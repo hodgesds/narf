@@ -52,8 +52,9 @@ const DRIVER: u32 = 0x40;
 /// are all DC_PLANE_TYPE_DCN_UNIVERSAL): amdgpu_dm's DCN4.0.1 list
 /// (`amdgpu_dm_modifiers::DM_PLANE_FORMATS`: rgb_formats, NV12, P010, then
 /// the FP16 ones) less those the native scanout does not program
-/// (RGBA8888 and the 16-bit UNORM orders), in its order.
-pub const PLANE_FORMATS: [u32; 15] = {
+/// (RGBA8888, which Linux's fill_dc_plane_info_and_addr also refuses),
+/// in its order.
+pub const PLANE_FORMATS: [u32; 19] = {
     use crate::amdgpu_dcn401_otg::SurfaceFormat as F;
     [
         F::Xrgb8888.fourcc(),
@@ -62,6 +63,10 @@ pub const PLANE_FORMATS: [u32; 15] = {
         F::Xbgr2101010.fourcc(),
         F::Argb2101010.fourcc(),
         F::Abgr2101010.fourcc(),
+        F::Xrgb16161616.fourcc(),
+        F::Xbgr16161616.fourcc(),
+        F::Argb16161616.fourcc(),
+        F::Abgr16161616.fourcc(),
         F::Xbgr8888.fourcc(),
         F::Abgr8888.fourcc(),
         F::Rgb565.fourcc(),
@@ -320,6 +325,7 @@ pub fn apply_routed_vrr(
             have.connector_type = c.kind;
         }
         native.push(NativeOutput {
+            color_format: None,
             connector: connector_id(c.index),
             edid: edid.copied(),
             timings,
@@ -403,6 +409,8 @@ pub struct ConnectorProps {
     /// devices included (drm_connector_attach_max_bpc_property(connector,
     /// 8, 16), starting at 16).
     pub max_bpc: bool,
+    /// Standard color-format property on native HDMI board connectors.
+    pub color_format: bool,
 }
 
 /// `apply_routed_vrr` with every native property amdgpu_dm attaches on
@@ -421,11 +429,25 @@ pub fn apply_routed_native(
     props: &[ConnectorProps],
 ) {
     /// A connector's committed Colorspace, HDR blob and max bpc.
-    type Committed = (u32, Option<u32>, Option<u32>, Option<u8>);
+    type Committed = (
+        u32,
+        Option<u32>,
+        Option<u32>,
+        Option<u8>,
+        Option<crate::amdgpu_hdr::ColorFormat>,
+    );
     let previous: alloc::vec::Vec<Committed> = card
         .native
         .iter()
-        .map(|n| (n.connector, n.colorspace, n.hdr_output_metadata, n.max_bpc))
+        .map(|n| {
+            (
+                n.connector,
+                n.colorspace,
+                n.hdr_output_metadata,
+                n.max_bpc,
+                n.color_format,
+            )
+        })
         .collect();
     let vrr: alloc::vec::Vec<bool> = props.iter().map(|p| p.vrr_capable).collect();
     apply_routed_vrr(card, crtcs, connectors, Some(&vrr));
@@ -434,6 +456,10 @@ pub fn apply_routed_native(
         let attach = props.get(n).is_some_and(|p| p.color);
         let kept = previous.iter().find(|p| p.0 == id);
         if let Some(native) = card.native.iter_mut().find(|x| x.connector == id) {
+            native.color_format = props
+                .get(n)
+                .is_some_and(|p| p.color_format)
+                .then(|| kept.and_then(|p| p.4).unwrap_or_default());
             native.colorspace = attach.then(|| kept.and_then(|p| p.1).unwrap_or(0));
             native.hdr_output_metadata = attach.then(|| kept.and_then(|p| p.2).unwrap_or(0));
             native.max_bpc = props.get(n).is_some_and(|p| p.max_bpc).then(|| {

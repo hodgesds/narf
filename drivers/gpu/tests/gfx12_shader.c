@@ -1,4 +1,4 @@
-/* GC12.0.1 compute proof contract, checked against Linux 7.3-rc7 headers.
+/* GC12.0.0/12.0.1 compute proof contract, checked against Linux 7.3-rc7 headers.
  * Run tests/gfx12_shader/check.sh for both this and the independent LLVM check.
  */
 #include "nvd.h"

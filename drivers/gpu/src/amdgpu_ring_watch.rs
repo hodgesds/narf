@@ -49,6 +49,21 @@ impl RingWatch {
     pub fn refusing(&self) -> Option<FsError> {
         self.hung.then_some(FsError::Canceled)
     }
+    pub(crate) fn reserve_errors(&mut self, extra: usize) -> Result<(), FsError> {
+        self.failed
+            .try_reserve(self.pending.len() + extra)
+            .map_err(|_| FsError::OutOfMemory)
+    }
+    /// Allocate every receipt/error slot before a multi-ring publication.
+    pub(crate) fn reserve_submission(&mut self) -> Result<u32, FsError> {
+        self.pending
+            .try_reserve(1)
+            .map_err(|_| FsError::OutOfMemory)?;
+        self.failed
+            .try_reserve(self.pending.len() + 1)
+            .map_err(|_| FsError::OutOfMemory)?;
+        Ok(self.issued.wrapping_add(1).max(1))
+    }
     /// Publish a submitted descriptor and return its stable client ticket.
     pub fn submitted(&mut self, physical: u32, job: Job, health: Arc<Health>, now: u64) -> u32 {
         if self.pending.is_empty() {
@@ -178,6 +193,13 @@ impl RingWatch {
             if !self.failed.iter().any(|(t, _)| *t == p.ticket) {
                 self.failed.push((p.ticket, FsError::Canceled));
             }
+        }
+    }
+    /// Persist an aggregate error even if its leader physically completed
+    /// before another constituent failed. Capacity is reserved before submit.
+    pub(crate) fn fail_ticket(&mut self, ticket: u32, error: FsError) {
+        if !self.failed.iter().any(|(t, _)| *t == ticket) {
+            self.failed.push((ticket, error));
         }
     }
     /// Only after full reset proved old jobs cannot execute. Preserve ticket

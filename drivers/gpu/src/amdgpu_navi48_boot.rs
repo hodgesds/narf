@@ -210,6 +210,36 @@ fn pin_vram(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MediaRequest {
+    keep: bool,
+    decode: bool,
+    encode: bool,
+    jpeg: bool,
+    jpeg_decode: bool,
+}
+impl MediaRequest {
+    fn new(keep: bool, decode: bool, encode: bool, jpeg: bool, jpeg_decode: bool) -> Self {
+        Self {
+            keep,
+            decode,
+            encode,
+            jpeg: jpeg || jpeg_decode || keep,
+            jpeg_decode,
+        }
+    }
+    fn ibs(self) -> bool {
+        self.keep || self.decode || self.encode || self.jpeg
+    }
+    fn bytes(self) -> u64 {
+        crate::amdgpu_vcn_navi48::proof_bytes(self.ibs(), self.decode, self.encode)
+            + if self.jpeg {
+                crate::amdgpu_jpeg_navi48::proof_bytes(self.jpeg_decode, self.keep)
+            } else {
+                0
+            }
+    }
+}
 #[derive(Debug)]
 struct Hardware {
     gpu: AmdGpu,
@@ -253,6 +283,7 @@ struct Hardware {
     jpeg_test: Option<Result<crate::amdgpu_jpeg_navi48::Proof, Error>>,
     jpeg_owner: Option<crate::amdgpu_navi48_dispatch::Handle>,
     media_test: Option<Result<crate::amdgpu_vcn_navi48::InterruptProof, Error>>,
+    media_request: Option<MediaRequest>,
     media_decode_required: bool,
     media_encode_required: bool,
     media_jpeg_required: bool,
@@ -621,13 +652,34 @@ fn rebind_display_clocks(
     }
     Ok(())
 }
-/// What the driver keeps of `available` free CPU-visible VRAM for its own
-/// later owners (scanout surfaces, display and queue memory): half of a
-/// small BAR's worth, at most 512 MiB — so a resizable BAR that shows all
-/// of VRAM hands nearly all of it to clients, not half.
-fn driver_reserve(available: u64) -> u64 {
-    (available / 2).min(512 << 20)
+/// Future driver-owner headroom, AFTER firmware, existing displays and the
+/// complete requested media set are charged to Pool. A small 256 MiB aperture
+/// keeps 32 MiB (staging/cursors and checked later display allocation); large
+/// apertures keep one eighth, capped 512 MiB. Never derive the floor from the
+/// post-proof remainder or silently trim requested codecs to admit a client.
+/// Future display requests still need their actual checked allocation; this
+/// floor is not a promise that every multi-monitor combination fits a BAR.
+fn driver_reserve(aperture: u64, available: u64) -> u64 {
+    (32u64 << 20)
+        .max((aperture / 8).min(512 << 20))
+        .min(available)
 }
+
+pub(crate) fn reserve_client_chunk(pool: &Pool) -> Result<crate::amdgpu_vram::Reservation, Error> {
+    const ALIGN: u64 = 2 << 20;
+    let available = pool.available();
+    let mut size = (available - driver_reserve(pool.size(), available)) & !(ALIGN - 1);
+    loop {
+        if size < 64 << 20 {
+            return Err(Error::Allocation);
+        }
+        match pool.reserve_aligned(size, ALIGN) {
+            Ok(chunk) => return Ok(chunk),
+            Err(_) => size = (size / 2) & !(ALIGN - 1),
+        }
+    }
+}
+
 impl ColdBoot {
     /// # Safety
     /// Caller owns a physical Navi48 GPU, permanent mappings and a pool made
@@ -822,6 +874,7 @@ impl ColdBoot {
                     jpeg_test: None,
                     jpeg_owner: None,
                     media_test: None,
+                    media_request: None,
                     media_decode_required: false,
                     media_encode_required: false,
                     media_jpeg_required: false,
@@ -867,8 +920,16 @@ impl ColdBoot {
         Ok(())
     }
     /// Prepare system suspend: the same preflight as `prepare_reset`, with
-    /// a resume-mode reset owner (PCI restore, then post or mode1).
+    /// a resume-mode reset owner (PCI restore, then post or mode1). The
+    /// platform must first commit zero streams and finish every teardown;
+    /// saving PCI state under a live display is never a valid suspend.
     pub(crate) fn prepare_suspend(&mut self) -> Result<(), Error> {
+        if self.display_retirement_busy()
+            || self.teardowns.check_idle().is_err()
+            || self.display_modesets().iter().any(Option::is_some)
+        {
+            return Err(Error::Busy);
+        }
         self.prepare_reset()?;
         let hw = &self.sequence.backend;
         // SAFETY: preparation performs no I/O; the platform establishes
@@ -1021,6 +1082,22 @@ impl ColdBoot {
     pub fn state(&self) -> State {
         self.sequence.state
     }
+    /// Inputs for the fixed draw, from this retained boot and loaded image.
+    pub(crate) fn draw_inputs(&self) -> Option<crate::amdgpu_gfx12_draw::Inputs> {
+        if self.state() != State::MemoryReady {
+            return None;
+        }
+        let backend = &self.sequence.backend;
+        let images = backend.firmware.images().ok()?;
+        Some(crate::amdgpu_gfx12_draw::Inputs {
+            chip: crate::amdgpu_rdna4::Rdna4Chip::of(&backend.gpu)?,
+            max_se: backend.gpu.gc_info?.num_se,
+            pfp_version: images
+                .iter()
+                .find(|i| i.source() == gfx::Source::Pfp)?
+                .version(),
+        })
+    }
     pub fn report(&self) -> Option<Report> {
         (self.state() == State::MemoryReady)
             .then(|| self.sequence.backend.report().ok())
@@ -1043,25 +1120,51 @@ impl ColdBoot {
     /// # Safety
     /// CPU IRQ control and executor are initialized; continue to exclude all
     /// reset/PM transitions after transferring IH to its permanent service.
-    pub(crate) unsafe fn start_interrupt_service(&mut self) -> Result<(), Error> {
+    pub(crate) async unsafe fn start_interrupt_service(&mut self) -> Result<(), Error> {
         if self.state() != State::MemoryReady {
             return Err(Error::Busy);
         }
         let hardware = &mut self.sequence.backend;
-        // SAFETY: same retained objects and exclusive post-boot handoff.
-        unsafe {
-            crate::amdgpu_navi48_interrupts::install(
-                &mut hardware.ih,
-                &mut hardware.interrupt_route,
-                &mut hardware.faults,
-                hardware.gmc.as_mut().ok_or(Error::Invalid)?,
-            )
+        let thermal = crate::amdgpu_navi48_power::thermal::Monitor::new(
+            &hardware.gpu,
+            hardware.authority,
+            hardware.smu.as_ref().and_then(smu::Smu::limits),
+        );
+        let vupdate = crate::amdgpu_navi48_interrupts::vupdate::Monitor::new(
+            &hardware.gpu,
+            hardware.authority,
+        );
+        let allow_thermal = thermal.is_some();
+        let result = async {
+            // SAFETY: same retained objects and exclusive post-boot handoff.
+            unsafe {
+                crate::amdgpu_navi48_interrupts::install(
+                    &mut hardware.ih,
+                    &mut hardware.interrupt_route,
+                    &mut hardware.faults,
+                    hardware.gmc.as_mut().ok_or(Error::Invalid)?,
+                    thermal,
+                    vupdate,
+                )
+            }
+            .map_err(Error::Interrupts)?;
+            if allow_thermal {
+                hardware
+                    .smu
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .allow_ih_interrupt()
+                    .await
+                    .map_err(Error::Smu)?;
+            }
+            Ok(())
         }
-        .map_err(|e| {
-            let error = Error::Interrupts(e);
+        .await;
+        if let Err(error) = result {
+            let _ = crate::amdgpu_navi48_interrupts::stop_for_reset().await;
             self.sequence.state = State::Failed(Stage::InterruptRings, error);
-            error
-        })
+        }
+        result
     }
     pub fn queue_state(&self) -> Option<queues::State> {
         self.sequence
@@ -1305,6 +1408,42 @@ impl ColdBoot {
         // the platform serializes all other accesses while this is pending.
         unsafe { queues.prove_interrupts(gmc).await }
     }
+    /// # Safety
+    /// OWNER retains this device and every job VM/BO and excludes other
+    /// queue publishers/reset/PM until publication or discard.
+    pub(crate) unsafe fn prepare_client_gang(
+        &mut self,
+        jobs: [queues::Job; 2],
+    ) -> Result<queues::PreparedGang, queues::Error> {
+        if self.state() != State::MemoryReady || crate::amdgpu_navi48_interrupts::blocked() {
+            return Err(queues::Error::Busy);
+        }
+        let queues = self
+            .sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(queues::Error::Busy)?;
+        // SAFETY: caller retains the matching serialized queue/VM owners.
+        unsafe { queues.prepare_gang(jobs) }
+    }
+    /// # Safety
+    /// Same retained owner as prepare_client_gang. Both constituent jobs
+    /// already have durable VM/BO/VMID/watch receipts, including on failure.
+    pub(crate) unsafe fn publish_client_gang(
+        &mut self,
+        prepared: queues::PreparedGang,
+        leader: queues::Pipe,
+    ) -> Result<(), queues::Error> {
+        let queues = self
+            .sequence
+            .backend
+            .queues
+            .as_mut()
+            .ok_or(queues::Error::Busy)?;
+        // SAFETY: matching preparation, exclusion and durable receipts.
+        unsafe { queues.publish_gang(prepared, leader) }
+    }
     /// Deterministic shader proof, after GC12/SDMA interrupt proofs and
     /// before any client work; the caller excludes all test-page users.
     /// # Safety
@@ -1376,7 +1515,6 @@ impl ColdBoot {
     /// address it as the GMC's framebuffer geometry translates it.
     /// Returns the heap's size.
     pub(crate) fn publish_client_vram(&mut self) -> Result<u64, Error> {
-        const ALIGN: u64 = 2 << 20;
         if self.client_vram.is_some() {
             return Err(Error::Busy);
         }
@@ -1388,19 +1526,9 @@ impl ColdBoot {
             .ok_or(Error::Invalid)?
             .display_context(regs)
             .map_err(Error::Gmc)?;
-        let available = hw.pool.available();
         let card = Self::drm_card().ok_or(Error::Invalid)?;
-        let mut size = (available - driver_reserve(available)) & !(ALIGN - 1);
-        // Free space need not be one run; settle for the largest that is.
-        let mut chunk = loop {
-            if size < 64 << 20 {
-                return Err(Error::Allocation);
-            }
-            match hw.pool.reserve_aligned(size, ALIGN) {
-                Ok(chunk) => break chunk,
-                Err(_) => size = (size / 2) & !(ALIGN - 1),
-            }
-        };
+        let mut chunk = reserve_client_chunk(&hw.pool)?;
+        let size = chunk.size();
         // SAFETY: the reservation is this heap's alone, inside the owned,
         // CPU-mapped VRAM range the boot inventory produced.
         let heap = unsafe { Pool::from_owned_range(chunk.mapping(), chunk.address()) }
@@ -1632,9 +1760,10 @@ impl ColdBoot {
     /// smu_v14_0_deep_sleep_control(true) for the default workload (narf has
     /// no power-profile or compute-profile path on Navi48, so the bootup
     /// default profile, which is not COMPUTE, is the only one). As in Linux,
-    /// nothing here fails display bring-up: a table that cannot be placed
-    /// is skipped, and refusals are logged and recorded
-    /// (`display_power_policy`). The table stays excluded from reuse.
+    /// a table that cannot be placed is skipped, and firmware refusals are
+    /// logged and recorded (`display_power_policy`). An interrupted or
+    /// authority-failed watermark transaction leaves the clock owner
+    /// unusable; subsequent preparation refuses it. The table stays excluded.
     async fn install_display_power_policy(&mut self) {
         let wm_ranges = self.notify_display_wm_ranges().await;
         if let Err(e) = wm_ranges {
@@ -2131,6 +2260,7 @@ impl ColdBoot {
         &mut self,
         pipe: u8,
         overlays: &[u8],
+        plan: &crate::amdgpu_dcn401_dml::Plan,
     ) -> Result<otg::RequestorApplied, otg::Error> {
         if self.display_retirement_busy() {
             return Err(otg::Error::Busy);
@@ -2147,6 +2277,7 @@ impl ColdBoot {
                     gmc,
                     pipe,
                     overlays,
+                    Some(plan),
                 )
                 .await
         }
@@ -2159,7 +2290,7 @@ impl ColdBoot {
         mode: &crate::amdgpu_dcn401_dml::Mode,
     ) -> Result<crate::amdgpu_dcn401_dml::Plan, otg::Error> {
         let soc = self.display_soc()?;
-        crate::amdgpu_dcn401_dml::admit_native(&soc, core::slice::from_ref(mode))
+        modeset::admit_native_modes(&soc, core::slice::from_ref(mode))
             .map(|plans| plans[0])
             .map_err(otg::Error::Admission)
     }
@@ -2262,6 +2393,22 @@ impl ColdBoot {
                 )
                 .await
         }
+    }
+    /// Retry a compbuf grow a slow DET acknowledgement deferred
+    /// (`Otg::retry_compbuf`), as Linux's next optimize_bandwidth programs
+    /// the compbuf again. `None` with nothing pending.
+    /// # Safety
+    /// As for `update_live_display_plan`.
+    pub async unsafe fn retry_display_compbuf(&mut self) -> Result<Option<[u8; 5]>, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        if !otg.compbuf_pending() {
+            return Ok(None);
+        }
+        // SAFETY: the caller's obligations.
+        unsafe { otg.retry_compbuf() }.await
     }
     /// Move display `pipe`'s live scanout to the planes `request` under
     /// `plan` without relighting it (`Otg::update_live_planes`: DC's medium
@@ -2808,7 +2955,7 @@ impl ColdBoot {
     /// for DRR while PMFW may switch UCLK (pin it first).
     /// # Safety
     /// As for `set_display_cursor`.
-    pub unsafe fn set_display_drr(
+    pub async unsafe fn set_display_drr(
         &mut self,
         pipe: u8,
         drr: Option<crate::amdgpu_freesync::Drr>,
@@ -2818,7 +2965,67 @@ impl ColdBoot {
             return Err(otg::Error::Busy);
         }
         // SAFETY: serialized retained owner; caller excludes writers.
-        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_drr(pipe, drr) }
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_drr(pipe, drr) }.await
+    }
+    /// Configure LFC from the admitted variable-refresh range. Nominal
+    /// DML and the pinned memory-clock contract remain unchanged.
+    /// # Safety
+    /// As for `set_display_cursor`.
+    pub async unsafe fn set_display_lfc(
+        &mut self,
+        pipe: u8,
+        config: Option<crate::amdgpu_freesync::LfcConfig>,
+    ) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady || (config.is_some() && self.uclk_switching()) {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes timing writers.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_lfc(pipe, config) }.await
+    }
+    /// Advance LFC only from a real observed frame transition.
+    /// # Safety
+    /// As for `set_display_cursor`; no cancelled display operation may be serviced.
+    pub unsafe fn display_lfc_progress(&mut self, pipe: u8, lost: bool) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady || self.uclk_switching() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes timing writers.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.lfc_progress(pipe, lost) }
+    }
+    /// Apply a finite native MID-for-MAX sequence independently of BTR.
+    /// # Safety
+    /// As for `set_display_cursor`; keep UCLK pinned until DRR is disabled.
+    pub unsafe fn set_display_drr_mid(
+        &mut self,
+        pipe: u8,
+        mid: Option<otg::DrrMid>,
+    ) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady || self.uclk_switching() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes timing writers.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_drr_mid(pipe, mid) }
+    }
+    /// Apply the live FreeSync timing and SPD under the same display owner.
+    /// # Safety
+    /// As for `set_display_cursor`.
+    pub async unsafe fn set_display_freesync(
+        &mut self,
+        pipe: u8,
+        drr: Option<crate::amdgpu_freesync::Drr>,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<Option<otg::DrrApplied>, otg::Error> {
+        if self.state() != State::MemoryReady || (drr.is_some() && self.uclk_switching()) {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .set_freesync(pipe, drr, packet)
+        }
+        .await
     }
     /// Set display `pipe`'s CRTC color: a live scanout is reprogrammed at
     /// once (no modeset), otherwise its next scanout start programs it.
@@ -3443,7 +3650,8 @@ impl ColdBoot {
                 .await
         }
     }
-    /// Start audio on the port's running HDMI or DP video.
+    /// Start audio on the port's running HDMI or DP video, on the Azalia
+    /// `endpoint` its stream acquired (`StreamEncoders::audio`).
     /// # Safety
     /// Fulfil `Otg::start_hdmi_audio` or `Otg::start_dp_audio` obligations.
     /// For MST also exclude payload changes; the retained manager allocation
@@ -3453,6 +3661,7 @@ impl ColdBoot {
         port: usize,
         hdmi: bool,
         info: otg::AudioInfo,
+        endpoint: u8,
     ) -> Result<otg::DisplayAudio, otg::Error> {
         let path = self.dp_phy_path(port)?;
         let otg = self.otg.as_mut().map_err(|e| *e)?;
@@ -3478,11 +3687,11 @@ impl ColdBoot {
         // SAFETY: matching retained board path/owners; caller's obligations.
         unsafe {
             if hdmi {
-                otg.start_hdmi_audio(path, info).await
+                otg.start_hdmi_audio(path, info, endpoint).await
             } else if let Some(slots) = mst_slots {
-                otg.start_mst_audio(path, info, slots).await
+                otg.start_mst_audio(path, info, slots, endpoint).await
             } else {
-                otg.start_dp_audio(path, info).await
+                otg.start_dp_audio(path, info, endpoint).await
             }
         }
     }
@@ -4037,20 +4246,23 @@ pub use mst::{
 };
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
+pub(crate) use modeset::admit_native_modes;
 #[path = "amdgpu_navi48_teardown.rs"]
 mod teardown;
 pub use modeset::{
     beside_pipes, broadcast_rgb, connector_max_bpc, dc_state, display_pipes, edid_timings,
     frl_audio, frl_cap, frl_carries, frl_dsc, frl_dsc_caps, frl_dsc_carries, frl_dsc_link,
-    frl_enabled, frl_link, frl_video_params, hdmi_avi, hdmi_caps, hdmi_stream, head_pipes,
-    light_pipes, limited_range, live_pipes, max_bpc, output_color, plan_pipes, plane_format,
-    plane_mode, plane_requests, plane_setup, requested_bpc, selection_mode, set_broadcast_rgb,
-    set_crtc_color, set_frl, set_max_bpc, set_output_color, set_plane_format, set_plane_setup,
-    set_requested_bpc, sink_audio_info, stream_planes, with_planes, BesideRefusal, Configuration,
-    DisplayPipes, DrmPlaneState, FirstFrames, FrlDscStream, FrlRate, HdmiCaps, HdmiStream, Health,
-    InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, OverlayPlane, PlaneGeometry,
-    PlanePipes, PlaneSetup, PlanesChange, Selection, SstOutput, StreamPipes, BROADCAST_RGB_AUTO,
-    BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED, MAX_REQUESTED_BPC, MIN_REQUESTED_BPC,
+    frl_enabled, frl_link, frl_video_params, frl_video_params_in, hdmi_avi, hdmi_candidates,
+    hdmi_caps, hdmi_stream, head_pipes, light_pipes, limited_range, live_pipes, max_bpc,
+    output_color, plan_pipes, plane_format, plane_mode, plane_requests, plane_setup, requested_bpc,
+    requested_color_format, selection_mode, set_broadcast_rgb, set_crtc_color, set_frl,
+    set_max_bpc, set_output_color, set_plane_format, set_plane_setup, set_requested_bpc,
+    set_requested_color_format, sink_audio_info, stream_planes, with_planes, BesideRefusal,
+    Configuration, DisplayPipes, DrmPlaneState, FirstFrames, FrlDscStream, FrlRate, HdmiCaps,
+    HdmiStream, Health, InheritedRetired, Modeset, ModesetError, MstRoute, MstStream, OverlayPlane,
+    PlaneGeometry, PlanePipes, PlaneSetup, PlanesChange, Selection, SstOutput, StreamPipes,
+    BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL, BROADCAST_RGB_LIMITED, MAX_REQUESTED_BPC,
+    MIN_REQUESTED_BPC,
 };
 pub use teardown::{TeardownStatus, TeardownStep};
 #[cfg(feature = "kernel-test")]

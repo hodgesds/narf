@@ -6,11 +6,12 @@ test_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 linux_src=${LINUX_SRC:-/usr/src/linux}
 scratch_dir=$(mktemp -d /tmp/narf-gfx12-shader.XXXXXX)
 trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
-"${LLVM_MC:-llvm-mc}" -triple=amdgcn-amd-amdhsa -mcpu=gfx1201 \
+for target in gfx1200 gfx1201; do
+"${LLVM_MC:-llvm-mc}" -triple=amdgcn-amd-amdhsa -mcpu="$target" \
     -filetype=obj "$test_dir/proof.s" -o "$scratch_dir/proof.o"
 "${LLVM_OBJCOPY:-llvm-objcopy}" -O binary --only-section=.text \
     "$scratch_dir/proof.o" "$scratch_dir/proof.bin"
-python3 - "$test_dir/../../src/amdgpu_gfx12_shader.rs" "$scratch_dir/proof.bin" <<'PY'
+python3 - "$test_dir/../../src/amdgpu_gfx12_shader.rs" "$scratch_dir/proof.bin" "$target" <<'PY'
 import pathlib
 import re
 import struct
@@ -23,9 +24,10 @@ words = [int(v.replace("_", ""), 0)
          for v in re.findall(r"\b(?:0x[0-9a-fA-F_]+|\d+)\b", array[1])]
 expected = struct.pack("<" + "I" * len(words), *words)
 actual = pathlib.Path(sys.argv[2]).read_bytes()
-assert actual == expected, f"LLVM gfx1201 encoding differs: {actual.hex()}"
-print(f"gfx1201 shader: {len(words)} dwords match LLVM assembly")
+assert actual == expected, f"LLVM {sys.argv[3]} encoding differs: {actual.hex()}"
+print(f"{sys.argv[3]} shader: {len(words)} dwords match LLVM assembly")
 PY
+done
 "${CC:-cc}" -Wall -Wextra -Werror \
     -I"$linux_src/drivers/gpu/drm/amd/include" \
     -I"$linux_src/drivers/gpu/drm/amd/amdgpu" \

@@ -62,3 +62,8 @@ clears the mapping so cached writers become empty. This CPU barrier does not
 prove hardware fetch retirement. Navi48's monitor combines it with native
 fetch/route/power checks and an HDP/PCIe drain before releasing current and
 parked display-only VRAM reservations after successful teardown.
+
+Framebuffer device mmap backings request WC, matching device scanout mappings;
+the address-space owner keeps RAM-backed scanout leaves WB. The devfs proxy
+forwards the complete backing and its attributes. Rebased native AMD generic
+scanouts continue to expose no physical fbdev mmap backing.

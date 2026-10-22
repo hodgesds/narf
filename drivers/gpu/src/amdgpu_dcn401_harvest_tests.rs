@@ -5,11 +5,12 @@
 //! names is renamed the same way (pipe index to the model, hardware
 //! instance back to the owner). An owner that addresses the pool's
 //! instances therefore drives the model exactly as on the full board, and
-//! any access to a fused instance, or a field naming one, panics. A run
+//! any access to a fused pipe block, or a field naming one, panics. The
+//! MPC's physical selectors remain accessible for initialization. A run
 //! under `under(fuses, ..)` is the same test on the harvested board. Models
 //! that address registers through the owner's own layout (so already at
 //! the pool's instances) use `guard` or `guard_raw` instead, which only
-//! refuse fused instances.
+//! refuse fused pipe blocks with that same MPC exception.
 //!
 //! The blocks and fields are written out from dcn_4_1_0_offset.h /
 //! sh_mask.h, not borrowed from the driver.
@@ -22,8 +23,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// dword of instance 0, instance stride, whether a fused instance's may be
 /// read). Bank 1 is DCCG, 2 the DCN core, 3 the MPC. Only DCHUBBUB's DET
 /// sizes are read for every instance, fused ones included, as Linux's
-/// dcn401_init_crb and dcn401_program_compbuf_segments read DET0-3; no
-/// fused instance is ever written.
+/// dcn401_init_crb and dcn401_program_compbuf_segments read DET0-3. The
+/// MPC selector exception is checked separately below: MPC keeps
+/// all four MPCCs after pipe harvesting, as dcn10_init_pipes initializes.
 const BLOCKS: [(u8, u64, u64, u64, bool); 21] = [
     (2, 0xcc5, 0xdc8, 0x16b, false), // DPP_TOP, CNVC_CFG/CUR, DSCL, CM (dpp->inst)
     (2, 0x5e5, 0x68d, 0xdc, false),  // HUBP, HUBPREQ, HUBPRET, CURSOR0 (hubp->inst)
@@ -106,9 +108,13 @@ impl<I> Renamed<I> {
                 let lo = base + (first + u64::from(inst) * stride) * 4;
                 let hi = base + (last + u64::from(inst) * stride) * 4;
                 if (lo..=hi).contains(&at) {
+                    let offset = (at - lo) / 4;
+                    let physical_mpc = bank == 3
+                        && ((first == 0 && [0, 1, 2, 5].contains(&offset))
+                            || first == 0x2f2 && offset == 0);
                     let pipe = match self.pool.pipe(inst) {
                         Some(pipe) => pipe,
-                        None if readable && !write => {
+                        None if readable && !write || physical_mpc => {
                             (0..4u8).find(|&p| self.pool.hw(p) == inst).unwrap()
                         }
                         None => panic!("fused pipe instance {inst} touched at {at:#x}"),
@@ -178,6 +184,9 @@ impl<I> DerefMut for Renamed<I> {
     }
 }
 impl<I: Io> Io for Renamed<I> {
+    async fn vupdate(&mut self, pipe: u8, enable: bool) -> Result<(), Error> {
+        self.model.vupdate(pipe, enable).await
+    }
     fn read(&mut self, at: u64) -> u32 {
         let at = self.rename_addr(at, false);
         let value = self.model.read(at);

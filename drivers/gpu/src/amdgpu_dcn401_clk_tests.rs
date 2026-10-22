@@ -105,6 +105,7 @@ impl Io for Fake {
 fn engine() -> Engine<Fake> {
     Engine {
         authority: Cap::bootstrap(),
+        unanswered_ignored: false,
         layout: Layout {
             mp1: MP1,
             dccg: 0x20000,
@@ -663,6 +664,14 @@ fn dcn401_fixed_clocks_do_not_issue_unsupported_dpm_commands() -> TestResult {
         (100000, 100000)
     );
     assert_eq!(e.io.commands, [(14, 1)]);
+    e.io.commands.clear();
+    let released = run(e.release()).unwrap();
+    assert_eq!(e.io.commands, [(14, 0)]);
+    assert_eq!(released.request.displays, 0);
+    assert_eq!(
+        (released.display_khz, released.dpp_khz, released.dtb_khz),
+        (100000, 100000, 100000)
+    );
     TestResult::Pass
 }
 kernel_test_in!(
@@ -1086,6 +1095,72 @@ fn dcn401_watermark_ranges_reach_pmfw() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/dcn401-clk", dcn401_watermark_ranges_reach_pmfw);
 
+/// Linux's void DAL helpers ignore a post-write timeout and the following
+/// send replaces the unanswered transaction after its readiness wait. This
+/// permission comes only from a completed ignored-result helper: an unknown
+/// busy mailbox and a cancelled transaction remain unusable.
+fn dcn401_sent_optional_timeouts_continue_without_reusing_cancelled_commands() -> TestResult {
+    let mut e = engine();
+    start(&mut e);
+    e.io.commands.clear();
+    e.io.stall = Some(1);
+    assert_eq!(run(e.notify_wm_ranges(0x8_0040_1000)), Ok(()));
+    assert_eq!(e.io.commands, [(5, 8), (6, 0x0040_1000), (8, 2)]);
+    assert_eq!(e.status.state, State::Ready);
+    assert_eq!(e.status.ignored.last, Some((5, Error::Timeout)));
+    assert!(!e.unanswered_ignored);
+
+    // A timeout at the end of a void sequence may be followed by prepare's
+    // required DCF/DISP/DPP/DTB responses, each still validated normally.
+    e.io.commands.clear();
+    e.io.stall = Some(3);
+    assert_eq!(run(e.notify_wm_ranges(0x8_0040_1000)), Ok(()));
+    assert!(e.unanswered_ignored);
+    assert_eq!(e.status.ignored.last, Some((8, Error::Timeout)));
+    assert!(run(e.prepare(request())).is_ok());
+    assert_eq!(e.status.state, State::Applied);
+    assert!(!e.unanswered_ignored);
+
+    // ReturnHardMinStatus is also optional when the UCLK floor's returned
+    // frequency is unread; a timed-out status must not fail a live owner.
+    e.io.commands.clear();
+    e.io.stall = Some(4);
+    let (updated, sent) = bw(&mut e, pstate_bw(), true);
+    assert!(updated.is_ok());
+    assert_eq!(sent, [(0xd, 11), (0x1a, 1), (9, 2 << 16 | 96), (0x15, 0)]);
+    assert_eq!(e.status.state, State::Applied);
+    assert_eq!(
+        e.status.ignored.last,
+        Some((9, Error::HardMinTimeout(Clock::Memory)))
+    );
+    assert!(e.unanswered_ignored);
+
+    // Cancellation never creates the timeout exception. The state transition
+    // also protects watermark notifications, which previously stayed Ready.
+    for step in 1..=3 {
+        let mut e = engine();
+        start(&mut e);
+        e.io.commands.clear();
+        e.io.stall = Some(step);
+        {
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut f = core::pin::pin!(e.notify_wm_ranges(0x8_0040_1000));
+            assert!(f.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(e.io.commands.len(), step);
+        assert_eq!(e.status.state, State::Applying);
+        assert!(!e.unanswered_ignored);
+        assert_eq!(run(e.prepare(request())), Err(Error::Busy));
+        assert_eq!(run(e.notify_wm_ranges(0)), Err(Error::Busy));
+        assert_eq!(e.io.commands.len(), step);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_sent_optional_timeouts_continue_without_reusing_cancelled_commands
+);
+
 /// dcn401_smu_send_msg_with_param waits only for a nonzero DAL_RESP and
 /// then sends: a fresh owner sends over a refusal an earlier owner left
 /// there. A refused NumOfDisplays or SetMinDeepSleepDcfclk is ignored, as
@@ -1307,7 +1382,7 @@ fn dcn401_no_display_left_releases_like_dcn401_update_clocks() -> TestResult {
         deep_sleep_dcfclk_khz: 10_673,
         ..request()
     };
-    let applied = run(e.prepare(lit)).unwrap();
+    run(e.prepare(lit)).unwrap();
     // A display still lit: nothing is sent.
     let busy = DIO + 0x1b43 * 4;
     e.io.regs.insert(busy, 1);
@@ -1329,6 +1404,12 @@ fn dcn401_no_display_left_releases_like_dcn401_update_clocks() -> TestResult {
             (0x1a, 1),
             (9, 2 << 16 | 100),
             (0x15, 0),
+            (9, 10 << 16 | 100),
+            (0x15, 0),
+            (9, 6 << 16 | 100),
+            (0x15, 0),
+            (9, 7 << 16 | 100),
+            (0x15, 0),
         ]
     {
         return TestResult::Fail("no-display optimize sequence");
@@ -1343,8 +1424,12 @@ fn dcn401_no_display_left_releases_like_dcn401_update_clocks() -> TestResult {
         || !e.status.uclk_switching()
         || !e.status.bandwidth.fclk_pstate
         || e.status.bandwidth.deep_sleep_dcfclk_khz != 0
-        || (released.display_khz, released.dpp_khz, released.dtb_khz)
-            != (applied.display_khz, applied.dpp_khz, applied.dtb_khz)
+        || (released.display_khz, released.dpp_khz, released.dtb_khz) != (100_000, 100_000, 100_000)
+        || (
+            released.request.display_khz,
+            released.request.dpp_khz,
+            released.request.dtb_khz,
+        ) != (100_000, 100_000, 100_000)
     {
         return TestResult::Fail("no-display optimize state");
     }
@@ -1366,4 +1451,86 @@ fn dcn401_no_display_left_releases_like_dcn401_update_clocks() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-clk",
     dcn401_no_display_left_releases_like_dcn401_update_clocks
+);
+
+fn dcn401_no_display_release_tracks_actual_rates_and_fails_closed() -> TestResult {
+    for chip in crate::amdgpu_rdna4::Rdna4Chip::ALL {
+        let mut e = idle_dpm_engine();
+        e.layout.chip = Some(chip);
+        run(e.prepare(request())).unwrap();
+        e.io.commands.clear();
+        // Actual rates need not equal the requested floor. Only the requested
+        // first levels are remembered as floors, as Linux's clks do.
+        e.io.actual = Some(101_000);
+        let released = run(e.release()).unwrap();
+        assert_eq!(
+            hard_mins(&e.io.commands),
+            [(9, 100), (10, 100), (6, 100), (7, 100)]
+        );
+        assert!(e.io.commands.contains(&(0x18, 300 << 16 | 96)));
+        assert!(e.io.commands.contains(&(0x19, 0)));
+        assert_eq!(
+            (released.display_khz, released.dpp_khz, released.dtb_khz),
+            (101_000, 101_000, 101_000)
+        );
+        assert_eq!(released.request.display_khz, 100_000);
+        assert_eq!(released.request.dpp_khz, 100_000);
+        assert_eq!(released.request.dtb_khz, 100_000);
+    }
+    let mut e = engine();
+    start(&mut e);
+    let previous = run(e.prepare(request())).unwrap();
+    e.io.commands.clear();
+    run(e.release()).unwrap();
+    let sequence = e.io.commands;
+    for step in 1..=sequence.len() {
+        let mut e = engine();
+        start(&mut e);
+        run(e.prepare(request())).unwrap();
+        e.io.commands.clear();
+        e.io.stall = Some(step);
+        {
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut f = core::pin::pin!(e.release());
+            assert!(f.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(e.status.state, State::Applying);
+        assert_eq!(e.status.applied, Some(previous));
+        assert_eq!(run(e.release()), Err(Error::Busy));
+        assert_eq!(run(e.prepare(request())), Err(Error::Busy));
+        assert_eq!(e.io.commands.len(), step);
+    }
+    // Rejected display floors and their required status results are fatal;
+    // the partly released owner must be retained without retry or rollback.
+    let first_display = sequence
+        .iter()
+        .position(|&(message, arg)| message == 9 && arg >> 16 == Clock::Dtb as u32)
+        .unwrap()
+        + 1;
+    for step in first_display..=sequence.len() {
+        let mut e = engine();
+        start(&mut e);
+        run(e.prepare(request())).unwrap();
+        e.io.commands.clear();
+        e.io.refuse = Some(step);
+        assert_eq!(run(e.release()), Err(Error::Rejected(0xfd)));
+        assert_eq!(e.status.state, State::Failed(Error::Rejected(0xfd)));
+        assert_eq!(e.status.applied, Some(previous));
+        assert_eq!(e.io.commands.len(), step);
+        assert_eq!(run(e.release()), Err(Error::Busy));
+    }
+    let mut e = engine();
+    start(&mut e);
+    run(e.prepare(request())).unwrap();
+    e.io.actual = Some(99_999);
+    assert_eq!(run(e.release()), Err(Error::Frequency(Clock::Dtb, 99_999)));
+    assert_eq!(
+        e.status.state,
+        State::Failed(Error::Frequency(Clock::Dtb, 99_999))
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_no_display_release_tracks_actual_rates_and_fails_closed
 );

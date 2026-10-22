@@ -519,6 +519,9 @@ struct Session<I: Io> {
     gfx_state: GfxLoadState,
     gfx_status: Option<GfxBootStatus>,
     media_firmware: MediaFirmware,
+    /// Common-header version of the GC12 VCN container whose payload was
+    /// accepted with the complete image set, never a second registry lookup.
+    gfx12_vcn_version: Option<u32>,
     fb_base: u64,
     fb_offset: u64,
 }
@@ -955,6 +958,7 @@ impl Psp {
                 gfx_state: GfxLoadState::Absent,
                 gfx_status: None,
                 media_firmware: MediaFirmware::default(),
+                gfx12_vcn_version: None,
                 fb_base,
                 fb_offset,
             },
@@ -1153,6 +1157,15 @@ impl Psp {
     }
     pub fn media_firmware(&self) -> MediaFirmware {
         self.session.media_firmware
+    }
+    /// Version from the retained GC12 container corresponding to PSP's
+    /// authenticated VCN payload. The header itself is container metadata;
+    /// only a complete upload, boot and still-owned TMR make it publishable.
+    pub(crate) fn authenticated_vcn_version(&self) -> Option<u32> {
+        if !matches!(self.kind, Kind::Navi48(_)) {
+            return None;
+        }
+        self.session.authenticated_vcn_version()
     }
     /// The GMC system aperture validated against the pool at construction:
     /// (`gmc.fb_start`, `vm_manager.vram_base_offset`) in Linux terms.
@@ -1446,11 +1459,25 @@ impl<I: Io> Session<I> {
         }
         .await;
         self.gfx_state = if result.is_ok() {
+            self.gfx12_vcn_version = images
+                .iter()
+                .find(|image| image.source() == Source::Vcn)
+                .map(|image| image.version());
             GfxLoadState::Accepted
         } else {
             GfxLoadState::Failed
         };
         result
+    }
+    fn authenticated_vcn_version(&self) -> Option<u32> {
+        if self.gfx_state != GfxLoadState::BootComplete
+            || !self.tmr_ready
+            || self.tmr.is_none()
+            || self.media_firmware.vcn.is_none()
+        {
+            return None;
+        }
+        self.gfx12_vcn_version
     }
     fn record_media(&mut self, reply: Reply, kind: u32) -> Result<(), Error> {
         let tmr = self.tmr.as_ref().ok_or(Error::Invalid)?;
@@ -1557,6 +1584,7 @@ impl<I: Io> Session<I> {
         self.smc_state = SmcState::Absent;
         self.gfx_state = GfxLoadState::Absent;
         self.gfx_status = None;
+        self.gfx12_vcn_version = None;
         Ok(())
     }
 }

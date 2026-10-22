@@ -76,7 +76,10 @@ mod mst;
 pub use mst::{vc_rate, MstAllocation};
 #[path = "amdgpu_dcn401_drr.rs"]
 mod drr;
-pub use drr::DrrApplied;
+pub use drr::{DrrApplied, DrrMid};
+#[path = "amdgpu_dcn401_freesync.rs"]
+mod freesync;
+pub use freesync::FreesyncApplied;
 #[path = "amdgpu_dcn401_frl.rs"]
 mod frl;
 pub use frl::{
@@ -128,6 +131,7 @@ pub enum Error {
     Firmware(crate::amdgpu_dmub_navi48::Error),
     DpTraining(DpTrainingError),
     Memory(crate::amdgpu_gmc_navi48::Error),
+    Interrupts(crate::amdgpu_ih7::Error),
     Admission(dml::Error),
     /// HUBP or OPTC underflow observed at this register during scanout.
     Underflow(u64),
@@ -329,7 +333,7 @@ pub struct Request {
     pub signal: Signal,
     /// HDMI YCbCr 4:2:0 output: two pixels per container, so the OTG
     /// divides its horizontal timing by two and formats 4:2:0 data.
-    pub ycbcr420: bool,
+    pub encoding: crate::amdgpu_hdr::PixelEncoding,
     /// Compressed by the pipe's own DSC (RGB at `cfg.bpc`, which the blank
     /// depth must match: DP SST or MST, DIO or HPO, or HDMI FRL); with
     /// ODM each segment's DSC compresses its segment (its share of the slices).
@@ -486,6 +490,8 @@ pub struct Status {
     /// Live DRR on the scanout's timing; cleared when fixed refresh is
     /// restored (on request, before fetch stops, and before the timing stops).
     pub drr: Option<DrrApplied>,
+    /// Requested SPD update, complete only after packet publication/readback.
+    pub freesync: Option<FreesyncApplied>,
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
@@ -624,6 +630,7 @@ impl Status {
             underflow: None,
             cursor: None,
             drr: None,
+            freesync: None,
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,
@@ -700,7 +707,7 @@ impl Plan {
         if self.request.odm.len() >= 2 {
             return 3;
         }
-        if self.request.ycbcr420 || self.request.odm.is_some() {
+        if self.request.encoding.is_420() || self.request.odm.is_some() {
             return 1;
         }
         ((self.request.timing.h_total
@@ -721,7 +728,7 @@ impl Plan {
         let t = self.request.timing;
         let count = self.request.odm.count();
         let width = t.h_active / count;
-        width + (width & 1 & u32::from(self.request.ycbcr420 && count > 1))
+        width + (width & 1 & u32::from(self.request.encoding.is_420() && count > 1))
     }
     /// The last segment's width (OPTC_SEGMENT_WIDTH_LAST for 3:1).
     pub(crate) fn last_segment_width(self) -> u32 {
@@ -822,7 +829,18 @@ impl Request {
         // line buffer, and every horizontal boundary must divide by two
         // (Linux would switch to the manual mode; this owner refuses).
         let segments = self.odm.count();
-        if self.ycbcr420
+        if !self.encoding.is_rgb() && !matches!(self.signal, Signal::Tmds | Signal::HdmiFrl) {
+            return Err(Error::Unsupported);
+        }
+        // FRL's 4:2:2 encoder counts horizontal pixel pairs too, while
+        // uncompressed 4:2:2 still uses one pixel per OPTC container.
+        if self.encoding.is_422()
+            && self.signal == Signal::HdmiFrl
+            && (t.h_active | (t.h_total - t.h_active)) & 1 != 0
+        {
+            return Err(Error::Unsupported);
+        }
+        if self.encoding.is_420()
             && (!matches!(self.signal, Signal::Tmds | Signal::HdmiFrl)
                 || t.h_active > segments * dml::FMT_420_BUFFER_WIDTH
                 || (t.h_total | t.h_sync_width | hs | he) & 1 != 0)
@@ -846,7 +864,7 @@ impl Request {
                 v_blank: 0,
                 vtg: 0,
             };
-            if (self.ycbcr420 && t.h_active % (2 * div) != 0)
+            if (self.encoding.is_420() && t.h_active % (2 * div) != 0)
                 || [t.h_active, t.h_total, t.h_sync_width, hs, he]
                     .iter()
                     .any(|&v| v % div != 0)
@@ -973,6 +991,12 @@ impl Layout {
 trait Io {
     fn read(&mut self, at: u64) -> u32;
     fn write(&mut self, at: u64, value: u32);
+    /// Source ownership is independent of this timing owner. Native code
+    /// awaits SERVICE with no IRQ-safe lock held; models may pause here to
+    /// prove no timing/clock write precedes confirmed IRQ retirement.
+    async fn vupdate(&mut self, _pipe: u8, _enable: bool) -> Result<(), Error> {
+        Ok(())
+    }
     /// Models can suspend at a missing acknowledgement without racing the
     /// host clock. Real MMIO never requests this test-only suspension.
     #[cfg(feature = "kernel-test")]
@@ -989,6 +1013,11 @@ trait Io {
 #[derive(Debug)]
 struct Mmio(MmioRegion);
 impl Io for Mmio {
+    async fn vupdate(&mut self, pipe: u8, enable: bool) -> Result<(), Error> {
+        crate::amdgpu_navi48_interrupts::set_vupdate(pipe, enable)
+            .await
+            .map_err(Error::Interrupts)
+    }
     fn read(&mut self, at: u64) -> u32 {
         // SAFETY: bounded discovery, permanent mapping and serialized owner.
         unsafe { self.0.read32(at) }
@@ -1219,6 +1248,15 @@ struct Displays {
     /// Each display's requested CRTC color, programmed at scanout start
     /// and on a live update.
     color: [Option<alloc::sync::Arc<ColorProgram>>; 4],
+    /// A compbuf grow (dcn401_program_compbuf_segments) deferred because a
+    /// DET had not acknowledged its request; the hub's, not a display's.
+    compbuf_pending: bool,
+    /// Physical HUBP instances for which this owner wrote DET=0. Only these
+    /// known retirements may remain pending while an unrelated stream runs.
+    retiring_dets: u8,
+    /// A compbuf grow this owner issued after every DET acknowledged. Its
+    /// CURRENT may lag without invalidating the active DET allocations.
+    compbuf_inflight: Option<u8>,
 }
 impl Displays {
     fn new() -> Box<Self> {
@@ -1227,6 +1265,9 @@ impl Displays {
             parked: alloc::vec![Status::new(); 4].into_boxed_slice(),
             siblings: Siblings::default(),
             color: [const { None }; 4],
+            compbuf_pending: false,
+            retiring_dets: 0,
+            compbuf_inflight: None,
         })
     }
 }
@@ -1428,13 +1469,13 @@ impl<I: Io> Engine<I> {
         self.update(odm(MEMORY), 0xffff, plan.memory(l.pool))?;
         // Fixed refresh; clear inherited DRR selectors before setting equal
         // total/min/max. No DMUB FAMS delegation is active under this owner.
-        self.update(otg(V_CONTROL), 0xffff0013, 0)?;
+        self.update(otg(V_CONTROL), drr::DRR_FIELDS, 0)?;
         for (r, mask, value) in plan.registers() {
             self.update(otg(r), mask, value)?;
         }
         self.update(l.vtg(pipe), 0x7fff7fff, plan.vtg)?;
         // OPTC_DATA_FORMAT: RGB/4:4:4, or 4:2:0; DSC disabled.
-        let format = if plan.request.ycbcr420 { 2 } else { 0 };
+        let format = plan.request.encoding.hardware_format();
         self.update(odm(FORMAT), 0x33, format)?;
         // link_set_dsc_on_stream: the pipe's DSC (any earlier one on this
         // stopped pipe turned off first), then the OPTC's DSC mode. An HDMI
@@ -1501,6 +1542,7 @@ impl<I: Io> Engine<I> {
     }
     async fn disable(&mut self, pipe: u8) -> Result<(), Error> {
         let l = self.layout;
+        self.io.vupdate(pipe, false).await?;
         self.drr_fixed(pipe)?;
         self.update(l.odm(pipe, SOURCE), 0xffff0003, 0xffff0000)?;
         self.update(l.odm(pipe, MEMORY), 0xffff, 0)?;

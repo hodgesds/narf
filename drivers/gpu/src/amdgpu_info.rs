@@ -391,10 +391,24 @@ pub(crate) fn publish_navi48_firmware(firmware: [(u32, u32, u32); 3]) {
 fn firmware_version(
     snap: &Snapshot,
     firmware: Option<[(u32, u32, u32); 3]>,
+    vcn_firmware: Option<u32>,
     fw_type: u32,
 ) -> Result<Vec<u8>, FsError> {
+    if rdna4(snap).is_none() {
+        return Err(FsError::InvalidData);
+    }
+    if fw_type == uapi::AMDGPU_INFO_FW_VCN {
+        amdgpu_discovery::find_ip(&snap.ip_blocks, amdgpu_discovery::HW_ID_VCN, 0)
+            .filter(|ip| (ip.major, ip.minor, ip.revision) == (5, 0, 0))
+            .ok_or(FsError::InvalidData)?;
+        // amdgpu_firmware_info: the common header's raw ucode_version;
+        // feature is zero, independently of CP ucode_feature_version.
+        return Ok(as_bytes(&uapi::DrmAmdgpuInfoFirmware {
+            ver: vcn_firmware.ok_or(FsError::InvalidData)?,
+            feature: 0,
+        }));
+    }
     let (_, ver, feature) = firmware
-        .filter(|_| rdna4(snap).is_some())
         .and_then(|f| f.into_iter().find(|(t, ..)| *t == fw_type))
         .ok_or(FsError::InvalidData)?;
     Ok(as_bytes(&uapi::DrmAmdgpuInfoFirmware { ver, feature }))
@@ -452,9 +466,24 @@ pub(crate) fn withdraw_navi48_clock() {
 }
 /// Navi48 codec directions proven on the live media rings
 /// (`amdgpu_video_caps_navi48::{AVC_DECODE, AVC_ENCODE, JPEG_DECODE}`).
-static NAVI48_VIDEO: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-pub(crate) fn publish_navi48_video(proven: u8) {
-    NAVI48_VIDEO.store(proven, core::sync::atomic::Ordering::Release);
+#[derive(Clone, Copy)]
+struct Navi48MediaInfo {
+    proven: u8,
+    vcn_firmware: Option<u32>,
+}
+static NAVI48_MEDIA: narf_lib::sync::IrqSafeSpinLock<Navi48MediaInfo> =
+    narf_lib::sync::IrqSafeSpinLock::new(Navi48MediaInfo {
+        proven: 0,
+        vcn_firmware: None,
+    });
+/// OWNER publishes current native media evidence together, after its
+/// retained PSP image and client transport are proven. Reset withdraws both
+/// before its first await. A VCN transport proof need not claim a codec.
+pub(crate) fn publish_navi48_media(proven: u8, vcn_firmware: Option<u32>) {
+    *NAVI48_MEDIA.lock() = Navi48MediaInfo {
+        proven,
+        vcn_firmware,
+    };
 }
 /// `AMDGPU_INFO_VIDEO_CAPS` (`soc24_query_video_codecs`) for Navi48.
 fn video_caps(snap: &Snapshot, kind: u32, proven: u8) -> Result<Vec<u8>, FsError> {
@@ -762,13 +791,16 @@ pub fn query_against(snap: &Snapshot, query: u32, payload: [u32; 4]) -> Result<V
         uapi::AMDGPU_INFO_READ_MMR_REG => read_mmr_reg(snap, *NAVI48_TOPOLOGY.lock(), payload),
         uapi::AMDGPU_INFO_TIMESTAMP => timestamp(snap, *NAVI48_CLOCK.lock()),
         // `query_fw { fw_type, ip_instance, index }`.
-        uapi::AMDGPU_INFO_FW_VERSION => firmware_version(snap, *NAVI48_FIRMWARE.lock(), payload[0]),
+        uapi::AMDGPU_INFO_FW_VERSION => {
+            let firmware = *NAVI48_FIRMWARE.lock();
+            let media = *NAVI48_MEDIA.lock();
+            firmware_version(snap, firmware, media.vcn_firmware, payload[0])
+        }
         // `query.video_cap.type` is word 0.
-        uapi::AMDGPU_INFO_VIDEO_CAPS => video_caps(
-            snap,
-            payload[0],
-            NAVI48_VIDEO.load(core::sync::atomic::Ordering::Acquire),
-        ),
+        uapi::AMDGPU_INFO_VIDEO_CAPS => {
+            let media = *NAVI48_MEDIA.lock();
+            video_caps(snap, payload[0], media.proven)
+        }
         // Everything else: `amdgpu_info_ioctl`'s default arm.
         _ => Err(FsError::InvalidData),
     }
@@ -1175,7 +1207,7 @@ mod topology_tests {
             (uapi::AMDGPU_INFO_FW_GFX_PFP, 0x11, 0x2f),
             (uapi::AMDGPU_INFO_FW_GFX_MEC, 0x12, 0x30),
         ]);
-        let fw = |t| firmware_version(&snap, firmware, t);
+        let fw = |t| firmware_version(&snap, firmware, None, t);
         if fw(uapi::AMDGPU_INFO_FW_GFX_MEC)
             != Ok(as_bytes(&uapi::DrmAmdgpuInfoFirmware {
                 ver: 0x12,
@@ -1183,8 +1215,8 @@ mod topology_tests {
             }))
             || fw(uapi::AMDGPU_INFO_FW_GFX_ME).is_err()
             || fw(uapi::AMDGPU_INFO_FW_VCN) != Err(FsError::InvalidData)
-            || firmware_version(&snap, None, uapi::AMDGPU_INFO_FW_GFX_ME).is_ok()
-            || firmware_version(&other, firmware, uapi::AMDGPU_INFO_FW_GFX_ME).is_ok()
+            || firmware_version(&snap, None, None, uapi::AMDGPU_INFO_FW_GFX_ME).is_ok()
+            || firmware_version(&other, firmware, None, uapi::AMDGPU_INFO_FW_GFX_ME).is_ok()
         {
             return TestResult::Fail("FW_VERSION");
         }
@@ -1193,6 +1225,79 @@ mod topology_tests {
     kernel_test_in!(
         "drivers/gpu/gfx12",
         gfx12_info_answers_mesa_firmware_and_register_queries
+    );
+
+    /// Linux amdgpu_vcn_setup_ucode stores the common header's version;
+    /// amdgpu_firmware_info(FW_VCN) returns it unchanged with feature=0.
+    /// Absence of current authenticated/proven publication remains EINVAL.
+    fn gfx12_info_vcn_firmware_uses_published_image_version_without_feature() -> TestResult {
+        use crate::amdgpu_navi48_ucode::{Image, Source};
+        use crate::amdgpu_rdna4::tests::Profile;
+        let mut bytes = crate::amdgpu_navi48_ucode::tests::container(Source::Vcn);
+        bytes[16..20].copy_from_slice(&0x1334_5678u32.to_le_bytes());
+        let image = Image::parse(Source::Vcn, &bytes).unwrap();
+        assert_eq!(image.version(), 0x1334_5678);
+        for profile in Profile::ALL {
+            let mut gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+            profile.apply(&mut gpu);
+            let snap = Snapshot::from_gpu(&gpu);
+            let ask = |version| firmware_version(&snap, None, version, uapi::AMDGPU_INFO_FW_VCN);
+            assert_eq!(ask(None), Err(FsError::InvalidData));
+            assert_eq!(
+                ask(Some(image.version())),
+                Ok(as_bytes(&uapi::DrmAmdgpuInfoFirmware {
+                    ver: 0x1334_5678,
+                    feature: 0,
+                }))
+            );
+            // Zero in an accepted header is a real value; None is absence.
+            assert_eq!(
+                ask(Some(0)),
+                Ok(as_bytes(&uapi::DrmAmdgpuInfoFirmware {
+                    ver: 0,
+                    feature: 0
+                }))
+            );
+            assert_eq!(ask(None), Err(FsError::InvalidData)); // withdrawn publication
+            assert!(video_caps(&snap, uapi::AMDGPU_INFO_VIDEO_CAPS_DECODE, 0)
+                .unwrap()
+                .iter()
+                .all(|v| *v == 0)); // FW metadata grants no codec direction
+            let mut missing = snap.clone();
+            missing
+                .ip_blocks
+                .retain(|ip| ip.hw_id != amdgpu_discovery::HW_ID_VCN);
+            assert_eq!(
+                firmware_version(
+                    &missing,
+                    None,
+                    Some(image.version()),
+                    uapi::AMDGPU_INFO_FW_VCN
+                ),
+                Err(FsError::InvalidData)
+            );
+            let mut unsupported = snap;
+            unsupported
+                .ip_blocks
+                .iter_mut()
+                .find(|ip| ip.hw_id == amdgpu_discovery::HW_ID_VCN)
+                .unwrap()
+                .major = 6;
+            assert_eq!(
+                firmware_version(
+                    &unsupported,
+                    None,
+                    Some(image.version()),
+                    uapi::AMDGPU_INFO_FW_VCN
+                ),
+                Err(FsError::InvalidData)
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/gfx12",
+        gfx12_info_vcn_firmware_uses_published_image_version_without_feature
     );
 
     /// The reference clock comes from smu_info, and on Navi and later from

@@ -38,6 +38,7 @@ fn session() -> (Pool, Session<Fake>) {
             gfx_state: GfxLoadState::Absent,
             gfx_status: None,
             media_firmware: MediaFirmware::default(),
+            gfx12_vcn_version: None,
             fb_base: 0x8_0000_0000,
             fb_offset: 0x1_0000_0000,
         },

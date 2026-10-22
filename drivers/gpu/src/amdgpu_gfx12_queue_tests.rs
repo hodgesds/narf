@@ -60,6 +60,8 @@ struct Fake {
     shader_corrupt: bool,
     shader_overrun: bool,
     shader_skip_fence: bool,
+    expect_gang_staged: bool,
+    gang_fail_after_first: bool,
 }
 impl Fake {
     /// Independent PM4/ISA model for the small proof kernel. Only the
@@ -415,9 +417,21 @@ impl Io for Fake {
                 6 => 1,
                 _ => panic!("wrong CP doorbell"),
             };
+            if self.expect_gang_staged {
+                for base in [0, 3072] {
+                    assert_eq!(
+                        self.memory[base + 512] >> 30,
+                        3,
+                        "both frames staged before first consumer starts"
+                    );
+                }
+            }
             self.bells.push(offset);
             if self.complete {
                 self.execute_jobs(pipe, v);
+            }
+            if self.gang_fail_after_first {
+                self.regs.insert(0x60000 + 0xc3 * 4, u32::MAX);
             }
             return;
         }
@@ -526,6 +540,8 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             shader_corrupt: false,
             shader_overrun: false,
             shader_skip_fence: false,
+            expect_gang_staged: false,
+            gang_fail_after_first: false,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -1580,4 +1596,114 @@ fn gfx12_client_fences_reject_device_loss_and_revocation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_client_fences_reject_device_loss_and_revocation
+);
+
+fn pair_jobs() -> [Job; 2] {
+    core::array::from_fn(|i| {
+        let mut job = Job::new(
+            (i + 1) as u8,
+            0x47,
+            0x1234_0007,
+            &[(0x1234_0000 + i as u64 * 4096, 8)],
+        )
+        .unwrap();
+        job.flush = true;
+        job.map_pasid = true;
+        job.ctx_switch = true;
+        job.mem_sync = true;
+        job
+    })
+}
+fn gfx12_gang_admits_both_consumers_before_any_publication() -> TestResult {
+    let (_pool, mut e, _, _, _) = shader_ready();
+    let initial = e.io.memory.clone();
+    let bells = e.io.bells.len();
+    let cursors = e.job_wptr;
+    e.job_wptr[1] += 1024;
+    assert_eq!(e.prepare_gang(pair_jobs()).err(), Some(Error::Busy));
+    assert_eq!(e.io.memory, initial);
+    assert_eq!(e.io.bells.len(), bells);
+    e.job_wptr = cursors;
+    let mut malformed = pair_jobs();
+    malformed[1].vmid = 0;
+    assert_eq!(e.prepare_gang(malformed).err(), Some(Error::Invalid));
+    assert_eq!(e.io.memory, initial);
+    assert_eq!(e.io.bells.len(), bells);
+    let prepared = e.prepare_gang(pair_jobs()).unwrap();
+    assert_eq!(prepared.sequences(), [1, 1]);
+    assert_eq!(e.job_wptr, cursors);
+    assert_eq!(e.io.memory, initial);
+    assert_eq!(e.io.bells.len(), bells);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_gang_admits_both_consumers_before_any_publication
+);
+fn gfx12_gang_stages_both_and_publishes_follower_before_either_leader() -> TestResult {
+    for leader in [Pipe::Graphics, Pipe::Compute] {
+        let (_pool, mut e, _, _, _) = shader_ready();
+        let bells = e.io.bells.len();
+        let prepared = e.prepare_gang(pair_jobs()).unwrap();
+        e.io.expect_gang_staged = true;
+        e.publish_gang(prepared, leader).unwrap();
+        let order = if leader == Pipe::Graphics {
+            [6, 0x116]
+        } else {
+            [0x116, 6]
+        };
+        assert_eq!(&e.io.bells[bells..], &order);
+        assert_eq!(e.job_wptr, [768; 2]);
+        assert_eq!(e.job_seq, [1; 2]);
+        assert_eq!(e.completed_job(Pipe::Graphics), Ok(1));
+        assert_eq!(e.completed_job(Pipe::Compute), Ok(1));
+        assert_eq!(e.io.job_ibs.len(), 2);
+        assert_eq!(e.io.job_hdp.len(), 2);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_gang_stages_both_and_publishes_follower_before_either_leader
+);
+fn gfx12_gang_partial_publication_freezes_both_reserved_slots() -> TestResult {
+    let (pool, mut e, _, _, _) = shader_ready();
+    let bells = e.io.bells.len();
+    let prepared = e.prepare_gang(pair_jobs()).unwrap();
+    e.io.gang_fail_after_first = true;
+    assert_eq!(
+        e.publish_gang(prepared, Pipe::Graphics),
+        Err(Error::DeviceGone)
+    );
+    assert_eq!(&e.io.bells[bells..], &[6]);
+    assert_eq!(e.job_wptr, [768; 2]);
+    assert_eq!(e.job_seq, [1; 2]);
+    assert!(matches!(e.state, State::Failed(_)));
+    assert_eq!(e.submit(Pipe::Graphics, pair_jobs()[0]), Err(Error::Busy));
+    assert_eq!(e.submit(Pipe::Compute, pair_jobs()[1]), Err(Error::Busy));
+    drop(e);
+    assert_eq!(
+        pool.available(),
+        0,
+        "uncertain native ring memory cannot be recycled"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_gang_partial_publication_freezes_both_reserved_slots
+);
+fn gfx12_gang_rejects_changed_owner_cursors_before_exposing_peer() -> TestResult {
+    let (_pool, mut e, _, _, _) = shader_ready();
+    let prepared = e.prepare_gang(pair_jobs()).unwrap();
+    e.submit(Pipe::Graphics, pair_jobs()[0]).unwrap();
+    let bells = e.io.bells.len();
+    assert_eq!(e.publish_gang(prepared, Pipe::Compute), Err(Error::Invalid));
+    assert_eq!(e.io.bells.len(), bells);
+    assert_eq!(e.job_wptr[1], 512);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_gang_rejects_changed_owner_cursors_before_exposing_peer
 );

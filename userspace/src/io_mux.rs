@@ -26,10 +26,10 @@ pub struct EventFd {
     semaphore: bool,
     /// Durable per-fd readiness cell — the SOLE readiness mechanism (there is no
     /// edge token). Mirrors POLL_IN (counter > 0) and POLL_OUT (counter < MAX-1);
-    /// every counter change publishes the new level via `set` and fires the
-    /// wait-queue via `notify` (see [`EventFd::sync_readiness`]), which wakes
-    /// armed poll/epoll waiters — including an EPOLLET consumer on a same-level
-    /// write.
+    /// every counter change publishes the new level via `set`; same-level write
+    /// events additionally fire `notify` (see [`EventFd::sync_readiness`]). This
+    /// wakes armed poll/epoll waiters, including an EPOLLET consumer on another
+    /// write while the counter remains readable.
     readiness: narf_lib::readiness::Readiness,
 }
 
@@ -46,20 +46,23 @@ impl EventFd {
         })
     }
 
-    /// Recompute the durable readiness cell from the current counter and publish
-    /// the transition. `set` publishes the level and wakes waiters on a rising
-    /// edge; `notify(event & add)` then fires the wait-queue for the just-changed
-    /// direction UNCONDITIONALLY so an EPOLLET consumer re-fires even when a write
-    /// lands on an already-readable counter. `event` is the direction the caller
-    /// changed: POLL_IN on a write, POLL_OUT on a read.
-    fn sync_readiness(&self, event: u32) {
+    /// Recompute the durable readiness cell from the current counter. `set`
+    /// publishes the level and wakes waiters on a rising edge. When the caller
+    /// reports a same-level event, `notify` fires the wait queue explicitly so
+    /// an EPOLLET consumer observes another write to an already-readable
+    /// counter. Avoid notifying after a rising edge: `set` already delivered
+    /// that event, and a second callback only relists the fd and wakes another
+    /// shared-epoll waiter for the same write.
+    fn sync_readiness(&self, event: u32, same_level_event: bool) {
         let c = self.counter.load(Ordering::Acquire);
         let readable = c > 0;
         let writable = c < u64::MAX - 1;
         let add = (if readable { POLL_IN } else { 0 }) | (if writable { POLL_OUT } else { 0 });
         let clear = (if readable { 0 } else { POLL_IN }) | (if writable { 0 } else { POLL_OUT });
         self.readiness.set(add, clear);
-        self.readiness.notify(event & add);
+        if same_level_event {
+            self.readiness.notify(event & add);
+        }
     }
 }
 
@@ -109,7 +112,9 @@ impl FileOps for EventFd {
                 }
                 (cur, cur >= u64::MAX - 1)
             };
-            self.sync_readiness(POLL_OUT);
+            // A read does not create a new writable edge unless the counter
+            // was saturated; that false→true transition is handled by `set`.
+            self.sync_readiness(POLL_OUT, false);
             buf[..8].copy_from_slice(&v.to_le_bytes());
             Ok(8)
         })
@@ -160,7 +165,10 @@ impl FileOps for EventFd {
             // starves the actual producer). The cell wake above is the correct
             // targeted path now that poll+epoll both arm cells, so the broadcast
             // is dropped.
-            self.sync_readiness(POLL_IN);
+            // A write to an already-readable counter is a same-level event and
+            // needs an explicit notify. Empty→readable is a rising edge already
+            // woken exactly once by `set`.
+            self.sync_readiness(POLL_IN, cur != 0);
             Ok(8)
         })
     }

@@ -13,6 +13,8 @@ struct Fake {
     writes: Vec<(u64, u32)>,
     edid: Vec<u8>,
     scdc: [u8; 256],
+    mccs: mccs::tests::Monitor,
+    stall_vendor: bool,
     fifo: Vec<u8>,
     cursor: usize,
     segment: usize,
@@ -75,8 +77,11 @@ impl Io for Fake {
                 self.regs.insert(reg, v);
             }
             0x1eb2 if v & 1 != 0 => {
-                assert_eq!(v, 0x80030001, "wrong EDID read-buffer index");
-                self.cursor = 3;
+                assert!(
+                    v == 0x80030001 || v == 0x80010001,
+                    "wrong read-buffer index"
+                );
+                self.cursor = ((v >> 16) & 0xff) as usize;
             }
             0x1eb2 => {
                 if v & 0x80000000 != 0 {
@@ -99,6 +104,19 @@ impl Io for Fake {
                     assert_ne!(self.regs[&0x291d] & (1 << (12 + port)), 0);
                     let mut nack = self.nack;
                     match self.fifo.as_slice() {
+                        [0x6e, body @ ..] => {
+                            assert_eq!(self.regs[&0x1eae], (body.len() as u32) << 16 | 0x3100);
+                            assert_eq!(v & 0x00300000, 0);
+                            self.mccs.write(body);
+                        }
+                        [0x6f] => {
+                            let len = (self.regs[&0x1eae] >> 16) as usize;
+                            assert_eq!(self.regs[&0x1eae] & 0xffff, 0x3101);
+                            assert_eq!(v & 0x00300000, 0);
+                            let mut b = [0; 38];
+                            self.mccs.read(&mut b[..len]);
+                            self.fifo.extend_from_slice(&b[..len]);
+                        }
                         [0x60, segment] => {
                             assert_eq!(self.regs[&0x1eae], 0x13100);
                             assert_eq!(v & 0x00300000, 0);
@@ -158,6 +176,9 @@ impl Io for Fake {
         }
     }
     async fn delay(&mut self, _: u64) {
+        if self.stall_vendor && !self.mccs.requests.is_empty() {
+            core::future::pending::<()>().await;
+        }
         narf_scheduler::yield_now().await;
     }
 }
@@ -195,6 +216,8 @@ fn fixture(blocks: usize) -> Engine<Fake> {
             writes: Vec::new(),
             edid,
             scdc: [0; 256],
+            mccs: Default::default(),
+            stall_vendor: false,
             fifo: Vec::new(),
             cursor: 0,
             segment: 7,
@@ -420,4 +443,53 @@ fn dcn4_ddc_scdc_reads_and_writes_single_registers_at_0x54() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-ddc",
     dcn4_ddc_scdc_reads_and_writes_single_registers_at_0x54
+);
+
+fn dcn4_ddcci_uses_raw_transactions_and_retains_cancelled_claim() -> TestResult {
+    let mut e = fixture(1);
+    let before = e.io.regs.clone();
+    let proof = run(e.mccs(2, 101, mccs::tests::metadata())).unwrap();
+    assert!(proof.range(101, mccs::tests::metadata()).is_some());
+    assert_eq!(e.io.mccs.value, 0x0101);
+    assert_eq!(e.state, State::Ready);
+    assert!(e.saved.is_none());
+    for reg in [0x28ff, 0x291d, 0x28d0, 0x28d4, 0x28dc] {
+        assert_eq!(e.io.regs[&reg], before[&reg]);
+    }
+    // A malformed but completely read message is a local refusal: release
+    // the selected channel and leave unrelated DDC/SCDC users usable.
+    e.io.mccs.corrupt = true;
+    assert_eq!(
+        run(e.mccs(0, 102, mccs::tests::metadata())),
+        Err(Error::InvalidMccs)
+    );
+    assert_eq!(e.state, State::Ready);
+    assert!(e.saved.is_none());
+    e.io.mccs.corrupt = false;
+    assert!(run(e.scdc(1, 0x10, Some(1))).is_ok());
+    let mut e = fixture(1);
+    e.io.stall_vendor = true;
+    {
+        let mut f = alloc::boxed::Box::pin(e.mccs(2, 103, mccs::tests::metadata()));
+        let mut cx = Context::from_waker(Waker::noop());
+        // Step beyond acquisition to the first actual vendor request.
+        for _ in 0..32 {
+            assert!(f.as_mut().poll(&mut cx).is_pending());
+        }
+    }
+    assert_eq!(e.state, State::Reading);
+    assert!(e.saved.is_some());
+    assert!(!e.io.mccs.requests.is_empty());
+    let writes = e.io.writes.len();
+    assert_eq!(run(e.edid(0)), Err(Error::Busy));
+    assert_eq!(
+        run(e.mccs(1, 104, mccs::tests::metadata())),
+        Err(Error::Busy)
+    );
+    assert_eq!(e.io.writes.len(), writes);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mccs",
+    dcn4_ddcci_uses_raw_transactions_and_retains_cancelled_claim
 );

@@ -25,6 +25,7 @@
 
 use core::sync::atomic::Ordering;
 
+use narf_memory::ioremap::MmioAttrs;
 use narf_memory::PhysAddr;
 
 use crate::device::{BusDevice, BusKind};
@@ -69,6 +70,8 @@ pub enum BarError {
     NotPcie,
     /// BAR is unimplemented or unprogrammed (size == 0).
     Unimplemented,
+    /// Kernel mapping failed, including a conflicting memory attribute.
+    MappingFailed,
 }
 
 /// Type-0 PCIe configuration-space layout, BAR window.
@@ -202,9 +205,8 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
 /// directly but always maps it first. Uncached (`Device`) for control
 /// BARs; write-combining for prefetchable windows (framebuffers/ROMs).
 ///
-/// If `ioremap` fails (or the BAR is unprogrammed), `virt` falls back
-/// to the raw phys — correct for the low BARs the boot map already
-/// covers, and no worse than the pre-ioremap behaviour otherwise.
+/// An unprogrammed BAR is refused. Mapping failures return `MappingFailed`;
+/// a physical-address fallback cannot preserve the requested memory type.
 ///
 /// # Safety
 /// See `read_bar`: `device` must be PCIe and the caller must hold
@@ -212,6 +214,35 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
 pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarError> {
     // SAFETY: forwarded.
     let bar = unsafe { read_bar(device, idx)? };
+    let attrs = match bar.kind {
+        BarKind::Mmio32 { prefetchable: true } | BarKind::Mmio64 { prefetchable: true } => {
+            MmioAttrs::WriteCombining
+        }
+        _ => MmioAttrs::Device,
+    };
+    // SAFETY: the caller owns this decoded BAR and its config space.
+    unsafe { map_decoded_bar(bar, attrs) }
+}
+
+/// Map a BAR containing control registers with Device attributes.
+///
+/// The prefetchable bit does not authorize merging VirtIO configuration,
+/// notification, ISR or MSI-X table accesses. Owners of such registers use
+/// this entry point from their first mapping, including every later MSI-X
+/// access to the same BAR. Identical mappings reuse the typed ioremap VA;
+/// a conflicting prior mapping still returns `MappingFailed`.
+///
+/// # Safety
+/// Same device/config-space ownership contract as [`map_bar`].
+pub unsafe fn map_bar_control(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarError> {
+    // SAFETY: forwarded device/config-space ownership.
+    let bar = unsafe { read_bar(device, idx)? };
+    // SAFETY: this decoded BAR belongs to the caller's device.
+    unsafe { map_decoded_bar(bar, MmioAttrs::Device) }
+}
+
+/// Install one typed mapping for a decoded, exclusively owned device BAR.
+unsafe fn map_decoded_bar(bar: Bar, attrs: MmioAttrs) -> Result<MmioRegion, BarError> {
     if matches!(bar.kind, BarKind::Io) {
         // I/O-port BARs aren't MMIO; callers wanting them go through
         // `read_bar` and use `outb/inb` directly.
@@ -219,37 +250,20 @@ pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarErro
     }
 
     let phys = bar.phys.raw();
-    // Unprogrammed BAR (phys == 0) or zero-size: nothing to ioremap;
-    // keep the raw phys so behaviour matches the old identity-map path.
-    let virt = if phys == 0 || bar.size == 0 {
-        phys
-    } else {
-        use narf_memory::ioremap::{ioremap, MmioAttrs};
+    if phys == 0 || bar.size == 0 {
+        return Err(BarError::Unimplemented);
+    }
+    let virt = {
+        use narf_memory::ioremap::ioremap;
         // A BAR base is naturally aligned to its size (>= 16 bytes) but not
         // necessarily to a page. `ioremap` maps the containing pages and
         // `va()` gives back this BAR's first byte.
-        let attrs = match bar.kind {
-            BarKind::Mmio32 { prefetchable: true } | BarKind::Mmio64 { prefetchable: true } => {
-                // Prefetchable window (framebuffer/ROM): write-combining on
-                // x86 (PAT) coalesces writes; aarch64's MmioAttrs has no WC
-                // variant, so fall back to write-back (cacheable) there.
-                #[cfg(target_arch = "x86_64")]
-                {
-                    MmioAttrs::WriteCombining
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    MmioAttrs::WriteBack
-                }
-            }
-            _ => MmioAttrs::Device,
-        };
         // SAFETY: `device` ownership is the caller's contract (see fn
         // safety); ioremap installs the VA→phys PTEs with the right memtype
         // and rounds the window out to whole pages.
         match unsafe { ioremap(phys, bar.size, attrs) } {
             Ok(m) => m.va(),
-            Err(_) => phys,
+            Err(_) => return Err(BarError::MappingFailed),
         }
     };
 

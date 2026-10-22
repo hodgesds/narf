@@ -9,6 +9,11 @@ impl Submitter {
         if *READ_GENERATION.lock() != self.generation {
             return;
         }
+        let gang_busy = self.gangs.lock().busy();
+        if gang_busy {
+            self.abort_gangs("GC12 gang fault; independent replay forbidden");
+            return;
+        }
         // Freeze every ledger before the first await/reset. Synchronous
         // readers also freeze on BLOCKED; reset-test fences retire nothing.
         {
@@ -17,6 +22,9 @@ impl Submitter {
                 watch.freeze();
             }
         }
+        // Cancellation before media's later retirement must not leave old
+        // proof metadata visible while the coordinated recovery is frozen.
+        crate::amdgpu_info::publish_navi48_media(0, None);
         let result = async {
             let boot = owner
                 .as_mut()
@@ -117,6 +125,8 @@ impl Submitter {
                 }
             }
             *self.contexts.lock() = [(0, 0); RINGS];
+            // All media proofs and every healthy replay committed under OWNER.
+            media_clients::activate_media(boot);
             Ok(scope)
         }
         .await;

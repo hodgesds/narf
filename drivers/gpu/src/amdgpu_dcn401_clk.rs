@@ -1,6 +1,7 @@
-//! Navi48 DAL display clocks, following Linux dcn401_clk_mgr{,_smu_msg}.c,
+//! RDNA4 DAL display clocks, following Linux dcn401_clk_mgr{,_smu_msg}.c,
 //! dcn401_smu14_driver_if.h and dalsmc.h. This mailbox is separate from PPSMC.
-//! Requires retired display consumers; no active-mode clock transitions yet.
+//! Startup/release require retired consumers; live updates retain the display
+//! owner's explicit consumer and DPP DTO coordination.
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_psp_ring::bank, amdgpu_smu_navi48 as smu,
 };
@@ -230,7 +231,7 @@ pub struct Status {
     pub applied: Option<Applied>,
     /// What the bandwidth sequence last programmed (clk_mgr's `clks`).
     pub bandwidth: Bandwidth,
-    /// DAL messages PMFW refused whose result Linux ignores.
+    /// DAL messages PMFW refused or timed out whose result Linux ignores.
     pub ignored: Ignored,
 }
 impl Status {
@@ -385,6 +386,10 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     layout: Layout,
     status: Status,
+    /// Only an ignored-result message that we actually sent may leave an
+    /// unanswered transaction reusable. Linux waits, then replaces it on the
+    /// next send; an unknown inherited busy mailbox must still fail closed.
+    unanswered_ignored: bool,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -421,20 +426,22 @@ impl<I: Io> Engine<I> {
             delay().await;
         }
     }
-    async fn command_until(
+    async fn send_until(
         &mut self,
         message: u32,
         parameter: u32,
         deadline: narf_time::Deadline,
-    ) -> Result<u32, Error> {
+    ) -> Result<(), Error> {
         // dcn401_smu_send_msg_with_param only waits for a nonzero response
         // (whatever an earlier message, this owner's or not, left there, a
-        // refusal included) and then sends. Unlike Linux, which sends anyway
-        // after two seconds, a register still zero at the deadline fails
-        // before any write.
-        self.settled(deadline).await?;
-        if deadline.expired() {
-            return Err(Error::Timeout);
+        // refusal included) and then sends. Linux also sends after a timeout.
+        // Permit that only for a known unanswered ignored-result transaction,
+        // never an inherited busy mailbox or an interrupted required result.
+        match self.settled(deadline).await {
+            Ok(_) if !deadline.expired() => {}
+            Ok(_) | Err(Error::Timeout) if self.unanswered_ignored => {}
+            Ok(_) => return Err(Error::Timeout),
+            Err(e) => return Err(e),
         }
         let base = self.layout.mp1;
         self.access(|io| {
@@ -443,14 +450,30 @@ impl<I: Io> Engine<I> {
             io.write(base + u64::from(MESSAGE) * 4, message);
             Ok(())
         })?;
+        self.unanswered_ignored = false;
+        Ok(())
+    }
+    async fn response_until(&mut self, deadline: narf_time::Deadline) -> Result<u32, Error> {
         let result = self.settled(deadline).await?;
         if result != 1 {
             return Err(Error::Rejected(result));
         }
-        self.access(|io| checked(io.read(base + u64::from(ARGUMENT) * 4)))
+        let at = self.layout.mp1 + u64::from(ARGUMENT) * 4;
+        self.access(|io| checked(io.read(at)))
+    }
+    async fn command_until(
+        &mut self,
+        message: u32,
+        parameter: u32,
+        deadline: narf_time::Deadline,
+    ) -> Result<u32, Error> {
+        self.send_until(message, parameter, deadline).await?;
+        self.response_until(deadline).await
     }
     async fn command(&mut self, message: u32, parameter: u32) -> Result<u32, Error> {
-        self.command_until(message, parameter, narf_time::Deadline::after_ms(2000))
+        self.send_until(message, parameter, narf_time::Deadline::after_ms(2000))
+            .await?;
+        self.response_until(narf_time::Deadline::after_ms(2000))
             .await
     }
     async fn start(
@@ -613,18 +636,34 @@ impl<I: Io> Engine<I> {
     }
     /// dcn401_smu_send_msg_with_param where the caller ignores the result:
     /// PMFW's refusal of the sent message is recorded (`Status::ignored`)
-    /// and logged; a transport failure (nothing sent, or no answer) still
-    /// fails. `command_until` reports `Rejected` only after its write, so
-    /// an unsent message is never counted as refused.
-    async fn command_ignored(&mut self, message: u32, parameter: u32) -> Result<(), Error> {
-        match self.command(message, parameter).await {
-            Ok(_) => Ok(()),
-            Err(e @ Error::Rejected(_)) => {
-                self.ignore(message, e);
-                Ok(())
+    /// and logged, as is a post-write timeout. The next send may replace that
+    /// known unanswered transaction after its bounded readiness wait, as in
+    /// Linux. A pre-write failure and revoked/removed authority still fail;
+    /// an unsent message is never counted as ignored.
+    async fn optional_result(
+        &mut self,
+        message: u32,
+        parameter: u32,
+    ) -> Result<Result<u32, Error>, Error> {
+        self.send_until(message, parameter, narf_time::Deadline::after_ms(2000))
+            .await?;
+        match self
+            .response_until(narf_time::Deadline::after_ms(2000))
+            .await
+        {
+            Ok(value) => Ok(Ok(value)),
+            Err(e @ (Error::Rejected(_) | Error::Timeout)) => {
+                self.unanswered_ignored = e == Error::Timeout;
+                Ok(Err(e))
             }
             Err(e) => Err(e),
         }
+    }
+    async fn command_ignored(&mut self, message: u32, parameter: u32) -> Result<(), Error> {
+        if let Err(e) = self.optional_result(message, parameter).await? {
+            self.ignore(message, e);
+        }
+        Ok(())
     }
     fn ignore(&mut self, message: u32, error: Error) {
         let i = &mut self.status.ignored;
@@ -642,8 +681,15 @@ impl<I: Io> Engine<I> {
     async fn hard_min_settled_ignored(&mut self, message: u32, clock: Clock) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_ms(1000);
         loop {
-            let bits = match self.command(0x15, 0).await {
+            let bits = match self.optional_result(0x15, 0).await? {
                 Ok(bits) => bits,
+                Err(Error::Timeout) => {
+                    // The result of the floor's acknowledgement is unread by
+                    // the clock manager as well. A status request was sent:
+                    // keep that fact so the following void step can proceed.
+                    self.ignore(message, Error::HardMinTimeout(clock));
+                    return Ok(());
+                }
                 Err(Error::Rejected(_)) => 0,
                 Err(e) => return Err(e),
             };
@@ -834,8 +880,9 @@ impl<I: Io> Engine<I> {
     /// sequence without planes (UCLK and FCLK P-state support set, as
     /// total_plane_count == 0 forces: the deep-sleep DCFCLK zero, switching
     /// allowed, the active UCLK/FCLK floors at their lowest levels and the
-    /// idle ones zero). Every result is unread, as in Linux. DISPCLK, DPPCLK
-    /// and DTBCLK keep their floors, which the next `prepare` sets again.
+    /// idle ones zero), then the display clock sequence: DTBCLK, DISPCLK,
+    /// DPPCLK at their first levels. No DTO update is needed without streams.
+    /// The bandwidth results are unread; display rates must be acknowledged.
     /// Every consumer must be retired. Nothing when nothing was applied or
     /// it already ran.
     async fn release(&mut self) -> Result<Applied, Error> {
@@ -872,16 +919,36 @@ impl<I: Io> Engine<I> {
             };
             let (bandwidth, floor) = self.bandwidth(none, true, false).await?;
             self.status.bandwidth = bandwidth;
+            let mut next = current;
+            // dcn401_build_update_display_clocks_sequence with dtbclk_en
+            // false and dml21_init_min_clocks_for_dc_state's first levels.
+            // With every consumer retired the DTO/dentist steps have no live
+            // pipe to update. Preserve the actual frequencies PMFW returns.
+            for (clock, requested, actual) in [
+                (Clock::Dtb, &mut next.request.dtb_khz, &mut next.dtb_khz),
+                (
+                    Clock::Display,
+                    &mut next.request.display_khz,
+                    &mut next.display_khz,
+                ),
+                (Clock::Dpp, &mut next.request.dpp_khz, &mut next.dpp_khz),
+            ] {
+                let minimum = levels.range(clock).min_khz();
+                if should_set(true, minimum, *requested) {
+                    *actual = self.hard_min(clock, minimum).await?;
+                    *requested = minimum;
+                }
+            }
             Ok(Applied {
                 request: Request {
                     displays: 0,
                     deep_sleep_dcfclk_khz: 0,
-                    ..current.request
+                    ..next.request
                 },
                 dcf_floor_khz: dcf.min_khz().min(current.dcf_floor_khz),
                 memory_floor_khz: floor,
                 uclk_pstate: bandwidth.uclk_pstate,
-                ..current
+                ..next
             })
         }
         .await;
@@ -901,12 +968,22 @@ impl<I: Io> Engine<I> {
         if !matches!(self.status.state, State::Ready | State::Applied) {
             return Err(Error::Busy);
         }
+        let previous = self.status.state;
+        self.status.state = State::Applying;
         // dcn401_smu_set_dram_addr_high/low and
-        // dcn401_smu_transfer_wm_table_dram_2_smu return nothing.
-        self.command_ignored(5, (address >> 32) as u32).await?;
-        self.command_ignored(6, address as u32).await?;
-        self.command_ignored(8, 2).await?;
-        Ok(())
+        // dcn401_smu_transfer_wm_table_dram_2_smu return nothing. Retain the
+        // applying state on cancellation so a partial mailbox is not reused.
+        let result = async {
+            self.command_ignored(5, (address >> 32) as u32).await?;
+            self.command_ignored(6, address as u32).await?;
+            self.command_ignored(8, 2).await
+        }
+        .await;
+        self.status.state = match result {
+            Ok(()) => previous,
+            Err(e) => State::Failed(e),
+        };
+        result
     }
     async fn prepare(&mut self, request: Request) -> Result<Applied, Error> {
         if !matches!(self.status.state, State::Ready | State::Applied) {
@@ -1062,6 +1139,7 @@ impl ClockManager {
             io: Mmio(gpu.regs),
             authority,
             layout,
+            unanswered_ignored: false,
             status: Status {
                 state: State::Prepared,
                 levels: None,
@@ -1160,8 +1238,9 @@ impl ClockManager {
     }
     /// dcn401_update_clocks' optimize once no stream is left (`Engine::
     /// release`): NumOfDisplays(0), DCFCLK at its lowest level, UCLK
-    /// switching allowed with UCLK and FCLK at their lowest. Every consumer
-    /// must be retired. Failure or cancellation leaves the owner failed.
+    /// switching allowed with UCLK and FCLK at their lowest, then DTBCLK,
+    /// DISPCLK and DPPCLK at their first levels. Every consumer must be
+    /// retired. Failure or cancellation leaves the owner unusable.
     pub(crate) async fn release(&mut self, regs: MmioRegion) -> Result<Applied, Error> {
         if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
             return Err(Error::Invalid);
@@ -1181,7 +1260,9 @@ impl ClockManager {
     }
     /// Send the watermark range table PMFW reads at `address` (the GPU
     /// address of [`Self::wm_range_table`]'s bytes, written and flushed by
-    /// the caller), as dcn401_init_hw does once the clocks are known.
+    /// the caller), as dcn401_init_hw does once the clocks are known. Firmware
+    /// refusals/timeouts are recorded; authority errors or cancellation leave
+    /// the retained owner unusable.
     pub(crate) async fn notify_wm_ranges(
         &mut self,
         regs: MmioRegion,

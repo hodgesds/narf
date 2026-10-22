@@ -238,14 +238,38 @@ kernel_test_in!(
 
 /// Linux DC's DCN401 stream-encoder acquisition over add/remove sequences
 /// (tests/dcn401_stream_enc: harness.c documents the format): each
-/// stream's DIO stream encoder, HPO DP stream encoder and its link's HPO
-/// DP link encoder after its OTG master, and their release.
+/// stream's DIO stream encoder, HPO DP stream encoder, its link's HPO DP
+/// link encoder and its audio endpoint after its OTG master, and their
+/// release; then find_first_free_audio over every acquisition state.
 const ENCODER_VECTORS: &str = include_str!("../tests/dcn401_stream_enc/vectors.txt");
 
 fn dcn401_stream_encoder_acquisition_matches_linux() -> TestResult {
     let cur = DcState::new(4);
     let mut checked = 0;
     for line in ENCODER_VECTORS.lines().filter(|l| !l.starts_with('#')) {
+        if let Some(v) = line.strip_prefix("audio ") {
+            let Some((args, want)) = v.split_once(" = ") else {
+                return TestResult::Fail("audio line");
+            };
+            let f: alloc::vec::Vec<u8> = args.split(' ').filter_map(|x| x.parse().ok()).collect();
+            let [se, aud, id] = f[..] else {
+                return TestResult::Fail("audio args");
+            };
+            let mut state = DcState::new(4);
+            for i in 0..4 {
+                state.stream_enc_acquired[i] = se >> i & 1 != 0;
+                state.audio_acquired[i] = aud >> i & 1 != 0;
+            }
+            let got = state
+                .find_first_free_audio(id)
+                .map_or(String::from("-"), |a| alloc::format!("{a}"));
+            checked += 1;
+            if got != want {
+                let _ = writeln!(narf_console::Writer, "dcn401 audio: {line}: gave {got}");
+                return TestResult::Fail("audio acquisition differs from Linux");
+            }
+            continue;
+        }
         let Some((ops, results)) = line.strip_prefix("seq ").and_then(|l| l.split_once(" = "))
         else {
             return TestResult::Fail("vector line");
@@ -263,7 +287,7 @@ fn dcn401_stream_encoder_acquisition_matches_linux() -> TestResult {
             } else {
                 let f: alloc::vec::Vec<u8> =
                     op[1..].split('.').filter_map(|x| x.parse().ok()).collect();
-                let [s, link, engine, hpo] = f[..] else {
+                let [s, link, engine, hpo, audio] = f[..] else {
                     return TestResult::Fail("add op");
                 };
                 if !state.add_stream(&cur, s, &ScalesAnywhere) {
@@ -273,14 +297,16 @@ fn dcn401_stream_encoder_acquisition_matches_linux() -> TestResult {
                     link,
                     preferred_engine: engine,
                     hpo_dp: hpo == 1,
+                    audio: audio == 1,
                 };
                 let opt = |v: Option<u8>| v.map_or(String::from("-"), |v| alloc::format!("{v}"));
                 match state.map_stream_encoders(s, output) {
                     Some(e) => alloc::format!(
-                        "{}.{}.{}",
+                        "{}.{}.{}.{}",
                         e.stream_enc,
                         opt(e.hpo_dp_stream_enc),
-                        opt(e.hpo_dp_link_enc)
+                        opt(e.hpo_dp_link_enc),
+                        opt(e.audio)
                     ),
                     None => String::from("E"),
                 }
@@ -295,7 +321,7 @@ fn dcn401_stream_encoder_acquisition_matches_linux() -> TestResult {
             }
         }
     }
-    if checked < 5000 {
+    if checked < 6000 {
         return TestResult::Fail("vectors.txt lost its sequences");
     }
     TestResult::Pass
@@ -317,6 +343,7 @@ fn dcn401_hpo_dp_link_encoder_follows_the_link() -> TestResult {
         link: 0,
         preferred_engine: engine,
         hpo_dp: true,
+        audio: false,
     };
     for s in [5, 6] {
         if !state.add_stream(&cur, s, &ScalesAnywhere) {
@@ -329,6 +356,7 @@ fn dcn401_hpo_dp_link_encoder_follows_the_link() -> TestResult {
         stream_enc: 3,
         hpo_dp_stream_enc: Some(1),
         hpo_dp_link_enc: Some(0),
+        audio: None,
     };
     if a.map(|e| e.hpo_dp_link_enc) != Some(Some(0)) || b != Some(want_b) {
         return TestResult::Fail("one link encoder per link");
@@ -348,12 +376,14 @@ fn dcn401_hpo_dp_link_encoder_follows_the_link() -> TestResult {
             link: 1,
             preferred_engine: 1,
             hpo_dp: true,
+            audio: false,
         },
     );
     let want = StreamEncoders {
         stream_enc: 1,
         hpo_dp_stream_enc: Some(0),
         hpo_dp_link_enc: Some(1),
+        audio: None,
     };
     if sst != Some(want) {
         return TestResult::Fail("another link's encoder");

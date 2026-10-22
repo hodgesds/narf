@@ -623,6 +623,7 @@ impl Pcm {
         Ok(narf_filesystem::MmapBacking {
             frames: owner.frames(at, len)?,
             lifetime: Some(owner),
+            memory_type: narf_memory::MemoryType::WriteBack,
         })
     }
     pub(crate) fn validate_mmap(

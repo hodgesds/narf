@@ -414,7 +414,7 @@ impl<I: Io> Engine<I> {
     }
     /// vpg3_update_generic_info_packet(index, packet, immediate) on HPO
     /// stream encoder `stream`'s VPG.
-    async fn uhbr_packet(
+    pub(in crate::amdgpu_dcn401_otg) async fn uhbr_packet(
         &mut self,
         stream: u8,
         index: u32,
@@ -717,7 +717,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         let request = blank.timing.request;
-        if request.signal != Signal::HpoDisplayPort || request.ycbcr420 {
+        if request.signal != Signal::HpoDisplayPort || !request.encoding.is_rgb() {
             return Err(Error::Unsupported);
         }
         request.validate_clock(clock)?;

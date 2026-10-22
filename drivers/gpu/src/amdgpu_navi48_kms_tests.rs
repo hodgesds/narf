@@ -495,13 +495,14 @@ kernel_test_in!(
 );
 
 /// Every plane lists amdgpu_dm_plane_get_plane_formats' DCN4.0.1 order
-/// (rgb_formats, NV12, P010, then the FP16 formats) less RGBA8888 and the
-/// 16-bit UNORM orders, and every card it publishes carries it on its
+/// (rgb_formats, NV12, P010, then the FP16 formats) less RGBA8888 (which
+/// Linux's plane-info setup refuses), and every card carries it on its
 /// primaries and overlays with the GFX12 modifiers.
 fn navi48_kms_plane_formats_follow_amdgpu_dm() -> TestResult {
     let want = [
-        *b"XR24", *b"AR24", *b"XR30", *b"XB30", *b"AR30", *b"AB30", *b"XB24", *b"AB24", *b"RG16",
-        *b"NV12", *b"P010", *b"XR4H", *b"AR4H", *b"XB4H", *b"AB4H",
+        *b"XR24", *b"AR24", *b"XR30", *b"XB30", *b"AR30", *b"AB30", *b"XR48", *b"XB48", *b"AR48",
+        *b"AB48", *b"XB24", *b"AB24", *b"RG16", *b"NV12", *b"P010", *b"XR4H", *b"AR4H", *b"XB4H",
+        *b"AB4H",
     ]
     .map(u32::from_le_bytes);
     if PLANE_FORMATS != want {
@@ -705,6 +706,7 @@ fn navi48_kms_publishes_connector_max_bpc() -> TestResult {
     ];
     let props = |max_bpc: [bool; 2]| {
         max_bpc.map(|max_bpc| ConnectorProps {
+            color_format: false,
             vrr_capable: false,
             color: true,
             max_bpc,

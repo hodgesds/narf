@@ -125,16 +125,16 @@ fn navi48_mst_dsc_virtual_dpcd_passthrough_order() -> TestResult {
     if dsc.end_link_kbps != 5_400_000 * 4 / 10_000 * 7760
         || dsc.aux != DscAux::Port(CHILD_SINK)
         || dsc.passthrough != Some(CHILD_PORT)
-        || dsc.caps.max_slice_width != 5120
+        || dsc.caps.unwrap().max_slice_width != 5120
     {
         panic!("decoder {dsc:?}");
     }
     hub.remote_writes.clear();
-    run(set_rx(&mut mgr, &mut hub, &topology, &dsc, true)).unwrap();
+    run(set_rx(&mut mgr, &mut hub, &topology, &dsc, true, false)).unwrap();
     if !run(rx_enabled(&mut mgr, &mut hub, &topology, &dsc)).unwrap() {
         return TestResult::Fail("decoder enabled");
     }
-    run(set_rx(&mut mgr, &mut hub, &topology, &dsc, false)).unwrap();
+    run(set_rx(&mut mgr, &mut hub, &topology, &dsc, false, false)).unwrap();
     let writes: Vec<_> = hub
         .remote_writes
         .iter()
@@ -245,11 +245,13 @@ fn navi48_mst_dsc_port_support_mode_like_amdgpu_dm() -> TestResult {
     let mut hub = Hub::new();
     let (_, topology) = probed(&mut hub);
     let mut dsc = MstDsc {
-        caps: caps().unwrap(),
+        caps: caps(),
         aux: DscAux::Port(ROOT_SINK),
         passthrough: None,
         end_link_kbps: 0,
         branch_oui: 0,
+        synaptics: None,
+        pcon: None,
     };
     if !port_supports_mode(&FHD60, 8, &topology, ROOT_SINK, None, &HBR3X4)
         || port_supports_mode(&UHD144, 8, &topology, ROOT_SINK, None, &HBR3X4)
@@ -386,11 +388,13 @@ fn navi48_mst_dsc_streams_take_the_deepest_depth() -> TestResult {
     let budget = |_: Sink, _: &[(Sink, u16)]| u16::MAX;
     let pick = |decoder: [u8; 16], max_bpc: u8| {
         let mst = MstDsc {
-            caps: DscSinkCaps::parse(&decoder, &[0; 3]).unwrap(),
+            caps: DscSinkCaps::parse(&decoder, &[0; 3]),
             aux: DscAux::Port(ROOT_SINK),
             passthrough: None,
             end_link_kbps: 0,
             branch_oui: 0,
+            synaptics: None,
+            pcon: None,
         };
         let dsc_of = |s: Sink| (s == ROOT_SINK).then_some(mst);
         let max_bpc = |_: Sink| max_bpc;
@@ -638,11 +642,13 @@ fn navi48_mst_dsc_beside_running_streams_like_amdgpu_dm() -> TestResult {
     let mut hub = Hub::new();
     let (_, topology) = probed(&mut hub);
     let mst = MstDsc {
-        caps: DscSinkCaps::parse(&DECODER, &[0; 3]).unwrap(),
+        caps: DscSinkCaps::parse(&DECODER, &[0; 3]),
         aux: DscAux::Port(ROOT_SINK),
         passthrough: None,
         end_link_kbps: 0,
         branch_oui: 0,
+        synaptics: None,
+        pcon: None,
     };
     let dsc_of = |s: Sink| (s == ROOT_SINK || s == CHILD_SINK).then_some(mst);
     let max_bpc = |_: Sink| 8;
@@ -766,11 +772,13 @@ fn navi48_mst_dsc_affected_relight_keeps_the_search_order() -> TestResult {
     let sinks = topology.sinks();
     assert_eq!(sinks.len(), 3);
     let mst = MstDsc {
-        caps: DscSinkCaps::parse(&DECODER, &[0; 3]).unwrap(),
+        caps: DscSinkCaps::parse(&DECODER, &[0; 3]),
         aux: DscAux::Port(ROOT_SINK),
         passthrough: None,
         end_link_kbps: 0,
         branch_oui: 0,
+        synaptics: None,
+        pcon: None,
     };
     let max_bpc = |_: Sink| 8;
     let budget = |_: Sink, _: &[(Sink, u16)]| u16::MAX;
@@ -930,11 +938,13 @@ fn navi48_mst_dsc_affected_streams_like_amdgpu_dm() -> TestResult {
     let mut hub = Hub::new();
     let (_, topology) = probed(&mut hub);
     let mst = MstDsc {
-        caps: DscSinkCaps::parse(&DECODER, &[0; 3]).unwrap(),
+        caps: DscSinkCaps::parse(&DECODER, &[0; 3]),
         aux: DscAux::Port(ROOT_SINK),
         passthrough: None,
         end_link_kbps: 0,
         branch_oui: 0,
+        synaptics: None,
+        pcon: None,
     };
     let dsc_of = |s: Sink| (s == ROOT_SINK || s == CHILD_SINK).then_some(mst);
     let none = |_: Sink| None;
@@ -1030,4 +1040,740 @@ fn navi48_mst_dsc_affected_streams_like_amdgpu_dm() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-mst",
     navi48_mst_dsc_affected_streams_like_amdgpu_dm
+);
+
+/// Full native admission follows a fresh whole-link fairness calculation at
+/// every depth. The wide stream works only after single-stream Vmin ODM2;
+/// beside an independent running stream it must retry 8-bpc raw, rather
+/// than publishing the deeper DSC payload or rejecting the timing early.
+fn navi48_mst_final_admission_retries_complete_link_candidates() -> TestResult {
+    let mut hub = Hub::new();
+    // The raw 900 MHz RGB8 fallback needs 21.6 Gbit/s. The generic Hub's
+    // 2561-PBN Root port is narrower than this HBR3 x4 link, so declare
+    // the roomy end-to-end path this depth-fallback scenario requires.
+    hub.resources.insert((1, 1), (6000, 6000));
+    let (_, topology) = probed(&mut hub);
+    let mut decoder = MstDsc {
+        caps: DscSinkCaps::parse(&DECODER, &[0; 3]),
+        aux: DscAux::Port(ROOT_SINK),
+        passthrough: None,
+        end_link_kbps: 0,
+        branch_oui: 0,
+        synaptics: None,
+        pcon: None,
+    };
+    decoder.caps.as_mut().unwrap().max_slice_width = 2560;
+    let dsc_of = |s: Sink| (s == ROOT_SINK).then_some(decoder);
+    let ctx = MstDscContext {
+        topology: &topology,
+        dsc_of: &dsc_of,
+        max_dispclk_khz: 2_000_000,
+        max_bpc: &|_| 10,
+    };
+    let caps = modeset::DpCaps {
+        lanes: 4,
+        rate: crate::dp_link_training::LinkRate::Hbr3,
+        uhbr: 0,
+        fec: true,
+        dsc: None,
+    };
+    let devices = [(ROOT_SINK, uhd60_edid(3), u16::MAX)];
+    let mut chosen =
+        super::super::select_mst_dsc(0, caps, &devices, &|_| None, &|_, _| u16::MAX, &ctx, &[])
+            .unwrap()[0];
+    chosen.timing = crate::amdgpu_dml::Timing {
+        pixel_clock_khz: 900_000,
+        h_active: 5440,
+        h_total: 5600,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 3060,
+        v_total: 3200,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    let soc = crate::amdgpu_dcn401_dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    assert!(raw_supported(
+        &chosen.timing,
+        8,
+        topology.port(ROOT_SINK).unwrap().full_pbn,
+        &super::super::dsc_link(caps, soc.dispclk_max_khz).unwrap(),
+    ));
+    let normalize = |s: &mut [modeset::Selection]| {
+        super::super::refine_mst_link_payloads(&soc, 0, caps, &devices, &ctx, s, &[]).is_ok()
+    };
+    let (alone, plans) =
+        modeset::admit_selection_candidates_with(&soc, &[chosen], &[], true, &mut |s| normalize(s))
+            .unwrap();
+    assert_eq!(
+        (alone[0].depth, plans[0].pipes),
+        (otg::ColorDepth::Bpc10, 2)
+    );
+    assert_eq!(alone[0].dsc.map(|d| d.slices_h), Some(4));
+    let mut sibling = chosen;
+    sibling.port = 1;
+    sibling.mst = None;
+    sibling.dsc = None;
+    sibling.timing = modeset::edid_timings(&fhd60_edid())[0];
+    let (joint, plans) = modeset::admit_selection_candidates_with(
+        &soc,
+        &[sibling, chosen],
+        &[true, false],
+        true,
+        &mut |s| normalize(s),
+    )
+    .unwrap();
+    assert_eq!(joint[0], sibling);
+    assert_eq!(
+        (joint[1].depth, joint[1].dsc, plans[1].pipes),
+        (otg::ColorDepth::Bpc8, None, 1)
+    );
+    assert_ne!(joint[1].mst.unwrap().pbn, alone[0].mst.unwrap().pbn);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_final_admission_retries_complete_link_candidates
+);
+
+fn dark_candidate_soc() -> crate::amdgpu_dcn401_dml::Soc {
+    crate::amdgpu_dcn401_dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    }
+}
+
+/// Stable KMS slots can outlive a topology reorder. Equal-slack streams
+/// share an odd number of free time slots differently in the two orders;
+/// a dark candidate must use the exact PPS the actual native search uses.
+fn navi48_mst_dark_fairness_keeps_stable_device_order() -> TestResult {
+    let mut hub = Hub::new();
+    hub.grandchild_present = true;
+    let (_, topology) = probed(&mut hub);
+    let grand = Sink { branch: 2, port: 1 };
+    let decoder = MstDsc {
+        caps: caps(),
+        aux: DscAux::Port(CHILD_SINK),
+        passthrough: None,
+        end_link_kbps: 0,
+        branch_oui: 0,
+        synaptics: None,
+        pcon: None,
+    };
+    let dsc_of = |s| (s == CHILD_SINK || s == grand).then_some(decoder);
+    let ctx = MstDscContext {
+        topology: &topology,
+        dsc_of: &dsc_of,
+        max_dispclk_khz: 2_000_000,
+        max_bpc: &|_| 8,
+    };
+    let caps = modeset::DpCaps {
+        lanes: 4,
+        rate: crate::dp_link_training::LinkRate::Hbr2,
+        uhbr: 0,
+        fec: true,
+        dsc: None,
+    };
+    let edid = uhd60_edid(2);
+    let old = super::super::select_mst_dsc(
+        0,
+        caps,
+        &[(CHILD_SINK, edid.clone(), u16::MAX)],
+        &|_| None,
+        &|_, _| u16::MAX,
+        &ctx,
+        &[],
+    )
+    .unwrap()[0];
+    let timing = old.timing;
+    let order = [grand, CHILD_SINK]; // Surviving KMS slots, reversed in the new probe.
+    let devices = [
+        (grand, edid.clone(), u16::MAX),
+        (CHILD_SINK, edid.clone(), u16::MAX),
+    ];
+    let mut joining = old;
+    joining.mst.as_mut().unwrap().sink = grand;
+    let soc = dark_candidate_soc();
+    let mut actual = [old, joining];
+    super::super::refine_mst_link_payloads(&soc, 0, caps, &devices, &ctx, &mut actual, &[])
+        .unwrap();
+    let joint = super::super::compressed_mst_joint_modes(
+        &soc,
+        0,
+        caps,
+        &timing,
+        &[old],
+        grand,
+        &ctx,
+        &order,
+        8,
+    )
+    .unwrap();
+    assert_eq!(
+        joint,
+        actual
+            .iter()
+            .map(modeset::selection_mode)
+            .collect::<Vec<_>>()
+    );
+    let reordered = super::super::compressed_mst_joint_modes(
+        &soc,
+        0,
+        caps,
+        &timing,
+        &[old],
+        grand,
+        &ctx,
+        &topology.sinks(),
+        8,
+    )
+    .unwrap();
+    assert_ne!(
+        joint[0].dsc, reordered[0].dsc,
+        "fixture must exercise fairness tie order"
+    );
+    let available = super::super::topology::path_budget(
+        &topology,
+        grand,
+        &[(CHILD_SINK, old.mst.unwrap().pbn)],
+    )
+    .unwrap();
+    assert!(super::super::dark_mst_modes_in_order(
+        &soc,
+        0,
+        caps,
+        &edid,
+        available,
+        &[old],
+        Some((grand, &ctx)),
+        &order
+    )
+    .contains(&timing));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_dark_fairness_keeps_stable_device_order
+);
+
+/// A dark raw-only sink can fit after the running DSC stream gives back
+/// shared-hop PBN. The old leftover budget and the new sink's lack of a
+/// decoder must not veto full-link recomputation of this valid candidate.
+fn navi48_mst_dark_raw_sink_uses_recomputed_shared_budget() -> TestResult {
+    let mut hub = Hub::new();
+    hub.grandchild_present = true;
+    hub.resources.insert((1, 2), (1600, 1600));
+    let (_, topology) = probed(&mut hub);
+    let grand = Sink { branch: 2, port: 1 };
+    let decoder = MstDsc {
+        caps: caps(),
+        aux: DscAux::Port(CHILD_SINK),
+        passthrough: None,
+        end_link_kbps: 0,
+        branch_oui: 0,
+        synaptics: None,
+        pcon: None,
+    };
+    let dsc_of = |s| (s == CHILD_SINK).then_some(decoder);
+    let ctx = MstDscContext {
+        topology: &topology,
+        dsc_of: &dsc_of,
+        max_dispclk_khz: 2_000_000,
+        max_bpc: &|_| 8,
+    };
+    let caps = modeset::DpCaps {
+        lanes: 2,
+        rate: crate::dp_link_training::LinkRate::Hbr3,
+        uhbr: 0,
+        fec: true,
+        dsc: None,
+    };
+    let uhd = uhd60_edid(2);
+    let fhd = fhd60_edid();
+    let old = super::super::select_mst_dsc(
+        0,
+        caps,
+        &[(CHILD_SINK, uhd.clone(), u16::MAX)],
+        &|_| None,
+        &|s, a| super::super::topology::path_budget(&topology, s, a).unwrap_or(0),
+        &ctx,
+        &[],
+    )
+    .unwrap()[0];
+    assert!(old.dsc.is_some());
+    let timing = modeset::edid_timings(&fhd)[0];
+    let available = super::super::topology::path_budget(
+        &topology,
+        grand,
+        &[(CHILD_SINK, old.mst.unwrap().pbn)],
+    )
+    .unwrap();
+    let raw = super::super::raw_mst_stream(&timing, &fhd, caps, Some((grand, &ctx))).unwrap();
+    assert!(
+        raw.pbn > available,
+        "fixture must need released shared-hop PBN"
+    );
+    let mut joining = old;
+    joining.timing = timing;
+    joining.dsc = None;
+    joining.mst.as_mut().unwrap().sink = grand;
+    let soc = dark_candidate_soc();
+    let devices = [(CHILD_SINK, uhd, u16::MAX), (grand, fhd.clone(), u16::MAX)];
+    let mut actual = [old, joining];
+    super::super::refine_mst_link_payloads(&soc, 0, caps, &devices, &ctx, &mut actual, &[])
+        .unwrap();
+    assert!(actual[0].mst.unwrap().pbn < old.mst.unwrap().pbn);
+    assert!(actual[1].mst.unwrap().pbn > available);
+    assert!(actual[1].dsc.is_none());
+    modeset::admit_native_modes(
+        &soc,
+        &actual
+            .iter()
+            .map(modeset::selection_mode)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(super::super::dark_mst_modes_in_order(
+        &soc,
+        0,
+        caps,
+        &fhd,
+        available,
+        &[old],
+        Some((grand, &ctx)),
+        &[CHILD_SINK, grand]
+    )
+    .contains(&timing));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_mst_dark_raw_sink_uses_recomputed_shared_budget
+);
+
+fn synaptics_root(hub: &mut Hub, revision: u8, count: u8, name: &[u8; 6]) {
+    hub.dpcd.extend([(0, revision), (0x200, count)]);
+    for (i, b) in [0x90, 0xcc, 0x24]
+        .into_iter()
+        .chain(name.iter().copied())
+        .enumerate()
+    {
+        hub.dpcd.insert(0x500 + i as u32, b);
+    }
+}
+fn navi48_synaptics_dsc_aux_fallback_and_panamera_override() -> TestResult {
+    for oui in [0, OUI_SYNAPTICS, 0x90cc25] {
+        for revision in [0x11, 0x12, 0x13, 0x14, 0x20] {
+            for count in [0, 1, 2, 63, 0x42] {
+                assert_eq!(
+                    needs_dsc_aux_workaround(oui, revision, count),
+                    oui == OUI_SYNAPTICS && matches!(revision, 0x12 | 0x14) && count & 0x3f >= 2
+                );
+            }
+        }
+    }
+    let mut hub = Hub::new();
+    synaptics_root(&mut hub, 0x12, 2, b"SYNA\x10\0");
+    let (mut mgr, topology) = probed(&mut hub);
+    // A DP1.2 dock without remote DSC/FEC can decode for its immediate sink.
+    assert_eq!(
+        run(dsc_aux_for_port(&mut mgr, &mut hub, &topology, ROOT_SINK)),
+        Some((DscAux::Root, None))
+    );
+    // The same fallback may not skip a real intervening link/branch.
+    assert_eq!(
+        run(dsc_aux_for_port(&mut mgr, &mut hub, &topology, CHILD_SINK)),
+        None
+    );
+    hub.dpcd
+        .extend((0..16).map(|i| (0x60 + i, DECODER[i as usize])));
+    let dsc = run(read_dsc(&mut mgr, &mut hub, &topology, ROOT_SINK)).unwrap();
+    assert_eq!(dsc.synaptics, Some(true));
+    hub.dpcd.insert(5, 3); // virtual DPCD avoids the non-virtual write policy
+    assert_eq!(
+        run(read_dsc(&mut mgr, &mut hub, &topology, ROOT_SINK))
+            .unwrap()
+            .synaptics,
+        None
+    );
+    // Panamera root name[4] and vendor[2] override even a valid remote RX.
+    synaptics_root(&mut hub, 0x14, 2, b"SYNA\x50\0");
+    hub.remote.insert((1, 2), BTreeMap::new());
+    hub.remote.insert((2, 1), decoder(true));
+    hub.dpcd.insert(0x50e, 0x59);
+    assert_eq!(
+        run(dsc_aux_for_port(&mut mgr, &mut hub, &topology, CHILD_SINK)),
+        Some((DscAux::Port(CHILD_SINK), None))
+    );
+    hub.dpcd.insert(0x50e, 0x5a);
+    assert_eq!(
+        run(dsc_aux_for_port(&mut mgr, &mut hub, &topology, CHILD_SINK)),
+        Some((DscAux::Root, None))
+    );
+    hub.dpcd.insert(0x507, 0x40);
+    assert_eq!(
+        run(dsc_aux_for_port(&mut mgr, &mut hub, &topology, CHILD_SINK)),
+        Some((DscAux::Port(CHILD_SINK), None))
+    );
+    // An unresolved topology route never receives the root quirk.
+    hub.dpcd.insert(0x507, 0x50);
+    assert_eq!(
+        run(dsc_aux_for_port(
+            &mut mgr,
+            &mut hub,
+            &topology,
+            Sink {
+                branch: 99,
+                port: 1
+            }
+        )),
+        None
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_synaptics_dsc_aux_fallback_and_panamera_override
+);
+
+#[derive(Debug, PartialEq, Eq)]
+struct VendorCommand {
+    command: u8,
+    offset: u32,
+    length: u16,
+    data: [u8; 16],
+}
+struct VendorAux {
+    registers: BTreeMap<u32, [u8; 4]>,
+    writes: Vec<(u32, Vec<u8>)>,
+    commands: Vec<VendorCommand>,
+    data: [u8; 16],
+    offset: u32,
+    length: u16,
+    active: u8,
+    pending: u8,
+    delays: Vec<u64>,
+    fail_write: Option<usize>,
+    reject: bool,
+    stall: bool,
+    cancel_delay: bool,
+    enabled: u8,
+}
+impl VendorAux {
+    fn new() -> Self {
+        Self {
+            registers: [0x220998, 0x220d98, 0x221198]
+                .into_iter()
+                .map(|o| (o, [0xff, 0x32, 0x54, 0x76]))
+                .collect(),
+            writes: Vec::new(),
+            commands: Vec::new(),
+            data: [0; 16],
+            offset: 0,
+            length: 0,
+            active: 0,
+            pending: 0,
+            delays: Vec::new(),
+            fail_write: None,
+            reject: false,
+            stall: false,
+            cancel_delay: false,
+            enabled: 0,
+        }
+    }
+}
+impl MstAux for VendorAux {
+    type Error = ();
+    async fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), ()> {
+        match address {
+            0x4b2 => {
+                if self.pending != 0 || self.stall {
+                    self.pending = self.pending.saturating_sub(1);
+                    buf[0] = self.active | 0x80;
+                } else {
+                    buf[0] = self.active;
+                }
+            }
+            0x4b3 => buf[0] = u8::from(self.reject),
+            0x4c0 => buf.copy_from_slice(&self.data[..buf.len()]),
+            0x160 => buf[0] = self.enabled,
+            _ => return Err(()),
+        }
+        Ok(())
+    }
+    async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), ()> {
+        if self.fail_write == Some(self.writes.len()) {
+            return Err(());
+        }
+        self.writes.push((address, data.to_vec()));
+        match address {
+            0x4c0 => self.data.copy_from_slice(data),
+            0x4bc => self.offset = u32::from_le_bytes(data.try_into().unwrap()),
+            0x4b8 => self.length = u16::from_le_bytes(data.try_into().unwrap()),
+            0x4b2 => {
+                self.active = data[0] & 0x7f;
+                self.pending = 1;
+                self.commands.push(VendorCommand {
+                    command: self.active,
+                    offset: self.offset,
+                    length: self.length,
+                    data: self.data,
+                });
+                if !self.reject {
+                    if self.active == 0x31 {
+                        self.data[..4].copy_from_slice(self.registers.get(&self.offset).unwrap());
+                    } else if self.active == 0x21 {
+                        self.registers
+                            .insert(self.offset, self.data[..4].try_into().unwrap());
+                    }
+                }
+            }
+            0x160 => self.enabled = data[0],
+            _ => return Err(()),
+        }
+        Ok(())
+    }
+    async fn delay(&mut self, us: u64) {
+        self.delays.push(us);
+        if self.cancel_delay {
+            core::future::pending::<()>().await;
+        }
+    }
+}
+fn vendor_decoder() -> MstDsc {
+    MstDsc {
+        caps: caps(),
+        aux: DscAux::Root,
+        passthrough: None,
+        end_link_kbps: 0,
+        branch_oui: OUI_SYNAPTICS,
+        synaptics: Some(true),
+        pcon: None,
+    }
+}
+fn navi48_synaptics_fifo_reset_and_shared_decoder_lifetime() -> TestResult {
+    let mut aux = VendorAux::new();
+    let mut mgr = Manager::new();
+    let topology = Topology::default();
+    let decoder = vendor_decoder();
+    run(set_rx(&mut mgr, &mut aux, &topology, &decoder, true, false)).unwrap();
+    let sequence: Vec<_> = aux
+        .commands
+        .iter()
+        .map(|c| (c.command, c.offset, c.length))
+        .collect();
+    assert_eq!(
+        sequence,
+        [
+            (1, 0, 5),
+            (0x31, 0x220998, 4),
+            (0x21, 0x220998, 4),
+            (0x31, 0x220d98, 4),
+            (0x21, 0x220d98, 4),
+            (0x31, 0x221198, 4),
+            (0x21, 0x221198, 4),
+            (0x31, 0x220998, 4),
+            (0x21, 0x220998, 4),
+            (0x31, 0x220d98, 4),
+            (0x31, 0x221198, 4),
+            (0x21, 0x221198, 4),
+            (2, 0, 0)
+        ]
+    );
+    assert_eq!(&aux.commands[0].data[..5], b"PRIUS");
+    assert_eq!(&aux.commands[0].data[5..], &[0; 11]);
+    assert_eq!(aux.delays, alloc::vec![10_000;13]);
+    assert_eq!(aux.registers[&0x220998], [0xff, 0x32, 0x54, 0x76]);
+    assert_eq!(aux.registers[&0x220d98], [0xfd, 0x32, 0x54, 0x76]);
+    assert_eq!(aux.registers[&0x221198], [0xff, 0x32, 0x54, 0x76]);
+    assert_eq!(aux.writes.last(), Some(&(0x160, alloc::vec![1])));
+    // Native link bookkeeping, rather than an optimistic caller flag,
+    // preserves the decoder while any sibling payload is still retained.
+    let mut link = MstLink {
+        payloads: alloc::vec![
+            MstPayload {
+                sink: ROOT_SINK,
+                vcpi: 1,
+                start: 1,
+                slots: 5,
+                pbn: 100,
+                stream: 1,
+                allocation: PayloadAllocation::Remote
+            },
+            MstPayload {
+                sink: CHILD_SINK,
+                vcpi: 2,
+                start: 6,
+                slots: 5,
+                pbn: 100,
+                stream: 2,
+                allocation: PayloadAllocation::Remote
+            },
+        ],
+        ..MstLink::default()
+    };
+    let mut shared = VendorAux::new();
+    run(set_dsc(&mut link, &mut shared, &decoder, true)).unwrap();
+    assert!(shared.commands.is_empty());
+    link.payloads.remove(0);
+    run(set_dsc(&mut link, &mut shared, &decoder, false)).unwrap();
+    assert_eq!(shared.enabled, 1);
+    link.payloads.clear();
+    run(set_dsc(&mut link, &mut shared, &decoder, false)).unwrap();
+    assert_eq!(shared.enabled, 0);
+    let commands = aux.commands.len();
+    // Another stream cannot reset a live shared decoder's FIFO.
+    run(set_rx(&mut mgr, &mut aux, &topology, &decoder, true, true)).unwrap();
+    assert_eq!(aux.commands.len(), commands);
+    let writes = aux.writes.len();
+    run(set_rx(&mut mgr, &mut aux, &topology, &decoder, false, true)).unwrap();
+    assert_eq!(aux.writes.len(), writes);
+    assert_eq!(aux.enabled, 1);
+    run(set_rx(
+        &mut mgr, &mut aux, &topology, &decoder, false, false,
+    ))
+    .unwrap();
+    assert_eq!(aux.enabled, 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_synaptics_fifo_reset_and_shared_decoder_lifetime
+);
+
+fn navi48_synaptics_dsc_transaction_retains_uncertain_owner() -> TestResult {
+    use core::{
+        future::Future,
+        task::{Context, Waker},
+    };
+    let decoder = vendor_decoder();
+    let mut cx = Context::from_waker(Waker::noop());
+    // Exercise every individual vendor/AUX write failure in the real sequence.
+    let mut normal = VendorAux::new();
+    let mut link = MstLink::default();
+    run(set_dsc(&mut link, &mut normal, &decoder, true)).unwrap();
+    assert!(!link.dsc_change_pending());
+    for failure in 0..normal.writes.len() {
+        let mut aux = VendorAux::new();
+        aux.fail_write = Some(failure);
+        let mut link = MstLink::default();
+        assert!(run(set_dsc(&mut link, &mut aux, &decoder, true)).is_err());
+        assert!(link.dsc_change_pending() && link.has_stream_resources());
+        assert!(link.require_transaction_idle::<()>().is_err());
+        let before = aux.writes.len();
+        assert!(run(set_dsc(&mut link, &mut aux, &decoder, true)).is_err());
+        assert_eq!(aux.writes.len(), before);
+    }
+    for reject in [false, true] {
+        let mut aux = VendorAux::new();
+        aux.reject = reject;
+        aux.stall = !reject;
+        let mut link = MstLink::default();
+        assert!(run(set_dsc(&mut link, &mut aux, &decoder, true)).is_err());
+        assert!(link.dsc_change_pending());
+        assert!(!aux.writes.iter().any(|w| w.0 == 0x160));
+        assert_eq!(aux.delays.len(), if reject { 1 } else { 10 });
+    }
+    let mut aux = VendorAux::new();
+    aux.cancel_delay = true;
+    let mut link = MstLink::default();
+    {
+        let mut operation = alloc::boxed::Box::pin(set_dsc(&mut link, &mut aux, &decoder, true));
+        assert!(operation.as_mut().poll(&mut cx).is_pending());
+    }
+    assert!(link.dsc_change_pending() && link.has_stream_resources());
+    assert!(link.require_transaction_idle::<()>().is_err());
+    assert!(!aux.writes.iter().any(|w| w.0 == 0x160));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_synaptics_dsc_transaction_retains_uncertain_owner
+);
+
+fn navi48_synaptics_reprobe_requires_external_rc_completion() -> TestResult {
+    let decoder = vendor_decoder();
+    // A preceding owner left RC command0x31 active. GPU reset/reprobe may
+    // create a fresh local journal, but must not overwrite that command.
+    let mut external = VendorAux::new();
+    external.active = 0x31;
+    external.stall = true;
+    let mut old = MstLink {
+        dsc_change: Some(true),
+        ..MstLink::default()
+    };
+    assert!(old.dsc_change_pending());
+    let old_journal = core::mem::take(&mut old);
+    drop(old_journal); // model local ColdBoot retirement by GPU reset
+    assert!(matches!(
+        run(set_dsc(&mut old, &mut external, &decoder, true)),
+        Err(MstFailure::Mst(MstError::Timeout))
+    ));
+    assert!(old.dsc_change_pending());
+    assert!(external.writes.is_empty() && external.commands.is_empty());
+    assert_eq!(external.active, 0x31);
+    assert_eq!(external.delays, alloc::vec![10_000;10]);
+    // Another confirmed-idle probe can restart safely; an automatic local
+    // retry of the failed owner remains barred by its retained marker.
+    external.stall = false;
+    external.pending = 2;
+    assert!(run(set_dsc(&mut old, &mut external, &decoder, true)).is_err());
+    assert!(external.writes.is_empty());
+    let mut successor = MstLink::default();
+    run(set_dsc(&mut successor, &mut external, &decoder, true)).unwrap();
+    assert!(!successor.dsc_change_pending());
+    assert_eq!(external.commands.first().unwrap().command, 1);
+    assert_eq!(external.enabled, 1);
+    // A different command arriving while awaiting the observed predecessor
+    // is an ownership change, even if its active bit is already clear.
+    struct Changed(VendorAux, bool);
+    impl MstAux for Changed {
+        type Error = ();
+        async fn read(&mut self, at: u32, data: &mut [u8]) -> Result<(), ()> {
+            if at == 0x4b2 {
+                data[0] = if self.1 { 0x21 } else { 0xb1 };
+                self.1 = true;
+                Ok(())
+            } else {
+                self.0.read(at, data).await
+            }
+        }
+        async fn write(&mut self, at: u32, data: &[u8]) -> Result<(), ()> {
+            self.0.write(at, data).await
+        }
+        async fn delay(&mut self, us: u64) {
+            self.0.delay(us).await;
+        }
+    }
+    let mut changed = Changed(VendorAux::new(), false);
+    let mut link = MstLink::default();
+    assert!(matches!(
+        run(set_dsc(&mut link, &mut changed, &decoder, true)),
+        Err(MstFailure::Mst(MstError::Malformed))
+    ));
+    assert!(link.dsc_change_pending() && changed.0.writes.is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-mst",
+    navi48_synaptics_reprobe_requires_external_rc_completion
 );

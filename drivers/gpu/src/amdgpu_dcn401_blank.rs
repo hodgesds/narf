@@ -69,12 +69,23 @@ impl<I: Io> Engine<I> {
             .request
             .dsc
             .filter(|_| plan.request.signal != Signal::HdmiFrl || self.status.frl_dsc == Some(p));
+        let drr = self.status.drr.filter(|a| a.pipe == p);
         for (r, mask, value) in plan.registers() {
+            let value = match (r, drr) {
+                (V_MIN, Some(a)) => a.adjust.v_total_min - 1,
+                (0x1b31, Some(a)) => a.adjust.v_total_max - 1,
+                _ => value,
+            };
             self.expect(l.otg(p, r), mask, value)?;
         }
+        self.verify_drr_mid(p)?;
         for (at, mask, value) in [
             (l.otg(p, H_TIMING), 0x103, plan.h_divider()),
-            (l.otg(p, V_CONTROL), 0xffff0013, 0),
+            (
+                l.otg(p, V_CONTROL),
+                drr::DRR_FIELDS,
+                drr.map_or(0, |a| a.control()),
+            ),
             (l.otg(p, CLOCK), 0x113, 0x103),
             (l.odm(p, INPUT_CLOCK), 7, 7),
             (l.odm(p, SOURCE), 0xffff0003, plan.source(l.pool, connected)),
@@ -82,7 +93,7 @@ impl<I: Io> Engine<I> {
             (
                 l.odm(p, FORMAT),
                 0x33,
-                if plan.request.ycbcr420 { 2 } else { 0 } | if dsc.is_some() { 0x10 } else { 0 },
+                plan.request.encoding.hardware_format() | if dsc.is_some() { 0x10 } else { 0 },
             ),
             (l.vtg(p), 0xffff7fff, plan.vtg | u32::from(running) << 31),
         ] {

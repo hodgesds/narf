@@ -484,6 +484,7 @@ impl<I: Io> Engine<I> {
         #[cfg(feature = "kernel-test")]
         let mut polls = self.io.wait_poll_limit();
         loop {
+            self.lfc_progress(p.pipe)?;
             if p.watch {
                 self.underflow(p.pipe)?;
             }
@@ -632,6 +633,7 @@ impl<I: Io> Engine<I> {
     pub(super) async fn flip_from(&mut self, p: Pipe, from: Option<Pipe>) -> Result<u32, Error> {
         let l = self.layout;
         let pipe = p.pipe;
+        self.lfc_preflip(pipe, (narf_time::wall::monotonic_ns() / 1000) as u32)?;
         self.lock(pipe).await?;
         // Both ODM halves of every flipping plane re-address under the one
         // master lock.
@@ -763,6 +765,9 @@ impl<I: Io> Engine<I> {
     pub(super) async fn stop_fetch(&mut self, p: Pipe) -> Result<(), Error> {
         let l = self.layout;
         let pipe = p.pipe;
+        // Retire the independent IRQ source before fetch/clock shutdown.
+        // A cancelled wait retains StoppingScanout and all live resources.
+        self.io.vupdate(pipe, false).await?;
         // Leaving scanout returns to fixed refresh, so the later video and
         // timing waits see nominal frames; `p` already bounds a stretched one.
         self.drr_fixed(pipe)?;

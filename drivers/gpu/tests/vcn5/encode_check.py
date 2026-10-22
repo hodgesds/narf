@@ -45,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix='narf-vcn-encode-') as temp:
     (out/'native_encode_funcs.h').write_text('\n'.join(pieces)+'\n')
     harness = r'''
 extern crate alloc;
-#[derive(Debug, PartialEq, Eq)] enum Error { Invalid }
+#[derive(Debug, PartialEq, Eq)] enum Error { Invalid, Unsupported }
 #[allow(dead_code)] #[path="WORDS"] mod e;
 fn main() {
     let base = 0x8_1000_0000;
@@ -55,10 +55,10 @@ fn main() {
     }
     println!();
     for (n,p) in [e::Phase::Create,e::Phase::Encode,e::Phase::Destroy].into_iter().enumerate() {
-        print!("{n}"); for w in e::ib(base,p).unwrap() {print!(" {w:08x}");} println!();
+        print!("{n}"); for w in e::ib(base,p,0x10009).unwrap() {print!(" {w:08x}");} println!();
     }
     for at in [0,base+4,1<<48,(1<<48)-4096] {
-        assert_eq!(e::ib(at,e::Phase::Encode),Err(Error::Invalid));
+        assert_eq!(e::ib(at,e::Phase::Encode,0x10009),Err(Error::Invalid));
     }
     assert!(e::OUTPUT+e::OUTPUT_BYTES <= e::OUTPUT_END_GUARD);
     assert_eq!(e::FRAME.len(),160*128*3/2);

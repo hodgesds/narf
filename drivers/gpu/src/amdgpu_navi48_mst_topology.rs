@@ -22,7 +22,7 @@ pub struct MstOutput {
     /// Independently admitted timings while no stream is lit on this output.
     /// Recomputed against the current configuration; empty after a reprobe.
     pub modes: Vec<Timing>,
-    /// The end device's DSC decoder (`dsc::read_dsc`), read with its EDID.
+    /// Decoder and downstream converter state, read with this endpoint's EDID.
     pub dsc: Option<super::dsc::MstDsc>,
 }
 
@@ -182,6 +182,7 @@ impl MstLink {
     ) -> Result<(), MstFailure<A::Error>> {
         self.require_transaction_idle()?;
         if self.state == ProbeState::Ready && !self.dirty {
+            self.refresh_pcon_outputs(aux, &[]).await?;
             return Ok(());
         }
         if self.state == ProbeState::Probing || self.has_stream_resources() {
@@ -210,7 +211,16 @@ impl MstLink {
                     .await
                     .unwrap_or_default();
                 // validate_dsc_caps_on_connector, beside the EDID.
-                output.dsc = super::dsc::read_dsc(&mut self.manager, aux, &topology, sink).await;
+                self.endpoint_query = Some(sink);
+                output.dsc = super::dsc::read_endpoint_checked(
+                    &mut self.manager,
+                    aux,
+                    &topology,
+                    sink,
+                    &output.edid,
+                )
+                .await?;
+                self.endpoint_query = None;
             }
         }
         self.topology = topology;
@@ -395,7 +405,16 @@ impl MstLink {
                 output.edid = read_edid(&mut self.manager, aux, &topology, sink)
                     .await
                     .unwrap_or_default();
-                output.dsc = super::dsc::read_dsc(&mut self.manager, aux, &topology, sink).await;
+                self.endpoint_query = Some(sink);
+                output.dsc = super::dsc::read_endpoint_checked(
+                    &mut self.manager,
+                    aux,
+                    &topology,
+                    sink,
+                    &output.edid,
+                )
+                .await?;
+                self.endpoint_query = None;
             }
         }
         self.topology = topology;

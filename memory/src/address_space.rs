@@ -499,6 +499,10 @@ impl RegionPerms {
     /// independent pins even when LOCK_EXEMPT excludes generic mlock handling.
     pub const PINNABLE_RAM: RegionPerms = RegionPerms(1 << 20);
 
+    // Bits 24..=26 hold the requested `MemoryType` (see `crate::memtype`,
+    // `RegionPerms::memory_type` / `with_memory_type`). Zero is write-back,
+    // so every constructor that predates memory types requests write-back.
+
     pub const PROT_MASK: RegionPerms = RegionPerms(0b111);
 
     #[inline]
@@ -1963,8 +1967,20 @@ fn demand_map_error(error: crate::aarch64::paging::MapError) -> AddressSpaceErro
 /// `perms` here, because the callers genuinely differ: some consult only
 /// `RegionPerms::WRITE`, some `user_page_writable` (which folds in COW), and some
 /// a COW refcount they already have in hand.
+///
+/// `phys` is the frame this leaf will map. It selects the leaf's memory type
+/// through [`crate::memtype::effective_memory_type`]: the region's requested
+/// type, unless the region may not request one or `phys` is System RAM, in
+/// which case write-back. Write-back contributes no bits, so a region that
+/// never requested a type produces exactly the flags it did before memory
+/// types existed. The result is a **4 KiB** encoding; large leaves go
+/// through [`user_huge_leaf_flags`].
 #[cfg(target_arch = "x86_64")]
-fn user_leaf_flags(perms: RegionPerms, writable: bool) -> crate::x86_64::paging::PtFlags {
+fn user_leaf_flags(
+    perms: RegionPerms,
+    writable: bool,
+    phys: PhysAddr,
+) -> crate::x86_64::paging::PtFlags {
     use crate::x86_64::paging::PtFlags;
     let mut flags = PtFlags::USER;
     if writable {
@@ -1973,7 +1989,18 @@ fn user_leaf_flags(perms: RegionPerms, writable: bool) -> crate::x86_64::paging:
     if !perms.contains(RegionPerms::EXEC) {
         flags |= PtFlags::NO_EXEC;
     }
-    flags
+    flags | crate::memtype::x86_leaf_bits_4k(crate::memtype::effective_memory_type(perms, phys))
+}
+
+/// [`user_leaf_flags`] for a 2 MiB / 1 GiB leaf: the PAT bit moves from 7 to
+/// 12 (Linux `protval_4k_2_large`) so it cannot collide with `HUGE_PAGE`.
+#[cfg(target_arch = "x86_64")]
+fn user_huge_leaf_flags(
+    perms: RegionPerms,
+    writable: bool,
+    phys: PhysAddr,
+) -> crate::x86_64::paging::PtFlags {
+    user_leaf_flags(perms, writable, phys).protval_4k_2_large()
 }
 
 /// [`user_leaf_flags`] for aarch64's descriptor bits.
@@ -1982,8 +2009,17 @@ fn user_leaf_flags(perms: RegionPerms, writable: bool) -> crate::x86_64::paging:
 /// field rather than a USER bit, and "not executable" is UXN plus PXN rather
 /// than one NX bit — which is why the two arches' sites never shared code and
 /// each accumulated its own dozen-odd copies.
+///
+/// The memory type comes from `phys` exactly as on x86_64. Write-back is
+/// `AttrIndx` 0, which the paging layer's `ATTR_NORMAL` default already is,
+/// so it contributes no bits; the other types select their `AttrIndx` and
+/// force UXN|PXN. User leaves never select `ATTR_TAGGED`.
 #[cfg(target_arch = "aarch64")]
-fn user_leaf_flags(perms: RegionPerms, writable: bool) -> crate::aarch64::paging::PtFlags {
+fn user_leaf_flags(
+    perms: RegionPerms,
+    writable: bool,
+    phys: PhysAddr,
+) -> crate::aarch64::paging::PtFlags {
     use crate::aarch64::paging::PtFlags;
     let mut flags = if writable {
         PtFlags::AP_RW_EL0
@@ -1998,7 +2034,62 @@ fn user_leaf_flags(perms: RegionPerms, writable: bool) -> crate::aarch64::paging
         // Exception. Only meaningful on an executable page, hence the `else`.
         flags = flags | PtFlags::GUARDED;
     }
-    flags
+    flags | crate::memtype::aarch64_leaf_bits(crate::memtype::effective_memory_type(perms, phys))
+}
+
+/// aarch64 block descriptors carry the same attribute fields as pages.
+#[cfg(target_arch = "aarch64")]
+fn user_huge_leaf_flags(
+    perms: RegionPerms,
+    writable: bool,
+    phys: PhysAddr,
+) -> crate::aarch64::paging::PtFlags {
+    user_leaf_flags(perms, writable, phys)
+}
+
+/// Kernel-test view of the leaf encoder: the 4 KiB flags `perms` produces for
+/// `phys`, exactly as every installer computes them.
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn __user_leaf_flags_for_test(
+    perms: RegionPerms,
+    writable: bool,
+    phys: PhysAddr,
+) -> crate::x86_64::paging::PtFlags {
+    user_leaf_flags(perms, writable, phys)
+}
+
+/// Kernel-test view of the large-leaf encoder.
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn __user_huge_leaf_flags_for_test(
+    perms: RegionPerms,
+    writable: bool,
+    phys: PhysAddr,
+) -> crate::x86_64::paging::PtFlags {
+    user_huge_leaf_flags(perms, writable, phys)
+}
+
+/// Kernel-test view of the leaf encoder.
+#[cfg(all(feature = "kernel-test", target_arch = "aarch64"))]
+#[doc(hidden)]
+pub fn __user_leaf_flags_for_test(
+    perms: RegionPerms,
+    writable: bool,
+    phys: PhysAddr,
+) -> crate::aarch64::paging::PtFlags {
+    user_leaf_flags(perms, writable, phys)
+}
+
+/// Kernel-test view of the block-leaf encoder.
+#[cfg(all(feature = "kernel-test", target_arch = "aarch64"))]
+#[doc(hidden)]
+pub fn __user_huge_leaf_flags_for_test(
+    perms: RegionPerms,
+    writable: bool,
+    phys: PhysAddr,
+) -> crate::aarch64::paging::PtFlags {
+    user_huge_leaf_flags(perms, writable, phys)
 }
 
 fn release_failed_huge_region(
@@ -4130,14 +4221,16 @@ impl AddressSpace {
                 #[cfg(target_arch = "x86_64")]
                 {
                     use crate::x86_64::paging::{map_4kb, unmap_4kb_local};
-                    let flags = user_leaf_flags(perms, perms.contains(RegionPerms::WRITE));
+                    let flags =
+                        user_leaf_flags(perms, perms.contains(RegionPerms::WRITE), new_phys);
                     let _ = unmap_4kb_local(self.root, page_va);
                     map_4kb(self.root, page_va, new_phys, flags)
                 }
                 #[cfg(target_arch = "aarch64")]
                 {
                     use crate::aarch64::paging::{map_4kb, unmap_4kb};
-                    let flags = user_leaf_flags(perms, perms.contains(RegionPerms::WRITE));
+                    let flags =
+                        user_leaf_flags(perms, perms.contains(RegionPerms::WRITE), new_phys);
                     let _ = unmap_4kb(self.root, page_va);
                     map_4kb(self.root, page_va, new_phys, flags)
                 }
@@ -4152,6 +4245,7 @@ impl AddressSpace {
                         let flags = user_leaf_flags(
                             rollback_perms,
                             rollback_perms.contains(RegionPerms::WRITE),
+                            old_phys,
                         );
                         // SAFETY: exact inverse replacement under the same
                         // root/frame lifetime contract.
@@ -4166,6 +4260,7 @@ impl AddressSpace {
                         let flags = user_leaf_flags(
                             rollback_perms,
                             rollback_perms.contains(RegionPerms::WRITE),
+                            old_phys,
                         );
                         // SAFETY: rollback owns both the address-space root and
                         // old frame; this removes only the failed replacement leaf.
@@ -4403,7 +4498,11 @@ impl AddressSpace {
         perms: RegionPerms,
     ) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_1gb_locked, map_2mb_locked};
-        let flags = user_leaf_flags(perms, perms.contains(RegionPerms::WRITE));
+        let flags = user_huge_leaf_flags(
+            perms,
+            perms.contains(RegionPerms::WRITE),
+            PhysAddr::new(phys),
+        );
         // SAFETY: map_new_huge_leaves holds this root's page-table mutation
         // lock; map_huge_region validated the live-root and alignment contract.
         let result = unsafe {
@@ -4428,7 +4527,11 @@ impl AddressSpace {
         perms: RegionPerms,
     ) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_1gb, map_2mb};
-        let flags = user_leaf_flags(perms, perms.contains(RegionPerms::WRITE));
+        let flags = user_huge_leaf_flags(
+            perms,
+            perms.contains(RegionPerms::WRITE),
+            PhysAddr::new(phys),
+        );
         // SAFETY: map_huge_region validated both alignments and its caller
         // guarantees a live root owned by this address space.
         let result = unsafe {
@@ -4449,7 +4552,11 @@ impl AddressSpace {
         perms: RegionPerms,
     ) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_1gb_locked, map_2mb_locked};
-        let flags = user_leaf_flags(perms, perms.contains(RegionPerms::WRITE));
+        let flags = user_huge_leaf_flags(
+            perms,
+            perms.contains(RegionPerms::WRITE),
+            PhysAddr::new(phys),
+        );
         // SAFETY: map_new_huge_leaves holds the root mutation lock.
         let result = unsafe {
             match size {
@@ -4473,7 +4580,11 @@ impl AddressSpace {
         perms: RegionPerms,
     ) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_1gb, map_2mb};
-        let flags = user_leaf_flags(perms, perms.contains(RegionPerms::WRITE));
+        let flags = user_huge_leaf_flags(
+            perms,
+            perms.contains(RegionPerms::WRITE),
+            PhysAddr::new(phys),
+        );
         // SAFETY: map_huge_region validated both alignments and its caller
         // guarantees a live root owned by this address space.
         let result = unsafe {
@@ -7938,6 +8049,7 @@ impl AddressSpace {
                     user_leaf_flags(
                         region.perms,
                         user_page_writable_at_count(region.perms, phys, cow_count),
+                        phys,
                     )
                 })
             }
@@ -7966,6 +8078,7 @@ impl AddressSpace {
                     user_leaf_flags(
                         region.perms,
                         user_page_writable_at_count(region.perms, phys, cow_count),
+                        phys,
                     )
                 })
             }
@@ -8951,8 +9064,16 @@ impl AddressSpace {
                     if region.phys.get(index).is_none_or(|phys| phys.raw() != 0) {
                         return Err(AddressSpaceError::NotImplemented);
                     }
-                    let flags =
-                        user_leaf_flags(region.perms, region.perms.contains(RegionPerms::WRITE));
+                    // The swap backend picks the frame later, and it is always
+                    // allocator RAM, so this leaf is write-back whatever the
+                    // region requested. A zero frame makes
+                    // `effective_memory_type` answer write-back without a
+                    // RAM lookup; the request could only have been refused.
+                    let flags = user_leaf_flags(
+                        region.perms,
+                        region.perms.contains(RegionPerms::WRITE),
+                        PhysAddr::new(0),
+                    );
                     // Read-ahead consecutive swapped leaves in this VMA. The
                     // faulting page is first, followed by increasing VAs, so
                     // a sequential workload consumes the complete contiguous
@@ -9079,7 +9200,7 @@ impl AddressSpace {
                     );
                 }
             }
-            let flags = user_leaf_flags(perms, user_page_writable(perms, phys));
+            let flags = user_leaf_flags(perms, user_page_writable(perms, phys), phys);
             // SAFETY: identity map + AS live (active CR3's #PF handler);
             // `phys` is the frame this region owns for the page, and this is
             // the repair-capable user not-present fault path required by
@@ -9142,7 +9263,7 @@ impl AddressSpace {
                 // Forced PROT_NONE backing: frame only (see `demand_page_in`).
                 return Ok(());
             }
-            let flags = user_leaf_flags(perms, user_page_writable(perms, phys));
+            let flags = user_leaf_flags(perms, user_page_writable(perms, phys), phys);
             // SAFETY: finish_demand_page holds the authoritative region lock;
             // `phys` has just become this page's backing and the root is live.
             match unsafe { map_4kb_demand(self.root, VirtAddr::new(v), phys, flags) } {
@@ -9214,7 +9335,7 @@ impl AddressSpace {
             // the region's authoritative backing. See the x86_64 twin for the
             // full rationale.
             let va = VirtAddr::new(v);
-            let flags = user_leaf_flags(perms, user_page_writable(perms, phys));
+            let flags = user_leaf_flags(perms, user_page_writable(perms, phys), phys);
             // SAFETY: root valid + frame owned by this region (same
             // contract as the fresh-allocation path below).
             match unsafe { map_4kb(self.root, va, phys, flags) } {
@@ -9271,7 +9392,7 @@ impl AddressSpace {
             if perms.prot_only().0 == 0 {
                 return Ok(());
             }
-            let flags = user_leaf_flags(perms, user_page_writable(perms, phys));
+            let flags = user_leaf_flags(perms, user_page_writable(perms, phys), phys);
             // SAFETY: as on x86_64, publication and leaf installation are one
             // region-lock transaction against this live TTBR0 root.
             match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
@@ -11130,7 +11251,7 @@ impl AddressSpace {
                                 let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
                                 user_page_writable_at_count(r.perms, p, cow_count)
                             };
-                            user_leaf_flags(r.perms, writable)
+                            user_leaf_flags(r.perms, writable, p)
                         })
                     };
                 }
@@ -11202,7 +11323,7 @@ impl AddressSpace {
                             let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
                             user_page_writable_at_count(r.perms, p, cow_count)
                         };
-                        user_leaf_flags(r.perms, writable)
+                        user_leaf_flags(r.perms, writable, p)
                     })
                 };
             }
@@ -11661,6 +11782,7 @@ impl AddressSpace {
                         user_leaf_flags(
                             r.perms,
                             user_page_writable_at_count(r.perms, phys, cow_count),
+                            phys,
                         )
                     })
                 };
@@ -11680,6 +11802,7 @@ impl AddressSpace {
                         let flags = user_leaf_flags(
                             r.perms,
                             user_page_writable_at_count(r.perms, p, cow_count),
+                            p,
                         );
                         let v = crate::VirtAddr::new(window_base.as_u64() + ((index as u64) << 12));
                         // SAFETY: same validated root/range/backing contract as the
@@ -11774,6 +11897,7 @@ impl AddressSpace {
                         user_leaf_flags(
                             r.perms,
                             user_page_writable_at_count(r.perms, phys, cow_count),
+                            phys,
                         )
                     })
                 };
@@ -11790,6 +11914,7 @@ impl AddressSpace {
                         let flags = user_leaf_flags(
                             r.perms,
                             user_page_writable_at_count(r.perms, p, cow_count),
+                            p,
                         );
                         let v = crate::VirtAddr::new(window_base.as_u64() + ((index as u64) << 12));
                         // SAFETY: same validated root/range/backing contract as the
@@ -12478,13 +12603,13 @@ impl AddressSpace {
             #[cfg(target_arch = "x86_64")]
             {
                 use crate::x86_64::paging::map_4kb;
-                let flags = user_leaf_flags(perms, user_page_writable(perms, new_phys));
+                let flags = user_leaf_flags(perms, user_page_writable(perms, new_phys), new_phys);
                 map_4kb(self.root, page_va, new_phys, flags).map_err(|_| ())
             }
             #[cfg(target_arch = "aarch64")]
             {
                 use crate::aarch64::paging::map_4kb;
-                let flags = user_leaf_flags(perms, user_page_writable(perms, new_phys));
+                let flags = user_leaf_flags(perms, user_page_writable(perms, new_phys), new_phys);
                 map_4kb(self.root, page_va, new_phys, flags).map_err(|_| ())
             }
         };
@@ -12497,13 +12622,15 @@ impl AddressSpace {
                 #[cfg(target_arch = "x86_64")]
                 {
                     use crate::x86_64::paging::map_4kb;
-                    let flags = user_leaf_flags(perms, user_page_writable(perms, old_phys));
+                    let flags =
+                        user_leaf_flags(perms, user_page_writable(perms, old_phys), old_phys);
                     let _ = map_4kb(self.root, page_va, old_phys, flags);
                 }
                 #[cfg(target_arch = "aarch64")]
                 {
                     use crate::aarch64::paging::map_4kb;
-                    let flags = user_leaf_flags(perms, user_page_writable(perms, old_phys));
+                    let flags =
+                        user_leaf_flags(perms, user_page_writable(perms, old_phys), old_phys);
                     let _ = map_4kb(self.root, page_va, old_phys, flags);
                 }
             }
@@ -12700,7 +12827,7 @@ impl AddressSpace {
         // SAFETY: live root; page_va currently maps expected_src.
         let installed = unsafe {
             use crate::x86_64::paging::{map_4kb, unmap_4kb_local};
-            let flags = user_leaf_flags(perms, false);
+            let flags = user_leaf_flags(perms, false, dst);
             let _ = unmap_4kb_local(self.root, page_va);
             map_4kb(self.root, page_va, dst, flags).is_ok()
         };
@@ -12709,7 +12836,8 @@ impl AddressSpace {
             // SAFETY: same live-root / backing contract.
             unsafe {
                 use crate::x86_64::paging::map_4kb;
-                let flags = user_leaf_flags(perms, user_page_writable(perms, expected_src));
+                let flags =
+                    user_leaf_flags(perms, user_page_writable(perms, expected_src), expected_src);
                 let _ = map_4kb(self.root, page_va, expected_src, flags);
             }
             return Err(());
@@ -13121,7 +13249,7 @@ impl AddressSpace {
             .get(page_idx)
             .ok_or(AddressSpaceError::Unmapped)?;
 
-        let flags = user_leaf_flags(region.perms, user_page_writable(region.perms, phys));
+        let flags = user_leaf_flags(region.perms, user_page_writable(region.perms, phys), phys);
 
         // COW-break hot path (one call per first-write #PF). Lifetime PCIDs
         // retain entries on prior CPUs even for a single-threaded process, so
@@ -13182,7 +13310,7 @@ impl AddressSpace {
             .ok_or(AddressSpaceError::Unmapped)?;
 
         // Mirror the materialize() flag derivation for aarch64.
-        let flags = user_leaf_flags(region.perms, user_page_writable(region.perms, phys));
+        let flags = user_leaf_flags(region.perms, user_page_writable(region.perms, phys), phys);
 
         // SAFETY: `self.root` is a valid `TTBR0_EL1` table (checked non-zero
         // above); `page_va` was just located inside `region`. unmap_4kb

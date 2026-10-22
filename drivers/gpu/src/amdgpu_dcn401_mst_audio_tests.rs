@@ -87,7 +87,7 @@ fn fixture(stream: u8, depth: ColorDepth) -> (Engine<MstIo>, Link) {
     (e, link)
 }
 fn start_audio(e: &mut Engine<MstIo>) -> DisplayAudio {
-    run(e.start_mst_audio(path(2), info(), 24)).unwrap()
+    run(e.start_mst_audio(path(2), info(), 24, e.test_audio_endpoint())).unwrap()
 }
 fn dcn401_mst_audio_streams_depths_and_roundtrip() -> TestResult {
     for stream in 0..4 {
@@ -140,7 +140,10 @@ fn dcn401_mst_audio_streams_depths_and_roundtrip() -> TestResult {
                 let writes = e.io.writes.len();
                 assert_eq!(run(e.stop_dp_video(&mut link, path(2))), Err(Error::Busy));
                 assert_eq!(e.io.writes.len(), writes);
-                assert_eq!(run(e.start_dp_audio(path(2), info())), Err(Error::Busy));
+                assert_eq!(
+                    run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())),
+                    Err(Error::Busy)
+                );
                 run(e.stop_dp_audio(path(2))).unwrap();
                 assert!(e.status.dp_audio.is_none() && e.status.mst_audio_payload.is_none());
                 assert_eq!(e.io.fake().regs[&dio(stream, 0x2141)] & 0x1ff1_1111, 0);
@@ -204,7 +207,7 @@ fn dcn401_mst_audio_rejects_unproven_payload_and_source_before_programming() -> 
             }
         }
         assert!(
-            run(e.start_mst_audio(path(2), info(), 24)).is_err(),
+            run(e.start_mst_audio(path(2), info(), 24, e.test_audio_endpoint())).is_err(),
             "case {case}"
         );
         assert!(e.io.writes.is_empty(), "preflight writes, case {case}");
@@ -212,11 +215,11 @@ fn dcn401_mst_audio_rejects_unproven_payload_and_source_before_programming() -> 
     }
     let (mut e, _) = fixture(1, ColorDepth::Bpc8);
     for slots in [0, 1, 64] {
-        assert!(run(e.start_mst_audio(path(2), info(), slots)).is_err());
+        assert!(run(e.start_mst_audio(path(2), info(), slots, e.test_audio_endpoint())).is_err());
         assert!(e.io.writes.is_empty());
     }
     assert_eq!(
-        run(e.start_dp_audio(path(2), info())),
+        run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())),
         Err(Error::Unsupported)
     );
     TestResult::Pass
@@ -240,7 +243,7 @@ fn dcn401_mst_audio_partial_failures_retain_both_owners() -> TestResult {
         let result = if stopping {
             run(e.stop_dp_audio(path(2)))
         } else {
-            run(e.start_mst_audio(path(2), info(), 24)).map(|_| ())
+            run(e.start_mst_audio(path(2), info(), 24, e.test_audio_endpoint())).map(|_| ())
         };
         assert!(matches!(result, Err(Error::Readback(_))));
         assert!(matches!(e.status.state, State::Failed(_)));
@@ -296,7 +299,7 @@ fn dcn401_mst_audio_two_streams_survive_link_owner_handover() -> TestResult {
             pipe: 3,
             depth: ColorDepth::Bpc8,
             limited: false,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
         },
         c,
@@ -370,7 +373,7 @@ fn dcn401_mst_audio_endpoint_collision_includes_other_transports() -> TestResult
         }
         let writes = e.io.writes.len();
         assert_eq!(
-            run(e.start_mst_audio(path(2), info(), 24)),
+            run(e.start_mst_audio(path(2), info(), 24, e.test_audio_endpoint())),
             Err(Error::Busy)
         );
         assert_eq!(e.io.writes.len(), writes);
@@ -413,10 +416,11 @@ fn dcn401_mst_audio_requires_matching_live_scanout_witnesses() -> TestResult {
         plan: dml::admit(
             &soc,
             &dml::Mode {
+                hdmi: false,
                 timing: t,
                 pitch: (t.h_active + 63) & !63,
                 bytes_per_pixel: 4,
-                ycbcr420: false,
+                encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
                 dsc: None,
                 planes: [None; dml::MAX_PLANES],
             },
@@ -517,7 +521,7 @@ fn dcn401_mst_dsc_audio_shares_pps_and_budgets_compressed_bpp() -> TestResult {
         };
         let before = pps(&mut e);
         for _ in 0..2 {
-            let a = run(e.start_mst_audio(path(2), info(), 24)).unwrap();
+            let a = run(e.start_mst_audio(path(2), info(), 24, e.test_audio_endpoint())).unwrap();
             let f = e.status.dp_video_running.unwrap().frontend;
             let t = f.blank.timing.request.timing;
             assert_eq!(

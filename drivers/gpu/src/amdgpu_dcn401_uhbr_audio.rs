@@ -1,5 +1,6 @@
 //! DCN401 UHBR SST LPCM: dcn31 HPO stream encoder + APG, and Azalia.
-//! APG instance follows the HPO stream; its input mux chooses the endpoint.
+//! APG instance follows the HPO stream; its input mux chooses the endpoint
+//! the stream acquired (keyed by its DIO stream encoder, as for every signal).
 use super::*;
 use crate::amdgpu_dcn401_otg::dp_phy::training::uhbr::video::{uhbr_dsc_payload, uhbr_payload};
 #[path = "amdgpu_dcn401_uhbr_audio_bw.rs"]
@@ -136,7 +137,7 @@ impl<I: Io> Engine<I> {
         a: &DisplayAudio,
         enabled: bool,
     ) -> Result<(), Error> {
-        if !a.dp || a.endpoint != v.stream {
+        if !a.dp {
             return Err(Error::Invalid);
         }
         let l = self.layout;
@@ -194,6 +195,7 @@ impl<I: Io> Engine<I> {
         path: Path,
         info: AudioInfo,
         mst: Option<u8>,
+        endpoint: u8,
     ) -> Result<DisplayAudio, Error> {
         if self.status.uhbr_audio.is_some() {
             return Err(Error::Busy);
@@ -217,7 +219,7 @@ impl<I: Io> Engine<I> {
         let a = DisplayAudio {
             info,
             dp: true,
-            endpoint: v.stream,
+            endpoint,
             channels: 0xff,
             descriptors,
             hbr: uhbr_hbr(&t, bpc(&v), v.link.settings, dsc.as_ref()),

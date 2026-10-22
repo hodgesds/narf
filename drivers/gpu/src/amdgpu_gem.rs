@@ -59,6 +59,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::future::Future;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_filesystem::FsError;
@@ -383,10 +384,12 @@ pub const fn gmc_v12_dcc_alignment(gc: (u8, u8, u8), max_texture_channel_caches:
 
 /// amdgpu_vram_mgr_new's adjust_dcc_size for a buffer of `flags` on card
 /// `card`: the card's DCC alignment for a GFX12_DCC buffer, else 0. NARF
-/// places every VRAM buffer as one reservation, which is the
-/// VRAM_CONTIGUOUS path, so a DCC buffer takes the DCC placement wherever
-/// it lands in VRAM (create, every move back, and so the scanout pin, for
-/// which prepare_fb sets VRAM_CONTIGUOUS).
+/// places every VRAM buffer as one reservation, so a DCC buffer takes the
+/// VRAM_CONTIGUOUS path's power-of-two block wherever it lands in VRAM
+/// (create, every move back, and so the scanout pin, for which prepare_fb
+/// sets VRAM_CONTIGUOUS) and, where no block is free, its own size at the
+/// DCC alignment (`Pool::reserve_dcc`). This native range-allocation
+/// fallback needs no temporary larger block and remains contiguous.
 fn dcc_adjust(card: Option<u32>, flags: u64) -> u64 {
     if flags & u64::from(uapi::AMDGPU_GEM_CREATE_GFX12_DCC) == 0 {
         return 0;
@@ -1227,12 +1230,69 @@ impl Drop for GemPlacement {
 type GemTable = IrqSafeSpinLock<BTreeMap<u32, Arc<GemObject>>>;
 static GEM_TABLES: IrqSafeSpinLock<Vec<(u32, Weak<GemTable>)>> = IrqSafeSpinLock::new(Vec::new());
 
-// Sharding bounds storage without imposing a lifetime requirement on card
-// registration. Collisions only serialize unrelated cards.
-static PLACEMENT_GATES: [narf_lib::mutex::Mutex<()>; 16] =
-    [const { narf_lib::mutex::Mutex::new(()) }; 16];
+// DRM registration is append-only. One permanent cell per card makes a
+// quarantined reset exclude only that device, including after 16 cards.
+// The publication lock makes every concurrent lookup share one gate.
+static PLACEMENT_STATES: IrqSafeSpinLock<Vec<(u32, &'static PlacementState)>> =
+    IrqSafeSpinLock::new(Vec::new());
+static NEXT_PLACEMENT_WAITER: AtomicU64 = AtomicU64::new(1);
+
+struct PlacementState {
+    gate: narf_lib::mutex::Mutex<()>,
+    ready: narf_lib::readiness::Readiness,
+}
+fn placement_state(card: u32) -> Result<&'static PlacementState, FsError> {
+    let mut states = PLACEMENT_STATES.lock();
+    if let Some((_, state)) = states.iter().find(|(id, _)| *id == card) {
+        return Ok(*state);
+    }
+    states.try_reserve(1).map_err(|_| FsError::OutOfMemory)?;
+    // Vec's fallible reservation needs no allocator_api. The exact one-cell
+    // allocation becomes a permanent box without a second allocation,
+    // preserving the existing static guard lifetime.
+    let mut cell = Vec::new();
+    cell.try_reserve_exact(1)
+        .map_err(|_| FsError::OutOfMemory)?;
+    cell.push(PlacementState {
+        gate: narf_lib::mutex::Mutex::new(()),
+        ready: narf_lib::readiness::Readiness::new(0),
+    });
+    let state = &alloc::boxed::Box::leak(cell.into_boxed_slice())[0];
+    states.push((card, state));
+    Ok(state)
+}
+
+/// Terminal device loss wakes even clients already queued behind a reset
+/// guard which cannot safely be released. Temporary suspend never sets it.
+pub(crate) fn mark_placement_lost(card: u32) {
+    // Reset owns a PlacementGuard, so its cell is already published and
+    // this lookup allocates nothing.
+    placement_state(card)
+        .expect("reset placement cell already exists")
+        .ready
+        .set_wake_all(1, 0);
+}
+
+pub(crate) fn ensure_placement_live(card: u32) -> Result<(), FsError> {
+    if placement_state(card)?.ready.mask() != 0 {
+        Err(FsError::NoDevice)
+    } else {
+        Ok(())
+    }
+}
+
+struct PlacementLossWaiter {
+    ready: &'static narf_lib::readiness::Readiness,
+    id: u64,
+}
+impl Drop for PlacementLossWaiter {
+    fn drop(&mut self) {
+        self.ready.disarm(self.id);
+    }
+}
 
 /// Excludes new jobs and VA edits while a card's mappings are rebound.
+#[derive(Debug)]
 pub(crate) struct PlacementGuard {
     card: u32,
     _held: narf_lib::mutex::MutexGuard<'static, ()>,
@@ -1242,19 +1302,54 @@ impl PlacementGuard {
         self.card
     }
 }
+#[cfg(feature = "kernel-test")]
 pub(crate) async fn lock_placement(card: u32) -> PlacementGuard {
     PlacementGuard {
         card,
-        _held: PLACEMENT_GATES[card as usize % PLACEMENT_GATES.len()]
+        _held: placement_state(card)
+            .expect("internal placement admission allocation")
+            .gate
             .lock()
             .await,
     }
 }
+/// Client admission races the placement mutex against terminal device loss.
+/// Both waiter registrations are removed on success, refusal or cancellation.
+pub(crate) async fn lock_placement_live(card: u32) -> Result<PlacementGuard, FsError> {
+    let state = placement_state(card)?;
+    let waiter = PlacementLossWaiter {
+        ready: &state.ready,
+        id: NEXT_PLACEMENT_WAITER.fetch_add(1, Ordering::Relaxed),
+    };
+    let mut acquire = core::pin::pin!(state.gate.lock());
+    core::future::poll_fn(|cx| {
+        if waiter.ready.arm(waiter.id, 1, cx.waker()).is_ready() {
+            return core::task::Poll::Ready(Err(FsError::NoDevice));
+        }
+        match acquire.as_mut().poll(cx) {
+            core::task::Poll::Ready(held) => {
+                // Loss can race acquisition; never hand a client a guard
+                // whose reset has just been quarantined.
+                core::task::Poll::Ready(
+                    ensure_placement_live(card).map(|()| PlacementGuard { card, _held: held }),
+                )
+            }
+            core::task::Poll::Pending => core::task::Poll::Pending,
+        }
+    })
+    .await
+}
 pub(crate) fn try_placement(card: u32) -> Option<PlacementGuard> {
     Some(PlacementGuard {
         card,
-        _held: PLACEMENT_GATES[card as usize % PLACEMENT_GATES.len()].try_lock()?,
+        _held: placement_state(card).ok()?.gate.try_lock()?,
     })
+}
+pub(crate) fn try_placement_live(card: u32) -> Result<Option<PlacementGuard>, FsError> {
+    ensure_placement_live(card)?;
+    let guard = try_placement(card);
+    ensure_placement_live(card)?;
+    Ok(guard)
 }
 
 /// Every live buffer created on each card, whatever holds it (a handle, a
@@ -1267,7 +1362,7 @@ static CARD_OBJECTS: IrqSafeSpinLock<Vec<(u32, Weak<GemObject>)>> =
 static LRU_CARDS: IrqSafeSpinLock<Vec<u32>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Make DRM card `card`'s evictions (suspend's `evict_all`, pressure's
-/// `evict_visible` and `reclaim_vram`) walk every live buffer of the card,
+/// `evict_visible_locked` and `reclaim_vram_locked`) walk every live buffer of the card,
 /// as TTM walks its LRU, including one only a framebuffer holds (CREATE_DUMB,
 /// ADDFB2, then the handle closed). Otherwise they walk the opens' handle
 /// tables (a card that never sets it keeps that).
@@ -1310,7 +1405,8 @@ fn eviction_candidates(card: u32) -> Vec<Arc<GemObject>> {
 
 /// Reclaim idle client VRAM; address leases and unsignalled fences pin it.
 /// A shared handle or PRIME export alone does not pin placement.
-fn evict_visible(card: u32, fits: impl Fn() -> bool) {
+fn evict_visible_locked(gate: &PlacementGuard, fits: impl Fn() -> bool) {
+    let card = gate.card();
     for object in eviction_candidates(card) {
         if !object.system() && !object.pinned() {
             let _ = object.relocate(false);
@@ -1364,14 +1460,23 @@ pub(crate) fn restore_domains(touched: Vec<(Arc<GemObject>, u64)>) {
 /// mapped ones included (their mappings follow), until `size` bytes at
 /// `align` fit in the visible heap (or, for `no_cpu`, past the BAR). True
 /// once they do; the probe reservation is released again.
-async fn reclaim_vram(card: u32, heap: &VramHeap, size: u64, align: u64, flags: u64) -> bool {
+/// Reclaim with placement admission already held. A commit excludes its
+/// complete target set, including targets promoted earlier in this loop.
+async fn reclaim_vram_locked(
+    gate: &PlacementGuard,
+    heap: &VramHeap,
+    size: u64,
+    align: u64,
+    flags: u64,
+    excluded: &[Arc<GemObject>],
+) -> bool {
+    let card = gate.card();
     let no_cpu = flags & u64::from(uapi::AMDGPU_GEM_CREATE_NO_CPU_ACCESS) != 0;
-    let gate = lock_placement(card).await;
     for object in eviction_candidates(card) {
-        if object.system() {
+        if object.system() || excluded.iter().any(|target| Arc::ptr_eq(target, &object)) {
             continue;
         }
-        let _ = crate::amdgpu_vm::relocate(&gate, &object, false).await;
+        let _ = crate::amdgpu_vm::relocate(gate, &object, false).await;
         if reserve_visible(heap, Some(card), flags, size, align).is_ok()
             || (no_cpu
                 && heap.unmapped.as_ref().is_some_and(|u| {
@@ -1456,18 +1561,25 @@ pub async fn dispatch_async(
     if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_CREATE {
         return None;
     }
-    let result = create(state, arg);
+    let gate = match state.card {
+        Some(card) => match lock_placement_live(card).await {
+            Ok(gate) => Some(gate),
+            Err(error) => return Some(Err(error)),
+        },
+        None => None,
+    };
+    let result = create_locked(state, arg, gate.as_ref());
     if result != Err(FsError::NoSpace) {
         return Some(result);
     }
-    let Some(card) = state.card else {
+    let Some(gate) = gate.as_ref() else {
         return Some(result);
     };
-    let Some(heap) = vram_heap(card) else {
+    let Some(heap) = vram_heap(gate.card()) else {
         return Some(result);
     };
-    // SAFETY: same validated ioctl pointer contract as create; copy_in bounds
-    // and SMAP-brackets a fresh input snapshot. The retry validates it again.
+    // SAFETY: same validated ioctl pointer contract as create; every input
+    // is validated again for the retry, under the same placement admission.
     let bytes = match unsafe { copy_in(arg, 32) } {
         Ok(bytes) => bytes,
         Err(error) => return Some(Err(error)),
@@ -1488,8 +1600,8 @@ pub async fn dispatch_async(
         return Some(Err(FsError::InvalidData));
     };
     let flags = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-    if reclaim_vram(card, &heap, size, align, flags).await {
-        return Some(create(state, arg));
+    if reclaim_vram_locked(gate, &heap, size, align, flags, &[]).await {
+        return Some(create_locked(state, arg, Some(gate)));
     }
     Some(result)
 }
@@ -1504,45 +1616,101 @@ pub async fn create_dumb_async(
     height: u32,
     bpp: u32,
 ) -> Result<(u32, u32, u64), FsError> {
-    let result = state.create_dumb(width, height, bpp);
+    let card = state.card.ok_or(FsError::NoDevice)?;
+    let gate = lock_placement_live(card).await?;
+    let result = state.create_dumb_locked(width, height, bpp, &gate);
     if result != Err(FsError::NoSpace) {
         return result;
     }
-    let (Some(card), Ok((_, size))) = (state.card, dumb_layout(width, height, bpp)) else {
+    let Ok((_, size)) = dumb_layout(width, height, bpp) else {
         return result;
     };
     let Some(heap) = vram_heap(card) else {
         return result;
     };
-    if reclaim_vram(card, &heap, size, PAGE_SIZE, DUMB_CREATE_FLAGS).await {
-        return state.create_dumb(width, height, bpp);
+    if reclaim_vram_locked(&gate, &heap, size, PAGE_SIZE, DUMB_CREATE_FLAGS, &[]).await {
+        return state.create_dumb_locked(width, height, bpp, &gate);
     }
     result
+}
+
+/// Placement exclusion retained from scanout validation through KMS pinning.
+/// Dropping this guard releases admission on success, error or cancellation.
+#[must_use = "retain scanout preparation until the KMS commit has acquired its pins"]
+#[derive(Debug)]
+pub struct ScanoutPreparation {
+    _gate: PlacementGuard,
 }
 
 /// amdgpu_dm_plane_helper_prepare_fb's amdgpu_bo_pin validation, ahead of
 /// the commit that pins: each of `objects` that has left VRAM (suspend's
 /// evict_all, or eviction for another allocation) and is not pinned moves
 /// back, CPU mappings and all, so the commit's `pin_scanout` finds it in
-/// VRAM. A buffer that cannot move stays put and its pin is refused.
-pub async fn prepare_scanout(card: u32, objects: Vec<Arc<GemObject>>) {
-    let objects: Vec<_> = objects
-        .into_iter()
-        .filter(|o| {
-            o.system()
-                && !o.pinned()
-                && o.allowed_domains.load(Ordering::Acquire)
-                    & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
-                    != 0
-        })
-        .collect();
-    if objects.is_empty() {
-        return;
+/// VRAM. Other idle BOs are reclaimed if necessary; every commit target
+/// is excluded from that reclamation. A migration failure aborts preparation.
+/// Retain the returned guard through the synchronous KMS commit: neither
+/// asynchronous relocation nor synchronous pressure may evict a prepared
+/// buffer before `pin_scanout` takes over its lifetime protection.
+pub async fn prepare_scanout(
+    card: u32,
+    objects: Vec<Arc<GemObject>>,
+) -> Result<ScanoutPreparation, FsError> {
+    let gate = lock_placement_live(card).await?;
+    prepare_scanout_locked(gate, objects).await
+}
+
+/// The caller resolves exact commit targets while holding this guard,
+/// outside a KMS spinlock. Errors occur before any KMS state/event change.
+pub(crate) async fn prepare_scanout_locked(
+    gate: PlacementGuard,
+    mut objects: Vec<Arc<GemObject>>,
+) -> Result<ScanoutPreparation, FsError> {
+    let card = gate.card();
+    let mut unique: Vec<Arc<GemObject>> = Vec::with_capacity(objects.len());
+    for object in objects.drain(..) {
+        if object.card() != Some(card) {
+            return Err(FsError::InvalidData);
+        }
+        if !unique.iter().any(|other| Arc::ptr_eq(other, &object)) {
+            unique.push(object);
+        }
     }
-    let gate = lock_placement(card).await;
-    for object in objects {
-        let _ = crate::amdgpu_vm::relocate(&gate, &object, true).await;
+    for object in &unique {
+        // Preserve amdgpu_bo_pin's domain/userptr/foreign validation before
+        // trying to move it; these objects cannot become display buffers.
+        if object.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
+            == 0
+        {
+            return Err(FsError::InvalidData);
+        }
+        if object.is_userptr() {
+            return Err(FsError::OperationNotPermitted);
+        }
+        if !object.system() || object.pinned() {
+            continue;
+        }
+        match crate::amdgpu_vm::relocate(&gate, object, true).await {
+            Ok(()) => {}
+            Err(FsError::NoSpace | FsError::OutOfMemory) => {
+                let heap = vram_heap(card).ok_or(FsError::NoDevice)?;
+                if !reclaim_vram_locked(
+                    &gate,
+                    &heap,
+                    object.byte_len,
+                    object.alignment,
+                    object.flags,
+                    &unique,
+                )
+                .await
+                {
+                    return Err(FsError::OutOfMemory);
+                }
+                crate::amdgpu_vm::relocate(&gate, object, true).await?;
+            }
+            Err(error) => return Err(error),
+        }
     }
+    Ok(ScanoutPreparation { _gate: gate })
 }
 
 /// Per-open GEM state. One of these per `/dev/dri/*` open on an amdgpu card.
@@ -1702,7 +1870,16 @@ impl GemState {
         let object = self.get(handle)?;
         let target_vram = object.preferred_domains() & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM) != 0;
         if target_vram == object.system() {
-            let _ = object.relocate(target_vram);
+            // Lookup's opportunistic promotion must not publish VRAM while
+            // reset/suspend owns placement admission. An already-admitted
+            // VM/CS caller keeps the current placement and coordinates its
+            // own move instead of recursively acquiring this mutex.
+            let gate = self
+                .card
+                .and_then(|card| try_placement_live(card).ok().flatten());
+            if self.card.is_none() || gate.is_some() {
+                let _ = object.relocate(target_vram);
+            }
         }
         Some(object)
     }
@@ -1724,6 +1901,13 @@ impl GemState {
         self.validated(handle)
     }
 
+    /// Own-open identity capture without lookup's opportunistic promotion.
+    /// KMS decodes handles before validation; it must migrate only after
+    /// admitting the complete request under its placement guard.
+    pub(crate) fn object_unvalidated(&self, handle: u32) -> Option<Arc<GemObject>> {
+        self.get(handle)
+    }
+
     /// Whether `handle` belongs to this table at all, so `GEM_CLOSE` can tell
     /// an amdgpu handle from a dumb one without consulting both.
     pub fn owns(&self, handle: u32) -> bool {
@@ -1737,7 +1921,7 @@ impl GemState {
     /// once placed). CPU_ACCESS_REQUIRED keeps it in the BAR-visible heap,
     /// and VRAM_CONTIGUOUS is one reservation, zeroed through the BAR. When
     /// visible VRAM is full, idle unmapped buffers are evicted first
-    /// (`evict_visible`; [`create_dumb_async`] also moves mapped ones);
+    /// (`evict_visible_locked`; [`create_dumb_async`] also moves mapped ones);
     /// there is no GTT fallback, so it is then `NoSpace` (ENOMEM). Returns
     /// `(handle, pitch, size)`; the handle is in this open's table, as
     /// drm_gem_handle_create puts it in the file's.
@@ -1747,14 +1931,29 @@ impl GemState {
         height: u32,
         bpp: u32,
     ) -> Result<(u32, u32, u64), FsError> {
+        let card = self.card.ok_or(FsError::NoDevice)?;
+        let gate = try_placement_live(card)?.ok_or(FsError::Busy)?;
+        self.create_dumb_locked(width, height, bpp, &gate)
+    }
+
+    fn create_dumb_locked(
+        &self,
+        width: u32,
+        height: u32,
+        bpp: u32,
+        gate: &PlacementGuard,
+    ) -> Result<(u32, u32, u64), FsError> {
         let (pitch, byte_len) = dumb_layout(width, height, bpp)?;
         let card = self.card.ok_or(FsError::NoDevice)?;
+        if gate.card() != card {
+            return Err(FsError::InvalidData);
+        }
         let heap = vram_heap(card).ok_or(FsError::NoDevice)?;
         let reservation = heap
             .pool
             .reserve_aligned(byte_len, PAGE_SIZE)
             .or_else(|_| {
-                evict_visible(card, || {
+                evict_visible_locked(gate, || {
                     heap.pool.reserve_aligned(byte_len, PAGE_SIZE).is_ok()
                 });
                 heap.pool.reserve_aligned(byte_len, PAGE_SIZE)
@@ -1793,6 +1992,35 @@ impl GemState {
             pin_count: AtomicU32::new(0),
         })?;
         Ok((handle, pitch, byte_len))
+    }
+
+    /// Owned diagnostic storage, using ordinary GTT accounting and this open's
+    /// handle table. The borrowed card gate spans allocation and publication.
+    pub(crate) fn create_kernel_system(
+        &self,
+        bytes: u64,
+        gate: &PlacementGuard,
+    ) -> Result<(u32, Arc<GemObject>), FsError> {
+        if self.card != Some(gate.card()) {
+            return Err(FsError::InvalidData);
+        }
+        let object = GemObject {
+            placement: IrqSafeSpinLock::new(Arc::new(GemPlacement::new_system(bytes)?)),
+            byte_len: bytes,
+            alignment: PAGE_SIZE,
+            preferred_domains: AtomicU64::new(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT)),
+            allowed_domains: AtomicU64::new(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT)),
+            flags: 0,
+            metadata: IrqSafeSpinLock::new(Metadata::default()),
+            card: self.card,
+            dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
+            pin_count: AtomicU32::new(0),
+        };
+        let handle = self.insert(object)?;
+        Ok((
+            handle,
+            self.object_unvalidated(handle).ok_or(FsError::NotFound)?,
+        ))
     }
 
     /// `amdgpu_mode_dumb_mmap` (MAP_DUMB) for a handle of this table: the
@@ -1951,6 +2179,23 @@ fn alloc_system(pages: u64) -> Result<Vec<(u64, u8)>, FsError> {
 
 /// `amdgpu_gem_create_ioctl`.
 fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
+    let gate = match state.card {
+        Some(card) => Some(try_placement_live(card)?.ok_or(FsError::Busy)?),
+        None => None,
+    };
+    create_locked(state, arg, gate.as_ref())
+}
+
+/// Admission spans heap lookup, reservation and CARD_OBJECTS publication.
+/// A card-less software object has no device placement to exclude.
+fn create_locked(
+    state: &GemState,
+    arg: usize,
+    gate: Option<&PlacementGuard>,
+) -> Result<u64, FsError> {
+    if state.card != gate.map(PlacementGuard::card) {
+        return Err(FsError::InvalidData);
+    }
     let size = core::mem::size_of::<uapi::DrmAmdgpuGemCreateIn>();
     // SAFETY: `arg` is the ioctl pointer the trap layer validated (or kernel-
     // owned on the test path); `copy_in` bounds-checks and SMAP-brackets.
@@ -2046,8 +2291,8 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         let reserve = || reserve_visible(&heap, state.card, flags, byte_len, align);
         let reservation = reserve()
             .or_else(|error| {
-                if let Some(card) = state.card {
-                    evict_visible(card, || reserve().is_ok());
+                if let Some(gate) = gate {
+                    evict_visible_locked(gate, || reserve().is_ok());
                 }
                 reserve().map_err(|_| error)
             })
@@ -2408,3 +2653,7 @@ mod dcc_vram_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_gem_eviction_tests.rs"]
 mod eviction_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_placement_liveness_tests.rs"]
+mod placement_liveness_tests;

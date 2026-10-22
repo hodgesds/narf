@@ -135,7 +135,7 @@ fn req(pipe: u8) -> SurfaceRequest {
 /// the default pre-multiplied blend mode: (format, fourcc, bytes per pixel,
 /// SURFACE_PIXEL_FORMAT, crossbar, CNVC format, ALPHA_EN, per-pixel alpha).
 pub(super) type LinuxFormat = (SurfaceFormat, u32, u32, u32, u32, u32, u32, bool);
-pub(super) const LINUX_FORMATS: [LinuxFormat; 13] = [
+pub(super) const LINUX_FORMATS: [LinuxFormat; 17] = [
     (
         SurfaceFormat::Xrgb8888,
         0x3432_5258,
@@ -267,6 +267,46 @@ pub(super) const LINUX_FORMATS: [LinuxFormat; 13] = [
         1,
         false,
     ),
+    (
+        SurfaceFormat::Xrgb16161616,
+        0x3834_5258,
+        8,
+        26,
+        0xe00000,
+        26,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Argb16161616,
+        0x3834_5241,
+        8,
+        26,
+        0xe00000,
+        26,
+        1,
+        true,
+    ),
+    (
+        SurfaceFormat::Xbgr16161616,
+        0x3834_4258,
+        8,
+        26,
+        0xb00000,
+        26,
+        1,
+        false,
+    ),
+    (
+        SurfaceFormat::Abgr16161616,
+        0x3834_4241,
+        8,
+        26,
+        0xb00000,
+        26,
+        1,
+        true,
+    ),
 ];
 
 /// Every format's fourcc, depth, linear pitch and HUBP words, and the
@@ -327,7 +367,11 @@ fn dcn401_surface_programs_every_format_as_linux() -> TestResult {
         drop(surfaces);
         assert_eq!(pool.available(), 4096);
     }
-    for fourcc in [0, 0x3432_5241 ^ 1, 0x3834_5258 /* XR48 */] {
+    for fourcc in [
+        0,
+        0x3432_5241 ^ 1,
+        0x3432_4152, /* RA24, Linux refuses despite its format list */
+    ] {
         assert_eq!(SurfaceFormat::from_fourcc(fourcc), None);
     }
     TestResult::Pass
@@ -1067,4 +1111,65 @@ fn dcn401_surface_stages_split_rotated_and_video_planes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-surface",
     dcn401_surface_stages_split_rotated_and_video_planes
+);
+
+/// Linux maps fixed16 and FP16 into the same DML 444_64 source and scaler
+/// class. Check the full placed surface, including tiled DCC rotation and
+/// scaling, rather than admitting a fixed16 plane at the old 32-bit depth.
+fn dcn401_unorm16_planes_keep_64bit_dml_and_scaler_geometry() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{DccBlock, PlaneSurface, Swizzle, Tiling};
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    for format in [
+        SurfaceFormat::Xrgb16161616,
+        SurfaceFormat::Argb16161616,
+        SurfaceFormat::Xbgr16161616,
+        SurfaceFormat::Abgr16161616,
+    ] {
+        for tiled in [false, true] {
+            let mut r = req(0);
+            r.width = 512;
+            r.height = 256;
+            r.format = format;
+            r.surface = PlaneSurface {
+                tiling: if tiled {
+                    Tiling {
+                        swizzle: Swizzle::S64K2D,
+                        dcc: Some(DccBlock::B128),
+                    }
+                } else {
+                    Tiling::LINEAR
+                },
+                ..PlaneSurface::LINEAR
+            };
+            r.plane = Some(PlaneLayout {
+                src: Rect::new(0, 0, 512, 256),
+                dst: Rect::new(0, 0, 256, 128),
+                stream_width: 256,
+                stream_height: 128,
+                ycbcr420: false,
+                rotation: if tiled { Rotation::R90 } else { Rotation::R0 },
+                blend: Blend::default_for(format),
+                underlay: false,
+            });
+            assert_eq!(r.check(), Ok(()));
+            let fp = SurfaceRequest {
+                format: if format.per_pixel_alpha() {
+                    SurfaceFormat::Argb16161616f
+                } else {
+                    SurfaceFormat::Xrgb16161616f
+                },
+                ..r
+            };
+            assert_eq!(r.bytes(), fp.bytes());
+            assert_eq!(r.dml_plane(), fp.dml_plane());
+            assert_eq!(r.bytes().pitch_bytes, 4096);
+            assert_eq!(r.dml_plane().bytes_per_pixel, 8);
+            assert!(r.scalers().all(|(_, s)| s.ok));
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-surface",
+    dcn401_unorm16_planes_keep_64bit_dml_and_scaler_geometry
 );

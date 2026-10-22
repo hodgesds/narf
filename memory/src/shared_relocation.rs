@@ -11,6 +11,9 @@ type LeafFlags = crate::aarch64::paging::PtFlags;
 struct Alias {
     space: usize,
     region: u64,
+    /// The region's permissions, for recomputing the leaf memory type of
+    /// whichever frame the alias is rebound to.
+    perms: RegionPerms,
     slot: usize,
     va: VirtAddr,
     frame: usize,
@@ -38,7 +41,8 @@ struct Span {
 /// Every allocation (alias list, destination reverse-map rows and owner
 /// capacity) and every validation precedes leaf revocation, so neither the
 /// commit nor the rebind can fail for lack of memory. Rebinding reinstalls the
-/// exact original leaf attributes on the retained leaf-table paths; absent
+/// original leaf attributes on the retained leaf-table paths, with the memory
+/// type recomputed for the target frame (`memtype::rebind_leaf_flags`); absent
 /// metadata aliases stay absent, and reverse-map owners move with exactly the
 /// aliases that had them.
 ///
@@ -139,6 +143,7 @@ pub unsafe fn with_revoked_shared_frames(
                     found.push(Alias {
                         space: s,
                         region: region.base.raw(),
+                        perms: region.perms,
                         slot,
                         va,
                         frame,
@@ -241,6 +246,11 @@ pub unsafe fn with_revoked_shared_frames(
             let Some(flags) = alias.leaf else {
                 continue;
             };
+            // The original attributes, except the memory type: that belongs
+            // to the frame, so a write-combining device leaf rebound onto
+            // System RAM becomes write-back (`memtype` alias rule). Restoring
+            // the old frame on error recomputes its original type.
+            let flags = crate::memtype::rebind_leaf_flags(flags, alias.perms, phys);
             // SAFETY: exact same retained leaf-table path, live target and the
             // original leaf attributes. No page-table allocation is needed;
             // an error here is an internal invariant violation.

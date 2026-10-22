@@ -1432,14 +1432,14 @@ mod tests {
             for id in [in_formats_blob_id(plane), in_formats_async_blob_id(plane)] {
                 let blob = in_formats_blob(&card, id).unwrap();
                 let word = |at: usize| u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
-                // 24 + 15 formats * 4 = 84, aligned to 88.
+                // 24 + 19 formats * 4 = 100, aligned to 104.
                 assert_eq!(
                     [word(0), word(4), word(8), word(12), word(16), word(20)],
-                    [1, 0, 15, 24, 17, 88]
+                    [1, 0, 19, 24, 17, 104]
                 );
-                assert_eq!(blob.len(), 88 + 17 * 24);
+                assert_eq!(blob.len(), 104 + 17 * 24);
                 for (i, m) in PLANE_MODIFIERS.iter().enumerate() {
-                    let at = 88 + 24 * i;
+                    let at = 104 + 24 * i;
                     let mask = u64::from_le_bytes(blob[at..at + 8].try_into().unwrap());
                     let modifier = u64::from_le_bytes(blob[at + 16..at + 24].try_into().unwrap());
                     assert_eq!((mask, modifier), ((1 << formats.len()) - 1, *m));
@@ -1463,6 +1463,72 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/drm",
         drm_native_planes_in_formats_blob_lists_gfx12_modifiers
+    );
+
+    /// Every fixed16 order reaches native overlay geometry through the real
+    /// framebuffer and modifier checks, with 64-bit pitch and alpha semantics.
+    fn drm_native_planes_accept_unorm16_linear_and_tiled_overlays() -> TestResult {
+        use crate::amdgpu_dcn401_otg::{DccBlock, Tiling};
+        use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS};
+        for format in [
+            SurfaceFormat::Xrgb16161616,
+            SurfaceFormat::Argb16161616,
+            SurfaceFormat::Xbgr16161616,
+            SurfaceFormat::Abgr16161616,
+        ] {
+            for tiled in [false, true] {
+                let (mut card, _) = card();
+                card.gfx12_modifiers = true;
+                let tiling = if tiled {
+                    Tiling {
+                        swizzle: Swizzle::S64K2D,
+                        dcc: Some(DccBlock::B128),
+                    }
+                } else {
+                    Tiling::LINEAR
+                };
+                let handle = card.gem.alloc(0x3800_0000, 2 << 20).unwrap();
+                let mut cmd = FbCmd {
+                    width: 256,
+                    height: 256,
+                    pixel_format: format.fourcc(),
+                    flags: FB_MODIFIERS,
+                    ..Default::default()
+                };
+                cmd.handles[0] = handle;
+                cmd.pitches[0] = 2048;
+                cmd.modifier[0] = tiling.modifier();
+                let fb = card.addfb2_cmd(&cmd).unwrap();
+                let mut state = AtomicState::default();
+                state.planes.push(on(
+                    OVERLAY_PLANE_ID_BASE,
+                    fb,
+                    (256, 256),
+                    (100, 50, 128, 128),
+                ));
+                let checked = check(&card, &state, |_| {
+                    Some(crate::Mode {
+                        width: 1920,
+                        height: 1080,
+                        refresh_hz: 60,
+                        bpp: 32,
+                    })
+                })
+                .unwrap();
+                let overlay = checked[0].setup.overlays[0].unwrap();
+                assert_eq!(overlay.format, format);
+                assert_eq!(overlay.geometry.surface.tiling, tiling);
+                assert_eq!(
+                    overlay.geometry.blend.per_pixel_alpha,
+                    format.per_pixel_alpha()
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_accept_unorm16_linear_and_tiled_overlays
     );
 
     /// A tiled or 4:2:0 framebuffer reaches DC as its whole surface: an

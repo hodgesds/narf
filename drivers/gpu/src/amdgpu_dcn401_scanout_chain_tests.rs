@@ -86,6 +86,14 @@ struct ScanIo {
     /// Further pipes (by bit) whose planes latch with `pipe`'s timing: a
     /// live display's overlays.
     extra: u8,
+    /// DET retirements can outlive a VUPDATE. Active DET changes may be
+    /// modeled as double buffered, so a pre-unlock wait cannot succeed.
+    det_stall: u8,
+    det_on_latch: bool,
+    vupdate_owned: bool,
+    vupdate_pause: bool,
+    vupdate_error: Option<Error>,
+    vupdate_started: Arc<AtomicBool>,
 }
 impl ScanIo {
     fn get(&mut self, at: u64) -> u32 {
@@ -107,6 +115,11 @@ impl ScanIo {
         }
     }
     fn latch_pipe(&mut self, p: u8) {
+        if self.det_on_latch && self.det_stall & (1 << p) == 0 {
+            let at = BASE + (0x4bb + u64::from(p)) * 4;
+            let value = self.get(at);
+            self.put(at, (value & !0x1f00) | (value & 0x1f) << 8);
+        }
         let low = self.get(h(p, ADDRESS));
         let high = self.get(h(p, ADDRESS_HIGH));
         self.put(h(p, EARLIEST_INUSE), low);
@@ -137,6 +150,17 @@ impl ScanIo {
     }
 }
 impl Io for ScanIo {
+    async fn vupdate(&mut self, _pipe: u8, enable: bool) -> Result<(), Error> {
+        self.vupdate_started.store(true, Ordering::SeqCst);
+        if self.vupdate_pause {
+            core::future::pending::<()>().await;
+        }
+        if let Some(e) = self.vupdate_error {
+            return Err(e);
+        }
+        self.vupdate_owned = enable;
+        Ok(())
+    }
     fn wait_poll_limit(&self) -> Option<u32> {
         // After arming, the longest successful latch needs 200 reads. Keep
         // frozen frames/latches bounded without racing the host clock.
@@ -212,7 +236,16 @@ impl Io for ScanIo {
         // The CRB's DET and COMPBUF requests are acknowledged at once
         // (their CURRENT fields follow).
         if (BASE + 0x4ba * 4..=BASE + 0x4be * 4).contains(&at) {
-            value = (value & !0x1f00) | (value & 0x1f) << 8;
+            let index = ((at - (BASE + 0x4ba * 4)) / 4) as u8;
+            let pending = index != 0
+                && (self.det_stall & (1 << (index - 1)) != 0
+                    || self.det_on_latch && self.latching().contains(&(index - 1)));
+            let current = if pending {
+                self.get(at) & 0x1f00
+            } else {
+                (value & 0x1f) << 8
+            };
+            value = (value & !0x1f00) | current;
         }
         self.inner.write(at, value);
         if self.underflow_after == Some(self.writes) {
@@ -253,10 +286,11 @@ fn plan() -> dml::Plan {
     dml::admit(
         &soc(),
         &dml::Mode {
+            hdmi: true,
             timing,
             pitch: 640,
             bytes_per_pixel: 4,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             dsc: None,
             planes: [None; dml::MAX_PLANES],
         },
@@ -268,7 +302,7 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
     let t = Request {
         pipe,
         signal: Signal::Tmds,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: None,
         odm: SplitPipes::NONE,
         timing: plan.mode.timing,
@@ -396,7 +430,7 @@ fn stage_deadlines(s: &mut Staged, pipe: u8, plan: &dml::Plan) -> u64 {
     s.e.io.delay = [0; 5];
     run(s
         .surfaces
-        .prepare_requestor(&mut s.e, pipe, || Ok((clock, config()))))
+        .prepare_requestor_planes(&mut s.e, pipe, &[], Some(plan), || Ok((clock, config()))))
     .unwrap();
     s.e.io.fake().regs.insert(BASE + GLOBAL_TIMER * 4, 0x1002);
     let deadlines = run(s
@@ -455,6 +489,12 @@ fn hdmi_engine(
         writes: 0,
         lock_requested: Arc::new(AtomicBool::new(false)),
         extra: 0,
+        det_stall: 0,
+        det_on_latch: false,
+        vupdate_owned: false,
+        vupdate_pause: false,
+        vupdate_error: None,
+        vupdate_started: Arc::new(AtomicBool::new(false)),
     };
     Engine {
         io: Renamed::new(io, layout),
@@ -1179,7 +1219,9 @@ fn unwind_stage(c: &mut Chain, stage: u32) {
             info.modes[0].format = 2; // AC3 only, no supported LPCM
             info.mode_count = 1;
             assert_eq!(
-                run(c.e.start_hdmi_audio(path(0), info)),
+                run(c
+                    .e
+                    .start_hdmi_audio(path(0), info, c.e.test_audio_endpoint())),
                 Err(Error::Unsupported)
             );
             assert_eq!(c.e.status.state, State::ScanoutRunning(0));
@@ -1468,6 +1510,94 @@ kernel_test_in!(
     dcn401_scanout_chain_moves_a_live_display_to_a_new_plan
 );
 
+/// A live stream's own DET must latch before its new plan is published, but
+/// a different, idle DET can keep the optional compbuf grow pending across
+/// another update. The idle zero request is issued by the real owner.
+fn dcn401_live_det_settles_active_storage_and_retains_idle_retirements() -> TestResult {
+    use crate::amdgpu_dcn401_otg::WatermarkUpdate;
+    let mode = plan().mode;
+    let partner = dml::Mode {
+        hdmi: false,
+        ..mode
+    };
+    let old = dml::admit_all(&soc(), &[mode, partner]).unwrap()[0];
+    let mut faster = partner;
+    faster.timing.pixel_clock_khz *= 4;
+    let next = dml::admit_all(&soc(), &[mode, faster]).unwrap()[0];
+    assert!(next.det_bytes < old.det_bytes);
+    for active_stalls in [false, true] {
+        let p = 0;
+        let mut c = harvest::on_full_pool(|| {
+            let mut s = staged(p, &old);
+            let address = stage_deadlines(&mut s, p, &old);
+            let mut c = hdmi_chain(s, 0, 0, p, address);
+            let clock = c.clock;
+            start_hdmi(&mut c.e, 0, 0, p, clock);
+            c
+        });
+        run(c.start()).unwrap();
+        let mut raised = c.clock;
+        raised.global.display_khz = raised.global.display_khz.max(next.clocks.dispclk_khz);
+        raised.global.dpp_khz = raised.global.dpp_khz.max(next.clocks.dpprefclk_khz);
+        raised.global.request.display_khz = raised.global.display_khz;
+        raised.global.request.dpp_khz = raised.global.dpp_khz;
+        raised.request.dpp_khz = raised.request.dpp_khz.max(next.clocks.dppclk_khz);
+        c.e.status.rebind_timing(p, |a| a.clock = raised);
+        c.clock = raised;
+        let crb = |i: u64| BASE + (0x4ba + i) * 4;
+        let compbuf = 21 - old.det_bytes / 65536 - 5;
+        c.e.io.put(crb(0), compbuf * 0x101);
+        c.e.io.put(crb(2), 5 * 0x101);
+        c.e.status.requestor.as_mut().unwrap().compbuf_bytes = compbuf * 65536;
+        let previous = c.e.status.requestor;
+        c.e.io.det_on_latch = true;
+        c.e.io.det_stall = if active_stalls { 0b11 } else { 0b10 };
+        let update = |c: &mut Chain| {
+            let clock = c.clock;
+            run(c.surfaces.update_live_plan(
+                &mut c.e,
+                p,
+                &next,
+                WatermarkUpdate::Raise,
+                CRYSTAL_KHZ,
+                || Ok((clock, config())),
+            ))
+        };
+        let changed = update(&mut c);
+        if active_stalls {
+            assert!(matches!(changed, Err(Error::Timeout(_))));
+            assert!(matches!(c.e.status.state, State::Failed(_)));
+            assert_eq!(c.e.status.requestor, previous);
+            assert_eq!(c.e.status.deadlines.unwrap().plan, old);
+            assert_eq!(c.e.io.get(crb(0)) & 0x1f, compbuf);
+            continue;
+        }
+        assert_eq!(changed.map(|d| d.plan), Ok(next));
+        assert_eq!(c.e.io.get(crb(1)) & 0x1f1f, next.det_bytes / 65536 * 0x101);
+        assert_eq!(c.e.io.get(crb(2)) & 0x1f1f, 5 << 8);
+        assert_eq!(c.e.io.get(crb(0)) & 0x1f, compbuf);
+        assert!(c.e.displays.compbuf_pending);
+        assert_eq!(c.e.displays.retiring_dets & 0b10, 0b10);
+        assert!(run(c.check()).is_ok());
+        assert!(
+            update(&mut c).is_ok(),
+            "an unchanged optimize must retain the idle retirement"
+        );
+        assert!(c.e.displays.compbuf_pending);
+        c.e.io.put(crb(2), 0);
+        c.e.io.det_stall = 0;
+        assert!(run(c.e.retry_compbuf()).unwrap().is_some());
+        assert_eq!(c.e.io.get(crb(0)) & 0x1f, 21 - next.det_bytes / 65536);
+        assert!(!c.e.displays.compbuf_pending);
+        assert!(run(c.check()).is_ok());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_live_det_settles_active_storage_and_retains_idle_retirements
+);
+
 #[path = "amdgpu_dcn401_plane_update_chain_tests.rs"]
 mod plane_update;
 
@@ -1635,4 +1765,181 @@ fn pstate_plan(mut c: alloc::boxed::Box<Chain>, p: u8) -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_chain_runs_a_uclk_pstate_plan
+);
+
+fn dcn401_scanout_chain_vrr_lfc_uses_actual_flip_and_cancellation_owner() -> TestResult {
+    let mut c = chain(1, 3, 2);
+    run(c.start()).unwrap();
+    let p = c.pipe;
+    let timing = c.e.status.pipes[usize::from(p)].unwrap().request.timing;
+    let lfc_config = crate::amdgpu_freesync::LfcConfig::new(
+        &timing,
+        crate::amdgpu_freesync::VrrRange {
+            min_hz: 20,
+            max_hz: 61,
+        },
+    )
+    .unwrap();
+    c.e.set_drr(p, Some(lfc_config.base())).unwrap();
+    c.e.set_lfc(p, Some(lfc_config)).unwrap();
+    let admitted = c.e.status.scanout.unwrap().plan;
+    run(c.surfaces.prepare_back(&mut c.e, &c.pool, p, config())).unwrap();
+    // Full retained-owner/source verification accepts active DRR totals.
+    // The actual address transaction invokes preflip and real frame polling.
+    run(c.flip()).unwrap();
+    assert_eq!(c.e.status.scanout.unwrap().plan, admitted);
+    assert!(c.e.status.drr.unwrap().lfc_enabled());
+    run(c.check()).unwrap();
+    c.e.io.grant = false;
+    c.e.io.pause_wait = true;
+    let requested = c.e.io.lock_requested.clone();
+    requested.store(false, Ordering::SeqCst);
+    let clock = c.clock;
+    cancel_at(
+        || {
+            c.surfaces
+                .flip(&mut c.e, p, CRYSTAL_KHZ, move || Ok((clock, config())))
+        },
+        || requested.load(Ordering::SeqCst),
+    );
+    assert_eq!(c.e.status.state, State::Flipping(p));
+    let timing_owner = c.e.status.drr;
+    assert_eq!(c.e.lfc_idle(p), Err(Error::Busy));
+    assert_eq!(c.e.status.drr, timing_owner);
+    assert!(c.e.status.scanout.is_some());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_vrr_lfc_uses_actual_flip_and_cancellation_owner
+);
+
+fn dcn401_scanout_vupdate_mask_is_awaited_before_stop_and_cancel_quarantines() -> TestResult {
+    let mut c = chain(1, 3, 2);
+    run(c.start()).unwrap();
+    let p = c.pipe;
+    let t = c.e.status.pipes[usize::from(p)].unwrap().request.timing;
+    let lfc_config = crate::amdgpu_freesync::LfcConfig::new(
+        &t,
+        crate::amdgpu_freesync::VrrRange {
+            min_hz: 20,
+            max_hz: 61,
+        },
+    )
+    .unwrap();
+    run(c.e.configure_drr(p, Some(lfc_config.base()))).unwrap();
+    run(c.e.configure_lfc(p, Some(lfc_config))).unwrap();
+    assert!(c.e.io.vupdate_owned);
+    let held = c.e.status.drr;
+    let source = c.e.io.vupdate_started.clone();
+    source.store(false, Ordering::SeqCst);
+    c.e.io.vupdate_pause = true;
+    let clock = c.clock;
+    let writes = c.e.io.writes;
+    cancel_at(
+        || {
+            c.surfaces
+                .stop_scanout(&mut c.e, p, CRYSTAL_KHZ, move || Ok((clock, config())))
+        },
+        || source.load(Ordering::SeqCst),
+    );
+    assert_eq!(c.e.status.state, State::StoppingScanout(p));
+    assert!(c.e.io.vupdate_owned);
+    assert_eq!(c.e.status.drr, held);
+    assert!(c.e.status.scanout.is_some());
+    assert_eq!(
+        c.e.io.writes, writes,
+        "clock/fetch write preceded source retirement"
+    );
+    assert_eq!(c.e.lfc_idle(p), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_vupdate_mask_is_awaited_before_stop_and_cancel_quarantines
+);
+fn dcn401_scanout_vupdate_mask_failure_blocks_writes_and_success_retires() -> TestResult {
+    let mut c = chain(0, 0, 0);
+    run(c.start()).unwrap();
+    let p = c.pipe;
+    let t = c.e.status.pipes[usize::from(p)].unwrap().request.timing;
+    let lfc = crate::amdgpu_freesync::LfcConfig::new(
+        &t,
+        crate::amdgpu_freesync::VrrRange {
+            min_hz: 20,
+            max_hz: 61,
+        },
+    )
+    .unwrap();
+    run(c.e.configure_drr(p, Some(lfc.base()))).unwrap();
+    run(c.e.configure_lfc(p, Some(lfc))).unwrap();
+    let held = c.e.status.drr;
+    let writes = c.e.io.writes;
+    let error = Error::Interrupts(crate::amdgpu_ih7::Error::Readback);
+    c.e.io.vupdate_error = Some(error);
+    assert_eq!(run(c.stop()), Err(error));
+    assert_eq!(c.e.status.state, State::Failed(error));
+    assert_eq!(c.e.status.drr, held);
+    assert!(c.e.io.vupdate_owned);
+    assert!(c.e.status.scanout.is_some());
+    assert_eq!(c.e.io.writes, writes);
+    // A separate successful full chain masks first and then restores fixed
+    // timing and retires fetch; it does not merely clear a waiter.
+    let mut c = chain(0, 0, 0);
+    run(c.start()).unwrap();
+    run(c.e.configure_drr(0, Some(lfc.base()))).unwrap();
+    run(c.e.configure_lfc(0, Some(lfc))).unwrap();
+    assert!(c.e.io.vupdate_owned);
+    run(c.stop()).unwrap();
+    assert!(!c.e.io.vupdate_owned);
+    assert!(c.e.status.drr.is_none());
+    assert!(c.e.status.scanout.is_none());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_vupdate_mask_failure_blocks_writes_and_success_retires
+);
+fn dcn401_lfc_source_configuration_cancel_and_lost_events_keep_owner() -> TestResult {
+    let mut c = chain(0, 0, 0);
+    run(c.start()).unwrap();
+    let p = c.pipe;
+    let t = c.e.status.pipes[usize::from(p)].unwrap().request.timing;
+    let lfc_config = crate::amdgpu_freesync::LfcConfig::new(
+        &t,
+        crate::amdgpu_freesync::VrrRange {
+            min_hz: 20,
+            max_hz: 61,
+        },
+    )
+    .unwrap();
+    run(c.e.configure_drr(p, Some(lfc_config.base()))).unwrap();
+    run(c.e.configure_lfc(p, Some(lfc_config))).unwrap();
+    // Lost IH history resets BTR even if only one frame appears to have
+    // advanced. Nominal DML and source ownership remain retained.
+    let plan = c.e.status.scanout.unwrap().plan;
+    c.e.io.frozen = true;
+    c.e.lfc_preflip(p, 0).unwrap();
+    c.e.lfc_preflip(p, 100_000).unwrap();
+    assert!(c.e.status.drr.unwrap().lfc().unwrap().active);
+    c.e.lfc_resync(p).unwrap();
+    assert!(!c.e.status.drr.unwrap().lfc().unwrap().active);
+    assert_eq!(c.e.status.scanout.unwrap().plan, plan);
+    assert!(c.e.io.vupdate_owned);
+    c.e.io.vupdate_pause = true;
+    let started = c.e.io.vupdate_started.clone();
+    started.store(false, Ordering::SeqCst);
+    cancel_at(
+        || c.e.configure_lfc(p, None),
+        || started.load(Ordering::SeqCst),
+    );
+    assert_eq!(c.e.status.state, State::UpdatingStream(p));
+    assert!(c.e.io.vupdate_owned);
+    assert!(c.e.status.drr.unwrap().lfc_enabled());
+    assert_eq!(c.e.lfc_idle(p), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_lfc_source_configuration_cancel_and_lost_events_keep_owner
 );

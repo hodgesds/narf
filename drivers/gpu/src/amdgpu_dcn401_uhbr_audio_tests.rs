@@ -169,7 +169,7 @@ fn dcn401_uhbr_audio_programs_apg_endpoint_and_preserves_video() -> TestResult {
                     },
                 );
                 let video = e.status.uhbr_video_running;
-                let a = run(e.start_dp_audio(path(2), info())).unwrap();
+                let a = run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())).unwrap();
                 assert_eq!(a.endpoint, stream);
                 // Every 8-channel LPCM rate fits, so the 192-kHz HBR probe does.
                 assert!(a.dp && a.hbr);
@@ -232,7 +232,7 @@ fn dcn401_uhbr_audio_programs_apg_endpoint_and_preserves_video() -> TestResult {
                         !(hdmi::dio(p, 0x2075)..=hdmi::dio(p, 0x20ba)).contains(&at)
                     }));
                 }
-                run(e.start_dp_audio(path(2), info())).unwrap();
+                run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())).unwrap();
                 run(e.stop_dp_audio(path(2))).unwrap();
                 run(e.stop_uhbr_video(&mut sink, path(2))).unwrap();
             }
@@ -262,15 +262,24 @@ fn dcn401_uhbr_audio_rejects_inherited_or_changed_transport() -> TestResult {
         } else {
             Error::Readback(hpo(2, r))
         };
-        assert_eq!(run(e.start_dp_audio(path(2), info())), Err(error));
+        assert_eq!(
+            run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())),
+            Err(error)
+        );
         assert!(e.io.writes.is_empty());
         assert!(e.status.uhbr_audio.is_none());
     }
     let (mut e, _) = standard();
-    assert_eq!(run(e.start_dp_audio(path(1), info())), Err(Error::Invalid));
+    assert_eq!(
+        run(e.start_dp_audio(path(1), info(), e.test_audio_endpoint())),
+        Err(Error::Invalid)
+    );
     assert!(e.io.writes.is_empty());
     e.io.az.insert((2, 0x54), 0x80000000);
-    assert_eq!(run(e.start_dp_audio(path(2), info())), Err(Error::Busy));
+    assert_eq!(
+        run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())),
+        Err(Error::Busy)
+    );
     assert_eq!(e.io.writes, [(az(2), 0x54)]);
     TestResult::Pass
 }
@@ -284,7 +293,7 @@ fn dcn401_uhbr_audio_failed_writes_and_shutdown_retain_owners() -> TestResult {
         let (mut e, mut sink) = standard();
         let video = e.status.uhbr_video_running;
         e.io.drop_at = Some(hpo(2, r));
-        assert!(run(e.start_dp_audio(path(2), info())).is_err());
+        assert!(run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())).is_err());
         assert!(matches!(e.status.state, State::Failed(_)));
         assert!(e.status.uhbr_audio.is_some());
         assert_eq!(e.status.uhbr_video_running, video);
@@ -293,7 +302,7 @@ fn dcn401_uhbr_audio_failed_writes_and_shutdown_retain_owners() -> TestResult {
     }
     for r in [0x3625, 0x3632, 0x3631, 0x367c, 0x366b] {
         let (mut e, _) = standard();
-        let a = run(e.start_dp_audio(path(2), info())).unwrap();
+        let a = run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())).unwrap();
         *e.io.inner.inner.regs.get_mut(&hpo(2, r)).unwrap() ^= 1;
         let before = e.io.writes.len();
         assert_eq!(
@@ -305,7 +314,7 @@ fn dcn401_uhbr_audio_failed_writes_and_shutdown_retain_owners() -> TestResult {
     }
     for endpoint in [false, true] {
         let (mut e, mut sink) = standard();
-        let a = run(e.start_dp_audio(path(2), info())).unwrap();
+        let a = run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())).unwrap();
         if endpoint {
             e.io.drop_disable = true;
         } else {
@@ -332,7 +341,7 @@ fn dcn401_uhbr_audio_reset_timeout_cancellation_and_drift_quarantine() -> TestRe
         let (mut e, _) = standard();
         e.io.stall = stall;
         assert_eq!(
-            run(e.start_dp_audio(path(2), info())),
+            run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())),
             Err(Error::Timeout(hpo(2, 0x3630)))
         );
         assert!(matches!(e.status.state, State::Failed(_)));
@@ -344,7 +353,7 @@ fn dcn401_uhbr_audio_reset_timeout_cancellation_and_drift_quarantine() -> TestRe
         e.io.stall = stall;
         e.io.pause = true;
         {
-            let mut f = core::pin::pin!(e.start_dp_audio(path(2), info()));
+            let mut f = core::pin::pin!(e.start_dp_audio(path(2), info(), e.test_audio_endpoint()));
             assert!(f
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
@@ -353,7 +362,10 @@ fn dcn401_uhbr_audio_reset_timeout_cancellation_and_drift_quarantine() -> TestRe
         assert_eq!(e.status.state, State::StartingUhbrAudio(2));
         assert!(e.status.uhbr_audio.is_some());
         assert_eq!(e.select_display(1), Err(Error::Busy));
-        assert_eq!(run(e.start_dp_audio(path(2), info())), Err(Error::Busy));
+        assert_eq!(
+            run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())),
+            Err(Error::Busy)
+        );
         assert_eq!(run(e.stop_dp_audio(path(2))), Err(Error::Busy));
         assert_eq!(run(e.stop_uhbr_video(&mut sink, path(2))), Err(Error::Busy));
     }
@@ -361,7 +373,7 @@ fn dcn401_uhbr_audio_reset_timeout_cancellation_and_drift_quarantine() -> TestRe
         let (mut e, _) = standard();
         e.io.drift = Some((hpo(2, r), 0));
         assert_eq!(
-            run(e.start_dp_audio(path(2), info())),
+            run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())),
             Err(Error::Readback(hpo(2, r)))
         );
         assert!(e.status.uhbr_audio.is_some());
@@ -378,7 +390,7 @@ fn dcn401_uhbr_audio_shares_dto_and_excludes_endpoint_collisions() -> TestResult
     let (mut h, mut fw, c) = hdmi::fixture(0, 0, 0);
     run(h.prepare_hdmi_link(&mut fw, hdmi::path(0), hdmi::link(0, 0), c)).unwrap();
     run(h.start_hdmi_video(hdmi::path(0), c)).unwrap();
-    run(h.start_hdmi_audio(hdmi::path(0), hdmi::audio_info())).unwrap();
+    run(h.start_hdmi_audio(hdmi::path(0), hdmi::audio_info(), h.test_audio_endpoint())).unwrap();
     let (mut e, _) = standard();
     e.displays.selected = 1;
     e.displays.parked[0] = *h.status;
@@ -391,7 +403,7 @@ fn dcn401_uhbr_audio_shares_dto_and_excludes_endpoint_collisions() -> TestResult
             .link
             .request
             .pipe = hdmi_pipe;
-        run(e.start_dp_audio(path(2), info())).unwrap();
+        run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())).unwrap();
         assert_eq!(
             e.io.inner.inner.regs[&(bank + 0xab * 4)] & 0x37,
             u32::from(hdmi_pipe)
@@ -400,7 +412,7 @@ fn dcn401_uhbr_audio_shares_dto_and_excludes_endpoint_collisions() -> TestResult
         run(e.stop_dp_audio(path(2))).unwrap();
     }
     e.displays.parked[0].hdmi_audio = None;
-    let a = run(e.start_dp_audio(path(2), info())).unwrap();
+    let a = run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())).unwrap();
     assert_eq!(
         e.io.inner.inner.regs[&(bank + 0xab * 4)] & 0x100030,
         0x100010
@@ -408,7 +420,10 @@ fn dcn401_uhbr_audio_shares_dto_and_excludes_endpoint_collisions() -> TestResult
     run(e.stop_dp_audio(path(2))).unwrap();
     e.displays.parked[0].frl_audio = Some(a);
     let before = e.io.writes.len();
-    assert_eq!(run(e.start_dp_audio(path(2), info())), Err(Error::Busy));
+    assert_eq!(
+        run(e.start_dp_audio(path(2), info(), e.test_audio_endpoint())),
+        Err(Error::Busy)
+    );
     assert_eq!(e.io.writes.len(), before);
     TestResult::Pass
 }
@@ -454,12 +469,15 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
     let mut no_lpcm = raw;
     no_lpcm.modes[0].format = 2;
     assert_eq!(
-        run(e.start_dp_audio(path(2), no_lpcm)),
+        run(e.start_dp_audio(path(2), no_lpcm, e.test_audio_endpoint())),
         Err(Error::Unsupported)
     );
     assert!(e.io.writes.is_empty());
     e.status.state = State::ScanoutRunning(1);
-    assert_eq!(run(e.start_dp_audio(path(2), raw)), Err(Error::Invalid));
+    assert_eq!(
+        run(e.start_dp_audio(path(2), raw, e.test_audio_endpoint())),
+        Err(Error::Invalid)
+    );
     assert!(e.io.writes.is_empty());
     let plan = dml::admit(
         &dml::Soc {
@@ -474,10 +492,11 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
             dchub_refclk_khz: 50_000,
         },
         &dml::Mode {
+            hdmi: false,
             timing,
             pitch: 1920,
             bytes_per_pixel: 4,
-            ycbcr420: false,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
             dsc: None,
             planes: [None; dml::MAX_PLANES],
         },
@@ -498,9 +517,12 @@ fn dcn401_uhbr_audio_filters_capabilities_and_binds_scanout() -> TestResult {
         stream: 0,
         ..scanout
     });
-    assert_eq!(run(e.start_dp_audio(path(2), raw)), Err(Error::Invalid));
+    assert_eq!(
+        run(e.start_dp_audio(path(2), raw, e.test_audio_endpoint())),
+        Err(Error::Invalid)
+    );
     e.status.scanout = Some(scanout);
-    run(e.start_dp_audio(path(2), raw)).unwrap();
+    run(e.start_dp_audio(path(2), raw, e.test_audio_endpoint())).unwrap();
     run(e.stop_dp_audio(path(2))).unwrap();
     assert_eq!(e.status.state, State::ScanoutRunning(1));
     assert_eq!(e.status.scanout, Some(scanout));
@@ -525,8 +547,8 @@ fn dcn401_uhbr_mst_audio_rides_a_completed_payload() -> TestResult {
     };
     let (mut e, _sink) = fixture(2, 1, settings);
     let p = path(2);
-    if run(e.start_dp_audio(p, info())) != Err(Error::Unsupported)
-        || run(e.start_mst_audio(p, info(), 7)) != Err(Error::Invalid)
+    if run(e.start_dp_audio(p, info(), e.test_audio_endpoint())) != Err(Error::Unsupported)
+        || run(e.start_mst_audio(p, info(), 7, e.test_audio_endpoint())) != Err(Error::Invalid)
     {
         return TestResult::Fail("MST audio without its payload");
     }
@@ -534,14 +556,14 @@ fn dcn401_uhbr_mst_audio_rides_a_completed_payload() -> TestResult {
     let row = e.io.inner.inner.regs[&sat];
     e.io.inner.inner.regs.insert(sat, row & !0x7f00 | 5 << 8);
     let writes = e.io.writes.len();
-    if run(e.start_mst_audio(p, info(), 6)) != Err(Error::Readback(sat))
+    if run(e.start_mst_audio(p, info(), 6, e.test_audio_endpoint())) != Err(Error::Readback(sat))
         || e.io.writes.len() != writes
         || e.status.uhbr_audio.is_some()
     {
         return TestResult::Fail("disagreeing allocation row");
     }
     e.io.inner.inner.regs.insert(sat, row);
-    let a = match run(e.start_mst_audio(p, info(), 6)) {
+    let a = match run(e.start_mst_audio(p, info(), 6, e.test_audio_endpoint())) {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("MST audio start"),
     };
@@ -609,7 +631,7 @@ fn dcn401_uhbr_dsc_audio_rides_the_pps_sdp_path() -> TestResult {
     assert_eq!(gsp11 & 1, 1, "PPS sending before audio");
     let v = e.status.uhbr_video_running.unwrap();
     for _ in 0..2 {
-        let a = run(e.start_dp_audio(path(p), info())).unwrap();
+        let a = run(e.start_dp_audio(path(p), info(), e.test_audio_endpoint())).unwrap();
         assert_eq!(
             Some(a.info),
             uhbr_audio_info_with(info(), &req.timing, 8, settings, Some(&cfg))
@@ -638,4 +660,156 @@ fn dcn401_uhbr_dsc_audio_rides_the_pps_sdp_path() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-uhbr-audio",
     dcn401_uhbr_dsc_audio_rides_the_pps_sdp_path
+);
+
+/// What DC gives `outputs` (added in order, each on its OTG master): each
+/// stream's encoders, its audio endpoint keyed by its DIO stream encoder.
+fn acquire(
+    outputs: &[crate::amdgpu_dcn401_resource::StreamOutput],
+) -> Vec<crate::amdgpu_dcn401_resource::StreamEncoders> {
+    use crate::amdgpu_dcn401_resource::{DcState, ScalesAnywhere};
+    let cur = DcState::new(4);
+    let mut state = DcState::new(4);
+    outputs
+        .iter()
+        .enumerate()
+        .map(|(s, &o)| {
+            assert!(state.add_stream(&cur, s as u8, &ScalesAnywhere));
+            state.map_stream_encoders(s as u8, o).unwrap()
+        })
+        .collect()
+}
+/// A stream with audio on PHY link `link` whose link encoder prefers DIG
+/// `engine`, 128b/132b when `hpo_dp`.
+fn audio_output(link: u8, engine: u8, hpo_dp: bool) -> crate::amdgpu_dcn401_resource::StreamOutput {
+    crate::amdgpu_dcn401_resource::StreamOutput {
+        link,
+        preferred_engine: engine,
+        hpo_dp,
+        audio: true,
+    }
+}
+/// Another display's DP audio record on `endpoint`.
+fn audio_on(endpoint: u8) -> DisplayAudio {
+    DisplayAudio {
+        info: info(),
+        dp: true,
+        endpoint,
+        channels: 0xff,
+        descriptors: [0; 14],
+        hbr: false,
+    }
+}
+fn audio_enabled(e: &Engine<AudioIo>, endpoint: u8) -> bool {
+    e.io.az.get(&(endpoint, 0x54)).copied().unwrap_or(0) & 0x8000_0001 == 0x8000_0000
+}
+/// Park `held` endpoints' audio on the displays after the selected one.
+fn hold_elsewhere(e: &mut Engine<AudioIo>, held: &[u8]) {
+    let selected = usize::from(e.displays.selected);
+    for (k, &endpoint) in held.iter().enumerate() {
+        e.displays.parked[(selected + 1 + k) % 4].dp_audio = Some(audio_on(endpoint));
+    }
+}
+
+/// A UHBR monitor on UNIPHY B takes DIO 1 and HPO 0; an 8b/10b one on
+/// UNIPHY A then takes DIO 0. Audio follows the DIO stream encoder for
+/// every signal (find_first_free_audio): the UHBR stream's is endpoint 1,
+/// which HPO 0's APG selects, beside the SST stream's endpoint 0 (the HPO
+/// stream's own index, busy and refused before any write).
+fn dcn401_uhbr_audio_beside_sst_takes_its_dio_stream_encoders_endpoint() -> TestResult {
+    let enc = acquire(&[audio_output(1, 1, true), audio_output(0, 0, false)]);
+    let (uhbr, sst) = (enc[0], enc[1]);
+    if (uhbr.stream_enc, uhbr.hpo_dp_stream_enc, uhbr.audio) != (1, Some(0), Some(1))
+        || (sst.stream_enc, sst.hpo_dp_stream_enc, sst.audio) != (0, None, Some(0))
+    {
+        return TestResult::Fail("DC's encoders and endpoints");
+    }
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr20,
+        mst: false,
+    };
+    let (mut e, _) = fixture(0, 1, settings);
+    hold_elsewhere(&mut e, &[sst.audio.unwrap()]);
+    let writes = e.io.writes.len();
+    if run(e.start_dp_audio(path(2), info(), 0)) != Err(Error::Busy) || e.io.writes.len() != writes
+    {
+        return TestResult::Fail("the SST stream's endpoint");
+    }
+    let Ok(a) = run(e.start_dp_audio(path(2), info(), uhbr.audio.unwrap())) else {
+        return TestResult::Fail("UHBR audio beside SST audio");
+    };
+    if a.endpoint != 1
+        || reg(&e, 0, 0x3625) & 7 != 1
+        || !audio_enabled(&e, 1)
+        || e.io.az.keys().any(|&(k, _)| k != 1)
+    {
+        return TestResult::Fail("APG source and endpoint");
+    }
+    let v = e.status.uhbr_video_running.unwrap();
+    if e.uhbr_audio_verify(&v, &a).is_err() {
+        return TestResult::Fail("running audio witness");
+    }
+    run(e.stop_dp_audio(path(2))).unwrap();
+    if audio_enabled(&e, 1) {
+        return TestResult::Fail("endpoint left enabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-uhbr-audio",
+    dcn401_uhbr_audio_beside_sst_takes_its_dio_stream_encoders_endpoint
+);
+
+/// Two 128b/132b MST streams on one link (UNIPHY B) beside an 8b/10b SST
+/// stream on UNIPHY A: the SST stream takes DIO 0 and endpoint 0, the MST
+/// streams DIO 1 / HPO 0 / endpoint 1 and DIO 3 / HPO 1 / endpoint 3 on
+/// one HPO DP link encoder. The first MST stream's audio rides HPO 0's APG
+/// on endpoint 1 while the others hold theirs.
+fn dcn401_uhbr_mst_audio_beside_others_takes_its_dio_stream_encoders_endpoint() -> TestResult {
+    let enc = acquire(&[
+        audio_output(0, 0, false),
+        audio_output(1, 1, true),
+        audio_output(1, 1, true),
+    ]);
+    let want = [
+        (0, None, Some(0)),
+        (1, Some(0), Some(1)),
+        (3, Some(1), Some(3)),
+    ];
+    if enc
+        .iter()
+        .map(|e| (e.stream_enc, e.hpo_dp_stream_enc, e.audio))
+        .ne(want)
+        || enc[1].hpo_dp_link_enc != enc[2].hpo_dp_link_enc
+    {
+        return TestResult::Fail("DC's encoders and endpoints");
+    }
+    let settings = UhbrSettings {
+        lanes: 4,
+        rate: UhbrRate::Uhbr20,
+        mst: true,
+    };
+    let (mut e, _sink) = fixture(0, 1, settings);
+    hold_elsewhere(&mut e, &[0, 3]);
+    let p = path(2);
+    let writes = e.io.writes.len();
+    if run(e.start_mst_audio(p, info(), 6, 0)) != Err(Error::Busy) || e.io.writes.len() != writes {
+        return TestResult::Fail("the SST stream's endpoint");
+    }
+    let Ok(a) = run(e.start_mst_audio(p, info(), 6, enc[1].audio.unwrap())) else {
+        return TestResult::Fail("MST audio beside the others");
+    };
+    if a.endpoint != 1
+        || reg(&e, 0, 0x3625) & 7 != 1
+        || !audio_enabled(&e, 1)
+        || e.io.az.keys().any(|&(k, _)| k != 1)
+    {
+        return TestResult::Fail("APG source and endpoint");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-uhbr-audio",
+    dcn401_uhbr_mst_audio_beside_others_takes_its_dio_stream_encoders_endpoint
 );

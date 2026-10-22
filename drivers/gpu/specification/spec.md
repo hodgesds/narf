@@ -115,12 +115,37 @@ stay fixed; TLB sequences advance before another submission can run.
 The card gate spans native queue publication, `note_job`, and reservation-fence
 attachment. Dependency waits precede gate acquisition. User GEM_VA ioctls park
 for this gate through `dispatch_async`; synchronous dispatch reports Busy on
-contention. `amdgpu_gem::dispatch_async` retries a strict VRAM create after
+contention. GEM_CREATE and native CREATE_DUMB take admission before even
+their fast allocation path: sync entry tries the gate (Busy on contention),
+and async entry parks, then borrows that one guard across heap lookup,
+reservation/zeroing, reclaim and CARD_OBJECTS/handle publication. Lookup's
+opportunistic promotion also requires a successful nonblocking live guard;
+an already-admitted VM/CS caller retains current backing until its coordinated
+move. No client can repopulate a heap after reset's eviction snapshot or
+continue allocating through a captured heap after it is withdrawn.
+`amdgpu_gem::dispatch_async` retries a strict VRAM create after
 reclaiming GPU-mapped buffers; ordinary allocations retain GTT fallback.
+Placement exclusion is one permanent mutex/readiness cell per append-only DRM
+card registration, published once under a short lookup lock. The cell and
+lookup slot are fallibly allocated on first admission and retained for the
+card's lifetime; permanent reset quarantine cannot block an unrelated card.
+Client paths use `lock_placement_live` (or synchronous `try_placement_live`):
+terminal `mark_placement_lost` wakes every already-queued client and refuses
+new placement, VA, allocation and KMS work with NoDevice, even when an unsafe
+reset must retain its guard forever. Cancellation removes both mutex and
+loss waiters. Temporary suspend retains exclusion without marking loss;
+successful resume releases it normally. Internal reset code may retain the
+infallible guard API; close and release do not require new placement admission.
 Unregistered VM mappings, deferred CPU user-fence writes and legacy raw
 address leases (`GemMapping`, `mmap_lifetime`) still pin backing. GEM and
 PRIME `mmap_backing` instead return a revocable `CpuMap` token
-(`amdgpu_gem::cpu_mapping`): one `CpuBacking` per object holds the current
+(`amdgpu_gem::cpu_mapping`), requesting `MemoryType::WriteCombining` for
+the mapping. User BAR leaves select PAT WC on x86_64 or MAIR Normal-NC
+on aarch64, matching the kernel's prefetchable BAR and framebuffer mappings.
+System RAM leaves stay write-back to match the kernel direct map. The VMA
+retains the WC request across VRAM/GTT migration, fork and mprotect;
+relocation recomputes each destination leaf's cache type, including rollback.
+One `CpuBacking` per object holds the current
 placement lease and registers every frame of that generation with a count of
 external metadata aliases (`retain_cpu_frame`/`release_cpu_frame`, reached
 through the filesystem alias hooks), so the backing survives fork's interval
@@ -440,9 +465,15 @@ pipe resources: fusing leaves them, and the DIO/HPO stream encoder a
 display uses, unchanged. Every whole-hardware sweep (plane retirement,
 idle and power checks, running timing, DET grants) walks `pool.pipes()`;
 the clock owner's idle witnesses of a fused OTG are `(0, 0)` and never
-read. The only fused-instance registers ever read are DCHUBBUB's DET sizes
-(all four, as dcn401_init_crb and dcn401_program_compbuf_segments read
-them); none is written. OTG/HUBP interrupt sources name instances and count
+read. DCHUBBUB's DET sizes are read for all four instances, as
+dcn401_init_crb and dcn401_program_compbuf_segments do. MPC is separately
+unfused: whole, unshared plane retirement initializes all four physical
+MPCC selectors and output muxes, including the ones belonging to fused pipe
+indices, as dcn10_init_pipes sweeps all four `res_cap->num_opp` MPCCs.
+Only their selector and update-lock registers are accessed;
+fused HUBP/DPP/OPP/OTG blocks remain inaccessible. A retained sibling display
+limits retirement to unowned pool pipes, leaving the other physical MPCCs
+untouched. OTG/HUBP interrupt sources name instances and count
 for `pool.pipe(inst)` (`DisplayEvents` by pipe; a fused instance's event is
 unhandled). Planners and the platform take only pool pipes: DC's
 acquisition (below) searches the pool's pipe indices, `route_streams` and
@@ -452,8 +483,9 @@ crtc_count()` (Linux's `max_streams`, the pool's count) CRTCs with
 overlay/underlay/MPC trees, plane updates, cursor locks, timing, DSC, DCCG,
 interrupt mapping and planning on pipe-0-fused, pipe-1-fused and
 pipes-1-and-2-fused boards (`amdgpu_dcn401_harvest_tests.rs`: `Renamed`
-shows a full-board model to the harvested owner and panics on any fused
-instance or field naming one; `guard`/`guard_raw` refuse them for models
+shows a full-board model to the harvested owner and panics on fused pipe
+blocks or fields naming them, with the physical MPC selector exception;
+`guard`/`guard_raw` enforce the same rules for models
 addressed by the owner itself).
 
 **Pipe acquisition (DCN401).** `amdgpu_dcn401_resource::DcState` is DC's
@@ -555,14 +587,19 @@ cursor tasks (`crtc_pipe`) and DisplayEvents (by pipe).
 too, made in the same `DcState` right after each new stream's OTG master,
 as resource_map_pool_resources makes it (`StreamPipes::on(StreamOutput)`:
 the stream's board port as its link, its transmitter's DIG as the link
-encoder's preferred engine, whether it codes 128b/132b;
+encoder's preferred engine, whether it codes 128b/132b and has sink audio;
 `DcState::map_stream_encoders`): a DIO stream encoder for every stream
 (dcn10_find_first_free_match_stream_enc_for_link: the free preferred DIG,
 else the last free one), and on a 128b/132b DP stream the first free HPO
 DP stream encoder and its link's HPO DP link encoder
 (add_hpo_dp_link_enc_to_ctx: the one the link holds, retained, else a
 free one; one per link however many MST streams ride it), refusing the
-state without one; `remove_stream` releases them as
+state without one. Audio-capable streams also acquire an Azalia endpoint
+with Linux's `find_first_free_audio`, using the DIO stream encoder's engine
+for every transport: the matching free endpoint, otherwise the first free
+endpoint. No free endpoint leaves video enabled without audio. The state
+retains this assignment in `StreamEncoders::audio` and excludes it from
+later streams until removal; `remove_stream` releases these resources as
 resource_remove_otg_master_for_stream_output does. `dc_state(running)`
 records each running stream's (`Modeset::{output, encoders}`), so streams
 lit beside it take what it leaves. The start paths program what was
@@ -576,8 +613,9 @@ leaves and the link is handed to another stream's display
 (`MstLink::displays` maps each payload's stream encoder to its head pipe).
 FRL keeps its single HPO FRL encoder. `tests/dcn401_stream_enc/check.sh`
 compiles Linux's acquisition functions verbatim around the DCN 4.0.1 pool
-(four DIO, one virtual, four HPO DP stream and link encoders) and replays
-2000 add/remove sequences over four links
+(four DIO, one virtual, four HPO DP stream and link encoders, four audio
+endpoints) and replays 2000 add/remove sequences over four links plus
+1280 endpoint selections covering every encoder/endpoint acquisition mask
 (`dcn401_stream_encoder_acquisition_matches_linux`).
 
 Deviations from Linux: the
@@ -595,6 +633,22 @@ function 1 of the GPU without a device-id check.
 of this; Navi44's discovery is assumed to match Navi48 apart from the versions
 above (one VCN5.0.0, DCN 4.0.1, MMHUB 4.1.0, OSSSYS 7.0.0, NBIF/NBIO, SMUIO
 14.0.2, HDP 6.x), and any other discovered version fails closed.
+
+### Selected RX 9000 userspace INFO replay
+
+`tests/mesa_info/check.py` executes actual selected Mesa26.2.4 common/device
+initialization and libdrm2.4.134 initialization against unchanged production
+Rust INFO dispatch/builders and GET_CAP responses, using explicit representative
+state and host transport adapters. Both dies must pass the fully published
+query contract only in an explicit hypothetical host3.54/ACCEL envelope.
+Production DRM3.0.0 and ACCEL_WORKING=0 remain unchanged. The production
+ACCEL reply makes libdrm's `_amdgpu_device_initialize` return EBADF before
+Mesa's common GPU initialization; changing only that host value still reaches
+and fails Mesa's minor54 gate. Tests independently preserve both refusals,
+mandatory query failures, VCN withdrawal/unsupported IP, graphics-only degraded
+readiness, optional MAX_IBS fallback and exact raw VCN fields. The harness is
+source/ABI evidence, not native board state, API rendering, general video or
+capability acceptance; it never submits a GPU job.
 
 ### Navi 48 PCIe probe (RX 9070 XT)
 
@@ -616,7 +670,20 @@ until the cold-boot owner samples harvesting. `ACCEL_WORKING` remains zero.
 What Mesa 26's ac_query_gpu_info cannot start without is answered too:
 `FW_VERSION` reports ME, PFP and MEC `ucode_version` and v2.0
 `ucode_feature_version` (`amdgpu_navi48_ucode::Image::feature`), published
-by `prepare` (other types EINVAL); `READ_MMR_REG` answers soc24's
+by `prepare`. `FW_VCN` on VCN5.0.0 reports the common firmware header's raw
+`ucode_version` with `feature=0`, as `amdgpu_firmware_info` does. The version
+comes from the same retained GC12 container whose payload PSP accepted;
+the header is container metadata, not a separate PSP-signed version claim.
+The PSP owner retains it only after the complete GC12 upload succeeds and
+exposes it only after boot completion with its TMR and VCN entry retained.
+The platform publishes it beside media capabilities only when the current
+client VCN transport has its native IB/interrupt proof and retained source
+owner; a stopped diagnostic, failed/cancelled load or absent image grants
+no query. Reset/suspend withdraw this media publication before their first
+await, and recovery publishes only fresh proof. Missing publication and
+other firmware types return EINVAL. This closes Mesa26.2.4's required VCN
+firmware query when the unified ring is present; DRMminor and codec bits
+remain unchanged. `READ_MMR_REG` answers soc24's
 allow-list only for `GB_ADDR_CONFIG` (GC segment 0 + 0x13de, from the
 topology sample's `gb_addr_config`), with Linux's SE (< 4) / SH (< 2) /
 count (<= 128) checks and EFAULT for any other offset. `MAX_IBS` on an open
@@ -884,12 +951,58 @@ reads. `amdgpu_hwmon::publish_writable` adds writable attributes to the shared
 hwmon node. `power1_input` is absent. Values read empty
 until a sample or board limit exists, never as a fake zero. The monitor logs
 throttlers starting and ending, loss of a recorded protection, the first
-failed refresh, and hotspot reaching `software_shutdown_temp`. Linux powers
-off from its THM interrupt at that point; narf only reports it, and PMFW
-hardware CTF remains the protection. A clean PMFW rejection keeps polling; a
-terminal SMU failure stops the monitor. Platform diagnostics carry the latest
-snapshot, and `amdgpu_navi48_platform::set_gfx_level` applies GFX levels under
-the owner lock; no sysfs writer is wired to it yet.
+failed refresh, and hotspot reaching `software_shutdown_temp`. A fresh
+successful sample at that threshold requests the existing orderly hardware-
+protection shutdown (`hw_protection_shutdown`, 10 s filesystem-sync budget
+and its independent forced fallback). The decision runs synchronously under
+the same platform owner that produced the reading, so reset/PM cannot publish
+a successor between generation validation and notification. Only the first
+trip per hot episode notifies; a fresh below-threshold reading ends that
+episode, while missing data or an owner change does not. Cached telemetry
+remains useful for hwmon but never fabricates a fresh trip. A clean PMFW
+rejection keeps polling; a terminal SMU failure stops the monitor. Platform diagnostics carry the latest
+snapshot. The DRM card's `power_dpm_force_performance_level` accepts native
+RX 9000 `auto|low|high` through `amdgpu_navi48_power::request_level` and
+`amdgpu_navi48_platform::set_gfx_level`; listed Navi48/Navi44 cards and the
+exact discovery-supported OEM controller use the same owner. The parser
+rejects unsupported Linux manual/profile levels with EOPNOTSUPP and malformed
+values with EINVAL. Synchronous stores validate and enqueue; a normal async
+mutex serializes changes, and a newer pending write supersedes an older one.
+Queued writes recheck their owner generation under OWNER after runtime-PM
+access and before any SMU write, so reset/suspend successors reject stale
+requests. Reads report the last successfully applied level (initially `auto`),
+updated synchronously under OWNER only after both GFXCLK bounds succeed;
+rejected or cancelled changes never publish the requested level. Display,
+memory and fabric floors remain with their existing admission owners.
+Other power-policy feature-mask controls are unchanged.
+
+`amdgpu_navi48_power::thermal` retains THM/MP1 interrupt-register ownership
+in the independent IH service. Native THM14.0.2/3 bank0 and MP1 bank1 are
+resolved and bounded from discovery; without that layout or a nonzero board
+software-shutdown limit, no OS source is armed and telemetry remains the
+fallback. Before CPU MSI delivery, the retained controller programs
+smu_v14_0_set_irq_state's MAX_IH_CREDIT5, IH_HW_ENA, low0/high
+min(255, software_shutdown_temp), INTH/INTL/TRIGGER unmask and source clears,
+then MP1 ID0xfe/VALID0 and its interrupt unmask. The asynchronous cold-boot
+interrupt handoff sends `AllowIHHostInterrupt` (0x4d) only after that IH/thermal
+owner is retained; cancellation leaves the SMU runtime command owned and
+non-retryable. A returned failure stops the service and fails the handoff.
+
+Exact THM sources0/1 count high/low events; THM has no guessed per-vector ACK.
+A high alert coalesces one owner-bound confirmation task with Linux's50 ms
+SW CTF delay. It reads a fresh hotspot under the platform owner. Confirmed
+below-threshold data dismisses the alert; unreadable data after a known high
+IRQ requests shutdown as smu_swctf_delayed_work_handler does. Reset/PM cancels
+the old pending claim and generation, and an old task cannot clear a new
+owner's claim or request shutdown from its stale sample. MP1 source0xfe
+alone receives INT_ACK, before its context is handled. Fan-abnormal context8
+lowers the IRQ threshold by the signed board offset, clamped to0..255;
+fan-recovery9 restores the board threshold, clearing TRIGGER_MASK as Linux
+does. Other MP1 contexts are acknowledged and counted without invented
+policy; foreign sources are untouched. `interrupts::Status::thermal` reports
+arming, thresholds, counters and failures. Service retirement masks THM and
+MP1 sources before CPU routing is withdrawn. PMFW automatic fan control and
+hardware CTF remain enabled. All behavior is reference/model-tested only.
 
 `unsafe amdgpu_dcn401_clk::ClockManager::new` prepares a separate DAL mailbox
 owner without hardware writes. Exact Navi48/GC12/MP1 14.0.2/3/DCN4.0.1 discovery
@@ -968,17 +1081,21 @@ dcn401_smu_set_min_deep_sleep_dcef_clk return nothing). Every message, as
 dcn401_smu_send_msg_with_param, first waits only for DAL_RESP to be nonzero
 (any value: an OK, or a refusal this or an earlier owner left there) and
 then sends; only PMFW's answer to the message sent can be a refusal, so a
-message never sent is never counted. Unlike Linux, which sends anyway after
-its two-second wait, a response register still zero at the deadline fails
-with `Timeout` before any write. Timeout, revocation, device loss or
-cancellation still leave the owner failed.
+message never sent is never counted. A sent ignored-result message's response
+timeout is also logged and counted; after another bounded readiness wait,
+a later command may replace that known unanswered transaction, as Linux does.
+An unknown inherited busy mailbox still fails before any write. Queries and
+display-frequency commands require their response; revocation, device loss,
+required-result failure and cancellation leave the owner unusable.
 
 `notify_wm_ranges(regs, address).await` is dcn401_notify_wm_ranges:
 SetDalDramAddrHigh/Low (5, 6) with the GPU address of
 `ClockManager::wm_range_table()` (`WatermarksExternal_t`, 112 bytes: set A
 `WATERMARKS_CLOCK_RANGE`, set 1A `WATERMARKS_DUMMY_PSTATE`), then
-TransferTableDram2Smu (8) of TABLE_WATERMARKS (2), each refusal ignored and
-logged the same way.
+TransferTableDram2Smu (8) of TABLE_WATERMARKS (2), each refusal or sent timeout
+ignored and logged the same way. The owner stays `Applying` throughout the
+sequence and on cancellation; a transport/authority failure enters `Failed`,
+so a partially sent watermark sequence cannot be reused.
 
 `release(regs).await` is dcn401_update_clocks' optimize once no stream is
 left (NumOfDisplays 0, DCFCLK, UCLK and FCLK at their lowest levels, UCLK
@@ -1162,9 +1279,21 @@ to latch disconnection. Active update locks, pending flips, GSL synchronization,
 MALL prefetch mode, metadata/LUT loads and uncertain power states reject before
 writes. This path does not abort those independent transactions.
 
+The MPC retains all four physical MPCCs after pipe harvesting. When no sibling
+display holds staged or live pipes, retirement resets every physical MPCC's
+top/bottom/OPP/update-lock selector and MPC output mux (Linux's
+`dcn10_init_pipes` / `mpc1_mpc_init` contract) and reads the selectors back.
+MPCC drain waits remain limited to the unfused pool's pipes; Linux's
+initialization does not wait for a fused pipe's MPCC status. An inherited
+pending MPCC update or foreign selector rejects before writes. This sweep never touches the fused pipe's HUBP, DPP, OPP
+or OTG block, and its report still covers only the unfused HUBPs. With a sibling
+owner retained, only unowned pool pipes are inspected and disconnected; no
+physical MPCC initialization is attempted outside that set.
+
 Retirement parks output muxes first, then every MPCC top/bottom/OPP/update-lock
 selector, and disables cursors on powered HUBPs. A shared 100 ms deadline bounds
-all drain waits. Each MPCC must acknowledge IDLE or DISABLED with BUSY clear;
+all drain waits. Each unfused pipe's MPCC must acknowledge IDLE or DISABLED
+with BUSY clear;
 every powered HUBP must acknowledge no outstanding requests before any blanking
 or clock gating. Native HUBP blanking asserts blank and clears TTU-disable;
 MALL selection and surface GSL are cleared. Drain is checked again before fetch
@@ -1450,8 +1579,8 @@ display/hub/VM/IRQ/clock/reset/power writers. Native header contracts are in
 `tests/dcn401_mpc.c` and `tests/dcn401_requestor.c`; MMIO models cover all four
 pipes, all supported RGB depths, transient buffer usage, delayed CURRENT
 acknowledgements, cancellation, lost writes and stale owners. DLG/TTU and
-watermark calculation/admission, MPC route connection, visible framebuffer
-activation, live flips and physical RX 9070 XT validation remain open. Neither
+watermark admission, route activation and live presentation are separate
+steps described below. Physical RX 9000 validation remains open. Neither
 preparation API starts fetch or publishes an active framebuffer.
 
 `amdgpu_dcn401_dml::admit(&Soc, &Mode) -> Result<Plan, Error>` is the native
@@ -1459,13 +1588,14 @@ scanout admission calculation: Linux DML21's DCN4 mode-support and
 mode-programming path, evaluated in fixed point with no hardware access. It
 admits the shape the native path implements: progressive streams of linear
 RGB planes (`Mode::planes`: the primary, scaled or not, and overlays; see
-"Navi 48 plane scaling and overlay planes"), each pipe with the staged
-320-KiB DET (DCN4_01_DEFAULT_DET_SIZE). Deviation: DC never sets
-`det_size_override_kb` and lets CalculateDETBufferSize share the 1280-KiB
-pool (minimize_det_reallocation: per-stream budgets by pixel rate, then by
-bandwidth); NARF programs and plans the fixed 320 KiB, and the
-tests/dcn401_dml21 harnesses pass it as `det_size_override_kb` so every
-other value is compared. `Mode::bytes_per_pixel` is DML's source format
+"Navi 48 plane scaling and overlay planes"). CalculateDETBufferSize shares
+1280 KiB among the pipes without an override: DC's minimize_det_reallocation
+uses pixel-rate budgets per stream, then bandwidth per plane and full-swath
+minimums, in 64-KiB segments. A single tiled RGB pipe uses unbounded requesting,
+a two-swath DET of at least 128 KiB and the remainder as compbuf; bounded
+configurations leave at least one compbuf segment. `Plan::plane(k).det_bytes`
+is each pipe's allocation for that plane. The Linux harness uses these same
+DC settings, including the ForceSingleDPP allocation before MPC admission. `Mode::bytes_per_pixel` is DML's source format
 (2 `dml2_444_16`, 4 `dml2_444_32`, 8 `dml2_444_64`; anything else is
 `Invalid`) and the pitch must be whole 256-byte requests at that depth; the
 request width, swath, DET lines, read bandwidth and deep-sleep DCFCLK follow
@@ -1478,10 +1608,7 @@ DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and immediate
 flip are excluded rather than approximated.
 
 ODM follows DML's `dml2_odm_mode_auto` (DecideODMMode,
-CalculateODMConstraints, ValidateODMMode; deviation: the Vmin phase's
-dynamic ODM, which DC enables on DCN401 through
-enable_single_display_2to1_odm_policy, is not ported, as if every stream
-had `disable_dynamic_odm`): a stream takes the fewest of one
+CalculateODMConstraints, ValidateODMMode): a stream initially takes the fewest of one
 to four pipes (DPP/OPP each and, with DSC, a DSC each) whose DISPCLK
 (CalculateRequiredDispclk: the pixel clock over the pipes, never below half
 of it for HDMI TMDS 4:2:0) fits the downspread-limited maximum, at least
@@ -1494,6 +1621,12 @@ slices are not twelve. 3:1 and 4:1 lines divide by four (OTG_H_TIMING_DIV_BY4),
 (1 to 4) reports the decision; every pipe shares every programmed value
 except the DLG blank end, which each further pipe moves by the segments
 before it (`Plan::odm_refcyc_h_blank_end: [u32; 3]`, `Plan::pipe_dlg`).
+The Vmin phase then tries to lower a single DP stream's DISPCLK toward
+600 MHz using more ODM pipes, retaining supported partial progress. HDMI
+TMDS/FRL (`Mode::hdmi`), incompatible timing divisibility, base MPC combine
+and DSC slice constraints exclude candidates as in PMO. The same phase runs
+after P-state strategy search. A live P-state change that would move pipes
+stays pinned until a full modeset can adopt that topology.
 `tests/dcn401_dml21/odm34_vectors.txt` (1927 configurations: 8K, 10K, 5K and
 4K480 streams at every depth, with DSC of 4 to 24 slices, HDMI 4:2:0, beside
 other streams, and every configuration the older files marked "Unsupported
@@ -1502,9 +1635,13 @@ odm") is answered by Linux DML21 and replayed by
 the modeset, platform and MST admission call) also refuses (`Unsupported`)
 an ODM split whose other horizontal boundaries, segment widths
 (OPTC_SEGMENT_WIDTH) or segment memories the native OTG cannot take
-(`dml::odm_timing_ok`); Linux leaves them a TODO. `dml::dsc_shape(timing,
-slices, dispclk_max_khz) -> Option<pipes>` is the DSC policies' native
-shape check (up to four DSC401s of four slices and 5184 pixels each).
+(`dml::odm_timing_ok`); Linux leaves them a TODO. Native modeset, boot,
+platform and plane admission also validate DSC401's limits against the
+**final** `Plan::pipes`: at most four slices and 5184 pixels per DSC, slices
+split evenly, and twelve slices for ODM 3:1. DML's generic 5760-pixel limit
+alone is insufficient. `dml::dsc_shape(timing, slices, dispclk_max_khz)` is
+a conservative base-ODM diagnostic; candidate selection cannot use it to
+reject a stream before Vmin optimization or joint memory admission.
 
 MPC combine follows DML's auto `mpcc_combine_factor`, which DC leaves for
 DCN401 (`dml::Policy::NATIVE`; the older vector files replay with factor 1):
@@ -1544,7 +1681,7 @@ replayed by `dcn401_dml_matches_linux_dml21_mpc_vectors`, and
 configurations, 258 MPC-combined planes; harness_surfaces.c with MPC_AUTO)
 by `dcn401_dml_matches_linux_dml21_surface_mpc_vectors`, every plan value and
 four pipes' mcache registers exact. The harnesses run PMO with DC's
-`disable_dyn_odm = false` (every stream `disable_dynamic_odm`, see above);
+`disable_dyn_odm = false` with per-stream dynamic ODM allowed;
 surface_vectors.txt's single-stream ODM section (8K and 4K120 DCC planes of
 two to four mcaches) has Linux raise the ODM factor and fill allocations past
 three slices. Each harness_surfaces.c pipe's mcache viewports are SPL's on
@@ -1642,8 +1779,7 @@ its own inputs and refuses any difference, so an edited or hand-built `Plan`
 is not admission. It then binds the plan to the current owners: the retained
 MPC/DPP/surface/memory/timing sources and requestor allocation verify as for
 the requestor; the timing, global sync and legacy DP SST signal must equal the
-plan; the surface must be full-frame with the plan's pitch and the 320-KiB
-DET; applied DISPCLK, DPPREFCLK and pipe DPPCLK must be at least the plan's;
+plan; each surface must match its planned plane, pitch and per-pipe DET; applied DISPCLK, DPPREFCLK and pipe DPPCLK must be at least the plan's;
 the pinned UCLK and DCFCLK floors must equal the ones it assumed; and the live
 DCHUB reference must match. Any mismatch is `Invalid` with no writes.
 
@@ -1810,19 +1946,25 @@ uncompressed setting carries the mode at `bpc`, and compresses with
 `dc_dsc_compute_config` against `dc_link_bandwidth_kbps` at the sink's
 maximum link: 4 lanes x the best UHBR rate (`uhbr_kbps`, 128b/132b
 encoding, FEC inherent, no FEC cap needed) when `DpCaps::uhbr` is nonzero,
-else the maximum 8b/10b link with FEC (FEC cap required). Its result must fit
-the pipes admission gives it (`dml::dsc_shape(timing, slices,
-dispclk_max_khz)`: DecideODMMode less downspread, up to ODM 4:1, twelve
-slices on three pipes), each DSC taking at most four slices of at most 5184
-pixels, so 8K takes two DSCs (four on a board whose DISPCLK two cannot cover).
+else the maximum 8b/10b link with FEC (FEC cap required). The result is a
+provisional link/decoder candidate; hardware shape is checked only after
+full admission chooses the actual ODM split. A 5440-pixel stream with four
+slices can therefore pass single-DP Vmin ODM 2:1 (2720 pixels per DSC) even
+though base ODM bypass exceeds DSC401's 5184 pixels. HDMI, multistream and
+memory-starved configurations must independently pass their actual plans.
 `dsc_link(timing, cfg, caps)` is the link for the compressed bandwidth
 (`dc_dsc_stream_bandwidth_in_kbps`, unpadded): the maximum 8b/10b link with
 FEC when it carries it, else the first 128b/132b setting upward, lanes before
 rate. A UHBR sink therefore never compresses onto 8b/10b (16 bpp is two
 thirds of 24 bpp, and 8b/10b with FEC carries less than two thirds of UHBR10
 at any lane count), and uncompressed UHBR always wins over DSC at the same
-depth. `refine_dsc` redoes both with the board's DISPCLK, from the selected
-depth down (a depth whose DSC shape the board cannot run falls to the next). A compressed UHBR stream carries no
+depth. Configuration admission regenerates candidates with the board's
+DISPCLK and searches complete configurations from the selected depth down.
+A final shape, pipe or memory-admission failure tries the next depth,
+including raw output when it fits. Fixed running streams retain their exact
+selection during beside admission. A leading-prefix fallback returns only
+its normalized selections and matching plans; a rejected stale suffix is
+never re-admitted by a later DML-only pass. A compressed UHBR stream carries no
 audio. Fallback keeps the admitted PPS (`selected_dp_candidates`): Linux's
 `dp_lt_fallbacks` through its 128b/132b settings that carry the compressed
 stream for a UHBR link, narf's 8b/10b ladder for an 8b/10b one. DML21
@@ -1874,8 +2016,12 @@ compressed vectors against Linux built on the host; `tests/dcn401_dsc/
 check.sh` replays 3000 FRL DSC configurations and 890 CVTEM packet sets.
 `modeset::hdmi_stream` selects the stream (RGB at 12, 10 then 8 bpc, raw or
 compressed, then 4:2:0 raw, as Linux orders encodings and depths;
-`frl_dsc(.., bpc)` compresses at a depth); `refine_dsc` redoes the FRL DSC
-from the selected depth down with the board's DISPCLK; `frl_video_params` gives the HPO FRL video request's
+`frl_dsc(.., bpc)` compresses at a depth). `Selection::frl_caps` retains the
+sink's HDMI decoder/depth/subsampling caps and verified raw FRL cap, alongside
+the chosen link rate. Final configuration admission retries those candidates
+from the selected depth down with the board's DISPCLK; a shallower raw
+candidate can use the retained cap even when the first DSC candidate chose
+a slower rate. `frl_video_params` gives the HPO FRL video request's
 `FrlVideoRequest { audio_packets_line, borrow, hc_active, hc_blank }`.
 Lighting runs link_set_dsc_on_stream's FRL order after training: the pipe's
 DSC engines, then `hpo_enc401_hdmi_set_dsc_config` (`frl_dsc_start`:
@@ -1895,8 +2041,14 @@ DP MST DSC follows amdgpu_dm and DRM on both encodings.
 `DscLink { encoding, kbps, slots, max_dispclk_khz }`, `DscStream { sink,
 timing, dsc, bpc }` (the stream's depth: its uncompressed bandwidth and DSC
 input) and `DscPayload { pbn, slots, dsc }`; `fits` is the topology's
-per-hop PBN check and `native` the display pipeline's DSC shape (`dml::dsc_shape`: up to four
-ODM pipes of four slices). `tests/dcn401_dsc/check.sh` replays 1500
+per-hop PBN check and `native` a provisional decoder configuration. At each
+complete depth combination, native selection recomputes whole-link fairness
+in stable device-slot order with the board's real DISPCLK, then admits every stream's
+resulting DSC and plane topology jointly. Actual final `Plan::pipes`
+determine the DSC401 shape; theoretical Vmin support grants no permission.
+A beside operation whose fairness changes a fixed stream's PBN, slots or
+DSC returns `BesideRefusal::DscFairness` for a relight. The no-decoder raw
+MST path keeps requested-depth PBN accounting. `tests/dcn401_dsc/check.sh` replays 1500
 mst_vectors.txt links through Linux's own fairness functions (mst_harness.c)
 and 1200 mst_depth_vectors.txt links of 8-, 10- and 12-bpc streams (built
 with `STREAM_BPC`);
@@ -1904,12 +2056,21 @@ a configuration Linux leaves compressed at bpp 0 is refused. In
 `amdgpu_navi48_mst::dsc`, `dsc_aux_for_port` is
 `drm_dp_mst_dsc_aux_for_port` (end device, DP-to-DP virtual-DPCD peer with
 passthrough, DP-to-HDMI/virtual sink, `DSC_WITHOUT_VIRTUAL_DPCD` hubs),
-`read_dsc` is `validate_dsc_caps_on_connector` returning `MstDsc { caps, aux,
-passthrough, end_link_kbps, branch_oui }`, `port_supports_mode(t, bpc, ..)` is
+`read_endpoint` is `validate_dsc_caps_on_connector` beside the endpoint EDID,
+returning `MstDsc { caps, aux, passthrough, end_link_kbps, branch_oui,
+synaptics, pcon }` (optional decoder caps retain raw-only PCON endpoints), `port_supports_mode(t, bpc, ..)` is
 `dm_dp_mst_is_port_support_mode` at the stream's depth, and `set_rx` is
 `dm_helpers_dp_write_dsc_enable` (passthrough 2 before decoder 1; disable
 reverse) through `dp_mst_mgr::Manager::remote_dpcd_read/write`. Selection
-and offered modes run the fairness search jointly across the branch, each
+and offered modes run the fairness search jointly across the branch. Dark
+and lit MST alternatives validate all recomputed payloads against the other
+ports' streams; a joining payload is never checked beside stale earlier DSC
+configurations. Dark alternatives use the same stable device-slot order as
+actual selection, even after topology reordering. Complete recomputation uses
+each port's raw availability and the new other payloads; only additive raw
+admission uses the old remaining path budget. A raw-only joining sink can be
+admitted after existing DSC streams shrink. Every offered candidate retains
+the current plane geometry and overlays. Candidates are independent proposals, not reservations. Each
 end device at the deepest of its depths (`dp_depths` up to
 `MstDscContext::max_bpc`, create_validate_stream_for_sink's loop) that the
 port and the joint search take; such a stream leaves at that depth
@@ -1921,8 +2082,90 @@ payload PBN and VC rate come from the compressed bandwidth
 (`uhbr_mst_dsc_rate` on 128b/132b). The decoder is enabled before the
 payload, the PPS is sent per stream (DIO SDP or HPO GSP11) before unblank,
 and teardown stops the stream before clearing DP_DSC_ENABLE. MST DSC streams
-keep their LPCM (see audio below); Synaptics cascaded/Panamera workarounds and DP-to-HDMI PCON
-FRL DSC are not ported.
+keep their LPCM (see audio below). Synaptics routing adds amdgpu's exact
+`needs_dsc_aux_workaround` root identity/revision/sink-count gate: only an
+immediate root child may fall back to root AUX when DRM finds no decoder.
+A root Synaptics Panamera name byte4 high nibble0x50 plus vendor byte0x50e
+0x5a overrides routing to root AUX even through a cascade. Invalid topology
+routes and unavailable identity never authorize a workaround. The retained
+`MstDsc::synaptics` policy applies only when that root gate is true and the
+selected decoder's downstream-port byte is not virtual-DPCD value3.
+On the first stream, a root name starting `SYNA` executes amdgpu's PRIUS
+vendor FIFO sequence (RC command/result/length/offset/data at 0x4b2/0x4b3/
+0x4b8/0x4bc/0x4c0), then enables DP_DSC_ENABLE. Each RC command has at most
+ten 10ms async AUX delays and requires both the exact inactive command byte
+and a zero result; an old result cannot prove an active command complete.
+Before the first new vendor write, a successor preflight waits for the
+previously observed command byte to become exactly inactive within ten
+10ms async delays; a changed command or AUX failure refuses it. GPU reset
+alone never proves completion of an external hub command. A busy hub remains
+untouched and journalled; only a new confirmed-idle probe or an independently
+proved hub reset may start a fresh vendor sequence. No automatic GPU-reset
+loop is used to try to reset the external hub. Other streams
+enable without resetting the shared FIFO, and disable leaves the shared
+decoder enabled while any sibling payload is retained. Native link-active
+input comes from retained payload/transaction ownership, not `link.owner`
+(which is installed before first-stream DSC setup).
+`MstLink::dsc_change_pending` journals DSC work before the first AUX/vendor
+write. Only complete sequence and enable readback clear it; returned error
+or future cancellation retains the link and refuses payload changes or
+partial teardown until whole-device reset. A failed decoder enable cannot
+start a compressed payload. The existing teardown removes its payload and
+stops its frontend before last-stream decoder disable.
+
+`amdgpu_navi48_mst::dsc::pcon` owns a detailed virtual-DPCD HDMI endpoint's
+converter0x80..83 capability, validated HDMI EDID/HF DSC fields, LPCM budget,
+and autonomous post-training state. The route must be exactly that virtual
+end port; a shared non-virtual root decoder grants no per-endpoint PCON
+policy. `Pcon` is retained even when `MstDsc::caps` is None: missing DSC
+cannot bypass downstream raw limits. Converter MAX_ENCODED_LINK_BW_SUPPORT,
+endpoint Max_FRL_Rate, post-training bandwidth, and DSC_Max_FRL_Rate are
+intersected independently for raw and compressed output. Current source-
+controlled mode (0x305a bit3) is refused. FRL requires readable status,
+TX-ready0x303b, no autonomous training in progress0x303c, a nonzero trained
+rate0x3036, and training-finished for regulated autonomous mode. Like Linux,
+a reported bandwidth does not depend on FRL_MODE (some converters clear
+that bit); a confirmed active TMDS fallback instead uses the converter's
+TMDS clock, HDMI EDID clock/depth and RGB/4:2:0 constraints. Unknown, training
+or source-controlled output grants no usable FRL budget. This owner never
+starts source-controlled training or programs a PCON encoder/PPS override.
+
+Converter DSC passthrough additionally requires its DSC_SUPPORT passthrough
+bit and valid endpoint HDMI DSC/rate caps; otherwise its ordinary DP
+decoder may decompress only when the downstream link carries the result
+raw. A passthrough endpoint uses HDMI DSC slice/bpp/VIC/chunk rules and
+FRL capacity (including supported LPCM), then retains a DP source config
+(`DscConfig::frl` None). The selected PCON's DP_DSC_ENABLE passthrough mask0x02
+and matching readback are used; ordinary DP decoder mask0x01 and upstream peer
+ordering remain with their owners. A known PCON endpoint cannot acquire
+the shared Synaptics root FIFO policy merely from the primary branch OUI.
+
+`amdgpu_mst_dsc::compute_link_constrained` adds independent raw permission
+and an optional downstream DSC `BwRange` before the existing whole-link
+fairness search. Initial raw allocation, maximum compression, fair bpp
+increase and try-disable-DSC all respect that contract; final bpp/PBN cannot
+escape it. Converter decoder precision also aligns every constrained bpp
+candidate to the advertised increment. A converter that requires compression stays compressed even
+when the source DP link has ample raw bandwidth. Unconstrained streams keep
+the Linux fairness arithmetic and order. Native `compute_endpoints`, raw
+choices, reserved-payload alternatives, dark/lit offered modes and final
+link normalization use the same endpoint contract and complete plane/DML
+admission. Fixed streams retain their payload, DSC and PCON snapshot; a
+changed endpoint contract requests a relight before any fixed owner changes.
+
+`MstStream::pcon` retains that selection's snapshot for raw and compressed
+streams. Activation queries current state under the existing ColdBoot/OWNER
+exclusion before any source/link writes and refuses a configuration the
+current output cannot carry. Monitor service refreshes endpoint proposals
+without changing live payloads, reports only the affected stream on a known
+loss of downstream capacity, and readmits dark outputs as autonomous training
+finishes. `MstLink::endpoint_query` journals a status request before its
+first AUX transfer; complete reply or NAK clears it, while transport failure
+or cancellation retains the session and refuses reuse/partial retirement
+until source reset/reprobe. Fresh status still must be proved after reset;
+GPU reset itself never proves completion or training of the external PCON.
+No IRQ-safe lock crosses await and no host-controlled PCON training is
+silently substituted for the autonomous contract.
 `modeset_display_mode` and `modeset_displays` select, admit and light again
 (at most `VERIFY_ROUNDS`) when the first display reports `LinkReduced`; a later
 display's reduction is returned in `Configuration::failed`, and the monitor
@@ -1952,40 +2195,66 @@ abort described below; uncertain owners stay retained. `stop_modeset`
 reverses a success down to a disabled PHY with timing and planes retired; the
 surface allocation remains bound to its pipe.
 
-HDMI admission honors the sink's Y420VDB across protocol fallback: a 4:2:0-only
-mode uses 4:2:0 over TMDS or FRL. TMDS remains preferred when it carries a mode.
-FRL tries RGB first where allowed, then 4:2:0 for Y420VDB/Y420CMDB modes when
-RGB cannot fit. `HdmiCaps::dc30_420` and `dc36_420` decode HF-VSDB/HF-SCDB
-4:2:0 deep-color flags independently of RGB DC_30bit/DC_36bit. FRL chooses the
-deepest declared 8/10/12-bpc depth up to the requested maximum and the lowest
-carrying rate. `hdmi_output` also takes the sink audio capabilities: FRL
-admission, training fallback and borrow parameters reserve the highest rate and
-channel count of its valid SADs, compressed ones included as Linux
-`get_audio_check` does, with layout 0 at 576 lines or fewer. `Selection::audio`
-keeps valid LPCM and compressed SADs for FRL (`frl_audio_info`; one-bit audio
-and DST dropped, SD LPCM clamped to two channels); sinks without valid LPCM use
-silent video. The FRL endpoint advertises those compressed descriptors and HBR
-from `check_audio_bandwidth_hdmi`'s 8-channel 192-kHz probe.
-TMDS 4:2:0 remains limited to 8 bpc.
+Native HDMI connectors expose DRM's standard `"color format"` enum:
+`AUTO`=0, `RGB`=1, `YUV 4:4:4`=2, `YUV 4:2:2`=3 and `YUV 4:2:0`=4.
+AUTO preserves the HDMI helper policy: RGB first, then declared 4:2:0 if RGB
+cannot fit or the mode is 4:2:0-only. Explicit requests retain that encoding
+through depth fallback, final admission, offered-mode filtering and relights;
+unsupported sink/mode combinations fail. GETCONNECTOR lists timings admitted
+under any implemented HDMI format so format+mode can be selected atomically.
+CTA extension YCbCr 4:4:4/4:2:2 bits gate those outputs. 4:4:4 deep color additionally
+requires HDMI VSDB `DC_Y444` and the matching RGB `DC_30bit`/`DC_36bit`; 4:2:2
+permits 8/10/12 bpc independently of deep-color bits (HDMI 1.3 §6.5), within
+`max bpc`. 4:2:0 uses its independent HF-VSDB/HF-SCDB deep-color flags and
+Y420VDB/Y420CMDB mode maps. VIC 1 remains 8 bpc. 4:2:0-only modes never become
+RGB/444/422 under an override. 4:2:2/4:4:4 DSC remains refused; native DSC is RGB.
 
-`frl_carries`, `frl_link` and `ColdBoot::start_frl` take `ycbcr420` alongside
-`bpc`. The raw bandwidth guard accounts for subsampling, and the Linux FRL
-capacity calculation receives the actual encoding. Training fallback and
-borrow-parameter calculation preserve encoding/depth. DML admission and native
-OTG checks still enforce the single-OPP 4096-pixel 4:2:0 limit; no ODM is added.
+`Selection`, DML `Mode`, OTG `Request`, `BlankRequest` and `MpcApplied` carry
+`amdgpu_hdr::PixelEncoding`. Plane-layout geometry retains only the derived
+4:2:0 flag. DML simple 4:2:2 and 4:4:4 share uncompressed scheduling;
+native admission binds the full encoding, and 4:2:0 keeps its formatter-width, container and delay
+rules. Only native HDMI enables non-RGB output; DP/MST remains RGB.
+`hdmi_candidates` enumerates link/depth candidates for `ColorFormat`.
+`frl_carries_in`, `frl_link_in`, `frl_video_params_in` and
+`ColdBoot::start_frl` use the typed actual encoding. The bool FRL helpers remain
+RGB/420 compatibility wrappers for existing reference vectors.
 
-Native FRL video derives encoding/depth from its retained blank/timing owner.
-It programs the 4:2:0 pixel format, uncompressed FIFO format and half-width
-active/blank counts, clears stale DSC fields, and sends AVI Y=4:2:0,
-BT.709 colorimetry and limited YCbCr range. Existing OPP subsampling, YCbCr black
-and MPC BT.709 output CSC are reused. The DTB-derived pixel DTO and
-HDMISTREAMCLK retain the full pixel rate, independent of component depth.
-Writes and live format checks reject mismatched encoding, depth, compression
-or width. Startup rechecks the stream, link, clock route and format after its
-final frame wait before publishing running video. Failure after writes retains
-the link and quarantines the video owner. FRL LPCM uses the audio contract
-below; FRL DSC is described with the DSC policy above. Physical acceptance
-remains open.
+TMDS remains preferred where it carries the requested format. RGB/444 scale
+the character clock with depth; 4:2:0 halves pixel rate before that scaling;
+4:2:2 retains the full pixel rate and uses an 8 bpc PLL/deep-color resync carrier
+while preserving the stream's actual FMT/GCP depth, with deep-color enable off.
+FRL capacity uses 2×bpc for 4:2:2, 3×bpc for RGB/4:4:4 and 1.5×bpc for 4:2:0. Its encoder
+counts horizontal pixel pairs for 4:2:2/4:2:0, uses pixel format 1/2 respectively,
+and only 4:2:0 uses the FIFO 4:2:0 format. 4:2:2 deep-color enable stays off.
+
+OPP programs the actual pixel format, chroma-filter mode and bypass fields;
+non-primary ODM segments request the extra left chroma pixel for 4:2:2/4:2:0.
+OPTC programs format 0/1/2 for RGB/4:4:4, 4:2:2 and 4:2:0. MPC output CSC and black
+color follow the selected YCbCr colorspace (601 below SDTV pixel-rate cutoff,
+709 above it, or the requested supported colorimetry). "Broadcast RGB" affects
+RGB only. AVI Y bits signal the actual encoding. Startup and later live checks
+verify the complete retained format/depth/DSC state and detect drift before
+publishing video or allowing flips. Failure after writes retains the owner.
+
+`OutputFormatRequest`/`OutputRoute` and `output_formats_supported` validate the
+prospective native HDMI outputs before atomic/SETCRTC mutation or pins,
+including TEST_ONLY. They combine actual plane geometry, requested depths,
+final native DSC shape and memory admission, with at most one FRL encoder.
+The read-only board SoC snapshot survives all CRTCs becoming dark. Prospective
+routing removes disabled streams and remaps observed unchanged DP/MST sibling
+reservations to their new CRTC, rather than counting old routes twice. A new
+unobserved DP/MST link configuration or missing board inputs is refused.
+The connector's requested format survives publication/reshape and changes
+relight its display. Non-HDMI connectors do not expose this property.
+
+FRL audio admission/training fallback reserves the highest valid SAD rate and
+channel count using Linux's capacity helper (layout 0 at 576 lines or fewer).
+`Selection::audio` retains valid LPCM and compressed SADs (`frl_audio_info`);
+sinks without valid LPCM use silent video. The DTB pixel DTO and
+HDMISTREAMCLK retain full pixel rate independent of component depth. Physical
+acceptance remains open. `tests/dcn401_hdmi_formats/check.sh` compiles the
+primary Linux clock/sink/FMT/TMDS/FRL functions, and DML21 `hdmi422_vectors`
+exercise real simple 4:2:2 scheduling alongside the existing 4:4:4/4:2:0 corpus.
 
 `amdgpu_frl_training::poll_status` handles live SCDC FRL_Start, FLT_Update
 and Source_Test_Update requests as Linux's `hdmi_frl_poll_status_flag` does.
@@ -2306,8 +2575,14 @@ rate.
 Every native plane (primary and overlay: DCN4's planes are all
 DC_PLANE_TYPE_DCN_UNIVERSAL) lists `amdgpu_navi48_kms::PLANE_FORMATS`:
 amdgpu_dm's DCN4.0.1 order (`amdgpu_dm_modifiers::DM_PLANE_FORMATS`:
-rgb_formats, NV12, P010, the FP16 orders) less RGBA8888 and the 16-bit UNORM
-orders. The overlay planes, plane properties, placement, SETPLANE, tiling and
+rgb_formats, NV12, P010, the FP16 orders) less RGBA8888: Linux lists
+RGBA8888 but its actual `fill_dc_plane_info_and_addr` switch returns EINVAL
+for it. All four 16-bit UNORM orders (XR48/AR48/XB48/AB48) are supported:
+HUBP and CNVC format 26, BGR HUBP crossbar for XB48/AB48, and per-pixel
+alpha for AR48/AB48. Their eight-byte pixels use DML's 444_64 source and
+the FP16 scaling limits, with normal sRGB input transfer/color handling.
+The Linux input conversion/color/GAMCOR harness includes those orders and
+explicit RGBA8888 refusal vectors. The overlay planes, plane properties, placement, SETPLANE, tiling and
 4:2:0 planes are described in "Navi 48 plane scaling and overlay planes".
 ADDFB2 takes a format on a card whose `plane_formats` list it, with Linux's
 pitch and dumb-object size checks (a card without native planes keeps
@@ -2359,7 +2634,7 @@ published `GenericFb` is the surface's bus-physical BAR address, visible size
 and byte pitch (`Otg::scanout_framebuffer`, which requires `ScanoutRunning`
 for that pipe and the owned surface). The fb layer's existing observer moves
 the console onto it. Adoption maps the published physical range
-(write-combining on x86_64, Device on aarch64) and installs that kernel
+(write-combining on x86_64, Normal-NC on aarch64) and installs that kernel
 mapping, cached per range and never unmapped. DRM presentation (the existing CPU copy of
 a dumb buffer into the live scanout) reaches an adopted external scanout
 through that mapping: the fb hook reports it with a kernel-virtual base only
@@ -3075,7 +3350,7 @@ format full-range RGB, which is what is sent. No Audio InfoFrame or AFMT audio
 clock is enabled and no DCCG frontend symclk route is programmed, as
 `dcn401_enable_stream` does for TMDS.
 
-`start_display_audio(port, true, AudioInfo)` (`Otg::start_hdmi_audio`)
+`start_display_audio(port, true, AudioInfo, endpoint)` (`Otg::start_hdmi_audio`)
 programs the display half of HDMI audio on running video or live scanout.
 For TMDS, in Linux's order: the DCCG audio DTO0 (source = OTG, module = pixel
 clock in 100 Hz, phase 24 MHz; DCN401 has no audio DTBCLK DTO), the stream's AFMT audio
@@ -3089,7 +3364,8 @@ rates limited by `check_audio_bandwidth_hdmi`, AC-3 stream formats, HBR
 capability, lipsync, vendor/product, Linux's default port ids, the monitor
 name), the Audio InfoFrame on line 2 (built by hardware from the codec's
 channel allocation), `az_enable` and unmuted samples. The endpoint is the
-stream's own; a sink without LPCM is `Unsupported`. `stop_display_audio(port, true)`
+stream's acquired `StreamEncoders::audio`, independent of its pipe or HPO
+encoder index; a sink without LPCM is `Unsupported`. `stop_display_audio(port, true)`
 mutes, stops the AFMT clock and Audio InfoFrame and disables the endpoint; HDMI
 video cannot stop while audio runs. Modeset builds `AudioInfo` as
 amdgpu_dm does (`hdmi_audio_info`: SADs at CTA revision 3+, the first 3-byte
@@ -3100,7 +3376,7 @@ The HD-Audio controller and codec that stream samples are separate.
 The same HDMI audio entry points dispatch to native FRL when its video is owned.
 FRL programs AFMT4 (no DIO AFMT clock or APG), IEC 60958 channel status, source
 and channels, the lane-character-clock N/CTS table and automatic hardware ACR,
-then the pipe's Azalia HDMI endpoint and sample enable. Only LPCM is advertised;
+then the acquired Azalia HDMI endpoint and sample enable. Only LPCM is advertised;
 HBR is disabled, and SD timings clamp to two channels. The video must already
 reserve exactly the audio packets-per-line and borrow mode that its retained
 LPCM capabilities require. Inherited samples/ACR or an occupied endpoint reject
@@ -3133,10 +3409,11 @@ existing LPCM path; the endpoint also advertises the sink's compressed SADs
 and HBR, as for SST DP without DSC.
 Register/protocol models are not physical image or audible-output acceptance.
 
-`start_display_audio(port, false, AudioInfo)` / `Otg::start_dp_audio` also dispatch
+`start_display_audio(port, false, AudioInfo, endpoint)` / `Otg::start_dp_audio` also dispatch
 on owned UHBR SST video or its matching scanout. `Status::uhbr_audio` retains
-the APG/Azalia owner. APG instance and endpoint follow the HPO stream, independent
-of OTG/PHY; the input mux selects that endpoint. Startup programs stream ID 0,
+the APG/Azalia owner. The APG instance follows the HPO stream; its input mux
+selects the acquired Azalia endpoint independently of HPO, OTG and PHY indices.
+Startup programs stream ID 0,
 pair-mode channel enables 0xff, APG memory power, a DP ELD (rate-filtered LPCM,
 compressed SADs unfiltered, HBR from the 8-channel 192-kHz probe),
 ASP/ATP/AIP and SDP master. APG reset assertion and deassertion each wait up to
@@ -3703,7 +3980,7 @@ for VMID0 use; a returned error retains `Failed`.
 
 The generated IB programs GC12 logical SH resource registers and dispatches
 one wave32 threadgroup, first on graphics and then on compute, under VMID0.
-The fixed gfx1201 shader stores a queue-specific salt XOR each lane's byte
+The fixed gfx1200/gfx1201 shader stores a queue-specific salt XOR each lane's byte
 offset to 32 output words. Code and IB occupy the first owned page; output
 and poison guards occupy the second. There are no caller-supplied shader
 bytes, resource addresses, LDS or scratch. Each submission invalidates shader
@@ -3729,8 +4006,69 @@ interrupt proof, while the same owner lock excludes clients and clear work.
 Diagnostics expose `shaders` separately; failure prevents the subsequent
 clearer publication. Explicit whole-device recovery repeats the requested
 shader proof on fresh owners before publishing its new submitter. This
-diagnostic does not enable Mesa acceleration or prove draw/render state or
-application-context execution.
+diagnostic does not enable Mesa acceleration or prove draw/render state.
+
+The same opt-in then schedules `amdgpu_navi48_client_shader` through the
+registered native submitter, after releasing OWNER. Two owned per-open GEM
+and context tables allocate distinct 8 KiB GTT BOs, GMC12 page-table roots
+and PASIDs; both roots map the same virtual address. Typed internal
+`GemState::create_kernel_system` and `VmInner::map_kernel_object` borrow
+that card's placement admission and never pass kernel pointers through user
+copy-in. The diagnostic keeps runtime-PM access and placement admission
+through all four jobs, acquiring OWNER only inside normal submission.
+The entire client proof has a ten-second deadline, including queue admission.
+Each root runs one fixed wave32 dispatch on graphics and compute, with
+queue/client salts, native VMID/PASID grants, context-switch handling, HDP
+request/ack and requested memory synchronization. Success requires a fresh
+non-error job fence, matching EOP/CPU delivery and every code, IB, output
+and guard word in both BOs, including the inactive peer. Diagnostics expose
+`client_shaders` separately from the VMID0 proof. The async retained owner
+keeps BO placements, tables, PASIDs and context health across cancellation
+or failure; only a newly registered hardware generation after proved
+quiescence/reset may replace this storage. Requested proofs repeat on
+fresh submitters. Models exercise both RDNA4 dies, incorrect output,
+cross-root writes, overruns, incomplete/error fences and missing interrupts;
+they establish software ownership/readback contracts, not physical shader
+execution. Mesa version/acceleration and codec advertisement remain gated.
+
+That opt-in also schedules `amdgpu_navi48_client_draw` after OWNER is released.
+It runs a genuine GFX12 META graphics rectangle on gfx1200/gfx1201, using
+pinned Mesa26.2.4 ACO NGG/PS binaries and the unchanged graphics-preamble,
+GE-ring, CB/descriptor, draw and cache-barrier constructors. The optional
+`tests/gfx12_render/generate.sh` verifies explicit Mesa/libdrm archive hashes,
+builds offline, compares every fixture word and all 4096 Addrlib3 pixel
+addresses, and independently validates both target ISAs with LLVM. The
+pristine DRM shim records gfx1201; gfx1200/1201 family, physical SE count,
+address32 and PFP version are explicit compiler/constructor inputs, not
+physical board evidence. PFP's retained authenticated image selects the
+pre/post-2680 constructor variant; discovered physical SE count must match.
+That version comes from the retained container's common header, corresponding
+to the loaded PFP payload; PSP does not independently attest that header field.
+
+Each of two distinct per-open roots/PASIDs maps the same VA: code/IB are
+readable/executable without write permission, while descriptors, upload,
+target and GE working storage are readable/writable without execution.
+GE sizing follows the primary max-SE-squared contract: 4 MiB for Navi44,
+10.5 MiB for Navi48. The two complete arenas consume 12.125/25.125 MiB of
+system/GTT backing respectively, plus page tables, and consume no driver
+VRAM-pool reservation. Success requires fresh increasing native graphics
+job fences, full RPTR drain, a fresh EOP/CPU-vector observation and exact
+readback of 667 red pixels in `(7,11,29,23)`, 3429 untouched pixels and all
+code/descriptor/padding/guard words in both clients. The allocated GE
+interiors are unspecified working data and are excluded from post-readback;
+their boundaries remain checked. The primary path does not require them
+zeroed. Actual CB-to-host synchronization and BOTTOM_OF_PIPE PWS completion
+precede the outer native job fence.
+
+`Diagnostics::client_draw` reports this separately from compute proofs. The
+ten-second operation retains runtime-PM access, placement admission and its
+async backing owner across submission/wait/readback. Error or cancellation
+quarantines storage; a matching new submitter can replace it only after
+whole-device reset and fresh queue/IH proofs. Models exercise both targets,
+VM permissions, wrong-root/pixel/guard errors, busy admission, incomplete or
+failed fences, absent interrupts and canceled submissions. These establish
+software lifetime/readback behavior; physical draw/cadence acceptance and
+Mesa/DRM capability advertisement remain separate gates.
 
 The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
 GC12.0.0/12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
@@ -3811,9 +4149,9 @@ boot's memory-translation stage runs it right after `initialize`, before any
 queue exists.
 
 After boot, the platform calls `ColdBoot::publish_client_vram`: the
-CPU-visible VRAM the driver's pool still has free, less a driver reserve of
-half of it capped at 512 MiB (so a resizable BAR's VRAM goes nearly all to
-clients), 2 MiB-aligned, halved until one free run holds it, at least
+CPU-visible VRAM the driver's pool still has free, less an explicit future-owner
+reserve of max(32MiB, one eighth of the aperture capped512MiB), bounded by
+current availability, 2 MiB-aligned, halved until one free run holds it, at least
 64 MiB, becomes a separate pool, registered as the Navi48 DRM card's
 `VramHeap` with the GMC's framebuffer geometry. The slice never returns to
 the driver's pool, so clients without eviction cannot starve its owners.
@@ -4225,7 +4563,7 @@ without a spinlock or executor poll on the stack. A preflight error resumes
 writers. A started failure/cancellation on the primary GPU keeps them stopped;
 an unrelated secondary GPU cannot quarantine another device's framebuffer.
 
-### Navi 48 variable refresh (DP Adaptive-Sync)
+### Navi 48 variable refresh (DP Adaptive-Sync / HDMI FreeSync)
 
 `amdgpu_freesync` is the shared, integer-only VRR policy (Linux drm_edid.c,
 amdgpu_dm and modules/freesync). `monitor_range(edid)` is
@@ -4235,7 +4573,11 @@ DTD areas and VTB extensions, "range limits only" (flags 0x01) descriptors
 with the 1.4 +255 offsets, the last one winning; `None` when none qualifies.
 `dp_sst_caps(edid, dpcd)` is amdgpu_dm_update_freesync_caps for a DP SST
 sink: DPCD 0x007 bit 6 (MSA_TIMING_PAR_IGNORED) and a range more than 10 Hz
-wide give a `VrrRange`. `VrrRange::supports(timing)` is vrr_supported
+wide give a `VrrRange`. When either monitor-range bound is zero, the
+first declared DisplayID extension is searched for the dynamic video timing
+range (tag 0x25, revision 0/1, length 9), including the revision-1 upper Hz
+bits and Linux's complete-block guard. Undeclared/truncated blocks cannot
+supply a range. `VrrRange::supports(timing)` is vrr_supported
 (drm_mode_vrefresh within the range). `drr(timing, range)` is
 mod_freesync_build_vrr_params for VRR_STATE_ACTIVE_VARIABLE on DCN401: the
 minimum is raised to the hardware floor (pixel clock over h_total times
@@ -4245,12 +4587,60 @@ refresh (`None`). `v_total_min` comes from the maximum and `v_total_max`
 from the minimum refresh through `calc_v_total_from_refresh`, whose
 stream-limit arguments amdgpu_dm leaves zero (so it rounds up), never below
 the nominal total. Totals above 32767 are refused as
-dc_stream_adjust_vmin_vmax does. Not implemented, and so not VRR-capable
-here: HDMI FreeSync (the AMD VSDB), DisplayID ranges, DP MST, PCON
-whitelists, MCCS, below-the-range frame insertion (BTR/LFC), V_TOTAL_MID and
-the FreeSync VSIF/SDP infopacket.
+dc_stream_adjust_vmin_vmax does.
 
-`Selection::vrr` carries a DP SST sink's range (`None` for HDMI and MST
+HDMI discovery sends the first declared CTA extension to the authenticated
+DCN401 DMUB's EDID_CEA parser (command 79, exact packed 16-byte payload,
+sixteen 8-byte chunks). One mailbox lease covers the entire parser sequence;
+ACKs must name the submitted offset. A consumed unchanged command is an
+unsupported optional query and supplies no range. Failed protocol/transport
+or cancelled parsing retains the mailbox/probe owner. `Sink::amd_vsdb`
+records the firmware-returned version/range/MCCS VCP code. `AmdVsdb::range`
+requires nonzero bounds more than 10 Hz apart and a zero VCP code. Native
+HDMI selection and connector capabilities use `Sink::hdmi_vrr_range`: a
+nonzero VCP additionally needs this discovery's `mccs::Negotiated` proof.
+`Sink::generation` is a fresh, nonwrapping identity for each MCCS discovery;
+proofs from old scans, different sinks or different metadata do not authorize
+a new snapshot. Running streams retain their old snapshot until retirement.
+Sink identity and validated EDID remain required.
+
+`unsafe Ddc::new` retains the shared DCN4 I2C arbitrator. `Ddc::mccs(channel,
+generation, metadata)` keeps that claim across the complete native HDMI
+negotiation and scheduler sleeps. Its raw I2C address0x37 operations have no
+synthetic register offset. `amdgpu_ddc_mccs` follows VESA DDC/CI1.1 §§4.1,
+4.3–4.6 and6.3: request/reply checksums use0x6e/0x50, fragment lengths and
+big-endian offsets must match, and only a complete, balanced capabilities
+string advertising the exact vendor VCP permits Get/Set. Empty-data fragments
+terminate assembly; trailing spaces/NULs are trimmed only afterward, with
+wire offsets unchanged and interior NUL rejected (as ddcutil's reader).
+Concatenated two-hex feature codes and balanced structured value lists are
+accepted; nested values never establish feature support. Responses are at
+most38 bytes, capabilities at most1024 bytes; NULL/NACK/bad-frame retries
+are bounded to three, with scheduler delays respecting40ms Get and50ms
+capabilities/Set intervals. A new owner waits50ms before its first packet
+so local GPU reset never substitutes for the remote command interval.
+Uncertain bus completion is never retried.
+The matching Get must report Set-parameter type, success and support bit0;
+Set sends AMD's upstream value0x0101. This implementation conservatively
+requires a subsequent matching Get to echo the whole0x0101 value; Linux
+does not separately define an enable-readback bit. Non-echoing sinks remain
+at fixed refresh. No nonvolatile Save command is sent.
+
+A completed unsupported/malformed DDC/CI reply is local: DDC restores pins,
+releases arbitration and discovery publishes that sink without VRR while
+continuing unrelated sinks. Transport uncertainty or cancellation retains
+the shared DDC claim and Scanning journal, publishes no partial results,
+and refuses reuse until reset. Previously owned stream snapshots and
+unrelated GPU owners remain retained. MCCS support is never inferred from
+EDID alone. Primary references are amdgpu_dm_helpers.c
+`dm_helpers_read_mccs_caps`/`dm_helpers_mccs_vcp_set` and the
+[VESA DDC/CI1.1 standard](https://glenwing.github.io/docs/VESA-DDCCI-1.1.pdf).
+
+DP MST remains outside this capability path, matching the primary
+amdgpu_dm_update_freesync_caps signal filter. PCON whitelist negotiation,
+MCCS negotiation retains its separate discovery contract.
+
+`Selection::vrr` carries a DP SST or parsed HDMI sink's range (`None` for MST
 streams); `Selection::vrr_supported()` and `Selection::drr()` give the mode's
 answer and totals. `SstOutput::vrr_capable` reports the connector's
 capability. Once an SST stream's video runs (8b/10b or 128b/132b),
@@ -4272,15 +4662,15 @@ at the same line time, so every per-line, prefetch, DET and watermark bound
 admitted at the nominal timing still holds, and the stutter budget (taken
 from the nominal blank) only gains idle time.
 
-`unsafe Otg::set_drr(pipe, Option<Drr>)` (ColdBoot `set_display_drr`) runs
+`unsafe async Otg::set_drr(pipe, Option<Drr>)` (ColdBoot `set_display_drr`) runs
 or stops DRR on a `ScanoutRunning` pipe (`Busy` otherwise), following
 dcn10_set_drr and optc401_set_drr's non-FAMS branch. Enabling writes
 V_TOTAL_MAX then V_TOTAL_MIN (minus one), OTG_V_TOTAL_CONTROL MIN_SEL and
 MAX_SEL with the TRIGA event in SET_V_TOTAL_MIN_MASK (FORCE_LOCK_ON_EVENT
-clear, MID fields untouched), then OTG_STATIC_SCREEN_CONTROL's TRIGA event
+clear, inherited MID selectors and frame count cleared), then OTG_STATIC_SCREEN_CONTROL's TRIGA event
 over two frames. Totals below the mode's, inverted or above 32767 are
 `Invalid` before any write; unchanged totals write nothing. `Status::drr`
-(`DrrApplied`) records the totals and the static-screen control replaced.
+(`DrrApplied`) records the configured totals, actual adjustment, optional MID/BTR state, and the static-screen control replaced.
 Disabling clears the selectors first, then restores V_TOTAL_MAX/MIN to
 V_TOTAL (fixed refresh exactly as `prepare` programs it; Linux writes zero,
 unused once the selectors are clear) and the replaced static-screen
@@ -4293,6 +4683,101 @@ commit_planes_for_stream fires it) so the stretched blank ends at the flip;
 flip completion evidence is unchanged. Frame waits on a DRR pipe are bounded
 by three frames at `v_total_max` plus 5 ms. TRIGA_CNTL is left as reset, as
 Linux's DCN401 path does not program it.
+
+
+`LfcConfig::new(timing, range)` derives BTR's effective minimum/maximum
+frame duration, midpoint and capped 2500us hysteresis margin; it requires
+an effective range of at least 2:1. `Lfc::preflip` implements Linux
+apply_below_the_range's multiplier choice and 2000us drift preference;
+`Lfc::vupdate` fixes MIN=MAX for the inserted duration on the first
+observed update and restores the configured variable range at count zero.
+DP floors and HDMI ceilings duration-to-total, clamped to nominal timing.
+DML admission remains at nominal timing, and UCLK must stay pinned.
+
+`unsafe async Otg::set_lfc` / `ColdBoot::set_display_lfc` attach that state to
+the matching ScanoutRunning timing and configured DRR range. The platform
+converges it when VRR_ENABLED is applied. Actual address flips sample
+render cadence immediately before the OTG address transaction, under the
+retained display owner. Real FRAME_COUNT transitions advance the repeat
+counter: owner-held latch waits service their own frames, while an idle
+scheduler task waits for acknowledged VUPDATE notifications with a 500us
+fallback and briefly acquires OWNER. Timer ticks and IV payloads do not
+count as frames. A missed frame discards the pending BTR cycle and
+render timestamp and restores the configured range; counter wrap uses
+the hardware's 24-bit arithmetic. Unreadable witnesses or drift in the
+owned totals/selectors/static-screen fields fail closed with timing and
+fetch ownership retained. A cancelled transaction stays quarantined;
+`lfc_progress`'s public idle entry accepts only ScanoutRunning. No address,
+surface lease or nominal DML plan is changed by repeating the retained
+surface. Disabling DRR, stopping scanout and recovery remove BTR state and
+restore fixed timing before releasing timing/fetch ownership. This
+service uses the real FRAME_COUNT witness after notification; precise
+physical cadence and interrupt delivery still require hardware acceptance.
+
+
+The independent IH `SERVICE` retains `dcn401_vupdate::Monitor`, owning
+OTG_GLOBAL_SYNC_STATUS VUPDATE_NO_LOCK_INT_EN (bit12) and EVENT_CLEAR
+(bit16). Discovery bounds the physical OTG register (0x1b88, stride0x80);
+PipePool maps pipe indices to live hardware instances and excludes fused
+OTGs. Service installation first masks and ACKs inherited VUPDATE sources
+on the live pool before CPU MSI delivery. Construction itself does no I/O.
+Only an admitted live LFC configuration arms a source. Enable intent is
+recorded before MMIO; current capability checks and checked enable-bit
+readbacks precede confirmed ownership changes. RMW suppresses other
+shared-register clear strobes, preserving their enable fields.
+
+Enable/ACK/mask operations execute synchronously while SERVICE is held;
+the only wait is acquiring its regular mutex, with no IRQ-safe lock held.
+The service ACKs a live VUPDATE source before dispatch updates/wakes its
+per-pipe event consumer. Queued events from a retired source neither read
+its possibly gated OTG nor wake a new consumer. Before a newly armed
+source, bounded IH drains discard already queued old events while the
+source is masked; even a late IV is only a wake, never frame evidence.
+Fused events remain diagnostics and cannot touch MMIO or wake a pipe.
+The LFC task waits for `dispatch::VUPDATE` outside OWNER, then samples
+FRAME_COUNT under OWNER; missing MSI/backend uses the same 500us fallback.
+An IH overflow/terminal-loss version resets BTR/timestamp/base timing,
+even if an apparent single frame transition was observed.
+
+Changing the configured DRR range or disabling it awaits source masking
+before timing writes. Native `set_lfc` awaits source enable/retirement;
+a cancelled wait leaves UpdatingStream with old/pending timing ownership,
+so idle work cannot resume it. Low-level native timing disable and fetch
+stop both await the same source-retirement hook before their first write.
+Readback/capability failure becomes `Error::Interrupts(ih::Error)` and
+blocks clock/fetch retirement, retaining source and scanout records.
+Thus all transport timing-stop paths, underflow recovery and scanout stop
+mask before the OTG becomes inaccessible, including caller cancellation.
+`SERVICE::stop`, device loss and reset detach also attempt source masking;
+a failed mask retains its owned bit and permanent service. Reset detach
+returns an error and refuses to drop that service or proceed to power/reset
+work until retirement is confirmed. Deferred loss cleanup checks the IH
+service generation so it cannot mask a newer GPU epoch.
+
+`tests/dcn401_vupdate/check.sh` expands the primary Linux DCN401 IRQ table
+macros and actual ASIC/source-ID headers for all four physical OTGs. Native
+models cover all16 fuse combinations, enable/ACK/mask ordering, live and
+fused dispatch, stale queued events, partial writes, authority loss and
+retained ownership. Actual scanout-chain stop/configuration regressions
+pause the awaited source hook, prove no retirement write preceded it,
+and verify failure/cancellation quarantine and loss-driven cadence reset.
+
+`unsafe Otg::set_drr_mid` / `ColdBoot::set_display_drr_mid` implement
+optc401_set_drr's non-FAMS MID-for-MAX branch: MID minus one, replacing
+MAX enable (bit2) and a nonzero 8-bit frame count. The total must lie
+inside the configured range and concurrent BTR is refused. The retained
+MID register and control are checked by subsequent source verification.
+Removing MID or DRR clears its selectors/count; fixed teardown also
+clears owned MID storage. The current primary FreeSync BTR module has no
+MID producer: native BTR follows its MIN/MAX sequence, while MID remains
+an explicit finite timing operation with its own owner.
+
+`tests/dcn401_lfc/check.sh` compiles the primary Linux BTR preflip and full
+VUPDATE functions plus duration/total conversion. Native tests replay
+1286 DP/HDMI steps and exercise frame wrap, repeat timing, missed/uncertain
+observations, readback failure, cancelled flips, live drift and MID
+lifetime. The full retained scanout-chain model verifies that an actual
+DRR-enabled address flip passes source verification and keeps its DML plan.
 
 KMS (`amdgpu_navi48_kms::{apply_routed_vrr, publish_routed_vrr}`) attaches,
 as amdgpu_dm does, an immutable "vrr_capable" range 0..1 to every native
@@ -4314,11 +4799,32 @@ EINVAL. As in Linux, enabling VRR on a
 sink or mode that cannot vary is accepted and the display stays fixed.
 A committed value goes to `amdgpu_native_kms::request_vrr_enabled` after the
 card lock is released (Navi22 ignores it), then
-`amdgpu_navi48_platform::request_vrr_enabled`, which records it and, when
-the display owner is free, reprograms each live scanout's DRR at once
+`amdgpu_navi48_platform::request_vrr_enabled`, which records it and schedules
+the serialized async stream updater to reprogram each live scanout's DRR
 (`Selection::drr()` while VRR_ENABLED and the CRTC is on, else fixed) with
 no modeset; the display monitor converges the same at the end of every
 pass, including after a relight.
+
+`info_packet(timing, range, hdmi, active)` builds the ordinary AMD FreeSync
+v1 SPD (the primary non-PCON/non-replay packet), using the same effective
+range as the totals: HDMI header 83/01/08/00, DP header 00/83/1b/04,
+AMD OUI 0x00001a, supported/enabled/active bits, rounded min/max Hz and
+checksum. Disabled VRR sends nominal min=max. `unsafe async
+Otg::set_freesync` / `ColdBoot::set_display_freesync` bind this packet to the
+same live display's timing: TMDS/FRL generic packet 3 or DP DIO/HPO packet 2,
+with immediate VPG publication and owned transmission enables. HDR, VSC,
+audio and DSC keep their separate packet slots and enables. Packet
+publication intent is retained in `Status::freesync`; only successful
+completion marks it complete. A dropped update leaves Failed/Busy with its
+DRR and intent retained, requiring owner recovery. Fixed refresh/scanout
+retirement disables the FreeSync packet before releasing fetch/timing. HDMI
+control snapshots include the SPD line register and clear SPD/HDR at link
+stop. The live updater and monitor both converge timing plus packet state.
+
+`tests/dcn401_freesync/check.sh` compiles the actual primary v1 packet
+builders and asserts the actual packed EDID_CEA offsets. Kernel tests replay
+its complete packet bytes and exercise all four native encoder routes,
+DisplayID/HDMI capability refusal, bad ACK and cancelled parser/publication.
 
 All of this is model-tested only (`drivers/gpu/freesync`, `dcn401-otg`,
 `dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm_ioctl`); it has not
@@ -4571,10 +5077,14 @@ their stream (or two for an MPC-combined overlay), staged on the overlay pipe th
 display's stream (`Engine::stream_pipe`). A memory restage keeps the other
 planes' records when the VMID0 context is unchanged, and staging checks
 tolerate the display's own pending staged addresses (`staged_planes`).
-`unsafe Otg::prepare_requestor_planes(.., pipe, overlays)` (ColdBoot
-`prepare_display_requestor_planes`; overlays bottom first, underlays before
-the others) gives every plane's HUBP the default DET and the primary's VTG
-and records `RequestorApplied::overlays`; it refuses an overlay on the
+`unsafe Otg::prepare_requestor_planes(.., pipe, overlays, plan: Option<&Plan>)`
+(ColdBoot `prepare_display_requestor_planes(.., &Plan)`; overlays bottom first,
+underlays before the others) gives every plane's HUBP its DML DET and the
+primary's VTG, recording `RequestorApplied::overlays`, `det_bytes` and
+`overlay_det_bytes`. Native modesetting always supplies the admitted plan;
+`None` retains default 320-KiB storage staging for low-level callers only.
+The total must leave compbuf space and each active DET is 2..20 segments;
+other displays retain their recorded per-plane allocations. It it refuses an overlay on the
 primary's pipes, an unstaged pipe, a pipe used twice, another display's pipe
 (`Siblings::pipes`, which counts overlay pipes and DETs) or an underlay above
 an overlay (`Invalid`), and a fourth overlay (`Unsupported`). Deadlines
@@ -4721,7 +5231,7 @@ native card (`Card::gfx12_modifiers`) every plane's `IN_FORMATS` and
 `IN_FORMATS_ASYNC` blob (`drm_native_planes::IN_FORMATS_PROP_ID` /
 `IN_FORMATS_ASYNC_PROP_ID`, blob ids `in_formats_blob_id` /
 `in_formats_async_blob_id`, GETPROPBLOB) is create_in_format_blob's
-version-1 `drm_format_modifier_blob`: the plane's 15 formats, then the 17
+version-1 `drm_format_modifier_blob`: the plane's 19 formats, then the 17
 modifiers each with the mask of the formats that take it (all of them); a
 card with native planes but no GFX12 modifiers lists LINEAR alone.
 `Tiling::from_modifier` is amdgpu_dm_plane_fill_gfx12_attrs_from_modifiers
@@ -4778,7 +5288,7 @@ whole at VUPDATE. SPL takes `spl::Video`
 SCL modes, chroma coefficient loads, EASF's video rules, LB config 3; a 4:2:0
 plane always goes through `spl::calculate` (its chroma is upscaled even
 unscaled). `tests/dcn401_spl/check.sh` also checks 137 video vectors
-(`video_vectors.txt`, rotations 90/180/270 included); `tests/dcn401_yuv/check.sh` checks 120 vectors of
+(`video_vectors.txt`, rotations 90/180/270 included); `tests/dcn401_yuv/check.sh` checks 160 vectors of
 fill_plane_color_attributes, dpp401_dpp_setup's format switch,
 hubp2_program_pixel_format and the post-CSC words extracted from Linux,
 replayed by `dcn401_dpp_input_conversion_matches_linux_vectors`.
@@ -4834,9 +5344,20 @@ in Linux's 32-bit dcc_size), placed at its own alignment, then trimmed to
 the buffer's size from the block's first multiple of the alignment counted
 from VRAM offset 0 (`amdgpu_vram::dcc_trim_start`, `Pool::reserve_dcc`,
 `UnmappedPool::reserve_dcc`; the rest of the block is free again).
+The temporary block's alignment is also relative to VRAM offset zero,
+independently of the GPU address of that origin. If no whole temporary block
+is free, the native range allocator instead reserves the final buffer size
+at the first free DCC-aligned start. This remains one contiguous reservation
+and preserves the hardware's address/size constraints, for visible and
+invisible VRAM. This fallback is more permissive than Linux's rounded
+VRAM_CONTIGUOUS path: its ENOSPC retry clears the buddy contiguous-allocation
+flag but retains the BO flag and DCC block rounding.
 `tests/amdgpu_dcc_vram/check.sh` builds gmc_v12_0_get_dcc_alignment and
 amdgpu_vram_mgr_new from the Linux tree over a stand-in buddy and checks
-1755 vectors, replayed by `dcc_vram_placement_matches_linux_vectors`. A
+1755 vectors, replayed through production `Pool::reserve_dcc` by
+`dcc_vram_placement_matches_linux_vectors`, including the exact reservation
+accounting after trimming and release. Separate native tests cover fragmented
+visible/invisible pools, non-aligned VRAM origins and exhausted aligned starts. A
 pinned DCC buffer reports `ScanoutPin::dcc_aligned`, a DCC buffer whose
 placement misses the alignment is refused at the pin, and a DCC plane
 refuses an `otg::ExternalSurface` without `dcc_aligned`. Linux takes the
@@ -4846,15 +5367,21 @@ that happened to land contiguous keeps its start); NARF's placements are
 all contiguous, so it applies from creation. The pin never moves a
 buffer: amdgpu_bo_pin's validation (a buffer in system memory moving back
 to VRAM, which waits for its jobs and copies it whole) runs before, in the
-async `drm_ioctl_bridge::amdgpu_prepare_scanout` (below), never under the
-KMS spinlock, so a buffer still outside VRAM is ENOMEM (`OutOfMemory`, as
+async `drm_ioctl_bridge::amdgpu_kms_async` (below), never under the
+KMS spinlock. `amdgpu_gem::prepare_scanout` returns
+`Result<ScanoutPreparation, FsError>`; success retains the card's placement
+exclusion through the synchronous KMS commit. It protects already-resident BOs
+as well as promoted ones: asynchronous movers park, and synchronous pressure
+cannot evict between validation and `PreparedFbs::prepare` acquiring pins.
+Success, refusal and cancellation release the guard; successful KMS pins
+continue protecting the actual scanout. A buffer still outside VRAM is ENOMEM (`OutOfMemory`, as
 ttm_bo_validate reports no room); one VRAM is not allowed for or a foreign
 dma-buf is EINVAL and a userptr EPERM, as amdgpu_bo_pin answers. A
 CPU-accessible buffer is only ever placed in visible VRAM (amdgpu_bo_pin
 forces CPU_ACCESS_REQUIRED for one; NARF puts only NO_CPU_ACCESS buffers
 past the BAR), and the pin refuses one found past the BAR. `ScanoutPin` (amdgpu_bo_unpin on drop) keeps the
 buffer and its placement: while any pin lives `GemObject::pinned` stops
-`relocate`, `commit_transfer`, pressure eviction (`evict_visible`) and
+`relocate`, `commit_transfer`, pressure eviction (`evict_visible_locked`) and
 `amdgpu_vm::relocate`, and `evict_all` passes the buffer by (TTM's LRU walk
 does not see pinned buffers). The presenter frame (`PlaneFrame::bo`) carries
 the pin; it waits up to 5 s for the buffer's WRITE fences
@@ -4902,12 +5429,13 @@ one that fails after programming it leaves the buffer pinned) and `retire_scanou
 plane's latched address while scanning out, none at rest, unknown while a
 change is in flight or after a failure) shows no plane fetching it (after
 each presenter flip, `flip_display`, and every display-monitor pass).
-`release_client_scanout` is dm_suspend's (and the lastclose restore's)
-commit: every plane still fetching a client framebuffer flips back to its
-back buffer and the pins retire, before system suspend evicts VRAM and
-after the last card close (a release that fails there keeps the pins until
-a later pass retires them: drm_fb_helper_lastclose ignores its restore
-commit's error). A cursor plane's GEM framebuffer is pinned in VRAM by the
+`release_client_scanout` implements the lastclose restore: every plane still
+fetching a client framebuffer flips back to its back buffer and the pins
+retire after the last card close (a failed release keeps the pins until a
+later pass retires them: drm_fb_helper_lastclose ignores its restore error).
+Suspend instead stops the streams through their retained teardown journal,
+then retires pins; it never exposes an old or cleared staged buffer on the way
+into S3. A cursor plane's GEM framebuffer is pinned in VRAM by the
 commit's prepare and handed to the display's cursor task
 (`amdgpu_navi48_platform::CursorContent::Gem`, `GemCursor`), which waits
 for the buffer's WRITE fences (the plane fence drm_gem_plane_helper_prepare_fb
@@ -4933,8 +5461,8 @@ GEM table (Linux's per-file handle space; the card's dumb table holds
 none). It is stored as amdgpu_bo_create leaves it: VRAM_WIPE_ON_RELEASE
 added, the CPU_ACCESS_REQUIRED hint dropped, alignment 0 (GEM_OP), allowed
 domains VRAM | GTT. Full visible VRAM first evicts idle unmapped buffers
-(`evict_visible`), and from a user open (`amdgpu_create_dumb_async`,
-`amdgpu_gem::create_dumb_async`) mapped ones too (`reclaim_vram`, shared
+(`evict_visible_locked`), and from a user open (`amdgpu_create_dumb_async`,
+`amdgpu_gem::create_dumb_async`) mapped ones too (`reclaim_vram_locked`, shared
 with GEM_CREATE's strict path); there is no GTT fallback, so it is then
 ENOMEM. MAP_DUMB and DESTROY_DUMB of one of an open's amdgpu GEM handles,
 on any amdgpu card, are amdgpu_mode_dumb_mmap (`GemState::map_dumb`: the
@@ -4943,28 +5471,56 @@ drm_gem_handle_delete (`destroy_dumb`); other handles fall through to the
 card's table. mmap of the offset is the revocable CPU-mapping backing
 (`cpu_mapping::backing`) over the buffer's BAR window, which follows the
 buffer when it moves. ADDFB2 of the handle is `amdgpu_addfb2_bo`, so
-showing it pins it and scans it out in place as above. Before a SETCRTC,
-PAGE_FLIP, SETPLANE or atomic commit, the open's framebuffer buffers that
-left VRAM (suspend's evict_all, eviction for another allocation) and are
-not pinned move back (`drm_ioctl_bridge::amdgpu_prepare_scanout`,
-`amdgpu_gem::prepare_scanout` through `amdgpu_vm::relocate`, CPU mappings
-following), as amdgpu_bo_pin's validation in prepare_fb migrates them, and
-so does a legacy CURSOR/CURSOR2's buffer (its handle in the ioctl); a
-buffer that cannot move is refused at the pin, failing the commit with
-ENOMEM. Legacy CURSOR/CURSOR2 with one of the open's GEM handles wraps that
+showing it pins it and scans it out in place as above. Native amdgpu user
+KMS requests go through `drm_ioctl_bridge::amdgpu_kms_async`: SETCRTC,
+PAGE_FLIP, SETPLANE, ATOMIC, SETPROPERTY/OBJ_SETPROPERTY and CURSOR/CURSOR2.
+The bridge checks DRM master before any guarded user copy, then copies the
+supported request once into owned storage before awaiting. ATOMIC retains
+the existing bounds (256 objects, 4096 properties) and guarded copies every
+nested array. Target resolution and commit use that same snapshot; no
+request header, property array, connector id or cursor handle is reread
+after migration. TEST_ONLY neither acquires placement admission nor migrates.
+SETCRTC/PAGE_FLIP/SETPLANE prepare only their named enabled framebuffer;
+atomic and plane-property requests prepare each touched plane's final
+enabled framebuffer after inheriting its current FB_ID/CRTC_ID. Disables
+prepare nothing. Framebuffer lookup is global, as the commit's lookup is:
+another open's framebuffer and a legacy cursor's internal framebuffer are
+valid targets for the current master; their owning open controls cleanup.
+A legacy cursor BO update captures only its own open's handle through
+`GemState::object_unvalidated` (no opportunistic promotion), while a
+MOVE-only request inherits the cursor plane's current framebuffer.
+
+Placement admission precedes the inherited-state snapshot, then the KMS
+spinlock is released before any wait or migration. Before migration, the
+owned request passes the commit's ordinary checks: atomic/property requests
+use a TEST_ONLY view, SETCRTC/PAGE_FLIP/SETPLANE stop at their existing pin
+boundary, and cursor requests validate own-open source/shape and native
+cursor checks. Invalid properties, objects, handles, geometry or flags do
+not move a valid BO or reclaim another. SETCRTC preserves the bridge's current
+behavior of presenting any nonzero fb_id even with mode_valid zero; SETPLANE
+disables only for fb_id zero. A nonzero FB with an absent CRTC is refused.
+Targets outside VRAM move
+through `amdgpu_vm::relocate`, with CPU mappings following. If necessary,
+`reclaim_vram_locked` evicts idle BOs under the same borrowed placement guard,
+excluding the complete target set (including BOs already promoted by this
+request), pinned scanout and busy jobs. Failure propagates before any KMS
+state, event or pin handoff changes. The actual commit rechecks current DRM
+master and every target's framebuffer id/BO identity under the Card lock;
+changed inherited state or identity is Busy, revoked master PermissionDenied.
+The guard remains through `PreparedFbs` pinning, including already-resident
+BOs, and releases on success, error or cancellation. Hotplug reuses the
+presenter's already-pinned `PlaneFrame`; it does not promote an open's idle
+framebuffers. Legacy CURSOR/CURSOR2 with one of the open's GEM handles wraps that
 buffer (`drm_ioctl_bridge::amdgpu_cursor_bo`, `Card::addfb2_bo` with no
 owning open, so drm_fb_release leaves it). `tests/amdgpu_dumb/check.sh`
 builds drm_mode_create_dumb, amdgpu_mode_dumb_create,
 amdgpu_gem_align_pitch, amdgpu_display_supported_domains and
 amdgpu_bo_get_preferred_domain from the Linux tree for an RX 9070 XT and
 checks 1277 vectors, replayed by `amdgpu_dumb_layout_matches_linux_vectors`.
-Deviations: a user CPU mapping of VRAM is not write-combined (NARF's user
-page tables carry no caching attribute: x86_64 leaves it to the MTRRs,
-uncached for the BAR on real boards; aarch64 maps Normal), and a GTT
-placement is not USWC; the migration back to VRAM runs before the commit
-rather than inside the pin, and without evicting other buffers to make
-room, and only for the open's own framebuffers and a legacy cursor's
-buffer (a commit naming another open's evicted framebuffer fails ENOMEM);
+Deviations: a System RAM/GTT placement remains write-back to preserve the
+direct-map alias (NARF does not retag RAM as USWC). User VRAM mappings are
+write-combined through the typed mmap backing. Migration back to VRAM runs before the commit
+rather than inside the pin;
 DRM_MODE_CREATE_DUMB from the render node keeps the card's table.
 SETCRTC admits such a framebuffer as a placed primary
 (`drm_native_planes::setcrtc_planes`), PAGE_FLIP requests the display's
@@ -5005,13 +5561,13 @@ makes CUR0_ROM_EN for the premultiplied cursor
 move included; a changed CRTC color on a live display reprograms the
 cursor's attributes and position too (`Surfaces::set_color`, under
 `Otg::set_color`), as amdgpu_dm_atomic_check adds the CRTC's cursor plane
-to a commit whose color_mgmt_changed). `tests/dcn401_yuv/check.sh` also checks 540 vectors
+to a commit whose color_mgmt_changed). `tests/dcn401_yuv/check.sh` also checks 684 vectors
 (`color_vectors.txt`: format, legacy gamma, CM_POST_CSC_MODE_CURRENT,
 encoding, range; the input transfer function's PRE_DEGAM, GAMCOR mode and
 select and the FNV-1a of its writes) of those Linux functions compiled
 verbatim, replayed by `dcn401_dpp_color_input_matches_linux_vectors`, and
-15 (`gamcor_vectors.txt`: every write of the input transfer function for
-five formats under legacy gamma from a bypassed GAMCOR, RAM A and RAM B)
+27 (`gamcor_vectors.txt`: every write of the input transfer function for
+nine formats under legacy gamma from a bypassed GAMCOR, RAM A and RAM B)
 from Linux's map_crtc_degamma_to_dc_plane, mod_color_calculate_degamma_params
 (color_gamma.c), dcn32_set_input_transfer_func and dpp3_program_gamcor_lut
 with its helpers (`input_tf.c`, linked against tests/dcn401_color's host
@@ -5019,7 +5575,7 @@ build), replayed by `dcn401_color_input_tf_matches_linux_gamcor_vectors`.
 
 Gaps: planes on an ODM stream
 must reach every segment; no
-RGBA8888 or 16-bit UNORM planes, no NV21 (not
+RGBA8888 planes (Linux's native setup refuses them), no NV21 (not
 on DCN4's universal planes), no COLOR_PIPELINE plane color (nor Linux's
 AMD_PRIVATE_COLOR properties); DML admits a client framebuffer at the
 staged (minimum) pitch; a linear RGB GEM framebuffer whose source rectangle
@@ -5179,7 +5735,7 @@ their own) under `plan`, its stream's own timing admitted with them, in
 commit_planes_for_stream's order:
 - Checks, before any write: the display scans out, every request stages
   (SPL), sits on the stream split like it and on pipes no other plane or
-  display holds, underlays below the others, its rows fit the default DET,
+  display holds, underlays below the others, and
   the plan binds the new planes and the current owners
   (`deadline::bound`), the live scanout is still the one its records name
   (`scanout_bound_with`, raise-tolerant watermarks), no flip is pending,
@@ -5197,13 +5753,15 @@ commit_planes_for_stream's order:
   update (no register written).
 - Before the lock (dcn20_enable_plane): each new pipe powered up if gated
   (dcn32_hubp_pg_control), its fetch clock, the VMID0 aperture, the
-  requestor on the stream's VTG and the DPP clock; its default DET from the
-  compressed buffer (shrunk first).
+  requestor on the stream's VTG and the DPP clock; compbuf is reduced before
+  any planned DET grows.
 - Under dcn401_interdependent_update_lock (the OTG master lock): the global
   sync if the plan's differs; for every freed pipe its DET released
   (`Engine::program_det_segments(q, 0)`, dcn401_program_det_segments, no
   wait) and then its plane_atomic_disconnect (mpc1_remove_mpcc) with its
-  cursor off, as dcn401_program_front_end_for_ctx orders them; each changed or new plane's DPP
+  cursor off, as dcn401_program_front_end_for_ctx orders them; the retained
+  and new planes receive their plan's DET (reductions before increases), then
+  each changed or new plane's DPP
   (dpp401_dpp_setup and the DSCL with the coefficient RAM swap,
   `program_dpp_live`); on a full update every segment's MPCC tree from its
   top pipe down as dcn20_update_mpcc does (each MPCC removed, inserted at
@@ -5217,15 +5775,23 @@ commit_planes_for_stream's order:
   reports its surface in use, the OTG's double-buffered state latched, the
   new MPCCs connected and the freed ones idle; then dcn20_disable_plane on
   each freed pipe (no outstanding request, blank, fetch and DPP clocks
-  off), and with a pipe freed optimize_bandwidth's compbuf increase
+  off), and then on every update optimize_bandwidth's compbuf increase
   (`Engine::increase_compbuf`, dcn401_program_compbuf_segments with
-  safe_to_increase: every DET_SIZE_CURRENT acknowledged, then COMPBUF to
-  the CRB's remaining segments; the requestor record carries it). A slow
-  acknowledgement is logged, never fatal, as REG_WAIT only logs: after a
-  slow DET the grow is skipped and the requested allocation kept
-  (deviation: Linux writes COMPBUF_SIZE anyway; NARF never grows into
-  segments a DET may still hold), and a grown compbuf whose CURRENT is slow
-  is kept (Linux does not wait for it). The records
+  safe_to_increase: when COMPBUF must grow to the CRB's remaining segments
+  (CRB minus every requested DET, independent of the default DET size),
+  every DET_SIZE_CURRENT is waited for as Linux's REG_WAIT(…, 1, 100),
+  about 100 µs each, then COMPBUF grows; with no grow nothing is waited
+  for; the requestor record carries it). A slow acknowledgement is logged,
+  never fatal, as REG_WAIT only logs: after a slow DET the grow is deferred
+  and the requested allocation kept (deviation: Linux writes COMPBUF_SIZE
+  anyway, an overlap its own ASSERT calls an erroneous configuration; NARF
+  never grows into segments a DET may still hold). The deferred grow stays
+  pending (`Otg::compbuf_pending`) and is retried on the next optimize pass
+  (`Otg::retry_compbuf` from `ColdBoot::retry_display_compbuf`, run by
+  every monitor pass's `converge_uclk_pstate`; a hub mid-transaction is
+  tried on the next pass), every display's requestor record then carrying
+  the grown size. A grown compbuf whose CURRENT is slow is kept (Linux does
+  not wait for it). The records
   then name the new planes (surfaces, apertures, DPP/MPC, requestor,
   deadlines, scanout, cursor, the timing's sync) and pass the scanout's
   re-binding checks; the surfaces the update superseded (with their back
@@ -5260,6 +5826,16 @@ configuration, a teardown in flight, DML refusing the configuration, another
 ODM split for the display, another display's pipes or split changing, a
 request that does not stage, or the engine's refusal.
 
+Live DET changes settle active CURRENT fields after VUPDATE before publishing
+the new plan. An idle zero request is deferred only when the driver retained
+ownership of that retirement; an unrelated release must acknowledge CURRENT
+before its space can fund growth. Cold allocation adoption remains strict.
+Live checks count requested and current capacity conservatively and permit
+only owned idle retirements or safe compbuf growth in flight. Compbuf capacity
+needed by a plan must acknowledge before publication; growth beyond its
+minimum may remain deferred. Across streams, net DET releases complete before
+budget takers, including a plane removal that frees space for a sibling.
+
 **Platform and KMS.** `request_display_planes` and `request_display_format`
 wake the display monitor (it sleeps in 16 ms steps), which applies a plane
 or format change of a display that otherwise runs on through
@@ -5282,8 +5858,7 @@ the presenter's flip after the update latched, not at the update's own
 VUPDATE, and the commit's flip event completes with that flip; a frame
 queued after the update copied the planes shows from that flip too; a
 change of the stream's ODM split (or another display's pipes) still
-relights; MST displays relight; no DCC/compbuf or MALL/SubVP
-reprogramming beyond the default DET. The cursor matrix stays bypassed over
+relights; MST displays relight; MALL/SubVP reprogramming remains absent. The cursor matrix stays bypassed over
 YCbCr planes as dcn401 leaves it (dpp401_set_cursor_matrix), its degamma ROM
 following legacy gamma ("Plane input color"). DRM cursor planes are
 described in "Navi 48 DRM cursor planes".
@@ -5431,15 +6006,18 @@ overlays, HDMI 4:2:0, RGB565 and FP16) is answered by `harness_pstate.c`
 (check.sh) and replayed by `dcn401_pstate_matches_linux_dml21_vectors`: the
 candidate list, the chosen strategy, level and DPMM clocks, every plane's
 plan values and every stream's FAMS2 state exactly (Linux's ±1 tolerances),
-or the documented firmware pin. `pstate_strategies.txt` holds PMO's
+or the documented firmware pin (183 exact plans, 29 firmware pins).
+`pstate_strategies.txt` holds PMO's
 expanded lists (`dcn401_pstate_strategy_lists_match_linux`).
 
 The display owner applies the answer as dcn401_prepare/optimize_bandwidth.
 `ColdBoot::start_display_clocks`, once the clock owner started, writes
 `wm_range_table` to a 4-KiB VRAM range kept out of reuse, sends
-`notify_wm_ranges` and runs `deep_sleep_control`. Neither fails display
-bring-up: a table that cannot be placed is skipped (as Linux skips a
-missing `wm_range_table`), and every refusal or error is logged and kept in
+`notify_wm_ranges` and runs `deep_sleep_control`. A table that cannot be
+placed is skipped (as Linux skips a missing `wm_range_table`); firmware
+refusals and ignored sent timeouts do not fail bring-up. An interrupted or
+authority-failed watermark transaction retains an unusable clock owner,
+which subsequent preparation refuses. Every refusal or error is logged in
 `ColdBoot::display_power_policy()` (`DisplayPowerPolicy { wm_ranges,
 deep_sleep }`). `ColdBoot::converge_uclk_pstate(drr)`, from every display monitor
 pass before DRR converges, searches the running configuration (every
@@ -5513,14 +6091,12 @@ both P-state supports) and the active UCLK/FCLK floors at their lowest
 levels with the idle ones zero, every result unread; every consumer must be
 retired, and `Applied::request.displays` becomes 0. `uclk_switching()` then
 reports true, so the next configuration change pins and its `prepare`
-counts its displays and disallows switching again. Deviations: DISPCLK,
-DPPCLK and DTBCLK keep their floors (Linux lowers them to their first levels
-as well; the next `prepare` sets them again). Runtime suspend needs every
-display dark, which the monitor pass that darkened the last one follows
-with this release. S3 is entered with the displays lit: the port does not
-commit zero streams as dm_suspend does, so NumOfDisplays and the UCLK/FCLK
-policy stay the running configuration's into S3, and the resume post (power
-cycle or mode1) restarts PMFW for a fresh owner. dcn401_hardware_release
+counts its displays and disallows switching again. After the bandwidth
+sequence, DTBCLK, DISPCLK and DPPCLK hard minimums move to their first DPM
+levels, in that order. Their requested minima and actual PMFW-returned rates
+are retained separately; frequency responses and acknowledgements remain
+required. Both runtime suspend and S3 retire all streams and run this release
+before quiescing the device. dcn401_hardware_release
 (FAMS2 off, P-state support forced on) is not ported: its only caller,
 dc_hardware_release, has no caller in Linux (7.3), so Linux never runs it
 before BACO or S3.
@@ -7378,15 +7954,53 @@ paths; only the tables differ.
   queued in the same FIFO as clears so no copy overtakes an earlier clear.
   A copy travels alone in its job; an upload stages its chunk under the
   platform owner just before queueing, followed by an HDP flush, so a
-  copy requeued by an SDMA0 reset re-stages. Each chunk's fence is added
-  to the buffer's KERNEL reservation and retains its source/destination
-  until it leaves the ring; a refused, timed-out (5 s) or post-reset chunk
-  fails the move without releasing either placement.
+  copy requeued by an SDMA0 reset re-stages. Each queued/inflight request
+  independently retains its source/destination, GEM identity and window
+  (`Arc<Stage>`), and its fence is added to the buffer's KERNEL reservation.
+  A refused, timed-out (5 s) or lost-generation chunk fails the move with
+  the original placement/PTEs intact; requests that hardware may still
+  reach retain their backing. A generic lost-device fence wakeup does not
+  prove a copy landed: migration returns `NoDevice`, and unreadable generic
+  clear/copy fences stay pending until a real completed sequence or explicit
+  retirement. CS propagates uncertain transfer/hardware errors before user
+  queue publication rather than treating them as allocation fallback.
+  Upload rechecks the live owner/generation after its final chunk/yield
+  before returning. Completion waits retire proven inflight leases under
+  the platform owner before placement commit, with backing drops outside
+  the state spinlock. The independent queue task also collects its final
+  inflight requests after a waiter is cancelled; bounded sleeps release the
+  owner, and unreadable progress keeps collecting without inferring stop.
+  The clearer records the owner generation. Under the same owner mutex
+  that excludes reset/power transitions, it validates that generation and
+  its live progress reader before CPU staging, then stages/flushes and
+  submits without an intervening await. Old-generation queues cannot
+  write their window or invoke stale progress MMIO. They refuse only
+  unsubmitted requests; inflight leases stay retained. Quiesce withdraws
+  the mover after suspend's eviction and reader invalidation, retaining
+  the old queue in `ResetClearer` until a completed whole-device reset
+  proves its DMA stopped. That proof explicitly retires the queue's shared
+  queued/inflight state and marks its fences failed even if stale callers
+  retain another queue clone; backing drops run outside its state spinlock.
+  Failed/cancelled reset quarantines that queue alongside its device owner;
+  registry removal cannot free its inflight resources. This applies even
+  with the whole VRAM BAR-visible.
+  Whole-device recovery and suspend acquire the card's live placement
+  admission before the platform owner, so no reset can interleave the final
+  upload validation with the coordinator's synchronous backing/PTE commit.
+  Suspend closes admission before draining submitted jobs and evicting,
+  and carries the same guard through quiesce, parked S3/BACO and resume.
+  The guard stays held through fresh-owner publication. Abandonment before
+  a full-reset proof quarantines it; abandonment after proof may release
+  it but marks that card terminal either way. Fallible client admission
+  wakes existing waiters with `NoDevice` and refuses new ones; CS checks
+  terminal loss during its pre-admission dependency waits too. A temporary
+  suspend does not mark loss. Gate acquisition never awaits under the
+  platform owner, including suspend's failed-retirement recovery path.
   GFX12 DCC buffers (AMDGPU_GEM_CREATE_GFX12_DCC on a card registered by
   `amdgpu_gem::set_gfx12_dcc`: VRAM holds them compressed) never move by
   CPU copy (`amdgpu_gem::moves_by_engine`): `GemObject::relocate` and the
   CPU-mapping move refuse them (Busy), and `amdgpu_vm::relocate` (evict_all,
-  reclaim_vram, prepare_scanout) moves them from any VRAM, visible or past
+  reclaim_vram_locked, prepare_scanout) moves them from any VRAM, visible or past
   the BAR, through the card's transfer engine with
   amdgpu_ttm_copy_mem_to_mem's copy flags (`amdgpu_gem::ttm_copy_flags`):
   READ_DECOMPRESSED out of VRAM, WRITE_COMPRESSED with the buffer's tiling
@@ -7395,7 +8009,9 @@ paths; only the tables differ.
   word (the stage stands in for the GTT side, so it takes neither flag).
   The platform registers that mover (`amdgpu_gem::register_vram_transfer`)
   whether or not the card has VRAM past the BAR, and it stays registered
-  while suspend withdraws the heap. Without an engine, or for a CPU-mapped
+  through suspend's eviction with the heap withdrawn; quiesce then removes
+  it, and a successfully restarted owner publishes a fresh mover. Without
+  an engine, or for a CPU-mapped
   DCC buffer (whose mapping would have to follow a frozen CPU copy), the
   move fails and the buffer stays; suspend then fails cleanly (Busy) rather
   than corrupt it. Deviation: Linux unmaps a CPU-mapped buffer and moves it
@@ -7618,29 +8234,30 @@ them paused. User CPU mappings of VRAM are not revoked, as in Linux.
 
 System suspend (S3) uses the async system-PM phase
 (`unsafe register_system_pm()`, installed by the fb boot handoff).
-`prepare_suspend` follows amdgpu_pmops_suspend for a dGPU: every plane
-still scanning a client framebuffer out in place flips back to its staged
-back buffer and the pins retire (`release_client_scanout`, as dm_suspend's
-commit makes cleanup_fb unpin them; a display that cannot let go fails the
-suspend with `Busy`, as dm_suspend's failed commit fails
-amdgpu_device_suspend). DRM presentation is held off from that commit
-until resume or a refused suspend (`gate_presenters`, standing in for
-Linux's frozen userspace): every queued frame (`PresentSlot::next`)
-completes unshown, a frame arriving meanwhile completes at once without a
-CPU copy, and a presenter that waited for the owner drops its frame, so no
-plane takes a client framebuffer's pin back before the eviction and
-quiesce. Then it unregisters
+`prepare_suspend` follows amdgpu_pmops_suspend for a dGPU. An exclusive
+presentation gate drains queued frames, pending GEM cursor commits and local
+presenter/cursor tasks (including their WRITE-fence waits) before any display
+or heap changes. Admission/requeue checks the gate under its mailbox lock;
+a drain that cannot finish within five seconds refuses with `Busy`. The last
+shown CPU cursor image remains available for replay. Kernel framebuffer
+writers are paused before their surfaces are withdrawn. Under OWNER, the
+display monitor generation is invalidated and every retained stream stops
+through the native teardown journal (`retire_suspend_displays`), with client
+pins retired only after fetch stops. The zero-stream bandwidth release then
+lowers the clock floors. `ColdBoot::prepare_suspend` defensively refuses a
+retained stream or unfinished teardown. A failed teardown recovers before
+refusing; eviction/preflight refusal republishes the heap and restarts the
+monitor. Then suspend unregisters
 the client VRAM heap and evicts every client VRAM buffer to system memory
 (`amdgpu_gem::evict_all`, as ttm_resource_manager_evict_all, widening each
 buffer's allowed domains with GTT for the move and waiting for its jobs;
 a buffer still pinned stays in VRAM, as it is not on TTM's LRU; the card is
 an LRU card, `amdgpu_gem::set_lru_eviction` from `publish_client_vram`, so
-this walk, like pressure's `evict_visible` and `reclaim_vram`, covers
+this walk, like pressure's `evict_visible_locked` and `reclaim_vram_locked`, covers
 every live buffer of the card, `CARD_OBJECTS`, including one only a
 framebuffer holds after CREATE_DUMB, ADDFB2 and closing the handle; other
 cards keep walking their opens' handle tables),
-pauses kernel boot-framebuffer writers, then quiesces exactly as recovery
-does and saves PCI state with bus mastering cleared
+then quiesces exactly as recovery does and saves PCI state with bus mastering cleared
 (`Reset::save_for_resume`). A refused eviction or preflight leaves the
 device running; a failed PCI save recovers immediately with mode1.
 `resume_from_suspend` (amdgpu_pmops_resume) restores PCI state before any
@@ -7650,9 +8267,20 @@ mode1 + post when SOS survived), replays GDDR6 training and brings up a
 fresh owner as recovery does, then restores the widened domains; buffers
 stay in system memory until validation promotes them (a framebuffer's
 buffer, a dumb one included, at its next commit's
-`amdgpu_prepare_scanout`). The interrupt-gated
-device-PM handler accepts Navi48 only while the async prepare holds it
-(`system_suspended()`). Hardware unvalidated.
+`amdgpu_kms_async`). The interrupt-gated
+device-PM handler accepts the native RX 9000 owner only while async prepare
+holds it (`system_suspended()`). Suspend/resume transitions are serialized by
+`PM_TRANSITION`. Their pinned retained future is polled inline, including by
+sync bridges; cancellation transfers unfinished work to an executor cleanup
+task. A canceled successful suspend resumes before releasing exclusion, and a
+canceled resume retains the parked owner through completion. System-PM's
+runtime reference follows the retained operation and rollback. Unsafe callers
+must retain their external ownership exclusions through that cleanup; its
+completion requires executor progress after cancellation. Hardware unvalidated.
+A detached display can change the surviving configuration's Vmin ODM topology.
+If `replan_displays` needs different pipes (`Admission(Pipes)`), the monitor
+performs the retained full relight before publishing the survivor's plan;
+it does not retain a joint admission naming the departed stream.
 S3 (and runtime) resume start from a clean quiesce (`Mode::Resume`), so
 `restart` drops that owner instead of quarantining it and returns the VRAM
 it published to the driver pool (`amdgpu_vram::Pool::reclaim_retired`:
@@ -7800,6 +8428,51 @@ VMID reuse nor skipping ACQUIRE_MEM removes host-data visibility ordering.
 The register banks are the same NBIF6.3.1/NBIO7.7 layouts already bounded
 by queue construction. CPU publication and fence-read HDP flushes remain
 part of their existing visibility contract.
+
+GC12 additionally accepts one graphics+compute gang: IBs are grouped by
+entity, in their original order within each entity, with at most eight IBs
+per entity. The last IB's entity is the leader, as Linux
+`amdgpu_cs_p1_ib`/`amdgpu_cs_job_idx` specify. Generic CS invokes
+`Submitter::validate_submission` before dependency waits or BO placement;
+Navi4 refuses unknown routes, oversized groups and SDMA/media mixed gangs.
+The actual native submission repeats validation. DRM version and
+ACCEL_WORKING remain unchanged; this is not a Mesa acceptance indication.
+
+Under OWNER, `Queues::prepare_gang([Job; 2])` validates both GC12 frames
+and both rings' free capacity without writing ring storage, WPTR or a
+doorbell. It returns a private `PreparedGang` tied to that queue owner and
+its exact cursor/sequence pair. Tentative cloned VMID-manager state grants
+both jobs through the ordinary concurrent-flush/PASID rules, retaining
+one client's identical root/PASID on both queues. Every watch receipt,
+aggregate leader and both VM lifetime tickets are registered before the
+first possible hardware publication. Error-bookkeeping capacity is also
+reserved first. `publish_gang(prepared, leader)` stages both command slots
+and flushes them before either WPTR, then releases follower before leader
+without an intervening await or other queue publisher. WPTR polling counts
+as possible publication even if its doorbell/flush fails. A publication
+error freezes both reserved cursor generations, stops all ledgers, returns
+the accepted aggregate receipt for normal BO/syncobj attachment, and
+requests whole-device recovery; uncertain resources remain pinned.
+
+The public ticket names the leader's ring/sequence, but its completion
+requires both physical constituent fences. Later tickets of the same
+leader fence context also wait for its outstanding follower, preserving
+syncobj/dma_resv context subsumption. VM/PTE/BO retirement uses this full
+aggregate completion, never an error signal or only the leader's fence.
+`Submitter::signalled` may wake API waiters with an error while hardware
+still owns resources; `Submitter::retired` alone answers whether a backend
+completion/reset witness permits freeing BOs or page tables. The default
+requires a successful signalled fence; Navi4 independently checks physical
+aggregate progress. Global deferred retirement during an unrelated BO's
+relocation uses `retired`, so it cannot free an errored gang or other job
+which that relocation did not itself wait for.
+A timeout/fault while a gang is outstanding escalates to whole-device
+recovery, rechecking under OWNER before any independent ring reset.
+Gangs are never replayed. Stopping/resetting records cancellation for a
+physically finished leader whose follower remains pending; successor
+ledgers retain that error. Normal single-ring paths keep their existing
+ring recovery. Physical gang scheduling/barrier/retirement acceptance is
+still required; models check admission, order, completion and ownership.
 
 `amdgpu_vmid::VmidManager` grants VMIDs as amdgpu_vmid_grab does with
 concurrent flushes: `grab(GrabRequest { owner, pd_addr, tlb_seq, pasid,
@@ -7963,6 +8636,152 @@ with clients it retains the proven VCPU. This flag advertises no codec
 profile. Models simulate device output only to test completion, checksum and
 storage rules; actual AVC decoding remains an end-of-bring-up silicon test.
 
+The same `amdgpu.decode_proof` sequence now also calls
+`unsafe Vcn::prove_hevc().await` after AVC and before any requested encoder
+proof. This separate retained Main8 arena uses an original 128×128 IDR
+fixture, independently decoded with pinned FFmpeg 8.0. Its four luma regions
+and distinct chroma values must match every byte of the 24576-byte NV12
+output, so equal-checksum corruption is also refused (`DecodePixel(offset)`).
+Mesa 26.2.4's unchanged HEVC builder/type layout and IGT 2.4's unchanged unified
+descriptor builder provide host reference checks. SPS needs three DPB slots;
+VCN5 64-byte DPB alignment, 128 KiB session and Main8 hardware context sizing
+follow `ac_vcn_dec.c`. Six guard pages bracket context, DPB, output and arena;
+input/scaling/IB bytes and firmware feedback error bits are checked as well.
+
+`HevcTesting`, pending `hevc_result` and the published reservation precede
+the first await. Fresh fence/RPTR/trap/CPU delivery is required independently
+of AVC. Success records `HevcVerified`, `Vcn::hevc_result` and
+`Diagnostics::media_hevc_decode`; failure/cancellation retains all storage,
+closes client submission and requires whole-device recovery. A successful
+owned VCPU/LMI stop permits reuse. Cold boot and recovery run both requested
+picture proofs before reopening media clients; encode can follow either the
+session, AVC or HEVC proof. The existing `media_decode` diagnostic continues
+to hold AVC evidence separately. HEVC codec capability rows remain unadvertised:
+Main10, profile/resolution ranges, inter pictures and application acceptance
+are not established by this Main8 fixture or synthetic models. Regeneration,
+source hashes and exact limits are documented in `fixtures/hevc/README.md`.
+
+The decode sequence additionally runs `unsafe Vcn::prove_hevc10().await`
+after Main8. It owns a distinct Main10 arena and records `Hevc10Testing`,
+`Hevc10Verified`, `Vcn::hevc10_result` and `Diagnostics::media_hevc10_decode`.
+The original 128×128 Main10 IDR has nonzero low two sample bits; independent
+FFmpeg decoding matches every source sample. Every byte of the 49152-byte
+MSB-aligned P010 output must match, including the low precision bits and zero
+packing bits. NV12 conversion or 8-bit round trips cannot satisfy this proof.
+Mesa's Main10 context formula yields 37888 bytes; three swizzled DPB slots
+occupy 110592 bytes, distinct from the linear target. DT pitch is 128 samples
+(256 bytes); UV begins after 32768 bytes. HEVC message depth-minus8 is two
+for both planes, with `p010_mode` and `msb_mode` set. The same fresh completion,
+full input/IB/feedback/guard checks, retained cancellation/failure and owned
+stop/restart rules apply. Boot and recovery require all requested picture
+proofs before clients reopen; encode uses the latest Main10 completion.
+Host comparison and fixture regeneration accept `--main10` and preserve the
+Main8 checks. HEVC rows remain unadvertised; two fixed intra pictures do not
+establish inter prediction, full profile/range or application acceptance.
+
+The requested decode chain next runs `unsafe Vcn::prove_vp9().await` with an
+original 128×128 Profile0 error-resilient keyframe. The retained tier3
+unified-DT arena uses the decoded linear NV12 target directly and emits the
+actual empty reference-list package; it allocates no worst-case 8K legacy
+DPB. Mesa's five probability contexts, segmentation, motion-vector and
+probability-table formula still requires 10857728 bytes of context, and the
+complete page-aligned arena is 11071488 bytes. Session default probabilities
+come from the pinned Mesa table; the per-frame probability page is separately
+writable by firmware. All 24576 decoded bytes, guards, bitstream, initialized
+probability defaults, IBs/padding and feedback must pass, with a fresh
+fence/RPTR/IH/CPU completion. `Vp9Testing` and the published arena precede the
+first await; cancellation/failure retains the arena and closes clients until
+owned recovery. Success records `Vp9Verified`, `Vcn::vp9_result` and
+`Diagnostics::media_vp9_decode`; owned stop permits reuse. Cold boot and
+recovery run VP9 after Main10 before any requested encoder or client work.
+Allocation refusal occurs before changing state/result/sequence or publishing
+VP9 addresses. Codec rows remain gated: this fixture establishes neither
+Profile2, inter-frame references, full profile/range nor application behavior.
+
+The current transport/IB, AVC/Main8/Main10/VP9 decode, AVC encode and JPEG
+transport/decode retained arenas total 30035968 bytes. Firmware/TMR and
+current display reservations are additional variable costs; admission uses
+actual contiguous `Pool` availability, including fragmentation, rather than
+assuming that a 256 MiB visible BAR guarantees success. The subsequent client
+VRAM carve retains its existing 64 MiB minimum and driver reserve policy.
+Synthetic VP9 models omit the opaque context tail but count every zeroing
+write before publication, keeping test storage below 256 KiB per model.
+Exact fixture/source provenance and limits are in `fixtures/vp9/README.md`.
+
+The same requested decode chain next runs `unsafe Vcn::prove_vp9_10().await`
+on an original 10-bit Profile2 keyframe. `Vp9TenTesting/Verified`,
+`Vcn::vp9_10_result` and `Diagnostics::media_vp9_10_decode` retain separate
+proof/state/arena ownership. Every byte of the 49152-byte P010 output must match, including nonzero
+low 2 sample bits and zero packing bits; an 8-bit intermediate is refused.
+Mesa's actual 10-bit context formula adds 65536 bytes, totaling 10923264 bytes;
+the complete retained arena is 11161600 bytes. Tier3 references, full guard,
+input/IB/feedback checks and fresh completion rules match Profile0. Cold boot
+and recovery run Profile2 after Profile0 before requested encoders/clients.
+A synthetic context model stays below 256 KiB while counting initialization.
+Retained VCN proof arenas now total 41123840 bytes; adding JPEG transport/decode
+yields 41197568 bytes before variable firmware/display claims and later codecs.
+Both strict source/FFmpeg oracles support `--profile2`; codec capability rows
+remain gated pending inter references, range and actual client acceptance.
+
+The requested decode chain next runs `unsafe Vcn::prove_av1().await` on an
+original 256×128 lossless Main8 reduced-still keyframe. It owns separate
+`av1_memory`, `Av1Testing/Verified`, `Vcn::av1_result` and platform
+`Diagnostics::media_av1_decode`. Exact NV12 pixels, input/IB padding/guards,
+immutable initialized decoder CDF, successful feedback and fresh native
+fence/RPTR/IH/CPU delivery are required. Mesa tier3 binds the current linear
+surface and an empty dynamic reference list, with no monolithic DPB. Actual
+VCN5 AV1 version2 sizing requires a 36688896-byte hardware context and four
+20480-byte initialized default CDFs. The complete arena is 37076992 bytes;
+128 KiB stream and 24 KiB per-frame segment/film-grain storage remain reserved.
+Firmware/TMR/display are additional costs. VCN proofs now total 78200832 bytes,
+or 78274560 bytes with JPEG, before separate new encoder roundtrip arenas.
+
+The private shared `decode_av1_frame` accepts a copied map/base whose caller
+retains a published Reservation, compact stream bytes, validated parsed
+fixed-sequence `Keyframe`, explicit pixel tolerance and Observer. It validates
+lengths/tile coverage/quant/filter/tx bounds before arena writes or address
+publication, checks every expected quadrant pixel and returns completion,
+absolute pixel-error sum and observed maximum. It owns no arena retirement;
+caller preserves storage on every await/failure and only an owned stop/reset
+permits reuse. Static proof uses zero tolerance. Dynamic encoder roundtrip
+uses separately retained storage and parses actual firmware output first;
+no pixel or codec claim follows solely from software model execution.
+
+Boot/recovery run AV1 after Profile2 before requested encoders/clients. Failures
+and cancellation retain published memory and close admission. Sparse models
+store defaults and meaningful pages below 512 KiB while counting every omitted
+context initialization write; full hardware reservations are unchanged.
+Actual Addrlib surfaces for both revisions, unchanged Mesa builder/CDF/IB
+constructors, independent FFmpeg pixels/CBS syntax and original pinned libaom
+regeneration provide host references. Provenance is in `fixtures/av1/README.md`.
+A separate requested AV1 Main-profile 10-bit precision proof next runs
+`unsafe Vcn::prove_av1_10().await`. It owns `av1_10_memory/result`,
+`Av1TenTesting/Verified`, `Vcn::av1_10_result` and platform
+`Diagnostics::media_av1_10_decode`. Its original independent lossless 256×128
+picture has nonzero low sample bits; every one of the 98,304 P010 bytes,
+including six zero padding bits per sample, must match. Actual Mesa messages
+select bit depths minus8=2 and P010/MSB mode, with no 10-to-8 dithering. Actual
+Addrlib derives sample pitches 256/128 and UV offset 65,536 on both revisions.
+Context and initialized decoder CDF are depth-independent and unchanged;
+the separately retained arena is 37,126,144 bytes, not just the 49,152-byte
+increase in target size. Native guards, immutable input/CDF/IB checks, feedback,
+fresh fence/modular RPTR/IH/CPU completion, failure/cancellation quarantine
+and owned-stop retirement use the same contracts as Main8. No static or
+encoder roundtrip arena is shared or released by ordinary completion.
+
+Cold boot/recovery run Main8 then Main10 before the encoder/client chain.
+Both native submit state gates and requested proof-result readiness accept
+only completed appropriate stages; encoders consume the newest completion.
+The Main8/parsed-Keyframe/dynamic320 APIs remain unchanged. The full retained
+VCN chain including this proof and AVC encoder is 115,326,976 bytes before
+separate HEVC/AV1 encoder roundtrip and variable firmware/display claims.
+Every additional owner uses actual checked pool admission, including pressure
+and contiguous-hole refusal, with no presumption of a larger visible BAR.
+Pinned primary/fixture references and precision provenance are in
+`fixtures/av1/README-10.md` and `research/summaries/rx9000-av1-p010.md`.
+Inter references, film grain, ranges and actual clients remain unproven;
+codec capability rows and DRM/ACCEL gates remain closed.
+
 The opt-in `amdgpu.encode_proof` requests `unsafe Vcn::prove_encode().await`
 after the session IB proof (and after decode when both flags are requested).
 It runs IGT 2.4's fixed 160x128 NV12 input through create/IDR/close tasks on
@@ -7972,11 +8791,25 @@ under `drivers/gpu/fixtures/vcn5/encode`. A separate retained arena owns
 session/CPB, pitched immutable input, metadata, feedback, output and commands.
 The output has the entire declared `0x1f000` range backed, with guards on
 both sides; the source test's smaller allocation is not copied.
+Its three AVC session headers use the interface selected from the retained
+authenticated firmware, exactly as the newer HEVC/AV1 proofs: major1 with
+minor>=8, clamped to1.10. Missing/unsupported interface refuses before fresh
+arena allocation, state transition or address publication, preserving any
+preclaimed unpublished storage and the prior proof. Cancellation/failure
+retention and owned retirement are unchanged. Full IGT1.9 body comparison
+remains intact; unchanged Mesa version decoding/selection/session constructors
+independently verify the variable1.8/1.9/1.10 session headers. Native physical
+completion and capability gates remain separate from these host comparisons.
+The version is retained common-header metadata corresponding to the loaded
+payload, with the same header-authentication limit as `FW_VCN` above.
+
 
 `EncodeTesting` and pending `encode_result` precede the first await and
 publication. Each arena page is initialized, including fresh zero feedback
-and output. Native fence/RPTR/source119/CPU evidence precedes reading a
-nonzero feedback byte count bounded by the declared output range. A bounded
+and output. Native fence/RPTR/source119/CPU evidence precedes reading feedback.
+Word 1 must be valid, word 8 must match the owned start offset 0, and word 6
+must be a nonzero end within the declared output range; only end minus start
+is accepted. A bounded
 Annex-B inspector requires matching SPS/PPS references, 160x128 eight-bit
 4:2:0 dimensions and IDR/I-slice headers. This is header evidence, not a
 complete H.264 validator or picture-quality proof. Command pages/padding,
@@ -7992,6 +8825,132 @@ stop/power-down cycle; with clients, the proven VCPU remains retained. No
 codec profile is advertised by this proof. Synthetic header output in the
 model verifies ownership, parsing and completion contracts; actual encoding
 and picture-quality acceptance remain physical tests at the end of bring-up.
+
+Before spawning the deferred media worker or carving the visible client heap,
+`ColdBoot::prepare_media_transport` admits the complete requested footprint.
+`Vcn::reserve_proofs` and JPEG's counterpart use exact per-codec arena constants,
+including both roundtrip arenas, Main10 profiles and JPEG client slots. VCN and
+JPEG owners stay local until both full sets fit. No power message, dispatch
+registration or media address is published on refusal; only new unpublished
+reservations drop, and pressure can be released before retry. Existing retained
+pins are never replaced/released by this transaction. Unsupported encoder
+firmware refuses the whole request without silently trimming its profile set.
+The prepared request is immutable; startup and new resume owners check the same
+request before power. Failure/cancellation after publication keeps the existing
+retained-engine/reset contract. The checked startup claim precedes client carve,
+so the asynchronously scheduled worker cannot discover that clients took its
+proof memory first.
+
+The full VCN chain currently claims155734016bytes after the384x128 HEVC
+correction: all requested decoders through AV1 Main10, AVC encode and both
+HEVC/AV1 encoder roundtrips. JPEG proof plus decode adds73728bytes; keeping
+its four64KiB staged client slots adds262144. These are distinct retained
+arenas, not reusable scratch. Firmware, existing display/queue allocations and
+inventory exclusions have already reduced actual `Pool::available()`. Client
+carve then preserves max(32MiB, aperture/8 capped512MiB) for later driver owners,
+uses actual checked contiguous2MiB-aligned reservation and requires at least
+64MiB. Small-aperture admission never halves the post-proof remainder. Missing
+space refuses a client VRAM heap or the complete media request, as applicable;
+there is no universal all-features-fit promise for256MiB. Later display requests
+must still obtain their exact checked backing. Draw proof arenas use System/GTT
+and do not consume this BootPool reserve. Native regressions use a real256MiB
+Pool, variable firmware/display claims, pressure/refusal/retry, old startup-order
+reproduction, published-pin retention and full proof-to-real-client submission
+through stop/restart. Capability/profile/range rows remain separately gated.
+Clean S3/BACO resume drops and reclaims the old stopped proof owner before
+this admission. Fault recovery instead keeps the old whole owner quarantined;
+its complete media backing and the carried client heap remain charged. A
+256MiB aperture can therefore refuse the new full request and remain lost
+after a fault, even when the initial request fit. No uncertain old owner is
+reclaimed to force recovery admission.
+
+The same `amdgpu.encode_proof` sequence additionally requests
+`unsafe Vcn::prove_hevc_encode().await` after AVC encoding (and all requested
+picture decoders), including after coordinated media restart. The VCN owner
+receives the authenticated firmware version in `Vcn::new`; Mesa's version
+bitfields select interface1.min(minor,10), with a minimum1.8 for the dependent
+slice-address template. Unknown majors/older interfaces refuse before
+allocation/publication. No client job can intervene between proof sessions.
+
+`HevcEncodeTesting`, pending `hevc_encode_result` and publication of both
+reservations precede the first await. The552960-byte encoder arena backs two
+98304-byte reconstruction slots (196608bytes collectively), separate per-slot metadata,
+128KiB session, immutable pitched input, output and guarded commands. Mesa's
+unchanged VCN5 constructors and sizing routines supply the host oracle. VPS,
+SPS and PPS are CPU-generated with unchanged Mesa bitstream writers; the80-byte
+aligned prefix is preserved. Feedback word1 must be valid, word8 must equal80,
+and end word6 must exceed start within the entire backed0x1f000 output range.
+Fresh ring/fence/source119/CPU evidence is required before reading any output.
+The fixed parameter sets/padding and single PPS0 IDR I-slice gate must match.
+
+Before recording success, the exact encoded output is copied into a separately
+retained462848-byte Main8 decode arena. Its dynamic bounded byte count, two-slot
+DPB/context, compact NV12 target, flat scaling and fixed producer SPS/PPS params
+match unchanged Mesa's generic decoder and HEVC builders. A second fresh physical
+sequence/IRQ completion must precede every output component comparison. Each
+component's absolute error must be<=4 and the mean error<=1; output starts zero,
+so stale/empty pictures cannot satisfy the source. Both sessions' input/command/
+guard checks and decoder feedback must succeed. `EncodeRoundtripProof` contains
+separate encoded/decoded completions and fidelity metrics; only its decoded
+completion is the newest fence. `HevcEncodeVerified`, `Vcn::hevc_encode_result`
+and `Diagnostics::media_hevc_encode` preserve this evidence. The client fence
+reader requires this roundtrip when encoding was requested, through boot and
+recovery. Every failure/cancellation retains both arenas and closes publication;
+only owned VCPU/LMI stop or whole-device retirement permits reuse. A refused
+unpublished allocation leaves the previous transport proof usable.
+
+The fixture's original input, unchanged Mesa-generated headers and independent
+x265 IDR are decoded by FFmpeg8.0 to every source sample in host tests; this is
+a reference validation, not evidence of physical firmware quality. Native models
+simulate encoder/decoder writes solely to check ownership/error/completion rules.
+HEVC capability/profile/range rows remain unadvertised by a single intra proof;
+inter prediction and application acceptance still require their own evidence.
+
+The same requested encode chain then calls `unsafe Vcn::prove_av1_encode()`.
+It emits one320x128 Main8 reduced-still keyframe, one5x2-SB64 tile and no
+inter references. CQP1 respects Mesa VCN5's AV1 minimum; the actual firmware
+quant/filter/transform fields are parsed rather than inferred lossless. The
+fixed CPU9-byte sequence header comes from unchanged Mesa's bitstream writer.
+This width respects Mesa VCN5's320-pixel minimum. Its physical16-byte prefix has7zero alignment bytes that must remain intact;
+those bytes are excluded from the compact logical stream sent to the decoder.
+Feedback word1 must be valid, word8 must equal16 and word6 must be a greater
+end within the fully backed126976-byte output. The bounded OBU parser accepts
+exactly one frame, checked eight-byte LEB128 length, fixed producer shape,
+signed quant deltas, loop-filter levels/delta updates and transform mode. It
+rejects unsupported tools, extra OBUs, truncated lengths and nonzero alignment.
+
+`Av1EncodeTesting`, pending result and both published reservations precede the
+first await. The encoder arena is1884160bytes, including Mesa-sized947200-byte
+search database, two196608-byte reconstructions,25088-byte per-frame metadata,
+81920-byte encoder CDF, input/output and guarded commands. The encoder CDF is
+firmware READWRITE; boundary checks retain it without assuming immutability.
+Actual unchanged Mesa constructors, setup sizing and native CDF array export
+verify these constants; actual GFX12 Addrlib checks encoder pitches512/256 and UV65536
+on both supported revisions. Default encoder and decoder CDF tables differ.
+
+The separate37101568-byte AV1 roundtrip arena retains the compact exact output
+through `decode_av1_frame`, using parsed tile offsets/size, quantization and
+filter/transform fields. The actual decoder target uses Addrlib sample pitches384/192, UV49152 and
+73728-byte backing for61440meaningful components. The helper's actual
+full36688896-byte context and
+separate decoder CDF are backed in full. Only a second fresh native fence,
+RPTR/source119/CPU completion, every component's error<=4, mean absolute error<=1
+and all stream/CDF/command/feedback/guard checks permit `Av1EncodeVerified` and
+`Vcn::av1_encode_result`/`Diagnostics::media_av1_encode`. The published result
+records separate encoded and decoded completions; the decoded completion is
+newest. Boot, recovery and requested client fence admission require the whole
+chain. Cancellation or uncertain failure retains both arenas until proven
+VCPU/LMI stop or whole-device retirement; unpublished allocation failure
+preserves prior transport and allows retry. These two arenas add38985728bytes
+to the complete retained proof budget, independently of the static decoder.
+
+Original libaom3.13.1 fixtures, actual Mesa CPU sequence and FFmpeg8/libaom
+roundtrip validate every source sample independently. Host parser regressions
+cover real lossless/lossy syntax and malformed/dynamic fields; native DMA
+models cover ownership/completion/error paths without implementing a codec.
+No AV1 codec/profile/range is advertised by this one keyframe. Inter prediction,
+other profiles/ranges, physical execution and application acceptance remain
+separate acceptance requirements.
 
 The opt-in `amdgpu.jpeg_proof` adds a retained JPEG5.0.0 static-power
 transport cycle while VCN holds the shared NBIO media doorbell range. Public

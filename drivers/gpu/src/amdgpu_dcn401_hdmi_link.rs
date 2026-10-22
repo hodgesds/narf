@@ -77,7 +77,7 @@ pub struct HdmiLinkReady {
     pub character_khz: u32,
     /// Above TMDS_SCRAMBLE_KHZ: scrambled, 1/4-rate clock channel.
     pub scrambled: bool,
-    controls: [u32; 18],
+    controls: [u32; 19],
     /// Every backend's frontend selection, so no other route moves.
     backend_routes: [u32; 4],
     /// The stream's DCCG symclk route, which TMDS leaves untouched.
@@ -86,7 +86,7 @@ pub struct HdmiLinkReady {
     on: bool,
 }
 impl HdmiLinkReady {
-    fn registers(self, l: Layout) -> [(u64, u32); 18] {
+    fn registers(self, l: Layout) -> [(u64, u32); 19] {
         let phy = self.path.transmitter;
         let s = self.request.stream;
         let be = |r| DpStream::Dio(phy).at(l, r);
@@ -112,6 +112,7 @@ impl HdmiLinkReady {
             (fe(0x20a9), u32::MAX),   // generic packets 0 (AVI) and 1 (vendor) line
             (fe(0x20b1), 0x1000),     // HDMI_DB_DISABLE
             (fe(0x20ab), u32::MAX),   // generic packets 4 (HDR) and 5 line
+            (fe(0x20aa), u32::MAX),   // generic packets 2 and 3 (FreeSync SPD) line
         ]
     }
 }
@@ -200,7 +201,7 @@ pub(crate) fn avi_infoframe(
         t,
         avi,
         BlankRequest::default_colorspace(limited, ycbcr420),
-        ycbcr420,
+        crate::amdgpu_hdr::PixelEncoding::from_420(ycbcr420),
     )
 }
 /// The AVI InfoFrame Linux's set_avi_info_frame builds for this stream: RGB
@@ -214,19 +215,13 @@ pub(crate) fn avi_infoframe_in(
     t: &crate::amdgpu_dml::Timing,
     avi: Avi,
     colorspace: crate::amdgpu_hdr::DcColorSpace,
-    ycbcr420: bool,
+    encoding: crate::amdgpu_hdr::PixelEncoding,
 ) -> [u8; 36] {
-    use crate::amdgpu_hdr::PixelEncoding;
-    let encoding = if ycbcr420 {
-        PixelEncoding::Ycbcr420
-    } else {
-        PixelEncoding::Rgb
-    };
     // CRTC color management never selects a Gamma 2.2 output transfer.
     let color = crate::amdgpu_hdr::avi_colorimetry(colorspace, encoding, avi.qs, false);
     let (q, c, ec) = (color.q, color.c, color.ec);
     // Y: 4:2:0 (3) or RGB (0).
-    let y = if ycbcr420 { 3 } else { 0 };
+    let y = encoding.avi();
     let mut p = [0u8; 36];
     p[..3].copy_from_slice(&[0x82, if avi.vic >= 128 { 3 } else { 2 }, 13]);
     let sb = &mut p[4..];
@@ -397,7 +392,7 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    fn hdmi_update(
+    pub(super) fn hdmi_update(
         &mut self,
         plan: &mut HdmiLinkReady,
         slot: usize,
@@ -405,6 +400,24 @@ impl<I: Io> Engine<I> {
         value: u32,
     ) -> Result<(), Error> {
         self.hdmi_link_verify(*plan, false)?;
+        self.update(plan.registers(self.layout)[slot].0, mask, value)?;
+        plan.controls[slot] = (plan.controls[slot] & !mask) | value;
+        Ok(())
+    }
+    /// Packet controls on the retained running stream allow its own OTG.
+    /// Cold link updates require every OTG to be stopped instead.
+    pub(super) fn hdmi_update_live(
+        &mut self,
+        plan: &mut HdmiLinkReady,
+        slot: usize,
+        mask: u32,
+        value: u32,
+    ) -> Result<(), Error> {
+        let running = self.status.hdmi_video_running.ok_or(Error::Busy)?;
+        if running.link.path != plan.path || running.link.request != plan.request {
+            return Err(Error::Busy);
+        }
+        self.hdmi_link_verify(*plan, true)?;
         self.update(plan.registers(self.layout)[slot].0, mask, value)?;
         plan.controls[slot] = (plan.controls[slot] & !mask) | value;
         Ok(())
@@ -460,7 +473,7 @@ impl<I: Io> Engine<I> {
             &timing,
             plan.request.avi,
             plan.blank.request.colorspace,
-            plan.blank.request.ycbcr420,
+            plan.blank.request.encoding,
         );
         let vendor = vendor_infoframe(&timing, plan.request.avi);
         let hdr = plan.request.hdr.map(|p| p.bytes());
@@ -481,7 +494,7 @@ impl<I: Io> Engine<I> {
     /// vpg3_update_generic_info_packet(index, packet, immediate) on stream
     /// encoder `stream`'s VPG: a conflict clear, nine data words at the
     /// packet's index, then the self-clearing immediate update.
-    async fn hdmi_packet(
+    pub(super) async fn hdmi_packet(
         &mut self,
         stream: u8,
         index: u32,
@@ -559,13 +572,14 @@ impl<I: Io> Engine<I> {
             return Err(Error::Unsupported);
         }
         let depth = match blank.request.depth {
+            _ if blank.request.encoding.is_422() => dmub::TmdsDepth::Bpc8,
             ColorDepth::Bpc8 => dmub::TmdsDepth::Bpc8,
             ColorDepth::Bpc10 => dmub::TmdsDepth::Bpc10,
             ColorDepth::Bpc12 => dmub::TmdsDepth::Bpc12,
         };
         // dcn401_calculate_dccg_tmds_div_value: divide-by-2 for 4:2:0,
         // divide-by-4 otherwise.
-        let divider = if timing.ycbcr420 {
+        let divider = if timing.encoding.is_420() {
             dccg::TmdsDivider::By2
         } else {
             dccg::TmdsDivider::By4
@@ -577,7 +591,7 @@ impl<I: Io> Engine<I> {
         timing.plan()?;
         // The TMDS link's pixel clock: halved for 4:2:0's two pixels per
         // container, as dcn401 build_pipe's requested_pix_clk.
-        let pixel_khz = timing.timing.pixel_clock_khz >> u32::from(timing.ycbcr420);
+        let pixel_khz = timing.timing.pixel_clock_khz >> u32::from(timing.encoding.is_420());
         let character_khz = depth.character_khz(pixel_khz);
         if pixel_khz < TMDS_MIN_KHZ || !(1..=TMDS_MAX_KHZ).contains(&character_khz) {
             return Err(Error::Unsupported);
@@ -591,7 +605,7 @@ impl<I: Io> Engine<I> {
             depth,
             character_khz,
             scrambled: character_khz > TMDS_SCRAMBLE_KHZ,
-            controls: [0; 18],
+            controls: [0; 19],
             backend_routes: [0; 4],
             clock_route: 0,
             on: false,
@@ -633,7 +647,12 @@ impl<I: Io> Engine<I> {
         // The encoder, DIG setup and transmitter take the character clock.
         let (path, khz) = (plan.path, plan.character_khz);
         let (stream, pipe) = (plan.request.stream, plan.request.pipe);
-        let deep = u32::from(plan.depth.code());
+        let pll_deep = u32::from(plan.depth.code());
+        let deep = match plan.blank.request.depth {
+            ColorDepth::Bpc8 => 0,
+            ColorDepth::Bpc10 => 1,
+            ColorDepth::Bpc12 => 2,
+        };
         // dcn401_program_pix_clk: PHY PLL from the pixel clock and depth,
         // then dce112_program_pixel_clk_resync's DCCG_DEEP_COLOR_CNTL.
         self.hdmi_link_verify(*plan, false)?;
@@ -642,7 +661,7 @@ impl<I: Io> Engine<I> {
             .pixel_clock(path, self.layout.inst(pipe), plan.pixel_khz, plan.depth)
             .await
             .map_err(Error::Firmware)?;
-        self.hdmi_update(plan, 5, 0x30, deep << 4)?;
+        self.hdmi_update(plan, 5, 0x30, pll_deep << 4)?;
         self.hdmi_update(plan, 4, 1, 1)?;
         // dcn401_link_encoder_setup(HDMI), with the HPD source and DIO mux.
         for (slot, mask, value) in [
@@ -665,7 +684,11 @@ impl<I: Io> Engine<I> {
             (6, 7, otg),         // dig_connect_to_otg(tg->inst)
             (6, 0x70, otg << 4), // stereo sync source (tg->inst)
             (6, 0x100, 0x100),   // stereo sync gate (stereo off)
-            (11, 0x7000, 0),     // RGB pixel encoding and colour format
+            (
+                11,
+                0x7000,
+                u32::from(plan.blank.request.encoding.is_422()) << 12,
+            ),
             // GEN v1, keepout, no extra NULL; above 340 MHz the data
             // scrambler and the 1/4-rate clock channel (HDMI_CLOCK_CHANNEL_RATE).
             (11, 0x0100001f, 0x19 | if plan.scrambled { 0x6 } else { 0 }),
@@ -673,7 +696,12 @@ impl<I: Io> Engine<I> {
             (
                 11,
                 0x31000000,
-                deep << 28 | if deep != 0 { 0x0100_0000 } else { 0 },
+                deep << 28
+                    | if deep != 0 && !plan.blank.request.encoding.is_422() {
+                        0x0100_0000
+                    } else {
+                        0
+                    },
             ),
             (12, 0x31, 0x31), // GC every frame, NULL packets
             (12, 0x1000, 0),  // no ACP
@@ -692,7 +720,11 @@ impl<I: Io> Engine<I> {
             (10, 7, u32::from(path.transmitter)),
             // DIG_FIFO_OUTPUT_PIXEL_PER_CYCLE: two for 4:2:0
             // (enc401_set_dig_input_mode), else one.
-            (9, 0x300, u32::from(plan.blank.request.ycbcr420) << 8),
+            (
+                9,
+                0x300,
+                u32::from(plan.blank.request.encoding.is_420()) << 8,
+            ),
             (9, 0x7c, 7 << 2),
         ] {
             self.hdmi_update(plan, slot, mask, value)?;
@@ -786,7 +818,9 @@ impl<I: Io> Engine<I> {
         self.hdmi_update(plan, 9, 0x300, 0)?;
         self.hdmi_route(plan, false)?;
         // enc3_stream_encoder_stop_hdmi_info_packets: AVI and vendor.
-        self.hdmi_update(plan, 14, 0x33, 0)?;
+        self.hdmi_update(plan, 14, 0x33033, 0)?;
+        self.hdmi_update(plan, 18, u32::MAX, 0)?;
+        self.hdmi_update(plan, 17, u32::MAX, 0)?;
         self.hdmi_update(plan, 15, u32::MAX, 0)?;
         self.hdmi_update(plan, 11, 0x0100001f, 0x11)?;
         self.hdmi_link_verify(*plan, false)

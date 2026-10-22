@@ -408,7 +408,7 @@ pub(super) fn request(pipe: u8) -> Request {
     Request {
         pipe,
         signal: Signal::HpoDisplayPort,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: None,
         odm: SplitPipes::NONE,
         timing: Timing {
@@ -974,7 +974,7 @@ fn blank_request(pipe: u8) -> BlankRequest {
         pipe,
         depth: ColorDepth::Bpc8,
         limited: false,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, false),
     }
 }
@@ -998,7 +998,7 @@ fn dcn401_opp_stages_native_rgb_black_without_claiming_blank_completion() -> Tes
                 pipe,
                 depth,
                 limited: false,
-                ycbcr420: false,
+                encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
                 colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(
                     false, false,
                 ),
@@ -1237,6 +1237,7 @@ fn dcn401_admission_inputs_read_live_dchub_timer_and_capped_levels() -> TestResu
         return TestResult::Fail("admission inputs");
     }
     let mode = dml::Mode {
+        hdmi: false,
         timing: Timing {
             pixel_clock_khz: 148_500,
             h_active: 1920,
@@ -1252,7 +1253,7 @@ fn dcn401_admission_inputs_read_live_dchub_timer_and_capped_levels() -> TestResu
         },
         pitch: 1920,
         bytes_per_pixel: 4,
-        ycbcr420: false,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
         dsc: None,
         planes: [None; dml::MAX_PLANES],
     };
@@ -1292,7 +1293,7 @@ fn dcn401_ycbcr420_divides_horizontal_timing_and_subsamples() -> TestResult {
     for signal in [Signal::Tmds, Signal::HdmiFrl] {
         let pipe = 2;
         let mut req = request(pipe);
-        (req.signal, req.ycbcr420) = (signal, true);
+        (req.signal, req.encoding) = (signal, crate::amdgpu_hdr::PixelEncoding::Ycbcr420);
         let mut e = engine();
         if run(e.prepare(req, clock(req))).is_err() {
             return TestResult::Fail("4:2:0 timing");
@@ -1326,13 +1327,13 @@ fn dcn401_ycbcr420_divides_horizontal_timing_and_subsamples() -> TestResult {
         e.io.regs.insert(opp(0x1847), 3); // 4:2:0 memory power forced
         e.io.retiring = [false; 4];
         let blank = BlankRequest {
-            ycbcr420: true,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(true),
             colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, true),
             ..blank_request(pipe)
         };
         for bad in [
             BlankRequest {
-                ycbcr420: false,
+                encoding: crate::amdgpu_hdr::PixelEncoding::from_420(false),
                 ..blank
             },
             BlankRequest {
@@ -1733,13 +1734,13 @@ fn odm_split_dsc_on(pipe: u8, odm: u8) -> TestResult {
     }
     // 4:2:0 wider than one formatter: the right OPP filters across the seam.
     let mut wide420 = narrow;
-    (wide420.signal, wide420.ycbcr420) = (Signal::Tmds, true);
+    (wide420.signal, wide420.encoding) = (Signal::Tmds, crate::amdgpu_hdr::PixelEncoding::Ycbcr420);
     (wide420.timing.h_active, wide420.timing.h_total) = (5120, 5500);
     let mut e = engine();
     run(e.prepare(wide420, clock(wide420))).unwrap();
     e.io.retiring = [false; 4];
     let blank420 = BlankRequest {
-        ycbcr420: true,
+        encoding: crate::amdgpu_hdr::PixelEncoding::from_420(true),
         colorspace: crate::amdgpu_dcn401_otg::BlankRequest::default_colorspace(false, true),
         ..blank_request(pipe)
     };
@@ -1755,7 +1756,7 @@ fn odm_split_dsc_on(pipe: u8, odm: u8) -> TestResult {
     let mut wide = narrow;
     (wide.timing.h_active, wide.timing.h_total) = (8320, 8500);
     let mut ycbcr = narrow;
-    (ycbcr.signal, ycbcr.ycbcr420) = (Signal::Tmds, true);
+    (ycbcr.signal, ycbcr.encoding) = (Signal::Tmds, crate::amdgpu_hdr::PixelEncoding::Ycbcr420);
     ycbcr.timing.h_active = 3842; // segments of 1921: half a pixel pair
     for (bad, want) in [
         (odd, Error::Unsupported),

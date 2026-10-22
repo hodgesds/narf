@@ -308,7 +308,7 @@ fn dcn401_color_input_tf_matches_linux_gamcor_vectors() -> TestResult {
         }
         n += 1;
     }
-    if n != 15 {
+    if n != 27 {
         return TestResult::Fail("vector count");
     }
     TestResult::Pass

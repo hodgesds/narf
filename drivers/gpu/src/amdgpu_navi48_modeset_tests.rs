@@ -25,6 +25,7 @@ fn completed_modeset(pipe: u8) -> Modeset {
             link: 0,
             preferred_engine: pipe,
             hpo_dp: false,
+            audio: false,
         },
         encoders: StreamEncoders {
             stream_enc: pipe,
@@ -191,6 +192,9 @@ fn port(path: inventory::Path, dpcd: Option<[u8; 16]>, edid: Vec<u8>) -> display
             dsc: None,
             dprx_feature: 0,
             verified_link: None,
+            amd_vsdb: None,
+            generation: 0,
+            mccs: None,
         }),
     }
 }
@@ -1113,16 +1117,89 @@ fn navi48_modeset_picks_ycbcr420_like_amdgpu() -> TestResult {
     let paths = [path(inventory::Connector::HdmiTypeA, 0)];
     let ports = [port(paths[0], None, edid.clone())];
     match select(&paths, &ports, 8, Some(p2160_60)) {
-        Ok(s) if s.ycbcr420 && s.hdmi && s.depth == Bpc8 && s.avi.vic == 97 => {}
+        Ok(s) if s.encoding.is_420() && s.hdmi && s.depth == Bpc8 && s.avi.vic == 97 => {}
         _ => return TestResult::Fail("4:2:0 selection"),
     }
-    if !selection_mode(&select(&paths, &ports, 8, Some(p2160_60)).unwrap()).ycbcr420
-        || select(&paths, &ports, 8, None).is_ok_and(|s| s.ycbcr420)
+    if !selection_mode(&select(&paths, &ports, 8, Some(p2160_60)).unwrap())
+        .encoding
+        .is_420()
+        || select(&paths, &ports, 8, None).is_ok_and(|s| s.encoding.is_420())
     {
         return TestResult::Fail("4:2:0 admission mode");
     }
     TestResult::Pass
 }
+
+/// HDMI Forum deep-color flags apply to 4:2:0 independently of RGB, and
+/// the halved pixel rate still pays the selected depth's TMDS ratio.
+fn navi48_tmds_420_deep_color_obeys_sink_and_character_limits() -> TestResult {
+    use otg::ColorDepth::{Bpc10, Bpc12, Bpc8};
+    let edid = edid_y420();
+    let t = edid_timings(&edid)
+        .into_iter()
+        .find(|t| (t.pixel_clock_khz, t.h_active, t.h_total) == (594_000, 3840, 4400))
+        .unwrap();
+    let mut caps = hdmi_caps(&edid);
+    caps.y420_only[usize::from(97u8 / 64)] |= 1 << (97 % 64);
+    caps.dc30 = false;
+    caps.dc36 = false;
+    caps.dc30_420 = true;
+    caps.dc36_420 = true;
+    caps.vsdb_max_khz = 600_000;
+    caps.forum_max_khz = 600_000;
+    caps.scdc = true;
+    for (max, expected) in [(12, Bpc12), (10, Bpc10), (8, Bpc8)] {
+        if hdmi_format(caps, &t, max) != Some((expected, true)) {
+            return TestResult::Fail("TMDS420 ignored independent deep-color caps or max bpc");
+        }
+    }
+    if hdmi_format(
+        HdmiCaps {
+            dc36_420: false,
+            ..caps
+        },
+        &t,
+        12,
+    ) != Some((Bpc10, true))
+        || hdmi_format(
+            HdmiCaps {
+                dc30_420: false,
+                dc36_420: false,
+                ..caps
+            },
+            &t,
+            12,
+        ) != Some((Bpc8, true))
+    {
+        return TestResult::Fail("TMDS420 used undeclared deep color");
+    }
+    // 12 bpc needs445.5MHz, 10bpc371.25MHz. Without SCDC, both
+    // must fall back to the297MHz 8bpc transport.
+    if hdmi_format(
+        HdmiCaps {
+            scdc: false,
+            ..caps
+        },
+        &t,
+        12,
+    ) != Some((Bpc8, true))
+        || hdmi_format(
+            HdmiCaps {
+                forum_max_khz: 400_000,
+                ..caps
+            },
+            &t,
+            12,
+        ) != Some((Bpc10, true))
+    {
+        return TestResult::Fail("TMDS420 deep color bypassed the character-rate limit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_tmds_420_deep_color_obeys_sink_and_character_limits
+);
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_picks_ycbcr420_like_amdgpu
@@ -1148,6 +1225,9 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
             dsc: None,
             dprx_feature: 0,
             verified_link: None,
+            amd_vsdb: None,
+            generation: 0,
+            mccs: None,
         };
         dp_caps(&p, &sink).unwrap().uhbr
     };
@@ -1264,6 +1344,9 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         dsc: None,
         dprx_feature: 0,
         verified_link: None,
+        amd_vsdb: None,
+        generation: 0,
+        mccs: None,
     };
     let port = display::Port {
         path: p,
@@ -1446,6 +1529,9 @@ fn navi48_modeset_decides_dsc_like_linux() -> TestResult {
         dsc,
         dprx_feature: 0,
         verified_link: None,
+        amd_vsdb: None,
+        generation: 0,
+        mccs: None,
     };
     let pick = |s: display::Sink| {
         select(
@@ -1572,7 +1658,7 @@ fn navi48_dp_alternatives_keep_dsc_admission_and_bound_the_fallback_link() -> Te
     };
     let previous = edid_timings(&edid_three_modes(false));
     let refreshed = admitted_modes(&soc, &[m], 0, previous, |t| {
-        dp_offered_mode(t, &m.selection, soc.dispclk_max_khz)
+        dp_offered_modes(t, &m.selection, soc.dispclk_max_khz)
     });
     assert_eq!(
         refreshed
@@ -1584,7 +1670,7 @@ fn navi48_dp_alternatives_keep_dsc_admission_and_bound_the_fallback_link() -> Te
     );
     // Even an empty old list retains the actual running timing as a historical
     // witness; alternatives still need fresh admission.
-    let refreshed = admitted_modes(&soc, &[m], 0, [], |_| None);
+    let refreshed = admitted_modes(&soc, &[m], 0, [], |_| Vec::new());
     assert_eq!(refreshed[0], Some(m.selection.timing));
     assert_eq!(refreshed.into_iter().flatten().count(), 1);
     TestResult::Pass
@@ -2023,7 +2109,7 @@ fn navi48_frl_420_caps_rates_and_selection() -> TestResult {
     let chosen = select(&paths, &ports, 12, Some(t));
     set_frl(enabled);
     let s = chosen.unwrap();
-    assert!(s.hdmi && s.ycbcr420 && s.audio.is_none());
+    assert!(s.hdmi && s.encoding.is_420() && s.audio.is_none());
     assert_eq!(s.depth, Bpc12);
     assert_eq!(s.frl, Some(cap));
     let soc = dml::Soc {
@@ -2038,9 +2124,9 @@ fn navi48_frl_420_caps_rates_and_selection() -> TestResult {
         dchub_refclk_khz: 50_000,
     };
     let plan = dml::admit(&soc, &selection_mode(&s)).unwrap();
-    assert!(plan.mode.ycbcr420);
+    assert!(plan.mode.encoding.is_420());
     assert_eq!(timing_request(0, &plan, &s).signal, otg::Signal::HdmiFrl);
-    assert!(timing_request(0, &plan, &s).ycbcr420);
+    assert!(timing_request(0, &plan, &s).encoding.is_420());
     assert_eq!(
         pipe_clock_request(0, &plan, &s).pixel,
         dccg::PixelClock::HdmiFrl {
@@ -2197,6 +2283,9 @@ fn navi48_dsc_link_verification_reselects_compressed_geometry() -> TestResult {
         dsc: Some(DSC),
         dprx_feature: 0,
         verified_link: None,
+        amd_vsdb: None,
+        generation: 0,
+        mccs: None,
     };
     let ports = || {
         alloc::vec![display::Port {
@@ -2801,6 +2890,9 @@ fn navi48_modeset_selects_dsc_over_uhbr() -> TestResult {
         dsc: Some(UHBR_DSC),
         dprx_feature: 0,
         verified_link: None,
+        amd_vsdb: None,
+        generation: 0,
+        mccs: None,
     };
     let port = display::Port {
         path: p,
@@ -2931,14 +3023,14 @@ fn navi48_selection_maps_colorspace_and_hdr_like_amdgpu_dm() -> TestResult {
         let sel = Selection {
             colorspace,
             limited,
-            ycbcr420,
+            encoding: crate::amdgpu_hdr::PixelEncoding::from_420(ycbcr420),
             ..s
         };
         let b = sel.blank_request(2);
         if sel.color_space() != cs
             || b.colorspace != cs
             || b.limited != matches!(cs, C::SrgbLimited | C::Rgb2020Limited)
-            || b.ycbcr420 != ycbcr420
+            || b.encoding.is_420() != ycbcr420
         {
             return TestResult::Fail("output color space");
         }
@@ -3290,7 +3382,7 @@ fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
     let got = stream(caps, &t, 8, cap).unwrap();
     let cfg = got.dsc.unwrap();
     if got.depth != otg::ColorDepth::Bpc8
-        || got.ycbcr420
+        || got.encoding.is_420()
         || got.frl.map(FrlRate::code) != Some(3)
         || (cfg.slices_h, cfg.slices_v, cfg.bpp_x16) != (8, 40, 159)
         || cfg.frl
@@ -3355,7 +3447,7 @@ fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
         stream(deep, &t, 10, cap).map(|s| (s.depth, s.dsc.map(|c| c.bpc), s.frl)),
         stream(no_rate, &t, 8, cap),
         stream(no_dsc, &t, 8, cap),
-        stream(also_420, &t, 8, cap).map(|s| (s.ycbcr420, s.dsc.is_some())),
+        stream(also_420, &t, 8, cap).map(|s| (s.encoding.is_420(), s.dsc.is_some())),
         stream(
             HdmiCaps {
                 dsc: None,
@@ -3365,7 +3457,13 @@ fn navi48_hdmi_frl_dsc_policy_matches_linux() -> TestResult {
             8,
             cap,
         )
-        .map(|s| (s.ycbcr420, s.dsc.is_some(), s.frl.map(FrlRate::code))),
+        .map(|s| {
+            (
+                s.encoding.is_420(),
+                s.dsc.is_some(),
+                s.frl.map(FrlRate::code),
+            )
+        }),
         stream(slow, &t, 8, frl_cap(slow)),
     );
     let deep8 = stream(deep_dsc8, &t, 10, cap).map(|s| (s.depth, s.dsc.map(|c| c.bpc)));
@@ -4722,4 +4820,500 @@ fn navi48_mst_selects_new_streams_beside_running_ones() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_mst_selects_new_streams_beside_running_ones
+);
+
+/// Exact Linux DML21 DET allocations (plane_vectors.txt's two final
+/// inputs). Removing a low-pixel-rate stream's overlay switches from the
+/// global fallback to per-stream DET budgets, so its sibling grows.
+fn navi48_live_plane_det_reallocation_releases_budget_before_growth() -> TestResult {
+    let soc = dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [2_500_000; 2],
+        dcfclk_khz: [1_564_000; 2],
+        socclk_khz: 1_200_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    let low = mode(Timing {
+        pixel_clock_khz: 148_500,
+        h_active: 1920,
+        h_total: 2200,
+        h_front_porch: 88,
+        h_sync_width: 44,
+        v_active: 1080,
+        v_total: 1125,
+        v_front_porch: 4,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    });
+    let high = mode(Timing {
+        pixel_clock_khz: 1_188_000,
+        h_active: 3840,
+        h_total: 4000,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 2160,
+        v_total: 2310,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    });
+    let mut overlay = low;
+    overlay.planes[1] = Some(dml::Plane::full(&low.timing, low.pitch, 4));
+    let old = dml::admit_native(&soc, &[overlay, high]).unwrap();
+    let new = dml::admit_native(&soc, &[low, high]).unwrap();
+    let segments = |p: &dml::Plan| -> u32 {
+        p.planes
+            .iter()
+            .flatten()
+            .map(|p| p.det_bytes / 65_536 * u32::from(p.dpps))
+            .sum::<u32>()
+    };
+    assert_eq!(old.iter().map(segments).collect::<Vec<_>>(), [4, 16]);
+    assert_eq!(new.iter().map(segments).collect::<Vec<_>>(), [2, 17]);
+    // The old sibling-first order would request all 21 segments as DET,
+    // leaving no COMPBUF, and refuse a valid plane removal.
+    assert_eq!(segments(&old[0]) + segments(&new[1]), 21);
+    for (before, after, expected) in [(&old, &new, [0, 1]), (&new, &old, [1, 0])] {
+        let order = det_update_order(before, after);
+        assert_eq!(order, expected);
+        let mut used: u32 = before.iter().map(segments).sum();
+        for i in order {
+            used = used - segments(&before[i]) + segments(&after[i]);
+            assert!(used <= 20, "intermediate DET exceeds the 1280 KiB pool");
+        }
+        assert_eq!(used, after.iter().map(segments).sum::<u32>());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_live_plane_det_reallocation_releases_budget_before_growth
+);
+
+fn navi48_detach_replans_single_dp_stream_with_vmin_topology() -> TestResult {
+    let mut retained = alloc::boxed::Box::new(completed_modeset(0));
+    let mut soc = retained.plan.soc;
+    soc.umc_channels = 16;
+    soc.uclk_khz = 1_250_000;
+    soc.fclk_khz = [2_500_000; 2];
+    soc.dcfclk_khz = [1_564_000; 2];
+    soc.dispclk_max_khz = 2_000_000;
+    soc.dppclk_max_khz = 2_000_000;
+    let mut stream = mode(big_timing(1_188_000, 3840, 2160, 2310));
+    stream.timing.h_total = 4000;
+    let joint = dml::admit_native(&soc, &[stream; 2]).unwrap();
+    assert_eq!(joint[0].pipes, 1);
+    assert_eq!(joint[1].pipes, 1);
+    retained.plan = joint[0];
+    retained.scanout.plan = joint[0];
+    let survivor = dml::admit_native(&soc, &[stream]).unwrap();
+    assert_eq!(survivor[0].pipes, 2);
+    assert_eq!(survivor[0].joint_modes(), [stream]);
+    // transition_running rejects this at its Admission(Pipes) preflight;
+    // the monitor must retire/relight rather than swallow that refusal.
+    assert!(!keeps_pipes(&retained, &survivor[0]));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_detach_replans_single_dp_stream_with_vmin_topology
+);
+
+fn dsc_vmin_timing() -> Timing {
+    Timing {
+        pixel_clock_khz: 900_000,
+        h_active: 5440,
+        h_total: 5600,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 3060,
+        v_total: 3200,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    }
+}
+
+fn dsc_vmin_selection() -> Selection {
+    let decoder = [
+        1, 0x21, 0, 0x0b, 0x0b, 4, 1, 0, 0, 0x13, 0x0e, 0xee, 8, 0, 0, 0,
+    ];
+    let p = path(inventory::Connector::DisplayPort, 0);
+    let mut s = select(&[p], &[port(p, dpcd(0x14, 4), edid_1080p())], 8, None).unwrap();
+    s.timing = dsc_vmin_timing();
+    s.caps = DpCaps {
+        lanes: 4,
+        rate: LinkRate::Hbr3,
+        fec: true,
+        dsc: crate::amdgpu_dsc::DscSinkCaps::parse(&decoder, &[0; 3]),
+        ..DpCaps::NONE
+    };
+    let link = dp_sst_stream(
+        &s.timing,
+        s.caps,
+        &[otg::ColorDepth::Bpc10],
+        dsc_soc().dispclk_max_khz,
+    )
+    .unwrap();
+    s.lanes = link.lanes;
+    s.rate = link.rate;
+    s.depth = link.depth;
+    s.dsc = link.dsc;
+    s
+}
+
+/// The 5440px DSC stream is wider than DSC401's 5184px input in base ODM
+/// bypass. Linux's final DP Vmin optimization gives two 2720px DSCs. HDMI
+/// and several streams do not get that optimization; memory admission is
+/// still required even when a theoretical split could fit the hardware.
+fn navi48_dsc_shape_uses_final_admitted_odm() -> TestResult {
+    let soc = dsc_soc();
+    let s = dsc_vmin_selection();
+    let cfg = s.dsc.unwrap();
+    assert_eq!(cfg.slices_h, 4);
+    assert_eq!(
+        dml::dsc_shape(&s.timing, cfg.slices_h, soc.dispclk_max_khz),
+        None
+    );
+    let m = selection_mode(&s);
+    assert_eq!(admit_native_modes(&soc, &[m]).unwrap()[0].pipes, 2);
+    let hdmi = dml::Mode { hdmi: true, ..m };
+    assert_eq!(dml::admit_native(&soc, &[hdmi]).unwrap()[0].pipes, 1);
+    assert_eq!(
+        admit_native_modes(&soc, &[hdmi]),
+        Err(dml::Error::Unsupported)
+    );
+    let sibling = mode(completed_modeset(1).selection.timing);
+    assert_eq!(dml::admit_native(&soc, &[m, sibling]).unwrap()[0].pipes, 1);
+    assert_eq!(
+        admit_native_modes(&soc, &[m, sibling]),
+        Err(dml::Error::Unsupported)
+    );
+    let starved = dml::Soc {
+        umc_channels: 1,
+        uclk_khz: 100_000,
+        ..soc
+    };
+    assert!(admit_native_modes(&starved, &[m]).is_err());
+    assert!(admit_selection_candidates(&starved, &[s], &[]).is_none());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_dsc_shape_uses_final_admitted_odm
+);
+
+/// Deep DSC is preferred alone, but its native shape fails beside a fixed
+/// running display. Continue the depth loop and accept 8-bpc RGB raw; do
+/// not reject the timing because the first link-valid candidate failed.
+fn navi48_dsc_joint_admission_retries_depth_and_offered_modes() -> TestResult {
+    let soc = dsc_soc();
+    let s = dsc_vmin_selection();
+    let sibling = completed_modeset(1);
+    let (alone, plans) = admit_selection_candidates(&soc, &[s], &[]).unwrap();
+    assert_eq!(
+        (alone[0].depth, plans[0].pipes),
+        (otg::ColorDepth::Bpc10, 2)
+    );
+    let (beside, plans) =
+        admit_selection_candidates(&soc, &[sibling.selection, s], &[true, false]).unwrap();
+    assert_eq!(beside[0], sibling.selection);
+    assert_eq!(
+        (beside[1].depth, beside[1].dsc, plans[1].pipes),
+        (otg::ColorDepth::Bpc8, None, 1)
+    );
+    let mut lit = completed_modeset(0);
+    lit.selection.caps = s.caps;
+    lit.selection.depth = s.depth;
+    // Offered alternatives use the trained HBR3 x4 cap and all depth
+    // candidates, then joint admission with the retained sibling.
+    lit.selection.lanes = 4;
+    lit.selection.rate = DpRate::Legacy(LinkRate::Hbr3);
+    let offered = admitted_modes(&soc, &[lit, sibling], 0, [s.timing], |t| {
+        dp_offered_modes(t, &lit.selection, soc.dispclk_max_khz)
+    });
+    assert!(offered.contains(&Some(s.timing)));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_dsc_joint_admission_retries_depth_and_offered_modes
+);
+
+/// The chosen DSC rate can be slower than the verified raw FRL cap. Keep
+/// that cap and the sink's deep-color caps through final admission so a
+/// failed 12-bpc DSC shape can fall back to 10-bpc raw at the higher rate.
+fn navi48_frl_final_admission_keeps_raw_fallback_cap() -> TestResult {
+    let soc = dsc_soc();
+    let mut caps = HdmiCaps {
+        dc30: true,
+        dc36: true,
+        max_frl_rate: 4,
+        ..hdmi_caps(&with_blocks(edid_1080p(), &[VSDB, HF_DSC]))
+    };
+    caps.dsc.as_mut().unwrap().bpc12 = true;
+    caps.dsc.as_mut().unwrap().max_frl_rate = 4;
+    let cap = FrlRate::new(4).unwrap();
+    let mut s = dsc_vmin_selection();
+    s.timing.h_total = 6000;
+    s.hdmi = true;
+    s.scdc = true;
+    s.audio = None;
+    let h = hdmi_stream(caps, &s.timing, 12, Some(cap), None, soc.dispclk_max_khz).unwrap();
+    assert_eq!(h.depth, otg::ColorDepth::Bpc12);
+    assert!(h.dsc.is_some());
+    s.depth = h.depth;
+    s.dsc = h.dsc;
+    s.frl = h.frl;
+    s.frl_caps = Some((caps, cap));
+    assert!(s.frl.unwrap() < cap);
+    let (chosen, plans) = admit_selection_candidates(&soc, &[s], &[]).unwrap();
+    assert_eq!(
+        (chosen[0].depth, chosen[0].dsc, plans[0].pipes),
+        (otg::ColorDepth::Bpc10, None, 1)
+    );
+    assert_eq!(chosen[0].frl, Some(cap));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_frl_final_admission_keeps_raw_fallback_cap
+);
+
+/// A link normalization failure removes a suffix from the actual result.
+/// Even when DML alone would admit that stale third stream, it must not
+/// reappear beside the smaller prefix's newly normalized DSC configuration.
+fn navi48_dsc_prefix_search_returns_only_normalized_streams() -> TestResult {
+    let soc = dsc_soc();
+    let original = completed_modeset(0).selection;
+    let mut calls = 0;
+    let (chosen, plans) = admit_prefix_candidates_with(&soc, &[original; 3], false, &mut |s| {
+        calls += 1;
+        if s.len() == 3 {
+            return false;
+        }
+        s[0].dsc = Some(crate::amdgpu_dsc::DscConfig {
+            bpp_x16: 128,
+            slices_h: 1,
+            ..crate::amdgpu_dsc::compute_config(
+                &dsc_vmin_selection().caps.dsc.unwrap(),
+                soc.dispclk_max_khz,
+                0,
+                &dsc_timing(&original.timing, 8),
+                crate::amdgpu_dsc::LinkEncoding::Dp8b10b,
+                false,
+            )
+            .unwrap()
+        });
+        true
+    })
+    .unwrap();
+    assert_eq!((chosen.len(), plans.len(), calls), (2, 2, 2));
+    let mut stale: Vec<_> = chosen.iter().map(selection_mode).collect();
+    stale.push(selection_mode(&original));
+    assert!(admit_native_modes(&soc, &stale).is_ok());
+    assert!(chosen[0].dsc.is_some());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_dsc_prefix_search_returns_only_normalized_streams
+);
+
+/// Offered-mode validation keeps the connector's actual overlays. Four
+/// planes consume the pipe pool in ODM bypass, preventing the Vmin split
+/// that would make this otherwise link-valid wide DSC image fit DSC401.
+fn navi48_dsc_offered_modes_preserve_plane_topology() -> TestResult {
+    let soc = dsc_soc();
+    let mut lit = completed_modeset(0);
+    lit.selection.caps = dsc_vmin_selection().caps;
+    lit.selection.caps.lanes = 2; // Even 8 bpc needs DSC.
+    lit.selection.lanes = 2;
+    lit.selection.rate = DpRate::Legacy(LinkRate::Hbr3);
+    let timing = dsc_vmin_timing();
+    let overlay = OverlayPlane {
+        format: otg::SurfaceFormat::Xrgb8888,
+        underlay: false,
+        plane: 0,
+        geometry: PlaneGeometry {
+            src_x: 0,
+            src_y: 0,
+            width: 640,
+            height: 480,
+            dst: crate::amdgpu_dcn401_spl::Rect::new(0, 0, 640, 480),
+            rotation: crate::amdgpu_dcn401_spl::Rotation::R0,
+            blend: otg::Blend::default_for(otg::SurfaceFormat::Xrgb8888),
+            surface: otg::PlaneSurface::LINEAR,
+            fb_size: (640, 480),
+            client: false,
+        },
+    };
+    lit.selection.planes.overlays = [Some(overlay); otg::MAX_OVERLAYS];
+    let candidates = dp_offered_modes(timing, &lit.selection, soc.dispclk_max_khz);
+    assert!(!candidates.is_empty());
+    assert!(candidates
+        .iter()
+        .any(|m| admit_native_modes(&soc, &[*m]).is_ok()));
+    let offered = admitted_modes(&soc, &[lit], 0, [timing], |t| {
+        dp_offered_modes(t, &lit.selection, soc.dispclk_max_khz)
+    });
+    assert!(!offered.contains(&Some(timing)));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_dsc_offered_modes_preserve_plane_topology
+);
+
+/// The connector property pins encoding, not just a provisional helper:
+/// CTA422 allows deep stream samples without VSDB deep-color bits; 444
+/// deep color requires DC_Y444, and AUTO keeps RGB/420 policy.
+fn navi48_hdmi_color_format_caps_depth_policy_and_final_admission() -> TestResult {
+    use crate::amdgpu_hdr::{ColorFormat as F, PixelEncoding as E};
+    use otg::ColorDepth::{Bpc10, Bpc12, Bpc8};
+    let mut edid = with_blocks(edid_1080p(), &[VSDB, HF_VSDB]);
+    edid[128 + 3] = 0x30;
+    edid[255] = 0;
+    edid[255] = narf_edid::compute_checksum(&edid[128..]);
+    let caps = hdmi_caps(&edid);
+    assert!(caps.ycbcr422 && caps.ycbcr444 && !caps.dc30 && !caps.dc36 && !caps.dc_y444);
+    let t = completed_modeset(0).selection.timing;
+    let candidates = |caps, t: &Timing, max, requested| {
+        hdmi_candidates(caps, t, max, None, None, 2_000_000, requested)
+    };
+    assert_eq!(candidates(caps, &t, 12, F::Ycbcr422)[0].depth, Bpc12);
+    assert_eq!(candidates(caps, &t, 10, F::Ycbcr422)[0].depth, Bpc10);
+    assert_eq!(candidates(caps, &t, 8, F::Ycbcr422)[0].depth, Bpc8);
+    assert_eq!(candidates(caps, &t, 12, F::Ycbcr444)[0].depth, Bpc8);
+    let deep_rgb = HdmiCaps {
+        dc30: true,
+        dc36: true,
+        ..caps
+    };
+    assert_eq!(candidates(deep_rgb, &t, 12, F::Ycbcr444)[0].depth, Bpc8);
+    assert_eq!(
+        candidates(
+            HdmiCaps {
+                dc_y444: true,
+                ..deep_rgb
+            },
+            &t,
+            12,
+            F::Ycbcr444
+        )[0]
+        .depth,
+        Bpc12
+    );
+    assert!(candidates(
+        HdmiCaps {
+            ycbcr422: false,
+            ..caps
+        },
+        &t,
+        12,
+        F::Ycbcr422
+    )
+    .is_empty());
+    assert!(candidates(
+        HdmiCaps {
+            ycbcr444: false,
+            ..caps
+        },
+        &t,
+        12,
+        F::Ycbcr444
+    )
+    .is_empty());
+    let uhd = crate::amdgpu_dcn_display::timing_from_edid(
+        &narf_edid::modes::cea_mode(97).unwrap().detailed(),
+    )
+    .unwrap();
+    assert_eq!(candidates(caps, &uhd, 12, F::Ycbcr422)[0].depth, Bpc12);
+    assert_eq!(candidates(deep_rgb, &uhd, 12, F::Ycbcr444)[0].depth, Bpc8);
+    let mut only420 = caps;
+    only420.y420_only[1] = 1 << (97 - 64);
+    for f in [F::Rgb, F::Ycbcr444, F::Ycbcr422] {
+        assert!(candidates(only420, &uhd, 12, f).is_empty());
+    }
+    assert!(candidates(only420, &uhd, 12, F::Auto)
+        .iter()
+        .all(|c| c.encoding == E::Ycbcr420));
+    let paths = [path(inventory::Connector::HdmiTypeA, 0)];
+    let ports = [port(paths[0], None, edid)];
+    let s = select_all_for_format(&paths, &ports, 12, &|_| None, &|_| F::Ycbcr422).unwrap()[0];
+    assert_eq!(
+        (s.color_format, s.encoding, s.depth),
+        (F::Ycbcr422, E::Ycbcr422, Bpc12)
+    );
+    assert_eq!(s.color_space(), crate::amdgpu_hdr::DcColorSpace::Ycbcr709);
+    let mut limited = s;
+    limited.limited = true; // Broadcast RGB never limits YCbCr a second time.
+    assert!(!limited.blank_request(0).limited);
+    let soc = completed_modeset(0).plan.soc;
+    let chosen = admit_selection_candidates(&soc, &[s], &[]).unwrap().0;
+    assert!(chosen
+        .iter()
+        .all(|s| s.color_format == F::Ycbcr422 && s.encoding == E::Ycbcr422));
+    // A forced non-RGB encoding never reaches the RGB-only DSC programmer.
+    let mut mode = selection_mode(&s);
+    mode.dsc = Some(dml::Dsc {
+        slices: 4,
+        bpp_x16: 192,
+    });
+    assert!(admit_native_modes(&soc, &[mode]).is_err());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi48",
+    navi48_hdmi_color_format_caps_depth_policy_and_final_admission
+);
+
+fn navi48_modeset_hdmi_freesync_requires_parsed_vsdb_and_complete_range() -> TestResult {
+    let path = path(inventory::Connector::HdmiTypeA, 0);
+    let mut port = port(path, None, with_cta(edid_1080p(), true));
+    assert!(select(&[path], &[port.clone()], 8, None)
+        .unwrap()
+        .vrr
+        .is_none());
+    let vsdb = crate::amdgpu_freesync::AmdVsdb {
+        version: 3,
+        min_hz: 30,
+        max_hz: 60,
+        vcp_code: 0,
+    };
+    port.sink.as_mut().unwrap().amd_vsdb = Some(vsdb);
+    let selection = select(&[path], &[port.clone()], 8, None).unwrap();
+    assert_eq!(selection.vrr, vsdb.range());
+    assert!(selection.vrr_supported());
+    assert_eq!(
+        selection.drr(),
+        Some(crate::amdgpu_freesync::Drr {
+            v_total_min: 1125,
+            v_total_max: 2250
+        })
+    );
+    for rejected in [
+        crate::amdgpu_freesync::AmdVsdb {
+            vcp_code: 0xe0,
+            ..vsdb
+        },
+        crate::amdgpu_freesync::AmdVsdb { min_hz: 50, ..vsdb },
+    ] {
+        port.sink.as_mut().unwrap().amd_vsdb = Some(rejected);
+        let selection = select(&[path], &[port.clone()], 8, None).unwrap();
+        assert!(selection.vrr.is_none());
+        assert!(!selection.vrr_supported());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_hdmi_freesync_requires_parsed_vsdb_and_complete_range
 );

@@ -12,8 +12,116 @@ use crate::amdgpu_smu_navi48_telemetry::{Limits, Telemetry, CRIT_HYST_MILLI, THR
 use alloc::{string::String, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 use narf_filesystem::FsError;
-use narf_lib::sync::IrqSafeSpinLock;
+use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+#[path = "amdgpu_navi48_thermal.rs"]
+pub mod thermal;
+
+/// Linux's delayed SW CTF confirmation and the existing orderly worker's
+/// bounded sync budget. Power-off never runs from an IH or SMU call frame.
+pub const SWCTF_DELAY_MS: u64 = 50;
+pub const FORCED_POWEROFF_MS: u64 = 10_000;
+static HOT_NOTIFIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static ALERTS: AlertSlots = AlertSlots(AtomicU64::new(0));
+struct AlertSlots(AtomicU64);
+struct AlertLease<'a> {
+    slots: &'a AlertSlots,
+    token: u64,
+}
+impl AlertSlots {
+    fn claim(&self, generation: u64) -> Option<AlertLease<'_>> {
+        let token = generation.wrapping_add(1).max(1);
+        self.0
+            .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(AlertLease { slots: self, token })
+    }
+    fn cancel(&self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+impl Drop for AlertLease<'_> {
+    fn drop(&mut self) {
+        // An old task cannot clear a newer owner's pending alert.
+        let _ = self
+            .slots
+            .0
+            .compare_exchange(self.token, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+async fn alert_delay<'a>(
+    lease: AlertLease<'a>,
+    delay: impl core::future::Future<Output = ()>,
+) -> AlertLease<'a> {
+    delay.await;
+    lease
+}
+/// Decide only from a fresh reading. A known thermal-high IRQ is fail-safe
+/// if its confirmation cannot read the sensor; unavailable periodic data
+/// alone is not evidence of a trip and never clears a hot-episode latch.
+fn thermal_trip(
+    notified: &core::sync::atomic::AtomicBool,
+    sample: Option<&Sample>,
+    irq_limit: Option<u16>,
+) -> bool {
+    let fresh = sample.and_then(|s| s.telemetry.as_ref().ok());
+    let limit = irq_limit
+        .or_else(|| sample.and_then(|s| s.limits).map(|l| l.software_shutdown_c))
+        .filter(|&l| l != 0);
+    let hot = match (fresh, limit) {
+        (Some(t), Some(limit)) => t.metrics.hotspot_milli / 1000 >= i32::from(limit),
+        _ if irq_limit.is_some() => true,
+        _ => return false,
+    };
+    if !hot {
+        notified.store(false, Ordering::Release);
+        return false;
+    }
+    !notified.swap(true, Ordering::AcqRel)
+}
+/// Called inside the platform OWNER critical section that supplied sample.
+/// Stop/restart change GENERATION under that same owner: a stale sensor
+/// read can never request shutdown after a reset/PM successor is published.
+fn thermal_trip_if_current(
+    owner: &AtomicU64,
+    generation: u64,
+    notified: &core::sync::atomic::AtomicBool,
+    sample: Option<&Sample>,
+    irq_limit: Option<u16>,
+) -> bool {
+    owner.load(Ordering::Acquire) == generation && thermal_trip(notified, sample, irq_limit)
+}
+fn observe_thermal(generation: u64, sample: Option<&Sample>, irq_limit: Option<u16>) {
+    if thermal_trip_if_current(&GENERATION, generation, &HOT_NOTIFIED, sample, irq_limit) {
+        narf_power::orderly::hw_protection_shutdown(
+            "RX 9000 GPU software critical temperature",
+            FORCED_POWEROFF_MS,
+        );
+    }
+}
+/// The retained thermal IRQ controller captured a high-threshold event.
+/// One task per owner waits 50 ms, then confirms under OWNER. No IRQ-safe
+/// lock is held while it waits or requests the orderly worker.
+pub(crate) fn thermal_alert(limit: u16) {
+    let generation = GENERATION.load(Ordering::Acquire);
+    let Some(lease) = ALERTS.claim(generation) else {
+        return;
+    };
+    narf_scheduler::spawn(async move {
+        let _lease = alert_delay(
+            lease,
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(SWCTF_DELAY_MS).as_instant()),
+        )
+        .await;
+        if GENERATION.load(Ordering::Acquire) != generation {
+            return;
+        }
+        crate::amdgpu_navi48_platform::power_sample_with(|sample| {
+            observe_thermal(generation, sample.as_ref().ok(), Some(limit));
+        })
+        .await;
+    });
+}
 
 /// Refresh period; also hwmon's natural update granularity.
 pub const POLL_MS: u64 = 1000;
@@ -45,6 +153,87 @@ static SNAPSHOT: IrqSafeSpinLock<Option<Snapshot>> = IrqSafeSpinLock::new(None);
 
 pub fn snapshot() -> Option<Snapshot> {
     *SNAPSHOT.lock()
+}
+
+/// Serializes queued sysfs changes without holding an IRQ-safe lock.
+static LEVEL_CONTROL: Mutex<()> = Mutex::new(());
+static LEVEL_REQUEST: AtomicU64 = AtomicU64::new(0);
+
+/// Linux performance-level spellings with a native GFXCLK implementation.
+pub fn parse_level(text: &str) -> Result<smu::GfxLevel, FsError> {
+    match text.trim() {
+        "auto" => Ok(smu::GfxLevel::Auto),
+        "low" => Ok(smu::GfxLevel::Low),
+        "high" => Ok(smu::GfxLevel::High),
+        "manual" | "profile_standard" | "profile_min_sclk" | "profile_min_mclk"
+        | "profile_peak" | "profile_exit" | "perf_determinism" => Err(FsError::Unsupported),
+        _ => Err(FsError::InvalidData),
+    }
+}
+fn level_name(snapshot: Option<Snapshot>) -> &'static str {
+    match snapshot.map(|s| s.gfx_level) {
+        Some(smu::GfxLevel::Low) => "low",
+        Some(smu::GfxLevel::High) => "high",
+        _ => "auto",
+    }
+}
+/// Last successfully applied GFXCLK level; no mailbox exchange on a read.
+pub fn level() -> &'static str {
+    level_name(snapshot())
+}
+fn controls_live(snapshot: Option<Snapshot>) -> bool {
+    snapshot.is_some_and(|s| s.error.is_none_or(|e| matches!(e, smu::Error::Rejected(_))))
+}
+/// Caller holds OWNER, excluding stop/restart and stale read publication.
+pub(crate) fn level_owner_current(generation: u64) -> bool {
+    GENERATION.load(Ordering::Acquire) == generation && controls_live(snapshot())
+}
+/// Publish only after PMFW accepted both bounds, while OWNER is retained.
+pub(crate) fn applied_level(level: smu::GfxLevel) {
+    if let Some(snapshot) = SNAPSHOT.lock().as_mut() {
+        snapshot.gfx_level = level;
+    }
+}
+async fn run_level_request<E>(
+    serial: &Mutex<()>,
+    latest: &AtomicU64,
+    request: u64,
+    apply: impl core::future::Future<Output = Result<(), E>>,
+) -> Option<Result<(), E>> {
+    let _serial = serial.lock().await;
+    if latest.load(Ordering::Acquire) != request {
+        return None;
+    }
+    Some(apply.await)
+}
+/// Validate synchronously, then serialize with other writes on the executor.
+/// A later pending write supersedes an earlier one; reset/PM owner changes
+/// refuse old queued requests before any clock write. Readback changes only
+/// after the retained SMU owner accepted the new GFXCLK bounds.
+pub fn request_level(text: &str) -> Result<(), FsError> {
+    let level = parse_level(text)?;
+    let generation = GENERATION.load(Ordering::Acquire);
+    if !controls_live(snapshot()) {
+        return Err(FsError::NoDevice);
+    }
+    let request = LEVEL_REQUEST.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    narf_scheduler::spawn(async move {
+        let result = run_level_request(
+            &LEVEL_CONTROL,
+            &LEVEL_REQUEST,
+            request,
+            crate::amdgpu_navi48_platform::set_gfx_level_current(level, generation),
+        )
+        .await;
+        if let Some(Err(error)) = result {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: rdna4 performance level {level:?} failed: {error:?}"
+            );
+        }
+    });
+    Ok(())
 }
 
 /// Notable transitions between two snapshots, for the console.
@@ -132,8 +321,8 @@ fn report(snapshot: &Snapshot, events: Events) {
         );
     }
     if events.software_shutdown {
-        // Linux schedules orderly_poweroff() from its THM interrupt; narf has
-        // no such policy yet. PMFW's hardware CTF still protects the board.
+        // The fresh sample already requested the orderly protection worker
+        // under OWNER. Keep console evidence separate from that decision.
         let hotspot = snapshot.telemetry.map_or(0, |t| t.metrics.hotspot_milli);
         let _ = writeln!(
             w,
@@ -153,22 +342,22 @@ async fn monitor(generation: u64) {
         if GENERATION.load(Ordering::Acquire) != generation {
             return;
         }
-        let sample = match crate::amdgpu_navi48_platform::power_sample().await {
-            Ok(sample) => sample,
-            Err(_) => return, // owner absent or boot not complete
-        };
-        let terminal = matches!(
-            sample.telemetry,
-            Err(e) if !matches!(e, smu::Error::Rejected(_))
-        );
-        let (snapshot, events) = {
-            let mut published = SNAPSHOT.lock();
+        let published = crate::amdgpu_navi48_platform::power_sample_with(|result| {
+            let sample = result.ok()?;
             if GENERATION.load(Ordering::Acquire) != generation {
-                return;
+                return None;
             }
+            observe_thermal(generation, Some(&sample), None);
+            let terminal =
+                matches!(sample.telemetry, Err(e) if !matches!(e, smu::Error::Rejected(_)));
+            let mut published = SNAPSHOT.lock();
             let (snapshot, events) = update(*published, sample);
             *published = Some(snapshot);
-            (snapshot, events)
+            Some((snapshot, events, terminal))
+        })
+        .await;
+        let Some((snapshot, events, terminal)) = published else {
+            return;
         };
         report(&snapshot, events);
         if terminal {
@@ -296,6 +485,7 @@ pub(crate) fn start(limits: Option<Limits>, gfx_level: smu::GfxLevel) {
 /// sampled and is waiting to publish. Recovery creates exactly one successor.
 pub(crate) fn stop() {
     GENERATION.fetch_add(1, Ordering::AcqRel);
+    ALERTS.cancel();
     if let Some(snapshot) = SNAPSHOT.lock().as_mut() {
         snapshot.protected = false;
         snapshot.error = Some(smu::Error::DeviceGone);
@@ -303,6 +493,7 @@ pub(crate) fn stop() {
 }
 pub(crate) fn restart(limits: Option<Limits>, gfx_level: smu::GfxLevel) {
     let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    ALERTS.cancel();
     *SNAPSHOT.lock() = Some(Snapshot {
         telemetry: None,
         limits,

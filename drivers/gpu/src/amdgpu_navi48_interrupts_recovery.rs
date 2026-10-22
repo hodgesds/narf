@@ -135,7 +135,7 @@ pub(crate) async unsafe fn finish_recovery(
 pub(crate) async fn quarantine() {
     FAILED.store(true, Ordering::Release);
     BLOCKED.store(true, Ordering::Release);
-    crate::amdgpu_info::publish_navi48_video(0);
+    crate::amdgpu_info::publish_navi48_media(0, None);
     if let Some(service) = SERVICE.lock().await.as_mut() {
         service.stop(dispatch::Terminal::Interrupts(ih::Error::Protocol));
     }

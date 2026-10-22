@@ -37,6 +37,8 @@ struct Fake {
     inbox0: bool,
     /// dmub_feature_caps.fw_assisted_mclk_switch_ver the caps query reports.
     fams_version: u8,
+    cea: bool,
+    cea_seen: Vec<[u8; 64]>,
 }
 impl Fake {
     fn slot(&self, offset: usize) -> [u8; 64] {
@@ -70,6 +72,26 @@ impl Fake {
                 request[4] = 1;
                 request[5] = self.fams_version;
                 request[16] = 1;
+            }
+            79 if self.cea => {
+                self.cea_seen.push(request);
+                let offset = u16::from_le_bytes([request[4], request[5]]);
+                assert_eq!(&request[..4], &[79, 0, 0, 16]);
+                assert_eq!(&request[6..9], &[8, 128, 0]);
+                assert_eq!(&request[17..20], &[0; 3]);
+                request[4..20].fill(0);
+                if offset == 120 {
+                    request[4] = 1;
+                    request[5] = 1;
+                    request[6] = 1;
+                    request[7..9].copy_from_slice(&3u16.to_le_bytes());
+                    request[9..11].copy_from_slice(&48u16.to_le_bytes());
+                    request[11..13].copy_from_slice(&144u16.to_le_bytes());
+                } else {
+                    request[4] = 2;
+                    request[5..7].copy_from_slice(&offset.to_le_bytes());
+                    request[7] = 1;
+                }
             }
             82 => {
                 assert_eq!(request[3], 12);
@@ -254,6 +276,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
             complete_pointer: None,
             inbox0: true,
             fams_version: 0x21,
+            cea: false,
+            cea_seen: Vec::new(),
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -566,4 +590,79 @@ fn dmub_navi48_stop_requires_pwait_and_reads_reset_back() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_stop_requires_pwait_and_reads_reset_back
+);
+
+fn cea_edid() -> Vec<u8> {
+    let mut edid = vec![0; 384];
+    edid[126] = 2;
+    edid[128] = 0x70;
+    for (i, b) in edid[256..].iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    edid[256] = 2;
+    edid
+}
+fn dmub_navi48_amd_vsdb_uses_exact_cea_chunks_and_reply_layout() -> TestResult {
+    let (_pool, mut e) = fixture();
+    run(e.quiesce()).unwrap();
+    run(e.start(tmr())).unwrap();
+    run(e.initialize_mailbox()).unwrap();
+    e.io.cea = true;
+    let edid = cea_edid();
+    assert_eq!(
+        run(e.amd_freesync_vsdb(&edid)).unwrap(),
+        Some(crate::amdgpu_freesync::AmdVsdb {
+            version: 3,
+            min_hz: 48,
+            max_hz: 144,
+            vcp_code: 0,
+        })
+    );
+    assert_eq!(e.io.cea_seen.len(), 16);
+    for (i, request) in e.io.cea_seen.iter().enumerate() {
+        assert_eq!(u16::from_le_bytes([request[4], request[5]]), (8 * i) as u16);
+        assert_eq!(&request[9..17], &edid[256 + 8 * i..264 + 8 * i]);
+    }
+    assert_eq!(e.mailbox.state, MailboxState::Ready);
+    // Undeclared/truncated extensions do not issue a firmware query.
+    let writes = e.io.writes.len();
+    assert_eq!(run(e.amd_freesync_vsdb(&edid[..256])), Ok(None));
+    assert_eq!(writes, e.io.writes.len());
+    e.io.cea = false;
+    assert_eq!(run(e.amd_freesync_vsdb(&edid)), Ok(None));
+    assert_eq!(e.mailbox.state, MailboxState::Ready);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub",
+    dmub_navi48_amd_vsdb_uses_exact_cea_chunks_and_reply_layout
+);
+fn dmub_navi48_amd_vsdb_bad_ack_and_cancel_retain_the_mailbox() -> TestResult {
+    for cancel in [false, true] {
+        let (_pool, mut e) = fixture();
+        run(e.quiesce()).unwrap();
+        run(e.start(tmr())).unwrap();
+        run(e.initialize_mailbox()).unwrap();
+        e.io.cea = true;
+        let edid = cea_edid();
+        if cancel {
+            e.io.commands = false;
+            {
+                let mut future = core::pin::pin!(e.amd_freesync_vsdb(&edid));
+                let mut cx = Context::from_waker(Waker::noop());
+                assert!(future.as_mut().poll(&mut cx).is_pending());
+            }
+            assert_eq!(e.mailbox.state, MailboxState::InFlight);
+        } else {
+            e.io.corrupt = Some((5, 8)); // ACK belongs to another offset.
+            assert_eq!(run(e.amd_freesync_vsdb(&edid)), Err(Error::Protocol));
+            assert_eq!(e.mailbox.state, MailboxState::Failed);
+        }
+        assert_eq!(run(e.amd_freesync_vsdb(&edid)), Err(Error::Busy));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub",
+    dmub_navi48_amd_vsdb_bad_ack_and_cancel_retain_the_mailbox
 );

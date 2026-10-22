@@ -22,35 +22,16 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::paging::{self, invlpg_global, map_4kb, read_cr3, unmap_4kb, MapError, PtFlags};
 use crate::vmalloc::{self, VmRange, VmallocError};
 use crate::{PhysAddr, VirtAddr};
 
-/// Cache of (phys, len) → IoMapping. Repeated `ioremap` calls on
-/// the same range return the same kernel VA — avoids leaking
-/// vmalloc ranges + PTE frames when test smokes re-probe the
-/// same hardware.
-static CACHE: IrqSafeSpinLock<Vec<IoMapping>> = IrqSafeSpinLock::new(Vec::new());
-
-fn cache_lookup(phys: u64, len: u64) -> Option<IoMapping> {
-    CACHE
-        .lock()
-        .iter()
-        .copied()
-        .find(|m| m.phys == phys && m.len == len)
-}
-
-fn cache_insert(m: IoMapping) {
-    CACHE.lock().push(m);
-}
-
-fn cache_remove(virt: u64) {
-    CACHE.lock().retain(|m| m.virt != virt);
-}
+/// Typed claims include pending installs and teardowns. No cache lock is
+/// held across page-table allocation, mapping, rollback or TLB shootdown.
+static CACHE: IrqSafeSpinLock<crate::ioremap_cache::Cache<MmioAttrs, IoMapping>> =
+    IrqSafeSpinLock::new(crate::ioremap_cache::Cache::new());
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MmioAttrs {
@@ -60,11 +41,11 @@ pub enum MmioAttrs {
     /// ROMs) where ordering doesn't matter and read-prefetching
     /// helps. Today's drivers all want Device.
     WriteBack,
-    /// Write-combining. Best for framebuffers + GPU command rings:
-    /// the CPU coalesces sequential writes into wide transactions,
-    /// which on real silicon is ~10× faster than uncached MMIO.
-    /// Requires PAT support + `narf_arch::x86_64::pat::init_default`
-    /// to have set PA1 = WC. PWT (bit 3) in the PTE selects PA1.
+    /// Write-combining for device framebuffer and command windows.
+    /// Known System RAM retains write-back leaves to match its direct map.
+    /// Requires PAT support + `narf_arch::x86_64::pat::bp_init` /
+    /// `cpu_init` to have set PA1 = WC on every CPU. PWT (bit 3) in the
+    /// PTE selects PA1.
     WriteCombining,
 }
 
@@ -72,6 +53,10 @@ pub enum MmioAttrs {
 pub enum IoremapError {
     BadLen,
     BadAlign,
+    /// An overlapping mapping requests different memory attributes.
+    AttributeConflict,
+    /// An identical mapping is currently installing or tearing down.
+    Busy,
     Exhausted,
     Map(MapError),
 }
@@ -127,8 +112,9 @@ impl IoMapping {
 /// page-aligned mapping that `iounmap` tears down.
 ///
 /// # Safety
-/// - `phys` must be a real device MMIO address the caller has
-///   exclusive access to (or the cap-system has authorised).
+/// - `phys` must be a real device MMIO address or owned firmware/RAM
+///   window the caller has exclusive access to (or cap authorization).
+///   Known System RAM always retains its write-back memory type.
 /// - `len` must cover the full device-window the caller wants
 ///   to dereference. Reads past `phys + len` may hit unmapped or
 ///   neighbour-device addresses.
@@ -155,11 +141,16 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
 
     // Cache hit? Return the prior mapping. Avoids the per-test-
     // re-probe leak that otherwise eats vmalloc + PT frames.
-    if let Some(m) = cache_lookup(base, map_len) {
-        // The cached entry carries whichever offset first created it; this
-        // caller wants its own.
-        return Ok(IoMapping { offset, ..m });
-    }
+    let reservation =
+        match crate::ioremap_cache::claim(&CACHE, base, map_len, attrs).map_err(|e| match e {
+            crate::ioremap_cache::Error::BadRange => IoremapError::BadLen,
+            crate::ioremap_cache::Error::Conflict => IoremapError::AttributeConflict,
+            crate::ioremap_cache::Error::Busy => IoremapError::Busy,
+            crate::ioremap_cache::Error::Exhausted => IoremapError::Exhausted,
+        })? {
+            crate::ioremap_cache::Claim::Ready(m) => return Ok(IoMapping { offset, ..m }),
+            crate::ioremap_cache::Claim::Pending(reservation) => reservation,
+        };
 
     let range = vmalloc::alloc(map_len)?;
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -167,17 +158,19 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
     // Per-attr PTE flags:
     //   Device          → NO_CACHE (PCD=1)              → PA2 = UC-
     //   WriteBack       → no extra bits                 → PA0 = WB
-    //   WriteCombining  → WRITE_THROUGH (PWT=1)         → PA1 = WC
-    //                     (requires pat::init_default
-    //                      has been run; failure is
-    //                      silent — WC just downgrades
-    //                      to WT, which is at least
-    //                      cacheable so still faster
-    //                      than UC).
+    //   WriteCombining  → PAT cache-mode table (normally PWT / PA1 = WC).
+    // The table also supplies the conservative fallback when PAT is disabled;
+    // an unexpected programming/readback failure stops CPU bring-up.
     let flags = match attrs {
         MmioAttrs::Device => PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_CACHE,
         MmioAttrs::WriteBack => PtFlags::PRESENT | PtFlags::WRITABLE,
-        MmioAttrs::WriteCombining => PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::WRITE_THROUGH,
+        MmioAttrs::WriteCombining => {
+            PtFlags::PRESENT
+                | PtFlags::WRITABLE
+                | PtFlags::from_bits(narf_arch::x86_64::pat::cachemode2pte(
+                    narf_arch::x86_64::pat::CacheMode::Wc,
+                ))
+        }
     };
 
     // Map page by page. On failure, walk back and unmap the
@@ -187,6 +180,11 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         let off = (i as u64) * 4096;
         let v = VirtAddr::new(range.base + off);
         let p = PhysAddr::new(base + off);
+        let flags = if attrs != MmioAttrs::WriteBack && crate::frame::is_system_ram(p) {
+            PtFlags::PRESENT | PtFlags::WRITABLE
+        } else {
+            flags
+        };
         // SAFETY: range.base + off is freshly-allocated VA (no
         // existing mapping); phys + off is per the caller's
         // exclusivity contract.
@@ -197,7 +195,12 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
                 let off_j = (j as u64) * 4096;
                 let v_j = VirtAddr::new(range.base + off_j);
                 // SAFETY: we just installed this PTE.
-                let _ = unsafe { unmap_4kb(pml4_phys, v_j) };
+                if unsafe { unmap_4kb(pml4_phys, v_j) }.is_err() {
+                    // Keep the interval reserved if rollback cannot prove
+                    // every old leaf gone; never admit a conflicting alias.
+                    core::mem::forget(reservation);
+                    return Err(IoremapError::Map(e));
+                }
             }
             vmalloc::free(range);
             return Err(IoremapError::Map(e));
@@ -218,7 +221,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         len: map_len,
         offset,
     };
-    cache_insert(m);
+    reservation.publish(m);
     Ok(m)
 }
 
@@ -228,12 +231,12 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
 ///
 /// # Safety
 /// `m` must originate from `ioremap`; the caller must have
-/// drained any in-flight MMIO accesses through the mapping
-/// before calling iounmap.
+/// stopped every user of reused handles and drained all in-flight MMIO
+/// accesses. Teardown is exclusive and may run once per installed mapping.
 pub unsafe fn iounmap(m: IoMapping) {
-    // Pull from cache first so a future ioremap of the same range
-    // gets a fresh mapping rather than the now-torn-down one.
-    cache_remove(m.virt);
+    // Mark the entry pending before teardown. Its physical type remains
+    // reserved until all leaves and cached translations have gone.
+    let reservation = crate::ioremap_cache::retire(&CACHE, |ready| ready.virt == m.virt);
     // SAFETY: caller-provided mapping handle.
     let pml4_phys = unsafe { read_cr3() };
     let pages = (m.len >> 12) as usize;
@@ -241,7 +244,11 @@ pub unsafe fn iounmap(m: IoMapping) {
         let off = (i as u64) * 4096;
         let v = VirtAddr::new(m.virt + off);
         // SAFETY: paired with ioremap's map_4kb.
-        let _ = unsafe { unmap_4kb(pml4_phys, v) };
+        if unsafe { unmap_4kb(pml4_phys, v) }.is_err() {
+            // A retained pending claim quarantines any uncertain leaf.
+            core::mem::forget(reservation);
+            return;
+        }
         // SAFETY: invlpg_global broadcasts via the installed
         // shootdown hook.
         // SAFETY: Valid memory or trusted environment
@@ -253,4 +260,5 @@ pub unsafe fn iounmap(m: IoMapping) {
         base: m.virt,
         len: m.len,
     });
+    drop(reservation);
 }

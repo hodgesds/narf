@@ -22,7 +22,8 @@
 //! - `stream_kbps` and `dsc_kbps` are dc_bandwidth_in_kbps_from_timing and
 //!   dc_dsc_stream_bandwidth_in_kbps, in Linux's 31.32 fixed point.
 //!
-//! eDP and DP-HDMI converters are not ported.
+//! Native MST owns DP-to-HDMI converter capability and output policy.
+//! eDP-specific panel/AUX lifecycle is outside this module.
 #[path = "amdgpu_dsc_qp.rs"]
 mod qp;
 

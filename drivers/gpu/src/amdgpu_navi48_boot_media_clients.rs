@@ -3,6 +3,19 @@ use super::*;
 use crate::{amdgpu_navi48_dispatch as dispatch, amdgpu_vcn_navi48 as vcn};
 
 impl ColdBoot {
+    /// The current proven client transport must retain the same PSP TMR
+    /// and firmware image. Diagnostic-only stopped media grants no query.
+    pub(crate) fn client_media_firmware_version(&self) -> Option<u32> {
+        if self.state() != State::MemoryReady {
+            return None;
+        }
+        self.client_media_fence_reader()?;
+        self.sequence
+            .backend
+            .psp
+            .as_ref()?
+            .authenticated_vcn_version()
+    }
     pub(crate) fn client_media_fence_reader(&self) -> Option<vcn::FenceReader> {
         let hw = &self.sequence.backend;
         if !self.media_submission_ready() || hw.vcn_owner.is_none() {
@@ -12,9 +25,17 @@ impl ColdBoot {
         vcn.ib_result()?.ok()?;
         if hw.media_decode_required {
             vcn.decode_result()?.ok()?;
+            vcn.hevc_result()?.ok()?;
+            vcn.hevc10_result()?.ok()?;
+            vcn.vp9_result()?.ok()?;
+            vcn.vp9_10_result()?.ok()?;
+            vcn.av1_result()?.ok()?;
+            vcn.av1_10_result()?.ok()?;
         }
         if hw.media_encode_required {
             vcn.encode_result()?.ok()?;
+            vcn.hevc_encode_result()?.ok()?;
+            vcn.av1_encode_result()?.ok()?;
         }
         vcn.fence_reader()
     }
@@ -73,7 +94,17 @@ impl ColdBoot {
         let vcn = self.sequence.backend.vcn.as_mut().ok_or(vcn::Error::Busy)?;
         if !matches!(
             vcn.state(),
-            vcn::State::IbVerified | vcn::State::DecodeVerified | vcn::State::EncodeVerified
+            vcn::State::IbVerified
+                | vcn::State::DecodeVerified
+                | vcn::State::Av1Verified
+                | vcn::State::Av1TenVerified
+                | vcn::State::Vp9TenVerified
+                | vcn::State::Vp9Verified
+                | vcn::State::Hevc10Verified
+                | vcn::State::HevcVerified
+                | vcn::State::EncodeVerified
+                | vcn::State::HevcEncodeVerified
+                | vcn::State::Av1EncodeVerified
         ) {
             return Err(vcn::Error::Busy);
         }
@@ -90,6 +121,9 @@ impl ColdBoot {
         if self.sequence.backend.vcn_owner.is_none() {
             return Err(Error::Busy);
         }
+        // Current media evidence cannot outlive a reset or its cancellation.
+        // The platform republishes only after reproof and replay commit.
+        crate::amdgpu_info::publish_navi48_media(0, None);
         let hw = &mut self.sequence.backend;
         hw.media_test = Some(Err(Error::Busy));
         if hw.media_jpeg_clients && hw.jpeg_owner.is_some() {
@@ -144,15 +178,35 @@ impl ColdBoot {
             if decode {
                 // SAFETY: same retained kernel VMID0 and no replay until the
                 // requested picture proof and all other rings finish.
-                proof = unsafe { vcn.prove_decode().await }
+                unsafe { vcn.prove_decode().await }.map_err(Error::Vcn)?;
+                // SAFETY: the AVC proof drained the same retained transport;
+                // clients remain excluded through this independent Main8 proof.
+                unsafe { vcn.prove_hevc().await }.map_err(Error::Vcn)?;
+                // SAFETY: no client publication; fresh drained Main8 transport.
+                unsafe { vcn.prove_hevc10().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained kernel VMID0 and drained Main10 predecessor.
+                unsafe { vcn.prove_vp9().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained VMID0 and drained Profile0 predecessor.
+                unsafe { vcn.prove_vp9_10().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained VMID0 and drained Profile2 predecessor.
+                unsafe { vcn.prove_av1().await }.map_err(Error::Vcn)?;
+                // SAFETY: retained VMID0 and drained AV1 Main8 predecessor;
+                // clients remain excluded through the full P010 precision proof.
+                proof = unsafe { vcn.prove_av1_10().await }
                     .map_err(Error::Vcn)?
                     .completion;
             }
             if encode {
                 // SAFETY: all ledgers remain frozen, including media, until
                 // the new requested proof and every healthy replay finish.
-                proof = unsafe { vcn.prove_encode().await }
+                unsafe { vcn.prove_encode().await }.map_err(Error::Vcn)?;
+                // SAFETY: same retained owner; exact encode output remains pinned
+                // through the independent decoder and per-component fidelity check.
+                unsafe { vcn.prove_hevc_encode().await }.map_err(Error::Vcn)?;
+                // SAFETY: same retained native owner through both AV1 sessions.
+                proof = unsafe { vcn.prove_av1_encode().await }
                     .map_err(Error::Vcn)?
+                    .decoded
                     .completion;
             }
             if jpeg {

@@ -55,6 +55,12 @@ for f in "$dml/display_mode_vba.c" "$work/dcn30/display_mode_vba_30.c" \
 	"$dml/calcs/dcn_calc_math.c"; do
 	cc -c "${flags[@]}" "$f" -o "$work/$(basename "$f" .c).o"
 done
+# Newer DCN30 VBA calls the shared DML1 FRL capability checker. Link its
+# primary implementation when present; older Linux trees predate this unit.
+if [ -f "$dml/dml1_frl_cap_chk.c" ]; then
+	cc -c "${flags[@]}" '-D__maybe_unused=__attribute__((unused))' \
+		"$dml/dml1_frl_cap_chk.c" -o "$work/dml1_frl_cap_chk.o"
+fi
 cc "${flags[@]}" "$here/harness.c" "$work"/*.o -lm -o "$work/harness"
 
 pass=0 fail=0

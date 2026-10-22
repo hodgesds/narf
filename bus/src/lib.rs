@@ -65,8 +65,8 @@ pub mod aarch64;
 
 pub use addr::{BusAddr, PcieAddr};
 pub use bar::{
-    allocate_pci_mmio, assign_unprogrammed_bars, init_mmio_pool, map_bar, read_bar, AssignError,
-    Bar, BarError, BarKind, MmioRegion, NUM_BARS,
+    allocate_pci_mmio, assign_unprogrammed_bars, init_mmio_pool, map_bar, map_bar_control,
+    read_bar, AssignError, Bar, BarError, BarKind, MmioRegion, NUM_BARS,
 };
 pub use device::{BusDevice, BusKind, DeviceId};
 pub use driver_match::{

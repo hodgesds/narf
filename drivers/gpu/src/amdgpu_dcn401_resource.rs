@@ -22,7 +22,10 @@
 //! for a 128b/132b DP stream an HPO DP stream encoder
 //! (find_first_free_match_hpo_dp_stream_enc_for_link) and its link's HPO DP
 //! link encoder, one per link shared by every stream on it and taken from
-//! the free pool (add_hpo_dp_link_enc_to_ctx).
+//! the free pool (add_hpo_dp_link_enc_to_ctx). A stream with audio then
+//! takes an Azalia audio endpoint keyed by its DIO stream encoder's engine,
+//! whatever its signal (find_first_free_audio: the endpoint of that
+//! engine's index when free, else the first free one, else none).
 
 /// Pipe contexts per state (DCN401's pipes; Linux sizes them MAX_PIPES,
 /// the pipes past the pool staying clear).
@@ -37,6 +40,8 @@ pub const STREAM_ENCODERS: usize = 4;
 pub const HPO_DP_STREAM_ENCODERS: usize = 4;
 /// HPO DP link encoders (num_hpo_dp_link_encoder, MAX_HPO_DP2_LINK_ENCODERS).
 pub const HPO_DP_LINK_ENCODERS: usize = 4;
+/// Azalia audio endpoints (res_cap_dcn4_01 num_audio).
+pub const AUDIOS: usize = 4;
 
 /// What encoder acquisition reads of a stream's output.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,15 +53,21 @@ pub struct StreamOutput {
     pub preferred_engine: u8,
     /// A 128b/132b DP stream (dp_get_encoding_format of its link settings).
     pub hpo_dp: bool,
+    /// The stream carries audio: an audio-capable signal whose sink
+    /// declared audio modes (resource_map_pool_resources' audio check).
+    pub audio: bool,
 }
 
 /// The encoders a stream's OTG master holds: stream_res.stream_enc,
-/// stream_res.hpo_dp_stream_enc and link_res.hpo_dp_link_enc, by instance.
+/// stream_res.hpo_dp_stream_enc and link_res.hpo_dp_link_enc, by instance,
+/// and its stream_res.audio endpoint (none when the stream has no audio or
+/// every endpoint is taken: the stream then lights without audio).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StreamEncoders {
     pub stream_enc: u8,
     pub hpo_dp_stream_enc: Option<u8>,
     pub hpo_dp_link_enc: Option<u8>,
+    pub audio: Option<u8>,
 }
 
 /// One pipe's `pipe_ctx` as acquisition sees it. All `None` is a cleared
@@ -111,6 +122,8 @@ pub struct DcState {
     /// res_ctx.hpo_dp_link_enc_to_link_idx and hpo_dp_link_enc_ref_cnts.
     pub hpo_dp_link_enc_link: [u8; HPO_DP_LINK_ENCODERS],
     pub hpo_dp_link_enc_refs: [u8; HPO_DP_LINK_ENCODERS],
+    /// res_ctx.is_audio_acquired.
+    pub audio_acquired: [bool; AUDIOS],
 }
 
 /// resource_build_scaling_params for `pipe` of `state`: whether SPL can
@@ -171,6 +184,7 @@ impl DcState {
                     link: 0,
                     preferred_engine: 0,
                     hpo_dp: false,
+                    audio: false,
                 },
                 encoders: None,
             }; MAX_STREAMS],
@@ -179,6 +193,7 @@ impl DcState {
             hpo_dp_stream_enc_acquired: [false; HPO_DP_STREAM_ENCODERS],
             hpo_dp_link_enc_link: [0; HPO_DP_LINK_ENCODERS],
             hpo_dp_link_enc_refs: [0; HPO_DP_LINK_ENCODERS],
+            audio_acquired: [false; AUDIOS],
         }
     }
     pub fn streams(&self) -> &[StreamStatus] {
@@ -869,11 +884,36 @@ impl DcState {
         self.hpo_dp_link_enc_refs[usize::from(i)] = 1;
         Some(i)
     }
+    /// find_first_free_audio for the stream encoder of engine `id`: the
+    /// free endpoint of that index whose stream encoder is acquired, else
+    /// the free endpoint of that index, else the first free one.
+    pub fn find_first_free_audio(&self, id: u8) -> Option<u8> {
+        let id = usize::from(id);
+        for i in 0..AUDIOS {
+            if !self.audio_acquired[i] && self.stream_enc_acquired.get(i) == Some(&true) {
+                // We have enough audio endpoints: find the matching inst.
+                if id != i {
+                    continue;
+                }
+                return Some(i as u8);
+            }
+        }
+        if id < AUDIOS && !self.audio_acquired[id] {
+            return Some(id as u8);
+        }
+        // Not found the matching one: first come, first served.
+        (0..AUDIOS)
+            .find(|&i| !self.audio_acquired[i])
+            .map(|i| i as u8)
+    }
     /// The encoders `encoders` of a stream on `link` held in this state
-    /// (update_stream_engine_usage and update_hpo_dp_stream_engine_usage
-    /// with acquired set, add_hpo_dp_link_enc_to_ctx).
+    /// (update_stream_engine_usage, update_hpo_dp_stream_engine_usage and
+    /// update_audio_usage with acquired set, add_hpo_dp_link_enc_to_ctx).
     fn hold_stream_encoders(&mut self, link: u8, e: StreamEncoders) {
         self.stream_enc_acquired[usize::from(e.stream_enc)] = true;
+        if let Some(a) = e.audio {
+            self.audio_acquired[usize::from(a)] = true;
+        }
         if let Some(h) = e.hpo_dp_stream_enc {
             self.hpo_dp_stream_enc_acquired[usize::from(h)] = true;
         }
@@ -897,13 +937,18 @@ impl DcState {
                 self.hpo_dp_link_enc_refs[usize::from(i)] -= 1;
             }
         }
+        if let Some(a) = e.audio {
+            self.audio_acquired[usize::from(a)] = false;
+        }
     }
     /// resource_map_pool_resources' encoders for `stream`, which holds its
     /// OTG master: the DIO stream encoder (DC_NO_STREAM_ENC_RESOURCE
     /// without one), then on a 128b/132b DP output the first free HPO DP
     /// stream encoder and the link's HPO DP link encoder
-    /// (DC_NO_LINK_ENC_RESOURCE without one). None refuses the state, as
-    /// Linux fails the commit.
+    /// (DC_NO_LINK_ENC_RESOURCE without one), then for a stream with audio
+    /// the endpoint find_first_free_audio gives its DIO stream encoder's
+    /// engine (none leaves the stream without audio, as Linux does). None
+    /// refuses the state, as Linux fails the commit.
     pub fn map_stream_encoders(
         &mut self,
         stream: u8,
@@ -920,6 +965,7 @@ impl DcState {
             stream_enc,
             hpo_dp_stream_enc: None,
             hpo_dp_link_enc: None,
+            audio: None,
         };
         self.streams[i].output = output;
         self.streams[i].encoders = Some(e);
@@ -929,6 +975,14 @@ impl DcState {
             e.hpo_dp_stream_enc = Some(h);
             self.streams[i].encoders = Some(e);
             e.hpo_dp_link_enc = Some(self.add_hpo_dp_link_enc_to_ctx(output.link)?);
+            self.streams[i].encoders = Some(e);
+        }
+        if output.audio {
+            // stream_enc->id: DIGA-DIGD are engines 0-3.
+            e.audio = self.find_first_free_audio(stream_enc);
+            if let Some(a) = e.audio {
+                self.audio_acquired[usize::from(a)] = true;
+            }
             self.streams[i].encoders = Some(e);
         }
         Some(e)

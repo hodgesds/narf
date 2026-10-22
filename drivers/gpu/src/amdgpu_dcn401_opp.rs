@@ -69,7 +69,7 @@ pub struct BlankRequest {
     /// subsamples, the MPC output CSC converts to BT.709 YCbCr (always
     /// limited range: `limited` is for RGB) and the blank pattern is YCbCr
     /// black. Requires 4:2:0 timing.
-    pub ycbcr420: bool,
+    pub encoding: crate::amdgpu_hdr::PixelEncoding,
     /// The stream's output color space (amdgpu_dm_get_output_color_space):
     /// it selects the output CSC (find_color_matrix), the blank black
     /// (color_space_to_black_color) and the colorimetry the stream signals.
@@ -100,10 +100,10 @@ impl BlankRequest {
         let (x, width) = plan.segment(segment);
         // opp2_get_left_edge_extra_pixel_count: a non-primary OPP's 4:2:0
         // chroma filter takes one pixel from the left neighbour.
-        let edge = u32::from(self.ycbcr420 && segment > 0);
+        let edge = u32::from(self.encoding.subsampled() && segment > 0);
         self.common_registers(plan.request.timing, width, x, edge)
             .into_iter()
-            .chain(self.ycbcr420.then_some((MAP420, 3, 0)))
+            .chain(self.encoding.is_420().then_some((MAP420, 3, 0)))
     }
     fn common_registers(self, t: Timing, width: u32, x: u32, edge: u32) -> [(u64, u32, u32); 14] {
         // color_space_to_black_color: YCbCr spaces' black, sRGB limited's
@@ -124,11 +124,9 @@ impl BlankRequest {
         };
         // FMT_PIXEL_ENCODING 4:2:0, subsampling mode 2, Cb/Cr bit
         // reduction bypassed (opp1_set_pixel_encoding); RGB otherwise.
-        let format = if self.ycbcr420 {
-            2 << 16 | 2 << 18 | 1 << 21
-        } else {
-            0
-        };
+        let format = self.encoding.hardware_format() << 16
+            | (u32::from(self.encoding.subsampled()) * 2) << 18
+            | u32::from(self.encoding.is_420()) << 21;
         [
             // The 4:2:2/4:2:0 chroma filter's extra left pixel: none on the
             // primary OPP (opp2_get_left_edge_extra_pixel_count).
@@ -193,14 +191,14 @@ impl<I: Io> Engine<I> {
             || timing.request.timing.v_active > 0x3fff
             // 4:2:0 formatting on 4:2:0 timing only, and always YCbCr's
             // own (limited) range.
-            || request.ycbcr420 != timing.request.ycbcr420
+            || request.encoding != timing.request.encoding
             // A compressed stream's OPP feeds its DSC the depth the PPS
             // codes (the stream's display_color_depth).
             || timing
                 .request
                 .dsc
                 .is_some_and(|c| u32::from(c.bpc) != request.depth.bpc())
-            || request.ycbcr420 && request.limited
+            || !request.encoding.is_rgb() && request.limited
             // `limited` names the limited-range RGB spaces exactly.
             || request.limited
                 != matches!(

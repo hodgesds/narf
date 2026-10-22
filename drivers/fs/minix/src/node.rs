@@ -213,6 +213,9 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
             if inode.is_dir() {
                 return Err(FsError::InvalidPath);
             }
+            // Bump before the bytes move: a partial write that ends in
+            // an error must still invalidate retained cache pages.
+            self.volume.bump_cache_generation(self.ino);
             let n = self.volume.write_file(&mut inode, offset, buf).await?;
             self.volume.write_inode(self.ino, &inode).await?;
             *self.inode.lock() = Some(inode);
@@ -247,6 +250,7 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
             if inode.is_dir() {
                 return Err(FsError::InvalidPath);
             }
+            self.volume.bump_cache_generation(self.ino);
             if len == 0 {
                 self.volume.truncate_inode(&mut inode).await?;
             } else if (len as u32) <= inode.size {
@@ -268,6 +272,22 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
             *self.inode.lock() = Some(inode);
             Ok(())
         })
+    }
+
+    /// Generic-fallback mmap opt-in for regular files: this file's
+    /// bytes change only through `write`, `truncate` and a final
+    /// `unlink` (link count reaching zero), and each of those bumps
+    /// the volume generation keyed by this inode number — see
+    /// `MinixVolume::cache_generations`. Every node minted for the
+    /// same inode reports the same value, so a mutation through any
+    /// one open invalidates pages retained through any other. A node
+    /// whose inode was never read, and any non-regular file, stays
+    /// on the conservative `None` behaviour.
+    fn mmap_cache_generation(&self) -> Option<u64> {
+        match *self.inode.lock() {
+            Some(inode) if inode.is_reg() => Some(self.volume.cache_generation(self.ino)),
+            _ => None,
+        }
     }
 }
 
@@ -504,6 +524,11 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             }
             victim.nlinks = victim.nlinks.saturating_sub(1);
             if victim.nlinks == 0 {
+                // The inode's zones are about to be released under
+                // any node still holding the file open: its retained
+                // cache pages no longer describe what a read through
+                // that node would return.
+                self.volume.bump_cache_generation(entry.ino as u32);
                 self.volume.truncate_inode(&mut victim).await?;
                 self.volume.free_inode(entry.ino as u32).await?;
             } else {

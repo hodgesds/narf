@@ -779,6 +779,14 @@ impl<I: Io> Engine<I> {
         }
         result
     }
+    /// smu_v14_0_enable_thermal_alert, after a retained IH/THM owner
+    /// armed its source registers. Cancellation keeps Runtime quarantined.
+    async fn allow_ih_interrupt(&mut self) -> Result<(), Error> {
+        let resume = self.begin_runtime()?;
+        let result = self.command(0x4d, 0).await.map(|_| ());
+        self.end_runtime(resume, &result);
+        result
+    }
     /// SetSoftMaxByFreq then SetSoftMinByFreq on GFXCLK, with Linux's
     /// `SMU_V14_SOFT_FREQ_ROUND` on manual maxima.
     async fn set_gfx_level(&mut self, level: GfxLevel) -> Result<(), Error> {
@@ -1035,6 +1043,11 @@ impl Smu {
     /// One PMFW metrics/feature/PPT refresh. Requires configured power.
     pub async fn read_telemetry(&mut self) -> Result<Telemetry, Error> {
         self.engine.read_telemetry().await
+    }
+    /// Permit SMU-to-host interrupts only after the retained thermal/IH
+    /// owner is ready to acknowledge them.
+    pub(crate) async fn allow_ih_interrupt(&mut self) -> Result<(), Error> {
+        self.engine.allow_ih_interrupt().await
     }
     /// Apply GFXCLK soft limits. Display clocks, UCLK/FCLK pinning and every
     /// protection are untouched; a clean rejection leaves the owner usable.

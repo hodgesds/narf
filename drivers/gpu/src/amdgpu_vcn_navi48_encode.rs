@@ -9,6 +9,10 @@ impl<I: Io> Engine<I> {
         &mut self,
         observer: &mut impl Observer,
     ) -> Result<EncodeProof, Error> {
+        let interface = self
+            .encode_interface
+            .filter(|i| (0x10008..=0x1000a).contains(i))
+            .ok_or(Error::Unsupported)?;
         if self.encode_result.is_some() {
             return Err(Error::Busy);
         }
@@ -17,6 +21,42 @@ impl<I: Io> Engine<I> {
                 .ib_result
                 .ok_or(Error::Busy)?
                 .map_err(|_| Error::Busy)?,
+            State::Av1TenVerified => {
+                self.av1_10_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
+            State::Av1Verified => {
+                self.av1_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
+            State::Vp9TenVerified => {
+                self.vp9_10_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
+            State::Vp9Verified => {
+                self.vp9_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
+            State::Hevc10Verified => {
+                self.hevc10_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
+            State::HevcVerified => {
+                self.hevc_result
+                    .ok_or(Error::Busy)?
+                    .map_err(|_| Error::Busy)?
+                    .completion
+            }
             State::DecodeVerified => {
                 self.decode_result
                     .ok_or(Error::Busy)?
@@ -40,7 +80,7 @@ impl<I: Io> Engine<I> {
         self.encode_result = Some(Err(Error::Busy));
         self.encode_memory.as_mut().unwrap().publish();
         let result = self
-            .prove_encode_inner(observer)
+            .prove_encode_inner(observer, interface)
             .await
             .and_then(|p| self.access(|_, _| Ok(p)));
         self.state = match result {
@@ -53,12 +93,13 @@ impl<I: Io> Engine<I> {
     async fn prove_encode_inner(
         &mut self,
         observer: &mut impl Observer,
+        interface: u32,
     ) -> Result<EncodeProof, Error> {
         let memory = self.encode_memory.as_ref().ok_or(Error::Busy)?;
         let (map, base) = (memory.mapping(), memory.address());
-        let create = e::ib(base, e::Phase::Create)?;
-        let encode = e::ib(base, e::Phase::Encode)?;
-        let destroy = e::ib(base, e::Phase::Destroy)?;
+        let create = e::ib(base, e::Phase::Create, interface)?;
+        let encode = e::ib(base, e::Phase::Encode, interface)?;
+        let destroy = e::ib(base, e::Phase::Destroy, interface)?;
         for page in (0..e::BYTES).step_by(4096) {
             self.access(|io, l| {
                 let value = if e::GUARDS.contains(&page) {
@@ -128,13 +169,12 @@ impl<I: Io> Engine<I> {
         }
         let at = self.memory.address() + FENCE;
         frame[18..].copy_from_slice(&[3, at as u32, (at >> 32) as u32, sequence, 4, 1]);
+        let start = self.wptr;
         let next = self.emit(&frame)?;
         let mut complete = false;
         for _ in 0..20_000 {
             let pointer = self.reg(RPTR)?;
-            if pointer > next {
-                return Err(Error::Readback);
-            }
+            proof_pointer(pointer, start, next)?;
             let fence = self.completed_job()? == sequence;
             let irq = observer.observed(sample).await.map_err(Error::Interrupts)?;
             if pointer == next && fence && irq {
@@ -148,7 +188,15 @@ impl<I: Io> Engine<I> {
         }
         let size = self.access(|io, l| {
             flush(io, l)?;
-            Ok(io.memory_read(map, e::FEEDBACK + 6 * 4))
+            // Mesa radeon_vcn_enc.c::radeon_enc_get_feedback: word 1
+            // validates feedback; words 6/8 are end/start byte offsets.
+            let valid = io.memory_read(map, e::FEEDBACK + 4);
+            let end = io.memory_read(map, e::FEEDBACK + 6 * 4);
+            let start = io.memory_read(map, e::FEEDBACK + 8 * 4);
+            if valid == 0 || start != 0 || end <= start {
+                return Err(Error::EncodeOutput);
+            }
+            Ok(end - start)
         })?;
         if size == 0 || u64::from(size) > e::OUTPUT_BYTES {
             return Err(Error::EncodeOutput);

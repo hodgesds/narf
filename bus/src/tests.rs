@@ -112,6 +112,7 @@ kernel_test_in!("bus", smoke_bus_discovers_pmu_ppi_from_dtb);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_enumerates_virtio_mmio() -> TestResult {
+    let _restore_registry = RegistryRestore::capture();
     // QEMU `virt` exposes 32 virtio-mmio transport slots at
     // 0x0a00_0000 (stride 0x200). We don't have easy access to the
     // DTB pointer from here, so the enumerator's fallback path probes
@@ -397,6 +398,7 @@ kernel_test_in!("bus", smoke_its_doorbell_addr);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_msix_enable_on_virtio() -> TestResult {
+    let _restore_registry = RegistryRestore::capture();
     // virtio-mmio transports have no PCIe capability list. `enable_msix`
     // must reject them cleanly with `NotPcie`.
     use crate::{
@@ -504,6 +506,7 @@ fn smoke_bus_hotplug_revoked_authority() -> TestResult {
 kernel_test_in!("bus", smoke_bus_hotplug_revoked_authority);
 
 fn smoke_bus_iommu_group_default() -> TestResult {
+    let _restore_registry = RegistryRestore::capture();
     // Stage-3 stub: every enumerated device lives in group 0 on the
     // default QEMU line (no vIOMMU).
     use crate::{devices, iommu_group_for};

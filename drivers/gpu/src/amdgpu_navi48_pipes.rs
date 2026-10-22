@@ -155,7 +155,7 @@ impl Scaling for PlaneScaling<'_> {
         }
         let (primary, others) = stream_planes(
             &sel.timing,
-            sel.ycbcr420,
+            sel.encoding.is_420(),
             sel.format,
             &sel.planes,
             (dpp[0], odm, mpc),

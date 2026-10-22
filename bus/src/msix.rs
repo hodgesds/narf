@@ -25,7 +25,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use narf_capabilities::{Cap, CapError, Write};
 use narf_memory::PhysAddr;
 
-use crate::bar::{map_bar, BarError};
+use crate::bar::{map_bar_control, BarError};
 use crate::device::{BusDevice, BusKind};
 use crate::registry::BusDeviceCap;
 
@@ -231,10 +231,10 @@ impl MsixTable {
             return Err(MsixError::VectorOutOfRange);
         }
 
-        // SAFETY: caller holds the device exclusively. map_bar
+        // SAFETY: caller holds the device exclusively. map_bar_control
         // does the size-detection write/restore against cfg-space.
         // SAFETY: Valid memory or trusted environment
-        let region = unsafe { map_bar(&self.device, self.bir)? };
+        let region = unsafe { map_bar_control(&self.device, self.bir)? };
 
         // aarch64-only: register the (DeviceID, EventID) → LPI
         // translation in the GIC ITS before the device fires its
@@ -331,8 +331,8 @@ impl MsixTable {
         if idx >= self.size {
             return Err(MsixError::VectorOutOfRange);
         }
-        // SAFETY: caller-owned device; map_bar reproducible.
-        let region = unsafe { map_bar(&self.device, self.bir)? };
+        // SAFETY: caller-owned device; the Device mapping is reused.
+        let region = unsafe { map_bar_control(&self.device, self.bir)? };
         let entry_off = self.table_offset as u64 + (idx as u64) * 16;
         // SAFETY: entry_off + 16 <= bar.size by spec (MsixTable was
         // built from the spec-mandated table size).
@@ -352,7 +352,7 @@ impl MsixTable {
             return Err(MsixError::VectorOutOfRange);
         }
         // SAFETY: caller-owned device.
-        let region = unsafe { map_bar(&self.device, self.bir)? };
+        let region = unsafe { map_bar_control(&self.device, self.bir)? };
         let entry_off = self.table_offset as u64 + (idx as u64) * 16;
         // SAFETY: same.
         unsafe {

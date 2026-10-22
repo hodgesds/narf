@@ -432,6 +432,80 @@ pub enum PixelEncoding {
     Ycbcr420 = 4,
 }
 
+impl PixelEncoding {
+    pub const fn is_420(self) -> bool {
+        matches!(self, Self::Ycbcr420)
+    }
+    pub const fn is_422(self) -> bool {
+        matches!(self, Self::Ycbcr422)
+    }
+    pub const fn is_rgb(self) -> bool {
+        matches!(self, Self::Rgb)
+    }
+    /// The shared chroma filter consumes adjacent horizontal pixels.
+    pub const fn subsampled(self) -> bool {
+        self.is_420() || self.is_422()
+    }
+    /// OPTC_DATA_FORMAT and HDMI_PIXEL_ENCODING (RGB/444 share zero).
+    pub const fn hardware_format(self) -> u32 {
+        match self {
+            Self::Ycbcr422 => 1,
+            Self::Ycbcr420 => 2,
+            _ => 0,
+        }
+    }
+    /// AVI InfoFrame Y2:Y0.
+    pub const fn avi(self) -> u8 {
+        match self {
+            Self::Rgb => 0,
+            Self::Ycbcr422 => 1,
+            Self::Ycbcr444 => 2,
+            Self::Ycbcr420 => 3,
+        }
+    }
+    pub const fn from_420(ycbcr420: bool) -> Self {
+        if ycbcr420 {
+            Self::Ycbcr420
+        } else {
+            Self::Rgb
+        }
+    }
+}
+
+/// DRM's connector "color format" values (drm_connector_color_format).
+/// AUTO preserves the HDMI helper policy: RGB, then declared 4:2:0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ColorFormat {
+    #[default]
+    Auto = 0,
+    Rgb = 1,
+    Ycbcr444 = 2,
+    Ycbcr422 = 3,
+    Ycbcr420 = 4,
+}
+impl ColorFormat {
+    pub const fn from_linux(value: u64) -> Option<Self> {
+        Some(match value {
+            0 => Self::Auto,
+            1 => Self::Rgb,
+            2 => Self::Ycbcr444,
+            3 => Self::Ycbcr422,
+            4 => Self::Ycbcr420,
+            _ => return None,
+        })
+    }
+    pub const fn encoding(self) -> Option<PixelEncoding> {
+        Some(match self {
+            Self::Auto => return None,
+            Self::Rgb => PixelEncoding::Rgb,
+            Self::Ycbcr444 => PixelEncoding::Ycbcr444,
+            Self::Ycbcr422 => PixelEncoding::Ycbcr422,
+            Self::Ycbcr420 => PixelEncoding::Ycbcr420,
+        })
+    }
+}
+
 /// The color-space-dependent AVI InfoFrame fields set_avi_info_frame fills.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AviColorimetry {

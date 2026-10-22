@@ -114,3 +114,92 @@ THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
 OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
+
+Mesa 26.2.4 (MIT)
+-----------------
+
+https://archive.mesa3d.org/mesa-26.2.4.tar.xz
+SHA-256: bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9
+
+src/amd/common/ac_vcn_dec.h and ac_vcn_dec.c:
+  HEVC message/layout/reference and context sizing in
+  amdgpu_vcn_navi48_hevc_words.rs; unchanged source extracted by hevc_check.py.
+  Copyright 2017 Advanced Micro Devices, Inc.
+src/amd/common/ac_vcn_enc.h and ac_vcn_enc.c;
+src/gallium/drivers/radeonsi/mm/radeon_vcn_enc.c,
+radeon_vcn_enc_1_2.c, radeon_vcn_enc_2_0.c, radeon_vcn_enc_5_0.c:
+  HEVC encoder packet/reference and reconstruction/metadata sizing adapted in
+  amdgpu_vcn_navi48_hevc_encode_words.rs; unchanged source extracted by
+  hevc_encode_check.py.
+  Copyright 2017, 2024 Advanced Micro Devices, Inc.
+src/gallium/drivers/radeonsi/mm/radeon_bitstream.c and radeon_bitstream.h:
+  VPS/SPS/PPS fixture generation and exact fixed HEVC slice template reference.
+  Copyright 2025 Advanced Micro Devices, Inc.
+src/amd/common/ac_video_dec.h:
+  HEVC input type extracted unchanged by hevc_check.py.
+  Copyright 2026 Advanced Micro Devices, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to
+do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+Mesa VP9 defaults (same pinned Mesa archive above)
+-------------------------------------------------
+
+src/amd/common/ac_vcn_vp9_default.h:
+  Default probabilities used by amdgpu_vcn_navi48_vp9_words.rs.
+
+/**************************************************************************
+ *
+ * Copyright 2018 Advanced Micro Devices, Inc.
+ * All Rights Reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sub license, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the
+ * next paragraph) shall be included in all copies or substantial portions
+ * of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR
+ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *
+ **************************************************************************/
+
+
+
+Mesa decoder AV1 default initialization (same pinned archive above)
+-----------------------------------------------------------------
+
+src/amd/common/ac_vcn_av1_default.h and ac_vcn_dec.c:
+  Actual decoder initialization in fixtures/av1/default_cdf.bin, regenerated
+  and compared using unchanged primary functions. Encoder CDF is distinct.
+  Copyright 2020 Advanced Micro Devices, Inc.
+  SPDX-License-Identifier: MIT
+  The full Mesa MIT permission/disclaimer above applies to this derived data.
+
+AV1 encoder default CDF (fixtures/vcn5/av1_encode/cdf.bin) derives from Mesa26.2.4 src/amd/common/ac_vcn_enc_av1_default_cdf.h, distributed with Mesa's AMD MIT encoder sources and the full AMD permission notice above. Encoder packets and CPU sequence header adapt src/gallium/drivers/radeonsi/mm/radeon_vcn_enc*.c and radeon_bitstream.c under the same notice. Original libaom-produced frame OBUs and source pixels were generated for this repository; no reference movie bytes are copied.

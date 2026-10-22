@@ -37,10 +37,12 @@ pub mod frame;
 pub mod heap;
 pub mod heap_backend;
 pub mod hugepage;
+mod ioremap_cache;
 #[cfg(feature = "kasan")]
 pub mod kasan;
 pub mod kaslr;
 pub mod mempolicy;
+pub mod memtype;
 pub mod migrate;
 pub mod module_text;
 pub mod numa_tier;
@@ -68,6 +70,7 @@ pub mod wx;
 pub mod zpool;
 
 mod guard_tests;
+mod memtype_tests;
 mod remote_access_tests;
 mod tests;
 
@@ -78,6 +81,7 @@ pub use address_space::{
     HugeRegion, MappingReceipt, MremapLimits, NumaRegionSnapshot, Region, RegionPerms,
     RemoteAccess, RemoteBuf, SharedMremapMode, StackGrowthLimits,
 };
+pub use memtype::{ram_alias_refusals, MemoryType};
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

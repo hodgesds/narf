@@ -18,6 +18,8 @@ pub(super) struct Model {
     memory: Vec<u8>,
     stages: u8,
     fault: u8,
+    expected_interface: Option<u32>,
+    session_interfaces: Vec<u32>,
 }
 impl Model {
     pub(super) fn contains(&self, at: u64) -> bool {
@@ -75,7 +77,8 @@ impl Model {
             match words[at + 1] {
                 1 => {
                     assert_eq!(pointer(1), base + e::SESSION);
-                    assert_eq!(data[0], 0x10009);
+                    assert_eq!(data[0], self.expected_interface.unwrap_or(0x1000a));
+                    self.session_interfaces.push(data[0]);
                 }
                 2 => {
                     assert_eq!(data[0] as usize, (words.len() - at) * 4);
@@ -126,6 +129,7 @@ impl Model {
             if self.fault != 1 {
                 self.memory[e::OUTPUT as usize..e::OUTPUT as usize + STREAM.len()]
                     .copy_from_slice(STREAM);
+                self.store(e::FEEDBACK + 4, 1);
                 self.store(e::FEEDBACK + 24, STREAM.len() as u32);
             }
             match self.fault {
@@ -134,6 +138,9 @@ impl Model {
                 4 => self.store(e::OUTPUT_END_GUARD, 0),
                 5 => self.store(e::INPUT, 0),
                 6 => self.store(e::ENCODE_IB + 8192 - 4, 1),
+                10 => self.store(e::FEEDBACK + 4, 0),
+                11 => self.store(e::FEEDBACK + 32, 1),
+                12 => self.store(e::FEEDBACK + 24, 0),
                 _ => {}
             }
         }
@@ -198,7 +205,7 @@ kernel_test_in!(
 );
 
 fn vcn5_encoder_failures_quarantine_commands_input_and_declared_output() -> TestResult {
-    for fault in 1..=9 {
+    for fault in 1..=12 {
         let (pool, mut engine, mut observer) = ready(false);
         engine.io.encoding.fault = fault;
         if fault == 8 {
@@ -208,7 +215,7 @@ fn vcn5_encoder_failures_quarantine_commands_input_and_declared_output() -> Test
             engine.io.emit_cpu = false;
         }
         let expected = match fault {
-            1..=3 => Error::EncodeOutput,
+            1..=3 | 10..=12 => Error::EncodeOutput,
             4..=6 => Error::Readback,
             _ => Error::Timeout,
         };
@@ -231,6 +238,8 @@ kernel_test_in!(
 fn vcn5_encoder_cancellation_keeps_the_pending_owner_before_and_after_publication() -> TestResult {
     for published in [false, true] {
         let (pool, mut engine, mut observer) = ready(false);
+        engine.encode_interface = Some(0x10008);
+        engine.io.encoding.expected_interface = Some(0x10008);
         observer.stall_observed = published;
         {
             let mut future = core::pin::pin!(engine.prove_encode(&mut observer));
@@ -310,4 +319,86 @@ fn vcn5_encoder_header_inspector_bounds_reads_and_matches_parameter_set_ids() ->
 kernel_test_in!(
     "drivers/gpu/vcn-navi48",
     vcn5_encoder_header_inspector_bounds_reads_and_matches_parameter_set_ids
+);
+
+fn vcn5_avc_encoder_uses_retained_firmware_interface_across_restart() -> TestResult {
+    for (minor, expected) in [(8, 0x10008), (9, 0x10009), (10, 0x1000a), (11, 0x1000a)] {
+        let (pool, mut engine, mut observer) = ready(false);
+        engine.encode_interface = hevc_encode_words::interface((1 << 20) | (minor << 12));
+        engine.io.encoding.expected_interface = Some(expected);
+        for restart in [false, true] {
+            if restart {
+                run(engine.start(IMAGE, power())).unwrap();
+                run(engine.prove()).unwrap();
+                run(engine.prove_interrupts(&mut observer)).unwrap();
+                run(engine.prove_ibs(&mut observer)).unwrap();
+            }
+            let prior = engine.seq;
+            let proof = run(engine.prove_encode(&mut observer)).unwrap();
+            assert_eq!(proof.completion.fence.sequence, prior + 1);
+            let interfaces = &engine.io.encoding.session_interfaces;
+            assert_eq!(interfaces.len(), if restart { 6 } else { 3 });
+            assert!(interfaces.iter().all(|&i| i == expected));
+            assert!(!engine.encode_memory.as_ref().unwrap().reusable_for_test());
+            run(engine.stop()).unwrap();
+            assert!(engine.encode_memory.as_ref().unwrap().reusable_for_test());
+        }
+        let capacity = engine.memory.size()
+            + engine.ib_memory.as_ref().unwrap().size()
+            + engine.encode_memory.as_ref().unwrap().size();
+        drop(engine);
+        assert_eq!(pool.available(), capacity);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_avc_encoder_uses_retained_firmware_interface_across_restart
+);
+fn vcn5_avc_unsupported_interface_refuses_before_arena_or_publication() -> TestResult {
+    for interface in [
+        None,
+        hevc_encode_words::interface(0),
+        hevc_encode_words::interface(2 << 20 | 10 << 12),
+        hevc_encode_words::interface(1 << 20 | 7 << 12),
+        Some(0x10007),
+        Some(0x2000a),
+    ] {
+        for preclaimed in [false, true] {
+            let (pool, mut engine, mut observer) = ready(false);
+            engine.encode_interface = interface;
+            if preclaimed {
+                engine.encode_memory = Some(pool.reserve(e::BYTES).unwrap());
+            }
+            let address = engine.encode_memory.as_ref().map(Reservation::address);
+            let prior = (pool.available(), engine.seq, engine.wptr, engine.io.traps);
+            assert_eq!(
+                run(engine.prove_encode(&mut observer)),
+                Err(Error::Unsupported)
+            );
+            assert_eq!(
+                (pool.available(), engine.seq, engine.wptr, engine.io.traps),
+                prior
+            );
+            assert_eq!(engine.state, State::IbVerified);
+            assert!(engine.encode_result.is_none());
+            assert_eq!(
+                engine.encode_memory.as_ref().map(Reservation::address),
+                address
+            );
+            assert!(engine
+                .encode_memory
+                .as_ref()
+                .is_none_or(Reservation::reusable_for_test));
+            assert!(engine.io.encoding.base.is_none());
+            // Unsupported firmware neither publishes nor retires an earlier
+            // transactional reservation; the prior transport remains usable.
+            run(engine.stop()).unwrap();
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_avc_unsupported_interface_refuses_before_arena_or_publication
 );

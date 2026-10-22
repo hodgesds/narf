@@ -69,7 +69,9 @@ pub struct DisplayAudio {
     pub info: AudioInfo,
     /// Carried by DP secondary packets rather than HDMI's AFMT packets.
     pub dp: bool,
-    /// Azalia endpoint (Linux's audio instance): the stream's own.
+    /// Azalia endpoint (Linux's stream_res.audio instance): the one the
+    /// stream acquired (`DcState::find_first_free_audio` of its DIO stream
+    /// encoder), whatever encoder carries the audio.
     pub endpoint: u8,
     /// AFMT channel enables from speakers, or APG pair-mode enables (0xff).
     pub channels: u8,
@@ -609,9 +611,10 @@ impl<I: Io> Engine<I> {
         &mut self,
         path: Path,
         info: AudioInfo,
+        endpoint: u8,
     ) -> Result<DisplayAudio, Error> {
         if self.status.frl_video_running.is_some() {
-            return self.start_frl_audio(path, info);
+            return self.start_frl_audio(path, info, endpoint);
         }
         if self.status.hdmi_audio.is_some() || info.mode_count == 0 || info.mode_count > 16 {
             return Err(if self.status.hdmi_audio.is_some() {
@@ -629,7 +632,7 @@ impl<I: Io> Engine<I> {
         let a = DisplayAudio {
             info,
             dp: false,
-            endpoint: link.request.stream,
+            endpoint,
             channels: channels(info.speakers),
             descriptors,
             hbr,
@@ -689,6 +692,22 @@ impl<I: Io> Engine<I> {
                 Err(e)
             }
         }
+    }
+}
+#[cfg(feature = "kernel-test")]
+impl<I: Io> Engine<I> {
+    /// Tests: the endpoint a fixture's running stream acquired on a board
+    /// whose endpoints follow its encoders' indices (its DIO stream encoder
+    /// on TMDS and 8b/10b DP, its HPO DP stream encoder on 128b/132b, its
+    /// pipe on FRL); 0 without one.
+    pub(in crate::amdgpu_dcn401_otg) fn test_audio_endpoint(&self) -> u8 {
+        let s = &*self.status;
+        s.frl_video_running
+            .map(|v| v.request.pipe)
+            .or(s.uhbr_video_running.map(|v| v.stream))
+            .or(s.dp_video_running.map(|v| v.frontend.request.stream))
+            .or(s.hdmi_video_running.map(|v| v.link.request.stream))
+            .unwrap_or(0)
     }
 }
 impl<I: Io> Engine<I> {
@@ -821,9 +840,10 @@ impl<I: Io> Engine<I> {
         &mut self,
         path: Path,
         info: AudioInfo,
+        endpoint: u8,
     ) -> Result<DisplayAudio, Error> {
         if self.status.uhbr_video_running.is_some() {
-            return self.start_uhbr_audio(path, info, None).await;
+            return self.start_uhbr_audio(path, info, None, endpoint).await;
         }
         if self.status.dp_audio.is_some() {
             return Err(Error::Busy);
@@ -844,7 +864,7 @@ impl<I: Io> Engine<I> {
         let a = DisplayAudio {
             info,
             dp: true,
-            endpoint: frontend.request.stream,
+            endpoint,
             channels: channels(info.speakers),
             descriptors,
             hbr,
@@ -924,6 +944,8 @@ impl Otg {
     /// Start legacy or UHBR DP SST audio on this owner's running DP video (or live
     /// scanout): the audio wall clock, audio source, the Azalia endpoint
     /// the codec reports as ELD, then the secondary audio packets, unmuted.
+    /// `endpoint` is the Azalia endpoint the stream acquired; the stream
+    /// encoder's audio source (AFMT or APG) selects it.
     /// # Safety
     /// start_dp_video's obligations; no other agent may program this
     /// stream's AFMT or secondary packets, the audio wall clock or this
@@ -932,8 +954,9 @@ impl Otg {
         &mut self,
         path: Path,
         info: AudioInfo,
+        endpoint: u8,
     ) -> Result<DisplayAudio, Error> {
-        self.0.start_dp_audio(path, info).await
+        self.0.start_dp_audio(path, info, endpoint).await
     }
     /// Mute and stop this owner's SST or legacy MST DP audio, keeping video running.
     /// # Safety
@@ -943,7 +966,9 @@ impl Otg {
     }
     /// Start HDMI audio on owned TMDS/FRL video (or live scanout):
     /// program the audio DTO, encoder ACR/AFMT, the Azalia endpoint the codec
-    /// reports as ELD, the Audio InfoFrame, then unmute.
+    /// reports as ELD, the Audio InfoFrame, then unmute. `endpoint` is the
+    /// Azalia endpoint the stream acquired; AFMT's (or FRL AFMT4's) audio
+    /// source selects it.
     /// # Safety
     /// start_hdmi_video/start_frl_video's obligations; no other agent may program this
     /// stream's AFMT, the audio DTO or this Azalia endpoint. The HD-Audio
@@ -952,8 +977,9 @@ impl Otg {
         &mut self,
         path: Path,
         info: AudioInfo,
+        endpoint: u8,
     ) -> Result<DisplayAudio, Error> {
-        self.0.start_hdmi_audio(path, info).await
+        self.0.start_hdmi_audio(path, info, endpoint).await
     }
     /// Mute and stop this owner's HDMI audio, keeping video running.
     /// # Safety

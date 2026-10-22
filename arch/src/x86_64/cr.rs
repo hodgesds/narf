@@ -72,6 +72,29 @@ pub const CR4_OSXSAVE: u64 = 1 << 18;
 /// `#NM`; kernels use that fault to defer restoring a task's FP/SIMD image
 /// until the task actually consumes the register file.
 pub const CR0_TS: u64 = 1 << 3;
+/// CR0 bit: NW, not write-through (bit 29). Kept clear: CD=1 with NW=0 is
+/// the SDM's "no-fill" cache mode used while reprogramming PAT or MTRRs.
+pub const CR0_NW: u64 = 1 << 29;
+/// CR0 bit: CD, cache disable (bit 30).
+pub const CR0_CD: u64 = 1 << 30;
+/// CR4 bit: PGE (bit 7). Any write that changes it invalidates every TLB
+/// entry, global ones included, for every PCID (SDM Vol 3 §4.10.4.1).
+pub const CR4_PGE: u64 = 1 << 7;
+
+/// Write CR0.
+///
+/// # Safety
+/// CPL=0. The caller owns the semantics of every bit it changes; in
+/// particular setting CR0.CD must follow the SDM cache-control sequence.
+#[inline]
+pub unsafe fn write_cr0(value: u64) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller guarantees CPL=0 and a valid CR0 value.
+    unsafe {
+        asm!("mov cr0, {v}", v = in(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+}
 
 /// Read CR0.
 ///

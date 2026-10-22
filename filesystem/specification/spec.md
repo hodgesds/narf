@@ -43,6 +43,12 @@
 
 ## 3. Public interface
 
+The `/dev/fb0` proxy forwards the driver's complete `MmapBacking`, including
+memory type and lifetime, instead of rebuilding it from `mmap_frames`.
+Framebuffer device mappings request WC; the memory owner retains WB for
+System RAM leaves, including RAM-backed virtual scanouts.
+
+
 ### 3.0a Filesystem type and device registration
 
 `FileSystemType` describes a mountable type, separately from an instantiated
@@ -514,7 +520,11 @@ to ENXIO (6), `StreamSuspended` to ESTRPIPE (86), and `StreamXrun` to EPIPE
 
 `mmap_backing` returns physical frames and an optional `Arc<dyn MmapLifetime>`
 together. Providers with replaceable storage must acquire both under the same
-lock. `validate_mmap` runs before VMA mutation and returns effective protections
+lock. `MmapBacking { frames, lifetime, memory_type }`: `memory_type:
+narf_memory::MemoryType` is the device's typed request for its user leaves
+(Linux `pgprot_writecombine` / `pgprot_noncached` on `vm_page_prot`);
+`WriteBack` keeps today's mapping. `sys_mmap` records it in the VMA and the
+address space applies it per frame, refusing it on System RAM (`memory/` §4). `validate_mmap` runs before VMA mutation and returns effective protections
 or a device error; only Unsupported from mmap_backing selects generic file
 fallback. `mmap_max_prot` defaults to RWX and constrains later mprotect calls,
 including after fd close, fork and mapping splits. Overlay forwards these hooks.

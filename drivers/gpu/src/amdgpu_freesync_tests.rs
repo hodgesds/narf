@@ -323,3 +323,143 @@ kernel_test_in!(
     "drivers/gpu/freesync",
     freesync_calc_v_total_rounding_branches
 );
+
+fn freesync_displayid_fallback_and_hdmi_vsdb_policy() -> TestResult {
+    let mut edid = alloc::vec![0; 256];
+    edid[126] = 1;
+    edid[128] = 0x70;
+    let j = 114; // Last full range accepted by Linux's >13 byte guard.
+    edid[128 + j] = 0x25;
+    edid[128 + j + 1] = 1;
+    edid[128 + j + 2] = 9;
+    edid[128 + j + 9] = 48;
+    edid[128 + j + 10] = 104;
+    edid[128 + j + 11] = 1;
+    let mut dpcd = [0; 16];
+    dpcd[7] = DPCD_MSA_TIMING_PAR_IGNORED;
+    assert_eq!(
+        dp_sst_caps(&edid, &dpcd),
+        Some(VrrRange {
+            min_hz: 48,
+            max_hz: 360
+        })
+    );
+    edid[128 + j + 1] = 0;
+    assert_eq!(
+        dp_sst_caps(&edid, &dpcd),
+        Some(VrrRange {
+            min_hz: 48,
+            max_hz: 104
+        })
+    );
+    edid[128 + j + 1] = 2;
+    assert_eq!(dp_sst_caps(&edid, &dpcd), None);
+    assert_eq!(dp_sst_caps(&edid[..255], &dpcd), None);
+    edid[126] = 0;
+    assert_eq!(dp_sst_caps(&edid, &dpcd), None);
+    let vsdb = AmdVsdb {
+        version: 3,
+        min_hz: 48,
+        max_hz: 144,
+        vcp_code: 0,
+    };
+    assert_eq!(
+        vsdb.range(),
+        Some(VrrRange {
+            min_hz: 48,
+            max_hz: 144
+        })
+    );
+    assert_eq!(
+        AmdVsdb {
+            vcp_code: 0xe0,
+            ..vsdb
+        }
+        .range(),
+        None
+    );
+    assert_eq!(AmdVsdb { max_hz: 58, ..vsdb }.range(), None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/freesync",
+    freesync_displayid_fallback_and_hdmi_vsdb_policy
+);
+fn freesync_spd_packets_follow_linux_headers_data_and_checksum() -> TestResult {
+    let timing = qhd144();
+    let range = VrrRange {
+        min_hz: 48,
+        max_hz: 144,
+    };
+    for hdmi in [false, true] {
+        for active in [false, true] {
+            let p = info_packet(&timing, range, hdmi, active).unwrap();
+            assert!(p.valid);
+            assert_eq!(
+                p.hb,
+                if hdmi {
+                    [0x83, 1, 8, 0]
+                } else {
+                    [0, 0x83, 0x1b, 4]
+                }
+            );
+            assert_eq!(
+                &p.sb[1..9],
+                &[
+                    0x1a,
+                    0,
+                    0,
+                    0,
+                    0,
+                    if active { 7 } else { 3 },
+                    if active { 48 } else { 144 },
+                    144
+                ]
+            );
+            assert_eq!(
+                p.hb.iter()
+                    .chain(&p.sb)
+                    .fold(0u8, |a, b| a.wrapping_add(*b)),
+                0
+            );
+            assert!(p.sb[9..].iter().all(|v| *v == 0));
+        }
+    }
+    assert!(info_packet(
+        &timing,
+        VrrRange {
+            min_hz: 30,
+            max_hz: 60
+        },
+        true,
+        true
+    )
+    .is_none());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/freesync",
+    freesync_spd_packets_follow_linux_headers_data_and_checksum
+);
+
+fn freesync_replays_primary_spd_packets() -> TestResult {
+    let range = VrrRange {
+        min_hz: 48,
+        max_hz: 144,
+    };
+    for line in include_str!("../tests/dcn401_freesync/vectors.txt").lines() {
+        let mut fields = line.split_whitespace();
+        let hdmi = fields.next().unwrap() == "1";
+        let active = fields.next().unwrap() == "1";
+        let bytes: Vec<u8> = fields.map(|s| u8::from_str_radix(s, 16).unwrap()).collect();
+        assert_eq!(
+            info_packet(&qhd144(), range, hdmi, active)
+                .unwrap()
+                .bytes()
+                .as_slice(),
+            bytes.as_slice()
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/freesync", freesync_replays_primary_spd_packets);

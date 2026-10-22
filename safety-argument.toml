@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
-agent = "OpenAI Codex GPT-5"
-prompt_hash = "42db698dcd4c06a93a740337591706deb4215a48b95c3fdf21cc461675b3397f"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1580,7 +1580,12 @@ argument = "The frame trap changes only prioritize delivery of an already-pendin
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "AddressSpace::reclaim_unshared_on_exit is callable only under an unsafe contract after the last process thread has completed robust-futex, clear-child-tid, and rusage user-memory accesses and can never return to userspace. It refuses every address space ever shared through CLONE_VM, retains the root and lifetime PCID/ASID until final Drop, and retires mappings through the ordinary unmap paths, which remove reverse-map/shared-owner state and invalidate cached translations before returning backing or page-table frames for reuse. Repeated calls see empty mapping tables and are harmless. No capability, domain tag, domain transition, mapping authority, or user-access window is added."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
 argument = "The frame/ change in bare_main.rs replaces the body of the IRQ-4 serial handler with one call to narf_input::fill_byte_ring(narf_console::try_read_byte, 256). The handler still only moves received UART bytes into the existing input ring under that ring's IRQ-safe lock; it gains no authority, mapping, capability, domain transition or scheduling state. The room check and push are now atomic with the reader's refill, so a full ring throttles the UART (bytes stay in the FIFO) instead of evicting queued input; the per-IRQ work stays bounded at 256 bytes."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "TLB shootdown target selection is narrowed without admitting a missed invalidation. (1) Process tags (PCID >= PROCESS_CONTEXT_FIRST): a CPU publishes the tag's bucket in CURRENT_BUCKETS before the CR3 write in AddressSpace::activate and narrows it only after; a sender that finds a resident CPU not running the bucket first publishes STALE_BUCKETS debt and then re-reads CURRENT_BUCKETS, while the loader widens CURRENT_BUCKETS and then reads STALE_BUCKETS, all SeqCst (Dekker), so either the sender interrupts the CPU or the loader performs a full non-global flush before its CR3 write; possibly both, never neither. PCID-tagged entries are usable only while CR3 carries that PCID (Intel SDM Vol 3 §4.10.1), every process-tag CR3 load goes through activate (the entry assembly and kernel_switch displace only PCIDs <= 16), and activate runs the claim, flush, CR3 write and finish with interrupts disabled on one CPU, so a deferred CPU cannot consume a stale translation of a reused frame. Domain tags are never deferred. (2) Tag 0: every tag-0 CR3 load drops that context's entries, so only CPUs whose live or announced root is the owner can hold them (Linux mm_cpumask); senders match the owner root against CURRENT_ROOT/LOADING_ROOT, which activate publishes before (LOADING) and after (CURRENT) its serialising CR3 write. This filter is enabled only while the entry-visible CR4 cache has PCIDE clear, the condition under which the trap/syscall entry and kernel_switch assembly cannot displace and later restore a tag-0 user root outside activate; otherwise tag 0 keeps the previous bucket-history broadcast. Idle debt, the receiver, completion waits, local invalidation, tag retirement and frame-release ordering are unchanged."
 
@@ -1600,6 +1605,8 @@ argument = "The scheduler change is inside the executor core, already a member o
 ref = "security-model/specification/spec.md#L42"
 argument = "The change performs no kernel-side data access beyond reading the current CPU's cycle counter and atomically adding the delta to that same CPU's idle-ns slot. It invokes no capability, changes no domain tag, mapping, or task state, and neither weakens nor bypasses the capability-and-domain rule; the filesystem change is a doc comment correcting gen_stat's description to match the code."
 
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
 argument = "The steal-accounting change stays inside existing TCB members (memory/'s kvm_pv module and the scheduler executor core) and the filesystem stats reader; it adds no TCB member and moves no boundary. The new memory/ code only reads the current guest's own already-registered KVM steal-time area through width-matched atomics under the ABI's version protocol; the scheduler only folds the resulting cumulative-counter deltas into a pre-existing-style per-CPU atomic accumulator, and filesystem/ only prints the accumulated value in /proc/stat's steal column."
 
 [[invariants_preserved]]
@@ -1613,3 +1620,72 @@ argument = "The MADV_DONTNEED deferred-flush change stays inside memory/, an exi
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The change performs no new kernel-side data access: it reads no additional memory, invokes no capability, and changes no domain tag, mapping permission, or task state. It invokes the pre-existing defer_punch_flush/drain_deferred_batch path (one IrqSafeSpinLock acquisition on the address space's own quarantine) in place of a synchronous shootdown plus immediate batched free. MADV_FREE's lazy-marking flush and the shared/file munmap paths are deliberately left synchronous: the former's invalidation is what forces a peer CPU's post-mark store to re-set the PTE DIRTY bit before the reclaim discard pass can judge the page clean, and the latter's frame release is ordered inside the per-AS shared-mapping transaction against the external owner's alias publication, so neither is deferred."
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+argument = "The WC prerequisite extends existing frame boot initialization, architecture cache-attribute encoders and memory user-leaf installation. No subsystem joins the TCB. Device mmap providers request only a cache type for frames they already own; this grants no new mapping or capability authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+argument = "The x86 cache selectors occupy PWT/PCD/PAT, disjoint from protection-key bits. PKRS, DomainSavedState, domain entry/exit and scheduler state are unchanged. Every new CR0/CR3/CR4, WBINVD and MAIR/PAT intrinsic keeps compiler_fence(SeqCst) bracketing; the BSP, every AP and S3 restore establish the same cache-attribute layout."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+argument = "Only externally owned SHARED|LOCK_EXEMPT regions without COW or PINNABLE_RAM may request non-WB leaves. Every known boot RAM frame (Usable, Kernel, ACPI reclaimable/NVS), allocator frame and hotplug RAM frame remains WB to match its direct-map alias. Registration is independent of donation and never frees reserved RAM. AMDGPU requests WC persistently, so a VRAM/GTT move recomputes WC for a BAR frame or WB for a RAM frame. Kernel I/O leaves also recompute per backing frame: known RAM retains WB, including a RAM-backed firmware framebuffer; actual device BAR/framebuffer leaves use PAT WC or ARM Normal-NC. Undifferentiated Reserved boot entries may be MMIO and remain a documented classifier limitation; this change does not export it through GPU mappings."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L125"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+argument = "Existing ARM MAIR indices 0..2 retain their bytes. New user WC and kernel prefetchable BAR leaves use Normal-NC at index3, never Normal-Tagged index2. Normal cacheable domain heaps and MTE allocation tags are unchanged, and non-WB user leaves force UXN|PXN."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L174"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+argument = "Cache-type selection never grants read, write or execute permissions. x86 WRITABLE and NX still follow the existing writable/COW and EXEC predicates; ARM AP permissions are unchanged and non-WB leaves only remove execution with UXN|PXN. Default WB leaves remain bit-identical to the old encoders for all tested permission combinations."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L165"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+argument = "New cache bits flow through existing page-table locking and TLB invalidation paths. Shared relocation retains source and destination through frozen alias replacement, recomputes cache bits for the destination, restores the old type on rollback and invalidates translations before releasing old ownership. Fork, mprotect, absent leaves and huge-leaf PAT-bit placement preserve their existing ownership contracts."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L151"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+argument = "An mmap cache request is kernel-only metadata in MmapBacking; it cannot retag RAM, alter another domain, change the direct map or choose an unrelated frame. The GPU backing snapshot retains the same placement token and pending-publication rules while returning the WC request. PRIME views share these rules, and NO_CPU_ACCESS/userptr refusals remain in force."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L147"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+argument = "No userspace mmap prot or flags bit selects MemoryType. Only a retained FileOps provider supplies it. mprotect replaces PROT_MASK and preserves internal memory-type bits, so an untrusted process cannot change cache policy through protection flags."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L165"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+argument = "Typed kernel ioremap claims reserve page-rounded physical intervals before page-table allocation. Differently typed overlapping ready or pending claims are refused. RAII releases a failed install only after partial leaves and TLB entries are removed; uncertain teardown retains the claim and VA. No IRQ-safe cache guard spans allocation or shootdowns. PCI BAR mapping fails closed instead of returning a raw-physical alias with unknown attributes. VirtIO control registers and MSI-X tables consistently request Device attributes from their first mapping and reuse the typed VA, including prefetchable control BARs."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L174"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+argument = "PAT establishment requires matching readback. BSP establishment failure stops boot, AP failure keeps that CPU offline, and S3 restore failure stops before device resume hooks. Kernel WC ioremap and user WC leaves use the same programmed cache-mode table, including conservative no-PAT fallback."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "866164f36a5358d5f2a5f4a34711c549b3006c6e106ae8e96ad82d4fb643bb24"
+argument = "The scheduler executor remains inside the existing TCB. The last-sample KVM steal counter is now compiled only for x86_64, matching its only references inside the x86_64 branch of sample_steal_ns. Removing an unused zero-initialized static on other architectures adds no code path, TCB member, or authority; x86_64 sampling and the public cpu_steal_ns interface are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-6"
+prompt_hash = "866164f36a5358d5f2a5f4a34711c549b3006c6e106ae8e96ad82d4fb643bb24"
+argument = "The architecture guard changes only whether unused counter storage exists. It introduces no access, capability, domain transition, mapping, or scheduler state transition. Non-x86_64 steal sampling remains a no-op and cpu_steal_ns continues to read the unchanged zero-initialized accumulated counter, so the capability-and-domain invariant is preserved."
