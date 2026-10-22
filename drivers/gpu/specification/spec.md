@@ -270,6 +270,16 @@ appropriate Sienna Cichlid codec tables and harvested-instance selection.
 
 ### AMD discrete PCIe probe and VRAM
 
+`AmdGpu::bring_up` probes MM_INDEX with the aligned byte address `0x378c`,
+then restores its previous selection without accessing MM_DATA. Navi22 and
+Raphael discard the latch's low address bits; an unaligned magic value is
+not a valid presence test. Indexed register helpers accept DWORD register
+IDs and scale them to byte addresses at the MM_INDEX boundary. Unrepresentable
+IDs and addresses selecting the VRAM mode perform no device I/O (reads return
+all ones). The separate VRAM accessor retains its explicit memory-mode and
+MM_INDEX_HI protocol. All register-port operations retain exclusive latch
+ownership and current PCI authority.
+
 `amdgpu_rdna2::PROFILES` inventories the discrete Navi21, Navi22, Navi23 and
 Navi24 ASICs using exact PCI IDs from Linux `amdgpu_drv.c::pciidlist`, including
 mobile and professional variants. `for_pci_id` rejects other vendors and holes;
