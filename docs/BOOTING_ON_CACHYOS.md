@@ -220,6 +220,41 @@ SATA) and fail unless their SHA-256 is unchanged afterwards.
 from the monitor to the 6750 XT's HDMI is optional and matters only once
 native modeset lands. Attach a USB keyboard for the NARF shell.
 
+If Limine reports `Could not find viable load address for executable` before
+NARF starts, check the ELF's full `PT_LOAD` memory spans with `readelf -lW`.
+This board reserves physical `[0x099ff000, 0x0a000000)`. The production image
+outgrew its former 32 MiB load placement and its final segment, including
+`.bss`, overlapped that reservation. The x86_64 linker now starts the image
+at 256 MiB. Rebuild old kernels when testing this board; changing a menu's
+file path alone does not change an executable's load addresses.
+
+For a KDE boot, a successful PCI probe and the presence of `/dev/dri/card0`
+do not establish acceleration readiness. Check the later
+`amdgpu: navi22 preflight refused:` line before diagnosing KWin or Qt plugin
+errors. This MSI RX 6750 XT's VBIOS `113-MSITV398MH.310` supplies a version-6
+PowerPlay payload; the generic Navy Flounder firmware SKU supplies version 1.
+Both use the same 2470-byte table and 1668-byte SMC layout. NARF accepts both
+versions while retaining board-source selection and power/thermal checks.
+Native graphics initialization and the graphical login still require a
+successful hardware boot; a VM smoke does not exercise those paths.
+
+On this board, discovery reports two distinct engines as `SDMA0:0` and
+`SDMA1:0`. Queue preparation normalizes the hardware ID and its local instance
+before checking for duplicate engines. The connector GPIO LUT also identifies
+DDC pairs through DATA bit 8; that selects the same AUX/I2C channel as CLOCK
+bit 0. Rejecting either valid encoding previously stopped queue preparation
+with `Queues(Unsupported)` and display routing with `Inventory(Unsupported)`.
+
+The subsequent hardware boot completed nine of the 31 cold-boot checkpoints,
+then stopped at `Graphics`: PSP returned DMCUB type 51 entry `0x82fee00100`,
+outside the newly allocated TMR `[0x8002300000, 0x8002d00000)`. Linux preserves
+PSP's separate secure CW0/CW1 windows. NARF now carries their pre-allocation
+inventory through boot and recovery: DMCUB may use the exact reserved CW0,
+and startup validates each complete secure window against its corresponding
+reservation or TMR without changing those registers. VCN still requires TMR.
+This correction requires another native hardware test before claiming progress
+beyond `Graphics` or a working graphical login.
+
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 
 ```sh
