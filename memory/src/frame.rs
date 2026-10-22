@@ -4268,6 +4268,31 @@ pub fn is_system_ram(phys: PhysAddr) -> bool {
         .any(|range| in_range(range.start, range.len))
 }
 
+/// Whether any known System RAM intersects `[start, start + len)`.
+/// Large ioremap leaves use this conservative range test so a 2 MiB leaf
+/// never changes the cache type of even one RAM page within the leaf.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn system_ram_intersects(start: u64, len: u64) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return true;
+    };
+    let overlaps = |range_start: u64, range_len: u64| {
+        range_start < end && start < range_start.saturating_add(range_len)
+    };
+    if BOOT_KNOWN_RAM.lock().iter().any(|&(s, n)| overlaps(s, n))
+        || BOOT_MEMORY_RANGES
+            .lock()
+            .iter()
+            .any(|&(s, n)| overlaps(s, n))
+    {
+        return true;
+    }
+    HOTPLUG_RANGES
+        .lock()
+        .iter()
+        .any(|r| overlaps(r.start, r.len))
+}
+
 pub fn hotplug_node_for_phys(addr: u64) -> Option<usize> {
     HOTPLUG_RANGES
         .lock()
