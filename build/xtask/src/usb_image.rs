@@ -328,7 +328,13 @@ default_entry: 1
     );
 
     if args.qemu {
-        qemu_check(&out, &root, token.as_deref(), !args.allow_all_disks)?;
+        qemu_check(
+            &out,
+            &root,
+            token.as_deref(),
+            !args.allow_all_disks,
+            &cmdline,
+        )?;
     }
     Ok(())
 }
@@ -336,13 +342,19 @@ default_entry: 1
 /// How a QEMU boot of the stick should end.
 #[derive(Clone, Copy, Debug)]
 enum Ending {
-    /// Type `reboot` into the serial shell once armed.
+    /// Type `reboot` into the boot console's shell once armed.
     Reboot,
     /// Boot with `narf.bootlog.selftest=panic`.
     Panic,
 }
 
-fn qemu_check(image: &Path, root: &Path, token: Option<&str>, boot_only: bool) -> Result<()> {
+fn qemu_check(
+    image: &Path,
+    root: &Path,
+    token: Option<&str>,
+    boot_only: bool,
+    cmdline: &str,
+) -> Result<()> {
     if token.is_none() {
         bail!("--qemu checks the persistent log; drop --no-bootlog");
     }
@@ -367,7 +379,7 @@ fn qemu_check(image: &Path, root: &Path, token: Option<&str>, boot_only: bool) -
         if matches!(ending, Ending::Panic) {
             add_selftest_arg(&copy, root)?;
         }
-        boot_once(&copy, &decoys, ending)?;
+        boot_once(&copy, &decoys, ending, uses_vt_console(cmdline))?;
         let log = root.join("target").join(format!("narf-boot-{n}.qemu.log"));
         let _ = std::fs::remove_file(&log);
         run_checked(
@@ -746,7 +758,45 @@ fn ovmf_split(root: &Path) -> Result<(PathBuf, PathBuf)> {
     )
 }
 
-fn boot_once(image: &Path, decoys: &[Decoy], ending: Ending) -> Result<()> {
+/// Match the kernel's supported console names and last-console-wins rule.
+/// The default USB image prefers the VT; serial input cannot reach its getty.
+fn uses_vt_console(cmdline: &str) -> bool {
+    cmdline
+        .split_ascii_whitespace()
+        .filter_map(|arg| {
+            let device = arg.strip_prefix("console=")?.split(',').next()?;
+            if let Some(port) = device.strip_prefix("ttyS") {
+                port.parse::<u32>().ok().filter(|n| *n == 0).map(|_| false)
+            } else {
+                device
+                    .strip_prefix("tty")?
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| *n <= 63)
+                    .map(|_| true)
+            }
+        })
+        .next_back()
+        .unwrap_or(false)
+}
+
+/// HMP sendkey presses one key at a time on the emulated USB keyboard.
+/// The login script contains only lowercase letters and newlines.
+fn type_on_usb_keyboard(stdin: &mut impl Write, text: &[u8]) -> std::io::Result<()> {
+    for &byte in text {
+        let key = match byte {
+            b'\n' => "ret".to_string(),
+            b'a'..=b'z' => char::from(byte).to_string(),
+            _ => return Err(std::io::ErrorKind::InvalidInput.into()),
+        };
+        writeln!(stdin, "sendkey {key} 50")?;
+        stdin.flush()?;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+fn boot_once(image: &Path, decoys: &[Decoy], ending: Ending, usb_keyboard: bool) -> Result<()> {
     let root = workspace_root()?;
     let (code, vars) = ovmf_split(&root)?;
     let mut cmd = Command::new("qemu-system-x86_64");
@@ -761,7 +811,13 @@ fn boot_once(image: &Path, decoys: &[Decoy], ending: Ending) -> Result<()> {
             vars.display()
         ))
         .args(["-machine", "q35", "-cpu", "max", "-smp", "4", "-m", "4096M"])
-        .args(["-serial", "stdio", "-display", "none", "-no-reboot"])
+        .args([
+            "-serial",
+            if usb_keyboard { "mon:stdio" } else { "stdio" },
+            "-display",
+            "none",
+            "-no-reboot",
+        ])
         .args(["-device", "qemu-xhci,id=xhci0"])
         .arg("-drive")
         .arg(format!(
@@ -852,8 +908,22 @@ fn boot_once(image: &Path, decoys: &[Decoy], ending: Ending) -> Result<()> {
             };
             if due {
                 if let Some(stdin) = stdin.as_mut() {
-                    let _ = stdin.write_all(script[step]);
-                    let _ = stdin.flush();
+                    let result = if usb_keyboard {
+                        // Ctrl-A C selects HMP on QEMU's multiplexed stdio.
+                        // Kernel serial output remains available for logging.
+                        let switch = if step == 0 {
+                            stdin.write_all(b"\x01c").and_then(|()| stdin.flush())
+                        } else {
+                            Ok(())
+                        };
+                        switch.and_then(|()| type_on_usb_keyboard(stdin, script[step]))
+                    } else {
+                        stdin.write_all(script[step]).and_then(|()| stdin.flush())
+                    };
+                    if let Err(error) = result {
+                        eprintln!("typing into the boot console failed: {error}");
+                        break;
+                    }
                 }
                 last_send = Some(Instant::now());
                 step += 1;
@@ -875,4 +945,19 @@ fn boot_once(image: &Path, decoys: &[Decoy], ending: Ending) -> Result<()> {
         bail!("QEMU boot of the stick image did not reach the {ending:?} ending");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qemu_input_follows_the_preferred_console() {
+        assert!(uses_vt_console(DISPLAY_CONSOLE_ARGS));
+        assert!(!uses_vt_console("console=tty0 console=ttyS0,115200n8"));
+        assert!(!uses_vt_console("console=tty0 console=ttyS00"));
+        assert!(uses_vt_console("console=ttyS0 console=tty1 console=hvc0"));
+        assert!(!uses_vt_console("console=ttyS1 console=tty64"));
+        assert!(!uses_vt_console(""));
+    }
 }
