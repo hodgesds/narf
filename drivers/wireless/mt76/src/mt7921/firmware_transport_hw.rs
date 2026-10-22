@@ -700,15 +700,6 @@ impl Transport {
     }
     /// Receive a data frame from the data queue.
     pub async fn receive_data_frame(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        self.session.backend.check()?;
-        if let Some(packet) = self.session.backend.receive_data()? {
-            if let Some(frame) = super::rx_frame(&packet) {
-                return Ok(super::to_ethernet(frame));
-            }
-            if packet.len() >= 14 {
-                return Ok(Some(packet));
-            }
-        }
-        Ok(None)
+        self.session.receive_ethernet()
     }
 }

@@ -367,9 +367,9 @@ pub struct Gen3BootRegions {
     pub iml_size: u32,
 }
 
-/// Kick the gen3 device into IML boot. Programs the four CSRs
-/// and sets `CSR_AUTO_FUNC_BOOT_ENA` — the device's ROM does the
-/// rest.
+/// Publish the gen3 self-load context and enable automatic function boot.
+/// The caller must separately release the CPU; the live runtime uses
+/// [`start_gen3`] to perform both steps in the required order.
 ///
 /// Pre-condition: `regions.ctxt_info_phys` points at a populated
 /// `CtxtInfoV2` in DMA-coherent host RAM, with
@@ -394,6 +394,32 @@ pub fn boot_gen3<M: IwlMmio>(mmio: &mut M, regions: &Gen3BootRegions) {
         regs::CSR_CTXT_INFO_BOOT_CTRL,
         cur | regs::CSR_AUTO_FUNC_BOOT_ENA,
     );
+}
+
+/// Publish the self-load addresses, then release the embedded firmware CPU.
+/// Mirrors `iwl_trans_pcie_gen2_start_fw` after `ctxt_info_v2_kick`:
+/// AX210 uses UMAC `UREG_CPU_INIT_RUN`; Bz/Sc instead initialize the
+/// function scratch marker and set `GP_CNTRL.ROM_START`. Enabling
+/// automatic boot alone leaves the CPU held and never produces ALIVE.
+///
+/// The caller must make the context/IML DMA visible and enable DMA/IRQs
+/// before this sequence, retaining all allocations until hardware stops.
+pub fn start_gen3<M: IwlMmio>(
+    mmio: &mut M,
+    regions: &Gen3BootRegions,
+    format: super::rx_rfh::CompletionFormat,
+) {
+    boot_gen3(mmio, regions);
+    match format {
+        super::rx_rfh::CompletionFormat::Ax210 => {
+            prph_write_ax210(mmio, regs::UREG_CPU_INIT_RUN + regs::UMAC_PRPH_OFFSET, 1);
+        }
+        super::rx_rfh::CompletionFormat::Bz => {
+            mmio.write(regs::CSR_FUNC_SCRATCH, regs::CSR_FUNC_SCRATCH_INIT_VALUE);
+            let control = mmio.read(regs::CSR_GP_CNTRL);
+            mmio.write(regs::CSR_GP_CNTRL, control | csr_gp_cntrl::ROM_START);
+        }
+    }
 }
 
 /// Extract the IML blob from a parsed firmware. Returns the
@@ -727,6 +753,66 @@ pub mod tests {
         TestResult::Pass
     }
 
+    fn smoke_iwlwifi_bz_sc_boot_releases_rom_after_context() -> TestResult {
+        let mut m = MockMmio::new();
+        let regions = Gen3BootRegions {
+            ctxt_info_phys: 0x1234_5678_9000,
+            iml_phys: 0xabcd_ef01_2000,
+            iml_size: 0x4000,
+        };
+        // Preserve PCI ownership and the MAC clock/access handshakes.
+        m.stage_read(regs::CSR_CTXT_INFO_BOOT_CTRL, 1 << 22);
+        m.stage_read(regs::CSR_GP_CNTRL, (1 << 6) | (1 << 20) | (1 << 21));
+        start_gen3(&mut m, &regions, super::super::rx_rfh::CompletionFormat::Bz);
+        if m.writes.as_slice()
+            != [
+                (0x118, 0x5678_9000),
+                (0x11c, 0x1234),
+                (0x120, 0xef01_2000),
+                (0x124, 0xabcd),
+                (0x128, 0x4000),
+                (0, (1 << 22) | (1 << 1)),
+                (0x2c, 0x0101_0101),
+                (0x24, (1 << 6) | (1 << 7) | (1 << 20) | (1 << 21)),
+            ]
+            || !m.reads.is_empty()
+        {
+            return TestResult::Fail("Bz/Sc must publish context and scratch before ROM_START");
+        }
+        TestResult::Pass
+    }
+
+    fn smoke_iwlwifi_ax210_boot_releases_umac_after_context() -> TestResult {
+        let mut m = MockMmio::new();
+        let regions = Gen3BootRegions {
+            ctxt_info_phys: 0x1234_5678_9000,
+            iml_phys: 0xabcd_ef01_2000,
+            iml_size: 0x4000,
+        };
+        m.stage_read(regs::CSR_CTXT_INFO_BOOT_CTRL, 1 << 22);
+        start_gen3(
+            &mut m,
+            &regions,
+            super::super::rx_rfh::CompletionFormat::Ax210,
+        );
+        if m.writes.as_slice()
+            != [
+                (0x118, 0x5678_9000),
+                (0x11c, 0x1234),
+                (0x120, 0xef01_2000),
+                (0x124, 0xabcd),
+                (0x128, 0x4000),
+                (0, (1 << 22) | (1 << 1)),
+                // UMAC offset + 32-bit PRPH access width encoding.
+                (0x444, 0x03d0_5c44),
+                (0x44c, 1),
+            ]
+        {
+            return TestResult::Fail("AX210 must release UMAC CPU after context publication");
+        }
+        TestResult::Pass
+    }
+
     fn smoke_iwlwifi_signal_load_done_writes_prph() -> TestResult {
         let mut m = MockMmio::new();
         signal_load_done_gen2(&mut m);
@@ -841,6 +927,14 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi/transport",
         smoke_iwlwifi_boot_gen3_programs_csrs
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/transport",
+        smoke_iwlwifi_bz_sc_boot_releases_rom_after_context
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/transport",
+        smoke_iwlwifi_ax210_boot_releases_umac_after_context
     );
     kernel_test_in!(
         "drivers/wireless/iwlwifi/transport",

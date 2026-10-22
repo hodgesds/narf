@@ -549,16 +549,14 @@ kernel_test_in!(
 fn smoke_ath10k_htc_setup_complete_encodes_flags() -> TestResult {
     let with = build_setup_complete(true);
     let without = build_setup_complete(false);
-    if u16::from_le_bytes([with[0], with[1]]) != MessageId::SetupCompleteEx as u16 {
-        return TestResult::Fail("setup-complete msg_id wrong");
+    // Linux ath10k_htc_start sends sizeof(msg->hdr) +
+    // sizeof(msg->setup_complete_ext), including the bundle limit and
+    // reserved tail. The former 8-byte frame truncated the firmware ABI.
+    if without.as_slice() != [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
+        return TestResult::Fail("PCIe setup-complete differs from Linux wire layout");
     }
-    let flags_with = u32::from_le_bytes(with[4..8].try_into().unwrap());
-    let flags_without = u32::from_le_bytes(without[4..8].try_into().unwrap());
-    if flags_with == 0 {
-        return TestResult::Fail("rx_bundle_en=true should set flags bit");
-    }
-    if flags_without != 0 {
-        return TestResult::Fail("rx_bundle_en=false should clear flags");
+    if with.as_slice() != [5, 0, 0, 0, 1, 0, 0, 0, 32, 0, 0, 0] {
+        return TestResult::Fail("bundled setup-complete limit or reserved tail wrong");
     }
     TestResult::Pass
 }

@@ -1,9 +1,10 @@
 # 2026 WiFi-driver clean-room audit
 
-> Status: reference document. Records what is and isn't publicly
-> documented for the modern WiFi families we have or might want.
-> Updated when a vendor publishes new material or when a tracked
-> chip's documentation status changes.
+> Status: historical pre-relicense research. The ID-table-only scope
+> decisions and "no GPL source consulted" statements below describe the
+> former clean-room policy. They do not describe the Linux-derived drivers
+> added after the May 2026 GPL-2.0-or-later relicense. Current implemented
+> paths and remaining bring-up work are listed in [the driver specification](spec.md).
 
 A targeted web search in 2026 looked for *any* public, non-GPL,
 non-NDA register- / firmware-command-level documentation for the

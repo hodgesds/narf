@@ -40,6 +40,8 @@ pub const CSR_HW_REV: u32 = 0x028;
 /// Function-scratch — driver-private 32-bit scratch the device
 /// preserves across resets.
 pub const CSR_FUNC_SCRATCH: u32 = 0x02C;
+/// Bz/Sc boot marker, written before releasing the embedded ROM CPU.
+pub const CSR_FUNC_SCRATCH_INIT_VALUE: u32 = 0x0101_0101;
 /// EEPROM register window.
 pub const CSR_EEPROM_REG: u32 = 0x02C;
 /// GP1 — driver→firmware general-purpose. Driver writes things
@@ -79,6 +81,8 @@ pub mod csr_gp_cntrl {
     pub const NIC_SLEEP: u32 = 1 << 1;
     /// MAC access disabled (driver should not poke the device).
     pub const MAC_ACCESS_DISABLED: u32 = 1 << 4;
+    /// Bz/Sc ROM CPU release; distinct from the MAC clock request.
+    pub const ROM_START: u32 = 1 << 7;
 }
 
 /// CSR_HW_IF_CONFIG_REG bits.
@@ -176,6 +180,11 @@ pub const CSR_IML_SIZE_ADDR: u32 = 0x128;
 pub const CSR_CTXT_INFO_BOOT_CTRL: u32 = 0x000;
 /// Bit set in `CSR_CTXT_INFO_BOOT_CTRL` to start IML boot.
 pub const CSR_AUTO_FUNC_BOOT_ENA: u32 = 1 << 1;
+
+/// AX210 firmware CPU release, before applying the UMAC peripheral offset.
+pub const UREG_CPU_INIT_RUN: u32 = 0x00A0_5C44;
+/// AX210/Bz/Sc UMAC peripheral registers are relocated by this amount.
+pub const UMAC_PRPH_OFFSET: u32 = 0x0030_0000;
 
 /// Doorbell register the SMU / WFPM uses for cross-CPU signalling.
 /// The driver writes `DOORBELL_TO_ISR6_NMI_BIT` here to force an

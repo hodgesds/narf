@@ -257,10 +257,15 @@ pub fn parse_connect_service_response(bytes: &[u8]) -> Result<ConnectServiceResp
     })
 }
 
+/// Host's receive-bundle capacity (`HTC_HOST_MAX_MSG_PER_RX_BUNDLE`).
+pub const HTC_HOST_MAX_MSG_PER_RX_BUNDLE: u8 = 32;
+
 /// Build the trailing `SETUP_COMPLETE` body. Linux uses the
-/// "extended" variant (`ath10k_htc_setup_complete_extended`,
-/// 8 bytes) on every modern part — encode that.
-pub const SETUP_COMPLETE_BODY_LEN: usize = 8;
+/// "extended" variant: the 2-byte message id followed by the
+/// 10-byte `ath10k_htc_setup_complete_extended` structure. This
+/// includes the receive-bundle limit and three reserved bytes even
+/// when bundling is disabled (the PCIe path).
+pub const SETUP_COMPLETE_BODY_LEN: usize = 12;
 
 pub fn build_setup_complete(rx_bundle_en: bool) -> [u8; SETUP_COMPLETE_BODY_LEN] {
     let mut buf = [0u8; SETUP_COMPLETE_BODY_LEN];
@@ -268,6 +273,9 @@ pub fn build_setup_complete(rx_bundle_en: bool) -> [u8; SETUP_COMPLETE_BODY_LEN]
     // bytes[2..4] = pad0, pad1
     let flags: u32 = if rx_bundle_en { 1 } else { 0 };
     buf[4..8].copy_from_slice(&flags.to_le_bytes());
+    if rx_bundle_en {
+        buf[8] = HTC_HOST_MAX_MSG_PER_RX_BUNDLE;
+    }
     buf
 }
 

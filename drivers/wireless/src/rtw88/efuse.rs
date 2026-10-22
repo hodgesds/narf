@@ -1,28 +1,9 @@
-//! RTW88 EFUSE read.
+//! RTW88 factory identity from the sparse physical EFUSE stream.
 //!
-//! Mirrors the per-byte EFUSE access pattern Linux uses for the
-//! 8821C / 8822B / 8822C parts:
-//!
-//! - `drivers/net/wireless/realtek/rtw88/efuse.c::rtw_efuse_read`
-//!   (Linux v6.6 lines ~50..~120) — the byte-loop that:
-//!     1. asserts `LDOE25_EN` in `REG_LDO_EFUSE_CTRL` once,
-//!     2. for each byte:
-//!        a. writes `(addr << 8)` to `REG_EFUSE_CTRL` (data/addr field),
-//!        b. clears bit 31 (`EFUSE_CTRL_VALID`) — this is the *write*
-//!        shape that arms the read once we re-assert it,
-//!        c. sets bit 31 to trigger,
-//!        d. polls bit 31 — when the hardware finishes the read, it
-//!        flips bit 31 back to 0 and presents the data byte in
-//!        bits[7:0],
-//!     3. clears `LDOE25_EN`.
-//!
-//! NARF is GPL-2.0-or-later, so this direct port is in-policy.
-//!
-//! The baseline only reads the 6 bytes the MAC lives in, but the
-//! `read_efuse_bytes` helper is generic over count so a follow-up can
-//! pull the full ~512-byte logical map.
-
-#![allow(dead_code)]
+//! Ported from Linux `rtw88/efuse.c::{rtw_dump_physical_efuse_map,
+//! rtw_dump_logical_efuse_map}` and the PCIe maps in `rtw8821c.h`,
+//! `rtw8822b.h`, and `rtw8822c.h`. Physical bytes are programming records,
+//! not a direct-addressed logical EEPROM image.
 
 use narf_bus::MmioRegion;
 use narf_time::Deadline;
@@ -31,122 +12,178 @@ use super::regs::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EfuseError {
-    /// A single byte read didn't complete within the wall-clock
-    /// budget. Either the LDO isn't actually powered (PWR-seq
-    /// incomplete) or the chip is in PMU power-down.
+    /// The hardware did not set the completion flag within the budget.
     Timeout,
-    /// The MAC bytes read back as the all-FF / all-00 sentinels
-    /// that mean "uninitialized EFUSE." Real factory-programmed
-    /// silicon never lands here; QEMU / un-fused parts do.
+    /// No valid unicast factory MAC was programmed.
     MacUninitialized,
+    /// The PCI ID has no known physical/logical EFUSE geometry.
+    UnsupportedChip,
+    /// A programming record was truncated or targeted outside the logical map.
+    MalformedMap,
 }
 
-/// Per-byte wall-clock budget. Linux uses a 100-iter poll loop with a
-/// 1 µs udelay between iters — so ~100 µs typical, ~few ms worst. 5 ms
-/// gives plenty of headroom.
-const EFUSE_POLL_MS: u32 = 5;
+const EFUSE_POLL_MS: u64 = 5;
 
-/// Read `count` bytes starting at logical EFUSE offset `addr` into
-/// `out`. Asserts the EFUSE LDO once, loops byte-by-byte, then
-/// de-asserts. `out.len()` must be ≥ `count`.
-///
-/// # Safety
-/// Caller owns the BAR0 MMIO exclusively and the power-on sequence
-/// has been run — the EFUSE LDO needs the PMU in the post-PWR state
-/// to actually present data, otherwise the polling loop wedges and
-/// times out.
-pub unsafe fn read_efuse_bytes(
-    mmio: &MmioRegion,
-    addr: u32,
-    out: &mut [u8],
-    count: usize,
-) -> Result<(), EfuseError> {
-    assert!(
-        out.len() >= count,
-        "rtw88: read_efuse_bytes out buffer smaller than count"
-    );
+/// Sizes/protected tails from the Linux per-chip `rtw_chip_info` tables.
+#[derive(Clone, Copy, Debug)]
+struct Geometry {
+    readable: usize,
+    logical: usize,
+    mac: usize,
+    ldo_addr: u64,
+    ldo_mask: u8,
+}
 
-    // Power the EFUSE LDO. Per `rtw88/efuse.c::rtw_efuse_read`, this
-    // is a write-1-to-set on bit 31 of REG_LDO_EFUSE_CTRL.
-    // SAFETY: identity-mapped MMIO; caller asserts BAR0 ownership.
-    let ldo = unsafe { mmio.read32(REG_LDO_EFUSE_CTRL) };
-    // SAFETY: same.
-    unsafe {
-        mmio.write32(REG_LDO_EFUSE_CTRL, ldo | LDO_EFUSE_EN);
+fn geometry(did: u16) -> Result<Geometry, EfuseError> {
+    let (readable, logical, mac, ldo_addr, ldo_mask) = match did {
+        RTL_DEV_8821CE => (512 - 96, 512, 0xd0, REG_LDO_EFUSE_CTRL + 3, 1 << 7),
+        RTL_DEV_8822BE => (1024 - 96, 768, 0xd0, REG_LDO_EFUSE_CTRL + 3, 1 << 7),
+        RTL_DEV_8822CE => (512 - 124, 768, 0x120, REG_ANAPARLDO_POW_MAC, 1),
+        _ => return Err(EfuseError::UnsupportedChip),
+    };
+    Ok(Geometry {
+        readable,
+        logical,
+        mac,
+        ldo_addr,
+        ldo_mask,
+    })
+}
+
+/// Private register seam: the production path and trace-based smokes run the
+/// same access sequence, including the hardware completion predicate.
+pub(super) trait EfuseIo {
+    fn read8(&mut self, addr: u64) -> u8;
+    fn write8(&mut self, addr: u64, value: u8);
+    fn read32(&mut self, addr: u64) -> u32;
+    fn write32(&mut self, addr: u64, value: u32);
+}
+
+struct MmioEfuse<'a>(&'a MmioRegion);
+
+impl EfuseIo for MmioEfuse<'_> {
+    fn read8(&mut self, addr: u64) -> u8 {
+        // SAFETY: read_mac's caller guarantees exclusive, powered BAR2 control access.
+        unsafe { self.0.read8(addr) }
     }
+    fn write8(&mut self, addr: u64, value: u8) {
+        // SAFETY: as above; only known EFUSE/LDO registers are supplied.
+        unsafe { self.0.write8(addr, value) }
+    }
+    fn read32(&mut self, addr: u64) -> u32 {
+        // SAFETY: as above; only known EFUSE registers are supplied.
+        unsafe { self.0.read32(addr) }
+    }
+    fn write32(&mut self, addr: u64, value: u32) {
+        // SAFETY: as above; only known EFUSE registers are supplied.
+        unsafe { self.0.write32(addr, value) }
+    }
+}
 
-    for (i, out_byte) in out.iter_mut().enumerate().take(count) {
-        let byte_addr = addr.saturating_add(i as u32) & EFUSE_CTRL_ADDR_MASK;
+fn read_physical(io: &mut impl EfuseIo, chip: Geometry, out: &mut [u8]) -> Result<(), EfuseError> {
+    // Read bank 0 (Wi-Fi), with the programming LDO *disabled*. 8822C
+    // controls LDO25 through ANAPARLDO instead of the 8821C/8822B register.
+    let bank = io.read32(REG_LDO_EFUSE_CTRL);
+    io.write32(REG_LDO_EFUSE_CTRL, bank & !EFUSE_BANK_MASK);
+    let ldo = io.read8(chip.ldo_addr);
+    io.write8(chip.ldo_addr, ldo & !chip.ldo_mask);
 
-        // Arm the read: write the address into bits[25:8] and clear
-        // VALID (bit 31). The hardware re-asserts VALID once we set
-        // it; clearing first matches the Linux shape and avoids a
-        // false "already done" detection if a prior read left VALID
-        // set.
-        let arm = (byte_addr & EFUSE_CTRL_ADDR_MASK) << EFUSE_CTRL_ADDR_SHIFT;
-        // SAFETY: same.
-        unsafe {
-            mmio.write32(REG_EFUSE_CTRL, arm);
-            // Trigger.
-            mmio.write32(REG_EFUSE_CTRL, arm | EFUSE_CTRL_VALID);
-        }
-
-        // Poll. Bit 31 reads back as 0 once the byte is presented in
-        // bits[7:0]. responsive_spin_until ticks sleep_pumps so the
-        // FB cursor / serial drain stay alive while we wait.
-        let mut last: u32 = 0;
+    let mut control = io.read32(REG_EFUSE_CTRL);
+    for (addr, byte) in out.iter_mut().enumerate() {
+        control &= !(EFUSE_CTRL_DATA_MASK
+            | (EFUSE_CTRL_ADDR_MASK << EFUSE_CTRL_ADDR_SHIFT)
+            | EFUSE_CTRL_VALID);
+        control |= (addr as u32) << EFUSE_CTRL_ADDR_SHIFT;
+        // Writing a *clear* flag starts the read; hardware sets it on
+        // completion. Preserve unrelated control bits between transactions.
+        io.write32(REG_EFUSE_CTRL, control);
         let done = narf_scheduler::responsive_spin_until(
             || {
-                // SAFETY: identity-mapped MMIO.
-                last = unsafe { mmio.read32(REG_EFUSE_CTRL) };
-                last & EFUSE_CTRL_VALID == 0
+                control = io.read32(REG_EFUSE_CTRL);
+                control & EFUSE_CTRL_VALID != 0
             },
-            Deadline::after_ms(EFUSE_POLL_MS as u64),
+            Deadline::after_ms(EFUSE_POLL_MS),
         );
         if !done {
-            // De-assert the LDO before returning so we don't leave it
-            // powered on the failure path.
-            // SAFETY: same.
-            unsafe {
-                let v = mmio.read32(REG_LDO_EFUSE_CTRL);
-                mmio.write32(REG_LDO_EFUSE_CTRL, v & !LDO_EFUSE_EN);
-            }
             return Err(EfuseError::Timeout);
         }
-        *out_byte = (last & EFUSE_CTRL_DATA_MASK) as u8;
+        *byte = (control & EFUSE_CTRL_DATA_MASK) as u8;
     }
-
-    // De-assert the LDO. Linux clears the bit at the end of
-    // `rtw_efuse_read` to leave the chip in the low-power state.
-    // SAFETY: same.
-    unsafe {
-        let v = mmio.read32(REG_LDO_EFUSE_CTRL);
-        mmio.write32(REG_LDO_EFUSE_CTRL, v & !LDO_EFUSE_EN);
-    }
-
     Ok(())
 }
 
-/// Read the 6-byte MAC address from the conventional logical EFUSE
-/// offset (`EFUSE_MAC_OFFSET`). Fails if the read times out OR if the
-/// MAC reads back as an all-zero / all-FF sentinel (which means EFUSE
-/// is unfused — caller's concern, but we surface it as an explicit
-/// error so probe can fall back to a derived MAC if it wants).
-///
-/// # Safety
-/// As for [`read_efuse_bytes`].
-pub unsafe fn read_mac(mmio: &MmioRegion) -> Result<[u8; MAC_ADDR_LEN], EfuseError> {
-    let mut mac = [0u8; MAC_ADDR_LEN];
-    // SAFETY: forwarded.
-    unsafe { read_efuse_bytes(mmio, EFUSE_MAC_OFFSET, &mut mac, MAC_ADDR_LEN) }?;
-    if mac == [0u8; MAC_ADDR_LEN] || mac == [0xFFu8; MAC_ADDR_LEN] {
+/// Decode one-/two-byte headers, sparse word enables, and later word
+/// overrides. Protected physical bytes must be excluded by the caller.
+pub(super) fn decode_map(physical: &[u8], logical: &mut [u8]) -> Result<(), EfuseError> {
+    logical.fill(0xff);
+    let mut cursor = 0;
+    while cursor < physical.len() {
+        let first = physical[cursor];
+        cursor += 1;
+        if first == 0xff {
+            break;
+        }
+        let (block, word_enable) = if first & 0x1f == 0x0f {
+            let second = *physical.get(cursor).ok_or(EfuseError::MalformedMap)?;
+            cursor += 1;
+            if second == 0xff {
+                break;
+            }
+            (
+                (((second & 0xf0) >> 1) | (first >> 5)) as usize,
+                second & 0x0f,
+            )
+        } else {
+            ((first >> 4) as usize, first & 0x0f)
+        };
+
+        for word in 0..4 {
+            if word_enable & (1 << word) != 0 {
+                continue;
+            }
+            let target = block * 8 + word * 2;
+            let source = physical
+                .get(cursor..cursor + 2)
+                .ok_or(EfuseError::MalformedMap)?;
+            logical
+                .get_mut(target..target + 2)
+                .ok_or(EfuseError::MalformedMap)?
+                .copy_from_slice(source);
+            cursor += 2;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn read_mac_with(
+    io: &mut impl EfuseIo,
+    did: u16,
+) -> Result<[u8; MAC_ADDR_LEN], EfuseError> {
+    // Reject unknown geometry before touching hardware. Read only the
+    // unprotected programming area; the protected tail is not map records.
+    let chip = geometry(did)?;
+    let mut physical = [0xff; 1024];
+    read_physical(io, chip, &mut physical[..chip.readable])?;
+    let mut logical = [0xff; 768];
+    decode_map(&physical[..chip.readable], &mut logical[..chip.logical])?;
+    let mut mac = [0; MAC_ADDR_LEN];
+    mac.copy_from_slice(&logical[chip.mac..chip.mac + MAC_ADDR_LEN]);
+    if !mac_is_valid(mac) {
         return Err(EfuseError::MacUninitialized);
     }
     Ok(mac)
 }
 
-/// `true` if the 6 bytes look like a real MAC (not the all-00 / all-FF
-/// sentinels EFUSE returns when unfused).
+/// Read and decode the chip-specific PCIe factory MAC.
+///
+/// # Safety
+/// Caller owns the powered BAR2 register mapping exclusively. The mapping must cover
+/// the EFUSE control (0x30), bank/LDO (0x34), and 8822C LDO (0x29) registers.
+pub unsafe fn read_mac(mmio: &MmioRegion, did: u16) -> Result<[u8; MAC_ADDR_LEN], EfuseError> {
+    read_mac_with(&mut MmioEfuse(mmio), did)
+}
+
+/// A factory station identity must be nonzero and unicast.
 pub fn mac_is_valid(mac: [u8; MAC_ADDR_LEN]) -> bool {
-    mac != [0u8; MAC_ADDR_LEN] && mac != [0xFFu8; MAC_ADDR_LEN]
+    mac != [0; MAC_ADDR_LEN] && mac[0] & 1 == 0
 }
