@@ -1462,3 +1462,121 @@ kernel_test_in!(
     "drivers/wireless/mt7921/transport",
     mcu_ethernet_tx_rx_frame_transport
 );
+
+fn native_data_packet(qos: bool) -> Vec<u8> {
+    let mut frame = vec![0u8; if qos { 26 } else { 24 }];
+    frame[..2].copy_from_slice(&[if qos { 0x88 } else { 0x08 }, 0x02]);
+    frame[4..10].copy_from_slice(&[2, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    frame[10..16].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+    frame[16..22].copy_from_slice(&[2, 6, 7, 8, 9, 10]);
+    frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00, 1, 2, 3]);
+    let mut packet = vec![0u8; 24];
+    packet[..4].copy_from_slice(&((2u32 << 27) | (24 + frame.len()) as u32).to_le_bytes());
+    packet.extend_from_slice(&frame);
+    packet
+}
+
+fn mt76_native_ethernet_conversion_rejects_unsupported_frame_layouts() -> TestResult {
+    let packet = native_data_packet(true);
+    let frame = &packet[24..];
+    let Some(ethernet) = to_ethernet(frame) else {
+        return TestResult::Fail("valid native QoS data rejected");
+    };
+    if ethernet
+        != [
+            2, 0x11, 0x22, 0x33, 0x44, 0x55, 2, 6, 7, 8, 9, 10, 0x08, 0x00, 1, 2, 3,
+        ]
+    {
+        return TestResult::Fail("native address/SNAP conversion");
+    }
+    let mut invalid = Vec::new();
+    invalid.push(ethernet); // An Ethernet frame is not a native 802.11 packet.
+    for (offset, value) in [
+        (0, 0x80),  // Beacon.
+        (0, 0x48),  // Null data.
+        (0, 0x89),  // Nonzero protocol version.
+        (1, 0x03),  // Four-address WDS.
+        (1, 0x06),  // More fragments.
+        (1, 0x42),  // Protected payload without a decrypt/replay path.
+        (1, 0x82),  // HT control changes header length.
+        (22, 1),    // Nonzero fragment number.
+        (24, 0x80), // A-MSDU requires deaggregation.
+        (26, 0),    // Missing SNAP header.
+        (32, 0),    // A length field is not an EtherType.
+    ] {
+        let mut bad = frame.to_vec();
+        bad[offset] = value;
+        invalid.push(bad);
+    }
+    for len in 0..34 {
+        invalid.push(frame[..len].to_vec());
+    }
+    for bad in invalid {
+        if to_ethernet(&bad).is_some() {
+            return TestResult::Fail("unsupported native frame became Ethernet");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport",
+    mt76_native_ethernet_conversion_rejects_unsupported_frame_layouts
+);
+
+fn mt76_receive_discards_bad_descriptors_and_other_station_frames() -> TestResult {
+    let mut session = Session::new(Model::new(), firmware(32));
+    if run(session.run()).is_err() || run(session.initialize_radio()).is_err() {
+        return TestResult::Fail("radio init");
+    }
+    let State::RadioReady(info) = session.state else {
+        return TestResult::Fail("radio state");
+    };
+    let packet = native_data_packet(true);
+    session.backend.packets.push_back(packet.clone());
+    if session.receive_ethernet() != Err(Error::Busy) || session.backend.packets.len() != 1 {
+        return TestResult::Fail("unassociated receive consumed data");
+    }
+    session.backend.packets.clear();
+    session.state = State::Associated {
+        info,
+        peer: [2, 1, 2, 3, 4, 5],
+        channel: 6,
+        aid: 42,
+    };
+    for (offset, value) in [
+        (3, 0),       // Invalid RX packet discriminator.
+        (7, 0x02),    // Descriptor integrity-error bit.
+        (24, 0x80),   // Management frame.
+        (25, 0x42),   // Still-protected native payload.
+        (24 + 4, 4),  // Unicast to another station.
+        (24 + 10, 4), // A different transmitter/AP.
+        (24 + 16, 3), // Multicast source address.
+    ] {
+        let mut bad = packet.clone();
+        bad[offset] = value;
+        session.backend.packets.push_back(bad);
+    }
+    session.backend.packets.push_back(packet.clone());
+    let expected = to_ethernet(&packet[24..]).unwrap();
+    if session.receive_ethernet() != Ok(Some(expected))
+        || !session.backend.packets.is_empty()
+        || session.receive_ethernet() != Ok(None)
+    {
+        return TestResult::Fail("rejected hardware/native packets reached Ethernet");
+    }
+    for _ in 0..17 {
+        session.backend.packets.push_back(vec![0; 32]);
+    }
+    session.backend.packets.push_back(packet);
+    if session.receive_ethernet() != Ok(None) || session.backend.packets.len() != 2 {
+        return TestResult::Fail("malformed RX burst exceeded bounded work");
+    }
+    if !matches!(session.receive_ethernet(), Ok(Some(_))) {
+        return TestResult::Fail("valid packet stranded behind malformed burst");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport",
+    mt76_receive_discards_bad_descriptors_and_other_station_frames
+);

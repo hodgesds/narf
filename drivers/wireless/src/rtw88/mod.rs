@@ -9,9 +9,9 @@
 //! ## Scope (this commit)
 //!
 //! 1. PCI device match via the existing `bus::driver_match` table.
-//! 2. BAR0 (register) + BAR2 (data) MMIO mapping.
+//! 2. BAR2 control-register MMIO mapping (Device memory attributes).
 //! 3. Baseline power-on sequence + chip-reset (CR.OPEN re-arm).
-//! 4. EFUSE read — MAC address from logical offset 0.
+//! 4. EFUSE physical read and sparse map decoding; chip-specific PCI MAC.
 //! 5. Hardware-identification registration with an offline `narf-net`
 //!    send function. The interface remains down and all wireless control
 //!    operations return `NotSupported` until firmware and packet rings land.
@@ -59,3 +59,9 @@ pub fn register() {
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod efuse_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod pci_tests;

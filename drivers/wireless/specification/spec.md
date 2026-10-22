@@ -6,16 +6,23 @@
 > `drivers/spec` and `wireless/spec` to define the operational
 > boundary for 802.11 hardware.
 
-## 0. Bring-up Status (May 2026)
+## 0. Bring-up status
 
-The following drivers have been advanced to functional bring-up
-states following the May 2026 relicensing to GPL-2.0:
+The May 2026 GPL-2.0 relicense permits the in-tree Linux-derived paths.
+The table describes reachable implementation, not physical acceptance;
+matching a PCI ID or testing a command encoder does not establish a WLAN.
 
 | Driver | Generation | Status | Mechanism |
 | :--- | :--- | :--- | :--- |
 | **iwlwifi** | AX210+ transport; Sc/BE211 MLD station profile | RX/TX and station implementation; silicon validation pending | Firmware self-load, RFH, command/data queues, Open/WPA2-PSK |
 | **ath11k** | Wi-Fi 6E | **Stage 5** (silicon qualification) | Offline-tested PCIe WCN6855 three-vdev STA/AP/P2P path: MHI/QMI/WMI/DP, scan/ROC, external supplicant, DFS, WoW/cold PM and RDDM recovery/device dump; first hardware boot pending — see `ath11k.md` §8 |
-| **rtw88** | Wi-Fi 5 | **Stage 2** (FW Load) | RTL8822C IDDMA, MCU handshake |
+| **mt76** | MT7921/MT7922 CONNAC2 | Firmware/radio and passive scan path; station transport incomplete | Retained startup and MLME/WPA2 helpers; packet pump and network transmit callback are not connected |
+| **rtw88** | RTL8821CE/RTL8822BE/RTL8822CE | Powered identification and EFUSE decoding | Firmware, full per-chip initialization, packet rings and station control remain open |
+| **rtw89 / rtlwifi / rtl8xxxu** | Realtek PCIe/USB families | Partial probe/transport helpers | Live firmware, packet and station integration remain incomplete; unsupported operations stay gated |
+| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Probe/reset and CE/HTC/WMI/HTT codecs | Firmware/BMI bootstrap, live transport/handshake and interface registration remain open |
+| **ath9k** | AR9285 | Reset/detection stub | EEPROM/RF, DMA/IRQ and interface lifecycle remain open |
+| **brcmfmac** | Broadcom PCIe FullMAC | Probe and firmware/shared-ring helpers | Firmware activation, live msgbuf/IRQ transport and wireless interface attachment remain open |
+| **cyw43439** | Infineon SDIO/gSPI FullMAC | Firmware, transport and event codecs | Live registration, F2 credits, correlated control/event/data dispatch and station interface remain open |
 
 ## 1. Purpose & scope
 
@@ -73,6 +80,25 @@ fairness; CoDel uses a 20 ms target, 100 ms interval, and ECN marking before
 drop. Hardware-queue stop reasons still gate the four ACs (VO, VI, BE, BK).
 The ring boundary stays deliberately metadata-minimal, so the driver derives
 a stable L2/L3/L4 flow hash rather than carrying Linux's private `skb->hash`.
+
+### Firmware boot and control-message helpers
+
+`iwlwifi::transport::start_gen3(mmio, regions, completion_format)` publishes
+the owned context/IML addresses and releases the firmware CPU in the same
+sequence. AX210 uses a 32-bit UMAC `CPU_INIT_RUN` write; Bz/Sc writes the
+function scratch marker before setting `GP_CNTRL.ROM_START`. This does not
+expand the accepted MLD station-command profile.
+
+`ath10k::htc::build_setup_complete(rx_bundle_en)` returns the full 12-byte
+`SETUP_COMPLETE_EX` body: message ID, padding, flags, receive-bundle limit and
+reserved tail. Disabled bundling leaves the limit zero; enabled bundling
+sets it to Linux's 32-message host limit.
+
+`cyw43439::events::parse_event(frame)` consumes an Ethernet header, the
+10-byte Broadcom vendor envelope and a 48-byte network-order event message.
+`EventHeader::decode` consumes the event message alone. Invalid envelope
+discriminators and truncated declared payloads fail; bytes after the declared
+payload are padding and are not returned to the caller.
 
 ### MT76 PCI discovery and register access
 
@@ -249,9 +275,26 @@ no caller can mutate the plan's phase directly.
    `STA_REC_KEY_V2` (tag 0x12) WTBL record with cipher 6 (`MCU_CIPHER_AES_CCMP`) and `CONN_STATE_PORT_SECURE`.
 4. Datapath transport submits 802.3 Ethernet frames encapsulated in 32-byte CONNAC2 TXD headers
    over WFDMA data rings, and translates incoming 802.11 LLC/SNAP data frames to 802.3 Ethernet.
-5. `Mt76Iface` binds `narf_ipc` producer/consumer rings (`tx_ring` and `rx_ring`) and exposes
-   `poll_data()` to bridge frames between IPC endpoints and hardware rings, updating the link state
-   in the network registry upon association and teardown upon disassociation.
+5. `Mt76Iface` creates `narf_ipc` producer/consumer rings (`tx_ring` and
+   `rx_ring`) after association and exposes `poll_data()`. No production task
+   currently calls that method, and the kernel netdev still registers a
+   transmit callback that always refuses. Capability frame registration and
+   kernel RX delivery also remain to be connected. Ring-only smoke tests do
+   not establish an Ethernet path through the radio.
+
+The retained receive API accepts data only in `State::Associated`, validates
+the CONNAC2 descriptor before native-frame conversion, and checks the current
+AP and station destination. It inspects at most 16 candidate data packets per
+call; each backend receive may inspect the three WFDMA rings. Invalid
+descriptors, management/null frames, fragments, four-address frames, protected
+payloads without the decrypt/replay path, A-MSDU and unsupported LLC layouts
+are discarded, never reinterpreted as raw Ethernet. The native unfragmented
+RFC1042 path supports Ethernet payloads up to 1500 bytes. Peer-bound EAPOL
+framing, group keys, protected RX/replay/rekey handling and the live
+packet-service lifecycle remain bring-up prerequisites; a successful model
+M1..M4 exchange does not close them. In particular, the current handshake
+parser still has a separate raw-packet fallback; the associated-data receive
+validation does not cover that parser.
 
 ### 3.1 Implemented iwlwifi MLD station profile
 

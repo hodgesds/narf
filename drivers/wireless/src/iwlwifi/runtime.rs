@@ -621,7 +621,7 @@ impl Hardware {
         self.armed = true;
         self.resources.rx.publish(&mut self.mmio)?;
         dma_barrier();
-        super::transport::boot_gen3(&mut self.mmio, &regions);
+        super::transport::start_gen3(&mut self.mmio, &regions, self.format);
         let alive = self.wait_notification(0, 1, 2000).await?;
         let alive_version = self
             .version(0, 1)

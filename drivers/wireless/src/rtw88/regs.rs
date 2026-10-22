@@ -61,7 +61,7 @@ pub const OCPBASE_DMEM_88XX: u32 = 0x00200000;
 //
 // Per Linux `drivers/net/wireless/realtek/rtw88/pci.c::rtw_pci_id_table`
 // (search for `PCI_VDEVICE(REALTEK, 0xC821)` etc.). All three parts
-// sit on the same PCI vendor and share the BAR0/BAR2 layout.
+// sit on the same PCI vendor and expose their register aperture at BAR2.
 
 /// Realtek Semiconductor Corp.
 pub const REALTEK_VENDOR: u16 = 0x10EC;
@@ -76,9 +76,9 @@ pub const RTL_DEV_8822BE: u16 = 0xB822;
 
 pub const ALL_DEV_IDS: &[u16] = &[RTL_DEV_8821CE, RTL_DEV_8822CE, RTL_DEV_8822BE];
 
-// ── SYS / power-control registers (BAR0 + offset) ──────────────────
+// ── SYS / power-control registers (BAR2 + offset) ──────────────────
 // Per Linux `rtw88/reg.h`. The "REG_SYS_*" block lives in the lower
-// 0x80 bytes of BAR0 and is what `rtw_power_on` touches before the
+// 0x80 bytes of BAR2 and is what `rtw_power_on` touches before the
 // MAC block comes alive.
 
 /// `REG_SYS_FUNC_EN` — system-wide function enable. Bit 13 (FEN_MREGEN)
@@ -142,57 +142,39 @@ pub const CR_OPEN: u16 = CR_HCI_TXDMA_EN
 
 // ── EFUSE / EEPROM access ───────────────────────────────────────────
 //
-// Linux `rtw88/efuse.c` exposes the chip's EFUSE through a two-step
-// register dance: write the byte offset to `REG_EFUSE_CTRL`'s low 16
-// bits, set the read-trigger bit (bit 31), poll for the ready bit
-// (bit 30), then read the data byte from `REG_EFUSE_CTRL`'s low 8.
+// Linux `rtw88/efuse.c`: clear bit 31 to start a physical byte read,
+// wait for hardware to set it, then take the low data byte.
 
 /// `REG_EFUSE_CTRL` — EFUSE control + data window. `reg.h` ~L141.
 pub const REG_EFUSE_CTRL: u64 = 0x0030;
 
-/// Bit 31 of `REG_EFUSE_CTRL` — write-1 to start a read.
+/// Bit 31 of `REG_EFUSE_CTRL`: clear to start, set by hardware when ready.
 pub const EFUSE_CTRL_VALID: u32 = 1 << 31;
-/// Address field shift within `REG_EFUSE_CTRL`. Linux: bits [25:8] hold
+/// Address field shift within `REG_EFUSE_CTRL`. Linux: bits [17:8] hold
 /// the EFUSE byte offset for the 8821C/8822B/8822C family.
 pub const EFUSE_CTRL_ADDR_SHIFT: u32 = 8;
-/// Address mask within `REG_EFUSE_CTRL` post-shift (18-bit address
-/// space — RTL8822C exposes ≤ 1024 logical EFUSE bytes but the field
-/// is wider to accommodate map remapping).
-pub const EFUSE_CTRL_ADDR_MASK: u32 = 0x0003_FFFF;
+/// Physical address mask before shifting (`BIT_MASK_EF_ADDR`).
+pub const EFUSE_CTRL_ADDR_MASK: u32 = 0x3ff;
 /// Data byte mask within `REG_EFUSE_CTRL`. Low byte after a successful
 /// read.
 pub const EFUSE_CTRL_DATA_MASK: u32 = 0x0000_00FF;
 
-/// `REG_LDO_EFUSE_CTRL` — LDO/EFUSE power control. `rtw88/efuse.c`
-/// asserts the EFUSE-LDO-enable bit (`BIT_LDOE25_EN`) before reads.
+/// `REG_LDO_EFUSE_CTRL` — EFUSE bank and 8821C/8822B programming LDO.
 pub const REG_LDO_EFUSE_CTRL: u64 = 0x0034;
 
-/// Bit 31 of `REG_LDO_EFUSE_CTRL` — `BIT_LDOE25_EN`. Linux
-/// `rtw88/efuse.c::rtw_efuse_read` writes this prior to the per-byte
-/// loop, then clears it on completion.
+/// 8821C/8822B programming LDO25 enable; keep clear for reads.
 pub const LDO_EFUSE_EN: u32 = 1 << 31;
+
+/// EFUSE bank selector; bank zero is Wi-Fi.
+pub const EFUSE_BANK_MASK: u32 = 3 << 8;
+
+/// 8822C programming LDO25 enable is bit zero of this byte register.
+pub const REG_ANAPARLDO_POW_MAC: u64 = 0x0029;
 
 // ── EFUSE map offsets ──────────────────────────────────────────────
 //
-// The MAC address sits in the logical EFUSE map (not the raw physical
-// EFUSE bytes) at a chip-specific offset. Linux defines these in
-// `rtw88/rtw8822c.c::rtw8822c_chip_info`:
-//
-//   `.mac_addr_offset_2g = 0x55F6`   (8822C, B-band entry)
-//   `.mac_addr_offset_5g = 0x55F0`   (8822C, A-band entry)
-//
-// 8821C uses the same field naming with slightly smaller offsets.
-// The baseline reads from `0x0` of the **logical** EFUSE which on
-// these parts contains the factory-programmed MAC mirror. Real
-// silicon also stores a copy at the higher offsets above; the
-// follow-up commit will add proper map-walking + checksum.
-
-/// Baseline EFUSE logical-map offset for the factory MAC. Real chips
-/// also mirror the MAC at chip-specific higher offsets (see comments
-/// above) — the baseline reads from offset 0 for parity with the
-/// 8822C "EEPROM hidden header" layout shown in Linux
-/// `rtw88/efuse.c::rtw_parse_efuse_map`.
-pub const EFUSE_MAC_OFFSET: u32 = 0x0000;
+// The PCIe MAC lives at logical 0xd0 on 8821C/8822B and 0x120 on
+// 8822C (Linux's per-chip *_efuse structs). See efuse::geometry.
 
 /// Number of MAC-address bytes to read from EFUSE.
 pub const MAC_ADDR_LEN: usize = 6;

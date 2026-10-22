@@ -1,5 +1,4 @@
-//! Infineon (Cypress) CYW43439 Wi-Fi 4 + Bluetooth 5 combo —
-//! clean-room driver.
+//! Infineon (Cypress) CYW43439 Wi-Fi 4 + Bluetooth 5 combo driver.
 //!
 //! Spec: `drivers/wireless/specification/cyw43439.md`.
 //!
@@ -33,28 +32,33 @@
 //! - **Embassy `cyw43`** (Apache-2.0 / MIT) — Rust async driver in
 //!   wide use on Raspberry Pi Pico W (CYW43439 over PIO+SPI).
 //!
-//! Consuming the *interface conventions* documented in those repos
-//! is clean-room compatible. **No GPL `brcmfmac` / `bcmdhd` source
-//! consulted.**
+//! The transport and firmware work originally used those public and
+//! permissive references. The event-wire codec is now also checked
+//! against Linux `brcmfmac/fweh.h` and `fweh.c`, under the workspace's
+//! GPL-2.0-or-later license.
 //!
 //! ## Stage progression
 //!
 //! - **Stage 1 (landed)** — module + spec presence, public part-
 //!   number / firmware-name constants, SDIO function-model
 //!   constants.
-//! - **Stage 2 (this commit)** — transport-codec layer:
+//! - **Stage 2 (landed)** — transport-codec layer:
 //!   - [`gspi`] — 32-bit gSPI command-word codec (datasheet §6.4).
 //!   - [`sdio`] — CMD52 / CMD53 argument-word codec + F0/F1
 //!     register addresses (SDIO Simplified Spec + datasheet §6.5).
 //!   - [`backplane`] — F1 window paging codec (datasheet §6.5).
 //!   - [`transport`] — the [`Transport`](transport::Transport) trait
 //!     gSPI / SDIO host adapters implement.
-//! - **Stage 3 (future)** — chip-RAM firmware staging: load
+//! - **Stage 3 (landed)** — chip-RAM firmware staging: load
 //!   `43439A0.bin` to the SOC-RAM core, push `43439A0.txt` NVRAM,
 //!   deassert WLAN_ARM reset.
-//! - **Stage 4 (future)** — IOCTL / IOVAR codec, with each command
-//!   number annotated by its public-doc justification before it
-//!   lands.
+//! - **Stage 4 (landed)** — SDPCM/BCDC IOCTL/IOVAR and event codecs.
+//!   Events carry a Broadcom vendor envelope and network-order header;
+//!   event-specific payloads retain their own byte order.
+//!
+//! [`sdio_bridge`] supplies an adapter over an `SdioFunction` host.
+//! Live F2 transport scheduling/credits, event dispatch, station control
+//! and a registered `WirelessNetIface` are still required for Wi-Fi use.
 
 #![allow(dead_code)]
 

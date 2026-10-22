@@ -51,11 +51,18 @@ switching via `MCU_EXT_CMD_CHANNEL_SWITCH`, open-authentication/association MLME
 handshakes, and IEEE 802.11i WPA2-PSK 4-way handshakes (M1..M4) with HMAC-SHA1 MIC
 verification/generation. WTBL station records commit temporal keys with
 tag 0x12 (`STA_REC_KEY_V2`), cipher 6 (`MCU_CIPHER_AES_CCMP`), and `PORT_SECURE`.
-The datapath encapsulates 802.3 Ethernet frames into CONNAC2 32-byte TXDs on WFDMA data rings,
-translates 802.11 LLC/SNAP to Ethernet on RX, and pumps frames through `narf_ipc`
-producer/consumer rings with link state updates.
-The targeted QEMU suite passes 99 tests with one skip (99 pass, 0 fail, 1 skip),
-including live WPA2 join dispatch, STA_REC key installation, and Ethernet transport.
+Packet transport helpers encapsulate 802.3 Ethernet frames into CONNAC2 TXDs
+and convert validated native LLC/SNAP frames on RX. The live packet-service
+task, functional kernel transmit callback and network RX/capability attachment
+remain unconnected; existing ring smoke tests do not prove off-box traffic.
+Group-key installation and protected RX/replay/rekey handling also remain open.
+The retained RX API now rejects invalid descriptors and unsupported native
+layouts rather than treating rejected hardware packets as Ethernet.
+The `drivers/wireless` QEMU filter passes 834 tests on x86_64 (9 skipped)
+and 291 on aarch64 (1 skipped), with zero failures. Coverage includes modeled
+WPA2 join dispatch, STA_REC key installation and packet codecs, plus Intel
+firmware CPU release, Realtek BAR/EFUSE access, ath10k HTC setup and Cypress
+event framing. These checks do not establish physical radio operation.
 Both-architecture Clippy and `cargo fmt` pass cleanly. Physical MT7922
 silicon validation on AMD Zen2/Phoenix hardware remains open to close the Stage 5 Wi-Fi gate.
 

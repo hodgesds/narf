@@ -56,34 +56,84 @@ pub(crate) fn wrap_eapol_frame(own: [u8; 6], peer: [u8; 6], eapol: &[u8]) -> Vec
     frame
 }
 
-/// Convert an incoming 802.11 Data frame with LLC/SNAP or raw 802.3 frame
-/// into an 802.3 Ethernet frame.
+/// Convert an unfragmented native station RX frame with RFC1042 LLC/SNAP.
+/// The retained transport disables RX header translation. Rejected native
+/// frames must never be reinterpreted as an already translated Ethernet frame.
 pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
-    if frame.len() >= 32 && (frame[0] == 0x08 || frame[0] == 0x88) && (frame[1] & 0x03 == 0x02) {
-        let da = &frame[4..10];
-        let sa = &frame[16..22];
-        let qos = frame[0] == 0x88;
-        let snap_offset = if qos { 26 } else { 24 };
-        if frame.len() >= snap_offset + 8
-            && frame[snap_offset..snap_offset + 6] == [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00]
-        {
-            let ethertype = &frame[snap_offset + 6..snap_offset + 8];
-            let payload = &frame[snap_offset + 8..];
-            let mut eth = Vec::with_capacity(14 + payload.len());
-            eth.extend_from_slice(da);
-            eth.extend_from_slice(sa);
-            eth.extend_from_slice(ethertype);
-            eth.extend_from_slice(payload);
-            return Some(eth);
+    let header = frame.get(..24)?;
+    let fc = u16::from_le_bytes([header[0], header[1]]);
+    if !matches!(fc & 0xff, 0x08 | 0x88)
+        || fc & 0xc700 != 0x0200 // FromDS only; no fragments, protection or HT control.
+        || header[22] & 15 != 0
+    {
+        return None;
+    }
+    let snap_offset = if fc & 0x80 != 0 {
+        let qos = frame.get(24..26)?;
+        if qos[0] & 0x80 != 0 {
+            return None; // A-MSDU needs its own bounded deaggregation path.
         }
+        26
+    } else {
+        24
+    };
+    let snap = frame.get(snap_offset..snap_offset + 8)?;
+    let protocol = u16::from_be_bytes([snap[6], snap[7]]);
+    if snap[..6] != [0xaa, 0xaa, 3, 0, 0, 0]
+        || protocol < 0x0600
+        || matches!(protocol, 0x80f3 | 0x8137)
+    {
+        // Linux's ieee80211_get_8023_tunnel_proto preserves LLC for AARP/IPX;
+        // that length-framed LLC path is not implemented by this profile.
+        return None;
     }
-    if frame.len() >= 14 {
-        return Some(frame.to_vec());
+    let payload = &frame[snap_offset + 8..];
+    if payload.len() > 1500 {
+        return None;
     }
-    None
+    let mut eth = Vec::with_capacity(14 + payload.len());
+    eth.extend_from_slice(&header[4..10]);
+    eth.extend_from_slice(&header[16..22]);
+    eth.extend_from_slice(&snap[6..8]);
+    eth.extend_from_slice(payload);
+    Some(eth)
 }
 
 impl<B: Backend> Session<B> {
+    /// Receive only validated native data from this station's associated AP.
+    /// A rejected RX descriptor is discarded with its payload; it is never
+    /// returned as a raw Ethernet frame. The budget also bounds malformed bursts.
+    pub(super) fn receive_ethernet(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        let (own, peer) = match self.state {
+            State::Associated { info, peer, .. } => (info.capabilities.mac, peer),
+            _ => return Err(Error::Busy),
+        };
+        for _ in 0..16 {
+            self.backend.check()?;
+            let Some(packet) = self.backend.receive_data()? else {
+                return Ok(None);
+            };
+            let Some(frame) = rx_frame(&packet) else {
+                continue;
+            };
+            let Some(header) = frame.get(..24) else {
+                continue;
+            };
+            if header[10..16] != peer
+                || header[4..10] != own && header[4] & 1 == 0
+                || header[16..22] == [0; 6]
+                || header[16] & 1 != 0
+                || header[4] & 1 != 0 && header[16..22] == own
+            {
+                continue;
+            }
+            if let Some(ethernet) = to_ethernet(frame) {
+                return Ok(Some(ethernet));
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) async fn send_management(
         &mut self,
         frame: &[u8],

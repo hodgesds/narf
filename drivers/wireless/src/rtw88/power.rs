@@ -58,14 +58,14 @@ const READ_GONE_U16: u16 = 0xFFFF;
 /// CR rearm.
 ///
 /// # Safety
-/// Caller owns the BAR0 MMIO exclusively for the duration of the
+/// Caller owns the BAR2 control MMIO exclusively for the duration of the
 /// call.
 pub unsafe fn baseline_power_on(mmio: &MmioRegion) -> Result<(), PowerError> {
     // Step 0: presence test. A fresh BAR window on absent silicon
     // returns all-FF on every read. `REG_SYS_FUNC_EN` is the lowest
     // 16-bit register guaranteed to exist regardless of PMU state,
     // so we sample it before issuing writes.
-    // SAFETY: identity-mapped MMIO; offset 0x0002 + 2 within BAR0.
+    // SAFETY: identity-mapped MMIO; offset 0x0002 + 2 within BAR2.
     let presence = unsafe { mmio.read16(REG_SYS_FUNC_EN) };
     if presence == READ_GONE_U16 {
         return Err(PowerError::DeviceGone);

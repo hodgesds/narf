@@ -9,7 +9,7 @@
 #     driver (L1 remap, MCU framing, WFDMA rings, firmware download, the
 #     WirelessNetIface scaffold) lives here.
 #   * `module`: built to a relocatable `.ko` via
-#     `cargo xtask build-module -p narf-drivers-wireless-mt76 \
+#     `cargo xtask build-module --package narf-drivers-wireless-mt76 \
 #        --no-default-features --features module`. The kernel crates drop from
 #     the graph; the driver registers through the `narf_register_pci_driver`
 #     KSYMTAB export (registration-only until the wireless datapath ABI lands).

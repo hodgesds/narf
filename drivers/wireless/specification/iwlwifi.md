@@ -1,18 +1,22 @@
 # iwlwifi — Specification
 
-> Status: **v0.4** (Stage 4 baseline: Interface traits + background
-> pumps + hardware ring initialization + scan scaffold).
+> Status: **v0.5** (AX210+ transport and Sc MLD station profile;
+> target hardware validation pending).
 >
-> GPL-2.0-or-later driver for Intel Wi-Fi 6 / 6E PCIe host
-> controllers (AX200 / AX201 / AX210 / AX211 / AX411 + Killer 1690).
+> GPL-2.0-or-later driver for Intel PCIe wireless host controllers
+> (AX200 / AX201 / AX210 / AX211 / AX411, Bz/BE200 and Sc/BE211).
 > Adapted directly from Linux `drivers/net/wireless/intel/iwlwifi/`
 > source.
 
 ## 1. Purpose & scope
 
-**Owns:** Bring-up and operational control of Intel AX2xx-class
+**Owns:** Bring-up and operational control of Intel AX2xx/BE2xx-class
 radios. Implements `narf_net::Interface` and
 `narf_wireless::WirelessNetIface`.
+
+The current Gen3 runtime includes AX210/Bz/Sc transport initialization and
+an MLD station profile. The separate Gen2 probe remains gated; existing
+software tests do not establish hardware acceptance for either path.
 
 **Does NOT own (any stage):** mac80211-equivalent stack,
 802.11 frame parsing/building (lives in `narf_net`), regulatory
@@ -40,9 +44,22 @@ addressing scheme. Commands (e.g., `SCAN_REQ_UMAC`) are enqueued
 as TFDs with a specific command header.
 
 ### 2.5 ALIVE Handshake
-The driver polls for the `ALIVE` notification (Status `0xCAFE`)
-after releasing the device CPU. Reached successfully on all
-supported families.
+After making boot DMA visible and enabling DMA/interrupts, the runtime
+publishes the context and IML addresses and sets `CSR_AUTO_FUNC_BOOT_ENA`.
+It must then release the embedded CPU: AX210 writes `UREG_CPU_INIT_RUN=1`
+through the 32-bit UMAC peripheral window at `0xd05c44`; Bz/Sc writes
+`CSR_FUNC_SCRATCH=0x01010101` before setting `CSR_GP_CNTRL.ROM_START` (bit
+7). Both control-register updates preserve existing ownership, clock and
+access bits. Automatic function boot alone does not release the CPU.
+The same sequence applies after a transport restart.
+
+The driver waits asynchronously for the DMA-delivered `ALIVE` notification
+(status `0xCAFE`) with a bounded timeout. Exact register order, address
+width and preservation of existing control bits have software regressions;
+successful ALIVE and subsequent radio operation still require silicon
+validation. Reference: Linux
+`pcie/gen1_2/trans-gen2.c::iwl_trans_pcie_gen2_start_fw` and
+`pcie/ctxt-info-v2.c::iwl_pcie_ctxt_info_v2_kick`.
 
 ## 3. Stage Progression
 
@@ -50,8 +67,10 @@ supported families.
 - **Stage 2**: CSR/PRPH mapping + APM init + ucode header parsing.
 - **Stage 3**: Firmware loading (Gen2/Gen3) + ALIVE handshake.
 - **Stage 4**: Interface traits, IPC ring integration, background
-  RX/TX pumps, and scan/association skeletons.
-- **Stage 5 (Planned)**: Full 802.11 data path + scan parsing.
+  RX/TX pumps, and the MLD station scan/association/data implementation.
+- **Stage 5 (In progress)**: First hardware boot/ALIVE, firmware init,
+  scan, station association and IP-traffic acceptance. Software tests
+  exercise these contracts without emulating the Intel radio.
 
 ## 4. References
 

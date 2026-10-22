@@ -1,18 +1,14 @@
 //! RTW88 PCI probe.
 //!
-//! Driver-match registration + BAR0 / BAR2 mapping. Mirrors the layout
-//! Linux uses in `drivers/net/wireless/realtek/rtw88/pci.c`
-//! (`rtw_pci_probe`, ~L1620..L1750 in v6.6): the chip exposes
-//!   - BAR0 (32-bit, 64 KiB) — register window,
-//!   - BAR2 (32-bit, 16 KiB) — secondary data window for the
-//!     8822C-class parts (used for TX/RX bookkeeping; baseline maps
-//!     it so the follow-up commit doesn't have to re-probe).
+//! Driver-match registration and BAR2 control-register mapping, matching
+//! Linux `rtw88/pci.c::rtw_pci_io_mapping` (`bar_id = 2`). BAR2 is
+//! the register aperture; firmware bytes cannot be copied into it as SRAM.
 //!
 //! What this file does *not* do, intentionally:
 //!   - MSI/MSI-X vector setup. The baseline is "chip detected + MAC
 //!     readable"; IRQ delivery lands with the TX/RX ring follow-up.
-//!   - Firmware load. Deferred — there's no `narf-firmware` blob
-//!     registered for RTW88 yet.
+//!   - Firmware load. The reserved-page DMA transport and parsed firmware
+//!     sections are not implemented, so the probe does not invoke a loader.
 
 #![allow(dead_code)]
 
@@ -23,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{map_bar_control, BarError, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -37,12 +33,11 @@ use super::efuse;
 use super::power;
 use super::regs::*;
 
-/// One bound RTW88 device. Holds the BAR0/BAR2 mappings + the EFUSE-
+/// One bound RTW88 device. Holds the BAR2 register mapping + the EFUSE-
 /// derived MAC. Single-instance for the baseline (every laptop ships
 /// at most one of these); multi-radio comes with the follow-up.
 pub struct Rtw88Device {
-    pub mmio_bar0: MmioRegion,
-    pub mmio_bar2: Option<MmioRegion>,
+    pub registers: MmioRegion,
     pub mac: [u8; MAC_ADDR_LEN],
     /// PCI device id we matched on — controls per-chip quirks in
     /// follow-up commits. Today it just feeds `name_for`.
@@ -122,7 +117,7 @@ impl core::fmt::Debug for Rtw88Device {
         f.debug_struct("Rtw88Device")
             .field("mac", &self.mac)
             .field("device_id", &self.device_id)
-            .field("bar2_present", &self.mmio_bar2.is_some())
+            .field("registers", &self.registers)
             .finish_non_exhaustive()
     }
 }
@@ -130,10 +125,10 @@ impl core::fmt::Debug for Rtw88Device {
 /// Errors raised by the baseline probe path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProbeError {
-    /// `map_bar(device, 0)` failed. Most likely the BAR isn't
-    /// implemented at all (wrong device) or the cap-list claim raced
-    /// another driver.
-    Bar0MapFailed,
+    /// The mandatory BAR2 control window could not be mapped.
+    RegisterBarMapFailed,
+    /// BAR2 cannot cover the registers used by baseline power and EFUSE.
+    RegisterBarTooSmall,
     /// Power-on / chip-reset prologue failed. See [`power::PowerError`].
     PowerOn(power::PowerError),
     /// EFUSE read failed. See [`efuse::EfuseError`].
@@ -206,75 +201,57 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
-/// Bring the chip up: map BAR0, run baseline power-on, map BAR2, read
+/// Keep the runtime BAR choice and minimum register extent in one place.
+/// The injected mapper lets smokes verify selection without touching host
+/// PCI configuration or changing the global bus registry.
+pub(super) fn map_registers_with(
+    device: &BusDevice,
+    map_control: impl FnOnce(&BusDevice, u8) -> Result<MmioRegion, BarError>,
+) -> Result<MmioRegion, ProbeError> {
+    // Linux rtw_pci_io_mapping uses PCI BAR2 on all supported rtw88 chips.
+    let registers = map_control(device, 2).map_err(|_| ProbeError::RegisterBarMapFailed)?;
+    if registers.len < REG_CR + core::mem::size_of::<u16>() as u64 {
+        return Err(ProbeError::RegisterBarTooSmall);
+    }
+    Ok(registers)
+}
+
+/// Bring the chip up: map BAR2 registers, run baseline power-on, read
 /// MAC from EFUSE. Pure-IO; no TX/RX ring setup.
 ///
 /// # Safety
 /// Caller owns the device's BARs exclusively.
 pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
     // SAFETY: caller-asserted BAR exclusivity.
-    let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    let registers = map_registers_with(device, |device, index| {
+        // SAFETY: bring_up's caller owns this PCI function and its BARs.
+        unsafe { map_bar_control(device, index) }
+    })?;
 
     // Power-on prologue. Some parts (notably 8821CE on certain BIOSes)
     // arrive in a fully-powered state and the prologue is a no-op;
     // others arrive in D3cold and need the PWR-state walk. Baseline
     // does the minimum cross-part prologue — full per-chip table
     // lands in the follow-up.
-    // SAFETY: BAR0 mapped + owned.
+    // SAFETY: BAR2 control registers mapped + owned.
     unsafe {
-        power::baseline_power_on(&mmio_bar0).map_err(ProbeError::PowerOn)?;
+        power::baseline_power_on(&registers).map_err(ProbeError::PowerOn)?;
     }
 
-    // Map BAR2 *after* power-on. The 8821C / 8822B / 8822C parts
-    // gate BAR2 visibility on the SYS clock being live (which the
-    // prologue ensures). Failure here is non-fatal — the baseline
-    // doesn't actually touch BAR2 yet.
-    // SAFETY: caller-asserted BAR exclusivity.
-    let mmio_bar2 = unsafe { map_bar(device, 2) }.ok();
+    // Decode the sparse physical EFUSE map and select this chip's PCI MAC.
+    // SAFETY: BAR2 control registers mapped, power-on done.
+    let mac =
+        unsafe { efuse::read_mac(&registers, device.id.device) }.map_err(ProbeError::Efuse)?;
 
-    // Read MAC from logical EFUSE offset 0.
-    // SAFETY: BAR0 mapped, power-on done.
-    let mac = unsafe { efuse::read_mac(&mmio_bar0) }.map_err(ProbeError::Efuse)?;
-
-    // ── Stage 2: Firmware load ──
-    let auth = match narf_firmware::trusted_loader_authority() {
-        Some(a) => a.derive().ok(),
-        None => None,
-    };
-    if let Some(auth) = auth {
-        // SAFETY: `mmio_bar0` is the powered-on, owned BAR0 mapping and
-        // `mmio_bar2` (if `Some`) the owned BAR2 mapping from `map_bar`;
-        // `download_firmware` only touches those device registers, and the
-        // `auth` token gates this to firmware the trusted loader vouched for.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        match unsafe {
-            super::fw::download_firmware(&mmio_bar0, mmio_bar2.as_ref(), device.id.device, &auth)
-        } {
-            Ok(()) => {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  rtw88: firmware loaded successfully"
-                );
-            }
-            Err(e) => {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  rtw88: firmware load failed: {:?}",
-                    e
-                );
-            }
-        }
-    }
+    // Firmware transport is not implemented. In particular, BAR2 is a
+    // register window, not a destination for whole firmware blob writes.
 
     // Initialize IPC rings.
     let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
     let device_obj = Arc::new(Rtw88Device {
-        mmio_bar0,
-        mmio_bar2,
+        registers,
         mac,
         device_id: device.id.device,
         link_up: AtomicBool::new(false),
@@ -285,8 +262,7 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
     narf_wireless::registry::register(device_obj.clone());
 
     Ok(Rtw88Device {
-        mmio_bar0,
-        mmio_bar2,
+        registers,
         mac,
         device_id: device.id.device,
         link_up: AtomicBool::new(false),
