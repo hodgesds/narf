@@ -378,6 +378,23 @@ failure before any gating writes from a partial transition. The older
 `Gating(DeviceGone)` capture lacks that information, so its exact failure and
 the physical black screen remain unresolved by this source audit.
 
+The October 23 `plasma-25ea18c1-b779-479e-b312-fe4af7f58481` capture confirms
+early 4.7 GHz calibration and a reported native HDMI mode. It gets past the
+journal/Plymouth read-write jobs and attempts `kwin_wayland` at 172 seconds.
+The gating failure is `RLC_CGTT_MGCG_OVERRIDE`, BAR5 byte offset `0x3b120`,
+after ten writes; that register address matches the Linux GC 10.3 header.
+These observations do not establish a visible image or successful greeter.
+
+For that boot, the useful additional artifact was `/var/lib/plasmalogin/core`;
+there were no greeter text logs under its home. Its executable mappings match
+`/usr/lib/plasma-login-greeter`. The 46,096-byte file ends after 822 of 853
+program headers, before its notes, so it contains no saved fault registers or
+process-identity note. The core writer now places notes immediately after the
+ELF header, batches metadata into one sequential write, and emits a
+`coredump: fatal ...` kernel record before file I/O. This improves the next
+capture; it does not fix or identify the underlying greeter fault. Preserve
+the core's timestamp and collect the new record before planning another fix.
+
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 
 ```sh

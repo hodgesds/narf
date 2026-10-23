@@ -1751,6 +1751,19 @@ checked before parsing) and a value in `[0, pid_max]` (`EINVAL`), and sets the
 cursor to `value + 1`. It is published in every build. `pid_max` is one global
 value shared by all namespaces (Linux 6.14+ keeps it per namespace).
 
+Userspace core dumps honor `RLIMIT_CORE` and emit ELF64 metadata with
+`PT_NOTE` data immediately after the ELF header, before the VMA program-header
+table. Metadata is written as one sequential buffer (retrying short writes),
+so a partial dump preserves process identity and raw register notes before a
+large table or memory payload. A nonempty write returning zero is a failure.
+`NT_PRSTATUS` currently contains the architecture's raw `user_regs_struct`,
+not Linux's full `elf_prstatus`; `NT_PRPSINFO` and optional `NT_AUXV` accompany
+it. Full Linux `NT_PRSTATUS`, `NT_SIGINFO`, and `NT_FILE` remain unsupported.
+Before optional core-file I/O, a fatal-path kernel record reports pid/tid,
+executable, signal, instruction/stack pointers and diagnostic registers even
+when `RLIMIT_CORE` disables the file. Ordinary traps and syscalls do not emit
+that record.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.
