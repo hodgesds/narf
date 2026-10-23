@@ -113,6 +113,19 @@ fn claim_once(claims: &mut Vec<narf_bus::BusAddr>, address: narf_bus::BusAddr) -
     Claim::New
 }
 
+/// Drop a claim recorded by `claim_once` after a failed initialization,
+/// so the host can be probed again instead of staying claimed forever.
+/// Returns `true` when the address was claimed (and is now released).
+fn release_claim(claims: &mut Vec<narf_bus::BusAddr>, address: narf_bus::BusAddr) -> bool {
+    match claims.iter().position(|claimed| *claimed == address) {
+        Some(index) => {
+            claims.remove(index);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Disable inherited DMA and decode before enabling the owned register
 /// aperture. Readback must establish each transition before the next one.
 fn configure_pio(
@@ -192,10 +205,29 @@ pub fn probe(
     authority
         .check_live()
         .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    let claim = claim_once(&mut CLAIMED.lock(), device.addr);
+    let address = device.addr;
+    let claim = claim_once(&mut CLAIMED.lock(), address);
     if claim == Claim::Existing {
         return Ok(());
     }
+    let result = probe_claimed(device, authority, claim);
+    if result.is_err() && claim == Claim::New {
+        // Initialization failed: drop the claim so the failure is not
+        // reboot-only — a later probe may retry this host.
+        release_claim(&mut CLAIMED.lock(), address);
+    }
+    result
+}
+
+/// Probe body for a host this call claimed (`Claim::New`) or that was
+/// turned away at the claim limit (`Claim::Full`, parked only). Split
+/// from `probe` so every error return funnels through the caller's
+/// claim-release path.
+fn probe_claimed(
+    device: BusDevice,
+    authority: Cap<BusDeviceCap, Write>,
+    claim: Claim,
+) -> Result<(), narf_bus::ProbeError> {
     configure_pio(claim == Claim::New, |clear, set| {
         if clear != 0 {
             narf_bus::pci::clear_command(&authority, &device, clear).map_err(|_| ())?;
@@ -290,6 +322,29 @@ mod tests {
     kernel_test_in!(
         "drivers/sdio/native",
         smoke_sdhci_pio_parking_and_duplicate_ownership
+    );
+
+    fn smoke_sdhci_failed_init_releases_host_claim() -> TestResult {
+        let address = narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0, 4, 0, 0));
+        let other = narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0, 5, 0, 0));
+        let mut claims = Vec::new();
+        if claim_once(&mut claims, address) != Claim::New
+            || release_claim(&mut claims, other)
+            || claims.len() != 1
+        {
+            return TestResult::Fail("releasing a foreign address dropped a live claim");
+        }
+        if !release_claim(&mut claims, address) || !claims.is_empty() {
+            return TestResult::Fail("failed init did not release the host claim");
+        }
+        if claim_once(&mut claims, address) != Claim::New || claims.len() != 1 {
+            return TestResult::Fail("retry after a failed init cannot re-claim the host");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/sdio/native",
+        smoke_sdhci_failed_init_releases_host_claim
     );
 
     fn smoke_sdhci_pci_slot_contract() -> TestResult {

@@ -28,9 +28,9 @@ use super::msgbuf::{
     WL_EVENT_SIZE,
 };
 use super::pcie::{
-    firmware_filename, name_for, register_pci_driver, ALL_DEV_IDS, BRCM_PCIE_43602_DEVICE_ID,
-    BRCM_PCIE_4365_DEVICE_ID, BRCM_PCIE_4366_DEVICE_ID, BRCM_PCIE_4371_DEVICE_ID,
-    BRCM_PCIE_4378_DEVICE_ID, BROADCOM_VENDOR,
+    claim_bdf, firmware_filename, name_for, register_pci_driver, release_bdf, Ownership,
+    ALL_DEV_IDS, BRCM_PCIE_43602_DEVICE_ID, BRCM_PCIE_4365_DEVICE_ID, BRCM_PCIE_4366_DEVICE_ID,
+    BRCM_PCIE_4371_DEVICE_ID, BRCM_PCIE_4378_DEVICE_ID, BROADCOM_VENDOR,
 };
 
 // ── PCI match table ────────────────────────────────────────────────
@@ -58,6 +58,40 @@ fn smoke_brcmfmac_pci_match_table() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/brcmfmac", smoke_brcmfmac_pci_match_table);
+
+// ── BDF ownership claim/release ───────────────────────────────────
+
+fn smoke_brcmfmac_failed_probe_releases_bdf_claim() -> TestResult {
+    let first = narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0, 2, 0, 0));
+    let second = narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0, 3, 0, 0));
+    let mut owner = None;
+    if claim_bdf(&mut owner, first) != Ownership::New
+        || claim_bdf(&mut owner, first) != Ownership::Existing
+        || claim_bdf(&mut owner, second) != Ownership::Extra
+    {
+        return TestResult::Fail("claim decision differs: new/existing/extra");
+    }
+    // A failed bring-up releases the claim: the same device may be
+    // retried, and releasing with a foreign address must not drop the
+    // live owner's claim (checked again after the re-claim below).
+    release_bdf(&mut owner, first);
+    if owner.is_some() || claim_bdf(&mut owner, second) != Ownership::New {
+        return TestResult::Fail("failed probe kept its BDF claimed forever");
+    }
+    release_bdf(&mut owner, first);
+    if owner != Some(second) || claim_bdf(&mut owner, first) != Ownership::Extra {
+        return TestResult::Fail("foreign release dropped the live owner's claim");
+    }
+    release_bdf(&mut owner, second);
+    if owner.is_some() || claim_bdf(&mut owner, first) != Ownership::New {
+        return TestResult::Fail("retry after a failed probe cannot claim the BDF");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmfmac_failed_probe_releases_bdf_claim
+);
 
 fn smoke_brcmfmac_name_for_known_ids() -> TestResult {
     if name_for(BRCM_PCIE_43602_DEVICE_ID) != "brcmfmac-43602" {
