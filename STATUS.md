@@ -70,6 +70,8 @@ software work. No off-box radio, DHCP or AP interoperability has been demonstrat
 All eleven in-tree families are covered by the current audit and dependency
 ledger in `drivers/wireless/specification/spec.md` and its family documents.
 Intel now sends versioned coexistence, SoC latency and awake-power setup.
+Its retained maintenance work progresses through synchronous packet service;
+stalled TX credit no longer prevents RX and cancelled waiters retain EAPOL work.
 MT76 retains cancelled work through bounded WFSYS reset, firmware reload and
 radio reinitialization, without replaying association or keys. Its coherent
 PCI backend and ownership models now build on x86_64 and aarch64; unsupported
@@ -82,8 +84,10 @@ control, scan, Open/WPA2 and bounded RX/TX. Board clocks/pins/regulators, gSPI
 host support and reset/reload/PM remain software work. Qualcomm ath10k reaches
 owned CE/BMI firmware/BDF/OTP, PLL and code-swap preparation, retained HTC
 runtime and versioned WMI service-ready/host-memory/INIT/READY, followed by
-retained HTT RX buffers and native TX/management completion. PFC events,
-security/decapsulation, WMI MLME and station attachment remain software work.
+retained HTT RX buffers and native TX/management completion. A retained WMI
+radio session now performs correlated passive scans across six dialects while
+servicing HTT completions. PFC events, security/decapsulation, remaining WMI
+MLME and station attachment remain software work.
 Ath9k programs AR9285 inactive PHY/PLL/RF INI and EEPROM modal tables with
 current-capability register access. Ath11k QCA6390 has its native
 IPQ8074 RX path and four-vdev resources; QCN9074 remains gated.
@@ -92,10 +96,13 @@ firmware/MAC/BB/RF/LLT plus LC/IQK worker and bounded native RTW89 TX ownership.
 Production AES-CCM, shared CCMP AAD/replay corrections and checked per-key/TID
 station wrappers provide software crypto prerequisites; channel/power and
 native station paths remain incomplete. RTL8188EU now has a persistent native
-packet receipt/stop owner; channel/power binding and station composition remain.
+packet receipt/stop owner, channel1/XTAL initialization and a bounded shared
+management association plan. Native RX/management service binding, verified
+transmit-power policy and station composition remain.
 RTL8188EE has a retained native firmware worker; packet DMA/RF remain closed.
-RTW89 has checked owned AX firmware selection and cold-power/DDV primitives;
-secure-fuse, DLE/HFC/CH12/WCPU composition and station work remain. Its diagnostic
+RTW89 has checked owned AX firmware selection, cold-power/DDV primitives and
+fuse-selected immutable header/section download plans with host blacklist
+enforcement. DLE/HFC/CH12/WCPU composition and station work remain. Its diagnostic
 probe retains unpublished storage without activating rings, IRQs or a NIC.
 USB retains published address/configuration/control/bulk DMA, checks slot
 generations and implements explicit Stop/Set-Dequeue fencing for the supported
@@ -108,8 +115,8 @@ cannot be closed by physical testing alone. No physical device validation is
 part of the current software-only work.
 
 The software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared wireless
-and crypto QEMU gates: x86_64 reports 1635 pass / 0 fail / 11 skip;
-aarch64 reports 939 pass / 0 fail / 3 skip.
+and crypto QEMU gates: x86_64 reports 1666 pass / 0 fail / 11 skip;
+aarch64 reports 970 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.

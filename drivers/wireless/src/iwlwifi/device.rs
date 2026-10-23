@@ -2,9 +2,15 @@
 //! waits drain RX themselves and never depend on another executor task.
 
 use super::connection::{Beacon, Connection};
+use super::progress::{PendingTx, Transmit, Work};
 use super::{runtime::Hardware, scan_api, station_api};
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::{
+    future::{poll_fn, Future},
+    pin::Pin,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    task::{Context, Poll, Waker},
+};
 use narf_ipc::{Consumer, Producer};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
@@ -15,6 +21,7 @@ use narf_wireless::{
 
 pub struct Device {
     state: Mutex<State>,
+    control: Mutex<Option<Work>>,
     mac: [u8; 6],
     irq_vector: Option<u8>,
     channels: Vec<u8>,
@@ -48,6 +55,63 @@ struct State {
     needs_reset: bool,
     producer: Option<Producer<Frame, RX_RING_N>>,
     eapol: VecDeque<Vec<u8>>,
+    tx: [Option<Consumer<Frame, TX_RING_N>>; 4],
+    pending: [Option<PendingTx<Frame>>; 4],
+    tx_progress: bool,
+}
+
+impl State {
+    fn clear_transmit(&mut self) {
+        self.pending = core::array::from_fn(|_| None);
+        self.tx_progress = false;
+        for consumer in self.tx.iter_mut().flatten() {
+            for _ in 0..TX_RING_N {
+                if !matches!(consumer.try_recv(), Ok(Some(_))) {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn progress_transmit(&mut self, mut cx: Option<&mut Context<'_>>) -> Result<(), &'static str> {
+        self.tx_progress = false;
+        let Some(connection) = self.connection.as_mut().filter(|c| c.authorized) else {
+            self.clear_transmit();
+            return Ok(());
+        };
+        for category in 0..4 {
+            if self.pending[category].is_none() {
+                if let Some(consumer) = &mut self.tx[category] {
+                    let frame = if let Some(cx) = cx.as_deref_mut() {
+                        match Pin::new(&mut consumer.recv()).poll(cx) {
+                            Poll::Ready(Ok(frame)) => Some(frame),
+                            _ => None,
+                        }
+                    } else {
+                        consumer.try_recv().ok().flatten()
+                    };
+                    self.pending[category] = frame.map(PendingTx::new);
+                }
+            }
+            if let Some(pending) = &self.pending[category] {
+                match pending.progress(|frame| {
+                    connection.try_enqueue_for_ac(
+                        &mut self.hardware,
+                        frame.payload(),
+                        Some(category),
+                    )
+                })? {
+                    Transmit::Sent => {
+                        self.pending[category] = None;
+                        self.tx_progress = true;
+                    }
+                    Transmit::Busy => {}
+                    Transmit::Expired => return Err("TX queue credit timed out"),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Device {
@@ -80,7 +144,11 @@ impl Device {
                 needs_reset: false,
                 producer: None,
                 eapol: VecDeque::new(),
+                tx: core::array::from_fn(|_| None),
+                pending: core::array::from_fn(|_| None),
+                tx_progress: false,
             }),
+            control: Mutex::new(None),
             mac,
             irq_vector,
             channels: nvm.channels,
@@ -130,6 +198,7 @@ impl Device {
         self.set_link(false);
         state.needs_reset = true;
         state.connection = None;
+        state.clear_transmit();
         state.eapol.clear();
         let mut parsed =
             super::parse_ucode(&self.firmware).map_err(|_| WirelessError::HardwareError)?;
@@ -165,6 +234,9 @@ impl Device {
         {
             let mut state = self.state.try_lock().expect("unpublished interface");
             state.producer = Some(rx_producer);
+            for (category, consumer) in tx_consumers {
+                state.tx[category as usize] = Some(consumer);
+            }
         }
         {
             let mut active = ACTIVE.lock();
@@ -183,12 +255,6 @@ impl Device {
         narf_scheduler::spawn(async move {
             device.pump().await;
         });
-        for (category, consumer) in tx_consumers {
-            let device = self.clone();
-            narf_scheduler::spawn(async move {
-                device.transmit_pump(consumer, category as usize).await;
-            });
-        }
         Ok(())
     }
 
@@ -220,13 +286,21 @@ impl Device {
     /// Nonblocking drain used both by the executor and synchronous IP
     /// waits. Dispatch to the network stack only after releasing state:
     /// an ARP/ICMP response can call send_frame synchronously.
-    fn step(&self) -> Vec<Vec<u8>> {
+    fn step(self: &Arc<Self>, mut cx: Option<&mut Context<'_>>) -> Vec<Vec<u8>> {
         let mut output = Vec::new();
+        let mut fallback = Context::from_waker(Waker::noop());
+        if self
+            .poll_control(cx.as_deref_mut().unwrap_or(&mut fallback))
+            .is_pending()
+        {
+            return output;
+        }
         let Some(mut state) = self.state.try_lock() else {
             return output;
         };
         if state.needs_reset {
             state.hardware.fail();
+            state.clear_transmit();
         }
         let State {
             hardware,
@@ -236,6 +310,7 @@ impl Device {
             ..
         } = &mut *state;
         if hardware.poll().is_err() {
+            state.clear_transmit();
             self.set_link(false);
             return output;
         }
@@ -283,42 +358,55 @@ impl Device {
         } else {
             hardware.notifications.clear();
         }
+        let maintenance = !state.needs_reset
+            && !state.hardware.is_failed()
+            && state.connection.as_ref().is_some_and(|connection| {
+                connection.authorized
+                    && (!state.eapol.is_empty() || connection.maintenance_pending())
+            });
+        if maintenance {
+            self.start_control();
+        } else if !self.link_up() {
+            state.clear_transmit();
+        } else if state.progress_transmit(cx.as_deref_mut()).is_err() {
+            state.hardware.fail();
+            state.needs_reset = true;
+            state.clear_transmit();
+            self.set_link(false);
+        }
+        drop(state);
+        if maintenance {
+            let _ = self.poll_control(cx.unwrap_or(&mut fallback));
+        }
         output
     }
 
-    async fn transmit_pump(
-        self: Arc<Self>,
-        mut consumer: Consumer<Frame, TX_RING_N>,
-        category: usize,
-    ) {
-        // recv registers the ring waker; queued Ethernet frames need no
-        // timer tick or radio interrupt to start transmission.
-        while let Ok(frame) = consumer.recv().await {
-            let mut state = self.state.lock().await;
-            if state.needs_reset {
-                continue;
-            }
-            let State {
-                hardware,
-                connection,
-                ..
-            } = &mut *state;
-            if let Some(connection) = connection {
-                let _ = connection
-                    .enqueue_wait_for_ac(hardware, frame.payload(), category)
-                    .await;
-            }
-        }
+    /// The slot owns the complete future, including its device-state guard.
+    /// Polling an external waiter is never required for firmware progress.
+    fn poll_control(&self, cx: &mut Context<'_>) -> Poll<()> {
+        super::progress::poll_work(&self.control, cx)
     }
 
-    async fn pump(self: Arc<Self>) {
-        loop {
-            let activity = super::iwl_msix::Activity::new(self.irq_vector, 100);
-            for mut frame in self.step() {
-                narf_net::iface::on_rx_frame_from(self.name(), &mut frame);
+    async fn finish_control(&self) {
+        poll_fn(|cx| self.poll_control(cx)).await;
+    }
+
+    fn start_control(self: &Arc<Self>) {
+        let Some(mut slot) = self.control.try_lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let device = self.clone();
+        *slot = Some(Work::new(async move {
+            let mut state = device.state.lock().await;
+            if state.needs_reset || state.hardware.is_failed() {
+                return;
             }
-            {
-                let mut state = self.state.lock().await;
+            // An unexpected drop of the retained owner also fails closed.
+            state.needs_reset = true;
+            let result = async {
                 let State {
                     hardware,
                     connection,
@@ -330,29 +418,53 @@ impl Device {
                         let Some(frame) = eapol.pop_front() else {
                             break;
                         };
-                        if connection.handle_eapol(hardware, &frame).await.is_err() {
-                            connection.authorized = false;
-                            self.set_link(false);
-                        }
+                        connection.handle_eapol(hardware, &frame).await?;
                     }
-                    if connection.service_aggregation(hardware).await.is_err() {
-                        connection.authorized = false;
-                        self.set_link(false);
-                    }
+                    connection.service_aggregation(hardware).await?;
                 } else {
                     eapol.clear();
                 }
+                Ok::<(), &'static str>(())
             }
-            let pending = {
-                let state = self.state.lock().await;
-                !state.hardware.is_failed()
-                    && (state.hardware.has_pending_rx() || !state.hardware.notifications.is_empty())
-            };
-            if pending {
-                narf_scheduler::yield_now().await;
+            .await;
+            if result.is_err() {
+                state.hardware.fail();
+                if let Some(connection) = &mut state.connection {
+                    connection.authorized = false;
+                }
+                state.clear_transmit();
+                device.set_link(false);
             } else {
-                activity.await;
+                state.needs_reset = false;
             }
+        }));
+    }
+
+    async fn pump(self: Arc<Self>) {
+        loop {
+            let mut activity = super::iwl_msix::Activity::new(self.irq_vector, 100);
+            // Re-enter step on every wake, including IPC producer and retained
+            // control wakes. Awaiting Activity alone would swallow those wakes
+            // until the next unrelated radio interrupt or fallback timer.
+            let frames = poll_fn(|cx| {
+                let frames = self.step(Some(cx));
+                let pending = self.state.try_lock().is_some_and(|state| {
+                    !state.hardware.is_failed()
+                        && (state.hardware.has_pending_rx()
+                            || !state.hardware.notifications.is_empty()
+                            || state.tx_progress)
+                });
+                if !frames.is_empty() || pending || Pin::new(&mut activity).poll(cx).is_ready() {
+                    Poll::Ready(frames)
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            for mut frame in frames {
+                narf_net::iface::on_rx_frame_from(self.name(), &mut frame);
+            }
+            narf_scheduler::yield_now().await;
         }
     }
 }
@@ -480,7 +592,8 @@ impl WirelessNetIface for Device {
             }
             channels
         };
-        let mut state = self.state.lock().await;
+        self.finish_control().await;
+        let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
         if state.needs_reset
             || state.hardware.is_failed()
             || state
@@ -663,7 +776,8 @@ impl WirelessNetIface for Device {
         if request.ssid.len() > 32 || request.bssid[0] & 1 != 0 {
             return Err(WirelessError::InvalidArgs);
         }
-        let mut state = self.state.lock().await;
+        self.finish_control().await;
+        let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
         if state.needs_reset
             || state.hardware.is_failed()
             || state
@@ -723,7 +837,10 @@ impl WirelessNetIface for Device {
 
     async fn disassociate(&self) -> Result<(), WirelessError> {
         self.set_link(false);
-        let mut state = self.state.lock().await;
+        self.finish_control().await;
+        let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
+        state.clear_transmit();
+        state.eapol.clear();
         if let Some(connection) = state.connection.take() {
             state.needs_reset = true;
             connection
@@ -752,7 +869,8 @@ impl WirelessNetIface for Device {
             // handshake itself; nl80211 never builds this for it).
             narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
         };
-        let mut state = self.state.lock().await;
+        self.finish_control().await;
+        let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
         // Roaming requires an existing association to reassociate away from.
         let Some(old) = state.connection.take() else {
             return Err(WirelessError::InvalidArgs);
@@ -775,11 +893,16 @@ impl WirelessNetIface for Device {
                 return Err(WirelessError::InvalidArgs);
             }
         };
-        // Tear down the old firmware state/keys, then reassociate to the new
-        // BSS (Reassociation Request carries the previous AP address). The
-        // netdev link stays up across the transition — no disconnect event.
+        // Close the carrier before replacing peer/queue/key authority.
+        // Reassociation still carries the previous AP address.
+        self.set_link(false);
+        state.clear_transmit();
+        state.eapol.clear();
         state.needs_reset = true;
-        let _ = old.disconnect(&mut state.hardware).await;
+        if old.disconnect(&mut state.hardware).await.is_err() {
+            state.hardware.fail();
+            return Err(WirelessError::HardwareError);
+        }
         let bssid = request.bssid;
         match Connection::associate(
             &mut state.hardware,
@@ -813,7 +936,8 @@ impl WirelessNetIface for Device {
         if config.tx_power_dbm.is_some() {
             return Err(WirelessError::NotSupported);
         }
-        let state = self.state.lock().await;
+        self.finish_control().await;
+        let state = self.state.try_lock().ok_or(WirelessError::Busy)?;
         if state
             .connection
             .as_ref()
@@ -835,31 +959,19 @@ fn send_frame(bytes: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     if !device.link_up() {
         return Err(());
     }
-    if let Some(mut state) = device.state.try_lock() {
-        let State {
-            hardware,
-            connection,
-            ..
-        } = &mut *state;
-        if let Some(connection) = connection {
-            return connection.enqueue(hardware, bytes).map_err(|_| ());
-        }
-        return Err(());
-    }
-    // Control commands can briefly own state across await. Queue the
-    // packet without blocking an IRQ-disabled network caller.
+    // All ordinary data follows the same bounded queue/credit path. In
+    // particular, no direct send may overtake a pending packet or a rekey.
     let buffer = super::runtime::dma_alloc(bytes.len()).map_err(|_| ())?;
     let mut frame = Frame::new(buffer, bytes.len() as u32);
     frame.payload_mut().copy_from_slice(bytes);
     let category = super::qos::Parameters::default()
         .classify(bytes)
         .ok_or(())?;
-    let result = device.tx[category]
-        .lock()
-        .as_mut()
-        .ok_or(())?
-        .try_send(frame)
-        .map_err(|_| ());
+    let mut producer = device.tx[category].lock();
+    if !device.link_up() {
+        return Err(());
+    }
+    let result = producer.as_mut().ok_or(())?.try_send(frame).map_err(|_| ());
     result
 }
 
@@ -867,7 +979,7 @@ fn drain_network() -> bool {
     let Some(device) = ACTIVE.lock().clone() else {
         return false;
     };
-    let frames = device.step();
+    let frames = device.step(None);
     let progress = !frames.is_empty();
     for mut frame in frames {
         narf_net::iface::on_rx_frame_from(device.name(), &mut frame);
@@ -896,3 +1008,7 @@ impl Interface for RegisteredDevice {
         self.0.tx_ring()
     }
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "device_tests.rs"]
+mod tests;

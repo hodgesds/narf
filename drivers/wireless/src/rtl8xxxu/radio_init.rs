@@ -214,6 +214,9 @@ pub(super) async fn configure<I: ControlIo>(
     }
     o.write8(r::REG_SECURITY_CFG, 0).await?;
     power(o, f, 1).await?;
+    // Establish the first 20MHz radio channel/crystal before LC/IQK while
+    // MAC packet gates are closed. A later policy owner controls activation.
+    super::channel_runtime::initial20(o, f, 1).await?;
     update8(o, r::REG_LEDCFG2, 0, r::LEDCFG2_DPDT_SELECT as u8).await?;
     o.write8(r::REG_HWSEQ_CTRL, 0xff).await?;
     o.write32(r::REG_BAR_MODE_CTRL, 0x0201ffff).await?;

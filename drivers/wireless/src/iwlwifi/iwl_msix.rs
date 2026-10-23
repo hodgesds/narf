@@ -233,10 +233,12 @@ impl Drop for Interrupts {
 pub struct Activity {
     irq: Option<narf_interrupts::wait::WaitForIrq>,
     timer: narf_time::SleepUntil,
+    yielded: bool,
 }
 impl Activity {
     pub fn new(vector: Option<u8>, max_ms: u64) -> Self {
         Self {
+            yielded: false,
             irq: vector.map(narf_interrupts::wait::wait_for_irq),
             timer: narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
                 if vector.is_some() { max_ms } else { 1 } * 1_000_000,
@@ -247,6 +249,14 @@ impl Activity {
 impl Future for Activity {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // A retained firmware future may be driven by a synchronous drain.
+        // Always yield once per wait, even if an IRQ stream is already ready,
+        // so one poll cannot spin through an unbounded sequence of completions.
+        if !self.yielded {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
         if let Some(irq) = self.irq.as_mut() {
             if Pin::new(irq).poll(cx).is_ready() {
                 return Poll::Ready(());
@@ -260,6 +270,27 @@ impl Future for Activity {
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_iwl_activity_yields_before_an_already_ready_timer() -> TestResult {
+        let mut activity = Activity {
+            irq: None,
+            timer: narf_time::sleep_cycles(0),
+            yielded: false,
+        };
+        let mut cx = Context::from_waker(core::task::Waker::noop());
+        if Pin::new(&mut activity).poll(&mut cx).is_ready()
+            || Pin::new(&mut activity).poll(&mut cx).is_pending()
+        {
+            return TestResult::Fail(
+                "firmware wait skipped bounded yield or lost ready completion",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/progress",
+        smoke_iwl_activity_yields_before_an_already_ready_timer
+    );
+
     #[derive(Default)]
     struct Mmio(alloc::collections::BTreeMap<u32, u32>);
     impl IwlMmio for Mmio {
@@ -294,18 +325,30 @@ mod tests {
         smoke_msix_real_offsets_and_bz_causes
     );
     fn smoke_msix_completion_before_wait_poll() -> TestResult {
+        struct Wakes(core::sync::atomic::AtomicUsize);
+        impl alloc::task::Wake for Wakes {
+            fn wake(self: alloc::sync::Arc<Self>) {
+                self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let vector = narf_interrupts::vector::alloc().expect("test IRQ vector");
         narf_interrupts::dispatch::enable_irq(vector);
         let mut activity = Activity::new(Some(vector), 10_000);
         // Device completion arrives after the ring was inspected, before
-        // the driver first polls its wait. It must not sleep until timeout.
+        // the driver first polls its wait. The mandatory bounded yield must
+        // self-wake, then deliver that captured completion without a timeout.
         narf_interrupts::dispatch::on_irq(vector);
-        let mut cx = Context::from_waker(core::task::Waker::noop());
+        let wakes = alloc::sync::Arc::new(Wakes(core::sync::atomic::AtomicUsize::new(0)));
+        let waker = core::task::Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let yielded = Pin::new(&mut activity).poll(&mut cx).is_pending();
+        let self_woken = wakes.0.load(core::sync::atomic::Ordering::Relaxed) != 0;
         let ready = Pin::new(&mut activity).poll(&mut cx).is_ready();
         drop(activity);
+        narf_interrupts::dispatch::disable_irq(vector);
         let _ = narf_interrupts::vector::free(vector);
-        if !ready {
-            return TestResult::Fail("completion before wait poll was lost");
+        if !yielded || !self_woken || !ready {
+            return TestResult::Fail("captured IRQ lost after bounded self-waking yield");
         }
         TestResult::Pass
     }

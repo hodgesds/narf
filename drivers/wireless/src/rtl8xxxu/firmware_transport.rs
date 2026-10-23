@@ -36,6 +36,8 @@ pub enum Error {
     LltTimeout,
     RadioRead,
     Calibration,
+    RuntimeBusy,
+    RuntimeState,
     CamTimeout,
     AlreadyStarted,
     InvalidImage,
@@ -61,6 +63,9 @@ pub enum Stage {
     InitializingTables,
     Calibrating,
     RadioReady,
+    StartingReceive,
+    Receiving,
+    ReceiveStopped,
     Failed,
 }
 
@@ -167,6 +172,8 @@ pub struct Owner<I: ControlIo> {
     status: IrqSafeSpinLock<Status>,
     factory: IrqSafeSpinLock<Option<super::device_init::Factory>>,
     calibration: IrqSafeSpinLock<Option<CalibrationInfo>>,
+    endpoints: IrqSafeSpinLock<Option<super::device_init::Endpoints>>,
+    runtime_taken: AtomicBool,
 }
 
 impl<I: ControlIo> core::fmt::Debug for Owner<I> {
@@ -201,6 +208,8 @@ impl<I: ControlIo> Owner<I> {
             started: AtomicBool::new(false),
             factory: IrqSafeSpinLock::new(None),
             calibration: IrqSafeSpinLock::new(None),
+            endpoints: IrqSafeSpinLock::new(None),
+            runtime_taken: AtomicBool::new(false),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
                 error: None,
@@ -306,6 +315,33 @@ impl<I: ControlIo> Owner<I> {
         *self.calibration.lock()
     }
 
+    pub fn endpoints(&self) -> Option<super::device_init::Endpoints> {
+        *self.endpoints.lock()
+    }
+
+    pub(super) fn claim_receive(&self) -> Result<(), Error> {
+        if self.status().stage != Stage::RadioReady {
+            return Err(Error::RuntimeState);
+        }
+        self.runtime_taken
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::RuntimeBusy)?;
+        self.stage(Stage::StartingReceive);
+        Ok(())
+    }
+    pub(super) fn receiving(&self) {
+        self.stage(Stage::Receiving);
+    }
+    pub(super) fn receive_stopped(&self) {
+        self.stage(Stage::ReceiveStopped);
+    }
+    pub(super) fn runtime_failed(&self, error: Error) {
+        *self.status.lock() = Status {
+            stage: Stage::Failed,
+            error: Some(error),
+        };
+    }
+
     async fn run_device_before(
         &self,
         blob: &[u8],
@@ -324,6 +360,7 @@ impl<I: ControlIo> Owner<I> {
                 return Err(Error::BadEndpoints);
             }
             let endpoints = super::device_init::endpoints(&config[..count])?;
+            *self.endpoints.lock() = Some(endpoints);
             let factory = super::device_init::factory(self).await?;
             *self.factory.lock() = Some(factory);
             self.stage(Stage::FactoryReady);

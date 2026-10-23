@@ -1,11 +1,12 @@
-//! Checked legacy 2.4/5 GHz station preparation and open authentication MLME.
+//! MT76 CONNAC2 station records plus the shared IEEE management plan.
 //! Firmware layouts follow Linux ecd997b0189a mt76_connac_mcu.{c,h}.
-//! This module prepares frames/commands; it does not authorize RF transmission
-//! or mark a WPA2 controlled port secure.
 use super::firmware_transport::ScanBss;
 use alloc::{vec, vec::Vec};
+use narf_wireless::association::JoinPlan as ManagementPlan;
+pub use narf_wireless::association::{validate_sme_ies, Error, Phase, SecurityMode};
+#[cfg(any(test, feature = "builtin"))]
 use narf_wireless::rsn::{self, RsnIe, Suite};
-
+#[cfg(any(test, feature = "builtin"))]
 const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
 
 /// CONNAC2 legacy TX rate, selected from the AP's validated basic rates.
@@ -31,7 +32,6 @@ pub enum Security {
     Open,
     Wpa2Psk { psk: [u8; 32] },
 }
-
 impl core::fmt::Debug for Security {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(if self.is_wpa2() {
@@ -41,56 +41,28 @@ impl core::fmt::Debug for Security {
         })
     }
 }
-
-/// Negotiated mode without retaining a PMK in a management-frame plan.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SecurityMode {
-    Open,
-    Wpa2Psk,
-}
-
-impl SecurityMode {
-    pub fn is_wpa2(self) -> bool {
-        matches!(self, Self::Wpa2Psk)
-    }
-}
-
 impl Security {
     #[inline]
     pub fn is_wpa2(&self) -> bool {
         matches!(self, Self::Wpa2Psk { .. })
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error {
-    InvalidBss,
-    UnsupportedRates,
-    UnsupportedSecurity,
-    Protocol,
-    Rejected(u16),
-    Busy,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
-    Prepared,
-    AwaitAuthentication,
-    AwaitAssociation,
-    Associated { aid: u16 },
-    Failed,
-}
-
-/// No PMK or temporal keys are stored in a frame/command plan.
+/// Retains MT76 record inputs; all IEEE frame preparation/transitions are
+/// delegated to the common plan, which stores no firmware/hardware state.
 #[derive(Debug)]
 pub struct JoinPlan {
-    own: [u8; 6],
+    common: ManagementPlan,
     peer: [u8; 6],
     channel: u8,
     security: SecurityMode,
     rates: u16,
     basic: u16,
-    auth: Vec<u8>,
-    assoc: Vec<u8>,
-    phase: Phase,
+}
+impl core::ops::Deref for JoinPlan {
+    type Target = ManagementPlan;
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
 }
 fn unicast(address: [u8; 6]) -> bool {
     address != [0; 6] && address[0] & 1 == 0
@@ -102,6 +74,7 @@ fn tlv(bytes: &mut Vec<u8>, id: u16, len: usize) -> usize {
     bytes[offset + 2..offset + 4].copy_from_slice(&(len as u16).to_le_bytes());
     offset
 }
+#[cfg(any(test, feature = "builtin"))]
 fn ies(
     mut bytes: &[u8],
     mut visit: impl FnMut(u8, &[u8]) -> Result<(), Error>,
@@ -115,43 +88,7 @@ fn ies(
     }
     Ok(())
 }
-
-/// Check the SME's optional IEs against the profile this driver actually
-/// negotiates. The driver supplies SSID/rates and its canonical RSNE; it must
-/// not silently discard a requested cipher, AKM, PMF requirement or PHY mode.
-pub(crate) fn validate_sme_ies(bytes: &[u8], protected: bool) -> Result<(), Error> {
-    if bytes.len() > 2048 {
-        return Err(Error::InvalidBss);
-    }
-    let mut rsn_seen = false;
-    ies(bytes, |id, body| match id {
-        0 | 1 | 50 => Err(Error::InvalidBss),
-        48 => {
-            if rsn_seen {
-                return Err(Error::InvalidBss);
-            }
-            rsn_seen = true;
-            let rsn = RsnIe::decode_body(body).ok_or(Error::InvalidBss)?;
-            if !protected || rsn != RsnIe::wpa2_psk_ccmp() {
-                return Err(Error::UnsupportedSecurity);
-            }
-            Ok(())
-        }
-        54..=56 | 244 => Err(Error::UnsupportedSecurity),
-        45 | 191 => Err(Error::UnsupportedRates),
-        255 if body.is_empty() => Err(Error::InvalidBss),
-        255 if body
-            .first()
-            .is_some_and(|id| matches!(*id, 35 | 36 | 108 | 109)) =>
-        {
-            Err(Error::UnsupportedRates)
-        }
-        221 if body.starts_with(&[0, 0x50, 0xf2, 1]) => Err(Error::UnsupportedSecurity),
-        221 if body.starts_with(&[0, 0x50, 0xf2, 2]) => Err(Error::UnsupportedRates),
-        221 if body.len() < 3 => Err(Error::InvalidBss),
-        _ => Ok(()),
-    })
-}
+#[cfg(any(test, feature = "builtin"))]
 fn management(subtype: u8, own: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
     let mut frame = vec![0; 24];
     frame[0] = subtype;
@@ -161,253 +98,55 @@ fn management(subtype: u8, own: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
     frame
 }
 impl JoinPlan {
-    pub fn phase(&self) -> Phase {
-        self.phase
-    }
-    pub fn channel(&self) -> u8 {
-        self.channel
-    }
-    pub fn security(&self) -> SecurityMode {
-        self.security
-    }
-    pub(crate) fn management_rate(&self) -> LegacyRate {
-        LegacyRate::lowest(self.basic)
-    }
-    /// Append validated optional SME elements before the first transmission.
-    /// Its RSNE is checked above and replaced by the driver's negotiated one.
-    pub(crate) fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if self.phase != Phase::Prepared {
-            return Err(Error::Busy);
-        }
-        validate_sme_ies(bytes, self.security.is_wpa2())?;
-        ies(bytes, |id, body| {
-            if id != 48 {
-                self.assoc.extend_from_slice(&[id, body.len() as u8]);
-                self.assoc.extend_from_slice(body);
-            }
-            Ok(())
-        })
-    }
     pub fn prepare(
         bss: &ScanBss,
         own: [u8; 6],
         ssid: &[u8],
         security: Security,
     ) -> Result<Self, Error> {
-        if !unicast(own)
-            || !unicast(bss.bssid)
-            || own == bss.bssid
-            || super::channel::band(bss.channel).is_none()
-            || ssid.is_empty()
-            || ssid.len() > 32
-            || (!bss.ssid.is_empty() && bss.ssid != ssid)
-            || bss.capability & 3 != 1
-        {
-            return Err(Error::InvalidBss);
-        }
-        let mut rates = 0u16;
-        let mut basic = 0u16;
-        let mut rate_ie = false;
-        let mut rsn = None;
-        let mut wpa = false;
-        let mut seen_ssid = false;
-        ies(&bss.information_elements, |id, body| {
-            match id {
-                0 => {
-                    if seen_ssid || body != bss.ssid {
-                        return Err(Error::InvalidBss);
-                    }
-                    seen_ssid = true;
-                }
-                1 | 50 => {
-                    if body.is_empty() || id == 1 && (rate_ie || body.len() > 8) {
-                        return Err(Error::InvalidBss);
-                    }
-                    rate_ie |= id == 1;
-                    for rate in body {
-                        if let Some(index) = RATES.iter().position(|local| *local == rate & 127) {
-                            rates |= 1 << index;
-                            if rate & 128 != 0 {
-                                basic |= 1 << index;
-                            }
-                        } else if rate & 128 != 0 {
-                            return Err(Error::UnsupportedRates);
-                        }
-                    }
-                }
-                48 => {
-                    if rsn.is_some() {
-                        return Err(Error::InvalidBss);
-                    }
-                    rsn = Some(RsnIe::decode_body(body).ok_or(Error::InvalidBss)?);
-                }
-                221 => wpa |= body.starts_with(&[0, 0x50, 0xf2, 1]),
-                _ => {}
-            }
-            Ok(())
-        })?;
-        if super::channel::band(bss.channel) == Some(super::channel::Band::Ghz5) {
-            if basic & 15 != 0 {
-                return Err(Error::UnsupportedRates);
-            }
-            rates &= !15;
-        }
-        if !seen_ssid || !rate_ie || rates == 0 || basic == 0 {
-            return Err(Error::UnsupportedRates);
-        }
-        let negotiated = match security {
-            Security::Open => {
-                if bss.capability & 0x10 != 0 || rsn.is_some() || wpa {
-                    return Err(Error::UnsupportedSecurity);
-                }
-                None
-            }
-            Security::Wpa2Psk { .. } => {
-                let rsn = rsn.ok_or(Error::UnsupportedSecurity)?;
-                if bss.capability & 0x10 == 0
-                    || rsn.group_cipher != Suite::standard(rsn::CIPHER_CCMP_128)
-                    || !rsn
-                        .pairwise_ciphers
-                        .contains(&Suite::standard(rsn::CIPHER_CCMP_128))
-                    || !rsn.akms.contains(&Suite::standard(rsn::AKM_PSK))
-                    || rsn.rsn_capabilities & (rsn::RSN_CAP_MFP_REQUIRED | rsn::RSN_CAP_NO_PAIRWISE)
-                        != 0
-                {
-                    return Err(Error::UnsupportedSecurity);
-                }
-                Some(RsnIe::wpa2_psk_ccmp().encode_body())
-            }
-        };
-        let mut auth = management(0xb0, own, bss.bssid);
-        auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
-        let mut assoc = management(0, own, bss.bssid);
-        // ESS, negotiated privacy, and only AP-supported short preamble/slot.
-        let optional = if super::channel::band(bss.channel) == Some(super::channel::Band::Ghz5) {
-            0x0400
+        let mode = if security.is_wpa2() {
+            SecurityMode::Wpa2Psk
         } else {
-            0x0420
+            SecurityMode::Open
         };
-        let capability =
-            1 | (bss.capability & optional) | if security.is_wpa2() { 0x10 } else { 0 };
-        assoc.extend_from_slice(&capability.to_le_bytes());
-        assoc.extend_from_slice(&5u16.to_le_bytes());
-        assoc.extend_from_slice(&[0, ssid.len() as u8]);
-        assoc.extend_from_slice(ssid);
-        let selected: Vec<_> = RATES
-            .iter()
-            .enumerate()
-            .filter_map(|(i, rate)| {
-                (rates & (1 << i) != 0)
-                    .then_some(*rate | if basic & (1 << i) != 0 { 128 } else { 0 })
-            })
-            .collect();
-        let split = selected.len().min(8);
-        assoc.extend_from_slice(&[1, split as u8]);
-        assoc.extend_from_slice(&selected[..split]);
-        if split < selected.len() {
-            assoc.extend_from_slice(&[50, (selected.len() - split) as u8]);
-            assoc.extend_from_slice(&selected[split..]);
-        }
-        if let Some(rsn) = negotiated {
-            assoc.extend_from_slice(&[48, rsn.len() as u8]);
-            assoc.extend_from_slice(&rsn);
-        }
+        let common = ManagementPlan::prepare(bss, own, ssid, mode)?;
+        let (rates, basic) = common.legacy_rates();
         Ok(Self {
-            own,
+            common,
             peer: bss.bssid,
             channel: bss.channel,
-            security: if security.is_wpa2() {
-                SecurityMode::Wpa2Psk
-            } else {
-                SecurityMode::Open
-            },
+            security: mode,
             rates,
             basic,
-            auth,
-            assoc,
-            phase: Phase::Prepared,
         })
     }
+    pub(crate) fn management_rate(&self) -> LegacyRate {
+        LegacyRate::lowest(self.basic)
+    }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
-        if self.phase != Phase::Prepared {
-            return Err(Error::Busy);
-        }
-        self.phase = Phase::AwaitAuthentication;
-        Ok(&self.auth)
+        self.common.start_authentication()
     }
-    fn response(&self, bytes: &[u8], subtype: u8) -> bool {
-        bytes.len() >= 24
-            && bytes[0] == subtype
-            && bytes[1] & 0xc7 == 0
-            && bytes[4..10] == self.own
-            && bytes[10..16] == self.peer
-            && bytes[16..22] == self.peer
-    }
-    /// Ignore other peers/subtypes; a matching rejection is terminal.
     pub fn authentication_response(&mut self, bytes: &[u8]) -> Result<Option<&[u8]>, Error> {
-        if self.phase != Phase::AwaitAuthentication {
-            return Err(Error::Busy);
-        }
-        if !self.response(bytes, 0xb0) {
-            return Ok(None);
-        }
-        if bytes.len() < 30 || bytes[24..28] != [0, 0, 2, 0] {
-            self.phase = Phase::Failed;
-            return Err(Error::Protocol);
-        }
-        let status = u16::from_le_bytes([bytes[28], bytes[29]]);
-        if status != 0 {
-            self.phase = Phase::Failed;
-            return Err(Error::Rejected(status));
-        }
-        self.phase = Phase::AwaitAssociation;
-        Ok(Some(&self.assoc))
+        self.common.authentication_response(bytes)
     }
-    /// Successful association does not authorize a WPA2 controlled port.
     pub fn association_response(&mut self, bytes: &[u8]) -> Result<Option<u16>, Error> {
-        if self.phase != Phase::AwaitAssociation {
-            return Err(Error::Busy);
-        }
-        if !self.response(bytes, 0x10) {
-            return Ok(None);
-        }
-        if bytes.len() < 30 {
-            self.phase = Phase::Failed;
-            return Err(Error::Protocol);
-        }
-        let status = u16::from_le_bytes([bytes[26], bytes[27]]);
-        if status != 0 {
-            self.phase = Phase::Failed;
-            return Err(Error::Rejected(status));
-        }
-        let capability = u16::from_le_bytes([bytes[24], bytes[25]]);
-        if capability & 3 != 1 || (capability & 0x10 != 0) != self.security.is_wpa2() {
-            self.phase = Phase::Failed;
-            return Err(Error::Protocol);
-        }
-        let raw = u16::from_le_bytes([bytes[28], bytes[29]]);
-        let aid = raw & 0x3fff;
-        if raw & 0xc000 != 0xc000
-            || !(1..=2007).contains(&aid)
-            || ies(&bytes[30..], |_, _| Ok(())).is_err()
-        {
-            self.phase = Phase::Failed;
-            return Err(Error::Protocol);
-        }
-        self.phase = Phase::Associated { aid };
-        Ok(Some(aid))
+        self.common.association_response(bytes)
     }
     pub fn cancel(&mut self) {
-        self.phase = Phase::Failed;
+        self.common.cancel();
     }
-
+    pub(crate) fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.common.append_sme_ies(bytes)
+    }
     /// Initial unencrypted AP record: CONN_STATE_CONNECT, never PORT_SECURE.
     /// Native RX remains enabled so later EAPOL processing sees full MPDUs.
     pub fn peer_record(&self, aid: u16, associated: bool) -> Result<Vec<u8>, Error> {
         if aid > 2007 || associated && aid == 0 {
             return Err(Error::Protocol);
         }
-        if self.phase == Phase::Failed || associated && self.phase != (Phase::Associated { aid }) {
+        if self.phase() == Phase::Failed
+            || associated && self.phase() != (Phase::Associated { aid })
+        {
             return Err(Error::Busy);
         }
         if !associated && aid != 0 {
@@ -455,14 +194,6 @@ impl JoinPlan {
         Ok(out)
     }
 
-    pub fn rsn_body(&self) -> Option<Vec<u8>> {
-        if self.security.is_wpa2() {
-            Some(RsnIe::wpa2_psk_ccmp().encode_body())
-        } else {
-            None
-        }
-    }
-
     /// Emits a completed station record for WCID 1 containing CCMP-128
     /// key installation and CONN_STATE_PORT_SECURE.
     pub fn secure_peer_record(&self, aid: u16, key: &[u8]) -> Result<Vec<u8>, Error> {
@@ -484,7 +215,6 @@ impl JoinPlan {
         Ok(out)
     }
 }
-
 /// The VIF's BMC WCID (19), used for received group keys. Linux uses the
 /// station's AP address for this record, not a fabricated multicast peer.
 pub fn group_record(peer: [u8; 6], aid: u16) -> Result<Vec<u8>, Error> {

@@ -25,7 +25,8 @@
 //!
 //! Calibrated BMI image preparation now reaches retained runtime CE DMA,
 //! HTC credit/endpoint negotiation and native WMI service-ready/INIT/READY.
-//! Native HTT setup, retained RX/TX DMA and event progress follow WMI READY.
+//! Native HTT setup and retained RX/TX DMA follow WMI READY, then a retained
+//! vdev/passive-scan owner uses per-dialect WMI commands and management RX.
 //! Station management/security, admission and recovery remain open.
 //! Older standalone codecs below are not the production activation path.
 //!
@@ -89,6 +90,7 @@ pub mod profile;
 mod swap;
 pub mod wmi;
 pub mod wmi_boot;
+pub mod wmi_runtime;
 
 pub use hw::{HwRev, ALL_PCI_MATCHES, ATHEROS_VENDOR, UBNT_VENDOR};
 pub use pci::{name_for, probe, register_pci_driver, Ath10kDevice, ProbeError};

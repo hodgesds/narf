@@ -31,9 +31,13 @@ pub struct PreparedFirmware {
     sections: [FwSection; FWDL_SECTION_MAX_NUM],
     header: FwHeader,
     name: &'static str,
+    chip: ChipId,
 }
 
 impl PreparedFirmware {
+    pub fn chip(&self) -> ChipId {
+        self.chip
+    }
     pub fn image(&self) -> &[u8] {
         &self.bytes[self.image.clone()]
     }
@@ -147,5 +151,6 @@ fn prepare(
         sections,
         header,
         name,
+        chip,
     })
 }

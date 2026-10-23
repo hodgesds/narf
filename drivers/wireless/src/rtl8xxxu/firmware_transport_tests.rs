@@ -928,3 +928,328 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu",
     smoke_rtl8188eu_rejects_erased_gain_and_absent_radio
 );
+
+fn smoke_rtl8188eu_initial_channel20_and_factory_crystal() -> TestResult {
+    let io = Fake::new();
+    {
+        let mut m = io.0.lock();
+        m.regs[0x603] = 0xa0;
+        m.regs[0x800..0x804].copy_from_slice(&0x12345679u32.to_le_bytes());
+        m.regs[0x900..0x904].copy_from_slice(&0xfedcba99u32.to_le_bytes());
+        m.regs[0x24..0x28].copy_from_slice(&0xf1234567u32.to_le_bytes());
+        m.rf[0x18] = 0xf0781;
+    }
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+    let f = super::device_init::Factory {
+        cut: 0,
+        mac: [2, 0, 0, 0, 0, 1],
+        cck_power: [32; 6],
+        ht40_power: [31; 5],
+        crystal_cap: 0x23,
+        channel_plan: 0,
+        thermal: 0,
+        board_option: 0,
+    };
+    if narf_scheduler::block_on(super::channel_runtime::initial20(&owner, f, 13)).is_err() {
+        return TestResult::Fail("initial channel20 rejected");
+    }
+    let m = io.0.lock();
+    let word = |r: usize| u32::from_le_bytes(m.regs[r..r + 4].try_into().unwrap());
+    if m.regs[0x603] != 0xa4
+        || word(0x800) != 0x12345678
+        || word(0x900) != 0xfedcba98
+        || m.rf[0x18] != 0xf0c0d
+        || word(0x24) != 0xf1471d67
+        || word(0x100) & 0xc0 != 0
+    {
+        return TestResult::Fail(
+            "Linux first-channel width/RF/crystal or closed MAC contract differs",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/channel",
+    smoke_rtl8188eu_initial_channel20_and_factory_crystal
+);
+
+fn smoke_rtl8188eu_initial_channel_rejects_invalid_or_live_mac() -> TestResult {
+    for channel in [0, 14, 255] {
+        let io = Fake::new();
+        let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+        let f = super::device_init::Factory {
+            cut: 0,
+            mac: [2, 0, 0, 0, 0, 1],
+            cck_power: [32; 6],
+            ht40_power: [31; 5],
+            crystal_cap: 0x23,
+            channel_plan: 0,
+            thermal: 0,
+            board_option: 0,
+        };
+        if narf_scheduler::block_on(super::channel_runtime::initial20(&owner, f, channel))
+            != Err(Error::BadEfuse)
+            || !io.0.lock().ops.is_empty()
+        {
+            return TestResult::Fail("invalid initial channel touched USB");
+        }
+    }
+    let io = Fake::new();
+    io.0.lock().regs[0x100] = 0x80;
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+    let f = super::device_init::Factory {
+        cut: 0,
+        mac: [2, 0, 0, 0, 0, 1],
+        cck_power: [32; 6],
+        ht40_power: [31; 5],
+        crystal_cap: 0x23,
+        channel_plan: 0,
+        thermal: 0,
+        board_option: 0,
+    };
+    if narf_scheduler::block_on(super::channel_runtime::initial20(&owner, f, 1))
+        != Err(Error::Calibration)
+        || io
+            .0
+            .lock()
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Write(_, _)))
+    {
+        return TestResult::Fail("live RX was silently retuned or relabelled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/channel",
+    smoke_rtl8188eu_initial_channel_rejects_invalid_or_live_mac
+);
+
+#[derive(Default)]
+struct BulkState {
+    next: u64,
+    active: Option<u64>,
+    pending_stop: bool,
+    starts: usize,
+    stops: usize,
+}
+#[derive(Clone)]
+struct Bulk {
+    control: Fake,
+    state: Arc<IrqSafeSpinLock<BulkState>>,
+}
+impl Bulk {
+    fn new(control: Fake) -> Self {
+        Self {
+            control,
+            state: Arc::new(IrqSafeSpinLock::new(BulkState::default())),
+        }
+    }
+}
+#[async_trait::async_trait]
+impl super::packet_transport::Io for Bulk {
+    type Receipt = u64;
+    fn begin_receive(&self, dci: u8, length: usize) -> Result<u64, UsbError> {
+        let mut m = self.state.lock();
+        if m.active.is_some() || dci != 3 || length != 4096 {
+            return Err(UsbError::Stall);
+        }
+        m.next += 1;
+        let id = m.next;
+        m.active = Some(id);
+        m.starts += 1;
+        self.control.0.lock().ops.push(Op::Write(0xfffe, vec![dci]));
+        Ok(id)
+    }
+    fn poll_receive(&self, receipt: &u64, _: &mut [u8]) -> Result<Option<usize>, UsbError> {
+        if self.state.lock().active == Some(*receipt) {
+            Ok(None)
+        } else {
+            Err(UsbError::Stall)
+        }
+    }
+    fn begin_send(&self, _: u8, _: &[u8]) -> Result<u64, UsbError> {
+        panic!("receive-only owner attempted TX")
+    }
+    fn poll_send(&self, _: &u64) -> Result<Option<usize>, UsbError> {
+        panic!("receive-only owner attempted TX")
+    }
+    async fn stop(&self, r: &u64) -> Result<(), UsbError> {
+        let pending = {
+            let mut m = self.state.lock();
+            if m.active != Some(*r) {
+                return Err(UsbError::Stall);
+            }
+            m.stops += 1;
+            self.control.0.lock().ops.push(Op::Write(0xfffd, vec![]));
+            m.pending_stop
+        };
+        if pending {
+            core::future::pending::<()>().await;
+        }
+        self.state.lock().active = None;
+        Ok(())
+    }
+}
+fn receive_permission() -> super::receive_runtime::Permission {
+    super::receive_runtime::Permission::from_domain(&narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![narf_wireless::reg::RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2422,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 0,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        }],
+    })
+    .unwrap()
+}
+fn prepared_receiver() -> (
+    Fake,
+    Arc<Owner<Fake>>,
+    Bulk,
+    super::receive_runtime::Receiver<Fake, Bulk>,
+) {
+    let control = Fake::new();
+    let owner = Arc::new(Owner::new(control.clone(), ChipFamily::Rtl8188eu));
+    narf_scheduler::block_on(owner.initialize_device(&image(123))).unwrap();
+    let bulk = Bulk::new(control.clone());
+    let receiver =
+        super::receive_runtime::Receiver::new(owner.clone(), bulk.clone(), receive_permission())
+            .unwrap();
+    (control, owner, bulk, receiver)
+}
+fn smoke_rtl8188eu_receiver_composes_claim_rx_gate_and_proven_stop() -> TestResult {
+    use super::receive_runtime::Phase;
+    let (control, owner, bulk, mut receiver) = prepared_receiver();
+    control.0.lock().ops.clear();
+    if narf_scheduler::block_on(receiver.start()).is_err()
+        || receiver.phase() != Phase::Receiving
+        || owner.status().stage != Stage::Receiving
+        || receiver.channel() != 1
+    {
+        return TestResult::Fail("composed radio/packet owner did not enter receiving");
+    }
+    for _ in 0..1000 {
+        if receiver.poll() != Ok(None) {
+            return TestResult::Fail("quiet RX cancelled or invented MPDU");
+        }
+    }
+    {
+        let m = control.0.lock();
+        let posted = m
+            .ops
+            .iter()
+            .position(|op| matches!(op, Op::Write(0xfffe, _)))
+            .unwrap();
+        let opened = m
+            .ops
+            .iter()
+            .position(|op| matches!(op,Op::Write(0x100,v)if v[0]&0xc0==0x80))
+            .unwrap();
+        if posted >= opened || bulk.state.lock().starts != 1 || m.regs[0x100] & 0xc0 != 0x80 {
+            return TestResult::Fail(
+                "MAC RX opened before persistent buffer ownership or TX opened",
+            );
+        }
+    }
+    control.0.lock().ops.clear();
+    if narf_scheduler::block_on(receiver.stop()).is_err()
+        || receiver.phase() != Phase::Stopped
+        || owner.status().stage != Stage::ReceiveStopped
+        || bulk.state.lock().active.is_some()
+    {
+        return TestResult::Fail("successful host stop did not retain paused radio state");
+    }
+    {
+        let m = control.0.lock();
+        let closed = m
+            .ops
+            .iter()
+            .position(|op| matches!(op,Op::Write(0x100,v)if v[0]&0xc0==0))
+            .unwrap();
+        let stopped = m
+            .ops
+            .iter()
+            .position(|op| matches!(op, Op::Write(0xfffd, _)))
+            .unwrap();
+        if closed >= stopped {
+            return TestResult::Fail("USB stop preceded MAC RX gate closure");
+        }
+    }
+    if narf_scheduler::block_on(receiver.start()).is_err()
+        || receiver.channel() != 1
+        || bulk.state.lock().starts != 2
+    {
+        return TestResult::Fail("same-channel proven pause could not restart");
+    }
+    if super::receive_runtime::Receiver::new(owner, bulk, receive_permission()).is_ok() {
+        return TestResult::Fail("second receiver acquired live radio controls");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/receive",
+    smoke_rtl8188eu_receiver_composes_claim_rx_gate_and_proven_stop
+);
+
+fn smoke_rtl8188eu_receiver_cancel_after_real_rx_gate_td_is_terminal() -> TestResult {
+    use super::receive_runtime::Phase;
+    let (control, owner, bulk, mut receiver) = prepared_receiver();
+    control.0.lock().pending_write = Some(0x100);
+    {
+        let mut f = Box::pin(receiver.start());
+        if f.as_mut().poll(&mut Context::from_waker(Waker::noop())) != Poll::Pending
+            || bulk.state.lock().active.is_none()
+            || !control.0.lock().active_td
+        {
+            return TestResult::Fail("start cancellation did not reach submitted EP0 gate TD");
+        }
+    }
+    let before = control.0.lock().ops.len();
+    if receiver.phase() != Phase::Failed
+        || owner.status().error != Some(Error::Cancelled)
+        || narf_scheduler::block_on(receiver.start()).is_ok()
+        || narf_scheduler::block_on(receiver.stop()).is_ok()
+        || control.0.lock().ops.len() != before
+        || bulk.state.lock().stops != 0
+        || control.0.lock().unsafe_reuses != 0
+    {
+        return TestResult::Fail("cancelled EP0 activation performed cleanup or reused native RX");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/receive",
+    smoke_rtl8188eu_receiver_cancel_after_real_rx_gate_td_is_terminal
+);
+
+fn smoke_rtl8188eu_receiver_cancel_after_mac_closed_and_stop_submitted() -> TestResult {
+    use super::receive_runtime::Phase;
+    let (control, owner, bulk, mut receiver) = prepared_receiver();
+    narf_scheduler::block_on(receiver.start()).unwrap();
+    bulk.state.lock().pending_stop = true;
+    {
+        let mut f = Box::pin(receiver.stop());
+        if f.as_mut().poll(&mut Context::from_waker(Waker::noop())) != Poll::Pending
+            || control.0.lock().regs[0x100] & 0xc0 != 0
+            || bulk.state.lock().stops != 1
+        {
+            return TestResult::Fail("stop cancellation did not reach actual submitted host stop");
+        }
+    }
+    let before = control.0.lock().ops.len();
+    if receiver.phase() != Phase::Failed
+        || owner.status().error != Some(Error::Cancelled)
+        || bulk.state.lock().active.is_none()
+        || narf_scheduler::block_on(receiver.start()).is_ok()
+        || control.0.lock().ops.len() != before
+    {
+        return TestResult::Fail("cancelled host stop reclaimed receipt or reopened receive gate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/receive",
+    smoke_rtl8188eu_receiver_cancel_after_mac_closed_and_stop_submitted
+);

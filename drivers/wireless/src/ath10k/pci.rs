@@ -50,6 +50,9 @@ pub struct Ath10kDevice {
     /// Negotiated HTT with retained RX/fragment memory; station still closed.
     pub htt_ready: Option<super::htt_runtime::Ready>,
     pub htt_error: Option<super::htt_runtime::Error>,
+    /// Real retained vdev/passive channel setup; no station or carrier.
+    pub scan_ready: Option<super::wmi_runtime::ScanReady>,
+    pub scan_error: Option<super::wmi_runtime::Error>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -131,11 +134,17 @@ struct HttSession {
     image: super::firmware::Image,
     profile: super::profile::Profile,
 }
+struct RadioSession {
+    radio: super::wmi_runtime::Radio<super::boot::PciBoot>,
+    image: super::firmware::Image,
+    profile: super::profile::Profile,
+}
 enum DriverSession {
     Boot(BootSession),
     Runtime(RuntimeSession),
     Wmi(WmiSession),
     Htt(HttSession),
+    Radio(RadioSession),
 }
 static SESSION: narf_lib::mutex::Mutex<Option<DriverSession>> = narf_lib::mutex::Mutex::new(None);
 
@@ -225,6 +234,53 @@ async fn initialize_htt(
     };
     let ready = runtime.htt.start().await;
     (DriverSession::Htt(runtime), ready)
+}
+
+async fn initialize_radio(
+    owner: DriverSession,
+) -> (
+    DriverSession,
+    Result<super::wmi_runtime::ScanReady, super::wmi_runtime::Error>,
+) {
+    let DriverSession::Htt(htt) = owner else {
+        return (owner, Err(super::wmi_runtime::Error::Failed));
+    };
+    let dialect = match super::wmi_boot::Dialect::from_version(htt.image.wmi) {
+        Ok(dialect) => dialect,
+        Err(error) => {
+            return (
+                DriverSession::Htt(htt),
+                Err(super::wmi_runtime::Error::Wmi(error)),
+            )
+        }
+    };
+    let mut owner = RadioSession {
+        radio: super::wmi_runtime::Radio::new(htt.htt, dialect, htt.image.features),
+        image: htt.image,
+        profile: htt.profile,
+    };
+    let result = owner.radio.start_from_hardware().await;
+    (DriverSession::Radio(owner), result)
+}
+
+/// Receive-only native scan over the retained HTC/WMI/HTT owner. The caller
+/// supplies centre frequencies in MHz from the configured hardware channels.
+/// This diagnostic API grants neither station TX nor interface registration.
+/// Dropping this future closes further operations until a full owned reset.
+pub async fn scan_passive(
+    frequencies: &[u16],
+) -> Result<super::wmi_runtime::ScanReport, super::wmi_runtime::Error> {
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    let result = owner.radio.passive_scan(frequencies).await;
+    if let Err(error) = &result {
+        if let Some(controller) = CONTROLLER.lock().as_mut() {
+            controller.scan_error = Some(*error);
+        }
+    }
+    result
 }
 
 /// Human-readable driver name keyed on the matched `(vendor, device)`.
@@ -430,6 +486,8 @@ unsafe fn bring_up_live(
         wmi_error: None,
         htt_ready: None,
         htt_error: None,
+        scan_ready: None,
+        scan_error: None,
     })
 }
 
@@ -525,15 +583,35 @@ async fn boot_task(
                                         controller.wmi_ready = Some(ready);
                                     }
                                     let (owner, result) = initialize_htt(owner, hw).await;
-                                    *SESSION.lock().await = Some(owner);
                                     match result {
                                         Ok(ready) => {
                                             if let Some(controller) = CONTROLLER.lock().as_mut() {
                                                 controller.htt_ready = Some(ready);
                                             }
                                             let _=writeln!(narf_console::Writer,"  ath10k: HTT {}.{} with retained packet DMA; station registration pending",ready.major,ready.minor);
+                                            let (owner, result) = initialize_radio(owner).await;
+                                            *SESSION.lock().await = Some(owner);
+                                            match result {
+                                                Ok(ready) => {
+                                                    if let Some(controller) =
+                                                        CONTROLLER.lock().as_mut()
+                                                    {
+                                                        controller.scan_ready = Some(ready);
+                                                    }
+                                                    let _=writeln!(narf_console::Writer,"  ath10k: retained passive scan vdev with {} receive-only channels; station closed",ready.channels);
+                                                }
+                                                Err(error) => {
+                                                    if let Some(controller) =
+                                                        CONTROLLER.lock().as_mut()
+                                                    {
+                                                        controller.scan_error = Some(error);
+                                                    }
+                                                    let _=writeln!(narf_console::Writer,"  ath10k: retained passive scan setup failed: {:?}",error);
+                                                }
+                                            }
                                         }
                                         Err(error) => {
+                                            *SESSION.lock().await = Some(owner);
                                             if let Some(controller) = CONTROLLER.lock().as_mut() {
                                                 controller.htt_error = Some(error);
                                             }

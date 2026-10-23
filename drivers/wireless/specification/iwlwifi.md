@@ -117,6 +117,36 @@ cannot manufacture a successful ALIVE. The live Gen3 path still requires the exa
 DMA notification and supported command versions described above. Real object-table
 revocation fixtures exercise native dword bounds and actual RX/command/data queues.
 
+### 3.2 Shared synchronous/asynchronous runtime progress
+
+Ordinary TX has one retained packet and a two-second credit deadline per access
+category, with the four IPC consumers owned by device state. The common bounded
+step drains RFH completions first and attempts at most one packet per category.
+Lack of credit keeps the original packet and sequence number; no async task holds
+the state mutex while waiting for ordinary TX credits. Closed carrier, disconnect
+and recovery clear pending and queued packets before later station admission.
+
+EAPOL/key replacement and receive-aggregation commands retain a complete,
+driver-owned future. Both executor polls and synchronous network drains poll the
+same future before attempting device-state access. A dropped external waiter
+does not drop firmware/DMA/key ownership, and unrelated control operations return
+Busy while another caller owns state. Key work remains exclusive until terminal
+completion; errors fail the transport and close carrier. Existing TX drain,
+key-install completion, RX discard and replay-reset ordering is preserved.
+
+Each hardware Activity wait yields at least once, including when its IRQ/timer
+is already ready, so one retained-future poll cannot loop indefinitely through a
+continuous IRQ stream. The pump re-enters common progress on IPC/control wakes.
+Roam closes packet admission before replacing the previous peer/queue/key owner;
+a failed old disconnect prevents a new association until transport recovery.
+
+Tests cover retained waiter cancellation, bounded pending-packet retries, and
+actual Device.step over RFH/DataQueue completions: a full TX queue still delivers
+RX, validated credit resumes the exact pending packet, disconnect clears queued
+data, and an independent WPA2 M1 advances through a retained EAPOL TX receipt
+using synchronous drains after its async waiter is dropped. These are software
+ownership regressions and do not emulate radio or establish silicon acceptance.
+
 ## 4. References
 
 - Linux `drivers/net/wireless/intel/iwlwifi/`

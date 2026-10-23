@@ -63,6 +63,21 @@ headers and transport source under the repository's GPL-2.0 licensing.
 
 ## 3. Public Interface
 
+`association::{Bss, JoinPlan, SecurityMode, Phase}` supplies the shared
+legacy SoftMAC management plan extracted from MT76. It validates bounded AP
+IEs, SSID, supported/basic rates and Open or WPA2-PSK/CCMP negotiation, builds
+open-authentication and association requests, and binds responses to the
+local/AP addresses, transaction phase, status and AID. `SecurityMode` carries
+no PMK. Fragmented responses (including a final fragment with nonzero
+SequenceControl fragment number) leave the phase unchanged.
+`append_sme_ies` accepts checked optional elements before first TX;
+`legacy_rates()` returns IEEE-rate bitmaps rather than hardware indices.
+`association::channel` exposes the existing 2.4/5GHz legacy 20MHz geometry.
+Drivers retain their own rate-index mapping, radio/regulatory authority,
+firmware peer records, retained supplicant, key installation and controlled
+port. `Associated` alone grants none of those. MT76 preserves its existing
+public driver API through a wrapper; RTL8188EU uses the common plan directly.
+
 ### 3.1 Interface Specialization
 
 ```rust

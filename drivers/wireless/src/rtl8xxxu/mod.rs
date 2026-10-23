@@ -36,18 +36,21 @@ pub mod btcoex;
 mod calibration;
 mod calibration_regs;
 pub mod ccmp_runtime;
+mod channel_runtime;
 pub mod device_init;
 pub mod efuse;
 pub mod firmware_transport;
 pub mod fw;
 pub mod intr;
 pub mod mac;
+pub mod management_runtime;
 pub mod packet_codec;
 pub mod packet_transport;
 pub mod phy;
 pub mod phy_tables;
 mod radio_init;
 pub mod rate;
+pub mod receive_runtime;
 pub mod regs;
 pub mod rtl8188e;
 pub mod rtl8192e;
@@ -271,3 +274,6 @@ pub mod tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod firmware_transport_tests;
+
+#[cfg(feature = "kernel-test")]
+mod management_tests;

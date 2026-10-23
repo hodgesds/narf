@@ -48,12 +48,24 @@ version. Header/table/dynamic-extension/payload extents and indexed/formatted
 MSSC signature pools, including v1 DSP checksums, are checked before committing
 caller section output. A malformed image leaves that output untouched.
 `PreparedFirmware` keeps selected-image, payload and signature-pool offsets
-bound to one immutable owner. Its unsecured fixed-header preparation excludes
-dynamic bytes and updates part_size; multiple security sections are rejected
-until header compaction and payload selection are implemented together.
-Physical secure-fuse selection, blacklist enforcement and signature replacement
-remain mandatory before any secure download. Header H2C requests no runtime
-ACK; section chunks are raw firmware bytes without an invented H2C/last flag.
+bound to one immutable owner and physical chip profile. The private
+`DownloadPlan` combines that owner with successfully read physical secure
+fuses. Unknown programmed fuses fail explicitly; erased selection is accepted
+only after both actual DDV bytes are read. Indexed and formatted signatures
+use the Linux AX selection/stride rules, checked bitmap dimensions/rank and
+pool extents. Secure hardware requires a matching signature and a host
+blacklist at least as new as the image's version; B/C have the upstream
+version0 empty policy, while A/51 require an authenticated board policy.
+No missing policy or signature falls back to an unsecured transfer.
+
+The plan couples v1 ignored-security descriptor compaction/count with the
+same payload selection, strips host dynamic bytes and sets part_size2020.
+B's secure v0 length960 override changes both descriptor and payload; ambiguous
+checksum-bearing overrides and v0 ignored-descriptor cases fail explicitly.
+Signatures replace bytes only in owned output, preserving the verified image.
+Header H2C requests no runtime ACK; section chunks are raw firmware bytes
+without an invented H2C/last flag. This prepares transfers but does not
+establish CH12/WCPU ownership or start a download.
 
 `power::Power<Io>::power_on` ports the complete PCI RTL8852A byte table and
 RTL8852B/C/8851B power-on callbacks, including XTAL commands, cut/RFE/SPS
@@ -131,7 +143,7 @@ bring-up scaffolding and does not establish a working station runtime.
 |---|---|
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
 | Complete per-chip power/PCIe initialization | Native cold-power-on port and Linux-C trace checks implemented; probe composition, verified power-off/reset and PCIe/DLE/HFC setup remain |
-| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked owned AX file/container selection implemented; secure-fuse policy, CH12 owner and WCPU lifecycle remain |
+| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked owned AX selection, native fuse reads and coupled secure download plans implemented; CH12 owner and WCPU lifecycle remain |
 | Ring quiesce/publication, BDRAM setup, IRQ ownership and recovery | Incomplete |
 | AX initial native TX layout and bounded completion ownership | Shared production backend implemented and model-tested; not yet activated by station/firmware owner |
 | RPQ release handling, RX assembly/validation and frame delivery | Incomplete |

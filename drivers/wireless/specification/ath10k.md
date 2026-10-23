@@ -1,11 +1,12 @@
 # ath10k — Specification
 
-> Status: **ROM/HTC/WMI initialization implemented; WLAN software incomplete.**
+> Status: **ROM/HTC/WMI/HTT and passive scan implemented; WLAN software incomplete.**
 > The live PCI task obtains BMI identity, selects trusted firmware/BDF,
 > runs OTP calibration and downloads the image. It retains runtime CE DMA
 > before BMI_DONE, negotiates HTC endpoints, handles firmware host-memory
-> requests and completes WMI INIT/READY. HTT packet runtime, station control
-> and interface registration remain; this is not usable Wi-Fi.
+> requests and completes WMI INIT/READY. Retained HTT RX/TX and a passive
+> scan vdev follow. Station control/security, the live packet service and
+> interface registration remain; this is not usable Wi-Fi.
 
 ## 1. Purpose & scope
 
@@ -42,7 +43,20 @@ packet service are not yet attached.
   correlated successful READY MAC/version/status; `wmi_error` retains
   service/ABI/memory/INIT failures. `htt_ready` records a supported target
   version after retained native RX/fragment setup and aggregation configuration;
-  `htt_error` retains setup failure. No netdev is registered.
+  `htt_error` retains setup failure. `scan_ready` records submitted native
+  station-vdev0 and passive channel setup, without claiming a firmware
+  vdev-create acknowledgement; `scan_error` retains setup/scan failure.
+  No netdev is registered.
+- `pci::scan_passive(frequencies_mhz)` serializes a receive-only scan over
+  the retained physical HTC/WMI/HTT owner. It accepts only configured IEEE
+  2.4/5 GHz centre frequencies within SERVICE_READY hardware ranges. Channel
+  configuration uses PASSIVE and zero power; this does not infer a country
+  policy or grant station transmission. The API returns
+  `wmi_runtime::ScanReport` with bounded raw-IE `ScanBss` entries, SNR,
+  received/ignored counts and an explicit truncation flag. It correlates
+  firmware requestor/scan/vdev identities and never reuses a 12-bit scan ID
+  within an owner lifetime. A failed/malformed terminal, timeout or dropped
+  post-publication future closes that owner until full reset, retaining DMA.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
@@ -155,6 +169,17 @@ offload metadata. Raw RX metadata does not authorize a peer or controlled port.
 Current-authority checks precede DMA reads and producer republication.
 Cancelled setup/TX/progress and malformed completion state fail closed.
 
+The native `wmi_runtime::Radio` retains HTT while creating station vdev0 and
+programming receive-only channels. MAIN, 10.1, 10.2, 10.2.4, TLV and 10.4 use
+separate Linux command/event mappings; MAIN/10.4 scans include the burst
+word, 10.x omits it, and TLV uses its 100-byte common command plus native
+arrays and the inverted FILTER_PROBE_REQ flag. Management RX selects the
+24-byte legacy, 40-byte extended, 28-byte 10.4 or tagged TLV header, checks
+all advertised extents and optional timestamp tails, and validates beacon
+identity/IE/channel data before caching. Passive scan continues HTT terminal
+completion processing and retains unrelated events for the later station
+worker. It never opens a controlled port, enables carrier or installs keys.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
@@ -219,7 +244,12 @@ configuration and TX literals checked against independently compiled Linux
 structures, major-2 management, terminal TX ownership, idle progress,
 A-MSDU/chained RX, out-of-order PADDR ownership and malformed/duplicate batch
 retention. The composed models are architecture-neutral; they do not emulate
-a Qualcomm radio or establish reset/ROM interoperability.
+a Qualcomm radio or establish reset/ROM interoperability. Composed scan
+fixtures cover all six dialects through actual HTC/WMI/HTT, native vdev and
+channel/scan commands checked against independently compiled Linux C
+functions, production hardware-channel selection, two scans with distinct
+IDs, stale/wrong-requestor responses, malformed beacons, management header
+variants, concurrent terminal HTT completion and dropped/failed ownership.
 
 ## 8. Remaining software and hardware acceptance
 
@@ -234,12 +264,13 @@ The following are software work, not gates that a physical boot can close:
 3. A retained station worker composing the native packet/event owner with
    complete WMI operation handling, higher-capacity CE service, HIF IRQ/MSI,
    recovery and PM/teardown. HTT setup alone does not publish an interface.
-4. Station/runtime WMI maps beyond INIT/READY; HTT peer/BA/security routing,
+4. Station/runtime WMI maps beyond receive-only vdev/scan; HTT peer/BA/security routing,
    PFC fetch/mode/host-queue handling, native packet conversion, RX security
    and replay/reorder policy. Existing standalone WMI/HTT codecs are not the
    production station implementation.
-5. Regulatory/channel and scan/station control, management/EAPOL/key
-   exchange, packet conversion, and `WirelessNetIface`/netdev registration.
+5. Authenticated regulatory/channel policy and station control, active/
+   directed scan and richer scan options, management/EAPOL/key exchange,
+   packet conversion, and `WirelessNetIface`/netdev registration.
 
 After those are integrated, physical acceptance must exercise ROM/BMI,
 board calibration, IRQ/DMA, scan, association, IP traffic, link loss and

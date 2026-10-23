@@ -61,6 +61,7 @@ pub mod chan;
 pub mod datapath;
 mod ddv;
 pub mod dma;
+mod download_plan;
 pub mod efuse;
 mod firmware_registry;
 pub mod fw;
@@ -76,6 +77,7 @@ mod power_native;
 mod power_regs;
 mod power_tables;
 mod prepared;
+mod secure;
 pub mod tx_transport;
 pub mod txrx;
 

@@ -69,6 +69,17 @@ impl NativeIo {
         self.ddv = state;
         result
     }
+    /// Read actual physical secure selection, preserving DDV's retained failure
+    /// state. No erased or disabled-boot default is supplied on access failure.
+    pub async fn secure_fuses(
+        &mut self,
+    ) -> Result<super::secure::Fuses, super::download_plan::Error> {
+        let mut bytes = [0; 2];
+        self.read_physical(0x5ec, &mut bytes)
+            .await
+            .map_err(|_| super::download_plan::Error::Firmware(super::fw::FwError::Authority))?;
+        Ok(super::secure::Fuses::decode(self.chip, bytes[0], bytes[1])?)
+    }
 }
 impl Io for NativeIo {
     fn read8(&mut self, address: u32) -> Result<u8, Error> {

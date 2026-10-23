@@ -63,6 +63,7 @@ pub mod iwl_msix;
 pub mod mac_ctx;
 pub mod mlme;
 pub mod pnvm;
+mod progress;
 pub mod qos;
 pub mod rates;
 pub mod regs;

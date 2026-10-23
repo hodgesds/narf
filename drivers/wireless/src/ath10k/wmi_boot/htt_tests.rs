@@ -730,3 +730,6 @@ kernel_test_in!(
     "drivers/wireless/ath10k/htt-runtime",
     smoke_ath10k_htt_rx_republication_requires_live_authority
 );
+
+#[path = "radio_tests.rs"]
+mod radio_tests;

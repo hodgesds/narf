@@ -68,6 +68,36 @@ rejected. Signed IQ matrix, thermal meter and NAV setup finish initialization.
 Erased/out-of-range factory gain indices fail before gains are programmed.
 MAC TX/RX remain closed: radio-ready is not regulatory, scan or packet ready.
 
+The production table/calibration path now sets the initial 20MHz channel1
+and both factory crystal-cap fields before LC/IQK. `channel_runtime` rejects
+live MAC TX/RX and invalid channel geometry before channel writes. It does
+not implement retune or infer transmit power from factory gain indices.
+
+`receive_runtime::Receiver` composes the retained firmware and packet owners
+for policy-admitted channel1 reception. `Permission::from_domain` bounds
+the caller-authenticated regulatory profile and grants no TX gain authority.
+Construction requires radio-ready/full IQK, snapshots checked descriptors,
+and permanently claims the radio once. `start` posts persistent USB RX before
+opening and verifying MAC RX with TX still closed; `stop` verifies MAC closure
+before proven USB Stop/SetDeq. Only successful same-channel stop permits
+restart. Cancellation/transport failure is terminal without cleanup or a
+new claim; unretired USB receipts stay owned. Quiet polls preserve the TD.
+Unexpected hardware-decrypted metadata and non-MPDU reports do not reach
+native management/data dispatch. Firmware status adds starting-receive,
+receiving and receive-stopped states. This entry point is not yet bound to
+the probe's network service worker.
+
+`management_runtime::{Candidate, Join}` admits native channel1 beacon/probe
+identity and strictly bounded IEs, requiring a basic 1Mbps rate matching the
+actual Realtek descriptor's rate0. It uses the shared
+`narf_wireless::association::JoinPlan` for Open/WPA2 frame preparation and
+peer/phase/status/AID transitions, stamps software sequence numbers, and
+preserves the original AP RSNE/RSNXE separately for retained RSNA binding.
+Protected/decrypted/fragmented/HT/40MHz management frames and mismatched
+direction/address identity fail admission. A matching rejection or AP
+teardown terminates the plan. Returned management frames still require a
+policy-admitted transmitter; `Associated` does not open the controlled port.
+
 `ccmp_runtime::Key` is the software CCMP dependency for the pending station
 runtime. `Role::Pairwise` admits KeyID0; `Role::Group` admits IDs0–3 but is
 receive-only. TX requires ToDS, peer RA/local TA; RX requires FromDS, peer TA,
@@ -146,9 +176,11 @@ diagnostic with checked LC/IQK through the production probe. It is not ready for
 | Endpoint-descriptor selection and MAC FIFO/LLT | Implemented; activation/RX filters remain open |
 | MAC/BB/AGC/RF table application | Implemented with source-matched tables and checked transfers |
 | Checked post-table MAC, CAM-clear, LC/full IQK and factory gain indices | Implemented; composed owner/status/error/cancellation regressions |
-| Policy-admitted channel/power and RX activation | Missing; factory gain indices are not dBm policy |
+| Initial channel/crystal and retained RX activation | Implemented channel1 owner; probe/service binding remains |
+| Policy-admitted transmit power | Missing; factory gain indices are not dBm policy |
 | Native USB descriptor/packet ownership | Implemented dependency; persistent receipt/stop and Linux descriptor regressions |
-| Management TX/RX dispatch, passive scan and real station MLME | Missing; transport is not yet station-bound |
+| Native beacon/management preparation and peer-bound transitions | Implemented narrow channel1/basic1Mbps dependency using shared plan |
+| Production passive scan/MLME service and policy-admitted management TX | Missing; receive/management owners are not yet service-bound |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Missing |
 | Regulatory channel/power, rates, coexistence | Missing |

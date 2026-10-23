@@ -2,17 +2,7 @@
 //! mt76_connac_mcu.{c,h}, mt7921/{mac,mcu}.c and mt792x.h.
 use super::{station::Command, *};
 
-/// One validated beacon/probe response, retaining original IEs for the SME.
-#[derive(Clone, Debug)]
-pub struct ScanBss {
-    pub bssid: [u8; 6],
-    pub ssid: Vec<u8>,
-    pub channel: u8,
-    pub signal_dbm: Option<i8>,
-    pub capability: u16,
-    pub beacon_interval: u16,
-    pub information_elements: Vec<u8>,
-}
+pub use narf_wireless::association::Bss as ScanBss;
 /// A completed hardware scan; an empty result is not a fabricated network.
 #[derive(Clone, Debug)]
 pub struct ScanReport {

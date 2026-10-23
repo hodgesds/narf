@@ -924,6 +924,21 @@ impl Hardware {
         Err("RX did not quiesce across key replacement")
     }
 
+    pub(super) fn transmit_space(&self, id: u16) -> Result<bool, &'static str> {
+        if self.failed {
+            return Err("Wi-Fi transport failed");
+        }
+        if !self.mmio.authorized() {
+            return Err("Wi-Fi authority revoked");
+        }
+        self.resources
+            .data
+            .iter()
+            .find(|queue| queue.id() == Some(id))
+            .map(super::data_queue::DataQueue::has_space)
+            .ok_or("unknown TX queue")
+    }
+
     pub fn enqueue_transmit(
         &mut self,
         id: u16,
@@ -1135,3 +1150,7 @@ impl Drop for Hardware {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "runtime_tests.rs"]
 mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "runtime_model.rs"]
+pub(super) mod model;

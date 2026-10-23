@@ -88,6 +88,60 @@ impl core::fmt::Debug for AuthMethod {
 }
 
 impl Connection {
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn open_model() -> Self {
+        Self {
+            beacon: Beacon {
+                bssid: [4; 6],
+                ssid: Vec::new(),
+                channel: 1,
+                interval: 100,
+                dtim: 1,
+                rsn: None,
+                privacy: false,
+                capabilities: 1,
+                information_elements: Vec::new(),
+            },
+            local: [2; 6],
+            management_queue: 1,
+            data_queues: [None, Some(17), None, None],
+            qos: None,
+            sequence: 0,
+            security: None,
+            replay: frame_api::Replay::default(),
+            authorized: true,
+            last_beacon: narf_time::now_cycles(),
+            group_keys: [None; 4],
+            pairwise_key: None,
+            tx_antenna: 1,
+            rates: super::rates::Rates::parse(&[1, 1, 0x82], 1).unwrap(),
+            phy: super::ht_vht::Negotiated::default(),
+            local_phy: super::ht_vht::Local::from_nvm(0, 1, 1),
+            rx_ba: core::array::from_fn(|_| None),
+            actions: VecDeque::new(),
+            mfp: narf_wireless::mfp::MfpKeyStore::new(),
+            mfp_active: false,
+        }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn secure_model() -> Self {
+        let mut connection = Self::open_model();
+        connection.security = Some(security::Session::new(
+            security::Akm::Wpa2Psk,
+            [0x11; 32],
+            [4; 6],
+            [2; 6],
+            [0x33; 32],
+            narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body(),
+        ));
+        connection.beacon.privacy = true;
+        connection
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn sequence_for_test(&self) -> u16 {
+        self.sequence
+    }
+
     pub async fn associate(
         hw: &mut Hardware,
         local: [u8; 6],
@@ -616,30 +670,38 @@ impl Connection {
         ethernet: &[u8],
         ac: Option<usize>,
     ) -> Result<(), &'static str> {
+        if self.try_enqueue_for_ac(hw, ethernet, ac)? {
+            Ok(())
+        } else {
+            Err("TX queue full")
+        }
+    }
+
+    pub(super) fn try_enqueue_for_ac(
+        &mut self,
+        hw: &mut Hardware,
+        ethernet: &[u8],
+        ac: Option<usize>,
+    ) -> Result<bool, &'static str> {
         if !self.authorized {
             return Err("controlled port closed");
         }
         let (queue, frame, header) = self.ethernet_frame(ethernet, self.security.is_some(), ac)?;
+        if !hw.transmit_space(queue)? {
+            return Ok(false);
+        }
         hw.enqueue_transmit(queue, &frame, header, None)?;
         self.sequence = self.sequence.wrapping_add(1);
-        Ok(())
+        Ok(true)
     }
 
-    pub(super) async fn enqueue_wait_for_ac(
-        &mut self,
-        hw: &mut Hardware,
-        ethernet: &[u8],
-        ac: usize,
-    ) -> Result<(), &'static str> {
-        if !self.authorized {
-            return Err("controlled port closed");
-        }
-        let (queue, frame, header) =
-            self.ethernet_frame(ethernet, self.security.is_some(), Some(ac))?;
-        hw.wait_tx_space(queue).await?;
-        hw.enqueue_transmit(queue, &frame, header, None)?;
-        self.sequence = self.sequence.wrapping_add(1);
-        Ok(())
+    pub(super) fn maintenance_pending(&self) -> bool {
+        !self.actions.is_empty()
+            || self
+                .rx_ba
+                .iter()
+                .flatten()
+                .any(|window| window.expired(narf_time::now_cycles()))
     }
 
     fn ethernet_frame(

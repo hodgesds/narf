@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 use narf_net::Interface;
 
+pub mod association;
 pub mod caps;
 pub mod ccmp;
 pub mod eapol;
