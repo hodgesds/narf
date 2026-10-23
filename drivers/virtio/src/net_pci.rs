@@ -688,7 +688,13 @@ impl VirtioNetPci {
         let want_status = feats & (1u64 << VIRTIO_NET_F_STATUS) != 0;
         let want_mtu = feats & (1u64 << VIRTIO_NET_F_MTU) != 0;
         let want_csum = feats & (1u64 << VIRTIO_NET_F_CSUM) != 0;
-        let want_tso4 = want_csum && feats & (1u64 << VIRTIO_NET_F_HOST_TSO4) != 0;
+        // HOST_TSO4 is deliberately not negotiated (#703): since 49e47f4c3
+        // enabled it, every net-smoke bulk TCP echo wedges after
+        // ~110-200 KB and never recovers. CSUM alone is the configuration
+        // that passed net-smoke 15/15 before that commit. Re-enable only
+        // once #704 root-causes the TSO transmit wedge. The device offer
+        // this replaces: want_csum && feats & (1 << VIRTIO_NET_F_HOST_TSO4).
+        let want_tso4 = false;
         let want_ctrl_vq = feats & (1u64 << VIRTIO_NET_F_CTRL_VQ) != 0;
         // F_MQ requires F_CTRL_VQ (we can only command the device to
         // enable a pair count through the control queue). Reject MQ

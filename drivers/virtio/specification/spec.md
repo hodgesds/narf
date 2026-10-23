@@ -54,7 +54,9 @@ memory-window ownership and do not use this control-register path.
   recycler shared by independent queues.
 - The primary virtio-net interface advertises TX checksum offload only after
   negotiating `VIRTIO_NET_F_CSUM`, and IPv4/TCP TSO only after additionally
-  negotiating `VIRTIO_NET_F_HOST_TSO4`. A requested offload that was not
+  negotiating `VIRTIO_NET_F_HOST_TSO4`. `VIRTIO_NET_F_HOST_TSO4` is
+  currently not negotiated (#703: the TSO transmit path wedges under bulk
+  load; #704 tracks root-causing it before re-enabling). A requested offload that was not
   negotiated, is malformed, needs VLAN insertion, or exceeds the bounded
   64-KiB TX DMA frame is rejected before descriptor publication. The driver
   honors the frame-ring `TxMeta::more` batching hint while forcing a notify at
