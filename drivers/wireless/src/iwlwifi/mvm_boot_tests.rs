@@ -31,6 +31,9 @@ impl Fixture {
                 mac: None,
                 nvm: None,
                 beacons: Vec::new(),
+                channel: super::channel::ChannelContext::new(
+                    &super::super::firmware_api::FirmwareApi::default(),
+                ),
                 scan: super::scan::ScanContext::new(
                     &super::super::firmware_api::FirmwareApi::default(),
                 ),

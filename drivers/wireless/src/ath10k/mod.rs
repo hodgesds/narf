@@ -30,7 +30,8 @@
 //! Host/factory regulatory policy now reaches correlated station-vdev START
 //! and owned sparse peer MAPs. Initial Open authentication/association frame
 //! transport now uses native WMI or HTT and correlated management RX. Firmware
-//! association/security, admission and recovery remain open.
+//! association commands now follow checked shared JoinPlan negotiation. Key/RSNA
+//! security, admission and recovery remain open.
 //! Older standalone codecs below are not the production activation path.
 //!
 //! ## Stage 0 (prior commit)

@@ -14,6 +14,8 @@ mod wire;
 pub use management::{
     Completion as ManagementCompletion, Receipt as ManagementReceipt, Token as ManagementToken,
 };
+mod mlme;
+pub use mlme::Associated as StationAssociated;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Htt(htt::Error),
@@ -248,7 +250,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         self.queue(htt::Event::Wmi(bytes))?;
                     }
                 }
-                htt::Event::Idle => narf_scheduler::yield_now().await,
+                htt::Event::Idle | htt::Event::Progress => narf_scheduler::yield_now().await,
                 // Keep peer/BA/packet events for the future station worker.
                 // No event can raise a link or open the controlled port here.
                 event => self.queue(event)?,

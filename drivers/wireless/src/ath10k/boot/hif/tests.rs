@@ -26,8 +26,9 @@ impl Memory for Buffer {
         self.bytes.borrow_mut()[i] = b;
     }
 }
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Io {
+    source_bases: Vec<u64>,
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
 }
@@ -38,6 +39,17 @@ impl Ath10kMmio for Io {
     fn write32(&mut self, r: u64, v: u32) {
         self.regs.insert(r, v);
         self.writes.push((r, v));
+        if self
+            .source_bases
+            .iter()
+            .any(|base| r == base + crate::ath10k::hw::ce_off::SR_WR_INDEX)
+        {
+            self.regs.insert(
+                r - crate::ath10k::hw::ce_off::SR_WR_INDEX
+                    + crate::ath10k::hw::ce_off::CURRENT_SRRI,
+                v,
+            );
+        }
     }
 }
 fn once<F: Future>(f: F) -> Poll<F::Output> {
@@ -143,3 +155,124 @@ kernel_test_in!(
     "drivers/wireless/ath10k/hif",
     smoke_ath10k_runtime_ce_cancel_after_publication
 );
+
+/// Protocol model adapter using the production CE allocation, send, terminal
+/// descriptor completion, receive copying and destination repost routines.
+/// Device behavior is limited to writing completion fields and source indexes.
+#[derive(Debug)]
+pub(in crate::ath10k) struct CeFixture {
+    runtime: Runtime<Buffer>,
+    allocations: Vec<Buffer>,
+    io: Io,
+    hardware: HwRev,
+    poisoned: bool,
+    pub sent: usize,
+    pub received: usize,
+    pub stall: Option<usize>,
+}
+impl CeFixture {
+    pub fn new(hardware: HwRev) -> Self {
+        let (mut runtime, mut allocations) = allocate_runtime(hardware);
+        // PciBoot retains CE1 from BMI as the additional runtime RX pipe.
+        let mut address = 0x300000;
+        let mut allocate = |size: usize| {
+            let buffer = Buffer {
+                address,
+                bytes: Rc::new(RefCell::new(vec![0; size])),
+            };
+            address += size.next_multiple_of(4096) as u64;
+            allocations.push(buffer.clone());
+            buffer
+        };
+        runtime.pipes.push(Pipe {
+            number: 1,
+            direction: Direction::Destination,
+            maximum: 2048,
+            ring: Ring::new(allocate(128 * 8), hardware, 1, 128, Direction::Destination).unwrap(),
+            buffer: allocate(2048),
+        });
+        let mut io = Io::default();
+        runtime.initialize(&mut io, hardware).unwrap();
+        io.source_bases = [3, 4]
+            .into_iter()
+            .map(|pipe| hardware.registers().unwrap().ce_base(pipe).unwrap())
+            .collect();
+        Self {
+            runtime,
+            allocations,
+            io,
+            hardware,
+            poisoned: false,
+            sent: 0,
+            received: 0,
+            stall: None,
+        }
+    }
+    pub async fn send(&mut self, number: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        let pipe = self
+            .runtime
+            .pipes
+            .iter_mut()
+            .find(|p| p.number == number && p.direction == Direction::Source)
+            .ok_or(BmiError::Unsupported)?;
+        if self.stall == Some(self.sent) {
+            self.io.source_bases.clear();
+        }
+        self.sent += 1;
+        send(
+            &mut pipe.ring,
+            &mut pipe.buffer,
+            &mut self.io,
+            &mut self.poisoned,
+            bytes,
+        )
+        .await?;
+        if pipe.buffer.bytes.borrow()[..bytes.len()] != *bytes {
+            return Err(BmiError::BadResponse);
+        }
+        Ok(())
+    }
+    pub fn receive(&mut self, number: u8, bytes: &[u8]) -> Result<(u8, Vec<u8>), BmiError> {
+        if self.poisoned {
+            return Err(BmiError::BadResponse);
+        }
+        let pipe = self
+            .runtime
+            .pipes
+            .iter()
+            .find(|p| p.number == number && p.direction == Direction::Destination)
+            .ok_or(BmiError::Unsupported)?;
+        if bytes.is_empty() || bytes.len() > usize::from(pipe.maximum) {
+            return Err(BmiError::BadResponse);
+        }
+        let base = self.hardware.registers().unwrap().ce_base(number).unwrap();
+        let descriptor = u64::from(self.io.regs[&(base + crate::ath10k::hw::ce_off::DR_BASE_LO)]);
+        let entries = self.io.regs[&(base + crate::ath10k::hw::ce_off::DR_SIZE)];
+        let next = self.io.regs[&(base + crate::ath10k::hw::ce_off::DR_WR_INDEX)];
+        let slot = next.wrapping_sub(1) & (entries - 1);
+        let storage = self
+            .allocations
+            .iter()
+            .find(|b| b.address == descriptor)
+            .unwrap();
+        let at = slot as usize * 8;
+        let address = u32::from_le_bytes(storage.bytes.borrow()[at..at + 4].try_into().unwrap());
+        let payload = self
+            .allocations
+            .iter()
+            .find(|b| b.address == u64::from(address))
+            .unwrap();
+        payload.bytes.borrow_mut()[..bytes.len()].copy_from_slice(bytes);
+        storage.bytes.borrow_mut()[at + 4..at + 6]
+            .copy_from_slice(&(bytes.len() as u16).to_le_bytes());
+        self.runtime.poll(&mut self.io)?;
+        self.received += 1;
+        self.runtime
+            .received
+            .pop_front()
+            .ok_or(BmiError::BadResponse)
+    }
+    pub fn retained(&self) -> bool {
+        !self.allocations.is_empty() && self.runtime.pipes.len() >= 4
+    }
+}

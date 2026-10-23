@@ -157,7 +157,10 @@ fn fragment_config(c: Config, d: DmaConfig) -> Result<Vec<u8>, Error> {
 }
 #[derive(Debug)]
 pub(super) enum Event {
+    /// Empty nonblocking HIF poll, after all retained payloads were drained.
     Idle,
+    /// A credit-only or internally consumed event; input may still be queued.
+    Progress,
     Tx(u8),
     Rx(RxBatch),
     InOrder(rx::InOrder, Vec<rx::Msdu>),
@@ -203,16 +206,20 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
             return Err(Error::Failed);
         }
         self.failed = true;
-        let packet = if let Some(bytes) = self.early_htt.pop_front() {
-            Some((self.wmi.htc.htt, bytes))
+        let (progressed, packet) = if let Some(bytes) = self.early_htt.pop_front() {
+            (true, Some((self.wmi.htc.htt, bytes)))
         } else if let Some(bytes) = self.wmi_events.pop_front() {
-            Some((self.wmi.htc.wmi, bytes))
+            (true, Some((self.wmi.htc.wmi, bytes)))
         } else {
-            self.wmi.htc.poll().await?
+            self.wmi.htc.poll_with_progress().await?
         };
         self.failed = false;
         let Some((endpoint, bytes)) = packet else {
-            return Ok(Event::Idle);
+            return Ok(if progressed {
+                Event::Progress
+            } else {
+                Event::Idle
+            });
         };
         if endpoint == self.wmi.htc.wmi {
             return Ok(Event::Wmi(bytes));

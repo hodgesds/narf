@@ -33,6 +33,9 @@ struct RadioModel {
     management_next: u64,
     mismatch_rx: bool,
     mismatched: u32,
+    mlme_beacon: Option<bool>,
+    mlme: Option<mlme_tests::Fixture>,
+    ce: Option<crate::ath10k::boot::CeFixture>,
 }
 impl HostMemory for RadioModel {
     fn retain_wmi_memory(&mut self, p: &[MemoryPlan]) -> Result<Vec<MemoryChunk>, Error> {
@@ -125,6 +128,17 @@ fn management(model: &mut RadioModel, bad_ie: bool) {
     frame[32] = 100;
     frame[34] = 1;
     frame.extend_from_slice(&[0, 4, b'n', b'a', b'r', b'f', 3, 1, 1]);
+    if let Some(protected) = model.mlme_beacon {
+        frame[34..36].copy_from_slice(&(if protected { 0x431u16 } else { 0x421 }).to_le_bytes());
+        frame.extend_from_slice(&[
+            1, 8, 0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108,
+        ]);
+        if protected {
+            frame.extend_from_slice(&[
+                48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
+            ]);
+        }
+    }
     if bad_ie {
         frame.push(0xff);
     }
@@ -177,12 +191,24 @@ impl Hif for RadioModel {
             add_event(self, 0x7001, &body);
             self.mismatched += 1;
         }
-        self.inner.poll(b).await
+        match self.inner.poll(b).await? {
+            Some((pipe, bytes)) if self.ce.is_some() => {
+                self.ce.as_mut().unwrap().receive(pipe, &bytes).map(Some)
+            }
+            other => Ok(other),
+        }
     }
     async fn receive(&mut self, b: u64) -> Result<(u8, Vec<u8>), BmiError> {
-        self.inner.receive(b).await
+        let (pipe, bytes) = self.inner.receive(b).await?;
+        match &mut self.ce {
+            Some(ce) => ce.receive(pipe, &bytes),
+            None => Ok((pipe, bytes)),
+        }
     }
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        if let Some(ce) = &mut self.ce {
+            ce.send(pipe, bytes).await?;
+        }
         if pipe == 4 && self.management.is_some() {
             return management_htt_send(self, bytes).await;
         }
@@ -198,6 +224,9 @@ impl Hif for RadioModel {
             return Err(BmiError::BadResponse);
         }
         self.sequence = self.sequence.wrapping_add(1);
+        if self.mlme.is_some() {
+            return mlme_tests::send(self, bytes).await;
+        }
         if self.management.is_some() {
             return management_send(self, bytes).await;
         }
@@ -332,6 +361,9 @@ fn radio_boot_options(
         management_next: 0x900000,
         mismatch_rx: false,
         mismatched: 0,
+        mlme_beacon: None,
+        mlme: None,
+        ce: None,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));
@@ -587,3 +619,6 @@ use station_tests::{station_send, StationFixture};
 #[path = "management_tests.rs"]
 mod management_tests;
 use management_tests::{management_htt_send, management_send, ManagementFixture};
+
+#[path = "mlme_tests.rs"]
+mod mlme_tests;

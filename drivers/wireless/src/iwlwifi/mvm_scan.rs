@@ -25,7 +25,7 @@ pub(super) struct ScanContext {
     beacon_filter_v4: bool,
     pub(super) nvm_lar: bool,
     ready: bool,
-    permissions: Option<Vec<u32>>,
+    pub(super) permissions: Option<Vec<u32>>,
 }
 impl ScanContext {
     pub(super) fn new(api: &FirmwareApi<'_>) -> Self {
@@ -117,7 +117,7 @@ fn mcc_permissions(version: u8, bytes: &[u8]) -> Result<Vec<u32>, &'static str> 
         .collect())
 }
 
-fn passive_permitted(domain: &RegulatoryDomain, channel: u8) -> bool {
+pub(super) fn passive_permitted(domain: &RegulatoryDomain, channel: u8) -> bool {
     if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
         return false;
     }
@@ -183,6 +183,28 @@ impl Owner {
         {
             return Err("invalid MVM scan channels");
         }
+        let version = self.validate_scan_profile()?;
+        // Firmware has a finite scan-slot namespace; slot0 is reused only
+        // after its exact terminal notification. Failed/dropped attempts never
+        // return to Configured. Retire previously queued notifications before
+        // publishing this operation, as Linux's scan slot lifecycle requires.
+        let request = scan_api::passive(version, 0, channels)?;
+        self.phase = Phase::Scanning;
+        let result = self.passive_scan_inner(channels, &request).await;
+        match result {
+            Ok((beacons, results)) => {
+                self.beacons = beacons;
+                self.phase = Phase::Configured;
+                Ok(results)
+            }
+            Err(error) => {
+                self.hardware.fail();
+                self.phase = Phase::Failed;
+                Err(error)
+            }
+        }
+    }
+    pub(super) fn validate_scan_profile(&self) -> Result<u8, &'static str> {
         if !self.scan.reduced
             || !self.scan.mld
             || self.hardware.version(1, 0xc).map(|v| v.0) != Some(5)
@@ -223,27 +245,9 @@ impl Owner {
         if !matches!(version, 14..=17) || self.hardware.version(0, 0xf).is_some_and(|v| v.1 != 1) {
             return Err("unsupported MVM scan API");
         }
-        // Firmware has a finite scan-slot namespace; slot0 is reused only
-        // after its exact terminal notification. Failed/dropped attempts never
-        // return to Configured. Retire previously queued notifications before
-        // publishing this operation, as Linux's scan slot lifecycle requires.
-        let request = scan_api::passive(version, 0, channels)?;
-        self.phase = Phase::Scanning;
-        let result = self.passive_scan_inner(channels, &request).await;
-        match result {
-            Ok((beacons, results)) => {
-                self.beacons = beacons;
-                self.phase = Phase::Configured;
-                Ok(results)
-            }
-            Err(error) => {
-                self.hardware.fail();
-                self.phase = Phase::Failed;
-                Err(error)
-            }
-        }
+        Ok(version)
     }
-    async fn prepare_scan(&mut self) -> Result<(), &'static str> {
+    pub(super) async fn prepare_scan(&mut self) -> Result<(), &'static str> {
         if !self.scan.ready && self.scan.dqa {
             self.hardware.command(5, 0, &[0; 4]).await?; // DQA HCMD queue0
         }

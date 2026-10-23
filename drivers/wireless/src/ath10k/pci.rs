@@ -339,6 +339,32 @@ pub async fn exchange_initial_management(
     result
 }
 
+/// Exchange checked legacy Open/WPA2 association and submit native peer/vdev
+/// state on the already prepared physical peer. No key, port or NIC is granted.
+pub async fn associate_station(
+    ssid: &[u8],
+    security: narf_wireless::association::SecurityMode,
+    sme_ies: &[u8],
+) -> Result<super::wmi_runtime::StationAssociated, super::wmi_runtime::Error> {
+    let domain =
+        narf_wireless::reg::db::get_domain().ok_or(super::wmi_runtime::Error::Unsupported)?;
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    let result = owner
+        .radio
+        .associate_station(&domain, ssid, security, sme_ies)
+        .await;
+    if let Some(controller) = CONTROLLER.lock().as_mut() {
+        controller.station_prepared = owner.radio.prepared_peer();
+        if let Err(error) = &result {
+            controller.station_error = Some(*error);
+        }
+    }
+    result
+}
+
 /// Human-readable driver name keyed on the matched `(vendor, device)`.
 /// Used as `PciMatch.name` + `BoundDriver.name`. Must be a `'static`
 /// string — the bus registry stores it by reference.

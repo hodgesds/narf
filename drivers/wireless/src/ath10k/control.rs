@@ -386,25 +386,31 @@ impl<T: Hif> Session<T> {
         Ok(())
     }
     pub async fn poll(&mut self) -> Result<Option<(u8, Vec<u8>)>, Error> {
+        self.poll_with_progress().await.map(|(_, payload)| payload)
+    }
+    /// Credit-only input is progress, even though it carries no payload.
+    /// Only an empty nonblocking HIF poll establishes receive quiescence.
+    pub async fn poll_with_progress(&mut self) -> Result<(bool, Option<(u8, Vec<u8>)>), Error> {
         if !self.started || self.failed {
             return Err(Error::Failed);
         }
         self.failed = true;
         if let Some(payload) = self.payloads.pop_front() {
             self.failed = false;
-            return Ok(Some(payload));
+            return Ok((true, Some(payload)));
         }
         let wire = if let Some(wire) = self.pending_wire.pop_front() {
             Some(wire)
         } else {
             self.transport.poll(0).await?
         };
+        let progressed = wire.is_some();
         if let Some((pipe, bytes)) = wire {
             self.accept(pipe, &bytes)?;
         }
         let result = self.payloads.pop_front();
         self.failed = false;
-        Ok(result)
+        Ok((progressed, result))
     }
     pub async fn receive(&mut self) -> Result<(u8, Vec<u8>), Error> {
         if !self.started || self.failed {

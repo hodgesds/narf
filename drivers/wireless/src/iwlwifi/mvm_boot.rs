@@ -10,6 +10,9 @@ pub enum Phase {
     Starting,
     Configured,
     Scanning,
+    PreparingChannel,
+    ChannelPrepared,
+    ReleasingChannel,
     Failed,
 }
 pub struct Owner {
@@ -21,6 +24,7 @@ pub struct Owner {
     nvm: Option<Nvm>,
     beacons: Vec<super::connection::Beacon>,
     scan: scan::ScanContext,
+    channel: channel::ChannelContext,
 }
 impl core::fmt::Debug for Owner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -69,6 +73,7 @@ impl Owner {
             nvm: None,
             beacons: Vec::new(),
             scan: scan::ScanContext::new(&parsed.api),
+            channel: channel::ChannelContext::new(&parsed.api),
         })
     }
     pub fn phase(&self) -> Phase {
@@ -155,3 +160,6 @@ mod tests;
 
 #[path = "mvm_scan.rs"]
 mod scan;
+
+#[path = "mvm_channel.rs"]
+mod channel;

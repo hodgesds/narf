@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One-shot owned station hardware preparation. No association/key/link state.
+//! Owned station preparation and legacy association; no key or controlled port.
 use super::*;
 use crate::ath10k::regulatory::Permission;
 
@@ -9,6 +9,7 @@ pub(super) struct Peer {
     bssid: [u8; 6],
     ids: [u64; 32],
     exchange_stage: u8,
+    associated: Option<StationAssociated>,
 }
 impl Peer {
     fn mapped(&self) -> Option<u16> {
@@ -48,6 +49,11 @@ impl Peer {
                 let bit = 1u64 << (id % 64);
                 let matched = *word & bit != 0;
                 *word &= !bit;
+                if matched && self.mapped().is_none() {
+                    // A later MAP for this address cannot restore the prior
+                    // AP negotiation after its last firmware owner vanished.
+                    self.associated = None;
+                }
                 Ok(matched)
             }
             _ => Ok(false),
@@ -55,6 +61,116 @@ impl Peer {
     }
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    pub fn associated_station(&self) -> Option<StationAssociated> {
+        if self.failed {
+            return None;
+        }
+        let peer = self.peer.as_ref()?;
+        peer.mapped()?;
+        peer.associated
+    }
+
+    /// Negotiate legacy Open/WPA2-PSK with the shared management plan. This
+    /// submits native PEER_ASSOC/VDEV_UP but installs no key and grants no port.
+    pub async fn associate_station(
+        &mut self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        ssid: &[u8],
+        security: narf_wireless::association::SecurityMode,
+        sme_ies: &[u8],
+    ) -> Result<StationAssociated, Error> {
+        use narf_wireless::association::{channel, Bss, JoinPlan};
+        let peer = self.prepared_peer().ok_or(Error::Failed)?;
+        if self.peer.as_ref().ok_or(Error::Failed)?.exchange_stage != 0 {
+            return Err(Error::Failed);
+        }
+        let cached = self
+            .scan_cache
+            .iter()
+            .find(|b| b.bssid == peer.bssid && b.frequency == peer.frequency)
+            .ok_or(Error::Failed)?;
+        let bss = Bss {
+            bssid: cached.bssid,
+            ssid: wire::owned(&cached.ssid)?,
+            channel: channel::from_frequency(u32::from(cached.frequency))
+                .ok_or(Error::Unsupported)?,
+            signal_dbm: None, // Native SNR is not an invented RSSI measurement.
+            capability: cached.capability,
+            beacon_interval: cached.beacon_interval,
+            information_elements: wire::owned(&cached.information_elements)?,
+        };
+        let own = self.ready.ok_or(Error::Failed)?.mac;
+        let mut plan = JoinPlan::prepare(&bss, own, ssid, security).map_err(plan_error)?;
+        plan.append_sme_ies(sme_ies).map_err(plan_error)?;
+        let auth = wire::owned(plan.start_authentication().map_err(plan_error)?)?;
+        let response = self.exchange_initial_management(domain, &auth).await?;
+        // A matching but semantically invalid response is terminal even if
+        // the lower transport accepted its address/channel/status envelope.
+        self.failed = true;
+        let assoc = wire::owned(
+            plan.authentication_response(&response)
+                .map_err(plan_error)?
+                .ok_or(Error::Malformed)?,
+        )?;
+        self.failed = false;
+        let response = self.exchange_initial_management(domain, &assoc).await?;
+        self.failed = true;
+        let aid = plan
+            .association_response(&response)
+            .map_err(plan_error)?
+            .ok_or(Error::Malformed)?;
+        let capability = u16::from_le_bytes([response[24], response[25]]);
+        let command = mlme::peer(
+            self.wire.dialect,
+            peer.bssid,
+            aid,
+            capability,
+            plan.legacy_rates().0,
+            security.is_wpa2(),
+        )?;
+        let up = mlme::up(self.wire.dialect, peer.bssid, aid)?;
+        // Existing failed state precedes both publications and stays retained
+        // if any command's waiter is dropped. CE receipt is no firmware ACK.
+        for command in [&command, &up] {
+            self.htt
+                .wmi
+                .htc
+                .send_wmi(command)
+                .await
+                .map_err(htt::Error::from)?;
+        }
+        // Consume maps/unmaps/completions already received with the command
+        // receipts before reporting the configured peer; never revive a lost
+        // peer. Flood/cancellation keeps this same owner closed.
+        let deadline = narf_time::Deadline::after_ms(3000);
+        for _ in 0..4096 {
+            narf_scheduler::yield_now().await;
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            let event = self.station_progress().await?;
+            if self.peer.as_ref().and_then(Peer::mapped).is_none() {
+                return Err(Error::Failed);
+            }
+            match event {
+                htt::Event::Idle => {
+                    let associated = StationAssociated {
+                        bssid: peer.bssid,
+                        frequency: peer.frequency,
+                        aid,
+                        protected: security.is_wpa2(),
+                    };
+                    self.peer.as_mut().ok_or(Error::Failed)?.associated = Some(associated);
+                    self.failed = false;
+                    return Ok(associated);
+                }
+                htt::Event::Progress => {}
+                other => self.queue(other)?,
+            }
+        }
+        Err(Error::Timeout)
+    }
+
     pub fn prepared_peer(&self) -> Option<PeerPrepared> {
         if self.failed {
             return None;
@@ -115,6 +231,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             bssid,
             ids: [0; 32],
             exchange_stage: 0,
+            associated: None,
         });
         // Even an unsent/ambiguous START cannot be retried under this owner.
         // The nested native mission transport retains all published DMA.
@@ -146,6 +263,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     }
                 }
                 htt::Event::Idle => narf_scheduler::yield_now().await,
+                htt::Event::Progress => {}
                 other => self.queue(other)?,
             }
         }
@@ -179,6 +297,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     }
                     narf_scheduler::yield_now().await;
                 }
+                htt::Event::Progress => {}
                 other => self.queue(other)?,
             }
         }
@@ -345,6 +464,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     return Ok(rx.frame);
                 }
                 htt::Event::Idle => {}
+                htt::Event::Progress => {}
                 other => self.queue(other)?,
             }
         }
@@ -370,13 +490,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     ids.extend(reports.iter().map(|r| r.id));
                     self.htt.wmi.htc.transport.complete_wmi_management(&ids)?;
                     self.management_done.extend(reports);
-                    return Ok(htt::Event::Idle);
+                    return Ok(htt::Event::Progress);
                 }
             }
         }
         if let htt::Event::Message(bytes) = &event {
             if self.peer.as_mut().ok_or(Error::Failed)?.record(bytes)? {
-                return Ok(htt::Event::Idle);
+                return Ok(htt::Event::Progress);
             }
         }
         Ok(event)
@@ -391,5 +511,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let event = self.station_progress().await?;
         self.failed = false;
         Ok(event)
+    }
+}
+
+fn plan_error(error: narf_wireless::association::Error) -> Error {
+    use narf_wireless::association::Error as PlanError;
+    match error {
+        PlanError::Rejected(status) => Error::Firmware(u32::from(status)),
+        PlanError::UnsupportedRates | PlanError::UnsupportedSecurity => Error::Unsupported,
+        PlanError::InvalidBss | PlanError::Protocol => Error::Malformed,
+        PlanError::Busy => Error::Failed,
     }
 }

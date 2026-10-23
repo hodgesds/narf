@@ -264,4 +264,4 @@ impl PciBoot {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "hif/tests.rs"]
-mod tests;
+pub(super) mod tests;

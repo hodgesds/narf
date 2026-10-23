@@ -96,11 +96,31 @@ packet service are not yet attached.
   Matching RX is bound to the same native channel, TA/BSSID and local recipient;
   failed status, malformed transport, timeout or dropped future closes the
   retained radio. Each phase advances at most once. The returned raw peer
-  response is a transport prerequisite: WMI PEER_ASSOC/VDEV_UP, negotiated
-  capabilities, keys, data admission and a NIC remain software work.
+  response is a transport prerequisite; use `pci::associate_station` to run
+  the checked negotiation and native peer/vdev commands. Keys, data admission
+  and a NIC remain software work.
   Internal `ManagementReceipt` distinguishes inline submission (no terminal
   air ACK fabricated), HTT packet IDs and referenced-WMI descriptor IDs;
   `ManagementCompletion` keeps the actual firmware status with its ID.
+- `pci::associate_station(ssid, SecurityMode, sme_ies)` uses the shared
+  `association::JoinPlan` on the exact prepared scan-cache BSS. It checks ESS,
+  SSID, legacy rates/basic-rate support and Open/WPA2-PSK CCMP policy before
+  publishing authentication; optional SME IEs follow the shared validator.
+  Bound native management responses must pass the shared phase, capability,
+  status, AID and IE checks. The negotiated legacy rates, capability and AID
+  enter dialect-specific native WMI PEER_ASSOC and VDEV_UP. The returned
+  `StationAssociated` describes AP negotiation plus command submission;
+  it is separate from key installation, RSNA completion, firmware security
+  authorization and controlled-port/NIC admission. Submission receipts are
+  not fabricated firmware acknowledgments. A failure or dropped waiter keeps
+  the radio closed and retains its nested DMA owner. Every receive iteration
+  yields, and credit-only or consumed terminal/MAP events are progress rather
+  than receive quiescence. Already queued UNMAPs are processed before exposing
+  the result; the last UNMAP clears association, and a later MAP cannot revive
+  it. The current shared plan derives peer rates from the scanned BSS; response
+  Supported Rates negotiation/downgrade remains shared MLME work before full
+  station admission. This remains a one-shot owner until disconnect/reset is
+  implemented.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
@@ -262,6 +282,19 @@ continuous event flood cannot monopolize one executor poll. Dropping those
 waits leaves the radio closed and DMA retained until the existing stop proof
 permits release.
 
+The checked association path uses the shared secret-free JoinPlan for
+Open/WPA2-PSK legacy management and translates only validated rates, AID and
+capabilities into each native PEER_ASSOC/VDEV_UP layout. Full unmodified Linux
+C serializers generate 40 literal management/association fixtures, including
+single-rate 11B/11G and TLV padding. The accompanying generator records native
+source SHA-256 provenance and runs independently of Rust encoders. Retained
+composition fixtures exercise actual CE3 source descriptor publication and
+completion, CE2/CE1/CE5 destination completion/copy/repost, HTC framing and
+credits, WMI commands and terminal referenced-management retirement. They
+cover cancellation after native PEER_ASSOC/VDEV_UP descriptor publication,
+send errors, invalid AP capability, queued peer loss, stale remap, and a
+post-UP credit-only flood. AP association does not open a controlled port.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
@@ -346,7 +379,8 @@ The following are software work, not gates that a physical boot can close:
 3. A retained station worker composing the native packet/event owner with
    complete WMI operation handling, higher-capacity CE service, HIF IRQ/MSI,
    recovery and PM/teardown. HTT setup alone does not publish an interface.
-4. Station/runtime WMI maps beyond scan and one-shot station-context preparation;
+4. Station/runtime WMI maps beyond scan, context preparation and initial
+   legacy association;
    complete HTT peer/BA/security routing,
    PFC fetch/mode/host-queue handling, native packet conversion, RX security
    and replay/reorder policy. Existing standalone WMI/HTT codecs are not the
@@ -354,7 +388,7 @@ The following are software work, not gates that a physical boot can close:
 5. Extend the initial authenticated channels 1–11 factory/host context policy
    to all claimed bands and widths, beacon hints/DFS and complete station
    control, active/
-   directed scan and richer scan options, management/EAPOL/key exchange,
+   directed scan and richer scan options, complete management/EAPOL/key exchange,
    packet conversion, and `WirelessNetIface`/netdev registration.
 
 After those are integrated, physical acceptance must exercise ROM/BMI,

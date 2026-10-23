@@ -36,6 +36,9 @@ impl Fixture {
                 mac: Some([2; 6]),
                 nvm: Some(station_api::Nvm::parse(4, &nvm).unwrap()),
                 beacons: vec![],
+                channel: super::super::channel::ChannelContext::new(
+                    &super::super::super::firmware_api::FirmwareApi::default(),
+                ),
                 scan: ScanContext {
                     dqa: false,
                     reduced: true,

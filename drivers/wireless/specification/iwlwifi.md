@@ -166,7 +166,7 @@ A separate Gen2 owner implements the context-v1 transport for exact AX200
 2723 and AX201 02f0/43f0/a0f0 MAC/RF profiles. It selects Linux's CC/Qu/QuZ
 firmware prefix from discovered identity and requires API77 and the negotiated
 ALIVE6/NVM4 command profile. Native automatic admission remains closed: MVM
-station PHY/binding, rate/key/Block-Ack and recovery lifecycle still need
+active station PHY/link activation, rate/key/Block-Ack and recovery lifecycle still need
 integration before a Gen2 interface can be published. The passive-scan owner
 creates its own idle MAC context but does not authorize station data.
 
@@ -258,10 +258,40 @@ policy fixtures use the same private admission path without global mutation.
 A retained C oracle compiled from actual Linux headers verifies complete
 MAC/link/SF/power/MCC and versioned channel packed geometry.
 
-These contracts do not enable Gen2 native PCI publication. Station PHY/binding,
+These contracts do not enable Gen2 native PCI publication. Active station PHY/link activation,
 association management TX/RX, peer/rate/key/Block-Ack and controlled-port
 integration, authenticated platform power/SAR, owned recovery and PM remain
 software dependencies before a Gen2 netdev can be exposed.
+
+### 3.7 Retained inactive API77 PHY context
+
+`mvm_boot::Owner::prepare_inactive_channel(channel)` prepares one 20 MHz
+PHY context attached to the existing inactive MAC0/link0. Its channel must
+be present in retained NVM, covered by the current authenticated host receive
+policy and permitted by a newly queried firmware MCC when LAR is active.
+The same optional-DQA/idle-MAC/link prerequisites used by passive scans remain
+owned by this owner. No scan request is published by this operation.
+
+CC/Qu API77 firmware omits `PHY_CONTEXT_CMD` from its version table; following
+Linux this selects command v1. `ULTRA_HB_CHANNELS` selects its exact 40-byte
+channel-v2 form, otherwise its channel-v1 form is 36 bytes. Antenna masks come
+from NVM and the RX chain count follows those masks. The existing Gen3 32-byte
+PHY encoder is not used. Actual API77 advertises RLC_CONFIGv2, so the owner
+sends its 32-byte NVM RX-chain command after PHY ADD and before inactive
+LINK_CONFIG binding. Absent/older RLC stays in the PHY command; v3+ delegates
+RLC to firmware, as Linux specifies. Every required command must receive its
+correlated native acknowledgement before
+`Phase::ChannelPrepared` is observable.
+
+`release_inactive_channel()` receives an explicit inactive unbind receipt
+before sending PHY REMOVE. Only the final correlated receipt reopens scan or
+channel preparation. Failure and cancellation at every publication boundary
+keep the phase closed and preserve the retained transport/DMA policy. These
+helpers never activate the link, allocate a station packet queue, install a
+peer/key or authorize transmit; active station and native PCI admission remain
+gated on the remaining power/SAR, peer/rate/key/BA, security and recovery work.
+Independent C fixtures compiled from actual Linux headers cover complete PHY
+and link/RLC payloads, both channel formats, both bands and each antenna mask.
 
 ## 4. References
 
