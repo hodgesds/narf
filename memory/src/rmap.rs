@@ -95,7 +95,15 @@ impl OwnerList {
             return;
         }
         match &mut self.owners {
-            Owners::Empty => self.owners = Owners::One(owner),
+            Owners::Empty if self.reserved == 0 => self.owners = Owners::One(owner),
+            Owners::Empty => {
+                // A normal publisher raced a promised first owner. Preserve
+                // the reservation by promoting with capacity for both; normal
+                // `add` is explicitly allowed to allocate.
+                let mut owners = Vec::with_capacity(self.reserved.saturating_add(1));
+                owners.push(owner);
+                self.owners = Owners::Many(owners);
+            }
             Owners::One(existing) => {
                 let first = *existing;
                 let mut owners = Vec::with_capacity(self.reserved.saturating_add(2));
@@ -138,15 +146,28 @@ impl OwnerList {
             !self.contains(owner),
             "reserved rmap owner already existed before commit"
         );
-        let Owners::Many(owners) = &mut self.owners else {
-            panic!("reserved rmap owner list lost its prepared storage");
-        };
-        assert!(
-            self.reserved != 0 && owners.len() < owners.capacity(),
-            "reserved rmap owner capacity was consumed before commit"
-        );
-        self.reserved -= 1;
-        owners.push(owner);
+        match &mut self.owners {
+            // A fresh frame's first owner needs no separate allocation. The
+            // table row itself is the fallible reservation; commit it into the
+            // inline representation used by ordinary unique mappings.
+            Owners::Empty => {
+                assert!(
+                    self.reserved == 1,
+                    "inline rmap reservation has an invalid owner count"
+                );
+                self.reserved = 0;
+                self.owners = Owners::One(owner);
+            }
+            Owners::Many(owners) => {
+                assert!(
+                    self.reserved != 0 && owners.len() < owners.capacity(),
+                    "reserved rmap owner capacity was consumed before commit"
+                );
+                self.reserved -= 1;
+                owners.push(owner);
+            }
+            Owners::One(_) => panic!("reserved rmap owner list lost its prepared storage"),
+        }
     }
 
     fn remove(&mut self, owner: Owner) {
@@ -495,6 +516,15 @@ pub(crate) fn try_prepare_owner_slots(phys: PhysAddr, additional: usize) -> Resu
             return list.try_reserve(additional);
         }
         let was_shell = list.reserved == 0;
+        if additional == 1 && was_shell {
+            // The first owner is stored inline. Mark the existing hash row as
+            // promised without allocating a one-element Vec merely to reserve
+            // an operation that cannot grow `Owners::One`.
+            list.reserved = 1;
+            debug_assert!(map.retained_empty != 0);
+            map.retained_empty -= 1;
+            return Ok(());
+        }
         let mut owners = match core::mem::replace(&mut list.owners, Owners::Empty) {
             Owners::Many(owners) => owners,
             _ => Vec::new(),
@@ -510,6 +540,20 @@ pub(crate) fn try_prepare_owner_slots(phys: PhysAddr, additional: usize) -> Resu
             debug_assert!(map.retained_empty != 0);
             map.retained_empty -= 1;
         }
+        return Ok(());
+    }
+    if additional == 1 {
+        // Reserve the hash-table insertion fallibly, but keep the promised
+        // first owner inline. `add_reserved` turns this Empty row into One
+        // without touching the allocator after the PTE is published.
+        map.try_prepare_insert()?;
+        map.insert_prepared(
+            key,
+            OwnerList {
+                owners: Owners::Empty,
+                reserved: 1,
+            },
+        );
         return Ok(());
     }
     let mut owners = Vec::new();
@@ -1032,6 +1076,7 @@ mod tests {
         __reset_for_test();
         let fresh = PhysAddr::new(0x34_0000);
         let shell = PhysAddr::new(0x34_0000 + (64 << 12));
+        let inline = PhysAddr::new(0x34_0000 + (128 << 12));
         let root = PhysAddr::new(0x1000);
         let (v0, v1) = (VirtAddr::new(0x4000_0000), VirtAddr::new(0x5000_0000));
         let result = (|| {
@@ -1044,6 +1089,31 @@ mod tests {
             add_reserved(fresh, root, v1);
             if owner_count(fresh) != 2 || retained_empty(fresh) != 0 {
                 return TestResult::Fail("prepared rmap row lost capacity or miscounted");
+            }
+            if try_prepare_owner_slots(inline, 1).is_err() {
+                return TestResult::Fail("fresh inline rmap destination was not prepared");
+            }
+            let inline_reserved = RMAP[shard(inline.raw())]
+                .map
+                .lock()
+                .as_ref()
+                .and_then(|table| table.get(inline.raw()))
+                .is_some_and(|list| matches!(list.owners, Owners::Empty) && list.reserved == 1);
+            if !inline_reserved {
+                return TestResult::Fail("one-owner rmap reservation allocated alias storage");
+            }
+            add_reserved(inline, root, v0);
+            let inline_committed = RMAP[shard(inline.raw())]
+                .map
+                .lock()
+                .as_ref()
+                .and_then(|table| table.get(inline.raw()))
+                .is_some_and(|list| {
+                    matches!(list.owners, Owners::One(owner) if owner == Owner { root, va: v0 })
+                        && list.reserved == 0
+                });
+            if !inline_committed {
+                return TestResult::Fail("one-owner rmap reservation did not commit inline");
             }
             // Same shard: turn `shell` into a counted reuse shell.
             add(shell, root, v0);

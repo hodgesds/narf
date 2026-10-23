@@ -1293,6 +1293,42 @@ pub fn snapshot_identities() -> alloc::vec::Vec<(u64, u64)> {
         .collect()
 }
 
+/// Visit every registered task's `(tid, pid)` in ascending TaskId order.
+///
+/// The fixed-size batch keeps the walk allocation-free, and the callback runs
+/// without the task-registry lock held so it may resolve scheduler state or
+/// take signal locks without introducing a lock-order cycle. TaskIds are
+/// monotonic and never reused, so a concurrent removal can only make an entry
+/// stale and a concurrent insertion appears later in this walk.
+pub(crate) fn for_each_identity(mut visit: impl FnMut(u64, u64) -> bool) {
+    const BATCH: usize = 32;
+    let mut after = None;
+    loop {
+        let mut batch = [(0u64, 0u64); BATCH];
+        let mut len = 0;
+        {
+            let tasks = TASKS.lock();
+            let lower = after.map_or(core::ops::Bound::Unbounded, core::ops::Bound::Excluded);
+            for (&tid, task) in tasks
+                .range((lower, core::ops::Bound::Unbounded))
+                .take(BATCH)
+            {
+                batch[len] = (tid, task.pid.load(Ordering::Relaxed));
+                len += 1;
+            }
+        }
+        for &(tid, pid) in &batch[..len] {
+            if !visit(tid, pid) {
+                return;
+            }
+        }
+        if len < BATCH {
+            return;
+        }
+        after = Some(batch[len - 1].0);
+    }
+}
+
 /// Scheduler slot-reap hook (installed at boot via
 /// `narf_scheduler::set_slot_reap_hook`). Fires when the executor
 /// drops a task slot through an ABNORMAL path — budget-cap revocation

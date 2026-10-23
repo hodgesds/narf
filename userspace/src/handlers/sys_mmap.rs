@@ -1,6 +1,26 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Build sparse VMA backing without routing allocation failure through
+/// `FromIterator`'s infallible `RegionBacking::push` path.
+fn try_raw_region_backing(
+    frames: &[u64],
+) -> Result<narf_memory::region_backing::RegionBacking, ()> {
+    let mut backing = narf_memory::region_backing::RegionBacking::new();
+    backing.resize(frames.len(), narf_memory::PhysAddr::new(0));
+    for (index, &raw) in frames.iter().enumerate() {
+        if raw == 0 {
+            continue;
+        }
+        backing.reserve_slot(index).map_err(|_| ())?;
+        *backing
+            .get_mut(index)
+            .expect("reserved region-backing slot disappeared") =
+            narf_memory::PhysAddr::new(raw);
+    }
+    Ok(backing)
+}
+
 fn finish_nonfixed_private_file_mapping(
     as_ref: &AddressSpace,
     receipt: narf_memory::MappingReceipt,
@@ -702,10 +722,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
-                let phys: alloc::vec::Vec<narf_memory::PhysAddr> = frames
-                    .iter()
-                    .map(|&p| narf_memory::PhysAddr::new(p))
-                    .collect();
+                let phys = match try_raw_region_backing(&frames) {
+                    Ok(backing) => backing,
+                    Err(()) => {
+                        ctx.set_return(errno_ret(ENOMEM));
+                        return;
+                    }
+                };
                 let region = Region {
                     base: VirtAddr::new(base),
                     len,
@@ -715,13 +738,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     perms: (perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT
                         | if ops.mmap_is_ram() { RegionPerms::PINNABLE_RAM } else { RegionPerms(0) })
                         .with_memory_type(memory_type),
-                    phys: match narf_memory::region_backing::RegionBacking::try_from_slice(&phys) {
-                        Ok(backing) => backing,
-                        Err(_) => {
-                            ctx.set_return(errno_ret(ENOMEM));
-                            return;
-                        }
-                    },
+                    phys,
                 };
                 let mapped = as_ref.with_vma_transaction(|| {
                     narf_memory::with_address_space_shared_mapping_transaction(
@@ -913,124 +930,25 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
     }
 
-    // Anonymous MAP_SHARED — Linux makes this a refcounted anonymous shared
-    // object that survives fork: parent and child map the SAME frames and see
-    // each other's writes. NARF backs unnamed objects with narf-shmem's
-    // sharded per-page references rather than inserting a short-lived public
-    // handle into the named/System-V registry. RegionPerms::SHARED makes
-    // `clone_for_fork` alias and retain those pages rather than COW-splitting
-    // a private copy the parent never sees. Without this a child's writes —
-    // e.g. stress-ng's shared bogo-op counters — vanish from the parent's
-    // view. Degrades to the private-anonymous path if the registry is
-    // unavailable or the segment exceeds the per-object cap; never a hard
-    // failure.
-    if flags & MAP_SHARED != 0 && anonymous {
-        if let Some(v) = shmem_vtable() {
-            let mut frames_raw = alloc::vec::Vec::new();
-            if (v.create_anonymous)(len, &mut frames_raw) {
-                if frames_raw.len() != pages {
-                    for &phys in &frames_raw {
-                        let _ = (v.release_frame)(phys);
-                    }
-                    ctx.set_return(errno_ret(ENOMEM));
-                    return;
-                }
-                let phys = frames_raw
-                    .iter()
-                    .copied()
-                    .map(narf_memory::PhysAddr::new)
-                    .collect();
-                let region = Region {
-                    base: VirtAddr::new(base),
-                    len,
-                    perms: perms | RegionPerms::SHARED,
-                    phys,
-                };
-                let mapped = as_ref.with_vma_transaction(|| {
-                    narf_memory::with_address_space_shared_mapping_transaction(
-                        as_ref.identity(),
-                        || {
-                            let result = crate::mapped_file::publish_current_unowned_mapping(
-                                as_ref.identity(),
-                                base,
-                                len,
-                                destructive_fixed,
-                                || {
-                                    // SAFETY: VMA -> shared-owner transactions
-                                    // cover the backing snapshot and alias
-                                    // publication.
-                                    unsafe {
-                                        if destructive_fixed {
-                                            as_ref.replace_shared_region_locked_limited_receipt(
-                                                region,
-                                                explicit_lock,
-                                                mlock_authority.limit_bytes,
-                                                mlock_authority.bypass_limit,
-                                            )
-                                        } else {
-                                            as_ref.map_shared_region_locked_limited_receipt(
-                                                region,
-                                                explicit_lock,
-                                                mlock_authority.limit_bytes,
-                                                mlock_authority.bypass_limit,
-                                            )
-                                        }
-                                    }
-                                },
-                                |receipt| {
-                                    // SAFETY: root plus VMA/shared transactions
-                                    // remain live through completion.
-                                    match unsafe { as_ref.materialize_mapping_locked(receipt) } {
-                                        Ok(()) => Ok(()),
-                                        Err(error) => {
-                                             // SAFETY: both structural
-                                            // transactions remain held.
-                                            let _ = unsafe {
-                                                as_ref.rollback_mapping_locked(receipt)
-                                            };
-                                            Err(error)
-                                        }
-                                    }
-                                },
-                            );
-                            // Keep creator-drop serialized with global shared
-                            // page migration: the migrator may replace the
-                            // physical identity as soon as this transaction
-                            // ends, after which releasing the old snapshot
-                            // would miss its ownership row.
-                            for &phys in &frames_raw {
-                                let released = (v.release_frame)(phys);
-                                debug_assert!(released);
-                            }
-                            result
-                        },
-                    )
-                });
-                if mapped.is_ok() {
-                    record_fixed_replacement_owner_committed!();
-                    crate::perf_event::on_mmap(current_task_id(), -1, base, len, 0, prot, flags);
-                    ctx.set_return(SyscallReturn::ok(base));
-                    return;
-                }
-                let map_error = mapped.expect_err("mapped success returned above");
-                if map_error == narf_memory::AddressSpaceError::LockLimit {
-                    ctx.set_return(errno_ret(EAGAIN));
-                    return;
-                }
-                if fixed_noreplace && map_error == narf_memory::AddressSpaceError::Overlap {
-                    ctx.set_return(errno_ret(EEXIST));
-                    return;
-                }
-                if fixed {
-                    ctx.set_return(errno_ret(ENOMEM));
-                    return;
-                }
-                // Publication failure for an ordinary anonymous shared
-                // mapping may still degrade to private anonymous.
+    // Linux implements MAP_SHARED|MAP_ANONYMOUS as an unlinked shmem file.
+    // Keep the same shape here: VMA publication allocates only the small file
+    // owner, while each page is allocated and zeroed on its first fault. The
+    // mapping-held Arc is cloned by fork and VMA splits, so every alias faults
+    // the same page at a given offset and the last owner drop frees it.
+    let anonymous_shared_ops = if flags & MAP_SHARED != 0 && anonymous {
+        match crate::mapped_file::new_anonymous_shared_file(len) {
+            Ok(ops) => {
+                narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
+                Some(ops)
+            }
+            Err(_) => {
+                ctx.set_return(errno_ret(ENOMEM));
+                return;
             }
         }
-        // Registry unavailable or create failed: degrade to private anonymous.
-    }
+    } else {
+        None
+    };
 
     if as_ref
         .check_locked_mapping_limit(
@@ -1058,9 +976,10 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     let may_defer_private_file = private_file_fallback
         && !explicit_lock
         && (flags & MAP_POPULATE == 0 || flags & MAP_NONBLOCK != 0);
-    let mut lazy_shared_file = false;
+    let direct_shared_file = anonymous_shared_ops.is_some();
+    let mut lazy_shared_file = direct_shared_file;
     let mut lazy_private_file = false;
-    let mut shared_file_ops = None;
+    let mut shared_file_ops = anonymous_shared_ops;
     let mut private_file_ops = None;
     let mut shared_publication = None;
     let mut shared_cache_generation = None;
@@ -1072,7 +991,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             || perms.contains(RegionPerms::EXEC));
     let mut population_frames = alloc::vec::Vec::new();
     let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
-        if map_type == MAP_PRIVATE && !populate_anonymous {
+        if direct_shared_file || map_type == MAP_PRIVATE && !populate_anonymous {
             // Linux publishes a lazy anonymous VMA without one descriptor per
             // virtual page. NARF represents the same demand-zero tail as an
             // implicit run after the materialized `Region::phys` prefix; the
@@ -1081,8 +1000,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             // while preserving zero-on-first-access and all normal admission.
             alloc::vec::Vec::new()
         } else {
-            // Shared and eagerly populated mappings still need an explicit
-            // slot for every page before their backing transaction begins.
+            // Eagerly populated private mappings still need an explicit slot
+            // for every page before their backing transaction begins.
             // Reserve fallibly so a huge userspace request returns ENOMEM
             // rather than entering the kernel allocator's abort path.
             let mut v = alloc::vec::Vec::new();
@@ -1188,7 +1107,10 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let writeback_phys = shared_file_ops.as_ref().map(|_| phys_list.clone());
+    let writeback_phys = shared_file_ops
+        .as_ref()
+        .filter(|_| !direct_shared_file)
+        .map(|_| phys_list.clone());
     let region = Region {
         base: VirtAddr::new(base),
         len,
@@ -1252,7 +1174,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     },
                     |receipt| {
                         if lazy_shared_file {
-                            eager_file_population = as_ref
+                            eager_file_population = populate_anonymous
+                                || as_ref
                                 .perms_covering(receipt.base(), receipt.len())
                                 .is_some_and(|perms| {
                                     perms.contains(RegionPerms::LOCKED)
@@ -2088,11 +2011,11 @@ mod tests {
         smoke_mmap_populate_and_nonblock_backing
     );
 
-    /// Anonymous shared mappings have no userspace-visible shmem handle. The
-    /// backing entry must therefore be name-removed after the first VMA has
-    /// retained it, and reclaimed by that VMA's final unmap rather than being
-    /// kept in the global registry until process exit.
-    fn smoke_mmap_shared_anon_retires_hidden_handle_on_success() -> TestResult {
+    /// Anonymous shared mmap is an unlinked sparse shmem file: publishing a
+    /// three-page VMA allocates no data page, and touching its middle page
+    /// materialises exactly that page. The mapping owner is the final file
+    /// reference, so removing it after the VMA returns the page to the buddy.
+    fn smoke_mmap_shared_anon_faults_sparse_shmem_lazily() -> TestResult {
         // SAFETY: paging and the frame allocator are live in the kernel-test
         // harness; this test owns the new root until `aspace` is dropped.
         let aspace = match unsafe { AddressSpace::new_for_user() } {
@@ -2104,13 +2027,9 @@ mod tests {
         install_task_id_lookup(task);
         CURRENT_TASK.store(TASK, Ordering::Relaxed);
 
-        let Some(vtable) = shmem_vtable() else {
-            *USER_AS.lock() = None;
-            return TestResult::Fail("shmem vtable is not installed");
-        };
         let mut mmap = TestCtx {
             args: SyscallArgs {
-                arg1: 4096,
+                arg1: 3 * 4096,
                 arg2: 3,    // PROT_READ | PROT_WRITE
                 arg3: 0x21, // MAP_SHARED | MAP_ANONYMOUS
                 arg4: u64::MAX,
@@ -2126,50 +2045,61 @@ mod tests {
                 return TestResult::Fail("anonymous MAP_SHARED mmap failed");
             }
         };
-        let region = match aspace.lookup(VirtAddr::new(base)) {
+        let initially_lazy = aspace.lookup(VirtAddr::new(base)).is_some_and(|region| {
+            region.perms.contains(RegionPerms::SHARED)
+                && region.perms.contains(RegionPerms::FILE_DEMAND)
+                && region.phys.is_empty()
+        });
+        if !initially_lazy || aspace.memory_stats().resident_pages != 0 {
+            *USER_AS.lock() = None;
+            return TestResult::Fail("anonymous MAP_SHARED eagerly allocated data pages");
+        }
+
+        // SAFETY: the test owns this live user root and the address is inside
+        // the VMA just published above.
+        if unsafe { aspace.demand_alloc_page(VirtAddr::new(base + 4096)) }.is_err() {
+            *USER_AS.lock() = None;
+            return TestResult::Fail("anonymous MAP_SHARED middle-page fault failed");
+        }
+        let phys = match aspace.lookup(VirtAddr::new(base)) {
             Some(region)
                 if region.perms.contains(RegionPerms::SHARED)
-                    && region.phys.len() == 1
-                    && region.phys[0].raw() != 0 =>
+                    && region.phys.len() == 2
+                    && region.phys[0].raw() == 0
+                    && region.phys[1].raw() != 0 =>
             {
-                region
+                region.phys[1]
             }
             _ => {
                 *USER_AS.lock() = None;
-                return TestResult::Fail("anonymous MAP_SHARED has no retained frame");
+                return TestResult::Fail("anonymous MAP_SHARED fault did not stay sparse");
             }
         };
-
-        // NEXT_HANDLE is monotonic and kernel tests are serialized. Creating
-        // one probe handle reveals the immediately preceding hidden handle
-        // without adding a registry-enumeration API solely for this test.
-        let probe = (vtable.create)(TASK, 4096);
-        if probe == 0 {
+        if aspace.memory_stats().resident_pages != 1 {
             *USER_AS.lock() = None;
-            return TestResult::Fail("could not allocate probe shmem handle");
+            return TestResult::Fail("one shared-anonymous fault charged more than one page");
         }
-        let hidden = probe - 1;
-        let hidden_is_public = (vtable.pid_of)(hidden) != 0;
-        let backing_live = (vtable.owns_frame)(region.phys[0].raw());
-        let _ = (vtable.destroy)(probe);
-        if hidden_is_public || !backing_live {
-            let _ = aspace.unmap_region(VirtAddr::new(base));
-            *USER_AS.lock() = None;
-            return TestResult::Fail("hidden handle lifecycle is not remove-then-retain");
-        }
-
-        if aspace.unmap_region(VirtAddr::new(base)).is_err()
-            || (vtable.owns_frame)(region.phys[0].raw())
+        // SAFETY: `phys` is the live allocator frame owned by the mapping's
+        // memfile; the kernel direct map covers it for this read-only check.
+        if unsafe { core::slice::from_raw_parts(phys.kernel_ptr::<u8>(), 4096) }
+            .iter()
+            .any(|byte| *byte != 0)
         {
             *USER_AS.lock() = None;
-            return TestResult::Fail("final anonymous shared unmap did not reclaim backing");
+            return TestResult::Fail("fresh shared-anonymous page was not zeroed");
         }
+
+        if aspace.unmap_region(VirtAddr::new(base)).is_err() {
+            *USER_AS.lock() = None;
+            return TestResult::Fail("anonymous MAP_SHARED unmap failed");
+        }
+        crate::mapped_file::unmap_current(base);
         *USER_AS.lock() = None;
         TestResult::Pass
     }
     kernel_test_in!(
         "userspace",
-        smoke_mmap_shared_anon_retires_hidden_handle_on_success
+        smoke_mmap_shared_anon_faults_sparse_shmem_lazily
     );
 
     fn smoke_mmap_private_file_faults_owned_pages_lazily() -> TestResult {

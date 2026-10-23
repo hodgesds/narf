@@ -1617,7 +1617,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if self.large_file.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut bytes = vec![0u8; 1024];
+        // The primary superblock is exactly 1024 bytes. Keep this fixed-size
+        // read/modify/write scratch on the kernel-task stack: large-file
+        // promotion can run while the machine is under writeback pressure,
+        // and failing an otherwise unrelated heap allocation here must not
+        // turn a recoverable filesystem error into a kernel OOM panic.
+        let mut bytes = [0u8; 1024];
         self.read_byte_range(1024, &mut bytes).await?;
         let ro_compat = u32::from_le_bytes(bytes[100..104].try_into().expect("four bytes"))
             | super::superblock::ro_compat::LARGE_FILE;
@@ -1634,7 +1639,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if blocks == 0 && inodes == 0 {
             return Ok(());
         }
-        let mut bytes = vec![0u8; 1024];
+        // Allocation/free updates are themselves reached while process and
+        // inode teardown is trying to relieve memory pressure. The on-disk
+        // primary superblock has a fixed 1024-byte size, so a stack buffer
+        // avoids depending on slab growth in the emergency reserve window.
+        let mut bytes = [0u8; 1024];
         self.read_byte_range(1024, &mut bytes).await?;
         for (lo_off, hi_off, delta) in [(12usize, Some(344usize), blocks), (16, None, inodes)] {
             if delta == 0 {

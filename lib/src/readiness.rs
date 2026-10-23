@@ -58,6 +58,10 @@ struct Waiter {
     waker: Waker,
     /// Linux `WQ_FLAG_EXCLUSIVE`: wake at most one such waiter for an event.
     exclusive: bool,
+    /// Persistent exclusive waiters are epoll registrations. They stay on the
+    /// provider wait queue and rotate to the FIFO tail after selection; blocking
+    /// syscall waiters remain logically dequeued until they explicitly re-arm.
+    persistent: bool,
 }
 
 struct Inner {
@@ -117,7 +121,11 @@ impl Inner {
                 continue;
             }
             if waiter.interest & bits != 0 {
+                let persistent = waiter.persistent;
                 wake(id, &waiter.waker);
+                if persistent {
+                    self.exclusive_order.push_back(id);
+                }
                 return Some(id);
             }
             self.exclusive_order.push_back(id);
@@ -357,6 +365,7 @@ impl Readiness {
                 interest,
                 waker: waker.clone(),
                 exclusive,
+                persistent: false,
             },
         );
         if exclusive {
@@ -385,8 +394,30 @@ impl Readiness {
                 interest,
                 waker: waker.clone(),
                 exclusive: false,
+                persistent: true,
             },
         );
+        g.mask & interest
+    }
+
+    /// Persistently register a Linux `EPOLLEXCLUSIVE` observer. Each provider
+    /// event selects one matching exclusive registration and rotates it to the
+    /// FIFO tail, while ordinary persistent observers still all wake. Selection
+    /// is therefore attached to the source wait queue rather than to a numeric
+    /// fd in an epoll instance.
+    pub fn arm_persistent_exclusive(&self, id: u64, interest: u32, waker: &Waker) -> u32 {
+        let mut g = self.inner.lock();
+        g.remove_exclusive_id(id);
+        g.waiters.insert(
+            id,
+            Waiter {
+                interest,
+                waker: waker.clone(),
+                exclusive: true,
+                persistent: true,
+            },
+        );
+        g.exclusive_order.push_back(id);
         g.mask & interest
     }
 
@@ -500,6 +531,26 @@ mod tests {
     }
 
     #[test]
+    fn persistent_waiter_survives_stale_external_reconcile() {
+        let r = Readiness::new(0);
+        let n = Arc::new(AtomicU32::new(0));
+        let w = counting_waker(&n);
+
+        // Providers whose authoritative level lives outside Readiness (for
+        // example signalfd) publish the waiter first, then sample and reconcile
+        // that external state. Model an event landing after a false sample but
+        // before its stale clear: the level may be cleared, but the wake must
+        // already be durable and the persistent waiter must remain installed.
+        assert_eq!(r.arm_persistent(1, IN, &w), 0);
+        r.set(IN, 0);
+        r.set(0, IN);
+
+        assert_eq!(n.load(Ordering::SeqCst), 1, "the racing event must wake");
+        assert_eq!(r.mask(), 0, "the stale sample may win the level");
+        assert_eq!(r.waiter_count(), 1, "the persistent arm must survive");
+    }
+
+    #[test]
     fn set_then_arm_returns_ready_never_parks() {
         let r = Readiness::new(0);
         let n = Arc::new(AtomicU32::new(0));
@@ -601,6 +652,38 @@ mod tests {
         assert_eq!(first.load(Ordering::SeqCst), 2);
         assert_eq!(second.load(Ordering::SeqCst), 1);
         assert_eq!(observer.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn persistent_exclusive_rotates_at_the_source() {
+        let r = Readiness::new(0);
+        let first = Arc::new(AtomicU32::new(0));
+        let second = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(AtomicU32::new(0));
+
+        assert_eq!(
+            r.arm_persistent_exclusive(0x101, IN, &counting_waker(&first)),
+            0
+        );
+        assert_eq!(
+            r.arm_persistent_exclusive(0x202, IN, &counting_waker(&second)),
+            0
+        );
+        assert_eq!(r.arm_persistent(0x303, IN, &counting_waker(&observer)), 0);
+
+        r.notify(IN);
+        r.notify(IN);
+        r.notify(IN);
+        assert_eq!(first.load(Ordering::SeqCst), 2);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.load(Ordering::SeqCst), 3);
+        assert_eq!(r.waiter_count(), 3, "persistent selections retain wakers");
+
+        r.disarm(0x101);
+        r.notify(IN);
+        assert_eq!(first.load(Ordering::SeqCst), 2);
+        assert_eq!(second.load(Ordering::SeqCst), 2);
+        assert_eq!(observer.load(Ordering::SeqCst), 4);
     }
 
     #[test]

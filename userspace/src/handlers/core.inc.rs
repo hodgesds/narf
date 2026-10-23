@@ -83,27 +83,44 @@ pub fn wake_signal(task_id: u64) {
 pub(crate) fn signal_wake_up(task_id: u64, deliverable: bool) {
     // Deref the ctx UNDER the registry lock (see `with_user_task_ctx`) so a
     // concurrent task-exit + box-drop on another CPU can't free it mid-deref.
-    let sem_wait = crate::user_task::with_user_task_ctx(task_id, |uctx| {
+    let task_state = crate::user_task::with_user_task_ctx(task_id, |uctx| {
         let deadline = uctx.sleep_deadline_ns.load(Ordering::Acquire);
         let sigwait_set = uctx.sigwait_set.load(Ordering::Acquire);
         if signal_wake_cuts_deadline(deadline, sigwait_set, deliverable) {
             uctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
-        uctx.sem_wait_pending.load(Ordering::Acquire).then(|| {
-            (
+        (
+            uctx.sem_wait_pending.load(Ordering::Acquire).then(|| (
                 uctx.sem_wait_ipc_ns.load(Ordering::Relaxed),
                 uctx.sem_wait_id.load(Ordering::Relaxed),
-            )
-        })
+            )),
+            uctx.scheduler_waker(),
+        )
     });
     let waker = {
         let mut g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
         g.as_mut().and_then(|m| m.remove(&task_id))
     };
+    let had_wait_waker = waker.is_some();
     if let Some(w) = waker {
         w.wake();
     }
-    if let Some(Some((ipc_ns, id))) = sem_wait {
+    // A wait-specific signal waker exists only while a park site is fully
+    // armed. SIGKILL can land after one wake was consumed but before the next
+    // park registers, leaving an off-CPU slot asleep despite its pending bit.
+    // The task-lifetime scheduler handle is NARF's `try_to_wake_up` fallback:
+    // use it only when the precise waiter was absent, avoiding a duplicate
+    // wake/refcount round-trip on the normal path.
+    if !had_wait_waker {
+        if let Some(w) = task_state
+            .as_ref()
+            .and_then(|(_, scheduler_waker)| scheduler_waker.as_ref())
+        {
+            w.wake_by_ref();
+        }
+    }
+    let sem_wait = task_state.and_then(|(sem_wait, _)| sem_wait);
+    if let Some((ipc_ns, id)) = sem_wait {
         crate::sysvipc::wake_sem_waiter_for_signal(task_id, ipc_ns, id);
     }
 }

@@ -1480,10 +1480,11 @@ pub trait FileOps: Send + Sync {
     /// stays live for the fd's whole membership in the set (never consumed on
     /// readiness). Returns `Some(current_ready_bits)` if the file is on the
     /// durable readiness path (so the caller can seed an initial ready-list
-    /// edge), `None` if it has no cell (timerfd / raw netlink / nested epoll —
-    /// those fall back to the full-scan + rising-mask path). The default arms the
+    /// edge), `None` if it has no cell (timerfd / raw netlink / other legacy
+    /// providers fall back to the cold scan + rising-mask path). The default arms the
     /// single directly-owned cell; composite / behind-a-lock files (sockets)
-    /// override to reconcile then persistently arm each of their cells.
+    /// override to persistently arm and, where necessary, reconcile each of
+    /// their cells without opening a check-before-register window.
     fn arm_readiness_persistent(
         &self,
         id: u64,
@@ -1492,6 +1493,23 @@ pub trait FileOps: Send + Sync {
     ) -> Option<u32> {
         self.readiness()
             .map(|r| r.arm_persistent(id, interest, waker))
+    }
+
+    /// Register a persistent `EPOLLEXCLUSIVE` observer on the provider's wait
+    /// queue. The default covers directly-owned readiness cells; composite or
+    /// lock-guarded providers override it just like
+    /// [`Self::arm_readiness_persistent`].
+    fn arm_readiness_persistent_exclusive(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        if let Some(readiness) = self.readiness() {
+            Some(readiness.arm_persistent_exclusive(id, interest, waker))
+        } else {
+            self.arm_readiness_persistent(id, interest, waker)
+        }
     }
 
     /// Remove `task_id`'s registration from this file's durable readiness.
@@ -3000,9 +3018,8 @@ pub fn resolve_directory_dentry_async<'a>(
     root: Arc<Dentry>,
     path: &'a str,
 ) -> FsFuture<'a, Arc<Dentry>> {
-    let path = String::from(path);
     Box::pin(async move {
-        match pathwalk::resolve_directory(root.clone(), &path) {
+        match pathwalk::resolve_directory(root.clone(), path) {
             pathwalk::FastDirectory::Hit(directory) => return Ok(directory),
             pathwalk::FastDirectory::Negative => return Err(FsError::NotFound),
             pathwalk::FastDirectory::Retry => {}
@@ -3125,26 +3142,36 @@ pub fn resolve_async_dentry_ext<'a>(
     path: &'a str,
     follow_final: bool,
 ) -> FsFuture<'a, Arc<dyn FileOps>> {
-    let initial = alloc::string::String::from(path);
     Box::pin(async move {
-        if initial.is_empty() {
+        if path.is_empty() {
             return Err(FsError::InvalidPath);
         }
-        if initial.as_bytes()[0] == b'/' {
+        if path.as_bytes()[0] == b'/' {
             return Err(FsError::InvalidPath);
         }
 
-        if let Some(result) = resolve_cached_dentry(root.clone(), &initial) {
+        if let Some(result) = resolve_cached_dentry(root.clone(), path) {
             return result;
         }
 
         // Components left to consume, head-first so symlink targets can
-        // splice in at the front of the remainder.
-        let mut remaining: alloc::collections::VecDeque<alloc::string::String> = initial
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(alloc::string::String::from)
-            .collect();
+        // splice in at the front of the remainder. Ordinary components borrow
+        // the caller's path: allocating a String for every segment made a
+        // three-component procfs lookup request a 96-byte VecDeque buffer plus
+        // three separate strings while the machine was already under OOM
+        // pressure. Reserve the queue fallibly and allocate owned components
+        // only for symlink targets whose read buffer cannot outlive the loop.
+        let component_count = path.split('/').filter(|s| !s.is_empty()).count();
+        let mut remaining: alloc::collections::VecDeque<alloc::borrow::Cow<'a, str>> =
+            alloc::collections::VecDeque::new();
+        remaining
+            .try_reserve_exact(component_count)
+            .map_err(|_| FsError::OutOfMemory)?;
+        remaining.extend(
+            path.split('/')
+                .filter(|s| !s.is_empty())
+                .map(alloc::borrow::Cow::Borrowed),
+        );
         if remaining.is_empty() {
             return Err(FsError::InvalidPath);
         }
@@ -3217,6 +3244,9 @@ pub fn resolve_async_dentry_ext<'a>(
                             pathwalk::cache_directory(&current, &seg, token, next.clone())
                         })
                         .unwrap_or_else(|| pathwalk::reference_directory(&current, &seg, next));
+                    parent_chain
+                        .try_reserve(1)
+                        .map_err(|_| FsError::OutOfMemory)?;
                     parent_chain.push(current);
                     current = next_dentry;
                     continue;
@@ -3269,15 +3299,19 @@ pub fn resolve_async_dentry_ext<'a>(
                 // Read the target. POSIX symlink targets are bounded
                 // by SYMLINK_MAX (typically 4096); we cap defensively
                 // at a single page.
-                let mut buf = alloc::vec![0u8; 4096];
+                // Path lookup is routinely exercised while reporting memory
+                // pressure (`/proc/self/*`). An infallible page-sized Vec here
+                // turned a recoverable kernel-heap miss into a whole-kernel
+                // panic before kswapd/OOM teardown could run. Keep the same
+                // one-page bound, but surface ENOMEM through the filesystem
+                // error path when the slab cannot grow.
+                let mut buf = alloc::vec::Vec::new();
+                buf.try_reserve_exact(4096)
+                    .map_err(|_| FsError::OutOfMemory)?;
+                buf.resize(4096, 0);
                 let n = f.read(0, &mut buf).await?;
                 let target = core::str::from_utf8(&buf[..n]).map_err(|_| FsError::InvalidPath)?;
                 let absolute = target.starts_with('/');
-                let target_components: alloc::vec::Vec<alloc::string::String> = target
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .map(alloc::string::String::from)
-                    .collect();
                 if absolute {
                     // Restart from the mount-root for absolute targets.
                     parent_chain.clear();
@@ -3286,8 +3320,17 @@ pub fn resolve_async_dentry_ext<'a>(
                 // Splice target components at the front of remaining.
                 // Push in reverse so the first target component pops
                 // off the queue next.
-                for c in target_components.into_iter().rev() {
-                    remaining.push_front(c);
+                let target_component_count = target.split('/').filter(|s| !s.is_empty()).count();
+                remaining
+                    .try_reserve(target_component_count)
+                    .map_err(|_| FsError::OutOfMemory)?;
+                for component in target.rsplit('/').filter(|s| !s.is_empty()) {
+                    let mut owned = alloc::string::String::new();
+                    owned
+                        .try_reserve_exact(component.len())
+                        .map_err(|_| FsError::OutOfMemory)?;
+                    owned.push_str(component);
+                    remaining.push_front(alloc::borrow::Cow::Owned(owned));
                 }
                 continue;
             }
@@ -3315,6 +3358,9 @@ pub fn resolve_async_dentry_ext<'a>(
             let next_dentry = dir_token
                 .and_then(|token| pathwalk::cache_directory(&current, &seg, token, next.clone()))
                 .unwrap_or_else(|| pathwalk::reference_directory(&current, &seg, next));
+            parent_chain
+                .try_reserve(1)
+                .map_err(|_| FsError::OutOfMemory)?;
             parent_chain.push(current);
             current = next_dentry;
         }

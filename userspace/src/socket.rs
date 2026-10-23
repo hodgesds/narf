@@ -4055,15 +4055,16 @@ impl FileOps for SocketFile {
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
         use core::task::Poll;
-        // One-shot arm: each cell's `arm` registers-or-returns-ready. Collect the
-        // satisfied bits; `Some(0)` means "cell-backed but nothing ready yet" →
-        // Pending (waiters registered), non-zero → Ready.
-        self.arm_cells(interest, |cell, bits| {
-            match cell.arm(task_id, bits, waker) {
-                Poll::Ready(b) => b,
-                Poll::Pending => 0,
-            }
-        })
+        // Publish every waiter even when a cell currently carries a stale ready
+        // level. Some socket classes reconcile their cell from external state
+        // inside `arm_cells`; persistent registration makes an event racing that
+        // sample durable. A Ready result is still one-shot to the caller, so
+        // remove all registrations before returning it.
+        self.arm_cells(
+            interest,
+            |cell, bits| cell.arm_persistent(task_id, bits, waker),
+            Some(task_id),
+        )
         .map(|ready| {
             if ready != 0 {
                 Poll::Ready(ready)
@@ -4084,7 +4085,24 @@ impl FileOps for SocketFile {
         interest: u32,
         waker: &core::task::Waker,
     ) -> Option<u32> {
-        self.arm_cells(interest, |cell, bits| cell.arm_persistent(id, bits, waker))
+        self.arm_cells(
+            interest,
+            |cell, bits| cell.arm_persistent(id, bits, waker),
+            None,
+        )
+    }
+
+    fn arm_readiness_persistent_exclusive(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.arm_cells(
+            interest,
+            |cell, bits| cell.arm_persistent_exclusive(id, bits, waker),
+            None,
+        )
     }
 
     /// Remove this task's waiter from both rings of a connected pair. Safe to
@@ -4183,6 +4201,7 @@ impl SocketFile {
         &self,
         interest: u32,
         mut arm_one: F,
+        one_shot_id: Option<u64>,
     ) -> Option<u32> {
         let want_in = interest & narf_filesystem::POLL_IN != 0;
         let want_out = interest & narf_filesystem::POLL_OUT != 0;
@@ -4191,10 +4210,16 @@ impl SocketFile {
         }
         if self.is_inet_icmp_echo() {
             return self.icmp_echo_socket().map(|echo| {
-                arm_one(
+                let ready = arm_one(
                     echo.readiness(),
                     interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
-                )
+                );
+                if ready != 0 {
+                    if let Some(id) = one_shot_id {
+                        echo.readiness().disarm(id);
+                    }
+                }
+                ready
             });
         }
         // Classify the socket under one short lock, cloning any rings needed.
@@ -4265,49 +4290,68 @@ impl SocketFile {
                         narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
                     );
                 }
+                if ready != 0 {
+                    if let Some(id) = one_shot_id {
+                        rx.readiness().disarm(id);
+                        tx.readiness().disarm(id);
+                    }
+                }
                 Some(ready)
             }
             // Kernel-TCP: reconcile both directions to the live level before
-            // arming. RX/close events drive POLL_IN; ACKs that free send-buffer
-            // space drive POLL_OUT.
+            // returning. Publish the waiter first: an RX/ACK racing the sample
+            // either appears in `armed`, updates the final level, or wakes the
+            // already-registered waiter before a stale clear. RX/close events
+            // drive POLL_IN; ACKs that free send-buffer space drive POLL_OUT.
             Arm::Wired(tcb_id) => {
                 let cell = crate::handlers::tcb_cell(tcb_id);
                 let directions = narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT;
-                // Sample only after the cell exists, then verify once after
-                // publishing. An ACK can race the first sample: its notify
-                // sets POLL_OUT, and a stale "full" sample must not clear that
-                // edge immediately before `arm` registers the writer. The
-                // second sample closes that check/publish window; an event
-                // after it is serialized by Readiness::set vs arm.
-                for _ in 0..2 {
-                    let live = (if narf_net::tcp_stack::readable(tcb_id) {
-                        narf_filesystem::POLL_IN
-                    } else {
-                        0
-                    }) | (if narf_net::tcp_stack::writable(tcb_id) {
-                        narf_filesystem::POLL_OUT
-                    } else {
-                        0
-                    });
-                    cell.set(live, directions & !live);
+                let interested = interest & directions;
+                let armed = arm_one(&cell, interested);
+                let live = (if narf_net::tcp_stack::readable(tcb_id) {
+                    narf_filesystem::POLL_IN
+                } else {
+                    0
+                }) | (if narf_net::tcp_stack::writable(tcb_id) {
+                    narf_filesystem::POLL_OUT
+                } else {
+                    0
+                });
+                cell.set(live, directions & !live);
+                let ready = armed | (cell.mask() & interested);
+                if ready != 0 {
+                    if let Some(id) = one_shot_id {
+                        cell.disarm(id);
+                    }
                 }
-                Some(arm_one(
-                    &cell,
-                    interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
-                ))
+                Some(ready)
             }
             // Connectionless datagram: one SocketFile-level cell carrying
             // POLL_OUT always (a dgram is always sendable) + POLL_IN when the
             // inbox is non-empty.
-            Arm::Dgram => Some(arm_one(
-                &self.dgram_readiness,
-                interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
-            )),
+            Arm::Dgram => {
+                let ready = arm_one(
+                    &self.dgram_readiness,
+                    interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
+                );
+                if ready != 0 {
+                    if let Some(id) = one_shot_id {
+                        self.dgram_readiness.disarm(id);
+                    }
+                }
+                Some(ready)
+            }
             // Listener: only ever POLL_IN-ready (a pending connection to accept).
             // A POLL_OUT-only interest has nothing durable to wait for.
             Arm::Listener => {
                 if want_in {
-                    Some(arm_one(&self.listener_readiness, narf_filesystem::POLL_IN))
+                    let ready = arm_one(&self.listener_readiness, narf_filesystem::POLL_IN);
+                    if ready != 0 {
+                        if let Some(id) = one_shot_id {
+                            self.listener_readiness.disarm(id);
+                        }
+                    }
+                    Some(ready)
                 } else {
                     None
                 }
@@ -4317,16 +4361,27 @@ impl SocketFile {
             // the emit path sets its rising edge.
             Arm::Uevent => {
                 if want_in {
-                    Some(arm_one(&self.uevent_readiness, narf_filesystem::POLL_IN))
+                    let ready = arm_one(&self.uevent_readiness, narf_filesystem::POLL_IN);
+                    if ready != 0 {
+                        if let Some(id) = one_shot_id {
+                            self.uevent_readiness.disarm(id);
+                        }
+                    }
+                    Some(ready)
                 } else {
                     None
                 }
             }
-            // Non-uevent netlink: reconcile the durable cell to the live queue
-            // level (POLL_OUT always sendable + POLL_IN iff readable), then arm.
-            // Each enqueue `notify`s POLL_IN so a same-level refill is still an
-            // epoll ready-list edge.
+            // Non-uevent netlink: publish the waiter before reconciling the
+            // durable cell to the sampled queue level. Retain the arm-time mask
+            // because an enqueue between the earlier queue sample and this arm
+            // may already have latched POLL_IN; an enqueue after the arm wakes
+            // the waiter even if this stale sample subsequently clears it. Each
+            // enqueue `notify`s POLL_IN so a same-level refill is still an epoll
+            // ready-list edge.
             Arm::Netlink(readable) => {
+                let interested = interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT);
+                let armed = arm_one(&self.netlink_readiness, interested);
                 self.netlink_readiness.set(
                     if readable {
                         narf_filesystem::POLL_IN
@@ -4339,18 +4394,29 @@ impl SocketFile {
                         narf_filesystem::POLL_IN
                     },
                 );
-                Some(arm_one(
-                    &self.netlink_readiness,
-                    interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
-                ))
+                let ready = armed | (self.netlink_readiness.mask() & interested);
+                if ready != 0 {
+                    if let Some(id) = one_shot_id {
+                        self.netlink_readiness.disarm(id);
+                    }
+                }
+                Some(ready)
             }
-            Arm::Packet(sock) => Some(arm_one(
-                sock.readiness(),
-                interest
-                    & (narf_filesystem::POLL_IN
-                        | narf_filesystem::POLL_OUT
-                        | narf_filesystem::POLL_ERR),
-            )),
+            Arm::Packet(sock) => {
+                let ready = arm_one(
+                    sock.readiness(),
+                    interest
+                        & (narf_filesystem::POLL_IN
+                            | narf_filesystem::POLL_OUT
+                            | narf_filesystem::POLL_ERR),
+                );
+                if ready != 0 {
+                    if let Some(id) = one_shot_id {
+                        sock.readiness().disarm(id);
+                    }
+                }
+                Some(ready)
+            }
         }
     }
 

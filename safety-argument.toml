@@ -950,7 +950,7 @@ argument = "Ordinary externally-owned shared-alias publication, fork retention, 
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "Unnamed anonymous MAP_SHARED pages begin with one creator reference in a cache-line-isolated ownership shard. VMA publication retains one reference per nonzero backing page, fork retains another for each child alias, and rollback/unmap releases only after leaf and reverse-map retirement. The mmap path drops creator references while still excluded from global alias migration, so a physical-identity replacement cannot make a stale snapshot miss its ownership row. MOVE_ALL migration transfers the complete page reference count from old to new physical identity while all address-space shards are held, and final release removes the row before returning the frame to the allocator. Named and System V objects retain their existing handle registry and lock accounting; ownership-dispatch booleans choose exactly one registry without granting new mapping, domain, or capability authority."
+argument = "Unnamed anonymous MAP_SHARED uses a mapping-owned sparse FileOps lifetime with four lock-free inline page slots and a fallible RegionBacking overflow. VMA publication records an empty FILE_DEMAND backing and a strong owner before any fault can observe it; fork and VMA splits clone that owner, so every alias resolves one object offset and observes the same frame. Inline publication zeroes a fresh frame before release-CAS and frees a losing concurrent candidate; overflow publication serializes the exact fallible slot reservation and frame install. Memory then publishes the selected frame under the existing page-scoped ticket and region lock, while an unpublished or cancelled fault remains covered by the mapping owner. Region teardown retires leaves and reverse maps before the corresponding owner row can be removed; the final owner drop frees every resident page. Named and System V objects retain their existing handle registry and lock accounting. No file owner, backing frame, mapping permission, domain right, or capability authority is published before its existing transaction commits."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
@@ -1212,7 +1212,7 @@ argument = "The fork selector still considers only allowed online CPUs and still
 # explicitly authorized unsigned commits for this branch.
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "RegionBacking changes base-page ownership metadata without adding a trusted subsystem or moving a domain boundary. Logical page offsets remain distinct from block-directory positions. Backing clones copy metadata only; AddressSpace remains responsible for every COW/shared retain, reverse-map transfer, and frame release. Sparse chunks preserve absolute virtual offsets through split, fork, protection rewrite, relocation, and teardown."
+argument = "RegionBacking changes base-page ownership metadata without adding a trusted subsystem or moving a domain boundary. Logical page offsets remain distinct from block-directory positions, and each 64-page directory bucket now retains only its fallibly reserved slot prefix. Backing clones copy metadata only; AddressSpace remains responsible for every COW/shared retain, reverse-map transfer, and frame release. Sparse chunks preserve absolute virtual offsets through split, fork, protection rewrite, relocation, and teardown."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
@@ -1220,7 +1220,7 @@ argument = "VMA admission, W^X and capability/domain checks are unchanged. A dem
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L44"
-argument = "A userspace-controlled high virtual offset reserves one fixed-size backing block rather than an offset-sized vector. Holes remain implicit through cloning and windowing. Shared frames still use external-owner hooks; private frames retain COW-aware release. No missing-block lookup fabricates physical backing or grants access to another mapping."
+argument = "A userspace-controlled high virtual offset reserves one bounded directory bucket and only the prefix through that exact slot rather than an offset-sized vector. A tiny mapping therefore cannot amplify one resident page into a 64-slot payload. Holes remain implicit through cloning and windowing. Shared frames still use external-owner hooks; private frames retain COW-aware release. No missing-slot lookup fabricates physical backing or grants access to another mapping."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1395,7 +1395,7 @@ argument = "Executor core (scheduler/src/lib.rs): poll_one_round_nested wraps po
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "frame/src/bare_main.rs installs narf_rcu's reclaim-offload hook (rcu_reclaim_kick) in run_async_demo. The hook only calls narf_scheduler::spawn_stackful on a task that runs narf_rcu::run_offloaded_reclaim. Reclamation still frees only nodes whose QSBR grace period has elapsed, the same objects at the same safety point as before. Only the context changes: a spawned kernel task instead of whatever frame reported quiescence. Destructors run later, never earlier, so no reader can lose its object. No authority, mapping, domain transition or capability change."
+argument = "frame/src/bare_main.rs installs narf_rcu's reclaim-offload hook (rcu_reclaim_kick) in run_async_demo after allocating one persistent rcuo0 worker and its stack while boot still has memory headroom. The hook only sets a work bit and wakes the stored task waker; it allocates no task or stack under memory pressure. The worker uses a register-then-recheck park protocol, while narf_rcu clears its coalescing bit before taking the pending list, so a callback published across either wake boundary cannot be stranded. Reclamation still frees only nodes whose QSBR grace period has elapsed, the same objects at the same safety point as before. Only the execution context changes from one newly spawned task per batch to the persistent worker; destructors still run later, never earlier, and never in the quiescent reporter's lock context. No authority, mapping, domain transition or capability change."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1713,3 +1713,69 @@ ref = "security-model/specification/spec.md#L42"
 agent = "Muse Wonder"
 prompt_hash = "eb7c13b58f312b98786e224dccf2048116c83b4f7c7751c4db7ebd34e16c6024"
 argument = "The KASAN shadow carve in frame/ now places the reserved span disjoint from every boot exclusion already in the excludes list (relocated kernel image + window span, hugepage reservations, initramfs), stepping the candidate span below each intersecting exclusion. Previously it took the usable region's tail unconditionally, and on a high KASLR slide the relocated image reaches into that tail, so kasan::init's memset would have zeroed the kernel's own .bss (live page tables included). The shadow remains buddy-excluded reserved RAM reached only via the direct map, and placement on the common no-overlap boot is byte-identical to before."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "The OOM change stays inside the existing memory TCB member and changes only which private backing an already-SIGKILLed victim may surrender. It adds no TCB member, mapping authority, domain transition, or capability path. SHARED backing remains excluded, so the reaper never frees frames owned by an external mapping registry."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "LOCKED is a reclaim-policy bit, not ownership or domain authority. The reaper still requires an OOM-selected victim whose death has been initiated, pins the AddressSpace with an Arc, serializes against region mutation with try_lock, removes reverse maps, completes a forced tag-wide TLB shootdown before frame reuse, and zeroes authoritative backing for idempotent exit teardown. No capability check or domain tag is weakened."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L171"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "A user process can still request ordinary mlock semantics while alive, but mlock no longer prevents the OOM reaper from recovering that process's private frames after SIGKILL. Skipping already-condemned thread groups also prevents repeated selection and reporting from draining the emergency kernel reserve without reclaim progress."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L171"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "Partial mlock and mprotect now prepare every sparse-backing boundary window before changing the live VMA tree. Metadata exhaustion returns AllocationFailed with mappings, permissions, backing ownership, maintained counters, and publication generations unchanged. Successful publication is allocation-free and keeps the region lock held, so the change neither creates an allocator-starvation panic nor exposes a partially split address space."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L171"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "Eager mlock still allocates through the reserve-respecting user allocator and returns EAGAIN without publishing an unowned frame when population fails. Because that synchronous syscall does not enter frame's fault-wait table, it now converts only its genuine typed reserve-pressure result into the existing explicitly scoped non-fault OOM request when overcommit policy permits. Kswapd still rechecks the reserve after a zero-progress reclaim pass, selects under the existing serialized policy, and SIGKILLs before reaping. Reaping requires the scheduler-maintained live-task count to reach zero plus invalidation-before-reuse; passive Arc owners may pin lifetime but cannot authorize execution. Never-overcommit mode remains graceful failure only; mapping permissions, frame identity, capability authority, and domain state are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "The scheduler and memory changes remain inside existing TCB members. Each user TaskSlot contributes exactly one atomic execution-liveness count: spawn attaches before registry/run-queue publication, exec attaches the replacement before publishing it and detaches the displaced root after the owner switch, and final slot Drop detaches only after the future cannot be polled again. Thus an acquire observation of zero proves no task can newly fault or contend an address-space lock. Passive Arc owners, including the active-mm handoff that may retain a completed task's hardware root, no longer delay that proof; the existing forced tag-wide shootdown still completes before any frame is reused."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "The OOM queue is a fixed pre-reserved VecDeque with one serialized in-flight victim and an extra reserved requeue slot, so front removal and back insertion are O(1) and allocate nothing under pressure. A live victim waits for its final task-detach event without consuming retries or spinning. The boot-preallocated oom_reaper worker uses a register-then-recheck wake protocol; only a post-quiescence region-lock collision requests a cooperative bounded retry. The queue Arc pins allocation lifetime, region try_lock serializes metadata, SHARED backing remains excluded, reverse maps retire before allocator return, and the full TLB shootdown remains the frame-reuse barrier."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "Demand-fault reverse-map publication is now failure-atomic under allocator pressure. The fault path fallibly reserves the physical-key row and any alias capacity while its ticket still owns the unpublished frame; a unique first owner remains inline. Leaf installation, authoritative backing publication, and reserved-owner commit occur under the same region lock without allocation. Cancellation or installation failure releases the reservation before freeing the private frame or dropping the shared reference, so every visible mapping still has reverse-map authority and no failed path leaks ownership or exposes a reusable frame."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "Eager mlock and MCL_CURRENT population now consult a caller-supplied fatal-signal predicate before each page fault, matching Linux GUP's bounded SIGKILL escape. The predicate runs outside address-space, allocator, rmap, and page-table locks and grants no new authority. Cancellation allocates or maps no further frame, returns through the ordinary syscall signal-delivery boundary, and deliberately retains the already-published LOCKED metadata just as any other Linux-compatible population failure does."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "The slab change remains inside memory/, an existing TCB member, and changes only the internal organization and bounded reclaim traversal of already-owned kernel heap blocks. It adds no TCB member, mapping authority, capability path, or domain transition."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-5"
+prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
+argument = "Each slab block remains in exactly one state: allocated, a per-CPU magazine, the locked central FIFO, or the locked reclaim candidate. Reclaim detaches a frame only after collecting exactly PAGE_SIZE / class_size distinct central-free blocks with the same page base; magazine or allocated blocks therefore prevent completion. The persistent cursor examines a finite queue snapshot in at most 2,048-node lock holds, excludes later producers from that snapshot, and returns an incomplete candidate to the FIFO without allocation. Complete frames leave class ownership under the lock and reach the buddy only after the class guard is released, preserving invalidation-free kernel-heap ownership and allocator reentrancy rules."

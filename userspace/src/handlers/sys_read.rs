@@ -54,6 +54,15 @@ pub(super) enum TransactionalReadError {
     BadFd,
 }
 
+/// Allocate an initialized syscall staging buffer without invoking the
+/// kernel's infallible allocation-error path under memory pressure.
+fn try_zeroed_staging(len: usize) -> Result<alloc::vec::Vec<u8>, ()> {
+    let mut staging = alloc::vec::Vec::new();
+    staging.try_reserve_exact(len).map_err(|_| ())?;
+    staging.resize(len, 0);
+    Ok(staging)
+}
+
 /// Pipe/FIFO reads must not dequeue bytes before the guarded user copy. A
 /// prior range check cannot exclude a concurrent unmap; these concrete stream
 /// surfaces hold the prefix stable and commit consumption only after copy.
@@ -131,7 +140,10 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     // pending ENETDOWN. FileOps::read has no errno-preserving error carrier,
     // so run packet_recvmsg directly, as sock_read_iter does in Linux.
     if let Some(packet) = crate::socket::packet::packet_socket_of(endpoint.ops.as_ref()) {
-        let mut staging = alloc::vec![0u8; count];
+        let Ok(mut staging) = try_zeroed_staging(count) else {
+            ctx.set_return(errno_ret(ENOMEM));
+            return;
+        };
         match packet.packet_read(&mut staging) {
             Ok(n) => {
                 // SAFETY: the complete destination range was validated above.
@@ -163,7 +175,10 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         if let Some(tcb) = sock.kernel_tcb_id() {
             let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
             let nonblock = endpoint.nonblocking() || sock.is_nonblock();
-            let mut staging = alloc::vec![0u8; count.min(1 << 20)];
+            let Ok(mut staging) = try_zeroed_staging(count.min(1 << 20)) else {
+                ctx.set_return(errno_ret(ENOMEM));
+                return;
+            };
             match narf_net::tcp_stack::recv_errno(tcb, &mut staging) {
                 Ok(n) => {
                     // SAFETY: the complete destination range was validated above.
@@ -327,7 +342,14 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                 Err(_) => break,
             }
         }
-        let mut staging = alloc::vec![0u8; want];
+        let mut staging = match try_zeroed_staging(want) {
+            Ok(staging) => staging,
+            Err(()) if total == 0 => {
+                ctx.set_return(errno_ret(ENOMEM));
+                return;
+            }
+            Err(()) => break,
+        };
         // Poll the read future ONCE (Pending → WouldBlock) instead of
         // spin-pumping it in `poll_blocking` when either
         //   - the description is O_NONBLOCK on a stream/char device: it must

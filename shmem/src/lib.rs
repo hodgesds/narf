@@ -144,7 +144,10 @@ fn allocate_zeroed_frames(len: u64) -> Result<(u64, Vec<u64>), ShmemError> {
     if pages > MAX_PAGES_PER_HANDLE {
         return Err(ShmemError::BadLen);
     }
-    let mut frames = Vec::with_capacity(pages);
+    let mut frames = Vec::new();
+    frames
+        .try_reserve_exact(pages)
+        .map_err(|_| ShmemError::OutOfMemory)?;
     for _ in 0..pages {
         let frame = match narf_memory::alloc_frame() {
             Ok(frame) => frame,
@@ -205,6 +208,11 @@ fn vt_create_anonymous(len: u64, out: &mut Vec<u64>) -> bool {
         Ok(result) => result,
         Err(_) => return false,
     };
+    out.clear();
+    if out.try_reserve_exact(frames.len()).is_err() {
+        free_phys_frames(frames);
+        return false;
+    }
     for &phys in &frames {
         let mut guard = ANONYMOUS_PAGES[anonymous_page_shard(phys)].refs.lock();
         let refs = guard.get_or_insert_with(BTreeMap::new);
@@ -213,7 +221,6 @@ fn vt_create_anonymous(len: u64, out: &mut Vec<u64>) -> bool {
             "anonymous shmem frame already indexed"
         );
     }
-    out.clear();
     out.extend_from_slice(&frames);
     true
 }

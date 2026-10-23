@@ -169,6 +169,11 @@ pub struct UserTaskCtx {
     /// That closes the level-triggered scan→register race without treating
     /// unrelated changes to the global readiness generation as our event.
     pub epoll_wait_fd: AtomicU64,
+    /// Task-owned intrusive epoll wait node. A blocking epoll syscall can be on
+    /// only one instance queue at a time, so embedding one stable Arc gives
+    /// registration, wake selection, re-arm, and removal O(1) linkage without
+    /// a task-id map or callback-time allocation.
+    pub(crate) epoll_wait_node: alloc::sync::Arc<crate::epoll::EpollWaitNode>,
     /// Futex word address this task is blocked on (`FUTEX_WAIT`), or 0 when
     /// not futex-waiting. Set by `sys_futex` before it yields; the poll
     /// routine registers `cx.waker()` in the per-uaddr futex wait queue so a
@@ -445,6 +450,15 @@ pub struct UserTaskCtx {
     /// (a timed FUTEX_WAIT) stores its kind after `own_stack_block`, which
     /// resets it to the default on entry so it never outlives one park.
     pub syscall_restart_kind: AtomicU32,
+    /// Scheduler-owned wake handle retained for this task's lifetime.
+    ///
+    /// Wait-specific registries still provide precise readiness routing, but
+    /// none is continuously installed: a signal can race the interval between
+    /// one park being consumed and the next wait site arming its waker. Linux
+    /// closes that interval through `task_struct`'s permanent scheduler state
+    /// (`try_to_wake_up`). Keeping the executor waker beside the task gives
+    /// NARF the same durable fallback without scanning run queues.
+    scheduler_waker: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>>,
     /// `restart_block` of a timed FUTEX_WAIT interrupted by a signal: the
     /// word it waited on and its ABSOLUTE monotonic deadline. Linux restarts
     /// such a wait through `futex_wait_restart` with the stored expiry, so
@@ -661,6 +675,26 @@ pub(crate) unsafe fn saved_syscall_regs(_top: u64, _state: *const u8) -> Option<
 }
 
 impl UserTaskCtx {
+    /// Publish the task's stable executor waker. The underlying WakeCell stays
+    /// the same across queue migration, so dispatches after the first normally
+    /// perform only the `will_wake` comparison.
+    pub(crate) fn install_scheduler_waker(&self, waker: &core::task::Waker) {
+        let mut installed = self.scheduler_waker.lock();
+        if !installed
+            .as_ref()
+            .is_some_and(|current| current.will_wake(waker))
+        {
+            *installed = Some(waker.clone());
+        }
+    }
+
+    /// Clone the lifetime-stable scheduler wake handle, if the task has been
+    /// dispatched at least once. Callers invoke it after dropping this lock so
+    /// raw-waker placement cannot re-enter while the task context is locked.
+    pub(crate) fn scheduler_waker(&self) -> Option<core::task::Waker> {
+        self.scheduler_waker.lock().as_ref().cloned()
+    }
+
     /// The syscall this task is blocked in: its NARF syscall id, then its six
     /// arguments — Linux `task_current_syscall()`, which decodes a blocked
     /// task's saved registers on demand rather than recording every entry.
@@ -752,6 +786,7 @@ impl UserTaskCtx {
             epoll_park_gen: AtomicU64::new(0),
             signal_park_gen: AtomicU64::new(0),
             epoll_wait_fd: AtomicU64::new(0),
+            epoll_wait_node: crate::epoll::EpollWaitNode::new(),
             futex_uaddr: AtomicU64::new(0),
             futex_namespace: AtomicU64::new(0),
             futex_park_gen: AtomicU64::new(0),
@@ -785,6 +820,7 @@ impl UserTaskCtx {
             fifo_open_pending_fd: AtomicU64::new(0),
             syscall_parked_restarting: AtomicBool::new(false),
             syscall_restart_kind: AtomicU32::new(SYSCALL_RESTART_SYS),
+            scheduler_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
             futex_restart_uaddr: AtomicU64::new(0),
             futex_restart_deadline_ns: AtomicU64::new(0),
             nanosleep_restart_req: AtomicU64::new(0),
@@ -800,6 +836,15 @@ impl UserTaskCtx {
             dbg_poll_strand_latch: AtomicU64::new(0),
             sigreturn_stack: UnsafeCell::new(alloc::vec::Vec::new()),
         }
+    }
+}
+
+impl Drop for UserTaskCtx {
+    fn drop(&mut self) {
+        // A fatal/forced task exit can bypass epoll_wait's ordinary return path.
+        // Detach its task-owned node while waker destruction is still safely in
+        // task teardown context.
+        crate::epoll::detach_task_wait_node(&self.epoll_wait_node);
     }
 }
 
@@ -2594,6 +2639,11 @@ impl core::future::Future for UserTaskFuture {
         // SAFETY: Valid memory or trusted environment
         let this = unsafe { self.get_unchecked_mut() };
 
+        // Retain the scheduler-owned wake handle independently of whichever
+        // wait-specific registry is armed. Signals use this as the durable
+        // `try_to_wake_up` fallback when they land between park registrations.
+        this.task.uctx.install_scheduler_waker(cx.waker());
+
         if this.state == TaskState::Exited {
             // Defensive — the executor drops Ready slots, so this
             // shouldn't be reached, but if a future somehow gets
@@ -3558,6 +3608,8 @@ impl core::future::Future for UserTaskFuture {
         // whose address stability we own.
         // SAFETY: Valid memory or trusted environment
         let this = unsafe { self.get_unchecked_mut() };
+
+        this.task.uctx.install_scheduler_waker(cx.waker());
 
         if this.state == TaskState::Exited {
             return core::task::Poll::Ready(());

@@ -371,6 +371,13 @@ fn unregister_live_user_address_space(id: TaskId) {
 impl Drop for TaskSlot {
     fn drop(&mut self) {
         unregister_live_user_address_space(self.id);
+        if let Some(address_space) = self.addr_space.as_ref() {
+            // Final slot drop is the execution-liveness boundary for this MM:
+            // the future cannot be polled again after Drop begins. Passive Arc
+            // owners may outlive it, but no task represented by this slot can
+            // fault or enter a VMA critical section after this decrement.
+            address_space.scheduler_detach_user_task();
+        }
         unregister_task_affinity(self.id);
     }
 }
@@ -1962,7 +1969,13 @@ pub fn dbg_resched_counts() -> (u64, u64) {
 /// it passed or failed with unrelated changes to the crate.
 #[doc(hidden)]
 pub fn __test_clear_published_address_space(id: TaskId) {
-    *active_user_as_slot().lock() = None;
+    let active = active_user_as_slot().lock().take();
+    if let Some(address_space) = active.as_ref() {
+        // `replace_address_space` transferred the synthetic current task's
+        // live count to this publication. A test which bypasses the normal
+        // poll reconciliation must retire that count as well as the Arc.
+        address_space.scheduler_detach_user_task();
+    }
     let shard = task_affinity_shard(id);
     let mut pending = PENDING_SLOT_AS[shard].lock();
     pending.retain(|(k, _)| *k != id.raw());
@@ -3658,6 +3671,9 @@ where
     awake
         .last_run_cycles
         .store(narf_time::now_cycles(), Ordering::Release);
+    // Publish execution liveness before any registry or run-queue lookup can
+    // expose the task to the OOM selector/reaper.
+    addr_space.scheduler_attach_user_task();
     register_live_user_address_space(id, &addr_space);
     let slot = TaskSlot {
         task,
@@ -3819,12 +3835,21 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
     //      own field.
     let id_now = current_task_slot().load(Ordering::Acquire);
     if id_now == id.raw() {
+        // Transfer execution liveness before publishing the replacement in
+        // either lookup path. An OOM scan which first discovers `new_arc` must
+        // never observe it with a zero live-task count.
+        new_arc.scheduler_attach_user_task();
         replace_live_user_address_space(id, &new_arc);
-        {
+        let previous_active = {
             let mut g = active_user_as_slot().lock();
-            let _ = g.take();
+            let previous = g.take();
             *g = Some(new_arc.clone());
-        }
+            previous
+        };
+        previous_active
+            .as_ref()
+            .expect("current user task missing active address space")
+            .scheduler_detach_user_task();
         let mut p = PENDING_SLOT_AS[task_affinity_shard(id)].lock();
         let prev = p
             .iter()
@@ -3836,14 +3861,25 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         return prev;
     }
     for q in READY.iter() {
-        let mut g = q.lock();
-        if let Some(ref mut dq) = *g {
-            if let Some(slot) = dq.iter_mut().find(|s| s.id == id) {
+        let replaced = {
+            let mut g = q.lock();
+            g.as_mut().and_then(|dq| {
+                let slot = dq.iter_mut().find(|s| s.id == id)?;
+                new_arc.scheduler_attach_user_task();
                 replace_live_user_address_space(id, &new_arc);
                 let prev = slot.addr_space.take();
-                slot.addr_space = Some(new_arc);
-                return prev;
+                slot.addr_space = Some(new_arc.clone());
+                Some(prev)
+            })
+        };
+        if let Some(prev) = replaced {
+            // Wake-capable final-detach notification runs after the ready-queue
+            // lock is released; the reaper waker may itself touch scheduler
+            // state.
+            if let Some(previous) = prev.as_ref() {
+                previous.scheduler_detach_user_task();
             }
+            return prev;
         }
     }
     None

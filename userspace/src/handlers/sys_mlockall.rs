@@ -60,11 +60,12 @@ pub(crate) fn sys_mlockall(ctx: &mut dyn TrapContext) {
     } else {
         narf_memory::FutureLockPolicy::None
     };
-    match as_ref.update_mlockall_limited(
+    match as_ref.update_mlockall_limited_interruptible(
         current,
         future,
         authority.limit_bytes,
         authority.bypass_limit,
+        current_task_fatal_signal_pending,
     ) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(error) => ctx.set_return(errno_ret(super::handler_sys_mlock::mlock_errno(error))),

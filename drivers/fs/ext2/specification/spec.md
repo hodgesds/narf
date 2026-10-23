@@ -25,8 +25,10 @@ NARF.
   byte 1024; with a 512-byte LBS the superblock sits at LBA 2; with a
   1024-byte or 4096-byte LBS it sits at LBA 1 or LBA 0 respectively.)
 - The VFS wrapper handles path resolution and capability derivation.
-- Memory for metadata + data buffers comes from heap `Vec<u8>` slices
-  copied through the volume's registered cap-bound `DmaBuffer`.
+- Variable-size metadata and data buffers use heap `Vec<u8>` slices copied
+  through the volume's registered cap-bound `DmaBuffer`. Fixed 1024-byte
+  primary-superblock counter/feature updates use bounded stack scratch so
+  inode teardown under global pressure does not require slab growth.
 
 ## 3. Public interface
 

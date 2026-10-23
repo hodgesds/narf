@@ -253,7 +253,7 @@ unsafe fn double_free_confirmed(
     }
     if may_lock_central {
         let g = class.head.lock();
-        let mut cur = *g;
+        let mut cur = g.head;
         let mut steps = 0usize;
         while let Some(b) = cur {
             if core::ptr::eq(b.as_ptr(), target) {
@@ -266,6 +266,15 @@ unsafe fn double_free_confirmed(
             // hold the head lock.
             cur = unsafe { b.as_ref().next };
             steps += 1;
+        }
+        let mut cur = g.scan.pending_head;
+        while let Some(b) = cur {
+            if core::ptr::eq(b.as_ptr(), target) {
+                return true;
+            }
+            // SAFETY: pending nodes are an exclusive free-block chain guarded
+            // by this same class lock.
+            cur = unsafe { b.as_ref().next };
         }
     }
     false
@@ -602,6 +611,146 @@ struct MagazineInner {
     top: usize,
 }
 
+/// Central free objects for one size class.
+///
+/// This is a queue, rather than the old stack, because the reclaim cursor must
+/// be able to rotate a bounded prefix without walking to the list tail.  New
+/// frees join at `tail`; allocation and reclaim consume from `head`.
+struct CentralList {
+    head: Option<NonNull<FreeBlock>>,
+    tail: Option<NonNull<FreeBlock>>,
+    len: usize,
+    scan: ReclaimScan,
+}
+
+/// Persistent, allocation-free cursor for one bounded empty-frame search.
+///
+/// Matching blocks are held off the allocatable queue until either the whole
+/// frame is found or one snapshot of the queue has been examined.  `remaining`
+/// excludes frees appended after the snapshot, so a continuous producer cannot
+/// make one reclaim pass unbounded.
+struct ReclaimScan {
+    active: bool,
+    frame_base: usize,
+    pending_head: Option<NonNull<FreeBlock>>,
+    pending_tail: Option<NonNull<FreeBlock>>,
+    pending_count: usize,
+    remaining: usize,
+}
+
+impl ReclaimScan {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            frame_base: 0,
+            pending_head: None,
+            pending_tail: None,
+            pending_count: 0,
+            remaining: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Append one detached central-list node to the private candidate chain.
+    ///
+    /// # Safety
+    /// `node` is exclusively owned by this scan and is a valid free block.
+    unsafe fn push_pending(&mut self, mut node: NonNull<FreeBlock>) {
+        // SAFETY: the caller detached `node` from the central queue.
+        unsafe { node.as_mut().next = None };
+        match self.pending_tail {
+            None => self.pending_head = Some(node),
+            Some(mut tail) => {
+                // SAFETY: `tail` is the exclusive last node of this chain.
+                unsafe { tail.as_mut().next = Some(node) };
+            }
+        }
+        self.pending_tail = Some(node);
+        self.pending_count += 1;
+    }
+}
+
+impl CentralList {
+    const fn new() -> Self {
+        Self {
+            head: None,
+            tail: None,
+            len: 0,
+            scan: ReclaimScan::new(),
+        }
+    }
+
+    /// Remove the queue head.  If a reclaim snapshot is active, allocation and
+    /// reclaim both consume one element from that finite snapshot.
+    ///
+    /// # Safety
+    /// Every queued node is a valid free block owned by this list.
+    unsafe fn pop_front(&mut self) -> Option<NonNull<FreeBlock>> {
+        let mut node = self.head?;
+        // SAFETY: `node` is the live queue head under the class lock.
+        let next = unsafe { node.as_ref().next };
+        self.head = next;
+        if next.is_none() {
+            self.tail = None;
+        }
+        // SAFETY: the detached node is now exclusively owned by the caller.
+        unsafe { node.as_mut().next = None };
+        self.len -= 1;
+        if self.scan.active && self.scan.remaining > 0 {
+            self.scan.remaining -= 1;
+        }
+        Some(node)
+    }
+
+    /// Append one node after both the active snapshot and any nodes it rotated.
+    ///
+    /// # Safety
+    /// `node` is exclusively owned by the caller and is a valid free block.
+    unsafe fn push_back(&mut self, mut node: NonNull<FreeBlock>) {
+        // SAFETY: `node` is not reachable from any free structure yet.
+        unsafe { node.as_mut().next = None };
+        match self.tail {
+            None => self.head = Some(node),
+            Some(mut tail) => {
+                // SAFETY: `tail` is the exclusive last queue node.
+                unsafe { tail.as_mut().next = Some(node) };
+            }
+        }
+        self.tail = Some(node);
+        self.len += 1;
+    }
+
+    /// Append an already-linked private chain in O(1).
+    ///
+    /// # Safety
+    /// `head..=tail` is a valid exclusive chain containing exactly `count`
+    /// nodes and `tail.next` is `None`.
+    unsafe fn append_chain(
+        &mut self,
+        head: Option<NonNull<FreeBlock>>,
+        tail: Option<NonNull<FreeBlock>>,
+        count: usize,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let head = head.expect("non-empty chain has head");
+        let tail = tail.expect("non-empty chain has tail");
+        match self.tail {
+            None => self.head = Some(head),
+            Some(mut old_tail) => {
+                // SAFETY: both chains are exclusive under the class lock.
+                unsafe { old_tail.as_mut().next = Some(head) };
+            }
+        }
+        self.tail = Some(tail);
+        self.len += count;
+    }
+}
+
 impl Magazine {
     const fn new() -> Self {
         Self {
@@ -639,7 +788,7 @@ unsafe impl Sync for Magazine {}
 /// weight: contention only matters when misses dominate, so
 /// the ratio is what tuning runs key on.
 struct SizeClass {
-    head: IrqSafeSpinLock<Option<NonNull<FreeBlock>>>,
+    head: IrqSafeSpinLock<CentralList>,
     /// Total blocks ever produced by this class (alloc-backed).
     grown: AtomicUsize,
     /// Free blocks on the central list. Updated only on batched slow paths;
@@ -653,7 +802,7 @@ struct SizeClass {
 impl SizeClass {
     const fn new() -> Self {
         Self {
-            head: IrqSafeSpinLock::new(None),
+            head: IrqSafeSpinLock::new(CentralList::new()),
             grown: AtomicUsize::new(0),
             central_free: AtomicUsize::new(0),
             magazines: [const { Magazine::new() }; MAX_CPUS],
@@ -995,7 +1144,7 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
             // slipped invariant (a stale `top`) must flush/return, never
             // index off the end of the fixed 16-slot stack.
             while taken < take && mag.top < MAG_SIZE {
-                match *g {
+                match g.head {
                     Some(head) => {
                         // Verify the block wasn't scribbled while free
                         // BEFORE trusting its `next` link — a clobbered
@@ -1005,8 +1154,9 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
                         // the lock for.
                         unsafe { canary_check_free(head, c) };
                         // SAFETY: central blocks were inserted by this slab.
-                        let next = unsafe { head.as_ref().next };
-                        *g = next;
+                        // SAFETY: `head` is the live central queue head under
+                        // the class lock.
+                        let head = unsafe { g.pop_front() }.expect("head present");
                         mag.stack[mag.top] = Some(head);
                         mag.top += 1;
                         taken += 1;
@@ -1073,9 +1223,9 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
             let mut g = class.head.lock();
             for i in to_mag..(n_blocks - 1) {
                 let blk = base.add(i * block_size) as *mut FreeBlock;
-                (*blk).next = *g;
                 canary_set_fresh(NonNull::new_unchecked(blk));
-                *g = NonNull::new(blk);
+                // SAFETY: this is a freshly carved, exclusively owned block.
+                g.push_back(NonNull::new_unchecked(blk));
             }
             drop(g);
         }
@@ -1144,7 +1294,7 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         let flush = MAG_SIZE / 2;
         let mut g = class.head.lock();
         for i in 0..flush {
-            let mut blk = mag.stack[i].expect("magazine full");
+            let blk = mag.stack[i].expect("magazine full");
             // The block stays free across the magazine → central
             // move; its canary must still be intact.
             // SAFETY: `blk` is a free block only we can reach.
@@ -1152,10 +1302,7 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
             // SAFETY: blocks were originally allocated from this slab,
             // so overwriting `next` re-links them onto the central head.
             // SAFETY: Valid memory or trusted environment
-            unsafe {
-                blk.as_mut().next = *g;
-            }
-            *g = Some(blk);
+            unsafe { g.push_back(blk) };
         }
         drop(g);
         // Compact: shift the surviving half down to slots 0..flush.
@@ -1368,15 +1515,25 @@ pub fn magazine_stats() -> MagazineStats {
 // their frame un-reclaimable (bounded by MAG_SIZE * MAX_CPUS per class).
 //
 // Detachment runs under the class's central lock and allocation-free (it is
-// reachable from the allocation-failure reclaim path), so it groups blocks by
-// frame with an in-place merge sort of the free list rather than a heap map.
-// Returning detached frames to the buddy happens only after releasing that
-// lock: `free_frame` can invoke accounting hooks that allocate and re-enter the
-// slab, which would otherwise deadlock on this same class.
+// reachable from the allocation-failure reclaim path).  The central queue has
+// a persistent frame candidate and snapshot cursor: one visit examines at most
+// `SLAB_RECLAIM_SCAN_BLOCKS`, then resumes later.  It never sorts or walks the
+// complete queue while excluding allocators.  Returning detached frames to the
+// buddy happens only after releasing that lock: `free_frame` can invoke
+// accounting hooks that allocate and re-enter the slab, which would otherwise
+// deadlock on this same class.
 
 /// Fixed stack capacity for one class-detachment pass. Larger page budgets
 /// make another bounded pass; reclaim never allocates its own work storage.
 const SLAB_RECLAIM_BATCH_FRAMES: usize = 64;
+
+/// Maximum central-list nodes inspected by one class-lock acquisition.
+///
+/// Reclaim keeps a cursor across calls, so this is a latency bound rather than
+/// a search truncation.  At 2,048 simple pointer operations, an allocator CPU
+/// can never be trapped behind the multi-million-node, O(n log n) critical
+/// section that the former whole-list address sort created.
+const SLAB_RECLAIM_SCAN_BLOCKS: usize = 2_048;
 
 /// Proactive empty-frame watermark (in frames, per size class). When a class's
 /// central free list grows past `_HIGH` frames' worth of blocks, the next
@@ -1628,129 +1785,73 @@ unsafe fn detach_class_frames(c: usize, max_pages: usize, frames: &mut [usize]) 
     if n_blocks == 0 || limit == 0 {
         return 0;
     }
-    // Page-size class (`block_size == PAGE_SIZE`, so `n_blocks == 1`): every free
-    // block IS a whole free frame, so there are no multi-block runs to find and
-    // NO address sort is needed. Taking, sorting (`O(n log n)`), and rebuilding
-    // the ENTIRE central list on every reclaim call — only to return `limit`
-    // frames — makes draining a large class `O(n²/limit)` and wedges kswapd on a
-    // 60k-block list (the CachyOS greeter's 4 KiB class hoarded ~240 MiB while
-    // the buddy starved). Pop up to `limit` blocks off the list head instead:
-    // `O(limit)`, canary-checked, bounded (so a corrupt/cyclic link cannot spin
-    // this path — the pop count is capped and each detached node's link is
-    // nulled), leaving the remaining free blocks in place for the next call.
-    if n_blocks == 1 {
-        let mut g = class.head.lock();
-        let mut detached = 0usize;
-        while detached < limit {
-            let Some(node) = *g else { break };
-            // SAFETY: `node` is a live free block of class `c` on the central
-            // list; validate its canary before trusting the `next` link, then
-            // null that link (this frame is leaving the allocator for the buddy
-            // and must carry no stale free-list pointer).
-            let nxt = unsafe {
-                canary_check_free(node, c);
-                let n = node.as_ref().next;
-                (*node.as_ptr()).next = None;
-                n
-            };
-            frames[detached] = (node.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1);
-            *g = nxt;
-            detached += 1;
-        }
-        drop(g);
-        // `n_blocks == 1`, so detached frames == detached blocks.
-        class.central_free.fetch_sub(detached, Ordering::Relaxed);
-        class.grown.fetch_sub(detached, Ordering::Relaxed);
-        return detached;
-    }
     let mut g = class.head.lock();
-    let taken = g.take();
-    // Validate every free block's canary before trusting its links, and bound
-    // the walk. The central list can hold at most `grown` blocks for this class,
-    // so a walk that runs past that has followed a corrupted/cyclic `next` link
-    // (a double-free or use-after-free spliced a cycle). Fail fast naming the
-    // offending block instead of looping forever under `class.head`: an
-    // unbounded loop here would silently wedge every CPU that allocates this
-    // class. This is defensive hardening — `double_free_confirmed` already caps
-    // its walk of this same list at 1M steps for the same reason; the reclaim
-    // walk was the asymmetric gap. The `+ n_blocks` slack absorbs a benign
-    // in-flight grow racing the `grown` snapshot.
-    let walk_cap = class
-        .grown
-        .load(Ordering::Relaxed)
-        .saturating_add(n_blocks)
-        .max(n_blocks);
-    // SAFETY: every node on the central list we just took is a valid free block
-    // of class `c`; we only read canaries and `next` links.
-    unsafe {
-        let mut cur = taken;
-        let mut steps = 0usize;
-        while let Some(b) = cur {
-            canary_check_free(b, c);
-            steps += 1;
-            assert!(
-                steps <= walk_cap,
-                "slab class {c} (block_size={block_size}) central free list \
-                 exceeded {walk_cap} blocks at node {:p} — corrupted/cyclic \
-                 `next` link (double-free or use-after-free)",
-                b.as_ptr(),
-            );
-            cur = b.as_ref().next;
-        }
-    }
-    // SAFETY: the nodes are this class's free blocks; the sort only relinks them.
-    let sorted = unsafe { sort_free_list_by_addr(taken) };
-
-    let mut kept_head: Option<NonNull<FreeBlock>> = None;
-    let mut kept_tail: Option<NonNull<FreeBlock>> = None;
     let mut detached_pages = 0usize;
+    let mut examined = 0usize;
 
-    let mut cur = sorted;
-    while let Some(run_start) = cur {
-        let frame_base = (run_start.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1);
-        // A frame's blocks are contiguous in the sorted list: measure the run.
-        let mut run_len = 0usize;
-        let mut scan = cur;
-        // SAFETY: sorted nodes are valid free blocks; we only read `next`.
-        let run_end = unsafe {
-            while let Some(b) = scan {
-                if ((b.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1)) != frame_base {
-                    break;
-                }
-                run_len += 1;
-                scan = b.as_ref().next;
-            }
-            scan // first block of the next frame (or None)
-        };
-
-        if run_len == n_blocks && detached_pages < limit {
-            // Every block is central-resident and therefore unowned. Omit the
-            // run from the rebuilt list; the caller returns it to the buddy
-            // only after this function releases `class.head`.
-            frames[detached_pages] = frame_base;
+    while detached_pages < limit && examined < SLAB_RECLAIM_SCAN_BLOCKS {
+        if g.scan.active && g.scan.pending_count == n_blocks {
+            // A frame has exactly `n_blocks` slab objects.  Holding that many
+            // distinct central-free nodes from one frame proves no object in
+            // the frame is allocated or cached in a magazine.
+            frames[detached_pages] = g.scan.frame_base;
             detached_pages += 1;
-        } else {
-            // Keep this run: append its blocks to the rebuilt list, in order.
-            // SAFETY: the run nodes are valid free blocks we own; we re-null and
-            // re-link their `next` pointers onto the rebuilt kept list.
-            unsafe {
-                let mut k = cur;
-                while k != run_end {
-                    let node = k.expect("run node within bounds");
-                    let nxt = node.as_ref().next;
-                    (*node.as_ptr()).next = None;
-                    match kept_tail {
-                        None => kept_head = Some(node),
-                        Some(t) => (*t.as_ptr()).next = Some(node),
-                    }
-                    kept_tail = Some(node);
-                    k = nxt;
-                }
-            }
+            g.scan.clear();
+            continue;
         }
-        cur = run_end;
+
+        if g.scan.active && g.scan.remaining == 0 {
+            // One finite queue snapshot contained only part of this frame.
+            // Put the candidate back at the tail in O(1); later frees can then
+            // join it and a future pass can prove the frame complete.
+            let head = g.scan.pending_head;
+            let tail = g.scan.pending_tail;
+            let count = g.scan.pending_count;
+            g.scan.clear();
+            // SAFETY: the scan exclusively owns this linked chain.
+            unsafe { g.append_chain(head, tail, count) };
+            continue;
+        }
+
+        if !g.scan.active {
+            // SAFETY: class lock gives exclusive ownership of the queue head.
+            let Some(node) = (unsafe { g.pop_front() }) else {
+                break;
+            };
+            // SAFETY: the node is a central-free block; validate before using
+            // any of its linkage or page identity.
+            unsafe { canary_check_free(node, c) };
+            g.scan.active = true;
+            g.scan.frame_base = (node.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1);
+            g.scan.remaining = g.len;
+            // SAFETY: `pop_front` gave the scan exclusive ownership.
+            unsafe { g.scan.push_pending(node) };
+            examined += 1;
+            continue;
+        }
+
+        // SAFETY: `remaining > 0` describes nodes at the queue head that
+        // existed when this snapshot began.  Allocations decrement it when
+        // they consume such a node, so a node is present here unless they
+        // exhausted the snapshot immediately before this lock acquisition.
+        let Some(node) = (unsafe { g.pop_front() }) else {
+            g.scan.remaining = 0;
+            continue;
+        };
+        // SAFETY: `node` was just detached from the valid central queue.
+        unsafe { canary_check_free(node, c) };
+        let frame_base = (node.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1);
+        if frame_base == g.scan.frame_base {
+            // SAFETY: the scan now exclusively owns `node`.
+            unsafe { g.scan.push_pending(node) };
+        } else {
+            // SAFETY: rotate the non-matching free node behind the finite
+            // snapshot.  This is O(1) because the central list stores a tail.
+            unsafe { g.push_back(node) };
+        }
+        examined += 1;
     }
-    *g = kept_head;
+
     class
         .central_free
         .fetch_sub(detached_pages * n_blocks, Ordering::Relaxed);
@@ -1794,126 +1895,6 @@ unsafe fn reclaim_class_frames(c: usize, max_pages: usize) -> usize {
     // SAFETY: exactly the initialized detached prefix is passed once.
     unsafe { free_detached_slab_frames(&frames[..detached]) };
     detached
-}
-
-/// Detach up to `n` nodes from the front of `head`; return `(front, rest)`.
-///
-/// # Safety
-/// `head` is a valid singly-linked list of free blocks owned by the caller.
-unsafe fn split_run(
-    head: Option<NonNull<FreeBlock>>,
-    n: usize,
-) -> (Option<NonNull<FreeBlock>>, Option<NonNull<FreeBlock>>) {
-    if head.is_none() || n == 0 {
-        return (None, head);
-    }
-    // SAFETY: per the fn contract `head` is a valid owned list; we walk and
-    // re-null the `next` link of a node we own.
-    unsafe {
-        let mut cur = head.expect("checked some");
-        for _ in 1..n {
-            match cur.as_ref().next {
-                Some(nx) => cur = nx,
-                None => return (head, None),
-            }
-        }
-        let rest = cur.as_ref().next;
-        (*cur.as_ptr()).next = None;
-        (head, rest)
-    }
-}
-
-/// Merge two address-sorted runs into one ascending run.
-///
-/// # Safety
-/// Both arguments are valid, address-sorted singly-linked runs.
-unsafe fn merge_runs(
-    mut a: Option<NonNull<FreeBlock>>,
-    mut b: Option<NonNull<FreeBlock>>,
-) -> Option<NonNull<FreeBlock>> {
-    let mut head: Option<NonNull<FreeBlock>> = None;
-    let mut tail: Option<NonNull<FreeBlock>> = None;
-    // SAFETY: per the fn contract both runs are valid owned lists; we read `next`
-    // links and re-link nodes we own onto the merged run.
-    unsafe {
-        loop {
-            let pick = match (a, b) {
-                (Some(x), Some(y)) => {
-                    if (x.as_ptr() as usize) <= (y.as_ptr() as usize) {
-                        a = x.as_ref().next;
-                        x
-                    } else {
-                        b = y.as_ref().next;
-                        y
-                    }
-                }
-                (Some(x), None) => {
-                    a = x.as_ref().next;
-                    x
-                }
-                (None, Some(y)) => {
-                    b = y.as_ref().next;
-                    y
-                }
-                (None, None) => break,
-            };
-            (*pick.as_ptr()).next = None;
-            match tail {
-                None => head = Some(pick),
-                Some(t) => (*t.as_ptr()).next = Some(pick),
-            }
-            tail = Some(pick);
-        }
-    }
-    head
-}
-
-/// In-place bottom-up merge sort of the free list by block address (ascending).
-/// Iterative — no recursion — so a long list can't overflow the kernel stack.
-///
-/// # Safety
-/// `head` is a valid singly-linked list of free blocks owned by the caller.
-unsafe fn sort_free_list_by_addr(head: Option<NonNull<FreeBlock>>) -> Option<NonNull<FreeBlock>> {
-    // SAFETY: per the fn contract `head` is a valid owned list; `split_run` /
-    // `merge_runs` preserve that invariant, and we only read `next` links.
-    unsafe {
-        let mut len = 0usize;
-        let mut cur = head;
-        while let Some(b) = cur {
-            len += 1;
-            cur = b.as_ref().next;
-        }
-        if len < 2 {
-            return head;
-        }
-        let mut head = head;
-        let mut width = 1usize;
-        while width < len {
-            let mut result_head: Option<NonNull<FreeBlock>> = None;
-            let mut result_tail: Option<NonNull<FreeBlock>> = None;
-            let mut cur = head;
-            while cur.is_some() {
-                let (left, rest1) = split_run(cur, width);
-                let (right, rest2) = split_run(rest1, width);
-                cur = rest2;
-                let merged = merge_runs(left, right);
-                match result_tail {
-                    None => result_head = merged,
-                    Some(t) => (*t.as_ptr()).next = merged,
-                }
-                // Advance the tail to the end of the just-merged run.
-                if let Some(mut t) = merged {
-                    while let Some(nx) = t.as_ref().next {
-                        t = nx;
-                    }
-                    result_tail = Some(t);
-                }
-            }
-            head = result_head;
-            width *= 2;
-        }
-        head
-    }
 }
 
 /// Number of distinct size classes the allocator supports.
@@ -2061,15 +2042,9 @@ fn smoke_slab_magazine_per_cpu_isolation() -> narf_kernel_test::TestResult {
         .available
         .store(mag.top, Ordering::Relaxed);
     let mut g = class.head.lock();
-    // SAFETY: `blk` came from this slab's class; we own its bytes
-    // until pushed onto the central list.
-    // SAFETY: Valid memory or trusted environment
-    unsafe {
-        blk.as_ptr()
-            .cast::<FreeBlock>()
-            .write(FreeBlock { next: *g })
-    };
-    *g = Some(blk);
+    // SAFETY: `blk` came from this slab's class and is exclusively owned until
+    // it is appended to the central queue.
+    unsafe { g.push_back(blk) };
     class.central_free.fetch_add(1, Ordering::Relaxed);
     drop(g);
     TestResult::Pass
@@ -2581,58 +2556,6 @@ kernel_test_in!(
     smoke_slab_owner_written_canary_value_is_not_double_free
 );
 
-/// The reclaim free-list sort must order blocks by address and preserve every
-/// node — the grouping the slab shrinker relies on to find fully-free frames.
-fn smoke_slab_sort_free_list_by_addr() -> narf_kernel_test::TestResult {
-    use narf_kernel_test::TestResult;
-    // A private frame gives us K well-separated FreeBlock slots to scramble.
-    let frame = match crate::alloc_frame() {
-        Ok(f) => f,
-        Err(_) => return TestResult::Skip("frame allocator drained"),
-    };
-    let base = frame.start_address().kernel_mut_ptr::<u8>();
-    const K: usize = 8;
-    const STRIDE: usize = 64;
-    // Link the slots in a scrambled order.
-    let order = [3usize, 0, 5, 1, 7, 2, 6, 4];
-    let result = (|| {
-        // SAFETY: `base..base+K*STRIDE` is within the owned frame.
-        unsafe {
-            for w in 0..K {
-                let node = base.add(order[w] * STRIDE) as *mut FreeBlock;
-                let next = if w + 1 < K {
-                    NonNull::new(base.add(order[w + 1] * STRIDE) as *mut FreeBlock)
-                } else {
-                    None
-                };
-                (*node).next = next;
-            }
-            let head = NonNull::new(base.add(order[0] * STRIDE) as *mut FreeBlock);
-            let sorted = sort_free_list_by_addr(head);
-            // Verify strictly ascending and all K nodes present.
-            let mut cur = sorted;
-            let mut prev = 0usize;
-            let mut count = 0usize;
-            while let Some(b) = cur {
-                let a = b.as_ptr() as usize;
-                if count > 0 && a <= prev {
-                    return TestResult::Fail("sort did not order by address");
-                }
-                prev = a;
-                count += 1;
-                cur = b.as_ref().next;
-            }
-            if count != K {
-                return TestResult::Fail("sort lost or duplicated a node");
-            }
-            TestResult::Pass
-        }
-    })();
-    crate::frame::free_frame(frame);
-    result
-}
-kernel_test_in!("memory", smoke_slab_sort_free_list_by_addr);
-
 /// Slab detachment is page-denominated and releases the class lock before the
 /// buddy/cgroup path: grow a class, detach exactly one frame, prove the lock is
 /// available, and only then free the detached frame.
@@ -2700,11 +2623,10 @@ fn smoke_slab_shrinker_detaches_before_free() -> narf_kernel_test::TestResult {
 }
 kernel_test_in!("memory", smoke_slab_shrinker_detaches_before_free);
 
-/// Page-size class (`n_blocks == 1`) detach fast path. Every free block is a
-/// whole free frame, so `detach_class_frames` returns up to `limit` of them by
-/// popping the central-list head — no address sort, no full-list rebuild. This
-/// is the regression guard for the kswapd livelock: the old path re-sorted the
-/// ENTIRE central list `O(n log n)` on every reclaim call, so draining a large
+/// Page-size class (`n_blocks == 1`) cursor path. Every free block is a whole
+/// free frame, so each queue pop immediately completes a candidate. This is the
+/// regression guard for the kswapd livelock: the old path re-sorted the ENTIRE
+/// central list `O(n log n)` on every reclaim call, so draining a large
 /// page-size class (the CachyOS greeter hoarded ~240 MiB of 4 KiB blocks) was
 /// `O(n²/limit)` and wedged forward progress. Assert a bounded detach returns
 /// exactly `limit` distinct, page-aligned frames and decrements `grown` +

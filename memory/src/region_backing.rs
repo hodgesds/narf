@@ -14,7 +14,11 @@ static ZERO: PhysAddr = PhysAddr::new(0);
 #[derive(Clone, Debug)]
 struct Block {
     first: usize,
-    slots: [PhysAddr; BLOCK_PAGES],
+    /// Materialized prefix of this 64-page directory bucket. Keeping the
+    /// payload variable-sized avoids retaining 512 bytes when a tiny VMA has
+    /// faulted only one or two pages (stress-ng's mlock object is three pages
+    /// with only its middle page resident).
+    slots: Vec<PhysAddr>,
 }
 
 /// Allocation failure while preparing region backing metadata.
@@ -71,11 +75,15 @@ impl RegionBacking {
             if slots.iter().all(|p| p.raw() == 0) {
                 continue;
             }
-            let mut block = Block {
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(slots.len())
+                .map_err(|_| BackingAllocError)?;
+            payload.extend_from_slice(slots);
+            let block = Block {
                 first: index * BLOCK_PAGES,
-                slots: [ZERO; BLOCK_PAGES],
+                slots: payload,
             };
-            block.slots[..slots.len()].copy_from_slice(slots);
             blocks.push(block);
         }
         Ok(Self {
@@ -94,12 +102,17 @@ impl RegionBacking {
         self.len == 0
     }
     pub fn allocated_slots(&self) -> usize {
-        self.blocks.len() * BLOCK_PAGES
+        self.blocks.iter().map(|block| block.slots.len()).sum()
     }
 
     /// Heap payload retained by the block directory, including spare capacity.
     pub fn metadata_bytes(&self) -> usize {
         self.blocks.capacity() * core::mem::size_of::<Block>()
+            + self
+                .blocks
+                .iter()
+                .map(|block| block.slots.capacity() * core::mem::size_of::<PhysAddr>())
+                .sum::<usize>()
     }
 
     fn block_position(&self, index: usize) -> Result<usize, usize> {
@@ -113,7 +126,9 @@ impl RegionBacking {
         }
         Some(
             self.block_position(index)
-                .map_or(&ZERO, |b| &self.blocks[b].slots[index % BLOCK_PAGES]),
+                .ok()
+                .and_then(|block| self.blocks[block].slots.get(index % BLOCK_PAGES))
+                .unwrap_or(&ZERO),
         )
     }
 
@@ -128,19 +143,41 @@ impl RegionBacking {
     /// fault handler. Failure leaves both contents and logical length intact.
     pub fn reserve_slot(&mut self, index: usize) -> Result<(), BackingAllocError> {
         let len = index.checked_add(1).ok_or(BackingAllocError)?;
-        if let Err(at) = self.block_position(index) {
-            #[cfg(any(test, feature = "kernel-test"))]
-            if core::mem::take(&mut self.fail_next_reserve) {
-                return Err(BackingAllocError);
+        let within = index % BLOCK_PAGES;
+        match self.block_position(index) {
+            Ok(at) => {
+                let block = &mut self.blocks[at];
+                if block.slots.len() <= within {
+                    #[cfg(any(test, feature = "kernel-test"))]
+                    if core::mem::take(&mut self.fail_next_reserve) {
+                        return Err(BackingAllocError);
+                    }
+                    block
+                        .slots
+                        .try_reserve(within + 1 - block.slots.len())
+                        .map_err(|_| BackingAllocError)?;
+                    block.slots.resize(within + 1, ZERO);
+                }
             }
-            self.blocks.try_reserve(1).map_err(|_| BackingAllocError)?;
-            self.blocks.insert(
-                at,
-                Block {
-                    first: index / BLOCK_PAGES * BLOCK_PAGES,
-                    slots: [ZERO; BLOCK_PAGES],
-                },
-            );
+            Err(at) => {
+                #[cfg(any(test, feature = "kernel-test"))]
+                if core::mem::take(&mut self.fail_next_reserve) {
+                    return Err(BackingAllocError);
+                }
+                let mut slots = Vec::new();
+                slots
+                    .try_reserve_exact(within + 1)
+                    .map_err(|_| BackingAllocError)?;
+                slots.resize(within + 1, ZERO);
+                self.blocks.try_reserve(1).map_err(|_| BackingAllocError)?;
+                self.blocks.insert(
+                    at,
+                    Block {
+                        first: index / BLOCK_PAGES * BLOCK_PAGES,
+                        slots,
+                    },
+                );
+            }
         }
         self.len = self.len.max(len);
         Ok(())
@@ -152,7 +189,7 @@ impl RegionBacking {
             return None;
         }
         let at = self.block_position(index).ok()?;
-        Some(&mut self.blocks[at].slots[index % BLOCK_PAGES])
+        self.blocks[at].slots.get_mut(index % BLOCK_PAGES)
     }
 
     /// Allocated slots with their original virtual page indices. Missing
@@ -180,7 +217,7 @@ impl RegionBacking {
         let end = end.min(self.len);
         let lo = self
             .blocks
-            .partition_point(|b| b.first.saturating_add(BLOCK_PAGES) <= first);
+            .partition_point(|b| b.first.saturating_add(b.slots.len()) <= first);
         let hi = if first < end {
             self.blocks.partition_point(|b| b.first < end).max(lo)
         } else {
@@ -188,7 +225,7 @@ impl RegionBacking {
         };
         self.blocks[lo..hi].iter().map(move |b| {
             let start = first.max(b.first);
-            let last = end.min(b.first.saturating_add(BLOCK_PAGES));
+            let last = end.min(b.first.saturating_add(b.slots.len()));
             (start, &b.slots[start - b.first..last - b.first])
         })
     }
@@ -207,8 +244,8 @@ impl RegionBacking {
         let keep = self.blocks.partition_point(|b| b.first < len);
         self.blocks.truncate(keep);
         if let Some(b) = self.blocks.last_mut() {
-            let used = len.saturating_sub(b.first).min(BLOCK_PAGES);
-            b.slots[used..].fill(ZERO);
+            let used = len.saturating_sub(b.first).min(b.slots.len());
+            b.slots.truncate(used);
         }
     }
 
@@ -253,7 +290,17 @@ impl RegionBacking {
         blocks
             .try_reserve_exact(self.blocks.len())
             .map_err(|_| BackingAllocError)?;
-        blocks.extend_from_slice(&self.blocks);
+        for block in &self.blocks {
+            let mut slots = Vec::new();
+            slots
+                .try_reserve_exact(block.slots.len())
+                .map_err(|_| BackingAllocError)?;
+            slots.extend_from_slice(&block.slots);
+            blocks.push(Block {
+                first: block.first,
+                slots,
+            });
+        }
         Ok(Self {
             blocks,
             len: self.len,
@@ -354,7 +401,7 @@ impl RegionBacking {
         let end = end.min(self.len);
         for block in &mut self.blocks {
             let start = first.max(block.first);
-            let last = end.min(block.first.saturating_add(BLOCK_PAGES));
+            let last = end.min(block.first.saturating_add(block.slots.len()));
             if start < last {
                 f(
                     start,
@@ -375,7 +422,7 @@ mod tests {
             *backing.get_mut(i).ok_or("reserved slot missing")? =
                 PhysAddr::new((i as u64 + 1) * 4096);
         }
-        if backing.allocated_slots() != 192 || backing.metadata_bytes() > 4096 {
+        if backing.allocated_slots() != 67 || backing.metadata_bytes() > 4096 {
             return Err("distant offset consumed proportional metadata");
         }
         if backing[1].raw() != 0 || backing[(1 << 28) - 1].raw() != 0 {
