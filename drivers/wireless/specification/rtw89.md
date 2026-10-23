@@ -67,6 +67,27 @@ Header H2C requests no runtime ACK; section chunks are raw firmware bytes
 without an invented H2C/last flag. This prepares transfers but does not
 establish CH12/WCPU ownership or start a download.
 
+The private `command_native::Native` CH12 backend owns checked coherent packet
+and ring allocations. Constructor/configuration require independently fenced
+DMA and verified PCI BME-off; activation separately requires completed
+PCIe/BDRAM/DLE/HFC setup, CH12-only TX DMA and verified BME-on. The backend
+does not enable BME itself, and rejects the incomplete per-domain IOMMU path.
+All register operations invoke current device authority and check complete
+width/alignment extents. Real revocation rejects the constructor before
+unmapped configuration access and prevents later packet publication.
+
+Firmware commands have a24-byte TXWD body on A/B/51 and a16-byte RX-like
+descriptor on C. TXBD length includes descriptor plus command bytes; there
+is no WP/address-info extension. Hardware RP is bits27:16 and host WP bits11:0;
+host doorbells write only the low16-bit half. `CommandQueue` retains mappings
+before descriptor/doorbell publication, validates whole read-pointer movement
+before retirement, and preserves the last eight consumed commands for the
+Linux multi-tag delay. Failed publication and Drop retain queued/quarantined
+DMA and the published ring. Only an independent hardware stop/idle/prefetch
+fence permits explicit reclamation; capability revocation or BME-off alone
+does not establish that proof. The backend remains inactive in the diagnostic
+probe until the complete PCIe/WCPU startup owner is implemented.
+
 `power::Power<Io>::power_on` ports the complete PCI RTL8852A byte table and
 RTL8852B/C/8851B power-on callbacks, including XTAL commands, cut/RFE/SPS
 quirks, power/ONMAC deadlines, platform edges, isolation and function enables.
@@ -158,7 +179,7 @@ bring-up scaffolding and does not establish a working station runtime.
 |---|---|
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
 | Complete per-chip power/PCIe initialization | Native power-on/off, inherited-state normalization and DLFW DLE/HFC primitives implemented with Linux-C traces; probe composition and full PCIe/BDRAM setup remain |
-| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked owned AX selection, native fuse reads and coupled secure download plans implemented; CH12 owner and WCPU lifecycle remain |
+| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans and native CH12 ownership implemented; full PCIe activation and WCPU lifecycle remain |
 | Ring quiesce/publication, BDRAM setup, IRQ ownership and recovery | Incomplete |
 | AX initial native TX layout and bounded completion ownership | Shared production backend implemented and model-tested; not yet activated by station/firmware owner |
 | RPQ release handling, RX assembly/validation and frame delivery | Incomplete |

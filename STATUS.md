@@ -86,8 +86,11 @@ owned CE/BMI firmware/BDF/OTP, PLL and code-swap preparation, retained HTC
 runtime and versioned WMI service-ready/host-memory/INIT/READY, followed by
 retained HTT RX buffers and native TX/management completion. A retained WMI
 radio session now performs correlated passive scans across six dialects while
-servicing HTT completions. PFC events, security/decapsulation, remaining WMI
-MLME and station attachment remain software work.
+servicing HTT completions. Station-context preparation now intersects immutable
+factory regulatory limits with authenticated host policy and an observed BSS,
+then waits for correlated vdev-start and sparse HTT peer-map completion.
+PFC events, security/decapsulation, remaining WMI MLME and station attachment
+remain software work.
 Ath9k programs AR9285 inactive PHY/PLL/RF INI, EEPROM modal and PDADC detector
 tables with current-capability register access; CTL/rate power, analog calibration
 and packet/station ownership remain open. Ath11k QCA6390 has its native
@@ -105,7 +108,9 @@ RTL8188EE has a retained native firmware worker; packet DMA/RF remain closed.
 RTW89 has checked owned AX firmware selection, cold-power/DDV primitives and
 fuse-selected immutable header/section download plans with host blacklist
 enforcement. Power-off/normalization and DLE/HFC primitives now have Linux-C
-trace coverage; PCIe/BDRAM/CH12/WCPU composition and station work remain. Its diagnostic
+trace coverage. Native CH12 commands now retain DMA through the multi-tag
+delay and use corrected hardware/host index fields; full PCIe/BDRAM/WCPU
+composition and station work remain. Its diagnostic
 probe retains unpublished storage without activating rings, IRQs or a NIC.
 USB retains published address/configuration/control/bulk DMA, checks slot
 generations and implements explicit Stop/Set-Dequeue fencing for the supported
@@ -117,9 +122,9 @@ silicon, reset/recovery and PM remain software work. These gates
 cannot be closed by physical testing alone. No physical device validation is
 part of the current software-only work.
 
-The software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared wireless
-and crypto QEMU gates: x86_64 reports 1686 pass / 0 fail / 11 skip;
-aarch64 reports 990 pass / 0 fail / 3 skip.
+The last committed software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared wireless
+and crypto QEMU gates: x86_64 reports 1699 pass / 0 fail / 11 skip;
+aarch64 reports 1003 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.

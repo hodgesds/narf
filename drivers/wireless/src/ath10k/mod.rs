@@ -27,7 +27,8 @@
 //! HTC credit/endpoint negotiation and native WMI service-ready/INIT/READY.
 //! Native HTT setup and retained RX/TX DMA follow WMI READY, then a retained
 //! vdev/passive-scan owner uses per-dialect WMI commands and management RX.
-//! Station management/security, admission and recovery remain open.
+//! Host/factory regulatory policy now reaches correlated station-vdev START
+//! and owned sparse peer MAPs. MLME/security, admission and recovery remain open.
 //! Older standalone codecs below are not the production activation path.
 //!
 //! ## Stage 0 (prior commit)
@@ -87,6 +88,7 @@ pub mod htt_runtime;
 pub mod hw;
 pub mod pci;
 pub mod profile;
+pub mod regulatory;
 mod swap;
 pub mod wmi;
 pub mod wmi_boot;

@@ -337,3 +337,6 @@ pub(super) fn supported(caps: &Capabilities, frequency: u16) -> bool {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "tests.rs"]
 mod tests;
+
+#[path = "station_wire.rs"]
+mod station;

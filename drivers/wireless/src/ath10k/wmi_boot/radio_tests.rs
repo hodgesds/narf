@@ -27,6 +27,7 @@ struct RadioModel {
     reason: u32,
     malformed: bool,
     default_channels: bool,
+    station: Option<StationFixture>,
 }
 impl HostMemory for RadioModel {
     fn retain_wmi_memory(&mut self, p: &[MemoryPlan]) -> Result<Vec<MemoryChunk>, Error> {
@@ -149,6 +150,9 @@ impl Hif for RadioModel {
             return Err(BmiError::BadResponse);
         }
         self.sequence = self.sequence.wrapping_add(1);
+        if self.station.is_some() {
+            return station_send(self, bytes).await;
+        }
         let dialect = self.inner.inner.dialect;
         let mut expected = match (self.phase, dialect) {
             (1, _) if self.default_channels => match dialect {
@@ -258,6 +262,7 @@ fn radio_boot(version: u32, dialect: Dialect) -> radio::Radio<RadioModel> {
         reason: 0,
         malformed: false,
         default_channels: false,
+        station: None,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));
@@ -505,3 +510,7 @@ kernel_test_in!(
     "drivers/wireless/ath10k/wmi-runtime",
     smoke_ath10k_scan_keeps_owner_across_real_scheduler_yields
 );
+
+#[path = "station_tests.rs"]
+mod station_tests;
+use station_tests::{station_send, StationFixture};

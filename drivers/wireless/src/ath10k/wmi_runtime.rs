@@ -66,6 +66,8 @@ pub struct ScanReady {
 }
 #[derive(Debug)]
 pub(super) struct Radio<T> {
+    scan_cache: Vec<ScanBss>,
+    peer: Option<station::Peer>,
     pub htt: htt::Runtime<T>,
     wire: wire::Wire,
     features: u64,
@@ -82,6 +84,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             wire: wire::Wire::new(dialect),
             features,
             ready: None,
+            scan_cache: Vec::new(),
+            peer: None,
             channels: Vec::new(),
             sequence: 0,
             pending: VecDeque::new(),
@@ -151,7 +155,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// Scan IDs never wrap within this firmware owner's lifetime. A timeout,
     /// failed scan or dropped future leaves the owner closed until reset.
     pub async fn passive_scan(&mut self, channels: &[u16]) -> Result<ScanReport, Error> {
-        if self.failed || self.ready.is_none() {
+        if self.failed || self.ready.is_none() || self.peer.is_some() {
             return Err(Error::Failed);
         }
         wire::validate_channels(channels)?;
@@ -201,6 +205,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         }
                         match event.kind {
                             2 if event.reason == 0 => {
+                                let mut cache = Vec::new();
+                                cache
+                                    .try_reserve_exact(report.bss.len())
+                                    .map_err(|_| Error::NoMemory)?;
+                                for bss in &report.bss {
+                                    cache.push(bss.copy_owned()?);
+                                }
+                                self.scan_cache = cache;
                                 self.failed = false;
                                 return Ok(report);
                             }
@@ -326,4 +338,28 @@ fn beacon(event: &Management, channels: &[u16]) -> Result<Option<ScanBss>, Error
         beacon_interval: u16::from_le_bytes([fixed[32], fixed[33]]),
         information_elements: wire::owned(&frame[36..])?,
     }))
+}
+
+impl ScanBss {
+    fn copy_owned(&self) -> Result<Self, Error> {
+        Ok(Self {
+            bssid: self.bssid,
+            ssid: wire::owned(&self.ssid)?,
+            frequency: self.frequency,
+            snr: self.snr,
+            capability: self.capability,
+            beacon_interval: self.beacon_interval,
+            information_elements: wire::owned(&self.information_elements)?,
+        })
+    }
+}
+#[path = "wmi_runtime/station.rs"]
+mod station;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerPrepared {
+    pub bssid: [u8; 6],
+    pub frequency: u16,
+    /// Sparse firmware ID, not an index bounded by resource peer count.
+    pub peer_id: u16,
+    pub maximum_power_dbm: u8,
 }

@@ -53,6 +53,9 @@ pub struct Ath10kDevice {
     /// Real retained vdev/passive channel setup; no station or carrier.
     pub scan_ready: Option<super::wmi_runtime::ScanReady>,
     pub scan_error: Option<super::wmi_runtime::Error>,
+    /// Native vdev START and peer-map prerequisites, never association or link.
+    pub station_prepared: Option<super::wmi_runtime::PeerPrepared>,
+    pub station_error: Option<super::wmi_runtime::Error>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -144,7 +147,7 @@ enum DriverSession {
     Runtime(RuntimeSession),
     Wmi(WmiSession),
     Htt(HttSession),
-    Radio(RadioSession),
+    Radio(alloc::boxed::Box<RadioSession>),
 }
 static SESSION: narf_lib::mutex::Mutex<Option<DriverSession>> = narf_lib::mutex::Mutex::new(None);
 
@@ -260,7 +263,7 @@ async fn initialize_radio(
         profile: htt.profile,
     };
     let result = owner.radio.start_from_hardware().await;
-    (DriverSession::Radio(owner), result)
+    (DriverSession::Radio(alloc::boxed::Box::new(owner)), result)
 }
 
 /// Receive-only native scan over the retained HTC/WMI/HTT owner. The caller
@@ -278,6 +281,31 @@ pub async fn scan_passive(
     if let Err(error) = &result {
         if let Some(controller) = CONTROLLER.lock().as_mut() {
             controller.scan_error = Some(*error);
+        }
+    }
+    result
+}
+
+/// Prepare the first legacy20 MHz station hardware context for a BSS from
+/// a completed native scan, constrained by the installed authenticated host
+/// regulatory policy and immutable EEPROM CTL. This sends no MLME/data frame,
+/// installs no keys and publishes no interface or carrier. Ambiguous firmware
+/// progress or cancellation retains the nested DMA owner until full reset.
+pub async fn prepare_station(
+    bssid: [u8; 6],
+    frequency: u16,
+) -> Result<super::wmi_runtime::PeerPrepared, super::wmi_runtime::Error> {
+    let domain =
+        narf_wireless::reg::db::get_domain().ok_or(super::wmi_runtime::Error::Unsupported)?;
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    let result = owner.radio.prepare_station(&domain, bssid, frequency).await;
+    if let Some(controller) = CONTROLLER.lock().as_mut() {
+        controller.station_prepared = owner.radio.prepared_peer();
+        if let Err(error) = &result {
+            controller.station_error = Some(*error);
         }
     }
     result
@@ -488,6 +516,8 @@ unsafe fn bring_up_live(
         htt_error: None,
         scan_ready: None,
         scan_error: None,
+        station_prepared: None,
+        station_error: None,
     })
 }
 

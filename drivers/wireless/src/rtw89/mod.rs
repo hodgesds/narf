@@ -15,18 +15,16 @@
 //! 1. PCI device match via the existing `bus::driver_match` table.
 //! 2. **BAR2** Device MMIO mapping (both rtw88 and rtw89 use BAR2). Linux `pci.c:rtw89_pci_claim_device` walks
 //!    `bar_id = 2` directly.
-//! 3. Baseline `rtw89_mac_pwr_on`-style power-on prologue. The
-//!    full per-chip PWR-seq table is out of scope; we run the
-//!    chip-agnostic minimum.
+//! 3. Diagnostic baseline power prologue; complete AX power-on/off and
+//!    DLE/HFC primitives await the composed boot owner.
 //! 4. Chip-ID detection from `R_AX_SYS_CFG1` so subsequent stages can
 //!    branch on the AX (8852A/B/C, 8851B) vs BE (8922A) generation.
 //! 5. EFUSE read for MAC + the 6-byte address copy. Logical map
 //!    offsets follow the per-chip layout in
 //!    `rtw89/rtw8852a.h::rtw8852ae_efuse`.
-//! 6. `narf-net::iface::register` stub for `wlan0` — `send_frame`
-//!    returns `Err(())` because TX rings + firmware aren't wired yet.
-//! 7. Firmware-download stub (`fw.rs`) + PHY parameter table stub
-//!    (`phy.rs`) so the follow-up can fill them in without churn.
+//! 6. Retained unpublished ring storage, without a registered NIC or IRQ.
+//! 7. Checked immutable secure firmware plans and native CH12 ownership,
+//!    still inactive pending full PCIe/BDRAM/WCPU composition and RF/MLME.
 //!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later as of
 //! 2026-05-20 per the root `LICENSE`)
@@ -58,6 +56,8 @@ extern crate alloc;
 
 pub mod btc;
 pub mod chan;
+mod command_native;
+mod command_queue;
 pub mod datapath;
 mod ddv;
 pub mod dma;

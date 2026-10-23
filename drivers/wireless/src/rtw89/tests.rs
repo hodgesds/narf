@@ -648,22 +648,14 @@ fn smoke_rtw89_dma_ring_state_avail() -> TestResult {
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_ring_state_avail);
 
 fn smoke_rtw89_dma_idx_pack_unpack() -> TestResult {
-    // pack_idx / split_idx round-trip — the index register format is
-    // (host_wp << 16) | hw_rp.
-    let packed = pack_idx(0x0AB, 0xCD12);
-    let (hw, host) = split_idx(packed);
-    if hw != 0x0AB {
-        return TestResult::Fail("HW pointer round-trip failed");
+    // Independent literal: Linux HW mask0x0fff0000 / host mask0x0fff.
+    let packed = pack_idx(0x0AB, 0x0D12);
+    let (hw, host) = split_idx(0xf0ab_ed12);
+    if packed != 0x00ab_0d12 || hw != 0x0AB || host != 0x0D12 {
+        return TestResult::Fail("literal Linux TXBD index fields");
     }
-    if host != 0xCD12 {
-        return TestResult::Fail("host pointer round-trip failed");
-    }
-    // Mask widths.
-    if RING_IDX_HW_MASK != 0x0FFF {
-        return TestResult::Fail("HW pointer mask not 12 bits");
-    }
-    if RING_IDX_HOST_SHIFT != 16 {
-        return TestResult::Fail("host shift not 16");
+    if RING_IDX_HW_MASK != 0x0FFF_0000 || RING_IDX_HOST_SHIFT != 0 {
+        return TestResult::Fail("Linux TXBD hardware/host index masks");
     }
     TestResult::Pass
 }

@@ -1,9 +1,9 @@
 //! RTW89 PCI probe.
 //!
 //! Driver-match registration + **BAR2** mapping. Notable difference
-//! from the sibling rtw88: the AX-generation 8852/8851/8922 parts
-//! expose only BAR2 as a single 64 KiB window — the register block
-//! Linux walks during init lives entirely inside BAR2, not BAR0.
+//! from the sibling rtw88: the AX-generation 8852/8851 parts use BAR2.
+//! Device-specific extents must cover each access; indirect CPU-local
+//! accesses on A/C require the larger aperture at0x40000.
 //!
 //! Linux's `rtw89/pci.c::rtw89_pci_claim_device` (~L3340..L3420) hard-
 //! codes `u8 bar_id = 2;` before the `pci_iomap` call. We mirror that
@@ -12,12 +12,11 @@
 //! ## What this file does *not* do at Stage 0/1 (deferred)
 //!
 //! - MSI/MSI-X vector setup. Lands with Stage-2 TX/RX rings.
-//! - Complete firmware load. Checked preparation and cold-power primitives
-//!   exist; secure-fuse, DLE/HFC, CH12 and WCPU owners still need composition.
+//! - Complete firmware load. Checked secure plans, power/DLE/HFC and native
+//!   CH12 primitives exist; full PCIe/BDRAM/WCPU still need composition.
 //! - PHY parameter table load. Stubbed in `phy.rs`.
-//! - DMA channel ring setup. The Linux code in `pci.c` allocates 13
-//!   TX + 2 RX rings; that's a non-trivial pile (~600 LOC of ring
-//!   bookkeeping) that lands with Stage 2.
+//! - DMA channel activation. The diagnostic retains13 TX +2 RX allocations;
+//!   they remain unpublished until the complete native startup owner exists.
 
 #![allow(dead_code)]
 

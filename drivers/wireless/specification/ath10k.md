@@ -63,6 +63,27 @@ packet service are not yet attached.
   IDs. The nonexistent `vdev_param::MAC_ADDR` constant is removed. These
   helpers remain MAIN-only; the retained runtime selects each firmware
   dialect separately.
+- `regulatory::Factory::from_eeprom` resolves the bounded SERVICE_READY
+  factory EEPROM identity through Linux's pair/country/CTL tables, including
+  exact sanitization and roaming-bit handling. Its country is descriptive,
+  never host transmit authority.
+- `pci::prepare_station(bssid, frequency_mhz)` prepares one native station
+  context selected from the last successful passive-scan cache. It requires
+  the installed authenticated host regulatory policy; initial geometry is
+  legacy 20 MHz on channels 1–11 within firmware hardware limits. The strict
+  initial factory-world 20 dBm ceiling and every overlapping host power,
+  bandwidth and DFS restriction constrain it. Negative power, DFS, 5/6 GHz
+  and beacon-hint-dependent channels stay closed in this profile.
+  It programs immutable factory pair/CTL and additional half-dBm power limits,
+  waits for a successful correlated VDEV_START_RESPONSE, creates the BSS
+  peer and waits for native HTT peer-map confirmation. `PeerPrepared` reports
+  the bound BSSID/frequency, sparse firmware peer ID and host power ceiling;
+  `Ath10kDevice::station_prepared`/`station_error` retain this diagnostic
+  result. These APIs transmit no MLME/data frame and do not imply association,
+  key installation, carrier or a registered NIC. A prepared context cannot
+  be scanned/replaced until owned teardown/reset is implemented. Any ambiguous
+  command, cancellation, malformed map or failed response closes its owner
+  while retaining DMA.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
@@ -186,6 +207,18 @@ identity/IE/channel data before caching. Passive scan continues HTT terminal
 completion processing and retains unrelated events for the later station
 worker. It never opens a controlled port, enables carrier or installs keys.
 
+The station-context composition uses dialect-specific native PDEV regulatory,
+power, vdev-start and peer-create layouts, including TLV pdev IDs. Firmware
+peer IDs are bounded by the 2048-entry descriptor namespace rather than the
+resource peer count; multiple IDs for one BSSID remain owned until individual
+UNMAPs. The retained station progress path rejects an owned ID rebound to a
+different MAC/vdev. No MAP itself authenticates a peer or controlled port.
+Independent tests compile Linux's unmodified regulatory initialization over
+all 65,536 EEPROM values and native WMI generators/packed channel structs for
+all six supported dialects. Composed tests traverse actual scan/cache, host
+policy, START status and HTT MAP/UNMAP; they cover cancellation after START
+publication, failed status, malformed/out-of-range map and retained DMA.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
@@ -270,11 +303,14 @@ The following are software work, not gates that a physical boot can close:
 3. A retained station worker composing the native packet/event owner with
    complete WMI operation handling, higher-capacity CE service, HIF IRQ/MSI,
    recovery and PM/teardown. HTT setup alone does not publish an interface.
-4. Station/runtime WMI maps beyond receive-only vdev/scan; HTT peer/BA/security routing,
+4. Station/runtime WMI maps beyond scan and one-shot station-context preparation;
+   complete HTT peer/BA/security routing,
    PFC fetch/mode/host-queue handling, native packet conversion, RX security
    and replay/reorder policy. Existing standalone WMI/HTT codecs are not the
    production station implementation.
-5. Authenticated regulatory/channel policy and station control, active/
+5. Extend the initial authenticated channels 1–11 factory/host context policy
+   to all claimed bands and widths, beacon hints/DFS and complete station
+   control, active/
    directed scan and richer scan options, management/EAPOL/key exchange,
    packet conversion, and `WirelessNetIface`/netdev registration.
 
