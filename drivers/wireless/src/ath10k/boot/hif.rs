@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! Owned runtime CE storage. CE0/1 remain in the original BMI owner;
+//! these allocations must be retained before BMI_DONE can activate firmware.
+use super::{allocate, PciBoot};
+use crate::ath10k::{
+    bmi::BmiError,
+    ce::Ath10kMmio,
+    dma::{barrier, Direction, Memory, Ring},
+    hw::HwRev,
+};
+use alloc::{collections::VecDeque, vec::Vec};
+
+#[derive(Debug)]
+pub(super) struct Pipe<B> {
+    pub number: u8,
+    pub direction: Direction,
+    pub maximum: u16,
+    pub ring: Ring<B>,
+    pub buffer: B,
+}
+#[derive(Debug)]
+pub(super) struct Runtime<B> {
+    pub pipes: Vec<Pipe<B>>,
+    pub received: VecDeque<(u8, Vec<u8>)>,
+    pub wmi_memory: Option<Vec<B>>,
+}
+impl<B: Memory> Runtime<B> {
+    pub fn allocate(
+        hw: HwRev,
+        mut allocate: impl FnMut(usize) -> Result<B, BmiError>,
+    ) -> Result<Self, BmiError> {
+        let mut pipes = Vec::new();
+        pipes.try_reserve_exact(5).map_err(|_| BmiError::NoMemory)?;
+        // Linux pci_host_ce_config_wlan + ath10k_pci_override_ce_config.
+        // QCA6174/9377 CE5 is disabled on the HOST, not a new source pipe.
+        for (number, direction, entries, maximum) in [
+            (2, Direction::Destination, 128, 2048),
+            (3, Direction::Source, 32, 2048),
+            (4, Direction::Source, 8192, 256),
+            (5, Direction::Destination, 512, 512),
+            (8, Direction::Destination, 128, 2048),
+        ] {
+            if number == 5 && matches!(hw, HwRev::Qca6174 | HwRev::Qca9377) {
+                continue;
+            }
+            if number == 8 && hw.registers().ok_or(BmiError::Unsupported)?.ce_count < 12 {
+                continue;
+            }
+            let ring = Ring::new(
+                allocate(entries as usize * 8)?,
+                hw,
+                number,
+                entries,
+                direction,
+            )?;
+            let buffer = allocate(maximum as usize)?;
+            pipes.push(Pipe {
+                number,
+                direction,
+                maximum,
+                ring,
+                buffer,
+            });
+        }
+        Ok(Self {
+            pipes,
+            received: VecDeque::new(),
+            wmi_memory: None,
+        })
+    }
+    pub fn initialize(&mut self, io: &mut impl Ath10kMmio, hw: HwRev) -> Result<(), BmiError> {
+        for pipe in &mut self.pipes {
+            pipe.ring.initialize(io, hw, pipe.number, pipe.maximum)?;
+            if pipe.direction == Direction::Destination {
+                pipe.ring
+                    .post(io, pipe.buffer.dma_address() as u32, pipe.maximum)?;
+            }
+        }
+        Ok(())
+    }
+    pub fn poll(&mut self, io: &mut impl Ath10kMmio) -> Result<(), BmiError> {
+        for pipe in &mut self.pipes {
+            if pipe.direction == Direction::Destination {
+                if let Some(frame) = receive(&mut pipe.ring, &mut pipe.buffer, io, pipe.maximum)? {
+                    if self.received.len() >= 32 {
+                        return Err(BmiError::BadResponse);
+                    }
+                    self.received
+                        .try_reserve(1)
+                        .map_err(|_| BmiError::NoMemory)?;
+                    self.received.push_back((pipe.number, frame));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+fn receive<B: Memory>(
+    ring: &mut Ring<B>,
+    buffer: &mut B,
+    io: &mut impl Ath10kMmio,
+    capacity: u16,
+) -> Result<Option<Vec<u8>>, BmiError> {
+    let Some(count) = ring.completion(io)? else {
+        return Ok(None);
+    };
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(count as usize)
+        .map_err(|_| BmiError::NoMemory)?;
+    for offset in 0..count as usize {
+        frame.push(buffer.read(offset));
+    }
+    ring.post(io, buffer.dma_address() as u32, capacity)?;
+    Ok(Some(frame))
+}
+async fn send<B: Memory>(
+    ring: &mut Ring<B>,
+    buffer: &mut B,
+    io: &mut impl Ath10kMmio,
+    poisoned: &mut bool,
+    bytes: &[u8],
+) -> Result<(), BmiError> {
+    if !io.authorized() {
+        return Err(BmiError::Pci);
+    }
+    if *poisoned || bytes.is_empty() || bytes.len() > buffer.len() {
+        return Err(BmiError::BadResponse);
+    }
+    *poisoned = true; // Cancellation cannot turn a pending DMA buffer reusable.
+    for (offset, &byte) in bytes.iter().enumerate() {
+        buffer.write(offset, byte);
+    }
+    barrier();
+    ring.post(io, buffer.dma_address() as u32, bytes.len() as u16)?;
+    let deadline = narf_time::Deadline::after_ms(3000);
+    loop {
+        if ring.completion(io)?.is_some() {
+            *poisoned = false;
+            return Ok(());
+        }
+        if deadline.expired() {
+            return Err(BmiError::Timeout);
+        }
+        PciBoot::delay(1).await;
+    }
+}
+
+impl PciBoot {
+    pub fn prepare_hif(&mut self) -> Result<(), BmiError> {
+        if !self.mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
+        if !self.power_ready || self.poisoned || self.hif.is_some() {
+            return Err(BmiError::BadResponse);
+        }
+        let runtime = Runtime::allocate(self.hardware, allocate)?;
+        // Store all allocations under fail-safe Drop before the first fallible
+        // ring-base write. A partially initialized attempt must never free them.
+        *self.hif = Some(runtime);
+        self.poisoned = true;
+        self.hif
+            .as_mut()
+            .unwrap()
+            .initialize(&mut self.mmio, self.hardware)?;
+        let address = self.resources.response.dma_address() as u32;
+        self.resources.rx.post(&mut self.mmio, address, 2048)?;
+        if !self.mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
+        self.poisoned = false;
+        Ok(())
+    }
+    pub async fn hif_send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        if !self.mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
+        if !self.hif_live || self.hif.is_none() {
+            return Err(BmiError::Unsupported);
+        }
+        if pipe == 0 {
+            let resources = &mut *self.resources;
+            return send(
+                &mut resources.tx,
+                &mut resources.request,
+                &mut self.mmio,
+                &mut self.poisoned,
+                bytes,
+            )
+            .await;
+        }
+        let port = self
+            .hif
+            .as_mut()
+            .unwrap()
+            .pipes
+            .iter_mut()
+            .find(|p| p.number == pipe && p.direction == Direction::Source)
+            .ok_or(BmiError::Unsupported)?;
+        send(
+            &mut port.ring,
+            &mut port.buffer,
+            &mut self.mmio,
+            &mut self.poisoned,
+            bytes,
+        )
+        .await
+    }
+    pub async fn hif_receive(&mut self, budget_ms: u64) -> Result<(u8, Vec<u8>), BmiError> {
+        if !self.mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
+        if self.poisoned || !self.hif_live || self.hif.is_none() {
+            return Err(BmiError::BadResponse);
+        }
+        self.poisoned = true; // A cancelled protocol wait requires reset, not replay.
+        let deadline = narf_time::Deadline::after_ms(budget_ms);
+        loop {
+            if !self.mmio.authorized() {
+                return Err(BmiError::Pci);
+            }
+            let hif = self.hif.as_mut().unwrap();
+            hif.poll(&mut self.mmio)?;
+            let resources = &mut *self.resources;
+            if let Some(frame) = receive(
+                &mut resources.rx,
+                &mut resources.response,
+                &mut self.mmio,
+                2048,
+            )? {
+                if hif.received.len() >= 32 {
+                    return Err(BmiError::BadResponse);
+                }
+                hif.received
+                    .try_reserve(1)
+                    .map_err(|_| BmiError::NoMemory)?;
+                hif.received.push_back((1, frame));
+            }
+            if let Some(frame) = hif.received.pop_front() {
+                self.poisoned = false;
+                return Ok(frame);
+            }
+            if deadline.expired() {
+                return Err(BmiError::Timeout);
+            }
+            PciBoot::delay(1).await;
+        }
+    }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "hif/tests.rs"]
+mod tests;

@@ -15,15 +15,15 @@ matching a PCI ID or testing a command encoder does not establish a WLAN.
 | Driver | Generation | Status | Mechanism |
 | :--- | :--- | :--- | :--- |
 | **iwlwifi** | Gen3 MLD station (Sc/BE211) | Live station runtime; hardware acceptance pending | Firmware CPU release, versioned coexistence/SoC/power setup, scan, station and packet paths; Gen2/MVM remains software work — `iwlwifi.md` |
-| **ath11k** | WCN6855 HW2.0/2.1 and matching QCA2066/QCA6698AQ layouts | Live STA/AP/P2P runtime; hardware acceptance pending | Incomplete QCA6390/QCN9074 profiles reject before DMA; their HAL/DP paths remain software work — `ath11k.md` |
-| **mt76** | MT7921/MT7922 CONNAC2 | Retained legacy 2.4 GHz station service on both architectures | Host-policy power/channel requests, UNI station/key commands, peer-bound RSNA, hardware CCMP replay checks, kernel/frame-ring service and verified reset/reload — `mt7921.md` |
+| **ath11k** | WCN6855-family and native QCA6390 profiles | Live station/runtime profiles; hardware acceptance pending | QCA6390 uses native IPQ8074 RX descriptors and four-vdev resources; QCN9074 remains gated pending its HAL/DP path — `ath11k.md` |
+| **mt76** | MT7921/MT7922 CONNAC2 | Retained legacy 2.4/5 GHz station service on both architectures | Host-policy power/channel requests, UNI station/key commands, peer-bound RSNA, hardware CCMP replay checks, kernel/frame-ring service and verified reset/reload — `mt7921.md` |
 | **rtw88** | RTL8821CE/RTL8822BE/RTL8822CE | Real chip/cut PCI power sequences and sparse EFUSE identity | Firmware reserved-page DMA, complete MAC/RF, rings and station control remain software work — `rtw88.md` |
 | **rtw89** | RTL8852A/B/C, RTL8851B AX | AX factory identity and retained native TX prerequisites | Full power/firmware startup, native producer/RPQ completion pump and station integration remain software work — `rtw89.md` |
 | **rtlwifi** | Legacy Realtek PCIe | BAR2 and per-chip sparse EFUSE identity | Full power/MAC/RF, firmware, DMA/IRQ and station runtime remain software work — `rtlwifi.md` |
-| **rtl8xxxu** | RTL8188EU USB firmware profile | Retained factory/FIFO/firmware/MAC/BB/RF/LLT setup | USB owns persistent transfers and slot/EP0 generations; IQK/LC/channel/power and native station packets remain software work — `rtl8xxxu.md` |
-| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Owned CE/BMI plus firmware/BDF/OTP/PLL/code-swap preparation | Runtime CE/IRQ ownership before BMI_DONE, HTC/WMI/HTT packet runtime and interface registration remain software work — `ath10k.md` |
+| **rtl8xxxu** | RTL8188EU USB firmware profile | Retained factory/FIFO/firmware/MAC/BB/RF/LLT and LC/IQK initialization | Production AES-CCM and checked role/TID CCMP prerequisites are available; channel/power, persistent native packets and station integration remain software work — `rtl8xxxu.md` |
+| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Owned CE/BMI through retained HTC and versioned WMI bootstrap | Runtime RX is posted before BMI_DONE; host-memory/INIT/READY ownership is retained. HTT packets and station registration remain software work — `ath10k.md` |
 | **ath9k** | AR9285 | Retained EEPROM identity and inactive PHY/PLL/RF INI programming | Modal/power/calibration, DMA/IRQ and soft-MAC station runtime remain software work — `ath9k.md` |
-| **brcmfmac** | Broadcom PCIe FullMAC | DMA parked, owned BAR0/AI core discovery | Firmware activation, shared/msgbuf/flow-ring runtime and interface attachment remain software work — `brcmfmac.md` |
+| **brcmfmac** | Explicit BCM43602 PCIe board profiles | CR4 firmware boot and owned v5/v6 msgbuf control/data/flow rings | Correlated IOCTL/RX/TX/flow completion ownership is implemented; board policy, station/security attachment, broader silicon and reclamation remain software work — `brcmfmac.md` |
 | **cyw43439** | Infineon SDIO FullMAC | Standard PCI SDHCI/explicit card bootstrap through F2 station attachment | Owned PIO enumeration, trusted firmware/NVRAM/CLM, discovered cores/RAM, mailbox/FIFO control and station/data; board wiring, gSPI host, reset/reload/PM remain — `cyw43439.md` |
 
 All eleven families are included in the software bring-up scope. Several
@@ -213,8 +213,11 @@ overflow reports an error instead of silently discarding a response. Neither
 normal frames nor TX releases can satisfy an MCU waiter.
 
 `Transport::scan_passive` and `scan_boot_passive` expose a bounded hardware
-diagnostic after `RadioReady`. Only unique world 2.4 GHz channels 1–11 are
-accepted. The first scan configures an unassociated station VIF with unified
+diagnostic after `RadioReady`. It accepts unique 2.4 GHz channels 1–11 and
+the Linux mt76 5 GHz channel set (36–64, 100–144 and 149–177 at the defined
+20 MHz spacing), limited to firmware-reported bands. Six-GHz RX channel flags
+are rejected before narrowing to a channel number. Requests spanning more than
+32 channels use the version-1 extension array with exact band/count fields. The first scan configures an unassociated station VIF with unified
 device/BSS commands, installs a 20 MHz `00` channel domain with NO_IR flags,
 enables the MAC/RX path, and submits a version-1 CONNAC2 passive scan request
 with zero probe requests. Subsequent scans reuse the VIF. Scan completion
@@ -228,13 +231,18 @@ IE bounds, RSN syntax, and consistency between RX and DS channels. Results
 retain original IEs and optional measured RSSI; unknown RSSI maps to -128
 at the wireless interface boundary. At most 64 BSSID/channel entries are
 retained, with a truncation flag; hidden-to-visible SSID updates are preserved.
+The shared native RX parser rejects zero/unsupported channels and six-GHz
+aliases. Authentication, association, EAPOL and connected packet RX must match
+the retained station channel before peer admission or replay-state changes.
 
 After successful radio initialization, `Mt76Iface` registers an exact shared
 netdev/wiphy name and its real MAC for passive nl80211 scans. Its constructor
 takes `(name, RadioInfo)` and rejects invalid identity; the old PCI-ID-derived
 constructor/registration scaffold is removed. Active/directed scans and
-unsupported channels are rejected before MMIO. Only the implemented 2.4 GHz
-profile is exposed, with HT/VHT/HE/EHT disabled. The link stays down and frame
+unsupported channels are rejected before MMIO. The implemented legacy 2.4/5 GHz
+profile is exposed, with HT/VHT/HE/EHT disabled. Random-MAC, mandatory dwell,
+colocated-6-GHz and extra-probe-IE scan requests fail explicitly; frequency
+and channel lists must agree when both are supplied. The link stays down and frame
 ring endpoints are absent until the retained station path completes a join.
 Association requires a cached matching BSS and an authenticated host policy;
 unsupported modes, channel configuration and scan profiles fail explicitly. No interface is registered on
@@ -248,8 +256,10 @@ rings. Its private serialized management TX path emits the Linux CONNAC2
 only those 64 bytes; TXP references the separate frame extent in the same
 owned allocation. Payload addresses must fit 32 bits, lengths must fit the
 allocation/TXP field, and token IDs stay within the MT7921 8192-token range.
-Only unprotected native management headers are accepted at the basic 1 Mbps
-rate; this backend is not exposed as a user-facing injection API.
+Unprotected native management/EAPOL frames use the lowest negotiated AP basic
+rate, including the Linux non-linear OFDM hardware-rate mapping in TXD6. The
+selected rate remains in the retained session for rekeys and deauthentication;
+this backend is not exposed as a user-facing injection API.
 
 After publication the slot remains pending until both a valid DMA device
 index/DDONE and a matching firmware TX-release token are observed, in either
@@ -263,13 +273,21 @@ the existing shutdown contract.
 
 `association::JoinPlan::prepare` validates a scanned ESS, exact SSID/BSSID,
 unicast station identity and legacy supported/basic rates before constructing
-an open-authentication and association request. The initial profile requires
-1 Mbps support on channels 1–11. Open and WPA2-PSK/CCMP are distinct modes:
+an open-authentication and association request. The profile accepts legacy
+CCK/OFDM on channels 1–11 and OFDM on the 5 GHz channel set; unknown mandatory
+rates and mandatory CCK on 5 GHz are rejected. Open and WPA2-PSK/CCMP are distinct modes:
 privacy/RSN mismatches, unknown mandatory rates, TKIP-only/SAE-only profiles
 and mandatory PMF are rejected. WPA2 requests contain the exact negotiated
 PSK/CCMP RSN IE plus supported rates; no PMK or temporal key enters the plan.
 `JoinPlan::security()` returns the secret-free `SecurityMode`; the input
 `Security` type redacts PMK bytes from debug output.
+
+`Transport::associate_station_with_ies` additionally accepts optional SME IEs.
+The request frequency/channel must identify the cached BSS. Malformed or
+duplicate RSNEs, conflicting cipher/AKM/PMF/PMKID requests, RSNXE/FT, and
+unimplemented PHY/WMM negotiation fail before hardware/recovery I/O. A matching
+PSK/CCMP RSNE is replaced by the driver's single negotiated RSNE; other accepted
+optional elements reach the native association request unchanged.
 
 The plan's read-only phase advances from prepared through authentication and
 association only on correctly addressed matching peer responses. Algorithm,
@@ -288,7 +306,9 @@ plan; no caller can mutate its phase directly.
 ### MT76 live join dispatch, WPA2 keys, and Ethernet data transport
 
 `Transport::associate_station` requires an installed host regulatory policy
-covering the entire 20 MHz channel. The retained profile is channels 1–11,
+covering the entire 20 MHz channel. Permissions bind the selected channel;
+2.4/5 GHz band fields are carried through channel domain, power limits, channel
+switch, band-local STA basic rates and BSS PHY modes. The retained profile uses
 one TX chain, legacy rates, Open or WPA2-PSK/CCMP; DFS/PMF-required/WPA3/HT
 profiles are not silently admitted. The host half-dBm ceiling is sent in the
 44-byte rate-power header plus one 162-byte channel/SKU record before any

@@ -36,6 +36,12 @@ pub struct TargetInfo {
 /// completions. A timeout poisons the transport; a later request must fail.
 pub(super) trait Transport {
     async fn exchange(&mut self, request: &[u8], response: &mut [u8]) -> Result<usize, BmiError>;
+    /// Physical transports validate that every runtime DMA prerequisite is
+    /// retained before DONE can start firmware. Pure ROM models may omit it.
+    fn prepare_done(&mut self) -> Result<(), BmiError> {
+        Ok(())
+    }
+    fn done_complete(&mut self) {}
     /// Retain the coherent code segment until the complete device owner
     /// quiesces DMA. Replacing an already advertised allocation is forbidden.
     fn prepare_codeswap(&mut self, _bytes: &[u8]) -> Result<(u32, [u8; 208]), BmiError> {
@@ -197,10 +203,12 @@ impl<T: Transport> Bmi<T> {
         if self.done {
             return Err(BmiError::AfterDone);
         }
+        self.transport.prepare_done()?;
         self.done = true;
         self.transport
             .exchange(&1u32.to_le_bytes(), &mut [])
             .await?;
+        self.transport.done_complete();
         Ok(())
     }
 }

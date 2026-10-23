@@ -2,7 +2,7 @@
 //!
 //! Spec: IEEE Std 802.11-2020 §12.5.3 (CCMP). Public IEEE document.
 //!   <https://standards.ieee.org/ieee/802.11/7028/>
-//! No GPL Linux source consulted.
+//! AAD masking cross-checked against Linux mac80211/wpa.c::ccmp_gcmp_aad.
 //!
 //! CCMP is the WPA2 (and WPA3-Personal-Compatibility) data-frame
 //! cipher. Each MPDU carries an 8-byte CCMP header in front of the
@@ -37,9 +37,10 @@
 //!
 //! Build from the MPDU header — masking out the muted fields per
 //! the spec table:
-//! - FC[Subtype 4..7] zeroed
-//! - FC[Retry, PowerMgmt, MoreData] cleared
-//! - Duration set to 0
+//! - Data FC[Subtype bits 4..6] zeroed; QoS indicator preserved
+//! - FC[Retry, PowerMgmt, MoreData] cleared; Protected set
+//! - QoS FC[Order] cleared (HT Control is not included)
+//! - Duration excluded
 //! - SeqCtrl[FragNum] preserved, [SeqNum] cleared
 //! - QoS Control field's TID (4 bits) preserved, rest cleared
 //!
@@ -162,12 +163,14 @@ pub fn build_aad(mac_header: &[u8]) -> Vec<u8> {
     // Frame Control with muted bits zeroed (§12.5.3.3.3).
     let fc_lo = mac_header[0];
     let fc_hi = mac_header[1];
-    // Mute Subtype bits 4..7 of FC[0]: we keep them as-is per Note 1
-    // (subtype is part of AAD); FC[1] mute Retry(11), PwrMgmt(12),
-    // MoreData(13) — bits 3, 4, 5 in the high byte.
-    let fc_hi_masked = fc_hi & !(0x38);
-    out.push(fc_lo);
-    out.push(fc_hi_masked);
+    let data = (fc_lo >> 2) & 3 == 2;
+    let management = (fc_lo >> 2) & 3 == 0;
+    let qos = data && fc_lo & 0x80 != 0;
+    // Preserve management subtype; mute data subtype bits 4..6 only.
+    // The QoS indicator remains authenticated. Protected is always set;
+    // Retry/PM/MoreData and (for QoS) Order are mutable on retransmission.
+    out.push(if management { fc_lo } else { fc_lo & !0x70 });
+    out.push((fc_hi & !0x38 | 0x40) & if qos { !0x80 } else { 0xff });
     // Per IEEE 802.11-2020 §12.5.3.3.3, AAD construction skips
     // the Duration/ID field — it goes straight from FC to A1.
     // (Earlier versions of this driver inserted two zero bytes
@@ -190,12 +193,9 @@ pub fn build_aad(mac_header: &[u8]) -> Vec<u8> {
 
     // QoS frames (subtype with bit 3 set in the data-frame range)
     // append the 2-byte QoS Control field with all bits zeroed
-    // except the TID nibble (bits 0..4).
-    // Type=Data (FC[0] bits 2..4 == 0b10) and bit 7 of FC[0] is the
+    // except the TID nibble (bits 0..3).
+    // Type=Data (FC[0] bits 2..3 == 0b10) and bit 7 of FC[0] is the
     // QoS-data subtype indicator (subtype 0x8..=0xF for QoS data).
-    let frame_type = (fc_lo >> 2) & 0x3;
-    let subtype = (fc_lo >> 4) & 0xF;
-    let qos = frame_type == 2 && subtype & 0x8 != 0;
     if qos && mac_header.len() >= header_offset + 2 {
         let qos_lo = mac_header[header_offset] & 0x0F; // TID
         out.push(qos_lo);
@@ -262,7 +262,10 @@ pub fn protect(
 
 /// Decrypt + verify an on-the-wire CCMP frame body. `protected` is
 /// `[ccmp_header || ciphertext || mic]`. On success the mutated
-/// plaintext is returned (the input is consumed).
+/// plaintext is returned. Authentication failure leaves ciphertext and replay
+/// state unchanged; the backend must honor AesCcm's verify-before-mutation
+/// contract. The caller validates complete MAC header shape, key ID and PN
+/// range, and provides a separate replay tracker per key / receiver TID.
 pub fn unprotect(
     aes: &dyn AesCcm,
     mac_header: &[u8],
@@ -279,7 +282,9 @@ pub fn unprotect(
         .try_into()
         .map_err(|_| CcmpError::TooShort)?;
     let (pn, _key_id) = decode_ccmp_header(&hdr_bytes)?;
-    replay.check(pn)?;
+    // A forged high PN must not advance the accepted replay state.
+    let mut candidate = *replay;
+    candidate.check(pn)?;
 
     let nonce = build_nonce(priority, mgmt, mac_header_a2(mac_header), pn);
     let aad = build_aad(mac_header);
@@ -288,6 +293,7 @@ pub fn unprotect(
     tag.copy_from_slice(&protected[CCMP_HDR_LEN + body_len..]);
     let body = &mut protected[CCMP_HDR_LEN..CCMP_HDR_LEN + body_len];
     aes.decrypt(key, &nonce, &aad, body, &tag)?;
+    *replay = candidate;
     Ok(body.to_vec())
 }
 
@@ -298,3 +304,7 @@ fn mac_header_a2(mac_header: &[u8]) -> &[u8; 6] {
         .expect("mac header < 16 bytes");
     arr
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "ccmp_tests.rs"]
+mod tests;

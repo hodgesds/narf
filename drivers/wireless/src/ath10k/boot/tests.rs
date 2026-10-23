@@ -48,9 +48,11 @@ struct Io {
     values: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
     complete: bool,
+    reads: usize,
 }
 impl Ath10kMmio for Io {
     fn read32(&mut self, offset: u64) -> u32 {
+        self.reads += 1;
         if self.complete
             && offset >= 0x34400
             && (offset - 0x34400) % 0x400 == hw::ce_off::CURRENT_SRRI
@@ -201,4 +203,57 @@ fn smoke_ath10k_boot_clears_poison_only_after_validated_completion() -> TestResu
 kernel_test_in!(
     "drivers/wireless/ath10k/boot",
     smoke_ath10k_boot_clears_poison_only_after_validated_completion
+);
+
+fn smoke_ath10k_revoked_cap_blocks_mmio_and_dma_publication() -> TestResult {
+    let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+    let (mut resources, io) = rig(false);
+    let mut mmio = Mmio { cap, io };
+    let mut poisoned = false;
+    let mut response = [0; 4];
+    if once(resources.bmi_exchange(&mut mmio, &mut poisoned, &[8, 0, 0, 0], &mut response))
+        != Poll::Pending
+        || !poisoned
+    {
+        return TestResult::Fail("revocation fixture did not publish actual BMI DMA");
+    }
+    let request = resources.request.bytes.clone();
+    let reads = mmio.io.reads;
+    let writes = mmio.io.writes.len();
+    cap.revoke(); // Real object-table epoch invalidation, not a fake boolean.
+    if mmio.authorized() || mmio.read32(0x34400) != u32::MAX {
+        return TestResult::Fail("revoked MMIO cap remained usable");
+    }
+    mmio.write32(0x34400, 0xdeadbeef);
+    if once(resources.bmi_exchange(&mut mmio, &mut poisoned, &[1, 2, 3, 4], &mut response))
+        != Poll::Ready(Err(BmiError::Pci))
+        || resources.tx.completion(&mut mmio) != Err(super::super::dma::DmaError::Authority)
+        || resources.request.bytes != request
+        || !poisoned
+        || mmio.io.reads != reads
+        || mmio.io.writes.len() != writes
+    {
+        return TestResult::Fail(
+            "revocation accessed hardware, overwrote pending DMA, or retired its owner",
+        );
+    }
+    // A fresh ring cannot publish either: check precedes descriptor writes.
+    let mut ring = Ring::new(
+        Buffer::new(16, 0x110000, false),
+        HwRev::Qca6174,
+        3,
+        2,
+        Direction::Source,
+    )
+    .unwrap();
+    if ring.post(&mut mmio, 0x112000, 16) != Err(super::super::dma::DmaError::Authority)
+        || mmio.io.writes.len() != writes
+    {
+        return TestResult::Fail("revoked cap admitted a new descriptor/doorbell");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/boot",
+    smoke_ath10k_revoked_cap_blocks_mmio_and_dma_publication
 );

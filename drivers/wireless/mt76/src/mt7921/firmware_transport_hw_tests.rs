@@ -360,7 +360,14 @@ fn inject_rx(words: &mut [u32], hw: &Hardware, which: usize, packet: &[u8]) {
 }
 fn mcu_management_tx_matches_linux_cut_through_header() -> TestResult {
     let frame = management_frame();
-    let header = packet_tx::management(&frame, 0x12345040, 0x1234, 19).unwrap();
+    let header = packet_tx::management(
+        &frame,
+        0x12345040,
+        0x1234,
+        19,
+        crate::mt7921::association::LegacyRate::ONE_MBPS,
+    )
+    .unwrap();
     let expected = [
         0x2000003eu32,
         0x80026013,
@@ -379,8 +386,20 @@ fn mcu_management_tx_matches_linux_cut_through_header() -> TestResult {
     if header[32..40] != [0x34, 0x92, 0, 0, 0, 0, 0, 0]
         || header[40..48] != [0x40, 0x50, 0x34, 0x12, 30, 0x80, 0, 0]
         || header[48..].iter().any(|b| *b != 0)
-        || packet_tx::management(&frame, 1u64 << 32, 1, 19) != Err(Error::DmaAddress)
-        || packet_tx::management(&frame[..23], 0, 1, 19) != Err(Error::Bounds)
+        || packet_tx::management(
+            &frame,
+            1u64 << 32,
+            1,
+            19,
+            crate::mt7921::association::LegacyRate::ONE_MBPS,
+        ) != Err(Error::DmaAddress)
+        || packet_tx::management(
+            &frame[..23],
+            0,
+            1,
+            19,
+            crate::mt7921::association::LegacyRate::ONE_MBPS,
+        ) != Err(Error::Bounds)
     {
         return TestResult::Fail("TXP segment/token/last/address geometry");
     }
@@ -401,7 +420,9 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
             let frame = management_frame();
             let slot = turn % DEPTH;
             let next = (slot + 1) % DEPTH;
-            if hw.submit_management(&frame, 19).is_err()
+            if hw
+                .submit_management(&frame, 19, crate::mt7921::association::LegacyRate::ONE_MBPS)
+                .is_err()
                 || words[(TX_DATA + 8) as usize / 4] != next as u32
             {
                 return TestResult::Fail("management doorbell or ring wrap");
@@ -411,7 +432,8 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
             if ring.word(slot, 1) != (64 << 16) | LAST {
                 return TestResult::Fail("DMA must publish TXD+TXP, not payload length");
             }
-            if hw.submit_management(&frame, 19) != Err(Error::Busy)
+            if hw.submit_management(&frame, 19, crate::mt7921::association::LegacyRate::ONE_MBPS)
+                != Err(Error::Busy)
                 || !matches!(hw.management_complete(), Ok(None))
             {
                 return TestResult::Fail("pending token allowed reuse");
@@ -579,7 +601,14 @@ fn mcu_tx_completion_pump_preserves_queued_and_fresh_command_replies() -> TestRe
         Err(_) => return TestResult::Fail("allocation"),
     };
     hw.owner.published = true;
-    if hw.submit_management(&management_frame(), 1).is_err() {
+    if hw
+        .submit_management(
+            &management_frame(),
+            1,
+            crate::mt7921::association::LegacyRate::ONE_MBPS,
+        )
+        .is_err()
+    {
         return TestResult::Fail("publish management TX");
     }
     let mut old = vec![0u8; 36];

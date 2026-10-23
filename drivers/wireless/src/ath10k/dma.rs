@@ -26,6 +26,7 @@ pub(super) fn barrier() {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DmaError {
+    Authority,
     BadConfig,
     Busy,
     DeviceGone,
@@ -109,7 +110,7 @@ impl<B: Memory> Ring<B> {
             .checked_add(memory.len() as u64)
             .ok_or(DmaError::BadConfig)?;
         if !entries.is_power_of_two()
-            || !(2..=4096).contains(&entries)
+            || !(2..=8192).contains(&entries)
             || memory.len() < entries as usize * 8
             || memory.dma_address() & 7 != 0
             || end > 1u64 << 32
@@ -133,6 +134,9 @@ impl<B: Memory> Ring<B> {
         pipe: u8,
         max: u16,
     ) -> Result<(), DmaError> {
+        if !mmio.authorized() {
+            return Err(DmaError::Authority);
+        }
         if self.pending.is_some() || hw.registers().and_then(|r| r.ce_base(pipe)) != Some(self.base)
         {
             return Err(DmaError::Busy);
@@ -181,6 +185,9 @@ impl<B: Memory> Ring<B> {
                 },
             self.entries,
         );
+        if !mmio.authorized() {
+            return Err(DmaError::Authority);
+        }
         Ok(())
     }
 
@@ -190,6 +197,9 @@ impl<B: Memory> Ring<B> {
         address: u32,
         bytes: u16,
     ) -> Result<(), DmaError> {
+        if !mmio.authorized() {
+            return Err(DmaError::Authority);
+        }
         if self.pending.is_some() {
             return Err(DmaError::Busy);
         }
@@ -223,10 +233,16 @@ impl<B: Memory> Ring<B> {
                 },
             self.next,
         );
+        if !mmio.authorized() {
+            return Err(DmaError::Authority);
+        }
         Ok(())
     }
 
     pub fn completion(&mut self, mmio: &mut impl Ath10kMmio) -> Result<Option<u16>, DmaError> {
+        if !mmio.authorized() {
+            return Err(DmaError::Authority);
+        }
         let Some((slot, capacity)) = self.pending else {
             return Ok(None);
         };

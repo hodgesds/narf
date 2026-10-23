@@ -456,6 +456,11 @@ impl<T: PacketTransport> Station<T> {
         }
         self.operation = true;
         let result = self.disconnect_inner().await;
+        if result.is_err() {
+            // A rejected DISASSOC does not establish firmware link-down.
+            // Do not reuse old SET_SSID/PSK events for a later attempt.
+            self.runtime.fail();
+        }
         self.operation = false;
         result
     }

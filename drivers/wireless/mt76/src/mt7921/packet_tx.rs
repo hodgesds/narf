@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 pub(super) const HEADER: usize = 64; // 32-byte TXD + 32-byte hardware TXP.
 const TOKEN_LIMIT: u16 = 8192; // Linux MT7921_TOKEN_SIZE; zero is unused here.
 
-/// Encode an unencrypted native management frame at the basic 1 Mbps rate.
+/// Encode an unencrypted native frame at the selected AP basic rate.
 /// Publication remains private to the hardware backend until association
 /// supplies verified channel/power permission. This is not an injection API.
 pub(super) fn management(
@@ -14,6 +14,7 @@ pub(super) fn management(
     payload: u64,
     token: u16,
     wcid: u16,
+    rate: crate::mt7921::association::LegacyRate,
 ) -> Result<[u8; HEADER], Error> {
     if !(24..=4032).contains(&frame.len()) {
         return Err(Error::Bounds);
@@ -43,7 +44,7 @@ pub(super) fn management(
         (1 << 28) | (15 << 11) | u32::from(multicast),
         0,
         0,
-        4,
+        4 | (u32::from(rate.hardware()) << 16),
         (if is_data { 2 << 20 } else { 0 }) | (subtype << 16),
     ];
     let mut bytes = [0; HEADER];

@@ -148,3 +148,64 @@ kernel_test_in!(
     "drivers/wireless/ath10k/bmi",
     smoke_ath10k_bmi_compressed_download_and_done_gate
 );
+
+#[derive(Default)]
+struct RuntimeTransport {
+    retained: bool,
+    fail: bool,
+    activated: bool,
+    requests: Vec<Vec<u8>>,
+}
+impl Transport for RuntimeTransport {
+    fn prepare_done(&mut self) -> Result<(), BmiError> {
+        if self.retained {
+            Ok(())
+        } else {
+            Err(BmiError::Unsupported)
+        }
+    }
+    fn done_complete(&mut self) {
+        self.activated = true;
+    }
+    async fn exchange(&mut self, request: &[u8], _: &mut [u8]) -> Result<usize, BmiError> {
+        self.requests.push(request.to_vec());
+        if self.fail {
+            Err(BmiError::Timeout)
+        } else {
+            Ok(0)
+        }
+    }
+}
+fn smoke_ath10k_done_requires_retained_runtime_and_terminal_completion() -> TestResult {
+    let mut bmi = Bmi::new(RuntimeTransport::default());
+    if ready(bmi.done()) != Some(Err(BmiError::Unsupported))
+        || !bmi.transport.requests.is_empty()
+        || bmi.done
+    {
+        return TestResult::Fail("unretained runtime reached irreversible BMI_DONE");
+    }
+    bmi.transport.retained = true;
+    if ready(bmi.done()) != Some(Ok(()))
+        || !bmi.transport.activated
+        || bmi.transport.requests != [vec![1, 0, 0, 0]]
+    {
+        return TestResult::Fail("retained runtime not activated after terminal BMI_DONE");
+    }
+    let mut bmi = Bmi::new(RuntimeTransport {
+        retained: true,
+        fail: true,
+        ..RuntimeTransport::default()
+    });
+    if ready(bmi.done()) != Some(Err(BmiError::Timeout))
+        || bmi.transport.activated
+        || ready(bmi.done()) != Some(Err(BmiError::AfterDone))
+        || bmi.transport.requests.len() != 1
+    {
+        return TestResult::Fail("ambiguous BMI_DONE activated or replayed runtime");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/bmi",
+    smoke_ath10k_done_requires_retained_runtime_and_terminal_completion
+);

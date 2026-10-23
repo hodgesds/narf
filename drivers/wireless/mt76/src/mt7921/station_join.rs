@@ -2,7 +2,8 @@
 //! Channel/power authorization, MLME open authentication/association
 //! request/response loops, and peer record installation.
 use super::{
-    scan::rx_frame, station::Command, Backend, Error, ScanBss, Session, Stage, State, TIMEOUT_MS,
+    scan::rx_on_channel, station::Command, Backend, Error, ScanBss, Session, Stage, State,
+    TIMEOUT_MS,
 };
 use crate::mt7921::{
     association::{disconnect_record, JoinPlan, Security},
@@ -147,8 +148,8 @@ pub(crate) fn extract_eapol(frame: &[u8]) -> Option<&[u8]> {
 /// An authenticator EAPOL PDU must come from the negotiated AP to this
 /// station, in a validated native FromDS MPDU. Ethernet/descriptor fallbacks
 /// cannot establish peer identity for the controlled port.
-pub(super) fn peer_eapol(packet: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<&[u8]> {
-    let frame = rx_frame(packet)?;
+pub(super) fn peer_eapol(packet: &[u8], own: [u8; 6], peer: [u8; 6], channel: u8) -> Option<&[u8]> {
+    let frame = rx_on_channel(packet, channel)?;
     let header = frame.get(..24)?;
     if header[1] & 3 != 2
         || header[4..10] != own
@@ -317,8 +318,13 @@ impl<B: Backend> Session<B> {
         if self.peer_lost {
             return Err(Error::DeviceGone);
         }
-        let (own, peer) = match self.state {
-            State::Associated { info, peer, .. } => (info.capabilities.mac, peer),
+        let (own, peer, channel) = match self.state {
+            State::Associated {
+                info,
+                peer,
+                channel,
+                ..
+            } => (info.capabilities.mac, peer, channel),
             _ => return Err(Error::Busy),
         };
         for _ in 0..16 {
@@ -329,6 +335,9 @@ impl<B: Backend> Session<B> {
             let Some(native) = super::scan::rx_native(&packet) else {
                 continue;
             };
+            if native.channel != channel {
+                continue;
+            }
             let frame = native.frame;
             let Some(header) = frame.get(..24) else {
                 continue;
@@ -436,7 +445,8 @@ impl<B: Backend> Session<B> {
         wcid: u16,
     ) -> Result<packet_tx::Completion, Error> {
         self.backend.check()?;
-        self.backend.submit_management(frame, wcid)?;
+        self.backend
+            .submit_management(frame, wcid, self.management_rate)?;
         let completion = self
             .wait(TIMEOUT_MS, |backend| backend.management_complete())
             .await?;
@@ -542,6 +552,7 @@ impl<B: Backend> Session<B> {
         ssid: &[u8],
         security: Security,
         permission: crate::mt7921::association::TxPermission,
+        extra_ies: &[u8],
     ) -> Result<u16, Error> {
         let (info, setup) = match self.state {
             State::RadioReady(info) => (info, true),
@@ -549,7 +560,11 @@ impl<B: Backend> Session<B> {
             State::Associated { .. } => return Err(Error::Busy),
             _ => return Err(Error::Busy),
         };
-        if info.capabilities.phy.bands & 1 == 0 {
+        let band = crate::mt7921::channel::band(bss.channel).ok_or(Error::Bounds)?;
+        if !permission.permits(bss.channel) {
+            return Err(Error::Authority);
+        }
+        if info.capabilities.phy.bands & band.capability() == 0 {
             return Err(Error::InvalidIdentity);
         }
         let own = info.capabilities.mac;
@@ -560,7 +575,9 @@ impl<B: Backend> Session<B> {
             crate::mt7921::association::Error::Busy => Error::Busy,
             _ => Error::Bounds,
         })?;
+        plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
 
+        self.management_rate = plan.management_rate();
         self.boot_started = Some(self.backend.now_ns());
         self.security = None;
         let result = async {
@@ -573,7 +590,7 @@ impl<B: Backend> Session<B> {
             let mut domain = vec![0u8; 12 + 8];
             domain[..2].copy_from_slice(&permission.country);
             domain[4..7].fill(1); // 20 MHz
-            domain[8] = 1; // 1 channel
+            domain[7 + usize::from(band.scan_tag())] = 1; // n_2ch / n_5ch.
             domain[12..14].copy_from_slice(&(u16::from(bss.channel)).to_le_bytes());
             domain[16..20].copy_from_slice(&0u32.to_le_bytes()); // NO_IR=0 (transmission authorized)
             self.notify(
@@ -592,7 +609,7 @@ impl<B: Backend> Session<B> {
                     id: 0x5d,
                     query: false,
                 },
-                &permission.rate_limits(bss.channel),
+                &permission.rate_limits(),
             )
             .await?;
 
@@ -604,7 +621,7 @@ impl<B: Backend> Session<B> {
                 cmd::CH_BW_20,
                 1, // The retained legacy profile transmits on one chain.
                 (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
-                cmd::CH_BAND_24G,
+                band.switch_tag(),
                 &mut switch,
             )
             .ok_or(Error::Bounds)?;
@@ -639,7 +656,7 @@ impl<B: Backend> Session<B> {
                         let Some(packet) = backend.receive_data()? else {
                             break;
                         };
-                        if let Some(frame) = rx_frame(&packet) {
+                        if let Some(frame) = rx_on_channel(&packet, bss.channel) {
                             if let Some(assoc) = plan
                                 .authentication_response(frame)
                                 .map_err(|_| Error::MalformedEvent)?
@@ -663,7 +680,7 @@ impl<B: Backend> Session<B> {
                         let Some(packet) = backend.receive_data()? else {
                             break;
                         };
-                        if let Some(frame) = rx_frame(&packet) {
+                        if let Some(frame) = rx_on_channel(&packet, bss.channel) {
                             if let Some(aid) = plan
                                 .association_response(frame)
                                 .map_err(|_| Error::MalformedEvent)?
@@ -709,7 +726,9 @@ impl<B: Backend> Session<B> {
                                     let Some(packet) = backend.receive_data()? else {
                                         break;
                                     };
-                                    if let Some(pdu) = peer_eapol(&packet, own, bss.bssid) {
+                                    if let Some(pdu) =
+                                        peer_eapol(&packet, own, bss.bssid, bss.channel)
+                                    {
                                         if let Some(result) = security.process(pdu, false)? {
                                             return Ok(Some(result));
                                         }

@@ -15,7 +15,7 @@ use narf_wireless::{
     scan::BssInfo, AssociateRequest, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
 
-/// One retained legacy 2.4 GHz station, with carrier gated by association.
+/// One retained legacy 2.4/5 GHz station, with carrier gated by association.
 #[derive(Debug)]
 pub struct Mt76Iface {
     name: String,
@@ -37,7 +37,7 @@ impl Mt76Iface {
     pub fn new(name: String, radio: RadioInfo) -> Result<Self, WirelessError> {
         if radio.capabilities.mac == [0; 6]
             || radio.capabilities.mac[0] & 1 != 0
-            || radio.capabilities.phy.bands & 1 == 0
+            || radio.capabilities.phy.bands & 3 == 0
         {
             return Err(WirelessError::InvalidArgs);
         }
@@ -57,12 +57,25 @@ impl Mt76Iface {
             recovery_after_ns: AtomicU64::new(0),
         })
     }
-    /// Only the implemented world 2.4 GHz passive scan channels are exposed.
+    /// Legacy 20 MHz channels on firmware-reported bands; scan remains passive.
     pub fn bands(&self) -> Vec<WirelessBand> {
-        vec![WirelessBand {
-            freq_mhz: 2400,
-            channels: (1..=11).collect(),
-        }]
+        let mut bands = Vec::new();
+        if self.radio.capabilities.phy.bands & 1 != 0 {
+            bands.push(WirelessBand {
+                freq_mhz: 2400,
+                channels: (1..=11).collect(),
+            });
+        }
+        if self.radio.capabilities.phy.bands & 2 != 0 {
+            bands.push(WirelessBand {
+                freq_mhz: 5000,
+                channels: crate::mt7921::channel::CHANNELS_5GHZ
+                    .into_iter()
+                    .map(u32::from)
+                    .collect(),
+            });
+        }
+        bands
     }
 
     /// Transmit an 802.3 Ethernet frame over the associated wireless datapath.
@@ -317,7 +330,7 @@ impl WirelessNetIface for Mt76Iface {
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let channels = passive_channels(&req)?;
+        let channels = passive_channels(&req, self.radio.capabilities.phy.bands)?;
         let _control = self.control.lock().await;
         self.finish_teardown(true).await?;
         {
@@ -337,7 +350,7 @@ impl WirelessNetIface for Mt76Iface {
                 .map(|bss| BssInfo {
                     bssid: bss.bssid,
                     ssid: bss.ssid.clone(),
-                    frequency_mhz: 2407 + 5 * u32::from(bss.channel),
+                    frequency_mhz: crate::mt7921::channel::frequency(bss.channel).unwrap_or(0),
                     channel: u32::from(bss.channel),
                     rssi: bss.signal_dbm.unwrap_or(-128),
                     security: scan_security(bss),
@@ -354,9 +367,9 @@ impl WirelessNetIface for Mt76Iface {
 
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
-        self.finish_teardown(true).await?;
-        if self.link_up() {
-            return Err(WirelessError::Busy);
+        let channel = u8::try_from(req.channel).map_err(|_| WirelessError::InvalidArgs)?;
+        if crate::mt7921::channel::frequency(channel) != Some(req.frequency_mhz) {
+            return Err(WirelessError::InvalidArgs);
         }
         if req.ssid.is_empty()
             || req.ssid.len() > 32
@@ -364,6 +377,21 @@ impl WirelessNetIface for Mt76Iface {
             || req.bssid[0] & 1 != 0
         {
             return Err(WirelessError::InvalidArgs);
+        }
+        let protected = match &req.security {
+            narf_wireless::SecurityConfig::Open => false,
+            narf_wireless::SecurityConfig::Wpa2 { .. } => true,
+            _ => return Err(WirelessError::NotSupported),
+        };
+        crate::mt7921::association::validate_sme_ies(&req.ie, protected).map_err(|error| {
+            match error {
+                crate::mt7921::association::Error::InvalidBss => WirelessError::InvalidArgs,
+                _ => WirelessError::NotSupported,
+            }
+        })?;
+        self.finish_teardown(true).await?;
+        if self.link_up() {
+            return Err(WirelessError::Busy);
         }
         let security = match req.security {
             narf_wireless::SecurityConfig::Open => crate::mt7921::association::Security::Open,
@@ -391,7 +419,7 @@ impl WirelessNetIface for Mt76Iface {
 
         {
             use crate::mt7921::firmware_transport::{associate_boot_station, Error};
-            let aid = associate_boot_station(&bss, &req.ssid, security)
+            let aid = associate_boot_station(&bss, &req.ssid, security, &req.ie)
                 .await
                 .map_err(|error| match error {
                     Error::Bounds => WirelessError::InvalidArgs,
@@ -450,30 +478,54 @@ impl WirelessNetIface for Mt76Iface {
         Err(WirelessError::NotSupported)
     }
 }
-fn passive_channels(req: &ScanRequest) -> Result<Vec<u8>, WirelessError> {
-    if req.active || !req.ssids.is_empty() {
+fn passive_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessError> {
+    use crate::mt7921::channel;
+    if req.active
+        || !req.ssids.is_empty()
+        || req.random_mac.is_some()
+        || req.colocated_6ghz
+        || req.duration_mandatory
+        || !req.extra_ies.is_empty()
+    {
         return Err(WirelessError::NotSupported);
     }
     let requested = if req.frequencies_mhz.is_empty() {
         req.channels.clone()
     } else {
-        req.frequencies_mhz
+        let channels = req
+            .frequencies_mhz
             .iter()
-            .map(|&freq| match freq {
-                2412..=2462 if (freq - 2407) % 5 == 0 => Ok((freq - 2407) / 5),
-                _ => Err(WirelessError::NotSupported),
+            .map(|&freq| {
+                channel::from_frequency(freq)
+                    .map(u32::from)
+                    .ok_or(WirelessError::NotSupported)
             })
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    if requested.is_empty() {
-        return Ok((1..=11).collect());
-    }
-    let mut channels = Vec::new();
-    for channel in &requested {
-        if !(1..=11).contains(channel) || channels.contains(&(*channel as u8)) {
+            .collect::<Result<Vec<_>, _>>()?;
+        if !req.channels.is_empty()
+            && (req.channels.len() != channels.len()
+                || !req
+                    .channels
+                    .iter()
+                    .all(|channel| channels.contains(channel)))
+        {
             return Err(WirelessError::InvalidArgs);
         }
-        channels.push(*channel as u8);
+        channels
+    };
+    if requested.is_empty() {
+        return Ok(channel::channels(bands));
+    }
+    let mut channels = Vec::new();
+    for requested in requested {
+        let value = u8::try_from(requested).map_err(|_| WirelessError::InvalidArgs)?;
+        let band = channel::band(value).ok_or(WirelessError::InvalidArgs)?;
+        if bands & band.capability() == 0 {
+            return Err(WirelessError::NotSupported);
+        }
+        if channels.contains(&value) {
+            return Err(WirelessError::InvalidArgs);
+        }
+        channels.push(value);
     }
     Ok(channels)
 }
@@ -622,7 +674,7 @@ mod tests {
             || iface.rx_ring().lock().is_some()
             || iface.tx_ring().lock().is_some()
             || info.base_name != "wlan7"
-            || info.bands.len() != 1
+            || info.bands.len() != 2
             || info.bands[0].channels != (1..=11).collect::<Vec<_>>()
             || info.hw_caps.ht_supported
             || info.hw_caps.vht_supported
@@ -660,29 +712,29 @@ mod tests {
             duration_mandatory: false,
             extra_ies: Vec::new(),
         };
-        if passive_channels(&req) != Ok(vec![1, 6, 11]) {
+        if passive_channels(&req, 3) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("valid passive request");
         }
         req.active = true;
-        if passive_channels(&req) != Err(WirelessError::NotSupported) {
+        if passive_channels(&req, 3) != Err(WirelessError::NotSupported) {
             return TestResult::Fail("active scan silently downgraded");
         }
         req.active = false;
         req.ssids.push(Vec::new());
-        if passive_channels(&req) != Err(WirelessError::NotSupported) {
+        if passive_channels(&req, 3) != Err(WirelessError::NotSupported) {
             return TestResult::Fail("directed probes allowed");
         }
         req.ssids.clear();
-        req.channels = vec![36];
-        if passive_channels(&req) != Err(WirelessError::InvalidArgs) {
+        req.channels = vec![35];
+        if passive_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("unimplemented band exposed");
         }
         req.channels = vec![1, 1];
-        if passive_channels(&req) != Err(WirelessError::InvalidArgs) {
+        if passive_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("duplicate channel");
         }
         req.channels.clear();
-        if passive_channels(&req) != Ok((1..=11).collect()) {
+        if passive_channels(&req, 3) != Ok(crate::mt7921::channel::channels(3)) {
             return TestResult::Fail("default scan channels");
         }
         TestResult::Pass
@@ -725,6 +777,35 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/mt7921/association",
         mt76_iface_association_validation_and_link_state
+    );
+    fn mt76_iface_rejects_frequency_and_security_before_recovery_io() -> TestResult {
+        let iface = Mt76Iface::new(String::from("wlan0"), radio()).unwrap();
+        iface.teardown_needed.store(true, Ordering::Release);
+        for (frequency_mhz, ie, expected) in [
+            (5180, Vec::new(), WirelessError::InvalidArgs),
+            (2437, vec![244, 1, 0], WirelessError::NotSupported),
+            (2437, vec![48, 20, 1], WirelessError::InvalidArgs),
+        ] {
+            let req = AssociateRequest {
+                bssid: [2, 1, 2, 3, 4, 5],
+                ssid: b"narf".to_vec(),
+                frequency_mhz,
+                channel: 6,
+                security: narf_wireless::SecurityConfig::Open,
+                ie,
+            };
+            if narf_scheduler::block_on_spin(iface.associate(req)) != Err(expected)
+                || !iface.teardown_needed.load(Ordering::Acquire)
+                || iface.link_up()
+            {
+                return TestResult::Fail("invalid association reached recovery or opened carrier");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/association",
+        mt76_iface_rejects_frequency_and_security_before_recovery_io
     );
     fn mt76_iface_ring_admission_and_link_cleanup() -> TestResult {
         let iface = Mt76Iface::new(String::from("wlan0"), radio()).unwrap();

@@ -36,6 +36,7 @@ pub mod tpm;
 // authoritative reference linked in-module. See `crypto/specification/
 // spec.md` §9.2.1 for the licensing posture and reference table.
 pub mod aead;
+pub mod aes_ccm;
 pub mod aes_ctr;
 pub mod aes_kw;
 pub mod aes_siv;

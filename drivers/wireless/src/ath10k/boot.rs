@@ -9,7 +9,7 @@
 use core::mem::ManuallyDrop;
 
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
-use narf_capabilities::{Cap, Write};
+use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Write};
 use narf_io::DmaBuffer;
 use narf_lib::id::DomainId;
 
@@ -18,18 +18,73 @@ use super::ce::{self, Ath10kMmio};
 use super::dma::{barrier, Direction, Memory, Ring};
 use super::hw::{self, HwRev, Registers};
 
+#[path = "boot/hif.rs"]
+mod hif;
+#[path = "boot/wmi_memory.rs"]
+mod wmi_memory;
+
 const HOST_INTEREST: u32 = 0x400800;
 
 #[derive(Debug)]
-struct Mmio(MmioRegion);
-impl Ath10kMmio for Mmio {
+struct RawMmio(MmioRegion);
+impl Ath10kMmio for RawMmio {
     fn read32(&mut self, offset: u64) -> u32 {
-        // SAFETY: the PCI owner validated BAR coverage for this chip.
+        if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > self.0.len) {
+            return u32::MAX;
+        }
+        // SAFETY: complete checked BAR extent; called inside Cap::invoke.
         unsafe { self.0.read32(offset) }
     }
     fn write32(&mut self, offset: u64, value: u32) {
-        // SAFETY: retained exclusive PCI function; bounded register offsets.
+        if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > self.0.len) {
+            return;
+        }
+        // SAFETY: complete checked BAR extent; called inside Cap::invoke.
         unsafe { self.0.write32(offset, value) }
+    }
+}
+
+#[derive(Debug)]
+struct Mmio<I = RawMmio> {
+    cap: Cap<BusDeviceCap, Write>,
+    io: I,
+}
+struct RegisterOp<'a, I> {
+    io: &'a mut I,
+    offset: u64,
+    value: Option<u32>,
+}
+impl<I: Ath10kMmio> CapOp<BusDeviceCap, Write> for RegisterOp<'_, I> {
+    type Output = u32;
+    fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<u32, CapError> {
+        Ok(match self.value {
+            Some(value) => {
+                self.io.write32(self.offset, value);
+                0
+            }
+            None => self.io.read32(self.offset),
+        })
+    }
+}
+impl<I: Ath10kMmio> Ath10kMmio for Mmio<I> {
+    fn authorized(&self) -> bool {
+        self.cap.invoke(NoopOp).is_ok()
+    }
+    fn read32(&mut self, offset: u64) -> u32 {
+        self.cap
+            .invoke(RegisterOp {
+                io: &mut self.io,
+                offset,
+                value: None,
+            })
+            .unwrap_or(u32::MAX)
+    }
+    fn write32(&mut self, offset: u64, value: u32) {
+        let _ = self.cap.invoke(RegisterOp {
+            io: &mut self.io,
+            offset,
+            value: Some(value),
+        });
     }
 }
 
@@ -56,8 +111,11 @@ pub(super) struct PciBoot {
     hardware: HwRev,
     registers: Registers,
     device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
     resources: ManuallyDrop<Resources>,
+    hif: ManuallyDrop<Option<hif::Runtime<DmaBuffer>>>,
+    hif_live: bool,
+    mission_pending: bool,
+    power_ready: bool,
     armed: bool,
     poisoned: bool,
     saved_aspm: Option<u16>,
@@ -87,12 +145,18 @@ impl PciBoot {
             codeswap: None,
         };
         Ok(Self {
-            mmio: Mmio(mmio),
+            mmio: Mmio {
+                cap,
+                io: RawMmio(mmio),
+            },
             hardware,
             registers,
             device,
-            cap,
             resources: ManuallyDrop::new(resources),
+            hif: ManuallyDrop::new(None),
+            hif_live: false,
+            mission_pending: false,
+            power_ready: false,
             armed: false,
             poisoned: false,
             saved_aspm: None,
@@ -217,8 +281,11 @@ impl PciBoot {
     }
 
     pub async fn power_up(&mut self, chip_revision: u32) -> Result<(), BmiError> {
+        if !self.mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
         self.saved_aspm = narf_bus::pci_express::clear_and_set_link_control(
-            &self.cap,
+            &self.mmio.cap,
             &self.device,
             narf_bus::pci_express::LNKCTL_ASPMC,
             0,
@@ -243,11 +310,12 @@ impl PciBoot {
         barrier();
         // Mark the resources as published before the first fallible enable.
         self.armed = true;
-        narf_bus::pci::set_command(&self.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
+        narf_bus::pci::set_command(&self.mmio.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
             .map_err(|_| BmiError::Pci)?;
         self.configure_target(chip_revision).await?;
         let control = self.mmio.read32(self.registers.soc_core);
         self.mmio.write32(self.registers.soc_core, control | 0x2000);
+        self.power_ready = true;
         Ok(())
     }
 
@@ -280,6 +348,9 @@ impl PciBoot {
         bytes: &mut [u8],
         write: bool,
     ) -> Result<(), BmiError> {
+        if !self.mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
         if self.poisoned
             || address & 3 != 0
             || bytes.is_empty()
@@ -346,6 +417,20 @@ impl PciBoot {
 }
 
 impl Transport for PciBoot {
+    fn prepare_done(&mut self) -> Result<(), BmiError> {
+        if !self.mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
+        if self.poisoned || self.hif.is_none() || self.hif_live {
+            return Err(BmiError::Unsupported);
+        }
+        self.mission_pending = true;
+        Ok(())
+    }
+    fn done_complete(&mut self) {
+        self.hif_live = true;
+    }
+
     async fn exchange(&mut self, request: &[u8], response: &mut [u8]) -> Result<usize, BmiError> {
         self.resources
             .bmi_exchange(&mut self.mmio, &mut self.poisoned, request, response)
@@ -353,6 +438,9 @@ impl Transport for PciBoot {
     }
 
     fn prepare_codeswap(&mut self, bytes: &[u8]) -> Result<(u32, [u8; 208]), BmiError> {
+        if !self.mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
         if self.poisoned || self.resources.codeswap.is_some() {
             return Err(BmiError::BadResponse);
         }
@@ -412,6 +500,9 @@ impl<B: Memory> Resources<B> {
         bytes: &mut [u8],
         write: bool,
     ) -> Result<(), BmiError> {
+        if !mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
         if *poisoned
             || bytes.is_empty()
             || bytes.len() > 2048
@@ -462,6 +553,9 @@ impl<B: Memory> Resources<B> {
         request: &[u8],
         response: &mut [u8],
     ) -> Result<usize, BmiError> {
+        if !mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
         if *poisoned {
             return Err(BmiError::BadResponse);
         }
@@ -504,25 +598,32 @@ impl Drop for PciBoot {
     fn drop(&mut self) {
         let mut stopped = true;
         if self.armed {
-            for pipe in [0, 1, 7] {
+            for pipe in 0..self.registers.ce_count {
                 stopped &= ce::halt_pipe(&mut self.mmio, self.hardware, pipe).is_ok();
             }
         }
-        let disabled =
-            narf_bus::pci::clear_command(&self.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
-                .is_ok()
-                && narf_bus::pci::read_command(&self.cap, &self.device)
-                    .is_ok_and(|command| command & narf_bus::pci::cmd::BUS_MASTER == 0);
-        if stopped && disabled {
+        let disabled = narf_bus::pci::clear_command(
+            &self.mmio.cap,
+            &self.device,
+            narf_bus::pci::cmd::BUS_MASTER,
+        )
+        .is_ok()
+            && narf_bus::pci::read_command(&self.mmio.cap, &self.device)
+                .is_ok_and(|command| command & narf_bus::pci::cmd::BUS_MASTER == 0);
+        if stopped && disabled && !self.mission_pending {
             barrier();
             // SAFETY: no CE can access the allocations and PCI BME is clear.
             unsafe {
                 ManuallyDrop::drop(&mut self.resources);
+                ManuallyDrop::drop(&mut self.hif);
             }
         }
+        // After DONE may have reached firmware, CE halt plus BME readback
+        // cannot prove CPU-directed/autonomous writes have drained. Keep every
+        // published mapping retained until an owned reset/drain implementation.
         if let Some(link) = self.saved_aspm {
             let _ = narf_bus::pci_express::clear_and_set_link_control(
-                &self.cap,
+                &self.mmio.cap,
                 &self.device,
                 narf_bus::pci_express::LNKCTL_ASPMC,
                 link & narf_bus::pci_express::LNKCTL_ASPMC,

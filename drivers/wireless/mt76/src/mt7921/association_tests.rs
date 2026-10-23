@@ -273,3 +273,141 @@ kernel_test_in!(
     "drivers/wireless/mt7921/association",
     mt76_group_wtbl_and_key_request_match_linux_null_station
 );
+
+fn mt76_sme_ies_bind_security_and_reach_native_assoc_once() -> TestResult {
+    let canonical = RsnIe::wpa2_psk_ccmp().encode_body();
+    let mut requested = vec![48, canonical.len() as u8];
+    requested.extend_from_slice(&canonical);
+    let vendor = [221, 5, 0, 1, 2, 3, 4];
+    requested.extend_from_slice(&vendor);
+    let mut plan =
+        JoinPlan::prepare(&bss(true), OWN, b"narf", Security::Wpa2Psk { psk: [7; 32] }).unwrap();
+    if plan.append_sme_ies(&requested).is_err() {
+        return TestResult::Fail("canonical offload IE rejected");
+    }
+    plan.start_authentication().unwrap();
+    if plan.append_sme_ies(&[]).is_ok() {
+        return TestResult::Fail("association elements changed after auth publication");
+    }
+    let assoc = plan
+        .authentication_response(&reply(0xb0, &[0, 0, 2, 0, 0, 0]))
+        .unwrap()
+        .unwrap();
+    if !assoc.ends_with(&vendor) {
+        return TestResult::Fail("optional SME IE dropped");
+    }
+    let mut rsns = 0;
+    if ies(&assoc[28..], |id, _| {
+        rsns += usize::from(id == 48);
+        Ok(())
+    })
+    .is_err()
+        || rsns != 1
+    {
+        return TestResult::Fail("SME RSNE duplicated rather than negotiated");
+    }
+    if validate_sme_ies(&requested, false) != Err(Error::UnsupportedSecurity) {
+        return TestResult::Fail("RSNE accepted for open connection");
+    }
+    for bytes in [&[48, 20, 1][..], &[255, 0], &[221, 2, 0, 1], &[0, 1, 0]] {
+        if validate_sme_ies(bytes, true) != Err(Error::InvalidBss) {
+            return TestResult::Fail("malformed or generated SME IE accepted");
+        }
+    }
+    for bytes in [
+        &[244, 1, 0][..],
+        &[54, 3, 0, 0, 0],
+        &[45, 1, 0],
+        &[221, 4, 0, 0x50, 0xf2, 1],
+    ] {
+        if validate_sme_ies(bytes, true).is_ok() {
+            return TestResult::Fail("unsupported security/PHY request silently discarded");
+        }
+    }
+    let mut pmf = RsnIe::wpa2_psk_ccmp();
+    pmf.rsn_capabilities = rsn::RSN_CAP_MFP_REQUIRED;
+    let mut group = RsnIe::wpa2_psk_ccmp();
+    group.group_cipher = Suite::standard(rsn::CIPHER_TKIP);
+    let mut cached = RsnIe::wpa2_psk_ccmp();
+    cached.pmkids.push([7; 16]);
+    for rsn in [RsnIe::wpa3_sae_ccmp(), pmf, group, cached] {
+        let body = rsn.encode_body();
+        let mut bytes = vec![48, body.len() as u8];
+        bytes.extend_from_slice(&body);
+        if validate_sme_ies(&bytes, true) != Err(Error::UnsupportedSecurity) {
+            return TestResult::Fail("unsupported requested RSNA downgraded");
+        }
+    }
+    let mut duplicate = requested.clone();
+    duplicate.extend_from_slice(&requested);
+    if validate_sme_ies(&duplicate, true) != Err(Error::InvalidBss) {
+        return TestResult::Fail("duplicate RSNE accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/association",
+    mt76_sme_ies_bind_security_and_reach_native_assoc_once
+);
+
+fn mt76_all_legacy_basic_rates_encode_native_txd_and_band_records() -> TestResult {
+    // Independent literal Linux mt76_rates values: CCK0..3, OFDM hardware codes.
+    let hardware = [0u16, 1, 2, 3, 75, 79, 74, 78, 73, 77, 72, 76];
+    for (index, (&rate, &expected)) in RATES.iter().zip(hardware.iter()).enumerate() {
+        for channel in [6, 36] {
+            let mut ap = bss(false);
+            ap.channel = channel;
+            ap.information_elements = vec![
+                0,
+                4,
+                b'n',
+                b'a',
+                b'r',
+                b'f',
+                1,
+                1,
+                rate | 128,
+                3,
+                1,
+                channel,
+            ];
+            let result = JoinPlan::prepare(&ap, OWN, b"narf", Security::Open);
+            if channel == 36 && index < 4 {
+                if !matches!(result, Err(Error::UnsupportedRates)) {
+                    return TestResult::Fail("5 GHz accepted mandatory CCK");
+                }
+                continue;
+            }
+            let mut plan = match result {
+                Ok(plan) => plan,
+                Err(_) => return TestResult::Fail("supported basic rate rejected"),
+            };
+            let selected = plan.management_rate();
+            let auth = plan.start_authentication().unwrap();
+            let txd = super::super::packet_tx::management(auth, 0x1000, 1, 1, selected).unwrap();
+            if u32::from_le_bytes(txd[24..28].try_into().unwrap())
+                != 4 | (u32::from(expected) << 16)
+            {
+                return TestResult::Fail("basic rate did not reach native TXD6");
+            }
+            let record = plan.peer_record(0, false).unwrap();
+            let expected_basic = 1u16 << if channel == 36 { index - 4 } else { index };
+            if record[32..34] != expected_basic.to_le_bytes()
+                || record[34] != if channel == 36 { 8 } else { 3 }
+            {
+                return TestResult::Fail("band-local STA PHY/basic rates");
+            }
+            let record = bss_record(&ap, false).unwrap();
+            if record[29] != if channel == 36 { 1 } else { 6 }
+                || record[32] != if channel == 36 { 8 } else { 3 }
+            {
+                return TestResult::Fail("band-specific BSS PHY mode");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/association",
+    mt76_all_legacy_basic_rates_encode_native_txd_and_band_records
+);

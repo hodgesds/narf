@@ -170,11 +170,11 @@ pub const ATH11K_WOW_RETRY_WAIT_MS: u32 = 200;
 /// `ath11k_wow_enable` / `ath11k_wow_wakeup` wait up to 3 HZ, i.e. three
 /// seconds on the normal 1 kHz kernel tick.
 pub const ATH11K_WOW_COMPLETION_TIMEOUT_MS: u32 = 3_000;
-/// NARF's deliberate vdev ceiling, currently also its resource request.
-/// Local Linux's WCN6855-family resource profile has four slots. A vdev remains owned
+/// Linux QCA6390/WCN6855 resource request and retained host capacity.
+/// A vdev remains owned
 /// by one netdev from WMI_VDEV_CREATE until its delete completion; the radio
 /// never aliases station/AP state between these slots.
-pub const WCN6855_MAX_VDEVS: usize = 3;
+pub const WCN6855_MAX_VDEVS: usize = 4;
 
 // `struct hal_tx_rate_stats.info0` in Linux's `ath11k/hal_desc.h`. The WBM
 // release records a PHY rate for the first MSDU of a PPDU; firmware-native
@@ -937,7 +937,7 @@ pub struct ApTxState {
 
 /// Runtime-owned state for one firmware vdev.  Linux keeps the equivalent
 /// state below its `ath11k_vif` / mac80211 vif; NARF keeps a compact entry
-/// per WCN6855 vdev because all three slots share one core/DP runtime.
+/// per WCN6855 vdev because all four slots share one core/DP runtime.
 #[derive(Debug, Default)]
 pub struct VdevRuntime {
     /// Station data path, including its native-Wi-Fi VIF attachment.
@@ -2611,7 +2611,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             vdev_slots: AtomicU32::new(1),
             // The physical/root netdev begins as a station.  It may change
             // role only while down through `assign_vdev_iftype` below.
-            vdev_iftypes: IrqSafeSpinLock::new([2, 0, 0]),
+            vdev_iftypes: IrqSafeSpinLock::new(core::array::from_fn(
+                |i| if i == 0 { 2 } else { 0 },
+            )),
             vdev_bindings: IrqSafeSpinLock::new([VdevBinding::default(); WCN6855_MAX_VDEVS]),
             operating_channels: IrqSafeSpinLock::new([0; WCN6855_MAX_VDEVS]),
             mbssid_beacons: IrqSafeSpinLock::new(core::array::from_fn(|_| None)),
@@ -2666,7 +2668,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// Assign a role to a reserved slot if it still fits the WCN6855
     /// interface combination published through nl80211.  The role groups
     /// mirror WCN6855's `ath11k_mac_setup_iface_combinations`: at most two
-    /// stations (the target advertises dual-station support), three
+    /// stations (the target advertises dual-station support), four
     /// AP/client/GO vdevs collectively, and one P2P-device vdev.
     ///
     /// A vdev is assigned before registration and changed only while down,

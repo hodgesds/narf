@@ -6,13 +6,14 @@
 //! parts that ride PCIe and speak the **msgbuf** protocol over Broadcom's
 //! H2D / D2H common-ring layout.
 //!
-//! PCI ownership now clears inherited bus mastering, retains authority,
-//! discovers actual AI cores through the serialized BAR0 window, and
-//! parks interrupts using the discovered PCIe core revision. This does
-//! not reset the chip or publish a usable network interface. The other
-//! modules contain wire/cursor helpers; firmware activation, owned DMA
-//! rings, flow rings, station lifecycle, and recovery remain software
-//! work. See `specification/brcmfmac.md` for the ordered dependency list.
+//! PCI ownership, AI core discovery, explicit BCM43602 board-profile boot,
+//! retained BAR2/DMA common rings, correlated control IOCTL/event ownership,
+//! and bounded workers now have production implementations. Admission still
+//! requires an exact platform calibration policy; no default board is invented.
+//! Owned flow TX/RX rings now implement create/delete, posted receive buffers,
+//! correlated retirement and fair bounded polling. Station lifecycle and
+//! recovery remain software work.
+//! No network interface is published by the control-runtime stage.
 //!
 //! ## References (all ISC / BSD-3 / GPL-2.0; NARF is GPL-2.0-or-later)
 //!
@@ -39,6 +40,7 @@
 
 extern crate alloc;
 
+pub mod boot;
 pub mod bus;
 pub mod cfg80211;
 pub mod chip;
@@ -47,8 +49,10 @@ pub mod firmware;
 pub mod fweh;
 pub mod fwil;
 pub mod msgbuf;
+pub mod native_runtime;
 pub mod pcie;
 pub mod ringbuf;
+pub mod runtime;
 pub mod shared;
 
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};
@@ -61,3 +65,9 @@ pub mod tests;
 pub fn register() {
     register_pci_driver();
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod runtime_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod data_wire_tests;

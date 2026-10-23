@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
-use narf_capabilities::{Cap, Write};
+use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::chip::{self, Backplane, Chip};
@@ -138,7 +138,7 @@ const READ_GONE_U32: u32 = 0xFFFF_FFFF;
 /// A parked PCIe device, retaining exclusive config-space authority.
 /// No network interface is published by this ownership/discovery stage.
 pub struct BrcmfmacDevice {
-    backplane: PcieBackplane,
+    pub(super) backplane: Option<PcieBackplane>,
     pub chip: Chip,
     pub device_id: u16,
 }
@@ -147,10 +147,28 @@ pub struct BrcmfmacDevice {
 /// authority private prevents independent MMIO handles from racing a
 /// select/access pair. Future async firmware work must own this value or
 /// put it behind an async mutex, never await under CONTROLLER's IRQ lock.
-struct PcieBackplane {
-    bar0: MmioRegion,
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
+pub(super) struct PcieBackplane {
+    pub(super) bar0: MmioRegion,
+    pub(super) bar2: Option<MmioRegion>,
+    pub(super) device: BusDevice,
+    pub(super) cap: Cap<BusDeviceCap, Write>,
+    pub(super) pcie_core: Option<chip::Core>,
+}
+
+/// Keep the actual device operation within the capability invocation rather
+/// than returning a raw register handle after a separate validity check.
+pub(super) fn invoke_registers<T>(
+    cap: &Cap<BusDeviceCap, Write>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, CapError> {
+    struct Registers<F>(F);
+    impl<T, F: FnOnce() -> T> CapOp<BusDeviceCap, Write> for Registers<F> {
+        type Output = T;
+        fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+            Ok(self.0())
+        }
+    }
+    cap.invoke(Registers(operation))
 }
 
 impl PcieBackplane {
@@ -189,18 +207,25 @@ impl PcieBackplane {
 
 impl Backplane for PcieBackplane {
     fn read32(&mut self, address: u32) -> Result<u32, chip::Error> {
-        let offset = self.select(address)?;
-        // SAFETY: BAR0 has at least 4 KiB; select validates dword
-        // alignment and returns an offset <=4092. The owning &mut self
-        // serializes window selection with the device register access.
-        Ok(unsafe { self.bar0.read32(offset) })
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            let offset = self.select(address)?;
+            // SAFETY: BAR0 has at least 4 KiB; select validates dword alignment
+            // and offset <=4092. Exclusive window/access runs inside invoke.
+            Ok(unsafe { self.bar0.read32(offset) })
+        })
+        .map_err(|_| chip::Error::Access)?
     }
 
     fn write32(&mut self, address: u32, value: u32) -> Result<(), chip::Error> {
-        let offset = self.select(address)?;
-        // SAFETY: same checked window and exclusive ownership as read32.
-        unsafe { self.bar0.write32(offset, value) };
-        Ok(())
+        let cap = self.cap;
+        invoke_registers(&cap, || {
+            let offset = self.select(address)?;
+            // SAFETY: same checked window and exclusive invocation as read32.
+            unsafe { self.bar0.write32(offset, value) };
+            Ok(())
+        })
+        .map_err(|_| chip::Error::Access)?
     }
 }
 
@@ -223,6 +248,7 @@ pub enum ProbeError {
     /// drive it.
     DeviceGone,
     Bar0TooSmall,
+    Bar2MapFailed,
     PciAccess,
     Discovery(chip::Error),
 }
@@ -230,6 +256,7 @@ pub enum ProbeError {
 /// Single-instance live device. Multi-radio support comes with the
 /// data-path follow-up.
 static CONTROLLER: IrqSafeSpinLock<Option<BrcmfmacDevice>> = IrqSafeSpinLock::new(None);
+static OWNED: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
 
 /// PCI driver match registration. Mirrors the Linux `brcmf_pcie_devices`
 /// array (~L2724..L2754 in `pcie.c`).
@@ -249,17 +276,30 @@ pub fn register_pci_driver() {
 /// Probe entry — called by `narf-bus::driver_match` when a Broadcom
 /// vendor/device pair we registered for surfaces.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    let extra = {
+        let mut owner = OWNED.lock();
+        match *owner {
+            Some(address) if address == device.addr => return Ok(()),
+            Some(_) => true,
+            None => {
+                *owner = Some(device.addr);
+                false
+            }
+        }
+    };
+    if extra {
+        park_command(&device, &cap, false).map_err(|_| narf_bus::ProbeError::BadDevice)?;
         return Ok(());
     }
 
     // SAFETY: caller hands us exclusive BusDeviceCap authority for
     // this device's cfg + BARs.
-    let dev = match unsafe { bring_up(device, cap) } {
+    let mut dev = match unsafe { bring_up(device, cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
+    super::native_runtime::start(&mut dev);
     let did = dev.device_id;
     *CONTROLLER.lock() = Some(dev);
 
@@ -284,31 +324,48 @@ pub unsafe fn bring_up(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
 ) -> Result<BrcmfmacDevice, ProbeError> {
-    // Firmware inherited from a previous owner must not DMA into memory
-    // before this driver has established rings, mappings, and ownership.
-    narf_bus::pci::clear_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER)
-        .map_err(|_| ProbeError::PciAccess)?;
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE,
-    )
-    .map_err(|_| ProbeError::PciAccess)?;
-    let command = narf_bus::pci::read_command(&cap, &device).map_err(|_| ProbeError::PciAccess)?;
-    if command & narf_bus::pci::cmd::BUS_MASTER != 0 {
-        return Err(ProbeError::PciAccess);
-    }
-    // SAFETY: caller-asserted BAR exclusivity.
-    let bar0 = unsafe { map_bar_control(&device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    // Verify decode and DMA parked before BAR sizing changes the BAR registers.
+    park_command(&device, &cap, false)?;
+    // SAFETY: exclusive BAR/config ownership, decoding and BME verified off.
+    let bar0 = invoke_registers(&cap, || {
+        // SAFETY: the invocation retains exclusive authority with decode and DMA off.
+        unsafe { map_bar_control(&device, 0) }
+    })
+    .map_err(|_| ProbeError::PciAccess)?
+    .map_err(|_| ProbeError::Bar0MapFailed)?;
     if bar0.len < 4096 {
         return Err(ProbeError::Bar0TooSmall);
     }
-    let mut backplane = PcieBackplane { bar0, device, cap };
+    let bar2 = if super::native_runtime::selected_profile(&device).is_some() {
+        // BAR2 is both dongle RAM and firmware control metadata; Device mapping
+        // preserves the required index/descriptor publication ordering.
+        // SAFETY: caller owns this function's BARs/config exclusively and
+        // park_command verified bus mastering and memory decode disabled.
+        Some(
+            invoke_registers(&cap, || {
+                // SAFETY: exclusive live authority; decode and DMA remain parked.
+                unsafe { map_bar_control(&device, 2) }
+            })
+            .map_err(|_| ProbeError::PciAccess)?
+            .map_err(|_| ProbeError::Bar2MapFailed)?,
+        )
+    } else {
+        None
+    };
+    park_command(&device, &cap, true)?;
+    let mut backplane = PcieBackplane {
+        bar0,
+        bar2,
+        device,
+        cap,
+        pcie_core: None,
+    };
     let chip = Chip::discover(&mut backplane).map_err(ProbeError::Discovery)?;
+    backplane.pcie_core = chip.core(chip::CORE_PCIE2);
     chip.park_pcie(&mut backplane)
         .map_err(ProbeError::Discovery)?;
     Ok(BrcmfmacDevice {
-        backplane,
+        backplane: Some(backplane),
         chip,
         device_id: device.id.device,
     })
@@ -394,4 +451,146 @@ pub fn with_controller<R>(f: impl FnOnce(&BrcmfmacDevice) -> R) -> Option<R> {
 #[cfg(any(test, feature = "kernel-test"))]
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
+    *OWNED.lock() = None;
+}
+
+/// Shared production transition used before BAR sizing and before MMIO access.
+fn configure_command(
+    enable: bool,
+    mut update: impl FnMut(u16, u16) -> Result<u16, ()>,
+) -> Result<(), ProbeError> {
+    use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+    let parked = update(BUS_MASTER | MEM_SPACE, INTX_DISABLE).map_err(|_| ProbeError::PciAccess)?;
+    if parked & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != INTX_DISABLE {
+        return Err(ProbeError::PciAccess);
+    }
+    if enable {
+        let command = update(0, MEM_SPACE | INTX_DISABLE).map_err(|_| ProbeError::PciAccess)?;
+        if command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE {
+            return Err(ProbeError::PciAccess);
+        }
+    }
+    Ok(())
+}
+fn park_command(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    enable: bool,
+) -> Result<(), ProbeError> {
+    invoke_registers(cap, || {
+        configure_command(enable, |clear, set| {
+            if clear != 0 {
+                narf_bus::pci::clear_command(cap, device, clear).map_err(|_| ())?;
+            }
+            narf_bus::pci::set_command(cap, device, set).map_err(|_| ())?;
+            narf_bus::pci::read_command(cap, device).map_err(|_| ())
+        })
+    })
+    .map_err(|_| ProbeError::PciAccess)?
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod command_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_brcmf_revoked_authority_blocks_native_register_operations() -> TestResult {
+        use super::super::{boot::Bus as _, runtime::Bus as _};
+        let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+        let mut calls = 0;
+        if invoke_registers(&cap, || calls += 1).is_err() || calls != 1 {
+            return TestResult::Fail("live register invocation did not execute");
+        }
+        cap.revoke();
+        if invoke_registers(&cap, || calls += 1) != Err(CapError::Revoked) || calls != 1 {
+            return TestResult::Fail("revoked capability entered the register operation");
+        }
+        let address = narf_bus::PcieAddr::new(0, 0, 0, 0);
+        let device = BusDevice {
+            addr: narf_bus::BusAddr::Pcie(address),
+            id: narf_bus::DeviceId {
+                vendor: BROADCOM_VENDOR,
+                device: BRCM_PCIE_43602_DEVICE_ID,
+                class: 0x028000,
+                subsystem_vendor: 0,
+                subsystem_id: 0,
+            },
+            kind: narf_bus::BusKind::Pcie {
+                addr: address,
+                cfg_phys: narf_memory::PhysAddr::new(0),
+            },
+        };
+        // Invalid mappings deliberately make an accidental post-revocation
+        // hardware access a fault. No operation below may dereference them.
+        let region = MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 4096,
+            kind: narf_bus::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        let mut bus = PcieBackplane {
+            bar0: region,
+            bar2: Some(region),
+            device,
+            cap,
+            pcie_core: None,
+        };
+        let mut out = [0xa5; 7];
+        if bus.read32(chip::ENUM_BASE) != Err(chip::Error::Access)
+            || bus.write32(chip::ENUM_BASE, 1) != Err(chip::Error::Access)
+            || bus.read_tcm(1, &mut out) != Err(super::super::boot::Error::Access)
+            || out != [0xa5; 7]
+            || bus.write_tcm(1, &[1; 7]) != Err(super::super::boot::Error::Access)
+            || bus.dma_enabled() != Err(super::super::boot::Error::Access)
+            || bus.enable_dma() != Err(super::super::runtime::Error::Access)
+            || bus.park_dma() != Err(super::super::runtime::Error::Access)
+            || park_command(&device, &cap, false) != Err(ProbeError::PciAccess)
+        {
+            return TestResult::Fail("revoked authority admitted native BAR/config access");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/brcmfmac",
+        smoke_brcmf_revoked_authority_blocks_native_register_operations
+    );
+
+    fn smoke_brcmf_native_parking_before_bar_sizing() -> TestResult {
+        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        let mut value = BUS_MASTER | MEM_SPACE;
+        let mut transcript = alloc::vec::Vec::new();
+        if configure_command(true, |clear, set| {
+            value = (value & !clear) | set;
+            transcript.push((clear, set, value));
+            Ok(value)
+        })
+        .is_err()
+            || transcript
+                != alloc::vec![
+                    (BUS_MASTER | MEM_SPACE, INTX_DISABLE, INTX_DISABLE),
+                    (0, MEM_SPACE | INTX_DISABLE, MEM_SPACE | INTX_DISABLE)
+                ]
+        {
+            return TestResult::Fail("BAR sizing did not follow verified BME/decode-off phase");
+        }
+        for stale in [BUS_MASTER | INTX_DISABLE, MEM_SPACE | INTX_DISABLE, 0] {
+            let mut calls = 0;
+            if configure_command(true, |_, _| {
+                calls += 1;
+                Ok(stale)
+            })
+            .is_ok()
+                || calls != 1
+            {
+                return TestResult::Fail("invalid parking readback reached decode enable");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/brcmfmac",
+        smoke_brcmf_native_parking_before_bar_sizing
+    );
 }

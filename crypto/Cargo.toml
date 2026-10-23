@@ -28,7 +28,7 @@ ed25519-dalek      = { version = "2",    default-features = false, features = ["
 # `--cfg poly1305_force_soft` rustflag in `.cargo/config.toml`. With
 # that, the dep compiles clean on both arches.
 chacha20poly1305   = { version = "0.10", default-features = false, features = ["alloc"] }
-aes                = { version = "0.8",  default-features = false }
+aes                = { version = "0.8",  default-features = false, features = ["zeroize"] }
 # aes-gcm: AES-128/256-GCM AEAD for e2e smoke tests and Stage-4 AEAD surface.
 # `aes_force_soft` rustflag (see .cargo/config.toml) pins the software AES path
 # so AES-NI isn't probed under code-model=kernel.
@@ -39,7 +39,8 @@ sha2               = { version = "0.10", default-features = false }
 blake3             = { version = "1",    default-features = false, features = ["pure"] }
 rand_core          = { version = "0.6",  default-features = false }
 rand_chacha        = { version = "0.3",  default-features = false }
-zeroize            = { version = "1",    default-features = false }
+zeroize            = { version = "1",    default-features = false, features = ["alloc"] }
+subtle             = { version = "2",    default-features = false }
 
 [features]
 # ECDSA/P-256 signing (RFC 6979 deterministic nonces). Off by default; the

@@ -5,8 +5,9 @@
 //! `rtl8xxxu/core.c::{rtl8xxxu_load_firmware,rtl8xxxu_writeN,
 //! rtl8xxxu_download_firmware,rtl8xxxu_start_firmware}`.
 //!
-//! Firmware-ready is a diagnostic stage. It does not enable the RF, install
-//! PHY/calibration tables, publish a station interface, or authorize TX.
+//! Production initialization continues through checked RTL8188EU tables,
+//! post-table MAC state and full LC/IQK. MAC TX/RX remain closed; neither
+//! firmware-ready nor radio-ready publishes a station or authorizes packets.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -33,6 +34,9 @@ pub enum Error {
     BadEfuse,
     EfuseTimeout,
     LltTimeout,
+    RadioRead,
+    Calibration,
+    CamTimeout,
     AlreadyStarted,
     InvalidImage,
     Firmware(FirmwareError),
@@ -55,6 +59,8 @@ pub enum Stage {
     FactoryReady,
     TablesReady,
     InitializingTables,
+    Calibrating,
+    RadioReady,
     Failed,
 }
 
@@ -62,6 +68,14 @@ pub enum Stage {
 pub struct Status {
     pub stage: Stage,
     pub error: Option<Error>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CalibrationInfo {
+    pub tx_x: u16,
+    pub tx_y: u16,
+    pub rx_x: u16,
+    pub rx_y: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +166,7 @@ pub struct Owner<I: ControlIo> {
     started: AtomicBool,
     status: IrqSafeSpinLock<Status>,
     factory: IrqSafeSpinLock<Option<super::device_init::Factory>>,
+    calibration: IrqSafeSpinLock<Option<CalibrationInfo>>,
 }
 
 impl<I: ControlIo> core::fmt::Debug for Owner<I> {
@@ -170,7 +185,7 @@ impl<I: ControlIo> Drop for Attempt<'_, I> {
         let mut state = self.0.status.lock();
         if !matches!(
             state.stage,
-            Stage::FirmwareReady | Stage::TablesReady | Stage::Failed
+            Stage::FirmwareReady | Stage::TablesReady | Stage::RadioReady | Stage::Failed
         ) {
             state.stage = Stage::Failed;
             state.error = Some(Error::Cancelled);
@@ -185,6 +200,7 @@ impl<I: ControlIo> Owner<I> {
             chip,
             started: AtomicBool::new(false),
             factory: IrqSafeSpinLock::new(None),
+            calibration: IrqSafeSpinLock::new(None),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
                 error: None,
@@ -210,7 +226,7 @@ impl<I: ControlIo> Owner<I> {
     fn finish(&self, result: Result<FirmwareInfo, Error>) -> Result<FirmwareInfo, Error> {
         match result {
             Ok(_) => {
-                if self.status().stage != Stage::TablesReady {
+                if !matches!(self.status().stage, Stage::TablesReady | Stage::RadioReady) {
                     self.stage(Stage::FirmwareReady);
                 }
             }
@@ -272,8 +288,8 @@ impl<I: ControlIo> Owner<I> {
     }
 
     /// Initialize the source-matched RTL8188EU factory/FIFO and register
-    /// tables. This is not calibration or packet readiness; MAC TX/RX gates
-    /// remain closed. Production initialize_registered follows this path.
+    /// tables and checked LC/IQ calibration. This is not packet readiness;
+    /// MAC TX/RX gates remain closed. Production initialize_registered follows this path.
     pub async fn initialize_device(&self, blob: &[u8]) -> Result<FirmwareInfo, Error> {
         let _attempt = self.begin()?;
         let result = self
@@ -284,6 +300,10 @@ impl<I: ControlIo> Owner<I> {
 
     pub fn factory(&self) -> Option<super::device_init::Factory> {
         *self.factory.lock()
+    }
+
+    pub fn calibration(&self) -> Option<CalibrationInfo> {
+        *self.calibration.lock()
     }
 
     async fn run_device_before(
@@ -314,6 +334,15 @@ impl<I: ControlIo> Owner<I> {
             self.stage(Stage::InitializingTables);
             super::device_init::mac_bb_rf(self, factory).await?;
             self.stage(Stage::TablesReady);
+            self.stage(Stage::Calibrating);
+            let iq = super::radio_init::configure(self, factory).await?;
+            *self.calibration.lock() = Some(CalibrationInfo {
+                tx_x: iq.tx_x,
+                tx_y: iq.tx_y,
+                rx_x: iq.rx_x,
+                rx_y: iq.rx_y,
+            });
+            self.stage(Stage::RadioReady);
             Ok(info)
         })
         .await

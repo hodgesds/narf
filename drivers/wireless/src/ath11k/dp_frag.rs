@@ -41,6 +41,7 @@ use super::dp_ring::{
 use super::hal::{field_get, field_prep, genmask, DmaMem, Hal};
 use super::hw::rbm;
 use super::power::ChipIo;
+use super::rx_descriptor::RxDescriptor;
 use narf_crypto::michael_mic::michael_mic;
 
 /// `ATH11K_DP_RX_FRAGMENT_TIMEOUT_MS` — `2 * HZ` jiffies, i.e. 2 s.
@@ -95,7 +96,7 @@ pub fn crypto_icv_len(enctype: u32) -> usize {
 }
 
 /// `ath11k_dp_rx_h_mpdu_start_enctype`.
-pub fn mpdu_start_enctype(d: &HalRxDescWcn6855) -> u32 {
+pub fn mpdu_start_enctype(d: &RxDescriptor) -> u32 {
     if !d.encrypt_valid() {
         return enc::OPEN;
     }
@@ -103,14 +104,14 @@ pub fn mpdu_start_enctype(d: &HalRxDescWcn6855) -> u32 {
 }
 
 /// `ath11k_dp_rx_h_attn_is_decrypted`.
-pub fn attn_is_decrypted(d: &HalRxDescWcn6855) -> bool {
-    field_get(RX_ATTENTION_INFO2_DCRYPT_STATUS_CODE, d.attention.info2)
+pub fn attn_is_decrypted(d: &RxDescriptor) -> bool {
+    field_get(RX_ATTENTION_INFO2_DCRYPT_STATUS_CODE, d.attention().info2)
         == RX_DESC_DECRYPT_STATUS_CODE_OK
 }
 
 /// `ath11k_dp_rx_h_attn_is_mcbc`.
-pub fn attn_is_mcbc(d: &HalRxDescWcn6855) -> bool {
-    d.first_msdu() && d.attention.info1 & RX_ATTENTION_INFO1_MCAST_BCAST != 0
+pub fn attn_is_mcbc(d: &RxDescriptor) -> bool {
+    d.first_msdu() && d.attention().info1 & RX_ATTENTION_INFO1_MCAST_BCAST != 0
 }
 
 fn fc_at(b: &[u8], off: usize) -> u16 {
@@ -207,7 +208,7 @@ impl Dp {
             return true;
         }
         let desc_sz = self.cfg.hal_desc_sz;
-        let Some(rxd) = HalRxDescWcn6855::from_bytes(&data) else {
+        let Some(rxd) = RxDescriptor::decode(self.cfg.hw.hw_rev, &data) else {
             return true;
         };
         let msdu_len = rxd.msdu_len() as usize;
@@ -248,7 +249,7 @@ impl Dp {
         if msdu.len() < desc_sz + 24 {
             return Err(EINVAL);
         }
-        let rxd = HalRxDescWcn6855::from_bytes(&msdu).ok_or(EINVAL)?;
+        let rxd = RxDescriptor::decode(self.cfg.hw.hw_rev, &msdu).ok_or(EINVAL)?;
         let peer_id = rxd.mpdu_peer_id();
         let tid = rxd.mpdu_tid() as usize;
         let seqno = rxd.mpdu_start_seq_no();
@@ -258,7 +259,7 @@ impl Dp {
         if attn_is_mcbc(&rxd) {
             return Err(EINVAL);
         }
-        let info1 = rxd.mpdu_start.info1;
+        let info1 = rxd.mpdu_info1();
         if info1 & RX_MPDU_START_INFO1_MPDU_SEQ_CTRL_VALID == 0
             || info1 & RX_MPDU_START_INFO1_MPDU_FCTRL_VALID == 0
             || tid > IEEE80211_NUM_TIDS
@@ -415,7 +416,7 @@ impl Dp {
         let Some(first) = frags.first() else {
             return false;
         };
-        let Some(d) = HalRxDescWcn6855::from_bytes(first) else {
+        let Some(d) = RxDescriptor::decode(self.cfg.hw.hw_rev, first) else {
             return false;
         };
         let et = mpdu_start_enctype(&d);
@@ -470,7 +471,7 @@ impl Dp {
         let mut first_enc = enc::OPEN;
         for (i, skb) in frags.iter_mut().enumerate() {
             let mut flags = 0;
-            let d = HalRxDescWcn6855::from_bytes(skb)?;
+            let d = RxDescriptor::decode(self.cfg.hw.hw_rev, skb)?;
             let enctype = mpdu_start_enctype(&d);
             if i == 0 {
                 first_enc = enctype;
@@ -552,8 +553,8 @@ impl Dp {
             | RX_MSDU_DESC_INFO0_VALID_SA
             | RX_MSDU_DESC_INFO0_VALID_DA;
         bank.wr(link_pa, 10, msdu_info).ok_or(EINVAL)?;
-        // ath11k_dp_rxdesc_set_msdu_len (msdu_start.info1 at byte 104).
-        let off = core::mem::offset_of!(HalRxDescWcn6855, msdu_start) + 4;
+        // ath11k_dp_rxdesc_set_msdu_len: select the native msdu_start.info1.
+        let off = RxDescriptor::msdu_len_offset(self.cfg.hw.hw_rev).ok_or(EINVAL)?;
         let mut i1 = u32::from_le_bytes([skb[off], skb[off + 1], skb[off + 2], skb[off + 3]]);
         i1 = (i1 & !RX_MSDU_START_INFO1_MSDU_LENGTH)
             | field_prep(RX_MSDU_START_INFO1_MSDU_LENGTH, len);

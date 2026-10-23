@@ -20,6 +20,7 @@ pub(in crate::cyw43439) struct Bus {
     secured: bool,
     wpa_ie: Option<Vec<u8>>,
     roam_off: bool,
+    disconnect_error: bool,
 }
 impl Bus {
     pub(in crate::cyw43439) fn new() -> Self {
@@ -33,6 +34,7 @@ impl Bus {
             secured: false,
             wpa_ie: None,
             roam_off: false,
+            disconnect_error: false,
         }
     }
     pub(in crate::cyw43439) fn queue(&mut self, channel: u8, maximum: u8, payload: &[u8]) {
@@ -151,11 +153,21 @@ impl PacketTransport for Bus {
                     }
                 }
             }
+            52 if self.disconnect_error => {
+                // Firmware rejected the disconnect and old link events can
+                // still arrive. None may authorize a subsequent attempt.
+                self.event(16, 0, 1, &[], maximum);
+                self.event(0, 0, 0, &[], maximum);
+            }
             52 => self.event(16, 0, 0, &[], maximum),
             _ => {}
         }
         let mut header = request;
         header.len = response.len() as u32;
+        if request.cmd == 52 && self.disconnect_error {
+            header.flags |= bcdc_flag::ERROR;
+            header.status = 1;
+        }
         let mut control = header.encode().to_vec();
         control.extend_from_slice(&response);
         self.queue(0, maximum, &control);
@@ -434,4 +446,32 @@ fn smoke_cyw_scan_wire_bounds_and_offsets() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/cyw43439/station",
     smoke_cyw_scan_wire_bounds_and_offsets
+);
+
+fn smoke_cyw_station_rejected_disconnect_cannot_reuse_link() -> TestResult {
+    let mut bus = Bus::new();
+    bus.disconnect_error = true;
+    let Some(Ok(mut station)) = ready(Station::initialize(Runtime::new(bus), &[1], domain()))
+    else {
+        return TestResult::Fail("disconnect-error fixture initialization");
+    };
+    if !matches!(ready(station.scan(scan_request())), Some(Ok(_)))
+        || ready(station.associate(join_request(false))) != Some(Ok(()))
+        || station.bssid != Some(AP)
+        || ready(station.disconnect()) != Some(Err(Error::Firmware(1)))
+        || station.bssid.is_some()
+        || !station.runtime.is_failed()
+        || ready(station.associate(join_request(false))) != Some(Err(Error::Failed))
+        || station.poll() != Err(Error::Failed)
+        || station.bssid.is_some()
+    {
+        return TestResult::Fail(
+            "rejected disconnect reused unconfirmed firmware link/late authorization",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/station",
+    smoke_cyw_station_rejected_disconnect_cannot_reuse_link
 );

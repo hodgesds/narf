@@ -3,7 +3,8 @@
 //! Probe disables inherited bus mastering, validates the per-chip BAR
 //! windows and wakes the target. The boot task owns reset/CE7 target
 //! configuration, CE0/CE1 BMI and calibrated firmware/BDF/OTP preparation.
-//! Runtime HIF/HTC/WMI activation and interface registration remain open.
+//! Retained runtime CEs and HTC are activated only after calibrated image
+//! preparation. WMI/HTT initialization and interface registration remain open.
 
 #![allow(dead_code)]
 
@@ -39,6 +40,13 @@ pub struct Ath10kDevice {
     pub firmware_prepared: Option<FirmwarePrepared>,
     /// Firmware/profile/BDF/OTP failure after a successful BMI identity.
     pub firmware_error: Option<super::firmware::Error>,
+    /// Real HTC endpoint negotiation, never station/interface admission.
+    pub htc_ready: Option<HtcReady>,
+    /// Runtime transport or HTC failure after ROM preparation.
+    pub runtime_error: Option<super::control::Error>,
+    /// Correlated service-ready/INIT/READY completed, with retained host DMA.
+    pub wmi_ready: Option<super::wmi_boot::Ready>,
+    pub wmi_error: Option<super::wmi_boot::Error>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +55,13 @@ pub struct FirmwarePrepared {
     pub api: u8,
     pub wmi_operations: u32,
     pub htt_operations: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HtcReady {
+    pub wmi_endpoint: u8,
+    pub htt_endpoint: u8,
+    pub credit_size: u16,
 }
 
 impl core::fmt::Debug for Ath10kDevice {
@@ -98,7 +113,70 @@ struct BootSession {
     image: super::firmware::Image,
     profile: super::profile::Profile,
 }
-static SESSION: narf_lib::mutex::Mutex<Option<BootSession>> = narf_lib::mutex::Mutex::new(None);
+struct RuntimeSession {
+    htc: super::control::Session<super::boot::PciBoot>,
+    image: super::firmware::Image,
+    profile: super::profile::Profile,
+}
+struct WmiSession {
+    wmi: super::wmi_boot::Runtime<super::boot::PciBoot>,
+    image: super::firmware::Image,
+    profile: super::profile::Profile,
+}
+enum DriverSession {
+    Boot(BootSession),
+    Runtime(RuntimeSession),
+    Wmi(WmiSession),
+}
+static SESSION: narf_lib::mutex::Mutex<Option<DriverSession>> = narf_lib::mutex::Mutex::new(None);
+
+async fn activate_runtime(
+    mut boot: BootSession,
+    hardware: HwRev,
+) -> (DriverSession, Result<HtcReady, super::control::Error>) {
+    let handoff = async {
+        boot.bmi.transport.prepare_hif()?;
+        boot.bmi.done().await
+    }
+    .await;
+    if let Err(error) = handoff {
+        return (DriverSession::Boot(boot), Err(error.into()));
+    }
+    let mut runtime = RuntimeSession {
+        htc: super::control::Session::new(boot.bmi.transport, hardware),
+        image: boot.image,
+        profile: boot.profile,
+    };
+    let ready = runtime.htc.start().await.map(|()| HtcReady {
+        wmi_endpoint: runtime.htc.wmi,
+        htt_endpoint: runtime.htc.htt,
+        credit_size: runtime.htc.credit_size,
+    });
+    (DriverSession::Runtime(runtime), ready)
+}
+
+async fn initialize_wmi(
+    owner: DriverSession,
+    hardware: HwRev,
+) -> (
+    DriverSession,
+    Result<super::wmi_boot::Ready, super::wmi_boot::Error>,
+) {
+    let DriverSession::Runtime(runtime) = owner else {
+        return (owner, Err(super::wmi_boot::Error::Failed));
+    };
+    let dialect = match super::wmi_boot::Dialect::from_version(runtime.image.wmi) {
+        Ok(dialect) => dialect,
+        Err(error) => return (DriverSession::Runtime(runtime), Err(error)),
+    };
+    let mut owner = WmiSession {
+        wmi: super::wmi_boot::Runtime::new(runtime.htc, dialect, hardware, runtime.image.features),
+        image: runtime.image,
+        profile: runtime.profile,
+    };
+    let result = owner.wmi.start().await;
+    (DriverSession::Wmi(owner), result)
+}
 
 /// PCI driver match registration. One entry per supported device id,
 /// each with a unique `name` so the bus registry doesn't collapse them.
@@ -230,7 +308,7 @@ pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice
     let required = (registers.pcie_local + 12)
         .max(registers.chip_id + 4)
         .max(registers.soc_core + 24)
-        .max(registers.ce_base(7).unwrap() + 0x54);
+        .max(registers.ce_base(registers.ce_count - 1).unwrap() + 0x54);
     if mmio_bar0.len < required {
         return Err(ProbeError::BadBar);
     }
@@ -291,6 +369,10 @@ pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice
         boot_error: None,
         firmware_prepared: None,
         firmware_error: None,
+        htc_ready: None,
+        runtime_error: None,
+        wmi_ready: None,
+        wmi_error: None,
     })
 }
 
@@ -346,22 +428,73 @@ async fn boot_task(
                     wmi_operations: image.wmi,
                     htt_operations: image.htt,
                 };
-                *SESSION.lock().await = Some(BootSession {
+                let boot = BootSession {
                     bmi,
                     image,
                     profile,
-                });
-                Ok::<_, super::firmware::Error>(status)
+                };
+                Ok::<_, super::firmware::Error>((boot, status))
             }
             .await;
             match prepared {
-                Ok(status) => {
+                Ok((boot, status)) => {
                     if let Some(controller) = CONTROLLER.lock().as_mut() {
                         controller.firmware_prepared = Some(status);
                     }
-                    let _ = writeln!(narf_console::Writer,
-                        "  ath10k: {} api {} WMI {} HTT {} calibrated image downloaded; HIF activation pending",
-                        status.directory, status.api, status.wmi_operations, status.htt_operations);
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  ath10k: {} api {} WMI {} HTT {} calibrated image downloaded",
+                        status.directory,
+                        status.api,
+                        status.wmi_operations,
+                        status.htt_operations
+                    );
+                    let (owner, ready) = activate_runtime(boot, hw).await;
+                    match ready {
+                        Ok(ready) => {
+                            if let Some(controller) = CONTROLLER.lock().as_mut() {
+                                controller.htc_ready = Some(ready);
+                            }
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  ath10k: HTC WMI endpoint {} HTT endpoint {} ready",
+                                ready.wmi_endpoint,
+                                ready.htt_endpoint
+                            );
+                            let (owner, result) = initialize_wmi(owner, hw).await;
+                            *SESSION.lock().await = Some(owner);
+                            match result {
+                                Ok(ready) => {
+                                    if let Some(controller) = CONTROLLER.lock().as_mut() {
+                                        controller.wmi_ready = Some(ready);
+                                    }
+                                    let _ = writeln!(narf_console::Writer,
+                                        "  ath10k: WMI READY; HTT datapath and station registration pending");
+                                }
+                                Err(error) => {
+                                    if let Some(controller) = CONTROLLER.lock().as_mut() {
+                                        controller.wmi_error = Some(error);
+                                    }
+                                    let _ = writeln!(
+                                        narf_console::Writer,
+                                        "  ath10k: retained WMI initialization failed: {:?}",
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            *SESSION.lock().await = Some(owner);
+                            if let Some(controller) = CONTROLLER.lock().as_mut() {
+                                controller.runtime_error = Some(error);
+                            }
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  ath10k: retained runtime activation failed: {:?}",
+                                error
+                            );
+                        }
+                    }
                 }
                 Err(error) => {
                     if let Some(controller) = CONTROLLER.lock().as_mut() {

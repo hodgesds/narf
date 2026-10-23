@@ -267,7 +267,12 @@ impl Hardware {
     }
 
     // Private until association supplies a verified transmit-capable channel.
-    fn submit_management(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
+    fn submit_management(
+        &mut self,
+        frame: &[u8],
+        wcid: u16,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
         self.check()?;
         if !self.owner.published {
             return Err(Error::Busy);
@@ -283,7 +288,7 @@ impl Hardware {
         let payload = address
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
-        let header = packet_tx::management(frame, payload, token, wcid)?;
+        let header = packet_tx::management(frame, payload, token, wcid, rate)?;
         // SAFETY: fully validated lengths; this slot has neither DMA nor
         // firmware ownership until the publication below.
         unsafe {
@@ -683,8 +688,13 @@ impl Backend for Hardware {
         self.owner.published = false;
         Ok(())
     }
-    fn submit_management(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
-        self.submit_management(frame, wcid)
+    fn submit_management(
+        &mut self,
+        frame: &[u8],
+        wcid: u16,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        self.submit_management(frame, wcid, rate)
     }
     fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
         self.submit_data(frame, protected)
@@ -788,12 +798,23 @@ impl Transport {
         ssid: &[u8],
         security: crate::mt7921::association::Security,
     ) -> Result<u16, Error> {
+        self.associate_station_with_ies(bss, ssid, security, &[])
+            .await
+    }
+    /// Associate while retaining checked optional SME association elements.
+    pub async fn associate_station_with_ies(
+        &mut self,
+        bss: &super::ScanBss,
+        ssid: &[u8],
+        security: crate::mt7921::association::Security,
+        extra_ies: &[u8],
+    ) -> Result<u16, Error> {
         let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Authority)?;
         let permission =
             crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
                 .ok_or(Error::Authority)?;
         self.session
-            .associate_station(bss, ssid, security, permission)
+            .associate_station(bss, ssid, security, permission, extra_ies)
             .await
     }
     /// Send deauthentication and tear down peer station record.

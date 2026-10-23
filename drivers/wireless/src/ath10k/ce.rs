@@ -54,6 +54,11 @@ use super::hw::*;
 /// 32-bit MMIO surface against the ath10k BAR0. Real impl wraps
 /// `narf_bus::MmioRegion`; tests use the in-memory mock.
 pub trait Ath10kMmio {
+    /// Current authority before descriptor/bounce publication. Pure models
+    /// have no revocation source; the physical owner checks its real cap.
+    fn authorized(&self) -> bool {
+        true
+    }
     /// Read a 32-bit register at the given BAR0-relative offset.
     fn read32(&mut self, offset: u64) -> u32;
     /// Write a 32-bit register at the given BAR0-relative offset.

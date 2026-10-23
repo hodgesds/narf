@@ -21,6 +21,13 @@
 //!   6. Receives a "ready" WMI event, then starts behaving as a
 //!      normal Wi-Fi NIC over HTT.
 //!
+//! ## Production status
+//!
+//! Calibrated BMI image preparation now reaches retained runtime CE DMA,
+//! HTC credit/endpoint negotiation and native WMI service-ready/INIT/READY.
+//! HTT packet runtime, station control and interface registration remain open.
+//! Older standalone codecs below are not the production activation path.
+//!
 //! ## Stage 0 (prior commit)
 //!
 //! - PCI match table (vendor 0x168c + Ubiquiti rebadge).
@@ -69,6 +76,7 @@ pub mod bmi;
 mod boot;
 pub mod ce;
 mod clock;
+pub mod control;
 pub mod dma;
 pub mod firmware;
 pub mod htc;
@@ -78,6 +86,7 @@ pub mod pci;
 pub mod profile;
 mod swap;
 pub mod wmi;
+pub mod wmi_boot;
 
 pub use hw::{HwRev, ALL_PCI_MATCHES, ATHEROS_VENDOR, UBNT_VENDOR};
 pub use pci::{name_for, probe, register_pci_driver, Ath10kDevice, ProbeError};

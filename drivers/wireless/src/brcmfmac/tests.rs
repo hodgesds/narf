@@ -527,6 +527,9 @@ fn smoke_brcmfmac_bcdc_tx_post_encode() -> TestResult {
             flags: 0,
             request_id: 1,
         },
+        tx_header: [0; 14],
+        flags: 1,
+        segments: 1,
         metadata_buf_addr: BufAddr(0),
         data_buf_addr: BufAddr(0xDEAD_0000_1234_5678),
         metadata_len: 0,
@@ -543,8 +546,8 @@ fn smoke_brcmfmac_bcdc_tx_post_encode() -> TestResult {
     if buf[0] != MsgType::TxPost as u8 {
         return TestResult::Fail("TxPost msgtype byte wrong");
     }
-    // data_len at bytes 26-27 LE.
-    if buf[26..28] != 100u16.to_le_bytes() {
+    // data_len at bytes 42-43 LE.
+    if buf[42..44] != 100u16.to_le_bytes() {
         return TestResult::Fail("TxPost data_len mis-encoded");
     }
     // Round-trip.
@@ -575,7 +578,9 @@ fn smoke_brcmfmac_rx_complete_decode() -> TestResult {
         },
         status: 0,
         flow_ring_id: 0,
-        rx_status_0: 0x00C8, // RSSI=0, status bits=0
+        metadata_len: 0,
+        flags: 1,
+        rx_status_0: 0x00C8,
         rx_status_1: 0,
         data_offset: 28,
         data_len: 1500,
@@ -615,6 +620,7 @@ fn smoke_brcmfmac_tx_status_roundtrip() -> TestResult {
         },
         status: 0,
         flow_ring_id: 3,
+        metadata_len: 0,
         tx_status: 0,
     };
     let mut buf = [0u8; TX_STATUS_SIZE];

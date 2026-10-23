@@ -15,15 +15,15 @@
 > "Unverified until hardware".
 >
 > Qualcomm ath11k Wi-Fi 6 / 6E driver for PCIe host-attached
-> silicon. WCN6855-layout parts have the live runtime; recognized QCA6390
-> and QCN9074 parts are rejected before DMA because their software is
-> incomplete. Adapted from Linux
+> silicon. QCA6390 and WCN6855-layout parts have native receive/runtime
+> profiles; recognized QCN9074 remains rejected before DMA because its
+> software is incomplete. Adapted from Linux
 > `drivers/net/wireless/ath/ath11k/` (BSD-3-Clause-Clear) and
 > `drivers/bus/mhi/host/`, `net/qrtr/`, `drivers/soc/qcom/qmi_*`.
 
 ## 1. Purpose & scope
 
-**Owns:** station-mode bring-up plus up to three concurrent station, AP/GO or
+**Owns:** station-mode bring-up plus up to four concurrent station, AP/GO or
 P2P-role vdevs of PCIe ath11k parts, first target the WCN6855 HW2.1 in Lenovo's QCNFA765
 module (`17cb:1103`, subsystem `17aa:9309`). AP/GO includes hostapd-facing
 management-frame transport, client-peer programming and an Ethernet data
@@ -115,14 +115,14 @@ RSC/offload/client-managed rings, EDL.
 
 ## 3. Public interface
 
-The implemented end-to-end runtime is restricted to the WCN6855 layout
+The implemented runtime supports native QCA6390 HW2.0 and the WCN6855 layout
 (HW2.0/HW2.1 plus QCA2066 HW2.1 and QCA6698AQ HW2.1). PCI matching and
 MHI/QMI support for another revision do not imply a registered WLAN:
 
 | Hardware | Reachable software | Remaining software gate |
 |---|---|---|
 | WCN6855 / QCA2066 / QCA6698AQ | MHI/QMI, CE/HTC/WMI, DP and STA/AP/P2P interfaces | Target-card and AP interoperability validation remains; optional Linux features outside this profile are not implied |
-| QCA6390 HW2.0 | Recognized PCI ID; shared MHI/QMI/CE definitions; probe rejects before MMIO/MSI/firmware activation | `CoreConfig::for_hw` and `DpHwParams::for_rev` return `None`; port `hal_rx_desc_ipq8074` and its RX accessors/DP parameters before admitting the live runtime |
+| QCA6390 HW2.0 | Native IPQ8074 RX/error/fragment DP and production core/CE profile; resource and host vdev capacity four | Native DMA fixtures pass both architectures; composed production-profile CE startup, WPA2 station/data and four-slot tests await the new integrated gate; physical interoperability remains |
 | QCN9074 HW1.0 | Recognized PCI ID; configuration definitions; probe rejects before MMIO/MSI/firmware activation | Static BAR windows, QCN9074 HAL register map/operations, core configuration, per-pdev/REO/HTT-v2 and RX descriptor runtime are not ported |
 
 Probe first verifies inherited bus mastering and memory decode are off,
@@ -462,14 +462,12 @@ HE caps for the mac layer, HAL reg caps), `dma_ring_caps`, `ready` +
   `pdev_reo_setup` (after service ready, before INIT), async
   `htt_ver_req` (last step of `ath11k_core_start`), async `pdev_create`,
   `irq_enable`.
-- `CoreConfig::for_hw(&HwParams)` (WCN6855 family; QCA6390/QCN9074
+- `CoreConfig::for_hw(&HwParams)` (QCA6390 and WCN6855 family; QCN9074
   `None`): `single_pdev_only`, `num_rxdma_per_pdev = 2`, `max_radios =
-  3`, `num_vdevs = 3`, credit flow, shadow regs, Linux timeouts (HTC
+  3`, `num_vdevs = 4`, credit flow, shadow regs, Linux timeouts (HTC
   1 s, connect 1 s, service / unified ready 5 s, WMI send 3 s).
-  Three is NARF's deliberate host/resource-request ceiling; the local
-  Linux WCN6855-family hardware resource profile uses four vdevs. Aligning
-  the resource request and generalizing host slot capacity belongs to the
-  next profile/runtime increment.
+  Firmware requests and retained host slot arrays both use four, matching
+  local Linux's QCA6390/WCN6855 resource profile.
 - `Ath11kCore::new` (`ath11k_wmi_attach` + `ath11k_htc_init`),
   `qmi_firmware_ready(&mut hooks)` (the whole sequence below), and the
   pieces: `htc_wait_target`, `htt_connect`, `wmi_connect`, `htc_start`,
@@ -558,10 +556,19 @@ endpoints.
 ### 3.7 DP ring runtime (`dp_ring.rs`, Linux `dp.c`, `dp_tx.c`, `dp_rx.c`, `hal_tx.c`, `hal_rx.c`)
 
 Pure layer over [`hal::Hal`] (the device's one HAL, `Ce::hal`) and
-`ChipIo`; driven by `runtime.rs` (§3.11). WCN6855 family only
-(`DpHwParams::for_rev`: single pdev, `num_rxdma_per_pdev = 2`,
+`ChipIo`; driven by `runtime.rs` (§3.11). `DpHwParams::for_rev` supports
+QCA6390 and the WCN6855 family: single pdev, `num_rxdma_per_pdev = 2`,
 `rx_mac_buf_ring`, no rxdma1 / monitor, one TCL ring with rbm SW0,
-`rx_buf_rbm` SW1, `hal_desc_sz` 392). `DpRingSizes::LINUX` is what
+`rx_buf_rbm` SW1. `hal_desc_sz` is 384 for QCA6390 (`ipq8074.rs`) and
+392 for WCN6855 (`dp.rs`). `rx_descriptor::RxDescriptor` selects the
+native packed layout by `HwRev`; normal RX, attention/error processing,
+continuation coalescing and fragment reinjection all use that view.
+`dp_ring::attn_mpdu_err` and `dp_frag::{mpdu_start_enctype,
+attn_is_decrypted, attn_is_mcbc}` accept this view. Descriptor length
+rewrite uses byte 96 on QCA6390 and byte 104 on WCN6855.
+The four native receive/error/coalescing/fragment DMA fixtures pass on both
+architectures; composed core/startup/station tests exercise the selected
+production profile in the next integrated gate. `DpRingSizes::LINUX` is what
 bring-up uses; tests shrink rings.
 
 Call order (Linux call sites):
@@ -1008,14 +1015,14 @@ singleton hysteresis or the moving low/high range before
 - Physical `SET_WIPHY`: GET_WIPHY exposes current and available TX/RX chain
   masks plus the retained RTS threshold. A full TX/RX chain-mask pair is
   normalized by nl80211 (all ones means all available chains); the runtime
-  shares it between the three WCN6855 vdevs so the first active worker sends
+  shares it between the four supported-family vdevs so the first active worker sends
   the pdev WMI update while every MAC rebuilds its host capability maps. RTS
   updates are sent to each live vdev and retained for the initial
   `VDEV_CREATE` sequence and recovery. Fragment-threshold input below 256 is
   invalid, otherwise it reports Linux ath11k's `-EOPNOTSUPP`.
 - Multiple BSSID / EMA AP: when
   `WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT` is present, WCN6855
-  advertises three MBSSID interfaces and an EMA profile periodicity of eight
+  advertises four MBSSID interfaces and an EMA profile periodicity of eight
   through nested `NL80211_ATTR_MBSSID_CONFIG`. `START_AP` translates the
   transmitting or non-transmitting role into `WMI_HOST_VDEV_FLAGS_*` in
   `WMI_VDEV_START_REQUEST_CMDID`; a non-transmitting VDEV_UP additionally
@@ -1437,9 +1444,9 @@ NARF admits firmware slots 0, 1 and 2, claimed atomically, and each child has
 its own MAC address, `Mac` instance, WMI event queue, RX/TX rings, link/AP
 state and unique `WDEV` id. PDEV-wide `ath11k_mac_op_start`/`stop` runs only
 at the shared open-vdev refcount's zero-to-one/one-to-zero transitions.
-The physical wiphy also reports and enforces NARF's three-vdev interface
+The physical wiphy also reports and enforces NARF's four-vdev interface
 combination through `NL80211_ATTR_INTERFACE_COMBINATIONS`: at most two STA,
-at most three AP/P2P client/GO vdevs, one P2P Device, a total cap of three,
+at most four AP/P2P client/GO vdevs, one P2P Device, a total cap of four,
 up to two operating channels for the target's dual-station profile, matching
 infrastructure/AP beacon intervals (minimum GCD 100) and radar detection
 across every ath11k-supported channel width.
@@ -1701,11 +1708,13 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
 
 ## 8. Open questions
 
-- Per-family software completion: the PCI table recognizes QCA6390 and
-  QCN9074, but probe explicitly rejects both with BME disabled, before
-  MMIO/MSI/firmware activation. Neither has a live NARF data path.
-  QCA6390 requires Linux `rx_desc.h::hal_rx_desc_ipq8074` and
-  matching HAL accessors/DP parameters; QCN9074 additionally needs the
+- Per-family software completion: QCA6390 now has Linux
+  `rx_desc.h::hal_rx_desc_ipq8074`, native HAL accessors and DP parameters,
+  four-vdev firmware/host capacity and production core dispatch. Its
+  normal/error/coalescing/CCMP fragment fixtures pass both architectures;
+  the new composed production startup/station fixture still needs the next
+  integrated gate. QCN9074 remains rejected with BME disabled before
+  MMIO/MSI/firmware activation. It needs the
   static CE/UMAC BAR windows, HAL register/operation tables, non-shadow
   ring setup and its independent core/peer-map/RX/runtime profile. Tests
   of the common transport or WCN6855 cannot validate those missing paths.

@@ -1,4 +1,4 @@
-//! Checked legacy 2.4 GHz station preparation and open authentication MLME.
+//! Checked legacy 2.4/5 GHz station preparation and open authentication MLME.
 //! Firmware layouts follow Linux ecd997b0189a mt76_connac_mcu.{c,h}.
 //! This module prepares frames/commands; it does not authorize RF transmission
 //! or mark a WPA2 controlled port secure.
@@ -7,6 +7,25 @@ use alloc::{vec, vec::Vec};
 use narf_wireless::rsn::{self, RsnIe, Suite};
 
 const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+
+/// CONNAC2 legacy TX rate, selected from the AP's validated basic rates.
+/// Linux mt76_rates: OFDM hardware indices are deliberately not linear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyRate(u16);
+
+impl LegacyRate {
+    pub(crate) const ONE_MBPS: Self = Self(0);
+
+    fn lowest(basic: u16) -> Self {
+        const HARDWARE: [u16; 12] = [0, 1, 2, 3, 75, 79, 74, 78, 73, 77, 72, 76];
+        // JoinPlan has already rejected zero and unsupported basic rates.
+        Self(HARDWARE[basic.trailing_zeros() as usize])
+    }
+
+    pub(crate) fn hardware(self) -> u16 {
+        self.0
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Security {
     Open,
@@ -96,6 +115,43 @@ fn ies(
     }
     Ok(())
 }
+
+/// Check the SME's optional IEs against the profile this driver actually
+/// negotiates. The driver supplies SSID/rates and its canonical RSNE; it must
+/// not silently discard a requested cipher, AKM, PMF requirement or PHY mode.
+pub(crate) fn validate_sme_ies(bytes: &[u8], protected: bool) -> Result<(), Error> {
+    if bytes.len() > 2048 {
+        return Err(Error::InvalidBss);
+    }
+    let mut rsn_seen = false;
+    ies(bytes, |id, body| match id {
+        0 | 1 | 50 => Err(Error::InvalidBss),
+        48 => {
+            if rsn_seen {
+                return Err(Error::InvalidBss);
+            }
+            rsn_seen = true;
+            let rsn = RsnIe::decode_body(body).ok_or(Error::InvalidBss)?;
+            if !protected || rsn != RsnIe::wpa2_psk_ccmp() {
+                return Err(Error::UnsupportedSecurity);
+            }
+            Ok(())
+        }
+        54..=56 | 244 => Err(Error::UnsupportedSecurity),
+        45 | 191 => Err(Error::UnsupportedRates),
+        255 if body.is_empty() => Err(Error::InvalidBss),
+        255 if body
+            .first()
+            .is_some_and(|id| matches!(*id, 35 | 36 | 108 | 109)) =>
+        {
+            Err(Error::UnsupportedRates)
+        }
+        221 if body.starts_with(&[0, 0x50, 0xf2, 1]) => Err(Error::UnsupportedSecurity),
+        221 if body.starts_with(&[0, 0x50, 0xf2, 2]) => Err(Error::UnsupportedRates),
+        221 if body.len() < 3 => Err(Error::InvalidBss),
+        _ => Ok(()),
+    })
+}
 fn management(subtype: u8, own: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
     let mut frame = vec![0; 24];
     frame[0] = subtype;
@@ -114,6 +170,24 @@ impl JoinPlan {
     pub fn security(&self) -> SecurityMode {
         self.security
     }
+    pub(crate) fn management_rate(&self) -> LegacyRate {
+        LegacyRate::lowest(self.basic)
+    }
+    /// Append validated optional SME elements before the first transmission.
+    /// Its RSNE is checked above and replaced by the driver's negotiated one.
+    pub(crate) fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.phase != Phase::Prepared {
+            return Err(Error::Busy);
+        }
+        validate_sme_ies(bytes, self.security.is_wpa2())?;
+        ies(bytes, |id, body| {
+            if id != 48 {
+                self.assoc.extend_from_slice(&[id, body.len() as u8]);
+                self.assoc.extend_from_slice(body);
+            }
+            Ok(())
+        })
+    }
     pub fn prepare(
         bss: &ScanBss,
         own: [u8; 6],
@@ -123,7 +197,7 @@ impl JoinPlan {
         if !unicast(own)
             || !unicast(bss.bssid)
             || own == bss.bssid
-            || !(1..=11).contains(&bss.channel)
+            || super::channel::band(bss.channel).is_none()
             || ssid.is_empty()
             || ssid.len() > 32
             || (!bss.ssid.is_empty() && bss.ssid != ssid)
@@ -172,7 +246,13 @@ impl JoinPlan {
             }
             Ok(())
         })?;
-        if !seen_ssid || !rate_ie || rates & 1 == 0 || basic == 0 {
+        if super::channel::band(bss.channel) == Some(super::channel::Band::Ghz5) {
+            if basic & 15 != 0 {
+                return Err(Error::UnsupportedRates);
+            }
+            rates &= !15;
+        }
+        if !seen_ssid || !rate_ie || rates == 0 || basic == 0 {
             return Err(Error::UnsupportedRates);
         }
         let negotiated = match security {
@@ -202,7 +282,13 @@ impl JoinPlan {
         auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
         let mut assoc = management(0, own, bss.bssid);
         // ESS, negotiated privacy, and only AP-supported short preamble/slot.
-        let capability = 1 | (bss.capability & 0x0420) | if security.is_wpa2() { 0x10 } else { 0 };
+        let optional = if super::channel::band(bss.channel) == Some(super::channel::Band::Ghz5) {
+            0x0400
+        } else {
+            0x0420
+        };
+        let capability =
+            1 | (bss.capability & optional) | if security.is_wpa2() { 0x10 } else { 0 };
         assoc.extend_from_slice(&capability.to_le_bytes());
         assoc.extend_from_slice(&5u16.to_le_bytes());
         assoc.extend_from_slice(&[0, ssid.len() as u8]);
@@ -343,8 +429,10 @@ impl JoinPlan {
         out[basic + 18..basic + 20]
             .copy_from_slice(&(if associated { 1u16 } else { 3 }).to_le_bytes());
         let phy = tlv(&mut out, 0x15, 12);
-        out[phy + 4..phy + 6].copy_from_slice(&self.basic.to_le_bytes());
-        out[phy + 6] = 3; // HR-DSSS | ERP, no HT/VHT/HE
+        let five = super::channel::band(self.channel) == Some(super::channel::Band::Ghz5);
+        let basic_rates = if five { self.basic >> 4 } else { self.basic };
+        out[phy + 4..phy + 6].copy_from_slice(&basic_rates.to_le_bytes());
+        out[phy + 6] = if five { 8 } else { 3 }; // OFDM / HR-DSSS | ERP.
         let ra = tlv(&mut out, 1, 16);
         out[ra + 4..ra + 6]
             .copy_from_slice(&((self.rates & 15) | ((self.rates >> 4) << 6)).to_le_bytes());
@@ -448,7 +536,10 @@ pub fn key_record(wcid: u8, key_id: u8, key: Option<&[u8]>) -> Result<Vec<u8>, E
 
 /// Update the active single legacy BSS from the negotiated scan identity.
 pub fn bss_record(bss: &ScanBss, connected: bool) -> Result<Vec<u8>, Error> {
-    if !unicast(bss.bssid) || !(1..=11).contains(&bss.channel) || bss.beacon_interval == 0 {
+    if !unicast(bss.bssid)
+        || super::channel::band(bss.channel).is_none()
+        || bss.beacon_interval == 0
+    {
         return Err(Error::InvalidBss);
     }
     let mut out = vec![0; 36];
@@ -459,9 +550,10 @@ pub fn bss_record(bss: &ScanBss, connected: bool) -> Result<Vec<u8>, Error> {
     out[18..24].copy_from_slice(&bss.bssid);
     out[24..26].copy_from_slice(&19u16.to_le_bytes());
     out[26..28].copy_from_slice(&bss.beacon_interval.to_le_bytes());
-    out[29] = 6; // PHY_MODE_B | PHY_MODE_G, no HT negotiation.
+    let five = super::channel::band(bss.channel) == Some(super::channel::Band::Ghz5);
+    out[29] = if five { 1 } else { 6 }; // PHY_MODE_A / PHY_MODE_B | PHY_MODE_G.
     out[30..32].copy_from_slice(&19u16.to_le_bytes());
-    out[32..34].copy_from_slice(&3u16.to_le_bytes()); // v2 HR-DSSS | ERP.
+    out[32..34].copy_from_slice(&(if five { 8u16 } else { 3 }).to_le_bytes());
     Ok(out)
 }
 
@@ -470,15 +562,16 @@ pub fn bss_record(bss: &ScanBss, connected: bool) -> Result<Vec<u8>, Error> {
 pub(crate) struct TxPermission {
     pub country: [u8; 2],
     pub power_dbm: i8,
+    channel: u8,
 }
 
 impl TxPermission {
     pub fn from_domain(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> Option<Self> {
         use narf_wireless::reg::RegFlags;
-        if !(1..=11).contains(&channel) || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+        if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return None;
         }
-        let center = 2407 + u32::from(channel) * 5;
+        let center = super::channel::frequency(channel)?;
         let power_dbm = domain
             .rules
             .iter()
@@ -498,15 +591,25 @@ impl TxPermission {
         Some(Self {
             country: domain.country_code,
             power_dbm,
+            channel,
         })
     }
 
-    pub fn rate_limits(self, channel: u8) -> Vec<u8> {
+    pub fn permits(self, channel: u8) -> bool {
+        self.channel == channel
+    }
+
+    pub fn rate_limits(self) -> Vec<u8> {
+        let channel = self.channel;
         // Linux mt76_connac_tx_power_limit_tlv (44 bytes), followed by one
         // channel + 161 signed half-dBm rate limits. Firmware's calibration
         // and CLC limits still constrain this additional host ceiling.
         let mut bytes = vec![0; 44 + 162];
-        bytes[4..7].copy_from_slice(&[1, 1, 1]); // n_chan, 2 GHz, last_msg
+        bytes[4..7].copy_from_slice(&[
+            1,
+            super::channel::band(channel).map_or(0, |band| band.scan_tag()),
+            1,
+        ]); // n_chan, band, last_msg
         bytes[8..10].copy_from_slice(&self.country);
         bytes[44] = channel;
         bytes[45..].fill(self.power_dbm.saturating_mul(2) as u8);

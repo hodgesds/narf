@@ -123,6 +123,7 @@ pub async fn associate_boot_station(
     bss: &ScanBss,
     ssid: &[u8],
     security: crate::mt7921::association::Security,
+    extra_ies: &[u8],
 ) -> Result<u16, Error> {
     finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
@@ -131,7 +132,7 @@ pub async fn associate_boot_station(
     owner
         .as_mut()
         .ok_or(Error::DeviceGone)?
-        .associate_station(bss, ssid, security)
+        .associate_station_with_ies(bss, ssid, security, extra_ies)
         .await
 }
 
@@ -631,7 +632,12 @@ trait Backend {
     fn configure_mac(&mut self) -> Result<(), Error>;
     fn clear_wtbl(&mut self, index: u8) -> Result<(), Error>;
     fn wtbl_idle(&mut self) -> Result<bool, Error>;
-    fn submit_management(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error>;
+    fn submit_management(
+        &mut self,
+        frame: &[u8],
+        wcid: u16,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error>;
     fn management_complete(
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error>;
@@ -648,6 +654,7 @@ struct Session<B: Backend> {
     boot_started: Option<u64>,
     scan_seq: u8,
     security: Option<join::StationSecurity>,
+    management_rate: crate::mt7921::association::LegacyRate,
     data_pending: Option<u64>,
     peer_lost: bool,
     station_bss: Option<ScanBss>,
@@ -664,6 +671,7 @@ impl<B: Backend> Session<B> {
             boot_started: None,
             scan_seq: 0,
             security: None,
+            management_rate: crate::mt7921::association::LegacyRate::ONE_MBPS,
             data_pending: None,
             peer_lost: false,
             station_bss: None,

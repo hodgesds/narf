@@ -12,24 +12,16 @@
 //!
 //! Plus ≥ 15 rebranded (TP-Link, D-Link, ASUS, Edimax, …) variants.
 //!
-//! ## Scope (this commit)
+//! ## Runtime scope
 //!
-//! 1. USB device-ID table (≥ 20 IDs).
-//! 2. USB control-transfer encode for register read/write.
-//! 3. EFUSE physical-stream decoder (PG-header format).
-//! 4. Firmware blob name resolution per chip family.
-//! 5. Per-chip Stage 0/1 register init tables for all 5 families.
-//! 6. MLME scaffold (reuses iwlwifi structures for auth/assoc).
-//! 7. USB bulk-OUT TX descriptor (32-byte / 40-byte variants).
-//!
-//! ## Deferred
-//!
-//! - Live USB probe (NARF USB bus integration).
-//! - Actual firmware download over bulk-OUT.
-//! - RX ring / ISR handling.
-//! - PHY / RF calibration tables.
-//! - Rate control.
-//! - BT coexistence (RTL8723BU).
+//! The retained RTL8188EU probe powers and identifies the chip, selects
+//! descriptor-derived USB endpoints, loads authenticated firmware, installs
+//! FIFO/MAC/BB/RF tables and performs checked post-table LC/full IQK. MAC
+//! TX/RX remain closed until channel policy and a retained station packet
+//! owner exist. Software CCMP framing/key ownership is tested separately;
+//! it does not publish a network interface or grant controlled-port access.
+//! Other matched families remain detection-only. Legacy register/descriptor
+//! helpers are diagnostics, not proof of working transport for those chips.
 //!
 //! ## References (GPL-2.0-or-later)
 //!
@@ -41,6 +33,9 @@
 extern crate alloc;
 
 pub mod btcoex;
+mod calibration;
+mod calibration_regs;
+pub mod ccmp_runtime;
 pub mod device_init;
 pub mod efuse;
 pub mod firmware_transport;
@@ -49,6 +44,7 @@ pub mod intr;
 pub mod mac;
 pub mod phy;
 pub mod phy_tables;
+mod radio_init;
 pub mod rate;
 pub mod regs;
 pub mod rtl8188e;

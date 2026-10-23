@@ -162,7 +162,7 @@ kernel_test_in!(
 
 fn smoke_ath11k_probe_requires_complete_runtime_profile() -> TestResult {
     use super::pci::{validate_runtime_profile, ProbeError};
-    for revision in [HwRev::Qca6390Hw20, HwRev::Qcn9074Hw10, HwRev::Unknown] {
+    for revision in [HwRev::Qcn9074Hw10, HwRev::Unknown] {
         if validate_runtime_profile(revision)
             != Err(ProbeError::UnsupportedRuntime { hw_rev: revision })
         {
@@ -170,13 +170,14 @@ fn smoke_ath11k_probe_requires_complete_runtime_profile() -> TestResult {
         }
     }
     for revision in [
+        HwRev::Qca6390Hw20,
         HwRev::Wcn6855Hw20,
         HwRev::Wcn6855Hw21,
         HwRev::Qca2066Hw21,
         HwRev::Qca6698aqHw21,
     ] {
         if validate_runtime_profile(revision).is_err() {
-            return TestResult::Fail("complete WCN6855-layout family must remain reachable");
+            return TestResult::Fail("complete native descriptor family must remain reachable");
         }
     }
     TestResult::Pass

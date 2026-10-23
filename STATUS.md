@@ -73,28 +73,34 @@ Intel now sends versioned coexistence, SoC latency and awake-power setup.
 MT76 retains cancelled work through bounded WFSYS reset, firmware reload and
 radio reinitialization, without replaying association or keys. Its coherent
 PCI backend and ownership models now build on x86_64 and aarch64; unsupported
-per-domain IOMMU mapping remains rejected.
+per-domain IOMMU mapping remains rejected. Its legacy 2.4/5 GHz path now binds
+RX to the selected channel, carries band-specific firmware settings, selects
+the AP basic TX rate and checks optional SME association/security IEs.
 CYW43439 now connects standard PCI SDHCI PIO/card enumeration or an explicitly
 supplied platform card through trusted firmware/NVRAM/CLM loading, mailbox/F2
 control, scan, Open/WPA2 and bounded RX/TX. Board clocks/pins/regulators, gSPI
 host support and reset/reload/PM remain software work. Qualcomm ath10k reaches
-owned CE/BMI firmware/BDF/OTP, PLL and retained code-swap preparation; ath9k
-programs AR9285 inactive PHY/PLL/RF INI tables after EEPROM identity. Neither
-has a station datapath. Unsupported ath11k QCA6390/QCN9074
-profiles reject before DMA rather than inheriting WCN6855 acceptance.
+owned CE/BMI firmware/BDF/OTP, PLL and code-swap preparation, retained HTC
+runtime and versioned WMI service-ready/host-memory/INIT/READY. HTT packets and
+station attachment remain software work. Ath9k programs AR9285 inactive
+PHY/PLL/RF INI tables after EEPROM identity. Ath11k QCA6390 has its native
+IPQ8074 RX path and four-vdev resources; QCN9074 remains gated.
 Realtek has per-family identity/power work, a retained RTL8188EU factory/FIFO/
-firmware/MAC/BB/RF/LLT worker and bounded native RTW89 TX ownership. USB now
-retains published address/configuration/control/bulk DMA and checks slot
-generations; stop/drain/reclamation and replug recovery remain software work.
-Full calibration/channel/native station paths
-remain incomplete. Broadcom PCIe parks DMA and discovers AI cores; firmware,
-msgbuf/flow rings and station attachment remain software work. These gates
+firmware/MAC/BB/RF/LLT plus LC/IQK worker and bounded native RTW89 TX ownership.
+Production AES-CCM, shared CCMP AAD/replay corrections and checked per-key/TID
+station wrappers provide software crypto prerequisites; channel/power and
+native station paths remain incomplete. USB retains published address/
+configuration/control/bulk DMA and checks slot generations; stop/drain/
+reclamation and replug recovery remain software work. Broadcom BCM43602 has
+explicit board-selected CR4 firmware boot, v5/v6 msgbuf control/data/flow rings
+and correlated completion ownership; station/security attachment, broader
+silicon profiles and long-lived resource recycling remain software work. These gates
 cannot be closed by physical testing alone. No physical device validation is
 part of the current software-only work.
 
-The software checkpoint passes the filtered Wi-Fi, SDIO and USB QEMU gates:
-x86_64 reports 1283 pass / 0 fail / 10 skip; aarch64 reports
-593 pass / 0 fail / 3 skip.
+The software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared wireless
+and crypto QEMU gates: x86_64 reports 1576 pass / 0 fail / 11 skip;
+aarch64 reports 880 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.

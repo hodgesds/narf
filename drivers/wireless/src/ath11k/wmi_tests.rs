@@ -525,12 +525,12 @@ kernel_test_in!(
 // ── INIT ────────────────────────────────────────────────────────────
 
 /// `struct wmi_resource_config` for WCN6855 (`ath11k_init_wmi_config_qca6390`
-/// with num_vdevs = 2 + 1, num_rf_chains = 2, REG_CC_EXT advertised),
+/// with num_vdevs = 4, num_rf_chains = 2, REG_CC_EXT advertised),
 /// hand-filled field by field from hw.c / wmi.c.
 pub(super) fn wcn6855_resource_config_words() -> Vec<u32> {
     vec![
         0x004b_0120, // tlv: RESOURCE_CONFIG, 292 - 4
-        3,           // num_vdevs = hw_params.num_vdevs (2 + 1)
+        4,           // num_vdevs = hw_params.num_vdevs
         16,          // num_peers
         3,           // num_offload_peers
         3,           // num_offload_reorder_buffs
@@ -611,7 +611,7 @@ fn smoke_ath11k_wmi_init_cmd_wcn6855_golden() -> TestResult {
         words.len() * 4 == WMI_RESOURCE_CONFIG_SIZE,
         "resource config is 73 words"
     );
-    let cfg = TargetResourceConfig::qca6390(3, 2, true);
+    let cfg = TargetResourceConfig::qca6390(4, 2, true);
     ensure!(cfg.to_wmi_bytes() == le(&words), "resource config golden");
     ensure!(cfg.rx_batchmode == 1, "rx_batchmode set (not transmitted)");
 
@@ -630,13 +630,13 @@ fn smoke_ath11k_wmi_init_cmd_wcn6855_golden() -> TestResult {
     ensure!(cmd.frame() == frame(0x1, &want), "init cmd golden");
 
     // Negative: without REG_CC_EXT the host_service_flags bit clears.
-    let no_ext = TargetResourceConfig::qca6390(3, 2, false).to_wmi_bytes();
+    let no_ext = TargetResourceConfig::qca6390(4, 2, false).to_wmi_bytes();
     ensure!(
         no_ext[276..280] == [0, 0, 0, 0],
         "host_service_flags 0 without REG_CC_EXT"
     );
     // 1 RF chain ⇒ chain masks 1.
-    let one = TargetResourceConfig::qca6390(3, 1, false).to_wmi_bytes();
+    let one = TargetResourceConfig::qca6390(4, 1, false).to_wmi_bytes();
     ensure!(one[32..40] == le(&[1, 1])[..], "1 chain → masks 1");
     TestResult::Pass
 }

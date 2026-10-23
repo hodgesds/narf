@@ -744,6 +744,21 @@ local-teardown notifications themselves through
 Deauthentication / Disassociation), so the control bridge does not emit a
 second local-disconnect event.
 
+### 3.4.1 CCMP packet helpers (`ccmp.rs`)
+
+`build_aad` authenticates the three addresses, fragment number and optional
+Address4 / QoS TID. It excludes Duration/HT Control, mutes data subtype bits
+4–6 (preserving the QoS indicator), Retry/PM/MoreData and QoS Order, and
+forces Protected. Management subtype and non-QoS Order remain authenticated.
+`build_nonce` includes the transmitter address and big-endian 48-bit PN.
+`protect` / `unprotect` take an `AesCcm` backend; `unprotect` checks a copy of
+`ReplayWindow` and commits it only after MIC verification. Authentication
+failure leaves ciphertext and replay state unchanged when the backend honors
+its verify-before-mutation contract. The caller must validate complete MAC
+header bounds, key role/ID, native station addresses, nonce uniqueness and
+PN exhaustion, and retain independent replay trackers per key/TID (including
+a separate non-QoS tracker). These helpers do not grant controlled-port access.
+
 ### 3.5 EAPOL supplicant (`eapol.rs`)
 
 `Supplicant` runs the 4-way handshake (`handle`) and, once it completed,

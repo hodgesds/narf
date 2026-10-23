@@ -38,12 +38,16 @@ struct Model {
     llt: Vec<(u8, u8)>,
     llt_stalled: bool,
     fail_write: Option<u16>,
+    cam_stalled: bool,
+    iq_failure: bool,
+    rf_read: u8,
+    rf: [u32; 256],
     pending_write: Option<u16>,
 }
 
 impl Model {
     fn new() -> Self {
-        let mut regs = vec![0; 0x2000];
+        let mut regs = vec![0; 0x10000];
         regs[REG_APS_FSMCO as usize + 2] = 2; // Power ready bit 17.
         regs[REG_SYS_FUNC as usize] = 0x7f;
         regs[REG_SYS_FUNC as usize + 1] = 0xa1;
@@ -67,6 +71,10 @@ impl Model {
             llt: Vec::new(),
             llt_stalled: false,
             fail_write: None,
+            cam_stalled: false,
+            iq_failure: false,
+            rf_read: 0,
+            rf: [0; 256],
             pending_write: None,
         }
     }
@@ -108,7 +116,24 @@ impl ControlIo for Fake {
                 g.regs[addr as usize] |= MCU_WINT_INIT_READY as u8;
             }
         }
-        if addr == 0x30 && out.len() == 4 {
+        if addr == 0xe94 || addr == 0xea4 {
+            out.copy_from_slice(&(0x100u32 << 16).to_le_bytes());
+        } else if addr == 0xe9c {
+            out.copy_from_slice(&(0x3ffu32 << 16).to_le_bytes());
+        } else if addr == 0xeac {
+            out.copy_from_slice(
+                &(if g.iq_failure {
+                    1u32 << 28 | 1 << 27
+                } else {
+                    2u32 << 16
+                })
+                .to_le_bytes(),
+            );
+        } else if (addr == 0x8a0 || addr == 0x8b8) && out.len() == 4 {
+            out.copy_from_slice(&g.rf[g.rf_read as usize].to_le_bytes());
+        } else if addr == 0x670 && out.len() == 4 && !g.cam_stalled {
+            out.fill(0);
+        } else if addr == 0x30 && out.len() == 4 {
             let address = (g.regs[0x31] as usize) | ((g.regs[0x32] as usize & 3) << 8);
             let value = 1 << 31 | ((address as u32) << 8) | g.physical[address] as u32;
             out.copy_from_slice(&value.to_le_bytes());
@@ -132,16 +157,19 @@ impl ControlIo for Fake {
             }
             g.ops.push(Op::Write(addr, bytes.to_vec()));
             g.writes += 1;
-            if g.fail_write == Some(addr) {
+            if g.fail_write == Some(addr) && (addr != 0xe48 || bytes == 0xf9000000u32.to_le_bytes())
+            {
                 return Err(UsbError::Stall);
             }
             if addr == 0x1e0 {
                 g.llt.push((bytes[1], bytes[0]));
             }
-            if g.pending_write == Some(addr) {
+            if g.pending_write == Some(addr)
+                && (addr != 0xe48 || bytes == 0xf9000000u32.to_le_bytes())
+            {
                 g.active_td = true;
                 None
-            } else if addr >= REG_FW_START_ADDRESS {
+            } else if (REG_FW_START_ADDRESS..REG_FW_START_ADDRESS + 0x1000).contains(&addr) {
                 let page = (g.regs[REG_MCU_FW_DL as usize + 2] & 7) as usize;
                 let offset = (addr - REG_FW_START_ADDRESS) as usize;
                 if bytes.len() > 196 || g.pages[page].len() != offset {
@@ -163,7 +191,18 @@ impl ControlIo for Fake {
                     Some(Ok(bytes.len()))
                 }
             } else {
+                let previous_hssi = u32::from_le_bytes(g.regs[0x824..0x828].try_into().unwrap());
                 g.regs[addr as usize..addr as usize + bytes.len()].copy_from_slice(bytes);
+                if addr == 0x840 && bytes.len() == 4 {
+                    let v = u32::from_le_bytes(bytes.try_into().unwrap());
+                    g.rf[(v >> 20) as usize] = v & 0xfffff;
+                }
+                if addr == 0x824 && bytes.len() == 4 {
+                    let v = u32::from_le_bytes(bytes.try_into().unwrap());
+                    if v & 0x80000000 != 0 && previous_hssi & 0x80000000 == 0 {
+                        g.rf_read = ((v >> 23) & 0xff) as u8;
+                    }
+                }
                 if addr == REG_MCU_FW_DL && bytes[0] & MCU_FW_DL_CSUM_REPORT != 0 {
                     g.regs[addr as usize] &= !MCU_FW_DL_CSUM_REPORT; // W1C.
                 }
@@ -500,7 +539,7 @@ fn smoke_rtl8188eu_retained_factory_fifo_and_register_pipeline() -> TestResult {
     let io = Fake::new();
     let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
     if narf_scheduler::block_on(owner.initialize_device(&image(123))).is_err()
-        || owner.status().stage != Stage::TablesReady
+        || owner.status().stage != Stage::RadioReady
     {
         return TestResult::Fail("RTL8188EU retained factory/MAC/BB/RF pipeline failed");
     }
@@ -664,4 +703,228 @@ fn smoke_rtl8188eu_pipeline_rejects_silicon_and_poisoned_tables() -> TestResult 
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu",
     smoke_rtl8188eu_pipeline_rejects_silicon_and_poisoned_tables
+);
+
+fn smoke_rtl8188eu_rf_read_edges_and_lc_restore() -> TestResult {
+    for pi in [false, true] {
+        let io = Fake::new();
+        let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+        {
+            let mut g = io.0.lock();
+            g.rf[0xef] = 0xabcde;
+            g.regs[0x820..0x824].copy_from_slice(&(if pi { 0x100u32 } else { 0 }).to_le_bytes());
+        }
+        if narf_scheduler::block_on(super::calibration::read_rf(&owner, 0xef)) != Ok(0xabcde) {
+            return TestResult::Fail("RF read used wrong address/PI readback");
+        }
+        let g = io.0.lock();
+        let expected = if pi { 0x8b8 } else { 0x8a0 };
+        if !matches!(g.ops.last(),Some(Op::Read(reg,4)) if *reg==expected) || !g.ops.iter().any(|op|matches!(op,Op::Write(0x824,v) if u32::from_le_bytes(v[..].try_into().unwrap())==0xf7800000)) || !g.ops.iter().any(|op|matches!(op,Op::Delay(100))) {return TestResult::Fail("RF read edge/address/delay sequence");}
+    }
+    for continuous in [false, true] {
+        let io = Fake::new();
+        let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+        let lstf = if continuous {
+            0x17000000u32
+        } else {
+            0x01000000
+        };
+        {
+            let mut g = io.0.lock();
+            g.regs[0xd00..0xd04].copy_from_slice(&lstf.to_le_bytes());
+            g.regs[0x522] = 0xa5;
+            g.rf[0] = 0x76543;
+            g.rf[0x18] = 0x30004;
+        }
+        if narf_scheduler::block_on(super::calibration::lc(&owner)).is_err() {
+            return TestResult::Fail("LC calibration failed");
+        }
+        let g = io.0.lock();
+        if g.regs[0xd00..0xd04]!=lstf.to_le_bytes() || g.regs[0x522]!=0xa5 || continuous&&g.rf[0]!=0x76543 || !g.ops.iter().any(|op|matches!(op,Op::Delay(100000))) || !g.ops.iter().any(|op|matches!(op,Op::Write(0x840,v)if u32::from_le_bytes(v[..].try_into().unwrap())==0x1838004)){return TestResult::Fail("LC channel trigger or preexisting TX/continuous state lost");}
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8188eu_rf_read_edges_and_lc_restore
+);
+
+fn smoke_rtl8188eu_post_table_core_and_iqk_coefficients() -> TestResult {
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+    if narf_scheduler::block_on(owner.initialize_device(&image(123))).is_err()
+        || owner.status().stage != Stage::RadioReady
+    {
+        return TestResult::Fail("production sequence did not reach checked calibration");
+    }
+    let c = owner.calibration().unwrap();
+    if (c.tx_x, c.tx_y, c.rx_x, c.rx_y) != (0x100, 0x3ff, 0x100, 2) {
+        return TestResult::Fail("IQK coefficients not retained");
+    }
+    let g = io.0.lock();
+    let word =
+        |address: usize| u32::from_le_bytes(g.regs[address..address + 4].try_into().unwrap());
+    if word(0xc80) & 0x003f03ff != 0x003f00e4
+        || word(0xc94) >> 28 != 15
+        || word(0xc14) & 0xffff != 0x900
+        || g.regs[0x522] != 0
+        || g.regs[0x680] != 0
+        || g.regs[0x100] & 0xc0 != 0
+    {
+        return TestResult::Fail("IQK signed matrix, restore or MAC/security gates wrong");
+    }
+    if g.regs[0x60f] != 4
+        || g.regs[0x610..0x616] != [2, 0xe0, 0x4c, 1, 2, 3]
+        || g.regs[0xfe55] & 0x18 != 0x10
+        || g.regs[0x10c] & 4 != 0
+        || word(0xe00) != 0x20202020
+        || g.regs[0x652] != 235
+        || g.rf[0x42] != 0x37cf8
+    {
+        return TestResult::Fail(
+            "post-table MAC/aggregation/factory gain/thermal setup incomplete",
+        );
+    }
+    let triggers=g.ops.iter().filter(|op|matches!(op,Op::Write(0xe48,v)if u32::from_le_bytes(v[..].try_into().unwrap())==0xf8000000)).count();
+    if triggers != 6 || !g.ops.iter().any(|op| matches!(op, Op::Delay(10000))) {
+        return TestResult::Fail("full TX/RX IQK attempts were not triggered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8188eu_post_table_core_and_iqk_coefficients
+);
+
+fn smoke_rtl8188eu_cam_iqk_failure_remains_terminal() -> TestResult {
+    for cam in [false, true] {
+        let io = Fake::new();
+        {
+            let mut g = io.0.lock();
+            g.cam_stalled = cam;
+            g.iq_failure = !cam;
+        }
+        let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+        let expected = if cam {
+            Error::CamTimeout
+        } else {
+            Error::Calibration
+        };
+        if narf_scheduler::block_on(owner.initialize_device(&image(123))) != Err(expected)
+            || owner.status().error != Some(expected)
+            || owner.calibration().is_some()
+        {
+            return TestResult::Fail("CAM/IQK failure accepted or fabricated calibration");
+        }
+        let count = io.0.lock().ops.len();
+        if narf_scheduler::block_on(owner.initialize_device(&image(123)))
+            != Err(Error::AlreadyStarted)
+            || io.0.lock().ops.len() != count
+        {
+            return TestResult::Fail("failed radio owner restarted");
+        }
+        let g = io.0.lock();
+        if g.regs[0x100] & 0xc0 != 0
+            || cam
+                && g.ops
+                    .iter()
+                    .any(|op| matches!(op, Op::Write(0xe48, v) if v==&0xf9000000u32.to_le_bytes()))
+        {
+            return TestResult::Fail("failed CAM gate reached IQK or opened MAC");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8188eu_cam_iqk_failure_remains_terminal
+);
+
+fn smoke_rtl8188eu_calibration_cancel_and_transport_poison() -> TestResult {
+    for cancel in [false, true] {
+        let io = Fake::new();
+        {
+            let mut g = io.0.lock();
+            if cancel {
+                g.pending_write = Some(0xe48);
+            } else {
+                g.fail_write = Some(0xe48);
+            }
+        }
+        let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+        let blob = image(123);
+        if cancel {
+            let mut future = Box::pin(owner.initialize_device(&blob));
+            if !matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ) || owner.status().stage != Stage::Calibrating
+            {
+                return TestResult::Fail("submitted IQK TD did not retain calibrating stage");
+            }
+            drop(future);
+        } else if narf_scheduler::block_on(owner.initialize_device(&blob))
+            != Err(Error::Usb(UsbError::Stall))
+        {
+            return TestResult::Fail("IQK transport failure ignored");
+        }
+        let g = io.0.lock();
+        let error = if cancel {
+            Error::Cancelled
+        } else {
+            Error::Usb(UsbError::Stall)
+        };
+        if owner.status().error != Some(error)
+            || owner.calibration().is_some()
+            || g.unsafe_reuses != 0
+            || !matches!(g.ops.last(), Some(Op::Write(0xe48, _)))
+        {
+            return TestResult::Fail("IQK drop/error performed cleanup or published usable radio");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8188eu_calibration_cancel_and_transport_poison
+);
+
+fn smoke_rtl8188eu_rejects_erased_gain_and_absent_radio() -> TestResult {
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+    let factory = super::device_init::Factory {
+        cut: 0,
+        mac: [2, 0, 0, 0, 0, 1],
+        cck_power: [0xff; 6],
+        ht40_power: [0x20; 5],
+        crystal_cap: 0x20,
+        channel_plan: 0,
+        thermal: 0,
+        board_option: 0,
+    };
+    if narf_scheduler::block_on(super::radio_init::configure(&owner, factory))
+        != Err(Error::BadEfuse)
+        || !io.0.lock().ops.is_empty()
+    {
+        return TestResult::Fail("erased factory gains reached radio programming");
+    }
+    {
+        let mut g = io.0.lock();
+        g.regs[0x824..0x828].fill(0xff);
+    }
+    if narf_scheduler::block_on(super::calibration::read_rf(&owner, 0x18)) != Err(Error::RadioRead)
+    {
+        return TestResult::Fail("absent HSSI read was accepted");
+    }
+    let g = io.0.lock();
+    if g.ops.len() != 1 || !matches!(g.ops[0], Op::Read(0x824, 4)) {
+        return TestResult::Fail("absent radio triggered further register writes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8188eu_rejects_erased_gain_and_absent_radio
 );

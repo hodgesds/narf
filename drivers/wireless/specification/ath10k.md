@@ -1,9 +1,11 @@
 # ath10k — Specification
 
-> Status: **ROM firmware preparation implemented; WLAN software incomplete.**
+> Status: **ROM/HTC/WMI initialization implemented; WLAN software incomplete.**
 > The live PCI task obtains BMI identity, selects trusted firmware/BDF,
-> runs OTP calibration and downloads the image. BMI_DONE is withheld until
-> an owned runtime HIF exists. This is not activated or usable Wi-Fi.
+> runs OTP calibration and downloads the image. It retains runtime CE DMA
+> before BMI_DONE, negotiates HTC endpoints, handles firmware host-memory
+> requests and completes WMI INIT/READY. HTT packet runtime, station control
+> and interface registration remain; this is not usable Wi-Fi.
 
 ## 1. Purpose & scope
 
@@ -30,8 +32,11 @@ packet service are not yet attached.
   real CE0 request and CE1 response complete. `boot_error` retains a
   bootstrap failure. `firmware_prepared` records the directory, API and
   WMI/HTT dialect only after real ROM-side image preparation;
-  `firmware_error` records profile/file/BDF/OTP failures. No netdev is
-  registered at this stage.
+  `firmware_error` records profile/file/BDF/OTP failures. `htc_ready` records
+  actual endpoint negotiation and credit size; `runtime_error` records a
+  transport/HTC failure after ROM preparation. `wmi_ready` records a
+  correlated successful READY MAC/version/status; `wmi_error` retains
+  service/ABI/memory/INIT failures. No netdev is registered.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
@@ -50,6 +55,12 @@ packet service are not yet attached.
   `host_int_disabled` controls `HOST_IE`, never destination byte swap.
   `halt_pipe(mmio, hw_rev, pipe)` requests CMD bit 0 and waits for bit 3
   in the same command register using a bounded responsive wait.
+- `ce::Ath10kMmio::authorized()` checks current publication authority.
+  The native implementation retains its PCI capability and performs each
+  bounded register access inside `Cap::invoke`; revoked reads return all
+  ones and revoked writes never reach the BAR. Ring, BMI, diagnostic,
+  HIF and host-memory entry points reject revoked authority before new
+  descriptor or bounce publication. Revocation does not retire pending DMA.
 
 The internal `boot::PciBoot` owns PCI authority, four coherent CE rings
 (CE0 source, CE1 destination, CE7 source/destination), and request,
@@ -59,6 +70,10 @@ target CPU interrupt before BMI. QCA988X uses the preferred warm-reset
 route; it does not automatically cold-reset boards Linux documents can
 hang on that path. An inherited nonempty CE fails rather than being
 repointed to new host memory.
+BAR admission covers every CE window that the selected chip can use,
+including CE8 on twelve-CE parts. A revoked capability cannot authorize
+the halt/BME readback proof needed to free published storage; Drop retains
+those allocations.
 
 Internal `bmi::Bmi` provides target information, chunked memory read/write,
 SoC register read/write, execute, zero-padded compressed download and the
@@ -70,8 +85,48 @@ runs OTP and downloads firmware. QCA6174 HW3.2/QCA9377 HW1.1 execute Linux's
 ordered PLL setup with bounded asynchronous settle waits. Code-swap TLVs
 are checked, copied into retained DMA32 storage and advertised through the
 208-byte segment record before image upload. An async mutex retains the
-BMI transport, selected profile and image after preparation. No DONE or
-HTC/WMI activation occurs while runtime ownership is incomplete.
+BMI or runtime transport, selected profile and image, including failed
+handoffs. The physical `Transport::prepare_done` refuses activation until
+all runtime allocations and RX postings are retained; `done_complete`
+opens HIF only after terminal CE0 completion. No station admission follows
+merely from successful HTC negotiation.
+
+Runtime storage retains Linux host CE2 RX128×2048, CE3 TX32×2048,
+CE4 TX8192×256, CE5 RX512×512, plus CE8 RX128×2048 on 12-CE parts.
+QCA6174/QCA9377 disable host CE5 and carry HTT receive through CE1.
+The original CE0/CE1 allocations are preserved through ROM handoff;
+CE1 and runtime RX pipes have one posted bounded buffer per pipe before
+DONE, with serialized polling and terminal-completion refill. This is
+control-path capacity, not a full runtime packet pool or IRQ service.
+
+`control::Session` owns HTC endpoint and credit state. The production
+path receives READY, connects HTT 0x300 with credit flow disabled and WMI 0x100
+with the advertised credit allocation, then sends Linux's 12-byte
+SETUP_COMPLETE_EX body without RX bundling. Endpoint IDs are checked for
+duplicates and family pipe binding. Early WMI events are retained through
+the connect response race. WMI sends progress credit trailers while waiting
+for enough credits, preserve endpoint TX sequence, and use CE3. Malformed
+frames, failed transfers, timeout or dropped in-flight waits close the
+session until a future owned reset; no ambiguous control operation retries.
+
+`wmi_boot::Runtime` owns the resulting HTC session through service-ready,
+host-memory retention, native INIT and READY. It selects MAIN, 10.1, 10.2,
+10.2.4, TLV or 10.4 from the parsed image's WMI operation version. Native
+service-ready layouts expose regulatory/RF/PHY capabilities; TLV validates
+the service-ready ABI namespace and bounded nested memory-request arrays.
+The four-low-bits-per-word service bitmap and dialect-specific extensions
+follow Linux's service mapping. Resource requests use the corresponding
+120/108/136/176/168-byte layouts; 10.4 peer caching and firmware PFC affect
+peer/active-peer/TID/MSDU counts. Optional bundled-management/TX-ACK-RSSI
+host capabilities are not advertised without handlers.
+
+The physical `HostMemory::retain_wmi_memory` adapter aligns each requested
+unit to four bytes, derives units from the same requested vdev/peer/active
+peer counts, checks multiplication, zeroes coherent DMA32 storage, and
+retains it in the transport before returning addresses for INIT. It handles
+at most 16 unique requests; a zero-unit request needs no chunk. Memory is
+one-shot, and cancelled or failed initialization cannot repeat allocation
+or INIT. Early HTT messages remain retained for the next HTT stage.
 
 ## 4. Invariants
 
@@ -88,8 +143,11 @@ HTC/WMI activation occurs while runtime ownership is incomplete.
   descriptor publication and clears poison only after validated completion.
   Cancellation, timeout or malformed completion retains poison. Pending DMA is
   not treated as cancelled and its backing memory is not recycled.
-- Drop frees allocations only after all active boot CEs acknowledge halt
-  and PCI bus-master disable is read back. A failure retains the memory.
+- Before mission handoff, Drop frees allocations only after all chip CEs
+  acknowledge halt and PCI bus-master disable is read back. Once DONE was
+  attempted, including ambiguous cancellation/timeout, DMA allocations remain
+  retained even if those checks succeed: firmware/autonomous writes need a
+  future complete reset/drain proof before recycling. A stop failure also retains.
 - CPU pointers come from coherent CPU mappings; DMA addresses only enter
   device descriptors/registers. Descriptor publication and consumption
   include device-visible ordering: outer-shareable DMB on aarch64, bracketed
@@ -120,26 +178,32 @@ CE programming, ring completion/wrap/reuse, DMA bounds, BMI chunking,
 short responses and the DONE transition. Composed ROM fixtures execute the
 production BMI orchestration and verify selected BDF bytes, OTP parameters,
 PLL register order, code-swap payload/segment records and failed-calibration
-gates. These tests do not emulate a Qualcomm radio or establish reset/ROM
+gates. Runtime regressions execute actual generic CE DMA receive/refill,
+8192-entry CE4 and per-family CE5/CE8 selection, cancellation after actual
+CE3 publication, DONE prerequisite/terminal hooks, and a literal-wire HTC
+model including credit starvation/refill, early service-ready, both HTT
+receive pipes and terminal duplicate/cancellation handling. These tests
+include actual HTC→WMI composition for all six dialects, INIT packets from
+an independently compiled C layout oracle, resource-dependent memory sizes,
+zero-unit skip, malformed ABI/count/extent handling and dropped INIT ownership.
+These tests
+do not emulate a Qualcomm radio or establish reset/ROM
 interoperability.
 
 ## 8. Remaining software and hardware acceptance
 
 The following are software work, not gates that a physical boot can close:
 
-1. Runtime-safe handoff of the prepared image through BMI_DONE. The current
-   ROM-only session stops before firmware activation. Alternate pre-cal/cal
-   sources (file/DT/EEPROM), non-BMI images and diagnostic fast download are
+1. Alternate pre-cal/cal sources (file/DT/EEPROM), non-BMI images and diagnostic fast download are
    not implemented; the supported ROM path requires a valid OTP image and
    calibrated BDF. Missing board files currently fail the boot session.
 2. Complete per-firmware-family feature/dialect operation tables and
    optional board/clock/UART quirks, with real firmware validation of the
    current OTP/BDF/PLL/code-swap path.
-3. Full runtime CE2/3/4/5 buffers and ownership, per-chip CE5 overrides,
-   HIF IRQ/MSI service, recovery and PM/teardown.
-4. Actual HTC credits/service handshake, family-specific WMI command and
-   event operation maps, service-ready/init/ready negotiation, and the
-   HTT version/descriptor/refill/TX completion/reorder paths. Existing
+3. Full runtime RX buffer pools and packet service beyond the retained
+   serialized control path, HIF IRQ/MSI service, recovery and PM/teardown.
+4. Station/runtime WMI command and event operation maps beyond INIT/READY,
+   and the HTT version/descriptor/refill/TX completion/reorder paths. Existing
    standalone WMI/HTT codecs do not establish a working transport.
 5. Regulatory/channel and scan/station control, management/EAPOL/key
    exchange, packet conversion, and `WirelessNetIface`/netdev registration.

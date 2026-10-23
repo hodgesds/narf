@@ -1,7 +1,7 @@
 # Broadcom FullMAC PCIe — software bring-up
 
-> Status: v0.3. PCI ownership and AI core discovery are implemented.
-> Firmware bootstrap and a live msgbuf station are software work still required.
+> Status: v0.5. BCM43602 CR4 firmware and retained PCIe control/flow/data
+> rings have production paths. Station and recovery remain software work.
 
 ## 1. Purpose & scope
 
@@ -22,16 +22,20 @@ information rather than equating the PCI device ID with the chip ID.
 `pcie::probe(BusDevice, Cap<BusDeviceCap, Write>)` retains exclusive PCI
 authority in a parked controller. `unsafe pcie::bring_up(device, cap)`
 requires exclusive BAR/config ownership and returns that same owned state.
-Both paths first clear inherited `BUS_MASTER`, enable `MEM_SPACE` and
-`INTX_DISABLE`, verify DMA is disabled, and validate BAR0 before access.
+Both paths clear inherited `BUS_MASTER|MEM_SPACE`, set `INTX_DISABLE`,
+verify all three bits before BAR sizing, then enable and verify memory decode
+with bus mastering off. Repeated owned-BDF probes return before PCI access;
+extra devices are parked with decode and bus mastering disabled.
 The control BAR mapping ignores a firmware-provided prefetchable attribute.
 They publish a bound-driver inventory entry, not a network interface.
 
 `chip::Backplane` supplies serialized fallible `read32`/`write32` operations.
 The production PCIe implementation keeps the BAR and capability private;
 each access validates alignment/range, selects the page, and verifies
-readback with at most one retry. The configuration helpers check current
-capability validity for every select. `Chip::discover` reads the actual
+readback with at most one retry. The complete select/access pair runs inside a `CapOp` invocation; the
+configuration helpers also check current validity at each select. Checked BAR2
+TCM reads/writes and PCI decode/DMA transitions run inside the same invocation
+contract, so possession of a retained BAR never authorizes a later access. `Chip::discover` reads the actual
 chip ID/revision, walks bounded AI EROM descriptors, and returns discovered
 `Core { id, revision, base, wrapper }` records. It performs no writes.
 Non-AI interconnects and malformed/out-of-range maps are rejected.
@@ -39,7 +43,8 @@ Non-AI interconnects and malformed/out-of-range maps are rejected.
 those callers validate their own CM3/RAM/D11/SDIO profile. `disable_core`
 and `reset_core` implement AI clock/reset/readback ordering with 300-us
 assert and 3-ms release deadlines. CYW43439 uses these live helpers; PCIe
-CPU passive/active integration and its CR4/CA7-specific work remain open.
+BCM43602 CR4 passive/active integration uses these same helpers; CA7 and
+other chip-specific lifecycle paths remain gated.
 
 `Chip::park_pcie` masks the PCIe interrupt and mailbox sources before
 acknowledging the sampled mailbox status. PCIe core revisions below 64
@@ -47,16 +52,90 @@ use offsets 0x24/0x48/0x4c; revisions 64 and above use 0xc14/0xc30/0xc34.
 Those offsets are relative to the discovered core, independently of the
 firmware shared-memory version. This is interrupt parking, not a reset.
 
-The existing `msgbuf`, `ringbuf`, `fwil`, `fweh`, `shared`, `firmware`,
-`cfg80211`, and `connect` interfaces contain wire/cursor helpers or
-attachment models. None supplies a live DMA/firmware owner or permits
-publishing a usable station yet. In particular `connect_wpa2_psk` is an
-orchestration model without a complete key-installation lifecycle.
+`native_runtime::register_board_profile(BoardProfile)` registers exact PCI
+vendor/device/subsystem, discovered chip/revision mask, and verified registry
+firmware/NVRAM names before probe. There is no guessed board-calibration
+fallback. The native path retains BAR0/BAR2 with Device attributes, resolves
+verified firmware capabilities, and starts a retained owner only for an
+explicit profile. No built-in profile has been asserted from an untested PCI
+ID. Actual platform profile/OTP selection remains a software dependency.
+
+`boot::Cr4<B: boot::Bus>::claim/boot` consumes exclusive backplane/TCM access.
+It admits BCM43602 only, halts CR4, disables discovered D11 cores, derives RAM
+from CR4 bank registers, applies bank5/7 PDA quirks, checks firmware/NVRAM
+nonoverlap, and uploads the reset vector at TCM0 before release. `pack_nvram`
+requires a selected single-board file with boardrev, adds the final list NUL,
+alignment, and complement token excluding the token bytes. Multi-device
+NVRAM is rejected until an actual selector exists. Shared readiness has a
+5-second deadline and requires a changed tail sentinel plus aligned RAM-bound
+metadata. Firmware RAM hints may shrink, never enlarge discovered RAM.
+
+`runtime::Runtime<B: runtime::Bus>::attach(Booted<B>)` owns five common rings,
+eight IOCTL-response buffers, eight event buffers, request input, scratch and
+ring-update memory. Shared versions5/6 use checked disjoint TCM metadata and
+16-bit indices at 4-byte strides. Nonzero rx_dataoffset descriptor-prefix
+geometries and v7 remain gated before any DMA allocation/publication. Optional host DMA-index
+fields are cleared to select the supported TCM fallback. All DMA allocations
+and host addresses are retained before publication and before enabling BME.
+
+`begin_ioctl`/`take_response` serialize bounded control requests with monotonic
+nonwrapping transaction/buffer IDs, zero-filled physical query prefixes,
+posted-buffer identity plus command/transaction/interface correlation, and
+copy-before-repost. `command(...).await` drives bounded polling with a 2-second
+deadline; cancellation poisons the owner and preserves active input bytes.
+`poll` consumes at most10 completions per each of three rings (30 total)
+per call, so control pressure cannot starve TX/RX; `pop_event` returns owned
+event payloads. Stale IDs, malformed extents/indices,
+uncorrelated flow/data completion, or bounded event overflow fail-stop the owner
+and attempt to disable BME. Native `command` and the 1-ms worker use an async
+mutex, with no IRQ lock across awaits. These are live control transport APIs,
+not station authorization. The existing `connect_wpa2_psk` is still an
+orchestration model without complete station/key/controlled-port integration.
+
+`enable_data` retains up to32 receive buffers of2048 bytes before publishing
+RX32 posts. The native bootstrap calls it before starting the packet worker.
+`open_flow(source,destination,priority)` allocates a512×48 flow ring, retains
+it before the create request, initializes its TCM indices, and returns a
+`FlowToken`. The token is Creating until a matching firmware create completion;
+only Open flows admit `send`. Source/destination and priority are immutable.
+
+`send` admits bounded Ethernet-II frames, copies the14-byte Ethernet header
+into the TX descriptor and publishes only the remaining body as DMA. At most64
+combined outstanding packets/receipts are retained. A matching request ID plus
+flow ID and metadata-free classic16-byte TX completion retire exactly one body
+mapping after a CPU DMA-read release edge; `pop_tx_receipt` returns its result.
+`close_flow` refuses outstanding TX, then waits for the correlated delete ACK.
+Create/delete have2-second deadlines driven by the shared poller. Flow IDs are
+never reused; at most8 (or the lower firmware maximum) are allocated per owner.
+Closed ring mappings remain retained, so long-lived flow recycling is an explicit
+remaining software dependency rather than premature freeing/reuse.
+
+RX classic32-byte completions validate posted ID, interface, status, Ethernet
+format, full16-bit offset/length and buffer bounds. Payload is copied before
+posting the same allocation under a fresh nonwrapping ID. `pop_received` returns
+owned Ethernet frames; bounded RX queue pressure drops ordinary data and keeps
+buffer progress. Unknown/stale completion identity fails the owner. Native
+`open_flow`, `flow_state`, `send`, `close_flow`, `pop_received`, and
+`pop_tx_receipt` forward to this retained runtime through its async mutex.
+These are kernel transport APIs: station authorization, EAPOL/control-port
+policy and network publication are not implied by a flow token.
+
+The `runtime::Memory` contract separates CPU and DMA addresses and requires
+cache maintenance plus peripheral barriers at ownership transitions; the
+native `DmaBuffer` adapter uses `dmb osh` on aarch64.
+`Memory::sync_from_device` performs pre-read cache visibility. A separate
+`Memory::release` edge retires CPU DMA reads before TCM consumer-index
+publication; the pre-read invalidation/barrier is not a substitute. Drop after any address
+publication disables BME best effort and retains every mapping permanently:
+config readback alone does not prove all previously posted PCI writes drained.
+Recovery/IOMMU quiescence and reclamation are explicit remaining software work.
 
 ## 4. Invariants
 
 - No bus mastering without owned DMA mappings, ring lifetimes, and a
-  terminal cleanup/reset path. Probe leaves it disabled even on errors.
+  retained terminal ownership. Probe leaves it disabled until explicit
+  board firmware/control-ring attachment; all post-publication failures keep
+  mappings retained even when BME-disable readback fails.
 - Window selection and the subsequent MMIO access have one mutable owner.
   Raw BAR handles are not exposed to concurrent clients.
 - Discovery consumes at most 1024 EROM words and retains at most 64 cores.
@@ -79,23 +158,23 @@ x86_64 and aarch64; passing them does not establish physical operation.
 
 ## 6. Dependencies
 
-Implemented dependency: PCI enumeration, exclusive capability, BAR mapping.
+Implemented: PCI enumeration/exclusive authority, Device BAR0/BAR2,
+BCM43602 bank-derived CR4 boot, explicit verified firmware/NVRAM policy,
+shared5/6 TCM indices, retained common/control/flow/RX/TX DMA, bounded correlated
+IOCTL/events/data ownership, and native probe-to-runtime dispatch.
+
 Remaining software dependencies, in activation order:
 
-1. Chip CPU passive/reset controls, bank-derived RAM discovery, chip quirks,
-   and owned BAR2 TCM mapping with checked extents.
-2. Signed chip/revision/board-specific firmware and NVRAM selection,
-   NVRAM padding/token construction, firmware upload/reset-vector start,
-   and deadline-bounded shared-memory pointer handshake. Newer Apple OTP
-   board selection and newer firmware metadata must be handled explicitly.
-3. Validated shared/ring-info addresses and feature negotiation; IOMMU/DMA
-   ownership; common-ring allocation/index visibility; MSI/doorbell work;
-   correlated IOCTL responses and provisioned event/IOCTL/RX buffers.
-4. Flow-ring create/delete/completion ownership, TX reclamation, RX
-   validation, bounded poll/workers, and recovery/reset cleanup.
-5. Regulatory/CLM attachment; live scan and association; firmware key and
+1. Nonzero descriptor-prefix geometry, actual platform-specific calibration
+   policy registrations, board/OTP
+   selection for other devices, additional CPU/RAM/chip profiles and shared7.
+2. Long-lived flow-ID recycling after confirmed delete/quiescence, larger
+   flow profiles and any firmware metadata/native802.11 RX modes.
+3. Regulatory/CLM attachment; live scan/association; firmware key and
    authorization events; Ethernet/control-port admission; NARF frame rings
    and wireless registry publication; disconnect/rekey/recovery replay.
+4. Confirmed stop/IOMMU quiescence, recovery and DMA reclamation. MSI/IRQ
+   operation may replace polling only with the same retained ownership.
 
 These are implementation blockers, not physical-only validation gates.
 
@@ -106,11 +185,17 @@ PCI match inventory, protocol encoders, or synthetic discovery tests.
 
 ## 8. Verification and open questions
 
-Regression fixtures exercise the production `Chip::discover` and
-`park_pcie` paths using literal Linux-format descriptors. They cover
+Regression fixtures exercise production `Cr4`, `Runtime`, PCI command
+transition, `Chip::discover` and `park_pcie` paths using literal Linux-format descriptors. They cover
 different discovered PCIe core bases, the revision-64 interrupt-layout
 boundary, extended address/size words, aliased/missing cores, invalid
 EROM pointers, malformed pairs, absent termination, and gone mailboxes.
+Literal CR4 transcripts cover RAM banks/reset-vector/NVRAM/shared readiness;
+actual DMA ring fixtures cover request bytes/query zero fill, response and
+event correlation/reposting, literal TX/RX wire offsets, full create/TX/delete
+state and DMA retirement, wide RX offset/reposting, stale/wrong-flow completions,
+control-pressure fairness, invalid indices, cancellation,
+and allocation cleanup before versus mapping retention after publication.
 
 Primary references: `/usr/src/linux/drivers/net/wireless/broadcom/brcm80211/`
 `brcmfmac/chip.c`, `pcie.c`, `firmware.c`, `msgbuf.c`, `commonring.c`, and

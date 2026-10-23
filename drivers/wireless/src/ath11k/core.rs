@@ -472,30 +472,29 @@ pub struct CoreConfig {
 
 impl CoreConfig {
     /// `ath11k_hw_params[]` for the PCI parts the core supports:
-    /// The WCN6855 family (all `single_pdev_only`,
-    /// `num_rxdma_per_pdev = 2`, `max_radios = 3`, and NARF's deliberate
-    /// `num_vdevs = 3` ceiling (local Linux requests four),
-    /// credit flow, shadow registers, the QCA6390 service map).
-    /// QCA6390 needs its IPQ8074 RX descriptor runtime; QCN9074 needs
-    /// its separate HAL/DP profile. Neither may start firmware here.
+    /// QCA6390 and WCN6855-layout families share Linux's single-pdev,
+    /// two-RXDMA, four-vdev resource configuration and HTC service map.
+    /// QCN9074 still requires its independent HAL/DP/core profile.
     pub fn for_hw(params: &HwParams) -> Option<Self> {
         match params.hw_rev {
-            HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
-                Some(CoreConfig {
-                    fw_mode: ATH11K_FIRMWARE_MODE_NORMAL,
-                    credit_flow: params.credit_flow,
-                    supports_shadow_regs: params.supports_shadow_regs,
-                    single_pdev_only: true,
-                    num_rxdma_per_pdev: 2,
-                    max_radios: 3,
-                    num_vdevs: 2 + 1,
-                    svc_to_ce_map: &htc::TARGET_SERVICE_TO_CE_MAP_WLAN_QCA6390,
-                    htc_wait_ms: 1000,
-                    htc_conn_ms: 1000,
-                    service_ready_ms: 5000,
-                    wmi_send_ms: 3000,
-                })
-            }
+            HwRev::Qca6390Hw20
+            | HwRev::Wcn6855Hw20
+            | HwRev::Wcn6855Hw21
+            | HwRev::Qca2066Hw21
+            | HwRev::Qca6698aqHw21 => Some(CoreConfig {
+                fw_mode: ATH11K_FIRMWARE_MODE_NORMAL,
+                credit_flow: params.credit_flow,
+                supports_shadow_regs: params.supports_shadow_regs,
+                single_pdev_only: true,
+                num_rxdma_per_pdev: 2,
+                max_radios: 3,
+                num_vdevs: 4,
+                svc_to_ce_map: &htc::TARGET_SERVICE_TO_CE_MAP_WLAN_QCA6390,
+                htc_wait_ms: 1000,
+                htc_conn_ms: 1000,
+                service_ready_ms: 5000,
+                wmi_send_ms: 3000,
+            }),
             _ => None,
         }
     }

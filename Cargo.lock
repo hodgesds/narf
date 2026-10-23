@@ -27,6 +27,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -1141,6 +1142,7 @@ dependencies = [
  "rand_chacha",
  "rand_core 0.6.4",
  "sha2",
+ "subtle",
  "xts-mode",
  "zeroize",
 ]

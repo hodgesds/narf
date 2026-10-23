@@ -28,18 +28,21 @@ fn firmware(bytes: usize) -> Firmware {
     Firmware::prepare(&patch, &ram).unwrap()
 }
 fn test_permission() -> crate::mt7921::association::TxPermission {
+    test_permission_for(6)
+}
+fn test_permission_for(channel: u8) -> crate::mt7921::association::TxPermission {
     crate::mt7921::association::TxPermission::from_domain(
         &narf_wireless::reg::RegulatoryDomain {
             country_code: *b"US",
             rules: vec![narf_wireless::reg::RegRule {
-                freq_start_mhz: 2402,
-                freq_end_mhz: 2472,
+                freq_start_mhz: if channel <= 11 { 2402 } else { 5170 },
+                freq_end_mhz: if channel <= 11 { 2472 } else { 5895 },
                 max_bandwidth_mhz: 20,
                 max_power_dbm: 17,
                 flags: narf_wireless::reg::RegFlags::empty(),
             }],
         },
-        6,
+        channel,
     )
     .unwrap()
 }
@@ -71,6 +74,9 @@ struct Model {
     loaded: bool,
     tx_stall: bool,
     management_resume: Option<u64>,
+    management_rates: Vec<u16>,
+    data_protection: Vec<bool>,
+    station_channel: u8,
     rx_stall: bool,
     idle_stall: bool,
     malformed: bool,
@@ -107,6 +113,9 @@ impl Model {
             loaded: false,
             tx_stall: false,
             management_resume: None,
+            management_rates: Vec::new(),
+            data_protection: Vec::new(),
+            station_channel: 6,
             rx_stall: false,
             idle_stall: false,
             malformed: false,
@@ -312,8 +321,14 @@ impl Backend for Model {
     fn wtbl_idle(&mut self) -> Result<bool, Error> {
         Ok(!self.wtbl_stall)
     }
-    fn submit_management(&mut self, frame: &[u8], _wcid: u16) -> Result<(), Error> {
+    fn submit_management(
+        &mut self,
+        frame: &[u8],
+        _wcid: u16,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
         self.check()?;
+        self.management_rates.push(rate.hardware());
         self.frames.push((false, frame.to_vec()));
         if self.psk != [0u8; 32] {
             if let Some(eapol) = super::extract_eapol(frame) {
@@ -377,7 +392,8 @@ impl Backend for Model {
                         let len = m3_packet.len();
                         m3_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
                         m3_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
-                        m3_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+                        m3_packet[12..16]
+                            .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
                         m3_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
                         m3_packet[32..].copy_from_slice(&m3_frame);
                         self.packets.push_back(m3_packet);
@@ -387,9 +403,10 @@ impl Backend for Model {
         }
         Ok(())
     }
-    fn submit_data(&mut self, frame: &[u8], _protected: bool) -> Result<(), Error> {
+    fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
         self.check()?;
         self.frames.push((false, frame.to_vec()));
+        self.data_protection.push(protected);
         Ok(())
     }
     fn management_complete(
@@ -1227,6 +1244,7 @@ fn mcu_live_join_open_dispatches_auth_assoc_and_sta_record() -> TestResult {
         b"narf-join",
         crate::mt7921::association::Security::Open,
         test_permission(),
+        &[],
     ));
     if res != Ok(42) {
         return TestResult::Fail("associate_station failed");
@@ -1311,6 +1329,7 @@ fn mcu_live_join_peer_rejection_and_timeout() -> TestResult {
         b"narf-join",
         crate::mt7921::association::Security::Open,
         test_permission(),
+        &[],
     ));
     if res != Err(Error::MalformedEvent) && !matches!(session.state, State::Failed { .. }) {
         return TestResult::Fail("rejection should fail join");
@@ -1325,7 +1344,7 @@ kernel_test_in!(
     mcu_live_join_peer_rejection_and_timeout
 );
 
-fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> TestResult {
+fn live_join_wpa2(channel: u8, ofdm: bool) -> TestResult {
     let mut model = Model::new();
     let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
     let ap = [2, 1, 2, 3, 4, 5];
@@ -1335,6 +1354,7 @@ fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> T
     model.anonce = anonce;
     model.ap_mac = ap;
     model.own_mac = own;
+    model.station_channel = channel;
 
     let mut session = Session::new(model, firmware(32));
     if run(session.run()).is_err() || run(session.initialize_radio()).is_err() {
@@ -1342,40 +1362,37 @@ fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> T
     }
 
     let rsn = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
-    let mut ies = vec![
-        0,
-        9,
-        b'n',
-        b'a',
-        b'r',
-        b'f',
-        b'-',
-        b'j',
-        b'o',
-        b'i',
-        b'n',
-        1,
-        4,
-        0x82,
-        0x84,
-        0x8b,
-        0x96,
-        3,
-        1,
-        6,
-        48,
-        rsn.len() as u8,
-    ];
+    let mut ies = vec![0, 9, b'n', b'a', b'r', b'f', b'-', b'j', b'o', b'i', b'n'];
+    if ofdm {
+        ies.extend_from_slice(&[1, 3, 0x8c, 0x98, 0xb0]);
+    } else {
+        ies.extend_from_slice(&[1, 4, 0x82, 0x84, 0x8b, 0x96]);
+    }
+    ies.extend_from_slice(&[3, 1, channel, 48, rsn.len() as u8]);
     ies.extend_from_slice(&rsn);
     let bss = ScanBss {
         bssid: ap,
         ssid: b"narf-join".to_vec(),
-        channel: 6,
+        channel,
         signal_dbm: Some(-45),
         capability: 1 | 0x10,
         beacon_interval: 100,
         information_elements: ies,
     };
+
+    // Select the actual observed BSS through the production scan parser.
+    let mut observed = scan_beacon(channel, b"narf-join");
+    observed.truncate(68);
+    observed[66..68].copy_from_slice(&bss.capability.to_le_bytes());
+    observed.extend_from_slice(&bss.information_elements);
+    let length = observed.len();
+    observed[..4].copy_from_slice(&((2u32 << 27) | length as u32).to_le_bytes());
+    session.backend.packets.push_back(observed);
+    let report = match run(session.scan_passive(&[channel])) {
+        Ok(report) if report.bss.len() == 1 => report,
+        _ => return TestResult::Fail("scan before native WPA2 join"),
+    };
+    let bss = &report.bss[0];
 
     // 1. Auth response (status 0)
     let mut auth_resp = vec![0u8; 30];
@@ -1388,7 +1405,7 @@ fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> T
     let len = auth_packet.len();
     auth_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
     auth_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
-    auth_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    auth_packet[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
     auth_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
     auth_packet[32..].copy_from_slice(&auth_resp);
     session.backend.packets.push_back(auth_packet);
@@ -1406,7 +1423,7 @@ fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> T
     let len = assoc_packet.len();
     assoc_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
     assoc_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
-    assoc_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    assoc_packet[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
     assoc_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
     assoc_packet[32..].copy_from_slice(&assoc_resp);
     session.backend.packets.push_back(assoc_packet);
@@ -1426,26 +1443,30 @@ fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> T
     let len = m1_packet.len();
     m1_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
     m1_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
-    m1_packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    m1_packet[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
     m1_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
     m1_packet[32..].copy_from_slice(&m1_frame);
     session.backend.packets.push_back(m1_packet);
 
     let before = session.backend.frames.len();
     let res = run(session.associate_station(
-        &bss,
+        bss,
         b"narf-join",
         crate::mt7921::association::Security::Wpa2Psk { psk },
-        test_permission(),
+        test_permission_for(channel),
+        &[],
     ));
     if res != Ok(42) {
         return TestResult::Fail("associate_station WPA2 failed");
     }
     match session.state {
         State::Associated {
-            peer, channel, aid, ..
+            peer,
+            channel: joined_channel,
+            aid,
+            ..
         } => {
-            if peer != ap || channel != 6 || aid != 42 {
+            if peer != ap || joined_channel != channel || aid != 42 {
                 return TestResult::Fail("associated state mismatch");
             }
         }
@@ -1481,6 +1502,31 @@ fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> T
         return TestResult::Fail("secure STA_REC with key tag 0x12 not emitted");
     }
 
+    let ethernet = [
+        2, 1, 2, 3, 4, 5, 2, 0x11, 0x22, 0x33, 0x44, 0x55, 8, 0, 1, 2, 3,
+    ];
+    if run(session.send_ethernet(&ethernet)).is_err()
+        || session.backend.data_protection.last() != Some(&true)
+    {
+        return TestResult::Fail("joined WPA2 transmit was not protected");
+    }
+    let mut encrypted = ccmp_packet(1, 0, false);
+    encrypted[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
+    session.backend.packets.push_back(encrypted);
+    if !matches!(session.receive_ethernet(), Ok(Some(_))) {
+        return TestResult::Fail("joined WPA2 receive path");
+    }
+    let expected_rate = if ofdm { 75 } else { 0 };
+    if session.backend.management_rates.len() < 4
+        || session
+            .backend
+            .management_rates
+            .iter()
+            .any(|rate| *rate != expected_rate)
+    {
+        return TestResult::Fail("auth/assoc/EAPOL ignored AP basic rate");
+    }
+
     if run(session.disassociate_station()).is_err() {
         return TestResult::Fail("disassociate_station failed");
     }
@@ -1488,8 +1534,35 @@ fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> T
         State::ScanReady(_) => {}
         _ => return TestResult::Fail("session state not ScanReady after disassociate"),
     }
+    if session.backend.management_rates.last() != Some(&expected_rate) {
+        return TestResult::Fail("deauthentication ignored AP basic rate");
+    }
+    if run(session.recover(own)).is_err()
+        || session.security.is_some()
+        || !matches!(session.state, State::RadioReady(_))
+    {
+        return TestResult::Fail("dual-band reset retained association/keys");
+    }
     TestResult::Pass
 }
+fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> TestResult {
+    live_join_wpa2(6, false)
+}
+fn mt76_ofdm_only_24ghz_runs_scan_rsna_packets_disconnect_and_reset() -> TestResult {
+    live_join_wpa2(6, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join",
+    mt76_ofdm_only_24ghz_runs_scan_rsna_packets_disconnect_and_reset
+);
+fn mt76_5ghz_runs_scan_rsna_packets_disconnect_and_reset() -> TestResult {
+    live_join_wpa2(36, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join",
+    mt76_5ghz_runs_scan_rsna_packets_disconnect_and_reset
+);
+
 kernel_test_in!(
     "drivers/wireless/mt7921/join",
     mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record
@@ -1582,6 +1655,7 @@ fn native_data_packet(qos: bool) -> Vec<u8> {
     frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00, 1, 2, 3]);
     let mut packet = vec![0u8; 24];
     packet[..4].copy_from_slice(&((2u32 << 27) | (24 + frame.len()) as u32).to_le_bytes());
+    packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
     packet.extend_from_slice(&frame);
     packet
 }
@@ -1694,6 +1768,7 @@ kernel_test_in!(
 fn descriptor(frame: &[u8]) -> Vec<u8> {
     let mut packet = vec![0; 24];
     packet[..4].copy_from_slice(&((2u32 << 27) | (24 + frame.len()) as u32).to_le_bytes());
+    packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
     packet.extend_from_slice(frame);
     packet
 }
@@ -1710,14 +1785,14 @@ fn mt76_eapol_rx_requires_native_peer_and_declared_pdu() -> TestResult {
     let pdu = key.into_eapol();
     let frame = ap_eapol_frame(own, ap, &pdu);
     let valid = descriptor(&frame);
-    if join::peer_eapol(&valid, own, ap) != Some(&pdu[..]) {
+    if join::peer_eapol(&valid, own, ap, 6) != Some(&pdu[..]) {
         return TestResult::Fail("native authenticator EAPOL rejected");
     }
     let mut padded = valid.clone();
     padded.extend_from_slice(&[0x55; 16]);
     let len = padded.len() as u32;
     padded[..4].copy_from_slice(&((2u32 << 27) | len).to_le_bytes());
-    if join::peer_eapol(&padded, own, ap) != Some(&pdu[..]) {
+    if join::peer_eapol(&padded, own, ap, 6) != Some(&pdu[..]) {
         return TestResult::Fail("EAPOL link padding entered the MIC/length extent");
     }
     for (offset, value) in [
@@ -1737,12 +1812,12 @@ fn mt76_eapol_rx_requires_native_peer_and_declared_pdu() -> TestResult {
     ] {
         let mut bad = valid.clone();
         bad[offset] = value;
-        if join::peer_eapol(&bad, own, ap).is_some() {
+        if join::peer_eapol(&bad, own, ap, 6).is_some() {
             return TestResult::Fail("wrong peer/layout/descriptor/length accepted as EAPOL");
         }
     }
     for end in 0..valid.len() {
-        if join::peer_eapol(&valid[..end], own, ap).is_some() {
+        if join::peer_eapol(&valid[..end], own, ap, 6).is_some() {
             return TestResult::Fail("truncated EAPOL hardware packet accepted");
         }
     }
@@ -1751,7 +1826,7 @@ fn mt76_eapol_rx_requires_native_peer_and_declared_pdu() -> TestResult {
     ethernet[6..12].copy_from_slice(&ap);
     ethernet[12..14].copy_from_slice(&[0x88, 0x8e]);
     ethernet.extend_from_slice(&pdu);
-    if join::peer_eapol(&ethernet, own, ap).is_some() || extract_eapol(&ethernet).is_some() {
+    if join::peer_eapol(&ethernet, own, ap, 6).is_some() || extract_eapol(&ethernet).is_some() {
         return TestResult::Fail("Ethernet fallback bypassed native peer validation");
     }
     TestResult::Pass
@@ -1833,6 +1908,7 @@ fn ccmp_packet(pn: u64, key: u8, multicast: bool) -> Vec<u8> {
     packet[4..8]
         .copy_from_slice(&((4u32 << 16) | (1 << 11) | (u32::from(key) << 21)).to_le_bytes());
     packet[24..30].copy_from_slice(&pn.to_le_bytes()[..6]);
+    packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
     packet.extend_from_slice(&frame);
     packet
 }
@@ -1940,7 +2016,7 @@ fn mt76_tx_policy_requires_full_channel_and_keeps_open_tx_unprotected() -> TestR
         rules: vec![rule],
     };
     let permit = TxPermission::from_domain(&domain, 6).unwrap();
-    let body = permit.rate_limits(6);
+    let body = permit.rate_limits();
     if body.len() != 206
         || body[..12] != [0, 0, 0, 0, 1, 1, 1, 0, b'U', b'S', 0, 0]
         || body[44] != 6
@@ -2091,7 +2167,14 @@ fn mt76_native_eapol_txd_sets_data_type_in_both_hardware_fields() -> TestResult 
     native[..2].copy_from_slice(&[8, 1]);
     native[4..10].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
     native[24..32].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
-    let txd = crate::mt7921::packet_tx::management(&native, 0x1000, 1, 1).unwrap();
+    let txd = crate::mt7921::packet_tx::management(
+        &native,
+        0x1000,
+        1,
+        1,
+        crate::mt7921::association::LegacyRate::ONE_MBPS,
+    )
+    .unwrap();
     let word2 = u32::from_le_bytes(txd[8..12].try_into().unwrap());
     let word7 = u32::from_le_bytes(txd[28..32].try_into().unwrap());
     if word2 & 0x30 != 0x20 || word7 & 0x30_0000 != 0x20_0000 {
@@ -2099,7 +2182,14 @@ fn mt76_native_eapol_txd_sets_data_type_in_both_hardware_fields() -> TestResult 
     }
     native[0] = 0xb0;
     native[1] = 0;
-    let txd = crate::mt7921::packet_tx::management(&native, 0x1000, 1, 1).unwrap();
+    let txd = crate::mt7921::packet_tx::management(
+        &native,
+        0x1000,
+        1,
+        1,
+        crate::mt7921::association::LegacyRate::ONE_MBPS,
+    )
+    .unwrap();
     if u32::from_le_bytes(txd[8..12].try_into().unwrap()) & 0x3f != 11 {
         return TestResult::Fail("management type/subtype changed by EAPOL correction");
     }
@@ -2289,4 +2379,115 @@ fn mt76_unregistered_boot_failure_can_recover_before_mac_discovery() -> TestResu
 kernel_test_in!(
     "drivers/wireless/mt7921/recovery",
     mt76_unregistered_boot_failure_can_recover_before_mac_discovery
+);
+
+fn mt76_dual_band_scan_encodes_extension_and_rejects_6ghz_aliases() -> TestResult {
+    let channels = crate::mt7921::channel::channels(3);
+    let body = scan::scan_request(1, &channels).unwrap();
+    if channels.len() != 39 || body[159] != 32 || body[826] != 7 || body[1110..1116] != [255; 6] {
+        return TestResult::Fail("dual-band scan extension counts/offsets");
+    }
+    for (i, channel) in channels.iter().enumerate() {
+        let offset = if i < 32 {
+            160 + 2 * i
+        } else {
+            830 + 2 * (i - 32)
+        };
+        if body[offset..offset + 2] != [if *channel <= 11 { 1 } else { 2 }, *channel] {
+            return TestResult::Fail("dual-band scan extension contents");
+        }
+        if scan::beacon(&scan_beacon(*channel, b"narf"), 2).map(|bss| bss.channel) != Some(*channel)
+        {
+            return TestResult::Fail("supported channel beacon rejected");
+        }
+    }
+    for channel in [6, 36] {
+        let mut packet = scan_beacon(channel, b"narf");
+        packet[14] |= 1; // RXD3 CH_FREQ bit8: 6 GHz, never a 2.4/5 GHz alias.
+        if scan::beacon(&packet, 2).is_some() {
+            return TestResult::Fail("6 GHz RX channel truncated to legacy channel");
+        }
+    }
+    let permit = test_permission_for(36);
+    let power = permit.rate_limits();
+    if !permit.permits(36) || permit.permits(6) || power[4..7] != [1, 2, 1] || power[44] != 36 {
+        return TestResult::Fail("5 GHz power permission/band geometry");
+    }
+    let dfs = narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![narf_wireless::reg::RegRule {
+            freq_start_mhz: 5250,
+            freq_end_mhz: 5330,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 17,
+            flags: narf_wireless::reg::RegFlags::DFS,
+        }],
+    };
+    if crate::mt7921::association::TxPermission::from_domain(&dfs, 52).is_some() {
+        return TestResult::Fail("DFS transmission admitted without CAC/radar runtime");
+    }
+    let mut session = Session::new(Model::new(), firmware(32));
+    run(session.run()).unwrap();
+    run(session.initialize_radio()).unwrap();
+    let State::RadioReady(mut info) = session.state else {
+        return TestResult::Fail("radio init");
+    };
+    info.capabilities.phy.bands = 1;
+    session.state = State::RadioReady(info);
+    let before = session.backend.frames.len();
+    if !matches!(
+        run(session.scan_passive(&[36])),
+        Err(Error::InvalidIdentity)
+    ) || session.backend.frames.len() != before
+    {
+        return TestResult::Fail("firmware-unsupported band published scan commands");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/scan",
+    mt76_dual_band_scan_encodes_extension_and_rejects_6ghz_aliases
+);
+
+fn mt76_native_rx_binds_channel_before_eapol_and_replay() -> TestResult {
+    for channel in [6u8, 36] {
+        let mut session = secure_model();
+        if let State::Associated {
+            channel: current, ..
+        } = &mut session.state
+        {
+            *current = channel;
+        }
+        for frequency in [
+            if channel == 6 { 36u16 } else { 6 },
+            0x100 | u16::from(channel),
+            0,
+        ] {
+            let mut invalid = ccmp_packet(100, 0, false);
+            invalid[12..16].copy_from_slice(&(u32::from(frequency) << 8).to_le_bytes());
+            session.backend.packets.push_back(invalid);
+        }
+        let mut good = ccmp_packet(1, 0, false);
+        good[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
+        session.backend.packets.push_back(good);
+        if !matches!(session.receive_ethernet(), Ok(Some(_))) || !session.backend.packets.is_empty()
+        {
+            return TestResult::Fail("off-channel RX accepted or consumed current PN");
+        }
+        let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let peer = [2, 1, 2, 3, 4, 5];
+        let pdu = narf_wireless::eapol::KeyFrame::empty(16).into_eapol();
+        let mut eapol = descriptor(&ap_eapol_frame(own, peer, &pdu));
+        eapol[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
+        if join::peer_eapol(&eapol, own, peer, channel) != Some(pdu.as_slice())
+            || join::peer_eapol(&eapol, own, peer, if channel == 6 { 36 } else { 6 }).is_some()
+        {
+            return TestResult::Fail("EAPOL channel binding");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport",
+    mt76_native_rx_binds_channel_before_eapol_and_replay
 );

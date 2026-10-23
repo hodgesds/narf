@@ -36,6 +36,7 @@
 
 pub mod association;
 pub mod bringup;
+pub(crate) mod channel;
 pub mod cmd;
 pub mod dma;
 pub mod firmware_transport;

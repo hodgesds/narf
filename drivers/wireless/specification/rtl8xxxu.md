@@ -1,6 +1,6 @@
 # rtl8xxxu — Specification
 
-> Status: runtime RTL8188EU factory/FIFO/firmware/MAC/BB/RF tables implemented;
+> Status: runtime RTL8188EU factory/FIFO/firmware/MAC/BB/RF + LC/IQK implemented;
 > full station software and physical acceptance remain incomplete.
 
 ## 1. Purpose & scope
@@ -20,14 +20,17 @@ MAC TX/RX stays closed. A usable station requires the remaining software below.
 `rtl8xxxu_probe` retains the handle and `firmware_transport::Owner<UsbControl>`.
 For RTL8188EU it spawns `initialize_registered()` after releasing the device
 registry lock. That production path now continues through factory identity,
-FIFO/queue boundaries, firmware and MAC/BB/AGC/RF table setup. Duplicate
+FIFO/queue boundaries, firmware, MAC/BB/AGC/RF tables and checked post-table
+MAC/LC/IQK initialization. Duplicate
 registration compares the retained Arc identity, instead of conflating equal slot numbers on different USB controllers.
 
 `Owner::status()` reports detected, validated, factory-ready, powered,
-downloading, firmware-ready, initializing-tables, tables-ready or terminal
-failed state. `Owner::factory()` returns the checked RTL8188EU factory identity
+downloading, firmware-ready, initializing-tables, tables-ready, calibrating,
+radio-ready or terminal failed state. Radio-ready means checked initialization
+with MAC TX/RX still closed. `Owner::calibration()` exposes the selected full
+TX/RX IQ coefficients only after successful completion. `Owner::factory()` returns the checked RTL8188EU factory identity
 and calibration snapshot. `initialize_device(blob)` runs the production
-factory/FIFO/firmware/table sequence for authenticated-byte owners/tests.
+factory/FIFO/firmware/table/calibration sequence for authenticated-byte owners/tests.
 The firmware-only `initialize(blob)` remains a diagnostic entry point.
 A second attempt returns `AlreadyStarted` without I/O. Dropping an
 active attempt records `Cancelled`; it cannot silently replay. Deadline,
@@ -54,7 +57,30 @@ unicast MAC at `0xd7`, and retain CCK/HT40 power bases, crystal, thermal and
 board fields. All table writes check exact transfer counts, RF addresses keep
 all eight bits, and Linux RF delay markers are delays. LLT installs the
 176-entry split with TX end 169 and a 170–175 ring after FIFO boundaries.
-MAC TX/RX remain closed: tables-ready is not IQK/LC, regulatory or packet ready.
+The post-table sequence programs RX/report geometry, filters, EDCA, beacon
+parameters, initial factory gain indices and the hardware security gate. It
+awaits CAM invalidation, performs RF HSSI reads with complete eight-bit
+addresses and PI/SI readback selection, runs LC preserving prior continuous-
+TX/pause state, then performs up to three full TX/RX IQK attempts with two
+retries per path. It restores saved ADDA/BB/MAC registers after completed
+attempts and accepts a full stable coefficient set; partial/fallback IQK is
+rejected. Signed IQ matrix, thermal meter and NAV setup finish initialization.
+Erased/out-of-range factory gain indices fail before gains are programmed.
+MAC TX/RX remain closed: radio-ready is not regulatory, scan or packet ready.
+
+`ccmp_runtime::Key` is the software CCMP dependency for the pending station
+runtime. `Role::Pairwise` admits KeyID0; `Role::Group` admits IDs0–3 but is
+receive-only. TX requires ToDS, peer RA/local TA; RX requires FromDS, peer TA,
+a unicast source and local RA for PTK or multicast RA for GTK. Only Data/QoS
+Data with exact native header extents is admitted; fragments/A-MSDU fail.
+CCMP reserved bits, ExtIV, key ID and the 4096-byte body bound are checked
+before crypto. Each key owns 16 QoS plus a separate non-QoS replay tracker;
+MIC failure leaves ciphertext and all trackers unchanged. TX consumes a
+non-wrapping 48-bit PN before USB ownership, and same-key `reinstall` preserves
+TX/RX counters. Keys and temporary encryption storage zeroize on drop. A
+fresh-key constructor must not replace an identical live/retired key; station
+integration retains key slots across EAPOL retries. This dependency does not
+publish a station, install RSNA keys or open the controlled port.
 
 Legacy synchronous stripped-payload loading returns `UseAsyncOwner`; the old
 unverified all-radio helper returns `NotImplemented` before transport access.
@@ -72,7 +98,7 @@ unverified all-radio helper returns `NotImplemented` before transport access.
 - The initialization attempt is bounded to 30 seconds. Cancellation/deadline
   leaves a poisoned owner without further transport access. No IRQ-disabling
   guard crosses an await and no `block_on` executes inside a spawned worker.
-- Firmware-ready does not imply RF calibration, association or packet TX.
+- Neither firmware-ready nor radio-ready implies association or packet TX.
 
 ## 5. Architecture notes
 
@@ -87,7 +113,7 @@ registry blobs; scheduler/time provide async execution and bounded waits.
 ## 7. Stage assignment
 
 RTL8188EU now reaches a software-tested factory/firmware/register-table
-diagnostic through the production probe. It is not ready for full station physical acceptance.
+diagnostic with checked LC/IQK through the production probe. It is not ready for full station physical acceptance.
 
 ## 8. Open questions / remaining software
 
@@ -98,12 +124,16 @@ diagnostic through the production probe. It is not ready for full station physic
 | EFUSE identity/calibration read through retained async owner | Implemented; chip/geometry/failure coverage |
 | Endpoint-descriptor selection and MAC FIFO/LLT | Implemented; activation/RX filters remain open |
 | MAC/BB/AGC/RF table application | Implemented with source-matched tables and checked transfers |
-| Verified IQK/LC/calibration, channel/power and RX activation | Missing |
+| Checked post-table MAC, CAM-clear, LC/full IQK and factory gain indices | Implemented; composed owner/status/error/cancellation regressions |
+| Policy-admitted channel/power and RX activation | Missing; factory gain indices are not dBm policy |
 | Management TX/RX, passive scan and real station MLME | Missing |
+| Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Missing |
 | Regulatory channel/power, rates, coexistence | Missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Disconnect callbacks, endpoint stop/drain, reset/PM recovery | Missing; software prerequisites |
 
-Linux references: `rtl8xxxu/8188e.c` power/reset functions and fops;
-`rtl8xxxu/core.c` firmware parsing, `writeN`, download and start functions.
+Linux references: `rtl8xxxu/8188e.c` power/reset, IQK and fops;
+`rtl8xxxu/core.c` firmware, post-table init, HSSI, LC and IQ matrix functions;
+`rtl8xxxu/8188f.c` factory gain-index programming; `net/mac80211/wpa.c` CCMP
+AAD/header/nonce layout. AES-CCM formatting follows RFC 3610.
