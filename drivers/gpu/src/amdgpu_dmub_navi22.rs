@@ -446,7 +446,9 @@ impl<I: Io> Engine<I> {
                     use core::fmt::Write;
                     let _ = writeln!(
                         narf_console::Writer,
-                        "amdgpu: DMCUB CW{index} invalid: base {base:#x}, top {top:#x}, physical {start:#x}, GPU {gpu_start:#x}..{gpu_end:#x}"
+                        "amdgpu: DMCUB CW{index} invalid: base {base:#x}, top {top:#x}, physical {start:#x}, GPU {gpu_start:#x}..{gpu_end:#x}; PSP image {:#x?}, inherited {:?}",
+                        memory.reported.as_ref().map(|(range, _)| range),
+                        memory.inherited,
                     );
                     return Err(Error::Invalid);
                 }

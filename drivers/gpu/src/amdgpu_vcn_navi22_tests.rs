@@ -90,6 +90,7 @@ struct Model {
     stalled: [bool; 7],
     drop_fences: bool,
     gone: bool,
+    gone_on_vcpu: bool,
     work: Vec<Work>,
     traps: u32,
     rptr: [u32; 7],
@@ -135,6 +136,7 @@ impl Model {
             stalled: [false; 7],
             drop_fences: false,
             gone: false,
+            gone_on_vcpu: false,
             work: Vec::new(),
             traps: 0,
             rptr: [0; 7],
@@ -367,6 +369,9 @@ impl Model {
 }
 impl Io for Model {
     fn read(&mut self, address: u64) -> u32 {
+        if self.gone_on_vcpu && (0..2).any(|i| address == v(i, VCPU_CNTL)) {
+            self.gone = true;
+        }
         if self.gone {
             return u32::MAX;
         }
@@ -529,6 +534,79 @@ fn vcn_navi22_powers_tiles_before_reading_vcpu_status() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi22",
     vcn_navi22_powers_tiles_before_reading_vcpu_status
+);
+
+fn vcn_navi22_all_ones_vcpu_control_preserves_linux_masked_updates() -> TestResult {
+    let mut model = Model::new();
+    for i in [0, 1] {
+        model.regs.insert(v(i, VCPU_CNTL), u32::MAX);
+    }
+    let (_pool, mut e) = engine(model, 3);
+    if run(e.start(firmware(3), None)).is_err() || e.state != State::Running {
+        return TestResult::Fail("all-ones VCPU control rejected on a live GPU");
+    }
+    for i in [0, 1] {
+        let writes: Vec<_> =
+            e.hw.io
+                .writes
+                .iter()
+                .filter(|&&(a, _)| a == v(i, VCPU_CNTL))
+                .collect();
+        // WREG32_P(VCPU_CNTL, CLK_EN, ~CLK_EN), then clear BLK_RST.
+        if writes.len() != 2
+            || writes[0].1 != u32::MAX
+            || writes[1].1 != u32::MAX & !VCPU_BLK_RST
+            || e.proof.booted[i] != 1
+            || !e.proof.dec_ring[i]
+            || !e.proof.enc_ring[i].iter().all(|tested| *tested)
+        {
+            return TestResult::Fail(
+                "VCPU masked writes changed unrelated bits or skipped ring tests",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_all_ones_vcpu_control_preserves_linux_masked_updates
+);
+
+fn vcn_navi22_all_ones_vcpu_control_checks_independent_device_presence() -> TestResult {
+    let mut model = Model::new();
+    model.gone_on_vcpu = true;
+    let (_pool, mut e) = engine(model, 1);
+    if run(e.start(firmware(1), None)) != Err(Error::DeviceGone)
+        || e.state != State::Failed
+        || e.hw.io.writes.iter().any(|&(a, _)| a == v(0, VCPU_CNTL))
+    {
+        return TestResult::Fail(
+            "VCPU control written after independent banks reported device loss",
+        );
+    }
+    // A live GC bank alone is insufficient when NBIO is absent or closed.
+    for aperture in [0, u32::MAX] {
+        let mut model = Model::new();
+        model.regs.insert(v(0, VCPU_CNTL), u32::MAX);
+        model
+            .regs
+            .insert(layout(1).nbio(NBIO_DOORBELL_APER_EN), aperture);
+        let want = if aperture == 0 {
+            Error::Invalid
+        } else {
+            Error::DeviceGone
+        };
+        if update_vcpu(&mut model, layout(1), 0, VCPU_CLK_EN, VCPU_CLK_EN) != Err(want)
+            || !model.writes.is_empty()
+        {
+            return TestResult::Fail("VCPU control written without a live NBIO aperture");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_all_ones_vcpu_control_checks_independent_device_presence
 );
 
 fn vcn_navi22_resolves_both_discovered_instances() -> TestResult {

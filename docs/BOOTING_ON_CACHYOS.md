@@ -272,6 +272,26 @@ notification and userdb credential loading running, with `sysinit.target`,
 Btrfs as the cause of the later userspace wait; no graphical-login success
 has been recorded.
 
+The next capture (`plasma-8aeb8863-b279-479e-b112-feca3ff5cc50`) confirms
+that the new diagnostic kernel ran but still stopped at 26/28 checkpoints.
+DMCUB CW0 read as entirely zero. VCN's first all-ones read was at BAR5 byte
+offset `0x1fd58`: discovery base `0x7e00` plus `UVD_VCPU_CNTL` dword `0x156`,
+not UVD_STATUS. Linux uses a masked read/modify/write for this control word
+without rejecting that value. NARF now preserves the unselected bits and
+checks independent GC/NBIO presence before accepting an all-ones VCPU control
+read; status and wait registers still reject all ones. Regression cases cover
+both control updates on a live GPU and disappearance before the write.
+This correction still requires hardware validation. The DMCUB zero-window
+failure remains unresolved; its diagnostic now includes the PSP image extent
+and inherited secure reservations, without changing secure window registers.
+
+That capture also shows journal flush completing around uptime 62.7 s,
+system tmpfiles completing around 69.5 s, and the journal catalog completing
+around 75 s. The linker-cache rebuild was still running at the end of the
+readable kernel capture; it contains no PlasmaLogin start. The earlier
+journal/userdb/Plymouth snapshot therefore does not establish a permanent
+sysinit deadlock.
+
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 
 ```sh

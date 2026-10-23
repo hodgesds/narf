@@ -531,6 +531,27 @@ fn update<I: Io>(io: &mut I, address: u64, mask: u32, value: u32) -> Result<(), 
     io.write(address, (old & !mask) | (value & mask));
     Ok(())
 }
+/// Linux uses WREG32_P for VCPU_CNTL, preserving all unselected bits even
+/// when the register reads all ones. That control word alone cannot prove
+/// removal: verify the independent GC/NBIO banks before accepting it.
+fn update_vcpu<I: Io>(
+    io: &mut I,
+    layout: Layout,
+    instance: usize,
+    mask: u32,
+    value: u32,
+) -> Result<(), Error> {
+    let address = layout.reg(instance, VCPU_CNTL);
+    let old = io.read(address);
+    if old == u32::MAX {
+        checked(io.read(layout.gc + u64::from(GB_ADDR_CONFIG) * 4))?;
+        if checked(io.read(layout.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
+            return Err(Error::Invalid);
+        }
+    }
+    io.write(address, (old & !mask) | (value & mask));
+    Ok(())
+}
 async fn delay(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
 }
@@ -1055,7 +1076,7 @@ impl<I: Io> Engine<I> {
             )?;
             update(io, r(l, SUVD_CGC_CTRL), SUVD_CGC_CTRL_MODES, 0)?;
             // enable VCPU clock, disable master interrupt, LMI channels on
-            update(io, r(l, VCPU_CNTL), VCPU_CLK_EN, VCPU_CLK_EN)?;
+            update_vcpu(io, l, i, VCPU_CLK_EN, VCPU_CLK_EN)?;
             update(io, r(l, MASTINT_EN), MASTINT_VCPU_EN, 0)?;
             update(io, r(l, LMI_CTRL2), LMI_CTRL2_STALL_ARB_UMC, 0)?;
             update(io, r(l, SOFT_RESET), SOFT_RESET_LMI | SOFT_RESET_LMI_UMC, 0)?;
@@ -1097,7 +1118,7 @@ impl<I: Io> Engine<I> {
             io.write(r(l, GFX10_ADDR_CONFIG), gb_addr_config);
             // unblock VCPU register access, release VCPU reset to boot
             update(io, r(l, RB_ARB_CTRL), RB_ARB_VCPU_DIS, 0)?;
-            update(io, r(l, VCPU_CNTL), VCPU_BLK_RST, 0)?;
+            update_vcpu(io, l, i, VCPU_BLK_RST, 0)?;
             Ok(())
         })?;
         let attempt = self.boot_vcpu(i).await?;
@@ -1117,10 +1138,10 @@ impl<I: Io> Engine<I> {
             }
             // "decode not responding, trying to reset the VCPU"
             self.hw
-                .access(|io, l| update(io, l.reg(i, VCPU_CNTL), VCPU_BLK_RST, VCPU_BLK_RST))?;
+                .access(|io, l| update_vcpu(io, l, i, VCPU_BLK_RST, VCPU_BLK_RST))?;
             delay(t.reset_us).await;
             self.hw
-                .access(|io, l| update(io, l.reg(i, VCPU_CNTL), VCPU_BLK_RST, 0))?;
+                .access(|io, l| update_vcpu(io, l, i, VCPU_BLK_RST, 0))?;
             delay(t.reset_us).await;
         }
         Err(Error::BootFailed(i as u8))
@@ -1384,8 +1405,8 @@ impl<I: Io> Engine<I> {
             self.hw.access(|io, l| {
                 let r = |x: Reg| reg(l, x);
                 update(io, r(RB_ARB_CTRL), RB_ARB_VCPU_DIS, RB_ARB_VCPU_DIS)?;
-                update(io, r(VCPU_CNTL), VCPU_BLK_RST, VCPU_BLK_RST)?;
-                update(io, r(VCPU_CNTL), VCPU_CLK_EN, 0)?;
+                update_vcpu(io, l, i, VCPU_BLK_RST, VCPU_BLK_RST)?;
+                update_vcpu(io, l, i, VCPU_CLK_EN, 0)?;
                 update(io, r(SOFT_RESET), SOFT_RESET_LMI_UMC, SOFT_RESET_LMI_UMC)?;
                 update(io, r(SOFT_RESET), SOFT_RESET_LMI, SOFT_RESET_LMI)?;
                 io.write(r(STATUS), 0);

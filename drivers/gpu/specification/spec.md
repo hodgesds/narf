@@ -6790,6 +6790,11 @@ range and runs `vcn_v3_0_start`'s static path with power gating disabled
 MGCG-style clock-gating disable, PSP-TMR cache window 0, VCPU boot with Linux's
 10-reset retry loop (100 × 10 ms samples each), decode RBC and both encode
 rings, then the SCRATCH9 decode and VCN_ENC_CMD_END encode ring tests.
+VCPU_CNTL masked writes preserve the original unselected bits, including an
+all-ones control word, as Linux's WREG32_P does. Before accepting that value,
+the owner checks independent GC and NBIO reads and requires the NBIO doorbell
+aperture to remain enabled; loss refuses the write. Status and wait-register
+all-ones reads still fail rather than proving readiness.
 `unsafe start_jpeg()` honours CC_UVD_HARVESTING, powers UVDJ on and runs
 `jpeg_v3_0_start` plus the JPEG pitch ring test. `test_ib()` runs the decoder
 create/destroy message pair and the encoder session initialize/close pair on
