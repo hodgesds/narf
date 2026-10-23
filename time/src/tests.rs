@@ -141,6 +141,38 @@ fn smoke_clock_ns_to_cycles_fixed_point_accuracy() -> TestResult {
 }
 kernel_test_in!("time", smoke_clock_ns_to_cycles_fixed_point_accuracy);
 
+/// An arch frequency cache may already exist before wall conversions are
+/// installed. Returning Cached must still make Deadline use that frequency.
+#[cfg(target_arch = "x86_64")]
+fn smoke_cached_calibration_installs_wall_scales() -> TestResult {
+    let hz = narf_arch::x86_64::tsc::frequency_hz();
+    if hz == 0 {
+        return TestResult::Skip("TSC not calibrated");
+    }
+    let (result, source, cycles, ns) = narf_lib::sync::without_interrupts(|| {
+        crate::set_clock_hz(1_000_000_000); // the pre-calibration identity scale
+        let (result, source) = crate::calibrate_clocks_with_source();
+        let cycles = crate::ns_to_cycles(1_000_000);
+        let ns = crate::cycles_to_ns(hz);
+        // Restore even when testing the old implementation, before assertions.
+        crate::set_clock_hz(hz);
+        (result, source, cycles, ns)
+    });
+    if result != hz || source != crate::CalibrationSource::Cached {
+        return TestResult::Fail("cached TSC frequency not reused");
+    }
+    if cycles.abs_diff(hz / 1000) > (hz / 1_000_000_000).max(1) || ns.abs_diff(1_000_000_000) > 1000
+    {
+        return TestResult::Fail("cached calibration left wall conversions uncalibrated");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "time/calibration",
+    smoke_cached_calibration_installs_wall_scales
+);
+
 // ── RTC backstops (CMOS / PL031 / Qualcomm PMIC) ──────────────────
 
 fn smoke_rtc_cmos_bcd_to_bin_and_back() -> TestResult {

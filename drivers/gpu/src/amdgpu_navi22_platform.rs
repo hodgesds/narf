@@ -9,6 +9,7 @@ use narf_lib::mutex::Mutex;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Busy,
+    Clock,
     Authority,
     InvalidFramebuffer,
     Firmware(boot::Error),
@@ -132,6 +133,12 @@ fn training_clients(protected: &[vram::Protected]) -> Result<(), Error> {
 pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Error> {
     if !amdgpu::is_navi22() {
         return Ok(None);
+    }
+    // No hardware writes or retained ownership before the timing preflight.
+    // Firmware delays must use wall time even though the BSP's timer IRQ
+    // setup runs after this Late initcall.
+    if !amdgpu::boot_clock_ready() {
+        return Err(Error::Clock);
     }
     let mut owner = OWNER.try_lock().ok_or(Error::Busy)?;
     if owner.is_some() {

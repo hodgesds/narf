@@ -4487,6 +4487,9 @@ single-CPU boot handoff. It prepares immutable firmware, inventories VRAM and
 refuses training over live firmware in the overwritten prefix, then claims
 exclusive controller access and retains `ColdBoot` in an async mutex. Errors
 before the claim perform no hardware writes and release all reservations.
+On x86_64, the preflight first establishes the calibrated TSC duration scale;
+`Error::Clock` refuses preparation before GPU ownership or device writes if
+no source is available. Frame's later timer-IRQ setup is not a prerequisite.
 Preparation now selects unified MES and retains the matching PCI function.
 After the DMA proof, startup maps BAR2 as Device memory (failing instead of
 falling back to an unmapped physical address), starts MES12 and records its
@@ -6728,6 +6731,11 @@ common→gmc→ih→gfx→sdma, reverse to ungate, GC under RLC safe mode),
 smu_cmn_feature_update_enable_state with running-set and protection checks),
 the initial `DisallowGfxOff`, and UCLK/FCLK hard minimums at the admitted
 floors (`ClockManager::hard_min`). It then starts the GFXOFF controller.
+An all-ones gating read logs its discovery block, BAR5 byte address and the
+number of register writes by that gating owner before returning `DeviceGone`.
+The gating owner remains terminal `Failed`: earlier IP blocks may already be
+programmed, and no successful rollback is implied. Failure returns before
+subsequent SMU feature enables, floor reductions or GFXOFF startup.
 `apply` may run again after `remove` (`replace_power_saving`), reusing the
 published PMFW watermark table and the gating owner; a set that is still
 applied refuses `Busy`.
@@ -7708,6 +7716,10 @@ it; a failure only logs, and faults then stay masked (default-page redirect).
 `amdgpu_navi22_platform::prepare(physical_boot_framebuffer)` is an unsafe,
 single-CPU boot-only entry. It requires a posted physical GPU, permanent probe
 mappings, no NARF VRAM allocations/queues, and stopped CPU framebuffer writers.
+On x86_64 it calibrates the TSC duration scale before preparing or claiming the
+GPU, and returns `Error::Clock` without device writes when no source is
+available. This initcall precedes frame's normal HPET/timer-IRQ setup; firmware
+minimum delays and deadlines must not use the uncalibrated identity scale.
 It reads the PCI board identity and validates every required firmware file and
 the prepared board PowerPlay table before reading the live VRAM plan,
 constructs the exclusive pool and optional training owner, and retains the

@@ -293,6 +293,7 @@ pub(crate) trait Io {
 #[derive(Debug)]
 struct Mmio {
     regs: MmioRegion,
+    writes: u64,
     gc0: u64,
     gc1: u64,
     gc2: Option<u64>,
@@ -319,11 +320,22 @@ impl Mmio {
 }
 impl Io for Mmio {
     fn read(&mut self, reg: Reg) -> u32 {
+        let offset = self.at(reg);
         // SAFETY: every bank was bounded through the highest register this
         // module names on it at construction; every caller passes a constant.
-        unsafe { self.regs.read32(self.at(reg)) }
+        let value = unsafe { self.regs.read32(offset) };
+        if value == u32::MAX {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 gating {reg:?} BAR5+{offset:#x} returned all ones after {} register writes",
+                self.writes
+            );
+        }
+        value
     }
     fn write(&mut self, reg: Reg, value: u32) {
+        self.writes = self.writes.saturating_add(1);
         // SAFETY: same bounds; the owner's contract excludes other writers of
         // these clock-gating registers.
         unsafe { self.regs.write32(self.at(reg), value) }
@@ -884,6 +896,7 @@ impl Gating {
         )?;
         let io = Mmio {
             regs: gpu.regs,
+            writes: 0,
             gc0: bank(discovery::HW_ID_GC, &[profile.gc_version], 0, GC0_LAST)?,
             gc1: bank(discovery::HW_ID_GC, &[profile.gc_version], 1, GC1_LAST)?,
             gc2: layout.sdma_high,

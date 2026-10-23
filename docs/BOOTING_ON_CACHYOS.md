@@ -352,6 +352,32 @@ board bounds before writes, stream counts, interrupted runtime operations and
 HDMI audio clock selection. Hardware acceptance of these requests, native
 modesetting and the KDE login remain unverified by this source audit.
 
+The discrete GPU handoff also establishes the x86_64 TSC duration scale before
+firmware startup. Its Late initcall precedes the normal HPET/timer-IRQ setup;
+using the identity scale there shortens hardware waits and inflates reported
+milliseconds on a >1 GHz TSC. A missing calibration source now refuses the
+handoff with `Clock` before GPU writes. For older captures, retain the raw
+`cyc` total and the later calibrated Hz when interpreting elapsed time: the
+79,755,617,363-cycle RX 6750 XT capture at 4.7 GHz represents about 17 seconds,
+although its pre-calibration warning says 79,755 ms. That capture continued
+into systemd but does not establish a working physical display or KDE login.
+
+The modeset-to-power-saving audit checks the RX 6750 XT's live Linux discovery
+bases against the HDP, MMHUB, ATHUB, OSSSYS, SMUIO and GC addressing, and the
+register fields against Linux's headers. Its sequence follows Linux's IP order
+(common, GMC, IH, GFX, SDMA), with RLC safe mode around GC gating. The native
+modeset's one-frame settling delay and two-frame underflow watch also require
+the calibrated scale; the old waits ended within a fraction of one frame on
+this host. An immediate SCDC read is diagnostic, not proof of a physical image.
+
+A gating failure can leave earlier IP writes applied; the owner then refuses
+further gating transitions. It returns before the subsequent GFXOFF/deep-sleep
+feature enables and memory/fabric floor reductions. The new all-ones diagnostic
+includes the BAR5 address and preceding register-write count, distinguishing
+failure before any gating writes from a partial transition. The older
+`Gating(DeviceGone)` capture lacks that information, so its exact failure and
+the physical black screen remain unresolved by this source audit.
+
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 
 ```sh

@@ -2088,6 +2088,33 @@ pub(crate) const fn mm_dword(rel_bytes: u32) -> u32 {
     rel_bytes / 4
 }
 
+/// Establish wall-time conversions before the discrete firmware handoff.
+/// Its initcall precedes frame's HPET/timer setup; using the identity scale
+/// there makes both minimum delays and timeouts too short on a >1 GHz TSC.
+pub(crate) fn boot_clock_ready() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (hz, source) = narf_time::calibrate_clocks_with_source();
+        if hz == 0 {
+            return false;
+        }
+        // Stamp the existing per-stage checkpoints only after their clock
+        // reports real ns. Frame's later installation uses the same scale.
+        narf_console::klog::set_clock(narf_time::monotonic_ns);
+        use core::fmt::Write;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: boot clock calibrated to {hz} Hz via {}",
+            source.name()
+        );
+        true
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        true
+    }
+}
+
 /// Busy-wait `us` microseconds of wall-clock time.
 ///
 /// `narf_time::calibrate_clocks` returns the TSC frequency, or 0 when every
