@@ -829,6 +829,21 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::Unsupported);
             }
             let vol = self.volume()?;
+            let old_size = self.live_size.load(core::sync::atomic::Ordering::Relaxed);
+            if len < old_size {
+                // Publish the new EOF, then revoke every installed PTE
+                // past it before the extents are retired — the ordering
+                // ext2's truncate uses. Without the revoke, an
+                // already-mapped page keeps serving its retired extent
+                // instead of faulting SIGBUS.
+                self.live_size
+                    .store(len, core::sync::atomic::Ordering::Relaxed);
+                if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
+                    self.live_size
+                        .store(old_size, core::sync::atomic::Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
             autogrow!(vol, crate::write::truncate_file(&vol, self.ino, len).await)?;
             self.live_size
                 .store(len, core::sync::atomic::Ordering::Relaxed);
@@ -850,6 +865,18 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 vol,
                 crate::write::fallocate_file(&vol, self.ino, mode, offset, len).await
             )?;
+            if mode & (crate::write::FALLOC_FL_PUNCH_HOLE | crate::write::FALLOC_FL_ZERO_RANGE) != 0
+            {
+                // The range's extents were deallocated or converted to
+                // unwritten: revoke installed PTEs from its first page, or
+                // a mapped page keeps serving the pre-punch bytes. A fault
+                // after this point reads the new (holed/zeroed) state.
+                narf_filesystem::unmap_mapping_range(
+                    self,
+                    (offset / narf_filesystem::PAGE_SIZE as u64)
+                        * narf_filesystem::PAGE_SIZE as u64,
+                )?;
+            }
             if mode & crate::write::FALLOC_FL_KEEP_SIZE == 0 {
                 self.live_size.fetch_max(
                     offset.saturating_add(len),

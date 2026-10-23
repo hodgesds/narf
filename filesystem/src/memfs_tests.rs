@@ -676,10 +676,13 @@ kernel_test_in!(
 /// A mapped page survives being truncated away, and keeps its charge.
 ///
 /// Linux would `unmap_mapping_range` the inode and let further accesses
-/// take SIGBUS. NARF has no reverse map from a file range to the mappings
-/// of it and no cross-address-space PTE invalidation, so freeing the frame
-/// would hand the buddy allocator a page userspace can still write —
-/// the hazard `mapped_file`'s module header exists to describe.
+/// take SIGBUS. NARF's truncate/punch paths do call the
+/// `unmap_mapping_range` bridge first — but the bridge is installed by
+/// the userspace layer, is a no-op in standalone filesystem tests, and
+/// cannot recall a hold raced between the revoke and the removal, so
+/// freeing the frame outright could still hand the buddy allocator a
+/// page userspace can write — the hazard `mapped_file`'s module header
+/// exists to describe.
 ///
 /// So a page that has been handed to `mmap_fault` is RETIRED rather than
 /// freed: dropped from the file's contents, kept as a frame until the

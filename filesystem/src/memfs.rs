@@ -2079,6 +2079,10 @@ impl MemFile {
 
     fn punch_hole(&self, offset: u64, len: u64) -> Result<(), FsError> {
         let end = offset.checked_add(len).ok_or(FsError::InvalidData)?;
+        // Revoke installed PTEs from the punch's first page before its
+        // pages are retired, mirroring ext2's hole punch; a page left
+        // mapped would keep serving its retired frame instead of the hole.
+        crate::unmap_mapping_range(self, (offset / PAGE_SIZE) * PAGE_SIZE)?;
         let mut data = self.data.lock();
         let indexes: Vec<u64> = data
             .pages
@@ -2383,8 +2387,20 @@ impl FileOps for MemFile {
 
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            let mut data = self.data.lock();
-            if len < data.len {
+            let old_len = self.data.lock().len;
+            if len < old_len {
+                // Publish the new EOF first, so a racing fault is refused by
+                // the EOF check in `mmap_fault`; then revoke every installed
+                // PTE past it before the pages are retired — the ordering
+                // ext2's truncate uses. Without the revoke, an
+                // already-mapped page keeps serving its retired frame
+                // instead of faulting SIGBUS.
+                self.data.lock().len = len;
+                if let Err(error) = crate::unmap_mapping_range(self, len) {
+                    self.data.lock().len = old_len;
+                    return Err(error);
+                }
+                let mut data = self.data.lock();
                 let first_removed = len.div_ceil(PAGE_SIZE);
                 let released = data.remove_pages_from(first_removed);
                 if len % PAGE_SIZE != 0 {
@@ -2393,16 +2409,17 @@ impl FileOps for MemFile {
                         page.zero_range(from, PAGE_SIZE as usize - from);
                     }
                 }
+                drop(data);
                 self._inode_lease.superblock.release_blocks(
                     self.uid.load(Ordering::Relaxed),
                     self.gid.load(Ordering::Relaxed),
                     released,
                 );
+            } else {
+                // Extending a tmpfs file creates a hole. No page/block is
+                // charged until a write or fallocate materialises it.
+                self.data.lock().len = len;
             }
-            // Extending a tmpfs file creates a hole. No page/block is charged
-            // until a write or fallocate materialises it.
-            data.len = len;
-            drop(data);
             self.touch_mtime_now();
             Ok(())
         })

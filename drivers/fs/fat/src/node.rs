@@ -391,14 +391,33 @@ impl<B: BlockDevice + 'static> FatNode<B> {
     }
 
     pub async fn truncate_async(&self, len: u64) -> Result<(), FsError> {
-        let (old_size, mut cluster) = {
+        let (old_size, old_blocks, mut cluster) = {
             let g = self.state.lock();
-            (g.stat.size, g.first_cluster)
+            (g.stat.size, g.stat.blocks, g.first_cluster)
         };
         if len == old_size {
             return Ok(());
         }
         self.note_content_mutation();
+
+        if len < old_size {
+            // Publish the new EOF and revoke every installed PTE past it
+            // before the cluster chain is freed — the ordering ext2's
+            // truncate uses. Without the revoke, an already-mapped page
+            // keeps serving a cluster that is about to be freed and
+            // reused instead of faulting SIGBUS.
+            {
+                let mut g = self.state.lock();
+                g.stat.size = len;
+                g.stat.blocks = len.div_ceil(self.volume.bpb.bytes_per_sec as u64);
+            }
+            if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
+                let mut g = self.state.lock();
+                g.stat.size = old_size;
+                g.stat.blocks = old_blocks;
+                return Err(error);
+            }
+        }
 
         if len < old_size {
             let bytes_per_cluster =

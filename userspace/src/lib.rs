@@ -163,6 +163,7 @@ mod abi_tests;
 mod abi_thp_tests;
 mod abi_tid_lookup_tests;
 mod abi_time_tests;
+mod abi_truncate_unmap_tests;
 mod abi_uaccess_tests;
 mod abi_udev_protocol_tests;
 mod abi_udp_gso_tests;

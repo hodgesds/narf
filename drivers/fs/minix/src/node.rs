@@ -251,6 +251,20 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
                 return Err(FsError::InvalidPath);
             }
             self.volume.bump_cache_generation(self.ino);
+            if len < u64::from(inode.size) {
+                // Publish the new EOF in the cached inode, then revoke
+                // every installed PTE past it before any zone is retired —
+                // the ordering ext2's truncate uses. Without the revoke,
+                // an already-mapped page keeps serving its frame instead
+                // of faulting SIGBUS.
+                let mut published = inode;
+                published.size = len as u32;
+                *self.inode.lock() = Some(published);
+                if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
+                    *self.inode.lock() = Some(inode);
+                    return Err(error);
+                }
+            }
             if len == 0 {
                 self.volume.truncate_inode(&mut inode).await?;
             } else if (len as u32) <= inode.size {
