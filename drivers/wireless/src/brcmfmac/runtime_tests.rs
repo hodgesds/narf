@@ -628,7 +628,10 @@ fn ethernet() -> [u8; 60] {
     frame
 }
 fn flow_reply(st: &mut State, slot: usize, kind: u8, flow: u16) {
-    complete(st, slot, kind, 0, (0, 0), 0, 0);
+    flow_reply_status(st, slot, kind, flow, 0);
+}
+fn flow_reply_status(st: &mut State, slot: usize, kind: u8, flow: u16, status: i16) {
+    complete(st, slot, kind, 0, (status, 0), 0, 0);
     let address = pointer(st, RINGS + 2 * 16 + 8);
     st.dma.get_mut(&address).unwrap()[slot * 24 + 10..slot * 24 + 12]
         .copy_from_slice(&flow.to_le_bytes());
@@ -1094,6 +1097,81 @@ fn smoke_brcmf_confirmed_delete_recycles_retained_ring_and_host_generation() -> 
 kernel_test_in!(
     "drivers/wireless/brcmfmac",
     smoke_brcmf_confirmed_delete_recycles_retained_ring_and_host_generation
+);
+fn smoke_brcmf_refused_flow_ops_retire_flow_not_runtime() -> TestResult {
+    let (bus, s) = model();
+    let mut owner = runtime::Runtime::attach(booted(bus)).unwrap();
+    owner.enable_data().unwrap();
+    let frame = ethernet();
+    let source: [u8; 6] = frame[6..12].try_into().unwrap();
+    let destination: [u8; 6] = frame[..6].try_into().unwrap();
+
+    // A refused create retires the flow as Closed; it must not fail-stop
+    // the runtime (regression fixture for the flow-refusal poisoning).
+    let flow = owner.open_flow(source, destination, 3).unwrap();
+    if owner.flow_state(flow) != Ok(runtime::FlowState::Creating) {
+        return TestResult::Fail("flow not Creating before refused create completion");
+    }
+    flow_reply_status(&mut s.lock(), 0, 4, 2, 5);
+    if owner.poll() != Ok(1) || owner.flow_state(flow) != Ok(runtime::FlowState::Closed) {
+        return TestResult::Fail("refused create did not retire the flow as Closed");
+    }
+    if owner.send(flow, &frame) != Err(runtime::Error::Busy) {
+        return TestResult::Fail("refused flow admitted TX");
+    }
+
+    // The runtime is still usable: the retained slot recycles under a new
+    // generation, and a granted create opens and carries traffic.
+    let flow = owner.open_flow(source, destination, 3).unwrap();
+    if owner.flow_state(flow) != Ok(runtime::FlowState::Creating) {
+        return TestResult::Fail("recycled flow not Creating after refused create");
+    }
+    flow_reply(&mut s.lock(), 1, 4, 2);
+    if owner.poll() != Ok(1) || owner.flow_state(flow) != Ok(runtime::FlowState::Open) {
+        return TestResult::Fail("create after a refused create did not open");
+    }
+    let id = owner.send(flow, &frame).unwrap();
+    {
+        let mut st = s.lock();
+        let tx_ring = pointer(&st, RINGS + 3 * 16 + 8);
+        let entry = &mut st.dma.get_mut(&tx_ring).unwrap()[..16];
+        entry[0] = 0x10;
+        entry[4..8].copy_from_slice(&id.to_le_bytes());
+        entry[10..12].copy_from_slice(&2u16.to_le_bytes());
+        put(&mut st, D2HW + 4, &1u16.to_le_bytes());
+    }
+    if owner.poll() != Ok(1)
+        || owner.pop_tx_receipt()
+            != Some(runtime::TxReceipt {
+                id,
+                status: 0,
+                tx_status: 0,
+            })
+    {
+        return TestResult::Fail("TX after a refused create did not retire exactly");
+    }
+
+    // A refused delete also retires the flow as Closed — this is the
+    // transition station_transport's flow-cache eviction relies on — and
+    // the runtime keeps working afterwards.
+    owner.close_flow(flow).unwrap();
+    if owner.flow_state(flow) != Ok(runtime::FlowState::Deleting) {
+        return TestResult::Fail("flow not Deleting before refused delete completion");
+    }
+    flow_reply_status(&mut s.lock(), 2, 6, 2, 5);
+    if owner.poll() != Ok(1) || owner.flow_state(flow) != Ok(runtime::FlowState::Closed) {
+        return TestResult::Fail("refused delete did not retire the flow as Closed");
+    }
+    let flow = owner.open_flow(source, destination, 3).unwrap();
+    flow_reply(&mut s.lock(), 3, 4, 2);
+    if owner.poll() != Ok(1) || owner.flow_state(flow) != Ok(runtime::FlowState::Open) {
+        return TestResult::Fail("runtime unusable after a refused delete");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_refused_flow_ops_retire_flow_not_runtime
 );
 
 #[cfg(feature = "kernel-test")]

@@ -871,8 +871,10 @@ impl<B: Bus> Runtime<B> {
             self.fail();
             return Err(Error::Protocol);
         }
-        // Closed is reached only after matching delete success in a usable
-        // runtime. Failed creates/deletes poison the entire owner instead.
+        // Closed is the terminal flow state: a matching create/delete
+        // completion retires the flow whether the firmware granted or
+        // refused the operation, and the retained mapping may be reused
+        // only after that completion has fenced the ring from firmware.
         zero(&mut flow.ring.memory)?;
         flow.generation = generation;
         flow.ring.read = 0;
@@ -994,9 +996,13 @@ impl<B: Bus> Runtime<B> {
             _ => return Err(Error::Protocol),
         }
         flow.deadline = None;
-        if status != 0 {
-            return Err(Error::Firmware(status as i16));
-        }
+        // A firmware refusal (status != 0) is a per-flow outcome, not a
+        // transport failure: the matching completion above is the terminal
+        // transition and the flow is retired as Closed. The refusal stays
+        // observable through flow_state, and callers such as
+        // station_transport evict Closed flows from a still-usable runtime.
+        // Fail-stop remains reserved for protocol/transport errors:
+        // mismatched completions (above), ring corruption, bus failures.
         Ok(())
     }
     pub fn send(&mut self, token: FlowToken, frame: &[u8]) -> Result<u32, Error> {
