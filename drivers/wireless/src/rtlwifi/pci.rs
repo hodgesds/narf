@@ -34,6 +34,8 @@ use super::regs::*;
 
 /// A bound rtlwifi PCIe device.  Holds BAR2 + MAC + device-ID.
 pub struct RtlwifiDevice {
+    /// Retained bus identity; a repeat probe must not park the active owner.
+    pub(crate) bus_addr: narf_bus::BusAddr,
     pub registers: MmioRegion,
     pub mac: [u8; MAC_ADDR_LEN],
     pub device_id: u16,
@@ -158,10 +160,15 @@ pub fn register_pci_driver() {
 
 /// PCI probe callback.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
-        // Even a skipped diagnostic match must not inherit active DMA.
-        crate::rtw88::pci_park::park(&device, &cap).map_err(|_| narf_bus::ProbeError::BadDevice)?;
-        return Ok(());
+    let bound = CONTROLLER.lock().as_ref().map(|owner| owner.bus_addr);
+    match crate::rtw88::pci_park::admission(bound, device.addr) {
+        crate::rtw88::pci_park::Admission::Bound => return Ok(()),
+        crate::rtw88::pci_park::Admission::ParkExtra => {
+            crate::rtw88::pci_park::park(&device, &cap)
+                .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+            return Ok(());
+        }
+        crate::rtw88::pci_park::Admission::Initialize => {}
     }
 
     // SAFETY: caller holds exclusive BusDeviceCap for this device.
@@ -231,6 +238,7 @@ pub unsafe fn bring_up(
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
     let device_arc = alloc::sync::Arc::new(RtlwifiDevice {
+        bus_addr: device.addr,
         registers,
         mac,
         device_id: device.id.device,
@@ -241,6 +249,7 @@ pub unsafe fn bring_up(
     narf_wireless::registry::register(device_arc);
 
     Ok(RtlwifiDevice {
+        bus_addr: device.addr,
         registers,
         mac,
         device_id: device.id.device,

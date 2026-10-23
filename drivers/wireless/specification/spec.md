@@ -16,15 +16,15 @@ matching a PCI ID or testing a command encoder does not establish a WLAN.
 | :--- | :--- | :--- | :--- |
 | **iwlwifi** | Gen3 MLD station (Sc/BE211) | Live station runtime; hardware acceptance pending | Firmware CPU release, versioned coexistence/SoC/power setup, scan, station and packet paths; Gen2/MVM remains software work — `iwlwifi.md` |
 | **ath11k** | WCN6855 HW2.0/2.1 and matching QCA2066/QCA6698AQ layouts | Live STA/AP/P2P runtime; hardware acceptance pending | Incomplete QCA6390/QCN9074 profiles reject before DMA; their HAL/DP paths remain software work — `ath11k.md` |
-| **mt76** | MT7921/MT7922 CONNAC2 | Retained legacy 2.4 GHz station service | Host-policy power/channel requests, UNI station/key commands, peer-bound RSNA, hardware CCMP replay checks, kernel/frame-ring service — `mt7921.md` |
+| **mt76** | MT7921/MT7922 CONNAC2 | Retained legacy 2.4 GHz station service on both architectures | Host-policy power/channel requests, UNI station/key commands, peer-bound RSNA, hardware CCMP replay checks, kernel/frame-ring service and verified reset/reload — `mt7921.md` |
 | **rtw88** | RTL8821CE/RTL8822BE/RTL8822CE | Real chip/cut PCI power sequences and sparse EFUSE identity | Firmware reserved-page DMA, complete MAC/RF, rings and station control remain software work — `rtw88.md` |
 | **rtw89** | RTL8852A/B/C, RTL8851B AX | AX factory identity and retained native TX prerequisites | Full power/firmware startup, native producer/RPQ completion pump and station integration remain software work — `rtw89.md` |
 | **rtlwifi** | Legacy Realtek PCIe | BAR2 and per-chip sparse EFUSE identity | Full power/MAC/RF, firmware, DMA/IRQ and station runtime remain software work — `rtlwifi.md` |
-| **rtl8xxxu** | RTL8188EU USB firmware profile | Real EP0 power/firmware worker | Other chips, USB unplug generations and full PHY/MAC/station packet runtime remain software work — `rtl8xxxu.md` |
-| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Owned CE/BMI bootstrap and target identity | Firmware/board/OTP activation, HTC/WMI/HTT packet runtime and interface registration remain software work — `ath10k.md` |
-| **ath9k** | AR9285 | Retained reset/validated EEPROM identity | PHY/RF/calibration, DMA/IRQ and soft-MAC station runtime remain software work — `ath9k.md` |
+| **rtl8xxxu** | RTL8188EU USB firmware profile | Retained factory/FIFO/firmware/MAC/BB/RF/LLT setup | USB owns persistent transfers and slot/EP0 generations; IQK/LC/channel/power and native station packets remain software work — `rtl8xxxu.md` |
+| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Owned CE/BMI plus firmware/BDF/OTP/PLL/code-swap preparation | Runtime CE/IRQ ownership before BMI_DONE, HTC/WMI/HTT packet runtime and interface registration remain software work — `ath10k.md` |
+| **ath9k** | AR9285 | Retained EEPROM identity and inactive PHY/PLL/RF INI programming | Modal/power/calibration, DMA/IRQ and soft-MAC station runtime remain software work — `ath9k.md` |
 | **brcmfmac** | Broadcom PCIe FullMAC | DMA parked, owned BAR0/AI core discovery | Firmware activation, shared/msgbuf/flow-ring runtime and interface attachment remain software work — `brcmfmac.md` |
-| **cyw43439** | Infineon SDIO/gSPI FullMAC | Explicit platform attach with live F2 control/station/data worker | A real fixed-FIFO host adapter and platform binding, firmware reload/PM and hardware acceptance remain — `cyw43439.md` |
+| **cyw43439** | Infineon SDIO FullMAC | Standard PCI SDHCI/explicit card bootstrap through F2 station attachment | Owned PIO enumeration, trusted firmware/NVRAM/CLM, discovered cores/RAM, mailbox/FIFO control and station/data; board wiring, gSPI host, reset/reload/PM remain — `cyw43439.md` |
 
 All eleven families are included in the software bring-up scope. Several
 entries still require a substantial hardware-driver port before physical
@@ -137,7 +137,7 @@ and selector encoding follow the local Linux reference at `ecd997b0189a`.
 
 `mt7921::firmware_transport::Firmware::prepare` validates and owns patch and
 RAM images before device writes; `Firmware::open` obtains them through a
-live firmware-registry capability. On x86_64, unsafe `Transport::new` requires
+live firmware-registry capability. On x86_64 and aarch64, unsafe `Transport::new` requires
 exclusive device/register-latch ownership, a permanent BAR mapping, coherent
 identity DMA and disabled PCI bus mastering. Per-domain IOMMU configurations
 are rejected until an explicit DMA mapping path is implemented.
@@ -155,10 +155,20 @@ boot budget. Waits self-wake and use the scheduler bridge rather than relying
 on another executor task or on enabled device interrupts.
 
 `state` reports the last stage and terminal error; `pop_event` drains retained
-notifications. Failed or cancelled attempts cannot be replayed. Published DMA
+notifications. Failed or cancelled attempts cannot be replayed without verified reset. Published DMA
 allocations remain retained even when the owner is dropped. `shutdown` permits
 release only after DMA is disabled and idle, PCI bus mastering is confirmed
 off and ring references are cleared. Failure to prove quiescence retains memory.
+`Transport::recover(expected_mac)` starts a new firmware generation only after
+verified PCI parking, link ownership, the Linux WFSYS reset hold/readiness
+sequence, DMA stop/idle and ring retirement. It then scrubs old TX payloads,
+resets descriptors/tokens and queued notifications, reloads firmware/radio
+state, and verifies the original MAC. No station keys or association are
+replayed. `recover_boot_radio` retains ownership of the reset future across
+caller cancellation. Interface service closes carrier and frame admission
+before recovery, limits automatic attempts to three with backoff, and permits
+operator-requested retries through scan/connect/disconnect. Initial radio
+startup failure can use the same owned reset path before registration.
 The late `mt76-firmware` initcall runs after firmware discovery and retains the
 transport on success or failure; `boot_status` exposes its state. A ready
 report proves firmware startup only. The late initcall registers a passive

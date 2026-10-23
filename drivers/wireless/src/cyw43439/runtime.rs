@@ -320,7 +320,19 @@ impl<T: PacketTransport> Runtime<T> {
             }
             .encode(),
         );
-        transaction.runtime.transport.transmit_packet(&request)?;
+        loop {
+            match transaction.runtime.transport.transmit_packet(&request) {
+                Ok(()) => break,
+                Err(super::TransportError::Busy) => {
+                    transaction.runtime.poll()?;
+                    if deadline.expired() {
+                        return Err(Error::Timeout);
+                    }
+                    delay().await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         transaction.runtime.tx_sequence = transaction.runtime.tx_sequence.wrapping_add(1);
         loop {
             transaction.runtime.poll()?;
@@ -373,6 +385,9 @@ impl<T: PacketTransport> Runtime<T> {
         bytes[12..16].copy_from_slice(&[0x20, priority, 0, 0]);
         bytes[16..length].copy_from_slice(ethernet);
         if let Err(error) = self.transport.transmit_packet(&bytes) {
+            if error == super::TransportError::Busy {
+                return Err(Error::Busy);
+            }
             self.failed = true;
             return Err(error.into());
         }

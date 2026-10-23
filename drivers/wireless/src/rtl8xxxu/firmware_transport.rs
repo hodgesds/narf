@@ -28,6 +28,11 @@ const MCU_RAM_SELECT: u8 = 1 << 7;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     UnsupportedChip,
+    UnsupportedSilicon,
+    BadEndpoints,
+    BadEfuse,
+    EfuseTimeout,
+    LltTimeout,
     AlreadyStarted,
     InvalidImage,
     Firmware(FirmwareError),
@@ -47,6 +52,9 @@ pub enum Stage {
     Powered,
     Downloading,
     FirmwareReady,
+    FactoryReady,
+    TablesReady,
+    InitializingTables,
     Failed,
 }
 
@@ -96,6 +104,9 @@ pub fn parse_image(chip: ChipFamily, blob: &[u8]) -> Result<(FirmwareInfo, &[u8]
 pub trait ControlIo: Send + Sync {
     async fn read(&self, addr: u16, out: &mut [u8]) -> Result<usize, UsbError>;
     async fn write(&self, addr: u16, data: &[u8]) -> Result<usize, UsbError>;
+    async fn configuration(&self, _out: &mut [u8]) -> Result<usize, UsbError> {
+        Err(UsbError::NotConfigured)
+    }
     async fn delay_us(&self, us: u64) {
         narf_time::sleep_cycles(narf_time::ns_to_cycles(us.saturating_mul(1000))).await;
     }
@@ -117,6 +128,9 @@ impl UsbControl {
 
 #[async_trait::async_trait]
 impl ControlIo for UsbControl {
+    async fn configuration(&self, out: &mut [u8]) -> Result<usize, UsbError> {
+        self.device.get_config_descriptor(0, out).await
+    }
     async fn read(&self, addr: u16, out: &mut [u8]) -> Result<usize, UsbError> {
         self.device
             .control_in(REALTEK_USB_READ, REALTEK_USB_CMD_REQ, addr, 0, out)
@@ -137,6 +151,7 @@ pub struct Owner<I: ControlIo> {
     chip: ChipFamily,
     started: AtomicBool,
     status: IrqSafeSpinLock<Status>,
+    factory: IrqSafeSpinLock<Option<super::device_init::Factory>>,
 }
 
 impl<I: ControlIo> core::fmt::Debug for Owner<I> {
@@ -153,7 +168,10 @@ struct Attempt<'a, I: ControlIo>(&'a Owner<I>);
 impl<I: ControlIo> Drop for Attempt<'_, I> {
     fn drop(&mut self) {
         let mut state = self.0.status.lock();
-        if !matches!(state.stage, Stage::FirmwareReady | Stage::Failed) {
+        if !matches!(
+            state.stage,
+            Stage::FirmwareReady | Stage::TablesReady | Stage::Failed
+        ) {
             state.stage = Stage::Failed;
             state.error = Some(Error::Cancelled);
         }
@@ -166,6 +184,7 @@ impl<I: ControlIo> Owner<I> {
             io,
             chip,
             started: AtomicBool::new(false),
+            factory: IrqSafeSpinLock::new(None),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
                 error: None,
@@ -190,7 +209,11 @@ impl<I: ControlIo> Owner<I> {
 
     fn finish(&self, result: Result<FirmwareInfo, Error>) -> Result<FirmwareInfo, Error> {
         match result {
-            Ok(_) => self.stage(Stage::FirmwareReady),
+            Ok(_) => {
+                if self.status().stage != Stage::TablesReady {
+                    self.stage(Stage::FirmwareReady);
+                }
+            }
             Err(error) => {
                 *self.status.lock() = Status {
                     stage: Stage::Failed,
@@ -221,7 +244,7 @@ impl<I: ControlIo> Owner<I> {
             // revocation cannot invalidate an outstanding borrowed view.
             let _ = parse_image(self.chip, view.bytes)?;
             let bytes = view.bytes.to_vec();
-            self.run_before(&bytes, narf_time::Deadline::after_ms(30_000))
+            self.run_device_before(&bytes, narf_time::Deadline::after_ms(30_000))
                 .await
         }
         .await;
@@ -248,6 +271,55 @@ impl<I: ControlIo> Owner<I> {
         self.finish(result)
     }
 
+    /// Initialize the source-matched RTL8188EU factory/FIFO and register
+    /// tables. This is not calibration or packet readiness; MAC TX/RX gates
+    /// remain closed. Production initialize_registered follows this path.
+    pub async fn initialize_device(&self, blob: &[u8]) -> Result<FirmwareInfo, Error> {
+        let _attempt = self.begin()?;
+        let result = self
+            .run_device_before(blob, narf_time::Deadline::after_ms(30_000))
+            .await;
+        self.finish(result)
+    }
+
+    pub fn factory(&self) -> Option<super::device_init::Factory> {
+        *self.factory.lock()
+    }
+
+    async fn run_device_before(
+        &self,
+        blob: &[u8],
+        deadline: narf_time::Deadline,
+    ) -> Result<FirmwareInfo, Error> {
+        let (info, payload) = parse_image(self.chip, blob)?;
+        self.stage(Stage::Validated);
+        narf_time::timeout(deadline, async {
+            let mut config = alloc::vec![0; 4096];
+            let count = self
+                .io
+                .configuration(&mut config)
+                .await
+                .map_err(Error::Usb)?;
+            if count > config.len() {
+                return Err(Error::BadEndpoints);
+            }
+            let endpoints = super::device_init::endpoints(&config[..count])?;
+            let factory = super::device_init::factory(self).await?;
+            *self.factory.lock() = Some(factory);
+            self.stage(Stage::FactoryReady);
+            self.power_on().await?;
+            super::device_init::pre_firmware(self, endpoints).await?;
+            self.stage(Stage::Powered);
+            self.download(payload).await?;
+            self.stage(Stage::InitializingTables);
+            super::device_init::mac_bb_rf(self, factory).await?;
+            self.stage(Stage::TablesReady);
+            Ok(info)
+        })
+        .await
+        .unwrap_or(Err(Error::Deadline))
+    }
+
     async fn run_before(
         &self,
         blob: &[u8],
@@ -271,6 +343,10 @@ impl<I: ControlIo> Owner<I> {
         // and a fresh USB lifecycle are required before any recovery I/O.
     }
 
+    pub(super) async fn delay_us(&self, us: u64) {
+        self.io.delay_us(us).await;
+    }
+
     async fn read<const N: usize>(&self, addr: u16) -> Result<[u8; N], Error> {
         let mut bytes = [0; N];
         let count = self.io.read(addr, &mut bytes).await.map_err(Error::Usb)?;
@@ -279,13 +355,13 @@ impl<I: ControlIo> Owner<I> {
         }
         Ok(bytes)
     }
-    async fn read8(&self, addr: u16) -> Result<u8, Error> {
+    pub(super) async fn read8(&self, addr: u16) -> Result<u8, Error> {
         Ok(self.read::<1>(addr).await?[0])
     }
-    async fn read16(&self, addr: u16) -> Result<u16, Error> {
+    pub(super) async fn read16(&self, addr: u16) -> Result<u16, Error> {
         Ok(u16::from_le_bytes(self.read(addr).await?))
     }
-    async fn read32(&self, addr: u16) -> Result<u32, Error> {
+    pub(super) async fn read32(&self, addr: u16) -> Result<u32, Error> {
         Ok(u32::from_le_bytes(self.read(addr).await?))
     }
     async fn write(&self, addr: u16, bytes: &[u8]) -> Result<(), Error> {
@@ -294,13 +370,13 @@ impl<I: ControlIo> Owner<I> {
         }
         Ok(())
     }
-    async fn write8(&self, addr: u16, value: u8) -> Result<(), Error> {
+    pub(super) async fn write8(&self, addr: u16, value: u8) -> Result<(), Error> {
         self.write(addr, &[value]).await
     }
-    async fn write16(&self, addr: u16, value: u16) -> Result<(), Error> {
+    pub(super) async fn write16(&self, addr: u16, value: u16) -> Result<(), Error> {
         self.write(addr, &value.to_le_bytes()).await
     }
-    async fn write32(&self, addr: u16, value: u32) -> Result<(), Error> {
+    pub(super) async fn write32(&self, addr: u16, value: u32) -> Result<(), Error> {
         self.write(addr, &value.to_le_bytes()).await
     }
 

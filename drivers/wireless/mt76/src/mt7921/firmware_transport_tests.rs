@@ -86,6 +86,10 @@ struct Model {
     anonce: [u8; 32],
     ap_mac: [u8; 6],
     own_mac: [u8; 6],
+    recovery_trace: Vec<(&'static str, u64)>,
+    reset_asserted_at: Option<u64>,
+    reset_stall: bool,
+    link_stall: bool,
 }
 impl Model {
     fn new() -> Self {
@@ -118,6 +122,10 @@ impl Model {
             anonce: [0; 32],
             ap_mac: [0; 6],
             own_mac: [0; 6],
+            recovery_trace: Vec::new(),
+            reset_asserted_at: None,
+            reset_stall: false,
+            link_stall: false,
         }
     }
 }
@@ -148,6 +156,7 @@ impl Backend for Model {
         Ok(!self.idle_stall)
     }
     fn initialize(&mut self) -> Result<(), Error> {
+        self.recovery_trace.push(("initialize", self.ticks.get()));
         self.owner.published = true;
         Ok(())
     }
@@ -246,7 +255,49 @@ impl Backend for Model {
         Ok(self.packets.pop_front())
     }
     fn release(&mut self) -> Result<(), Error> {
+        self.recovery_trace.push(("release", self.ticks.get()));
         self.owner.published = false;
+        Ok(())
+    }
+    fn park_bus_master(&mut self) -> Result<(), Error> {
+        self.recovery_trace.push(("park", self.ticks.get()));
+        self.check()
+    }
+    fn assert_reset(&mut self) -> Result<(), Error> {
+        self.reset_asserted_at = Some(self.ticks.get());
+        self.recovery_trace.push(("assert", self.ticks.get()));
+        self.check()
+    }
+    fn request_link_own(&mut self) -> Result<(), Error> {
+        self.recovery_trace.push(("wake", self.ticks.get()));
+        self.check()
+    }
+    fn link_owned(&mut self) -> Result<bool, Error> {
+        Ok(!self.link_stall)
+    }
+    fn release_reset(&mut self) -> Result<(), Error> {
+        let since = self.reset_asserted_at.ok_or(Error::Register)?;
+        if self.ticks.get().saturating_sub(since) < 50_000_000 {
+            return Err(Error::Register);
+        }
+        self.recovery_trace.push(("deassert", self.ticks.get()));
+        self.check()
+    }
+    fn reset_done(&mut self) -> Result<bool, Error> {
+        Ok(!self.reset_stall)
+    }
+    fn recycle(&mut self) -> Result<(), Error> {
+        if self.owner.published {
+            return Err(Error::Busy);
+        }
+        self.recovery_trace.push(("recycle", self.ticks.get()));
+        self.active = false;
+        self.loaded = false;
+        self.replies.clear();
+        self.packets.clear();
+        self.tx_stall = false;
+        self.rx_stall = false;
+        self.management_resume = None;
         Ok(())
     }
     fn configure_mac(&mut self) -> Result<(), Error> {
@@ -2057,4 +2108,185 @@ fn mt76_native_eapol_txd_sets_data_type_in_both_hardware_fields() -> TestResult 
 kernel_test_in!(
     "drivers/wireless/mt7921/join",
     mt76_native_eapol_txd_sets_data_type_in_both_hardware_fields
+);
+
+fn mt76_reset_recovers_cancelled_dma_then_requires_fresh_station() -> TestResult {
+    let mut session = secure_model();
+    let State::Associated { info, .. } = session.state else {
+        unreachable!()
+    };
+    session.backend.tx_stall = true;
+    {
+        let mut request = pin!(session.disassociate_station());
+        let mut cx = Context::from_waker(Waker::noop());
+        if request.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("stalled deauthentication did not suspend");
+        }
+    }
+    let start = session.backend.recovery_trace.len();
+    // These must never survive into the new MCU/RX generation.
+    session.events.push_back(vec![0x77; 36]);
+    session.backend.replies.push_back(vec![0x66; 36]);
+    session.backend.packets.push_back(vec![0x55; 36]);
+    let result = run(session.recover(info.capabilities.mac));
+    let trace = &session.backend.recovery_trace[start..];
+    let labels: Vec<_> = trace.iter().map(|(label, _)| *label).collect();
+    if result.is_err()
+        || labels
+            != [
+                "park",
+                "wake",
+                "assert",
+                "deassert",
+                "release",
+                "recycle",
+                "initialize",
+            ]
+        || trace[3].1.saturating_sub(trace[2].1) < 50_000_000
+        || !matches!(session.state, State::RadioReady(_))
+        || session.security.is_some()
+        || session.station_bss.is_some()
+        || session.data_pending.is_some()
+        || !session.events.is_empty()
+        || !session.backend.packets.is_empty()
+        || !session.backend.owner.published
+        || session.start_ethernet(&[0; 14]) != Err(Error::Busy)
+    {
+        return TestResult::Fail(
+            "reset replayed a port/key or recycled DMA before reset/stop proof",
+        );
+    }
+    if run(session.scan_passive(&[6])).is_err() {
+        return TestResult::Fail("recovered radio cannot start a fresh scan");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/recovery",
+    mt76_reset_recovers_cancelled_dma_then_requires_fresh_station
+);
+
+fn mt76_reset_failure_retains_dma_and_never_recycles_descriptors() -> TestResult {
+    for stall_stage in 0..3 {
+        let mut session = secure_model();
+        let State::Associated { info, .. } = session.state else {
+            unreachable!()
+        };
+        let resources = session.backend.resources.clone();
+        session.backend.link_stall = stall_stage == 0;
+        session.backend.reset_stall = stall_stage == 1;
+        session.backend.idle_stall = stall_stage == 2;
+        let start = session.backend.recovery_trace.len();
+        if run(session.recover(info.capabilities.mac)) != Err(Error::Timeout)
+            || !matches!(session.state, State::Failed { .. })
+            || !session.backend.owner.published
+            || session.backend.recovery_trace[start..]
+                .iter()
+                .any(|(label, _)| matches!(*label, "recycle" | "initialize"))
+            || session.backend.resources.load(Ordering::SeqCst) != 1
+        {
+            return TestResult::Fail("unproven reset/idle recycled or freed device-owned memory");
+        }
+        drop(session);
+        if resources.load(Ordering::SeqCst) != 1 {
+            return TestResult::Fail("failed reset owner released uncertain DMA");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/recovery",
+    mt76_reset_failure_retains_dma_and_never_recycles_descriptors
+);
+
+fn mt76_owned_reset_survives_cancelled_waiter() -> TestResult {
+    let session = secure_model();
+    let State::Associated { info, .. } = session.state else {
+        unreachable!()
+    };
+    let mut work = KeyWork {
+        future: Some(alloc::boxed::Box::pin(async move {
+            let mut session = session;
+            let result = session.recover(info.capabilities.mac).await.map(|_| ());
+            (session, result)
+        })),
+        completed: None,
+    };
+    let mut cx = Context::from_waker(Waker::noop());
+    {
+        let mut waiter = pin!(poll_fn(|cx| work.poll(cx)));
+        if waiter.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("reset skipped the mandatory 50ms hold");
+        }
+    }
+    for _ in 0..1000 {
+        if work.poll(&mut cx).is_ready() {
+            break;
+        }
+    }
+    let Some((session, result)) = work.completed.take() else {
+        return TestResult::Fail("owned reset stopped when its waiter was cancelled");
+    };
+    if result.is_err()
+        || !matches!(session.state, State::RadioReady(_))
+        || session.security.is_some()
+    {
+        return TestResult::Fail(
+            "retained reset completion lost the owner or reopened the old port",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/recovery",
+    mt76_owned_reset_survives_cancelled_waiter
+);
+
+fn mt76_reset_rejects_changed_radio_identity() -> TestResult {
+    let mut session = secure_model();
+    if run(session.recover([0; 6])) != Err(Error::Bounds)
+        || !matches!(session.state, State::Associated { .. })
+        || session.security.is_none()
+    {
+        return TestResult::Fail("invalid reset identity mutated a live station");
+    }
+    if run(session.recover([2, 0, 0, 0, 0, 99])) != Err(Error::InvalidIdentity)
+        || !matches!(
+            session.state,
+            State::Failed {
+                error: Error::InvalidIdentity,
+                ..
+            }
+        )
+        || session.security.is_some()
+    {
+        return TestResult::Fail("changed post-reset MAC reused an existing network interface");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/recovery",
+    mt76_reset_rejects_changed_radio_identity
+);
+
+fn mt76_unregistered_boot_failure_can_recover_before_mac_discovery() -> TestResult {
+    let mut model = Model::new();
+    model.tx_stall = true;
+    let mut session = Session::new(model, firmware(32));
+    if run(session.run()) != Err(Error::Timeout) {
+        return TestResult::Fail("boot timeout fixture did not fail before radio identity");
+    }
+    if run(session.recover_unregistered()).is_err()
+        || !matches!(session.state, State::RadioReady(_))
+        || session.security.is_some()
+    {
+        return TestResult::Fail(
+            "initial boot failure could not establish a fresh unregistered radio",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/recovery",
+    mt76_unregistered_boot_failure_can_recover_before_mac_discovery
 );

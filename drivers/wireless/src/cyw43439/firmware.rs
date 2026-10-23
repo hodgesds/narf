@@ -1,4 +1,4 @@
-//! CYW43439 firmware-load codec.
+//! CYW43439 owned firmware bootstrap.
 //!
 //! The chip's firmware-load procedure is documented in
 //! **CYW43439 datasheet Rev. 03 §6.6 ("Firmware download
@@ -16,17 +16,18 @@
 //! - [`FirmwareLoader`] — a small state machine that walks those
 //!   steps over a [`Transport`].
 //!
-//! Cross-checked against `soypat/cyw43439` (MIT) and Embassy
-//! `cyw43` (Apache-2.0 / MIT). **No GPL `brcmfmac` / `bcmdhd`
-//! source consulted.**
+//! Original public/permissive references: soypat/cyw43439 and Embassy
+//! cyw43. Live AI core/RAM/reset and NVRAM contracts now follow local
+//! Linux brcmfmac/{chip,firmware,sdio}.c under GPL-2.0-or-later.
 
 use alloc::vec::Vec;
 
 use super::backplane::{split as window_split, window_writes};
 use super::chipclk;
-use super::core::{bring_up_sequence, reset_sequence, wrapper, SOC_RAM_BASE};
+use super::core::{D11, SDIO_DEVICE, SOC_RAM, SOC_RAM_BASE, WLAN_ARM};
 use super::sdio::{BusWidth, CCCR_BUS_IFACE_CTRL, CCCR_IO_ENABLE, CCCR_IO_READY, F1_CHIPCLK_CTRL};
 use super::transport::{Function, Transport, TransportError};
+use crate::brcmfmac::chip::{Backplane, Chip, Core};
 
 /// Errors specific to firmware loading on top of the underlying
 /// [`TransportError`] surface.
@@ -46,6 +47,10 @@ pub enum LoadError {
     /// HT clock failed to come up after taking the WLAN core out
     /// of reset.
     HtDidNotComeUp,
+    InvalidImage,
+    InvalidState,
+    UnsupportedChip,
+    Chip(crate::brcmfmac::chip::Error),
 }
 
 impl From<TransportError> for LoadError {
@@ -106,7 +111,8 @@ pub const LOAD_SEQUENCE: [LoadStep; 9] = [
 /// 4. Pad with NULs to a 4-byte boundary.
 /// 5. Append a 4-byte trailer:
 ///    `[len_lo, len_hi, ~len_lo, ~len_hi]` where `len` is the
-///    total length **in 32-bit words including the trailer**.
+///    payload length **in 32-bit words excluding the trailer**. An extra
+///    NUL terminates the record list before alignment padding.
 ///
 /// The chip rejects the upload if the inverted-length checksum does
 /// not match — the trailer's primary purpose is integrity, not size
@@ -134,12 +140,14 @@ pub fn build_nvram_blob(text: &str) -> Result<Vec<u8>, LoadError> {
     if !buf.is_empty() {
         buf.push(0);
     }
-    // Pad to a 4-byte boundary.
+    // Linux firmware.c rounds up nvram_len + 1: preserve a separate
+    // list terminator even when the final key's NUL lands on a word edge.
+    buf.push(0);
     while buf.len() % 4 != 0 {
         buf.push(0);
     }
     // Append the length-checksum trailer.
-    let len_words = (buf.len() + 4) / 4;
+    let len_words = buf.len() / 4;
     if len_words > u16::MAX as usize {
         return Err(LoadError::NvramTooLarge);
     }
@@ -157,16 +165,13 @@ pub fn build_nvram_blob(text: &str) -> Result<Vec<u8>, LoadError> {
 ///
 /// The trailer is placed at the very top of SOC-RAM so the WLAN-ARM
 /// firmware can find it via a fixed offset at boot.
-pub fn nvram_blob_address(soc_ram_size: u32, blob_len: u32) -> u32 {
-    SOC_RAM_BASE + soc_ram_size - blob_len
+pub fn nvram_blob_address(soc_ram_size: u32, blob_len: u32) -> Option<u32> {
+    soc_ram_size
+        .checked_sub(blob_len)?
+        .checked_add(SOC_RAM_BASE)
 }
 
 // ── High-level loader ─────────────────────────────────────────────
-
-/// Polling budget for status-bit waits. Each iteration yields a
-/// single transport read. The driver's caller is expected to insert
-/// timing between iterations as appropriate for the transport.
-pub const POLL_RETRIES: u32 = 4096;
 
 /// State machine that drives the firmware-load procedure over a
 /// caller-provided [`Transport`].
@@ -179,6 +184,9 @@ pub struct FirmwareLoader<'fw, T: Transport> {
     /// Whether the transport is gSPI (and therefore needs the
     /// endian self-check + bus-control register dance) versus SDIO.
     pub is_gspi: bool,
+    layout: Option<(Core, Core)>,
+    next_step: usize,
+    failed: bool,
 }
 
 impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
@@ -195,6 +203,9 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
             nvram,
             soc_ram_size,
             is_gspi,
+            layout: None,
+            next_step: 0,
+            failed: false,
         }
     }
 
@@ -205,20 +216,49 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
     }
 
     /// Transfer the retained host adapter to the packet runtime after boot.
-    pub fn into_transport(self) -> T {
-        self.transport
+    pub fn into_transport(self) -> Result<T, LoadError> {
+        if self.packet_core().is_none() {
+            return Err(LoadError::InvalidState);
+        }
+        Ok(self.transport)
     }
 
     /// Run the full load procedure.
     pub fn run(&mut self) -> Result<(), LoadError> {
+        if self.failed || self.next_step != 0 {
+            return Err(LoadError::InvalidState);
+        }
         for step in LOAD_SEQUENCE {
             self.execute_step(step)?;
         }
         Ok(())
     }
 
+    fn validate_images(&self) -> Result<(), LoadError> {
+        if self.firmware.is_empty()
+            || self.firmware.len() > 4 * 1024 * 1024
+            || self.nvram.len() < 8
+            || self.nvram.len() % 4 != 0
+        {
+            return Err(LoadError::InvalidImage);
+        }
+        let end = self.nvram.len();
+        let words = u16::from_le_bytes([self.nvram[end - 4], self.nvram[end - 3]]);
+        let inverted = u16::from_le_bytes([self.nvram[end - 2], self.nvram[end - 1]]);
+        if !words != inverted || usize::from(words) * 4 != end - 4 {
+            return Err(LoadError::InvalidImage);
+        }
+        Ok(())
+    }
+
     pub fn execute_step(&mut self, step: LoadStep) -> Result<(), LoadError> {
-        match step {
+        if self.failed || LOAD_SEQUENCE.get(self.next_step) != Some(&step) {
+            return Err(LoadError::InvalidState);
+        }
+        if self.next_step == 0 {
+            self.validate_images()?;
+        }
+        let result = match step {
             LoadStep::VerifyEndian => self.verify_endian(),
             LoadStep::BusInit => self.bus_init(),
             LoadStep::AlpUp => self.alp_up(),
@@ -228,7 +268,13 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
             LoadStep::BringWlanArmUp => self.bring_wlan_arm_up(),
             LoadStep::HtUp => self.ht_up(),
             LoadStep::EnableWlanFunction => self.enable_wlan_function(),
+        };
+        if result.is_err() {
+            self.failed = true;
+        } else {
+            self.next_step += 1;
         }
+        result
     }
 
     fn verify_endian(&mut self) -> Result<(), LoadError> {
@@ -246,35 +292,78 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
 
     fn bus_init(&mut self) -> Result<(), LoadError> {
         // 4-bit bus + enable F1 are the SDIO-side sequence.
-        self.write_byte(Function::Bus, CCCR_BUS_IFACE_CTRL, BusWidth::FourBit as u8)?;
+        self.write_byte(Function::Bus, CCCR_BUS_IFACE_CTRL, BusWidth::OneBit as u8)?;
         self.write_byte(Function::Bus, CCCR_IO_ENABLE, 1 << 1)?; // F1
         self.poll_byte(Function::Bus, CCCR_IO_READY, 1 << 1)?;
         Ok(())
     }
 
     fn alp_up(&mut self) -> Result<(), LoadError> {
-        self.write_byte(Function::Backplane, F1_CHIPCLK_CTRL, chipclk::FORCE_ALP_REQ)?;
-        for _ in 0..POLL_RETRIES {
-            let v = self.read_byte(Function::Backplane, F1_CHIPCLK_CTRL)?;
-            if v & chipclk::ALP_AVAIL != 0 {
-                return Ok(());
-            }
-        }
-        Err(LoadError::AlpDidNotComeUp)
+        self.write_byte(Function::Backplane, F1_CHIPCLK_CTRL, 0x08)?;
+        self.poll_byte(Function::Backplane, F1_CHIPCLK_CTRL, chipclk::ALP_AVAIL)
+            .map_err(|e| {
+                if e == LoadError::StatusTimeout {
+                    LoadError::AlpDidNotComeUp
+                } else {
+                    e
+                }
+            })?;
+        self.write_byte(Function::Backplane, F1_CHIPCLK_CTRL, chipclk::FORCE_ALP_REQ)
     }
-
     fn hold_cores_in_reset(&mut self) -> Result<(), LoadError> {
-        for w in reset_sequence(wrapper::WLAN_ARM) {
-            self.backplane_write32(w.address, w.value)?;
+        let mut bus = LoaderBackplane(&mut self.transport);
+        let chip = Chip::discover_ai(&mut bus).map_err(LoadError::Chip)?;
+        if chip.id != 43439 {
+            return Err(LoadError::UnsupportedChip);
         }
-        for w in reset_sequence(wrapper::SOC_RAM) {
-            self.backplane_write32(w.address, w.value)?;
+        let unique = |id| {
+            let mut matching = chip.cores.iter().copied().filter(|c| c.id == id);
+            let first = matching.next().ok_or(LoadError::UnsupportedChip)?;
+            if matching.next().is_some() {
+                return Err(LoadError::UnsupportedChip);
+            }
+            Ok(first)
+        };
+        let arm = unique(WLAN_ARM)?;
+        let ram = unique(SOC_RAM)?;
+        let d11 = unique(D11)?;
+        let sdio = unique(SDIO_DEVICE)?;
+        Chip::disable_core(&mut bus, arm, 0, 0).map_err(LoadError::Chip)?;
+        Chip::reset_core(&mut bus, d11, 12, 4, 4).map_err(LoadError::Chip)?;
+        Chip::reset_core(&mut bus, ram, 0, 0, 0).map_err(LoadError::Chip)?;
+        // 43439 CM3 must not retain the firmware bank-3 remap.
+        bus.write32(ram.base + 0x10, 3).map_err(LoadError::Chip)?;
+        bus.write32(ram.base + 0x44, 0).map_err(LoadError::Chip)?;
+        let info = bus.read32(ram.base).map_err(LoadError::Chip)?;
+        // Bank-info layout (rev>=8 excluding12). Older SOCRAM layouts
+        // remain gated rather than guessing capacity from a caller's size.
+        if ram.revision < 8 || ram.revision == 12 {
+            return Err(LoadError::UnsupportedChip);
         }
-        // SOC-RAM needs to be brought up so the firmware can be
-        // staged into it. The WLAN-ARM core stays parked.
-        for w in bring_up_sequence(wrapper::SOC_RAM) {
-            self.backplane_write32(w.address, w.value)?;
+        let banks = (info & if ram.revision >= 23 { 0x1f0 } else { 0xf0 }) >> 4;
+        if info == u32::MAX || banks == 0 {
+            return Err(LoadError::UnsupportedChip);
         }
+        let mut size = 0u32;
+        for bank in 0..banks {
+            bus.write32(ram.base + 0x10, bank)
+                .map_err(LoadError::Chip)?;
+            let bank_info = bus.read32(ram.base + 0x40).map_err(LoadError::Chip)?;
+            if bank_info == u32::MAX {
+                return Err(LoadError::Chip(crate::brcmfmac::chip::Error::Gone));
+            }
+            size = size
+                .checked_add(((bank_info & 0x7f) + 1) * 8192)
+                .ok_or(LoadError::InvalidImage)?;
+        }
+        if size > 4 * 1024 * 1024
+            || (self.soc_ram_size != 0 && self.soc_ram_size != size)
+            || self.firmware.len() + self.nvram.len() > size as usize
+        {
+            return Err(LoadError::InvalidImage);
+        }
+        self.soc_ram_size = size;
+        self.layout = Some((arm, sdio));
         Ok(())
     }
 
@@ -284,31 +373,46 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
 
     fn nvram_upload(&mut self) -> Result<(), LoadError> {
         let blob_len = self.nvram.len() as u32;
-        let addr = nvram_blob_address(self.soc_ram_size, blob_len);
+        let addr =
+            nvram_blob_address(self.soc_ram_size, blob_len).ok_or(LoadError::InvalidImage)?;
         self.backplane_write_burst(addr, self.nvram)
     }
 
     fn bring_wlan_arm_up(&mut self) -> Result<(), LoadError> {
-        for w in bring_up_sequence(wrapper::WLAN_ARM) {
-            self.backplane_write32(w.address, w.value)?;
-        }
-        Ok(())
+        let (arm, sdio) = self.layout.ok_or(LoadError::InvalidState)?;
+        // Linux activate clears interrupts before releasing the CM3.
+        self.backplane_write32(sdio.base + 0x20, u32::MAX)?;
+        Chip::reset_core(&mut LoaderBackplane(&mut self.transport), arm, 0, 0, 0)
+            .map_err(LoadError::Chip)
     }
-
     fn ht_up(&mut self) -> Result<(), LoadError> {
-        for _ in 0..POLL_RETRIES {
-            let v = self.read_byte(Function::Backplane, F1_CHIPCLK_CTRL)?;
-            if v & chipclk::HT_AVAIL != 0 {
-                return Ok(());
+        self.write_byte(Function::Backplane, F1_CHIPCLK_CTRL, 0x10)?;
+        self.poll_byte(
+            Function::Backplane,
+            F1_CHIPCLK_CTRL,
+            chipclk::HT_AVAIL | chipclk::ALP_AVAIL,
+        )
+        .map_err(|e| {
+            if e == LoadError::StatusTimeout {
+                LoadError::HtDidNotComeUp
+            } else {
+                e
             }
-        }
-        Err(LoadError::HtDidNotComeUp)
+        })?;
+        self.write_byte(Function::Backplane, F1_CHIPCLK_CTRL, chipclk::FORCE_HT_REQ)
     }
-
     fn enable_wlan_function(&mut self) -> Result<(), LoadError> {
-        self.write_byte(Function::Bus, CCCR_IO_ENABLE, (1 << 1) | (1 << 2))?; // F1+F2
-        self.poll_byte(Function::Bus, CCCR_IO_READY, 1 << 2)?; // F2 ready
-        Ok(())
+        let (_, sdio) = self.layout.ok_or(LoadError::InvalidState)?;
+        self.backplane_write32(sdio.base + 0x48, 4 << 16)?;
+        self.write_byte(Function::Bus, CCCR_IO_ENABLE, 6)?;
+        self.poll_byte(Function::Bus, CCCR_IO_READY, 4)
+    }
+    pub fn packet_core(&self) -> Option<u32> {
+        if self.failed || self.next_step != LOAD_SEQUENCE.len() {
+            None
+        } else {
+            self.layout.map(|(_, c)| c.base)
+        }
     }
 
     // ── Helpers ────────────────────────────────────────────────────
@@ -325,12 +429,24 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
     }
 
     fn poll_byte(&mut self, f: Function, addr: u32, mask: u8) -> Result<(), LoadError> {
-        for _ in 0..POLL_RETRIES {
-            if self.read_byte(f, addr)? & mask != 0 {
-                return Ok(());
-            }
+        let mut failure = None;
+        let ready = narf_scheduler::responsive_spin_until(
+            || match self.read_byte(f, addr) {
+                Ok(value) => value & mask == mask,
+                Err(error) => {
+                    failure = Some(error);
+                    true
+                }
+            },
+            narf_time::Deadline::after_ms(1000),
+        );
+        if let Some(error) = failure {
+            Err(error)
+        } else if ready {
+            Ok(())
+        } else {
+            Err(LoadError::StatusTimeout)
         }
-        Err(LoadError::StatusTimeout)
     }
 
     fn backplane_write32(&mut self, addr: u32, val: u32) -> Result<(), LoadError> {
@@ -350,7 +466,9 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
             let n = window_room.min(buf.len());
             self.transport
                 .write_burst(Function::Backplane, off, &buf[..n])?;
-            cursor = cursor.wrapping_add(n as u32);
+            cursor = cursor
+                .checked_add(n as u32)
+                .ok_or(LoadError::InvalidImage)?;
             buf = &buf[n..];
         }
         Ok(())
@@ -363,6 +481,34 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
         }
         Ok(())
     }
+}
+
+/// Adapter for generic firmware transports; the SDIO implementation adds
+/// the 32-bit backplane access flag at its CMD53 boundary.
+struct LoaderBackplane<'a, T: Transport>(&'a mut T);
+impl<T: Transport> Backplane for LoaderBackplane<'_, T> {
+    fn read32(&mut self, address: u32) -> Result<u32, crate::brcmfmac::chip::Error> {
+        loader_window(self.0, address)?;
+        self.0
+            .read32(Function::Backplane, address & 0x7fff)
+            .map_err(|_| crate::brcmfmac::chip::Error::Access)
+    }
+    fn write32(&mut self, address: u32, value: u32) -> Result<(), crate::brcmfmac::chip::Error> {
+        loader_window(self.0, address)?;
+        self.0
+            .write32(Function::Backplane, address & 0x7fff, value)
+            .map_err(|_| crate::brcmfmac::chip::Error::Access)
+    }
+}
+fn loader_window(t: &mut impl Transport, address: u32) -> Result<(), crate::brcmfmac::chip::Error> {
+    if !crate::brcmfmac::chip::valid_address(address) {
+        return Err(crate::brcmfmac::chip::Error::Address);
+    }
+    for w in window_writes(address) {
+        t.write_burst(Function::Backplane, w.address, &[w.data])
+            .map_err(|_| crate::brcmfmac::chip::Error::Access)?;
+    }
+    Ok(())
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -398,7 +544,7 @@ ccode=US
         if (!len) != inv {
             return TestResult::Fail("trailer checksum mismatch");
         }
-        if usize::from(len) * 4 != n {
+        if usize::from(len) * 4 != n - 4 {
             return TestResult::Fail("trailer length mismatch");
         }
         TestResult::Pass
@@ -408,10 +554,42 @@ ccode=US
         smoke_nvram_trailer_round_trip
     );
 
+    fn smoke_nvram_linux_token_excludes_trailer_and_has_list_nul() -> TestResult {
+        if build_nvram_blob("a=b\n")
+            != Ok(alloc::vec![
+                b'a', b'=', b'b', 0, 0, 0, 0, 0, 2, 0, 0xfd, 0xff
+            ])
+            || nvram_blob_address(4, 8).is_some()
+        {
+            return TestResult::Fail("Linux NVRAM payload/list terminator/token extent differs");
+        }
+        let mock = MockTransport {
+            log: Vec::new(),
+            poll_call: 0,
+            window: 0,
+            words: alloc::collections::BTreeMap::new(),
+        };
+        let mut loader = FirmwareLoader::new(mock, &[1; 4], &[0; 8], 0, false);
+        if loader.run() != Err(LoadError::InvalidImage)
+            || !loader.transport.log.is_empty()
+            || loader.execute_step(LoadStep::FirmwareUpload) != Err(LoadError::InvalidState)
+        {
+            return TestResult::Fail("invalid image or out-of-order step performed bus I/O");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/firmware",
+        smoke_nvram_linux_token_excludes_trailer_and_has_list_nul
+    );
+
     fn smoke_nvram_address_top_of_ram() -> TestResult {
         let soc_size: u32 = 512 * 1024;
         let blob_len: u32 = 256;
-        let addr = nvram_blob_address(soc_size, blob_len);
+        let addr = match nvram_blob_address(soc_size, blob_len) {
+            Some(a) => a,
+            None => return TestResult::Fail("address rejected"),
+        };
         // Trailer must end exactly at the top of SOC-RAM.
         if addr.wrapping_add(blob_len) != SOC_RAM_BASE + soc_size {
             return TestResult::Fail("NVRAM address not anchored to SOC-RAM top");
@@ -450,19 +628,19 @@ ccode=US
         // For status reads the loader expects to eventually flip:
         // we return the polled bit on the second read.
         poll_call: u32,
+        window: u32,
+        words: alloc::collections::BTreeMap<u32, u32>,
     }
 
     impl Transport for MockTransport {
         fn read32(&mut self, _f: Function, addr: u32) -> Result<u32, TransportError> {
-            // Return the gSPI factory pattern for the endian probe,
-            // 0 elsewhere.
-            if addr == super::super::gspi::REG_TEST_RO {
-                Ok(super::super::gspi::TEST_RO_PATTERN)
-            } else {
-                Ok(0)
-            }
+            Ok(*self
+                .words
+                .get(&(self.window | (addr & 0x7fff)))
+                .unwrap_or(&0))
         }
-        fn write32(&mut self, _f: Function, _addr: u32, _v: u32) -> Result<(), TransportError> {
+        fn write32(&mut self, _f: Function, addr: u32, value: u32) -> Result<(), TransportError> {
+            self.words.insert(self.window | (addr & 0x7fff), value);
             Ok(())
         }
         fn read_burst(
@@ -492,6 +670,17 @@ ccode=US
             buf: &[u8],
         ) -> Result<(), TransportError> {
             self.log.push((f, addr, buf.to_vec()));
+            if f == Function::Backplane && buf.len() == 1 {
+                let shift = match addr {
+                    super::super::sdio::F1_SBADDRLOW => Some(8),
+                    super::super::sdio::F1_SBADDRMID => Some(16),
+                    super::super::sdio::F1_SBADDRHIGH => Some(24),
+                    _ => None,
+                };
+                if let Some(shift) = shift {
+                    self.window = (self.window & !(255 << shift)) | (u32::from(buf[0]) << shift);
+                }
+            }
             Ok(())
         }
     }
@@ -503,10 +692,24 @@ ccode=US
             Ok(b) => b,
             Err(_) => return TestResult::Fail("NVRAM build failed"),
         };
-        let mock = MockTransport {
+        let mut mock = MockTransport {
             log: alloc::vec::Vec::new(),
             poll_call: 0,
+            window: 0,
+            words: alloc::collections::BTreeMap::new(),
         };
+        mock.words.insert(0x18000000, 0x1000a9af); // AI, 43439 A0.
+        mock.words.insert(0x180000fc, 0x18100000);
+        let descriptors = [
+            0x4bf80001, 0x18080001, 0x18000005, 0x18110085, 0x4bf82a01, 0x07080001, 0x18002005,
+            0x18114085, 0x4bf80e01, 0x18080001, 0x18004005, 0x18116085, 0x4bf81201, 0x18080001,
+            0x18003005, 0x18118085, 0x4bf82901, 0x18080001, 0x18011005, 0x1811a085, 0xf,
+        ];
+        for (i, word) in descriptors.into_iter().enumerate() {
+            mock.words.insert(0x18100000 + i as u32 * 4, word);
+        }
+        mock.words.insert(0x18004000, 0x40); // four 64-KiB banks.
+        mock.words.insert(0x18004040, 7);
         let mut loader = FirmwareLoader::new(
             mock,
             &firmware,
@@ -533,6 +736,16 @@ ccode=US
         }
         if !saw_nvram {
             return TestResult::Fail("loader did not stream NVRAM blob");
+        }
+        if loader.packet_core() != Some(0x18011000)
+            || loader.transport.words.get(&0x18004044) != Some(&0)
+            || loader.transport.words.get(&0x18114408) != Some(&1)
+            || loader.transport.words.get(&0x18011048) != Some(&(4 << 16))
+        {
+            return TestResult::Fail("discovered core reset/remap/mailbox contract differs");
+        }
+        if loader.run() != Err(LoadError::InvalidState) {
+            return TestResult::Fail("firmware owner reused after CPU release");
         }
         TestResult::Pass
     }

@@ -145,6 +145,57 @@ also consult upstream Linux GPL sources.
 - `Xhci::control_in` and `Xhci::control_out` identify Data and Status Stage
   completion events by their originating control-ring TRB and drain both before
   returning. A queued Status completion may never satisfy the next control TD.
+- `USBDevice::{begin_bulk_in,begin_bulk_out}` submit one 1..4096-byte TD
+  and return a `BulkToken`; `poll_bulk_in(token, out)` / `poll_bulk_out(token)`
+  return `None` while the same TD remains active. A receive buffer must cover
+  the original requested length. Polling never imposes an idle timeout.
+  Receipts identify the slot generation, endpoint, private submission serial,
+  direction and originating TRB. Only that TRB's exact terminal event can
+  retire the submission; IN short packets are valid, malformed residue and
+  error completions poison the endpoint. Copy-out precedes reuse.
+- The controller retains bulk DMA ownership before any scratch-buffer mutation
+  or TRB publication. Dropping a token or compatibility `bulk_in/out` future,
+  and timeout/error returns, do not cancel or release that ownership. A second
+  submission fails before touching the scratch page or ring. Recovery requires
+  a future explicit stop/drain/reset contract; this API does not provide one.
+  `USBDevice` bulk operations reject stale slot generations. Periodic transfer
+  methods cannot target bulk endpoints. The xHCI layer owns DMA cache
+  maintenance and device barriers, including outer-shareable ordering on ARM.
+- `Xhci::configure_endpoints` accepts new, distinct endpoint DCIs and refuses
+  replacement of an existing endpoint without quiescence. It serializes slot
+  configuration with new bulk submissions and preserves the highest existing
+  DCI. Input Context and new rings are retained across a published command's
+  cancellation or ambiguous failure; only the exact command TRB's successful
+  completion permits adoption. An ambiguous configuration poisons the slot
+  against retry/readdress rather than freeing hardware-owned DMA.
+- `USBDevice` control, descriptor and endpoint-configuration operations carry
+  the handle's retained generation into the controller. EP0 claims its shared
+  page before mutation and releases it only after validated Data/Status
+  terminal completions and copy-out. Error/cancellation keeps EP0 busy; a new
+  software firmware owner cannot reuse an ambiguous TD's buffer. Disable Slot
+  invalidates handles before command publication and retains all mappings.
+- Address Device reserves a slot before DMA setup, retains Input/Device
+  Contexts plus EP0 ring/page before DCBAA publication, and adopts them only
+  after the exact command TRB succeeds. Address, Configure, Evaluate, Disable
+  and Enable command waits match originating command pointers. Evaluate
+  Context also retains its Input Context across error/cancellation. EP0 Link
+  initialization follows zeroing so the ring can wrap.
+- Readdress/reuse of an owned, published-failed or disabled slot is currently
+  refused. HCE soft reset is refused once any slot has reserved ownership.
+  Full reconnect, endpoint stop/drain, reclamation and controller-reset
+  recovery remain software prerequisites; receipt APIs do not claim them.
+- Command/EP0 waits inspect the bounded completion queues before each single
+  hardware-event demux, check deadlines throughout, and yield after at most
+  32 unrelated events. Queue pressure cannot make the waiter's own draining
+  evict its completion, and a continuous producer cannot bypass its timeout
+  or executor yield. Unmatched events retain the existing 64-entry policy.
+- ISR demux retains exact active bulk and EP0 Data/Status completions in
+  per-owner latches before the shared queues. Command-ring entries reserve a
+  receipt before publication and retain their exact completion there until
+  consumed. Device ownership locks are short, blocking and IRQ-safe, so another
+  CPU's contention cannot send an owned completion into a lossy fallback.
+  Identical duplicates are idempotent; conflicting results poison reuse.
+  Command-ring entries cannot overwrite an unconsumed or abandoned receipt.
 - `class_registry::dispatch_probe(device, config)` evaluates exact VID/PID
   entries against the device descriptor and class-triple entries against
   Interface Descriptors in `config`. A class-only entry is an explicit

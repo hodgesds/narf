@@ -43,7 +43,7 @@ async-trait = "0.1"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
-kernel-test = []
+kernel-test = ["narf-drivers-sdio/kernel-test"]
 
 [lints]
 workspace = true

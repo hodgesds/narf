@@ -61,7 +61,7 @@ pub const F1_SBADDRHIGH: u32 = 0x1_000C;
 /// to gate the ALP / HT clocks during firmware load.
 pub const F1_CHIPCLK_CTRL: u32 = 0x1_000E;
 /// F1 sleep / wake control register (datasheet §6.5 Table 6-7).
-pub const F1_SLEEP_CSR: u32 = 0x1_000F;
+pub const F1_SLEEP_CSR: u32 = 0x1_001F;
 
 /// CMD52 (single-byte I/O) raw argument word (SDIO Simplified Spec
 /// §5.1 Figure 5-1).

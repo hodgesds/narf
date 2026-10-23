@@ -1,27 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! SDHCI SDIO host controller driver for NARF.
 //!
-//! ## What this crate provides
-//!
-//! 1. **PCI probe** (`sdhci::probe`) — matches class 0x080500, extracts BAR0.
-//! 2. **SDHCI register map** (`sdhci::regs`) — all MMIO offsets + bit masks.
-//! 3. **Bus command encoders** (`sdhci::cmd`) — CMD0/3/5/7/52/53 argument
-//!    words, R4/R5 response decoding.
-//! 4. **1.8 V switch helpers** (`sdhci::voltage`) — power-control and
-//!    host-control-2 register values for the UHS-I voltage transition.
-//! 5. **Host state** (`host`) — `SdhciHost` struct: capabilities decode,
-//!    clock-divider calculation, RCA/OCR storage.
-//! 6. **SDIO protocol** (`sdio::cccr`) — CCCR + FBR register addresses,
-//!    CIS tuple decoders (MANFID, FUNCID, FUNCE).
-//! 7. **`SdioFunction` trait** (`sdio::function`) — per-function CMD52/53
-//!    surface consumed by chip drivers (e.g. cyw43439 bridge).
-//!
-//! ## Deferred
-//!
-//! - UHS-II (CMD11 + re-tuning loop, eMMC HS400, SD secure erase).
-//! - DMA ring / ADMA2 descriptor management.
-//! - Live MMIO register I/O (needs `narf-bus` MMIO cap surface);
-//!   encoders here are pure computation that can be unit-tested without HW.
+//! Owned standard SDHCI PIO execution, 3.3-V one-bit SDIO enumeration,
+//! checked function access and PCI function-driver dispatch. See
+//! `specification/spec.md` for the supported profile and remaining platform,
+//! vendor-quirk, DMA and hotplug work. CYW43439 consumes this live host.
 //!
 //! ## References
 //!
@@ -37,7 +20,10 @@
 
 extern crate alloc;
 
+pub mod card;
 pub mod host;
+pub mod native;
+pub mod pio;
 pub mod sdhci;
 pub mod sdio;
 

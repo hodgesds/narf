@@ -5,10 +5,24 @@
 //! paths. Addresses are DMA32; CPU access always uses the coherent mapping.
 //! The PCI owner must stop these engines before releasing their memory.
 
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use super::ce::{self, Ath10kMmio, RingConfig};
 use super::hw::{ce_off, HwRev};
+
+/// Order coherent descriptor/data access against a PCI peripheral. A Rust
+/// atomic fence alone is inner-shareable on ARM and does not order PCI DMA.
+pub(super) fn barrier() {
+    compiler_fence(Ordering::SeqCst);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: orders outer-shareable memory; no object or stack is accessed.
+    unsafe {
+        core::arch::asm!("dmb osh", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::fence(Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DmaError {
@@ -140,7 +154,7 @@ impl<B: Memory> Ring<B> {
         for i in 0..self.entries as usize * 8 {
             self.memory.write(i, 0);
         }
-        fence(Ordering::SeqCst);
+        barrier();
         let config = RingConfig {
             hw_rev: hw,
             pipe,
@@ -199,7 +213,7 @@ impl<B: Memory> Ring<B> {
         self.memory.write(offset + 7, 0);
         self.next = (slot + 1) & (self.entries - 1);
         self.pending = Some((slot, bytes));
-        fence(Ordering::SeqCst);
+        barrier();
         mmio.write32(
             self.base
                 + if self.direction == Direction::Source {
@@ -242,7 +256,7 @@ impl<B: Memory> Ring<B> {
                 count
             }
         };
-        fence(Ordering::Acquire);
+        barrier();
         self.pending = None;
         let offset = slot as usize * 8 + 4;
         self.memory.write(offset, 0);

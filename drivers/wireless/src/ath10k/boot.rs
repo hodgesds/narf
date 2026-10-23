@@ -7,7 +7,6 @@
 //! verified PCI bus-master disable; otherwise allocations remain retained.
 
 use core::mem::ManuallyDrop;
-use core::sync::atomic::{fence, Ordering};
 
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
@@ -16,7 +15,7 @@ use narf_lib::id::DomainId;
 
 use super::bmi::{word, BmiError, Transport};
 use super::ce::{self, Ath10kMmio};
-use super::dma::{Direction, Memory, Ring};
+use super::dma::{barrier, Direction, Memory, Ring};
 use super::hw::{self, HwRev, Registers};
 
 const HOST_INTEREST: u32 = 0x400800;
@@ -43,6 +42,7 @@ struct Resources<B = DmaBuffer> {
     request: B,
     response: B,
     diag: B,
+    codeswap: Option<B>,
 }
 
 fn allocate(bytes: usize) -> Result<DmaBuffer, BmiError> {
@@ -84,6 +84,7 @@ impl PciBoot {
             request: allocate(256)?,
             response: allocate(2048)?,
             diag: allocate(2048)?,
+            codeswap: None,
         };
         Ok(Self {
             mmio: Mmio(mmio),
@@ -239,7 +240,7 @@ impl PciBoot {
             HwRev::Ar9462Legacy => return Err(BmiError::Unsupported),
         }
         self.initialize_pipes()?;
-        fence(Ordering::SeqCst);
+        barrier();
         // Mark the resources as published before the first fallible enable.
         self.armed = true;
         narf_bus::pci::set_command(&self.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
@@ -350,6 +351,19 @@ impl Transport for PciBoot {
             .bmi_exchange(&mut self.mmio, &mut self.poisoned, request, response)
             .await
     }
+
+    fn prepare_codeswap(&mut self, bytes: &[u8]) -> Result<(u32, [u8; 208]), BmiError> {
+        if self.poisoned || self.resources.codeswap.is_some() {
+            return Err(BmiError::BadResponse);
+        }
+        let layout = super::swap::Layout::parse(bytes)?;
+        let mut memory = allocate(layout.size)?;
+        let info = layout.fill(bytes, &mut memory)?;
+        // This allocation becomes part of the same fail-safe teardown owner
+        // as every CE buffer before its address enters target memory.
+        self.resources.codeswap = Some(memory);
+        Ok((layout.target, info))
+    }
 }
 
 impl<B: Memory> Resources<B> {
@@ -422,7 +436,7 @@ impl<B: Memory> Resources<B> {
         };
         let result = async {
             self.diag_rx.post(mmio, destination, bytes.len() as u16)?;
-            fence(Ordering::SeqCst);
+            barrier();
             self.diag_tx.post(mmio, source, bytes.len() as u16)?;
             if self.wait_pair(mmio, true, true, 1000).await? as usize != bytes.len() {
                 return Err(BmiError::BadResponse);
@@ -500,7 +514,7 @@ impl Drop for PciBoot {
                 && narf_bus::pci::read_command(&self.cap, &self.device)
                     .is_ok_and(|command| command & narf_bus::pci::cmd::BUS_MASTER == 0);
         if stopped && disabled {
-            fence(Ordering::SeqCst);
+            barrier();
             // SAFETY: no CE can access the allocations and PCI BME is clear.
             unsafe {
                 ManuallyDrop::drop(&mut self.resources);

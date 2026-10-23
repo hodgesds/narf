@@ -224,10 +224,10 @@ pub mod tests {
     kernel_test_in!("drivers/sdio/cccr", smoke_fbr_layout_fn1);
 
     fn smoke_cistpl_manfid_decode() -> TestResult {
-        // MANFID for CYW43439: vendor=0x02D0, device=0xA9A6.
-        let body: [u8; 4] = [0xD0, 0x02, 0xA6, 0xA9];
+        // MANFID for CYW43439: vendor=0x02D0, device=0xA9AF.
+        let body: [u8; 4] = [0xD0, 0x02, 0xAF, 0xA9];
         match cistpl_manfid_decode(&body) {
-            Some((0x02D0, 0xA9A6)) => {}
+            Some((0x02D0, 0xA9AF)) => {}
             _ => return TestResult::Fail("MANFID decode mismatch"),
         }
         TestResult::Pass

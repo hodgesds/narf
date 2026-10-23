@@ -68,11 +68,15 @@ extern crate alloc;
 pub mod bmi;
 mod boot;
 pub mod ce;
+mod clock;
 pub mod dma;
+pub mod firmware;
 pub mod htc;
 pub mod htt;
 pub mod hw;
 pub mod pci;
+pub mod profile;
+mod swap;
 pub mod wmi;
 
 pub use hw::{HwRev, ALL_PCI_MATCHES, ATHEROS_VENDOR, UBNT_VENDOR};

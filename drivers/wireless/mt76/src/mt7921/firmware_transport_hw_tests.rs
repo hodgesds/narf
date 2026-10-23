@@ -97,6 +97,101 @@ kernel_test_in!(
     mcu_dma_production_tx_descriptor_completion_and_wrap
 );
 
+fn mt76_recycled_storage_clears_tokens_payloads_indices_and_old_rx() -> TestResult {
+    let (_words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("recovery DMA fixture allocation"),
+    };
+    let storage = hw.owner.storage.as_mut().unwrap();
+    for ring in [&mut storage.wm, &mut storage.fwdl, &mut storage.data] {
+        ring.index = 7;
+        ring.pending = true;
+        ring.set_word(7, 0, 0x12340000);
+        ring.set_word(7, 1, (64 << 16) | LAST);
+        ring.buffers[7].as_mut_slice()[..32].fill(0x77);
+    }
+    storage.tokens.begin(1).unwrap();
+    storage.pending_events.push_back(vec![0x66; 36]);
+    storage.pending_data.push_back(vec![0x55; 64]);
+    storage.rx[0].index = 9;
+    storage.rx[0].set_word(9, 1, (36 << 16) | LAST | DONE);
+    // All fixture buffers are CPU-owned; there is no device attached to this
+    // memory model. Use the exact storage operation called after stop proof.
+    storage.recycle();
+    if storage.tokens.available() != Ok(1)
+        || !storage.pending_events.is_empty()
+        || !storage.pending_data.is_empty()
+    {
+        return TestResult::Fail("old firmware tokens/replies survived DMA generation reset");
+    }
+    for ring in [&storage.wm, &storage.fwdl, &storage.data] {
+        if ring.index != 0 || ring.pending {
+            return TestResult::Fail("old TX index/pending state retained");
+        }
+        for slot in 0..DEPTH {
+            if [
+                ring.word(slot, 0),
+                ring.word(slot, 1),
+                ring.word(slot, 2),
+                ring.word(slot, 3),
+            ] != [0, DONE, 0, 0]
+                || ring.buffers[slot].as_slice().iter().any(|byte| *byte != 0)
+            {
+                return TestResult::Fail("old TX descriptor/key payload remained device visible");
+            }
+        }
+    }
+    for ring in &storage.rx {
+        if ring.index != 0 || ring.pending {
+            return TestResult::Fail("old RX index retained");
+        }
+        for slot in 0..DEPTH {
+            let address = ring.buffers[slot].dma_addr().raw();
+            if [
+                ring.word(slot, 0),
+                ring.word(slot, 1),
+                ring.word(slot, 2),
+                ring.word(slot, 3),
+            ] != [
+                address as u32,
+                (MAX_FRAME as u32) << 16,
+                0,
+                (address >> 32) as u32 & 15,
+            ] {
+                return TestResult::Fail("RX generation was not freshly armed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/recovery",
+    mt76_recycled_storage_clears_tokens_payloads_indices_and_old_rx
+);
+
+fn mt76_wfsys_reset_uses_real_register_bits_and_preserves_neighbors() -> TestResult {
+    let (_words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("reset register fixture allocation"),
+    };
+    if hw.write(0x18000140, 0xaabb0001).is_err()
+        || hw.assert_reset().is_err()
+        || hw.read(0x18000140) != Ok(0xaabb0000)
+        || hw.release_reset().is_err()
+        || hw.read(0x18000140) != Ok(0xaabb0001)
+        || hw.reset_done() != Ok(false)
+        || hw.write(0x18000140, 0xaabb0011).is_err()
+        || hw.reset_done() != Ok(true)
+    {
+        return TestResult::Fail("WFSYS reset/readiness touched wrong address or mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/recovery",
+    mt76_wfsys_reset_uses_real_register_bits_and_preserves_neighbors
+);
+
 fn mcu_dma_production_rx_copies_before_rearm_and_checks_lengths() -> TestResult {
     let (mut words, mut hw) = match rig() {
         Ok(rig) => rig,

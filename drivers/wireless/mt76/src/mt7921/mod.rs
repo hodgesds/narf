@@ -22,7 +22,8 @@
 //! scanning is connected to nl80211; management TX has a private retained
 //! cut-through backend. The retained legacy station profile connects Open/WPA2
 //! association, controlled-port keys and bounded kernel/frame-ring RX/TX service.
-//! Broader modes and reset recovery remain software work. The older `full_bring_up` boundary intentionally returns `NotImplemented`;
+//! Reset/recovery retires old DMA before firmware reload on x86_64/aarch64.
+//! Broader radio modes remain software work. The older `full_bring_up` boundary intentionally returns `NotImplemented`;
 //! firmware-only initialization uses the retained transport owner instead.
 //!
 //! ## Provenance
@@ -44,7 +45,6 @@ pub mod mcu;
 mod packet_tx;
 pub mod pci;
 mod registers;
-#[cfg(target_arch = "x86_64")]
 mod registers_tests;
 pub mod regs;
 pub mod txrx;
@@ -61,7 +61,6 @@ pub use regs::{
 /// (one level up in `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
-    #[cfg(target_arch = "x86_64")]
     narf_init::register_with_budget(
         narf_init::Stage::Late,
         "mt76-firmware",

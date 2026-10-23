@@ -1,8 +1,9 @@
 # ath10k — Specification
 
-> Status: **Boot transport implemented; WLAN software incomplete.**
-> The live PCI probe schedules an owned DMA32 CE/BMI bootstrap and obtains
-> target information. This is not firmware activation or usable Wi-Fi.
+> Status: **ROM firmware preparation implemented; WLAN software incomplete.**
+> The live PCI task obtains BMI identity, selects trusted firmware/BDF,
+> runs OTP calibration and downloads the image. BMI_DONE is withheld until
+> an owned runtime HIF exists. This is not activated or usable Wi-Fi.
 
 ## 1. Purpose & scope
 
@@ -27,7 +28,20 @@ packet service are not yet attached.
 - `pci::with_controller` exposes `Ath10kDevice` metadata.
   `target_info: Option<bmi::TargetInfo>` becomes present only after the
   real CE0 request and CE1 response complete. `boot_error` retains a
-  bootstrap failure. No netdev is registered at this stage.
+  bootstrap failure. `firmware_prepared` records the directory, API and
+  WMI/HTT dialect only after real ROM-side image preparation;
+  `firmware_error` records profile/file/BDF/OTP failures. No netdev is
+  registered at this stage.
+- `profile::Profile::select(device, version)` binds the PCI device ID and
+  exact BMI target version to Linux's PCI firmware directory, board sizes,
+  OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
+  separate exact entries; SDIO tuples are excluded. A QCA9887 tuple does
+  not add a PCI match or runtime support for that part.
+- `firmware::Image::{parse, load}` own the API 2–6 container and expose
+  bounded image/OTP/code-swap slices, feature bits and WMI/HTT operation
+  versions. `Files` supplies owned immutable bytes; production uses
+  capability-authorized verified firmware-registry blobs. The highest
+  present API is parsed; a malformed present blob fails explicitly.
 - `hw::HwRev::registers()` returns the correct per-family windows;
   `Registers::ce_base(pipe)` rejects an out-of-range CE index. The RTC
   chip-ID helper now returns the complete BAR-relative address.
@@ -47,11 +61,17 @@ hang on that path. An inherited nonempty CE fails rather than being
 repointed to new host memory.
 
 Internal `bmi::Bmi` provides target information, chunked memory read/write,
-execute, zero-padded compressed download and the one-way BMI_DONE handoff.
-These are wired to the owned PCI transport; firmware/board activation
-does not yet call the download/DONE sequence. A retained async mutex owns
-the session after target identification so no IRQ-disabling lock crosses
-an await.
+SoC register read/write, execute, zero-padded compressed download and the
+one-way BMI_DONE handoff. The live boot task waits for firmware registry
+publication, derives board names from the actual PCI/subsystem/OTP identity
+and bounded SMBIOS variant, selects board-2 data or explicit legacy board
+data, writes host-interest configuration, downloads BDF/extended BDF,
+runs OTP and downloads firmware. QCA6174 HW3.2/QCA9377 HW1.1 execute Linux's
+ordered PLL setup with bounded asynchronous settle waits. Code-swap TLVs
+are checked, copied into retained DMA32 storage and advertised through the
+208-byte segment record before image upload. An async mutex retains the
+BMI transport, selected profile and image after preparation. No DONE or
+HTC/WMI activation occurs while runtime ownership is incomplete.
 
 ## 4. Invariants
 
@@ -59,6 +79,8 @@ an await.
   memory decode enabled and verified. Additional matched singleton radios
   are parked with BME/memory decode off and rejected. BME is enabled only
   after initialization of retained rings.
+- Repeated dispatch of the already owned PCI address fails before any
+  parking or MMIO operation and cannot stop its active DMA.
 - A ring slot cannot be reused until its terminal completion. Source
   completion validates the read index; RX completion reads the aligned
   16-bit count atomically and checks it against the posted capacity.
@@ -70,7 +92,8 @@ an await.
   and PCI bus-master disable is read back. A failure retains the memory.
 - CPU pointers come from coherent CPU mappings; DMA addresses only enter
   device descriptors/registers. Descriptor publication and consumption
-  include release/acquire ordering.
+  include device-visible ordering: outer-shareable DMB on aarch64, bracketed
+  by compiler fences, and a full fence on x86_64.
 - BMI_DONE prevents further bootloader commands even if that handoff times
   out. Rounded writes and LZ tail chunks are zero-padded.
 - Identity or bootloader success never enables carrier, transmit or a
@@ -86,25 +109,32 @@ the separate 16-byte WCN3990 format is not their DMA format.
 
 `bus/` supplies PCI authority and device mappings, `io/` coherent DMA32,
 `lib/` the retained async mutex, and scheduler/time supply bounded waits.
-Later firmware activation will consume the trusted firmware registry;
-the current task does not claim arbitrary bytes as calibrated board data.
+The firmware registry supplies verified blobs under derived read authority.
+Board selection uses exact identities and checked record bounds; malformed
+containers or failed OTP execution do not proceed to image activation.
 
 ## 7. Stage assignment
 
 Boot transport groundwork in Stage 5. Software regressions cover corrected
 CE programming, ring completion/wrap/reuse, DMA bounds, BMI chunking,
-short responses and the DONE transition. These tests do not emulate a
-Qualcomm radio or establish reset/ROM interoperability.
+short responses and the DONE transition. Composed ROM fixtures execute the
+production BMI orchestration and verify selected BDF bytes, OTP parameters,
+PLL register order, code-swap payload/segment records and failed-calibration
+gates. These tests do not emulate a Qualcomm radio or establish reset/ROM
+interoperability.
 
 ## 8. Remaining software and hardware acceptance
 
 The following are software work, not gates that a physical boot can close:
 
-1. Firmware API container/profile parsing keyed by BMI target version;
-   correct firmware paths, WMI/HTT operation versions and file lifecycle.
-2. Board/OTP selection and execution, BDF and extended BDF upload,
-   host-interest target configuration, clocks/PLL/UART options and the
-   calibrated firmware download/DONE handoff.
+1. Runtime-safe handoff of the prepared image through BMI_DONE. The current
+   ROM-only session stops before firmware activation. Alternate pre-cal/cal
+   sources (file/DT/EEPROM), non-BMI images and diagnostic fast download are
+   not implemented; the supported ROM path requires a valid OTP image and
+   calibrated BDF. Missing board files currently fail the boot session.
+2. Complete per-firmware-family feature/dialect operation tables and
+   optional board/clock/UART quirks, with real firmware validation of the
+   current OTP/BDF/PLL/code-swap path.
 3. Full runtime CE2/3/4/5 buffers and ownership, per-chip CE5 overrides,
    HIF IRQ/MSI service, recovery and PM/teardown.
 4. Actual HTC credits/service handshake, family-specific WMI command and

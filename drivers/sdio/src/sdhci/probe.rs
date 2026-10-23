@@ -14,7 +14,7 @@ use super::regs::{PCI_CLASS_SDHCI, PCI_SDHCI_BAR};
 pub const PCI_BASE_CLASS_SYSTEM: u8 = 0x08;
 /// PCI sub-class for SD host controllers.
 pub const PCI_SUB_CLASS_SDHCI: u8 = 0x05;
-/// Programming interface 0x00 (standard SDHCI; 0x01 is vendor-specific).
+/// Programming interface 0x00 (standard SDHCI; 0x01 adds DMA capability; 0x02 is vendor-specific).
 pub const PCI_PROG_IF_SDHCI: u8 = 0x00;
 
 /// Build the 24-bit class code from base/sub/prog_if.
@@ -26,9 +26,9 @@ pub const fn pci_class(base: u8, sub: u8, prog_if: u8) -> u32 {
 /// Test whether a raw 24-bit PCI class code identifies an SDHCI controller.
 #[inline]
 pub fn is_sdhci_class(class24: u32) -> bool {
-    // Programming interface byte may be 0x00 (standard) or 0x01 (vendor);
-    // match on base + sub only.
-    (class24 >> 8) == (PCI_CLASS_SDHCI >> 8)
+    // Standard PIO and standard DMA-capable interfaces use the same
+    // register model. Vendor-specific interface 2 needs a dedicated driver.
+    class24 == PCI_CLASS_SDHCI || class24 == PCI_CLASS_SDHCI + 1
 }
 
 /// Return the BAR index that SDHCI controllers expose their MMIO registers on.
@@ -82,7 +82,7 @@ pub mod tests {
         if !is_sdhci_class(class) {
             return TestResult::Fail("is_sdhci_class rejected known-good class");
         }
-        // Vendor-specific prog-if (0x01) should also match.
+        // DMA-capable standard prog-if (0x01) should also match.
         let vendor_if = pci_class(PCI_BASE_CLASS_SYSTEM, PCI_SUB_CLASS_SDHCI, 0x01);
         if !is_sdhci_class(vendor_if) {
             return TestResult::Fail("is_sdhci_class rejected prog_if=0x01");

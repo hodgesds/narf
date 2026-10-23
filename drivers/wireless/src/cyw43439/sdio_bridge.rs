@@ -1,47 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! CYW43439 SDIO transport bridge.
 //!
-//! Connects the CYW43439's [`Transport`] trait to the `narf-drivers-sdio`
-//! `SdioFunction` / CMD52 / CMD53 codec layer.
-//!
-//! ## Why this exists
-//!
-//! The CYW43439 chip presents three SDIO functions (F0 CCCR, F1
-//! backplane, F2 WLAN). The existing `cyw43439::transport::Transport`
-//! trait exposes a `(Function, address) → bytes` model that is
-//! transport-agnostic; this file provides the SDIO-flavour adapter
-//! that calls `narf_drivers_sdio` argument encoders instead of
-//! bit-banging the SPI/PIO bus.
-//!
-//! ## What it does **not** do
-//!
-//! * Does not touch the SDHCI hardware directly — that is the
-//!   `SdioFunction` implementor's job.
-//! * Does not rewrite any existing cyw43439 code.
-//! * Does not add any PCI or bus-init logic here.
-//!
-//! ## Cross-check
-//!
-//! The argument-word sequences produced by `encode_*` helpers below
-//! are verified in `tests` to be byte-identical to the reference
-//! encodings from `soypat/cyw43439` (MIT) and Embassy `cyw43`
-//! (Apache-2.0/MIT) for the same (function, address, data) tuples.
+//! Owned F0/F1 register/RAM and F2 packet adapter over `SdioFunction`.
+//! Reference: Linux brcmfmac/{bcmsdh,sdio}.c. F1 words use CMD53 with
+//! the 32-bit backplane access flag. F2 RX uses fixed reads, TX follows
+//! incrementing writes; mailbox handling bounds readiness and flow control.
 
 #![allow(dead_code)]
 
 use narf_drivers_sdio::sdhci::cmd::{cmd52_arg, cmd53_arg};
 use narf_drivers_sdio::sdio::function::{SdioError, SdioFunction};
 
-use super::transport::{Function, Transport, TransportError};
+use super::transport::{Function, PacketTransport, Transport, TransportError};
 
-/// Maximum single-burst byte count for the CYW43439 WLAN path
-/// when using SDIO byte mode (SDIO Simplified Spec §5.3; 9-bit
-/// count field, but CYW43439 datasheet caps F2 bursts at 2048 B).
-pub const CYW43439_F2_MAX_BURST: usize = 2048;
+/// Maximum byte-mode CMD53 command extent (zero count encodes512).
+pub const CYW43439_F2_MAX_BURST: usize = 512;
 
-/// SDIO block size used for F2 bulk transfers.
-/// CYW43439 datasheet §6.5 / soypat/cyw43439 reference driver.
-pub const CYW43439_SDIO_BLOCK_SIZE: u16 = 64;
+/// SDIO F2 block size, matching Linux bcmsdh.c (F1 uses64).
+pub const CYW43439_SDIO_BLOCK_SIZE: u16 = 512;
+const F1_BLOCK_SIZE: u16 = 64;
 
 // ── Argument-word encoders (pure functions for test coverage) ─────────
 
@@ -78,6 +55,8 @@ fn map_err(e: SdioError) -> TransportError {
         SdioError::BadFunction => TransportError::AddressOverflow,
         SdioError::HostError => TransportError::Timeout,
         SdioError::NotEnabled => TransportError::NotReady,
+        SdioError::AddressOverflow => TransportError::AddressOverflow,
+        SdioError::Unsupported => TransportError::NotReady,
     }
 }
 
@@ -87,77 +66,298 @@ fn map_err(e: SdioError) -> TransportError {
 /// it wraps the SDHCI host; in tests it is a `MockSdio`.
 pub struct SdioTransport<F: SdioFunction> {
     func: F,
+    packet_core: Option<u32>,
+    rx_pending: bool,
+    flow_stopped: bool,
+    failed: bool,
 }
 
 impl<F: SdioFunction> core::fmt::Debug for SdioTransport<F> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("SdioTransport").finish_non_exhaustive()
+        f.debug_struct("SdioTransport")
+            .field("failed", &self.failed)
+            .field("packet_core", &self.packet_core)
+            .finish_non_exhaustive()
     }
 }
-
 impl<F: SdioFunction> SdioTransport<F> {
-    /// Wrap an `SdioFunction` implementor.
     pub fn new(func: F) -> Self {
-        Self { func }
+        Self {
+            func,
+            packet_core: None,
+            rx_pending: false,
+            flow_stopped: false,
+            failed: false,
+        }
     }
-
-    /// Enable the CYW43439 WLAN function (F2) over the `SdioFunction` surface.
+    /// F1 is enabled before any backplane command. The host retains matching
+    /// enable/block-size state; raw CCCR writes cannot bypass its lifecycle.
+    pub fn prepare(&mut self) -> Result<(), TransportError> {
+        self.func.enable_func(1).map_err(map_err)?;
+        self.func
+            .set_block_size(1, F1_BLOCK_SIZE)
+            .map_err(map_err)?;
+        self.func
+            .set_block_size(2, CYW43439_SDIO_BLOCK_SIZE)
+            .map_err(map_err)
+    }
     pub fn enable_wlan(&mut self) -> Result<(), TransportError> {
-        self.func.enable_func(Function::Wlan as u8).map_err(map_err)
+        self.func.enable_func(2).map_err(map_err)
+    }
+    pub fn read_backplane(&mut self, address: u32) -> Result<u32, TransportError> {
+        self.window(address)?;
+        self.read32(Function::Backplane, address & 0x7fff)
+    }
+    pub fn write_backplane(&mut self, address: u32, value: u32) -> Result<(), TransportError> {
+        self.window(address)?;
+        self.write32(Function::Backplane, address & 0x7fff, value)
+    }
+    fn window(&mut self, address: u32) -> Result<(), TransportError> {
+        for write in super::backplane::window_writes(address) {
+            self.func
+                .cmd52_write(1, write.address, write.data)
+                .map_err(map_err)?;
+        }
+        Ok(())
+    }
+    /// Linux sdio.c firmware callback: publish protocol v4 before enabling
+    /// F2, and latch core mailbox/frame indications. Polling needs no IRQ.
+    pub fn initialize_packets(&mut self, core: u32) -> Result<(), TransportError> {
+        if !crate::brcmfmac::chip::valid_address(core) {
+            return Err(TransportError::AddressOverflow);
+        }
+        self.write_backplane(core + 0x48, 4 << 16)?;
+        self.enable_wlan()?;
+        self.write_backplane(core + 0x24, 0xf0 | (1 << 29))?;
+        self.packet_core = Some(core);
+        Ok(())
+    }
+    fn mailbox(&mut self) -> Result<(), TransportError> {
+        let core = self.packet_core.ok_or(TransportError::NotReady)?;
+        let status = self.read_backplane(core + 0x20)?;
+        if status == u32::MAX || status & 0xff00 != 0 {
+            return Err(TransportError::ChipFlowError);
+        }
+        // FC_CHANGE is W1C; STATE reflects the current global stop state.
+        if status & 0x20 != 0 {
+            self.write_backplane(core + 0x20, 0x20)?;
+            // A second CHANGE may race the ACK. Linux treats either STATE
+            // or a reasserted CHANGE as stopped until the next debounce.
+            self.flow_stopped = self.read_backplane(core + 0x20)? & 0x30 != 0;
+        } else {
+            self.flow_stopped = status & 0x10 != 0;
+        }
+        let pending = status & ((1 << 6) | (1 << 7) | (1 << 29));
+        if pending != 0 {
+            self.write_backplane(core + 0x20, pending)?;
+        }
+        if status & (1 << 7) != 0 {
+            let data = self.read_backplane(core + 0x4c)?;
+            self.write_backplane(core + 0x40, 2)?; // SMB_INT_ACK.
+            if data & 0x10 != 0 {
+                return Err(TransportError::NotReady);
+            }
+            if data & 0xa != 0 && (data >> 16) & 255 != 4 {
+                return Err(TransportError::BadFraming);
+            }
+            if data & 1 != 0 {
+                self.rx_pending = true;
+            }
+        }
+        if status & (1 << 6) != 0 {
+            self.rx_pending = true;
+        }
+        Ok(())
+    }
+    fn receive_inner(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
+        self.mailbox()?;
+        if !self.rx_pending {
+            return Ok(0);
+        }
+        if buffer.len() < 64 {
+            return Err(TransportError::LengthOverflow);
+        }
+        self.window(0x1800_0000)?;
+        self.func
+            .cmd53_read_fixed(2, 0x8000, &mut buffer[..64])
+            .map_err(map_err)?;
+        let length = usize::from(u16::from_le_bytes([buffer[0], buffer[1]]));
+        let inverted = u16::from_le_bytes([buffer[2], buffer[3]]);
+        if length == 0 && inverted == 0 {
+            self.rx_pending = false;
+            return Ok(0);
+        }
+        if length < 12 || !(length as u16) != inverted || length > super::runtime::MAX_PACKET {
+            return Err(TransportError::BadFraming);
+        }
+        let physical = length.max(64).next_multiple_of(4);
+        if physical > buffer.len() {
+            return Err(TransportError::LengthOverflow);
+        }
+        for chunk in buffer[64..physical].chunks_mut(512) {
+            self.func
+                .cmd53_read_fixed(2, 0x8000, chunk)
+                .map_err(map_err)?;
+        }
+        Ok(length)
     }
 }
-
+impl<F: SdioFunction> crate::brcmfmac::chip::Backplane for SdioTransport<F> {
+    fn read32(&mut self, address: u32) -> Result<u32, crate::brcmfmac::chip::Error> {
+        self.read_backplane(address)
+            .map_err(|_| crate::brcmfmac::chip::Error::Access)
+    }
+    fn write32(&mut self, address: u32, value: u32) -> Result<(), crate::brcmfmac::chip::Error> {
+        self.write_backplane(address, value)
+            .map_err(|_| crate::brcmfmac::chip::Error::Access)
+    }
+}
 impl<F: SdioFunction> Transport for SdioTransport<F> {
     fn read32(&mut self, function: Function, address: u32) -> Result<u32, TransportError> {
-        // Four sequential CMD52 reads; CYW43439 datasheet §6.5.
-        let mut word = 0u32;
-        for i in 0..4u32 {
-            let b = self
-                .func
-                .cmd52_read(function as u8, address + i)
+        let mut bytes = [0; 4];
+        if function == Function::Backplane && address < 0x10000 {
+            if address & 3 != 0 || address & 0x7fff > 0x7ffc {
+                return Err(TransportError::AddressOverflow);
+            }
+            self.func
+                .cmd53_read(1, address | 0x8000, &mut bytes)
                 .map_err(map_err)?;
-            word |= (b as u32) << (i * 8);
+        } else {
+            self.read_burst(function, address, &mut bytes)?;
         }
-        Ok(word)
+        Ok(u32::from_le_bytes(bytes))
     }
-
     fn write32(
         &mut self,
         function: Function,
         address: u32,
         value: u32,
     ) -> Result<(), TransportError> {
-        for i in 0..4u32 {
-            let b = ((value >> (i * 8)) & 0xFF) as u8;
+        if function == Function::Backplane && address < 0x10000 {
+            if address & 3 != 0 || address & 0x7fff > 0x7ffc {
+                return Err(TransportError::AddressOverflow);
+            }
             self.func
-                .cmd52_write(function as u8, address + i, b)
-                .map_err(map_err)?;
+                .cmd53_write(1, address | 0x8000, &value.to_le_bytes())
+                .map_err(map_err)
+        } else {
+            self.write_burst(function, address, &value.to_le_bytes())
         }
-        Ok(())
     }
-
     fn read_burst(
         &mut self,
         function: Function,
         address: u32,
         buf: &mut [u8],
     ) -> Result<(), TransportError> {
-        self.func
-            .cmd53_read(function as u8, address, buf)
-            .map_err(map_err)
+        if address > 0x1ffff || buf.len() > (0x20000 - address) as usize {
+            return Err(TransportError::AddressOverflow);
+        }
+        if function == Function::Bus || buf.len() == 1 {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = self
+                    .func
+                    .cmd52_read(function as u8, address + i as u32)
+                    .map_err(map_err)?;
+            }
+        } else {
+            let stride = if function == Function::Backplane {
+                usize::from(F1_BLOCK_SIZE)
+            } else {
+                512
+            };
+            for (i, chunk) in buf.chunks_mut(stride).enumerate() {
+                self.func
+                    .cmd53_read(function as u8, address + (i * stride) as u32, chunk)
+                    .map_err(map_err)?;
+            }
+        }
+        Ok(())
     }
-
     fn write_burst(
         &mut self,
         function: Function,
         address: u32,
         buf: &[u8],
     ) -> Result<(), TransportError> {
-        self.func
-            .cmd53_write(function as u8, address, buf)
-            .map_err(map_err)
+        if address > 0x1ffff || buf.len() > (0x20000 - address) as usize {
+            return Err(TransportError::AddressOverflow);
+        }
+        if function == Function::Bus || buf.len() == 1 {
+            for (i, &b) in buf.iter().enumerate() {
+                let at = address + i as u32;
+                if function == Function::Bus && at == super::sdio::CCCR_IO_ENABLE {
+                    for number in 1..=7 {
+                        if b & (1 << number) != 0 {
+                            self.func.enable_func(number).map_err(map_err)?;
+                        }
+                    }
+                } else {
+                    self.func
+                        .cmd52_write(function as u8, at, b)
+                        .map_err(map_err)?;
+                }
+            }
+        } else {
+            let stride = if function == Function::Backplane {
+                usize::from(F1_BLOCK_SIZE)
+            } else {
+                512
+            };
+            for (i, chunk) in buf.chunks(stride).enumerate() {
+                self.func
+                    .cmd53_write(function as u8, address + (i * stride) as u32, chunk)
+                    .map_err(map_err)?;
+            }
+        }
+        Ok(())
     }
 }
+impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
+    fn receive_packet(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
+        if self.failed {
+            return Err(TransportError::NotReady);
+        }
+        let result = self.receive_inner(buffer);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn transmit_packet(&mut self, packet: &[u8]) -> Result<(), TransportError> {
+        if self.failed {
+            return Err(TransportError::NotReady);
+        }
+        if packet.len() < 12 || packet.len() > super::runtime::MAX_PACKET || packet.len() % 4 != 0 {
+            return Err(TransportError::LengthOverflow);
+        }
+        if let Err(error) = self.mailbox() {
+            self.failed = true;
+            return Err(error);
+        }
+        if self.flow_stopped {
+            return Err(TransportError::Busy);
+        }
+        self.window(0x1800_0000)?;
+        // Linux uses incrementing memcpy_toio for F2 TX and fixed readsb
+        // for F2 RX. Each byte-mode command is at most 512 bytes.
+        for (i, chunk) in packet.chunks(512).enumerate() {
+            if let Err(error) = self
+                .func
+                .cmd53_write(2, 0x8000 + (i * 512) as u32, chunk)
+                .map_err(map_err)
+            {
+                self.failed = true;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "sdio_bridge_tests.rs"]
+mod runtime_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {

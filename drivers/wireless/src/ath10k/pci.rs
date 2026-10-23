@@ -2,8 +2,8 @@
 //! PCI identification and retained asynchronous DMA-backed BMI bootstrap.
 //! Probe disables inherited bus mastering, validates the per-chip BAR
 //! windows and wakes the target. The boot task owns reset/CE7 target
-//! configuration and CE0/CE1 BMI. Firmware/board activation, runtime HIF
-//! and interface registration remain separate unfinished software work.
+//! configuration, CE0/CE1 BMI and calibrated firmware/BDF/OTP preparation.
+//! Runtime HIF/HTC/WMI activation and interface registration remain open.
 
 #![allow(dead_code)]
 
@@ -18,6 +18,7 @@ use super::hw::*;
 
 /// Retained PCI identity and the asynchronous boot transport's result.
 pub struct Ath10kDevice {
+    address: narf_bus::BusAddr,
     /// BAR0 MMIO window.
     pub mmio_bar0: MmioRegion,
     /// Decoded hardware family.
@@ -34,6 +35,18 @@ pub struct Ath10kDevice {
     pub target_info: Option<super::bmi::TargetInfo>,
     /// Last boot failure; identification alone never implies a live WLAN.
     pub boot_error: Option<super::bmi::BmiError>,
+    /// ROM-side calibrated image download; firmware is not yet activated.
+    pub firmware_prepared: Option<FirmwarePrepared>,
+    /// Firmware/profile/BDF/OTP failure after a successful BMI identity.
+    pub firmware_error: Option<super::firmware::Error>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FirmwarePrepared {
+    pub directory: &'static str,
+    pub api: u8,
+    pub wmi_operations: u32,
+    pub htt_operations: u32,
 }
 
 impl core::fmt::Debug for Ath10kDevice {
@@ -80,8 +93,12 @@ static CONTROLLER: IrqSafeSpinLock<Option<Ath10kDevice>> = IrqSafeSpinLock::new(
 // The boot session retains its PCI authority, awake target and all DMA
 // allocations. Future firmware/runtime work takes this async mutex, never
 // an IRQ-disabling controller guard, while awaiting CE completions.
-static SESSION: narf_lib::mutex::Mutex<Option<super::bmi::Bmi<super::boot::PciBoot>>> =
-    narf_lib::mutex::Mutex::new(None);
+struct BootSession {
+    bmi: super::bmi::Bmi<super::boot::PciBoot>,
+    image: super::firmware::Image,
+    profile: super::profile::Profile,
+}
+static SESSION: narf_lib::mutex::Mutex<Option<BootSession>> = narf_lib::mutex::Mutex::new(None);
 
 /// PCI driver match registration. One entry per supported device id,
 /// each with a unique `name` so the bus registry doesn't collapse them.
@@ -132,8 +149,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // Verify inherited DMA is parked before any MMIO. An additional
     // matched radio is parked with memory decode off, never reported bound.
-    let occupied = CONTROLLER.lock().is_some();
-    crate::qualcomm_pci::park(&device, &cap, !occupied)?;
+    let owner = CONTROLLER
+        .lock()
+        .as_ref()
+        .map(|controller| controller.address);
+    let occupied = owner.is_some();
+    crate::qualcomm_pci::park(&device, &cap, !occupied, owner)?;
     if occupied {
         return Err(narf_bus::ProbeError::Other(
             "ath10k singleton already owns another radio",
@@ -170,7 +191,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         dev.chip_id_raw,
         dev.chip_id_rev,
     );
-    // Firmware/profile selection and activation are still pending.
+    // Exact profile selection needs the asynchronous BMI target version.
     let _ = writeln!(
         narf_console::Writer,
         "  ath10k:   firmware required at /firmware/ath10k/{}/",
@@ -259,6 +280,7 @@ pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice
     let rev = chip_id_rev(chip_id_raw);
 
     Ok(Ath10kDevice {
+        address: device.addr,
         mmio_bar0,
         hw_rev,
         chip_id_raw,
@@ -267,6 +289,8 @@ pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice
         device_id: device.id.device,
         target_info: None,
         boot_error: None,
+        firmware_prepared: None,
+        firmware_error: None,
     })
 }
 
@@ -282,18 +306,74 @@ async fn boot_task(
         transport.power_up(revision).await?;
         let mut bmi = super::bmi::Bmi::new(transport);
         let info = bmi.target_info().await?;
-        *SESSION.lock().await = Some(bmi);
-        Ok::<_, super::bmi::BmiError>(info)
+        Ok::<_, super::bmi::BmiError>((bmi, info))
     }
     .await;
     match result {
-        Ok(info) => {
+        Ok((mut bmi, info)) => {
             if let Some(controller) = CONTROLLER.lock().as_mut() {
                 controller.target_info = Some(info);
             }
-            let _ = writeln!(narf_console::Writer,
-                "  ath10k: BMI target version={:#010x} type={}; firmware/board/runtime initialization pending",
-                info.version, info.target_type);
+            let prepared = async {
+                let profile = super::profile::Profile::select(device.id.device, info.version)
+                    .ok_or(super::firmware::Error::Unsupported)?;
+                let mut files = super::firmware::RegistryFiles::new()?;
+                let deadline = Deadline::after_ms(60_000);
+                let image = loop {
+                    match super::firmware::Image::load(&mut files, profile) {
+                        Ok(image) => break image,
+                        Err(super::firmware::Error::Missing) if !deadline.expired() => {
+                            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
+                                .await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                let identity = super::firmware::Identity {
+                    vendor: device.id.vendor,
+                    device: device.id.device,
+                    subsystem_vendor: device.id.subsystem_vendor,
+                    subsystem_device: device.id.subsystem_id,
+                };
+                let variant = crate::ath11k::board::check_smbios().bdf_ext;
+                let variant = core::str::from_utf8(&variant)
+                    .map_err(|_| super::firmware::Error::Unsupported)?;
+                super::firmware::prepare(&mut bmi, &mut files, profile, identity, variant, &image)
+                    .await?;
+                let status = FirmwarePrepared {
+                    directory: profile.directory,
+                    api: image.api,
+                    wmi_operations: image.wmi,
+                    htt_operations: image.htt,
+                };
+                *SESSION.lock().await = Some(BootSession {
+                    bmi,
+                    image,
+                    profile,
+                });
+                Ok::<_, super::firmware::Error>(status)
+            }
+            .await;
+            match prepared {
+                Ok(status) => {
+                    if let Some(controller) = CONTROLLER.lock().as_mut() {
+                        controller.firmware_prepared = Some(status);
+                    }
+                    let _ = writeln!(narf_console::Writer,
+                        "  ath10k: {} api {} WMI {} HTT {} calibrated image downloaded; HIF activation pending",
+                        status.directory, status.api, status.wmi_operations, status.htt_operations);
+                }
+                Err(error) => {
+                    if let Some(controller) = CONTROLLER.lock().as_mut() {
+                        controller.firmware_error = Some(error.clone());
+                    }
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  ath10k: firmware/BDF/OTP preparation failed: {:?}",
+                        error
+                    );
+                }
+            }
         }
         Err(error) => {
             if let Some(controller) = CONTROLLER.lock().as_mut() {

@@ -147,6 +147,7 @@ pub struct MsiState {
 /// One bound ath11k device. Holds the BAR0 mapping + the hw_rev
 /// derived from the TCSR version registers.
 pub struct Ath11kDevice {
+    address: narf_bus::BusAddr,
     pub mmio_bar0: MmioRegion,
     pub chip: ChipInfo,
     pub hw_rev: HwRev,
@@ -916,9 +917,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Quiesce an inherited function before identifying or resetting it.
     // Recognized QCA6390/QCN9074 IDs currently lack a complete runtime
     // profile; reject them before MMIO/MSI setup and never enable DMA.
-    let occupied = CONTROLLER.lock().is_some();
+    let owner = CONTROLLER
+        .lock()
+        .as_ref()
+        .map(|controller| controller.address);
+    let occupied = owner.is_some();
     let profile = validate_runtime_profile(chip.default_hw_rev);
-    crate::qualcomm_pci::park(&device, &cap, !occupied && profile.is_ok())?;
+    crate::qualcomm_pci::park(&device, &cap, !occupied && profile.is_ok(), owner)?;
     if occupied {
         return Err(narf_bus::ProbeError::Other(
             "ath11k singleton already owns another radio",
@@ -1147,6 +1152,7 @@ pub unsafe fn bring_up(
     diag::set_wifi_stage(WifiStage::PowerUp);
 
     Ok(Ath11kDevice {
+        address: device.addr,
         mmio_bar0,
         chip,
         hw_rev,

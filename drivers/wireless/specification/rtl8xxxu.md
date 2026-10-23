@@ -1,6 +1,6 @@
 # rtl8xxxu — Specification
 
-> Status: runtime RTL8188EU power/firmware transport implemented;
+> Status: runtime RTL8188EU factory/FIFO/firmware/MAC/BB/RF tables implemented;
 > full station software and physical acceptance remain incomplete.
 
 ## 1. Purpose & scope
@@ -12,20 +12,24 @@ RTL8188EU async firmware owner. Other matched families remain detection-only.
 
 The USB enumerator supplies an addressed, configured `Arc<USBDevice>`.
 Authenticated firmware must already be installed in the NARF registry before
-probe. The owner does not detach host devices, enumerate arbitrary hardware,
-enable RF, or publish a usable station interface.
+probe. Initialization powers the RF blocks for register-table setup while
+MAC TX/RX stays closed. A usable station requires the remaining software below.
 
 ## 3. Public interface
 
 `rtl8xxxu_probe` retains the handle and `firmware_transport::Owner<UsbControl>`.
 For RTL8188EU it spawns `initialize_registered()` after releasing the device
-registry lock. Duplicate registration compares the retained Arc identity,
-instead of conflating equal slot numbers on different USB controllers.
+registry lock. That production path now continues through factory identity,
+FIFO/queue boundaries, firmware and MAC/BB/AGC/RF table setup. Duplicate
+registration compares the retained Arc identity, instead of conflating equal slot numbers on different USB controllers.
 
-`Owner::status()` reports detected, validated, powered, downloading,
-firmware-ready or terminal failed state. `initialize(blob)` exercises the same
-production sequence for callers owning authenticated bytes and register-model
-tests. A second attempt returns `AlreadyStarted` without I/O. Dropping an
+`Owner::status()` reports detected, validated, factory-ready, powered,
+downloading, firmware-ready, initializing-tables, tables-ready or terminal
+failed state. `Owner::factory()` returns the checked RTL8188EU factory identity
+and calibration snapshot. `initialize_device(blob)` runs the production
+factory/FIFO/firmware/table sequence for authenticated-byte owners/tests.
+The firmware-only `initialize(blob)` remains a diagnostic entry point.
+A second attempt returns `AlreadyStarted` without I/O. Dropping an
 active attempt records `Cancelled`; it cannot silently replay. Deadline,
 transport errors (including ambiguous xHCI errors) and cancellation poison the
 one-shot owner: no cleanup read/write, retry, or other EP0 operation follows.
@@ -37,10 +41,20 @@ signature family `0x88e0`, nonempty exact `ramcodesize` and at most eight 4 KiB
 pages. Validation/unsupported-family failures occur before USB. Registry bytes
 are validated and copied into owned storage before awaiting USB transfers.
 
-`ControlIo` provides async exact-count reads/writes and delay; `UsbControl`
+`ControlIo` provides configuration-descriptor reads, async exact-count
+register reads/writes and delay; `UsbControl`
 uses vendor EP0 request `0x05`, index zero, value=register address. Firmware
 pages use 196-byte control writes at `0x1000`, with the page selected through
 `MCU_FW_DL+2`. Firmware bytes never use a bulk packet endpoint.
+
+`device_init::endpoints(config)` validates the active vendor interface's
+bulk descriptors and derives 1–3 OUT queue geometry. Factory reads reject test
+silicon/I cut, use the sparse logical map, validate RTL ID `0x8129` and nonzero
+unicast MAC at `0xd7`, and retain CCK/HT40 power bases, crystal, thermal and
+board fields. All table writes check exact transfer counts, RF addresses keep
+all eight bits, and Linux RF delay markers are delays. LLT installs the
+176-entry split with TX end 169 and a 170–175 ring after FIFO boundaries.
+MAC TX/RX remain closed: tables-ready is not IQK/LC, regulatory or packet ready.
 
 Legacy synchronous stripped-payload loading returns `UseAsyncOwner`; the old
 unverified all-radio helper returns `NotImplemented` before transport access.
@@ -72,8 +86,8 @@ registry blobs; scheduler/time provide async execution and bounded waits.
 
 ## 7. Stage assignment
 
-RTL8188EU now reaches a software-tested firmware-ready diagnostic through
-the production probe. It is not ready for full station physical acceptance.
+RTL8188EU now reaches a software-tested factory/firmware/register-table
+diagnostic through the production probe. It is not ready for full station physical acceptance.
 
 ## 8. Open questions / remaining software
 
@@ -81,13 +95,15 @@ the production probe. It is not ready for full station physical acceptance.
 |---|---|
 | RTL8188EU power + EP0 firmware lifecycle | Implemented; shared-path regressions |
 | RTL8192EU / RTL8723BU / RTL8821CU / RTL8822BU runtime initialization | Missing |
-| EFUSE identity/calibration read through retained async owner | Missing |
-| Endpoint-descriptor selection, MAC FIFO/RX configuration | Missing |
-| BB/RF table application and verified IQK/LC/calibration | Missing |
+| EFUSE identity/calibration read through retained async owner | Implemented; chip/geometry/failure coverage |
+| Endpoint-descriptor selection and MAC FIFO/LLT | Implemented; activation/RX filters remain open |
+| MAC/BB/AGC/RF table application | Implemented with source-matched tables and checked transfers |
+| Verified IQK/LC/calibration, channel/power and RX activation | Missing |
 | Management TX/RX, passive scan and real station MLME | Missing |
 | WPA2 key installation/controlled port and Ethernet transport | Missing |
 | Regulatory channel/power, rates, coexistence | Missing |
-| Disconnect callbacks, USB handle generations, reset/PM recovery | Missing; requires USB-owner coordination |
+| USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
+| Disconnect callbacks, endpoint stop/drain, reset/PM recovery | Missing; software prerequisites |
 
 Linux references: `rtl8xxxu/8188e.c` power/reset functions and fops;
 `rtl8xxxu/core.c` firmware parsing, `writeN`, download and start functions.

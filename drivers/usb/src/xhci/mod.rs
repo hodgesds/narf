@@ -55,7 +55,7 @@
 //! follow-ups; the bones land here so the next pass can layer on
 //! `Address Device` against a known-good slot-id.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
@@ -69,6 +69,10 @@ use narf_lib::sync::IrqSafeSpinLock;
 // layer of the xHCI specification has a discoverable home. The big
 // monolithic implementation in this `mod.rs` still owns the live
 // controller state machine — these are pure spec-encode shapes.
+mod bulk_owner;
+mod completion;
+mod event_wait;
+pub use bulk_owner::{Direction as BulkDirection, Token as BulkToken};
 pub mod cap;
 pub mod cmd_ring;
 pub mod dcbaa;
@@ -493,6 +497,8 @@ pub struct Xhci {
     /// is unused. Sized lazily on first `address_device` so we
     /// don't burn `MaxSlots+1` empty slots up-front.
     devices: IrqSafeSpinLock<alloc::vec::Vec<Option<Device>>>,
+    slots: IrqSafeSpinLock<bulk_owner::Slots>,
+    command_completions: IrqSafeSpinLock<completion::Commands>,
     /// Demuxed event queues populated by `xhci_isr` (and by
     /// callers when they happen to dequeue a TE not destined for
     /// them). Resolves audit findings #2 + #11: the ISR no longer
@@ -527,6 +533,9 @@ pub struct Xhci {
 /// + control transfer ring so they live as long as the slot does.
 #[derive(Debug)]
 pub struct Device {
+    generation: u64,
+    endpoint_configuration: bool,
+    control: bulk_owner::ControlState,
     pub slot_id: u8,
     pub port: u8,
     pub speed: PortSpeed,
@@ -559,6 +568,7 @@ pub struct Device {
 /// for as long as the slot is configured.
 #[derive(Debug)]
 pub struct EndpointState {
+    bulk: bulk_owner::State,
     pub dci: u8,
     pub max_packet: u16,
     pub kind: EndpointKind,
@@ -820,6 +830,15 @@ impl Xhci {
     /// after MSI-X enable), but a transient hardware fault on real
     /// silicon could still trip HCE — recover instead of giving up.
     fn soft_recover(&self) -> Result<(), XhciError> {
+        // Hold the reservation lock through this synchronous reset so an
+        // Address Device attempt cannot publish ownership concurrently.
+        // Entry paths use try_lock: a boot-context sleep pump may poll a peer
+        // USB task here, and that peer must fail rather than spin recursively.
+        let slots = self.slots.try_lock().ok_or(XhciError::NotReady)?;
+        if slots.any_reserved() || self.command_completions.lock().active() {
+            return Err(XhciError::NotReady);
+        }
+
         let mmio = &self.mmio;
         let op_off = self.op_off;
 
@@ -1670,6 +1689,8 @@ impl Xhci {
                 drained_evs
             }),
             devices: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            slots: IrqSafeSpinLock::new(bulk_owner::Slots::new()),
+            command_completions: IrqSafeSpinLock::new(completion::Commands::new(CMD_RING_TRBS)),
             // Pre-allocate to MAX_DEPTH (64) so the ISR's
             // `push_back` from `demux_one_event` never grows the
             // VecDeque — VecDeque::push_back triggers the
@@ -2045,15 +2066,29 @@ impl Xhci {
     /// `dword3_no_cycle` must already include the TRB Type field
     /// (bits[15:10]) but should NOT carry the cycle bit — the
     /// helper adds it.
-    fn submit_command(
+    fn submit_command_record(
         &self,
         dword0: u32,
         dword1: u32,
         dword2: u32,
         dword3_no_cycle: u32,
-    ) -> Result<(), XhciError> {
+    ) -> Result<u64, XhciError> {
+        // Serialize publication with HCE recovery too. A nested boot pump can
+        // see HCE clear before reset finishes and attempt Enable Slot; it must
+        // fail without touching a ring whose indices recovery is resetting.
+        let _slots = self.slots.try_lock().ok_or(XhciError::NotReady)?;
         let mut enq_g = self.cmd_enqueue.lock();
         let mut pcs_g = self.cmd_pcs.lock();
+        let entry = if *enq_g >= CMD_RING_TRBS - 1 {
+            0
+        } else {
+            *enq_g
+        };
+        let pointer = self.cmd_ring.dma_addr().raw() + (entry * 16) as u64;
+        self.command_completions
+            .lock()
+            .reserve(entry, pointer, (dword3_no_cycle >> 24) as u8)
+            .map_err(|_| XhciError::CmdRingFull)?;
         // Audit F-39: when we hit the Link TRB at slot N-1, publish
         // it with the *current* PCS so the controller follows it,
         // then wrap enq=0 and toggle PCS so the next normal TRB we
@@ -2071,7 +2106,8 @@ impl Xhci {
                     link_d3,
                 );
             }
-            compiler_fence(Ordering::SeqCst);
+            self.cmd_ring.sync((CMD_RING_TRBS - 1) * 16, 16);
+            device_dma_barrier();
             *enq_g = 0;
             *pcs_g ^= TRB_CYCLE_BIT;
         }
@@ -2097,7 +2133,8 @@ impl Xhci {
                 dword2,
             );
         }
-        compiler_fence(Ordering::SeqCst);
+        self.cmd_ring.sync(trb_off as usize, 16);
+        device_dma_barrier();
         // SAFETY: same.
         unsafe {
             core::ptr::write_volatile(
@@ -2106,11 +2143,13 @@ impl Xhci {
             );
         }
         compiler_fence(Ordering::SeqCst);
+        self.cmd_ring.sync(trb_off as usize, 16);
+        device_dma_barrier();
         *enq_g += 1;
         drop(enq_g);
         drop(pcs_g);
         self.ring_command_doorbell();
-        Ok(())
+        Ok(trb_addr)
     }
 
     /// Poll the Event Ring for the next event whose cycle matches
@@ -2121,6 +2160,7 @@ impl Xhci {
         let mut ccs_g = self.er_ccs.lock();
         let trb_off = (*deq_g * 16) as u64;
         let trb_addr = self.event_ring.dma_addr().raw() + trb_off;
+        self.event_ring.sync(trb_off as usize, 16);
         // SAFETY: identity-mapped DMA page; deq in-range.
         let d3 = unsafe {
             core::ptr::read_volatile(narf_memory::PhysAddr::new(trb_addr + 12).kernel_ptr::<u32>())
@@ -2128,6 +2168,7 @@ impl Xhci {
         if (d3 & TRB_CYCLE_BIT) != *ccs_g {
             return None;
         }
+        device_dma_barrier();
         // SAFETY: same.
         let d0 = unsafe {
             core::ptr::read_volatile(narf_memory::PhysAddr::new(trb_addr).kernel_ptr::<u32>())
@@ -2201,6 +2242,13 @@ impl Xhci {
     /// event so direct callers can also inspect.
     fn demux_one_event(&self) -> Option<[u32; 4]> {
         let ev = self.poll_event()?;
+        // Short, blocking ownership locks are deliberate: falling back to
+        // the lossy queues on another CPU's lock contention loses live TDs.
+        // poll_event released its ring locks before this call. No await or
+        // reservation-lock acquisition occurs while devices is held.
+        if self.latch_owned_event(ev) {
+            return Some(ev);
+        }
         let ty = (ev[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
         // Route Port Status Change Events (xHCI 1.2 §6.4.2.3, TRB
         // type 34) to the USB supervisor. Pre-fix the `_ =>` arm
@@ -2216,22 +2264,82 @@ impl Xhci {
             wake_usb_supervisor();
             return Some(ev);
         }
-        const MAX_DEPTH: usize = 64;
         let queue: &IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>> = match ty {
             t if t == TRB_TYPE_CMD_COMPLETION => &self.cmd_events,
             t if t == TRB_TYPE_TRANSFER_EVENT => &self.transfer_events,
             _ => return Some(ev),
         };
         let mut g = queue.lock();
-        if g.len() >= MAX_DEPTH {
-            // Drop oldest to keep memory bounded; bump the counter
-            // so a future debugger can spot the loss.
-            g.pop_front();
-            self.events_overflowed
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if event_wait::enqueue(&mut g, ev) {
+            self.events_overflowed.fetch_add(1, Ordering::Relaxed);
         }
-        g.push_back(ev);
         Some(ev)
+    }
+
+    fn latch_owned_event(&self, event: event_wait::Event) -> bool {
+        let kind = (event[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+        if kind == TRB_TYPE_CMD_COMPLETION {
+            return self.command_completions.lock().record(event);
+        }
+        if kind != TRB_TYPE_TRANSFER_EVENT {
+            return false;
+        }
+        let slot = (event[3] >> 24) as u8;
+        let dci = ((event[3] >> 16) & 31) as u8;
+        let mut devices = self.devices.lock();
+        let Some(device) = devices.get_mut(usize::from(slot)).and_then(Option::as_mut) else {
+            return false;
+        };
+        if dci == 1 {
+            return device.control.record(slot, event);
+        }
+        if !(2..=31).contains(&dci) {
+            return false;
+        }
+        device
+            .eps
+            .get_mut(usize::from(dci - 2))
+            .and_then(Option::as_mut)
+            .is_some_and(|endpoint| endpoint.bulk.record(event))
+    }
+
+    fn take_matching_event(
+        &self,
+        predicate: &mut dyn FnMut(&event_wait::Event) -> bool,
+    ) -> Result<Option<event_wait::Event>, XhciError> {
+        if let Some(event) = self
+            .command_completions
+            .lock()
+            .take_matching(predicate)
+            .map_err(|_| XhciError::CmdFailed(0xFB))?
+        {
+            return Ok(Some(event));
+        }
+        {
+            let mut devices = self.devices.lock();
+            for device in devices.iter_mut().flatten() {
+                if let Some(event) = device
+                    .control
+                    .take_matching(predicate)
+                    .map_err(bulk_error)?
+                {
+                    return Ok(Some(event));
+                }
+                for endpoint in device.eps.iter_mut().flatten() {
+                    if let Some(event) =
+                        endpoint.bulk.take_matching(predicate).map_err(bulk_error)?
+                    {
+                        return Ok(Some(event));
+                    }
+                }
+            }
+        }
+        for queue in [&self.cmd_events, &self.transfer_events] {
+            if let Some(event) = event_wait::take_matching(&mut queue.lock(), predicate) {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
     }
 
     /// Drain queued events of either class into a closure until the
@@ -2243,35 +2351,17 @@ impl Xhci {
         &self,
         mut predicate: impl FnMut(&[u32; 4]) -> bool,
     ) -> Result<[u32; 4], XhciError> {
-        // Helper: try to pop any queued event matching predicate
-        // from either class queue. Returns None if no match in
-        // either queue. Drains non-matching entries back into a
-        // local buffer so they survive for the next await.
-        let try_match = |me: &Self, mut p: &mut dyn FnMut(&[u32; 4]) -> bool| -> Option<[u32; 4]> {
-            for q in [&me.cmd_events, &me.transfer_events] {
-                let mut g = q.lock();
-                if let Some(pos) = g.iter().position(&mut p) {
-                    return g.remove(pos);
-                }
-            }
-            None
-        };
-
-        // First pass: maybe the event we want already arrived
-        // (ISR populated it, or a prior await left it in queue).
-        if let Some(ev) = try_match(self, &mut predicate) {
-            return Ok(ev);
-        }
-
         let deadline = narf_time::Deadline::after_ms(250);
         loop {
-            // Drain any new ring entries the ISR may have missed.
-            while self.demux_one_event().is_some() {}
-            if let Some(ev) = try_match(self, &mut predicate) {
-                return Ok(ev);
-            }
-            if deadline.expired() {
-                return Err(XhciError::CmdTimeout);
+            match event_wait::poll_batch(
+                || self.take_matching_event(&mut predicate),
+                || self.demux_one_event().is_some(),
+                || deadline.expired(),
+            ) {
+                Ok(Some(event)) => return Ok(event),
+                Ok(None) => {}
+                Err(event_wait::PollError::TimedOut) => return Err(XhciError::CmdTimeout),
+                Err(event_wait::PollError::Source(error)) => return Err(error),
             }
             // Wheel-bypass: yield_now self-wakes via cx.waker(),
             // bypassing timer_wheel::register entirely. The
@@ -2302,11 +2392,9 @@ impl Xhci {
         }
         // Enable Slot TRB (§6.4.3.2): all dwords 0 except TRB Type.
         let trb_type = TRB_TYPE_ENABLE_SLOT_CMD << TRB_TYPE_SHIFT;
-        self.submit_command(0, 0, 0, trb_type)?;
-        // Wait for a Command Completion Event (§6.4.2.2).
-        let cce_type = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
+        let command = self.submit_command_record(0, 0, 0, trb_type)?;
         let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type)
+            .await_event(|event| bulk_owner::command_pointer_matches(event, command))
             .await?;
         // CCE layout (§6.4.2.2):
         //   dword0..1 = command-TRB phys addr
@@ -2332,14 +2420,22 @@ impl Xhci {
         if slot_id == 0 || slot_id > self.caps.max_slots {
             return Err(XhciError::CmdFailed(0xFD));
         }
-        let trb_type = TRB_TYPE_DISABLE_SLOT_CMD << TRB_TYPE_SHIFT;
-        // Slot ID rides in dword3[31:24], same encoding as the
-        // Command Completion Event from enable_slot returns it.
-        let d3 = trb_type | ((slot_id as u32) << 24);
-        self.submit_command(0, 0, 0, d3)?;
-        let cce_type = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
+        {
+            let mut slots = self.slots.try_lock().ok_or(XhciError::NotReady)?;
+            slots.retire(slot_id);
+            let mut devices = self.devices.lock();
+            if let Some(device) = devices
+                .get_mut(usize::from(slot_id))
+                .and_then(Option::as_mut)
+            {
+                device.generation = 0;
+                device.endpoint_configuration = true;
+            }
+        }
+        let d3 = (TRB_TYPE_DISABLE_SLOT_CMD << TRB_TYPE_SHIFT) | (u32::from(slot_id) << 24);
+        let command = self.submit_command_record(0, 0, 0, d3)?;
         let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type)
+            .await_event(|event| bulk_owner::command_matches(event, slot_id, command))
             .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
@@ -2412,6 +2508,29 @@ impl Xhci {
             return Err(XhciError::BadPort);
         }
 
+        let generation = next_device_generation()?;
+        self.slots
+            .try_lock()
+            .ok_or(XhciError::NotReady)?
+            .begin(slot_id, generation)
+            .map_err(bulk_error)?;
+        let mut claim = AddressAttempt {
+            controller: self,
+            slot: slot_id,
+            generation,
+            published: false,
+        };
+        // Existing slot ownership is retained until explicit stop/drain/removal
+        // is implemented. Readdress may never replace EP0 or endpoint DMA.
+        if self
+            .devices
+            .lock()
+            .get(usize::from(slot_id))
+            .is_some_and(Option::is_some)
+        {
+            return Err(XhciError::NotReady);
+        }
+
         // §6.2.5 Input Context layout. Per-context stride is 32 or
         // 64 bytes depending on HCCPARAMS1.CSZ. Worst case (CSZ=1):
         // 64 (Input Control) + 64 (Slot) + 64 × 31 (EP) = 2112 bytes
@@ -2422,6 +2541,13 @@ impl Xhci {
         let ctrl_data =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
 
+        // SAFETY: fresh owned 4 KiB CPU mappings; zero before planting Link.
+        unsafe {
+            core::ptr::write_bytes(input.cpu_mut_ptr::<u8>(), 0, 4096);
+            core::ptr::write_bytes(dev_ctx.cpu_mut_ptr::<u8>(), 0, 4096);
+            core::ptr::write_bytes(ctrl_tr.cpu_mut_ptr::<u8>(), 0, 4096);
+            core::ptr::write_bytes(ctrl_data.cpu_mut_ptr::<u8>(), 0, 4096);
+        }
         let input_phys = input.dma_addr().raw();
         let dev_ctx_phys = dev_ctx.dma_addr().raw();
         let ctrl_tr_phys = ctrl_tr.dma_addr().raw();
@@ -2477,15 +2603,6 @@ impl Xhci {
         //   dword2/3 = TR Dequeue Pointer (low/high) | DCS
         //   dword4 bits[15:0]  = Average TRB Length (8 for Control)
         //         bits[31:16] = Max ESIT Payload Lo (0)
-
-        // Zero the input context first — fresh frames are zeroed,
-        // but be explicit so a future allocator change can't bite.
-        // SAFETY: identity-mapped DMA; 4 KiB contiguous.
-        unsafe {
-            core::ptr::write_bytes(input.cpu_mut_ptr::<u8>(), 0, 4096);
-            core::ptr::write_bytes(dev_ctx.cpu_mut_ptr::<u8>(), 0, 4096);
-            core::ptr::write_bytes(ctrl_tr.cpu_mut_ptr::<u8>(), 0, 4096);
-        }
 
         let cs = self.context_stride();
         let input_ctrl = input_phys; // always at offset 0
@@ -2578,24 +2695,24 @@ impl Xhci {
             ); // Avg TRB Len
         }
 
-        // Plant Device Context phys at DCBAA[slot_id] BEFORE issuing
-        // the command (§4.3.4 step 6). The engine reads DCBAA when
-        // it processes Address Device.
-        let dcbaa_phys = self.dcbaa.dma_addr().raw();
-        // SAFETY: `dcbaa_phys` is the identity-mapped base of the
-        // DCBAA page this controller allocated; `slot_id < MaxSlots`
-        // (validated at slot-enable) so `slot_id*8` stays inside the
-        // page, giving an aligned, in-range 8-byte slot we exclusively
-        // own.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
+        input.sync(0, input.len());
+        dev_ctx.sync(0, dev_ctx.len());
+        ctrl_tr.sync(0, ctrl_tr.len());
+        ctrl_data.sync(0, ctrl_data.len());
+        device_dma_barrier();
+        // DCBAA publication is already a hardware-visible ownership boundary.
+        let mut retained = bulk_owner::CommandDma::new((input, dev_ctx, ctrl_tr, ctrl_data));
+        retained.publish();
+        claim.published = true;
+        // SAFETY: validated slot <= MaxSlots fits this retained DCBAA page.
         unsafe {
             core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(dcbaa_phys + (slot_id as u64) * 8)
-                    .kernel_mut_ptr::<u64>(),
+                self.dcbaa.cpu_mut_ptr_at::<u64>(u64::from(slot_id) * 8),
                 dev_ctx_phys,
             );
         }
-        compiler_fence(Ordering::SeqCst);
+        self.dcbaa.sync(usize::from(slot_id) * 8, 8);
+        device_dma_barrier();
 
         // Address Device — single BSR=0 call (xHCI 1.2 §4.6.5).
         // Earlier code did a two-phase BSR=1-then-BSR=0 dance as a
@@ -2614,20 +2731,27 @@ impl Xhci {
         //   dword2 = reserved
         //   dword3 = TRB Type | Slot ID << 24
         let trb_type = TRB_TYPE_ADDRESS_DEVICE_CMD << TRB_TYPE_SHIFT;
-        let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
-        let want_slot = (slot_id as u32) << 24;
-        let dword3 = trb_type | ((slot_id as u32) << 24);
-        self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
+        let dword3 = trb_type | (u32::from(slot_id) << 24);
+        let command =
+            self.submit_command_record(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
         let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)
+            .await_event(|event| bulk_owner::command_matches(event, slot_id, command))
             .await?;
-        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+        let ccode = (ev[2] >> 24) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
         }
+        let slots = self.slots.try_lock().ok_or(XhciError::NotReady)?;
+        if !slots.matches(slot_id, generation) {
+            return Err(XhciError::NotReady);
+        }
+        let (input, dev_ctx, ctrl_tr, ctrl_data) = retained.complete();
 
         // Slot is now Addressed. Stash the per-slot state.
         let dev = Device {
+            generation,
+            endpoint_configuration: false,
+            control: bulk_owner::ControlState::new(),
             slot_id,
             port,
             speed,
@@ -2646,6 +2770,8 @@ impl Xhci {
             g.push(None);
         }
         g[slot_id as usize] = Some(dev);
+        drop(g);
+        drop(slots);
         // input drops here — the Address Device command consumed
         // its contents during processing.
         let _ = input;
@@ -2684,6 +2810,62 @@ impl Xhci {
     ///     Number of Ports in bits[31:24].
     ///   - Slot dword2: preserves the parent Transaction Translator
     ///     metadata for a low/full-speed hub behind a high-speed hub.
+    fn begin_context(&self, slot: u8) -> Result<EndpointConfiguration<'_>, XhciError> {
+        let mut devices = self.devices.lock();
+        let device = devices
+            .get_mut(usize::from(slot))
+            .and_then(Option::as_mut)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        if device.generation == 0 {
+            return Err(XhciError::CmdFailed(0xFD));
+        }
+        if device.endpoint_configuration || device.control.active() {
+            return Err(XhciError::NotReady);
+        }
+        device.endpoint_configuration = true;
+        Ok(EndpointConfiguration {
+            controller: self,
+            slot,
+            generation: device.generation,
+            published: false,
+        })
+    }
+
+    async fn evaluate_input(
+        &self,
+        input: DmaBuffer,
+        claim: &mut EndpointConfiguration<'_>,
+    ) -> Result<(), XhciError> {
+        let input_phys = input.dma_addr().raw();
+        input.sync(0, input.len());
+        device_dma_barrier();
+        let mut retained = bulk_owner::CommandDma::new(input);
+        retained.publish();
+        claim.published = true;
+        let d3 = (TRB_TYPE_EVAL_CONTEXT_CMD << TRB_TYPE_SHIFT) | (u32::from(claim.slot) << 24);
+        let command =
+            self.submit_command_record(input_phys as u32, (input_phys >> 32) as u32, 0, d3)?;
+        let ev = self
+            .await_event(|event| bulk_owner::command_matches(event, claim.slot, command))
+            .await?;
+        let code = (ev[2] >> 24) as u8;
+        if code != 1 {
+            return Err(XhciError::CmdFailed(code));
+        }
+        let mut devices = self.devices.lock();
+        let device = devices
+            .get_mut(usize::from(claim.slot))
+            .and_then(Option::as_mut)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        if device.generation != claim.generation {
+            return Err(XhciError::CmdFailed(0xFD));
+        }
+        device.endpoint_configuration = false;
+        claim.published = false;
+        drop(retained.complete());
+        Ok(())
+    }
+
     pub async fn mark_as_hub(
         &self,
         slot_id: u8,
@@ -2693,6 +2875,7 @@ impl Xhci {
         if slot_id == 0 || slot_id > self.caps.max_slots {
             return Err(XhciError::CmdFailed(0xFD));
         }
+        let mut claim = self.begin_context(slot_id)?;
         let (speed, port, topology) = {
             let g = self.devices.lock();
             let d = g
@@ -2746,19 +2929,7 @@ impl Xhci {
         }
         compiler_fence(Ordering::SeqCst);
 
-        let trb_type = TRB_TYPE_EVAL_CONTEXT_CMD << TRB_TYPE_SHIFT;
-        let dword3 = trb_type | ((slot_id as u32) << 24);
-        self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
-        let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
-        let want_slot = (slot_id as u32) << 24;
-        let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)
-            .await?;
-        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
-        if ccode != 1 {
-            return Err(XhciError::CmdFailed(ccode));
-        }
-        let _ = input;
+        self.evaluate_input(input, &mut claim).await?;
         Ok(())
     }
 
@@ -2777,12 +2948,16 @@ impl Xhci {
                 .get(slot_id as usize)
                 .and_then(|x| x.as_ref())
                 .ok_or(XhciError::CmdFailed(0xFD))?;
+            if d.generation == 0 {
+                return Err(XhciError::CmdFailed(0xFD));
+            }
             (d.max_packet_ep0, d.speed, d.port)
         };
         if cur_mps == new_mps {
             return Ok(());
         }
 
+        let mut claim = self.begin_context(slot_id)?;
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
         let input_phys = input.dma_addr().raw();
         // SAFETY: identity-mapped DMA, 4 KiB contiguous, just allocated.
@@ -2833,19 +3008,7 @@ impl Xhci {
         }
         compiler_fence(Ordering::SeqCst);
 
-        let trb_type = TRB_TYPE_EVAL_CONTEXT_CMD << TRB_TYPE_SHIFT;
-        let dword3 = trb_type | ((slot_id as u32) << 24);
-        self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
-        let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
-        let want_slot = (slot_id as u32) << 24;
-        let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)
-            .await?;
-        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
-        if ccode != 1 {
-            return Err(XhciError::CmdFailed(ccode));
-        }
-
+        self.evaluate_input(input, &mut claim).await?;
         // Update cache.
         {
             let mut g = self.devices.lock();
@@ -2853,7 +3016,6 @@ impl Xhci {
                 d.max_packet_ep0 = new_mps;
             }
         }
-        let _ = input;
         Ok(())
     }
 
@@ -2886,6 +3048,9 @@ impl Xhci {
             .get_mut(slot_id as usize)
             .and_then(|s| s.as_mut())
             .ok_or(XhciError::CmdFailed(0xFC))?;
+        if !dev.control.active() || dev.generation == 0 {
+            return Err(XhciError::NotReady);
+        }
         if dev.ctrl_enq == CTRL_TR_TRBS - 1 {
             // Wrap: re-stamp the Link TRB with current cycle, reset
             // enq, toggle pcs. Same shape as ep_enqueue_normal's
@@ -2901,12 +3066,16 @@ impl Xhci {
                     link_d3,
                 );
             }
-            compiler_fence(Ordering::SeqCst);
+            dev.ctrl_tr.sync(link_off as usize, 16);
+            device_dma_barrier();
             dev.ctrl_enq = 0;
             dev.ctrl_pcs ^= 1;
         }
         let trb_off = (dev.ctrl_enq * 16) as u64;
         let trb_addr = dev.ctrl_tr.dma_addr().raw() + trb_off;
+        if d3_no_cycle & TRB_IOC != 0 {
+            dev.control.expect(trb_addr).map_err(bulk_error)?;
+        }
         let d3 = d3_no_cycle | (dev.ctrl_pcs & TRB_CYCLE_BIT);
         // SAFETY: identity-mapped DMA; offset in-page.
         unsafe {
@@ -2923,7 +3092,8 @@ impl Xhci {
                 d2,
             );
         }
-        compiler_fence(Ordering::SeqCst);
+        dev.ctrl_tr.sync(trb_off as usize, 16);
+        device_dma_barrier();
         // SAFETY: same.
         unsafe {
             core::ptr::write_volatile(
@@ -2931,7 +3101,8 @@ impl Xhci {
                 d3,
             );
         }
-        compiler_fence(Ordering::SeqCst);
+        dev.ctrl_tr.sync(trb_off as usize, 16);
+        device_dma_barrier();
         dev.ctrl_enq += 1;
         Ok(trb_off)
     }
@@ -2946,9 +3117,70 @@ impl Xhci {
         let want_ep = (DCI_CONTROL_EP) << 16;
         let event_trb = (t[0] as u64) | ((t[1] as u64) << 32);
         (t[3] & TRB_TYPE_MASK) == xfer
+            && t[3] & (1 << 2) == 0
             && (t[3] & 0xFF00_0000) == want_slot
             && (t[3] & 0x001F_0000) == want_ep
             && (event_trb & !0xFu64) == trb_phys
+    }
+
+    fn begin_control(&self, slot_id: u8, generation: u64) -> Result<(u64, u64, usize), XhciError> {
+        let mut devices = self.devices.lock();
+        let device = devices
+            .get_mut(usize::from(slot_id))
+            .and_then(Option::as_mut)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        if device.endpoint_configuration {
+            return Err(XhciError::NotReady);
+        }
+        device
+            .control
+            .begin(device.generation, generation)
+            .map_err(bulk_error)?;
+        Ok((
+            device.ctrl_data.dma_addr().raw(),
+            device.ctrl_tr.dma_addr().raw(),
+            device.ctrl_data.cpu_mut_ptr::<u8>() as usize,
+        ))
+    }
+
+    fn ring_control(&self, slot_id: u8, generation: u64) -> Result<(), XhciError> {
+        let devices = self.devices.lock();
+        let device = devices
+            .get(usize::from(slot_id))
+            .and_then(Option::as_ref)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        if generation == 0 || device.generation != generation || !device.control.active() {
+            return Err(XhciError::CmdFailed(0xFD));
+        }
+        device_dma_barrier();
+        self.ring_slot_doorbell(slot_id, DCI_CONTROL_EP);
+        Ok(())
+    }
+
+    fn sync_control(&self, slot_id: u8, generation: u64, length: usize) -> Result<(), XhciError> {
+        let devices = self.devices.lock();
+        let device = devices
+            .get(usize::from(slot_id))
+            .and_then(Option::as_ref)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        if device.generation != generation || !device.control.active() {
+            return Err(XhciError::CmdFailed(0xFD));
+        }
+        device.ctrl_data.sync(0, length);
+        device_dma_barrier();
+        Ok(())
+    }
+
+    fn complete_control(&self, slot_id: u8, generation: u64) -> Result<(), XhciError> {
+        let mut devices = self.devices.lock();
+        let device = devices
+            .get_mut(usize::from(slot_id))
+            .and_then(Option::as_mut)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        device
+            .control
+            .complete(device.generation, generation)
+            .map_err(bulk_error)
     }
 
     /// Issue a control IN transfer with no OUT data stage and read
@@ -2969,14 +3201,39 @@ impl Xhci {
         w_index: u16,
         out: &mut [u8],
     ) -> Result<usize, XhciError> {
+        let generation = self
+            .device_generation(slot_id)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        self.control_in_generation(
+            slot_id,
+            generation,
+            bm_request_type,
+            b_request,
+            w_value,
+            w_index,
+            out,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
+    pub(crate) async fn control_in_generation(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        out: &mut [u8],
+    ) -> Result<usize, XhciError> {
         if !control_request_is_in(bm_request_type) {
             // Internal call-site contract violation: a control-IN
             // transfer must set the USB SETUP direction bit.
             return Err(XhciError::CmdFailed(0xF8));
         }
-        if out.len() != usize::from(w_value) && out.is_empty() {
-            // Allow the caller to ask for any byte-count that fits
-            // a u16; w_length is just the SETUP-packet field.
+        if out.len() > 4096 {
+            return Err(XhciError::CmdFailed(0xF9));
         }
         let w_length = out.len() as u16;
         // Audit F-45: reuse the per-slot persistent control-data
@@ -2984,24 +3241,15 @@ impl Xhci {
         // lives in the Device struct and is freed when the slot is
         // disabled. 4 KiB is enough for any descriptor we fetch
         // (max wTotalLength capped at 4096 by the kbd path).
-        let (data_phys, ctrl_tr_phys) = {
-            let g = self.devices.lock();
-            let d = g
-                .get(slot_id as usize)
-                .and_then(|x| x.as_ref())
-                .ok_or(XhciError::CmdFailed(0xFD))?;
-            (d.ctrl_data.dma_addr().raw(), d.ctrl_tr.dma_addr().raw())
-        };
+        let (data_phys, ctrl_tr_phys, data_cpu) = self.begin_control(slot_id, generation)?;
         // Zero so a stale buffer can't be confused with the device
         // response on a short read.
         // SAFETY: identity-mapped DMA page; persistent and 4 KiB.
         unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(data_phys).kernel_mut_ptr::<u8>(),
-                0,
-                4096,
-            );
+            core::ptr::write_bytes(data_cpu as *mut u8, 0, 4096);
         }
+
+        self.sync_control(slot_id, generation, 4096)?;
 
         // ── Setup Stage TRB (§6.4.1.2.1) ──────────────────────────
         // dword0 = bmRequestType | bRequest << 8 | wValue << 16
@@ -3052,7 +3300,7 @@ impl Xhci {
         let status_trb = ctrl_tr_phys + self.ctrl_enqueue(slot_id, 0, 0, 0, status_d3)?;
 
         // Ring the slot's control-EP doorbell.
-        self.ring_slot_doorbell(slot_id, DCI_CONTROL_EP);
+        self.ring_control(slot_id, generation)?;
 
         let data_ev = if let Some(data_trb) = data_trb {
             Some(
@@ -3075,13 +3323,17 @@ impl Xhci {
             .await_event(|t| Self::control_transfer_event_matches(t, slot_id, status_trb))
             .await?;
         let ccode = ((status_ev[2] >> 24) & 0xFF) as u8;
-        if ccode != 1 && ccode != 13 {
+        if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
         }
         // Transfer Length residue lives in dword2[23:0]. Bytes
         // actually transferred = w_length - residue.
         let residue = data_ev.unwrap_or(status_ev)[2] & 0x00FF_FFFF;
-        let xferred = (w_length as u32).saturating_sub(residue) as usize;
+        if residue > u32::from(w_length) {
+            return Err(XhciError::CmdFailed(0xFB));
+        }
+        let xferred = (u32::from(w_length) - residue) as usize;
+        self.sync_control(slot_id, generation, usize::from(w_length))?;
 
         // Copy data buffer → out.
         let copy = xferred.min(out.len());
@@ -3090,12 +3342,9 @@ impl Xhci {
             // page; `i < copy ≤ xferred ≤ w_length ≤ 4096` keeps the
             // byte read inside that page, aligned for a `u8`.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *slot = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(data_phys + i as u64).kernel_ptr::<u8>(),
-                )
-            };
+            *slot = unsafe { core::ptr::read_volatile((data_cpu as *mut u8).add(i)) };
         }
+        self.complete_control(slot_id, generation)?;
         Ok(xferred)
     }
 
@@ -3115,6 +3364,32 @@ impl Xhci {
         w_index: u16,
         data: &[u8],
     ) -> Result<usize, XhciError> {
+        let generation = self
+            .device_generation(slot_id)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        self.control_out_generation(
+            slot_id,
+            generation,
+            bm_request_type,
+            b_request,
+            w_value,
+            w_index,
+            data,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // SETUP fields plus retained slot generation.
+    pub(crate) async fn control_out_generation(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &[u8],
+    ) -> Result<usize, XhciError> {
         if control_request_is_in(bm_request_type) {
             // Internal call-site contract violation: a control-OUT
             // transfer must clear the USB SETUP direction bit.
@@ -3124,31 +3399,19 @@ impl Xhci {
             return Err(XhciError::CmdFailed(0xF9));
         }
         let w_length = data.len() as u16;
-        let (data_phys, ctrl_tr_phys) = {
-            let g = self.devices.lock();
-            let d = g
-                .get(slot_id as usize)
-                .and_then(|x| x.as_ref())
-                .ok_or(XhciError::CmdFailed(0xFD))?;
-            (d.ctrl_data.dma_addr().raw(), d.ctrl_tr.dma_addr().raw())
-        };
+        let (data_phys, ctrl_tr_phys, data_cpu) = self.begin_control(slot_id, generation)?;
         // Stage caller's bytes into the persistent control-data
         // buffer (audit F-45). Zero the prefix first so a stale
         // tail can't leak into a subsequent transfer.
         // SAFETY: identity-mapped DMA page; ≤ 4 KiB.
         unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(data_phys).kernel_mut_ptr::<u8>(),
-                0,
-                4096,
-            );
+            core::ptr::write_bytes(data_cpu as *mut u8, 0, 4096);
             for (i, b) in data.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(data_phys + i as u64).kernel_mut_ptr::<u8>(),
-                    *b,
-                );
+                core::ptr::write_volatile((data_cpu as *mut u8).add(i), *b);
             }
         }
+
+        self.sync_control(slot_id, generation, 4096)?;
 
         // ── Setup Stage TRB ───────────────────────────────────────
         let setup_d0 =
@@ -3186,7 +3449,7 @@ impl Xhci {
         let status_d3 = (TRB_TYPE_STATUS_STAGE << TRB_TYPE_SHIFT) | TRB_DIR_IN | TRB_IOC;
         let status_trb = ctrl_tr_phys + self.ctrl_enqueue(slot_id, 0, 0, 0, status_d3)?;
 
-        self.ring_slot_doorbell(slot_id, DCI_CONTROL_EP);
+        self.ring_control(slot_id, generation)?;
 
         let data_ev = if let Some(data_trb) = data_trb {
             Some(
@@ -3198,7 +3461,7 @@ impl Xhci {
         };
         if let Some(ev) = data_ev {
             let ccode = ((ev[2] >> 24) & 0xFF) as u8;
-            if ccode != 1 && ccode != 13 {
+            if ccode != 1 {
                 return Err(XhciError::CmdFailed(ccode));
             }
         }
@@ -3206,11 +3469,15 @@ impl Xhci {
             .await_event(|t| Self::control_transfer_event_matches(t, slot_id, status_trb))
             .await?;
         let ccode = ((status_ev[2] >> 24) & 0xFF) as u8;
-        if ccode != 1 && ccode != 13 {
+        if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
         }
         let residue = data_ev.unwrap_or(status_ev)[2] & 0x00FF_FFFF;
-        Ok((w_length as u32).saturating_sub(residue) as usize)
+        if residue > u32::from(w_length) {
+            return Err(XhciError::CmdFailed(0xFB));
+        }
+        self.complete_control(slot_id, generation)?;
+        Ok((u32::from(w_length) - residue) as usize)
     }
 
     /// Fetch the complete 18-byte USB Device Descriptor (§9.6.1) for
@@ -3223,13 +3490,26 @@ impl Xhci {
     /// silently turn the VID/PID fields at offsets 8..12 into zeros and
     /// route a composite device to the wrong class driver.
     pub async fn get_device_descriptor(&self, slot_id: u8) -> Result<[u8; 18], XhciError> {
+        let generation = self
+            .device_generation(slot_id)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        self.get_device_descriptor_generation(slot_id, generation)
+            .await
+    }
+
+    pub(crate) async fn get_device_descriptor_generation(
+        &self,
+        slot_id: u8,
+        generation: u64,
+    ) -> Result<[u8; 18], XhciError> {
         const HEADER_LEN: usize = 8;
         const DESCRIPTOR_LEN: usize = 18;
 
         let mut header = [0u8; HEADER_LEN];
         let header_len = self
-            .control_in(
+            .control_in_generation(
                 slot_id,
+                generation,
                 0x80,                               // bmRequestType: IN, Standard, Device
                 USB_REQ_GET_DESCRIPTOR,             // bRequest
                 (USB_DESC_TYPE_DEVICE as u16) << 8, // wValue: descriptor type | index
@@ -3261,8 +3541,9 @@ impl Xhci {
 
         let mut buf = [0u8; 18];
         let n = self
-            .control_in(
+            .control_in_generation(
                 slot_id,
+                generation,
                 0x80,                               // bmRequestType: IN, Standard, Device
                 USB_REQ_GET_DESCRIPTOR,             // bRequest
                 (USB_DESC_TYPE_DEVICE as u16) << 8, // wValue: descriptor type | index
@@ -3279,6 +3560,15 @@ impl Xhci {
         Ok(buf)
     }
 
+    pub fn device_generation(&self, slot_id: u8) -> Option<u64> {
+        self.devices
+            .lock()
+            .get(slot_id as usize)?
+            .as_ref()
+            .map(|device| device.generation)
+            .filter(|generation| *generation != 0)
+    }
+
     /// Look up a previously-addressed device by slot id.
     pub fn device_info(&self, slot_id: u8) -> Option<(u8, PortSpeed, u16)> {
         let g = self.devices.lock();
@@ -3293,7 +3583,7 @@ impl Xhci {
         let g = self.devices.lock();
         for (idx, slot) in g.iter().enumerate() {
             if let Some(d) = slot {
-                if d.port == port {
+                if d.port == port && d.generation != 0 {
                     return Some(idx as u8);
                 }
             }
@@ -3311,11 +3601,26 @@ impl Xhci {
         cfg_idx: u8,
         out: &mut [u8],
     ) -> Result<usize, XhciError> {
+        let generation = self
+            .device_generation(slot_id)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        self.get_config_descriptor_generation(slot_id, generation, cfg_idx, out)
+            .await
+    }
+
+    pub(crate) async fn get_config_descriptor_generation(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        cfg_idx: u8,
+        out: &mut [u8],
+    ) -> Result<usize, XhciError> {
         // wValue = (descriptor_type << 8) | descriptor_index. Type
         // 2 = CONFIGURATION (§9.4 Table 9-5).
         let w_value = (2u16 << 8) | (cfg_idx as u16);
-        self.control_in(
+        self.control_in_generation(
             slot_id,
+            generation,
             0x80, // bmRequestType: IN, Standard, Device
             USB_REQ_GET_DESCRIPTOR,
             w_value,
@@ -3340,17 +3645,68 @@ impl Xhci {
         slot_id: u8,
         endpoints: &[EndpointConfig],
     ) -> Result<(), XhciError> {
+        let generation = self
+            .device_generation(slot_id)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        self.configure_endpoints_generation(slot_id, generation, endpoints)
+            .await
+    }
+
+    pub(crate) async fn configure_endpoints_generation(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        endpoints: &[EndpointConfig],
+    ) -> Result<(), XhciError> {
         if endpoints.is_empty() {
             return Ok(());
         }
 
-        let speed = {
-            let devices = self.devices.lock();
-            devices
-                .get(slot_id as usize)
-                .and_then(|device| device.as_ref())
-                .map(|device| device.speed)
-                .ok_or(XhciError::CmdFailed(0xFD))?
+        let mut seen = 0u32;
+        for ep in endpoints {
+            let dci = ep.dci();
+            if !(2..=31).contains(&dci) || seen & (1u32 << dci) != 0 {
+                return Err(XhciError::CmdFailed(0xFB));
+            }
+            seen |= 1u32 << dci;
+        }
+        let (speed, existing_max) = {
+            let mut devices = self.devices.lock();
+            let device = devices
+                .get_mut(slot_id as usize)
+                .and_then(Option::as_mut)
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            if generation == 0 || device.generation != generation {
+                return Err(XhciError::CmdFailed(0xFD));
+            }
+            if device.control.active()
+                || device.endpoint_configuration
+                || endpoints.iter().any(|ep| {
+                    let dci = ep.dci();
+                    !(2..=31).contains(&dci)
+                        || device
+                            .eps
+                            .get(dci.saturating_sub(2) as usize)
+                            .is_some_and(Option::is_some)
+                })
+            {
+                return Err(XhciError::NotReady);
+            }
+            device.endpoint_configuration = true;
+            let existing_max = device
+                .eps
+                .iter()
+                .flatten()
+                .map(|ep| ep.dci as u32)
+                .max()
+                .unwrap_or(1);
+            (device.speed, existing_max)
+        };
+        let mut claim = EndpointConfiguration {
+            controller: self,
+            slot: slot_id,
+            generation,
+            published: false,
         };
 
         // Allocate Input Context (4 KiB, zeroed). Layout matches
@@ -3379,7 +3735,7 @@ impl Xhci {
 
         // Need to compute the new "Context Entries" value: highest
         // DCI in use + 1, capped at 31. Default-control = DCI 1.
-        let mut max_dci = 1u32;
+        let mut max_dci = existing_max;
 
         for ep in endpoints.iter().copied() {
             let dci = ep.dci();
@@ -3478,7 +3834,9 @@ impl Xhci {
                     ep_d4,
                 );
             }
+            tr.sync(0, tr.len());
             new_eps.push(EndpointState {
+                bulk: bulk_owner::State::new(),
                 dci,
                 max_packet: params.max_packet,
                 kind: ep.kind,
@@ -3499,14 +3857,27 @@ impl Xhci {
         // command processing. On real hardware that wipes the
         // assigned device address and leaves the slot in Default
         // state, breaking later control transfers.
-        // SAFETY: identity-mapped DCBAA[slot_id] points at the
-        // slot's device context.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let dev_ctx_phys = unsafe {
-            let dcbaa_phys = self.dcbaa.dma_addr().raw();
-            core::ptr::read_volatile(
-                narf_memory::PhysAddr::new(dcbaa_phys + (slot_id as u64) * 8).kernel_ptr::<u64>(),
-            )
+        let slot_context = {
+            let devices = self.devices.lock();
+            let device = devices
+                .get(usize::from(slot_id))
+                .and_then(Option::as_ref)
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            if device.generation != generation {
+                return Err(XhciError::NotReady);
+            }
+            device._device_ctx.sync(0, 16);
+            device_dma_barrier();
+            let mut words = [0u32; 4];
+            for (index, word) in words.iter_mut().enumerate() {
+                // SAFETY: the retained output context covers these four dwords.
+                *word = unsafe {
+                    core::ptr::read_volatile(
+                        device._device_ctx.cpu_ptr_at::<u32>((index * 4) as u64),
+                    )
+                };
+            }
+            words
         };
         let slot_ctx_off = input_phys + self.context_stride();
         // Copy the full Slot Context (4 dwords; bytes 0..16). The
@@ -3517,9 +3888,7 @@ impl Xhci {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for off in 0..4u64 {
-                let v = core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(dev_ctx_phys + off * 4).kernel_ptr::<u32>(),
-                );
+                let v = slot_context[off as usize];
                 core::ptr::write_volatile(
                     narf_memory::PhysAddr::new(slot_ctx_off + off * 4).kernel_mut_ptr::<u32>(),
                     v,
@@ -3546,11 +3915,18 @@ impl Xhci {
         // Address Device, different Type.
         let trb_type = TRB_TYPE_CONFIGURE_ENDPOINT_CMD << TRB_TYPE_SHIFT;
         let dword3 = trb_type | ((slot_id as u32) << 24);
-        self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
-        let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
-        let want_slot = (slot_id as u32) << 24;
+        input.sync(0, input.len());
+        device_dma_barrier();
+        // Once the command is published, cancellation/timeout cannot free
+        // its Input Context or endpoint rings. Keep them retained until
+        // an exact terminal completion permits adoption into the slot.
+        let mut retained = bulk_owner::CommandDma::new((input, new_eps));
+        retained.publish();
+        claim.published = true;
+        let command_trb =
+            self.submit_command_record(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
         let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)
+            .await_event(|event| bulk_owner::command_matches(event, slot_id, command_trb))
             .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
@@ -3564,6 +3940,12 @@ impl Xhci {
             .get_mut(slot_id as usize)
             .and_then(|s| s.as_mut())
             .ok_or(XhciError::CmdFailed(0xFC))?;
+        if dev.generation != generation || !dev.endpoint_configuration {
+            return Err(XhciError::NotReady);
+        }
+        // The originating command's Success event proves the Input Context
+        // was consumed; endpoint DMA remains retained in dev.eps.
+        let (input, new_eps) = retained.complete();
         for ep in new_eps {
             let dci = ep.dci as usize;
             let need = dci.saturating_sub(2) + 1;
@@ -3572,6 +3954,8 @@ impl Xhci {
             }
             dev.eps[dci - 2] = Some(ep);
         }
+        dev.endpoint_configuration = false;
+        claim.published = false;
         let _ = input;
         Ok(())
     }
@@ -3586,71 +3970,23 @@ impl Xhci {
         phys: u64,
         len: u32,
     ) -> Result<(), XhciError> {
-        let mut g = self.devices.lock();
-        let dev = g
+        let mut devices = self.devices.lock();
+        let device = devices
             .get_mut(slot_id as usize)
-            .and_then(|s| s.as_mut())
+            .and_then(Option::as_mut)
             .ok_or(XhciError::CmdFailed(0xFC))?;
-        let idx = (dci as usize).saturating_sub(2);
-        let ep = dev
+        if device.endpoint_configuration {
+            return Err(XhciError::NotReady);
+        }
+        let ep = device
             .eps
-            .get_mut(idx)
-            .and_then(|s| s.as_mut())
+            .get_mut(dci.saturating_sub(2) as usize)
+            .and_then(Option::as_mut)
             .ok_or(XhciError::CmdFailed(0xFA))?;
-        // Slot CTRL_TR_TRBS-1 is the Link TRB planted at ring
-        // construction. When enq reaches it, follow the link:
-        // re-update the Link TRB's cycle bit so hardware can
-        // see it as "valid + toggle" on its next dequeue, reset
-        // enq to 0, toggle pcs, then write the new Normal TRB
-        // at slot 0 with the toggled cycle.
-        if ep.enq == CTRL_TR_TRBS - 1 {
-            // Re-stamp the Link TRB with the *current* cycle so
-            // the engine consumes it. Without this, a Link TRB
-            // written at construction with cycle=0 stays valid
-            // forever (engine reads it once, follows it, but
-            // subsequent wraps need fresh cycle bits).
-            let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
-            let link_addr = ep.tr.dma_addr().raw() + link_off;
-            let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
-            // SAFETY: identity-mapped DMA, offset in-page.
-            unsafe {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(link_addr + 12).kernel_mut_ptr::<u32>(),
-                    link_d3,
-                );
-            }
-            compiler_fence(Ordering::SeqCst);
-            ep.enq = 0;
-            ep.pcs ^= 1;
+        if ep.bulk.active() {
+            return Err(XhciError::NotReady);
         }
-        let trb_off = (ep.enq * 16) as u64;
-        let trb_addr = ep.tr.dma_addr().raw() + trb_off;
-        let d3 = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC | (ep.pcs & TRB_CYCLE_BIT);
-        // SAFETY: identity-mapped DMA; offset in-page.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(trb_addr).kernel_mut_ptr::<u32>(),
-                phys as u32,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(trb_addr + 4).kernel_mut_ptr::<u32>(),
-                (phys >> 32) as u32,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(trb_addr + 8).kernel_mut_ptr::<u32>(),
-                len,
-            );
-        }
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: same.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(trb_addr + 12).kernel_mut_ptr::<u32>(),
-                d3,
-            );
-        }
-        compiler_fence(Ordering::SeqCst);
-        ep.enq += 1;
+        enqueue_normal_on(&ep.tr, &mut ep.pcs, &mut ep.enq, phys, len);
         Ok(())
     }
 
@@ -3741,7 +4077,7 @@ impl Xhci {
         if data.is_empty() || data.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
-        let phys = self.ep_dma_phys(slot_id, dci)?;
+        let phys = self.ep_dma_phys(slot_id, dci, EndpointKind::IsochOut)?;
         // SAFETY: identity-mapped DMA page; size bounded above.
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -3785,7 +4121,7 @@ impl Xhci {
         if out.is_empty() || out.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
-        let phys = self.ep_dma_phys(slot_id, dci)?;
+        let phys = self.ep_dma_phys(slot_id, dci, EndpointKind::IsochIn)?;
         // Zero only the prefix we'll read — stale data in the
         // persistent buffer mustn't masquerade as device payload.
         // SAFETY: identity-mapped DMA page; bounds-checked above.
@@ -3829,63 +4165,254 @@ impl Xhci {
         Ok(xferred)
     }
 
-    /// Issue a bulk-IN read against `slot_id` / `dci`. Allocates a
-    /// single DMA scratch page (max read = 4 KiB), enqueues a
-    /// Normal TRB, rings the slot doorbell, and waits for a
-    /// Transfer Event. Returns bytes received.
-    pub async fn bulk_in(&self, slot_id: u8, dci: u8, out: &mut [u8]) -> Result<usize, XhciError> {
-        if out.is_empty() || out.len() > 4096 {
+    /// Begin one bounded bulk TD. The endpoint retains its DMA page until
+    /// the exact originating TRB completes; dropping the receipt is not a
+    /// cancellation or permission to overwrite that page.
+    fn begin_bulk(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        generation: u64,
+        direction: BulkDirection,
+        length: usize,
+        data: &[u8],
+    ) -> Result<BulkToken, XhciError> {
+        if !(2..=31).contains(&dci)
+            || !(1..=4096).contains(&length)
+            || (direction == BulkDirection::Out && data.len() != length)
+        {
             return Err(XhciError::CmdFailed(0xF9));
         }
-        // Reuse the per-EP persistent DMA buffer (audit #14).
-        let phys = self.ep_dma_phys(slot_id, dci)?;
-        // Zero only the prefix we'll read back so a stale page can't
-        // be confused with a 0-length response from the device.
-        // SAFETY: identity-mapped DMA page; bounds-checked by the
-        // upstream `out.len() > 4096` guard.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
-                0,
-                out.len(),
-            );
-        }
-        self.ep_enqueue_normal(slot_id, dci, phys, out.len() as u32)?;
-        self.ring_slot_doorbell(slot_id, dci as u32);
-
-        // Audit F-41: filter Transfer Events by both Slot ID and
-        // Endpoint ID so a parallel control transfer (DCI=1) on the
-        // same slot doesn't steal our event.
-        let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
-        let want_slot = (slot_id as u32) << 24;
-        let want_ep = (dci as u32) << 16;
-        let ev = self
-            .await_event(|t| {
-                (t[3] & TRB_TYPE_MASK) == xfer
-                    && (t[3] & 0xFF00_0000) == want_slot
-                    && (t[3] & 0x001F_0000) == want_ep
-            })
-            .await?;
-        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
-        if ccode != 1 && ccode != 13 {
-            return Err(XhciError::CmdFailed(ccode));
-        }
-        let residue = ev[2] & 0x00FF_FFFF;
-        let xferred = (out.len() as u32).saturating_sub(residue) as usize;
-        let copy = xferred.min(out.len());
-        for (i, slot) in out[..copy].iter_mut().enumerate() {
-            // SAFETY: `phys` is this endpoint's identity-mapped DMA
-            // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
-            // read inside that page, aligned for a `u8`.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            *slot = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_ptr::<u8>(),
-                )
+        let token = {
+            let mut devices = self.devices.lock();
+            let device = devices
+                .get_mut(slot_id as usize)
+                .and_then(Option::as_mut)
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            if generation == 0 || device.generation != generation {
+                return Err(XhciError::CmdFailed(0xFD));
+            }
+            if device.endpoint_configuration {
+                return Err(XhciError::NotReady);
+            }
+            let ep = device
+                .eps
+                .get_mut(usize::from(dci - 2))
+                .and_then(Option::as_mut)
+                .ok_or(XhciError::CmdFailed(0xFA))?;
+            let expected = match direction {
+                BulkDirection::In => EndpointKind::BulkIn,
+                BulkDirection::Out => EndpointKind::BulkOut,
             };
+            if ep.kind != expected {
+                return Err(XhciError::CmdFailed(0xF8));
+            }
+            let EndpointState {
+                bulk,
+                tr,
+                dma_buf,
+                pcs,
+                enq,
+                ..
+            } = ep;
+            bulk.begin(
+                bulk_owner::Endpoint {
+                    generation,
+                    slot: slot_id,
+                    dci,
+                },
+                direction,
+                length,
+                || {
+                    // SAFETY: the ownership claim is recorded before this closure;
+                    // a single endpoint owns this page, and length is <= 4096.
+                    unsafe {
+                        if direction == BulkDirection::In {
+                            core::ptr::write_bytes(dma_buf.cpu_mut_ptr::<u8>(), 0, length);
+                        } else {
+                            core::ptr::copy_nonoverlapping(
+                                data.as_ptr(),
+                                dma_buf.cpu_mut_ptr::<u8>(),
+                                length,
+                            );
+                        }
+                    }
+                    dma_buf.sync(0, length);
+                    device_dma_barrier();
+                    enqueue_normal_on(tr, pcs, enq, dma_buf.dma_addr().raw(), length as u32)
+                },
+            )
+            .map_err(bulk_error)?
+        };
+        {
+            let devices = self.devices.lock();
+            let device = devices
+                .get(usize::from(slot_id))
+                .and_then(Option::as_ref)
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            let ep = device
+                .eps
+                .get(usize::from(dci - 2))
+                .and_then(Option::as_ref)
+                .ok_or(XhciError::CmdFailed(0xFA))?;
+            ep.bulk
+                .validate(device.generation, &token)
+                .map_err(bulk_error)?;
+            self.ring_slot_doorbell(slot_id, u32::from(dci));
         }
-        Ok(xferred)
+        Ok(token)
+    }
+
+    /// Submit a bulk-IN TD without imposing a receive timeout.
+    pub fn begin_bulk_in(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        generation: u64,
+        length: usize,
+    ) -> Result<BulkToken, XhciError> {
+        self.begin_bulk(slot_id, dci, generation, BulkDirection::In, length, &[])
+    }
+
+    /// Stage and submit a bulk-OUT TD with retained scratch ownership.
+    pub fn begin_bulk_out(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        generation: u64,
+        data: &[u8],
+    ) -> Result<BulkToken, XhciError> {
+        self.begin_bulk(
+            slot_id,
+            dci,
+            generation,
+            BulkDirection::Out,
+            data.len(),
+            data,
+        )
+    }
+
+    fn validate_bulk(&self, token: &BulkToken) -> Result<(), XhciError> {
+        let devices = self.devices.lock();
+        let device = devices
+            .get(usize::from(token.slot()))
+            .and_then(Option::as_ref)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        let ep = device
+            .eps
+            .get(usize::from(token.endpoint() - 2))
+            .and_then(Option::as_ref)
+            .ok_or(XhciError::CmdFailed(0xFA))?;
+        ep.bulk
+            .validate(device.generation, token)
+            .map_err(bulk_error)
+    }
+
+    fn complete_bulk(
+        &self,
+        token: &BulkToken,
+        event: &[u32; 4],
+        out: Option<&mut [u8]>,
+    ) -> Result<Option<usize>, XhciError> {
+        let mut devices = self.devices.lock();
+        let device = devices
+            .get_mut(usize::from(token.slot()))
+            .and_then(Option::as_mut)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        let ep = device
+            .eps
+            .get_mut(usize::from(token.endpoint() - 2))
+            .and_then(Option::as_mut)
+            .ok_or(XhciError::CmdFailed(0xFA))?;
+        let EndpointState { bulk, dma_buf, .. } = ep;
+        bulk.complete(device.generation, token, event, |length| {
+            if let Some(out) = out {
+                dma_buf.sync(0, token.length());
+                device_dma_barrier();
+                // SAFETY: the exact terminal event retires device writes;
+                // caller capacity is checked before removing any event.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        dma_buf.cpu_ptr::<u8>(),
+                        out.as_mut_ptr(),
+                        length,
+                    );
+                }
+            }
+        })
+        .map_err(bulk_error)
+    }
+
+    fn poll_bulk(
+        &self,
+        token: &BulkToken,
+        out: Option<&mut [u8]>,
+    ) -> Result<Option<usize>, XhciError> {
+        self.validate_bulk(token)?;
+        match event_wait::poll_batch(
+            || self.take_matching_event(&mut |event| token.matches(event)),
+            || self.demux_one_event().is_some(),
+            || false,
+        ) {
+            Ok(Some(event)) => self.complete_bulk(token, &event, out),
+            Ok(None) => Ok(None),
+            Err(event_wait::PollError::Source(error)) => Err(error),
+            Err(event_wait::PollError::TimedOut) => Err(XhciError::CmdTimeout),
+        }
+    }
+
+    /// Poll an already-published receive. None preserves the TD and page.
+    pub fn poll_bulk_in(
+        &self,
+        token: &BulkToken,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, XhciError> {
+        if token.direction() != BulkDirection::In || out.len() < token.length() {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        self.poll_bulk(token, Some(out))
+    }
+
+    /// Poll an already-published transmit. USB completion is not a WLAN ACK.
+    pub fn poll_bulk_out(&self, token: &BulkToken) -> Result<Option<usize>, XhciError> {
+        if token.direction() != BulkDirection::Out {
+            return Err(XhciError::CmdFailed(0xF8));
+        }
+        self.poll_bulk(token, None)
+    }
+
+    pub(crate) async fn wait_bulk_in(
+        &self,
+        token: &BulkToken,
+        out: &mut [u8],
+    ) -> Result<usize, XhciError> {
+        if token.direction() != BulkDirection::In || out.len() < token.length() {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        self.validate_bulk(token)?;
+        let event = self.await_event(|event| token.matches(event)).await?;
+        self.complete_bulk(token, &event, Some(out))?
+            .ok_or(XhciError::NotReady)
+    }
+
+    pub(crate) async fn wait_bulk_out(&self, token: &BulkToken) -> Result<usize, XhciError> {
+        if token.direction() != BulkDirection::Out {
+            return Err(XhciError::CmdFailed(0xF8));
+        }
+        self.validate_bulk(token)?;
+        let event = self.await_event(|event| token.matches(event)).await?;
+        self.complete_bulk(token, &event, None)?
+            .ok_or(XhciError::NotReady)
+    }
+
+    /// Compatibility receive wait. A timeout retains endpoint ownership;
+    /// persistent receivers should use begin_bulk_in + poll_bulk_in instead.
+    pub async fn bulk_in(&self, slot_id: u8, dci: u8, out: &mut [u8]) -> Result<usize, XhciError> {
+        let generation = self
+            .device_generation(slot_id)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        let token = self.begin_bulk_in(slot_id, dci, generation, out.len())?;
+        self.wait_bulk_in(&token, out).await
     }
 
     /// Stage one Normal TRB on an interrupt-IN endpoint and ring the
@@ -3900,7 +4427,7 @@ impl Xhci {
         if len == 0 || len > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
-        let phys = self.ep_dma_phys(slot_id, dci)?;
+        let phys = self.ep_dma_phys(slot_id, dci, EndpointKind::InterruptIn)?;
         // Zero the prefix so a stale page doesn't masquerade as
         // device data.
         // SAFETY: identity-mapped DMA page; bounds-checked above.
@@ -3974,7 +4501,7 @@ impl Xhci {
         }
         let residue = ev[2] & 0x00FF_FFFF;
         let xferred = (out.len() as u32).saturating_sub(residue) as usize;
-        let phys = self.ep_dma_phys(slot_id, dci)?;
+        let phys = self.ep_dma_phys(slot_id, dci, EndpointKind::InterruptIn)?;
         let copy = xferred.min(out.len());
         for (i, slot) in out[..copy].iter_mut().enumerate() {
             // SAFETY: `phys` is this endpoint's identity-mapped DMA
@@ -3993,7 +4520,7 @@ impl Xhci {
     }
 
     /// Resolve the persistent DMA buffer phys for an endpoint.
-    fn ep_dma_phys(&self, slot_id: u8, dci: u8) -> Result<u64, XhciError> {
+    fn ep_dma_phys(&self, slot_id: u8, dci: u8, kind: EndpointKind) -> Result<u64, XhciError> {
         let g = self.devices.lock();
         let dev = g
             .get(slot_id as usize)
@@ -4005,49 +4532,146 @@ impl Xhci {
             .get(idx)
             .and_then(|s| s.as_ref())
             .ok_or(XhciError::CmdFailed(0xFA))?;
+        if !(2..=31).contains(&dci)
+            || dev.endpoint_configuration
+            || ep.kind != kind
+            || ep.bulk.active()
+        {
+            return Err(XhciError::NotReady);
+        }
         Ok(ep.dma_buf.dma_addr().raw())
     }
 
-    /// Issue a bulk-OUT write. Mirror of `bulk_in`: stages caller's
-    /// bytes into a DMA scratch page, enqueues a Normal TRB,
-    /// rings the slot doorbell, awaits the Transfer Event.
-    /// Returns bytes acknowledged by the engine.
+    /// Compatibility transmit wait. Error or cancellation does not reopen
+    /// the endpoint page; no Stop Endpoint/drain contract is implied.
     pub async fn bulk_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<usize, XhciError> {
-        if data.is_empty() || data.len() > 4096 {
-            return Err(XhciError::CmdFailed(0xF9));
+        let generation = self
+            .device_generation(slot_id)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        let token = self.begin_bulk_out(slot_id, dci, generation, data)?;
+        self.wait_bulk_out(&token).await
+    }
+}
+
+static NEXT_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_device_generation() -> Result<u64, XhciError> {
+    NEXT_DEVICE_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1).filter(|next| *next != u64::MAX)
+        })
+        .map_err(|_| XhciError::NotReady)
+}
+
+/// Order device-visible DMA, including devices outside ARM's inner-shareable
+/// CPU domain. Cache maintenance remains owned by the host-controller API.
+fn device_dma_barrier() {
+    compiler_fence(Ordering::SeqCst);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: orders normal-memory DMA against device accesses, no pointers.
+    unsafe {
+        core::arch::asm!("dmb osh", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::fence(Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
+}
+
+fn bulk_error(error: bulk_owner::Error) -> XhciError {
+    match error {
+        bulk_owner::Error::Busy | bulk_owner::Error::Exhausted => XhciError::NotReady,
+        bulk_owner::Error::Stale => XhciError::CmdFailed(0xFD),
+        bulk_owner::Error::BadLength => XhciError::CmdFailed(0xF9),
+        bulk_owner::Error::Malformed => XhciError::CmdFailed(0xFB),
+        bulk_owner::Error::Completion(code) => XhciError::CmdFailed(code),
+    }
+}
+
+struct AddressAttempt<'a> {
+    controller: &'a Xhci,
+    slot: u8,
+    generation: u64,
+    published: bool,
+}
+impl Drop for AddressAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.controller
+                .slots
+                .lock()
+                .release_unpublished(self.slot, self.generation);
         }
-        // Reuse per-EP DMA buffer (audit #14).
-        let phys = self.ep_dma_phys(slot_id, dci)?;
-        // SAFETY: identity-mapped DMA page; bounds-checked by guard.
-        unsafe {
-            for (i, &b) in data.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                    b,
-                );
+    }
+}
+
+struct EndpointConfiguration<'a> {
+    controller: &'a Xhci,
+    slot: u8,
+    generation: u64,
+    published: bool,
+}
+impl Drop for EndpointConfiguration<'_> {
+    fn drop(&mut self) {
+        // Before publication ordinary errors release the claim. After it,
+        // the command may still own the retained Input Context and rings.
+        if !self.published {
+            let mut devices = self.controller.devices.lock();
+            if let Some(device) = devices
+                .get_mut(usize::from(self.slot))
+                .and_then(Option::as_mut)
+            {
+                if device.generation == self.generation {
+                    device.endpoint_configuration = false;
+                }
             }
         }
-        self.ep_enqueue_normal(slot_id, dci, phys, data.len() as u32)?;
-        self.ring_slot_doorbell(slot_id, dci as u32);
-
-        let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
-        let want_slot = (slot_id as u32) << 24;
-        let want_ep = (dci as u32) << 16;
-        let ev = self
-            .await_event(|t| {
-                (t[3] & TRB_TYPE_MASK) == xfer
-                    && (t[3] & 0xFF00_0000) == want_slot
-                    && (t[3] & 0x001F_0000) == want_ep
-            })
-            .await?;
-        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
-        if ccode != 1 {
-            return Err(XhciError::CmdFailed(ccode));
-        }
-        let residue = ev[2] & 0x00FF_FFFF;
-        let acked = (data.len() as u32).saturating_sub(residue) as usize;
-        Ok(acked)
     }
+}
+
+fn enqueue_normal_on(tr: &DmaBuffer, pcs: &mut u32, enq: &mut usize, phys: u64, len: u32) -> u64 {
+    // Slot CTRL_TR_TRBS-1 is the Link TRB planted at ring
+    // construction. When enq reaches it, follow the link:
+    // re-update the Link TRB's cycle bit so hardware can
+    // see it as "valid + toggle" on its next dequeue, reset
+    // enq to 0, toggle pcs, then write the new Normal TRB
+    // at slot 0 with the toggled cycle.
+    if *enq == CTRL_TR_TRBS - 1 {
+        // Re-stamp the Link TRB with the *current* cycle so
+        // the engine consumes it. Without this, a Link TRB
+        // written at construction with cycle=0 stays valid
+        // forever (engine reads it once, follows it, but
+        // subsequent wraps need fresh cycle bits).
+        let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
+        let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (*pcs & TRB_CYCLE_BIT);
+        // SAFETY: identity-mapped DMA, offset in-page.
+        unsafe {
+            core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(link_off + 12), link_d3);
+        }
+        tr.sync(link_off as usize, 16);
+        device_dma_barrier();
+        *enq = 0;
+        *pcs ^= 1;
+    }
+    let trb_off = (*enq * 16) as u64;
+    let trb_addr = tr.dma_addr().raw() + trb_off;
+    let d3 = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC | (*pcs & TRB_CYCLE_BIT);
+    // SAFETY: identity-mapped DMA; offset in-page.
+    unsafe {
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off), phys as u32);
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 4), (phys >> 32) as u32);
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 8), len);
+    }
+    tr.sync(trb_off as usize, 16);
+    device_dma_barrier();
+    // SAFETY: same.
+    unsafe {
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 12), d3);
+    }
+    compiler_fence(Ordering::SeqCst);
+    tr.sync(trb_off as usize, 16);
+    device_dma_barrier();
+    *enq += 1;
+    trb_addr
 }
 
 /// xHCI controller handle. Wrapped in `Arc` so callers can hold a

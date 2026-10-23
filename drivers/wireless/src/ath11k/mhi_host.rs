@@ -78,7 +78,6 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
-use core::sync::atomic::{compiler_fence, fence, Ordering};
 
 use narf_io::DmaBuffer;
 use narf_lib::id::DomainId;
@@ -405,9 +404,7 @@ impl Dma {
 /// `dma_wmb()` / `smp_wmb()`: order descriptor writes before the
 /// doorbell / context update that publishes them.
 fn dma_wmb() {
-    compiler_fence(Ordering::SeqCst);
-    fence(Ordering::Release);
-    compiler_fence(Ordering::SeqCst);
+    super::hal::dma_wmb();
 }
 
 /// `struct mhi_ring` for a DMA ring: `pre_aligned` = `mem`,

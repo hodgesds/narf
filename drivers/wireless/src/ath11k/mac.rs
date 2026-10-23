@@ -504,7 +504,7 @@ impl DeviceCaps {
 /// `ath11k_hw_params` / module defaults the mac layer reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MacConfig {
-    /// WMI vdev slot allocated by the radio.  WCN6855 advertises three
+    /// WMI vdev slot allocated by the radio. NARF currently admits three
     /// independent vdevs; each NARF netdev owns exactly one of those slots
     /// for its whole lifetime, just as one `ieee80211_vif` owns one
     /// `arvif->vdev_id` in Linux.

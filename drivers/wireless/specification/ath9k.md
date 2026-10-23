@@ -1,7 +1,8 @@
 # ath9k — Specification
 
-> Status: **AR9285 reset/EEPROM identity implemented; radio software
-> incomplete.** No network interface or packet DMA is enabled.
+> Status: **AR9285 reset/EEPROM and inactive baseband preparation
+> implemented; radio software incomplete.** No network interface, PHY
+> activation or packet DMA is enabled.
 
 ## 1. Purpose & scope
 
@@ -14,7 +15,7 @@ WLAN firmware to supply MLME and hardware programming.
 
 The PCI dispatcher grants exclusive function authority. Probe disables
 inherited bus mastering, enables memory decode and masks INTx before
-mapping a device-typed BAR0 covering registers through `0x704f`.
+mapping a device-typed BAR0 covering registers through `0xd387`.
 AR9285-specific writes follow a checked silicon revision.
 
 ## 3. Public interface
@@ -28,20 +29,31 @@ AR9285-specific writes follow a checked silicon revision.
   EEPROM version, factory regulatory-domain values, and chain masks.
 - `Ath9k::calibration()` exposes the complete 376-byte normalized
   `ar5416_eeprom_4k` image for later PHY calibration programming.
+- `Ath9k::baseband` reports `BasebandPrepared`: the 2412 MHz reference
+  frequency, selected EEPROM high-power gain/SYNTH9 XE2 variant and count
+  of programmed INI rows. It records inactive register preparation, not
+  channel authorization or a calibrated/operational PHY.
 - Errors distinguish absent/mismatched silicon, timeout, invalid EEPROM
   magic/length/checksum/version, and invalid factory identity.
 
 The former reset-only `Ath9k::new` constructor is removed. Construction
 goes through the PCI authority and identification path. Successful probe
-records hardware identity; it does not register a netdev or imply a WLAN.
+records hardware identity and then programs Linux's AR9285 2GHz HT20
+mode/gain/common tables (655 writes), ordered PLL/analog shift setup and RF
+synth reference registers with bounded responsive settling delays. All
+four gain-table combinations use the actual factory TXGAIN and SYNTH9
+selection. It does not register a netdev or imply a WLAN.
 
 ## 4. Invariants
 
 - PCI parking is verified by command-register readback before MMIO: BME
   off and INTx masked, followed by verified memory-decode enable. Additional
   matched singleton radios are parked with BME/memory decode off and rejected.
-- BME remains disabled throughout identification. Interrupts remain
-  masked; no unowned DMA rings can run.
+  Repeated dispatch of the owned address fails before parking.
+- BME remains disabled throughout identification and baseband preparation.
+  PHY activation, MAC RX, all ten TX queues and interrupts remain disabled;
+  no unowned DMA rings can run. The common table's cleared DIAG_SW is
+  followed by restored RX_ABORT/RX_DIS before any PHY activation.
 - Register and EEPROM waits use the scheduler's bounded responsive wait;
   reset settling delays are measured in time, not CPU iteration counts.
 - EEPROM reads trigger by reading `0x2000 + word * 4` and accept data only
@@ -67,18 +79,23 @@ responsive waits from scheduler/time. No packet-DMA allocation is made.
 
 ## 7. Stage assignment
 
-Stage 5 identification prerequisite. Traced smokes exercise the live
+Stage 5 identification/baseband prerequisites. Traced smokes exercise the live
 identification helper, complete EEPROM extent, reset register order,
 endianness/checksum/version validation and invalid/busy hardware cases.
+Independent hashes from Linux cover every address/value pair for all four
+production INI choices; fixtures also verify PLL/RF values, analog delays,
+BAR bounds and that packet/PHY engines stay disabled.
 They do not prove RF or packet operation.
 
 ## 8. Remaining software and physical acceptance
 
 Software still required before AR9285 is ready for physical Wi-Fi testing:
 
-1. AR9002/AR9285 MAC/baseband/analog initialization tables, PLL and PCIe
-   power-save setup, EEPROM modal/power/antenna/CTL application, RF channel
-   synth programming, noise-floor/IQ/PA calibration and regulatory limits.
+1. Complete the partially prepared PHY: channel-mode overrides, chain
+   masks and delta slope/spur handling, EEPROM modal/power/antenna/CTL and
+   PDADC application, noise-floor/IQ/PA calibration and regulatory limits.
+   The fixed inactive reference synth setting does not implement channel
+   switching or radio activation. PCIe power-save/PM setup also remains.
 2. Real TX queue/RX descriptor allocations and DMA ownership, IRQ service,
    TX completion, RX status/decryption/replay/error handling, and complete
    stop/reset/hot-remove/PM lifecycle before any memory can be reclaimed.

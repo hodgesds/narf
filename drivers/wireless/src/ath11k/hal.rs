@@ -44,7 +44,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{compiler_fence, fence, Ordering};
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use narf_io::DmaBuffer;
 use narf_lib::id::DomainId;
@@ -1131,22 +1131,25 @@ impl DmaMem {
 
 /// `dma_rmb()`.
 pub fn dma_rmb() {
-    compiler_fence(Ordering::SeqCst);
-    fence(Ordering::Acquire);
-    compiler_fence(Ordering::SeqCst);
+    dma_mb();
 }
 
 /// `dma_wmb()`.
 pub fn dma_wmb() {
-    compiler_fence(Ordering::SeqCst);
-    fence(Ordering::Release);
-    compiler_fence(Ordering::SeqCst);
+    dma_mb();
 }
 
 /// `mb()` / `dma_mb()`.
 pub fn dma_mb() {
     compiler_fence(Ordering::SeqCst);
-    fence(Ordering::SeqCst);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the PCI device is an outer-shareable observer. No memory is
+    // accessed by this instruction; compiler fences bracket the intrinsic.
+    unsafe {
+        core::arch::asm!("dmb osh", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::fence(Ordering::SeqCst);
     compiler_fence(Ordering::SeqCst);
 }
 

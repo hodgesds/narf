@@ -257,31 +257,32 @@ pub fn decode_efuse_map(raw: &[u8], map_out: &mut [u8; EFUSE_MAP_LEN]) {
 
 // ── Convenience: extract MAC from decoded map ───────────────────────
 
-/// MAC address logical-map offset for RTL8188EU / RTL8192EU / RTL8723BU.
+/// MAC address logical-map offset for RTL8188EU. Other families need their
+/// own chip-specific factory geometry.
 ///
 /// Linux locates the factory MAC in the efuse_wifi map at this offset.
 /// Value derived from `8188e.c::rtl8188eu_parse_efuse` which reads
 /// `map.efuse.mac_addr[0..6]` at struct offset corresponding to
 /// `EFUSE_WIFI_MAC_OFFSET_8188E`.
-pub const EFUSE_WIFI_MAC_OFFSET: usize = 0x0007 * 2; // word 7 = byte 14
+pub const EFUSE_WIFI_MAC_OFFSET: usize = 0xd7; // rtl8188eu_efuse::mac_addr
 
 /// Extract the 6-byte MAC address from the decoded EFUSE logical map.
 ///
-/// Returns `None` if the MAC reads as all-zero or all-0xFF.
+/// Returns `None` for a zero or multicast factory address.
 pub fn extract_mac(map: &[u8; EFUSE_MAP_LEN]) -> Option<[u8; 6]> {
     let off = EFUSE_WIFI_MAC_OFFSET;
     if off + 6 > EFUSE_MAP_LEN {
         return None;
     }
     let mac: [u8; 6] = map[off..off + 6].try_into().ok()?;
-    if mac == [0u8; 6] || mac == [0xFFu8; 6] {
+    if mac == [0u8; 6] || mac[0] & 1 != 0 {
         None
     } else {
         Some(mac)
     }
 }
 
-/// `true` if a 6-byte MAC is neither all-zero nor all-0xFF.
+/// `true` for a nonzero unicast factory address.
 pub fn mac_is_valid(mac: [u8; 6]) -> bool {
-    mac != [0u8; 6] && mac != [0xFFu8; 6]
+    mac != [0u8; 6] && mac[0] & 1 == 0
 }

@@ -6,8 +6,6 @@
 //! validate the bound device through retained firmware/radio state;
 //! QEMU skips them because it has no MT7921 PCIe model.
 
-#![cfg(target_arch = "x86_64")]
-
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::mac::PowerError;

@@ -170,7 +170,8 @@ pub const ATH11K_WOW_RETRY_WAIT_MS: u32 = 200;
 /// `ath11k_wow_enable` / `ath11k_wow_wakeup` wait up to 3 HZ, i.e. three
 /// seconds on the normal 1 kHz kernel tick.
 pub const ATH11K_WOW_COMPLETION_TIMEOUT_MS: u32 = 3_000;
-/// `num_vdevs` in WCN6855's resource configuration.  A vdev remains owned
+/// NARF's deliberate vdev ceiling, currently also its resource request.
+/// Local Linux's WCN6855-family resource profile has four slots. A vdev remains owned
 /// by one netdev from WMI_VDEV_CREATE until its delete completion; the radio
 /// never aliases station/AP state between these slots.
 pub const WCN6855_MAX_VDEVS: usize = 3;
@@ -1035,7 +1036,7 @@ pub struct MgmtTxBuf {
 pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     pub core: Ath11kCore<CeHif<Io, Irq>, Q>,
     pub dp: Dp,
-    /// WCN6855's three independently addressable firmware vdev slots.
+    /// The three independently addressable vdev slots NARF currently admits.
     /// Entry index always equals its WMI `vdev_id`.
     pub vdevs: Vec<VdevRuntime>,
     pub mgmt: MgmtTx,
@@ -2508,7 +2509,7 @@ pub struct Shared<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     /// One stable `struct wiphy` identity for all this radio's vdevs.
     pub radio_id: u64,
     /// Firmware vdev slots currently owned by NARF netdevs.  Slot zero is
-    /// reserved for the initial `wlan%d`; WCN6855 exposes exactly three.
+    /// reserved for the initial `wlan%d`; NARF currently admits three.
     vdev_slots: AtomicU32,
     /// The `NL80211_IFTYPE_*` role assigned to each reserved vdev slot.
     /// This is kept beside the allocator rather than on each netdev so a

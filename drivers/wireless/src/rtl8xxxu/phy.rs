@@ -84,12 +84,12 @@ pub const REG_FPGA0_LSSI_B: u16 = 0x0844;
 /// Encode an RF write request as a 32-bit word to push into the LSSI
 /// parameter register.
 ///
-/// Bits[19:0] hold (addr << 16) | data16. Bit 31 set to assert write.
+/// Bits[27:20] select the RF register; bits[19:0] hold its data.
 ///
 /// Source: `core.c::rtl8xxxu_write_rfreg` ~L1700.
 pub const fn lssi_encode(addr: u8, data: u32) -> u32 {
-    // addr is 5 bits, data is 20 bits.
-    (((addr as u32) & 0x1F) << 20) | (data & 0xF_FFFF)
+    // The real RF table includes extended addresses such as 0x57/0xef.
+    ((addr as u32) << 20) | (data & 0xF_FFFF)
 }
 
 /// LSSI register for a given path.

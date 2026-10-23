@@ -13,6 +13,7 @@ struct Bus {
     tx: Vec<Vec<u8>>,
     auto_reply: bool,
     fail_write: bool,
+    busy: bool,
     header_only: bool,
     firmware_error: Option<u32>,
 }
@@ -39,6 +40,9 @@ impl PacketTransport for Bus {
         Ok(packet.len())
     }
     fn transmit_packet(&mut self, packet: &[u8]) -> Result<(), TransportError> {
+        if self.busy {
+            return Err(TransportError::Busy);
+        }
         if self.fail_write {
             return Err(TransportError::Timeout);
         }
@@ -255,6 +259,35 @@ fn smoke_cyw_f2_credit_wrap_and_priority_flow_control() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/cyw43439/runtime",
     smoke_cyw_f2_credit_wrap_and_priority_flow_control
+);
+
+fn smoke_cyw_f2_global_busy_preserves_credit_and_rx() -> TestResult {
+    let mut runtime = Runtime::new(Bus {
+        busy: true,
+        ..Bus::default()
+    });
+    runtime.tx_max = 8;
+    runtime
+        .transport
+        .rx
+        .push_back(frame(0, CHANNEL_CONTROL, 8, &[]));
+    if runtime.send_data(&ethernet(), 0) != Err(Error::Busy)
+        || runtime.tx_sequence != 0
+        || runtime.is_failed()
+        || runtime.poll() != Ok(1)
+        || !runtime.transport.tx.is_empty()
+    {
+        return TestResult::Fail("global FIFO stop consumed sequence/credit or blocked RX");
+    }
+    runtime.transport.busy = false;
+    if runtime.send_data(&ethernet(), 0).is_err() || runtime.tx_sequence != 1 {
+        return TestResult::Fail("unblocked FIFO did not resume retained credit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/runtime",
+    smoke_cyw_f2_global_busy_preserves_credit_and_rx
 );
 
 fn smoke_cyw_f2_cancel_and_bus_error_fail_session() -> TestResult {

@@ -33,7 +33,7 @@ validation was run while the equivalence work remained in progress.
 
 ## MT7921/MT7922 firmware bringup
 
-The x86_64 MT76 late init path now owns coherent WM/FWDL/MCU DMA rings and
+The x86_64 and aarch64 MT76 late init path now owns coherent WM/FWDL/MCU DMA rings and
 performs ROM restart, patch semaphore negotiation, patch/RAM download and
 firmware-ready verification. Post-firmware MCU commands obtain the real MAC
 and PHY, read EFUSE hardware identity, select embedded world country limits,
@@ -58,30 +58,43 @@ M3 RSNE/MIC/ANonce/KDE checks, pairwise/group keys and per-key/TID CCMP replay
 windows. Kernel transmit, capability frame rings and RX delivery share a
 bounded service step with synchronous network waiters; owned rekey work can
 progress even when its original waiter is cancelled. Peer disconnect closes
-carrier and acknowledged key/WTBL/BSS cleanup precedes reuse. Uncertain DMA,
-failed/cancelled control and full reset recovery remain fail-stopped software
-work. No off-box radio, DHCP or AP interoperability has been demonstrated.
+carrier and acknowledged key/WTBL/BSS cleanup precedes reuse. Verified WFSYS
+reset, DMA stop/retirement and firmware reload now recover failed/cancelled
+control without replaying station keys; failed quiescence retains allocations.
+Initial startup failure and registered-interface recovery use retained owned
+futures with bounded retry/backoff. Broader radio modes, removal and PM remain
+software work. No off-box radio, DHCP or AP interoperability has been demonstrated.
 
 ## Wi-Fi family software bring-up
 
 All eleven in-tree families are covered by the current audit and dependency
 ledger in `drivers/wireless/specification/spec.md` and its family documents.
 Intel now sends versioned coexistence, SoC latency and awake-power setup.
-CYW43439 has explicit platform/F2 attach with correlated control, regulatory
-CLM setup, scan, Open/WPA2 station control and bounded RX/TX; a real SDIO/gSPI
-FIFO host implementation and binding are still missing software. Qualcomm
-ath10k reaches owned CE/BMI target discovery, and ath9k retains AR9285 EEPROM
-identity; neither has a station datapath. Unsupported ath11k QCA6390/QCN9074
+MT76 retains cancelled work through bounded WFSYS reset, firmware reload and
+radio reinitialization, without replaying association or keys. Its coherent
+PCI backend and ownership models now build on x86_64 and aarch64; unsupported
+per-domain IOMMU mapping remains rejected.
+CYW43439 now connects standard PCI SDHCI PIO/card enumeration or an explicitly
+supplied platform card through trusted firmware/NVRAM/CLM loading, mailbox/F2
+control, scan, Open/WPA2 and bounded RX/TX. Board clocks/pins/regulators, gSPI
+host support and reset/reload/PM remain software work. Qualcomm ath10k reaches
+owned CE/BMI firmware/BDF/OTP, PLL and retained code-swap preparation; ath9k
+programs AR9285 inactive PHY/PLL/RF INI tables after EEPROM identity. Neither
+has a station datapath. Unsupported ath11k QCA6390/QCN9074
 profiles reject before DMA rather than inheriting WCN6855 acceptance.
-Realtek has per-family identity/power work, a real RTL8188EU USB firmware
-worker and bounded native RTW89 TX ownership; full firmware/RF/station paths
+Realtek has per-family identity/power work, a retained RTL8188EU factory/FIFO/
+firmware/MAC/BB/RF/LLT worker and bounded native RTW89 TX ownership. USB now
+retains published address/configuration/control/bulk DMA and checks slot
+generations; stop/drain/reclamation and replug recovery remain software work.
+Full calibration/channel/native station paths
 remain incomplete. Broadcom PCIe parks DMA and discovers AI cores; firmware,
 msgbuf/flow rings and station attachment remain software work. These gates
 cannot be closed by physical testing alone. No physical device validation is
 part of the current software-only work.
 
-The software checkpoint passes the filtered Wi-Fi QEMU gates: x86_64 reports
-898 pass / 0 fail / 9 skip; aarch64 reports 346 pass / 0 fail / 1 skip.
+The software checkpoint passes the filtered Wi-Fi, SDIO and USB QEMU gates:
+x86_64 reports 1283 pass / 0 fail / 10 skip; aarch64 reports
+593 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.

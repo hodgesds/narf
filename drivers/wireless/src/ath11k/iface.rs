@@ -701,7 +701,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         ))
     }
 
-    /// Opaque net-stack dispatch identity.  WCN6855 has at most three vdevs,
+    /// Opaque net-stack dispatch identity. NARF currently admits three vdevs,
     /// leaving the low two bits for the slot under the physical radio id.
     fn dispatch_cookie(&self) -> u64 {
         (self.shared.radio_id << 2) | u64::from(self.vdev_id)
@@ -2326,7 +2326,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
             return Vec::new();
         }
         // `ath11k_mac_setup_iface_combinations`, reduced to WCN6855's
-        // actual three firmware vdev slots. WCN6855 advertises two station
+        // deliberate three-vdev host ceiling. WCN6855 advertises two station
         // vdevs on up to two channels; AP/GO beaconing shares the
         // infrastructure beacon interval.
         alloc::vec![narf_wireless::InterfaceCombination {

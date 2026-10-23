@@ -41,6 +41,7 @@
 extern crate alloc;
 
 pub mod btcoex;
+pub mod device_init;
 pub mod efuse;
 pub mod firmware_transport;
 pub mod fw;
@@ -120,7 +121,7 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
 /// USB class probe function. Called by the class registry when a
 /// newly-enumerated USB device matches `RTL8XXXU_USB_IDS`. Stores
 /// the `Arc<USBDevice>` in the global device table and logs the
-/// chip family. RTL8188EU starts a retained async power/firmware owner;
+/// chip family. RTL8188EU starts a retained async factory/power/firmware/table owner;
 /// other families remain detection-only until their runtime is implemented.
 ///
 /// Linux analogue: `rtl8xxxu_probe` in

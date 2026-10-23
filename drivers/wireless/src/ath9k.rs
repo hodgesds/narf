@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! AR9285 PCIe reset and EEPROM identity bring-up. Linux ath9k is the
-//! reference. PHY/RF, calibration programming and packet DMA remain open.
+//! AR9285 PCIe reset, EEPROM identity and inactive INI/PLL/RF preparation.
+//! Linux ath9k is the reference. Modal/power/calibration programming,
+//! PHY activation and packet DMA remain open.
 
 use core::fmt::Write as _;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
@@ -8,7 +9,10 @@ use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 mod identity;
+mod initvals;
+mod phy;
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
+pub use phy::Prepared as BasebandPrepared;
 
 const ATHEROS_PCI_VENDOR: u16 = 0x168c;
 const ATHEROS_AR9285_DEVICE: u16 = 0x002b;
@@ -21,6 +25,7 @@ pub struct Ath9k {
     _device: BusDevice,
     _cap: Cap<BusDeviceCap, Write>,
     pub identity: Identity,
+    pub baseband: BasebandPrepared,
     calibration: [u8; EEPROM_4K_BYTES],
 }
 
@@ -40,8 +45,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if device.id.vendor != ATHEROS_PCI_VENDOR || device.id.device != ATHEROS_AR9285_DEVICE {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
-    let occupied = CONTROLLER.lock().is_some();
-    crate::qualcomm_pci::park(&device, &cap, !occupied)?;
+    let owner = CONTROLLER
+        .lock()
+        .as_ref()
+        .map(|controller| controller._device.addr);
+    let occupied = owner.is_some();
+    crate::qualcomm_pci::park(&device, &cap, !occupied, owner)?;
     if occupied {
         return Err(narf_bus::ProbeError::Other(
             "ath9k singleton already owns another radio",
@@ -50,7 +59,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // SAFETY: exclusive PCI function authority from bus dispatch.
     let mmio = unsafe { narf_bus::map_bar_control(&device, 0) }
         .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    if mmio.len < 0x7050 {
+    if mmio.len < phy::REQUIRED_BAR {
         return Err(narf_bus::ProbeError::BadDevice);
     }
     let (identity, calibration) = identity::read(mmio).map_err(|error| {
@@ -61,9 +70,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
         narf_bus::ProbeError::BadDevice
     })?;
+    let baseband = phy::program(mmio, &calibration).map_err(|error| {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath9k: AR9285 baseband preparation failed: {:?}",
+            error
+        );
+        narf_bus::ProbeError::BadDevice
+    })?;
     let _ = writeln!(
         narf_console::Writer,
-        "  ath9k: AR9285 rev {} MAC {:02x?}, EEPROM {:#x}; PHY/RF and packet runtime pending",
+        "  ath9k: AR9285 rev {} MAC {:02x?}, EEPROM {:#x}; INI/PLL/RF registers prepared, calibration and packet runtime pending",
         identity.revision,
         identity.mac,
         identity.eeprom_version
@@ -75,6 +92,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         _device: device,
         _cap: cap,
         identity,
+        baseband,
         calibration,
     });
     narf_drivers::record_bound(narf_drivers::BoundDriver {

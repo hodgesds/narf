@@ -37,6 +37,8 @@ use super::regs::*;
 /// derived MAC. Single-instance for the baseline (every laptop ships
 /// at most one of these); multi-radio comes with the follow-up.
 pub struct Rtw88Device {
+    /// Retained bus identity; a repeat probe must not park the active owner.
+    pub(crate) bus_addr: narf_bus::BusAddr,
     pub registers: MmioRegion,
     pub mac: [u8; MAC_ADDR_LEN],
     /// PCI device id we matched on — controls per-chip quirks in
@@ -161,10 +163,15 @@ pub fn register_pci_driver() {
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     // Skip if a device is already bound. Real laptops only ship one
     // RTW88; a second probe is a re-enumeration race.
-    if CONTROLLER.lock().is_some() {
-        // Even a skipped diagnostic match must not inherit active DMA.
-        crate::rtw88::pci_park::park(&device, &cap).map_err(|_| narf_bus::ProbeError::BadDevice)?;
-        return Ok(());
+    let bound = CONTROLLER.lock().as_ref().map(|owner| owner.bus_addr);
+    match crate::rtw88::pci_park::admission(bound, device.addr) {
+        crate::rtw88::pci_park::Admission::Bound => return Ok(()),
+        crate::rtw88::pci_park::Admission::ParkExtra => {
+            crate::rtw88::pci_park::park(&device, &cap)
+                .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+            return Ok(());
+        }
+        crate::rtw88::pci_park::Admission::Initialize => {}
     }
 
     // SAFETY: caller (the bus dispatch layer) hands us exclusive
@@ -246,6 +253,7 @@ pub unsafe fn bring_up(
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
     let device_obj = Arc::new(Rtw88Device {
+        bus_addr: device.addr,
         registers,
         mac,
         device_id: device.id.device,
@@ -257,6 +265,7 @@ pub unsafe fn bring_up(
     narf_wireless::registry::register(device_obj.clone());
 
     Ok(Rtw88Device {
+        bus_addr: device.addr,
         registers,
         mac,
         device_id: device.id.device,

@@ -14,9 +14,9 @@
 //! ## Hardware validation is gated
 //!
 //! QEMU emulates no MediaTek Wi-Fi PCIe device, so chip-id read, firmware
-//! download, and association cannot run here. Validation is the clean dual
-//! build plus the ~1,477 lines of pure-data smokes carried from the original
-//! module (see [`mt7921::tests`]).
+//! download, and association cannot run here. Validation includes dual builds,
+//! command fixtures, native descriptor models and retained station/reset
+//! ownership tests on both architectures. These do not establish RF acceptance.
 
 #![no_std]
 #![allow(dead_code)]

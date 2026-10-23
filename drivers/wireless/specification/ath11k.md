@@ -127,7 +127,9 @@ MHI/QMI support for another revision do not imply a registered WLAN:
 
 Probe first verifies inherited bus mastering and memory decode are off,
 with INTx masked, using command-register readback. Rejected family/singleton
-functions stay parked. Accepted profiles enable and read back memory decode
+functions stay parked. Repeated dispatch of the already owned canonical PCI
+address returns before config/MMIO access, preserving its active DMA.
+Accepted profiles enable and read back memory decode
 only after that parking proof. Probe validates the complete
 HAL/core/DP/MHI software profile before enabling memory decode. It repeats
 the check after refining the silicon revision and before MSI allocation or
@@ -464,6 +466,10 @@ HE caps for the mac layer, HAL reg caps), `dma_ring_caps`, `ready` +
   `None`): `single_pdev_only`, `num_rxdma_per_pdev = 2`, `max_radios =
   3`, `num_vdevs = 3`, credit flow, shadow regs, Linux timeouts (HTC
   1 s, connect 1 s, service / unified ready 5 s, WMI send 3 s).
+  Three is NARF's deliberate host/resource-request ceiling; the local
+  Linux WCN6855-family hardware resource profile uses four vdevs. Aligning
+  the resource request and generalizing host slot capacity belongs to the
+  next profile/runtime increment.
 - `Ath11kCore::new` (`ath11k_wmi_attach` + `ath11k_htc_init`),
   `qmi_firmware_ready(&mut hooks)` (the whole sequence below), and the
   pieces: `htc_wait_target`, `htt_connect`, `wmi_connect`, `htc_start`,
@@ -1427,11 +1433,11 @@ station, AP, P2P Device, P2P Client, and P2P GO iftypes. A down-only
 requests are serialized onto the runtime queue so their WMI completion waits
 never re-enter a generic-netlink syscall. One physical `wiphy_id` groups the
 root `wlan%d` netdev and up to two `NL80211_CMD_NEW_INTERFACE` children;
-WCN6855's firmware slots 0, 1 and 2 are claimed atomically and each child has
+NARF admits firmware slots 0, 1 and 2, claimed atomically, and each child has
 its own MAC address, `Mac` instance, WMI event queue, RX/TX rings, link/AP
 state and unique `WDEV` id. PDEV-wide `ath11k_mac_op_start`/`stop` runs only
 at the shared open-vdev refcount's zero-to-one/one-to-zero transitions.
-The physical wiphy also reports and enforces WCN6855's three-vdev interface
+The physical wiphy also reports and enforces NARF's three-vdev interface
 combination through `NL80211_ATTR_INTERFACE_COMBINATIONS`: at most two STA,
 at most three AP/P2P client/GO vdevs, one P2P Device, a total cap of three,
 up to two operating channels for the target's dual-station profile, matching
@@ -1655,6 +1661,10 @@ operations refused) and the reset gate.
 - Memory the firmware may DMA into is freed only after the device was
   reset or restarted its firmware (recovery), or never (failed bring-up /
   failed recovery: parked).
+- HAL descriptor/doorbell and MHI publication barriers order the PCI device
+  as an outer-shareable observer on aarch64 (`dmb osh`, compiler-fenced
+  before and after); x86_64 uses a full memory fence. CPU-only atomic
+  ordering is not substituted for device-visible DMA ordering.
 - Bring-up never blocks or panics the init path: probe spawns the MHI
   task, which runs everything after; failures latch a step and park the
   objects the firmware may still use.

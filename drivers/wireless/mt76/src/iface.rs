@@ -2,13 +2,11 @@
 //! Registration requires real NIC/EFUSE/MAC initialization. Packet progress
 //! uses the same bounded step from both the executor and synchronous waiters.
 use crate::mt7921::firmware_transport::{RadioInfo, ScanBss};
-#[cfg(target_arch = "x86_64")]
 use alloc::sync::Arc;
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use async_trait::async_trait;
-use core::sync::atomic::AtomicBool;
-#[cfg(target_arch = "x86_64")]
 use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use narf_ipc::{Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
@@ -31,6 +29,8 @@ pub struct Mt76Iface {
     pending_tx: IrqSafeSpinLock<Option<Frame>>,
     control: narf_lib::mutex::Mutex<()>,
     teardown_needed: AtomicBool,
+    recovery_attempts: AtomicU32,
+    recovery_after_ns: AtomicU64,
 }
 impl Mt76Iface {
     /// Build from validated radio identity, without disconnected frame rings.
@@ -53,6 +53,8 @@ impl Mt76Iface {
             pending_tx: IrqSafeSpinLock::new(None),
             control: narf_lib::mutex::Mutex::new(()),
             teardown_needed: AtomicBool::new(false),
+            recovery_attempts: AtomicU32::new(0),
+            recovery_after_ns: AtomicU64::new(0),
         })
     }
     /// Only the implemented world 2.4 GHz passive scan channels are exposed.
@@ -68,17 +70,11 @@ impl Mt76Iface {
         if !self.link_up() {
             return Err(WirelessError::Denied);
         }
-        #[cfg(target_arch = "x86_64")]
         {
             use crate::mt7921::firmware_transport::transmit_boot_frame;
             transmit_boot_frame(frame)
                 .await
                 .map_err(|_| WirelessError::HardwareError)
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = frame;
-            Err(WirelessError::NotSupported)
         }
     }
 
@@ -87,29 +83,23 @@ impl Mt76Iface {
         if !self.link_up() {
             return Err(WirelessError::Denied);
         }
-        #[cfg(target_arch = "x86_64")]
         {
             use crate::mt7921::firmware_transport::receive_boot_data;
             receive_boot_data()
                 .await
                 .map_err(|_| WirelessError::HardwareError)
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            Err(WirelessError::NotSupported)
-        }
     }
 
     /// Advance bounded packet work, then service authenticated rekeys. No
     /// IRQ-safe lock survives an await; hardware ownership uses a regular mutex.
     pub async fn poll_data(&self) -> Result<(), WirelessError> {
-        #[cfg(target_arch = "x86_64")]
         {
-            if self.teardown_needed.load(Ordering::Acquire) {
+            if self.teardown_needed.load(Ordering::Acquire) || radio_needs_recovery() {
                 let Some(_control) = self.control.try_lock() else {
                     return Ok(());
                 };
-                self.finish_teardown().await?;
+                self.finish_teardown(false).await?;
             }
             self.drain_network()?;
             if self.link_up() {
@@ -130,7 +120,6 @@ impl Mt76Iface {
     }
 
     /// The synchronous path never waits on a future or another executor task.
-    #[cfg(target_arch = "x86_64")]
     fn drain_network(&self) -> Result<bool, WirelessError> {
         if !self.link_up() {
             return Ok(false);
@@ -196,7 +185,6 @@ impl Mt76Iface {
         *self.rx_prod.lock() = None;
     }
 
-    #[cfg(target_arch = "x86_64")]
     fn lose_link(&self) {
         let connected = self.link_up();
         if connected {
@@ -208,19 +196,52 @@ impl Mt76Iface {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    async fn finish_teardown(&self) -> Result<(), WirelessError> {
-        if !self.teardown_needed.load(Ordering::Acquire) {
+    async fn finish_teardown(&self, operator_request: bool) -> Result<(), WirelessError> {
+        if self.teardown_needed.load(Ordering::Acquire) {
+            match crate::mt7921::firmware_transport::disassociate_boot_station().await {
+                Ok(()) => {
+                    self.teardown_needed.store(false, Ordering::Release);
+                    self.recovery_attempts.store(0, Ordering::Release);
+                    self.recovery_after_ns.store(0, Ordering::Release);
+                }
+                Err(_) if radio_needs_recovery() => {}
+                Err(crate::mt7921::firmware_transport::Error::Busy) => {
+                    return Err(WirelessError::Busy)
+                }
+                Err(_) => return Err(WirelessError::HardwareError),
+            }
+        }
+        if !radio_needs_recovery() {
             return Ok(());
         }
-        crate::mt7921::firmware_transport::disassociate_boot_station()
+        let now = narf_time::wall::monotonic_ns();
+        let attempts = self.recovery_attempts.load(Ordering::Acquire);
+        if !operator_request
+            && (attempts >= 3 || now < self.recovery_after_ns.load(Ordering::Acquire))
+        {
+            return Err(WirelessError::Busy);
+        }
+        self.recovery_attempts
+            .store(attempts.saturating_add(1), Ordering::Release);
+        let delay = match attempts {
+            0 => 1_000_000_000,
+            1 => 5_000_000_000,
+            _ => 30_000_000_000,
+        };
+        self.recovery_after_ns
+            .store(now.saturating_add(delay), Ordering::Release);
+        self.lose_link();
+        self.teardown_needed.store(true, Ordering::Release);
+        self.scan_cache.lock().clear();
+        crate::mt7921::firmware_transport::recover_boot_radio(self.mac())
             .await
             .map_err(|_| WirelessError::HardwareError)?;
         self.teardown_needed.store(false, Ordering::Release);
+        self.recovery_attempts.store(0, Ordering::Release);
+        self.recovery_after_ns.store(0, Ordering::Release);
         Ok(())
     }
 
-    #[cfg(target_arch = "x86_64")]
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
         if !self.link_up() || !transmit_admitted(bytes, self.mac()) {
             return Err(());
@@ -242,6 +263,14 @@ fn transmit_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
         && bytes[6..12] == local
         && u16::from_be_bytes([bytes[12], bytes[13]]) >= 0x600
         && bytes[12..14] != [0x88, 0x8e]
+}
+
+fn radio_needs_recovery() -> bool {
+    use crate::mt7921::firmware_transport::{boot_status, BootStatus, State};
+    matches!(
+        boot_status(),
+        BootStatus::Retained(State::Failed { .. } | State::Running(_) | State::Stopped)
+    )
 }
 impl Interface for Mt76Iface {
     fn name(&self) -> &str {
@@ -290,9 +319,7 @@ impl WirelessNetIface for Mt76Iface {
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let channels = passive_channels(&req)?;
         let _control = self.control.lock().await;
-        #[cfg(target_arch = "x86_64")]
-        self.finish_teardown().await?;
-        #[cfg(target_arch = "x86_64")]
+        self.finish_teardown(true).await?;
         {
             use crate::mt7921::firmware_transport::{scan_boot_passive, Error};
             let report = scan_boot_passive(&channels)
@@ -319,11 +346,6 @@ impl WirelessNetIface for Mt76Iface {
             *self.scan_cache.lock() = report.bss;
             Ok(results)
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = channels;
-            Err(WirelessError::NotSupported)
-        }
     }
 
     fn connected_bssid(&self) -> Option<[u8; 6]> {
@@ -332,8 +354,7 @@ impl WirelessNetIface for Mt76Iface {
 
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
-        #[cfg(target_arch = "x86_64")]
-        self.finish_teardown().await?;
+        self.finish_teardown(true).await?;
         if self.link_up() {
             return Err(WirelessError::Busy);
         }
@@ -368,7 +389,6 @@ impl WirelessNetIface for Mt76Iface {
         crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
             .ok_or(WirelessError::Denied)?;
 
-        #[cfg(target_arch = "x86_64")]
         {
             use crate::mt7921::firmware_transport::{associate_boot_station, Error};
             let aid = associate_boot_station(&bss, &req.ssid, security)
@@ -391,21 +411,14 @@ impl WirelessNetIface for Mt76Iface {
             narf_net::iface::set_link_state(&self.name, true);
             Ok(())
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (bss, security);
-            Err(WirelessError::NotSupported)
-        }
     }
 
     async fn disassociate(&self) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
-        #[cfg(target_arch = "x86_64")]
-        self.finish_teardown().await?;
+        self.finish_teardown(true).await?;
         if self.associated_bssid.lock().is_none() {
             return Ok(());
         }
-        #[cfg(target_arch = "x86_64")]
         {
             use crate::mt7921::firmware_transport::{disassociate_boot_station, Error};
             self.teardown_needed.store(true, Ordering::Release);
@@ -426,10 +439,6 @@ impl WirelessNetIface for Mt76Iface {
             *self.associated_bssid.lock() = None;
             narf_net::iface::set_link_state(&self.name, false);
             Ok(())
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            Err(WirelessError::NotSupported)
         }
     }
 
@@ -504,7 +513,6 @@ fn scan_security(
 
 /// Register one boot-owned radio with both network registries. The same
 /// bounded packet step services executor and synchronous network callers.
-#[cfg(target_arch = "x86_64")]
 pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, WirelessError> {
     let authority = narf_net::trusted_net_authority()
         .and_then(|a| a.derive().ok())
@@ -536,24 +544,19 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
     Ok(iface)
 }
 
-#[cfg(target_arch = "x86_64")]
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Mt76Iface>>> = IrqSafeSpinLock::new(None);
 
-#[cfg(target_arch = "x86_64")]
 fn send_frame(bytes: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     let iface = ACTIVE.lock().clone().ok_or(())?;
     iface.enqueue(bytes)
 }
 
-#[cfg(target_arch = "x86_64")]
 fn drain_network() -> bool {
     let iface = ACTIVE.lock().clone();
     iface.is_some_and(|iface| iface.drain_network().unwrap_or(false))
 }
 
-#[cfg(target_arch = "x86_64")]
 struct RegisteredIface(Arc<Mt76Iface>);
-#[cfg(target_arch = "x86_64")]
 impl Interface for RegisteredIface {
     fn name(&self) -> &str {
         self.0.name()

@@ -1,11 +1,30 @@
-//! x86_64 coherent PCI backend. Linux reference: ecd997b0189a mt792x_dma.c.
+//! Coherent PCI backend for x86_64 and aarch64.
+//! Linux reference: ecd997b0189a mt792x_dma.c.
 use super::{Backend, Error, Firmware, RadioInfo, Report, Retained, Session, State, MAX_FRAME};
 use crate::mt7921::{packet_tx, registers, regs::*};
 use alloc::{collections::VecDeque, vec, vec::Vec};
-use core::sync::atomic::{fence, Ordering};
+#[cfg(not(target_arch = "aarch64"))]
+use core::sync::atomic::fence;
+use core::sync::atomic::Ordering;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_io::DmaBuffer;
+
+// A CPU atomic fence is inner-shareable on ARM. Device ownership also needs
+// the outer-shareable domain used by PCI DMA (Linux dma_rmb/dma_wmb).
+fn dma_barrier() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        // SAFETY: DMB only orders accesses; no register or memory operand.
+        unsafe {
+            core::arch::asm!("dmb osh", options(nostack, preserves_flags));
+        }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    fence(Ordering::SeqCst);
+}
 
 const DEPTH: usize = 16;
 const GLOBAL: u32 = 0xd4208;
@@ -118,6 +137,35 @@ struct Storage {
     pending_events: VecDeque<Vec<u8>>,
     pending_data: VecDeque<Vec<u8>>,
 }
+impl Storage {
+    // Caller has proved device quiescence and retired every hardware ring reference.
+    fn recycle(&mut self) {
+        for ring in [&mut self.wm, &mut self.fwdl, &mut self.data] {
+            ring.index = 0;
+            ring.pending = false;
+            for slot in 0..DEPTH {
+                for word in 0..4 {
+                    ring.set_word(slot, word, 0);
+                }
+                ring.set_word(slot, 1, DONE);
+            }
+            for buffer in &mut ring.buffers {
+                buffer.as_mut_slice().fill(0);
+            }
+        }
+        for ring in &mut self.rx {
+            ring.index = 0;
+            ring.pending = false;
+            for slot in 0..DEPTH {
+                ring.arm_rx(slot);
+            }
+        }
+        self.tokens = packet_tx::Tokens::new();
+        self.pending_events.clear();
+        self.pending_data.clear();
+        dma_barrier();
+    }
+}
 #[derive(Debug)]
 struct Hardware {
     mmio: MmioRegion,
@@ -137,13 +185,13 @@ impl Hardware {
         if didx == ring.index {
             return Ok(None);
         }
-        fence(Ordering::Acquire);
+        dma_barrier();
         let ctrl = ring.word(ring.index, 1);
         let len = ((ctrl >> 16) & 0x3fff) as usize;
         if ctrl & (DONE | LAST) != (DONE | LAST) || !(8..=MAX_FRAME).contains(&len) {
             return Err(Error::MalformedEvent);
         }
-        fence(Ordering::Acquire); // device payload writes precede observed DDONE
+        dma_barrier(); // device payload writes precede observed DDONE
         let mut frame = vec![0u8; len];
         // SAFETY: completion/length verified; copy before returning buffer to DMA.
         unsafe {
@@ -161,7 +209,7 @@ impl Hardware {
         frame.truncate(packet_len);
         let slot = ring.index;
         ring.arm_rx(slot);
-        fence(Ordering::SeqCst);
+        dma_barrier();
         let base = ring.base;
         self.write(base + 8, slot as u32)?;
         self.owner.storage.as_mut().ok_or(Error::Busy)?.rx[which].index = (slot + 1) % DEPTH;
@@ -257,9 +305,9 @@ impl Hardware {
         ring.set_word(slot, 0, address as u32);
         ring.set_word(slot, 2, 0);
         ring.set_word(slot, 3, (address >> 32) as u32 & 15);
-        fence(Ordering::Release);
+        dma_barrier();
         ring.set_word(slot, 1, ((packet_tx::HEADER as u32) << 16) | LAST);
-        fence(Ordering::SeqCst);
+        dma_barrier();
         self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
     }
     fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
@@ -300,9 +348,9 @@ impl Hardware {
         ring.set_word(slot, 0, address as u32);
         ring.set_word(slot, 2, 0);
         ring.set_word(slot, 3, (address >> 32) as u32 & 15);
-        fence(Ordering::Release);
+        dma_barrier();
         ring.set_word(slot, 1, ((packet_tx::HEADER as u32) << 16) | LAST);
-        fence(Ordering::SeqCst);
+        dma_barrier();
         self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
     }
     fn management_complete(&mut self) -> Result<Option<packet_tx::Completion>, Error> {
@@ -317,7 +365,7 @@ impl Hardware {
             return Err(Error::Ring);
         }
         let done = didx == next && ring.word(ring.index, 1) & DONE != 0;
-        fence(Ordering::Acquire);
+        dma_barrier();
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
         if done {
             storage.tokens.dma_done()?;
@@ -384,6 +432,59 @@ impl Backend for Hardware {
     fn check(&self) -> Result<(), Error> {
         self.authority.check_live().map_err(|_| Error::Authority)
     }
+    fn park_bus_master(&mut self) -> Result<(), Error> {
+        narf_bus::pci::clear_command(
+            &self.authority,
+            &self.device,
+            narf_bus::pci::cmd::BUS_MASTER,
+        )
+        .map_err(|_| Error::Authority)?;
+        if narf_bus::pci::read_command(&self.authority, &self.device)
+            .map_err(|_| Error::Authority)?
+            & narf_bus::pci::cmd::BUS_MASTER
+            != 0
+        {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+    fn assert_reset(&mut self) -> Result<(), Error> {
+        self.update(MT_WFSYS_SW_RST_B, 1, 0)?;
+        if self.read(MT_WFSYS_SW_RST_B)? & 1 != 0 {
+            return Err(Error::Register);
+        }
+        Ok(())
+    }
+    fn request_link_own(&mut self) -> Result<(), Error> {
+        self.write(MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_CLR_OWN)
+    }
+    fn link_owned(&mut self) -> Result<bool, Error> {
+        Ok(self.read(MT_CONN_ON_LPCTL)? & PCIE_LPCR_HOST_OWN_SYNC == 0)
+    }
+    fn release_reset(&mut self) -> Result<(), Error> {
+        self.update(MT_WFSYS_SW_RST_B, 0, 1)?;
+        if self.read(MT_WFSYS_SW_RST_B)? & 1 == 0 {
+            return Err(Error::Register);
+        }
+        Ok(())
+    }
+    fn reset_done(&mut self) -> Result<bool, Error> {
+        Ok(self.read(MT_WFSYS_SW_RST_B)? & (1 << 4) != 0)
+    }
+    fn recycle(&mut self) -> Result<(), Error> {
+        if self.owner.published || !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
+            return Err(Error::Busy);
+        }
+        if narf_bus::pci::read_command(&self.authority, &self.device)
+            .map_err(|_| Error::Authority)?
+            & narf_bus::pci::cmd::BUS_MASTER
+            != 0
+        {
+            return Err(Error::Busy);
+        }
+        self.owner.storage.as_mut().ok_or(Error::Busy)?.recycle();
+        Ok(())
+    }
     fn quiesce(&mut self) -> Result<(), Error> {
         self.write(MT_PCIE_MAC_INT_ENABLE, 0)?;
         self.write(MT_WFDMA0_HOST_INT_ENA, 0)?;
@@ -409,7 +510,7 @@ impl Backend for Hardware {
         // Conservatively mark published BEFORE the first ring base write.
         self.owner.published = true;
         let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
-        fence(Ordering::SeqCst);
+        dma_barrier();
         self.program(&storage.wm, false)?;
         self.program(&storage.fwdl, false)?;
         self.program(&storage.data, false)?;
@@ -517,9 +618,9 @@ impl Backend for Hardware {
         ring.set_word(slot, 0, address as u32);
         ring.set_word(slot, 2, 0);
         ring.set_word(slot, 3, (address >> 32) as u32 & 15);
-        fence(Ordering::Release);
+        dma_barrier();
         ring.set_word(slot, 1, ((frame.len() as u32) << 16) | LAST);
-        fence(Ordering::SeqCst);
+        dma_barrier();
         ring.pending = true;
         let base = ring.base;
         let next = (slot + 1) % DEPTH;
@@ -540,7 +641,7 @@ impl Backend for Hardware {
         if didx != ring.index && didx != next {
             return Err(Error::Ring);
         }
-        fence(Ordering::Acquire);
+        dma_barrier();
         if didx != next || ring.word(ring.index, 1) & DONE == 0 {
             return Ok(false);
         }
@@ -594,7 +695,7 @@ impl Backend for Hardware {
         self.management_complete()
     }
 }
-/// Single-use, retained coherent MCU/FWDL transport for x86_64 CONNAC2.
+/// Retained coherent MCU/FWDL transport with verified reset/recovery.
 #[derive(Debug)]
 pub struct Transport {
     session: Session<Hardware>,
@@ -702,6 +803,15 @@ impl Transport {
     /// Stop DMA, verify idle, clear bus mastering and retire ring bases.
     pub async fn shutdown(&mut self) -> Result<(), Error> {
         self.session.shutdown().await
+    }
+    /// Park DMA, reset WFSYS, retire old ring ownership, and reload firmware.
+    /// The caller closes carrier before awaiting. No association/key replay is
+    /// attempted; a fresh scan/association is required after successful recovery.
+    pub async fn recover(&mut self, expected_mac: [u8; 6]) -> Result<RadioInfo, Error> {
+        self.session.recover(expected_mac).await
+    }
+    pub(super) async fn recover_unregistered(&mut self) -> Result<RadioInfo, Error> {
+        self.session.recover_unregistered().await
     }
     /// Last observed boot stage/result, also preserved after cancellation.
     pub fn state(&self) -> State {

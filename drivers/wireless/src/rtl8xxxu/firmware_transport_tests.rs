@@ -33,6 +33,12 @@ struct Model {
     active_td: bool,
     unsafe_reuses: usize,
     writes: usize,
+    physical: [u8; 512],
+    config: Vec<u8>,
+    llt: Vec<(u8, u8)>,
+    llt_stalled: bool,
+    fail_write: Option<u16>,
+    pending_write: Option<u16>,
 }
 
 impl Model {
@@ -56,6 +62,12 @@ impl Model {
             active_td: false,
             unsafe_reuses: 0,
             writes: 0,
+            physical: factory_stream(),
+            config: configuration(3),
+            llt: Vec::new(),
+            llt_stalled: false,
+            fail_write: None,
+            pending_write: None,
         }
     }
 }
@@ -70,6 +82,11 @@ impl Fake {
 
 #[async_trait::async_trait]
 impl ControlIo for Fake {
+    async fn configuration(&self, out: &mut [u8]) -> Result<usize, UsbError> {
+        let g = self.0.lock();
+        out[..g.config.len()].copy_from_slice(&g.config);
+        Ok(g.config.len())
+    }
     async fn read(&self, addr: u16, out: &mut [u8]) -> Result<usize, UsbError> {
         let pending = { self.0.lock().pending };
         if pending {
@@ -91,7 +108,15 @@ impl ControlIo for Fake {
                 g.regs[addr as usize] |= MCU_WINT_INIT_READY as u8;
             }
         }
-        out.copy_from_slice(&g.regs[addr as usize..addr as usize + out.len()]);
+        if addr == 0x30 && out.len() == 4 {
+            let address = (g.regs[0x31] as usize) | ((g.regs[0x32] as usize & 3) << 8);
+            let value = 1 << 31 | ((address as u32) << 8) | g.physical[address] as u32;
+            out.copy_from_slice(&value.to_le_bytes());
+        } else if addr == 0x1e0 && out.len() == 4 && !g.llt_stalled {
+            out.fill(0);
+        } else {
+            out.copy_from_slice(&g.regs[addr as usize..addr as usize + out.len()]);
+        }
         Ok(if g.short_read {
             out.len() - 1
         } else {
@@ -107,7 +132,16 @@ impl ControlIo for Fake {
             }
             g.ops.push(Op::Write(addr, bytes.to_vec()));
             g.writes += 1;
-            if addr >= REG_FW_START_ADDRESS {
+            if g.fail_write == Some(addr) {
+                return Err(UsbError::Stall);
+            }
+            if addr == 0x1e0 {
+                g.llt.push((bytes[1], bytes[0]));
+            }
+            if g.pending_write == Some(addr) {
+                g.active_td = true;
+                None
+            } else if addr >= REG_FW_START_ADDRESS {
                 let page = (g.regs[REG_MCU_FW_DL as usize + 2] & 7) as usize;
                 let offset = (addr - REG_FW_START_ADDRESS) as usize;
                 if bytes.len() > 196 || g.pages[page].len() != offset {
@@ -144,6 +178,65 @@ impl ControlIo for Fake {
     async fn delay_us(&self, us: u64) {
         self.0.lock().ops.push(Op::Delay(us));
     }
+}
+
+fn configuration(out: u8) -> Vec<u8> {
+    let total = 9 + 9 + 7 * (out as usize + 1);
+    let mut bytes = vec![
+        9,
+        2,
+        total as u8,
+        0,
+        1,
+        1,
+        0,
+        0x80,
+        50,
+        9,
+        4,
+        0,
+        0,
+        out + 1,
+        0xff,
+        0xff,
+        0xff,
+        0,
+        7,
+        5,
+        0x81,
+        2,
+        0,
+        2,
+        0,
+    ];
+    for index in 0..out {
+        bytes.extend_from_slice(&[7, 5, index + 2, 2, 0, 2, 0]);
+    }
+    bytes
+}
+
+fn factory_stream() -> [u8; 512] {
+    let mut logical = [0xff; 512];
+    logical[..2].copy_from_slice(&[0x29, 0x81]);
+    logical[0x10..0x1b].fill(0x20);
+    logical[0xb8..0xbc].copy_from_slice(&[0x20, 0x20, 0x18, 0]);
+    logical[0xc1] = 1;
+    logical[0xd7..0xdd].copy_from_slice(&[2, 0xe0, 0x4c, 1, 2, 3]);
+    let mut raw = [0xff; 512];
+    let mut cursor = 0;
+    for block in [0usize, 2, 3, 0x17, 0x18, 0x1a, 0x1b] {
+        if block < 16 {
+            raw[cursor] = (block << 4) as u8;
+            cursor += 1;
+        } else {
+            raw[cursor] = (((block & 7) << 5) | 0xf) as u8;
+            raw[cursor + 1] = ((block & 0x78) << 1) as u8;
+            cursor += 2;
+        }
+        raw[cursor..cursor + 8].copy_from_slice(&logical[block * 8..block * 8 + 8]);
+        cursor += 8;
+    }
+    raw
 }
 
 fn image(payload_len: usize) -> Vec<u8> {
@@ -401,4 +494,174 @@ fn smoke_rtl8xxxu_live_firmware_active_td_poison() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu",
     smoke_rtl8xxxu_live_firmware_active_td_poison
+);
+
+fn smoke_rtl8188eu_retained_factory_fifo_and_register_pipeline() -> TestResult {
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+    if narf_scheduler::block_on(owner.initialize_device(&image(123))).is_err()
+        || owner.status().stage != Stage::TablesReady
+    {
+        return TestResult::Fail("RTL8188EU retained factory/MAC/BB/RF pipeline failed");
+    }
+    let factory = owner.factory().unwrap();
+    if factory.mac != [2, 0xe0, 0x4c, 1, 2, 3]
+        || factory.crystal_cap != 0x20
+        || factory.cck_power != [0x20; 6]
+        || factory.ht40_power != [0x20; 5]
+    {
+        return TestResult::Fail("RTL8188EU factory/calibration geometry wrong");
+    }
+    let g = io.0.lock();
+    if g.llt.len() != 176
+        || g.llt[169] != (169, 255)
+        || g.llt[175] != (175, 170)
+        || g.regs[0x100] & 0xc0 != 0
+        || g.regs[0x116..0x118] != [0xff, 0x25]
+    {
+        return TestResult::Fail("FIFO/LLT boundary or disabled MAC TX/RX invariant");
+    }
+    // A real RF table entry above 0x1f must remain a distinct RF address.
+    if !g.ops.iter().any(|op| {
+        matches!(op, Op::Write(0x840, data)
+        if data.len()==4 && u32::from_le_bytes(data[..].try_into().unwrap())>>20 == 0x57)
+    }) {
+        return TestResult::Fail("extended RF address was truncated");
+    }
+    let mut rf = false;
+    for op in &g.ops {
+        if matches!(op, Op::Write(0x840, _)) {
+            rf = true;
+        }
+        if matches!(op, Op::Write(0x1e0, _)) && !rf {
+            return TestResult::Fail("LLT ran before source-matched RF setup");
+        }
+        if let Op::Write(0x100, data) = op {
+            if data[0] & 0xc0 != 0 {
+                return TestResult::Fail("MAC started before calibration/packet owner");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8188eu_retained_factory_fifo_and_register_pipeline
+);
+
+fn smoke_rtl8188eu_pipeline_stops_at_failed_register() -> TestResult {
+    for fail in [0x31, 0x214, 0x421, 0x800, 0x840, 0x1e0] {
+        let io = Fake::new();
+        io.0.lock().fail_write = Some(fail);
+        let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+        if narf_scheduler::block_on(owner.initialize_device(&image(123)))
+            != Err(Error::Usb(UsbError::Stall))
+            || owner.status().stage != Stage::Failed
+        {
+            return TestResult::Fail("pipeline did not preserve first transport failure");
+        }
+        let count = {
+            let g = io.0.lock();
+            if !matches!(g.ops.last(), Some(Op::Write(addr, _)) if *addr == fail) {
+                return TestResult::Fail("pipeline attempted I/O after failed register write");
+            }
+            g.ops.len()
+        };
+        if narf_scheduler::block_on(owner.initialize_device(&image(123)))
+            != Err(Error::AlreadyStarted)
+            || io.0.lock().ops.len() != count
+        {
+            return TestResult::Fail("pipeline replayed a failed one-shot owner");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8188eu_pipeline_stops_at_failed_register
+);
+
+fn smoke_rtl8188eu_descriptor_geometry_and_llt_failure() -> TestResult {
+    use super::device_init::endpoints;
+    for count in 1..=3 {
+        let plan = endpoints(&configuration(count)).unwrap();
+        if plan.output_count != count || plan.input != 0x81 || plan.output[0] != 2 {
+            return TestResult::Fail("descriptor-derived endpoint plan wrong");
+        }
+    }
+    let mut duplicate = configuration(3);
+    duplicate[34] = 2;
+    if endpoints(&duplicate).is_ok()
+        || endpoints(&configuration(0)).is_ok()
+        || endpoints(&configuration(4)).is_ok()
+    {
+        return TestResult::Fail("invalid endpoint geometry accepted");
+    }
+    let io = Fake::new();
+    io.0.lock().llt_stalled = true;
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+    if narf_scheduler::block_on(owner.initialize_device(&image(123))) != Err(Error::LltTimeout)
+        || io.0.lock().llt.len() != 1
+        || io.0.lock().regs[0x100] & 0xc0 != 0
+    {
+        return TestResult::Fail("LLT timeout advanced or enabled MAC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8188eu_descriptor_geometry_and_llt_failure
+);
+
+fn smoke_rtl8188eu_pipeline_rejects_silicon_and_poisoned_tables() -> TestResult {
+    for cfg in [u32::MAX, 1 << 23, 8 << 12] {
+        let io = Fake::new();
+        io.0.lock().regs[0xf0..0xf4].copy_from_slice(&cfg.to_le_bytes());
+        let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+        if narf_scheduler::block_on(owner.initialize_device(&image(123)))
+            != Err(Error::UnsupportedSilicon)
+            || io.0.lock().writes != 0
+        {
+            return TestResult::Fail("unsupported silicon reached profile-specific writes");
+        }
+    }
+    let io = Fake::new();
+    io.0.lock().physical.fill(0xff);
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+    if narf_scheduler::block_on(owner.initialize_device(&image(123))) != Err(Error::BadEfuse)
+        || io.0.lock().pages.iter().any(|page| !page.is_empty())
+    {
+        return TestResult::Fail("erased factory map reached firmware/RF stages");
+    }
+    let io = Fake::new();
+    io.0.lock().pending_write = Some(0x840);
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+    {
+        let blob = image(123);
+        let mut future = Box::pin(owner.initialize_device(&blob));
+        if !matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ) || owner.status().stage != Stage::InitializingTables
+        {
+            return TestResult::Fail("post-firmware RF TD did not reach cancellable table stage");
+        }
+    }
+    let g = io.0.lock();
+    if owner.status().error != Some(Error::Cancelled)
+        || g.unsafe_reuses != 0
+        || !g.active_td
+        || !matches!(g.ops.last(), Some(Op::Write(0x840, _)))
+    {
+        return TestResult::Fail(
+            "post-firmware cancellation was mistaken for terminal firmware success",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu",
+    smoke_rtl8188eu_pipeline_rejects_silicon_and_poisoned_tables
 );

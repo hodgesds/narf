@@ -24,6 +24,14 @@ fn prepare(config: &mut impl Config, memory: bool) -> Result<(), ()> {
     }
     Ok(())
 }
+fn prepare_for_probe(config: &mut impl Config, memory: bool, same_owner: bool) -> Result<(), ()> {
+    if same_owner {
+        // Repeated dispatch of the live function is not inherited DMA.
+        // It must not park or reset rings still owned by the current runtime.
+        return Err(());
+    }
+    prepare(config, memory)
+}
 struct Function<'a> {
     cap: &'a Cap<BusDeviceCap, Write>,
     device: &'a BusDevice,
@@ -47,8 +55,14 @@ pub(crate) fn park(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
     memory: bool,
+    owner: Option<narf_bus::BusAddr>,
 ) -> Result<(), narf_bus::ProbeError> {
-    prepare(&mut Function { cap, device }, memory).map_err(|_| narf_bus::ProbeError::BadDevice)
+    prepare_for_probe(
+        &mut Function { cap, device },
+        memory,
+        owner == Some(device.addr),
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -134,5 +148,31 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/qualcomm",
         smoke_qualcomm_pci_readback_precedes_memory_decode
+    );
+
+    fn smoke_qualcomm_pci_repeat_owner_is_not_parked() -> TestResult {
+        let mut config = Fake {
+            command: BUS_MASTER | MEM_SPACE,
+            sticky: 0,
+            ignored: 0,
+            trace: vec![],
+        };
+        if prepare_for_probe(&mut config, false, true).is_ok()
+            || !config.trace.is_empty()
+            || config.command != BUS_MASTER | MEM_SPACE
+        {
+            return TestResult::Fail("repeated dispatch stopped the live owner's DMA");
+        }
+        if prepare_for_probe(&mut config, false, false).is_err()
+            || config.command != INTX_DISABLE
+            || config.trace.is_empty()
+        {
+            return TestResult::Fail("unclaimed additional radio was not parked");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/qualcomm",
+        smoke_qualcomm_pci_repeat_owner_is_not_parked
     );
 }

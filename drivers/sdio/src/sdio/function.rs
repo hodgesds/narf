@@ -20,6 +20,10 @@ pub enum SdioError {
     HostError,
     /// Function is not yet enabled (I/O Enable not set).
     NotEnabled,
+    /// The caller requested a bus address that cannot be encoded in CMD52/53.
+    AddressOverflow,
+    /// This adapter has no implementation for the requested transfer mode.
+    Unsupported,
 }
 
 impl core::fmt::Display for SdioError {
@@ -30,6 +34,8 @@ impl core::fmt::Display for SdioError {
             SdioError::BadFunction => f.write_str("bad function number"),
             SdioError::HostError => f.write_str("host error"),
             SdioError::NotEnabled => f.write_str("function not enabled"),
+            SdioError::AddressOverflow => f.write_str("address overflow"),
+            SdioError::Unsupported => f.write_str("unsupported transfer mode"),
         }
     }
 }
@@ -79,6 +85,22 @@ pub trait SdioFunction {
 
     /// Enable function `func` by setting bit `func` in CCCR IO_ENABLE.
     fn enable_func(&mut self, func: u8) -> Result<(), SdioError>;
+
+    /// Fixed-address FIFO CMD53 read. Legacy adapters fail explicitly rather
+    /// than silently incrementing a FIFO address.
+    fn cmd53_read_fixed(
+        &mut self,
+        _func: u8,
+        _addr: u32,
+        _buf: &mut [u8],
+    ) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
+    /// Program and retain the per-function FBR block size.
+    fn set_block_size(&mut self, _func: u8, _size: u16) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
 }
 
 /// Encode a CMD52 argument for a read and validate fields.
@@ -88,6 +110,9 @@ pub fn encode_cmd52_read(func: u8, addr: u32) -> Result<u32, SdioError> {
     if func > 7 {
         return Err(SdioError::BadFunction);
     }
+    if addr > 0x1ffff {
+        return Err(SdioError::AddressOverflow);
+    }
     Ok(cmd52_arg(false, func, false, addr, 0))
 }
 
@@ -96,6 +121,9 @@ pub fn encode_cmd52_write(func: u8, addr: u32, val: u8) -> Result<u32, SdioError
     if func > 7 {
         return Err(SdioError::BadFunction);
     }
+    if addr > 0x1ffff {
+        return Err(SdioError::AddressOverflow);
+    }
     Ok(cmd52_arg(true, func, false, addr, val))
 }
 
@@ -103,6 +131,9 @@ pub fn encode_cmd52_write(func: u8, addr: u32, val: u8) -> Result<u32, SdioError
 pub fn encode_cmd53_byte_read(func: u8, addr: u32, len: u16) -> Result<u32, SdioError> {
     if func > 7 {
         return Err(SdioError::BadFunction);
+    }
+    if addr > 0x1ffff {
+        return Err(SdioError::AddressOverflow);
     }
     if len == 0 || len > CMD53_MAX_BYTE_COUNT {
         return Err(SdioError::LengthOverflow);
@@ -117,6 +148,9 @@ pub fn encode_cmd53_byte_write(func: u8, addr: u32, len: u16) -> Result<u32, Sdi
     if func > 7 {
         return Err(SdioError::BadFunction);
     }
+    if addr > 0x1ffff {
+        return Err(SdioError::AddressOverflow);
+    }
     if len == 0 || len > CMD53_MAX_BYTE_COUNT {
         return Err(SdioError::LengthOverflow);
     }
@@ -129,6 +163,9 @@ pub fn encode_cmd53_block_read(func: u8, addr: u32, block_count: u16) -> Result<
     if func > 7 {
         return Err(SdioError::BadFunction);
     }
+    if addr > 0x1ffff {
+        return Err(SdioError::AddressOverflow);
+    }
     if block_count == 0 || block_count > CMD53_MAX_BLOCK_COUNT {
         return Err(SdioError::LengthOverflow);
     }
@@ -139,6 +176,9 @@ pub fn encode_cmd53_block_read(func: u8, addr: u32, block_count: u16) -> Result<
 pub fn encode_cmd53_block_write(func: u8, addr: u32, block_count: u16) -> Result<u32, SdioError> {
     if func > 7 {
         return Err(SdioError::BadFunction);
+    }
+    if addr > 0x1ffff {
+        return Err(SdioError::AddressOverflow);
     }
     if block_count == 0 || block_count > CMD53_MAX_BLOCK_COUNT {
         return Err(SdioError::LengthOverflow);
@@ -219,6 +259,24 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/sdio/function", smoke_encode_cmd53_block_write);
+
+    fn smoke_encode_rejects_unrepresentable_address() -> TestResult {
+        let address = 0x20000;
+        if encode_cmd52_read(1, address) != Err(SdioError::AddressOverflow)
+            || encode_cmd52_write(1, address, 0) != Err(SdioError::AddressOverflow)
+            || encode_cmd53_byte_read(1, address, 4) != Err(SdioError::AddressOverflow)
+            || encode_cmd53_byte_write(1, address, 4) != Err(SdioError::AddressOverflow)
+            || encode_cmd53_block_read(1, address, 1) != Err(SdioError::AddressOverflow)
+            || encode_cmd53_block_write(1, address, 1) != Err(SdioError::AddressOverflow)
+        {
+            return TestResult::Fail("validated CMD52/53 encoder truncated address");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/sdio/function",
+        smoke_encode_rejects_unrepresentable_address
+    );
 
     fn smoke_encode_bad_function() -> TestResult {
         // Function > 7 should be rejected for all encoders.

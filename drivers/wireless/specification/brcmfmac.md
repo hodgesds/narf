@@ -35,6 +35,11 @@ capability validity for every select. `Chip::discover` reads the actual
 chip ID/revision, walks bounded AI EROM descriptors, and returns discovered
 `Core { id, revision, base, wrapper }` records. It performs no writes.
 Non-AI interconnects and malformed/out-of-range maps are rejected.
+`Chip::discover_ai` shares the bounded EROM walker with SDIO consumers;
+those callers validate their own CM3/RAM/D11/SDIO profile. `disable_core`
+and `reset_core` implement AI clock/reset/readback ordering with 300-us
+assert and 3-ms release deadlines. CYW43439 uses these live helpers; PCIe
+CPU passive/active integration and its CR4/CA7-specific work remain open.
 
 `Chip::park_pcie` masks the PCIe interrupt and mailbox sources before
 acknowledging the sampled mailbox status. PCIe core revisions below 64

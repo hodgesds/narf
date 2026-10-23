@@ -40,7 +40,7 @@ pub struct Identity {
     pub big_endian_fields: bool,
 }
 
-trait RegisterIo {
+pub(super) trait RegisterIo {
     fn read32(&mut self, offset: u64) -> u32;
     fn write32(&mut self, offset: u64, value: u32);
     fn delay_us(&mut self, us: u64) {
@@ -66,7 +66,7 @@ trait RegisterIo {
     }
 }
 
-struct Registers(narf_bus::MmioRegion);
+pub(super) struct Registers(pub(super) narf_bus::MmioRegion);
 impl RegisterIo for Registers {
     fn read32(&mut self, offset: u64) -> u32 {
         // SAFETY: probe checked BAR0 coverage and retains exclusive ownership.

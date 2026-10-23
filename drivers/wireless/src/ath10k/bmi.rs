@@ -36,6 +36,11 @@ pub struct TargetInfo {
 /// completions. A timeout poisons the transport; a later request must fail.
 pub(super) trait Transport {
     async fn exchange(&mut self, request: &[u8], response: &mut [u8]) -> Result<usize, BmiError>;
+    /// Retain the coherent code segment until the complete device owner
+    /// quiesces DMA. Replacing an already advertised allocation is forbidden.
+    fn prepare_codeswap(&mut self, _bytes: &[u8]) -> Result<(u32, [u8; 208]), BmiError> {
+        Err(BmiError::Unsupported)
+    }
 }
 
 #[derive(Debug)]
@@ -50,6 +55,14 @@ impl<T: Transport> Bmi<T> {
             transport,
             done: false,
         }
+    }
+
+    pub async fn configure_codeswap(&mut self, bytes: &[u8]) -> Result<(), BmiError> {
+        if self.done {
+            return Err(BmiError::AfterDone);
+        }
+        let (address, info) = self.transport.prepare_codeswap(bytes)?;
+        self.write_memory(address, &info).await
     }
 
     async fn exchange(&mut self, request: &[u8], response: &mut [u8]) -> Result<usize, BmiError> {
@@ -69,6 +82,34 @@ impl<T: Transport> Bmi<T> {
             version: word(&response[4..8]),
             target_type: word(&response[8..12]),
         })
+    }
+
+    pub async fn read_soc(&mut self, address: u32) -> Result<u32, BmiError> {
+        if address & 3 != 0 {
+            return Err(BmiError::AddressOverflow);
+        }
+        let mut request = [0; 8];
+        request[..4].copy_from_slice(&6u32.to_le_bytes());
+        request[4..].copy_from_slice(&address.to_le_bytes());
+        let mut response = [0; 4];
+        if self.exchange(&request, &mut response).await? != 4 {
+            return Err(BmiError::BadResponse);
+        }
+        Ok(word(&response))
+    }
+
+    pub async fn write_soc(&mut self, address: u32, value: u32) -> Result<(), BmiError> {
+        if address & 3 != 0 {
+            return Err(BmiError::AddressOverflow);
+        }
+        let mut request = [0; 12];
+        request[..4].copy_from_slice(&7u32.to_le_bytes());
+        request[4..8].copy_from_slice(&address.to_le_bytes());
+        request[8..].copy_from_slice(&value.to_le_bytes());
+        if self.exchange(&request, &mut []).await? != 0 {
+            return Err(BmiError::BadResponse);
+        }
+        Ok(())
     }
 
     pub async fn read_memory(&mut self, mut address: u32, out: &mut [u8]) -> Result<(), BmiError> {

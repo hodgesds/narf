@@ -91,3 +91,23 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_realtek_diagnostic_pci_requires_park_readback
 );
+
+fn smoke_realtek_repeat_probe_preserves_bound_function() -> TestResult {
+    use super::pci_park::{admission, Admission};
+    use narf_bus::{BusAddr, PcieAddr};
+    let bound = BusAddr::Pcie(PcieAddr::new(0, 2, 0, 0));
+    let extra = BusAddr::Pcie(PcieAddr::new(0, 3, 0, 0));
+    let other_segment = BusAddr::Pcie(PcieAddr::new(1, 2, 0, 0));
+    if admission(None, bound) != Admission::Initialize
+        || admission(Some(bound), bound) != Admission::Bound
+        || admission(Some(bound), extra) != Admission::ParkExtra
+        || admission(Some(bound), other_segment) != Admission::ParkExtra
+    {
+        return TestResult::Fail("repeat probe could re-park an existing Realtek owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_realtek_repeat_probe_preserves_bound_function
+);

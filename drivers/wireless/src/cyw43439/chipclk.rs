@@ -7,8 +7,8 @@
 //! report when the requested clock has actually become available.
 //!
 //! Cross-checked against `soypat/cyw43439` (MIT) and Embassy
-//! `cyw43` (Apache-2.0 / MIT). **No GPL `brcmfmac` / `bcmdhd`
-//! source consulted.**
+//! `cyw43` (Apache-2.0 / MIT). Live register corrections also follow
+//! local Linux brcmfmac/sdio.h under GPL-2.0-or-later.
 
 /// Force ALP-clock-available request.
 pub const FORCE_ALP_REQ: u8 = 0x01;
@@ -57,16 +57,16 @@ impl ClockState {
 }
 
 /// F1 sleep / wake control register (`SBSDIO_FUNC1_SLEEPCSR`,
-/// datasheet §6.5 Table 6-7, F1 address `0x1000F`).
+/// datasheet §6.5 Table 6-7, F1 address `0x1001F`).
 pub mod sleep {
     /// Keep-SDIO-on bit — host writes to keep the SDIO core powered
     /// while the rest of the chip is asleep.
     pub const KSO: u8 = 0x01;
     /// Mirror of [`KSO`] read back from the chip — used to confirm
     /// the chip honoured the host's KSO request.
-    pub const KSO_STATUS: u8 = 0x02;
+    pub const KSO_STATUS: u8 = KSO;
     /// Device-on bit — set by the chip once the SOC has booted.
-    pub const DEV_ON: u8 = 0x04;
+    pub const DEV_ON: u8 = 0x02;
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

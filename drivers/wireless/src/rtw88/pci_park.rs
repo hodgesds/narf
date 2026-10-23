@@ -12,6 +12,24 @@ pub(crate) enum Error {
     NotParked,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Admission {
+    Initialize,
+    Bound,
+    ParkExtra,
+}
+
+pub(crate) fn admission(
+    bound: Option<narf_bus::BusAddr>,
+    candidate: narf_bus::BusAddr,
+) -> Admission {
+    match bound {
+        None => Admission::Initialize,
+        Some(address) if address == candidate => Admission::Bound,
+        Some(_) => Admission::ParkExtra,
+    }
+}
+
 pub(crate) fn park_with(
     clear: impl FnOnce(u16) -> Result<u16, ()>,
     set: impl FnOnce(u16) -> Result<u16, ()>,

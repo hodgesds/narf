@@ -87,6 +87,7 @@ fn rig(complete: bool) -> (Resources<Buffer>, Io) {
         request: Buffer::new(256, 0x104000, false),
         response: Buffer::new(2048, 0x105000, false),
         diag: Buffer::new(2048, 0x106000, false),
+        codeswap: None,
     };
     for (ring, pipe) in [
         (&mut resources.tx, 0),

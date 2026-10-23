@@ -74,7 +74,7 @@ impl SdhciHost {
     }
 
     /// Calculate the clock-control register value to achieve
-    /// approximately `target_hz` on a spec-2.00 host (10-bit divider
+    /// at most `target_hz` when representable (10-bit divider
     /// split as d[9:8] in bits [7:6], d[7:0] in bits [15:8]).
     ///
     /// Returns the 16-bit CLOCK_CONTROL word (without INT_EN / CARD_EN
@@ -85,23 +85,7 @@ impl SdhciHost {
         if self.clock_base_hz == 0 || target_hz == 0 {
             return 0;
         }
-        // Find the smallest power-of-two (spec 2.00) or step-of-two
-        // (spec 3.00) divisor that brings the clock ≤ target.
-        // For simplicity, use the spec-2.00 path (power-of-two, ≤256):
-        let mut div: u32 = 1;
-        let max_div = if self.spec_version >= SPEC_300 as u8 {
-            MAX_DIV_SPEC_300 as u32
-        } else {
-            MAX_DIV_SPEC_200 as u32
-        };
-
-        while self.clock_base_hz / div > target_hz {
-            div <<= 1;
-            if div > max_div {
-                div = max_div;
-                break;
-            }
-        }
+        let div = self.clock_divisor(target_hz);
 
         // Encode divisor into 10-bit field (spec 3.00 split encoding).
         // Low 8 bits → CLOCK_CONTROL[15:8].
@@ -110,6 +94,25 @@ impl SdhciHost {
         let lo8 = (d & 0xFF) << 8;
         let hi2 = ((d >> 8) & 0x03) << 6;
         lo8 | hi2
+    }
+
+    /// Actual divided-clock divisor; v3 permits every even divisor while
+    /// v1/v2 permit powers of two. Programmable/multiplied clocks stay off.
+    pub fn clock_divisor(&self, target_hz: u32) -> u32 {
+        if target_hz == 0 || self.clock_base_hz <= target_hz {
+            return 1;
+        }
+        if self.spec_version >= SPEC_300 as u8 {
+            self.clock_base_hz
+                .div_ceil(target_hz)
+                .next_multiple_of(2)
+                .min(u32::from(MAX_DIV_SPEC_300))
+        } else {
+            self.clock_base_hz
+                .div_ceil(target_hz)
+                .next_power_of_two()
+                .min(u32::from(MAX_DIV_SPEC_200))
+        }
     }
 
     /// Returns true if the host supports 1.8 V signalling.

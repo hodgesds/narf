@@ -39,6 +39,8 @@ use narf_lib::id::DomainId;
 
 /// One bound RTW89 device.
 pub struct Rtw89Device {
+    /// Retained bus identity; a repeat probe must not park the active owner.
+    pub(crate) bus_addr: narf_bus::BusAddr,
     /// BAR2 MMIO mapping — the only BAR rtw89 silicon exposes.
     pub mmio_bar2: MmioRegion,
     /// Factory MAC decoded from the chip-specific logical EFUSE map.
@@ -100,10 +102,15 @@ static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtw89Device>>> = IrqSafeSpinLock::
 
 /// Probe entry called by `narf-bus::driver_match`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
-        // Even a skipped diagnostic match must not inherit active DMA.
-        crate::rtw88::pci_park::park(&device, &cap).map_err(|_| narf_bus::ProbeError::BadDevice)?;
-        return Ok(());
+    let bound = CONTROLLER.lock().as_ref().map(|owner| owner.bus_addr);
+    match crate::rtw88::pci_park::admission(bound, device.addr) {
+        crate::rtw88::pci_park::Admission::Bound => return Ok(()),
+        crate::rtw88::pci_park::Admission::ParkExtra => {
+            crate::rtw88::pci_park::park(&device, &cap)
+                .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+            return Ok(());
+        }
+        crate::rtw88::pci_park::Admission::Initialize => {}
     }
 
     // SAFETY: caller-authority.
@@ -363,6 +370,7 @@ pub unsafe fn bring_up(
     }
 
     Ok(Rtw89Device {
+        bus_addr: device.addr,
         mmio_bar2,
         mac,
         device_id: device.id.device,
@@ -389,6 +397,20 @@ pub fn send_frame(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     Err(())
 }
 
+/// Device ownership is outside ARM's inner-shareable CPU ordering domain.
+fn native_dma_barrier() {
+    use core::sync::atomic::{compiler_fence, Ordering};
+    compiler_fence(Ordering::SeqCst);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: orders normal-memory DMA ownership against device MMIO.
+    unsafe {
+        core::arch::asm!("dmb osh", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::fence(Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
+}
+
 impl Rtw89Device {
     /// Retained native PCI TX backend for a future station producer. No current
     /// probe/network callback invokes it: firmware, RF and RPQ startup still
@@ -406,7 +428,6 @@ impl Rtw89Device {
     ) -> Result<Ticket, tx_transport::Error> {
         use super::datapath::{read_tx_ring_idx, ring_doorbell_tx};
         use super::dma::{split_idx, TxBd, TXBD_OPT_LS};
-        use core::sync::atomic::{fence, Ordering};
         let chip = self.chip_id.ok_or(tx_transport::Error::BadQueue)?;
         let queue = self
             .native_tx
@@ -418,7 +439,7 @@ impl Rtw89Device {
         let ring = self.tx_rings[info.channel as usize].lock();
         // SAFETY: caller guarantees a live initialized owned AX channel.
         let (rp, _) = split_idx(unsafe { read_tx_ring_idx(&self.mmio_bar2, &ring.regs) });
-        fence(Ordering::Acquire);
+        native_dma_barrier();
         // A read-pointer update alone deliberately cannot release a packet.
         drop(owner.observe_read_pointer(rp)?);
         if owner.is_full() {
@@ -481,7 +502,7 @@ impl Rtw89Device {
             core::mem::size_of::<TxBd>(),
         );
         owner.publish(ticket)?;
-        fence(Ordering::Release);
+        native_dma_barrier();
         // SAFETY: same live channel; packet retention was committed above.
         unsafe {
             ring_doorbell_tx(&self.mmio_bar2, &ring.regs, owner.write_pointer());
@@ -501,13 +522,12 @@ impl Rtw89Device {
     ) -> Result<Vec<u8>, tx_transport::Error> {
         use super::datapath::read_tx_ring_idx;
         use super::dma::split_idx;
-        use core::sync::atomic::{fence, Ordering};
         let report = tx_transport::parse_report(bytes)?;
         let mut owner = self.native_tx[report.channel as usize].lock();
         let ring = self.tx_rings[report.channel as usize].lock();
         // SAFETY: caller guarantees a coherently acquired live AX RPQ/ring.
         let (rp, _) = split_idx(unsafe { read_tx_ring_idx(&self.mmio_bar2, &ring.regs) });
-        fence(Ordering::Acquire);
+        native_dma_barrier();
         let completed = owner.observe_read_pointer(rp)?;
         let mut statuses: Vec<u8> = completed.into_iter().map(|done| done.status).collect();
         if let Some(done) = owner.observe_report(report)? {

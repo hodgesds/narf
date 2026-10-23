@@ -14,16 +14,14 @@ pub use scan::{rx_frame, ScanBss, ScanReport};
 #[path = "station_join.rs"]
 mod join;
 pub use join::to_ethernet;
-#[cfg(target_arch = "x86_64")]
+#[path = "recovery.rs"]
+mod recovery;
 pub(super) use join::{extract_eapol, wrap_eapol_frame};
 
-#[cfg(target_arch = "x86_64")]
 #[path = "firmware_transport_hw.rs"]
 mod hardware;
-#[cfg(target_arch = "x86_64")]
 pub use hardware::Transport;
 
-#[cfg(target_arch = "x86_64")]
 static BOOT_OWNER: narf_lib::mutex::Mutex<Option<Transport>> = narf_lib::mutex::Mutex::new(None);
 
 type KeyFuture<T> = core::pin::Pin<
@@ -51,13 +49,11 @@ impl<T> KeyWork<T> {
     }
 }
 
-// Key work owns the transport rather than borrowing it across executor polls.
-// Both the normal task and a synchronous network drain may advance this future.
-#[cfg(target_arch = "x86_64")]
+// Rekey/reset work owns the transport across executor polls. Both the normal
+// task and a synchronous network drain may advance the retained future.
 static KEY_WORK: narf_lib::mutex::Mutex<Option<KeyWork<Transport>>> =
     narf_lib::mutex::Mutex::new(None);
 
-#[cfg(target_arch = "x86_64")]
 fn poll_boot_keys(cx: &mut core::task::Context<'_>) -> Poll<Result<(), Error>> {
     let Some(mut slot) = KEY_WORK.try_lock() else {
         cx.waker().wake_by_ref();
@@ -82,13 +78,11 @@ fn poll_boot_keys(cx: &mut core::task::Context<'_>) -> Poll<Result<(), Error>> {
     Poll::Ready(result)
 }
 
-#[cfg(target_arch = "x86_64")]
 async fn finish_boot_keys() -> Result<(), Error> {
     poll_fn(poll_boot_keys).await
 }
 
 /// Boot-only retained transport diagnostics, independent of radio readiness.
-#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootStatus {
     Absent,
@@ -97,7 +91,6 @@ pub enum BootStatus {
 }
 
 /// Inspect without waiting on the boot runner's owner lock.
-#[cfg(target_arch = "x86_64")]
 pub fn boot_status() -> BootStatus {
     match KEY_WORK.try_lock() {
         Some(work) if work.is_none() => {}
@@ -113,7 +106,6 @@ pub fn boot_status() -> BootStatus {
 
 /// Run a receive-only hardware diagnostic using the retained boot owner.
 /// May be awaited from the executor; no sync bridge or IRQ lock is held.
-#[cfg(target_arch = "x86_64")]
 pub async fn scan_boot_passive(channels: &[u8]) -> Result<ScanReport, Error> {
     finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
@@ -127,7 +119,6 @@ pub async fn scan_boot_passive(channels: &[u8]) -> Result<ScanReport, Error> {
 }
 
 /// Dispatch station association using the retained boot owner.
-#[cfg(target_arch = "x86_64")]
 pub async fn associate_boot_station(
     bss: &ScanBss,
     ssid: &[u8],
@@ -145,7 +136,6 @@ pub async fn associate_boot_station(
 }
 
 /// Disassociate the current station using the retained boot owner.
-#[cfg(target_arch = "x86_64")]
 pub async fn disassociate_boot_station() -> Result<(), Error> {
     finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
@@ -159,7 +149,6 @@ pub async fn disassociate_boot_station() -> Result<(), Error> {
 }
 
 /// Submit an Ethernet data frame using the retained boot owner.
-#[cfg(target_arch = "x86_64")]
 pub async fn transmit_boot_frame(frame: &[u8]) -> Result<(), Error> {
     finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
@@ -173,7 +162,6 @@ pub async fn transmit_boot_frame(frame: &[u8]) -> Result<(), Error> {
 }
 
 /// Receive a data frame from the data queue using the retained boot owner.
-#[cfg(target_arch = "x86_64")]
 pub async fn receive_boot_data() -> Result<Option<Vec<u8>>, Error> {
     finish_boot_keys().await?;
     let frame = {
@@ -198,7 +186,6 @@ pub struct PacketStep {
     pub received: Vec<Vec<u8>>,
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
     let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
     match poll_boot_keys(&mut cx) {
@@ -211,7 +198,6 @@ pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
     owner.as_mut().ok_or(Error::DeviceGone)?.step_network(tx)
 }
 
-#[cfg(target_arch = "x86_64")]
 pub async fn service_boot_keys() -> Result<(), Error> {
     {
         let Some(mut work) = KEY_WORK.try_lock() else {
@@ -238,7 +224,54 @@ pub async fn service_boot_keys() -> Result<(), Error> {
     finish_boot_keys().await
 }
 
-#[cfg(target_arch = "x86_64")]
+/// Recovery owns its transport across polls, including after caller
+/// cancellation. Carrier must be closed before this operation is requested.
+pub async fn recover_boot_radio(expected_mac: [u8; 6]) -> Result<(), Error> {
+    if expected_mac == [0; 6] || expected_mac[0] & 1 != 0 {
+        return Err(Error::Bounds);
+    }
+    reset_boot_transport(Some(expected_mac)).await
+}
+
+async fn reset_boot_transport(expected_mac: Option<[u8; 6]>) -> Result<(), Error> {
+    // A prior failed rekey must first return its owned transport. Its error
+    // explains the closed port; reset below establishes a fresh radio state.
+    let _ = finish_boot_keys().await;
+    {
+        let Some(mut work) = KEY_WORK.try_lock() else {
+            return Err(Error::Busy);
+        };
+        if work.is_some() {
+            return Err(Error::Busy);
+        }
+        let Some(mut owner) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        if let Some(transport) = owner.as_ref() {
+            if let State::RadioReady(info) = transport.state() {
+                return if expected_mac.is_none_or(|mac| mac == info.capabilities.mac) {
+                    Ok(())
+                } else {
+                    Err(Error::InvalidIdentity)
+                };
+            }
+        }
+        let mut transport = owner.take().ok_or(Error::DeviceGone)?;
+        *work = Some(KeyWork {
+            future: Some(alloc::boxed::Box::pin(async move {
+                let result = match expected_mac {
+                    Some(mac) => transport.recover(mac).await,
+                    None => transport.recover_unregistered().await,
+                }
+                .map(|_| ());
+                (transport, result)
+            })),
+            completed: None,
+        });
+    }
+    finish_boot_keys().await
+}
+
 pub(super) fn start_boot() -> narf_init::InitResult {
     use core::fmt::Write;
     use narf_init::InitResult;
@@ -279,6 +312,32 @@ pub(super) fn start_boot() -> narf_init::InitResult {
         }
         InitResult::Ok
     } else {
+        // Recovery after initial firmware/radio failure has no registered
+        // interface yet. Keep ownership in the same retained worker and only
+        // publish an interface after a successful fresh identity query.
+        narf_scheduler::spawn(async {
+            for delay_ns in [1_000_000_000, 5_000_000_000, 30_000_000_000] {
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ns)).await;
+                let result = reset_boot_transport(None).await;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "mt76: initial radio recovery {result:?}"
+                );
+                if result.is_ok() {
+                    let info = {
+                        let owner = BOOT_OWNER.lock().await;
+                        match owner.as_ref().map(Transport::state) {
+                            Some(State::RadioReady(info)) => Some(info),
+                            _ => None,
+                        }
+                    };
+                    if let Some(info) = info {
+                        let _ = crate::iface::register_scan_iface(info);
+                    }
+                    return;
+                }
+            }
+        });
         InitResult::Error("MT76 firmware startup (owner retained)")
     }
 }
@@ -329,6 +388,10 @@ pub enum Error {
 /// Last operation reached by a single firmware boot attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    RecoveryPark,
+    RecoveryReset,
+    RecoveryReady,
+    RecoveryRearm,
     Quiesce,
     Initialize,
     DriverOwn,
@@ -556,6 +619,15 @@ trait Backend {
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error>;
     fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error>;
     fn release(&mut self) -> Result<(), Error>;
+    fn park_bus_master(&mut self) -> Result<(), Error>;
+    fn request_link_own(&mut self) -> Result<(), Error>;
+    fn link_owned(&mut self) -> Result<bool, Error>;
+    fn assert_reset(&mut self) -> Result<(), Error>;
+    fn release_reset(&mut self) -> Result<(), Error>;
+    fn reset_done(&mut self) -> Result<bool, Error>;
+    /// Only called after release() has proved DMA idle, bus mastering off
+    /// and every device ring reference cleared.
+    fn recycle(&mut self) -> Result<(), Error>;
     fn configure_mac(&mut self) -> Result<(), Error>;
     fn clear_wtbl(&mut self, index: u8) -> Result<(), Error>;
     fn wtbl_idle(&mut self) -> Result<bool, Error>;
@@ -827,6 +899,5 @@ impl<B: Backend> Session<B> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 #[path = "firmware_transport_tests.rs"]
 mod tests;

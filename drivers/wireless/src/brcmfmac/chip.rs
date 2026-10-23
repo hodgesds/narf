@@ -29,6 +29,7 @@ pub enum Error {
     MalformedErom,
     EromLimit,
     MissingCore,
+    Timeout,
 }
 
 /// Exclusive, serialized register access. Implementations must preserve each
@@ -176,12 +177,59 @@ fn regions(bus: &mut impl Backplane, rom: &mut Erom) -> Result<(u32, u32), Error
     }
 }
 
+fn wait_register(
+    bus: &mut impl Backplane,
+    address: u32,
+    mask: u32,
+    wanted: u32,
+    us: u64,
+) -> Result<(), Error> {
+    let mut failure = None;
+    let complete = narf_scheduler::responsive_spin_until(
+        || match bus.read32(address) {
+            Ok(u32::MAX) => {
+                failure = Some(Error::Gone);
+                true
+            }
+            Ok(value) => value & mask == wanted,
+            Err(error) => {
+                failure = Some(error);
+                true
+            }
+        },
+        narf_time::Deadline::after_us(us),
+    );
+    if let Some(error) = failure {
+        Err(error)
+    } else if complete {
+        Ok(())
+    } else {
+        Err(Error::Timeout)
+    }
+}
+
 impl Chip {
     pub fn core(&self, id: u16) -> Option<Core> {
         self.cores.iter().copied().find(|core| core.id == id)
     }
 
     pub fn discover(bus: &mut impl Backplane) -> Result<Self, Error> {
+        let chip = Self::discover_ai(bus)?;
+        if chip
+            .cores
+            .iter()
+            .filter(|core| core.id == CORE_PCIE2)
+            .count()
+            != 1
+        {
+            return Err(Error::MissingCore);
+        }
+        Ok(chip)
+    }
+
+    /// AI discovery shared with SDIO CM3 parts. The PCIe entry additionally
+    /// requires one PCIe2 core; an SDIO caller validates its own core profile.
+    pub fn discover_ai(bus: &mut impl Backplane) -> Result<Self, Error> {
         let identity = bus.read32(ENUM_BASE)?;
         if identity == u32::MAX || identity & 0xffff == 0 {
             return Err(Error::Gone);
@@ -248,16 +296,57 @@ impl Chip {
         if chip
             .core(CORE_CHIPCOMMON)
             .is_none_or(|core| core.base != ENUM_BASE)
-            || chip
-                .cores
-                .iter()
-                .filter(|core| core.id == CORE_PCIE2)
-                .count()
-                != 1
         {
             return Err(Error::MissingCore);
         }
         Ok(chip)
+    }
+
+    /// AI core-disable contract from Linux brcmf_chip_ai_coredisable.
+    pub fn disable_core(
+        bus: &mut impl Backplane,
+        core: Core,
+        before: u32,
+        reset: u32,
+    ) -> Result<(), Error> {
+        if !valid_address(core.wrapper) || core.wrapper & 0xfff != 0 {
+            return Err(Error::Address);
+        }
+        let control = core.wrapper + 0x408;
+        let reset_control = core.wrapper + 0x800;
+        let state = bus.read32(reset_control)?;
+        if state == u32::MAX {
+            return Err(Error::Gone);
+        }
+        if state & 1 == 0 {
+            bus.write32(control, before | 3)?;
+            let _ = bus.read32(control)?;
+            bus.write32(reset_control, 1)?;
+            let _ =
+                narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(10));
+            wait_register(bus, reset_control, 1, 1, 300)?;
+        }
+        bus.write32(control, reset | 3)?;
+        let _ = bus.read32(control)?;
+        Ok(())
+    }
+
+    /// Reset release is checked before removing forced clocks. Failure is
+    /// terminal for the calling owner; firmware must not run on a guessed core.
+    pub fn reset_core(
+        bus: &mut impl Backplane,
+        core: Core,
+        before: u32,
+        reset: u32,
+        after: u32,
+    ) -> Result<(), Error> {
+        Self::disable_core(bus, core, before, reset)?;
+        bus.write32(core.wrapper + 0x800, 0)?;
+        let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(40));
+        wait_register(bus, core.wrapper + 0x800, 1, 0, 3_000)?;
+        bus.write32(core.wrapper + 0x408, after | 1)?;
+        let _ = bus.read32(core.wrapper + 0x408)?;
+        Ok(())
     }
 
     /// Mask both interrupt paths before acknowledging the sampled mailbox

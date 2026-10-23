@@ -21,7 +21,7 @@ Realtek command policy: clear `BUS_MASTER`, enable `MEM_SPACE | INTX_DISABLE`,
 and read back the command register. Any access failure, retained BME or missing
 requested decoding fails before BAR mapping. Bus mastering remains disabled
 on success and every later error; identity and ring allocation do not authorize
-DMA. Skipped single-instance matches also park their PCI function. Re-enabling
+DMA. A repeat probe of the retained bus address returns without configuration access; a distinct additional singleton match parks only its own PCI function. Re-enabling
 BME requires a future complete firmware/ring/reset owner.
 
 `efuse::read_mac(registers, ChipId, cut)` runs the AX DDV read lifecycle and

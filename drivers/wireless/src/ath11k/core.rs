@@ -456,7 +456,8 @@ pub struct CoreConfig {
     pub single_pdev_only: bool,
     pub num_rxdma_per_pdev: u32,
     pub max_radios: u8,
-    /// `hw_params.num_vdevs` (resource config).
+    /// NARF's requested vdev resources (currently limited to three).
+    /// Local Linux's WCN6855-family hardware profile uses four.
     pub num_vdevs: u32,
     pub svc_to_ce_map: &'static [htc::ServiceToPipe],
     /// `ATH11K_HTC_WAIT_TIMEOUT_HZ`.
@@ -472,7 +473,8 @@ pub struct CoreConfig {
 impl CoreConfig {
     /// `ath11k_hw_params[]` for the PCI parts the core supports:
     /// The WCN6855 family (all `single_pdev_only`,
-    /// `num_rxdma_per_pdev = 2`, `max_radios = 3`, `num_vdevs = 2 + 1`,
+    /// `num_rxdma_per_pdev = 2`, `max_radios = 3`, and NARF's deliberate
+    /// `num_vdevs = 3` ceiling (local Linux requests four),
     /// credit flow, shadow registers, the QCA6390 service map).
     /// QCA6390 needs its IPQ8074 RX descriptor runtime; QCN9074 needs
     /// its separate HAL/DP profile. Neither may start firmware here.
