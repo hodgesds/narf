@@ -78,11 +78,15 @@ pub struct Prepared {
     bytes: Vec<u8>,
     version: u32,
     psp_version: u32,
+    signed_size: u64,
+    instruction_size: u64,
 }
 impl Prepared {
     pub fn new(image: &[u8], vbios: &[u8], psp_version: u32) -> Result<Self, Error> {
         let image = fw::Image::parse(image).map_err(Error::Firmware)?;
         let version = image.metadata().version;
+        let signed_size = image.signed_instructions().len() as u64;
+        let instruction_size = image.instructions().len() as u64;
         let prepared = image.prepare_dcn30(vbios).map_err(Error::Firmware)?;
         let layout = prepared.layout();
         let mut bytes = Vec::new();
@@ -96,6 +100,8 @@ impl Prepared {
             bytes,
             version,
             psp_version,
+            signed_size,
+            instruction_size,
         })
     }
 }
@@ -357,12 +363,24 @@ impl<I: Io> Engine<I> {
     }
     async fn start_inner(
         &mut self,
-        memory: crate::amdgpu_psp_ring::DmubMemory,
+        mut memory: crate::amdgpu_psp_ring::DmubMemory,
         fb: Aperture,
     ) -> Result<Status, Error> {
         let l = self.layout;
         let address = self.memory.address();
         let shape = self.prepared.layout;
+        if let Some((image, _)) = &mut memory.reported {
+            // The PSP request includes signature packaging, while its reply
+            // identifies executable instructions. Linux removes the PSP
+            // header/footer before sizing DMUB_WINDOW_0_INST_CONST.
+            if image.end.checked_sub(image.start) != Some(self.prepared.signed_size) {
+                return Err(Error::Invalid);
+            }
+            image.end = image
+                .start
+                .checked_add(self.prepared.instruction_size)
+                .ok_or(Error::Invalid)?;
+        }
         let tmr = &memory.tmr;
         if !self.access(|io| is_reset(io, l.dcn))? {
             self.reset().await?;
@@ -390,8 +408,10 @@ impl<I: Io> Engine<I> {
             {
                 return Err(Error::Invalid);
             }
-            // Validate PSP's authenticated instruction and stack windows, but
-            // preserve them verbatim. They use GPU-physical VRAM addresses.
+            // Decode both complete windows before reserving either. PSP may
+            // have replaced the pre-allocation inventory during LOAD_IP_FW.
+            // Preserve the secure registers verbatim, as dmub_dcn30 does.
+            let mut windows = [0..0, 0..0];
             for index in 0..2 {
                 // linux-lit: 0x1a5=mmDMCUB_REGION3_CW0_BASE_ADDRESS
                 let base = read(io, l.dcn, 0x1a5 + index)? & MASK;
@@ -422,10 +442,25 @@ impl<I: Io> Engine<I> {
                     || base != index << 24
                     || gpu_start < fb
                     || gpu_end > end
-                    || !memory.contains(index as usize, &(gpu_start..gpu_end))
                 {
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: DMCUB CW{index} invalid: base {base:#x}, top {top:#x}, physical {start:#x}, GPU {gpu_start:#x}..{gpu_end:#x}"
+                    );
                     return Err(Error::Invalid);
                 }
+                windows[index as usize] = gpu_start..gpu_end;
+            }
+            if !memory.authorize(&windows) {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: DMCUB windows {windows:#x?} outside owned memory; TMR {tmr:#x?}, PSP image {:#x?}, inherited {:?}",
+                    memory.reported.as_ref().map(|(range, _)| range),
+                    memory.inherited,
+                );
+                return Err(Error::Invalid);
             }
             Ok(place)
         })?;

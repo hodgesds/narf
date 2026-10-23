@@ -30,6 +30,7 @@ fn session_with_pool(mapping: narf_bus::MmioRegion, address: u64) -> (Pool, Sess
             gfx_state: GfxLoadState::Absent,
             gfx_status: None,
             media_firmware: MediaFirmware::default(),
+            dmub_image: None,
             gfx12_vcn_version: None,
             fb_base: 0x8_0000_0000,
             fb_offset: 0x1_0000_0000,
@@ -133,6 +134,7 @@ fn psp_dmcub_claims_authenticated_reply_range_in_owned_vram() -> TestResult {
     )
     .is_err()
         || s.media_firmware.dmcub != Some(address)
+        || s.dmub_image != Some(address..address + firmware_size)
     {
         return TestResult::Fail("PSP DMCUB placement inside owned VRAM was rejected");
     }
@@ -157,6 +159,56 @@ fn psp_dmcub_claims_authenticated_reply_range_in_owned_vram() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/psp-ring",
     psp_dmcub_claims_authenticated_reply_range_in_owned_vram
+);
+
+fn psp_dmub_fresh_windows_refuse_live_allocations_and_partial_images() -> TestResult {
+    let mapping = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0x90000000),
+        virt: 0,
+        len: 1 << 20,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    let base = 0x8200000000;
+    // SAFETY: bookkeeping-only model; no device or CPU accesses.
+    let pool = unsafe { Pool::from_owned_range(mapping, base) }.unwrap();
+    let allocation = pool.reserve(4096).unwrap();
+    let memory = DmubMemory {
+        tmr: base + 0x10000..base + 0x20000,
+        inherited: None,
+        reported: Some((base + 0x100..base + 0x800, pool.clone())),
+    };
+    let windows = [base..base + 0x1000, base + 0x4000..base + 0x6000];
+    if memory.authorize(&windows) {
+        return TestResult::Fail("secure window overlapped a live allocation");
+    }
+    drop(allocation);
+    let mut short = windows.clone();
+    short[0].end = base + 0x400;
+    if memory.authorize(&short) {
+        return TestResult::Fail("CW0 contained only part of the authenticated image");
+    }
+    let mut outside = windows.clone();
+    outside[1].end = base + mapping.len + 4096;
+    if memory.authorize(&outside) {
+        return TestResult::Fail("CW1 escaped the matching pool");
+    }
+    let mut overlap = windows.clone();
+    overlap[1].start = base + 0x800;
+    if memory.authorize(&overlap) {
+        return TestResult::Fail("secure instruction and stack windows overlapped");
+    }
+    let before = pool.available();
+    if !memory.authorize(&windows) || before - pool.available() != 3 * 4096 {
+        return TestResult::Fail("full fresh PSP windows were not reserved");
+    }
+    if !memory.authorize(&windows) || before - pool.available() != 3 * 4096 {
+        return TestResult::Fail("revalidation changed protected reservations");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_dmub_fresh_windows_refuse_live_allocations_and_partial_images
 );
 fn psp_navi22_tmr_embedded_toc_and_address_spaces() -> TestResult {
     let (pool, mut session) = session();

@@ -85,6 +85,7 @@ struct Model {
     releases: [u32; 2],
     never_boot: [bool; 2],
     pgfsm_stuck: bool,
+    status_requires_power: bool,
     /// Rings that ignore doorbells: dec0, enc0.0, enc0.1, dec1, enc1.0, enc1.1, jpeg.
     stalled: [bool; 7],
     drop_fences: bool,
@@ -130,6 +131,7 @@ impl Model {
             releases: [0; 2],
             never_boot: [false; 2],
             pgfsm_stuck: false,
+            status_requires_power: false,
             stalled: [false; 7],
             drop_fences: false,
             gone: false,
@@ -368,6 +370,13 @@ impl Io for Model {
         if self.gone {
             return u32::MAX;
         }
+        if self.status_requires_power
+            && (0..2).any(|i| {
+                address == v(i, STATUS) && self.reg(v(i, PGFSM_STATUS)) & PGFSM_STATUS_MASK != 0
+            })
+        {
+            return u32::MAX;
+        }
         self.reg(address)
     }
     fn write(&mut self, address: u64, value: u32) {
@@ -507,6 +516,20 @@ fn cancel_at<F: Future>(future: F, progress: &AtomicU32, goal: u32) -> bool {
         }
     }
 }
+
+fn vcn_navi22_powers_tiles_before_reading_vcpu_status() -> TestResult {
+    let mut model = Model::new();
+    model.status_requires_power = true;
+    let (_pool, mut e) = engine(model, 3);
+    if run(e.start(firmware(3), None)).is_err() || e.state != State::Running {
+        return TestResult::Fail("gated UVD_STATUS mistaken for device removal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_powers_tiles_before_reading_vcpu_status
+);
 
 fn vcn_navi22_resolves_both_discovered_instances() -> TestResult {
     let mut gpu = crate::amdgpu_gfx_navi22::tests::gpu();

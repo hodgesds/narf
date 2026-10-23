@@ -525,6 +525,7 @@ struct Session<I: Io> {
     gfx_state: GfxLoadState,
     gfx_status: Option<GfxBootStatus>,
     media_firmware: MediaFirmware,
+    dmub_image: Option<core::ops::Range<u64>>,
     /// Common-header version of the GC12 VCN container whose payload was
     /// accepted with the complete image set, never a second registry lookup.
     gfx12_vcn_version: Option<u32>,
@@ -538,12 +539,15 @@ struct Session<I: Io> {
 pub(crate) struct DmubMemory {
     pub(crate) tmr: core::ops::Range<u64>,
     pub(crate) inherited: Option<crate::amdgpu_vram_boot::SecureDmub>,
+    /// Authenticated PSP image and the matching pool that already excludes it.
+    pub(crate) reported: Option<(core::ops::Range<u64>, Pool)>,
 }
 impl From<core::ops::Range<u64>> for DmubMemory {
     fn from(tmr: core::ops::Range<u64>) -> Self {
         Self {
             tmr,
             inherited: None,
+            reported: None,
         }
     }
 }
@@ -555,6 +559,51 @@ impl DmubMemory {
                     .inherited
                     .as_ref()
                     .is_some_and(|windows| windows.contains(index, range)))
+    }
+    /// PSP can program fresh CW0/1 after the pre-allocation inventory. Accept
+    /// them only when CW0 contains the whole authenticated image and each new
+    /// full window can be excluded from this GPU's pool without a live overlap.
+    pub(crate) fn authorize(&self, windows: &[core::ops::Range<u64>; 2]) -> bool {
+        if windows.iter().any(|range| range.start >= range.end)
+            || (windows[0].start < windows[1].end && windows[1].start < windows[0].end)
+        {
+            return false;
+        }
+        if windows
+            .iter()
+            .enumerate()
+            .all(|(index, range)| self.contains(index, range))
+        {
+            return true;
+        }
+        let Some((image, pool)) = &self.reported else {
+            return false;
+        };
+        if image.start >= image.end || image.start < windows[0].start || image.end > windows[0].end
+        {
+            return false;
+        }
+        let Some(pool_end) = pool.address().checked_add(pool.size()) else {
+            return false;
+        };
+        if windows.iter().enumerate().any(|(index, range)| {
+            !self.contains(index, range)
+                && (range.start >= range.end
+                    || range.start < pool.address()
+                    || range.end > pool_end)
+        }) {
+            return false;
+        }
+        for (index, range) in windows.iter().enumerate() {
+            if !self.contains(index, range)
+                && pool
+                    .claim(range.start - pool.address()..range.end - pool.address())
+                    .is_err()
+            {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -990,6 +1039,7 @@ impl Psp {
                 gfx_state: GfxLoadState::Absent,
                 gfx_status: None,
                 media_firmware: MediaFirmware::default(),
+                dmub_image: None,
                 gfx12_vcn_version: None,
                 fb_base,
                 fb_offset,
@@ -1240,6 +1290,11 @@ impl Psp {
         Ok(DmubMemory {
             tmr: self.dmub_tmr()?,
             inherited: self.session.secure_dmub.clone(),
+            reported: self
+                .session
+                .dmub_image
+                .as_ref()
+                .map(|range| (range.clone(), self.session.pool.clone())),
         })
     }
     /// Wait for idle CP and RLC BOOTLOAD_COMPLETE after this session's accepted
@@ -1599,7 +1654,10 @@ impl<I: Io> Session<I> {
         match kind {
             13 => self.media_firmware.vcn = Some(reply.address), // linux-lit: 13=GFX_FW_TYPE_VCN
             crate::amdgpu_gfx_firmware::VCN1_TYPE => self.media_firmware.vcn1 = Some(reply.address),
-            _ => self.media_firmware.dmcub = Some(reply.address),
+            _ => {
+                self.media_firmware.dmcub = Some(reply.address);
+                self.dmub_image = range;
+            }
         }
         Ok(())
     }

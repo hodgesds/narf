@@ -6786,7 +6786,7 @@ ranges (size 8). `unsafe start(MediaFirmware, Option<PowerStatus>)` refuses a
 missing per-instance TMR address or a running SMU MM_DPM_PG feature before any
 write, then per instance zeroes the BO, sets fw_shared flags, programs the
 range and runs `vcn_v3_0_start`'s static path with power gating disabled
-(PGFSM all tiles on, no UVD_PG_EN; Linux's default DPG mode is not used),
+(PGFSM all tiles on before any UVD_STATUS read, no UVD_PG_EN; Linux's default DPG mode is not used),
 MGCG-style clock-gating disable, PSP-TMR cache window 0, VCPU boot with Linux's
 10-reset retry loop (100 × 10 ms samples each), decode RBC and both encode
 rings, then the SCRATCH9 decode and VCN_ENC_CMD_END encode ring tests.
@@ -6939,8 +6939,15 @@ After PSP loads DMCUB, `unsafe start(&Psp).await` validates that execution is
 still reset, security reset is released, and both PSP instruction/stack windows
 are enabled and wholly inside either the retained TMR or their respective
 pre-inventoried secure CW0/CW1 reservation after checked GPU-physical translation.
+If PSP programmed fresh windows after that inventory, CW0 must contain the
+complete authenticated image from this PSP session's reply. Each new full
+CW0/CW1 range must fit the matching retained GPU pool and be permanently
+excluded without overlapping any live or retired allocation before startup.
+The prepared signed-image size must match the PSP upload; the executable
+CW0 extent excludes the parsed PSP header/footer, matching Linux's DMUB
+instruction-window sizing. The original signed range stays reserved.
 Each full window must fit one reservation; a point address, unrelated protected
-client, inter-window gap or enlarged window is insufficient.
+client, inter-window gap or enlarged inherited window is insufficient.
 Those secure registers are preserved verbatim. The caller retains the matching
 PSP/TMR for DMUB's lifetime, with trained VRAM, ready memory hubs and protected
 power. Nonsecure VBIOS/mailbox/trace/state windows use owned GPU VRAM addresses.

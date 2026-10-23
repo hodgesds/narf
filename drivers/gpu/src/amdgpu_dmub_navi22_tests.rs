@@ -273,12 +273,13 @@ fn dmub_navi22_secure_windows_outside_tmr_stay_bounded_and_unchanged() -> TestRe
         fb.offset,
         windows.clone(),
     );
-    for case in 0..4 {
+    for case in 0..7 {
         let (_, mut engine) = fixture();
         // Owned nonsecure storage must use this fixture's GMC address space.
-        let memory = crate::amdgpu_psp_ring::DmubMemory {
+        let mut memory = crate::amdgpu_psp_ring::DmubMemory {
             tmr: 0x8002300000..0x8002d00000,
             inherited: (case != 1).then(|| plan.secure_dmub()),
+            reported: None,
         };
         for (index, window) in windows.iter().enumerate() {
             let window = window.as_ref().unwrap();
@@ -306,13 +307,48 @@ fn dmub_navi22_secure_windows_outside_tmr_stay_bounded_and_unchanged() -> TestRe
         // windows, but keep the physical translation at the real MC base.
         // The fixture storage is relocated by a fresh model allocator.
         let map = engine.memory.mapping();
+        let pool_base = fb.base + 0x400000;
+        let pool_map = MmioRegion {
+            len: if case >= 4 {
+                fb.end - pool_base
+            } else {
+                map.len
+            },
+            ..map
+        };
         // SAFETY: inert model mapping; no physical accesses.
-        let pool = unsafe { Pool::from_owned_range(map, fb.base + 0x400000) }.unwrap();
+        let pool = unsafe { Pool::from_owned_range(pool_map, pool_base) }.unwrap();
         engine.memory = pool.reserve(map.len).unwrap();
+        let available_without_secure = pool.available();
+        if case >= 4 {
+            // Inventory happened before PSP programmed these windows. Its
+            // reply identifies an image inside CW0, with page-rounded bounds
+            // that do not by themselves cover the complete CW0 or CW1.
+            let image_base = if case == 5 {
+                // A valid PSP image elsewhere does not authorize these CWs.
+                0x82fed00100
+            } else {
+                0x82fee00100
+            };
+            let image = image_base
+                ..image_base + engine.prepared.signed_size + if case == 6 { 4 } else { 0 };
+            pool.claim(image.start - pool_base..image.end - pool_base)
+                .unwrap();
+            memory.inherited = None;
+            memory.reported = Some((image, pool.clone()));
+        }
         run(engine.quiesce()).unwrap();
         let result = run(engine.start(memory, fb));
-        if (case == 0 && result.is_err()) || (case != 0 && result != Err(Error::Invalid)) {
+        if (matches!(case, 0 | 4) && result.is_err())
+            || (!matches!(case, 0 | 4) && result != Err(Error::Invalid))
+        {
             return TestResult::Fail("inherited secure-window extent check");
+        }
+        if case == 4 {
+            let secure_bytes: u64 = windows.iter().flatten().map(|w| w.end - w.start).sum();
+            if available_without_secure - pool.available() != secure_bytes {
+                return TestResult::Fail("fresh PSP secure windows not permanently reserved");
+            }
         }
         for reg in [0x1a5, 0x1a6, 0x1ad, 0x1ae, 0x1b5, 0x1b6, 0x1b7, 0x1b8] {
             if engine.io.regs.get(&(DCN + reg * 4)) != secure.get(&(DCN + reg * 4)) {

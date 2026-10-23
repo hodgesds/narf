@@ -480,7 +480,15 @@ impl Io for Mmio {
     fn read(&mut self, address: u64) -> u32 {
         // SAFETY: Layout bounds every VCN/GC/NBIO/HDP bank inside BAR5 and
         // this exclusive owner only calls this inside live PCI authority.
-        unsafe { self.regs.read32(address) }
+        let value = unsafe { self.regs.read32(address) };
+        if value == u32::MAX {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: VCN MMIO {address:#x} returned all ones"
+            );
+        }
+        value
     }
     fn write(&mut self, address: u64, value: u32) {
         // SAFETY: same bounded exclusive register mapping and authority.
@@ -1009,7 +1017,9 @@ impl<I: Io> Engine<I> {
         let r = move |l: Layout, reg: Reg| l.reg(i, reg);
         // vcn_v3_0_disable_static_power_gating, !AMD_PG_SUPPORT_VCN branch.
         self.hw.access(|io, l| {
-            checked(io.read(r(l, STATUS)))?;
+            // UVD_STATUS belongs to the gated domain. Like vcn_v3_0_start,
+            // power the tiles first; GC and NBIO liveness were checked before
+            // reaching here. A gated status read is not proof of device loss.
             io.write(r(l, PGFSM_CONFIG), PGFSM_ALL_ON);
             Ok(())
         })?;

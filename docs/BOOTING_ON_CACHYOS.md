@@ -255,6 +255,23 @@ reservation or TMR without changing those registers. VCN still requires TMR.
 This correction requires another native hardware test before claiming progress
 beyond `Graphics` or a working graphical login.
 
+After synchronizing the kernel selected by the host's Limine entry, the
+2026-10-22 boot passed `Graphics`, `RlcBoot`, GFX/SDMA queues and IB tests:
+26 of 28 reported checkpoints completed. `DmubStart` degraded with `Invalid`,
+then `Media(DeviceGone)` stopped startup and quarantined the framebuffer.
+The DMCUB and VCN payloads in that boot's firmware initramfs match the host
+Linux Navy Flounder files byte for byte. The next corrections retain the
+PSP-reported executable extent, reserve complete freshly programmed secure
+windows, and power VCN tiles before reading their gated status register.
+Their register-model tests do not establish a working hardware display.
+
+In the same boot, root mounting took 4314 ms and GPU startup took 52899 ms.
+At uptime 54 s the capture still showed journal flush, Plymouth's writable-root
+notification and userdb credential loading running, with `sysinit.target`,
+`basic.target` and PlasmaLogin waiting. That snapshot does not establish
+Btrfs as the cause of the later userspace wait; no graphical-login success
+has been recorded.
+
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 
 ```sh
