@@ -122,7 +122,8 @@ kernel_test_in!(
 );
 
 fn smoke_rtlwifi_factory_timeout_cleanup_and_unknown_chip() -> TestResult {
-    for (did, function) in [(0xffff, 0), (RTL_DEV_8192DE, 2), (RTL_DEV_8822BE, 0)] {
+    // 0xB822 (RTL8822BE) is rtw88-owned and has no rtlwifi EFUSE geometry.
+    for (did, function) in [(0xffff, 0), (RTL_DEV_8192DE, 2), (0xB822, 0)] {
         let mut model = Model::new(0xd0);
         if read_mac_with(&mut model, did, function) != Err(EfuseError::UnsupportedChip)
             || !model.writes.is_empty()

@@ -40,10 +40,23 @@ pub unsafe trait Memory: Send {
 const TX_BYTES: usize = 64;
 const RX_BYTES: usize = 32;
 const RX_BUFFER: usize = 4096;
-// Linux RTL8188EE differs from 8192EE's BD register layout. Every queue
-// gets a distinct, valid linked ring, including presently idle queues.
-const TX_BASES: [u16; 7] = [0x308, 0x310, 0x318, 0x320, 0x328, 0x330, 0x338];
-const RX_BASE: u16 = 0x340;
+// Descriptor-base registers follow mac.rs's named register map
+// (source: rtl8192ee/reg.h:143..165): TX queues BCNQ..BKQ occupy
+// 0x308..0x330, RX sits at 0x338 (REG_RX_DESA), and the high-priority
+// TX queue is at 0x340 (REG_HQ0_DESA) — after RX, not in sequence.
+// The bases are taken from mac.rs so this publication path and the
+// dma.rs programming path can never diverge. Every queue gets a
+// distinct, valid linked ring, including presently idle queues.
+const TX_BASES: [u16; 7] = [
+    super::mac::REG_BCNQ_DESA as u16,
+    super::mac::REG_MGQ_DESA as u16,
+    super::mac::REG_VOQ_DESA as u16,
+    super::mac::REG_VIQ_DESA as u16,
+    super::mac::REG_BEQ_DESA as u16,
+    super::mac::REG_BKQ_DESA as u16,
+    super::mac::REG_HQ0_DESA as u16,
+];
+const RX_BASE: u16 = super::mac::REG_RX_DESA as u16;
 fn extent(memory: &impl Memory, needed: usize, alignment: u64) -> Result<u32, Error> {
     let base = memory.address();
     if needed == 0

@@ -336,7 +336,6 @@ pub const fn name_for(did: u16) -> &'static str {
         RTL_DEV_8723AE => "rtlwifi-8723ae",
         RTL_DEV_8723BE => "rtlwifi-8723be",
         RTL_DEV_8821AE => "rtlwifi-8821ae",
-        RTL_DEV_8822BE => "rtlwifi-8822be",
         _ => "rtlwifi",
     }
 }

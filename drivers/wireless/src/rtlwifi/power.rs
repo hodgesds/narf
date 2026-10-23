@@ -391,22 +391,6 @@ pub static RTL8192CE_PWR_ON: &[WlanPwrCfg] = &[
     pci_end(),
 ];
 
-/// RTL8822BE Cardemu→Active power-on flow.  Closely tracks 8821AE since
-/// the legacy rtlwifi binding shares the driver class; the table is a
-/// trimmed version of `rtl8821ae/pwrseq.h` with the 8822BE-specific
-/// rows from the kernel diff (BIT(0) at 0x21 to enable VHT-80 LDO).
-pub static RTL8822BE_PWR_ON: &[WlanPwrCfg] = &[
-    pci_w(0x0020, 1 << 0, 1 << 0),
-    pci_w(0x0021, 1 << 0, 1 << 0),
-    pci_w(0x0005, 1 << 7, 0),
-    pci_p(0x0006, 1 << 1, 1 << 1),
-    pci_w(0x0006, 1 << 0, 1 << 0),
-    pci_w(0x0005, (1 << 4) | (1 << 3), 0),
-    pci_w(0x0005, 1 << 0, 1 << 0),
-    pci_p(0x0005, 1 << 0, 0),
-    pci_end(),
-];
-
 /// Return the chip's power-on table.  Mirrors how `_rtl<ver>_init_mac`
 /// calls `rtl_hal_pwrseqcmdparsing(..., RTL8XXX_NIC_ENABLE_FLOW)` in
 /// Linux.
@@ -418,7 +402,6 @@ pub fn power_on_table_for(did: u16) -> Option<&'static [WlanPwrCfg]> {
         RTL_DEV_8192EE => Some(RTL8192EE_PWR_ON),
         RTL_DEV_8723AE | RTL_DEV_8723BE => Some(RTL8723BE_PWR_ON),
         RTL_DEV_8821AE => Some(RTL8821AE_PWR_ON),
-        RTL_DEV_8822BE => Some(RTL8822BE_PWR_ON),
         _ => None,
     }
 }

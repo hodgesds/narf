@@ -13,11 +13,13 @@
 //! | RTL8723AE   | 0x8723 | 802.11n 1T1R+BT | Combo A-cut             |
 //! | RTL8723BE   | 0xB723 | 802.11n 1T1R+BT | Combo B-cut             |
 //! | RTL8821AE   | 0x8821 | 802.11ac 1T1R   | Wi-Fi 5                 |
-//! | RTL8822BE   | 0xB822 | 802.11ac 2T2R   | Wi-Fi 5 (legacy bind)   |
+//!
+//! RTL8822BE (0xB822) is not in this family: it belongs to `rtw88`
+//! (`specification/rtlwifi.md` §1) and must never be matched here.
 //!
 //! ## Scope (this commit)
 //!
-//! 1. PCI device-ID table — all 9 IDs registered with `narf-bus`.
+//! 1. PCI device-ID table — all 8 IDs registered with `narf-bus`.
 //! 2. BAR2 control mapping and verifiably parked PCI bus mastering.
 //! 3. EFUSE read — per-byte LDO-switched access (`REG_EFUSE_CTRL` / `REG_EFUSE_TEST`).
 //! 4. Per-chip register-bank / MMIO-size constants.
@@ -75,7 +77,6 @@ pub mod rtl8192ce;
 pub mod rtl8192ee;
 pub mod rtl8723be;
 pub mod rtl8821ae;
-pub mod rtl8822be;
 
 pub use pci::{name_for, probe, register_pci_driver, RtlwifiDevice};
 pub use regs::{ALL_DEV_IDS, REALTEK_VENDOR};

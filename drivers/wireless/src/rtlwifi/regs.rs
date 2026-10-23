@@ -1,8 +1,10 @@
 //! rtlwifi — shared register definitions.
 //!
 //! Covers the common register block used by RTL8188EE, RTL8192CE/DE/EE/SE,
-//! RTL8723AE/BE, RTL8821AE, and RTL8822BE (the "legacy PCIe rtlwifi" family
-//! shipping circa 2010–2017).
+//! RTL8723AE/BE, and RTL8821AE (the "legacy PCIe rtlwifi" family
+//! shipping circa 2010–2017). RTL8822BE (0xB822) is deliberately not
+//! part of this family: it belongs to `rtw88` (see
+//! `specification/rtlwifi.md` §1).
 //!
 //! All offsets are taken from the per-chip `reg.h` headers under
 //! `drivers/net/wireless/realtek/rtlwifi/` in the Linux kernel.  The
@@ -13,7 +15,7 @@
 //!
 //! - `rtlwifi/rtl8188ee/reg.h`  — RTL8188EE offsets
 //! - `rtlwifi/rtl8192ee/reg.h`  — RTL8192EE offsets (mostly identical)
-//! - `rtlwifi/rtl8821ae/reg.h`  — RTL8821AE / RTL8822BE offsets
+//! - `rtlwifi/rtl8821ae/reg.h`  — RTL8821AE offsets
 //! - `rtlwifi/pci.h`            — queue-index constants and TX/RX desc sizes
 
 #![allow(dead_code)]
@@ -57,10 +59,6 @@ pub const RTL_DEV_8723BE: u16 = 0xB723;
 /// RTL8821AE — 1T1R 802.11ac 2.4 + 5 GHz PCIe.
 /// Linux `pci.h`: `RTL_PCI_8821AE_DID = 0x8821`.
 pub const RTL_DEV_8821AE: u16 = 0x8821;
-
-/// RTL8822BE — 2T2R 802.11ac Wave-2 PCIe (same DID reused in rtw88).
-/// Linux `pci.h`: `RTL_PCI_8822BE_DID = 0xB822`.
-pub const RTL_DEV_8822BE: u16 = 0xB822;
 
 /// All device IDs handled by this driver, in the same order as
 /// `rtlwifi/pci.c`'s `rtl_pci_id_tbl[]`.
@@ -190,7 +188,7 @@ pub const REG_HISRE: u64 = 0x00BC;
 
 // ── MAC command register (CR) ─────────────────────────────────────────────
 //
-// Identical across 8188EE / 8192EE / 8821AE / 8822BE.
+// Identical across 8188EE / 8192EE / 8821AE.
 // Source: `rtl8188ee/reg.h:0x0100`.
 
 /// `REG_CR` — MAC chip command register. `reg.h:0x0100`.
