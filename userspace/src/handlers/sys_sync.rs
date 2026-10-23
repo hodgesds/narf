@@ -7,10 +7,11 @@ use super::*;
 /// returns 0 whatever the per-filesystem results were, as Linux's does
 /// (`SYSCALL_DEFINE0(sync)` has no error path).
 ///
-/// LINUX-GAP: dirty `MAP_SHARED` file pages that NARF tracks for explicit
-/// writeback (`mapped_file::flush_current_file`) are committed by
-/// `fsync`/`msync` on the mapping, not by this global walk.
+/// Dirty generic-fallback `MAP_SHARED` pages are committed first, across
+/// every owning process: the fallback cache — not any one process's
+/// fsync/msync — is what can reach them (`mapped_file` #676).
 pub(crate) fn sys_sync(ctx: &mut dyn TrapContext) {
+    crate::mapped_file::flush_all_shared_file_pages();
     let _ = sync_all_blocking();
     ctx.set_return(SyscallReturn::ok(0));
 }

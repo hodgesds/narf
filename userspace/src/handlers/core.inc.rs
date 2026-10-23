@@ -5366,6 +5366,13 @@ fn copy_fd_to_fd(
                     let result = poll_blocking(output_ops.write(sink_off, bytes))
                         .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
                     if let Ok(written) = result {
+                        if written != 0 && written <= bytes.len() {
+                            crate::mapped_file::note_file_written(
+                                output_ops,
+                                sink_off,
+                                &bytes[..written],
+                            );
+                        }
                         sink_off = sink_off.saturating_add(written as u64);
                     }
                     result
@@ -5393,7 +5400,16 @@ fn copy_fd_to_fd(
             match poll_blocking(output_ops.write(step_out_off, &kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
             {
-                Ok(written) if written <= n => Ok(written),
+                Ok(written) if written <= n => {
+                    if written != 0 {
+                        crate::mapped_file::note_file_written(
+                            output_ops,
+                            step_out_off,
+                            &kbuf[..written],
+                        );
+                    }
+                    Ok(written)
+                }
                 Ok(_) => Err(narf_filesystem::FsError::InvalidData),
                 Err(error) => Err(error),
             }
@@ -10133,8 +10149,16 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
                     break;
                 }
             };
-            poll_blocking(endpoint.ops.write(off, &payload))
-                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+            let outcome = poll_blocking(endpoint.ops.write(off, &payload))
+                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+            // Keep any live generic-fallback MAP_SHARED page of this file
+            // coherent with the write (mapped_file::note_file_written).
+            if let Ok(n) = &outcome {
+                if *n != 0 && *n <= payload.len() {
+                    crate::mapped_file::note_file_written(&endpoint.ops, off, &payload[..*n]);
+                }
+            }
+            outcome
         } else {
             let mut staging = alloc::vec![0u8; iovec.len];
             let read = poll_blocking(endpoint.ops.read(off, &mut staging))

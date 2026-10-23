@@ -2670,6 +2670,339 @@ mod tests {
         smoke_mmap_overlay_copy_up_keeps_mapping_pinned_to_lower
     );
 
+    // ── #676: generic-fallback coherence and writeback lifecycle ──────
+    //
+    // The generic fallback cache used to be a write-only island: write(2)
+    // bypassed its frames, and its dirty pages were committed only by an
+    // fsync/msync from the owning process — never by munmap, exit or
+    // sync(2). These tests pin the Linux contract end to end through the
+    // real syscall handlers: the file TestFile serves IS what read(2)
+    // would return, so a stale file image is the observable bug.
+
+    /// Stand up the fsync test's environment with a caller-chosen file
+    /// image: a fresh user AS as current, TASK registered, and one
+    /// O_RDWR fd on a fresh TestFile.
+    fn fallback_test_setup(
+        image: alloc::vec::Vec<u8>,
+    ) -> Result<(Arc<AddressSpace>, Arc<TestFile>, u32), TestResult> {
+        // SAFETY: the syscall runs with paging active; this allocates an
+        // independent user address space without switching the active one.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(aspace) => Arc::new(aspace),
+            Err(_) => return Err(TestResult::Fail("new_for_user failed")),
+        };
+        *USER_AS.lock() = Some(Arc::clone(&aspace));
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+        crate::fd::__test_reset();
+        crate::handlers::register_task_to_pid(TASK, PROCESS);
+        let file = Arc::new(TestFile {
+            bytes: IrqSafeSpinLock::new(image),
+            writes: AtomicUsize::new(0),
+        });
+        let fd = crate::fd::install(
+            TASK,
+            crate::fd::FdEntry {
+                ops: Arc::clone(&file) as Arc<dyn FileOps>,
+                offset: 0,
+                flags: 0,
+                status_flags: crate::fd::O_RDWR,
+            },
+        )
+        .unwrap_or(u32::MAX);
+        if fd == u32::MAX {
+            return Err(TestResult::Fail("could not install test file fd"));
+        }
+        Ok((aspace, file, fd))
+    }
+
+    fn fallback_test_teardown() {
+        crate::fd::__test_reset();
+        *USER_AS.lock() = None;
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+    }
+
+    /// mmap `len` bytes of `fd` MAP_SHARED PROT_READ|PROT_WRITE and fault
+    /// the first page in, returning (base, frame phys).
+    fn mmap_shared_faulted(
+        aspace: &Arc<AddressSpace>,
+        fd: u32,
+        len: u64,
+    ) -> Result<(u64, narf_memory::PhysAddr), TestResult> {
+        let mut mmap = TestCtx {
+            args: SyscallArgs {
+                arg1: len,
+                arg2: 3,    // PROT_READ | PROT_WRITE
+                arg3: 0x01, // MAP_SHARED
+                arg4: fd as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        sys_mmap(&mut mmap);
+        let base = match mmap.ret {
+            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => ret.value,
+            _ => return Err(TestResult::Fail("MAP_SHARED file mmap failed")),
+        };
+        // SAFETY: the test owns this live user root and the address lies in
+        // the FILE_DEMAND mapping just published through sys_mmap.
+        if unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(base)) }.is_err() {
+            return Err(TestResult::Fail("file fault did not publish a page"));
+        }
+        let region = match aspace.lookup(narf_memory::VirtAddr::new(base)) {
+            Some(region) if !region.phys.is_empty() && region.phys[0].raw() != 0 => region,
+            _ => return Err(TestResult::Fail("file fault left the region unbacked")),
+        };
+        Ok((base, region.phys[0]))
+    }
+
+    fn call_syscall(
+        handler: fn(&mut dyn TrapContext),
+        args: SyscallArgs,
+    ) -> Result<SyscallReturn, TestResult> {
+        let mut ctx = TestCtx { args, ret: None };
+        handler(&mut ctx);
+        match ctx.ret {
+            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) >= 0 => Ok(ret),
+            _ => Err(TestResult::Fail("syscall did not return success")),
+        }
+    }
+
+    /// The headline #676 sequence: a store through a generic-fallback
+    /// MAP_SHARED mapping, then munmap, must be what a later read(2)
+    /// returns — with no fsync anywhere. Before the fix the dirty fallback
+    /// page was dropped/retained without writeback, so read(2) served the
+    /// pre-mmap device bytes forever.
+    fn smoke_mmap_shared_write_survives_munmap() -> TestResult {
+        let (aspace, file, fd) = match fallback_test_setup(vec![0; 4096]) {
+            Ok(setup) => setup,
+            Err(result) => return result,
+        };
+        let (base, phys) = match mmap_shared_faulted(&aspace, fd, 4096) {
+            Ok(pair) => pair,
+            Err(result) => {
+                fallback_test_teardown();
+                return result;
+            }
+        };
+        // SAFETY: the fault published this cache-owned frame for the test
+        // mapping and all physical memory is kernel identity-mapped.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                c"PERSIST!".as_ptr().cast(),
+                phys.kernel_mut_ptr::<u8>(),
+                9,
+            );
+        }
+        if file.writes.load(Ordering::Relaxed) != 0 {
+            fallback_test_teardown();
+            return TestResult::Fail("the mapped store reached the file before munmap");
+        }
+        if call_syscall(
+            crate::handlers::sys_munmap,
+            SyscallArgs {
+                arg0: base,
+                arg1: 4096,
+                ..SyscallArgs::default()
+            },
+        )
+        .is_err()
+        {
+            fallback_test_teardown();
+            return TestResult::Fail("munmap of the shared file mapping failed");
+        }
+        let persisted = &file.bytes.lock()[..9] == b"PERSIST!\0";
+        let wrote = file.writes.load(Ordering::Relaxed) != 0;
+        fallback_test_teardown();
+        if !persisted || !wrote {
+            return TestResult::Fail(
+                "mmap write was not written back at munmap; read(2) would serve stale bytes",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_mmap_shared_write_survives_munmap);
+
+    /// write(2) must be visible through a live generic-fallback mapping,
+    /// and a later msync must not resurrect the pre-write bytes: the
+    /// fallback page's snapshot marks the whole page dirty after one
+    /// mapped store, so a whole-page writeback used to clobber every
+    /// interleaved write(2) change in that page.
+    fn smoke_mmap_write2_coherent_and_msync_no_clobber() -> TestResult {
+        // The pwrite64 below passes a kernel buffer as its source; the
+        // scope makes validate_rw_user_range accept it on this CPU.
+        let _kernel_buffers = crate::handlers::kernel_buffers_guard();
+        let (aspace, file, fd) = match fallback_test_setup(vec![b'A'; 4096]) {
+            Ok(setup) => setup,
+            Err(result) => return result,
+        };
+        let (base, phys) = match mmap_shared_faulted(&aspace, fd, 4096) {
+            Ok(pair) => pair,
+            Err(result) => {
+                fallback_test_teardown();
+                return result;
+            }
+        };
+        // pwrite64(fd, "BBBB", 4, 100) through the write(2) path, into a
+        // byte range the live mapping covers. (The source is a kernel
+        // buffer: this harness never switches the active page tables to
+        // the test AS, so syscall buffers are kernel pointers — the same
+        // idiom as every other handler test.)
+        let src = *b"BBBB";
+        if call_syscall(
+            crate::handlers::sys_pwrite64,
+            SyscallArgs {
+                arg0: fd as u64,
+                arg1: src.as_ptr() as u64,
+                arg2: 4,
+                arg3: 100,
+                ..SyscallArgs::default()
+            },
+        )
+        .is_err()
+        {
+            fallback_test_teardown();
+            return TestResult::Fail("pwrite64 on the mapped file failed");
+        }
+        // SAFETY: the frame is the canonical cache page for this mapping.
+        let coherent =
+            unsafe { core::slice::from_raw_parts(phys.kernel_ptr::<u8>(), 4096) }[100..104]
+                == *b"BBBB";
+        if !coherent {
+            fallback_test_teardown();
+            return TestResult::Fail("write(2) did not update the live MAP_SHARED page");
+        }
+        // One mapped store, then msync: writeback must carry the store
+        // without clobbering the write(2) bytes at offset 100.
+        // SAFETY: as above.
+        unsafe {
+            *phys.kernel_mut_ptr::<u8>().add(200) = b'C';
+        }
+        if call_syscall(
+            crate::handlers::sys_msync,
+            SyscallArgs {
+                arg0: base,
+                arg1: 4096,
+                arg2: 4, // MS_SYNC
+                ..SyscallArgs::default()
+            },
+        )
+        .is_err()
+        {
+            fallback_test_teardown();
+            return TestResult::Fail("msync of the shared file mapping failed");
+        }
+        let bytes = file.bytes.lock();
+        let kept_write = bytes[100..104] == *b"BBBB";
+        let kept_store = bytes[200] == b'C';
+        let kept_rest = bytes[0] == b'A' && bytes[3000] == b'A';
+        drop(bytes);
+        fallback_test_teardown();
+        if !kept_write {
+            return TestResult::Fail("msync writeback clobbered interleaved write(2) data");
+        }
+        if !kept_store || !kept_rest {
+            return TestResult::Fail("msync did not persist exactly the mapped store");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mmap_write2_coherent_and_msync_no_clobber
+    );
+
+    /// sync(2) is global: it must commit fallback dirty pages whose owner
+    /// is a different address space that never calls fsync. Before the
+    /// fix, flush entry points only ever walked the caller's own owner
+    /// bucket, so another process's dirty pages were unreachable.
+    fn smoke_mmap_shared_dirty_pages_flush_on_sync() -> TestResult {
+        let (aspace, file, fd) = match fallback_test_setup(vec![0; 4096]) {
+            Ok(setup) => setup,
+            Err(result) => return result,
+        };
+        let (_base, phys) = match mmap_shared_faulted(&aspace, fd, 4096) {
+            Ok(pair) => pair,
+            Err(result) => {
+                fallback_test_teardown();
+                return result;
+            }
+        };
+        // SAFETY: the fault published this cache-owned frame for the test
+        // mapping and all physical memory is kernel identity-mapped.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                c"SYNCDIRT".as_ptr().cast(),
+                phys.kernel_mut_ptr::<u8>(),
+                9,
+            );
+        }
+        // sync(2) arrives from an unrelated process context: a different
+        // current address space that owns no mappings of the file.
+        // SAFETY: as in fallback_test_setup.
+        let other = match unsafe { AddressSpace::new_for_user() } {
+            Ok(other) => Arc::new(other),
+            Err(_) => {
+                fallback_test_teardown();
+                return TestResult::Fail("second new_for_user failed");
+            }
+        };
+        *USER_AS.lock() = Some(other);
+        if call_syscall(
+            crate::handlers::sys_sync,
+            SyscallArgs::default(),
+        )
+        .is_err()
+        {
+            fallback_test_teardown();
+            return TestResult::Fail("sync(2) failed");
+        }
+        let persisted = &file.bytes.lock()[..9] == b"SYNCDIRT\0";
+        fallback_test_teardown();
+        if !persisted {
+            return TestResult::Fail(
+                "sync(2) did not commit another address space's dirty MAP_SHARED pages",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_mmap_shared_dirty_pages_flush_on_sync);
+
+    /// Address-space teardown is the last writeback chance: a process
+    /// that dirties a fallback page and exits without munmap/fsync must
+    /// still commit it, through the same hook memory's drop path calls.
+    fn smoke_mmap_shared_dirty_pages_flush_on_exit() -> TestResult {
+        let (aspace, file, fd) = match fallback_test_setup(vec![0; 4096]) {
+            Ok(setup) => setup,
+            Err(result) => return result,
+        };
+        let (_base, phys) = match mmap_shared_faulted(&aspace, fd, 4096) {
+            Ok(pair) => pair,
+            Err(result) => {
+                fallback_test_teardown();
+                return result;
+            }
+        };
+        // SAFETY: the fault published this cache-owned frame for the test
+        // mapping and all physical memory is kernel identity-mapped.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                c"EXITDIRT".as_ptr().cast(),
+                phys.kernel_mut_ptr::<u8>(),
+                9,
+            );
+        }
+        crate::drop_mapped_file_address_space(aspace.identity());
+        let persisted = &file.bytes.lock()[..9] == b"EXITDIRT\0";
+        fallback_test_teardown();
+        if !persisted {
+            return TestResult::Fail(
+                "address-space teardown did not write back dirty MAP_SHARED pages",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_mmap_shared_dirty_pages_flush_on_exit);
     // ── demand-paged device mappings, through a BPF arena ──────────────
     //
     // The arena is the first `FileOps` that both grows behind a live mapping

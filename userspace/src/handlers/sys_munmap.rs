@@ -81,12 +81,19 @@ fn munmap_core(as_ref: &AddressSpace, base: u64, requested_len: u64) -> Result<u
 /// `sys_munmap` so a raw Linux call with `len == 0` still returns `EINVAL`.
 pub(crate) fn munmap_native_v1(as_ref: &AddressSpace, base: u64) -> Result<(), ()> {
     let base = VirtAddr::new(base);
+    let region_len = as_ref.lookup(base).map(|region| region.len).unwrap_or(0);
+    let flush_files =
+        crate::mapped_file::file_ops_in_range(as_ref.identity(), base.as_u64(), region_len);
     as_ref
         .unmap_region(base)
         .map(|_| ())
         .or_else(|_| as_ref.unmap_huge_region(base))
         .map_err(|_| ())?;
     crate::mapped_file::unmap_current(base.as_u64());
+    // Commit the removed mapping's dirty fallback pages (see sys_munmap).
+    for ops in &flush_files {
+        let _ = crate::mapped_file::flush_shared_pages_for_ops(ops);
+    }
     Ok(())
 }
 
@@ -114,6 +121,14 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // Snapshot the files mapped in the range before the punch retires
+    // their owner rows: munmap is a writeback lifecycle point for the
+    // generic fallback cache, whose dirty pages only the cache itself can
+    // still reach once the VMA is gone (#676). Linux keeps such pages in
+    // its page cache past munmap; NARF's fallback has no background
+    // flusher, so the bytes are committed here instead.
+    let flush_files = crate::mapped_file::file_ops_in_range(as_ref.identity(), base.as_u64(), len);
+
     // Linux reaches SysV accounting only through `shm_vm_ops.close`. Inspect
     // the affected VMA range while holding the same per-mm transaction used by
     // the punch. If no SysV VMA overlaps, a first shmat cannot publish one
@@ -131,6 +146,11 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
         }
     });
     if let Some(result) = fast_result {
+        if result.is_ok() {
+            for ops in &flush_files {
+                let _ = crate::mapped_file::flush_shared_pages_for_ops(ops);
+            }
+        }
         ctx.set_return(match result {
             Ok(()) => SyscallReturn::ok(0),
             Err(errno) => errno_ret(errno),
@@ -152,7 +172,12 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
         Ok(())
     });
     match result {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Ok(()) => {
+            for ops in &flush_files {
+                let _ = crate::mapped_file::flush_shared_pages_for_ops(ops);
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         // EINVAL for a malformed range, ENOMEM when the teardown itself
         // could not be completed.
         Err(errno) => ctx.set_return(errno_ret(errno)),

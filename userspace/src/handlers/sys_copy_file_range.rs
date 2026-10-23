@@ -259,6 +259,13 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
                     }
                     None => break,
                 };
+                if write_n != 0 {
+                    crate::mapped_file::note_file_written(
+                        &output.ops,
+                        cur_out,
+                        &chunk[..write_n],
+                    );
+                }
                 copied += write_n;
                 cur_in = cur_in.saturating_add(write_n as u64);
                 cur_out = cur_out.saturating_add(write_n as u64);
