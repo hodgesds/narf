@@ -255,6 +255,87 @@ NARF_UEFI_ALLOW_NON_ESP=1 \
 grep -F 'host Limine 99.0' "$tmp/esp/EFI/BOOT/BOOTX64.EFI" >/dev/null
 sh -n "$tmp/tree/usr/bin/narf-uefi" "$tmp/tree/etc/grub.d/42_narf"
 
+# A pre-package hardware entry may still boot ESP:/boot/narf-frame, with
+# firmware and a root-rw graphical command line. Adopting it must refresh the
+# image it actually loads, preserve policy, and persist across package hooks.
+host_esp=$tmp/host-esp
+host_state=$tmp/host-state
+host_config=$host_esp/boot/limine/limine.conf
+mkdir -p "$host_esp/boot/limine" "$host_esp/EFI/BOOT"
+printf 'host Limine 99.0\n' >"$host_esp/EFI/BOOT/BOOTX64.EFI"
+printf 'old hardware kernel\n' >"$host_esp/boot/narf-frame"
+printf 'firmware initramfs\n' >"$host_esp/boot/initramfs.cpio"
+cat >"$host_config" <<'EOF'
+timeout: 5
+default_entry: 2
+/NARF KDE Plasma (read-write)
+    protocol: multiboot2
+    path: boot():/boot/narf-frame
+    kernel_cmdline: narf.disks=root-rw root=UUID=test rw systemd_pid1 systemd.unit=graphical.target
+    module_path: boot():/boot/initramfs.cpio
+    module_string: initramfs
+/CachyOS
+    protocol: linux
+    path: boot():/vmlinuz-linux-cachyos
+EOF
+cp "$host_config" "$tmp/host-original.conf"
+cp "$host_esp/boot/narf-frame" "$tmp/host-original-kernel"
+host_uefi() {
+    NARF_UEFI_SOURCE_DIR="$tmp/tree/usr/lib/narf/uefi" \
+    NARF_UEFI_STATE_DIR="$host_state" NARF_UEFI_ALLOW_NON_ESP=1 \
+        "$tmp/tree/usr/bin/narf-uefi" "$@" --esp "$host_esp" --no-manager-hooks --quiet
+}
+host_uefi install --limine-config "$host_config"
+cmp "$tmp/tree/usr/lib/narf/uefi/narf-frame" "$host_esp/boot/narf-frame"
+cmp "$tmp/host-original-kernel" "$host_state/limine-kernel-before-package"
+cmp "$tmp/host-original.conf" "$host_config"
+grep -Fx 'firmware initramfs' "$host_esp/boot/initramfs.cpio" >/dev/null
+host_uefi status | grep -Fx 'host Limine kernel matches package: yes' >/dev/null
+printf 'stale hardware kernel\n' >"$host_esp/boot/narf-frame"
+if host_uefi status >"$tmp/host-status.log" 2>&1; then
+    echo 'status accepted the stale kernel selected by the host Limine entry' >&2
+    exit 1
+fi
+grep -F 'stale: host Limine entry loads a different NARF kernel' "$tmp/host-status.log" >/dev/null
+host_uefi install
+cmp "$tmp/tree/usr/lib/narf/uefi/narf-frame" "$host_esp/boot/narf-frame"
+cmp "$tmp/host-original-kernel" "$host_state/limine-kernel-before-package"
+cmp "$tmp/host-original.conf" "$host_config"
+
+# Ambiguous menus and hash-pinned older images must fail before publishing
+# any payload. The administrator must first disambiguate the selected entry.
+cat >>"$host_config" <<'EOF'
+/NARF duplicate
+    protocol: multiboot2
+    path: boot():/boot/narf-frame
+EOF
+printf 'do not overwrite\n' >"$host_esp/boot/narf-frame"
+printf 'do not overwrite\n' >"$host_esp/EFI/NARF/narf-frame"
+if host_uefi install >/dev/null 2>&1; then
+    echo 'install accepted multiple host NARF entries' >&2
+    exit 1
+fi
+grep -Fx 'do not overwrite' "$host_esp/boot/narf-frame" >/dev/null
+grep -Fx 'do not overwrite' "$host_esp/EFI/NARF/narf-frame" >/dev/null
+sed 's@path: boot():/boot/narf-frame$@path: boot():/boot/narf-frame#old-digest@' \
+    "$tmp/host-original.conf" >"$host_config"
+if host_uefi install >/dev/null 2>&1; then
+    echo 'install accepted a host entry pinned to an older kernel digest' >&2
+    exit 1
+fi
+grep -Fx 'do not overwrite' "$host_esp/boot/narf-frame" >/dev/null
+if host_uefi install --limine-config "$tmp/host-original.conf" >/dev/null 2>&1; then
+    echo 'install accepted a host config outside the selected ESP' >&2
+    exit 1
+fi
+cp "$tmp/host-original.conf" "$host_config"
+host_uefi install
+host_uefi status >/dev/null
+host_uefi remove
+test ! -e "$host_state/limine-config"
+cmp "$tmp/host-original.conf" "$host_config"
+cmp "$tmp/tree/usr/lib/narf/uefi/narf-frame" "$host_esp/boot/narf-frame"
+
 # Exercise the source-installable Cargo frontend as well as the underlying
 # release builder. It must produce the same package layout without installing
 # anything on the host.

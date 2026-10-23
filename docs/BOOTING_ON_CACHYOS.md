@@ -814,6 +814,39 @@ CachyOS Limine installation, the hook asks `limine-entry-tool` to register the
 same EFI application; if the tool reports a warning, reinstall it explicitly
 with `narf-uefi install` after confirming the ESP and active manager.
 
+For an existing hardware-test Limine menu that directly loads
+`boot():/boot/narf-frame`, adopt that config so the package also updates the
+kernel the menu actually selects:
+
+```sh
+sudo narf-uefi install --esp /boot/efi \
+  --limine-config /boot/efi/boot/limine/limine.conf
+sudo narf-uefi status --esp /boot/efi
+```
+
+Use the actual ESP and config path. The config must contain exactly one NARF
+Multiboot2 entry. Its command line, writable-root policy, graphical target,
+and firmware modules remain intact. The selected kernel must report
+`host Limine kernel matches package: yes` before rebooting; checking only
+`/EFI/NARF/narf-frame` does not verify the old `/boot/narf-frame` target.
+The adopted config is remembered for future package upgrades.
+
+When building a package for this installed-root Plasma test, first build the
+production systemd kernel, then package that exact artifact with
+`--skip-build`:
+
+```sh
+cargo xtask build --arch=x86_64 \
+  --features boot-init,cgroup-all,container,firmware-allow-unsigned
+cargo narf package --version 0.5.0 --skip-build \
+  --limine-efi /usr/share/limine/BOOTX64.EFI
+```
+
+`boot-init` enables `systemd_pid1`; the cgroup and namespace features support
+the distro's systemd services. Do not package the canonical artifact left
+by a kernel-test run. The normal package build serves NARF's built-in
+userspace and does not enable these installed-root features automatically.
+
 Installing a newer `narf-kernel` package upgrades the same package name,
 removes the previous package-owned NARF image, and regenerates GRUB. It does
 not retain an automatic older-NARF rollback entry. The separately installed
