@@ -17,6 +17,10 @@ pub(super) struct Fake {
     // DPG latch, FMT latch, frame progress
     stall: u16,
     poll_limit: Option<u32>,
+    /// Waits park at a missing acknowledgement instead of racing the
+    /// host clock (Io::pause_wait). Set only by tests whose scenario is
+    /// a never-arriving acknowledgement.
+    pub(super) pause_wait: bool,
     retiring: [bool; 4],
     delay: [u8; 4],
     pub(super) reject: Option<usize>,
@@ -40,6 +44,9 @@ pub(super) struct Fake {
 impl Io for Fake {
     fn wait_poll_limit(&self) -> Option<u32> {
         self.poll_limit
+    }
+    fn pause_wait(&self) -> bool {
+        self.pause_wait
     }
     fn read(&mut self, at: u64) -> u32 {
         if self.guarded {
@@ -380,6 +387,7 @@ pub(super) fn engine() -> Engine<Fake> {
             writes: Vec::new(),
             stall: 0,
             poll_limit: None,
+            pause_wait: false,
             retiring: [false; 4],
             delay: [0; 4],
             reject: None,
