@@ -88,8 +88,9 @@ retained HTT RX buffers and native TX/management completion. A retained WMI
 radio session now performs correlated passive scans across six dialects while
 servicing HTT completions. PFC events, security/decapsulation, remaining WMI
 MLME and station attachment remain software work.
-Ath9k programs AR9285 inactive PHY/PLL/RF INI and EEPROM modal tables with
-current-capability register access. Ath11k QCA6390 has its native
+Ath9k programs AR9285 inactive PHY/PLL/RF INI, EEPROM modal and PDADC detector
+tables with current-capability register access; CTL/rate power, analog calibration
+and packet/station ownership remain open. Ath11k QCA6390 has its native
 IPQ8074 RX path and four-vdev resources; QCN9074 remains gated.
 Realtek has per-family identity/power work, a retained RTL8188EU factory/FIFO/
 firmware/MAC/BB/RF/LLT plus LC/IQK worker and bounded native RTW89 TX ownership.
@@ -97,12 +98,14 @@ Production AES-CCM, shared CCMP AAD/replay corrections and checked per-key/TID
 station wrappers provide software crypto prerequisites; channel/power and
 native station paths remain incomplete. RTL8188EU now has a persistent native
 packet receipt/stop owner, channel1/XTAL initialization and a bounded shared
-management association plan. Native RX/management service binding, verified
-transmit-power policy and station composition remain.
+management association plan. Signed, exact-board calibration artifacts now
+gate native transmit gains and MAC TX activation; missing qualification keeps
+TX closed. Native RX/management service binding and station composition remain.
 RTL8188EE has a retained native firmware worker; packet DMA/RF remain closed.
 RTW89 has checked owned AX firmware selection, cold-power/DDV primitives and
 fuse-selected immutable header/section download plans with host blacklist
-enforcement. DLE/HFC/CH12/WCPU composition and station work remain. Its diagnostic
+enforcement. Power-off/normalization and DLE/HFC primitives now have Linux-C
+trace coverage; PCIe/BDRAM/CH12/WCPU composition and station work remain. Its diagnostic
 probe retains unpublished storage without activating rings, IRQs or a NIC.
 USB retains published address/configuration/control/bulk DMA, checks slot
 generations and implements explicit Stop/Set-Dequeue fencing for the supported
@@ -115,8 +118,8 @@ cannot be closed by physical testing alone. No physical device validation is
 part of the current software-only work.
 
 The software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared wireless
-and crypto QEMU gates: x86_64 reports 1666 pass / 0 fail / 11 skip;
-aarch64 reports 970 pass / 0 fail / 3 skip.
+and crypto QEMU gates: x86_64 reports 1686 pass / 0 fail / 11 skip;
+aarch64 reports 990 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.

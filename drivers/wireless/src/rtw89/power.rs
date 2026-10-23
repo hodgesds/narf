@@ -19,8 +19,10 @@ pub enum Phase {
     Cold,
     Starting,
     Powered,
+    Stopping,
+    Off,
 }
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Calibration {
     pub rfe_type: u8,
     pub valid: bool,
@@ -52,12 +54,14 @@ pub struct Step {
 pub struct Power<I> {
     io: I,
     phase: Phase,
+    profile: Option<(ChipId, u8, Calibration)>,
 }
 impl<I: Io> Power<I> {
     pub fn new(io: I) -> Self {
         Self {
             io,
             phase: Phase::Cold,
+            profile: None,
         }
     }
     pub fn phase(&self) -> Phase {
@@ -117,11 +121,11 @@ impl<I: Io> Power<I> {
         self.poll32(R_AX_WLAN_XTAL_SI_CTRL, 1 << 31, 0, 50, 50_000)
             .await
     }
-    async fn table(&mut self, cut: u8) -> Result<(), Error> {
+    async fn table_steps(&mut self, cut: u8, steps: &[Step]) -> Result<(), Error> {
         if cut >= 8 {
             return Err(Error::Unsupported);
         }
-        for step in A_ON {
+        for step in steps {
             if step.command == 3 {
                 break;
             }
@@ -165,13 +169,20 @@ impl<I: Io> Power<I> {
         mut cut: u8,
         calibration: Calibration,
     ) -> Result<u8, Error> {
-        if self.phase != Phase::Cold {
+        if !matches!(self.phase, Phase::Cold | Phase::Off) {
             return Err(Error::Terminal);
+        }
+        if self
+            .profile
+            .is_some_and(|profile| profile != (chip, cut, calibration))
+        {
+            return Err(Error::Unsupported);
         }
         if chip == ChipId::Rtl8922A || cut > 15 {
             return Err(Error::Unsupported);
         }
         self.phase = Phase::Starting;
+        self.profile = Some((chip, cut, calibration));
         if self.io.read16(R_AX_SYS_FUNC_EN)? == u16::MAX {
             return Err(Error::Gone);
         }
@@ -185,12 +196,13 @@ impl<I: Io> Power<I> {
             return Err(Error::AlreadyOn);
         }
         if chip == ChipId::Rtl8852A {
-            self.table(cut).await?;
+            self.table_steps(cut, A_ON).await?;
         } else {
             self.callback(chip, &mut cut, calibration).await?;
         }
         self.io
             .write8(R_AX_SCOREBOARD + 3, MAC_AX_NOTIFY_TP_MAJOR as u8)?;
+        self.profile = Some((chip, cut, calibration));
         self.phase = Phase::Powered;
         Ok(cut)
     }
@@ -396,3 +408,6 @@ impl<I: Io> Power<I> {
         Ok(())
     }
 }
+
+#[path = "power_off.rs"]
+mod off;

@@ -57,6 +57,12 @@ packet service are not yet attached.
   firmware requestor/scan/vdev identities and never reuses a 12-bit scan ID
   within an owner lifetime. A failed/malformed terminal, timeout or dropped
   post-publication future closes that owner until full reset, retaining DMA.
+- The older public `wmi` MAIN-dialect codec now uses Linux's group IDs
+  starting at index 1, with distinct scan/debug events and correct
+  `VDEV_SET_PARAM` (0x5008), RTS, fragmentation, beacon and DTIM parameter
+  IDs. The nonexistent `vdev_param::MAC_ADDR` constant is removed. These
+  helpers remain MAIN-only; the retained runtime selects each firmware
+  dialect separately.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have

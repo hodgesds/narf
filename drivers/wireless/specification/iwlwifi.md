@@ -147,6 +147,18 @@ data, and an independent WPA2 M1 advances through a retained EAPOL TX receipt
 using synchronous drains after its async waiter is dropped. These are software
 ownership regressions and do not emulate radio or establish silicon acceptance.
 
+### 3.3 One-shot interface publication
+
+Publication claims the device once before changing IPC endpoints. Missing or
+revoked network authority, an occupied interface name or capability-registry
+failure rejects startup while every new channel remains private. Successful
+capability registration is required before ACTIVE, the kernel netdev and workers
+appear. No later fallible step releases that published ownership. Repeated calls
+fail before replacing the live RX/TX endpoints; a failed attempt requires a fresh
+device owner. Real-cap revocation/missing-authority, duplicate-call and
+post-staging registry-failure fixtures exercise the actual publication entry
+without publishing an interface or worker.
+
 ## 4. References
 
 - Linux `drivers/net/wireless/intel/iwlwifi/`

@@ -30,6 +30,7 @@ pub enum BringUpError {
     BadChecksum,
     BadVersion,
     BadIdentity,
+    BadCalibration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

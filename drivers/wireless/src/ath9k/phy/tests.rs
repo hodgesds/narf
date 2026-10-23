@@ -36,6 +36,20 @@ fn smoke_ath9k_live_baseband_uses_linux_ini_and_eeprom_gain() -> TestResult {
         io.regs.insert(0x9874, 0x80000000);
         let mut image = [0; EEPROM_4K_BYTES];
         image[31] = (index % 2) as u8;
+        image[4..6].copy_from_slice(&0xe002u16.to_le_bytes());
+        image[72] = 12;
+        image[76] = 2;
+        image[120..123].copy_from_slice(&[112, 137, 162]);
+        for pier in 0..3 {
+            for gain in 0..2 {
+                for point in 0..5 {
+                    let at = 123 + pier * 20 + gain * 5 + point;
+                    image[at] = (8 + gain * 20 + point * 4 + pier * 2) as u8;
+                    image[at + 10] = (20 + gain * 50 + point * 15 + pier * 3) as u8;
+                }
+            }
+        }
+
         let status = prepare(&mut io, &image).unwrap();
         let first = io
             .writes
@@ -97,4 +111,52 @@ fn smoke_ath9k_baseband_rejects_absent_synth_before_writes() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath9k/phy",
     smoke_ath9k_baseband_rejects_absent_synth_before_writes
+);
+
+// The same independent Linux register oracle used by the detector-only
+// fixture, reached here through the complete production preparation path.
+#[allow(dead_code)]
+mod detector_oracle {
+    include!("power/golden.rs");
+    pub(super) fn image() -> &'static [u8] {
+        EEPROM_0
+    }
+    pub(super) fn writes() -> &'static [[u32; 2]] {
+        GOLDEN_0
+    }
+}
+
+fn smoke_ath9k_ini_modal_detector_composition_stays_inactive() -> TestResult {
+    let mut io = Io::default();
+    let image = detector_oracle::image().try_into().unwrap();
+    if prepare(&mut io, image).is_err() {
+        return TestResult::Fail("INI/modal preparation did not reach detector table programming");
+    }
+    let Some(boundary) = io.writes.iter().rposition(|&(r, _)| r == 0xa26c) else {
+        return TestResult::Fail("composed preparation omitted detector boundaries");
+    };
+    let expected = detector_oracle::writes();
+    let end = boundary + expected.len() - 4;
+    let Some(actual) = io.writes.get(boundary..end) else {
+        return TestResult::Fail("composed preparation truncated the detector table");
+    };
+    // Four gain-control RMWs preserve unrelated INI bits; the remaining
+    // boundary/table registers are fully specified by the Linux oracle.
+    if boundary < 659
+        || io.writes[boundary - 1].0 != 0xa258
+        || io.writes[boundary - 1].1 & 0x3fc000 != expected[3][1] & 0x3fc000
+        || actual
+            .iter()
+            .zip(&expected[4..])
+            .any(|(&(r, v), e)| [r as u32, v] != *e)
+        || io.writes[end..] != [(0x981c, 0), (0x24, 0), (0x8, 0x20)]
+        || io.regs[&0x8048] & 0x02000020 != 0x02000020
+    {
+        return TestResult::Fail("composed INI/modal/detector writes differ or activate PHY/DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/phy",
+    smoke_ath9k_ini_modal_detector_composition_stays_inactive
 );

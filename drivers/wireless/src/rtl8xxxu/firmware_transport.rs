@@ -121,6 +121,9 @@ pub fn parse_image(chip: ChipFamily, blob: &[u8]) -> Result<(FirmwareInfo, &[u8]
 /// index=0. The trait requires exact-count checking at the owner boundary.
 #[async_trait::async_trait]
 pub trait ControlIo: Send + Sync {
+    fn identity(&self) -> Option<(u16, u16)> {
+        None
+    }
     async fn read(&self, addr: u16, out: &mut [u8]) -> Result<usize, UsbError>;
     async fn write(&self, addr: u16, data: &[u8]) -> Result<usize, UsbError>;
     async fn configuration(&self, _out: &mut [u8]) -> Result<usize, UsbError> {
@@ -147,6 +150,9 @@ impl UsbControl {
 
 #[async_trait::async_trait]
 impl ControlIo for UsbControl {
+    fn identity(&self) -> Option<(u16, u16)> {
+        Some((self.device.vendor_id(), self.device.product_id()))
+    }
     async fn configuration(&self, out: &mut [u8]) -> Result<usize, UsbError> {
         self.device.get_config_descriptor(0, out).await
     }
@@ -168,6 +174,7 @@ impl ControlIo for UsbControl {
 pub struct Owner<I: ControlIo> {
     io: I,
     chip: ChipFamily,
+    identity: Option<(u16, u16)>,
     started: AtomicBool,
     status: IrqSafeSpinLock<Status>,
     factory: IrqSafeSpinLock<Option<super::device_init::Factory>>,
@@ -202,7 +209,9 @@ impl<I: ControlIo> Drop for Attempt<'_, I> {
 
 impl<I: ControlIo> Owner<I> {
     pub fn new(io: I, chip: ChipFamily) -> Self {
+        let identity = io.identity();
         Self {
+            identity,
             io,
             chip,
             started: AtomicBool::new(false),
@@ -217,6 +226,9 @@ impl<I: ControlIo> Owner<I> {
         }
     }
 
+    pub fn usb_identity(&self) -> Option<(u16, u16)> {
+        self.identity
+    }
     pub fn status(&self) -> Status {
         *self.status.lock()
     }

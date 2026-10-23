@@ -73,8 +73,31 @@ and both factory crystal-cap fields before LC/IQK. `channel_runtime` rejects
 live MAC TX/RX and invalid channel geometry before channel writes. It does
 not implement retune or infer transmit power from factory gain indices.
 
+`power_policy::Calibration` loads a signed, exact-device power qualification
+artifact; [the N8PC v1 contract](rtl8188eu-power.md) defines its bounds and
+required physical input. Registry signer metadata is mandatory even in an
+unsigned-firmware development build. The artifact binds USB VID/PID,
+chip/cut/profile and all retained factory fields. Its measured per-channel
+CCK/OFDM gain upper bounds, maximum antenna gain and qualified EIRP are
+intersected with every overlapping authenticated regulatory rule. Unknown
+points are never interpolated and indices never exceed factory bases. The
+opaque `Permission` binds the selected gains to that exact device/channel;
+there is no default calibration or cross-chip dBm conversion.
+
+`ControlIo::identity()` supplies immutable descriptor VID/PID (default absent);
+`UsbControl` obtains it from the retained device and `Owner::usb_identity()`
+returns the constructor snapshot. Private native TX activation rechecks the
+power token against the actual retained identity/factory/channel, programs
+and reads back each CCK/OFDM gain lane and exact response-rate bitmap1 while
+TX is closed, and only then verifies MAC TX-open. Gain/TX-gate cancellation
+or error is terminal without EP0 cleanup. Only the pending station owner can
+submit local native management frames through this gate; it is not a public
+injection or controlled-port API. Successful pause closes TX/RX before host
+Stop and resumes RX-only, requiring fresh TX activation. No real board curve
+is provided or qualified by this software change.
+
 `receive_runtime::Receiver` composes the retained firmware and packet owners
-for policy-admitted channel1 reception. `Permission::from_domain` bounds
+for policy-admitted channel1 reception and private qualified TX activation. `Permission::from_domain` bounds
 the caller-authenticated regulatory profile and grants no TX gain authority.
 Construction requires radio-ready/full IQK, snapshots checked descriptors,
 and permanently claims the radio once. `start` posts persistent USB RX before
@@ -177,13 +200,13 @@ diagnostic with checked LC/IQK through the production probe. It is not ready for
 | MAC/BB/AGC/RF table application | Implemented with source-matched tables and checked transfers |
 | Checked post-table MAC, CAM-clear, LC/full IQK and factory gain indices | Implemented; composed owner/status/error/cancellation regressions |
 | Initial channel/crystal and retained RX activation | Implemented channel1 owner; probe/service binding remains |
-| Policy-admitted transmit power | Missing; factory gain indices are not dBm policy |
+| Signed board power artifact and checked native TX gate | Implemented software contract; real qualified per-device data must be acquired/signed/installed |
 | Native USB descriptor/packet ownership | Implemented dependency; persistent receipt/stop and Linux descriptor regressions |
 | Native beacon/management preparation and peer-bound transitions | Implemented narrow channel1/basic1Mbps dependency using shared plan |
 | Production passive scan/MLME service and policy-admitted management TX | Missing; receive/management owners are not yet service-bound |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Missing |
-| Regulatory channel/power, rates, coexistence | Missing |
+| Broader channel/rate profiles and coexistence | Missing; initial profile is channel1/basic1Mbps only |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
 | Disconnect callbacks, EP0/Halted reset, FIFO retune and PM recovery | Missing; software prerequisites |

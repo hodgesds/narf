@@ -27,6 +27,7 @@ impl Fixture {
                 tx_progress: false,
             }),
             control: Mutex::new(None),
+            publication: AtomicBool::new(false),
             mac: [2; 6],
             irq_vector: None,
             channels: alloc::vec![1],
@@ -220,4 +221,106 @@ fn smoke_iwl_device_retained_eapol_waiter_drop_native_credit_and_receipt() -> Te
 kernel_test_in!(
     "drivers/wireless/iwlwifi/progress",
     smoke_iwl_device_retained_eapol_waiter_drop_native_credit_and_receipt
+);
+
+fn smoke_iwl_publication_revocation_and_missing_authority_leave_endpoints_private() -> TestResult {
+    use narf_capabilities::{Cap, Grant};
+    for revoked in [false, true] {
+        let fixture = Fixture::new(false);
+        let device = fixture.device.as_ref().unwrap();
+        let before = device.state.try_lock().unwrap().tx[1]
+            .as_ref()
+            .unwrap()
+            .__ring_ptr_for_test();
+        let authority = Cap::<narf_net::NetIface, Grant>::bootstrap();
+        if revoked {
+            authority.revoke();
+        }
+        let result = device.start_pumps_with_authority(revoked.then_some(&authority));
+        if result.is_ok()
+            || !device.publication.load(Ordering::Acquire)
+            || device.rx.lock().is_some()
+            || device.tx.iter().any(|tx| tx.lock().is_some())
+            || device.state.try_lock().unwrap().producer.is_some()
+            || device.state.try_lock().unwrap().tx[1]
+                .as_ref()
+                .unwrap()
+                .__ring_ptr_for_test()
+                != before
+        {
+            return TestResult::Fail(
+                "failed network authority replaced/published private endpoints",
+            );
+        }
+        if device
+            .start_pumps_with_authority(Some(&Cap::bootstrap()))
+            .is_ok()
+        {
+            return TestResult::Fail(
+                "failed publication attempt was reusable without a fresh owner",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/progress",
+    smoke_iwl_publication_revocation_and_missing_authority_leave_endpoints_private
+);
+
+fn smoke_iwl_duplicate_publication_rejected_before_endpoint_replacement() -> TestResult {
+    let fixture = Fixture::new(false);
+    let device = fixture.device.as_ref().unwrap();
+    let before = device.state.try_lock().unwrap().tx[1]
+        .as_ref()
+        .unwrap()
+        .__ring_ptr_for_test();
+    device.publication.store(true, Ordering::Release);
+    if device.start_pumps_with_authority(None) != Err("iwlwifi publication already attempted")
+        || device.rx.lock().is_some()
+        || device.tx.iter().any(|tx| tx.lock().is_some())
+        || device.state.try_lock().unwrap().tx[1]
+            .as_ref()
+            .unwrap()
+            .__ring_ptr_for_test()
+            != before
+    {
+        return TestResult::Fail("duplicate publication replaced live ring endpoints");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/progress",
+    smoke_iwl_duplicate_publication_rejected_before_endpoint_replacement
+);
+
+fn smoke_iwl_registry_revocation_after_staging_does_not_publish_endpoints() -> TestResult {
+    use narf_capabilities::{Cap, Grant};
+    let fixture = Fixture::new(false);
+    let device = fixture.device.as_ref().unwrap();
+    let authority = Cap::<narf_net::NetIface, Grant>::bootstrap();
+    let mut called = false;
+    let result = device.publish_with_registration(Some(&authority), |authority, interface| {
+        called = true;
+        // Revoke after the outer admission check, then exercise the actual
+        // capability registry's failure path. No entry is inserted globally.
+        authority.revoke();
+        narf_net::registry()
+            .register(authority, interface)
+            .map(|_| ())
+            .map_err(|_| "revoked during registry publication")
+    });
+    if result != Err("revoked during registry publication")
+        || !called
+        || device.rx.lock().is_some()
+        || device.tx.iter().any(|tx| tx.lock().is_some())
+        || device.state.try_lock().unwrap().producer.is_some()
+    {
+        return TestResult::Fail("registry failure committed staged endpoint ownership");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/progress",
+    smoke_iwl_registry_revocation_after_staging_does_not_publish_endpoints
 );

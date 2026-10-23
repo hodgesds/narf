@@ -9,8 +9,8 @@ use super::{
     EEPROM_4K_BYTES,
 };
 
-/// Registers prepared on a quiescent device, including modal/RF but before CTL/PDADC
-/// programming and calibration. This is not an active radio state.
+/// Registers prepared on a quiescent device, including modal/RF and the
+/// EEPROM detector table. CTL/rate power and calibration remain; PHY stays off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Prepared {
     pub reference_frequency: u16,
@@ -97,8 +97,9 @@ fn prepare(
         (synth & 0xc0000000) | (1 << 29) | (1 << 28) | ((2412 * 0x10000) / 15),
     );
     modal::prepare(io, image, false, false)?;
-    // Leave PHY, interrupts and packet engines disabled. Power/CTL/PDADC
-    // interpolation and calibration must precede activation.
+    power::program(io, image, 2412)?;
+    // Leave PHY, interrupts and packet engines disabled. CTL/rate-power
+    // policy and analog calibration must precede activation.
     io.write32(0x981c, 0);
     io.write32(0x24, 0);
     io.write32(0x8, 0x20);
@@ -122,5 +123,6 @@ pub(super) fn program(
 }
 
 mod modal;
+mod power;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

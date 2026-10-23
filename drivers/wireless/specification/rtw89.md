@@ -70,13 +70,28 @@ establish CH12/WCPU ownership or start a download.
 `power::Power<Io>::power_on` ports the complete PCI RTL8852A byte table and
 RTL8852B/C/8851B power-on callbacks, including XTAL commands, cut/RFE/SPS
 quirks, power/ONMAC deadlines, platform edges, isolation and function enables.
-An inherited powered MAC is rejected until a verified power-off/reset owner
-exists. Failure or cancellation leaves a one-shot Starting state and rejects
-replay before further I/O. The native backend checks live capability, extent
+`power_off` ports the A off table and B/C/51 callbacks, preserving corrected
+physical-cut and calibration identity. It requires independently stopped/fenced
+DMA, verified PCI BME-off and serialized producers; it does not grant a DMA
+reclamation proof. Callback completion plus explicit MAC-OFF readback permits
+the same profile to power on again. `normalize_inherited` applies that off/on
+sequence to an inherited ON MAC; unknown transitional states fail explicitly.
+Failure/cancellation leaves Starting or Stopping and rejects replay before
+further I/O. The native backend checks live capability, extent
 and width alignment for every register operation, and provides asynchronous
 DDV reads for ECV/secure/factory bytes. Cancelled or incompletely restored DDV
 power-cut state stays retained and refuses reuse. These primitives do not yet
 activate CH12, publish a station or establish complete MAC/RF readiness.
+
+`fifo::Fifo::prepare` implements the AX firmware-download DLE/HFC pre-init:
+per-chip MAC/DMAC and internal AXI enables, WDE64/PLE128 geometry, DLFW quotas
+with the SCC WCPU minimum, bounded WDE/PLE readiness, and CH12-only host flow
+control. 8852C uses its V1 HFC register page. Independent Linux C traces cover
+all four AX profiles with inherited zero and nonzero register seeds. The
+operation requires a powered, serialized, DMA-fenced device with PCI BME off;
+it publishes no system-memory rings. Failure or cancellation retains
+Configuring and refuses replay. PCIe quirks/BDRAM, CH12 DMA and WCPU composition
+remain necessary before this private primitive can be activated.
 
 `efuse::read_mac(registers, ChipId, cut)` runs the AX DDV read lifecycle and
 decodes the two-byte sparse records. All four AX profiles use a 1216-byte
@@ -142,7 +157,7 @@ bring-up scaffolding and does not establish a working station runtime.
 | Prerequisite | State |
 |---|---|
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
-| Complete per-chip power/PCIe initialization | Native cold-power-on port and Linux-C trace checks implemented; probe composition, verified power-off/reset and PCIe/DLE/HFC setup remain |
+| Complete per-chip power/PCIe initialization | Native power-on/off, inherited-state normalization and DLFW DLE/HFC primitives implemented with Linux-C traces; probe composition and full PCIe/BDRAM setup remain |
 | Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked owned AX selection, native fuse reads and coupled secure download plans implemented; CH12 owner and WCPU lifecycle remain |
 | Ring quiesce/publication, BDRAM setup, IRQ ownership and recovery | Incomplete |
 | AX initial native TX layout and bounded completion ownership | Shared production backend implemented and model-tested; not yet activated by station/firmware owner |

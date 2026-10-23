@@ -764,9 +764,9 @@ fn smoke_ath10k_wmi_vdev_set_param_encode() -> TestResult {
         return TestResult::Fail("vdev_set_param frame size wrong (expected 16)");
     }
     let cmd_id = u32::from_le_bytes(frame[0..4].try_into().unwrap()) & 0x00FF_FFFF;
-    // WMI_VDEV_SET_PARAM_CMDID = 0x5003.
-    if cmd_id != 0x5003 {
-        return TestResult::Fail("cmd_id != WMI_VDEV_SET_PARAM_CMDID (0x5003)");
+    // MAIN WMI_VDEV_SET_PARAM_CMDID = 0x5008.
+    if cmd_id != 0x5008 {
+        return TestResult::Fail("cmd_id != WMI_VDEV_SET_PARAM_CMDID (0x5008)");
     }
     let vdev_id = u32::from_le_bytes(frame[4..8].try_into().unwrap());
     if vdev_id != 1 {

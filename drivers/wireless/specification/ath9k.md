@@ -34,10 +34,12 @@ AR9285-specific writes follow a checked silicon revision.
 - `Ath9k::baseband` reports `BasebandPrepared`: the 2412 MHz reference
   frequency, selected EEPROM high-power gain/SYNTH9 XE2 variant and count
   of programmed INI rows. Successful preparation also applies normalized
-  EEPROM modal/RF board values. It records inactive register preparation, not
-  channel authorization or a calibrated/operational PHY.
+  EEPROM modal/RF board values and the interpolated detector/PDADC table.
+  It records inactive register preparation, not channel authorization or
+  a calibrated/operational PHY.
 - Errors distinguish absent/mismatched silicon, timeout, invalid EEPROM
-  magic/length/checksum/version, and invalid factory identity.
+  magic/length/checksum/version, invalid factory identity and
+  `BadCalibration` for malformed or unusable detector intercepts.
 
 The former reset-only `Ath9k::new` constructor is removed. Construction
 goes through the PCI authority and identification path. Successful probe
@@ -51,6 +53,11 @@ and margins, EEPROM antenna-diversity controls, versioned OB/DB analog
 fields, settling/ADC/XPA/RX timing, CCA thresholds and baseband power scale.
 Analog updates use bounded settling delays. Dynamic diversity combining
 is not enabled by the current reference-channel probe.
+The detector stage selects the factory PD gains, interpolates frequency-pier
+power/VPD intercepts, and programs the gain boundaries and all 128 PDADC
+entries. The complete bounded calibration plan is validated before its first
+register write; EEPROM versions before minor 2 retain the hardware overlap
+source. This stage does not program regulatory CTL or per-rate transmit power.
 
 Native register reads and writes validate complete aligned BAR extents and
 execute inside `Cap::invoke`; revoked reads return all ones, revoked writes
@@ -103,6 +110,11 @@ Complete modal/RF write traces match independently compiled local Linux
 modal-version, HT40 and diversity cases. Native MMIO tests revoke an actual
 object-table epoch before deliberately invalid BAR addresses, proving no
 post-revocation read/write occurs.
+Detector fixtures compare every register write with independently compiled
+Linux `eeprom.c` interpolation and `eeprom_4k.c` table-programming functions.
+They cover one/two gains, exact/interpolated/clamped frequency piers, legacy
+overlap sourcing, invalid calibration without partial table publication, and
+the actual INI/modal/detector preparation chain with PHY and DMA disabled.
 They do not prove RF or packet operation.
 
 ## 8. Remaining software and physical acceptance
@@ -110,8 +122,8 @@ They do not prove RF or packet operation.
 Software still required before AR9285 is ready for physical Wi-Fi testing:
 
 1. Complete the partially prepared PHY: channel-mode overrides, chain
-   masks and delta slope/spur handling, power/antenna policy, CTL/PDADC
-   application, noise-floor/IQ/PA calibration and regulatory limits.
+   masks and delta slope/spur handling, power/antenna policy, CTL and
+   per-rate power limits, noise-floor/IQ/PA calibration and regulatory limits.
    The fixed inactive reference synth setting does not implement channel
    switching or radio activation. PCIe power-save/PM setup also remains.
 2. Real TX queue/RX descriptor allocations and DMA ownership, IRQ service,

@@ -22,6 +22,7 @@ use narf_wireless::{
 pub struct Device {
     state: Mutex<State>,
     control: Mutex<Option<Work>>,
+    publication: AtomicBool,
     mac: [u8; 6],
     irq_vector: Option<u8>,
     channels: Vec<u8>,
@@ -149,6 +150,7 @@ impl Device {
                 tx_progress: false,
             }),
             control: Mutex::new(None),
+            publication: AtomicBool::new(false),
             mac,
             irq_vector,
             channels: nvm.channels,
@@ -224,33 +226,73 @@ impl Device {
     }
 
     pub fn start_pumps(self: &Arc<Self>) -> Result<(), &'static str> {
+        let authority =
+            narf_net::trusted_net_authority().and_then(|authority| authority.derive().ok());
+        self.start_pumps_with_authority(authority.as_ref())
+    }
+
+    fn start_pumps_with_authority(
+        self: &Arc<Self>,
+        authority: Option<&narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Grant>>,
+    ) -> Result<(), &'static str> {
+        self.publish_with_registration(authority, |authority, interface| {
+            narf_net::registry()
+                .register(authority, interface)
+                .map(|_| ())
+                .map_err(|_| "iwlwifi capability registry registration failed")
+        })
+    }
+
+    fn publish_with_registration(
+        self: &Arc<Self>,
+        authority: Option<&narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Grant>>,
+        register: impl FnOnce(
+            &narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Grant>,
+            RegisteredDevice,
+        ) -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        // Claim before replacing any endpoint, checking global publication, or
+        // obtaining a registry entry. A failed attempt requires a fresh owner.
+        self.publication
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "iwlwifi publication already attempted")?;
+        let authority = authority.ok_or("iwlwifi has no network publication authority")?;
+        authority
+            .check_live()
+            .map_err(|_| "iwlwifi network publication authority revoked")?;
+        let mut active = ACTIVE.lock();
+        if active.is_some()
+            || narf_net::iface::lookup(self.name()).is_some()
+            || narf_wireless::registry::list()
+                .iter()
+                .any(|interface| interface.name() == self.name())
+        {
+            return Err("iwlwifi interface already registered");
+        }
+        let mut state = self
+            .state
+            .try_lock()
+            .ok_or("iwlwifi unpublished device busy")?;
         let (rx_producer, rx_consumer) = narf_ipc::channel::<Frame, RX_RING_N>();
-        *self.rx.lock() = Some(rx_consumer);
-        let tx_consumers = narf_wireless::AccessCategory::ALL.map(|category| {
+        let tx_channels = narf_wireless::AccessCategory::ALL.map(|category| {
             let (producer, consumer) = narf_ipc::channel::<Frame, TX_RING_N>();
-            *self.tx[category as usize].lock() = Some(producer);
-            (category, consumer)
+            (category, producer, consumer)
         });
-        {
-            let mut state = self.state.try_lock().expect("unpublished interface");
-            state.producer = Some(rx_producer);
-            for (category, consumer) in tx_consumers {
-                state.tx[category as usize] = Some(consumer);
-            }
+        // This is the final fallible publication step. Failure leaves all
+        // staged channels private and never exposes ACTIVE/netdev/workers.
+        register(authority, RegisteredDevice(self.clone()))?;
+        state.producer = Some(rx_producer);
+        *self.rx.lock() = Some(rx_consumer);
+        for (category, producer, consumer) in tx_channels {
+            *self.tx[category as usize].lock() = Some(producer);
+            state.tx[category as usize] = Some(consumer);
         }
-        {
-            let mut active = ACTIVE.lock();
-            if active.is_some() {
-                return Err("iwlwifi interface already registered");
-            }
-            *active = Some(self.clone());
-        }
+        *active = Some(self.clone());
+        drop(state);
+        drop(active);
         narf_net::iface::register(self.name(), self.mac, send_frame);
         narf_net::iface::set_link_state(self.name(), false);
         narf_net::iface::install_rx_drain(drain_network);
-        if let Some(authority) = narf_net::trusted_net_authority().and_then(|a| a.derive().ok()) {
-            let _ = narf_net::registry().register(&authority, RegisteredDevice(self.clone()));
-        }
         let device = self.clone();
         narf_scheduler::spawn(async move {
             device.pump().await;

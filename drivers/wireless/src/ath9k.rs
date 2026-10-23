@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! AR9285 PCIe reset, EEPROM identity and inactive INI/PLL/RF preparation.
-//! Linux ath9k is the reference. Modal/RF board values are applied; power/calibration,
+//! Linux ath9k is the reference. Modal/RF and detector table values are applied; CTL/rate power and calibration,
 //! PHY activation and packet DMA remain open.
 
 use core::fmt::Write as _;

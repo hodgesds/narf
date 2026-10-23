@@ -13,16 +13,16 @@ use super::firmware_transport::{parse_image, ControlIo, Error, Owner, Stage};
 use super::regs::*;
 
 #[derive(Clone, Debug)]
-enum Op {
+pub(super) enum Op {
     Read(u16, usize),
     Write(u16, Vec<u8>),
     Delay(u64),
 }
 
-struct Model {
-    regs: Vec<u8>,
+pub(super) struct Model {
+    pub(super) regs: Vec<u8>,
     pages: Vec<Vec<u8>>,
-    ops: Vec<Op>,
+    pub(super) ops: Vec<Op>,
     checksum: bool,
     init: bool,
     short_read: bool,
@@ -30,8 +30,8 @@ struct Model {
     pending: bool,
     pending_page: bool,
     page_error: bool,
-    active_td: bool,
-    unsafe_reuses: usize,
+    pub(super) active_td: bool,
+    pub(super) unsafe_reuses: usize,
     writes: usize,
     physical: [u8; 512],
     config: Vec<u8>,
@@ -42,7 +42,7 @@ struct Model {
     iq_failure: bool,
     rf_read: u8,
     rf: [u32; 256],
-    pending_write: Option<u16>,
+    pub(super) pending_write: Option<u16>,
 }
 
 impl Model {
@@ -81,7 +81,7 @@ impl Model {
 }
 
 #[derive(Clone)]
-struct Fake(Arc<IrqSafeSpinLock<Model>>);
+pub(super) struct Fake(pub(super) Arc<IrqSafeSpinLock<Model>>);
 impl Fake {
     fn new() -> Self {
         Self(Arc::new(IrqSafeSpinLock::new(Model::new())))
@@ -90,6 +90,10 @@ impl Fake {
 
 #[async_trait::async_trait]
 impl ControlIo for Fake {
+    fn identity(&self) -> Option<(u16, u16)> {
+        Some((0x0bda, 0x8179))
+    }
+
     async fn configuration(&self, out: &mut [u8]) -> Result<usize, UsbError> {
         let g = self.0.lock();
         out[..g.config.len()].copy_from_slice(&g.config);
@@ -1026,17 +1030,20 @@ kernel_test_in!(
 );
 
 #[derive(Default)]
-struct BulkState {
+pub(super) struct BulkState {
     next: u64,
     active: Option<u64>,
     pending_stop: bool,
     starts: usize,
     stops: usize,
+    tx: Option<(u64, usize)>,
+    pub(super) tx_pending: bool,
+    pub(super) sent: Vec<(u8, Vec<u8>)>,
 }
 #[derive(Clone)]
-struct Bulk {
+pub(super) struct Bulk {
     control: Fake,
-    state: Arc<IrqSafeSpinLock<BulkState>>,
+    pub(super) state: Arc<IrqSafeSpinLock<BulkState>>,
 }
 impl Bulk {
     fn new(control: Fake) -> Self {
@@ -1068,11 +1075,29 @@ impl super::packet_transport::Io for Bulk {
             Err(UsbError::Stall)
         }
     }
-    fn begin_send(&self, _: u8, _: &[u8]) -> Result<u64, UsbError> {
-        panic!("receive-only owner attempted TX")
+    fn begin_send(&self, dci: u8, bytes: &[u8]) -> Result<u64, UsbError> {
+        let mut m = self.state.lock();
+        if m.tx.is_some() || dci != 4 {
+            return Err(UsbError::Stall);
+        }
+        m.next += 1;
+        let id = m.next;
+        m.tx = Some((id, bytes.len()));
+        m.sent.push((dci, bytes.to_vec()));
+        self.control.0.lock().ops.push(Op::Write(0xfffc, vec![dci]));
+        Ok(id)
     }
-    fn poll_send(&self, _: &u64) -> Result<Option<usize>, UsbError> {
-        panic!("receive-only owner attempted TX")
+    fn poll_send(&self, receipt: &u64) -> Result<Option<usize>, UsbError> {
+        let mut m = self.state.lock();
+        let (id, length) = m.tx.ok_or(UsbError::Stall)?;
+        if id != *receipt {
+            return Err(UsbError::Stall);
+        }
+        if m.tx_pending {
+            return Ok(None);
+        }
+        m.tx = None;
+        Ok(Some(length))
     }
     async fn stop(&self, r: &u64) -> Result<(), UsbError> {
         let pending = {
@@ -1104,7 +1129,7 @@ fn receive_permission() -> super::receive_runtime::Permission {
     })
     .unwrap()
 }
-fn prepared_receiver() -> (
+pub(super) fn prepared_receiver() -> (
     Fake,
     Arc<Owner<Fake>>,
     Bulk,
