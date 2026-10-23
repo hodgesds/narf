@@ -324,6 +324,14 @@ fn navi22_multi_hdmi_and_dp_share_init_clocks_and_watermarks() -> TestResult {
     {
         return TestResult::Fail("shared init/clocks/watermarks not once");
     }
+    if !log.windows(2).any(|pair| {
+        pair[0].dword == m::MP1 + 0x273
+            && pair[0].value == 2
+            && pair[1].dword == m::MP1 + 0x28a
+            && pair[1].value == 0xe
+    }) {
+        return TestResult::Fail("joint clocks did not report two active streams");
+    }
     let Some(joint) = group.joint() else {
         return TestResult::Fail("no joint plan");
     };

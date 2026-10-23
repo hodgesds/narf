@@ -251,6 +251,9 @@ struct Engine<I: Io> {
     state: State,
     levels: Option<Levels>,
     applied: Option<Plan>,
+    /// Shared PHYCLK must cover every active or verified DP link. This
+    /// owner conservatively retains its peak until GPU restart.
+    phy_floor_mhz: u16,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -299,6 +302,24 @@ impl<I: Io> Engine<I> {
             return Err(Error::DeviceGone);
         }
         Ok(result)
+    }
+    fn begin_runtime(&mut self) -> Result<State, Error> {
+        if !matches!(self.state, State::Ready | State::Configured) {
+            return Err(Error::Busy);
+        }
+        let resume = self.state;
+        self.state = State::InFlight;
+        Ok(resume)
+    }
+    async fn runtime_command(&mut self, msg: u32, arg: u32) -> Result<u32, Error> {
+        let resume = self.begin_runtime()?;
+        let result = self.command(msg, arg).await;
+        self.state = match result {
+            // A completed refusal leaves no unknown transaction in flight.
+            Ok(_) | Err(Error::Rejected(_)) => resume,
+            Err(_) => State::Failed,
+        };
+        result
     }
     async fn start(
         &mut self,
@@ -388,11 +409,24 @@ impl<I: Io> Engine<I> {
             vco_khz,
         })
     }
-    async fn floor(&mut self, clock: Clock, khz: u32) -> Result<(), Error> {
-        let mhz = khz.div_ceil(1000);
-        if mhz == 0 || mhz > u32::from(u16::MAX) {
+    fn floor_mhz(&self, clock: Clock, khz: u32) -> Result<u32, Error> {
+        let levels = self.levels.ok_or(Error::Invalid)?;
+        let range = levels.range(clock);
+        let min = range.min_khz() / 1000;
+        let max = range.max_khz() / 1000;
+        if khz == 0 || min == 0 || min > max {
             return Err(Error::Invalid);
         }
+        // dcn30_notify_link_rate_change starts at the board's minimum PHYCLK.
+        // Clamp lower requests, but never send a floor above the board range.
+        let mhz = khz.div_ceil(1000).max(min);
+        if mhz > max {
+            return Err(Error::Invalid);
+        }
+        Ok(mhz)
+    }
+    async fn floor(&mut self, clock: Clock, khz: u32) -> Result<(), Error> {
+        let mhz = self.floor_mhz(clock, khz)?;
         let applied = self.command(HARD_MIN, (clock as u32) << 16 | mhz).await?;
         if applied < mhz
             || applied > self.levels.ok_or(Error::Invalid)?.range(clock).max_khz() / 1000
@@ -401,9 +435,40 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
+    async fn runtime_floor(&mut self, clock: Clock, khz: u32) -> Result<(), Error> {
+        let mut mhz = self.floor_mhz(clock, khz)?;
+        if clock == Clock::Phy {
+            // dcn30_notify_link_rate_change takes the maximum across links.
+            // We do not release individual link floors on unplug yet.
+            mhz = mhz.max(u32::from(self.phy_floor_mhz));
+        }
+        let resume = self.begin_runtime()?;
+        let result = self.floor(clock, mhz * 1000).await;
+        if result.is_ok() && clock == Clock::Phy {
+            self.phy_floor_mhz = mhz as u16;
+        }
+        self.state = if result.is_ok() {
+            resume
+        } else {
+            State::Failed
+        };
+        result
+    }
     async fn prepare(&mut self, plan: Plan, dentist: &mut impl Dentist) -> Result<(), Error> {
+        self.prepare_displays(plan, dentist, 1).await
+    }
+    async fn prepare_displays(
+        &mut self,
+        plan: Plan,
+        dentist: &mut impl Dentist,
+        displays: u8,
+    ) -> Result<(), Error> {
         if !matches!(self.state, State::Ready | State::Configured) {
             return Err(Error::Busy);
+        }
+        // DCN30 has at most six streams. Count streams, not ODM slices or PHYs.
+        if !(1..=6).contains(&displays) {
+            return Err(Error::Invalid);
         }
         let levels = self.levels.ok_or(Error::Invalid)?;
         // Revalidate public frequency fields, provenance and both divider ids.
@@ -417,7 +482,7 @@ impl<I: Io> Engine<I> {
             // admission uses DCFCLK as its fabric clock; Linux does not set
             // separate SOC/FCLK floors or send the unused DF C-state message.
             // Pin UCLK at the top board state to disable p-state switching.
-            self.notify(DISPLAYS, 1).await?;
+            self.notify(DISPLAYS, u32::from(displays)).await?;
             self.floor(Clock::Dcf, plan.dcf_khz).await?;
             self.notify(DEEP_SLEEP_MIN, plan.dcf_khz.div_ceil(1000))
                 .await?;
@@ -490,6 +555,7 @@ impl ClockManager {
                 state: State::Dormant,
                 levels: None,
                 applied: None,
+                phy_floor_mhz: 0,
             },
             dccg,
         })
@@ -527,13 +593,21 @@ impl ClockManager {
         self.dccg.set_reference_dppclk(plan.pixel_khz);
         Ok(())
     }
+    /// Joint modeset: report the admitted streams rather than one display.
+    pub(crate) async fn prepare_displays(&mut self, plan: Plan, displays: u8) -> Result<(), Error> {
+        self.engine
+            .prepare_displays(plan, &mut self.dccg, displays)
+            .await?;
+        self.dccg.set_reference_dppclk(plan.pixel_khz);
+        Ok(())
+    }
     /// `dcn30_notify_link_rate_change`: the PHYCLK hard minimum for a DP link
     /// at `khz` (link rate code x 27 MHz).
     pub async fn phy_floor(&mut self, khz: u32) -> Result<(), Error> {
         if self.engine.state != State::Configured {
             return Err(Error::Busy);
         }
-        self.engine.floor(Clock::Phy, khz).await
+        self.engine.runtime_floor(Clock::Phy, khz).await
     }
     /// `dcn30_notify_link_rate_change` for a link verified before any mode
     /// is configured (detection's destructive link verification): the
@@ -542,7 +616,7 @@ impl ClockManager {
         if !matches!(self.engine.state, State::Ready | State::Configured) {
             return Err(Error::Busy);
         }
-        self.engine.floor(Clock::Phy, khz).await
+        self.engine.runtime_floor(Clock::Phy, khz).await
     }
     pub fn pipe_clock(&mut self, pipe: u8, khz: u32) -> Result<(), Error> {
         if self.engine.state != State::Configured {
@@ -563,7 +637,7 @@ impl ClockManager {
         if !matches!(clock, Clock::Memory | Clock::Fabric) {
             return Err(Error::Invalid);
         }
-        self.engine.floor(clock, khz).await
+        self.engine.runtime_floor(clock, khz).await
     }
 }
 /// `dcn3_notify_wm_ranges`' three DAL messages, and nothing else.
@@ -579,7 +653,7 @@ impl crate::amdgpu_dcn30_watermarks::DalMailbox for ClockManager {
         if !matches!(self.engine.state, State::Ready | State::Configured) {
             return Err(Error::Busy);
         }
-        self.engine.command(message, argument).await
+        self.engine.runtime_command(message, argument).await
     }
 }
 /// `dcn3_enable_pme_wa`: wake the Azalia from D3 before its endpoint is
@@ -587,7 +661,7 @@ impl crate::amdgpu_dcn30_watermarks::DalMailbox for ClockManager {
 /// response is not checked there); so does this.
 impl crate::amdgpu_dcn30_audio::AzaliaWake for ClockManager {
     async fn wake_azalia(&mut self) {
-        let _ = self.engine.command(BACO_AUDIO_D3_PME, 0).await;
+        let _ = self.engine.runtime_command(BACO_AUDIO_D3_PME, 0).await;
     }
 }
 

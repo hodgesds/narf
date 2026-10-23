@@ -14,6 +14,7 @@ struct Fake {
     reads: usize,
     idle: bool,
     refuse: Option<u32>,
+    refuse_clock: Option<Clock>,
     stall: Option<u32>,
     underclock: bool,
     display_only: bool,
@@ -46,7 +47,12 @@ impl Io for Fake {
                     // PMFW can refuse optional notifications and the SOC/FCLK
                     // floors that dcn3_update_clocks never requests.
                     0xff
-                } else if self.refuse == Some(value) {
+                } else if self.refuse == Some(value)
+                    || (value == HARD_MIN
+                        && self
+                            .refuse_clock
+                            .is_some_and(|c| self.arg >> 16 == c as u32))
+                {
                     0xfd
                 } else {
                     1
@@ -110,6 +116,7 @@ fn engine() -> Engine<Fake> {
         state: State::Dormant,
         levels: None,
         applied: None,
+        phy_floor_mhz: 0,
         io: Fake {
             response: 1,
             arg: 0,
@@ -121,6 +128,7 @@ fn engine() -> Engine<Fake> {
             reads: 0,
             idle: true,
             refuse: None,
+            refuse_clock: None,
             stall: None,
             underclock: false,
             display_only: false,
@@ -281,6 +289,149 @@ fn navi22_dal_uses_display_floors_and_tolerates_optional_refusals() -> TestResul
 kernel_test_in!(
     "drivers/gpu/dcn30-clk",
     navi22_dal_uses_display_floors_and_tolerates_optional_refusals
+);
+fn navi22_dal_checks_each_required_floor_and_bounds_before_writing() -> TestResult {
+    for clock in [Clock::Dcf, Clock::Memory, Clock::Pixel, Clock::Display] {
+        let mut e = engine();
+        let l = run(e.start(core::future::ready(Ok(())))).unwrap();
+        let p = l.plan(148_500, 148_500, 300_000).unwrap();
+        e.io.refuse_clock = Some(clock);
+        let mut sink = Sink::new();
+        if run(e.prepare(p, &mut sink)) != Err(Error::Rejected(0xfd))
+            || sink.programmed.is_some()
+            || e.state != State::Failed
+            || e.applied.is_some()
+        {
+            return TestResult::Fail("required floor rejection reached DENTIST");
+        }
+    }
+    for clock in [Clock::Phy, Clock::Memory, Clock::Fabric] {
+        let mut e = engine();
+        run(e.start(core::future::ready(Ok(())))).unwrap();
+        e.io.commands.clear();
+        // A low link request keeps the board's minimum, as Linux does.
+        run(e.runtime_floor(clock, 1)).unwrap();
+        if e.io.commands != [(9, (clock as u32) << 16 | 100)] || e.state != State::Ready {
+            return TestResult::Fail("floor below board minimum or owner not restored");
+        }
+        let n = e.io.reads;
+        for invalid in [0, 1_200_001, u32::MAX] {
+            if run(e.runtime_floor(clock, invalid)) != Err(Error::Invalid)
+                || e.io.reads != n
+                || e.state != State::Ready
+            {
+                return TestResult::Fail("invalid frequency touched DAL or poisoned owner");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-clk",
+    navi22_dal_checks_each_required_floor_and_bounds_before_writing
+);
+fn navi22_dal_shared_phy_floor_never_drops_below_another_link() -> TestResult {
+    let mut e = engine();
+    run(e.start(core::future::ready(Ok(())))).unwrap();
+    e.io.commands.clear();
+    // HBR3 followed by RBR, then an HBR2 verification request. They share
+    // one PHYCLK floor even when the clock owner is lent between pipelines.
+    for khz in [810_000, 162_000, 540_000] {
+        run(e.runtime_floor(Clock::Phy, khz)).unwrap();
+    }
+    if e.io.commands != [(9, 0xb032a); 3] || e.phy_floor_mhz != 810 {
+        return TestResult::Fail("slower DP link lowered the shared PHYCLK floor");
+    }
+    e.io.refuse = Some(HARD_MIN);
+    if run(e.runtime_floor(Clock::Phy, 900_000)) != Err(Error::Rejected(0xfd))
+        || e.phy_floor_mhz != 810
+        || e.state != State::Failed
+    {
+        return TestResult::Fail("refused PHY floor published or owner reused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-clk",
+    navi22_dal_shared_phy_floor_never_drops_below_another_link
+);
+
+fn navi22_dal_joint_preparation_reports_stream_count() -> TestResult {
+    for count in 1..=6 {
+        let mut e = engine();
+        let l = run(e.start(core::future::ready(Ok(())))).unwrap();
+        let p = l.plan(148_500, 148_500, 300_000).unwrap();
+        e.io.commands.clear();
+        run(e.prepare_displays(p, &mut Sink::new(), count)).unwrap();
+        if e.io.commands.first() != Some(&(14, u32::from(count))) {
+            return TestResult::Fail("wrong active-stream count sent to DAL");
+        }
+    }
+    let mut e = engine();
+    let l = run(e.start(core::future::ready(Ok(())))).unwrap();
+    let p = l.plan(148_500, 148_500, 300_000).unwrap();
+    let n = e.io.reads;
+    for invalid in [0, 7, u8::MAX] {
+        if run(e.prepare_displays(p, &mut Sink::new(), invalid)) != Err(Error::Invalid)
+            || e.io.reads != n
+        {
+            return TestResult::Fail("invalid stream count touched hardware");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-clk",
+    navi22_dal_joint_preparation_reports_stream_count
+);
+
+fn navi22_dal_runtime_operations_retain_cancelled_transactions() -> TestResult {
+    for state in [State::Ready, State::Configured] {
+        for floor in [false, true] {
+            let mut e = engine();
+            run(e.start(core::future::ready(Ok(())))).unwrap();
+            e.state = state;
+            e.io.stall = Some(if floor { HARD_MIN } else { DISPLAYS });
+            if floor {
+                let mut f = core::pin::pin!(e.runtime_floor(Clock::Phy, 162_000));
+                if f.as_mut().poll(&mut Context::from_waker(Waker::noop())) != Poll::Pending {
+                    return TestResult::Fail("runtime floor did not pend");
+                }
+            } else {
+                let mut f = core::pin::pin!(e.runtime_command(DISPLAYS, 2));
+                if f.as_mut().poll(&mut Context::from_waker(Waker::noop())) != Poll::Pending {
+                    return TestResult::Fail("runtime command did not pend");
+                }
+            }
+            // Even a late reply cannot make a cancelled owner reusable.
+            e.io.response = 1;
+            let n = e.io.reads;
+            if e.state != State::InFlight
+                || run(e.runtime_floor(Clock::Phy, 162_000)) != Err(Error::Busy)
+                || run(e.runtime_command(DISPLAYS, 2)) != Err(Error::Busy)
+                || e.io.reads != n
+            {
+                return TestResult::Fail("cancelled runtime clock request replayed");
+            }
+        }
+    }
+    // An acknowledged optional refusal is safe to reuse, transport loss is not.
+    let mut e = engine();
+    run(e.start(core::future::ready(Ok(())))).unwrap();
+    e.io.refuse = Some(DISPLAYS);
+    if run(e.runtime_command(DISPLAYS, 2)) != Err(Error::Rejected(0xfd)) || e.state != State::Ready
+    {
+        return TestResult::Fail("acknowledged optional refusal retained as busy");
+    }
+    e.io.response = u32::MAX;
+    if run(e.runtime_command(DISPLAYS, 2)) != Err(Error::DeviceGone) || e.state != State::Failed {
+        return TestResult::Fail("lost runtime mailbox reused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-clk",
+    navi22_dal_runtime_operations_retain_cancelled_transactions
 );
 fn navi22_dal_bad_tables_rejection_and_revocation_fail_closed() -> TestResult {
     // dcn3_init_clocks tolerates a header/interface mismatch, a failed or

@@ -146,6 +146,10 @@ fn dcn30_hdmi_modeset_deep_colour_scrambled_with_scdc_in_linux_order() -> TestRe
     if marker(m::SLOT_PIXEL_CLOCK, 0) != 377_550 || lit.bench.get(d1(0x40)) & 0x30 != 0x20 {
         return TestResult::Fail("12-bpc pixel clock");
     }
+    let timing = lit.pipeline.output().unwrap().timing;
+    if lit.pipeline.audio_stream(&timing).timing.pixel_clock_khz != 25_170 {
+        return TestResult::Fail("audio pixel clock incorrectly includes deep-colour PLL scale");
+    }
     // dcn3_program_pix_clk → dce112_program_pix_clk leaves color_depth 0:
     // set_pixel_clock_v7's deep_color_ratio (PS byte 9) is RATIO_DIS even at
     // 12 bpc, and miscinfo (byte 7) carries no YUV420 bit (DCN2+ never sets
@@ -262,6 +266,10 @@ fn dcn30_hdmi_modeset_ycbcr420_through_otg_fmt_ocsc_and_dpg() -> TestResult {
     let get = |d| lit.bench.get(d);
     if get(MARK + 16 * m::SLOT_PIXEL_CLOCK) != 371_250 || get(d1(0x40)) & 0x30 != 0 {
         return TestResult::Fail("4:2:0 pixel clock");
+    }
+    let timing = lit.pipeline.output().unwrap().timing;
+    if lit.pipeline.audio_stream(&timing).timing.pixel_clock_khz != 37_125 {
+        return TestResult::Fail("4:2:0 audio DTO/ACR uses the unhalved pixel clock");
     }
     // OTG: two pixels per container, set after the timing, before enable.
     let timing = pos(&log, 0, |w| w.dword == d2(0x1b2a + p * 0x80));

@@ -7075,9 +7075,23 @@ without aborting the modeset, as with Linux's void notification wrappers;
 transport errors and rejected, inadequate or out-of-range required floors
 still fail before DENTIST programming. Rejection diagnostics retain the
 message, argument and firmware response. No running stream changes clocks.
+Joint preparation reports the admitted stream count (1–6), including separate
+MST streams but excluding extra ODM slices. Runtime PHY and memory/fabric
+floors clamp requests to the board minimum and refuse zero, empty ranges and
+requests above the board maximum before MMIO. Each required floor must be
+acknowledged at a sufficient, in-range frequency. Runtime floors, watermark
+messages and the audio PME notification also retain `InFlight` across
+cancellation; a late firmware reply does not permit replay. Shared PHYCLK
+retains the highest successful link request until GPU restart, so a slower
+link cannot lower a faster link's floor; per-link floor release is not yet
+implemented. Completed optional
+refusals leave the mailbox reusable; transport loss makes it `Failed`.
 `pipe_clock` programs a DTO only after successful preparation. No default PLL,
 clock table, voltage or memory bandwidth is invented. A failed modeset leaves
 floors retained. GDDR6 mode math and the full native pipeline remain separate.
+HDMI audio DTO/ACR uses the requested pixel clock halved for YCbCr 4:2:0,
+without the PHY PLL's deep-colour scaling (`dce110_populate_audio_dto_parameters`).
+Scanout timing retains its original pixel clock.
 
 `amdgpu_navi22_boot::Firmware::open(gpu, registry_cap)` validates every required
 register bank and prepares the SOS, SMC and SDMA/CP/RLC firmware sets before any

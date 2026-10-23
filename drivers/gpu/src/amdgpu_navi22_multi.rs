@@ -1008,7 +1008,10 @@ impl Group {
                 joint.clocks.dcfclk_khz,
             )
             .map_err(Error::Block)?;
-        lead.clocks.prepare(clocks).await.map_err(Error::Block)?;
+        lead.clocks
+            .prepare_displays(clocks, self.requests.len() as u8)
+            .await
+            .map_err(Error::Block)?;
         lead.at(Step::Watermarks);
         // SAFETY: no HUBP fetches yet.
         unsafe { lead.hubbub.program(&joint.hubbub, refclk) }.map_err(Error::Hubbub)?;

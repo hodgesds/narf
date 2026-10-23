@@ -324,6 +324,34 @@ of the old requests was refused. Register-model tests cover the corrected
 request sequence and refused optional notifications; they do not establish
 native hardware modesetting success.
 
+The subsequent clock-request audit covers the Navi22 DAL and GFX PPSMC
+mailboxes plus the native display's PLL, DPP/DP and audio DTO paths against
+Linux `ecd997b0189a`. It does not cover other GPU families. The checks include
+message/register IDs, clock IDs, units and packing, request ordering, board
+bounds, response handling and cancellation ownership:
+
+| Request or path | Linux comparison and result |
+| --- | --- |
+| DAL startup `0x2/0x3/0x4/0xb` | `dcn3_init_clocks`: versions and scalar MHz levels; header/interface and level-query refusals are tolerated; usable ranges remain required for admission. NARF does not query unused DTBCLK. |
+| DAL display floors `0x9`, hints `0xd/0xe` | `dcn3_update_clocks`: DCF/UCLK/PIX/DISP, ceil(kHz/1000), clock ID shifted by 16. Required floors remain strict; notifications tolerate refusal. Joint setup now reports all admitted streams instead of always one. |
+| DP PHYCLK floor | `dcn30_notify_link_rate_change`: link code × 27000 kHz, no lower than the board minimum, covering all links. NARF conservatively retains the highest successful link request until GPU restart. Requests above the board maximum now fail before writing. |
+| Runtime clock operations | PHY and optional memory floors, watermark messages and audio PME now retain in-flight ownership across cancellation, including when firmware replies after the future is dropped. |
+| GFX PPSMC range/control | `smu_v11_0`: GFXCLK ID 0, UCLK ID 2; min/max queries in MHz; SoftMax then SoftMin, `0xffff/0` for automatic mode. Separate GFX and DAL mailbox registers/message spaces match Linux. |
+| Display DPM and power saving | `sienna_cichlid` feature IDs and board masks match; required protections stay enabled. Current display admission refuses FCLK switching, deep sleep and hub power gating. Their optional paths are not evidence of hardware readiness. |
+| HDMI PHY PLL | `dcn3_program_pix_clk` → `dce112_program_pix_clk` → `set_pixel_clock_v7`: target in 100 Hz, combo PLL/CRTC/encoder IDs, XTALIN 0 and deep-colour ratio 0 match. DCN's resource builder leaves `SUPPORT_YCBCR420` unset; the generic helper's YUV420 flag is therefore not added. |
+| DENTIST and DPP DTO | `dcn20_update_clocks_update_dentist` / `dccg2_update_dpp_dto`: divider IDs, completion bits, bounded waits, phase = ceil(255 × requested/reference), modulo 255. NARF retires consumers before changing dividers. |
+| DP pixel DTO | `dcn3_program_pix_clk`: 730 MHz DPREFCLK, optimized-rate entries, otherwise pixel Hz/reference Hz; no VBIOS PLL request for DP. |
+| HDMI/DP audio DTO | `dce110_populate_audio_dto_parameters` / `dce_aud_wall_dto_setup`: HDMI's lowest active OTG drives DTO0; DP uses DPREFCLK/DTO1. HDMI audio now uses the 4:2:0-halved requested clock without deep-colour PLL scaling. |
+| PMFW watermarks and audio wake | DAL `0x5/0x6/0x8` carries the retained watermark address/table 1; `0x11` is optional audio PME. Watermark failure refuses dependent power-saving admission; it does not prove a display-clock failure. |
+
+`bash drivers/gpu/tests/navi22_clock/check.sh ~/git/linux` checks the wire
+constants and register fields against Linux's headers; the harness is also
+included by the revision-pinned `cargo xtask gpu-reference` gate. The kernel
+regressions cover every required display-floor rejection, frequencies outside
+board bounds before writes, stream counts, interrupted runtime operations and
+HDMI audio clock selection. Hardware acceptance of these requests, native
+modesetting and the KDE login remain unverified by this source audit.
+
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 
 ```sh

@@ -1380,15 +1380,25 @@ impl Pipeline {
             scanout: fb,
         })
     }
-    /// The stream's audio once pixels flow (`dce110_enable_audio_stream`
-    /// and its setup half, as the DCN30 audio owner orders them). Audio never
-    /// fails the display: an error is logged and the stream stays lit.
-    async fn start_audio(&mut self, timing: &Timing, sink: &Sink) {
+    /// dce110_populate_audio_dto_parameters: HDMI 4:2:0 uses the halved
+    /// requested pixel clock for DTO/ACR, without the PLL's deep-colour scale.
+    pub(crate) fn audio_stream(&self, timing: &Timing) -> AudioStream {
         let (otg, dig) = (self.route.pipe, self.route.stream);
-        let stream = match self.connector.signal {
-            Signal::Hdmi => AudioStream::hdmi(otg, dig, *timing),
+        match self.connector.signal {
+            Signal::Hdmi => {
+                let mut audio_timing = *timing;
+                if self.hdmi.is_some_and(|s| s.format.ycbcr420) {
+                    audio_timing.pixel_clock_khz /= 2;
+                }
+                AudioStream::hdmi(otg, dig, audio_timing)
+            }
             Signal::DisplayPort => AudioStream::dp(otg, dig, *timing),
-        };
+        }
+    }
+    /// Start audio once pixels flow. An audio error leaves the stream lit.
+    async fn start_audio(&mut self, timing: &Timing, sink: &Sink) {
+        let stream = self.audio_stream(timing);
+        let dig = stream.dig;
         // SAFETY: the stream is live and stays live until tear_down stops
         // its audio first; this pipeline owns the DIG and the endpoints.
         let result = unsafe {
