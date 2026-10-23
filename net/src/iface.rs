@@ -723,6 +723,7 @@ pub fn unregister(name: &str) -> bool {
     let removed = entries.len() != before;
     drop(g);
     if removed {
+        crate::ipv4::remove_interface_binding(name);
         crate::udp_sock::remove_interface(name);
         crate::arp_cache::remove_interface_pending(name);
     }
