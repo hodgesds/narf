@@ -301,6 +301,22 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         self.vol.upgrade().ok_or(FsError::NotFound)
     }
 
+    /// The `(fs tree, inode)` key this node's content generation is
+    /// tracked under in the shared core — the same key
+    /// `mmap_backing_identity` anchors identity under, resolved the
+    /// same way (the node's own tree for a pinned subvolume, else the
+    /// volume view's fs tree).
+    fn generation_key(&self, vol: &BtrfsVolume<B>) -> (u64, u64) {
+        (self.tree_id.unwrap_or_else(|| vol.fs_tree_id()), self.ino)
+    }
+
+    /// Record a content mutation of this inode (see
+    /// `VolCore::bump_cache_generation`).
+    fn bump_cache_generation(&self, vol: &BtrfsVolume<B>) {
+        let (tree, ino) = self.generation_key(vol);
+        vol.bump_cache_generation(tree, ino);
+    }
+
     /// Exact on-disk atime/ctime/mtime for the stat path. The ns→cycles→ns
     /// round trip behind [`Stat::mtime_cycles`] is not exact, so `stat` and
     /// `statx` take `mtime_ns` from here; fontconfig compares a font
@@ -807,6 +823,10 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
+            // Bump before the bytes move: a partial write that ends
+            // in an error must still invalidate retained cache pages
+            // (the `mmap_cache_generation` contract; the minix rule).
+            self.bump_cache_generation(&vol);
             let written = autogrow!(
                 vol,
                 crate::write::cow_write_file(&vol, self.ino, &self.inode(), offset, buf).await
@@ -829,6 +849,8 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::Unsupported);
             }
             let vol = self.volume()?;
+            // Bump before the length moves (see `write`).
+            self.bump_cache_generation(&vol);
             let old_size = self.live_size.load(core::sync::atomic::Ordering::Relaxed);
             if len < old_size {
                 // Publish the new EOF, then revoke every installed PTE
@@ -861,6 +883,11 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::Unsupported);
             }
             let vol = self.volume()?;
+            // Bump before the range moves: fallocate is staged (a
+            // zero-range can commit before the preallocation stage
+            // fails), so a fallocate that ends in an error may still
+            // have changed bytes or length.
+            self.bump_cache_generation(&vol);
             autogrow!(
                 vol,
                 crate::write::fallocate_file(&vol, self.ino, mode, offset, len).await
@@ -936,6 +963,31 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             vol.mmap_anchor(tree, self.ino)
         });
         Arc::as_ptr(anchor) as *const () as usize
+    }
+
+    /// Generic-fallback mmap opt-in for regular files. The mutation
+    /// surface is closed (issue #680's enumeration): bytes or length
+    /// change only through `write`, `truncate` and `fallocate` on a
+    /// node of this volume's trees — each bumps before it mutates —
+    /// through the write engine when an inode is destroyed (a final
+    /// `unlink`, a rename whose destination is destroyed, both bump
+    /// there), or at `create`, which bumps the new inode's key
+    /// because inode numbers are issued max+1 and a freed number is
+    /// reissued. Snapshots and subvolume creation mint a new tree
+    /// (no entries under it; a reissued tree id had its entries
+    /// pruned at destruction), and COW guarantees a write never
+    /// mutates a shared extent in place, so no path changes one
+    /// file's bytes under another file's key. Every node of one
+    /// inode reports the same value, so a mutation through any one
+    /// open invalidates pages retained through any other.
+    /// Non-regular files stay on the conservative `None` behaviour.
+    fn mmap_cache_generation(&self) -> Option<u64> {
+        if !self.inode().is_regular() {
+            return None;
+        }
+        let vol = self.volume().ok()?;
+        let (tree, ino) = self.generation_key(&vol);
+        Some(vol.cache_generation(tree, ino))
     }
 
     fn owners(&self) -> (u32, u32) {
@@ -1246,6 +1298,12 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             let vol = self.volume()?;
             let (ino, inode) =
                 autogrow!(vol, crate::write::create_file(&vol, self.ino, name).await)?;
+            // Inode numbers are issued max+1 (`next_inode_number`),
+            // so `ino` may be a freed file's number: issue the new
+            // file's instance generation now, so pages the previous
+            // tenant left in the shared page cache can never validate
+            // against this file.
+            vol.bump_cache_generation(vol.fs_tree_id(), ino);
             Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
         })
     }

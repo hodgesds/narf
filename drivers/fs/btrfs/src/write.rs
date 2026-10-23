@@ -6986,7 +6986,14 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
             incompat_flags_add: 0,
         },
     )
-    .await
+    .await?;
+    // Tree ids are issued max+1 (`next_subvol_id`), so a later
+    // subvolume can reissue `child_id`. Forget the destroyed tree's
+    // content generations so its files' retained pages can never
+    // validate under the new tree's files (see
+    // `VolCore::prune_cache_generations`).
+    vol.prune_cache_generations(child_id);
+    Ok(())
 }
 
 /// What kind of inode [`create_node`] materialises: mode + directory-entry type,
@@ -7453,6 +7460,13 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     }
 
     commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
+    if last_link {
+        // The inode is gone: pages retained under it must not
+        // validate for a still-open node (its reads now fail), nor
+        // for a later file that recycles its inode number
+        // (`next_inode_number` issues max+1).
+        vol.bump_cache_generation(vol.fs_tree_id(), child_ino);
+    }
     Ok(())
 }
 
@@ -7867,11 +7881,21 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         new_bucket = append_dir_item(Some(&new_bucket), new_name, &di)?;
         edits.push(Edit::Upsert(new_di_key, new_bucket));
     }
+    // A destroyed destination (no surviving inode body) takes its
+    // pages' validity with it; a surviving one keeps its bytes, and
+    // only the name moved.
+    let destroyed_target = target
+        .as_ref()
+        .filter(|target| target.inode_update.is_none())
+        .map(|target| target.ino);
     if let Some(target) = target {
         target.append_edits(&mut edits);
     }
 
     commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
+    if let Some(ino) = destroyed_target {
+        vol.bump_cache_generation(vol.fs_tree_id(), ino);
+    }
     Ok(())
 }
 
@@ -8078,11 +8102,21 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     }
     new_bucket = append_dir_item(Some(&new_bucket), new_name, &di)?;
     edits.push(Edit::Upsert(new_di_key, new_bucket));
+    // A destroyed destination (no surviving inode body) takes its
+    // pages' validity with it; a surviving one keeps its bytes, and
+    // only the name moved.
+    let destroyed_target = target
+        .as_ref()
+        .filter(|target| target.inode_update.is_none())
+        .map(|target| target.ino);
     if let Some(target) = target {
         target.append_edits(&mut edits);
     }
 
     commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
+    if let Some(ino) = destroyed_target {
+        vol.bump_cache_generation(vol.fs_tree_id(), ino);
+    }
     Ok(())
 }
 

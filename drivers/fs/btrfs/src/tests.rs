@@ -3358,6 +3358,136 @@ fn smoke_btrfs_mmap_identity_is_per_inode() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mmap_identity_is_per_inode);
 
+/// The btrfs half of the `mmap_cache_generation` contract (issue
+/// #680; the minix/FAT smokes of the same name are the shape): the
+/// generation lives in the shared core, keyed by (fs tree, inode),
+/// so every open of one file reports the same value and a mutation
+/// through any open — or the inode's destruction, or a create that
+/// recycles its number — moves it for all of them.
+fn smoke_btrfs_mmap_cache_generation_tracks_mutations() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let root = vol.root();
+
+    let file = match poll_once(root.create("gen.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create gen.dat failed"),
+    };
+    if !matches!(poll_once(file.write(0, b"hello")), Some(Ok(5))) {
+        return TestResult::Fail("write gen.dat failed");
+    }
+    let g0 = match file.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("regular file reports no cache generation"),
+    };
+    let reopened = match poll_once(root.lookup_async("gen.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second lookup gen.dat failed"),
+    };
+    if reopened.mmap_cache_generation() != Some(g0) {
+        return TestResult::Fail("two opens of one file disagree on generation");
+    }
+    if !matches!(poll_once(reopened.write(0, b"HELLO")), Some(Ok(5))) {
+        return TestResult::Fail("write through second open failed");
+    }
+    let g1 = file.mmap_cache_generation();
+    if g1 == Some(g0) || reopened.mmap_cache_generation() != g1 {
+        return TestResult::Fail("write through a second open did not invalidate");
+    }
+    if !matches!(poll_once(file.truncate(1)), Some(Ok(()))) {
+        return TestResult::Fail("truncate failed");
+    }
+    let g2 = file.mmap_cache_generation();
+    if g2 == g1 || g2.is_none() {
+        return TestResult::Fail("truncate did not move the generation");
+    }
+    // Grow back out, then punch a hole: fallocate moves it too.
+    if !matches!(poll_once(file.truncate(8192)), Some(Ok(()))) {
+        return TestResult::Fail("grow truncate failed");
+    }
+    let g3 = file.mmap_cache_generation();
+    let punch = crate::write::FALLOC_FL_PUNCH_HOLE | crate::write::FALLOC_FL_KEEP_SIZE;
+    if !matches!(poll_once(file.fallocate(punch, 0, 4096)), Some(Ok(()))) {
+        return TestResult::Fail("fallocate punch failed");
+    }
+    if file.mmap_cache_generation() == g3 || file.mmap_cache_generation().is_none() {
+        return TestResult::Fail("fallocate punch did not move the generation");
+    }
+    // An unrelated file's generation does not move with gen.dat's.
+    let other = match poll_once(root.create("gen-other.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create gen-other.dat failed"),
+    };
+    let og = other.mmap_cache_generation();
+    if og.is_none() {
+        return TestResult::Fail("created file reports no cache generation");
+    }
+    if !matches!(poll_once(file.write(0, b"x")), Some(Ok(1))) {
+        return TestResult::Fail("second write failed");
+    }
+    if other.mmap_cache_generation() != og {
+        return TestResult::Fail("a write to one file moved another file's generation");
+    }
+    // A final unlink moves the generation for a node that still has
+    // the file open (the engine bumps when the last link drops).
+    let doomed = match poll_once(root.create("gen-doomed.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create gen-doomed.dat failed"),
+    };
+    if !matches!(poll_once(doomed.write(0, b"bye")), Some(Ok(3))) {
+        return TestResult::Fail("write gen-doomed.dat failed");
+    }
+    let dg = doomed.mmap_cache_generation();
+    if !matches!(poll_once(root.unlink("gen-doomed.dat")), Some(Ok(()))) {
+        return TestResult::Fail("unlink gen-doomed.dat failed");
+    }
+    if doomed.mmap_cache_generation() == dg || doomed.mmap_cache_generation().is_none() {
+        return TestResult::Fail("final unlink did not move the generation");
+    }
+    // Inode numbers are issued max+1: the next create reuses the
+    // highest freed number, and the recycled file must not inherit
+    // its predecessor's generation.
+    let victim = match poll_once(root.create("gen-last.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create gen-last.dat failed"),
+    };
+    let victim_ino = victim.ino();
+    let vg = match victim.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("gen-last.dat reports no cache generation"),
+    };
+    if !matches!(poll_once(root.unlink("gen-last.dat")), Some(Ok(()))) {
+        return TestResult::Fail("unlink gen-last.dat failed");
+    }
+    let recycled = match poll_once(root.create("gen-recycled.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create gen-recycled.dat failed"),
+    };
+    if recycled.ino() != victim_ino {
+        return TestResult::Fail("inode number was not recycled; test premise broken");
+    }
+    if recycled.mmap_cache_generation() == Some(vg) {
+        return TestResult::Fail("recycled inode inherited its predecessor's generation");
+    }
+    // A directory is not a cacheable file.
+    let dir = match poll_once(root.lookup_async("subdir")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup subdir failed"),
+    };
+    if dir.mmap_cache_generation().is_some() {
+        return TestResult::Fail("directory reports a cache generation");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_mmap_cache_generation_tracks_mutations
+);
+
 fn smoke_btrfs_write_rejections() -> TestResult {
     use narf_filesystem::{FsError, FsInstance};
     let vol = match mount_fixture() {
