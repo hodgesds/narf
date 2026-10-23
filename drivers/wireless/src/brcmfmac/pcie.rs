@@ -273,30 +273,63 @@ pub fn register_pci_driver() {
     }
 }
 
+/// BDF ownership decision for `probe`, kept pure for fixture coverage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Ownership {
+    /// This probe claimed the BDF and must bring the device up.
+    New,
+    /// The BDF is already owned by an earlier successful probe.
+    Existing,
+    /// Another BDF owns the single-instance slot; park this device.
+    Extra,
+}
+
+pub(super) fn claim_bdf(
+    owner: &mut Option<narf_bus::BusAddr>,
+    address: narf_bus::BusAddr,
+) -> Ownership {
+    match *owner {
+        Some(owned) if owned == address => Ownership::Existing,
+        Some(_) => Ownership::Extra,
+        None => {
+            *owner = Some(address);
+            Ownership::New
+        }
+    }
+}
+
+/// Release a claim recorded by `claim_bdf` after a failed bring-up, so a
+/// later probe can retry the device instead of finding it owned forever.
+/// A mismatched address leaves the current owner's claim untouched.
+pub(super) fn release_bdf(owner: &mut Option<narf_bus::BusAddr>, address: narf_bus::BusAddr) {
+    if *owner == Some(address) {
+        *owner = None;
+    }
+}
+
 /// Probe entry — called by `narf-bus::driver_match` when a Broadcom
 /// vendor/device pair we registered for surfaces.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    let extra = {
-        let mut owner = OWNED.lock();
-        match *owner {
-            Some(address) if address == device.addr => return Ok(()),
-            Some(_) => true,
-            None => {
-                *owner = Some(device.addr);
-                false
-            }
+    match claim_bdf(&mut OWNED.lock(), device.addr) {
+        Ownership::Existing => return Ok(()),
+        Ownership::Extra => {
+            park_command(&device, &cap, false).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+            return Ok(());
         }
-    };
-    if extra {
-        park_command(&device, &cap, false).map_err(|_| narf_bus::ProbeError::BadDevice)?;
-        return Ok(());
+        Ownership::New => {}
     }
 
     // SAFETY: caller hands us exclusive BusDeviceCap authority for
     // this device's cfg + BARs.
     let mut dev = match unsafe { bring_up(device, cap) } {
         Ok(d) => d,
-        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
+        Err(_) => {
+            // Bring-up failed: drop the claim so the failure is not
+            // reboot-only — a later probe may retry this device, and a
+            // second Broadcom device is no longer parked behind it.
+            release_bdf(&mut OWNED.lock(), device.addr);
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
     };
 
     super::native_runtime::start(&mut dev);
