@@ -54,13 +54,14 @@ memory-window ownership and do not use this control-register path.
   recycler shared by independent queues.
 - The primary virtio-net interface advertises TX checksum offload only after
   negotiating `VIRTIO_NET_F_CSUM`, and IPv4/TCP TSO only after additionally
-  negotiating `VIRTIO_NET_F_HOST_TSO4`. `VIRTIO_NET_F_HOST_TSO4` is
-  currently not negotiated (#703: the TSO transmit path wedges under bulk
-  load; #704 tracks root-causing it before re-enabling). A requested offload that was not
+  negotiating `VIRTIO_NET_F_HOST_TSO4`. A requested offload that was not
   negotiated, is malformed, needs VLAN insertion, or exceeds the bounded
   64-KiB TX DMA frame is rejected before descriptor publication. The driver
-  honors the frame-ring `TxMeta::more` batching hint while forcing a notify at
-  a full TX ring or an explicit flush boundary.
+  honors the frame-ring `TxMeta::more` batching hint while checking for a notify
+  at an exhausted TX buffer pool, a full TX ring, or an explicit flush boundary.
+  Copy-path TX buffer acquisition reclaims completed descriptors before
+  reporting an empty pool, allowing the stack's copy fallback to recover even
+  after its zero-copy pool is exhausted.
 - The primary virtio-net interface opts into the kernel stack's
   per-interface software GRO stage. Every RX forwarder flushes the current
   CPU's held flows after its queue drains and before it parks; secondary
