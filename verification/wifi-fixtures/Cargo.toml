@@ -1,0 +1,24 @@
+[package]
+name = "narf-wifi-fixtures"
+description = "Deterministic AP and DHCP peers for wireless driver conversation tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# These fixtures use the kernel's network/crypto types and register with the
+# kernel-test runner; their dependency graph needs the kernel linker symbols.
+test = false
+doctest = false
+
+[dependencies]
+narf-net = { path = "../../net" }
+narf-wireless = { path = "../../wireless" }
+narf-crypto = { path = "../../crypto" }
+narf-kernel-test = { path = "../kernel-test" }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true

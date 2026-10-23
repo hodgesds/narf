@@ -42,7 +42,7 @@ builtin = [
     "dep:narf-arch", "dep:narf-bus", "dep:narf-capabilities",
     "dep:narf-console", "dep:narf-driver-runtime", "dep:narf-drivers",
     "dep:narf-firmware", "dep:narf-interrupts", "dep:narf-io", "dep:narf-ipc",
-    "dep:narf-kernel-test", "dep:narf-lib", "dep:narf-memory", "dep:narf-net",
+    "dep:narf-kernel-test", "dep:narf-wifi-fixtures", "dep:narf-lib", "dep:narf-memory", "dep:narf-net",
     "dep:narf-scheduler", "dep:narf-time", "dep:narf-wireless", "dep:narf-crypto", "dep:zeroize",
 ]
 # Module: NO kernel crates. The only undefined symbols in the `.ko` are the
@@ -68,6 +68,7 @@ narf-interrupts   = { path = "../../../interrupts", optional = true }
 narf-io           = { path = "../../../io", optional = true }
 narf-ipc          = { path = "../../../ipc", optional = true }
 narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
+narf-wifi-fixtures = { path = "../../../verification/wifi-fixtures", optional = true }
 narf-lib          = { path = "../../../lib", optional = true }
 narf-memory       = { path = "../../../memory", optional = true }
 narf-net          = { path = "../../../net", optional = true }

@@ -150,9 +150,20 @@ silicon, reset/recovery and PM remain software work. These gates
 cannot be closed by physical testing alone. No physical device validation is
 part of the current software-only work.
 
+The shared A2 conversation kit now supplies a reactive legacy Open/WPA2 AP
+and a transaction-bound DHCP peer. MT76 uses the shared management/EAPOL peer;
+ath11k's native TCL/REO-ring model and CYW's SDPCM/BDC FullMAC model reuse its
+DHCP server. All three compose association to a lease and exact bidirectional
+Ethernet data. CYW's WPA2 proof is firmware-offloaded key completion; it does
+not simulate firmware-internal crypto. The fixtures also cover controlled-port
+closure, real carrier metadata and interface-local IPv4 binding retirement.
+This work publishes missing MT76/CYW carrier changes and prevents removed
+interfaces from leaving their IPv4 address/gateway/DNS behind for name reuse.
+It does not close the remaining driver stages or establish physical acceptance.
+
 The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
-wireless, crypto and ARM RNG QEMU gates: x86_64 reports 1822 pass / 0 fail /
-10 skip; aarch64 reports 1124 pass / 0 fail / 3 skip.
+wireless, network, crypto, RNG and shared-fixture QEMU gates: x86_64 reports
+2597 pass / 0 fail / 10 skip; aarch64 reports 1895 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.

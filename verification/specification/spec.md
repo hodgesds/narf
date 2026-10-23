@@ -42,6 +42,23 @@ and user-mode configurations run when their inputs are affected or the plan
 requires full coverage. The primary selected run still performs the normal
 production boot and host interoperability postflight.
 
+Wi-Fi conversation fixtures share the no_std `narf-wifi-fixtures` kit in
+`verification/wifi-fixtures`. Its `FakeAp` exchanges legacy 2.4-GHz Open or
+WPA2-PSK/CCMP authentication, association and EAPOL frames; phase, peer,
+fragment, replay and MIC checks gate authorization. `DhcpServer` provides an
+initial lease only after a MAC- and transaction-correlated DISCOVER/REQUEST,
+checking Ethernet/IPv4/UDP framing and control options. `NetworkPlan` defines
+the expected address, mask, gateway, DNS and duration; `udp_ipv4` builds test
+data. The kit has no device, driver-registration or carrier authority.
+Driver adapters retain native RX/TX framing, completions and controlled-port
+admission. MT76 and ath11k compose production station/security paths through a
+lease and exact bidirectional Ethernet data; ath11k retains its x86_64 native
+ring fixture. CYW composes its FullMAC path on both architectures, with WPA2
+explicitly represented by firmware key-completion events. Kernel-test-only
+codec/peer negatives run on both architectures; these kernel-dependent types
+are not a host test executable and none of these checks establish RF or real
+firmware/silicon acceptance.
+
 | Category        | Runs on       | Who gates | What it protects against                     |
 | --------------- | ------------- | --------- | -------------------------------------------- |
 | Unit            | host          | every PR  | pure-logic regressions in a single module    |

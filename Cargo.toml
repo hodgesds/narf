@@ -21,6 +21,7 @@ members = [
     "verification",
     "verification/busybox",
     "verification/kernel-test",
+    "verification/wifi-fixtures",
     "bpf",
     "bpf/bench",
     "bpf/btf",
