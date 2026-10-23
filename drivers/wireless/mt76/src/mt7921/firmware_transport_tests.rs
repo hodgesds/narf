@@ -2577,3 +2577,8 @@ kernel_test_in!(
     "drivers/wireless/mt7921/join",
     mt76_rekey_nonce_failure_closes_authorization_before_reply
 );
+
+/// Association → carrier → DHCP composition (Wi-Fi program A1,
+/// issue #706): the net-stack half of the station fixtures.
+#[path = "dhcp_composition_tests.rs"]
+mod dhcp_composition;
