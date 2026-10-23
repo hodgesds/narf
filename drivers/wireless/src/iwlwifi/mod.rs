@@ -13,8 +13,10 @@
 //! command profile targets Sc/BE211 firmware. Unsupported command
 //! versions fail startup explicitly. Gen2 has a retained API77 context-v1
 //! boot owner with RFH/TFH commands and NVM initialization. Native station
-//! admission, scan, configuration, and association stay gated until the
-//! remaining MVM station lifecycle is implemented.
+//! admission and association stay gated until the remaining MVM station
+//! lifecycle is implemented. The retained boot owner supports force-passive
+//! scanning after optional DQA/current-MCC and actual idle MLD MAC/link
+//! preparation selected from the installed API77 command profile.
 //!
 //! The station path supports 2.4/5 GHz legacy-rate Open or WPA2-PSK/CCMP
 //! networks. Firmware supplies channel/antenna data and enforces its

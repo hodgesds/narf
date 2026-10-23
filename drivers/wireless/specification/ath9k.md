@@ -34,12 +34,15 @@ AR9285-specific writes follow a checked silicon revision.
 - `Ath9k::baseband` reports `BasebandPrepared`: the 2412 MHz reference
   frequency, selected EEPROM high-power gain/SYNTH9 XE2 variant and count
   of programmed INI rows. Successful preparation also applies normalized
-  EEPROM modal/RF board values and the interpolated detector/PDADC table.
+  EEPROM modal/RF board values, the interpolated detector/PDADC table, and
+  legacy20 CCK/OFDM/HT20 target-power registers limited by factory CTL and
+  an explicit zero-dBm ceiling.
   It records inactive register preparation, not channel authorization or
   a calibrated/operational PHY.
 - Errors distinguish absent/mismatched silicon, timeout, invalid EEPROM
   magic/length/checksum/version, invalid factory identity and
-  `BadCalibration` for malformed or unusable detector intercepts.
+  `BadCalibration` for malformed or unusable detector intercepts, target
+  power piers, CTL edges or unsupported factory regulatory identity.
 
 The former reset-only `Ath9k::new` constructor is removed. Construction
 goes through the PCI authority and identification path. Successful probe
@@ -57,7 +60,17 @@ The detector stage selects the factory PD gains, interpolates frequency-pier
 power/VPD intercepts, and programs the gain boundaries and all 128 PDADC
 entries. The complete bounded calibration plan is validated before its first
 register write; EEPROM versions before minor 2 retain the hardware overlap
-source. This stage does not program regulatory CTL or per-rate transmit power.
+source.
+The rate stage interpolates the three factory target-power pier tables,
+applies the exact factory CCK/OFDM/HT20 CTL edge rules and antenna-gain
+reduction, and programs the six rate-power words with the AR5416 table
+offset. World SKUs take the minimum across matching regulatory groups.
+The PCI probe passes a zero-dBm ceiling and keeps per-packet TPC disabled;
+this inactive reference preparation grants no transmit permission. Values
+are planned and validated before any rate-register write, and antenna
+reduction saturates rather than wrapping an unsigned zero ceiling upward.
+The pure immutable factory-domain resolver/table is shared with ath10k;
+no firmware transport or runtime driver is used to resolve EEPROM identity.
 
 Native register reads and writes validate complete aligned BAR extents and
 execute inside `Cap::invoke`; revoked reads return all ones, revoked writes
@@ -114,7 +127,19 @@ Detector fixtures compare every register write with independently compiled
 Linux `eeprom.c` interpolation and `eeprom_4k.c` table-programming functions.
 They cover one/two gains, exact/interpolated/clamped frequency piers, legacy
 overlap sourcing, invalid calibration without partial table publication, and
-the actual INI/modal/detector preparation chain with PHY and DMA disabled.
+the actual INI/modal/detector/rate preparation chain with PHY and DMA disabled.
+Rate fixtures compile the complete Linux target-power and 4K TX-power
+generators and compare every rate-register value across exact/interpolated/
+clamped piers, CTL flags, specific/world regulatory groups, antenna gain and
+zero ceiling. All 65,536 EEPROM identifiers match an independent native C
+initial-CTL oracle. Actual object-table revocation before invalid native
+register addresses prevents rate publication; refusal during programming
+stops later writes.
+The reproducible `phy/rates/make_linux_oracle.py` and
+`make_regulatory_oracle.py` retain complete native C functions, generated
+artifacts and source/function SHA256 provenance; `phy/rates/ORACLE.md`
+documents usage and all nine rate cases. They compare existing literals and
+exhaustive hashes without rewriting expected values.
 They do not prove RF or packet operation.
 
 ## 8. Remaining software and physical acceptance
@@ -122,8 +147,9 @@ They do not prove RF or packet operation.
 Software still required before AR9285 is ready for physical Wi-Fi testing:
 
 1. Complete the partially prepared PHY: channel-mode overrides, chain
-   masks and delta slope/spur handling, power/antenna policy, CTL and
-   per-rate power limits, noise-floor/IQ/PA calibration and regulatory limits.
+   masks and delta slope/spur handling, authenticated power/antenna/channel
+   policy, noise-floor/IQ/PA calibration and current regulatory limits.
+   Initial factory CTL/rate preparation does not implement those live rules.
    The fixed inactive reference synth setting does not implement channel
    switching or radio activation. PCIe power-save/PM setup also remains.
 2. Real TX queue/RX descriptor allocations and DMA ownership, IRQ service,

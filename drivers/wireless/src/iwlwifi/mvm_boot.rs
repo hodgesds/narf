@@ -9,6 +9,8 @@ pub enum Phase {
     New,
     Starting,
     Configured,
+    Scanning,
+    Failed,
 }
 pub struct Owner {
     hardware: Hardware,
@@ -17,6 +19,8 @@ pub struct Owner {
     phase: Phase,
     mac: Option<[u8; 6]>,
     nvm: Option<Nvm>,
+    beacons: Vec<super::connection::Beacon>,
+    scan: scan::ScanContext,
 }
 impl core::fmt::Debug for Owner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -63,6 +67,8 @@ impl Owner {
             phase: Phase::New,
             mac: None,
             nvm: None,
+            beacons: Vec::new(),
+            scan: scan::ScanContext::new(&parsed.api),
         })
     }
     pub fn phase(&self) -> Phase {
@@ -97,6 +103,7 @@ impl Owner {
         }
         let packet = self.hardware.command(0xc, 2, &[0; 4]).await?;
         let nvm = Nvm::parse(4, &packet.payload)?;
+        self.scan.nvm_lar = u32::from_le_bytes(packet.payload[20..24].try_into().unwrap()) != 0;
         let defaults = configuration(self.profile);
         self.hardware
             .command(1, 0x98, &nvm.tx_chains.to_le_bytes())
@@ -108,9 +115,8 @@ impl Owner {
         // Queue0 is already described by context-v1. Additional RX queues/RSS and
         // their PRPH allocations remain disabled in this single-queue boot profile.
         self.hardware.command(1, 0x77, &[0; 4]).await?;
-        self.hardware
-            .command(1, 0xc, &super::station_api::scan_config(&nvm))
-            .await?;
+        // DQA/LAR and the idle station MAC are owned by the scan preparation
+        // transaction. SCAN_CFG is sent there after those prerequisites.
         self.mac = Some(mac);
         self.nvm = Some(nvm);
         self.phase = Phase::Configured;
@@ -146,3 +152,6 @@ fn configuration(profile: Profile) -> Configuration {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mvm_boot_tests.rs"]
 mod tests;
+
+#[path = "mvm_scan.rs"]
+mod scan;

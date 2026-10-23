@@ -1,0 +1,26 @@
+{
+  "extracted_function_sha256": {
+    "ath9k_hw_4k_set_txpower": "f720a6794076574c72e6c0d9e54f919c2b70876a8f59f41cdcde8059972d3ed0",
+    "ath9k_hw_fbin2freq": "ab488df35153bd98ac56bf6bed4220ec45083f34c05b512182d29124279c7dfa",
+    "ath9k_hw_fill_vpd_table": "3197e8ca17e1f624bbb200894ce585ebc1d516f69b1efdefd99ab7e3dcbbb952",
+    "ath9k_hw_get_gain_boundaries_pdadcs": "ac3a82dcdbc071d50d438e74527dda9528ac1bb937ef3370beb2581ab37de7ff",
+    "ath9k_hw_get_legacy_target_powers": "cb44fe2eec72b2e733d6b669c91167eb750c0719621b3401b73b9aecb431214a",
+    "ath9k_hw_get_lower_upper_index": "8e945a0cb8b560745f929ba3e83a1ee2dde49291a0ec92f30cd4a502a1959cbb",
+    "ath9k_hw_get_max_edge_power": "690a4627b32b0e231eef2af8da68c65c60620552c79ff106b25b7fcb32d4dd7c",
+    "ath9k_hw_get_target_powers": "c01f66acb5c49d0554a7c9c07089e97ae4f863e2e550caac62535c27fa321abe",
+    "ath9k_hw_interpolate": "2a84758eb273e79722d7a1ed8af5f48d685c9343fc9868ba1af89fa38c357100",
+    "ath9k_hw_set_4k_power_cal_table": "762716c7509d245d75a1a2c075bee16099b4c7a1ad74aef29712fa7ba97e044c",
+    "ath9k_hw_set_4k_power_per_rate_table": "cc7f644d31ecee243d60fe2d7627b447bbbc90661910bb2c0fee6a5bccf750a5"
+  },
+  "extraction": "Complete native C function bodies after mechanical comment removal; native packed structs and register/EEPROM macro dependencies.",
+  "reference": "local Linux drivers/net/wireless/ath/ath9k",
+  "sources": {
+    "ar9002_phy.h": "d2cceaa4340087d8bd961f9704d4361d9e22e737d038076294f1b172deb8f5fd",
+    "eeprom.c": "c32f68d69d322709288572be6312c8b0fc2590a044c5e3667c555b6397ed1d2f",
+    "eeprom.h": "b6bc5f1bffd56f5b8828d14635eac4846487ff6f2ef06344d474ac4c1c11b7b0",
+    "eeprom_4k.c": "c14f741663cf27677838d1a62219b1de1f864473606bc7160e66831ed2d70277",
+    "hw.h": "95498a7e664cf66e99edcdfa9225a147ec4bb77b0458bfb726b5b0c26c1ebe85",
+    "phy.h": "edab45a51cfa37c1226a90d59d1f7474a65758802518b0d00f6e34fd93ddddf2",
+    "reg.h": "629a6df177d63b2a99202ab97a3641c488b5f1ac738f6f15612c7b4ebacebade"
+  }
+}

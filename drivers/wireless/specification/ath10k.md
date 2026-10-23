@@ -66,7 +66,10 @@ packet service are not yet attached.
 - `regulatory::Factory::from_eeprom` resolves the bounded SERVICE_READY
   factory EEPROM identity through Linux's pair/country/CTL tables, including
   exact sanitization and roaming-bit handling. Its country is descriptive,
-  never host transmit authority.
+  never host transmit authority. `Factory` and `FactoryError` are reexports
+  of the common immutable Qualcomm resolver, also used by ath9k; unknown or
+  oversized identifiers return `FactoryError::Unsupported`. Internal station
+  permission construction maps that error to its existing unsupported error.
 - `pci::prepare_station(bssid, frequency_mhz)` prepares one native station
   context selected from the last successful passive-scan cache. It requires
   the installed authenticated host regulatory policy; initial geometry is

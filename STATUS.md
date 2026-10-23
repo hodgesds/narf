@@ -71,7 +71,9 @@ All eleven in-tree families are covered by the current audit and dependency
 ledger in `drivers/wireless/specification/spec.md` and its family documents.
 Intel now sends versioned coexistence, SoC latency and awake-power setup.
 A retained Gen2 context-v1/RFH/TFH boot owner now covers APM, ALIVE6, unified
-NVM and MVM post-init configuration; the Gen2 scan/station lifecycle remains
+NVM and MVM post-init configuration. Its API77 passive-scan owner now composes
+current signed host policy, fresh MCC/LAR, conditional DQA, versioned MAC/link
+receipts and scan15 channel records; automatic Gen2 station admission remains
 gated. Host nonce and SAE paths require fallible hardware entropy instead of
 the old timing seed; validated RSNA M1 renewal alone requests a fresh SNonce.
 Full system entropy-pool/health services remain open.
@@ -100,8 +102,10 @@ and bounded progress under unrelated-event floods.
 PFC events, security/decapsulation, remaining WMI MLME and station attachment
 remain software work.
 Ath9k programs AR9285 inactive PHY/PLL/RF INI, EEPROM modal and PDADC detector
-tables with current-capability register access; CTL/rate power, analog calibration
-and packet/station ownership remain open. Ath11k QCA6390 has its native
+tables with current-capability register access. Factory CTL edges and target
+power now bound the rate-power registers under an explicit zero-dBm ceiling;
+analog calibration and packet/station ownership remain open. Ath11k QCA6390 has
+its native
 IPQ8074 RX path and four-vdev resources; QCN9074 remains gated.
 Realtek has per-family identity/power work, a retained RTL8188EU factory/FIFO/
 firmware/MAC/BB/RF/LLT plus LC/IQK worker and bounded native RTW89 TX ownership.
@@ -141,8 +145,8 @@ cannot be closed by physical testing alone. No physical device validation is
 part of the current software-only work.
 
 The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
-wireless, crypto and ARM RNG QEMU gates: x86_64 reports 1782 pass / 0 fail /
-10 skip; aarch64 reports 1084 pass / 0 fail / 3 skip.
+wireless, crypto and ARM RNG QEMU gates: x86_64 reports 1796 pass / 0 fail /
+10 skip; aarch64 reports 1098 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.

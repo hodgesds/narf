@@ -9,6 +9,7 @@ pub mod brcmfmac;
 pub mod cyw43439;
 pub mod iwlwifi;
 mod qualcomm_pci;
+mod qualcomm_regulatory;
 pub mod rtl8xxxu;
 pub mod rtlwifi;
 pub mod rtw88;

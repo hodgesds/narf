@@ -50,6 +50,7 @@ fn smoke_ath9k_live_baseband_uses_linux_ini_and_eeprom_gain() -> TestResult {
             }
         }
 
+        rate_oracle::configure(&mut image);
         let status = prepare(&mut io, &image).unwrap();
         let first = io
             .writes
@@ -128,8 +129,9 @@ mod detector_oracle {
 
 fn smoke_ath9k_ini_modal_detector_composition_stays_inactive() -> TestResult {
     let mut io = Io::default();
-    let image = detector_oracle::image().try_into().unwrap();
-    if prepare(&mut io, image).is_err() {
+    let mut image: [u8; EEPROM_4K_BYTES] = detector_oracle::image().try_into().unwrap();
+    rate_oracle::configure(&mut image);
+    if prepare(&mut io, &image).is_err() {
         return TestResult::Fail("INI/modal preparation did not reach detector table programming");
     }
     let Some(boundary) = io.writes.iter().rposition(|&(r, _)| r == 0xa26c) else {
@@ -149,7 +151,13 @@ fn smoke_ath9k_ini_modal_detector_composition_stays_inactive() -> TestResult {
             .iter()
             .zip(&expected[4..])
             .any(|(&(r, v), e)| [r as u32, v] != *e)
-        || io.writes[end..] != [(0x981c, 0), (0x24, 0), (0x8, 0x20)]
+        || io.writes.get(end..end + 7).is_none_or(|actual| {
+            actual
+                .iter()
+                .zip(rate_oracle::writes())
+                .any(|(&(r, v), e)| [r as u32, v] != *e)
+        })
+        || io.writes[end + 7..] != [(0x981c, 0), (0x24, 0), (0x8, 0x20)]
         || io.regs[&0x8048] & 0x02000020 != 0x02000020
     {
         return TestResult::Fail("composed INI/modal/detector writes differ or activate PHY/DMA");
@@ -160,3 +168,15 @@ kernel_test_in!(
     "drivers/wireless/ath9k/phy",
     smoke_ath9k_ini_modal_detector_composition_stays_inactive
 );
+
+#[allow(dead_code)]
+mod rate_oracle {
+    include!("rates/golden.rs");
+    pub(super) fn configure(image: &mut [u8; super::EEPROM_4K_BYTES]) {
+        image[8..10].copy_from_slice(&[0x64, 0]);
+        image[183..375].copy_from_slice(&RATE_EEPROM_6[183..375]);
+    }
+    pub(super) fn writes() -> &'static [[u32; 2]] {
+        RATE_GOLDEN_6
+    }
+}

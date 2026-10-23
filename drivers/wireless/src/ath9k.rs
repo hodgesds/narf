@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! AR9285 PCIe reset, EEPROM identity and inactive INI/PLL/RF preparation.
-//! Linux ath9k is the reference. Modal/RF and detector table values are applied; CTL/rate power and calibration,
-//! PHY activation and packet DMA remain open.
+//! Linux ath9k is the reference. Modal/RF, detector and factory CTL/rate
+//! tables are prepared at a zero-dBm ceiling; calibration, PHY activation
+//! and packet DMA remain open.
 
 use core::fmt::Write as _;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};

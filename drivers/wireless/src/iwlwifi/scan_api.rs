@@ -44,9 +44,16 @@ pub fn passive(version: u8, uid: u32, channels: &[u8]) -> Result<Vec<u8>, &'stat
         let start = 48 + i * 8;
         // Modern channel flags use PHY_BAND_24=1, PHY_BAND_5=0
         // (opposite the legacy scan v2 band's numbering).
-        put32(&mut out, start, if channel <= 14 { 1 << 30 } else { 0 });
+        let band = u8::from(channel <= 14);
+        if version < 17 {
+            // SCAN_CHANNEL_CONFIG v2: band is the byte after channel.
+            out[start + 5] = band;
+        } else {
+            // v5 moves band into flags and reuses that byte for PSD.
+            put32(&mut out, start, u32::from(band) << 30);
+            out[start + 5] = 127; // PSD reserved
+        }
         out[start + 4] = channel;
-        out[start + 5] = 127; // PSD reserved
         out[start + 6] = 1; // one iteration
     }
     out[periodic + 2] = 1;

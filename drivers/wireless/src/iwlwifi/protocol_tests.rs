@@ -319,7 +319,7 @@ kernel_test_in!(
 
 fn smoke_active_scan_segments_and_channel_permissions() -> TestResult {
     let local = [2, 1, 2, 3, 4, 5];
-    for (version, capacity) in [(14, 67), (17, 67), (18, 68)] {
+    for (version, capacity) in [(14, 67), (15, 67), (16, 67), (17, 67), (18, 68)] {
         let ssids = vec![b"hidden".to_vec(), Vec::new()];
         let command = scan_api::active(
             version,
@@ -332,10 +332,24 @@ fn smoke_active_scan_segments_and_channel_permissions() -> TestResult {
         .unwrap();
         let probe = 48 + capacity * 8 + 12;
         let data = probe + 20;
+        // Linux mvm/scan.c::iwl_mvm_umac_scan_cfg_channels_v7 uses
+        // the channel's band byte through request16; request17 moves
+        // band to flags[31:30] and leaves byte5 for reserved PSD.
+        let channels = if version < 17 {
+            [
+                3, 0, 0, 0, 1, 1, 1, 0, // active 2.4GHz, SSID bitmap3
+                3, 0, 0, 0, 36, 0, 1, 0, // active 5GHz, SSID bitmap3
+                0, 0, 0, 0, 52, 0, 1, 0, // denied probe remains passive
+            ]
+        } else {
+            [
+                3, 0, 0, 64, 1, 127, 1, 0, // 2.4GHz band in flags
+                3, 0, 0, 0, 36, 127, 1, 0, // 5GHz band in flags
+                0, 0, 0, 0, 52, 127, 1, 0, // denied probe remains passive
+            ]
+        };
         if command[8..10] != [2, 0]
-            || command[48..52] != ((1u32 << 30) | 3).to_le_bytes()
-            || command[56..60] != 3u32.to_le_bytes()
-            || command[64..68] != [0; 4]
+            || command[48..72] != channels
             || command[probe..probe + 4] != [0, 0, 26, 0]
             || command[data..data + 2] != [0x40, 0]
             || command[data + 4..data + 10] != [0xff; 6]

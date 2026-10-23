@@ -30,6 +30,10 @@ impl Fixture {
                 phase: Phase::Starting,
                 mac: None,
                 nvm: None,
+                beacons: Vec::new(),
+                scan: super::scan::ScanContext::new(
+                    &super::super::firmware_api::FirmwareApi::default(),
+                ),
             }),
             firmware,
         }
@@ -77,7 +81,6 @@ fn smoke_iwl_mvm_boot_defaults_native_command_receipts() -> TestResult {
             (0x9b, 1, vec![]),
             (1, 2, vec![]),
             (0x77, 1, vec![]),
-            (12, 1, vec![]),
         ]
         .into_iter()
         .enumerate()

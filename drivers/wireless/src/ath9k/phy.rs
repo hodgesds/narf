@@ -98,7 +98,10 @@ fn prepare(
     );
     modal::prepare(io, image, false, false)?;
     power::program(io, image, 2412)?;
-    // Leave PHY, interrupts and packet engines disabled. CTL/rate-power
+    // Inactive reference preparation supplies no positive transmit budget.
+    // A later channel owner must bind live host policy before activation.
+    rates::program(io, image, 2412, 0)?;
+    // Leave PHY, interrupts and packet engines disabled. Live channel/power
     // policy and analog calibration must precede activation.
     io.write32(0x981c, 0);
     io.write32(0x24, 0);
@@ -124,5 +127,6 @@ pub(super) fn program(
 
 mod modal;
 mod power;
+mod rates;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

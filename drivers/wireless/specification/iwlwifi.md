@@ -87,7 +87,7 @@ acceptance gates and are not enabled by this profile's station tests.
 - **Stage 2**: CSR/PRPH mapping + APM init + ucode header parsing.
 - **Stage 3**: Owned Gen3 firmware loading and DMA ALIVE handshake. Gen2
   context-v1/RFH/TFH and retained API77 MVM boot ownership are implemented;
-  MVM station context/security/scan lifecycle remains an explicit software dependency.
+  MVM station context/security/recovery lifecycle remains an explicit software dependency.
 - **Stage 4**: Interface traits, IPC ring integration, background
   RX/TX pumps, and the MLD station scan/association/data implementation.
 - **Stage 5 (In progress)**: First hardware boot/ALIVE, firmware init,
@@ -166,8 +166,9 @@ A separate Gen2 owner implements the context-v1 transport for exact AX200
 2723 and AX201 02f0/43f0/a0f0 MAC/RF profiles. It selects Linux's CC/Qu/QuZ
 firmware prefix from discovered identity and requires API77 and the negotiated
 ALIVE6/NVM4 command profile. Native automatic admission remains closed: MVM
-station MAC/PHY/binding, rate/key/Block-Ack, scan and recovery lifecycle still
-need integration before a Gen2 interface can be published.
+station PHY/binding, rate/key/Block-Ack and recovery lifecycle still need
+integration before a Gen2 interface can be published. The passive-scan owner
+creates its own idle MAC context but does not authorize station data.
 
 The transport retains its 1792-byte context, all LMAC/UMAC/paging sections,
 command ring and Qu RFH allocations. Context-v1 uses 8-byte page-address/tag
@@ -188,7 +189,8 @@ Nonzero SKU does not select the Gen3 external PNVM sequence.
 
 `mvm_boot::Owner` retains the exact transport and firmware sections through
 NVM/antenna discovery, BT coexistence, exact PCI SoC latency, continuously
-awake device power and scan configuration. Missing command versions/capabilities
+awake device power. Scan configuration is deferred until the scan owner has
+confirmed DQA and current LAR prerequisites. Missing command versions/capabilities
 fail before boot publication. It exposes identity only after all correlated
 firmware receipts. Failed or dropped initialization cannot reset/retry that
 owner; transport stop/fence/quarantine rules govern later destruction.
@@ -210,6 +212,56 @@ active PTK or replay state. Repeated M1 uses the retained response without
 resampling. Partial failing samples remain private and are zeroized. Independent
 key/replay fixtures cover failure, retry and cached retransmission; no timing
 seed is admitted for production nonces.
+
+### 3.6 Retained MVM passive-scan lifecycle
+
+The configured MVM boot owner scans through the same retained RFH/TFH resources.
+Its profile is selected from actual API77 AX200/AX201 firmware metadata: MLD MAC
+configuration, reduced SCAN_CFG5 and scan15. DQA enable is conditional on the
+firmware capability; the installed CC/Qu/QuZ images do not advertise it. The
+legacy MAC_CONTEXT command is not substituted for the advertised MLD MAC API.
+
+Before first scan, correlated receipts establish the idle MLD BSS-STA with the
+52-byte MAC_CONFIG payload, disabled beacon filtering, SF_INIT_OFF when not
+offloaded, a real 208-byte inactive LINK_CONFIG with PHY_INVALID and continuously
+awake MAC power. MAC0 and link0 therefore exist before scan uses reference0.
+No active PHY binding, peer, key or ordinary TX queue is implied. Missing or
+unsupported command/profile envelopes fail before preparation publication.
+
+When both EXT-NVM and firmware enable LAR, each scan first queries the current
+NVM/default regdomain using `ZZ` and the supported current-source selector. MCC
+v3/v4/v8 extent, status and count are checked. Current MCC is queried again on
+later scans; an earlier successful scan grants no lasting channel permission.
+MCC receipts precede SCAN_CFG and MAC/link preparation. The query chooses no
+country and grants no host transmit authority.
+
+Each scan also snapshots the existing trusted regulatory registry, whose native
+binding installs a signed deployment policy. Missing policy, unsupported NVM
+channels or absent complete 20MHz rule coverage fail before preparation I/O.
+Host policy and current firmware LAR both apply. DFS remains strictly passive;
+no probe template, host TX power or platform power/SAR policy is synthesized.
+
+SCAN_REQ14..16 encode the band in the channel record's band byte; versions17+
+move it to flags and use that byte for PSD. The actual API77 scan15 path uses
+the former layout. Every request uses firmware slot0 with FORCE_PASSIVE. Both
+the command receipt and exact UID0 successful terminal notification are required
+before reopening the slot or replacing cached BSS records. Cancellation,
+timeout, malformed terminal or preparation error keeps the owner closed.
+
+RX48 frames require checked CRC/security/fragment/header extents, native
+TA/BSSID/RA, a requested channel and bounded singleton SSID/RSNE/channel IEs.
+Original AP IE and RSNE bytes are retained unchanged. Work per poll and BSS
+cache size are bounded. Actual RAM/RFH/TFH fixtures cover native prerequisite
+receipts, optional DQA, current LAR denial/requery, completion before ACK,
+cancellation at each published prerequisite and successful scan reuse. Local
+policy fixtures use the same private admission path without global mutation.
+A retained C oracle compiled from actual Linux headers verifies complete
+MAC/link/SF/power/MCC and versioned channel packed geometry.
+
+These contracts do not enable Gen2 native PCI publication. Station PHY/binding,
+association management TX/RX, peer/rate/key/Block-Ack and controlled-port
+integration, authenticated platform power/SAR, owned recovery and PM remain
+software dependencies before a Gen2 netdev can be exposed.
 
 ## 4. References
 
