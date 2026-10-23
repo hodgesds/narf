@@ -12,7 +12,14 @@
 # (memory note narf-execve-same-binary-stale-argv) that breaks shell-driven
 # churn. It is a musl-PIE ELF against Alpine's own /lib/ld-musl, which NARF runs.
 #
-# Fully unprivileged: apk.static installs into a --root dir, mke2fs -d packs it.
+# apk.static installs into a --root dir and mke2fs -d packs it — but the
+# build itself NEEDS root: apk executes package install scripts by
+# chroot(2)-ing into the rootfs and chowns files to their packaged owners,
+# so an unprivileged run dies with "chroot: Operation not permitted" and
+# apk exit code 2 (#699 — this silently killed every nightly CI run,
+# which invokes this script as the unprivileged `runner` user). When
+# invoked non-root the script re-execs itself under sudo (passwordless on
+# GitHub-hosted runners); local root invocations are unaffected.
 #
 #   sh verification/data/musl-demo/REGEN_stress_rootfs.sh
 #   cargo xtask run-interactive --kasan --cmd chroot_run --expect STRESS-DONE
@@ -21,6 +28,17 @@
 # Requires: curl, tar, mke2fs (e2fsprogs >= 1.43 for `-d`), network to the
 # Alpine CDN. ~40 MiB image.
 set -e
+
+# apk needs CAP_SYS_CHROOT + CAP_CHOWN (see header). Escalate once,
+# before doing any work, so the whole build runs with one privilege
+# level; refuse loudly rather than failing mid-install like apk does.
+if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo "$0" "$@"
+    fi
+    echo "error: building the rootfs requires root (apk chroot scripts); re-run as root or install sudo" >&2
+    exit 1
+fi
 
 ALPINE=v3.21
 ARCH=x86_64
@@ -210,4 +228,10 @@ chmod +x "$RD/perfbench.sh"
 
 # Pack into an ext2 image (256 MiB, 1 KiB blocks).
 mke2fs -q -F -t ext2 -d "$RD" -b 1024 "$OUT" 262144
+# If we escalated via sudo, hand the image back to the invoking user so
+# later unprivileged steps (cargo, QEMU) in the same workspace don't
+# trip over a root-owned file in target/.
+if [ -n "${SUDO_USER:-}" ]; then
+    chown "$SUDO_USER" "$OUT"
+fi
 echo "built $OUT ($(du -h "$OUT" | cut -f1)); stress-ng+perf present"
