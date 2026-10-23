@@ -108,6 +108,9 @@ fn az(e: u8) -> u64 {
     BASE + (0x386 + 6 * u64::from(e)) * 4
 }
 impl Io for TmdsIo {
+    fn pause_wait(&self) -> bool {
+        self.inner.pause_wait()
+    }
     fn read(&mut self, at: u64) -> u32 {
         for e in 0..4u8 {
             if at == az(e) + 4 {
@@ -1408,6 +1411,10 @@ fn dcn401_hdmi_cancelled_freesync_packet_retains_timing_and_intent() -> TestResu
     let packet = crate::amdgpu_freesync::info_packet(&timing, range, true, true).unwrap();
     let drr = crate::amdgpu_freesync::drr(&timing, range).unwrap();
     e.io.inner.regs.insert(dio(1, 0x206c), 2);
+    // The VPG acknowledgement never arrives: park the publish wait
+    // instead of racing the guest wall clock, whose 500us deadline can
+    // expire inside a single poll under emulation.
+    e.io.inner.pause_wait = true;
     {
         let mut future = core::pin::pin!(e.set_freesync(1, Some(drr), packet));
         assert!(future
