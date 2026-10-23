@@ -266,10 +266,13 @@ demand-zero semantics. `MAP_NONBLOCK` suppresses prefaulting without changing
 VMA publication. No-hint private-anonymous placement first validates the
 address-space high-water candidate and falls back to the locked live-topology
 search when necessary; caller hints remain advisory. Anonymous
-`MAP_SHARED` mappings eagerly allocate zeroed frames whose unnamed ownership is
-tracked by cache-line-isolated, per-page reference shards. A creator reference
-keeps each page live until VMA publication or rollback completes; VMA and fork
-aliases take their own references, and the last alias unmap reclaims the page.
+`MAP_SHARED` mappings publish an unlinked lightweight shmem object, matching Linux's
+shmem-file model: mmap allocates no resident data pages, first access allocates
+and zeroes only the faulted page, and every alias at the same object offset sees
+the same frame. VMA splits and fork clone the mapping-held file reference; the
+last owner drop reclaims all resident pages. Blocking `MAP_POPULATE` and
+`MAP_LOCKED` prefault this sparse object, while `MAP_NONBLOCK` suppresses that
+work.
 Named and System V shared-memory objects retain the public-handle registry.
 Ordinary unlocked file-backed `MAP_PRIVATE` mappings likewise publish only
 VMA and file-owner metadata. First access reads exactly the faulting page into
@@ -365,6 +368,11 @@ exactly to the visited request prefix; as on Linux, a later hole does not undo
 flags already applied to earlier VMAs. A zero length is a successful no-op.
 Plain `mlock` publishes LOCKED before eagerly populating anonymous and
 file-demand pages, and population failure does not roll that flag back.
+Before each eager page fault, `mlock`, `mlock2(flags=0)`, and eager
+`mlockall(MCL_CURRENT)` perform Linux's O(1) `fatal_signal_pending(current)`
+check outside address-space locks. Pending SIGKILL stops population promptly so
+the syscall can reach return-to-user signal delivery; already-published LOCKED
+state remains visible, as for any other population failure.
 Malformed/wrapping range arithmetic returns `EINVAL`, an uncovered range
 returns `ENOMEM`, and eager-population failure returns `EAGAIN`.
 `mlock2(MLOCK_ONFAULT)` records LOCKED without populating lazy pages;

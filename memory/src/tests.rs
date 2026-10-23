@@ -9363,6 +9363,85 @@ fn smoke_memory_unmap_region_cycle_no_leak() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_unmap_region_cycle_no_leak);
 
+/// A split VMA punch can leave only extracted data frames in the deferred
+/// TLB quarantine: a neighbouring live mapping keeps the leaf page table
+/// attached, while the split fragments themselves are fully removed. The
+/// drain must not mistake that shape for an empty batch and leak the frames.
+/// stress-ng's mlock worker repeats exactly this 12 KiB map / middle-page
+/// lock / whole-range unmap sequence.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_split_punch_deferred_loose_frames_are_freed() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh user address space used only by this smoke.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = 0x0000_0080_0A00_0000u64;
+    let sentinel = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => {
+            core::mem::forget(a);
+            return TestResult::Skip("frame allocator drained");
+        }
+    };
+    if a.map_region(Region {
+        base: VirtAddr::new(base),
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); 3].into(),
+    })
+    .is_err()
+        || a.map_region(Region {
+            // Same 2 MiB page-table span: this leaf keeps that table attached
+            // when the three-page stressor range is punched.
+            base: VirtAddr::new(base + 0x10_000),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![sentinel].into(),
+        })
+        .is_err()
+    {
+        crate::free_frame(crate::PhysFrame::new(sentinel));
+        core::mem::forget(a);
+        return TestResult::Fail("test mappings were rejected");
+    }
+    // SAFETY: both regions belong to this live root.
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("materialize failed");
+    }
+    if a.mlock_range(VirtAddr::new(base + 0x1000), 0x1000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("middle-page mlock failed");
+    }
+    if a.punch_fixed(VirtAddr::new(base), 0x3000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("split punch failed");
+    }
+    let after_punch = crate::frame::stats().free;
+    a.flush_deferred();
+    let after_flush = crate::frame::stats().free;
+    let sentinel_live = a
+        .lookup(VirtAddr::new(base + 0x10_000))
+        .is_some_and(|region| region.phys.first().copied() == Some(sentinel));
+    core::mem::forget(a);
+
+    if after_flush < after_punch + 1 {
+        return TestResult::Fail("loose-only deferred batch leaked its data frame");
+    }
+    if !sentinel_live {
+        return TestResult::Fail("split punch disturbed the neighbouring mapping");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_split_punch_deferred_loose_frames_are_freed
+);
+
 /// The OOM reaper reclaims a private anonymous region's resident frames out
 /// from under a would-be victim, returns them to the pool, unmaps them, and is
 /// idempotent — a second reap frees nothing (so it never double-frees against
@@ -9405,9 +9484,9 @@ fn smoke_memory_reap_anonymous_reclaims_and_is_idempotent() -> TestResult {
     // the pool. Measure the delta across the reap to isolate the data frames
     // from the (leaked-on-forget) page-table overhead.
     let before_reap = crate::frame::stats().free;
-    let freed = a.reap_anonymous();
+    let freed = a.reap_anonymous_owned();
     let after_reap = crate::frame::stats().free;
-    if freed != pages {
+    if freed != crate::oom::ReapOutcome::Reaped(pages) {
         core::mem::forget(a);
         return TestResult::Fail("reap did not free every resident anonymous page");
     }
@@ -9417,7 +9496,7 @@ fn smoke_memory_reap_anonymous_reclaims_and_is_idempotent() -> TestResult {
     }
     // Idempotent: a second reap frees nothing (backing already zeroed), so it
     // cannot double-free against the victim's own teardown.
-    if a.reap_anonymous() != 0 {
+    if a.reap_anonymous_owned() != crate::oom::ReapOutcome::Reaped(0) {
         core::mem::forget(a);
         return TestResult::Fail("second reap double-counted freed frames");
     }
@@ -9437,6 +9516,68 @@ fn smoke_memory_reap_anonymous_reclaims_and_is_idempotent() -> TestResult {
 kernel_test_in!(
     "memory",
     smoke_memory_reap_anonymous_reclaims_and_is_idempotent
+);
+
+/// `mlock` prevents ordinary pressure reclaim, but it must not make a process
+/// immortal after the OOM killer has committed to SIGKILL. The OOM reaper
+/// therefore tears down private LOCKED backing.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_oom_reaper_reclaims_private_mlocked_pages() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let private_base = 0x0000_0080_0B20_0000u64;
+    let private_pages = 3usize;
+    let mut private_phys = alloc::vec::Vec::with_capacity(private_pages);
+    for _ in 0..private_pages {
+        match crate::alloc_frame() {
+            Ok(frame) => private_phys.push(frame.start_address()),
+            Err(_) => {
+                core::mem::forget(a);
+                return TestResult::Skip("frame allocator drained");
+            }
+        }
+    }
+    a.map_region(Region {
+        base: VirtAddr::new(private_base),
+        len: (private_pages as u64) * 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
+        phys: private_phys.into(),
+    })
+    .expect("map private locked region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("materialize failed");
+    }
+
+    if a.reap_anonymous_owned() != crate::oom::ReapOutcome::Reaped(private_pages) {
+        core::mem::forget(a);
+        return TestResult::Fail("OOM reaper did not free private mlocked pages");
+    }
+    // SAFETY: the root is live, and this is a read-only translation query.
+    if unsafe { translate_arch(a.root, VirtAddr::new(private_base)) }.is_some() {
+        core::mem::forget(a);
+        return TestResult::Fail("OOM reaper left a private mlocked page mapped");
+    }
+
+    // Remove the zeroed private metadata so ordinary AddressSpace teardown can
+    // reclaim the now-empty page tables without seeing live data backing.
+    if a.unmap_region(VirtAddr::new(private_base)).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("test cleanup could not unmap reaper fixtures");
+    }
+    drop(a);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_oom_reaper_reclaims_private_mlocked_pages
 );
 
 /// Build a fresh user AS with `pages` resident private-anonymous base pages
@@ -9538,9 +9679,10 @@ kernel_test_in!(
     smoke_memory_exit_reclaim_retires_unshared_mappings_only
 );
 
-/// A victim whose region lock is transiently held is REQUEUED (not dropped) by
-/// `reap_all`, then reaped once the lock is released — proving a transient
-/// `try_lock` failure never strands the victim's frames.
+/// A held region lock blocks direct reaping, and an unshared address space with
+/// an attached scheduler task remains queued until final detach. Passive Arc
+/// owners deliberately do not affect this proof. These are the two independent
+/// gates which keep shootdown from deadlocking an IRQ-disabled lock waiter.
 #[cfg(target_arch = "x86_64")]
 fn smoke_memory_oom_reaper_requeues_locked_victim() -> TestResult {
     use crate::oom::{self, test_support, OomVictim};
@@ -9554,6 +9696,15 @@ fn smoke_memory_oom_reaper_requeues_locked_victim() -> TestResult {
         return TestResult::Skip("could not build reapable AS");
     };
 
+    let locked = as_arc.with_regions_locked(|| as_arc.reap_anonymous_owned());
+    if locked != oom::ReapOutcome::Blocked {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("reaped while region lock held");
+    }
+
+    // Simulate scheduler publication before enqueue. The local Arc is only a
+    // passive test owner and must not be mistaken for execution liveness.
+    as_arc.scheduler_attach_user_task();
     if !test_support::enqueue(OomVictim {
         pid: 4242,
         tid: 4242,
@@ -9561,35 +9712,38 @@ fn smoke_memory_oom_reaper_requeues_locked_victim() -> TestResult {
         address_space: as_arc.clone(),
         retries_left: 0,
     }) {
+        as_arc.scheduler_detach_user_task();
         forget_sole_as(as_arc);
         return TestResult::Fail("victim not enqueued");
     }
 
-    // While the region lock is held, reap_all cannot make progress: the victim
-    // must be requeued (not dropped) and no frames freed.
-    let freed_while_locked = as_arc.with_regions_locked(oom::reap_all);
-    if freed_while_locked != 0 {
+    // Even though this AS was never vm_shared, its live task must defer reap.
+    if oom::reap_all() != 0 {
         test_support::drain_queue();
+        as_arc.scheduler_detach_user_task();
         forget_sole_as(as_arc);
-        return TestResult::Fail("reaped while region lock held");
+        return TestResult::Fail("reaped an unshared AS while its task was live");
     }
     if test_support::queued_len() != 1 {
         test_support::drain_queue();
+        as_arc.scheduler_detach_user_task();
         forget_sole_as(as_arc);
-        return TestResult::Fail("locked victim was dropped, not requeued");
+        return TestResult::Fail("live unshared victim was dropped, not requeued");
     }
     if !oom::reap_pending() {
         test_support::drain_queue();
+        as_arc.scheduler_detach_user_task();
         forget_sole_as(as_arc);
         return TestResult::Fail("reap_pending cleared with a victim still queued");
     }
 
-    // Lock released: the next pass reaps the resident pages and empties queue.
+    // Final scheduler detach is the quiescence event. Keep the local Arc alive
+    // across reap to prove passive lifetime owners no longer block progress.
+    as_arc.scheduler_detach_user_task();
     let freed = oom::reap_all();
     if freed != pages {
         test_support::drain_queue();
-        forget_sole_as(as_arc);
-        return TestResult::Fail("requeued victim not reaped after lock released");
+        return TestResult::Fail("requeued victim not reaped after task exit");
     }
     if test_support::queued_len() != 0 || oom::reap_pending() {
         forget_sole_as(as_arc);
@@ -9669,12 +9823,10 @@ fn smoke_memory_oom_reaper_honors_retry_bound() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_oom_reaper_honors_retry_bound);
 
-/// A `vm_shared` (formerly-multithreaded) victim is NOT reaped while another
-/// `Arc` clone exists (a live sibling thread), but IS reaped once that clone is
-/// dropped (last thread exited => reaper is sole owner) — the vm_shared
-/// soundness gate.
+/// A `vm_shared` victim is NOT reaped while scheduler tasks remain attached,
+/// but IS reaped after the final detach even when passive `Arc` clones remain.
 #[cfg(target_arch = "x86_64")]
-fn smoke_memory_oom_reaper_defers_vm_shared_until_sole_owner() -> TestResult {
+fn smoke_memory_oom_reaper_defers_vm_shared_until_tasks_quiesce() -> TestResult {
     use crate::oom::{self, test_support, OomVictim};
 
     test_support::arm_queue();
@@ -9685,9 +9837,11 @@ fn smoke_memory_oom_reaper_defers_vm_shared_until_sole_owner() -> TestResult {
     let Some(as_arc) = build_reapable_as(vbase, pages) else {
         return TestResult::Skip("could not build reapable AS");
     };
-    // Mark it multithreaded and simulate a still-live sibling thread by holding
-    // an extra Arc clone (a scheduler slot's clone in production).
+    // Mark it multithreaded, attach two scheduler tasks, and also hold an extra
+    // passive Arc which must not participate in the liveness decision.
     as_arc.mark_vm_shared();
+    as_arc.scheduler_attach_user_task();
+    as_arc.scheduler_attach_user_task();
     let sibling = as_arc.clone();
 
     if !test_support::enqueue(OomVictim {
@@ -9697,54 +9851,74 @@ fn smoke_memory_oom_reaper_defers_vm_shared_until_sole_owner() -> TestResult {
         address_space: as_arc.clone(),
         retries_left: 0,
     }) {
+        as_arc.scheduler_detach_user_task();
+        as_arc.scheduler_detach_user_task();
         drop(sibling);
         forget_sole_as(as_arc);
         return TestResult::Fail("victim not enqueued");
     }
 
-    // Sibling still live (strong_count > 1): reap_all must defer, not reap.
+    // Both scheduler tasks are still live: reap_all must defer, not reap.
     let freed_live = oom::reap_all();
     if freed_live != 0 {
         test_support::drain_queue();
+        as_arc.scheduler_detach_user_task();
+        as_arc.scheduler_detach_user_task();
         drop(sibling);
         forget_sole_as(as_arc);
         return TestResult::Fail("reaped a vm_shared AS with a live sibling");
     }
     if test_support::queued_len() != 1 {
         test_support::drain_queue();
+        as_arc.scheduler_detach_user_task();
+        as_arc.scheduler_detach_user_task();
         drop(sibling);
         forget_sole_as(as_arc);
         return TestResult::Fail("vm_shared victim dropped instead of requeued");
     }
 
-    // Last thread exits: drop the sibling clone, then our own local clone, so
-    // the only remaining Arc is the queued victim's — the reaper is now the sole
-    // owner (strong_count == 1) and may safely reap the formerly-vm_shared AS.
-    // We deliberately hold no clone during reap: reap_all consumes and drops the
-    // queued victim, whose Drop teardown (a safe no-op over the zeroed backing)
-    // reclaims the page tables. No post-reap AS access, so no use-after-free.
-    drop(sibling);
+    // One exiting sibling is insufficient; the group stays queued and waiting
+    // for the final execution-liveness transition.
+    as_arc.scheduler_detach_user_task();
+    if oom::reap_all() != 0 || test_support::queued_len() != 1 {
+        test_support::drain_queue();
+        as_arc.scheduler_detach_user_task();
+        drop(sibling);
+        forget_sole_as(as_arc);
+        return TestResult::Fail("vm_shared AS reaped before final task detach");
+    }
+
+    // Final detach makes reaping safe. Keep both passive Arcs alive to prove
+    // that allocation lifetime is no longer conflated with task execution.
+    as_arc.scheduler_detach_user_task();
     let before_reap = crate::frame::stats().free;
-    drop(as_arc);
 
     let freed = oom::reap_all();
     if freed != pages {
         test_support::drain_queue();
-        return TestResult::Fail("vm_shared AS not reaped after sole ownership");
+        drop(sibling);
+        forget_sole_as(as_arc);
+        return TestResult::Fail("vm_shared AS not reaped after final task detach");
     }
     if test_support::queued_len() != 0 || oom::reap_pending() {
+        drop(sibling);
+        forget_sole_as(as_arc);
         return TestResult::Fail("queue not drained after vm_shared reap");
     }
     // The reaped data frames returned to the pool.
     if crate::frame::stats().free < before_reap + pages {
+        drop(sibling);
+        forget_sole_as(as_arc);
         return TestResult::Fail("reaped vm_shared frames did not return to pool");
     }
+    drop(sibling);
+    forget_sole_as(as_arc);
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!(
     "memory",
-    smoke_memory_oom_reaper_defers_vm_shared_until_sole_owner
+    smoke_memory_oom_reaper_defers_vm_shared_until_tasks_quiesce
 );
 
 /// Frame-backed vmalloc: a 64 KiB `valloc` (the order-4 size that defeats a
@@ -13332,6 +13506,106 @@ fn smoke_memory_mlock_splits_exact_subrange() -> TestResult {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_mlock_splits_exact_subrange);
 
+/// Sparse-backing metadata for a partial VMA split is prepared before the
+/// live region is removed or any permission/accounting state changes. An
+/// allocation failure in either mlock or mprotect must therefore return
+/// `AllocationFailed` with the original VMA byte-for-byte intact; retrying
+/// after pressure clears performs the expected three-way split.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_vma_split_backing_oom_is_preflight() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    fn three_page_space(base: u64) -> Result<AddressSpace, &'static str> {
+        let space = AddressSpace::empty();
+        space
+            .map_region(Region {
+                base: VirtAddr::new(base),
+                len: 0x3000,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![PhysAddr::new(0); 3].into(),
+            })
+            .map_err(|_| "could not build split fixture")?;
+        Ok(space)
+    }
+
+    const MLOCK_BASE: u64 = 0x0000_0080_1A00_0000;
+    let mlock_space = match three_page_space(MLOCK_BASE) {
+        Ok(space) => space,
+        Err(error) => return TestResult::Fail(error),
+    };
+    let before = mlock_space.regions_snapshot();
+    crate::address_space::__test_fail_region_backing_window_after(2);
+    let failed = mlock_space.mlock_range_onfault(VirtAddr::new(MLOCK_BASE + 0x1000), 0x1000);
+    if failed != Err(AddressSpaceError::AllocationFailed)
+        || mlock_space.regions_snapshot() != before
+        || mlock_space.memory_stats().locked_bytes != 0
+    {
+        return TestResult::Fail("mlock backing ENOMEM partially changed the VMA");
+    }
+    if mlock_space
+        .mlock_range_onfault(VirtAddr::new(MLOCK_BASE + 0x1000), 0x1000)
+        .is_err()
+    {
+        return TestResult::Fail("mlock retry failed after backing ENOMEM");
+    }
+    let mlock_regions = mlock_space.regions_snapshot();
+    if mlock_regions.len() != 3
+        || mlock_regions[0].perms.contains(RegionPerms::LOCKED)
+        || !mlock_regions[1].perms.contains(RegionPerms::LOCKED)
+        || !mlock_regions[1].perms.contains(RegionPerms::LOCK_ONFAULT)
+        || mlock_regions[2].perms.contains(RegionPerms::LOCKED)
+        || mlock_space.memory_stats().locked_bytes != 0x1000
+    {
+        return TestResult::Fail("mlock retry lost split or locked-byte accounting");
+    }
+
+    const MPROTECT_BASE: u64 = 0x0000_0080_1B00_0000;
+    let mprotect_space = match three_page_space(MPROTECT_BASE) {
+        Ok(space) => space,
+        Err(error) => return TestResult::Fail(error),
+    };
+    let before = mprotect_space.regions_snapshot();
+    crate::address_space::__test_fail_region_backing_window_after(2);
+    let failed = mprotect_space.mprotect_range(
+        VirtAddr::new(MPROTECT_BASE + 0x1000),
+        0x1000,
+        RegionPerms::READ,
+    );
+    if failed != Err(AddressSpaceError::AllocationFailed)
+        || mprotect_space.regions_snapshot() != before
+    {
+        return TestResult::Fail("mprotect backing ENOMEM partially changed the VMA");
+    }
+    if mprotect_space
+        .mprotect_range(
+            VirtAddr::new(MPROTECT_BASE + 0x1000),
+            0x1000,
+            RegionPerms::READ,
+        )
+        .is_err()
+    {
+        return TestResult::Fail("mprotect retry failed after backing ENOMEM");
+    }
+    let mprotect_regions = mprotect_space.regions_snapshot();
+    if mprotect_regions.len() == 3
+        && mprotect_regions[0].perms.contains(RegionPerms::WRITE)
+        && !mprotect_regions[1].perms.contains(RegionPerms::WRITE)
+        && mprotect_regions[2].perms.contains(RegionPerms::WRITE)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("mprotect retry lost split or permission state")
+    }
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!("memory", smoke_memory_vma_split_backing_oom_is_preflight);
+
 /// MLOCK_ONFAULT pins the VMA state without eagerly populating it; the first
 /// access backs only the faulted page and the LOCKED marker survives.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -14559,6 +14833,60 @@ fn smoke_memory_fork_clears_current_and_future_locking() -> TestResult {
 kernel_test_in!(
     "memory",
     smoke_memory_fork_clears_current_and_future_locking
+);
+
+/// Linux's GUP population loop checks `fatal_signal_pending(current)` before
+/// faulting each page. An eager mlock must likewise stop promptly after its
+/// caller is condemned instead of keeping SIGKILL trapped inside a long syscall.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_mlock_population_is_fatal_signal_interruptible() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh test-owned user root; paging and the frame allocator are
+    // live in the kernel-test harness.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = 0x0000_4080_2380_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(base),
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); 3].into(),
+    })
+    .is_err()
+    {
+        return TestResult::Fail("fatal-interrupt mlock setup failed");
+    }
+
+    let mut probes = 0usize;
+    let result =
+        a.mlock_range_limited_interruptible(VirtAddr::new(base), 0x3000, u64::MAX, true, || {
+            probes += 1;
+            probes > 1
+        });
+    let Some(region) = a.lookup(VirtAddr::new(base)) else {
+        return TestResult::Fail("fatal-interrupt mlock removed its VMA");
+    };
+    let resident = region.phys.iter().filter(|phys| phys.raw() != 0).count();
+    let locked = region.perms.contains(RegionPerms::LOCKED);
+    drop(a);
+
+    if result != Err(AddressSpaceError::LockFailed) {
+        TestResult::Fail("fatal-signal probe did not interrupt eager mlock")
+    } else if probes != 2 || resident != 1 {
+        TestResult::Fail("eager mlock populated pages after fatal cancellation")
+    } else if !locked {
+        TestResult::Fail("fatal cancellation rolled back Linux-visible LOCKED state")
+    } else {
+        TestResult::Pass
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_mlock_population_is_fatal_signal_interruptible
 );
 
 /// RLIMIT_MEMLOCK accounts virtual bytes, but a repeated/overlapping mlock

@@ -35,10 +35,12 @@ impl ProcessOomKiller {
         let total_pages = narf_memory::frame::stats().total.max(1) as i64;
         let mut best: Option<(u64, u64, usize, i64, Arc<AddressSpace>)> = None;
 
-        for (tid, pid) in crate::task::snapshot_identities() {
+        // Allocation-free batched walk: OOM selection must not ask the kernel
+        // heap for a Vec precisely when userspace has exhausted memory.
+        crate::task::for_each_identity(|tid, pid| {
             // Never target init (pid 1) or kernel identities (pid 0).
             if pid <= 1 {
-                continue;
+                return true;
             }
             // A prior OOM pass may already have condemned this thread group.
             // The reap queue only deduplicates while an entry is queued; a
@@ -50,19 +52,19 @@ impl ProcessOomKiller {
             // terminal marker, so move on to another process while this one
             // reaches its exit path.
             if crate::handlers::task_fatal_signal_pending(tid) {
-                continue;
+                return true;
             }
             // Cgroup-scoped OOM: skip anything outside the offending subtree.
             if let Some(pids) = filter {
                 if !pids.contains(&pid) {
-                    continue;
+                    return true;
                 }
             }
             // Only user processes have an address space to reclaim; a kernel
             // task (or an already-reaped zombie off the ready queue) resolves
             // to None and is skipped.
             let Some(address_space) = narf_scheduler::address_space_of_live(TaskId(tid)) else {
-                continue;
+                return true;
             };
             // Badness must rank RESIDENT memory, not virtual reservations:
             // `mapped_bytes` counts region lengths, so a sparse-VA process
@@ -72,11 +74,11 @@ impl ProcessOomKiller {
             // `get_mm_rss()` — resident pages — plus the adj bias.
             let rss_pages = address_space.memory_stats().resident_pages as usize;
             if rss_pages == 0 {
-                continue;
+                return true;
             }
             let adj = crate::handlers::proc_oom_adj_of(pid);
             if adj <= OOM_SCORE_ADJ_MIN {
-                continue; // opted out of the OOM killer
+                return true; // opted out of the OOM killer
             }
             // Linux-shaped badness: resident pages, biased by oom_score_adj
             // scaled against total RAM. Higher wins.
@@ -84,17 +86,34 @@ impl ProcessOomKiller {
             if best.as_ref().is_none_or(|b| badness > b.3) {
                 best = Some((tid, pid, rss_pages, badness, address_space));
             }
-        }
+            true
+        });
 
         let (tid, pid, rss_pages, _badness, address_space) = best?;
         report_kill(tid, pid, rss_pages);
-        // Deliver an uncatchable SIGKILL; the victim exits at its next
-        // return-to-user, and the async reaper reclaims its anonymous frames
-        // now rather than waiting for that exit.
-        // `do_send_sig_info(SIGKILL, SEND_SIG_PRIV, victim, PIDTYPE_TGID)`:
-        // the whole victim process dies.
-        let _ =
-            crate::handlers::raise_group_signal(tid, SIGKILL, crate::handlers::GroupSigInfo::None);
+        // Linux's __oom_kill_process also kills every task which shares the
+        // selected mm, including CLONE_VM peers in a different thread group.
+        // Without that walk the address-space live-task count could never reach
+        // zero and the reaper would correctly—but permanently—defer this mm.
+        // The first signal marks its whole group fatal; the pending check then
+        // suppresses duplicate group walks for sibling threads.
+        crate::task::for_each_identity(|candidate_tid, _| {
+            if crate::handlers::task_fatal_signal_pending(candidate_tid) {
+                return true;
+            }
+            let Some(candidate_mm) = narf_scheduler::address_space_of_live(TaskId(candidate_tid))
+            else {
+                return true;
+            };
+            if Arc::ptr_eq(&candidate_mm, &address_space) {
+                let _ = crate::handlers::raise_group_signal(
+                    candidate_tid,
+                    SIGKILL,
+                    crate::handlers::GroupSigInfo::None,
+                );
+            }
+            true
+        });
         Some(OomVictim {
             pid,
             tid,

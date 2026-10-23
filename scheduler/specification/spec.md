@@ -151,6 +151,14 @@ authorize a same-MM switch elision. The deferred slot owner is consumed on the
 next dispatch of a pending task and is retired immediately if the task instead
 completes or is abnormally reaped, so a task id that never polls again cannot
 retain an address space.
+Each user slot also owns exactly one execution-liveness count in its address
+space. Spawn increments before registry/run-queue publication; exec increments
+the replacement before publishing it and decrements the displaced root only
+after the active/queued owner has switched; final `TaskSlot` drop decrements
+after the future can no longer be polled. This counter intentionally does not
+follow passive `Arc` clones, including `active_mm`: memory's OOM reaper needs an
+O(1) proof that no task can fault or contend a VMA lock, not proof that no
+kernel code retains the page-table allocation.
 On x86_64 and aarch64, every own-stack switch-out folds the elapsed on-CPU slice through
 the slice-account hook. A CPL0 timer preemption additionally calls `pause`
 before switching and calls `resume` only when `pause` reported an open syscall
@@ -645,6 +653,9 @@ control callback.
   replacement is reconciled before either root owner is dropped and forces a
   restore rather than carrying stale same-MM identity into the next dispatch.
   Its deferred slot owner is removed on completion and every abnormal reap.
+  The same spawn/exec/final-drop boundaries maintain one live-task count per
+  slot. A zero count is published only after no task can execute through that
+  root; replacement publication never exposes a runnable root at zero.
 - On x86_64 the executor publishes the address space's lifetime process PCID
   before loading `root|pcid|NOFLUSH`. Kernel-root restore and own-stack resume
   preserve nonzero tags. Residency is conservative history and remains set

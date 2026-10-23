@@ -15,13 +15,144 @@
 //! this table from bookkeeping into the thing that makes `Arena::drop` sound.
 //! `memory/src/bpf_arena.rs`'s `Arena::drop` names the test that pins it.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use narf_filesystem::FsError;
-use narf_filesystem::{FileOps, MmapLifetime};
+use core::sync::atomic::{AtomicU64, Ordering};
+use narf_filesystem::{FileOps, FsError, FsFuture, MmapLifetime, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::{AddressSpaceError, FileFaultError, MappingReceipt, PhysAddr};
+
+const ANON_SHARED_INLINE_PAGES: usize = 4;
+
+/// The unnamed shmem inode behind one `MAP_SHARED | MAP_ANONYMOUS` mapping.
+///
+/// This deliberately is not a full MemFs inode. Linux uses an unlinked shmem
+/// file here, but the hot stress-ng shape creates tens of thousands of
+/// three-page objects: giving every one its own superblock, quota tables,
+/// xattrs, timestamps and B-tree node makes kernel metadata rival the resident
+/// pages. Four atomic slots cover that common shape without another allocation;
+/// larger objects spill into the same fallible sparse backing used by VMAs.
+struct AnonymousSharedFile {
+    len: u64,
+    inline: [AtomicU64; ANON_SHARED_INLINE_PAGES],
+    overflow: IrqSafeSpinLock<narf_memory::region_backing::RegionBacking>,
+}
+
+impl AnonymousSharedFile {
+    fn new(len: u64) -> Self {
+        Self {
+            len,
+            inline: [const { AtomicU64::new(0) }; ANON_SHARED_INLINE_PAGES],
+            overflow: IrqSafeSpinLock::new(narf_memory::region_backing::RegionBacking::new()),
+        }
+    }
+
+    fn allocate_zeroed() -> Result<narf_memory::PhysFrame, FsError> {
+        let frame = narf_memory::frame::alloc_frame().map_err(|_| FsError::OutOfMemory)?;
+        // SAFETY: this fresh allocator frame is exclusively owned here and is
+        // reachable through the kernel direct map.
+        unsafe {
+            core::ptr::write_bytes(frame.start_address().kernel_mut_ptr::<u8>(), 0, 4096);
+        }
+        Ok(frame)
+    }
+
+    fn inline_fault(&self, index: usize) -> Result<u64, FsError> {
+        let slot = &self.inline[index];
+        let existing = slot.load(Ordering::Acquire);
+        if existing != 0 {
+            return Ok(existing);
+        }
+        let frame = Self::allocate_zeroed()?;
+        let candidate = frame.start_address().raw();
+        match slot.compare_exchange(0, candidate, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(candidate),
+            Err(winner) => {
+                narf_memory::free_frame(frame);
+                Ok(winner)
+            }
+        }
+    }
+
+    fn overflow_fault(&self, index: usize) -> Result<u64, FsError> {
+        let mut backing = self.overflow.lock();
+        if let Some(existing) = backing.get(index).filter(|phys| phys.raw() != 0) {
+            return Ok(existing.raw());
+        }
+        backing
+            .reserve_slot(index)
+            .map_err(|_| FsError::OutOfMemory)?;
+        let frame = Self::allocate_zeroed()?;
+        let phys = frame.start_address();
+        *backing
+            .get_mut(index)
+            .expect("reserved anonymous-shmem slot disappeared") = phys;
+        Ok(phys.raw())
+    }
+}
+
+impl Drop for AnonymousSharedFile {
+    fn drop(&mut self) {
+        for slot in &self.inline {
+            let phys = slot.load(Ordering::Relaxed);
+            if phys != 0 {
+                narf_memory::free_frame(narf_memory::PhysFrame::new(PhysAddr::new(phys)));
+            }
+        }
+        for (_, phys) in self.overflow.lock().indexed() {
+            if phys.raw() != 0 {
+                narf_memory::free_frame(narf_memory::PhysFrame::new(*phys));
+            }
+        }
+    }
+}
+
+impl FileOps for AnonymousSharedFile {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: self.len,
+            blocks: 0,
+            mode: Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
+    }
+
+    fn mmap_is_ram(&self) -> bool {
+        true
+    }
+
+    fn supports_mmap_fault(&self) -> bool {
+        true
+    }
+
+    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError> {
+        if offset & 0xfff != 0 || offset >= self.len {
+            return Err(FsError::BadAddress);
+        }
+        let index = usize::try_from(offset >> 12).map_err(|_| FsError::BadAddress)?;
+        if index < ANON_SHARED_INLINE_PAGES {
+            self.inline_fault(index)
+        } else {
+            self.overflow_fault(index)
+        }
+    }
+}
+
+pub(crate) fn new_anonymous_shared_file(len: u64) -> Result<Arc<dyn FileOps>, FsError> {
+    Arc::try_new(AnonymousSharedFile::new(len))
+        .map(|file| file as Arc<dyn FileOps>)
+        .map_err(|_| FsError::OutOfMemory)
+}
 
 /// Snapshot process roots; the memory transaction's metadata census refuses
 /// roots still being built by fork or retiring outside this snapshot.

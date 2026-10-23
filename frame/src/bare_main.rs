@@ -89,25 +89,147 @@ fn kswapd_wake(node: usize) {
     }
 }
 
+/// Work signal for the persistent RCU reclaim kthread. The worker and its
+/// stack are allocated at boot, before userspace can drive the system into
+/// memory pressure; a reclaim kick itself must never allocate.
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
+static RCU_RECLAIM_WORK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Waker installed whenever the persistent RCU reclaim kthread parks.
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
+static RCU_RECLAIM_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
 /// RCU reclaim offload hook (`narf_rcu::set_reclaim_offload`). Called by the
 /// QSBR drain when it hands grace-period-expired destructors off, at most once
-/// per batch (the drain coalesces). It only spawns: the destructors then run
-/// in that task — interrupts enabled, no caller's driver gate or lock held,
-/// and with its own stack, so a destructor that finds a device gate busy can
-/// `cooperative_yield` until the holder finishes. Linux runs RCU callbacks
-/// from softirq / the rcuo kthreads for the same reason.
+/// per batch (the drain coalesces). It only signals the boot-preallocated
+/// worker: the destructors then run in that task — interrupts enabled, no
+/// caller's driver gate or lock held, and with its own stack, so a destructor
+/// that finds a device gate busy can `cooperative_yield` until the holder
+/// finishes. Linux runs RCU callbacks from softirq / the rcuo kthreads for the
+/// same reason.
 #[cfg(not(any(
     feature = "kernel-test",
     feature = "boot-smoke",
     feature = "idt-selftest"
 )))]
 fn rcu_reclaim_kick() {
-    let _ = narf_scheduler::spawn_stackful(async {
-        let _ = narf_rcu::run_offloaded_reclaim();
-    });
+    use core::sync::atomic::Ordering;
+    RCU_RECLAIM_WORK.store(true, Ordering::Release);
+    let waker = RCU_RECLAIM_WAKER.lock().clone();
+    if let Some(w) = waker {
+        w.wake();
+    }
 }
 
-/// The per-node kswapd / OOM-reaper kthread (kswapd0, kswapd1, …) — the wakeable reclaimer NARF's watermarks
+/// Persistent RCU callback worker. Its register-then-recheck park protocol
+/// closes both sides of the wake race: a kick before waker installation leaves
+/// `RCU_RECLAIM_WORK` set, and a kick after installation wakes the task.
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
+async fn rcu_reclaim_kthread() {
+    use core::sync::atomic::Ordering;
+    loop {
+        core::future::poll_fn(|cx| {
+            if RCU_RECLAIM_WORK.swap(false, Ordering::AcqRel) {
+                return core::task::Poll::Ready(());
+            }
+            *RCU_RECLAIM_WAKER.lock() = Some(cx.waker().clone());
+            if RCU_RECLAIM_WORK.swap(false, Ordering::AcqRel) {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+        .await;
+
+        // `run_offloaded_reclaim` clears narf_rcu's coalescing bit before it
+        // takes the list. A concurrent publisher therefore invokes the hook
+        // again, leaving this worker's work bit set for the next loop.
+        let _ = narf_rcu::run_offloaded_reclaim();
+    }
+}
+
+/// Work signal and parked waker for the single persistent OOM reaper. The task
+/// and its stack are allocated at boot; enqueue/final-task-detach kicks are
+/// therefore allocation-free even when the heap reserve is exhausted.
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
+static OOM_REAPER_WORK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
+static OOM_REAPER_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
+fn oom_reaper_kick() {
+    use core::sync::atomic::Ordering;
+    OOM_REAPER_WORK.store(true, Ordering::Release);
+    let waker = OOM_REAPER_WAKER.lock().clone();
+    if let Some(w) = waker {
+        w.wake();
+    }
+}
+
+/// Event-driven OOM reaper. A live victim is visited once and then waits for
+/// its address space's final scheduler detach. Only a post-quiescence region-
+/// lock collision requests a cooperative yield/retry, so a task which is slow
+/// to observe SIGKILL cannot turn this worker into a busy loop.
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
+async fn oom_reaper_kthread() {
+    use core::sync::atomic::Ordering;
+    loop {
+        core::future::poll_fn(|cx| {
+            if OOM_REAPER_WORK.swap(false, Ordering::AcqRel) {
+                return core::task::Poll::Ready(());
+            }
+            *OOM_REAPER_WAKER.lock() = Some(cx.waker().clone());
+            if OOM_REAPER_WORK.swap(false, Ordering::AcqRel) {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+        .await;
+
+        loop {
+            let _ = narf_memory::oom::reap_all();
+            if !narf_memory::oom::take_reap_retry_request() {
+                break;
+            }
+            narf_scheduler::yield_now().await;
+        }
+    }
+}
+
+/// The per-node kswapd kthread (kswapd0, kswapd1, …) — the wakeable reclaimer NARF's watermarks
 /// launch. Linux's kswapd is event-driven: the allocator wakes it when a zone
 /// falls below its low watermark, and it reclaims until the zone is balanced at
 /// the high watermark, then sleeps. This is the faithful shape (superseding the
@@ -117,8 +239,8 @@ fn rcu_reclaim_kick() {
 /// * reclaims toward the `high` watermark (in-kernel shrinkers);
 /// * if it cannot lift free off the emergency `min` floor, the remaining
 ///   pressure is anonymous userspace memory, so it OOM-kills the
-///   highest-badness process and drains the async reap backlog — freeing a
-///   victim's pages without waiting for it to schedule and exit;
+///   highest-badness process and wakes the dedicated OOM reaper, which frees
+///   the victim's pages as soon as its final task becomes quiescent;
 /// * parks again once balanced.
 ///
 /// Runs in cooperative executor (task, NOT IRQ) context, so taking the buddy
@@ -273,8 +395,6 @@ async fn kswapd_kthread(node: usize) {
                 );
             }
         }
-        narf_memory::oom::reap_all();
-
         // Complete only the allocation-pressure requests this cycle consumed.
         // A proactive/background cycle has no ticket and cannot wake a fault
         // that raced it; that request remains queued for the next cycle.
@@ -4978,13 +5098,26 @@ fn run_async_demo() -> ! {
         "  scheduler: ready queues already live (no re-init)"
     );
 
-    // RCU reclaim offload: from here on, grace-period-expired destructors run
-    // in a task the drain spawns, never inline at the quiescent point that
-    // found them (which may sit inside a driver wait holding its gate). Before
-    // this point — early boot, before the ready queues — drains stay inline.
+    // RCU reclaim offload: allocate one persistent worker and its stack while
+    // boot still has memory headroom, then install the allocation-free wake
+    // hook. From here on, grace-period-expired destructors run in that worker,
+    // never inline at the quiescent point that found them (which may sit inside
+    // a driver wait holding its gate). Before this point — early boot, before
+    // the ready queues — drains stay inline. Spawning before hook installation
+    // is safe even though the worker has not polled yet: an early kick leaves
+    // its work bit set for the worker's first poll.
+    let rcu_tid = narf_scheduler::spawn_stackful(rcu_reclaim_kthread());
+    narf_userspace::handlers::set_proc_comm(rcu_tid.raw(), "rcuo0");
     narf_rcu::set_reclaim_offload(rcu_reclaim_kick);
 
-    // Spawn one wakeable kswapd/OOM-reaper kthread per online NUMA node
+    // The OOM reaper is likewise persistent and boot-preallocated. Enqueue and
+    // final address-space task detach only set a bit and wake this task; they
+    // never allocate a fresh kernel stack while the reserve is exhausted.
+    let oom_reaper_tid = narf_scheduler::spawn_stackful(oom_reaper_kthread());
+    narf_userspace::handlers::set_proc_comm(oom_reaper_tid.raw(), "oom_reaper");
+    narf_memory::oom::set_reaper_wake_hook(oom_reaper_kick);
+
+    // Spawn one wakeable kswapd kthread per online NUMA node
     // (`kswapd0`, `kswapd1`, … — matching Linux), now that the scheduler's
     // ready queues are live and BEFORE `run_until_empty` (with boot-init the
     // user futures loop forever, so the executor never returns). Each parks

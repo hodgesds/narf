@@ -70,14 +70,12 @@ pub(crate) fn sys_process_mrelease(ctx: &mut dyn TrapContext) {
     // `if (!mm_flags_test(MMF_OOM_SKIP, mm) && !__oom_reap_task_mm(mm)) ret =
     // -EAGAIN;`
     //
-    // `sole_owner` is Linux's `mm_users <= 1` plus its "every task sharing
-    // this mm is dying too" walk, in the form NARF's reaper already takes: an
-    // `Arc` count of 1 means no scheduler slot still references the address
-    // space, so no sibling thread can be mid-fault on it. The reaper returns
-    // `Blocked` rather than reaping when that does not hold, which is exactly
-    // the -EAGAIN the caller is expected to retry.
-    let sole_owner = Arc::strong_count(&mm) == 1;
-    let r = match mm.reap_anonymous_owned(sole_owner) {
+    // NARF's scheduler-maintained address-space live-task count is the
+    // `mm_users`/task walk proof: zero means no sibling can still fault or
+    // contend a VMA lock. Passive Arc owners do not represent executable
+    // users. The reaper returns `Blocked` until that quiescence point, which is
+    // exactly the -EAGAIN the caller is expected to retry.
+    let r = match mm.reap_anonymous_owned() {
         narf_memory::oom::ReapOutcome::Reaped(_) | narf_memory::oom::ReapOutcome::Nothing => {
             SyscallReturn::ok(0)
         }

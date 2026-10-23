@@ -19,36 +19,29 @@
 //!   * The reaper holds an `Arc<AddressSpace>` (in [`OomVictim`]), so the
 //!     last-`Arc` `Drop` teardown — which frees the same frames — cannot run
 //!     concurrently. No double free.
-//!   * No sibling thread can be mid-fault on the same table while the reaper
-//!     issues its shootdown. This holds trivially for a single-threaded
-//!     (`!vm_shared`) victim, and for a formerly-multithreaded (`vm_shared`)
-//!     victim once *every* sibling thread has exited — see below. The region
-//!     table is taken with `try_lock`, so no CPU is spinning on that lock while
-//!     the reaper's forced shootdown waits for acks (which would deadlock).
+//!   * No victim thread can be mid-fault on the same table while the reaper
+//!     issues its shootdown. The scheduler maintains an explicit per-address-
+//!     space live-task count: admission increments before publication and final
+//!     slot drop decrements after the task can no longer run. Reaping waits for
+//!     that count to reach zero. This is deliberately independent of `Arc`
+//!     ownership, because passive kernel references pin lifetime without being
+//!     able to fault or contend the IRQ-disabling region lock.
 //!   * A forced full user-TLB shootdown lands before any frame is freed, so a
 //!     CPU still momentarily running the doomed task cannot alias a reused
 //!     frame through a stale entry (its next access simply re-faults).
 //!
-//! # Reaping a formerly-multithreaded (`vm_shared`) victim
+//! # Reaping only after the last task exits
 //!
-//! A `vm_shared` address space can be resident on several CPUs at once while
-//! its threads run, so reaping it out from under a *live* sibling would be
-//! unsound (a sibling could be mid-fault installing a PTE the reaper is tearing
-//! down). But a SIGKILL propagates to ALL threads of the group, and each thread
-//! holds its own `Arc<AddressSpace>` clone (in its scheduler slot) that is
-//! dropped synchronously when the thread finishes its exit poll. Once the LAST
-//! thread has exited, no scheduler slot references the AS any more, so the only
-//! remaining clone is the one the reaper pinned in [`OomVictim`]. The reaper
-//! detects that state with `Arc::strong_count(&victim.address_space) == 1`: a
-//! count of one proves there is no other live holder — no sibling thread can be
-//! running or mid-fault — so the AS is effectively single-owner and reaping is
-//! safe. The forced full cross-CPU shootdown still runs first, flushing any
-//! stale entry left on a CPU a now-dead thread last ran on. A victim whose
-//! count is still `> 1` (a thread has not finished exiting yet) is requeued and
-//! retried on a later pass rather than reaped early.
+//! Every scheduler task attached to an address space contributes exactly one
+//! live-task count, whether the address space is single-threaded or
+//! `vm_shared`. SIGKILL propagates to all threads of a group, and final slot
+//! drop retires each count. The zero transition wakes the dedicated reaper;
+//! until then the victim remains queued without consuming its transient-lock
+//! retry budget. The forced full cross-CPU shootdown flushes stale entries left
+//! on CPUs where the dead task ran before any frame becomes reusable.
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -70,10 +63,9 @@ pub struct OomVictim {
     /// The victim's address space, pinned for the reaper.
     pub address_space: Arc<AddressSpace>,
     /// Remaining reaper passes this victim may be requeued for before it is
-    /// abandoned to normal exit teardown. Decremented each time the reaper
-    /// cannot make progress (region lock held, or a `vm_shared` sibling has not
-    /// finished exiting). `select_victim` leaves this at 0; the queue seeds it
-    /// (see [`REAP_MAX_RETRIES`]) on enqueue.
+    /// abandoned to normal exit teardown. Decremented only for a transient
+    /// region-lock collision after every victim task is quiescent; waiting for
+    /// task exit is event-driven and does not consume this budget.
     pub retries_left: u32,
 }
 
@@ -100,8 +92,8 @@ pub enum ReapOutcome {
     /// Nothing reapable (empty / no root). Terminal: the victim is dropped.
     Nothing,
     /// Could not proceed WITHOUT losing soundness — the region lock's `try_lock`
-    /// failed, or the AS is `vm_shared` with a sibling thread still exiting. The
-    /// caller should requeue and retry on a later pass.
+    /// failed, or a victim task is still executable. The caller should requeue
+    /// and retry after the appropriate event.
     Blocked,
 }
 
@@ -152,16 +144,47 @@ fn try_begin_oom_selection() -> Option<OomSelectionGuard> {
 /// Bounded backlog of victims awaiting reaping. Pre-reserved at registration so
 /// enqueue never allocates — freeing memory must not require allocating memory.
 const REAP_BACKLOG: usize = 16;
-static REAP_QUEUE: IrqSafeSpinLock<Option<Vec<OomVictim>>> = IrqSafeSpinLock::new(None);
+static REAP_QUEUE: IrqSafeSpinLock<Option<VecDeque<OomVictim>>> = IrqSafeSpinLock::new(None);
 
-/// How many reaper passes a victim may be requeued for before it is abandoned
-/// to its own exit teardown. Covers a transiently-held region lock and a
-/// `vm_shared` group whose last thread has not finished exiting; a handful of
-/// passes is enough for either to clear without spinning the reaper.
+/// Only one context may hold an in-flight victim outside the queue. Besides
+/// making reaping match Linux's single oom_reaper shape, this reserves exactly
+/// one extra deque slot for a blocked victim even if selection fills the
+/// logical backlog while the pass is outside the lock.
+static REAP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct ReapGuard;
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        REAP_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn try_begin_reap() -> Option<ReapGuard> {
+    REAP_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| ReapGuard)
+}
+
+/// How many post-quiescence region-lock collisions may be retried before a
+/// victim is abandoned to its normal exit teardown. Live tasks do not consume
+/// this budget: their final scheduler detach wakes the reaper directly.
 const REAP_MAX_RETRIES: u32 = 8;
 
 /// Set while at least one victim is queued, so the reaper kthread knows to run.
 static REAP_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Set by a reap pass only when every victim task is quiescent but a transient
+/// region-lock owner prevented progress. The persistent worker consumes this
+/// bit and yields before retrying; a live victim instead waits for its final
+/// scheduler detach event without spinning.
+static REAP_RETRY_SOON: AtomicBool = AtomicBool::new(false);
+
+/// Allocation-free wake seam for the upper-layer persistent OOM reaper task.
+/// `memory` cannot depend on the scheduler/frame crates, so boot installs a
+/// plain function pointer after preallocating the worker and its stack.
+static REAPER_WAKE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Count of victims abandoned to normal exit teardown after exhausting their
 /// requeue budget (retry bound reached with no progress). Diagnostic only — a
@@ -177,7 +200,30 @@ pub fn register_oom_killer(killer: &'static dyn OomKiller) {
     *OOM_KILLER.lock() = Some(killer);
     let mut q = REAP_QUEUE.lock();
     if q.is_none() {
-        *q = Some(Vec::with_capacity(REAP_BACKLOG));
+        *q = Some(VecDeque::with_capacity(REAP_BACKLOG + 1));
+    }
+}
+
+/// Install the wake hook for the boot-preallocated OOM reaper worker.
+pub fn set_reaper_wake_hook(hook: fn()) {
+    REAPER_WAKE_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn wake_reaper() {
+    let p = REAPER_WAKE_HOOK.load(Ordering::Acquire);
+    if p != 0 {
+        // SAFETY: `p` came from a real static `fn()` in
+        // `set_reaper_wake_hook` and registration is append-only at boot.
+        let hook: fn() = unsafe { core::mem::transmute::<usize, fn()>(p) };
+        hook();
+    }
+}
+
+/// Wake the reaper only when a queued victim can benefit. Called by the
+/// address-space live-task counter's one-to-zero transition.
+pub(crate) fn wake_reaper_if_pending() {
+    if REAP_PENDING.load(Ordering::Acquire) {
+        wake_reaper();
     }
 }
 
@@ -199,8 +245,13 @@ pub fn __reset_oom_killer_for_test() {
 /// "Out of memory: Killed process N" line), or `None` if nothing was
 /// eligible. Safe to call from the reclaim pump (executor context).
 pub fn request_oom_relief() -> Option<u64> {
-    let _selection = try_begin_oom_selection()?;
-    request_oom_relief_unserialized()
+    let selection = try_begin_oom_selection()?;
+    let killed = request_oom_relief_unserialized();
+    drop(selection);
+    if killed.is_some() {
+        wake_reaper();
+    }
+    killed
 }
 
 fn request_oom_relief_unserialized() -> Option<u64> {
@@ -214,12 +265,16 @@ fn request_oom_relief_unserialized() -> Option<u64> {
 /// its queued pages while holding the global OOM-selection gate. A competing
 /// node returns `None`; a later allocation failure can retry after this pass.
 pub fn request_oom_relief_and_reap_if(still_needed: fn() -> bool) -> Option<u64> {
-    let _selection = try_begin_oom_selection()?;
+    let selection = try_begin_oom_selection()?;
     if !still_needed() {
         return None;
     }
     let killed = request_oom_relief_unserialized();
     let _ = reap_all();
+    drop(selection);
+    if killed.is_some() || reap_pending() {
+        wake_reaper();
+    }
     killed
 }
 
@@ -228,9 +283,12 @@ pub fn request_oom_relief_and_reap_if(still_needed: fn() -> bool) -> Option<u64>
 /// no listed pid is eligible — in which case the caller fails the charge as
 /// ENOMEM rather than killing outside the offending cgroup (cgroup v2 semantics).
 pub fn request_oom_relief_in(pids: &[u64]) -> Option<u64> {
-    let _selection = try_begin_oom_selection()?;
+    let selection = try_begin_oom_selection()?;
     let killer = (*OOM_KILLER.lock())?;
-    enqueue_victim(killer.select_victim_in(pids)?)
+    let killed = enqueue_victim(killer.select_victim_in(pids)?);
+    drop(selection);
+    wake_reaper();
+    killed
 }
 
 mod selection_gate_tests {
@@ -263,9 +321,8 @@ mod selection_gate_tests {
 fn enqueue_victim(mut victim: OomVictim) -> Option<u64> {
     let pid = victim.pid;
     let tid = victim.tid;
-    // Seed the requeue budget here (not in the policy): a victim whose region
-    // lock is transiently held, or whose last `vm_shared` sibling has not yet
-    // finished exiting, is retried on later reaper passes instead of dropped.
+    // Seed the transient-lock retry budget here (not in the policy). Waiting
+    // for the final task detach is event-driven and does not decrement it.
     victim.retries_left = REAP_MAX_RETRIES;
     let mut q = REAP_QUEUE.lock();
     if let Some(queue) = q.as_mut() {
@@ -273,8 +330,8 @@ fn enqueue_victim(mut victim: OomVictim) -> Option<u64> {
         // victim; drop silently if the bounded backlog is full (the victim's
         // own exit teardown still reclaims it). `push` stays within the
         // reserved capacity, so it never reallocates.
-        if !queue.iter().any(|v| v.tid == tid) && queue.len() < queue.capacity() {
-            queue.push(victim);
+        if !queue.iter().any(|v| v.tid == tid) && queue.len() < REAP_BACKLOG {
+            queue.push_back(victim);
             REAP_PENDING.store(true, Ordering::Release);
         }
     }
@@ -292,27 +349,39 @@ pub fn reap_abandoned_count() -> usize {
     REAP_ABANDONED.load(Ordering::Acquire)
 }
 
+/// Consume a request for a cooperative retry. This is set only for a reaper
+/// collision or a post-quiescence region-lock collision, never merely because
+/// a victim task remains alive.
+pub fn take_reap_retry_request() -> bool {
+    REAP_RETRY_SOON.swap(false, Ordering::AcqRel)
+}
+
 /// Reap every queued victim, freeing its resident anonymous frames. Returns the
 /// number of base pages reclaimed. Driven by a dedicated reaper kthread from a
 /// safe (non-IRQ, no-locks-held) context; each victim's `Arc` is released as it
 /// is processed, so if the reaper held the last reference the remaining teardown
 /// (page tables, root) completes in `Drop`.
 ///
-/// A victim the reaper cannot make progress on this pass — its region lock is
-/// transiently held (`try_lock` failed), or it is a `vm_shared` group with a
-/// sibling thread still exiting (`Arc::strong_count > 1`) — is REQUEUED with a
-/// decremented retry budget rather than dropped, so a later pass retries it.
-/// Only once the budget is exhausted is it abandoned to its own exit teardown
-/// (and accounted in [`reap_abandoned_count`]), so a transient obstruction
-/// never silently strands the victim's frames.
+/// A victim with live scheduler tasks is requeued WITHOUT spending its retry
+/// budget and is revisited when final task detach wakes the worker. Once tasks
+/// are quiescent, a transient region-lock collision decrements the bounded
+/// retry budget and requests a cooperative retry. Only exhaustion of that
+/// post-quiescence budget abandons the victim to normal exit teardown.
 ///
 /// Allocation-free: it processes only the victims present when the pass starts
-/// (a length snapshot), popping each from the FRONT and pushing a still-blocked,
-/// budget-decremented victim to the BACK of the same pre-reserved queue — so it
-/// never re-examines a requeued victim within one pass and never grows the
-/// backing store. Freeing memory must not require allocating memory.
+/// (a length snapshot), popping each from the front and pushing a still-blocked
+/// victim to the back of the same pre-reserved `VecDeque`. Both operations are
+/// O(1), and the extra reserved slot covers the sole serialized in-flight
+/// victim, so freeing memory never allocates.
 pub fn reap_all() -> usize {
+    let Some(_reap) = try_begin_reap() else {
+        // The persistent worker will yield and retry after the current pass
+        // releases its in-flight victim.
+        REAP_RETRY_SOON.store(true, Ordering::Release);
+        return 0;
+    };
     let mut total = 0;
+    let mut retry_soon = false;
     // Snapshot how many victims to process this pass. Blocked victims we push
     // back land beyond this count and are left for the next pass, so a single
     // call can't spin on the same still-blocked victim.
@@ -322,38 +391,55 @@ pub fn reap_all() -> usize {
     };
     while remaining > 0 {
         remaining -= 1;
-        // Pop one victim from the FRONT under the queue lock; `remove(0)` keeps
-        // the reserved capacity so the queue never reallocates. Reaping itself
-        // runs outside the queue lock (it takes address-space + shootdown locks).
+        // Pop one victim from the front in O(1). Reaping itself runs outside
+        // the queue lock (it takes address-space + shootdown locks).
         let mut victim = {
             let mut q = REAP_QUEUE.lock();
             match q.as_mut() {
-                Some(queue) if !queue.is_empty() => queue.remove(0),
+                Some(queue) => match queue.pop_front() {
+                    Some(victim) => victim,
+                    None => break,
+                },
                 _ => break,
             }
         };
-        // A count of 1 means the reaper's own `Arc` is the sole remaining
-        // clone: no scheduler slot references the AS, so no thread (single- or
-        // multi-threaded) is live on it — reaping is safe even if it was once
-        // `vm_shared`. See the module doc.
-        let sole_owner = Arc::strong_count(&victim.address_space) == 1;
-        match victim.address_space.reap_anonymous_owned(sole_owner) {
+        // Passive Arc owners are irrelevant to execution liveness. Only the
+        // scheduler-maintained task count proves whether a user can still fault
+        // or enter a VMA critical section through this root.
+        if !victim.address_space.user_tasks_quiesced() {
+            let mut q = REAP_QUEUE.lock();
+            if let Some(queue) = q.as_mut() {
+                debug_assert!(queue.len() < queue.capacity());
+                queue.push_back(victim);
+            }
+            continue;
+        }
+        match victim.address_space.reap_anonymous_owned() {
             ReapOutcome::Reaped(pages) => total += pages,
             ReapOutcome::Nothing => {}
             ReapOutcome::Blocked => {
-                // Couldn't make progress (lock held, or a `vm_shared` sibling
-                // still exiting). Requeue with a decremented budget, or abandon
-                // it once the budget is spent.
+                // Re-check liveness because a task publication racing the first
+                // observation must be treated as event-driven task wait, not as
+                // a transient lock collision. Valid scheduler lifecycles do not
+                // attach after zero, but this keeps the gate fail-closed.
+                if !victim.address_space.user_tasks_quiesced() {
+                    let mut q = REAP_QUEUE.lock();
+                    if let Some(queue) = q.as_mut() {
+                        debug_assert!(queue.len() < queue.capacity());
+                        queue.push_back(victim);
+                    }
+                    continue;
+                }
+                // Every task is quiescent, so Blocked means `try_lock` met a
+                // transient passive kernel owner. Retry cooperatively with a
+                // bounded budget rather than spinning under this call.
                 if victim.retries_left > 0 {
                     victim.retries_left -= 1;
                     let mut q = REAP_QUEUE.lock();
                     if let Some(queue) = q.as_mut() {
-                        // Push to the BACK, within the reserved capacity (this
-                        // victim just came off the same bounded queue, so there
-                        // is room). Never reallocates.
-                        if queue.len() < queue.capacity() {
-                            queue.push(victim);
-                        }
+                        debug_assert!(queue.len() < queue.capacity());
+                        queue.push_back(victim);
+                        retry_soon = true;
                     }
                 } else {
                     // Retry budget spent. Account it (never a silent leak — the
@@ -370,9 +456,13 @@ pub fn reap_all() -> usize {
     // Leave REAP_PENDING set iff victims (requeued blockers) remain.
     let still_queued = {
         let q = REAP_QUEUE.lock();
-        q.as_ref().map_or(0, |queue| queue.len())
+        let pending = q.as_ref().is_some_and(|queue| !queue.is_empty());
+        REAP_PENDING.store(pending, Ordering::Release);
+        pending
     };
-    REAP_PENDING.store(still_queued > 0, Ordering::Release);
+    if retry_soon && still_queued {
+        REAP_RETRY_SOON.store(true, Ordering::Release);
+    }
     total
 }
 
@@ -392,7 +482,7 @@ pub(crate) mod test_support {
     pub(crate) fn arm_queue() {
         let mut q = REAP_QUEUE.lock();
         if q.is_none() {
-            *q = Some(Vec::with_capacity(REAP_BACKLOG));
+            *q = Some(VecDeque::with_capacity(REAP_BACKLOG + 1));
         }
     }
 
@@ -408,6 +498,7 @@ pub(crate) mod test_support {
             queue.clear();
         }
         REAP_PENDING.store(false, Ordering::Release);
+        REAP_RETRY_SOON.store(false, Ordering::Release);
         n
     }
 
@@ -419,8 +510,8 @@ pub(crate) mod test_support {
         let tid = victim.tid;
         let mut q = REAP_QUEUE.lock();
         if let Some(queue) = q.as_mut() {
-            if !queue.iter().any(|v| v.tid == tid) && queue.len() < queue.capacity() {
-                queue.push(victim);
+            if !queue.iter().any(|v| v.tid == tid) && queue.len() < REAP_BACKLOG {
+                queue.push_back(victim);
                 REAP_PENDING.store(true, Ordering::Release);
                 return true;
             }

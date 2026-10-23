@@ -8792,11 +8792,9 @@ pub(crate) fn raise_group_signal(target: u64, signum: u32, info: GroupSigInfo) -
     }
     if signum == 9 {
         let pid = task_to_pid_raw(target).unwrap_or(target);
-        let mut members: alloc::vec::Vec<u64> = thread_group_members(pid);
-        if !members.contains(&target) {
-            members.push(target);
-        }
-        for t in members {
+        let mut saw_target = false;
+        for_each_group_member(pid, |t| {
+            saw_target |= t == target;
             if t == target
                 || crate::task::task_get(t).is_some_and(|task| {
                     task.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING
@@ -8804,6 +8802,13 @@ pub(crate) fn raise_group_signal(target: u64, signum: u32, info: GroupSigInfo) -
             {
                 raise_signal_pending_inner(t, 9, Some(SI_USER));
             }
+            true
+        });
+        // A racing registration/removal can leave the reverse index without
+        // the explicit target. Preserve the old guarantee without allocating a
+        // temporary Vec on this OOM-critical SIGKILL path.
+        if !saw_target {
+            raise_signal_pending_inner(target, 9, Some(SI_USER));
         }
         return Some(0);
     }

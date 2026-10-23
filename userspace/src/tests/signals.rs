@@ -597,6 +597,59 @@ kernel_test_in!(
     smoke_userspace_signal_wakers_are_sharded_and_isolated
 );
 
+/// A signal can land after a wait-specific waker was consumed but before the
+/// task arms its next park. Linux's `try_to_wake_up` still reaches the stable
+/// scheduler state in `task_struct`; NARF's task-lifetime scheduler waker must
+/// provide the same fallback when SIGNAL_WAKERS has no entry.
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_signal_wake_falls_back_to_task_scheduler_waker() -> TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    static WOKE: AtomicBool = AtomicBool::new(false);
+
+    unsafe fn clone_raw(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &VTABLE)
+    }
+    unsafe fn wake_raw(data: *const ()) {
+        // SAFETY: the data pointer below references the static AtomicBool.
+        unsafe { &*(data.cast::<AtomicBool>()) }.store(true, Ordering::Release);
+    }
+    unsafe fn wake_by_ref_raw(data: *const ()) {
+        // SAFETY: the data pointer below references the static AtomicBool.
+        unsafe { &*(data.cast::<AtomicBool>()) }.store(true, Ordering::Release);
+    }
+    unsafe fn drop_raw(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+
+    const TASK: u64 = 0x51_fa_11;
+    crate::handlers::signal_waker_init();
+    WOKE.store(false, Ordering::Relaxed);
+    let task = crate::task::Task::new_registered(TASK, TASK);
+    // SAFETY: the RawWaker points at a static atomic and every vtable operation
+    // preserves that non-owning pointer.
+    let waker =
+        unsafe { Waker::from_raw(RawWaker::new((&WOKE as *const AtomicBool).cast(), &VTABLE)) };
+    task.uctx.install_scheduler_waker(&waker);
+
+    // Deliberately do not register a wait-specific signal waker.
+    crate::handlers::wake_signal(TASK);
+    let woke = WOKE.load(Ordering::Acquire);
+    drop(task);
+    drop(crate::task::release_task(TASK));
+    crate::handlers::signal_waker_init();
+    if !woke {
+        return TestResult::Fail("signal wake lost without a transient wait waker");
+    }
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_signal_wake_falls_back_to_task_scheduler_waker
+);
+
 /// Linux `complete_signal` -> `signal_wake_up` only for a thread that
 /// `wants_signal`, and that wake ends ANY interruptible sleep, a timed one
 /// included. A wake for a signal the thread blocks (a thread-directed raise

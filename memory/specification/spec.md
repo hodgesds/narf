@@ -280,9 +280,16 @@ pub struct ReclaimRequest {
 /// Atomically consume one node's coalesced target, newest ticket, and OOM
 /// authorization while retaining the sequence base for later requests.
 pub fn take_reclaim_request(node: usize) -> ReclaimRequest;
-/// Serialize global victim selection, re-check viability, and reap before
-/// another node may select a victim.
+/// Serialize global victim selection, re-check viability, and stage one victim
+/// for the dedicated reaper before another node may select.
 pub fn request_oom_relief_and_reap_if(still_needed: fn() -> bool) -> Option<u64>;
+/// Install the allocation-free wake seam for a boot-preallocated reaper task.
+pub fn oom::set_reaper_wake_hook(hook: fn());
+/// Process one bounded snapshot of the O(1)-ended victim deque.
+pub fn oom::reap_all() -> usize;
+/// True only when a serialized reap collided or a quiescent victim's region
+/// lock was transiently busy; the worker yields before retrying.
+pub fn oom::take_reap_retry_request() -> bool;
 
 /// Fixed-point proportional-set-size units (one private resident page).
 pub const PSS_UNITS_PER_PAGE: u64;
@@ -376,7 +383,9 @@ pub struct HugeRegion {
 }
 
 /// Ordinary base-page VMA metadata. Backing is indexed by virtual page offset
-/// in sparse 64-slot blocks; absent blocks and explicit zero both mean unbacked.
+/// in sparse 64-page directory buckets whose slot payload grows only through
+/// the highest reserved offset in that bucket; absent slots and explicit zero
+/// both mean unbacked.
 /// BRK_HEAP, STACK_SEGMENT, FILE_DEMAND, and ANON_MERGEABLE may have a logical
 /// backing length shorter than the VMA; other kinds retain an exact logical
 /// length. Neither logical length nor the highest touched offset allocates holes.
@@ -415,8 +424,10 @@ impl UserPagePin {
 /// AddressSpaceError::Pinned (move_pages reports per-page EBUSY).
 
 /// Metadata only: cloning does not retain frames; dropping does not free them.
-/// A sorted block directory provides logarithmic lookup and amortized
-/// sequential growth. Insertion before existing blocks shifts directory entries.
+/// A sorted 64-page-bucket directory provides logarithmic lookup and amortized
+/// sequential growth. Each bucket's slot vector is a materialized prefix, so a
+/// one-page fault in a tiny VMA does not retain a full 64-slot payload.
+/// Insertion before existing blocks shifts directory entries.
 /// Existing dense builders can convert Vec<PhysAddr> with Into; fault and
 /// transaction paths use fallible reservation/copy before publishing ownership.
 pub struct RegionBacking { /* private block directory and logical length */ }
@@ -429,7 +440,7 @@ impl RegionBacking {
     pub fn allocated_slots(&self) -> usize;
     pub fn metadata_bytes(&self) -> usize; // directory payload + spare capacity
     pub fn get(&self, index: usize) -> Option<&PhysAddr>;
-    /// Prepare one block fallibly before entering allocators/filesystems.
+    /// Prepare the exact slot prefix fallibly before entering allocators/filesystems.
     pub fn reserve_slot(&mut self, index: usize) -> Result<(), BackingAllocError>;
     /// Allocation-free; None means no explicit slot was reserved.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut PhysAddr>;
@@ -449,7 +460,9 @@ impl RegionBacking {
 
 /// POSIX protection bits plus internal address-space state. COW preserves the
 /// logical WRITE authority while shared resident leaves remain hardware RO;
-/// LOCKED excludes a range from reclaim, including lazy MLOCK_ONFAULT pages.
+/// LOCKED excludes a range from ordinary pressure reclaim, including lazy
+/// MLOCK_ONFAULT pages. It does not exempt a SIGKILLed OOM victim's private
+/// backing from final reaping.
 pub struct RegionPerms(u32);
 impl RegionPerms {
     pub const READ: RegionPerms;
@@ -566,6 +579,11 @@ impl AddressSpace {
     /// Stable, never-reused identity of this address-space incarnation.
     /// Const-created empty address spaces allocate it lazily on first use.
     pub fn identity(&self) -> u64;
+    /// Scheduler-owned execution-liveness accounting. Attach happens before
+    /// task publication; detach happens only after its final poll. Passive Arc
+    /// owners do not contribute.
+    pub fn scheduler_attach_user_task(&self);
+    pub fn scheduler_detach_user_task(&self);
     /// Publish/query the main executable's immutable Linux RLIMIT_DATA charge.
     pub fn set_program_data_bytes(&self, bytes: u64);
     pub fn program_data_bytes(&self) -> u64;
@@ -605,10 +623,12 @@ impl AddressSpace {
     /// Region backing; huge mappings are copied and installed eagerly.
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError>;
     /// Back one anonymous/file-demand page. An already-backed not-present
-    /// fault attempts one root-locked leaf install: success registers the rmap
-    /// (without an x86 invalidation for a non-present-to-present transition),
-    /// while `AlreadyMapped` performs the architecture-local invalidation and
-    /// retries without duplicating ownership. Anonymous reserve refusal returns
+    /// fault fallibly reserves the rmap hash row and any alias capacity before
+    /// attempting one root-locked leaf install. Success consumes that reservation
+    /// without allocation and registers the rmap (without an x86 invalidation
+    /// for a non-present-to-present transition), while `AlreadyMapped` performs
+    /// the architecture-local invalidation and retries without duplicating
+    /// ownership. Anonymous reserve refusal returns
     /// `AddressSpaceError::ReclaimPressure(ReclaimTicket)` only after its page
     /// claim and all address-space/allocator locks have been released;
     /// `Unmapped` and `OutOfRange` retain their non-reclaim meanings.
@@ -678,8 +698,10 @@ impl AddressSpace {
         &self, receipt: MappingReceipt,
     ) -> Result<(), AddressSpaceError>;
     /// Atomically changes a completely-covered rounded range across ordinary
-    /// and hardware-huge VMAs. Base-page split capacity and swap state are
-    /// preflighted before any huge leaf changes; internal VMA flags survive.
+    /// and hardware-huge VMAs. Base-page index capacity, sparse-backing
+    /// boundary windows, and swap state are preflighted before any permission
+    /// or huge-leaf change; allocation failure leaves the VMA tree unchanged,
+    /// and internal VMA flags survive a successful split.
     pub fn mprotect_range(
         &self, base: VirtAddr, len: u64, new_perms: RegionPerms,
     ) -> Result<(), AddressSpaceError>;
@@ -699,6 +721,14 @@ impl AddressSpace {
     /// Safety: no task may execute user code in this address space again, and
     /// all exit-time user-memory accesses must already be complete.
     pub unsafe fn reclaim_unshared_on_exit(&self) -> usize;
+    /// Reap resident private base pages after the OOM policy has initiated
+    /// SIGKILL. `_owned` proceeds only when the scheduler-maintained live-task
+    /// count is zero; passive Arc owners may remain. This prevents an IRQ-
+    /// disabled region-lock waiter from blocking the cross-CPU TLB-shootdown
+    /// acknowledgement. Private LOCKED pages are included; SHARED borrowed
+    /// backing, huge mappings, and swap slots remain for normal exit teardown.
+    pub fn reap_anonymous(&self) -> usize;
+    pub fn reap_anonymous_owned(&self) -> ReapOutcome;
     /// Test membership across both base-page and hardware huge-page regions.
     pub fn contains_address(&self, vaddr: VirtAddr) -> bool;
     /// Return the registered hardware leaf size (4 KiB, 2 MiB, or 1 GiB).
@@ -743,12 +773,21 @@ impl AddressSpace {
         new_base: VirtAddr,
         new_len: u64,
     ) -> Result<(), AddressSpaceError>;
-    /// Publish LOCKED on the mapped prefix, then eagerly populate it. A later
-    /// coverage hole returns `Unmapped` without rolling back the earlier VMA
-    /// flags; malformed arithmetic returns `OutOfRange`; backing allocation or
-    /// installation failure returns `LockFailed` and also retains LOCKED.
+    /// Publish LOCKED on the mapped prefix, then eagerly populate it. Boundary
+    /// split metadata is preflighted and returns `AllocationFailed` without
+    /// changing VMA flags or accounting. A later coverage hole returns
+    /// `Unmapped` without rolling back the earlier mapped-prefix flags;
+    /// malformed arithmetic returns `OutOfRange`; data-page allocation or
+    /// installation failure returns `LockFailed` and retains LOCKED.
     pub fn mlock_range(&self, base: VirtAddr, len: u64)
         -> Result<(), AddressSpaceError>;
+    /// Limit-enforcing eager lock with a caller-supplied fatal-signal probe.
+    /// The O(1) probe runs lock-free before each page population; cancellation
+    /// returns `LockFailed` without rolling back already-published LOCKED flags.
+    pub fn mlock_range_limited_interruptible(
+        &self, base: VirtAddr, len: u64, limit_bytes: u64,
+        bypass_limit: bool, should_abort: impl FnMut() -> bool,
+    ) -> Result<(), AddressSpaceError>;
     /// Pin exactly the rounded mapped range without populating lazy pages.
     pub fn mlock_range_onfault(&self, base: VirtAddr, len: u64)
         -> Result<(), AddressSpaceError>;
@@ -770,6 +809,13 @@ impl AddressSpace {
         future: FutureLockPolicy,
         limit_bytes: u64,
         bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError>;
+    /// Limit-enforcing MCL transition whose eager CURRENT population observes
+    /// the same caller-supplied fatal-signal probe as mlock.
+    pub fn update_mlockall_limited_interruptible(
+        &self, current: Option<FutureLockPolicy>, future: FutureLockPolicy,
+        limit_bytes: u64, bypass_limit: bool,
+        should_abort: impl FnMut() -> bool,
     ) -> Result<(), AddressSpaceError>;
     /// Clear current and future memory locking atomically.
     pub fn munlock_all(&self) -> Result<(), AddressSpaceError>;
@@ -1321,8 +1367,9 @@ x86_64 is rejected at runtime.
   cached frames are visible in the zone; alternative allocators use the
   scalar default.
 - Ordinary private anonymous mmap regions, including MAP_FIXED replacements,
-  carry explicit provenance. All base-page backing uses sparse 64-slot blocks;
-  holes and untouched tails consume no slots. A demand fault reserves its block
+  carry explicit provenance. All base-page backing uses sparse 64-page buckets
+  with variable slot prefixes; holes and untouched tails consume no slots. A
+  demand fault reserves its exact slot prefix
   fallibly before leaf/rmap publication or filesystem entry. Allocation failure
   retires the ticket and leaves frame ownership with the fault path. Logical
   prefix length is separate from storage: a distant offset cannot force dense
@@ -1508,6 +1555,14 @@ x86_64 is rejected at runtime.
   verifies the leaf in memory and executes local `INVLPG`; general kernel,
   remap, permission, teardown, and AArch64 paths retain their prior barriers
   and invalidation behavior.
+- A demand fault reserves its reverse-map table row and any required alias
+  capacity while the fault ticket still exclusively owns the frame. A fresh
+  frame's promised first owner remains in the inline representation; only hash
+  growth or an existing alias can require allocation. Leaf installation,
+  authoritative backing publication, and `add_reserved` then run as one
+  allocation-free region-lock transaction. Cancellation or install failure
+  releases the reservation before the unpublished frame/reference is returned,
+  so no visible user leaf can outlive or precede its reverse-map authority.
 - Final-owner address-space teardown relies on the scheduler active-mm's strong
   `Arc` ownership: reaching `Drop` proves no CPU can still execute or repopulate
   the root. Both architectures retire a nonzero lifetime process tag before
@@ -1540,10 +1595,17 @@ x86_64 is rejected at runtime.
   The slab converts free blocks to page estimates per size class, visits the
   4 KiB class first while dividing pressure fairly across the remaining
   classes, and reclaims only a frame whose complete block set is present on the
-  central list. It detaches those blocks and updates class ownership under the
-  class lock, then releases that lock before buddy return, cgroup uncharge, or
-  any callback that can re-enter the allocator. The negative cgroup uncharge
-  path reached during final-owner return is itself allocation-free. Test
+  central list. Each central list is an intrusive FIFO with a persistent
+  allocation-free frame candidate and finite snapshot cursor. A class-lock
+  acquisition examines at most 2,048 nodes; concurrent allocations consume
+  from that finite snapshot and new frees append after it, so producers cannot
+  extend a pass. Partial candidates remain private across bounded visits and
+  return to the queue in O(1) after one snapshot; a complete candidate detaches
+  exactly one frame. The old whole-list address sort is forbidden. The slab
+  updates class ownership under the class lock, then releases that lock before
+  buddy return, cgroup uncharge, or any callback that can re-enter the
+  allocator. The negative cgroup uncharge path reached during final-owner
+  return is itself allocation-free. Test
   cleanup unregisters only its named/test-marked shrinkers and cannot erase a
   live slab, page-cache, or other production registration.
 - Slab fast-path allocation accounting is cache-local: each magazine publishes
@@ -1594,7 +1656,17 @@ x86_64 is rejected at runtime.
   that cycle, so a handled failure or exited stressor cannot make a late pass
   kill an unrelated process. Generic kernel allocation failures request
   reclaim without authorizing OOM because fallible heap callers may handle the
-  error; explicitly scoped non-fault OOM policy does not require a waiter. One
+  error. Eager `mlock` population is an explicitly scoped non-fault OOM site:
+  when reserve pressure ends the synchronous population with `EAGAIN`, it
+  republishes the request without the fault-waiter requirement so the failed
+  syscall cannot leave every memory hog resident while later kernel work drains
+  the protected reserve. `Never` overcommit mode still suppresses that
+  authorization. Other explicitly scoped non-fault OOM policy likewise does
+  not require a waiter. Eager `mlock`, `mlock2(flags=0)`, and MCL_CURRENT
+  population also call the upper layer's O(1) fatal-signal predicate before
+  each page fault, outside every address-space and allocator lock. Cancellation
+  stops further allocation while retaining already-published LOCKED metadata,
+  matching Linux GUP's `fatal_signal_pending(current)` escape. One
   compare-exchange transaction consumes the target/authorization/
   ticket while preserving the sequence base, so neither an existing ordinary
   request nor a failure arriving during a pass can mismatch completion with
@@ -1604,6 +1676,20 @@ x86_64 is rejected at runtime.
   retried before declaring no progress. A `brk` extension
   reserves virtual address space only; physical user frames are allocated
   lazily by the demand-fault path and inherit the same watermark policy.
+- OOM victim execution liveness is independent of allocation lifetime. Each
+  scheduler slot increments its address space's atomic live-task count before
+  publication, exec attaches the replacement before exposing it and detaches
+  the old root afterwards, and final slot drop decrements only after the task
+  cannot be polled again. The reaper requires an acquire observation of zero
+  before taking the region lock and issuing a forced tag-wide shootdown. This
+  admits passive strong owners (active-mm handoff, process metadata, `/proc`
+  snapshots) without mistaking them for executable threads. A live victim is
+  kept on the bounded queue without consuming retries and its one-to-zero
+  transition wakes the boot-preallocated reaper. Only a post-quiescence
+  `try_lock` collision consumes the bounded retry budget. The queue is a
+  pre-reserved `VecDeque`: front pop and back requeue are O(1), a serialized
+  pass holds at most one victim outside it, and the reserved extra slot makes
+  requeue allocation-free even if selection fills the logical backlog.
 - PSS is a range-selection weight, never evidence that physical memory was
   released. Watermark progress advances only by conservative reverse-map
   `expected_free_pages`; locked, malformed, and zero-yield ranges are skipped.

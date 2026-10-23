@@ -119,11 +119,12 @@ pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    match as_ref.mlock_range_limited(
+    match as_ref.mlock_range_limited_interruptible(
         VirtAddr::new(start),
         len,
         authority.limit_bytes,
         authority.bypass_limit,
+        current_task_fatal_signal_pending,
     ) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         // Linux: EINVAL for malformed/range-overflow input, ENOMEM for a VMA
