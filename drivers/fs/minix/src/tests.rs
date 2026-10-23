@@ -768,3 +768,119 @@ kernel_test_in!(
     "drivers/fs/minix",
     smoke_minix_mmap_cache_generation_tracks_mutations
 );
+
+/// The shared page cache keys retained pages by
+/// `mmap_backing_identity`, so the identity must belong to the
+/// inode, not to the node an open minted (issue #679): two opens of
+/// one file report the volume anchor for its inode number, a
+/// different inode reports a different anchor, and the value
+/// survives the first open.
+fn smoke_minix_mmap_identity_is_per_inode() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image_writable();
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    let first = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hi.txt failed"),
+    };
+    let second = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second lookup failed"),
+    };
+    if alloc::sync::Arc::ptr_eq(&first, &second) {
+        return TestResult::Fail("expected two distinct opens of hi.txt");
+    }
+    if first.mmap_backing_identity() != second.mmap_backing_identity() {
+        return TestResult::Fail("two opens of one inode report different mmap identities");
+    }
+    let other = match poll_once(root.create("other.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create other.txt failed"),
+    };
+    if other.mmap_backing_identity() == first.mmap_backing_identity() {
+        return TestResult::Fail("two inodes share an mmap identity");
+    }
+    let identity = first.mmap_backing_identity();
+    drop(first);
+    if second.mmap_backing_identity() != identity {
+        return TestResult::Fail("the identity changed while an open of the inode was alive");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_mmap_identity_is_per_inode);
+
+/// Inode reuse after unlink (issue #679): the inode allocator hands
+/// a freed number to the next create, so the new file necessarily
+/// shares the old file's identity anchor while an open of the old
+/// file is still alive — what must separate the two files is the
+/// generation: the final unlink and the create each issue a fresh
+/// one, so the old tenant's retained pages can never validate
+/// against the new file.
+fn smoke_minix_mmap_identity_inode_reuse_after_unlink() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image_writable();
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    let first = match poll_once(root.create("one.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create one.txt failed"),
+    };
+    if poll_once(first.write(0, b"ONE")).and_then(|r| r.ok()) != Some(3) {
+        return TestResult::Fail("write through one.txt failed");
+    }
+    let ino = first.ino();
+    let id_first = first.mmap_backing_identity();
+    let gen_first = match first.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("one.txt reports no cache generation"),
+    };
+    // Unlink while `first` stays open — the POSIX case that leaves a
+    // live node holding a dead file's pages.
+    if poll_once(root.unlink("one.txt"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("unlink one.txt failed");
+    }
+    let second = match poll_once(root.create("two.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create two.txt failed"),
+    };
+    if second.ino() != ino {
+        return TestResult::Fail("inode number was not reused (test premise)");
+    }
+    if second.mmap_backing_identity() != id_first {
+        return TestResult::Fail("reused inode reports a different identity");
+    }
+    if second.mmap_cache_generation() == Some(gen_first) {
+        return TestResult::Fail(
+            "new tenant of a recycled inode validates against the old tenant's generation",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_mmap_identity_inode_reuse_after_unlink
+);

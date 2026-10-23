@@ -1067,3 +1067,132 @@ kernel_test_in!(
     "drivers/fs/fat",
     smoke_fat_mmap_cache_generation_tracks_mutations
 );
+
+/// The shared page cache keys retained pages by
+/// `mmap_backing_identity`, so the identity must belong to the file,
+/// not to the node an open minted (issue #679): two opens of one file
+/// report the volume anchor for its directory entry, a different file
+/// reports a different anchor, and the value survives the first open.
+fn smoke_fat_mmap_identity_is_per_file() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    let img = build_fat12_image(128, b"narf\n");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    let first = match poll_once(root.lookup_async("NARF.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup NARF.TXT failed"),
+    };
+    let second = match poll_once(root.lookup_async("NARF.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second lookup failed"),
+    };
+    if alloc::sync::Arc::ptr_eq(&first, &second) {
+        return TestResult::Fail("expected two distinct opens of NARF.TXT");
+    }
+    if first.mmap_backing_identity() != second.mmap_backing_identity() {
+        return TestResult::Fail("two opens of one file report different mmap identities");
+    }
+    let other = match poll_once(root.create("OTHER.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create OTHER.TXT failed"),
+    };
+    if other.mmap_backing_identity() == first.mmap_backing_identity() {
+        return TestResult::Fail("two files share an mmap identity");
+    }
+    let identity = first.mmap_backing_identity();
+    drop(first);
+    if second.mmap_backing_identity() != identity {
+        return TestResult::Fail("the identity changed while an open of the file was alive");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_mmap_identity_is_per_file);
+
+/// Slot reuse after rename (issue #679): rename vacates a directory
+/// slot without re-keying the moved file's open nodes, and a later
+/// create reuses the tombstoned slot. The new tenant necessarily
+/// shares the slot's identity anchor — what must separate the two
+/// files is the generation: rename and create each issue a fresh
+/// one, so neither the moved file's retained pages nor the still-open
+/// pre-rename node's pages can validate against the new tenant (and
+/// vice versa). A fresh lookup of the renamed file keys by its new
+/// slot instead.
+fn smoke_fat_mmap_identity_slot_reuse_after_rename() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    let img = build_fat12_image(128, b"narf\n");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    let a = match poll_once(root.create("AAAA.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create AAAA.TXT failed"),
+    };
+    if poll_once(a.write(0, b"AAAA-DATA")).and_then(|r| r.ok()) != Some(9) {
+        return TestResult::Fail("write through AAAA.TXT failed");
+    }
+    let id_a = a.mmap_backing_identity();
+    let gen_a = match a.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("AAAA.TXT reports no cache generation"),
+    };
+
+    if poll_once(root.rename("AAAA.TXT", "BBBB.TXT"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("rename AAAA.TXT -> BBBB.TXT failed");
+    }
+    // The create below must land in AAAA's tombstoned slot: the
+    // directory's free-slot scan is linear, and that tombstone is the
+    // earliest free slot in the fixture's root directory.
+    let c = match poll_once(root.create("CCCC.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create CCCC.TXT failed"),
+    };
+    if c.mmap_backing_identity() != id_a {
+        return TestResult::Fail("create did not reuse the renamed-away slot (test premise)");
+    }
+    if c.mmap_cache_generation() == Some(gen_a) {
+        return TestResult::Fail(
+            "new tenant of a reused slot validates against the old tenant's generation",
+        );
+    }
+    // The still-open pre-rename node keeps the old slot's identity,
+    // but rename moved that slot's generation: its retained pages
+    // are retired too, not silently carried to the new tenant.
+    if a.mmap_cache_generation() == Some(gen_a) {
+        return TestResult::Fail("rename did not invalidate the moved file's retained pages");
+    }
+    // A fresh lookup of the renamed file keys by its new slot.
+    let b = match poll_once(root.lookup_async("BBBB.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup BBBB.TXT failed"),
+    };
+    if b.mmap_backing_identity() == id_a {
+        return TestResult::Fail("renamed file kept its old slot identity on fresh lookup");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_mmap_identity_slot_reuse_after_rename
+);

@@ -1002,8 +1002,17 @@ file as generic (mutually exclusive with `mmap_frames`/`mmap_fault`) and opt it
 into bounded retention of clean fallback pages after their final unmap. The
 generation changes after every byte or length mutation; an idle page is reused
 only while its recorded generation matches. The cache keeps only a weak file
-reference, never discards a dirty page, and files returning `None` retain the
-conservative final-unmap reclamation behavior.
+reference and never discards a dirty page. For files returning `None` the weak
+reference is also the retention guard — the page is reclaimed once no mapping
+and no live file object remains, because the default
+`mmap_backing_identity` is a per-object address another file may recycle. A
+file returning a generation vouches for the stronger discipline: a stable
+per-file `mmap_backing_identity` (a volume-anchored token shared by every open
+of the file) plus a generation that names one file instance at one mutation
+epoch and is never reissued to a different file. For those files
+(identity, generation) is the guard: retained pages survive the publishing
+open and may be reused or written back through any later open of the same
+file while the generation matches.
 
 `supports_mmap_fault` is the side-effect-free capability check for direct
 demand backing. It is deliberately separate from `mmap_fault_async`: a

@@ -993,15 +993,27 @@ const MAX_RETAINED_SHARED_FILE_PAGES: usize = 1024;
 
 /// `page` caches `ops`'s file. A page with live mappings or pending holds is
 /// pinned by those mappers' strong `FileOps` references, so its identity
-/// cannot have been reused; an idle page additionally needs its recording
-/// open to be alive, so a recycled default identity (an object address)
-/// never adopts another file's stale page.
+/// cannot have been reused. An idle page falls into one of two regimes:
+///
+/// - No cache generation: the filesystem never vouched for the page, and its
+///   identity may be a recycled object address, so the recording open must
+///   still be alive — otherwise a recycled identity could adopt another
+///   file's stale page.
+/// - A cache generation is recorded: the filesystem opted into the
+///   generation discipline, which is only sound with a stable per-file
+///   `mmap_backing_identity` (a volume-anchored token, never a per-open
+///   address). Identity plus the generation checks at the call sites are
+///   the guard then, and the recording open need not outlive the page —
+///   that is what lets a later open of the same file reuse it.
 ///
 /// `identity` is the caller's `ops.mmap_backing_identity()`, computed before
 /// taking the cache lock (a filesystem may lock or allocate to answer it).
 fn shared_page_matches_ops(page: &SharedFilePage, identity: usize) -> bool {
     page.identity == identity
-        && (page.mappings != 0 || page.pending != 0 || page.ops.upgrade().is_some())
+        && (page.mappings != 0
+            || page.pending != 0
+            || page.ops.upgrade().is_some()
+            || page.cache_generation.is_some())
 }
 
 fn retain_pending_shared_page(page: &mut SharedFilePage) {
@@ -1019,9 +1031,13 @@ fn shared_page_is_clean(page: &SharedFilePage) -> bool {
 }
 
 fn should_retire_idle_shared_page(page: &SharedFilePage, cache_len: usize) -> bool {
-    if page.ops.upgrade().is_none() {
-        // The file object is gone, so no writeback can ever reach it again;
-        // retaining the frame only leaks it.
+    if page.cache_generation.is_none() && page.ops.upgrade().is_none() {
+        // The file object is gone and no generation discipline vouches for
+        // the page, so no writeback can ever reach it again and its
+        // identity cannot be trusted across opens; retaining the frame
+        // only leaks it. A generation-carrying page is the opposite case:
+        // its file is identified by (identity, generation), a later open
+        // can still flush or reuse it, and the cap below bounds retention.
         return true;
     }
     if !shared_page_is_clean(page) {
@@ -3005,5 +3021,143 @@ mod tests {
     kernel_test_in!(
         "userspace/perf",
         smoke_shared_file_idle_cache_requires_current_generation
+    );
+
+    /// Two opens of one generation-disciplined file, modelled the way
+    /// the FAT/minix drivers behave: distinct owner objects reporting
+    /// one volume-anchored identity and one shared generation counter.
+    struct AnchoredOwner {
+        identity: usize,
+        generation: Arc<AtomicU64>,
+    }
+
+    impl FileOps for AnchoredOwner {
+        fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move { Ok(buf.len()) })
+        }
+
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+
+        fn mmap_cache_generation(&self) -> Option<u64> {
+            Some(self.generation.load(Ordering::Acquire))
+        }
+
+        fn mmap_backing_identity(&self) -> usize {
+            self.identity
+        }
+    }
+
+    /// Cross-open retention (issue #679): a generation-carrying page
+    /// is retained for its *file*, so a second open reuses it after
+    /// the publishing open — the only holder of the recording
+    /// `FileOps` object — is gone. A generation-less page keeps the
+    /// old rule and retires with its owner.
+    fn smoke_shared_file_cache_survives_publisher_close() -> TestResult {
+        const OFFSET: u64 = 0x7ffd_0000;
+        // The anchor stand-in: a dedicated static whose address plays
+        // the volume anchor's role (stable, unique, never a node).
+        static ANCHOR: AtomicU64 = AtomicU64::new(0);
+        let identity = &ANCHOR as *const AtomicU64 as usize;
+        let generation = Arc::new(AtomicU64::new(7));
+
+        let first_candidate = match narf_memory::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        let open1: Arc<dyn FileOps> = Arc::new(AnchoredOwner {
+            identity,
+            generation: Arc::clone(&generation),
+        });
+        let (first_phys, first) =
+            publish_shared_file_pages(&open1, OFFSET, alloc::vec![first_candidate], Some(7));
+        let first_canonical = first_phys == alloc::vec![first_candidate];
+        let first_retained = retain_shared_file_page(first_candidate.raw());
+        first.commit();
+        // Close the publishing open before the mapping is released:
+        // the recording file object is gone entirely.
+        drop(open1);
+        let first_released = release_shared_file_page(first_candidate.raw());
+        let retained_after_close = SHARED_FILE_PAGES
+            .lock()
+            .by_phys
+            .values()
+            .any(|page| page.phys == first_candidate);
+
+        // A fresh open of the same file (a new object, same anchored
+        // identity and generation) must reuse the retained page.
+        let open2: Arc<dyn FileOps> = Arc::new(AnchoredOwner {
+            identity,
+            generation: Arc::clone(&generation),
+        });
+        let hit = reserve_cached_shared_file_pages(&open2, OFFSET, 1);
+        let hit_same = hit
+            .as_ref()
+            .is_some_and(|(phys, _)| phys == &alloc::vec![first_candidate]);
+        if let Some((phys, publication)) = hit {
+            let _ = retain_shared_file_page(phys[0].raw());
+            publication.commit();
+            let _ = release_shared_file_page(phys[0].raw());
+        }
+        // A mutation through the file (a generation move) ends reuse.
+        generation.store(8, Ordering::Release);
+        let stale_rejected = reserve_cached_shared_file_pages(&open2, OFFSET, 1).is_none();
+        let retired = SHARED_FILE_PAGES.lock().remove_phys(first_candidate.raw());
+        let retired_final = retired.is_some();
+        if let Some(page) = retired {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(page.phys));
+        }
+        if !first_canonical
+            || !first_retained
+            || !first_released
+            || !retained_after_close
+            || !hit_same
+            || !stale_rejected
+            || !retired_final
+        {
+            return TestResult::Fail(
+                "retained page did not survive its publishing open for the next open",
+            );
+        }
+
+        // The generation-less regime is unchanged: a page whose owner
+        // is gone retires at release, because its identity is only an
+        // object address.
+        let plain_candidate = match narf_memory::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        let plain: Arc<dyn FileOps> = Arc::new(TestOwner);
+        let (plain_phys, plain_pub) =
+            publish_shared_file_pages(&plain, OFFSET, alloc::vec![plain_candidate], None);
+        let plain_canonical = plain_phys == alloc::vec![plain_candidate];
+        let plain_retained = retain_shared_file_page(plain_candidate.raw());
+        plain_pub.commit();
+        drop(plain);
+        let plain_released = release_shared_file_page(plain_candidate.raw());
+        let plain_gone = !SHARED_FILE_PAGES
+            .lock()
+            .by_phys
+            .values()
+            .any(|page| page.phys == plain_candidate);
+        if !plain_canonical || !plain_retained || !plain_released || !plain_gone {
+            return TestResult::Fail("generation-less page survived the death of its only owner");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "userspace/perf",
+        smoke_shared_file_cache_survives_publisher_close
     );
 }
