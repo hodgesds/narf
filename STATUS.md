@@ -70,6 +70,11 @@ software work. No off-box radio, DHCP or AP interoperability has been demonstrat
 All eleven in-tree families are covered by the current audit and dependency
 ledger in `drivers/wireless/specification/spec.md` and its family documents.
 Intel now sends versioned coexistence, SoC latency and awake-power setup.
+A retained Gen2 context-v1/RFH/TFH boot owner now covers APM, ALIVE6, unified
+NVM and MVM post-init configuration; the Gen2 scan/station lifecycle remains
+gated. Host nonce and SAE paths require fallible hardware entropy instead of
+the old timing seed; validated RSNA M1 renewal alone requests a fresh SNonce.
+Full system entropy-pool/health services remain open.
 Its retained maintenance work progresses through synchronous packet service;
 stalled TX credit no longer prevents RX and cancelled waiters retain EAPOL work.
 MT76 retains cancelled work through bounded WFSYS reset, firmware reload and
@@ -103,15 +108,21 @@ native station paths remain incomplete. RTL8188EU now has a persistent native
 packet receipt/stop owner, channel1/XTAL initialization and a bounded shared
 management association plan. Signed, exact-board calibration artifacts now
 gate native transmit gains and MAC TX activation; missing qualification keeps
-TX closed. Native RX/management service binding and station composition remain.
+TX closed. The initial channel1 station service now composes native USB
+management/data, authentication/association, RSNA and CCMP with Narf-Rings and
+synchronous packet progression; the exact terminal M4 receipt precedes key/port
+commit. Signed board curves and deployment policy are required for publication.
+Reset/rejoin generations, broader channels/rates and PMF remain software work.
 RTL8188EE has a retained native firmware worker; packet DMA/RF remain closed.
 RTW89 has checked owned AX firmware selection, cold-power/DDV primitives and
 fuse-selected immutable header/section download plans with host blacklist
 enforcement. Power-off/normalization and DLE/HFC primitives now have Linux-C
 trace coverage. Native CH12 commands now retain DMA through the multi-tag
-delay and use corrected hardware/host index fields; full PCIe/BDRAM/WCPU
-composition and station work remain. Its diagnostic
-probe retains unpublished storage without activating rings, IRQs or a NIC.
+delay and use corrected hardware/host index fields. A retained WCPU loader
+now follows Linux reset, secure IDMEM and header/section progression and waits
+for initialized firmware; full PCIe/BDRAM/startup composition and station work
+remain. Its diagnostic probe retains unpublished storage without activating
+rings, IRQs or a NIC.
 USB retains published address/configuration/control/bulk DMA, checks slot
 generations and implements explicit Stop/Set-Dequeue fencing for the supported
 bulk profile; halt/reset/replug and broader reclamation remain software work.
@@ -122,9 +133,9 @@ silicon, reset/recovery and PM remain software work. These gates
 cannot be closed by physical testing alone. No physical device validation is
 part of the current software-only work.
 
-The last committed software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared wireless
-and crypto QEMU gates: x86_64 reports 1699 pass / 0 fail / 11 skip;
-aarch64 reports 1003 pass / 0 fail / 3 skip.
+The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
+wireless, crypto and ARM RNG QEMU gates: x86_64 reports 1756 pass / 0 fail /
+10 skip; aarch64 reports 1058 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.

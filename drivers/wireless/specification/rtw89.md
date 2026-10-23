@@ -64,8 +64,7 @@ B's secure v0 length960 override changes both descriptor and payload; ambiguous
 checksum-bearing overrides and v0 ignored-descriptor cases fail explicitly.
 Signatures replace bytes only in owned output, preserving the verified image.
 Header H2C requests no runtime ACK; section chunks are raw firmware bytes
-without an invented H2C/last flag. This prepares transfers but does not
-establish CH12/WCPU ownership or start a download.
+without an invented H2C/last flag. The plan alone performs no hardware I/O.
 
 The private `command_native::Native` CH12 backend owns checked coherent packet
 and ring allocations. Constructor/configuration require independently fenced
@@ -86,7 +85,24 @@ Linux multi-tag delay. Failed publication and Drop retain queued/quarantined
 DMA and the published ring. Only an independent hardware stop/idle/prefetch
 fence permits explicit reclamation; capability revocation or BME-off alone
 does not establish that proof. The backend remains inactive in the diagnostic
-probe until the complete PCIe/WCPU startup owner is implemented.
+probe until the complete PCIe/BDRAM/startup composition is implemented.
+
+The private `firmware_boot::Firmware<Transport>` retains the plan and prepared
+CH12 transport through one WCPU reset/download attempt. It checks chip identity
+and fresh, never-published transport preparation before starting; an empty ring
+that has already carried a command cannot authorize another WCPU reset.
+AX watchdog/platform reset and CPU
+enable precede secure IDMEM mode recording, H2C-path readiness, the sequence0
+header command, FWDL-path readiness and ordered raw sections. A five-ms settle
+and bounded firmware-control status7 check precede `Running`; status6 alone
+does not authorize runtime commands. A/C watchdog accesses require the full
+indirect BAR aperture at0x40000, checked by the native register backend.
+Errors and cancellation retain a non-reusable owner and uncertain command DMA;
+retry requires a separate complete fenced reset. Linux C trace comparisons cover
+all four AX profiles with zero/nonzero initial registers and secure mode, while
+models cover exact prepared transfers, every register-access failure, failed
+publication, path/final-status timeout and cancellation. This prerequisite does
+not enable the diagnostic probe's DMA or publish a network interface.
 
 `power::Power<Io>::power_on` ports the complete PCI RTL8852A byte table and
 RTL8852B/C/8851B power-on callbacks, including XTAL commands, cut/RFE/SPS
@@ -179,7 +195,7 @@ bring-up scaffolding and does not establish a working station runtime.
 |---|---|
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
 | Complete per-chip power/PCIe initialization | Native power-on/off, inherited-state normalization and DLFW DLE/HFC primitives implemented with Linux-C traces; probe composition and full PCIe/BDRAM setup remain |
-| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans and native CH12 ownership implemented; full PCIe activation and WCPU lifecycle remain |
+| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans, native CH12 ownership and retained WCPU loading implemented; full PCIe activation and startup composition remain |
 | Ring quiesce/publication, BDRAM setup, IRQ ownership and recovery | Incomplete |
 | AX initial native TX layout and bounded completion ownership | Shared production backend implemented and model-tested; not yet activated by station/firmware owner |
 | RPQ release handling, RX assembly/validation and frame delivery | Incomplete |

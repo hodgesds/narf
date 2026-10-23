@@ -18,6 +18,9 @@ impl Firmware {
     pub(in crate::iwlwifi) fn tx_write(&self) -> u32 {
         self._registers[tx_gen2::HBUS_TARG_WRPTR as usize / 4]
     }
+    pub(in crate::iwlwifi) fn register(&mut self, offset: u32, value: u32) {
+        self._registers[offset as usize / 4] = value;
+    }
     /// Inject one literal firmware packet into a posted RFH buffer and
     /// publish its actual used-ring descriptor/status, as a device would.
     pub(in crate::iwlwifi) fn inject(
@@ -64,6 +67,12 @@ impl Firmware {
 }
 
 pub(in crate::iwlwifi) fn create(full: bool) -> (Hardware, Firmware) {
+    create_for_format(full, rx_rfh::CompletionFormat::Bz)
+}
+pub(in crate::iwlwifi) fn create_for_format(
+    full: bool,
+    format: rx_rfh::CompletionFormat,
+) -> (Hardware, Firmware) {
     let cap = Cap::<BusDeviceCap, Write>::bootstrap();
     let mut registers = vec![0u32; 0x10000 / 4].into_boxed_slice();
     let region = MmioRegion {
@@ -75,7 +84,7 @@ pub(in crate::iwlwifi) fn create(full: bool) -> (Hardware, Firmware) {
         },
     };
     let mut mmio = super::super::IwlMmioImpl::new(region, cap);
-    let mut rx = ReceiveQueue::new(rx_rfh::CompletionFormat::Bz).unwrap();
+    let mut rx = ReceiveQueue::new(format).unwrap();
     rx.publish(&mut mmio).unwrap();
     let firmware = Firmware {
         _registers: registers,
@@ -84,7 +93,7 @@ pub(in crate::iwlwifi) fn create(full: bool) -> (Hardware, Firmware) {
         status: rx.status.as_mut_ptr(),
         next: 0,
     };
-    let mut queue = super::super::data_queue::DataQueue::new().unwrap();
+    let mut queue = super::super::data_queue::DataQueue::for_format(format).unwrap();
     let mut response = [0; 8];
     boot_context::put16(&mut response, 0, 17);
     queue.configure(0, 0).unwrap();
@@ -103,10 +112,12 @@ pub(in crate::iwlwifi) fn create(full: bool) -> (Hardware, Firmware) {
             commands: CommandQueue::new().unwrap(),
             boot: BootImage {
                 context: dma_alloc(4096).unwrap(),
-                scratch: dma_alloc(4096).unwrap(),
-                iml: dma_alloc(4096).unwrap(),
+                scratch: Some(dma_alloc(4096).unwrap()),
+                iml: Some(dma_alloc(4096).unwrap()),
                 iml_len: 0,
-                _info: dma_alloc(4096).unwrap(),
+                _info: Some(dma_alloc(4096).unwrap()),
+                prepare: None,
+                phy_config: 0,
                 _sections: Vec::new(),
             },
             data: vec![queue],
@@ -126,7 +137,7 @@ pub(in crate::iwlwifi) fn create(full: bool) -> (Hardware, Firmware) {
             },
         },
         cap,
-        format: rx_rfh::CompletionFormat::Bz,
+        format,
         interrupts: None,
         notifications: alloc::collections::VecDeque::new(),
         responses: alloc::collections::VecDeque::new(),
@@ -156,4 +167,8 @@ pub(in crate::iwlwifi) unsafe fn destroy(hardware: Hardware) {
         core::ptr::drop_in_place(&mut hardware.tx_completed);
         core::ptr::drop_in_place(&mut hardware.versions);
     };
+}
+
+pub(in crate::iwlwifi) fn versions(hardware: &mut Hardware, commands: &[u8]) {
+    hardware.versions = commands.to_vec();
 }

@@ -7,7 +7,7 @@ use super::{
     scan_api, security, station_api,
 };
 use alloc::{collections::VecDeque, vec::Vec};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Debug)]
 pub struct Beacon {
@@ -190,6 +190,13 @@ impl Connection {
         } else if beacon.privacy {
             return Err("secured AP requested as open");
         }
+        // Fail before station firmware changes if secure association cannot
+        // obtain an unpredictable SNonce. Open networks do not sample entropy.
+        let snonce = if secure {
+            Some(Zeroizing::new(security::fresh_nonce()?))
+        } else {
+            None
+        };
         let qos = super::qos::Parameters::parse(&beacon.information_elements)?;
         let domain = narf_wireless::reg::db::get_domain()
             .ok_or("wireless regulatory domain is not configured")?;
@@ -311,14 +318,12 @@ impl Connection {
         };
         // With the PMK in hand, arm the 4-way handshake session.
         if let (Some(pmk), Some(akm)) = (pmk, akm) {
-            let mut nonce = [0; 32];
-            narf_crypto::fill_random_bytes(&mut nonce);
             this.security = Some(security::Session::new(
                 akm,
                 pmk,
                 this.beacon.bssid,
                 local,
-                nonce,
+                **snonce.as_ref().ok_or("missing secure association nonce")?,
                 this.beacon.rsn.clone().ok_or("AP has no RSN IE")?,
             ));
         }
@@ -537,7 +542,9 @@ impl Connection {
         // `build_commit` is called once: an anti-clogging retry must resend the
         // same scalar/element, adding only the AP-supplied token (§12.4.7.4).
         const SAE_STATUS_ANTI_CLOGGING: u16 = 76; // §9.4.1.9
-        let commit = sae.build_commit();
+        let commit = sae
+            .try_build_commit()
+            .map_err(|_| "SAE commit entropy/parameters unavailable")?;
         let mut token: Vec<u8> = Vec::new();
         let mut commit_reply = Vec::new();
         let mut accepted = false;

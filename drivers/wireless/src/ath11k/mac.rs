@@ -120,7 +120,9 @@ pub trait WmiPort {
     /// `ath11k_wmi_send_scan_chan_list_cmd`'s split.
     fn max_msg_len(&self) -> u32;
     /// `get_random_bytes`.
-    fn random_bytes(&self, out: &mut [u8]);
+    /// Failure supplies no usable randomness, even if the output was partly
+    /// written. Callers must close the pending protocol before publication.
+    fn random_bytes(&self, out: &mut [u8]) -> Result<(), i32>;
 }
 
 /// The data-path side of the core.
@@ -390,11 +392,15 @@ pub mod step {
     pub const FOUR_ADDR: u32 = 317;
     /// `NL80211_EXT_FEATURE_STA_TX_PWR` peer-power programming failed.
     pub const STATION_TX_POWER: u32 = 318;
+    /// Cryptographic entropy unavailable. detail:0=LRO,1=4-way,2=rekey,
+    /// 3=SA-query,4=SAE. No partially filled output may reach a protocol.
+    pub const ENTROPY: u32 = 319;
 }
 
 /// Linux errnos used here (positive).
 pub mod errno {
     pub const EPERM: i32 = 1;
+    pub const EIO: i32 = 5;
     pub const EINVAL: i32 = 22;
     pub const EBUSY: i32 = 16;
     pub const ENOENT: i32 = 2;
@@ -5008,7 +5014,11 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             return fail(step::START_DP, 2, e, "mon status default");
         }
         let mut seed = [0u8; 4 * (ATH11K_IPV4_TH_SEED_SIZE + ATH11K_IPV6_TH_SEED_SIZE)];
-        self.wmi.random_bytes(&mut seed);
+        self.wmi.random_bytes(&mut seed).map_err(|e| {
+            let error = MacError::new(step::ENTROPY, 0, e);
+            error.report("LRO entropy");
+            error
+        })?;
         let w = |i: usize| {
             u32::from_le_bytes([
                 seed[4 * i],

@@ -13,7 +13,7 @@
 //! - [`groups`] — the IANA "Transform Type 4 - DH Group" IDs SAE
 //!   selects between (P-256 / P-384 / P-521 …).
 //! - [`session`] — the [`SaeSession`] handshake driver (H2E or
-//!   hunting-and-pecking PWE) with the `build_commit` / `on_commit` /
+//!   hunting-and-pecking PWE) with the `try_build_commit` / `on_commit` /
 //!   `build_confirm` / `on_confirm` API used by drivers, pinned to the
 //!   IEEE 802.11-2020 Annex J.10 vectors hostap's `sae_tests` checks.
 //!

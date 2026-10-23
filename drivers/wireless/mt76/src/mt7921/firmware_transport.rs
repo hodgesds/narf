@@ -369,6 +369,7 @@ impl<T> Drop for Retained<T> {
 /// Firmware/transport failure. A started failure cannot be replayed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    EntropyUnavailable,
     Busy,
     InvalidFirmware,
     UnsupportedFirmware,
@@ -606,6 +607,11 @@ fn command_frame(command: u8, seq: u8, payload: &[u8]) -> Result<Vec<u8>, Error>
 }
 
 trait Backend {
+    /// Protocol nonce entropy is fallible; deterministic fixtures override this
+    /// boundary, while the native backend always requires the architectural RNG.
+    fn random_bytes(&mut self, out: &mut [u8]) -> Result<(), Error> {
+        narf_crypto::try_fill_random_bytes(out).map_err(|_| Error::EntropyUnavailable)
+    }
     fn progress(&mut self, _stage: Stage) {}
     fn now_ns(&self) -> u64;
     fn check(&self) -> Result<(), Error>;

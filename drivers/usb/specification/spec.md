@@ -194,6 +194,14 @@ also consult upstream Linux GPL sources.
   Full reconnect, DMA-page reclamation and controller-reset recovery remain
   software prerequisites. Successful bulk stop reuses retained pages only;
   it does not free mappings, reopen a poisoned EP0 or enable slot reuse.
+  Live Address Device/HID fixtures hold recycled hardware slots allocated
+  until Enable Slot supplies a never-used software slot, using the same
+  unused-generation predicate as production Address Device. They never clear
+  retired ownership. Two real address/class-bind/Disable cycles cover the
+  HID-before-address order and verify the prior slot stays retired when a
+  different fresh slot is addressed, independently of hardware allocation
+  order. Every fixture reservation is disabled on terminal cleanup; the
+  bounded HID report wait uses the scheduler's self-driven sleep bridge.
 - Command/EP0 waits inspect the bounded completion queues before each single
   hardware-event demux, check deadlines throughout, and yield after at most
   32 unrelated events. Queue pressure cannot make the waiter's own draining

@@ -86,7 +86,8 @@ acceptance gates and are not enabled by this profile's station tests.
 - **Stage 1**: PCI match table.
 - **Stage 2**: CSR/PRPH mapping + APM init + ucode header parsing.
 - **Stage 3**: Owned Gen3 firmware loading and DMA ALIVE handshake. Gen2
-  context-v1/RFH/TFH/MVM boot remains an explicit software dependency.
+  context-v1/RFH/TFH and retained API77 MVM boot ownership are implemented;
+  MVM station context/security/scan lifecycle remains an explicit software dependency.
 - **Stage 4**: Interface traits, IPC ring integration, background
   RX/TX pumps, and the MLD station scan/association/data implementation.
 - **Stage 5 (In progress)**: First hardware boot/ALIVE, firmware init,
@@ -158,6 +159,57 @@ fail before replacing the live RX/TX endpoints; a failed attempt requires a fres
 device owner. Real-cap revocation/missing-authority, duplicate-call and
 post-staging registry-failure fixtures exercise the actual publication entry
 without publishing an interface or worker.
+
+### 3.4 Retained 22000 / API77 MVM boot
+
+A separate Gen2 owner implements the context-v1 transport for exact AX200
+2723 and AX201 02f0/43f0/a0f0 MAC/RF profiles. It selects Linux's CC/Qu/QuZ
+firmware prefix from discovered identity and requires API77 and the negotiated
+ALIVE6/NVM4 command profile. Native automatic admission remains closed: MVM
+station MAC/PHY/binding, rate/key/Block-Ack, scan and recovery lifecycle still
+need integration before a Gen2 interface can be published.
+
+The transport retains its 1792-byte context, all LMAC/UMAC/paging sections,
+command ring and Qu RFH allocations. Context-v1 uses 8-byte page-address/tag
+free entries and 4-byte low12-ID completions. TX uses the 20-byte v9 command
+and DWORD byte counts; RX MPDUs use the separate 48-byte v1 envelope.
+Mappings are checked for alignment, tag bounds and 4GiB self-load boundaries.
+It does not borrow the Gen3 IML/scratch bootstrap.
+
+Gen2 native preparation has a one-shot phase before the first register
+operation. BME stays verified off through ownership/reset, protected
+persistence handling, integrated forced-gating or discrete AX200 BISR,
+L0s/clock workarounds, firmware PHY configuration and shadow registers.
+Actual interleaved PRPH apertures and 20-bit/width-encoded addressing are
+used throughout. Retained context publication precedes ROM LTR programming
+and CPU release. ALIVE6's packed extent is checked, then unified NVM init
+requires INIT_EXTENDED_CFG(NVM), NVM_ACCESS_COMPLETE and INIT_COMPLETE.
+Nonzero SKU does not select the Gen3 external PNVM sequence.
+
+`mvm_boot::Owner` retains the exact transport and firmware sections through
+NVM/antenna discovery, BT coexistence, exact PCI SoC latency, continuously
+awake device power and scan configuration. Missing command versions/capabilities
+fail before boot publication. It exposes identity only after all correlated
+firmware receipts. Failed or dropped initialization cannot reset/retry that
+owner; transport stop/fence/quarantine rules govern later destruction.
+Configured boot is distinct from an authorized station or a usable netdev.
+
+Kernel fixtures drive the actual owned RFH/TFH paths through ALIVE/NVM and
+post-init command receipts, cancellation and duplicate-retry rejection.
+Independent literal register/descriptor fixtures check context queue units,
+PRPH apertures, TXv9/byte-count and RX48 geometry. These are software ownership
+checks, with physical radio validation still pending.
+
+### 3.5 Secure association and rekey entropy
+
+Protected association obtains its SNonce from the fallible guarded hardware
+entropy API before station firmware mutation; Open association needs no sample.
+SAE uses the shared fallible Commit API and propagates unavailable entropy.
+Pairwise rekey samples a fresh SNonce before replacing its pending candidate,
+active PTK or replay state. Repeated M1 uses the retained response without
+resampling. Partial failing samples remain private and are zeroized. Independent
+key/replay fixtures cover failure, retry and cached retransmission; no timing
+seed is admitted for production nonces.
 
 ## 4. References
 

@@ -65,6 +65,7 @@ mod download_plan;
 pub mod efuse;
 mod fifo;
 mod fifo_regs;
+mod firmware_boot;
 mod firmware_registry;
 pub mod fw;
 pub mod fwdl;

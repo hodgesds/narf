@@ -17,9 +17,10 @@
 //! The retained RTL8188EU probe powers and identifies the chip, selects
 //! descriptor-derived USB endpoints, loads authenticated firmware, installs
 //! FIFO/MAC/BB/RF tables and performs checked post-table LC/full IQK. MAC
-//! TX/RX remain closed until channel policy and a retained station packet
-//! owner exist. Software CCMP framing/key ownership is tested separately;
-//! it does not publish a network interface or grant controlled-port access.
+//! TX/RX remain closed until signed board qualification and deployment policy
+//! admit the retained channel1 station service. That service binds native USB,
+//! Open/WPA2 MLME, retained shared RSNA/software CCMP and Narf-Ring Ethernet.
+//! No real board qualification artifact is supplied by this software port.
 //! Other matched families remain detection-only. Legacy register/descriptor
 //! helpers are diagnostics, not proof of working transport for those chips.
 //!
@@ -41,6 +42,7 @@ pub mod device_init;
 pub mod efuse;
 pub mod firmware_transport;
 pub mod fw;
+pub mod interface;
 pub mod intr;
 pub mod mac;
 pub mod management_runtime;
@@ -59,6 +61,9 @@ pub mod rtl8723b;
 pub mod rtl8821c;
 pub mod rtl8822b;
 pub mod rx;
+pub mod security_runtime;
+pub mod service_runtime;
+pub mod station_runtime;
 pub mod usb;
 
 pub use regs::{ChipFamily, RTL8XXXU_VENDOR};
@@ -181,6 +186,14 @@ pub fn rtl8xxxu_probe(
                 "  rtl8188eu: firmware attempt {:?}",
                 result
             );
+            if result.is_ok() {
+                let service = interface::attach(firmware.clone()).await;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8188eu: channel1 station service {:?}",
+                    service
+                );
+            }
         });
     }
 
@@ -257,8 +270,8 @@ impl From<usb::TransportError> for BringUpError {
 
 /// Retired synchronous all-in-one bring-up. The old implementation ignored
 /// table-write errors and IQK results and enabled RX before a complete MAC
-/// lifecycle. Live probe initialization now uses `firmware_transport::Owner`;
-/// full RF/station initialization remains an explicit subsequent stage.
+/// lifecycle. Live probe initialization now uses `firmware_transport::Owner`
+/// and the separately admitted retained station service.
 pub fn bring_up_8188eu<T: usb::Rtl8xxxuTransport>(
     _transport: &T,
     _fw_payload: &[u8],

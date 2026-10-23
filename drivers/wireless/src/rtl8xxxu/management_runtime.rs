@@ -141,11 +141,17 @@ impl Candidate {
     pub fn bssid(&self) -> [u8; 6] {
         self.bss.bssid
     }
+    pub(super) fn capability(&self) -> u16 {
+        self.bss.capability
+    }
     pub fn ssid(&self) -> &[u8] {
         &self.bss.ssid
     }
     pub fn channel(&self) -> u8 {
         self.bss.channel
+    }
+    pub fn information_elements(&self) -> &[u8] {
+        &self.bss.information_elements
     }
     /// Original AP bodies, retained independently from the station's canonical
     /// negotiated RSNE for Supplicant::with_rsna and M3 KDE binding.
@@ -207,6 +213,9 @@ impl Join {
             .to_vec();
         Ok(Action::Transmit(self.sequence(frame)))
     }
+    pub fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.plan.append_sme_ies(bytes).map_err(Error::Protocol)
+    }
     pub fn cancel(&mut self) {
         self.plan.cancel();
     }
@@ -218,6 +227,7 @@ impl Join {
             || bytes[10..16] != self.candidate.bssid()
             || bytes[16..22] != self.candidate.bssid()
             || bytes[4..10] != self.local
+                && !(matches!(bytes[0], 0xa0 | 0xc0) && bytes[4..10] == [255; 6])
         {
             return Ok(None);
         }
@@ -231,7 +241,12 @@ impl Join {
         if matches!(bytes[0], 0xa0 | 0xc0) {
             self.plan.cancel();
             let reason = bytes.get(24..26).ok_or(Error::Frame)?;
-            return Err(Error::PeerLeft(u16::from_le_bytes([reason[0], reason[1]])));
+            let reason = u16::from_le_bytes([reason[0], reason[1]]);
+            return Err(if reason == 0 {
+                Error::Frame
+            } else {
+                Error::PeerLeft(reason)
+            });
         }
         match (self.plan.phase(), bytes[0]) {
             (Phase::AwaitAuthentication, 0xb0) => {

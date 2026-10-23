@@ -381,6 +381,8 @@ pub(super) struct World {
     pub(super) next_desc: u32,
     pub(super) done_descs: Vec<u32>,
     pub(super) eapol_rx: VecDeque<Vec<u8>>,
+    pub(super) rng_error: bool,
+    pub(super) rng_calls: u32,
     pub(super) eth_tx: Vec<Vec<u8>>,
     pub(super) ap: Ap,
     pub(super) dp_calls: Vec<&'static str>,
@@ -793,8 +795,15 @@ impl WmiPort for FakeWmi {
     fn max_msg_len(&self) -> u32 {
         MAX_MSG_LEN
     }
-    fn random_bytes(&self, out: &mut [u8]) {
+    fn random_bytes(&self, out: &mut [u8]) -> Result<(), i32> {
+        let mut state = self.0.lock();
+        state.rng_calls += 1;
+        if state.rng_error {
+            out.fill(0xa5);
+            return Err(errno::EIO);
+        }
         out.fill(SNONCE_FILL);
+        Ok(())
     }
 }
 
@@ -1341,8 +1350,9 @@ impl WmiPort for Failing {
     fn max_msg_len(&self) -> u32 {
         MAX_MSG_LEN
     }
-    fn random_bytes(&self, out: &mut [u8]) {
+    fn random_bytes(&self, out: &mut [u8]) -> Result<(), i32> {
         out.fill(0);
+        Ok(())
     }
 }
 
@@ -4005,3 +4015,161 @@ kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mac_11d_new_country);
 
 /// Unused helper kept for symmetry with the wiphy type in signatures.
 fn _wiphy_type(_: &Wiphy) {}
+
+fn smoke_ath11k_entropy_failure_never_sends_nonce_or_authorizes() -> TestResult {
+    run(|| {
+        let reg = us_reg(false);
+        let (mut fresh, w) = new_mac(default_caps(), Some(&reg), FwCfg::default());
+        w.lock().rng_error = true;
+        let error = block(fresh.start()).unwrap_err();
+        ensure!(
+            error.step == step::ENTROPY && error.detail == 0 && error.errno == errno::EIO,
+            "start entropy error propagated"
+        );
+        ensure!(
+            !take_sent(&w)
+                .iter()
+                .any(|c| c.cmd_id == WMI_LRO_CONFIG_CMDID),
+            "partial entropy never programs LRO hash seed"
+        );
+        let (mut m, w) = scanned_mac(FwCfg {
+            eapol: true,
+            ..Default::default()
+        });
+        w.lock().rng_error = true;
+        let error = block(m.connect(&wpa2_req())).unwrap_err();
+        ensure!(
+            error.step == step::ENTROPY && error.detail == 1 && error.errno == errno::EIO,
+            "SNonce entropy error propagated through real connect"
+        );
+        let state = w.lock();
+        ensure!(
+            state.eth_tx.is_empty() && state.ap.ptk.is_none() && state.authorized != Some(true),
+            "partly filled failed RNG emitted M2, derived PTK or opened controlled port"
+        );
+        ensure!(
+            m.link().is_none(),
+            "failed entropy tears down prepared station"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_entropy_failure_never_sends_nonce_or_authorizes
+);
+fn smoke_ath11k_sae_entropy_failure_precedes_commit() -> TestResult {
+    run(|| {
+        let rsne = [
+            0x30, 0x1a, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8,
+            0xcc, 0, 0, 0, 0, 0x0f, 0xac, 6,
+        ];
+        let cfg = FwCfg {
+            beacons: vec![(6, 50, beacon_sec(&BSSID, SSID, 6, Some(&rsne)))],
+            sae: Some(SaeAp {
+                password: b"entropy-test-pass".to_vec(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (mut m, w) = started_mac(default_caps(), Some(&us_reg(false)), cfg);
+        block(m.hw_scan(&[], &[2437], None, false)).unwrap();
+        take_sent(&w);
+        w.lock().mgmt.clear();
+        w.lock().rng_error = true;
+        let mut req = wpa2_req();
+        req.security = SecurityConfig::Wpa3 {
+            password: b"entropy-test-pass".to_vec(),
+        };
+        let error = block(m.connect(&req)).unwrap_err();
+        ensure!(
+            error.step == step::ENTROPY && error.detail == 4 && error.errno == errno::EIO,
+            "SAE seed failure reported"
+        );
+        ensure!(
+            !w.lock()
+                .mgmt
+                .iter()
+                .any(|f| f.len() >= 30 && f[0] == 0xb0 && f[24..26] == [3, 0]),
+            "failed RNG published a deterministic SAE commit"
+        );
+        ensure!(
+            w.lock().authorized != Some(true) && m.link().is_none(),
+            "failed SAE entropy retained associated/authorized state"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_sae_entropy_failure_precedes_commit
+);
+
+fn smoke_ath11k_rekey_entropy_failure_closes_port_without_reply() -> TestResult {
+    run(|| {
+        let (mut m, w) = scanned_mac(FwCfg {
+            eapol: true,
+            ..Default::default()
+        });
+        block(m.connect(&wpa2_req())).unwrap();
+        let sent = w.lock().eth_tx.len();
+        let calls = w.lock().rng_calls;
+        w.lock().rng_error = true;
+        // Invalid native EAPOL from the right AP must be dropped before a
+        // request for entropy. Exhausting entropy cannot turn garbage into a
+        // forced disconnect or emit a protocol response.
+        w.lock()
+            .eapol_rx
+            .push_back(frame::eapol_eth(&OWN, &BSSID, &[2, 0, 0, 0]));
+        ensure!(
+            block(m.poll()).is_none(),
+            "discarded EAPOL closed healthy link"
+        );
+        {
+            let state = w.lock();
+            ensure!(
+                state.rng_calls == calls
+                    && state.eth_tx.len() == sent
+                    && state.authorized == Some(true),
+                "discarded EAPOL consumed nonce entropy, replied or changed port"
+            );
+        }
+        let mut message = KeyFrame::empty(16);
+        message.key_information = 0x8a;
+        message.key_length = 16;
+        message.replay_counter = 7;
+        message.key_nonce = [0x33; 32];
+        w.lock()
+            .eapol_rx
+            .push_back(frame::eapol_eth(&OWN, &BSSID, &message.into_eapol()));
+        w.lock().rng_error = true;
+        let loss = block(m.poll());
+        ensure!(
+            matches!(
+                loss,
+                Some(LinkLoss::Supplicant {
+                    step: step::ENTROPY,
+                    detail: 2,
+                    ..
+                })
+            ),
+            "rekey entropy failure reaches retained MAC link-loss path"
+        );
+        {
+            let state = w.lock();
+            ensure!(
+                state.eth_tx.len() == sent && state.authorized == Some(false),
+                "failed rekey RNG emitted reply or left data port authorized"
+            );
+        }
+        ensure!(
+            m.link().is_none(),
+            "rekey entropy failure detached station state"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_rekey_entropy_failure_closes_port_without_reply
+);

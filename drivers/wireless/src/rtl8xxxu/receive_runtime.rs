@@ -23,6 +23,7 @@ pub enum Phase {
     Receiving,
     EnablingTransmit,
     Active,
+    Configuring,
     Stopped,
     Failed,
 }
@@ -51,6 +52,8 @@ pub struct Receiver<C: ControlIo, B: PacketIo> {
     firmware: Arc<Firmware<C>>,
     packets: Packets<B>,
     phase: Phase,
+    mailbox: u8,
+    peer: Option<[u8; 6]>,
 }
 impl<C: ControlIo, B: PacketIo> core::fmt::Debug for Receiver<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -83,6 +86,8 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             firmware,
             packets,
             phase: Phase::Prepared,
+            mailbox: 0,
+            peer: None,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -111,6 +116,32 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                 return Err(Error::State);
             }
             self.packets.start().map_err(Error::Packet)?;
+            // Linux start enables data/management filter maps and resets IGI
+            // after posting RX URBs. The firmware/table stage alone does not
+            // establish these receive-admission registers.
+            for register in [0x6a4, 0x6a0] {
+                self.firmware
+                    .write16(register, 0xffff)
+                    .await
+                    .map_err(Error::Control)?;
+                if self
+                    .firmware
+                    .read16(register)
+                    .await
+                    .map_err(Error::Control)?
+                    != 0xffff
+                {
+                    return Err(Error::State);
+                }
+            }
+            let igi = (self.firmware.read32(0xc50).await.map_err(Error::Control)? & !0x7f) | 0x1e;
+            self.firmware
+                .write32(0xc50, igi)
+                .await
+                .map_err(Error::Control)?;
+            if self.firmware.read32(0xc50).await.map_err(Error::Control)? != igi {
+                return Err(Error::State);
+            }
             // The controller owns an RX buffer before MAC RX opens. TX bit6
             // remains clear; no transmitter or station key state is created.
             self.firmware
@@ -181,6 +212,21 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                 .map_err(Error::Control)?;
             if self.firmware.read16(0x100).await.map_err(Error::Control)? & 0xc0 != 0 {
                 return Err(Error::State);
+            }
+            for register in [0x6a0, 0x6a4] {
+                self.firmware
+                    .write16(register, 0)
+                    .await
+                    .map_err(Error::Control)?;
+                if self
+                    .firmware
+                    .read16(register)
+                    .await
+                    .map_err(Error::Control)?
+                    != 0
+                {
+                    return Err(Error::State);
+                }
             }
             // A successful EP0 closure precedes host Stop/SetDeq. No USB
             // cleanup is attempted after an ambiguous EP0 error/cancellation.
@@ -330,6 +376,232 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             Err(error) => {
                 self.fail();
                 Err(Error::Packet(error))
+            }
+        }
+    }
+    pub(super) fn matches_power(&self, permission: super::power_policy::Permission) -> bool {
+        match (self.firmware.factory(), self.firmware.usb_identity()) {
+            (Some(factory), Some((vid, pid))) => {
+                permission.gains(factory, vid, pid, self.channel()).is_ok()
+            }
+            _ => false,
+        }
+    }
+    pub(super) fn local(&self) -> Option<[u8; 6]> {
+        self.firmware.factory().map(|f| f.mac)
+    }
+    pub(super) fn fail_terminal(&mut self) {
+        self.fail();
+    }
+    pub(super) fn submit_native_data(&mut self, frame: &[u8]) -> Result<(), Error> {
+        if self.phase() != Phase::Active
+            || frame.len() < 24
+            || frame[10..16] != self.local().ok_or(Error::State)?
+            || Some(frame[4..10].try_into().unwrap()) != self.peer
+        {
+            return Err(Error::State);
+        }
+        let result = self.packets.submit(super::packet_codec::Kind::Data, frame);
+        if self.packets.is_failed() {
+            self.fail();
+        }
+        result.map_err(Error::Packet)
+    }
+    /// Serialized unicast station programming, from Linux set_linktype and
+    /// set_bssid. This owner has no packet in flight during this transition.
+    pub(super) async fn prepare_station(
+        &mut self,
+        peer: [u8; 6],
+        short_slot: bool,
+    ) -> Result<(), Error> {
+        if self.phase() != Phase::Active
+            || peer == [0; 6]
+            || peer[0] & 1 != 0
+            || Some(peer) == self.local()
+            || self.peer.is_some()
+        {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Configuring;
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = async {
+            if self.firmware.read16(0x100).await.map_err(Error::Control)? & 0xc0 != 0xc0 {
+                return Err(Error::State);
+            }
+            // Linux add_interface(STATION, port0): suppress local beacons
+            // and enable the port's receive/TSF function with ATIM semantics.
+            let q = self.firmware.read8(0x422).await.map_err(Error::Control)?;
+            self.firmware
+                .write8(0x422, q & !0x40)
+                .await
+                .map_err(Error::Control)?;
+            self.firmware
+                .write8(0x541, 0x64)
+                .await
+                .map_err(Error::Control)?;
+            let t = self.firmware.read8(0x542).await.map_err(Error::Control)?;
+            self.firmware
+                .write8(0x542, t & !1)
+                .await
+                .map_err(Error::Control)?;
+            let beacon = self.firmware.read8(0x550).await.map_err(Error::Control)? | 0x19;
+            self.firmware
+                .write8(0x550, beacon)
+                .await
+                .map_err(Error::Control)?;
+            if self.firmware.read8(0x550).await.map_err(Error::Control)? != beacon {
+                return Err(Error::State);
+            }
+            let prior = self.firmware.read8(0x102).await.map_err(Error::Control)?;
+            let msr = (prior & 0x0c) | 2;
+            self.firmware
+                .write8(0x102, msr)
+                .await
+                .map_err(Error::Control)?;
+            if self.firmware.read8(0x102).await.map_err(Error::Control)? != msr {
+                return Err(Error::State);
+            }
+            for (i, byte) in peer.iter().enumerate() {
+                let reg = 0x618 + i as u16;
+                self.firmware
+                    .write8(reg, *byte)
+                    .await
+                    .map_err(Error::Control)?;
+                if self.firmware.read8(reg).await.map_err(Error::Control)? != *byte {
+                    return Err(Error::State);
+                }
+            }
+            self.firmware
+                .write8(0x51b, if short_slot { 9 } else { 20 })
+                .await
+                .map_err(Error::Control)?;
+            // This one-channel passive scan is complete. Linux's scan_complete
+            // permits TSF updates only after the selected BSSID is installed.
+            let beacon = beacon & !0x10;
+            self.firmware
+                .write8(0x550, beacon)
+                .await
+                .map_err(Error::Control)?;
+            if self.firmware.read8(0x550).await.map_err(Error::Control)? != beacon {
+                return Err(Error::State);
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        match result {
+            Ok(()) => {
+                self.peer = Some(peer);
+                self.phase = Phase::Active;
+                Ok(())
+            }
+            Err(error) => {
+                self.fail();
+                Err(error)
+            }
+        }
+    }
+    /// Port0 Linux association bookkeeping and gen2 MEDIA_STATUS_RPT. The
+    /// fixed-rate legacy profile does not enable host rate adaptation/HT.
+    pub(super) async fn association(&mut self, aid: u16, connected: bool) -> Result<(), Error> {
+        if self.phase() != Phase::Active
+            || self.peer.is_none()
+            || connected && !(1..=2007).contains(&aid)
+        {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Configuring;
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let mailbox = self.mailbox;
+        let result = async {
+            if connected {
+                self.firmware
+                    .write8(0x55d, 255)
+                    .await
+                    .map_err(Error::Control)?;
+                let q = self.firmware.read8(0x422).await.map_err(Error::Control)?;
+                self.firmware
+                    .write8(0x422, q & !0x40)
+                    .await
+                    .map_err(Error::Control)?;
+                self.firmware
+                    .write8(0x541, 0x64)
+                    .await
+                    .map_err(Error::Control)?;
+                let t = self.firmware.read8(0x542).await.map_err(Error::Control)?;
+                self.firmware
+                    .write8(0x542, t & !1)
+                    .await
+                    .map_err(Error::Control)?;
+                self.firmware
+                    .write16(0x6a8, 0xc000 | aid)
+                    .await
+                    .map_err(Error::Control)?;
+                if self.firmware.read16(0x6a8).await.map_err(Error::Control)? != 0xc000 | aid {
+                    return Err(Error::State);
+                }
+            } else {
+                // Linux bss_info_changed disconnect: suppress peer TSF updates
+                // before publishing the disconnected media command.
+                let beacon = self.firmware.read8(0x550).await.map_err(Error::Control)? | 0x10;
+                self.firmware
+                    .write8(0x550, beacon)
+                    .await
+                    .map_err(Error::Control)?;
+                if self.firmware.read8(0x550).await.map_err(Error::Control)? != beacon {
+                    return Err(Error::State);
+                }
+            }
+            // Availability precedes publication. Any failed/dropped EP0
+            // poisons the entire radio; mailbox contents are never replayed.
+            let mut ready = false;
+            for _ in 0..100 {
+                if self.firmware.read8(0x1cc).await.map_err(Error::Control)? & (1 << mailbox) == 0 {
+                    ready = true;
+                    break;
+                }
+                self.firmware.delay_us(50).await;
+            }
+            if !ready {
+                return Err(Error::State);
+            }
+            self.firmware
+                .write32(
+                    0x1d0 + u16::from(mailbox) * 4,
+                    if connected { 0x2101 } else { 0x2001 },
+                )
+                .await
+                .map_err(Error::Control)?;
+            let mut consumed = false;
+            for _ in 0..100 {
+                if self.firmware.read8(0x1cc).await.map_err(Error::Control)? & (1 << mailbox) == 0 {
+                    consumed = true;
+                    break;
+                }
+                self.firmware.delay_us(50).await;
+            }
+            if !consumed {
+                return Err(Error::State);
+            }
+            Ok(())
+        }
+        .await;
+        attempt.armed = false;
+        match result {
+            Ok(()) => {
+                self.mailbox = (mailbox + 1) % 4;
+                self.phase = Phase::Active;
+                Ok(())
+            }
+            Err(error) => {
+                self.fail();
+                Err(error)
             }
         }
     }

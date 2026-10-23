@@ -11,10 +11,10 @@
 //! firmware API negotiation, and an MLD station control/data path are
 //! implemented in `runtime`, `device`, and `connection`. The current MLD
 //! command profile targets Sc/BE211 firmware. Unsupported command
-//! versions fail startup explicitly. Gen2 retains a diagnostic transport
-//! path, but keeps carrier down and rejects scan, configuration, and
-//! association until it has a complete firmware command and completion
-//! lifecycle.
+//! versions fail startup explicitly. Gen2 has a retained API77 context-v1
+//! boot owner with RFH/TFH commands and NVM initialization. Native station
+//! admission, scan, configuration, and association stay gated until the
+//! remaining MVM station lifecycle is implemented.
 //!
 //! The station path supports 2.4/5 GHz legacy-rate Open or WPA2-PSK/CCMP
 //! networks. Firmware supplies channel/antenna data and enforces its
@@ -52,16 +52,20 @@ pub mod aggregation;
 pub mod bcast;
 pub mod boot_context;
 pub mod connection;
+mod context_v1;
 pub mod data_queue;
 pub mod device;
 pub mod firmware_api;
 pub mod frame_api;
 pub mod fw_loader;
+mod gen2_prepare;
+mod gen2_profile;
 pub mod handshake;
 pub mod ht_vht;
 pub mod iwl_msix;
 pub mod mac_ctx;
 pub mod mlme;
+mod mvm_boot;
 pub mod pnvm;
 mod progress;
 pub mod qos;

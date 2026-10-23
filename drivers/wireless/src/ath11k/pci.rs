@@ -417,15 +417,17 @@ impl MhiBus for Bar0Mhi {
     fn now_ms(&self) -> u64 {
         narf_time::wall::monotonic_ns() / 1_000_000
     }
-    fn random_nonzero(&self, max: u32) -> u32 {
+    fn random_nonzero(&self, max: u32) -> Result<u32, MhiError> {
         let mut b = [0u8; 4];
-        narf_crypto::fill_random_bytes(&mut b);
+        narf_crypto::try_fill_random_bytes(&mut b).map_err(|_| {
+            MhiError::new(
+                super::mhi_host::step::ENTROPY,
+                max,
+                super::mhi_host::errno::EIO,
+            )
+        })?;
         let v = u32::from_le_bytes(b) & max;
-        if v == 0 {
-            1
-        } else {
-            v
-        }
+        Ok(if v == 0 { 1 } else { v })
     }
     fn notify(&self, ev: MhiNotify) {
         use core::fmt::Write as _;

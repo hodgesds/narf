@@ -196,6 +196,12 @@ impl Native {
         self.state = State::Active;
         Ok(())
     }
+    pub fn chip(&self) -> ChipId {
+        self.chip
+    }
+    pub fn firmware_prepared(&self) -> bool {
+        self.state == State::Active && self.queue.is_pristine()
+    }
     pub fn io(&mut self) -> &mut NativeIo {
         &mut self.io
     }

@@ -222,7 +222,10 @@ kernel_test_in!(
 fn smoke_xhci_address_reservations_never_reuse_published_slots() -> TestResult {
     let mut slots = Slots::new();
     if slots.any_reserved()
+        || slots.is_unused(0)
+        || !slots.is_unused(5)
         || slots.begin(5, 42) != Ok(())
+        || slots.is_unused(5)
         || !slots.any_reserved()
         || slots.begin(5, 43) != Err(Error::Busy)
     {
@@ -233,14 +236,28 @@ fn smoke_xhci_address_reservations_never_reuse_published_slots() -> TestResult {
         return TestResult::Fail("stale attempt released address reservation");
     }
     slots.release_unpublished(5, 42);
-    if slots.any_reserved() || slots.begin(5, 43) != Ok(()) {
+    if slots.any_reserved() || !slots.is_unused(5) || slots.begin(5, 43) != Ok(()) {
         return TestResult::Fail("unpublished address error leaked reservation");
     }
     // Publication omits release_unpublished; disable permanently retires it.
     slots.retire(5);
     slots.release_unpublished(5, 43);
-    if slots.matches(5, 43) || slots.begin(5, 44) != Err(Error::Busy) || !slots.any_reserved() {
+    if slots.matches(5, 43)
+        || slots.is_unused(5)
+        || slots.begin(5, 44) != Err(Error::Busy)
+        || !slots.any_reserved()
+    {
         return TestResult::Fail("disabled slot silently reused retained device DMA");
+    }
+    // Holding a retired hardware slot reserved lets a fixture obtain another
+    // slot without changing the old ownership generation or its DMA claim.
+    if !slots.is_unused(6)
+        || slots.begin(6, 45) != Ok(())
+        || !slots.matches(6, 45)
+        || slots.is_unused(5)
+        || slots.begin(5, 46) != Err(Error::Busy)
+    {
+        return TestResult::Fail("fresh fixture reservation weakened retired-slot ownership");
     }
     TestResult::Pass
 }

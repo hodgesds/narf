@@ -429,3 +429,6 @@ kernel_test_in!(
     "wireless",
     smoke_rtl8188eu_signed_power_then_real_retained_native_management_tx
 );
+
+#[path = "station_tests.rs"]
+mod station_tests;

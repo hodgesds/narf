@@ -66,6 +66,8 @@ fn event(cmd: u8, seq: u8, status: u8) -> Vec<u8> {
 #[derive(Debug)]
 struct Model {
     ticks: Cell<u64>,
+    entropy_fail: bool,
+    entropy_calls: usize,
     live: bool,
     owner: Retained<Lease>,
     active: bool,
@@ -102,6 +104,8 @@ impl Model {
         let resources = Arc::new(AtomicUsize::new(1));
         Self {
             ticks: Cell::new(0),
+            entropy_fail: false,
+            entropy_calls: 0,
             live: true,
             owner: Retained {
                 storage: Some(Lease(resources.clone())),
@@ -146,6 +150,16 @@ impl Drop for Lease {
     }
 }
 impl Backend for Model {
+    fn random_bytes(&mut self, out: &mut [u8]) -> Result<(), Error> {
+        self.entropy_calls += 1;
+        // Explicit deterministic model boundary, never a native fallback.
+        out.fill(0x73);
+        if self.entropy_fail {
+            Err(Error::EntropyUnavailable)
+        } else {
+            Ok(())
+        }
+    }
     fn now_ns(&self) -> u64 {
         let now = self.ticks.get();
         self.ticks.set(now + 1_000_000);
@@ -1344,12 +1358,13 @@ kernel_test_in!(
     mcu_live_join_peer_rejection_and_timeout
 );
 
-fn live_join_wpa2(channel: u8, ofdm: bool) -> TestResult {
+fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult {
     let mut model = Model::new();
     let own = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
     let ap = [2, 1, 2, 3, 4, 5];
     let psk = [0x55u8; 32];
     let anonce = [0xaau8; 32];
+    model.entropy_fail = entropy_failure;
     model.psk = psk;
     model.anonce = anonce;
     model.ap_mac = ap;
@@ -1456,6 +1471,25 @@ fn live_join_wpa2(channel: u8, ofdm: bool) -> TestResult {
         test_permission_for(channel),
         &[],
     ));
+    if entropy_failure {
+        if res != Err(Error::EntropyUnavailable)
+            || !matches!(
+                session.state,
+                State::Failed {
+                    stage: Stage::EapolHandshake,
+                    error: Error::EntropyUnavailable
+                }
+            )
+            || session.security.is_some()
+            || session.backend.entropy_calls != 1
+            || session.backend.frames[before..]
+                .iter()
+                .any(|(_, frame)| join::extract_eapol(frame).is_some())
+        {
+            return TestResult::Fail("entropy failure sent EAPOL or admitted station/keys");
+        }
+        return TestResult::Pass;
+    }
     if res != Ok(42) {
         return TestResult::Fail("associate_station WPA2 failed");
     }
@@ -1546,17 +1580,17 @@ fn live_join_wpa2(channel: u8, ofdm: bool) -> TestResult {
     TestResult::Pass
 }
 fn mcu_live_join_wpa2_psk_dispatches_4way_handshake_and_secure_sta_record() -> TestResult {
-    live_join_wpa2(6, false)
+    live_join_wpa2(6, false, false)
 }
 fn mt76_ofdm_only_24ghz_runs_scan_rsna_packets_disconnect_and_reset() -> TestResult {
-    live_join_wpa2(6, true)
+    live_join_wpa2(6, true, false)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/join",
     mt76_ofdm_only_24ghz_runs_scan_rsna_packets_disconnect_and_reset
 );
 fn mt76_5ghz_runs_scan_rsna_packets_disconnect_and_reset() -> TestResult {
-    live_join_wpa2(36, true)
+    live_join_wpa2(36, true, false)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/join",
@@ -2490,4 +2524,56 @@ fn mt76_native_rx_binds_channel_before_eapol_and_replay() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/transport",
     mt76_native_rx_binds_channel_before_eapol_and_replay
+);
+
+fn mt76_initial_nonce_failure_never_sends_m2_or_opens_port() -> TestResult {
+    live_join_wpa2(6, false, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join",
+    mt76_initial_nonce_failure_never_sends_m2_or_opens_port
+);
+
+fn mt76_rekey_nonce_failure_closes_authorization_before_reply() -> TestResult {
+    let mut session = secure_model();
+    let State::Associated { info, peer, .. } = session.state else {
+        unreachable!()
+    };
+    let mut m1 = narf_wireless::eapol::KeyFrame::empty(16);
+    m1.key_information = 2 | (1 << 3) | (1 << 7);
+    m1.key_length = 16;
+    m1.replay_counter = 7;
+    m1.key_nonce = [0x55; 32];
+    session
+        .backend
+        .packets
+        .push_back(descriptor(&ap_eapol_frame(
+            info.capabilities.mac,
+            peer,
+            &m1.into_eapol(),
+        )));
+    if session.receive_ethernet() != Ok(None) || !session.keys_pending() {
+        return TestResult::Fail("rekey M1 was not queued");
+    }
+    let sent = session.backend.frames.len();
+    session.backend.entropy_fail = true;
+    if run(session.service_keys()) != Err(Error::EntropyUnavailable)
+        || session.backend.frames.len() != sent
+        || session.security.is_some()
+        || !matches!(
+            session.state,
+            State::Failed {
+                stage: Stage::EapolHandshake,
+                error: Error::EntropyUnavailable
+            }
+        )
+        || session.receive_ethernet() != Err(Error::Busy)
+    {
+        return TestResult::Fail("rekey entropy failure emitted a reply or left port authorized");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/join",
+    mt76_rekey_nonce_failure_closes_authorization_before_reply
 );

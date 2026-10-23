@@ -1,8 +1,11 @@
 //! iwlwifi PCIe transport — BAR0 MMIO programming for gen2
 //! direct-DMA section loads and gen3 IML / context-info-v2 boot.
 //!
-//! Both paths share the `apm_init` clock + reset prologue and
-//! diverge from there:
+//! The retained AX200/AX201 API77 boot owner uses `context_v1`,
+//! `gen2_prepare`, and `runtime`; it does not call the older FH
+//! section-loader helpers below. Those helpers remain unactivated.
+//!
+//! The older loader descriptions are:
 //!
 //! - **gen2** (AX200/AX201): driver iterates each section in the
 //!   firmware's INIT image then RUNTIME image, programs the FH
@@ -96,7 +99,7 @@ pub enum TransportError {
 
 /// Read a PRPH register via the HBUS target-address indirection.
 pub fn prph_read<M: IwlMmio>(mmio: &mut M, addr: u32) -> u32 {
-    mmio.write(regs::HBUS_TARG_PRPH_RADDR, addr);
+    mmio.write(regs::HBUS_TARG_PRPH_RADDR, (addr & 0x000f_ffff) | (3 << 24));
     // Linux inserts a small delay loop here ("PRPH read must be
     // staged"); we mirror with a 1-tick compiler_fence pair so a
     // future MMIO ordering audit can find the site.
@@ -106,7 +109,7 @@ pub fn prph_read<M: IwlMmio>(mmio: &mut M, addr: u32) -> u32 {
 
 /// Write a PRPH register via the HBUS target-address indirection.
 pub fn prph_write<M: IwlMmio>(mmio: &mut M, addr: u32, value: u32) {
-    mmio.write(regs::HBUS_TARG_PRPH_WADDR, addr);
+    mmio.write(regs::HBUS_TARG_PRPH_WADDR, (addr & 0x000f_ffff) | (3 << 24));
     compiler_fence(Ordering::SeqCst);
     mmio.write(regs::HBUS_TARG_PRPH_WDAT, value);
 }
@@ -412,8 +415,12 @@ pub fn start_gen3<M: IwlMmio>(
     regions: &Gen3BootRegions,
     format: super::rx_rfh::CompletionFormat,
 ) {
+    if format == super::rx_rfh::CompletionFormat::Qu {
+        return;
+    }
     boot_gen3(mmio, regions);
     match format {
+        super::rx_rfh::CompletionFormat::Qu => unreachable!(),
         super::rx_rfh::CompletionFormat::Ax210 => {
             prph_write_ax210(mmio, regs::UREG_CPU_INIT_RUN + regs::UMAC_PRPH_OFFSET, 1);
         }
@@ -805,7 +812,7 @@ pub mod tests {
     fn smoke_iwlwifi_signal_load_done_writes_prph() -> TestResult {
         let mut m = MockMmio::new();
         signal_load_done_gen2(&mut m);
-        if m.last_write_to(regs::HBUS_TARG_PRPH_WADDR) != Some(regs::PRPH_UREG_UCODE_LOAD_STATUS) {
+        if m.last_write_to(regs::HBUS_TARG_PRPH_WADDR) != Some(0x0300_5c40) {
             return TestResult::Fail("PRPH WADDR wrong");
         }
         if m.last_write_to(regs::HBUS_TARG_PRPH_WDAT) != Some(regs::FH_UCODE_LOAD_STATUS_GEN2) {

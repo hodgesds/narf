@@ -147,8 +147,26 @@ fn clock() -> u64 {
 
 fn noop() {}
 
-fn test_rng(out: &mut [u8]) {
+static ENTROPY_FAIL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+struct EntropyFailure;
+impl EntropyFailure {
+    fn enable() -> Self {
+        ENTROPY_FAIL.store(true, Ordering::Release);
+        Self
+    }
+}
+impl Drop for EntropyFailure {
+    fn drop(&mut self) {
+        ENTROPY_FAIL.store(false, Ordering::Release);
+    }
+}
+fn test_rng(out: &mut [u8]) -> Result<(), i32> {
+    if ENTROPY_FAIL.load(Ordering::Acquire) {
+        out.fill(0xa5);
+        return Err(super::mac::errno::EIO);
+    }
     out.fill(0x22);
+    Ok(())
 }
 
 /// The fake chip, shareable between the HIF and the device model.
@@ -5432,4 +5450,36 @@ fn smoke_ath11k_qca6390_production_profile_station_and_capacity() -> TestResult 
 kernel_test_in!(
     "drivers/wireless/ath11k/qca6390",
     smoke_ath11k_qca6390_production_profile_station_and_capacity
+);
+
+fn smoke_ath11k_native_sa_query_entropy_failure_sends_no_request() -> TestResult {
+    use super::mac_frame::stype;
+    check(|| {
+        let u = up(pmf_cfg())?;
+        pmf_connect(&u)?;
+        let before = mgmt_sent(&u).len();
+        inject(&u, &ap_mgmt(stype::DEAUTH, &OWN, &[6, 0]));
+        let _failure = EntropyFailure::enable();
+        let (_, step, detail, _) = latched(|| pump(&u, 3));
+        ensure!(
+            step == super::mac::step::ENTROPY && detail == 3,
+            "native SA-query entropy failure latched"
+        );
+        let sent = mgmt_sent(&u);
+        ensure!(
+            !sent[before..]
+                .iter()
+                .any(|f| f.len() > 33 && f[0] == 0xd0 && f[32..34] == [8, 0]),
+            "partial failed entropy emitted SA-query transaction ID"
+        );
+        ensure!(
+            !u.netdev.link_up(),
+            "failed SA-query RNG kept native carrier up"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_native_sa_query_entropy_failure_sends_no_request
 );

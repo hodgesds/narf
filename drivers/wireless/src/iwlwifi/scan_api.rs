@@ -1,4 +1,4 @@
-//! UMAC scan v14..18 and AX210+ receive MPDU envelope.
+//! UMAC scan v14..18 and generation-specific receive MPDU envelopes.
 
 use super::boot_context::{put16, put32};
 use alloc::{vec, vec::Vec};
@@ -144,24 +144,32 @@ impl<'a> Mpdu<'a> {
 /// AX210+ uses the 64-byte v3 envelope. CRC/overrun failures must
 /// never enter the 802.11 parser or the network stack.
 pub fn mpdu(bytes: &[u8]) -> Option<Mpdu<'_>> {
-    if bytes.len() < 64 {
+    mpdu_layout(bytes, 64, 40)
+}
+/// Pre-AX210 MVM API4 envelope is 48 bytes. Fields before the PHY union
+/// are shared, but chain energy/channel live eight bytes earlier.
+pub fn mpdu_gen2(bytes: &[u8]) -> Option<Mpdu<'_>> {
+    mpdu_layout(bytes, 48, 32)
+}
+fn mpdu_layout(bytes: &[u8], prefix: usize, energy_offset: usize) -> Option<Mpdu<'_>> {
+    if bytes.len() < prefix {
         return None;
     }
     let len = u16::from_le_bytes(bytes[..2].try_into().ok()?) as usize;
     let status = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
-    if status & 3 != 3 || len < 10 || len > bytes.len() - 64 {
+    if status & 3 != 3 || len < 10 || len > bytes.len() - prefix {
         return None;
     }
-    let energy_a = bytes[40];
-    let energy_b = bytes[41];
+    let energy_a = bytes[energy_offset];
+    let energy_b = bytes[energy_offset + 1];
     let energy = match (energy_a, energy_b) {
         (0, b) => b,
         (a, 0) => a,
         (a, b) => a.min(b),
     };
     Some(Mpdu {
-        frame: &bytes[64..64 + len],
-        channel: bytes[42],
+        frame: &bytes[prefix..prefix + len],
+        channel: bytes[energy_offset + 2],
         rssi: -(energy.min(127) as i8),
         status,
         reorder: u32::from_le_bytes(bytes[16..20].try_into().ok()?),
@@ -229,4 +237,54 @@ pub fn with_phy_capabilities(
         offset += bytes.len();
     }
     Ok(())
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod gen2_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_iwl_gen2_mpdu_native48_prefix_and_phy_offsets() -> TestResult {
+        // Literal RX_MPDU_RES_START_API_S_VER_4: common20 + v1 tail28.
+        // PHY union has RSS/filter/rate, then energy A/B and channel.
+        let mut bytes = [0; 48 + 36];
+        bytes[..5].copy_from_slice(&[36, 0, 0x20, 0x60, 0x83]);
+        bytes[12..16].copy_from_slice(&0x12340003u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&0x56789abcu32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&[75, 43, 36, 0]);
+        // Distinguish from the modern PHY position and catch a reused64 prefix.
+        bytes[40..44].copy_from_slice(&[21, 22, 11, 0]);
+        bytes[48..].fill(0xab);
+        bytes[48..50].copy_from_slice(&[0x88, 2]);
+        let Some(mpdu) = mpdu_gen2(&bytes) else {
+            return TestResult::Fail("valid48-byte MVM envelope rejected");
+        };
+        if mpdu.frame != &bytes[48..]
+            || mpdu.channel != 36
+            || mpdu.rssi != -43
+            || mpdu.status != 0x12340003
+            || mpdu.reorder != 0x56789abc
+            || !mpdu.amsdu
+            || mpdu.amsdu_index != 3
+            || !mpdu.amsdu_last
+            || mpdu.body(26, 0) != Some(&bytes[76..80])
+            || mpdu_gen2(&bytes[..47]).is_some()
+            || super::mpdu(&bytes).is_some()
+        {
+            return TestResult::Fail("Gen2 envelope extent/PHY/padding/trailer used modern layout");
+        }
+        bytes[0..2].copy_from_slice(&37u16.to_le_bytes());
+        if mpdu_gen2(&bytes).is_some() {
+            return TestResult::Fail("Gen2 MPDU body escaped received extent");
+        }
+        bytes[0..2].copy_from_slice(&36u16.to_le_bytes());
+        bytes[12] &= !1;
+        if mpdu_gen2(&bytes).is_some() {
+            return TestResult::Fail("Gen2 CRC failure admitted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/gen2",
+        smoke_iwl_gen2_mpdu_native48_prefix_and_phy_offsets
+    );
 }

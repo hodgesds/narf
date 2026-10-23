@@ -11,7 +11,7 @@ use crate::mt7921::{
 };
 use alloc::{collections::VecDeque, vec, vec::Vec};
 use narf_wireless::eapol::{EapolRx, EapolRxError, Gtk, KeyMgmt, RsnaParams, Supplicant};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Association-owned RSNA state. Key bytes are never included in driver
 /// diagnostics. Keeping the same supplicant across RX permits PTK/GTK rekeys
@@ -74,12 +74,29 @@ impl StationSecurity {
         })
     }
 
-    fn process(&mut self, pdu: &[u8], encrypted: bool) -> Result<Option<EapolRx>, Error> {
-        let mut fresh = [0; 32];
-        narf_crypto::fill_random_bytes(&mut fresh);
-        match self.supplicant.rx_eapol(pdu, encrypted, fresh) {
+    fn process(
+        &mut self,
+        pdu: &[u8],
+        encrypted: bool,
+        mut fill: impl FnMut(&mut [u8]) -> Result<(), Error>,
+    ) -> Result<Option<EapolRx>, Error> {
+        let mut failure = None;
+        let result = self.supplicant.rx_eapol_with_nonce(pdu, encrypted, || {
+            let mut fresh = Zeroizing::new([0; 32]);
+            match fill(&mut fresh[..]) {
+                Ok(()) => Some(*fresh),
+                Err(error) => {
+                    failure = Some(error);
+                    None
+                }
+            }
+        });
+        match result {
             Ok(rx) => Ok(Some(rx)),
             Err(EapolRxError::Drop(_)) => Ok(None),
+            Err(EapolRxError::NonceUnavailable) => {
+                Err(failure.unwrap_or(Error::EntropyUnavailable))
+            }
             Err(_) => Err(Error::MalformedEvent),
         }
     }
@@ -268,7 +285,9 @@ impl<B: Backend> Session<B> {
                 let Some((pdu, protected)) = security.pending.pop_front() else {
                     break;
                 };
-                let Some(result) = security.process(&pdu, protected)? else {
+                let Some(result) =
+                    security.process(&pdu, protected, |out| self.backend.random_bytes(out))?
+                else {
                     continue;
                 };
                 let (reply, tk, gtk) = match result {
@@ -729,7 +748,11 @@ impl<B: Backend> Session<B> {
                                     if let Some(pdu) =
                                         peer_eapol(&packet, own, bss.bssid, bss.channel)
                                     {
-                                        if let Some(result) = security.process(pdu, false)? {
+                                        if let Some(result) =
+                                            security.process(pdu, false, |out| {
+                                                backend.random_bytes(out)
+                                            })?
+                                        {
                                             return Ok(Some(result));
                                         }
                                     }

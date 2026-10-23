@@ -1278,3 +1278,10 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/receive",
     smoke_rtl8188eu_receiver_cancel_after_mac_closed_and_stop_submitted
 );
+
+pub(super) fn initialized_firmware() -> (Fake, Arc<Owner<Fake>>) {
+    let control = Fake::new();
+    let owner = Arc::new(Owner::new(control.clone(), ChipFamily::Rtl8188eu));
+    narf_scheduler::block_on(owner.initialize_device(&image(123))).unwrap();
+    (control, owner)
+}

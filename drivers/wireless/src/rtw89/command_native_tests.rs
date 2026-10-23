@@ -114,7 +114,7 @@ fn smoke_rtw89_native_ch12_program_publish_and_revocation() -> TestResult {
         ChipId::Rtl8851B,
     ] {
         let mut fixture = Fixture::new(chip).unwrap();
-        if fixture.activate().is_err() {
+        if fixture.activate().is_err() || !fixture.native.firmware_prepared() {
             return TestResult::Fail("actual native ring publication/readback");
         }
         let mut body = [0u8; 72];
@@ -123,6 +123,7 @@ fn smoke_rtw89_native_ch12_program_publish_and_revocation() -> TestResult {
         }
         if ready(fixture.native.send(Kind::Section, &body)) != Some(Ok(()))
             || fixture.native.queue.pending() != 1
+            || fixture.native.firmware_prepared()
         {
             return TestResult::Fail("actual native firmware-command receipt");
         }
@@ -146,7 +147,10 @@ fn smoke_rtw89_native_ch12_program_publish_and_revocation() -> TestResult {
             return TestResult::Fail("TXBD omitted command descriptor bytes/address");
         }
         fixture.words[idx] = 0x0001_0001;
-        if fixture.native.poll() != Ok(0) || fixture.native.queue.pending() != 0 {
+        if fixture.native.poll() != Ok(0)
+            || fixture.native.queue.pending() != 0
+            || fixture.native.firmware_prepared()
+        {
             return TestResult::Fail("HW upper-half consumption / multi-tag retention");
         }
         fixture.native.authority.revoke();

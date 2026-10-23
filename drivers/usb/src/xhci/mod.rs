@@ -3575,6 +3575,14 @@ impl Xhci {
         Ok(buf)
     }
 
+    /// Live functional fixtures hold recycled hardware slots allocated until
+    /// they obtain a generation the production Address path can own. This
+    /// never reclaims or clears a retired software reservation.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn test_address_slot_unused(&self, slot_id: u8) -> bool {
+        slot_id <= self.caps.max_slots && self.slots.lock().is_unused(slot_id)
+    }
+
     pub fn device_generation(&self, slot_id: u8) -> Option<u64> {
         self.devices
             .lock()

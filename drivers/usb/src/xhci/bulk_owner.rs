@@ -370,11 +370,14 @@ impl Slots {
         if slot == 0 || generation == 0 || generation == u64::MAX {
             return Err(Error::Stale);
         }
-        if self.generations[usize::from(slot)] != 0 {
+        if !self.is_unused(slot) {
             return Err(Error::Busy);
         }
         self.generations[usize::from(slot)] = generation;
         Ok(())
+    }
+    pub fn is_unused(&self, slot: u8) -> bool {
+        slot != 0 && self.generations[usize::from(slot)] == 0
     }
     pub fn matches(&self, slot: u8, generation: u64) -> bool {
         generation != 0 && self.generations[usize::from(slot)] == generation

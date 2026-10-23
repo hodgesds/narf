@@ -85,9 +85,9 @@ pub struct ReceiveQueue {
 impl ReceiveQueue {
     pub fn new(format: rx_rfh::CompletionFormat) -> Result<Self, &'static str> {
         let mut queue = Self {
-            free: dma_alloc(RX_DEPTH * 16)?,
+            free: dma_alloc(RX_DEPTH * format.free_size())?,
             used: dma_alloc(RX_DEPTH * format.size())?,
-            status: dma_alloc(2)?,
+            status: dma_alloc(16)?,
             buffers: Vec::with_capacity(RX_DEPTH - 1),
             tracker: rx_rfh::CompletionTracker::new(format),
             format,
@@ -115,7 +115,14 @@ impl ReceiveQueue {
         // SAFETY: this buffer has returned to the host, or is not yet
         // published. No device can own it until the next doorbell.
         unsafe { core::ptr::write_bytes(self.buffers[index].as_mut_ptr(), 0, RX_BUFFER_BYTES) };
-        write_dma(&self.free, self.write * 16, &descriptor);
+        if self.format == rx_rfh::CompletionFormat::Qu {
+            let descriptor =
+                super::context_v1::free_descriptor(self.buffers[index].dma_addr().raw(), tag)
+                    .expect("coherent page alignment and bounded tag");
+            write_dma(&self.free, self.write * 8, &descriptor);
+        } else {
+            write_dma(&self.free, self.write * 16, &descriptor);
+        }
         self.tags[self.write] = tag;
         self.write = (self.write + 1) & (RX_DEPTH - 1);
     }
@@ -322,10 +329,12 @@ impl CommandQueue {
 #[derive(Debug)]
 pub struct BootImage {
     pub context: DmaBuffer,
-    pub scratch: DmaBuffer,
-    pub iml: DmaBuffer,
+    pub scratch: Option<DmaBuffer>,
+    pub iml: Option<DmaBuffer>,
     pub iml_len: usize,
-    _info: DmaBuffer,
+    _info: Option<DmaBuffer>,
+    prepare: Option<super::gen2_prepare::Owner>,
+    phy_config: u32,
     _sections: Vec<DmaBuffer>,
 }
 
@@ -367,7 +376,11 @@ impl BootImage {
         let mut config = [0; 16];
         boot_context::put64(&mut config, 0, address);
         boot_context::put32(&mut config, 8, total);
-        write_dma(&self.scratch, 16, &config);
+        write_dma(
+            self.scratch.as_ref().ok_or("Gen2 has no PNVM scratch")?,
+            16,
+            &config,
+        );
         dma_barrier();
         Ok(())
     }
@@ -378,6 +391,9 @@ impl BootImage {
         rx: &ReceiveQueue,
         command: &CommandQueue,
     ) -> Result<Self, &'static str> {
+        if rx.format == rx_rfh::CompletionFormat::Qu {
+            return Self::gen2(parsed, hw_rev, rx, command);
+        }
         let iml_bytes = parsed.api.iml.ok_or("firmware has no IML TLV")?;
         let map = boot_context::section_map(parsed)?;
         let iml = dma_alloc(iml_bytes.len())?;
@@ -410,10 +426,69 @@ impl BootImage {
         );
         Ok(Self {
             context,
-            scratch,
-            iml,
+            scratch: Some(scratch),
+            iml: Some(iml),
             iml_len: iml_bytes.len(),
-            _info: info,
+            _info: Some(info),
+            prepare: None,
+            phy_config: parsed.api.phy_config,
+            _sections: sections,
+        })
+    }
+    fn gen2(
+        parsed: &ParsedUcode<'_>,
+        hw_rev: u16,
+        rx: &ReceiveQueue,
+        command: &CommandQueue,
+    ) -> Result<Self, &'static str> {
+        if parsed.header.version != super::gen2_profile::API
+            || parsed
+                .fw_version
+                .is_some_and(|version| version.0 != super::gen2_profile::API)
+        {
+            return Err("unsupported Gen2 firmware API");
+        }
+        let queues = boot_context::BootQueues {
+            free: rx.free.dma_addr().raw(),
+            used: rx.used.dma_addr().raw(),
+            status: rx.status.dma_addr().raw(),
+            command: command.descriptors.dma_addr().raw(),
+            rx_depth: RX_DEPTH as u16,
+            command_depth: COMMAND_DEPTH as u16,
+        };
+        let mut bytes =
+            super::context_v1::header(hw_rev, queues).map_err(|_| "invalid Gen2 boot queues")?;
+        let map = super::context_v1::section_map(parsed).map_err(|_| "invalid Gen2 sections")?;
+        let mut sections = Vec::with_capacity(map.len());
+        for (index, offset) in map {
+            let payload = parsed.rt_sections[index].payload;
+            let buffer = dma_alloc(payload.len())?;
+            super::context_v1::set_section(
+                &mut bytes,
+                offset,
+                buffer.dma_addr().raw(),
+                payload.len(),
+            )
+            .map_err(|_| "invalid Gen2 section mapping")?;
+            write_dma(&buffer, 0, payload);
+            sections.push(buffer);
+        }
+        let context = dma_alloc(super::context_v1::CONTEXT_BYTES)?;
+        if !super::context_v1::dma_extent(
+            context.dma_addr().raw(),
+            super::context_v1::CONTEXT_BYTES,
+        ) {
+            return Err("Gen2 context crosses 4GiB");
+        }
+        write_dma(&context, 0, &bytes);
+        Ok(Self {
+            context,
+            scratch: None,
+            iml: None,
+            iml_len: 0,
+            _info: None,
+            prepare: Some(super::gen2_prepare::Owner::default()),
+            phy_config: parsed.api.phy_config,
             _sections: sections,
         })
     }
@@ -429,6 +504,33 @@ struct Resources {
 
 /// Serialized by an async mutex in the interface. Command waits drive
 /// RX themselves; they never depend on a pump blocked on that mutex.
+struct Gen2PrepareIo<'a>(&'a mut super::IwlMmioImpl);
+impl super::gen2_prepare::Io for Gen2PrepareIo<'_> {
+    fn read(&mut self, address: u32) -> Result<u32, super::gen2_prepare::Error> {
+        if !self.0.authorized() {
+            return Err(super::gen2_prepare::Error::Access);
+        }
+        Ok(self.0.read(address))
+    }
+    fn write(&mut self, address: u32, value: u32) -> Result<(), super::gen2_prepare::Error> {
+        if !self.0.authorized() {
+            return Err(super::gen2_prepare::Error::Access);
+        }
+        self.0.write(address, value);
+        if self.0.authorized() {
+            Ok(())
+        } else {
+            Err(super::gen2_prepare::Error::Access)
+        }
+    }
+    fn now_us(&self) -> u64 {
+        narf_time::wall::monotonic_ns() / 1000
+    }
+    async fn delay_us(&mut self, us: u64) {
+        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(us.saturating_mul(1000))).await;
+    }
+}
+
 pub struct Hardware {
     mmio: super::IwlMmioImpl,
     resources: core::mem::ManuallyDrop<Resources>,
@@ -466,6 +568,19 @@ impl Hardware {
         // not leave a previous boot's bus-master state running.
         super::mmio::set_master(&device, &cap, false)?;
         let mut mmio = super::IwlMmioImpl::new(region, cap);
+        if format == rx_rfh::CompletionFormat::Qu {
+            super::gen2_profile::select(
+                device.id.device,
+                mmio.read(super::regs::CSR_HW_REV),
+                mmio.read(0x9c),
+            )
+            .map_err(|_| "unsupported Gen2 PCI/MAC/RF profile")?;
+            if parsed.api.versions(0, 1).map(|v| v.1) != Some(6)
+                || parsed.api.versions(0xc, 2) != Some((1, 4))
+            {
+                return Err("unsupported MVM initialization command versions");
+            }
+        }
         let rx = ReceiveQueue::new(format)?;
         let commands = CommandQueue::new()?;
         let boot = BootImage::new(
@@ -493,6 +608,37 @@ impl Hardware {
             armed: false,
             failed: false,
         })
+    }
+
+    pub(super) fn gen2_profile(&mut self) -> Result<super::gen2_profile::Profile, &'static str> {
+        if self.format != rx_rfh::CompletionFormat::Qu {
+            return Err("MVM owner requires 22000 transport");
+        }
+        super::gen2_profile::select(
+            self.device.id.device,
+            self.mmio.read(super::regs::CSR_HW_REV),
+            self.mmio.read(0x9c),
+        )
+        .map_err(|_| "unsupported Gen2 identity")
+    }
+    pub(super) fn matches_firmware(&self, parsed: &ParsedUcode<'_>) -> bool {
+        if self.format != rx_rfh::CompletionFormat::Qu
+            || self.versions != parsed.api.commands
+            || self.resources.boot.phy_config != parsed.api.phy_config
+        {
+            return false;
+        }
+        let Ok(map) = super::context_v1::section_map(parsed) else {
+            return false;
+        };
+        map.len() == self.resources.boot._sections.len()
+            && map
+                .into_iter()
+                .zip(&self.resources.boot._sections)
+                .all(|((index, _), buffer)| {
+                    let payload = parsed.rt_sections[index].payload;
+                    buffer.as_slice().get(..payload.len()) == Some(payload)
+                })
     }
 
     pub fn version(&self, group: u8, command: u8) -> Option<(u8, u8)> {
@@ -565,49 +711,72 @@ impl Hardware {
     pub async fn start(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
         use super::regs::*;
         super::mmio::set_master(&self.device, &self.cap, false)?;
-        let control = self.mmio.read(CSR_HW_IF_CONFIG_REG);
-        self.mmio.write(CSR_HW_IF_CONFIG_REG, control | (1 << 22));
-        self.poll_register(CSR_HW_IF_CONFIG_REG, 1 << 22, 1 << 22, 50)
-            .await?;
-        self.mmio.write(0x88, 1 << 5); // OS_ALIVE mailbox
-                                       // Reset before publishing DMA addresses, then retake ownership.
-                                       // Bz reset lives in GP_CNTRL; older devices use CSR_RESET.
-        let (reset, bit, delay_ms) = if self.format == rx_rfh::CompletionFormat::Bz {
-            (CSR_GP_CNTRL, 1 << 31, 20)
+        if self.format == rx_rfh::CompletionFormat::Qu {
+            let hw_rev = self.mmio.read(CSR_HW_REV);
+            let profile =
+                super::gen2_profile::select(self.device.id.device, hw_rev, self.mmio.read(0x9c))
+                    .map_err(|_| "unsupported Gen2 PCI/MAC/RF profile")?;
+            let owner = self
+                .resources
+                .boot
+                .prepare
+                .as_mut()
+                .ok_or("missing Gen2 preparation owner")?;
+            let mut io = Gen2PrepareIo(&mut self.mmio);
+            // SAFETY: Hardware exclusively retains the native function/cap,
+            // PCI BME was verified off above, and all boot/queue mappings stay
+            // owned. No DMA memory is released; no workers exist during boot.
+            unsafe {
+                owner
+                    .prepare(&mut io, profile, hw_rev, parsed.api.phy_config)
+                    .await
+            }
+            .map_err(|_| "Gen2 APM/NIC preparation failed")?;
         } else {
-            (CSR_RESET, 1 << 7, 6)
-        };
-        let value = self.mmio.read(reset);
-        self.mmio.write(reset, value | bit);
-        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ms * 1_000_000)).await;
-        let control = self.mmio.read(CSR_HW_IF_CONFIG_REG);
-        self.mmio.write(CSR_HW_IF_CONFIG_REG, control | (1 << 22));
-        self.poll_register(CSR_HW_IF_CONFIG_REG, 1 << 22, 1 << 22, 50)
-            .await?;
-        self.mmio.write(0x88, 1 << 5);
-        self.mmio.write(CSR_INT_MASK, 0);
-        self.mmio.write(CSR_INT, u32::MAX);
-        // APM workarounds: disable L0s RX, maximize FH wait threshold,
-        // and permit the management bus to wake the PCIe link.
-        for (register, bits) in [
-            (0x100, 1 << 23),
-            (0x240, 0xffff0000),
-            (CSR_HW_IF_CONFIG_REG, 1 << 19),
-        ] {
-            let value = self.mmio.read(register);
-            self.mmio.write(register, value | bits);
-        }
+            let control = self.mmio.read(CSR_HW_IF_CONFIG_REG);
+            self.mmio.write(CSR_HW_IF_CONFIG_REG, control | (1 << 22));
+            self.poll_register(CSR_HW_IF_CONFIG_REG, 1 << 22, 1 << 22, 50)
+                .await?;
+            self.mmio.write(0x88, 1 << 5); // OS_ALIVE mailbox
+                                           // Reset before publishing DMA addresses, then retake ownership.
+                                           // Bz reset lives in GP_CNTRL; older devices use CSR_RESET.
+            let (reset, bit, delay_ms) = if self.format == rx_rfh::CompletionFormat::Bz {
+                (CSR_GP_CNTRL, 1 << 31, 20)
+            } else {
+                (CSR_RESET, 1 << 7, 6)
+            };
+            let value = self.mmio.read(reset);
+            self.mmio.write(reset, value | bit);
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ms * 1_000_000)).await;
+            let control = self.mmio.read(CSR_HW_IF_CONFIG_REG);
+            self.mmio.write(CSR_HW_IF_CONFIG_REG, control | (1 << 22));
+            self.poll_register(CSR_HW_IF_CONFIG_REG, 1 << 22, 1 << 22, 50)
+                .await?;
+            self.mmio.write(0x88, 1 << 5);
+            self.mmio.write(CSR_INT_MASK, 0);
+            self.mmio.write(CSR_INT, u32::MAX);
+            // APM workarounds: disable L0s RX, maximize FH wait threshold,
+            // and permit the management bus to wake the PCIe link.
+            for (register, bits) in [
+                (0x100, 1 << 23),
+                (0x240, 0xffff0000),
+                (CSR_HW_IF_CONFIG_REG, 1 << 19),
+            ] {
+                let value = self.mmio.read(register);
+                self.mmio.write(register, value | bits);
+            }
 
-        // Bz moved reset and clock handshakes into GP_CNTRL. Keep the
-        // MAC access request asserted while the transport runs.
-        let (request, ready) = if self.format == rx_rfh::CompletionFormat::Bz {
-            (1 << 6 | 1 << 21, 1 << 20)
-        } else {
-            (1 << 2 | 1 << 3, 1)
-        };
-        let gp = self.mmio.read(CSR_GP_CNTRL);
-        self.mmio.write(CSR_GP_CNTRL, gp | request);
-        self.poll_register(CSR_GP_CNTRL, ready, ready, 25).await?;
+            // Bz moved reset and clock handshakes into GP_CNTRL. Keep the
+            // MAC access request asserted while the transport runs.
+            let (request, ready) = if self.format == rx_rfh::CompletionFormat::Bz {
+                (1 << 6 | 1 << 21, 1 << 20)
+            } else {
+                (1 << 2 | 1 << 3, 1)
+            };
+            let gp = self.mmio.read(CSR_GP_CNTRL);
+            self.mmio.write(CSR_GP_CNTRL, gp | request);
+            self.poll_register(CSR_GP_CNTRL, ready, ready, 25).await?;
+        }
 
         if self.interrupts.is_none() {
             self.interrupts = Some(self.mmio.interrupts(&self.device)?);
@@ -615,31 +784,61 @@ impl Hardware {
         // AX210/Bz/Sc use the UMAC interrupt selector, with peripherals
         // relocated by 0x300000. Reset clears the selector/IVARs,
         // so reprogram on every start while retaining the owned vector.
-        super::transport::prph_write_ax210(&mut self.mmio, 0xD05C00, 1 << 25);
+        if self.format == rx_rfh::CompletionFormat::Qu {
+            super::transport::prph_write(&mut self.mmio, 0xA05C00, 1 << 25);
+        } else {
+            super::transport::prph_write_ax210(&mut self.mmio, 0xD05C00, 1 << 25);
+        }
         self.interrupts
             .as_mut()
             .unwrap()
             .enable(self.format == rx_rfh::CompletionFormat::Bz)?;
 
-        let boot = &self.resources.boot;
-        let regions = super::transport::Gen3BootRegions {
-            ctxt_info_phys: boot.context.dma_addr().raw(),
-            iml_phys: boot.iml.dma_addr().raw(),
-            iml_size: boot.iml_len as u32,
-        };
         super::mmio::set_master(&self.device, &self.cap, true)?;
         self.armed = true;
         self.resources.rx.publish(&mut self.mmio)?;
         dma_barrier();
-        super::transport::start_gen3(&mut self.mmio, &regions, self.format);
+        let boot = &self.resources.boot;
+        if self.format == rx_rfh::CompletionFormat::Qu {
+            super::context_v1::publish(&mut self.mmio, boot.context.dma_addr().raw())
+                .map_err(|_| "invalid Gen2 context address")?;
+            let profile = super::gen2_profile::select(
+                self.device.id.device,
+                self.mmio.read(CSR_HW_REV),
+                self.mmio.read(0x9c),
+            )
+            .map_err(|_| "unsupported Gen2 PCI/MAC/RF profile")?;
+            super::gen2_prepare::Owner::rom_ltr(&mut Gen2PrepareIo(&mut self.mmio), profile)
+                .map_err(|_| "Gen2 ROM LTR configuration failed")?;
+            super::context_v1::release(&mut self.mmio)
+                .map_err(|_| "Gen2 CPU release authority revoked")?;
+        } else {
+            let regions = super::transport::Gen3BootRegions {
+                ctxt_info_phys: boot.context.dma_addr().raw(),
+                iml_phys: boot
+                    .iml
+                    .as_ref()
+                    .ok_or("missing Gen3 IML")?
+                    .dma_addr()
+                    .raw(),
+                iml_size: boot.iml_len as u32,
+            };
+            super::transport::start_gen3(&mut self.mmio, &regions, self.format);
+        }
+        self.finish_boot(parsed).await
+    }
+    async fn finish_boot(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
+        use super::regs::*;
         let alive = self.wait_notification(0, 1, 2000).await?;
         let alive_version = self
             .version(0, 1)
             .or_else(|| self.version(1, 1))
             .map(|v| v.1);
-        let expected = match alive_version {
-            Some(7) => 144,
-            Some(8) => 152,
+        let expected = match (self.format, alive_version) {
+            (rx_rfh::CompletionFormat::Qu, Some(6)) => 144,
+            (rx_rfh::CompletionFormat::Qu, _) => return Err("unsupported MVM ALIVE version"),
+            (_, Some(7)) => 144,
+            (_, Some(8)) => 152,
             _ => return Err("unsupported ALIVE notification version"),
         };
         if alive.payload.len() != expected || alive.payload[..2] != 0xcafeu16.to_le_bytes() {
@@ -648,7 +847,7 @@ impl Hardware {
         let sku = core::array::from_fn(|i| {
             u32::from_le_bytes(alive.payload[116 + i * 4..120 + i * 4].try_into().unwrap())
         });
-        if sku != [0; 3] {
+        if self.format != rx_rfh::CompletionFormat::Qu && sku != [0; 3] {
             let pnvm = parsed.api.pnvm.ok_or("firmware needs external PNVM")?;
             let hw = self.mmio.read(CSR_HW_REV);
             let rf = self.mmio.read(0x9c);
@@ -669,19 +868,27 @@ impl Hardware {
                 return Err("PNVM initialization failed");
             }
         }
-        self.command(2, 3, &4u32.to_le_bytes()).await?; // INIT_EXTENDED_CFG: PHY follows
-        let version = self.version(1, 0x6a).map(|v| v.0).unwrap_or(1);
-        let size = match version {
-            1 => 12,
-            3 => 28,
-            _ => return Err("unsupported PHY configuration version"),
-        };
-        let mut phy = vec![0; size];
-        boot_context::put32(&mut phy, 0, parsed.api.phy_config);
-        boot_context::put32(&mut phy, 4, parsed.api.calibration[0]);
-        boot_context::put32(&mut phy, 8, parsed.api.calibration[1]);
-        self.command(1, 0x6a, &phy).await?;
-        self.wait_notification(0, 4, 2000).await?;
+        if self.format == rx_rfh::CompletionFormat::Qu {
+            // MVM unified image: allow firmware to populate NVM, then signal
+            // completion. Do not send MLD's separate PHY configuration flow.
+            self.command(2, 3, &2u32.to_le_bytes()).await?;
+            self.command(0xc, 0, &[0; 4]).await?;
+            self.wait_notification(0, 4, 2000).await?;
+        } else {
+            self.command(2, 3, &4u32.to_le_bytes()).await?; // INIT_EXTENDED_CFG: PHY follows
+            let version = self.version(1, 0x6a).map(|v| v.0).unwrap_or(1);
+            let size = match version {
+                1 => 12,
+                3 => 28,
+                _ => return Err("unsupported PHY configuration version"),
+            };
+            let mut phy = vec![0; size];
+            boot_context::put32(&mut phy, 0, parsed.api.phy_config);
+            boot_context::put32(&mut phy, 4, parsed.api.calibration[0]);
+            boot_context::put32(&mut phy, 8, parsed.api.calibration[1]);
+            self.command(1, 0x6a, &phy).await?;
+            self.wait_notification(0, 4, 2000).await?;
+        }
         let base = if self.format == rx_rfh::CompletionFormat::Bz {
             0x30
         } else {
@@ -775,7 +982,7 @@ impl Hardware {
         if self.version(5, 0x17).map(|v| v.0) != Some(3) {
             return Err("unsupported queue allocation version");
         }
-        let mut queue = super::data_queue::DataQueue::new()?;
+        let mut queue = super::data_queue::DataQueue::for_format(self.format)?;
         let body = queue.configure(station, tid)?;
         let index = self.resources.data.len();
         // Pin BEFORE publishing the allocation command. Timeout does
@@ -1154,3 +1361,7 @@ mod tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "runtime_model.rs"]
 pub(super) mod model;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "runtime_gen2_tests.rs"]
+mod gen2_tests;

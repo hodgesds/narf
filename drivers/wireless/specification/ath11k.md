@@ -115,6 +115,13 @@ RSC/offload/client-managed rings, EDL.
 
 ## 3. Public interface
 
+`MhiBus::random_nonzero(max) -> Result<u32, MhiError>` supplies secure
+BHI/BHIe sequence IDs. The native provider uses the guarded common entropy
+API and reports MHI step 40 (`ENTROPY`, detail = mask, errno = `EIO`) on
+failure. A successful zero word is mapped to nonzero sequence 1; an entropy
+failure has no fallback. RDDM, BHI and BHIe setup obtain the sequence before
+publishing the corresponding DMA address or sequence doorbell.
+
 The implemented runtime supports native QCA6390 HW2.0 and the WCN6855 layout
 (HW2.0/HW2.1 plus QCA2066 HW2.1 and QCA6698AQ HW2.1). PCI matching and
 MHI/QMI support for another revision do not imply a registered WLAN:
@@ -673,7 +680,23 @@ poll), `mgmt_tx(vdev_id, frame) -> Result<desc_id, errno>`
 (`ath11k_mac_mgmt_tx_wmi`: DMA-map + `WMI_MGMT_TX_SEND_CMDID`),
 `mgmt_tx_done(desc_id)` (`wmi_process_mgmt_tx_comp`, called when the
 mac layer sees the MGMT_TX_COMPLETION), `now_ms()`, `max_msg_len()`
-(WMI endpoint, for the channel-list split), `random_bytes()`.
+(WMI endpoint, for the channel-list split),
+`random_bytes(out) -> Result<(), errno>`. The RNG provider must fill the
+whole output with secure, unpredictable bytes or return an error; failed
+partial output must never be consumed. Native ports use
+`narf_crypto::try_fill_random_bytes`, mapping unavailable entropy to `EIO`.
+MAC step 319 (`ENTROPY`) identifies failure before protocol mutation or
+transmission: detail 0 = LRO seed, 1 = initial 4-way nonce, 2 = rekey nonce,
+3 = SA Query transaction ID, 4 = SAE commit. Initial authentication
+failure follows normal disconnect cleanup; an established link loses its
+controlled port on rekey or SA Query entropy failure. Both supplicant
+paths use `rx_eapol_with_nonce`: fresh SNonce material is requested only
+for an accepted M1 that renews it. Retransmissions, M3, group rekeys and
+discarded traffic never request nonce entropy. Temporary nonce buffers
+are zeroized, including partially filled failed samples. SAE uses
+`SaeSession::try_build_commit_with_entropy` through this fallible provider,
+with partial samples private to the shared session; committed retries keep
+the same scalar and element without resampling.
 
 **`DataPort`** (DP side): `ppdu_stats_req()`, `mon_status_default(on)`,
 `vdev_tx_attach(vdev, addr)`, `wait_peer_mapped(vdev, addr, mapped,
@@ -1262,8 +1285,9 @@ step starts with `Rt::service()`:
 `ath11k_wmi_cmd_send` with credit / CE-full retry for 3 s;
 `next_event`; `mgmt_tx` = IDR id (≤ 512 pending) + DMA32 copy +
 `wmi::mgmt_send_cmd(vdev, id, frame, paddr, 0, false)`, freed on
-`mgmt_tx_done`; `now_ms`; `max_msg_len`; `random_bytes` =
-`narf_crypto::fill_random_bytes`) and `mac::DataPort`
+`mgmt_tx_done`; `now_ms`; `max_msg_len`; `random_bytes` = the fallible
+`Shared::new` RNG callback (`fn(&mut [u8]) -> Result<(), errno>`), with
+`narf_crypto::try_fill_random_bytes` for native devices) and `mac::DataPort`
 (`ppdu_stats_req` = `htt::ppdu_stats_cfg_msgs`; `mon_status_default` =
 `dp.mon_status_default_msgs` sent, last result returned as Linux, reap
 timer armed; `vdev_tx_attach` = `VifTx::attach`; `wait_peer_mapped`

@@ -582,3 +582,11 @@ impl<I: ControlIo> Owner<I> {
         .await
     }
 }
+
+impl Owner<UsbControl> {
+    /// The packet adapter must use the identical retained USB generation and
+    /// controller as EP0. Taking another caller-provided handle is forbidden.
+    pub(super) fn usb_device(&self) -> Arc<USBDevice> {
+        self.io.device.clone()
+    }
+}

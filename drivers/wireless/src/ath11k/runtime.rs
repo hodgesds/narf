@@ -2500,7 +2500,7 @@ pub struct Shared<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     pub irq: Irq,
     pub clock: fn() -> u64,
     /// `get_random_bytes`.
-    pub rng: fn(&mut [u8]),
+    pub rng: fn(&mut [u8]) -> Result<(), i32>,
     /// WMI endpoint `max_msg_len`.
     pub max_msg_len: u32,
     /// `WMI_SEND_TIMEOUT_HZ`.
@@ -2594,7 +2594,7 @@ struct VdevBinding {
 }
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
-    pub fn new(rt: Rt<Io, Irq, Q>, rng: fn(&mut [u8])) -> Arc<Self> {
+    pub fn new(rt: Rt<Io, Irq, Q>, rng: fn(&mut [u8]) -> Result<(), i32>) -> Arc<Self> {
         let irq = rt.core.hif.irq.clone();
         let clock = rt.core.hif.clock;
         let max_msg_len = rt.core.wmi_ep.map_or(0, |e| e.max_msg_len);
@@ -3706,7 +3706,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WmiPort for Port<Io, Irq, Q> {
         self.0.max_msg_len
     }
 
-    fn random_bytes(&self, out: &mut [u8]) {
+    fn random_bytes(&self, out: &mut [u8]) -> Result<(), i32> {
         (self.0.rng)(out)
     }
 }
@@ -4247,12 +4247,12 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
         Ok(c) => c,
         Err(e) => {
             e.report("ath11k mac register");
-            *STRANDED_RT.lock() = Some(Shared::new(rt, narf_crypto::fill_random_bytes));
+            *STRANDED_RT.lock() = Some(Shared::new(rt, secure_random));
             return;
         }
     };
     let initial_reg = rt.core.reg_info.clone();
-    let shared = Shared::new(rt, narf_crypto::fill_random_bytes);
+    let shared = Shared::new(rt, secure_random);
     let mac = super::mac::Mac::new(
         Port(shared.clone(), 0),
         Port(shared.clone(), 0),
@@ -4266,4 +4266,8 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
         "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
         name, m[0], m[1], m[2], m[3], m[4], m[5]
     ));
+}
+
+fn secure_random(out: &mut [u8]) -> Result<(), i32> {
+    narf_crypto::try_fill_random_bytes(out).map_err(|_| super::mac::errno::EIO)
 }

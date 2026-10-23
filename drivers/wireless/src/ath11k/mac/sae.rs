@@ -106,14 +106,29 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         } else {
             SaeSession::new_hunt_and_peck(password, own, bssid)
         };
-        // dragonfly_generate_scalar's randomness from get_random_bytes.
-        let mut seed = [0u8; 64];
-        self.wmi.random_bytes(&mut seed);
-        sae = sae.with_test_seed(seed);
-        let commit = sae.build_commit();
-        if commit.is_empty() {
-            // "SAE: Could not pick PWE"
-            return fail(step::SAE_PWE, 0, errno::EINVAL, "SAE (PWE)");
+        // Keep secure entropy in the driver's fallible provider. Failed
+        // partial samples stay private to the session and are never committed.
+        let mut entropy_error = None;
+        let commit = sae.try_build_commit_with_entropy(|out| {
+            self.wmi.random_bytes(out).map_err(|e| {
+                entropy_error = Some(e);
+                SaeError::EntropyUnavailable
+            })
+        });
+        match commit {
+            Ok(_) => {}
+            Err(SaeError::EntropyUnavailable) => {
+                return fail(
+                    step::ENTROPY,
+                    4,
+                    entropy_error.unwrap_or(errno::EIO),
+                    "SAE entropy",
+                );
+            }
+            Err(_) => {
+                // "SAE: Could not pick PWE"
+                return fail(step::SAE_PWE, 0, errno::EINVAL, "SAE (PWE)");
+            }
         }
         let mut token: Option<Vec<u8>> = None;
         let mut rounds = 0;

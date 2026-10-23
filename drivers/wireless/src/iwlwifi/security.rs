@@ -7,6 +7,21 @@ use alloc::{boxed::Box, vec::Vec};
 use narf_wireless::eapol::*;
 use zeroize::{Zeroize, Zeroizing};
 
+/// Production nonces require the guarded hardware entropy path. A partial
+/// failing sample stays private and is zeroized before returning an error.
+pub(super) fn fresh_nonce() -> Result<[u8; 32], &'static str> {
+    fresh_nonce_with(|bytes| {
+        narf_crypto::try_fill_random_bytes(bytes).map_err(|_| "secure entropy unavailable")
+    })
+}
+fn fresh_nonce_with(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), &'static str>,
+) -> Result<[u8; 32], &'static str> {
+    let mut bytes = Zeroizing::new([0; 32]);
+    fill(bytes.as_mut_slice())?;
+    Ok(*bytes)
+}
+
 pub struct KeyUpdate {
     pub pairwise: Option<[u8; 16]>,
     pub group: [u8; 16],
@@ -164,6 +179,62 @@ mod tests {
         smoke_wpa2_authenticated_key_install
     );
 
+    fn smoke_iwl_nonce_entropy_failure_keeps_rekey_and_retransmit_ownership() -> TestResult {
+        let (mut session, m1, m3) = fixture();
+        session.process(&m1).unwrap();
+        session.process(&m3).unwrap();
+        let old = session.ptk.as_ref().unwrap().tk.clone();
+        let last = session.last_response.clone();
+        let rekey=hex("0203005f02008a0010000000000000000355555555555555555555555555555555555555555555555555555555555555550000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        if session
+            .process_with_nonce(&rekey, || Err("entropy test failure"))
+            .err()
+            != Some("entropy test failure")
+            || !session.complete()
+            || session.replay != 2
+            || session.pending_rekey.is_some()
+            || session.ptk.as_ref().unwrap().tk != old
+            || session.last_response != last
+        {
+            return TestResult::Fail("entropy failure changed active key/replay or published M2");
+        }
+        let reply = session
+            .process_with_nonce(&rekey, || Ok([0x66; 32]))
+            .unwrap();
+        let retry = session
+            .process_with_nonce(&rekey, || Err("retry must not need new entropy"))
+            .unwrap();
+        if reply.bytes != retry.bytes
+            || retry.keys.is_some()
+            || session.ptk.as_ref().unwrap().tk != old
+        {
+            return TestResult::Fail("cached rekey retry regenerated nonce or changed key");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/security",
+        smoke_iwl_nonce_entropy_failure_keeps_rekey_and_retransmit_ownership
+    );
+    fn smoke_iwl_nonce_partial_entropy_failure_does_not_return_sample() -> TestResult {
+        if fresh_nonce_with(|out| {
+            out[..16].fill(0xaa);
+            Err("entropy test failure")
+        }) != Err("entropy test failure")
+            || fresh_nonce_with(|out| {
+                out.fill(0x55);
+                Ok(())
+            }) != Ok([0x55; 32])
+        {
+            return TestResult::Fail("partial entropy failure returned predictable nonce");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/security",
+        smoke_iwl_nonce_partial_entropy_failure_does_not_return_sample
+    );
+
     fn smoke_wpa2_bad_mic_preserves_state() -> TestResult {
         let (mut session, m1, m3) = fixture();
         session.process(&m1).unwrap();
@@ -213,7 +284,9 @@ mod tests {
         let old_key = session.ptk.as_ref().unwrap().tk.clone();
         let rekey1 = hex("0203005f02008a0010000000000000000355555555555555555555555555555555555555555555555555555555555555550000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
         let rekey3 = hex("020300970213ca00100000000000000004555555555555555555555555555555555555555555555555555555555555555500000000000000000000000000000000000000000000000000000000000000000de565ea6423eacef8a8be83dcfcb76100383d3479c5595f9bb85a430c70134b111b0d4cc49b0d9a98319e6561431ffdb340922b32e3e0be2db08738d74ea6f4a5ebf58be766a01c9765");
-        let m2 = session.process_with_nonce(&rekey1, || [0x66; 32]).unwrap();
+        let m2 = session
+            .process_with_nonce(&rekey1, || Ok([0x66; 32]))
+            .unwrap();
         if m2.keys.is_some() || !session.complete() || session.ptk.as_ref().unwrap().tk != old_key {
             return TestResult::Fail("unauthenticated rekey M1 replaced the active PTK");
         }
@@ -383,11 +456,7 @@ impl Session {
     }
 
     pub fn process(&mut self, pdu: &[u8]) -> Result<Response, &'static str> {
-        self.process_with_nonce(pdu, || {
-            let mut nonce = [0; 32];
-            narf_crypto::fill_random_bytes(&mut nonce);
-            nonce
-        })
+        self.process_with_nonce(pdu, fresh_nonce)
     }
 
     // The old PTK remains active while the unauthenticated M1 is pending.
@@ -395,7 +464,7 @@ impl Session {
     fn process_with_nonce(
         &mut self,
         pdu: &[u8],
-        nonce: impl FnOnce() -> [u8; 32],
+        nonce: impl FnOnce() -> Result<[u8; 32], &'static str>,
     ) -> Result<Response, &'static str> {
         if self.complete
             && pdu.len() >= 99
@@ -421,7 +490,7 @@ impl Session {
                     self.pmk,
                     self.ap,
                     self.local,
-                    nonce(),
+                    nonce()?,
                     self.ap_rsn.clone(),
                 ));
                 let reply = candidate.process_inner(pdu)?;

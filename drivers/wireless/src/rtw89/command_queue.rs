@@ -75,6 +75,7 @@ pub struct CommandQueue<T> {
     wp: u16,
     rp: u16,
     terminal: bool,
+    ever_published: bool,
 }
 impl<T> CommandQueue<T> {
     pub fn new(depth: u16) -> Result<Self, Error> {
@@ -96,10 +97,14 @@ impl<T> CommandQueue<T> {
             wp: 0,
             rp: 0,
             terminal: false,
+            ever_published: false,
         })
     }
     pub fn write_pointer(&self) -> u16 {
         self.wp
+    }
+    pub fn is_pristine(&self) -> bool {
+        !self.terminal && !self.ever_published
     }
     pub fn pending(&self) -> usize {
         (self.wp + self.slots.len() as u16 - self.rp) as usize % self.slots.len()
@@ -147,6 +152,7 @@ impl<T> CommandQueue<T> {
             resource: Some(resource),
         });
         let entry = self.slots[slot as usize].as_ref().unwrap();
+        self.ever_published = true;
         let result = publish(slot, next, entry.resource.as_ref().unwrap());
         self.wp = next;
         if result.is_err() {

@@ -36,6 +36,7 @@ struct Section {
 #[derive(Debug)]
 pub struct DownloadPlan {
     image: PreparedFirmware,
+    secure: bool,
     header: Vec<u8>,
     sections: Vec<Section>,
 }
@@ -143,9 +144,20 @@ impl DownloadPlan {
         header[28..32].copy_from_slice(&((part & !0xffff) | 2020).to_le_bytes());
         Ok(Self {
             image,
+            secure: fuses.enabled(),
             header,
             sections,
         })
+    }
+    pub fn chip(&self) -> ChipId {
+        self.image.chip()
+    }
+    pub fn secure_enabled(&self) -> bool {
+        self.secure
+    }
+    pub fn idmem_share_mode(&self) -> u8 {
+        let word = u32::from_le_bytes(self.header[28..32].try_into().unwrap());
+        ((word >> 18) & 15) as u8
     }
     pub fn section_count(&self) -> usize {
         self.sections.len()

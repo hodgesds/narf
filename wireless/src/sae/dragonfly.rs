@@ -33,10 +33,13 @@
 //! provide an `EccGroup` impl and the state machine drives it.
 
 use alloc::vec::Vec;
+use zeroize::Zeroizing;
 
 /// Errors from the SAE state machine.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SaeError {
+    /// No secure entropy sample was available; no commit was generated.
+    EntropyUnavailable,
     /// Peer's Confirm MAC didn't match.
     ConfirmMismatch,
     /// Peer sent a frame in the wrong order.
@@ -110,6 +113,22 @@ pub trait EccGroup {
         peer_mac: &[u8; 6],
         own_mac: &[u8; 6],
     ) -> (Vec<u8>, Vec<u8>);
+
+    /// Fallible commit surface. Entropy-dependent production groups must
+    /// override this and refuse unavailable entropy. The default preserves
+    /// explicit deterministic test/structural group implementations.
+    fn try_make_commit(
+        &mut self,
+        password: &[u8],
+        peer_mac: &[u8; 6],
+        own_mac: &[u8; 6],
+    ) -> Result<(Vec<u8>, Vec<u8>), SaeError> {
+        let pair = self.make_commit(password, peer_mac, own_mac);
+        if pair.0.len() != self.scalar_len() || pair.1.len() != self.element_len() {
+            return Err(SaeError::InvalidParameters);
+        }
+        Ok(pair)
+    }
 
     /// Compute the shared secret `K = scalar(rand, peer_element + scalar(peer_scalar, pwe))`
     /// using the local `rand` saved from `make_commit`. Returns a
@@ -234,18 +253,42 @@ impl<G: EccGroup, M: MacPrimitive> Sae<G, M> {
 
     /// Build our outgoing Commit frame. Drives `make_commit` on the
     /// underlying group.
-    pub fn build_commit(&mut self, password: &[u8]) -> CommitFrame {
-        let (scalar, element) = self
-            .group
-            .make_commit(password, &self.peer_mac, &self.own_mac);
+    pub fn try_build_commit(&mut self, password: &[u8]) -> Result<CommitFrame, SaeError> {
+        match self.state {
+            SaeState::Committed => {
+                return Ok(CommitFrame {
+                    group: self.group.group_id(),
+                    scalar: self.local_scalar.clone(),
+                    element: self.local_element.clone(),
+                })
+            }
+            SaeState::Nothing => {}
+            _ => return Err(SaeError::Protocol),
+        }
+        let (scalar, element) =
+            self.group
+                .try_make_commit(password, &self.peer_mac, &self.own_mac)?;
+        if scalar.len() != self.group.scalar_len() || element.len() != self.group.element_len() {
+            return Err(SaeError::InvalidParameters);
+        }
         self.local_scalar = scalar.clone();
         self.local_element = element.clone();
         self.state = SaeState::Committed;
-        CommitFrame {
+        Ok(CommitFrame {
             group: self.group.group_id(),
             scalar,
             element,
-        }
+        })
+    }
+    /// Legacy wrapper returns an invalid empty frame on failure, without
+    /// advancing state. Production transmitters use try_build_commit.
+    pub fn build_commit(&mut self, password: &[u8]) -> CommitFrame {
+        self.try_build_commit(password)
+            .unwrap_or_else(|_| CommitFrame {
+                group: self.group.group_id(),
+                scalar: Vec::new(),
+                element: Vec::new(),
+            })
     }
 
     /// Consume peer's Commit. On success we have everything needed
@@ -457,7 +500,7 @@ pub struct P256Group {
     pub(crate) rand: Scalar,
     /// Optional RNG override for deterministic tests. Production
     /// callers leave this `None`; the impl then pulls bytes from
-    /// `narf_crypto::per_task_rng()`.
+    /// guarded hardware entropy with no timing fallback.
     test_rng_seed: Option<[u8; 64]>,
 }
 
@@ -470,9 +513,10 @@ impl P256Group {
         }
     }
 
-    /// Test hook: seed the (otherwise per-task) RNG with a fixed value
-    /// so smokes can re-derive the same commit deterministically. The
-    /// seed is consumed once per `make_commit`.
+    /// Test hook: expand a fixed seed under explicit rand/mask domains
+    /// so smokes can re-derive the same commit deterministically. Production
+    /// uses independent guarded-entropy candidates.
+    #[cfg(any(test, feature = "kernel-test"))]
     pub fn with_test_seed(seed: [u8; 64]) -> Self {
         Self {
             pwe: None,
@@ -482,47 +526,85 @@ impl P256Group {
     }
 }
 
+impl P256Group {
+    fn commit_with_entropy(
+        &mut self,
+        password: &[u8],
+        peer_mac: &[u8; 6],
+        own_mac: &[u8; 6],
+        mut entropy: impl FnMut(&mut [u8]) -> Result<(), SaeError>,
+    ) -> Result<(Vec<u8>, Vec<u8>), SaeError> {
+        let pwe = match self.pwe {
+            Some(p) => p,
+            None => super::pt::pwe_hunt_and_peck(password, own_mac, peer_mac)
+                .map(|(p, _)| p)
+                .ok_or(SaeError::InvalidParameters)?,
+        };
+        let rand = group_random_scalar(self.test_rng_seed.as_ref(), b"SAE rand", &mut entropy)?;
+        let mask = group_random_scalar(self.test_rng_seed.as_ref(), b"SAE mask", &mut entropy)?;
+        let scalar = rand.add(&mask);
+        if scalar.is_zero() || scalar == Scalar::ONE {
+            return Err(SaeError::InvalidParameters);
+        }
+        let mp = scalar_mul(&mask, &pwe);
+        let element = AffinePoint {
+            x: mp.x,
+            y: mp.y.neg(),
+            infinity: mp.infinity,
+        };
+        let encoded = element.to_encoded().ok_or(SaeError::InvalidParameters)?;
+        self.pwe = Some(pwe);
+        self.rand = rand;
+        Ok((scalar.to_bytes_be().to_vec(), encoded.to_vec()))
+    }
+}
+
 impl Default for P256Group {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Internal helper: random scalar in [1, n). Uses HKDF-Expand over
-/// 64 bytes of seed material; the wider seed makes the reduction
-/// mod n statistically uniform (NIST SP 800-90A §A.5 "Test Method").
-fn random_scalar_from_seed(seed: &[u8; 64], info: &[u8]) -> Scalar {
-    // Stretch the 64-byte seed to 48 bytes via HKDF; reduce mod n.
-    let prk = hkdf_extract(None, seed);
-    let okm = hkdf_expand(&prk, info, 48);
-    // The 48-byte output gives ~2^128 statistical distance from any
-    // arbitrary modular bias — enough for a 256-bit-order group.
-    // We pad to 32 bytes by taking the trailing 32; this discards
-    // the high-order bits of the wider buffer, which is exactly the
-    // standard "extra bits then reduce" technique.
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&okm[16..48]);
-    let mut s = Scalar::from_bytes_be_reduce(&bytes);
-    // Reject zero; if it ever happens (negligible odds against a
-    // good RNG) flip to ONE so the handshake doesn't blow up — a
-    // production impl would resample, but the per-task RNG path
-    // already excludes adversarial control.
-    if s.is_zero() {
-        s = Scalar::ONE;
+/// Bound rejection work even when a provider repeatedly supplies invalid
+/// scalar encodings. Candidates are accepted only in the exact range [1,n).
+const MAX_SCALAR_SAMPLES: u8 = 16;
+pub(super) fn sample_scalar(
+    mut sample: impl FnMut(u8, &mut [u8; 32]) -> Result<(), SaeError>,
+) -> Result<Scalar, SaeError> {
+    for counter in 0..MAX_SCALAR_SAMPLES {
+        let mut candidate = Zeroizing::new([0u8; 32]);
+        sample(counter, &mut candidate)?;
+        if let Some(scalar) = Scalar::from_bytes_be(&candidate) {
+            if !scalar.is_zero() {
+                return Ok(scalar);
+            }
+        }
     }
-    s
+    Err(SaeError::InvalidParameters)
 }
 
-/// Internal helper: pull a fresh random scalar from either the test
-/// seed (if set) or the per-task RNG.
-fn group_random_scalar(test_seed: Option<&[u8; 64]>, info: &[u8]) -> Scalar {
+/// Deterministic fixture expansion. Each rejection uses a fresh explicit
+/// counter under its scalar-specific domain; no truncation/reduction or
+/// zero-to-one substitution is allowed. Production samples bytes directly.
+pub(super) fn random_scalar_from_seed(seed: &[u8; 64], domain: &[u8]) -> Result<Scalar, SaeError> {
+    let prk = Zeroizing::new(hkdf_extract(None, seed));
+    sample_scalar(|counter, candidate| {
+        let mut info = domain.to_vec();
+        info.push(counter);
+        let expanded = Zeroizing::new(hkdf_expand(&prk, &info, 32));
+        candidate.copy_from_slice(&expanded);
+        Ok(())
+    })
+}
+
+fn group_random_scalar(
+    test_seed: Option<&[u8; 64]>,
+    domain: &[u8],
+    entropy: &mut impl FnMut(&mut [u8]) -> Result<(), SaeError>,
+) -> Result<Scalar, SaeError> {
     match test_seed {
-        Some(seed) => random_scalar_from_seed(seed, info),
-        None => {
-            let mut seed = [0u8; 64];
-            narf_crypto::fill_random_bytes(&mut seed);
-            random_scalar_from_seed(&seed, info)
-        }
+        Some(seed) => random_scalar_from_seed(seed, domain),
+        None => sample_scalar(|_, candidate| entropy(candidate)),
     }
 }
 
@@ -573,39 +655,18 @@ impl EccGroup for P256Group {
         peer_mac: &[u8; 6],
         own_mac: &[u8; 6],
     ) -> (Vec<u8>, Vec<u8>) {
-        // Derive PWE if we haven't already.
-        if self.pwe.is_none() {
-            let _ = self.hunt_and_peck(password, peer_mac, own_mac);
-        }
-        let pwe = match self.pwe {
-            Some(p) => p,
-            None => {
-                // PWE derivation failed; return zeros so the caller
-                // can detect the empty-element path. The state
-                // machine will fail Confirm anyway.
-                return (alloc::vec![0u8; 32], alloc::vec![0u8; 64]);
-            }
-        };
-
-        // Pull rand + mask. Per RFC 7664 §3.2.2 / 802.11-2020 §12.4.5.3
-        // both must be uniformly random in [1, n).
-        let rand = group_random_scalar(self.test_rng_seed.as_ref(), b"SAE rand");
-        let mask = group_random_scalar(self.test_rng_seed.as_ref(), b"SAE mask");
-        self.rand = rand;
-
-        let commit_scalar = rand.add(&mask);
-
-        // commit_element = -(mask * PWE)
-        let mask_pwe = scalar_mul(&mask, &pwe);
-        let commit_element = AffinePoint {
-            x: mask_pwe.x,
-            y: mask_pwe.y.neg(),
-            infinity: mask_pwe.infinity,
-        };
-
-        let s_bytes = commit_scalar.to_bytes_be().to_vec();
-        let e_bytes = commit_element.to_encoded().unwrap_or([0u8; 64]).to_vec();
-        (s_bytes, e_bytes)
+        self.try_make_commit(password, peer_mac, own_mac)
+            .unwrap_or_default()
+    }
+    fn try_make_commit(
+        &mut self,
+        password: &[u8],
+        peer_mac: &[u8; 6],
+        own_mac: &[u8; 6],
+    ) -> Result<(Vec<u8>, Vec<u8>), SaeError> {
+        self.commit_with_entropy(password, peer_mac, own_mac, |out| {
+            narf_crypto::try_fill_random_bytes(out).map_err(|_| SaeError::EntropyUnavailable)
+        })
     }
 
     /// Compute the shared secret K and project to its X coordinate.
@@ -942,6 +1003,90 @@ mod hp_tests {
     }
     kernel_test_in!("wireless/sae", smoke_sae_h2p_iteration_floor_is_constant);
 
+    fn smoke_sae_scalar_rejection_exact_boundaries_and_work_bound() -> TestResult {
+        // Independent P-256 order literal, FIPS 186-4 D.1.2.3.
+        const N: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        let mut n_minus_one = N;
+        n_minus_one[31] -= 1;
+        let mut calls = 0u8;
+        let result = sample_scalar(|counter, bytes| {
+            if counter != calls {
+                return Err(SaeError::Protocol);
+            }
+            *bytes = match calls {
+                0 => [0; 32],
+                1 => N,
+                _ => n_minus_one,
+            };
+            calls += 1;
+            Ok(())
+        });
+        if result.map(|scalar| scalar.to_bytes_be()) != Ok(n_minus_one) || calls != 3 {
+            return TestResult::Fail("scalar sampler reduced n/accepted zero or lost n-1");
+        }
+        for invalid in [[0; 32], N, [0xff; 32]] {
+            calls = 0;
+            if sample_scalar(|counter, bytes| {
+                if counter != calls {
+                    return Err(SaeError::Protocol);
+                }
+                calls += 1;
+                *bytes = invalid;
+                Ok(())
+            }) != Err(SaeError::InvalidParameters)
+                || calls != MAX_SCALAR_SAMPLES
+            {
+                return TestResult::Fail("malicious scalar provider bypassed rejection/work bound");
+            }
+        }
+        let rand = random_scalar_from_seed(&[0; 64], b"rand").unwrap();
+        if rand != random_scalar_from_seed(&[0; 64], b"rand").unwrap()
+            || rand == random_scalar_from_seed(&[0; 64], b"mask").unwrap()
+            || rand.is_zero()
+        {
+            return TestResult::Fail("explicit deterministic scalar domains are not reproducible");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/sae",
+        smoke_sae_scalar_rejection_exact_boundaries_and_work_bound
+    );
+
+    fn smoke_sae_legacy_group_entropy_failure_retains_no_partial_secret() -> TestResult {
+        for fail_at in [0, 1] {
+            let mut group = P256Group::new();
+            let mut call = 0;
+            let result = group.commit_with_entropy(b"pw", &[0x22; 6], &[0x11; 6], |out| {
+                out.fill(0x55);
+                let current = call;
+                call += 1;
+                if current == fail_at {
+                    Err(SaeError::EntropyUnavailable)
+                } else {
+                    Ok(())
+                }
+            });
+            if result != Err(SaeError::EntropyUnavailable)
+                || group.rand != Scalar::ZERO
+                || group.pwe.is_some()
+            {
+                return TestResult::Fail(
+                    "legacy SAE entropy failure installed partial ephemeral state",
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/sae",
+        smoke_sae_legacy_group_entropy_failure_retains_no_partial_secret
+    );
+
     fn smoke_sae_make_commit_round_trip() -> TestResult {
         // Verify that the commit_element bytes (from make_commit) decode
         // to the same point we started with — to isolate any encoding
@@ -980,29 +1125,31 @@ mod hp_tests {
     fn smoke_sae_scalar_mul_consistency() -> TestResult {
         // Verify scalar_mul produces the EXPECTED known answer for
         // HKDF-derived scalars times G. We compare against bytes
-        // computed in Python (sage/standalone reference).
+        // computed independently with Python stdlib HMAC and P-256 integers
+        // scalar = HMAC(HMAC(0^32, seed), domain || counter || 0x01),
+        // taking only checked scalar values; points use standard P-256 G.
         use narf_crypto::p256::point::scalar_mul_base;
         let seed_a = [0x11u8; 64];
         let seed_b = [0x22u8; 64];
-        let rand_a = random_scalar_from_seed(&seed_a, b"SAE rand");
-        let rand_b = random_scalar_from_seed(&seed_b, b"SAE rand");
+        let rand_a = random_scalar_from_seed(&seed_a, b"SAE rand").unwrap();
+        let rand_b = random_scalar_from_seed(&seed_b, b"SAE rand").unwrap();
 
         // Expected x-coords (Python-computed):
         // rand_a * G:
-        //   5d7e083d80f540e9c19cacbfb8b81305081557c43a122595952fa403bbbc4682
+        //   e63174c2db57177ffb5efa333832a4926680c703c249cc55ace336280f4155c3
         // rand_b * G:
-        //   09280e887ed77a9b11e5390a5686d5bd872f04f267964aa1cb82380862e732bc
+        //   3c511e653118e9f30276e6afa6ca8d885c697f6122723934610fe66a7fbabc21
         let ra_g = scalar_mul_base(&rand_a);
         let rb_g = scalar_mul_base(&rand_b);
         let exp_a = [
-            0x5d, 0x7e, 0x08, 0x3d, 0x80, 0xf5, 0x40, 0xe9, 0xc1, 0x9c, 0xac, 0xbf, 0xb8, 0xb8,
-            0x13, 0x05, 0x08, 0x15, 0x57, 0xc4, 0x3a, 0x12, 0x25, 0x95, 0x95, 0x2f, 0xa4, 0x03,
-            0xbb, 0xbc, 0x46, 0x82,
+            0xe6, 0x31, 0x74, 0xc2, 0xdb, 0x57, 0x17, 0x7f, 0xfb, 0x5e, 0xfa, 0x33, 0x38, 0x32,
+            0xa4, 0x92, 0x66, 0x80, 0xc7, 0x03, 0xc2, 0x49, 0xcc, 0x55, 0xac, 0xe3, 0x36, 0x28,
+            0x0f, 0x41, 0x55, 0xc3,
         ];
         let exp_b = [
-            0x09, 0x28, 0x0e, 0x88, 0x7e, 0xd7, 0x7a, 0x9b, 0x11, 0xe5, 0x39, 0x0a, 0x56, 0x86,
-            0xd5, 0xbd, 0x87, 0x2f, 0x04, 0xf2, 0x67, 0x96, 0x4a, 0xa1, 0xcb, 0x82, 0x38, 0x08,
-            0x62, 0xe7, 0x32, 0xbc,
+            0x3c, 0x51, 0x1e, 0x65, 0x31, 0x18, 0xe9, 0xf3, 0x02, 0x76, 0xe6, 0xaf, 0xa6, 0xca,
+            0x8d, 0x88, 0x5c, 0x69, 0x7f, 0x61, 0x22, 0x72, 0x39, 0x34, 0x61, 0x0f, 0xe6, 0x6a,
+            0x7f, 0xba, 0xbc, 0x21,
         ];
         if ra_g.x.to_bytes_be() != exp_a {
             return TestResult::Fail("rand_a * G mismatch");
@@ -1021,10 +1168,10 @@ mod hp_tests {
         let pwe = AffinePoint::generator();
         let seed_a = [0x11u8; 64];
         let seed_b = [0x22u8; 64];
-        let rand_a = random_scalar_from_seed(&seed_a, b"SAE rand");
-        let mask_a = random_scalar_from_seed(&seed_a, b"SAE mask");
-        let rand_b = random_scalar_from_seed(&seed_b, b"SAE rand");
-        let mask_b = random_scalar_from_seed(&seed_b, b"SAE mask");
+        let rand_a = random_scalar_from_seed(&seed_a, b"SAE rand").unwrap();
+        let mask_a = random_scalar_from_seed(&seed_a, b"SAE mask").unwrap();
+        let rand_b = random_scalar_from_seed(&seed_b, b"SAE rand").unwrap();
+        let mask_b = random_scalar_from_seed(&seed_b, b"SAE mask").unwrap();
         let cs_a = rand_a.add(&mask_a);
         let cs_b = rand_b.add(&mask_b);
         let mpa = scalar_mul(&mask_a, &pwe);
@@ -1049,14 +1196,14 @@ mod hp_tests {
 
         // sum_a should be rand_b * G; sum_b should be rand_a * G.
         let exp_a_x = [
-            0x09, 0x28, 0x0e, 0x88, 0x7e, 0xd7, 0x7a, 0x9b, 0x11, 0xe5, 0x39, 0x0a, 0x56, 0x86,
-            0xd5, 0xbd, 0x87, 0x2f, 0x04, 0xf2, 0x67, 0x96, 0x4a, 0xa1, 0xcb, 0x82, 0x38, 0x08,
-            0x62, 0xe7, 0x32, 0xbc,
+            0x3c, 0x51, 0x1e, 0x65, 0x31, 0x18, 0xe9, 0xf3, 0x02, 0x76, 0xe6, 0xaf, 0xa6, 0xca,
+            0x8d, 0x88, 0x5c, 0x69, 0x7f, 0x61, 0x22, 0x72, 0x39, 0x34, 0x61, 0x0f, 0xe6, 0x6a,
+            0x7f, 0xba, 0xbc, 0x21,
         ];
         let exp_b_x = [
-            0x5d, 0x7e, 0x08, 0x3d, 0x80, 0xf5, 0x40, 0xe9, 0xc1, 0x9c, 0xac, 0xbf, 0xb8, 0xb8,
-            0x13, 0x05, 0x08, 0x15, 0x57, 0xc4, 0x3a, 0x12, 0x25, 0x95, 0x95, 0x2f, 0xa4, 0x03,
-            0xbb, 0xbc, 0x46, 0x82,
+            0xe6, 0x31, 0x74, 0xc2, 0xdb, 0x57, 0x17, 0x7f, 0xfb, 0x5e, 0xfa, 0x33, 0x38, 0x32,
+            0xa4, 0x92, 0x66, 0x80, 0xc7, 0x03, 0xc2, 0x49, 0xcc, 0x55, 0xac, 0xe3, 0x36, 0x28,
+            0x0f, 0x41, 0x55, 0xc3,
         ];
         if sum_a.x.to_bytes_be() != exp_a_x {
             return TestResult::Fail("sum_A != rand_b * G");
@@ -1076,10 +1223,10 @@ mod hp_tests {
         // group_random_scalar helper with HKDF seeds.
         let seed_a = [0x11u8; 64];
         let seed_b = [0x22u8; 64];
-        let rand_a = random_scalar_from_seed(&seed_a, b"SAE rand");
-        let mask_a = random_scalar_from_seed(&seed_a, b"SAE mask");
-        let rand_b = random_scalar_from_seed(&seed_b, b"SAE rand");
-        let mask_b = random_scalar_from_seed(&seed_b, b"SAE mask");
+        let rand_a = random_scalar_from_seed(&seed_a, b"SAE rand").unwrap();
+        let mask_a = random_scalar_from_seed(&seed_a, b"SAE mask").unwrap();
+        let rand_b = random_scalar_from_seed(&seed_b, b"SAE rand").unwrap();
+        let mask_b = random_scalar_from_seed(&seed_b, b"SAE mask").unwrap();
         // commit_scalar = rand + mask
         let cs_a = rand_a.add(&mask_a);
         let cs_b = rand_b.add(&mask_b);

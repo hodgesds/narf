@@ -104,6 +104,19 @@ Post-quantum: algorithm choice left as an open question (§8).
 
 ### 3.2 RNG / DRBG
 
+`try_per_task_rng() -> Result<ChaCha20Rng, CryptoError>` and
+`try_fill_random_bytes(&mut [u8]) -> Result<(), CryptoError>` are the current
+fallible protocol-entropy adapters. Each nonempty fill obtains a fresh 256-bit
+seed from feature-gated, bounded RDSEED then RDRAND (x86_64), or RNDRRS then
+RNDR (aarch64), and expands it with ChaCha20. Source failure discards any
+partial seed, zeroizes the full caller output and returns
+`CryptoError::EntropyUnavailable`; no cycle-counter fallback is accepted.
+Empty fills need no entropy. Temporary seeds are zeroized. This adapter
+explicitly trusts the architectural RNG; it does not implement the system
+pool, jitter collection, per-task handle lifecycle, or SP 800-90B service
+specified below. The legacy Stage-3 `per_task_rng` / `fill_random_bytes`
+helpers remain predictable and must not supply protocol secrets or nonces.
+
 ```rust
 pub struct Rng;                                           // typed handle
 pub fn rng_open(cap: &Cap<Rng, Read>) -> Rng;
