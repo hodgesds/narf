@@ -12031,11 +12031,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     if flags & CLONE_VFORK != 0 {
         vfork_wait_register(child_visible_pid, parent_pid);
     }
-    // Publish inherited mapping owners before the child becomes runnable.
-    // Otherwise an immediate child exit can race the late copy and leave an
-    // owner reference keyed to a process that has already been reaped.
+    // Publish the remaining per-mm compatibility state before the child
+    // becomes runnable. File/device VMA owners were already cloned atomically
+    // by memory's fork hook while the parent VMA transaction was held.
     if !share_vm {
-        crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
         fork_address_space_pkeys(parent_as.identity(), child_as.identity());
         // A child with its OWN mm carries copies of the parent's mbind range
         // policies (`dup_mmap` -> `vma_dup_policy`). A CLONE_VM child shares

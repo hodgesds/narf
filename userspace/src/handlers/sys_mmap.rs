@@ -735,7 +735,10 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     // The device's memory-type request rides in the VMA like
                     // Linux's `vm_page_prot`; the address space applies it
                     // per frame and refuses it on System RAM.
-                    perms: (perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT
+                    perms: (perms
+                        | RegionPerms::SHARED
+                        | RegionPerms::EXTERNAL_REFS
+                        | RegionPerms::LOCK_EXEMPT
                         | if ops.mmap_is_ram() { RegionPerms::PINNABLE_RAM } else { RegionPerms(0) })
                         .with_memory_type(memory_type),
                     phys,
@@ -848,6 +851,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     // anonymous zero page".
                     perms: perms
                         | RegionPerms::SHARED
+                        | RegionPerms::EXTERNAL_REFS
                         | RegionPerms::FILE_DEMAND
                         | RegionPerms::LOCK_EXEMPT
                         | if ops.mmap_is_ram() { RegionPerms::PINNABLE_RAM } else { RegionPerms(0) },
@@ -1118,13 +1122,18 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     let region = Region {
         base: VirtAddr::new(base),
         len,
-        // Generic MAP_SHARED file mappings borrow a frame from the
-        // userspace file-page cache. RegionPerms::SHARED lets multiple
-        // VMAs alias one page and delegates lifetime to the cache through
-        // memory's shared-frame hooks.
+        // Generic MAP_SHARED file mappings borrow a frame from the userspace
+        // file-page cache. SHARED lets multiple VMAs alias one page;
+        // EXTERNAL_REFS delegates per-frame lifetime to that cache. Anonymous
+        // shared backing is instead pinned by the VMA's file Arc.
         perms: if shared_file_ops.is_some() {
             perms
                 | RegionPerms::SHARED
+                | if direct_shared_file {
+                    RegionPerms(0)
+                } else {
+                    RegionPerms::EXTERNAL_REFS
+                }
                 | if lazy_shared_file {
                     RegionPerms::FILE_DEMAND
                 } else {

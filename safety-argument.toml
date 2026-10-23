@@ -1829,3 +1829,18 @@ ref = "security-model/specification/spec.md#L42"
 agent = "Muse Wonder"
 argument = "Composing hwmon grants no new authority and moves no trust boundary. The crate's initcalls only register bus match entries (k10temp PCI, Super-I/O, MSR/SMM, JC42 at Stage::Device) whose probes receive the same Cap<BusDeviceCap, Write> the bus framework hands every PCI driver, plus a Stage::Late sysfs bridge that reads through the existing HwmonDevice trait. No capability type, mapping authority, or domain transition is created. The companion #909 change is purely subtractive: sysfs_bridge no longer publishes a fabricated 0 for failed sensor reads (it renders an empty value), so published information strictly decreases."
 argument = "Hardware access is unchanged in kind and in reach. The TPM MMIO window is touched only by the platform driver's pre-existing probe/submit code, exactly as before this change; registration clones an Arc handle to that already-probed device and does not widen which code can reach the registers. Dispatch in frame::measure flows through the same registry::list().first() call that existed before (and previously always found an empty registry), so no new kernel-side data access is created: the change makes one pre-existing access path reachable under the same trait contract as every other TpmDevice call, and makes the boot log's claim about that path's state accurate. Registration is once-only on the probe's None-to-Some transition, so no second device can silently replace the dispatch target."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "OpenAI Codex GPT-5"
+argument = "The fork change remains inside memory/ and frame/, existing TCB members, with userspace compatibility code providing the already-established backing-owner callbacks. EXTERNAL_REFS is internal mapping provenance; it grants no capability, adds no TCB member or domain transition, and changes only which known owner balances a shared frame alias."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-5"
+argument = "Every SHARED mapping remains non-owning at the address-space layer. Registry-backed file, device, shmem, and SysV aliases carry EXTERNAL_REFS and retain/release exactly as before, after leaf invalidation. Plain shared aliases are instead pinned by an intrinsically long-lived owner or a VMA-held Arc. Fork copies that Arc while the parent VMA transaction still excludes munmap; the child is not runnable, the per-frame shared transaction is released before the callback, and any later clone failure drops the partial child through the existing address-space owner-retirement hook. Thus no shared frame can be recycled while either address space still names it."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L171"
+agent = "OpenAI Codex GPT-5"
+argument = "Fork classifies shared backing in O(1) from immutable VMA provenance. Ordinary MAP_SHARED anonymous pages no longer probe four unrelated global owner registries per resident frame, eliminating a workload-amplifiable cross-process lock convoy. Registry-backed aliases retain the same per-frame accounting, and the admission invariant EXTERNAL_REFS implies SHARED prevents an unowned private mapping from entering that path."

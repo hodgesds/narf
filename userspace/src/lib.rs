@@ -208,6 +208,13 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
     handlers::drop_address_space_shm(address_space_id);
 }
 
+/// Clone file/device VMA ownership while memory still holds the parent's fork
+/// topology transaction. This pins VMA-owned backing until the child publishes
+/// or its partially-built address space is dropped.
+pub fn fork_mapped_file_address_space(parent_id: u64, child_id: u64) {
+    mapped_file::fork_address_space(parent_id, child_id);
+}
+
 /// Filesystem truncation bridge installed during common boot init.
 pub use mapped_file::truncate_file_mappings;
 

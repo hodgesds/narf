@@ -3602,6 +3602,25 @@ fn smoke_memory_phys_len_mismatch_rejected() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_phys_len_mismatch_rejected);
 
+/// Per-frame external lifetime accounting is meaningful only for a borrowed
+/// SHARED mapping. Rejecting the orphan marker at admission keeps teardown
+/// from either leaking private backing or calling an unrelated owner hook.
+fn smoke_memory_external_refs_require_shared() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = AddressSpace::empty();
+    match a.map_region(Region {
+        base: VirtAddr::new(0x4000),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::EXTERNAL_REFS,
+        phys: alloc::vec![PhysAddr::new(0x10_000)].into(),
+    }) {
+        Err(AddressSpaceError::SharedMapping) => TestResult::Pass,
+        _ => TestResult::Fail("EXTERNAL_REFS without SHARED was accepted"),
+    }
+}
+kernel_test_in!("memory", smoke_memory_external_refs_require_shared);
+
 /// Frame allocator: alloc, free, alloc-again must return a valid
 /// frame each cycle. Asserts addresses are 4 KiB-aligned and
 /// freed frames are reusable.

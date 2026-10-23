@@ -1409,6 +1409,14 @@ irrelevant. It mirrors `MAP_FIXED` region splitting and is released by
 registry lives in userspace compatibility code so address-space regions do not
 gain a filesystem dependency.
 
+Fork clones this VMA-level owner bucket through memory's fork hook before the
+parent VMA transaction is released. A concurrent `munmap` therefore cannot
+drop the final backing `Arc` between the child's memory snapshot and owner
+publication. `MAP_SHARED|MAP_ANONYMOUS`, vVAR, huge shared mappings, and
+kernel-owned rings do not probe per-frame owner registries; mappings whose
+cache, shmem, or device owner maintains alias counts carry the separate
+`EXTERNAL_REFS` provenance bit and retain/release only those frames.
+
 When `FileOps::mmap_lifetime` returns a per-object owner, the same registry
 retains it beside the file reference and clones it across fork and VMA splits.
 This permits a multiplexed device such as DRM to remove a closed GEM handle
