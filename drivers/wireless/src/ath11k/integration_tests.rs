@@ -44,13 +44,12 @@ use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIf
 use super::ce::{self, Ce, CeIrq, CeMsi};
 use super::ce_tests::{phys_rd32, phys_read, phys_wr32, phys_write, FakeChip};
 use super::core::{Ath11kCore, CeHif, CoreHooks, CoreState, FwNotice, QmiFw};
-use super::core_tests::{self, Fw, Script, CTRL_DL, FW_MAC, HTT_EID, WMI_DL, WMI_EID};
+use super::core_tests::{Fw, Script, CTRL_DL, FW_MAC, HTT_EID, WMI_DL, WMI_EID};
 use super::dp_ring::{self, buf_addr_get, DpHwParams, DpRingSizes};
 use super::dp_tests::{
-    good_rxd, reo_dest, rx_desc_bytes, wbm_htt, wbm_tqm_rate, FIRST, LAST, SMALL,
+    good_rxd, qca_rx_desc_bytes, reo_dest, rx_desc_bytes, wbm_htt, wbm_tqm_rate, FIRST, LAST, SMALL,
 };
 use super::hal::TransportError;
-use super::hal_tests::wcn6855;
 use super::htc::{self, HtcHdr};
 use super::htt;
 use super::hw::{HwRev, MSI_CONFIG_ONE, MSI_CONFIG_QCA6390, RING_MASK_QCA6390};
@@ -148,8 +147,26 @@ fn clock() -> u64 {
 
 fn noop() {}
 
-fn test_rng(out: &mut [u8]) {
+static ENTROPY_FAIL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+struct EntropyFailure;
+impl EntropyFailure {
+    fn enable() -> Self {
+        ENTROPY_FAIL.store(true, Ordering::Release);
+        Self
+    }
+}
+impl Drop for EntropyFailure {
+    fn drop(&mut self) {
+        ENTROPY_FAIL.store(false, Ordering::Release);
+    }
+}
+fn test_rng(out: &mut [u8]) -> Result<(), i32> {
+    if ENTROPY_FAIL.load(Ordering::Acquire) {
+        out.fill(0xa5);
+        return Err(super::mac::errno::EIO);
+    }
     out.fill(0x22);
+    Ok(())
 }
 
 /// The fake chip, shareable between the HIF and the device model.
@@ -421,6 +438,7 @@ struct DevState {
 }
 
 struct Dev {
+    revision: HwRev,
     chip: Arc<Chip>,
     st: RefCell<DevState>,
 }
@@ -430,9 +448,10 @@ unsafe impl Send for Dev {}
 unsafe impl Sync for Dev {}
 
 impl Dev {
-    fn new(chip: Arc<Chip>, script: Script, cfg: FwCfg) -> Arc<Dev> {
+    fn new(chip: Arc<Chip>, script: Script, cfg: FwCfg, revision: HwRev) -> Arc<Dev> {
         let credit_size = script.credit_size as u32;
         Arc::new(Dev {
+            revision,
             chip,
             st: RefCell::new(DevState {
                 fw: Fw::new(script),
@@ -546,10 +565,28 @@ impl Dev {
         let c = self.chip();
         let r = &mut st.rings;
         if r.tcl.is_none() {
-            r.tcl = umac(c, TCL1_R0, TCL1_HP, false);
+            r.tcl = umac(
+                c,
+                if self.revision == HwRev::Qca6390Hw20 {
+                    0x00a4_4684
+                } else {
+                    TCL1_R0
+                },
+                TCL1_HP,
+                false,
+            );
         }
         if r.wbm.is_none() {
-            r.wbm = umac(c, WBM2SW0_R0, WBM2SW0_TP, true);
+            r.wbm = umac(
+                c,
+                if self.revision == HwRev::Qca6390Hw20 {
+                    0x00a3_4910
+                } else {
+                    WBM2SW0_R0
+                },
+                WBM2SW0_TP,
+                true,
+            );
         }
         if r.reo.is_none() {
             r.reo = umac(c, REO2SW1_R0, REO2SW1_TP, true);
@@ -558,7 +595,11 @@ impl Dev {
             r.reo_cmd = umac(c, REO_CMD_R0, REO_CMD_HP, false);
         }
         if r.reo_status.is_none() {
-            r.reo_status = umac(c, REO_STATUS_R0, REO_STATUS_TP, true);
+            r.reo_status = if self.revision == HwRev::Qca6390Hw20 {
+                umac(c, 0x00a3_84ac, 0x00a3_b06c, true)
+            } else {
+                umac(c, REO_STATUS_R0, REO_STATUS_TP, true)
+            };
         }
     }
 
@@ -658,7 +699,11 @@ impl Dev {
             let mut d = good_rxd(msdu.len(), 1);
             d.attn1 = st.rx_attn1;
             d.rate_info = st.rx_rate_info;
-            let mut buf = rx_desc_bytes(&d);
+            let mut buf = if self.revision == HwRev::Qca6390Hw20 {
+                qca_rx_desc_bytes(&d)
+            } else {
+                rx_desc_bytes(&d)
+            };
             buf.extend_from_slice(&msdu);
             phys_write(pa, &buf);
             if !reo.produce(
@@ -816,10 +861,19 @@ fn wpa2_cfg() -> FwCfg {
 
 /// A core + DP hooks on a fresh chip, before `qmi_firmware_ready`.
 fn rig(script: Script, cfg: FwCfg, sizes: DpRingSizes) -> (TCore, DpHooks, Arc<Dev>) {
+    rig_for_rev(script, cfg, sizes, HwRev::Wcn6855Hw21)
+}
+fn rig_for_rev(
+    script: Script,
+    cfg: FwCfg,
+    sizes: DpRingSizes,
+    revision: HwRev,
+) -> (TCore, DpHooks, Arc<Dev>) {
+    let params = revision.params().expect("checked production profile");
     NOW.store(0, Ordering::Relaxed);
-    let ce = Ce::alloc(&wcn6855(), msi(&MSI_CONFIG_QCA6390), clock).expect("Ce::alloc");
-    let chip = Arc::new(Chip(FakeChip::new(ce.shadow_reg_v2())));
-    let dev = Dev::new(chip.clone(), script, cfg);
+    let ce = Ce::alloc(&params, msi(&MSI_CONFIG_QCA6390), clock).expect("Ce::alloc");
+    let chip = Arc::new(Chip(FakeChip::for_revision(revision, ce.shadow_reg_v2())));
+    let dev = Dev::new(chip.clone(), script, cfg, revision);
     let hif = CeHif {
         ce,
         io: Io(chip),
@@ -831,13 +885,13 @@ fn rig(script: Script, cfg: FwCfg, sizes: DpRingSizes) -> (TCore, DpHooks, Arc<D
         dev: Some(dev.clone()),
         ..TestQmi::default()
     };
-    let core = match Ath11kCore::new(hif, qmi, core_tests::cfg()) {
+    let core = match Ath11kCore::new(hif, qmi, super::core::CoreConfig::for_hw(&params).unwrap()) {
         Ok(c) => c,
         Err(_) => panic!("Ath11kCore::new"),
     };
     let hooks = DpHooks::new(
-        DpHwParams::for_rev(HwRev::Wcn6855Hw21),
-        HwRev::Wcn6855Hw21 as u32,
+        DpHwParams::for_rev(revision),
+        revision as u32,
         sizes,
         Some(msi(&MSI_CONFIG_QCA6390)),
     );
@@ -970,7 +1024,14 @@ fn up_down_caps(
     cfg: FwCfg,
     adjust: impl FnOnce(&mut super::mac::DeviceCaps),
 ) -> Result<Up, &'static str> {
-    let (mut core, mut hooks, dev) = rig(script(), cfg, SIZES);
+    up_down_caps_for_rev(cfg, adjust, HwRev::Wcn6855Hw21)
+}
+fn up_down_caps_for_rev(
+    cfg: FwCfg,
+    adjust: impl FnOnce(&mut super::mac::DeviceCaps),
+    revision: HwRev,
+) -> Result<Up, &'static str> {
+    let (mut core, mut hooks, dev) = rig_for_rev(script(), cfg, SIZES, revision);
     let (r, err, _, stage) = bring_up(&mut core, &mut hooks);
     ensure!(r.is_ok() && err == 0, "bring-up with the DP");
     ensure!(
@@ -5301,3 +5362,124 @@ kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_int_ptk_rekey);
 
 #[path = "supplicant_tests.rs"]
 mod supplicant;
+
+/// Native QCA6390 production profile: real CE/WMI initialization and DP hook
+/// setup, four owned slots, WPA2 over native RX, then packet TX/RX through
+/// the family's literal TCL/WBM/REO register geometry.
+fn smoke_ath11k_qca6390_production_profile_station_and_capacity() -> TestResult {
+    check(|| {
+        let mut u = up_down_caps_for_rev(wpa2_cfg(), |_| {}, HwRev::Qca6390Hw20)?;
+        {
+            let rt = run(u.shared.lock());
+            ensure!(
+                rt.core.cfg.num_vdevs == 4 && rt.dp.cfg.hal_desc_sz == 384,
+                "production QCA6390 core and native DP profile"
+            );
+            ensure!(
+                rt.vdev(3).is_some() && rt.vdev(4).is_none(),
+                "four isolated host vdev states"
+            );
+        }
+        ensure!(
+            u.shared.reserve_vdev() == Some(1)
+                && u.shared.reserve_vdev() == Some(2)
+                && u.shared.reserve_vdev() == Some(3)
+                && u.shared.reserve_vdev().is_none(),
+            "slot3 available without aliasing a fifth slot"
+        );
+        ensure!(
+            u.shared.assign_vdev_iftype(1, 2)
+                && !u.shared.assign_vdev_iftype(2, 2)
+                && u.shared.assign_vdev_iftype(2, 3)
+                && u.shared.assign_vdev_iftype(3, 9),
+            "dual-station and four-total interface constraints"
+        );
+        for id in 1..=3 {
+            u.shared.release_vdev(id);
+        }
+        // The generic fixture has no host registry/virtual lifecycle and
+        // must not advertise one. Compare the descriptor used by production
+        // PCI registration; actual slot reservation/roles are exercised above.
+        ensure!(
+            !u.netdev.supports_virtual_interfaces() && u.netdev.interface_combinations().is_empty(),
+            "single-interface fixture preserves the lifecycle admission gate"
+        );
+        let combinations = super::iface::supported_interface_combinations();
+        let combination = combinations
+            .first()
+            .ok_or("production interface combination")?;
+        ensure!(
+            combination.max_interfaces == 4,
+            "nl80211 capacity equals firmware request"
+        );
+        ensure!(narf_net::iface::set_link_state(u.name, true), "IFF_UP");
+        pump(&u, 1);
+        connect(&u)?;
+        ensure!(
+            u.netdev.link_up() && u.dev.st.borrow().world.ap.m4_ok,
+            "native QCA6390 RX carried complete WPA2 handshake"
+        );
+        let before = u.dev.st.borrow().tcl_tx.len();
+        let tx = ipv4_frame(&GW, &OWN, 0, &[1, 2, 3, 4]);
+        ensure!(
+            narf_net::iface::send_on(u.name, &tx).is_ok(),
+            "queue Ethernet on active station"
+        );
+        let frame = u
+            .tx_cons
+            .try_recv()
+            .ok()
+            .flatten()
+            .ok_or("queued Ethernet")?;
+        run(u.netdev.tx_one(&frame)).map_err(|_| "native TCL TX")?;
+        pump(&u, 3);
+        ensure!(
+            u.dev.st.borrow().tcl_tx.len() == before + 1,
+            "native TCL/WBM TX completion"
+        );
+        let rx = ipv4_frame(&OWN, &GW, 0, &[9, 8, 7, 6]);
+        u.dev.st.borrow_mut().rx_queue.push_back(rx.clone());
+        pump(&u, 3);
+        ensure!(
+            RX_SEEN.lock().contains(&rx),
+            "native RX descriptor reaches Ethernet sink"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k/qca6390",
+    smoke_ath11k_qca6390_production_profile_station_and_capacity
+);
+
+fn smoke_ath11k_native_sa_query_entropy_failure_sends_no_request() -> TestResult {
+    use super::mac_frame::stype;
+    check(|| {
+        let u = up(pmf_cfg())?;
+        pmf_connect(&u)?;
+        let before = mgmt_sent(&u).len();
+        inject(&u, &ap_mgmt(stype::DEAUTH, &OWN, &[6, 0]));
+        let _failure = EntropyFailure::enable();
+        let (_, step, detail, _) = latched(|| pump(&u, 3));
+        ensure!(
+            step == super::mac::step::ENTROPY && detail == 3,
+            "native SA-query entropy failure latched"
+        );
+        let sent = mgmt_sent(&u);
+        ensure!(
+            !sent[before..]
+                .iter()
+                .any(|f| f.len() > 33 && f[0] == 0xd0 && f[32..34] == [8, 0]),
+            "partial failed entropy emitted SA-query transaction ID"
+        );
+        ensure!(
+            !u.netdev.link_up(),
+            "failed SA-query RNG kept native carrier up"
+        );
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_native_sa_query_entropy_failure_sends_no_request
+);

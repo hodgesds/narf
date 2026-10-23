@@ -63,6 +63,21 @@ headers and transport source under the repository's GPL-2.0 licensing.
 
 ## 3. Public Interface
 
+`association::{Bss, JoinPlan, SecurityMode, Phase}` supplies the shared
+legacy SoftMAC management plan extracted from MT76. It validates bounded AP
+IEs, SSID, supported/basic rates and Open or WPA2-PSK/CCMP negotiation, builds
+open-authentication and association requests, and binds responses to the
+local/AP addresses, transaction phase, status and AID. `SecurityMode` carries
+no PMK. Fragmented responses (including a final fragment with nonzero
+SequenceControl fragment number) leave the phase unchanged.
+`append_sme_ies` accepts checked optional elements before first TX;
+`legacy_rates()` returns IEEE-rate bitmaps rather than hardware indices.
+`association::channel` exposes the existing 2.4/5GHz legacy 20MHz geometry.
+Drivers retain their own rate-index mapping, radio/regulatory authority,
+firmware peer records, retained supplicant, key installation and controlled
+port. `Associated` alone grants none of those. MT76 preserves its existing
+public driver API through a wrapper; RTL8188EU uses the common plan directly.
+
 ### 3.1 Interface Specialization
 
 ```rust
@@ -744,6 +759,21 @@ local-teardown notifications themselves through
 Deauthentication / Disassociation), so the control bridge does not emit a
 second local-disconnect event.
 
+### 3.4.1 CCMP packet helpers (`ccmp.rs`)
+
+`build_aad` authenticates the three addresses, fragment number and optional
+Address4 / QoS TID. It excludes Duration/HT Control, mutes data subtype bits
+4–6 (preserving the QoS indicator), Retry/PM/MoreData and QoS Order, and
+forces Protected. Management subtype and non-QoS Order remain authenticated.
+`build_nonce` includes the transmitter address and big-endian 48-bit PN.
+`protect` / `unprotect` take an `AesCcm` backend; `unprotect` checks a copy of
+`ReplayWindow` and commits it only after MIC verification. Authentication
+failure leaves ciphertext and replay state unchanged when the backend honors
+its verify-before-mutation contract. The caller must validate complete MAC
+header bounds, key role/ID, native station addresses, nonce uniqueness and
+PN exhaustion, and retain independent replay trackers per key/TID (including
+a separate non-QoS tracker). These helpers do not grant controlled-port access.
+
 ### 3.5 EAPOL supplicant (`eapol.rs`)
 
 `Supplicant` runs the 4-way handshake (`handle`) and, once it completed,
@@ -766,6 +796,45 @@ handshake offload feature. Required MFP, other ciphers/AKMs, arbitrary
 association IEs, random scan MACs and other unsupported mutation options
 are rejected. Scan execution is passive. Full wpa_supplicant/iw process
 interoperability remains a separate integration test.
+
+`Supplicant::rx_eapol_with_nonce(pdu, encrypted, provider)` supplies the
+RSNA path with a fallible, lazy SNonce provider (`FnMut() -> Option<[u8;32]>`).
+The provider runs only for a validated new message1 while `renew_snonce` is
+set, after existing EAPOL/front, PMF and KDE checks. Retries, message3, group
+rekeys and discarded traffic never request fresh entropy. `None` returns
+`EapolRxError::NonceUnavailable` before committing new nonce/key state; the
+caller aborts the attempted handshake/rekey. Production callers use the
+fallible hardware-seeded crypto API, with no timing fallback. Existing
+`rx_eapol` retains its fixed-byte interface through this same implementation.
+
+### 3.5.1 SAE commit entropy (`sae`)
+
+Production `SaeSession::try_build_commit()` and the P-256 `EccGroup` backend
+obtain their secret scalar/mask material through
+`narf_crypto::try_fill_random_bytes`. Unavailable entropy returns
+`SaeError::EntropyUnavailable` without publishing a Commit, changing state,
+or retaining partial samples. Temporary seed buffers are zeroized on success
+and failure. `try_build_commit_with_entropy` accepts a driver's fallible secure
+provider: it must fill every requested byte unpredictably or return an error;
+timing counters and deterministic fallbacks are inadmissible. A Committed retry
+returns the existing scalar/element without consulting the provider.
+
+Scalar generation accepts a complete 32-byte candidate only when its checked
+big-endian encoding lies in `[1, n)` for the P-256 order. It never reduces an
+out-of-range encoding or substitutes one for zero. Each scalar has a maximum of
+16 attempts; exhaustion fails without committing session/group secrets.
+Production candidates come directly from the fallible secure provider.
+Deterministic fixture seeds expand under separate scalar domains with an explicit
+rejection counter. Literal `0`, `n`, `n-1` and persistent invalid-provider
+regressions check the acceptance range and bounded work; explicit Annex J.10
+rand/mask fixtures retain their existing wire/key values.
+
+The generic `Sae::try_build_commit` delegates to `EccGroup::try_make_commit`;
+entropy-dependent production groups must implement that fallible surface.
+Legacy infallible Commit wrappers return empty output on failure and leave
+state unchanged; transmitters use the fallible APIs. Deterministic seed and
+scalar/mask constructors exist only in test or `kernel-test` builds. Protocol
+fixtures use explicit injected material and do not depend on target entropy.
 
 ### 3.5 Deployment regulatory policy
 

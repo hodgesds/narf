@@ -200,6 +200,7 @@ kernel_test_in!("drivers/wireless/rtw88", smoke_rtw88_probe_bound_or_skip);
 
 fn smoke_rtw88_unready_control_plane_fails_closed() -> TestResult {
     let device = super::pci::Rtw88Device {
+        bus_addr: narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0, 0, 1, 0)),
         registers: MmioRegion {
             phys: PhysAddr::new(0),
             virt: 0,
@@ -209,6 +210,7 @@ fn smoke_rtw88_unready_control_plane_fails_closed() -> TestResult {
             },
         },
         mac: [0x00, 0xE0, 0x4C, 0x68, 0x12, 0x34],
+        firmware: None,
         device_id: RTL_DEV_8822CE,
         link_up: core::sync::atomic::AtomicBool::new(false),
         rx_ring: narf_lib::sync::IrqSafeSpinLock::new(None),

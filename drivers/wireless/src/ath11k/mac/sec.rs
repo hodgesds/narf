@@ -23,6 +23,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use zeroize::Zeroizing;
 
 use narf_crypto::bip::{self, Cipher as BipCipher};
 use narf_wireless::eapol::KeyMgmt;
@@ -538,6 +539,14 @@ use narf_wireless::eapol::{
 
 use super::{errno, fail, step, timeout, DataPort, LinkLoss, Mac, MacError, ScanBss, WmiPort};
 
+/// Failed partial samples never escape this temporary buffer. The shared
+/// supplicant invokes this only when an accepted M1 must renew SNonce.
+fn random_snonce(wmi: &impl WmiPort) -> Result<[u8; 32], i32> {
+    let mut bytes = Zeroizing::new([0; 32]);
+    wmi.random_bytes(bytes.as_mut_slice())?;
+    Ok(*bytes)
+}
+
 /// `step::EAPOL_PROTO` / `step::EAPOL_GTK` details of a 4-way failure.
 fn pairwise_fail_step(w: PairwiseFail) -> (u32, u32) {
     match w {
@@ -619,9 +628,16 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             if src != aa {
                 continue;
             }
-            let mut fresh = [0u8; 32];
-            self.wmi.random_bytes(&mut fresh);
-            match sup.rx_eapol(pdu, encrypted, fresh) {
+            let mut entropy_error = None;
+            let result =
+                sup.rx_eapol_with_nonce(pdu, encrypted, || match random_snonce(&self.wmi) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) => {
+                        entropy_error = Some(error);
+                        None
+                    }
+                });
+            match result {
                 Ok(EapolRx::Pairwise1(m2)) => {
                     let f = frame::eapol_eth(&aa, &own, &m2.reply);
                     if let Err(e) = self.dp.send_eth(&f).await {
@@ -662,6 +678,14 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                     return Ok(());
                 }
                 Ok(EapolRx::Group1(_)) => {}
+                Err(EapolRxError::NonceUnavailable) => {
+                    return fail(
+                        step::ENTROPY,
+                        1,
+                        entropy_error.unwrap_or(errno::EIO),
+                        "4-way entropy",
+                    );
+                }
                 Err(EapolRxError::Drop(GroupKeyDrop::BadMic)) => mic_failures += 1,
                 Err(EapolRxError::Drop(_)) => {}
                 Err(EapolRxError::Pairwise { reason, why }) => {
@@ -714,9 +738,12 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             if src != aa {
                 continue;
             }
-            let mut fresh = [0u8; 32];
-            self.wmi.random_bytes(&mut fresh);
-            let r = self.sup.as_mut().unwrap().rx_eapol(pdu, encrypted, fresh);
+            let wmi = &self.wmi;
+            let r = self
+                .sup
+                .as_mut()
+                .unwrap()
+                .rx_eapol_with_nonce(pdu, encrypted, || random_snonce(wmi).ok());
             let own = self.caps.mac_addr;
             let m1 = match r {
                 Ok(EapolRx::Group1(m)) => m,
@@ -747,6 +774,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                             });
                         }
                     }
+                    return;
+                }
+                Err(EapolRxError::NonceUnavailable) => {
+                    self.supplicant_deauth(step::ENTROPY, 2);
                     return;
                 }
                 Err(EapolRxError::Drop(_)) => continue,
@@ -1080,7 +1111,11 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             return;
         }
         let mut tid = [0u8; 2];
-        self.wmi.random_bytes(&mut tid);
+        if self.wmi.random_bytes(&mut tid).is_err() {
+            self.mfp.sa_query = None;
+            self.supplicant_deauth(step::ENTROPY, 3);
+            return;
+        }
         if let Some(q) = self.mfp.sa_query.as_mut() {
             q.trans_ids.push(tid);
             q.next_us += SA_QUERY_RETRY_TU * 1024;

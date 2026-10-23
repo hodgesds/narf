@@ -38,14 +38,14 @@ use super::sdpcm::{
 
 /// `WLC_GET_MAGIC` — read the firmware "magic" value to confirm the
 /// IOCTL channel is up and the chip's endianness matches.
-pub const WLC_GET_MAGIC: u32 = 1;
+pub const WLC_GET_MAGIC: u32 = 0;
 /// `WLC_UP` — bring the radio up (associate / scan can follow).
 pub const WLC_UP: u32 = 2;
 /// `WLC_DOWN` — take the radio back down.
 pub const WLC_DOWN: u32 = 3;
 /// `WLC_GET_VERSION` — read the host-API version the firmware
 /// implements (used to gate IOVAR availability).
-pub const WLC_GET_VERSION: u32 = 4;
+pub const WLC_GET_VERSION: u32 = 1;
 /// `WLC_GET_INFRA` — read whether infra (managed STA) mode is on.
 pub const WLC_GET_INFRA: u32 = 19;
 /// `WLC_SET_INFRA` — set infra (managed STA) mode.
@@ -57,7 +57,7 @@ pub const WLC_SET_AUTH: u32 = 22;
 /// `WLC_GET_BSSID` — read the BSSID we're associated with.
 pub const WLC_GET_BSSID: u32 = 23;
 /// `WLC_SET_BSSID` — direct-associate to a specified BSSID.
-pub const WLC_SET_BSSID: u32 = 26;
+pub const WLC_SET_BSSID: u32 = 24;
 /// `WLC_GET_SSID` — read the SSID the firmware reports.
 pub const WLC_GET_SSID: u32 = 25;
 /// `WLC_SET_SSID` — request association to an SSID.

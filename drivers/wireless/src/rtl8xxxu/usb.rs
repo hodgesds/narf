@@ -359,17 +359,6 @@ pub fn poll_intr_in(
     }
 }
 
-/// Upload a firmware blob via bulk-OUT. The Realtek 8051 MCU expects
-/// the blob in MaxPacket-sized chunks; the wrapper handles that.
-pub async fn upload_firmware(
-    dev: &narf_drivers_usb::device::USBDevice,
-    ep_addr: u8,
-    blob: &[u8],
-    max_packet: u16,
-) -> Result<usize, narf_drivers_usb::firmware::FirmwareError> {
-    narf_drivers_usb::firmware::upload_default(dev, ep_addr, blob, max_packet).await
-}
-
 // ──────────────────────────────────────────────────────────────────────
 // Transport abstraction
 //
@@ -406,8 +395,8 @@ pub trait Rtl8xxxuTransport {
     fn write8(&self, addr: u16, val: u8) -> Result<(), TransportError>;
     fn write16(&self, addr: u16, val: u16) -> Result<(), TransportError>;
     fn write32(&self, addr: u16, val: u32) -> Result<(), TransportError>;
-    /// Submit one bulk-OUT frame on the bulk-OUT endpoint reserved
-    /// for FW download. Returns bytes transferred.
+    /// Submit one packet on a descriptor-selected bulk-OUT endpoint.
+    /// Firmware loading uses the separate asynchronous EP0 control owner.
     fn bulk_out(&self, ep: u8, bytes: &[u8]) -> Result<usize, TransportError>;
     /// Receive one bulk-IN URB. Returns bytes copied into `out`.
     fn bulk_in(&self, ep: u8, out: &mut [u8]) -> Result<usize, TransportError>;

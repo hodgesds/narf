@@ -33,7 +33,7 @@ validation was run while the equivalence work remained in progress.
 
 ## MT7921/MT7922 firmware bringup
 
-The x86_64 MT76 late init path now owns coherent WM/FWDL/MCU DMA rings and
+The x86_64 and aarch64 MT76 late init path now owns coherent WM/FWDL/MCU DMA rings and
 performs ROM restart, patch semaphore negotiation, patch/RAM download and
 firmware-ready verification. Post-firmware MCU commands obtain the real MAC
 and PHY, read EFUSE hardware identity, select embedded world country limits,
@@ -51,20 +51,113 @@ switching via `MCU_EXT_CMD_CHANNEL_SWITCH`, open-authentication/association MLME
 handshakes, and IEEE 802.11i WPA2-PSK 4-way handshakes (M1..M4) with HMAC-SHA1 MIC
 verification/generation. WTBL station records commit temporal keys with
 tag 0x12 (`STA_REC_KEY_V2`), cipher 6 (`MCU_CIPHER_AES_CCMP`), and `PORT_SECURE`.
-Packet transport helpers encapsulate 802.3 Ethernet frames into CONNAC2 TXDs
-and convert validated native LLC/SNAP frames on RX. The live packet-service
-task, functional kernel transmit callback and network RX/capability attachment
-remain unconnected; existing ring smoke tests do not prove off-box traffic.
-Group-key installation and protected RX/replay/rekey handling also remain open.
-The retained RX API now rejects invalid descriptors and unsupported native
-layouts rather than treating rejected hardware packets as Ethernet.
-The `drivers/wireless` QEMU filter passes 834 tests on x86_64 (9 skipped)
-and 291 on aarch64 (1 skipped), with zero failures. Coverage includes modeled
-WPA2 join dispatch, STA_REC key installation and packet codecs, plus Intel
-firmware CPU release, Realtek BAR/EFUSE access, ath10k HTC setup and Cypress
-event framing. These checks do not establish physical radio operation.
-Both-architecture Clippy and `cargo fmt` pass cleanly. Physical MT7922
-silicon validation on AMD Zen2/Phoenix hardware remains open to close the Stage 5 Wi-Fi gate.
+The retained legacy 2.4 GHz station profile now uses Linux's packed 76-byte
+channel request and UNI3 station/key commands. It installs the BSSID and
+unauthorized AP WTBL before authentication, then drives peer-bound RSNA with
+M3 RSNE/MIC/ANonce/KDE checks, pairwise/group keys and per-key/TID CCMP replay
+windows. Kernel transmit, capability frame rings and RX delivery share a
+bounded service step with synchronous network waiters; owned rekey work can
+progress even when its original waiter is cancelled. Peer disconnect closes
+carrier and acknowledged key/WTBL/BSS cleanup precedes reuse. Verified WFSYS
+reset, DMA stop/retirement and firmware reload now recover failed/cancelled
+control without replaying station keys; failed quiescence retains allocations.
+Initial startup failure and registered-interface recovery use retained owned
+futures with bounded retry/backoff. Broader radio modes, removal and PM remain
+software work. No off-box radio, DHCP or AP interoperability has been demonstrated.
+
+## Wi-Fi family software bring-up
+
+All eleven in-tree families are covered by the current audit and dependency
+ledger in `drivers/wireless/specification/spec.md` and its family documents.
+Intel now sends versioned coexistence, SoC latency and awake-power setup.
+A retained Gen2 context-v1/RFH/TFH boot owner now covers APM, ALIVE6, unified
+NVM and MVM post-init configuration. Its API77 passive-scan owner now composes
+current signed host policy, fresh MCC/LAR, conditional DQA, versioned MAC/link
+receipts and scan15 channel records; automatic Gen2 station admission remains
+gated. An inactive PHY/link owner now checks receive-channel policy, programs
+the API77 PHY/RLC commands and requires acknowledged unbind/remove before reuse.
+Host nonce and SAE paths require fallible hardware entropy instead of
+the old timing seed; validated RSNA M1 renewal alone requests a fresh SNonce.
+Full system entropy-pool/health services remain open.
+Its retained maintenance work progresses through synchronous packet service;
+stalled TX credit no longer prevents RX and cancelled waiters retain EAPOL work.
+MT76 retains cancelled work through bounded WFSYS reset, firmware reload and
+radio reinitialization, without replaying association or keys. Its coherent
+PCI backend and ownership models now build on x86_64 and aarch64; unsupported
+per-domain IOMMU mapping remains rejected. Its legacy 2.4/5 GHz path now binds
+RX to the selected channel, carries band-specific firmware settings, selects
+the AP basic TX rate and checks optional SME association/security IEs.
+CYW43439 now connects standard PCI SDHCI PIO/card enumeration or an explicitly
+supplied platform card through trusted firmware/NVRAM/CLM loading, mailbox/F2
+control, scan, Open/WPA2 and bounded RX/TX. Board clocks/pins/regulators, gSPI
+host support and reset/reload/PM remain software work. Qualcomm ath10k reaches
+owned CE/BMI firmware/BDF/OTP, PLL and code-swap preparation, retained HTC
+runtime and versioned WMI service-ready/host-memory/INIT/READY, followed by
+retained HTT RX buffers and native TX/management completion. A retained WMI
+radio session now performs correlated passive scans across six dialects while
+servicing HTT completions. Station-context preparation now intersects immutable
+factory regulatory limits with authenticated host policy and an observed BSS,
+then waits for correlated vdev-start and sparse HTT peer-map completion.
+Initial Open authentication/association exchanges now use the actual dialect's
+inline WMI, retained referenced WMI or HTT management path, with peer-bound RX
+and bounded progress under unrelated-event floods. Shared JoinPlan now drives
+native PEER_ASSOC/VDEV_UP and rejects queued peer loss before reporting success.
+Association-response rate negotiation, PFC events, security/decapsulation,
+remaining WMI MLME and station attachment remain software work.
+Ath9k programs AR9285 inactive PHY/PLL/RF INI, EEPROM modal and PDADC detector
+tables with current-capability register access. Factory CTL edges and target
+power now bound the rate-power registers under an explicit zero-dBm ceiling;
+analog calibration and packet/station ownership remain open. Ath11k QCA6390 has
+its native IPQ8074 RX path and four-vdev resources; QCN9074 remains gated.
+Realtek has per-family identity/power work, a retained RTL8188EU factory/FIFO/
+firmware/MAC/BB/RF/LLT plus LC/IQK worker and bounded native RTW89 TX ownership.
+Production AES-CCM, shared CCMP AAD/replay corrections and checked per-key/TID
+station wrappers provide software crypto prerequisites; channel/power and
+native station paths remain incomplete. RTL8188EU now has a persistent native
+packet receipt/stop owner, channel1/XTAL initialization and a bounded shared
+management association plan. Signed, exact-board calibration artifacts now
+gate native transmit gains and MAC TX activation; missing qualification keeps
+TX closed. The initial channel1 station service now composes native USB
+management/data, authentication/association, RSNA and CCMP with Narf-Rings and
+synchronous packet progression; the exact terminal M4 receipt precedes key/port
+commit. Signed board curves and deployment policy are required for publication.
+Reset/rejoin generations, broader channels/rates and PMF remain software work.
+RTL8188EE now carries a one-shot continuation from its exact firmware owner
+through LLT and distinct linked TX/RX ring preparation, retained before native
+publication. Active packet DMA, full MAC/BB/RF and IRQ operation remain closed.
+RTL8822CE now retains an authenticated section-firmware attempt through native
+all-ring-owned beacon reserved pages and IDDMA. Success parks DMA; ambiguous or
+cancelled mappings stay pinned. Complete MAC/RF, firmware commands, ordinary
+packet/station paths and other RTW88 chips remain software work.
+RTW89 has checked owned AX firmware selection, cold-power/DDV primitives and
+fuse-selected immutable header/section download plans with host blacklist
+enforcement. Power-off/normalization and DLE/HFC primitives now have Linux-C
+trace coverage. Native CH12 commands now retain DMA through the multi-tag
+delay and use corrected hardware/host index fields. A retained WCPU loader
+now follows Linux reset, secure IDMEM and header/section progression and waits
+for initialized firmware; full PCIe/BDRAM/startup composition and station work
+remain. Its diagnostic probe retains unpublished storage without activating
+rings, IRQs or a NIC.
+Scoped native PCIe PHY/DBI operations now provide bounded MDIO/RAC access with
+retained failure/cancellation exclusion; complete PCIe/BDRAM startup remains.
+USB retains published address/configuration/control/bulk DMA, checks slot
+generations and implements explicit Stop/Set-Dequeue fencing for the supported
+bulk profile; halt/reset/replug and broader reclamation remain software work.
+Broadcom BCM43602 now connects explicit board-selected CR4/msgbuf transport to
+the common CYW FullMAC station/security lifecycle, with generation-safe retained
+flow-ring reuse after delete acknowledgment. Actual board selection, broader
+silicon, reset/recovery and PM remain software work. These gates
+cannot be closed by physical testing alone. No physical device validation is
+part of the current software-only work.
+
+The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
+wireless, crypto and ARM RNG QEMU gates: x86_64 reports 1822 pass / 0 fail /
+10 skip; aarch64 reports 1124 pass / 0 fail / 3 skip.
+Both include a clean production boot and btrfs interoperability postflight.
+Release/debug builds, targeted Clippy across the kernel feature contexts,
+workspace formatting, and the MT76 module build pass on both architectures.
+These are software/model checks; the skipped physical-device cases remain
+unvalidated and the missing driver stages above remain open.
 
 ## Loadable e1000 datapath
 

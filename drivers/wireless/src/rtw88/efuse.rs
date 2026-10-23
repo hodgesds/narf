@@ -114,7 +114,7 @@ fn read_physical(io: &mut impl EfuseIo, chip: Geometry, out: &mut [u8]) -> Resul
 
 /// Decode one-/two-byte headers, sparse word enables, and later word
 /// overrides. Protected physical bytes must be excluded by the caller.
-pub(super) fn decode_map(physical: &[u8], logical: &mut [u8]) -> Result<(), EfuseError> {
+pub(crate) fn decode_map(physical: &[u8], logical: &mut [u8]) -> Result<(), EfuseError> {
     logical.fill(0xff);
     let mut cursor = 0;
     while cursor < physical.len() {

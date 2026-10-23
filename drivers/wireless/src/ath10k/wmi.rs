@@ -111,7 +111,7 @@ pub fn decode_wmi_hdr(bytes: &[u8]) -> Result<WmiCmdHdr, ()> {
 //   WMI_GRP_VDEV  = 0x5
 //   WMI_GRP_PEER  = 0x6
 //
-// Command id = (group << 12) | local_index. We use the *legacy* WMI
+// A group's first ID is (group << 12) | 1; subsequent commands increment. We use the *legacy* WMI
 // numbering (the TLV variant used by 6174 has a parallel enum;
 // Stage 2 covers main-WMI which is the wire format for 988X / 9888 /
 // 9984 / 99X0).
@@ -123,36 +123,39 @@ pub enum WmiCmdId {
     /// `WMI_INIT_CMDID` — `0x1`. Host's first command after the HTC
     /// handshake.
     Init = 0x0001,
-    /// `WMI_START_SCAN_CMDID` — `WMI_GRP_SCAN << 12 | 0`.
-    StartScan = 0x3000,
-    /// `WMI_STOP_SCAN_CMDID` — `WMI_GRP_SCAN << 12 | 1`.
-    StopScan = 0x3001,
-    /// `WMI_PDEV_SET_PARAM_CMDID` — `WMI_GRP_PDEV << 12 | 0`.
-    PdevSetParam = 0x4000,
-    /// `WMI_PDEV_SET_CHANNEL_CMDID` — `WMI_GRP_PDEV << 12 | 1`.
-    PdevSetChannel = 0x4001,
-    /// `WMI_VDEV_CREATE_CMDID` — `WMI_GRP_VDEV << 12 | 0`.
-    VdevCreate = 0x5000,
-    /// `WMI_VDEV_DELETE_CMDID` — `WMI_GRP_VDEV << 12 | 1`.
-    VdevDelete = 0x5001,
-    /// `WMI_VDEV_START_REQUEST_CMDID` — `WMI_GRP_VDEV << 12 | 2`.
-    VdevStart = 0x5002,
-    /// `WMI_PEER_CREATE_CMDID` — `WMI_GRP_PEER << 12 | 0`.
-    PeerCreate = 0x6000,
+    /// `WMI_START_SCAN_CMDID` — first scan-group command (0x3001).
+    StartScan = 0x3001,
+    /// `WMI_STOP_SCAN_CMDID` — second scan-group command (0x3002).
+    StopScan = 0x3002,
+    /// `WMI_PDEV_SET_PARAM_CMDID` — third pdev-group command (0x4003).
+    PdevSetParam = 0x4003,
+    /// `WMI_PDEV_SET_CHANNEL_CMDID` — second pdev-group command (0x4002).
+    PdevSetChannel = 0x4002,
+    /// `WMI_VDEV_CREATE_CMDID` — first vdev-group command (0x5001).
+    VdevCreate = 0x5001,
+    /// `WMI_VDEV_DELETE_CMDID` — second vdev-group command (0x5002).
+    VdevDelete = 0x5002,
+    /// `WMI_VDEV_START_REQUEST_CMDID` — third vdev-group command (0x5003).
+    VdevStart = 0x5003,
+    /// `WMI_PEER_CREATE_CMDID` — first peer-group command (0x6001).
+    PeerCreate = 0x6001,
+    /// `WMI_VDEV_SET_PARAM_CMDID` in the MAIN dialect.
+    VdevSetParam = 0x5008,
 }
 
 impl WmiCmdId {
     pub fn from_raw(v: u32) -> Option<Self> {
         Some(match v {
             0x0001 => WmiCmdId::Init,
-            0x3000 => WmiCmdId::StartScan,
-            0x3001 => WmiCmdId::StopScan,
-            0x4000 => WmiCmdId::PdevSetParam,
-            0x4001 => WmiCmdId::PdevSetChannel,
-            0x5000 => WmiCmdId::VdevCreate,
-            0x5001 => WmiCmdId::VdevDelete,
-            0x5002 => WmiCmdId::VdevStart,
-            0x6000 => WmiCmdId::PeerCreate,
+            0x3001 => WmiCmdId::StartScan,
+            0x3002 => WmiCmdId::StopScan,
+            0x4003 => WmiCmdId::PdevSetParam,
+            0x4002 => WmiCmdId::PdevSetChannel,
+            0x5001 => WmiCmdId::VdevCreate,
+            0x5002 => WmiCmdId::VdevDelete,
+            0x5003 => WmiCmdId::VdevStart,
+            0x6001 => WmiCmdId::PeerCreate,
+            0x5008 => WmiCmdId::VdevSetParam,
             _ => return None,
         })
     }
@@ -175,10 +178,10 @@ pub enum WmiEventId {
     /// `WMI_READY_EVENTID` — `0x2`. Firmware sends this after the
     /// host has acknowledged `SERVICE_READY` and is ready to run.
     Ready = 0x0002,
-    /// `WMI_SCAN_EVENTID` — `WMI_GRP_SCAN << 12 | 0`.
-    Scan = 0x3000,
+    /// `WMI_SCAN_EVENTID` — first scan-group event (0x3001).
+    Scan = 0x3001,
     /// `WMI_DEBUG_MESG_EVENTID`.
-    DebugMessage = 0x3001,
+    DebugMessage = 0x1d003,
 }
 
 impl WmiEventId {
@@ -186,8 +189,8 @@ impl WmiEventId {
         Some(match v {
             0x0001 => WmiEventId::ServiceReady,
             0x0002 => WmiEventId::Ready,
-            0x3000 => WmiEventId::Scan,
-            0x3001 => WmiEventId::DebugMessage,
+            0x3001 => WmiEventId::Scan,
+            0x1d003 => WmiEventId::DebugMessage,
             _ => return None,
         })
     }
@@ -363,11 +366,10 @@ pub fn build_vdev_create(
 
 /// WMI_VDEV_PARAM_* constants from `wmi.h::enum wmi_vdev_param`.
 pub mod vdev_param {
-    pub const MAC_ADDR: u32 = 0x1;
-    pub const RTS_THRESHOLD: u32 = 0x2;
-    pub const FRAGMENTATION_THRESHOLD: u32 = 0x3;
-    pub const DTIM_PERIOD: u32 = 0x5;
-    pub const BEACON_INTERVAL: u32 = 0x6;
+    pub const RTS_THRESHOLD: u32 = 0x1;
+    pub const FRAGMENTATION_THRESHOLD: u32 = 0x2;
+    pub const DTIM_PERIOD: u32 = 0xd;
+    pub const BEACON_INTERVAL: u32 = 0x3;
 }
 
 /// Build a `WMI_VDEV_SET_PARAM_CMDID` command frame.
@@ -375,8 +377,8 @@ pub mod vdev_param {
 /// Payload from `wmi.h::struct wmi_vdev_set_param_cmd`:
 ///   __le32 vdev_id; __le32 param_id; __le32 param_value;
 pub fn build_vdev_set_param(vdev_id: u32, param_id: u32, param_value: u32) -> Vec<u8> {
-    // WMI_VDEV_SET_PARAM_CMDID = WMI_GRP_VDEV << 12 | 0x3 = 0x5003.
-    const VDEV_SET_PARAM_ID: u32 = 0x5003;
+    // MAIN WMI_VDEV_SET_PARAM_CMDID is the eighth vdev-group command.
+    const VDEV_SET_PARAM_ID: u32 = WmiCmdId::VdevSetParam as u32;
     let mut buf = Vec::with_capacity(4 + 12);
     let hdr = WmiCmdHdr::new(VDEV_SET_PARAM_ID);
     buf.extend_from_slice(&hdr.cmd_id_and_priv.to_le_bytes());
@@ -385,3 +387,7 @@ pub fn build_vdev_set_param(vdev_id: u32, param_id: u32, param_value: u32) -> Ve
     buf.extend_from_slice(&param_value.to_le_bytes());
     buf
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "wmi_legacy_tests.rs"]
+mod legacy_tests;

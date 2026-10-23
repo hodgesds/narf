@@ -1,34 +1,13 @@
-//! RTW89 firmware downloader — Stage-7.
+//! Checked AX firmware containers and raw section segmentation.
 //!
-//! Parses the rtw89 firmware-blob "Format v0" header (8 dwords + N
-//! section descriptors) and the Format v1 header (12 dwords) — the
-//! split that `rtw89_fw_hdr_parser_v0` / `rtw89_fw_hdr_parser_v1`
-//! handle in Linux (`fw.c:140`, `fw.c:440`). Walks the section table
-//! and segments each section into FW-DL packets of ≤2020 bytes (`fw.h:287`
-//! `FWDL_SECTION_PER_PKT_LEN`), with an 8-byte checksum trailer when
-//! the section header sets `CHECKSUM` (`fw.h:579`).
+//! Linux rtw89/fw.h defines v0 header32/section16 and v1 header48/section16.
+//! Both use four-bit inner section types; outer MFW image types select a
+//! normal, CE or BB-MCU image independently. AX chunks are always2020 bytes.
+//! Dynamic headers, checksums and indexed/formatted hardware signature pools
+//! are bounded before caller section metadata is committed. Selecting secure
+//! hardware signatures and activating the retained CH12 owner are separate
+//! boot steps.
 //!
-//! ## What lands in this stage
-//!
-//! - **Header parsing** for both v0 and v1 layouts.
-//! - **Section iteration** with type / length / DL-addr / CHKSUM /
-//!   REDL flags surfaced.
-//! - **Packet segmentation** (≤ 2020 bytes per H2C FWDL packet).
-//!
-//! What it does **not** do: the actual H2C DMA push (that's the
-//! pci.rs / dma.rs handshake that the next stage glues together
-//! through `make_fwhdr_dl_h2c` + the CH12 (FW-cmd) TX ring).
-//!
-//! ## References (all GPL-2.0)
-//!
-//! - Linux `rtw89/fw.h:583..611` — `struct rtw89_fw_hdr` (v0).
-//! - Linux `rtw89/fw.h:632..665` — `struct rtw89_fw_hdr_v1` (v1).
-//! - Linux `rtw89/fw.h:285..301` — `FWDL_SECTION_*` constants +
-//!   `rtw89_fw_hdr_section_info`.
-//! - Linux `rtw89/fw.c:140..280` — `rtw89_fw_hdr_parser_v0`.
-//! - Linux `rtw89/fw.c:440..540` — `rtw89_fw_hdr_parser_v1`.
-//! - Linux `rtw89/core.h:4723..4730` — `enum rtw89_fw_type`.
-
 #![allow(dead_code)]
 
 use core::convert::TryInto;
@@ -64,9 +43,8 @@ pub const FWDL_SECTION_MAX_NUM: usize = 10;
 
 /// Size of the v0 base header in bytes (8 × u32).
 pub const FW_HDR_V0_BASE_SIZE: usize = 8 * 4;
-/// Size of one v0 section descriptor in bytes (3 × u32). The Linux
-/// struct (`fw.h:573`) is `w0/w1/w2`.
-pub const FW_HDR_V0_SECTION_SIZE: usize = 3 * 4;
+/// Size of one v0 section descriptor in bytes (4 × u32): w0..w3.
+pub const FW_HDR_V0_SECTION_SIZE: usize = 4 * 4;
 
 /// Size of the v1 base header in bytes (12 × u32).
 pub const FW_HDR_V1_BASE_SIZE: usize = 12 * 4;
@@ -111,10 +89,9 @@ pub const FWSECTION_W0_DL_ADDR_MASK: u32 = 0x1FFF_FFFF;
 /// `FWSECTION_HDR_W1_SECTIONTYPE` — bits[27:24]. `fw.h:577`.
 pub const FWSECTION_W1_TYPE_SHIFT: u32 = 24;
 pub const FWSECTION_W1_TYPE_MASK: u32 = 0xF << FWSECTION_W1_TYPE_SHIFT;
-/// v1 widens SECTIONTYPE to bits[31:24] — needed for FW_TYPE_BBMCU0
-/// (64) and friends that don't fit in the v0 4-bit field.
+/// v1 section types remain four bits; BBMCU is an outer MFW image type.
 pub const FWSECTION_V1_W1_TYPE_SHIFT: u32 = 24;
-pub const FWSECTION_V1_W1_TYPE_MASK: u32 = 0xFF << FWSECTION_V1_W1_TYPE_SHIFT;
+pub const FWSECTION_V1_W1_TYPE_MASK: u32 = 0xF << FWSECTION_V1_W1_TYPE_SHIFT;
 /// `FWSECTION_HDR_W1_SEC_SIZE` — bits[23:0]. `fw.h:578`.
 pub const FWSECTION_W1_SEC_SIZE_MASK: u32 = 0x00FF_FFFF;
 /// `FWSECTION_HDR_W1_CHECKSUM` — `BIT(28)`. `fw.h:579`.
@@ -127,8 +104,8 @@ pub const FWSECTION_W1_REDL: u32 = 1 << 29;
 /// Decoded section descriptor.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FwSection {
-    /// Section type (`enum rtw89_fw_type` value). For BB-MCU FW the
-    /// value is `RTW89_FW_BBMCU0` (64).
+    /// Inner four-bit section type. BBMCU0(64) is an outer MFW image
+    /// type and cannot appear in this field.
     pub kind: u8,
     /// Download-target address inside the WCPU IMEM/DMEM.
     pub dladdr: u32,
@@ -163,209 +140,300 @@ pub struct FwHeader {
     pub part_size: usize,
     /// True if a dynamic header follows the base.
     pub dynamic_hdr: bool,
+    /// Bounded hardware-signature pools, excluded from section DMA payloads.
+    pub signature_pools: [Option<SignaturePool>; FWDL_SECTION_MAX_NUM],
 }
 
-// ── v0 parser ───────────────────────────────────────────────────────
+/// Firmware-provided signature storage; selecting a signature still requires
+/// the real secure-boot fuse policy. Parsing a pool grants no device authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignaturePool {
+    pub offset: usize,
+    pub len: usize,
+    pub signatures_offset: usize,
+    pub signature_len: usize,
+    pub signature_count: usize,
+    pub bitmap: bool,
+}
 
-fn read_u32(bytes: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(off..off + 4)?.try_into().ok()?,
+// ── Checked AX firmware layouts ─────────────────────────────────────
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, FwError> {
+    let value = bytes
+        .get(offset..offset.checked_add(4).ok_or(FwError::BadFormat)?)
+        .ok_or(FwError::BadFormat)?;
+    Ok(u32::from_le_bytes(
+        value.try_into().map_err(|_| FwError::BadFormat)?,
     ))
 }
 
-/// Parse a v0 firmware blob header. Sections are written into
-/// `sections` (caller-allocated, must hold at least `section_num`
-/// entries). Returns the parsed header.
-///
-/// Mirrors `rtw89_fw_hdr_parser_v0` (`fw.c:140`).
-pub fn parse_v0(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwError> {
-    if blob.len() < FW_HDR_V0_BASE_SIZE {
-        return Err(FwError::BadFormat);
-    }
-    let w1 = read_u32(blob, 4).ok_or(FwError::BadFormat)?;
-    let w3 = read_u32(blob, 12).ok_or(FwError::BadFormat)?;
-    let w6 = read_u32(blob, 24).ok_or(FwError::BadFormat)?;
-    let w7 = read_u32(blob, 28).ok_or(FwError::BadFormat)?;
-    let major = (w1 & FW_HDR_W1_MAJOR_MASK) as u8;
-    let minor = ((w1 & FW_HDR_W1_MINOR_MASK) >> FW_HDR_W1_MINOR_SHIFT) as u8;
-    let section_num = ((w6 & FW_HDR_W6_SEC_NUM_MASK) >> FW_HDR_W6_SEC_NUM_SHIFT) as u8;
-    let dynamic = w7 & FW_HDR_W7_DYN_HDR != 0;
-
-    if section_num as usize > FWDL_SECTION_MAX_NUM {
-        return Err(FwError::BadFormat);
-    }
-    if (section_num as usize) > sections.len() {
-        return Err(FwError::BadFormat);
-    }
-
-    let base_hdr_len = FW_HDR_V0_BASE_SIZE + section_num as usize * FW_HDR_V0_SECTION_SIZE;
-    let hdr_len = if dynamic {
-        ((w3 & FW_HDR_W3_LEN_MASK) >> FW_HDR_W3_LEN_SHIFT) as usize
-    } else {
-        base_hdr_len
-    };
-
-    if blob.len() < hdr_len {
-        return Err(FwError::BadFormat);
-    }
-
-    // Walk per-section descriptors.
-    let mut payload_off = hdr_len;
-    for (i, section) in sections.iter_mut().enumerate().take(section_num as usize) {
-        let sec_off = FW_HDR_V0_BASE_SIZE + i * FW_HDR_V0_SECTION_SIZE;
-        let sw0 = read_u32(blob, sec_off).ok_or(FwError::BadFormat)?;
-        let sw1 = read_u32(blob, sec_off + 4).ok_or(FwError::BadFormat)?;
-        let kind = ((sw1 & FWSECTION_W1_TYPE_MASK) >> FWSECTION_W1_TYPE_SHIFT) as u8;
-        let chksum = sw1 & FWSECTION_W1_CHECKSUM != 0;
-        let redl = sw1 & FWSECTION_W1_REDL != 0;
-        let raw_len = sw1 & FWSECTION_W1_SEC_SIZE_MASK;
-        let final_len = if chksum {
-            raw_len + FWDL_SECTION_CHKSUM_LEN as u32
-        } else {
-            raw_len
-        };
-        let dladdr = sw0 & FWSECTION_W0_DL_ADDR_MASK;
-
-        *section = FwSection {
-            kind,
-            dladdr,
-            len: final_len,
-            chksum,
-            redl,
-            payload_off,
-        };
-        payload_off = payload_off.saturating_add(final_len as usize);
-    }
-
-    Ok(FwHeader {
-        version: 0,
-        fw_major: major,
-        fw_minor: minor,
-        section_num,
-        hdr_len,
-        part_size: FWDL_SECTION_PER_PKT_LEN,
-        dynamic_hdr: dynamic,
-    })
-}
-
-// ── v1 parser ───────────────────────────────────────────────────────
-
-/// Parse a v1 firmware blob header (8852C / BE-family blobs).
-/// Mirrors `rtw89_fw_hdr_parser_v1` (`fw.c:440`).
-pub fn parse_v1(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwError> {
-    if blob.len() < FW_HDR_V1_BASE_SIZE {
-        return Err(FwError::BadFormat);
-    }
-    let w1 = read_u32(blob, 4).ok_or(FwError::BadFormat)?;
-    let w5 = read_u32(blob, 20).ok_or(FwError::BadFormat)?;
-    let w6 = read_u32(blob, 24).ok_or(FwError::BadFormat)?;
-    let w7 = read_u32(blob, 28).ok_or(FwError::BadFormat)?;
-    let major = (w1 & FW_HDR_W1_MAJOR_MASK) as u8;
-    let minor = ((w1 & FW_HDR_W1_MINOR_MASK) >> FW_HDR_W1_MINOR_SHIFT) as u8;
-    let section_num = ((w6 & FW_HDR_V1_W6_SEC_NUM_MASK) >> FW_HDR_V1_W6_SEC_NUM_SHIFT) as u8;
-    let dynamic = w7 & FW_HDR_V1_W7_DYN_HDR != 0;
-    let part_size = (w7 & FW_HDR_V1_W7_PART_SIZE_MASK) as usize;
-    let hdr_size_field =
-        ((w5 & FW_HDR_V1_W5_HDR_SIZE_MASK) >> FW_HDR_V1_W5_HDR_SIZE_SHIFT) as usize;
-
-    if section_num as usize > FWDL_SECTION_MAX_NUM {
-        return Err(FwError::BadFormat);
-    }
-    if (section_num as usize) > sections.len() {
-        return Err(FwError::BadFormat);
-    }
-
-    let base_hdr_len = FW_HDR_V1_BASE_SIZE + section_num as usize * FW_HDR_V1_SECTION_SIZE;
-    let hdr_len = if hdr_size_field != 0 {
-        hdr_size_field
-    } else {
-        base_hdr_len
-    };
-
-    if blob.len() < hdr_len {
-        return Err(FwError::BadFormat);
-    }
-
-    let mut payload_off = hdr_len;
-    for (i, section) in sections.iter_mut().enumerate().take(section_num as usize) {
-        let sec_off = FW_HDR_V1_BASE_SIZE + i * FW_HDR_V1_SECTION_SIZE;
-        let sw0 = read_u32(blob, sec_off).ok_or(FwError::BadFormat)?;
-        let sw1 = read_u32(blob, sec_off + 4).ok_or(FwError::BadFormat)?;
-        // v1 widens type to bits[31:24] (FW_TYPE_BBMCU0=64 wouldn't
-        // fit otherwise); v0's 4-bit mask is wrong here.
-        let kind = ((sw1 & FWSECTION_V1_W1_TYPE_MASK) >> FWSECTION_V1_W1_TYPE_SHIFT) as u8;
-        let chksum = sw1 & FWSECTION_W1_CHECKSUM != 0;
-        let redl = sw1 & FWSECTION_W1_REDL != 0;
-        let raw_len = sw1 & FWSECTION_W1_SEC_SIZE_MASK;
-        let final_len = if chksum {
-            raw_len + FWDL_SECTION_CHKSUM_LEN as u32
-        } else {
-            raw_len
-        };
-        // v1 DL_ADDR is full 32 bits (no 0x1FFFFFFF mask in fw.c:496-ish).
-        *section = FwSection {
-            kind,
-            dladdr: sw0,
-            len: final_len,
-            chksum,
-            redl,
-            payload_off,
-        };
-        payload_off = payload_off.saturating_add(final_len as usize);
-    }
-
-    Ok(FwHeader {
-        version: 1,
-        fw_major: major,
-        fw_minor: minor,
-        section_num,
-        hdr_len,
-        part_size: if part_size != 0 {
-            part_size
-        } else {
-            FWDL_SECTION_PER_PKT_LEN
-        },
-        dynamic_hdr: dynamic,
-    })
-}
-
-// ── Auto-detect parser ──────────────────────────────────────────────
-
-/// Header-version detection. v1 blobs set `W3[31:24] = 1`
-/// (`FW_HDR_W3_HDR_VER`) — Linux's `__rtw89_fw_recognize` (~`fw.c:730`)
-/// branches on this.
+/// Header-version detection; unknown layouts are never interpreted as v1.
 pub fn detect_version(blob: &[u8]) -> Result<u8, FwError> {
     if blob.len() < FW_HDR_V0_BASE_SIZE {
         return Err(FwError::BadFormat);
     }
-    let w3 = read_u32(blob, 12).ok_or(FwError::BadFormat)?;
-    let version = ((w3 >> 24) & 0xFF) as u8;
-    Ok(version)
+    Ok((read_u32(blob, 12)? >> 24) as u8)
 }
 
-/// Generic parser — chooses v0 or v1 based on header byte.
-pub fn parse_auto(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwError> {
-    let ver = detect_version(blob)?;
-    if ver >= 1 {
-        parse_v1(blob, sections)
-    } else {
-        parse_v0(blob, sections)
+/// Parse AX layout v0. The caller output remains untouched on any failure.
+pub fn parse_v0(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwError> {
+    parse_layout(blob, sections, 0)
+}
+/// Parse AX layout v1; AX always uses 2020-byte download chunks, including
+/// RTL8852C. Header-version is independent of chip generation/firmware suit.
+pub fn parse_v1(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwError> {
+    parse_layout(blob, sections, 1)
+}
+
+fn parse_layout(blob: &[u8], sections: &mut [FwSection], version: u8) -> Result<FwHeader, FwError> {
+    if detect_version(blob)? != version {
+        return Err(FwError::UnsupportedFormat);
     }
+    let base_size = if version == 0 { 32usize } else { 48 };
+    if blob.len() < base_size {
+        return Err(FwError::BadFormat);
+    }
+    let w1 = read_u32(blob, 4)?;
+    let w6 = read_u32(blob, 24)?;
+    let w7 = read_u32(blob, 28)?;
+    let count = ((w6 >> 8) & 255) as usize;
+    if count == 0 || count > FWDL_SECTION_MAX_NUM || count > sections.len() {
+        return Err(FwError::BadFormat);
+    }
+    let fixed = base_size + 16 * count;
+    let dynamic = w7 & (1 << 16) != 0;
+    let length = if !dynamic {
+        fixed
+    } else if version == 0 {
+        ((read_u32(blob, 12)? >> 16) & 255) as usize
+    } else {
+        (read_u32(blob, 20)? >> 16) as usize
+    };
+    if length < fixed || length > blob.len() {
+        return Err(FwError::BadFormat);
+    }
+    if dynamic {
+        let extra = length - fixed;
+        if extra < 8 || read_u32(blob, fixed)? as usize != extra {
+            return Err(FwError::BadFormat);
+        }
+    }
+    let empty = FwSection {
+        kind: 0,
+        dladdr: 0,
+        len: 0,
+        chksum: false,
+        redl: false,
+        payload_off: 0,
+    };
+    let mut checked = [empty; FWDL_SECTION_MAX_NUM];
+    let mut position = length;
+    let mut signature_pools = [None; FWDL_SECTION_MAX_NUM];
+    for (index, section) in checked.iter_mut().take(count).enumerate() {
+        let offset = base_size + 16 * index;
+        let address = read_u32(blob, offset)?;
+        let flags = read_u32(blob, offset + 4)?;
+        let kind = ((flags >> 24) & 15) as u8;
+        let checksum = flags & (1 << 28) != 0;
+        let raw_len = flags & 0x00ff_ffff;
+        let len = raw_len
+            .checked_add(if checksum { 8 } else { 0 })
+            .ok_or(FwError::BadFormat)?;
+        let end = position
+            .checked_add(len as usize)
+            .ok_or(FwError::BadFormat)?;
+        if end > blob.len() {
+            return Err(FwError::BadFormat);
+        }
+        let dladdr = if version == 0 {
+            address & 0x1fff_ffff
+        } else {
+            address
+        };
+        dladdr
+            .checked_add(len.saturating_sub(1))
+            .ok_or(FwError::BadFormat)?;
+        *section = FwSection {
+            kind,
+            dladdr,
+            len,
+            chksum: checksum,
+            redl: flags & (1 << 29) != 0,
+            payload_off: position,
+        };
+        let pool = if kind == 9 {
+            signature_pool(
+                blob,
+                version,
+                read_u32(blob, offset + 8)?,
+                position,
+                len as usize,
+                version == 1 && w6 & (1 << 24) != 0,
+            )?
+        } else {
+            None
+        };
+        position = end
+            .checked_add(pool.map_or(0, |pool| pool.len))
+            .ok_or(FwError::BadFormat)?;
+        if position > blob.len() {
+            return Err(FwError::BadFormat);
+        }
+        signature_pools[index] = pool;
+    }
+    if position != blob.len() {
+        return Err(FwError::BadFormat);
+    }
+    sections[..count].copy_from_slice(&checked[..count]);
+    Ok(FwHeader {
+        version,
+        fw_major: w1 as u8,
+        fw_minor: (w1 >> 8) as u8,
+        section_num: count as u8,
+        hdr_len: length,
+        part_size: FWDL_SECTION_PER_PKT_LEN,
+        dynamic_hdr: dynamic,
+        signature_pools,
+    })
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<usize, FwError> {
+    let value = bytes
+        .get(offset..offset.checked_add(2).ok_or(FwError::BadFormat)?)
+        .ok_or(FwError::BadFormat)?;
+    Ok(usize::from(u16::from_le_bytes(
+        value.try_into().map_err(|_| FwError::BadFormat)?,
+    )))
+}
+fn signature_pool(
+    blob: &[u8],
+    version: u8,
+    mssc: u32,
+    content: usize,
+    content_len: usize,
+    dsp_checksum: bool,
+) -> Result<Option<SignaturePool>, FwError> {
+    let count = if version == 0 {
+        mssc as usize
+    } else {
+        (mssc & 255) as usize
+    };
+    if count == 0 {
+        return Ok(None);
+    }
+    let offset = content.checked_add(content_len).ok_or(FwError::BadFormat)?;
+    let suffix = blob.get(offset..).ok_or(FwError::BadFormat)?;
+    let (signatures, count, signature_len, bitmap) = if count & 255 == 255 {
+        let header = suffix.get(..32).ok_or(FwError::BadFormat)?;
+        if &header[..8] != b"MSSKPOOL" || header[20] != 0 {
+            return Err(FwError::UnsupportedFormat);
+        }
+        let entries = usize::from(header[21])
+            .checked_mul(read_u16(header, 24)?)
+            .and_then(|n| n.checked_mul(read_u16(header, 26).ok()?))
+            .ok_or(FwError::BadFormat)?;
+        // Linux's bitmask table has a whole number of bytes.
+        if entries & 7 != 0 {
+            return Err(FwError::BadFormat);
+        }
+        let bitmap_len = (entries / 8)
+            .checked_add(if header[16] != 0 { 8 } else { 0 })
+            .ok_or(FwError::BadFormat)?;
+        let signatures = 32usize.checked_add(bitmap_len).ok_or(FwError::BadFormat)?;
+        if read_u32(header, 8)? != 32 || read_u32(header, 12)? as usize != signatures {
+            return Err(FwError::BadFormat);
+        }
+        let body = blob
+            .get(content..content.checked_add(content_len).ok_or(FwError::BadFormat)?)
+            .ok_or(FwError::BadFormat)?;
+        let length = match read_u16(body, 60)? >> 2 {
+            0 => 512,
+            other => other,
+        };
+        (signatures, read_u16(header, 22)?, length, true)
+    } else {
+        (0, count, 512, false)
+    };
+    let signature_len = signature_len
+        .checked_add(if dsp_checksum { 8 } else { 0 })
+        .ok_or(FwError::BadFormat)?;
+    let len = signature_len
+        .checked_mul(count)
+        .and_then(|n| n.checked_add(signatures))
+        .ok_or(FwError::BadFormat)?;
+    if len > suffix.len() {
+        return Err(FwError::BadFormat);
+    }
+    Ok(Some(SignaturePool {
+        offset,
+        len,
+        signatures_offset: offset + signatures,
+        signature_len,
+        signature_count: count,
+        bitmap,
+    }))
+}
+
+/// Parse either supported AX header layout, rejecting future versions.
+pub fn parse_auto(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwError> {
+    match detect_version(blob)? {
+        0 => parse_v0(blob, sections),
+        1 => parse_v1(blob, sections),
+        _ => Err(FwError::UnsupportedFormat),
+    }
+}
+
+/// Select a normal/CE/WoW/BB-MCU image from a Realtek multi-firmware file.
+/// Selection follows Linux's nearest non-manufacturing CV <= physical cut.
+/// Every entry is bounded before selecting one; payloads cannot overlap TOC.
+pub fn select_image(blob: &[u8], cut: u8, image_type: u8) -> Result<&[u8], FwError> {
+    if blob.first() != Some(&255) {
+        return if image_type == FW_TYPE_NORMAL {
+            Ok(blob)
+        } else {
+            Err(FwError::ImageMissing)
+        };
+    }
+    let count = usize::from(*blob.get(1).ok_or(FwError::BadFormat)?);
+    let table_end = 16 + count * 16;
+    if count == 0 || table_end > blob.len() {
+        return Err(FwError::BadFormat);
+    }
+    let mut selected: Option<(u8, usize, usize)> = None;
+    for index in 0..count {
+        let offset = 16 + index * 16;
+        let entry = &blob[offset..offset + 16];
+        let start = read_u32(entry, 4)? as usize;
+        let size = read_u32(entry, 8)? as usize;
+        let end = start.checked_add(size).ok_or(FwError::BadFormat)?;
+        if start < table_end || size == 0 || end > blob.len() {
+            return Err(FwError::BadFormat);
+        }
+        if entry[1] != image_type || entry[2] != 0 || entry[0] > cut {
+            continue;
+        }
+        match selected {
+            Some((cv, _, _)) if cv == entry[0] => return Err(FwError::BadFormat),
+            Some((cv, _, _)) if cv > entry[0] => {}
+            _ => selected = Some((entry[0], start, end)),
+        }
+    }
+    let (_, start, end) = selected.ok_or(FwError::ImageMissing)?;
+    Ok(&blob[start..end])
 }
 
 // ── Packet segmentation ─────────────────────────────────────────────
 
-/// One slice of a section ready to be wrapped in a FWHDR_DL H2C and
-/// pushed via CH12. Linux's `__rtw89_fw_download_section` (`fw.c:284`)
-/// segments by `info->part_size` (2020 on AX, header-specified on v1).
+/// One raw section slice for CH12. Only the firmware header is an FWHDR_DL
+/// H2C command; section chunks carry no additional H2C header or last-packet
+/// flag. Linux segments all AX chips by2020, independent of header version.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FwdlPacket {
     /// Offset inside the section's payload.
     pub section_off: usize,
     /// Bytes carried by this packet.
     pub len: usize,
-    /// `true` for the final packet of the section. Linux sets the
-    /// `FWDL_LAST_PKT` flag in the H2C payload header here.
+    /// `true` for the final slice; host bookkeeping only, never a wire flag.
     pub is_last: bool,
 }
 

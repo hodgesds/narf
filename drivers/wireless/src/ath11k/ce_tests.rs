@@ -110,6 +110,8 @@ struct DevCe {
 }
 
 pub(super) struct FakeChip {
+    ce_source: u32,
+    ce_destination: u32,
     regs: RefCell<BTreeMap<u32, u32>>,
     ops: RefCell<Vec<Op>>,
     /// Shadow register n mirrors into `shadow[n]` (the QMI list).
@@ -120,7 +122,21 @@ pub(super) struct FakeChip {
 
 impl FakeChip {
     pub(super) fn new(shadow: &[u32]) -> Self {
+        Self::for_revision(HwRev::Wcn6855Hw21, shadow)
+    }
+    /// Independently literal Linux CE windows, not copied from the HAL under
+    /// test. QCA6390 and WCN6855 share stride/layout but not the CE aperture.
+    pub(super) fn for_revision(revision: HwRev, shadow: &[u32]) -> Self {
+        let (ce_source, ce_destination) = match revision {
+            HwRev::Qca6390Hw20 => (0x00a0_0000, 0x00a0_1000),
+            HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
+                (0x01b8_0000, 0x01b8_1000)
+            }
+            _ => panic!("unmodeled CE profile"),
+        };
         let chip = FakeChip {
+            ce_source,
+            ce_destination,
             regs: RefCell::new(BTreeMap::new()),
             ops: RefCell::new(Vec::new()),
             shadow: shadow.to_vec(),
@@ -132,7 +148,7 @@ impl FakeChip {
         for ce in 0..CE_COUNT_MAX as u32 {
             chip.regs
                 .borrow_mut()
-                .insert(CE_DST0 + ce * STRIDE + 0xb0, 0xabcd_0000);
+                .insert(chip.ce_destination + ce * STRIDE + 0xb0, 0xabcd_0000);
         }
         chip
     }
@@ -170,7 +186,7 @@ impl FakeChip {
     /// `(meta, payload)` per descriptor; TP written back through the
     /// programmed TP address.
     pub(super) fn target_consume(&self, ce: u32) -> Vec<(u32, Vec<u8>)> {
-        let r0 = CE_SRC0 + ce * STRIDE;
+        let r0 = self.ce_source + ce * STRIDE;
         let (base, size) = self.ring(r0);
         let hp = self.reg(r0 + 0x400);
         let tp_addr = self.addr(r0 + 0x1c);
@@ -199,13 +215,13 @@ impl FakeChip {
     /// and reports `len` (default `data.len()`) in a status descriptor.
     /// `false` when no buffer is posted or the status ring is full.
     pub(super) fn target_deliver(&self, ce: u32, data: &[u8], len: Option<u32>) -> bool {
-        let d0 = CE_DST0 + ce * STRIDE;
+        let d0 = self.ce_destination + ce * STRIDE;
         let (dbase, dsize) = self.ring(d0);
         let host_hp = self.reg(d0 + 0x400);
         let max = self.reg(d0 + 0xb0) & 0xffff;
-        let s0 = CE_DST0 + 0x58 + ce * STRIDE;
+        let s0 = self.ce_destination + 0x58 + ce * STRIDE;
         let (sbase, ssize) = self.ring(s0);
-        let host_tp = self.reg(CE_DST0 + 0x40c + ce * STRIDE);
+        let host_tp = self.reg(self.ce_destination + 0x40c + ce * STRIDE);
         let mut dev = self.dev.borrow_mut();
         let d = &mut dev[ce as usize];
         if dsize == 0 || ssize == 0 || d.dst_tp == host_hp || data.len() as u32 > max {

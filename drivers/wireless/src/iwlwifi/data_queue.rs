@@ -16,6 +16,7 @@ pub const DEPTH: usize = 128;
 
 #[derive(Debug)]
 pub struct DataQueue {
+    pre_ax210: bool,
     descriptors: DmaBuffer,
     byte_counts: DmaBuffer,
     pending: Vec<Option<DmaBuffer>>,
@@ -28,7 +29,13 @@ pub struct DataQueue {
 
 impl DataQueue {
     pub fn new() -> Result<Self, &'static str> {
+        Self::for_format(super::rx_rfh::CompletionFormat::Ax210)
+    }
+    pub(super) fn for_format(
+        format: super::rx_rfh::CompletionFormat,
+    ) -> Result<Self, &'static str> {
         Ok(Self {
+            pre_ax210: format == super::rx_rfh::CompletionFormat::Qu,
             descriptors: dma_alloc(DEPTH * 256)?,
             byte_counts: dma_alloc(2048)?,
             pending: (0..DEPTH).map(|_| None).collect(),
@@ -130,6 +137,9 @@ impl DataQueue {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<u16, &'static str> {
+        if !mmio.authorized() {
+            return Err("Wi-Fi authority revoked");
+        }
         let id = self.id.ok_or("TX queue not activated")?;
         if frame.len() < header_len
             || frame.len() > 4095
@@ -148,29 +158,33 @@ impl DataQueue {
         let padding = header_len.next_multiple_of(4) - header_len;
         // Short command header, 28-byte TX command, MAC header (padded
         // to a dword), followed by the payload. len excludes the padding.
-        let mut bytes = vec![0; 32 + frame.len() + padding];
+        let command_bytes = if self.pre_ax210 { 20 } else { 28 };
+        let mac_offset = 4 + command_bytes;
+        let mut bytes = vec![0; mac_offset + frame.len() + padding];
         bytes[0] = 0x1c;
         put16(&mut bytes, 2, ((id & 0x1f) << 8) | slot as u16);
         put16(&mut bytes, 4, frame.len() as u16);
         // Protected frames use the station's firmware CCMP key. The
         // firmware inserts IV/MIC and advances its TX packet number.
         let flags = u16::from(rate.is_some()) | if frame[1] & 0x40 != 0 { 0 } else { 2 };
-        put16(&mut bytes, 6, flags);
-        put32(
-            &mut bytes,
-            8,
-            ((header_len / 2) as u32) << 8 | if padding != 0 { 1 << 13 } else { 0 },
-        );
+        let offload = ((header_len / 2) as u32) << 8 | if padding != 0 { 1 << 13 } else { 0 };
+        if self.pre_ax210 {
+            put16(&mut bytes, 6, offload as u16);
+            put32(&mut bytes, 8, u32::from(flags));
+        } else {
+            put16(&mut bytes, 6, flags);
+            put32(&mut bytes, 8, offload);
+        }
         put32(&mut bytes, 20, rate.unwrap_or(0));
-        bytes[32..32 + header_len].copy_from_slice(&frame[..header_len]);
-        bytes[32 + header_len + padding..].copy_from_slice(&frame[header_len..]);
+        bytes[mac_offset..mac_offset + header_len].copy_from_slice(&frame[..header_len]);
+        bytes[mac_offset + header_len + padding..].copy_from_slice(&frame[header_len..]);
         let dma = dma_alloc(bytes.len())?;
         write_dma(&dma, 0, &bytes);
         let mut descriptor = tx_gen2::TfhTfd::default();
         descriptor
             .push_tb(dma.dma_addr().raw(), 20)
             .map_err(|_| "invalid data TB0")?;
-        let payload_offset = 32 + header_len + padding;
+        let payload_offset = mac_offset + header_len + padding;
         descriptor
             .push_tb(dma.dma_addr().raw() + 20, (payload_offset - 20) as u16)
             .map_err(|_| "invalid data TB1")?;
@@ -182,8 +196,12 @@ impl DataQueue {
                 )
                 .map_err(|_| "invalid data TB2")?;
         }
-        let count = tx_gen2::bc_entry_ax210(frame.len() as u16, descriptor.filled_bytes())
-            .map_err(|_| "invalid TX byte count")?;
+        let count = if self.pre_ax210 {
+            tx_gen2::bc_entry_pre_ax210(frame.len() as u16, descriptor.filled_bytes())
+        } else {
+            tx_gen2::bc_entry_ax210(frame.len() as u16, descriptor.filled_bytes())
+        }
+        .map_err(|_| "invalid TX byte count")?;
         // SAFETY: fully initialized packed wire structure has no holes.
         let wire = unsafe {
             core::slice::from_raw_parts((&descriptor as *const tx_gen2::TfhTfd).cast::<u8>(), 256)
@@ -232,6 +250,33 @@ mod tests {
         }
         fn write(&mut self, _: u32, _: u32) {}
     }
+    fn smoke_gen2_native_tx_command_and_dword_byte_count() -> TestResult {
+        let mut q = DataQueue::for_format(super::super::rx_rfh::CompletionFormat::Qu).unwrap();
+        q.activate(&[17, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let mut frame = [0; 26];
+        frame[0] = 8;
+        frame[1] = 1;
+        frame[24..].copy_from_slice(&[9, 10]);
+        q.send(&mut Mmio, &frame, 24, Some(0x4100)).unwrap();
+        let bytes = q.pending[0].as_ref().unwrap().as_slice();
+        if bytes[4..24]
+            != [
+                26, 0, 0, 12, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65, 0, 0,
+            ]
+            || bytes[24..50] != frame
+            || q.byte_counts.as_slice()[..2] != [7, 0]
+        {
+            return TestResult::Fail(
+                "Gen2 owner used AX210 command extent/fields or byte-count units",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/gen2",
+        smoke_gen2_native_tx_command_and_dword_byte_count
+    );
+
     fn smoke_tx_adaptive_rate_and_qos_padding() -> TestResult {
         let mut q = DataQueue::new().unwrap();
         q.activate(&[17, 0, 0, 0, 0, 0, 0, 0]).unwrap();

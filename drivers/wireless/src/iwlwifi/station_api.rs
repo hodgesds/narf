@@ -132,6 +132,51 @@ pub fn scan_config(nvm: &Nvm) -> [u8; 12] {
     put32(&mut out, 8, nvm.rx_chains);
     out
 }
+
+/// Required post-INIT_COMPLETE defaults for the continuously awake station
+/// profile. Linux: mld/coex.c, fw/init.c, mld/power.c and cfg/{ax210,bz,sc}.c.
+/// Choose by the PCI configuration, since BE200 uses the discrete GL
+/// configuration while Sc uses the integrated configuration despite both
+/// having Bz-format RFH completions.
+#[derive(Debug)]
+pub struct RuntimeConfiguration {
+    pub coexistence: [u8; 8],
+    pub soc: [u8; 8],
+    pub power: [u8; 4],
+}
+
+pub fn runtime_configuration(
+    device: u16,
+    coexistence_version: u8,
+    soc_version: u8,
+    power_version: u8,
+) -> Result<RuntimeConfiguration, &'static str> {
+    if coexistence_version != 6 || soc_version != 2 || power_version != 7 {
+        return Err("unsupported firmware runtime configuration API");
+    }
+    // DISCRETE=bit 0, LOW_LATENCY=bit 1, LTR delay=bits 2..3.
+    let (flags, latency) = match device {
+        0x2725 => (1, 500),                       // Ty, discrete AX210.
+        0x51f0 | 0x54f0 => (2 | (2 << 2), 12000), // So, long-latency CNVi.
+        0x7e40 => (0, 0),                         // Ma uses the firmware's default latency.
+        0x272b => (1 | 2, 12000),                 // GL/BE200, discrete; no CNVi LTR delay.
+        0x6e70 | 0x9327 | 0xd240 | 0xd340 | 0xe340 | 0xe440 => (2 | (2 << 2), 12000),
+        _ => return Err("unsupported firmware runtime PCI configuration"),
+    };
+    let mut out = RuntimeConfiguration {
+        coexistence: [0; 8],
+        soc: [0; 8],
+        power: [0; 4],
+    };
+    put32(&mut out.coexistence, 0, 1); // BT_COEX_NW.
+    put32(&mut out.coexistence, 4, 1 | (1 << 4)); // MPLUT + HIGH_BAND_RET.
+    put32(&mut out.soc, 0, flags);
+    put32(&mut out.soc, 4, latency);
+    // Linux IWL_POWER_SCHEME_CAM: power saving disabled. Runtime PM and
+    // suspend are not implemented by this profile; never let firmware sleep.
+    Ok(out)
+}
+
 /// REDUCE_TX_POWER_CMD v10/v11, link 0. Firmware takes eighth-dBm
 /// units and applies this ceiling in addition to its regulatory limits.
 pub fn tx_power(version: u8, dbm: i8) -> Result<alloc::vec::Vec<u8>, &'static str> {

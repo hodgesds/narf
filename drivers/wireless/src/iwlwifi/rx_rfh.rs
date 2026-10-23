@@ -110,6 +110,8 @@ pub struct RxCompletionDescBz {
 /// Which completion-descriptor layout a device family uses.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CompletionFormat {
+    /// Pre-AX210 RFH: 8-byte tagged free pages, 4-byte low12-bit completion.
+    Qu,
     /// 32-byte `iwl_rx_completion_desc`, AX210.
     Ax210,
     /// 4-byte `iwl_rx_completion_desc_bz`, Bz and later.
@@ -137,8 +139,16 @@ impl CompletionFormat {
     /// desynchronises every entry after the first.
     pub const fn size(self) -> usize {
         match self {
+            CompletionFormat::Qu => 4,
             CompletionFormat::Ax210 => core::mem::size_of::<RxCompletionDesc>(),
             CompletionFormat::Bz => core::mem::size_of::<RxCompletionDescBz>(),
+        }
+    }
+
+    pub const fn free_size(self) -> usize {
+        match self {
+            Self::Qu => 8,
+            Self::Ax210 | Self::Bz => 16,
         }
     }
 
@@ -151,6 +161,7 @@ impl CompletionFormat {
             return None;
         }
         let (rbid, flags) = match self {
+            CompletionFormat::Qu => (u16::from_le_bytes([bytes[0], bytes[1]]) & 0x0fff, 0),
             CompletionFormat::Ax210 => (u16::from_le_bytes([bytes[4], bytes[5]]), bytes[6]),
             CompletionFormat::Bz => (u16::from_le_bytes([bytes[0], bytes[1]]), bytes[2]),
         };
@@ -164,7 +175,7 @@ impl CompletionFormat {
     pub const fn doorbell(self, queue: u16, write_ptr: u16) -> (u32, u32) {
         let write_actual = (write_ptr & !7) as u32;
         match self {
-            Self::Ax210 => (rfh_frbdcb_widx_trg(queue as u32), write_actual),
+            Self::Qu | Self::Ax210 => (rfh_frbdcb_widx_trg(queue as u32), write_actual),
             Self::Bz => (
                 super::tx_gen2::HBUS_TARG_WRPTR,
                 super::tx_gen2::rx_doorbell(queue as u32, write_actual),
@@ -219,6 +230,9 @@ impl<const N: usize> CompletionTracker<N> {
     /// Create an empty pool. Hardware tags are nonzero 16-bit values.
     pub const fn new(format: CompletionFormat) -> Self {
         assert!(N > 0 && N <= u16::MAX as usize);
+        if let CompletionFormat::Qu = format {
+            assert!(N <= 0x0fff);
+        }
         Self {
             format,
             posted: [false; N],
@@ -399,7 +413,7 @@ mod tests {
         let mut bytes = [0; 32];
         let offset = match format {
             CompletionFormat::Ax210 => 4,
-            CompletionFormat::Bz => 0,
+            CompletionFormat::Qu | CompletionFormat::Bz => 0,
         };
         bytes[offset..offset + 2].copy_from_slice(&tag.to_le_bytes());
         bytes[offset + 2] = flags;

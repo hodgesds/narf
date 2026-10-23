@@ -36,6 +36,7 @@ pub mod tpm;
 // authoritative reference linked in-module. See `crypto/specification/
 // spec.md` §9.2.1 for the licensing posture and reference table.
 pub mod aead;
+pub mod aes_ccm;
 pub mod aes_ctr;
 pub mod aes_kw;
 pub mod aes_siv;
@@ -46,6 +47,8 @@ pub mod cmac_aes128;
 pub mod cmac_aes256;
 pub mod curve25519;
 pub mod ed25519;
+mod entropy;
+pub use entropy::{try_fill_random_bytes, try_per_task_rng};
 pub mod hdcp;
 pub mod hkdf;
 pub mod michael_mic;
@@ -189,6 +192,8 @@ pub enum CryptoError {
     /// dependency stubbed out). Should never fire in a well-configured
     /// build.
     BackendUnavailable,
+    /// No suitable architectural RNG, or bounded entropy retries exhausted.
+    EntropyUnavailable,
 }
 
 impl From<CapError> for CryptoError {
@@ -486,23 +491,18 @@ pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
 
 // ── Per-task RNG ─────────────────────────────────────────────────────
 //
-// Stage-3 placeholder: we seed a `ChaCha20Rng` from the monotonic cycle
-// counter. **This is not cryptographically secure** — `narf_time::now_cycles`
-// is observable to the adversary and replay-able. Stage 4 must wire the
-// `arch/` HW entropy surface (RDSEED on x86_64, RNDR on aarch64) and
-// the SP 800-90B health-test discipline before any user-facing crypto
-// depends on `per_task_rng`. The fallback exists so the rest of the
-// Stage-3 surface can compile and be exercised end-to-end; callers
-// touching real key material must check `arch::has_hw_entropy()` (not
-// yet exposed) and refuse if false.
+// Legacy Stage-3 compatibility helpers use observable cycle counters. They
+// remain predictable and must not supply protocol secrets or nonces. New
+// protocol callers use try_per_task_rng / try_fill_random_bytes, which require
+// fresh architectural RNG output and propagate failure. The full system pool,
+// per-task lifecycle and SP 800-90B health service remain separate work.
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 
-/// Construct a per-task RNG. Stage 3 seeds from the monotonic cycle
-/// counter; Stage 4 must replace the seed source with the arch HW
-/// entropy path. Marked safe because the underlying ChaCha20 stream is
-/// safe — the *seed quality* is the open issue.
+/// Construct the predictable Stage-3 compatibility stream from cycle counts.
+/// This helper is unsuitable for cryptographic secrets.
+/// Protocol secrets and nonces must use [`try_per_task_rng`] instead.
 pub fn per_task_rng() -> ChaCha20Rng {
     // Mix cycles into a 32-byte seed by stretching across the buffer.
     // Two independent reads + a constant tag keep the seed at least
@@ -518,11 +518,9 @@ pub fn per_task_rng() -> ChaCha20Rng {
     ChaCha20Rng::from_seed(seed)
 }
 
-/// Fill `out` with bytes from `per_task_rng()`. Lets downstream
-/// crates (e.g. `narf-wireless` for SAE nonces) pull entropy
-/// without taking a `rand_core` direct dependency. Same caveats
-/// apply as `per_task_rng`: the seed quality issue is open until
-/// the arch HW entropy path lands.
+/// Fill `out` with the predictable Stage-3 compatibility stream.
+/// This helper is unsuitable for cryptographic secrets.
+/// Protocol secrets and nonces must use [`try_fill_random_bytes`] instead.
 pub fn fill_random_bytes(out: &mut [u8]) {
     per_task_rng().fill_bytes(out);
 }

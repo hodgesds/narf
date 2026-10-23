@@ -20,8 +20,10 @@
 //! Post-firmware initialization reads real NIC/EFUSE identity, applies
 //! package-selected world limits and initializes the MAC/WTBL. Passive
 //! scanning is connected to nl80211; management TX has a private retained
-//! cut-through backend. Association and the WLAN data path remain unfinished. The
-//! older `full_bring_up` boundary intentionally returns `NotImplemented`;
+//! cut-through backend. The retained legacy station profile connects Open/WPA2
+//! association, controlled-port keys and bounded kernel/frame-ring RX/TX service.
+//! Reset/recovery retires old DMA before firmware reload on x86_64/aarch64.
+//! Broader radio modes remain software work. The older `full_bring_up` boundary intentionally returns `NotImplemented`;
 //! firmware-only initialization uses the retained transport owner instead.
 //!
 //! ## Provenance
@@ -34,6 +36,7 @@
 
 pub mod association;
 pub mod bringup;
+pub(crate) mod channel;
 pub mod cmd;
 pub mod dma;
 pub mod firmware_transport;
@@ -43,7 +46,6 @@ pub mod mcu;
 mod packet_tx;
 pub mod pci;
 mod registers;
-#[cfg(target_arch = "x86_64")]
 mod registers_tests;
 pub mod regs;
 pub mod txrx;
@@ -60,7 +62,6 @@ pub use regs::{
 /// (one level up in `drivers/wireless/src/lib.rs`).
 pub fn register() {
     register_pci_driver();
-    #[cfg(target_arch = "x86_64")]
     narf_init::register_with_budget(
         narf_init::Stage::Late,
         "mt76-firmware",

@@ -7,8 +7,8 @@
 //! What this file does *not* do, intentionally:
 //!   - MSI/MSI-X vector setup. The baseline is "chip detected + MAC
 //!     readable"; IRQ delivery lands with the TX/RX ring follow-up.
-//!   - Firmware load. The reserved-page DMA transport and parsed firmware
-//!     sections are not implemented, so the probe does not invoke a loader.
+//!   - Packet runtime. RTL8822CE starts one retained authenticated firmware
+//!     attempt after probe publishes ownership; carrier and packet gates stay down.
 
 #![allow(dead_code)]
 
@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_bus::{map_bar_control, BarError, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BarError, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -37,11 +37,15 @@ use super::regs::*;
 /// derived MAC. Single-instance for the baseline (every laptop ships
 /// at most one of these); multi-radio comes with the follow-up.
 pub struct Rtw88Device {
+    /// Retained bus identity; a repeat probe must not park the active owner.
+    pub(crate) bus_addr: narf_bus::BusAddr,
     pub registers: MmioRegion,
     pub mac: [u8; MAC_ADDR_LEN],
     /// PCI device id we matched on — controls per-chip quirks in
     /// follow-up commits. Today it just feeds `name_for`.
     pub device_id: u16,
+    /// The exact post-power native owner, shared by controller and interface.
+    pub(super) firmware: Option<Arc<super::firmware_native::Firmware>>,
     pub link_up: AtomicBool,
     pub rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -50,6 +54,13 @@ pub struct Rtw88Device {
 /// This device's interface name, `wlan%d` as Linux `dev_alloc_name` picks
 /// it; set when the interface registers.
 static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
+
+impl Rtw88Device {
+    /// Firmware loading is independent of station/radio readiness.
+    pub fn firmware_status(&self) -> Option<super::FirmwareStatus> {
+        self.firmware.as_ref().map(|owner| owner.status())
+    }
+}
 
 impl Interface for Rtw88Device {
     fn name(&self) -> &str {
@@ -81,8 +92,8 @@ impl WirelessNetIface for Rtw88Device {
             bands: alloc::vec![],
             modes: narf_wireless::iface::WirelessModes::STATION,
             hw_caps: narf_wireless::iface::HwCaps {
-                ht_supported: true,
-                vht_supported: true,
+                ht_supported: false,
+                vht_supported: false,
                 he_supported: false,
                 eht_supported: false,
             },
@@ -125,6 +136,8 @@ impl core::fmt::Debug for Rtw88Device {
 /// Errors raised by the baseline probe path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProbeError {
+    /// PCI access failed or bus mastering could not be verifiably parked.
+    PciAccess,
     /// The mandatory BAR2 control window could not be mapped.
     RegisterBarMapFailed,
     /// BAR2 cannot cover the registers used by baseline power and EFUSE.
@@ -138,6 +151,7 @@ pub enum ProbeError {
 /// Single-instance live device. The baseline only supports one bound
 /// RTW88; the follow-up will switch to a `Vec` keyed by domain id.
 static CONTROLLER: IrqSafeSpinLock<Option<Rtw88Device>> = IrqSafeSpinLock::new(None);
+static PROBING: AtomicBool = AtomicBool::new(false);
 
 /// PCI driver match registration. One entry per supported device id —
 /// mirrors the `rtw88/pci.c::rtw_pci_id_table` shape.
@@ -157,26 +171,32 @@ pub fn register_pci_driver() {
 /// Probe entry called by `narf-bus::driver_match` when a Realtek
 /// vendor/device pair we registered for surfaces.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    super::probe_guard::run(&PROBING, || probe_exclusive(device, cap))
+        .unwrap_or(Err(narf_bus::ProbeError::BadDevice))
+}
+
+fn probe_exclusive(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+) -> Result<(), narf_bus::ProbeError> {
     // Skip if a device is already bound. Real laptops only ship one
     // RTW88; a second probe is a re-enumeration race.
-    if CONTROLLER.lock().is_some() {
-        return Ok(());
+    let bound = CONTROLLER.lock().as_ref().map(|owner| owner.bus_addr);
+    match crate::rtw88::pci_park::admission(bound, device.addr) {
+        crate::rtw88::pci_park::Admission::Bound => return Ok(()),
+        crate::rtw88::pci_park::Admission::ParkExtra => {
+            super::pci_park::invoke(&cap, || super::pci_park::park(&device, &cap))
+                .map_err(|_| narf_bus::ProbeError::BadDevice)?
+                .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+            return Ok(());
+        }
+        crate::rtw88::pci_park::Admission::Initialize => {}
     }
-
-    // Enable MEM_SPACE + BUS_MASTER so BAR reads land + the device
-    // can DMA later. Match the `e1000` shape so the test harness's
-    // mocked-cfg writes go through the same path.
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     // SAFETY: caller (the bus dispatch layer) hands us exclusive
     // BusDeviceCap authority for this device's cfg + BARs.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let result = unsafe { bring_up(&device) };
+    let result = unsafe { bring_up(&device, &cap) };
     let dev = match result {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
@@ -184,6 +204,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     let mac = dev.mac;
     let did = dev.device_id;
+    let firmware = dev.firmware.clone();
     *CONTROLLER.lock() = Some(dev);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -198,6 +219,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // stack sees the MAC. send_frame returns Err for now — this
     // commit only delivers "chip detected + MAC readable."
     *IFNAME.lock() = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
+    if let Some(firmware) = firmware {
+        // The registered interface and controller retain this exact owner
+        // before the first DMA base/BME publication. No spinlock crosses await.
+        narf_scheduler::spawn(async move {
+            if let Err(error) = firmware.initialize_registered().await {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "rtw88-8822ce firmware: {:?}", error);
+            }
+        });
+    }
     Ok(())
 }
 
@@ -210,50 +241,72 @@ pub(super) fn map_registers_with(
 ) -> Result<MmioRegion, ProbeError> {
     // Linux rtw_pci_io_mapping uses PCI BAR2 on all supported rtw88 chips.
     let registers = map_control(device, 2).map_err(|_| ProbeError::RegisterBarMapFailed)?;
-    if registers.len < REG_CR + core::mem::size_of::<u16>() as u64 {
+    if registers.len < register_window_min(device.id.device) {
         return Err(ProbeError::RegisterBarTooSmall);
     }
     Ok(registers)
+}
+
+pub(super) const fn register_window_min(did: u16) -> u64 {
+    if did == RTL_DEV_8822CE {
+        // Firmware LTE coexistence indirect data at 0x1708 is a dword.
+        0x170c
+    } else {
+        power::REGISTER_WINDOW_MIN
+    }
 }
 
 /// Bring the chip up: map BAR2 registers, run baseline power-on, read
 /// MAC from EFUSE. Pure-IO; no TX/RX ring setup.
 ///
 /// # Safety
-/// Caller owns the device's BARs exclusively.
-pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
-    // SAFETY: caller-asserted BAR exclusivity.
-    let registers = map_registers_with(device, |device, index| {
-        // SAFETY: bring_up's caller owns this PCI function and its BARs.
-        unsafe { map_bar_control(device, index) }
-    })?;
+/// Caller owns the device's PCI configuration and BARs exclusively.
+pub unsafe fn bring_up(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+) -> Result<Rtw88Device, ProbeError> {
+    let (registers, mac) = super::pci_park::invoke(cap, || -> Result<_, ProbeError> {
+        let registers = map_registers_with(device, |device, index| {
+            super::pci_park::map_bar_control(device, cap, index)
+        })?;
 
-    // Power-on prologue. Some parts (notably 8821CE on certain BIOSes)
-    // arrive in a fully-powered state and the prologue is a no-op;
-    // others arrive in D3cold and need the PWR-state walk. Baseline
-    // does the minimum cross-part prologue — full per-chip table
-    // lands in the follow-up.
-    // SAFETY: BAR2 control registers mapped + owned.
-    unsafe {
-        power::baseline_power_on(&registers).map_err(ProbeError::PowerOn)?;
-    }
+        // Run the chip/cut-filtered Linux PCI power sequence. Bus mastering
+        // remains parked throughout power cycling and read-only EFUSE access.
+        // SAFETY: BAR2 control registers mapped + owned.
+        unsafe {
+            power::power_on(&registers, device.id.device).map_err(ProbeError::PowerOn)?;
+        }
 
-    // Decode the sparse physical EFUSE map and select this chip's PCI MAC.
-    // SAFETY: BAR2 control registers mapped, power-on done.
-    let mac =
-        unsafe { efuse::read_mac(&registers, device.id.device) }.map_err(ProbeError::Efuse)?;
+        // Decode the sparse physical EFUSE map and select this chip's PCI MAC.
+        // SAFETY: BAR2 control registers mapped, power-on done.
+        let mac =
+            unsafe { efuse::read_mac(&registers, device.id.device) }.map_err(ProbeError::Efuse)?;
 
-    // Firmware transport is not implemented. In particular, BAR2 is a
-    // register window, not a destination for whole firmware blob writes.
+        Ok((registers, mac))
+    })
+    .map_err(|_| ProbeError::PciAccess)??;
+
+    let firmware = if device.id.device == RTL_DEV_8822CE {
+        // SAFETY: the exact exclusively owned function completed real chip/cut
+        // power reset and factory EFUSE above, with PCI BME/IRQs parked. No
+        // previous native owner exists; every later access rechecks authority.
+        Some(Arc::new(unsafe {
+            super::firmware_native::Firmware::new(*device, *cap, registers)
+        }))
+    } else {
+        None
+    };
 
     // Initialize IPC rings.
     let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
     let device_obj = Arc::new(Rtw88Device {
+        bus_addr: device.addr,
         registers,
         mac,
         device_id: device.id.device,
+        firmware: firmware.clone(),
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(Some(rx_cons)),
         tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -262,9 +315,11 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
     narf_wireless::registry::register(device_obj.clone());
 
     Ok(Rtw88Device {
+        bus_addr: device.addr,
         registers,
         mac,
         device_id: device.id.device,
+        firmware,
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(None),
         tx_ring: IrqSafeSpinLock::new(None),

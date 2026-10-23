@@ -282,6 +282,9 @@ pub enum PairwiseFail {
 /// Why an EAPOL-Key frame was not processed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EapolRxError {
+    /// A new SNonce was required, but the trusted nonce provider failed.
+    /// No new nonce or message1 key state was committed; abort the operation.
+    NonceUnavailable,
     /// Dropped (`goto out` / the discard returns); the association stays.
     Drop(GroupKeyDrop),
     /// A 4-way handshake failure: deauthenticate with `reason`.
@@ -485,6 +488,20 @@ impl Supplicant {
         encrypted: bool,
         fresh_snonce: [u8; 32],
     ) -> Result<EapolRx, EapolRxError> {
+        self.rx_eapol_with_nonce(pdu, encrypted, || Some(fresh_snonce))
+    }
+
+    /// As rx_eapol, obtaining entropy only at an actual new-SNonce
+    /// consumption point. The provider runs after the existing native EAPOL
+    /// validation and message1 KDE/PMF checks, only while renew_snonce is set.
+    /// Message1 retries, message3, group rekeys and discarded traffic never
+    /// request fresh material. None fails before nonce/key-state mutation.
+    pub fn rx_eapol_with_nonce(
+        &mut self,
+        pdu: &[u8],
+        encrypted: bool,
+        fresh_snonce: impl FnMut() -> Option<[u8; 32]>,
+    ) -> Result<EapolRx, EapolRxError> {
         if self.rsna.is_none() {
             // "No SSID info found"
             return Err(EapolRxError::Drop(GroupKeyDrop::NotKey));
@@ -539,7 +556,7 @@ impl Supplicant {
         &mut self,
         f: &Front,
         encrypted: bool,
-        fresh_snonce: [u8; 32],
+        mut fresh_snonce: impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<PairwiseM1, EapolRxError> {
         let r = self.rsna.clone().unwrap();
         if !encrypted && self.ptk_installed && r.pmf {
@@ -552,7 +569,7 @@ impl Supplicant {
             return Err(EapolRxError::Drop(GroupKeyDrop::KeyData));
         }
         if self.renew_snonce {
-            self.snonce = fresh_snonce;
+            self.snonce = fresh_snonce().ok_or(EapolRxError::NonceUnavailable)?;
             self.renew_snonce = false;
         }
         let mut anonce = [0u8; 32];
@@ -1024,4 +1041,142 @@ mod rsna_tests {
         TestResult::Pass
     }
     kernel_test_in!("wireless/eapol", smoke_eapol_sae_4way_negatives);
+    fn smoke_eapol_nonce_provider_is_lazy_at_actual_m1_renewal() -> TestResult {
+        let mut s = sup();
+        let mut calls = 0;
+        let m1 = ap_frame(M1_KI, 1, ANONCE, &[], None);
+        if !matches!(
+            s.rx_eapol_with_nonce(&m1, false, || {
+                calls += 1;
+                Some(SNONCE)
+            }),
+            Ok(EapolRx::Pairwise1(_))
+        ) || calls != 1
+        {
+            return TestResult::Fail("initial M1 did not consume exactly one SNonce");
+        }
+        if !matches!(
+            s.rx_eapol_with_nonce(&m1, false, || panic!("retry requested nonce")),
+            Ok(EapolRx::Pairwise1(_))
+        ) {
+            return TestResult::Fail("M1 retry failed without a new nonce");
+        }
+        let p = ptk_of(ANONCE, SNONCE);
+        let m3 = ap_frame(
+            M3_KI,
+            2,
+            ANONCE,
+            &m3_kd(&AP_RSNE, Some(&RSNXE), true),
+            Some(&p),
+        );
+        if !matches!(
+            s.rx_eapol_with_nonce(&m3, false, || panic!("M3 requested nonce")),
+            Ok(EapolRx::Pairwise3(_))
+        ) {
+            return TestResult::Fail("M3 failed without a nonce request");
+        }
+        s.pairwise_key_installed();
+        s.group_keys_installed(Some(&GTK), Some(&IGTK));
+        let group = ap_frame(
+            0x1380,
+            3,
+            [0; 32],
+            &m3_kd(&AP_RSNE, Some(&RSNXE), true),
+            Some(&p),
+        );
+        if !matches!(
+            s.rx_eapol_with_nonce(&group, true, || panic!("group requested SNonce")),
+            Ok(EapolRx::Group1(_))
+        ) {
+            return TestResult::Fail("group rekey requested or needed a fresh SNonce");
+        }
+        let rekey = ap_frame(M1_KI, 4, [0x44; 32], &[], None);
+        if s.rx_eapol_with_nonce(&rekey, false, || panic!("PMF drop requested nonce"))
+            != Err(EapolRxError::Drop(GroupKeyDrop::Unencrypted))
+        {
+            return TestResult::Fail("PMF reject bypassed nonce boundary");
+        }
+        let bad = ap_frame(M1_KI, 4, [0x44; 32], &[0xdd, 20, 0], None);
+        if s.rx_eapol_with_nonce(&bad, true, || panic!("bad KDE requested nonce"))
+            != Err(EapolRxError::Drop(GroupKeyDrop::KeyData))
+        {
+            return TestResult::Fail("malformed M1 crossed the nonce boundary");
+        }
+        let replay = ap_frame(M1_KI, 3, ANONCE, &[], None);
+        if s.rx_eapol_with_nonce(&replay, true, || panic!("replay requested nonce"))
+            != Err(EapolRxError::Drop(GroupKeyDrop::Replay))
+        {
+            return TestResult::Fail("replayed M1 crossed the nonce boundary");
+        }
+        if !matches!(
+            s.rx_eapol_with_nonce(&rekey, true, || {
+                calls += 1;
+                Some([0x55; 32])
+            }),
+            Ok(EapolRx::Pairwise1(_))
+        ) || calls != 2
+            || s.snonce != [0x55; 32]
+        {
+            return TestResult::Fail("new PTK rekey did not renew exactly once");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/eapol",
+        smoke_eapol_nonce_provider_is_lazy_at_actual_m1_renewal
+    );
+    fn smoke_eapol_nonce_failure_does_not_commit_m1_state() -> TestResult {
+        let mut s = sup();
+        let mut calls = 0;
+        let m1 = ap_frame(M1_KI, 1, ANONCE, &[], None);
+        if s.rx_eapol_with_nonce(&m1, false, || {
+            calls += 1;
+            None
+        }) != Err(EapolRxError::NonceUnavailable)
+            || calls != 1
+            || s.snonce != [0; 32]
+            || s.anonce != [0; 32]
+            || !s.renew_snonce
+            || s.tptk.is_some()
+            || s.ptk.is_some()
+            || s.state != FourWayState::WaitM1
+            || s.rx_replay_counter_set
+        {
+            return TestResult::Fail("failed nonce source changed initial M1/key state");
+        }
+        if !matches!(
+            s.rx_eapol_with_nonce(&m1, false, || Some(SNONCE)),
+            Ok(EapolRx::Pairwise1(_))
+        ) {
+            return TestResult::Fail("nonce failure consumed the M1 attempt");
+        }
+        let p = ptk_of(ANONCE, SNONCE);
+        let m3 = ap_frame(
+            M3_KI,
+            2,
+            ANONCE,
+            &m3_kd(&AP_RSNE, Some(&RSNXE), true),
+            Some(&p),
+        );
+        s.rx_eapol_with_nonce(&m3, false, || panic!("M3 entropy"))
+            .unwrap();
+        s.pairwise_key_installed();
+        let rekey = ap_frame(M1_KI, 3, [0x44; 32], &[], None);
+        if s.rx_eapol_with_nonce(&rekey, true, || None) != Err(EapolRxError::NonceUnavailable)
+            || s.snonce != SNONCE
+            || s.anonce != ANONCE
+            || !s.renew_snonce
+            || s.tptk.is_some()
+            || s.ptk.as_ref().map(|k| &k.tk) != Some(&p.tk)
+            || !s.ptk_installed
+            || s.state != FourWayState::PtkDone
+        {
+            return TestResult::Fail("failed rekey entropy replaced the installed key/nonce");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/eapol",
+        smoke_eapol_nonce_failure_does_not_commit_m1_state
+    );
 }

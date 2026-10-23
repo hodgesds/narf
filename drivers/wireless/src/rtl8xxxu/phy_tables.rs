@@ -44,10 +44,10 @@ impl MacRow {
     }
 }
 
-/// 5-bit-RF-address × 20-bit-data row used by RF init tables.
+/// 8-bit-RF-address × 20-bit-data row used by RF init tables.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RfRow {
-    /// RF register address (5 bits, but stored as u8).
+    /// RF register address, including extended registers above 0x1f.
     pub reg: u8,
     /// 20-bit data field; high bits 0.
     pub val: u32,

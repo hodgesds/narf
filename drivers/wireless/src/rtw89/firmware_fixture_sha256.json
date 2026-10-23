@@ -1,0 +1,12 @@
+{
+  "/lib/firmware/rtw89/rtw8851b_fw-1.bin": "1c4ccb5fa06bf5649146025e95993db66876a1fbc0bd766ec05686587f69c1b7",
+  "/lib/firmware/rtw89/rtw8851b_fw.bin": "945c854d7cf69dd97bf1da0181b011787d9b3c5d59c47e8b9dbea4eb4eee170b",
+  "/lib/firmware/rtw89/rtw8852a_fw-1.bin": "241320fae9ca40781abb3e5368da91232e11c1c96609563822442b533348ccab",
+  "/lib/firmware/rtw89/rtw8852a_fw.bin": "7eb1fe457f5a704b7a4f05a66c67cfa6af2f1142566b640c8e402445d04b0159",
+  "/lib/firmware/rtw89/rtw8852b_fw-1.bin": "5b68415e3bfe72715d63a70703d4471b04b5475b8ff69cfdc8cdf48233cd5d3a",
+  "/lib/firmware/rtw89/rtw8852b_fw-2.bin": "6ff6aeb56bb5b85cba333b755f8cc1dbfe9ff6e5b16e39f6ba01ce7f1eaa7714",
+  "/lib/firmware/rtw89/rtw8852b_fw.bin": "5b9c224ae014e0aeade8701412d820e213c8880e08615b3905dba89659f21baf",
+  "/lib/firmware/rtw89/rtw8852c_fw-1.bin": "95e4226f7a4c2a506a5ea2bb8b6247842dd12fc312639750881c5bfdec7bbec5",
+  "/lib/firmware/rtw89/rtw8852c_fw-2.bin": "916e87d1470bce5400712f53d419ae68a0f44d858670c57e118d4f0b1d89c5b4",
+  "/lib/firmware/rtw89/rtw8852c_fw.bin": "e05e704911ec5d6523e2951416290cc2189444d48a0420e637de6acf5bf21228"
+}

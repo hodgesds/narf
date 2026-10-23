@@ -164,8 +164,9 @@ pub unsafe fn write_gcspr_el0(v: u64);
 
 ### 4.2 Instructions
 
-- **`MRS Xt, RNDR`** — pseudo-random 64 bits, NZCV.C = 0 on
-  failure (entropy starvation), C = 1 on success.
+- **`MRS Xt, RNDR`** — pseudo-random 64 bits, NZCV = `0000` on
+  success and `0100` on failure (entropy starvation). Test Z with
+  `CSET NE`; carry is clear in both cases.
 - **`MRS Xt, RNDRRS`** — random number suitable for reseeding;
   same return semantics.
 

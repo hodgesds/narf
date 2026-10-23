@@ -259,6 +259,57 @@ pub const WCN6855_SHADOW_REG_V2: [u32; 30] = [
     0x01b8_e400,
 ];
 
+// Literal qca6390_regs shadow list from local Linux hal.c/hw.c.
+pub const QCA6390_SHADOW_REG_V2: [u32; 30] = [
+    // REO2SW1..4 TP (DST): 0xa3b030 + 8n + 4
+    0x00a3_b034,
+    0x00a3_b03c,
+    0x00a3_b044,
+    0x00a3_b04c,
+    // REO2TCL TP (DST): 0xa3b050 + 4
+    0x00a3_b054,
+    // SW2REO HP (SRC)
+    0x00a3_b028,
+    // REO_CMD HP (SRC)
+    0x00a3_b020,
+    // REO_STATUS TP (DST): 0xa3b068 + 4
+    0x00a3_b06c,
+    // SW2TCL1..3 HP (SRC): 0xa46000 + 8n
+    0x00a4_6000,
+    0x00a4_6008,
+    0x00a4_6010,
+    // SW2TCL_CMD HP
+    0x00a4_6018,
+    // TCL_STATUS TP: 0xa46030 + 4
+    0x00a4_6034,
+    // WBM_IDLE_LINK HP
+    0x00a3_70b0,
+    // SW2WBM_RELEASE HP
+    0x00a3_7018,
+    // WBM2SW0..4 TP: 0xa370c0 + 8n + 4
+    0x00a3_70c4,
+    0x00a3_70cc,
+    0x00a3_70d4,
+    0x00a3_70dc,
+    0x00a3_70e4,
+    // CE0 src HP: 0xa00400
+    0x00a0_0400,
+    // CE1 dst HP (CE_DST is a SRC ring), dst-status TP: 0xa01400/0xa01408 + 0x2000, +4
+    0x00a0_3400,
+    0x00a0_340c,
+    // CE2
+    0x00a0_5400,
+    0x00a0_540c,
+    // CE3 src, CE4 src
+    0x00a0_6400,
+    0x00a0_8400,
+    // CE5 dst, dst-status
+    0x00a0_b400,
+    0x00a0_b40c,
+    // CE7 src (CE6 / CE8 have no rings)
+    0x00a0_e400,
+];
+
 fn smoke_ath11k_hal_shadow_reg_v2_wcn6855_golden() -> TestResult {
     let hw = wcn6855();
     let s = match shadow_reg_v2(&hw) {

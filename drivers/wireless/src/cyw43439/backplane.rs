@@ -78,7 +78,7 @@ pub fn window_writes(base: u32) -> [WindowWrite; 3] {
 // ── Backplane core ids (datasheet §6.5 Table 6-8) ─────────────────
 
 /// The WLAN ARM ("D11") core — runs the WiFi MAC firmware.
-pub const CORE_ID_WLAN_ARM: u16 = 0x829;
+pub const CORE_ID_WLAN_ARM: u16 = 0x82a;
 /// The on-chip RAM core — the staging area for firmware before the
 /// ARM core is taken out of reset.
 pub const CORE_ID_SOC_RAM: u16 = 0x80E;

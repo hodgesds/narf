@@ -16,9 +16,9 @@
 //!    send function. The interface remains down and all wireless control
 //!    operations return `NotSupported` until firmware and packet rings land.
 //!
-//! Firmware load + RF/PHY init + TX/RX rings are explicitly **not**
-//! part of this baseline — they need the `narf-firmware` blob path
-//! and a follow-up bring-up that doesn't fit cleanly in one commit.
+//! RTL8822CE retains one authenticated section-firmware attempt using beacon
+//! host DMA/IDDMA and parks it afterward. Complete MAC/RF, station control
+//! and active packet rings remain follow-up work.
 //!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later)
 //!
@@ -43,9 +43,22 @@
 extern crate alloc;
 
 pub mod efuse;
+mod firmware_lifecycle;
+mod firmware_native;
+mod firmware_transport;
 pub mod fw;
+mod pci_firmware;
+mod probe_guard;
+mod reserved_page;
+pub use firmware_lifecycle::{Stage as FirmwareStage, Status as FirmwareStatus};
+pub use firmware_transport::{Error as FirmwareError, Info as FirmwareInfo};
 pub mod pci;
+pub(crate) mod pci_park;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod pci_park_tests;
 pub mod power;
+mod power_tables;
 pub mod regs;
 
 pub use pci::{name_for, probe, register_pci_driver, Rtw88Device};
@@ -65,3 +78,9 @@ mod efuse_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod pci_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod power_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod authority_tests;

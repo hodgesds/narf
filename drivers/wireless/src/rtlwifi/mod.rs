@@ -18,17 +18,18 @@
 //! ## Scope (this commit)
 //!
 //! 1. PCI device-ID table — all 9 IDs registered with `narf-bus`.
-//! 2. BAR0 MMIO mapping — 16 KiB window for all chips.
+//! 2. BAR2 control mapping and verifiably parked PCI bus mastering.
 //! 3. EFUSE read — per-byte LDO-switched access (`REG_EFUSE_CTRL` / `REG_EFUSE_TEST`).
 //! 4. Per-chip register-bank / MMIO-size constants.
 //! 5. TX descriptor layout (BE queue) + RX descriptor layout.
-//! 6. Firmware blob-name resolver.
+//! 6. Retained RTL8188EE authenticated paged firmware and inactive linked-ring/LLT owner.
+//!    Other silicon profiles remain diagnostic.
 //!
 //! ## Deferred
 //!
-//! - Power-on / chip-reset sequence (power.rs follow-up).
-//! - Firmware download via H2C page-write.
-//! - TX/RX ring initialisation and DMA setup.
+//! - Complete power/reset flows for silicon beyond RTL8188EE.
+//! - Firmware transport for the remaining legacy parts.
+//! - Active DMA, complete MAC/BB/RF/calibration and station packet runtime.
 //! - MSI / INTx IRQ routing.
 //! - Bluetooth co-existence (8723AE/BE).
 //!
@@ -52,6 +53,8 @@ pub mod btcoex;
 pub mod channel;
 pub mod dma;
 pub mod efuse;
+mod firmware_native;
+pub mod firmware_transport;
 pub mod fw;
 pub mod h2c;
 pub mod irq;
@@ -59,6 +62,8 @@ pub mod mac;
 pub mod pci;
 pub mod phy;
 pub mod power;
+pub mod prepare;
+mod prepare_native;
 pub mod regs;
 pub mod rf;
 pub mod rx;
@@ -79,6 +84,9 @@ pub use regs::{ALL_DEV_IDS, REALTEK_VENDOR};
 pub fn register() {
     register_pci_driver();
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod efuse_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;

@@ -1,75 +1,109 @@
-//! Atheros 802.11n wireless driver (ath9k).
-//!
-//! Provides support for the classic Atheros AR5008, AR9001, and AR9002
-//! family of 802.11n wireless chipsets.
-//!
-//! References: `linux/drivers/net/wireless/ath/ath9k/`
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! AR9285 PCIe reset, EEPROM identity and inactive INI/PLL/RF preparation.
+//! Linux ath9k is the reference. Modal/RF, detector and factory CTL/rate
+//! tables are prepared at a zero-dBm ceiling; calibration, PHY activation
+//! and packet DMA remain open.
 
-extern crate alloc;
-
-use alloc::sync::Arc;
+use core::fmt::Write as _;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
+use narf_lib::sync::IrqSafeSpinLock;
 
-const ATHEROS_PCI_VENDOR: u16 = 0x168C;
-const ATHEROS_AR9285_DEVICE: u16 = 0x002B;
+mod identity;
+mod initvals;
+mod phy;
+pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
+pub use phy::Prepared as BasebandPrepared;
 
-// Basic ATH9K registers
-const AR_RC: u64 = 0x4000;
-const AR_RC_AHB: u32 = 1 << 0;
-const AR_INTR_SYNC_CAUSE: u64 = 0x4010;
+const ATHEROS_PCI_VENDOR: u16 = 0x168c;
+const ATHEROS_AR9285_DEVICE: u16 = 0x002b;
 
+/// Retained hardware identity and calibration bytes. No netdev or packet
+/// DMA is enabled until the MAC/PHY and soft-MAC runtime are implemented.
 #[derive(Debug)]
 pub struct Ath9k {
-    mmio: MmioRegion,
+    _mmio: MmioRegion,
+    _device: BusDevice,
+    _cap: Cap<BusDeviceCap, Write>,
+    pub identity: Identity,
+    pub baseband: BasebandPrepared,
+    calibration: [u8; EEPROM_4K_BYTES],
 }
 
 impl Ath9k {
-    pub fn new(mmio: MmioRegion) -> Self {
-        let nic = Self { mmio };
-        nic.init();
-        nic
-    }
-
-    fn write_u32(&self, offset: u64, val: u32) {
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { self.mmio.write32(offset, val) }
-    }
-
-    fn init(&self) {
-        // Assert AHB reset
-        self.write_u32(AR_RC, AR_RC_AHB);
-        let mut timeout = 10_000;
-        while timeout > 0 {
-            core::hint::spin_loop();
-            timeout -= 1;
-        }
-
-        // Deassert AHB reset
-        self.write_u32(AR_RC, 0);
-
-        // Clear sync cause
-        self.write_u32(AR_INTR_SYNC_CAUSE, 0xFFFFFFFF);
+    pub fn calibration(&self) -> &[u8; EEPROM_4K_BYTES] {
+        &self.calibration
     }
 }
 
-pub fn probe(
-    device: BusDevice,
-    _cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let mmio = match unsafe { narf_bus::map_bar(&device, 0) } {
-        // ath9k uses BAR0
-        Ok(m) => m,
-        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
-    };
+static CONTROLLER: IrqSafeSpinLock<Option<Ath9k>> = IrqSafeSpinLock::new(None);
 
-    let _nic = Arc::new(Ath9k::new(mmio));
-    // Register to wireless subsystem
+pub fn with_controller<R>(callback: impl FnOnce(&Ath9k) -> R) -> Option<R> {
+    CONTROLLER.lock().as_ref().map(callback)
+}
+
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if device.id.vendor != ATHEROS_PCI_VENDOR || device.id.device != ATHEROS_AR9285_DEVICE {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    let owner = CONTROLLER
+        .lock()
+        .as_ref()
+        .map(|controller| controller._device.addr);
+    let occupied = owner.is_some();
+    crate::qualcomm_pci::park(&device, &cap, false, owner)?;
+    if occupied {
+        return Err(narf_bus::ProbeError::Other(
+            "ath9k singleton already owns another radio",
+        ));
+    }
+    let mmio = crate::qualcomm_pci::map_bar_control(&device, &cap, 0)?;
+    if mmio.len < phy::REQUIRED_BAR {
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
+    let (identity, calibration) = identity::read(mmio, cap).map_err(|error| {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath9k: AR9285 identification failed: {:?}",
+            error
+        );
+        narf_bus::ProbeError::BadDevice
+    })?;
+    let baseband = phy::program(mmio, cap, &calibration).map_err(|error| {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath9k: AR9285 baseband preparation failed: {:?}",
+            error
+        );
+        narf_bus::ProbeError::BadDevice
+    })?;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  ath9k: AR9285 rev {} MAC {:02x?}, EEPROM {:#x}; INI/PLL/RF registers prepared, calibration and packet runtime pending",
+        identity.revision,
+        identity.mac,
+        identity.eeprom_version
+    );
+    let vendor = device.id.vendor;
+    let device_id = device.id.device;
+    *CONTROLLER.lock() = Some(Ath9k {
+        _mmio: mmio,
+        _device: device,
+        _cap: cap,
+        identity,
+        baseband,
+        calibration,
+    });
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name: alloc::string::String::from("ath9k-ar9285"),
+        kind: narf_drivers::BoundKind::Net,
+        pci_vid: Some(vendor),
+        pci_did: Some(device_id),
+        domain: narf_drivers::BoundKind::Net.default_domain(),
+    });
     Ok(())
 }
 
-/// Register the ath9k driver.
 pub fn register() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {
         name: "ath9k",

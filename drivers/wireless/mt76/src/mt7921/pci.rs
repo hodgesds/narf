@@ -23,7 +23,7 @@
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -74,7 +74,7 @@ pub enum ProbeError {
     RemapRejected,
     /// Chip identity is not supported by this CONNAC2 implementation.
     UnsupportedChip,
-    /// `map_bar(device, 0)` failed. Most likely the BAR isn't
+    /// `map_bar_control(device, 0)` failed. Most likely the BAR isn't
     /// implemented (wrong PCI ID matched) or another driver claimed it.
     Bar0MapFailed,
     /// BAR0 reads returned the all-FF sentinel that means "device
@@ -97,7 +97,6 @@ pub enum ProbeError {
 /// Single-instance live device. Probe drops a new entry into this
 /// slot. The kernel-test smokes reset it via `__reset_for_test`.
 static CONTROLLER: IrqSafeSpinLock<Option<Mt7921Device>> = IrqSafeSpinLock::new(None);
-#[cfg(target_arch = "x86_64")]
 static FIRMWARE_BINDING: IrqSafeSpinLock<Option<(BusDevice, Cap<BusDeviceCap, Write>)>> =
     IrqSafeSpinLock::new(None);
 static TRANSPORT_CLAIMED: AtomicBool = AtomicBool::new(false);
@@ -132,18 +131,41 @@ pub fn register_pci_driver() {
 /// PCI probe entry. Called by the bus dispatch layer when one of our
 /// registered (vendor, device) pairs is enumerated.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    // Skip if we already bound a device. Single-instance baseline;
-    // a second probe is an enumeration race.
+    cap.check_live()
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    if FIRMWARE_BINDING
+        .lock()
+        .as_ref()
+        .is_some_and(|(bound, authority)| {
+            bound.addr == device.addr && authority.check_live().is_ok()
+        })
+    {
+        // Rediscovery must not park a function whose retained owner is active.
+        return Ok(());
+    }
+    // Discovery does not publish DMA rings. Keep bus mastering disabled
+    // and memory decode off until parking has been verified. This applies to
+    // skipped singleton matches as well as the function selected for probe.
+    use narf_bus::pci::{self, cmd};
+    pci::clear_command(&cap, &device, cmd::BUS_MASTER | cmd::MEM_SPACE)
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    pci::set_command(&cap, &device, cmd::INTX_DISABLE)
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let policy = cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE;
+    if pci::read_command(&cap, &device).map_err(|_| narf_bus::ProbeError::BadDevice)? & policy
+        != cmd::INTX_DISABLE
+    {
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
-
-    // Discovery does not publish DMA rings. Keep bus mastering disabled
-    // until a live firmware transport owns all device-visible allocations.
-    narf_bus::pci::clear_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER)
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    narf_bus::pci::set_command(&cap, &device, narf_bus::pci::cmd::MEM_SPACE)
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    pci::set_command(&cap, &device, cmd::MEM_SPACE).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    if pci::read_command(&cap, &device).map_err(|_| narf_bus::ProbeError::BadDevice)? & policy
+        != cmd::MEM_SPACE | cmd::INTX_DISABLE
+    {
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
 
     // SAFETY: bus dispatch hands us exclusive BusDeviceCap authority
     // for this device's cfg + BARs for the duration of probe.
@@ -185,7 +207,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     );
 
     let did = dev.effective_did;
-    #[cfg(target_arch = "x86_64")]
     {
         *FIRMWARE_BINDING.lock() = Some((device, cap));
     }
@@ -218,7 +239,7 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
     // ── Stage 0: BAR0 mapping ───────────────────────────────────
     //
     // SAFETY: caller-asserted BAR exclusivity.
-    let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    let mmio_bar0 = unsafe { map_bar_control(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
 
     validate_probe_window(mmio_bar0.len)?;
     let _ = writeln!(
@@ -369,7 +390,6 @@ pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
 }
 
-#[cfg(target_arch = "x86_64")]
 pub(super) fn claim_firmware_transport(
 ) -> Result<Option<super::firmware_transport::Transport>, super::firmware_transport::Error> {
     use super::firmware_transport::{Error, Firmware, Transport};
@@ -406,7 +426,6 @@ pub(super) fn claim_firmware_transport(
 #[cfg(any(test, feature = "builtin"))]
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
-    #[cfg(target_arch = "x86_64")]
     {
         *FIRMWARE_BINDING.lock() = None;
     }

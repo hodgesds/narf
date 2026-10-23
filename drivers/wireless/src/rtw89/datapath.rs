@@ -1,22 +1,9 @@
 //! RTW89 TX/RX datapath glue — Stage-11.
 //!
-//! Wires the existing pieces together so a queued frame on a TX
-//! channel walks through:
-//!
-//! ```text
-//! ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
-//! │ 802.11   │ → │ TXWD     │ → │ BD slot  │ → │ doorbell │
-//! │ frame    │   │ prefix   │   │ write    │   │ MMIO     │
-//! └──────────┘   └──────────┘   └──────────┘   └──────────┘
-//! ```
-//!
-//! The TX side composes a TXWD body (`txrx::encode_txwd`), writes it
-//! into a host-DMA buffer in front of the 802.11 payload, advances the
-//! ring's wp, then bangs the `*_TXBD_IDX` doorbell with the new wp.
-//!
-//! The RX side, on interrupt, reads `*_RXBD_IDX` to learn how many
-//! BDs the hardware filled, walks them, decodes the RXD prefix
-//! (`txrx::decode_rxd`), and surfaces each 802.11 payload.
+//! Legacy TXWD-body and RX descriptor codecs plus ring register helpers.
+//! `stage_tx` alone is not a PCI submission: it omits the WP sequence and
+//! address-info records. The retained native backend uses `tx_transport`
+//! instead; the generic Ethernet SendFn rejects pending station integration.
 //!
 //! ## References (all GPL-2.0)
 //!
@@ -28,15 +15,14 @@
 
 use narf_bus::MmioRegion;
 
-use super::dma::{addr_set_for_chip, RingState, RxRingRegs, TxRingRegs, RING_IDX_HOST_SHIFT};
+use super::dma::{addr_set_for_chip, RingState, RxRingRegs, TxRingRegs};
 use super::mac::ChipId;
 use super::txrx::{decode_rxd, encode_txwd, RxdInfo, TxwdInfo, RXD_SHORT_SIZE, TXWD_BODY_SIZE};
 
 // ── TX submit ───────────────────────────────────────────────────────
 
-/// Result of preparing a frame for TX. Caller is expected to copy
-/// `wire` into a DMA-coherent buffer and write the buffer's physical
-/// address into the BD descriptor.
+/// Legacy body-only codec result. This is not a complete PCI header and
+/// must not be submitted as a TXBD; use `tx_transport::prepare_header`.
 #[derive(Debug)]
 pub struct TxSubmission<'a> {
     /// TXWD body (24 bytes) prepended to the 802.11 payload.
@@ -47,8 +33,7 @@ pub struct TxSubmission<'a> {
     pub total: usize,
 }
 
-/// Stage a frame for transmission on `channel`. Builds the TXWD body;
-/// caller does the DMA copy + BD setup.
+/// Encode a baseline body fixture. No publication or DMA ownership is granted.
 pub fn stage_tx<'a>(
     channel: u8,
     qsel: u8,
@@ -70,23 +55,15 @@ pub fn stage_tx<'a>(
     })
 }
 
-/// Bang the TX ring's doorbell. The 32-bit `*_TXBD_IDX` register holds
-/// the HW read pointer in bits[11:0] and the host write pointer in
-/// bits[31:16]; we write the new host_wp into the upper half.
-///
-/// Mirrors the WP update in `rtw89_pci_tx_kick_off` (`pci.c:1430`).
-///
+/// Publish host WP through the low16-bit index half. Hardware RP is in
+/// bits27:16 and must never be overwritten by a32-bit read/modify/write.
 /// # Safety
-/// Caller owns the BAR2 MMIO.
+/// Caller owns the complete aligned Device register and initialized channel;
+/// new_wp is below the programmed ring depth and DMA publication is ordered.
 pub unsafe fn ring_doorbell_tx(mmio: &MmioRegion, regs: &TxRingRegs, new_wp: u16) {
-    // SAFETY: identity-mapped MMIO.
-    let cur = unsafe { mmio.read32(regs.idx) };
-    // Preserve the HW read pointer in bits[11:0]; overwrite host_wp
-    // in bits[31:16].
-    let new = (cur & 0x0000_FFFF) | ((new_wp as u32) << RING_IDX_HOST_SHIFT);
-    // SAFETY: same.
+    // SAFETY: caller's complete aligned register, index and ordering contract.
     unsafe {
-        mmio.write32(regs.idx, new);
+        mmio.write16(regs.idx, new_wp);
     }
 }
 
@@ -106,12 +83,9 @@ pub unsafe fn read_tx_ring_idx(mmio: &MmioRegion, regs: &TxRingRegs) -> u32 {
 /// # Safety
 /// Caller owns the BAR2 MMIO.
 pub unsafe fn ring_doorbell_rx(mmio: &MmioRegion, regs: &RxRingRegs, new_wp: u16) {
-    // SAFETY: identity-mapped MMIO.
-    let cur = unsafe { mmio.read32(regs.idx) };
-    let new = (cur & 0x0000_FFFF) | ((new_wp as u32) << RING_IDX_HOST_SHIFT);
-    // SAFETY: same.
+    // SAFETY: caller owns the complete aligned host-index register half.
     unsafe {
-        mmio.write32(regs.idx, new);
+        mmio.write16(regs.idx, new_wp);
     }
 }
 

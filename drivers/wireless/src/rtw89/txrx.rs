@@ -50,7 +50,7 @@ pub const TXWD_BODY0_WD_INFO_EN: u32 = 1 << 22;
 pub const TXWD_BODY0_CHANNEL_SHIFT: u32 = 16;
 pub const TXWD_BODY0_CHANNEL_MASK: u32 = 0xF << TXWD_BODY0_CHANNEL_SHIFT;
 /// TXWD_BODY0 — `RTW89_TXWD_BODY0_WD_PAGE`. BIT(7).
-/// Set when the frame spans multiple TX-page descriptors.
+/// Select the PCI WD-page format.
 pub const TXWD_BODY0_WD_PAGE: u32 = 1 << 7;
 
 /// TXWD_BODY2 — `RTW89_TXWD_BODY2_MACID` shift / mask.
@@ -76,7 +76,7 @@ pub const QSEL_B0_VI: u8 = 2;
 /// `RTW89_TX_QSEL_B0_VO` — Band-0 voice (highest priority data).
 pub const QSEL_B0_VO: u8 = 3;
 /// `RTW89_TX_QSEL_B0_MGMT` — Band-0 management.
-pub const QSEL_B0_MGMT: u8 = 6;
+pub const QSEL_B0_MGMT: u8 = 0x12;
 
 /// Wire size of the baseline TXWD body (6 dwords = 24 bytes).
 /// `sizeof(struct rtw89_txwd_body)`. Linux `rtw89/core.h:1047`.
@@ -176,8 +176,8 @@ pub fn encode_txwd(info: &TxwdInfo, out: &mut [u8]) -> Option<()> {
         return None;
     }
     // Dword 0: channel DMA select + WD_INFO_EN (required for the WD
-    // info block that follows in the full pipeline; harmless when the
-    // block is absent because it just tells the firmware to look).
+    // info block that must follow when this bit is set). This body-only
+    // codec is not a complete PCI submission; tx_transport clears it.
     let dw0: u32 = TXWD_BODY0_WD_INFO_EN
         | ((info.channel as u32) << TXWD_BODY0_CHANNEL_SHIFT & TXWD_BODY0_CHANNEL_MASK);
     out[0..4].copy_from_slice(&dw0.to_le_bytes());

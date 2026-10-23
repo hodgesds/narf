@@ -74,6 +74,17 @@ stricter whole-encryption-sector rule before calling these primitives.
 | Disk      | AES-256-XTS, 512-byte data units, `plain64` little-endian sector tweak |
 | Key wrap  | AES Key Wrap, 128-bit KEK (`aes_kw::aes_wrap` / `aes_unwrap`, RFC 3394; IEEE 802.11 EAPOL-Key Key Data) |
 
+`aes_ccm::{seal, open}` supplies the AES-128-CCM profile used by 802.11
+CCMP: 13-byte nonce, detached eight-byte MIC and a two-byte message-length
+field. Messages longer than 65535 bytes fail before mutation. Associated data
+uses RFC 3610's two/six/ten-byte length encodings. `open` commits plaintext
+only after Subtle MIC verification and leaves caller ciphertext unchanged on
+all errors; temporary plaintext, CBC/CTR state and the AES key schedule are
+zeroized. The protocol owner supplies unique nonces, refuses packet-number
+wrap and commits replay state only after successful authentication. These
+packet primitives take protocol-owned raw temporal keys like the existing
+BIP/key-wrap helpers; they do not create or change capability grants.
+
 `bip::{protect_mmie, verify_mmie}` is the 802.11 management-frame integrity
 surface. It accepts an explicit CMAC-128, CMAC-256, GMAC-128, or GMAC-256
 suite and validates its 16/32-byte IGTK, 48-bit replay IPN, and trailing
@@ -92,6 +103,19 @@ firmware-owned.
 Post-quantum: algorithm choice left as an open question (§8).
 
 ### 3.2 RNG / DRBG
+
+`try_per_task_rng() -> Result<ChaCha20Rng, CryptoError>` and
+`try_fill_random_bytes(&mut [u8]) -> Result<(), CryptoError>` are the current
+fallible protocol-entropy adapters. Each nonempty fill obtains a fresh 256-bit
+seed from feature-gated, bounded RDSEED then RDRAND (x86_64), or RNDRRS then
+RNDR (aarch64), and expands it with ChaCha20. Source failure discards any
+partial seed, zeroizes the full caller output and returns
+`CryptoError::EntropyUnavailable`; no cycle-counter fallback is accepted.
+Empty fills need no entropy. Temporary seeds are zeroized. This adapter
+explicitly trusts the architectural RNG; it does not implement the system
+pool, jitter collection, per-task handle lifecycle, or SP 800-90B service
+specified below. The legacy Stage-3 `per_task_rng` / `fill_random_bytes`
+helpers remain predictable and must not supply protocol secrets or nonces.
 
 ```rust
 pub struct Rng;                                           // typed handle

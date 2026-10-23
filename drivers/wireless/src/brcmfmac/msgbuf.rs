@@ -580,237 +580,155 @@ impl IoctlResp {
     }
 }
 
-// ── TX-post descriptor (`MSGBUF_TYPE_TX_POST`) ──────────────────────
-//
-// Layout per `msgbuf.c::msgbuf_tx_msghdr` and Linux
-// `brcmfmac/core.c::brcmf_netdev_start_xmit` (~L293).
-//
-// The host builds a TxPost entry for every Ethernet frame it wants to
-// transmit; the firmware drains these from the flow-ring, DMAs the
-// frame payload out of the host-side buffer (described by `data_buf`),
-// and delivers a TxStatus back through D2H_MSGRING_TX_COMPLETE.
-//
-//   common_hdr (8B)             @ 0
-//   metadata_buf_addr BufAddr   @ 8..16   (set to 0 — metadata unused)
-//   data_buf_addr     BufAddr   @ 16..24  (DMA address of frame data)
-//   metadata_len      u16 LE    @ 24
-//   data_len          u16 LE    @ 26
-//   rsvd[4]           u32 LE×4  @ 28..44  (compat padding to 48 bytes)
-//
-// Total 48 bytes — matches `H2D_TXFLOWRING_ITEMSIZE`.
-//
-// Reference: Linux `brcmfmac/msgbuf.c::brcmf_msgbuf_txflow`
-// (~L640..L700, v6.6).
-
-/// Wire size of an encoded TxPost descriptor.
+// Linux msgbuf.c: msgbuf_tx_msghdr, tx_status, rx_complete. Classic
+// completions are16/32 bytes; shared v7 pads them to24/40 respectively.
 pub const TX_POST_SIZE: usize = 48;
-
-/// Per-frame TX descriptor posted to a flow-ring.
-///
-/// The actual frame bytes live in the DMA buffer at `data_buf_addr`;
-/// only the address + length are carried here. `metadata_buf_addr`
-/// is left as zero (metadata feature not used in the baseline path).
-///
-/// Reference: Linux `brcmfmac/msgbuf.c::msgbuf_tx_msghdr` (~L97).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub const TX_STATUS_SIZE: usize = 24;
+pub const TX_STATUS_CLASSIC_SIZE: usize = 16;
+pub const RX_COMPLETE_SIZE: usize = 40;
+pub const RX_COMPLETE_CLASSIC_SIZE: usize = 32;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TxPost {
     pub hdr: CommonHdr,
+    pub tx_header: [u8; 14],
+    pub flags: u8,
+    pub segments: u8,
     pub metadata_buf_addr: BufAddr,
     pub data_buf_addr: BufAddr,
     pub metadata_len: u16,
     pub data_len: u16,
 }
-
 impl TxPost {
-    /// Encode to a 48-byte buffer. Returns `None` if the buffer is too
-    /// small.
     pub fn encode(self, out: &mut [u8]) -> Option<()> {
-        if out.len() < TX_POST_SIZE {
-            return None;
+        let out = out.get_mut(..TX_POST_SIZE)?;
+        out.fill(0);
+        CommonHdr {
+            msgtype: MsgType::TxPost as u8,
+            ..self.hdr
         }
-        let mut hdr = self.hdr;
-        hdr.msgtype = MsgType::TxPost as u8;
-        hdr.encode(out)?;
-        self.metadata_buf_addr.encode(&mut out[8..16])?;
-        self.data_buf_addr.encode(&mut out[16..24])?;
-        out[24..26].copy_from_slice(&self.metadata_len.to_le_bytes());
-        out[26..28].copy_from_slice(&self.data_len.to_le_bytes());
-        out[28..TX_POST_SIZE].fill(0);
+        .encode(out)?;
+        out[8..22].copy_from_slice(&self.tx_header);
+        out[22] = self.flags;
+        out[23] = self.segments;
+        self.metadata_buf_addr.encode(&mut out[24..32])?;
+        self.data_buf_addr.encode(&mut out[32..40])?;
+        out[40..42].copy_from_slice(&self.metadata_len.to_le_bytes());
+        out[42..44].copy_from_slice(&self.data_len.to_le_bytes());
         Some(())
     }
-
-    /// Decode from a 48-byte buffer.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < TX_POST_SIZE {
+        let bytes = bytes.get(..TX_POST_SIZE)?;
+        let hdr = CommonHdr::decode(bytes)?;
+        if hdr.msgtype != MsgType::TxPost as u8 {
             return None;
         }
-        let hdr = CommonHdr::decode(&bytes[0..8])?;
-        let metadata_buf_addr = BufAddr::decode(&bytes[8..16])?;
-        let data_buf_addr = BufAddr::decode(&bytes[16..24])?;
-        let metadata_len = u16::from_le_bytes(bytes[24..26].try_into().ok()?);
-        let data_len = u16::from_le_bytes(bytes[26..28].try_into().ok()?);
         Some(Self {
             hdr,
-            metadata_buf_addr,
-            data_buf_addr,
-            metadata_len,
-            data_len,
+            tx_header: bytes[8..22].try_into().ok()?,
+            flags: bytes[22],
+            segments: bytes[23],
+            metadata_buf_addr: BufAddr::decode(&bytes[24..32])?,
+            data_buf_addr: BufAddr::decode(&bytes[32..40])?,
+            metadata_len: u16::from_le_bytes(bytes[40..42].try_into().ok()?),
+            data_len: u16::from_le_bytes(bytes[42..44].try_into().ok()?),
         })
     }
 }
-
-// ── TX-status (D2H TX complete) ─────────────────────────────────────
-//
-// Layout per `msgbuf.c::msgbuf_tx_status` (~L115, v6.6).
-//
-//   common_hdr (8B)   @ 0
-//   compl_hdr  (4B)   @ 8..12  (status u16 + flow_ring_id u16)
-//   msg_type   u8     @ 12
-//   tx_status  u8     @ 13
-//   rsvd       u16    @ 14..16
-//
-// Total 16 bytes (pre-v7 item size for D2H TX complete).
-// v7+ pads to 24 bytes; we model the 24-byte form here.
-//   rsvd[2]    u32×2  @ 16..24
-//
-// Reference: `msgbuf.c` (~L115), `msgbuf.h` `D2H_MSGRING_TX_COMPLETE_ITEMSIZE`.
-
-/// Wire size of an encoded TxStatus (v7+ 24-byte form).
-pub const TX_STATUS_SIZE: usize = 24;
-
-/// Per-frame TX completion from firmware to host.
-///
-/// When the firmware finishes transmitting (or drops) a frame that was
-/// posted via [`TxPost`], it delivers one of these through
-/// `D2H_MSGRING_TX_COMPLETE`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TxStatus {
     pub hdr: CommonHdr,
     pub status: u16,
     pub flow_ring_id: u16,
-    /// Firmware-side TX status code. 0 = success.
-    pub tx_status: u8,
+    pub metadata_len: u16,
+    pub tx_status: u16,
 }
-
 impl TxStatus {
     pub fn encode(self, out: &mut [u8]) -> Option<()> {
-        if out.len() < TX_STATUS_SIZE {
-            return None;
+        let length = if out.len() >= TX_STATUS_SIZE {
+            TX_STATUS_SIZE
+        } else {
+            TX_STATUS_CLASSIC_SIZE
+        };
+        let out = out.get_mut(..length)?;
+        out.fill(0);
+        CommonHdr {
+            msgtype: MsgType::TxStatus as u8,
+            ..self.hdr
         }
-        let mut hdr = self.hdr;
-        hdr.msgtype = MsgType::TxStatus as u8;
-        hdr.encode(out)?;
+        .encode(out)?;
         out[8..10].copy_from_slice(&self.status.to_le_bytes());
         out[10..12].copy_from_slice(&self.flow_ring_id.to_le_bytes());
-        out[12] = MsgType::TxStatus as u8;
-        out[13] = self.tx_status;
-        out[14..TX_STATUS_SIZE].fill(0);
+        out[12..14].copy_from_slice(&self.metadata_len.to_le_bytes());
+        out[14..16].copy_from_slice(&self.tx_status.to_le_bytes());
         Some(())
     }
-
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < TX_STATUS_SIZE {
+        let bytes = bytes.get(..TX_STATUS_CLASSIC_SIZE)?;
+        let hdr = CommonHdr::decode(bytes)?;
+        if hdr.msgtype != MsgType::TxStatus as u8 {
             return None;
         }
-        let hdr = CommonHdr::decode(&bytes[0..8])?;
-        let status = u16::from_le_bytes(bytes[8..10].try_into().ok()?);
-        let flow_ring_id = u16::from_le_bytes(bytes[10..12].try_into().ok()?);
-        let tx_status = bytes[13];
         Some(Self {
             hdr,
-            status,
-            flow_ring_id,
-            tx_status,
+            status: u16::from_le_bytes(bytes[8..10].try_into().ok()?),
+            flow_ring_id: u16::from_le_bytes(bytes[10..12].try_into().ok()?),
+            metadata_len: u16::from_le_bytes(bytes[12..14].try_into().ok()?),
+            tx_status: u16::from_le_bytes(bytes[14..16].try_into().ok()?),
         })
     }
 }
-
-// ── RX-complete (D2H RX complete) ───────────────────────────────────
-//
-// Layout per `msgbuf.c::msgbuf_rx_complete` (~L126, v6.6).
-//
-//   common_hdr (8B)         @ 0
-//   compl_hdr  (4B)         @ 8..12
-//   rx_status_0 u16 LE      @ 12   (RSSI in high byte, status bits in low)
-//   rx_status_1 u16 LE      @ 14
-//   data_offset u8          @ 16   (bytes from start of DMA buf to 802.11)
-//   data_len    u16 LE      @ 17
-//   rsvd                    @ 19..40
-//
-// Total 40 bytes (v7+ form). Pre-v7 is 32 bytes; the extra 8 bytes are
-// reserved padding.
-//
-// Reference: Linux `msgbuf.c` (~L126..L143) +
-// `brcmf_rx_frame` in `core.c` (~L502..L560).
-
-/// Wire size of an encoded RxComplete (v7+ 40-byte form).
-pub const RX_COMPLETE_SIZE: usize = 40;
-
-/// Per-frame RX completion from firmware to host.
-///
-/// Firmware posts one of these for every inbound frame. The actual
-/// frame payload sits in the DMA buffer that was previously posted
-/// via `RxBufPost` (ring id `H2D_MSGRING_RXPOST_SUBMIT`); `data_offset`
-/// tells the host where the 802.11 payload starts in that buffer.
-///
-/// References: Linux `msgbuf.c::msgbuf_rx_complete` (~L126),
-/// `core.c::brcmf_rx_frame` (~L502).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RxComplete {
     pub hdr: CommonHdr,
     pub status: u16,
     pub flow_ring_id: u16,
-    /// Combined status bits (low byte) and RSSI (high byte). Per
-    /// `msgbuf.c::msgbuf_rx_complete.rx_status_0`.
-    pub rx_status_0: u16,
-    /// Additional rx-status bits (flags, sequence number fragment).
-    pub rx_status_1: u16,
-    /// Byte offset from the start of the DMA buffer to the first byte
-    /// of the 802.11 frame payload. Mirrors `data_offset` in the
-    /// `brcmf_rx_frame` strip path.
-    pub data_offset: u8,
-    /// Length in bytes of the 802.11 frame (payload only; excludes the
-    /// DMA-buffer header bytes before `data_offset`).
+    pub metadata_len: u16,
     pub data_len: u16,
+    pub data_offset: u16,
+    pub flags: u16,
+    pub rx_status_0: u32,
+    pub rx_status_1: u32,
 }
-
 impl RxComplete {
     pub fn encode(self, out: &mut [u8]) -> Option<()> {
-        if out.len() < RX_COMPLETE_SIZE {
-            return None;
+        let length = if out.len() >= RX_COMPLETE_SIZE {
+            RX_COMPLETE_SIZE
+        } else {
+            RX_COMPLETE_CLASSIC_SIZE
+        };
+        let out = out.get_mut(..length)?;
+        out.fill(0);
+        CommonHdr {
+            msgtype: MsgType::RxCmplt as u8,
+            ..self.hdr
         }
-        let mut hdr = self.hdr;
-        hdr.msgtype = MsgType::RxCmplt as u8;
-        hdr.encode(out)?;
+        .encode(out)?;
         out[8..10].copy_from_slice(&self.status.to_le_bytes());
         out[10..12].copy_from_slice(&self.flow_ring_id.to_le_bytes());
-        out[12..14].copy_from_slice(&self.rx_status_0.to_le_bytes());
-        out[14..16].copy_from_slice(&self.rx_status_1.to_le_bytes());
-        out[16] = self.data_offset;
-        out[17..19].copy_from_slice(&self.data_len.to_le_bytes());
-        out[19..RX_COMPLETE_SIZE].fill(0);
+        out[12..14].copy_from_slice(&self.metadata_len.to_le_bytes());
+        out[14..16].copy_from_slice(&self.data_len.to_le_bytes());
+        out[16..18].copy_from_slice(&self.data_offset.to_le_bytes());
+        out[18..20].copy_from_slice(&self.flags.to_le_bytes());
+        out[20..24].copy_from_slice(&self.rx_status_0.to_le_bytes());
+        out[24..28].copy_from_slice(&self.rx_status_1.to_le_bytes());
         Some(())
     }
-
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < RX_COMPLETE_SIZE {
+        let bytes = bytes.get(..RX_COMPLETE_CLASSIC_SIZE)?;
+        let hdr = CommonHdr::decode(bytes)?;
+        if hdr.msgtype != MsgType::RxCmplt as u8 {
             return None;
         }
-        let hdr = CommonHdr::decode(&bytes[0..8])?;
-        let status = u16::from_le_bytes(bytes[8..10].try_into().ok()?);
-        let flow_ring_id = u16::from_le_bytes(bytes[10..12].try_into().ok()?);
-        let rx_status_0 = u16::from_le_bytes(bytes[12..14].try_into().ok()?);
-        let rx_status_1 = u16::from_le_bytes(bytes[14..16].try_into().ok()?);
-        let data_offset = bytes[16];
-        let data_len = u16::from_le_bytes(bytes[17..19].try_into().ok()?);
         Some(Self {
             hdr,
-            status,
-            flow_ring_id,
-            rx_status_0,
-            rx_status_1,
-            data_offset,
-            data_len,
+            status: u16::from_le_bytes(bytes[8..10].try_into().ok()?),
+            flow_ring_id: u16::from_le_bytes(bytes[10..12].try_into().ok()?),
+            metadata_len: u16::from_le_bytes(bytes[12..14].try_into().ok()?),
+            data_len: u16::from_le_bytes(bytes[14..16].try_into().ok()?),
+            data_offset: u16::from_le_bytes(bytes[16..18].try_into().ok()?),
+            flags: u16::from_le_bytes(bytes[18..20].try_into().ok()?),
+            rx_status_0: u32::from_le_bytes(bytes[20..24].try_into().ok()?),
+            rx_status_1: u32::from_le_bytes(bytes[24..28].try_into().ok()?),
         })
     }
 }

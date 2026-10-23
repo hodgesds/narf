@@ -512,8 +512,8 @@ pub mod tests {
         let mut mmio = MockMmio::new();
         // Queue 3, write-pointer = 42.
         tx_doorbell(&mut mmio, 3, 42);
-        // HBUS_TARG_PRPH_WADDR must carry `scd_queue_wrptr(3)`.
-        let expected_addr = scd_queue_wrptr(3);
+        // Literal SCD queue3 address, masked to 20 bits with 32-bit width.
+        let expected_addr = 0x0300_2c0c;
         if mmio.last_write(regs::HBUS_TARG_PRPH_WADDR) != Some(expected_addr) {
             return TestResult::Fail("PRPH WADDR wrong");
         }

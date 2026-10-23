@@ -1,54 +1,68 @@
-//! Checked legacy 2.4 GHz station preparation and open authentication MLME.
+//! MT76 CONNAC2 station records plus the shared IEEE management plan.
 //! Firmware layouts follow Linux ecd997b0189a mt76_connac_mcu.{c,h}.
-//! This module prepares frames/commands; it does not authorize RF transmission
-//! or mark a WPA2 controlled port secure.
 use super::firmware_transport::ScanBss;
 use alloc::{vec, vec::Vec};
+use narf_wireless::association::JoinPlan as ManagementPlan;
+pub use narf_wireless::association::{validate_sme_ies, Error, Phase, SecurityMode};
+#[cfg(any(test, feature = "builtin"))]
 use narf_wireless::rsn::{self, RsnIe, Suite};
-
+#[cfg(any(test, feature = "builtin"))]
 const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+
+/// CONNAC2 legacy TX rate, selected from the AP's validated basic rates.
+/// Linux mt76_rates: OFDM hardware indices are deliberately not linear.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyRate(u16);
+
+impl LegacyRate {
+    pub(crate) const ONE_MBPS: Self = Self(0);
+
+    fn lowest(basic: u16) -> Self {
+        const HARDWARE: [u16; 12] = [0, 1, 2, 3, 75, 79, 74, 78, 73, 77, 72, 76];
+        // JoinPlan has already rejected zero and unsupported basic rates.
+        Self(HARDWARE[basic.trailing_zeros() as usize])
+    }
+
+    pub(crate) fn hardware(self) -> u16 {
+        self.0
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Security {
     Open,
     Wpa2Psk { psk: [u8; 32] },
 }
-
+impl core::fmt::Debug for Security {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(if self.is_wpa2() {
+            "Wpa2Psk { .. }"
+        } else {
+            "Open"
+        })
+    }
+}
 impl Security {
     #[inline]
     pub fn is_wpa2(&self) -> bool {
         matches!(self, Self::Wpa2Psk { .. })
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error {
-    InvalidBss,
-    UnsupportedRates,
-    UnsupportedSecurity,
-    Protocol,
-    Rejected(u16),
-    Busy,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
-    Prepared,
-    AwaitAuthentication,
-    AwaitAssociation,
-    Associated { aid: u16 },
-    Failed,
-}
-
-/// No PMK or temporal keys are stored in a frame/command plan.
+/// Retains MT76 record inputs; all IEEE frame preparation/transitions are
+/// delegated to the common plan, which stores no firmware/hardware state.
 #[derive(Debug)]
 pub struct JoinPlan {
-    own: [u8; 6],
+    common: ManagementPlan,
     peer: [u8; 6],
     channel: u8,
-    security: Security,
+    security: SecurityMode,
     rates: u16,
     basic: u16,
-    auth: Vec<u8>,
-    assoc: Vec<u8>,
-    phase: Phase,
+}
+impl core::ops::Deref for JoinPlan {
+    type Target = ManagementPlan;
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
 }
 fn unicast(address: [u8; 6]) -> bool {
     address != [0; 6] && address[0] & 1 == 0
@@ -60,6 +74,7 @@ fn tlv(bytes: &mut Vec<u8>, id: u16, len: usize) -> usize {
     bytes[offset + 2..offset + 4].copy_from_slice(&(len as u16).to_le_bytes());
     offset
 }
+#[cfg(any(test, feature = "builtin"))]
 fn ies(
     mut bytes: &[u8],
     mut visit: impl FnMut(u8, &[u8]) -> Result<(), Error>,
@@ -73,6 +88,7 @@ fn ies(
     }
     Ok(())
 }
+#[cfg(any(test, feature = "builtin"))]
 fn management(subtype: u8, own: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
     let mut frame = vec![0; 24];
     frame[0] = subtype;
@@ -82,219 +98,55 @@ fn management(subtype: u8, own: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
     frame
 }
 impl JoinPlan {
-    pub fn phase(&self) -> Phase {
-        self.phase
-    }
-    pub fn channel(&self) -> u8 {
-        self.channel
-    }
-    pub fn security(&self) -> Security {
-        self.security
-    }
     pub fn prepare(
         bss: &ScanBss,
         own: [u8; 6],
         ssid: &[u8],
         security: Security,
     ) -> Result<Self, Error> {
-        if !unicast(own)
-            || !unicast(bss.bssid)
-            || own == bss.bssid
-            || !(1..=11).contains(&bss.channel)
-            || ssid.is_empty()
-            || ssid.len() > 32
-            || (!bss.ssid.is_empty() && bss.ssid != ssid)
-            || bss.capability & 3 != 1
-        {
-            return Err(Error::InvalidBss);
-        }
-        let mut rates = 0u16;
-        let mut basic = 0u16;
-        let mut rate_ie = false;
-        let mut rsn = None;
-        let mut wpa = false;
-        let mut seen_ssid = false;
-        ies(&bss.information_elements, |id, body| {
-            match id {
-                0 => {
-                    if seen_ssid || body != bss.ssid {
-                        return Err(Error::InvalidBss);
-                    }
-                    seen_ssid = true;
-                }
-                1 | 50 => {
-                    if body.is_empty() || id == 1 && (rate_ie || body.len() > 8) {
-                        return Err(Error::InvalidBss);
-                    }
-                    rate_ie |= id == 1;
-                    for rate in body {
-                        if let Some(index) = RATES.iter().position(|local| *local == rate & 127) {
-                            rates |= 1 << index;
-                            if rate & 128 != 0 {
-                                basic |= 1 << index;
-                            }
-                        } else if rate & 128 != 0 {
-                            return Err(Error::UnsupportedRates);
-                        }
-                    }
-                }
-                48 => {
-                    if rsn.is_some() {
-                        return Err(Error::InvalidBss);
-                    }
-                    rsn = Some(RsnIe::decode_body(body).ok_or(Error::InvalidBss)?);
-                }
-                221 => wpa |= body.starts_with(&[0, 0x50, 0xf2, 1]),
-                _ => {}
-            }
-            Ok(())
-        })?;
-        if !seen_ssid || !rate_ie || rates & 1 == 0 || basic == 0 {
-            return Err(Error::UnsupportedRates);
-        }
-        let negotiated = match security {
-            Security::Open => {
-                if bss.capability & 0x10 != 0 || rsn.is_some() || wpa {
-                    return Err(Error::UnsupportedSecurity);
-                }
-                None
-            }
-            Security::Wpa2Psk { .. } => {
-                let rsn = rsn.ok_or(Error::UnsupportedSecurity)?;
-                if bss.capability & 0x10 == 0
-                    || rsn.group_cipher != Suite::standard(rsn::CIPHER_CCMP_128)
-                    || !rsn
-                        .pairwise_ciphers
-                        .contains(&Suite::standard(rsn::CIPHER_CCMP_128))
-                    || !rsn.akms.contains(&Suite::standard(rsn::AKM_PSK))
-                    || rsn.rsn_capabilities & (rsn::RSN_CAP_MFP_REQUIRED | rsn::RSN_CAP_NO_PAIRWISE)
-                        != 0
-                {
-                    return Err(Error::UnsupportedSecurity);
-                }
-                Some(RsnIe::wpa2_psk_ccmp().encode_body())
-            }
+        let mode = if security.is_wpa2() {
+            SecurityMode::Wpa2Psk
+        } else {
+            SecurityMode::Open
         };
-        let mut auth = management(0xb0, own, bss.bssid);
-        auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
-        let mut assoc = management(0, own, bss.bssid);
-        // ESS, negotiated privacy, and only AP-supported short preamble/slot.
-        let capability = 1 | (bss.capability & 0x0420) | if security.is_wpa2() { 0x10 } else { 0 };
-        assoc.extend_from_slice(&capability.to_le_bytes());
-        assoc.extend_from_slice(&5u16.to_le_bytes());
-        assoc.extend_from_slice(&[0, ssid.len() as u8]);
-        assoc.extend_from_slice(ssid);
-        let selected: Vec<_> = RATES
-            .iter()
-            .enumerate()
-            .filter_map(|(i, rate)| {
-                (rates & (1 << i) != 0)
-                    .then_some(*rate | if basic & (1 << i) != 0 { 128 } else { 0 })
-            })
-            .collect();
-        let split = selected.len().min(8);
-        assoc.extend_from_slice(&[1, split as u8]);
-        assoc.extend_from_slice(&selected[..split]);
-        if split < selected.len() {
-            assoc.extend_from_slice(&[50, (selected.len() - split) as u8]);
-            assoc.extend_from_slice(&selected[split..]);
-        }
-        if let Some(rsn) = negotiated {
-            assoc.extend_from_slice(&[48, rsn.len() as u8]);
-            assoc.extend_from_slice(&rsn);
-        }
+        let common = ManagementPlan::prepare(bss, own, ssid, mode)?;
+        let (rates, basic) = common.legacy_rates();
         Ok(Self {
-            own,
+            common,
             peer: bss.bssid,
             channel: bss.channel,
-            security,
+            security: mode,
             rates,
             basic,
-            auth,
-            assoc,
-            phase: Phase::Prepared,
         })
     }
+    pub(crate) fn management_rate(&self) -> LegacyRate {
+        LegacyRate::lowest(self.basic)
+    }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
-        if self.phase != Phase::Prepared {
-            return Err(Error::Busy);
-        }
-        self.phase = Phase::AwaitAuthentication;
-        Ok(&self.auth)
+        self.common.start_authentication()
     }
-    fn response(&self, bytes: &[u8], subtype: u8) -> bool {
-        bytes.len() >= 24
-            && bytes[0] == subtype
-            && bytes[1] & 0xc7 == 0
-            && bytes[4..10] == self.own
-            && bytes[10..16] == self.peer
-            && bytes[16..22] == self.peer
-    }
-    /// Ignore other peers/subtypes; a matching rejection is terminal.
     pub fn authentication_response(&mut self, bytes: &[u8]) -> Result<Option<&[u8]>, Error> {
-        if self.phase != Phase::AwaitAuthentication {
-            return Err(Error::Busy);
-        }
-        if !self.response(bytes, 0xb0) {
-            return Ok(None);
-        }
-        if bytes.len() < 30 || bytes[24..28] != [0, 0, 2, 0] {
-            self.phase = Phase::Failed;
-            return Err(Error::Protocol);
-        }
-        let status = u16::from_le_bytes([bytes[28], bytes[29]]);
-        if status != 0 {
-            self.phase = Phase::Failed;
-            return Err(Error::Rejected(status));
-        }
-        self.phase = Phase::AwaitAssociation;
-        Ok(Some(&self.assoc))
+        self.common.authentication_response(bytes)
     }
-    /// Successful association does not authorize a WPA2 controlled port.
     pub fn association_response(&mut self, bytes: &[u8]) -> Result<Option<u16>, Error> {
-        if self.phase != Phase::AwaitAssociation {
-            return Err(Error::Busy);
-        }
-        if !self.response(bytes, 0x10) {
-            return Ok(None);
-        }
-        if bytes.len() < 30 {
-            self.phase = Phase::Failed;
-            return Err(Error::Protocol);
-        }
-        let status = u16::from_le_bytes([bytes[26], bytes[27]]);
-        if status != 0 {
-            self.phase = Phase::Failed;
-            return Err(Error::Rejected(status));
-        }
-        let capability = u16::from_le_bytes([bytes[24], bytes[25]]);
-        if capability & 3 != 1 || (capability & 0x10 != 0) != self.security.is_wpa2() {
-            self.phase = Phase::Failed;
-            return Err(Error::Protocol);
-        }
-        let raw = u16::from_le_bytes([bytes[28], bytes[29]]);
-        let aid = raw & 0x3fff;
-        if raw & 0xc000 != 0xc000
-            || !(1..=2007).contains(&aid)
-            || ies(&bytes[30..], |_, _| Ok(())).is_err()
-        {
-            self.phase = Phase::Failed;
-            return Err(Error::Protocol);
-        }
-        self.phase = Phase::Associated { aid };
-        Ok(Some(aid))
+        self.common.association_response(bytes)
     }
     pub fn cancel(&mut self) {
-        self.phase = Phase::Failed;
+        self.common.cancel();
     }
-
+    pub(crate) fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.common.append_sme_ies(bytes)
+    }
     /// Initial unencrypted AP record: CONN_STATE_CONNECT, never PORT_SECURE.
     /// Native RX remains enabled so later EAPOL processing sees full MPDUs.
     pub fn peer_record(&self, aid: u16, associated: bool) -> Result<Vec<u8>, Error> {
         if aid > 2007 || associated && aid == 0 {
             return Err(Error::Protocol);
         }
-        if self.phase == Phase::Failed || associated && self.phase != (Phase::Associated { aid }) {
+        if self.phase() == Phase::Failed
+            || associated && self.phase() != (Phase::Associated { aid })
+        {
             return Err(Error::Busy);
         }
         if !associated && aid != 0 {
@@ -306,19 +158,25 @@ impl JoinPlan {
         out[4] = 1; // WCID 1, five TLVs, append
         let basic = tlv(&mut out, 0, 20);
         out[basic + 4..basic + 8].copy_from_slice(&0x10002u32.to_le_bytes());
-        out[basic + 8] = 1;
+        out[basic + 8] = if associated && !self.security.is_wpa2() {
+            2
+        } else {
+            1
+        };
         out[basic + 10..basic + 12].copy_from_slice(&aid.to_le_bytes());
         out[basic + 12..basic + 18].copy_from_slice(&self.peer);
         out[basic + 18..basic + 20]
             .copy_from_slice(&(if associated { 1u16 } else { 3 }).to_le_bytes());
         let phy = tlv(&mut out, 0x15, 12);
-        out[phy + 4..phy + 6].copy_from_slice(&self.basic.to_le_bytes());
-        out[phy + 6] = 3; // HR-DSSS | ERP, no HT/VHT/HE
+        let five = super::channel::band(self.channel) == Some(super::channel::Band::Ghz5);
+        let basic_rates = if five { self.basic >> 4 } else { self.basic };
+        out[phy + 4..phy + 6].copy_from_slice(&basic_rates.to_le_bytes());
+        out[phy + 6] = if five { 8 } else { 3 }; // OFDM / HR-DSSS | ERP.
         let ra = tlv(&mut out, 1, 16);
         out[ra + 4..ra + 6]
             .copy_from_slice(&((self.rates & 15) | ((self.rates >> 4) << 6)).to_le_bytes());
         let state = tlv(&mut out, 7, 12);
-        out[state + 8] = if associated { 2 } else { 1 };
+        out[state + 8] = if associated { 2 } else { 1 }; // MLME state, independent of port authorization.
         let wtbl = tlv(&mut out, 13, 12); // outer TLV + eight-byte WTBL request
         out[wtbl + 4] = 1;
         out[wtbl + 5] = 1;
@@ -336,18 +194,15 @@ impl JoinPlan {
         Ok(out)
     }
 
-    pub fn rsn_body(&self) -> Option<Vec<u8>> {
-        if self.security.is_wpa2() {
-            Some(RsnIe::wpa2_psk_ccmp().encode_body())
-        } else {
-            None
-        }
-    }
-
     /// Emits a completed station record for WCID 1 containing CCMP-128
     /// key installation and CONN_STATE_PORT_SECURE.
     pub fn secure_peer_record(&self, aid: u16, key: &[u8]) -> Result<Vec<u8>, Error> {
+        if !self.security.is_wpa2() || key.len() != 16 {
+            return Err(Error::UnsupportedSecurity);
+        }
         let mut out = self.peer_record(aid, true)?;
+        out[16] = 2; // STA_REC_BASIC.CONN_STATE_PORT_SECURE
+        out[64] = 2; // STA_REC_STATE.CONN_STATE_PORT_SECURE
         out[2] += 1; // 6 TLVs
         let sec = tlv(&mut out, 0x12, 44);
         out[sec + 4] = 1; // cmd = SET_KEY
@@ -356,9 +211,139 @@ impl JoinPlan {
         out[sec + 9] = 36; // cipher_len
         out[sec + 10] = 0; // key_id = 0
         out[sec + 11] = 16; // key_len = 16
-        let k = key.len().min(16);
-        out[sec + 12..sec + 12 + k].copy_from_slice(&key[..k]);
+        out[sec + 12..sec + 28].copy_from_slice(key);
         Ok(out)
+    }
+}
+/// The VIF's BMC WCID (19), used for received group keys. Linux uses the
+/// station's AP address for this record, not a fabricated multicast peer.
+pub fn group_record(peer: [u8; 6], aid: u16) -> Result<Vec<u8>, Error> {
+    if !unicast(peer) || !(1..=2007).contains(&aid) {
+        return Err(Error::InvalidBss);
+    }
+    let mut out = vec![0; 8];
+    out[1] = 19;
+    out[2] = 1;
+    out[4] = 1;
+    out[5] = 0xe; // VIF/BMC MUAR, not a peer station's OMAC.
+    let wtbl = tlv(&mut out, 13, 12);
+    out[wtbl + 4..wtbl + 8].copy_from_slice(&[19, 1, 3, 0]);
+    let generic = tlv(&mut out, 0, 20);
+    out[generic + 4..generic + 10].copy_from_slice(&peer);
+    out[generic + 10] = 0xe;
+    let rx = tlv(&mut out, 1, 12);
+    out[rx + 5..rx + 8].fill(1);
+    let trans = tlv(&mut out, 6, 8);
+    out[trans + 4..trans + 7].copy_from_slice(&[1, 0, 1]);
+    out[wtbl + 2..wtbl + 4].copy_from_slice(&52u16.to_le_bytes());
+    Ok(out)
+}
+
+/// Install/remove one CCMP-128 key without replaying the peer/WTBL state.
+/// WCID 1 is pairwise key zero; WCID 19 holds the VIF's indexed GTKs.
+pub fn key_record(wcid: u8, key_id: u8, key: Option<&[u8]>) -> Result<Vec<u8>, Error> {
+    if !matches!(wcid, 1 | 19)
+        || key_id > 3
+        || wcid == 1 && key_id != 0
+        || key.is_some_and(|key| key.len() != 16)
+    {
+        return Err(Error::UnsupportedSecurity);
+    }
+    let mut out = vec![0; 8];
+    out[1] = wcid;
+    out[2] = 1;
+    out[4] = 1;
+    out[5] = if wcid == 19 { 0xe } else { 0 };
+    let sec = tlv(&mut out, 0x12, if key.is_some() { 44 } else { 8 });
+    if let Some(key) = key {
+        out[sec + 4] = 1;
+        out[sec + 5] = 1;
+        out[sec + 8..sec + 12].copy_from_slice(&[6, 36, key_id, 16]);
+        out[sec + 12..sec + 28].copy_from_slice(key);
+    }
+    Ok(out)
+}
+
+/// Update the active single legacy BSS from the negotiated scan identity.
+pub fn bss_record(bss: &ScanBss, connected: bool) -> Result<Vec<u8>, Error> {
+    if !unicast(bss.bssid)
+        || super::channel::band(bss.channel).is_none()
+        || bss.beacon_interval == 0
+    {
+        return Err(Error::InvalidBss);
+    }
+    let mut out = vec![0; 36];
+    out[6..8].copy_from_slice(&32u16.to_le_bytes());
+    out[8] = 1; // Keep the station BSS active when disconnected.
+    out[12..16].copy_from_slice(&0x10001u32.to_le_bytes());
+    out[16] = u8::from(!connected);
+    out[18..24].copy_from_slice(&bss.bssid);
+    out[24..26].copy_from_slice(&19u16.to_le_bytes());
+    out[26..28].copy_from_slice(&bss.beacon_interval.to_le_bytes());
+    let five = super::channel::band(bss.channel) == Some(super::channel::Band::Ghz5);
+    out[29] = if five { 1 } else { 6 }; // PHY_MODE_A / PHY_MODE_B | PHY_MODE_G.
+    out[30..32].copy_from_slice(&19u16.to_le_bytes());
+    out[32..34].copy_from_slice(&(if five { 8u16 } else { 3 }).to_le_bytes());
+    Ok(out)
+}
+
+/// A 20 MHz station transmission authorized by the installed host policy.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TxPermission {
+    pub country: [u8; 2],
+    pub power_dbm: i8,
+    channel: u8,
+}
+
+impl TxPermission {
+    pub fn from_domain(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> Option<Self> {
+        use narf_wireless::reg::RegFlags;
+        if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+            return None;
+        }
+        let center = super::channel::frequency(channel)?;
+        let power_dbm = domain
+            .rules
+            .iter()
+            .filter(|rule| {
+                rule.freq_start_mhz <= center - 10
+                    && center + 10 <= rule.freq_end_mhz
+                    && rule.max_bandwidth_mhz >= 20
+                    && !rule.flags.contains(RegFlags::DFS)
+            })
+            .map(|rule| rule.max_power_dbm)
+            .min()?;
+        // Signed half-dBm table entries must be representable. This profile
+        // transmits on one chain, so no multi-stream EIRP addition is needed.
+        if !(-64..=63).contains(&power_dbm) {
+            return None;
+        }
+        Some(Self {
+            country: domain.country_code,
+            power_dbm,
+            channel,
+        })
+    }
+
+    pub fn permits(self, channel: u8) -> bool {
+        self.channel == channel
+    }
+
+    pub fn rate_limits(self) -> Vec<u8> {
+        let channel = self.channel;
+        // Linux mt76_connac_tx_power_limit_tlv (44 bytes), followed by one
+        // channel + 161 signed half-dBm rate limits. Firmware's calibration
+        // and CLC limits still constrain this additional host ceiling.
+        let mut bytes = vec![0; 44 + 162];
+        bytes[4..7].copy_from_slice(&[
+            1,
+            super::channel::band(channel).map_or(0, |band| band.scan_tag()),
+            1,
+        ]); // n_chan, band, last_msg
+        bytes[8..10].copy_from_slice(&self.country);
+        bytes[44] = channel;
+        bytes[45..].fill(self.power_dbm.saturating_mul(2) as u8);
+        bytes
     }
 }
 
@@ -370,11 +355,22 @@ pub fn disconnect_record(peer: [u8; 6]) -> Vec<u8> {
     out[4] = 1; // WCID 1
     let basic = tlv(&mut out, 0, 20);
     out[basic + 4..basic + 8].copy_from_slice(&0x10002u32.to_le_bytes());
-    out[basic + 8] = 1;
+    out[basic + 8] = 0;
     out[basic + 12..basic + 18].copy_from_slice(&peer);
-    out[basic + 18..basic + 20].copy_from_slice(&3u16.to_le_bytes());
-    let state = tlv(&mut out, 7, 12);
-    out[state + 8] = 0; // CONN_STATE_DISCONNECT
+    out[basic + 18..basic + 20].copy_from_slice(&1u16.to_le_bytes());
+    let wtbl = tlv(&mut out, 13, 12);
+    out[wtbl + 4..wtbl + 6].copy_from_slice(&[1, 1]); // RESET_AND_SET, no nested TLVs.
+    out
+}
+
+pub fn group_disconnect_record() -> Vec<u8> {
+    let mut out = vec![0; 8];
+    out[1] = 19;
+    out[2] = 1;
+    out[4] = 1;
+    out[5] = 0xe;
+    let wtbl = tlv(&mut out, 13, 12);
+    out[wtbl + 4..wtbl + 6].copy_from_slice(&[19, 1]);
     out
 }
 

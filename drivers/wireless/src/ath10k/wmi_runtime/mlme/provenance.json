@@ -1,0 +1,180 @@
+{
+  "linux_tree": "/usr/src/linux-7.3-rc4",
+  "linux_makefile": [
+    "# SPDX-License-Identifier: GPL-2.0",
+    "VERSION = 7",
+    "PATCHLEVEL = 3",
+    "SUBLEVEL = 0",
+    "EXTRAVERSION = -rc4",
+    "NAME = Baby Opossum Posse"
+  ],
+  "source_sha256": {
+    "wmi.h": "fff0e5749d68c461ed08e69060321942d68bdb050954c39b2a57c0045457106c",
+    "wmi-tlv.h": "4e399314c47c93552159a948873cb22166ab38649e6560d7fa55d21b363f1fbc",
+    "wmi.c": "68a4fedc3d0cd815c209dda9c0eb3aa3869bd3d35847c633e0c458ba53c320f4",
+    "wmi-tlv.c": "02309cad56513a1ef0975c9d73e568e343c874d35124f39111ddd26d8a75c5bb"
+  },
+  "oracle_c_sha256": "b46bec1bda7a439cb651f05a3d391db723525b5d512323621f63c46ade9a5e18",
+  "fixtures": {
+    "AUTH_MAIN": {
+      "length": 60,
+      "sha256": "fadc13bc2665700aa08947aec95228b7a74dda261e739f99e8b406e323cb975c"
+    },
+    "AUTH_10X": {
+      "length": 60,
+      "sha256": "3414078af736e63a00a619f212701a0c8d71f5e1f4fc2d58b72cb013d3a0ea43"
+    },
+    "AUTH_102": {
+      "length": 60,
+      "sha256": "4776c6845dff330cbc9402ffb31725ea4675cbc16e2e755690163ea68a0abf9f"
+    },
+    "AUTH_104": {
+      "length": 60,
+      "sha256": "f073944e61280c9fb12f5a12ef23b13436254cef74e871135b220766603ae828"
+    },
+    "AUTH_TLV": {
+      "length": 72,
+      "sha256": "5da21b3f4b26139ad7b03e0ef997f256cfac4c23f4495acb3262a4b5da9c6a8f"
+    },
+    "AIR_OPEN_MAIN": {
+      "length": 80,
+      "sha256": "fc5ea3b62a9b6f9e3f16d35eb4caafb4ba08656ae2499b489d992280f5b57516"
+    },
+    "AIR_OPEN_10X": {
+      "length": 80,
+      "sha256": "8ea150970a566d356cfed65b2cef412408f43af2d4a899be75326adc1cf43974"
+    },
+    "AIR_OPEN_102": {
+      "length": 80,
+      "sha256": "9709c6a95c68b356f73f14b5250f4d8a472b3206ced337fe13c428ae92bf010d"
+    },
+    "AIR_OPEN_104": {
+      "length": 80,
+      "sha256": "03016aae2740a71ce16a40e94f118a4f78e6723e6a2aae9dcf22207e4d98829a"
+    },
+    "AIR_OPEN_TLV": {
+      "length": 92,
+      "sha256": "882ee15a09ba44af4df328aaa07202d33ac8bca46602e31de5e28a4c22932d6a"
+    },
+    "OPEN_MAIN": {
+      "length": 360,
+      "sha256": "40c3b06ad3a676fe58136990f70838d419ec915876fd45a1b764a50021086cda"
+    },
+    "OPEN_10X": {
+      "length": 352,
+      "sha256": "652c3d20ba71813a0ce92c8cab71ec8d8fef8932c874b91032e77cfc21330578"
+    },
+    "OPEN_102": {
+      "length": 356,
+      "sha256": "da7e89001d6d1e60f200dfb111ae40abbc3e5bb0e4be2f47740b4b7ce3117e57"
+    },
+    "OPEN_104": {
+      "length": 360,
+      "sha256": "c83a9dc391e900fe51d75907d7ec6d70f20950fc43f128dc899eae169ed19a92"
+    },
+    "OPEN_TLV": {
+      "length": 124,
+      "sha256": "a497b2a765c69fc988f37de998a782768fda42686131f964e216ee72ac79cd85"
+    },
+    "AIR_SEC_MAIN": {
+      "length": 100,
+      "sha256": "e116ee00535349bfbc8be7099de1f190803edfcd90a70e27ebdedfa2ac8727aa"
+    },
+    "AIR_SEC_10X": {
+      "length": 100,
+      "sha256": "2f2ef4b0d9b7b835d0b1549cf68835182d1d3d9472fa5e661be4cd485dad5294"
+    },
+    "AIR_SEC_102": {
+      "length": 100,
+      "sha256": "2e625dc23d6f4576ed118e4c7c3d87b0399cbcc5b31018a661238cb8282f5b51"
+    },
+    "AIR_SEC_104": {
+      "length": 100,
+      "sha256": "0513e48f816a14a62646538dcb98938b6091c8840e403f328799508d4f2b4a31"
+    },
+    "AIR_SEC_TLV": {
+      "length": 104,
+      "sha256": "ecb73d827f5640e99818590c932a7e53aef510f091ef0fd0baef11a2e4eda55b"
+    },
+    "SEC_MAIN": {
+      "length": 360,
+      "sha256": "829e1b4978651915bcca579a52b46af13671881cfbc6143c5f76c6e94548b357"
+    },
+    "SEC_10X": {
+      "length": 352,
+      "sha256": "a8c5307e18c9cfab8342fb010d72ef9812ea44c586f84780c906ea1639995d26"
+    },
+    "SEC_102": {
+      "length": 356,
+      "sha256": "093bcb37de5057ed9ee3bad6ceb6cb3e9cf355ff9a60f104e693b73e5db15d51"
+    },
+    "SEC_104": {
+      "length": 360,
+      "sha256": "5a7ac4d8bd2db625c5d39b1e824f25c746e63eafe0ec8fed3afde3e1f1a3491e"
+    },
+    "SEC_TLV": {
+      "length": 124,
+      "sha256": "1c0c2648ebe5d1f5d35da532cb21889e255feec3a37147432e201209e81fadf4"
+    },
+    "UP_MAIN": {
+      "length": 20,
+      "sha256": "f2d64079cfcc88308fbaa839b5b2f148e7f8caf186b1c6bfccf0673e26f8efae"
+    },
+    "UP_10X": {
+      "length": 20,
+      "sha256": "ed0e706815d8c65b84154c23199feb90efb2e6dea27696589bcaab77f22862fc"
+    },
+    "UP_102": {
+      "length": 20,
+      "sha256": "bb66f4d4419db91a1eec1c42871f1d33b8d3dd33834caa83bf7e99b6917fb0a2"
+    },
+    "UP_104": {
+      "length": 20,
+      "sha256": "dd904457da99fec26204953b326d6c4f57437b75b440bdda740b1bcd9fe88e03"
+    },
+    "UP_TLV": {
+      "length": 24,
+      "sha256": "3f2d02c2e6da85fae2e4a572a4c6d09b28524f9d808dde007e3dd87b2efff36b"
+    },
+    "B_MAIN": {
+      "length": 360,
+      "sha256": "da13bcad7e9fb0be596f80ec7e9ae4538a12fc1df05b4fdcc9f36b39a172f4f3"
+    },
+    "B_10X": {
+      "length": 352,
+      "sha256": "09bb991306067c930becf32ed0ca4ac41af789dd54e522eced9ae6997dea2d6f"
+    },
+    "B_102": {
+      "length": 356,
+      "sha256": "3ac3146a246518010dd9064e3bcdd9af5a79f472bc15427f4d35b4ca8acedcb0"
+    },
+    "B_104": {
+      "length": 360,
+      "sha256": "f974f1142aac51916bae1005aada75561d9f442a292de98f1cfe9e023bd46b04"
+    },
+    "B_TLV": {
+      "length": 116,
+      "sha256": "ff67d808ddc17995e873ca43d82cb0ef2a757afeeb581dc17405fdefe83f8cab"
+    },
+    "OFDM_MAIN": {
+      "length": 360,
+      "sha256": "3a35e589d0bad676e64342072539e698b2b3eef9c41c1ab21a88c454ad643ea2"
+    },
+    "OFDM_10X": {
+      "length": 352,
+      "sha256": "3fce077c0c1160c43c6a53edc2b0072d485d1daad67f5691a6b6e19c9f17a71e"
+    },
+    "OFDM_102": {
+      "length": 356,
+      "sha256": "d73342b2763a507481fc59efd5db62470d0a615b3afb73c91bd52d482fb3e0b7"
+    },
+    "OFDM_104": {
+      "length": 360,
+      "sha256": "28700b5f173e4421dbc63f2f2fcf3779cc8bde4f05f053d99a61bfd1be8b64d4"
+    },
+    "OFDM_TLV": {
+      "length": 116,
+      "sha256": "3628784fa7b6405791f35e1bb8f8bd8f02e40f02d1030b67dba248ec4971a569"
+    }
+  }
+}

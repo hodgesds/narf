@@ -9,7 +9,7 @@
 //!
 //! ## Lifetime
 //!
-//! A `USBDevice` is cheap (16 bytes: an `Arc<Xhci>` plus a `slot_id`).
+//! A `USBDevice` is a cheap handle with a retained controller and slot generation.
 //! Clones share the same controller handle and slot. Drop does NOT
 //! tear down the slot — slot lifetime is owned by the supervisor /
 //! hub teardown logic. A class driver hands its `USBDevice` back via
@@ -19,6 +19,8 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+pub use crate::xhci::BulkToken;
 
 use crate::xhci::{self, EndpointConfig, EndpointKind, PortSpeed, Xhci, XhciError};
 
@@ -89,6 +91,7 @@ impl UsbError {
 pub struct USBDevice {
     controller: Arc<Xhci>,
     slot_id: u8,
+    generation: u64,
     port: u8,
     speed: PortSpeed,
     /// Cached vendor ID from the 18-byte Device Descriptor (low 16
@@ -115,9 +118,11 @@ impl USBDevice {
     /// drivers should call [`USBDevice::attach`] which fetches and
     /// caches the device descriptor.
     pub fn new(controller: Arc<Xhci>, slot_id: u8, port: u8, speed: PortSpeed) -> Self {
+        let generation = controller.device_generation(slot_id).unwrap_or(0);
         Self {
             controller,
             slot_id,
+            generation,
             port,
             speed,
             vendor_id: 0,
@@ -134,15 +139,22 @@ impl USBDevice {
         port: u8,
         speed: PortSpeed,
     ) -> Result<Self, UsbError> {
+        let generation = controller
+            .device_generation(slot_id)
+            .ok_or(UsbError::StaleSlot)?;
         let desc = controller
             .get_device_descriptor(slot_id)
             .await
             .map_err(UsbError::from_xhci)?;
+        if controller.device_generation(slot_id) != Some(generation) {
+            return Err(UsbError::StaleSlot);
+        }
         let vendor_id = u16::from_le_bytes([desc[8], desc[9]]);
         let product_id = u16::from_le_bytes([desc[10], desc[11]]);
         Ok(Self {
             controller,
             slot_id,
+            generation,
             port,
             speed,
             vendor_id,
@@ -205,8 +217,9 @@ impl USBDevice {
         out: &mut [u8],
     ) -> Result<usize, UsbError> {
         self.controller
-            .control_in(
+            .control_in_generation(
                 self.slot_id,
+                self.generation,
                 bm_request_type,
                 b_request,
                 w_value,
@@ -229,8 +242,9 @@ impl USBDevice {
         data: &[u8],
     ) -> Result<usize, UsbError> {
         self.controller
-            .control_out(
+            .control_out_generation(
                 self.slot_id,
+                self.generation,
                 bm_request_type,
                 b_request,
                 w_value,
@@ -241,19 +255,73 @@ impl USBDevice {
             .map_err(UsbError::from_xhci)
     }
 
-    /// Bulk-OUT transfer. `dci` is the Device Context Index of the
-    /// endpoint (2 × ep_num for OUT, 2 × ep_num + 1 for IN).
-    pub async fn bulk_out(&self, dci: u8, data: &[u8]) -> Result<usize, UsbError> {
+    fn validate_bulk_token(&self, token: &BulkToken) -> Result<(), UsbError> {
+        if token.slot() != self.slot_id || token.generation() != self.generation {
+            return Err(UsbError::StaleSlot);
+        }
+        Ok(())
+    }
+
+    /// Begin a persistent receive. `dci` is 2 * endpoint_number + 1.
+    /// Poll the receipt until terminal completion; dropping it preserves
+    /// endpoint DMA ownership and prevents another transfer on that page.
+    pub fn begin_bulk_in(&self, dci: u8, length: usize) -> Result<BulkToken, UsbError> {
         self.controller
-            .bulk_out(self.slot_id, dci, data)
+            .begin_bulk_in(self.slot_id, dci, self.generation, length)
+            .map_err(UsbError::from_xhci)
+    }
+
+    /// Stage and submit a transmit. USB completion does not imply a radio ACK.
+    pub fn begin_bulk_out(&self, dci: u8, data: &[u8]) -> Result<BulkToken, UsbError> {
+        self.controller
+            .begin_bulk_out(self.slot_id, dci, self.generation, data)
+            .map_err(UsbError::from_xhci)
+    }
+
+    pub fn poll_bulk_in(
+        &self,
+        token: &BulkToken,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, UsbError> {
+        self.validate_bulk_token(token)?;
+        self.controller
+            .poll_bulk_in(token, out)
+            .map_err(UsbError::from_xhci)
+    }
+
+    pub fn poll_bulk_out(&self, token: &BulkToken) -> Result<Option<usize>, UsbError> {
+        self.validate_bulk_token(token)?;
+        self.controller
+            .poll_bulk_out(token)
+            .map_err(UsbError::from_xhci)
+    }
+
+    /// Stop/drain one retained bulk receipt before discarding or reusing its
+    /// page/ring. Any error or dropped future leaves the claim terminally busy.
+    pub async fn stop_bulk(&self, token: &BulkToken) -> Result<(), UsbError> {
+        self.validate_bulk_token(token)?;
+        self.controller
+            .stop_bulk(token)
             .await
             .map_err(UsbError::from_xhci)
     }
 
-    /// Bulk-IN transfer.
-    pub async fn bulk_in(&self, dci: u8, out: &mut [u8]) -> Result<usize, UsbError> {
+    /// Compatibility bulk-OUT wait. Timeout/error leaves the endpoint busy;
+    /// caller buffers may be released because the host owns the staged copy.
+    pub async fn bulk_out(&self, dci: u8, data: &[u8]) -> Result<usize, UsbError> {
+        let token = self.begin_bulk_out(dci, data)?;
         self.controller
-            .bulk_in(self.slot_id, dci, out)
+            .wait_bulk_out(&token)
+            .await
+            .map_err(UsbError::from_xhci)
+    }
+
+    /// Compatibility bounded receive wait. Persistent idle receivers should
+    /// use begin_bulk_in + poll_bulk_in to keep the same TD posted.
+    pub async fn bulk_in(&self, dci: u8, out: &mut [u8]) -> Result<usize, UsbError> {
+        let token = self.begin_bulk_in(dci, out.len())?;
+        self.controller
+            .wait_bulk_in(&token, out)
             .await
             .map_err(UsbError::from_xhci)
     }
@@ -280,7 +348,7 @@ impl USBDevice {
     /// Configure Endpoint command.
     pub async fn configure_endpoints(&self, eps: &[EndpointConfig]) -> Result<(), UsbError> {
         self.controller
-            .configure_endpoints(self.slot_id, eps)
+            .configure_endpoints_generation(self.slot_id, self.generation, eps)
             .await
             .map_err(UsbError::from_xhci)
     }
@@ -288,7 +356,7 @@ impl USBDevice {
     /// Read the 18-byte Device Descriptor.
     pub async fn get_device_descriptor(&self) -> Result<[u8; 18], UsbError> {
         self.controller
-            .get_device_descriptor(self.slot_id)
+            .get_device_descriptor_generation(self.slot_id, self.generation)
             .await
             .map_err(UsbError::from_xhci)
     }
@@ -303,7 +371,7 @@ impl USBDevice {
         out: &mut [u8],
     ) -> Result<usize, UsbError> {
         self.controller
-            .get_config_descriptor(self.slot_id, cfg_idx, out)
+            .get_config_descriptor_generation(self.slot_id, self.generation, cfg_idx, out)
             .await
             .map_err(UsbError::from_xhci)
     }

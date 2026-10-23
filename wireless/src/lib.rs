@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 use narf_net::Interface;
 
+pub mod association;
 pub mod caps;
 pub mod ccmp;
 pub mod eapol;
@@ -2442,6 +2443,7 @@ mod tests {
         let mut hdr = [0u8; 24];
         hdr[0] = 0x08; // Type=Data subtype 0
         hdr[1] = 0x38; // Retry|PwrMgmt|MoreData all set
+        hdr[4..22].copy_from_slice(&[0x12; 18]);
         hdr[2] = 0xFF; // Duration low
         hdr[3] = 0xFF;
         hdr[22] = 0x73; // SeqCtrl: FragNum=3 (low 4 bits), SeqNum bits should mute.
@@ -2453,8 +2455,10 @@ mod tests {
         if aad[1] & 0x38 != 0 {
             return TestResult::Fail("Retry/PwrMgmt/MoreData must be zeroed in AAD");
         }
-        if aad[2] != 0 || aad[3] != 0 {
-            return TestResult::Fail("Duration must be zero in AAD");
+        if aad[..2] != [0x08, 0x40] || aad[2..20] != [0x12; 18] {
+            return TestResult::Fail(
+                "FC masks or excluded Duration changed authenticated addresses",
+            );
         }
         if aad[20] & 0xF0 != 0 || aad[20] != 0x03 {
             return TestResult::Fail("SeqCtrl FragNum should be preserved, SeqNum muted");

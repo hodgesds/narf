@@ -701,7 +701,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         ))
     }
 
-    /// Opaque net-stack dispatch identity.  WCN6855 has at most three vdevs,
+    /// Opaque net-stack dispatch identity. NARF currently admits four vdevs,
     /// leaving the low two bits for the slot under the physical radio id.
     fn dispatch_cookie(&self) -> u64 {
         (self.shared.radio_id << 2) | u64::from(self.vdev_id)
@@ -2311,6 +2311,37 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Interface for Ath11kNetdev<Io, Irq, Q> {
     }
 }
 
+/// Combination descriptor used by production PCI registration. Callers must
+/// separately own a virtual-interface lifecycle before advertising it; the
+/// generic single-interface constructor intentionally does not provide one.
+pub(super) fn supported_interface_combinations() -> Vec<narf_wireless::InterfaceCombination> {
+    // Linux `ath11k_mac_setup_iface_combinations`: QCA6390/WCN6855
+    // request four vdevs, including at most two station vdevs on two
+    // channels. AP/GO beaconing shares the infrastructure beacon interval.
+    alloc::vec![narf_wireless::InterfaceCombination {
+        limits: alloc::vec![
+            narf_wireless::InterfaceTypeLimit {
+                max: 2,
+                iftypes: alloc::vec![2], // NL80211_IFTYPE_STATION
+            },
+            narf_wireless::InterfaceTypeLimit {
+                max: super::runtime::WCN6855_MAX_VDEVS as u32,
+                iftypes: alloc::vec![3, 8, 9], // AP, P2P client, P2P GO
+            },
+            narf_wireless::InterfaceTypeLimit {
+                max: 1,
+                iftypes: alloc::vec![10], // P2P device
+            },
+        ],
+        max_interfaces: super::runtime::WCN6855_MAX_VDEVS as u32,
+        max_channels: 2,
+        sta_ap_beacon_interval_match: true,
+        beacon_interval_min_gcd: Some(100),
+        // NL80211_CHAN_WIDTH_{20_NOHT,20,40,80,80P80,160}.
+        radar_detect_widths: Some((1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5)),
+    }]
+}
+
 #[async_trait]
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, Q> {
     fn wiphy_id(&self) -> u64 {
@@ -2325,34 +2356,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
         if self.virtual_lifecycle.is_none() {
             return Vec::new();
         }
-        // `ath11k_mac_setup_iface_combinations`, reduced to WCN6855's
-        // actual three firmware vdev slots. WCN6855 advertises two station
-        // vdevs on up to two channels; AP/GO beaconing shares the
-        // infrastructure beacon interval.
-        alloc::vec![narf_wireless::InterfaceCombination {
-            limits: alloc::vec![
-                narf_wireless::InterfaceTypeLimit {
-                    max: 2,
-                    iftypes: alloc::vec![2], // NL80211_IFTYPE_STATION
-                },
-                narf_wireless::InterfaceTypeLimit {
-                    max: 3,
-                    iftypes: alloc::vec![3, 8, 9], // AP, P2P client, P2P GO
-                },
-                narf_wireless::InterfaceTypeLimit {
-                    max: 1,
-                    iftypes: alloc::vec![10], // P2P device
-                },
-            ],
-            max_interfaces: super::runtime::WCN6855_MAX_VDEVS as u32,
-            max_channels: 2,
-            sta_ap_beacon_interval_match: true,
-            beacon_interval_min_gcd: Some(100),
-            // NL80211_CHAN_WIDTH_{20_NOHT,20,40,80,80P80,160}.
-            radar_detect_widths: Some(
-                (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5)
-            ),
-        }]
+        supported_interface_combinations()
     }
 
     fn wiphy_mac_addresses(&self) -> Vec<[u8; 6]> {

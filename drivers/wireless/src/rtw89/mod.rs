@@ -13,21 +13,18 @@
 //! ## Scope (this commit set)
 //!
 //! 1. PCI device match via the existing `bus::driver_match` table.
-//! 2. **BAR2** MMIO mapping (rtw89 uses BAR2 — distinct from rtw88's
-//!    BAR0+BAR2 split). Linux `pci.c:rtw89_pci_claim_device` walks
+//! 2. **BAR2** Device MMIO mapping (both rtw88 and rtw89 use BAR2). Linux `pci.c:rtw89_pci_claim_device` walks
 //!    `bar_id = 2` directly.
-//! 3. Baseline `rtw89_mac_pwr_on`-style power-on prologue. The
-//!    full per-chip PWR-seq table is out of scope; we run the
-//!    chip-agnostic minimum.
+//! 3. Diagnostic baseline power prologue; complete AX power-on/off and
+//!    DLE/HFC primitives await the composed boot owner.
 //! 4. Chip-ID detection from `R_AX_SYS_CFG1` so subsequent stages can
 //!    branch on the AX (8852A/B/C, 8851B) vs BE (8922A) generation.
 //! 5. EFUSE read for MAC + the 6-byte address copy. Logical map
 //!    offsets follow the per-chip layout in
 //!    `rtw89/rtw8852a.h::rtw8852ae_efuse`.
-//! 6. `narf-net::iface::register` stub for `wlan0` — `send_frame`
-//!    returns `Err(())` because TX rings + firmware aren't wired yet.
-//! 7. Firmware-download stub (`fw.rs`) + PHY parameter table stub
-//!    (`phy.rs`) so the follow-up can fill them in without churn.
+//! 6. Retained unpublished ring storage, without a registered NIC or IRQ.
+//! 7. Checked immutable secure firmware plans and native CH12 ownership,
+//!    still inactive pending full PCIe/BDRAM/WCPU composition and RF/MLME.
 //!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later as of
 //! 2026-05-20 per the root `LICENSE`)
@@ -59,9 +56,17 @@ extern crate alloc;
 
 pub mod btc;
 pub mod chan;
+mod command_native;
+mod command_queue;
 pub mod datapath;
+mod ddv;
 pub mod dma;
+mod download_plan;
 pub mod efuse;
+mod fifo;
+mod fifo_regs;
+mod firmware_boot;
+mod firmware_registry;
 pub mod fw;
 pub mod fwdl;
 pub mod h2c;
@@ -69,8 +74,31 @@ pub mod mac;
 pub mod mac_init;
 pub mod pci;
 pub mod phy;
+mod phy_access;
 pub mod phy_table;
+mod power;
+mod power_native;
+mod power_regs;
+mod power_tables;
+mod prepared;
+mod secure;
+pub mod tx_transport;
 pub mod txrx;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tx_transport_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod fwdl_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod power_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod ddv_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod pci_authority_tests;
 
 pub use mac::{ChipGeneration, ChipId, MacError};
 pub use pci::{name_for, probe, register_pci_driver, Rtw89Device};
@@ -87,7 +115,8 @@ pub const RTL_DEV_8852AE: u16 = 0x8852;
 pub const RTL_DEV_8852AE_VT: u16 = 0xA85A;
 /// RTL8852BE — Wi-Fi 6 2x2. `rtw89/rtw8852be.c`.
 pub const RTL_DEV_8852BE: u16 = 0xB852;
-/// RTL8852BE alt subsystem (BT-coex bundle). `rtw89/rtw8852be.c`.
+/// RTL8852BE alternate PCI ID with the same B-chip profile. Linux's
+/// distinct RTL8852BT ID is0xb520 and is not claimed here.
 pub const RTL_DEV_8852BE_ALT: u16 = 0xB85B;
 /// RTL8852CE — Wi-Fi 6E 2x2. `rtw89/rtw8852ce.c`.
 pub const RTL_DEV_8852CE: u16 = 0xC852;
@@ -117,6 +146,9 @@ pub const ALL_DEV_IDS: &[u16] = &[
 pub fn register() {
     register_pci_driver();
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod efuse_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;

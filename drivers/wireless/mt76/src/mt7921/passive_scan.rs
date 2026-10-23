@@ -2,17 +2,7 @@
 //! mt76_connac_mcu.{c,h}, mt7921/{mac,mcu}.c and mt792x.h.
 use super::{station::Command, *};
 
-/// One validated beacon/probe response, retaining original IEs for the SME.
-#[derive(Clone, Debug)]
-pub struct ScanBss {
-    pub bssid: [u8; 6],
-    pub ssid: Vec<u8>,
-    pub channel: u8,
-    pub signal_dbm: Option<i8>,
-    pub capability: u16,
-    pub beacon_interval: u16,
-    pub information_elements: Vec<u8>,
-}
+pub use narf_wireless::association::Bss as ScanBss;
 /// A completed hardware scan; an empty result is not a fabricated network.
 #[derive(Clone, Debug)]
 pub struct ScanReport {
@@ -30,6 +20,30 @@ fn word(bytes: &[u8], offset: usize) -> Option<u32> {
 
 /// Extract the validated 802.11 MPDU slice from a CONNAC2 normal RX packet.
 pub fn rx_frame(packet: &[u8]) -> Option<&[u8]> {
+    let native = rx_native(packet)?;
+    native.ccmp.is_none().then_some(native.frame)
+}
+
+pub(super) fn rx_on_channel(packet: &[u8], channel: u8) -> Option<&[u8]> {
+    let native = rx_native(packet)?;
+    (native.channel == channel && native.ccmp.is_none()).then_some(native.frame)
+}
+
+/// Hardware-stripped CCMP metadata. PN bytes in RX group 1 are little
+/// endian, as in Linux mt7921_mac_fill_rx; the key index is in RXD1.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CcmpRx {
+    pub pn: u64,
+    pub key_id: u8,
+}
+
+pub(super) struct NativeRx<'a> {
+    pub frame: &'a [u8],
+    pub ccmp: Option<CcmpRx>,
+    pub channel: u8,
+}
+
+pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
     let r0 = word(packet, 0)?;
     let len = (r0 & 0xffff) as usize;
     let normal = r0 >> 27 == 2 || r0 >> 27 == 7 && (r0 >> 16) & 15 == 1;
@@ -39,17 +53,28 @@ pub fn rx_frame(packet: &[u8]) -> Option<&[u8]> {
     let packet = &packet[..len];
     let r1 = word(packet, 4)?;
     let r2 = word(packet, 8)?;
+    let frequency = (word(packet, 12)? >> 8) & 0x1ff;
+    let channel = u8::try_from(frequency).ok()?;
+    super::super::channel::band(channel)?;
     let r4 = word(packet, 16)?;
-    if r1 & ((0x1f << 16) | (0x3f << 23)) != 0
+    let cipher = (r1 >> 16) & 0x1f;
+    if !matches!(cipher, 0 | 4) // MT_CIPHER_NONE / MT_CIPHER_AES_CCMP
+        || r1 & (0x3f << 23) != 0
         || r2 & ((1 << 13) | (7 << 23) | (1 << 27)) != 0
         || r4 & 3 != 0
     {
         return None;
     }
     let mut offset = 24usize;
+    let mut pn = None;
     for (flag, size) in [(14, 16), (11, 16), (12, 8)] {
         if r1 & (1 << flag) != 0 {
-            packet.get(offset..offset + size)?;
+            let group = packet.get(offset..offset + size)?;
+            if flag == 11 {
+                let mut bytes = [0u8; 8];
+                bytes[..6].copy_from_slice(&group[..6]);
+                pn = Some(u64::from_le_bytes(bytes));
+            }
             offset += size;
         }
     }
@@ -64,7 +89,18 @@ pub fn rx_frame(packet: &[u8]) -> Option<&[u8]> {
         return None;
     }
     offset += 2 * ((r2 >> 14) & 3) as usize;
-    packet.get(offset..)
+    Some(NativeRx {
+        frame: packet.get(offset..)?,
+        channel,
+        ccmp: if cipher == 4 {
+            Some(CcmpRx {
+                pn: pn?,
+                key_id: ((r1 >> 21) & 3) as u8,
+            })
+        } else {
+            None
+        },
+    })
 }
 
 // Parse only native management RX here. Translated/aggregated/protected data
@@ -76,8 +112,9 @@ pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
     let packet = &packet[..len];
     let r1 = word(packet, 4)?;
     let r3 = word(packet, 12)?;
-    let channel = ((r3 >> 8) & 255) as u8;
-    if !(1..=11).contains(&channel) {
+    let frequency = (r3 >> 8) & 0x1ff;
+    let channel = frequency as u8;
+    if frequency & 0x100 != 0 || super::super::channel::band(channel).is_none() {
         return None;
     }
     let mut offset = 24usize;
@@ -158,8 +195,10 @@ pub(super) fn scan_request(sequence: u8, channels: &[u8]) -> Result<Vec<u8>, Err
     if sequence == 0
         || sequence > 127
         || channels.is_empty()
-        || channels.len() > 11
-        || channels.iter().any(|ch| !(1..=11).contains(ch))
+        || channels.len() > 64
+        || channels
+            .iter()
+            .any(|ch| super::super::channel::band(*ch).is_none())
         || channels
             .iter()
             .enumerate()
@@ -175,10 +214,18 @@ pub(super) fn scan_request(sequence: u8, channels: &[u8]) -> Result<Vec<u8>, Err
     body[6] = 1 << 5; // CONNAC2 split scan.
     body[7] = 1;
     body[158] = 4;
-    body[159] = channels.len() as u8;
+    body[159] = channels.len().min(32) as u8;
+    body[826] = channels.len().saturating_sub(32) as u8;
     for (i, channel) in channels.iter().enumerate() {
-        body[160 + 2 * i] = 1;
-        body[161 + 2 * i] = *channel;
+        let offset = if i < 32 {
+            160 + 2 * i
+        } else {
+            830 + 2 * (i - 32)
+        };
+        body[offset] = super::super::channel::band(*channel)
+            .ok_or(Error::Bounds)?
+            .scan_tag();
+        body[offset + 1] = *channel;
     }
     body[1110..1116].fill(255);
     Ok(body)
@@ -203,14 +250,24 @@ impl<B: Backend> Session<B> {
         bss[24..26].copy_from_slice(&19u16.to_le_bytes()); // reserved BMC WCID
         bss[30..32].copy_from_slice(&19u16.to_le_bytes());
         self.exchange(Command::Unified { id: 2 }, &bss).await?;
-        // Limit firmware to passive world 2.4 GHz channels, 20 MHz. No active
-        // probes or packet TX API is exposed by this scan path.
-        let mut domain = vec![0u8; 12 + 11 * 8];
+        // Every exposed band remains NO_IR during passive scan. Association
+        // installs a separate authenticated host policy before transmission.
+        let channels = super::super::channel::channels(info.capabilities.phy.bands);
+        let mut domain = vec![0u8; 12 + channels.len() * 8];
         domain[..2].copy_from_slice(b"00");
         domain[4..7].fill(1); // 20 MHz only
-        domain[8] = 11;
-        for i in 0..11 {
-            domain[12 + i * 8..14 + i * 8].copy_from_slice(&((i + 1) as u16).to_le_bytes());
+        domain[8] = if info.capabilities.phy.bands & 1 != 0 {
+            11
+        } else {
+            0
+        };
+        domain[9] = if info.capabilities.phy.bands & 2 != 0 {
+            28
+        } else {
+            0
+        };
+        for (i, channel) in channels.into_iter().enumerate() {
+            domain[12 + i * 8..14 + i * 8].copy_from_slice(&u16::from(channel).to_le_bytes());
             domain[16 + i * 8..20 + i * 8].copy_from_slice(&2u32.to_le_bytes());
             // NO_IR
         }
@@ -254,7 +311,10 @@ impl<B: Backend> Session<B> {
             State::ScanReady(info) => (info, false),
             _ => return Err(Error::Busy),
         };
-        if info.capabilities.phy.bands & 1 == 0 {
+        if channels.iter().any(|channel| {
+            super::super::channel::band(*channel)
+                .is_none_or(|band| info.capabilities.phy.bands & band.capability() == 0)
+        }) {
             return Err(Error::InvalidIdentity);
         }
         self.scan_seq = sequence;

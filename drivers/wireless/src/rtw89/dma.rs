@@ -85,8 +85,7 @@ pub const RXCH_NUM: usize = 2;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TxRingRegs {
     /// `*_TXBD_IDX` — write to advance the host's write-pointer
-    /// ("doorbell"). 32-bit reg, low 12 bits = HW-pointer, high 16 =
-    /// host-pointer; mask via `B_AX_DESC_NUM_MSK`. `pci.h:537..549`.
+    /// ("doorbell"). Hardware RP is bits27:16; host WP is bits11:0; mask via `B_AX_DESC_NUM_MSK`. `pci.h:537..549`.
     pub idx: u64,
     /// `*_TXBD_DESA_L` — low 32 bits of the ring's physical base.
     /// `pci.h:557..582`.
@@ -312,7 +311,7 @@ impl RingState {
     }
 
     /// Record an updated HW read pointer (typically polled out of the
-    /// `*_TXBD_IDX` register's low 12 bits).
+    /// `*_TXBD_IDX` register's bits27:16).
     pub fn set_rp(&mut self, rp: u16) {
         self.rp = rp;
     }
@@ -375,20 +374,21 @@ pub const fn rx_ring_bytes(slots: u16) -> usize {
     slots as usize * RX_BD_SIZE
 }
 
-/// `RING_IDX` mask: lower 12 bits of the index register hold the
-/// HW-side read pointer; upper 16 hold the host-write pointer.
-/// `pci.h:617` (`B_AX_DESC_NUM_MSK = GENMASK(11,0)`).
-pub const RING_IDX_HW_MASK: u32 = 0x0000_0FFF;
-pub const RING_IDX_HOST_SHIFT: u32 = 16;
+/// Linux pci.h TXBD_HW_IDX_MASK=GENMASK(27,16) and
+/// TXBD_HOST_IDX_MASK=GENMASK(11,0). Host doorbells write the low16 bits.
+pub const RING_IDX_HW_MASK: u32 = 0x0FFF_0000;
+pub const RING_IDX_HW_SHIFT: u32 = 16;
+pub const RING_IDX_HOST_MASK: u32 = 0x0FFF;
+pub const RING_IDX_HOST_SHIFT: u32 = 0;
 
 /// Decompose an index-register value into (hw_rp, host_wp).
 pub const fn split_idx(value: u32) -> (u16, u16) {
-    let hw = (value & RING_IDX_HW_MASK) as u16;
-    let host = ((value >> RING_IDX_HOST_SHIFT) & 0xFFFF) as u16;
+    let hw = ((value & RING_IDX_HW_MASK) >> RING_IDX_HW_SHIFT) as u16;
+    let host = (value & RING_IDX_HOST_MASK) as u16;
     (hw, host)
 }
 
 /// Pack a (hw_rp, host_wp) pair into an index-register value.
 pub const fn pack_idx(hw: u16, host: u16) -> u32 {
-    (hw as u32 & RING_IDX_HW_MASK) | ((host as u32) << RING_IDX_HOST_SHIFT)
+    ((hw as u32) << RING_IDX_HW_SHIFT & RING_IDX_HW_MASK) | (host as u32 & RING_IDX_HOST_MASK)
 }

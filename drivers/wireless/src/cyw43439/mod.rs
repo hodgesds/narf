@@ -57,30 +57,36 @@
 //!   event-specific payloads retain their own byte order.
 //!
 //! [`sdio_bridge`] supplies an adapter over an `SdioFunction` host.
-//! Live F2 transport scheduling/credits, event dispatch, station control
-//! and a registered `WirelessNetIface` are still required for Wi-Fi use.
+//! Standard PCI SDHCI/card matches now feed the firmware loader, F2
+//! FIFO service, station control and registered `WirelessNetIface` path.
+//! Platform-specific power/clock discovery and hardware acceptance remain.
 
 #![allow(dead_code)]
 
 extern crate alloc;
 
 pub mod backplane;
+pub mod bootstrap;
 pub mod chipclk;
 pub mod core;
 pub mod events;
 pub mod firmware;
+pub mod fullmac;
 pub mod gspi;
+pub mod interface;
 pub mod ioctl;
 pub mod iovar;
+pub mod runtime;
 pub mod sdio;
 pub mod sdio_bridge;
 pub mod sdpcm;
+pub mod station;
 pub mod transport;
 
 pub use firmware::{build_nvram_blob, FirmwareLoader, LoadError, LoadStep};
 pub use ioctl::{build_request, parse_response, Direction, ParseError, Response};
 pub use iovar::{build_region_cmd, COUNTRY_WORLDWIDE, VAR_COUNTRY, WL_COUNTRY_T_SIZE};
-pub use transport::{Function, Transport, TransportError};
+pub use transport::{Function, PacketTransport, Transport, TransportError};
 
 // ── Hardware identification (public datasheet cover sheet) ─────────
 
@@ -108,18 +114,12 @@ pub const CLM_BLOB_FILENAME: &str = "43439A0_clm.bin";
 pub const CYW43439_SDIO_VENDOR: u16 = 0x02D0;
 
 /// CYW43439 SDIO device/product ID.
-pub const CYW43439_SDIO_DEVICE: u16 = 0xA9A6;
+pub const CYW43439_SDIO_DEVICE: u16 = 0xA9AF;
 
-/// Stage-1 register stub — kept so existing call-sites (e.g. the
-/// wireless crate's `register_initcalls`) link cleanly. The chip
-/// is not exposed on PCI; the eventual integration hooks into the
-/// gSPI / SDIO transport adapters described in [`transport`].
+/// Register exact CYW43439 SDIO function matches and the standard PCI
+/// SDHCI host entry. Firmware initialization precedes network publication.
 pub fn register() {
-    // Intentional no-op for now: the bus through which the chip is
-    // reached (gSPI on a microcontroller pin set, or SDIO on a
-    // Raspberry Pi) is not part of the PCI dispatch table. Once the
-    // SDIO host-controller interface lands, this will register a
-    // CYW43439 SDIO match instead.
+    bootstrap::register();
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -155,8 +155,8 @@ pub mod tests {
         if CYW43439_SDIO_VENDOR != 0x02D0 {
             return TestResult::Fail("SDIO vendor should be 0x02D0 (Broadcom/Infineon)");
         }
-        if CYW43439_SDIO_DEVICE != 0xA9A6 {
-            return TestResult::Fail("SDIO device should be 0xA9A6 (CYW43439)");
+        if CYW43439_SDIO_DEVICE != 0xA9AF {
+            return TestResult::Fail("SDIO device should be 0xA9AF (CYW43439)");
         }
         TestResult::Pass
     }

@@ -1,6 +1,6 @@
 # ath11k — Specification
 
-> Status: **v0.9** — the whole station path is wired and
+> Status: **v0.9** — the WCN6855-layout station path is wired and
 > offline-tested end to end; nothing has run on the card yet. Probe →
 > power-up → MHI (firmware to mission mode) → WLFW QMI to FW_READY →
 > core bring-up (QMI firmware start, CE, HTC, WMI to READY) with the
@@ -15,13 +15,15 @@
 > "Unverified until hardware".
 >
 > Qualcomm ath11k Wi-Fi 6 / 6E driver for PCIe host-attached
-> silicon (QCA6390 / WCN6855 / QCN9074). Adapted from Linux
+> silicon. QCA6390 and WCN6855-layout parts have native receive/runtime
+> profiles; recognized QCN9074 remains rejected before DMA because its
+> software is incomplete. Adapted from Linux
 > `drivers/net/wireless/ath/ath11k/` (BSD-3-Clause-Clear) and
 > `drivers/bus/mhi/host/`, `net/qrtr/`, `drivers/soc/qcom/qmi_*`.
 
 ## 1. Purpose & scope
 
-**Owns:** station-mode bring-up plus up to three concurrent station, AP/GO or
+**Owns:** station-mode bring-up plus up to four concurrent station, AP/GO or
 P2P-role vdevs of PCIe ath11k parts, first target the WCN6855 HW2.1 in Lenovo's QCNFA765
 module (`17cb:1103`, subsystem `17aa:9309`). AP/GO includes hostapd-facing
 management-frame transport, client-peer programming and an Ethernet data
@@ -112,6 +114,40 @@ RDDM image takes the ath11k reset path. Still not ported: BW scaling,
 RSC/offload/client-managed rings, EDL.
 
 ## 3. Public interface
+
+`MhiBus::random_nonzero(max) -> Result<u32, MhiError>` supplies secure
+BHI/BHIe sequence IDs. The native provider uses the guarded common entropy
+API and reports MHI step 40 (`ENTROPY`, detail = mask, errno = `EIO`) on
+failure. A successful zero word is mapped to nonzero sequence 1; an entropy
+failure has no fallback. RDDM, BHI and BHIe setup obtain the sequence before
+publishing the corresponding DMA address or sequence doorbell.
+
+The implemented runtime supports native QCA6390 HW2.0 and the WCN6855 layout
+(HW2.0/HW2.1 plus QCA2066 HW2.1 and QCA6698AQ HW2.1). PCI matching and
+MHI/QMI support for another revision do not imply a registered WLAN:
+
+| Hardware | Reachable software | Remaining software gate |
+|---|---|---|
+| WCN6855 / QCA2066 / QCA6698AQ | MHI/QMI, CE/HTC/WMI, DP and STA/AP/P2P interfaces | Target-card and AP interoperability validation remains; optional Linux features outside this profile are not implied |
+| QCA6390 HW2.0 | Native IPQ8074 RX/error/fragment DP and production core/CE profile; resource and host vdev capacity four | Native DMA fixtures pass both architectures; composed production-profile CE startup, WPA2 station/data and four-slot tests pass on x86_64; those integration fixtures are x86-only; physical interoperability remains |
+| QCN9074 HW1.0 | Recognized PCI ID; configuration definitions; probe rejects before MMIO/MSI/firmware activation | Static BAR windows, QCN9074 HAL register map/operations, core configuration, per-pdev/REO/HTT-v2 and RX descriptor runtime are not ported |
+
+Probe first verifies inherited bus mastering and memory decode are off,
+with INTx masked, using command-register readback. Rejected family/singleton
+functions stay parked. Repeated dispatch of the already owned canonical PCI
+address returns before config/MMIO access, preserving its active DMA.
+Accepted profiles retain decode off during capability-invoked BAR sizing
+and mapping; memory decode is enabled and read back only after sizing writes
+have been restored. Probe validates the complete
+HAL/core/DP/MHI software profile before enabling memory decode. It repeats
+the check after refining the silicon revision and before MSI allocation or
+reset; BME is enabled only after those checks and PCI power-up succeed.
+`pci::ProbeError::UnsupportedRuntime` reports these recognized-but-incomplete
+families; `PciConfiguration` distinguishes a failed command access.
+Unsupported configurations never reach firmware activation or descriptor
+allocation. These are software gaps, independent
+of access to physical hardware; the WCN6855 acceptance plan does not close
+them.
 
 - `register()` — registers the three Linux PCI ids.
 - `pci::probe` — identify, power up, spawn the MHI bring-up task.
@@ -434,10 +470,12 @@ HE caps for the mac layer, HAL reg caps), `dma_ring_caps`, `ready` +
   `pdev_reo_setup` (after service ready, before INIT), async
   `htt_ver_req` (last step of `ath11k_core_start`), async `pdev_create`,
   `irq_enable`.
-- `CoreConfig::for_hw(&HwParams)` (QCA6390 + WCN6855 family; QCN9074
+- `CoreConfig::for_hw(&HwParams)` (QCA6390 and WCN6855 family; QCN9074
   `None`): `single_pdev_only`, `num_rxdma_per_pdev = 2`, `max_radios =
-  3`, `num_vdevs = 3`, credit flow, shadow regs, Linux timeouts (HTC
+  3`, `num_vdevs = 4`, credit flow, shadow regs, Linux timeouts (HTC
   1 s, connect 1 s, service / unified ready 5 s, WMI send 3 s).
+  Firmware requests and retained host slot arrays both use four, matching
+  local Linux's QCA6390/WCN6855 resource profile.
 - `Ath11kCore::new` (`ath11k_wmi_attach` + `ath11k_htc_init`),
   `qmi_firmware_ready(&mut hooks)` (the whole sequence below), and the
   pieces: `htc_wait_target`, `htt_connect`, `wmi_connect`, `htc_start`,
@@ -526,10 +564,20 @@ endpoints.
 ### 3.7 DP ring runtime (`dp_ring.rs`, Linux `dp.c`, `dp_tx.c`, `dp_rx.c`, `hal_tx.c`, `hal_rx.c`)
 
 Pure layer over [`hal::Hal`] (the device's one HAL, `Ce::hal`) and
-`ChipIo`; driven by `runtime.rs` (§3.11). WCN6855 family only
-(`DpHwParams::for_rev`: single pdev, `num_rxdma_per_pdev = 2`,
+`ChipIo`; driven by `runtime.rs` (§3.11). `DpHwParams::for_rev` supports
+QCA6390 and the WCN6855 family: single pdev, `num_rxdma_per_pdev = 2`,
 `rx_mac_buf_ring`, no rxdma1 / monitor, one TCL ring with rbm SW0,
-`rx_buf_rbm` SW1, `hal_desc_sz` 392). `DpRingSizes::LINUX` is what
+`rx_buf_rbm` SW1. `hal_desc_sz` is 384 for QCA6390 (`ipq8074.rs`) and
+392 for WCN6855 (`dp.rs`). `rx_descriptor::RxDescriptor` selects the
+native packed layout by `HwRev`; normal RX, attention/error processing,
+continuation coalescing and fragment reinjection all use that view.
+`dp_ring::attn_mpdu_err` and `dp_frag::{mpdu_start_enctype,
+attn_is_decrypted, attn_is_mcbc}` accept this view. Descriptor length
+rewrite uses byte 96 on QCA6390 and byte 104 on WCN6855.
+The four native receive/error/coalescing/fragment DMA fixtures pass on both
+architectures; composed core/startup/station tests pass on x86_64 and exercise
+the selected production profile. Those integration fixtures are x86-only.
+`DpRingSizes::LINUX` is what
 bring-up uses; tests shrink rings.
 
 Call order (Linux call sites):
@@ -632,7 +680,23 @@ poll), `mgmt_tx(vdev_id, frame) -> Result<desc_id, errno>`
 (`ath11k_mac_mgmt_tx_wmi`: DMA-map + `WMI_MGMT_TX_SEND_CMDID`),
 `mgmt_tx_done(desc_id)` (`wmi_process_mgmt_tx_comp`, called when the
 mac layer sees the MGMT_TX_COMPLETION), `now_ms()`, `max_msg_len()`
-(WMI endpoint, for the channel-list split), `random_bytes()`.
+(WMI endpoint, for the channel-list split),
+`random_bytes(out) -> Result<(), errno>`. The RNG provider must fill the
+whole output with secure, unpredictable bytes or return an error; failed
+partial output must never be consumed. Native ports use
+`narf_crypto::try_fill_random_bytes`, mapping unavailable entropy to `EIO`.
+MAC step 319 (`ENTROPY`) identifies failure before protocol mutation or
+transmission: detail 0 = LRO seed, 1 = initial 4-way nonce, 2 = rekey nonce,
+3 = SA Query transaction ID, 4 = SAE commit. Initial authentication
+failure follows normal disconnect cleanup; an established link loses its
+controlled port on rekey or SA Query entropy failure. Both supplicant
+paths use `rx_eapol_with_nonce`: fresh SNonce material is requested only
+for an accepted M1 that renews it. Retransmissions, M3, group rekeys and
+discarded traffic never request nonce entropy. Temporary nonce buffers
+are zeroized, including partially filled failed samples. SAE uses
+`SaeSession::try_build_commit_with_entropy` through this fallible provider,
+with partial samples private to the shared session; committed retries keep
+the same scalar and element without resampling.
 
 **`DataPort`** (DP side): `ppdu_stats_req()`, `mon_status_default(on)`,
 `vdev_tx_attach(vdev, addr)`, `wait_peer_mapped(vdev, addr, mapped,
@@ -976,14 +1040,14 @@ singleton hysteresis or the moving low/high range before
 - Physical `SET_WIPHY`: GET_WIPHY exposes current and available TX/RX chain
   masks plus the retained RTS threshold. A full TX/RX chain-mask pair is
   normalized by nl80211 (all ones means all available chains); the runtime
-  shares it between the three WCN6855 vdevs so the first active worker sends
+  shares it between the four supported-family vdevs so the first active worker sends
   the pdev WMI update while every MAC rebuilds its host capability maps. RTS
   updates are sent to each live vdev and retained for the initial
   `VDEV_CREATE` sequence and recovery. Fragment-threshold input below 256 is
   invalid, otherwise it reports Linux ath11k's `-EOPNOTSUPP`.
 - Multiple BSSID / EMA AP: when
   `WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT` is present, WCN6855
-  advertises three MBSSID interfaces and an EMA profile periodicity of eight
+  advertises four MBSSID interfaces and an EMA profile periodicity of eight
   through nested `NL80211_ATTR_MBSSID_CONFIG`. `START_AP` translates the
   transmitting or non-transmitting role into `WMI_HOST_VDEV_FLAGS_*` in
   `WMI_VDEV_START_REQUEST_CMDID`; a non-transmitting VDEV_UP additionally
@@ -1221,8 +1285,9 @@ step starts with `Rt::service()`:
 `ath11k_wmi_cmd_send` with credit / CE-full retry for 3 s;
 `next_event`; `mgmt_tx` = IDR id (≤ 512 pending) + DMA32 copy +
 `wmi::mgmt_send_cmd(vdev, id, frame, paddr, 0, false)`, freed on
-`mgmt_tx_done`; `now_ms`; `max_msg_len`; `random_bytes` =
-`narf_crypto::fill_random_bytes`) and `mac::DataPort`
+`mgmt_tx_done`; `now_ms`; `max_msg_len`; `random_bytes` = the fallible
+`Shared::new` RNG callback (`fn(&mut [u8]) -> Result<(), errno>`), with
+`narf_crypto::try_fill_random_bytes` for native devices) and `mac::DataPort`
 (`ppdu_stats_req` = `htt::ppdu_stats_cfg_msgs`; `mon_status_default` =
 `dp.mon_status_default_msgs` sent, last result returned as Linux, reap
 timer armed; `vdev_tx_attach` = `VifTx::attach`; `wait_peer_mapped`
@@ -1401,13 +1466,13 @@ station, AP, P2P Device, P2P Client, and P2P GO iftypes. A down-only
 requests are serialized onto the runtime queue so their WMI completion waits
 never re-enter a generic-netlink syscall. One physical `wiphy_id` groups the
 root `wlan%d` netdev and up to two `NL80211_CMD_NEW_INTERFACE` children;
-WCN6855's firmware slots 0, 1 and 2 are claimed atomically and each child has
+NARF admits firmware slots 0, 1 and 2, claimed atomically, and each child has
 its own MAC address, `Mac` instance, WMI event queue, RX/TX rings, link/AP
 state and unique `WDEV` id. PDEV-wide `ath11k_mac_op_start`/`stop` runs only
 at the shared open-vdev refcount's zero-to-one/one-to-zero transitions.
-The physical wiphy also reports and enforces WCN6855's three-vdev interface
+The physical wiphy also reports and enforces NARF's four-vdev interface
 combination through `NL80211_ATTR_INTERFACE_COMBINATIONS`: at most two STA,
-at most three AP/P2P client/GO vdevs, one P2P Device, a total cap of three,
+at most four AP/P2P client/GO vdevs, one P2P Device, a total cap of four,
 up to two operating channels for the target's dual-station profile, matching
 infrastructure/AP beacon intervals (minimum GCD 100) and radar detection
 across every ath11k-supported channel width.
@@ -1629,6 +1694,10 @@ operations refused) and the reset gate.
 - Memory the firmware may DMA into is freed only after the device was
   reset or restarted its firmware (recovery), or never (failed bring-up /
   failed recovery: parked).
+- HAL descriptor/doorbell and MHI publication barriers order the PCI device
+  as an outer-shareable observer on aarch64 (`dmb osh`, compiler-fenced
+  before and after); x86_64 uses a full memory fence. CPU-only atomic
+  ordering is not substituted for device-visible DMA ordering.
 - Bring-up never blocks or panics the init path: probe spawns the MHI
   task, which runs everything after; failures latch a step and park the
   objects the firmware may still use.
@@ -1664,6 +1733,17 @@ SAE, registry), `narf-net` (frame rings).
 Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
 
 ## 8. Open questions
+
+- Per-family software completion: QCA6390 now has Linux
+  `rx_desc.h::hal_rx_desc_ipq8074`, native HAL accessors and DP parameters,
+  four-vdev firmware/host capacity and production core dispatch. Its
+  normal/error/coalescing/CCMP fragment fixtures pass both architectures;
+  the composed production startup/station fixture passes on x86_64 and is
+  not included in the ARM integration configuration. QCN9074 remains rejected with BME disabled before
+  MMIO/MSI/firmware activation. It needs the
+  static CE/UMAC BAR windows, HAL register/operation tables, non-shadow
+  ring setup and its independent core/peer-map/RX/runtime profile. Tests
+  of the common transport or WCN6855 cannot validate those missing paths.
 
 - Test loop (decided): phases land with offline tests only; one
   full hardware bring-up at the end by booting NARF bare-metal on

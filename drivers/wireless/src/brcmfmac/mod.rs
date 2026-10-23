@@ -6,24 +6,15 @@
 //! parts that ride PCIe and speak the **msgbuf** protocol over Broadcom's
 //! H2D / D2H common-ring layout.
 //!
-//! ## Stage progression
-//!
-//! - **Stage 0 (landed)** — PCI device match table (vendor `0x14E4`,
-//!   the BCM43602 / 4350 / 4356 / 4358 / 4365 / 4366 / 4371 / 4378 /
-//!   4387 family), BAR0 (32 KiB register window) map, and a soft-reset
-//!   prologue via the PCIE2 mailbox-int / mailbox-mask registers.
-//!   Firmware-blob name lookup is included so the data-path follow-up
-//!   has a stable hook.
-//! - **Stage 1 (this commit)** — Common-ring SPSC index dance
-//!   (`brcmf_commonring_*` in Linux `commonring.c`) + the per-ring
-//!   layout table from `msgbuf.h`.
-//! - **Stage 2 (this commit)** — msgbuf protocol encoders/decoders
-//!   (`MSGBUF_TYPE_IOCTLPTR_REQ` / `IOCTL_CMPLT` / `WL_EVENT`) and
-//!   the cfg80211-equivalent attachment stub.
-//!
-//! TX/RX data path, flow-ring management, full cfg80211 attach,
-//! scan/assoc, and the firmware-side console reader are explicitly
-//! **not** in Stage 0–2.
+//! PCI ownership, AI core discovery, explicit BCM43602 board-profile boot,
+//! retained BAR2/DMA common rings, correlated control IOCTL/event ownership,
+//! and bounded workers now have production implementations. Admission still
+//! requires an exact platform calibration policy; no default board is invented.
+//! Owned flow TX/RX rings now implement create/delete, posted receive buffers,
+//! correlated retirement and fair bounded polling. Station lifecycle and
+//! fixed-BSSID station integration now has a native publication path after
+//! authenticated policy and firmware validation. Reset/recovery remain software
+//! work. No interface is published from the control-only owner.
 //!
 //! ## References (all ISC / BSD-3 / GPL-2.0; NARF is GPL-2.0-or-later)
 //!
@@ -50,16 +41,21 @@
 
 extern crate alloc;
 
+pub mod boot;
 pub mod bus;
 pub mod cfg80211;
+pub mod chip;
 pub mod connect;
 pub mod firmware;
 pub mod fweh;
 pub mod fwil;
 pub mod msgbuf;
+pub mod native_runtime;
 pub mod pcie;
 pub mod ringbuf;
+pub mod runtime;
 pub mod shared;
+pub mod station_transport;
 
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};
 
@@ -71,3 +67,9 @@ pub mod tests;
 pub fn register() {
     register_pci_driver();
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod runtime_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod data_wire_tests;

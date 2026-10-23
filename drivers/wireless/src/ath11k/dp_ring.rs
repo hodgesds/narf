@@ -73,6 +73,7 @@ use super::hal::{
 use super::htt::{self, HttPpduStats, HttT2h, HttTarget, RxRingTlvFilter};
 use super::hw::{rbm, HwHalParams, HwParams, HwRev, RingMask, HW_HAL_PARAMS_QCA6390};
 use super::power::ChipIo;
+use super::rx_descriptor::RxDescriptor;
 
 // ── diag steps (DP 200–216; HTT 220–225 in `htt::step`) ──
 
@@ -384,28 +385,33 @@ pub struct DpHwParams {
 }
 
 impl DpHwParams {
-    /// The WCN6855 family entries (WCN6855 HW2.0 / HW2.1, QCA2066,
-    /// QCA6698AQ share every DP field). `None` for parts whose DP is
-    /// not ported.
+    /// QCA6390 and the WCN6855 family share ring geometry, with their
+    /// independent native RX descriptor sizes. `None` for unported DP.
     pub fn for_rev(rev: HwRev) -> Option<DpHwParams> {
         match rev {
-            HwRev::Wcn6855Hw20 | HwRev::Wcn6855Hw21 | HwRev::Qca2066Hw21 | HwRev::Qca6698aqHw21 => {
-                Some(DpHwParams {
-                    hw: rev.params()?,
-                    hal_params: &HW_HAL_PARAMS_QCA6390,
-                    num_rxdma_per_pdev: 2,
-                    rx_mac_buf_ring: true,
-                    rxdma1_enable: false,
-                    supports_monitor: false,
-                    full_monitor_mode: false,
-                    htt_peer_map_v2: false,
-                    tcl_ring_retry: true,
-                    tx_ring_size: DP_TCL_DATA_RING_SIZE,
-                    hal_desc_sz: HalRxDescWcn6855::SIZE,
-                    alloc_cacheable_memory: false,
-                    single_pdev_only: true,
-                })
-            }
+            HwRev::Qca6390Hw20
+            | HwRev::Wcn6855Hw20
+            | HwRev::Wcn6855Hw21
+            | HwRev::Qca2066Hw21
+            | HwRev::Qca6698aqHw21 => Some(DpHwParams {
+                hw: rev.params()?,
+                hal_params: &HW_HAL_PARAMS_QCA6390,
+                num_rxdma_per_pdev: 2,
+                rx_mac_buf_ring: true,
+                rxdma1_enable: false,
+                supports_monitor: false,
+                full_monitor_mode: false,
+                htt_peer_map_v2: false,
+                tcl_ring_retry: true,
+                tx_ring_size: DP_TCL_DATA_RING_SIZE,
+                hal_desc_sz: if rev == HwRev::Qca6390Hw20 {
+                    super::ipq8074::HalRxDescIpq8074::SIZE
+                } else {
+                    HalRxDescWcn6855::SIZE
+                },
+                alloc_cacheable_memory: false,
+                single_pdev_only: true,
+            }),
             _ => None,
         }
     }
@@ -1441,8 +1447,8 @@ pub enum RxDrop {
 }
 
 /// `ath11k_dp_rx_h_attn_mpdu_err`.
-pub fn attn_mpdu_err(d: &HalRxDescWcn6855) -> u32 {
-    let info = d.attention.info1;
+pub fn attn_mpdu_err(d: &RxDescriptor) -> u32 {
+    let info = d.attention().info1;
     let mut e = 0;
     if info & RX_ATTENTION_INFO1_FCS_ERR != 0 {
         e |= DP_RX_MPDU_ERR_FCS;
@@ -1468,8 +1474,8 @@ pub fn attn_mpdu_err(d: &HalRxDescWcn6855) -> u32 {
     e
 }
 
-fn rx_desc(b: &[u8]) -> HalRxDescWcn6855 {
-    HalRxDescWcn6855::from_bytes(b).expect("RX buffer holds a descriptor")
+fn rx_desc(rev: HwRev, b: &[u8]) -> RxDescriptor {
+    RxDescriptor::decode(rev, b).expect("RX buffer holds a descriptor")
 }
 
 impl Dp {
@@ -2307,11 +2313,11 @@ impl Dp {
     /// buffer. These reports arrive before normal RX processing, unlike an
     /// attention-bit failure in [`Self::h_mpdu`].
     fn record_mic_failure_from_skb(&mut self, skb: &RxSkb) {
-        let rxd = rx_desc(&skb.data);
-        let group = rxd.first_msdu() && rxd.attention.info1 & RX_ATTENTION_INFO1_MCAST_BCAST != 0;
+        let rxd = rx_desc(self.cfg.hw.hw_rev, &skb.data);
+        let group = rxd.first_msdu() && rxd.attention().info1 & RX_ATTENTION_INFO1_MCAST_BCAST != 0;
         let peer = self.peer_by_id(rxd.mpdu_peer_id()).copied().or_else(|| {
-            (rxd.mpdu_start.info1 & RX_MPDU_START_INFO1_MAC_ADDR2_VALID != 0)
-                .then_some(rxd.mpdu_start.addr2)
+            (rxd.mpdu_info1() & RX_MPDU_START_INFO1_MAC_ADDR2_VALID != 0)
+                .then_some(rxd.addr2())
                 .and_then(|addr| self.peers.iter().find(|peer| peer.addr == addr).copied())
         });
         if let Some(peer) = peer {
@@ -2875,13 +2881,13 @@ impl Dp {
             }
         };
 
-        let mut rxd = rx_desc(&first.data);
+        let mut rxd = rx_desc(self.cfg.hw.hw_rev, &first.data);
         if attn_mpdu_err(&rxd) & DP_RX_MPDU_ERR_MSDU_LEN != 0 {
             return Err(RxDrop::MsduLenErr);
         }
         let lrxd = match last_idx {
             None => rxd,
-            Some(i) => rx_desc(&list[i].data),
+            Some(i) => rx_desc(self.cfg.hw.hw_rev, &list[i].data),
         };
         if !lrxd.msdu_done() {
             return Err(RxDrop::MsduNotDone);
@@ -2914,9 +2920,8 @@ impl Dp {
                 first.is_last_msdu = lrxd.last_msdu();
                 // ath11k_dp_rx_desc_end_tlv_copy (wcn6855: msdu_end,
                 // attention, mpdu_end from the last buffer)
-                rxd.msdu_end = lrxd.msdu_end;
-                rxd.attention = lrxd.attention;
-                rxd.mpdu_end = lrxd.mpdu_end;
+                rxd.copy_attention_end(&lrxd)
+                    .map_err(|_| RxDrop::Coalesce)?;
                 let mut v = first.data[hdr_len..bufsz].to_vec();
                 let mut rem = (msdu_len - first_len) as isize;
                 while let Some(skb) = list.pop_front() {
@@ -2950,14 +2955,14 @@ impl Dp {
     fn h_mpdu(
         &mut self,
         skb: RxSkb,
-        rxd: &HalRxDescWcn6855,
+        rxd: &RxDescriptor,
         mut payload: Vec<u8>,
         from_err_path: bool,
     ) -> Result<Option<RxMsdu>, RxDrop> {
         let mut peer_id = skb.peer_id;
         let mut seq_no = skb.seq_no;
         let is_mcbc =
-            rxd.first_msdu() && (rxd.attention.info1 & RX_ATTENTION_INFO1_MCAST_BCAST != 0);
+            rxd.first_msdu() && (rxd.attention().info1 & RX_ATTENTION_INFO1_MCAST_BCAST != 0);
         if is_mcbc {
             peer_id = rxd.mpdu_peer_id();
             seq_no = rxd.mpdu_start_seq_no();
@@ -2970,9 +2975,9 @@ impl Dp {
             None
         };
         if peer.is_none() {
-            let v = rxd.mpdu_start.info1;
+            let v = rxd.mpdu_info1();
             if v & RX_MPDU_START_INFO1_MAC_ADDR2_VALID != 0 {
-                let a2 = rxd.mpdu_start.addr2;
+                let a2 = rxd.addr2();
                 peer = self.peers.iter().find(|p| p.addr == a2).copied();
             }
         }
@@ -2995,7 +3000,7 @@ impl Dp {
         let err_bitmap = attn_mpdu_err(rxd);
         let decrypted = enctype != enc::OPEN
             && err_bitmap == 0
-            && field_get(RX_ATTENTION_INFO2_DCRYPT_STATUS_CODE, rxd.attention.info2)
+            && field_get(RX_ATTENTION_INFO2_DCRYPT_STATUS_CODE, rxd.attention().info2)
                 == RX_DESC_DECRYPT_STATUS_CODE_OK;
 
         // mac80211 drops these (RX_FLAG_FAILED_FCS_CRC / MMIC_ERROR) or
@@ -3014,7 +3019,7 @@ impl Dp {
         }
 
         // ath11k_dp_rx_h_csum_offload
-        let csum_ok = rxd.attention.info1
+        let csum_ok = rxd.attention().info1
             & (RX_ATTENTION_INFO1_IP_CKSUM_FAIL | RX_ATTENTION_INFO1_TCP_UDP_CKSUM_FAIL)
             == 0;
 
@@ -3077,7 +3082,7 @@ impl Dp {
             decap: decap_ty,
             csum_ok,
             freq: rxd.msdu_freq(),
-            rate_info: rxd.msdu_start.info3,
+            rate_info: rxd.rate_info(),
             from_err_path,
         }))
     }
@@ -3336,7 +3341,7 @@ impl Dp {
     ) -> Result<Option<RxMsdu>, RxDrop> {
         let desc_sz = self.cfg.hal_desc_sz;
         let bufsz = DP_RX_BUFFER_SIZE as usize;
-        let rxd = rx_desc(&skb.data);
+        let rxd = rx_desc(self.cfg.hw.hw_rev, &skb.data);
         let msdu_len = rxd.msdu_len() as usize;
         if msdu_len + desc_sz > bufsz {
             // First buffer is dropped by the caller; drop the rest of the

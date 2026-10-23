@@ -148,6 +148,7 @@ struct Dev {
     now: u64,
     irqs: u32,
     rand_calls: u32,
+    rand_fail_on: Option<u32>,
     logs: Vec<String>,
     notes: Vec<MhiNotify>,
     /// Device write position per event ring (DMA address), plus the
@@ -570,10 +571,13 @@ impl MhiBus for FakeMhi {
     fn now_ms(&self) -> u64 {
         self.d.borrow().now
     }
-    fn random_nonzero(&self, max: u32) -> u32 {
+    fn random_nonzero(&self, max: u32) -> Result<u32, MhiError> {
         let d = &mut *self.d.borrow_mut();
+        if d.rand_fail_on == Some(d.rand_calls + 1) {
+            return Err(MhiError::new(step::ENTROPY, max, errno::EIO));
+        }
         d.rand_calls += 1;
-        (SESSION + d.rand_calls - 1) & max
+        Ok((SESSION + d.rand_calls - 1) & max)
     }
     fn notify(&self, ev: MhiNotify) {
         self.d.borrow_mut().notes.push(ev);
@@ -2519,3 +2523,51 @@ fn smoke_mhi_power_down_states() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_mhi_power_down_states);
+
+fn smoke_mhi_entropy_failure_precedes_image_and_rddm_publication() -> TestResult {
+    for failed_sample in 1..=3 {
+        let mut h = host(Behaviour::default());
+        h.bus.d.borrow_mut().rand_fail_on = Some(failed_sample);
+        let result = h.prepare_for_power_up().and_then(|()| {
+            h.set_firmware(firmware(FW_LEN, false));
+            run(h.sync_power_up())
+        });
+        check!(
+            matches!(result, Err(error) if error.step == step::ENTROPY && error.errno == errno::EIO),
+            "MHI propagates unavailable RDDM/BHI/BHIe sequence entropy"
+        );
+        let writes = h.bus.writes();
+        // Preparing RDDM first clears the whole RX register aperture. Zero
+        // reset writes are allowed; a failed sample must never publish an
+        // address/size/sequence for that transfer or start a later stage.
+        if failed_sample == 1 {
+            check!(
+                !writes.iter().any(|&(reg, value)| value != 0
+                    && matches!(reg, r if r == BHIE + BHIE_RXVECADDR_HIGH_OFFS
+                        || r == BHIE + BHIE_RXVECADDR_LOW_OFFS
+                        || r == BHIE + BHIE_RXVECSIZE_OFFS
+                        || r == BHIE + BHIE_RXVECDB_OFFS)),
+                "failed RDDM entropy published receive vector"
+            );
+        }
+        if failed_sample <= 2 {
+            check!(
+                find_write(&writes, 0, BHI + BHI_IMGADDR_HIGH).is_none()
+                    && find_write(&writes, 0, BHI + BHI_IMGADDR_LOW).is_none()
+                    && find_write(&writes, 0, BHI + BHI_IMGTXDB).is_none(),
+                "failed entropy published BHI image"
+            );
+        }
+        check!(
+            find_write(&writes, 0, BHIE + BHIE_TXVECADDR_HIGH_OFFS).is_none()
+                && find_write(&writes, 0, BHIE + BHIE_TXVECADDR_LOW_OFFS).is_none()
+                && find_write(&writes, 0, BHIE + BHIE_TXVECDB_OFFS).is_none(),
+            "failed entropy published BHIe image vector"
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_mhi_entropy_failure_precedes_image_and_rddm_publication
+);

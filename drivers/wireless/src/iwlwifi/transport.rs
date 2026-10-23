@@ -1,8 +1,11 @@
 //! iwlwifi PCIe transport — BAR0 MMIO programming for gen2
 //! direct-DMA section loads and gen3 IML / context-info-v2 boot.
 //!
-//! Both paths share the `apm_init` clock + reset prologue and
-//! diverge from there:
+//! The retained AX200/AX201 API77 boot owner uses `context_v1`,
+//! `gen2_prepare`, and `runtime`; it does not call the older FH
+//! section-loader helpers below. Those helpers remain unactivated.
+//!
+//! The older loader descriptions are:
 //!
 //! - **gen2** (AX200/AX201): driver iterates each section in the
 //!   firmware's INIT image then RUNTIME image, programs the FH
@@ -62,6 +65,9 @@ use narf_bus;
 /// the loader code is testable against a mock without real HW.
 /// Same shape as `amdgpu_psp::PspMmio` and `amdgpu_smu::SmuMmio`.
 pub trait IwlMmio {
+    fn authorized(&self) -> bool {
+        true
+    }
     fn read(&mut self, offset: u32) -> u32;
     fn write(&mut self, offset: u32, value: u32);
 }
@@ -93,7 +99,7 @@ pub enum TransportError {
 
 /// Read a PRPH register via the HBUS target-address indirection.
 pub fn prph_read<M: IwlMmio>(mmio: &mut M, addr: u32) -> u32 {
-    mmio.write(regs::HBUS_TARG_PRPH_RADDR, addr);
+    mmio.write(regs::HBUS_TARG_PRPH_RADDR, (addr & 0x000f_ffff) | (3 << 24));
     // Linux inserts a small delay loop here ("PRPH read must be
     // staged"); we mirror with a 1-tick compiler_fence pair so a
     // future MMIO ordering audit can find the site.
@@ -103,7 +109,7 @@ pub fn prph_read<M: IwlMmio>(mmio: &mut M, addr: u32) -> u32 {
 
 /// Write a PRPH register via the HBUS target-address indirection.
 pub fn prph_write<M: IwlMmio>(mmio: &mut M, addr: u32, value: u32) {
-    mmio.write(regs::HBUS_TARG_PRPH_WADDR, addr);
+    mmio.write(regs::HBUS_TARG_PRPH_WADDR, (addr & 0x000f_ffff) | (3 << 24));
     compiler_fence(Ordering::SeqCst);
     mmio.write(regs::HBUS_TARG_PRPH_WDAT, value);
 }
@@ -409,8 +415,12 @@ pub fn start_gen3<M: IwlMmio>(
     regions: &Gen3BootRegions,
     format: super::rx_rfh::CompletionFormat,
 ) {
+    if format == super::rx_rfh::CompletionFormat::Qu {
+        return;
+    }
     boot_gen3(mmio, regions);
     match format {
+        super::rx_rfh::CompletionFormat::Qu => unreachable!(),
         super::rx_rfh::CompletionFormat::Ax210 => {
             prph_write_ax210(mmio, regs::UREG_CPU_INIT_RUN + regs::UMAC_PRPH_OFFSET, 1);
         }
@@ -465,59 +475,45 @@ pub trait AliveSink {
 /// bring-up before IRQs and the RX path are fully integrated.
 #[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct PollingAliveSink {
-    region: narf_bus::MmioRegion,
+    mmio: super::IwlMmioImpl,
 }
 
 impl PollingAliveSink {
-    pub fn new(region: narf_bus::MmioRegion) -> Self {
-        Self { region }
+    pub fn new(
+        region: narf_bus::MmioRegion,
+        cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    ) -> Self {
+        Self {
+            mmio: super::IwlMmioImpl::new(region, cap),
+        }
     }
 }
 
 impl AliveSink for PollingAliveSink {
     fn wait(&mut self, deadline_ms: u64) -> Option<u32> {
-        // Poll for the ALIVE bit in CSR_INT.
-        // Deadline is in milliseconds. We'll use a simple loop.
-        // On real HW we'd use a timer; here we use MMIO read iterations
-        // as a proxy for time if no timer is available, but wait,
-        // narf might have a sleep/delay function.
-        // Actually, let's just use a large number of iterations
-        // or check if there's a way to get time.
-
-        for _ in 0..(deadline_ms * 1000) {
-            // SAFETY: `self.region` is the live BAR0 `MmioRegion` handed to
-            // `PollingAliveSink::new`; `CSR_INT` is a 32-bit device CSR within
-            // that BAR, so the volatile MMIO read is to a valid, in-range,
-            // 4-byte-aligned register.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            let intr = unsafe { self.region.read32(regs::CSR_INT as u64) };
-            if intr & csr_int::ALIVE != 0 {
-                // Acknowledge the interrupt.
-                // SAFETY: `self.region` is the live BAR0 mapping; `CSR_INT` is a
-                // writable 32-bit device CSR within that BAR, and writing the
-                // `ALIVE` bit is the documented way to acknowledge the interrupt.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                unsafe { self.region.write32(regs::CSR_INT as u64, csr_int::ALIVE) };
-
-                // On many Intel chips, the ALIVE status is written to
-                // CSR_UCODE_DRV_GP2 (0x60).
-                // SAFETY: `self.region` is the live BAR0 mapping; `CSR_UCODE_DRV_GP2`
-                // (0x60) is a 32-bit device CSR within that BAR, so the volatile
-                // MMIO read targets a valid, in-range, 4-byte-aligned register.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                let status = unsafe { self.region.read32(regs::CSR_UCODE_DRV_GP2 as u64) };
-                if status == regs::IWL_ALIVE_STATUS_OK {
-                    return Some(status);
+        // The diagnostic sink cannot manufacture an ALIVE after authority
+        // revocation or an unverified status. Actual Gen2 boot needs context-v1
+        // and a DMA notification path; this legacy observer remains gated.
+        let mut result = None;
+        narf_scheduler::responsive_spin_until(
+            || {
+                let interrupt = self.mmio.read(regs::CSR_INT);
+                if interrupt == u32::MAX {
+                    return true;
                 }
-                // If GP2 doesn't have it, some chips might just use the bit.
-                // But the trait expects the status.
-                // For now, if we see the bit, let's return OK to advance.
-                return Some(regs::IWL_ALIVE_STATUS_OK);
-            }
-            // Small delay proxy.
-            core::hint::spin_loop();
-        }
-        None
+                if interrupt & csr_int::ALIVE == 0 {
+                    return false;
+                }
+                self.mmio.write(regs::CSR_INT, csr_int::ALIVE);
+                let status = self.mmio.read(regs::CSR_UCODE_DRV_GP2);
+                if status == regs::IWL_ALIVE_STATUS_OK {
+                    result = Some(status);
+                }
+                true
+            },
+            narf_time::Deadline::after_ms(deadline_ms),
+        );
+        result
     }
 }
 
@@ -816,7 +812,7 @@ pub mod tests {
     fn smoke_iwlwifi_signal_load_done_writes_prph() -> TestResult {
         let mut m = MockMmio::new();
         signal_load_done_gen2(&mut m);
-        if m.last_write_to(regs::HBUS_TARG_PRPH_WADDR) != Some(regs::PRPH_UREG_UCODE_LOAD_STATUS) {
+        if m.last_write_to(regs::HBUS_TARG_PRPH_WADDR) != Some(0x0300_5c40) {
             return TestResult::Fail("PRPH WADDR wrong");
         }
         if m.last_write_to(regs::HBUS_TARG_PRPH_WDAT) != Some(regs::FH_UCODE_LOAD_STATUS_GEN2) {

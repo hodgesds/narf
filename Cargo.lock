@@ -27,6 +27,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -1133,6 +1134,7 @@ dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
  "hkdf",
+ "narf-arch",
  "narf-capabilities",
  "narf-ipc",
  "narf-kernel-test",
@@ -1141,6 +1143,7 @@ dependencies = [
  "rand_chacha",
  "rand_core 0.6.4",
  "sha2",
+ "subtle",
  "xts-mode",
  "zeroize",
 ]
@@ -2048,6 +2051,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
  "narf-time",
 ]
 
@@ -2486,6 +2490,7 @@ dependencies = [
  "narf-scheduler",
  "narf-time",
  "narf-wireless",
+ "zeroize",
 ]
 
 [[package]]

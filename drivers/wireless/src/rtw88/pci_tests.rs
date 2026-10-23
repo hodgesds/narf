@@ -7,7 +7,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_memory::PhysAddr;
 
 use super::fw::{download_firmware, FwError};
-use super::pci::{map_registers_with, ProbeError};
+use super::pci::{map_registers_with, register_window_min, ProbeError};
 use super::regs::*;
 
 fn device(did: u16) -> BusDevice {
@@ -103,12 +103,18 @@ fn smoke_rtw88_pci_missing_or_short_register_bar_fails() -> TestResult {
         return TestResult::Fail("rtw88 accepted absent BAR2 or attempted a fallback register BAR");
     }
     if !matches!(
-        map_registers_with(&device, |_, _| Ok(register_fixture(REG_CR + 1))),
+        map_registers_with(&device, |_, _| Ok(register_fixture(
+            register_window_min(device.id.device) - 1
+        ))),
         Err(ProbeError::RegisterBarTooSmall)
     ) {
         return TestResult::Fail("rtw88 accepted a register BAR too short for power-on");
     }
-    if map_registers_with(&device, |_, _| Ok(register_fixture(REG_CR + 2))).is_err() {
+    if map_registers_with(&device, |_, _| {
+        Ok(register_fixture(register_window_min(device.id.device)))
+    })
+    .is_err()
+    {
         return TestResult::Fail("rtw88 rejected the minimum complete register extent");
     }
     TestResult::Pass

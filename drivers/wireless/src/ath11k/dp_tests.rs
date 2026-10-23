@@ -273,7 +273,10 @@ struct Rig {
 }
 
 fn rig(sizes: DpRingSizes) -> Rig {
-    let cfg = DpHwParams::for_rev(HwRev::Wcn6855Hw21).expect("WCN6855 DP params");
+    rig_for_rev(sizes, HwRev::Wcn6855Hw21)
+}
+fn rig_for_rev(sizes: DpRingSizes, rev: HwRev) -> Rig {
+    let cfg = DpHwParams::for_rev(rev).expect("complete DP params");
     let mut hal = Hal::new(&cfg.hw).expect("hal");
     let io = RecIo::default();
     let mut dp = Dp::alloc(&mut hal, &io, &cfg, sizes, Some(msi())).expect("dp alloc");
@@ -467,10 +470,14 @@ fn smoke_ath11k_dp_hw_params_wcn6855() -> TestResult {
             "rx_buf_rbm SW1, TX rbm SW0"
         );
     }
+    let qca = DpHwParams::for_rev(HwRev::Qca6390Hw20).unwrap();
     check!(
-        DpHwParams::for_rev(HwRev::Qcn9074Hw10).is_none()
-            && DpHwParams::for_rev(HwRev::Qca6390Hw20).is_none(),
-        "DP not ported for other parts"
+        qca.hal_desc_sz == 384 && qca.num_rxdma_per_pdev == 2 && qca.single_pdev_only,
+        "QCA6390 uses native IPQ8074 RX descriptors"
+    );
+    check!(
+        DpHwParams::for_rev(HwRev::Qcn9074Hw10).is_none(),
+        "QCN9074 DP not ported"
     );
     // 2730 + 227 + 4681 + 10922 = 18560 → 1 << fls(18560) = 32768
     check!(wbm_idle_n_link_desc() == 32768, "n_link_desc");
@@ -2278,7 +2285,10 @@ const FRAG_DEST: u32 = 2;
 /// A rig with the AP mapped (HTT PEER_MAP) and its REO queues set up
 /// (`ath11k_dp_peer_setup`, so `dp_setup_done`), CCMP on the peer.
 fn frag_rig() -> Rig {
-    let mut r = rig(SMALL);
+    frag_rig_for_rev(HwRev::Wcn6855Hw21)
+}
+fn frag_rig_for_rev(rev: HwRev) -> Rig {
+    let mut r = rig_for_rev(SMALL, rev);
     let mut m = Vec::new();
     m.extend_from_slice(&(3u32 | (FRAG_PEER as u32) << 16).to_le_bytes());
     m.extend_from_slice(&[BSSID[0], BSSID[1], BSSID[2], BSSID[3]]);
@@ -2346,7 +2356,11 @@ fn frag_entry(
     mcbc: bool,
 ) -> [u32; 2] {
     let (pa, cookie) = fw_take(&r.io, refill);
-    let mut buf = frag_desc(mpdu.len(), seq, mcbc);
+    let mut buf = if r.dp.cfg.hw.hw_rev == HwRev::Qca6390Hw20 {
+        qca_frag_desc(mpdu.len(), seq, mcbc)
+    } else {
+        frag_desc(mpdu.len(), seq, mcbc)
+    };
     buf.extend_from_slice(mpdu);
     phys_write(pa, &buf);
     let w = idle.consume(&r.io).expect("idle link descriptor");
@@ -2910,4 +2924,361 @@ fn smoke_ath11k_dp_failed_alloc_unwinds() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_dp_failed_alloc_unwinds
+);
+
+// Native QCA6390/IPQ8074 fixture bytes: offsets independently compiled from
+// Linux rx_desc.h; never use the driver's accessor/encoder for the oracle.
+pub(super) fn qca_rx_desc_bytes(d: &Rxd) -> Vec<u8> {
+    let mut b = vec![0; 384];
+    put32(
+        &mut b,
+        24,
+        (d.first as u32) << 14 | (d.last as u32) << 15 | (d.l3pad & 3) << 26,
+    );
+    put32(&mut b, 80, d.attn1);
+    put32(
+        &mut b,
+        84,
+        ((!d.not_done) as u32) << 31 | (d.decrypt_status & 7) << 10,
+    );
+    put32(&mut b, 96, d.msdu_len & 0x3fff);
+    put32(&mut b, 100, (d.decap & 3) << 8);
+    put32(&mut b, 112, d.rate_info);
+    put32(&mut b, 120, d.freq);
+    put32(&mut b, 144, (d.enc_type & 15) << 2 | (d.tid & 15) << 14);
+    b[138..140].copy_from_slice(&d.sw_peer_id.to_le_bytes());
+    put32(
+        &mut b,
+        140,
+        (d.enc_valid as u32) << 9 | (d.addr2.is_some() as u32) << 3 | (d.seq & 0xfff) << 20,
+    );
+    if let Some(addr) = d.addr2 {
+        b[198..204].copy_from_slice(&addr);
+    }
+    b
+}
+fn qca_frag_desc(len: usize, seq: u32, mcbc: bool) -> Vec<u8> {
+    let mut b = qca_rx_desc_bytes(&Rxd {
+        first: true,
+        last: true,
+        msdu_len: len as u32,
+        decap: 0,
+        enc_valid: true,
+        enc_type: enc::CCMP_128,
+        seq,
+        sw_peer_id: FRAG_PEER,
+        attn1: if mcbc { 4 } else { 0 },
+        ..Rxd::default()
+    });
+    let value = u32::from_le_bytes(b[140..144].try_into().unwrap()) | 1 | (1 << 6);
+    put32(&mut b, 140, value);
+    b
+}
+fn qca_deliver(io: &RecIo, refill: &mut DevRing, reo: &mut DevRing, d: &Rxd, msdu: &[u8]) -> u32 {
+    let (pa, cookie) = fw_take(io, refill);
+    let mut buf = qca_rx_desc_bytes(d);
+    buf.resize(384 + d.l3pad as usize, 0);
+    buf.extend_from_slice(msdu);
+    phys_write(pa, &buf);
+    assert!(reo.produce(
+        io,
+        &reo_dest(pa, cookie, FIRST | LAST | (msdu.len() as u32) << 3, 1, 0, 3)
+    ));
+    cookie
+}
+fn qca_umac_dst(io: &RecIo, r0: u32, shadow_index: u32) -> DevRing {
+    DevRing {
+        base: reg64(io, r0),
+        size: (io.reg(r0 + 4) >> 8) & 0xfffff,
+        esz: io.reg(r0 + 8) & 255,
+        hw_ptr: io.reg(r0 + 0x14) as u64 | (io.reg(r0 + 0x18) as u64) << 32,
+        host: HostPtr::Reg(SHADOW_BASE + shadow_index * 4),
+        idx: 0,
+    }
+}
+
+fn smoke_ath11k_qca6390_rx_reap_nwifi_and_eth() -> TestResult {
+    let mut r = rig_for_rev(SMALL, HwRev::Qca6390Hw20);
+    let mut refill = lmac(&r.msgs[0]);
+    let mut reo = umac_dst(&r.io, REO2SW1_R0, REO2SW1_TP);
+    check!(
+        reo.esz == 16 && reo.size == 16 * 16,
+        "REO2SW1 from registers"
+    );
+
+    let payload = [0x45u8, 0x00, 0x00, 0x14, 1, 2, 3, 4];
+    let msdu = nwifi_msdu(0x0800, &payload);
+    let mut d = good_rxd(msdu.len(), 1);
+    d.l3pad = 2;
+    d.seq = 77;
+    qca_deliver(&r.io, &mut refill, &mut reo, &d, &msdu);
+    let eapol = eth_frame(0x888e, &[1, 3, 0, 0x5f]);
+    qca_deliver(
+        &r.io,
+        &mut refill,
+        &mut reo,
+        &good_rxd(eapol.len(), 2),
+        &eapol,
+    );
+
+    let (n, rx) = r.dp.process_rx(&mut r.hal, &r.io, 0, 64);
+    check!(n == 2 && rx.len() == 2, "two MSDUs reaped");
+    check!(
+        rx[0].frame == eth_frame(0x0800, &payload),
+        "native wifi → Ethernet II (DA = addr1, SA = addr3, SNAP type)"
+    );
+    check!(
+        rx[0].peer_id == 3 && rx[0].seq_no == 5 && rx[0].tid == 0 && rx[0].freq == 5180,
+        "REO metadata + rx_desc freq"
+    );
+    check!(
+        rx[0].decap == 1 && !rx[0].decrypted && rx[0].csum_ok && !rx[0].is_mcbc && !rx[0].is_eapol,
+        "flags"
+    );
+    check!(
+        rx[1].frame == eapol && rx[1].is_eapol,
+        "Ethernet II passthrough, EAPOL flagged"
+    );
+    // TP published through the REO2SW1 shadow register, buffers reposted.
+    check!(
+        r.io.reg(shadow_of(REO2SW1_TP)) == 2 * 16,
+        "REO TP published"
+    );
+    check!(refill.pending(&r.io) == 15, "two buffers replenished");
+    // idr_alloc hands out the lowest free ids: 1 and 2 again, in the two
+    // slots after the old HP (15, 0).
+    let c15 = buf_addr_get(refill.entry(15)[0], refill.entry(15)[1]).1;
+    let c0 = buf_addr_get(refill.entry(0)[0], refill.entry(0)[1]).1;
+    check!(c15 == 1 && c0 == 2, "reaped ids reposted");
+    check!(
+        r.dp.pdev.as_ref().unwrap().rx_refill_buf_ring.bufs.len() == 15,
+        "no buffer leak"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k/qca6390",
+    smoke_ath11k_qca6390_rx_reap_nwifi_and_eth
+);
+
+fn smoke_ath11k_qca6390_rx_continuation_coalesce() -> TestResult {
+    let mut r = rig_for_rev(SMALL, HwRev::Qca6390Hw20);
+    let mut refill = lmac(&r.msgs[0]);
+    let mut reo = umac_dst(&r.io, REO2SW1_R0, REO2SW1_TP);
+    // 3000-byte Ethernet MSDU over two buffers: 1664 (2048 - 384) + 1336.
+    let frame: Vec<u8> = {
+        let p: Vec<u8> = (0..3000 - 14).map(|i| i as u8).collect();
+        eth_frame(0x0800, &p)
+    };
+    let (pa1, c1) = fw_take(&r.io, &mut refill);
+    let (pa2, c2) = fw_take(&r.io, &mut refill);
+    let mut d1 = good_rxd(3000, 2);
+    d1.last = false;
+    let mut b1 = qca_rx_desc_bytes(&d1);
+    b1.extend_from_slice(&frame[..1664]);
+    phys_write(pa1, &b1);
+    // Only the last buffer's attention / msdu_end are valid.
+    let mut d2 = good_rxd(0, 2);
+    d2.first = false;
+    let mut b2 = qca_rx_desc_bytes(&d2);
+    b2.extend_from_slice(&frame[1664..]);
+    phys_write(pa2, &b2);
+    check!(
+        reo.produce(
+            &r.io,
+            &reo_dest(pa1, c1, FIRST | CONT | (2048 << 3), 1, 0, 3)
+        ) && reo.produce(&r.io, &reo_dest(pa2, c2, LAST | (1336 << 3), 1, 0, 3)),
+        "two REO entries"
+    );
+    let (n, rx) = r.dp.process_rx(&mut r.hal, &r.io, 0, 64);
+    check!(n == 1 && rx.len() == 1, "one MSDU from two buffers");
+    check!(rx[0].frame == frame, "coalesced payload");
+    check!(refill.pending(&r.io) == 15, "both buffers replenished");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k/qca6390",
+    smoke_ath11k_qca6390_rx_continuation_coalesce
+);
+
+fn smoke_ath11k_qca6390_rx_wbm_err_null_q_desc() -> TestResult {
+    let mut r = rig_for_rev(SMALL, HwRev::Qca6390Hw20);
+    let mut refill = lmac(&r.msgs[0]);
+    let mut rel = umac_dst(&r.io, 0x00a34910 + 3 * 0x58, WBM2SW3_TP);
+    let msdu = nwifi_msdu(0x0800, &[9; 12]);
+    let mut put =
+        |r: &Rig, refill: &mut DevRing, d: &Rxd, mgr: u32, src: u32, push: u32, code: u32| {
+            let (pa, c) = fw_take(&r.io, refill);
+            let mut b = qca_rx_desc_bytes(d);
+            b.extend_from_slice(&msdu);
+            phys_write(pa, &b);
+            assert!(rel.produce(&r.io, &wbm_rx_err(pa, c, mgr, src, push, code)));
+        };
+    let mut d = good_rxd(msdu.len(), 1);
+    d.tid = 6;
+    // REO, ERR_DETECTED, DESC_ADDR_ZERO (no TID queue): delivered.
+    put(&r, &mut refill, &d, 4, 2, 0, 0);
+    // PN check failed: dropped.
+    put(&r, &mut refill, &d, 4, 2, 0, 11);
+    // RXDMA TKIP MIC: dropped (no countermeasures).
+    put(&r, &mut refill, &d, 4, 1, 0, 4);
+    // RXDMA FCS error: dropped.
+    put(&r, &mut refill, &d, 4, 1, 0, 2);
+    // Wrong return buffer manager (SW0): parse error, buffer not taken.
+    put(&r, &mut refill, &d, 3, 2, 0, 0);
+    // Routing push reason on the error ring: buffer freed, not processed.
+    put(&r, &mut refill, &d, 4, 2, 1, 0);
+
+    let (n, rx) = r.dp.rx_process_wbm_err(&mut r.hal, &r.io, 64);
+    let s = &r.dp.stats;
+    check!(n == 5, "five buffers reaped (the bad-rbm one is not)");
+    check!(rx.len() == 1, "one MSDU delivered");
+    check!(
+        rx[0].frame == eth_frame(0x0800, &[9; 12]) && rx[0].from_err_path && rx[0].tid == 6,
+        "null-queue MSDU: Ethernet, TID from mpdu_start"
+    );
+    check!(s.reo_error[0] == 1 && s.reo_error[11] == 1, "reo_error[]");
+    check!(
+        s.rxdma_error[4] == 1 && s.rxdma_error[2] == 1,
+        "rxdma_error[]"
+    );
+    check!(s.rx_mic_err == 1, "TKIP MIC dropped");
+    check!(s.invalid_rbm == 1 && s.wbm_err_parse == 1, "bad rbm");
+    check!(
+        r.io.reg(shadow_of(WBM2SW3_TP)) == 6 * 8,
+        "release ring TP published"
+    );
+    check!(
+        refill.pending(&r.io) == 15 - 1,
+        "5 replenished (the stranded buffer stays out)"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k/qca6390",
+    smoke_ath11k_qca6390_rx_wbm_err_null_q_desc
+);
+
+fn smoke_ath11k_qca6390_defrag_reinject_golden() -> TestResult {
+    let mut r = frag_rig_for_rev(HwRev::Qca6390Hw20);
+    let mut refill = lmac(&r.msgs[0]);
+    let mut idle = umac_src(&r.io, 0x00a34860, WBM_IDLE_HP);
+    let mut exc = qca_umac_dst(&r.io, 0x00a383a4, 4);
+    let mut sw2wbm = umac_src(&r.io, 0x00a341d8, SW2WBM_HP);
+    let mut reinj = umac_src(&r.io, SW2REO_R0, SW2REO_HP);
+    let mut reo = umac_dst(&r.io, REO2SW1_R0, REO2SW1_TP);
+    r.dp.now_ms = 1000;
+    let f0 = raw_frag(FRAG_SEQ, 0, false, 0x10, &body0());
+    let f1 = raw_frag(FRAG_SEQ, 1, true, 0x11, &[5, 6, 7, 8]);
+    let l0 = frag_entry(&r, &mut refill, &mut idle, &mut exc, &f0, FRAG_SEQ, false);
+    check!(
+        r.dp.process_rx_err(&mut r.hal, &r.io, 64) == 1,
+        "frag 0 reaped"
+    );
+    let t = &r.dp.peer_rx.peer(0, &BSSID).unwrap().rx_tid[0];
+    check!(
+        t.rx_frag_bitmap == 1 && t.cur_sn == FRAG_SEQ as u16 && t.frag_timer == Some(3000),
+        "frag 0 held, 2 s timer armed"
+    );
+    check!(
+        sw2wbm.consume(&r.io).is_none(),
+        "frag 0's link descriptor kept"
+    );
+    let l1 = frag_entry(&r, &mut refill, &mut idle, &mut exc, &f1, FRAG_SEQ, false);
+    check!(
+        r.dp.process_rx_err(&mut r.hal, &r.io, 64) == 1,
+        "frag 1 reaped"
+    );
+    let ret = sw2wbm.consume(&r.io).expect("frag 1's link descriptor");
+    check!(
+        ret[..2] == l1 && ret[2] == 0x44,
+        "frag 1 returned PUT_IN_IDLE"
+    );
+    check!(
+        sw2wbm.consume(&r.io).is_none(),
+        "frag 0's link descriptor reused"
+    );
+    check!(r.dp.stats.rx_defrag_reinjected == 1, "reinjected");
+    let t = &r.dp.peer_rx.peer(0, &BSSID).unwrap().rx_tid[0];
+    check!(
+        t.rx_frags.is_empty() && t.rx_frag_bitmap == 0 && t.dst_ring_desc.is_none(),
+        "state cleared"
+    );
+    // hal_reo_entrance_ring: frag 0's link descriptor (rbm
+    // WBM_IDLE_DESC_LIST = 1, cookie = bank), MSDU count 1 | seq 5 |
+    // VALID_PN (24) | VALID_SA (25) | VALID_DA (27) | RAW_MPDU (30),
+    // meta data + queue address from the exception entry, dest ind 2.
+    let e = reinj.consume(&r.io).expect("reinject entry");
+    let link = [l0[0], (l0[1] & !(7 << 8)) | (1 << 8)];
+    check!(
+        e[..2] == link
+            && e[2] == 1 | FRAG_SEQ << 8 | 1 << 24 | 1 << 25 | 1 << 27 | 1 << 30
+            && e[3] == FRAG_PEER as u32
+            && e[4] == FRAG_QLO
+            && e[5] == FRAG_QHI | FRAG_DEST << 22
+            && e[6] == 0
+            && e[7] == 0,
+        "reinject entry golden"
+    );
+    // The MSDU link entry now names the reassembled buffer: FIRST | LAST
+    // | length << 3 | dest << 17 | VALID_SA (23) | VALID_DA (25).
+    let want = defragged();
+    let (lpa, _, _) = buf_addr_get(l0[0], l0[1]);
+    let mut ld = [0u8; 48];
+    phys_read(lpa, &mut ld);
+    let w = |i: usize| u32::from_le_bytes([ld[i * 4], ld[i * 4 + 1], ld[i * 4 + 2], ld[i * 4 + 3]]);
+    check!(
+        w(10) == 1 | 2 | (want.len() as u32) << 3 | FRAG_DEST << 17 | 1 << 23 | 1 << 25
+            && w(11) == 0,
+        "MSDU link entry golden"
+    );
+    let (bpa, cookie, mgr) = buf_addr_get(w(8), w(9));
+    check!(
+        mgr == rbm::SW1_BM && cookie >> 18 == 0,
+        "rx_buf_rbm, pdev 0"
+    );
+    let mut buf = vec![0u8; 384 + want.len()];
+    phys_read(bpa, &mut buf);
+    let mut desc = qca_frag_desc(want.len(), FRAG_SEQ, false);
+    check!(buf[384..] == want[..], "reassembled MPDU golden");
+    desc[96..100].copy_from_slice(&(want.len() as u32).to_le_bytes());
+    check!(
+        buf[..384] == desc[..],
+        "descriptor with the MSDU length rewritten"
+    );
+
+    // The REO delivers it on REO2SW1 (routing): a raw, decrypted MPDU →
+    // FCS, MIC, IV stripped (ath11k_dp_rx_h_undecap_raw) → Ethernet II.
+    check!(
+        reo.produce(
+            &r.io,
+            &reo_dest(
+                bpa,
+                cookie,
+                FIRST | LAST | (want.len() as u32) << 3,
+                1,
+                0,
+                FRAG_PEER as u32
+            )
+        ),
+        "REO dest entry"
+    );
+    let (n, out) = r.dp.process_rx(&mut r.hal, &r.io, 0, 64);
+    check!(n == 1 && out.len() == 1, "delivered");
+    let mut eth = STA.to_vec();
+    eth.extend_from_slice(&SRC);
+    eth.extend_from_slice(&[0x08, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]);
+    check!(
+        out[0].frame == eth && out[0].decrypted && out[0].decap == 0,
+        "Ethernet II golden"
+    );
+    check!(
+        r.dp.rx_buf(cookie).is_none(),
+        "the reinjected buffer left the IDR"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k/qca6390",
+    smoke_ath11k_qca6390_defrag_reinject_golden
 );

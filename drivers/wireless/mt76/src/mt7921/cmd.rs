@@ -298,35 +298,12 @@ pub fn encode_sta_rec_basic_tlv(
 
 /// `MCU_EXT_CMD_CHANNEL_SWITCH` body — 32 bytes.
 ///
-/// Layout per Linux `mt76_connac_mcu_set_chan_info` (`mt76_connac_mcu.c`
-/// ~L1640):
-///
-/// ```c
-/// struct mcu_ext_channel_switch {
-///     u8 dbdc_idx;
-///     u8 control_chan;
-///     u8 center_chan;
-///     u8 bw;
-///     u8 tx_streams;
-///     u8 rx_streams;
-///     u8 ss_type;
-///     u8 center_chan2;
-///     __le16 ext_pa;
-///     u8 outband_freq;
-///     u8 ack_mode;
-///     u8 band;
-///     u8 cmd_mode;
-///     u8 rsv[3];
-///     u8 channel_band;
-///     __le32 ht_op_info;
-///     __le16 he_op_info;
-///     u8 rsv2[6];
-/// };
-/// ```
-///
-/// We model the active subset (channel + bandwidth + streams + band)
-/// — the firmware fills in derived fields.
-pub const CHANNEL_SWITCH_SIZE: usize = 32;
+/// Full packed request from Linux `mt7921_mcu_set_chan_info`:
+/// control/center/BW/TX-NSS/RX-mask/reason/band-index/center2 (8 bytes),
+/// CAC case (u16), channel band (u8), reserved (u8), outband frequency
+/// (u32), TX power drop/AP width/AP center (3 bytes), reserved (57 bytes).
+/// Reserved fields must be transmitted, not omitted from a shorter request.
+pub const CHANNEL_SWITCH_SIZE: usize = 76;
 
 /// Bandwidth values.
 pub const CH_BW_20: u8 = 0;
@@ -350,30 +327,24 @@ pub fn encode_channel_switch(
     band: u8,
     out: &mut [u8],
 ) -> Option<()> {
-    if out.len() < CHANNEL_SWITCH_SIZE {
+    if out.len() < CHANNEL_SWITCH_SIZE
+        || control_chan == 0
+        || center_chan == 0
+        || band > CH_BAND_6G
+        || bw > CH_BW_160
+        || !(1..=2).contains(&tx_streams)
+        || rx_streams == 0
+        || rx_streams & !3 != 0
+    {
         return None;
     }
-    out[0] = 0; // dbdc_idx
-    out[1] = control_chan;
-    out[2] = center_chan;
-    out[3] = bw;
-    out[4] = tx_streams;
-    out[5] = rx_streams;
-    out[6] = 0; // ss_type
-    out[7] = 0; // center_chan2
-    out[8..10].copy_from_slice(&0u16.to_le_bytes()); // ext_pa
-    out[10] = 0; // outband_freq
-    out[11] = 0; // ack_mode
-    out[12] = band;
-    out[13] = 0; // cmd_mode
-    for b in &mut out[14..16] {
-        *b = 0;
-    }
-    out[16] = band; // channel_band (repeated)
-    out[17..20].fill(0);
-    out[20..24].copy_from_slice(&0u32.to_le_bytes()); // ht_op_info
-    out[24..26].copy_from_slice(&0u16.to_le_bytes()); // he_op_info
-    out[26..CHANNEL_SWITCH_SIZE].fill(0);
+    out[..CHANNEL_SWITCH_SIZE].fill(0);
+    out[0] = control_chan;
+    out[1] = center_chan;
+    out[2] = bw;
+    out[3] = tx_streams;
+    out[4] = rx_streams; // An antenna mask, not a stream count.
+    out[10] = band;
     Some(())
 }
 
@@ -387,7 +358,7 @@ pub fn encode_default_channel_switch(out: &mut [u8]) -> Option<()> {
         MT7921_DEFAULT_CHAN_5G,
         CH_BW_20,
         2,
-        2,
+        3,
         CH_BAND_5G,
         out,
     )

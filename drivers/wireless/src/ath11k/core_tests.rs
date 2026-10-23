@@ -37,7 +37,7 @@ use super::ce::{self, CeIrq, CeMsi, CeRecv, HOST_CE_CONFIG_QCA6390};
 use super::ce_tests::FakeChip;
 use super::core::*;
 use super::hal::TransportError;
-use super::hal_tests::{wcn6855, WCN6855_SHADOW_REG_V2};
+use super::hal_tests::{wcn6855, QCA6390_SHADOW_REG_V2, WCN6855_SHADOW_REG_V2};
 use super::htc::{self, conn_status, msg_id, svc_id, HtcHdr};
 use super::hw::{HwRev, MSI_CONFIG_QCA6390};
 use super::power::ChipIo;
@@ -674,7 +674,7 @@ fn smoke_ath11k_core_config_wcn6855() -> TestResult {
         c.single_pdev_only && c.num_rxdma_per_pdev == 2 && c.max_radios == 3,
         "WCN6855 hw_params"
     );
-    ensure!(c.num_vdevs == 3, "num_vdevs 2 + 1");
+    ensure!(c.num_vdevs == 4, "Linux QCA6390/WCN6855 four-vdev profile");
     ensure!(
         c.initial_hw_mode() == hw_mode::SINGLE,
         "wmi_attach: SINGLE (single_pdev_only, 2 rxdma)"
@@ -695,6 +695,11 @@ fn smoke_ath11k_core_config_wcn6855() -> TestResult {
     );
     let q = HwRev::Qcn9074Hw10.params().expect("qcn9074 params");
     ensure!(CoreConfig::for_hw(&q).is_none(), "QCN9074 unsupported");
+    let q = HwRev::Qca6390Hw20.params().expect("qca6390 params");
+    ensure!(
+        CoreConfig::for_hw(&q).is_some_and(|cfg| cfg.num_vdevs == 4 && cfg.num_rxdma_per_pdev == 2),
+        "QCA6390 native RX/DP shares the four-vdev core resource profile"
+    );
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_core_config_wcn6855);
@@ -1362,18 +1367,20 @@ impl CeIrq for FwIrq<'_> {
     }
 }
 
-fn smoke_ath11k_core_over_real_ce() -> TestResult {
+fn core_over_real_ce(revision: HwRev) -> TestResult {
+    let params = revision.params().expect("checked production profile");
+    let config = CoreConfig::for_hw(&params).expect("checked production core config");
     NOW.store(0, Ordering::Relaxed);
     let msi = CeMsi {
         addr: 0xfee0_1000,
         ep_base_data: 0x40,
         config: &MSI_CONFIG_QCA6390,
     };
-    let ce = match ce::Ce::alloc(&wcn6855(), msi, clock) {
+    let ce = match ce::Ce::alloc(&params, msi, clock) {
         Ok(c) => c,
         Err(_) => return TestResult::Fail("Ce::alloc"),
     };
-    let chip = FakeChip::new(ce.shadow_reg_v2());
+    let chip = FakeChip::for_revision(revision, ce.shadow_reg_v2());
     let irq = FwIrq {
         chip: &chip,
         fw: RefCell::new(Fw::new(Script::default())),
@@ -1390,7 +1397,7 @@ fn smoke_ath11k_core_over_real_ce() -> TestResult {
         trace: trace.clone(),
         fail: None,
     };
-    let mut core = match Ath11kCore::new(hif, qmi, cfg()) {
+    let mut core = match Ath11kCore::new(hif, qmi, config) {
         Ok(c) => c,
         Err(_) => return TestResult::Fail("Ath11kCore::new"),
     };
@@ -1404,7 +1411,12 @@ fn smoke_ath11k_core_over_real_ce() -> TestResult {
     );
     match trace.borrow().first() {
         Some(Ev::QmiStart { shadow, .. }) => ensure!(
-            shadow[..] == WCN6855_SHADOW_REG_V2,
+            shadow[..]
+                == if revision == HwRev::Qca6390Hw20 {
+                    QCA6390_SHADOW_REG_V2
+                } else {
+                    WCN6855_SHADOW_REG_V2
+                },
             "QMI got the CE's shadow list"
         ),
         _ => return TestResult::Fail("QMI start first"),
@@ -1441,4 +1453,14 @@ fn smoke_ath11k_core_over_real_ce() -> TestResult {
     );
     TestResult::Pass
 }
+fn smoke_ath11k_core_over_real_ce() -> TestResult {
+    core_over_real_ce(HwRev::Wcn6855Hw21)
+}
+fn smoke_ath11k_qca6390_core_over_real_ce() -> TestResult {
+    core_over_real_ce(HwRev::Qca6390Hw20)
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k/qca6390",
+    smoke_ath11k_qca6390_core_over_real_ce
+);
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_core_over_real_ce);

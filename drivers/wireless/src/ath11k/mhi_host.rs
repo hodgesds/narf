@@ -78,7 +78,6 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
-use core::sync::atomic::{compiler_fence, fence, Ordering};
 
 use narf_io::DmaBuffer;
 use narf_lib::id::DomainId;
@@ -149,6 +148,8 @@ pub mod step {
     pub const RDDM_ERROR: u32 = 38;
     /// `mhi_download_rddm_image` did not observe BHIe RX completion.
     pub const RDDM_TIMEOUT: u32 = 39;
+    /// Entropy unavailable before a BHI/BHIe/RDDM sequence publication.
+    pub const ENTROPY: u32 = 40;
 }
 
 /// A bring-up failure, with the diag step + detail it latches.
@@ -229,7 +230,7 @@ pub trait MhiBus {
     /// around the MHI stop / start ([`MhiController::power_cycle`]).
     fn hif_power(&self, _step: HifPower) {}
     /// `get_random_u32_inclusive(1, max)`.
-    fn random_nonzero(&self, max: u32) -> u32;
+    fn random_nonzero(&self, max: u32) -> Result<u32, MhiError>;
     /// `status_cb` and milestones.
     fn notify(&self, _ev: MhiNotify) {}
     /// One console line.
@@ -405,9 +406,7 @@ impl Dma {
 /// `dma_wmb()` / `smp_wmb()`: order descriptor writes before the
 /// doorbell / context update that publishes them.
 fn dma_wmb() {
-    compiler_fence(Ordering::SeqCst);
-    fence(Ordering::Release);
-    compiler_fence(Ordering::SeqCst);
+    super::hal::dma_wmb();
 }
 
 /// `struct mhi_ring` for a DMA ring: `pre_aligned` = `mem`,
@@ -1149,7 +1148,7 @@ impl<B: MhiBus> MhiController<B> {
         // `mhi_buf->len` of the vector entry: the entries, not the
         // page-rounded allocation behind them (as `download_amss_image`).
         let vector_len = core::mem::size_of::<BhiVecEntry>() * data_segments;
-        let sequence_id = self.bus.random_nonzero(BHIE_TXVECSTATUS_SEQNUM_BMSK);
+        let sequence_id = self.bus.random_nonzero(BHIE_TXVECSTATUS_SEQNUM_BMSK)?;
         self.write_reg(
             self.bhie,
             BHIE_RXVECADDR_HIGH_OFFS,
@@ -2073,7 +2072,7 @@ impl<B: MhiBus> MhiController<B> {
         if !pm::reg_access_valid(self.pm_state) {
             return Err(MhiError::new(step::REG_ACCESS, self.pm_state, errno::EIO));
         }
-        let session_id = self.bus.random_nonzero(BHI_TXDB_SEQNUM_BMSK);
+        let session_id = self.bus.random_nonzero(BHI_TXDB_SEQNUM_BMSK)?;
         mlog!(
             self,
             "mhi: starting image download via BHI, session ID {}",
@@ -2118,7 +2117,7 @@ impl<B: MhiBus> MhiController<B> {
             return Err(MhiError::new(step::REG_ACCESS, self.pm_state, errno::EIO));
         }
         let base = self.bhie;
-        let sequence_id = self.bus.random_nonzero(BHIE_TXVECSTATUS_SEQNUM_BMSK);
+        let sequence_id = self.bus.random_nonzero(BHIE_TXVECSTATUS_SEQNUM_BMSK)?;
         mlog!(
             self,
             "mhi: starting image download via BHIe, sequence ID {}",

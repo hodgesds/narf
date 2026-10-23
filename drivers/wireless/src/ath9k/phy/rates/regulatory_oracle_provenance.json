@@ -1,0 +1,21 @@
+{
+  "extracted_function_sha256": {
+    "__ath_regd_init": "844cf27ae6307a6870f4e996bafd31c58e6b839b4ea4be8edf47b8db55f46b3c",
+    "ath_get_regpair": "e5ac53c0d6503705732231cb40191ce6589b4be02be413ba6984b72a13f933a4",
+    "ath_regd_find_country": "c48dea5827d7908b473e50f06485abc4707a3fcb6884aa50c30598100b452c8b",
+    "ath_regd_find_country_by_rd": "b0b27098e5245e97022098ecd7f29a87f95d719caef2b5b60052093669938d94",
+    "ath_regd_get_band_ctl": "2e169c0ff9cb42575e5e97b3b51d0e6204e85d56fcfa257f9b1a6547011f6fd5",
+    "ath_regd_get_default_country": "bf475bbe48e35b052d76959836ec65b7e7d0cbeb4eee818a1de15a1d266698aa",
+    "ath_regd_get_eepromRD": "1abf1357742735a7f7eee717b561631e60ec7b4710510e09481b2bba46453132",
+    "ath_regd_is_eeprom_valid": "0e2376001157814b88e33d55b10d653124b56305294d410f5f5e410e02d2da22",
+    "ath_regd_sanitize": "989c07ec9786d90d517194b0dd3643f841f5a71f8ae6ea2128195ee567a2d12e",
+    "is_wwr_sku": "0922b97a46d4aa68866c06da4358eb4afa9693761e9eb9571aef78fb740552eb"
+  },
+  "extraction": "Unmodified native C regulatory initialization/helpers, tables and initial DFS-unset band CTL selector.",
+  "reference": "local Linux drivers/net/wireless/ath",
+  "sources": {
+    "regd.c": "928582bfaa3d72574eb40a69e6bc8f268ff7d37f87de805ec21c2c24beedc5c4",
+    "regd.h": "17ddca22d3e35d396cc6dc9005f364157dc34937d609156c80c48d37c7afc73f",
+    "regd_common.h": "95eca0ec1ab9e7ea248b4b9cc4ad3081cc9f61eb036e7faa9959acb49b356941"
+  }
+}

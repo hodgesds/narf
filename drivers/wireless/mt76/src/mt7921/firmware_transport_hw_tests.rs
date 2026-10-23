@@ -97,6 +97,101 @@ kernel_test_in!(
     mcu_dma_production_tx_descriptor_completion_and_wrap
 );
 
+fn mt76_recycled_storage_clears_tokens_payloads_indices_and_old_rx() -> TestResult {
+    let (_words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("recovery DMA fixture allocation"),
+    };
+    let storage = hw.owner.storage.as_mut().unwrap();
+    for ring in [&mut storage.wm, &mut storage.fwdl, &mut storage.data] {
+        ring.index = 7;
+        ring.pending = true;
+        ring.set_word(7, 0, 0x12340000);
+        ring.set_word(7, 1, (64 << 16) | LAST);
+        ring.buffers[7].as_mut_slice()[..32].fill(0x77);
+    }
+    storage.tokens.begin(1).unwrap();
+    storage.pending_events.push_back(vec![0x66; 36]);
+    storage.pending_data.push_back(vec![0x55; 64]);
+    storage.rx[0].index = 9;
+    storage.rx[0].set_word(9, 1, (36 << 16) | LAST | DONE);
+    // All fixture buffers are CPU-owned; there is no device attached to this
+    // memory model. Use the exact storage operation called after stop proof.
+    storage.recycle();
+    if storage.tokens.available() != Ok(1)
+        || !storage.pending_events.is_empty()
+        || !storage.pending_data.is_empty()
+    {
+        return TestResult::Fail("old firmware tokens/replies survived DMA generation reset");
+    }
+    for ring in [&storage.wm, &storage.fwdl, &storage.data] {
+        if ring.index != 0 || ring.pending {
+            return TestResult::Fail("old TX index/pending state retained");
+        }
+        for slot in 0..DEPTH {
+            if [
+                ring.word(slot, 0),
+                ring.word(slot, 1),
+                ring.word(slot, 2),
+                ring.word(slot, 3),
+            ] != [0, DONE, 0, 0]
+                || ring.buffers[slot].as_slice().iter().any(|byte| *byte != 0)
+            {
+                return TestResult::Fail("old TX descriptor/key payload remained device visible");
+            }
+        }
+    }
+    for ring in &storage.rx {
+        if ring.index != 0 || ring.pending {
+            return TestResult::Fail("old RX index retained");
+        }
+        for slot in 0..DEPTH {
+            let address = ring.buffers[slot].dma_addr().raw();
+            if [
+                ring.word(slot, 0),
+                ring.word(slot, 1),
+                ring.word(slot, 2),
+                ring.word(slot, 3),
+            ] != [
+                address as u32,
+                (MAX_FRAME as u32) << 16,
+                0,
+                (address >> 32) as u32 & 15,
+            ] {
+                return TestResult::Fail("RX generation was not freshly armed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/recovery",
+    mt76_recycled_storage_clears_tokens_payloads_indices_and_old_rx
+);
+
+fn mt76_wfsys_reset_uses_real_register_bits_and_preserves_neighbors() -> TestResult {
+    let (_words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("reset register fixture allocation"),
+    };
+    if hw.write(0x18000140, 0xaabb0001).is_err()
+        || hw.assert_reset().is_err()
+        || hw.read(0x18000140) != Ok(0xaabb0000)
+        || hw.release_reset().is_err()
+        || hw.read(0x18000140) != Ok(0xaabb0001)
+        || hw.reset_done() != Ok(false)
+        || hw.write(0x18000140, 0xaabb0011).is_err()
+        || hw.reset_done() != Ok(true)
+    {
+        return TestResult::Fail("WFSYS reset/readiness touched wrong address or mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/recovery",
+    mt76_wfsys_reset_uses_real_register_bits_and_preserves_neighbors
+);
+
 fn mcu_dma_production_rx_copies_before_rearm_and_checks_lengths() -> TestResult {
     let (mut words, mut hw) = match rig() {
         Ok(rig) => rig,
@@ -265,7 +360,14 @@ fn inject_rx(words: &mut [u32], hw: &Hardware, which: usize, packet: &[u8]) {
 }
 fn mcu_management_tx_matches_linux_cut_through_header() -> TestResult {
     let frame = management_frame();
-    let header = packet_tx::management(&frame, 0x12345040, 0x1234, 19).unwrap();
+    let header = packet_tx::management(
+        &frame,
+        0x12345040,
+        0x1234,
+        19,
+        crate::mt7921::association::LegacyRate::ONE_MBPS,
+    )
+    .unwrap();
     let expected = [
         0x2000003eu32,
         0x80026013,
@@ -284,8 +386,20 @@ fn mcu_management_tx_matches_linux_cut_through_header() -> TestResult {
     if header[32..40] != [0x34, 0x92, 0, 0, 0, 0, 0, 0]
         || header[40..48] != [0x40, 0x50, 0x34, 0x12, 30, 0x80, 0, 0]
         || header[48..].iter().any(|b| *b != 0)
-        || packet_tx::management(&frame, 1u64 << 32, 1, 19) != Err(Error::DmaAddress)
-        || packet_tx::management(&frame[..23], 0, 1, 19) != Err(Error::Bounds)
+        || packet_tx::management(
+            &frame,
+            1u64 << 32,
+            1,
+            19,
+            crate::mt7921::association::LegacyRate::ONE_MBPS,
+        ) != Err(Error::DmaAddress)
+        || packet_tx::management(
+            &frame[..23],
+            0,
+            1,
+            19,
+            crate::mt7921::association::LegacyRate::ONE_MBPS,
+        ) != Err(Error::Bounds)
     {
         return TestResult::Fail("TXP segment/token/last/address geometry");
     }
@@ -306,7 +420,9 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
             let frame = management_frame();
             let slot = turn % DEPTH;
             let next = (slot + 1) % DEPTH;
-            if hw.submit_management(&frame, 19).is_err()
+            if hw
+                .submit_management(&frame, 19, crate::mt7921::association::LegacyRate::ONE_MBPS)
+                .is_err()
                 || words[(TX_DATA + 8) as usize / 4] != next as u32
             {
                 return TestResult::Fail("management doorbell or ring wrap");
@@ -316,7 +432,8 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
             if ring.word(slot, 1) != (64 << 16) | LAST {
                 return TestResult::Fail("DMA must publish TXD+TXP, not payload length");
             }
-            if hw.submit_management(&frame, 19) != Err(Error::Busy)
+            if hw.submit_management(&frame, 19, crate::mt7921::association::LegacyRate::ONE_MBPS)
+                != Err(Error::Busy)
                 || !matches!(hw.management_complete(), Ok(None))
             {
                 return TestResult::Fail("pending token allowed reuse");
@@ -476,4 +593,65 @@ fn mcu_receive_router_bounds_both_queues_without_dropping_command_replies() -> T
 kernel_test_in!(
     "drivers/wireless/mt7921/tx",
     mcu_receive_router_bounds_both_queues_without_dropping_command_replies
+);
+
+fn mcu_tx_completion_pump_preserves_queued_and_fresh_command_replies() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("allocation"),
+    };
+    hw.owner.published = true;
+    if hw
+        .submit_management(
+            &management_frame(),
+            1,
+            crate::mt7921::association::LegacyRate::ONE_MBPS,
+        )
+        .is_err()
+    {
+        return TestResult::Fail("publish management TX");
+    }
+    let mut old = vec![0u8; 36];
+    old[..4].copy_from_slice(&((7u32 << 27) | 36).to_le_bytes());
+    old[24..26].copy_from_slice(&12u16.to_le_bytes());
+    old[28] = 1;
+    old[29] = 1;
+    let mut fresh = old.clone();
+    fresh[29] = 2;
+    hw.owner
+        .storage
+        .as_mut()
+        .unwrap()
+        .pending_events
+        .push_back(old.clone());
+    inject_rx(&mut words, &hw, 0, &fresh);
+    inject_rx(&mut words, &hw, 1, &release_event(1, 0, false));
+    hw.owner
+        .storage
+        .as_ref()
+        .unwrap()
+        .data
+        .set_word(0, 1, (64 << 16) | LAST | DONE);
+    words[(TX_DATA + 12) as usize / 4] = 1;
+    let completion = hw.management_complete();
+    let first = hw.receive();
+    let second = hw.receive();
+    hw.owner.published = false; // Fixture owns memory; no device engine exists.
+    if completion
+        != Ok(Some(packet_tx::Completion {
+            token: 1,
+            status: 0,
+        }))
+        || first != Ok(Some(old))
+        || second != Ok(Some(fresh))
+    {
+        return TestResult::Fail(
+            "completion pumping consumed MCU response or failed to harvest TX free",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport",
+    mcu_tx_completion_pump_preserves_queued_and_fresh_command_replies
 );

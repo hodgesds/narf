@@ -23,6 +23,7 @@ narf-driver-runtime = { path = "../runtime", default-features = false, features 
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-console      = { path = "../../console" }
 narf-time         = { path = "../../time" }
+narf-scheduler    = { path = "../../scheduler" }
 
 [features]
 kernel-test = []

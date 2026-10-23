@@ -102,6 +102,7 @@ struct Shared {
 /// are synchronized. The hard IRQ only acknowledges/latches causes; all
 /// DMA processing stays in the driver task.
 pub struct Interrupts {
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     table: narf_bus::MsixTable,
     vector: u8,
     shared: Box<IrqSafeSpinLock<Shared>>,
@@ -135,37 +136,44 @@ impl Interrupts {
         if region.len < 0x28c0 {
             return Err("Wi-Fi BAR is too short for MSI-X");
         }
-        let mut table =
-            narf_bus::enable_msix(cap, device).map_err(|_| "Wi-Fi has no MSI-X table")?;
+        let mut table = super::mmio::invoke(cap, || narf_bus::enable_msix(cap, device))
+            .map_err(|_| "Wi-Fi authority revoked")?
+            .map_err(|_| "Wi-Fi has no MSI-X table")?;
         table
             .alloc_block(2)
             .map_err(|_| "Wi-Fi MSI-X table too small")?;
-        // SAFETY: the claimed device is not running, and no handler is live.
-        unsafe {
-            table.disable();
-        }
+        super::mmio::invoke(cap, || {
+            // SAFETY: owned config/table, in the live invocation; no handler yet.
+            unsafe {
+                table.disable();
+            }
+        })
+        .map_err(|_| "Wi-Fi authority revoked")?;
         let vector = narf_interrupts::vector::alloc().map_err(|_| "no Wi-Fi IRQ vector")?;
         narf_interrupts::dispatch::enable_irq(vector);
         let shared = Box::new(IrqSafeSpinLock::new(Shared {
-            mmio: super::IwlMmioImpl(region),
+            mmio: super::IwlMmioImpl::new(region, *cap),
             pending: Causes::default(),
         }));
         mask(&mut shared.lock().mmio);
         let cookie = (&*shared as *const IrqSafeSpinLock<Shared>) as u64;
         narf_interrupts::dispatch::install_handler_named(vector, "iwlwifi", cookie, handler);
         let mut this = Self {
+            cap: *cap,
             table,
             vector,
             shared,
         };
-        // SAFETY: both entries were reserved; this object owns cfg/table.
-        unsafe {
+        super::mmio::invoke(cap, || {
             for slot in 0..2 {
-                this.table
-                    .program_vector(slot, 0, vector)
+                // SAFETY: reserved entries and exclusive config/BAR ownership
+                // remain within the current capability invocation.
+                unsafe { this.table.program_vector(slot, 0, vector) }
                     .map_err(|_| "cannot route Wi-Fi MSI-X")?;
             }
-        }
+            Ok(())
+        })
+        .map_err(|_| "Wi-Fi authority revoked")??;
         Ok(this)
     }
 
@@ -175,15 +183,21 @@ impl Interrupts {
             state.pending = Causes::default();
             configure(&mut state.mmio, bz);
         }
-        // SAFETY: both table entries and the handler exist before delivery.
-        unsafe { self.table.enable().map_err(|_| "cannot enable Wi-Fi MSI-X") }
+        super::mmio::invoke(&self.cap, || {
+            // SAFETY: retained entries/handler, exclusive device, live invocation.
+            unsafe { self.table.enable().map_err(|_| "cannot enable Wi-Fi MSI-X") }
+        })
+        .map_err(|_| "Wi-Fi authority revoked")?
     }
-    pub fn mask(&mut self) {
+    pub fn mask(&mut self) -> bool {
         mask(&mut self.shared.lock().mmio);
-        // SAFETY: exclusive device ownership; cookie remains live.
-        unsafe {
-            self.table.disable();
-        }
+        super::mmio::invoke(&self.cap, || {
+            // SAFETY: owned table/config, live invocation and retained cookie.
+            unsafe {
+                self.table.disable();
+            }
+        })
+        .is_ok()
     }
     pub fn take_causes(&self) -> Causes {
         let mut state = self.shared.lock();
@@ -200,12 +214,16 @@ impl Interrupts {
 }
 impl Drop for Interrupts {
     fn drop(&mut self) {
-        self.mask();
+        let masked = self.mask();
         narf_interrupts::dispatch::disable_irq(self.vector);
         let cookie = (&*self.shared as *const IrqSafeSpinLock<Shared>) as u64;
         narf_interrupts::dispatch::remove_handler(self.vector, "iwlwifi", cookie);
         narf_interrupts::dispatch::synchronize_irq(self.vector);
-        let _ = narf_interrupts::vector::free(self.vector);
+        // Revocation prevents proving device delivery disabled. Keep this
+        // vector reserved rather than routing stale device IRQs to a new owner.
+        if masked {
+            let _ = narf_interrupts::vector::free(self.vector);
+        }
     }
 }
 
@@ -215,10 +233,12 @@ impl Drop for Interrupts {
 pub struct Activity {
     irq: Option<narf_interrupts::wait::WaitForIrq>,
     timer: narf_time::SleepUntil,
+    yielded: bool,
 }
 impl Activity {
     pub fn new(vector: Option<u8>, max_ms: u64) -> Self {
         Self {
+            yielded: false,
             irq: vector.map(narf_interrupts::wait::wait_for_irq),
             timer: narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
                 if vector.is_some() { max_ms } else { 1 } * 1_000_000,
@@ -229,6 +249,14 @@ impl Activity {
 impl Future for Activity {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // A retained firmware future may be driven by a synchronous drain.
+        // Always yield once per wait, even if an IRQ stream is already ready,
+        // so one poll cannot spin through an unbounded sequence of completions.
+        if !self.yielded {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
         if let Some(irq) = self.irq.as_mut() {
             if Pin::new(irq).poll(cx).is_ready() {
                 return Poll::Ready(());
@@ -242,6 +270,27 @@ impl Future for Activity {
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_iwl_activity_yields_before_an_already_ready_timer() -> TestResult {
+        let mut activity = Activity {
+            irq: None,
+            timer: narf_time::sleep_cycles(0),
+            yielded: false,
+        };
+        let mut cx = Context::from_waker(core::task::Waker::noop());
+        if Pin::new(&mut activity).poll(&mut cx).is_ready()
+            || Pin::new(&mut activity).poll(&mut cx).is_pending()
+        {
+            return TestResult::Fail(
+                "firmware wait skipped bounded yield or lost ready completion",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/progress",
+        smoke_iwl_activity_yields_before_an_already_ready_timer
+    );
+
     #[derive(Default)]
     struct Mmio(alloc::collections::BTreeMap<u32, u32>);
     impl IwlMmio for Mmio {
@@ -276,18 +325,30 @@ mod tests {
         smoke_msix_real_offsets_and_bz_causes
     );
     fn smoke_msix_completion_before_wait_poll() -> TestResult {
+        struct Wakes(core::sync::atomic::AtomicUsize);
+        impl alloc::task::Wake for Wakes {
+            fn wake(self: alloc::sync::Arc<Self>) {
+                self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let vector = narf_interrupts::vector::alloc().expect("test IRQ vector");
         narf_interrupts::dispatch::enable_irq(vector);
         let mut activity = Activity::new(Some(vector), 10_000);
         // Device completion arrives after the ring was inspected, before
-        // the driver first polls its wait. It must not sleep until timeout.
+        // the driver first polls its wait. The mandatory bounded yield must
+        // self-wake, then deliver that captured completion without a timeout.
         narf_interrupts::dispatch::on_irq(vector);
-        let mut cx = Context::from_waker(core::task::Waker::noop());
+        let wakes = alloc::sync::Arc::new(Wakes(core::sync::atomic::AtomicUsize::new(0)));
+        let waker = core::task::Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let yielded = Pin::new(&mut activity).poll(&mut cx).is_pending();
+        let self_woken = wakes.0.load(core::sync::atomic::Ordering::Relaxed) != 0;
         let ready = Pin::new(&mut activity).poll(&mut cx).is_ready();
         drop(activity);
+        narf_interrupts::dispatch::disable_irq(vector);
         let _ = narf_interrupts::vector::free(vector);
-        if !ready {
-            return TestResult::Fail("completion before wait poll was lost");
+        if !yielded || !self_woken || !ready {
+            return TestResult::Fail("captured IRQ lost after bounded self-waking yield");
         }
         TestResult::Pass
     }

@@ -155,115 +155,202 @@ fn smoke_xhci_enable_slot_command() -> TestResult {
 }
 kernel_test_in!("drivers/usb/xhci", smoke_xhci_enable_slot_command);
 
+/// Enable Slot may return a slot whose old software generation still owns
+/// retained DMA. Keep every such hardware reservation allocated while asking
+/// for another: disabling it immediately would return the same slot forever.
+/// This only observes the production ownership predicate; it never clears it.
+async fn reserve_fresh_address_slot(
+    controller: &crate::xhci::Xhci,
+    held: &mut alloc::vec::Vec<u8>,
+) -> Result<(u8, usize), crate::xhci::XhciError> {
+    use crate::xhci::XhciError;
+    for retired in 0..usize::from(controller.max_slots()) {
+        let slot = controller.enable_slot().await?;
+        if slot == 0 || slot > controller.max_slots() || held.contains(&slot) {
+            return Err(XhciError::CmdFailed(0xFD));
+        }
+        held.push(slot);
+        if controller.test_address_slot_unused(slot) {
+            return Ok((slot, retired));
+        }
+    }
+    Err(XhciError::NotReady)
+}
+
+/// Clear class metadata before Disable Slot: a sleep-pump must not rearm an
+/// interrupt endpoint being retired. The controller retains all DMA mappings.
+async fn release_fixture_slots(
+    controller: &crate::xhci::Xhci,
+    held: &mut alloc::vec::Vec<u8>,
+) -> Result<(), crate::xhci::XhciError> {
+    use core::fmt::Write as _;
+    crate::hid::__reset_keyboards_for_test();
+    let mut first_error = None;
+    for slot in held.drain(..) {
+        if let Err(error) = controller.disable_slot(slot).await {
+            let _ = writeln!(
+                narf_console::Writer,
+                "xhci fixture Disable Slot failed: slot={} error={:?}",
+                slot,
+                error,
+            );
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 fn smoke_xhci_address_device_qemu() -> TestResult {
-    use crate::xhci;
+    use crate::{hid, xhci};
     if !xhci::is_probed() {
         return TestResult::Skip("xhci not probed");
     }
-    let port_speed = xhci::with_controller(|c| {
-        let connected = c.connected_ports();
-        connected
-            .first()
-            .copied()
-            .map(|(p, _)| (p, c.port_speed(p)))
-    })
-    .flatten();
-    let (port, speed) = match port_speed {
-        Some((p, Some(s))) => (p, s),
-        _ => return TestResult::Skip("no connected port / unknown speed"),
-    };
-    // Earlier tests (e.g. smoke_xhci_hid_kbd_first_report) may have left
-    // a slot bound to this port. Address Device on a port that's already
-    // assigned to another slot returns TRB Error "port already
-    // assigned", so release any stale binding before exercising the
-    // command. Also clears the hid keyboard registry so a subsequent
-    // hid_kbd run starts from a clean state.
-    crate::hid::__reset_keyboards_for_test();
-    if let Some(Some(stale)) = xhci::with_controller(|c| c.slot_for_port(port)) {
-        if let Some(c) = xhci::controller() {
-            let _ = narf_scheduler::block_on(async { c.disable_slot(stale).await });
-        }
-    }
-    let _post = match xhci::controller() {
-        Some(c) => match narf_scheduler::block_on(async { c.port_reset(port).await }) {
-            Ok(v) => v,
-            Err(_) => return TestResult::Fail("port_reset failed"),
-        },
-        None => return TestResult::Fail("xhci controller missing"),
-    };
     let c = match xhci::controller() {
         Some(c) => c,
         None => return TestResult::Fail("xhci controller missing"),
     };
-    let slot_id = match narf_scheduler::block_on(async { c.enable_slot().await }) {
-        Ok(s) => s,
-        _ => return TestResult::Fail("enable_slot failed"),
+    let port = match c.connected_ports().first().copied() {
+        Some((port, _)) => port,
+        None => return TestResult::Skip("no connected port"),
     };
-    let r = match narf_scheduler::block_on(async { c.address_device(slot_id, port, speed).await }) {
-        Ok(_) => TestResult::Pass,
-        _ => TestResult::Fail("address_device failed"),
-    };
-    // Release the slot so later tests (e.g. smoke_xhci_hid_kbd_first_report)
-    // can re-address the same port without TRB Error "port already
-    // assigned". Best-effort; the assertion is the address_device
-    // result above.
-    let _ = narf_scheduler::block_on(async { c.disable_slot(slot_id).await });
-    r
+    hid::__reset_keyboards_for_test();
+    let stale_slot = c.slot_for_port(port);
+    let disable_result =
+        stale_slot.map(|slot| narf_scheduler::block_on(async { c.disable_slot(slot).await }));
+    if matches!(disable_result, Some(Err(_))) {
+        return TestResult::Fail("could not disable earlier port binding");
+    }
+
+    // Exercise both orders deterministically. Each cycle addresses and, for a
+    // keyboard, runs the real descriptor/configuration/interrupt-IN path. Its
+    // successful Disable retires the software generation. Its predicate must
+    // stay closed when the next cycle selects a fresh slot, regardless of
+    // whether the controller returns the lowest free or a rotating slot ID.
+    let mut previous_slot = None;
+    for cycle in 0..2 {
+        let mut held = alloc::vec::Vec::new();
+        let mut addressed_slot = None;
+        let result = narf_scheduler::block_on(async {
+            let pre_speed = c.port_speed(port);
+            let post = match c.port_reset(port).await {
+                Ok(post) => post,
+                Err(_) => return TestResult::Fail("port_reset failed"),
+            };
+            let speed = match c.port_speed(port) {
+                Some(speed) => speed,
+                None => return TestResult::Fail("unknown post-reset port speed"),
+            };
+            let (slot, retired) = match reserve_fresh_address_slot(&c, &mut held).await {
+                Ok(reservation) => reservation,
+                Err(_) => return TestResult::Fail("no fresh software slot available"),
+            };
+            if previous_slot == Some(slot)
+                || previous_slot.is_some_and(|old| c.test_address_slot_unused(old))
+            {
+                return TestResult::Fail("second address cycle reopened retired ownership");
+            }
+            if let Err(error) = c.address_device(slot, port, speed).await {
+                // Failure-only diagnostics preserve the command timing window.
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "xhci address smoke: error={:?} cycle={} slot={} retired={} port={} pre_speed={:?} post_speed={:?} portsc={:#x} stale={:?} disable={:?} mapped={:?} generation={:?} retained={:?}",
+                    error, cycle, slot, retired, port, pre_speed, c.port_speed(port), post,
+                    stale_slot, disable_result, c.slot_for_port(port),
+                    c.device_generation(slot), c.device_info(slot),
+                );
+                return TestResult::Fail("address_device failed");
+            }
+            addressed_slot = Some(slot);
+            match hid::try_bind_kbd_already_addressed(&c, slot, port, speed).await {
+                Ok(()) | Err(hid::HidError::NotBootKeyboard) => TestResult::Pass,
+                Err(_) => TestResult::Fail("HID bind after fresh Address Device failed"),
+            }
+        });
+        // Cleanup is checked even when the address/class path failed. The next
+        // cycle starts after a real successful Disable, not a software reset.
+        if narf_scheduler::block_on(release_fixture_slots(&c, &mut held)).is_err() {
+            return TestResult::Fail("fixture slot cleanup failed");
+        }
+        if !matches!(result, TestResult::Pass) {
+            return result;
+        }
+        let slot = addressed_slot.expect("passing cycle addressed a real device");
+        if c.test_address_slot_unused(slot)
+            || c.device_generation(slot).is_some()
+            || c.device_info(slot).is_none()
+        {
+            return TestResult::Fail("successful Disable discarded retained generation ownership");
+        }
+        previous_slot = Some(slot);
+    }
+    TestResult::Pass
 }
 kernel_test_in!("drivers/usb/xhci", smoke_xhci_address_device_qemu);
 
-/// End-to-end live USB-HID kbd attach + first interrupt-IN report.
-/// Runs the full enumeration via `try_attach_keyboard_on_port` (port
-/// reset → enable_slot → address_device → SET_CONFIG → SET_PROTOCOL
-/// → arm_interrupt_in) and then waits up to 200 ms for the device to
-/// emit any boot-time / "no keys held" report. QEMU's usb-kbd sends
-/// an empty report shortly after attach, so we use that as the "the
-/// MSI-X + interrupt-IN + drain plumbing is wired correctly"
-/// witness. Without the bring_up CRCR/ERSTBA write-order fix or the
-/// IMAN re-write after MSI-X enable this test would either fail
-/// attach (CmdTimeout / TRB Error) or never see a report.
+/// Live USB-HID attach, followed by a bounded interrupt-IN pump. Enumeration
+/// uses a fresh software slot and the real post-address class path, so this
+/// works before or after the address/retire fixture. A quiet keyboard need not
+/// emit a report; this asserts successful configuration and periodic pumping.
 fn smoke_xhci_hid_kbd_first_report() -> TestResult {
     use crate::{hid, xhci};
     if !xhci::is_probed() {
         return TestResult::Skip("xhci not probed");
     }
-    // Reset state — earlier tests may have allocated slots already.
+    let c = match xhci::controller() {
+        Some(c) => c,
+        None => return TestResult::Fail("xhci controller missing"),
+    };
     hid::__reset_keyboards_for_test();
-    let port = match xhci::with_controller(|c| c.connected_ports().first().copied().map(|(p, _)| p))
-        .flatten()
-    {
-        Some(p) => p,
+    let port = match c.connected_ports().first().copied() {
+        Some((port, _)) => port,
         None => return TestResult::Skip("no connected port"),
     };
-    let attached = match xhci::controller() {
-        Some(c) => narf_scheduler::block_on(async {
-            hid::try_attach_keyboard_on_port(&c, port).await.is_ok()
-        }),
-        None => false,
-    };
-    if !attached {
-        return TestResult::Skip("port not a HID Boot Keyboard");
-    }
-    // Pump up to ~200 ms looking for any report. The first report
-    // comes from the device automatically (USB-HID kbd sends an
-    // initial "no keys held" report on enumeration).
-    let deadline = narf_time::Deadline::after_ms(200);
-    while !deadline.expired() {
-        let n = xhci::with_controller(hid::pump_all).unwrap_or(0);
-        if n > 0 {
-            // Got a press/release event — fully end-to-end.
-            return TestResult::Pass;
+    if let Some(stale) = c.slot_for_port(port) {
+        if narf_scheduler::block_on(c.disable_slot(stale)).is_err() {
+            return TestResult::Fail("could not disable earlier port binding");
         }
-        // Even with n=0, if KEYBOARDS list is non-empty AND we
-        // pumped a report (which translate_diff folded into
-        // last_report w/o emitting), the path is functional. The
-        // best signal we have without a key actually being pressed
-        // is "kbd registered + pump returned without error".
     }
-    // No report arrived in 200 ms — still a pass for the wiring
-    // check as long as attach succeeded; absence of a key press
-    // doesn't mean the pipeline is broken.
-    TestResult::Pass
+    let mut held = alloc::vec::Vec::new();
+    let result = narf_scheduler::block_on(async {
+        if c.port_reset(port).await.is_err() {
+            return TestResult::Fail("HID port_reset failed");
+        }
+        let speed = match c.port_speed(port) {
+            Some(speed) => speed,
+            None => return TestResult::Fail("unknown HID post-reset port speed"),
+        };
+        let (slot, _) = match reserve_fresh_address_slot(&c, &mut held).await {
+            Ok(reservation) => reservation,
+            Err(_) => return TestResult::Fail("no fresh HID software slot available"),
+        };
+        if c.address_device(slot, port, speed).await.is_err() {
+            return TestResult::Fail("HID Address Device failed");
+        }
+        match hid::try_bind_kbd_already_addressed(&c, slot, port, speed).await {
+            Ok(()) => TestResult::Pass,
+            Err(hid::HidError::NotBootKeyboard) => TestResult::Skip("port not a HID Boot Keyboard"),
+            Err(_) => TestResult::Fail("HID configuration/transport failed"),
+        }
+    });
+    if matches!(result, TestResult::Pass) {
+        narf_scheduler::block_on(async {
+            let deadline = narf_time::Deadline::after_ms(200);
+            while !deadline.expired() {
+                if hid::pump_all(&c) > 0 {
+                    break;
+                }
+                // No class/controller guard survives this self-driven wait.
+                // block_on drives sleep_pumps after direct HID pumping has
+                // returned, so other devices progress without recursive locks.
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            }
+        });
+    }
+    if narf_scheduler::block_on(release_fixture_slots(&c, &mut held)).is_err() {
+        return TestResult::Fail("HID fixture slot cleanup failed");
+    }
+    result
 }
 kernel_test_in!("drivers/usb/xhci", smoke_xhci_hid_kbd_first_report);
 

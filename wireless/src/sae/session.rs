@@ -6,7 +6,7 @@
 //!
 //! ```ignore
 //! let mut s = SaeSession::new("MySSID", "password", own_mac, peer_mac);
-//! let commit_out = s.build_commit();
+//! let commit_out = s.try_build_commit()?;
 //! tx_to_peer(commit_out);
 //! s.on_commit(&peer_commit)?;
 //! let confirm_out = s.build_confirm();
@@ -45,6 +45,7 @@
 //! sync counter and refuse after `MAX_SYNC_RETRIES`.
 
 use alloc::vec::Vec;
+use zeroize::Zeroizing;
 
 use narf_crypto::p256::point::{scalar_mul, AffinePoint};
 use narf_crypto::p256::scalar::Scalar;
@@ -222,6 +223,7 @@ impl SaeSession {
 
     /// Test hook: fix `rand` and `mask` (big-endian, each in `[1, r)`)
     /// the way hostap's `sae_tests` overrides `sae->tmp->sae_rand`.
+    #[cfg(any(test, feature = "kernel-test"))]
     pub fn with_test_rand_mask(mut self, rand: [u8; 32], mask: [u8; 32]) -> Self {
         if let (Some(r), Some(m)) = (Scalar::from_bytes_be(&rand), Scalar::from_bytes_be(&mask)) {
             self.test_rand_mask = Some((r, m));
@@ -263,7 +265,8 @@ impl SaeSession {
     /// Test hook: seed the per-handshake RNG with a deterministic
     /// 64-byte value so smokes can re-derive the same Commit pair.
     /// Production callers do not use this — `new` pulls entropy from
-    /// `narf_crypto::per_task_rng()`.
+    /// guarded hardware entropy, with no timing-seeded fallback.
+    #[cfg(any(test, feature = "kernel-test"))]
     pub fn with_test_seed(mut self, seed: [u8; 64]) -> Self {
         self.test_seed = Some(seed);
         self
@@ -329,49 +332,78 @@ impl SaeSession {
     /// a re-Commit (sync retry); the local rand / private are kept so
     /// the peer's prior Commit (if any) still matches our K.
     pub fn build_commit(&mut self) -> Vec<u8> {
-        // sae_prepare_commit / sae_prepare_commit_pt → PWE.
+        self.try_build_commit().unwrap_or_default()
+    }
+
+    /// Build a commit only with secure entropy. Failure exposes no Commit and
+    /// leaves all ephemeral/state fields unchanged. Retries return the same
+    /// cached scalar/element without resampling or resetting the transcript.
+    pub fn try_build_commit(&mut self) -> Result<Vec<u8>, SaeError> {
+        self.try_build_commit_with_entropy(|out| {
+            narf_crypto::try_fill_random_bytes(out).map_err(|_| SaeError::EntropyUnavailable)
+        })
+    }
+    /// Use a driver's entropy provider. The provider must fill every requested
+    /// byte with unpredictable secure randomness, or return EntropyUnavailable;
+    /// timing counters and deterministic fallbacks are forbidden. Partial output
+    /// is private and zeroized on failure. A committed retry does not call it.
+    pub fn try_build_commit_with_entropy(
+        &mut self,
+        mut entropy: impl FnMut(&mut [u8]) -> Result<(), SaeError>,
+    ) -> Result<Vec<u8>, SaeError> {
+        match self.state {
+            SaeState::Committed => return Ok(self.commit_body(None)),
+            SaeState::Nothing => {}
+            _ => return Err(SaeError::Protocol),
+        }
         let pwe = match &self.pwe_src {
             PweSource::H2e(pt) => pwe_from_pt(*pt, &self.own_mac, &self.peer_mac),
-            PweSource::HuntAndPeck(pw) => {
-                match pwe_hunt_and_peck(pw, &self.own_mac, &self.peer_mac) {
-                    Some((p, _)) => p,
-                    // "SAE: Could not pick PWE"
-                    None => return Vec::new(),
-                }
-            }
+            PweSource::HuntAndPeck(pw) => pwe_hunt_and_peck(pw, &self.own_mac, &self.peer_mac)
+                .map(|(p, _)| p)
+                .ok_or(SaeError::InvalidParameters)?,
         };
-        self.pwe = Some(pwe);
-
-        // sae_derive_commit: rand, mask; commit-scalar = (rand + mask)
-        // mod r must be > 1 (dragonfly_generate_scalar retries).
+        if pwe.infinity {
+            return Err(SaeError::InvalidParameters);
+        }
         let (rand, mask, commit_scalar) = match self.test_rand_mask {
             Some((r, m)) => (r, m, r.add(&m)),
             None => {
-                let mut tries = 0u8;
-                loop {
-                    let (r, m) = sample_two_scalars(self.test_seed.as_ref(), tries);
+                let mut sampled = None;
+                for retry in 0..16 {
+                    let (r, m) = sample_two_scalars(self.test_seed.as_ref(), retry, &mut entropy)?;
                     let c = r.add(&m);
-                    tries = tries.wrapping_add(1);
                     if !c.is_zero() && c != Scalar::ONE {
-                        break (r, m, c);
+                        sampled = Some((r, m, c));
+                        break;
                     }
                 }
+                sampled.ok_or(SaeError::InvalidParameters)?
             }
         };
-        self.rand = rand;
-        self.private = mask;
-        self.commit_scalar = commit_scalar;
-
-        // COMMIT-ELEMENT = inverse(scalar-op(mask, PWE))
+        if rand.is_zero()
+            || mask.is_zero()
+            || commit_scalar.is_zero()
+            || commit_scalar == Scalar::ONE
+        {
+            return Err(SaeError::InvalidParameters);
+        }
         let mp = scalar_mul(&mask, &pwe);
-        self.commit_element = AffinePoint {
+        let commit_element = AffinePoint {
             x: mp.x,
             y: mp.y.neg(),
             infinity: mp.infinity,
         };
-
+        if commit_element.to_encoded().is_none() {
+            return Err(SaeError::InvalidParameters);
+        }
+        // Commit only after entropy, geometry and scalar/point checks succeed.
+        self.pwe = Some(pwe);
+        self.rand = rand;
+        self.private = mask;
+        self.commit_scalar = commit_scalar;
+        self.commit_element = commit_element;
         self.state = SaeState::Committed;
-        self.commit_body(None)
+        Ok(self.commit_body(None))
     }
 
     /// Consume the peer's Commit body (after the Authentication frame's
@@ -582,9 +614,18 @@ impl SaeSession {
 
     /// Wire-format Commit frame body. Useful for inspecting what
     /// `build_commit` produced (tests / driver tracing).
+    pub fn try_build_commit_frame(&mut self) -> Result<CommitFrame, SaeError> {
+        CommitFrame::decode(&self.try_build_commit()?, 32, 64).ok_or(SaeError::InvalidParameters)
+    }
+    /// Legacy wrapper: an entropy failure returns empty scalar/element fields
+    /// and never advances the session. Transmitters must use the fallible API.
     pub fn build_commit_frame(&mut self) -> CommitFrame {
-        let body = self.build_commit();
-        CommitFrame::decode(&body, 32, 64).expect("self-built commit must decode")
+        self.try_build_commit_frame()
+            .unwrap_or_else(|_| CommitFrame {
+                group: 19,
+                scalar: Vec::new(),
+                element: Vec::new(),
+            })
     }
 
     /// Wire-format Confirm frame. Same idea as `build_commit_frame`.
@@ -594,36 +635,29 @@ impl SaeSession {
     }
 }
 
-/// Pull two random scalars from either the test seed or the per-task
-/// RNG. Mirrors `dragonfly::group_random_scalar` so the H2E session
-/// uses the same entropy source as the legacy path.
-fn sample_two_scalars(test_seed: Option<&[u8; 64]>, retry: u8) -> (Scalar, Scalar) {
-    fn from_seed(seed: &[u8; 64], info: &[u8]) -> Scalar {
-        let prk = narf_crypto::hkdf::hkdf_extract(None, seed);
-        let okm = narf_crypto::hkdf::hkdf_expand(&prk, info, 48);
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&okm[16..48]);
-        let mut s = Scalar::from_bytes_be_reduce(&bytes);
-        if s.is_zero() {
-            s = Scalar::ONE;
+/// Sample separate nonzero scalars without modular-reduction bias. Production
+/// obtains independent 32-byte candidates; explicit fixture seeds use separate
+/// domain/counter expansions and change their transcript on a pair retry.
+fn sample_two_scalars(
+    test_seed: Option<&[u8; 64]>,
+    retry: u8,
+    entropy: &mut impl FnMut(&mut [u8]) -> Result<(), SaeError>,
+) -> Result<(Scalar, Scalar), SaeError> {
+    use super::dragonfly::{random_scalar_from_seed, sample_scalar};
+    match test_seed {
+        Some(seed) => {
+            let mut seed = Zeroizing::new(*seed);
+            seed[0] ^= retry;
+            Ok((
+                random_scalar_from_seed(&seed, b"SAE H2E rand")?,
+                random_scalar_from_seed(&seed, b"SAE H2E mask")?,
+            ))
         }
-        s
+        None => Ok((
+            sample_scalar(|_, candidate| entropy(candidate))?,
+            sample_scalar(|_, candidate| entropy(candidate))?,
+        )),
     }
-    let seed = match test_seed {
-        Some(s) => {
-            let mut s = *s;
-            s[0] ^= retry;
-            s
-        }
-        None => {
-            let mut buf = [0u8; 64];
-            narf_crypto::fill_random_bytes(&mut buf);
-            buf
-        }
-    };
-    let rand = from_seed(&seed, b"SAE H2E rand");
-    let mask = from_seed(&seed, b"SAE H2E mask");
-    (rand, mask)
 }
 
 /// SAE keyseed (IEEE 802.11-2020 §12.4.5.4, hostap `sae_derive_keys`):
@@ -673,6 +707,73 @@ pub fn kdf_sha256(key: &[u8], label: &[u8], context: &[u8], out_len: usize) -> V
 mod session_tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_sae_entropy_failure_preserves_commit_state_and_retry() -> TestResult {
+        for hp in [false, true] {
+            let mut s = if hp {
+                SaeSession::new_hunt_and_peck(b"pw", [0x11; 6], [0x22; 6])
+            } else {
+                SaeSession::new("net", "pw", [0x11; 6], [0x22; 6])
+            };
+            if s.try_build_commit_with_entropy(|out| {
+                out[..32].fill(0xaa);
+                Err(SaeError::EntropyUnavailable)
+            }) != Err(SaeError::EntropyUnavailable)
+                || s.state() != SaeState::Nothing
+                || s.pwe.is_some()
+                || s.rand != Scalar::ZERO
+                || s.private != Scalar::ZERO
+                || !s.commit_body(None).is_empty()
+                || s.pmk().is_some()
+            {
+                return TestResult::Fail("failed SAE entropy published/retained a partial commit");
+            }
+            let commit = s
+                .try_build_commit_with_entropy(|out| {
+                    out.fill(0x55);
+                    Ok(())
+                })
+                .unwrap();
+            if commit.len() != 98
+                || s.state() != SaeState::Committed
+                || s.try_build_commit_with_entropy(|_| Err(SaeError::EntropyUnavailable))
+                    != Ok(commit)
+            {
+                return TestResult::Fail(
+                    "SAE retry resampled instead of retaining committed scalars",
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/sae",
+        smoke_sae_entropy_failure_preserves_commit_state_and_retry
+    );
+
+    fn smoke_sae_scalar_rejection_keeps_session_uncommitted() -> TestResult {
+        let mut session = SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]);
+        let mut calls = 0;
+        if session.try_build_commit_with_entropy(|bytes| {
+            calls += 1;
+            bytes.fill(0);
+            Ok(())
+        }) != Err(SaeError::InvalidParameters)
+            || calls != 16
+            || session.state() != SaeState::Nothing
+            || session.pwe.is_some()
+            || session.rand != Scalar::ZERO
+            || session.private != Scalar::ZERO
+            || !session.commit_body(None).is_empty()
+        {
+            return TestResult::Fail("bounded rejection published a zero/partial SAE commit");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/sae",
+        smoke_sae_scalar_rejection_keeps_session_uncommitted
+    );
 
     fn smoke_sae_session_commit_frame_layout() -> TestResult {
         // §9.4.1.36 / Table 9-72: Commit body = group(2 LE) || scalar(32)
@@ -778,7 +879,7 @@ mod session_tests {
 
     fn smoke_sae_session_state_machine_rejects_premature_confirm() -> TestResult {
         // build_confirm before on_commit must not advance state.
-        let mut a = SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]);
+        let mut a = SaeSession::new("net", "pw", [0x11; 6], [0x22; 6]).with_test_seed([0x11; 64]);
         let _ = a.build_commit();
         let _ = a.build_confirm();
         // kck not set, build_confirm returned empty body; state must
@@ -1062,7 +1163,8 @@ mod session_tests {
         {
             return TestResult::Fail("H2E token container");
         }
-        let mut peer = SaeSession::new_h2e_bytes(b"byteme", b"pw", J10_ADDR2, J10_ADDR1);
+        let mut peer = SaeSession::new_h2e_bytes(b"byteme", b"pw", J10_ADDR2, J10_ADDR1)
+            .with_test_seed([0x77; 64]);
         let mut pc = peer.build_commit();
         pc.extend_from_slice(&[0xFF, 3, EID_EXT_REJECTED_GROUPS, 19, 0]);
         if h.on_commit(&pc) != Err(SaeError::InvalidParameters) {

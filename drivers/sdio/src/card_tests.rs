@@ -1,0 +1,285 @@
+use super::*;
+use alloc::{rc::Rc, vec, vec::Vec};
+use core::cell::RefCell;
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+struct State {
+    registers: [u8; 256],
+    common: Vec<u8>,
+    commands: Vec<(u8, u32, u16)>,
+    words: Vec<u32>,
+    left: usize,
+    reject_data: bool,
+}
+impl State {
+    fn set32(&mut self, a: u32, v: u32) {
+        self.registers[a as usize..a as usize + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn get32(&self, a: u32) -> u32 {
+        u32::from_le_bytes(
+            self.registers[a as usize..a as usize + 4]
+                .try_into()
+                .unwrap(),
+        )
+    }
+    fn get16(&self, a: u32) -> u16 {
+        u16::from_le_bytes(
+            self.registers[a as usize..a as usize + 2]
+                .try_into()
+                .unwrap(),
+        )
+    }
+    fn moved(&mut self) {
+        self.left -= 1;
+        if self.left == 0 {
+            self.set32(PRESENT_STATE, PS_CARD_PRESENT);
+            self.set32(INT_STATUS, self.get32(INT_STATUS) | INT_DATA_END);
+        }
+    }
+}
+#[derive(Clone)]
+struct Model(Rc<RefCell<State>>);
+impl Model {
+    fn new() -> Self {
+        let mut s = State {
+            registers: [0; 256],
+            common: vec![0; 0x20000],
+            commands: Vec::new(),
+            words: Vec::new(),
+            left: 0,
+            reject_data: false,
+        };
+        s.set32(CAPABILITIES, (50 << 8) | CAPS_CAN_VDD_330);
+        s.registers[HOST_VERSION as usize] = SPEC_300 as u8;
+        s.set32(PRESENT_STATE, PS_CARD_PRESENT);
+        s.common[CCCR_SDIO_REVISION as usize] = 0x32;
+        s.common[CCCR_IO_ENABLE as usize] = 6;
+        s.common[CCCR_IO_READY as usize] = 6;
+        s.common[9..12].copy_from_slice(&[0, 0x10, 0]);
+        s.common[0x1000..0x100d]
+            .copy_from_slice(&[0x20, 4, 0xd0, 2, 0xaf, 0xa9, 0x22, 4, 0, 0, 2, 0x32, 0xff]);
+        for f in 1..=2 {
+            let a = 0x100 * f + 9;
+            let cis = 0x1000 + f * 0x100;
+            s.common[a..a + 3].copy_from_slice(&[0, (cis >> 8) as u8, 0]);
+            s.common[cis] = 0x22;
+            s.common[cis + 1] = 42;
+            s.common[cis + 2] = 1;
+            if f == 1 {
+                s.common[cis + 2 + 12] = 64;
+            } else {
+                s.common[cis + 2 + 13] = 2;
+            }
+            s.common[cis + 44] = 0xff;
+        }
+        Self(Rc::new(RefCell::new(s)))
+    }
+}
+impl Registers for Model {
+    fn read8(&mut self, a: u32) -> u8 {
+        self.0.borrow().registers[a as usize]
+    }
+    fn read16(&mut self, a: u32) -> u16 {
+        self.0.borrow().get16(a)
+    }
+    fn read32(&mut self, a: u32) -> u32 {
+        let mut s = self.0.borrow_mut();
+        if a == BUFFER {
+            s.words.push(0x44332211);
+            s.moved();
+            0x44332211
+        } else {
+            s.get32(a)
+        }
+    }
+    fn write8(&mut self, a: u32, value: u8) {
+        self.0.borrow_mut().registers[a as usize] = if a == SOFTWARE_RESET { 0 } else { value };
+    }
+    fn write16(&mut self, a: u32, value: u16) {
+        let mut s = self.0.borrow_mut();
+        let stored = if a == CLOCK_CONTROL && value & CLK_INT_EN != 0 {
+            value | CLK_INT_STABLE
+        } else {
+            value
+        };
+        s.registers[a as usize..a as usize + 2].copy_from_slice(&stored.to_le_bytes());
+        if a != COMMAND {
+            return;
+        }
+        let cmd = (value >> 8) as u8;
+        let arg = s.get32(ARGUMENT);
+        let mode = s.get16(TRANSFER_MODE);
+        s.commands.push((cmd, arg, mode));
+        let status = s.get32(INT_STATUS) | INT_RESPONSE;
+        s.set32(INT_STATUS, status);
+        let response = match cmd {
+            5 => 0xa0300000,
+            3 => 0x12340000,
+            52 => {
+                let addr = ((arg >> 9) & 0x1ffff) as usize;
+                if arg >> 31 != 0 {
+                    s.common[addr] = arg as u8;
+                    if addr == CCCR_IO_ENABLE as usize {
+                        s.common[CCCR_IO_READY as usize] = arg as u8;
+                    }
+                }
+                u32::from(s.common[addr])
+            }
+            53 if s.reject_data => 0x0200,
+            _ => 0,
+        };
+        s.set32(RESPONSE, response);
+        if value & CMD_DATA != 0 {
+            s.left =
+                usize::from(s.get16(BLOCK_SIZE)).div_ceil(4) * usize::from(s.get16(BLOCK_COUNT));
+            s.set32(
+                PRESENT_STATE,
+                PS_CARD_PRESENT
+                    | if mode & TRNS_READ != 0 {
+                        PS_DATA_AVAIL
+                    } else {
+                        PS_SPACE_AVAIL
+                    },
+            );
+        } else if value & CMD_RESP_MASK == CMD_RESP_SHORT_BUSY {
+            let status = s.get32(INT_STATUS) | INT_DATA_END;
+            s.set32(INT_STATUS, status);
+        }
+    }
+    fn write32(&mut self, a: u32, value: u32) {
+        let mut s = self.0.borrow_mut();
+        if a == INT_STATUS {
+            let new = s.get32(a) & !value;
+            s.set32(a, new);
+        } else if a == BUFFER {
+            s.words.push(value);
+            s.moved();
+        } else {
+            s.set32(a, value);
+        }
+    }
+}
+fn smoke_sdio_owned_card_enumeration_and_fifo() -> TestResult {
+    let model = Model::new();
+    let shared = model.0.clone();
+    let mut card = match Card::initialize(model, Config::default()) {
+        Ok(card) => card,
+        Err(_) => return TestResult::Fail("card initialization failed"),
+    };
+    if card.host().rca != 0x1234
+        || card.host().func_count != 2
+        || card.host().current_clock_hz != 25_000_000
+        || card
+            .function(2)
+            .map(|f| (f.vendor, f.device, f.max_block_size))
+            != Some((0x02d0, 0xa9af, 512))
+    {
+        return TestResult::Fail("actual card response/CIS not retained");
+    }
+    if shared.borrow().commands[..5]
+        .iter()
+        .map(|v| v.0)
+        .collect::<Vec<_>>()
+        != [0, 5, 5, 3, 7]
+    {
+        return TestResult::Fail("SDIO card command order differs");
+    }
+    if shared.borrow().common[CCCR_IO_ENABLE as usize] != 0 {
+        return TestResult::Fail("inherited functions remained enabled across host reset");
+    }
+    if card.cmd53_write(2, 0, &[1; 8]) != Err(SdioError::NotEnabled)
+        || card.enable_func(2).is_err()
+        || card.set_block_size(2, 512).is_err()
+        || card.cmd53_block_write(2, 0, 512, 2, &[0x55; 1024]).is_err()
+    {
+        return TestResult::Fail("function enable/block PIO failed");
+    }
+    let mut data = [0; 8];
+    if card.cmd53_read_fixed(2, 0, &mut data).is_err()
+        || data != [0x11, 0x22, 0x33, 0x44, 0x11, 0x22, 0x33, 0x44]
+    {
+        return TestResult::Fail("fixed FIFO read failed");
+    }
+    let s = shared.borrow();
+    let last = s.commands.last().unwrap();
+    if last.0 != 53
+        || last.1 & (1 << 26) != 0
+        || last.1 & 511 != 8
+        || s.common[0x210..0x212] != [0, 2]
+        || last.2 & TRNS_DMA != 0
+    {
+        return TestResult::Fail("fixed CMD53/FBR or PIO flags differ");
+    }
+    drop(s);
+    drop(card);
+    let s = shared.borrow();
+    if s.get16(CLOCK_CONTROL) != 0 || s.registers[POWER_CONTROL as usize] != 0 {
+        return TestResult::Fail("owned card drop did not power down");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_owned_card_enumeration_and_fifo
+);
+
+fn smoke_sdio_card_invalid_extent_and_r5_no_fifo() -> TestResult {
+    let model = Model::new();
+    let shared = model.0.clone();
+    let mut card = match Card::initialize(model, Config::default()) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("init"),
+    };
+    if card.enable_func(1).is_err() {
+        return TestResult::Fail("enable");
+    }
+    let before = shared.borrow().commands.len();
+    if card.cmd52_read(1, 0x20000) != Err(SdioError::AddressOverflow)
+        || card.cmd53_write(1, 0x1ffff, &[1; 2]) != Err(SdioError::AddressOverflow)
+        || card.cmd53_write(1, 0, &[1; 65]) != Err(SdioError::LengthOverflow)
+        || shared.borrow().commands.len() != before
+    {
+        return TestResult::Fail("invalid address reached command register");
+    }
+    shared.borrow_mut().reject_data = true;
+    if card.cmd53_write(1, 0, &[1; 4]) != Err(SdioError::ResponseError(2))
+        || !shared.borrow().words.is_empty()
+        || !card.is_failed()
+    {
+        return TestResult::Fail("R5 rejection touched FIFO or allowed reuse");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_card_invalid_extent_and_r5_no_fifo
+);
+
+fn smoke_sdio_card_cis_bounds_and_clock_limits() -> TestResult {
+    let host = SdhciHost::new(0, SPEC_300 as u8, 50 << 8, 0);
+    if host.clock_divisor(400_000) != 126
+        || host.clock_divisor(12_000_000) != 6
+        || host.calc_clk_div(12_000_000) != 0x300
+    {
+        return TestResult::Fail("v3 even clock divisor wrong");
+    }
+    let host = SdhciHost::new(0, SPEC_200 as u8, 50 << 8, 0);
+    if host.clock_divisor(400_000) != 128 || host.clock_divisor(12_000_000) != 8 {
+        return TestResult::Fail("v2 power-of-two divisor wrong");
+    }
+    let model = Model::new();
+    let shared = model.0.clone();
+    shared.borrow_mut().common[0x1000..0x1400].fill(0);
+    if !matches!(Card::initialize(model, Config::default()), Err(Error::Cis)) {
+        return TestResult::Fail("unterminated CIS accepted");
+    }
+    let s = shared.borrow();
+    if s.commands.len() > 1050 || s.registers[POWER_CONTROL as usize] != 0 {
+        return TestResult::Fail("CIS work unbounded or failed init not powered down");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_card_cis_bounds_and_clock_limits
+);

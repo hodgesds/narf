@@ -2,7 +2,7 @@
 //!
 //! The rtlwifi family encodes its power-state transitions as arrays of
 //! `WlanPwrCfg` structs.  Linux walks the array with
-//! `rtl_hal_pwrseqcmdparsing` (`rtlwifi/core.c:1746`).  Each entry is a
+//! `rtl_hal_pwrseqcmdparsing` (`rtlwifi/pwrseqcmd.c`).  Each entry is a
 //! (offset, cut-mask, fab/interface-mask, base, cmd, mask, value) tuple
 //! and the parser dispatches on `cmd` to do a register write, register
 //! polling read, microsecond/millisecond delay, or end-of-table marker.
@@ -14,7 +14,7 @@
 //! ## Linux reference (GPL-2.0; NARF is GPL-2.0-or-later)
 //!
 //! - `rtlwifi/pwrseqcmd.h` — struct + command IDs + base addresses
-//! - `rtlwifi/core.c::rtl_hal_pwrseqcmdparsing` — command parser
+//! - `rtlwifi/pwrseqcmd.c::rtl_hal_pwrseqcmdparsing` — command parser
 //! - `rtlwifi/rtl8192ee/pwrseq.{c,h}` — RTL8192EE NIC enable table
 //! - `rtlwifi/rtl8188ee/pwrseq.{c,h}` — RTL8188EE table
 //! - `rtlwifi/rtl8723be/pwrseq.{c,h}` — RTL8723BE table
@@ -138,20 +138,107 @@ impl WlanPwrCfg {
 pub enum PwrSeqError {
     /// Polling loop did not converge.  Linux returns `false`; we surface it.
     PollingTimeout,
-    /// Unknown command word — table corruption.
+    /// Unknown command/base, invalid delay unit or missing END — table corruption.
     BadCmd,
+    /// Register access could not be authorized or lies outside the aperture.
+    Access,
 }
 
-/// Walk a power-sequence table.  Mirrors
-/// `rtlwifi/core.c::rtl_hal_pwrseqcmdparsing` (line 1746).
-///
-/// - `cut_version`: e.g. `PWR_CUT_A_MSK` for an A-cut chip.
-/// - `fab_version`: e.g. `PWR_FAB_TSMC_MSK`.
-/// - `interface_type`: always `PWR_INTF_PCI_MSK` here.
-/// - `table`: array of `WlanPwrCfg` ending in `PWR_CMD_END`.
+/// Register seam shared by the production MMIO parser and traced models.
+/// No method may wait on another executor task while the synchronous parser runs.
+pub trait Io {
+    fn read8(&self, offset: u16) -> Result<u8, PwrSeqError>;
+    fn write8(&self, offset: u16, value: u8) -> Result<(), PwrSeqError>;
+    fn delay_us(&self, micros: u64) {
+        narf_scheduler::responsive_spin_until(|| false, Deadline::after_us(micros));
+    }
+}
+struct MmioIo<'a>(&'a MmioRegion);
+impl Io for MmioIo<'_> {
+    fn read8(&self, offset: u16) -> Result<u8, PwrSeqError> {
+        if u64::from(offset) >= self.0.len {
+            return Err(PwrSeqError::Access);
+        }
+        // SAFETY: run_pwrseq caller owns the mapped register aperture.
+        Ok(unsafe { self.0.read8(u64::from(offset)) })
+    }
+    fn write8(&self, offset: u16, value: u8) -> Result<(), PwrSeqError> {
+        if u64::from(offset) >= self.0.len {
+            return Err(PwrSeqError::Access);
+        }
+        // SAFETY: same ownership and checked aperture.
+        unsafe { self.0.write8(u64::from(offset), value) };
+        Ok(())
+    }
+}
+
+/// Execute the exact selected rows, preserving unrelated byte fields.
+/// PCI matching rows must address MAC registers. Unknown commands, missing END,
+/// and access failures stop before any later row is dispatched.
+pub fn run_with(
+    io: &impl Io,
+    cut_version: u8,
+    fab_version: u8,
+    interface_type: u8,
+    table: &[WlanPwrCfg],
+) -> Result<(), PwrSeqError> {
+    for cfg in table {
+        if cfg.fab() & fab_version == 0
+            || cfg.cut_msk & cut_version == 0
+            || cfg.intf() & interface_type == 0
+        {
+            continue;
+        }
+        if cfg.cmd() == PWR_CMD_END {
+            return Ok(());
+        }
+        if cfg.base() != PWR_BASEADDR_MAC {
+            return Err(PwrSeqError::BadCmd);
+        }
+        match cfg.cmd() {
+            PWR_CMD_READ => {
+                io.read8(cfg.offset)?;
+            }
+            PWR_CMD_WRITE => {
+                let value = io.read8(cfg.offset)?;
+                io.write8(cfg.offset, (value & !cfg.msk) | (cfg.value & cfg.msk))?;
+            }
+            PWR_CMD_POLLING => {
+                let mut access = Ok(());
+                let done = narf_scheduler::responsive_spin_until(
+                    || match io.read8(cfg.offset) {
+                        Ok(value) => value & cfg.msk == cfg.value & cfg.msk,
+                        Err(error) => {
+                            access = Err(error);
+                            true
+                        }
+                    },
+                    Deadline::after_ms(100),
+                );
+                access?;
+                if !done {
+                    return Err(PwrSeqError::PollingTimeout);
+                }
+            }
+            PWR_CMD_DELAY => {
+                let micros = match cfg.value {
+                    PWRSEQ_DELAY_US => u64::from(cfg.offset),
+                    PWRSEQ_DELAY_MS => u64::from(cfg.offset) * 1000,
+                    _ => return Err(PwrSeqError::BadCmd),
+                };
+                io.delay_us(micros);
+            }
+            _ => return Err(PwrSeqError::BadCmd),
+        }
+    }
+    Err(PwrSeqError::BadCmd)
+}
+
+/// Execute a bounded synchronous power flow over the real register aperture.
 ///
 /// # Safety
-/// Caller must own the BAR0 MMIO region exclusively.
+/// Caller exclusively owns the BAR2 control region and keeps PCI bus mastering
+/// parked until a complete runtime owns all DMA mappings and reset lifecycle.
 pub unsafe fn run_pwrseq(
     mmio: &MmioRegion,
     cut_version: u8,
@@ -159,79 +246,13 @@ pub unsafe fn run_pwrseq(
     interface_type: u8,
     table: &[WlanPwrCfg],
 ) -> Result<(), PwrSeqError> {
-    // Linux's `max_polling_cnt = 5000` at 10 µs/step ≈ 50 ms; round to
-    // 100 ms for headroom on slower silicon.
-    const POLLING_BUDGET_MS: u64 = 100;
-
-    for cfg in table {
-        // Linux iterates with `do { ... } while (1)` and breaks on
-        // `PWR_CMD_END`; we instead terminate the loop body.
-        if cfg.fab() & fab_version == 0
-            || cfg.cut_msk & cut_version == 0
-            || cfg.intf() & interface_type == 0
-        {
-            if cfg.cmd() == PWR_CMD_END {
-                return Ok(());
-            }
-            continue;
-        }
-
-        match cfg.cmd() {
-            PWR_CMD_READ => {
-                // Informational only in Linux; preserved for parity.
-                // SAFETY: caller-asserted MMIO ownership.
-                let _ = unsafe { mmio.read8(cfg.offset as u64) };
-            }
-            PWR_CMD_WRITE => {
-                // SAFETY: same.
-                unsafe {
-                    let v = mmio.read8(cfg.offset as u64);
-                    let v = (v & !cfg.msk) | (cfg.value & cfg.msk);
-                    mmio.write8(cfg.offset as u64, v);
-                }
-            }
-            PWR_CMD_POLLING => {
-                let mut hit = false;
-                let target = cfg.value & cfg.msk;
-                let offset = cfg.offset as u64;
-                let msk = cfg.msk;
-                let done = narf_scheduler::responsive_spin_until(
-                    || {
-                        // SAFETY: same.
-                        let v = unsafe { mmio.read8(offset) } & msk;
-                        hit = v == target;
-                        hit
-                    },
-                    Deadline::after_ms(POLLING_BUDGET_MS),
-                );
-                if !done || !hit {
-                    return Err(PwrSeqError::PollingTimeout);
-                }
-            }
-            PWR_CMD_DELAY => {
-                // `offset` holds the count, `value` selects unit.
-                // Linux uses `udelay` / `mdelay` (busy-wait).  We do the
-                // same so the sequence remains synchronous on bring-up
-                // paths where the scheduler hasn't started yet.
-                let count = cfg.offset as u64;
-
-                let cycles = match cfg.value {
-                    PWRSEQ_DELAY_MS => {
-                        narf_time::ns_to_cycles(count.saturating_mul(1_000_000))
-                    }
-                    _ /* PWRSEQ_DELAY_US */ => {
-                        narf_time::ns_to_cycles(count.saturating_mul(1_000))
-                    }
-                };
-                narf_time::busy_wait_cycles(cycles);
-            }
-            PWR_CMD_END => return Ok(()),
-            _ => return Err(PwrSeqError::BadCmd),
-        }
-    }
-    // Fell off the end without `PWR_CMD_END` — treat as success since
-    // every legitimate table is terminated.
-    Ok(())
+    run_with(
+        &MmioIo(mmio),
+        cut_version,
+        fab_version,
+        interface_type,
+        table,
+    )
 }
 
 // ── Per-chip power-on tables ──────────────────────────────────────────────
@@ -311,14 +332,21 @@ pub static RTL8192EE_PWR_ON: &[WlanPwrCfg] = &[
     pci_end(),
 ];
 
-/// RTL8188EE Cardemu→Active power-on flow.  Source:
-/// `rtl8188ee/pwrseq.h::RTL8188EE_TRANS_CARDEMU_TO_ACT`.
+/// Complete RTL8188EE PCI NIC-enable flow, including CardDisabled→CardEmu.
+/// Linux rtl8188ee/pwrseq.c::rtl8188ee_card_enable_flow and pwrseq.h.
+/// SDIO-only rows have no PCI match and are omitted.
 pub static RTL8188EE_PWR_ON: &[WlanPwrCfg] = &[
-    pci_w(0x0006, 1 << 0, 1 << 0),
-    pci_p(0x0006, 1 << 1, 1 << 1),
-    pci_w(0x0005, (1 << 4) | (1 << 7), 0),
-    pci_w(0x0005, 1 << 0, 1 << 0),
-    pci_p(0x0005, 1 << 0, 0),
+    // CardDisabled→CardEmu: disable WL suspend before waiting for ready.
+    pci_w(0x0005, 0x18, 0),
+    // CardEmu→Active, in source order.
+    pci_p(0x0006, 0x02, 0x02),
+    pci_w(0x0002, 0x03, 0),    // Reset BB.
+    pci_w(0x0026, 0x80, 0x80), // Schmitt trigger.
+    pci_w(0x0005, 0x80, 0),    // Disable HWPDN.
+    pci_w(0x0005, 0x18, 0),    // Disable WL suspend.
+    pci_w(0x0005, 0x01, 0x01), // Request hardware state transition.
+    pci_p(0x0005, 0x01, 0),
+    pci_w(0x0023, 0x10, 0), // LDO normal mode.
     pci_end(),
 ];
 
@@ -395,27 +423,36 @@ pub fn power_on_table_for(did: u16) -> Option<&'static [WlanPwrCfg]> {
     }
 }
 
-/// High-level power-on entry.  Walks the chip's enable table over PCIe.
+/// Source-matched per-profile enable entry. RTL8188EE includes the three
+/// _rtl88ee_init_mac prefix transactions needed before the NIC-enable table:
+/// disable XTAL output/HWPDN and unlock reserved control registers.
+pub fn power_on_with(io: &impl Io, did: u16) -> Result<(), PwrSeqError> {
+    let table = power_on_table_for(did).ok_or(PwrSeqError::BadCmd)?;
+    if did == super::regs::RTL_DEV_8188EE {
+        let value = io.read8(0x7c)?;
+        io.write8(0x7c, value & !1)?;
+        let value = io.read8(5)?;
+        io.write8(5, value & !0x80)?;
+        io.write8(0x1c, 0)?;
+    }
+    run_with(
+        io,
+        PWR_CUT_ALL_MSK,
+        PWR_FAB_ALL_MSK,
+        PWR_INTF_PCI_MSK,
+        table,
+    )
+}
+
+/// High-level power-on entry. Walks the chip's enable table over PCIe.
 ///
 /// # Safety
-/// Caller owns BAR0 exclusively and has already enabled bus-master + MEM.
+/// Caller exclusively owns BAR2 with MEM decoding enabled and bus mastering
+/// parked, and dispatches this operation within the live PCI capability.
 pub unsafe fn power_on(mmio: &MmioRegion, did: u16) -> Result<(), PwrSeqError> {
-    let table = match power_on_table_for(did) {
-        Some(t) => t,
-        None => return Err(PwrSeqError::BadCmd),
-    };
-    // Run with the broadest possible chip/fab masks — the driver doesn't
-    // sniff cut/fab from EFUSE in this scaffold, and every row in our
-    // tables is `PWR_CUT_ALL_MSK | PWR_FAB_ALL_MSK` so the broad mask
-    // matches them all.
-    // SAFETY: forwarded.
-    unsafe {
-        run_pwrseq(
-            mmio,
-            PWR_CUT_ALL_MSK,
-            PWR_FAB_ALL_MSK,
-            PWR_INTF_PCI_MSK,
-            table,
-        )
-    }
+    power_on_with(&MmioIo(mmio), did)
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "power_tests.rs"]
+mod tests;

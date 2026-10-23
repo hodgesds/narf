@@ -11,8 +11,8 @@
 //! `narf-bus` SDIO host controller; for gSPI, the platform's SPI
 //! controller wrapped by the boot path.
 //!
-//! **No GPL `brcmfmac` / `bcmdhd` source consulted.** Cross-checks:
-//! `soypat/cyw43439` (MIT) and Embassy `cyw43` (Apache-2.0 / MIT).
+//! Original trait references: soypat/cyw43439 and Embassy cyw43.
+//! The live SDIO adapter now also follows Linux brcmfmac/bcmsdh.c.
 
 use core::fmt;
 
@@ -45,6 +45,8 @@ impl Function {
 pub enum TransportError {
     /// Transport reported a CRC failure / bad framing on the wire.
     BadFraming,
+    /// Complete packet was not submitted; global hardware flow control is active.
+    Busy,
     /// The chip reported an `OVERFLOW` / `UNDERFLOW` status bit.
     ChipFlowError,
     /// Caller asked for an access wider than the transport supports.
@@ -62,6 +64,7 @@ pub enum TransportError {
 impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TransportError::Busy => f.write_str("transport busy"),
             TransportError::BadFraming => f.write_str("bad framing"),
             TransportError::ChipFlowError => f.write_str("chip flow error"),
             TransportError::LengthOverflow => f.write_str("length overflow"),
@@ -77,10 +80,8 @@ impl fmt::Display for TransportError {
 /// firmware loader needs. Adapters that are inherently async wrap
 /// this in their own executor.
 ///
-/// The trait carries no `&mut self` requirement on individual
-/// accesses so an adapter can choose between exclusive ownership
-/// (single-task driver) and a sharded interior-mutability strategy
-/// (multi-CPU bring-up), at the implementor's discretion.
+/// Mutable ownership serializes individual accesses. A caller must also
+/// serialize the entire backplane window-select/access transaction.
 pub trait Transport {
     /// Read a single 32-bit register through `function:address`.
     /// Address auto-increments unless the adapter explicitly fixes
@@ -114,6 +115,21 @@ pub trait Transport {
         address: u32,
         buf: &[u8],
     ) -> Result<(), TransportError>;
+}
+
+/// Packet FIFO operations required after firmware boot. These are separate
+/// from incrementing register/RAM bursts: Linux brcmfmac uses fixed-address
+/// `sdio_readsb` for F2 RX and incrementing writes for TX. A host adapter must implement actual
+/// FIFO transactions and readiness detection before attaching a runtime.
+pub trait PacketTransport: Transport + Send {
+    /// Copy one complete SDPCM packet, including its 12-byte bus header.
+    /// Zero means no packet is currently available. The adapter consumes
+    /// physical bus padding but may include it in the returned byte count.
+    fn receive_packet(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError>;
+
+    /// Synchronously copy one complete packet to F2. On return the adapter
+    /// no longer borrows `packet`; it must not retain a pointer into it.
+    fn transmit_packet(&mut self, packet: &[u8]) -> Result<(), TransportError>;
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

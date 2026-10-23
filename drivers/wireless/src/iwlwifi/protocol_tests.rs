@@ -2,6 +2,46 @@ use super::*;
 use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_runtime_configuration_matches_linux_pci_profiles() -> TestResult {
+    for (device, flags, latency) in [
+        (0x2725, 1u32, 500u32),
+        (0x51f0, 10, 12000),
+        (0x54f0, 10, 12000),
+        (0x7e40, 0, 0),
+        (0x272b, 3, 12000),
+        (0xe340, 10, 12000),
+        (0xe440, 10, 12000),
+    ] {
+        let config = match station_api::runtime_configuration(device, 6, 2, 7) {
+            Ok(config) => config,
+            Err(_) => return TestResult::Fail("known runtime PCI configuration rejected"),
+        };
+        if config.coexistence != [1, 0, 0, 0, 17, 0, 0, 0]
+            || config.soc[..4] != flags.to_le_bytes()
+            || config.soc[4..] != latency.to_le_bytes()
+            || config.power != [0; 4]
+        {
+            return TestResult::Fail("runtime coexistence/SoC/CAM power layout");
+        }
+    }
+    for (device, coexistence, soc, power) in [
+        (0x2723, 6, 2, 7), // Gen2 has no supported MLD lifecycle.
+        (0xffff, 6, 2, 7),
+        (0xe340, 5, 2, 7),
+        (0xe340, 6, 1, 7), // v1 interprets flags as an integer.
+        (0xe340, 6, 2, 6),
+    ] {
+        if station_api::runtime_configuration(device, coexistence, soc, power).is_ok() {
+            return TestResult::Fail("unknown PCI/configuration command ABI accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/protocol",
+    smoke_runtime_configuration_matches_linux_pci_profiles
+);
+
 fn smoke_tx_power_command_versions_and_units() -> TestResult {
     for (version, length) in [(10, 108), (11, 116)] {
         let command = station_api::tx_power(version, 17).unwrap();
@@ -279,7 +319,7 @@ kernel_test_in!(
 
 fn smoke_active_scan_segments_and_channel_permissions() -> TestResult {
     let local = [2, 1, 2, 3, 4, 5];
-    for (version, capacity) in [(14, 67), (17, 67), (18, 68)] {
+    for (version, capacity) in [(14, 67), (15, 67), (16, 67), (17, 67), (18, 68)] {
         let ssids = vec![b"hidden".to_vec(), Vec::new()];
         let command = scan_api::active(
             version,
@@ -292,10 +332,24 @@ fn smoke_active_scan_segments_and_channel_permissions() -> TestResult {
         .unwrap();
         let probe = 48 + capacity * 8 + 12;
         let data = probe + 20;
+        // Linux mvm/scan.c::iwl_mvm_umac_scan_cfg_channels_v7 uses
+        // the channel's band byte through request16; request17 moves
+        // band to flags[31:30] and leaves byte5 for reserved PSD.
+        let channels = if version < 17 {
+            [
+                3, 0, 0, 0, 1, 1, 1, 0, // active 2.4GHz, SSID bitmap3
+                3, 0, 0, 0, 36, 0, 1, 0, // active 5GHz, SSID bitmap3
+                0, 0, 0, 0, 52, 0, 1, 0, // denied probe remains passive
+            ]
+        } else {
+            [
+                3, 0, 0, 64, 1, 127, 1, 0, // 2.4GHz band in flags
+                3, 0, 0, 0, 36, 127, 1, 0, // 5GHz band in flags
+                0, 0, 0, 0, 52, 127, 1, 0, // denied probe remains passive
+            ]
+        };
         if command[8..10] != [2, 0]
-            || command[48..52] != ((1u32 << 30) | 3).to_le_bytes()
-            || command[56..60] != 3u32.to_le_bytes()
-            || command[64..68] != [0; 4]
+            || command[48..72] != channels
             || command[probe..probe + 4] != [0, 0, 26, 0]
             || command[data..data + 2] != [0x40, 0]
             || command[data + 4..data + 10] != [0xff; 6]

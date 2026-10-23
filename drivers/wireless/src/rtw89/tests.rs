@@ -337,19 +337,19 @@ kernel_test_in!(
 fn smoke_rtw89_fw_blob_names() -> TestResult {
     // The blob names mirror Linux's `request_firmware` keys. Catch
     // accidental rename drift.
-    if expected_blob_name(ChipId::Rtl8852A) != Some("rtw89/8852a_fw.bin") {
+    if expected_blob_name(ChipId::Rtl8852A) != Some("rtw89/rtw8852a_fw.bin") {
         return TestResult::Fail("8852A blob name drift");
     }
-    if expected_blob_name(ChipId::Rtl8852B) != Some("rtw89/8852b_fw.bin") {
+    if expected_blob_name(ChipId::Rtl8852B) != Some("rtw89/rtw8852b_fw.bin") {
         return TestResult::Fail("8852B blob name drift");
     }
-    if expected_blob_name(ChipId::Rtl8852C) != Some("rtw89/8852c_fw.bin") {
+    if expected_blob_name(ChipId::Rtl8852C) != Some("rtw89/rtw8852c_fw.bin") {
         return TestResult::Fail("8852C blob name drift");
     }
-    if expected_blob_name(ChipId::Rtl8851B) != Some("rtw89/8851b_fw.bin") {
+    if expected_blob_name(ChipId::Rtl8851B) != Some("rtw89/rtw8851b_fw.bin") {
         return TestResult::Fail("8851B blob name drift");
     }
-    if expected_blob_name(ChipId::Rtl8922A) != Some("rtw89/8922a_fw.bin") {
+    if expected_blob_name(ChipId::Rtl8922A) != Some("rtw89/rtw8922a_fw.bin") {
         return TestResult::Fail("8922A blob name drift");
     }
     TestResult::Pass
@@ -648,22 +648,14 @@ fn smoke_rtw89_dma_ring_state_avail() -> TestResult {
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_dma_ring_state_avail);
 
 fn smoke_rtw89_dma_idx_pack_unpack() -> TestResult {
-    // pack_idx / split_idx round-trip — the index register format is
-    // (host_wp << 16) | hw_rp.
-    let packed = pack_idx(0x0AB, 0xCD12);
-    let (hw, host) = split_idx(packed);
-    if hw != 0x0AB {
-        return TestResult::Fail("HW pointer round-trip failed");
+    // Independent literal: Linux HW mask0x0fff0000 / host mask0x0fff.
+    let packed = pack_idx(0x0AB, 0x0D12);
+    let (hw, host) = split_idx(0xf0ab_ed12);
+    if packed != 0x00ab_0d12 || hw != 0x0AB || host != 0x0D12 {
+        return TestResult::Fail("literal Linux TXBD index fields");
     }
-    if host != 0xCD12 {
-        return TestResult::Fail("host pointer round-trip failed");
-    }
-    // Mask widths.
-    if RING_IDX_HW_MASK != 0x0FFF {
-        return TestResult::Fail("HW pointer mask not 12 bits");
-    }
-    if RING_IDX_HOST_SHIFT != 16 {
-        return TestResult::Fail("host shift not 16");
+    if RING_IDX_HW_MASK != 0x0FFF_0000 || RING_IDX_HOST_SHIFT != 0 {
+        return TestResult::Fail("Linux TXBD hardware/host index masks");
     }
     TestResult::Pass
 }
@@ -990,6 +982,9 @@ fn smoke_rtw89_h2c_prebuilt_helpers() -> TestResult {
     if h.cat != H2C_CAT_MAC_H2C || h.class != H2C_CL_MAC_FWDL_H2C {
         return TestResult::Fail("FWHDR_DL H2C wrong setup");
     }
+    if h.done_ack || h.rec_ack {
+        return TestResult::Fail("firmware bootstrap header must not request runtime ACKs");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_prebuilt_helpers);
@@ -1021,7 +1016,7 @@ fn smoke_rtw89_fwdl_constants() -> TestResult {
     if FW_HDR_V0_BASE_SIZE != 32 {
         return TestResult::Fail("v0 base hdr");
     }
-    if FW_HDR_V0_SECTION_SIZE != 12 {
+    if FW_HDR_V0_SECTION_SIZE != 16 {
         return TestResult::Fail("v0 section");
     }
     if FW_HDR_V1_BASE_SIZE != 48 {
@@ -1050,6 +1045,7 @@ fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
     blob.extend_from_slice(&sw0.to_le_bytes());
     blob.extend_from_slice(&sw1.to_le_bytes());
     blob.extend_from_slice(&sw2.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
     blob.extend(core::iter::repeat_n(0xABu8, 512));
 
     let mut sections = [FwSection {
@@ -1073,7 +1069,7 @@ fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
     if h.version != 0 {
         return TestResult::Fail("version");
     }
-    if h.hdr_len != 44 {
+    if h.hdr_len != 48 {
         return TestResult::Fail("hdr_len");
     }
     let s = &sections[0];
@@ -1086,7 +1082,7 @@ fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
     if s.len != 512 {
         return TestResult::Fail("section len");
     }
-    if s.payload_off != 44 {
+    if s.payload_off != 48 {
         return TestResult::Fail("payload_off");
     }
     TestResult::Pass
@@ -1105,6 +1101,7 @@ fn smoke_rtw89_fwdl_v0_chksum() -> TestResult {
     blob.extend_from_slice(&sw0.to_le_bytes());
     blob.extend_from_slice(&sw1.to_le_bytes());
     blob.extend_from_slice(&sw2.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
     blob.extend(core::iter::repeat_n(0x55u8, 1008));
 
     let mut sections = [FwSection {
@@ -1141,7 +1138,7 @@ fn smoke_rtw89_fwdl_v1_parse() -> TestResult {
         blob.extend_from_slice(&w.to_le_bytes());
     }
     let sw0 = 0x4000_0000u32;
-    let sw1 = (64u32 << 24) | 256u32;
+    let sw1 = (1u32 << 24) | 256u32;
     let sw2 = 0u32;
     let sw3 = 0u32;
     blob.extend_from_slice(&sw0.to_le_bytes());
@@ -1172,8 +1169,8 @@ fn smoke_rtw89_fwdl_v1_parse() -> TestResult {
         return TestResult::Fail("v1 major/minor");
     }
     let s = &sections[0];
-    if s.kind != 64 {
-        return TestResult::Fail("v1 BBMCU0");
+    if s.kind != 1 {
+        return TestResult::Fail("v1 inner section type; BBMCU belongs to outer MFW");
     }
     if s.dladdr != 0x4000_0000 {
         return TestResult::Fail("v1 dladdr");
@@ -1752,3 +1749,19 @@ fn smoke_rtw89_probe_bound_or_skip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_probe_bound_or_skip);
+
+fn smoke_rtw89_ethernet_requires_station_encapsulation() -> TestResult {
+    // This is deliberately independent of the controller registry. The
+    // network hook must reject before touching rings or allocating DMA,
+    // including while a future raw native backend is installed.
+    for frame in [&[][..], &[0xff; 14][..], &[0; 1500][..]] {
+        if super::pci::send_frame(frame, narf_net::TxMeta::plain()).is_ok() {
+            return TestResult::Fail("Ethernet accepted without station encapsulation");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_ethernet_requires_station_encapsulation
+);

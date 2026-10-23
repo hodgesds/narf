@@ -170,10 +170,11 @@ pub const ATH11K_WOW_RETRY_WAIT_MS: u32 = 200;
 /// `ath11k_wow_enable` / `ath11k_wow_wakeup` wait up to 3 HZ, i.e. three
 /// seconds on the normal 1 kHz kernel tick.
 pub const ATH11K_WOW_COMPLETION_TIMEOUT_MS: u32 = 3_000;
-/// `num_vdevs` in WCN6855's resource configuration.  A vdev remains owned
+/// Linux QCA6390/WCN6855 resource request and retained host capacity.
+/// A vdev remains owned
 /// by one netdev from WMI_VDEV_CREATE until its delete completion; the radio
 /// never aliases station/AP state between these slots.
-pub const WCN6855_MAX_VDEVS: usize = 3;
+pub const WCN6855_MAX_VDEVS: usize = 4;
 
 // `struct hal_tx_rate_stats.info0` in Linux's `ath11k/hal_desc.h`. The WBM
 // release records a PHY rate for the first MSDU of a PPDU; firmware-native
@@ -936,7 +937,7 @@ pub struct ApTxState {
 
 /// Runtime-owned state for one firmware vdev.  Linux keeps the equivalent
 /// state below its `ath11k_vif` / mac80211 vif; NARF keeps a compact entry
-/// per WCN6855 vdev because all three slots share one core/DP runtime.
+/// per WCN6855 vdev because all four slots share one core/DP runtime.
 #[derive(Debug, Default)]
 pub struct VdevRuntime {
     /// Station data path, including its native-Wi-Fi VIF attachment.
@@ -1035,7 +1036,7 @@ pub struct MgmtTxBuf {
 pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     pub core: Ath11kCore<CeHif<Io, Irq>, Q>,
     pub dp: Dp,
-    /// WCN6855's three independently addressable firmware vdev slots.
+    /// The three independently addressable vdev slots NARF currently admits.
     /// Entry index always equals its WMI `vdev_id`.
     pub vdevs: Vec<VdevRuntime>,
     pub mgmt: MgmtTx,
@@ -2499,7 +2500,7 @@ pub struct Shared<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     pub irq: Irq,
     pub clock: fn() -> u64,
     /// `get_random_bytes`.
-    pub rng: fn(&mut [u8]),
+    pub rng: fn(&mut [u8]) -> Result<(), i32>,
     /// WMI endpoint `max_msg_len`.
     pub max_msg_len: u32,
     /// `WMI_SEND_TIMEOUT_HZ`.
@@ -2508,7 +2509,7 @@ pub struct Shared<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     /// One stable `struct wiphy` identity for all this radio's vdevs.
     pub radio_id: u64,
     /// Firmware vdev slots currently owned by NARF netdevs.  Slot zero is
-    /// reserved for the initial `wlan%d`; WCN6855 exposes exactly three.
+    /// reserved for the initial `wlan%d`; NARF currently admits three.
     vdev_slots: AtomicU32,
     /// The `NL80211_IFTYPE_*` role assigned to each reserved vdev slot.
     /// This is kept beside the allocator rather than on each netdev so a
@@ -2593,7 +2594,7 @@ struct VdevBinding {
 }
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
-    pub fn new(rt: Rt<Io, Irq, Q>, rng: fn(&mut [u8])) -> Arc<Self> {
+    pub fn new(rt: Rt<Io, Irq, Q>, rng: fn(&mut [u8]) -> Result<(), i32>) -> Arc<Self> {
         let irq = rt.core.hif.irq.clone();
         let clock = rt.core.hif.clock;
         let max_msg_len = rt.core.wmi_ep.map_or(0, |e| e.max_msg_len);
@@ -2610,7 +2611,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             vdev_slots: AtomicU32::new(1),
             // The physical/root netdev begins as a station.  It may change
             // role only while down through `assign_vdev_iftype` below.
-            vdev_iftypes: IrqSafeSpinLock::new([2, 0, 0]),
+            vdev_iftypes: IrqSafeSpinLock::new(core::array::from_fn(
+                |i| if i == 0 { 2 } else { 0 },
+            )),
             vdev_bindings: IrqSafeSpinLock::new([VdevBinding::default(); WCN6855_MAX_VDEVS]),
             operating_channels: IrqSafeSpinLock::new([0; WCN6855_MAX_VDEVS]),
             mbssid_beacons: IrqSafeSpinLock::new(core::array::from_fn(|_| None)),
@@ -2665,7 +2668,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// Assign a role to a reserved slot if it still fits the WCN6855
     /// interface combination published through nl80211.  The role groups
     /// mirror WCN6855's `ath11k_mac_setup_iface_combinations`: at most two
-    /// stations (the target advertises dual-station support), three
+    /// stations (the target advertises dual-station support), four
     /// AP/client/GO vdevs collectively, and one P2P-device vdev.
     ///
     /// A vdev is assigned before registration and changed only while down,
@@ -3703,7 +3706,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WmiPort for Port<Io, Irq, Q> {
         self.0.max_msg_len
     }
 
-    fn random_bytes(&self, out: &mut [u8]) {
+    fn random_bytes(&self, out: &mut [u8]) -> Result<(), i32> {
         (self.0.rng)(out)
     }
 }
@@ -4244,12 +4247,12 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
         Ok(c) => c,
         Err(e) => {
             e.report("ath11k mac register");
-            *STRANDED_RT.lock() = Some(Shared::new(rt, narf_crypto::fill_random_bytes));
+            *STRANDED_RT.lock() = Some(Shared::new(rt, secure_random));
             return;
         }
     };
     let initial_reg = rt.core.reg_info.clone();
-    let shared = Shared::new(rt, narf_crypto::fill_random_bytes);
+    let shared = Shared::new(rt, secure_random);
     let mac = super::mac::Mac::new(
         Port(shared.clone(), 0),
         Port(shared.clone(), 0),
@@ -4263,4 +4266,8 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
         "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
         name, m[0], m[1], m[2], m[3], m[4], m[5]
     ));
+}
+
+fn secure_random(out: &mut [u8]) -> Result<(), i32> {
+    narf_crypto::try_fill_random_bytes(out).map_err(|_| super::mac::errno::EIO)
 }

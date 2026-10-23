@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 pub(super) const HEADER: usize = 64; // 32-byte TXD + 32-byte hardware TXP.
 const TOKEN_LIMIT: u16 = 8192; // Linux MT7921_TOKEN_SIZE; zero is unused here.
 
-/// Encode an unencrypted native management frame at the basic 1 Mbps rate.
+/// Encode an unencrypted native frame at the selected AP basic rate.
 /// Publication remains private to the hardware backend until association
 /// supplies verified channel/power permission. This is not an injection API.
 pub(super) fn management(
@@ -14,6 +14,7 @@ pub(super) fn management(
     payload: u64,
     token: u16,
     wcid: u16,
+    rate: crate::mt7921::association::LegacyRate,
 ) -> Result<[u8; HEADER], Error> {
     if !(24..=4032).contains(&frame.len()) {
         return Err(Error::Bounds);
@@ -35,11 +36,15 @@ pub(super) fn management(
     let words = [
         (frame.len() as u32 + 32) | (0x10 << 25), // CT, LMAC ALTX0.
         (1 << 31) | (2 << 16) | (12 << 11) | u32::from(wcid),
-        (1 << 31) | (1 << 13) | (u32::from(multicast) << 10) | subtype,
+        (1 << 31)
+            | (1 << 13)
+            | (u32::from(multicast) << 10)
+            | subtype
+            | if is_data { 2 << 4 } else { 0 },
         (1 << 28) | (15 << 11) | u32::from(multicast),
         0,
         0,
-        4,
+        4 | (u32::from(rate.hardware()) << 16),
         (if is_data { 2 << 20 } else { 0 }) | (subtype << 16),
     ];
     let mut bytes = [0; HEADER];
@@ -58,8 +63,9 @@ pub(super) fn ethernet(
     payload: u64,
     token: u16,
     wcid: u16,
+    protected: bool,
 ) -> Result<[u8; HEADER], Error> {
-    if !(14..=1536).contains(&frame.len()) {
+    if !(14..=1514).contains(&frame.len()) {
         return Err(Error::Bounds);
     }
     if payload
@@ -71,14 +77,16 @@ pub(super) fn ethernet(
     if token == 0 || token >= TOKEN_LIMIT || wcid >= 20 {
         return Err(Error::Bounds);
     }
-    let multicast = frame[0] & 1 != 0;
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    let is_eth_802_3 = ethertype >= 0x0600;
+    if ethertype < 0x0600 {
+        return Err(Error::Bounds);
+    }
+    let is_eth_802_3 = true;
     let words = [
         (frame.len() as u32 + 32), // CT, LMAC AC00 (0 << 25 = 0)
         (1 << 31) | (u32::from(is_eth_802_3) << 15) | u32::from(wcid),
-        (2 << 4) | (u32::from(multicast) << 10),
-        (15 << 11) | (1 << 1), // REM_TX_COUNT 15, PROTECT_FRAME 1
+        2 << 4, // STA receiver is the unicast AP even for an Ethernet multicast DA.
+        (15 << 11) | (u32::from(protected) << 1), // Only an installed PTK authorizes encryption.
         0,
         0,
         0,
