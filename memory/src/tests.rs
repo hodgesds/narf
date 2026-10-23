@@ -2652,13 +2652,24 @@ kernel_test_in!("memory", smoke_slab_magazine_hot_path);
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_alloc_per_node_distribution() -> TestResult {
     if !narf_lib::smp::is_online(1) {
-        return TestResult::Skip(
-            "needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs",
-        );
+        return TestResult::Skip("CPU 1 not online in this configuration");
+    }
+    // The distribution below can only exist when the firmware
+    // described a multi-node topology. When the harness runs with
+    // NARF_QEMU_SMP set, xtask drops its -numa machine config, QEMU
+    // presents no SRAT, and bare_main legitimately keeps the
+    // single-node fallback — there is nothing to distribute. Probe
+    // the firmware topology (not allocator state) so this skip can
+    // never mask a real rebalance failure on a multi-node machine:
+    // with >= 2 SRAT nodes the checks below stay hard failures.
+    // (This is exactly the config the #682 KASAN verification ran
+    // under, which made the failure look KASAN-only in #686.)
+    if crate::firmware_node_count() < 2 {
+        return TestResult::Skip("no multi-node NUMA topology (no SRAT in this config)");
     }
     // After SRAT-driven rebalance, each NUMA node should hold a
-    // non-trivial slice of free frames. With QEMU's 2-node config
-    // (128 MiB each), both bins should be non-empty.
+    // non-trivial slice of free frames. With QEMU's 2-node config,
+    // both bins should be non-empty.
     if !crate::is_numa_aware() {
         return TestResult::Fail("frame allocator not NUMA-rebalanced");
     }

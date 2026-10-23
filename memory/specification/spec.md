@@ -228,6 +228,9 @@ pub fn take_numa_hint(vaddr: VirtAddr) -> bool;
 pub fn numa_node_stats(node: usize) -> NumaNodeStats;
 /// Stable allocator-managed base-page total established at NUMA rebalance.
 pub fn node_total(node: usize) -> usize;
+/// Number of NUMA nodes in the firmware-described (SRAT) topology,
+/// independent of allocator rebalance state; 1 when unknown.
+pub fn firmware_node_count() -> u32;
 /// Free-block counts for buddy orders 0 through 10.
 pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT];
 

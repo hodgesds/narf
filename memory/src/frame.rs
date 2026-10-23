@@ -3975,6 +3975,11 @@ extern "Rust" {
     /// (cross-node). Used to order the allocator's cross-node
     /// fallback nearest-first.
     fn narf_node_distance(from: u32, to: u32) -> u32;
+    /// Number of NUMA nodes in the firmware-described topology
+    /// (frame's bridge over the SRAT parse). Independent of the
+    /// allocator's rebalance state; the bridge floors the result
+    /// at 1 (no SRAT described → single node).
+    fn narf_numa_node_count() -> u32;
 }
 
 // Host-side crate tests do not link the kernel binary that owns the ACPI
@@ -3999,6 +4004,22 @@ unsafe fn narf_node_distance(from: u32, to: u32) -> u32 {
     } else {
         20
     }
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn narf_numa_node_count() -> u32 {
+    1
+}
+
+/// Number of NUMA nodes in the firmware-described topology, via the
+/// weak ACPI bridge. Unlike [`online_node_count`], this reflects
+/// what firmware described whether or not the allocator has
+/// rebalanced onto it, so callers can distinguish "no multi-node
+/// topology exists" from "rebalance did not happen". Returns `1`
+/// when topology is unknown (no SRAT parsed, or the host stub).
+pub fn firmware_node_count() -> u32 {
+    // SAFETY: narf-frame provides the `#[no_mangle]` definition.
+    unsafe { narf_numa_node_count() }.max(1)
 }
 
 /// Resolve a physical address to an allocator NUMA-node index.
