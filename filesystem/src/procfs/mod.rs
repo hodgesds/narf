@@ -1933,56 +1933,66 @@ struct ProcPidDir {
     thread: Option<u64>,
 }
 
-impl DirOps for ProcPidDir {
-    fn ino(&self) -> u64 {
-        pid_dir_ino(self.pid)
-    }
-    fn inode_attrs(&self) -> crate::InodeAttrs {
-        proc_attrs()
-    }
-    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+fn try_proc_file_node<T>(node: T) -> Result<Arc<dyn FileOps>, FsError>
+where
+    T: FileOps + 'static,
+{
+    Arc::try_new(node)
+        .map(|node| node as Arc<dyn FileOps>)
+        .map_err(|_| FsError::OutOfMemory)
+}
+
+impl ProcPidDir {
+    /// Allocate the synthetic node for a single per-pid entry.
+    ///
+    /// Procfs lookups run in ordinary syscall context, including while the
+    /// machine is under enough pressure for the OOM machinery to inspect
+    /// tasks.  `Arc::new` invokes the infallible allocation path and turns a
+    /// recoverable lookup failure into a kernel abort.  Keep the allocation
+    /// fallible and preserve ENOMEM through the async VFS lookup surface.
+    fn try_lookup(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
         // Subdirectory markers — resolve_async calls lookup_dir next.
         match name {
             "task" => {
                 let dir = pid_ext::ProcTaskDir { pid: self.pid };
-                return Some(Arc::new(ProcDirMarker {
+                return try_proc_file_node(ProcDirMarker {
                     ino: pid_entry_ino(self.pid, name),
                     attrs: crate::DirOps::inode_attrs(&dir),
-                }));
+                });
             }
             "fd" | "fdinfo" | "ns" | "attr" => {
-                return Some(Arc::new(ProcDirMarker::new(pid_entry_ino(self.pid, name))))
+                return try_proc_file_node(ProcDirMarker::new(pid_entry_ino(self.pid, name)));
             }
             _ => {}
         }
         // user-ns id-map files (read + one-shot write).
         match name {
             "uid_map" => {
-                return Some(Arc::new(ProcIdMapFile {
+                return try_proc_file_node(ProcIdMapFile {
                     pid: self.pid,
                     file: NsIdMapFile::UidMap,
-                }))
+                });
             }
             "gid_map" => {
-                return Some(Arc::new(ProcIdMapFile {
+                return try_proc_file_node(ProcIdMapFile {
                     pid: self.pid,
                     file: NsIdMapFile::GidMap,
-                }))
+                });
             }
             "setgroups" => {
-                return Some(Arc::new(ProcIdMapFile {
+                return try_proc_file_node(ProcIdMapFile {
                     pid: self.pid,
                     file: NsIdMapFile::Setgroups,
-                }))
+                });
             }
             _ => {}
         }
         // `REG("mem", S_IRUSR|S_IWUSR, proc_mem_operations)`.
         if name == "mem" {
-            return Some(Arc::new(mem::ProcMemNode {
+            return try_proc_file_node(mem::ProcMemNode {
                 pid: self.pid,
                 ino: pid_entry_ino(self.pid, name),
-            }));
+            });
         }
         // Core flat files.
         let field = match name {
@@ -1995,17 +2005,33 @@ impl DirOps for ProcPidDir {
             "smaps_rollup" => PidField::SmapsRollup,
             "comm" => PidField::Comm,
             _ => {
-                return pid_ext::lookup_pid_ext(self.pid, name)
-                    .map(|f| Arc::new(f) as Arc<dyn FileOps>);
+                let file = pid_ext::lookup_pid_ext(self.pid, name).ok_or(FsError::NotFound)?;
+                return try_proc_file_node(file);
             }
         };
-        Some(Arc::new(ProcPidFile {
+        try_proc_file_node(ProcPidFile {
             pid: self.pid,
             field,
             ino: pid_entry_ino(self.pid, name),
             thread: self.thread,
             rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
-        }))
+        })
+    }
+}
+
+impl DirOps for ProcPidDir {
+    fn ino(&self) -> u64 {
+        pid_dir_ino(self.pid)
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        proc_attrs()
+    }
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        self.try_lookup(name).ok()
+    }
+    fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        let result = self.try_lookup(name);
+        Box::pin(async move { result })
     }
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         match name {
