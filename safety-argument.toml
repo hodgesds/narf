@@ -1779,3 +1779,13 @@ ref = "security-model/specification/spec.md#L42"
 agent = "OpenAI Codex GPT-5"
 prompt_hash = "c93c1243e9e156fa8d459b3890fb42181bed6cee181c48b216b351e54e3eb0c5"
 argument = "Each slab block remains in exactly one state: allocated, a per-CPU magazine, the locked central FIFO, or the locked reclaim candidate. Reclaim detaches a frame only after collecting exactly PAGE_SIZE / class_size distinct central-free blocks with the same page base; magazine or allocated blocks therefore prevent completion. The persistent cursor examines a finite queue snapshot in at most 2,048-node lock holds, excludes later producers from that snapshot, and returns an incomplete candidate to the FIFO without allocation. Complete frames leave class ownership under the lock and reach the buddy only after the class guard is released, preserving invalidation-free kernel-heap ownership and allocator reentrancy rules."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "Muse Wonder"
+argument = "The change stays inside memory/ (an existing TCB member): a read-only topology accessor in the frame allocator module, its lib.rs re-export, a kernel-test precondition, and the memory spec §3 entry. It adds no TCB member, moves no trust boundary, and touches no capability or domain code; the only new production code path forwards to the pre-existing frame-provided narf_numa_node_count bridge."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "Muse Wonder"
+argument = "firmware_node_count() performs no kernel data access of its own and mutates no allocator state: it calls the existing weak ACPI bridge and floors the result at 1. It grants no capability, changes no mapping or domain tag, and alters no allocation decision; every allocation path is byte-identical. The host (not(target_os = \"none\")) stub returns 1, the documented no-topology behavior, mirroring the three existing topology-hook fallbacks, so no host consumer can observe a fabricated multi-node topology."
