@@ -295,6 +295,52 @@ impl<B: BlockDevice> VolCore<B> {
         self.state.lock().superblock.generation
     }
 
+    /// Current content generation for inode `ino` in fs tree `tree`
+    /// (see [`CacheGenerations`]). An inode nobody has issued a
+    /// generation for yet is assigned a fresh tick on first read:
+    /// issuing lazily here (rather than only on mutation) is what
+    /// gives a pre-existing, never-mutated file an instance-unique
+    /// value before any page can be retained under it.
+    pub(crate) fn cache_generation(&self, tree: u64, ino: u64) -> u64 {
+        let mut generations = self.cache_generations.lock();
+        match generations.values.get(&(tree, ino)) {
+            Some(&generation) => generation,
+            None => {
+                let generation = generations.fresh_tick();
+                generations.values.insert((tree, ino), generation);
+                generation
+            }
+        }
+    }
+
+    /// Record a change to inode `ino` in fs tree `tree`: a content
+    /// mutation (bytes or length), the inode's destruction, or a
+    /// create landing a new file on a (possibly recycled) inode
+    /// number. Assigns a fresh tick rather than incrementing, so the
+    /// value afterwards names the new instance / epoch and no earlier
+    /// tenant's. Every such change in this driver bumps exactly once,
+    /// before the operation returns, so a completed mutation can
+    /// never leave a retained page looking current.
+    pub(crate) fn bump_cache_generation(&self, tree: u64, ino: u64) {
+        let mut generations = self.cache_generations.lock();
+        let generation = generations.fresh_tick();
+        generations.values.insert((tree, ino), generation);
+    }
+
+    /// Forget every generation issued for fs tree `tree` (subvolume
+    /// destruction). Tree ids are issued max+1 (`next_subvol_id`), so
+    /// a destroyed tree's id can be reissued to a later subvolume;
+    /// without this, the new tree's files could read the destroyed
+    /// tree's leftover values. Forgotten keys are reissued lazily
+    /// from the same never-repeating tick source, so a recycled tree
+    /// id starts from values no page was ever retained under.
+    pub(crate) fn prune_cache_generations(&self, tree: u64) {
+        self.cache_generations
+            .lock()
+            .values
+            .retain(|&(t, _), _| t != tree);
+    }
+
     /// The live [`MmapAnchor`] of inode `ino` in fs tree `tree`, created on
     /// first use. Dead entries are pruned as the table grows.
     pub(crate) fn mmap_anchor(&self, tree: u64, ino: u64) -> Arc<MmapAnchor> {
@@ -356,6 +402,50 @@ pub(crate) struct MmapAnchor {
     _ino: u64,
 }
 
+/// Content-generation counters for one filesystem instance, backing
+/// `FileOps::mmap_cache_generation` and keyed by the same
+/// `(fs tree id, inode number)` pair as the identity anchors above.
+/// Nodes are minted per lookup, so the counter cannot live on the
+/// node: two opens of one file are two objects, and a write through
+/// one must invalidate pages retained through the other. The core is
+/// the one place every view (mount) of the filesystem shares.
+///
+/// Values are NOT per-inode counters: every assignment — the first
+/// read of an inode, a content mutation, a create — draws a fresh
+/// core-wide tick. A generation therefore names one file *instance*
+/// at one mutation epoch: two different inodes (or two successive
+/// tenants of one recycled inode number, or of one recycled tree id)
+/// can never hold the same value, so a retained page's recorded
+/// generation can only ever match the file instance that published
+/// it. That uniqueness is what makes the generation half of the
+/// page cache's (identity, generation) guard sound even when an
+/// identity anchor's address is recycled.
+#[derive(Debug)]
+pub(crate) struct CacheGenerations {
+    values: BTreeMap<(u64, u64), u64>,
+    /// Next tick to issue. Starts at 1: 0 is never a real generation,
+    /// so an inode with no entry yet cannot alias an issued one.
+    next_tick: u64,
+}
+
+impl CacheGenerations {
+    fn new() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            next_tick: 1,
+        }
+    }
+
+    fn fresh_tick(&mut self) -> u64 {
+        let tick = self.next_tick;
+        self.next_tick = self.next_tick.wrapping_add(1);
+        if self.next_tick == 0 {
+            self.next_tick = 1;
+        }
+        tick
+    }
+}
+
 /// The filesystem-wide half of a mount (Linux `btrfs_fs_info`): devices,
 /// superblock, chunk map, node cache, the running transaction and its
 /// allocator, pinned extents, and the commit timer.
@@ -363,6 +453,12 @@ pub(crate) struct MmapAnchor {
 pub struct VolCore<B: BlockDevice> {
     /// Live [`MmapAnchor`]s by `(fs tree id, inode number)`.
     mmap_anchors: IrqSafeSpinLock<BTreeMap<(u64, u64), Weak<MmapAnchor>>>,
+    /// Per-inode content generations backing
+    /// `FileOps::mmap_cache_generation`, keyed by the same
+    /// `(fs tree id, inode number)` pair as `mmap_anchors`: the
+    /// generation domain must be exactly the identity domain, so
+    /// both live here on the shared core, not on a mount view.
+    cache_generations: IrqSafeSpinLock<CacheGenerations>,
     /// Source device passed first at mount. Retained for compatibility with
     /// single-device callers and tests; logical I/O routes through `devices`.
     pub device: Arc<B>,
@@ -1767,6 +1863,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
         let core = Arc::new(VolCore {
             mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
+            cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
             device: source_device,
             magic: superblock.magic,
             nodesize: superblock.nodesize,
