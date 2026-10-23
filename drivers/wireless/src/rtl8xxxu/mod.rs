@@ -42,6 +42,7 @@ extern crate alloc;
 
 pub mod btcoex;
 pub mod efuse;
+pub mod firmware_transport;
 pub mod fw;
 pub mod intr;
 pub mod mac;
@@ -119,8 +120,8 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
 /// USB class probe function. Called by the class registry when a
 /// newly-enumerated USB device matches `RTL8XXXU_USB_IDS`. Stores
 /// the `Arc<USBDevice>` in the global device table and logs the
-/// chip family. Async EFUSE reads and firmware upload are spawned
-/// as a background task.
+/// chip family. RTL8188EU starts a retained async power/firmware owner;
+/// other families remain detection-only until their runtime is implemented.
 ///
 /// Linux analogue: `rtl8xxxu_probe` in
 /// `drivers/net/wireless/realtek/rtl8xxxu/rtl8xxxu_core.c` (~L7692).
@@ -139,15 +140,22 @@ pub fn rtl8xxxu_probe(
 
     // Store the device Arc in the global registry so the driver's
     // async init task can find it.
+    let firmware = alloc::sync::Arc::new(firmware_transport::Owner::new(
+        firmware_transport::UsbControl::new(alloc::sync::Arc::clone(&device)),
+        family,
+    ));
     {
         let mut g = DEVICES.lock();
-        if g.iter().any(|d| d.device.slot_id() == device.slot_id()) {
+        if g.iter()
+            .any(|d| alloc::sync::Arc::ptr_eq(&d.device, &device))
+        {
             // Already registered (e.g. double-probe after hub reset).
             return Ok(());
         }
         g.push(Rtl8xxxuDevice {
             device: alloc::sync::Arc::clone(&device),
             family,
+            firmware: firmware.clone(),
         });
     }
 
@@ -161,6 +169,18 @@ pub fn rtl8xxxu_probe(
         device.slot_id()
     );
 
+    if family == regs::ChipFamily::Rtl8188eu {
+        narf_scheduler::spawn(async move {
+            let result = firmware.initialize_registered().await;
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8188eu: firmware attempt {:?}",
+                result
+            );
+        });
+    }
+
     Ok(())
 }
 
@@ -169,6 +189,7 @@ pub fn rtl8xxxu_probe(
 pub struct Rtl8xxxuDevice {
     pub device: alloc::sync::Arc<narf_drivers_usb::device::USBDevice>,
     pub family: regs::ChipFamily,
+    pub firmware: alloc::sync::Arc<firmware_transport::Owner<firmware_transport::UsbControl>>,
 }
 
 /// Global registry of bound RTL8XXXU USB-WiFi devices.
@@ -221,6 +242,8 @@ pub enum BringUpError {
     UnsupportedChip(regs::ChipFamily),
     /// Channel argument outside the chip's valid range.
     BadChannel(u8),
+    /// The synchronous helper has no verified full radio/station lifecycle.
+    NotImplemented,
 }
 
 impl From<usb::TransportError> for BringUpError {
@@ -229,96 +252,23 @@ impl From<usb::TransportError> for BringUpError {
     }
 }
 
-/// Apply the 8188EU register-init tables in the canonical order
-/// (MAC → BB → AGC → RF) and run path-A IQK, then tune to `channel`.
-///
-/// `fw_payload` is the firmware bytes *with the 32-byte Realtek
-/// header already stripped* (`FwLayout::strip_header`). Pass an
-/// empty slice to skip FW upload (e.g. when running smokes against
-/// a chip that already has firmware resident).
-///
-/// Source: `core.c::rtl8xxxu_init_device` (~L4255) is the Linux
-/// reference for the overall ordering.
+/// Retired synchronous all-in-one bring-up. The old implementation ignored
+/// table-write errors and IQK results and enabled RX before a complete MAC
+/// lifecycle. Live probe initialization now uses `firmware_transport::Owner`;
+/// full RF/station initialization remains an explicit subsequent stage.
 pub fn bring_up_8188eu<T: usb::Rtl8xxxuTransport>(
-    transport: &T,
-    fw_payload: &[u8],
+    _transport: &T,
+    _fw_payload: &[u8],
     channel: u8,
 ) -> Result<usize, BringUpError> {
     if !rtl8188e::channel_valid(channel) {
         return Err(BringUpError::BadChannel(channel));
     }
-
-    // Stage 0: power-on register bank.
-    for &(reg, val) in rtl8188e::stage0_register_bank() {
-        transport.write8(reg, val)?;
-    }
-
-    // Stage 1: FW download (if a blob was supplied).
-    let mut total_writes = rtl8188e::stage0_register_bank().len();
-    if !fw_payload.is_empty() {
-        // Caller is expected to have armed the fake-poll progression.
-        let n =
-            fw::upload_firmware_blob(transport, fw_payload).map_err(BringUpError::FwDownload)?;
-        total_writes += n.div_ceil(regs::RTL_FW_PAGE_SIZE);
-    }
-
-    // Stage 2: MAC init.
-    let mut n_mac = 0usize;
-    rtl8188e::init_mac(|r, v| {
-        let _ = transport.write8(r, v);
-        n_mac += 1;
-    });
-    total_writes += n_mac;
-
-    // Stage 3: BB + AGC init.
-    let mut n_phy = 0usize;
-    rtl8188e::init_phy(|r, v| {
-        let _ = transport.write32(r, v);
-        n_phy += 1;
-    });
-    total_writes += n_phy;
-
-    // Stage 4: RF path-A init via LSSI write.
-    let mut n_rf = 0usize;
-    rtl8188e::init_rf(|addr, val| {
-        let lssi = phy::lssi_encode(addr, val);
-        let _ = transport.write32(phy::REG_FPGA0_LSSI_A, lssi);
-        n_rf += 1;
-    });
-    total_writes += n_rf;
-
-    // Stage 5: IQK path A (single iteration; the real driver retries).
-    let mut iqk = [phy::IqkStep { reg: 0, val: 0 }; rtl8188e::IQK_PATH_A_STEP_COUNT];
-    let n_iqk = rtl8188e::build_iqk_path_a_sequence(&mut iqk);
-    for step in &iqk[..n_iqk] {
-        transport.write32(step.reg, step.val)?;
-    }
-    total_writes += n_iqk;
-
-    // Stage 6: LC calibration. Shared gen1 sequence — 3 RF writes via LSSI.
-    // 8188EU is 1T1R: only the path-A writes have wire effect, but
-    // emitting the path-B write keeps the trace identical to Linux.
-    for (path, addr, val) in phy::lc_calibrate_rf_writes() {
-        let lssi = phy::lssi_encode(addr, val);
-        let lssi_reg = phy::lssi_reg_for_path(path);
-        transport.write32(lssi_reg, lssi)?;
-        total_writes += 1;
-    }
-
-    // Stage 7: channel set.
-    for &(reg, val) in rtl8188e::channel_set_writes_8188e(channel).iter() {
-        transport.write32(reg, val)?;
-        total_writes += 1;
-    }
-
-    // Stage 8: enable RX — set the RX-MAC enable bit (REG_CR bit 3).
-    // Source: `regs.h::CR_RXDMA_ENABLE = 0x08` set by core.c::set_rx_mode.
-    let cr = transport.read8(regs::REG_CR)?;
-    transport.write8(regs::REG_CR, cr | 0x08)?;
-    total_writes += 1;
-
-    Ok(total_writes)
+    Err(BringUpError::NotImplemented)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod firmware_transport_tests;

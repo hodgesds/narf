@@ -1,6 +1,6 @@
 # ath11k — Specification
 
-> Status: **v0.9** — the whole station path is wired and
+> Status: **v0.9** — the WCN6855-layout station path is wired and
 > offline-tested end to end; nothing has run on the card yet. Probe →
 > power-up → MHI (firmware to mission mode) → WLFW QMI to FW_READY →
 > core bring-up (QMI firmware start, CE, HTC, WMI to READY) with the
@@ -15,7 +15,9 @@
 > "Unverified until hardware".
 >
 > Qualcomm ath11k Wi-Fi 6 / 6E driver for PCIe host-attached
-> silicon (QCA6390 / WCN6855 / QCN9074). Adapted from Linux
+> silicon. WCN6855-layout parts have the live runtime; recognized QCA6390
+> and QCN9074 parts are rejected before DMA because their software is
+> incomplete. Adapted from Linux
 > `drivers/net/wireless/ath/ath11k/` (BSD-3-Clause-Clear) and
 > `drivers/bus/mhi/host/`, `net/qrtr/`, `drivers/soc/qcom/qmi_*`.
 
@@ -112,6 +114,30 @@ RDDM image takes the ath11k reset path. Still not ported: BW scaling,
 RSC/offload/client-managed rings, EDL.
 
 ## 3. Public interface
+
+The implemented end-to-end runtime is restricted to the WCN6855 layout
+(HW2.0/HW2.1 plus QCA2066 HW2.1 and QCA6698AQ HW2.1). PCI matching and
+MHI/QMI support for another revision do not imply a registered WLAN:
+
+| Hardware | Reachable software | Remaining software gate |
+|---|---|---|
+| WCN6855 / QCA2066 / QCA6698AQ | MHI/QMI, CE/HTC/WMI, DP and STA/AP/P2P interfaces | Target-card and AP interoperability validation remains; optional Linux features outside this profile are not implied |
+| QCA6390 HW2.0 | Recognized PCI ID; shared MHI/QMI/CE definitions; probe rejects before MMIO/MSI/firmware activation | `CoreConfig::for_hw` and `DpHwParams::for_rev` return `None`; port `hal_rx_desc_ipq8074` and its RX accessors/DP parameters before admitting the live runtime |
+| QCN9074 HW1.0 | Recognized PCI ID; configuration definitions; probe rejects before MMIO/MSI/firmware activation | Static BAR windows, QCN9074 HAL register map/operations, core configuration, per-pdev/REO/HTT-v2 and RX descriptor runtime are not ported |
+
+Probe first verifies inherited bus mastering and memory decode are off,
+with INTx masked, using command-register readback. Rejected family/singleton
+functions stay parked. Accepted profiles enable and read back memory decode
+only after that parking proof. Probe validates the complete
+HAL/core/DP/MHI software profile before enabling memory decode. It repeats
+the check after refining the silicon revision and before MSI allocation or
+reset; BME is enabled only after those checks and PCI power-up succeed.
+`pci::ProbeError::UnsupportedRuntime` reports these recognized-but-incomplete
+families; `PciConfiguration` distinguishes a failed command access.
+Unsupported configurations never reach firmware activation or descriptor
+allocation. These are software gaps, independent
+of access to physical hardware; the WCN6855 acceptance plan does not close
+them.
 
 - `register()` — registers the three Linux PCI ids.
 - `pci::probe` — identify, power up, spawn the MHI bring-up task.
@@ -434,7 +460,7 @@ HE caps for the mac layer, HAL reg caps), `dma_ring_caps`, `ready` +
   `pdev_reo_setup` (after service ready, before INIT), async
   `htt_ver_req` (last step of `ath11k_core_start`), async `pdev_create`,
   `irq_enable`.
-- `CoreConfig::for_hw(&HwParams)` (QCA6390 + WCN6855 family; QCN9074
+- `CoreConfig::for_hw(&HwParams)` (WCN6855 family; QCA6390/QCN9074
   `None`): `single_pdev_only`, `num_rxdma_per_pdev = 2`, `max_radios =
   3`, `num_vdevs = 3`, credit flow, shadow regs, Linux timeouts (HTC
   1 s, connect 1 s, service / unified ready 5 s, WMI send 3 s).
@@ -1664,6 +1690,15 @@ SAE, registry), `narf-net` (frame rings).
 Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
 
 ## 8. Open questions
+
+- Per-family software completion: the PCI table recognizes QCA6390 and
+  QCN9074, but probe explicitly rejects both with BME disabled, before
+  MMIO/MSI/firmware activation. Neither has a live NARF data path.
+  QCA6390 requires Linux `rx_desc.h::hal_rx_desc_ipq8074` and
+  matching HAL accessors/DP parameters; QCN9074 additionally needs the
+  static CE/UMAC BAR windows, HAL register/operation tables, non-shadow
+  ring setup and its independent core/peer-map/RX/runtime profile. Tests
+  of the common transport or WCN6855 cannot validate those missing paths.
 
 - Test loop (decided): phases land with offline tests only; one
   full hardware bring-up at the end by booting NARF bare-metal on

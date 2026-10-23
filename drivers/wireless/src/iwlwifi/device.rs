@@ -107,12 +107,16 @@ impl Device {
         if nvm.phy.ht {
             hardware.check_aggregation_api()?;
         }
+        let runtime = hardware.runtime_configuration()?;
         hardware
             .command(1, 0x98, &nvm.tx_chains.to_le_bytes())
             .await?;
+        hardware.command(1, 0x9b, &runtime.coexistence).await?;
+        hardware.command(2, 1, &runtime.soc).await?;
         hardware
             .command(1, 0xc, &station_api::scan_config(&nvm))
             .await?;
+        hardware.command(1, 0x77, &runtime.power).await?;
         hardware
             .command(3, 8, &station_api::mac(1, mac, None))
             .await?;

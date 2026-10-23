@@ -30,6 +30,24 @@ fn word(bytes: &[u8], offset: usize) -> Option<u32> {
 
 /// Extract the validated 802.11 MPDU slice from a CONNAC2 normal RX packet.
 pub fn rx_frame(packet: &[u8]) -> Option<&[u8]> {
+    let native = rx_native(packet)?;
+    native.ccmp.is_none().then_some(native.frame)
+}
+
+/// Hardware-stripped CCMP metadata. PN bytes in RX group 1 are little
+/// endian, as in Linux mt7921_mac_fill_rx; the key index is in RXD1.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CcmpRx {
+    pub pn: u64,
+    pub key_id: u8,
+}
+
+pub(super) struct NativeRx<'a> {
+    pub frame: &'a [u8],
+    pub ccmp: Option<CcmpRx>,
+}
+
+pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
     let r0 = word(packet, 0)?;
     let len = (r0 & 0xffff) as usize;
     let normal = r0 >> 27 == 2 || r0 >> 27 == 7 && (r0 >> 16) & 15 == 1;
@@ -40,16 +58,24 @@ pub fn rx_frame(packet: &[u8]) -> Option<&[u8]> {
     let r1 = word(packet, 4)?;
     let r2 = word(packet, 8)?;
     let r4 = word(packet, 16)?;
-    if r1 & ((0x1f << 16) | (0x3f << 23)) != 0
+    let cipher = (r1 >> 16) & 0x1f;
+    if !matches!(cipher, 0 | 4) // MT_CIPHER_NONE / MT_CIPHER_AES_CCMP
+        || r1 & (0x3f << 23) != 0
         || r2 & ((1 << 13) | (7 << 23) | (1 << 27)) != 0
         || r4 & 3 != 0
     {
         return None;
     }
     let mut offset = 24usize;
+    let mut pn = None;
     for (flag, size) in [(14, 16), (11, 16), (12, 8)] {
         if r1 & (1 << flag) != 0 {
-            packet.get(offset..offset + size)?;
+            let group = packet.get(offset..offset + size)?;
+            if flag == 11 {
+                let mut bytes = [0u8; 8];
+                bytes[..6].copy_from_slice(&group[..6]);
+                pn = Some(u64::from_le_bytes(bytes));
+            }
             offset += size;
         }
     }
@@ -64,7 +90,17 @@ pub fn rx_frame(packet: &[u8]) -> Option<&[u8]> {
         return None;
     }
     offset += 2 * ((r2 >> 14) & 3) as usize;
-    packet.get(offset..)
+    Some(NativeRx {
+        frame: packet.get(offset..)?,
+        ccmp: if cipher == 4 {
+            Some(CcmpRx {
+                pn: pn?,
+                key_id: ((r1 >> 21) & 3) as u8,
+            })
+        } else {
+            None
+        },
+    })
 }
 
 // Parse only native management RX here. Translated/aggregated/protected data

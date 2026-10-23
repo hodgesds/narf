@@ -1,0 +1,603 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! Explicit platform attachment for a booted CYW43439 packet adapter.
+//! SDHCI/gSPI discovery must supply PacketTransport; codecs cannot bind it.
+
+use super::{
+    runtime::{Error, Runtime},
+    station::Station,
+    PacketTransport,
+};
+use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use narf_ipc::{Consumer, Producer};
+use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
+use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
+use narf_wireless::{
+    AssociateRequest, BssInfo, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
+};
+
+struct State<T: PacketTransport> {
+    station: Station<T>,
+    rx: Producer<Frame, RX_RING_N>,
+    tx: Consumer<Frame, TX_RING_N>,
+    pending: Option<PendingTx>,
+}
+struct PendingTx {
+    frame: Frame,
+    deadline: narf_time::Deadline,
+}
+impl<T: PacketTransport> State<T> {
+    fn clear_transmit(&mut self) {
+        self.pending = None;
+        // A ring has finite capacity. Bound cleanup even if its producer
+        // runs concurrently; a disconnected interface admits no new TX.
+        for _ in 0..TX_RING_N {
+            if !matches!(self.tx.try_recv(), Ok(Some(_))) {
+                break;
+            }
+        }
+    }
+
+    /// One synchronous progress step, shared by the timer and kernel
+    /// network drains. Waiting for credits never retains the async mutex.
+    fn progress(&mut self) -> Result<(), Error> {
+        if let Err(error) = self.station.poll() {
+            self.clear_transmit();
+            return Err(error);
+        }
+        if self.station.bssid.is_none() {
+            self.clear_transmit();
+            return Ok(());
+        }
+        if self.pending.is_none() {
+            if let Ok(Some(frame)) = self.tx.try_recv() {
+                if transmit_admitted(frame.payload(), self.station.mac) {
+                    self.pending = Some(PendingTx {
+                        frame,
+                        deadline: narf_time::Deadline::after_ms(2000),
+                    });
+                }
+            }
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(());
+        };
+        let result = if pending.deadline.expired() {
+            Err(Error::Timeout)
+        } else {
+            self.station.runtime.send_data(pending.frame.payload(), 0)
+        };
+        match result {
+            Ok(()) => self.pending = None,
+            Err(Error::Busy) => {}
+            Err(error) => {
+                self.station.runtime.fail();
+                self.station.bssid = None;
+                self.clear_transmit();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+pub struct Device<T: PacketTransport> {
+    state: Mutex<State<T>>,
+    name: String,
+    mac: [u8; 6],
+    channels: Vec<u32>,
+    supplicant: bool,
+    up: AtomicBool,
+    bssid: AtomicU64,
+    rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+}
+impl<T: PacketTransport> core::fmt::Debug for Device<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CywDevice")
+            .field("name", &self.name)
+            .field("mac", &self.mac)
+            .finish_non_exhaustive()
+    }
+}
+
+trait Endpoint: Send + Sync {
+    fn enqueue(&self, bytes: &[u8]) -> Result<(), ()>;
+    fn drain(&self) -> bool;
+}
+static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
+
+/// Attach to a platform-owned, already booted FIFO adapter. All firmware
+/// initialization succeeds before any netdev, frame rings or worker appears.
+/// There is deliberately no SDIO/gSPI auto-probe without a live host driver.
+pub async fn attach<T: PacketTransport + 'static>(
+    name: &str,
+    transport: T,
+    clm: &[u8],
+) -> Result<Arc<Device<T>>, Error> {
+    if name.is_empty()
+        || name.len() > 15
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        || ACTIVE.lock().is_some()
+        || narf_net::iface::lookup(name).is_some()
+        || narf_wireless::registry::list()
+            .iter()
+            .any(|iface| iface.name() == name)
+    {
+        return Err(Error::Busy);
+    }
+    let authority = narf_net::trusted_net_authority()
+        .and_then(|cap| cap.derive().ok())
+        .ok_or(Error::Unsupported)?;
+    let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Unsupported)?;
+    let station = Station::initialize(Runtime::new(transport), clm, domain).await?;
+    let (rx_producer, rx_consumer) = narf_ipc::channel();
+    let (tx_producer, tx_consumer) = narf_ipc::channel();
+    let device = Arc::new(Device {
+        name: name.into(),
+        mac: station.mac,
+        channels: station.channels.iter().map(|&ch| u32::from(ch)).collect(),
+        supplicant: station.supplicant,
+        state: Mutex::new(State {
+            station,
+            rx: rx_producer,
+            tx: tx_consumer,
+            pending: None,
+        }),
+        up: AtomicBool::new(false),
+        bssid: AtomicU64::new(0),
+        rx: IrqSafeSpinLock::new(Some(rx_consumer)),
+        tx: IrqSafeSpinLock::new(Some(tx_producer)),
+    });
+    {
+        let mut active = ACTIVE.lock();
+        // Firmware setup awaited bus transactions. Another driver may have
+        // claimed this name in that interval; never replace its netdev.
+        if active.is_some()
+            || narf_net::iface::lookup(name).is_some()
+            || narf_wireless::registry::list()
+                .iter()
+                .any(|iface| iface.name() == name)
+        {
+            return Err(Error::Busy);
+        }
+        // Registration may reject a revoked authority or duplicate name.
+        // Fail before publishing ACTIVE, a kernel netdev, or any worker.
+        narf_net::registry()
+            .register(&authority, Registered(device.clone()))
+            .map_err(|error| match error {
+                narf_net::RegisterError::DuplicateName => Error::Busy,
+                narf_net::RegisterError::AuthorityRevoked => Error::Unsupported,
+            })?;
+        *active = Some(device.clone());
+    }
+    narf_net::iface::register(name, device.mac, send_frame);
+    narf_net::iface::set_link_state(name, false);
+    narf_net::iface::install_rx_drain(drain);
+    narf_wireless::registry::register(device.clone());
+    let worker = device.clone();
+    narf_scheduler::spawn(async move {
+        worker.receive_worker().await;
+    });
+    Ok(device)
+}
+
+impl<T: PacketTransport + 'static> Device<T> {
+    fn link(&self, peer: Option<[u8; 6]>) {
+        let mut packed = [0; 8];
+        if let Some(peer) = peer {
+            packed[..6].copy_from_slice(&peer);
+            packed[7] = 1;
+        }
+        self.bssid
+            .store(u64::from_le_bytes(packed), Ordering::Release);
+        let up = peer.is_some();
+        let was_up = self.up.swap(up, Ordering::AcqRel);
+        narf_net::iface::set_link_state(&self.name, up);
+        if was_up && !up {
+            narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+        }
+    }
+
+    fn step(&self) -> Vec<Vec<u8>> {
+        let Some(mut state) = self.state.try_lock() else {
+            return Vec::new();
+        };
+        if state.progress().is_err() {
+            self.link(None);
+            return Vec::new();
+        }
+        self.link(state.station.bssid);
+        let mut output = Vec::new();
+        for _ in 0..32 {
+            let Some(bytes) = state.station.runtime.pop_data() else {
+                break;
+            };
+            if !self.up.load(Ordering::Acquire) || !receive_admitted(&bytes, self.mac) {
+                continue;
+            }
+            if let Ok(buffer) =
+                narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
+            {
+                let mut frame = Frame::new(buffer, bytes.len() as u32);
+                frame.payload_mut().copy_from_slice(&bytes);
+                let _ = state.rx.try_send(frame);
+            }
+            output.push(bytes);
+        }
+        output
+    }
+
+    async fn receive_worker(self: Arc<Self>) {
+        loop {
+            for mut frame in self.step() {
+                narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+            }
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+        }
+    }
+}
+impl<T: PacketTransport + 'static> Endpoint for Device<T> {
+    fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
+        if !self.up.load(Ordering::Acquire) || !transmit_admitted(bytes, self.mac) {
+            return Err(());
+        }
+        let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
+            .map_err(|_| ())?;
+        let mut frame = Frame::new(buffer, bytes.len() as u32);
+        frame.payload_mut().copy_from_slice(bytes);
+        self.tx
+            .lock()
+            .as_mut()
+            .ok_or(())?
+            .try_send(frame)
+            .map_err(|_| ())
+    }
+    fn drain(&self) -> bool {
+        let frames = self.step();
+        let progress = !frames.is_empty();
+        for mut frame in frames {
+            narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+        }
+        progress
+    }
+}
+fn send_frame(bytes: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
+    let active = ACTIVE.lock().clone().ok_or(())?;
+    active.enqueue(bytes)
+}
+fn drain() -> bool {
+    let active = ACTIVE.lock().clone();
+    active.is_some_and(|active| active.drain())
+}
+
+impl<T: PacketTransport + 'static> Interface for Device<T> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        self.up.load(Ordering::Acquire)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx
+    }
+}
+#[async_trait::async_trait]
+impl<T: PacketTransport + 'static> WirelessNetIface for Device<T> {
+    fn supports_handshake_offload(&self) -> bool {
+        self.supplicant
+    }
+    fn reports_disconnect_events(&self) -> bool {
+        true
+    }
+    fn connected_bssid(&self) -> Option<[u8; 6]> {
+        let packed = self.bssid.load(Ordering::Acquire).to_le_bytes();
+        (packed[7] != 0).then(|| packed[..6].try_into().unwrap())
+    }
+    fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
+        self.state
+            .try_lock()?
+            .station
+            .cache
+            .iter()
+            .find(|b| b.info.bssid == bssid)
+            .map(|b| b.ies.clone())
+    }
+    fn get_wireless_info(&self) -> narf_wireless::WirelessIfaceInfo {
+        use narf_wireless::iface::*;
+        WirelessIfaceInfo {
+            base_name: self.name.clone(),
+            base_mac: self.mac,
+            bands: vec![WirelessBand {
+                freq_mhz: 2400,
+                channels: self.channels.clone(),
+            }],
+            modes: WirelessModes::STATION,
+            hw_caps: HwCaps {
+                ht_supported: false,
+                vht_supported: false,
+                he_supported: false,
+                eht_supported: false,
+            },
+        }
+    }
+    async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        self.state
+            .lock()
+            .await
+            .station
+            .scan(request)
+            .await
+            .map_err(wireless_error)
+    }
+    async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        let mut state = self.state.lock().await;
+        let result = state.station.associate(request).await;
+        self.link(state.station.bssid);
+        result.map_err(wireless_error)
+    }
+    async fn disassociate(&self) -> Result<(), WirelessError> {
+        self.link(None);
+        let mut state = self.state.lock().await;
+        state.clear_transmit();
+        state.station.disconnect().await.map_err(wireless_error)
+    }
+    async fn set_config(&self, _: WirelessConfig) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+}
+fn wireless_error(error: Error) -> WirelessError {
+    match error {
+        Error::Busy => WirelessError::Busy,
+        Error::Timeout => WirelessError::Timeout,
+        Error::Unsupported => WirelessError::NotSupported,
+        Error::Malformed => WirelessError::InvalidArgs,
+        _ => WirelessError::HardwareError,
+    }
+}
+struct Registered<T: PacketTransport>(Arc<Device<T>>);
+fn receive_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
+    (14..=1514).contains(&bytes.len())
+        && u16::from_be_bytes([bytes[12], bytes[13]]) >= 0x600
+        && bytes[12..14] != [0x88, 0x8e]
+        && (bytes[0] & 1 != 0 || bytes[..6] == local)
+        && bytes[6] & 1 == 0
+        && bytes[6..12] != [0; 6]
+}
+fn transmit_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
+    (14..=1514).contains(&bytes.len())
+        && u16::from_be_bytes([bytes[12], bytes[13]]) >= 0x600
+        && bytes[6..12] == local
+        && bytes[12..14] != [0x88, 0x8e]
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tests {
+    use super::*;
+    use crate::cyw43439::{station::tests as station_tests, Function, Transport, TransportError};
+    use core::{
+        future::Future,
+        pin::pin,
+        sync::atomic::AtomicUsize,
+        task::{Context, Poll, Waker},
+    };
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    #[derive(Clone)]
+    struct Bus {
+        inner: Arc<IrqSafeSpinLock<station_tests::Bus>>,
+        reads: Arc<AtomicUsize>,
+    }
+    impl Transport for Bus {
+        fn read32(&mut self, f: Function, a: u32) -> Result<u32, TransportError> {
+            self.inner.lock().read32(f, a)
+        }
+        fn write32(&mut self, f: Function, a: u32, v: u32) -> Result<(), TransportError> {
+            self.inner.lock().write32(f, a, v)
+        }
+        fn read_burst(
+            &mut self,
+            f: Function,
+            a: u32,
+            bytes: &mut [u8],
+        ) -> Result<(), TransportError> {
+            self.inner.lock().read_burst(f, a, bytes)
+        }
+        fn write_burst(&mut self, f: Function, a: u32, bytes: &[u8]) -> Result<(), TransportError> {
+            self.inner.lock().write_burst(f, a, bytes)
+        }
+    }
+    impl PacketTransport for Bus {
+        fn receive_packet(&mut self, bytes: &mut [u8]) -> Result<usize, TransportError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.lock().receive_packet(bytes)
+        }
+        fn transmit_packet(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+            self.inner.lock().transmit_packet(bytes)
+        }
+    }
+
+    fn frame(bytes: &[u8]) -> Frame {
+        let buffer =
+            narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0).unwrap();
+        let mut frame = Frame::new(buffer, bytes.len() as u32);
+        frame.payload_mut().copy_from_slice(bytes);
+        frame
+    }
+
+    fn smoke_cyw_sync_credit_wait_allows_rx_and_disconnect_cleanup() -> TestResult {
+        let bus = Bus {
+            inner: Arc::new(IrqSafeSpinLock::new(station_tests::Bus::new())),
+            reads: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut initialize = pin!(Station::initialize(
+            Runtime::new(bus.clone()),
+            &[1],
+            station_tests::domain()
+        ));
+        let Poll::Ready(Ok(mut station)) = initialize
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            return TestResult::Fail("CYW synchronous progress fixture did not initialize");
+        };
+        let local = station.mac;
+        station.bssid = Some([2, 1, 2, 3, 4, 5]);
+        let (rx, _rx_consumer) = narf_ipc::channel();
+        let (mut producer, tx) = narf_ipc::channel();
+        let mut state = State {
+            station,
+            rx,
+            tx,
+            pending: None,
+        };
+        let mut bytes = vec![0; 14];
+        bytes[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+        bytes[6..12].copy_from_slice(&local);
+        bytes[12..14].copy_from_slice(&[8, 0]);
+        producer.try_send(frame(&bytes)).unwrap();
+        {
+            let mut bus = bus.inner.lock();
+            let maximum = bus.credit_window(2); // Only reserved control credits.
+            bus.queue(0, maximum, &[]);
+            let mut rx = vec![0x20, 0, 0, 0];
+            rx.extend_from_slice(&bytes);
+            for _ in 0..20 {
+                bus.queue(2, maximum, &rx);
+            }
+        }
+        bus.reads.store(0, Ordering::Relaxed);
+        if state.progress().is_err()
+            || state.pending.is_none()
+            || bus.reads.load(Ordering::Relaxed) != 16
+            || bus.inner.lock().sent_data() != 0
+        {
+            return TestResult::Fail(
+                "credit wait retained TX owner, transmitted early, or exceeded RX bound",
+            );
+        }
+        let mut received = 0;
+        while state.station.runtime.pop_data().is_some() {
+            received += 1;
+        }
+        if received != 15 || state.progress().is_err() {
+            return TestResult::Fail("bounded credit-wait step did not deliver first RX batch");
+        }
+        while state.station.runtime.pop_data().is_some() {
+            received += 1;
+        }
+        if received != 20 || state.pending.is_none() {
+            return TestResult::Fail("synchronous credit wait blocked remaining RX progress");
+        }
+        {
+            let mut bus = bus.inner.lock();
+            let maximum = bus.credit_window(5);
+            bus.queue(0, maximum, &[]);
+        }
+        producer.try_send(frame(&bytes)).unwrap();
+        if state.progress().is_err() || state.pending.is_some() || bus.inner.lock().sent_data() != 1
+        {
+            return TestResult::Fail("credit update did not release exactly one pending TX");
+        }
+        {
+            let mut bus = bus.inner.lock();
+            let maximum = bus.credit_window(2);
+            bus.queue(0, maximum, &[]);
+        }
+        if state.progress().is_err() || state.pending.is_none() {
+            return TestResult::Fail("second frame did not retain bounded credit wait");
+        }
+        producer.try_send(frame(&bytes)).unwrap();
+        {
+            let mut bus = bus.inner.lock();
+            let maximum = bus.credit_window(2);
+            bus.event(16, 0, 0, &[], maximum);
+        }
+        if state.progress().is_err()
+            || state.station.bssid.is_some()
+            || state.pending.is_some()
+            || !matches!(state.tx.try_recv(), Ok(None))
+            || bus.inner.lock().sent_data() != 1
+        {
+            return TestResult::Fail(
+                "link loss retained pending/queued TX or released an unauthorized frame",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/interface",
+        smoke_cyw_sync_credit_wait_allows_rx_and_disconnect_cleanup
+    );
+    fn smoke_cyw_interface_ethernet_address_and_control_port() -> TestResult {
+        let local = [2, 1, 2, 3, 4, 5];
+        let mut bytes = vec![2, 1, 2, 3, 4, 5, 2, 6, 7, 8, 9, 10, 8, 0];
+        if !receive_admitted(&bytes, local) || transmit_admitted(&bytes, local) {
+            return TestResult::Fail("valid RX or foreign-source TX admission");
+        }
+        bytes[..6].copy_from_slice(&[4, 1, 2, 3, 5, 5]);
+        if receive_admitted(&bytes, local) {
+            return TestResult::Fail("foreign unicast accepted from wrong multicast byte");
+        }
+        bytes[..6].copy_from_slice(&[1, 1, 2, 3, 4, 5]);
+        if !receive_admitted(&bytes, local) {
+            return TestResult::Fail("multicast destination rejected");
+        }
+        bytes[6..12].copy_from_slice(&local);
+        if !transmit_admitted(&bytes, local) {
+            return TestResult::Fail("own-source multicast TX rejected");
+        }
+        bytes[12..14].copy_from_slice(&[0x05, 0xff]);
+        if transmit_admitted(&bytes, local) || receive_admitted(&bytes, local) {
+            return TestResult::Fail("802.3 length escaped Ethernet-II admission");
+        }
+        bytes[12..14].copy_from_slice(&[0x06, 0]);
+        if !transmit_admitted(&bytes, local) || !receive_admitted(&bytes, local) {
+            return TestResult::Fail("Ethernet-II minimum type rejected");
+        }
+        bytes[12..14].copy_from_slice(&[0x88, 0x8e]);
+        if transmit_admitted(&bytes, local) || receive_admitted(&bytes, local) {
+            return TestResult::Fail("firmware-owned EAPOL escaped controlled port");
+        }
+        for end in 0..14 {
+            if transmit_admitted(&bytes[..end], local) || receive_admitted(&bytes[..end], local) {
+                return TestResult::Fail("truncated Ethernet admitted");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/interface",
+        smoke_cyw_interface_ethernet_address_and_control_port
+    );
+}
+impl<T: PacketTransport + 'static> Interface for Registered<T> {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.0.mac()
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        self.0.link_up()
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        self.0.rx_ring()
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        self.0.tx_ring()
+    }
+}

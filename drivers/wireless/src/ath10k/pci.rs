@@ -1,35 +1,22 @@
-//! ath10k PCI probe + BAR0 mapping + soft-reset.
-//!
-//! Stage 0 scope:
-//!   - Match the QCA988X / 6174 / 6164 / 99X0 / 9377 / 9888 / 9984
-//!     PCI IDs (plus the Ubiquiti rebadge of 988X).
-//!   - Map BAR0 (the single MMIO register window).
-//!   - Read `SOC_CHIP_ID` to confirm we actually have silicon.
-//!   - Issue a soft global reset via `SOC_GLOBAL_RESET_ADDRESS`.
-//!   - Log `(hw_rev, chip_id, chip_id_rev)` to the kernel console.
-//!   - Defer iface registration to a follow-up — `narf_net::iface` is
-//!     useful only after the firmware load + WMI handshake, neither of
-//!     which Stage 0 attempts. Register a kernel-driver record so
-//!     `dmesg` shows the bind.
-//!
-//! Pattern mirrors `rtw88::pci::probe` for shape (single-instance
-//! controller; per-PCI-ID match registration with one name per ID;
-//! Cap-gated probe entry).
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! PCI identification and retained asynchronous DMA-backed BMI bootstrap.
+//! Probe disables inherited bus mastering, validates the per-chip BAR
+//! windows and wakes the target. The boot task owns reset/CE7 target
+//! configuration and CE0/CE1 BMI. Firmware/board activation, runtime HIF
+//! and interface registration remain separate unfinished software work.
 
 #![allow(dead_code)]
 
 use core::fmt::Write as _;
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_time::Deadline;
 
 use super::hw::*;
 
-/// One bound ath10k device. Stage 0 tracks the BAR0 mapping plus
-/// the decoded chip identity; the Copy-Engine layout lives in the
-/// follow-up.
+/// Retained PCI identity and the asynchronous boot transport's result.
 pub struct Ath10kDevice {
     /// BAR0 MMIO window.
     pub mmio_bar0: MmioRegion,
@@ -43,6 +30,10 @@ pub struct Ath10kDevice {
     pub device_id: u16,
     /// PCI vendor id we matched on.
     pub vendor_id: u16,
+    /// Published only after a real DMA-backed BMI target-info response.
+    pub target_info: Option<super::bmi::TargetInfo>,
+    /// Last boot failure; identification alone never implies a live WLAN.
+    pub boot_error: Option<super::bmi::BmiError>,
 }
 
 impl core::fmt::Debug for Ath10kDevice {
@@ -73,6 +64,10 @@ pub enum ProbeError {
     /// shouldn't bind it. Surfaced explicitly rather than silently
     /// succeeding so the probe trace shows what happened.
     LegacyChipRejected,
+    /// The mapped BAR cannot cover this family's register windows.
+    BadBar,
+    /// The target's PCI-local RTC did not reach its awake state.
+    WakeTimeout,
 }
 
 /// All-FF sentinel for a 32-bit MMIO read on absent silicon.
@@ -81,6 +76,12 @@ const READ_GONE_U32: u32 = 0xFFFF_FFFF;
 /// Single-instance live device. Same shape as `rtw88` — laptops only
 /// ship one ath10k radio, so single-instance is fine for now.
 static CONTROLLER: IrqSafeSpinLock<Option<Ath10kDevice>> = IrqSafeSpinLock::new(None);
+
+// The boot session retains its PCI authority, awake target and all DMA
+// allocations. Future firmware/runtime work takes this async mutex, never
+// an IRQ-disabling controller guard, while awaiting CE completions.
+static SESSION: narf_lib::mutex::Mutex<Option<super::bmi::Bmi<super::boot::PciBoot>>> =
+    narf_lib::mutex::Mutex::new(None);
 
 /// PCI driver match registration. One entry per supported device id,
 /// each with a unique `name` so the bus registry doesn't collapse them.
@@ -115,18 +116,13 @@ pub const fn name_for(vendor: u16, device: u16) -> &'static str {
 /// Probe entry called by `narf-bus::driver_match` when a matching
 /// `(vendor, device)` pair surfaces.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    // Refuse re-probe — single-instance for Stage 0.
-    if CONTROLLER.lock().is_some() {
-        return Ok(());
-    }
-
     // Resolve hw_rev from the PCI ID first so we can refuse AR9462
     // before doing any MMIO.
     let hw_rev = match HwRev::from_pci_id(device.id.vendor, device.id.device) {
         Some(HwRev::Ar9462Legacy) => {
             let _ = writeln!(
                 narf_console::Writer,
-                "  ath10k: AR9462 (1002:0034) is ath9k territory, skipping"
+                "  ath10k: AR9462 (168c:0034) is ath9k territory, skipping"
             );
             return Err(narf_bus::ProbeError::NotForThisDriver);
         }
@@ -134,14 +130,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => return Err(narf_bus::ProbeError::NotForThisDriver),
     };
 
-    // Enable MEM_SPACE + BUS_MASTER so BAR reads land + the device
-    // can DMA later. Same shape as rtw88.
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    // Verify inherited DMA is parked before any MMIO. An additional
+    // matched radio is parked with memory decode off, never reported bound.
+    let occupied = CONTROLLER.lock().is_some();
+    crate::qualcomm_pci::park(&device, &cap, !occupied)?;
+    if occupied {
+        return Err(narf_bus::ProbeError::Other(
+            "ath10k singleton already owns another radio",
+        ));
+    }
 
     // SAFETY: bus dispatch hands us exclusive BusDeviceCap authority
     // for this device's cfg + BARs for the lifetime of this call.
@@ -173,14 +170,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         dev.chip_id_raw,
         dev.chip_id_rev,
     );
-    // Tell the operator where to drop the firmware blob. Stage 1 will
-    // try to actually load it; Stage 0 just announces the path.
+    // Firmware/profile selection and activation are still pending.
     let _ = writeln!(
         narf_console::Writer,
         "  ath10k:   firmware required at /firmware/ath10k/{}/",
         hw_rev.short_name(),
     );
 
+    let mmio = dev.mmio_bar0;
+    let revision = dev.chip_id_rev;
     let vid = dev.vendor_id;
     let did = dev.device_id;
     *CONTROLLER.lock() = Some(dev);
@@ -193,37 +191,66 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    narf_scheduler::spawn(boot_task(device, cap, mmio, hw_rev, revision));
+
     Ok(())
 }
 
-/// Bring the chip up: map BAR0, identify silicon, soft-reset, decode
-/// chip ID. Pure-IO; no CE ring setup, no firmware load.
+/// Map and wake the device and read the fuse-backed chip identity.
+/// No reset or DMA starts until the asynchronous boot owner takes over.
 ///
 /// # Safety
 /// Caller owns the device's BARs exclusively.
 pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice, ProbeError> {
     // SAFETY: caller-asserted BAR exclusivity.
-    let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    let mmio_bar0 = unsafe { map_bar_control(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
 
-    // Presence test before any writes — the first read of any BAR0
+    let registers = hw_rev.registers().ok_or(ProbeError::LegacyChipRejected)?;
+    let required = (registers.pcie_local + 12)
+        .max(registers.chip_id + 4)
+        .max(registers.soc_core + 24)
+        .max(registers.ce_base(7).unwrap() + 0x54);
+    if mmio_bar0.len < required {
+        return Err(ProbeError::BadBar);
+    }
+    // Force the target awake before accessing the RTC/CE windows. The
+    // register offsets are relative to the per-chip PCI-local window.
+    // SAFETY: probe owns the BAR and the bounds above cover this wake register.
+    unsafe {
+        mmio_bar0.write32(registers.pcie_local + PCIE_SOC_WAKE_ADDRESS, 1);
+    }
+    let on = if hw_rev == HwRev::Qca99x0 { 7 } else { 3 };
+    let mut gone = false;
+    let awake = narf_scheduler::responsive_spin_until(
+        || {
+            // SAFETY: the BAR bounds above cover PCI-local RTC state.
+            let state = unsafe { mmio_bar0.read32(registers.pcie_local + RTC_STATE_ADDRESS) };
+            if state == u32::MAX {
+                gone = true;
+                return true;
+            }
+            state & RTC_STATE_V_MASK == on
+        },
+        Deadline::after_ms(30),
+    );
+    if gone {
+        return Err(ProbeError::DeviceGone);
+    }
+    if !awake {
+        return Err(ProbeError::WakeTimeout);
+    }
+
+    // Presence test — the first read of any BAR0
     // register returns all-FF if the device dropped off the link.
     // `SOC_CHIP_ID` is always present; pick it.
     let chip_id_off = soc_chip_id_address(hw_rev);
-    // SAFETY: identity-mapped MMIO; `chip_id_off` < 0x100, well inside
-    // BAR0 even on the smallest chip.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
+    // SAFETY: the selected full BAR-relative offset was checked above.
     let pre_reset_chip_id = unsafe { mmio_bar0.read32(chip_id_off) };
     if pre_reset_chip_id == READ_GONE_U32 {
         return Err(ProbeError::DeviceGone);
     }
 
-    // SAFETY: BAR0 mapped + owned.
-    unsafe { soft_reset(&mmio_bar0)? };
-
-    // Re-read CHIP_ID after the reset so we capture the value the
-    // operator-visible log reports. Reset doesn't change it
-    // (it's a fuse-backed read-only value) but it's a cheap
-    // post-reset presence test.
+    // Re-read the fuse-backed value for the operator-visible log.
     // SAFETY: same.
     let chip_id_raw = unsafe { mmio_bar0.read32(chip_id_off) };
     if chip_id_raw == READ_GONE_U32 {
@@ -238,54 +265,47 @@ pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice
         chip_id_rev: rev,
         vendor_id: device.id.vendor,
         device_id: device.id.device,
+        target_info: None,
+        boot_error: None,
     })
 }
 
-/// Soft-reset the SoC via `SOC_GLOBAL_RESET_ADDRESS`. Mirrors
-/// `ath10k/pci.c::ath10k_pci_warm_reset_si0` minus the QCA6174
-/// cold/warm dance (which Stage 0 doesn't need — soft-reset alone
-/// is enough to land in a known state for CHIP_ID readback).
-///
-/// Sequence:
-///   1. Write the pulse bit to `SOC_GLOBAL_RESET_ADDRESS`.
-///   2. Spin until the bit self-clears (chip signals "reset
-///      complete" by zeroing the latch). Linux uses a 100 ms
-///      budget; we use the same.
-///
-/// # Safety
-/// Caller owns BAR0 exclusively.
-pub unsafe fn soft_reset(mmio: &MmioRegion) -> Result<(), ProbeError> {
-    // SAFETY: `SOC_GLOBAL_RESET_ADDRESS = 0x0008` < BAR0 size on
-    // every ath10k part.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    unsafe {
-        mmio.write32(SOC_GLOBAL_RESET_ADDRESS, SOC_GLOBAL_RESET_PULSE);
+async fn boot_task(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    mmio: MmioRegion,
+    hw: HwRev,
+    revision: u32,
+) {
+    let result = async {
+        let mut transport = super::boot::PciBoot::new(device, cap, mmio, hw)?;
+        transport.power_up(revision).await?;
+        let mut bmi = super::bmi::Bmi::new(transport);
+        let info = bmi.target_info().await?;
+        *SESSION.lock().await = Some(bmi);
+        Ok::<_, super::bmi::BmiError>(info)
     }
-
-    // Poll for the latch to self-clear. responsive_spin_until ticks
-    // sleep_pumps so the FB cursor + serial drain stay alive while we
-    // wait (per project_lapic_calibration.md the project's
-    // sleep_pump pattern is important).
-    let deadline = Deadline::after_ms(100);
-    let cleared = narf_scheduler::responsive_spin_until(
-        || {
-            // SAFETY: same.
-            let v = unsafe { mmio.read32(SOC_GLOBAL_RESET_ADDRESS) };
-            v == 0 || v == READ_GONE_U32
-        },
-        deadline,
-    );
-    if !cleared {
-        return Err(ProbeError::ResetTimeout);
+    .await;
+    match result {
+        Ok(info) => {
+            if let Some(controller) = CONTROLLER.lock().as_mut() {
+                controller.target_info = Some(info);
+            }
+            let _ = writeln!(narf_console::Writer,
+                "  ath10k: BMI target version={:#010x} type={}; firmware/board/runtime initialization pending",
+                info.version, info.target_type);
+        }
+        Err(error) => {
+            if let Some(controller) = CONTROLLER.lock().as_mut() {
+                controller.boot_error = Some(error);
+            }
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath10k: BMI bootstrap failed: {:?}",
+                error
+            );
+        }
     }
-
-    // SAFETY: same.
-    let post = unsafe { mmio.read32(SOC_GLOBAL_RESET_ADDRESS) };
-    if post == READ_GONE_U32 {
-        return Err(ProbeError::DeviceGone);
-    }
-
-    Ok(())
 }
 
 /// Test helper — `true` if the static slot has a bound device.

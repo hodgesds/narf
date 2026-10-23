@@ -31,8 +31,12 @@ struct Ring {
 }
 impl Ring {
     fn allocate(base: u32, rx: bool) -> Result<Self, Error> {
-        let descriptors = narf_io::alloc_coherent(DEPTH * 16, narf_lib::id::DomainId::DRIVER_0)
-            .map_err(|_| Error::Allocation)?;
+        let descriptors = narf_io::alloc_coherent_masked(
+            DEPTH * 16,
+            narf_lib::id::DomainId::DRIVER_0,
+            u64::from(u32::MAX),
+        )
+        .map_err(|_| Error::Allocation)?;
         // Hardware descriptor-base registers have no upper-address field.
         if descriptors
             .dma_addr()
@@ -44,8 +48,14 @@ impl Ring {
         }
         let mut buffers = Vec::with_capacity(DEPTH);
         for _ in 0..DEPTH {
-            let buffer = narf_io::alloc_coherent(MAX_FRAME, narf_lib::id::DomainId::DRIVER_0)
-                .map_err(|_| Error::Allocation)?;
+            let mask = if base == TX_DATA {
+                u64::from(u32::MAX)
+            } else {
+                (1u64 << 36) - 1
+            };
+            let buffer =
+                narf_io::alloc_coherent_masked(MAX_FRAME, narf_lib::id::DomainId::DRIVER_0, mask)
+                    .map_err(|_| Error::Allocation)?;
             if buffer
                 .dma_addr()
                 .raw()
@@ -157,13 +167,13 @@ impl Hardware {
         self.owner.storage.as_mut().ok_or(Error::Busy)?.rx[which].index = (slot + 1) % DEPTH;
         Ok(Some(frame))
     }
-    fn route_rx(&mut self, event: bool) -> Result<Option<Vec<u8>>, Error> {
+    fn route_rx(&mut self, event: Option<bool>) -> Result<Option<Vec<u8>>, Error> {
         self.check()?;
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
-        if let Some(packet) = if event {
-            storage.pending_events.pop_front()
-        } else {
-            storage.pending_data.pop_front()
+        if let Some(packet) = match event {
+            Some(true) => storage.pending_events.pop_front(),
+            Some(false) => storage.pending_data.pop_front(),
+            None => None,
         } {
             return Ok(Some(packet));
         }
@@ -186,7 +196,7 @@ impl Hardware {
                 if !normal && packet.len() < 32 {
                     return Err(Error::MalformedEvent);
                 }
-                if event != normal {
+                if event == Some(!normal) {
                     return Ok(Some(packet));
                 }
                 let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
@@ -252,7 +262,7 @@ impl Hardware {
         fence(Ordering::SeqCst);
         self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
     }
-    fn submit_data(&mut self, frame: &[u8]) -> Result<(), Error> {
+    fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
         self.check()?;
         if !self.owner.published {
             return Err(Error::Busy);
@@ -268,7 +278,7 @@ impl Hardware {
         let payload = address
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
-        let header = packet_tx::ethernet(frame, payload, token, 1)?;
+        let header = packet_tx::ethernet(frame, payload, token, 1, protected)?;
         // SAFETY: fully validated lengths; this slot has neither DMA nor
         // firmware ownership until the publication below.
         unsafe {
@@ -314,7 +324,8 @@ impl Hardware {
         }
         let mut result = storage.tokens.finish();
         if result.is_none() {
-            let _ = self.route_rx(true)?;
+            // Poll reports without consuming queued/fresh MCU replies.
+            let _ = self.route_rx(None)?;
             let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
             result = storage.tokens.finish();
         }
@@ -544,10 +555,10 @@ impl Backend for Hardware {
         Ok(true)
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        self.route_rx(true)
+        self.route_rx(Some(true))
     }
     fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        self.route_rx(false)
+        self.route_rx(Some(false))
     }
     fn release(&mut self) -> Result<(), Error> {
         if !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
@@ -574,8 +585,8 @@ impl Backend for Hardware {
     fn submit_management(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
         self.submit_management(frame, wcid)
     }
-    fn submit_data(&mut self, frame: &[u8]) -> Result<(), Error> {
-        self.submit_data(frame)
+    fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
+        self.submit_data(frame, protected)
     }
     fn management_complete(
         &mut self,
@@ -676,7 +687,13 @@ impl Transport {
         ssid: &[u8],
         security: crate::mt7921::association::Security,
     ) -> Result<u16, Error> {
-        self.session.associate_station(bss, ssid, security).await
+        let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Authority)?;
+        let permission =
+            crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
+                .ok_or(Error::Authority)?;
+        self.session
+            .associate_station(bss, ssid, security, permission)
+            .await
     }
     /// Send deauthentication and tear down peer station record.
     pub async fn disassociate_station(&mut self) -> Result<(), Error> {
@@ -701,5 +718,17 @@ impl Transport {
     /// Receive a data frame from the data queue.
     pub async fn receive_data_frame(&mut self) -> Result<Option<Vec<u8>>, Error> {
         self.session.receive_ethernet()
+    }
+
+    pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
+        self.session.step_network(tx)
+    }
+
+    pub(super) async fn service_keys(&mut self) -> Result<(), Error> {
+        self.session.service_keys().await
+    }
+
+    pub(super) fn keys_pending(&self) -> bool {
+        self.session.keys_pending()
     }
 }

@@ -45,7 +45,12 @@ extern crate alloc;
 pub mod efuse;
 pub mod fw;
 pub mod pci;
+pub(crate) mod pci_park;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod pci_park_tests;
 pub mod power;
+mod power_tables;
 pub mod regs;
 
 pub use pci::{name_for, probe, register_pci_driver, Rtw88Device};
@@ -65,3 +70,6 @@ mod efuse_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod pci_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod power_tests;

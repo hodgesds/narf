@@ -73,7 +73,6 @@ pub const ALL_DEV_IDS: &[u16] = &[
     RTL_DEV_8723AE,
     RTL_DEV_8723BE,
     RTL_DEV_8821AE,
-    RTL_DEV_8822BE,
 ];
 
 // ── System / power-control (BAR0 low-byte block) ───────────────────────────
@@ -121,8 +120,11 @@ pub const REG_EFUSE_CTRL: u64 = 0x0030;
 /// `LDOE25_EN` (bits[31:28] = 0x3) is set before EFUSE reads.
 pub const REG_EFUSE_TEST: u64 = 0x0034;
 
-/// Bit 31 of `REG_EFUSE_CTRL`: set to trigger a read; hardware clears
-/// when the byte is ready.
+/// Read-access gate for the post-8192C/8192D EFUSE controller.
+pub const REG_EFUSE_ACCESS: u64 = 0x00cf;
+
+/// Bit 31 of `REG_EFUSE_CTRL`: clear to trigger a physical read; hardware
+/// sets it when data is ready. Setting it instead starts programming.
 pub const EFUSE_CTRL_VALID: u32 = 1 << 31;
 
 /// Address field shift within `REG_EFUSE_CTRL`.  The 8-bit EFUSE address
@@ -131,7 +133,7 @@ pub const EFUSE_CTRL_ADDR_SHIFT: u32 = 8;
 
 /// Address mask (8-bit: 256 raw cells; full logical map after repeated
 /// reading is up to 512 B depending on chip).
-pub const EFUSE_CTRL_ADDR_MASK: u32 = 0x0000_00FF;
+pub const EFUSE_CTRL_ADDR_MASK: u32 = 0x3ff;
 
 /// Data byte mask — low 8 bits of `REG_EFUSE_CTRL` after a successful
 /// read.
@@ -140,7 +142,7 @@ pub const EFUSE_CTRL_DATA_MASK: u32 = 0x0000_00FF;
 /// LDOE25 enable value written to bits[31:28] of `REG_EFUSE_TEST`.
 /// Linux `efuse.c::efuse_power_switch` writes `(VOLTAGE_V25 << LDOE25_SHIFT)`
 /// = `(0x03 << 28)` before each EFUSE access.
-pub const EFUSE_TEST_LDOE25_EN: u32 = 0x03 << 28;
+pub const EFUSE_TEST_LDOE25_EN: u32 = 1 << 31;
 
 /// MAC address length (bytes).
 pub const MAC_ADDR_LEN: usize = 6;
@@ -165,7 +167,7 @@ pub const BIT_MCUFWDL_EN: u32 = 1 << 0;
 pub const BIT_MCUFWDL_RDY: u32 = 1 << 1;
 
 /// `BIT_FWDL_CHK_RPT` — bit 7: firmware download checksum pass.
-pub const BIT_FWDL_CHK_RPT: u32 = 1 << 7;
+pub const BIT_FWDL_CHK_RPT: u32 = 1 << 2;
 
 /// Composite firmware-ready mask (RDY + CHK_RPT).
 pub const FW_READY_MASK: u32 = BIT_MCUFWDL_RDY | BIT_FWDL_CHK_RPT;

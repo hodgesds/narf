@@ -135,13 +135,13 @@ kernel_test_in!(
 
 fn smoke_ath10k_per_chip_chip_id_addr_distinct() -> TestResult {
     // QCA6174 uses 0xF0; the rest use 0xEC.
-    if soc_chip_id_address(HwRev::Qca6174) != 0x0000_00f0 {
+    if soc_chip_id_address(HwRev::Qca6174) != 0x0000_08f0 {
         return TestResult::Fail("QCA6174 chip_id_address wrong");
     }
-    if soc_chip_id_address(HwRev::Qca988x) != 0x0000_00ec {
+    if soc_chip_id_address(HwRev::Qca988x) != 0x0000_40ec {
         return TestResult::Fail("QCA988X chip_id_address wrong");
     }
-    if soc_chip_id_address(HwRev::Qca9984) != 0x0000_00ec {
+    if soc_chip_id_address(HwRev::Qca9984) != 0x0008_00ec {
         return TestResult::Fail("QCA9984 chip_id_address wrong");
     }
     TestResult::Pass
@@ -153,14 +153,14 @@ kernel_test_in!(
 
 fn smoke_ath10k_fw_indicator_address_per_chip() -> TestResult {
     // QCA988X / 6174 / 9377 — FW_INDICATOR at SOC_PCIE + 0x40.
-    if fw_indicator_address(HwRev::Qca988x) != SOC_PCIE_BASE_ADDRESS + 0x40 {
+    if fw_indicator_address(HwRev::Qca988x) != 0x9030 {
         return TestResult::Fail("QCA988X FW_INDICATOR offset wrong");
     }
     // QCA99X0 / 9888 / 9984 — at +0x50.
-    if fw_indicator_address(HwRev::Qca99x0) != SOC_PCIE_BASE_ADDRESS + 0x50 {
+    if fw_indicator_address(HwRev::Qca99x0) != 0x40050 {
         return TestResult::Fail("QCA99X0 FW_INDICATOR offset wrong");
     }
-    if fw_indicator_address(HwRev::Qca9984) != SOC_PCIE_BASE_ADDRESS + 0x50 {
+    if fw_indicator_address(HwRev::Qca9984) != 0x40050 {
         return TestResult::Fail("QCA9984 FW_INDICATOR offset wrong");
     }
     TestResult::Pass
@@ -237,6 +237,7 @@ impl Ath10kMmio for MockMmio {
 fn smoke_ath10k_program_src_ring_writes_expected_offsets() -> TestResult {
     let mut m = MockMmio::new();
     let cfg = RingConfig {
+        hw_rev: HwRev::Qca988x,
         pipe: 0,
         base_phys_lo: 0xC000_0000,
         nentries: 16,
@@ -251,14 +252,14 @@ fn smoke_ath10k_program_src_ring_writes_expected_offsets() -> TestResult {
     if m.last_write_to(base + ce_off::SR_BASE_LO) != Some(0xC000_0000) {
         return TestResult::Fail("SR_BASE_LO not written");
     }
-    if m.last_write_to(base + ce_off::SR_SIZE) != Some(16 * CE_DESC_SIZE as u32) {
+    if m.last_write_to(base + ce_off::SR_SIZE) != Some(16) {
         return TestResult::Fail("SR_SIZE not written");
     }
     if m.last_write_to(base + ce_off::CTRL1) != Some(0x0E80) {
         return TestResult::Fail("CTRL1 dmax_length not written");
     }
-    if m.last_write_to(base + ce_off::SR_WR_INDEX) != Some(0) {
-        return TestResult::Fail("SR_WR_INDEX not zeroed");
+    if m.last_write_to(base + ce_off::SR_WR_INDEX).is_some() {
+        return TestResult::Fail("ring config overwrote hardware producer index");
     }
     TestResult::Pass
 }
@@ -270,6 +271,7 @@ kernel_test_in!(
 fn smoke_ath10k_program_src_ring_honours_flags() -> TestResult {
     let mut m = MockMmio::new();
     let cfg = RingConfig {
+        hw_rev: HwRev::Qca988x,
         pipe: 3,
         base_phys_lo: 0x1000_0000,
         nentries: 32,
@@ -285,8 +287,10 @@ fn smoke_ath10k_program_src_ring_honours_flags() -> TestResult {
     if ctrl1 & CE_CTRL1_DMAX_LENGTH_MASK != 0x0040 {
         return TestResult::Fail("CTRL1 dmax_length wrong");
     }
-    if ctrl1 & CE_CTRL1_HOST_INT_DISABLE == 0 {
-        return TestResult::Fail("CTRL1 host_int_disabled not set");
+    if ctrl1 & CE_CTRL1_DST_RING_BYTE_SWAP_EN != 0
+        || m.last_write_to(base + ce_off::HOST_IE) != Some(0)
+    {
+        return TestResult::Fail("interrupt disable changed destination byte swap");
     }
     if ctrl1 & CE_CTRL1_SRC_RING_BYTE_SWAP_EN == 0 {
         return TestResult::Fail("CTRL1 src_byte_swap not set");
@@ -301,6 +305,7 @@ kernel_test_in!(
 fn smoke_ath10k_program_dst_ring_writes_expected_offsets() -> TestResult {
     let mut m = MockMmio::new();
     let cfg = RingConfig {
+        hw_rev: HwRev::Qca988x,
         pipe: 5,
         base_phys_lo: 0x2000_0000,
         nentries: 512,
@@ -315,11 +320,11 @@ fn smoke_ath10k_program_dst_ring_writes_expected_offsets() -> TestResult {
     if m.last_write_to(base + ce_off::DR_BASE_LO) != Some(0x2000_0000) {
         return TestResult::Fail("DR_BASE_LO not written");
     }
-    if m.last_write_to(base + ce_off::DR_SIZE) != Some(512 * CE_DESC_SIZE as u32) {
+    if m.last_write_to(base + ce_off::DR_SIZE) != Some(512) {
         return TestResult::Fail("DR_SIZE not written");
     }
-    if m.last_write_to(base + ce_off::DR_WR_INDEX) != Some(0) {
-        return TestResult::Fail("DR_WR_INDEX not zeroed");
+    if m.last_write_to(base + ce_off::DR_WR_INDEX).is_some() {
+        return TestResult::Fail("ring config overwrote hardware producer index");
     }
     TestResult::Pass
 }
@@ -330,6 +335,7 @@ kernel_test_in!(
 
 fn smoke_ath10k_validate_rejects_bad_pipe_and_nentries() -> TestResult {
     let bad_pipe = RingConfig {
+        hw_rev: HwRev::Qca988x,
         pipe: 13,
         base_phys_lo: 0,
         nentries: 8,
@@ -341,6 +347,7 @@ fn smoke_ath10k_validate_rejects_bad_pipe_and_nentries() -> TestResult {
         return TestResult::Fail("validate accepted bad pipe");
     }
     let not_pow2 = RingConfig {
+        hw_rev: HwRev::Qca988x,
         pipe: 0,
         base_phys_lo: 0,
         nentries: 30,
@@ -352,6 +359,7 @@ fn smoke_ath10k_validate_rejects_bad_pipe_and_nentries() -> TestResult {
         return TestResult::Fail("validate accepted non-pow2 nentries");
     }
     let ok_dmax_max = RingConfig {
+        hw_rev: HwRev::Qca988x,
         pipe: 0,
         base_phys_lo: 0,
         nentries: 16,
@@ -374,7 +382,7 @@ fn smoke_ath10k_halt_pipe_polls_status() -> TestResult {
     let base = CE_BASE_ADDRESSES[2];
     m.stage_read(base + CE_CMD_HALT_STATUS_OFFSET, 0);
     m.stage_read(base + CE_CMD_HALT_STATUS_OFFSET, CE_CMD_HALT_STATUS_HALTED);
-    match ce::halt_pipe(&mut m, 2) {
+    match ce::halt_pipe(&mut m, HwRev::Qca988x, 2) {
         Ok(()) => {}
         Err(_) => return TestResult::Fail("halt_pipe should succeed"),
     }
@@ -390,7 +398,7 @@ kernel_test_in!(
 
 fn smoke_ath10k_halt_pipe_times_out_when_status_never_set() -> TestResult {
     let mut m = MockMmio::new();
-    match ce::halt_pipe(&mut m, 4) {
+    match ce::halt_pipe(&mut m, HwRev::Qca988x, 4) {
         Err(ce::CeError::HaltTimeout) => TestResult::Pass,
         _ => TestResult::Fail("halt_pipe should time out"),
     }
@@ -409,7 +417,7 @@ fn smoke_ath10k_default_pipe_config_shape() -> TestResult {
         return TestResult::Fail("default pipe 0 wrong");
     }
     let p4 = DEFAULT_PIPE_CONFIG[4];
-    if p4.pipe != 4 || !p4.is_src || p4.nentries != 256 {
+    if p4.pipe != 4 || !p4.is_src || p4.nentries != 8192 {
         return TestResult::Fail("default pipe 4 (HTT TX) wrong");
     }
     let p5 = DEFAULT_PIPE_CONFIG[5];

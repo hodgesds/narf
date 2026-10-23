@@ -1,32 +1,15 @@
-//! `brcmfmac` PCIe transport — match table + BAR0 map + soft-reset.
-//!
-//! This is the Stage-0 floor:
-//!   - PCI device match (vendor `0x14E4`, the BCM43602 / 4350 / 4356 /
-//!     4358 / 4365 / 4366 / 4371 / 4378 / 4387 family + the Apple-only
-//!     `0x4488` (BCM4387) sub-variant the kernel ships under the same
-//!     driver).
-//!   - BAR0 (32 KiB register window) map. Linux pcie.c uses
-//!     `BRCMF_PCIE_REG_MAP_SIZE = 32 * 1024`. BAR2 (TCM window) isn't
-//!     touched at this stage — it's gated on the boot loader / shared
-//!     memory protocol handshake which lands in Stage-2+.
-//!   - Read `BRCMF_PCIE_PCIE2REG_INTMASK` to confirm the BAR window is
-//!     live (an all-FF return on the PCIe2 mailbox-mask register is the
-//!     standard "device gone" sentinel — same idiom Linux uses in
-//!     `brcmf_pcie_intr_disable`).
-//!   - Soft-reset via the PCIe-bus interface: clear the mailbox-int
-//!     register, then mask everything. This is the minimum cross-chip
-//!     "park the device" sequence Linux runs at `brcmf_pcie_release`
-//!     and at probe-time before chip-id discovery.
-//!
-//! Reference: Linux `drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c`
-//! (~L117 .. L210 for the register map, ~L2700 .. L2780 for the
-//! `brcmf_pcie_devices` PCI ID table; v6.6).
+//! PCIe ownership, bounded BAR0 window access, AI core discovery, and
+//! interrupt parking. DMA remains disabled until an owned firmware/ring
+//! lifecycle exists. Parking mailbox interrupts is not a chip reset.
+//! Reference: Linux `brcmfmac/pcie.c` and `brcmfmac/chip.c`.
 
 #![allow(dead_code)]
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
+
+use super::chip::{self, Backplane, Chip};
 
 // ── Hardware identification ────────────────────────────────────────
 //
@@ -108,9 +91,8 @@ pub const ALL_DEV_IDS: &[u16] = &[
 //     `BRCMF_PCIE_BARO_PCIE_ENUM_OFFSET = 0x2000` is the start of the
 //     PCIe2 block.
 //
-// The "64-bit" register set (BRCMF_PCIE_64_PCIE2REG_*) is at higher
-// offsets and only relevant for the v7 shared-memory protocol; the
-// stage-0 path doesn't care.
+// The revision >=64 PCIe core uses different interrupt offsets. The
+// discovery path selects those from the core revision, not firmware ABI.
 
 /// BAR0 window size — `BRCMF_PCIE_REG_MAP_SIZE`. Linux `pcie.c` ~L119.
 pub const BRCMF_PCIE_REG_MAP_SIZE: u64 = 32 * 1024;
@@ -153,26 +135,80 @@ const READ_GONE_U32: u32 = 0xFFFF_FFFF;
 
 // ── Driver state ───────────────────────────────────────────────────
 
-/// One bound `brcmfmac` PCIe device. Holds the BAR0 mapping + the
-/// 32-bit chip-id sample we took at probe time. The full shared-memory
-/// protocol (BAR2 TCM window + firmware push + ring DMA) gets attached
-/// to this struct in Stage-2/3.
+/// A parked PCIe device, retaining exclusive config-space authority.
+/// No network interface is published by this ownership/discovery stage.
 pub struct BrcmfmacDevice {
-    pub mmio_bar0: MmioRegion,
-    /// Best-effort chip-id sample. Real chip-id discovery on Broadcom
-    /// parts walks the ChipCommon backplane via `BAR0_WINDOW`; the
-    /// stage-0 path only reads `PCIE2REG_INTMASK` as a presence test,
-    /// so this is the raw 32-bit value of that register (0 when the
-    /// device is parked, non-FF when alive).
-    pub chip_id_probe: u32,
+    backplane: PcieBackplane,
+    pub chip: Chip,
     pub device_id: u16,
+}
+
+/// The BAR0 sliding window is mutable device state. Keeping it and the
+/// authority private prevents independent MMIO handles from racing a
+/// select/access pair. Future async firmware work must own this value or
+/// put it behind an async mutex, never await under CONTROLLER's IRQ lock.
+struct PcieBackplane {
+    bar0: MmioRegion,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+}
+
+impl PcieBackplane {
+    fn select(&mut self, address: u32) -> Result<u64, chip::Error> {
+        if !chip::valid_address(address) {
+            return Err(chip::Error::Address);
+        }
+        let window = address & !0xfff;
+        // Retry the posted PCI configuration write once, as Linux's
+        // brcmf_pcie_select_core does. This is a fixed transaction bound,
+        // not a register wait loop. Every operation checks live authority.
+        for _ in 0..2 {
+            narf_bus::pci::write_config32(
+                &self.cap,
+                &self.device,
+                BRCMF_PCIE_BAR0_WINDOW as u16,
+                window,
+            )
+            .map_err(|_| chip::Error::Access)?;
+            let selected = narf_bus::pci::read_config32(
+                &self.cap,
+                &self.device,
+                BRCMF_PCIE_BAR0_WINDOW as u16,
+            )
+            .map_err(|_| chip::Error::Access)?;
+            if selected == window {
+                return Ok(u64::from(address & 0xfff));
+            }
+            if selected == u32::MAX {
+                return Err(chip::Error::Gone);
+            }
+        }
+        Err(chip::Error::Access)
+    }
+}
+
+impl Backplane for PcieBackplane {
+    fn read32(&mut self, address: u32) -> Result<u32, chip::Error> {
+        let offset = self.select(address)?;
+        // SAFETY: BAR0 has at least 4 KiB; select validates dword
+        // alignment and returns an offset <=4092. The owning &mut self
+        // serializes window selection with the device register access.
+        Ok(unsafe { self.bar0.read32(offset) })
+    }
+
+    fn write32(&mut self, address: u32, value: u32) -> Result<(), chip::Error> {
+        let offset = self.select(address)?;
+        // SAFETY: same checked window and exclusive ownership as read32.
+        unsafe { self.bar0.write32(offset, value) };
+        Ok(())
+    }
 }
 
 impl core::fmt::Debug for BrcmfmacDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BrcmfmacDevice")
             .field("device_id", &format_args!("{:#06x}", self.device_id))
-            .field("chip_id_probe", &format_args!("{:#x}", self.chip_id_probe))
+            .field("chip", &self.chip)
             .finish_non_exhaustive()
     }
 }
@@ -186,6 +222,9 @@ pub enum ProbeError {
     /// register — the device dropped off the link before we could
     /// drive it.
     DeviceGone,
+    Bar0TooSmall,
+    PciAccess,
+    Discovery(chip::Error),
 }
 
 /// Single-instance live device. Multi-radio support comes with the
@@ -214,20 +253,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         return Ok(());
     }
 
-    // Enable MEM_SPACE + BUS_MASTER. BAR0 maps need MEM_SPACE; the
-    // msgbuf data path needs BUS_MASTER for the firmware-initiated
-    // DMA reads (stage-2+).
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-
     // SAFETY: caller hands us exclusive BusDeviceCap authority for
     // this device's cfg + BARs.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let dev = match unsafe { bring_up(&device) } {
+    let dev = match unsafe { bring_up(device, cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
@@ -246,41 +274,42 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
-/// Bring the chip up: map BAR0, sample the chip-id probe register,
-/// run the soft-reset prologue.
+/// Claim a parked device: first revoke inherited bus mastering, then
+/// map registers, discover actual cores, and mask the matching PCIe
+/// interrupt registers. This does not start firmware or publish a NIC.
 ///
 /// # Safety
 /// Caller owns the device's BARs exclusively.
-pub unsafe fn bring_up(device: &BusDevice) -> Result<BrcmfmacDevice, ProbeError> {
+pub unsafe fn bring_up(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+) -> Result<BrcmfmacDevice, ProbeError> {
+    // Firmware inherited from a previous owner must not DMA into memory
+    // before this driver has established rings, mappings, and ownership.
+    narf_bus::pci::clear_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER)
+        .map_err(|_| ProbeError::PciAccess)?;
+    narf_bus::pci::set_command(
+        &cap,
+        &device,
+        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE,
+    )
+    .map_err(|_| ProbeError::PciAccess)?;
+    let command = narf_bus::pci::read_command(&cap, &device).map_err(|_| ProbeError::PciAccess)?;
+    if command & narf_bus::pci::cmd::BUS_MASTER != 0 {
+        return Err(ProbeError::PciAccess);
+    }
     // SAFETY: caller-asserted BAR exclusivity.
-    let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
-
-    // Presence test on the PCIE2REG_INTMASK register. An all-FF read
-    // is the device-gone sentinel Linux uses everywhere.
-    let intmask_off = BRCMF_PCIE_BARO_PCIE_ENUM_OFFSET + BRCMF_PCIE_PCIE2REG_INTMASK;
-    // SAFETY: BAR0 mapped, 32-bit aligned.
-    let chip_id_probe = unsafe { mmio_bar0.read32(intmask_off) };
-    if chip_id_probe == READ_GONE_U32 {
-        return Err(ProbeError::DeviceGone);
+    let bar0 = unsafe { map_bar_control(&device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    if bar0.len < 4096 {
+        return Err(ProbeError::Bar0TooSmall);
     }
-
-    // Soft-reset prologue: clear MAILBOXINT (RW1C), mask everything in
-    // MAILBOXMASK. This is the minimum cross-chip "park the device"
-    // sequence Linux runs at `brcmf_pcie_release_*`.
-    // SAFETY: BAR0 mapped + 32-bit aligned offsets.
-    unsafe {
-        let mailboxint_off = BRCMF_PCIE_BARO_PCIE_ENUM_OFFSET + BRCMF_PCIE_PCIE2REG_MAILBOXINT;
-        let mailboxmask_off = BRCMF_PCIE_BARO_PCIE_ENUM_OFFSET + BRCMF_PCIE_PCIE2REG_MAILBOXMASK;
-        // RW1C — write a sticky-clear pattern of all-1s.
-        mmio_bar0.write32(mailboxint_off, 0xFFFF_FFFF);
-        // Mask everything until the data-path follow-up lights the
-        // doorbells back up.
-        mmio_bar0.write32(mailboxmask_off, 0x0000_0000);
-    }
-
+    let mut backplane = PcieBackplane { bar0, device, cap };
+    let chip = Chip::discover(&mut backplane).map_err(ProbeError::Discovery)?;
+    chip.park_pcie(&mut backplane)
+        .map_err(ProbeError::Discovery)?;
     Ok(BrcmfmacDevice {
-        mmio_bar0,
-        chip_id_probe,
+        backplane,
+        chip,
         device_id: device.id.device,
     })
 }

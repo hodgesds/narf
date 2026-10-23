@@ -19,16 +19,30 @@ compliance.
 
 The caller owns the PCI function and its BAR2 register aperture exclusively.
 `pci::bring_up` maps BAR2 with `map_bar_control` (Device memory attributes)
-and rejects a window that cannot cover the power/EFUSE registers before
-performing MMIO. The baseline power sequence
-still requires real-board qualification and the complete per-chip PMU
-tables. BAR2 is mandatory and is a control-register window.
+and rejects windows smaller than `0x1104` before MMIO. Chip/cut-filtered
+PCI power enable/disable tables and pre/system setup now follow Linux's
+actual flows. BAR2 is mandatory and is a control-register window. The
+device has no active firmware/packet DMA or IRQ handler during this reset.
 
 ## 3. Public interface
+
+`pci::bring_up(device, cap)` first parks inherited PCI DMA through the shared
+Realtek command policy: clear `BUS_MASTER`, enable `MEM_SPACE | INTX_DISABLE`,
+and read back the command register. Any access failure, retained BME or missing
+requested decoding fails before BAR mapping. Bus mastering remains disabled
+on success and every later error; identity and ring allocation do not authorize
+DMA. Skipped single-instance matches also park their PCI function. Re-enabling
+BME requires a future complete firmware/ring/reset owner.
 
 `Rtw88Device::registers` holds the single mandatory BAR2 control mapping;
 there is no separate firmware data BAR. Mapping/short-window failures are
 reported as `ProbeError::{RegisterBarMapFailed, RegisterBarTooSmall}`.
+
+`power::power_on(registers, pci_device_id)` detects the silicon cut,
+rejects unknown cuts/absent hardware, runs cold-card enable or the warm
+disable/enable cycle, and preserves unrelated register fields. PCI polling
+uses a bounded responsive wait and the Linux PFM_WOWL retry. Cut-C-only
+8822B rows remain cut filtered. This stage does not enable station traffic.
 
 `efuse::read_mac(registers, pci_device_id)` returns a validated, nonzero
 unicast factory MAC or `EfuseError`. Unknown PCI IDs fail before MMIO;
@@ -76,7 +90,8 @@ and `narf-time` provides the bounded completion deadline.
 
 - **Stage 1**: PCI match table + sparse EFUSE MAC read (software covered;
   physical hardware acceptance pending).
-- **Stage 2 (Incomplete)**: Complete per-chip power-on and firmware loading.
+- **Stage 2 (Incomplete)**: Per-chip PCI power lifecycle is implemented;
+  firmware transport/loading is absent.
 - **Stage 3 (Planned)**: H2C command queue + INIT command.
 - **Stage 4 (Planned)**: RX/TX fast path.
 
@@ -87,6 +102,24 @@ copying helper was removed because BAR2 contains registers. Linux's parsed
 firmware sections, reserved-page host DMA transport, and full loader
 lifecycle are still needed. Firmware transport, MAC/RF initialization,
 H2C, and packet rings remain bring-up blockers.
+
+Remaining software ledger:
+
+| Prerequisite | State |
+|---|---|
+| PCI BAR2, power/cut sequencing, factory identity | Implemented; register-model and QEMU regressions |
+| Beacon reserved-page DMA owner, descriptors, quiesce/recovery | Missing |
+| Authenticated per-chip firmware section loading, IDDMA validation | Missing; public loader rejects |
+| H2C/C2H dispatch and command correlation | Missing |
+| Per-board RF/BB tables, EFUSE calibration, regulatory channel/power | Missing |
+| Passive scan, authentication/association, WPA2 controlled port | Missing |
+| Native management/data TX, RX, completion and ring ownership | Missing |
+| Reset/suspend/removal and multi-device lifetime | Missing |
+
+Power-table rows were ported from each Linux chip's `trans_*` arrays.
+Their numeric expressions were checked with a C oracle compiled from those
+original arrays; shared-path tests cover all chips, warm/cold boot, cut-C
+filtering, polling retry/failure, unknown cuts, and absent hardware.
 
 - Linux `drivers/net/wireless/realtek/rtw88/efuse.c` (read protocol and map).
 - Linux `rtw88/rtw8821c.{c,h}`, `rtw8822b.{c,h}`, `rtw8822c.{c,h}`

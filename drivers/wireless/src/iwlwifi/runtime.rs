@@ -494,6 +494,17 @@ impl Hardware {
             .map(|entry| (entry[2], entry[3]))
     }
 
+    pub fn runtime_configuration(
+        &self,
+    ) -> Result<super::station_api::RuntimeConfiguration, &'static str> {
+        super::station_api::runtime_configuration(
+            self.device.id.device,
+            self.version(1, 0x9b).ok_or("missing BT coexistence API")?.0,
+            self.version(2, 1).ok_or("missing SoC configuration API")?.0,
+            self.version(1, 0x77).ok_or("missing device power API")?.0,
+        )
+    }
+
     pub fn has_pending_rx(&self) -> bool {
         // SAFETY: coherent status allocation remains live until DMA stop;
         // hardware publishes this aligned u16 after completion descriptors.

@@ -2,6 +2,46 @@ use super::*;
 use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_runtime_configuration_matches_linux_pci_profiles() -> TestResult {
+    for (device, flags, latency) in [
+        (0x2725, 1u32, 500u32),
+        (0x51f0, 10, 12000),
+        (0x54f0, 10, 12000),
+        (0x7e40, 0, 0),
+        (0x272b, 3, 12000),
+        (0xe340, 10, 12000),
+        (0xe440, 10, 12000),
+    ] {
+        let config = match station_api::runtime_configuration(device, 6, 2, 7) {
+            Ok(config) => config,
+            Err(_) => return TestResult::Fail("known runtime PCI configuration rejected"),
+        };
+        if config.coexistence != [1, 0, 0, 0, 17, 0, 0, 0]
+            || config.soc[..4] != flags.to_le_bytes()
+            || config.soc[4..] != latency.to_le_bytes()
+            || config.power != [0; 4]
+        {
+            return TestResult::Fail("runtime coexistence/SoC/CAM power layout");
+        }
+    }
+    for (device, coexistence, soc, power) in [
+        (0x2723, 6, 2, 7), // Gen2 has no supported MLD lifecycle.
+        (0xffff, 6, 2, 7),
+        (0xe340, 5, 2, 7),
+        (0xe340, 6, 1, 7), // v1 interprets flags as an integer.
+        (0xe340, 6, 2, 6),
+    ] {
+        if station_api::runtime_configuration(device, coexistence, soc, power).is_ok() {
+            return TestResult::Fail("unknown PCI/configuration command ABI accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/protocol",
+    smoke_runtime_configuration_matches_linux_pci_profiles
+);
+
 fn smoke_tx_power_command_versions_and_units() -> TestResult {
     for (version, length) in [(10, 108), (11, 116)] {
         let command = station_api::tx_power(version, 17).unwrap();

@@ -204,6 +204,11 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
         &mut self.transport
     }
 
+    /// Transfer the retained host adapter to the packet runtime after boot.
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+
     /// Run the full load procedure.
     pub fn run(&mut self) -> Result<(), LoadError> {
         for step in LOAD_SEQUENCE {

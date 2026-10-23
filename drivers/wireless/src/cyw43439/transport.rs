@@ -116,6 +116,21 @@ pub trait Transport {
     ) -> Result<(), TransportError>;
 }
 
+/// Packet FIFO operations required after firmware boot. These are separate
+/// from incrementing register/RAM bursts: Linux brcmfmac uses fixed-address
+/// `sdio_readsb`/`sdio_writesb` for F2. A host adapter must implement actual
+/// FIFO transactions and readiness detection before attaching a runtime.
+pub trait PacketTransport: Transport + Send {
+    /// Copy one complete SDPCM packet, including its 12-byte bus header.
+    /// Zero means no packet is currently available. The adapter consumes
+    /// physical bus padding but may include it in the returned byte count.
+    fn receive_packet(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError>;
+
+    /// Synchronously copy one complete packet to F2. On return the adapter
+    /// no longer borrows `packet`; it must not retain a pointer into it.
+    fn transmit_packet(&mut self, packet: &[u8]) -> Result<(), TransportError>;
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;

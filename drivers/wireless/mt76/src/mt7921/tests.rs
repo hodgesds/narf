@@ -1236,25 +1236,12 @@ kernel_test_in!(
 // ── Stage-10: channel switch ──────────────────────────────────────
 
 fn smoke_mt7921_channel_switch_default_5g() -> TestResult {
-    use super::cmd::{build_default_channel_switch_vec, CHANNEL_SWITCH_SIZE, CH_BAND_5G, CH_BW_20};
-    let body = build_default_channel_switch_vec();
-    if body.len() != CHANNEL_SWITCH_SIZE {
-        return TestResult::Fail("channel switch body size wrong");
-    }
-    if body[1] != MT7921_DEFAULT_CHAN_5G {
-        return TestResult::Fail("control channel not 36");
-    }
-    if body[2] != MT7921_DEFAULT_CHAN_5G {
-        return TestResult::Fail("center channel not 36");
-    }
-    if body[3] != CH_BW_20 {
-        return TestResult::Fail("bw not 20 MHz");
-    }
-    if body[4] != 2 || body[5] != 2 {
-        return TestResult::Fail("tx/rx streams not 2");
-    }
-    if body[12] != CH_BAND_5G {
-        return TestResult::Fail("band not 5 GHz");
+    let body = super::cmd::build_default_channel_switch_vec();
+    if body.len() != 76
+        || body[..12] != [36, 36, 0, 2, 3, 0, 0, 0, 0, 0, 1, 0]
+        || body[12..].iter().any(|byte| *byte != 0)
+    {
+        return TestResult::Fail("channel request differs from Linux packed MT7921 ABI");
     }
     TestResult::Pass
 }

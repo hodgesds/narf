@@ -70,17 +70,20 @@ pub mod core;
 pub mod events;
 pub mod firmware;
 pub mod gspi;
+pub mod interface;
 pub mod ioctl;
 pub mod iovar;
+pub mod runtime;
 pub mod sdio;
 pub mod sdio_bridge;
 pub mod sdpcm;
+pub mod station;
 pub mod transport;
 
 pub use firmware::{build_nvram_blob, FirmwareLoader, LoadError, LoadStep};
 pub use ioctl::{build_request, parse_response, Direction, ParseError, Response};
 pub use iovar::{build_region_cmd, COUNTRY_WORLDWIDE, VAR_COUNTRY, WL_COUNTRY_T_SIZE};
-pub use transport::{Function, Transport, TransportError};
+pub use transport::{Function, PacketTransport, Transport, TransportError};
 
 // ── Hardware identification (public datasheet cover sheet) ─────────
 

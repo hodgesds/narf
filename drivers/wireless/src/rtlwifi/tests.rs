@@ -85,7 +85,7 @@ fn smoke_rtlwifi_pci_id_table_coverage() -> TestResult {
         RTL_DEV_8723AE,
         RTL_DEV_8723BE,
         RTL_DEV_8821AE,
-        RTL_DEV_8822BE,
+        RTL_DEV_8192CE_ALT,
     ];
     for did in required {
         let found = registered.iter().any(|m| {
@@ -122,7 +122,7 @@ fn smoke_rtlwifi_efuse_descriptor_layout() -> TestResult {
         return TestResult::Fail("EFUSE_CTRL_DATA_MASK is not 0xFF");
     }
     // LDOE25 occupies bits [31:28] = 0x03 << 28.
-    if EFUSE_TEST_LDOE25_EN != 0x03 << 28 {
+    if EFUSE_TEST_LDOE25_EN != 1 << 31 {
         return TestResult::Fail("EFUSE_TEST_LDOE25_EN wrong");
     }
     TestResult::Pass
@@ -848,7 +848,7 @@ kernel_test_in!(
 
 fn smoke_rtlwifi_unready_control_plane_fails_closed() -> TestResult {
     let device = super::pci::RtlwifiDevice {
-        mmio_bar0: MmioRegion {
+        registers: MmioRegion {
             phys: PhysAddr::new(0),
             virt: 0,
             len: 0,

@@ -42,7 +42,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::diag::{self, WifiStage};
@@ -67,6 +67,8 @@ pub mod step {
     pub const UNSUPPORTED_SOC: u32 = 3;
     pub const NO_HW_PARAMS: u32 = 4;
     pub const MSI_UNAVAILABLE: u32 = 5;
+    pub const SOFTWARE_UNSUPPORTED: u32 = 6;
+    pub const PCI_CONFIG: u32 = 7;
 }
 
 /// Errors raised by the baseline probe path.
@@ -80,6 +82,11 @@ pub enum ProbeError {
     /// The TCSR version names a stepping Linux's `ath11k_pci_probe`
     /// rejects (`unsupported_*_soc`).
     UnsupportedSoc { major: u32, minor: u32 },
+    /// Silicon is recognized, but its complete HAL/core/DP profile has
+    /// not been implemented. It must never reach MHI firmware activation.
+    UnsupportedRuntime { hw_rev: HwRev },
+    /// PCI command access failed while preparing the owned function.
+    PciConfiguration,
     /// Neither the per-chip vector count nor a single MSI vector
     /// could be set up (Linux `ath11k_pci_alloc_msi` -EINVAL).
     MsiUnavailable,
@@ -95,7 +102,28 @@ impl ProbeError {
                 (step::UNSUPPORTED_SOC, (major << 8) | minor)
             }
             ProbeError::MsiUnavailable => (step::MSI_UNAVAILABLE, 0),
+            ProbeError::UnsupportedRuntime { hw_rev } => {
+                (step::SOFTWARE_UNSUPPORTED, hw_rev as u32)
+            }
+            ProbeError::PciConfiguration => (step::PCI_CONFIG, 0),
         }
+    }
+}
+
+/// A PCI ID and firmware directory alone are not a runtime implementation.
+/// Keep probe admission tied to the profiles the live core and RX/TX path
+/// actually use, before any MSI allocation, reset or DMA activation.
+pub(super) fn validate_runtime_profile(hw_rev: HwRev) -> Result<(), ProbeError> {
+    let complete = hw_rev.params().is_some_and(|params| {
+        params.regs.is_some()
+            && super::core::CoreConfig::for_hw(&params).is_some()
+            && super::dp_ring::DpHwParams::for_rev(hw_rev).is_some()
+            && mhi::config_for(hw_rev).is_some()
+    });
+    if complete {
+        Ok(())
+    } else {
+        Err(ProbeError::UnsupportedRuntime { hw_rev })
     }
 }
 
@@ -880,32 +908,65 @@ pub fn register_pci_driver() {
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     use core::fmt::Write as _;
 
-    if CONTROLLER.lock().is_some() {
-        return Ok(());
-    }
-
     let chip = match hw::chip_for_pci_id(device.id.vendor, device.id.device) {
         Some(c) => c,
         None => return Err(narf_bus::ProbeError::NotForThisDriver),
     };
 
-    // Enable MEM_SPACE + BUS_MASTER. The MHI controller will issue
-    // DMA from inside the chip once running, so BUS_MASTER must be
-    // set before BAR mapping completes.
-    let command_bits = narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER;
-    narf_bus::pci::set_command(&cap, &device, command_bits)
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-
+    // Quiesce an inherited function before identifying or resetting it.
+    // Recognized QCA6390/QCN9074 IDs currently lack a complete runtime
+    // profile; reject them before MMIO/MSI setup and never enable DMA.
+    let occupied = CONTROLLER.lock().is_some();
+    let profile = validate_runtime_profile(chip.default_hw_rev);
+    crate::qualcomm_pci::park(&device, &cap, !occupied && profile.is_ok())?;
+    if occupied {
+        return Err(narf_bus::ProbeError::Other(
+            "ath11k singleton already owns another radio",
+        ));
+    }
+    if let Err(error) = profile {
+        let (code, detail) = error.diag_code();
+        diag::latch_wifi_error(code, detail);
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: {}: {:?}",
+            chip.display_name,
+            error
+        );
+        return Err(narf_bus::ProbeError::Other(
+            "ath11k family runtime is not implemented",
+        ));
+    }
     // SAFETY: caller hands us exclusive BusDeviceCap authority for
     // this device's cfg + BARs.
-    let result = unsafe { bring_up(&device, &cap, chip) };
+    let result = unsafe { bring_up(&device, &cap, chip) }.and_then(|dev| {
+        // The silicon and all software profiles have now been accepted;
+        // no firmware DMA was enabled during identification or reset.
+        if narf_bus::pci::set_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER).is_err() {
+            teardown_msi(&dev.msi);
+            if let Some(link_ctl) = dev.saved_link_ctl {
+                let _ = narf_bus::pci_express::clear_and_set_link_control(
+                    &cap,
+                    &device,
+                    narf_bus::pci_express::LNKCTL_ASPMC,
+                    link_ctl & narf_bus::pci_express::LNKCTL_ASPMC,
+                );
+            }
+            return Err(ProbeError::PciConfiguration);
+        }
+        Ok(dev)
+    });
     let dev = match result {
         Ok(d) => d,
         Err(e) => {
             // No controller was published, so no later lifecycle path will
             // revoke the command bits.  In particular, leaving BUS_MASTER
             // set after a rejected probe would let an unbound function DMA.
-            let _ = narf_bus::pci::clear_command(&cap, &device, command_bits);
+            let _ = narf_bus::pci::clear_command(
+                &cap,
+                &device,
+                narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
+            );
             let (code, detail) = e.diag_code();
             diag::latch_wifi_error(code, detail);
             let _ = writeln!(
@@ -1014,15 +1075,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// sequence short of starting MHI.
 ///
 /// # Safety
-/// Caller owns the device's BARs and cfg space exclusively.
+/// Caller owns the device's BARs and cfg space exclusively and has
+/// disabled inherited bus mastering before calling.
 pub unsafe fn bring_up(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
     chip: ChipInfo,
 ) -> Result<Ath11kDevice, ProbeError> {
     // SAFETY: `bring_up`'s contract is that the caller owns the device's BARs
-    // exclusively — exactly the precondition `map_bar` requires.
-    let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    // exclusively — exactly the precondition `map_bar_control` requires.
+    let mmio_bar0 = unsafe { map_bar_control(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    if mmio_bar0.len < 0x100000 {
+        return Err(ProbeError::Bar0MapFailed);
+    }
 
     // SAFETY: BAR0 mapped + owned; TCSR_SOC_HW_VERSION is a readable
     // chip register.
@@ -1045,6 +1110,7 @@ pub unsafe fn bring_up(
     let params = hw_rev
         .params()
         .ok_or(ProbeError::UnsupportedSoc { major, minor })?;
+    validate_runtime_profile(hw_rev)?;
     diag::set_wifi_stage(WifiStage::Probe);
 
     // SAFETY: caller owns cfg space exclusively.

@@ -2486,6 +2486,7 @@ dependencies = [
  "narf-scheduler",
  "narf-time",
  "narf-wireless",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 //! Retained CONNAC2 firmware transport, adapted from local Linux ecd997b0189a:
 //! mt76_connac_mcu.{c,h}, mt7921/{pci,pci_mcu,mcu}.c and mt792x_dma.c.
-//! This boots ROM patch + WM only; association and data queues are separate.
+//! Retains ROM/WM startup, legacy station control, and serialized packet ownership.
 use super::fwdl;
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{future::poll_fn, ops::Range, task::Poll};
@@ -26,6 +26,67 @@ pub use hardware::Transport;
 #[cfg(target_arch = "x86_64")]
 static BOOT_OWNER: narf_lib::mutex::Mutex<Option<Transport>> = narf_lib::mutex::Mutex::new(None);
 
+type KeyFuture<T> = core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = (T, Result<(), Error>)> + Send>,
+>;
+
+struct KeyWork<T> {
+    future: Option<KeyFuture<T>>,
+    completed: Option<(T, Result<(), Error>)>,
+}
+
+impl<T> KeyWork<T> {
+    fn poll(&mut self, cx: &mut core::task::Context<'_>) -> Poll<()> {
+        if let Some(future) = self.future.as_mut() {
+            if let Poll::Ready(result) = future.as_mut().poll(cx) {
+                self.future = None;
+                self.completed = Some(result);
+            }
+        }
+        if self.completed.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+// Key work owns the transport rather than borrowing it across executor polls.
+// Both the normal task and a synchronous network drain may advance this future.
+#[cfg(target_arch = "x86_64")]
+static KEY_WORK: narf_lib::mutex::Mutex<Option<KeyWork<Transport>>> =
+    narf_lib::mutex::Mutex::new(None);
+
+#[cfg(target_arch = "x86_64")]
+fn poll_boot_keys(cx: &mut core::task::Context<'_>) -> Poll<Result<(), Error>> {
+    let Some(mut slot) = KEY_WORK.try_lock() else {
+        cx.waker().wake_by_ref();
+        return Poll::Pending;
+    };
+    let Some(work) = slot.as_mut() else {
+        return Poll::Ready(Ok(()));
+    };
+    if work.poll(cx).is_pending() {
+        return Poll::Pending;
+    }
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        cx.waker().wake_by_ref();
+        return Poll::Pending;
+    };
+    if owner.is_some() {
+        return Poll::Ready(Err(Error::Ring));
+    }
+    let (transport, result) = work.completed.take().unwrap();
+    *owner = Some(transport);
+    *slot = None;
+    Poll::Ready(result)
+}
+
+#[cfg(target_arch = "x86_64")]
+async fn finish_boot_keys() -> Result<(), Error> {
+    poll_fn(poll_boot_keys).await
+}
+
 /// Boot-only retained transport diagnostics, independent of radio readiness.
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +99,10 @@ pub enum BootStatus {
 /// Inspect without waiting on the boot runner's owner lock.
 #[cfg(target_arch = "x86_64")]
 pub fn boot_status() -> BootStatus {
+    match KEY_WORK.try_lock() {
+        Some(work) if work.is_none() => {}
+        _ => return BootStatus::Running,
+    }
     match BOOT_OWNER.try_lock() {
         None => BootStatus::Running,
         Some(owner) => owner.as_ref().map_or(BootStatus::Absent, |owner| {
@@ -50,6 +115,7 @@ pub fn boot_status() -> BootStatus {
 /// May be awaited from the executor; no sync bridge or IRQ lock is held.
 #[cfg(target_arch = "x86_64")]
 pub async fn scan_boot_passive(channels: &[u8]) -> Result<ScanReport, Error> {
+    finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
         return Err(Error::Busy);
     };
@@ -67,6 +133,7 @@ pub async fn associate_boot_station(
     ssid: &[u8],
     security: crate::mt7921::association::Security,
 ) -> Result<u16, Error> {
+    finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
         return Err(Error::Busy);
     };
@@ -80,6 +147,7 @@ pub async fn associate_boot_station(
 /// Disassociate the current station using the retained boot owner.
 #[cfg(target_arch = "x86_64")]
 pub async fn disassociate_boot_station() -> Result<(), Error> {
+    finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
         return Err(Error::Busy);
     };
@@ -93,6 +161,7 @@ pub async fn disassociate_boot_station() -> Result<(), Error> {
 /// Submit an Ethernet data frame using the retained boot owner.
 #[cfg(target_arch = "x86_64")]
 pub async fn transmit_boot_frame(frame: &[u8]) -> Result<(), Error> {
+    finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
         return Err(Error::Busy);
     };
@@ -106,14 +175,67 @@ pub async fn transmit_boot_frame(frame: &[u8]) -> Result<(), Error> {
 /// Receive a data frame from the data queue using the retained boot owner.
 #[cfg(target_arch = "x86_64")]
 pub async fn receive_boot_data() -> Result<Option<Vec<u8>>, Error> {
+    finish_boot_keys().await?;
+    let frame = {
+        let Some(mut owner) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        owner
+            .as_mut()
+            .ok_or(Error::DeviceGone)?
+            .receive_data_frame()
+            .await?
+    };
+    service_boot_keys().await?;
+    Ok(frame)
+}
+
+/// One bounded packet-service step. No executor task or IRQ wake is needed
+/// to retire TX and route RX, so synchronous network waiters can call it.
+#[derive(Debug)]
+pub struct PacketStep {
+    pub transmitted: bool,
+    pub received: Vec<Vec<u8>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    match poll_boot_keys(&mut cx) {
+        Poll::Ready(result) => result?,
+        Poll::Pending => return Err(Error::Busy),
+    }
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
         return Err(Error::Busy);
     };
-    owner
-        .as_mut()
-        .ok_or(Error::DeviceGone)?
-        .receive_data_frame()
-        .await
+    owner.as_mut().ok_or(Error::DeviceGone)?.step_network(tx)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub async fn service_boot_keys() -> Result<(), Error> {
+    {
+        let Some(mut work) = KEY_WORK.try_lock() else {
+            return Err(Error::Busy);
+        };
+        if work.is_none() {
+            let Some(mut owner) = BOOT_OWNER.try_lock() else {
+                return Err(Error::Busy);
+            };
+            let transport = owner.as_ref().ok_or(Error::DeviceGone)?;
+            if !transport.keys_pending() {
+                return Ok(());
+            }
+            let mut transport = owner.take().unwrap();
+            *work = Some(KeyWork {
+                future: Some(alloc::boxed::Box::pin(async move {
+                    let result = transport.service_keys().await;
+                    (transport, result)
+                })),
+                completed: None,
+            });
+        }
+    }
+    finish_boot_keys().await
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -148,7 +270,7 @@ pub(super) fn start_boot() -> narf_init::InitResult {
     });
     let _ = writeln!(
         narf_console::Writer,
-        "mt76: firmware {result:?}; retained {:?}; WLAN data path not enabled",
+        "mt76: firmware {result:?}; retained {:?}; station idle; packet service awaits association",
         transport.state()
     );
     if let Ok(info) = result {
@@ -441,7 +563,7 @@ trait Backend {
     fn management_complete(
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error>;
-    fn submit_data(&mut self, frame: &[u8]) -> Result<(), Error>;
+    fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error>;
 }
 #[derive(Debug)]
 struct Session<B: Backend> {
@@ -453,6 +575,10 @@ struct Session<B: Backend> {
     transferred: usize,
     boot_started: Option<u64>,
     scan_seq: u8,
+    security: Option<join::StationSecurity>,
+    data_pending: Option<u64>,
+    peer_lost: bool,
+    station_bss: Option<ScanBss>,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -465,6 +591,10 @@ impl<B: Backend> Session<B> {
             transferred: 0,
             boot_started: None,
             scan_seq: 0,
+            security: None,
+            data_pending: None,
+            peer_lost: false,
+            station_bss: None,
         }
     }
     fn stage(&mut self, stage: Stage) {

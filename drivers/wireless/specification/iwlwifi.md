@@ -61,6 +61,26 @@ validation. Reference: Linux
 `pcie/gen1_2/trans-gen2.c::iwl_trans_pcie_gen2_start_fw` and
 `pcie/ctxt-info-v2.c::iwl_pcie_ctxt_info_v2_kick`.
 
+### 2.6 Post-init runtime configuration
+
+After `INIT_COMPLETE` and NVM/antenna discovery, the live station runtime
+sends Linux's BT coexistence defaults (`BT_CONFIG` v6: network coexistence,
+MPLUT and high-band retention), the PCI-profile-specific
+`SOC_CONFIGURATION` v2, and `POWER_TABLE` v7 with continuously awake mode.
+Sc uses integrated-device flags, low-latency XTAL, a 12,000 µs stabilization
+latency and 2,500 µs LTR delay; the discrete BE200 configuration keeps the
+discrete flag and has no integrated LTR delay. Unknown PCI profiles or
+command versions fail initialization instead of choosing defaults from the
+RX descriptor format. Recovery replays these commands before recreating
+the station interface. RX queue zero is configured by the boot context;
+additional RX queues and RSS remain disabled for this single-queue profile.
+
+The supported software profile is a single station with Open/WPA2-PSK or
+WPA3-SAE security, 2.4/5 GHz, and legacy/HT/VHT operation up to 80 MHz.
+Gen2/MVM station operation, AP mode, 6 GHz/HE/EHT and system suspend/resume
+still require separate software implementations. They are not hardware-only
+acceptance gates and are not enabled by this profile's station tests.
+
 ## 3. Stage Progression
 
 - **Stage 1**: PCI match table.

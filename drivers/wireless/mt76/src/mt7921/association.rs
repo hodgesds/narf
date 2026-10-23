@@ -7,10 +7,33 @@ use alloc::{vec, vec::Vec};
 use narf_wireless::rsn::{self, RsnIe, Suite};
 
 const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Security {
     Open,
     Wpa2Psk { psk: [u8; 32] },
+}
+
+impl core::fmt::Debug for Security {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(if self.is_wpa2() {
+            "Wpa2Psk { .. }"
+        } else {
+            "Open"
+        })
+    }
+}
+
+/// Negotiated mode without retaining a PMK in a management-frame plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecurityMode {
+    Open,
+    Wpa2Psk,
+}
+
+impl SecurityMode {
+    pub fn is_wpa2(self) -> bool {
+        matches!(self, Self::Wpa2Psk)
+    }
 }
 
 impl Security {
@@ -43,7 +66,7 @@ pub struct JoinPlan {
     own: [u8; 6],
     peer: [u8; 6],
     channel: u8,
-    security: Security,
+    security: SecurityMode,
     rates: u16,
     basic: u16,
     auth: Vec<u8>,
@@ -88,7 +111,7 @@ impl JoinPlan {
     pub fn channel(&self) -> u8 {
         self.channel
     }
-    pub fn security(&self) -> Security {
+    pub fn security(&self) -> SecurityMode {
         self.security
     }
     pub fn prepare(
@@ -207,7 +230,11 @@ impl JoinPlan {
             own,
             peer: bss.bssid,
             channel: bss.channel,
-            security,
+            security: if security.is_wpa2() {
+                SecurityMode::Wpa2Psk
+            } else {
+                SecurityMode::Open
+            },
             rates,
             basic,
             auth,
@@ -306,7 +333,11 @@ impl JoinPlan {
         out[4] = 1; // WCID 1, five TLVs, append
         let basic = tlv(&mut out, 0, 20);
         out[basic + 4..basic + 8].copy_from_slice(&0x10002u32.to_le_bytes());
-        out[basic + 8] = 1;
+        out[basic + 8] = if associated && !self.security.is_wpa2() {
+            2
+        } else {
+            1
+        };
         out[basic + 10..basic + 12].copy_from_slice(&aid.to_le_bytes());
         out[basic + 12..basic + 18].copy_from_slice(&self.peer);
         out[basic + 18..basic + 20]
@@ -318,7 +349,7 @@ impl JoinPlan {
         out[ra + 4..ra + 6]
             .copy_from_slice(&((self.rates & 15) | ((self.rates >> 4) << 6)).to_le_bytes());
         let state = tlv(&mut out, 7, 12);
-        out[state + 8] = if associated { 2 } else { 1 };
+        out[state + 8] = if associated { 2 } else { 1 }; // MLME state, independent of port authorization.
         let wtbl = tlv(&mut out, 13, 12); // outer TLV + eight-byte WTBL request
         out[wtbl + 4] = 1;
         out[wtbl + 5] = 1;
@@ -347,7 +378,12 @@ impl JoinPlan {
     /// Emits a completed station record for WCID 1 containing CCMP-128
     /// key installation and CONN_STATE_PORT_SECURE.
     pub fn secure_peer_record(&self, aid: u16, key: &[u8]) -> Result<Vec<u8>, Error> {
+        if !self.security.is_wpa2() || key.len() != 16 {
+            return Err(Error::UnsupportedSecurity);
+        }
         let mut out = self.peer_record(aid, true)?;
+        out[16] = 2; // STA_REC_BASIC.CONN_STATE_PORT_SECURE
+        out[64] = 2; // STA_REC_STATE.CONN_STATE_PORT_SECURE
         out[2] += 1; // 6 TLVs
         let sec = tlv(&mut out, 0x12, 44);
         out[sec + 4] = 1; // cmd = SET_KEY
@@ -356,9 +392,125 @@ impl JoinPlan {
         out[sec + 9] = 36; // cipher_len
         out[sec + 10] = 0; // key_id = 0
         out[sec + 11] = 16; // key_len = 16
-        let k = key.len().min(16);
-        out[sec + 12..sec + 12 + k].copy_from_slice(&key[..k]);
+        out[sec + 12..sec + 28].copy_from_slice(key);
         Ok(out)
+    }
+}
+
+/// The VIF's BMC WCID (19), used for received group keys. Linux uses the
+/// station's AP address for this record, not a fabricated multicast peer.
+pub fn group_record(peer: [u8; 6], aid: u16) -> Result<Vec<u8>, Error> {
+    if !unicast(peer) || !(1..=2007).contains(&aid) {
+        return Err(Error::InvalidBss);
+    }
+    let mut out = vec![0; 8];
+    out[1] = 19;
+    out[2] = 1;
+    out[4] = 1;
+    out[5] = 0xe; // VIF/BMC MUAR, not a peer station's OMAC.
+    let wtbl = tlv(&mut out, 13, 12);
+    out[wtbl + 4..wtbl + 8].copy_from_slice(&[19, 1, 3, 0]);
+    let generic = tlv(&mut out, 0, 20);
+    out[generic + 4..generic + 10].copy_from_slice(&peer);
+    out[generic + 10] = 0xe;
+    let rx = tlv(&mut out, 1, 12);
+    out[rx + 5..rx + 8].fill(1);
+    let trans = tlv(&mut out, 6, 8);
+    out[trans + 4..trans + 7].copy_from_slice(&[1, 0, 1]);
+    out[wtbl + 2..wtbl + 4].copy_from_slice(&52u16.to_le_bytes());
+    Ok(out)
+}
+
+/// Install/remove one CCMP-128 key without replaying the peer/WTBL state.
+/// WCID 1 is pairwise key zero; WCID 19 holds the VIF's indexed GTKs.
+pub fn key_record(wcid: u8, key_id: u8, key: Option<&[u8]>) -> Result<Vec<u8>, Error> {
+    if !matches!(wcid, 1 | 19)
+        || key_id > 3
+        || wcid == 1 && key_id != 0
+        || key.is_some_and(|key| key.len() != 16)
+    {
+        return Err(Error::UnsupportedSecurity);
+    }
+    let mut out = vec![0; 8];
+    out[1] = wcid;
+    out[2] = 1;
+    out[4] = 1;
+    out[5] = if wcid == 19 { 0xe } else { 0 };
+    let sec = tlv(&mut out, 0x12, if key.is_some() { 44 } else { 8 });
+    if let Some(key) = key {
+        out[sec + 4] = 1;
+        out[sec + 5] = 1;
+        out[sec + 8..sec + 12].copy_from_slice(&[6, 36, key_id, 16]);
+        out[sec + 12..sec + 28].copy_from_slice(key);
+    }
+    Ok(out)
+}
+
+/// Update the active single legacy BSS from the negotiated scan identity.
+pub fn bss_record(bss: &ScanBss, connected: bool) -> Result<Vec<u8>, Error> {
+    if !unicast(bss.bssid) || !(1..=11).contains(&bss.channel) || bss.beacon_interval == 0 {
+        return Err(Error::InvalidBss);
+    }
+    let mut out = vec![0; 36];
+    out[6..8].copy_from_slice(&32u16.to_le_bytes());
+    out[8] = 1; // Keep the station BSS active when disconnected.
+    out[12..16].copy_from_slice(&0x10001u32.to_le_bytes());
+    out[16] = u8::from(!connected);
+    out[18..24].copy_from_slice(&bss.bssid);
+    out[24..26].copy_from_slice(&19u16.to_le_bytes());
+    out[26..28].copy_from_slice(&bss.beacon_interval.to_le_bytes());
+    out[29] = 6; // PHY_MODE_B | PHY_MODE_G, no HT negotiation.
+    out[30..32].copy_from_slice(&19u16.to_le_bytes());
+    out[32..34].copy_from_slice(&3u16.to_le_bytes()); // v2 HR-DSSS | ERP.
+    Ok(out)
+}
+
+/// A 20 MHz station transmission authorized by the installed host policy.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TxPermission {
+    pub country: [u8; 2],
+    pub power_dbm: i8,
+}
+
+impl TxPermission {
+    pub fn from_domain(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> Option<Self> {
+        use narf_wireless::reg::RegFlags;
+        if !(1..=11).contains(&channel) || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+            return None;
+        }
+        let center = 2407 + u32::from(channel) * 5;
+        let power_dbm = domain
+            .rules
+            .iter()
+            .filter(|rule| {
+                rule.freq_start_mhz <= center - 10
+                    && center + 10 <= rule.freq_end_mhz
+                    && rule.max_bandwidth_mhz >= 20
+                    && !rule.flags.contains(RegFlags::DFS)
+            })
+            .map(|rule| rule.max_power_dbm)
+            .min()?;
+        // Signed half-dBm table entries must be representable. This profile
+        // transmits on one chain, so no multi-stream EIRP addition is needed.
+        if !(-64..=63).contains(&power_dbm) {
+            return None;
+        }
+        Some(Self {
+            country: domain.country_code,
+            power_dbm,
+        })
+    }
+
+    pub fn rate_limits(self, channel: u8) -> Vec<u8> {
+        // Linux mt76_connac_tx_power_limit_tlv (44 bytes), followed by one
+        // channel + 161 signed half-dBm rate limits. Firmware's calibration
+        // and CLC limits still constrain this additional host ceiling.
+        let mut bytes = vec![0; 44 + 162];
+        bytes[4..7].copy_from_slice(&[1, 1, 1]); // n_chan, 2 GHz, last_msg
+        bytes[8..10].copy_from_slice(&self.country);
+        bytes[44] = channel;
+        bytes[45..].fill(self.power_dbm.saturating_mul(2) as u8);
+        bytes
     }
 }
 
@@ -370,11 +522,22 @@ pub fn disconnect_record(peer: [u8; 6]) -> Vec<u8> {
     out[4] = 1; // WCID 1
     let basic = tlv(&mut out, 0, 20);
     out[basic + 4..basic + 8].copy_from_slice(&0x10002u32.to_le_bytes());
-    out[basic + 8] = 1;
+    out[basic + 8] = 0;
     out[basic + 12..basic + 18].copy_from_slice(&peer);
-    out[basic + 18..basic + 20].copy_from_slice(&3u16.to_le_bytes());
-    let state = tlv(&mut out, 7, 12);
-    out[state + 8] = 0; // CONN_STATE_DISCONNECT
+    out[basic + 18..basic + 20].copy_from_slice(&1u16.to_le_bytes());
+    let wtbl = tlv(&mut out, 13, 12);
+    out[wtbl + 4..wtbl + 6].copy_from_slice(&[1, 1]); // RESET_AND_SET, no nested TLVs.
+    out
+}
+
+pub fn group_disconnect_record() -> Vec<u8> {
+    let mut out = vec![0; 8];
+    out[1] = 19;
+    out[2] = 1;
+    out[4] = 1;
+    out[5] = 0xe;
+    let wtbl = tlv(&mut out, 13, 12);
+    out[wtbl + 4..wtbl + 6].copy_from_slice(&[19, 1]);
     out
 }
 

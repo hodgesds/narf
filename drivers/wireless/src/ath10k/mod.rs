@@ -65,7 +65,10 @@
 
 extern crate alloc;
 
+pub mod bmi;
+mod boot;
 pub mod ce;
+pub mod dma;
 pub mod htc;
 pub mod htt;
 pub mod hw;

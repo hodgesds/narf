@@ -326,11 +326,11 @@ pub const TX_TOTAL_PAGE_NUM_DEFAULT: u8 = 0xF8;
 // Source: `regs.h` (various REG_MCU_* defines).
 
 /// `REG_MCU_FW_DL` — MCU firmware download control register.
-/// Value 0x00 = firmware not loaded; `MCU_FW_RAM_SEL (BIT6)` set =
+/// Value 0x00 = firmware not loaded; `MCU_FW_RAM_SEL (BIT7)` set =
 /// firmware running from RAM.
 pub const REG_MCU_FW_DL: u16 = 0x0080;
 /// Bit 6 of `REG_MCU_FW_DL` — firmware running from on-chip RAM.
-pub const MCU_FW_RAM_SEL: u8 = 1 << 6;
+pub const MCU_FW_RAM_SEL: u8 = 1 << 7;
 /// Firmware page size for IDDMA transfers.
 /// `RTL_FW_PAGE_SIZE = 4096`.
 pub const RTL_FW_PAGE_SIZE: usize = 4096;

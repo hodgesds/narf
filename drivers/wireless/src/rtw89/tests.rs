@@ -1752,3 +1752,19 @@ fn smoke_rtw89_probe_bound_or_skip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_probe_bound_or_skip);
+
+fn smoke_rtw89_ethernet_requires_station_encapsulation() -> TestResult {
+    // This is deliberately independent of the controller registry. The
+    // network hook must reject before touching rings or allocating DMA,
+    // including while a future raw native backend is installed.
+    for frame in [&[][..], &[0xff; 14][..], &[0; 1500][..]] {
+        if super::pci::send_frame(frame, narf_net::TxMeta::plain()).is_ok() {
+            return TestResult::Fail("Ethernet accepted without station encapsulation");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_ethernet_requires_station_encapsulation
+);

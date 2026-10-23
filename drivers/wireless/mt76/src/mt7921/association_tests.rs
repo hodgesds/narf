@@ -69,6 +69,7 @@ fn mt76_join_plan_encodes_rates_and_exact_wpa2_rsn() -> TestResult {
         || record[..8] != [0, 1, 5, 0, 1, 0, 0, 0]
         || record[8..16] != [0, 0, 20, 0, 2, 0, 1, 0]
         || record[16] != 1
+        || record[64] != 2
         || record[18..20] != [42, 0]
         || record[20..26] != AP
         || record[26..28] != [1, 0]
@@ -84,8 +85,15 @@ fn mt76_join_plan_encodes_rates_and_exact_wpa2_rsn() -> TestResult {
         || sec_rec[120..128] != [18, 0, 44, 0, 1, 1, 0, 0]
         || sec_rec[128..132] != [6, 36, 0, 16]
         || sec_rec[132..148] != key
+        || sec_rec[16] != 2
+        || sec_rec[64] != 2
     {
         return TestResult::Fail("secure_peer_record STA_REC_KEY_V2 layout mismatch");
+    }
+    for len in [0, 1, 15, 17, 32] {
+        if plan.secure_peer_record(42, &vec![0x55; len]).is_ok() {
+            return TestResult::Fail("short/long CCMP key silently truncated or zero-padded");
+        }
     }
     TestResult::Pass
 }
@@ -205,16 +213,63 @@ fn mt76_disconnect_record_layout() -> TestResult {
     if disc.len() != 40
         || disc[..8] != [0, 1, 2, 0, 1, 0, 0, 0]
         || disc[8..16] != [0, 0, 20, 0, 2, 0, 1, 0]
-        || disc[16] != 1
+        || disc[16] != 0
+        || disc[26..28] != [1, 0]
         || disc[20..26] != AP
-        || disc[28..36] != [7, 0, 12, 0, 0, 0, 0, 0]
+        || disc[28..36] != [13, 0, 12, 0, 1, 1, 0, 0]
         || disc[36] != 0
     {
         return TestResult::Fail("disconnect STA_REC wire layout");
+    }
+    if group_disconnect_record()
+        != [
+            0, 19, 1, 0, 1, 14, 0, 0, 13, 0, 12, 0, 19, 1, 0, 0, 0, 0, 0, 0,
+        ]
+    {
+        return TestResult::Fail("BMC WTBL reset does not match NULL-station update");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/association",
     mt76_disconnect_record_layout
+);
+
+fn mt76_group_wtbl_and_key_request_match_linux_null_station() -> TestResult {
+    let group = group_record(AP, 42).unwrap();
+    if group.len() != 60
+        || group[..20]
+            != [
+                0, 19, 1, 0, 1, 14, 0, 0, 13, 0, 52, 0, 19, 1, 3, 0, 0, 0, 0, 0,
+            ]
+        || group[20..24] != [0, 0, 20, 0]
+        || group[24..30] != AP
+        || group[30..40] != [14, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        || group[40..52] != [1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]
+        || group[52..] != [6, 0, 8, 0, 1, 0, 1, 0]
+    {
+        return TestResult::Fail("VIF/BMC native RX WTBL layout");
+    }
+    let record = key_record(19, 2, Some(&[0x77; 16])).unwrap();
+    if record.len() != 52
+        || record[..20]
+            != [
+                0, 19, 1, 0, 1, 14, 0, 0, 18, 0, 44, 0, 1, 1, 0, 0, 6, 36, 2, 16,
+            ]
+        || record[20..36] != [0x77; 16]
+        || record[36..] != [0; 16]
+    {
+        return TestResult::Fail("group key MCU request geometry/index/MUAR");
+    }
+    if key_record(1, 1, Some(&[0; 16])).is_ok()
+        || key_record(19, 4, Some(&[0; 16])).is_ok()
+        || key_record(19, 0, Some(&[0; 15])).is_ok()
+    {
+        return TestResult::Fail("invalid CCMP key request accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/association",
+    mt76_group_wtbl_and_key_request_match_linux_null_station
 );

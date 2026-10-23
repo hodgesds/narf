@@ -695,6 +695,11 @@ fn smoke_ath11k_core_config_wcn6855() -> TestResult {
     );
     let q = HwRev::Qcn9074Hw10.params().expect("qcn9074 params");
     ensure!(CoreConfig::for_hw(&q).is_none(), "QCN9074 unsupported");
+    let q = HwRev::Qca6390Hw20.params().expect("qca6390 params");
+    ensure!(
+        CoreConfig::for_hw(&q).is_none(),
+        "QCA6390 RX/DP runtime is not implemented"
+    );
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_core_config_wcn6855);

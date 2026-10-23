@@ -88,7 +88,7 @@ pub const REG_SYS_FUNC_EN: u64 = 0x0002;
 /// `REG_SYS_PW_CTRL` — system power control. Cleared as the first step
 /// of `rtw_power_on` for the chips that need a full PWR reset. `reg.h`
 /// ~L17.
-pub const REG_SYS_PW_CTRL: u64 = 0x0006;
+pub const REG_SYS_PW_CTRL: u64 = 0x0004;
 
 /// `REG_SYS_CLK_CTRL` — system clock gating. `reg.h` ~L24.
 pub const REG_SYS_CLK_CTRL: u64 = 0x0008;

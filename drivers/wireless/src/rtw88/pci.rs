@@ -125,6 +125,8 @@ impl core::fmt::Debug for Rtw88Device {
 /// Errors raised by the baseline probe path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProbeError {
+    /// PCI access failed or bus mastering could not be verifiably parked.
+    PciAccess,
     /// The mandatory BAR2 control window could not be mapped.
     RegisterBarMapFailed,
     /// BAR2 cannot cover the registers used by baseline power and EFUSE.
@@ -160,23 +162,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Skip if a device is already bound. Real laptops only ship one
     // RTW88; a second probe is a re-enumeration race.
     if CONTROLLER.lock().is_some() {
+        // Even a skipped diagnostic match must not inherit active DMA.
+        crate::rtw88::pci_park::park(&device, &cap).map_err(|_| narf_bus::ProbeError::BadDevice)?;
         return Ok(());
     }
-
-    // Enable MEM_SPACE + BUS_MASTER so BAR reads land + the device
-    // can DMA later. Match the `e1000` shape so the test harness's
-    // mocked-cfg writes go through the same path.
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     // SAFETY: caller (the bus dispatch layer) hands us exclusive
     // BusDeviceCap authority for this device's cfg + BARs.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let result = unsafe { bring_up(&device) };
+    let result = unsafe { bring_up(&device, &cap) };
     let dev = match result {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
@@ -210,7 +204,7 @@ pub(super) fn map_registers_with(
 ) -> Result<MmioRegion, ProbeError> {
     // Linux rtw_pci_io_mapping uses PCI BAR2 on all supported rtw88 chips.
     let registers = map_control(device, 2).map_err(|_| ProbeError::RegisterBarMapFailed)?;
-    if registers.len < REG_CR + core::mem::size_of::<u16>() as u64 {
+    if registers.len < power::REGISTER_WINDOW_MIN {
         return Err(ProbeError::RegisterBarTooSmall);
     }
     Ok(registers)
@@ -220,22 +214,23 @@ pub(super) fn map_registers_with(
 /// MAC from EFUSE. Pure-IO; no TX/RX ring setup.
 ///
 /// # Safety
-/// Caller owns the device's BARs exclusively.
-pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
+/// Caller owns the device's PCI configuration and BARs exclusively.
+pub unsafe fn bring_up(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+) -> Result<Rtw88Device, ProbeError> {
+    crate::rtw88::pci_park::park(device, cap).map_err(|_| ProbeError::PciAccess)?;
     // SAFETY: caller-asserted BAR exclusivity.
     let registers = map_registers_with(device, |device, index| {
         // SAFETY: bring_up's caller owns this PCI function and its BARs.
         unsafe { map_bar_control(device, index) }
     })?;
 
-    // Power-on prologue. Some parts (notably 8821CE on certain BIOSes)
-    // arrive in a fully-powered state and the prologue is a no-op;
-    // others arrive in D3cold and need the PWR-state walk. Baseline
-    // does the minimum cross-part prologue — full per-chip table
-    // lands in the follow-up.
+    // Run the chip/cut-filtered Linux PCI power sequence. Bus mastering
+    // remains parked throughout power cycling and read-only EFUSE access.
     // SAFETY: BAR2 control registers mapped + owned.
     unsafe {
-        power::baseline_power_on(&registers).map_err(ProbeError::PowerOn)?;
+        power::power_on(&registers, device.id.device).map_err(ProbeError::PowerOn)?;
     }
 
     // Decode the sparse physical EFUSE map and select this chip's PCI MAC.

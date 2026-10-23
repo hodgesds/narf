@@ -1,22 +1,9 @@
 //! RTW89 TX/RX datapath glue — Stage-11.
 //!
-//! Wires the existing pieces together so a queued frame on a TX
-//! channel walks through:
-//!
-//! ```text
-//! ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
-//! │ 802.11   │ → │ TXWD     │ → │ BD slot  │ → │ doorbell │
-//! │ frame    │   │ prefix   │   │ write    │   │ MMIO     │
-//! └──────────┘   └──────────┘   └──────────┘   └──────────┘
-//! ```
-//!
-//! The TX side composes a TXWD body (`txrx::encode_txwd`), writes it
-//! into a host-DMA buffer in front of the 802.11 payload, advances the
-//! ring's wp, then bangs the `*_TXBD_IDX` doorbell with the new wp.
-//!
-//! The RX side, on interrupt, reads `*_RXBD_IDX` to learn how many
-//! BDs the hardware filled, walks them, decodes the RXD prefix
-//! (`txrx::decode_rxd`), and surfaces each 802.11 payload.
+//! Legacy TXWD-body and RX descriptor codecs plus ring register helpers.
+//! `stage_tx` alone is not a PCI submission: it omits the WP sequence and
+//! address-info records. The retained native backend uses `tx_transport`
+//! instead; the generic Ethernet SendFn rejects pending station integration.
 //!
 //! ## References (all GPL-2.0)
 //!
@@ -34,9 +21,8 @@ use super::txrx::{decode_rxd, encode_txwd, RxdInfo, TxwdInfo, RXD_SHORT_SIZE, TX
 
 // ── TX submit ───────────────────────────────────────────────────────
 
-/// Result of preparing a frame for TX. Caller is expected to copy
-/// `wire` into a DMA-coherent buffer and write the buffer's physical
-/// address into the BD descriptor.
+/// Legacy body-only codec result. This is not a complete PCI header and
+/// must not be submitted as a TXBD; use `tx_transport::prepare_header`.
 #[derive(Debug)]
 pub struct TxSubmission<'a> {
     /// TXWD body (24 bytes) prepended to the 802.11 payload.
@@ -47,8 +33,7 @@ pub struct TxSubmission<'a> {
     pub total: usize,
 }
 
-/// Stage a frame for transmission on `channel`. Builds the TXWD body;
-/// caller does the DMA copy + BD setup.
+/// Encode a baseline body fixture. No publication or DMA ownership is granted.
 pub fn stage_tx<'a>(
     channel: u8,
     qsel: u8,

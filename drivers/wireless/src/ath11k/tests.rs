@@ -160,6 +160,32 @@ kernel_test_in!(
 
 // ── Window-register arithmetic ─────────────────────────────────────
 
+fn smoke_ath11k_probe_requires_complete_runtime_profile() -> TestResult {
+    use super::pci::{validate_runtime_profile, ProbeError};
+    for revision in [HwRev::Qca6390Hw20, HwRev::Qcn9074Hw10, HwRev::Unknown] {
+        if validate_runtime_profile(revision)
+            != Err(ProbeError::UnsupportedRuntime { hw_rev: revision })
+        {
+            return TestResult::Fail("incomplete family must be rejected before MHI activation");
+        }
+    }
+    for revision in [
+        HwRev::Wcn6855Hw20,
+        HwRev::Wcn6855Hw21,
+        HwRev::Qca2066Hw21,
+        HwRev::Qca6698aqHw21,
+    ] {
+        if validate_runtime_profile(revision).is_err() {
+            return TestResult::Fail("complete WCN6855-layout family must remain reachable");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_probe_requires_complete_runtime_profile
+);
+
 fn smoke_ath11k_window_constants_consistent() -> TestResult {
     // ATH11K_PCI_WINDOW_RANGE_MASK covers exactly the 19 low bits.
     if ATH11K_PCI_WINDOW_RANGE_MASK != (1u32 << 19) - 1 {

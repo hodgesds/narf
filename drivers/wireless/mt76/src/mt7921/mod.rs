@@ -20,8 +20,9 @@
 //! Post-firmware initialization reads real NIC/EFUSE identity, applies
 //! package-selected world limits and initializes the MAC/WTBL. Passive
 //! scanning is connected to nl80211; management TX has a private retained
-//! cut-through backend. Association and the WLAN data path remain unfinished. The
-//! older `full_bring_up` boundary intentionally returns `NotImplemented`;
+//! cut-through backend. The retained legacy station profile connects Open/WPA2
+//! association, controlled-port keys and bounded kernel/frame-ring RX/TX service.
+//! Broader modes and reset recovery remain software work. The older `full_bring_up` boundary intentionally returns `NotImplemented`;
 //! firmware-only initialization uses the retained transport owner instead.
 //!
 //! ## Provenance

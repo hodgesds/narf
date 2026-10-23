@@ -13,8 +13,7 @@
 //! ## Scope (this commit set)
 //!
 //! 1. PCI device match via the existing `bus::driver_match` table.
-//! 2. **BAR2** MMIO mapping (rtw89 uses BAR2 — distinct from rtw88's
-//!    BAR0+BAR2 split). Linux `pci.c:rtw89_pci_claim_device` walks
+//! 2. **BAR2** Device MMIO mapping (both rtw88 and rtw89 use BAR2). Linux `pci.c:rtw89_pci_claim_device` walks
 //!    `bar_id = 2` directly.
 //! 3. Baseline `rtw89_mac_pwr_on`-style power-on prologue. The
 //!    full per-chip PWR-seq table is out of scope; we run the
@@ -70,7 +69,11 @@ pub mod mac_init;
 pub mod pci;
 pub mod phy;
 pub mod phy_table;
+pub mod tx_transport;
 pub mod txrx;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tx_transport_tests;
 
 pub use mac::{ChipGeneration, ChipId, MacError};
 pub use pci::{name_for, probe, register_pci_driver, Rtw89Device};
@@ -117,6 +120,9 @@ pub const ALL_DEV_IDS: &[u16] = &[
 pub fn register() {
     register_pci_driver();
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod efuse_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;

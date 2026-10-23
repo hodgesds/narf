@@ -6,24 +6,13 @@
 //! parts that ride PCIe and speak the **msgbuf** protocol over Broadcom's
 //! H2D / D2H common-ring layout.
 //!
-//! ## Stage progression
-//!
-//! - **Stage 0 (landed)** — PCI device match table (vendor `0x14E4`,
-//!   the BCM43602 / 4350 / 4356 / 4358 / 4365 / 4366 / 4371 / 4378 /
-//!   4387 family), BAR0 (32 KiB register window) map, and a soft-reset
-//!   prologue via the PCIE2 mailbox-int / mailbox-mask registers.
-//!   Firmware-blob name lookup is included so the data-path follow-up
-//!   has a stable hook.
-//! - **Stage 1 (this commit)** — Common-ring SPSC index dance
-//!   (`brcmf_commonring_*` in Linux `commonring.c`) + the per-ring
-//!   layout table from `msgbuf.h`.
-//! - **Stage 2 (this commit)** — msgbuf protocol encoders/decoders
-//!   (`MSGBUF_TYPE_IOCTLPTR_REQ` / `IOCTL_CMPLT` / `WL_EVENT`) and
-//!   the cfg80211-equivalent attachment stub.
-//!
-//! TX/RX data path, flow-ring management, full cfg80211 attach,
-//! scan/assoc, and the firmware-side console reader are explicitly
-//! **not** in Stage 0–2.
+//! PCI ownership now clears inherited bus mastering, retains authority,
+//! discovers actual AI cores through the serialized BAR0 window, and
+//! parks interrupts using the discovered PCIe core revision. This does
+//! not reset the chip or publish a usable network interface. The other
+//! modules contain wire/cursor helpers; firmware activation, owned DMA
+//! rings, flow rings, station lifecycle, and recovery remain software
+//! work. See `specification/brcmfmac.md` for the ordered dependency list.
 //!
 //! ## References (all ISC / BSD-3 / GPL-2.0; NARF is GPL-2.0-or-later)
 //!
@@ -52,6 +41,7 @@ extern crate alloc;
 
 pub mod bus;
 pub mod cfg80211;
+pub mod chip;
 pub mod connect;
 pub mod firmware;
 pub mod fweh;

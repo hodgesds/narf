@@ -1569,48 +1569,21 @@ kernel_test_in!(
     smoke_rtl8xxxu_wave36_init_rf_via_fake
 );
 
-// ── 30. FW upload via bulk-OUT: 2-page synthetic blob ───────────────
+// ── 30. Retired firmware packet path rejects before transport ───────
 
-fn smoke_rtl8xxxu_wave36_fw_upload_bulk_out() -> TestResult {
-    use super::fw::{upload_firmware_blob, FW_BULK_OUT_EP};
-    use super::regs::RTL_FW_PAGE_SIZE;
-    use super::usb::FakeUsbTransport;
-    let t = FakeUsbTransport::new();
-    // Arm both poll-loops: CSUM after page transfer, INIT after CSUM.
-    t.arm_fw_csum_ok();
-    t.arm_fw_init_ready();
-
-    // 2 full pages = 8192 bytes (payload only — header already stripped).
-    let payload = alloc::vec![0x5Au8; 2 * RTL_FW_PAGE_SIZE];
-
-    let bytes = match upload_firmware_blob(&t, &payload) {
-        Ok(b) => b,
-        Err(_) => return TestResult::Fail("upload_firmware_blob returned Err"),
-    };
-    if bytes != 2 * RTL_FW_PAGE_SIZE {
-        return TestResult::Fail("bytes_xferred != 2 pages");
-    }
-    if t.bulk_out_count() != 2 {
-        return TestResult::Fail("bulk_out count != 2 for 2 pages");
-    }
-    // Verify all bulk-OUT bytes went to the FW endpoint.
-    let log = t.log();
-    for op in &log {
-        if let super::usb::FakeOp::BulkOut { ep, .. } = op {
-            if *ep != FW_BULK_OUT_EP {
-                return TestResult::Fail("bulk-OUT on wrong endpoint");
-            }
-        }
-    }
-    // The first byte of every page should be 0x5A (payload sentinel).
-    if t.bulk_out_concat().iter().any(|&b| b != 0x5A) {
-        return TestResult::Fail("page bytes corrupted in bulk-OUT");
+fn smoke_rtl8xxxu_legacy_fw_packet_path_rejected() -> TestResult {
+    let transport = super::usb::FakeUsbTransport::new();
+    if super::fw::upload_firmware_blob(&transport, &[0x5a; 32])
+        != Err(super::fw::FwDlError::UseAsyncOwner)
+        || !transport.log().is_empty()
+    {
+        return TestResult::Fail("retired rtl8xxxu firmware path performed packet/register IO");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu",
-    smoke_rtl8xxxu_wave36_fw_upload_bulk_out
+    smoke_rtl8xxxu_legacy_fw_packet_path_rejected
 );
 
 // ── 31. RX ring: single MPDU per URB ───────────────────────────────
@@ -1724,39 +1697,22 @@ kernel_test_in!(
     smoke_rtl8xxxu_wave36_channel_set_ch6
 );
 
-// ── 35. Full bring_up_8188eu against FakeUsbTransport ────────────────
+// ── 35. Full radio completion cannot be inferred from register writes ─
 
-fn smoke_rtl8xxxu_wave36_full_bring_up() -> TestResult {
-    use super::usb::FakeUsbTransport;
-    let t = FakeUsbTransport::new();
-    // FW upload short-circuit progressions.
-    t.arm_fw_csum_ok();
-    t.arm_fw_init_ready();
-
-    // 1-page payload (4096 bytes) — minimum sensible blob.
-    let payload = alloc::vec![0u8; super::regs::RTL_FW_PAGE_SIZE];
-
-    let total = match super::bring_up_8188eu(&t, &payload, 6) {
-        Ok(n) => n,
-        Err(_) => return TestResult::Fail("bring_up_8188eu returned Err"),
-    };
-
-    // Expected lower bound: stage0 (3) + MAC (92) + PHY+AGC (322) +
-    // RF-A (95) + IQK (7) + LC (3) + ch-set (1) + RX-enable (1) +
-    // FW-pages (1 page = 1).
-    let expected_min = 3 + 92 + 322 + 95 + 7 + 3 + 1 + 1 + 1;
-    if total < expected_min {
-        return TestResult::Fail("bring_up write count too low");
-    }
-    // Verify at least one BulkOut happened (FW page).
-    if t.bulk_out_count() != 1 {
-        return TestResult::Fail("bring_up should emit exactly 1 bulk-OUT page");
+fn smoke_rtl8xxxu_legacy_full_bring_up_rejected() -> TestResult {
+    let transport = super::usb::FakeUsbTransport::new();
+    if super::bring_up_8188eu(&transport, &[0; 32], 6) != Err(super::BringUpError::NotImplemented)
+        || !transport.log().is_empty()
+    {
+        return TestResult::Fail(
+            "legacy rtl8xxxu helper claimed radio readiness or touched registers",
+        );
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu",
-    smoke_rtl8xxxu_wave36_full_bring_up
+    smoke_rtl8xxxu_legacy_full_bring_up_rejected
 );
 
 // ── 36. bring_up rejects out-of-range channel ───────────────────────
@@ -1777,22 +1733,5 @@ kernel_test_in!(
     smoke_rtl8xxxu_wave36_bring_up_bad_channel
 );
 
-// ── 37. FW upload: poll timeout when CSUM never asserts ─────────────
-
-fn smoke_rtl8xxxu_wave36_fw_upload_poll_timeout() -> TestResult {
-    use super::fw::{upload_firmware_blob, FwDlError};
-    use super::regs::RTL_FW_PAGE_SIZE;
-    use super::usb::FakeUsbTransport;
-    let t = FakeUsbTransport::new();
-    // Note: csum / init ready bits NOT armed → poll exhausts.
-    let payload = alloc::vec![0xCCu8; RTL_FW_PAGE_SIZE];
-    match upload_firmware_blob(&t, &payload) {
-        Err(FwDlError::PollTimeout) => TestResult::Pass,
-        Ok(_) => TestResult::Fail("upload should poll-timeout without armed bits"),
-        Err(_) => TestResult::Fail("upload wrong error for CSUM timeout"),
-    }
-}
-kernel_test_in!(
-    "drivers/wireless/rtl8xxxu",
-    smoke_rtl8xxxu_wave36_fw_upload_poll_timeout
-);
+// Live firmware short-transfer, checksum, start, and cancellation cases
+// are exercised by firmware_transport_tests against the production owner.

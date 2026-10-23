@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -29,19 +29,19 @@ use super::efuse;
 use super::mac::{self, ChipId};
 use super::*;
 
+use super::tx_transport::{self, Ticket, TxQueue};
 use crate::rtw89::datapath::{RxChannelState, TxChannelState};
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
-use narf_io::{alloc_coherent, DmaBuffer};
+use narf_io::{alloc_coherent, alloc_coherent_masked, DmaBuffer};
 use narf_lib::id::DomainId;
 
 /// One bound RTW89 device.
 pub struct Rtw89Device {
     /// BAR2 MMIO mapping — the only BAR rtw89 silicon exposes.
     pub mmio_bar2: MmioRegion,
-    /// Factory MAC read from logical EFUSE offset 0.
+    /// Factory MAC decoded from the chip-specific logical EFUSE map.
     pub mac: [u8; efuse::MAC_ADDR_LEN],
     /// PCI device id we matched on.
     pub device_id: u16,
@@ -52,6 +52,9 @@ pub struct Rtw89Device {
 
     // ── Stage-2 Data Path ──
     pub tx_rings: Vec<IrqSafeSpinLock<TxChannelState>>,
+    // Native packets and their header mappings remain owned until both a
+    // TXBD read-pointer update and the matching firmware RPQ release.
+    native_tx: Vec<IrqSafeSpinLock<TxQueue<NativePacket>>>,
     pub rx_rings: Vec<IrqSafeSpinLock<RxChannelState>>,
     pub tx_ring_dma: Vec<DmaBuffer>,
     pub rx_ring_dma: Vec<DmaBuffer>,
@@ -70,9 +73,16 @@ impl core::fmt::Debug for Rtw89Device {
     }
 }
 
+struct NativePacket {
+    header: DmaBuffer,
+    frame: DmaBuffer,
+}
+
 /// Errors raised by the Stage-0/1 probe path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProbeError {
+    /// PCI access failed or bus mastering could not be verifiably parked.
+    PciAccess,
     /// `map_bar(device, 2)` failed.
     Bar2MapFailed,
     /// Power-on prologue failed.
@@ -91,15 +101,10 @@ static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtw89Device>>> = IrqSafeSpinLock::
 /// Probe entry called by `narf-bus::driver_match`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
+        // Even a skipped diagnostic match must not inherit active DMA.
+        crate::rtw88::pci_park::park(&device, &cap).map_err(|_| narf_bus::ProbeError::BadDevice)?;
         return Ok(());
     }
-
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     // SAFETY: caller-authority.
     let result = unsafe { bring_up(&device, &cap) };
@@ -195,20 +200,28 @@ async fn rtw89_rx_pump(device: Arc<Rtw89Device>) {
 /// version, read MAC from EFUSE, and setup DMA rings.
 ///
 /// # Safety
-/// Caller owns the device's BARs exclusively.
+/// Caller owns the device's PCI configuration and BARs exclusively.
 pub unsafe fn bring_up(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<Rtw89Device, ProbeError> {
+    crate::rtw88::pci_park::park(device, cap).map_err(|_| ProbeError::PciAccess)?;
     // SAFETY: caller-asserted BAR exclusivity. rtw89 maps BAR2 only.
-    let mmio_bar2 = unsafe { map_bar(device, 2) }.map_err(|_| ProbeError::Bar2MapFailed)?;
+    let mmio_bar2 = unsafe { map_bar_control(device, 2) }.map_err(|_| ProbeError::Bar2MapFailed)?;
+    if mmio_bar2.len < 0x10000 {
+        return Err(ProbeError::Bar2MapFailed);
+    }
+
+    let chip_id = ChipId::from_pci_did(device.id.device).ok_or(ProbeError::UnknownChip)?;
+    if chip_id == ChipId::Rtl8922A {
+        return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip));
+    }
 
     // SAFETY: BAR2 mapped + owned.
     unsafe {
         mac::baseline_power_on(&mmio_bar2).map_err(ProbeError::PowerOn)?;
     }
 
-    let chip_id = ChipId::from_pci_did(device.id.device).ok_or(ProbeError::UnknownChip)?;
     // SAFETY: `mmio_bar2` is the just-mapped, caller-owned BAR2 region; reading
     // the chip-version field (`R_AX_SYS_CFG1`) is an MMIO read of a valid,
     // in-range device register on this owned window.
@@ -217,7 +230,8 @@ pub unsafe fn bring_up(
     // SAFETY: `mmio_bar2` is the caller-owned BAR2 region; `efuse::read_mac`
     // only touches in-range EFUSE registers on this owned window.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let mac = unsafe { efuse::read_mac(&mmio_bar2) }.map_err(ProbeError::Efuse)?;
+    let mac =
+        unsafe { efuse::read_mac(&mmio_bar2, chip_id, chip_version) }.map_err(ProbeError::Efuse)?;
 
     // ── MSI-X Setup ──
     let mut irq_vector = None;
@@ -242,6 +256,12 @@ pub unsafe fn bring_up(
 
     let mut tx_rings = Vec::new();
     let mut tx_ring_dma = Vec::new();
+    let mut native_tx = Vec::new();
+    for ch in 0..12 {
+        native_tx.push(IrqSafeSpinLock::new(
+            TxQueue::new(ch, DEFAULT_TXBD_NUM).map_err(|_| ProbeError::NoMemory)?,
+        ));
+    }
     for ch in 0..TXCH_NUM as u8 {
         let buf = alloc_coherent(tx_ring_bytes(DEFAULT_TXBD_NUM), DomainId::DRIVER_0)
             .map_err(|_| ProbeError::NoMemory)?;
@@ -349,6 +369,7 @@ pub unsafe fn bring_up(
         chip_id: Some(chip_id),
         chip_version,
         tx_rings,
+        native_tx,
         rx_rings,
         tx_ring_dma,
         rx_ring_dma,
@@ -361,92 +382,139 @@ fn rtw89_isr() {
     // Completion handling deferred to pumps.
 }
 
-/// SendFn registered with `narf_net::iface` at probe time.
-pub fn send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
-    with_controller(|dev| {
-        use crate::rtw89::datapath::*;
-        use crate::rtw89::dma::*;
+/// Ethernet SendFn. Station association, controlled-port handling and native
+/// encapsulation are not wired; accepting this input as an MPDU would corrupt
+/// both the on-air frame and the PCI descriptor layout. Reject before DMA/MMIO.
+pub fn send_frame(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    Err(())
+}
 
-        // ACH0 (BE) for general data.
-        let mut tx_q = dev.tx_rings[TXCH_ACH0 as usize].lock();
-        let mmio = &dev.mmio_bar2;
-
-        if tx_q.state.is_full() {
-            // Poll for completion to free up slots.
-            // SAFETY: `mmio` is the bound device's BAR2 region; `tx_q.regs` holds
-            // the in-range TX ring-index register offset for this channel, so the
-            // MMIO read of the HW ring index is to a valid device register.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            let idx = unsafe { read_tx_ring_idx(mmio, &tx_q.regs) };
-            let (rp, _) = split_idx(idx);
-            tx_q.state.set_rp(rp);
-            if tx_q.state.is_full() {
-                return Err(());
-            }
+impl Rtw89Device {
+    /// Retained native PCI TX backend for a future station producer. No current
+    /// probe/network callback invokes it: firmware, RF and RPQ startup still
+    /// need a single runtime owner.
+    ///
+    /// # Safety
+    /// Caller has initialized firmware/station rate state and enabled the
+    /// selected AX channel with the exact ring geometry installed by bring_up;
+    /// no reset/removal can race. The RPQ consumer must pass release records to
+    /// complete_native_report. `frame` is an unprotected, non-QoS native MPDU.
+    pub(super) unsafe fn submit_native(
+        &self,
+        info: super::txrx::TxwdInfo,
+        frame: &[u8],
+    ) -> Result<Ticket, tx_transport::Error> {
+        use super::datapath::{read_tx_ring_idx, ring_doorbell_tx};
+        use super::dma::{split_idx, TxBd, TXBD_OPT_LS};
+        use core::sync::atomic::{fence, Ordering};
+        let chip = self.chip_id.ok_or(tx_transport::Error::BadQueue)?;
+        let queue = self
+            .native_tx
+            .get(info.channel as usize)
+            .ok_or(tx_transport::Error::BadQueue)?;
+        // Validate the native profile and extent before allocating anything.
+        tx_transport::prepare_header(chip, info, 0, 0, frame)?;
+        let mut owner = queue.lock();
+        let ring = self.tx_rings[info.channel as usize].lock();
+        // SAFETY: caller guarantees a live initialized owned AX channel.
+        let (rp, _) = split_idx(unsafe { read_tx_ring_idx(&self.mmio_bar2, &ring.regs) });
+        fence(Ordering::Acquire);
+        // A read-pointer update alone deliberately cannot release a packet.
+        drop(owner.observe_read_pointer(rp)?);
+        if owner.is_full() {
+            return Err(tx_transport::Error::Full);
         }
-
-        // 1. Stage TXWD.
-        // mac_id 0, qsel BE (ACH0)
-        let sub = stage_tx(TXCH_ACH0, 0, 0, frame).ok_or(())?;
-
-        // 2. Setup DMA.
-        // We reuse the pre-allocated packet buffers in a real driver,
-        // but for now we allocate coherent memory for simplicity
-        // (Audit #14: in production we'd use a pool).
-        let buf = alloc_coherent(sub.total, DomainId::DRIVER_0).map_err(|_| ())?;
-        // SAFETY: `buf` is a fresh DMA allocation of `sub.total` bytes, and
-        // `stage_tx` guarantees `sub.total == sub.txwd.len() + sub.frame.len()`,
-        // so both copies stay in bounds; the TXWD is written at offset 0 and the
-        // frame immediately after at `sub.txwd.len()`, neither overlapping the
-        // distinct source slices.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let mask = if chip == ChipId::Rtl8852C {
+            0xf_ffff_ffff
+        } else {
+            0xff_ffff_ffff
+        };
+        let payload = alloc_coherent_masked(frame.len(), DomainId::DRIVER_0, mask)
+            .map_err(|_| tx_transport::Error::NoMemory)?;
+        let header = tx_transport::prepare_header(chip, info, 0, payload.dma_addr().raw(), frame)?;
+        let header_dma = alloc_coherent_masked(header.len(), DomainId::DRIVER_0, 0xff_ffff_ffff)
+            .map_err(|_| tx_transport::Error::NoMemory)?;
+        let ticket = owner
+            .reserve(
+                NativePacket {
+                    header: header_dma,
+                    frame: payload,
+                },
+                info.mac_id,
+                info.qsel,
+            )
+            .map_err(|(error, _resource)| error)?;
+        // No fallible preparation remains after publication. Until then abort
+        // returns ordinary ownership and both mappings can be safely freed.
+        let packet = owner.reserved_mut(ticket)?;
+        let mut header = header;
+        let body = if chip == ChipId::Rtl8852C { 32 } else { 24 };
+        header[body..body + 2].copy_from_slice(&(ticket.sequence | 0x8000).to_le_bytes());
+        // SAFETY: fresh owned allocations cover the exact source lengths.
         unsafe {
-            core::ptr::copy_nonoverlapping(sub.txwd.as_ptr(), buf.as_mut_ptr(), sub.txwd.len());
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), packet.frame.as_mut_ptr(), frame.len());
             core::ptr::copy_nonoverlapping(
-                sub.frame.as_ptr(),
-                buf.as_mut_ptr().add(sub.txwd.len()),
-                sub.frame.len(),
+                header.as_ptr(),
+                packet.header.as_mut_ptr(),
+                header.len(),
             );
         }
-
-        // 3. Fill BD.
-        let ring_dma = &dev.tx_ring_dma[TXCH_ACH0 as usize];
-        let ring_ptr = ring_dma.as_mut_ptr() as *mut TxBd;
-        let slot = tx_q.state.wp as usize;
-
-        // SAFETY: `ring_ptr` points into the `DEFAULT_TXBD_NUM`-entry TX ring DMA
-        // buffer for ACH0; `slot == tx_q.state.wp` is a valid in-range write
-        // pointer (the full check above guarantees the ring is not full), so
-        // `ring_ptr.add(slot)` is an in-bounds, properly aligned `TxBd` slot, and
-        // `set_phys` records the physical address of `buf`.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
+        packet.frame.sync(0, frame.len());
+        packet.header.sync(0, header.len());
+        let mut bd = TxBd {
+            length: header.len() as u16,
+            opt: TXBD_OPT_LS,
+            ..Default::default()
+        };
+        bd.set_phys(packet.header.dma_addr().raw());
+        let ring_dma = &self.tx_ring_dma[info.channel as usize];
+        // SAFETY: owner validates slot < configured ring depth and reserves it
+        // exclusively until TXBD consumption plus RPQ release.
         unsafe {
-            let mut bd = TxBd {
-                length: sub.total as u16,
-                opt: TXBD_OPT_LS,
-                ..Default::default()
-            };
-            bd.set_phys(buf.dma_addr().raw());
-            core::ptr::write_volatile(ring_ptr.add(slot), bd);
+            core::ptr::write_volatile(
+                (ring_dma.as_mut_ptr() as *mut TxBd).add(ticket.slot as usize),
+                bd,
+            );
         }
-
-        // 4. Advance WP + Ring Doorbell.
-        tx_q.state.advance_wp(1);
-        // SAFETY: `mmio` is the bound device's BAR2 region; `tx_q.regs` holds the
-        // in-range TX doorbell register offset, and `wp` is a valid write-pointer
-        // index, so this MMIO write targets a valid device register.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
+        ring_dma.sync(
+            ticket.slot as usize * core::mem::size_of::<TxBd>(),
+            core::mem::size_of::<TxBd>(),
+        );
+        owner.publish(ticket)?;
+        fence(Ordering::Release);
+        // SAFETY: same live channel; packet retention was committed above.
         unsafe {
-            ring_doorbell_tx(mmio, &tx_q.regs, tx_q.state.wp);
+            ring_doorbell_tx(&self.mmio_bar2, &ring.regs, owner.write_pointer());
         }
+        Ok(ticket)
+    }
 
-        // Keep buf alive (leaked for now in this Stage-2 sketch;
-        // real driver would stash it for completion cleanup).
-        Box::leak(Box::new(buf));
-
-        Ok(())
-    })
-    .unwrap_or(Err(()))
+    /// Apply one validated AX RPQ release together with the current DMA read
+    /// pointer. Either arrival order is allowed; resources retire only once.
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as submit_native. `bytes` must come
+    /// from this device's coherently acquired RPQ (not untrusted network data).
+    pub(super) unsafe fn complete_native_report(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, tx_transport::Error> {
+        use super::datapath::read_tx_ring_idx;
+        use super::dma::split_idx;
+        use core::sync::atomic::{fence, Ordering};
+        let report = tx_transport::parse_report(bytes)?;
+        let mut owner = self.native_tx[report.channel as usize].lock();
+        let ring = self.tx_rings[report.channel as usize].lock();
+        // SAFETY: caller guarantees a coherently acquired live AX RPQ/ring.
+        let (rp, _) = split_idx(unsafe { read_tx_ring_idx(&self.mmio_bar2, &ring.regs) });
+        fence(Ordering::Acquire);
+        let completed = owner.observe_read_pointer(rp)?;
+        let mut statuses: Vec<u8> = completed.into_iter().map(|done| done.status).collect();
+        if let Some(done) = owner.observe_report(report)? {
+            statuses.push(done.status);
+        }
+        Ok(statuses)
+    }
 }
 
 /// Human-readable name for a known device id. Used as the

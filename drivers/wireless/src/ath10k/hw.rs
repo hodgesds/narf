@@ -1,37 +1,8 @@
-//! Qualcomm Atheros QCA-family register + chip-ID constants.
-//!
-//! Numbers sourced from Linux `drivers/net/wireless/ath/ath10k/hw.h`
-//! (kernel 6.10+; ISC-licensed but NARF is GPL-2.0-or-later post
-//! 2026-05-20, so direct reference + adaptation is in-policy per
-//! `memory/MEMORY.md::feedback_no_gpl_links.md`). The ath10k vendor
-//! ID is the Atheros / Qualcomm Atheros legacy 0x168c.
-//!
-//! ## Layout primer
-//!
-//! ath10k devices expose a single PCIe BAR0 register window. From
-//! the host's perspective the device memory map is:
-//!
-//! ```text
-//!   0x00000 .. 0x07fff   SoC core / PCIe local
-//!   0x08000 .. 0x0ffff   SoC PCIe block (CORE_CTRL, PCIE_INTR_*)
-//!   0x10000 .. 0x1ffff   WLAN (mac / phy / efuse)
-//!   0x20000 .. 0x2ffff   reserved
-//!   0x30000 .. 0x6ffff   per-chip private (BTI / DBI / analog)
-//! ```
-//!
-//! Within "SoC core" lives the global-reset register
-//! (`SOC_GLOBAL_RESET_ADDRESS = 0x0008`). Within "SoC PCIe block"
-//! live `PCIE_INTR_ENABLE` / `PCIE_INTR_CAUSE`. Within "WLAN" live
-//! the Copy-Engine register banks `CE0..CE7`.
-//!
-//! ## References (Linux v6.10)
-//!
-//! - `ath10k/hw.h` lines ~860..1020 — base-address + reset offsets.
-//! - `ath10k/hw.h` lines ~24..50 — PCI device IDs.
-//! - `ath10k/hw.h` lines ~227..240 — `enum ath10k_hw_rev`.
-//! - `ath10k/hw.c` lines ~462..481 — `qcax_ce_regs` (CE register
-//!   offsets shared by 988X / 6174 / 99X0 / 9377 / 9888 / 9984).
-//! - `ath10k/pci.c` lines ~57..97 — PCI ID table + chip_id_rev list.
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! PCI IDs and Linux ath10k PCIe register maps. All active BAR accesses
+//! select `HwRev::registers`; RTC SoC, PCI-local, core and CE windows have
+//! different bases on QCA988X, QCA6174/9377 and QCA99X0-class silicon.
+//! Reference: Linux `ath10k/hw.{c,h}` and `pci.c`.
 
 #![allow(dead_code)]
 
@@ -92,6 +63,44 @@ pub enum HwRev {
 }
 
 impl HwRev {
+    /// Linux `ath10k_hw_regs` for the PCIe register map. The CE format
+    /// is the 32-bit `qcax_ce_regs` format for these PCIe parts.
+    pub const fn registers(self) -> Option<Registers> {
+        Some(match self {
+            Self::Qca988x => Registers {
+                rtc_soc: 0x4000,
+                pcie_local: 0x80000,
+                soc_core: 0x9000,
+                ce0: 0x57400,
+                ce_count: 8,
+                chip_id: 0x40ec,
+                fw_indicator: 0x9030,
+                ce_reset: 0x40000,
+            },
+            Self::Qca6174 | Self::Qca9377 => Registers {
+                rtc_soc: 0x800,
+                pcie_local: 0x80000,
+                soc_core: 0x3a000,
+                ce0: 0x34400,
+                ce_count: 8,
+                chip_id: 0x8f0,
+                fw_indicator: 0x3a028,
+                ce_reset: 1,
+            },
+            Self::Qca99x0 | Self::Qca9888 | Self::Qca9984 => Registers {
+                rtc_soc: 0x80000,
+                pcie_local: 0,
+                soc_core: 0x82000,
+                ce0: 0x4a000,
+                ce_count: 12,
+                chip_id: 0x800ec,
+                fw_indicator: 0x40050,
+                ce_reset: 0x100,
+            },
+            Self::Ar9462Legacy => return None,
+        })
+    }
+
     /// Short, lowercase canonical name. Used in firmware-path
     /// construction (`/firmware/ath10k/<name>/...`) and the
     /// `BoundDriver.name` value.
@@ -123,6 +132,29 @@ impl HwRev {
             // table claims it, then refuse politely in probe.
             (ATHEROS_VENDOR, AR9462_DEVICE_ID) => Some(HwRev::Ar9462Legacy),
             _ => None,
+        }
+    }
+}
+
+/// BAR0-relative register windows; Linux `ath10k/hw.c`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Registers {
+    pub rtc_soc: u64,
+    pub pcie_local: u64,
+    pub soc_core: u64,
+    pub ce0: u64,
+    pub ce_count: u8,
+    pub chip_id: u64,
+    pub fw_indicator: u64,
+    pub ce_reset: u32,
+}
+
+impl Registers {
+    pub const fn ce_base(self, pipe: u8) -> Option<u64> {
+        if pipe < self.ce_count {
+            Some(self.ce0 + pipe as u64 * 0x400)
+        } else {
+            None
         }
     }
 }
@@ -165,7 +197,7 @@ pub const RTC_STATE_ADDRESS: u64 = 0x0000;
 pub const RTC_STATE_V_MASK: u32 = 0x0000_0007;
 /// "RTC is up" state value. Used to validate the SoC didn't drop
 /// off the link mid-reset.
-pub const RTC_STATE_V_ON_DEFAULT: u32 = 5;
+pub const RTC_STATE_V_ON_DEFAULT: u32 = 3;
 
 /// PCIe→SoC wake request. Writing 1 wakes the SoC out of L2; writing
 /// the reset value (0) lets it sleep. `hw.h::PCIE_SOC_WAKE_ADDRESS`.
@@ -179,8 +211,8 @@ pub const PCIE_SOC_WAKE_RESET_V: u32 = 0x0000_0000;
 /// equivalent to a cold PCIe link toggle from the device's
 /// perspective. `hw.h::SOC_GLOBAL_RESET_ADDRESS`.
 pub const SOC_GLOBAL_RESET_ADDRESS: u64 = 0x0008;
-/// Pulse value to write to `SOC_GLOBAL_RESET_ADDRESS`. The chip
-/// self-clears the bit after the reset completes.
+/// Reset assertion bit. The host must explicitly clear it after the
+/// 20 ms PCIe settling delay; it does not self-clear.
 pub const SOC_GLOBAL_RESET_PULSE: u32 = 0x0000_0001;
 
 // ── Chip-ID read ────────────────────────────────────────────────────
@@ -200,12 +232,9 @@ pub const SOC_GLOBAL_RESET_PULSE: u32 = 0x0000_0001;
 /// Per-chip offset of the SOC_CHIP_ID register within the SoC-core
 /// block (BAR0-relative).
 pub const fn soc_chip_id_address(rev: HwRev) -> u64 {
-    match rev {
-        HwRev::Qca6174 => 0x0000_00f0,
-        HwRev::Qca988x | HwRev::Qca99x0 | HwRev::Qca9888 | HwRev::Qca9984 | HwRev::Qca9377 => {
-            0x0000_00ec
-        }
-        HwRev::Ar9462Legacy => 0x0000_00ec, // not really used; AR9462 is rejected
+    match rev.registers() {
+        Some(regs) => regs.chip_id,
+        None => 0,
     }
 }
 
@@ -258,11 +287,10 @@ pub const FW_IND_EVENT_PENDING: u32 = 1;
 
 /// Per-chip absolute BAR0 offset of the FW_INDICATOR register.
 pub const fn fw_indicator_address(rev: HwRev) -> u64 {
-    SOC_PCIE_BASE_ADDRESS
-        + match rev {
-            HwRev::Qca99x0 | HwRev::Qca9888 | HwRev::Qca9984 => FW_INDICATOR_OFFSET_99X0,
-            _ => FW_INDICATOR_OFFSET_988X,
-        }
+    match rev.registers() {
+        Some(regs) => regs.fw_indicator,
+        None => 0,
+    }
 }
 
 // ── Copy Engine register bank ──────────────────────────────────────
@@ -288,25 +316,18 @@ pub const fn fw_indicator_address(rev: HwRev) -> u64 {
 //   .current_drri_addr     = 0x48
 
 /// CE register-bank stride in BAR0.
-pub const CE_BANK_STRIDE: u64 = 0x1000;
+pub const CE_BANK_STRIDE: u64 = 0x400;
 
 /// CE base addresses for CE0..CE7 (BAR0-relative). The chip exposes
 /// eight CE banks; ath10k uses CE0..CE5 for control + WMI/HTT
 /// traffic and the upper CEs for diagnostics / per-AC TX.
 pub const CE_BASE_ADDRESSES: [u64; 8] = [
-    0x0004_0000, // CE0
-    0x0004_1000, // CE1
-    0x0004_2000, // CE2
-    0x0004_3000, // CE3
-    0x0004_4000, // CE4
-    0x0004_5000, // CE5
-    0x0004_6000, // CE6
-    0x0004_7000, // CE7
+    0x57400, 0x57800, 0x57c00, 0x58000, 0x58400, 0x58800, 0x58c00, 0x59000,
 ];
 
 /// CE-wrapper base. Contains global CE enable/disable + per-bank
 /// status mirrors.
-pub const CE_WRAPPER_BASE_ADDRESS: u64 = 0x0004_d000;
+pub const CE_WRAPPER_BASE_ADDRESS: u64 = 0x0005_7000;
 
 /// CE register offsets (within a single CE bank — add to
 /// `CE_BASE_ADDRESSES[i]` to get the BAR0-relative offset).
@@ -314,7 +335,7 @@ pub const CE_WRAPPER_BASE_ADDRESS: u64 = 0x0004_d000;
 pub mod ce_off {
     /// Source-ring base address, lo 32 bits. (`sr_base_addr_lo`)
     pub const SR_BASE_LO: u64 = 0x00;
-    /// Source-ring number of entries × CE_DESC_SIZE.
+    /// Source-ring number of entries (not bytes).
     pub const SR_SIZE: u64 = 0x04;
     /// Destination-ring base address, lo 32 bits.
     pub const DR_BASE_LO: u64 = 0x08;
@@ -343,7 +364,8 @@ pub mod ce_off {
 /// CE descriptor size (matches `struct ce_desc` — `__le32 addr; __le16 nbytes; __le16 flags`).
 pub const CE_DESC_SIZE: usize = 8;
 
-/// Wider 64-bit descriptor for WCN3990 / QCA99X0 (`struct ce_desc_64`).
+/// Wider 64-bit descriptor for WCN3990 (`struct ce_desc_64`).
+/// The PCIe QCA99X0/9888/9984 profiles use the 8-byte format.
 pub const CE_DESC_SIZE_64: usize = 16;
 
 /// Number of CE banks the QCA988X exposes.
@@ -351,20 +373,20 @@ pub const CE_COUNT_988X: usize = 8;
 /// Number of CE banks the QCA99X0 / QCA9984 expose.
 pub const CE_COUNT_99X0: usize = 12;
 
-/// CE_CTRL1.HOST_INT_DISABLE — bit 17.
-pub const CE_CTRL1_HOST_INT_DISABLE: u32 = 1 << 17;
+/// CE_CTRL1.DST_RING_BYTE_SWAP_EN — bit 17 (not interrupt disable).
+pub const CE_CTRL1_DST_RING_BYTE_SWAP_EN: u32 = 1 << 17;
 /// CE_CTRL1.SRC_RING_BYTE_SWAP_EN — bit 16 (QCA988X-class).
 pub const CE_CTRL1_SRC_RING_BYTE_SWAP_EN: u32 = 1 << 16;
 /// CE_CTRL1.DMAX_LENGTH — bits 15:0 (`hw_ce_regs_addr_map` qcax_dmax).
 pub const CE_CTRL1_DMAX_LENGTH_MASK: u32 = 0x0000_ffff;
 
-/// CE_CMD.HALT — bit 0. Driver writes 1 to halt a CE pipe, polls
-/// for halt-ack via `CE_CMD_HALT_STATUS` (offset 0x14).
+/// CE_CMD.HALT — bit 0. Halt acknowledgement is bit 3 of the same
+/// command register (offset 0x18).
 pub const CE_CMD_HALT: u32 = 1 << 0;
 /// Offset of the CE command-halt status register within the bank.
-pub const CE_CMD_HALT_STATUS_OFFSET: u64 = 0x14;
-/// CE_CMD_HALT_STATUS.HALTED — bit 0.
-pub const CE_CMD_HALT_STATUS_HALTED: u32 = 1 << 0;
+pub const CE_CMD_HALT_STATUS_OFFSET: u64 = ce_off::CMD;
+/// CE_CMD.HALT_STATUS — bit 3.
+pub const CE_CMD_HALT_STATUS_HALTED: u32 = 1 << 3;
 
 // ── Descriptor flag bits ───────────────────────────────────────────
 //
@@ -374,8 +396,3 @@ pub const CE_CMD_HALT_STATUS_HALTED: u32 = 1 << 0;
 pub const CE_DESC_FLAGS_GATHER: u16 = 1 << 0;
 /// CE descriptor flag: byte-swap the payload (BE-targeted parts).
 pub const CE_DESC_FLAGS_BYTE_SWAP: u16 = 1 << 1;
-/// CE descriptor flag (QCA99X0+): disable host-interrupt for this
-/// descriptor. Used when the driver wants to batch completions.
-pub const CE_DESC_FLAGS_HOST_INT_DIS: u16 = 1 << 2;
-/// CE descriptor flag (QCA99X0+): disable target-interrupt.
-pub const CE_DESC_FLAGS_TGT_INT_DIS: u16 = 1 << 3;

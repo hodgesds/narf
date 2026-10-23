@@ -81,4 +81,7 @@ pub fn register() {
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
+mod efuse_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;

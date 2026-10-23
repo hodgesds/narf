@@ -14,15 +14,24 @@ matching a PCI ID or testing a command encoder does not establish a WLAN.
 
 | Driver | Generation | Status | Mechanism |
 | :--- | :--- | :--- | :--- |
-| **iwlwifi** | AX210+ transport; Sc/BE211 MLD station profile | RX/TX and station implementation; silicon validation pending | Firmware self-load, RFH, command/data queues, Open/WPA2-PSK |
-| **ath11k** | Wi-Fi 6E | **Stage 5** (silicon qualification) | Offline-tested PCIe WCN6855 three-vdev STA/AP/P2P path: MHI/QMI/WMI/DP, scan/ROC, external supplicant, DFS, WoW/cold PM and RDDM recovery/device dump; first hardware boot pending — see `ath11k.md` §8 |
-| **mt76** | MT7921/MT7922 CONNAC2 | Firmware/radio and passive scan path; station transport incomplete | Retained startup and MLME/WPA2 helpers; packet pump and network transmit callback are not connected |
-| **rtw88** | RTL8821CE/RTL8822BE/RTL8822CE | Powered identification and EFUSE decoding | Firmware, full per-chip initialization, packet rings and station control remain open |
-| **rtw89 / rtlwifi / rtl8xxxu** | Realtek PCIe/USB families | Partial probe/transport helpers | Live firmware, packet and station integration remain incomplete; unsupported operations stay gated |
-| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Probe/reset and CE/HTC/WMI/HTT codecs | Firmware/BMI bootstrap, live transport/handshake and interface registration remain open |
-| **ath9k** | AR9285 | Reset/detection stub | EEPROM/RF, DMA/IRQ and interface lifecycle remain open |
-| **brcmfmac** | Broadcom PCIe FullMAC | Probe and firmware/shared-ring helpers | Firmware activation, live msgbuf/IRQ transport and wireless interface attachment remain open |
-| **cyw43439** | Infineon SDIO/gSPI FullMAC | Firmware, transport and event codecs | Live registration, F2 credits, correlated control/event/data dispatch and station interface remain open |
+| **iwlwifi** | Gen3 MLD station (Sc/BE211) | Live station runtime; hardware acceptance pending | Firmware CPU release, versioned coexistence/SoC/power setup, scan, station and packet paths; Gen2/MVM remains software work — `iwlwifi.md` |
+| **ath11k** | WCN6855 HW2.0/2.1 and matching QCA2066/QCA6698AQ layouts | Live STA/AP/P2P runtime; hardware acceptance pending | Incomplete QCA6390/QCN9074 profiles reject before DMA; their HAL/DP paths remain software work — `ath11k.md` |
+| **mt76** | MT7921/MT7922 CONNAC2 | Retained legacy 2.4 GHz station service | Host-policy power/channel requests, UNI station/key commands, peer-bound RSNA, hardware CCMP replay checks, kernel/frame-ring service — `mt7921.md` |
+| **rtw88** | RTL8821CE/RTL8822BE/RTL8822CE | Real chip/cut PCI power sequences and sparse EFUSE identity | Firmware reserved-page DMA, complete MAC/RF, rings and station control remain software work — `rtw88.md` |
+| **rtw89** | RTL8852A/B/C, RTL8851B AX | AX factory identity and retained native TX prerequisites | Full power/firmware startup, native producer/RPQ completion pump and station integration remain software work — `rtw89.md` |
+| **rtlwifi** | Legacy Realtek PCIe | BAR2 and per-chip sparse EFUSE identity | Full power/MAC/RF, firmware, DMA/IRQ and station runtime remain software work — `rtlwifi.md` |
+| **rtl8xxxu** | RTL8188EU USB firmware profile | Real EP0 power/firmware worker | Other chips, USB unplug generations and full PHY/MAC/station packet runtime remain software work — `rtl8xxxu.md` |
+| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Owned CE/BMI bootstrap and target identity | Firmware/board/OTP activation, HTC/WMI/HTT packet runtime and interface registration remain software work — `ath10k.md` |
+| **ath9k** | AR9285 | Retained reset/validated EEPROM identity | PHY/RF/calibration, DMA/IRQ and soft-MAC station runtime remain software work — `ath9k.md` |
+| **brcmfmac** | Broadcom PCIe FullMAC | DMA parked, owned BAR0/AI core discovery | Firmware activation, shared/msgbuf/flow-ring runtime and interface attachment remain software work — `brcmfmac.md` |
+| **cyw43439** | Infineon SDIO/gSPI FullMAC | Explicit platform attach with live F2 control/station/data worker | A real fixed-FIFO host adapter and platform binding, firmware reload/PM and hardware acceptance remain — `cyw43439.md` |
+
+All eleven families are included in the software bring-up scope. Several
+entries still require a substantial hardware-driver port before physical
+station validation is meaningful; build and model-test success must not be
+reported as having closed those software gaps. The family documents list the
+ordered missing implementations. The current loadable MT76 module likewise
+registers PCI IDs only; its packet ABI integration remains software work.
 
 ## 1. Purpose & scope
 
@@ -117,8 +126,8 @@ must not use an indirect offset without a serialized selector transaction.
 Probe clears PCI bus mastering and leaves DMA ring publication disabled.
 Ownership waits are deadline-bounded; `PowerError::InvalidWindow` reports
 an invalid register access and `UnsupportedChip` rejects unknown identities.
-PCI discovery does not publish a zero-MAC netdev/wiphy. A working Wi-Fi data
-path remains unimplemented. The legacy
+PCI discovery does not publish a zero-MAC netdev/wiphy. Firmware, radio and
+station initialization precede packet admission through the retained transport. The legacy
 `full_bring_up` boundary returns `NotImplemented` without allocating or
 programming rings until it can retain every published allocation.
 PCI alias `14c3:0616` selects the MT7922 firmware pair. Register translation
@@ -215,9 +224,10 @@ netdev/wiphy name and its real MAC for passive nl80211 scans. Its constructor
 takes `(name, RadioInfo)` and rejects invalid identity; the old PCI-ID-derived
 constructor/registration scaffold is removed. Active/directed scans and
 unsupported channels are rejected before MMIO. Only the implemented 2.4 GHz
-profile is exposed, with HT/VHT/HE/EHT disabled. The link stays down, frame
-ring endpoints are absent, and packet sends/association/configuration fail
-until the corresponding driver paths exist. No interface is registered on
+profile is exposed, with HT/VHT/HE/EHT disabled. The link stays down and frame
+ring endpoints are absent until the retained station path completes a join.
+Association requires a cached matching BSS and an authenticated host policy;
+unsupported modes, channel configuration and scan profiles fail explicitly. No interface is registered on
 firmware/radio initialization failure. No host device is detached for tests.
 
 ### MT76 management TX backend
@@ -248,6 +258,8 @@ an open-authentication and association request. The initial profile requires
 privacy/RSN mismatches, unknown mandatory rates, TKIP-only/SAE-only profiles
 and mandatory PMF are rejected. WPA2 requests contain the exact negotiated
 PSK/CCMP RSN IE plus supported rates; no PMK or temporal key enters the plan.
+`JoinPlan::security()` returns the secret-free `SecurityMode`; the input
+`Security` type redacts PMK bytes from debug output.
 
 The plan's read-only phase advances from prepared through authentication and
 association only on correctly addressed matching peer responses. Algorithm,
@@ -258,43 +270,80 @@ does not authorize the controlled port until key exchange completes.
 
 `peer_record` emits checked Linux CONNAC2 station/PHY/RA/state and nested WTBL
 records for WCID 1, with the peer classified as an AP, native RX retained,
-and `CONN_STATE_CONNECT`. Associated records require the AID observed by this plan;
-no caller can mutate the plan's phase directly.
+and an MLME state separate from controlled-port authorization. WPA2 uses
+`CONN_STATE_CONNECT` until key completion; Open association may use
+`CONN_STATE_PORT_SECURE`. Associated records require the AID observed by the
+plan; no caller can mutate its phase directly.
 
 ### MT76 live join dispatch, WPA2 keys, and Ethernet data transport
 
-`Session::associate_station` executes the full live join workflow:
-1. Validates host regulatory rules and dispatches channel/power configuration
-   via `MCU_EXT_CMD_CHANNEL_SWITCH` before frame transmission.
-2. Transmits 802.11 Open Authentication and Association requests via the management TX queue,
-   awaiting matching responses within a bounded 3-second timeout per phase.
-3. For WPA2-PSK connections, drives the IEEE 802.11i 4-way handshake via `narf_wireless::eapol::Supplicant`.
-   Computes HMAC-SHA1 and verifies/generates message integrity codes (MIC).
-   On receiving M1, derives the PTK (`KCK`, `KEK`, `TK`) and emits M2 containing the negotiated RSN IE.
-   Upon receiving and verifying M3, sends M4 and installs the 16-byte temporal key via a checked
-   `STA_REC_KEY_V2` (tag 0x12) WTBL record with cipher 6 (`MCU_CIPHER_AES_CCMP`) and `CONN_STATE_PORT_SECURE`.
-4. Datapath transport submits 802.3 Ethernet frames encapsulated in 32-byte CONNAC2 TXD headers
-   over WFDMA data rings, and translates incoming 802.11 LLC/SNAP data frames to 802.3 Ethernet.
-5. `Mt76Iface` creates `narf_ipc` producer/consumer rings (`tx_ring` and
-   `rx_ring`) after association and exposes `poll_data()`. No production task
-   currently calls that method, and the kernel netdev still registers a
-   transmit callback that always refuses. Capability frame registration and
-   kernel RX delivery also remain to be connected. Ring-only smoke tests do
-   not establish an Ethernet path through the radio.
+`Transport::associate_station` requires an installed host regulatory policy
+covering the entire 20 MHz channel. The retained profile is channels 1–11,
+one TX chain, legacy rates, Open or WPA2-PSK/CCMP; DFS/PMF-required/WPA3/HT
+profiles are not silently admitted. The host half-dBm ceiling is sent in the
+44-byte rate-power header plus one 162-byte channel/SKU record before any
+native transmission. Channel switching uses Linux's full packed 76-byte
+MT7921 request, including RX antenna mask and reserved tail.
 
-The retained receive API accepts data only in `State::Associated`, validates
-the CONNAC2 descriptor before native-frame conversion, and checks the current
-AP and station destination. It inspects at most 16 candidate data packets per
-call; each backend receive may inspect the three WFDMA rings. Invalid
-descriptors, management/null frames, fragments, four-address frames, protected
-payloads without the decrypt/replay path, A-MSDU and unsupported LLC layouts
-are discarded, never reinterpreted as raw Ethernet. The native unfragmented
-RFC1042 path supports Ethernet payloads up to 1500 bytes. Peer-bound EAPOL
-framing, group keys, protected RX/replay/rekey handling and the live
-packet-service lifecycle remain bring-up prerequisites; a successful model
-M1..M4 exchange does not close them. In particular, the current handshake
-parser still has a separate raw-packet fallback; the associated-data receive
-validation does not cover that parser.
+`Session::associate_station` installs the BSSID and unauthorized AP WTBL
+before native authentication/EAPOL RX. Authentication and association bind the
+peer, station addresses and phase, with bounded waits. All live station,
+WTBL and key updates use `MCU_UNI_CMD(STA_REC_UPDATE)` (id 3), with command ID
+and full result status validation; the older extended-command encoder is not
+used for these MT7921 station operations.
+
+WPA2 uses `Supplicant::with_rsna` with the negotiated association RSNE and the
+AP's scanned RSNE. EAPOL is accepted only from validated native FromDS data
+addressed by the negotiated AP to this station. Its declared 802.1X extent is
+bounded and link padding is excluded. There is no raw-descriptor/Ethernet
+fallback. M3 MIC/ANonce/RSNE/replay and AES-wrapped KDE checks precede M4 and
+key installation. The 16-byte PTK is installed for WCID 1; the VIF WCID 19
+receives its NULL-station generic/RX/native-header WTBL setup and indexed GTK.
+`STA_REC_STATE.ASSOC` does not by itself open the WPA2 controlled port.
+Malformed key lengths are rejected, rather than padded/truncated.
+
+`association::{bss_record,group_record,key_record,disconnect_record,
+group_disconnect_record}` expose the checked single-BSS command bodies.
+Key updates do not replay WTBL initialization, and the retained supplicant
+suppresses reinstalling unchanged keys. Key/PN state stays per association;
+PMK/PTK/GTK storage is erased when its owner is dropped.
+
+`Mt76Iface` registers the kernel netdev, derives its frame-registry authority,
+and starts its bounded packet worker. The IPC rings appear after successful
+association. The kernel transmit callback enqueues validated Ethernet frames,
+and the common `step_boot_network` progresses TX/RX without awaiting another
+executor task. At most one cut-through payload is published; its descriptor
+and buffer are reused only after both DMA completion and firmware token
+release. TX completion polling preserves queued and newly received MCU replies.
+Descriptor allocations use a 32-bit coherent DMA mask; data TXP payloads are
+also allocated below 4 GiB, while other payloads fit their 36-bit fields.
+Open TX does not request encryption. Ethernet multicast still uses a unicast
+AP receiver/ACK/PTK, rather than the native multicast descriptor bit.
+
+`PacketStep` reports whether a submitted frame was accepted and up to four
+received Ethernet frames. Each RX conversion inspects at most 16 candidate
+packets (up to three hardware completions per candidate). The same service is
+installed as a synchronous network drain, with RX delivery outside driver/ring
+locks. `service_boot_keys` retains an owned rekey future that either the normal
+task or a synchronous drain may poll; cancelling its waiter cannot discard the
+transport or strand the key exchange behind an executor-dependent mutex.
+
+Native RX rejects invalid descriptor extents/groups, FCS/integrity/cipher
+errors, fragments, WDS/null/A-MSDU/HT-control and unsupported LLC layouts.
+Only unfragmented RFC1042 payloads up to 1500 bytes are converted. For secured
+links, non-EAPOL plaintext is discarded. Hardware-decrypted CCMP requires
+matching security metadata and group-1 PN; replay state is separate for each
+key and TID, and advances only after valid peer/address/body admission. The
+shared RSNA engine handles subsequent PTK and GTK exchanges; fresh installed
+keys reset only their own PN windows.
+
+Matching AP deauthentication/disassociation closes packet admission and queues
+firmware teardown. Disconnect waits for pending TX retirement, removes keys
+and resets both WTBL entries, updates the BSS and returns to `ScanReady` only
+after required replies. A timeout, cancelled control operation or uncertain
+DMA/key state cannot become a clean reusable radio; a full reset/recovery path
+is still required for those failure states. This is software model coverage,
+not demonstrated RF traffic or DHCP/AP interoperability.
 
 ### 3.1 Implemented iwlwifi MLD station profile
 

@@ -238,19 +238,17 @@ fn smoke_e2e_mt7921_channel_switch_ch36_5180mhz() -> TestResult {
     if body.len() != CHANNEL_SWITCH_SIZE {
         return TestResult::Fail("CHANNEL_SWITCH body wrong size");
     }
-    // Body offsets per encode_channel_switch:
-    //   [0] dbdc_idx=0  [1] control_chan=36  [2] center_chan=36
-    //   [3] bw=CH_BW_20 [12] band=CH_BAND_5G
-    if body[1] != 36 {
+    // Linux mt7921_mcu_set_chan_info's packed 76-byte request.
+    if body[0] != 36 {
         return TestResult::Fail("control_chan not 36");
     }
-    if body[2] != 36 {
+    if body[1] != 36 {
         return TestResult::Fail("center_chan not 36");
     }
-    if body[3] != CH_BW_20 {
+    if body[2] != CH_BW_20 {
         return TestResult::Fail("bandwidth not 20 MHz");
     }
-    if body[12] != CH_BAND_5G {
+    if body[10] != CH_BAND_5G || body.len() != 76 || body[19..].iter().any(|b| *b != 0) {
         return TestResult::Fail("band not 5 GHz");
     }
     TestResult::Pass

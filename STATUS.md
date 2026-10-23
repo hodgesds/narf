@@ -51,20 +51,42 @@ switching via `MCU_EXT_CMD_CHANNEL_SWITCH`, open-authentication/association MLME
 handshakes, and IEEE 802.11i WPA2-PSK 4-way handshakes (M1..M4) with HMAC-SHA1 MIC
 verification/generation. WTBL station records commit temporal keys with
 tag 0x12 (`STA_REC_KEY_V2`), cipher 6 (`MCU_CIPHER_AES_CCMP`), and `PORT_SECURE`.
-Packet transport helpers encapsulate 802.3 Ethernet frames into CONNAC2 TXDs
-and convert validated native LLC/SNAP frames on RX. The live packet-service
-task, functional kernel transmit callback and network RX/capability attachment
-remain unconnected; existing ring smoke tests do not prove off-box traffic.
-Group-key installation and protected RX/replay/rekey handling also remain open.
-The retained RX API now rejects invalid descriptors and unsupported native
-layouts rather than treating rejected hardware packets as Ethernet.
-The `drivers/wireless` QEMU filter passes 834 tests on x86_64 (9 skipped)
-and 291 on aarch64 (1 skipped), with zero failures. Coverage includes modeled
-WPA2 join dispatch, STA_REC key installation and packet codecs, plus Intel
-firmware CPU release, Realtek BAR/EFUSE access, ath10k HTC setup and Cypress
-event framing. These checks do not establish physical radio operation.
-Both-architecture Clippy and `cargo fmt` pass cleanly. Physical MT7922
-silicon validation on AMD Zen2/Phoenix hardware remains open to close the Stage 5 Wi-Fi gate.
+The retained legacy 2.4 GHz station profile now uses Linux's packed 76-byte
+channel request and UNI3 station/key commands. It installs the BSSID and
+unauthorized AP WTBL before authentication, then drives peer-bound RSNA with
+M3 RSNE/MIC/ANonce/KDE checks, pairwise/group keys and per-key/TID CCMP replay
+windows. Kernel transmit, capability frame rings and RX delivery share a
+bounded service step with synchronous network waiters; owned rekey work can
+progress even when its original waiter is cancelled. Peer disconnect closes
+carrier and acknowledged key/WTBL/BSS cleanup precedes reuse. Uncertain DMA,
+failed/cancelled control and full reset recovery remain fail-stopped software
+work. No off-box radio, DHCP or AP interoperability has been demonstrated.
+
+## Wi-Fi family software bring-up
+
+All eleven in-tree families are covered by the current audit and dependency
+ledger in `drivers/wireless/specification/spec.md` and its family documents.
+Intel now sends versioned coexistence, SoC latency and awake-power setup.
+CYW43439 has explicit platform/F2 attach with correlated control, regulatory
+CLM setup, scan, Open/WPA2 station control and bounded RX/TX; a real SDIO/gSPI
+FIFO host implementation and binding are still missing software. Qualcomm
+ath10k reaches owned CE/BMI target discovery, and ath9k retains AR9285 EEPROM
+identity; neither has a station datapath. Unsupported ath11k QCA6390/QCN9074
+profiles reject before DMA rather than inheriting WCN6855 acceptance.
+Realtek has per-family identity/power work, a real RTL8188EU USB firmware
+worker and bounded native RTW89 TX ownership; full firmware/RF/station paths
+remain incomplete. Broadcom PCIe parks DMA and discovers AI cores; firmware,
+msgbuf/flow rings and station attachment remain software work. These gates
+cannot be closed by physical testing alone. No physical device validation is
+part of the current software-only work.
+
+The software checkpoint passes the filtered Wi-Fi QEMU gates: x86_64 reports
+898 pass / 0 fail / 9 skip; aarch64 reports 346 pass / 0 fail / 1 skip.
+Both include a clean production boot and btrfs interoperability postflight.
+Release/debug builds, targeted Clippy across the kernel feature contexts,
+workspace formatting, and the MT76 module build pass on both architectures.
+These are software/model checks; the skipped physical-device cases remain
+unvalidated and the missing driver stages above remain open.
 
 ## Loadable e1000 datapath
 

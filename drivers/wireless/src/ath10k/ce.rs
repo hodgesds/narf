@@ -23,13 +23,12 @@
 //! - Descriptor structs (`CeDesc` 8-byte, `CeDesc64` 16-byte).
 //! - `RingConfig` describing one source / dest ring.
 //! - `program_src_ring` / `program_dst_ring` — emit the SR_BASE / SR_SIZE
-//!   / CTRL1 writes against a generic `Ath10kMmio` shim. No DMA-coherent
-//!   allocation yet — the caller stages those upstream and hands us the
-//!   physical addresses.
+//!   / CTRL1 writes against a generic `Ath10kMmio` shim. The owned
+//!   boot rings in `dma.rs` allocate coherent DMA32 backing storage.
 //! - `halt_pipe` — drive a CE into the halted state for re-init.
 //!
-//! Real DMA-coherent allocation + per-pipe per-AC TX/RX dispatch lives
-//! in the follow-up alongside HTC + the firmware blob.
+//! `boot.rs` drives CE0/CE1 BMI and CE7 diagnostics. Runtime WMI/HTT
+//! queue ownership and per-AC frame dispatch remain to be implemented.
 //!
 //! ## References (Linux v6.10)
 //!
@@ -99,8 +98,8 @@ impl CeDesc {
 
 const _: () = assert!(core::mem::size_of::<CeDesc>() == CE_DESC_SIZE);
 
-/// 16-byte CE descriptor — used by QCA99X0 / WCN3990 with 64-bit
-/// DMA addressing. `ath10k/ce.h::struct ce_desc_64`.
+/// 16-byte CE descriptor — WCN3990 with 64-bit DMA addressing.
+/// The PCIe families handled by this driver use `CeDesc`. `ath10k/ce.h::struct ce_desc_64`.
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct CeDesc64 {
@@ -131,6 +130,8 @@ const _: () = assert!(core::mem::size_of::<CeDesc64>() == CE_DESC_SIZE_64);
 /// CE registers.
 #[derive(Copy, Clone, Debug)]
 pub struct RingConfig {
+    /// Select the real per-family CE bank map.
+    pub hw_rev: HwRev,
     /// CE pipe index 0..=7.
     pub pipe: u8,
     /// Host phys of the ring (lo 32 bits; ath10k only uses 35 bits
@@ -138,7 +139,7 @@ pub struct RingConfig {
     /// 64-bit-descriptor parts — Stage 1 lo-only is fine for QCA988X
     /// + QCA6174 / 9377 which use the 32-bit descriptor).
     pub base_phys_lo: u32,
-    /// Number of entries — must be a power of two, ≤ 4096.
+    /// Number of entries — must be a power of two, 2..=8192.
     pub nentries: u32,
     /// Max single-descriptor byte count (used in CTRL1.DMAX_LENGTH).
     /// Linux defaults to 0x0E80 (3712 — leaves headroom under the
@@ -167,13 +168,18 @@ pub enum CeError {
 /// Validate a ring config. Cheap structural check used by the
 /// callers and the smoke tests.
 pub fn validate(cfg: &RingConfig) -> Result<(), CeError> {
-    if cfg.pipe >= 12 {
+    if cfg
+        .hw_rev
+        .registers()
+        .and_then(|regs| regs.ce_base(cfg.pipe))
+        .is_none()
+    {
         return Err(CeError::BadConfig);
     }
-    if !cfg.nentries.is_power_of_two() || cfg.nentries == 0 || cfg.nentries > 4096 {
+    if !cfg.nentries.is_power_of_two() || cfg.nentries < 2 || cfg.nentries > 8192 {
         return Err(CeError::BadConfig);
     }
-    if (cfg.dmax_length as u32) > CE_CTRL1_DMAX_LENGTH_MASK {
+    if cfg.base_phys_lo & 7 != 0 || cfg.dmax_length == 0 {
         return Err(CeError::BadConfig);
     }
     Ok(())
@@ -187,28 +193,24 @@ pub fn validate(cfg: &RingConfig) -> Result<(), CeError> {
 /// can be safely re-pointed).
 pub fn program_src_ring<M: Ath10kMmio>(mmio: &mut M, cfg: &RingConfig) -> Result<(), CeError> {
     validate(cfg)?;
-    let base = CE_BASE_ADDRESSES[cfg.pipe as usize];
+    let base = cfg.hw_rev.registers().unwrap().ce_base(cfg.pipe).unwrap();
 
     // SR_BASE_LO + SR_SIZE.
     mmio.write32(base + ce_off::SR_BASE_LO, cfg.base_phys_lo);
-    mmio.write32(
-        base + ce_off::SR_SIZE,
-        cfg.nentries.saturating_mul(CE_DESC_SIZE as u32),
-    );
+    mmio.write32(base + ce_off::SR_SIZE, cfg.nentries);
 
-    // CTRL1: DMAX_LENGTH | optional byte-swap | optional host-int-disable.
-    let mut ctrl1 = (cfg.dmax_length as u32) & CE_CTRL1_DMAX_LENGTH_MASK;
+    // CTRL1: source DMAX_LENGTH and byte swap. HOST_IE controls interrupts.
+    let mut ctrl1 = mmio.read32(base + ce_off::CTRL1)
+        & !(CE_CTRL1_DMAX_LENGTH_MASK | CE_CTRL1_SRC_RING_BYTE_SWAP_EN);
+    ctrl1 |= cfg.dmax_length as u32;
     if cfg.src_byte_swap {
         ctrl1 |= CE_CTRL1_SRC_RING_BYTE_SWAP_EN;
     }
-    if cfg.host_int_disabled {
-        ctrl1 |= CE_CTRL1_HOST_INT_DISABLE;
-    }
     mmio.write32(base + ce_off::CTRL1, ctrl1);
+    program_interrupts(mmio, base, cfg.host_int_disabled);
 
-    // Reset the write-index. Linux clears `sw_index`, `write_index`,
-    // and the cached HW indices to 0 in `ath10k_ce_init_src_ring`.
-    mmio.write32(base + ce_off::SR_WR_INDEX, 0);
+    // Linux seeds software indices from the hardware. Do not reset a
+    // producer index here: nonzero empty rings can survive a warm reset.
 
     // Ensure the writes are observable before the device starts
     // walking the ring.
@@ -220,22 +222,19 @@ pub fn program_src_ring<M: Ath10kMmio>(mmio: &mut M, cfg: &RingConfig) -> Result
 /// `program_src_ring`, but writes DR_BASE / DR_SIZE / DR_WR_INDEX.
 pub fn program_dst_ring<M: Ath10kMmio>(mmio: &mut M, cfg: &RingConfig) -> Result<(), CeError> {
     validate(cfg)?;
-    let base = CE_BASE_ADDRESSES[cfg.pipe as usize];
+    let base = cfg.hw_rev.registers().unwrap().ce_base(cfg.pipe).unwrap();
 
     mmio.write32(base + ce_off::DR_BASE_LO, cfg.base_phys_lo);
+    mmio.write32(base + ce_off::DR_SIZE, cfg.nentries);
+
+    // DMAX is a source-ring limit, not a destination-buffer size. Keep
+    // source configuration intact when a pipe has both ring directions.
+    let ctrl1 = mmio.read32(base + ce_off::CTRL1);
     mmio.write32(
-        base + ce_off::DR_SIZE,
-        cfg.nentries.saturating_mul(CE_DESC_SIZE as u32),
+        base + ce_off::CTRL1,
+        ctrl1 & !CE_CTRL1_DST_RING_BYTE_SWAP_EN,
     );
-
-    // Dest rings don't carry the byte-swap / src-only bits.
-    let mut ctrl1 = (cfg.dmax_length as u32) & CE_CTRL1_DMAX_LENGTH_MASK;
-    if cfg.host_int_disabled {
-        ctrl1 |= CE_CTRL1_HOST_INT_DISABLE;
-    }
-    mmio.write32(base + ce_off::CTRL1, ctrl1);
-
-    mmio.write32(base + ce_off::DR_WR_INDEX, 0);
+    program_interrupts(mmio, base, cfg.host_int_disabled);
 
     compiler_fence(Ordering::SeqCst);
     Ok(())
@@ -244,26 +243,42 @@ pub fn program_dst_ring<M: Ath10kMmio>(mmio: &mut M, cfg: &RingConfig) -> Result
 /// Halt a CE pipe so its rings can be re-pointed safely.
 /// `ce.c::ath10k_ce_halt_pipe`: write CE_CMD.HALT, then poll the
 /// halt-status register at offset 0x14 until bit 0 reads 1.
-pub fn halt_pipe<M: Ath10kMmio>(mmio: &mut M, pipe: u8) -> Result<(), CeError> {
-    if pipe >= 12 {
-        return Err(CeError::BadConfig);
-    }
-    let base = CE_BASE_ADDRESSES[pipe as usize];
-    mmio.write32(base + ce_off::CMD, CE_CMD_HALT);
+pub fn halt_pipe<M: Ath10kMmio>(mmio: &mut M, hw_rev: HwRev, pipe: u8) -> Result<(), CeError> {
+    let base = hw_rev
+        .registers()
+        .and_then(|regs| regs.ce_base(pipe))
+        .ok_or(CeError::BadConfig)?;
+    let cmd = mmio.read32(base + ce_off::CMD);
+    mmio.write32(base + ce_off::CMD, cmd | CE_CMD_HALT);
 
     // Bounded spin — Linux uses a 1 ms budget but the chip halts in
     // a few cycles in practice. Cap at 1000 reads so a faulty mock
     // doesn't wedge a test.
-    for _ in 0..1000 {
-        let v = mmio.read32(base + CE_CMD_HALT_STATUS_OFFSET);
-        if v == 0xFFFF_FFFF {
-            return Err(CeError::HaltTimeout); // device gone
-        }
-        if v & CE_CMD_HALT_STATUS_HALTED != 0 {
-            return Ok(());
-        }
+    let mut gone = false;
+    let halted = narf_scheduler::responsive_spin_until(
+        || {
+            let v = mmio.read32(base + CE_CMD_HALT_STATUS_OFFSET);
+            if v == 0xFFFF_FFFF {
+                gone = true;
+                return true;
+            }
+            v & CE_CMD_HALT_STATUS_HALTED != 0
+        },
+        narf_time::Deadline::after_ms(10),
+    );
+    if halted && !gone {
+        Ok(())
+    } else {
+        Err(CeError::HaltTimeout)
     }
-    Err(CeError::HaltTimeout)
+}
+
+fn program_interrupts<M: Ath10kMmio>(mmio: &mut M, base: u64, disabled: bool) {
+    let enabled = mmio.read32(base + ce_off::HOST_IE);
+    mmio.write32(
+        base + ce_off::HOST_IE,
+        if disabled { enabled & !1 } else { enabled | 1 },
+    );
 }
 
 // ── Default per-pipe configs ───────────────────────────────────────
@@ -304,13 +319,13 @@ pub const DEFAULT_PIPE_CONFIG: &[PipeDefault] = &[
     PipeDefault {
         pipe: 1,
         is_src: false,
-        nentries: 16,
+        nentries: 512,
         service: "htc-ctrl-rx",
     },
     PipeDefault {
         pipe: 2,
         is_src: false,
-        nentries: 32,
+        nentries: 128,
         service: "wmi-events",
     },
     PipeDefault {
@@ -322,7 +337,7 @@ pub const DEFAULT_PIPE_CONFIG: &[PipeDefault] = &[
     PipeDefault {
         pipe: 4,
         is_src: true,
-        nentries: 256,
+        nentries: 8192,
         service: "htt-tx",
     },
     PipeDefault {

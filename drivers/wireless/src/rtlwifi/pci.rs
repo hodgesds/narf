@@ -1,11 +1,11 @@
 //! rtlwifi PCIe transport — device-ID table, BAR mapping, probe.
 //!
-//! The rtlwifi family uses a single BAR0 window (typically 16 KiB) for all
-//! register accesses.  Unlike rtw88 there is no separate BAR2 data window.
+//! Linux per-chip `rtl_hal_cfg.bar_id` selects BAR2 for the supported PCIe
+//! parts. It is mapped as Device memory for all control-register accesses.
 //!
 //! ## Linux reference
 //!
-//! - `rtlwifi/pci.c::rtl_pci_probe` — probe entry, BAR0 ioremap
+//! - `rtlwifi/pci.c::rtl_pci_probe` — probe entry, per-chip BAR2 ioremap
 //! - `rtlwifi/pci.c::rtl_pci_id_tbl` — `pci_device_id` table
 //! - `rtlwifi/pci.h` — queue / descriptor constants
 
@@ -16,7 +16,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -32,9 +32,9 @@ use super::mac;
 use super::power;
 use super::regs::*;
 
-/// A bound rtlwifi PCIe device.  Holds BAR0 + MAC + device-ID.
+/// A bound rtlwifi PCIe device.  Holds BAR2 + MAC + device-ID.
 pub struct RtlwifiDevice {
-    pub mmio_bar0: MmioRegion,
+    pub registers: MmioRegion,
     pub mac: [u8; MAC_ADDR_LEN],
     pub device_id: u16,
     pub link_up: AtomicBool,
@@ -119,7 +119,9 @@ impl core::fmt::Debug for RtlwifiDevice {
 /// Errors from the probe path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProbeError {
-    Bar0MapFailed,
+    /// PCI access failed or bus mastering could not be verifiably parked.
+    PciAccess,
+    RegisterBarMapFailed,
     Efuse(efuse::EfuseError),
     PowerOn(power::PwrSeqError),
     MacInit(mac::MacInitError),
@@ -157,18 +159,13 @@ pub fn register_pci_driver() {
 /// PCI probe callback.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
+        // Even a skipped diagnostic match must not inherit active DMA.
+        crate::rtw88::pci_park::park(&device, &cap).map_err(|_| narf_bus::ProbeError::BadDevice)?;
         return Ok(());
     }
 
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-
     // SAFETY: caller holds exclusive BusDeviceCap for this device.
-    let result = unsafe { bring_up(&device) };
+    let result = unsafe { bring_up(&device, &cap) };
     let dev = match result {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
@@ -190,47 +187,51 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
-/// Map BAR0, walk the chip-specific power-on flow, run the MAC-init
-/// sequence, read EFUSE MAC, unmask interrupts, build the device object.
-///
-/// This is the end-to-end bring-up path that takes the chip from
-/// "BAR0 just mapped" to "ready for FW download" — every step Linux
-/// runs between `rtl_pci_probe` (`rtlwifi/pci.c`) and the
-/// `_rtl<ver>_init_mac` return.  FW download itself is deferred to
-/// the wireless-runtime caller via [`crate::rtlwifi::h2c::download_fw`]
-/// once the FS layer has the blob in memory.
+/// Park PCI DMA, map BAR2, apply the existing power table and read factory
+/// EFUSE identity with device IRQs masked. This diagnostic does not dispatch
+/// MAC/LLT/firmware/ring initialization or authorize a usable station.
 ///
 /// # Safety
-/// Caller must own the device BARs exclusively.
-pub unsafe fn bring_up(device: &BusDevice) -> Result<RtlwifiDevice, ProbeError> {
+/// Caller owns the device's PCI configuration and BARs exclusively.
+pub unsafe fn bring_up(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+) -> Result<RtlwifiDevice, ProbeError> {
+    crate::rtw88::pci_park::park(device, cap).map_err(|_| ProbeError::PciAccess)?;
     // SAFETY: caller-asserted.
-    let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    let registers =
+        unsafe { map_bar_control(device, 2) }.map_err(|_| ProbeError::RegisterBarMapFailed)?;
+    if registers.len < REG_EFUSE_ACCESS + 1 {
+        return Err(ProbeError::RegisterBarMapFailed);
+    }
     let did = device.id.device;
 
     // Power-on (cardemu → active).  Optional — chips not in the table
     // are tolerated for forward compat; the rest fall through to MAC
     // init unchanged.
     if power::power_on_table_for(did).is_some() {
-        // SAFETY: BAR0 mapped, no other thread holds the chip.
-        unsafe { power::power_on(&mmio_bar0, did) }?;
+        // SAFETY: BAR2 mapped, no other thread holds the chip.
+        unsafe { power::power_on(&registers, did) }?;
     }
 
-    // MAC init (LLT, CR open, RCR/TCR seed, HISR clear).
-    // SAFETY: BAR0 mapped + chip powered on.
-    unsafe { mac::init_mac(&mmio_bar0, did) }?;
+    // The diagnostic identity stage does not own packet DMA or an IRQ
+    // handler. Keep interrupt masks clear and defer MAC TX/RX/ring setup.
+    // SAFETY: BAR2 mapped and owned.
+    unsafe { irq::disable_interrupts(&registers) };
 
-    // Mask in the default interrupts (HIMR + HIMRE).
-    // SAFETY: same.
-    unsafe { irq::enable_interrupts(&mmio_bar0) };
-
-    // SAFETY: BAR0 mapped and owned.
-    let mac = unsafe { efuse::read_mac(&mmio_bar0) }.map_err(ProbeError::Efuse)?;
+    let function = match device.addr {
+        narf_bus::BusAddr::Pcie(addr) => addr.function,
+        _ => return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip)),
+    };
+    // SAFETY: BAR2 mapped and owned, with EFUSE read clocks configured by
+    // the helper. PCI function selects the dual-MAC 8192DE factory address.
+    let mac = unsafe { efuse::read_mac(&registers, did, function) }.map_err(ProbeError::Efuse)?;
 
     let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
     let device_arc = alloc::sync::Arc::new(RtlwifiDevice {
-        mmio_bar0,
+        registers,
         mac,
         device_id: device.id.device,
         link_up: AtomicBool::new(false),
@@ -240,7 +241,7 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<RtlwifiDevice, ProbeError> 
     narf_wireless::registry::register(device_arc);
 
     Ok(RtlwifiDevice {
-        mmio_bar0,
+        registers,
         mac,
         device_id: device.id.device,
         link_up: AtomicBool::new(false),

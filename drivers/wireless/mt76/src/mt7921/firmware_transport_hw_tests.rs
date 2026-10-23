@@ -477,3 +477,57 @@ kernel_test_in!(
     "drivers/wireless/mt7921/tx",
     mcu_receive_router_bounds_both_queues_without_dropping_command_replies
 );
+
+fn mcu_tx_completion_pump_preserves_queued_and_fresh_command_replies() -> TestResult {
+    let (mut words, mut hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("allocation"),
+    };
+    hw.owner.published = true;
+    if hw.submit_management(&management_frame(), 1).is_err() {
+        return TestResult::Fail("publish management TX");
+    }
+    let mut old = vec![0u8; 36];
+    old[..4].copy_from_slice(&((7u32 << 27) | 36).to_le_bytes());
+    old[24..26].copy_from_slice(&12u16.to_le_bytes());
+    old[28] = 1;
+    old[29] = 1;
+    let mut fresh = old.clone();
+    fresh[29] = 2;
+    hw.owner
+        .storage
+        .as_mut()
+        .unwrap()
+        .pending_events
+        .push_back(old.clone());
+    inject_rx(&mut words, &hw, 0, &fresh);
+    inject_rx(&mut words, &hw, 1, &release_event(1, 0, false));
+    hw.owner
+        .storage
+        .as_ref()
+        .unwrap()
+        .data
+        .set_word(0, 1, (64 << 16) | LAST | DONE);
+    words[(TX_DATA + 12) as usize / 4] = 1;
+    let completion = hw.management_complete();
+    let first = hw.receive();
+    let second = hw.receive();
+    hw.owner.published = false; // Fixture owns memory; no device engine exists.
+    if completion
+        != Ok(Some(packet_tx::Completion {
+            token: 1,
+            status: 0,
+        }))
+        || first != Ok(Some(old))
+        || second != Ok(Some(fresh))
+    {
+        return TestResult::Fail(
+            "completion pumping consumed MCU response or failed to harvest TX free",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport",
+    mcu_tx_completion_pump_preserves_queued_and_fresh_command_replies
+);

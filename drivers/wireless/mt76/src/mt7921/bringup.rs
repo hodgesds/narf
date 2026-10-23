@@ -196,7 +196,7 @@ pub fn build_channel_switch_body(config: &BringUpConfig) -> alloc::vec::Vec<u8> 
         config.channel,
         config.bw,
         2,
-        2,
+        3,
         config.band,
         &mut out,
     );

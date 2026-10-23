@@ -103,12 +103,18 @@ fn smoke_rtw88_pci_missing_or_short_register_bar_fails() -> TestResult {
         return TestResult::Fail("rtw88 accepted absent BAR2 or attempted a fallback register BAR");
     }
     if !matches!(
-        map_registers_with(&device, |_, _| Ok(register_fixture(REG_CR + 1))),
+        map_registers_with(&device, |_, _| Ok(register_fixture(
+            super::power::REGISTER_WINDOW_MIN - 1
+        ))),
         Err(ProbeError::RegisterBarTooSmall)
     ) {
         return TestResult::Fail("rtw88 accepted a register BAR too short for power-on");
     }
-    if map_registers_with(&device, |_, _| Ok(register_fixture(REG_CR + 2))).is_err() {
+    if map_registers_with(&device, |_, _| {
+        Ok(register_fixture(super::power::REGISTER_WINDOW_MIN))
+    })
+    .is_err()
+    {
         return TestResult::Fail("rtw88 rejected the minimum complete register extent");
     }
     TestResult::Pass
