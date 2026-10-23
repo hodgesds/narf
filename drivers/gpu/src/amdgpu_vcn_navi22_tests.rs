@@ -106,6 +106,7 @@ impl Model {
     fn new() -> Self {
         let mut regs = BTreeMap::new();
         regs.insert(NBIO + u64::from(NBIO_DOORBELL_APER_EN) * 4, 1);
+        regs.insert(NBIO + u64::from(NBIO_CONFIG_MEMSIZE) * 4, 12288);
         regs.insert(GC + u64::from(GB_ADDR_CONFIG) * 4, GB_ADDR);
         for i in [0, 1] {
             // Tiles gated at reset, gates closed, LMI clean.
@@ -584,7 +585,19 @@ fn vcn_navi22_all_ones_vcpu_control_checks_independent_device_presence() -> Test
             "VCPU control written after independent banks reported device loss",
         );
     }
-    // A live GC bank alone is insufficient when NBIO is absent or closed.
+    // A gated GC bank is not evidence of removal. Linux's working GPU
+    // returned all ones for both GB_ADDR_CONFIG and UVD_VCPU_CNTL.
+    let mut model = Model::new();
+    model
+        .regs
+        .insert(GC + u64::from(GB_ADDR_CONFIG) * 4, u32::MAX);
+    model.regs.insert(v(0, VCPU_CNTL), u32::MAX);
+    if update_vcpu(&mut model, layout(1), 0, VCPU_CLK_EN, VCPU_CLK_EN).is_err()
+        || model.writes != [(v(0, VCPU_CNTL), u32::MAX)]
+    {
+        return TestResult::Fail("gated GC mistaken for removal during VCPU masked update");
+    }
+    // A live memory-size register is insufficient when the aperture is absent or closed.
     for aperture in [0, u32::MAX] {
         let mut model = Model::new();
         model.regs.insert(v(0, VCPU_CNTL), u32::MAX);
@@ -600,6 +613,21 @@ fn vcn_navi22_all_ones_vcpu_control_checks_independent_device_presence() -> Test
             || !model.writes.is_empty()
         {
             return TestResult::Fail("VCPU control written without a live NBIO aperture");
+        }
+    }
+    for size in [0, u32::MAX] {
+        let mut model = Model::new();
+        model.regs.insert(v(0, VCPU_CNTL), u32::MAX);
+        model.regs.insert(layout(1).nbio(NBIO_CONFIG_MEMSIZE), size);
+        let want = if size == 0 {
+            Error::Invalid
+        } else {
+            Error::DeviceGone
+        };
+        if update_vcpu(&mut model, layout(1), 0, VCPU_CLK_EN, VCPU_CLK_EN) != Err(want)
+            || !model.writes.is_empty()
+        {
+            return TestResult::Fail("VCPU control written without NBIO memory-size presence");
         }
     }
     TestResult::Pass

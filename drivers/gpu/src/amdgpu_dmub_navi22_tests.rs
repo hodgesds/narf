@@ -362,6 +362,94 @@ kernel_test_in!(
     "drivers/gpu/dmub-navi22",
     dmub_navi22_secure_windows_outside_tmr_stay_bounded_and_unchanged
 );
+fn dmub_navi22_zero_secure_readback_requires_authenticated_owned_image() -> TestResult {
+    const SECURE: [u32; 9] = [
+        0x1a5, 0x1a6, 0x1ad, 0x1ae, 0x1b5, 0x1b6, 0x1b7, 0x1b8, 0x1ce,
+    ];
+    for case in 0..8 {
+        let (_, mut engine) = fixture();
+        let map = engine.memory.mapping();
+        let pool_base = fb().base + 0x400000;
+        // SAFETY: model bookkeeping only; the Fake owns all I/O.
+        let pool = unsafe {
+            Pool::from_owned_range(
+                MmioRegion {
+                    len: fb().end - pool_base,
+                    ..map
+                },
+                pool_base,
+            )
+        }
+        .unwrap();
+        engine.memory = pool.reserve(map.len).unwrap();
+        let signed_size = engine.prepared.signed_size;
+        let image_base = match case {
+            4 => fb().end + 0x1000,          // outside the matching pool
+            5 => engine.memory.address(),    // aliases live nonsecure storage
+            6 => fb().end - signed_size / 2, // signed packaging straddles pool end
+            7 => tmr().start,                // PSP may place the opaque image in this TMR
+            _ => fb().end - 0x1200000 + 0x100,
+        };
+        let image = image_base..image_base + signed_size + if case == 2 { 4 } else { 0 };
+        let memory = crate::amdgpu_psp_ring::DmubMemory {
+            tmr: tmr(),
+            inherited: None,
+            reported: (case != 1).then(|| (image.clone(), pool.clone())),
+        };
+        // Match a PSP reply whose entire image was already claimed. The
+        // rejected alias/out-of-pool cases exercise the consumer's guard too.
+        if matches!(case, 0 | 2 | 3) {
+            pool.claim(image.start - pool_base..image.end - pool_base)
+                .unwrap();
+        }
+        if case == 7 {
+            pool.claim(tmr().start - pool_base..tmr().end - pool_base)
+                .unwrap();
+        }
+        for reg in SECURE {
+            engine.io.regs.insert(DCN + u64::from(reg) * 4, 0);
+        }
+        if case == 3 {
+            // Only fully zero readback is opaque; partial enabled windows
+            // must still pass the existing complete-window validator.
+            engine.io.regs.insert(DCN + 0x1ae * 4, 1 << 31);
+        }
+        run(engine.quiesce()).unwrap();
+        let writes = engine.io.writes.len();
+        let result = run(engine.start(memory, fb()));
+        let good = matches!(case, 0 | 7);
+        if (good && (result.is_err() || engine.state != State::Running))
+            || (!good && result != Err(Error::Invalid))
+        {
+            return TestResult::Fail(
+                "opaque secure windows accepted without full PSP image ownership",
+            );
+        }
+        // Dmub::start follows the low-level start with this transport proof.
+        if good && run(engine.initialize_mailbox()).is_err() {
+            return TestResult::Fail("opaque PSP path failed mailbox initialization");
+        }
+        if good
+            && engine
+                .status
+                .is_none_or(|s| s.boot_status != 3 || s.capabilities.is_none())
+        {
+            return TestResult::Fail("opaque PSP path skipped fresh boot or mailbox proof");
+        }
+        if engine.io.writes[writes..].iter().any(|&(reg, _)| {
+            SECURE
+                .iter()
+                .any(|&secure| reg == DCN + u64::from(secure) * 4)
+        }) {
+            return TestResult::Fail("opaque PSP secure register overwritten");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_zero_secure_readback_requires_authenticated_owned_image
+);
 fn run<T>(f: impl Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(f)
 }

@@ -6792,8 +6792,9 @@ MGCG-style clock-gating disable, PSP-TMR cache window 0, VCPU boot with Linux's
 rings, then the SCRATCH9 decode and VCN_ENC_CMD_END encode ring tests.
 VCPU_CNTL masked writes preserve the original unselected bits, including an
 all-ones control word, as Linux's WREG32_P does. Before accepting that value,
-the owner checks independent GC and NBIO reads and requires the NBIO doorbell
-aperture to remain enabled; loss refuses the write. Status and wait-register
+the owner checks NBIO's memory-size and doorbell-aperture registers and requires
+nonzero memory and an enabled aperture; loss refuses the write. A gated GC
+register is not a presence probe. Status and wait-register
 all-ones reads still fail rather than proving readiness.
 `unsafe start_jpeg()` honours CC_UVD_HARVESTING, powers UVDJ on and runs
 `jpeg_v3_0_start` plus the JPEG pitch ring test. `test_ib()` runs the decoder
@@ -6941,8 +6942,8 @@ It holds DCN3.0 `DMCUB_CNTL.SOFT_RESET` (bit 17) and `MMHUBBUB_SOFT_RESET`
 It never uses DCN31's separate CNTL2 reset or dword `0x342` hub reset.
 
 After PSP loads DMCUB, `unsafe start(&Psp).await` validates that execution is
-still reset, security reset is released, and both PSP instruction/stack windows
-are enabled and wholly inside either the retained TMR or their respective
+still reset and security reset is released. When readable, both PSP
+instruction/stack windows must be enabled and wholly inside either the retained TMR or their respective
 pre-inventoried secure CW0/CW1 reservation after checked GPU-physical translation.
 If PSP programmed fresh windows after that inventory, CW0 must contain the
 complete authenticated image from this PSP session's reply. Each new full
@@ -6953,6 +6954,18 @@ CW0 extent excludes the parsed PSP header/footer, matching Linux's DMUB
 instruction-window sizing. The original signed range stays reserved.
 Each full window must fit one reservation; a point address, unrelated protected
 client, inter-window gap or enlarged inherited window is insufficient.
+On hardware where all eight secure CW0/CW1 registers read as zero, the
+completed PSP load is the placement authority, as on Linux's PSP path. This
+case requires a zero PSP response status for the matching session's complete
+authenticated signed image,
+the prepared upload-size match, and retained ownership of its full extent:
+TMR, inherited CW0, or a bounded claim in that GPU's pool without any live or
+retired overlap. A plain TMR range without an authenticated PSP reply, partial
+zero readback, or an image outside the owned memory does not authorize this
+path. No secure-window addresses are inferred from zero readback or the entry
+point. PSP remains responsible for those secure windows; the TMR and full
+signed-image claim stay retained. Fresh firmware-ready and mailbox proof are
+still required before readiness is published.
 Those secure registers are preserved verbatim. The caller retains the matching
 PSP/TMR for DMUB's lifetime, with trained VRAM, ready memory hubs and protected
 power. Nonsecure VBIOS/mailbox/trace/state windows use owned GPU VRAM addresses.

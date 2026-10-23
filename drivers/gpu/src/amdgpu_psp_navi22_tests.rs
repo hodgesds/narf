@@ -57,6 +57,7 @@ fn psp_dmcub_accepts_only_inventoried_instruction_window_outside_tmr() -> TestRe
     run(s.setup_tmr_payload(None)).unwrap();
     let entry = 0x82fee00100;
     let reply = |address| Reply {
+        status: 0,
         address,
         tmr_size: 0,
     };
@@ -114,6 +115,7 @@ fn psp_dmcub_claims_authenticated_reply_range_in_owned_vram() -> TestResult {
     let firmware_size = 0x41690;
     if s.record_media(
         Reply {
+            status: 0,
             address: base + 0x100,
             tmr_size: 0,
         },
@@ -126,6 +128,7 @@ fn psp_dmcub_claims_authenticated_reply_range_in_owned_vram() -> TestResult {
     let before = pool.available();
     if s.record_media(
         Reply {
+            status: 0,
             address,
             tmr_size: 0,
         },
@@ -145,6 +148,7 @@ fn psp_dmcub_claims_authenticated_reply_range_in_owned_vram() -> TestResult {
     }
     if s.record_media(
         Reply {
+            status: 0,
             address,
             tmr_size: 0,
         },
@@ -153,6 +157,22 @@ fn psp_dmcub_claims_authenticated_reply_range_in_owned_vram() -> TestResult {
     ) != Err(Error::Invalid)
     {
         return TestResult::Fail("non-DMCUB firmware escaped its TMR");
+    }
+    // A compatibility-tolerated PSP response must not supply authentication
+    // evidence for secure windows whose readback is unavailable.
+    if s.record_media(
+        Reply {
+            status: 1,
+            address,
+            tmr_size: 0,
+        },
+        51,
+        firmware_size,
+    )
+    .is_err()
+        || s.dmub_image.is_some()
+    {
+        return TestResult::Fail("nonzero PSP status authorized opaque DMUB windows");
     }
     TestResult::Pass
 }

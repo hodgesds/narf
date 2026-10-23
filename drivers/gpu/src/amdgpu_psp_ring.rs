@@ -69,6 +69,7 @@ pub enum State {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Reply {
+    status: u32,
     address: u64,
     tmr_size: u32,
 }
@@ -363,10 +364,12 @@ impl<I: Io> Engine<I> {
         }
         let (status, reply, uresp) = self.access(|io| {
             io.invalidate();
+            // linux-lit: 864=offsetof(struct psp_gfx_cmd_resp, resp.status)
+            let status = io.read_mem(COMMAND + 864);
             (
-                // linux-lit: 864=offsetof(struct psp_gfx_cmd_resp, resp.status)
-                io.read_mem(COMMAND + 864),
+                status,
                 Reply {
+                    status,
                     // linux-lit: 872=offsetof(struct psp_gfx_cmd_resp, resp.fw_addr_lo)
                     address: io.read_mem(COMMAND + 872) as u64
                         // linux-lit: 876=offsetof(struct psp_gfx_cmd_resp, resp.fw_addr_hi)
@@ -552,6 +555,29 @@ impl From<core::ops::Range<u64>> for DmubMemory {
     }
 }
 impl DmubMemory {
+    /// PSP owns CW0/CW1 and can hide their MMIO readback. Linux's PSP path
+    /// never requires those registers to be readable. Require this session's
+    /// authenticated full image and retain its reservation instead; do not
+    /// invent secure-window bounds from a zero register or an entry point.
+    pub(crate) fn authorize_opaque(&self) -> bool {
+        let Some((image, pool)) = &self.reported else {
+            return false;
+        };
+        if image.start >= image.end {
+            return false;
+        }
+        if self.contains(0, image) {
+            return true;
+        }
+        let Some(pool_end) = pool.address().checked_add(pool.size()) else {
+            return false;
+        };
+        image.start >= pool.address()
+            && image.end <= pool_end
+            && pool
+                .claim(image.start - pool.address()..image.end - pool.address())
+                .is_ok()
+    }
     pub(crate) fn contains(&self, index: usize, range: &core::ops::Range<u64>) -> bool {
         range.start < range.end
             && ((range.start >= self.tmr.start && range.end <= self.tmr.end)
@@ -1656,7 +1682,10 @@ impl<I: Io> Session<I> {
             crate::amdgpu_gfx_firmware::VCN1_TYPE => self.media_firmware.vcn1 = Some(reply.address),
             _ => {
                 self.media_firmware.dmcub = Some(reply.address);
-                self.dmub_image = range;
+                // Linux's compatibility policy may tolerate a nonzero status
+                // on other bring-up paths. Opaque secure-window readback
+                // needs an unambiguous successful load from this session.
+                self.dmub_image = if reply.status == 0 { range } else { None };
             }
         }
         Ok(())

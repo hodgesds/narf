@@ -369,13 +369,16 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let address = self.memory.address();
         let shape = self.prepared.layout;
-        if let Some((image, _)) = &mut memory.reported {
+        if let Some((image, _)) = &memory.reported {
             // The PSP request includes signature packaging, while its reply
             // identifies executable instructions. Linux removes the PSP
             // header/footer before sizing DMUB_WINDOW_0_INST_CONST.
             if image.end.checked_sub(image.start) != Some(self.prepared.signed_size) {
                 return Err(Error::Invalid);
             }
+        }
+        let opaque_authorized = memory.authorize_opaque();
+        if let Some((image, _)) = &mut memory.reported {
             image.end = image
                 .start
                 .checked_add(self.prepared.instruction_size)
@@ -411,18 +414,36 @@ impl<I: Io> Engine<I> {
             // Decode both complete windows before reserving either. PSP may
             // have replaced the pre-allocation inventory during LOAD_IP_FW.
             // Preserve the secure registers verbatim, as dmub_dcn30 does.
+            let mut secure = [[0; 4]; 2];
+            for (index, window) in secure.iter_mut().enumerate() {
+                let index = index as u32;
+                // linux-lit: 0x1a5=mmDMCUB_REGION3_CW0_BASE_ADDRESS; 0x1ad=mmDMCUB_REGION3_CW0_TOP_ADDRESS
+                // linux-lit: 0x1b5=mmDMCUB_REGION3_CW0_OFFSET; 0x1b6=mmDMCUB_REGION3_CW0_OFFSET_HIGH
+                // linux-lit: 2=mmDMCUB_REGION3_CW1_OFFSET - mmDMCUB_REGION3_CW0_OFFSET
+                for (value, reg) in window.iter_mut().zip([
+                    0x1a5 + index,
+                    0x1ad + index,
+                    0x1b5 + index * 2,
+                    0x1b6 + index * 2,
+                ]) {
+                    *value = read(io, l.dcn, reg)?;
+                }
+            }
+            if secure == [[0; 4]; 2] {
+                // A running Linux DMUB on Navi22 exposes exactly this zero
+                // readback. Trust the completed PSP load, as dm_dmub_hw_init
+                // does, while retaining the full authenticated image claim.
+                // Mixed/partial windows still take the strict decoder below.
+                return if opaque_authorized {
+                    Ok(place)
+                } else {
+                    Err(Error::Invalid)
+                };
+            }
             let mut windows = [0..0, 0..0];
-            for index in 0..2 {
-                // linux-lit: 0x1a5=mmDMCUB_REGION3_CW0_BASE_ADDRESS
-                let base = read(io, l.dcn, 0x1a5 + index)? & MASK;
-                // linux-lit: 0x1ad=mmDMCUB_REGION3_CW0_TOP_ADDRESS
-                let top = read(io, l.dcn, 0x1ad + index)?;
-                // linux-lit: 0x1b5=mmDMCUB_REGION3_CW0_OFFSET
-                // linux-lit: 2=mmDMCUB_REGION3_CW1_OFFSET - mmDMCUB_REGION3_CW0_OFFSET
-                let low = read(io, l.dcn, 0x1b5 + index * 2)?;
-                // linux-lit: 0x1b6=mmDMCUB_REGION3_CW0_OFFSET_HIGH
-                // linux-lit: 2=mmDMCUB_REGION3_CW1_OFFSET - mmDMCUB_REGION3_CW0_OFFSET
-                let high = read(io, l.dcn, 0x1b6 + index * 2)?;
+            for (index, [raw_base, top, low, high]) in secure.into_iter().enumerate() {
+                let index = index as u32;
+                let base = raw_base & MASK;
                 // linux-lit: 0xffffff00=DMCUB_REGION3_CW0_OFFSET__DMCUB_REGION3_CW0_OFFSET_MASK
                 // linux-lit: 0xffff=DMCUB_REGION3_CW0_OFFSET_HIGH__DMCUB_REGION3_CW0_OFFSET_HIGH_MASK
                 let start = u64::from(low & 0xffffff00) | (u64::from(high & 0xffff) << 32);

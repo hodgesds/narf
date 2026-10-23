@@ -137,6 +137,7 @@ pub(crate) mod regs {
     /// nbio_2_3_offset.h / nbio_v2_3.c, NBIO BASE_IDX 2.
     // linux-ctx: hdr=nbio seg=2
     pub const NBIO_DOORBELL_APER_EN: u32 = 0x0c0; // linux: mmRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN
+    pub const NBIO_CONFIG_MEMSIZE: u32 = 0x0c3; // linux: mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
     /// linux: mmBIF_MMSCH0_DOORBELL_RANGE; mmBIF_MMSCH1_DOORBELL_RANGE
     pub const NBIO_MMSCH_DOORBELL_RANGE: [u32; 2] = [0x1d3, 0x1d8];
     pub const LAST_NBIO: u32 = 0x1d8; // linux: mmBIF_MMSCH1_DOORBELL_RANGE
@@ -533,7 +534,8 @@ fn update<I: Io>(io: &mut I, address: u64, mask: u32, value: u32) -> Result<(), 
 }
 /// Linux uses WREG32_P for VCPU_CNTL, preserving all unselected bits even
 /// when the register reads all ones. That control word alone cannot prove
-/// removal: verify the independent GC/NBIO banks before accepting it.
+/// removal: verify NBIO's memory-size and aperture registers before accepting
+/// it. GC registers themselves can return all ones while GFXOFF is active.
 fn update_vcpu<I: Io>(
     io: &mut I,
     layout: Layout,
@@ -544,7 +546,9 @@ fn update_vcpu<I: Io>(
     let address = layout.reg(instance, VCPU_CNTL);
     let old = io.read(address);
     if old == u32::MAX {
-        checked(io.read(layout.gc + u64::from(GB_ADDR_CONFIG) * 4))?;
+        if checked(io.read(layout.nbio(NBIO_CONFIG_MEMSIZE)))? == 0 {
+            return Err(Error::Invalid);
+        }
         if checked(io.read(layout.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
             return Err(Error::Invalid);
         }
@@ -560,7 +564,7 @@ fn flush<I: Io>(io: &mut I, l: Layout) {
     barrier(Ordering::SeqCst);
     // linux: n/a (MMIO_REG_HOLE_OFFSET write, amdgpu_hdp_generic_flush)
     io.write(0x7f000, 0);
-    io.read(l.nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
+    io.read(l.nbio(NBIO_CONFIG_MEMSIZE));
     barrier(Ordering::SeqCst);
 }
 /// HDP read-cache invalidate before the CPU samples engine writes.

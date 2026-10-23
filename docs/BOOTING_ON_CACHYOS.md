@@ -292,6 +292,19 @@ readable kernel capture; it contains no PlasmaLogin start. The earlier
 journal/userdb/Plymouth snapshot therefore does not establish a permanent
 sysinit deadlock.
 
+The working-Linux comparison after that boot found DMCUB enabled, out of reset,
+and ready (`DMCUB_SCRATCH0 = 3`) while all eight CW0/CW1 registers also read
+zero. `UVD_VCPU_CNTL` and the gated GC `GB_ADDR_CONFIG` both read all ones.
+NARF therefore cannot use either observation alone as evidence of failure.
+The corrected DMUB path accepts wholly zero secure readback only with this
+PSP session's authenticated full image, matching upload size and retained
+memory ownership, then still requires a fresh ready publication and mailbox
+proof. Readable and partially readable windows retain their bounds checks.
+VCN presence uses NBIO's memory-size and aperture registers instead of GC.
+The captured root was `btrfs / ... rw`, and diagnostic files were persisted;
+the service snapshot still had PlasmaLogin waiting. These corrections have
+not yet established a working hardware graphical login.
+
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 
 ```sh
