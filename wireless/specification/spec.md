@@ -49,13 +49,19 @@ headers and transport source under the repository's GPL-2.0 licensing.
 - **802.11 Frame Parsing** — (SoftMAC specific) building and parsing management frames.
 
 **Does NOT own:**
-- The WPA Supplicant — WPA2/WPA3 handshakes live in a userspace daemon.
+- Userspace supplicant policy — credential selection, network profiles and
+  connection policy live in userspace (e.g. wpa_supplicant / NetworkManager
+  over nl80211). The RSNA supplicant itself — the WPA2/WPA3 4-way and
+  group-key handshakes and SAE — is in-kernel (see §5 and decision §8.3);
+  userspace supplies credentials (passphrase, PMK, SAE password) through
+  nl80211 `CONNECT`, or drives the handshake itself only on
+  external-supplicant drivers (§3.4).
 - Regulatory domain enforcement — the driver/firmware is responsible for hardware limits; the kernel validates against a signed database.
 - L3+ networking — lives in stack daemons via `net/spec`.
 
 ## 2. Design Principles
 
-1. **Microkernel-Pure**: The kernel does not contain a full 802.11 stack. Management frames are passed to a userspace "Wireless Daemon" for complex logic (MLME).
+1. **In-Kernel MLME**: The 802.11 station MLME and the RSNA supplicant run in-kernel (shared `narf-wireless` code for SoftMAC families; firmware supplicants for FullMAC families), behind the nl80211 control plane. Userspace configures and observes; it is not in the association or handshake path (decision §8.3, superseding §8.1).
 2. **Capability-Gated**: Discovery (scanning) is a distinct right from connectivity (association).
 3. **Zero-Copy Hot Path**: Data frames use the standard `net/spec` Narf-Rings; management frames use a separate `MgmtRing`.
 4. **Documented hardware contracts**: Record the source of firmware wire
@@ -859,34 +865,52 @@ unknown flags, malformed ranges and length mismatches are rejected.
 The driver intersects the selected host rule with firmware MCC permission
 and applies its power ceiling before transmitting association frames.
 
-For Stage 5 bring-up the iwlwifi driver currently hosts the station MLME
-and WPA2 state machine behind `WirelessNetIface`. The intended daemon
-split described below has not yet replaced that implementation.
+The iwlwifi driver hosts the station MLME
+and WPA2 state machine behind `WirelessNetIface`. That in-kernel placement
+is the approved architecture (decision §8.3, 2026-10-23), not an interim
+step toward a userspace-daemon split; the daemon design described in
+earlier revisions of this specification is dropped.
 
 ## 4. Architecture: SoftMAC vs. FullMAC
 
 NARF supports both through the `WirelessIface` trait:
 
 - **FullMAC Drivers**: The firmware handles scan/associate state machines. The driver implements the high-level `associate()` call by sending a command to hardware.
-- **SoftMAC Drivers**: The hardware only does radio/PHY. The driver/kernel/daemon must handle the 802.11 MAC management.
+- **SoftMAC Drivers**: The hardware only does radio/PHY. The driver and kernel handle the 802.11 MAC management.
   - In NARF, SoftMAC logic is split:
     - **Driver**: Timing-critical frames (ACKs, Beacons where possible).
-    - **Wireless Daemon (Userspace)**: MLME (Association, Authentication, Reassociation).
-    - **Narf-Link**: Management frames are routed to the Daemon via a dedicated `MgmtRing`.
+    - **Kernel (`narf-wireless` + driver)**: MLME (scan, authentication, association, reassociation) and the RSNA supplicant (§3.5, §5).
+    - **Narf-Link / nl80211**: Userspace configures connections and receives events over the nl80211 control plane (§3.4). A userspace SME remains available on drivers that advertise it, but is not the default path.
 
-## 5. Security: The Wireless Daemon
+## 5. Security: In-Kernel RSNA and Key Management
 
-Following the `net/spec` §8.5 "Stack-daemon trust" model:
+Key management runs where the keys are used (decision §8.3); there is no
+userspace wireless daemon in the trust path:
 - WPA2/WPA3 (SAE) encryption/decryption happens in hardware where possible.
-- Key management and the 4-way handshake happen in the **Wireless Daemon**.
-- The Daemon holds `Cap<WirelessIface, Associate>` and `Cap<WirelessIface, Config>`.
+- Key management and the 4-way handshake happen in the **kernel**: the shared
+  `narf-wireless` RSNA supplicant (`eapol`/`rsna`, SAE in `sae`) for SoftMAC
+  and handshake-offload families, the driver's own supplicant for families
+  with per-driver implementations (iwlwifi), and the firmware supplicant for
+  FullMAC families (cyw43439, brcmfmac). Derived temporal keys are installed
+  into the hardware/firmware by the driver; key material is never returned
+  to userspace.
+- Userspace holds capabilities, not keys: connection requests are gated by
+  the `Cap<WirelessIface, Associate>` / `Cap<WirelessIface, Config>` rights
+  through the nl80211 permission model (§3.4), and userspace supplies only
+  credentials (passphrase, PMK, or SAE password).
+- Compat path: on drivers advertising nl80211 handshake offload
+  (`4WAY_HANDSHAKE_STA_PSK` / `SAE_OFFLOAD`), a userspace supplicant such as
+  wpa_supplicant derives the PMK (or supplies the SAE password) and passes it
+  in `CONNECT`, while the in-kernel supplicant still runs the 4-way
+  handshake. On external-supplicant drivers (§3.4) userspace runs the
+  handshake itself over the control port — the exception, not the model.
 
 ## 6. Zero-Copy Management Path
 
 Management frames (Beacons, Probe Requests) are voluminous.
 - A `Monitor` cap allows a process to open a `MgmtRing`.
 - `MgmtRing` carries `DmaBuffer` caps pointing to raw 802.11 frames.
-- No copy between hardware → driver → daemon.
+- No copy between hardware → driver → monitor consumer.
 
 ## 7. Stage Assignment
 
@@ -896,11 +920,15 @@ Management frames (Beacons, Probe Requests) are voluminous.
 
 ## 8. Resolved Decisions
 
-### 8.1 No MLME in Kernel (Resolved)
+### 8.1 No MLME in Kernel (Resolved — superseded by §8.3, 2026-10-23)
 **Decision**: The 802.11 MLME (Media Access Control Sublayer Management Entity) state machine is too complex and bug-prone for the Frame. It lives in userspace. The kernel only provides the mechanism to send/receive management frames.
+**Superseded**: The implementation went the other way; §8.3 records the ruling that replaced this decision. Kept for history.
 
 ### 8.2 Hardware-Agnostic Scan (Resolved)
 **Decision**: Drivers implement a unified `scan()` async call. If the hardware supports "Offload Scan", the driver uses it. If not, the driver performs the channel-hopping and probe-sending manually in the driver domain.
+
+### 8.3 In-Kernel MLME and RSNA (Resolved, 2026-10-23)
+**Decision** (project owner, 2026-10-23 — "the 4-way handshake can be in-kernel"): The station MLME and the RSNA supplicant (WPA2/WPA3 4-way and group-key handshakes, SAE) live in-kernel. SoftMAC families share the `narf-wireless` supplicant (`eapol`/`rsna`, `sae`); FullMAC families (cyw43439, brcmfmac) use their firmware supplicants; iwlwifi retains its per-driver implementation. nl80211 is the control plane: userspace supplies credentials and policy and receives events, and the nl80211 handshake-offload mode (`4WAY_HANDSHAKE_STA_PSK` / `SAE_OFFLOAD` via `CONNECT`) is retained as the compat path for a userspace supplicant such as wpa_supplicant; external-supplicant drivers (§3.4) remain the exception. No userspace "Wireless Daemon" is part of the design. This supersedes §8.1 and the daemon placement described in earlier revisions of §§1, 2, 4 and 5.
 
 ## 9. Dependencies
 
