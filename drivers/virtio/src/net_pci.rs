@@ -241,8 +241,8 @@ struct QueuePair {
     /// With fire-and-forget TX the payload `DmaBuffer` must stay
     /// alive (the device DMAs from it) until its used-ring entry
     /// appears. On submit we move the buffer into `tx_buffers[head]`;
-    /// on lazy reclaim (drained at the start of the next transmit)
-    /// we `take()` it out and drop it. Sized to the TX queue size.
+    /// on completion reclaim we `take()` it out and return it to this pair's
+    /// pool. Sized to the TX queue size.
     tx_buffers: IrqSafeSpinLock<Vec<Option<DmaBuffer>>>,
     /// Recycled TX DMA buffers owned solely by this queue pair. A completion
     /// returns to the same pool its submission acquired from, so multi-queue
@@ -258,6 +258,23 @@ struct QueuePair {
     tx_qsize: u16,
     rx_notify_off: u16,
     tx_notify_off: u16,
+}
+
+impl QueuePair {
+    /// Caller holds this pair's queue lock followed by its buffer-table lock.
+    /// Reclaim only device-completed descriptors, returning their buffers to
+    /// this pair without allocating or waiting for outstanding DMA.
+    fn reclaim_tx(&self, q: &mut Virtqueue, bufs: &mut [Option<DmaBuffer>]) -> bool {
+        let mut freed_any = false;
+        while let Some((head, _)) = q.poll_used() {
+            q.free_chain(head as u16);
+            if let Some(buf) = bufs.get_mut(head as usize).and_then(Option::take) {
+                self.tx_pool.release(buf);
+            }
+            freed_any = true;
+        }
+        freed_any
+    }
 }
 
 /// Cap on each queue pair's recycled TX DMA-buffer free-list. A 64 KiB GSO
@@ -688,13 +705,7 @@ impl VirtioNetPci {
         let want_status = feats & (1u64 << VIRTIO_NET_F_STATUS) != 0;
         let want_mtu = feats & (1u64 << VIRTIO_NET_F_MTU) != 0;
         let want_csum = feats & (1u64 << VIRTIO_NET_F_CSUM) != 0;
-        // HOST_TSO4 is deliberately not negotiated (#703): since 49e47f4c3
-        // enabled it, every net-smoke bulk TCP echo wedges after
-        // ~110-200 KB and never recovers. CSUM alone is the configuration
-        // that passed net-smoke 15/15 before that commit. Re-enable only
-        // once #704 root-causes the TSO transmit wedge. The device offer
-        // this replaces: want_csum && feats & (1 << VIRTIO_NET_F_HOST_TSO4).
-        let want_tso4 = false;
+        let want_tso4 = want_csum && feats & (1u64 << VIRTIO_NET_F_HOST_TSO4) != 0;
         let want_ctrl_vq = feats & (1u64 << VIRTIO_NET_F_CTRL_VQ) != 0;
         // F_MQ requires F_CTRL_VQ (we can only command the device to
         // enable a pair count through the control queue). Reject MQ
@@ -1207,7 +1218,16 @@ impl VirtioNetPci {
     /// `None` for backpressure. Pairs with `tx_buf_release_on`; never
     /// allocates in the packet path.
     fn tx_buf_acquire_on(&self, pair_idx: usize) -> Option<DmaBuffer> {
-        self.pairs.get(pair_idx)?.tx_pool.try_acquire()
+        let pair = self.pairs.get(pair_idx)?;
+        pair.tx_pool.try_acquire().or_else(|| {
+            // Reclaim before requiring another buffer: once the fixed pool
+            // empties, submit-time reclaim is otherwise unreachable (#704).
+            let mut queue = pair.tx_queue.lock();
+            let q = queue.as_mut()?;
+            let mut bufs = pair.tx_buffers.lock();
+            pair.reclaim_tx(q, &mut bufs);
+            pair.tx_pool.try_acquire()
+        })
     }
 
     /// Return a completed TX DMA buffer to its submitting queue's recycler, or
@@ -1354,14 +1374,7 @@ impl VirtioNetPci {
             // Lazy completion reclaim: drain every TX the device has finished
             // since the last transmit. A descriptor can be reused only after
             // its paired DMA buffer has been returned to this queue's pool.
-            while let Some((done_head, _)) = q.poll_used() {
-                q.free_chain(done_head as u16);
-                if let Some(slot) = bufs.get_mut(done_head as usize) {
-                    if let Some(done_buf) = slot.take() {
-                        self.tx_buf_release_on(pair_idx, done_buf);
-                    }
-                }
-            }
+            pair.reclaim_tx(q, &mut bufs);
 
             let head = match submit(q) {
                 Some(h) => h,
@@ -1372,17 +1385,7 @@ impl VirtioNetPci {
                     // work, no unbounded sync wait.
                     let mut retried = None;
                     for _ in 0..8 {
-                        let mut freed_any = false;
-                        while let Some((done_head, _)) = q.poll_used() {
-                            q.free_chain(done_head as u16);
-                            if let Some(slot) = bufs.get_mut(done_head as usize) {
-                                if let Some(b) = slot.take() {
-                                    self.tx_buf_release_on(pair_idx, b);
-                                }
-                            }
-                            freed_any = true;
-                        }
-                        if !freed_any {
+                        if !pair.reclaim_tx(q, &mut bufs) {
                             break;
                         }
                         if let Some(h) = submit(q) {
@@ -1406,12 +1409,13 @@ impl VirtioNetPci {
             // another sender can reclaim the descriptor.
             bufs[head as usize] = Some(buf);
             // `TxMeta::more` is Linux's xmit_more hint: defer the expensive
-            // notify VM-exit until the ordered burst ends, but force it before
-            // the descriptor ring fills so a preempted producer cannot leave
-            // unpublished work behind its own backpressure. Once a flush is
-            // required, `needs_kick` remains the virtio EVENT_IDX authority.
+            // notify VM-exit until the ordered burst ends. Flush at either
+            // descriptor or buffer exhaustion: the 32-buffer pool can empty
+            // well before the 128-entry ring fills, preventing a later frame
+            // from delivering the burst's final notify (#704). Once a flush
+            // is required, `needs_kick` remains the EVENT_IDX authority.
             let ring_full = q.diagnostic_snapshot().3 == 0;
-            if !meta.more || ring_full {
+            if !meta.more || ring_full || pair.tx_pool.available() == 0 {
                 q.needs_kick() || (TX_ALWAYS_KICK.load(Ordering::Relaxed) && !meta.more)
             } else {
                 false
@@ -2493,4 +2497,233 @@ pub fn with_at<R>(idx: usize, f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
     // CONTROLLERS doc comment).
     let ctrl = CONTROLLERS.lock().get(idx).cloned();
     ctrl.as_deref().map(f)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod tx_tests {
+    use super::*;
+    use crate::queue::VirtqUsedElem;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    const QSIZE: u16 = 128;
+    const FRAME_LEN: usize = 54 + 8192;
+
+    // Real driver queues and DMA ownership, with RAM in place of the notify
+    // register. The fake device completes only when the test tells it to, so
+    // pool exhaustion and delayed completion do not depend on QEMU timing.
+    struct TxFixture {
+        dev: VirtioNetPci,
+        _registers: DmaBuffer,
+        layouts: Vec<VirtqueueLayout>,
+    }
+
+    impl TxFixture {
+        fn new() -> Result<Self, &'static str> {
+            let registers =
+                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "register page")?;
+            let region = || VirtioRegion {
+                region: narf_bus::MmioRegion {
+                    phys: registers.phys_addr(),
+                    virt: registers.cpu_ptr::<u8>() as u64,
+                    len: 4096,
+                    kind: narf_bus::BarKind::Mmio32 {
+                        prefetchable: false,
+                    },
+                },
+                virt: registers.cpu_ptr::<u8>() as u64,
+                offset: 0,
+                length: 4096,
+            };
+            let mut pairs = Vec::new();
+            let mut layouts = Vec::new();
+            for n in 0..2 {
+                let rx = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "RX ring page")?;
+                let tx = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "TX ring page")?;
+                let layout =
+                    VirtqueueLayout::new(QSIZE, tx.phys_addr().raw()).ok_or("TX layout")?;
+                // SAFETY: tx owns a coherent page containing this entire layout.
+                let mut queue = unsafe { Virtqueue::new(layout) };
+                queue.set_event_idx(true);
+                let pool = Arc::new(DmaPool::new(TX_BUF_LEN, DomainId::DRIVER_0, TX_POOL_CAP));
+                if pool.prefill(TX_POOL_CAP) != TX_POOL_CAP {
+                    return Err("TX pool prefill");
+                }
+                pairs.push(QueuePair {
+                    rx_qidx: 2 * n,
+                    tx_qidx: 2 * n + 1,
+                    rx_queue: IrqSafeSpinLock::new(None),
+                    tx_queue: IrqSafeSpinLock::new(Some(queue)),
+                    rx_buffers: IrqSafeSpinLock::new(Vec::new()),
+                    tx_buffers: IrqSafeSpinLock::new((0..QSIZE).map(|_| None).collect()),
+                    tx_pool: pool,
+                    rx_pool: DmaPool::new(4096, DomainId::DRIVER_0, 0),
+                    _rx_q_buf: rx,
+                    _tx_q_buf: tx,
+                    rx_qsize: 0,
+                    tx_qsize: QSIZE,
+                    rx_notify_off: 2 * n,
+                    tx_notify_off: 2 * n + 1,
+                });
+                layouts.push(layout);
+            }
+            let dev = VirtioNetPci {
+                common: region(),
+                notify: region(),
+                device_cfg: None,
+                notify_off_multiplier: 2,
+                pairs,
+                tx_rr: AtomicU64::new(0),
+                irq_vector: None,
+                rx_irq_vectors: Vec::new(),
+                flow_affine: false,
+                tx_irq_vector: None,
+                msix: None,
+                ready: true,
+                mac: IrqSafeSpinLock::new([0; 6]),
+                has_ctrl_mac_addr: false,
+                mtu: 1500,
+                has_status: false,
+                tx_checksum: true,
+                tx_tso4: true,
+                ctrl_qidx: 4,
+                ctrl: None,
+                cfg_phys: 0,
+            };
+            Ok(Self {
+                dev,
+                _registers: registers,
+                layouts,
+            })
+        }
+
+        fn submit(&self, pair: usize, more: bool) -> Result<(), &'static str> {
+            let mut buf = self.dev.tx_buf_acquire_on(pair).ok_or("TX pool starved")?;
+            let frame = &mut buf.as_mut_slice()[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + FRAME_LEN];
+            frame.fill(0);
+            frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            frame[14] = 0x45;
+            frame[16..18].copy_from_slice(&((FRAME_LEN - 14) as u16).to_be_bytes());
+            frame[23] = 6;
+            frame[46] = 5 << 4;
+            frame[47] = 0x18;
+            self.dev
+                .tx_dma_on_with_meta(
+                    pair,
+                    buf,
+                    FRAME_LEN as u32,
+                    narf_net::TxMeta::with_tso(1024).with_more(more),
+                )
+                .map_err(|_| "TSO submit rejected")
+        }
+
+        fn complete(&self, pair: usize) -> Result<(), &'static str> {
+            let layout = self.layouts[pair];
+            let avail = narf_memory::PhysAddr::new(layout.avail_ring).kernel_ptr::<u16>();
+            let used = narf_memory::PhysAddr::new(layout.used_ring).kernel_mut_ptr::<u16>();
+            let descs = narf_memory::PhysAddr::new(layout.desc_table).kernel_ptr::<VirtqDesc>();
+            let buffers = self.dev.pairs[pair].tx_buffers.lock();
+            // SAFETY: the fixture exclusively owns these aligned ring pages;
+            // every index is masked to QSIZE, and no real device accesses them.
+            unsafe {
+                let end = core::ptr::read_volatile(avail.add(1));
+                let mut idx = core::ptr::read_volatile(used.add(1));
+                while idx != end {
+                    let slot = usize::from(idx % QSIZE);
+                    let head = core::ptr::read_volatile(avail.add(2 + slot));
+                    let desc = core::ptr::read_volatile(descs.add(usize::from(head)));
+                    let buf = buffers[usize::from(head)]
+                        .as_ref()
+                        .ok_or("missing TX owner")?;
+                    if desc.addr != buf.dma_addr().raw()
+                        || desc.len as usize != VIRTIO_NET_HDR_LEN + FRAME_LEN
+                        || desc.flags != 0
+                        || buf.as_slice()[..2] != [1, 1]
+                    {
+                        return Err("TSO descriptor/header ownership mismatch");
+                    }
+                    core::ptr::write_volatile(
+                        used.add(2 + slot * 4).cast::<VirtqUsedElem>(),
+                        VirtqUsedElem {
+                            id: u32::from(head),
+                            len: 0,
+                        },
+                    );
+                    idx = idx.wrapping_add(1);
+                }
+                crate::queue::virtio_wmb();
+                core::ptr::write_volatile(used.add(1), end);
+            }
+            Ok(())
+        }
+    }
+
+    fn smoke_virtio_net_tso_burst_recovers_exhausted_pool() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let fixture = TxFixture::new()?;
+            for pair in 0..2 {
+                for _ in 0..3 {
+                    for i in 0..TX_POOL_CAP {
+                        fixture.submit(pair, i + 1 < TX_POOL_CAP)?;
+                    }
+                    if fixture.dev.tx_buf_acquire_on(pair).is_some() {
+                        return Err("uncompleted DMA buffer was reused");
+                    }
+                    fixture.complete(pair)?;
+                    let buf = fixture
+                        .dev
+                        .tx_buf_acquire_on(pair)
+                        .ok_or("completed pool stayed empty")?;
+                    let p = &fixture.dev.pairs[pair];
+                    if p.tx_pool.available() != TX_POOL_CAP - 1
+                        || p.tx_buffers.lock().iter().any(Option::is_some)
+                        || p.tx_queue.lock().as_ref().unwrap().diagnostic_snapshot().3 != QSIZE
+                        || fixture.dev.pairs[1 - pair].tx_pool.available() != TX_POOL_CAP
+                    {
+                        return Err("TSO burst leaked buffers/descriptors or crossed queue pools");
+                    }
+                    fixture.dev.tx_buf_release_on(pair, buf);
+                }
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_tso_burst_recovers_exhausted_pool
+    );
+
+    fn smoke_virtio_net_tso_more_flushes_at_pool_limit() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let fixture = TxFixture::new()?;
+            // SAFETY: RAM-backed notify register, owned by this fixture.
+            unsafe {
+                fixture.dev.notify.write16(2, u16::MAX);
+            }
+            for _ in 0..TX_POOL_CAP - 1 {
+                fixture.submit(0, true)?;
+            }
+            // SAFETY: same RAM-backed notify register.
+            if unsafe { fixture.dev.notify.read16(2) } != u16::MAX {
+                return Err("TSO more hint was not batched");
+            }
+            fixture.submit(0, true)?;
+            // SAFETY: same RAM-backed notify register.
+            if unsafe { fixture.dev.notify.read16(2) } != 1 {
+                return Err("TX pool exhausted without flushing a deferred TSO burst");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_tso_more_flushes_at_pool_limit
+    );
 }

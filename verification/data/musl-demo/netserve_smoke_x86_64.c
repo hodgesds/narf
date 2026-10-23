@@ -1197,9 +1197,13 @@ static int r_bigio(void) {
         eagains++;
         q = r_outq(s);
         if (q > max_outq) max_outq = q;
-        if (q <= 0) return failf("bigio: EAGAIN but SIOCOUTQ empty", (unsigned long)q, off);
+        // ACK processing can drain the queue between write's EAGAIN and this
+        // ioctl, especially with TSO. Zero is a valid later snapshot; poll
+        // must then report writable immediately. Require a positive backlog
+        // somewhere in the run below, rather than at every racy observation.
+        if (q < 0) return failf("bigio: SIOCOUTQ failed", (unsigned long)q, off);
         struct pollfd p = {.fd = s, .events = POLLOUT};
-        if (poll(&p, 1, 20000) != 1) return failf("bigio 4 POLLOUT never came", off, 0);
+        if (poll(&p, 1, 20000) != 1 || !(p.revents & POLLOUT)) return failf("bigio 4 POLLOUT never came", off, 0);
     }
     for (int i = 0; i < 200 && (q = r_outq(s)) != 0; i++) r_sleep_ms(25);
     if (q != 0) return failf("bigio: SIOCOUTQ never drained to 0", (unsigned long)q, 0);
@@ -1210,6 +1214,7 @@ static int r_bigio(void) {
              eagains, partial, max_outq);
     w(m);
     if (eagains == 0) return failf("bigio: SO_SNDBUF 32K never filled", 0, 0);
+    if (max_outq == 0) return failf("bigio: SIOCOUTQ never observed queued bytes", 0, 0);
     // Linux queues while sk_wmem_queued < sk_sndbuf: at most the doubled
     // SO_SNDBUF plus the one write that crossed it.
     if (max_outq > 2 * sb + (256 << 10)) return failf("bigio: send queue exceeded SO_SNDBUF", (unsigned long)max_outq, 2 * sb);
