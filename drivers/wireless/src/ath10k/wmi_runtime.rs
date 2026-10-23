@@ -7,8 +7,13 @@ use crate::ath10k::{
     wmi_boot::{self, Dialect, HostMemory},
 };
 use alloc::{collections::VecDeque, vec::Vec};
+#[path = "wmi_runtime/management.rs"]
+pub(super) mod management;
 #[path = "wmi_runtime/wire.rs"]
 mod wire;
+pub use management::{
+    Completion as ManagementCompletion, Receipt as ManagementReceipt, Token as ManagementToken,
+};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Htt(htt::Error),
@@ -67,6 +72,7 @@ pub struct ScanReady {
 #[derive(Debug)]
 pub(super) struct Radio<T> {
     scan_cache: Vec<ScanBss>,
+    management_done: VecDeque<ManagementCompletion>,
     peer: Option<station::Peer>,
     pub htt: htt::Runtime<T>,
     wire: wire::Wire,
@@ -85,6 +91,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             features,
             ready: None,
             scan_cache: Vec::new(),
+            management_done: VecDeque::new(),
             peer: None,
             channels: Vec::new(),
             sequence: 0,

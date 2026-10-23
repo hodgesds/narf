@@ -1,6 +1,6 @@
 # rtlwifi — Specification
 
-> Status: PCI/EFUSE identity plus retained RTL8188EE paged firmware lifecycle;
+> Status: PCI/EFUSE identity, retained RTL8188EE paged firmware and inactive native rings;
 > native packet/RF/station software remains incomplete.
 
 ## 1. Purpose & scope
@@ -80,8 +80,33 @@ Failed(error). The bounded attempt is self-driven/async, holds no IRQ-disabling
 guard across await, and never invokes block_on in a spawned task. Cancellation,
 timeout or write/checksum/start failure prevents retry and performs no cleanup
 I/O. Ready means a running firmware CPU, with packet DMA/IRQ/station admission
-still closed. It does not initialize LLT/native rings, dispatch H2C/C2H or
-advertise HT/VHT support. The diagnostic network interface remains down.
+still closed. The one-shot native continuation below does not dispatch
+H2C/C2H or advertise HT/VHT support. The diagnostic interface remains down.
+
+`prepare::Prepared<I, M>` is the RTL8188EE-only inactive descriptor/LLT owner.
+It validates DMA32 full extents, alignment and overlap before MMIO, constructs
+seven distinct linked 64-byte TX rings (DW10 next pointers, all OWN clear),
+one 32-byte RX ring and separately retained 4096-byte RX buffers (DW6 address,
+OWN/EOR). Exact Linux `_rtl88ee_llt_table_init` uses boundary0xab/max-page0xaf;
+all seven queue bases and RX base use the 8188EE register map. No 8192EE TXBD
+count registers or aliased queue bases are used. BME stays off, PCIe DMA byte
+0x301 stays0xff, CR packet gates and both interrupt masks remain closed.
+
+The private `prepare_native` adapter claims one non-cloneable `PacketIo` from
+the exact successful firmware owner. Failed allocation, cancellation and Drop
+never reopen that claim. Every actual allocation/register access uses current
+PCI authority and verifies parked bus mastering; unsupported per-domain IOMMU
+mode is rejected. The controller and diagnostic interface share an async
+mutex that retains the complete native owner before its first base write.
+`RtlwifiDevice::native_preparation_status()` reports its Allocated/Prepared/
+terminal Failed state; None covers unallocated state (including allocation
+failure) or initialization holding the async guard. Cancellation installs Failed before awaiting LLT. Published mappings
+are retained on every error/Drop until a future reset/quiescence proof; no
+firmware/reset helper may reconstruct a second packet owner.
+
+`initialize_registered` now composes authenticated firmware boot with that
+retained inactive preparation in the real probe worker. Ready firmware plus
+Prepared rings remains below RF/BB/calibration and active packet admission.
 
 ## 4. Invariants
 
@@ -101,7 +126,8 @@ The scheduler's responsive wait supplies bounded EFUSE completion/settling.
 
 ## 7. Stage assignment
 
-Factory identity and RTL8188EE CPU firmware lifecycle are software covered.
+Factory identity, RTL8188EE CPU firmware and inactive LLT/linked-ring
+preparation are software covered.
 Complete station software and physical
 board qualification remain required.
 
@@ -112,7 +138,7 @@ board qualification remain required.
 | Correct BAR2/read-only EFUSE lifecycle and per-chip identity | Implemented; shared-path regressions |
 | Complete source-matched per-chip power/reset qualification | RTL8188EE PCI enable prefix/flow implemented; other families remain incomplete |
 | Authenticated image/header selection and runtime firmware loading | RTL8188EE retained probe owner implemented; other profiles missing |
-| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | Missing |
+| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE DMA32 inactive linked rings/LLT and retained publication implemented; active DMA, quiesce/recovery, IRQ and H2C/C2H missing |
 | RF/BB tables, calibration, channel/power and rate control | Missing |
 | Scan, management RX/TX, authentication/association and WPA2 | Missing |
 | Ethernet packet path and terminal TX completion ownership | Missing |

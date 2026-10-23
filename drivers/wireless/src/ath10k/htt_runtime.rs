@@ -79,6 +79,12 @@ pub(super) struct DmaConfig {
 /// Returned addresses must already be retained by the physical transport's
 /// mission-mode DMA owner; cancelled setup never returns them to an allocator.
 pub(super) trait HttMemory {
+    fn prepare_wmi_management(&mut self, _bytes: &[u8]) -> Result<(u32, u64), Error> {
+        Err(Error::Unsupported)
+    }
+    fn complete_wmi_management(&mut self, _ids: &[u32]) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn retain_htt_memory(&mut self, config: Config) -> Result<DmaConfig, Error>;
     fn prepare_htt_tx(
         &mut self,

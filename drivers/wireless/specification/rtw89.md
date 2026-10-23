@@ -130,6 +130,20 @@ it publishes no system-memory rings. Failure or cancellation retains
 Configuring and refuses replay. PCIe quirks/BDRAM, CH12 DMA and WCPU composition
 remain necessary before this private primitive can be activated.
 
+The private `phy_access::Access` and its `NativeIo` adapter serialize AX PCIe
+PHY transactions: A/B/51 MDIO uses the exact Gen1/Gen2 page and five-bit
+register selection, while C uses aligned direct RAC words. Explicit DBI byte
+fallback is supported only on A/B/51; the future PCI configuration owner must
+choose it after a failed primary configuration transaction. Idle checks reject
+unknown controller requests before data/address publication. Bounded async
+completion, capability-checked widths/extents, and a retained terminal state
+prevent failure or cancellation from reopening the same owner. Replacement
+requires an independently verified reset. Extracted Linux C traces cover
+MDIO read/write/masked writes and DBI byte enables; actual-capability RAM
+fixtures check native RAC offsets and revoked access before dereference.
+These access prerequisites leave PCIe quirks/calibration, BDRAM, complete
+startup composition and packet/station ownership open.
+
 `efuse::read_mac(registers, ChipId, cut)` runs the AX DDV read lifecycle and
 decodes the two-byte sparse records. All four AX profiles use a 1216-byte
 physical map with four-byte security prefixes/tails. Logical size is 1536 on

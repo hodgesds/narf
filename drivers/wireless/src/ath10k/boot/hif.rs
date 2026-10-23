@@ -23,6 +23,7 @@ pub(super) struct Runtime<B> {
     pub pipes: Vec<Pipe<B>>,
     pub received: VecDeque<(u8, Vec<u8>)>,
     pub wmi_memory: Option<Vec<B>>,
+    pub management_memory: Option<crate::ath10k::wmi_runtime::management::Pool<B>>,
     pub htt_memory: Option<crate::ath10k::htt_runtime::storage::Storage<B>>,
 }
 impl<B: Memory> Runtime<B> {
@@ -67,6 +68,7 @@ impl<B: Memory> Runtime<B> {
             pipes,
             received: VecDeque::new(),
             wmi_memory: None,
+            management_memory: None,
             htt_memory: None,
         })
     }

@@ -74,6 +74,7 @@ pub mod mac;
 pub mod mac_init;
 pub mod pci;
 pub mod phy;
+mod phy_access;
 pub mod phy_table;
 mod power;
 mod power_native;

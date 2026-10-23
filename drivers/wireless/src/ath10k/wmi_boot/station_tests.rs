@@ -6,14 +6,16 @@ pub(super) struct StationFixture {
     pub stall: Option<u8>,
     pub status: u32,
     pub bad_map: bool,
+    pub wrong_start: usize,
 }
 impl StationFixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             phase: 0,
             stall: None,
             status: 0,
             bad_map: false,
+            wrong_start: 1,
         }
     }
 }
@@ -72,7 +74,9 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
     }
     if phase == 2 {
         let status = m.station.as_ref().unwrap().status;
-        for vdev in [1u32, 0] {
+        for vdev in core::iter::repeat_n(1u32, m.station.as_ref().unwrap().wrong_start)
+            .chain(core::iter::once(0))
+        {
             let mut body = Vec::new();
             for v in [vdev, 0, 0, status] {
                 body.extend_from_slice(&v.to_le_bytes());
@@ -108,7 +112,7 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
     }
     Ok(())
 }
-fn policy() -> narf_wireless::reg::RegulatoryDomain {
+pub(super) fn policy() -> narf_wireless::reg::RegulatoryDomain {
     narf_wireless::reg::RegulatoryDomain {
         country_code: *b"US",
         rules: vec![narf_wireless::reg::RegRule {
@@ -427,4 +431,62 @@ fn smoke_ath10k_station_policy_power_and_overlapping_restrictions() -> TestResul
 kernel_test_in!(
     "drivers/wireless/ath10k/regulatory",
     smoke_ath10k_station_policy_power_and_overlapping_restrictions
+);
+
+fn smoke_ath10k_station_start_flood_yields_and_cancel_keeps_owner() -> TestResult {
+    use alloc::{sync::Arc, task::Wake};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    struct Counter(AtomicUsize);
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    for (version, dialect) in [(1, Dialect::Main), (4, Dialect::Tlv)] {
+        let mut r = scanned(version, dialect);
+        r.htt
+            .wmi
+            .htc
+            .transport
+            .station
+            .as_mut()
+            .unwrap()
+            .wrong_start = 32;
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let domain = policy();
+        {
+            let mut future =
+                core::pin::pin!(r.prepare_station(&domain, [2, 8, 9, 10, 11, 12], 2412));
+            for _ in 0..8 {
+                if future.as_mut().poll(&mut cx) != Poll::Pending {
+                    return TestResult::Fail("wrong-vdev START flood monopolized one poll");
+                }
+            }
+        }
+        let transport = &r.htt.wmi.htc.transport;
+        if counter.0.load(Ordering::Relaxed) < 8
+            || transport.station.as_ref().unwrap().phase != 3
+            || transport.inner.storage.is_none()
+            || r.prepared_peer().is_some()
+        {
+            return TestResult::Fail("START flood did not self-wake or lost retained owner");
+        }
+        let sent = transport.sent.len();
+        if drive(r.prepare_station(&domain, [2, 8, 9, 10, 11, 12], 2412))
+            != Poll::Ready(Err(radio::Error::Failed))
+            || r.htt.wmi.htc.transport.sent.len() != sent
+        {
+            return TestResult::Fail("cancelled START flood permitted further publication");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmi-runtime",
+    smoke_ath10k_station_start_flood_yields_and_cancel_keeps_owner
 );

@@ -246,7 +246,7 @@ impl Wire {
         })
     }
 }
-fn packet(id: u32, body: usize) -> Result<Vec<u8>, Error> {
+pub(super) fn packet(id: u32, body: usize) -> Result<Vec<u8>, Error> {
     let mut v = Vec::new();
     v.try_reserve_exact(4 + body).map_err(|_| Error::NoMemory)?;
     v.resize(4 + body, 0);
@@ -256,7 +256,7 @@ fn packet(id: u32, body: usize) -> Result<Vec<u8>, Error> {
 fn header(v: &mut [u8], tag: u16, len: u16) {
     put(v, 4, (u32::from(tag) << 16) | u32::from(len));
 }
-fn put(v: &mut [u8], at: usize, value: u32) {
+pub(super) fn put(v: &mut [u8], at: usize, value: u32) {
     v[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }
 pub(super) fn word(v: &[u8], at: usize) -> Result<u32, Error> {

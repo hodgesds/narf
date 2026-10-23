@@ -94,6 +94,9 @@ radio session now performs correlated passive scans across six dialects while
 servicing HTT completions. Station-context preparation now intersects immutable
 factory regulatory limits with authenticated host policy and an observed BSS,
 then waits for correlated vdev-start and sparse HTT peer-map completion.
+Initial Open authentication/association exchanges now use the actual dialect's
+inline WMI, retained referenced WMI or HTT management path, with peer-bound RX
+and bounded progress under unrelated-event floods.
 PFC events, security/decapsulation, remaining WMI MLME and station attachment
 remain software work.
 Ath9k programs AR9285 inactive PHY/PLL/RF INI, EEPROM modal and PDADC detector
@@ -113,7 +116,9 @@ management/data, authentication/association, RSNA and CCMP with Narf-Rings and
 synchronous packet progression; the exact terminal M4 receipt precedes key/port
 commit. Signed board curves and deployment policy are required for publication.
 Reset/rejoin generations, broader channels/rates and PMF remain software work.
-RTL8188EE has a retained native firmware worker; packet DMA/RF remain closed.
+RTL8188EE now carries a one-shot continuation from its exact firmware owner
+through LLT and distinct linked TX/RX ring preparation, retained before native
+publication. Active packet DMA, full MAC/BB/RF and IRQ operation remain closed.
 RTW89 has checked owned AX firmware selection, cold-power/DDV primitives and
 fuse-selected immutable header/section download plans with host blacklist
 enforcement. Power-off/normalization and DLE/HFC primitives now have Linux-C
@@ -123,6 +128,8 @@ now follows Linux reset, secure IDMEM and header/section progression and waits
 for initialized firmware; full PCIe/BDRAM/startup composition and station work
 remain. Its diagnostic probe retains unpublished storage without activating
 rings, IRQs or a NIC.
+Scoped native PCIe PHY/DBI operations now provide bounded MDIO/RAC access with
+retained failure/cancellation exclusion; complete PCIe/BDRAM startup remains.
 USB retains published address/configuration/control/bulk DMA, checks slot
 generations and implements explicit Stop/Set-Dequeue fencing for the supported
 bulk profile; halt/reset/replug and broader reclamation remain software work.
@@ -134,8 +141,8 @@ cannot be closed by physical testing alone. No physical device validation is
 part of the current software-only work.
 
 The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
-wireless, crypto and ARM RNG QEMU gates: x86_64 reports 1756 pass / 0 fail /
-10 skip; aarch64 reports 1058 pass / 0 fail / 3 skip.
+wireless, crypto and ARM RNG QEMU gates: x86_64 reports 1782 pass / 0 fail /
+10 skip; aarch64 reports 1084 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.

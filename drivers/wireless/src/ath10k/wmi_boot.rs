@@ -106,7 +106,7 @@ impl Capabilities {
     /// Firmware uses four low bits per32-bit word for the original map.
     /// Extended TLV services use32 bits; extended legacy services use the
     /// remaining28 bits. Length is bytes, matching Linux's SVCMAP macros.
-    fn service(&self, dialect: Dialect, id: usize) -> bool {
+    pub(super) fn service(&self, dialect: Dialect, id: usize) -> bool {
         let length = self.bitmap.len();
         let (index, bit) = if id < length {
             (id / 4, id % 4)

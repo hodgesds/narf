@@ -29,6 +29,23 @@ impl PciIo {
             registers,
         }
     }
+    pub(super) fn allocate_dma(&self, bytes: usize) -> Result<narf_io::DmaBuffer, Error> {
+        if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain {
+            return Err(Error::Unsupported);
+        }
+        // Current PCI authority and parked DMA are checked in the same
+        // invocation that allocates storage for this exact retained function.
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check(0, 1)?;
+            narf_io::alloc_coherent_masked(
+                bytes,
+                narf_lib::id::DomainId::DRIVER_0,
+                u64::from(u32::MAX),
+            )
+            .map_err(|_| Error::NoMemory)
+        })
+        .map_err(|_| Error::Access)?
+    }
     fn access<T>(&self, reg: u16, width: usize, operation: impl FnOnce() -> T) -> Result<T, Error> {
         // The PCI command check and actual MMIO execute in the same live
         // capability operation; returning a raw register handle is forbidden.

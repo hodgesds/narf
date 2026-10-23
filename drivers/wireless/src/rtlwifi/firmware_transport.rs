@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! RTL8188EE paged MMIO firmware owner; Linux rtlwifi/rtl8188ee/fw.c and efuse.c.
 //! PCI bus mastering remains parked. This does not install native packet rings.
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_firmware::FirmwareError;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -89,6 +89,7 @@ pub struct Owner<I: Io> {
     io: I,
     did: u16,
     started: AtomicBool,
+    native_claimed: AtomicBool,
     status: IrqSafeSpinLock<Status>,
 }
 impl<I: Io> core::fmt::Debug for Owner<I> {
@@ -97,6 +98,49 @@ impl<I: Io> core::fmt::Debug for Owner<I> {
             .field("device_id", &self.did)
             .field("status", &self.status())
             .finish_non_exhaustive()
+    }
+}
+/// Exclusive native continuation of the exact successful firmware owner.
+/// No Clone and no public constructor: a second owner cannot overwrite the
+/// ring bases or LLT while the first retains published device DMA.
+pub(super) struct PacketIo<I: Io>(Arc<Owner<I>>);
+impl<I: Io> core::fmt::Debug for PacketIo<I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Rtl8188eePacketIo")
+            .field("firmware", &self.0)
+            .finish_non_exhaustive()
+    }
+}
+impl<I: Io> PacketIo<I> {
+    pub(super) fn with_io<T>(
+        &self,
+        operation: impl FnOnce(&I) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if self.0.status().stage != Stage::Ready {
+            return Err(Error::Gate);
+        }
+        operation(&self.0.io)
+    }
+}
+#[async_trait::async_trait]
+impl<I: Io> Io for PacketIo<I> {
+    fn read8(&self, reg: u16) -> Result<u8, Error> {
+        self.with_io(|io| io.read8(reg))
+    }
+    fn read32(&self, reg: u16) -> Result<u32, Error> {
+        self.with_io(|io| io.read32(reg))
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), Error> {
+        self.with_io(|io| io.write8(reg, value))
+    }
+    fn write32(&self, reg: u16, value: u32) -> Result<(), Error> {
+        self.with_io(|io| io.write32(reg, value))
+    }
+    fn write_bytes(&self, reg: u16, bytes: &[u8]) -> Result<(), Error> {
+        self.with_io(|io| io.write_bytes(reg, bytes))
+    }
+    async fn delay_us(&self, micros: u64) {
+        self.0.io.delay_us(micros).await;
     }
 }
 struct Attempt<'a, I: Io>(&'a Owner<I>);
@@ -117,6 +161,7 @@ impl<I: Io> Owner<I> {
             io,
             did,
             started: AtomicBool::new(false),
+            native_claimed: AtomicBool::new(false),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
                 error: None,
@@ -125,6 +170,17 @@ impl<I: Io> Owner<I> {
     }
     pub fn status(&self) -> Status {
         *self.status.lock()
+    }
+    /// Claim at most one LLT/descriptor continuation after successful boot.
+    /// Failed allocation, cancellation, or Drop never reopens this claim.
+    pub(super) fn claim_packet_io(self: &Arc<Self>) -> Result<PacketIo<I>, Error> {
+        if self.status().stage != Stage::Ready {
+            return Err(Error::Gate);
+        }
+        self.native_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::AlreadyStarted)?;
+        Ok(PacketIo(self.clone()))
     }
     fn set(&self, stage: Stage, error: Option<Error>) {
         *self.status.lock() = Status { stage, error };

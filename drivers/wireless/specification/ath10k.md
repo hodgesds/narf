@@ -84,6 +84,20 @@ packet service are not yet attached.
   be scanned/replaced until owned teardown/reset is implemented. Any ambiguous
   command, cancellation, malformed map or failed response closes its owner
   while retaining DMA.
+- `pci::exchange_initial_management(frame)` exchanges initial unprotected
+  Open-System Authentication and then Association Request on that prepared
+  peer. Requests must use its BSSID and local station address; association
+  must name the cached SSID. Frames must have no DS/protection/fragment flags
+  and must carry complete bounded IEs. The installed
+  host policy must still match the programmed channel/power permission.
+  Matching RX is bound to the same native channel, TA/BSSID and local recipient;
+  failed status, malformed transport, timeout or dropped future closes the
+  retained radio. Each phase advances at most once. The returned raw peer
+  response is a transport prerequisite: WMI PEER_ASSOC/VDEV_UP, negotiated
+  capabilities, keys, data admission and a NIC remain software work.
+  Internal `ManagementReceipt` distinguishes inline submission (no terminal
+  air ACK fabricated), HTT packet IDs and referenced-WMI descriptor IDs;
+  `ManagementCompletion` keeps the actual firmware status with its ID.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
@@ -165,7 +179,7 @@ The four-low-bits-per-word service bitmap and dialect-specific extensions
 follow Linux's service mapping. Resource requests use the corresponding
 120/108/136/176/168-byte layouts; 10.4 peer caching and firmware PFC affect
 peer/active-peer/TID/MSDU counts. Optional bundled-management/TX-ACK-RSSI
-host capabilities are not advertised without handlers.
+host capabilities remain unadvertised in this initial station profile.
 
 The physical `HostMemory::retain_wmi_memory` adapter aligns each requested
 unit to four bytes, derives units from the same requested vdev/peer/active
@@ -218,6 +232,32 @@ all 65,536 EEPROM values and native WMI generators/packed channel structs for
 all six supported dialects. Composed tests traverse actual scan/cache, host
 policy, START status and HTT MAP/UNMAP; they cover cancellation after START
 publication, failed status, malformed/out-of-range map and retained DMA.
+
+Management TX follows Linux's actual dispatch. Firmware feature
+`HAS_WMI_MGMT_TX` or raw TLV service 76 chooses WMI; `MGMT_TX_BY_REF` then
+chooses the TLV referenced command. Legacy MAIN/10.x/10.4 use the native
+inline command. Without WMI management, target-major 2 uses the separate
+56-byte HTT management message and major 3 uses the normal HTT descriptor.
+Incompatible feature/dialect combinations remain unsupported before any
+payload allocation. The native mission owner retains each referenced-WMI
+payload before the command exposes its DMA address; a CE receipt never frees
+it. A complete matching WMI terminal event retires it. Single and bundled
+completion parsers handle repeated array tags, preserve the distinct status
+array, and validate the whole ID batch before freeing any payload. Descriptor
+IDs increase across slot reuse, so a late duplicate cannot free a new packet.
+Current authority is rechecked before preparation, publication and retirement;
+revocation/cancellation preserve the existing stop-protected DMA lifetime.
+Full local Linux C management generators produce command goldens, including
+padding and the 64-byte reference prefix. Composed runtime fixtures traverse
+scan/policy/START/MAP, all management dispatch choices, command credit receipts,
+terminal completion and native auth/association responses. They cover wrong
+recipients, changed policy, partial/duplicate terminal batches, invalid IDs,
+and cancellation after actual command publication and during response wait.
+Initial response, START-response and peer-map waits yield on every event
+iteration, including discarded management frames or wrong-vdev STARTs; a
+continuous event flood cannot monopolize one executor poll. Dropping those
+waits leaves the radio closed and DMA retained until the existing stop proof
+permits release.
 
 ## 4. Invariants
 

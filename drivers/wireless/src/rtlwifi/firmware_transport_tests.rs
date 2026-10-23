@@ -51,6 +51,9 @@ impl Io for Fake {
     fn read32(&self, reg: u16) -> Result<u32, Error> {
         let mut m = self.0.lock();
         m.ops.push(Op::Read(reg));
+        if reg == 0x1e0 {
+            m.regs[usize::from(reg) + 3] &= 0x3f;
+        }
         if reg == 0x80
             && m.regs[0x80] & 1 == 0
             && m.pages.iter().any(|p| !p.is_empty())
@@ -264,4 +267,108 @@ fn smoke_rtlwifi_8188ee_packet_gate_failure_prevents_firmware() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/fw",
     smoke_rtlwifi_8188ee_packet_gate_failure_prevents_firmware
+);
+
+fn smoke_rtl8188ee_native_claim_is_exact_ready_and_one_shot() -> TestResult {
+    let io = Fake::new();
+    let owner = Arc::new(Owner::new(io.clone(), super::super::regs::RTL_DEV_8188EE));
+    if !matches!(owner.claim_packet_io(), Err(Error::Gate)) || !io.0.lock().ops.is_empty() {
+        return TestResult::Fail("native packet continuation escaped firmware readiness");
+    }
+    narf_scheduler::block_on(owner.initialize(&image(17))).unwrap();
+    let packet = owner.claim_packet_io().unwrap();
+    let before = io.0.lock().ops.len();
+    if !matches!(owner.claim_packet_io(), Err(Error::AlreadyStarted))
+        || io.0.lock().ops.len() != before
+    {
+        return TestResult::Fail("a second native owner could replace retained descriptors");
+    }
+    packet.write8(0x301, 0xff).unwrap();
+    if io.0.lock().regs[0x301] != 0xff {
+        return TestResult::Fail("native continuation was not bound to actual firmware transport");
+    }
+    drop(packet);
+    let before = io.0.lock().ops.len();
+    if !matches!(owner.claim_packet_io(), Err(Error::AlreadyStarted))
+        || narf_scheduler::block_on(owner.initialize(&image(17))) != Err(Error::AlreadyStarted)
+        || io.0.lock().ops.len() != before
+    {
+        return TestResult::Fail("native Drop permitted ring overwrite or firmware reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8188ee_native_claim_is_exact_ready_and_one_shot
+);
+
+fn smoke_rtl8188ee_actual_firmware_to_retained_llt_rings() -> TestResult {
+    use super::super::prepare::{self, Memory, Prepared};
+    struct Block {
+        address: u64,
+        bytes: Vec<u8>,
+    }
+    // SAFETY: independent inert model storage; addresses are never sent to a
+    // physical device. The production outer owner governs publication/Drop.
+    unsafe impl Memory for Block {
+        fn address(&self) -> u64 {
+            self.address
+        }
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+        fn write32(&mut self, at: usize, value: u32) -> Result<(), prepare::Error> {
+            self.bytes
+                .get_mut(at..at + 4)
+                .ok_or(prepare::Error::Memory)?
+                .copy_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
+        fn sync(&self) {}
+    }
+    let io = Fake::new();
+    let owner = Arc::new(Owner::new(io.clone(), super::super::regs::RTL_DEV_8188EE));
+    narf_scheduler::block_on(owner.initialize(&image(17))).unwrap();
+    let port = owner.claim_packet_io().unwrap();
+    let mut address = 0x10000u64;
+    let mut prepared = Prepared::allocate(port, 4, |bytes| {
+        address = (address + 255) & !255;
+        let block = Block {
+            address,
+            bytes: vec![0xa5; bytes],
+        };
+        address += bytes as u64;
+        Ok(block)
+    })
+    .unwrap();
+    if narf_scheduler::block_on(prepared.prepare()) != Ok(())
+        || prepared.phase() != prepare::Phase::Prepared
+        || owner.status().stage != Stage::Ready
+    {
+        return TestResult::Fail(
+            "actual successful firmware did not feed retained LLT/native owner",
+        );
+    }
+    let m = io.0.lock();
+    let read_base = |reg: usize| u32::from_le_bytes(m.regs[reg..reg + 4].try_into().unwrap());
+    let mut bases = Vec::new();
+    for reg in [0x308, 0x310, 0x318, 0x320, 0x328, 0x330, 0x338, 0x340] {
+        let base = read_base(reg);
+        if base == 0 || bases.contains(&base) {
+            return TestResult::Fail("firmware continuation aliased native queue bases");
+        }
+        bases.push(base);
+    }
+    if m.regs[0x301] != 0xff
+        || m.regs[0x100] & 0xcf != 0
+        || read_base(0xb0) != 0
+        || read_base(0xb8) != 0
+    {
+        return TestResult::Fail("firmware/LLT composition opened DMA/MAC/IRQ prematurely");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8188ee_actual_firmware_to_retained_llt_rings
 );

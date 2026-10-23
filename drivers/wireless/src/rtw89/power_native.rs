@@ -15,6 +15,7 @@ pub struct NativeIo {
     chip: ChipId,
     cut: u8,
     ddv: crate::rtw89::ddv::Ddv,
+    phy: super::phy_access::Access,
 }
 impl NativeIo {
     /// # Safety
@@ -35,6 +36,7 @@ impl NativeIo {
             chip,
             cut,
             ddv: crate::rtw89::ddv::Ddv::default(),
+            phy: super::phy_access::Access::default(),
         })
     }
     fn checked<T>(
@@ -55,6 +57,63 @@ impl NativeIo {
             Ok(operation(&self.region, offset))
         })
         .map_err(|_| Error::Access)?
+    }
+    /// Serialized PCIe PHY/DBI access. A failed/cancelled transaction leaves
+    /// this native owner terminal for all PHY/DBI operations. An independent
+    /// verified device reset must precede a replacement NativeIo owner.
+    pub async fn read_phy(
+        &mut self,
+        generation: super::phy_access::Generation,
+        address: u8,
+    ) -> Result<u16, Error> {
+        let mut state = core::mem::replace(&mut self.phy, super::phy_access::Access::terminal());
+        let chip = self.chip;
+        let result = state.read_phy(self, chip, generation, address).await;
+        self.phy = state;
+        result
+    }
+    pub async fn write_phy(
+        &mut self,
+        generation: super::phy_access::Generation,
+        address: u8,
+        value: u16,
+    ) -> Result<(), Error> {
+        let mut state = core::mem::replace(&mut self.phy, super::phy_access::Access::terminal());
+        let chip = self.chip;
+        let result = state
+            .write_phy(self, chip, generation, address, value)
+            .await;
+        self.phy = state;
+        result
+    }
+    pub async fn modify_phy(
+        &mut self,
+        generation: super::phy_access::Generation,
+        address: u8,
+        mask: u16,
+        value: u16,
+    ) -> Result<(), Error> {
+        let mut state = core::mem::replace(&mut self.phy, super::phy_access::Access::terminal());
+        let chip = self.chip;
+        let result = state
+            .modify_phy(self, chip, generation, address, mask, value)
+            .await;
+        self.phy = state;
+        result
+    }
+    pub async fn read_dbi(&mut self, address: u16) -> Result<u8, Error> {
+        let mut state = core::mem::replace(&mut self.phy, super::phy_access::Access::terminal());
+        let chip = self.chip;
+        let result = state.read_dbi(self, chip, address).await;
+        self.phy = state;
+        result
+    }
+    pub async fn write_dbi(&mut self, address: u16, value: u8) -> Result<(), Error> {
+        let mut state = core::mem::replace(&mut self.phy, super::phy_access::Access::terminal());
+        let chip = self.chip;
+        let result = state.write_dbi(self, chip, address, value).await;
+        self.phy = state;
+        result
     }
     /// AX DDV physical bytes, including ECV0x5ea and secure selection0x5ec.
     /// Cancellation keeps DDV terminal and permanently refuses another read;
@@ -166,6 +225,7 @@ mod tests {
             chip: ChipId::Rtl8852B,
             cut: 0,
             ddv: crate::rtw89::ddv::Ddv::default(),
+            phy: super::super::phy_access::Access::default(),
         };
         if io.read8(0) != Ok(0xbb)
             || io.read16(0) != Ok(0xaabb)
@@ -212,3 +272,7 @@ mod tests {
         smoke_rtw89_native_power_authority_and_bounds
     );
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "phy_access/native_tests.rs"]
+mod phy_tests;

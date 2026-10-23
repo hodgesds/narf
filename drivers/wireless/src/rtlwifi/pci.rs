@@ -43,6 +43,7 @@ pub struct RtlwifiDevice {
     pub device_id: u16,
     /// One retained authenticated firmware attempt for the qualified 8188EE profile.
     pub(super) firmware: Option<Arc<FirmwareOwner<PciIo>>>,
+    pub(super) prepared: Option<Arc<super::prepare_native::Retained>>,
     pub link_up: AtomicBool,
     pub rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -56,6 +57,12 @@ impl RtlwifiDevice {
     /// Firmware-ready is diagnostic CPU readiness, never station readiness.
     pub fn firmware_status(&self) -> Option<super::firmware_transport::Status> {
         self.firmware.as_ref().map(|owner| owner.status())
+    }
+    /// Inactive descriptor/LLT readiness remains below RF and packet admission.
+    /// None covers unallocated state or async preparation holding its guard.
+    pub fn native_preparation_status(&self) -> Option<super::prepare::Phase> {
+        let prepared = self.prepared.as_ref()?.try_lock()?;
+        prepared.as_ref().map(|owner| owner.phase())
     }
 }
 
@@ -193,6 +200,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let mac = dev.mac;
     let did = dev.device_id;
     let firmware = dev.firmware.clone();
+    let prepared = dev.prepared.clone();
     *CONTROLLER.lock() = Some(dev);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -204,13 +212,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
 
     *IFNAME.lock() = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
-    if let Some(firmware) = firmware {
+    if let (Some(firmware), Some(prepared)) = (firmware, prepared) {
         // The retained controller/interface own this attempt before its first
         // register access. No IRQ-disabling guard survives into the task.
         narf_scheduler::spawn(async move {
-            if let Err(error) = firmware.initialize_registered().await {
+            if let Err(error) =
+                super::prepare_native::initialize_registered(firmware, prepared).await
+            {
                 use core::fmt::Write as _;
-                let _ = writeln!(narf_console::Writer, "rtlwifi-8188ee firmware: {:?}", error);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "rtlwifi-8188ee firmware/native preparation: {:?}",
+                    error
+                );
             }
         });
     }
@@ -220,7 +234,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// Park PCI DMA, map BAR2, apply the existing power table and read factory
 /// EFUSE identity with device IRQs masked. Retains the qualified 8188EE
 /// firmware owner; probe starts it asynchronously after publishing ownership.
-/// MAC/LLT/packet rings and station admission remain closed.
+/// Its one-shot continuation retains inactive LLT/native rings. Packet DMA,
+/// RF/BB, IRQ and station admission remain closed.
 ///
 /// # Safety
 /// Caller owns the device's PCI configuration and BARs exclusively.
@@ -277,12 +292,16 @@ pub unsafe fn bring_up(
     } else {
         None
     };
+    let prepared = firmware
+        .as_ref()
+        .map(|_| Arc::new(super::prepare_native::Retained::new(None)));
     let device_arc = Arc::new(RtlwifiDevice {
         bus_addr: device.addr,
         registers,
         mac,
         device_id: device.id.device,
         firmware: firmware.clone(),
+        prepared: prepared.clone(),
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(Some(rx_cons)),
         tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -295,6 +314,7 @@ pub unsafe fn bring_up(
         mac,
         device_id: device.id.device,
         firmware,
+        prepared,
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(None),
         tx_ring: IrqSafeSpinLock::new(None),

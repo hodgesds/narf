@@ -311,6 +311,34 @@ pub async fn prepare_station(
     result
 }
 
+/// Exchange the initial Open-System Authentication, then Association Request,
+/// over the retained native firmware/CE owner. The peer must already have been
+/// prepared from a completed scan under installed host policy. Returns the
+/// matching raw peer response; no firmware association, keys, NIC or controlled
+/// port is claimed by this transport prerequisite. Cancellation retains DMA
+/// and closes the radio until full reset.
+pub async fn exchange_initial_management(
+    frame: &[u8],
+) -> Result<alloc::vec::Vec<u8>, super::wmi_runtime::Error> {
+    let domain =
+        narf_wireless::reg::db::get_domain().ok_or(super::wmi_runtime::Error::Unsupported)?;
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    let result = owner
+        .radio
+        .exchange_initial_management(&domain, frame)
+        .await;
+    if let Some(controller) = CONTROLLER.lock().as_mut() {
+        controller.station_prepared = owner.radio.prepared_peer();
+        if let Err(error) = &result {
+            controller.station_error = Some(*error);
+        }
+    }
+    result
+}
+
 /// Human-readable driver name keyed on the matched `(vendor, device)`.
 /// Used as `PciMatch.name` + `BoundDriver.name`. Must be a `'static`
 /// string — the bus registry stores it by reference.

@@ -22,13 +22,14 @@
 //! 3. EFUSE read — per-byte LDO-switched access (`REG_EFUSE_CTRL` / `REG_EFUSE_TEST`).
 //! 4. Per-chip register-bank / MMIO-size constants.
 //! 5. TX descriptor layout (BE queue) + RX descriptor layout.
-//! 6. Retained RTL8188EE authenticated paged firmware owner; other parts remain diagnostic.
+//! 6. Retained RTL8188EE authenticated paged firmware and inactive linked-ring/LLT owner.
+//!    Other silicon profiles remain diagnostic.
 //!
 //! ## Deferred
 //!
-//! - Power-on / chip-reset sequence (power.rs follow-up).
+//! - Complete power/reset flows for silicon beyond RTL8188EE.
 //! - Firmware transport for the remaining legacy parts.
-//! - TX/RX ring initialisation and DMA setup.
+//! - Active DMA, complete MAC/BB/RF/calibration and station packet runtime.
 //! - MSI / INTx IRQ routing.
 //! - Bluetooth co-existence (8723AE/BE).
 //!
@@ -61,6 +62,8 @@ pub mod mac;
 pub mod pci;
 pub mod phy;
 pub mod power;
+pub mod prepare;
+mod prepare_native;
 pub mod regs;
 pub mod rf;
 pub mod rx;

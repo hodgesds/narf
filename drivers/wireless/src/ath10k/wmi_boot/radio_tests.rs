@@ -28,6 +28,11 @@ struct RadioModel {
     malformed: bool,
     default_channels: bool,
     station: Option<StationFixture>,
+    management: Option<ManagementFixture>,
+    management_memory: Option<radio::management::Pool<HttBuffer>>,
+    management_next: u64,
+    mismatch_rx: bool,
+    mismatched: u32,
 }
 impl HostMemory for RadioModel {
     fn retain_wmi_memory(&mut self, p: &[MemoryPlan]) -> Result<Vec<MemoryChunk>, Error> {
@@ -35,6 +40,29 @@ impl HostMemory for RadioModel {
     }
 }
 impl htt::HttMemory for RadioModel {
+    fn prepare_wmi_management(&mut self, bytes: &[u8]) -> Result<(u32, u64), htt::Error> {
+        if self.management_memory.is_none() {
+            self.management_memory = Some(radio::management::Pool::new()?);
+        }
+        let address = &mut self.management_next;
+        self.management_memory
+            .as_mut()
+            .unwrap()
+            .prepare(bytes, |size| {
+                let result = HttBuffer {
+                    bytes: vec![0xa5; size],
+                    address: *address,
+                };
+                *address += 4096;
+                Ok(result)
+            })
+    }
+    fn complete_wmi_management(&mut self, ids: &[u32]) -> Result<(), htt::Error> {
+        self.management_memory
+            .as_mut()
+            .ok_or(htt::Error::Memory)?
+            .complete(ids)
+    }
     fn retain_htt_memory(&mut self, c: htt::Config) -> Result<htt::DmaConfig, htt::Error> {
         self.inner.retain_htt_memory(c)
     }
@@ -132,12 +160,32 @@ fn management(model: &mut RadioModel, bad_ie: bool) {
 }
 impl Hif for RadioModel {
     async fn poll(&mut self, b: u64) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        if self.mismatch_rx && self.inner.inner.rx.is_empty() {
+            // Literal TLV management RX containing an otherwise valid Open
+            // Authentication response for a different local recipient.
+            let mut head = vec![0; 40];
+            u32at(&mut head, 0, 1);
+            u32at(&mut head, 4, 31);
+            u32at(&mut head, 16, 30);
+            let frame = [
+                0xb0, 0, 0, 0, 4, 3, 4, 5, 6, 7, 2, 8, 9, 10, 11, 12, 2, 8, 9, 10, 11, 12, 0, 0, 0,
+                0, 2, 0, 0, 0,
+            ];
+            let mut body = Vec::new();
+            item(&mut body, 44, &head);
+            item(&mut body, 17, &frame);
+            add_event(self, 0x7001, &body);
+            self.mismatched += 1;
+        }
         self.inner.poll(b).await
     }
     async fn receive(&mut self, b: u64) -> Result<(u8, Vec<u8>), BmiError> {
         self.inner.receive(b).await
     }
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        if pipe == 4 && self.management.is_some() {
+            return management_htt_send(self, bytes).await;
+        }
         if pipe != 3 || self.inner.storage.is_none() {
             return self.inner.send(pipe, bytes).await;
         }
@@ -150,6 +198,9 @@ impl Hif for RadioModel {
             return Err(BmiError::BadResponse);
         }
         self.sequence = self.sequence.wrapping_add(1);
+        if self.management.is_some() {
+            return management_send(self, bytes).await;
+        }
         if self.station.is_some() {
             return station_send(self, bytes).await;
         }
@@ -237,6 +288,17 @@ impl Hif for RadioModel {
     }
 }
 fn radio_boot(version: u32, dialect: Dialect) -> radio::Radio<RadioModel> {
+    radio_boot_features(version, dialect, 0)
+}
+fn radio_boot_features(version: u32, dialect: Dialect, features: u64) -> radio::Radio<RadioModel> {
+    radio_boot_options(version, dialect, features, 3)
+}
+fn radio_boot_options(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    major: u8,
+) -> radio::Radio<RadioModel> {
     let hardware = if dialect == Dialect::Tlv {
         HwRev::Qca6174
     } else if dialect == Dialect::TenFour {
@@ -252,8 +314,10 @@ fn radio_boot(version: u32, dialect: Dialect) -> radio::Radio<RadioModel> {
         1
     };
     let c = htt::Config::new(hardware, version, htt_version, 0).unwrap();
+    let mut inner = HttModel::new(dialect, c, hardware);
+    inner.version = major;
     let model = RadioModel {
-        inner: HttModel::new(dialect, c, hardware),
+        inner,
         phase: 0,
         sequence: 1,
         scan: 0,
@@ -263,6 +327,11 @@ fn radio_boot(version: u32, dialect: Dialect) -> radio::Radio<RadioModel> {
         malformed: false,
         default_channels: false,
         station: None,
+        management: None,
+        management_memory: None,
+        management_next: 0x900000,
+        mismatch_rx: false,
+        mismatched: 0,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));
@@ -270,7 +339,7 @@ fn radio_boot(version: u32, dialect: Dialect) -> radio::Radio<RadioModel> {
     assert!(matches!(once(wmi.start()), Poll::Ready(Ok(_))));
     let mut htt = htt::Runtime::new(wmi, c);
     assert!(matches!(once(htt.start()), Poll::Ready(Ok(_))));
-    radio::Radio::new(htt, dialect, 0)
+    radio::Radio::new(htt, dialect, features)
 }
 fn smoke_ath10k_composed_wmi_passive_scan_all_dialects() -> TestResult {
     for (version, dialect) in [
@@ -514,3 +583,7 @@ kernel_test_in!(
 #[path = "station_tests.rs"]
 mod station_tests;
 use station_tests::{station_send, StationFixture};
+
+#[path = "management_tests.rs"]
+mod management_tests;
+use management_tests::{management_htt_send, management_send, ManagementFixture};

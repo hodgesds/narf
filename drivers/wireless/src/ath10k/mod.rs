@@ -28,7 +28,9 @@
 //! Native HTT setup and retained RX/TX DMA follow WMI READY, then a retained
 //! vdev/passive-scan owner uses per-dialect WMI commands and management RX.
 //! Host/factory regulatory policy now reaches correlated station-vdev START
-//! and owned sparse peer MAPs. MLME/security, admission and recovery remain open.
+//! and owned sparse peer MAPs. Initial Open authentication/association frame
+//! transport now uses native WMI or HTT and correlated management RX. Firmware
+//! association/security, admission and recovery remain open.
 //! Older standalone codecs below are not the production activation path.
 //!
 //! ## Stage 0 (prior commit)

@@ -7,6 +7,37 @@ use crate::ath10k::{
     htt_runtime::{storage::Storage, Config, DmaConfig, Error, HttMemory},
 };
 impl HttMemory for PciBoot {
+    fn prepare_wmi_management(&mut self, bytes: &[u8]) -> Result<(u32, u64), Error> {
+        if !self.mmio.authorized() || self.poisoned || !self.hif_live {
+            return Err(Error::Memory);
+        }
+        let owner = self.hif.as_mut().ok_or(Error::Memory)?;
+        if owner.management_memory.is_none() {
+            owner.management_memory = Some(crate::ath10k::wmi_runtime::management::Pool::new()?);
+        }
+        // Physical mission owner owns the payload before publication. A dropped
+        // WMI send never frees it merely because its CE command was consumed.
+        let mmio = &self.mmio;
+        owner
+            .management_memory
+            .as_mut()
+            .unwrap()
+            .prepare_authorized(
+                bytes,
+                || mmio.authorized(),
+                |size| allocate(size).map_err(|_| Error::NoMemory),
+            )
+    }
+    fn complete_wmi_management(&mut self, ids: &[u32]) -> Result<(), Error> {
+        if !self.mmio.authorized() || self.poisoned || !self.hif_live {
+            return Err(Error::Memory);
+        }
+        self.hif
+            .as_mut()
+            .and_then(|h| h.management_memory.as_mut())
+            .ok_or(Error::Memory)?
+            .complete(ids)
+    }
     fn prepare_htt_tx(
         &mut self,
         config: Config,
