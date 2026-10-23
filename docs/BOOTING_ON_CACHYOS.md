@@ -305,6 +305,25 @@ The captured root was `btrfs / ... rw`, and diagnostic files were persisted;
 the service snapshot still had PlasmaLogin waiting. These corrections have
 not yet established a working hardware graphical login.
 
+The next capture (`plasma-cbd60c86-9b79-479e-a512-fe4a80eb0ea2`)
+completed `DmubStart`, including firmware version and feature-capability
+mailbox replies. Startup reached 30/31 checkpoints, exposed the framebuffer,
+and read a 256-byte HDMI EDID with a preferred 3840x2160 mode. VCN degraded
+with `BootFailed(0)` but no longer quarantined display startup. Native HDMI
+then failed at `Clocks` with `Block(Rejected(255))`; a working native mode
+and graphical login are still unverified.
+
+The DAL clock preparation now follows Linux's `dcn3_update_clocks`: it omits
+the separate SOC/FCLK floors and unused DF C-state command, retains strict
+DCF/UCLK/PIX/DISP floor validation, and tolerates firmware rejection of the
+optional display-count and deep-sleep hints. Transport failures still abort.
+Each rejected command logs its message, argument and response so another
+clock failure identifies the exact request rather than only `Rejected(255)`.
+The captured error predates that diagnostic and does not identify which
+of the old requests was refused. Register-model tests cover the corrected
+request sequence and refused optional notifications; they do not establish
+native hardware modesetting success.
+
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 
 ```sh

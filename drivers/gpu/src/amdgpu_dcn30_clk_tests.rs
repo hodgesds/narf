@@ -16,6 +16,7 @@ struct Fake {
     refuse: Option<u32>,
     stall: Option<u32>,
     underclock: bool,
+    display_only: bool,
     revoke: Option<Cap<BusDeviceCap, Write>>,
 }
 impl Io for Fake {
@@ -38,7 +39,18 @@ impl Io for Fake {
                 if self.stall == Some(value) {
                     return;
                 }
-                self.response = if self.refuse == Some(value) { 0xfd } else { 1 };
+                self.response = if self.display_only
+                    && (matches!(value, 0xd | 0xe | 0x10)
+                        || (value == 9 && matches!(self.arg >> 16, 1 | 3)))
+                {
+                    // PMFW can refuse optional notifications and the SOC/FCLK
+                    // floors that dcn3_update_clocks never requests.
+                    0xff
+                } else if self.refuse == Some(value) {
+                    0xfd
+                } else {
+                    1
+                };
                 if let Some(cap) = self.revoke {
                     cap.revoke();
                 }
@@ -53,7 +65,7 @@ impl Io for Fake {
                         .copied()
                         .unwrap_or(0),
                     HARD_MIN => (self.arg & 0xffff).saturating_sub(u32::from(self.underclock)),
-                    DEEP_SLEEP_MIN | DISPLAYS | DF_CSTATE_ALLOW => 0,
+                    DEEP_SLEEP_MIN | DISPLAYS | 0x10 => 0,
                     _ => panic!("non-DAL command"),
                 };
             }
@@ -111,6 +123,7 @@ fn engine() -> Engine<Fake> {
             refuse: None,
             stall: None,
             underclock: false,
+            display_only: false,
             revoke: None,
         },
     }
@@ -206,12 +219,9 @@ fn navi22_dal_pins_memory_before_programming_global_dividers() -> TestResult {
     if e.io.commands
         != [
             (14, 1),
-            (16, 0),
-            (9, 0x204b0),
-            (9, 0x304b0),
-            (9, 0x104b0),
             (9, 0x8012d),
             (13, 301),
+            (9, 0x204b0),
             (9, 0xa0095),
             (9, 0x90095),
         ]
@@ -237,6 +247,40 @@ fn navi22_dal_pins_memory_before_programming_global_dividers() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn30-clk",
     navi22_dal_pins_memory_before_programming_global_dividers
+);
+fn navi22_dal_uses_display_floors_and_tolerates_optional_refusals() -> TestResult {
+    let mut e = engine();
+    let levels = run(e.start(core::future::ready(Ok(())))).unwrap();
+    let plan = levels.plan(148_500, 148_500, 300_001).unwrap();
+    e.io.commands.clear();
+    e.io.display_only = true;
+    let mut sink = Sink::new();
+    if run(e.prepare(plan, &mut sink)).is_err()
+        || e.state != State::Configured
+        || e.applied != Some(plan)
+        || sink.programmed != Some((0x51, 0x51))
+    {
+        return TestResult::Fail("optional DAL refusal prevented native clocks");
+    }
+    // Linux dcn3_update_clocks: DCFCLK, deep-sleep hint, pinned UCLK,
+    // DPPCLK and DISPCLK; no separate SOC/FCLK floor or DF C-state message.
+    if e.io.commands
+        != [
+            (14, 1),
+            (9, 0x8012d),
+            (13, 301),
+            (9, 0x204b0),
+            (9, 0xa0095),
+            (9, 0x90095),
+        ]
+    {
+        return TestResult::Fail("non-DCN DAL requests or required floors omitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn30-clk",
+    navi22_dal_uses_display_floors_and_tolerates_optional_refusals
 );
 fn navi22_dal_bad_tables_rejection_and_revocation_fail_closed() -> TestResult {
     // dcn3_init_clocks tolerates a header/interface mismatch, a failed or

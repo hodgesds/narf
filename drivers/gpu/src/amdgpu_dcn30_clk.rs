@@ -24,7 +24,6 @@ const HARD_MIN: u32 = 9; // linux: DALSMC_MSG_SetHardMinByFreq
 const DPM_BY_INDEX: u32 = 0xb; // linux: DALSMC_MSG_GetDpmFreqByIndex
 const DEEP_SLEEP_MIN: u32 = 0xd; // linux: DALSMC_MSG_SetMinDeepSleepDcefclk
 const DISPLAYS: u32 = 0xe; // linux: DALSMC_MSG_NumOfDisplays
-const DF_CSTATE_ALLOW: u32 = 0x10; // linux: DALSMC_MSG_SetExternalClientDfCstateAllow
 /// `DALSMC_MSG_BacoAudioD3PME`.
 const BACO_AUDIO_D3_PME: u32 = 0x11; // linux: DALSMC_MSG_BacoAudioD3PME
                                      // linux: n/a (NARF table bound; Linux clk_table holds MAX_NUM_DPM_LVL = 8)
@@ -288,6 +287,11 @@ impl<I: Io> Engine<I> {
         let response = self.settled().await?;
         // linux-lit: 1=DALSMC_Result_OK
         if response != 1 {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 DAL message {msg:#x} argument {arg:#x} rejected {response:#x}"
+            );
             return Err(Error::Rejected(response));
         }
         let result = self.access(|io| io.read(ARGUMENT))?;
@@ -328,6 +332,12 @@ impl<I: Io> Engine<I> {
             Err(Error::Rejected(_)) => Ok(0),
             other => other,
         }
+    }
+    /// The void notifications in dcn3_update_clocks do not make a refused
+    /// display-count or deep-sleep hint a modeset failure. Transport errors
+    /// still fail; voltage/bandwidth floors continue to use strict `floor`.
+    async fn notify(&mut self, msg: u32, arg: u32) -> Result<(), Error> {
+        self.query_lenient(msg, arg).await.map(|_| ())
     }
     /// `dcn3_init_clocks`: only the SMU version query decides `smu_present`;
     /// the driver-interface and message-header checks are logged ("do we
@@ -403,15 +413,15 @@ impl<I: Io> Engine<I> {
         self.access(|io| io.idle())??;
         self.state = State::InFlight;
         let result = async {
-            // The first native path pins memory/fabric/SOC at their upper
-            // board states. It does not enable p-state switching or deep sleep.
-            self.command(DISPLAYS, 1).await?;
-            self.command(DF_CSTATE_ALLOW, 0).await?;
-            for clock in [Clock::Memory, Clock::Fabric, Clock::Soc] {
-                self.floor(clock, levels.range(clock).max_khz()).await?;
-            }
+            // dcn3_update_clocks: request only display-owned floors. DCN30
+            // admission uses DCFCLK as its fabric clock; Linux does not set
+            // separate SOC/FCLK floors or send the unused DF C-state message.
+            // Pin UCLK at the top board state to disable p-state switching.
+            self.notify(DISPLAYS, 1).await?;
             self.floor(Clock::Dcf, plan.dcf_khz).await?;
-            self.command(DEEP_SLEEP_MIN, plan.dcf_khz.div_ceil(1000))
+            self.notify(DEEP_SLEEP_MIN, plan.dcf_khz.div_ceil(1000))
+                .await?;
+            self.floor(Clock::Memory, levels.range(Clock::Memory).max_khz())
                 .await?;
             self.floor(Clock::Pixel, plan.pixel_khz).await?;
             self.floor(Clock::Display, plan.display_khz).await?;

@@ -7060,13 +7060,21 @@ BACO and gating remain excluded. Both owners retain in-flight state across
 cancellation and reject replay after incomplete or failed transitions.
 
 `start(smu)` reads the CLK02 PLL at dword `0x17010` and scalar DAL clock levels
-(including fine-grained min/max endpoints). It requires message-header version
-1 and records the driver-table version without assuming Sienna's table layout.
+(including fine-grained min/max endpoints). Only a successful firmware-version
+query establishes the SMU's presence; header/interface mismatches are recorded
+and rejected level queries produce empty ranges, as in `dcn3_init_clocks`.
+An unusable range is refused by the subsequent clock plan.
 `Levels::plan` rounds DISP/DPP requests to DENTIST frequencies within board
 limits; `ceiling` supplies their highest representable rates. `prepare(plan)`
-requires every stream idle, pins memory/fabric/SOC at their upper board states,
-sets the display count and DCF/PIX/DISP floors, checks firmware responses, then
-waits for DISP and DPP divider completion. No running stream changes clocks.
+requires every stream idle and follows `dcn3_update_clocks`: display-count
+notification, DCF floor, deep-sleep hint, UCLK pinned at its upper board state,
+then PIX/DISP floors and DISP/DPP divider completion. DCN30's bounding box uses
+DCFCLK as its fabric clock; separate SOC/FCLK floors and the unused DF C-state
+message are not sent. Refused display-count/deep-sleep notifications are logged
+without aborting the modeset, as with Linux's void notification wrappers;
+transport errors and rejected, inadequate or out-of-range required floors
+still fail before DENTIST programming. Rejection diagnostics retain the
+message, argument and firmware response. No running stream changes clocks.
 `pipe_clock` programs a DTO only after successful preparation. No default PLL,
 clock table, voltage or memory bandwidth is invented. A failed modeset leaves
 floors retained. GDDR6 mode math and the full native pipeline remain separate.
