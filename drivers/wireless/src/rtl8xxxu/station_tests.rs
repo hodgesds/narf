@@ -112,8 +112,19 @@ struct Link {
 }
 struct Ccm;
 impl narf_wireless::ccmp::AesCcm for Ccm {
-    fn encrypt(&self, k: &[u8; 16], n: &[u8; 13], a: &[u8], b: &mut [u8]) -> [u8; 8] {
-        narf_crypto::aes_ccm::seal(k, n, a, b).unwrap()
+    fn encrypt(
+        &self,
+        k: &[u8; 16],
+        n: &[u8; 13],
+        a: &[u8],
+        b: &mut [u8],
+    ) -> Result<[u8; 8], narf_wireless::ccmp::CcmpError> {
+        narf_crypto::aes_ccm::seal(k, n, a, b).map_err(|error| match error {
+            narf_crypto::aes_ccm::Error::Length => narf_wireless::ccmp::CcmpError::TooLong,
+            narf_crypto::aes_ccm::Error::Authentication => {
+                narf_wireless::ccmp::CcmpError::AuthFailed
+            }
+        })
     }
     fn decrypt(
         &self,
@@ -233,7 +244,8 @@ impl Io for Link {
                                 0,
                                 false,
                                 &mut plain,
-                            );
+                            )
+                            .unwrap();
                             reply.extend_from_slice(&wire);
                         } else {
                             reply.extend_from_slice(&body);

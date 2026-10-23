@@ -2498,8 +2498,8 @@ mod tests {
             _nonce: &[u8; crate::ccmp::CCMP_NONCE_LEN],
             _aad: &[u8],
             _plaintext: &mut [u8],
-        ) -> [u8; crate::ccmp::CCMP_MIC_LEN] {
-            [0u8; crate::ccmp::CCMP_MIC_LEN]
+        ) -> Result<[u8; crate::ccmp::CCMP_MIC_LEN], crate::ccmp::CcmpError> {
+            Ok([0u8; crate::ccmp::CCMP_MIC_LEN])
         }
         fn decrypt(
             &self,
@@ -2525,7 +2525,7 @@ mod tests {
         hdr[10..16].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
         let plaintext = [0xDEu8, 0xAD, 0xBE, 0xEF];
         let mut body = plaintext.to_vec();
-        let mut wire = protect(&StubCcm, &hdr, &key, 1, 0, 0, false, &mut body);
+        let mut wire = protect(&StubCcm, &hdr, &key, 1, 0, 0, false, &mut body).expect("protect");
         let mut replay = ReplayWindow::default();
         let recovered =
             unprotect(&StubCcm, &hdr, &key, 0, false, &mut replay, &mut wire).expect("unprotect");

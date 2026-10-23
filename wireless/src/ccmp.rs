@@ -61,6 +61,9 @@ pub const CCMP_NONCE_LEN: usize = 13;
 pub enum CcmpError {
     /// Frame body was too short to carry a CCMP header + MIC.
     TooShort,
+    /// Frame body exceeded the CCM message-length bound (the
+    /// two-octet length encoding caps a seal at 65535 bytes).
+    TooLong,
     /// CCMP header had ExtIV=0 (= TKIP / unencrypted, not CCMP).
     NotEncrypted,
     /// AES-CCM decryption rejected the MIC.
@@ -76,14 +79,16 @@ pub enum CcmpError {
 pub trait AesCcm {
     /// AES-128-CCM encrypt-and-tag.
     /// `nonce` is exactly `CCMP_NONCE_LEN` bytes; `tag` returned
-    /// is `CCMP_MIC_LEN` bytes.
+    /// is `CCMP_MIC_LEN` bytes. Fallible like `decrypt`: a backend
+    /// that refuses to seal (e.g. body beyond the CCM length
+    /// bound) returns `Err` and leaves `plaintext` unmodified.
     fn encrypt(
         &self,
         key: &[u8; 16],
         nonce: &[u8; CCMP_NONCE_LEN],
         aad: &[u8],
         plaintext: &mut [u8],
-    ) -> [u8; CCMP_MIC_LEN];
+    ) -> Result<[u8; CCMP_MIC_LEN], CcmpError>;
 
     /// AES-128-CCM decrypt-and-verify. Returns `Ok` if the tag
     /// matches; the ciphertext slice is mutated to plaintext on
@@ -238,6 +243,8 @@ impl ReplayWindow {
 /// - `body`: the plaintext frame body, mutated in-place to ciphertext.
 ///
 /// Returns the on-the-wire layout: `[ccmp_header || ciphertext || mic]`.
+/// A backend seal refusal propagates as `Err` (e.g. `CcmpError::TooLong`
+/// for a body beyond the CCM length bound) with `body` left unmodified.
 #[allow(clippy::too_many_arguments)] // CCMP requires all 8 protocol inputs; no natural grouping
 pub fn protect(
     aes: &dyn AesCcm,
@@ -248,16 +255,16 @@ pub fn protect(
     priority: u8,
     mgmt: bool,
     body: &mut [u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, CcmpError> {
     let hdr = build_ccmp_header(pn, key_id);
     let nonce = build_nonce(priority, mgmt, mac_header_a2(mac_header), pn);
     let aad = build_aad(mac_header);
-    let mic = aes.encrypt(key, &nonce, &aad, body);
+    let mic = aes.encrypt(key, &nonce, &aad, body)?;
     let mut out = Vec::with_capacity(CCMP_HDR_LEN + body.len() + CCMP_MIC_LEN);
     out.extend_from_slice(&hdr);
     out.extend_from_slice(body);
     out.extend_from_slice(&mic);
-    out
+    Ok(out)
 }
 
 /// Decrypt + verify an on-the-wire CCMP frame body. `protected` is

@@ -3,8 +3,17 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 struct Ccm;
 impl AesCcm for Ccm {
-    fn encrypt(&self, key: &[u8; 16], nonce: &[u8; 13], aad: &[u8], body: &mut [u8]) -> [u8; 8] {
-        narf_crypto::aes_ccm::seal(key, nonce, aad, body).expect("bounded fixture")
+    fn encrypt(
+        &self,
+        key: &[u8; 16],
+        nonce: &[u8; 13],
+        aad: &[u8],
+        body: &mut [u8],
+    ) -> Result<[u8; 8], CcmpError> {
+        narf_crypto::aes_ccm::seal(key, nonce, aad, body).map_err(|error| match error {
+            narf_crypto::aes_ccm::Error::Length => CcmpError::TooLong,
+            narf_crypto::aes_ccm::Error::Authentication => CcmpError::AuthFailed,
+        })
     }
     fn decrypt(
         &self,
@@ -84,7 +93,7 @@ fn smoke_ccmp_composed_independent_ciphertext_vector() -> TestResult {
     }
     let plain = body;
     let h = header();
-    let mut wire = protect(&Ccm, &h, &key, 0x010203040506, 2, 7, false, &mut body);
+    let mut wire = protect(&Ccm, &h, &key, 0x010203040506, 2, 7, false, &mut body).unwrap();
     if wire[..8] != [6, 5, 0, 0xa0, 4, 3, 2, 1] || wire[8..] != expected {
         return TestResult::Fail("independent CCMP ciphertext/header/MIC vector");
     }
@@ -106,7 +115,7 @@ fn smoke_ccmp_forged_high_pn_keeps_ciphertext_and_replay() -> TestResult {
     let key = [7; 16];
     let mut replay = ReplayWindow { last_seen_pn: 9 };
     let mut body = [0x42; 20];
-    let mut bad = protect(&Ccm, &h, &key, 0xabcdef, 0, 7, false, &mut body);
+    let mut bad = protect(&Ccm, &h, &key, 0xabcdef, 0, 7, false, &mut body).unwrap();
     *bad.last_mut().unwrap() ^= 1;
     let saved = bad.clone();
     if unprotect(&Ccm, &h, &key, 7, false, &mut replay, &mut bad) != Err(CcmpError::AuthFailed)
@@ -116,7 +125,7 @@ fn smoke_ccmp_forged_high_pn_keeps_ciphertext_and_replay() -> TestResult {
         return TestResult::Fail("forged MIC changed ciphertext or replay state");
     }
     let mut body = [0x42; 20];
-    let mut good = protect(&Ccm, &h, &key, 10, 0, 7, false, &mut body);
+    let mut good = protect(&Ccm, &h, &key, 10, 0, 7, false, &mut body).unwrap();
     let original = good.clone();
     if unprotect(&Ccm, &h, &key, 7, false, &mut replay, &mut good).is_err()
         || replay.last_seen_pn != 10
@@ -141,7 +150,7 @@ fn smoke_ccmp_muted_fields_do_not_break_authentication() -> TestResult {
     let h = header();
     let key = [3; 16];
     let mut body = [0x5a; 13];
-    let wire = protect(&Ccm, &h, &key, 1, 0, 7, false, &mut body);
+    let wire = protect(&Ccm, &h, &key, 1, 0, 7, false, &mut body).unwrap();
     let mut changed = h;
     changed[0] ^= 0x70;
     changed[1] ^= 0xb8;
@@ -184,3 +193,20 @@ kernel_test_in!(
     "wireless/ccmp",
     smoke_ccmp_muted_fields_do_not_break_authentication
 );
+
+fn smoke_ccmp_protect_propagates_seal_failure() -> TestResult {
+    // A body beyond the CCM two-octet length bound (65535) cannot
+    // seal. protect must surface the backend's refusal as a typed
+    // CcmpError and leave the body untouched — never panic.
+    let h = header();
+    let key = [7; 16];
+    let mut body = alloc::vec![0x42u8; 65_536];
+    let saved = body.clone();
+    if protect(&Ccm, &h, &key, 1, 0, 7, false, &mut body) != Err(CcmpError::TooLong)
+        || body != saved
+    {
+        return TestResult::Fail("oversized protect did not fail typed/untouched");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("wireless/ccmp", smoke_ccmp_protect_propagates_seal_failure);
