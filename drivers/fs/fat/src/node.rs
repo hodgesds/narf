@@ -49,6 +49,11 @@ pub struct FatNode<B: BlockDevice> {
     dcache_cluster: u32,
     pub state: IrqSafeSpinLock<FatNodeState>,
     pub entry_location: Option<(u64, usize)>, // (LBA, offset in sector)
+    /// This file's volume-anchored `MAP_SHARED` identity, resolved
+    /// once from the volume's anchor table (see
+    /// `FatVolume::mmap_anchor`). Every node minted for the same
+    /// directory entry shares the one anchor.
+    mmap_anchor: narf_lib::sync::OnceLock<Arc<crate::volume::MmapAnchor>>,
 }
 
 const DIR_ENTRY_SIZE: usize = 32;
@@ -292,6 +297,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
                 times,
             }),
             entry_location,
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
 
@@ -1008,6 +1014,25 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
     fn mmap_cache_generation(&self) -> Option<u64> {
         self.cache_generation()
     }
+
+    /// The shared-page cache key for this file: the volume anchor for
+    /// its directory-entry position (the btrfs construction), stable
+    /// across opens, so retained pages are keyed by the file and not
+    /// by whichever node object an open happened to mint. The root
+    /// has no directory entry to anchor to; it keeps the default
+    /// per-object identity, which is safe because it reports no cache
+    /// generation and never enters the retained set.
+    fn mmap_backing_identity(&self) -> usize {
+        match self.entry_location {
+            Some((lba, offset)) => {
+                let anchor = self
+                    .mmap_anchor
+                    .get_or_init(|| self.volume.mmap_anchor(lba, offset));
+                Arc::as_ptr(anchor) as usize
+            }
+            None => self as *const Self as *const () as usize,
+        }
+    }
 }
 
 impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
@@ -1171,6 +1196,13 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
             let lbs = self.volume.bpb.bytes_per_sec as usize;
             let sfn_lba = lba + (sfn_byte_offset / lbs) as u64;
             let sfn_off_in_sector = sfn_byte_offset % lbs;
+
+            // The slot has a new occupant: issue its instance
+            // generation before the file can be opened by anyone, so
+            // pages a previous tenant of this slot left in the shared
+            // page cache can never validate against the new file.
+            self.volume
+                .bump_cache_generation(sfn_lba, sfn_off_in_sector);
 
             Ok(Arc::new(FatNode::new(
                 self.volume.clone(),
@@ -1384,8 +1416,26 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
             slots.push(DirSlotWrite::Sfn(entry));
 
             let (new_lba, new_offset) = self.find_free_slots(slots.len() as u32).await?;
+            // The SFN slot is the last of the run; its position is
+            // the moved file's new generation/identity key.
+            let sfn_byte_offset = new_offset + (slots.len() - 1) * DIR_ENTRY_SIZE;
+            let lbs = self.volume.bpb.bytes_per_sec as usize;
+            let new_sfn_lba = new_lba + (sfn_byte_offset / lbs) as u64;
+            let new_sfn_offset = sfn_byte_offset % lbs;
             self.write_dir_slots(new_lba, new_offset, &slots).await?;
             self.tombstone_slot(old_lba, old_offset).await?;
+            // Occupant changes on both slots. The source slot is now
+            // vacant: pages the moved file retained under it must not
+            // validate against a later tenant, nor against the moved
+            // file's still-open nodes (which keep keying by the
+            // source slot) once the slot is reused. The destination
+            // slot's earlier history must not validate against the
+            // moved file. Both bumps are fail-safe in the spurious
+            // direction only: they can retire the moved file's own
+            // retained pages, never cross-serve another file's.
+            self.volume.bump_cache_generation(old_lba, old_offset);
+            self.volume
+                .bump_cache_generation(new_sfn_lba, new_sfn_offset);
             Ok(())
         })
     }

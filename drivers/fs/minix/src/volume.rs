@@ -89,11 +89,67 @@ pub struct MinixVolume<B: BlockDevice> {
     /// two opens of one file are two objects, and a write through one
     /// must invalidate pages retained through the other. Volume scope
     /// keyed by the inode number is the one place all opens share.
-    /// Entries start at 0 and only ever move forward; an inode number
-    /// recycled by free + realloc keeps counting up, so a new file can
-    /// never collide with a previous tenant's recorded generation by
-    /// going backwards.
-    cache_generations: IrqSafeSpinLock<BTreeMap<u64, u64>>,
+    cache_generations: IrqSafeSpinLock<CacheGenerations>,
+    /// Live `MAP_SHARED` identity anchors by inode number, the minix
+    /// half of `FileOps::mmap_backing_identity` (the btrfs
+    /// construction): the generic page cache keys retained pages by
+    /// the anchor's address, so every open of one inode must report
+    /// the one live anchor for it while any node of the inode exists.
+    /// Weak so an inode no open references gives its anchor up; a
+    /// later open mints a fresh one (safe: generations, below,
+    /// distinguish file instances even if an anchor address is
+    /// recycled).
+    mmap_anchors: IrqSafeSpinLock<BTreeMap<u64, Weak<MmapAnchor>>>,
+}
+
+/// Content-generation counters for one volume. Values are NOT
+/// per-inode counters: every assignment — the first read of an inode,
+/// a content mutation, a create — draws a fresh volume-wide tick. A
+/// generation therefore names one file *instance* at one mutation
+/// epoch: two different inodes (or two successive tenants of one
+/// recycled inode number) can never hold the same value, so a
+/// retained page's recorded generation can only ever match the file
+/// instance that published it. That uniqueness is what makes the
+/// generation half of the page cache's (identity, generation) guard
+/// sound even when an identity anchor's address is recycled.
+#[derive(Debug)]
+struct CacheGenerations {
+    values: BTreeMap<u64, u64>,
+    /// Next tick to issue. Starts at 1: 0 is never a real generation,
+    /// so an inode with no entry yet cannot alias an issued one.
+    next_tick: u64,
+}
+
+impl CacheGenerations {
+    fn new() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            next_tick: 1,
+        }
+    }
+
+    fn fresh_tick(&mut self) -> u64 {
+        let tick = self.next_tick;
+        self.next_tick = self.next_tick.wrapping_add(1);
+        if self.next_tick == 0 {
+            self.next_tick = 1;
+        }
+        tick
+    }
+}
+
+/// One minix inode's `MAP_SHARED` identity. Every open of a file gets
+/// its own [`crate::node::MinixNode`], but `MAP_SHARED` mappings of
+/// the same inode must share pages across those opens. The address of
+/// the single live anchor per inode number is what
+/// `FileOps::mmap_backing_identity` reports; every node of the inode
+/// holds it, so it cannot be reused while any open of the inode
+/// exists.
+#[derive(Debug)]
+pub struct MmapAnchor {
+    /// The inode number this anchor identifies. Carried for debug
+    /// identity only; the anchor's address is the identity.
+    _ino: u64,
 }
 
 impl<B: BlockDevice + 'static> MinixVolume<B> {
@@ -151,31 +207,60 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             io: IrqSafeSpinLock::new(io),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
             root_inode: IrqSafeSpinLock::new(None),
-            cache_generations: IrqSafeSpinLock::new(BTreeMap::new()),
+            cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
+            mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
         });
         let root = volume.read_inode(super::MINIX_ROOT_INO).await?;
         *volume.root_inode.lock() = Some(root);
         Ok(volume)
     }
 
-    /// Current content generation for inode `ino`.
+    /// Current content generation for inode `ino`. An inode nobody
+    /// has issued a generation for yet is assigned a fresh tick on
+    /// first read: issuing lazily here (rather than only on mutation)
+    /// is what gives a pre-existing, never-mutated file an
+    /// instance-unique value before any page can be retained under
+    /// it.
     pub fn cache_generation(&self, ino: u32) -> u64 {
-        self.cache_generations
-            .lock()
-            .get(&u64::from(ino))
-            .copied()
-            .unwrap_or(0)
+        let mut generations = self.cache_generations.lock();
+        match generations.values.get(&u64::from(ino)) {
+            Some(&generation) => generation,
+            None => {
+                let generation = generations.fresh_tick();
+                generations.values.insert(u64::from(ino), generation);
+                generation
+            }
+        }
     }
 
-    /// Record a content mutation (bytes or length) of inode `ino`.
-    /// Every such mutation in this driver bumps exactly once, before
-    /// the mutating operation returns, so a completed
-    /// write/truncate/final-unlink can never leave a retained page
-    /// looking current.
+    /// Record a change to inode `ino`: a content mutation (bytes or
+    /// length), a final unlink, or a create landing a new file on a
+    /// (possibly recycled) inode number. Assigns a fresh tick rather
+    /// than incrementing, so the value afterwards names the new
+    /// instance / epoch and no earlier tenant's. Every such change in
+    /// this driver bumps exactly once, before the operation returns,
+    /// so a completed write/truncate/unlink can never leave a
+    /// retained page looking current.
     pub fn bump_cache_generation(&self, ino: u32) {
         let mut generations = self.cache_generations.lock();
-        let entry = generations.entry(u64::from(ino)).or_insert(0);
-        *entry = entry.wrapping_add(1);
+        let generation = generations.fresh_tick();
+        generations.values.insert(u64::from(ino), generation);
+    }
+
+    /// The live [`MmapAnchor`] for inode `ino`, created on first use.
+    /// Dead entries are pruned as the table grows.
+    pub fn mmap_anchor(&self, ino: u32) -> Arc<MmapAnchor> {
+        let key = u64::from(ino);
+        let mut anchors = self.mmap_anchors.lock();
+        if let Some(anchor) = anchors.get(&key).and_then(Weak::upgrade) {
+            return anchor;
+        }
+        if anchors.len() >= 256 && anchors.len().is_power_of_two() {
+            anchors.retain(|_, anchor| anchor.strong_count() != 0);
+        }
+        let anchor = Arc::new(MmapAnchor { _ino: key });
+        anchors.insert(key, Arc::downgrade(&anchor));
+        anchor
     }
 
     /// Read one device sector (LBS bytes) into `dst`. `dst.len()`

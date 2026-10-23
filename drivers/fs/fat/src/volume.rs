@@ -101,9 +101,67 @@ pub struct FatVolume<B: BlockDevice> {
     /// counter cannot live on the node: two opens of one file are two
     /// objects, and a write through one must invalidate pages retained
     /// through the other. Volume scope keyed by on-disk identity is the
-    /// one place all opens share. Entries start at 0 and only ever move
-    /// forward; a missing entry reads as generation 0.
-    cache_generations: IrqSafeSpinLock<BTreeMap<u64, u64>>,
+    /// one place all opens share.
+    cache_generations: IrqSafeSpinLock<CacheGenerations>,
+    /// Live `MAP_SHARED` identity anchors by entry key, the FAT half of
+    /// `FileOps::mmap_backing_identity` (the btrfs construction): the
+    /// generic page cache keys retained pages by the anchor's address,
+    /// so every open of one file must report the one live anchor for
+    /// its entry while any node of the file exists. Weak so a file no
+    /// open references gives its anchor up; a later open mints a fresh
+    /// one (safe: generations, below, distinguish file instances even
+    /// if an anchor address is recycled).
+    mmap_anchors: IrqSafeSpinLock<BTreeMap<u64, Weak<MmapAnchor>>>,
+}
+
+/// Content-generation counters for one volume. Values are NOT per-key
+/// counters: every assignment — the first read of a key, a content
+/// mutation, an occupant change (create / rename) — draws a fresh
+/// volume-wide tick. A generation therefore names one file *instance*
+/// at one mutation epoch: two different files (or two successive
+/// tenants of one directory slot) can never hold the same value, so a
+/// retained page's recorded generation can only ever match the file
+/// instance that published it. That uniqueness is what makes the
+/// generation half of the page cache's (identity, generation) guard
+/// sound even when an identity anchor's address is recycled.
+#[derive(Debug)]
+struct CacheGenerations {
+    values: BTreeMap<u64, u64>,
+    /// Next tick to issue. Starts at 1: 0 is never a real generation,
+    /// so a key with no entry yet cannot alias an issued one.
+    next_tick: u64,
+}
+
+impl CacheGenerations {
+    fn new() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            next_tick: 1,
+        }
+    }
+
+    fn fresh_tick(&mut self) -> u64 {
+        let tick = self.next_tick;
+        self.next_tick = self.next_tick.wrapping_add(1);
+        if self.next_tick == 0 {
+            self.next_tick = 1;
+        }
+        tick
+    }
+}
+
+/// One FAT file's `MAP_SHARED` identity. Every open of a file gets its
+/// own [`crate::node::FatNode`], but `MAP_SHARED` mappings of the same
+/// file must share pages across those opens. The address of the single
+/// live anchor per directory-entry key is what
+/// `FileOps::mmap_backing_identity` reports; every node of the file
+/// holds it, so it cannot be reused while any open of the file exists.
+#[derive(Debug)]
+pub struct MmapAnchor {
+    /// The directory-entry key (`FatNode::inode_number` value) this
+    /// anchor identifies. Carried for debug identity only; the
+    /// anchor's address is the identity.
+    _key: u64,
 }
 
 impl<B: BlockDevice + 'static> FatVolume<B> {
@@ -199,35 +257,71 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
             tz_offset_secs: opts.tz_offset_secs,
             opts,
-            cache_generations: IrqSafeSpinLock::new(BTreeMap::new()),
+            cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
+            mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
         }))
     }
 
-    /// Current content generation for the file whose directory entry
-    /// sits at `(lba, offset)` — the key `FatNode::inode_number`
-    /// derives from the same position, so a node and its directory
-    /// entry always agree on the key.
-    pub fn cache_generation(&self, lba: u64, offset: usize) -> u64 {
+    /// The map key for the file whose directory entry sits at
+    /// `(lba, offset)` — the value `FatNode::inode_number` derives
+    /// from the same position, so a node and its directory entry
+    /// always agree on the key.
+    fn entry_key(&self, lba: u64, offset: usize) -> u64 {
         let entries_per_sector = u64::from(self.bpb.bytes_per_sec) / 32;
-        let key = lba * entries_per_sector + (offset / 32) as u64;
-        self.cache_generations
-            .lock()
-            .get(&key)
-            .copied()
-            .unwrap_or(0)
+        lba * entries_per_sector + (offset / 32) as u64
     }
 
-    /// Record a content mutation (bytes or length) of the file whose
-    /// directory entry sits at `(lba, offset)`. Every such mutation in
-    /// this driver bumps exactly once, before the mutating operation
-    /// returns, so a completed write/truncate/unlink can never leave a
+    /// Current content generation for the file whose directory entry
+    /// sits at `(lba, offset)`. A key nobody has issued a generation
+    /// for yet is assigned a fresh tick on first read: until then the
+    /// key has no file instance to vouch for, and issuing lazily here
+    /// (rather than only on mutation) is what gives a pre-existing,
+    /// never-mutated file an instance-unique value before any page
+    /// can be retained under it.
+    pub fn cache_generation(&self, lba: u64, offset: usize) -> u64 {
+        let key = self.entry_key(lba, offset);
+        let mut generations = self.cache_generations.lock();
+        match generations.values.get(&key) {
+            Some(&generation) => generation,
+            None => {
+                let generation = generations.fresh_tick();
+                generations.values.insert(key, generation);
+                generation
+            }
+        }
+    }
+
+    /// Record a change to the file whose directory entry sits at
+    /// `(lba, offset)`: a content mutation (bytes or length) or an
+    /// occupant change (create lands a new file here; rename vacates
+    /// or fills the slot). Assigns a fresh tick rather than
+    /// incrementing, so the value afterwards names the new instance /
+    /// epoch and no earlier tenant's. Every such change in this
+    /// driver bumps exactly once, before the operation returns, so a
+    /// completed write/truncate/unlink/rename can never leave a
     /// retained page looking current.
     pub fn bump_cache_generation(&self, lba: u64, offset: usize) {
-        let entries_per_sector = u64::from(self.bpb.bytes_per_sec) / 32;
-        let key = lba * entries_per_sector + (offset / 32) as u64;
+        let key = self.entry_key(lba, offset);
         let mut generations = self.cache_generations.lock();
-        let entry = generations.entry(key).or_insert(0);
-        *entry = entry.wrapping_add(1);
+        let generation = generations.fresh_tick();
+        generations.values.insert(key, generation);
+    }
+
+    /// The live [`MmapAnchor`] for the file whose directory entry
+    /// sits at `(lba, offset)`, created on first use. Dead entries
+    /// are pruned as the table grows.
+    pub fn mmap_anchor(&self, lba: u64, offset: usize) -> Arc<MmapAnchor> {
+        let key = self.entry_key(lba, offset);
+        let mut anchors = self.mmap_anchors.lock();
+        if let Some(anchor) = anchors.get(&key).and_then(Weak::upgrade) {
+            return anchor;
+        }
+        if anchors.len() >= 256 && anchors.len().is_power_of_two() {
+            anchors.retain(|_, anchor| anchor.strong_count() != 0);
+        }
+        let anchor = Arc::new(MmapAnchor { _key: key });
+        anchors.insert(key, Arc::downgrade(&anchor));
+        anchor
     }
 
     pub fn first_data_sector(&self) -> u32 {

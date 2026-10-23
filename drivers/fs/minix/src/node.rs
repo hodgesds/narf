@@ -36,6 +36,11 @@ pub struct MinixNode<B: BlockDevice> {
     /// async op fills it. After that it's never invalidated — this
     /// is a read-only driver.
     inode: IrqSafeSpinLock<Option<Inode>>,
+    /// This inode's volume-anchored `MAP_SHARED` identity, resolved
+    /// once from the volume's anchor table (see
+    /// `MinixVolume::mmap_anchor`). Every node minted for the same
+    /// inode shares the one anchor.
+    mmap_anchor: narf_lib::sync::OnceLock<Arc<crate::volume::MmapAnchor>>,
 }
 
 impl<B: BlockDevice + 'static> MinixNode<B> {
@@ -44,6 +49,7 @@ impl<B: BlockDevice + 'static> MinixNode<B> {
             volume,
             ino,
             inode: IrqSafeSpinLock::new(None),
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
 
@@ -52,6 +58,7 @@ impl<B: BlockDevice + 'static> MinixNode<B> {
             volume,
             ino,
             inode: IrqSafeSpinLock::new(Some(inode)),
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
 
@@ -303,6 +310,19 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
             _ => None,
         }
     }
+
+    /// The shared-page cache key for this file: the volume anchor for
+    /// its inode number (the btrfs construction), stable across
+    /// opens, so retained pages are keyed by the inode and not by
+    /// whichever node object an open happened to mint. (Rename keeps
+    /// the inode number, so a renamed file keeps its identity —
+    /// the same file under a new name, as on Linux.)
+    fn mmap_backing_identity(&self) -> usize {
+        let anchor = self
+            .mmap_anchor
+            .get_or_init(|| self.volume.mmap_anchor(self.ino));
+        Arc::as_ptr(anchor) as usize
+    }
 }
 
 impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
@@ -456,6 +476,11 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             let new_ino = self.volume.alloc_inode().await?;
             let file_inode = Inode::new_regular(0o644, dir_inode.mtime);
             self.volume.write_inode(new_ino, &file_inode).await?;
+            // The inode number may be recycled from a freed file:
+            // issue the new file's instance generation now, so pages
+            // the previous tenant left in the shared page cache can
+            // never validate against this file.
+            self.volume.bump_cache_generation(new_ino);
             // Append entry to the directory body.
             self.append_dir_entry(&mut dir_inode, &mut bytes, new_ino as u16, name)
                 .await?;
