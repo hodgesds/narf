@@ -772,8 +772,11 @@ Address4 / QoS TID. It excludes Duration/HT Control, mutes data subtype bits
 4–6 (preserving the QoS indicator), Retry/PM/MoreData and QoS Order, and
 forces Protected. Management subtype and non-QoS Order remain authenticated.
 `build_nonce` includes the transmitter address and big-endian 48-bit PN.
-`protect` / `unprotect` take an `AesCcm` backend; `unprotect` checks a copy of
-`ReplayWindow` and commits it only after MIC verification. Authentication
+`protect` / `unprotect` take an `AesCcm` backend and are both fallible: a
+backend seal/open refusal propagates as `CcmpError` (`TooLong` for a body
+beyond the CCM two-octet length bound) with the frame body left unmodified —
+datapath adapters must never convert a refusal into a panic. `unprotect`
+checks a copy of `ReplayWindow` and commits it only after MIC verification. Authentication
 failure leaves ciphertext and replay state unchanged when the backend honors
 its verify-before-mutation contract. The caller must validate complete MAC
 header bounds, key role/ID, native station addresses, nonce uniqueness and

@@ -27,9 +27,22 @@ pub enum Role {
 }
 struct Ccm;
 impl AesCcm for Ccm {
-    fn encrypt(&self, key: &[u8; 16], nonce: &[u8; 13], aad: &[u8], body: &mut [u8]) -> [u8; 8] {
-        // Every production caller first bounds body to MAX_BODY (4096).
-        narf_crypto::aes_ccm::seal(key, nonce, aad, body).expect("bounded CCMP body")
+    fn encrypt(
+        &self,
+        key: &[u8; 16],
+        nonce: &[u8; 13],
+        aad: &[u8],
+        body: &mut [u8],
+    ) -> Result<[u8; 8], CcmpError> {
+        // The adapter is total: a seal refusal (the CCM two-octet
+        // length bound, 65535 bytes) surfaces as a typed error,
+        // never a panic in the TX path. Key::protect pre-bounds
+        // bodies to MAX_BODY, so this is defense in depth that keeps
+        // the adapter's contract independent of caller pre-bounds.
+        narf_crypto::aes_ccm::seal(key, nonce, aad, body).map_err(|error| match error {
+            narf_crypto::aes_ccm::Error::Length => CcmpError::TooLong,
+            narf_crypto::aes_ccm::Error::Authentication => CcmpError::AuthFailed,
+        })
     }
     fn decrypt(
         &self,
@@ -129,7 +142,7 @@ impl Key {
         }
         self.tx_pn += 1;
         let mut ciphertext = Zeroizing::new(body.to_vec());
-        Ok(ccmp::protect(
+        ccmp::protect(
             &Ccm,
             header,
             &self.tk,
@@ -138,7 +151,8 @@ impl Key {
             shape.priority,
             false,
             &mut ciphertext,
-        ))
+        )
+        .map_err(Error::Crypto)
     }
     /// Authenticate before committing this key/TID's replay tracker. All
     /// admission/MIC/replay failures leave the entire wire buffer unchanged.

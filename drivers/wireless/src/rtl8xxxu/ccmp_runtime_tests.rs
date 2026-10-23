@@ -26,6 +26,7 @@ fn wire(key: &[u8; 16], h: &[u8], pn: u64, id: u8) -> Vec<u8> {
         false,
         &mut body,
     )
+    .unwrap()
 }
 fn smoke_rtl_ccmp_forgery_cannot_poison_key_tid() -> TestResult {
     let h = header(PEER, Some(7));
@@ -261,4 +262,40 @@ fn smoke_rtl_ccmp_station_role_and_address_admission() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/ccmp",
     smoke_rtl_ccmp_station_role_and_address_admission
+);
+
+fn smoke_rtl_ccmp_seal_failure_is_a_typed_error() -> TestResult {
+    // The production Ccm adapter: a body over the CCM two-octet
+    // length bound (65535) makes narf-crypto's seal refuse. That
+    // refusal must reach callers as CcmpError::TooLong (wrapped as
+    // Error::Crypto by Key::protect in production) — the adapter
+    // previously .expect()ed it into a kernel panic on the TX path.
+    // Key::protect pre-bounds bodies to MAX_BODY, so exercise the
+    // adapter and ccmp::protect layers directly.
+    let tk = [5; 16];
+    let mut body = alloc::vec![0x42u8; 65_536];
+    let saved = body.clone();
+    if Ccm.encrypt(&tk, &[0; 13], &[], &mut body) != Err(CcmpError::TooLong) || body != saved {
+        return TestResult::Fail("adapter turned a seal refusal into a panic or mutation");
+    }
+    let h = header(LOCAL, None);
+    if ccmp::protect(&Ccm, &h, &tk, 1, 0, 0, false, &mut body) != Err(CcmpError::TooLong)
+        || body != saved
+    {
+        return TestResult::Fail("protect swallowed the seal refusal");
+    }
+    // In-bounds bodies still seal and open through the same adapter.
+    let mut small = [0x42u8; 31];
+    let tag = match Ccm.encrypt(&tk, &[0; 13], &[], &mut small) {
+        Ok(tag) => tag,
+        Err(_) => return TestResult::Fail("in-bounds seal rejected"),
+    };
+    if Ccm.decrypt(&tk, &[0; 13], &[], &mut small, &tag).is_err() || small != [0x42u8; 31] {
+        return TestResult::Fail("adapter round-trip broke");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/ccmp",
+    smoke_rtl_ccmp_seal_failure_is_a_typed_error
 );

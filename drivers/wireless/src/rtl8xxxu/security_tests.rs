@@ -74,8 +74,19 @@ fn mpdu(bytes: Vec<u8>) -> Mpdu {
 }
 struct Ccm;
 impl narf_wireless::ccmp::AesCcm for Ccm {
-    fn encrypt(&self, key: &[u8; 16], nonce: &[u8; 13], aad: &[u8], body: &mut [u8]) -> [u8; 8] {
-        narf_crypto::aes_ccm::seal(key, nonce, aad, body).unwrap()
+    fn encrypt(
+        &self,
+        key: &[u8; 16],
+        nonce: &[u8; 13],
+        aad: &[u8],
+        body: &mut [u8],
+    ) -> Result<[u8; 8], narf_wireless::ccmp::CcmpError> {
+        narf_crypto::aes_ccm::seal(key, nonce, aad, body).map_err(|error| match error {
+            narf_crypto::aes_ccm::Error::Length => narf_wireless::ccmp::CcmpError::TooLong,
+            narf_crypto::aes_ccm::Error::Authentication => {
+                narf_wireless::ccmp::CcmpError::AuthFailed
+            }
+        })
     }
     fn decrypt(
         &self,
@@ -102,7 +113,8 @@ fn encrypt(frame: &[u8], tk: &[u8], pn: u64, id: u8) -> Vec<u8> {
         0,
         false,
         &mut body,
-    );
+    )
+    .unwrap();
     header.extend_from_slice(&wire);
     header
 }
