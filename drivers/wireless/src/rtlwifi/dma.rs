@@ -168,7 +168,7 @@ impl RxRing {
 /// lines in `_rtl92ee_init_mac` (`hw.c:825..921`).
 ///
 /// `dma64` selects whether the chip should be told about the high 32
-/// bits of the address (8192EE / 8821AE / 8822BE support 64-bit DMA;
+/// bits of the address (8192EE / 8821AE support 64-bit DMA;
 /// the older chips ignore the high write).
 ///
 /// # Safety

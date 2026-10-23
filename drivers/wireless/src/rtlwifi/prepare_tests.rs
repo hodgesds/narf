@@ -195,10 +195,31 @@ fn smoke_rtl8188ee_fifo_llt_matches_actual_linux_and_pins_published_rings() -> T
     {
         return TestResult::Fail("actual Linux 8188EE FIFO/0xab-0xaf LLT trace differs");
     }
-    for (address, ring) in TX_BASES.iter().zip(&owner.tx) {
+    // Expected bases come from mac.rs's named register map
+    // (rtl8192ee/reg.h:143..165) — deliberately NOT prepare's own
+    // TX_BASES/RX_BASE constants, so a swapped TX/RX base in
+    // prepare fails here instead of being rubber-stamped.
+    let expected_tx_bases: [u16; 7] = [
+        super::super::mac::REG_BCNQ_DESA as u16,
+        super::super::mac::REG_MGQ_DESA as u16,
+        super::super::mac::REG_VOQ_DESA as u16,
+        super::super::mac::REG_VIQ_DESA as u16,
+        super::super::mac::REG_BEQ_DESA as u16,
+        super::super::mac::REG_BKQ_DESA as u16,
+        super::super::mac::REG_HQ0_DESA as u16,
+    ];
+    for (address, ring) in expected_tx_bases.iter().zip(&owner.tx) {
         if !m.trace.contains(&(32, *address, ring.address as u32)) {
             return TestResult::Fail("per-chip distinct native queue base omitted");
         }
+    }
+    let receive = owner.receive.as_ref().unwrap();
+    if !m.trace.contains(&(
+        32,
+        super::super::mac::REG_RX_DESA as u16,
+        receive.address as u32,
+    )) {
+        return TestResult::Fail("RX ring base not published at REG_RX_DESA");
     }
     if m.regs[0x301] != 255
         || m.regs[0x100] & 0xcf != 0

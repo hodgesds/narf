@@ -66,7 +66,7 @@ pub const RF_CHNLBW: u8 = 0x18;
 /// value occupies the low byte of RF[0x18] data; bandwidth flags
 /// occupy bits 11..8.
 ///
-/// `is_2t` — true for 2T2R chips (8192CE/DE/EE, 8822BE).
+/// `is_2t` — true for 2T2R chips (8192CE/DE/EE).
 ///
 /// # Safety
 /// Caller must own BAR0 exclusively, BB block opened.
@@ -106,7 +106,7 @@ pub enum Bandwidth {
     Ht20 = 0,
     /// 40 MHz HT.
     Ht40 = 1,
-    /// 80 MHz VHT (8821AE / 8822BE only).
+    /// 80 MHz VHT (8821AE only).
     Vht80 = 2,
 }
 

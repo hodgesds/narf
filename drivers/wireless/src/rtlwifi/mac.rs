@@ -48,8 +48,6 @@ pub const TXPKTBUF_BNDY_8192EE: u8 = 0xF7;
 pub const TXPKTBUF_BNDY_8723BE: u8 = 0xF7;
 /// 8821AE TX/RX page boundary.  `rtl8821ae/hw.c`.
 pub const TXPKTBUF_BNDY_8821AE: u8 = 0xF7;
-/// 8822BE TX/RX page boundary.
-pub const TXPKTBUF_BNDY_8822BE: u8 = 0xF7;
 
 /// Pick the chip's TX/RX page boundary value.
 pub const fn txpktbuf_bndy_for(did: u16) -> u8 {
@@ -59,7 +57,6 @@ pub const fn txpktbuf_bndy_for(did: u16) -> u8 {
         RTL_DEV_8192EE => TXPKTBUF_BNDY_8192EE,
         RTL_DEV_8723AE | RTL_DEV_8723BE => TXPKTBUF_BNDY_8723BE,
         RTL_DEV_8821AE => TXPKTBUF_BNDY_8821AE,
-        RTL_DEV_8822BE => TXPKTBUF_BNDY_8822BE,
         _ => TXPKTBUF_BNDY_8192EE,
     }
 }

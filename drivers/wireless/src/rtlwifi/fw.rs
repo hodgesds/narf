@@ -55,11 +55,6 @@ pub const FW_8723BE: &str = "rtlwifi/rtl8723befw.bin";
 /// Linux `rtl8821ae/sw.c::MODULE_FIRMWARE("rtlwifi/rtl8821aefw.bin")`.
 pub const FW_8821AE: &str = "rtlwifi/rtl8821aefw.bin";
 
-/// Firmware blob for RTL8822BE.
-/// Linux `rtl8821ae/sw.c` — 8822BE shares the 8821AE driver in Linux and
-/// uses a separate blob: `MODULE_FIRMWARE("rtlwifi/rtl8822befw.bin")`.
-pub const FW_8822BE: &str = "rtlwifi/rtl8822befw.bin";
-
 // ── Firmware header constants (RTL8192EE generation) ─────────────────────
 //
 // Source: `rtlwifi/rtl8192ee/fw.h`.
@@ -93,7 +88,6 @@ pub const fn fw_name_for(did: u16) -> Option<&'static str> {
         RTL_DEV_8723AE => Some(FW_8723AE),
         RTL_DEV_8723BE => Some(FW_8723BE),
         RTL_DEV_8821AE => Some(FW_8821AE),
-        RTL_DEV_8822BE => Some(FW_8822BE),
         _ => None,
     }
 }

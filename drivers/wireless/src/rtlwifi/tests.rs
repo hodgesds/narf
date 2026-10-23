@@ -42,7 +42,7 @@ use super::phy::{BB_BRINGUP_PREAMBLE, BB_RST_VALUE, RF_EN, RF_RSTB, RF_SDMRSTB};
 use super::power::{
     power_on_table_for, WlanPwrCfg, PWR_BASEADDR_MAC, PWR_CMD_END, PWR_CMD_POLLING, PWR_CMD_WRITE,
     PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK, PWR_INTF_PCI_MSK, RTL8188EE_PWR_ON, RTL8192CE_PWR_ON,
-    RTL8192EE_PWR_ON, RTL8723BE_PWR_ON, RTL8821AE_PWR_ON, RTL8822BE_PWR_ON,
+    RTL8192EE_PWR_ON, RTL8723BE_PWR_ON, RTL8821AE_PWR_ON,
 };
 use super::regs::*;
 use super::rf::{lssi_pack, RfPath, RF_MASK_12};
@@ -205,7 +205,6 @@ fn smoke_rtlwifi_fw_blob_name_by_chip() -> TestResult {
         (RTL_DEV_8723AE, "rtlwifi/rtl8723aefw.bin"),
         (RTL_DEV_8723BE, "rtlwifi/rtl8723befw.bin"),
         (RTL_DEV_8821AE, "rtlwifi/rtl8821aefw.bin"),
-        (RTL_DEV_8822BE, "rtlwifi/rtl8822befw.bin"),
     ];
     for &(did, expected) in cases {
         match fw_name_for(did) {
@@ -219,6 +218,10 @@ fn smoke_rtlwifi_fw_blob_name_by_chip() -> TestResult {
     // Unknown device should return None.
     if fw_name_for(0xFFFF).is_some() {
         return TestResult::Fail("fw_name_for(0xFFFF) should return None");
+    }
+    // RTL8822BE (0xB822) belongs to rtw88 and must never resolve here.
+    if fw_name_for(0xB822).is_some() {
+        return TestResult::Fail("fw_name_for(0xB822) should return None (rtw88-owned)");
     }
     TestResult::Pass
 }
@@ -238,7 +241,6 @@ fn smoke_rtlwifi_per_chip_mmio_size_table() -> TestResult {
         (RTL_DEV_8192EE, super::rtl8192ee::MMIO_SIZE),
         (RTL_DEV_8723BE, super::rtl8723be::MMIO_SIZE),
         (RTL_DEV_8821AE, super::rtl8821ae::MMIO_SIZE),
-        (RTL_DEV_8822BE, super::rtl8822be::MMIO_SIZE),
     ];
     for &(did, sz) in sizes {
         if sz != 0x4000 {
@@ -283,6 +285,14 @@ fn smoke_rtlwifi_name_for_all_ids() -> TestResult {
     }
     if name_for(0xDEAD) != "rtlwifi" {
         return TestResult::Fail("name_for unknown id should return 'rtlwifi'");
+    }
+    // RTL8822BE (0xB822) belongs to rtw88: not in this family's table
+    // and no per-chip name may resolve for it here.
+    if ALL_DEV_IDS.contains(&0xB822) {
+        return TestResult::Fail("rtlwifi must not claim RTL8822BE (0xB822)");
+    }
+    if name_for(0xB822) != "rtlwifi" {
+        return TestResult::Fail("name_for(0xB822) should hit the generic fallback");
     }
     TestResult::Pass
 }
@@ -341,7 +351,6 @@ fn smoke_rtlwifi_power_on_tables_present() -> TestResult {
         (RTL_DEV_8723AE, RTL8723BE_PWR_ON),
         (RTL_DEV_8723BE, RTL8723BE_PWR_ON),
         (RTL_DEV_8821AE, RTL8821AE_PWR_ON),
-        (RTL_DEV_8822BE, RTL8822BE_PWR_ON),
     ];
     for &(did, expected) in cases {
         let got = match power_on_table_for(did) {
@@ -362,6 +371,10 @@ fn smoke_rtlwifi_power_on_tables_present() -> TestResult {
     if power_on_table_for(0xFFFF).is_some() {
         return TestResult::Fail("rtlwifi: unknown DID got a table");
     }
+    // RTL8822BE (0xB822) belongs to rtw88 and must not resolve here.
+    if power_on_table_for(0xB822).is_some() {
+        return TestResult::Fail("rtlwifi: rtw88-owned 0xB822 got a table");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -378,7 +391,6 @@ fn smoke_rtlwifi_power_on_row_encoding() -> TestResult {
         RTL8192EE_PWR_ON,
         RTL8723BE_PWR_ON,
         RTL8821AE_PWR_ON,
-        RTL8822BE_PWR_ON,
     ];
     for &t in tables {
         for row in t {
@@ -729,7 +741,7 @@ fn smoke_rtlwifi_btcoex_matrix() -> TestResult {
             return TestResult::Fail("combo chip not classified as BT-capable");
         }
     }
-    let pure_wifi = [RTL_DEV_8188EE, RTL_DEV_8192EE, RTL_DEV_8822BE];
+    let pure_wifi = [RTL_DEV_8188EE, RTL_DEV_8192EE];
     for did in pure_wifi {
         if has_bt(did) {
             return TestResult::Fail("non-combo chip mis-classified as BT-capable");
@@ -760,9 +772,6 @@ fn smoke_rtlwifi_vht_capability() -> TestResult {
     if !has_vht(RTL_DEV_8821AE) {
         return TestResult::Fail("8821AE should be VHT-capable");
     }
-    if !has_vht(RTL_DEV_8822BE) {
-        return TestResult::Fail("8822BE should be VHT-capable");
-    }
     for did in [RTL_DEV_8188EE, RTL_DEV_8192EE, RTL_DEV_8723BE] {
         if has_vht(did) {
             return TestResult::Fail("HT-only chip mis-classified as VHT");
@@ -771,10 +780,6 @@ fn smoke_rtlwifi_vht_capability() -> TestResult {
     // 8821AE is 1T1R → MCS9 only.
     if max_mcs_for(RTL_DEV_8821AE) != Some(VhtMcs::Vht1ssMcs9) {
         return TestResult::Fail("8821AE max MCS not 1ssMCS9");
-    }
-    // 8822BE is 2T2R → 2ss MCS9.
-    if max_mcs_for(RTL_DEV_8822BE) != Some(VhtMcs::Vht2ssMcs9) {
-        return TestResult::Fail("8822BE max MCS not 2ssMCS9");
     }
     if VhtMode::Bw20 as u8 == VhtMode::Bw80 as u8 {
         return TestResult::Fail("VhtMode enum collapsed");
@@ -829,7 +834,6 @@ fn smoke_rtlwifi_per_chip_feature_flags() -> TestResult {
         (RTL_DEV_8723AE, true, false),
         (RTL_DEV_8723BE, true, false),
         (RTL_DEV_8821AE, true, true),
-        (RTL_DEV_8822BE, false, true),
     ];
     for &(did, want_bt, want_vht) in cases {
         if has_bt(did) != want_bt {
@@ -860,7 +864,7 @@ fn smoke_rtlwifi_unready_control_plane_fails_closed() -> TestResult {
             },
         },
         mac: [0x00, 0xE0, 0x4C, 0x12, 0x34, 0x56],
-        device_id: RTL_DEV_8822BE,
+        device_id: RTL_DEV_8188EE,
         link_up: core::sync::atomic::AtomicBool::new(false),
         rx_ring: narf_lib::sync::IrqSafeSpinLock::new(None),
         tx_ring: narf_lib::sync::IrqSafeSpinLock::new(None),

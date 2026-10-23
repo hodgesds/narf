@@ -1,4 +1,4 @@
-//! 802.11ac (VHT) enable for RTL8821AE + RTL8822BE.
+//! 802.11ac (VHT) enable for RTL8821AE.
 //!
 //! Both chips are Wi-Fi 5 silicon, but the BB / MAC paths only carry
 //! VHT after specific bits are flipped:
@@ -32,7 +32,7 @@ pub const REG_BWOPMODE: u64 = 0x0603;
 
 /// True for chips that ship a VHT-capable BB block.
 pub const fn has_vht(did: u16) -> bool {
-    matches!(did, RTL_DEV_8821AE | RTL_DEV_8822BE)
+    matches!(did, RTL_DEV_8821AE)
 }
 
 /// VHT operating modes selectable through `REG_BWOPMODE`.
@@ -80,8 +80,6 @@ pub const fn max_mcs_for(did: u16) -> Option<VhtMcs> {
     match did {
         // 1T1R — 1 spatial stream.
         RTL_DEV_8821AE => Some(VhtMcs::Vht1ssMcs9),
-        // 2T2R — 2 spatial streams.
-        RTL_DEV_8822BE => Some(VhtMcs::Vht2ssMcs9),
         _ => None,
     }
 }
