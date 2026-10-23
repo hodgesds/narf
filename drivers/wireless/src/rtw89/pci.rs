@@ -12,8 +12,8 @@
 //! ## What this file does *not* do at Stage 0/1 (deferred)
 //!
 //! - MSI/MSI-X vector setup. Lands with Stage-2 TX/RX rings.
-//! - Firmware load. Stubbed in `fw.rs`; needs `narf-firmware` blobs
-//!   for `rtw89/8852a_*.bin` / `rtw89/8852b_*.bin` etc.
+//! - Complete firmware load. Checked preparation and cold-power primitives
+//!   exist; secure-fuse, DLE/HFC, CH12 and WCPU owners still need composition.
 //! - PHY parameter table load. Stubbed in `phy.rs`.
 //! - DMA channel ring setup. The Linux code in `pci.c` allocates 13
 //!   TX + 2 RX rings; that's a non-trivial pile (~600 LOC of ring
@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 
-use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -33,7 +33,6 @@ use super::tx_transport::{self, Ticket, TxQueue};
 use crate::rtw89::datapath::{RxChannelState, TxChannelState};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::fmt::Write as _;
 use narf_io::{alloc_coherent, alloc_coherent_masked, DmaBuffer};
 use narf_lib::id::DomainId;
 
@@ -41,6 +40,7 @@ use narf_lib::id::DomainId;
 pub struct Rtw89Device {
     /// Retained bus identity; a repeat probe must not park the active owner.
     pub(crate) bus_addr: narf_bus::BusAddr,
+    cap: Cap<BusDeviceCap, Write>,
     /// BAR2 MMIO mapping — the only BAR rtw89 silicon exposes.
     pub mmio_bar2: MmioRegion,
     /// Factory MAC decoded from the chip-specific logical EFUSE map.
@@ -106,7 +106,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     match crate::rtw88::pci_park::admission(bound, device.addr) {
         crate::rtw88::pci_park::Admission::Bound => return Ok(()),
         crate::rtw88::pci_park::Admission::ParkExtra => {
-            crate::rtw88::pci_park::park(&device, &cap)
+            crate::rtw88::pci_park::invoke(&cap, || crate::rtw88::pci_park::park(&device, &cap))
+                .map_err(|_| narf_bus::ProbeError::BadDevice)?
                 .map_err(|_| narf_bus::ProbeError::BadDevice)?;
             return Ok(());
         }
@@ -120,7 +121,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
-    let mac = dev.mac;
     let did = dev.device_id;
     let arc_dev = Arc::new(dev);
     *CONTROLLER.lock() = Some(arc_dev.clone());
@@ -133,78 +133,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    narf_net::iface::register("wlan%d", mac, send_frame);
-
-    spawn_pumps(arc_dev);
-
     Ok(())
 }
 
-fn spawn_pumps(device: Arc<Rtw89Device>) {
-    let d1 = device.clone();
-    narf_scheduler::spawn(async move {
-        rtw89_rx_pump(d1).await;
-    });
-}
-
-async fn rtw89_rx_pump(device: Arc<Rtw89Device>) {
-    use crate::rtw89::datapath::*;
-    use crate::rtw89::dma::*;
-
-    let _ = writeln!(narf_console::Writer, "  rtw89: RX pump started");
-
-    loop {
-        if let Some(v) = device.irq_vector {
-            narf_interrupts::wait::wait_for_irq(v).await;
-        } else {
-            narf_scheduler::yield_now().await;
-        }
-
-        {
-            let mut rx_q = device.rx_rings[RXCH_RXQ as usize].lock();
-            let mmio = &device.mmio_bar2;
-            // SAFETY: `mmio` is the BAR2 region mapped + owned by `bring_up`;
-            // `rx_q.regs` holds in-range RX ring-index register offsets for this
-            // channel, so the MMIO read of the HW ring index is to a valid device
-            // register.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            let idx = unsafe { read_rx_ring_idx(mmio, &rx_q.regs) };
-            let (rp, _) = split_idx(idx);
-
-            // hardware advances rp when it fills a BD.
-            // host wp is where we last acknowledged.
-            while rx_q.state.wp != rp {
-                let slot = rx_q.state.wp as usize;
-                let bd_payload = device.rx_buffers[RXCH_RXQ as usize][slot].as_slice();
-
-                if let Some(delivery) = consume_rx_bd(bd_payload) {
-                    // Push to network stack.
-                    // For now we just log.
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "  rtw89: RX frame len={}",
-                        delivery.rxd.pkt_len
-                    );
-                }
-
-                rx_q.state.advance_wp(1);
-            }
-
-            // Acknowledge processed BDs by updating doorbell WP.
-            // SAFETY: `mmio` is the BAR2 region mapped + owned by `bring_up`;
-            // `rx_q.regs` holds the in-range RX doorbell register offset, and
-            // `wp` is a valid write-pointer index, so this MMIO write targets a
-            // valid device register.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe {
-                ring_doorbell_rx(mmio, &rx_q.regs, rx_q.state.wp);
-            }
-        }
-    }
-}
-
 /// Bring the chip up: map BAR2, run baseline power-on, detect chip
-/// version, read MAC from EFUSE, and setup DMA rings.
+/// version and factory MAC, and retain unpublished ring storage.
 ///
 /// # Safety
 /// Caller owns the device's PCI configuration and BARs exclusively.
@@ -212,9 +145,20 @@ pub unsafe fn bring_up(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<Rtw89Device, ProbeError> {
-    crate::rtw88::pci_park::park(device, cap).map_err(|_| ProbeError::PciAccess)?;
-    // SAFETY: caller-asserted BAR exclusivity. rtw89 maps BAR2 only.
-    let mmio_bar2 = unsafe { map_bar_control(device, 2) }.map_err(|_| ProbeError::Bar2MapFailed)?;
+    crate::rtw88::pci_park::invoke(cap, || {
+        // SAFETY: caller's exclusive function/BAR contract; complete diagnostic
+        // accesses stay inside the real capability operation.
+        unsafe { bring_up_registers(device, cap) }
+    })
+    .map_err(|_| ProbeError::PciAccess)?
+}
+
+unsafe fn bring_up_registers(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+) -> Result<Rtw89Device, ProbeError> {
+    let mmio_bar2 = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
+        .map_err(|_| ProbeError::Bar2MapFailed)?;
     if mmio_bar2.len < 0x10000 {
         return Err(ProbeError::Bar2MapFailed);
     }
@@ -240,23 +184,9 @@ pub unsafe fn bring_up(
     let mac =
         unsafe { efuse::read_mac(&mmio_bar2, chip_id, chip_version) }.map_err(ProbeError::Efuse)?;
 
-    // ── MSI-X Setup ──
-    let mut irq_vector = None;
-    if let Ok(v) = narf_interrupts::vector::alloc() {
-        if let Ok(mut msix) = narf_bus::msix::enable_msix(cap, device) {
-            // SAFETY: `msix` is a live MSI-X table handle returned by
-            // `enable_msix` for this owned device; table entry 0 is in range and
-            // `v` is a freshly allocated interrupt vector, so programming the
-            // vector and enabling the table writes only valid MSI-X registers.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe {
-                let _ = msix.program_vector(0, 0, v);
-                let _ = msix.enable();
-            }
-            irq_vector = Some(v);
-            narf_interrupts::install_handler(v, rtw89_isr);
-        }
-    }
+    // No interrupt delivery is enabled until a complete firmware/ring owner
+    // installs and owns its actual completion path.
+    let irq_vector = None;
 
     // ── DMA Ring Allocation ──
     use crate::rtw89::dma::*;
@@ -329,48 +259,11 @@ pub unsafe fn bring_up(
         )));
     }
 
-    // ── Hardware Ring Init ──
-    for i in 0..TXCH_NUM {
-        let r = &tx_rings[i].lock();
-        let dma = &tx_ring_dma[i];
-        let phys = dma.dma_addr().raw();
-        // SAFETY: `mmio_bar2` is the caller-owned BAR2 region; `r.regs` holds the
-        // in-range TX ring register offsets (`desa_l/h`, `num`, `bdram`, `idx`)
-        // for this channel, so these MMIO writes target valid device registers
-        // with matching access widths.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            mmio_bar2.write32(r.regs.desa_l, (phys & 0xFFFFFFFF) as u32);
-            mmio_bar2.write32(r.regs.desa_h, (phys >> 32) as u32);
-            mmio_bar2.write16(r.regs.num, DEFAULT_TXBD_NUM);
-            // BDRAM_CTRL init — typical values from Linux pci.c
-            mmio_bar2.write32(r.regs.bdram, 0);
-            // Set initial host write pointer to 0.
-            mmio_bar2.write32(r.regs.idx, 0);
-        }
-    }
-
-    for i in 0..RXCH_NUM {
-        let r = &rx_rings[i].lock();
-        let dma = &rx_ring_dma[i];
-        let phys = dma.dma_addr().raw();
-        // SAFETY: `mmio_bar2` is the caller-owned BAR2 region; `r.regs` holds the
-        // in-range RX ring register offsets (`desa_l/h`, `num`, `idx`) for this
-        // channel, so these MMIO writes target valid device registers with
-        // matching access widths.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            mmio_bar2.write32(r.regs.desa_l, (phys & 0xFFFFFFFF) as u32);
-            mmio_bar2.write32(r.regs.desa_h, (phys >> 32) as u32);
-            mmio_bar2.write16(r.regs.num, DEFAULT_RXBD_NUM);
-            // Set WP to len-1 so all buffers are owned by HW.
-            let idx_val = pack_idx(0, DEFAULT_RXBD_NUM - 1);
-            mmio_bar2.write32(r.regs.idx, idx_val);
-        }
-    }
-
+    // The diagnostic owns unpublished storage only. Ring base/index/BDRAM
+    // writes belong to the future verified firmware/DLE/HFC/reset owner.
     Ok(Rtw89Device {
         bus_addr: device.addr,
+        cap: *cap,
         mmio_bar2,
         mac,
         device_id: device.id.device,
@@ -418,10 +311,22 @@ impl Rtw89Device {
     ///
     /// # Safety
     /// Caller has initialized firmware/station rate state and enabled the
-    /// selected AX channel with the exact ring geometry installed by bring_up;
+    /// selected AX channel with explicitly programmed and retained ring geometry;
     /// no reset/removal can race. The RPQ consumer must pass release records to
     /// complete_native_report. `frame` is an unprotected, non-QoS native MPDU.
     pub(super) unsafe fn submit_native(
+        &self,
+        info: super::txrx::TxwdInfo,
+        frame: &[u8],
+    ) -> Result<Ticket, tx_transport::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller's live initialized ring/no-reset contract.
+            unsafe { self.submit_native_authorized(info, frame) }
+        })
+        .map_err(|_| tx_transport::Error::Authority)?
+    }
+
+    unsafe fn submit_native_authorized(
         &self,
         info: super::txrx::TxwdInfo,
         frame: &[u8],
@@ -517,6 +422,17 @@ impl Rtw89Device {
     /// Same live-ring/no-reset contract as submit_native. `bytes` must come
     /// from this device's coherently acquired RPQ (not untrusted network data).
     pub(super) unsafe fn complete_native_report(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, tx_transport::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller guarantees an acquired native RPQ/live ring.
+            unsafe { self.complete_native_report_authorized(bytes) }
+        })
+        .map_err(|_| tx_transport::Error::Authority)?
+    }
+
+    unsafe fn complete_native_report_authorized(
         &self,
         bytes: &[u8],
     ) -> Result<Vec<u8>, tx_transport::Error> {

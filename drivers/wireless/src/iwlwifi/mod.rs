@@ -89,7 +89,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 
 use crate::iwlwifi::transport::IwlMmio;
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_io::DmaBuffer;
 use narf_ipc::{channel, Consumer, Producer};
@@ -105,6 +105,7 @@ pub const INTEL_VENDOR: u16 = 0x8086;
 // ── IwlDevice ──────────────────────────────────────────────────────
 
 struct IwlDevice {
+    cap: Cap<narf_bus::BusDeviceCap, Write>,
     mmio: MmioRegion,
     chip: ChipConfig,
     mac_addr: [u8; 6],
@@ -187,7 +188,7 @@ impl IwlDevice {
         let frame_len = total as u16;
 
         let mut tx_q = self.tx_q0.lock();
-        let mut mmio = IwlMmioImpl(self.mmio);
+        let mut mmio = IwlMmioImpl::new(self.mmio, self.cap);
         let slot = tx_q.write_ptr;
 
         let cmd = tx::IwlTxCmd::for_management(frame_len, 0xFF);
@@ -228,6 +229,7 @@ impl IwlDevice {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mmio: MmioRegion,
+        cap: Cap<narf_bus::BusDeviceCap, Write>,
         chip: ChipConfig,
         mac_addr: [u8; 6],
         rx_q: rx::RxQueue,
@@ -240,6 +242,7 @@ impl IwlDevice {
     ) -> Self {
         Self {
             mmio,
+            cap,
             chip,
             mac_addr,
             link_up: AtomicBool::new(false),
@@ -416,7 +419,7 @@ impl WirelessNetIface for IwlDevice {
 
             {
                 let mut tx_q = self.tx_q0.lock();
-                let mut mmio = IwlMmioImpl(self.mmio);
+                let mut mmio = IwlMmioImpl::new(self.mmio, self.cap);
                 let slot = tx_q.write_ptr;
 
                 // 1. Build IwlCmdHeader.
@@ -518,7 +521,7 @@ impl WirelessNetIface for IwlDevice {
 
         {
             let mut tx_q = self.tx_q0.lock();
-            let mut mmio = IwlMmioImpl(self.mmio);
+            let mut mmio = IwlMmioImpl::new(self.mmio, self.cap);
             let slot = tx_q.write_ptr;
 
             let cmd = tx::IwlTxCmd::for_management(frame.len() as u16, 0xFF);
@@ -667,7 +670,7 @@ async fn iwl_rx_pump(device: Arc<IwlDevice>, rx_prod: Producer<Frame, RX_RING_N>
 
         {
             let mut rx_q = device.rx_q.lock();
-            let mut mmio = IwlMmioImpl(device.mmio);
+            let mut mmio = IwlMmioImpl::new(device.mmio, device.cap);
             let wptr = mmio.read(rx::CSR_FH_RSCSR_CHNL0_STTS_WPTR_REG);
 
             rx::drain_rx_queue(
@@ -695,7 +698,7 @@ async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RIN
 
     while let Ok(frame) = tx_cons.recv().await {
         let mut tx_q = device.tx_q0.lock();
-        let mut mmio = IwlMmioImpl(device.mmio);
+        let mut mmio = IwlMmioImpl::new(device.mmio, device.cap);
 
         let slot = tx_q.write_ptr;
 
@@ -739,26 +742,8 @@ async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RIN
 
 // ── MMIO implementation ────────────────────────────────────────────
 
-struct IwlMmioImpl(narf_bus::MmioRegion);
-
-impl transport::IwlMmio for IwlMmioImpl {
-    fn read(&mut self, offset: u32) -> u32 {
-        // SAFETY: `self.0` is the BAR0 `MmioRegion` mapped by `map_bar`
-        // at probe; `offset` is a 32-bit register offset within BAR0
-        // (callers pass CSR/FH register constants), so the read is
-        // naturally aligned and in range, and the driver owns the
-        // device exclusively.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { self.0.read32(offset as u64) }
-    }
-    fn write(&mut self, offset: u32, value: u32) {
-        // SAFETY: `self.0` is the BAR0 `MmioRegion` from `map_bar`;
-        // `offset` is an in-range, naturally-aligned register offset
-        // within BAR0 and the driver owns the device exclusively.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { self.0.write32(offset as u64, value) }
-    }
-}
+mod mmio;
+use mmio::IwlMmioImpl;
 
 // ── Per-chip configuration table ───────────────────────────────────
 
@@ -1431,12 +1416,29 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
 /// (BAR0 mapping, MMIO programming, ALIVE handshake) is deferred
 /// until the gen2/gen3 transport paths land — this commit only
 /// validates that we can match the device + find its firmware.
+static OWNED: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     let chip = match chip_config_for_pci_id(device.id.vendor, device.id.device) {
         Some(c) => c,
         None => return Err(narf_bus::ProbeError::NotForThisDriver),
     };
 
+    let extra = {
+        let mut owner = OWNED.lock();
+        match *owner {
+            Some(address) if address == device.addr => return Ok(()),
+            Some(_) => true,
+            None => {
+                *owner = Some(device.addr);
+                false
+            }
+        }
+    };
+    mmio::park(&device, &cap).map_err(narf_bus::ProbeError::Other)?;
+    if extra {
+        return Ok(());
+    }
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("iwlwifi"),
         kind: narf_drivers::BoundKind::Net,
@@ -1456,6 +1458,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         chip.mac.prefix(),
         chip.rf_candidates,
     );
+
+    if rx_rfh::CompletionFormat::for_mac(chip.mac).is_none() {
+        let _ = writeln!(
+            narf_console::Writer,
+            "iwlwifi: Gen2 context-v1/RFH/MVM owner is not ready; device remains parked"
+        );
+        return Ok(());
+    }
 
     // Walk the firmware ladder. First match wins — the registry's
     // `open` returns NotFound for absent blobs, so we just iterate
@@ -1539,16 +1549,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
             // ── Hardware bring-up ──
 
-            // 1. Map BAR0.
-            // SAFETY: `device` is the PCIe function the bus handed this
-            // driver to probe, so it's a real PCIe device and this
-            // driver holds exclusive access to its cfg window for the
-            // duration of probe. BAR index 0 is iwlwifi's MMIO BAR.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            let mmio_region = unsafe { map_bar(&device, 0) }.map_err(|_| {
-                let _ = writeln!(narf_console::Writer, "  iwlwifi: BAR0 map failed");
-                narf_bus::ProbeError::Other("BAR0 map failed")
-            })?;
+            // Verify parking before BAR sizing and enable checked Device memory.
+            let mmio_region = mmio::map(&device, &cap).map_err(narf_bus::ProbeError::Other)?;
             if let Some(format) = rx_rfh::CompletionFormat::for_mac(chip.mac) {
                 // Country selection is deployment policy, not inferred from
                 // a language/timezone or an unauthenticated AP beacon.
@@ -1628,7 +1630,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 });
                 return Ok(());
             }
-            let mut mmio = IwlMmioImpl(mmio_region);
+            let mut mmio = IwlMmioImpl::new(mmio_region, cap);
 
             // 2. APM Init (clocks + reset prologue).
             transport::apm_init(&mut mmio).map_err(|e| {
@@ -1638,7 +1640,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
             // 3. Firmware load + ALIVE handshake.
             let mut allocator = fw_loader::DmaAllocatorImpl::new();
-            let mut alive = transport::PollingAliveSink::new(mmio_region);
+            let mut alive = transport::PollingAliveSink::new(mmio_region, cap);
 
             match fw_loader::load_firmware(&mut mmio, &chip, &parsed, &mut allocator, &mut alive) {
                 Ok(()) => {
@@ -1785,6 +1787,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
             let device = Arc::new(IwlDevice::new(
                 mmio_region,
+                cap,
                 chip,
                 mac_addr,
                 rx_q,

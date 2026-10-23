@@ -62,6 +62,14 @@ pub(super) struct Endpoint {
     pub dci: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StopIdentity {
+    pub generation: u64,
+    pub serial: u64,
+    pub slot: u8,
+    pub dci: u8,
+}
+
 #[derive(Debug)]
 struct Pending {
     identity: Endpoint,
@@ -69,6 +77,7 @@ struct Pending {
     serial: u64,
     trb: u64,
     poisoned: bool,
+    stopping: bool,
 }
 
 #[derive(Debug)]
@@ -119,6 +128,7 @@ impl State {
             serial,
             trb: 0,
             poisoned: false,
+            stopping: false,
         });
         let trb = publish();
         self.pending.as_mut().unwrap().trb = trb;
@@ -139,6 +149,16 @@ impl State {
         let Some(pending) = self.pending.as_mut() else {
             return false;
         };
+        if pending.stopping
+            && event[3] & (0x3f << 10) == 32 << 10
+            && event[3] >> 24 == u32::from(pending.identity.slot)
+            && event[3] & (0x1f << 16) == u32::from(pending.identity.dci) << 16
+        {
+            // Stop can force an event at the successor (not the old token)
+            // TRB. Quarantine all this endpoint's TEs until Stop+SetDequeue
+            // retire the old schedule; none may enter the lossy global queue.
+            return true;
+        }
         if super::completion::transfer_matches(
             &event,
             pending.identity.slot,
@@ -158,6 +178,9 @@ impl State {
         let Some(pending) = self.pending.as_mut() else {
             return Ok(None);
         };
+        if pending.stopping {
+            return Ok(None);
+        }
         pending.completion.take_matching(predicate).map_err(|_| {
             pending.poisoned = true;
             Error::Malformed
@@ -167,14 +190,56 @@ impl State {
     pub fn validate(&self, generation: u64, token: &Token) -> Result<(), Error> {
         let pending = self.pending.as_ref().ok_or(Error::Stale)?;
         if generation != token.generation
+            || pending.identity.generation != generation
+            || pending.identity.slot != token.slot
+            || pending.identity.dci != token.endpoint
             || pending.serial != token.serial
             || pending.trb != token.trb
         {
             return Err(Error::Stale);
         }
+        if pending.stopping {
+            return Err(Error::Busy);
+        }
         if pending.poisoned || pending.completion.conflicted() {
             return Err(Error::Malformed);
         }
+        Ok(())
+    }
+
+    pub fn begin_stop(&mut self, generation: u64, token: &Token) -> Result<StopIdentity, Error> {
+        let p = self.pending.as_mut().ok_or(Error::Stale)?;
+        if generation != token.generation || p.serial != token.serial || p.trb != token.trb {
+            return Err(Error::Stale);
+        }
+        if p.stopping {
+            return Err(Error::Busy);
+        }
+        p.stopping = true;
+        Ok(StopIdentity {
+            generation,
+            serial: p.serial,
+            slot: p.identity.slot,
+            dci: p.identity.dci,
+        })
+    }
+    pub fn validate_stop(&self, id: StopIdentity) -> Result<(), Error> {
+        let p = self.pending.as_ref().ok_or(Error::Stale)?;
+        if !p.stopping
+            || p.serial != id.serial
+            || p.identity.generation != id.generation
+            || p.identity.slot != id.slot
+            || p.identity.dci != id.dci
+        {
+            return Err(Error::Stale);
+        }
+        Ok(())
+    }
+    /// Only the completed Stop+SetDequeue coordinator may call this after
+    /// context verification and quarantined event-queue removal.
+    pub fn finish_stop(&mut self, id: StopIdentity) -> Result<(), Error> {
+        self.validate_stop(id)?;
+        self.pending = None;
         Ok(())
     }
 

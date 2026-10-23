@@ -81,16 +81,41 @@ Gen2/MVM station operation, AP mode, 6 GHz/HE/EHT and system suspend/resume
 still require separate software implementations. They are not hardware-only
 acceptance gates and are not enabled by this profile's station tests.
 
-## 3. Stage Progression
+## 3. Public interface and stage progression
 
 - **Stage 1**: PCI match table.
 - **Stage 2**: CSR/PRPH mapping + APM init + ucode header parsing.
-- **Stage 3**: Firmware loading (Gen2/Gen3) + ALIVE handshake.
+- **Stage 3**: Owned Gen3 firmware loading and DMA ALIVE handshake. Gen2
+  context-v1/RFH/TFH/MVM boot remains an explicit software dependency.
 - **Stage 4**: Interface traits, IPC ring integration, background
   RX/TX pumps, and the MLD station scan/association/data implementation.
 - **Stage 5 (In progress)**: First hardware boot/ALIVE, firmware init,
   scan, station association and IP-traffic acceptance. Software tests
   exercise these contracts without emulating the Intel radio.
+
+### 3.1 Native PCI and current authority
+
+Probe reserves one PCI function, leaves repeated owned-BDF dispatch untouched,
+and parks additional candidates. It clears inherited bus mastering and memory
+decode and verifies INTx disabled before BAR sizing, maps BAR0 with Device
+attributes, then verifies decode enabled with bus mastering still off. Unsupported
+Gen2 candidates remain parked: the old FH diagnostic loader cannot establish a
+working AX200/AX201 lifecycle and never publishes a synthetic station identity.
+
+Every native CSR/PRPH-window dword read/write executes inside `Cap::invoke` and
+checks the complete aligned BAR extent. Revoked/invalid reads return the gone
+sentinel and writes do nothing. RX publication/draining, host commands and data
+submissions check current authority before mutating device-visible ownership.
+PCI bus-master transitions require command readback. MSI-X mapping, configuration
+and enable/disable also execute inside invocation; if revocation prevents proving
+interrupt delivery disabled, teardown retains the vector reservation. These checks
+prove current-operation admission, not atomic exclusion of concurrent revocation.
+
+The diagnostic `PollingAliveSink::new(region,cap)` uses bounded scheduler polling,
+rejects gone/revoked reads and requires its observed status; an interrupt bit alone
+cannot manufacture a successful ALIVE. The live Gen3 path still requires the exact
+DMA notification and supported command versions described above. Real object-table
+revocation fixtures exercise native dword bounds and actual RX/command/data queues.
 
 ## 4. References
 

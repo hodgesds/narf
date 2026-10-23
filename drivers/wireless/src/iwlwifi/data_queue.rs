@@ -130,6 +130,9 @@ impl DataQueue {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<u16, &'static str> {
+        if !mmio.authorized() {
+            return Err("Wi-Fi authority revoked");
+        }
         let id = self.id.ok_or("TX queue not activated")?;
         if frame.len() < header_len
             || frame.len() > 4095

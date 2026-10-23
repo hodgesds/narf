@@ -337,19 +337,19 @@ kernel_test_in!(
 fn smoke_rtw89_fw_blob_names() -> TestResult {
     // The blob names mirror Linux's `request_firmware` keys. Catch
     // accidental rename drift.
-    if expected_blob_name(ChipId::Rtl8852A) != Some("rtw89/8852a_fw.bin") {
+    if expected_blob_name(ChipId::Rtl8852A) != Some("rtw89/rtw8852a_fw.bin") {
         return TestResult::Fail("8852A blob name drift");
     }
-    if expected_blob_name(ChipId::Rtl8852B) != Some("rtw89/8852b_fw.bin") {
+    if expected_blob_name(ChipId::Rtl8852B) != Some("rtw89/rtw8852b_fw.bin") {
         return TestResult::Fail("8852B blob name drift");
     }
-    if expected_blob_name(ChipId::Rtl8852C) != Some("rtw89/8852c_fw.bin") {
+    if expected_blob_name(ChipId::Rtl8852C) != Some("rtw89/rtw8852c_fw.bin") {
         return TestResult::Fail("8852C blob name drift");
     }
-    if expected_blob_name(ChipId::Rtl8851B) != Some("rtw89/8851b_fw.bin") {
+    if expected_blob_name(ChipId::Rtl8851B) != Some("rtw89/rtw8851b_fw.bin") {
         return TestResult::Fail("8851B blob name drift");
     }
-    if expected_blob_name(ChipId::Rtl8922A) != Some("rtw89/8922a_fw.bin") {
+    if expected_blob_name(ChipId::Rtl8922A) != Some("rtw89/rtw8922a_fw.bin") {
         return TestResult::Fail("8922A blob name drift");
     }
     TestResult::Pass
@@ -990,6 +990,9 @@ fn smoke_rtw89_h2c_prebuilt_helpers() -> TestResult {
     if h.cat != H2C_CAT_MAC_H2C || h.class != H2C_CL_MAC_FWDL_H2C {
         return TestResult::Fail("FWHDR_DL H2C wrong setup");
     }
+    if h.done_ack || h.rec_ack {
+        return TestResult::Fail("firmware bootstrap header must not request runtime ACKs");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_h2c_prebuilt_helpers);
@@ -1021,7 +1024,7 @@ fn smoke_rtw89_fwdl_constants() -> TestResult {
     if FW_HDR_V0_BASE_SIZE != 32 {
         return TestResult::Fail("v0 base hdr");
     }
-    if FW_HDR_V0_SECTION_SIZE != 12 {
+    if FW_HDR_V0_SECTION_SIZE != 16 {
         return TestResult::Fail("v0 section");
     }
     if FW_HDR_V1_BASE_SIZE != 48 {
@@ -1050,6 +1053,7 @@ fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
     blob.extend_from_slice(&sw0.to_le_bytes());
     blob.extend_from_slice(&sw1.to_le_bytes());
     blob.extend_from_slice(&sw2.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
     blob.extend(core::iter::repeat_n(0xABu8, 512));
 
     let mut sections = [FwSection {
@@ -1073,7 +1077,7 @@ fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
     if h.version != 0 {
         return TestResult::Fail("version");
     }
-    if h.hdr_len != 44 {
+    if h.hdr_len != 48 {
         return TestResult::Fail("hdr_len");
     }
     let s = &sections[0];
@@ -1086,7 +1090,7 @@ fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
     if s.len != 512 {
         return TestResult::Fail("section len");
     }
-    if s.payload_off != 44 {
+    if s.payload_off != 48 {
         return TestResult::Fail("payload_off");
     }
     TestResult::Pass
@@ -1105,6 +1109,7 @@ fn smoke_rtw89_fwdl_v0_chksum() -> TestResult {
     blob.extend_from_slice(&sw0.to_le_bytes());
     blob.extend_from_slice(&sw1.to_le_bytes());
     blob.extend_from_slice(&sw2.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
     blob.extend(core::iter::repeat_n(0x55u8, 1008));
 
     let mut sections = [FwSection {
@@ -1141,7 +1146,7 @@ fn smoke_rtw89_fwdl_v1_parse() -> TestResult {
         blob.extend_from_slice(&w.to_le_bytes());
     }
     let sw0 = 0x4000_0000u32;
-    let sw1 = (64u32 << 24) | 256u32;
+    let sw1 = (1u32 << 24) | 256u32;
     let sw2 = 0u32;
     let sw3 = 0u32;
     blob.extend_from_slice(&sw0.to_le_bytes());
@@ -1172,8 +1177,8 @@ fn smoke_rtw89_fwdl_v1_parse() -> TestResult {
         return TestResult::Fail("v1 major/minor");
     }
     let s = &sections[0];
-    if s.kind != 64 {
-        return TestResult::Fail("v1 BBMCU0");
+    if s.kind != 1 {
+        return TestResult::Fail("v1 inner section type; BBMCU belongs to outer MFW");
     }
     if s.dladdr != 0x4000_0000 {
         return TestResult::Fail("v1 dladdr");

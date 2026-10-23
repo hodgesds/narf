@@ -1,7 +1,8 @@
 # Broadcom FullMAC PCIe — software bring-up
 
-> Status: v0.5. BCM43602 CR4 firmware and retained PCIe control/flow/data
-> rings have production paths. Station and recovery remain software work.
+> Status: v0.6. BCM43602 CR4 firmware, retained PCIe control/flow/data
+> rings and a constrained FullMAC station path are implemented. Recovery remains
+> software work; physical validation is pending.
 
 ## 1. Purpose & scope
 
@@ -27,7 +28,7 @@ verify all three bits before BAR sizing, then enable and verify memory decode
 with bus mastering off. Repeated owned-BDF probes return before PCI access;
 extra devices are parked with decode and bus mastering disabled.
 The control BAR mapping ignores a firmware-provided prefetchable attribute.
-They publish a bound-driver inventory entry, not a network interface.
+They publish a bound-driver inventory entry before the separate station lifecycle.
 
 `chip::Backplane` supplies serialized fallible `read32`/`write32` operations.
 The production PCIe implementation keeps the BAR and capability private;
@@ -89,8 +90,9 @@ event payloads. Stale IDs, malformed extents/indices,
 uncorrelated flow/data completion, or bounded event overflow fail-stop the owner
 and attempt to disable BME. Native `command` and the 1-ms worker use an async
 mutex, with no IRQ lock across awaits. These are live control transport APIs,
-not station authorization. The existing `connect_wpa2_psk` is still an
-orchestration model without complete station/key/controlled-port integration.
+not station authorization. The native station owner described below exclusively
+consumes this transport when authenticated regulatory policy is available; the old
+`connect_wpa2_psk` helper remains an orchestration model.
 
 `enable_data` retains up to32 receive buffers of2048 bytes before publishing
 RX32 posts. The native bootstrap calls it before starting the packet worker.
@@ -105,10 +107,13 @@ combined outstanding packets/receipts are retained. A matching request ID plus
 flow ID and metadata-free classic16-byte TX completion retire exactly one body
 mapping after a CPU DMA-read release edge; `pop_tx_receipt` returns its result.
 `close_flow` refuses outstanding TX, then waits for the correlated delete ACK.
-Create/delete have2-second deadlines driven by the shared poller. Flow IDs are
-never reused; at most8 (or the lower firmware maximum) are allocated per owner.
-Closed ring mappings remain retained, so long-lived flow recycling is an explicit
-remaining software dependency rather than premature freeing/reuse.
+Create/delete have2-second deadlines driven by the shared poller. At most8 (or
+the lower firmware maximum) flow mappings are retained concurrently. A successful
+delete ACK after all exact TX completions fences firmware ownership and permits
+reusing that retained mapping and hardware ID; failed/timed-out deletes cannot.
+`FlowToken` includes a nonwrapping host generation so old software handles cannot
+act on a recycled ID. Mappings remain allocated until whole-device quiescence;
+recycling does not free DMA based only on PCI command readback.
 
 RX classic32-byte completions validate posted ID, interface, status, Ethernet
 format, full16-bit offset/length and buffer bounds. Payload is copied before
@@ -117,8 +122,31 @@ owned Ethernet frames; bounded RX queue pressure drops ordinary data and keeps
 buffer progress. Unknown/stale completion identity fails the owner. Native
 `open_flow`, `flow_state`, `send`, `close_flow`, `pop_received`, and
 `pop_tx_receipt` forward to this retained runtime through its async mutex.
-These are kernel transport APIs: station authorization, EAPOL/control-port
-policy and network publication are not implied by a flow token.
+These are kernel transport APIs for the control-only owner when regulatory policy
+is absent. Once promoted to the station owner, it exclusively owns the runtime;
+the native forwarding APIs return Failed/None instead of consuming its replies.
+Station authorization and network publication are not implied by a flow token.
+
+`station_transport::Adapter` implements the common `cyw43439::fullmac::Fullmac`
+command/event/data contract over real msgbuf rings. Query results are limited to
+the caller extent despite a longer iovar-name envelope; SET uses its actual input
+extent. It decodes posted vendor event frames, tracks bounded TX deadlines, and
+admits Ethernet only after the station's correlated link/key lifecycle authorizes
+a peer. Link-down drains exact TX receipts and acknowledged flow deletions before
+new-peer traffic. A bounded flow cache evicts idle destinations only through the
+same delete-ACK fence.
+
+For an exact registered BCM43602 board profile, native bootstrap loads an existing
+authenticated regulatory domain or signed wireless-regulatory.bin, then calls the
+common station attach path and publishes a named wireless/net interface only after
+firmware initialization. This chip's Linux firmware embeds CLM; no SDIO glom or
+external CLM commands are sent. The current shared profile restricts scanning and
+joining to authenticated 2.4-GHz channels, Open or firmware-supported WPA2-PSK/CCMP,
+a fixed BSSID and roam_off=1. Missing firmware supplicant support rejects WPA2;
+there is no host-PSK fallback. Firmware MAC/channels, canonical RSN IE, key/link
+events, controlled-port Ethernet-II checks and synchronous bounded network drains
+come from the same station implementation as CYW43439. No physical acceptance or
+5-GHz/WPA3/AP support is implied.
 
 The `runtime::Memory` contract separates CPU and DMA addresses and requires
 cache maintenance plus peripheral barriers at ownership transitions; the
@@ -161,18 +189,18 @@ x86_64 and aarch64; passing them does not establish physical operation.
 Implemented: PCI enumeration/exclusive authority, Device BAR0/BAR2,
 BCM43602 bank-derived CR4 boot, explicit verified firmware/NVRAM policy,
 shared5/6 TCM indices, retained common/control/flow/RX/TX DMA, bounded correlated
-IOCTL/events/data ownership, and native probe-to-runtime dispatch.
+IOCTL/events/data ownership, generation-safe retained flow recycling, shared
+station/control-port lifecycle and native probe-to-interface dispatch.
 
 Remaining software dependencies, in activation order:
 
 1. Nonzero descriptor-prefix geometry, actual platform-specific calibration
    policy registrations, board/OTP
    selection for other devices, additional CPU/RAM/chip profiles and shared7.
-2. Long-lived flow-ID recycling after confirmed delete/quiescence, larger
-   flow profiles and any firmware metadata/native802.11 RX modes.
-3. Regulatory/CLM attachment; live scan/association; firmware key and
-   authorization events; Ethernet/control-port admission; NARF frame rings
-   and wireless registry publication; disconnect/rekey/recovery replay.
+2. Larger flow profiles, firmware metadata/native802.11 RX modes and broader
+   bands/channel widths.
+3. Host WPA2 supplicant fallback for firmware without sup_wpa, WPA3/AP support,
+   and explicit rekey/recovery replay beyond firmware offload.
 4. Confirmed stop/IOMMU quiescence, recovery and DMA reclamation. MSI/IRQ
    operation may replace polling only with the same retained ownership.
 

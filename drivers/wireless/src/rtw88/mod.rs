@@ -73,3 +73,6 @@ mod pci_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod power_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod authority_tests;

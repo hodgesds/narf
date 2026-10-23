@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! FullMAC single-station commands over the live F2 runtime.
+//! FullMAC single-station commands over retained BCDC or msgbuf runtimes.
 //! References: Linux brcmfmac/{common,cfg80211}.c and fwil_types.h.
 
 use super::{
     events,
+    fullmac::Fullmac,
     ioctl::{self, Direction},
-    runtime::{Error, Runtime},
-    PacketTransport,
+    runtime::Error,
 };
+#[cfg(any(test, feature = "kernel-test"))]
+use super::{runtime::Runtime, PacketTransport};
 use alloc::{vec, vec::Vec};
 use narf_wireless::{AssociateRequest, BssInfo, ScanRequest, SecurityConfig};
 
@@ -17,8 +19,8 @@ pub struct Bss {
     pub ies: Vec<u8>,
 }
 
-pub struct Station<T: PacketTransport> {
-    pub runtime: Runtime<T>,
+pub struct Station<R: Fullmac> {
+    pub runtime: R,
     pub mac: [u8; 6],
     pub channels: Vec<u8>,
     domain: narf_wireless::reg::RegulatoryDomain,
@@ -28,25 +30,25 @@ pub struct Station<T: PacketTransport> {
     pub supplicant: bool,
     operation: bool,
 }
-impl<T: PacketTransport> core::fmt::Debug for Station<T> {
+impl<R: Fullmac> core::fmt::Debug for Station<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CywStation")
+        f.debug_struct("FullmacStation")
             .field("mac", &self.mac)
             .field("bssid", &self.bssid)
             .finish_non_exhaustive()
     }
 }
 
-impl<T: PacketTransport> Station<T> {
+impl<R: Fullmac> Station<R> {
     /// Initialize firmware IOCTLs, CLM, regulatory policy and event delivery.
     /// The caller supplies a completed firmware-loader transport and an
     /// authenticated host policy; no interface may be published before success.
     pub async fn initialize(
-        mut runtime: Runtime<T>,
+        mut runtime: R,
         clm: &[u8],
         domain: narf_wireless::reg::RegulatoryDomain,
     ) -> Result<Self, Error> {
-        if clm.is_empty()
+        if (R::EXTERNAL_CLM && clm.is_empty())
             || clm.len() > 1024 * 1024
             || !domain.country_code.iter().all(u8::is_ascii_uppercase)
         {
@@ -69,16 +71,15 @@ impl<T: PacketTransport> Station<T> {
             payload[12..].copy_from_slice(chunk);
             set_var(&mut runtime, "clmload", &payload).await?;
         }
-        if get_var(&mut runtime, "clmload_status", 4).await?.as_slice() != [0; 4] {
+        if !clm.is_empty() && get_var(&mut runtime, "clmload_status", 4).await?.as_slice() != [0; 4]
+        {
             return Err(Error::Firmware(1));
         }
         let mut country = [0; 12];
         country[..2].copy_from_slice(&domain.country_code);
         country[8..10].copy_from_slice(&domain.country_code);
         set_var(&mut runtime, "country", &country).await?;
-        set_var(&mut runtime, "bus:txglom", &0u32.to_le_bytes()).await?;
-        // A single-packet host adapter never consumes an unnegotiated superframe.
-        set_var(&mut runtime, "bus:rxglom", &0u32.to_le_bytes()).await?;
+        runtime.configure_bus().await?;
         set_int(&mut runtime, 86, 0).await?; // WLC_SET_PM: continuously awake.
         set_int(&mut runtime, 20, 1).await?; // Infrastructure station.
         set_int(&mut runtime, 22, 0).await?; // Open-system 802.11 authentication.
@@ -426,6 +427,7 @@ impl<T: PacketTransport> Station<T> {
                     }
                 }
                 if associated && keys {
+                    self.runtime.set_link(Some(request.bssid));
                     self.bssid = Some(request.bssid);
                     // No packets captured before authorization reach the stack.
                     while self.runtime.pop_data().is_some() {}
@@ -457,8 +459,6 @@ impl<T: PacketTransport> Station<T> {
         self.operation = true;
         let result = self.disconnect_inner().await;
         if result.is_err() {
-            // A rejected DISASSOC does not establish firmware link-down.
-            // Do not reuse old SET_SSID/PSK events for a later attempt.
             self.runtime.fail();
         }
         self.operation = false;
@@ -467,6 +467,7 @@ impl<T: PacketTransport> Station<T> {
 
     async fn disconnect_inner(&mut self) -> Result<(), Error> {
         let peer = self.bssid.take();
+        self.runtime.set_link(None);
         self.runtime
             .command(Direction::Set, 52, &[], MAX_REPLY)
             .await?;
@@ -516,6 +517,7 @@ impl<T: PacketTransport> Station<T> {
                 }
             }
         }
+        self.runtime.set_link(self.bssid);
         Ok(())
     }
 }
@@ -561,18 +563,14 @@ fn validate_association_ies(mut ies: &[u8], secure: bool) -> Result<(), Error> {
 async fn wait() {
     narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
 }
-async fn set_int<T: PacketTransport>(
-    runtime: &mut Runtime<T>,
-    command: u32,
-    value: u32,
-) -> Result<(), Error> {
+async fn set_int<R: Fullmac>(runtime: &mut R, command: u32, value: u32) -> Result<(), Error> {
     runtime
         .command(Direction::Set, command, &value.to_le_bytes(), MAX_REPLY)
         .await
         .map(|_| ())
 }
-pub(super) async fn set_var<T: PacketTransport>(
-    runtime: &mut Runtime<T>,
+pub(super) async fn set_var<R: Fullmac>(
+    runtime: &mut R,
     name: &str,
     value: &[u8],
 ) -> Result<(), Error> {
@@ -584,11 +582,7 @@ pub(super) async fn set_var<T: PacketTransport>(
         .await
         .map(|_| ())
 }
-async fn get_var<T: PacketTransport>(
-    runtime: &mut Runtime<T>,
-    name: &str,
-    length: usize,
-) -> Result<Vec<u8>, Error> {
+async fn get_var<R: Fullmac>(runtime: &mut R, name: &str, length: usize) -> Result<Vec<u8>, Error> {
     let mut payload = name.as_bytes().to_vec();
     payload.push(0);
     runtime.command(Direction::Get, 262, &payload, length).await

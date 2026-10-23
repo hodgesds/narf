@@ -587,6 +587,9 @@ impl<T: Hif + HostMemory> Runtime<T> {
         }
         Err(Error::Timeout)
     }
+    pub fn take_early_htt(&mut self) -> Option<Vec<u8>> {
+        self.early_htt.pop_front()
+    }
     pub async fn start(&mut self) -> Result<Ready, Error> {
         if self.failed || self.ready.is_some() {
             return Err(Error::Failed);

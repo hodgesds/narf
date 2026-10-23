@@ -71,6 +71,7 @@ pub mod chipclk;
 pub mod core;
 pub mod events;
 pub mod firmware;
+pub mod fullmac;
 pub mod gspi;
 pub mod interface;
 pub mod ioctl;

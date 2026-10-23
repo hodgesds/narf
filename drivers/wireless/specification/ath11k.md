@@ -122,15 +122,16 @@ MHI/QMI support for another revision do not imply a registered WLAN:
 | Hardware | Reachable software | Remaining software gate |
 |---|---|---|
 | WCN6855 / QCA2066 / QCA6698AQ | MHI/QMI, CE/HTC/WMI, DP and STA/AP/P2P interfaces | Target-card and AP interoperability validation remains; optional Linux features outside this profile are not implied |
-| QCA6390 HW2.0 | Native IPQ8074 RX/error/fragment DP and production core/CE profile; resource and host vdev capacity four | Native DMA fixtures pass both architectures; composed production-profile CE startup, WPA2 station/data and four-slot tests await the new integrated gate; physical interoperability remains |
+| QCA6390 HW2.0 | Native IPQ8074 RX/error/fragment DP and production core/CE profile; resource and host vdev capacity four | Native DMA fixtures pass both architectures; composed production-profile CE startup, WPA2 station/data and four-slot tests pass on x86_64; those integration fixtures are x86-only; physical interoperability remains |
 | QCN9074 HW1.0 | Recognized PCI ID; configuration definitions; probe rejects before MMIO/MSI/firmware activation | Static BAR windows, QCN9074 HAL register map/operations, core configuration, per-pdev/REO/HTT-v2 and RX descriptor runtime are not ported |
 
 Probe first verifies inherited bus mastering and memory decode are off,
 with INTx masked, using command-register readback. Rejected family/singleton
 functions stay parked. Repeated dispatch of the already owned canonical PCI
 address returns before config/MMIO access, preserving its active DMA.
-Accepted profiles enable and read back memory decode
-only after that parking proof. Probe validates the complete
+Accepted profiles retain decode off during capability-invoked BAR sizing
+and mapping; memory decode is enabled and read back only after sizing writes
+have been restored. Probe validates the complete
 HAL/core/DP/MHI software profile before enabling memory decode. It repeats
 the check after refining the silicon revision and before MSI allocation or
 reset; BME is enabled only after those checks and PCI power-up succeed.
@@ -567,8 +568,9 @@ continuation coalescing and fragment reinjection all use that view.
 attn_is_decrypted, attn_is_mcbc}` accept this view. Descriptor length
 rewrite uses byte 96 on QCA6390 and byte 104 on WCN6855.
 The four native receive/error/coalescing/fragment DMA fixtures pass on both
-architectures; composed core/startup/station tests exercise the selected
-production profile in the next integrated gate. `DpRingSizes::LINUX` is what
+architectures; composed core/startup/station tests pass on x86_64 and exercise
+the selected production profile. Those integration fixtures are x86-only.
+`DpRingSizes::LINUX` is what
 bring-up uses; tests shrink rings.
 
 Call order (Linux call sites):
@@ -1712,8 +1714,8 @@ Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
   `rx_desc.h::hal_rx_desc_ipq8074`, native HAL accessors and DP parameters,
   four-vdev firmware/host capacity and production core dispatch. Its
   normal/error/coalescing/CCMP fragment fixtures pass both architectures;
-  the new composed production startup/station fixture still needs the next
-  integrated gate. QCN9074 remains rejected with BME disabled before
+  the composed production startup/station fixture passes on x86_64 and is
+  not included in the ARM integration configuration. QCN9074 remains rejected with BME disabled before
   MMIO/MSI/firmware activation. It needs the
   static CE/UMAC BAR windows, HAL register/operation tables, non-shadow
   ring setup and its independent core/peer-map/RX/runtime profile. Tests

@@ -111,3 +111,165 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_realtek_repeat_probe_preserves_bound_function
 );
+
+struct MappingModel {
+    command: u16,
+    sticky: u16,
+    ignored: u16,
+    failed: Option<usize>,
+    calls: usize,
+    trace: Vec<(u8, u16)>,
+}
+impl MappingModel {
+    fn new(command: u16) -> Self {
+        Self {
+            command,
+            sticky: 0,
+            ignored: 0,
+            failed: None,
+            calls: 0,
+            trace: Vec::new(),
+        }
+    }
+    fn operation(&mut self, kind: u8, bits: u16) -> Result<u16, ()> {
+        self.trace.push((kind, bits));
+        let call = self.calls;
+        self.calls += 1;
+        if self.failed == Some(call) {
+            return Err(());
+        }
+        match kind {
+            0 => self.command &= !(bits & !self.sticky),
+            1 => self.command |= bits & !self.ignored,
+            _ => {}
+        }
+        Ok(self.command)
+    }
+}
+fn mapping(state: &RefCell<MappingModel>, failure: bool) -> Result<u8, narf_bus::BarError> {
+    super::pci_park::map_with(
+        |bits| state.borrow_mut().operation(0, bits),
+        |bits| state.borrow_mut().operation(1, bits),
+        || state.borrow_mut().operation(2, 0),
+        || {
+            let mut g = state.borrow_mut();
+            let command = g.command;
+            g.trace.push((3, command));
+            if command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != INTX_DISABLE {
+                return Err(narf_bus::BarError::MappingFailed);
+            }
+            if failure {
+                Err(narf_bus::BarError::Unimplemented)
+            } else {
+                Ok(7)
+            }
+        },
+    )
+}
+fn smoke_realtek_bar_sizing_requires_disabled_decode() -> TestResult {
+    for initial in [0, BUS_MASTER | MEM_SPACE, 0xffff] {
+        let state = RefCell::new(MappingModel::new(initial));
+        if mapping(&state, false) != Ok(7) {
+            return TestResult::Fail("valid Realtek BAR sizing policy rejected");
+        }
+        let g = state.borrow();
+        let parked = (initial & !(BUS_MASTER | MEM_SPACE)) | INTX_DISABLE;
+        if g.command != parked | MEM_SPACE
+            || g.trace.as_slice()
+                != [
+                    (0, BUS_MASTER | MEM_SPACE),
+                    (1, INTX_DISABLE),
+                    (2, 0),
+                    (3, parked),
+                    (1, MEM_SPACE),
+                    (2, 0),
+                ]
+        {
+            return TestResult::Fail("Realtek BAR sizing ran with decode/DMA enabled");
+        }
+    }
+    let state = RefCell::new(MappingModel::new(BUS_MASTER | MEM_SPACE));
+    if mapping(&state, true) != Err(narf_bus::BarError::Unimplemented)
+        || state.borrow().command != INTX_DISABLE
+        || state.borrow().trace.len() != 4
+    {
+        return TestResult::Fail("failed Realtek mapping enabled decode or discarded BAR error");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_realtek_bar_sizing_requires_disabled_decode
+);
+
+fn smoke_realtek_bar_mapping_requires_each_config_transition() -> TestResult {
+    // Five native command operations: clear both, mask IRQ, read parked,
+    // enable decode after restored sizing, read final parked-DMA policy.
+    for failed in 0..5 {
+        let state = RefCell::new(MappingModel::new(BUS_MASTER | MEM_SPACE));
+        state.borrow_mut().failed = Some(failed);
+        if mapping(&state, false) != Err(narf_bus::BarError::MappingFailed)
+            || state.borrow().calls != failed + 1
+        {
+            return TestResult::Fail("Realtek mapping continued after configuration failure");
+        }
+        if failed < 3 && state.borrow().trace.iter().any(|e| e.0 == 3) {
+            return TestResult::Fail("Realtek BAR sizing preceded verified parking");
+        }
+    }
+    for (sticky, ignored) in [
+        (BUS_MASTER, 0),
+        (MEM_SPACE, 0),
+        (0, INTX_DISABLE),
+        (0, MEM_SPACE),
+    ] {
+        let state = RefCell::new(MappingModel::new(BUS_MASTER | MEM_SPACE));
+        state.borrow_mut().sticky = sticky;
+        state.borrow_mut().ignored = ignored;
+        if mapping(&state, false) != Err(narf_bus::BarError::MappingFailed)
+            || ((sticky != 0 || ignored == INTX_DISABLE)
+                && state.borrow().trace.iter().any(|e| e.0 == 3))
+        {
+            return TestResult::Fail("Realtek BAR mapping accepted computed writes as readback");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_realtek_bar_mapping_requires_each_config_transition
+);
+
+fn smoke_realtek_revocation_prevents_bar_sizing_and_decode_changes() -> TestResult {
+    use narf_bus::BusDeviceCap;
+    use narf_capabilities::{object_table, Cap, CapError, CapKind, CapSlot, Rights, Write};
+    let (index, generation) = object_table::register(CapKind::BusDevice);
+    // SAFETY: the fixture owns the newly registered BusDevice object and
+    // mints only its declared type, current generation and Write rights.
+    let cap: Cap<BusDeviceCap, Write> = unsafe {
+        Cap::mint(CapSlot::new(
+            generation,
+            index,
+            Write::BITS,
+            CapKind::BusDevice as u32,
+        ))
+    };
+    let state = RefCell::new(MappingModel::new(BUS_MASTER | MEM_SPACE));
+    if super::pci_park::invoke(&cap, || mapping(&state, false)) != Ok(Ok(7)) {
+        return TestResult::Fail("current Realtek mapping invocation rejected");
+    }
+    cap.revoke();
+    state.borrow_mut().trace.clear();
+    state.borrow_mut().command = BUS_MASTER | MEM_SPACE;
+    if super::pci_park::invoke(&cap, || mapping(&state, false)) != Err(CapError::Revoked)
+        || !state.borrow().trace.is_empty()
+        || state.borrow().command != BUS_MASTER | MEM_SPACE
+    {
+        return TestResult::Fail("revoked Realtek authority entered config/BAR sizing operation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_realtek_revocation_prevents_bar_sizing_and_decode_changes
+);

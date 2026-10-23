@@ -82,6 +82,27 @@ fresh-key constructor must not replace an identical live/retired key; station
 integration retains key slots across EAPOL retries. This dependency does not
 publish a station, install RSNA keys or open the controlled port.
 
+`packet_codec::{receive,transmit}` and `packet_transport::Owner<UsbIo>` are
+the native USB transport dependency. RX uses the physically 24-byte
+`rxdesc16`, complete PHY/shift extents, packet count and 128-byte aggregate
+alignment. Reports remain separate raw post-descriptor records; CRC/ICV-bad
+MPDUs are dropped. No translated-Ethernet fallback exists. TX uses the Linux
+32-byte descriptor, native DA multicast bit, software sequence, XOR checksum
+and a fixed legacy 1Mbps rate. A future production station profile must admit
+only a 2.4GHz/20MHz AP supporting that rate; no HT/VHT mode is implied.
+
+The packet owner posts one persistent 4096-byte RX receipt, keeps it over
+indefinite quiet polls, copies/validates exact completions before reposting,
+and serializes TX through descriptor-derived management/BE endpoint mapping.
+USB completion means host delivery, not a radio ACK. Every transfer/extent
+failure is terminal without buffer reuse. `Owner::stop` uses the USB proven
+Stop Endpoint/Set TR Dequeue contract; drop/error keeps unretired receipts and
+fails the owner. Successful stop permits a restart only on its immutable
+channel. RF/FIFO quiescence before retune is separate software work: changing
+a channel label cannot qualify queued RX bytes. This transport is not yet
+bound to a station/network service; MAC TX/RX and controlled-port admission
+remain closed until channel/power, MLME and retained shared RSNA are composed.
+
 Legacy synchronous stripped-payload loading returns `UseAsyncOwner`; the old
 unverified all-radio helper returns `NotImplemented` before transport access.
 
@@ -126,12 +147,14 @@ diagnostic with checked LC/IQK through the production probe. It is not ready for
 | MAC/BB/AGC/RF table application | Implemented with source-matched tables and checked transfers |
 | Checked post-table MAC, CAM-clear, LC/full IQK and factory gain indices | Implemented; composed owner/status/error/cancellation regressions |
 | Policy-admitted channel/power and RX activation | Missing; factory gain indices are not dBm policy |
-| Management TX/RX, passive scan and real station MLME | Missing |
+| Native USB descriptor/packet ownership | Implemented dependency; persistent receipt/stop and Linux descriptor regressions |
+| Management TX/RX dispatch, passive scan and real station MLME | Missing; transport is not yet station-bound |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Missing |
 | Regulatory channel/power, rates, coexistence | Missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
-| Disconnect callbacks, endpoint stop/drain, reset/PM recovery | Missing; software prerequisites |
+| Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
+| Disconnect callbacks, EP0/Halted reset, FIFO retune and PM recovery | Missing; software prerequisites |
 
 Linux references: `rtl8xxxu/8188e.c` power/reset, IQK and fops;
 `rtl8xxxu/core.c` firmware, post-table init, HSSI, LC and IQ matrix functions;

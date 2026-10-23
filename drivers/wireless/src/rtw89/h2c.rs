@@ -296,9 +296,7 @@ pub fn make_scanofld_h2c(seq: u8, is_be: bool) -> H2cBuilder {
 /// `FWHDR_DL` H2C — firmware header download. Class `H2C_CL_MAC_FWDL`,
 /// function `H2C_FUNC_MAC_FWHDR_DL`. Used during firmware upload.
 pub fn make_fwhdr_dl_h2c(seq: u8) -> H2cBuilder {
-    H2cBuilder::new(H2C_CAT_MAC, H2C_CL_MAC_FWDL, H2C_FUNC_MAC_FWHDR_DL)
-        .with_seq(seq)
-        .with_done_ack(true)
+    H2cBuilder::new(H2C_CAT_MAC, H2C_CL_MAC_FWDL, H2C_FUNC_MAC_FWHDR_DL).with_seq(seq)
 }
 
 /// `_ = FWCMD_TYPE_H2C` — keep the import alive in users that don't

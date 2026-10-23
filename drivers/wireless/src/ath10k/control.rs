@@ -23,6 +23,11 @@ impl From<BmiError> for Error {
 pub(super) trait Hif {
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError>;
     async fn receive(&mut self, budget_ms: u64) -> Result<(u8, Vec<u8>), BmiError>;
+    /// Optional idle-safe progress. A timeout of an outstanding protocol wait
+    /// remains an error; native polling overrides this without cancelling DMA.
+    async fn poll(&mut self, budget_ms: u64) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        Ok(Some(self.receive(budget_ms).await?))
+    }
 }
 impl Hif for super::boot::PciBoot {
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
@@ -30,6 +35,9 @@ impl Hif for super::boot::PciBoot {
     }
     async fn receive(&mut self, budget_ms: u64) -> Result<(u8, Vec<u8>), BmiError> {
         self.hif_receive(budget_ms).await
+    }
+    async fn poll(&mut self, budget_ms: u64) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        self.hif_poll(budget_ms).await
     }
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -350,6 +358,53 @@ impl<T: Hif> Session<T> {
         self.transport.send(endpoint.pipe, &frame).await?;
         self.failed = false;
         Ok(())
+    }
+    pub async fn send_htt(&mut self, payload: &[u8]) -> Result<(), Error> {
+        if !self.started || self.failed {
+            return Err(Error::Failed);
+        }
+        let endpoint = &mut self.endpoints[self.htt as usize];
+        if endpoint.service != 0x300
+            || endpoint.flow
+            || payload.is_empty()
+            || payload.len() > usize::from(endpoint.maximum)
+        {
+            return Err(Error::Malformed);
+        }
+        self.failed = true;
+        let mut frame = owned(&[0; 8])?;
+        frame
+            .try_reserve_exact(payload.len())
+            .map_err(|_| Error::NoMemory)?;
+        frame[0] = self.htt;
+        frame[2..4].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+        frame[5] = endpoint.sequence;
+        endpoint.sequence = endpoint.sequence.wrapping_add(1);
+        frame.extend_from_slice(payload);
+        self.transport.send(endpoint.pipe, &frame).await?;
+        self.failed = false;
+        Ok(())
+    }
+    pub async fn poll(&mut self) -> Result<Option<(u8, Vec<u8>)>, Error> {
+        if !self.started || self.failed {
+            return Err(Error::Failed);
+        }
+        self.failed = true;
+        if let Some(payload) = self.payloads.pop_front() {
+            self.failed = false;
+            return Ok(Some(payload));
+        }
+        let wire = if let Some(wire) = self.pending_wire.pop_front() {
+            Some(wire)
+        } else {
+            self.transport.poll(0).await?
+        };
+        if let Some((pipe, bytes)) = wire {
+            self.accept(pipe, &bytes)?;
+        }
+        let result = self.payloads.pop_front();
+        self.failed = false;
+        Ok(result)
     }
     pub async fn receive(&mut self) -> Result<(u8, Vec<u8>), Error> {
         if !self.started || self.failed {

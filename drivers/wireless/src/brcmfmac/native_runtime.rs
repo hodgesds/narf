@@ -92,6 +92,36 @@ pub(super) fn start(device: &mut BrcmfmacDevice) {
                 return;
             }
         };
+        // Authenticated regulatory policy and exact board firmware are both
+        // prerequisites. Missing policy leaves only the diagnostic control
+        // owner; it cannot register a NIC or authorize a station.
+        if station_policy() {
+            let Some(name) = available_name() else {
+                let _ = writeln!(narf_console::Writer, "brcmfmac: no free interface name");
+                return;
+            };
+            let adapter = match super::station_transport::Adapter::new(runtime) {
+                Ok(a) => a,
+                Err(_) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "brcmfmac: station transport setup failed"
+                    );
+                    return;
+                }
+            };
+            match crate::cyw43439::interface::attach_runtime(&name, adapter, &[]).await {
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "brcmfmac: station attachment failed: {:?}",
+                        error
+                    );
+                }
+            }
+            return;
+        }
         *RUNTIME.lock().await = Some(runtime);
         loop {
             {
@@ -408,4 +438,36 @@ pub async fn pop_received() -> Option<Vec<u8>> {
 }
 pub async fn pop_tx_receipt() -> Option<runtime::TxReceipt> {
     RUNTIME.lock().await.as_mut()?.pop_tx_receipt()
+}
+
+fn station_policy() -> bool {
+    if narf_wireless::reg::db::get_domain().is_some() {
+        return true;
+    }
+    let Some(authority) = narf_firmware::trusted_loader_authority().and_then(|c| c.derive().ok())
+    else {
+        return false;
+    };
+    let Ok(cap) = narf_firmware::open("wireless-regulatory.bin", &authority) else {
+        return false;
+    };
+    let Ok(view) = narf_firmware::view_of(&cap) else {
+        return false;
+    };
+    if view.signer.is_none() {
+        return false;
+    }
+    let Ok(domain) = narf_wireless::reg::parse_policy(view.bytes) else {
+        return false;
+    };
+    narf_wireless::reg::db::set_domain(domain);
+    true
+}
+fn available_name() -> Option<alloc::string::String> {
+    (0..16).map(|i| alloc::format!("wlan{}", i)).find(|name| {
+        narf_net::iface::lookup(name).is_none()
+            && !narf_wireless::registry::list()
+                .iter()
+                .any(|iface| iface.name() == name)
+    })
 }

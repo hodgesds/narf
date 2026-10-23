@@ -1,8 +1,8 @@
 //! Verified PCI parking before Qualcomm/Atheros MMIO, including rejected
 //! software profiles and additional radios the singleton cannot own.
 use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
-use narf_bus::{BusDevice, BusDeviceCap};
-use narf_capabilities::{Cap, Write};
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
+use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 trait Config {
     fn clear(&mut self, bits: u16) -> Result<(), ()>;
@@ -62,6 +62,43 @@ pub(crate) fn park(
         memory,
         owner == Some(device.addr),
     )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)
+}
+
+/// BAR sizing performs all-ones PCI BAR writes. Keep decode and inherited
+/// DMA parked until every sizing write is restored, then enable memory.
+fn map_prepared<T>(config: &mut impl Config, map: impl FnOnce() -> Result<T, ()>) -> Result<T, ()> {
+    prepare(config, false)?;
+    let region = map()?;
+    prepare(config, true)?;
+    Ok(region)
+}
+pub(crate) fn invoke<T>(
+    cap: &Cap<BusDeviceCap, Write>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, CapError> {
+    struct Access<F>(F);
+    impl<T, F: FnOnce() -> T> CapOp<BusDeviceCap, Write> for Access<F> {
+        type Output = T;
+        fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+            Ok(self.0())
+        }
+    }
+    cap.invoke(Access(operation))
+}
+pub(crate) fn map_bar_control(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    index: u8,
+) -> Result<MmioRegion, narf_bus::ProbeError> {
+    invoke(cap, || {
+        map_prepared(&mut Function { cap, device }, || {
+            // SAFETY: exclusive current PCI authority; map_prepared verifies
+            // BME/MEM disabled before BAR sizing, restores decode only after.
+            unsafe { narf_bus::map_bar_control(device, index) }.map_err(|_| ())
+        })
+    })
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?
     .map_err(|_| narf_bus::ProbeError::BadDevice)
 }
 
@@ -174,5 +211,98 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/qualcomm",
         smoke_qualcomm_pci_repeat_owner_is_not_parked
+    );
+
+    fn smoke_qualcomm_bar_sizing_is_decode_parked_and_capability_scoped() -> TestResult {
+        use alloc::rc::Rc;
+        use core::cell::{Cell, RefCell};
+        struct Timed {
+            state: Rc<Cell<u16>>,
+            events: Rc<RefCell<Vec<(u8, u16)>>>,
+        }
+        impl Config for Timed {
+            fn clear(&mut self, bits: u16) -> Result<(), ()> {
+                self.state.set(self.state.get() & !bits);
+                self.events.borrow_mut().push((0, self.state.get()));
+                Ok(())
+            }
+            fn set(&mut self, bits: u16) -> Result<(), ()> {
+                self.state.set(self.state.get() | bits);
+                self.events.borrow_mut().push((1, self.state.get()));
+                Ok(())
+            }
+            fn read(&mut self) -> Result<u16, ()> {
+                self.events.borrow_mut().push((2, self.state.get()));
+                Ok(self.state.get())
+            }
+        }
+        let state = Rc::new(Cell::new(BUS_MASTER | MEM_SPACE));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut config = Timed {
+            state: state.clone(),
+            events: events.clone(),
+        };
+        let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+        let result = invoke(&cap, || {
+            map_prepared(&mut config, || {
+                events.borrow_mut().push((3, state.get()));
+                if state.get() & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != INTX_DISABLE {
+                    return Err(());
+                }
+                Ok(17)
+            })
+        });
+        if result != Ok(Ok(17))
+            || state.get() != MEM_SPACE | INTX_DISABLE
+            || events.borrow().as_slice()
+                != [
+                    (0, 0),
+                    (1, INTX_DISABLE),
+                    (2, INTX_DISABLE),
+                    (3, INTX_DISABLE),
+                    (0, INTX_DISABLE),
+                    (1, INTX_DISABLE),
+                    (2, INTX_DISABLE),
+                    (1, MEM_SPACE | INTX_DISABLE),
+                    (2, MEM_SPACE | INTX_DISABLE),
+                ]
+        {
+            return TestResult::Fail(
+                "BAR sizing ran with decode/DMA enabled or decode opened before restored sizing",
+            );
+        }
+        cap.revoke();
+        events.borrow_mut().clear();
+        if invoke(&cap, || {
+            map_prepared(&mut config, || {
+                events.borrow_mut().push((3, 0));
+                Ok(0)
+            })
+        }) != Err(CapError::Revoked)
+            || !events.borrow().is_empty()
+        {
+            return TestResult::Fail("revoked mapping operation touched config space or BARs");
+        }
+        let mut sticky = Fake {
+            command: MEM_SPACE | BUS_MASTER,
+            sticky: MEM_SPACE,
+            ignored: 0,
+            trace: vec![],
+        };
+        let mapped = Cell::new(false);
+        if map_prepared(&mut sticky, || {
+            mapped.set(true);
+            Ok(())
+        })
+        .is_ok()
+            || mapped.get()
+        {
+            return TestResult::Fail("unverified decode parking admitted BAR sizing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/qualcomm",
+        smoke_qualcomm_bar_sizing_is_decode_parked_and_capability_scoped
     );
 }

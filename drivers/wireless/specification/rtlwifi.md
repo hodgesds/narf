@@ -1,7 +1,7 @@
 # rtlwifi — Specification
 
-> Status: corrected PCI/EFUSE identity lifecycle; firmware and station
-> runtime remain incomplete.
+> Status: PCI/EFUSE identity plus retained RTL8188EE paged firmware lifecycle;
+> native packet/RF/station software remains incomplete.
 
 ## 1. Purpose & scope
 
@@ -26,7 +26,10 @@ BME requires a future complete firmware/ring/reset owner.
 
 `RtlwifiDevice::registers` is the mandatory BAR2 `map_bar_control` mapping;
 it must cover through EFUSE access gate `0xcf`. Probe enables MEM decoding,
-runs the existing power table and reads factory identity with IRQs masked.
+runs the profile power flow and reads factory identity with IRQs masked.
+The mapping and actual power/IRQ/EFUSE operations execute inside the current
+PCI `Cap::invoke` operation. The same invocation helper protects every native
+firmware access; holding a retained token alone grants no register access.
 MAC/LLT code is not dispatched as if a packet DMA owner already existed.
 
 `efuse::read_mac(registers, pci_device_id, pci_function)` reads sparse physical
@@ -46,6 +49,40 @@ Unknown geometry/functions fail before I/O. Sparse-map bounds/overrides
 share the checked Realtek record decoder. Scan, association and configuration
 continue to return `NotSupported`; packet TX remains unavailable.
 
+`power::run_with(io, cut, fab, interface, table)` is the production-shared
+byte-register parser: selected rows preserve unrelated fields, PCI rows use
+MAC base, register failures stop at the exact transaction, and unknown commands,
+invalid delay units or missing END fail. `power_on_with` selects the flow.
+RTL8188EE uses the complete Linux PCI NIC-enable flow, including
+CardDisabled→CardEmu, BB reset, Schmitt trigger and LDO-normal. It first performs
+the Linux XCK-output/HWPDN/reserved-register-unlock prefix. Other parts still
+require their complete reset/power qualification.
+
+RTL8188EE probe retains `firmware_transport::Owner<firmware_native::PciIo>`
+before spawning `initialize_registered()`. `RtlwifiDevice::firmware_status()`
+returns the shared attempt state; other profiles return None. Registry selection
+uses exactly `rtlwifi/rtl8188eefw.bin`, authenticated through firmware authority.
+The complete 32-byte header, exact nonempty declared RAM-code length, 88E1
+signature and at most eight 4096-byte pages are checked before allocation/I/O.
+The EE filename remains mandatory because the signature alone cannot distinguish
+USB EU firmware. Supplied-byte `initialize` is for authenticated owners/tests.
+
+The one-shot owner closes CR HCI/TX/RX DMA and MAC packet gates and verifies
+readback, enables the CPU clock, performs 8051 reset when replacing a running
+image, writes selected 4KiB pages at MMIO0x1000 in bounded byte chunks, pads the
+final dword and awaits fresh checksum plus firmware WINTINI readiness. It checks
+reserved page-selector/CPU bits and stops on absent device, stale authority,
+active BME or a short BAR. Every real MMIO operation occurs inside Cap::invoke
+and validates MEM decoding with BME disabled. No raw authority/handle escapes.
+
+States are Detected, Validated, Preparing, Downloading, Ready and terminal
+Failed(error). The bounded attempt is self-driven/async, holds no IRQ-disabling
+guard across await, and never invokes block_on in a spawned task. Cancellation,
+timeout or write/checksum/start failure prevents retry and performs no cleanup
+I/O. Ready means a running firmware CPU, with packet DMA/IRQ/station admission
+still closed. It does not initialize LLT/native rings, dispatch H2C/C2H or
+advertise HT/VHT support. The diagnostic network interface remains down.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -64,7 +101,8 @@ The scheduler's responsive wait supplies bounded EFUSE completion/settling.
 
 ## 7. Stage assignment
 
-Factory identity is software covered. Complete station software and physical
+Factory identity and RTL8188EE CPU firmware lifecycle are software covered.
+Complete station software and physical
 board qualification remain required.
 
 ## 8. Open questions / remaining software
@@ -72,8 +110,8 @@ board qualification remain required.
 | Prerequisite | State |
 |---|---|
 | Correct BAR2/read-only EFUSE lifecycle and per-chip identity | Implemented; shared-path regressions |
-| Complete source-matched per-chip power/reset qualification | Existing trimmed tables remain incomplete |
-| Authenticated image/header selection and runtime firmware loading | Missing; disconnected helpers are insufficient |
+| Complete source-matched per-chip power/reset qualification | RTL8188EE PCI enable prefix/flow implemented; other families remain incomplete |
+| Authenticated image/header selection and runtime firmware loading | RTL8188EE retained probe owner implemented; other profiles missing |
 | DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | Missing |
 | RF/BB tables, calibration, channel/power and rate control | Missing |
 | Scan, management RX/TX, authentication/association and WPA2 | Missing |

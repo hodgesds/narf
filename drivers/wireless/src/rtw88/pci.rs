@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_bus::{map_bar_control, BarError, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BarError, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -83,8 +83,8 @@ impl WirelessNetIface for Rtw88Device {
             bands: alloc::vec![],
             modes: narf_wireless::iface::WirelessModes::STATION,
             hw_caps: narf_wireless::iface::HwCaps {
-                ht_supported: true,
-                vht_supported: true,
+                ht_supported: false,
+                vht_supported: false,
                 he_supported: false,
                 eht_supported: false,
             },
@@ -167,7 +167,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     match crate::rtw88::pci_park::admission(bound, device.addr) {
         crate::rtw88::pci_park::Admission::Bound => return Ok(()),
         crate::rtw88::pci_park::Admission::ParkExtra => {
-            crate::rtw88::pci_park::park(&device, &cap)
+            super::pci_park::invoke(&cap, || super::pci_park::park(&device, &cap))
+                .map_err(|_| narf_bus::ProbeError::BadDevice)?
                 .map_err(|_| narf_bus::ProbeError::BadDevice)?;
             return Ok(());
         }
@@ -226,24 +227,26 @@ pub unsafe fn bring_up(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<Rtw88Device, ProbeError> {
-    crate::rtw88::pci_park::park(device, cap).map_err(|_| ProbeError::PciAccess)?;
-    // SAFETY: caller-asserted BAR exclusivity.
-    let registers = map_registers_with(device, |device, index| {
-        // SAFETY: bring_up's caller owns this PCI function and its BARs.
-        unsafe { map_bar_control(device, index) }
-    })?;
+    let (registers, mac) = super::pci_park::invoke(cap, || -> Result<_, ProbeError> {
+        let registers = map_registers_with(device, |device, index| {
+            super::pci_park::map_bar_control(device, cap, index)
+        })?;
 
-    // Run the chip/cut-filtered Linux PCI power sequence. Bus mastering
-    // remains parked throughout power cycling and read-only EFUSE access.
-    // SAFETY: BAR2 control registers mapped + owned.
-    unsafe {
-        power::power_on(&registers, device.id.device).map_err(ProbeError::PowerOn)?;
-    }
+        // Run the chip/cut-filtered Linux PCI power sequence. Bus mastering
+        // remains parked throughout power cycling and read-only EFUSE access.
+        // SAFETY: BAR2 control registers mapped + owned.
+        unsafe {
+            power::power_on(&registers, device.id.device).map_err(ProbeError::PowerOn)?;
+        }
 
-    // Decode the sparse physical EFUSE map and select this chip's PCI MAC.
-    // SAFETY: BAR2 control registers mapped, power-on done.
-    let mac =
-        unsafe { efuse::read_mac(&registers, device.id.device) }.map_err(ProbeError::Efuse)?;
+        // Decode the sparse physical EFUSE map and select this chip's PCI MAC.
+        // SAFETY: BAR2 control registers mapped, power-on done.
+        let mac =
+            unsafe { efuse::read_mac(&registers, device.id.device) }.map_err(ProbeError::Efuse)?;
+
+        Ok((registers, mac))
+    })
+    .map_err(|_| ProbeError::PciAccess)??;
 
     // Firmware transport is not implemented. In particular, BAR2 is a
     // register window, not a destination for whole firmware blob writes.

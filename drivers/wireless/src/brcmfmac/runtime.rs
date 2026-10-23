@@ -101,6 +101,7 @@ pub enum FlowState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlowToken {
     id: u16,
+    generation: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TxReceipt {
@@ -109,6 +110,7 @@ pub struct TxReceipt {
     pub tx_status: u16,
 }
 struct Flow<M: Memory> {
+    generation: u32,
     ring: Ring<M>,
     state: FlowState,
     deadline: Option<narf_time::Deadline>,
@@ -801,43 +803,88 @@ impl<B: Bus> Runtime<B> {
         }) {
             return Err(Error::Busy);
         }
-        let index = data.flows.len();
+        // A successful delete completion fences this ring from firmware.
+        // Reuse its retained mapping only after that terminal transition.
+        let index = data
+            .flows
+            .iter()
+            .position(|flow| flow.state == FlowState::Closed && flow.generation != u32::MAX)
+            .unwrap_or(data.flows.len());
+        let generation = data.flows.get(index).map_or(Ok(1), |flow| {
+            flow.generation.checked_add(1).ok_or(Error::Exhausted)
+        })?;
         if index >= FLOW_LIMIT || index >= usize::from(self.max_flows) {
             return Err(Error::Exhausted);
         }
         self.control_available()?;
         let id = index as u16 + 2;
-        let mut memory = allocate(&mut self.bus, 512 * 48)?;
-        zero(&mut memory)?;
-        let address = memory.address();
-        let ring = Ring {
-            memory,
-            read: 0,
-            write: 0,
-            depth: 512,
-            size: 48,
-            wptr: self.h2d_write + u32::from(id) * 4,
-            rptr: self.h2d_read + u32::from(id) * 4,
-            h2d: true,
-        };
-        let wptr = ring.wptr;
-        let rptr = ring.rptr;
-        self.resources
+        if index
+            == self
+                .resources
+                .as_ref()
+                .unwrap()
+                .data
+                .as_ref()
+                .unwrap()
+                .flows
+                .len()
+        {
+            let mut memory = allocate(&mut self.bus, 512 * 48)?;
+            zero(&mut memory)?;
+            let ring = Ring {
+                memory,
+                read: 0,
+                write: 0,
+                depth: 512,
+                size: 48,
+                wptr: self.h2d_write + u32::from(id) * 4,
+                rptr: self.h2d_read + u32::from(id) * 4,
+                h2d: true,
+            };
+            self.resources
+                .as_mut()
+                .unwrap()
+                .data
+                .as_mut()
+                .unwrap()
+                .flows
+                .push(Flow {
+                    generation,
+                    ring,
+                    state: FlowState::Closed,
+                    deadline: None,
+                    source,
+                    destination,
+                    priority,
+                    outstanding: 0,
+                });
+        }
+        let flow = &mut self
+            .resources
             .as_mut()
             .unwrap()
             .data
             .as_mut()
             .unwrap()
-            .flows
-            .push(Flow {
-                ring,
-                state: FlowState::Creating,
-                deadline: Some(narf_time::Deadline::after_ms(2000)),
-                source,
-                destination,
-                priority,
-                outstanding: 0,
-            });
+            .flows[index];
+        if flow.outstanding != 0 {
+            self.fail();
+            return Err(Error::Protocol);
+        }
+        // Closed is reached only after matching delete success in a usable
+        // runtime. Failed creates/deletes poison the entire owner instead.
+        zero(&mut flow.ring.memory)?;
+        flow.generation = generation;
+        flow.ring.read = 0;
+        flow.ring.write = 0;
+        flow.state = FlowState::Creating;
+        flow.deadline = Some(narf_time::Deadline::after_ms(2000));
+        flow.source = source;
+        flow.destination = destination;
+        flow.priority = priority;
+        let address = flow.ring.memory.address();
+        let wptr = flow.ring.wptr;
+        let rptr = flow.ring.rptr;
         let mut entry = [0; 40];
         entry[0] = 3;
         entry[8..14].copy_from_slice(&destination);
@@ -856,7 +903,7 @@ impl<B: Bus> Runtime<B> {
             self.fail();
             return Err(e);
         }
-        Ok(FlowToken { id })
+        Ok(FlowToken { id, generation })
     }
     fn control_available(&mut self) -> Result<(), Error> {
         let ring = &self.resources.as_ref().unwrap().rings[0];
@@ -884,6 +931,7 @@ impl<B: Bus> Runtime<B> {
             .data
             .as_ref()
             .and_then(|d| d.flows.get(usize::from(index)))
+            .filter(|f| f.generation == token.generation)
             .map(|f| f.state)
             .ok_or(Error::Protocol)
     }
@@ -903,6 +951,9 @@ impl<B: Bus> Runtime<B> {
             .flows
             .get_mut(usize::from(token.id.checked_sub(2).ok_or(Error::Protocol)?))
             .ok_or(Error::Protocol)?;
+        if flow.generation != token.generation {
+            return Err(Error::Protocol);
+        }
         if flow.state != FlowState::Open || flow.outstanding != 0 {
             return Err(Error::Busy);
         }
@@ -968,6 +1019,9 @@ impl<B: Bus> Runtime<B> {
         }
         let index = usize::from(token.id.checked_sub(2).ok_or(Error::Protocol)?);
         let flow = data.flows.get(index).ok_or(Error::Protocol)?;
+        if flow.generation != token.generation {
+            return Err(Error::Protocol);
+        }
         if flow.state != FlowState::Open {
             return Err(Error::Busy);
         }

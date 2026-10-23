@@ -1,7 +1,8 @@
 # rtw89 — Specification
 
-> Status: AX factory-identity prerequisite corrected; complete firmware,
-> bounded native TX prerequisite added; firmware and station runtime remain incomplete.
+> Status: AX factory identity, checked firmware preparation, native cold-power
+> primitives and bounded native TX ownership are implemented. The composed
+> firmware/station owner remains incomplete.
 
 ## 1. Purpose & scope
 
@@ -11,8 +12,9 @@ identity code implements AX DDV EFUSE; BE has a different read/block layout.
 ## 2. Assumptions
 
 The caller owns BAR2, mapped with Device attributes and covering the register
-window. Minimal existing platform power code is not a full chip-specific power
-port. No factory-MAC result establishes firmware/station readiness.
+window. The diagnostic probe still uses its existing power prologue; the new
+cold-power owner must be composed with firmware/secure-fuse and CH12 setup
+before replacing that path. No factory-MAC result establishes station readiness.
 
 ## 3. Public interface
 
@@ -23,6 +25,46 @@ requested decoding fails before BAR mapping. Bus mastering remains disabled
 on success and every later error; identity and ring allocation do not authorize
 DMA. A repeat probe of the retained bus address returns without configuration access; a distinct additional singleton match parks only its own PCI function. Re-enabling
 BME requires a future complete firmware/ring/reset owner.
+The complete diagnostic mapping/power/identity operation runs within actual
+capability invocation. It retains unpublished storage, with no ring base/index
+publication, enabled MSI-X delivery, RX pump or network-interface registration.
+The private native TX/report hooks also invoke the retained device capability;
+revocation returns `Authority` before register access or packet allocation.
+
+The internal `prepared::load(Files, ChipId, physical_cut)` selects owned
+verified firmware snapshots. AX filenames use the Linux `rtw89/rtw8852*_fw`
+and `rtw8851b_fw` basenames, preferring supported format suffixes before the
+unversioned fallback. Only a missing file permits filename fallback; invalid
+images or missing/revoked authority abort. 8852B/8851B prefer the NORMAL_CE
+image, then NORMAL. MFW selection bounds every entry before choosing the
+nearest non-manufacturing cut at or below the physical revision. BE is rejected
+before file access. The native registry adapter copies bytes inside the actual
+firmware capability invocation.
+
+`fwdl::parse_auto` accepts AX header versions0/1 only: base sizes32/48 and
+section size16 in both versions. Inner section types remain four bits; BBMCU
+is an outer image type. AX download chunks are2020 bytes independent of header
+version. Header/table/dynamic-extension/payload extents and indexed/formatted
+MSSC signature pools, including v1 DSP checksums, are checked before committing
+caller section output. A malformed image leaves that output untouched.
+`PreparedFirmware` keeps selected-image, payload and signature-pool offsets
+bound to one immutable owner. Its unsecured fixed-header preparation excludes
+dynamic bytes and updates part_size; multiple security sections are rejected
+until header compaction and payload selection are implemented together.
+Physical secure-fuse selection, blacklist enforcement and signature replacement
+remain mandatory before any secure download. Header H2C requests no runtime
+ACK; section chunks are raw firmware bytes without an invented H2C/last flag.
+
+`power::Power<Io>::power_on` ports the complete PCI RTL8852A byte table and
+RTL8852B/C/8851B power-on callbacks, including XTAL commands, cut/RFE/SPS
+quirks, power/ONMAC deadlines, platform edges, isolation and function enables.
+An inherited powered MAC is rejected until a verified power-off/reset owner
+exists. Failure or cancellation leaves a one-shot Starting state and rejects
+replay before further I/O. The native backend checks live capability, extent
+and width alignment for every register operation, and provides asynchronous
+DDV reads for ECV/secure/factory bytes. Cancelled or incompletely restored DDV
+power-cut state stays retained and refuses reuse. These primitives do not yet
+activate CH12, publish a station or establish complete MAC/RF readiness.
 
 `efuse::read_mac(registers, ChipId, cut)` runs the AX DDV read lifecycle and
 decodes the two-byte sparse records. All four AX profiles use a 1216-byte
@@ -88,8 +130,8 @@ bring-up scaffolding and does not establish a working station runtime.
 | Prerequisite | State |
 |---|---|
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
-| Complete per-chip power/PCIe initialization | Missing beyond current prologue |
-| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Missing; existing parsers/stub are disconnected |
+| Complete per-chip power/PCIe initialization | Native cold-power-on port and Linux-C trace checks implemented; probe composition, verified power-off/reset and PCIe/DLE/HFC setup remain |
+| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked owned AX file/container selection implemented; secure-fuse policy, CH12 owner and WCPU lifecycle remain |
 | Ring quiesce/publication, BDRAM setup, IRQ ownership and recovery | Incomplete |
 | AX initial native TX layout and bounded completion ownership | Shared production backend implemented and model-tested; not yet activated by station/firmware owner |
 | RPQ release handling, RX assembly/validation and frame delivery | Incomplete |

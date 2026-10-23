@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    Authority,
     NoMemory,
     BadQueue,
     Full,

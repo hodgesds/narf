@@ -70,6 +70,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 // monolithic implementation in this `mod.rs` still owns the live
 // controller state machine — these are pure spec-encode shapes.
 mod bulk_owner;
+mod bulk_stop;
+mod bulk_stop_native;
 mod completion;
 mod event_wait;
 pub use bulk_owner::{Direction as BulkDirection, Token as BulkToken};
@@ -508,6 +510,9 @@ pub struct Xhci {
     /// `events_overflowed` which is a diagnostic counter.
     cmd_events: IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>>,
     transfer_events: IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>>,
+    /// Serializes pop→latch publication across ISR/task CPUs. Stop CCE
+    /// visibility must imply its preceding forced TEs already quarantined.
+    demux_publication: IrqSafeSpinLock<()>,
     events_overflowed: core::sync::atomic::AtomicU32,
     pub running: bool,
     /// MSI-X table handle owned by this controller. `Some` when
@@ -1701,6 +1706,7 @@ impl Xhci {
             // without ever realloc'ing.
             cmd_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::with_capacity(64)),
             transfer_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::with_capacity(64)),
+            demux_publication: IrqSafeSpinLock::new(()),
             events_overflowed: core::sync::atomic::AtomicU32::new(0),
             running: true,
             msix,
@@ -2241,6 +2247,9 @@ impl Xhci {
     /// gets stashed for whichever waiter does want it. Returns the
     /// event so direct callers can also inspect.
     fn demux_one_event(&self) -> Option<[u32; 4]> {
+        // No await/pump/slot reservation occurs under this short IRQ-safe
+        // guard. Ring locks release before devices/latches; no reverse order.
+        let _publication = self.demux_publication.lock();
         let ev = self.poll_event()?;
         // Short, blocking ownership locks are deliberate: falling back to
         // the lossy queues on another CPU's lock contention loses live TDs.
@@ -2261,6 +2270,9 @@ impl Xhci {
         // supervisor waker.
         if ty == TRB_TYPE_PORT_STATUS_CHANGE {
             USB_PSCE_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Release);
+            // The counter publication is ordered already. Invoke arbitrary
+            // registered wakers after releasing the demux reservation.
+            drop(_publication);
             wake_usb_supervisor();
             return Some(ev);
         }
@@ -2444,11 +2456,14 @@ impl Xhci {
         Ok(())
     }
 
-    /// Drain the Event Ring without dispatching anything. Useful in
-    /// tests that just want to count events.
+    /// Drain at most one ring capacity, retaining owned command/transfer
+    /// completions. Counting must never bypass demux publication/ownership.
     pub fn drain_events(&self) -> usize {
         let mut n = 0;
-        while self.poll_event().is_some() {
+        for _ in 0..ER_SEG_TRBS {
+            if self.demux_one_event().is_none() {
+                break;
+            }
             n += 1;
         }
         n
@@ -4290,6 +4305,13 @@ impl Xhci {
             data.len(),
             data,
         )
+    }
+
+    /// Explicit cancellation of a retained bulk TD. A successful return
+    /// proves Stop + Set TR Dequeue completion and output-context readback;
+    /// errors/cancellation keep the endpoint/page and slot claim closed.
+    pub async fn stop_bulk(&self, token: &BulkToken) -> Result<(), XhciError> {
+        bulk_stop::run(self, token).await
     }
 
     fn validate_bulk(&self, token: &BulkToken) -> Result<(), XhciError> {

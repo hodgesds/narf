@@ -157,7 +157,16 @@ also consult upstream Linux GPL sources.
   or TRB publication. Dropping a token or compatibility `bulk_in/out` future,
   and timeout/error returns, do not cancel or release that ownership. A second
   submission fails before touching the scratch page or ring. Recovery requires
-  a future explicit stop/drain/reset contract; this API does not provide one.
+  an explicit stop/drain/reset contract. `USBDevice::stop_bulk(token)` is the
+  one-shot non-stream bulk cancellation path: it reserves slot configuration
+  and the endpoint before awaiting Stop Endpoint and Set TR Dequeue Pointer.
+  Both commands require their exact originating TRB/slot Success completion;
+  output-context readback must show Stopped and the requested successor/DCS.
+  Only then are old endpoint events discarded and the page/ring reopened.
+  The old token becomes stale. It canonicalizes the Link-boundary enqueue
+  cursor and preserves USB data-toggle state. Errors and Future Drop retain
+  the endpoint/page plus the slot claim; Halted endpoint/device reset, EP0
+  cancellation and stalled-device CLEAR_FEATURE recovery remain separate.
   `USBDevice` bulk operations reject stale slot generations. Periodic transfer
   methods cannot target bulk endpoints. The xHCI layer owns DMA cache
   maintenance and device barriers, including outer-shareable ordering on ARM.
@@ -182,13 +191,21 @@ also consult upstream Linux GPL sources.
   initialization follows zeroing so the ring can wrap.
 - Readdress/reuse of an owned, published-failed or disabled slot is currently
   refused. HCE soft reset is refused once any slot has reserved ownership.
-  Full reconnect, endpoint stop/drain, reclamation and controller-reset
-  recovery remain software prerequisites; receipt APIs do not claim them.
+  Full reconnect, DMA-page reclamation and controller-reset recovery remain
+  software prerequisites. Successful bulk stop reuses retained pages only;
+  it does not free mappings, reopen a poisoned EP0 or enable slot reuse.
 - Command/EP0 waits inspect the bounded completion queues before each single
   hardware-event demux, check deadlines throughout, and yield after at most
   32 unrelated events. Queue pressure cannot make the waiter's own draining
   evict its completion, and a continuous producer cannot bypass its timeout
   or executor yield. Unmatched events retain the existing 64-entry policy.
+- Event demux serializes pop→latch/queue publication under a short IRQ-safe
+  guard, so a Stop command completion cannot overtake its preceding forced
+  transfer events on another CPU. A stopping bulk owner quarantines every
+  event for its slot/DCI, including forced events at a successor TRB. No
+  wait/pump or slot reservation occurs under this publication guard; ring
+  locks release before device/latch locks. `drain_events` uses this same
+  owned-aware demux and is bounded to one event-ring capacity.
 - ISR demux retains exact active bulk and EP0 Data/Status completions in
   per-owner latches before the shared queues. Command-ring entries reserve a
   receipt before publication and retain their exact completion there until

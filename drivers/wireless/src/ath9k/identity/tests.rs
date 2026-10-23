@@ -184,8 +184,7 @@ kernel_test_in!(
 
 fn smoke_ath9k_eeprom_endian_and_magic() -> TestResult {
     let little = image(false);
-    let mut normalized = little;
-    let expected = match decode_identity(2, 0xa55a, &mut normalized) {
+    let expected = match decode_identity(2, 0xa55a, &mut little.clone()) {
         Ok(id) => id,
         Err(_) => return TestResult::Fail("LE EEPROM fixture rejected"),
     };
@@ -216,8 +215,7 @@ kernel_test_in!(
 
 fn smoke_ath9k_rejects_bad_eeprom_metadata() -> TestResult {
     let good = image(false);
-    let mut invalid_magic = good;
-    if decode_identity(0, 0xffff, &mut invalid_magic) != Err(BringUpError::BadMagic) {
+    if decode_identity(0, 0xffff, &mut good.clone()) != Err(BringUpError::BadMagic) {
         return TestResult::Fail("bad EEPROM magic accepted");
     }
     for length in [0u16, 31, 33, 378, u16::MAX] {
@@ -280,4 +278,47 @@ fn smoke_ath9k_rejects_absent_revision_and_busy_eeprom() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath9k",
     smoke_ath9k_rejects_absent_revision_and_busy_eeprom
+);
+
+fn smoke_ath9k_native_mmio_revocation_and_bounds() -> TestResult {
+    use narf_bus::BusDeviceCap;
+    use narf_capabilities::Cap;
+    use narf_capabilities::Write;
+    let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+    let mut words = [0x12345678u32, 0];
+    let mmio = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: words.as_mut_ptr() as u64,
+        len: 8,
+        kind: narf_bus::BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    let mut registers = Registers::new(mmio, cap);
+    if registers.read32(0) != 0x12345678
+        || registers.read32(1) != u32::MAX
+        || registers.read32(8) != u32::MAX
+    {
+        return TestResult::Fail(
+            "native AR9285 register reads ignored live authority or checked bounds",
+        );
+    }
+    registers.write32(4, 0xaabbccdd);
+    if words[1] != 0xaabbccdd {
+        return TestResult::Fail("live native MMIO write did not execute");
+    }
+    cap.revoke();
+    registers.mmio.virt = 0; // Any actual post-revocation access faults.
+    if registers.authorized() || registers.read32(0) != u32::MAX {
+        return TestResult::Fail("revoked AR9285 register access remained live");
+    }
+    registers.write32(4, 0xdeadbeef);
+    if words[1] != 0xaabbccdd {
+        return TestResult::Fail("revocation modified native register memory");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k",
+    smoke_ath9k_native_mmio_revocation_and_bounds
 );

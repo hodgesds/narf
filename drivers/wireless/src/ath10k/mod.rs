@@ -25,7 +25,8 @@
 //!
 //! Calibrated BMI image preparation now reaches retained runtime CE DMA,
 //! HTC credit/endpoint negotiation and native WMI service-ready/INIT/READY.
-//! HTT packet runtime, station control and interface registration remain open.
+//! Native HTT setup, retained RX/TX DMA and event progress follow WMI READY.
+//! Station management/security, admission and recovery remain open.
 //! Older standalone codecs below are not the production activation path.
 //!
 //! ## Stage 0 (prior commit)
@@ -81,6 +82,7 @@ pub mod dma;
 pub mod firmware;
 pub mod htc;
 pub mod htt;
+pub mod htt_runtime;
 pub mod hw;
 pub mod pci;
 pub mod profile;

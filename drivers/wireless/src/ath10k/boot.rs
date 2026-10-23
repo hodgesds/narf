@@ -20,6 +20,8 @@ use super::hw::{self, HwRev, Registers};
 
 #[path = "boot/hif.rs"]
 mod hif;
+#[path = "boot/htt_memory.rs"]
+mod htt_memory;
 #[path = "boot/wmi_memory.rs"]
 mod wmi_memory;
 

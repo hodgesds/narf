@@ -121,6 +121,9 @@ impl ReceiveQueue {
     }
 
     pub fn publish(&mut self, mmio: &mut impl IwlMmio) -> Result<(), &'static str> {
+        if !mmio.authorized() {
+            return Err("Wi-Fi authority revoked");
+        }
         let next = self.write & !7;
         if next == self.advertised {
             return Ok(());
@@ -141,6 +144,9 @@ impl ReceiveQueue {
     /// every tag before forming a packet slice. Repost only after the
     /// batch, so a duplicate completion cannot reclaim the same buffer.
     pub fn drain(&mut self, mmio: &mut impl IwlMmio) -> Result<Vec<Packet>, &'static str> {
+        if !mmio.authorized() {
+            return Err("Wi-Fi authority revoked");
+        }
         // SAFETY: status is aligned coherent memory owned for the whole
         // device lifetime, and hardware updates this u16 atomically.
         let closed = u16::from_le(unsafe {
@@ -236,6 +242,9 @@ impl CommandQueue {
         version: u8,
         payload: &[u8],
     ) -> Result<u16, &'static str> {
+        if !mmio.authorized() {
+            return Err("Wi-Fi authority revoked");
+        }
         let slot = self.write as usize & (COMMAND_DEPTH - 1);
         if self.outstanding >= COMMAND_DEPTH - 1 || self.pending[slot].is_some() {
             return Err("command queue full");
@@ -455,9 +464,8 @@ impl Hardware {
         // Stop inherited DMA before allocating buffers or rejecting an
         // unsupported firmware profile. Early initialization failures must
         // not leave a previous boot's bus-master state running.
-        narf_bus::pci::clear_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER)
-            .map_err(|_| "cannot disable inherited Wi-Fi DMA")?;
-        let mut mmio = super::IwlMmioImpl(region);
+        super::mmio::set_master(&device, &cap, false)?;
+        let mut mmio = super::IwlMmioImpl::new(region, cap);
         let rx = ReceiveQueue::new(format)?;
         let commands = CommandQueue::new()?;
         let boot = BootImage::new(
@@ -556,11 +564,7 @@ impl Hardware {
 
     pub async fn start(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
         use super::regs::*;
-        use narf_bus::pci::{self, cmd};
-        pci::clear_command(&self.cap, &self.device, cmd::BUS_MASTER)
-            .map_err(|_| "cannot disable stale Wi-Fi DMA")?;
-        pci::set_command(&self.cap, &self.device, cmd::MEM_SPACE | cmd::INTX_DISABLE)
-            .map_err(|_| "cannot enable Wi-Fi PCI memory access")?;
+        super::mmio::set_master(&self.device, &self.cap, false)?;
         let control = self.mmio.read(CSR_HW_IF_CONFIG_REG);
         self.mmio.write(CSR_HW_IF_CONFIG_REG, control | (1 << 22));
         self.poll_register(CSR_HW_IF_CONFIG_REG, 1 << 22, 1 << 22, 50)
@@ -606,11 +610,7 @@ impl Hardware {
         self.poll_register(CSR_GP_CNTRL, ready, ready, 25).await?;
 
         if self.interrupts.is_none() {
-            self.interrupts = Some(super::iwl_msix::Interrupts::new(
-                &self.cap,
-                &self.device,
-                self.mmio.0,
-            )?);
+            self.interrupts = Some(self.mmio.interrupts(&self.device)?);
         }
         // AX210/Bz/Sc use the UMAC interrupt selector, with peripherals
         // relocated by 0x300000. Reset clears the selector/IVARs,
@@ -627,8 +627,7 @@ impl Hardware {
             iml_phys: boot.iml.dma_addr().raw(),
             iml_size: boot.iml_len as u32,
         };
-        pci::set_command(&self.cap, &self.device, cmd::BUS_MASTER)
-            .map_err(|_| "cannot enable Wi-Fi PCI bus mastering")?;
+        super::mmio::set_master(&self.device, &self.cap, true)?;
         self.armed = true;
         self.resources.rx.publish(&mut self.mmio)?;
         dma_barrier();
@@ -857,8 +856,7 @@ impl Hardware {
             self.mmio.write(register, value | request);
             self.poll_register(register, done, done, 100).await?;
         }
-        narf_bus::pci::clear_command(&self.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
-            .map_err(|_| "cannot disable DMA for recovery")?;
+        super::mmio::set_master(&self.device, &self.cap, false)?;
         let rx = ReceiveQueue::new(self.format)?;
         let commands = CommandQueue::new()?;
         let boot = BootImage::new(
@@ -1118,9 +1116,7 @@ impl Drop for Hardware {
                 narf_time::Deadline::after_ms(100),
             )
         };
-        let disabled =
-            narf_bus::pci::clear_command(&self.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
-                .is_ok();
+        let disabled = super::mmio::set_master(&self.device, &self.cap, false).is_ok();
         if stopped && disabled {
             // SAFETY: this is the only drop, and hardware has acknowledged
             // DMA stop (or was never given addresses), with PCI BME off.

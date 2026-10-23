@@ -42,6 +42,8 @@ pub mod firmware_transport;
 pub mod fw;
 pub mod intr;
 pub mod mac;
+pub mod packet_codec;
+pub mod packet_transport;
 pub mod phy;
 pub mod phy_tables;
 mod radio_init;

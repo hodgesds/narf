@@ -62,6 +62,9 @@ use narf_bus;
 /// the loader code is testable against a mock without real HW.
 /// Same shape as `amdgpu_psp::PspMmio` and `amdgpu_smu::SmuMmio`.
 pub trait IwlMmio {
+    fn authorized(&self) -> bool {
+        true
+    }
     fn read(&mut self, offset: u32) -> u32;
     fn write(&mut self, offset: u32, value: u32);
 }
@@ -465,59 +468,45 @@ pub trait AliveSink {
 /// bring-up before IRQs and the RX path are fully integrated.
 #[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct PollingAliveSink {
-    region: narf_bus::MmioRegion,
+    mmio: super::IwlMmioImpl,
 }
 
 impl PollingAliveSink {
-    pub fn new(region: narf_bus::MmioRegion) -> Self {
-        Self { region }
+    pub fn new(
+        region: narf_bus::MmioRegion,
+        cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    ) -> Self {
+        Self {
+            mmio: super::IwlMmioImpl::new(region, cap),
+        }
     }
 }
 
 impl AliveSink for PollingAliveSink {
     fn wait(&mut self, deadline_ms: u64) -> Option<u32> {
-        // Poll for the ALIVE bit in CSR_INT.
-        // Deadline is in milliseconds. We'll use a simple loop.
-        // On real HW we'd use a timer; here we use MMIO read iterations
-        // as a proxy for time if no timer is available, but wait,
-        // narf might have a sleep/delay function.
-        // Actually, let's just use a large number of iterations
-        // or check if there's a way to get time.
-
-        for _ in 0..(deadline_ms * 1000) {
-            // SAFETY: `self.region` is the live BAR0 `MmioRegion` handed to
-            // `PollingAliveSink::new`; `CSR_INT` is a 32-bit device CSR within
-            // that BAR, so the volatile MMIO read is to a valid, in-range,
-            // 4-byte-aligned register.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            let intr = unsafe { self.region.read32(regs::CSR_INT as u64) };
-            if intr & csr_int::ALIVE != 0 {
-                // Acknowledge the interrupt.
-                // SAFETY: `self.region` is the live BAR0 mapping; `CSR_INT` is a
-                // writable 32-bit device CSR within that BAR, and writing the
-                // `ALIVE` bit is the documented way to acknowledge the interrupt.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                unsafe { self.region.write32(regs::CSR_INT as u64, csr_int::ALIVE) };
-
-                // On many Intel chips, the ALIVE status is written to
-                // CSR_UCODE_DRV_GP2 (0x60).
-                // SAFETY: `self.region` is the live BAR0 mapping; `CSR_UCODE_DRV_GP2`
-                // (0x60) is a 32-bit device CSR within that BAR, so the volatile
-                // MMIO read targets a valid, in-range, 4-byte-aligned register.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                let status = unsafe { self.region.read32(regs::CSR_UCODE_DRV_GP2 as u64) };
-                if status == regs::IWL_ALIVE_STATUS_OK {
-                    return Some(status);
+        // The diagnostic sink cannot manufacture an ALIVE after authority
+        // revocation or an unverified status. Actual Gen2 boot needs context-v1
+        // and a DMA notification path; this legacy observer remains gated.
+        let mut result = None;
+        narf_scheduler::responsive_spin_until(
+            || {
+                let interrupt = self.mmio.read(regs::CSR_INT);
+                if interrupt == u32::MAX {
+                    return true;
                 }
-                // If GP2 doesn't have it, some chips might just use the bit.
-                // But the trait expects the status.
-                // For now, if we see the bit, let's return OK to advance.
-                return Some(regs::IWL_ALIVE_STATUS_OK);
-            }
-            // Small delay proxy.
-            core::hint::spin_loop();
-        }
-        None
+                if interrupt & csr_int::ALIVE == 0 {
+                    return false;
+                }
+                self.mmio.write(regs::CSR_INT, csr_int::ALIVE);
+                let status = self.mmio.read(regs::CSR_UCODE_DRV_GP2);
+                if status == regs::IWL_ALIVE_STATUS_OK {
+                    result = Some(status);
+                }
+                true
+            },
+            narf_time::Deadline::after_ms(deadline_ms),
+        );
+        result
     }
 }
 

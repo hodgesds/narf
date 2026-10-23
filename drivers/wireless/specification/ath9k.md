@@ -13,9 +13,11 @@ WLAN firmware to supply MLME and hardware programming.
 
 ## 2. Assumptions
 
-The PCI dispatcher grants exclusive function authority. Probe disables
-inherited bus mastering, enables memory decode and masks INTx before
-mapping a device-typed BAR0 covering registers through `0xd387`.
+The PCI dispatcher grants exclusive function authority. Probe verifies
+inherited bus mastering and memory decoding are off with INTx masked.
+BAR sizing/mapping runs within the capability invocation while decoding
+is off; verified memory decoding is enabled after BAR restoration. The
+device-typed BAR0 covers registers through `0xd387`.
 AR9285-specific writes follow a checked silicon revision.
 
 ## 3. Public interface
@@ -31,7 +33,8 @@ AR9285-specific writes follow a checked silicon revision.
   `ar5416_eeprom_4k` image for later PHY calibration programming.
 - `Ath9k::baseband` reports `BasebandPrepared`: the 2412 MHz reference
   frequency, selected EEPROM high-power gain/SYNTH9 XE2 variant and count
-  of programmed INI rows. It records inactive register preparation, not
+  of programmed INI rows. Successful preparation also applies normalized
+  EEPROM modal/RF board values. It records inactive register preparation, not
   channel authorization or a calibrated/operational PHY.
 - Errors distinguish absent/mismatched silicon, timeout, invalid EEPROM
   magic/length/checksum/version, and invalid factory identity.
@@ -43,11 +46,21 @@ mode/gain/common tables (655 writes), ordered PLL/analog shift setup and RF
 synth reference registers with bounded responsive settling delays. All
 four gain-table combinations use the actual factory TXGAIN and SYNTH9
 selection. It does not register a netdev or imply a WLAN.
+The modal stage programs switch controls, IQ coefficients, RX attenuation
+and margins, EEPROM antenna-diversity controls, versioned OB/DB analog
+fields, settling/ADC/XPA/RX timing, CCA thresholds and baseband power scale.
+Analog updates use bounded settling delays. Dynamic diversity combining
+is not enabled by the current reference-channel probe.
+
+Native register reads and writes validate complete aligned BAR extents and
+execute inside `Cap::invoke`; revoked reads return all ones, revoked writes
+are refused, and preparation cannot report success after authority loss.
 
 ## 4. Invariants
 
-- PCI parking is verified by command-register readback before MMIO: BME
-  off and INTx masked, followed by verified memory-decode enable. Additional
+- PCI parking is verified by command-register readback before BAR sizing: BME
+  and memory decode off and INTx masked. Decode is enabled only after sizing
+  writes are restored; MMIO follows that readback. Additional
   matched singleton radios are parked with BME/memory decode off and rejected.
   Repeated dispatch of the owned address fails before parking.
 - BME remains disabled throughout identification and baseband preparation.
@@ -85,6 +98,11 @@ endianness/checksum/version validation and invalid/busy hardware cases.
 Independent hashes from Linux cover every address/value pair for all four
 production INI choices; fixtures also verify PLL/RF values, analog delays,
 BAR bounds and that packet/PHY engines stay disabled.
+Complete modal/RF write traces match independently compiled local Linux
+`eeprom_4k.c` functions and register/EEPROM definitions for four EEPROM,
+modal-version, HT40 and diversity cases. Native MMIO tests revoke an actual
+object-table epoch before deliberately invalid BAR addresses, proving no
+post-revocation read/write occurs.
 They do not prove RF or packet operation.
 
 ## 8. Remaining software and physical acceptance
@@ -92,8 +110,8 @@ They do not prove RF or packet operation.
 Software still required before AR9285 is ready for physical Wi-Fi testing:
 
 1. Complete the partially prepared PHY: channel-mode overrides, chain
-   masks and delta slope/spur handling, EEPROM modal/power/antenna/CTL and
-   PDADC application, noise-floor/IQ/PA calibration and regulatory limits.
+   masks and delta slope/spur handling, power/antenna policy, CTL/PDADC
+   application, noise-floor/IQ/PA calibration and regulatory limits.
    The fixed inactive reference synth setting does not implement channel
    switching or radio activation. PCIe power-save/PM setup also remains.
 2. Real TX queue/RX descriptor allocations and DMA ownership, IRQ service,

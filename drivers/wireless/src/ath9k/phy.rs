@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! AR9285 baseband register preparation from Linux ar5008_phy.c,
-//! ar9002_phy.c, ar9002_hw.c and ar9002_initvals.h. Calibration and
+//! ar9002_phy.c, ar9002_hw.c, ar9002_initvals.h and eeprom_4k.c. Calibration and
 //! channel admission are separate stages; PHY activation stays disabled.
 
 use super::{
@@ -9,7 +9,7 @@ use super::{
     EEPROM_4K_BYTES,
 };
 
-/// Registers prepared on a quiescent device, before modal/CTL/PDADC
+/// Registers prepared on a quiescent device, including modal/RF but before CTL/PDADC
 /// programming and calibration. This is not an active radio state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Prepared {
@@ -52,6 +52,9 @@ fn prepare(
     io: &mut impl RegisterIo,
     image: &[u8; EEPROM_4K_BYTES],
 ) -> Result<Prepared, BringUpError> {
+    if !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
     // SYNTH9 identifies the XE2 variant; SREV's revision nibble does not.
     let synth9 = io.read32(0x7868);
     if synth9 == u32::MAX {
@@ -93,11 +96,15 @@ fn prepare(
         0x9874,
         (synth & 0xc0000000) | (1 << 29) | (1 << 28) | ((2412 * 0x10000) / 15),
     );
-    // Leave PHY, interrupts and packet engines disabled. Modal settings,
-    // power/CTL interpolation and calibration must precede activation.
+    modal::prepare(io, image, false, false)?;
+    // Leave PHY, interrupts and packet engines disabled. Power/CTL/PDADC
+    // interpolation and calibration must precede activation.
     io.write32(0x981c, 0);
     io.write32(0x24, 0);
     io.write32(0x8, 0x20);
+    if !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
     Ok(Prepared {
         reference_frequency: 2412,
         high_power_gain: high,
@@ -108,10 +115,12 @@ fn prepare(
 
 pub(super) fn program(
     mmio: narf_bus::MmioRegion,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     image: &[u8; EEPROM_4K_BYTES],
 ) -> Result<Prepared, BringUpError> {
-    prepare(&mut Registers(mmio), image)
+    prepare(&mut Registers::new(mmio, cap), image)
 }
 
+mod modal;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;

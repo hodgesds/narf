@@ -2,6 +2,9 @@
 //! Linux ath9k `hw.c`, `pci.c::ath_pci_eeprom_read`, `eeprom.c` and
 //! `eeprom_4k.c`: AR9285 reset and the complete factory calibration map.
 
+use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Write};
+
 const AR_RC: u64 = 0x4000;
 const AR_SREV: u64 = 0x4020;
 const AR_INTR_SYNC_CAUSE: u64 = 0x4028;
@@ -41,6 +44,9 @@ pub struct Identity {
 }
 
 pub(super) trait RegisterIo {
+    fn authorized(&self) -> bool {
+        true
+    }
     fn read32(&mut self, offset: u64) -> u32;
     fn write32(&mut self, offset: u64, value: u32);
     fn delay_us(&mut self, us: u64) {
@@ -66,15 +72,52 @@ pub(super) trait RegisterIo {
     }
 }
 
-pub(super) struct Registers(pub(super) narf_bus::MmioRegion);
+/// Run the actual device access inside the current capability invocation.
+pub(super) fn invoke<T>(
+    cap: &Cap<BusDeviceCap, Write>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, CapError> {
+    struct RegistersOp<F>(F);
+    impl<T, F: FnOnce() -> T> CapOp<BusDeviceCap, Write> for RegistersOp<F> {
+        type Output = T;
+        fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+            Ok(self.0())
+        }
+    }
+    cap.invoke(RegistersOp(operation))
+}
+pub(super) struct Registers {
+    mmio: MmioRegion,
+    cap: Cap<BusDeviceCap, Write>,
+}
+impl Registers {
+    pub fn new(mmio: MmioRegion, cap: Cap<BusDeviceCap, Write>) -> Self {
+        Self { mmio, cap }
+    }
+}
 impl RegisterIo for Registers {
+    fn authorized(&self) -> bool {
+        self.cap.invoke(NoopOp).is_ok()
+    }
     fn read32(&mut self, offset: u64) -> u32 {
-        // SAFETY: probe checked BAR0 coverage and retains exclusive ownership.
-        unsafe { self.0.read32(offset) }
+        if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > self.mmio.len) {
+            return u32::MAX;
+        }
+        invoke(&self.cap, || {
+            // SAFETY: full dword bounds and alignment are checked above;
+            // current exclusive authority gates the actual BAR access.
+            unsafe { self.mmio.read32(offset) }
+        })
+        .unwrap_or(u32::MAX)
     }
     fn write32(&mut self, offset: u64, value: u32) {
-        // SAFETY: only the bounded AR9285 register set is used here.
-        unsafe { self.0.write32(offset, value) }
+        if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > self.mmio.len) {
+            return;
+        }
+        let _ = invoke(&self.cap, || {
+            // SAFETY: checked dword extent/alignment and live exclusive authority.
+            unsafe { self.mmio.write32(offset, value) }
+        });
     }
 }
 
@@ -167,6 +210,9 @@ fn decode_identity(
 }
 
 fn identify(io: &mut impl RegisterIo) -> Result<(Identity, [u8; EEPROM_4K_BYTES]), BringUpError> {
+    if !io.authorized() {
+        return Err(BringUpError::DeviceGone);
+    }
     // Reject mismatched silicon before AR9285-specific writes.
     let srev = io.read32(AR_SREV);
     if srev == u32::MAX {
@@ -188,8 +234,9 @@ fn identify(io: &mut impl RegisterIo) -> Result<(Identity, [u8; EEPROM_4K_BYTES]
 
 pub(super) fn read(
     mmio: narf_bus::MmioRegion,
+    cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(Identity, [u8; EEPROM_4K_BYTES]), BringUpError> {
-    identify(&mut Registers(mmio))
+    identify(&mut Registers::new(mmio, cap))
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

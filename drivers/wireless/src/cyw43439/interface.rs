@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Explicit platform attachment for a booted CYW43439 packet adapter.
-//! SDHCI/gSPI discovery must supply PacketTransport; codecs cannot bind it.
+//! Common station publication for booted SDIO-BCDC and PCIe-msgbuf owners.
+//! SDIO/gSPI discovery supplies a PacketTransport; PCIe supplies its retained runtime.
 
 use super::{
+    fullmac::{Family, Fullmac},
     runtime::{Error, Runtime},
     station::Station,
     PacketTransport,
@@ -16,8 +17,8 @@ use narf_wireless::{
     AssociateRequest, BssInfo, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
 
-struct State<T: PacketTransport> {
-    station: Station<T>,
+struct State<R: Fullmac> {
+    station: Station<R>,
     rx: Producer<Frame, RX_RING_N>,
     tx: Consumer<Frame, TX_RING_N>,
     pending: Option<PendingTx>,
@@ -26,7 +27,7 @@ struct PendingTx {
     frame: Frame,
     deadline: narf_time::Deadline,
 }
-impl<T: PacketTransport> State<T> {
+impl<R: Fullmac> State<R> {
     fn clear_transmit(&mut self) {
         self.pending = None;
         // A ring has finite capacity. Bound cleanup even if its producer
@@ -80,8 +81,8 @@ impl<T: PacketTransport> State<T> {
         Ok(())
     }
 }
-pub struct Device<T: PacketTransport> {
-    state: Mutex<State<T>>,
+pub struct Device<R: Fullmac> {
+    state: Mutex<State<R>>,
     name: String,
     mac: [u8; 6],
     channels: Vec<u32>,
@@ -91,9 +92,9 @@ pub struct Device<T: PacketTransport> {
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
-impl<T: PacketTransport> core::fmt::Debug for Device<T> {
+impl<R: Fullmac> core::fmt::Debug for Device<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CywDevice")
+        f.debug_struct("FullmacDevice")
             .field("name", &self.name)
             .field("mac", &self.mac)
             .finish_non_exhaustive()
@@ -104,7 +105,14 @@ trait Endpoint: Send + Sync {
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()>;
     fn drain(&self) -> bool;
 }
-static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
+static ACTIVE_SDIO: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
+static ACTIVE_PCIE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
+fn active_slot(family: Family) -> &'static IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> {
+    match family {
+        Family::Sdio => &ACTIVE_SDIO,
+        Family::Pcie => &ACTIVE_PCIE,
+    }
+}
 
 /// Attach to a platform-owned, already booted FIFO adapter. All firmware
 /// initialization succeeds before any netdev, frame rings or worker appears.
@@ -113,13 +121,23 @@ pub async fn attach<T: PacketTransport + 'static>(
     name: &str,
     transport: T,
     clm: &[u8],
-) -> Result<Arc<Device<T>>, Error> {
+) -> Result<Arc<Device<Runtime<T>>>, Error> {
+    attach_runtime(name, Runtime::new(transport), clm).await
+}
+/// Common station publication for an already booted, retained firmware runtime.
+/// All initialization/key capabilities and authenticated policy checks still run.
+pub async fn attach_runtime<R: Fullmac + 'static>(
+    name: &str,
+    runtime: R,
+    clm: &[u8],
+) -> Result<Arc<Device<R>>, Error> {
+    let slot = active_slot(R::FAMILY);
     if name.is_empty()
         || name.len() > 15
         || !name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-        || ACTIVE.lock().is_some()
+        || slot.lock().is_some()
         || narf_net::iface::lookup(name).is_some()
         || narf_wireless::registry::list()
             .iter()
@@ -131,7 +149,7 @@ pub async fn attach<T: PacketTransport + 'static>(
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Unsupported)?;
     let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Unsupported)?;
-    let station = Station::initialize(Runtime::new(transport), clm, domain).await?;
+    let station = Station::initialize(runtime, clm, domain).await?;
     let (rx_producer, rx_consumer) = narf_ipc::channel();
     let (tx_producer, tx_consumer) = narf_ipc::channel();
     let device = Arc::new(Device {
@@ -151,7 +169,7 @@ pub async fn attach<T: PacketTransport + 'static>(
         tx: IrqSafeSpinLock::new(Some(tx_producer)),
     });
     {
-        let mut active = ACTIVE.lock();
+        let mut active = slot.lock();
         // Firmware setup awaited bus transactions. Another driver may have
         // claimed this name in that interval; never replace its netdev.
         if active.is_some()
@@ -172,7 +190,11 @@ pub async fn attach<T: PacketTransport + 'static>(
             })?;
         *active = Some(device.clone());
     }
-    narf_net::iface::register(name, device.mac, send_frame);
+    let send = match R::FAMILY {
+        Family::Sdio => send_sdio as fn(&[u8], narf_net::TxMeta) -> Result<(), ()>,
+        Family::Pcie => send_pcie,
+    };
+    narf_net::iface::register(name, device.mac, send);
     narf_net::iface::set_link_state(name, false);
     narf_net::iface::install_rx_drain(drain);
     narf_wireless::registry::register(device.clone());
@@ -183,7 +205,7 @@ pub async fn attach<T: PacketTransport + 'static>(
     Ok(device)
 }
 
-impl<T: PacketTransport + 'static> Device<T> {
+impl<R: Fullmac + 'static> Device<R> {
     fn link(&self, peer: Option<[u8; 6]>) {
         let mut packed = [0; 8];
         if let Some(peer) = peer {
@@ -238,7 +260,7 @@ impl<T: PacketTransport + 'static> Device<T> {
         }
     }
 }
-impl<T: PacketTransport + 'static> Endpoint for Device<T> {
+impl<R: Fullmac + 'static> Endpoint for Device<R> {
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
         if !self.up.load(Ordering::Acquire) || !transmit_admitted(bytes, self.mac) {
             return Err(());
@@ -263,16 +285,24 @@ impl<T: PacketTransport + 'static> Endpoint for Device<T> {
         progress
     }
 }
-fn send_frame(bytes: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
-    let active = ACTIVE.lock().clone().ok_or(())?;
+fn send_sdio(bytes: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
+    let active = ACTIVE_SDIO.lock().clone().ok_or(())?;
+    active.enqueue(bytes)
+}
+fn send_pcie(bytes: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
+    let active = ACTIVE_PCIE.lock().clone().ok_or(())?;
     active.enqueue(bytes)
 }
 fn drain() -> bool {
-    let active = ACTIVE.lock().clone();
-    active.is_some_and(|active| active.drain())
+    let owners = [ACTIVE_SDIO.lock().clone(), ACTIVE_PCIE.lock().clone()];
+    let mut progress = false;
+    for owner in owners.into_iter().flatten() {
+        progress |= owner.drain();
+    }
+    progress
 }
 
-impl<T: PacketTransport + 'static> Interface for Device<T> {
+impl<R: Fullmac + 'static> Interface for Device<R> {
     fn name(&self) -> &str {
         &self.name
     }
@@ -293,7 +323,7 @@ impl<T: PacketTransport + 'static> Interface for Device<T> {
     }
 }
 #[async_trait::async_trait]
-impl<T: PacketTransport + 'static> WirelessNetIface for Device<T> {
+impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     fn supports_handshake_offload(&self) -> bool {
         self.supplicant
     }
@@ -365,7 +395,7 @@ fn wireless_error(error: Error) -> WirelessError {
         _ => WirelessError::HardwareError,
     }
 }
-struct Registered<T: PacketTransport>(Arc<Device<T>>);
+struct Registered<R: Fullmac>(Arc<Device<R>>);
 fn receive_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
     (14..=1514).contains(&bytes.len())
         && u16::from_be_bytes([bytes[12], bytes[13]]) >= 0x600
@@ -581,7 +611,7 @@ mod tests {
         smoke_cyw_interface_ethernet_address_and_control_port
     );
 }
-impl<T: PacketTransport + 'static> Interface for Registered<T> {
+impl<R: Fullmac + 'static> Interface for Registered<R> {
     fn name(&self) -> &str {
         self.0.name()
     }

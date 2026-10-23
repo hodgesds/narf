@@ -59,8 +59,10 @@ extern crate alloc;
 pub mod btc;
 pub mod chan;
 pub mod datapath;
+mod ddv;
 pub mod dma;
 pub mod efuse;
+mod firmware_registry;
 pub mod fw;
 pub mod fwdl;
 pub mod h2c;
@@ -69,11 +71,28 @@ pub mod mac_init;
 pub mod pci;
 pub mod phy;
 pub mod phy_table;
+mod power;
+mod power_native;
+mod power_regs;
+mod power_tables;
+mod prepared;
 pub mod tx_transport;
 pub mod txrx;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tx_transport_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod fwdl_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod power_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod ddv_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod pci_authority_tests;
 
 pub use mac::{ChipGeneration, ChipId, MacError};
 pub use pci::{name_for, probe, register_pci_driver, Rtw89Device};
@@ -90,7 +109,8 @@ pub const RTL_DEV_8852AE: u16 = 0x8852;
 pub const RTL_DEV_8852AE_VT: u16 = 0xA85A;
 /// RTL8852BE — Wi-Fi 6 2x2. `rtw89/rtw8852be.c`.
 pub const RTL_DEV_8852BE: u16 = 0xB852;
-/// RTL8852BE alt subsystem (BT-coex bundle). `rtw89/rtw8852be.c`.
+/// RTL8852BE alternate PCI ID with the same B-chip profile. Linux's
+/// distinct RTL8852BT ID is0xb520 and is not claimed here.
 pub const RTL_DEV_8852BE_ALT: u16 = 0xB85B;
 /// RTL8852CE — Wi-Fi 6E 2x2. `rtw89/rtw8852ce.c`.
 pub const RTL_DEV_8852CE: u16 = 0xC852;

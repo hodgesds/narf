@@ -40,6 +40,14 @@ pub(super) trait Memory {
     fn dma_address(&self) -> u64;
     fn read(&self, offset: usize) -> u8;
     fn write(&mut self, offset: usize, value: u8);
+    fn read32(&self, offset: usize) -> u32 {
+        u32::from_le_bytes([
+            self.read(offset),
+            self.read(offset + 1),
+            self.read(offset + 2),
+            self.read(offset + 3),
+        ])
+    }
     fn read16(&self, offset: usize) -> u16 {
         u16::from_le_bytes([self.read(offset), self.read(offset + 1)])
     }
@@ -61,6 +69,16 @@ impl Memory for narf_io::DmaBuffer {
         assert!(offset < self.len());
         // SAFETY: checked offset; ownership/CE completion controls access.
         unsafe { self.cpu_mut_ptr::<u8>().add(offset).write_volatile(value) }
+    }
+    fn read32(&self, offset: usize) -> u32 {
+        assert!(offset & 3 == 0 && offset + 4 <= self.len());
+        // SAFETY: aligned publication word in retained coherent DMA.
+        u32::from_le(unsafe {
+            self.cpu_ptr::<u8>()
+                .add(offset)
+                .cast::<u32>()
+                .read_volatile()
+        })
     }
     fn read16(&self, offset: usize) -> u16 {
         assert!(offset & 1 == 0 && offset + 2 <= self.len());

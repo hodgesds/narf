@@ -13,10 +13,10 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -27,6 +27,8 @@ use narf_wireless::{
 };
 
 use super::efuse;
+use super::firmware_native::PciIo;
+use super::firmware_transport::Owner as FirmwareOwner;
 use super::irq;
 use super::mac;
 use super::power;
@@ -39,6 +41,8 @@ pub struct RtlwifiDevice {
     pub registers: MmioRegion,
     pub mac: [u8; MAC_ADDR_LEN],
     pub device_id: u16,
+    /// One retained authenticated firmware attempt for the qualified 8188EE profile.
+    pub(super) firmware: Option<Arc<FirmwareOwner<PciIo>>>,
     pub link_up: AtomicBool,
     pub rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -47,6 +51,13 @@ pub struct RtlwifiDevice {
 /// This device's interface name, `wlan%d` as Linux `dev_alloc_name` picks
 /// it; set when the interface registers.
 static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
+
+impl RtlwifiDevice {
+    /// Firmware-ready is diagnostic CPU readiness, never station readiness.
+    pub fn firmware_status(&self) -> Option<super::firmware_transport::Status> {
+        self.firmware.as_ref().map(|owner| owner.status())
+    }
+}
 
 impl Interface for RtlwifiDevice {
     fn name(&self) -> &str {
@@ -78,8 +89,8 @@ impl WirelessNetIface for RtlwifiDevice {
             bands: alloc::vec![],
             modes: narf_wireless::iface::WirelessModes::STATION,
             hw_caps: narf_wireless::iface::HwCaps {
-                ht_supported: true,
-                vht_supported: matches!(self.device_id, RTL_DEV_8821AE | RTL_DEV_8822BE),
+                ht_supported: false,
+                vht_supported: false,
                 he_supported: false,
                 eht_supported: false,
             },
@@ -164,7 +175,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     match crate::rtw88::pci_park::admission(bound, device.addr) {
         crate::rtw88::pci_park::Admission::Bound => return Ok(()),
         crate::rtw88::pci_park::Admission::ParkExtra => {
-            crate::rtw88::pci_park::park(&device, &cap)
+            crate::rtw88::pci_park::invoke(&cap, || crate::rtw88::pci_park::park(&device, &cap))
+                .map_err(|_| narf_bus::ProbeError::BadDevice)?
                 .map_err(|_| narf_bus::ProbeError::BadDevice)?;
             return Ok(());
         }
@@ -180,6 +192,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     let mac = dev.mac;
     let did = dev.device_id;
+    let firmware = dev.firmware.clone();
     *CONTROLLER.lock() = Some(dev);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -191,12 +204,23 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
 
     *IFNAME.lock() = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
+    if let Some(firmware) = firmware {
+        // The retained controller/interface own this attempt before its first
+        // register access. No IRQ-disabling guard survives into the task.
+        narf_scheduler::spawn(async move {
+            if let Err(error) = firmware.initialize_registered().await {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "rtlwifi-8188ee firmware: {:?}", error);
+            }
+        });
+    }
     Ok(())
 }
 
 /// Park PCI DMA, map BAR2, apply the existing power table and read factory
-/// EFUSE identity with device IRQs masked. This diagnostic does not dispatch
-/// MAC/LLT/firmware/ring initialization or authorize a usable station.
+/// EFUSE identity with device IRQs masked. Retains the qualified 8188EE
+/// firmware owner; probe starts it asynchronously after publishing ownership.
+/// MAC/LLT/packet rings and station admission remain closed.
 ///
 /// # Safety
 /// Caller owns the device's PCI configuration and BARs exclusively.
@@ -204,44 +228,61 @@ pub unsafe fn bring_up(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<RtlwifiDevice, ProbeError> {
-    crate::rtw88::pci_park::park(device, cap).map_err(|_| ProbeError::PciAccess)?;
-    // SAFETY: caller-asserted.
-    let registers =
-        unsafe { map_bar_control(device, 2) }.map_err(|_| ProbeError::RegisterBarMapFailed)?;
-    if registers.len < REG_EFUSE_ACCESS + 1 {
-        return Err(ProbeError::RegisterBarMapFailed);
-    }
     let did = device.id.device;
+    let (registers, mac) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
+        let registers = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
+            .map_err(|_| ProbeError::RegisterBarMapFailed)?;
+        if registers.len < REG_EFUSE_ACCESS + 1
+            || (device.id.device == RTL_DEV_8188EE && registers.len < 0x2000)
+        {
+            return Err(ProbeError::RegisterBarMapFailed);
+        }
 
-    // Power-on (cardemu → active).  Optional — chips not in the table
-    // are tolerated for forward compat; the rest fall through to MAC
-    // init unchanged.
-    if power::power_on_table_for(did).is_some() {
-        // SAFETY: BAR2 mapped, no other thread holds the chip.
-        unsafe { power::power_on(&registers, did) }?;
-    }
+        // Power-on (cardemu → active).  Optional — chips not in the table
+        // are tolerated for forward compat; the rest fall through to MAC
+        // init unchanged.
+        if power::power_on_table_for(did).is_some() {
+            // SAFETY: BAR2 mapped, no other thread holds the chip.
+            unsafe { power::power_on(&registers, did) }?;
+        }
 
-    // The diagnostic identity stage does not own packet DMA or an IRQ
-    // handler. Keep interrupt masks clear and defer MAC TX/RX/ring setup.
-    // SAFETY: BAR2 mapped and owned.
-    unsafe { irq::disable_interrupts(&registers) };
+        // The diagnostic identity stage does not own packet DMA or an IRQ
+        // handler. Keep interrupt masks clear and defer MAC TX/RX/ring setup.
+        // SAFETY: BAR2 mapped and owned.
+        unsafe { irq::disable_interrupts(&registers) };
 
-    let function = match device.addr {
-        narf_bus::BusAddr::Pcie(addr) => addr.function,
-        _ => return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip)),
-    };
-    // SAFETY: BAR2 mapped and owned, with EFUSE read clocks configured by
-    // the helper. PCI function selects the dual-MAC 8192DE factory address.
-    let mac = unsafe { efuse::read_mac(&registers, did, function) }.map_err(ProbeError::Efuse)?;
+        let function = match device.addr {
+            narf_bus::BusAddr::Pcie(addr) => addr.function,
+            _ => return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip)),
+        };
+        // SAFETY: BAR2 mapped and owned, with EFUSE read clocks configured by
+        // the helper. PCI function selects the dual-MAC 8192DE factory address.
+        let mac =
+            unsafe { efuse::read_mac(&registers, did, function) }.map_err(ProbeError::Efuse)?;
+
+        Ok((registers, mac))
+    })
+    .map_err(|_| ProbeError::PciAccess)??;
 
     let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
-    let device_arc = alloc::sync::Arc::new(RtlwifiDevice {
+    let firmware = if did == RTL_DEV_8188EE {
+        // SAFETY: probe parked this exact function and exclusively owns BAR2.
+        // PciIo rechecks current authority and parked BME at every access.
+        Some(Arc::new(FirmwareOwner::new(
+            unsafe { PciIo::new(*device, *cap, registers) },
+            did,
+        )))
+    } else {
+        None
+    };
+    let device_arc = Arc::new(RtlwifiDevice {
         bus_addr: device.addr,
         registers,
         mac,
         device_id: device.id.device,
+        firmware: firmware.clone(),
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(Some(rx_cons)),
         tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -253,6 +294,7 @@ pub unsafe fn bring_up(
         registers,
         mac,
         device_id: device.id.device,
+        firmware,
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(None),
         tx_ring: IrqSafeSpinLock::new(None),

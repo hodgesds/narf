@@ -10,7 +10,7 @@
 
 use core::fmt::Write as _;
 
-use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_time::Deadline;
@@ -47,6 +47,9 @@ pub struct Ath10kDevice {
     /// Correlated service-ready/INIT/READY completed, with retained host DMA.
     pub wmi_ready: Option<super::wmi_boot::Ready>,
     pub wmi_error: Option<super::wmi_boot::Error>,
+    /// Negotiated HTT with retained RX/fragment memory; station still closed.
+    pub htt_ready: Option<super::htt_runtime::Ready>,
+    pub htt_error: Option<super::htt_runtime::Error>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -123,10 +126,16 @@ struct WmiSession {
     image: super::firmware::Image,
     profile: super::profile::Profile,
 }
+struct HttSession {
+    htt: super::htt_runtime::Runtime<super::boot::PciBoot>,
+    image: super::firmware::Image,
+    profile: super::profile::Profile,
+}
 enum DriverSession {
     Boot(BootSession),
     Runtime(RuntimeSession),
     Wmi(WmiSession),
+    Htt(HttSession),
 }
 static SESSION: narf_lib::mutex::Mutex<Option<DriverSession>> = narf_lib::mutex::Mutex::new(None);
 
@@ -190,6 +199,34 @@ pub fn register_pci_driver() {
     }
 }
 
+async fn initialize_htt(
+    owner: DriverSession,
+    hardware: HwRev,
+) -> (
+    DriverSession,
+    Result<super::htt_runtime::Ready, super::htt_runtime::Error>,
+) {
+    let DriverSession::Wmi(wmi) = owner else {
+        return (owner, Err(super::htt_runtime::Error::Failed));
+    };
+    let config = match super::htt_runtime::Config::new(
+        hardware,
+        wmi.image.wmi,
+        wmi.image.htt,
+        wmi.image.features,
+    ) {
+        Ok(config) => config,
+        Err(error) => return (DriverSession::Wmi(wmi), Err(error)),
+    };
+    let mut runtime = HttSession {
+        htt: super::htt_runtime::Runtime::new(wmi.wmi, config),
+        image: wmi.image,
+        profile: wmi.profile,
+    };
+    let ready = runtime.htt.start().await;
+    (DriverSession::Htt(runtime), ready)
+}
+
 /// Human-readable driver name keyed on the matched `(vendor, device)`.
 /// Used as `PciMatch.name` + `BoundDriver.name`. Must be a `'static`
 /// string — the bus registry stores it by reference.
@@ -232,7 +269,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         .as_ref()
         .map(|controller| controller.address);
     let occupied = owner.is_some();
-    crate::qualcomm_pci::park(&device, &cap, !occupied, owner)?;
+    crate::qualcomm_pci::park(&device, &cap, false, owner)?;
     if occupied {
         return Err(narf_bus::ProbeError::Other(
             "ath10k singleton already owns another radio",
@@ -242,7 +279,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // SAFETY: bus dispatch hands us exclusive BusDeviceCap authority
     // for this device's cfg + BARs for the lifetime of this call.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let result = unsafe { bring_up(&device, hw_rev) };
+    let result = unsafe { bring_up(&device, &cap, hw_rev) };
     let dev = match result {
         Ok(d) => d,
         Err(e) => {
@@ -300,9 +337,27 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 ///
 /// # Safety
 /// Caller owns the device's BARs exclusively.
-pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice, ProbeError> {
+pub unsafe fn bring_up(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    hw_rev: HwRev,
+) -> Result<Ath10kDevice, ProbeError> {
+    crate::qualcomm_pci::invoke(cap, || {
+        // SAFETY: forwarded exclusive BAR/config ownership. The actual
+        // mapping, wake and identity accesses stay inside this invocation.
+        unsafe { bring_up_live(device, cap, hw_rev) }
+    })
+    .map_err(|_| ProbeError::DeviceGone)?
+}
+
+unsafe fn bring_up_live(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    hw_rev: HwRev,
+) -> Result<Ath10kDevice, ProbeError> {
     // SAFETY: caller-asserted BAR exclusivity.
-    let mmio_bar0 = unsafe { map_bar_control(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    let mmio_bar0 = crate::qualcomm_pci::map_bar_control(device, cap, 0)
+        .map_err(|_| ProbeError::Bar0MapFailed)?;
 
     let registers = hw_rev.registers().ok_or(ProbeError::LegacyChipRejected)?;
     let required = (registers.pcie_local + 12)
@@ -373,6 +428,8 @@ pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice
         runtime_error: None,
         wmi_ready: None,
         wmi_error: None,
+        htt_ready: None,
+        htt_error: None,
     })
 }
 
@@ -462,16 +519,34 @@ async fn boot_task(
                                 ready.htt_endpoint
                             );
                             let (owner, result) = initialize_wmi(owner, hw).await;
-                            *SESSION.lock().await = Some(owner);
                             match result {
                                 Ok(ready) => {
                                     if let Some(controller) = CONTROLLER.lock().as_mut() {
                                         controller.wmi_ready = Some(ready);
                                     }
-                                    let _ = writeln!(narf_console::Writer,
-                                        "  ath10k: WMI READY; HTT datapath and station registration pending");
+                                    let (owner, result) = initialize_htt(owner, hw).await;
+                                    *SESSION.lock().await = Some(owner);
+                                    match result {
+                                        Ok(ready) => {
+                                            if let Some(controller) = CONTROLLER.lock().as_mut() {
+                                                controller.htt_ready = Some(ready);
+                                            }
+                                            let _=writeln!(narf_console::Writer,"  ath10k: HTT {}.{} with retained packet DMA; station registration pending",ready.major,ready.minor);
+                                        }
+                                        Err(error) => {
+                                            if let Some(controller) = CONTROLLER.lock().as_mut() {
+                                                controller.htt_error = Some(error);
+                                            }
+                                            let _ = writeln!(
+                                                narf_console::Writer,
+                                                "  ath10k: retained HTT setup failed: {:?}",
+                                                error
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(error) => {
+                                    *SESSION.lock().await = Some(owner);
                                     if let Some(controller) = CONTROLLER.lock().as_mut() {
                                         controller.wmi_error = Some(error);
                                     }

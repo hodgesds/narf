@@ -18,16 +18,16 @@
 //! ## Scope (this commit)
 //!
 //! 1. PCI device-ID table — all 9 IDs registered with `narf-bus`.
-//! 2. BAR0 MMIO mapping — 16 KiB window for all chips.
+//! 2. BAR2 control mapping and verifiably parked PCI bus mastering.
 //! 3. EFUSE read — per-byte LDO-switched access (`REG_EFUSE_CTRL` / `REG_EFUSE_TEST`).
 //! 4. Per-chip register-bank / MMIO-size constants.
 //! 5. TX descriptor layout (BE queue) + RX descriptor layout.
-//! 6. Firmware blob-name resolver.
+//! 6. Retained RTL8188EE authenticated paged firmware owner; other parts remain diagnostic.
 //!
 //! ## Deferred
 //!
 //! - Power-on / chip-reset sequence (power.rs follow-up).
-//! - Firmware download via H2C page-write.
+//! - Firmware transport for the remaining legacy parts.
 //! - TX/RX ring initialisation and DMA setup.
 //! - MSI / INTx IRQ routing.
 //! - Bluetooth co-existence (8723AE/BE).
@@ -52,6 +52,8 @@ pub mod btcoex;
 pub mod channel;
 pub mod dma;
 pub mod efuse;
+mod firmware_native;
+pub mod firmware_transport;
 pub mod fw;
 pub mod h2c;
 pub mod irq;

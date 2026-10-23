@@ -42,7 +42,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::diag::{self, WifiStage};
@@ -915,15 +915,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
 
     // Quiesce an inherited function before identifying or resetting it.
-    // Recognized QCA6390/QCN9074 IDs currently lack a complete runtime
-    // profile; reject them before MMIO/MSI setup and never enable DMA.
+    // Unsupported families such as QCN9074 are rejected before mapping,
+    // MMIO/MSI setup, or DMA. Accepted profiles retain decode off for sizing.
     let owner = CONTROLLER
         .lock()
         .as_ref()
         .map(|controller| controller.address);
     let occupied = owner.is_some();
     let profile = validate_runtime_profile(chip.default_hw_rev);
-    crate::qualcomm_pci::park(&device, &cap, !occupied && profile.is_ok(), owner)?;
+    crate::qualcomm_pci::park(&device, &cap, false, owner)?;
     if occupied {
         return Err(narf_bus::ProbeError::Other(
             "ath11k singleton already owns another radio",
@@ -1089,7 +1089,8 @@ pub unsafe fn bring_up(
 ) -> Result<Ath11kDevice, ProbeError> {
     // SAFETY: `bring_up`'s contract is that the caller owns the device's BARs
     // exclusively — exactly the precondition `map_bar_control` requires.
-    let mmio_bar0 = unsafe { map_bar_control(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
+    let mmio_bar0 = crate::qualcomm_pci::map_bar_control(device, cap, 0)
+        .map_err(|_| ProbeError::Bar0MapFailed)?;
     if mmio_bar0.len < 0x100000 {
         return Err(ProbeError::Bar0MapFailed);
     }

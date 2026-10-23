@@ -346,3 +346,5 @@ kernel_test_in!(
     "drivers/wireless/ath10k/wmi-runtime",
     smoke_ath10k_wmi_native_bounds_abi_and_resources
 );
+
+include!("htt_tests.rs");

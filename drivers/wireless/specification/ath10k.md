@@ -27,6 +27,10 @@ packet service are not yet attached.
 - `pci::probe` disables inherited bus mastering, wakes and identifies the
   chip, retains its metadata and schedules the boot task. Bound-driver
   presence does not mean firmware or an interface is ready.
+- Native `pci::bring_up` requires the PCI capability. Actual BAR sizing,
+  wake and identity accesses execute inside its invocation. Sizing occurs
+  with verified memory decoding and bus mastering off; decoding is restored
+  and read back only after all sizing writes have been restored.
 - `pci::with_controller` exposes `Ath10kDevice` metadata.
   `target_info: Option<bmi::TargetInfo>` becomes present only after the
   real CE0 request and CE1 response complete. `boot_error` retains a
@@ -36,7 +40,9 @@ packet service are not yet attached.
   actual endpoint negotiation and credit size; `runtime_error` records a
   transport/HTC failure after ROM preparation. `wmi_ready` records a
   correlated successful READY MAC/version/status; `wmi_error` retains
-  service/ABI/memory/INIT failures. No netdev is registered.
+  service/ABI/memory/INIT failures. `htt_ready` records a supported target
+  version after retained native RX/fragment setup and aggregation configuration;
+  `htt_error` retains setup failure. No netdev is registered.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
@@ -128,10 +134,32 @@ at most 16 unique requests; a zero-unit request needs no chunk. Memory is
 one-shot, and cancelled or failed initialization cannot repeat allocation
 or INIT. Early HTT messages remain retained for the next HTT stage.
 
+The production PCI owner then enters `htt_runtime::Runtime`: HTC carries
+the four-byte version request, accepts target major 2 or 3, retains the
+2048-entry DMA32 RX-address ring with 1023 posted 2048-byte buffers, and
+sends the native 40-byte RX-ring command. All matched PCI profiles use the
+300-byte `htt_rx_desc_v1`, including wave2 parts. Continuous-fragment profiles
+retain 64-byte descriptors for the same pending-TX ceiling used by WMI;
+PFC images also retain the 4772-byte queue-state layout before its address
+is advertised. The fragment-bank command precedes RX-ring/aggregation setup.
+
+HTT event progress is idle-safe, distinct from a timed-out protocol request.
+TX payload/fragment owners survive CE completion and retire only after a
+validated terminal HTT indication; a batch validates every ID and completion
+kind before releasing any allocation. Target major 2 uses the separate
+56-byte management command and management completion. Native legacy RX
+validates MSDU_DONE, copies complete A-MSDUs/chains, then reposts the retained
+buffers. TLV full-reorder PADDR events select exact live DMA owners, validate
+the entire pointer batch before repost, and preserve the separate seven-byte
+offload metadata. Raw RX metadata does not authorize a peer or controlled port.
+Current-authority checks precede DMA reads and producer republication.
+Cancelled setup/TX/progress and malformed completion state fail closed.
+
 ## 4. Invariants
 
-- PCI parking is read back before MMIO: BME off, INTx masked, then
-  memory decode enabled and verified. Additional matched singleton radios
+- PCI parking is read back before BAR sizing: BME and memory decode off,
+  INTx masked; sizing runs in the current capability invocation, then
+  memory decode is enabled and verified before MMIO. Additional matched singleton radios
   are parked with BME/memory decode off and rejected. BME is enabled only
   after initialization of retained rings.
 - Repeated dispatch of the already owned PCI address fails before any
@@ -186,9 +214,12 @@ receive pipes and terminal duplicate/cancellation handling. These tests
 include actual HTC→WMI composition for all six dialects, INIT packets from
 an independently compiled C layout oracle, resource-dependent memory sizes,
 zero-unit skip, malformed ABI/count/extent handling and dropped INIT ownership.
-These tests
-do not emulate a Qualcomm radio or establish reset/ROM
-interoperability.
+HTC→WMI→HTT fixtures exercise actual retained RX/fragment/PFC storage, native
+configuration and TX literals checked against independently compiled Linux
+structures, major-2 management, terminal TX ownership, idle progress,
+A-MSDU/chained RX, out-of-order PADDR ownership and malformed/duplicate batch
+retention. The composed models are architecture-neutral; they do not emulate
+a Qualcomm radio or establish reset/ROM interoperability.
 
 ## 8. Remaining software and hardware acceptance
 
@@ -200,11 +231,13 @@ The following are software work, not gates that a physical boot can close:
 2. Complete per-firmware-family feature/dialect operation tables and
    optional board/clock/UART quirks, with real firmware validation of the
    current OTP/BDF/PLL/code-swap path.
-3. Full runtime RX buffer pools and packet service beyond the retained
-   serialized control path, HIF IRQ/MSI service, recovery and PM/teardown.
-4. Station/runtime WMI command and event operation maps beyond INIT/READY,
-   and the HTT version/descriptor/refill/TX completion/reorder paths. Existing
-   standalone WMI/HTT codecs do not establish a working transport.
+3. A retained station worker composing the native packet/event owner with
+   complete WMI operation handling, higher-capacity CE service, HIF IRQ/MSI,
+   recovery and PM/teardown. HTT setup alone does not publish an interface.
+4. Station/runtime WMI maps beyond INIT/READY; HTT peer/BA/security routing,
+   PFC fetch/mode/host-queue handling, native packet conversion, RX security
+   and replay/reorder policy. Existing standalone WMI/HTT codecs are not the
+   production station implementation.
 5. Regulatory/channel and scan/station control, management/EAPOL/key
    exchange, packet conversion, and `WirelessNetIface`/netdev registration.
 

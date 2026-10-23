@@ -23,6 +23,7 @@ pub(super) struct Runtime<B> {
     pub pipes: Vec<Pipe<B>>,
     pub received: VecDeque<(u8, Vec<u8>)>,
     pub wmi_memory: Option<Vec<B>>,
+    pub htt_memory: Option<crate::ath10k::htt_runtime::storage::Storage<B>>,
 }
 impl<B: Memory> Runtime<B> {
     pub fn allocate(
@@ -66,6 +67,7 @@ impl<B: Memory> Runtime<B> {
             pipes,
             received: VecDeque::new(),
             wmi_memory: None,
+            htt_memory: None,
         })
     }
     pub fn initialize(&mut self, io: &mut impl Ath10kMmio, hw: HwRev) -> Result<(), BmiError> {
@@ -207,6 +209,15 @@ impl PciBoot {
         .await
     }
     pub async fn hif_receive(&mut self, budget_ms: u64) -> Result<(u8, Vec<u8>), BmiError> {
+        match self.hif_poll(budget_ms).await? {
+            Some(frame) => Ok(frame),
+            None => {
+                self.poisoned = true;
+                Err(BmiError::Timeout)
+            }
+        }
+    }
+    pub async fn hif_poll(&mut self, budget_ms: u64) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
         if !self.mmio.authorized() {
             return Err(BmiError::Pci);
         }
@@ -238,10 +249,11 @@ impl PciBoot {
             }
             if let Some(frame) = hif.received.pop_front() {
                 self.poisoned = false;
-                return Ok(frame);
+                return Ok(Some(frame));
             }
             if deadline.expired() {
-                return Err(BmiError::Timeout);
+                self.poisoned = false;
+                return Ok(None);
             }
             PciBoot::delay(1).await;
         }

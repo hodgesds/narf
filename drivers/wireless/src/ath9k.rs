@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! AR9285 PCIe reset, EEPROM identity and inactive INI/PLL/RF preparation.
-//! Linux ath9k is the reference. Modal/power/calibration programming,
+//! Linux ath9k is the reference. Modal/RF board values are applied; power/calibration,
 //! PHY activation and packet DMA remain open.
 
 use core::fmt::Write as _;
@@ -50,19 +50,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         .as_ref()
         .map(|controller| controller._device.addr);
     let occupied = owner.is_some();
-    crate::qualcomm_pci::park(&device, &cap, !occupied, owner)?;
+    crate::qualcomm_pci::park(&device, &cap, false, owner)?;
     if occupied {
         return Err(narf_bus::ProbeError::Other(
             "ath9k singleton already owns another radio",
         ));
     }
-    // SAFETY: exclusive PCI function authority from bus dispatch.
-    let mmio = unsafe { narf_bus::map_bar_control(&device, 0) }
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let mmio = crate::qualcomm_pci::map_bar_control(&device, &cap, 0)?;
     if mmio.len < phy::REQUIRED_BAR {
         return Err(narf_bus::ProbeError::BadDevice);
     }
-    let (identity, calibration) = identity::read(mmio).map_err(|error| {
+    let (identity, calibration) = identity::read(mmio, cap).map_err(|error| {
         let _ = writeln!(
             narf_console::Writer,
             "  ath9k: AR9285 identification failed: {:?}",
@@ -70,7 +68,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
         narf_bus::ProbeError::BadDevice
     })?;
-    let baseband = phy::program(mmio, &calibration).map_err(|error| {
+    let baseband = phy::program(mmio, cap, &calibration).map_err(|error| {
         let _ = writeln!(
             narf_console::Writer,
             "  ath9k: AR9285 baseband preparation failed: {:?}",

@@ -12,8 +12,9 @@
 //! requires an exact platform calibration policy; no default board is invented.
 //! Owned flow TX/RX rings now implement create/delete, posted receive buffers,
 //! correlated retirement and fair bounded polling. Station lifecycle and
-//! recovery remain software work.
-//! No network interface is published by the control-runtime stage.
+//! fixed-BSSID station integration now has a native publication path after
+//! authenticated policy and firmware validation. Reset/recovery remain software
+//! work. No interface is published from the control-only owner.
 //!
 //! ## References (all ISC / BSD-3 / GPL-2.0; NARF is GPL-2.0-or-later)
 //!
@@ -54,6 +55,7 @@ pub mod pcie;
 pub mod ringbuf;
 pub mod runtime;
 pub mod shared;
+pub mod station_transport;
 
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};
 

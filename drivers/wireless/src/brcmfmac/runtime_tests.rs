@@ -1,7 +1,12 @@
 use super::{boot, chip, runtime, shared};
-use alloc::{collections::BTreeMap, rc::Rc, vec, vec::Vec};
-use core::cell::RefCell;
+use alloc::sync::Arc as Rc;
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    vec,
+    vec::Vec,
+};
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_lib::sync::IrqSafeSpinLock;
 use runtime::Memory;
 const BASE: u32 = 0x180000;
 const SIZE: u32 = 0x40000;
@@ -14,6 +19,13 @@ const H2DW: u32 = BASE + 0x400;
 const H2DR: u32 = BASE + 0x440;
 const D2HW: u32 = BASE + 0x480;
 const D2HR: u32 = BASE + 0x4c0;
+#[derive(Default)]
+struct Firmware {
+    control_read: u16,
+    completion_write: u16,
+    responses: VecDeque<(u32, u64)>,
+    commands: Vec<(u32, Vec<u8>, u16)>,
+}
 #[derive(Default)]
 struct State {
     registers: BTreeMap<u32, u32>,
@@ -30,16 +42,17 @@ struct State {
     started: bool,
     unreleased_read: bool,
     unsafe_free: usize,
+    firmware: Option<Firmware>,
 }
-struct Model(Rc<RefCell<State>>);
+struct Model(Rc<IrqSafeSpinLock<State>>);
 struct Mem {
-    state: Rc<RefCell<State>>,
+    state: Rc<IrqSafeSpinLock<State>>,
     address: u64,
     len: usize,
 }
 impl Drop for Mem {
     fn drop(&mut self) {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock();
         state.dropped += 1;
         if state.unreleased_read {
             state.unsafe_free += 1;
@@ -54,7 +67,7 @@ impl Memory for Mem {
         self.len
     }
     fn write(&mut self, at: usize, bytes: &[u8]) -> Result<(), runtime::Error> {
-        let mut s = self.state.borrow_mut();
+        let mut s = self.state.lock();
         let buf = s.dma.get_mut(&self.address).unwrap();
         let out = buf
             .get_mut(at..at.checked_add(bytes.len()).ok_or(runtime::Error::Bounds)?)
@@ -63,7 +76,7 @@ impl Memory for Mem {
         Ok(())
     }
     fn read(&mut self, at: usize, bytes: &mut [u8]) -> Result<(), runtime::Error> {
-        let mut s = self.state.borrow_mut();
+        let mut s = self.state.lock();
         s.unreleased_read = true;
         let buf = s.dma.get(&self.address).unwrap();
         let data = buf
@@ -75,19 +88,19 @@ impl Memory for Mem {
     fn to_device(&mut self, _: usize, _: usize) {}
     fn sync_from_device(&mut self, _: usize, _: usize) {}
     fn release(&mut self) {
-        self.state.borrow_mut().unreleased_read = false;
+        self.state.lock().unreleased_read = false;
     }
 }
 impl chip::Backplane for Model {
     fn read32(&mut self, at: u32) -> Result<u32, chip::Error> {
-        let s = self.0.borrow();
+        let s = self.0.lock();
         if at == ARM + 0x44 {
             return Ok(15);
         }
         Ok(*s.registers.get(&at).unwrap_or(&0))
     }
     fn write32(&mut self, at: u32, value: u32) -> Result<(), chip::Error> {
-        let mut s = self.0.borrow_mut();
+        let mut s = self.0.lock();
         s.registers.insert(at, value);
         s.writes.push((at, value));
         if at == WRAP + 0x408
@@ -105,14 +118,14 @@ impl boot::Bus for Model {
         BASE + SIZE
     }
     fn read_tcm(&mut self, at: u32, bytes: &mut [u8]) -> Result<(), boot::Error> {
-        let s = self.0.borrow();
+        let s = self.0.lock();
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = *s.tcm.get(&(at + i as u32)).unwrap_or(&0);
         }
         Ok(())
     }
     fn write_tcm(&mut self, at: u32, bytes: &[u8]) -> Result<(), boot::Error> {
-        let mut s = self.0.borrow_mut();
+        let mut s = self.0.lock();
         if (D2HR..D2HR + 12).contains(&at) && s.unreleased_read {
             return Err(boot::Error::State);
         }
@@ -127,13 +140,13 @@ impl boot::Bus for Model {
         Ok(())
     }
     fn dma_enabled(&mut self) -> Result<bool, boot::Error> {
-        Ok(self.0.borrow().dma_enable)
+        Ok(self.0.lock().dma_enable)
     }
 }
 impl runtime::Bus for Model {
     type Memory = Mem;
     fn allocate(&mut self, len: usize) -> Result<Mem, runtime::Error> {
-        let mut s = self.0.borrow_mut();
+        let mut s = self.0.lock();
         if s.fail_allocate == Some(s.allocated) {
             return Err(runtime::Error::Access);
         }
@@ -148,7 +161,7 @@ impl runtime::Bus for Model {
         })
     }
     fn enable_dma(&mut self) -> Result<(), runtime::Error> {
-        let mut s = self.0.borrow_mut();
+        let mut s = self.0.lock();
         if s.allocated != 24 {
             return Err(runtime::Error::Protocol);
         }
@@ -156,16 +169,95 @@ impl runtime::Bus for Model {
         Ok(())
     }
     fn park_dma(&mut self) -> Result<(), runtime::Error> {
-        self.0.borrow_mut().dma_enable = false;
+        self.0.lock().dma_enable = false;
         Ok(())
     }
     fn doorbell(&mut self) -> Result<(), runtime::Error> {
-        self.0.borrow_mut().doorbells += 1;
+        let mut state = self.0.lock();
+        state.doorbells += 1;
+        firmware_step(&mut state);
         Ok(())
     }
     fn host_ready(&mut self, _: bool) -> Result<(), runtime::Error> {
         Ok(())
     }
+}
+/// Independent firmware fixture consumes the actual posted 40-byte control
+/// descriptors and their DMA input, and writes actual correlated completions.
+fn firmware_step(state: &mut State) {
+    let Some(mut firmware) = state.firmware.take() else {
+        return;
+    };
+    let address = pointer(state, RINGS + 8);
+    if address != 0 {
+        let producer = word(state, H2DW) as u16;
+        let depth = word(state, RINGS + 4) as u16;
+        while firmware.control_read != producer {
+            let offset = usize::from(firmware.control_read) * 40;
+            let descriptor = state.dma[&address][offset..offset + 40].to_vec();
+            let id = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
+            if descriptor[0] == 0xb {
+                firmware.responses.push_back((
+                    id,
+                    u64::from_le_bytes(descriptor[16..24].try_into().unwrap()),
+                ));
+            } else if matches!(descriptor[0], 3 | 5) {
+                let field = if descriptor[0] == 3 { 22 } else { 8 };
+                let flow = u16::from_le_bytes(descriptor[field..field + 2].try_into().unwrap());
+                flow_reply(
+                    state,
+                    usize::from(firmware.completion_write),
+                    descriptor[0] + 1,
+                    flow,
+                );
+                firmware.completion_write =
+                    (firmware.completion_write + 1) % (word(state, RINGS + 2 * 16 + 4) as u16);
+                put(state, D2HW, &firmware.completion_write.to_le_bytes());
+            } else if descriptor[0] == 9 {
+                let command = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
+                let transaction = u16::from_le_bytes(descriptor[12..14].try_into().unwrap());
+                let input_len = u16::from_le_bytes(descriptor[14..16].try_into().unwrap());
+                let output_len = u16::from_le_bytes(descriptor[16..18].try_into().unwrap());
+                let input_dma = u64::from_le_bytes(descriptor[24..32].try_into().unwrap());
+                let input = state.dma[&input_dma][..usize::from(input_len)].to_vec();
+                firmware.commands.push((command, input.clone(), output_len));
+                let response = match command {
+                    1 => 2u32.to_le_bytes().to_vec(),
+                    217 => [3u32, 1, 6, 11]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect(),
+                    262 if input.starts_with(b"cur_etheraddr\0") => {
+                        // Include the physical query tail: the common station
+                        // must still receive exactly its six requested bytes.
+                        let mut bytes = vec![0; usize::from(output_len)];
+                        bytes[..6].copy_from_slice(&[2, 6, 7, 8, 9, 10]);
+                        bytes
+                    }
+                    262 if input.starts_with(b"sup_wpa\0") => vec![0; usize::from(output_len)],
+                    _ => Vec::new(),
+                };
+                let (response_id, response_dma) = firmware.responses.pop_front().unwrap();
+                state.dma.get_mut(&response_dma).unwrap()[..response.len()]
+                    .copy_from_slice(&response);
+                complete(
+                    state,
+                    usize::from(firmware.completion_write),
+                    0xc,
+                    response_id,
+                    (0, response.len() as u16),
+                    transaction,
+                    command,
+                );
+                firmware.completion_write =
+                    (firmware.completion_write + 1) % (word(state, RINGS + 2 * 16 + 4) as u16);
+                put(state, D2HW, &firmware.completion_write.to_le_bytes());
+            }
+            firmware.control_read = (firmware.control_read + 1) % depth;
+            put(state, H2DR, &firmware.control_read.to_le_bytes());
+        }
+    }
+    state.firmware = Some(firmware);
 }
 fn put(s: &mut State, at: u32, bytes: &[u8]) {
     for (i, &b) in bytes.iter().enumerate() {
@@ -182,7 +274,7 @@ fn pointer(s: &State, at: u32) -> u64 {
         *s.tcm.get(&(at + i as u32)).unwrap_or(&0)
     }))
 }
-fn model() -> (Model, Rc<RefCell<State>>) {
+fn model() -> (Model, Rc<IrqSafeSpinLock<State>>) {
     let mut s = State {
         next: 0x10000000,
         ..State::default()
@@ -236,7 +328,7 @@ fn model() -> (Model, Rc<RefCell<State>>) {
     put(&mut s, INFO + 52, &2u16.to_le_bytes());
     put(&mut s, INFO + 54, &4u16.to_le_bytes());
     put(&mut s, INFO + 56, &3u16.to_le_bytes());
-    let rc = Rc::new(RefCell::new(s));
+    let rc = Rc::new(IrqSafeSpinLock::new(s));
     (Model(rc.clone()), rc)
 }
 fn pci() -> boot::PciIdentity {
@@ -257,7 +349,7 @@ fn profile() -> boot::BoardProfile {
     }
 }
 fn booted(bus: Model) -> boot::Booted<Model> {
-    let s = bus.0.borrow();
+    let s = bus.0.lock();
     let mut bytes = [0; 76];
     for (i, b) in bytes.iter_mut().enumerate() {
         *b = *s.tcm.get(&(SHARED + i as u32)).unwrap_or(&0);
@@ -302,7 +394,7 @@ fn smoke_brcmf_cr4_board_policy_and_real_boot_transcript() -> TestResult {
     let mut wrong = profile();
     wrong.pci.subsystem_device ^= 1;
     if !matches!(boot::Cr4::claim(bus, pci(), wrong), Err(boot::Error::Board))
-        || !s.borrow().writes.is_empty()
+        || !s.lock().writes.is_empty()
     {
         return TestResult::Fail("board policy must precede hardware writes");
     }
@@ -322,7 +414,7 @@ fn smoke_brcmf_cr4_board_policy_and_real_boot_transcript() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Fail("actual CR4 ownership/firmware path failed"),
     };
-    let state = s.borrow();
+    let state = s.lock();
     if boot.ram.size != SIZE
         || boot.shared_address != SHARED
         || !state.started
@@ -357,7 +449,7 @@ fn smoke_brcmf_msgbuf_actual_dma_request_completion() -> TestResult {
         Err(_) => return TestResult::Fail("production IOCTL submit failed"),
     };
     {
-        let mut st = s.borrow_mut();
+        let mut st = s.lock();
         if !st.dma_enable
             || st.allocated != 24
             || st.doorbells != 17
@@ -397,7 +489,7 @@ fn smoke_brcmf_msgbuf_actual_dma_request_completion() -> TestResult {
         return TestResult::Fail("correlated posted-buffer IOCTL response failed");
     }
     drop(owner);
-    let st = s.borrow();
+    let st = s.lock();
     if st.dma_enable || st.dropped != 0 {
         return TestResult::Fail("published DMA was freed before device/IOMMU quiescence");
     }
@@ -415,7 +507,7 @@ fn smoke_brcmf_msgbuf_event_repost_and_bad_identity_terminal() -> TestResult {
     };
     let old_id;
     {
-        let mut st = s.borrow_mut();
+        let mut st = s.lock();
         let ring = pointer(&st, RINGS + 8);
         let post = &st.dma.get(&ring).unwrap()[8 * 40..9 * 40];
         old_id = u32::from_le_bytes(post[4..8].try_into().unwrap());
@@ -427,7 +519,7 @@ fn smoke_brcmf_msgbuf_event_repost_and_bad_identity_terminal() -> TestResult {
         return TestResult::Fail("event did not copy before repost");
     }
     {
-        let mut st = s.borrow_mut();
+        let mut st = s.lock();
         let ring = pointer(&st, RINGS + 8);
         let repost = &st.dma.get(&ring).unwrap()[16 * 40..17 * 40];
         if repost[0] != 0xd || u32::from_le_bytes(repost[4..8].try_into().unwrap()) == old_id {
@@ -451,7 +543,7 @@ fn smoke_brcmf_msgbuf_allocation_publication_retention() -> TestResult {
     for published in [false, true] {
         let (bus, s) = model();
         {
-            let mut st = s.borrow_mut();
+            let mut st = s.lock();
             if published {
                 st.fail_tcm = true;
             } else {
@@ -461,7 +553,7 @@ fn smoke_brcmf_msgbuf_allocation_publication_retention() -> TestResult {
         if runtime::Runtime::attach(booted(bus)).is_ok() {
             return TestResult::Fail("injected setup failure accepted");
         }
-        let st = s.borrow();
+        let st = s.lock();
         if (published && st.dropped != 0)
             || (!published && st.dropped != st.allocated)
             || st.dma_enable
@@ -472,17 +564,17 @@ fn smoke_brcmf_msgbuf_allocation_publication_retention() -> TestResult {
         }
     }
     let (bus, s) = model();
-    put(&mut s.borrow_mut(), SHARED + 36, &8u32.to_le_bytes());
+    put(&mut s.lock(), SHARED + 36, &8u32.to_le_bytes());
     if !matches!(
         runtime::Runtime::attach(booted(bus)),
         Err(runtime::Error::Protocol)
-    ) || s.borrow().allocated != 0
+    ) || s.lock().allocated != 0
     {
         return TestResult::Fail("unsupported descriptor prefix allocated/published DMA");
     }
     let (bus, s) = model();
     let mut owner = runtime::Runtime::attach(booted(bus)).unwrap();
-    put(&mut s.borrow_mut(), D2HW, &64u16.to_le_bytes());
+    put(&mut s.lock(), D2HW, &64u16.to_le_bytes());
     if owner.poll() != Err(runtime::Error::Protocol) || !owner.is_failed() {
         return TestResult::Fail("out-of-range peer index admitted");
     }
@@ -515,7 +607,7 @@ fn smoke_brcmf_msgbuf_dropped_command_retains_dma_and_input() -> TestResult {
     if !owner.is_failed() || owner.begin_ioctl(1, &[], 4).is_ok() {
         return TestResult::Fail("cancelled waiter allowed input DMA overwrite");
     }
-    let st = s.borrow();
+    let st = s.lock();
     let ring = pointer(&st, RINGS + 8);
     let req = &st.dma.get(&ring).unwrap()[16 * 40..17 * 40];
     let input = u64::from_le_bytes(req[24..32].try_into().unwrap());
@@ -560,7 +652,7 @@ fn smoke_brcmf_actual_flow_tx_lifecycle_and_retirement() -> TestResult {
     }
     let flow_address;
     {
-        let mut st = s.borrow_mut();
+        let mut st = s.lock();
         let ctrl = pointer(&st, RINGS + 8);
         let req = &st.dma.get(&ctrl).unwrap()[16 * 40..17 * 40];
         if req[0] != 3
@@ -583,7 +675,7 @@ fn smoke_brcmf_actual_flow_tx_lifecycle_and_retirement() -> TestResult {
         return TestResult::Fail("flow deleted before TX completion");
     }
     {
-        let mut st = s.borrow_mut();
+        let mut st = s.lock();
         let desc = &st.dma.get(&flow_address).unwrap()[..48];
         if desc[0] != 0xf
             || desc[8..22] != frame[..14]
@@ -612,19 +704,19 @@ fn smoke_brcmf_actual_flow_tx_lifecycle_and_retirement() -> TestResult {
                 status: 0,
                 tx_status: 0,
             })
-        || s.borrow().dropped != 1
-        || s.borrow().unsafe_free != 0
+        || s.lock().dropped != 1
+        || s.lock().unsafe_free != 0
     {
         return TestResult::Fail("exact TX completion did not safely retire body DMA");
     }
     owner.close_flow(flow).unwrap();
     {
-        flow_reply(&mut s.borrow_mut(), 1, 6, 2);
+        flow_reply(&mut s.lock(), 1, 6, 2);
     }
     if owner.poll() != Ok(1)
         || owner.flow_state(flow) != Ok(runtime::FlowState::Closed)
         || owner.send(flow, &frame) != Err(runtime::Error::Busy)
-        || s.borrow().dropped != 1
+        || s.lock().dropped != 1
     {
         return TestResult::Fail("flow delete state or retained ring allocation differs");
     }
@@ -641,7 +733,7 @@ fn smoke_brcmf_actual_rx_copy_repost_and_stale_id() -> TestResult {
     let frame = ethernet();
     let id;
     {
-        let mut st = s.borrow_mut();
+        let mut st = s.lock();
         let rxpost = pointer(&st, RINGS + 16 + 8);
         let post = &st.dma.get(&rxpost).unwrap()[..32];
         id = u32::from_le_bytes(post[4..8].try_into().unwrap());
@@ -661,7 +753,7 @@ fn smoke_brcmf_actual_rx_copy_repost_and_stale_id() -> TestResult {
         return TestResult::Fail("wide RX offset/copy-before-repost failed");
     }
     {
-        let mut st = s.borrow_mut();
+        let mut st = s.lock();
         let post_ring = pointer(&st, RINGS + 16 + 8);
         let repost = &st.dma.get(&post_ring).unwrap()[32 * 32..33 * 32];
         if u32::from_le_bytes(repost[4..8].try_into().unwrap()) == id {
@@ -673,8 +765,7 @@ fn smoke_brcmf_actual_rx_copy_repost_and_stale_id() -> TestResult {
         bytes[32..64].copy_from_slice(&old);
         put(&mut st, D2HW + 8, &2u16.to_le_bytes());
     }
-    if owner.poll() != Err(runtime::Error::Protocol) || !owner.is_failed() || s.borrow().dma_enable
-    {
+    if owner.poll() != Err(runtime::Error::Protocol) || !owner.is_failed() || s.lock().dma_enable {
         return TestResult::Fail("stale RX completion failed to stop DMA owner");
     }
     TestResult::Pass
@@ -695,11 +786,11 @@ fn smoke_brcmf_control_pressure_cannot_starve_data_completion() -> TestResult {
             0,
         )
         .unwrap();
-    flow_reply(&mut s.borrow_mut(), 0, 4, 2);
+    flow_reply(&mut s.lock(), 0, 4, 2);
     owner.poll().unwrap();
     let id = owner.send(flow, &frame).unwrap();
     {
-        let mut st = s.borrow_mut();
+        let mut st = s.lock();
         for slot in 1..33 {
             complete(&mut st, slot, 1, 0, (0, 0), 0, 0);
         }
@@ -712,7 +803,7 @@ fn smoke_brcmf_control_pressure_cannot_starve_data_completion() -> TestResult {
     }
     if owner.poll() != Ok(11)
         || owner.pop_tx_receipt().is_none()
-        || word(&s.borrow(), D2HR) & 0xffff != 11
+        || word(&s.lock(), D2HR) & 0xffff != 11
     {
         return TestResult::Fail(
             "bounded control batch starved TX or exceeded per-ring work bound",
@@ -730,7 +821,7 @@ fn smoke_brcmf_data_bad_completion_cannot_retire_dma() -> TestResult {
         let mut owner = runtime::Runtime::attach(booted(bus)).unwrap();
         owner.enable_data().unwrap();
         if bad_rx {
-            let mut st = s.borrow_mut();
+            let mut st = s.lock();
             let posts = pointer(&st, RINGS + 16 + 8);
             let id = u32::from_le_bytes(st.dma.get(&posts).unwrap()[4..8].try_into().unwrap());
             let ring = pointer(&st, RINGS + 4 * 16 + 8);
@@ -748,10 +839,10 @@ fn smoke_brcmf_data_bad_completion_cannot_retire_dma() -> TestResult {
                     0,
                 )
                 .unwrap();
-            flow_reply(&mut s.borrow_mut(), 0, 4, 2);
+            flow_reply(&mut s.lock(), 0, 4, 2);
             owner.poll().unwrap();
             let id = owner.send(flow, &frame).unwrap();
-            let mut st = s.borrow_mut();
+            let mut st = s.lock();
             let ring = pointer(&st, RINGS + 3 * 16 + 8);
             let entry = &mut st.dma.get_mut(&ring).unwrap()[..16];
             entry[0] = 0x10;
@@ -761,8 +852,8 @@ fn smoke_brcmf_data_bad_completion_cannot_retire_dma() -> TestResult {
         }
         if owner.poll().is_ok()
             || !owner.is_failed()
-            || s.borrow().dropped != 0
-            || s.borrow().dma_enable
+            || s.lock().dropped != 0
+            || s.lock().dma_enable
         {
             return TestResult::Fail(
                 "bad RX extent or wrong-flow TX completion freed/kept-running DMA",
@@ -774,4 +865,299 @@ fn smoke_brcmf_data_bad_completion_cannot_retire_dma() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/brcmfmac",
     smoke_brcmf_data_bad_completion_cannot_retire_dma
+);
+fn smoke_fullmac_msgbuf_set_uses_input_extent_and_cancel_retains() -> TestResult {
+    use crate::cyw43439::{fullmac::Fullmac, ioctl::Direction};
+    use core::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    let (bus, s) = model();
+    let runtime = runtime::Runtime::attach(booted(bus)).unwrap();
+    let mut adapter = super::station_transport::Adapter::new(runtime).unwrap();
+    {
+        let input = 0u32.to_le_bytes();
+        let mut command = pin!(adapter.command(Direction::Set, 86, &input, 1502));
+        if !matches!(
+            command
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ) {
+            return TestResult::Fail("SET did not retain awaited completion");
+        }
+        let st = s.lock();
+        let ring = pointer(&st, RINGS + 8);
+        let req = &st.dma.get(&ring).unwrap()[16 * 40..17 * 40];
+        if req[14..18] != [4, 0, 4, 0] {
+            return TestResult::Fail(
+                "msgbuf SET advertised CYW maximum rather than actual input length",
+            );
+        }
+    }
+    if adapter.poll().is_ok() || s.lock().dma_enable || s.lock().dropped != 0 {
+        return TestResult::Fail("cancelled shared command owner reused/freed input DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_fullmac_msgbuf_set_uses_input_extent_and_cancel_retains
+);
+fn smoke_fullmac_msgbuf_event_does_not_authorize_port() -> TestResult {
+    use crate::cyw43439::fullmac::Fullmac;
+    let (bus, s) = model();
+    let runtime = runtime::Runtime::attach(booted(bus)).unwrap();
+    let mut adapter = super::station_transport::Adapter::new(runtime).unwrap();
+    let mut event = [0; 75];
+    event[12..14].copy_from_slice(&[0x88, 0x6c]);
+    event[14..24].copy_from_slice(&[0x80, 1, 0, 0, 0, 0, 0x10, 0x18, 0, 1]);
+    event[24..28].copy_from_slice(&[0, 2, 0, 1]);
+    event[28..32].copy_from_slice(&16u32.to_be_bytes());
+    event[44..48].copy_from_slice(&3u32.to_be_bytes());
+    event[48..54].copy_from_slice(&[2, 0, 0, 0, 0, 9]);
+    event[72..].copy_from_slice(b"evt");
+    {
+        let mut st = s.lock();
+        let ring = pointer(&st, RINGS + 8);
+        let post = &st.dma.get(&ring).unwrap()[8 * 40..9 * 40];
+        let id = u32::from_le_bytes(post[4..8].try_into().unwrap());
+        let address = u64::from_le_bytes(post[16..24].try_into().unwrap());
+        st.dma.get_mut(&address).unwrap()[..event.len()].copy_from_slice(&event);
+        complete(&mut st, 0, 0xe, id, (0, event.len() as u16), 0, 0);
+    }
+    if adapter.poll() != Ok(1)
+        || !matches!(adapter.pop_event(),Some(event) if event.header.event_type==16 && event.payload==b"evt")
+        || adapter.send_data(&ethernet(), 0) != Err(crate::cyw43439::runtime::Error::Failed)
+    {
+        return TestResult::Fail(
+            "real msgbuf event framing or pre-authorization data gate differs",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_fullmac_msgbuf_event_does_not_authorize_port
+);
+fn smoke_fullmac_msgbuf_link_down_closes_prior_flows() -> TestResult {
+    use crate::cyw43439::fullmac::Fullmac;
+    let (bus, s) = model();
+    let runtime = runtime::Runtime::attach(booted(bus)).unwrap();
+    let mut adapter = super::station_transport::Adapter::new(runtime).unwrap();
+    let peer = [2, 0, 0, 0, 0, 9];
+    let frame = ethernet();
+    adapter.set_link(Some(peer));
+    if adapter.send_data(&frame, 0) != Err(crate::cyw43439::runtime::Error::Busy) {
+        return TestResult::Fail("flow creation did not backpressure retained frame");
+    }
+    flow_reply(&mut s.lock(), 0, 4, 2);
+    adapter.poll().unwrap();
+    adapter.send_data(&frame, 0).unwrap();
+    let id;
+    {
+        let st = s.lock();
+        let ctrl = pointer(&st, RINGS + 8);
+        let create = &st.dma.get(&ctrl).unwrap()[16 * 40..17 * 40];
+        let flow = u64::from_le_bytes(create[32..40].try_into().unwrap());
+        id = u32::from_le_bytes(st.dma.get(&flow).unwrap()[4..8].try_into().unwrap());
+    }
+    adapter.set_link(None);
+    adapter.poll().unwrap();
+    if adapter.send_data(&frame, 0) != Err(crate::cyw43439::runtime::Error::Failed)
+        || s.lock().dropped != 0
+    {
+        return TestResult::Fail("link-down admitted data or released pending TX");
+    }
+    {
+        let mut st = s.lock();
+        let ring = pointer(&st, RINGS + 3 * 16 + 8);
+        let entry = &mut st.dma.get_mut(&ring).unwrap()[..16];
+        entry[0] = 0x10;
+        entry[4..8].copy_from_slice(&id.to_le_bytes());
+        entry[10..12].copy_from_slice(&2u16.to_le_bytes());
+        put(&mut st, D2HW + 4, &1u16.to_le_bytes());
+    }
+    adapter.poll().unwrap();
+    flow_reply(&mut s.lock(), 1, 6, 2);
+    adapter.poll().unwrap();
+    adapter.set_link(Some([2, 0, 0, 0, 0, 10]));
+    if adapter.send_data(&frame, 0) != Err(crate::cyw43439::runtime::Error::Busy) {
+        return TestResult::Fail("next peer reused old flow instead of fresh create");
+    }
+    let st = s.lock();
+    let ring = pointer(&st, RINGS + 8);
+    let create = &st.dma.get(&ring).unwrap()[18 * 40..19 * 40];
+    if create[0] != 3 || create[22..24] != [2, 0] || st.dropped != 1 || st.unsafe_free != 0 {
+        return TestResult::Fail("old peer flow was not recycled after confirmed deletion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_fullmac_msgbuf_link_down_closes_prior_flows
+);
+
+fn smoke_fullmac_msgbuf_query_returns_requested_extent() -> TestResult {
+    use crate::cyw43439::{fullmac::Fullmac, ioctl::Direction};
+    use core::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    let (bus, state) = model();
+    state.lock().firmware = Some(Firmware::default());
+    let runtime = runtime::Runtime::attach(booted(bus)).unwrap();
+    let mut adapter = super::station_transport::Adapter::new(runtime).unwrap();
+    let mut query = pin!(adapter.command(Direction::Get, 262, b"cur_etheraddr\0", 6));
+    if query.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        != Poll::Ready(Ok(vec![2, 6, 7, 8, 9, 10]))
+    {
+        return TestResult::Fail("long iovar query envelope leaked into the station reply");
+    }
+    let state = state.lock();
+    let command = &state.firmware.as_ref().unwrap().commands[0];
+    if command.0 != 262 || command.1 != b"cur_etheraddr\0" || command.2 != 14 {
+        return TestResult::Fail("actual query descriptor lost its logical input extent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_fullmac_msgbuf_query_returns_requested_extent
+);
+
+fn smoke_brcmf_confirmed_delete_recycles_retained_ring_and_host_generation() -> TestResult {
+    let (bus, state) = model();
+    state.lock().firmware = Some(Firmware::default());
+    let mut runtime = runtime::Runtime::attach(booted(bus)).unwrap();
+    runtime.enable_data().unwrap();
+    let initial = state.lock().allocated;
+    let frame = ethernet();
+    let mut previous = None;
+    let mut previous_tx = None;
+    for cycle in 0..40u16 {
+        let flow = runtime
+            .open_flow(
+                frame[6..12].try_into().unwrap(),
+                frame[..6].try_into().unwrap(),
+                0,
+            )
+            .unwrap();
+        if let Some(old) = previous {
+            if flow == old
+                || runtime.flow_state(old) != Err(runtime::Error::Protocol)
+                || runtime.send(old, &frame) != Err(runtime::Error::Protocol)
+                || runtime.close_flow(old) != Err(runtime::Error::Protocol)
+            {
+                return TestResult::Fail("recycled firmware flow accepted an earlier host token");
+            }
+        }
+        runtime.poll().unwrap();
+        let id = runtime.send(flow, &frame).unwrap();
+        if previous_tx.is_some_and(|previous| id <= previous)
+            || runtime.close_flow(flow) != Err(runtime::Error::Busy)
+        {
+            return TestResult::Fail("pending TX was aliased or flow deleted before retirement");
+        }
+        {
+            let mut state = state.lock();
+            let ring = pointer(&state, RINGS + 3 * 16 + 8);
+            let at = usize::from(cycle) * 16;
+            let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + 16];
+            entry[0] = 0x10;
+            entry[4..8].copy_from_slice(&id.to_le_bytes());
+            entry[10..12].copy_from_slice(&2u16.to_le_bytes());
+            put(&mut state, D2HW + 4, &(cycle + 1).to_le_bytes());
+        }
+        runtime.poll().unwrap();
+        if runtime.pop_tx_receipt().map(|receipt| receipt.id) != Some(id) {
+            return TestResult::Fail("recycled ring lost its exact TX receipt");
+        }
+        runtime.close_flow(flow).unwrap();
+        runtime.poll().unwrap();
+        if runtime.flow_state(flow) != Ok(runtime::FlowState::Closed) {
+            return TestResult::Fail("confirmed delete did not fence and close the ring");
+        }
+        previous = Some(flow);
+        previous_tx = Some(id);
+    }
+    let state = state.lock();
+    if state.allocated != initial + 1 + 40 || state.dropped != 40 || state.unsafe_free != 0 {
+        return TestResult::Fail(
+            "reconnect leaked flow mappings or released DMA before completion",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_brcmf_confirmed_delete_recycles_retained_ring_and_host_generation
+);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_fullmac_station_initializes_over_actual_msgbuf() -> TestResult {
+    use core::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    let (bus, state) = model();
+    state.lock().firmware = Some(Firmware::default());
+    let runtime = runtime::Runtime::attach(booted(bus)).unwrap();
+    let adapter = super::station_transport::Adapter::new(runtime).unwrap();
+    let domain = narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![narf_wireless::reg::RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 17,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        }],
+    };
+    let mut initialization = pin!(crate::cyw43439::station::Station::initialize(
+        adapter,
+        &[],
+        domain
+    ));
+    let station = match initialization
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(Ok(station)) => station,
+        _ => return TestResult::Fail("common station did not consume actual msgbuf replies"),
+    };
+    if station.mac != [2, 6, 7, 8, 9, 10]
+        || station.channels != [1, 6, 11]
+        || station.bssid.is_some()
+        || !station.supplicant
+    {
+        return TestResult::Fail(
+            "firmware-derived station identity/channel/security state differs",
+        );
+    }
+    let state = state.lock();
+    let commands = &state.firmware.as_ref().unwrap().commands;
+    if !commands
+        .iter()
+        .any(|(cmd, input, _)| *cmd == 263 && input.starts_with(b"country\0US"))
+        || !commands
+            .iter()
+            .any(|(cmd, input, _)| *cmd == 263 && input == b"roam_off\0\x01\0\0\0")
+        || commands
+            .iter()
+            .any(|(_, input, _)| input.starts_with(b"bus:") || input.starts_with(b"clmload"))
+    {
+        return TestResult::Fail(
+            "PCIe initialization sent SDIO glom/CLM or omitted station policy",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/wireless/brcmfmac",
+    smoke_fullmac_station_initializes_over_actual_msgbuf
 );

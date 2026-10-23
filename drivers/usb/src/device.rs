@@ -296,6 +296,16 @@ impl USBDevice {
             .map_err(UsbError::from_xhci)
     }
 
+    /// Stop/drain one retained bulk receipt before discarding or reusing its
+    /// page/ring. Any error or dropped future leaves the claim terminally busy.
+    pub async fn stop_bulk(&self, token: &BulkToken) -> Result<(), UsbError> {
+        self.validate_bulk_token(token)?;
+        self.controller
+            .stop_bulk(token)
+            .await
+            .map_err(UsbError::from_xhci)
+    }
+
     /// Compatibility bulk-OUT wait. Timeout/error leaves the endpoint busy;
     /// caller buffers may be released because the host owns the staged copy.
     pub async fn bulk_out(&self, dci: u8, data: &[u8]) -> Result<usize, UsbError> {
