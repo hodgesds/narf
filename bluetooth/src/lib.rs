@@ -61,6 +61,7 @@ pub mod mesh;
 pub mod mgmt;
 pub mod opcode;
 pub mod profiles;
+pub mod pump;
 pub mod rfcomm;
 pub mod sdp;
 pub mod services;
@@ -113,8 +114,10 @@ pub fn register_firmware_initcalls() {
 /// runs out of the USB host supervisor's per-port attach pass
 /// (`narf_drivers_usb::btusb::try_bind_btusb_already_addressed`).
 ///
-/// Future stages will hook here to spawn an HCI event-pump task and
-/// register Bluetooth-specific syscalls.
+/// The HCI event-pump task is enabled here: [`pump::enable_spawning`]
+/// adopts every controller that is already ready, and controllers
+/// that become ready later (USB attach, PCIe firmware load) start
+/// their pump from `pump::notify_controller_ready`.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     #[cfg(target_arch = "x86_64")]
@@ -127,6 +130,14 @@ pub fn register_initcalls() {
         // controller probed by the USB supervisor will print its own
         // `bluetooth: ... adapter` line at attach time.
         let _ = transport::transport_count();
+        InitResult::Ok
+    });
+    // Stage: enable the HCI event/ACL pump (see `pump`). Runs after
+    // the Stage::Late bring-up initcall in registration order across
+    // the boot sequence; controllers discovered later are adopted by
+    // `pump::notify_controller_ready` at registration time.
+    narf_init::register(Stage::Late, "bluetooth-pump", || {
+        pump::enable_spawning();
         InitResult::Ok
     });
     // Stage: install /dev/rfcomm<N> lookup + enumerate hooks into devfs.

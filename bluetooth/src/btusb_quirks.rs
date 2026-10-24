@@ -9,10 +9,10 @@
 //!   `BTUSB_QCA_WCN6855`, `BTUSB_MEDIATEK`, `BTUSB_BCM_PATCHRAM`,
 //!   `BTUSB_CSR`, `BTUSB_AMP`).
 //! - `drivers/bluetooth/btintel.c` — Intel firmware-load sequence
-//!   (HCI_Reset → vendor command 0xFC09 read boot params → load
-//!   .sfi/.bseq into boot ROM → vendor command 0xFC01 boot → wait
-//!   for vendor event 0xFF/0x02). NARF defers blob load but records
-//!   the path so a userspace firmware service can stage it.
+//!   (HCI_Reset → vendor command 0xFC0D read boot params → secure
+//!   send of the .sfi over 0xFC09 → Intel Reset 0xFC01 boot → .ddc
+//!   over 0xFC8B). Implemented in `narf-drivers-usb::btusb_intel`;
+//!   this module records the identity + blob names it selects from.
 //! - `drivers/bluetooth/btrtl.c` — Realtek firmware-load sequence
 //!   (read ROM version via H4 vendor pkt, fetch `rtl_bt/rtl8761*.bin`
 //!   + `rtl_bt/rtl8761*_config.bin`, send via vendor command 0xFC20).
