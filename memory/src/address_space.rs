@@ -2314,6 +2314,25 @@ pub struct FixedRelocationError {
     pub source_shrunk: bool,
 }
 
+/// How a [`AddressSpace::zap_mapping_range_locked_for_syscall_with_shared`]
+/// call disposed of its window. The two outcomes are NOT interchangeable for
+/// the caller: upper file-owner tables must mirror them differently (a
+/// retained VMA keeps its owner row and loses only the window's backing
+/// entries; a removed range retires the row exactly like a punch).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ZapOutcome {
+    /// Every overlapping region survived with its base, length, perms and
+    /// backing descriptor intact; only the window's resident leaves were
+    /// torn down and their frames released. The range can fault back in
+    /// place as soon as its backing source serves it again.
+    Retained,
+    /// Retention was impossible for this window (it intersects swap-backed
+    /// pages or a huge leaf), so the call delegated to the full MAP_FIXED
+    /// punch and the window's regions were removed, exactly as
+    /// [`AddressSpace::punch_fixed`] would have removed them.
+    RangeRemoved,
+}
+
 /// Linux resource limits applied atomically to one `mremap` growth.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MremapLimits {
@@ -7654,6 +7673,240 @@ impl AddressSpace {
             unsafe { crate::frame::free_unique_frame_batch(&frames) };
         }
         Ok(())
+    }
+
+    /// Truncate-only zap with both the VMA and shared-owner transactions
+    /// already held in that order: tear down the resident leaves in
+    /// `[base, base+len)` while KEEPING every overlapping region alive.
+    ///
+    /// # Safety
+    /// The caller must hold [`Self::with_vma_transaction`] and, when
+    /// `shared_transaction_held` is true,
+    /// [`with_address_space_shared_mapping_transaction`].
+    pub unsafe fn zap_mapping_range_locked_for_syscall_with_shared(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        shared_transaction_held: bool,
+    ) -> Result<ZapOutcome, AddressSpaceError> {
+        self.zap_mapping_range_locked_with_shared(base, len, shared_transaction_held)
+    }
+
+    /// The retention half of Linux `unmap_mapping_range`: the PTEs (and the
+    /// frames behind them) go away, the VMA stays. A shrink-truncate revokes
+    /// a file mapping's past-EOF tail through here so that re-extending the
+    /// file lets the SAME mapping fault the range back in — [`Self::punch_fixed`]
+    /// cannot express that, because its contract is range removal (the
+    /// region node goes away, and with it any chance to re-serve the VA).
+    ///
+    /// Zap semantics, per overlapping region: base/len/perms, the backing
+    /// descriptor, guard markers and page tables all survive; each resident
+    /// leaf in the window is cleared locally, its rmap owner retired, its
+    /// `phys` slot zeroed in place, and its frame released through the same
+    /// owner-aware paths the punch uses (external release hook for SHARED
+    /// frames, batched buddy free for private ones), after ONE cross-CPU
+    /// invalidation covering the window. Resident accounting is adjusted by
+    /// hand, as in [`Self::madvise_dontneed`], whose in-place slot writes
+    /// are likewise invisible to the insert/remove accounting primitives.
+    ///
+    /// Two window shapes cannot be retained and delegate to the full punch
+    /// ([`ZapOutcome::RangeRemoved`]): windows intersecting swap-backed
+    /// pages (no phys slot to zero; slot-aware teardown is the punch's
+    /// refusing path) and windows touching a huge leaf (a retained 4 KiB
+    /// region cannot describe a torn huge leaf, and file windows — the
+    /// zap's reason to exist — are regular regions). Callers mirror the
+    /// outcome in their own owner tables.
+    ///
+    /// LOCKED regions are NOT exempt. `madvise_dontneed` spares them
+    /// because it is a hint; truncate is destructive in the munmap family
+    /// (whose punch also ignores LOCKED), and a locked file mapping must
+    /// still stop serving past-EOF frames. The LOCKED bit survives on the
+    /// retained region, so pages re-faulted after re-extension re-enter
+    /// under the lock policy.
+    fn zap_mapping_range_locked_with_shared(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        shared_transaction_held: bool,
+    ) -> Result<ZapOutcome, AddressSpaceError> {
+        if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        let lo = base.as_u64();
+        let hi = lo.checked_add(len).ok_or(AddressSpaceError::OutOfRange)?;
+        if len == 0 {
+            // Nothing to retire; retention is vacuous. (Also keeps an
+            // empty window away from the punch fallback, whose overlap
+            // predicates are not meaningful for a zero-length range.)
+            return Ok(ZapOutcome::Retained);
+        }
+
+        // Keep huge -> regular as the address-space lock order, and run the
+        // punch's shared-transaction dance verbatim: if a SHARED region
+        // overlaps while the caller does not already hold the shared-owner
+        // transaction, drop both table locks, acquire the transaction, and
+        // reclassify under transaction -> huge -> regular order, holding it
+        // through leaf teardown and the external owner's release hook.
+        let mut huge = self.huge_regions.lock();
+        let mut regions = self.regions.lock();
+        let shared =
+            regions.overlapping_any(lo, hi, |region| region.perms.contains(RegionPerms::SHARED));
+        let _shared_transaction = if shared && !shared_transaction_held {
+            drop(regions);
+            drop(huge);
+            let transaction = lock_address_space_shared_mapping_transaction(self.identity());
+            huge = self.huge_regions.lock();
+            regions = self.regions.lock();
+            Some(transaction)
+        } else {
+            None
+        };
+        // The transaction is held from here on iff the caller already held
+        // it or the dance just acquired it; the punch fallback below must
+        // be told the truth, because it re-runs this same classification
+        // and would deadlock re-acquiring a transaction we already hold.
+        let transaction_held = shared_transaction_held || _shared_transaction.is_some();
+
+        let huge_overlap = huge.iter().any(|region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            re > lo && rb < hi
+        });
+        let swap_overlap = regions.swap_pages.range(lo..hi).next().is_some();
+        if huge_overlap || swap_overlap {
+            drop(regions);
+            drop(huge);
+            self.punch_fixed_locked_with_shared_reserving(base, len, transaction_held, 0)?;
+            return Ok(ZapOutcome::RangeRemoved);
+        }
+
+        // Preflight: count the resident pages the zap would retire, split
+        // by release path, and reserve both release batches BEFORE touching
+        // a leaf — the punch's no-allocation-after-commit discipline (a Vec
+        // growth under these IRQ-safe locks could otherwise abort the
+        // kernel mid-teardown).
+        let mut shared_release_count = 0usize;
+        let mut private_release_count = 0usize;
+        regions.for_each_overlapping(lo, hi, |region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            if rb >= hi || re <= lo {
+                return;
+            }
+            let total = (region.len >> 12) as usize;
+            let first = ((lo.max(rb) - rb) >> 12) as usize;
+            let last = (((hi.min(re) - rb) >> 12) as usize).min(total);
+            // A demand region may carry a phys list shorter than its page
+            // count; pages past the materialized prefix have no frame, no
+            // leaf and no rmap owner to retire.
+            let p_last = last.min(region.phys.len());
+            let p_first = first.min(p_last);
+            let resident = region
+                .phys
+                .indexed_range(p_first, p_last)
+                .filter(|(_, phys)| phys.raw() != 0)
+                .count();
+            if region.perms.contains(RegionPerms::SHARED) {
+                shared_release_count = shared_release_count.saturating_add(resident);
+            } else {
+                private_release_count = private_release_count.saturating_add(resident);
+            }
+        });
+        let mut to_free: Vec<crate::frame::PhysFrame> = Vec::new();
+        to_free
+            .try_reserve_exact(private_release_count)
+            .map_err(|_| AddressSpaceError::AllocationFailed)?;
+        let mut shared_to_release: Vec<PhysAddr> = Vec::new();
+        shared_to_release
+            .try_reserve_exact(shared_release_count)
+            .map_err(|_| AddressSpaceError::AllocationFailed)?;
+
+        // Commit: per overlapping region, clear the window's leaves locally
+        // from the AUTHORITATIVE backing — never a deferred PTE walk, the
+        // stale-walk use-after-free the punch's snapshot discipline exists
+        // to prevent — then zero each resident slot in place while retiring
+        // its rmap owner and collecting its frame for release. The pass
+        // runs under the region lock end to end, so it is a serialization
+        // point for racing faults in this AS, exactly like the punch's
+        // commit: a fault publication (which claims and publishes under
+        // the same lock) lands either entirely before the pass — and is
+        // retired whole: leaf, slot and rmap owner together — or entirely
+        // after it, where it sees zeroed slots over a live region and
+        // re-enters the ordinary demand path (SIGBUS while the file is
+        // still shrunk, fresh content once it grows again).
+        let mut retired = 0u64;
+        regions.for_each_overlapping_mut(lo, hi, |region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            if rb >= hi || re <= lo {
+                return;
+            }
+            let total = (region.len >> 12) as usize;
+            let first = ((lo.max(rb) - rb) >> 12) as usize;
+            let last = (((hi.min(re) - rb) >> 12) as usize).min(total);
+            let p_last = last.min(region.phys.len());
+            let p_first = first.min(p_last);
+            if p_first >= p_last {
+                return;
+            }
+            if self.root.as_u64() != 0 {
+                // SAFETY: the region lock pins this region's backing for
+                // the whole walk; the interval is its page-aligned
+                // intersection with the zap window.
+                unsafe { self.unmap_region_window_local(region, p_first, p_last) };
+            }
+            let shared_region = region.perms.contains(RegionPerms::SHARED);
+            region
+                .phys
+                .for_each_chunk_mut(p_first, p_last, |chunk_first, slots| {
+                    for (offset, slot) in slots.iter_mut().enumerate() {
+                        let phys = *slot;
+                        if phys.raw() == 0 {
+                            continue;
+                        }
+                        let va = VirtAddr::new(rb + ((chunk_first + offset) as u64) * 4096);
+                        // Retire the reverse-map entry before the frame is
+                        // released, exactly as the punch and
+                        // `free_region_frames` do: a stale (root, va) owner
+                        // on a released frame breaks the mapcount invariant.
+                        crate::rmap::remove(phys, self.root, va);
+                        if shared_region {
+                            shared_to_release.push(phys);
+                        } else {
+                            to_free.push(crate::frame::PhysFrame::new(phys));
+                        }
+                        *slot = PhysAddr::new(0);
+                        retired += 1;
+                    }
+                });
+        });
+        regions.acct.resident_pages = regions.acct.resident_pages.saturating_sub(retired);
+        drop(regions);
+        drop(huge);
+
+        if retired > 0 {
+            // ONE cross-CPU invalidation covering the window, BEFORE any
+            // frame is released for reuse — the punch's ordering. The zap
+            // detaches no page tables (a retained region may re-fault
+            // immediately), so the invalidation spans exactly the window.
+            // Unlike the punch this release is never deferred: truncate is
+            // not the munmap hot path, and shared file frames — the zap's
+            // common case — require the synchronous ordering anyway.
+            self.flush_region_broadcast(base, (hi - lo) >> 12);
+        }
+        // Shared owners may return their last frame to an external cache,
+        // so release them only after the remote invalidation that protects
+        // private backing reuse. The shared-owner transaction remains held.
+        for phys in shared_to_release {
+            release_shared_phys(phys);
+        }
+        if self.root.as_u64() != 0 && !to_free.is_empty() {
+            // `to_free` comes exclusively from retained regions' phys lists
+            // snapshotted under the lock above; the range flush completed
+            // before this batched owner drop.
+            crate::frame::free_frame_batch(&to_free);
+        }
+        Ok(ZapOutcome::Retained)
     }
 
     /// Detach emptied page-table pages covering the just-unmapped
