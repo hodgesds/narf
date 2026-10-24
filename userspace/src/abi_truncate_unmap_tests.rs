@@ -48,7 +48,6 @@ fn lookup_trunc_as() -> Option<Arc<AddressSpace>> {
 struct Fixture {
     aspace: Arc<AddressSpace>,
     fd: u64,
-    ops: Arc<dyn FileOps>,
     /// Whether this filesystem's fault path materialises in-size holes
     /// as zero pages (memfs does; FAT's read path errors past the end of
     /// the cluster chain instead — a pre-existing gap tracked
@@ -89,7 +88,6 @@ fn with_file(
             body(&Fixture {
                 aspace,
                 fd,
-                ops,
                 hole_fault_zero,
             })
         })();
@@ -216,14 +214,26 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
             return Err("re-extending the file resurrected stale bytes in the truncated range");
         }
     }
-    // Rewrite the truncated range with new bytes through the driver;
+    // Rewrite the truncated range with new bytes through `pwrite64`;
     // a fresh fault must serve those, never the pre-truncate content.
+    // The write goes through the syscall surface on purpose: write(2)
+    // coherence for generic-fallback filesystems lives in the
+    // handler's `note_file_written` fold (#688), so a raw
+    // `FileOps::write` here would model a sequence no user program can
+    // produce — one whose bytes reach the disk but never the retained
+    // cache frame (#724).
     let new_bytes = alloc::vec![0xC3u8; PAGE as usize];
-    let written = crate::handlers::poll_io_to_completion(fx.ops.write(2 * PAGE, &new_bytes))
-        .and_then(|r| r.ok())
-        .ok_or("rewrite of the truncated range failed")?;
-    if written != new_bytes.len() {
-        return Err("rewrite of the truncated range was short");
+    let args = SyscallArgs {
+        arg0: fx.fd,
+        arg1: new_bytes.as_ptr() as u64,
+        arg2: PAGE,
+        arg3: 2 * PAGE,
+        arg4: 0,
+        arg5: 0,
+    };
+    match call(Syscall::Pwrite64.raw(), args) {
+        Some(n) if n == PAGE as i64 => {}
+        _ => return Err("rewrite of the truncated range failed or was short"),
     }
     fault(&fx.aspace, base2 + 2 * PAGE)?;
     if mapped_bytes(&fx.aspace, base2 + 2 * PAGE, PAGE as usize)? != new_bytes {
