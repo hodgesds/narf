@@ -814,6 +814,10 @@ Compiled original Linux CAM/role/join/CCTL/EDCA helpers and default table writes
 independently fix serialized bytes and indirect register order. Control models
 earn their factory through actual sparse-DDV decoding, invoke real capability
 epochs around whole MMIO operations, and parse raw modeled C2H acknowledgements.
+The actual native control adapter also encloses the complete register operation
+in the retained signed RF invocation. A revocation between an earlier successful
+sample and that invocation prevents every control write; current-device cleanup
+still closes ordinary TX/DMA and retains uncertain command mappings.
 They cover missing/receive-only/foreign/failed execution receipts, readback
 failures, short aperture, actual secure branch, cancellation, admission rebinding
 and authority loss before command publication. They supply no physical RF grant.

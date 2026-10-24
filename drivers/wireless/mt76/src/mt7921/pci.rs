@@ -424,10 +424,11 @@ pub fn is_probed() -> bool {
 /// Borrow discovery state before the exclusive firmware transport handoff.
 /// Returns `None` if probe hasn't run or the transport owns the device.
 pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
+    let controller = CONTROLLER.lock();
     if TRANSPORT_CLAIMED.load(Ordering::Acquire) {
         return None;
     }
-    CONTROLLER.lock().as_ref().map(f)
+    controller.as_ref().map(f)
 }
 
 pub(super) fn claim_firmware_transport(
@@ -449,16 +450,24 @@ pub(super) fn claim_firmware_transport(
         .derive()
         .map_err(|_| Error::Authority)?;
     let firmware = Firmware::open(did, &registry)?;
-    // SAFETY: final single-CPU boot handoff after discovery and firmware scan,
-    // before executor polling; no MT76 rings exist and bus mastering is off.
-    let transport = unsafe { Transport::new(mmio, device, authority, firmware)? };
-    if TRANSPORT_CLAIMED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
     {
-        return Err(Error::Busy);
+        // Match with_controller's lock so a reader which observed an earlier
+        // unclaimed value cannot enter after the runtime handoff.
+        let _controller = CONTROLLER.lock();
+        TRANSPORT_CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::Busy)?;
     }
-    Ok(Some(transport))
+    // SAFETY: the boot provisioning mutex and owner/work locks serialize this
+    // handoff with later provisioning callers. Discovery has parked BME; no
+    // transport has been claimed and no MT76 rings have been published.
+    let transport = unsafe { Transport::new(mmio, device, authority, firmware) };
+    if transport.is_err() {
+        // Construction only validates/read-checks and allocates unpublished
+        // rings. No hardware references exist, so discovery may be retried.
+        TRANSPORT_CLAIMED.store(false, Ordering::Release);
+    }
+    transport.map(Some)
 }
 
 /// Test-only reset of the bound slot. Available in the built-in build (which

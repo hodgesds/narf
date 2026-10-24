@@ -314,6 +314,11 @@ pub(in crate::rtw89) fn revocable_model() -> (Qualification, Cap<FirmwareBlob, R
     calibration.model_domain = Some(domain());
     (calibration, cap)
 }
+pub(in crate::rtw89) fn revoke_on_publication_model() -> (Qualification, Cap<FirmwareBlob, Read>) {
+    let (mut qualification, cap) = revocable_model();
+    qualification.model_revoke_before_publication = true;
+    (qualification, cap)
+}
 
 fn smoke_rtw89_b_each_calibration_packet_and_response_peak_is_independently_required() -> TestResult
 {

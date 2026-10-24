@@ -23,6 +23,9 @@ mod hardware;
 pub use hardware::Transport;
 
 static BOOT_OWNER: narf_lib::mutex::Mutex<Option<Transport>> = narf_lib::mutex::Mutex::new(None);
+// Serializes publication and initial preparation. The work itself lives in
+// KEY_WORK, so cancelling a provisioning caller never drops a started owner.
+static PROVISION: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
 
 type KeyFuture<T> = core::pin::Pin<
     alloc::boxed::Box<dyn core::future::Future<Output = (T, Result<(), Error>)> + Send>,
@@ -34,6 +37,17 @@ struct KeyWork<T> {
 }
 
 impl<T> KeyWork<T> {
+    fn prepare(
+        prepare: impl FnOnce() -> Result<T, Error>,
+        start: impl FnOnce(T) -> KeyFuture<T>,
+    ) -> Result<Self, Error> {
+        let owner = prepare()?;
+        Ok(Self {
+            future: Some(start(owner)),
+            completed: None,
+        })
+    }
+
     fn poll(&mut self, cx: &mut core::task::Context<'_>) -> Poll<()> {
         if let Some(future) = self.future.as_mut() {
             if let Poll::Ready(result) = future.as_mut().poll(cx) {
@@ -80,6 +94,60 @@ fn poll_boot_keys(cx: &mut core::task::Context<'_>) -> Poll<Result<(), Error>> {
 
 async fn finish_boot_keys() -> Result<(), Error> {
     poll_fn(poll_boot_keys).await
+}
+
+/// Continue initial firmware provisioning on the same parked PCI binding.
+/// Missing/invalid assets leave discovery unclaimed and can be replaced before
+/// retry. Started work stays retained across caller cancellation; failed work
+/// requires the separate verified-reset recovery path, never a fresh claim.
+/// Repeating this on an initialized radio preserves its current station state.
+pub async fn provision_boot_radio() -> Result<RadioInfo, Error> {
+    let Some(_provision) = PROVISION.try_lock() else {
+        return Err(Error::Busy);
+    };
+    finish_boot_keys().await?;
+    {
+        let Some(mut work) = KEY_WORK.try_lock() else {
+            return Err(Error::Busy);
+        };
+        if work.is_some() {
+            return Err(Error::Busy);
+        }
+        let Some(owner) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        if owner.is_none() {
+            // No await between the exclusive claim and retained installation.
+            // Firmware preflight completes before PCI/DMA transport creation.
+            *work = Some(KeyWork::prepare(
+                || super::pci::claim_firmware_transport()?.ok_or(Error::DeviceGone),
+                |mut transport| {
+                    alloc::boxed::Box::pin(async move {
+                        let result = async {
+                            transport.run().await?;
+                            transport.initialize_radio().await.map(|_| ())
+                        }
+                        .await;
+                        (transport, result)
+                    })
+                },
+            )?);
+        }
+    }
+    finish_boot_keys().await?;
+    let info = {
+        let Some(owner) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        match owner.as_ref().map(Transport::state) {
+            Some(State::RadioReady(info) | State::ScanReady(info))
+            | Some(State::Associated { info, .. }) => info,
+            Some(State::Failed { error, .. }) => return Err(error),
+            _ => return Err(Error::Busy),
+        }
+    };
+    crate::iface::register_scan_iface(info).map_err(|_| Error::Authority)?;
+    Ok(info)
 }
 
 /// Boot-only retained transport diagnostics, independent of radio readiness.
@@ -276,42 +344,23 @@ async fn reset_boot_transport(expected_mac: Option<[u8; 6]>) -> Result<(), Error
 pub(super) fn start_boot() -> narf_init::InitResult {
     use core::fmt::Write;
     use narf_init::InitResult;
-    let Some(mut owner) = BOOT_OWNER.try_lock() else {
-        return InitResult::Error("MT76 owner busy");
-    };
-    if owner.is_some() {
-        return InitResult::Error("MT76 firmware already attempted");
-    }
-    match super::pci::claim_firmware_transport() {
-        Ok(None) => return InitResult::NotPresent,
-        Err(error) => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "mt76: firmware preparation refused: {error:?}"
-            );
-            return InitResult::Error("MT76 firmware preflight");
-        }
-        Ok(Some(transport)) => *owner = Some(transport),
-    }
-    let Some(transport) = owner.as_mut() else {
-        return InitResult::Error("MT76 owner missing");
-    };
     // Before executor polling, regular Mutex (no IRQ spinlock) retained.
     // This future is self-waking and never depends on another executor task.
-    let result = narf_scheduler::block_on_spin(async {
-        transport.run().await?;
-        transport.initialize_radio().await
-    });
+    let result = narf_scheduler::block_on_spin(provision_boot_radio());
+    if result == Err(Error::DeviceGone) && !super::pci::is_probed() {
+        return InitResult::NotPresent;
+    }
     let _ = writeln!(
         narf_console::Writer,
         "mt76: firmware {result:?}; retained {:?}; station idle; packet service awaits association",
-        transport.state()
+        boot_status()
     );
-    if let Ok(info) = result {
-        if crate::iface::register_scan_iface(info).is_err() {
-            return InitResult::Error("MT76 scan interface identity");
-        }
+    if result.is_ok() {
         InitResult::Ok
+    } else if matches!(boot_status(), BootStatus::Absent) {
+        // No firmware attempt: public provisioning can retry this same parked
+        // binding once the actual missing payload/authority is installed.
+        InitResult::Error("MT76 firmware preflight (provisioning available)")
     } else {
         // Recovery after initial firmware/radio failure has no registered
         // interface yet. Keep ownership in the same retained worker and only
@@ -325,16 +374,7 @@ pub(super) fn start_boot() -> narf_init::InitResult {
                     "mt76: initial radio recovery {result:?}"
                 );
                 if result.is_ok() {
-                    let info = {
-                        let owner = BOOT_OWNER.lock().await;
-                        match owner.as_ref().map(Transport::state) {
-                            Some(State::RadioReady(info)) => Some(info),
-                            _ => None,
-                        }
-                    };
-                    if let Some(info) = info {
-                        let _ = crate::iface::register_scan_iface(info);
-                    }
+                    let _ = provision_boot_radio().await;
                     return;
                 }
             }

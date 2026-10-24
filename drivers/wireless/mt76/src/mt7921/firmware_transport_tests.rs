@@ -9,6 +9,78 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn mt76_late_preflight_retry_and_owned_start_survive_cancelled_waiter() -> TestResult {
+    let allocations = Cell::new(0);
+    // The exact queued-start constructor used by public provisioning must not
+    // begin a session for missing or malformed firmware. A later valid pair
+    // can enter the same queue without a reset or an earlier owner to recover.
+    for missing in [true, false] {
+        let attempt = KeyWork::prepare(
+            || {
+                let image = if missing {
+                    Err(Error::InvalidFirmware)
+                } else {
+                    Firmware::prepare(&[], &[])
+                }?;
+                allocations.set(allocations.get() + 1);
+                Ok(Session::new(Model::new(), image))
+            },
+            |session| alloc::boxed::Box::pin(async move { (session, Ok(())) }),
+        );
+        if !matches!(attempt, Err(Error::InvalidFirmware)) || allocations.get() != 0 {
+            return TestResult::Fail("MT76 preflight consumed an owner before valid assets");
+        }
+    }
+    let mut work = KeyWork::prepare(
+        || {
+            let image = firmware(32);
+            allocations.set(allocations.get() + 1);
+            Ok(Session::new(Model::new(), image))
+        },
+        |mut session| {
+            alloc::boxed::Box::pin(async move {
+                let result = async {
+                    session.run().await?;
+                    // Cancel a waiter between firmware DMA and radio setup.
+                    narf_scheduler::yield_now().await;
+                    session.initialize_radio().await.map(|_| ())
+                }
+                .await;
+                (session, result)
+            })
+        },
+    )
+    .unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    {
+        let mut waiter = pin!(poll_fn(|cx| work.poll(cx)));
+        if waiter.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("MT76 staged startup skipped cancellation boundary");
+        }
+    }
+    for _ in 0..1000 {
+        if work.poll(&mut cx).is_ready() {
+            break;
+        }
+    }
+    let Some((mut session, result)) = work.completed.take() else {
+        return TestResult::Fail("MT76 cancelled waiter lost retained initial startup");
+    };
+    if result.is_err()
+        || allocations.get() != 1
+        || !matches!(session.state, State::RadioReady(_))
+        || session.security.is_some()
+        || run(session.run()) != Err(Error::Busy)
+    {
+        return TestResult::Fail("MT76 staged startup replayed or published invalid radio state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/firmware",
+    mt76_late_preflight_retry_and_owned_start_survive_cancelled_waiter
+);
+
 pub(super) fn firmware(bytes: usize) -> Firmware {
     let mut patch = vec![0u8; 96 + 64 + bytes];
     patch[44..48].copy_from_slice(&1u32.to_be_bytes());

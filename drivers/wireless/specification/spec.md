@@ -180,6 +180,11 @@ The late `mt76-firmware` initcall runs after firmware discovery and retains the
 transport on success or failure; `boot_status` exposes its state. A ready
 report proves firmware startup only. The late initcall registers a passive
 scan interface only after the subsequent radio initialization succeeds.
+`provision_boot_radio().await` permits late asset provisioning on the same parked
+PCI binding. Missing or invalid preflight inputs leave the claim unconsumed;
+started firmware work is retained independently of caller cancellation. Successful
+repeated provisioning preserves the existing interface/station, while a failed
+started transport requires the verified reset path described above.
 
 After `run`, `Transport::initialize_radio` performs a second single-use,
 30-second-bounded initialization. `NicCapabilities::parse` decodes the counted

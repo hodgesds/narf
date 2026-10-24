@@ -277,75 +277,21 @@ fn probe_exclusive(
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    if let (Some(firmware), Some(interface)) = (firmware, interface) {
-        // The registered interface and controller retain this exact owner
-        // before the first DMA base/BME publication. No spinlock crosses await.
+    if firmware.is_some() && interface.is_some() {
+        // Boot and public staged provisioning share the same admission lock
+        // and phase-aware retained-owner continuation.
         narf_scheduler::spawn(async move {
-            if interface.closed() {
-                return;
-            }
-            if let Err(error) = firmware.initialize_registered().await {
-                use core::fmt::Write as _;
-                let _ = writeln!(narf_console::Writer, "rtw88-8822ce firmware: {:?}", error);
-                return;
-            }
-            if interface.closed() {
-                return;
-            }
-            if let Err(error) = firmware.prepare_mac().await {
+            if let Err(error) = provision().await {
                 use core::fmt::Write as _;
                 let _ = writeln!(
                     narf_console::Writer,
-                    "rtw88-8822ce inactive MAC: {:?}",
-                    error
-                );
-                return;
-            }
-            if interface.closed() {
-                return;
-            }
-            if let Err(error) = firmware.prepare_phy_tables().await {
-                use core::fmt::Write as _;
-                let _ = writeln!(narf_console::Writer, "rtw88-8822ce PHY tables: {:?}", error);
-                return;
-            }
-            if interface.closed() {
-                return;
-            }
-            let permission = match firmware.qualify_board().await {
-                Ok(permission) => permission,
-                Err(error) => {
-                    use core::fmt::Write as _;
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "rtw88-8822ce board qualification: {:?}",
-                        error
-                    );
-                    return;
-                }
-            };
-            if let Err(error) = firmware.prepare_radio(permission).await {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "rtw88-8822ce radio calibration: {:?}",
-                    error
-                );
-                return;
-            }
-            if interface.closed() {
-                return;
-            }
-            if let Err(error) = interface.activate().await {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "rtw88-8822ce station activation: {:?}",
+                    "rtw88-8822ce provisioning: {:?}",
                     error
                 );
             }
         });
     }
+
     Ok(())
 }
 
@@ -492,10 +438,242 @@ pub fn with_controller<R>(f: impl FnOnce(&Rtw88Device) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(|owner| f(owner))
 }
 
+struct Provisioning {
+    firmware: Arc<super::firmware_native::Firmware>,
+    interface: Arc<super::interface::Native>,
+}
+fn provisioning(controller: Option<&Rtw88Device>) -> Result<Provisioning, super::FirmwareError> {
+    use super::firmware_lifecycle::Stage;
+    let controller = controller.ok_or(super::FirmwareError::State)?;
+    if controller.device_id != RTL_DEV_8822CE {
+        return Err(super::FirmwareError::Unsupported);
+    }
+    let firmware = controller
+        .firmware
+        .as_ref()
+        .ok_or(super::FirmwareError::State)?;
+    let interface = controller
+        .interface
+        .as_ref()
+        .ok_or(super::FirmwareError::State)?;
+    if interface.closed() {
+        return Err(super::FirmwareError::Cancelled);
+    }
+    if !Arc::ptr_eq(&firmware.lifecycle(), &interface.lifecycle)
+        || firmware.factory().mac() != controller.mac
+        || interface.mac() != controller.mac
+        || !matches!(
+            firmware.status().stage,
+            Stage::Detected
+                | Stage::Ready
+                | Stage::MacPrepared
+                | Stage::PhyTablesPrepared
+                | Stage::Calibrated
+                | Stage::StationReady
+        )
+    {
+        return Err(super::FirmwareError::State);
+    }
+    Ok(Provisioning {
+        firmware: firmware.clone(),
+        interface: interface.clone(),
+    })
+}
+static PROVISIONING: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
+async fn provision_with(
+    control: &narf_lib::mutex::Mutex<()>,
+    binding: impl FnOnce() -> Result<Provisioning, super::FirmwareError>,
+) -> Result<(), super::FirmwareError> {
+    use super::firmware_lifecycle::Stage;
+    let _control = control.lock().await;
+    let retained = binding()?;
+    loop {
+        if retained.interface.closed() {
+            return Err(super::FirmwareError::Cancelled);
+        }
+        match retained.firmware.status().stage {
+            Stage::Detected => {
+                retained.firmware.initialize_registered().await?;
+            }
+            Stage::Ready => {
+                retained.firmware.prepare_mac().await?;
+            }
+            Stage::MacPrepared => {
+                retained.firmware.prepare_phy_tables().await?;
+            }
+            Stage::PhyTablesPrepared => {
+                // Asset/policy lookup is pure at this exact parked checkpoint.
+                // Missing qualification preserves it for a later explicit call.
+                let permission = retained.firmware.qualify_board().await?;
+                retained.firmware.prepare_radio(permission).await?;
+            }
+            Stage::Calibrated => retained
+                .interface
+                .activate()
+                .await
+                .map_err(|_| super::FirmwareError::Prerequisite)?,
+            Stage::StationReady => return Ok(()),
+            _ => return Err(super::FirmwareError::State),
+        }
+    }
+}
+/// Continue staged RTL8822CE assets on the exact registered owner. Only pure
+/// Detected or completed parked checkpoints resume; started/failed/cancelled
+/// work is never reconstructed, reset or replayed. Existing station is a no-op.
+pub async fn provision() -> Result<(), super::FirmwareError> {
+    provision_with(&PROVISIONING, || {
+        let controller = CONTROLLER.lock();
+        provisioning(controller.as_deref())
+    })
+    .await
+}
+
 /// Test-only reset of the bound slot. Avoids cross-test leak when the
 /// smoke suite re-probes; gated under `kernel-test`-style cfg so it
 /// drops from production binaries.
 #[cfg(any(test, feature = "kernel-test"))]
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod provision_tests {
+    use super::*;
+    use core::{
+        future::Future,
+        task::{Context, Waker},
+    };
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn fixture() -> Rtw88Device {
+        let address = narf_bus::PcieAddr::new(0xfffd, 0xfc, 0x18, 0);
+        let device = BusDevice {
+            addr: narf_bus::BusAddr::Pcie(address),
+            id: narf_bus::DeviceId {
+                vendor: REALTEK_VENDOR,
+                device: RTL_DEV_8822CE,
+                class: 0x028000,
+                subsystem_vendor: REALTEK_VENDOR,
+                subsystem_id: 0xfffe,
+            },
+            kind: narf_bus::BusKind::Pcie {
+                addr: address,
+                cfg_phys: narf_memory::PhysAddr::new(0),
+            },
+        };
+        let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+        cap.revoke();
+        let registers = MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 0x5000,
+            kind: narf_bus::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        let mut logical = [255; 768];
+        logical[0x120..0x126].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
+        let factory = super::super::efuse::Factory::for_test_with_trims(logical, [1; 19]).unwrap();
+        let mac = factory.mac();
+        // SAFETY: explicitly inert revoked-cap owner. Admission tests never
+        // start this object's deliberately invalid PCI/MMIO mappings.
+        let firmware = Arc::new(unsafe {
+            super::super::firmware_native::Firmware::new(device, cap, registers, factory)
+        });
+        let interface = Arc::new(super::super::interface::Device::new(
+            "rtw88-provision-fixture",
+            mac,
+            firmware.lifecycle(),
+            Arc::new(super::super::station::NativeEnvironment),
+        ));
+        Rtw88Device {
+            bus_addr: device.addr,
+            registers,
+            mac,
+            device_id: RTL_DEV_8822CE,
+            firmware: Some(firmware),
+            interface: Some(interface),
+            link_up: AtomicBool::new(false),
+            rx_ring: IrqSafeSpinLock::new(None),
+            tx_ring: IrqSafeSpinLock::new(None),
+        }
+    }
+    fn smoke_rtw8822ce_public_provision_retains_bindings_and_cancels_before_admission() -> TestResult
+    {
+        if provisioning(None).is_ok() {
+            return TestResult::Fail("provision admitted absent controller");
+        }
+        let mut controller = fixture();
+        let admitted = provisioning(Some(&controller)).unwrap();
+        if !Arc::ptr_eq(&admitted.firmware, controller.firmware.as_ref().unwrap())
+            || !Arc::ptr_eq(&admitted.interface, controller.interface.as_ref().unwrap())
+            || !Arc::ptr_eq(
+                &admitted.firmware.lifecycle(),
+                &admitted.interface.lifecycle,
+            )
+        {
+            return TestResult::Fail("provision reconstructed exact firmware/interface lifecycle");
+        }
+        let control = narf_lib::mutex::Mutex::new(());
+        let guard = control.try_lock().unwrap();
+        let entered = AtomicBool::new(false);
+        {
+            let mut future = core::pin::pin!(provision_with(&control, || {
+                entered.store(true, Ordering::Release);
+                provisioning(Some(&controller))
+            }));
+            if !future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+            {
+                return TestResult::Fail("provision bypassed async serialization");
+            }
+        }
+        drop(guard);
+        if entered.load(Ordering::Acquire)
+            || controller.firmware_status().unwrap().stage != super::super::FirmwareStage::Detected
+            || provisioning(Some(&controller)).is_err()
+        {
+            return TestResult::Fail("cancelled provisioning wait consumed retained owner");
+        }
+        controller.device_id = RTL_DEV_8821CE;
+        if provisioning(Some(&controller)).is_ok() {
+            return TestResult::Fail("diagnostic sibling admitted for station provisioning");
+        }
+        controller.device_id = RTL_DEV_8822CE;
+        let original = controller.interface.take().unwrap();
+        let mismatched = Arc::new(super::super::interface::Device::new(
+            "rtw88-wrong-lifecycle",
+            controller.mac,
+            Arc::new(super::super::firmware_lifecycle::Lifecycle::new(
+                RTL_DEV_8822CE,
+            )),
+            Arc::new(super::super::station::NativeEnvironment),
+        ));
+        controller.interface = Some(mismatched);
+        if provisioning(Some(&controller)).is_ok() {
+            return TestResult::Fail("provision accepted independent interface owner");
+        }
+        controller.interface = Some(original);
+        let lifecycle = controller.firmware.as_ref().unwrap().lifecycle();
+        if narf_scheduler::block_on(
+            lifecycle.initialize_bytes(|| Err(super::super::FirmwareError::Memory), Vec::new()),
+        ) != Err(super::super::FirmwareError::Memory)
+            || lifecycle.status().stage != super::super::FirmwareStage::Failed
+            || provisioning(Some(&controller)).is_ok()
+        {
+            return TestResult::Fail(
+                "failed actual allocation attempt reopened public provisioning",
+            );
+        }
+        controller.interface.as_ref().unwrap().admission().close();
+        if provisioning(Some(&controller)).is_ok() {
+            return TestResult::Fail("closed one-shot interface reopened provisioning");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtw88",
+        smoke_rtw8822ce_public_provision_retains_bindings_and_cancels_before_admission
+    );
 }

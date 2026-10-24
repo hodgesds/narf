@@ -108,6 +108,34 @@ or authorized controlled port. RTL8821CE/RTL8822BE have no native firmware owner
 `FwError::Unsupported` before registry or MMIO access for every device:
 raw MMIO alone cannot prove exclusive DMA/ring/reset ownership.
 
+`pci::provision()` (also re-exported as `rtw88::provision`) is the public
+staged-asset continuation for the already registered RTL8822CE. Probe's worker
+calls this same function. A single async admission mutex serializes boot and
+operator calls; no IRQ-disabling lock crosses an await. Admission snapshots the
+exact firmware/interface Arcs, verifies their shared lifecycle and factory MAC,
+and rejects absent controllers, diagnostic siblings, closed interfaces and
+in-progress/failed stages. Only `Detected`, completed firmware/MAC/PHY-table/
+calibration checkpoints can advance. `StationReady` is idempotent. No call
+reconstructs the device, repeats an earlier stage or resets a failed owner.
+
+Registered firmware lookup, current Registry/Blob capability invocations,
+owned snapshot and header/extent parsing complete before the lifecycle's
+single-use atomic begin and before allocating native rings. Missing, revoked
+or malformed registered assets leave `Detected` with a diagnostic error and
+no native allocation/I/O. A later provisioning call can load newly staged bytes
+on that same owner. Direct retained `Owner::initialize_registered` likewise
+preserves `Phase::New` on preflight failure. The supplied-byte diagnostic path
+keeps its existing one-shot semantics. Once allocation/claim begins, failure or
+cancellation remains terminal and cannot reopen preflight or reuse DMA.
+
+Missing signed board/policy assets preserve `PhyTablesPrepared`. Fresh current
+policy, board binding and power permission are checked in an opaque pure radio
+preflight before publishing `Calibrating`; after that accepted attempt, current
+checks during real radio operations still fail terminally. Regressions cover
+late firmware staging without allocations, real publication/cancellation,
+resumption from a completed PHY checkpoint through actual radio calibration,
+exact retained-owner identity, and cancelled public admission waits.
+
 The private RTL8822CE continuation opens exactly
 `rtw88/rtw8822c_fw.bin` through current firmware authority, snapshots the
 authenticated image, and rejects malformed layouts before DMA claim. It

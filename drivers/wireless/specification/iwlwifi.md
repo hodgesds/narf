@@ -104,15 +104,30 @@ readback succeeds; a concurrent caller cannot race that transition. `provision_s
 `provision().await` retries newly staged inputs only while Parked. Missing authority,
 missing images or invalid source/container inputs leave the same binding parked;
 cancellation while waiting for its async mutex cannot consume an attempt. Initial
-parking failure, or failure/cancellation after the first mapped/runtime startup
+parking failure, or failure/cancellation after the first firmware/runtime startup
 attempt, remains terminal without reconstructing a native owner.
 
-The existing filename ladder and highest-present-image semantics remain exact:
-absent candidates may fall through, while a present invalid image fails. Registry
+Before Sc asset lookup, the same retained owner maps BAR0 once with bus mastering
+still disabled and reads actual `CSR_HW_REV` and `CSR_HW_RF_ID` inside current PCI
+capability invocations. This bounded identity discovery grants no firmware, DMA,
+interrupt or station admission. Missing assets retain that same mapping and Parked
+owner. The native Sc ladder contains only the discovered MAC/RF/step pairing:
+Sc A0 with WH-b0, FM-b0, FM-c0 or GF-a0. GF firmware uses the source's fixed A
+suffix; unsupported MAC steps, RF pairings and CDB/GF4 variants fail closed. A
+different installed RF image can never satisfy an absent matching image. These
+names do not widen the exact firmware-command gates or the WH c103 composition
+evidence below. Non-Sc transport and the separate Gen2 profile are unchanged.
+
+Within that exact pairing, highest-present-image semantics remain exact:
+absent APIs may fall through, while a present invalid image fails. Registry
 lookup and bounded firmware/sibling-PNVM byte copies occur inside current registry
 and blob `Cap::invoke` operations. All TLV parsing uses owned copied bytes; no
 borrowed registry view escapes invocation. Source epochs are checked again before
-starting the actual native `Hardware`/`Device` lifecycle. Optional external PNVM
+starting the actual native `Hardware`/`Device` lifecycle. The selected raw Sc
+identity is checked again before that transition and retained by `Hardware`;
+initial start and restart recheck it before enabling bus mastering or publishing
+boot DMA. A changed identity cannot reuse the previously selected image.
+Optional external PNVM
 retains its existing firmware/SKU requirement; unsupported command/profile gates
 remain unchanged. Existing Gen2 boot/passive/peer owners are separate and native
 MVM station publication stays disabled.
@@ -123,7 +138,11 @@ retains the previous receive/firmware behavior; active scan and association stil
 bootstrap authenticated policy and fail closed. Real signed registry fixtures cover
 assets staged after the first attempt, a cancelled pre-attempt waiter, exact
 firmware/PNVM copies, present-invalid ladder refusal, and actual PCI/source epoch
-revocation before deliberately invalid ECAM or native startup publication. The
+revocation before deliberately invalid ECAM or native startup publication. Native
+backed-MMIO/real-registry regressions additionally cover several RF images present,
+missing exact-image staging, exact sibling PNVM selection, MAC/RF/step/CDB refusal,
+identity changes and revoked current PCI authority. Inert image headers remain in
+a test-only registry namespace and never shadow production firmware. The
 minimal test TLV contains no executable firmware and never crosses a valid native
 PCI boundary.
 

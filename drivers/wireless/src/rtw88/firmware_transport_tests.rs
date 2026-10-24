@@ -449,3 +449,43 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_firmware_registers_match_actual_linux_callbacks
 );
+
+fn smoke_rtw88_registered_image_preflight_keeps_exact_owner_pristine_until_claim() -> TestResult {
+    let mut owner = Owner::new(Model::new(), 0xc822);
+    for error in [
+        Error::Firmware(narf_firmware::FirmwareError::NotFound),
+        Error::Firmware(narf_firmware::FirmwareError::AuthorityRevoked),
+        Error::Image,
+    ] {
+        if narf_scheduler::block_on(owner.initialize_registered_with(|| Err(error))) != Err(error)
+            || owner.phase() != Phase::New
+            || owner.io.calls != 0
+            || owner.image_digest.is_some()
+        {
+            return TestResult::Fail(
+                "registered image lookup poisoned or accessed existing native owner",
+            );
+        }
+    }
+    if narf_scheduler::block_on(
+        owner.initialize_registered_with(|| preflight_image(0xc822, image(9, 9, 0))),
+    )
+    .is_err()
+        || owner.phase() != Phase::Ready
+        || owner.io.calls == 0
+    {
+        return TestResult::Fail("valid later image could not continue same pristine owner");
+    }
+    let calls = owner.io.calls;
+    if narf_scheduler::block_on(owner.initialize_registered_with(|| Err(Error::Image)))
+        != Err(Error::State)
+        || owner.io.calls != calls
+    {
+        return TestResult::Fail("ready registered owner repeated preflight/claim");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_registered_image_preflight_keeps_exact_owner_pristine_until_claim
+);

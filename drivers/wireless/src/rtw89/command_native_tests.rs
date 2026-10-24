@@ -183,6 +183,84 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_native_station_cannot_convert_basic_or_dma_into_ordinary_rf
 );
+fn smoke_rtw89_native_station_control_invokes_retained_rf_grant_and_keeps_cleanup() -> TestResult {
+    use super::super::station_control::Interface as Control;
+    use alloc::sync::Arc;
+    for revoke in [false, true] {
+        let mut f = Fixture::aperture(ChipId::Rtl8852B, 0x40020).unwrap();
+        if f.activate().is_err() || ready(f.native.send(Kind::Header, &[0x5a; 16])) != Some(Ok(()))
+        {
+            return TestResult::Fail("native control signed-scope baseline");
+        }
+        let (qualification, authority) = if revoke {
+            super::super::radio_policy::tests::revoke_on_publication_model()
+        } else {
+            super::super::radio_policy::tests::revocable_model()
+        };
+        if qualification.current().is_err() {
+            return TestResult::Fail("isolated signed scope was not live before publication");
+        }
+        // Explicit inert qualification boundary, not a fabricated physical
+        // radio/attach receipt. Actual Native/Access/NativeIo and typed device
+        // and signed-artifact capabilities execute the real MMIO transaction.
+        f.native.ordinary = Some(OrdinaryGrant {
+            qualification: Arc::new(qualification),
+        });
+        let pending = f.native.queue.pending();
+        let ring = f.native.ring.as_ref().unwrap().dma_addr().raw();
+        let packet = f.native.queue.model_resource(0).unwrap().dma_addr().raw();
+        let before = f.words.clone();
+        let mut called = false;
+        let result = Control::with_current(&mut f.native.station_access(), |access| {
+            called = true;
+            access.write32(0xc400, 0x804)?;
+            if access.read32(0xc400)? != 0x804 {
+                return Err(super::super::power::Error::Access);
+            }
+            Ok(())
+        });
+        if revoke {
+            if result != Err(super::super::power::Error::Access)
+                || called
+                || authority.is_live()
+                || f.words != before
+            {
+                return TestResult::Fail("prior RF grant sample authorized a later native control operation after revocation");
+            }
+            // Revoking emission authority must still permit actual native
+            // ordinary-DMA/TX and port closure under current device authority.
+            f.words[0xc000 / 4] |= 1 << 29;
+            f.words[0x1010 / 4] = 0;
+            f.words[0xc400 / 4] = 0x804;
+            let cleanup = Control::with_current(&mut f.native.station_cleanup(), |access| {
+                access.write32(0xc400, 4)
+            });
+            if cleanup != Ok(())
+                || f.words[0xc000 / 4] & (1 << 29) != 0
+                || f.words[0x1010 / 4] & (1 << 8 | 1 << 16 | 1 << 19)
+                    != (1 << 8 | 1 << 16 | 1 << 19)
+                || f.words[0xc400 / 4] != 4
+            {
+                return TestResult::Fail("revoked RF grant blocked current-device native teardown");
+            }
+        } else if result != Ok(()) || !called || f.words[0xc400 / 4] != 0x804 {
+            return TestResult::Fail("live retained RF grant rejected native control transaction");
+        }
+        if f.native.queue.pending() != pending
+            || f.native.ring.as_ref().unwrap().dma_addr().raw() != ring
+            || f.native.queue.model_resource(0).unwrap().dma_addr().raw() != packet
+        {
+            return TestResult::Fail(
+                "native control scope or cleanup released uncertain command DMA",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_station_control_invokes_retained_rf_grant_and_keeps_cleanup
+);
 fn smoke_rtw89_native_ch12_program_publish_and_revocation() -> TestResult {
     for chip in [
         ChipId::Rtl8852A,

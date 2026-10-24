@@ -39,7 +39,7 @@ impl<I: Io> core::fmt::Debug for Lifecycle<I> {
     }
 }
 enum Source {
-    Registered,
+    Prepared(super::firmware_transport::PreparedImage),
     #[cfg(any(test, feature = "kernel-test"))]
     Bytes(alloc::vec::Vec<u8>),
 }
@@ -84,7 +84,30 @@ impl<I: Io> Lifecycle<I> {
         &self,
         allocate: impl FnOnce() -> Result<I, Error> + Send,
     ) -> Result<Info, Error> {
-        self.initialize(allocate, Source::Registered).await
+        self.initialize_registered_with(allocate, || {
+            super::firmware_transport::registered_image(self.did)
+        })
+        .await
+    }
+    async fn initialize_registered_with(
+        &self,
+        allocate: impl FnOnce() -> Result<I, Error> + Send,
+        load: impl FnOnce() -> Result<super::firmware_transport::PreparedImage, Error> + Send,
+    ) -> Result<Info, Error> {
+        if self.started.load(Ordering::Acquire) {
+            return Err(Error::State);
+        }
+        let image = match load() {
+            Ok(image) => image,
+            Err(error) => {
+                let mut status = self.status.lock();
+                if !self.started.load(Ordering::Acquire) && status.stage == Stage::Detected {
+                    status.error = Some(error);
+                }
+                return Err(error);
+            }
+        };
+        self.initialize(allocate, Source::Prepared(image)).await
     }
     pub(super) async fn start_station(
         &self,
@@ -142,7 +165,6 @@ impl<I: Io> Lifecycle<I> {
             .ok_or(Error::State)?
             .qualify_with(factory, domain, source)
     }
-    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) async fn prepare_radio_with_policy<F>(
         &self,
         factory: &super::efuse::Factory,
@@ -156,13 +178,13 @@ impl<I: Io> Lifecycle<I> {
         if self.status().stage != Stage::PhyTablesPrepared {
             return Err(Error::State);
         }
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        // Complete pure current-policy/board/permission validation before the
+        // one-shot calibration attempt or any hardware register transition.
+        let plan = owner.preflight_radio(factory, permission, &policy()?)?;
         self.status.lock().stage = Stage::Calibrating;
         let _attempt = Attempt(self);
-        let result = retained
-            .as_mut()
-            .ok_or(Error::State)?
-            .prepare_radio_with_policy(factory, permission, policy)
-            .await;
+        let result = owner.prepare_radio_prepared(factory, plan, policy).await;
         let mut status = self.status.lock();
         match result {
             Ok(_) => status.stage = Stage::Calibrated,
@@ -242,29 +264,11 @@ impl<I: Io> Lifecycle<I> {
         factory: &super::efuse::Factory,
         permission: super::power_policy::Permission,
     ) -> Result<super::radio::Info, Error> {
-        let mut retained = self.retained.lock().await;
-        if self.status().stage != Stage::PhyTablesPrepared {
-            return Err(Error::State);
-        }
-        self.status.lock().stage = Stage::Calibrating;
-        let _attempt = Attempt(self);
-        let result = retained
-            .as_mut()
-            .ok_or(Error::State)?
-            .prepare_radio(factory, permission)
-            .await;
-        let mut status = self.status.lock();
-        match result {
-            Ok(_) => status.stage = Stage::Calibrated,
-            Err(error) => {
-                *status = Status {
-                    stage: Stage::Failed,
-                    info: None,
-                    error: Some(error),
-                }
-            }
-        }
-        result
+        self.prepare_radio_with_policy(factory, permission, || {
+            narf_wireless::reg::db::ensure_domain()
+                .map_err(|_| Error::Power(super::power_policy::Error::Policy))
+        })
+        .await
     }
     async fn initialize(
         &self,
@@ -294,7 +298,7 @@ impl<I: Io> Lifecycle<I> {
             };
             let owner = retained.as_mut().ok_or(Error::State)?;
             match source {
-                Source::Registered => owner.initialize_registered().await,
+                Source::Prepared(image) => owner.initialize_prepared(image).await,
                 #[cfg(any(test, feature = "kernel-test"))]
                 Source::Bytes(bytes) => owner.download(&bytes).await,
             }

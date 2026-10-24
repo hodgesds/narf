@@ -108,9 +108,15 @@ platform must still supply CYW power, clock and reset wiring.
 
 Registry staging may happen after device detection. Intel, BCM43602 and CYW
 retain parked startup owners; RTL8188EE exposes a bounded `pci::provision`
-continuation for its existing detected owner. Missing assets before the first
-hardware attempt remain retryable. A consumed, failed or cancelled native
-attempt cannot be replaced by reopening an asset name or reconstructing an owner.
+continuation for its existing detected owner. RTL8822CE's `rtw88::pci::provision`
+continues that same owner at completed firmware/MAC/PHY/calibration boundaries;
+MT76's `mt7921::firmware_transport::provision_boot_radio` resumes its parked
+binding after firmware preflight was missing or invalid. Intel Sc selects only
+the actual CSR MAC/RF/step's firmware ladder, even if other Sc images are present.
+Missing assets before the first hardware attempt remain retryable. A consumed
+or failed native attempt cannot be replaced by reopening an asset name or
+reconstructing an owner. MT76 keeps its started future across caller cancellation;
+other drivers retain their documented one-shot cancellation behavior.
 Keep proprietary
 originals and deployment calibration outside git and apply their distribution
 terms when packaging them.

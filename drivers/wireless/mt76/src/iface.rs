@@ -573,12 +573,20 @@ fn scan_security(
 /// Register one boot-owned radio with both network registries. The same
 /// bounded packet step services executor and synchronous network callers.
 pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, WirelessError> {
+    // Reusing our retained interface grants no new registry access and must
+    // not depend on the authority used for its original publication.
+    if let Some(existing) = ACTIVE.lock().as_ref() {
+        return if existing.radio.capabilities == info.capabilities
+            && existing.radio.hardware_type == info.hardware_type
+        {
+            Ok(existing.clone())
+        } else {
+            Err(WirelessError::InvalidArgs)
+        };
+    }
     let authority = narf_net::trusted_net_authority()
         .and_then(|a| a.derive().ok())
         .ok_or(WirelessError::Denied)?;
-    if ACTIVE.lock().is_some() {
-        return Err(WirelessError::Busy);
-    }
     let mut iface = Mt76Iface::new(String::new(), info)?;
     // Bootstrap before control-plane discovery/association can query the
     // domain. Missing deployment policy still permits the receive-only scan
@@ -747,6 +755,143 @@ mod tests {
             channel_configuration: Some(0),
         }
     }
+    static REPEAT_ADMIN_CALLS: AtomicU32 = AtomicU32::new(0);
+    fn repeat_admin_hook(_: &str, _: bool) {
+        REPEAT_ADMIN_CALLS.fetch_add(1, Ordering::AcqRel);
+    }
+    struct RepeatedRegistration {
+        iface: Arc<Mt76Iface>,
+        name: String,
+    }
+    impl Drop for RepeatedRegistration {
+        fn drop(&mut self) {
+            {
+                let mut active = ACTIVE.lock();
+                if active
+                    .as_ref()
+                    .is_some_and(|owner| Arc::ptr_eq(owner, &self.iface))
+                {
+                    *active = None;
+                }
+            }
+            narf_net::iface::unregister(&self.name);
+        }
+    }
+    fn mt76_repeat_scan_registration_preserves_same_associated_owner_and_admin() -> TestResult {
+        if ACTIVE.lock().is_some() {
+            return TestResult::Skip("live MT76 interface owns registration slot");
+        }
+        let info = radio();
+        let name = narf_net::iface::register("mt76-repeat-model%d", info.capabilities.mac, reject);
+        let iface = match Mt76Iface::new(name.clone(), info) {
+            Ok(iface) => Arc::new(iface),
+            Err(_) => {
+                narf_net::iface::unregister(&name);
+                return TestResult::Fail("repeat-registration fixture identity");
+            }
+        };
+        let _fixture = RepeatedRegistration {
+            iface: iface.clone(),
+            name: name.clone(),
+        };
+        {
+            let mut active = ACTIVE.lock();
+            if active.is_some() {
+                return TestResult::Skip("MT76 interface became live before fixture installation");
+            }
+            *active = Some(iface.clone());
+        }
+        let (mut tx, tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
+        let (mut rx, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
+        for (producer, value) in [(&mut tx, 0x55u8), (&mut rx, 0xaau8)] {
+            let Ok(buffer) = narf_io::alloc_coherent(32, narf_lib::id::DomainId::DRIVER_0) else {
+                return TestResult::Fail("repeat-registration frame allocation");
+            };
+            let mut frame = Frame::new(buffer, 32);
+            frame.payload_mut().fill(value);
+            if producer.try_send(frame).is_err() {
+                return TestResult::Fail("repeat-registration sentinel queue");
+            }
+        }
+        *iface.tx_ring.lock() = Some(tx);
+        *iface.tx_cons.lock() = Some(tx_cons);
+        *iface.rx_prod.lock() = Some(rx);
+        *iface.rx_ring.lock() = Some(rx_cons);
+        let peer = [2, 0, 0, 0, 0, 9];
+        *iface.associated_bssid.lock() = Some(peer);
+        REPEAT_ADMIN_CALLS.store(0, Ordering::Release);
+        if !narf_net::iface::set_open_stop(&name, repeat_admin_hook) {
+            return TestResult::Fail("repeat-registration administrative hook");
+        }
+        narf_net::iface::set_link_state(&name, true); // actual operator IFF_UP
+        publish_link(&name, true);
+        let before = narf_net::iface::lookup(&name).unwrap();
+        let admin_calls = REPEAT_ADMIN_CALLS.load(Ordering::Acquire);
+        for _ in 0..2 {
+            match register_scan_iface(info) {
+                Ok(existing) if Arc::ptr_eq(&existing, &iface) => {}
+                _ => {
+                    return TestResult::Fail(
+                        "repeat registration replaced/refused the same retained interface",
+                    )
+                }
+            }
+        }
+        for changed in [
+            RadioInfo {
+                hardware_type: info.hardware_type ^ 1,
+                ..info
+            },
+            RadioInfo {
+                capabilities: NicCapabilities {
+                    mac: [2, 0, 0, 0, 0, 10],
+                    ..info.capabilities
+                },
+                ..info
+            },
+        ] {
+            if !matches!(
+                register_scan_iface(changed),
+                Err(WirelessError::InvalidArgs)
+            ) {
+                return TestResult::Fail("changed radio identity reused existing registration");
+            }
+        }
+        let after = narf_net::iface::lookup(&name).unwrap();
+        if !iface.link_up()
+            || iface.connected_bssid() != Some(peer)
+            || !after.link_up
+            || !after.carrier
+            || after.link_up != before.link_up
+            || after.carrier != before.carrier
+            || after.carrier_changes != before.carrier_changes
+            || REPEAT_ADMIN_CALLS.load(Ordering::Acquire) != admin_calls
+            || !ACTIVE
+                .lock()
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, &iface))
+        {
+            return TestResult::Fail(
+                "repeat registration changed association/admin/carrier or called admin hook",
+            );
+        }
+        let tx = iface.tx_cons.lock().as_mut().unwrap().try_recv();
+        let rx = iface.rx_ring.lock().as_mut().unwrap().try_recv();
+        if !matches!(tx, Ok(Some(frame)) if frame.payload() == [0x55;32])
+            || !matches!(rx, Ok(Some(frame)) if frame.payload() == [0xaa;32])
+            || iface.tx_ring.lock().is_none()
+            || iface.rx_prod.lock().is_none()
+        {
+            return TestResult::Fail(
+                "repeat registration discarded/recreated retained frame rings",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/scan",
+        mt76_repeat_scan_registration_preserves_same_associated_owner_and_admin
+    );
     fn mt76_scan_interface_reports_implemented_profile() -> TestResult {
         let iface = Mt76Iface::new(String::from("wlan7"), radio()).unwrap();
         let info = iface.get_wireless_info();

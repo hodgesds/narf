@@ -81,6 +81,8 @@ pub(super) struct Qualification {
     peaks_qdbm: [i16; 3],
     #[cfg(any(test, feature = "kernel-test"))]
     model_domain: Option<narf_wireless::reg::RegulatoryDomain>,
+    #[cfg(any(test, feature = "kernel-test"))]
+    model_revoke_before_publication: bool,
 }
 struct Decode(Board);
 impl CapOp<FirmwareBlob, Read> for Decode {
@@ -145,6 +147,8 @@ impl Qualification {
             peaks_qdbm,
             #[cfg(any(test, feature = "kernel-test"))]
             model_domain: None,
+            #[cfg(any(test, feature = "kernel-test"))]
+            model_revoke_before_publication: false,
         })
     }
     pub fn matches(&self, board: Board) -> bool {
@@ -167,6 +171,12 @@ impl Qualification {
         &self,
         operation: impl FnOnce() -> Result<T, super::power::Error>,
     ) -> Result<T, super::power::Error> {
+        // Deterministic inert-model interleaving: prior metadata/current()
+        // succeeds, then revocation occurs at the actual publication boundary.
+        #[cfg(any(test, feature = "kernel-test"))]
+        if self.model_revoke_before_publication {
+            self.authority.revoke();
+        }
         struct Invoke<'a, F> {
             qualification: &'a Qualification,
             operation: F,
@@ -230,4 +240,4 @@ impl Qualification {
 }
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "radio_policy/tests.rs"]
-mod tests;
+pub(super) mod tests;

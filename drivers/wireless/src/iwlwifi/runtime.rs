@@ -555,6 +555,7 @@ pub struct Hardware {
     device: narf_bus::BusDevice,
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     format: rx_rfh::CompletionFormat,
+    sc_identity: Option<super::firmware_identity::Sc>,
     interrupts: Option<super::iwl_msix::Interrupts>,
     pub notifications: alloc::collections::VecDeque<Packet>,
     responses: alloc::collections::VecDeque<Packet>,
@@ -574,18 +575,30 @@ impl core::fmt::Debug for Hardware {
 }
 
 impl Hardware {
-    pub fn new(
+    pub(super) fn new(
         device: narf_bus::BusDevice,
         cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
         region: narf_bus::MmioRegion,
         parsed: &ParsedUcode<'_>,
         format: rx_rfh::CompletionFormat,
+        sc_identity: Option<super::firmware_identity::Sc>,
     ) -> Result<Self, &'static str> {
+        let sc = super::chip_config_for_pci_id(device.id.vendor, device.id.device)
+            .is_some_and(|chip| chip.mac == super::MacFamily::ScA0);
+        if sc && sc_identity.is_none() {
+            return Err("Sc startup requires selected hardware identity");
+        }
+        if !sc && sc_identity.is_some() {
+            return Err("Sc firmware binding on another PCI profile");
+        }
         // Stop inherited DMA before allocating buffers or rejecting an
         // unsupported firmware profile. Early initialization failures must
         // not leave a previous boot's bus-master state running.
         super::mmio::set_master(&device, &cap, false)?;
         let mut mmio = super::IwlMmioImpl::new(region, cap);
+        if let Some(identity) = sc_identity {
+            identity.check(&mut mmio)?;
+        }
         if format == rx_rfh::CompletionFormat::Qu {
             super::gen2_profile::select(
                 device.id.device,
@@ -618,6 +631,7 @@ impl Hardware {
             device,
             cap,
             format,
+            sc_identity,
             interrupts: None,
             notifications: alloc::collections::VecDeque::new(),
             responses: alloc::collections::VecDeque::new(),
@@ -728,6 +742,15 @@ impl Hardware {
 
     pub async fn start(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
         use super::regs::*;
+        if super::chip_config_for_pci_id(self.device.id.vendor, self.device.id.device)
+            .is_some_and(|chip| chip.mac == super::MacFamily::ScA0)
+            && self.sc_identity.is_none()
+        {
+            return Err("Sc startup requires selected hardware identity");
+        }
+        if let Some(identity) = self.sc_identity {
+            identity.check(&mut self.mmio)?;
+        }
         super::mmio::set_master(&self.device, &self.cap, false)?;
         if self.format == rx_rfh::CompletionFormat::Qu {
             let hw_rev = self.mmio.read(CSR_HW_REV);
@@ -812,6 +835,9 @@ impl Hardware {
             .unwrap()
             .enable(self.format == rx_rfh::CompletionFormat::Bz)?;
 
+        if let Some(identity) = self.sc_identity {
+            identity.check(&mut self.mmio)?;
+        }
         super::mmio::set_master(&self.device, &self.cap, true)?;
         self.armed = true;
         self.resources.rx.publish(&mut self.mmio)?;

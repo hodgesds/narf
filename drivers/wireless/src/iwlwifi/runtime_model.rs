@@ -186,6 +186,7 @@ pub(in crate::iwlwifi) fn create_for_format(
     }
     let address = PcieAddr::new(0, 0, 7, 0);
     let hardware = Hardware {
+        sc_identity: None,
         mmio,
         resources: core::mem::ManuallyDrop::new(Resources {
             rx,

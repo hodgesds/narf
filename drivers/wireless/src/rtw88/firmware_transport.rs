@@ -85,16 +85,44 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for Snapshot {
         })())
     }
 }
-fn registered_image(did: u16) -> Result<alloc::vec::Vec<u8>, Error> {
+/// Owned authenticated/validated image staging. Construction publishes no DMA
+/// or readiness; only the real retained Owner may begin a hardware attempt.
+pub(super) struct PreparedImage {
+    did: u16,
+    bytes: alloc::vec::Vec<u8>,
+}
+pub(super) fn preflight_image(
+    did: u16,
+    bytes: alloc::vec::Vec<u8>,
+) -> Result<PreparedImage, Error> {
+    parse(did, &bytes)?;
+    Ok(PreparedImage { did, bytes })
+}
+struct Open(&'static str);
+impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
+    type Output = Result<Cap<narf_firmware::FirmwareBlob, Read>, FirmwareError>;
+    fn execute(
+        self,
+        cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self::Output, CapError> {
+        Ok(narf_firmware::open(self.0, cap))
+    }
+}
+pub(super) fn registered_image(did: u16) -> Result<PreparedImage, Error> {
     let name = filename(did)?;
     let loader = narf_firmware::trusted_loader_authority()
         .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
     let authority = loader
         .derive()
         .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
-    let cap = narf_firmware::open(name, &authority).map_err(Error::Firmware)?;
-    cap.invoke(Snapshot(did))
+    let cap = authority
+        .invoke(Open(name))
         .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?
+        .map_err(Error::Firmware)?;
+    let bytes = cap
+        .invoke(Snapshot(did))
+        .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))??;
+    preflight_image(did, bytes)
 }
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
@@ -245,6 +273,15 @@ struct Backup {
     pages: u16,
     rqpn: u32,
     beacon: u8,
+}
+pub(super) struct RadioPreflight {
+    board: super::power_policy::Board,
+    calibration: alloc::sync::Arc<super::power_policy::Calibration>,
+    permission: super::power_policy::Permission,
+    gain: [u8; 2],
+    gate: super::power_policy::Gate,
+    mac: super::mac::Info,
+    phy: super::phy::Info,
 }
 pub(super) struct Owner<I: Io> {
     io: I,
@@ -523,10 +560,19 @@ impl<I: Io> Owner<I> {
     where
         F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
     {
+        let plan = self.preflight_radio(factory, permission, &policy()?)?;
+        self.prepare_radio_prepared(factory, plan, policy).await
+    }
+    pub(super) fn preflight_radio(
+        &self,
+        factory: &super::efuse::Factory,
+        permission: super::power_policy::Permission,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<RadioPreflight, Error> {
         if self.phase != Phase::PhyTablesPrepared {
             return Err(Error::State);
         }
-        let gain = self.current_power(permission, &policy()?)?;
+        let gain = self.current_power(permission, domain)?;
         let calibration = self.power.clone().ok_or(Error::State)?;
         let board = super::power_policy::Board::new(
             factory,
@@ -541,6 +587,47 @@ impl<I: Io> Owner<I> {
         let gate = super::power_policy::Gate::new(calibration.clone(), permission, factory.mac());
         let mac = self.mac.ok_or(Error::State)?;
         let phy = self.phy.ok_or(Error::State)?;
+        Ok(RadioPreflight {
+            board,
+            calibration,
+            permission,
+            gain,
+            gate,
+            mac,
+            phy,
+        })
+    }
+    pub(super) async fn prepare_radio_prepared<F>(
+        &mut self,
+        factory: &super::efuse::Factory,
+        plan: RadioPreflight,
+        policy: F,
+    ) -> Result<super::radio::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        if self.phase != Phase::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        let actual = super::power_policy::Board::new(
+            factory,
+            self.phy.ok_or(Error::State)?,
+            self.hardware.ok_or(Error::State)?,
+            self.image_digest.ok_or(Error::State)?,
+        )
+        .map_err(Error::Power)?;
+        if actual != plan.board {
+            return Err(Error::Power(super::power_policy::Error::Identity));
+        }
+        let RadioPreflight {
+            calibration,
+            permission,
+            gain,
+            gate,
+            mac,
+            phy,
+            ..
+        } = plan;
         // Poison before any radio/calibration register or await. A partial
         // calibration never grants replay, ordinary packet or carrier access.
         self.phase = Phase::Failed;
@@ -578,12 +665,31 @@ impl<I: Io> Owner<I> {
     /// Production always opens exactly the NIC image through current firmware
     /// authority; the same signature/header can occur in WoW or sibling files.
     pub async fn initialize_registered(&mut self) -> Result<Info, Error> {
+        let did = self.did;
+        self.initialize_registered_with(|| registered_image(did))
+            .await
+    }
+    async fn initialize_registered_with(
+        &mut self,
+        load: impl FnOnce() -> Result<PreparedImage, Error>,
+    ) -> Result<Info, Error> {
         if self.phase != Phase::New {
             return Err(Error::State);
         }
+        let image = load()?;
+        self.initialize_prepared(image).await
+    }
+    pub(super) async fn initialize_prepared(
+        &mut self,
+        image: PreparedImage,
+    ) -> Result<Info, Error> {
+        if self.phase != Phase::New || self.did != image.did {
+            return Err(Error::State);
+        }
+        // The staged bytes are immutable and parsed before this single-use
+        // boundary. Every attempted claim, I/O failure or drop stays terminal.
         self.phase = Phase::Failed;
-        let bytes = registered_image(self.did)?;
-        self.download_inner(&bytes).await
+        self.download_inner(&image.bytes).await
     }
     /// In-family authenticated owner/model entry; production uses registry.
     pub(super) async fn download(&mut self, bytes: &[u8]) -> Result<Info, Error> {

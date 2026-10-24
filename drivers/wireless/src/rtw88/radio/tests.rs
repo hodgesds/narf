@@ -673,3 +673,98 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw8822ce_radio_current_policy_revocation_cancel_and_path_backup
 );
+
+fn smoke_rtw8822ce_staged_policy_preserves_phy_checkpoint_and_resumes_same_owner() -> TestResult {
+    use crate::rtw88::firmware_lifecycle::{Lifecycle, Stage};
+    use crate::rtw88::firmware_transport::Phase;
+    let lifecycle = Lifecycle::new(0xc822);
+    let allocations = AtomicUsize::new(0);
+    narf_scheduler::block_on(lifecycle.initialize_bytes(
+        || {
+            allocations.fetch_add(1, Ordering::SeqCst);
+            Ok(RadioIo::new())
+        },
+        super::mac_tests::firmware(),
+    ))
+    .unwrap();
+    narf_scheduler::block_on(lifecycle.prepare_mac()).unwrap();
+    let factory = super::power_policy_tests::make_factory(0, 60);
+    narf_scheduler::block_on(lifecycle.prepare_phy_tables(&factory)).unwrap();
+    let domain = super::power_policy_tests::domain();
+    let (board, pointer, trace) = {
+        let retained = lifecycle.retained.try_lock().unwrap();
+        let owner = retained.as_ref().unwrap();
+        (
+            Board::new(
+                &factory,
+                owner.phy_info().unwrap(),
+                owner.hardware_info().unwrap(),
+                owner.image_digest().unwrap(),
+            )
+            .unwrap(),
+            owner as *const _ as usize,
+            owner.io.base.trace.clone(),
+        )
+    };
+    let cap = narf_capabilities::Cap::bootstrap();
+    if narf_scheduler::block_on(lifecycle.qualify_board_with_source(
+        &factory,
+        &domain,
+        super::power_policy_tests::source(Vec::new(), cap),
+    ))
+    .is_ok()
+        || lifecycle.status().stage != Stage::PhyTablesPrepared
+    {
+        return TestResult::Fail("invalid staged board artifact consumed PHY checkpoint");
+    }
+    let permission = narf_scheduler::block_on(lifecycle.qualify_board_with_source(
+        &factory,
+        &domain,
+        super::power_policy_tests::source(super::power_policy_tests::image(board, &factory), cap),
+    ))
+    .unwrap();
+    let error = Error::Power(crate::rtw88::power_policy::Error::Policy);
+    if narf_scheduler::block_on(
+        lifecycle.prepare_radio_with_policy(&factory, permission, || Err(error)),
+    ) != Err(error)
+        || lifecycle.status().stage != Stage::PhyTablesPrepared
+    {
+        return TestResult::Fail("pure current-policy failure consumed calibration attempt");
+    }
+    {
+        let mut retained = lifecycle.retained.try_lock().unwrap();
+        let owner = retained.as_mut().unwrap();
+        if owner.phase() != Phase::PhyTablesPrepared
+            || owner as *const _ as usize != pointer
+            || owner.io.base.trace != trace
+        {
+            return TestResult::Fail("asset/policy staging touched/replaced native hardware owner");
+        }
+        owner.io.arm_calibration();
+        *owner.io.policy.lock() = domain.clone();
+    }
+    if narf_scheduler::block_on(
+        lifecycle.prepare_radio_with_policy(&factory, permission, || Ok(domain.clone())),
+    )
+    .is_err()
+        || lifecycle.status().stage != Stage::Calibrated
+        || allocations.load(Ordering::SeqCst) != 1
+    {
+        return TestResult::Fail("later valid policy could not continue actual retained radio");
+    }
+    let retained = lifecycle.retained.try_lock().unwrap();
+    let owner = retained.as_ref().unwrap();
+    if owner as *const _ as usize != pointer
+        || owner.phase() != Phase::Calibrated
+        || owner.radio_info().is_none()
+        || !owner.io.finished
+        || owner.io.packets.tx_publications != 0
+    {
+        return TestResult::Fail("resumed calibration reconstructed owner or published packets");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw8822ce_staged_policy_preserves_phy_checkpoint_and_resumes_same_owner
+);

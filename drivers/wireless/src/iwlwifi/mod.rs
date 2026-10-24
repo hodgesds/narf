@@ -62,6 +62,7 @@ pub mod device;
 pub mod firmware_api;
 #[cfg(any(test, feature = "kernel-test"))]
 mod firmware_golden_tests;
+mod firmware_identity;
 pub mod frame_api;
 pub mod fw_loader;
 mod gen2_prepare;
@@ -1037,7 +1038,8 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
 /// Mirrors `iwl_request_firmware` in iwl-drv.c: outer loop over
 /// `rf_candidates`, inner loop over API versions from `api_max`
 /// down to `api_min`. First file the firmware registry resolves
-/// is the one we use.
+/// is the one we use. Native Sc startup instead binds this API ladder to its
+/// actual CSR MAC/RF/step through `firmware_identity`, never cross-RF fallback.
 ///
 /// Linux's special-case at API 100 → 102 (the "core" numbering
 /// jump on Bz+) is preserved: when the requested chip's

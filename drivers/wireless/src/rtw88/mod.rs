@@ -73,7 +73,7 @@ pub mod power;
 mod power_tables;
 pub mod regs;
 
-pub use pci::{name_for, probe, register_pci_driver, Rtw88Device};
+pub use pci::{name_for, probe, provision, register_pci_driver, Rtw88Device};
 pub use regs::{REALTEK_VENDOR, RTL_DEV_8821CE, RTL_DEV_8822BE, RTL_DEV_8822CE};
 
 /// Entry point invoked from the wireless crate's `register_initcalls`

@@ -20,6 +20,7 @@ pub enum ProvisionState {
 }
 struct State {
     interface: Option<Arc<Device>>,
+    discovery: Option<narf_bus::MmioRegion>,
 }
 pub(super) struct Owner {
     device: BusDevice,
@@ -35,7 +36,10 @@ impl Owner {
             cap,
             chip,
             phase: AtomicU8::new(ProvisionState::Parking as u8),
-            state: Mutex::new(State { interface: None }),
+            state: Mutex::new(State {
+                interface: None,
+                discovery: None,
+            }),
         }
     }
     pub(super) fn parked(&self) {
@@ -63,18 +67,68 @@ impl Owner {
         let authority = narf_firmware::trusted_loader_authority()
             .and_then(|cap| cap.derive().ok())
             .ok_or("firmware authority unavailable")?;
-        self.provision_using(&authority, &super::firmware_filename_ladder(&self.chip))
+        self.provision_with_authority(&authority).await
+    }
+    async fn provision_with_authority(
+        &self,
+        authority: &Cap<FirmwareRegistry, Read>,
+    ) -> Result<(), &'static str> {
+        let mut state = self.state.lock().await;
+        self.admit()?;
+        let (candidates, identity) = self.candidates(&mut state)?;
+        self.start(&mut state, authority, &candidates, identity)
             .await
     }
+    fn admit(&self) -> Result<(), &'static str> {
+        if self.phase() != ProvisionState::Parked {
+            return Err("Intel startup already attempted");
+        }
+        Ok(())
+    }
+    fn candidates(
+        &self,
+        state: &mut State,
+    ) -> Result<
+        (
+            alloc::vec::Vec<String>,
+            Option<super::firmware_identity::Sc>,
+        ),
+        &'static str,
+    > {
+        if self.chip.mac != super::MacFamily::ScA0 {
+            return Ok((super::firmware_filename_ladder(&self.chip), None));
+        }
+        let region = match state.discovery {
+            Some(region) => region,
+            None => {
+                // Identity discovery enables only checked memory decode; BME
+                // stays off. Retain this same mapping across missing assets.
+                let region = super::mmio::map(&self.device, &self.cap)?;
+                state.discovery = Some(region);
+                region
+            }
+        };
+        let mut io = super::IwlMmioImpl::new(region, self.cap);
+        let identity = super::firmware_identity::Sc::read(&mut io)?;
+        Ok((identity.ladder(&self.chip)?, Some(identity)))
+    }
+    #[cfg(feature = "kernel-test")]
     async fn provision_using(
         &self,
         authority: &Cap<FirmwareRegistry, Read>,
         candidates: &[String],
     ) -> Result<(), &'static str> {
         let mut state = self.state.lock().await;
-        if self.phase() != ProvisionState::Parked {
-            return Err("Intel startup already attempted");
-        }
+        self.admit()?;
+        self.start(&mut state, authority, candidates, None).await
+    }
+    async fn start(
+        &self,
+        state: &mut State,
+        authority: &Cap<FirmwareRegistry, Read>,
+        candidates: &[String],
+        identity: Option<super::firmware_identity::Sc>,
+    ) -> Result<(), &'static str> {
         let format =
             CompletionFormat::for_mac(self.chip.mac).ok_or("Gen2 native station remains gated")?;
         let input = resolve(authority, candidates)?;
@@ -89,12 +143,28 @@ impl Owner {
         if !input.firmware.current() || input.pnvm.as_ref().is_some_and(|asset| !asset.current()) {
             return Err("Intel selected asset authority revoked before attempt");
         }
+        if let Some(identity) = identity {
+            let mut io = super::IwlMmioImpl::new(
+                state.discovery.ok_or("Sc discovery mapping unavailable")?,
+                self.cap,
+            );
+            identity.check(&mut io)?;
+        }
         self.phase
             .store(ProvisionState::Starting as u8, Ordering::Release);
         let _attempt = Attempt(self);
-        let region = super::mmio::map(&self.device, &self.cap)?;
-        let hardware =
-            super::runtime::Hardware::new(self.device, self.cap, region, &parsed, format)?;
+        let region = match state.discovery {
+            Some(region) => region,
+            None => super::mmio::map(&self.device, &self.cap)?,
+        };
+        let hardware = super::runtime::Hardware::new(
+            self.device,
+            self.cap,
+            region,
+            &parsed,
+            format,
+            identity,
+        )?;
         let interface = Device::initialize(hardware, &parsed, &input.firmware.bytes).await?;
         // Retain this SAME live Device before registration/pump publication.
         state.interface = Some(interface.clone());
@@ -168,7 +238,8 @@ pub(super) fn schedule(owner: Arc<Owner>) {
         }
     });
 }
-/// Retry newly staged inputs only before any mapped/runtime startup attempt.
+/// Retry newly staged inputs before firmware/runtime startup; Sc identity-only
+/// discovery retains the same mapping with bus mastering disabled.
 pub async fn provision() -> Result<(), &'static str> {
     let owner = NATIVE
         .lock()

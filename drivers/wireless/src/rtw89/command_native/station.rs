@@ -215,9 +215,30 @@ impl control::Interface for Access<'_> {
         operation: impl FnOnce(&mut Self) -> Result<T, power::Error>,
     ) -> Result<T, power::Error> {
         let cap = self.native.authority;
+        if self.cleanup {
+            // Teardown remains possible after the emission grant is revoked.
+            // It closes ordinary engines under current device authority only.
+            return crate::rtw88::pci_park::invoke(&cap, || {
+                self.preflight(false)?;
+                operation(self)
+            })
+            .map_err(|_| power::Error::Access)?;
+        }
         crate::rtw88::pci_park::invoke(&cap, || {
-            self.preflight(false)?;
-            operation(self)
+            let qualification = self
+                .native
+                .ordinary
+                .as_ref()
+                .ok_or(power::Error::Unsupported)?
+                .qualification
+                .clone();
+            // A successful earlier sample is not authority for later port,
+            // crypto or table MMIO. Retain the exact signed grant through the
+            // complete transaction, including native masked readbacks.
+            qualification.with_current(|| {
+                self.preflight(false)?;
+                operation(self)
+            })
         })
         .map_err(|_| power::Error::Access)?
     }
