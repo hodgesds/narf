@@ -15,6 +15,13 @@ use narf_wireless::{
     scan::BssInfo, AssociateRequest, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
 
+/// Publish the association's physical carrier along with the interface's
+/// existing up/down state. Shared by production and its composition fixture.
+pub(crate) fn publish_link(name: &str, up: bool) -> bool {
+    let carrier = narf_net::iface::set_link_metadata(name, up, None, None);
+    narf_net::iface::set_link_state(name, up) && carrier
+}
+
 /// One retained legacy 2.4/5 GHz station, with carrier gated by association.
 #[derive(Debug)]
 pub struct Mt76Iface {
@@ -190,7 +197,7 @@ impl Mt76Iface {
 
     fn clear_link(&self) {
         *self.associated_bssid.lock() = None;
-        narf_net::iface::set_link_state(&self.name, false);
+        publish_link(&self.name, false);
         *self.pending_tx.lock() = None;
         *self.tx_ring.lock() = None;
         *self.rx_ring.lock() = None;
@@ -436,7 +443,7 @@ impl WirelessNetIface for Mt76Iface {
             *self.tx_cons.lock() = Some(tx_cons);
             *self.rx_prod.lock() = Some(rx_prod);
             *self.associated_bssid.lock() = Some(req.bssid);
-            narf_net::iface::set_link_state(&self.name, true);
+            publish_link(&self.name, true);
             Ok(())
         }
     }
@@ -465,7 +472,7 @@ impl WirelessNetIface for Mt76Iface {
             *self.tx_cons.lock() = None;
             *self.rx_prod.lock() = None;
             *self.associated_bssid.lock() = None;
-            narf_net::iface::set_link_state(&self.name, false);
+            publish_link(&self.name, false);
             Ok(())
         }
     }
@@ -574,7 +581,7 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
     }
     let mut iface = Mt76Iface::new(String::new(), info)?;
     iface.name = narf_net::iface::register("wlan%d", info.capabilities.mac, send_frame);
-    narf_net::iface::set_link_state(&iface.name, false);
+    publish_link(&iface.name, false);
     let iface = Arc::new(iface);
     if narf_net::registry()
         .register(&authority, RegisteredIface(iface.clone()))

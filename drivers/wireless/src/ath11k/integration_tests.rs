@@ -39,6 +39,7 @@ use core::task::{Context, Poll, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::Interface;
+use narf_wifi_fixtures::DhcpServer;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIface};
 
 use super::ce::{self, Ce, CeIrq, CeMsi};
@@ -416,6 +417,10 @@ struct DevState {
     tcl_tx: Vec<TclTx>,
     /// Ethernet frames the AP side sends to the station.
     rx_queue: VecDeque<Vec<u8>>,
+    /// Optional shared fake-AP DHCP server for the composition fixture.
+    dhcp: Option<DhcpServer>,
+    /// Ethernet data observed at the AP, with its native TX protection bit.
+    ap_data: Vec<(Vec<u8>, bool)>,
     /// Frames the AP sends once the station transmits an Authentication
     /// frame (the BSS peer exists; the station is not yet associated).
     rx_on_auth: Vec<Vec<u8>>,
@@ -466,6 +471,8 @@ impl Dev {
                 wmi: Vec::new(),
                 tcl_tx: Vec::new(),
                 rx_queue: VecDeque::new(),
+                dhcp: None,
+                ap_data: Vec::new(),
                 rx_on_auth: Vec::new(),
                 rx_delivered: 0,
                 reo_cmds: 0,
@@ -628,6 +635,11 @@ impl Dev {
                 eth.extend_from_slice(&f[hl + 6..]);
                 if eth[12..14] == [0x88, 0x8e] {
                     st.world.on_eth(&eth);
+                } else if st.dhcp.is_some() {
+                    st.ap_data.push((eth.clone(), fc & 0x4000 != 0));
+                    if let Some(reply) = st.dhcp.as_mut().and_then(|ap| ap.receive(&eth)) {
+                        st.rx_queue.push_back(reply);
+                    }
                 }
             }
             let rel = match st.tx_rel {
@@ -919,13 +931,24 @@ static RX_SEEN: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new())
 static LINK_SEEN: IrqSafeSpinLock<Vec<bool>> = IrqSafeSpinLock::new(Vec::new());
 static TEST_DEV: IrqSafeSpinLock<Option<Arc<TNetdev>>> = IrqSafeSpinLock::new(None);
 
-fn rx_sink(_name: &str, f: &mut [u8]) {
+fn rx_sink(name: &str, f: &mut [u8]) {
     RX_SEEN.lock().push(f.to_vec());
+    if dhcp_composition::active() {
+        // The stack can synchronously send a reply. Release RX_SEEN before
+        // entering it, just as the hardware sink does.
+        narf_net::iface::on_rx_frame_from(name, f);
+    }
 }
 
-fn link_sink(_name: &str, up: bool) {
+fn link_sink(name: &str, up: bool) {
     LINK_SEEN.lock().push(up);
+    if dhcp_composition::active() {
+        narf_net::iface::set_link_metadata(name, up, None, None);
+    }
 }
+
+#[path = "dhcp_composition_tests.rs"]
+mod dhcp_composition;
 
 fn admin_sink(name: &str, up: bool) {
     narf_net::iface::set_link_state(name, up);

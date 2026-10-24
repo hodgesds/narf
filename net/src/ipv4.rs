@@ -193,6 +193,15 @@ pub fn lookup_binding(iface_name: &str) -> Option<Binding> {
         .cloned()
 }
 
+/// Retire only the removed interface's address, gateway and DNS configuration.
+/// Called after releasing the interface registry's own lock when an interface
+/// is unregistered, before its removal is reported complete to the caller.
+pub(crate) fn remove_interface_binding(iface_name: &str) {
+    BINDINGS
+        .lock()
+        .retain(|binding| binding.iface_name != iface_name);
+}
+
 // ── ipv4_send ──────────────────────────────────────────────────────
 
 /// Maximum frame we'll ever write (Ethernet + IPv4 + full MTU payload).
@@ -297,4 +306,81 @@ mod tests {
         narf_kernel_test::TestResult::Pass
     }
     narf_kernel_test::kernel_test_in!("net/ipv4", link_local_detection);
+
+    fn smoke_ipv4_unregister_retires_only_its_binding() -> narf_kernel_test::TestResult {
+        use narf_kernel_test::TestResult;
+
+        fn send(_frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+            Ok(())
+        }
+
+        // Remove just these fixtures on every exit, including assertion
+        // failures; never reset another device's live address configuration.
+        struct Interfaces([alloc::string::String; 2]);
+        impl Drop for Interfaces {
+            fn drop(&mut self) {
+                for name in &self.0 {
+                    iface::unregister(name);
+                    remove_interface_binding(name);
+                }
+            }
+        }
+        let interfaces = Interfaces([
+            iface::register("ipdrop%d", [2, 0, 0, 0, 0xfe, 1], send),
+            iface::register("ipkeep%d", [2, 0, 0, 0, 0xfe, 2], send),
+        ]);
+        let removed = &interfaces.0[0];
+        let retained = &interfaces.0[1];
+        let mask = Ipv4Addr([255, 255, 255, 0]);
+        bind_address(
+            removed,
+            Ipv4Addr([203, 0, 113, 2]),
+            mask,
+            Some(Ipv4Addr([203, 0, 113, 1])),
+            &[Ipv4Addr([192, 0, 2, 53])],
+        );
+        bind_address(
+            retained,
+            Ipv4Addr([198, 51, 100, 2]),
+            mask,
+            Some(Ipv4Addr([198, 51, 100, 1])),
+            &[Ipv4Addr([192, 0, 2, 54]), Ipv4Addr([192, 0, 2, 55])],
+        );
+        let retained_binding_is_intact = || {
+            lookup_binding(retained).is_some_and(|binding| {
+                binding.addr == Ipv4Addr([198, 51, 100, 2])
+                    && binding.netmask == mask
+                    && binding.gateway == Some(Ipv4Addr([198, 51, 100, 1]))
+                    && binding.dns == [Ipv4Addr([192, 0, 2, 54]), Ipv4Addr([192, 0, 2, 55])]
+            })
+        };
+        if lookup_binding(removed).is_none() || !retained_binding_is_intact() {
+            return TestResult::Fail("fixture IPv4 bindings were not installed");
+        }
+        if !iface::unregister(removed)
+            || iface::lookup(removed).is_some()
+            || lookup_binding(removed).is_some()
+        {
+            return TestResult::Fail("unregistered interface retained its IPv4 binding");
+        }
+        if !retained_binding_is_intact() {
+            return TestResult::Fail("unregister changed another interface's IPv4 binding");
+        }
+
+        let reused = iface::register(removed, [2, 0, 0, 0, 0xfe, 3], send);
+        if &reused != removed
+            || lookup_binding(&reused).is_some()
+            || !matches!(
+                ipv4_send(&reused, Ipv4Addr::BROADCAST, IpProto::Udp, &[]),
+                Err(SendError::NoBinding)
+            )
+        {
+            return TestResult::Fail("reused interface name inherited a removed device's lease");
+        }
+        if !retained_binding_is_intact() {
+            return TestResult::Fail("name reuse changed another interface's IPv4 binding");
+        }
+        TestResult::Pass
+    }
+    narf_kernel_test::kernel_test_in!("net/ipv4", smoke_ipv4_unregister_retires_only_its_binding);
 }

@@ -94,6 +94,7 @@ struct Model {
     anonce: [u8; 32],
     ap_mac: [u8; 6],
     own_mac: [u8; 6],
+    access_point: Option<narf_wifi_fixtures::FakeAp>,
     recovery_trace: Vec<(&'static str, u64)>,
     reset_asserted_at: Option<u64>,
     reset_stall: bool,
@@ -135,6 +136,7 @@ impl Model {
             anonce: [0; 32],
             ap_mac: [0; 6],
             own_mac: [0; 6],
+            access_point: None,
             recovery_trace: Vec::new(),
             reset_asserted_at: None,
             reset_stall: false,
@@ -344,6 +346,21 @@ impl Backend for Model {
         self.check()?;
         self.management_rates.push(rate.hardware());
         self.frames.push((false, frame.to_vec()));
+        if let Some(ap) = &mut self.access_point {
+            let replies = ap.receive(frame).map_err(|_| Error::Bounds)?;
+            for reply in replies {
+                let mut packet = vec![0u8; 32 + reply.len()];
+                let len = packet.len();
+                packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+                packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+                packet[12..16]
+                    .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
+                packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+                packet[32..].copy_from_slice(&reply);
+                self.packets.push_back(packet);
+            }
+            return Ok(());
+        }
         if self.psk != [0u8; 32] {
             if let Some(eapol) = super::extract_eapol(frame) {
                 if let Some(m2) = eapol
@@ -419,6 +436,11 @@ impl Backend for Model {
     }
     fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
         self.check()?;
+        if self.access_point.as_ref().is_some_and(|ap| {
+            ap.phase() != narf_wifi_fixtures::ApPhase::Authorized || ap.protected() != protected
+        }) {
+            return Err(Error::Bounds);
+        }
         self.frames.push((false, frame.to_vec()));
         self.data_protection.push(protected);
         Ok(())

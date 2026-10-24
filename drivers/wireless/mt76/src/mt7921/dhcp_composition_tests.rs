@@ -37,7 +37,9 @@
 
 use super::*;
 use alloc::{string::String, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use narf_wifi_fixtures::{
+    dhcp_message_type, udp_ipv4 as wrap_udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan,
+};
 
 // ── Fixture network plan ───────────────────────────────────────────
 
@@ -57,6 +59,14 @@ const SERVER_IP: [u8; 4] = [10, 77, 0, 1];
 const LEASE_IP: [u8; 4] = [10, 77, 0, 42];
 const NETMASK: [u8; 4] = [255, 255, 255, 0];
 const LEASE_SECS: u32 = 3600;
+const NETWORK: NetworkPlan = NetworkPlan {
+    station: OWN,
+    bssid: AP,
+    server_ip: SERVER_IP,
+    lease_ip: LEASE_IP,
+    netmask: NETMASK,
+    lease_seconds: LEASE_SECS,
+};
 
 // ── Harness ────────────────────────────────────────────────────────
 
@@ -83,8 +93,8 @@ struct Harness {
     /// WPA2 composition: downlink data is presented as
     /// hardware-decrypted CCMP. Open composition: plaintext.
     protected_link: bool,
-    saw_discover: bool,
-    saw_request: bool,
+    server: DhcpServer,
+    received: Vec<Vec<u8>>,
 }
 
 static HARNESS: narf_lib::sync::IrqSafeSpinLock<Option<Harness>> =
@@ -138,7 +148,10 @@ fn harness_drain() -> bool {
         let step = session.step_network(tx.as_deref());
         harness.session = Some(session);
         match step {
-            Ok(step) => (harness.name.clone(), step.received, step.transmitted),
+            Ok(step) => {
+                harness.received.extend(step.received.iter().cloned());
+                (harness.name.clone(), step.received, step.transmitted)
+            }
             Err(Error::Busy) => {
                 // A previous data TX is still completing; keep the
                 // queued frame for the next step, as the production
@@ -173,16 +186,8 @@ impl Harness {
             if !is_station_data(&frame) {
                 continue;
             }
-            match dhcp_respond(&frame) {
-                Some((reply, narf_net::pkt_dhcp::DHCPDISCOVER)) => {
-                    self.saw_discover = true;
-                    replies.push(reply);
-                }
-                Some((reply, narf_net::pkt_dhcp::DHCPREQUEST)) => {
-                    self.saw_request = true;
-                    replies.push(reply);
-                }
-                _ => {}
+            if let Some(reply) = self.server.receive(&frame) {
+                replies.push(reply);
             }
         }
         for reply in replies {
@@ -260,222 +265,38 @@ fn captured_data(session: &Session<Model>) -> Vec<(Vec<u8>, bool)> {
         .collect()
 }
 
-// ── Fake DHCP server ───────────────────────────────────────────────
+// ── Native packet adapter for the shared reactive AP ────────────────
 
-/// Answer one station DHCP request with the server's reply Ethernet
-/// frame plus the DHCP message type seen, or `None` for anything
-/// that is not a well-formed DISCOVER/REQUEST for this server.
-fn dhcp_respond(eth: &[u8]) -> Option<(Vec<u8>, u8)> {
-    use narf_net::pkt_dhcp::{
-        append_end, append_message_type, append_option, append_server_identifier, DhcpHeader,
-        DHCPACK, DHCPOFFER, OPT_DNS_SERVER, OPT_LEASE_TIME, OPT_REQUESTED_IP, OPT_ROUTER,
-        OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
-    };
-    if eth.len() < 42 || eth[0..6] != [0xff; 6] || eth[12..14] != [0x08, 0x00] {
-        return None;
-    }
-    let ip = &eth[14..];
-    let ihl = usize::from(ip[0] & 0x0f) * 4;
-    if ihl < 20 || ip[9] != 17 || ip.len() < ihl + 8 {
-        return None;
-    }
-    let udp = &ip[ihl..];
-    if u16::from_be_bytes([udp[0], udp[1]]) != 68 || u16::from_be_bytes([udp[2], udp[3]]) != 67 {
-        return None;
-    }
-    let payload = udp[8..].to_vec();
-    let request = DhcpHeader::decode(&payload).ok()?;
-    if request.op != 1 || request.chaddr[..6] != OWN {
-        return None;
-    }
-    let mut msg_type = 0u8;
-    let mut requested_ip = None;
-    let mut server_id = None;
-    for option in narf_net::pkt_dhcp::iter_options(&payload[240..]) {
-        match option.tag {
-            53 if option.data.len() == 1 => msg_type = option.data[0],
-            OPT_REQUESTED_IP if option.data.len() == 4 => {
-                requested_ip = Some(option.data);
-            }
-            OPT_SERVER_IDENTIFIER if option.data.len() == 4 => {
-                server_id = Some(option.data);
-            }
-            _ => {}
-        }
-    }
-    let reply_type = match msg_type {
-        narf_net::pkt_dhcp::DHCPDISCOVER => DHCPOFFER,
-        narf_net::pkt_dhcp::DHCPREQUEST => {
-            // A REQUEST is only ACKed for the address this server
-            // offered, naming this server — anything else is not
-            // part of the composed conversation.
-            if requested_ip != Some(&LEASE_IP[..]) || server_id != Some(&SERVER_IP[..]) {
-                return None;
-            }
-            DHCPACK
-        }
-        _ => return None,
-    };
-    let mut dhcp = Vec::with_capacity(300);
-    DhcpHeader {
-        op: 2,
-        htype: 1,
-        hlen: 6,
-        hops: 0,
-        xid: request.xid,
-        secs: 0,
-        flags: request.flags,
-        ciaddr: [0; 4],
-        yiaddr: LEASE_IP,
-        siaddr: SERVER_IP,
-        giaddr: [0; 4],
-        chaddr: request.chaddr,
-    }
-    .encode_into(&mut dhcp);
-    append_message_type(&mut dhcp, reply_type);
-    append_server_identifier(&mut dhcp, SERVER_IP);
-    append_option(&mut dhcp, OPT_SUBNET_MASK, &NETMASK);
-    append_option(&mut dhcp, OPT_ROUTER, &SERVER_IP);
-    append_option(&mut dhcp, OPT_DNS_SERVER, &SERVER_IP);
-    append_option(&mut dhcp, OPT_LEASE_TIME, &LEASE_SECS.to_be_bytes());
-    append_end(&mut dhcp);
-    Some((
-        wrap_udp_ipv4(OWN, AP, SERVER_IP, [255; 4], 67, 68, &dhcp),
-        msg_type,
-    ))
-}
-
-/// Wrap a payload in UDP + IPv4 + Ethernet, the mirror of the DHCP
-/// client's own `wrap_broadcast_frame` (which see in `net/src/dhcp.rs`)
-/// with explicit unicast/broadcast addressing.
-fn wrap_udp_ipv4(
-    dst_mac: [u8; 6],
-    src_mac: [u8; 6],
-    src_ip: [u8; 4],
-    dst_ip: [u8; 4],
-    src_port: u16,
-    dst_port: u16,
-    payload: &[u8],
-) -> Vec<u8> {
-    use narf_net::pkt::{
-        set_ipv4_checksum, write_eth_header, write_ipv4_header, ETHERTYPE_IPV4, ETH_HDR_LEN,
-        IPV4_HDR_LEN, IP_PROTO_UDP,
-    };
-    let ip_total = (IPV4_HDR_LEN + narf_net::pkt_udp::UDP_HDR_LEN + payload.len()) as u16;
-    let mut frame = vec![0u8; ETH_HDR_LEN + ip_total as usize];
-    write_eth_header(&mut frame, dst_mac, src_mac, ETHERTYPE_IPV4);
-    {
-        let ip = &mut frame[ETH_HDR_LEN..];
-        let _ = write_ipv4_header(ip, ip_total, IP_PROTO_UDP, src_ip, dst_ip);
-        set_ipv4_checksum(ip);
-    }
-    let udp = &mut frame[ETH_HDR_LEN + IPV4_HDR_LEN..];
-    let _ = narf_net::pkt_udp::build_ipv4(udp, src_ip, dst_ip, src_port, dst_port, payload);
-    frame
-}
-
-// ── Join choreography (mirrors the parent fixture's wire bytes) ────
-
-fn push_beacon(session: &mut Session<Model>, wpa2: bool) {
-    let mut packet = scan_beacon(CHANNEL, SSID);
-    if wpa2 {
-        // Same construction as `live_join_wpa2`: keep the fixed
-        // header, patch capability, replace the IEs with the full
-        // set including the RSN element.
-        packet.truncate(68);
-        packet[66..68].copy_from_slice(&0x11u16.to_le_bytes());
-        let rsn = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
-        let mut ies = vec![0, SSID.len() as u8];
-        ies.extend_from_slice(SSID);
-        ies.extend_from_slice(&[1, 3, 0x8c, 0x98, 0xb0]);
-        ies.extend_from_slice(&[3, 1, CHANNEL, 48, rsn.len() as u8]);
-        ies.extend_from_slice(&rsn);
-        packet.extend_from_slice(&ies);
-        let len = packet.len();
-        packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
-    } else {
-        packet[66..68].copy_from_slice(&1u16.to_le_bytes());
-        // A real beacon always carries Supported Rates, and the join
-        // plan derives the association request's rates from the
-        // scanned BSS's elements. `scan_beacon`'s minimal element set
-        // omits them (it was built for scan-parser tests), so append
-        // the rates element the parent's own open-join fixture puts
-        // in its hand-built BSS.
-        packet.extend_from_slice(&[1, 4, 0x82, 0x84, 0x8b, 0x96]);
-        let len = packet.len();
-        packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
-    }
-    session.backend.packets.push_back(packet);
-}
-
-fn management_packet(frame: &[u8]) -> Vec<u8> {
+fn push_beacon(session: &mut Session<Model>) {
+    let frame = session
+        .backend
+        .access_point
+        .as_ref()
+        .expect("fixture AP")
+        .beacon();
     let mut packet = vec![0u8; 32 + frame.len()];
     let len = packet.len();
     packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
     packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
     packet[12..16].copy_from_slice(&(u32::from(CHANNEL) << 8).to_le_bytes());
     packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
-    packet[32..].copy_from_slice(frame);
-    packet
-}
-
-fn push_join_replies(session: &mut Session<Model>, wpa2: bool) {
-    let mut auth_resp = vec![0u8; 30];
-    auth_resp[0] = 0xb0;
-    auth_resp[4..10].copy_from_slice(&OWN);
-    auth_resp[10..16].copy_from_slice(&AP);
-    auth_resp[16..22].copy_from_slice(&AP);
-    auth_resp[24..30].copy_from_slice(&[0, 0, 2, 0, 0, 0]);
-    session
-        .backend
-        .packets
-        .push_back(management_packet(&auth_resp));
-
-    let mut assoc_resp = vec![0u8; 30];
-    assoc_resp[0] = 0x10;
-    assoc_resp[4..10].copy_from_slice(&OWN);
-    assoc_resp[10..16].copy_from_slice(&AP);
-    assoc_resp[16..22].copy_from_slice(&AP);
-    assoc_resp[24..26].copy_from_slice(&(if wpa2 { 0x31u16 } else { 1u16 }).to_le_bytes());
-    assoc_resp[26..28].copy_from_slice(&0u16.to_le_bytes());
-    assoc_resp[28..30].copy_from_slice(&(42u16 | 0xc000).to_le_bytes());
-    session
-        .backend
-        .packets
-        .push_back(management_packet(&assoc_resp));
-
-    if wpa2 {
-        // EAPOL-Key M1; the Model's authenticator answers the M2 the
-        // session sends with a real M3 (see `submit_management`).
-        let mut m1 = narf_wireless::eapol::KeyFrame::empty(16);
-        m1.descriptor_type = narf_wireless::eapol::KEY_DESCRIPTOR_RSN;
-        m1.key_information = narf_wireless::eapol::KI_KEY_TYPE_PAIRWISE
-            | narf_wireless::eapol::KI_KEY_ACK
-            | narf_wireless::eapol::KI_VERSION_HMAC_SHA1_AES;
-        m1.key_length = 16;
-        m1.replay_counter = 1;
-        m1.key_nonce = ANONCE;
-        let m1_frame = ap_eapol_frame(OWN, AP, &m1.into_eapol());
-        session
-            .backend
-            .packets
-            .push_back(management_packet(&m1_frame));
-    }
+    packet[32..].copy_from_slice(&frame);
+    session.backend.packets.push_back(packet);
 }
 
 // ── The composition ────────────────────────────────────────────────
 
-static STACK_INIT: AtomicBool = AtomicBool::new(false);
-
 fn composition(wpa2: bool) -> TestResult {
     let mut model = Model::new();
     model.station_channel = CHANNEL;
-    if wpa2 {
-        model.psk = PSK;
-        model.anonce = ANONCE;
-        model.ap_mac = AP;
-        model.own_mac = OWN;
-    }
+    model.access_point = Some(
+        if wpa2 {
+            FakeAp::wpa2(NETWORK, SSID, CHANNEL, 42, PSK, ANONCE)
+        } else {
+            FakeAp::open(NETWORK, SSID, CHANNEL, 42)
+        }
+        .expect("fixture AP configuration"),
+    );
     let mut session = Session::new(model, firmware(32));
     if run(session.run()).is_err() || run(session.initialize_radio()).is_err() {
         return TestResult::Fail("composition radio init");
@@ -487,11 +308,9 @@ fn composition(wpa2: bool) -> TestResult {
         return TestResult::Fail("composition radio identity");
     }
 
-    // Kernel-test guests never run the boot init that wires the
-    // stack's RX handler; the virtio DHCP smoke does the same call.
-    if !STACK_INIT.swap(true, Ordering::AcqRel) {
-        narf_net::tcp_stack::init();
-    }
+    // Install only the idempotent RX dispatch, without resetting another
+    // family's routes, timers or netfilter hooks in the shared test guest.
+    narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
     let name = narf_net::iface::register("wlan%d", OWN, harness_send);
     narf_net::iface::install_rx_drain(harness_drain);
     *HARNESS.lock() = Some(Harness {
@@ -501,8 +320,8 @@ fn composition(wpa2: bool) -> TestResult {
         ap_cursor: 0,
         next_pn: 1,
         protected_link: wpa2,
-        saw_discover: false,
-        saw_request: false,
+        server: DhcpServer::new(NETWORK),
+        received: Vec::new(),
     });
 
     let result = composition_body(&name, wpa2);
@@ -511,9 +330,19 @@ fn composition(wpa2: bool) -> TestResult {
     // fire against a half-removed interface), then carrier, then
     // the registry entry — the next composition reuses the name.
     *HARNESS.lock() = None;
-    narf_net::iface::set_link_state(&name, false);
+    let closed = crate::iface::publish_link(&name, false)
+        && narf_net::iface::lookup(&name).is_some_and(|snap| {
+            !snap.link_up
+                && !snap.carrier
+                && snap.carrier_up_count == 1
+                && snap.carrier_down_count == 1
+        });
     narf_net::iface::unregister(&name);
-    result
+    if result == TestResult::Pass && (!closed || narf_net::ipv4::lookup_binding(&name).is_some()) {
+        TestResult::Fail("composition retained carrier or IPv4 binding after teardown")
+    } else {
+        result
+    }
 }
 
 fn composition_body(name: &str, wpa2: bool) -> TestResult {
@@ -521,7 +350,7 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
     // keeps DHCP off the air entirely (audit §4.3.1 S1: "no DHCP
     // before PORT_SECURE" — here, before association completes).
     match narf_net::iface::lookup(name) {
-        Some(snap) if !snap.link_up => {}
+        Some(snap) if !snap.link_up && !snap.carrier => {}
         _ => return TestResult::Fail("interface must start with carrier down"),
     }
     if narf_net::dhcp::acquire(name, 400).is_ok() {
@@ -539,7 +368,7 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
     let Some(mut session) = take_session() else {
         return TestResult::Fail("harness session missing at join");
     };
-    push_beacon(&mut session, wpa2);
+    push_beacon(&mut session);
     let joined = run(session.scan_passive(&[CHANNEL]))
         .ok()
         .and_then(|report| report.bss.into_iter().next())
@@ -547,7 +376,6 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
             if bss.bssid != AP || bss.ssid != SSID {
                 return None;
             }
-            push_join_replies(&mut session, wpa2);
             let security = if wpa2 {
                 crate::mt7921::association::Security::Wpa2Psk { psk: PSK }
             } else {
@@ -561,7 +389,10 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
         put_session(session);
         return TestResult::Fail("scan/association did not complete");
     };
-    if aid != 42 || !matches!(session.state, State::Associated { .. }) {
+    if aid != 42
+        || !matches!(session.state, State::Associated { .. })
+        || session.backend.access_point.as_ref().map(FakeAp::phase) != Some(ApPhase::Authorized)
+    {
         put_session(session);
         return TestResult::Fail("associated state/aid mismatch");
     }
@@ -569,8 +400,8 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
 
     // ── Carrier up, exactly where `Mt76Iface::associate` raises it:
     // after the association (and 4-way) has completed.
-    if !narf_net::iface::set_link_state(name, true)
-        || !narf_net::iface::lookup(name).is_some_and(|snap| snap.link_up)
+    if !crate::iface::publish_link(name, true)
+        || !narf_net::iface::lookup(name).is_some_and(|snap| snap.link_up && snap.carrier)
     {
         return TestResult::Fail("carrier did not come up after association");
     }
@@ -582,20 +413,15 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
         Ok(lease) => lease,
         Err(_) => return TestResult::Fail("DHCP did not complete over the associated link"),
     };
-    if lease.addr.0 != LEASE_IP
-        || lease.netmask.0 != NETMASK
-        || lease.gateway.map(|gateway| gateway.0) != Some(SERVER_IP)
-        || lease.dns.len() != 1
-        || lease.dns[0].0 != SERVER_IP
-        || lease.lease_seconds != LEASE_SECS
-    {
+    if !NETWORK.matches_lease(&lease) {
         return TestResult::Fail("lease terms differ from the server's offer");
     }
 
     // ── Wire evidence at the AP: a DISCOVER and a REQUEST arrived
     // as data frames, protected iff the link is WPA2.
     if let Some(harness) = HARNESS.lock().as_ref() {
-        if !harness.saw_discover || !harness.saw_request {
+        let seen = harness.server.observations();
+        if seen.discovers != 1 || seen.requests != 1 {
             return TestResult::Fail("AP did not observe the full DISCOVER/REQUEST exchange");
         }
         let session = harness.session.as_ref().expect("session parked");
@@ -658,32 +484,15 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
     if rx_packets(name) <= rx_before {
         return TestResult::Fail("post-lease downlink never entered stack RX dispatch");
     }
+    if !HARNESS
+        .lock()
+        .as_ref()
+        .is_some_and(|h| h.received.contains(&downlink))
+    {
+        return TestResult::Fail("post-lease native downlink changed Ethernet bytes");
+    }
 
     TestResult::Pass
-}
-
-/// The DHCP message type (option 53) of an Ethernet frame, if it is
-/// a DHCP client→server datagram at all.
-fn dhcp_message_type(eth: &[u8]) -> Option<u8> {
-    if eth.len() < 42 || eth[12..14] != [0x08, 0x00] {
-        return None;
-    }
-    let ip = &eth[14..];
-    let ihl = usize::from(ip[0] & 0x0f) * 4;
-    if ihl < 20 || ip[9] != 17 || ip.len() < ihl + 8 {
-        return None;
-    }
-    let udp = &ip[ihl..];
-    if u16::from_be_bytes([udp[2], udp[3]]) != 67 {
-        return None;
-    }
-    let payload = &udp[8..];
-    if payload.len() < 240 || narf_net::pkt_dhcp::DhcpHeader::decode(payload).is_err() {
-        return None;
-    }
-    narf_net::pkt_dhcp::iter_options(&payload[240..])
-        .find(|option| option.tag == 53 && option.data.len() == 1)
-        .map(|option| option.data[0])
 }
 
 fn rx_packets(name: &str) -> u64 {

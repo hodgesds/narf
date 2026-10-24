@@ -2461,6 +2461,7 @@ dependencies = [
  "narf-power",
  "narf-scheduler",
  "narf-time",
+ "narf-wifi-fixtures",
  "narf-wireless",
  "zeroize",
 ]
@@ -2489,6 +2490,7 @@ dependencies = [
  "narf-net",
  "narf-scheduler",
  "narf-time",
+ "narf-wifi-fixtures",
  "narf-wireless",
  "zeroize",
 ]
@@ -3225,6 +3227,17 @@ dependencies = [
  "narf-tracing",
  "narf-userspace",
  "narf-wireless",
+]
+
+[[package]]
+name = "narf-wifi-fixtures"
+version = "0.0.0"
+dependencies = [
+ "narf-crypto",
+ "narf-kernel-test",
+ "narf-net",
+ "narf-wireless",
+ "zeroize",
 ]
 
 [[package]]

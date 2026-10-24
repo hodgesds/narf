@@ -83,6 +83,11 @@ longer resolves to a live owner/device context. Dispatch copies the hook out
 under the registry lock and invokes it after releasing the lock, matching the
 re-entry rules of `register`.
 
+Removing an interface also discards its IPv4 address, mask, gateway and DNS
+binding, along with its UDP socket state and pending ARP work. Re-registering
+the same name starts without the removed device's binding; another
+interface's configuration is unaffected.
+
 ### 3.2 Frame rings
 
 ```rust

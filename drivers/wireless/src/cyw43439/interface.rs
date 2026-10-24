@@ -217,6 +217,7 @@ impl<R: Fullmac + 'static> Device<R> {
         let up = peer.is_some();
         let was_up = self.up.swap(up, Ordering::AcqRel);
         narf_net::iface::set_link_state(&self.name, up);
+        narf_net::iface::set_link_metadata(&self.name, up, None, None);
         if was_up && !up {
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
@@ -631,3 +632,7 @@ impl<R: Fullmac + 'static> Interface for Registered<R> {
         self.0.tx_ring()
     }
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "interface_dhcp_tests.rs"]
+mod dhcp_composition_tests;

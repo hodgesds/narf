@@ -37,6 +37,9 @@ impl Bus {
             disconnect_error: false,
         }
     }
+    pub(in crate::cyw43439) fn set_secured(&mut self, secured: bool) {
+        self.secured = secured;
+    }
     pub(in crate::cyw43439) fn queue(&mut self, channel: u8, maximum: u8, payload: &[u8]) {
         self.rx
             .push_back(packet(self.sequence, channel, maximum, payload));
