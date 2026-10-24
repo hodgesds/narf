@@ -276,3 +276,76 @@ kernel_test_in!(
     "syscall_abi/fault_write/memfs",
     smoke_memfs_fault_then_write
 );
+
+/// The btrfs driver's own fixture image (`NARFBTR1` sparse encoding),
+/// shared with `drivers/fs/btrfs`' test suite.
+const BTRFS_FIXTURE_SPARSE: &[u8] =
+    include_bytes!("../../drivers/fs/btrfs/testdata/fixture.img.sparse");
+
+/// Reconstruct the full zero-filled image from the sparse encoding
+/// (a copy of `drivers/fs/btrfs`' `decode_sparse`).
+pub(crate) fn btrfs_decode_sparse(sparse: &[u8]) -> alloc::vec::Vec<u8> {
+    use alloc::vec;
+    assert!(
+        sparse.len() >= 20 && &sparse[0..8] == b"NARFBTR1",
+        "bad fixture magic"
+    );
+    let total = u64::from_le_bytes(sparse[8..16].try_into().unwrap()) as usize;
+    let n_runs = u32::from_le_bytes(sparse[16..20].try_into().unwrap()) as usize;
+    let mut img = vec![0u8; total];
+    let mut p = 20usize;
+    for _ in 0..n_runs {
+        let off = u64::from_le_bytes(sparse[p..p + 8].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(sparse[p + 8..p + 16].try_into().unwrap()) as usize;
+        p += 16;
+        img[off..off + len].copy_from_slice(&sparse[p..p + len]);
+        p += len;
+    }
+    img
+}
+
+/// Mount the btrfs fixture and seed `narf.txt` with `seed` through
+/// the driver's own create/write path.
+pub(crate) fn btrfs_volume_with_file(
+    seed: &[u8],
+) -> Result<Arc<narf_drivers_fs_btrfs::volume::BtrfsVolume<RamBlockDevice>>, &'static str> {
+    let device = RamBlockDevice::from_image(512, btrfs_decode_sparse(BTRFS_FIXTURE_SPARSE));
+    let volume = crate::handlers::poll_io_to_completion(
+        narf_drivers_fs_btrfs::volume::BtrfsVolume::mount(device, narf_lib::id::DomainId::DRIVER_0),
+    )
+    .and_then(|r| r.ok())
+    .ok_or("mounting the test btrfs fixture failed")?;
+    let file = crate::handlers::poll_io_to_completion(volume.root().create("narf.txt"))
+        .and_then(|r| r.ok())
+        .ok_or("creating narf.txt on the btrfs fixture failed")?;
+    let written = crate::handlers::poll_io_to_completion(file.write(0, seed))
+        .and_then(|r| r.ok())
+        .ok_or("seeding narf.txt failed")?;
+    if written != seed.len() {
+        return Err("seeding narf.txt was short");
+    }
+    Ok(volume)
+}
+
+fn btrfs_open(
+    volume: &Arc<narf_drivers_fs_btrfs::volume::BtrfsVolume<RamBlockDevice>>,
+) -> Result<Arc<dyn FileOps>, &'static str> {
+    crate::handlers::poll_io_to_completion(volume.root().lookup_async("narf.txt"))
+        .and_then(|r| r.ok())
+        .ok_or("lookup of narf.txt failed")
+}
+
+/// The #724 sequence on btrfs (#742): btrfs bumps the (tree, inode)
+/// generation in the shared core before engine mutations, keyed
+/// independently of which node object writes, so the fold lands.
+fn smoke_btrfs_fault_then_write() -> TestResult {
+    with_two_opens(
+        || btrfs_volume_with_file(&content(3 * PAGE as usize - 100)),
+        btrfs_open,
+        scenario_fault_then_write,
+    )
+}
+kernel_test_in!(
+    "syscall_abi/fault_write/btrfs",
+    smoke_btrfs_fault_then_write
+);

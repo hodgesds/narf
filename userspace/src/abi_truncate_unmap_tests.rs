@@ -348,3 +348,26 @@ fn smoke_truncate_unmap_fat() -> TestResult {
     )
 }
 kernel_test_in!("syscall_abi/truncate_unmap/fat", smoke_truncate_unmap_fat);
+
+fn smoke_truncate_unmap_btrfs() -> TestResult {
+    with_file(
+        || {
+            let volume = crate::abi_fault_write_tests::btrfs_volume_with_file(&content(
+                3 * PAGE as usize - 100,
+            ))?;
+            let file =
+                crate::handlers::poll_io_to_completion(volume.root().lookup_async("narf.txt"))
+                    .and_then(|r| r.ok())
+                    .ok_or("lookup of narf.txt failed")?;
+            Ok(file)
+        },
+        // btrfs holes (dropped extents, never-allocated ranges) read
+        // back as zeros, so a regrown range faults in as zero pages.
+        true,
+        run_scenario,
+    )
+}
+kernel_test_in!(
+    "syscall_abi/truncate_unmap/btrfs",
+    smoke_truncate_unmap_btrfs
+);
