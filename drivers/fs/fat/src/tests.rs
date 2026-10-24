@@ -713,6 +713,93 @@ kernel_test_in!(
     smoke_fat_truncate_grow_extends_chain_and_reads_zero
 );
 
+fn smoke_fat_rename_open_node_stamps_own_entry() -> TestResult {
+    // #697 regression: sync_metadata stamps size/first-cluster into
+    // the directory slot the node was minted with, unconditionally.
+    // Rename moves the entry to a new slot and tombstones the old
+    // one; the next create reuses the tombstoned slot — and a
+    // grow-write through the still-open pre-rename node then stamped
+    // the renamed file's size and cluster chain into the NEW file's
+    // directory entry, orphaning the new file's own chain.
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    let img = build_fat12_image(256, &[]);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    // A.TXT in root slot 0 (this fixture's root sector is LBA 3,
+    // 16 entries per sector, so slot 0 reports ino 48).
+    let node_a = match poll_once(root.create("A.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create A.TXT failed"),
+    };
+    if node_a.ino() != 48 {
+        return TestResult::Fail("A.TXT did not land in root slot 0");
+    }
+    if !matches!(poll_once(node_a.write(0, b"hello")), Some(Ok(5))) {
+        return TestResult::Fail("seed write through A failed");
+    }
+
+    // Rename A -> B: B's entry lands in slot 1, slot 0 is tombstoned.
+    if !matches!(poll_once(root.rename("A.TXT", "B.TXT")), Some(Ok(()))) {
+        return TestResult::Fail("rename A.TXT -> B.TXT failed");
+    }
+
+    // C.TXT reuses the tombstoned slot 0.
+    let node_c = match poll_once(root.create("C.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create C.TXT failed"),
+    };
+    if node_c.ino() != 48 {
+        return TestResult::Fail("C.TXT did not reuse root slot 0");
+    }
+
+    // Grow-write through the still-open pre-rename node. Its
+    // metadata sync must land in B's entry (slot 1), not C's.
+    if !matches!(poll_once(node_a.write(5, b" world, renamed")), Some(Ok(15))) {
+        return TestResult::Fail("grow write through pre-rename node failed");
+    }
+
+    // C is untouched: still empty, and a fresh lookup agrees.
+    if node_c.stat().size != 0 {
+        return TestResult::Fail("C.TXT size changed by a write through the renamed node");
+    }
+    let fresh_c = match poll_once(root.lookup_async("C.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup C.TXT failed"),
+    };
+    if fresh_c.stat().size != 0 {
+        return TestResult::Fail("C.TXT on-disk entry was stamped with the renamed file's size");
+    }
+
+    // B carries the full grown content.
+    let fresh_b = match poll_once(root.lookup_async("B.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup B.TXT failed"),
+    };
+    if fresh_b.stat().size != 20 {
+        return TestResult::Fail("B.TXT on-disk size did not follow the pre-rename node's write");
+    }
+    let mut buf = [0u8; 20];
+    match poll_once(fresh_b.read(0, &mut buf)) {
+        Some(Ok(20)) if &buf == b"hello world, renamed" => {}
+        _ => return TestResult::Fail("B.TXT content mismatch after rename + grow"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_rename_open_node_stamps_own_entry
+);
+
 // ── Timestamps ──────────────────────────────────────────────────────
 //
 // Linux `fat_fill_inode` (vfat): mtime = ctime = `fat_time_fat2unix`

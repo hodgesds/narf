@@ -48,7 +48,12 @@ pub struct FatNode<B: BlockDevice> {
     pub volume: Arc<FatVolume<B>>,
     dcache_cluster: u32,
     pub state: IrqSafeSpinLock<FatNodeState>,
-    pub entry_location: Option<(u64, usize)>, // (LBA, offset in sector)
+    /// Shared locator for this file's directory entry — `(LBA,
+    /// offset in sector)` as currently keyed on the volume — or
+    /// `None` for the root. Shared across every node of the file and
+    /// re-keyed by `rename` / detached by `unlink`, so a metadata
+    /// sync never stamps a slot the entry has moved away from (#697).
+    entry_locator: Option<Arc<crate::volume::EntryLocator>>,
     /// This file's volume-anchored `MAP_SHARED` identity, resolved
     /// once from the volume's anchor table (see
     /// `FatVolume::mmap_anchor`). Every node minted for the same
@@ -288,6 +293,9 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         times: FatTimes,
         entry_location: Option<(u64, usize)>,
     ) -> Self {
+        // Resolve the shared locator while the volume is at hand:
+        // all nodes minted for one entry share it (see EntryLocator).
+        let entry_locator = entry_location.map(|(lba, offset)| volume.entry_locator(lba, offset));
         Self {
             volume,
             dcache_cluster: first_cluster,
@@ -296,9 +304,17 @@ impl<B: BlockDevice + 'static> FatNode<B> {
                 stat,
                 times,
             }),
-            entry_location,
+            entry_locator,
             mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
+    }
+
+    /// This file's directory-entry position as currently keyed, or
+    /// `None` for the root and for a file unlinked while open.
+    fn entry_location(&self) -> Option<(u64, usize)> {
+        self.entry_locator
+            .as_ref()
+            .and_then(|locator| locator.get())
     }
 
     /// Device plus exact times; ctime is mtime (one shared on-disk field).
@@ -328,7 +344,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
     /// directory), and the same on every lookup.
     pub fn inode_number(&self) -> u64 {
         const MSDOS_ROOT_INO: u64 = 1;
-        match self.entry_location {
+        match self.entry_location() {
             None => MSDOS_ROOT_INO,
             Some((lba, offset)) => {
                 let entries_per_sector =
@@ -378,7 +394,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
     /// that location in the volume, so every node minted for the same
     /// on-disk file reports the same value.
     fn cache_generation(&self) -> Option<u64> {
-        let (lba, offset) = self.entry_location?;
+        let (lba, offset) = self.entry_location()?;
         if self.state.lock().stat.mode.file_type != FileType::File {
             return None;
         }
@@ -391,7 +407,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
     /// costs a retained page its reuse, never correctness.
     fn note_content_mutation(&self) {
         if self.cache_generation().is_some() {
-            let (lba, offset) = self.entry_location.expect("gated above");
+            let (lba, offset) = self.entry_location().expect("gated above");
             self.volume.bump_cache_generation(lba, offset);
         }
     }
@@ -733,7 +749,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
     }
 
     pub async fn sync_metadata(&self) -> Result<(), FsError> {
-        let (lba, offset) = match self.entry_location {
+        let (lba, offset) = match self.entry_location() {
             Some(loc) => loc,
             None => return Ok(()),
         };
@@ -1134,7 +1150,7 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
     /// per-object identity, which is safe because it reports no cache
     /// generation and never enters the retained set.
     fn mmap_backing_identity(&self) -> usize {
-        match self.entry_location {
+        match self.entry_location() {
             Some((lba, offset)) => {
                 let anchor = self
                     .mmap_anchor
@@ -1444,6 +1460,10 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
                     // cache pages no longer describe what a read
                     // through that node would return.
                     self.volume.bump_cache_generation(lba, offset);
+                    // The entry is gone: detach its locator so a
+                    // still-open node never stamps metadata into
+                    // this slot's next tenant (#697).
+                    self.volume.detach_entry_locator((lba, offset));
                     let first = entry.first_cluster();
                     if first >= 2 {
                         self.free_chain(first).await?;
@@ -1474,6 +1494,9 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
                         }
                     }
                     self.tombstone_slot(lba, offset).await?;
+                    // The directory's entry is gone: detach its
+                    // locator like unlink does (#697).
+                    self.volume.detach_entry_locator((lba, offset));
                     let first = entry.first_cluster();
                     if first >= 2 {
                         self.free_chain(first).await?;
@@ -1547,6 +1570,13 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
             self.volume.bump_cache_generation(old_lba, old_offset);
             self.volume
                 .bump_cache_generation(new_sfn_lba, new_sfn_offset);
+            // The entry moved: re-key the shared locator so the
+            // file's still-open nodes stamp the NEW slot. Without
+            // this, a grow-write through a pre-rename node stamped
+            // the tombstoned slot — by then possibly a new file's
+            // entry (#697).
+            self.volume
+                .move_entry_locator((old_lba, old_offset), (new_sfn_lba, new_sfn_offset));
             Ok(())
         })
     }
