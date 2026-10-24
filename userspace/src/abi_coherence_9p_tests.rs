@@ -169,6 +169,14 @@ fn smoke_9p_external_change_invalidates_retained_pages() -> TestResult {
         if mapped_bytes(&fx.aspace, base + PAGE, 32)? != seed[PAGE as usize..PAGE as usize + 32] {
             return Err("the faulted page does not show the seed bytes");
         }
+        // Pin the scenario's second premise before the change: the
+        // backing identity reported by an open minted now. If the
+        // identity ever became version-dependent, the fresh open
+        // after the change would miss the retained page by key and
+        // fill from the server — this smoke would pass with the
+        // generation fold never exercised.
+        let ops_before = open_narf(&fx.volume)?;
+        let identity_before = ops_before.mmap_backing_identity();
         // The server-side file changes behind the client's back;
         // `replace_data` bumps the qid version like a real server's
         // write from another client would.
@@ -180,6 +188,9 @@ fn smoke_9p_external_change_invalidates_retained_pages() -> TestResult {
         // through it must fill from the server, not from the page
         // retained under the old generation.
         let ops2 = open_narf(&fx.volume)?;
+        if ops2.mmap_backing_identity() != identity_before {
+            return Err("the backing identity moved across the external change");
+        }
         let fd2 = install_fd(&ops2)?;
         let base2 = map_shared(fd2, 3 * PAGE)?;
         fault(&fx.aspace, base2 + PAGE)?;
