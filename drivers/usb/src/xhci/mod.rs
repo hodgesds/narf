@@ -2857,7 +2857,7 @@ impl Xhci {
                 )
             };
             let (new_enq, new_pcs) = Self::canonical_cursor(CTRL_TR_TRBS, enq, pcs);
-            let target = ring + (new_enq as u64) * 16 | u64::from(new_pcs & 1);
+            let target = (ring + (new_enq as u64) * 16) | u64::from(new_pcs & 1);
             device.endpoint_configuration = true;
             (claim, target, new_enq, new_pcs)
         };
