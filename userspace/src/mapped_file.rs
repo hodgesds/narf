@@ -1984,9 +1984,14 @@ fn trim_advice_records_for_file(identity: usize) {
 /// recorded batch, restore the whole batch: consume the record and
 /// install the current owner's extent of it as ONE
 /// `AddressSpace::demand_alloc_range` batch (#737 step 2), returning
-/// `true`. Returns `false` — record untouched — when no batch covers
-/// the fault or the restore is declined, so the caller falls back to
-/// the fixed fault-around window.
+/// `true`. Returns `false` when no batch covers the fault or the
+/// restore is declined, so the caller falls back to the fixed
+/// fault-around window. Consumption is on attempt: a covering
+/// record is removed the moment it is found, before the owner
+/// re-check below, so a decline past that point (owner row gone or
+/// replaced, file shrunk past the fault) has still consumed it —
+/// the record was stale, and leaving it would only re-decline on
+/// every later fault in the range.
 ///
 /// The extent is re-derived against the *current* mapping state, not
 /// the record's memory of it: the owner row serving the faulting page
@@ -2015,16 +2020,23 @@ fn restore_recorded_batch(address_space_id: u64, fault_page: u64) -> bool {
     let Some(records) = existing_advice_records(address_space_id) else {
         return false;
     };
-    let index = {
-        let records = records.lock();
-        records
+    // Find-and-remove under ONE lock acquisition: the fault hook is
+    // invoked with no lock held, so a concurrent fault in this space
+    // — or a madvise/munmap/mprotect scrub from another CPU — can
+    // mutate this Vec at any moment. An index computed under an
+    // earlier acquisition could name a different record by the time
+    // it is used, or fall out of bounds and panic in `Vec::remove`
+    // on the fault path.
+    let record = {
+        let mut records = records.lock();
+        let Some(index) = records
             .iter()
             .position(|record| fault_page >= record.base && fault_page - record.base < record.len)
+        else {
+            return false;
+        };
+        records.remove(index)
     };
-    let Some(index) = index else {
-        return false;
-    };
-    let record = records.lock().remove(index);
     let Some(bucket) = existing_mapping_owners(address_space_id) else {
         return false;
     };
