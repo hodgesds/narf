@@ -1615,6 +1615,70 @@ kernel_test_in!(
     smoke_scheduler_address_space_handoff_reconciles_in_poll_replace
 );
 
+/// Regression for #721: the current-task fast path of
+/// `replace_address_space` panicked with "current user task missing
+/// active address space" when the current task had no published
+/// address space. The poll prelude moves `slot.addr_space` into
+/// ACTIVE_USER_AS verbatim, so a kernel task polls with an empty cell
+/// while `current_task_slot()` names it — and the execve
+/// loads-then-bails-without-a-user-ctx path reaches the swap in
+/// exactly that state. The swap must still publish the replacement
+/// and retire nothing: a task with no AS holds no live-task count to
+/// transfer (spawn attaches only for user slots), and the count
+/// taken on the replacement is retired by the poll epilogue's slot
+/// reconciliation and final slot Drop. Before the fix this test's
+/// poll died in the panic.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_scheduler_replace_address_space_from_task_without_as() -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use narf_memory::AddressSpace;
+
+    static RETURNED_NONE: AtomicBool = AtomicBool::new(false);
+    static PUBLISHED: AtomicBool = AtomicBool::new(false);
+    RETURNED_NONE.store(false, Ordering::Relaxed);
+    PUBLISHED.store(false, Ordering::Relaxed);
+
+    crate::__reset_queues_for_test();
+    // SAFETY: paging is live in the kernel-test environment.
+    let replacement =
+        Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc replacement AS"));
+    let replacement_weak = Arc::downgrade(&replacement);
+    let replacement_for_poll = Arc::clone(&replacement);
+
+    // A kernel task: its slot carries no address space, so its poll
+    // publishes an empty ACTIVE_USER_AS cell — the #721 state.
+    crate::spawn(async move {
+        let prev = crate::replace_address_space(
+            crate::current_task_id(),
+            Arc::clone(&replacement_for_poll),
+        );
+        RETURNED_NONE.store(prev.is_none(), Ordering::Relaxed);
+        let published = crate::current_address_space()
+            .is_some_and(|active| Arc::ptr_eq(&active, &replacement_for_poll));
+        PUBLISHED.store(published, Ordering::Relaxed);
+    });
+    crate::run_until_empty();
+
+    drop(replacement);
+    if !RETURNED_NONE.load(Ordering::Relaxed) {
+        return TestResult::Fail("replace from a task without an AS returned a previous AS");
+    }
+    if !PUBLISHED.load(Ordering::Relaxed) {
+        return TestResult::Fail("replace did not publish the replacement as the active AS");
+    }
+    if replacement_weak.upgrade().is_some() {
+        return TestResult::Fail("completed task retained the replacement address space");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_replace_address_space_from_task_without_as
+);
+
 // ── relocated from verification ──
 
 fn smoke_sleep_future_waits() -> TestResult {

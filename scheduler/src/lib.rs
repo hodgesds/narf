@@ -3846,10 +3846,22 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
             *g = Some(new_arc.clone());
             previous
         };
-        previous_active
-            .as_ref()
-            .expect("current user task missing active address space")
-            .scheduler_detach_user_task();
+        // Detach the displaced publication's liveness reference — but
+        // only when one was actually published. The poll prelude moves
+        // `slot.addr_space` into the cell verbatim, so a slot with no
+        // address space (kernel tasks; synthetic test tasks) polls with
+        // the cell empty while `current_task_slot()` names it, and a
+        // task contributes a live-task count only through a user slot's
+        // spawn attach. An empty cell therefore means there is no
+        // displaced root and no reference to retire: the count taken on
+        // `new_arc` above is owned by this publication and is retired
+        // by the poll epilogue's slot reconciliation and final slot
+        // Drop (or, in synthetic contexts that bypass the epilogue, by
+        // `__test_clear_published_address_space`). The ready-queue path
+        // below tolerates a missing previous AS the same way.
+        if let Some(previous) = previous_active.as_ref() {
+            previous.scheduler_detach_user_task();
+        }
         let mut p = PENDING_SLOT_AS[task_affinity_shard(id)].lock();
         let prev = p
             .iter()
