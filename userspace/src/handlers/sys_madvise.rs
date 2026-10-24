@@ -200,6 +200,11 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
         MADV_WILLNEED => {
             if as_ref.range_fully_mapped(base, len) {
                 crate::mapped_file::populate_mapped_range(as_ref.identity(), base.as_u64(), len);
+                // Record the batch (#737 step 2): if these pages are
+                // later evicted, the first fault inside the range
+                // restores the whole recorded range in one bulk
+                // operation instead of the fixed fault-around window.
+                crate::mapped_file::record_advice_range(as_ref.identity(), base.as_u64(), len);
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
                 ctx.set_return(errno_ret(ENOMEM));
