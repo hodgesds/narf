@@ -112,11 +112,19 @@ pub struct NarfSmpCrypto;
 impl NarfSmpCrypto {
     fn fill_random(out: &mut [u8]) {
         for _ in 0..8 {
-            if narf_crypto::try_fill_random_bytes(out).is_ok() {
+            if Self::fill_once(out).is_ok() {
                 return;
             }
         }
         out.fill(0);
+    }
+
+    fn fill_once(out: &mut [u8]) -> Result<(), narf_crypto::CryptoError> {
+        #[cfg(any(test, feature = "kernel-test"))]
+        if let Some(result) = test_entropy::fill(out) {
+            return result;
+        }
+        narf_crypto::try_fill_random_bytes(out)
     }
 
     fn reverse32(input: &[u8; 32]) -> [u8; 32] {
@@ -185,6 +193,68 @@ impl smp::SmpCrypto for NarfSmpCrypto {
         let mut out = [0u8; 16];
         Self::fill_random(&mut out);
         out
+    }
+}
+
+/// Test-only entropy seam for [`NarfSmpCrypto`], compiled only for
+/// test / kernel-test builds (same pattern as [`__test_reset`]).
+///
+/// The production SMP fixtures need two entropy regimes the
+/// hardware source cannot be asked for on demand: a deterministic
+/// nonzero stream (so a fixture exchange runs the real keygen /
+/// ECDH path rather than the degenerate zero-key one, whatever the
+/// host CPU advertises) and a hard failure (to pin the fail-closed
+/// zero-fill in `fill_random`). Installing a mode replaces
+/// `narf_crypto::try_fill_random_bytes` for this adapter only;
+/// clearing restores the hardware source. Fixtures must clear what
+/// they install — `__test_reset` also clears, so a leaked install
+/// cannot poison a later fixture that resets first.
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod test_entropy {
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    #[derive(Copy, Clone, Debug)]
+    enum Mode {
+        /// Every fill fails, as a dead hardware source does.
+        Fail,
+        /// Deterministic xorshift64* stream (state must be nonzero).
+        Stream(u64),
+    }
+
+    static STATE: IrqSafeSpinLock<Option<Mode>> = IrqSafeSpinLock::new(None);
+
+    /// Make every subsequent fill fail with `EntropyUnavailable`.
+    pub fn install_fail() {
+        *STATE.lock() = Some(Mode::Fail);
+    }
+
+    /// Make subsequent fills serve a deterministic nonzero stream.
+    pub fn install_stream(seed: u64) {
+        *STATE.lock() = Some(Mode::Stream(seed | 1));
+    }
+
+    /// Restore the hardware entropy source.
+    pub fn clear() {
+        *STATE.lock() = None;
+    }
+
+    /// `Some` when a test mode is installed: the fill result to use
+    /// in place of the hardware source.
+    pub(super) fn fill(out: &mut [u8]) -> Option<Result<(), narf_crypto::CryptoError>> {
+        let mut state = STATE.lock();
+        match &mut *state {
+            None => None,
+            Some(Mode::Fail) => Some(Err(narf_crypto::CryptoError::EntropyUnavailable)),
+            Some(Mode::Stream(s)) => {
+                for b in out.iter_mut() {
+                    *s ^= *s >> 12;
+                    *s ^= *s << 25;
+                    *s ^= *s >> 27;
+                    *b = (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
+                }
+                Some(Ok(()))
+            }
+        }
     }
 }
 
@@ -945,14 +1015,22 @@ pub fn pump_once(index: usize) -> PumpStep {
     let mut pumps = PUMPS.lock();
     if let Some(slot) = find_slot_mut(&mut pumps, index) {
         slot.core = Some(core);
-        slot.stats = final_stats;
+        // Merge this step's fan-out drops into the cumulative total
+        // before publishing the slot stats. `final_stats` comes from
+        // the core, which never observes fan-out drops (the core's
+        // own `socket_events_dropped` is always 0), so assigning it
+        // after counting — or without carrying the slot's running
+        // total over — would reset the counter on every step.
+        let mut merged = final_stats;
+        merged.socket_events_dropped = slot.stats.socket_events_dropped;
         for frame in socket_frames {
             if slot.socket_events.len() >= SOCKET_EVENT_QUEUE_CAP {
                 slot.socket_events.pop_front();
-                slot.stats.socket_events_dropped += 1;
+                merged.socket_events_dropped += 1;
             }
             slot.socket_events.push_back(frame);
         }
+        slot.stats = merged;
     }
     step
 }
@@ -961,6 +1039,8 @@ pub fn pump_once(index: usize) -> PumpStep {
 pub fn __test_reset() {
     PUMPS.lock().clear();
     SPAWN_ENABLED.store(false, Ordering::Release);
+    #[cfg(any(test, feature = "kernel-test"))]
+    test_entropy::clear();
 }
 
 // ── Fixtures: fake HCI controller conversations ─────────────────────
@@ -1225,4 +1305,927 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_reset_nak_fails_closed);
+
+    // ── Independent peer model for the production SMP crypto ─────
+    //
+    // The fixtures below drive the PRODUCTION construction
+    // `Responder<NarfSmpCrypto>` through complete LE Secure
+    // Connections exchanges and assert the cryptographic results
+    // byte-for-byte. The expected values are computed by this peer
+    // model, which re-implements — from the public specifications
+    // only — everything a real peer performs: P-256 field/curve
+    // arithmetic (FIPS 186-4 / SEC 2), AES-128 (FIPS 197), AES-CMAC
+    // (RFC 4493), and the SMP f5 / g2 derivations (Core 5.3 Vol 3
+    // Part H §2.2), all in SMP wire (little-endian) order.
+    //
+    // INDEPENDENCE: the model shares no code with narf-crypto, with
+    // the `NarfSmpCrypto` adapter, or with the SMP state machine —
+    // nothing is fed back. If the adapter's LE↔BE reversal (or its
+    // CMAC passthrough) is wrong, the model's DHKey / LTK / g2
+    // values disagree with the responder's and the assertions fail;
+    // the error cannot cancel out. The model anchors itself with
+    // self-checks against universally published constants (the
+    // P-256 generator and group order, the FIPS-197 AES vector, the
+    // RFC 4493 CMAC vectors) and reports those failures with a
+    // distinct message, so a model bug cannot masquerade as a
+    // production failure.
+    //
+    // SCOPE NOTE: this state machine's Just-Works flow has no
+    // Pairing Confirm PDU (smp.rs: Just Works skips the confirm
+    // exchange) and its DHKey Check PDU carries the zero value by
+    // design — no f4/f6 value ever crosses the wire. The byte-exact
+    // crypto assertions therefore target the values that actually
+    // carry the cryptography: the ECDH DHKey, the f5-derived LTK,
+    // and the g2 numeric-comparison value (computed by the
+    // responder when Numeric Comparison is negotiated). The DHKey
+    // Check PDU's exact wire bytes are pinned as emitted.
+
+    /// Field element mod the P-256 prime, little-endian limbs.
+    type Fe = [u64; 4];
+
+    const FE_P: Fe = [
+        0xFFFF_FFFF_FFFF_FFFF,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0x0000_0000_FFFF_FFFF,
+        0xFFFF_FFFF_0000_0001,
+    ];
+    const FE_P_MINUS_2: Fe = [
+        0xFFFF_FFFF_FFFF_FFFD,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0x0000_0000_FFFF_FFFF,
+        0xFFFF_FFFF_0000_0001,
+    ];
+    const FE_B: Fe = [
+        0x3BCE_3C3E_27D2_604B,
+        0x651D_06B0_CC53_B0F6,
+        0xB3EB_BD55_7698_86BC,
+        0x5AC6_35D8_AA3A_93E7,
+    ];
+    const ORDER_N: Fe = [
+        0xF3B9_CAC2_FC63_2551,
+        0xBCE6_FAAD_A717_9E84,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0xFFFF_FFFF_0000_0000,
+    ];
+    const GEN_X: Fe = [
+        0xF4A1_3945_D898_C296,
+        0x7703_7D81_2DEB_33A0,
+        0xF8BC_E6E5_63A4_40F2,
+        0x6B17_D1F2_E12C_4247,
+    ];
+    const GEN_Y: Fe = [
+        0xCBB6_4068_37BF_51F5,
+        0x2BCE_3357_6B31_5ECE,
+        0x8EE7_EB4A_7C0F_9E16,
+        0x4FE3_42E2_FE1A_7F9B,
+    ];
+
+    fn fe_adc(a: &Fe, b: &Fe) -> (Fe, u64) {
+        let mut out = [0u64; 4];
+        let mut carry = 0u128;
+        for (o, (x, y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+            let t = u128::from(*x) + u128::from(*y) + carry;
+            *o = t as u64;
+            carry = t >> 64;
+        }
+        (out, carry as u64)
+    }
+
+    fn fe_sbb(a: &Fe, b: &Fe) -> (Fe, u64) {
+        let mut out = [0u64; 4];
+        let mut borrow = 0u64;
+        for (o, (x, y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+            let (d1, b1) = x.overflowing_sub(*y);
+            let (d2, b2) = d1.overflowing_sub(borrow);
+            *o = d2;
+            borrow = u64::from(b1 || b2);
+        }
+        (out, borrow)
+    }
+
+    fn fe_add(a: &Fe, b: &Fe) -> Fe {
+        let (s, carry) = fe_adc(a, b);
+        let (d, borrow) = fe_sbb(&s, &FE_P);
+        // a + b < 2p always; subtract p exactly when the sum
+        // reached it (borrow == 0) or overflowed 256 bits (carry).
+        if carry == 1 || borrow == 0 {
+            d
+        } else {
+            s
+        }
+    }
+
+    fn fe_sub(a: &Fe, b: &Fe) -> Fe {
+        let (d, borrow) = fe_sbb(a, b);
+        if borrow == 1 {
+            fe_adc(&d, &FE_P).0
+        } else {
+            d
+        }
+    }
+
+    fn fe_is_zero(a: &Fe) -> bool {
+        a.iter().all(|x| *x == 0)
+    }
+
+    /// Bit-serial double-and-add multiply: slow, and correct by
+    /// construction — the right trade for a fixture model.
+    fn fe_mul(a: &Fe, b: &Fe) -> Fe {
+        let mut r: Fe = [0; 4];
+        for i in (0..256).rev() {
+            r = fe_add(&r, &r);
+            if (b[i >> 6] >> (i & 63)) & 1 == 1 {
+                r = fe_add(&r, a);
+            }
+        }
+        r
+    }
+
+    /// Fermat inversion: a^(p-2) mod p.
+    fn fe_inv(a: &Fe) -> Fe {
+        let mut r: Fe = [1, 0, 0, 0];
+        for i in (0..256).rev() {
+            r = fe_mul(&r, &r);
+            if (FE_P_MINUS_2[i >> 6] >> (i & 63)) & 1 == 1 {
+                r = fe_mul(&r, a);
+            }
+        }
+        r
+    }
+
+    fn fe_from_be(bytes: &[u8; 32]) -> Fe {
+        let mut out = [0u64; 4];
+        for (i, limb) in out.iter_mut().enumerate() {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&bytes[8 * (3 - i)..8 * (3 - i) + 8]);
+            *limb = u64::from_be_bytes(w);
+        }
+        out
+    }
+
+    fn fe_to_be(a: &Fe) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, limb) in a.iter().enumerate() {
+            out[8 * (3 - i)..8 * (3 - i) + 8].copy_from_slice(&limb.to_be_bytes());
+        }
+        out
+    }
+
+    /// SMP wire order is little-endian: reverse the FIPS form.
+    fn fe_from_wire(wire: &[u8; 32]) -> Fe {
+        let mut be = *wire;
+        be.reverse();
+        fe_from_be(&be)
+    }
+
+    fn fe_to_wire(a: &Fe) -> [u8; 32] {
+        let mut b = fe_to_be(a);
+        b.reverse();
+        b
+    }
+
+    /// Jacobian point; the point at infinity is any with z == 0.
+    #[derive(Copy, Clone, Debug)]
+    struct Jac {
+        x: Fe,
+        y: Fe,
+        z: Fe,
+    }
+
+    const JAC_INF: Jac = Jac {
+        x: [0; 4],
+        y: [0; 4],
+        z: [0; 4],
+    };
+
+    /// Doubling for a = -3 (the "dbl-2001-b" shape).
+    fn jac_double(p: &Jac) -> Jac {
+        let delta = fe_mul(&p.z, &p.z);
+        let gamma = fe_mul(&p.y, &p.y);
+        let beta = fe_mul(&p.x, &gamma);
+        let t = fe_mul(&fe_sub(&p.x, &delta), &fe_add(&p.x, &delta));
+        let alpha = fe_add(&fe_add(&t, &t), &t);
+        let beta2 = fe_add(&beta, &beta);
+        let beta4 = fe_add(&beta2, &beta2);
+        let beta8 = fe_add(&beta4, &beta4);
+        let x3 = fe_sub(&fe_mul(&alpha, &alpha), &beta8);
+        let yz = fe_add(&p.y, &p.z);
+        let z3 = fe_sub(&fe_sub(&fe_mul(&yz, &yz), &gamma), &delta);
+        let gamma2 = fe_mul(&gamma, &gamma);
+        let g2x = fe_add(&gamma2, &gamma2);
+        let g4x = fe_add(&g2x, &g2x);
+        let g8x = fe_add(&g4x, &g4x);
+        let y3 = fe_sub(&fe_mul(&alpha, &fe_sub(&beta4, &x3)), &g8x);
+        Jac {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// General addition ("add-2007-bl" shape).
+    fn jac_add(p: &Jac, q: &Jac) -> Jac {
+        if fe_is_zero(&p.z) {
+            return *q;
+        }
+        if fe_is_zero(&q.z) {
+            return *p;
+        }
+        let z1z1 = fe_mul(&p.z, &p.z);
+        let z2z2 = fe_mul(&q.z, &q.z);
+        let u1 = fe_mul(&p.x, &z2z2);
+        let u2 = fe_mul(&q.x, &z1z1);
+        let s1 = fe_mul(&fe_mul(&p.y, &q.z), &z2z2);
+        let s2 = fe_mul(&fe_mul(&q.y, &p.z), &z1z1);
+        if u1 == u2 {
+            if s1 != s2 {
+                return JAC_INF;
+            }
+            return jac_double(p);
+        }
+        let h = fe_sub(&u2, &u1);
+        let hh = fe_add(&h, &h);
+        let i = fe_mul(&hh, &hh);
+        let j = fe_mul(&h, &i);
+        let r0 = fe_sub(&s2, &s1);
+        let r = fe_add(&r0, &r0);
+        let v = fe_mul(&u1, &i);
+        let x3 = fe_sub(&fe_sub(&fe_mul(&r, &r), &j), &fe_add(&v, &v));
+        let s1j = fe_mul(&s1, &j);
+        let y3 = fe_sub(&fe_mul(&r, &fe_sub(&v, &x3)), &fe_add(&s1j, &s1j));
+        let zz = fe_add(&p.z, &q.z);
+        let z3 = fe_mul(&fe_sub(&fe_sub(&fe_mul(&zz, &zz), &z1z1), &z2z2), &h);
+        Jac {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    fn jac_to_affine(p: &Jac) -> Option<(Fe, Fe)> {
+        if fe_is_zero(&p.z) {
+            return None;
+        }
+        let zinv = fe_inv(&p.z);
+        let zinv2 = fe_mul(&zinv, &zinv);
+        let zinv3 = fe_mul(&zinv2, &zinv);
+        Some((fe_mul(&p.x, &zinv2), fe_mul(&p.y, &zinv3)))
+    }
+
+    fn jac_scalar_mul(k: &Fe, px: &Fe, py: &Fe) -> Jac {
+        let base = Jac {
+            x: *px,
+            y: *py,
+            z: [1, 0, 0, 0],
+        };
+        let mut top = 256usize;
+        while top > 0 && (k[(top - 1) >> 6] >> ((top - 1) & 63)) & 1 == 0 {
+            top -= 1;
+        }
+        let mut r = JAC_INF;
+        for i in (0..top).rev() {
+            r = jac_double(&r);
+            if (k[i >> 6] >> (i & 63)) & 1 == 1 {
+                r = jac_add(&r, &base);
+            }
+        }
+        r
+    }
+
+    fn peer_on_curve(x: &Fe, y: &Fe) -> bool {
+        let lhs = fe_mul(y, y);
+        let x2 = fe_mul(x, x);
+        let x3 = fe_mul(&x2, x);
+        let three_x = fe_add(&fe_add(x, x), x);
+        let rhs = fe_add(&fe_sub(&x3, &three_x), &FE_B);
+        lhs == rhs
+    }
+
+    fn peer_public(priv_scalar: &Fe) -> (Fe, Fe) {
+        jac_to_affine(&jac_scalar_mul(priv_scalar, &GEN_X, &GEN_Y))
+            .expect("a nonzero scalar yields a point")
+    }
+
+    /// The peer's DHKey, in SMP wire order, from its own scalar and
+    /// the responder's wire public key.
+    fn peer_dhkey_wire(priv_scalar: &Fe, pub_wire_x: &[u8; 32], pub_wire_y: &[u8; 32]) -> [u8; 32] {
+        let x = fe_from_wire(pub_wire_x);
+        let y = fe_from_wire(pub_wire_y);
+        let shared = jac_scalar_mul(priv_scalar, &x, &y);
+        let (sx, _) = jac_to_affine(&shared).expect("ECDH yields a point");
+        fe_to_wire(&sx)
+    }
+
+    // ── Fixture AES-128 (FIPS 197) ───────────────────────────────
+
+    fn gf_mul8(mut a: u8, mut b: u8) -> u8 {
+        let mut p = 0u8;
+        for _ in 0..8 {
+            if b & 1 != 0 {
+                p ^= a;
+            }
+            let hi = a & 0x80;
+            a <<= 1;
+            if hi != 0 {
+                a ^= 0x1B;
+            }
+            b >>= 1;
+        }
+        p
+    }
+
+    /// The S-box is generated, not tabulated: affine transform of
+    /// the GF(2^8) inverse, so no 256-entry table can be mistyped.
+    fn build_sbox() -> [u8; 256] {
+        let mut s = [0u8; 256];
+        for (i, v) in s.iter_mut().enumerate() {
+            let x = i as u8;
+            let inv = if x == 0 {
+                0
+            } else {
+                let mut r = 1u8;
+                let mut base = x;
+                let mut e = 254u16;
+                while e > 0 {
+                    if e & 1 == 1 {
+                        r = gf_mul8(r, base);
+                    }
+                    base = gf_mul8(base, base);
+                    e >>= 1;
+                }
+                r
+            };
+            *v = inv
+                ^ inv.rotate_left(1)
+                ^ inv.rotate_left(2)
+                ^ inv.rotate_left(3)
+                ^ inv.rotate_left(4)
+                ^ 0x63;
+        }
+        s
+    }
+
+    fn aes_sub_bytes(sbox: &[u8; 256], state: &mut [u8; 16]) {
+        for b in state.iter_mut() {
+            *b = sbox[usize::from(*b)];
+        }
+    }
+
+    fn aes_shift_rows(state: &mut [u8; 16]) {
+        let old = *state;
+        for r in 0..4 {
+            for c in 0..4 {
+                state[r + 4 * c] = old[r + 4 * ((c + r) % 4)];
+            }
+        }
+    }
+
+    fn aes_mix_columns(state: &mut [u8; 16]) {
+        for c in 0..4 {
+            let a0 = state[4 * c];
+            let a1 = state[4 * c + 1];
+            let a2 = state[4 * c + 2];
+            let a3 = state[4 * c + 3];
+            state[4 * c] = gf_mul8(a0, 2) ^ gf_mul8(a1, 3) ^ a2 ^ a3;
+            state[4 * c + 1] = a0 ^ gf_mul8(a1, 2) ^ gf_mul8(a2, 3) ^ a3;
+            state[4 * c + 2] = a0 ^ a1 ^ gf_mul8(a2, 2) ^ gf_mul8(a3, 3);
+            state[4 * c + 3] = gf_mul8(a0, 3) ^ a1 ^ a2 ^ gf_mul8(a3, 2);
+        }
+    }
+
+    fn aes128_encrypt(sbox: &[u8; 256], key: &[u8; 16], input: &[u8; 16]) -> [u8; 16] {
+        // Key expansion (FIPS 197 §5.2), 11 round keys.
+        let mut w = [0u8; 176];
+        w[..16].copy_from_slice(key);
+        let mut rcon = 1u8;
+        for i in 4..44 {
+            let mut t = [
+                w[4 * (i - 1)],
+                w[4 * (i - 1) + 1],
+                w[4 * (i - 1) + 2],
+                w[4 * (i - 1) + 3],
+            ];
+            if i % 4 == 0 {
+                t = [
+                    sbox[usize::from(t[1])] ^ rcon,
+                    sbox[usize::from(t[2])],
+                    sbox[usize::from(t[3])],
+                    sbox[usize::from(t[0])],
+                ];
+                rcon = gf_mul8(rcon, 2);
+            }
+            for j in 0..4 {
+                w[4 * i + j] = w[4 * (i - 4) + j] ^ t[j];
+            }
+        }
+        let mut state = *input;
+        for i in 0..16 {
+            state[i] ^= w[i];
+        }
+        for round in 1..10 {
+            aes_sub_bytes(sbox, &mut state);
+            aes_shift_rows(&mut state);
+            aes_mix_columns(&mut state);
+            for i in 0..16 {
+                state[i] ^= w[16 * round + i];
+            }
+        }
+        aes_sub_bytes(sbox, &mut state);
+        aes_shift_rows(&mut state);
+        for i in 0..16 {
+            state[i] ^= w[160 + i];
+        }
+        state
+    }
+
+    // ── Fixture AES-CMAC (RFC 4493) ──────────────────────────────
+
+    fn cmac_dbl(b: &[u8; 16]) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        let mut carry = 0u8;
+        for i in (0..16).rev() {
+            let c = b[i] >> 7;
+            out[i] = (b[i] << 1) | carry;
+            carry = c;
+        }
+        if b[0] >> 7 == 1 {
+            out[15] ^= 0x87;
+        }
+        out
+    }
+
+    fn peer_cmac(sbox: &[u8; 256], key: &[u8; 16], msg: &[u8]) -> [u8; 16] {
+        let l = aes128_encrypt(sbox, key, &[0u8; 16]);
+        let k1 = cmac_dbl(&l);
+        let k2 = cmac_dbl(&k1);
+        let block_count = if msg.is_empty() {
+            1
+        } else {
+            msg.len().div_ceil(16)
+        };
+        let complete = !msg.is_empty() && msg.len() % 16 == 0;
+        let mut last = [0u8; 16];
+        if complete {
+            last.copy_from_slice(&msg[16 * (block_count - 1)..16 * block_count]);
+            for (lb, kb) in last.iter_mut().zip(k1.iter()) {
+                *lb ^= kb;
+            }
+        } else {
+            let rem: &[u8] = if msg.is_empty() {
+                &[]
+            } else {
+                &msg[16 * (block_count - 1)..]
+            };
+            last[..rem.len()].copy_from_slice(rem);
+            last[rem.len()] = 0x80;
+            for (lb, kb) in last.iter_mut().zip(k2.iter()) {
+                *lb ^= kb;
+            }
+        }
+        let mut x = [0u8; 16];
+        for n in 0..block_count - 1 {
+            for (xb, mb) in x.iter_mut().zip(msg[16 * n..16 * n + 16].iter()) {
+                *xb ^= mb;
+            }
+            x = aes128_encrypt(sbox, key, &x);
+        }
+        for (xb, lb) in x.iter_mut().zip(last.iter()) {
+            *xb ^= lb;
+        }
+        aes128_encrypt(sbox, key, &x)
+    }
+
+    /// f5 (Core 5.3 Vol 3 Part H §2.2.7): the LTK half, keyed on
+    /// the DHKey in SMP wire order, exactly as the machine derives
+    /// it — but computed with the fixture CMAC.
+    fn peer_f5_ltk(
+        sbox: &[u8; 256],
+        dhkey_wire: &[u8; 32],
+        na: &[u8; 16],
+        nb: &[u8; 16],
+        a1: &[u8; 7],
+        a2: &[u8; 7],
+    ) -> [u8; 16] {
+        const SALT: [u8; 16] = [
+            0x6C, 0x88, 0x83, 0x91, 0xAA, 0xF5, 0xA5, 0x38, 0x60, 0x37, 0x0B, 0xDB, 0x5A, 0x60,
+            0x83, 0xBE,
+        ];
+        let t = peer_cmac(sbox, &SALT, dhkey_wire);
+        let mut buf = [0u8; 53];
+        buf[0] = 0x01; // counter 1 → LTK (counter 0 is the MacKey)
+        buf[1..5].copy_from_slice(b"btle");
+        buf[5..21].copy_from_slice(na);
+        buf[21..37].copy_from_slice(nb);
+        buf[37..44].copy_from_slice(a1);
+        buf[44..51].copy_from_slice(a2);
+        buf[51] = 0x01;
+        buf[52] = 0x00;
+        peer_cmac(sbox, &t, &buf)
+    }
+
+    /// g2 (Core 5.3 Vol 3 Part H §2.2.8), mirroring the formula the
+    /// state machine's `numeric_comparison_value` documents, with
+    /// the fixture CMAC.
+    fn peer_g2(
+        sbox: &[u8; 256],
+        initiator_pk_x_wire: &[u8; 32],
+        responder_pk_x_wire: &[u8; 32],
+        na: &[u8; 16],
+        nb: &[u8; 16],
+    ) -> u32 {
+        let mut data = [0u8; 80];
+        data[0..32].copy_from_slice(initiator_pk_x_wire);
+        data[32..64].copy_from_slice(responder_pk_x_wire);
+        data[64..80].copy_from_slice(nb);
+        let mac = peer_cmac(sbox, na, &data);
+        u32::from_be_bytes([mac[12], mac[13], mac[14], mac[15]]) % 1_000_000
+    }
+
+    /// Anchor the model against published constants. A failure
+    /// here indicts the fixture, never the production code — the
+    /// messages say so.
+    fn peer_model_self_check(sbox: &[u8; 256]) -> Result<(), &'static str> {
+        // AES-128: FIPS 197 worked example.
+        let key: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
+        ];
+        let pt: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        let want: [u8; 16] = [
+            0x69, 0xC4, 0xE0, 0xD8, 0x6A, 0x7B, 0x04, 0x30, 0xD8, 0xCD, 0xB7, 0x80, 0x70, 0xB4,
+            0xC5, 0x5A,
+        ];
+        if aes128_encrypt(sbox, &key, &pt) != want {
+            return Err("peer model self-check failed: AES-128 FIPS-197 vector");
+        }
+        // AES-CMAC: RFC 4493 examples 1 (empty) and 2 (one block).
+        let ck: [u8; 16] = [
+            0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6, 0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF,
+            0x4F, 0x3C,
+        ];
+        if peer_cmac(sbox, &ck, &[])
+            != [
+                0xBB, 0x1D, 0x69, 0x29, 0xE9, 0x59, 0x37, 0x28, 0x7F, 0xA3, 0x7D, 0x12, 0x9B, 0x75,
+                0x67, 0x46,
+            ]
+        {
+            return Err("peer model self-check failed: CMAC RFC 4493 empty-message vector");
+        }
+        let m2: [u8; 16] = [
+            0x6B, 0xC1, 0xBE, 0xE2, 0x2E, 0x40, 0x9F, 0x96, 0x88, 0x2D, 0x8E, 0x5F, 0x45, 0xA8,
+            0x97, 0x6A,
+        ];
+        if peer_cmac(sbox, &ck, &m2)
+            != [
+                0x07, 0x0A, 0x16, 0xB4, 0x6B, 0x4D, 0x41, 0x44, 0xF7, 0x9B, 0xDD, 0x9D, 0xD0, 0x4A,
+                0x28, 0x7C,
+            ]
+        {
+            return Err("peer model self-check failed: CMAC RFC 4493 one-block vector");
+        }
+        // P-256 anchors: 1·G = G, n·G = O, (n−1)·G = −G.
+        let one: Fe = [1, 0, 0, 0];
+        if jac_to_affine(&jac_scalar_mul(&one, &GEN_X, &GEN_Y)) != Some((GEN_X, GEN_Y)) {
+            return Err("peer model self-check failed: 1*G is not the generator");
+        }
+        if jac_to_affine(&jac_scalar_mul(&ORDER_N, &GEN_X, &GEN_Y)).is_some() {
+            return Err("peer model self-check failed: n*G is not infinity");
+        }
+        let n_minus_1: Fe = [ORDER_N[0] - 1, ORDER_N[1], ORDER_N[2], ORDER_N[3]];
+        let neg_g = (GEN_X, fe_sub(&[0, 0, 0, 0], &GEN_Y));
+        if jac_to_affine(&jac_scalar_mul(&n_minus_1, &GEN_X, &GEN_Y)) != Some(neg_g) {
+            return Err("peer model self-check failed: (n-1)*G is not -G");
+        }
+        Ok(())
+    }
+
+    const SMP_IAT: [u8; 7] = [0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    const SMP_RAT: [u8; 7] = [0, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    const SMP_NA: [u8; 16] = [
+        0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE,
+        0xAF,
+    ];
+
+    /// What one driven exchange produced: the responder (LTK and
+    /// DHKey already asserted against the peer model inside
+    /// `run_production_exchange`), the two public-key X coordinates
+    /// as they crossed the wire, and the responder's nonce.
+    struct ExchangeOutcome {
+        responder: Responder<NarfSmpCrypto>,
+        peer_pk_x: [u8; 32],
+        resp_pk_x: [u8; 32],
+        nb: [u8; 16],
+    }
+
+    /// Drive one full exchange against `Responder<NarfSmpCrypto>`
+    /// (the production construction `route_smp` uses) with the
+    /// deterministic entropy stream installed. Returns the
+    /// responder plus its emitted public-key wire bytes so each
+    /// fixture asserts the phase it owns.
+    fn run_production_exchange(
+        sbox: &[u8; 256],
+        initiator_io: u8,
+        initiator_auth: u8,
+        peer_priv: &Fe,
+    ) -> Result<ExchangeOutcome, &'static str> {
+        let mut r = Responder::new(NarfSmpCrypto, SMP_IAT, SMP_RAT);
+        let req = smp::PairingFeatureExchange {
+            io_capability: initiator_io,
+            oob_data_flag: 0,
+            auth_req: initiator_auth,
+            max_encryption_key_size: 16,
+            initiator_key_distribution: 0,
+            responder_key_distribution: 0,
+        }
+        .encode(smp::SMP_PAIRING_REQUEST);
+        let rsp = r
+            .feed(&req)
+            .map_err(|_| "responder rejected the pairing request")?
+            .ok_or("responder emitted no pairing response")?;
+        if rsp.code != smp::SMP_PAIRING_RESPONSE || rsp.payload != [0x01, 0x00, 0x0D, 16, 0, 0] {
+            return Err("pairing response payload is not the responder feature set");
+        }
+        // Public Key exchange: the peer's key comes from the
+        // independent model; the responder's must be a real point
+        // whose ECDH agrees with the model bit-for-bit.
+        let (ppx, ppy) = peer_public(peer_priv);
+        let peer_pk_x_wire = fe_to_wire(&ppx);
+        let mut pk_payload = Vec::with_capacity(64);
+        pk_payload.extend_from_slice(&peer_pk_x_wire);
+        pk_payload.extend_from_slice(&fe_to_wire(&ppy));
+        let our_pk = r
+            .feed(&smp::Pdu {
+                code: smp::SMP_PAIRING_PUBLIC_KEY,
+                payload: pk_payload,
+            })
+            .map_err(|_| "responder rejected the peer public key")?
+            .ok_or("responder emitted no public key")?;
+        if our_pk.code != smp::SMP_PAIRING_PUBLIC_KEY || our_pk.payload.len() != 64 {
+            return Err("responder public key PDU shape wrong");
+        }
+        let mut resp_pk_x = [0u8; 32];
+        let mut resp_pk_y = [0u8; 32];
+        resp_pk_x.copy_from_slice(&our_pk.payload[0..32]);
+        resp_pk_y.copy_from_slice(&our_pk.payload[32..64]);
+        if resp_pk_x == [0u8; 32] && resp_pk_y == [0u8; 32] {
+            return Err("responder emitted a zero public key (entropy seam not live)");
+        }
+        if resp_pk_x != r.pub_x || resp_pk_y != r.pub_y {
+            return Err("public key PDU does not carry the responder keypair");
+        }
+        if !peer_on_curve(&fe_from_wire(&resp_pk_x), &fe_from_wire(&resp_pk_y)) {
+            return Err("responder public key is not a P-256 point");
+        }
+        let peer_dh = peer_dhkey_wire(peer_priv, &resp_pk_x, &resp_pk_y);
+        if r.dh_key != peer_dh {
+            return Err("DHKey mismatch: production ECDH disagrees with the independent peer");
+        }
+        if r.state != smp::ResponderState::SentPublicKey {
+            return Err("responder did not advance to SentPublicKey");
+        }
+        // Pairing Random: Na in, Nb out; LTK is derived here.
+        let nb_pdu = r
+            .feed(&smp::Pdu {
+                code: smp::SMP_PAIRING_RANDOM,
+                payload: SMP_NA.to_vec(),
+            })
+            .map_err(|_| "responder rejected the pairing random")?
+            .ok_or("responder emitted no pairing random")?;
+        if nb_pdu.code != smp::SMP_PAIRING_RANDOM || nb_pdu.payload.len() != 16 {
+            return Err("pairing random PDU shape wrong");
+        }
+        let mut nb = [0u8; 16];
+        nb.copy_from_slice(&nb_pdu.payload);
+        if nb != r.nb {
+            return Err("pairing random PDU does not carry the responder nonce");
+        }
+        if nb == [0u8; 16] {
+            return Err("responder nonce is zero (entropy seam not live)");
+        }
+        let want_ltk = peer_f5_ltk(sbox, &peer_dh, &SMP_NA, &nb, &SMP_IAT, &SMP_RAT);
+        if r.ltk != want_ltk {
+            return Err("LTK mismatch: production f5/CMAC disagrees with the independent peer");
+        }
+        if r.ltk == [0u8; 16] {
+            return Err("derived LTK is zero");
+        }
+        Ok(ExchangeOutcome {
+            responder: r,
+            peer_pk_x: peer_pk_x_wire,
+            resp_pk_x,
+            nb,
+        })
+    }
+
+    /// Complete Just-Works exchange against the production SMP
+    /// crypto, byte-exact on the DHKey and the f5 LTK via the
+    /// independent peer model.
+    fn smoke_pump_smp_production_crypto_full_exchange() -> TestResult {
+        reset_all();
+        let sbox = build_sbox();
+        if let Err(m) = peer_model_self_check(&sbox) {
+            return TestResult::Fail(m);
+        }
+        test_entropy::install_stream(0x0123_4567_89AB_CDEF);
+        let result = run_production_exchange(
+            &sbox,
+            smp::IoCapability::NoInputNoOutput as u8,
+            smp::AUTH_BONDING | smp::AUTH_SC,
+            &[0x5A5A_5A5A_5A5A_5A5A; 4],
+        )
+        .and_then(|mut out| {
+            let r = &mut out.responder;
+            if r.method != smp::PairingMethod::JustWorks {
+                return Err("negotiated method is not Just Works");
+            }
+            // DHKey Check: this machine's Just-Works check value is
+            // the zero placeholder (see the model note above); pin
+            // its exact wire bytes and the terminal state.
+            let check = r
+                .feed(&smp::Pdu {
+                    code: smp::SMP_PAIRING_DHKEY_CHECK,
+                    payload: alloc::vec![0x99; 16],
+                })
+                .map_err(|_| "responder rejected the DHKey check")?
+                .ok_or("responder emitted no DHKey check")?;
+            if check.code != smp::SMP_PAIRING_DHKEY_CHECK || check.payload != [0u8; 16] {
+                return Err("DHKey check PDU is not the machine's zero check value");
+            }
+            if r.state != smp::ResponderState::Done {
+                return Err("responder did not reach Done");
+            }
+            Ok(())
+        });
+        test_entropy::clear();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(m) => TestResult::Fail(m),
+        }
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_smp_production_crypto_full_exchange
+    );
+
+    /// Numeric Comparison run: the responder computes the g2 value
+    /// with the production CMAC during the random exchange; assert
+    /// it byte-exact against the independent model.
+    fn smoke_pump_smp_production_crypto_numeric_comparison() -> TestResult {
+        reset_all();
+        let sbox = build_sbox();
+        if let Err(m) = peer_model_self_check(&sbox) {
+            return TestResult::Fail(m);
+        }
+        test_entropy::install_stream(0x0FED_CBA9_8765_4321);
+        let result = run_production_exchange(
+            &sbox,
+            smp::IoCapability::KeyboardDisplay as u8,
+            smp::AUTH_BONDING | smp::AUTH_SC | smp::AUTH_MITM,
+            &[0x3C3C_3C3C_3C3C_3C3C; 4],
+        )
+        .and_then(|out| {
+            let r = &out.responder;
+            if r.method != smp::PairingMethod::NumericComparison {
+                return Err("negotiated method is not Numeric Comparison");
+            }
+            let want = peer_g2(&sbox, &out.peer_pk_x, &out.resp_pk_x, &SMP_NA, &out.nb);
+            if r.numeric_comparison != Some(want) {
+                return Err("g2 mismatch: production CMAC disagrees with the independent peer");
+            }
+            Ok(())
+        });
+        test_entropy::clear();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(m) => TestResult::Fail(m),
+        }
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_smp_production_crypto_numeric_comparison
+    );
+
+    /// Fail-closed entropy: with the source dead, the adapter must
+    /// emit NO key material — keygen collapses to the all-zero
+    /// point-at-infinity encoding, the nonce is zero, and a
+    /// responder built on it puts zeros on the wire, so no peer
+    /// could ever accept the pairing. Nothing is fabricated.
+    fn smoke_pump_smp_entropy_failure_emits_no_key_material() -> TestResult {
+        reset_all();
+        test_entropy::install_fail();
+        let result = run_entropy_failure();
+        test_entropy::clear();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(m) => TestResult::Fail(m),
+        }
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_smp_entropy_failure_emits_no_key_material
+    );
+
+    fn run_entropy_failure() -> Result<(), &'static str> {
+        let crypto = NarfSmpCrypto;
+        let (priv_k, pub_x, pub_y) = <NarfSmpCrypto as smp::SmpCrypto>::p256_keygen(&crypto);
+        if priv_k != [0u8; 32] || pub_x != [0u8; 32] || pub_y != [0u8; 32] {
+            return Err("dead entropy produced non-zero key material");
+        }
+        if <NarfSmpCrypto as smp::SmpCrypto>::rand128(&crypto) != [0u8; 16] {
+            return Err("dead entropy produced a non-zero nonce");
+        }
+        // A responder on the dead source: feature exchange still
+        // works (it needs no secrets), but everything secret it
+        // would emit is zero.
+        let mut r = Responder::new(NarfSmpCrypto, SMP_IAT, SMP_RAT);
+        let req = smp::PairingFeatureExchange {
+            io_capability: smp::IoCapability::NoInputNoOutput as u8,
+            oob_data_flag: 0,
+            auth_req: smp::AUTH_BONDING | smp::AUTH_SC,
+            max_encryption_key_size: 16,
+            initiator_key_distribution: 0,
+            responder_key_distribution: 0,
+        }
+        .encode(smp::SMP_PAIRING_REQUEST);
+        if r.feed(&req).is_err() {
+            return Err("responder rejected the pairing request");
+        }
+        let mut pk_payload = Vec::with_capacity(64);
+        pk_payload.extend_from_slice(&fe_to_wire(&GEN_X));
+        pk_payload.extend_from_slice(&fe_to_wire(&GEN_Y));
+        let our_pk = r
+            .feed(&smp::Pdu {
+                code: smp::SMP_PAIRING_PUBLIC_KEY,
+                payload: pk_payload,
+            })
+            .map_err(|_| "responder rejected the peer public key")?
+            .ok_or("responder emitted no public key")?;
+        if our_pk.payload != [0u8; 64] {
+            return Err("responder emitted key material with a dead entropy source");
+        }
+        if r.dh_key != [0u8; 32] {
+            return Err("DHKey is non-zero with a dead entropy source");
+        }
+        let nb_pdu = r
+            .feed(&smp::Pdu {
+                code: smp::SMP_PAIRING_RANDOM,
+                payload: SMP_NA.to_vec(),
+            })
+            .map_err(|_| "responder rejected the pairing random")?
+            .ok_or("responder emitted no pairing random")?;
+        if nb_pdu.payload != [0u8; 16] {
+            return Err("responder emitted a non-zero nonce with a dead entropy source");
+        }
+        Ok(())
+    }
+
+    /// `socket_events_dropped` must accumulate across steps: four
+    /// undrained steps of 64 events fill the 128-deep fan-out queue
+    /// in two steps, then drop 64 per step — 128 total, held
+    /// cumulatively in the published stats (not last-step-only).
+    /// Kept separate from the conversation smoke because that one
+    /// pins its exact step counts and drains the queue.
+    fn smoke_pump_socket_event_drops_accumulate() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let peer = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        for _ in 0..4 {
+            for _ in 0..64 {
+                fake.enqueue_event(le_connection_complete(0x0040, peer));
+            }
+            if pump_once(0).events != 64 {
+                reset_all();
+                return TestResult::Fail("pump step did not drain its 64 events");
+            }
+        }
+        let st = stats(0);
+        let totals_ok = st.map(|s| s.events_seen) == Some(256)
+            && st.map(|s| s.socket_events_dropped) == Some(128);
+        let mut drained = 0usize;
+        while take_socket_event(0).is_some() {
+            drained += 1;
+        }
+        reset_all();
+        if !totals_ok {
+            return TestResult::Fail("socket_events_dropped did not accumulate across steps");
+        }
+        if drained != SOCKET_EVENT_QUEUE_CAP {
+            return TestResult::Fail("socket queue did not hold exactly the cap");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_socket_event_drops_accumulate);
 }
