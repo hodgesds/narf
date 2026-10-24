@@ -16,7 +16,7 @@
 //! `memory/src/bpf_arena.rs`'s `Arena::drop` names the test that pins it.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -1181,7 +1181,64 @@ fn current_address_space_id() -> Option<u64> {
 /// entered from the page-fault handler. `address_space_id` comes from the
 /// owning `AddressSpace`, not the CPU's currently active user root: ptrace may
 /// fault a stopped tracee's file-backed page while the tracer's root is live.
+/// What a resolved generic shared fault can tell the fault-around
+/// expansion: the owner row that served it. Only the generic path
+/// produces one — a private copy and a direct-provider page have no
+/// cache window to widen into.
+struct FaultExpansion {
+    owner_base: u64,
+    owner_len: u64,
+    ops: Arc<dyn FileOps>,
+    offset: u64,
+}
+
+/// The single-page fault hook installed in `narf-memory`: resolve one
+/// page through [`demand_frame_inner`], then — for a generic shared
+/// fault only — widen it through [`fault_around`]. The expansion lives
+/// here, in the single-page entry, and never in the fill core: that is
+/// what makes bulk faulting acyclic (see `demand_alloc_range` in
+/// `narf-memory` and [`demand_frames_batch`] below).
 pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
+    let (phys, expansion) = demand_frame_inner(address_space_id, vaddr)?;
+    if let Some(expansion) = expansion {
+        fault_around(
+            address_space_id,
+            vaddr & !0xFFF,
+            expansion.owner_base,
+            expansion.owner_len,
+            &expansion.ops,
+            expansion.offset,
+        );
+    }
+    Ok(phys)
+}
+
+/// The batch fill hook installed in `narf-memory` beside
+/// [`demand_frame`]: supply frames for a run of pages a bulk fault
+/// claimed, through the same fill core, one page at a time. A page
+/// that cannot be supplied keeps its zero slot — a per-page refusal
+/// the batch skips. Fill-only by construction: this path never calls
+/// [`demand_frame`] (so it never expands a window) and never installs
+/// a leaf, so a batch fill cannot re-enter the fault machinery.
+pub(crate) fn demand_frames_batch(address_space_id: u64, first_vaddr: u64, out: &mut [u64]) {
+    for (index, slot) in out.iter_mut().enumerate() {
+        let vaddr = first_vaddr.saturating_add((index as u64).saturating_mul(4096));
+        if let Ok((phys, _)) = demand_frame_inner(address_space_id, vaddr) {
+            *slot = phys;
+        }
+    }
+}
+
+/// Resolve one page for a demand fault, returning the frame and, for a
+/// generic shared fault, the [`FaultExpansion`] the caller may widen.
+/// Fill-only: this function never expands a window and never installs
+/// a leaf — it is the whole of what `demand_frame` did before
+/// fault-around existed, shared by the single-page hook and the batch
+/// fill hook.
+fn demand_frame_inner(
+    address_space_id: u64,
+    vaddr: u64,
+) -> Result<(u64, Option<FaultExpansion>), FileFaultError> {
     let page = vaddr & !0xFFFu64;
     let owner_bucket = existing_mapping_owners(address_space_id).ok_or(FileFaultError::NoOwner)?;
     let (offset, ops, generic_fallback, private_copy, zero_from, owner_base, owner_len) = {
@@ -1225,7 +1282,7 @@ pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, Fil
                 }
             }
         }
-        return Ok(phys.raw());
+        return Ok((phys.raw(), None));
     }
     if !generic_fallback {
         // `filemap_fault`: an I/O-backed direct provider returns Pending with
@@ -1234,7 +1291,8 @@ pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, Fil
         // waker fires; it does not spin on a folio owned by another task.
         return crate::handlers::poll_io_to_completion(ops.mmap_fault_async(offset))
             .ok_or(FileFaultError::Bus)?
-            .map_err(fault_error);
+            .map_err(fault_error)
+            .map(|phys| (phys, None));
     }
 
     // Linux filemap_fault first looks in the inode page cache, then reads a
@@ -1302,47 +1360,25 @@ pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, Fil
         debug_assert!(released);
         return Err(FileFaultError::NoOwner);
     }
-    // The faulting page is fully published and no lock is held: widen the
-    // win for a sequential reader by installing the surrounding window
-    // before the fault returns (`do_fault_around`, #734).
-    fault_around(address_space_id, page, owner_base, owner_len, &ops, offset);
-    Ok(phys.raw())
+    // The faulting page is fully published and no lock is held. Report
+    // the owner row so the caller (`demand_frame`) can widen the win
+    // for a sequential reader before the fault returns
+    // (`do_fault_around`, #734) — the expansion itself lives there,
+    // never in this fill core.
+    Ok((
+        phys.raw(),
+        Some(FaultExpansion {
+            owner_base,
+            owner_len,
+            ops,
+            offset,
+        }),
+    ))
 }
 
 /// Linux's `fault_around_bytes` (64 KiB): the window one fault tries to
 /// make resident around itself, the faulting page included.
 const FAULT_AROUND_PAGES: u64 = 16;
-
-/// Address spaces whose fault-around expansion is currently running.
-///
-/// [`fault_around`] installs neighbours through
-/// `AddressSpace::demand_alloc_page`, and every one of those calls
-/// re-enters [`demand_frame`] through the fault hook. Without this set
-/// the nested fault would expand a window around itself in turn, and the
-/// recursion would stop only at the mapping's edge. The set is keyed by
-/// address space — not CPU or task — because a faulting task parked on
-/// I/O can resume on another CPU, while a sibling thread's fault on the
-/// same space merely skips expansion for its duration, which costs
-/// nothing: expansion is advisory.
-static FAULT_AROUND_ACTIVE: IrqSafeSpinLock<BTreeSet<u64>> = IrqSafeSpinLock::new(BTreeSet::new());
-
-/// RAII removal for [`FAULT_AROUND_ACTIVE`]: every expansion exit —
-/// including an early return — must release the address space, or
-/// fault-around would stay disabled there for the space's lifetime.
-struct FaultAroundGuard(u64);
-
-impl Drop for FaultAroundGuard {
-    fn drop(&mut self) {
-        FAULT_AROUND_ACTIVE.lock().remove(&self.0);
-    }
-}
-
-fn fault_around_enter(address_space_id: u64) -> Option<FaultAroundGuard> {
-    if !FAULT_AROUND_ACTIVE.lock().insert(address_space_id) {
-        return None;
-    }
-    Some(FaultAroundGuard(address_space_id))
-}
 
 /// `mm/filemap.c::do_fault_around`: after a generic shared fault has
 /// resolved its page, install a bounded window of neighbours so a
@@ -1355,25 +1391,31 @@ fn fault_around_enter(address_space_id: u64) -> Option<FaultAroundGuard> {
 /// a page at or past EOF can only SIGBUS, so there is nothing to install
 /// for it, and a mapping may legitimately extend past EOF.
 ///
-/// Each neighbour is installed through `AddressSpace::demand_alloc_page`
-/// — the same ticketed fault path a real touch takes, and the entry
-/// `mlock` population already drives page by page — so an installed
-/// neighbour is indistinguishable from a faulted one: same claim
-/// discipline (a peer mid-fault on that page makes the call a no-op),
-/// same cache fill, same generation stamp, same writeback registration.
-/// The nested `demand_frame` that each call drives is kept from
-/// expanding in turn by [`FAULT_AROUND_ACTIVE`]. Every result is
-/// deliberately discarded: a neighbour that cannot be installed (racing
-/// unmap, reclaim pressure, a fill error) fails silently and its next
-/// real touch faults it in the ordinary way. Only the faulting page's
-/// own outcome, already decided by the caller, is ever reported, so a
-/// fill error here can never fail the original fault.
+/// The window is installed by ONE `AddressSpace::demand_alloc_range`
+/// call (#737): the batch claims the whole window atomically, fills it
+/// through the batch hook ([`demand_frames_batch`] — this fault path's
+/// own fill core, so an installed neighbour carries the same cache
+/// fill, generation stamp, and writeback registration as a faulted
+/// page), and publishes each page through the single fault's own
+/// transaction. The batch skips the faulting page itself — its ticket
+/// is held by the fault that triggered this — and any page a peer is
+/// mid-fault on. As landed in #736 this loop instead drove
+/// `demand_alloc_page` once per neighbour behind a recursion guard
+/// (`FAULT_AROUND_ACTIVE`), because every call re-entered
+/// [`demand_frame`] and would expand in turn; the batch's fill cannot
+/// re-enter the fault path at all, so the guard's reason for existing
+/// is gone and the guard is deleted, not bypassed. The result is
+/// deliberately discarded: a neighbour that cannot be installed
+/// (racing unmap, reclaim pressure, a fill error) fails silently and
+/// its next real touch faults it in the ordinary way. Only the
+/// faulting page's own outcome, already decided by the caller, is ever
+/// reported, so a fill error here can never fail the original fault.
 ///
-/// Installation needs the faulting space's page-table root live on this
-/// CPU — the normal-fault case `demand_alloc_page`'s contract names.
-/// When the space active here is a different one (a ptrace remote access
-/// faulting a stopped tracee's page through this hook), expansion is
-/// skipped and the fault keeps its single-page service.
+/// Installation needs the faulting space's page-table root live on
+/// this CPU — the batch's safety contract, as it was for the per-page
+/// path. When the space active here is a different one (a ptrace
+/// remote access faulting a stopped tracee's page through this hook),
+/// expansion is skipped and the fault keeps its single-page service.
 fn fault_around(
     address_space_id: u64,
     fault_page: u64,
@@ -1388,35 +1430,34 @@ fn fault_around(
     if aspace.identity() != address_space_id {
         return;
     }
-    let Some(_guard) = fault_around_enter(address_space_id) else {
-        return;
-    };
     let owner_pages = owner_len.div_ceil(4096);
     if owner_pages <= 1 {
         return;
     }
     let fault_index = (fault_page - owner_base) / 4096;
     let window_first = fault_index & !(FAULT_AROUND_PAGES - 1);
-    let window_last = (window_first + FAULT_AROUND_PAGES).min(owner_pages);
+    let mut window_last = (window_first + FAULT_AROUND_PAGES).min(owner_pages);
+    // Nothing at or past i_size is installable; clamp the window to
+    // the pages that begin below EOF, exactly the set the per-page
+    // loop's `>= size` skip admitted.
     let owner_file_offset = fault_offset - fault_index * 4096;
     let size = ops.stat().size;
-    for index in window_first..window_last {
-        if index == fault_index {
-            continue;
-        }
-        // The file offset this page would fault from; at or past i_size
-        // it is SIGBUS territory, never installable content.
-        if owner_file_offset + index * 4096 >= size {
-            continue;
-        }
-        let va = owner_base + index * 4096;
-        // SAFETY: `aspace` is the space active on this CPU (identity
-        // checked above) inside its own page fault, so its root is the
-        // live one and paging is enabled — the same contract the trap
-        // path's `demand_page` call on this fault satisfies. The result
-        // is advisory and discarded by design (see above).
-        let _ = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(va)) };
+    if size <= owner_file_offset {
+        return;
     }
+    window_last = window_last.min((size - owner_file_offset).div_ceil(4096));
+    if window_last <= window_first {
+        return;
+    }
+    let first_va = owner_base + window_first * 4096;
+    let pages = window_last - window_first;
+    // SAFETY: `aspace` is the space active on this CPU (identity
+    // checked above) inside its own page fault, so its root is the
+    // live one and paging is enabled — the batch's contract, and the
+    // same one the trap path's `demand_page` call on this fault
+    // satisfies. The result is advisory and discarded by design (see
+    // above).
+    let _ = unsafe { aspace.demand_alloc_range(narf_memory::VirtAddr::new(first_va), pages) };
 }
 
 /// `vmf_error`: `-ENOMEM` waits for reclaim and retries (`VM_FAULT_OOM`);

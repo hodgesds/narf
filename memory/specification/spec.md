@@ -661,6 +661,33 @@ impl AddressSpace {
         &self,
         vaddr: VirtAddr,
     ) -> Result<(), AddressSpaceError>;
+    /// Bulk demand paging (#737): claim, fill, and install every
+    /// claimable page of `[vaddr, vaddr + pages * 4096)` as one
+    /// operation, returning how many pages were installed. The claim
+    /// set is taken in a single region-lock acquisition — a ticket for
+    /// every page a single fault would own; backed, in-progress,
+    /// guarded, `PROT_NONE`, swap-owned, and out-of-region pages are
+    /// skipped. `FILE_DEMAND` pages are filled by the batch hook
+    /// installed with `install_file_batch_fault_hook(
+    ///     fn(address_space_id: u64, first_vaddr: u64, out: &mut [u64]))`
+    /// — one call per contiguous claimed run; a slot left zero is a
+    /// per-page refusal. Other pages are demand-zero frames. Every
+    /// filled page is published through the single fault's own
+    /// finish transaction, so a batch-installed page is
+    /// indistinguishable from a faulted one.
+    ///
+    /// The batch is advisory: it reports a count, never an error, and
+    /// a skipped page faults later through `demand_alloc_page`, which
+    /// keeps its all-or-nothing (fatal) semantics — the batch must
+    /// never serve the faulting page itself. The batch hook is
+    /// fill-only: it must not install leaves or call back into any
+    /// demand entry point, which keeps bulk faulting acyclic by
+    /// construction (no recursion guard exists or is needed).
+    pub unsafe fn demand_alloc_range(
+        &self,
+        vaddr: VirtAddr,
+        pages: u64,
+    ) -> usize;
     /// `madvise(MADV_GUARD_INSTALL)` / `madvise(MADV_GUARD_REMOVE)`
     /// (`mm/madvise.c`). Markers are per page and keyed by VA, like Linux's
     /// guard PTE markers: fork copies them, mremap moves them (a truncated

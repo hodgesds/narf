@@ -1792,3 +1792,13 @@ argument = "The change stays inside memory/ (an existing TCB member): a read-onl
 ref = "security-model/specification/spec.md#L42"
 agent = "Muse Wonder"
 argument = "firmware_node_count() performs no kernel data access of its own and mutates no allocator state: it calls the existing weak ACPI bridge and floors the result at 1. It grants no capability, changes no mapping or domain tag, and alters no allocation decision; every allocation path is byte-identical. The host (not(target_os = \"none\")) stub returns 1, the documented no-topology behavior, mirroring the three existing topology-hook fallbacks, so no host consumer can observe a fabricated multi-node topology."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "Muse Wonder"
+argument = "Bulk faulting (#737) stays inside the existing TCB boundary: the new API (AddressSpace::demand_alloc_range, claim_demand_range, and the install_file_batch_fault_hook seam) lives in memory/, an existing TCB member, and the userspace side only registers a fill hook and calls the API. It adds no TCB member, no capability path, no domain transition, and no new cross-domain surface: the batch hook is a fn-pointer seam of the same shape as the pre-existing install_file_fault_hook, installed through the same kernel-side registration pattern."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "Muse Wonder"
+argument = "Batch publication preserves the demand-fault ownership invariants. Every page the batch installs was claimed under the same region lock and demand-ticket table a single fault uses — a page with a live ticket (including the faulting page itself, whose ticket its own fault holds) or a non-zero backing slot is never claimed twice — and is published by the same finish_demand_page transaction (leaf install, backing store, resident accounting, and reserved rmap-owner commit under one lock), after the same fallible rmap owner-slot reservation a single fault performs while it exclusively owns the frame. The batch hook is fill-only: it can name frames but cannot install, publish, or re-enter any demand entry point, so bulk expansion is acyclic by construction and needs no recursion guard. Failure is strictly weaker than the single path: any page the batch cannot claim, fill, or publish is skipped with its ticket cancelled and its frame released by the single fault's own rules (shared-hook release for externally owned file frames, free for the rest), and faults later through the unchanged all-or-nothing demand_alloc_page."
