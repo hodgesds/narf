@@ -203,10 +203,27 @@ unsafe fn read_cfg(
     take
 }
 
-/// Read the device name + per-axis bounds + LED bitmap. Returns
-/// the (name, axis_info[], led_bits) triple. Best-effort — missing
-/// selectors leave fields empty / `None` / `0`. Called once at
-/// probe.
+/// Parse a `CFG_ID_DEVIDS` payload into an evdev [`InputId`].
+///
+/// The wire struct is four little-endian u16s — bustype, vendor,
+/// product, version — so a full read is 8 bytes and every field sits
+/// at its own offset. A short or absent selector (a device that
+/// simply does not publish ids) falls back to the synthetic
+/// identity: BUS_VIRTUAL with zeroed ids.
+///
+/// [`InputId`]: narf_input::evdev::InputId
+fn parse_devids(bytes: &[u8]) -> narf_input::evdev::InputId {
+    if bytes.len() < 8 {
+        return narf_input::evdev::InputId::new(narf_input::evdev::bus::VIRTUAL, 0, 0, 0);
+    }
+    let le16 = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+    narf_input::evdev::InputId::new(le16(0), le16(2), le16(4), le16(6))
+}
+
+/// Read the device name + serial + ids + per-axis bounds + LED
+/// bitmap. Returns (name, serial, ids, axis_info[], led_bits).
+/// Best-effort — missing selectors leave fields empty / `None` /
+/// `0`. Called once at probe.
 ///
 /// # Safety
 /// `region` must be a live virtio-input device-cfg mapping.
@@ -215,7 +232,7 @@ unsafe fn read_device_metadata(
 ) -> (
     alloc::string::String,
     alloc::string::String,
-    (u16, u16, u16),
+    narf_input::evdev::InputId,
     [Option<narf_input::AxisInfo>; ABS_BOUNDS_LEN],
     u8,
 ) {
@@ -241,21 +258,14 @@ unsafe fn read_device_metadata(
         .unwrap_or(trimmed.len());
     let serial = alloc::string::String::from_utf8_lossy(&trimmed[..stop]).into_owned();
 
-    // Device ids: `struct virtio_input_devids { le16 vendor, product,
-    // version }` (VirtIO 1.2 §5.8.4). Absent selector → zeros, matching
-    // a device that simply does not publish ids.
+    // Device ids: `struct virtio_input_devids { le16 bustype; le16
+    // vendor; le16 product; le16 version; }` (VirtIO §5.8,
+    // virtio_input.h) — the bustype is the device's own, not a
+    // hardcoded BUS_VIRTUAL.
     let mut id_buf = [0u8; 8];
     // SAFETY: caller-asserted mapped region.
     let got = unsafe { read_cfg(region, CFG_ID_DEVIDS, 0, &mut id_buf) };
-    let devids = if got >= 6 {
-        (
-            u16::from_le_bytes([id_buf[0], id_buf[1]]),
-            u16::from_le_bytes([id_buf[2], id_buf[3]]),
-            u16::from_le_bytes([id_buf[4], id_buf[5]]),
-        )
-    } else {
-        (0, 0, 0)
-    };
+    let devids = parse_devids(&id_buf[..got]);
 
     // EV_BITS for EV_ABS tells us which axes have abs-info to read.
     let mut ev_abs_bits = [0u8; 128];
@@ -430,6 +440,7 @@ fn abs_to_px(v: i32, info: Option<narf_input::AxisInfo>, span: i64) -> i32 {
 }
 
 mod abs_px_tests;
+mod devids_tests;
 
 #[derive(Debug)]
 struct Queues {
@@ -747,7 +758,7 @@ impl VirtioInputPci {
             None => (
                 alloc::string::String::new(),
                 alloc::string::String::new(),
-                (0, 0, 0),
+                narf_input::evdev::InputId::new(narf_input::evdev::bus::VIRTUAL, 0, 0, 0),
                 [None; ABS_BOUNDS_LEN],
                 0u8,
             ),
@@ -777,12 +788,7 @@ impl VirtioInputPci {
                 },
                 &phys,
                 &serial,
-                narf_input::evdev::InputId::new(
-                    narf_input::evdev::bus::VIRTUAL,
-                    devids.0,
-                    devids.1,
-                    devids.2,
-                ),
+                devids,
             );
             caps
         };
