@@ -637,10 +637,11 @@ fn spawn_supervisor_task() {
                     }
                 }
                 if new_bound_bits != 0 {
-                    let mut g = HUBS.lock();
-                    if let Some(h) = g.get_mut(idx) {
-                        h.bound_downstream |= new_bound_bits;
-                    }
+                    // Sets the bound bits AND stamps each newly
+                    // bound port's activity tick — a port's idle
+                    // window runs from bind, not from the boot
+                    // epoch its tick initialised to (#840).
+                    attach::mark_ports_bound(idx, new_bound_bits);
                 }
             }
 
@@ -654,7 +655,9 @@ fn spawn_supervisor_task() {
             // Power management: suspend any downstream port whose
             // last activity is older than IDLE_SUSPEND_NS. Pumps
             // above touch `last_activity_tick` via mark_port_activity
-            // on each completed transfer, so an actively-used keyboard
+            // on each completed transfer, and the MSC BOT path feeds
+            // activity on each completed transaction (resuming its
+            // port first if suspended), so an actively-used device
             // never gets suspended; an idle USB stick / hub does.
             attach::idle_suspend_pass(c).await;
             SUPERVISOR_PHASE.store(9, core::sync::atomic::Ordering::Relaxed);

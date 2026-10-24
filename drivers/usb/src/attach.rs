@@ -144,10 +144,13 @@ pub struct HubBinding {
     /// suspended (the device is bound but idle long enough to
     /// be suspended for power-saving).
     pub suspended_downstream: u64,
-    /// Per-port last-activity tick. The supervisor records the
-    /// current `narf_time` tick whenever a port's bound device
-    /// sees an interrupt-IN transfer; if (now - last) exceeds
-    /// the idle threshold, the supervisor suspends the port.
+    /// Per-port last-activity tick. Stamped by
+    /// [`mark_ports_bound`] when the port binds (bind is activity —
+    /// a port's idle window runs from bind, not from the boot epoch
+    /// the array initialises to), then refreshed by
+    /// [`mark_port_activity`] whenever a port's bound device
+    /// completes a transfer; if (now - last) exceeds the idle
+    /// threshold, the supervisor suspends the port.
     /// `u64::MAX` means "active right now, never let it be
     /// suspended on the next pass" (used as a sentinel after
     /// `port_resume`).
@@ -195,6 +198,75 @@ pub fn mark_port_activity(parent_hub_idx: usize, port: u8) {
     }
 }
 
+/// Record that the downstream ports in `bits` of hub
+/// `parent_hub_idx` have just been bound, stamping each newly
+/// bound port's last-activity tick to *now*. Called by the
+/// supervisor in place of a bare `bound_downstream |= bits`:
+/// without the stamp the tick keeps its initial value of 0 (the
+/// boot epoch), so a device bound after the machine has been up
+/// for [`IDLE_SUSPEND_NS`] would be suspended on the very next
+/// pass — it never got an idle window (#840).
+pub fn mark_ports_bound(parent_hub_idx: usize, bits: u64) {
+    let now = narf_time::monotonic_ns();
+    let mut g = HUBS.lock();
+    if let Some(h) = g.get_mut(parent_hub_idx) {
+        h.bound_downstream |= bits;
+        let mut rest = bits;
+        while rest != 0 {
+            let p = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            if let Some(slot) = h.last_activity_tick.get_mut(p & 63) {
+                *slot = now;
+            }
+        }
+    }
+}
+
+/// Find the [`HUBS`] index of the hub occupying xHCI slot
+/// `slot_id`. [`HUBS`] is append-only for the life of the system,
+/// so the index is stable once the hub has bound. Class drivers
+/// key their hub-PM calls ([`mark_port_activity`], [`resume_port`])
+/// by this index.
+pub fn hub_index_for_slot(slot_id: u8) -> Option<usize> {
+    let g = HUBS.lock();
+    g.iter().position(|h| h.hub.slot_id == slot_id)
+}
+
+/// Pure per-port suspend decision behind [`idle_suspend_pass`]:
+/// a port is idle-expired when its last-activity tick is at least
+/// [`IDLE_SUSPEND_NS`] old. The `u64::MAX` sentinel (stamped by
+/// [`resume_port`]) never expires — the class driver that resumed
+/// the port replaces it with a real tick on its next completed
+/// transfer via [`mark_port_activity`].
+pub(crate) fn port_idle_expired(last_activity_tick: u64, now: u64) -> bool {
+    last_activity_tick != u64::MAX && now.saturating_sub(last_activity_tick) >= IDLE_SUSPEND_NS
+}
+
+/// Select the (hub index, port) pairs [`idle_suspend_pass`]
+/// should suspend from a registry snapshot: bound, not already
+/// suspended, and idle-expired. Split out from the pass itself so
+/// the selection policy is unit-testable without a controller.
+pub(crate) fn idle_suspend_candidates(hubs: &[HubBinding], now: u64) -> Vec<(usize, u8)> {
+    let mut out = Vec::new();
+    for (idx, h) in hubs.iter().enumerate() {
+        let num_ports = h.hub.descriptor.num_ports.min(64);
+        for p in 1..=num_ports {
+            let bit = 1u64 << (p as u32 & 63);
+            // Only consider bound + non-suspended ports.
+            if h.bound_downstream & bit == 0 {
+                continue;
+            }
+            if h.suspended_downstream & bit != 0 {
+                continue;
+            }
+            if port_idle_expired(h.last_activity_tick[p as usize & 63], now) {
+                out.push((idx, p));
+            }
+        }
+    }
+    out
+}
+
 /// Walk every bound hub + suspend any downstream port whose last
 /// activity is older than `IDLE_SUSPEND_NS`. Called once per
 /// supervisor cycle. Suspended ports stay in `bound_downstream`
@@ -207,28 +279,7 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
     // transfers (which can sleep) don't hold the registry lock.
     let work: alloc::vec::Vec<(usize, u8)> = {
         let g = HUBS.lock();
-        let mut out = alloc::vec::Vec::new();
-        for (idx, h) in g.iter().enumerate() {
-            let num_ports = h.hub.descriptor.num_ports.min(64);
-            for p in 1..=num_ports {
-                let bit = 1u64 << (p as u32 & 63);
-                // Only consider bound + non-suspended ports.
-                if h.bound_downstream & bit == 0 {
-                    continue;
-                }
-                if h.suspended_downstream & bit != 0 {
-                    continue;
-                }
-                let last = h.last_activity_tick[p as usize & 63];
-                if last == u64::MAX {
-                    continue;
-                }
-                if now.saturating_sub(last) >= IDLE_SUSPEND_NS {
-                    out.push((idx, p));
-                }
-            }
-        }
-        out
+        idle_suspend_candidates(&g[..], now)
     };
     let mut suspended = 0;
     for (idx, p) in &work {
@@ -306,6 +357,7 @@ pub async fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
     }
     dispatch_after_address(
         xhci_dev, slot_id, port, speed, /*route*/ 0, /*root_port*/ port,
+        /*parent_hub_idx*/ None,
     )
     .await
 }
@@ -356,6 +408,7 @@ pub async fn try_attach_via_hub(
         speed,
         topology.route_string,
         parent_root_port,
+        hub_index_for_slot(parent.slot_id),
     )
     .await
 }
@@ -465,6 +518,10 @@ pub fn detach_all_bindings() {
 /// Free function so the dispatcher logic stays one place. `port` is
 /// the per-hub port number used purely for HID-side error logging
 /// dedup; `root_port` is the root-hub port that anchors the path.
+/// `parent_hub_idx` is the [`HUBS`] index of the parent hub when
+/// the device sits behind one (`None` on a root port); class
+/// drivers that participate in hub idle-suspend (MSC today) record
+/// it with their port so they can resume / feed their port.
 async fn dispatch_after_address(
     xhci_dev: &Xhci,
     slot_id: u8,
@@ -472,6 +529,7 @@ async fn dispatch_after_address(
     speed: PortSpeed,
     this_route: u32,
     root_port: u8,
+    parent_hub_idx: Option<usize>,
 ) -> AttachOutcome {
     // GET_DESCRIPTOR(DEVICE) — bDeviceClass at offset +4 (USB 2.0
     // §9.6.1). 0x09 = Hub. 0x00 = "look at interface class" — most
@@ -665,8 +723,13 @@ async fn dispatch_after_address(
         // SubClass=0x06, Protocol=0x50. `find_bot_endpoints`
         // walks the config blob; if it doesn't find an MSC
         // interface it returns EndpointsMissing and we fall through.
-        if let Ok(_idx) =
-            crate::msc::try_bind_msc_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        if let Ok(_idx) = crate::msc::try_bind_msc_already_addressed(
+            xhci_dev,
+            slot_id,
+            &cfg_blob,
+            parent_hub_idx.map(|idx| (idx, port)),
+        )
+        .await
         {
             return AttachOutcome::MassStorage;
         }

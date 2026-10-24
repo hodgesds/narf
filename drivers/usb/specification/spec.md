@@ -126,6 +126,16 @@ also consult upstream Linux GPL sources.
 - `HubDescriptor::tt_think_time()` returns the USB 2.0
   `wHubCharacteristics[6:5]` encoding used directly in a low/full-speed
   child's xHCI Slot Context.
+- Hub downstream idle-suspend: the supervisor marks ports bound via
+  `attach::mark_ports_bound`, which also stamps each port's
+  last-activity tick (a port's idle window runs from bind). Class
+  drivers feed `attach::mark_port_activity` on each completed
+  transfer and call `attach::resume_port` before a transfer to a
+  port that may be suspended. `msc::try_bind_msc_already_addressed`
+  takes the device's hub context — (index into `attach::HUBS`,
+  downstream port), `None` on a root port — and `MscDevice` records
+  it as `hub_port`; its BOT funnels resume-then-feed on every
+  transaction.
 - `Xhci::address_device_with(..., Topology)` retains the topology for later
   Evaluate Context operations; marking a downstream device as a hub must not
   erase its route string or parent-TT fields.

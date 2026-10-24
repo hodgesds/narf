@@ -169,6 +169,16 @@ pub struct MscDevice {
     pub generation: u64,
     /// Sequence counter for `dCBWTag` (matched by the device in CSW).
     tag: IrqSafeSpinLock<u32>,
+    /// Hub context when this device sits behind a USB hub:
+    /// (index into `crate::attach::HUBS`, downstream port).
+    /// `None` for root-hub-attached devices (root ports are never
+    /// idle-suspended) and for the legacy root enumerate path.
+    /// The BOT funnels resume the port before a transfer and feed
+    /// `crate::attach::mark_port_activity` on completion when this
+    /// is `Some` — without it a hub-attached device wedges ~30 s
+    /// after bind: the supervisor idle-suspends its port and
+    /// nothing ever resumes it (#840).
+    pub hub_port: Option<(usize, u8)>,
 }
 
 /// Walk a Configuration Descriptor (§9.6.3) tree looking for the
@@ -259,6 +269,7 @@ impl MscDevice {
             last_lba: 0,
             generation: 0,
             tag: IrqSafeSpinLock::new(1),
+            hub_port: None,
         };
         let cap = dev.read_capacity_10(xhci).await?;
         Ok(MscDevice {
@@ -269,6 +280,7 @@ impl MscDevice {
             last_lba: cap.1,
             generation: 0,
             tag: IrqSafeSpinLock::new(2),
+            hub_port: None,
         })
     }
 
@@ -313,35 +325,62 @@ impl MscDevice {
         Ok((status, resid))
     }
 
+    /// Resume this device's hub port if the supervisor has
+    /// idle-suspended it, so the transfer below doesn't run
+    /// against a gated port. No-op for root-attached devices and
+    /// for ports that aren't suspended (`resume_port` is
+    /// idempotent). Called at the top of every BOT funnel (#840).
+    async fn resume_hub_port(&self, xhci: &Xhci) {
+        if let Some((hub_idx, port)) = self.hub_port {
+            crate::attach::resume_port(xhci, hub_idx, port).await;
+        }
+    }
+
+    /// Feed the hub idle-suspend activity timer after a completed
+    /// BOT transaction, so an actively used device keeps its port.
+    /// Called on the success path of every BOT funnel (#840).
+    fn note_hub_activity(&self) {
+        if let Some((hub_idx, port)) = self.hub_port {
+            crate::attach::mark_port_activity(hub_idx, port);
+        }
+    }
+
     /// Run a SCSI command with no data stage. Used by TEST UNIT READY
     /// and SYNCHRONIZE CACHE(10).
     async fn cmd_no_data(&self, xhci: &Xhci, cb: &[u8]) -> Result<(), MscError> {
+        self.resume_hub_port(xhci).await;
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, 0, false, cb);
         xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
         let (status, _) = self.read_csw(xhci, tag).await?;
-        check_csw_status(status)
+        check_csw_status(status)?;
+        self.note_hub_activity();
+        Ok(())
     }
 
     /// Run a SCSI command with a host-bound (IN) data stage.
     async fn cmd_data_in(&self, xhci: &Xhci, cb: &[u8], out: &mut [u8]) -> Result<usize, MscError> {
+        self.resume_hub_port(xhci).await;
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, out.len() as u32, true, cb);
         xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
         let n = xhci.bulk_in(self.slot_id, self.bulk_in, out).await?;
         let (status, _) = self.read_csw(xhci, tag).await?;
         check_csw_status(status)?;
+        self.note_hub_activity();
         Ok(n)
     }
 
     /// Run a SCSI command with a device-bound (OUT) data stage.
     async fn cmd_data_out(&self, xhci: &Xhci, cb: &[u8], data: &[u8]) -> Result<usize, MscError> {
+        self.resume_hub_port(xhci).await;
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, data.len() as u32, false, cb);
         xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
         let n = xhci.bulk_out(self.slot_id, self.bulk_out, data).await?;
         let (status, _) = self.read_csw(xhci, tag).await?;
         check_csw_status(status)?;
+        self.note_hub_activity();
         Ok(n)
     }
 
@@ -635,10 +674,16 @@ fn insert_device(mut dev: MscDevice) -> usize {
 /// Caller's responsibility: the device is post-`address_device`
 /// and `cfg` is the full GET_DESCRIPTOR(CONFIG) blob (so we don't
 /// re-issue the control transfer).
+///
+/// `hub_port` is the device's hub context — (index into
+/// `crate::attach::HUBS`, downstream port) — when it sits behind
+/// a hub, `None` on a root port. Recorded on the device so its
+/// BOT transfers can resume / feed its port (#840).
 pub async fn try_bind_msc_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     cfg: &[u8],
+    hub_port: Option<(usize, u8)>,
 ) -> Result<usize, MscError> {
     let (ep_in, ep_out) = find_bot_endpoints(cfg)?;
     // SET_CONFIGURATION before any class-specific request (USB 2.0
@@ -665,7 +710,13 @@ pub async fn try_bind_msc_already_addressed(
         .map_err(MscError::Xhci)?;
     let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
     let bulk_out_dci = (ep_out.ep_addr & 0x0F) * 2; // xHCI OUT DCI: ep_num * 2
-    let dev = MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci).await?;
+    let mut dev = MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci).await?;
+    // Record the hub context *after* attach: the READ CAPACITY(10)
+    // inside attach runs before the supervisor marks the port
+    // bound, and idle-suspend only ever targets bound ports — the
+    // port cannot be suspended yet, so that first transaction
+    // needs no resume.
+    dev.hub_port = hub_port;
     let idx = insert_device(dev);
     // Register against the block layer + scan partitions. Done
     // inline so the post-bind state (block device visible + per-
@@ -1358,8 +1409,10 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         // adapter was built from (generation match). A tombstone
         // or a generation mismatch — the index was reused by a
         // replugged disk — fails DeviceRemoved without issuing
-        // anything against the current occupant.
-        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation) = {
+        // anything against the current occupant. The hub context
+        // rides along so the snapshot's transfer funnels can
+        // resume / feed the port (#840).
+        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation, hub_port) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
@@ -1374,6 +1427,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
                 dev.bulk_out,
                 dev.lba_bytes,
                 dev.generation,
+                dev.hub_port,
             )
         };
         let c = match xhci::controller() {
@@ -1388,6 +1442,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             last_lba: 0,
             generation,
             tag: IrqSafeSpinLock::new(1),
+            hub_port,
         };
         let Some(_claim) = MscIoClaim::acquire(self.idx) else {
             return Err(narf_block::BlockIoError::DriverError);
@@ -1418,8 +1473,10 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         // Identity gate, identical to `read`: snapshot the live
         // entry and compare bind generations before the I/O claim
         // is taken, so a stale adapter never issues a write against
-        // the disk that reused its index after a replug.
-        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation) = {
+        // the disk that reused its index after a replug. The hub
+        // context rides along so the snapshot's transfer funnels
+        // can resume / feed the port (#840).
+        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation, hub_port) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
@@ -1434,6 +1491,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
                 dev.bulk_out,
                 dev.lba_bytes,
                 dev.generation,
+                dev.hub_port,
             )
         };
         let c = match xhci::controller() {
@@ -1448,6 +1506,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             last_lba: 0,
             generation,
             tag: IrqSafeSpinLock::new(1),
+            hub_port,
         };
         let Some(_claim) = MscIoClaim::acquire(self.idx) else {
             return Err(narf_block::BlockIoError::DriverError);
