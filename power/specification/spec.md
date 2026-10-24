@@ -184,7 +184,9 @@ semantics differ: no `\_S3_` / FADT requirement (`s2idle_supported()` needs
 only an arch park primitive), no CPU context save or resume trampoline (the
 CPU never loses power — execution stays in the caller's frame), no TSC
 snapshot, no `\_PTS` / FACS / PM1 write. The platform step masks every IRQ
-vector except the wake allowlist (`wake_irq_allowlist()`: the ACPI SCI) and
+vector except the wake allowlist (`wake_irq_allowlist()`: the vector the
+platform installed the ACPI SCI handler on, recorded in `narf_acpi` by the
+install path — not a FADT-derived value) and
 parks via `narf_arch::idle_halt_then_disable` until a wake source latches an
 event with `note_wake_event`. An unarmed request walks the phases and returns
 `NotImplemented`, exactly like unarmed S3.

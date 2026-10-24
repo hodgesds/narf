@@ -671,6 +671,83 @@ fn smoke_s2idle_reentrant_request_refused() -> TestResult {
 kernel_test_in!("power/s2idle", smoke_s2idle_reentrant_request_refused);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_s2idle_allowlist_matches_installed_sci_vector() -> TestResult {
+    // Pin the wake allowlist to the vector the platform ACTUALLY
+    // installed the SCI handler on. The install
+    // (drivers/platform `init_sci`) resolves SCI_INT through the
+    // MADT interrupt-source-override table — a matching entry
+    // remaps the line to a different GSI — and installs
+    // `dispatch_sci` at a dynamically allocated vector, so no
+    // FADT/GSI arithmetic (`32 + sci_int`, `32 + gsi`) can name the
+    // live vector. The old allowlist used `32 + sci_int`: it
+    // exempted a vector nothing wakes on while the real SCI stayed
+    // masked, and no park could ever wake. This fixture models the
+    // install's effect — allocate a vector exactly as `init_sci`
+    // does and record it exactly where `init_sci` records it — and
+    // pins the allowlist to the record.
+    s2idle_fixture_reset();
+    let saved = narf_acpi::sci_vector();
+    let mut fail: Option<&'static str> = None;
+
+    // Pre-install shape: with no install recorded, nothing is
+    // exempted — there is no FADT-derived fallback guess.
+    narf_acpi::record_sci_vector(0);
+    if !crate::s2idle::wake_irq_allowlist().is_empty() {
+        fail = Some("allowlist not empty with no SCI install recorded");
+    }
+
+    // Model the install: dynamic allocation, as in `init_sci`.
+    let installed = match narf_interrupts::vector::alloc() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            fail = Some("vector::alloc failed modelling the SCI install");
+            None
+        }
+    };
+    if let Some(installed) = installed {
+        narf_acpi::record_sci_vector(installed);
+        if narf_acpi::sci_vector() != Some(installed) {
+            fail = Some("installed SCI vector not readable from narf_acpi");
+        }
+        let allowlist = crate::s2idle::wake_irq_allowlist();
+        if allowlist.len() != 1 || allowlist[0] != installed {
+            fail = Some("allowlist does not exempt exactly the installed SCI vector");
+        }
+        // The FADT-derived vector must NOT be the exempted one
+        // (the allocator's range starts above the legacy
+        // `32 + sci_int` window, so the two can never coincide).
+        if fail.is_none() {
+            if let Some(pm) = narf_acpi::fadt_pm() {
+                if pm.sci_int != 0 {
+                    let naive = 32u32 + pm.sci_int as u32;
+                    if naive != installed as u32 {
+                        if let Ok(naive) = u8::try_from(naive) {
+                            if allowlist.contains(&naive) {
+                                fail =
+                                    Some("allowlist exempts the FADT-derived vector, not the installed one");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = narf_interrupts::vector::free(installed);
+    }
+
+    // Restore whatever install state the environment had.
+    narf_acpi::record_sci_vector(saved.unwrap_or(0));
+    match fail {
+        None => TestResult::Pass,
+        Some(msg) => TestResult::Fail(msg),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "power/s2idle",
+    smoke_s2idle_allowlist_matches_installed_sci_vector
+);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_s3_resume_context_save_captures_cr3() -> TestResult {
     // save_resume_context() captures CR0/CR3/CR4/GDTR/IDTR/RSP.
     // After a save, captured_context() should report Some(_) with

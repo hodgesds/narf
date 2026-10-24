@@ -44,12 +44,21 @@
 //!   no firmware sleep transition to prepare or trigger — that
 //!   absence is the point of the state.
 //! - **Wake is a latched event, not a vector return.** Wake sources
-//!   (power/sleep button, lid, EC, RTC) already surface as ordinary
-//!   interrupts on this platform; their handlers call
-//!   [`note_wake_event`] and the park loop observes the latch. The
-//!   IRQ mask snapshot keeps those vectors unmasked (see
-//!   [`wake_irq_allowlist`]) and masks everything else, exactly as
-//!   the S3 entry does.
+//!   surface as ordinary interrupts on this platform; their
+//!   handlers call [`note_wake_event`] and the park loop observes
+//!   the latch. Under the park's IRQ mask only handlers that can
+//!   still run can latch, so the deliverable wake set is exactly
+//!   the SCI-funneled sources — the fixed power/sleep buttons and
+//!   the EC/lid GPEs. (An RTC wired as an ACPI wake GPE also
+//!   arrives through the SCI and is deliverable as such; a
+//!   discrete RTC IRQ has its own vector, which the mask leaves
+//!   masked, so it cannot wake a park.) The mask snapshot is the
+//!   S3 entry's mechanism, but the allowlist deliberately differs:
+//!   S3 passes an empty one (`snapshot_and_mask_irqs(&[])`)
+//!   because firmware/PM1 owns S3 wake, while s2idle keeps the CPU
+//!   powered, so the SCI handler *is* the wake path and its
+//!   installed vector must stay unmasked (see
+//!   [`wake_irq_allowlist`]).
 //!
 //! Task freezing: like the S3 core today, the phase progression
 //! marks `FreezingUserspace` / `ThawingUserspace` but no scheduler
@@ -162,6 +171,9 @@ pub enum WakeSource {
     SleepButton = 2,
     Lid = 3,
     EmbeddedController = 4,
+    /// RTC alarm. Deliverable during a park only when the RTC is
+    /// wired as an ACPI wake GPE, i.e. funnelled through the SCI;
+    /// a discrete RTC IRQ vector is masked while parked.
     RtcAlarm = 5,
     /// Injected by the kernel-test harness.
     TestInjected = 6,
@@ -201,26 +213,28 @@ pub fn last_wake_source() -> Option<WakeSource> {
 }
 
 /// IRQ vectors that must stay unmasked across the park so a wake
-/// event can actually fire. Today that is the ACPI SCI: the fixed
-/// power/sleep buttons and EC/lid GPEs all funnel through it on the
-/// Stage-5 laptops. GSI `n` dispatches on vector `32 + n` in the
-/// identity mapping `narf_interrupts` soft-masks on; the EC driver
-/// resolves the same GSI through the MADT override table for its
-/// own routing (`drivers/platform/src/ec.rs`). Empty when the FADT
-/// has not been parsed or advertises no SCI — the park then relies
-/// on the latch alone, which a test or a future non-ACPI source can
-/// still set.
+/// event can actually fire. Today that is exactly one: the vector
+/// the platform installed the ACPI SCI handler on — the fixed
+/// power/sleep buttons and EC/lid GPEs all funnel through the SCI
+/// on the Stage-5 laptops.
+///
+/// The vector is read from `narf_acpi`'s install record, never
+/// derived from the FADT: the install path
+/// (`drivers/platform/src/ec.rs::init_sci`) remaps `SCI_INT`
+/// through the MADT override table and installs `dispatch_sci` at
+/// a dynamically allocated vector, so `32 + sci_int` names some
+/// other vector entirely — exempting it would keep an unrelated
+/// vector live while the real SCI stays masked and no wake source
+/// can ever fire. With no install recorded there is no SCI handler
+/// to exempt, so the list is empty rather than a FADT-derived
+/// guess; the park then relies on the latch alone, which a test or
+/// a future non-ACPI source can still set.
 pub fn wake_irq_allowlist() -> Vec<u8> {
     let mut v = Vec::new();
     #[cfg(target_arch = "x86_64")]
     {
-        if let Some(pm) = narf_acpi::fadt_pm() {
-            if pm.sci_int != 0 {
-                let vec = 32u32 + pm.sci_int as u32;
-                if let Ok(vec) = u8::try_from(vec) {
-                    v.push(vec);
-                }
-            }
+        if let Some(vector) = narf_acpi::sci_vector() {
+            v.push(vector);
         }
     }
     v

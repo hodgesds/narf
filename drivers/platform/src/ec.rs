@@ -723,8 +723,10 @@ pub fn __test_dispatch_synthetic_block(base_gsi: u32, status: &[u8]) {
 /// any matching ISO, locate the IOAPIC owning that GSI, program
 /// the redirection-table entry (level / active-low, fixed
 /// delivery, dest = BSP, unmasked), install `dispatch_sci` as
-/// the synchronous handler, and switch the platform from legacy
-/// (SMI-driven) to ACPI (SCI-driven) mode via FADT.SMI_CMD.
+/// the synchronous handler, record the installed vector in
+/// `narf_acpi` (see `narf_acpi::record_sci_vector`), and switch
+/// the platform from legacy (SMI-driven) to ACPI (SCI-driven)
+/// mode via FADT.SMI_CMD.
 pub fn init_sci(ec_gpe_bit: Option<u8>) {
     if let Some(b) = ec_gpe_bit {
         EC_GPE_BIT.store(b as u64, Ordering::Release);
@@ -791,6 +793,14 @@ pub fn init_sci(ec_gpe_bit: Option<u8>) {
             );
             return;
         }
+
+        // Publish the installed vector. It is neither `sci_int` nor
+        // `32 + gsi` — the vector came from the dynamic allocator —
+        // and consumers that need the live SCI vector (the s2idle
+        // wake allowlist in `narf_power`) read it back from
+        // `narf_acpi`, which power may depend on without a layering
+        // cycle through this crate.
+        narf_acpi::record_sci_vector(vector);
 
         narf_acpi::acpi_enable();
         let _ = writeln!(
