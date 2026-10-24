@@ -719,6 +719,7 @@ fn smoke_drm_multi_monitor_enumerate_independent_modesets() -> TestResult {
         1920,
         surface_a,
         dcn_base,
+        0,
     ) {
         Ok(p) => p,
         Err(KmsError::UnsupportedMode) => {
@@ -736,6 +737,7 @@ fn smoke_drm_multi_monitor_enumerate_independent_modesets() -> TestResult {
         1280,
         surface_b,
         dcn_base,
+        0,
     ) {
         Ok(p) => p,
         Err(KmsError::UnsupportedMode) => {

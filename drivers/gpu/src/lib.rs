@@ -185,6 +185,8 @@ pub mod amdgpu_dccg;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_dcn20_audio;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_audio;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_clk;

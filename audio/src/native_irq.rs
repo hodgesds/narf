@@ -12,6 +12,9 @@ use narf_interrupts::{dispatch, vector};
 pub(crate) enum Kind {
     Hda,
     Acp,
+    /// ACP 3.x (Renoir): same service semantics as `Acp`, but the
+    /// external-interrupt status register lives at 0x1808, not 0x1a0c.
+    Acp3x,
 }
 #[derive(Debug)]
 pub(crate) struct State {
@@ -64,6 +67,15 @@ impl State {
                 Kind::Acp => {
                     let cause = self.mmio.read32(0x1a0c);
                     self.mmio.write32(0x1a0c, cause);
+                    if cause == u32::MAX || cause & (1 << 29) != 0 {
+                        self.failed.store(true, Ordering::Release);
+                    }
+                    self.pending.fetch_or(cause, Ordering::Release);
+                    cause != 0 && cause != u32::MAX
+                }
+                Kind::Acp3x => {
+                    let cause = self.mmio.read32(0x1808);
+                    self.mmio.write32(0x1808, cause);
                     if cause == u32::MAX || cause & (1 << 29) != 0 {
                         self.failed.store(true, Ordering::Release);
                     }

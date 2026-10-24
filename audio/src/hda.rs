@@ -398,13 +398,46 @@ const HDA_PCI_IDS: &[(&str, u16, u16)] = &[
     ),
 ];
 
+/// The Renoir / Lucienne / Cezanne APU's display-audio function
+/// (1002:1637). Unlike the Phoenix function (1002:1640, a named
+/// `HDA_PCI_IDS` entry), Linux binds this one through the ATI HDMI
+/// no-snoop preset, so it belongs in `HDA_ATI_HDMI_NS_DEVICES`: the
+/// registration gets the bind and `ati_hdmi_noncoherent` gives the
+/// probe the same explicit cache maintenance the other ATI HDMI
+/// functions receive. Without the entry the APU's only HDA function
+/// matched nothing and the target laptops had no HDA audio at all.
+pub const HDA_AMD_RENOIR_HDMI_DEVICE: u16 = 0x1637;
+
 /// ATI/AMD GPU HD-Audio functions Linux binds with
 /// `AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS`
 /// (sound/hda/controllers/intel.c): HDMI/DP audio beside a Radeon GPU, with
 /// snooping off and LPIB positions. 0xab40 is the newest (RDNA4-era) entry.
 pub const HDA_ATI_HDMI_NS_DEVICES: &[u16] = &[
-    0x0002, 0x1308, 0x157a, 0x15b3, 0x9840, 0x9902, 0xaaa0, 0xaaa8, 0xaab0, 0xaac0, 0xaac8, 0xaad8,
-    0xaae0, 0xaae8, 0xaaf0, 0xaaf8, 0xab00, 0xab08, 0xab10, 0xab18, 0xab20, 0xab28, 0xab30, 0xab38,
+    0x0002,
+    0x1308,
+    0x157a,
+    0x15b3,
+    HDA_AMD_RENOIR_HDMI_DEVICE,
+    0x9840,
+    0x9902,
+    0xaaa0,
+    0xaaa8,
+    0xaab0,
+    0xaac0,
+    0xaac8,
+    0xaad8,
+    0xaae0,
+    0xaae8,
+    0xaaf0,
+    0xaaf8,
+    0xab00,
+    0xab08,
+    0xab10,
+    0xab18,
+    0xab20,
+    0xab28,
+    0xab30,
+    0xab38,
     0xab40,
 ];
 /// Whether this controller needs explicit cache maintenance (Linux's
@@ -437,3 +470,36 @@ pub fn register_pci_driver() {
 }
 
 extern crate alloc;
+
+#[cfg(feature = "kernel-test")]
+mod renoir_bind_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// The Renoir APU audio function (1002:1637) binds through the ATI
+    /// HDMI NS table: the table membership is what registers the PCI
+    /// match, and the predicate is what the probe feeds the runtime's
+    /// non-coherent DMA setup — both halves of the bind are pinned.
+    /// (Lives in this module, not `hda_tests`, so the pin survives
+    /// alongside the tables it checks.)
+    fn native_hda_renoir_function_binds_ns() -> TestResult {
+        if !HDA_ATI_HDMI_NS_DEVICES.contains(&HDA_AMD_RENOIR_HDMI_DEVICE) {
+            return TestResult::Fail("Renoir 1002:1637 missing from ATI HDMI NS table");
+        }
+        if !ati_hdmi_noncoherent(HDA_AMD_RADEON_VENDOR, HDA_AMD_RENOIR_HDMI_DEVICE) {
+            return TestResult::Fail("Renoir function must get the no-snoop treatment");
+        }
+        // The vendor gate matters: the same device id under another
+        // vendor is not an ATI HDMI function.
+        if ati_hdmi_noncoherent(0x8086, HDA_AMD_RENOIR_HDMI_DEVICE) {
+            return TestResult::Fail("noncoherent predicate must be vendor-gated");
+        }
+        // The Phoenix APU function (1002:1640) deliberately stays on
+        // the named coherent path — it must not drift into the NS set.
+        if ati_hdmi_noncoherent(HDA_AMD_RADEON_VENDOR, 0x1640) {
+            return TestResult::Fail("Phoenix 1002:1640 must stay off the NS path");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/hda", native_hda_renoir_function_binds_ns);
+}
