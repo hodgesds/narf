@@ -51,9 +51,13 @@
 //! - Issue an `Enable Slot` command on the Command Ring and wait for
 //!   the Command Completion Event on the Event Ring (`§4.6.3`).
 //!
-//! Address Device + descriptor fetch + transfer rings are still
-//! follow-ups; the bones land here so the next pass can layer on
-//! `Address Device` against a known-good slot-id.
+//! On top of that bring-up: Address Device + descriptor fetch,
+//! control / bulk / interrupt transfer rings with retained-TD
+//! ownership, Configure Endpoint, the Stop Endpoint + Set TR
+//! Dequeue cancellation profile (`bulk_stop`), halted-endpoint
+//! recovery via Reset Endpoint (`reset_endpoint`), slot reclamation
+//! after Disable Slot (`reclaim_slot`), and full controller
+//! recovery with live devices (`recover_controller`).
 
 use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
@@ -74,6 +78,9 @@ mod bulk_stop;
 mod bulk_stop_native;
 mod completion;
 mod event_wait;
+#[cfg(feature = "kernel-test")]
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
 pub use bulk_owner::{Direction as BulkDirection, Token as BulkToken};
 pub mod cap;
 pub mod cmd_ring;
@@ -205,6 +212,10 @@ const TRB_TYPE_DISABLE_SLOT_CMD: u32 = 10;
 const TRB_TYPE_ADDRESS_DEVICE_CMD: u32 = 11;
 const TRB_TYPE_CONFIGURE_ENDPOINT_CMD: u32 = 12;
 const TRB_TYPE_EVAL_CONTEXT_CMD: u32 = 13;
+const TRB_TYPE_RESET_ENDPOINT_CMD: u32 = 14;
+#[allow(dead_code)] // named for symmetry; the Stop profile encodes 15 in bulk_stop
+const TRB_TYPE_STOP_ENDPOINT_CMD: u32 = 15;
+const TRB_TYPE_SET_TR_DEQUEUE_CMD: u32 = 16;
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const TRB_TYPE_NO_OP_CMD: u32 = 23;
 const TRB_TYPE_TRANSFER_EVENT: u32 = 32;
@@ -514,6 +525,11 @@ pub struct Xhci {
     /// visibility must imply its preceding forced TEs already quarantined.
     demux_publication: IrqSafeSpinLock<()>,
     events_overflowed: core::sync::atomic::AtomicU32,
+    /// Number of completed full controller recoveries
+    /// (`recover_controller`) since bring-up. The supervisor watches
+    /// this epoch: a change means every slot, binding and handle from
+    /// before the reset is dead and all ports must re-enumerate.
+    recovery_epoch: core::sync::atomic::AtomicU64,
     pub running: bool,
     /// MSI-X table handle owned by this controller. `Some` when
     /// `bring_up` successfully programmed interrupter 0's vector;
@@ -843,7 +859,24 @@ impl Xhci {
         if slots.any_reserved() || self.command_completions.lock().active() {
             return Err(XhciError::NotReady);
         }
+        // Keep the reservation held across both halves of the dance:
+        // `slots` stays in scope (as `_reservation`) until the
+        // restart completes, so no Address Device attempt or command
+        // submission can publish against the half-reset controller.
+        let _reservation = slots;
+        self.stop_and_reset_hardware()?;
+        self.reprogram_and_restart()
+    }
 
+    /// First half of the reset dance: halt the controller and issue
+    /// HCRST (the only way to clear HCE, xHCI §5.4.1.1), then wait
+    /// for CNR to clear. On success the controller is stopped and
+    /// provably performs no further DMA — that is what licenses a
+    /// caller to release device DMA pages afterwards. Callers own
+    /// the slot-reservation discipline: no command may be submitted
+    /// concurrently (submission try-locks the same reservation and
+    /// fails while a recovery holds it).
+    fn stop_and_reset_hardware(&self) -> Result<(), XhciError> {
         let mmio = &self.mmio;
         let op_off = self.op_off;
 
@@ -881,6 +914,18 @@ impl Xhci {
         if !cnr_clear {
             return Err(XhciError::NotReady);
         }
+        Ok(())
+    }
+
+    /// Second half of the reset dance: re-program CONFIG / DCBAAP /
+    /// CRCR / IR0 against the retained controller DMA pages, reset
+    /// the command/event ring cursors, re-plant the command-ring
+    /// Link TRB, drain the stale event queues and restart the
+    /// controller. Assumes `stop_and_reset_hardware` has completed
+    /// (CNR clear, no DMA in flight).
+    fn reprogram_and_restart(&self) -> Result<(), XhciError> {
+        let mmio = &self.mmio;
+        let op_off = self.op_off;
 
         // Re-program CONFIG.
         // SAFETY: same.
@@ -1005,6 +1050,103 @@ impl Xhci {
             return Err(XhciError::StartFailed);
         }
         Ok(())
+    }
+
+    /// Whether the controller has signalled an internal error
+    /// (USBSTS.HCE) that only a hardware reset clears. Supervisors
+    /// poll this to decide between `soft_recover` (no slots owned)
+    /// and `recover_controller` (slots owned).
+    pub fn needs_recovery(&self) -> bool {
+        self.usbsts() & USBSTS_HCE != 0
+    }
+
+    /// Number of completed full controller recoveries since
+    /// bring-up. A change invalidates every slot, binding and
+    /// `USBDevice` handle issued before it; supervisors compare the
+    /// epoch across their loop iterations to trigger wholesale
+    /// re-enumeration.
+    pub fn recovery_epoch(&self) -> u64 {
+        self.recovery_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Full controller recovery with live devices — the path
+    /// `soft_recover` refuses (it bails when any slot is reserved).
+    ///
+    /// Sequence, under the slot reservation (held throughout, so
+    /// command submission and Address Device fail `NotReady`
+    /// instead of publishing against a dying controller):
+    ///   1. Invalidate every slot generation — in-flight operations
+    ///      fail their next generation check rather than completing
+    ///      against wiped state.
+    ///   2. Halt + HCRST (`stop_and_reset_hardware`). Once this
+    ///      returns, the controller provably performs no DMA.
+    ///   3. Release every slot's DMA: zero its DCBAA entry, then
+    ///      drop the `Device` (device/input contexts, control ring
+    ///      and data pages, per-endpoint rings and buffers). Input
+    ///      Context pages from Configure Endpoint attempts were
+    ///      already adopted-or-retired by their own `CommandDma`
+    ///      contract and are not tracked here.
+    ///   4. Drop retained command receipts (their ring is about to
+    ///      restart at cursor 0; a stale receipt could alias a
+    ///      recycled entry's pointer).
+    ///   5. Reset the slot table to all-unused and re-run the
+    ///      bring-up register dance (`reprogram_and_restart`)
+    ///      against the retained controller DMA (DCBAA page itself,
+    ///      command/event rings, ERST, scratchpad).
+    ///   6. Bump the recovery epoch and return it. Every pre-reset
+    ///      handle is stale by construction: its generation no
+    ///      longer exists in any slot.
+    ///
+    /// On error the controller is left halted with all generations
+    /// invalidated — a dead but honest state; a later call may
+    /// retry the whole sequence.
+    pub fn recover_controller(&self) -> Result<u64, XhciError> {
+        let mut slots = self.slots.try_lock().ok_or(XhciError::NotReady)?;
+        slots.invalidate_all();
+
+        self.stop_and_reset_hardware()?;
+
+        // DMA is stopped: free every slot's pages. Zero the DCBAA
+        // entries first so no retained pointer names a freed page,
+        // then drop the Device values outside the devices lock
+        // (DmaBuffer release must not run under it longer than
+        // necessary, and drop order across slots does not matter).
+        let mut drained: alloc::vec::Vec<Device> = alloc::vec::Vec::new();
+        {
+            let mut devices = self.devices.lock();
+            for slot in 1..=self.caps.max_slots {
+                if devices.get(usize::from(slot)).is_some_and(Option::is_some) {
+                    // SAFETY: DCBAA is a retained 256-entry page;
+                    // `slot <= max_slots < 256` is in range. The
+                    // controller is halted post-HCRST and cannot
+                    // observe the transient value.
+                    unsafe {
+                        core::ptr::write_volatile(
+                            self.dcbaa.cpu_mut_ptr_at::<u64>(u64::from(slot) * 8),
+                            0,
+                        );
+                    }
+                }
+            }
+            self.dcbaa.sync(0, self.dcbaa.len());
+            device_dma_barrier();
+            for entry in devices.iter_mut() {
+                if let Some(device) = entry.take() {
+                    drained.push(device);
+                }
+            }
+        }
+        drop(drained);
+
+        self.command_completions.lock().clear();
+        slots.reset();
+        // `slots` stays in scope until the restart completes, so the
+        // reservation is held across `reprogram_and_restart` as the
+        // fn-level contract states.
+        self.reprogram_and_restart()?;
+
+        let epoch = self.recovery_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(epoch)
     }
 
     /// Bring up the controller far enough that USBCMD.RS = 1.
@@ -1708,6 +1850,7 @@ impl Xhci {
             transfer_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::with_capacity(64)),
             demux_publication: IrqSafeSpinLock::new(()),
             events_overflowed: core::sync::atomic::AtomicU32::new(0),
+            recovery_epoch: core::sync::atomic::AtomicU64::new(0),
             running: true,
             msix,
             irq_vector,
@@ -2399,6 +2542,11 @@ impl Xhci {
         // re-init before submitting the command. HCE is RO and only
         // clears on HCRST — without recovery the doorbell write
         // below has no effect and we'd time out 250 ms later.
+        // `soft_recover` refuses while any slot is reserved; with
+        // live devices the recovery path is `recover_controller`,
+        // driven by the supervisor (it invalidates every binding),
+        // so this call failing `NotReady` under reservations is the
+        // honest outcome, not a wedge.
         if self.usbsts() & USBSTS_HCE != 0 {
             self.soft_recover()?;
         }
@@ -2452,6 +2600,326 @@ impl Xhci {
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
+        }
+        Ok(())
+    }
+
+    /// Drop every queued event that names `slot_id` from the two
+    /// lossy demux queues. Retained receipts (command completions,
+    /// per-endpoint/control latches inside `Device`) are NOT touched
+    /// — they belong to operations whose waiters key on exact TRB
+    /// pointers, and they die with the `Device` when it is dropped.
+    fn purge_slot_events(&self, slot_id: u8) {
+        for queue in [&self.cmd_events, &self.transfer_events] {
+            queue.lock().retain(|event| {
+                let ty = (event[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+                !((ty == TRB_TYPE_TRANSFER_EVENT || ty == TRB_TYPE_CMD_COMPLETION)
+                    && event[3] >> 24 == u32::from(slot_id))
+            });
+        }
+    }
+
+    /// Reclaim a disabled slot so its id can be handed out again —
+    /// the explicit stop/drain/removal API the ownership model in
+    /// `bulk_owner` has always required before slot reuse.
+    ///
+    /// Preconditions (all verified, in order):
+    ///   1. The slot is retired, i.e. `disable_slot` has completed
+    ///      for it. That command's completion is the hardware
+    ///      quiescence proof: the controller no longer fetches the
+    ///      slot's contexts or rings.
+    ///   2. The retained `Device` entry is still present with
+    ///      generation 0 (the state `disable_slot` leaves behind).
+    ///
+    /// The reclaim then: drains the hardware event ring (so no
+    /// in-ring event for this slot can be demuxed after its DMA is
+    /// freed), zeroes the slot's DCBAA entry, drops the `Device`
+    /// (releasing the device/input contexts, control ring + data
+    /// page and every endpoint ring + buffer — including the state
+    /// of any TD that was still posted when the device vanished;
+    /// its token fails as stale from here on), purges the slot's
+    /// queued events, and only then returns the slot id to the
+    /// allocatable pool.
+    ///
+    /// A later Address Device for this id runs under a fresh
+    /// generation from the monotonic controller-global counter, so
+    /// no handle issued for the previous occupant can ever match
+    /// the new one. Reclaiming a live, unknown or already-reclaimed
+    /// slot is refused and changes nothing.
+    pub fn reclaim_slot(&self, slot_id: u8) -> Result<(), XhciError> {
+        if slot_id == 0 || slot_id > self.caps.max_slots {
+            return Err(XhciError::CmdFailed(0xFD));
+        }
+        {
+            let slots = self.slots.try_lock().ok_or(XhciError::NotReady)?;
+            if !slots.is_retired(slot_id) {
+                return Err(XhciError::NotReady);
+            }
+        }
+        // Move anything the ISR/demux has not yet lifted out of the
+        // hardware ring into the software queues, where the purge
+        // below can see it. A disabled slot produces no new events,
+        // so after this drain the slot is event-quiet.
+        self.drain_events();
+
+        let mut slots = self.slots.try_lock().ok_or(XhciError::NotReady)?;
+        // Re-check under the lock that performs the reclaim: a
+        // racing reclaim of the same slot must lose here.
+        if !slots.is_retired(slot_id) {
+            return Err(XhciError::NotReady);
+        }
+        let device = {
+            let mut devices = self.devices.lock();
+            let entry = devices
+                .get_mut(usize::from(slot_id))
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            if let Some(present) = entry.as_ref() {
+                if present.generation != 0 {
+                    // The entry never passed through
+                    // `disable_slot`'s invalidation — not ours to
+                    // reclaim.
+                    return Err(XhciError::NotReady);
+                }
+            }
+            // Zero the DCBAA entry before any context page is
+            // freed, so no retained pointer names released memory.
+            // The slot is disabled; the controller does not read
+            // this entry for a disabled slot, and the write also
+            // orders the free for any observer of the array. The
+            // zeroing is unconditional: a slot whose Address Device
+            // failed after DCBAA publication has no `Device` entry
+            // but may still have a stale entry here.
+            // SAFETY: DCBAA is a retained 256-entry page and
+            // `slot_id <= max_slots < 256` is in range.
+            unsafe {
+                core::ptr::write_volatile(
+                    self.dcbaa.cpu_mut_ptr_at::<u64>(u64::from(slot_id) * 8),
+                    0,
+                );
+            }
+            self.dcbaa.sync(usize::from(slot_id) * 8, 8);
+            device_dma_barrier();
+            entry.take()
+        };
+        // Release all of the slot's DMA while the reservation is
+        // held, so no new Address Device can observe the slot as
+        // simultaneously reclaimed and still DMA-backed.
+        drop(device);
+        self.purge_slot_events(slot_id);
+        slots.reclaim(slot_id).map_err(bulk_error)?;
+        Ok(())
+    }
+
+    /// Canonical enqueue cursor for an endpoint ring: a cursor on
+    /// the Link TRB slot canonicalizes to the ring start under the
+    /// toggled cycle bit — the same rule `bulk_stop::Plan` applies
+    /// for the Stop profile.
+    fn canonical_cursor(entries: usize, enqueue: usize, cycle: u32) -> (usize, u32) {
+        if enqueue + 1 == entries {
+            (0, cycle ^ 1)
+        } else {
+            (enqueue, cycle)
+        }
+    }
+
+    /// Command TRB words for the endpoint commands (Reset Endpoint
+    /// / Set TR Dequeue Pointer): dword 0..1 carry the dequeue
+    /// pointer (bit 0 = Dequeue Cycle State), dword 3 the type /
+    /// slot / DCI. The command-ring cycle bit is patched in by
+    /// `submit_command_record`, exactly as for the `bulk_stop`
+    /// coordinator's commands.
+    fn endpoint_command_words(kind: u32, slot_id: u8, dci: u8, dequeue: u64) -> [u32; 4] {
+        [
+            dequeue as u32,
+            (dequeue >> 32) as u32,
+            0,
+            (kind << TRB_TYPE_SHIFT) | (u32::from(slot_id) << 24) | (u32::from(dci) << 16),
+        ]
+    }
+
+    /// Read back one endpoint's output-context state + TR Dequeue
+    /// Pointer under the caller's claim — the Stop profile's
+    /// context step, shared with halt recovery.
+    fn endpoint_context_snapshot(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        dci: u8,
+    ) -> Result<(u8, u64), XhciError> {
+        let devices = self.devices.lock();
+        let device = devices
+            .get(usize::from(slot_id))
+            .and_then(Option::as_ref)
+            .ok_or(XhciError::CmdFailed(0xfd))?;
+        if device.generation != generation || !device.endpoint_configuration {
+            return Err(XhciError::CmdFailed(0xfd));
+        }
+        let offset = usize::from(dci) * self.context_stride() as usize;
+        device._device_ctx.sync(offset, 16);
+        device_dma_barrier();
+        // SAFETY: the output Device Context is a retained 4 KiB
+        // page; DCI <= 31 and the 32/64-byte context stride keep
+        // `offset + 16` in range. The xHC updated the context
+        // before the exact command completion this readback follows.
+        let (state, dequeue) = unsafe {
+            (
+                core::ptr::read_volatile(device._device_ctx.cpu_ptr_at::<u32>(offset as u64)),
+                core::ptr::read_volatile(device._device_ctx.cpu_ptr_at::<u64>(offset as u64 + 8)),
+            )
+        };
+        Ok(((state & 7) as u8, dequeue))
+    }
+
+    /// Recover a halted endpoint — the recovery the spec's bulk
+    /// profile has always carved out as separate work ("Halted
+    /// endpoint/device reset, EP0 cancellation and stalled-device
+    /// CLEAR_FEATURE recovery remain separate").
+    ///
+    /// Runs the hardware sequence: Reset Endpoint (Halted → Stopped
+    /// without touching the transfer ring), readback proving the
+    /// endpoint Stopped, then Set TR Dequeue Pointer to the
+    /// canonical enqueue cursor (everything before the cursor is
+    /// consumed-or-discarded; nothing is replayed), a second
+    /// readback proving Stopped at exactly that dequeue, and a
+    /// purge of the endpoint's queued Transfer Events so the
+    /// retained TD's late completion can never alias a future
+    /// transfer.
+    ///
+    /// Covers EP0 (DCI 1; claim state in `Device::control`, released
+    /// via `ControlState::force_reset` only at commit, after the
+    /// hardware proof) and bulk endpoints (claim state in the
+    /// endpoint's `bulk_owner`, quarantined via
+    /// `begin_halt_recovery`). Interrupt and isochronous endpoints
+    /// are refused — their submission paths retain no token state
+    /// to quarantine, and this coordinator does not guess at their
+    /// ownership.
+    ///
+    /// Discipline mirrors `stop_bulk`: claim first, publish second;
+    /// once claimed, any error leaves the claim in place (the
+    /// endpoint stays terminally busy) rather than reopening a
+    /// possibly-live ring. On success, a retained TD's token is
+    /// stale — its completion can never arrive and validation
+    /// rejects it — and the data toggles restart from the canonical
+    /// cursor; the device-side half of a stall is the caller's
+    /// `USBDevice::clear_endpoint_halt` (CLEAR_FEATURE) job.
+    pub async fn reset_endpoint(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        dci: u8,
+    ) -> Result<(), XhciError> {
+        if slot_id == 0 || slot_id > self.caps.max_slots || dci == 0 || dci > 31 {
+            return Err(XhciError::CmdFailed(0xfd));
+        }
+        enum Claim {
+            Control,
+            Bulk(Option<bulk_owner::StopIdentity>),
+        }
+        // Claim the slot's configuration window and capture the ring
+        // cursor, before any command is published.
+        let (claim, target, new_enq, new_pcs) = {
+            let mut devices = self.devices.lock();
+            let device = match devices
+                .get_mut(usize::from(slot_id))
+                .and_then(Option::as_mut)
+            {
+                Some(device) if generation != 0 && device.generation == generation => device,
+                _ => return Err(XhciError::CmdFailed(0xfd)),
+            };
+            if device.endpoint_configuration {
+                return Err(XhciError::NotReady);
+            }
+            let (ring, enq, pcs, claim) = if dci == 1 {
+                (
+                    device.ctrl_tr.dma_addr().raw(),
+                    device.ctrl_enq,
+                    device.ctrl_pcs,
+                    Claim::Control,
+                )
+            } else {
+                let ep = device
+                    .eps
+                    .get_mut(usize::from(dci - 2))
+                    .and_then(Option::as_mut)
+                    .ok_or(XhciError::CmdFailed(0xfa))?;
+                if !matches!(ep.kind, EndpointKind::BulkIn | EndpointKind::BulkOut) {
+                    return Err(XhciError::CmdFailed(0xf8));
+                }
+                let identity = ep
+                    .bulk
+                    .begin_halt_recovery(generation)
+                    .map_err(bulk_error)?;
+                (
+                    ep.tr.dma_addr().raw(),
+                    ep.enq,
+                    ep.pcs,
+                    Claim::Bulk(identity),
+                )
+            };
+            let (new_enq, new_pcs) = Self::canonical_cursor(CTRL_TR_TRBS, enq, pcs);
+            let target = ring + (new_enq as u64) * 16 | u64::from(new_pcs & 1);
+            device.endpoint_configuration = true;
+            (claim, target, new_enq, new_pcs)
+        };
+
+        // Reset Endpoint, then prove Stopped from the readback.
+        <Self as bulk_stop::Bus>::command(
+            self,
+            Self::endpoint_command_words(TRB_TYPE_RESET_ENDPOINT_CMD, slot_id, dci, 0),
+        )
+        .await?;
+        let (state, _) = self.endpoint_context_snapshot(slot_id, generation, dci)?;
+        if state != 3 {
+            return Err(XhciError::CmdFailed(0xf8));
+        }
+        // Set TR Dequeue Pointer to the canonical cursor, then prove
+        // Stopped at exactly that dequeue.
+        <Self as bulk_stop::Bus>::command(
+            self,
+            Self::endpoint_command_words(TRB_TYPE_SET_TR_DEQUEUE_CMD, slot_id, dci, target),
+        )
+        .await?;
+        let (state, dequeue) = self.endpoint_context_snapshot(slot_id, generation, dci)?;
+        if state != 3 || dequeue != target {
+            return Err(XhciError::CmdFailed(0xf8));
+        }
+        // Purge the endpoint's queued Transfer Events, re-verifying
+        // the claim first (the Stop profile's order).
+        self.endpoint_context_snapshot(slot_id, generation, dci)?;
+        self.transfer_events.lock().retain(|event| {
+            !(((event[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) == TRB_TYPE_TRANSFER_EVENT
+                && event[3] >> 24 == u32::from(slot_id)
+                && (event[3] >> 16) & 0x1f == u32::from(dci))
+        });
+        // Commit: release the retained claim state and publish the
+        // canonical cursor as the ring's software position.
+        {
+            let mut devices = self.devices.lock();
+            let device = match devices
+                .get_mut(usize::from(slot_id))
+                .and_then(Option::as_mut)
+            {
+                Some(device) if device.generation == generation => device,
+                _ => return Err(XhciError::CmdFailed(0xfd)),
+            };
+            match claim {
+                Claim::Control => {
+                    device.control.force_reset();
+                    device.ctrl_enq = new_enq;
+                    device.ctrl_pcs = new_pcs;
+                }
+                Claim::Bulk(identity) => {
+                    let ep = device
+                        .eps
+                        .get_mut(usize::from(dci - 2))
+                        .and_then(Option::as_mut)
+                        .ok_or(XhciError::CmdFailed(0xfa))?;
+                    ep.bulk.finish_halt_recovery(identity).map_err(bulk_error)?;
+                    ep.enq = new_enq;
+                    ep.pcs = new_pcs;
+                }
+            }
+            device.endpoint_configuration = false;
         }
         Ok(())
     }

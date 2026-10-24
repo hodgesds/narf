@@ -4310,6 +4310,40 @@ kernel_test_in!(
     smoke_usb_setup_packet_encode_vendor_and_get_descriptor
 );
 
+/// CLEAR_FEATURE(ENDPOINT_HALT) — the device half of halted-endpoint
+/// recovery (`USBDevice::clear_endpoint_halt`) must encode exactly
+/// the USB 2.0 §9.4.1 packet: host-to-device / standard / endpoint
+/// recipient, bRequest 1, wValue = feature selector 0, wIndex =
+/// endpoint address, no data stage.
+fn smoke_usb_clear_feature_endpoint_halt_packet() -> TestResult {
+    use crate::control::{clear_feature, FEATURE_ENDPOINT_HALT, RT_RECIP_ENDPOINT};
+    let s = clear_feature(RT_RECIP_ENDPOINT, FEATURE_ENDPOINT_HALT, 0x83);
+    if s.bm_request_type != 0x02 {
+        return TestResult::Fail("CLEAR_FEATURE bmRT must be 0x02 (OUT/std/endpoint)");
+    }
+    if s.b_request != 1 {
+        return TestResult::Fail("CLEAR_FEATURE bReq must be 1");
+    }
+    if s.w_value != 0 {
+        return TestResult::Fail("ENDPOINT_HALT feature selector must be 0");
+    }
+    if s.w_index != 0x83 {
+        return TestResult::Fail("CLEAR_FEATURE wIndex must be the endpoint address");
+    }
+    if s.w_length != 0 || s.is_in() {
+        return TestResult::Fail("CLEAR_FEATURE has no data stage and is OUT");
+    }
+    let expected: [u8; 8] = [0x02, 0x01, 0x00, 0x00, 0x83, 0x00, 0x00, 0x00];
+    if s.to_bytes() != expected {
+        return TestResult::Fail("CLEAR_FEATURE wire bytes mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/control",
+    smoke_usb_clear_feature_endpoint_halt_packet
+);
+
 /// rtl8xxxu integration — read MAC EFUSE byte via control-transfer
 /// SETUP-packet encoding matches the per-chip Realtek read layout.
 ///
