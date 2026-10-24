@@ -914,6 +914,7 @@ fn smoke_e2e_mouse_boot_report_to_router() -> TestResult {
         slot_id: 0,
         interrupt_in_ep: 0,
         interface_num: 0,
+        hub_port: None,
         last_buttons: 0,
         evdev_id,
         evdev_node,

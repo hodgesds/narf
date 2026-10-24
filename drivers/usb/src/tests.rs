@@ -262,7 +262,7 @@ fn smoke_xhci_address_device_qemu() -> TestResult {
                 return TestResult::Fail("address_device failed");
             }
             addressed_slot = Some(slot);
-            match hid::try_bind_kbd_already_addressed(&c, slot, port, speed).await {
+            match hid::try_bind_kbd_already_addressed(&c, slot, port, speed, None).await {
                 Ok(()) | Err(hid::HidError::NotBootKeyboard) => TestResult::Pass,
                 Err(_) => TestResult::Fail("HID bind after fresh Address Device failed"),
             }
@@ -327,7 +327,7 @@ fn smoke_xhci_hid_kbd_first_report() -> TestResult {
         if c.address_device(slot, port, speed).await.is_err() {
             return TestResult::Fail("HID Address Device failed");
         }
-        match hid::try_bind_kbd_already_addressed(&c, slot, port, speed).await {
+        match hid::try_bind_kbd_already_addressed(&c, slot, port, speed, None).await {
             Ok(()) => TestResult::Pass,
             Err(hid::HidError::NotBootKeyboard) => TestResult::Skip("port not a HID Boot Keyboard"),
             Err(_) => TestResult::Fail("HID configuration/transport failed"),
@@ -629,6 +629,16 @@ kernel_test_in!("drivers/usb/msc", smoke_msc_stale_adapter_generation_gate);
 // CBW and feed on completion) is exercised end-to-end only on
 // real hub hardware; QEMU's xtask topology attaches storage to
 // root ports, where hub_port is None and the hooks are no-ops.
+//
+// The fix-round fixtures at the end of this section pin the
+// HID half the same way: HID bindings record hub context,
+// `hid::hub_ports` collects it across the pumped classes
+// (deduplicated), and the wake step's pure selection
+// (`suspended_ports_among`) picks out only bound,
+// currently-suspended ports to resume before the pumps run.
+// The pumps' feed itself calls the same `mark_port_activity`
+// the bind-stamps fixture already proves pushes the deadline
+// out.
 
 fn fake_hub_binding(slot_id: u8, num_ports: u8) -> crate::attach::HubBinding {
     crate::attach::HubBinding {
@@ -777,6 +787,97 @@ fn smoke_hub_bind_stamps_activity() -> TestResult {
     result
 }
 kernel_test_in!("drivers/usb/hub_pm", smoke_hub_bind_stamps_activity);
+
+/// Wake-step selection matrix for `suspended_ports_among`, the
+/// pure filter behind `hid::resume_suspended_hub_ports`: only
+/// bound + currently-suspended ports are selected; duplicate
+/// pairs (two classes bound on one port) collapse; unknown
+/// hubs and suspended-but-unbound bits are ignored.
+fn smoke_hub_hid_wake_selection() -> TestResult {
+    use crate::attach::suspended_ports_among;
+    let mut h0 = fake_hub_binding(7, 4);
+    // Port 1: bound + suspended → selected.
+    h0.bound_downstream |= 1 << 1;
+    h0.suspended_downstream |= 1 << 1;
+    // Port 2: bound, awake → not selected.
+    h0.bound_downstream |= 1 << 2;
+    // Port 3: suspended bit set but never bound → ignored.
+    h0.suspended_downstream |= 1 << 3;
+    let mut h1 = fake_hub_binding(8, 2);
+    // Hub 1 port 2: bound + suspended → selected.
+    h1.bound_downstream |= 1 << 2;
+    h1.suspended_downstream |= 1 << 2;
+    let hubs = alloc::vec![h0, h1];
+    let bindings = alloc::vec![
+        (0usize, 1u8),
+        (0usize, 2u8),
+        (0usize, 3u8),
+        (1usize, 2u8),
+        (0usize, 1u8), // duplicate — collapses
+        (9usize, 1u8), // unknown hub
+    ];
+    let got = suspended_ports_among(&hubs, &bindings);
+    if got != alloc::vec![(0usize, 1u8), (1usize, 2u8)] {
+        return TestResult::Fail("wake selection mismatch");
+    }
+    // Nothing suspended → nothing woken (the wake step must
+    // never touch an awake port).
+    let mut h2 = fake_hub_binding(9, 1);
+    h2.bound_downstream |= 1 << 1;
+    if !suspended_ports_among(&alloc::vec![h2], &alloc::vec![(0usize, 1u8)]).is_empty() {
+        return TestResult::Fail("awake bound port selected for wake");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hub_pm", smoke_hub_hid_wake_selection);
+
+/// Registry-level: `hid::hub_ports` collects the hub contexts
+/// the dispatcher recorded on live HID bindings across the
+/// pumped classes, sorted + deduplicated (a composite device
+/// binds two classes on one port), and omits root-attached
+/// bindings. Seeds the keyboard + consumer registries via
+/// their test hooks and resets them afterwards.
+fn smoke_hub_hid_context_collection() -> TestResult {
+    use crate::hid::{self, BootKeyboard, KbdReport};
+    hid::__reset_keyboards_for_test();
+    hid::consumer::__reset_consumers_for_test();
+    let result = (|| {
+        hid::__push_keyboard_for_test(BootKeyboard {
+            slot_id: 11,
+            interrupt_in_ep: 3,
+            interface_num: 0,
+            hub_port: Some((0, 1)),
+            last_report: KbdReport::default(),
+        });
+        // A second binding on the same port — must collapse.
+        hid::__push_keyboard_for_test(BootKeyboard {
+            slot_id: 12,
+            interrupt_in_ep: 3,
+            interface_num: 0,
+            hub_port: Some((0, 1)),
+            last_report: KbdReport::default(),
+        });
+        // Root-attached keyboard — omitted.
+        hid::__push_keyboard_for_test(BootKeyboard {
+            slot_id: 13,
+            interrupt_in_ep: 3,
+            interface_num: 0,
+            hub_port: None,
+            last_report: KbdReport::default(),
+        });
+        // A second class on a different hub's port.
+        hid::consumer::__push_consumer_for_test(14, Some((1, 2)));
+        let got = hid::hub_ports();
+        if got != alloc::vec![(0usize, 1u8), (1usize, 2u8)] {
+            return TestResult::Fail("hub_ports aggregation mismatch");
+        }
+        TestResult::Pass
+    })();
+    hid::__reset_keyboards_for_test();
+    hid::consumer::__reset_consumers_for_test();
+    result
+}
+kernel_test_in!("drivers/usb/hub_pm", smoke_hub_hid_context_collection);
 
 // ── MSC BBB protocol codec unit tests ──────────────────────────────
 
@@ -1307,6 +1408,7 @@ fn smoke_hid_diff_press_release_repeat() -> TestResult {
         slot_id: 1,
         interrupt_in_ep: 3,
         interface_num: 0,
+        hub_port: None,
         last_report: KbdReport::default(),
     };
 
@@ -1417,6 +1519,7 @@ fn smoke_hid_rollover_suppressed() -> TestResult {
         slot_id: 1,
         interrupt_in_ep: 3,
         interface_num: 0,
+        hub_port: None,
         last_report: KbdReport::default(),
     };
     // The HID error roll-over: all six positions = 0x01 with no
@@ -1445,6 +1548,7 @@ fn smoke_hid_modifier_only_transition() -> TestResult {
         slot_id: 1,
         interrupt_in_ep: 3,
         interface_num: 0,
+        hub_port: None,
         last_report: KbdReport::default(),
     };
     // Press LCtrl alone → one event with CTRL set.
@@ -1954,6 +2058,7 @@ fn smoke_hid_boot_mouse_translate_diff() -> TestResult {
         slot_id: 1,
         interrupt_in_ep: 3,
         interface_num: 0,
+        hub_port: None,
         last_buttons: 0,
         evdev_id,
         evdev_node,

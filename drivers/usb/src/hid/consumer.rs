@@ -132,6 +132,12 @@ pub struct ConsumerDevice {
     /// item, every report starts with that byte and we strip it
     /// before parsing the usage-code bytes. `None` = no report ID.
     pub report_id: Option<u8>,
+    /// Hub context — (index into `attach::HUBS`, downstream
+    /// port) — when the device sits behind a hub; `None` on a
+    /// root port, whose ports are never idle-suspended. The
+    /// pump feeds `attach::mark_port_activity` with it whenever
+    /// a report completes (#840).
+    pub hub_port: Option<(usize, u8)>,
     /// Previous report payload (up to 8 usage codes, list-encoded).
     /// Diffed against each new report to synthesise press/release
     /// events. Stored in `[u16; 8]` to handle 2-byte usage codes.
@@ -584,6 +590,7 @@ pub async fn try_bind_consumer_already_addressed(
     slot_id: u8,
     _interface_num: u8,
     desc: &[u8],
+    hub_port: Option<(usize, u8)>,
 ) -> Result<(), HidError> {
     // Step 1: find the HID interface with its HID Descriptor offset +
     // interrupt-IN endpoint. The `interface_num` argument is the
@@ -688,6 +695,7 @@ pub async fn try_bind_consumer_already_addressed(
         interrupt_in_dci: dci,
         interface_num: iface_num,
         report_id,
+        hub_port,
         last_report: IrqSafeSpinLock::new([0u16; 8]),
     };
     {
@@ -710,6 +718,14 @@ pub async fn try_bind_consumer_already_addressed(
 
 // ── Pump ───────────────────────────────────────────────────────────
 
+/// Hub contexts of all live consumer bindings (root-attached
+/// bindings omitted). Aggregated by `hid::hub_ports` for the
+/// supervisor's HID wake step.
+pub fn hub_ports() -> alloc::vec::Vec<(usize, u8)> {
+    let g = CONSUMER_DEVICES.lock();
+    g.iter().filter_map(|d| d.hub_port).collect()
+}
+
 /// Drain pending reports from all bound Consumer Control devices,
 /// diff each against its previous report, and push press/release
 /// events onto the global Key ring. Returns total events emitted.
@@ -731,19 +747,21 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
 fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
     // Snapshot the fields we need without holding the registry lock
     // across the poll calls (which may access DMA-mapped buffers).
-    let (slot_id, dci, report_id) = {
+    let (slot_id, dci, report_id, hub_port) = {
         let g = CONSUMER_DEVICES.lock();
         match g.get(idx) {
-            Some(d) => (d.slot_id, d.interrupt_in_dci, d.report_id),
+            Some(d) => (d.slot_id, d.interrupt_in_dci, d.report_id, d.hub_port),
             None => return 0,
         }
     };
 
     let mut buf = [0u8; CONSUMER_REPORT_BUF];
     let mut total = 0usize;
+    let mut reports = 0usize;
     loop {
         match xhci_dev.poll_interrupt_in(slot_id, dci, &mut buf) {
             Ok(Some(_n)) => {
+                reports += 1;
                 let cur = decode_report(&buf, report_id);
                 let prev = {
                     let g = CONSUMER_DEVICES.lock();
@@ -766,6 +784,14 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
         }
         // Reset buffer for next iteration.
         buf = [0u8; CONSUMER_REPORT_BUF];
+    }
+    // Completed interrupt-IN transfers are activity on the
+    // device's hub port (#840) — feed even when the reports
+    // diffed to zero emitted events. No-op when root-attached.
+    if reports > 0 {
+        if let Some((hub_idx, port)) = hub_port {
+            crate::attach::mark_port_activity(hub_idx, port);
+        }
     }
     total
 }
@@ -807,6 +833,18 @@ pub fn clear_consumers() {
 pub fn __reset_consumers_for_test() {
     CONSUMER_DEVICES.lock().clear();
     ATTACHED_CONSUMER_COUNT.store(0, core::sync::atomic::Ordering::Release);
+}
+
+#[doc(hidden)]
+pub fn __push_consumer_for_test(slot_id: u8, hub_port: Option<(usize, u8)>) {
+    CONSUMER_DEVICES.lock().push(ConsumerDevice {
+        slot_id,
+        interrupt_in_dci: 0,
+        interface_num: 0,
+        report_id: None,
+        hub_port,
+        last_report: IrqSafeSpinLock::new([0u16; 8]),
+    });
 }
 
 // ── Smokes ─────────────────────────────────────────────────────────

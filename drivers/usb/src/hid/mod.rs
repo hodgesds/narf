@@ -146,6 +146,13 @@ pub struct BootKeyboard {
     pub slot_id: u8,
     pub interrupt_in_ep: u8, // DCI of the interrupt-IN endpoint
     pub interface_num: u8,
+    /// Hub context — (index into `attach::HUBS`, downstream
+    /// port) — when the keyboard sits behind a hub; `None` on a
+    /// root port, whose ports are never idle-suspended. The
+    /// pump feeds `attach::mark_port_activity` with it whenever
+    /// a report completes, so an in-use keyboard's port never
+    /// idle-suspends mid-typing (#840).
+    pub hub_port: Option<(usize, u8)>,
     /// Last report seen, used for press/release diffing in
     /// `pump_once`. Initialised to the all-zero report so the
     /// first non-empty poll fires presses for every key in it.
@@ -229,6 +236,7 @@ impl BootKeyboard {
         slot_id: u8,
         interface_num: u8,
         interrupt_in_ep: u8,
+        hub_port: Option<(usize, u8)>,
     ) -> Result<Self, HidError> {
         // Set Protocol class request (§7.2.6):
         //   bmRequestType: 0x21 (Class | Interface | Host-to-Device)
@@ -279,6 +287,7 @@ impl BootKeyboard {
             slot_id,
             interrupt_in_ep,
             interface_num,
+            hub_port,
             last_report: KbdReport::default(),
         })
     }
@@ -309,8 +318,22 @@ impl BootKeyboard {
     /// (zero or more reports per call).
     pub fn pump_once(&mut self, xhci_dev: &Xhci) -> Result<usize, HidError> {
         let mut total = 0usize;
+        let mut reports = 0usize;
         while let Some(report) = self.read_report(xhci_dev)? {
+            reports += 1;
             total += self.translate_report(report);
+        }
+        // A completed interrupt-IN transfer is activity on the
+        // binding's hub port (#840): feed it so the supervisor's
+        // idle-suspend pass never gates a keyboard mid-typing.
+        // Feeding keys on completed *transfers*, not emitted
+        // events — a report that diffs to zero events still
+        // proves the device is in use. No-op for root-attached
+        // keyboards (`hub_port` is `None`).
+        if reports > 0 {
+            if let Some((hub_idx, port)) = self.hub_port {
+                crate::attach::mark_port_activity(hub_idx, port);
+            }
         }
         Ok(total)
     }
@@ -607,8 +630,9 @@ pub async fn try_bind_kbd_already_addressed(
     slot_id: u8,
     port: u8,
     speed: xhci::PortSpeed,
+    hub_port: Option<(usize, u8)>,
 ) -> Result<(), HidError> {
-    let r = bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed).await;
+    let r = bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed, hub_port).await;
     if r.is_ok() {
         note_attach_ok(port);
     }
@@ -640,7 +664,7 @@ async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
                 note_attach_fail(port, AttachStep::AddressDevice, &err);
                 err
             })?;
-        bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed).await
+        bind_kbd_addressed_slot(xhci_dev, slot_id, port, speed, None).await
     }
     .await;
     if res.is_err() {
@@ -664,6 +688,7 @@ async fn bind_kbd_addressed_slot(
     slot_id: u8,
     port: u8,
     speed: xhci::PortSpeed,
+    hub_port: Option<(usize, u8)>,
 ) -> Result<(), HidError> {
     // GET_DESCRIPTOR(DEVICE) and refresh EP0 MaxPacketSize via
     // Evaluate Context if the device's real bMaxPacketSize0
@@ -772,7 +797,7 @@ async fn bind_kbd_addressed_slot(
 
     let interrupt_in_ep = ep.ep_addr & 0x0F; // DCI computed from this on RX
     let dci = (interrupt_in_ep * 2) + 1;
-    let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci)
+    let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci, hub_port)
         .await
         .inspect_err(|e| {
             note_attach_fail(port, AttachStep::SetProtocol, e);
@@ -822,6 +847,60 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
     total
 }
 
+/// Snapshot the hub contexts of every live HID binding across
+/// the pumped classes (boot keyboards here, plus mouse /
+/// touchpad / consumer), sorted and deduplicated — a composite
+/// device can bind two classes on the same hub port.
+/// Root-attached bindings (`hub_port` is `None`) are omitted:
+/// root ports are never idle-suspended.
+pub fn hub_ports() -> alloc::vec::Vec<(usize, u8)> {
+    let mut v: alloc::vec::Vec<(usize, u8)> = {
+        let g = KEYBOARDS.lock();
+        g.iter().filter_map(|k| k.hub_port).collect()
+    };
+    v.extend(mouse::hub_ports());
+    v.extend(touchpad::hub_ports());
+    v.extend(consumer::hub_ports());
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Supervisor wake step for hub-attached HID, run immediately
+/// before the pump calls each cycle (#840). A suspended port
+/// gates the device's interrupt endpoint, so the pump can
+/// neither observe a report nor feed activity for it — and no
+/// device-initiated path back exists in the tree (nothing
+/// enables remote wakeup on HID devices or watches hub
+/// port-change bits). For every HID-bound port the registry
+/// currently marks suspended, resume it via the idempotent
+/// `attach::resume_port`, then replace the resume sentinel
+/// with a real tick via `attach::mark_port_activity`: the
+/// resume opens a fresh idle window (the same rule
+/// `attach::mark_ports_bound` applies at bind), so a device
+/// that stays silent re-suspends after a full idle window
+/// and is woken again on a later cycle, while a device that
+/// starts reporting takes over its own feeding through the
+/// pumps. Ports whose resume fails keep their suspended bit
+/// and are retried on the next cycle.
+pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
+    // Collect binding contexts first, then snapshot the hub
+    // registry — never hold HUBS across the HID registry locks
+    // (the pumps nest the other way: registry lock held while
+    // `mark_port_activity` takes HUBS).
+    let ports = hub_ports();
+    let targets = {
+        let g = crate::attach::HUBS.lock();
+        crate::attach::suspended_ports_among(&g[..], &ports)
+    };
+    for (hub_idx, port) in targets {
+        crate::attach::resume_port(xhci_dev, hub_idx, port).await;
+        if !crate::attach::hub_port_is_suspended(hub_idx, port) {
+            crate::attach::mark_port_activity(hub_idx, port);
+        }
+    }
+}
+
 /// Diagnostic counter: how many times `pump_all` has been called
 /// since boot. Increments on every supervisor wake (xHCI IRQ or
 /// 100 ms timeout). Surfaced in the FB status panel so a real-HW
@@ -867,4 +946,9 @@ pub fn clear_boot_keyboards() {
 pub fn __reset_keyboards_for_test() {
     KEYBOARDS.lock().clear();
     ATTACHED_KEYBOARD_COUNT.store(0, core::sync::atomic::Ordering::Release);
+}
+
+#[doc(hidden)]
+pub fn __push_keyboard_for_test(kbd: BootKeyboard) {
+    KEYBOARDS.lock().push(kbd);
 }

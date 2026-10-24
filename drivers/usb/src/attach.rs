@@ -223,10 +223,37 @@ pub fn mark_ports_bound(parent_hub_idx: usize, bits: u64) {
 }
 
 /// Find the [`HUBS`] index of the hub occupying xHCI slot
-/// `slot_id`. [`HUBS`] is append-only for the life of the system,
-/// so the index is stable once the hub has bound. Class drivers
-/// key their hub-PM calls ([`mark_port_activity`], [`resume_port`])
-/// by this index.
+/// `slot_id`. Class drivers key their hub-PM calls
+/// ([`mark_port_activity`], [`resume_port`]) by this index.
+///
+/// First-match is unambiguous: at most one entry can carry a
+/// given slot id at any time, even once slot ids recycle — the
+/// composition this branch must stay correct under once slot
+/// reclamation (queue 10) and hub detach (queue 11) land. The
+/// invariant rests on four pillars, each verifiable in-tree:
+///   1. Entries are created at exactly one site — the hub arm
+///      of `dispatch_after_address` — one push per successful
+///      hub bind of an addressed slot.
+///   2. A slot id returns to the allocatable pool only via
+///      `Xhci::reclaim_slot`, whose sole caller is
+///      `detach_slot`; and `detach_slot` removes *every* HUBS
+///      entry for the slot (`retain`) strictly before it
+///      disables and reclaims the slot. Attach-failure paths
+///      call `disable_slot` but never `reclaim_slot`, so a
+///      failed bind's id stays retired rather than recycling
+///      under a live entry.
+///   3. Wholesale controller recovery clears HUBS entirely
+///      (`detach_all_bindings`) in the same supervisor step
+///      that observes the recovery-epoch change, before any
+///      re-enumeration can push a fresh entry.
+///   4. Attach and detach both run in the single supervisor
+///      task, and this helper's only production caller is the
+///      supervisor's attach walk — no interleaving can observe
+///      a half-detached registry or bind a child under a hub
+///      whose entry is being removed.
+/// A stale live entry would have to survive its occupant's
+/// detach, which pillar 2 makes impossible: removal strictly
+/// precedes reuse.
 pub fn hub_index_for_slot(slot_id: u8) -> Option<usize> {
     let g = HUBS.lock();
     g.iter().position(|h| h.hub.slot_id == slot_id)
@@ -332,6 +359,45 @@ pub async fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_idx: usize, po
             h.last_activity_tick[port as usize & 63] = u64::MAX;
         }
     }
+}
+
+/// True iff `port` of hub `parent_hub_idx` is currently marked
+/// suspended in the registry — the bookkeeping bit
+/// [`idle_suspend_pass`] sets and [`resume_port`] clears. This
+/// is a registry read, not a hardware probe (the hardware-side
+/// equivalent is `UsbHub::port_is_suspended`).
+pub fn hub_port_is_suspended(parent_hub_idx: usize, port: u8) -> bool {
+    let g = HUBS.lock();
+    match g.get(parent_hub_idx) {
+        Some(h) => h.suspended_downstream & (1u64 << (port as u32 & 63)) != 0,
+        None => false,
+    }
+}
+
+/// Pure selection behind the supervisor's HID wake step: the
+/// subset of `ports` — hub contexts recorded by class-driver
+/// bindings — that names a bound, currently-suspended port.
+/// Split out from `hid::resume_suspended_hub_ports` so the
+/// selection policy is unit-testable without a controller,
+/// mirroring [`idle_suspend_candidates`]. Duplicate pairs in
+/// `ports` (a composite device can bind two classes on one
+/// port) collapse to one entry.
+pub(crate) fn suspended_ports_among(
+    hubs: &[HubBinding],
+    ports: &[(usize, u8)],
+) -> Vec<(usize, u8)> {
+    let mut out: Vec<(usize, u8)> = Vec::new();
+    for &(idx, port) in ports {
+        let bit = 1u64 << (port as u32 & 63);
+        let selected = match hubs.get(idx) {
+            Some(h) => h.bound_downstream & bit != 0 && h.suspended_downstream & bit != 0,
+            None => false,
+        };
+        if selected && !out.contains(&(idx, port)) {
+            out.push((idx, port));
+        }
+    }
+    out
 }
 
 /// Drive enumeration for a device on root-hub `port`. Returns the
@@ -520,8 +586,9 @@ pub fn detach_all_bindings() {
 /// dedup; `root_port` is the root-hub port that anchors the path.
 /// `parent_hub_idx` is the [`HUBS`] index of the parent hub when
 /// the device sits behind one (`None` on a root port); class
-/// drivers that participate in hub idle-suspend (MSC today) record
-/// it with their port so they can resume / feed their port.
+/// drivers that participate in hub idle-suspend (MSC and the
+/// pumped HID classes) record it with their port so they can
+/// resume / feed their port.
 async fn dispatch_after_address(
     xhci_dev: &Xhci,
     slot_id: u8,
@@ -662,9 +729,15 @@ async fn dispatch_after_address(
     // CDC-NCM → btusb → WBDI fingerprint. Keyboard and mouse use
     // class-at-interface match; the rest fingerprint via the config
     // descriptor blob.
-    if hid::try_bind_kbd_already_addressed(xhci_dev, slot_id, port, speed)
-        .await
-        .is_ok()
+    if hid::try_bind_kbd_already_addressed(
+        xhci_dev,
+        slot_id,
+        port,
+        speed,
+        parent_hub_idx.map(|idx| (idx, port)),
+    )
+    .await
+    .is_ok()
     {
         return AttachOutcome::Keyboard;
     }
@@ -678,7 +751,13 @@ async fn dispatch_after_address(
         // shape matching a precision-touchpad device.
         if let Some((iface, hid_off, ep)) = hid::touchpad::find_hid_interface(&cfg_blob) {
             if hid::touchpad::try_bind_touchpad_already_addressed(
-                xhci_dev, slot_id, iface, hid_off, &cfg_blob, ep,
+                xhci_dev,
+                slot_id,
+                iface,
+                hid_off,
+                &cfg_blob,
+                ep,
+                parent_hub_idx.map(|idx| (idx, port)),
             )
             .await
             .is_ok()
@@ -691,9 +770,15 @@ async fn dispatch_after_address(
         // report-descriptor shape) and before Boot Mouse (protocol 2)
         // because consumer interfaces present protocol=0 and would
         // look like a non-boot HID device to the mouse scanner.
-        if hid::consumer::try_bind_consumer_already_addressed(xhci_dev, slot_id, 0, &cfg_blob)
-            .await
-            .is_ok()
+        if hid::consumer::try_bind_consumer_already_addressed(
+            xhci_dev,
+            slot_id,
+            0,
+            &cfg_blob,
+            parent_hub_idx.map(|idx| (idx, port)),
+        )
+        .await
+        .is_ok()
         {
             return AttachOutcome::ConsumerControl;
         }
@@ -702,9 +787,14 @@ async fn dispatch_after_address(
         // demoted to a boot mouse, but before CDC-ACM so a USB mouse
         // isn't misclassified as a serial dongle.
         if mouse::find_boot_mouse(&cfg_blob).is_ok()
-            && mouse::try_bind_mouse_already_addressed(xhci_dev, slot_id, speed)
-                .await
-                .is_ok()
+            && mouse::try_bind_mouse_already_addressed(
+                xhci_dev,
+                slot_id,
+                speed,
+                parent_hub_idx.map(|idx| (idx, port)),
+            )
+            .await
+            .is_ok()
         {
             return AttachOutcome::Mouse;
         }

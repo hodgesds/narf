@@ -135,7 +135,15 @@ also consult upstream Linux GPL sources.
   takes the device's hub context — (index into `attach::HUBS`,
   downstream port), `None` on a root port — and `MscDevice` records
   it as `hub_port`; its BOT funnels resume-then-feed on every
-  transaction.
+  transaction. The pumped HID classes (boot keyboard, boot mouse,
+  PTP touchpad, consumer control) record the same `hub_port`
+  context through their `try_bind_*_already_addressed` binders;
+  their pumps feed on each completed interrupt-IN report, and the
+  supervisor resumes suspended HID-bound ports immediately before
+  the pumps each cycle (`hid::resume_suspended_hub_ports`),
+  opening a fresh idle window — a suspended port gates the very
+  interrupt endpoint the pump polls, so the resume has to come
+  from the supervisor side of the pump, not from report traffic.
 - `Xhci::address_device_with(..., Topology)` retains the topology for later
   Evaluate Context operations; marking a downstream device as a hub must not
   erase its route string or parent-TT fields.

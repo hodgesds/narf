@@ -85,6 +85,13 @@ pub struct BootMouse {
     pub slot_id: u8,
     pub interrupt_in_ep: u8,
     pub interface_num: u8,
+    /// Hub context — (index into `attach::HUBS`, downstream
+    /// port) — when the mouse sits behind a hub; `None` on a
+    /// root port, whose ports are never idle-suspended. The
+    /// pump feeds `attach::mark_port_activity` with it whenever
+    /// a report completes, so an in-use mouse's port never
+    /// idle-suspends mid-motion (#840).
+    pub hub_port: Option<(usize, u8)>,
     /// Last button mask, used to diff press / release on `pump_once`.
     /// Movement deltas are accumulator-free — the device sends a
     /// fresh dx/dy every report, so each report is a self-contained
@@ -178,6 +185,7 @@ impl BootMouse {
         slot_id: u8,
         interface_num: u8,
         interrupt_in_ep: u8,
+        hub_port: Option<(usize, u8)>,
     ) -> Result<Self, HidError> {
         xhci_dev
             .control_out(
@@ -204,6 +212,7 @@ impl BootMouse {
             slot_id,
             interrupt_in_ep,
             interface_num,
+            hub_port,
             last_buttons: 0,
             evdev_id,
             evdev_node,
@@ -239,8 +248,20 @@ impl BootMouse {
     /// call. Non-blocking.
     pub fn pump_once(&mut self, xhci_dev: &Xhci) -> Result<usize, HidError> {
         let mut total = 0usize;
+        let mut reports = 0usize;
         while let Some(report) = self.read_report(xhci_dev)? {
+            reports += 1;
             total += self.translate_report(report);
+        }
+        // A completed interrupt-IN transfer is activity on the
+        // binding's hub port (#840) — feed it, keyed on
+        // completed transfers rather than emitted events (an
+        // idle report diffs to zero events but still proves
+        // the device is in use). No-op when root-attached.
+        if reports > 0 {
+            if let Some((hub_idx, port)) = self.hub_port {
+                crate::attach::mark_port_activity(hub_idx, port);
+            }
         }
         Ok(total)
     }
@@ -369,8 +390,9 @@ pub async fn try_bind_mouse_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
     speed: crate::xhci::PortSpeed,
+    hub_port: Option<(usize, u8)>,
 ) -> Result<(), HidError> {
-    bind_mouse_addressed_slot(xhci_dev, slot_id, speed).await
+    bind_mouse_addressed_slot(xhci_dev, slot_id, speed, hub_port).await
 }
 
 async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
@@ -382,7 +404,7 @@ async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
             .address_device(slot_id, port, speed)
             .await
             .map_err(HidError::Xhci)?;
-        bind_mouse_addressed_slot(xhci_dev, slot_id, speed).await
+        bind_mouse_addressed_slot(xhci_dev, slot_id, speed, None).await
     }
     .await;
     if res.is_err() {
@@ -401,6 +423,7 @@ async fn bind_mouse_addressed_slot(
     xhci_dev: &Xhci,
     slot_id: u8,
     speed: crate::xhci::PortSpeed,
+    hub_port: Option<(usize, u8)>,
 ) -> Result<(), HidError> {
     // Refresh EP0 MPS via Evaluate Context once the device tells
     // us its real bMaxPacketSize0. Same logic as kbd path
@@ -477,7 +500,7 @@ async fn bind_mouse_addressed_slot(
         .map_err(HidError::Xhci)?;
 
     let dci = ((ep.ep_addr & 0x0F) * 2) + 1;
-    let m = BootMouse::attach(xhci_dev, slot_id, iface, dci).await?;
+    let m = BootMouse::attach(xhci_dev, slot_id, iface, dci, hub_port).await?;
     {
         let mut g = MICE.lock();
         g.push(m);
@@ -496,6 +519,14 @@ pub static ATTACHED_MOUSE_COUNT: core::sync::atomic::AtomicU32 =
 /// Number of mice currently bound. Lock-free read of the snapshot.
 pub fn attached_mouse_count() -> usize {
     ATTACHED_MOUSE_COUNT.load(core::sync::atomic::Ordering::Acquire) as usize
+}
+
+/// Hub contexts of all live mouse bindings (root-attached
+/// bindings omitted). Aggregated by `hid::hub_ports` for the
+/// supervisor's HID wake step.
+pub fn hub_ports() -> alloc::vec::Vec<(usize, u8)> {
+    let g = MICE.lock();
+    g.iter().filter_map(|m| m.hub_port).collect()
 }
 
 /// Drain one report from each attached mouse. Returns total events
