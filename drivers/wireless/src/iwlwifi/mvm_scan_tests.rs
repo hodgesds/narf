@@ -35,6 +35,7 @@ impl Fixture {
                 phase: Phase::Configured,
                 mac: Some([2; 6]),
                 nvm: Some(station_api::Nvm::parse(4, &nvm).unwrap()),
+                peer: None,
                 beacons: vec![],
                 channel: super::super::channel::ChannelContext::new(
                     &super::super::super::firmware_api::FirmwareApi::default(),

@@ -50,6 +50,7 @@ impl Fixture {
                 phase: Phase::Configured,
                 mac: Some([2; 6]),
                 nvm: Some(nvm()),
+                peer: None,
                 beacons: vec![],
                 scan: super::super::scan::ScanContext::new(&api),
                 channel: ChannelContext::new(&api),

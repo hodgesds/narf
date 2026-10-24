@@ -95,18 +95,19 @@ int main(void){
  dump("UP_102",WMI_10_2_VDEV_UP_CMDID,ath10k_wmi_op_gen_vdev_up(&ar,0,7,(u8[]){2,8,9,10,11,12}));
  dump("UP_104",WMI_10_4_VDEV_UP_CMDID,ath10k_wmi_op_gen_vdev_up(&ar,0,7,(u8[]){2,8,9,10,11,12}));
  dump("UP_TLV",WMI_TLV_VDEV_UP_CMDID,ath10k_wmi_tlv_op_gen_vdev_up(&ar,0,7,(u8[]){2,8,9,10,11,12}));
- for(unsigned ofdm=0;ofdm<2;ofdm++){
+ for(unsigned ofdm=0;ofdm<3;ofdm++){
   struct wmi_peer_assoc_complete_arg arg={.addr={2,8,9,10,11,12},.peer_aid=7,.peer_caps=0x421,.peer_listen_intval=1,.peer_num_spatial_streams=1,.peer_phymode=ofdm?MODE_11G:MODE_11B};
   arg.peer_legacy_rates.num_rates=1;arg.peer_legacy_rates.rates[0]=ofdm?12:2;
+  if(ofdm==2){arg.peer_legacy_rates.num_rates=11;memcpy(arg.peer_legacy_rates.rates,(u8[]){2,4,11,22,12,18,24,36,48,72,96},11);}
   arg.peer_flags=WMI_PEER_AUTH;
-  dump(ofdm?"OFDM_MAIN":"B_MAIN",WMI_PEER_ASSOC_CMDID,ath10k_wmi_op_gen_peer_assoc(&ar,&arg));
+  dump(ofdm==2?"DOWNGRADE_MAIN":ofdm?"OFDM_MAIN":"B_MAIN",WMI_PEER_ASSOC_CMDID,ath10k_wmi_op_gen_peer_assoc(&ar,&arg));
   arg.peer_flags=WMI_10X_PEER_AUTH;
-  dump(ofdm?"OFDM_10X":"B_10X",WMI_10X_PEER_ASSOC_CMDID,ath10k_wmi_10_1_op_gen_peer_assoc(&ar,&arg));
+  dump(ofdm==2?"DOWNGRADE_10X":ofdm?"OFDM_10X":"B_10X",WMI_10X_PEER_ASSOC_CMDID,ath10k_wmi_10_1_op_gen_peer_assoc(&ar,&arg));
   arg.peer_flags=WMI_10_2_PEER_AUTH;
-  dump(ofdm?"OFDM_102":"B_102",WMI_10_2_PEER_ASSOC_CMDID,ath10k_wmi_10_2_op_gen_peer_assoc(&ar,&arg));
-  dump(ofdm?"OFDM_104":"B_104",WMI_10_4_PEER_ASSOC_CMDID,ath10k_wmi_10_4_op_gen_peer_assoc(&ar,&arg));
+  dump(ofdm==2?"DOWNGRADE_102":ofdm?"OFDM_102":"B_102",WMI_10_2_PEER_ASSOC_CMDID,ath10k_wmi_10_2_op_gen_peer_assoc(&ar,&arg));
+  dump(ofdm==2?"DOWNGRADE_104":ofdm?"OFDM_104":"B_104",WMI_10_4_PEER_ASSOC_CMDID,ath10k_wmi_10_4_op_gen_peer_assoc(&ar,&arg));
   arg.peer_flags=WMI_TLV_PEER_AUTH;
-  dump(ofdm?"OFDM_TLV":"B_TLV",WMI_TLV_PEER_ASSOC_CMDID,ath10k_wmi_tlv_op_gen_peer_assoc(&ar,&arg));
+  dump(ofdm==2?"DOWNGRADE_TLV":ofdm?"OFDM_TLV":"B_TLV",WMI_TLV_PEER_ASSOC_CMDID,ath10k_wmi_tlv_op_gen_peer_assoc(&ar,&arg));
  }
 }
 '''

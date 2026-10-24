@@ -54,6 +54,7 @@
 
 extern crate alloc;
 
+mod bdram;
 pub mod btc;
 pub mod chan;
 mod command_native;

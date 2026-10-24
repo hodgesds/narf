@@ -59,7 +59,10 @@ fn mt76_join_plan_encodes_rates_and_exact_wpa2_rsn() -> TestResult {
     if assoc[40] != 48 || RsnIe::decode_body(&assoc[42..]) != Some(RsnIe::wpa2_psk_ccmp()) {
         return TestResult::Fail("RSN negotiation differs from exact PSK/CCMP profile");
     }
-    if plan.association_response(&reply(0x10, &[0x11, 0, 0, 0, 42, 0xc0])) != Ok(Some(42))
+    if plan.association_response(&reply(
+        0x10,
+        &[0x11, 0, 0, 0, 42, 0xc0, 1, 4, 0x82, 0x84, 0x8b, 0x96],
+    )) != Ok(Some(42))
         || plan.phase() != (Phase::Associated { aid: 42 })
     {
         return TestResult::Fail("association response state");
@@ -410,4 +413,39 @@ fn mt76_all_legacy_basic_rates_encode_native_txd_and_band_records() -> TestResul
 kernel_test_in!(
     "drivers/wireless/mt7921/association",
     mt76_all_legacy_basic_rates_encode_native_txd_and_band_records
+);
+
+fn mt76_response_rates_reach_peer_records_and_management_rate() -> TestResult {
+    let mut ap = bss(false);
+    // Bitmap order places CCK11Mbps before OFDM6Mbps. Both are basic;
+    // 12/54Mbps are optional offers that the association response removes.
+    ap.information_elements = vec![0, 4, b'n', b'a', b'r', b'f', 1, 4, 0x96, 0x8c, 24, 108];
+    let mut plan = JoinPlan::prepare(&ap, OWN, b"narf", Security::Open).unwrap();
+    if plan.management_rate().hardware() != 75 {
+        return TestResult::Fail("bitmap order selected 11Mbps ahead of actual lower6Mbps");
+    }
+    let before = plan.peer_record(0, false).unwrap();
+    if before[44..46] != [0x48, 0x21] {
+        return TestResult::Fail("initial legacy offer differs from literal CONNAC2 rate map");
+    }
+    plan.start_authentication().unwrap();
+    plan.authentication_response(&reply(0xb0, &[0, 0, 2, 0, 0, 0]))
+        .unwrap();
+    if plan.association_response(&reply(0x10, &[1, 0, 0, 0, 42, 0xc0, 1, 2, 0x96, 0x8c]))
+        != Ok(Some(42))
+    {
+        return TestResult::Fail("supported AP rate downgrade rejected");
+    }
+    let after = plan.peer_record(42, true).unwrap();
+    if after[32..34] != [0x18, 0]
+        || after[44..46] != [0x48, 0]
+        || plan.management_rate().hardware() != 75
+    {
+        return TestResult::Fail("firmware peer retained stale scan-time supported/basic rates");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/association",
+    mt76_response_rates_reach_peer_records_and_management_rate
 );

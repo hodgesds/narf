@@ -340,3 +340,6 @@ mod tests;
 
 #[path = "station_wire.rs"]
 mod station;
+
+#[path = "teardown_wire.rs"]
+mod teardown;

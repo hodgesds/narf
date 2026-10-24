@@ -293,6 +293,49 @@ gated on the remaining power/SAR, peer/rate/key/BA, security and recovery work.
 Independent C fixtures compiled from actual Linux headers cover complete PHY
 and link/RLC payloads, both channel formats, both bands and each antenna mask.
 
+### 3.8 Retained TX-disabled API77 AP peer
+
+`mvm_boot::Owner::prepare_ap_peer(bssid)` reserves the sole AP peer only after
+`ChannelPrepared`. The BSSID must be a distinct unicast identity from the retained
+scan cache, with ESS capability and the same channel as the still-owned inactive
+PHY. Retained NVM antenna/channel identity and a fresh authenticated host receive
+policy are mandatory. When firmware/NVM enable LAR, the owner re-queries MCC and
+checks its current receive permission before peer publication; it does not
+recreate or activate the already-bound MAC/link.
+
+The captured CC API77 table advertises legacy long-group `ADD_STA` command12 /
+response2 and `REMOVE_STA` command2 / response0. Both version pairs are
+checked exactly before any publication. It does not advertise MLD `STA_CONFIG`.
+Only this explicit legacy profile is admitted. As Linux `sta.c` specifies for
+new-RX hardware, ADD uses the packed 48-byte `iwl_mvm_add_sta_cmd` body; version12
+repurposes its MAC-context word as LMAC identity without changing that size.
+The exclusive single-peer owner reserves station0/MAC0/LMAC0, sets both the
+`STA_FLG_DISABLE_TX` flag and its update mask, disables all aggregation TIDs,
+and leaves class-auth/association, AID, queue mask, keys, BA and UAPSD clear.
+No packet queue is allocated. A precise four-byte response with low-byte
+`ADD_STA_SUCCESS` is required before `PeerPrepared` or `prepared_ap_peer()`
+metadata can be observed; a generic empty ACK cannot substitute for that status.
+
+`release_ap_peer()` issues the four-byte `REMOVE_STA` body for the retained
+station0 and requires its correlated native empty ACK before clearing peer
+ownership. The PHY remains `ChannelPrepared`; a separate acknowledged inactive
+PHY release must still unbind/remove it. Peer identity is reserved before the
+first MCC/ADD wait and survives failure or cancellation. Dropped preparation
+or removal stays in its in-progress phase, rejects retries, and prevents scan
+or PHY release. Any malformed, foreign or failed receipt makes the owner
+terminal while retaining its peer and transport/DMA teardown policy.
+
+Independent C output compiled from actual Linux `sta.h` checks the complete
+ADD/REMOVE layouts and the disabled-transmit flags. Native RFH/TFH fixtures
+check status/command identity, fresh MCC denial, acknowledged peer reuse,
+invalid profile/BSSID/NVM/policy rejection and cancellation at MCC, ADD and
+REMOVE publication. A metadata-only replay of the SHA256-pinned real CC API77
+image drives the production version checks; opaque image bytes are never loaded.
+This is a firmware table-ownership prerequisite, with the link inactive and
+transmit disabled. Active station PHY/link, management, rate/key/BA/security,
+authenticated platform power/SAR, recovery and native Gen2 publication remain
+software work.
+
 ## 4. References
 
 - Linux `drivers/net/wireless/intel/iwlwifi/`

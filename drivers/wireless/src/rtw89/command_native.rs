@@ -22,6 +22,7 @@ enum State {
 }
 pub struct Native {
     io: NativeIo,
+    bdram: super::bdram::Bdram,
     device: BusDevice,
     authority: Cap<BusDeviceCap, Write>,
     chip: ChipId,
@@ -93,6 +94,7 @@ impl Native {
         ring.sync(0, usize::from(depth) * 8);
         Ok(Self {
             io,
+            bdram: super::bdram::Bdram::default(),
             device,
             authority,
             chip,
@@ -111,11 +113,48 @@ impl Native {
         .map_err(|_| Error::Access)?
         .map_err(|_| Error::Access)
     }
+    /// Prepare the device's internal BD-RAM and zero hardware indices before
+    /// any system-memory descriptor base is published.
+    ///
+    /// # Safety
+    /// Same independently fenced, powered, exclusive device contract as new.
+    /// PCIe power/PHY quirks and mode configuration must already be complete;
+    /// this bounded subset does not establish full PCIe or DMA readiness.
+    pub async unsafe fn prepare_bdram(&mut self) -> Result<(), Error> {
+        if self.state != State::Unpublished || self.bdram.state() != super::bdram::State::New {
+            return Err(Error::Terminal);
+        }
+        match self.command() {
+            Ok(command)
+                if command & narf_bus::pci::cmd::BUS_MASTER == 0
+                    && command & narf_bus::pci::cmd::MEM_SPACE != 0 => {}
+            _ => {
+                self.state = State::Terminal;
+                self.bdram = super::bdram::Bdram::terminal();
+                return Err(Error::Access);
+            }
+        }
+        // SAFETY: caller's retained reset/serialization contract and the live
+        // PCI command check above. NativeIo invokes authority for every MMIO.
+        let result = unsafe { self.bdram.prepare(&mut self.io, self.chip).await }.map_err(
+            |error| match error {
+                super::power::Error::Timeout => Error::Timeout,
+                super::power::Error::Unsupported => Error::Unsupported,
+                super::power::Error::Terminal => Error::Terminal,
+                _ => Error::Access,
+            },
+        );
+        if result.is_err() {
+            self.state = State::Terminal;
+        }
+        result
+    }
     /// # Safety
     /// Same stopped/fenced/serialized contract as new; BDRAM and hardware
-    /// indices have been reset independently, with CH12 DMA disabled.
+    /// indices were prepared by this owner's prepare_bdram, with CH12 DMA
+    /// disabled and the rest of the PCIe setup still retained.
     pub unsafe fn configure(&mut self) -> Result<(), Error> {
-        if self.state != State::Unpublished {
+        if self.state != State::Unpublished || self.bdram.state() != super::bdram::State::Ready {
             return Err(Error::Terminal);
         }
         self.state = State::Configuring;

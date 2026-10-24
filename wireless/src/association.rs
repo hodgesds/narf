@@ -64,6 +64,42 @@ pub struct JoinPlan {
     assoc: Vec<u8>,
     phase: Phase,
 }
+
+#[derive(Default)]
+struct RateElements {
+    supported: bool,
+    extended: bool,
+    rates: u16,
+    basic: u16,
+}
+impl RateElements {
+    fn observe(&mut self, id: u8, body: &[u8]) -> Result<(), Error> {
+        let seen = match id {
+            1 if body.len() <= 8 => &mut self.supported,
+            50 => &mut self.extended,
+            1 => return Err(Error::InvalidBss),
+            _ => return Ok(()),
+        };
+        if body.is_empty() || *seen {
+            return Err(Error::InvalidBss);
+        }
+        *seen = true;
+        for rate in body {
+            if let Some(index) = RATES.iter().position(|local| *local == rate & 127) {
+                self.rates |= 1 << index;
+                if rate & 128 != 0 {
+                    self.basic |= 1 << index;
+                }
+            } else if rate & 128 != 0 {
+                // This legacy profile has no HT/VHT/HE membership-selector
+                // negotiation. Unknown optional rates do not become offers.
+                return Err(Error::UnsupportedRates);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn unicast(address: [u8; 6]) -> bool {
     address != [0; 6] && address[0] & 1 == 0
 }
@@ -168,9 +204,7 @@ impl JoinPlan {
         {
             return Err(Error::InvalidBss);
         }
-        let mut rates = 0u16;
-        let mut basic = 0u16;
-        let mut rate_ie = false;
+        let mut rate_elements = RateElements::default();
         let mut rsn = None;
         let mut wpa = false;
         let mut seen_ssid = false;
@@ -183,20 +217,7 @@ impl JoinPlan {
                     seen_ssid = true;
                 }
                 1 | 50 => {
-                    if body.is_empty() || id == 1 && (rate_ie || body.len() > 8) {
-                        return Err(Error::InvalidBss);
-                    }
-                    rate_ie |= id == 1;
-                    for rate in body {
-                        if let Some(index) = RATES.iter().position(|local| *local == rate & 127) {
-                            rates |= 1 << index;
-                            if rate & 128 != 0 {
-                                basic |= 1 << index;
-                            }
-                        } else if rate & 128 != 0 {
-                            return Err(Error::UnsupportedRates);
-                        }
-                    }
+                    rate_elements.observe(id, body)?;
                 }
                 48 => {
                     if rsn.is_some() {
@@ -209,13 +230,15 @@ impl JoinPlan {
             }
             Ok(())
         })?;
+        let mut rates = rate_elements.rates;
+        let basic = rate_elements.basic;
         if channel::band(bss.channel) == Some(channel::Band::Ghz5) {
             if basic & 15 != 0 {
                 return Err(Error::UnsupportedRates);
             }
             rates &= !15;
         }
-        if !seen_ssid || !rate_ie || rates == 0 || basic == 0 {
+        if !seen_ssid || !rate_elements.supported || rates == 0 || basic == 0 {
             return Err(Error::UnsupportedRates);
         }
         let negotiated = match security {
@@ -327,6 +350,10 @@ impl JoinPlan {
         self.phase = Phase::AwaitAssociation;
         Ok(Some(&self.assoc))
     }
+    /// Negotiate legacy rates from a successful bound response. The response
+    /// can narrow the request's offer but must preserve every beacon basic
+    /// rate. New mandatory rates must have been offered. This conservative
+    /// legacy profile retains beacon basics even if the response omits flags.
     /// Successful association does not authorize a WPA2 controlled port.
     pub fn association_response(&mut self, bytes: &[u8]) -> Result<Option<u16>, Error> {
         if self.phase != Phase::AwaitAssociation {
@@ -351,13 +378,28 @@ impl JoinPlan {
         }
         let raw = u16::from_le_bytes([bytes[28], bytes[29]]);
         let aid = raw & 0x3fff;
-        if raw & 0xc000 != 0xc000
-            || !(1..=2007).contains(&aid)
-            || ies(&bytes[30..], |_, _| Ok(())).is_err()
-        {
+        if raw & 0xc000 != 0xc000 || !(1..=2007).contains(&aid) {
             self.phase = Phase::Failed;
             return Err(Error::Protocol);
         }
+        let mut response = RateElements::default();
+        if let Err(error) = ies(&bytes[30..], |id, body| response.observe(id, body)) {
+            self.phase = Phase::Failed;
+            return Err(if error == Error::InvalidBss {
+                Error::Protocol
+            } else {
+                error
+            });
+        }
+        let rates = self.rates & response.rates;
+        let basic = self.basic | response.basic;
+        if !response.supported || rates == 0 || basic & !rates != 0 {
+            self.phase = Phase::Failed;
+            return Err(Error::UnsupportedRates);
+        }
+        // Commit only after all frame, IE and rate checks have passed.
+        self.rates = rates;
+        self.basic = basic;
         self.phase = Phase::Associated { aid };
         Ok(Some(aid))
     }
@@ -365,7 +407,9 @@ impl JoinPlan {
         self.phase = Phase::Failed;
     }
 
-    /// Validated supported/basic legacy-rate bitmaps in IEEE 500kbps order:
+    /// Before association: the validated request offer. After association:
+    /// the negotiated supported/basic bitmaps. Failed replies leave these
+    /// unchanged. Bit order is IEEE legacy order (not increasing bit rate):
     /// 1,2,5.5,11,6,9,12,18,24,36,48,54Mbps. Hardware indices stay driver-owned.
     pub fn legacy_rates(&self) -> (u16, u16) {
         (self.rates, self.basic)

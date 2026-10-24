@@ -76,6 +76,10 @@ current signed host policy, fresh MCC/LAR, conditional DQA, versioned MAC/link
 receipts and scan15 channel records; automatic Gen2 station admission remains
 gated. An inactive PHY/link owner now checks receive-channel policy, programs
 the API77 PHY/RLC commands and requires acknowledged unbind/remove before reuse.
+A subsequent retained AP-peer owner validates current receive policy/MCC, emits
+the exact API77 TX-disabled legacy station entry and requires native ADD status
+and REMOVE receipt before identity reuse. It keeps packet queues, keys and
+active station admission closed.
 Host nonce and SAE paths require fallible hardware entropy instead of
 the old timing seed; validated RSNA M1 renewal alone requests a fresh SNonce.
 Full system entropy-pool/health services remain open.
@@ -102,8 +106,12 @@ Initial Open authentication/association exchanges now use the actual dialect's
 inline WMI, retained referenced WMI or HTT management path, with peer-bound RX
 and bounded progress under unrelated-event floods. Shared JoinPlan now drives
 native PEER_ASSOC/VDEV_UP and rejects queued peer loss before reporting success.
-Association-response rate negotiation, PFC events, security/decapsulation,
-remaining WMI MLME and station attachment remain software work.
+Response-negotiated legacy rates now reach native PEER_ASSOC. Terminal station
+teardown drives native DOWN/DELETE, every sparse-ID UNMAP and conditional TLV
+delete ACK, then STOP/STOPPED with receive quiescence. Even confirmed teardown
+retains DMA and stays closed until a future full reset/generation owner. PFC
+events, security/decapsulation, reset/rejoin, remaining WMI MLME and station
+attachment remain software work.
 Ath9k programs AR9285 inactive PHY/PLL/RF INI, EEPROM modal and PDADC detector
 tables with current-capability register access. Factory CTL edges and target
 power now bound the rate-power registers under an explicit zero-dBm ceiling;
@@ -135,11 +143,13 @@ enforcement. Power-off/normalization and DLE/HFC primitives now have Linux-C
 trace coverage. Native CH12 commands now retain DMA through the multi-tag
 delay and use corrected hardware/host index fields. A retained WCPU loader
 now follows Linux reset, secure IDMEM and header/section progression and waits
-for initialized firmware; full PCIe/BDRAM/startup composition and station work
-remain. Its diagnostic probe retains unpublished storage without activating
+for initialized firmware. Internal AX BDRAM preparation now stops and checks
+DMA idle, configures exact per-chip partitions, clears/resets hardware indices
+and gates CH12 ring-base publication on its retained Ready receipt. Full PCIe
+mode/calibration and startup composition plus station work remain. Its diagnostic probe retains unpublished storage without activating
 rings, IRQs or a NIC.
 Scoped native PCIe PHY/DBI operations now provide bounded MDIO/RAC access with
-retained failure/cancellation exclusion; complete PCIe/BDRAM startup remains.
+retained failure/cancellation exclusion; complete PCIe/BDRAM startup composition remains.
 USB retains published address/configuration/control/bulk DMA, checks slot
 generations and implements explicit Stop/Set-Dequeue fencing for the supported
 bulk profile; halt/reset/replug and broader reclamation remain software work.
@@ -175,10 +185,21 @@ families. This host has 60 assets present and 15 required assets missing
 board calibration, policy and exact board/PNVM matching remain separate gates.
 See [the firmware evidence and provisioning guide](verification/data/wifi-firmware/README.md).
 
+The next station checkpoint adds 21 software smokes. The shared legacy join
+plan now intersects successful response rates with the offered set, preserves
+beacon-mandatory rates and rejects unsupported response requirements before
+committing AID/rates. MT76 reads that negotiated state for its native peer/RA
+records and chooses the actual lowest basic bit rate, including mixed CCK/OFDM
+sets. Independent Linux C layout/trace checks cover the Intel peer, ath10k
+teardown and RTW89 BDRAM prerequisites described above. Full station, IRQ,
+reset/rejoin and physical acceptance still require the remaining family work.
+
 The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
 wireless, network, crypto, RNG and shared-fixture QEMU gates: x86_64 reports
-2613 pass / 0 fail / 10 skip; aarch64 reports 1911 pass / 0 fail / 3 skip.
+2634 pass / 0 fail / 10 skip; aarch64 reports 1932 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
+The final strict Intel command/response-ABI checks also pass a focused
+x86_64 Gen2 rerun (33 pass / 0 fail) after the primary boot/postflight gate.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.
 These are software/model checks; the skipped physical-device cases remain

@@ -365,6 +365,25 @@ pub async fn associate_station(
     result
 }
 
+/// Retire the current peer and stop its station vdev with native firmware
+/// correlation. This closes the retained radio permanently even on success;
+/// its DMA and firmware resources still need the future full reset owner.
+pub async fn disconnect_station(
+) -> Result<super::wmi_runtime::StationDisconnected, super::wmi_runtime::Error> {
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    let result = owner.radio.disconnect_station().await;
+    if let Some(controller) = CONTROLLER.lock().as_mut() {
+        controller.station_prepared = owner.radio.prepared_peer();
+        if let Err(error) = &result {
+            controller.station_error = Some(*error);
+        }
+    }
+    result
+}
+
 /// Human-readable driver name keyed on the matched `(vendor, device)`.
 /// Used as `PciMatch.name` + `BoundDriver.name`. Must be a `'static`
 /// string — the bus registry stores it by reference.

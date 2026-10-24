@@ -19,8 +19,13 @@ impl LegacyRate {
 
     fn lowest(basic: u16) -> Self {
         const HARDWARE: [u16; 12] = [0, 1, 2, 3, 75, 79, 74, 78, 73, 77, 72, 76];
-        // JoinPlan has already rejected zero and unsupported basic rates.
-        Self(HARDWARE[basic.trailing_zeros() as usize])
+        // CCK precedes OFDM in the bitmap: 11Mbps has a lower bit than
+        // 6Mbps. Select the lowest actual rate, not the lowest set bit.
+        let index = (0..RATES.len())
+            .filter(|index| basic & (1 << index) != 0)
+            .min_by_key(|index| RATES[*index])
+            .expect("shared plan has a nonempty validated basic-rate set");
+        Self(HARDWARE[index])
     }
 
     pub(crate) fn hardware(self) -> u16 {
@@ -55,8 +60,6 @@ pub struct JoinPlan {
     peer: [u8; 6],
     channel: u8,
     security: SecurityMode,
-    rates: u16,
-    basic: u16,
 }
 impl core::ops::Deref for JoinPlan {
     type Target = ManagementPlan;
@@ -110,18 +113,15 @@ impl JoinPlan {
             SecurityMode::Open
         };
         let common = ManagementPlan::prepare(bss, own, ssid, mode)?;
-        let (rates, basic) = common.legacy_rates();
         Ok(Self {
             common,
             peer: bss.bssid,
             channel: bss.channel,
             security: mode,
-            rates,
-            basic,
         })
     }
     pub(crate) fn management_rate(&self) -> LegacyRate {
-        LegacyRate::lowest(self.basic)
+        LegacyRate::lowest(self.common.legacy_rates().1)
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
         self.common.start_authentication()
@@ -169,12 +169,12 @@ impl JoinPlan {
             .copy_from_slice(&(if associated { 1u16 } else { 3 }).to_le_bytes());
         let phy = tlv(&mut out, 0x15, 12);
         let five = super::channel::band(self.channel) == Some(super::channel::Band::Ghz5);
-        let basic_rates = if five { self.basic >> 4 } else { self.basic };
+        let (rates, basic) = self.common.legacy_rates();
+        let basic_rates = if five { basic >> 4 } else { basic };
         out[phy + 4..phy + 6].copy_from_slice(&basic_rates.to_le_bytes());
         out[phy + 6] = if five { 8 } else { 3 }; // OFDM / HR-DSSS | ERP.
         let ra = tlv(&mut out, 1, 16);
-        out[ra + 4..ra + 6]
-            .copy_from_slice(&((self.rates & 15) | ((self.rates >> 4) << 6)).to_le_bytes());
+        out[ra + 4..ra + 6].copy_from_slice(&((rates & 15) | ((rates >> 4) << 6)).to_le_bytes());
         let state = tlv(&mut out, 7, 12);
         out[state + 8] = if associated { 2 } else { 1 }; // MLME state, independent of port authorization.
         let wtbl = tlv(&mut out, 13, 12); // outer TLV + eight-byte WTBL request

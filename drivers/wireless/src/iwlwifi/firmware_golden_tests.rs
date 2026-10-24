@@ -38,6 +38,17 @@ fn replay(golden: &Golden) -> Vec<u8> {
         .expect("pinned metadata fragments are in bounds and nonoverlapping")
 }
 
+/// Test-only metadata replay for consumers checking actual API77 negotiation.
+/// Opaque section bytes remain zero and must never enter a device loader.
+pub(super) fn api77_replay() -> Vec<u8> {
+    replay(
+        GOLDENS
+            .iter()
+            .find(|golden| golden.source == "iwlwifi-cc-a0-77.ucode")
+            .expect("pinned API77 metadata is present"),
+    )
+}
+
 fn smoke_iwlwifi_real_metadata_structural_replays() -> TestResult {
     for golden in GOLDENS {
         if !golden.source.ends_with(".ucode") || golden.source_sha256.len() != 64 {

@@ -70,6 +70,7 @@ impl Fixture {
         }
         let native = Native {
             io,
+            bdram: super::super::bdram::Bdram::default(),
             device: device(chip),
             authority,
             chip,
@@ -240,4 +241,49 @@ fn smoke_rtw89_ring_host_doorbells_preserve_hardware_half() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_ring_host_doorbells_preserve_hardware_half
+);
+
+fn smoke_rtw89_native_bdram_requires_preparation_and_current_authority() -> TestResult {
+    let mut fixture = Fixture::new(ChipId::Rtl8852B).unwrap();
+    fixture.native.state = State::Unpublished;
+    let before = fixture.words.clone();
+    // SAFETY: exclusively owned inert model has no DMA or other producer.
+    // The deliberately unmapped PCI configuration must not be accessed here:
+    // a missing owned BDRAM receipt rejects before base publication/config I/O.
+    if unsafe { fixture.native.configure() } != Err(Error::Terminal)
+        || fixture.native.state != State::Unpublished
+        || fixture.words != before
+    {
+        return TestResult::Fail("CH12 published a ring without its BDRAM preparation receipt");
+    }
+    fixture.native.authority.revoke();
+    // SAFETY: no actual device exists; revocation must stop the exact native
+    // entry before it can access the deliberately unmapped PCI configuration.
+    if ready(unsafe { fixture.native.prepare_bdram() }) != Some(Err(Error::Access))
+        || fixture.native.state != State::Terminal
+        || fixture.native.bdram.state() != super::super::bdram::State::Preparing
+        || fixture.words != before
+        // SAFETY: the same exclusive inert model remains revoked and terminal;
+        // this retry must reject before its unmapped PCI configuration access.
+        || ready(unsafe { fixture.native.prepare_bdram() }) != Some(Err(Error::Terminal))
+    {
+        return TestResult::Fail("revoked native BDRAM entry accessed PCI/MMIO or reopened");
+    }
+    // Exercise actual NativeIo authority checks on the register path as well,
+    // independently of the PCI command preflight above.
+    let mut owner = super::super::bdram::Bdram::default();
+    // SAFETY: NativeIo maps the fixture's exclusive inert RAM, with no device
+    // or DMA producer; revoked authority must reject before any BAR access.
+    if ready(unsafe { owner.prepare(&mut fixture.native.io, ChipId::Rtl8852B) })
+        != Some(Err(super::super::power::Error::Access))
+        || owner.state() != super::super::bdram::State::Preparing
+        || fixture.words != before
+    {
+        return TestResult::Fail("revoked BDRAM register operation touched actual NativeIo BAR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_bdram_requires_preparation_and_current_authority
 );

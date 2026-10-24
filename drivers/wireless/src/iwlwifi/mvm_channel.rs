@@ -10,7 +10,7 @@ pub(super) struct ChannelContext {
     version: u8,
     rlc_version: u8,
     ultra_channels: bool,
-    current: Option<u8>,
+    pub(super) current: Option<u8>,
 }
 impl ChannelContext {
     pub(super) fn new(api: &FirmwareApi<'_>) -> Self {

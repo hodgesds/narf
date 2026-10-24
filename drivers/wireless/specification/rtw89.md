@@ -75,6 +75,28 @@ All register operations invoke current device authority and check complete
 width/alignment extents. Real revocation rejects the constructor before
 unmapped configuration access and prevents later packet publication.
 
+The retained `bdram::Bdram` owner implements the internal AX preparation subset
+for 8852A/B/C/8851B. With independently fenced old DMA and BME off, it stops
+WPDMA and global host DMA, applies the exact per-profile TX/RX idle checks
+(10-us interval, 100-us budget), clears supported indices, writes/readbacks
+Linux's dual/single internal BDRAM partitions and C's 16-entry WP selector,
+then waits for the self-clearing BDRAM reset (1-us interval, 100-us budget).
+All supported hardware TX/RX indices must actually read zero. It leaves global
+and channel DMA stopped and verifies those bits; no ring base/count, interrupt
+or bus-master activation is part of preparation. Failure or dropped waits leave
+Preparing and reject reuse before I/O; a replacement requires an independently
+verified reset. BE is rejected before any register access.
+`Native::prepare_bdram` invokes current PCI authority to verify BME-off/MEM
+decoding, then uses the capability-scoped `NativeIo` for every register access.
+`Native::configure` requires that same retained owner's Ready receipt before
+system-memory ring publication. The diagnostic probe still does not call it.
+Linux-C traces cover the four AX profiles and nonzero inherited register fields;
+negative models cover every access failure, ignored writes, dirty indices,
+device disappearance, both wait deadlines, cancellation and actual revocation.
+This closes internal partition/index preparation only: complete PCIe PHY/
+calibration/mode configuration, full startup composition, RX and IRQ ownership
+remain required, and Ready is neither a DMA-reclamation nor station proof.
+
 Firmware commands have a24-byte TXWD body on A/B/51 and a16-byte RX-like
 descriptor on C. TXBD length includes descriptor plus command bytes; there
 is no WP/address-info extension. Hardware RP is bits27:16 and host WP bits11:0;
@@ -127,7 +149,7 @@ control. 8852C uses its V1 HFC register page. Independent Linux C traces cover
 all four AX profiles with inherited zero and nonzero register seeds. The
 operation requires a powered, serialized, DMA-fenced device with PCI BME off;
 it publishes no system-memory rings. Failure or cancellation retains
-Configuring and refuses replay. PCIe quirks/BDRAM, CH12 DMA and WCPU composition
+Configuring and refuses replay. PCIe quirks, owned BDRAM/CH12 DMA and WCPU composition
 remain necessary before this private primitive can be activated.
 
 The private `phy_access::Access` and its `NativeIo` adapter serialize AX PCIe
@@ -141,7 +163,7 @@ prevent failure or cancellation from reopening the same owner. Replacement
 requires an independently verified reset. Extracted Linux C traces cover
 MDIO read/write/masked writes and DBI byte enables; actual-capability RAM
 fixtures check native RAC offsets and revoked access before dereference.
-These access prerequisites leave PCIe quirks/calibration, BDRAM, complete
+These access prerequisites leave PCIe quirks/calibration, complete
 startup composition and packet/station ownership open.
 
 `efuse::read_mac(registers, ChipId, cut)` runs the AX DDV read lifecycle and
@@ -208,9 +230,9 @@ bring-up scaffolding and does not establish a working station runtime.
 | Prerequisite | State |
 |---|---|
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
-| Complete per-chip power/PCIe initialization | Native power-on/off, inherited-state normalization and DLFW DLE/HFC primitives implemented with Linux-C traces; probe composition and full PCIe/BDRAM setup remain |
+| Complete per-chip power/PCIe initialization | Native power-on/off, inherited-state normalization, DLFW DLE/HFC and retained internal BDRAM/index setup implemented with Linux-C traces; PCIe PHY/calibration/mode setup and probe composition remain |
 | Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans, native CH12 ownership and retained WCPU loading implemented; full PCIe activation and startup composition remain |
-| Ring quiesce/publication, BDRAM setup, IRQ ownership and recovery | Incomplete |
+| Ring quiesce/publication, BDRAM setup, IRQ ownership and recovery | Internal BDRAM partition/reset and actual zero-index readback implemented; independent old-DMA fencing, full ring/IRQ ownership and recovery remain |
 | AX initial native TX layout and bounded completion ownership | Shared production backend implemented and model-tested; not yet activated by station/firmware owner |
 | RPQ release handling, RX assembly/validation and frame delivery | Incomplete |
 | RF/BB calibration, regulatory channel/power and coexistence | Missing |
