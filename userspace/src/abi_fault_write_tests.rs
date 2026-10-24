@@ -17,6 +17,7 @@
 //! folds. These smokes drive the real syscall surface throughout.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use narf_block::ram::RamBlockDevice;
 use narf_filesystem::{FileOps, FsInstance};

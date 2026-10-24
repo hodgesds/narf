@@ -25,6 +25,7 @@
 //!      range serves the new bytes — never the pre-truncate content.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use narf_block::ram::RamBlockDevice;
 use narf_filesystem::{FileOps, FsInstance};
