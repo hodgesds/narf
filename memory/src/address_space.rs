@@ -353,6 +353,52 @@ fn file_fault_frame(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultE
     }
 }
 
+/// Batch sibling of [`FileFaultHook`]: fills frames for a contiguous run
+/// of pages in one call — the fill half of [`AddressSpace::demand_alloc_range`].
+///
+/// The hook is handed the address-space identity, the run's first
+/// (page-aligned) VA, and one output slot per page in the run. It writes
+/// the physical address of the frame supplying each page into that page's
+/// slot, or leaves the slot zero when it cannot supply the page; a zero
+/// (or misaligned) answer is a per-page refusal the batch skips, never
+/// an error for the whole run.
+///
+/// Fill-only contract: the hook supplies frames exactly as
+/// [`FileFaultHook`] does (same ownership transfer per frame — one
+/// reference the caller balances), but it must not install leaves, must
+/// not publish address-space state, and must not call back into any
+/// demand entry point ([`AddressSpace::demand_alloc_page`] or
+/// [`AddressSpace::demand_alloc_range`]). Bulk faulting is therefore
+/// acyclic by construction: a fault may expand into one batch operation,
+/// and the batch's fill cannot expand in turn, so no recursion guard is
+/// needed anywhere in the composition.
+type FileBatchFaultHook = fn(u64, u64, &mut [u64]);
+static FILE_BATCH_FAULT_HOOK: IrqSafeSpinLock<Option<FileBatchFaultHook>> =
+    IrqSafeSpinLock::new(None);
+
+/// Install the batch demand-paging callback used by
+/// [`AddressSpace::demand_alloc_range`], returning whatever it displaced.
+///
+/// Same seam discipline as [`install_file_fault_hook`]: idempotent,
+/// callable at any time, and the displaced hook is returned so a test
+/// can chain to it.
+pub fn install_file_batch_fault_hook(hook: FileBatchFaultHook) -> Option<FileBatchFaultHook> {
+    FILE_BATCH_FAULT_HOOK.lock().replace(hook)
+}
+
+/// Ask the backing file for the frames of a whole run of pages. Must be
+/// called with **no** address-space lock held, for the same reason as
+/// [`file_fault_frame`]: the hook re-enters the filesystem. Slots the
+/// hook does not fill stay zero (no hook installed, or a per-page
+/// refusal); the caller validates alignment before trusting an answer,
+/// exactly as `file_fault_frame` does for the single-page hook.
+fn file_fault_frames_batch(address_space_id: u64, first_vaddr: u64, out: &mut [u64]) {
+    let hook = *FILE_BATCH_FAULT_HOOK.lock();
+    if let Some(hook) = hook {
+        hook(address_space_id, first_vaddr, out);
+    }
+}
+
 /// The `AddressSpaceError` a failed file fault surfaces as. `NoMemory` asks the
 /// fault path to wait for reclaim and retry (`VM_FAULT_OOM`); with no reclaim
 /// to wait for it stays unresolved, as an exhausted anonymous fault does.
@@ -1836,6 +1882,18 @@ enum DemandPageClaim {
         file_backed: bool,
         externally_owned: bool,
     },
+}
+
+/// One page claimed by [`AddressSpace::claim_demand_range`]: the batch
+/// analogue of [`DemandPageClaim::Owner`], carried as data because a
+/// batch owns many tickets at once. The ticket grants exactly the
+/// single claim's rights — publish through `finish_demand_page` or
+/// cancel — and no more.
+struct DemandRangeClaim {
+    v: u64,
+    ticket: u64,
+    file_backed: bool,
+    externally_owned: bool,
 }
 
 static NEXT_COW_TICKET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -8798,6 +8856,78 @@ impl AddressSpace {
         }
     }
 
+    /// Claim the slow path for every claimable page of
+    /// `[first, first + pages * 4096)` in **one** region-lock acquisition
+    /// — the claim half of [`Self::demand_alloc_range`].
+    ///
+    /// Each page is classified exactly as [`Self::claim_demand_page_mode`]
+    /// classifies a single fault, minus the parts that belong to the
+    /// faulting page alone: no backed-page repair (a peer's stale leaf is
+    /// that peer fault's business) and no `force` admission (a batch
+    /// never backs a `PROT_NONE` page). A page is claimed — slot
+    /// reserved, ticket issued — only when a single fault on it would
+    /// have become the slow-path owner. Everything else is skipped, per
+    /// page and silently: outside every region, `PROT_NONE` or guard
+    /// pages, pages carrying a swap state (the swap transaction owns
+    /// them; the single-fault path serves them), pages already backed,
+    /// and pages a peer is already faulting — including the faulting
+    /// page whose own fault may have triggered this batch, whose ticket
+    /// its fault still holds.
+    ///
+    /// No closure runs under the lock and nothing allocates outside the
+    /// region table's own fallible growth (a reservation failure skips
+    /// that page), so taking the whole set atomically cannot deadlock
+    /// against the per-page paths: a ticket means the same thing to
+    /// every observer however many were issued beside it.
+    fn claim_demand_range(&self, first: u64, pages: u64) -> Vec<DemandRangeClaim> {
+        let mut claimed = Vec::new();
+        if pages == 0 {
+            return claimed;
+        }
+        let mut regions = self.regions.lock();
+        for index in 0..pages {
+            let Some(v) = first.checked_add(index.saturating_mul(4096)) else {
+                break;
+            };
+            let Some((slot_index, perms)) = regions.containing(v).and_then(|region| {
+                let rb = region.base.as_u64();
+                let slot_index = ((v - rb) >> 12) as usize;
+                let phys = region
+                    .phys
+                    .get(slot_index)
+                    .copied()
+                    .unwrap_or(PhysAddr::new(0));
+                (phys.raw() == 0).then_some((slot_index, region.perms))
+            }) else {
+                continue;
+            };
+            // `handle_pte_marker` and the PROT_NONE admission, as in
+            // claim_demand_page_mode with force = false.
+            if perms.prot_only().0 == 0 || regions.guard_pages.contains(&v) {
+                continue;
+            }
+            if regions.swap_pages.contains_key(&v) || regions.demand_pages.get(v).is_some() {
+                continue;
+            }
+            let Some(region) = regions.containing_backing_mut(v) else {
+                continue;
+            };
+            if region.reserve_backing_slot(slot_index).is_err() {
+                continue;
+            }
+            let Ok(ticket) = regions.demand_pages.insert_new(v) else {
+                continue;
+            };
+            claimed.push(DemandRangeClaim {
+                v,
+                ticket,
+                file_backed: perms.contains(RegionPerms::FILE_DEMAND),
+                externally_owned: perms.contains(RegionPerms::SHARED),
+            });
+        }
+        claimed
+    }
+
     /// Append cold private-anonymous reclaim candidates from this address
     /// space to `out`, stopping once the emitted runs cover at least
     /// `max_pages` resident pages (or a fixed per-call run cap is hit).
@@ -9462,6 +9592,185 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Bulk demand paging: claim, fill, and install every claimable page
+    /// of `[vaddr, vaddr + pages * 4096)` as **one operation**, returning
+    /// how many pages were installed.
+    ///
+    /// The batch contract, against [`Self::demand_alloc_page`]'s
+    /// all-or-nothing single page:
+    ///
+    /// - The claim set is taken atomically ([`Self::claim_demand_range`]):
+    ///   one region-lock acquisition reserves a ticket for every page a
+    ///   single fault would own, and skips the rest. The range is an
+    ///   arbitrary contiguous VA span — it may cross regions, run past
+    ///   the end of every region, or cover the page whose fault triggered
+    ///   it (that page's own ticket is held by its fault, so it is
+    ///   skipped and finished by the fault itself).
+    /// - Fill sources differ, the batch shape does not: a
+    ///   `FILE_DEMAND` page is filled by the batch file hook
+    ///   ([`install_file_batch_fault_hook`]) — one call per contiguous
+    ///   claimed run — and any other page is a demand-zero frame from
+    ///   the allocator, zeroed while the batch owns it. Neither fill
+    ///   runs under the address-space lock.
+    /// - Publication is not new machinery: every filled page goes
+    ///   through the same `finish_demand_page` transaction, rmap
+    ///   reservation, and release idioms as a single fault, so a
+    ///   batch-installed page is indistinguishable from a faulted one.
+    /// - Advisory throughout: the batch reports a count, never an
+    ///   error. A page that cannot be claimed, filled, or published is
+    ///   skipped and faults later through the unchanged single-page
+    ///   path, which keeps its fatal semantics — that split is the
+    ///   contract, and it is why this entry point must never be used to
+    ///   serve the faulting page itself.
+    ///
+    /// # Safety
+    /// As [`Self::demand_alloc_page`]: the batch installs real leaves,
+    /// so `self.root` must be the root live on this CPU (the normal
+    /// fault path) or a ptrace-stopped tracee's.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn demand_alloc_range(&self, vaddr: VirtAddr, pages: u64) -> usize {
+        use crate::x86_64::paging::map_4kb_demand;
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            self.demand_range_in(vaddr.as_u64() & !0xFFF, pages, |phys, perms, va| {
+                if perms.prot_only().0 == 0 {
+                    // Unreachable (the batch never claims a PROT_NONE
+                    // page); kept so the installer is total, as in
+                    // demand_page_in's finish closure.
+                    return Ok(());
+                }
+                let flags = user_leaf_flags(perms, user_page_writable(perms, phys), phys);
+                // SAFETY: identity map + AS live (the demand_alloc_range
+                // contract); `phys` is the frame this claim owns. The
+                // enclosing unsafe block covers this closure body, which
+                // is defined inside it.
+                match map_4kb_demand(self.root, VirtAddr::new(va), phys, flags) {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(demand_map_error(error)),
+                }
+            })
+        }
+    }
+
+    /// The shared body of [`Self::demand_alloc_range`]: everything but
+    /// the per-arch leaf installer, which arrives as `install` and is
+    /// invoked by `finish_demand_page` under the region lock exactly as
+    /// in the single-fault twins.
+    ///
+    /// # Safety
+    /// As [`Self::demand_alloc_range`].
+    unsafe fn demand_range_in(
+        &self,
+        first: u64,
+        pages: u64,
+        install: impl Fn(PhysAddr, RegionPerms, u64) -> Result<(), AddressSpaceError>,
+    ) -> usize {
+        let release = |claim: &DemandRangeClaim, phys: PhysAddr| {
+            // The single fault's release rule: a shared file hook frame
+            // balances through the shared release hook; every other
+            // frame is the caller's to free.
+            if claim.file_backed && claim.externally_owned {
+                release_shared_phys(phys);
+            } else {
+                crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
+            }
+        };
+        let claimed = self.claim_demand_range(first, pages);
+        if claimed.is_empty() {
+            return 0;
+        }
+        // Fill phase. No address-space lock is held anywhere in it: the
+        // tickets, not the lock, exclude duplicate slow paths, exactly
+        // as a single fault's fill runs outside the lock.
+        let mut frames: Vec<Option<PhysAddr>> = Vec::new();
+        if frames.try_reserve_exact(claimed.len()).is_err() {
+            for claim in &claimed {
+                self.cancel_demand_page(claim.v, claim.ticket);
+            }
+            return 0;
+        }
+        frames.resize(claimed.len(), None);
+        let mut index = 0;
+        while index < claimed.len() {
+            if !claimed[index].file_backed {
+                // Demand-zero fill source: a fresh frame, zeroed while
+                // this batch owns it exclusively — the anonymous half
+                // of demand_page_in, per page.
+                if let Ok(frame) =
+                    crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
+                {
+                    let phys = frame.start_address();
+                    // SAFETY: the frame is exclusively owned by this
+                    // claim until finish_demand_page publishes it, and
+                    // is reachable through the kernel RAM map.
+                    unsafe {
+                        core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
+                    }
+                    frames[index] = Some(phys);
+                }
+                index += 1;
+                continue;
+            }
+            // File fill source: one batch-hook call per contiguous
+            // claimed run, so the hook sees the run as one fill.
+            let run_start = index;
+            let mut run_end = index + 1;
+            while run_end < claimed.len()
+                && claimed[run_end].file_backed
+                && claimed[run_end].v == claimed[run_end - 1].v.saturating_add(4096)
+            {
+                run_end += 1;
+            }
+            let mut supplied = Vec::new();
+            if supplied.try_reserve_exact(run_end - run_start).is_ok() {
+                supplied.resize(run_end - run_start, 0u64);
+                file_fault_frames_batch(self.identity(), claimed[run_start].v, &mut supplied);
+                for (slot, phys) in supplied.iter().enumerate() {
+                    // A zero or misaligned answer is a per-page refusal,
+                    // under the same rule file_fault_frame applies to
+                    // the single hook.
+                    if *phys != 0 && phys & 0xFFF == 0 {
+                        frames[run_start + slot] = Some(PhysAddr::new(*phys));
+                    }
+                }
+            }
+            index = run_end;
+        }
+        // Publish phase: the single fault's transaction, reservation,
+        // and release idioms, per page. Every failure is final only for
+        // its page.
+        let mut installed = 0usize;
+        for (claim, frame) in claimed.iter().zip(frames) {
+            let Some(phys) = frame else {
+                self.cancel_demand_page(claim.v, claim.ticket);
+                continue;
+            };
+            if crate::rmap::try_prepare_owner_slots(phys, 1).is_err() {
+                self.cancel_demand_page(claim.v, claim.ticket);
+                release(claim, phys);
+                continue;
+            }
+            match self.finish_demand_page(claim.v, claim.ticket, phys, |phys, perms| {
+                install(phys, perms, claim.v)
+            }) {
+                Ok(true) => installed += 1,
+                Ok(false) => {
+                    // A concurrent VMA removal cancelled the ticket, so
+                    // ownership never left this batch (the single
+                    // fault's !published branch, per page).
+                    crate::rmap::release_reserved_owner_slots(phys, 1);
+                    release(claim, phys);
+                }
+                Err(_) => {
+                    // finish_demand_page already retired the ticket.
+                    crate::rmap::release_reserved_owner_slots(phys, 1);
+                    release(claim, phys);
+                }
+            }
+        }
+        installed
+    }
+
     /// # Safety
     /// - The low-memory identity map must be live (used to zero the fresh
     ///   frame and walk the translation tables).
@@ -9597,9 +9906,41 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// aarch64 twin of the x86_64 [`Self::demand_alloc_range`]; see its
+    /// documentation for the batch contract.
+    ///
+    /// # Safety
+    /// As [`Self::demand_alloc_page`].
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn demand_alloc_range(&self, vaddr: VirtAddr, pages: u64) -> usize {
+        use crate::aarch64::paging::map_4kb;
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            self.demand_range_in(vaddr.as_u64() & !0xFFF, pages, |phys, perms, va| {
+                if perms.prot_only().0 == 0 {
+                    return Ok(());
+                }
+                let flags = user_leaf_flags(perms, user_page_writable(perms, phys), phys);
+                // SAFETY: as on x86_64, publication and leaf installation
+                // are one region-lock transaction against this live
+                // TTBR0 root. The enclosing unsafe block covers this
+                // closure body, which is defined inside it.
+                match map_4kb(self.root, VirtAddr::new(va), phys, flags) {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(demand_map_error(error)),
+                }
+            })
+        }
+    }
+
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn demand_alloc_page(&self, _vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub unsafe fn demand_alloc_range(&self, _vaddr: VirtAddr, _pages: u64) -> usize {
+        0
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -14224,6 +14565,53 @@ fn arm_test_file_fault_hook() {
     }
 }
 
+/// Batch twin of [`FILE_FAULT_HOOK_UNDER_TEST`]: whatever
+/// [`install_file_batch_fault_hook`] displaced when the test hook was
+/// armed. Same discipline as the single hook — never restored, the
+/// test hook stays in front as a pure delegate once disarmed.
+static FILE_BATCH_FAULT_HOOK_UNDER_TEST: IrqSafeSpinLock<Option<FileBatchFaultHook>> =
+    IrqSafeSpinLock::new(None);
+/// First page of the run the test batch hook serves, and the frames it
+/// serves there (one per page, at most 8).
+static TEST_BATCH_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TEST_BATCH_FRAMES: IrqSafeSpinLock<[u64; 8]> = IrqSafeSpinLock::new([0; 8]);
+/// Page inside the served run whose slot the hook leaves zero (a
+/// per-page refusal); 0 = refuse nothing.
+static TEST_BATCH_FAIL_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TEST_BATCH_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn test_file_batch_fault_hook(address_space_id: u64, first_vaddr: u64, out: &mut [u64]) {
+    use core::sync::atomic::Ordering;
+    let base = TEST_BATCH_BASE.load(Ordering::Relaxed);
+    if base != 0 && first_vaddr >= base && first_vaddr < base + 8 * 4096 {
+        TEST_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        let frames = *TEST_BATCH_FRAMES.lock();
+        let fail = TEST_BATCH_FAIL_PAGE.load(Ordering::Relaxed);
+        for (index, slot) in out.iter_mut().enumerate() {
+            let va = first_vaddr + (index as u64) * 4096;
+            let frame_index = ((va - base) / 4096) as usize;
+            if va != fail && frame_index < frames.len() && frames[frame_index] != 0 {
+                *slot = frames[frame_index];
+            }
+        }
+        return;
+    }
+    let chained = *FILE_BATCH_FAULT_HOOK_UNDER_TEST.lock();
+    if let Some(hook) = chained {
+        hook(address_space_id, first_vaddr, out);
+    }
+}
+
+/// Put the test batch hook in front of whatever is installed, chaining
+/// to it — the same self-chaining guard as [`arm_test_file_fault_hook`].
+fn arm_test_file_batch_fault_hook() {
+    if let Some(displaced) = install_file_batch_fault_hook(test_file_batch_fault_hook) {
+        if !core::ptr::fn_addr_eq(displaced, test_file_batch_fault_hook as FileBatchFaultHook) {
+            *FILE_BATCH_FAULT_HOOK_UNDER_TEST.lock() = Some(displaced);
+        }
+    }
+}
+
 /// Does `v` have a leaf translation in `a`? Per-arch because the walkers are.
 fn translate_is_mapped(a: &AddressSpace, v: VirtAddr) -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -15212,6 +15600,290 @@ fn smoke_memory_file_demand_errors_keep_their_meaning() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_file_demand_errors_keep_their_meaning);
+
+/// The bulk fault API (#737) installs a whole claimed range through one
+/// call: one claim operation, one batch-hook invocation for the single
+/// contiguous run, and the region ends up holding exactly the frames
+/// the hook named, each with a leaf — the state sixteen single faults
+/// would have produced, reached without sixteen fault round-trips.
+/// A second call over the now-backed range installs nothing and does
+/// not consult the hook again, and a range that runs off the region's
+/// end simply stops there.
+fn smoke_memory_file_demand_batch_installs_a_range_in_one_call() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    // SAFETY: as the tests above.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0000_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x4000,
+        perms: RegionPerms::READ
+            | RegionPerms::WRITE
+            | RegionPerms::SHARED
+            | RegionPerms::FILE_DEMAND,
+        phys: Vec::new().into(),
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region rejected a FILE_DEMAND region");
+    }
+
+    let mut frames = Vec::new();
+    for i in 0..4u64 {
+        let frame = match crate::frame::alloc_frame() {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("alloc_frame failed"),
+        };
+        let phys = frame.start_address();
+        // SAFETY: a freshly-allocated frame is exclusively ours and
+        // reachable through the kernel RAM accessor.
+        unsafe {
+            phys.kernel_mut_ptr::<u64>().write_volatile(0x0B47_0000 + i);
+        }
+        frames.push(frame);
+    }
+    {
+        let mut table = TEST_BATCH_FRAMES.lock();
+        for (slot, frame) in table.iter_mut().zip(frames.iter()) {
+            *slot = frame.start_address().raw();
+        }
+    }
+    TEST_BATCH_BASE.store(vbase, Ordering::Relaxed);
+    TEST_BATCH_FAIL_PAGE.store(0, Ordering::Relaxed);
+    TEST_BATCH_CALLS.store(0, Ordering::Relaxed);
+    arm_test_file_batch_fault_hook();
+
+    // SAFETY: `a` is a live user root from `new_for_user`; the identity
+    // map is up and the frame allocator is initialised.
+    let installed = unsafe { a.demand_alloc_range(VirtAddr::new(vbase), 4) };
+    let calls = TEST_BATCH_CALLS.load(Ordering::Relaxed);
+    let region = a.lookup(VirtAddr::new(vbase));
+    let slots_ok = region.as_ref().is_some_and(|r| {
+        frames
+            .iter()
+            .enumerate()
+            .all(|(i, f)| r.phys.get(i).copied() == Some(f.start_address()))
+    });
+    let mapped_ok = (0..4u64).all(|i| translate_is_mapped(&a, VirtAddr::new(vbase + i * 4096)));
+    let markers_ok = frames.iter().enumerate().all(|(i, f)| {
+        // SAFETY: the frames are this test's allocations, served through
+        // the hook but still owned here (SHARED region).
+        let seen = unsafe { f.start_address().kernel_ptr::<u64>().read_volatile() };
+        seen == 0x0B47_0000 + i as u64
+    });
+    // Everything backed now: a repeat installs nothing and the hook is
+    // not consulted again. A range running off the region's end also
+    // installs nothing.
+    // SAFETY: as above.
+    let repeat = unsafe { a.demand_alloc_range(VirtAddr::new(vbase), 4) };
+    // SAFETY: as above.
+    let overrun = unsafe { a.demand_alloc_range(VirtAddr::new(vbase + 0x3000), 4) };
+    let calls_after = TEST_BATCH_CALLS.load(Ordering::Relaxed);
+
+    TEST_BATCH_BASE.store(0, Ordering::Relaxed);
+    drop(a);
+    // The region was SHARED, so teardown freed nothing: the frames are
+    // ours to return, exactly as a file's would be its own.
+    for frame in frames {
+        crate::frame::free_frame(frame);
+    }
+
+    if installed != 4 {
+        return TestResult::Fail("the batch did not install the whole claimed range");
+    }
+    if calls != 1 {
+        return TestResult::Fail("the batch did not fill the run through one hook call");
+    }
+    if !slots_ok {
+        return TestResult::Fail("the region does not hold the frames the hook named");
+    }
+    if !mapped_ok {
+        return TestResult::Fail("the batch left a claimed page without a leaf");
+    }
+    if !markers_ok {
+        return TestResult::Fail("an installed page is not the hook's frame contents");
+    }
+    if repeat != 0 || overrun != 0 || calls_after != 1 {
+        return TestResult::Fail("a batch over backed / out-of-region pages was not a no-op");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_file_demand_batch_installs_a_range_in_one_call
+);
+
+/// The batch's error contract (#737): a page the file refuses is a
+/// *skip* inside a batch — the rest of the range still installs, and
+/// the refused page's claim is released so a later batch can retry it —
+/// while the same refusal on the single-page path stays fatal, with
+/// exactly the outcome `vm_fault_t` prescribes. That split is what
+/// lets fault-around be advisory without making real faults advisory.
+fn smoke_memory_file_demand_batch_refusal_is_advisory_single_is_fatal() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    // SAFETY: as the tests above.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0000_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x5000,
+        perms: RegionPerms::READ
+            | RegionPerms::WRITE
+            | RegionPerms::SHARED
+            | RegionPerms::FILE_DEMAND,
+        phys: Vec::new().into(),
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region rejected a FILE_DEMAND region");
+    }
+    let mut frames = Vec::new();
+    for _ in 0..4 {
+        let frame = match crate::frame::alloc_frame() {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("alloc_frame failed"),
+        };
+        frames.push(frame);
+    }
+    {
+        let mut table = TEST_BATCH_FRAMES.lock();
+        for (slot, frame) in table.iter_mut().zip(frames.iter()) {
+            *slot = frame.start_address().raw();
+        }
+    }
+    TEST_BATCH_BASE.store(vbase, Ordering::Relaxed);
+    // Page 2 is refused by the batch hook; page 4 (outside the batch's
+    // first four) is refused by the single hook, as a SIGBUS.
+    TEST_BATCH_FAIL_PAGE.store(vbase + 0x2000, Ordering::Relaxed);
+    TEST_BATCH_CALLS.store(0, Ordering::Relaxed);
+    arm_test_file_batch_fault_hook();
+    TEST_FAULT_PAGE.store(vbase + 0x4000, Ordering::Relaxed);
+    TEST_FAULT_ERROR.store(1, Ordering::Relaxed);
+    arm_test_file_fault_hook();
+
+    let slot = |a: &AddressSpace, index: usize| {
+        a.lookup(VirtAddr::new(vbase))
+            .and_then(|r| r.phys.get(index).copied())
+    };
+    // SAFETY: as the batch test above.
+    let installed = unsafe { a.demand_alloc_range(VirtAddr::new(vbase), 4) };
+    let partial_ok = installed == 3
+        && slot(&a, 0) == Some(frames[0].start_address())
+        && slot(&a, 1) == Some(frames[1].start_address())
+        && slot(&a, 2) == Some(PhysAddr::new(0))
+        && slot(&a, 3) == Some(frames[3].start_address())
+        && !translate_is_mapped(&a, VirtAddr::new(vbase + 0x2000));
+
+    // The refused page's claim was released, not leaked: with the
+    // refusal lifted, a retry installs exactly that page.
+    TEST_BATCH_FAIL_PAGE.store(0, Ordering::Relaxed);
+    // SAFETY: as above.
+    let retried = unsafe { a.demand_alloc_range(VirtAddr::new(vbase), 4) };
+    let retried_ok = retried == 1 && slot(&a, 2) == Some(frames[2].start_address());
+
+    // And the single-page path stays fatal for a refusal: page 4's
+    // SIGBUS surfaces as Bus and backs nothing.
+    // SAFETY: as above.
+    let single = unsafe { a.demand_alloc_page(VirtAddr::new(vbase + 0x4000)) };
+    let single_ok =
+        single == Err(AddressSpaceError::Bus) && slot(&a, 4).is_none_or(|phys| phys.raw() == 0);
+
+    TEST_BATCH_BASE.store(0, Ordering::Relaxed);
+    TEST_FAULT_PAGE.store(0, Ordering::Relaxed);
+    TEST_FAULT_ERROR.store(0, Ordering::Relaxed);
+    drop(a);
+    for frame in frames {
+        crate::frame::free_frame(frame);
+    }
+
+    if !partial_ok {
+        return TestResult::Fail("the batch did not skip exactly the refused page");
+    }
+    if !retried_ok {
+        return TestResult::Fail("the refused page's claim was not released for a retry");
+    }
+    if !single_ok {
+        return TestResult::Fail("a single fault's refusal did not stay fatal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_file_demand_batch_refusal_is_advisory_single_is_fatal
+);
+
+/// The demand-zero fill source rides the same batch operation (#737):
+/// a plain lazy region's pages are allocated and zeroed by the batch
+/// itself, with no file hook involved — the shape a bulk-evicted
+/// private range's page-in takes.
+fn smoke_memory_demand_range_installs_demand_zero_pages() -> TestResult {
+    // SAFETY: as the tests above.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0000_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        // A lazy anonymous region carries dense zero backing slots;
+        // the empty sparse shape is FILE_DEMAND-only.
+        phys: alloc::vec![PhysAddr::new(0); 3].into(),
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region rejected a lazy region");
+    }
+
+    // SAFETY: as the batch test above.
+    let installed = unsafe { a.demand_alloc_range(VirtAddr::new(vbase), 3) };
+    let region = a.lookup(VirtAddr::new(vbase));
+    let slots: Vec<PhysAddr> = region
+        .as_ref()
+        .map(|r| (0..3).filter_map(|i| r.phys.get(i).copied()).collect())
+        .unwrap_or_default();
+    let zeroed_ok = slots.len() == 3
+        && slots.iter().all(|phys| {
+            phys.raw() != 0
+                // SAFETY: each frame was allocated by this batch and is
+                // owned by this region; reading it through the kernel
+                // RAM accessor is the zero-check.
+                && unsafe { phys.kernel_ptr::<u64>().read_volatile() } == 0
+                // SAFETY: as above (last word of the page).
+                && unsafe { phys.kernel_ptr::<u64>().add(511).read_volatile() } == 0
+        });
+    let mapped_ok = (0..3u64).all(|i| translate_is_mapped(&a, VirtAddr::new(vbase + i * 4096)));
+    // SAFETY: as above.
+    let repeat = unsafe { a.demand_alloc_range(VirtAddr::new(vbase), 3) };
+    drop(a);
+
+    if installed != 3 {
+        return TestResult::Fail("the batch did not install the demand-zero range");
+    }
+    if !zeroed_ok {
+        return TestResult::Fail("a batch-installed anonymous page was not a zeroed frame");
+    }
+    if !mapped_ok {
+        return TestResult::Fail("the batch left a demand-zero page without a leaf");
+    }
+    if repeat != 0 {
+        return TestResult::Fail("a batch over backed anonymous pages was not a no-op");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_demand_range_installs_demand_zero_pages
+);
 
 /// The address-space drop hook must run with its registry lock RELEASED. It
 /// drops every file owner of the dying mm (arbitrary destructors); calling it

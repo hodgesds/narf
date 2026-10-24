@@ -835,6 +835,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 // boot-order constraint of the kind §4.1 imposes on the BPF
                 // page-table slots.
                 narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
+                narf_memory::install_file_batch_fault_hook(crate::mapped_file::demand_frames_batch);
                 narf_filesystem::install_mmap_truncate_hook(
                     crate::mapped_file::truncate_file_mappings,
                 );
@@ -939,6 +940,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         match crate::mapped_file::new_anonymous_shared_file(len) {
             Ok(ops) => {
                 narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
+                narf_memory::install_file_batch_fault_hook(crate::mapped_file::demand_frames_batch);
                 Some(ops)
             }
             Err(_) => {
@@ -1042,6 +1044,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             } else {
                 lazy_shared_file = true;
                 narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
+                narf_memory::install_file_batch_fault_hook(crate::mapped_file::demand_frames_batch);
                 // Linux installs only VMA metadata here. An empty sparse
                 // prefix represents every page as absent until FILE_DEMAND
                 // grows through the first touched slot.
@@ -1066,6 +1069,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             lazy_private_file = true;
             private_file_ops = Some(Arc::clone(&ops));
             narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
+            narf_memory::install_file_batch_fault_hook(crate::mapped_file::demand_frames_batch);
             // As with Linux's file-backed VMA, mmap publishes no resident pages.
             // Each first touch reads exactly that file page into a private frame.
             alloc::vec::Vec::new()
