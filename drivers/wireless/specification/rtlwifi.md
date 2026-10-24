@@ -1,8 +1,9 @@
 # rtlwifi — Specification
 
 > Status: retained RTL8188EE firmware, factory-qualified MAC/BB/RF/IQ/LC,
-> signed channel/power, parked operational MAC and native polled packet/stop
-> core are software covered. Station service and physical validation remain.
+> signed channel/power, native polled station/packet/stop and Open/WPA2 device
+> integration are implemented. Composed DHCP/IP and lifecycle regressions are
+> pending combined checks; board qualification and physical validation remain.
 
 ## 1. Purpose & scope
 
@@ -49,8 +50,9 @@ Programming LDOE25 is not enabled for a read.
 | 8723AE | 497 | 256 | `0x67` |
 
 Unknown geometry/functions fail before I/O. Sparse-map bounds/overrides
-share the checked Realtek record decoder. Scan, association and configuration
-continue to return `NotSupported`; packet TX remains unavailable.
+share the checked Realtek record decoder. Only the retained qualified RTL8188EE
+station below implements scan/association/data; other matched silicon remains
+diagnostic and returns `NotSupported` for those operations.
 
 `power::run_with(io, cut, fab, interface, table)` is the production-shared
 byte-register parser: selected rows preserve unrelated fields, PCI rows use
@@ -83,8 +85,9 @@ Failed(error). The bounded attempt is self-driven/async, holds no IRQ-disabling
 guard across await, and never invokes block_on in a spawned task. Cancellation,
 timeout or write/checksum/start failure prevents retry and performs no cleanup
 I/O. Ready means a running firmware CPU, with packet DMA/IRQ/station admission
-still closed. The one-shot native continuation below does not dispatch
-H2C/C2H or advertise HT/VHT support. The diagnostic interface remains down.
+still closed. The one-shot native continuation below admits only its exact EE
+mailbox and legacy station profile; it does not advertise HT/VHT support.
+Firmware CPU readiness alone leaves the interface down.
 
 `prepare::Prepared<I, M>` is the RTL8188EE-only inactive descriptor/LLT owner.
 It validates DMA32 full extents, alignment and overlap before MMIO, constructs
@@ -214,8 +217,8 @@ The real probe worker reaches this boundary after signed board/channel policy.
 Its crate-private `start_packets` validates actual retained descriptor links,
 DMA32 addresses, base registers, RX postings and operational MAC readbacks before
 the one-shot current-capability BME transition and CR/PCIe DMA opening. Device
-IRQs stay masked. This is a bounded polling transport core; the registered
-diagnostic netdev still has no station service and remains down.
+IRQs stay masked. The retained station service below drives this bounded
+polling transport; transport readiness alone leaves carrier down.
 
 Management and non-QoS legacy data use distinct retained rings. Linux queue
 IDs MGNT6/BE1 supply doorbell bits64/2; allocation-vector indices1/4 never
@@ -250,6 +253,85 @@ reclamation proof. The next station facade must invoke this terminal stop on
 all association/disconnect/error paths; transport readiness alone raises no
 carrier or controlled port.
 
+`interface::Device` is the single shared native RTL8188EE view used by the
+controller, wireless registry and real Ethernet stack. It retains the same async
+`Prepared` storage installed before the probe worker publishes any ring address;
+it never takes/reconstructs the firmware or packet owner. Current net authority
+is required before production publication admits station DMA. Only
+channel1/2412MHz, legacy20/1T, mandatory basic1Mbps, continuously awake software
+crypto and one association per firmware claim are admitted. IRQs stay masked
+and a bounded synchronous drain serves the real stack even while a synchronous
+DHCP caller prevents other executor tasks from running. Both native-owner and
+endpoint-state mutexes are released before stack dispatch/reentrant ARP/ND TX.
+Missing signed board calibration or staged host policy can be retried from the
+retained parked radio/MAC boundary; a dirty/cancelled operation cannot retry.
+
+Public passive scan validates channel/frequency, filters and bounded dwell;
+beacons/probe responses come only from actual consumed native RX descriptors.
+Shared `association::observe` checks raw admission, addresses, ESS/interval,
+singleton IEs, rates and DS/current-channel agreement; EE additionally requires
+channel1/basic1Mbps. Signal is unknown instead of invented RSSI. Active/randomized
+scans, other channels and HT/VHT/HE/EHT modes remain unsupported.
+
+`prepare::station` retains the immutable observed BSS, shared `JoinPlan`, PMK,
+shared `station_security::Security`, exact pending TX ID/bytes, monotonic
+deadlines and key history beside the native DMA/mailbox owner. Actual Open
+authentication and association responses must complete MLME; software flags
+never substitute for peer frames. Negotiated rates and peer capabilities set
+real RRSR/INIRTS, preamble, slot/SIFS and non-QoS DCF BE registers. CAM is reset
+and software crypto remains selected. Current signed domain/board permission
+and physical radio switch are checked before progress/submission; a changed
+permission is terminal for the already configured channel.
+
+Before MLME, the service toggles RPWM awake and consumes H2C20 active mode
+`[0,0x10,5,0,0x0c]`. After association it installs peer/AID/media filters, consumes
+H2C3 keepalive and follows Linux's reserved-page/JOIN continuation: enable
+software beacon access, clear stale BCN_VALID, publish the owned768-byte body
+on the actual BCN ring, consume H2C0 page locations, await fresh BCN_VALID,
+restore beacon/TXQ/CR gates, then consume H2C1 media connected. HMETFR uses
+four rotating boxes and actual byte lanes, extension before inline; only
+demonstrated command IDs/body lengths are accepted. Command cancellation, stale
+authority, radio-off, timeout or readback failure installs terminal failure
+before awaiting. The reserved body stays retained for the firmware claim;
+beacon OWN clearing is not invented as its receipt. Independent oracles execute
+the original EE C mailbox/reserved-body/command-descriptor functions and check
+actual model MMIO/DMA, rather than comparing caller source buffers.
+
+WPA2-PSK/CCMP supplies original AP RSNE/RSNXE and fallible fresh entropy to
+shared RSNA/software CCMP. M4 must reach the exact terminal host receipt with
+both native ID and bytes matching the retained security reply before keys,
+controlled port and carrier open. AP authorization or different same-length
+DMA bytes are insufficient. Established carrier survives a temporary rekey
+reply gate; new data waits for the native reply. No extra AP/on-air ACK is
+required beyond the demonstrated vendor terminal host receipt. Narf-Ring
+clients cannot inject EAPOL, spoof factory source or request unsupported
+checksum/TSO/VLAN offloads.
+
+RX security uses original native MPDUs and actual descriptor software-decrypt
+metadata; exact authenticated Ethernet reaches both the real RX Narf-Ring and
+stack. A consumed invalid/report descriptor is distinguished from true OWN-idle,
+so queued peer loss/failure is processed before carrier or received data escapes.
+An environment-owned admission flag and publication lock serialize close with
+all bounded packet-start, ordinary MLME/data and reserved-beacon DMA publication.
+Async CAM/mailbox continuation checks closure after waits; no publication guard
+survives an await. Disconnect closes host publication before waiting for the retained owner,
+fences an already-entered stale carrier publisher, consumes H2C1 disconnected,
+clears peer registers and terminally closes packet gates. Cancellation,
+deadline, policy/capability/radio failure or peer loss closes keys and carrier,
+discards host TX and retains native DMA. No reset/reclaim or second-association
+recovery is promised.
+
+Composed Device fixtures boot the production paged firmware owner, consume its
+unique `PacketIo`, run retained radio/channel/MAC and native MLME/security, then
+use actual kernel DHCP and exact bidirectional Ethernet/IP. A reactive shared
+AP/DHCP server reads only published DMA descriptors/bodies. Dedicated smokes
+cover Open/WPA2, held/modified M4, direct IPC metadata, current policy,
+report/deauth bursts, rekey and disconnect/pending-DMA/old-publisher failures.
+Inert MMIO/DMA/AP and private signed-envelope fixtures establish software
+composition, not authenticated firmware execution on silicon or RF/power
+measurement. Physical operation still requires exact signed EE firmware,
+canonical signed regulatory policy and a measured matching NEPC board envelope.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -270,8 +352,8 @@ The scheduler's responsive wait supplies bounded EFUSE completion/settling.
 
 Factory identity, RTL8188EE CPU firmware, inactive LLT/linked-ring preparation
 and retained factory-qualified table/IQK/LCK continuation are software covered.
-Complete station software and physical
-board qualification remain required.
+Native legacy station/Device and composed DHCP/IP/lifecycle regressions are
+implemented, awaiting combined gates. Physical board qualification remains.
 
 ## 8. Open questions / remaining software
 
@@ -280,10 +362,10 @@ board qualification remain required.
 | Correct BAR2/read-only EFUSE lifecycle and per-chip identity | Implemented; shared-path regressions |
 | Complete source-matched per-chip power/reset qualification | RTL8188EE PCI enable prefix/flow implemented; other families remain incomplete |
 | Authenticated image/header selection and runtime firmware loading | RTL8188EE retained probe owner implemented; other profiles missing |
-| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 linked rings/LLT, one-shot active polled core, exact terminal host delivery and terminal gate-close/retention implemented; station/native service integration remains. Reclamation/reset/recovery and optional IRQ/H2C/C2H work remain |
-| RF/BB tables, calibration, channel/power and rate control | RTL8188EE complete tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 channel power and parked operational MAC implemented; negotiated peer/rate/filter integration remains. Optional gain tracking is excluded by measured profile |
-| Scan, management RX/TX, authentication/association and WPA2 | Missing |
-| Ethernet packet path and terminal TX completion ownership | Native raw-MPDU terminal ownership implemented; shared station-security and Ethernet/DHCP/IP service composition remains |
+| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 rings/LLT, one-shot polled service, terminal host delivery, demonstrated awake/keepalive/reserved-page/JOIN mailbox and terminal close/retention implemented. Reclamation/reset/recovery and optional IRQ/C2H expansion remain outside the initial profile |
+| RF/BB tables, calibration, channel/power and rate control | RTL8188EE tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 power, operational MAC and negotiated legacy peer/rate/filter integration implemented. Measured board envelope and silicon qualification remain; optional gain tracking is excluded by measured profile |
+| Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; new Device/composition regressions await combined gates. Other matched chips remain missing |
+| Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures implemented; combined gates and actual board testing remain |
 | Multi-radio, removal, suspend/reset/recovery | Missing |
 
 References: Linux `rtlwifi/efuse.c`, per-chip `sw.c`/`reg.h`,

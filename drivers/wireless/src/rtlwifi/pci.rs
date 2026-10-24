@@ -45,6 +45,7 @@ pub struct RtlwifiDevice {
     pub(super) firmware: Option<Arc<FirmwareOwner<PciIo>>>,
     pub(super) prepared: Option<Arc<super::prepare_native::Retained>>,
     pub(super) factory: Option<Arc<super::efuse::Factory>>,
+    pub(super) native: Option<Arc<super::interface::Native>>,
     pub link_up: AtomicBool,
     pub rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -69,7 +70,9 @@ impl RtlwifiDevice {
 
 impl Interface for RtlwifiDevice {
     fn name(&self) -> &str {
-        *IFNAME.lock()
+        self.native
+            .as_ref()
+            .map_or_else(|| *IFNAME.lock(), |native| native.name())
     }
     fn mac(&self) -> [u8; 6] {
         self.mac
@@ -78,19 +81,51 @@ impl Interface for RtlwifiDevice {
         1500
     }
     fn link_up(&self) -> bool {
-        self.link_up.load(Ordering::Acquire)
+        self.native.as_ref().map_or_else(
+            || self.link_up.load(Ordering::Acquire),
+            |native| native.link_up(),
+        )
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        &self.rx_ring
+        self.native
+            .as_ref()
+            .map_or(&self.rx_ring, |native| native.rx_ring())
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        &self.tx_ring
+        self.native
+            .as_ref()
+            .map_or(&self.tx_ring, |native| native.tx_ring())
     }
 }
 
 #[async_trait::async_trait]
 impl WirelessNetIface for RtlwifiDevice {
+    fn supports_handshake_offload(&self) -> bool {
+        self.native
+            .as_ref()
+            .is_some_and(|native| native.supports_handshake_offload())
+    }
+    fn reports_disconnect_events(&self) -> bool {
+        self.native.is_some()
+    }
+    fn supports_scan_dwell(&self) -> bool {
+        self.native.is_some()
+    }
+    fn connected_bssid(&self) -> Option<[u8; 6]> {
+        self.native.as_ref()?.connected_bssid()
+    }
+    fn cipher_suites(&self) -> &'static [u32] {
+        self.native
+            .as_ref()
+            .map_or(&[], |native| native.cipher_suites())
+    }
+    fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<alloc::vec::Vec<u8>> {
+        self.native.as_ref()?.scan_information_elements(bssid)
+    }
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
+        if let Some(native) = &self.native {
+            return native.get_wireless_info();
+        }
         WirelessIfaceInfo {
             base_name: self.name().into(),
             base_mac: self.mac(),
@@ -105,26 +140,33 @@ impl WirelessNetIface for RtlwifiDevice {
         }
     }
 
-    async fn scan(&self, _req: ScanRequest) -> Result<alloc::vec::Vec<BssInfo>, WirelessError> {
-        Err(WirelessError::NotSupported)
+    async fn scan(&self, req: ScanRequest) -> Result<alloc::vec::Vec<BssInfo>, WirelessError> {
+        match &self.native {
+            Some(native) => native.scan(req).await,
+            None => Err(WirelessError::NotSupported),
+        }
     }
 
-    async fn associate(&self, _req: AssociateRequest) -> Result<(), WirelessError> {
-        // Firmware, management-frame exchange, and data rings are not live
-        // yet.  Never report carrier merely because userspace requested an
-        // association.
-        Err(WirelessError::NotSupported)
+    async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
+        match &self.native {
+            Some(native) => native.associate(req).await,
+            None => Err(WirelessError::NotSupported),
+        }
     }
 
     async fn disassociate(&self) -> Result<(), WirelessError> {
+        if let Some(native) = &self.native {
+            return native.disassociate().await;
+        }
         self.link_up.store(false, Ordering::Release);
         Ok(())
     }
 
-    async fn set_config(&self, _cfg: WirelessConfig) -> Result<(), WirelessError> {
-        // Channel/power configuration belongs to the firmware-backed MAC
-        // path, which has not been implemented for this baseline.
-        Err(WirelessError::NotSupported)
+    async fn set_config(&self, cfg: WirelessConfig) -> Result<(), WirelessError> {
+        match &self.native {
+            Some(native) => native.set_config(cfg).await,
+            None => Err(WirelessError::NotSupported),
+        }
     }
 }
 
@@ -203,6 +245,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let firmware = dev.firmware.clone();
     let prepared = dev.prepared.clone();
     let factory = dev.factory.clone();
+    let native = dev.native.clone();
     *CONTROLLER.lock() = Some(dev);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -213,7 +256,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    *IFNAME.lock() = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
+    if let Some(native) = native {
+        // The controller already retains the complete device before either
+        // registry can expose it. Current net authority is required before
+        // the station facade may open native DMA.
+        super::interface::publish(native).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    } else {
+        *IFNAME.lock() = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
+    }
     if let (Some(firmware), Some(prepared), Some(factory)) = (firmware, prepared, factory) {
         // The retained controller/interface own this attempt before its first
         // register access. No IRQ-disabling guard survives into the task.
@@ -236,8 +286,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// Park PCI DMA, map BAR2, apply the existing power table and read factory
 /// EFUSE identity with device IRQs masked. Retains the qualified 8188EE
 /// firmware owner; probe starts it asynchronously after publishing ownership.
-/// Its one-shot continuation retains inactive LLT/native rings. Packet DMA,
-/// RF/BB, IRQ and station admission remain closed.
+/// Its one-shot continuation retains LLT/native rings and qualifies RF/BB/MAC.
+/// Public native station control separately gates packet DMA and association
+/// under signed board/current regulatory policy; device IRQs remain masked.
 ///
 /// # Safety
 /// Caller owns the device's PCI configuration and BARs exclusively.
@@ -299,6 +350,17 @@ pub unsafe fn bring_up(
     let prepared = firmware
         .as_ref()
         .map(|_| Arc::new(super::prepare_native::Retained::new(None)));
+    let native = match (&firmware, &prepared, &factory) {
+        (Some(firmware), Some(prepared), Some(factory)) => {
+            Some(Arc::new(super::interface::Device::new(
+                narf_net::iface::reserve_name("wlan%d"),
+                prepared.clone(),
+                factory.clone(),
+                super::interface::NativeEnvironment::new(firmware.clone()),
+            )))
+        }
+        _ => None,
+    };
     let device_arc = Arc::new(RtlwifiDevice {
         bus_addr: device.addr,
         registers,
@@ -307,11 +369,14 @@ pub unsafe fn bring_up(
         firmware: firmware.clone(),
         prepared: prepared.clone(),
         factory: factory.clone(),
+        native: native.clone(),
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(Some(rx_cons)),
         tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
     });
-    narf_wireless::registry::register(device_arc);
+    if native.is_none() {
+        narf_wireless::registry::register(device_arc);
+    }
 
     Ok(RtlwifiDevice {
         bus_addr: device.addr,
@@ -321,6 +386,7 @@ pub unsafe fn bring_up(
         firmware,
         prepared,
         factory,
+        native,
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(None),
         tx_ring: IrqSafeSpinLock::new(None),

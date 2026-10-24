@@ -95,6 +95,17 @@ firmware peer records, retained supplicant, key installation and controlled
 port. `Associated` alone grants none of those. MT76 preserves its existing
 public driver API through a wrapper; RTL8188EU uses the common plan directly.
 
+`association::observe(&impl RawFrame, channel, own, signal_dbm)` decodes a
+bounded unmodified legacy beacon/probe response into `ObservedBss`, retaining
+the original IEs and AP RSNE/RSNXE bodies plus IEEE supported/basic rate
+bitmaps. It binds receiver/transmitter/BSSID and optional DS channel IEs to
+the supplied retained radio channel; malformed or duplicate SSID/rate/security
+elements, fragments, modified RX and unsupported mandatory rates fail.
+The caller supplies native signal converted to dBm, or None. Hardware
+channel/PHY qualification, mandatory driver rates, signed radio policy,
+connection state and transmit/key authority remain driver-owned. Observed
+facts still pass through `JoinPlan` security and association negotiation.
+
 ### 3.1 Interface Specialization
 
 ```rust

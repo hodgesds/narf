@@ -14,6 +14,7 @@ impl Fixture {
         let mut consumers = core::array::from_fn(|_| None);
         consumers[1] = Some(consumer);
         let device = Arc::new(Device {
+            test_name: None,
             state: Mutex::new(State {
                 hardware,
                 scan_uid: 0,

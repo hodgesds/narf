@@ -68,6 +68,7 @@ pub struct Factory {
     state: State,
     identity: Option<Identity>,
     logical: Vec<u8>,
+    b_phycap: Option<[u8; 128]>,
 }
 impl Default for Factory {
     fn default() -> Self {
@@ -75,6 +76,7 @@ impl Default for Factory {
             state: State::New,
             identity: None,
             logical: Vec::new(),
+            b_phycap: None,
         }
     }
 }
@@ -87,6 +89,11 @@ impl Factory {
     }
     pub fn logical(&self) -> Option<&[u8]> {
         (self.state == State::Ready).then_some(self.logical.as_slice())
+    }
+    pub(super) fn b_phycap(&self) -> Option<&[u8; 128]> {
+        (self.state == State::Ready)
+            .then_some(self.b_phycap.as_ref())
+            .flatten()
     }
     /// A single completed native DDV lifecycle supplies every input. No erased
     /// data is synthesized after an I/O error and no caller can construct an
@@ -119,7 +126,17 @@ impl Factory {
         }
         // Linux physical power-k marker0x5e9, ECV0x5ea, secure0x5ec/5ed.
         let mut extra = [0; 5];
-        io.physical(0x5e9, &mut extra).await?;
+        let b_phycap = if chip == ChipId::Rtl8852B {
+            // The PHY-cap map is separate from the1216-byte sparse map.
+            // Read every byte before exposing trim/TSSI or secure inputs.
+            let mut bytes = [0; 128];
+            io.physical(0x580, &mut bytes).await?;
+            extra.copy_from_slice(&bytes[0x69..0x6e]);
+            Some(bytes)
+        } else {
+            io.physical(0x5e9, &mut extra).await?;
+            None
+        };
         if chip == ChipId::Rtl8851B && extra[1] >> 4 != 15 && extra[1] >> 4 != cut {
             return Err(Error::Unsupported);
         }
@@ -140,6 +157,7 @@ impl Factory {
             fuses,
         };
         self.logical = logical;
+        self.b_phycap = b_phycap;
         self.identity = Some(identity);
         self.state = State::Ready;
         Ok(())

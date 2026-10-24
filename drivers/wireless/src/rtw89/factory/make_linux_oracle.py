@@ -24,6 +24,15 @@ code='#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\ntypedef uint
 for n,model in zip(['A','B','C','N51'],models):
     for field in ['rfe_type','xtal_k','country_code']:
         code+='printf("pub const '+n+'_'+field.upper()+': usize = 0x%zx;\\n",offsetof(struct '+model+','+field+'));\n'
+for name,field in [
+    ('TSSI_A','path_a_tssi'),('TSSI_B','path_b_tssi'),
+    ('THERMAL_A','path_a_therm'),('THERMAL_B','path_b_therm'),
+    ('GAIN_CCK','rx_gain_2g_cck'),('GAIN_OFDM','rx_gain_2g_ofdm'),
+    ('GAIN_LOW','rx_gain_5g_low'),('GAIN_MID','rx_gain_5g_mid'),('GAIN_HIGH','rx_gain_5g_high'),
+]:
+    code+='printf("pub const B_'+name+': usize = 0x%zx;\\n",offsetof(struct rtw8852bx_efuse,'+field+'));\n'
+for name,field in [('CCK','cck_tssi'),('MCS2G','bw40_tssi'),('MCS5G','bw40_1s_tssi_5g')]:
+    code+='printf("pub const B_TSSI_'+name+': usize = 0x%zx;\\n",offsetof(struct rtw8852bx_tssi_offset,'+field+'));\n'
 code+='return 0;}\n'
 with tempfile.TemporaryDirectory() as td:
     td=Path(td);(td/'oracle.c').write_text(code);subprocess.run(['cc','-O2','-o',str(td/'oracle'),str(td/'oracle.c')],check=True);result=subprocess.check_output([str(td/'oracle')]).decode()

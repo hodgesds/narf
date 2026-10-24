@@ -10,6 +10,7 @@ pub(super) struct Firmware {
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
     mmio: MmioRegion,
+    factory: super::efuse::Factory,
     lifecycle: Lifecycle<Transport>,
 }
 impl core::fmt::Debug for Firmware {
@@ -28,16 +29,21 @@ impl Firmware {
         device: BusDevice,
         cap: Cap<BusDeviceCap, Write>,
         mmio: MmioRegion,
+        factory: super::efuse::Factory,
     ) -> Self {
         Self {
             device,
             cap,
             mmio,
+            factory,
             lifecycle: Lifecycle::new(device.id.device),
         }
     }
     pub(super) fn status(&self) -> Status {
         self.lifecycle.status()
+    }
+    pub(super) fn factory(&self) -> &super::efuse::Factory {
+        &self.factory
     }
     pub(super) async fn initialize_registered(&self) -> Result<Info, Error> {
         self.lifecycle
@@ -47,5 +53,16 @@ impl Firmware {
                 unsafe { pci_firmware::allocate(self.device, self.cap, self.mmio) }
             })
             .await
+    }
+    pub(super) async fn prepare_mac(&self) -> Result<super::mac::Info, Error> {
+        self.lifecycle.prepare_mac().await
+    }
+    pub(super) async fn prepare_phy_tables(&self) -> Result<super::phy::Info, Error> {
+        self.lifecycle.prepare_phy_tables(&self.factory).await
+    }
+    pub(super) async fn qualify_board(&self) -> Result<super::power_policy::Permission, Error> {
+        let domain = narf_wireless::reg::db::ensure_domain()
+            .map_err(|_| Error::Power(super::power_policy::Error::Policy))?;
+        self.lifecycle.qualify_board(&self.factory, &domain).await
     }
 }

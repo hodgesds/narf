@@ -29,6 +29,7 @@ pub(crate) struct Model {
     delays: usize,
     pause: Option<usize>,
     ignore: Option<u16>,
+    w1c: Option<u16>,
 }
 #[derive(Clone)]
 pub(crate) struct Port(Arc<IrqSafeSpinLock<Model>>);
@@ -51,6 +52,7 @@ impl Port {
             delays: 0,
             pause: None,
             ignore: None,
+            w1c: None,
         })))
     }
 }
@@ -96,7 +98,11 @@ impl Io for Port {
         if model.ignore == Some(reg) {
             return Ok(());
         }
-        model.registers[usize::from(reg)] = data;
+        if model.w1c == Some(reg) {
+            model.registers[usize::from(reg)] &= !data;
+        } else {
+            model.registers[usize::from(reg)] = data;
+        }
         Ok(())
     }
     fn write32(&self, reg: u16, data: u32) -> Result<(), AccessError> {
@@ -237,6 +243,18 @@ pub(crate) fn channel_owner(
 impl Port {
     pub(crate) fn trace(&self) -> Vec<(u8, u16, u32)> {
         self.0.lock().trace.clone()
+    }
+    pub(crate) fn w1c(&self, reg: u16) {
+        self.0.lock().w1c = Some(reg);
+    }
+    pub(crate) fn hardware_byte(&self, reg: u16, value: u8) {
+        self.0.lock().registers[usize::from(reg)] = value;
+    }
+    pub(crate) fn hardware_read8(&self, reg: u16) -> u8 {
+        self.0.lock().registers[usize::from(reg)]
+    }
+    pub(crate) fn hardware_word(&self, reg: u16, data: u32) {
+        store(&mut self.0.lock(), reg, data);
     }
     pub(crate) fn accesses(&self) -> usize {
         self.0.lock().accesses

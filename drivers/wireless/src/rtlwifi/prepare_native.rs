@@ -175,5 +175,12 @@ pub(super) async fn initialize_registered(
     storage
         .as_mut()
         .ok_or(Error::State)?
-        .configure_mac(&factory)
+        .configure_mac(&factory)?;
+    // Preserve the exact signed board envelope with this same native owner;
+    // station progress recomputes permission against current host policy.
+    storage
+        .as_mut()
+        .ok_or(Error::State)?
+        .stage_station_calibration(calibration, &domain)
+        .map_err(|_| Error::Power(super::channel_power::Error::Policy))
 }

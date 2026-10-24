@@ -8,6 +8,10 @@ pub enum Stage {
     Allocating,
     Loading,
     Ready,
+    PreparingMac,
+    MacPrepared,
+    PreparingPhy,
+    PhyTablesPrepared,
     Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +42,10 @@ struct Attempt<'a, I: Io>(&'a Lifecycle<I>);
 impl<I: Io> Drop for Attempt<'_, I> {
     fn drop(&mut self) {
         let mut status = self.0.status.lock();
-        if !matches!(status.stage, Stage::Ready | Stage::Failed) {
+        if !matches!(
+            status.stage,
+            Stage::Ready | Stage::MacPrepared | Stage::PhyTablesPrepared | Stage::Failed
+        ) {
             *status = Status {
                 stage: Stage::Failed,
                 info: None,
@@ -68,6 +75,67 @@ impl<I: Io> Lifecycle<I> {
         allocate: impl FnOnce() -> Result<I, Error> + Send,
     ) -> Result<Info, Error> {
         self.initialize(allocate, Source::Registered).await
+    }
+    pub(super) async fn prepare_mac(&self) -> Result<super::mac::Info, Error> {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::Ready {
+            return Err(Error::State);
+        }
+        self.status.lock().stage = Stage::PreparingMac;
+        let _attempt = Attempt(self);
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let result = owner.prepare_mac().await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::MacPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn prepare_phy_tables(
+        &self,
+        factory: &super::efuse::Factory,
+    ) -> Result<super::phy::Info, Error> {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::MacPrepared {
+            return Err(Error::State);
+        }
+        self.status.lock().stage = Stage::PreparingPhy;
+        let _attempt = Attempt(self);
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let result = owner.prepare_phy_tables(factory).await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::PhyTablesPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn qualify_board(
+        &self,
+        factory: &super::efuse::Factory,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<super::power_policy::Permission, Error> {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        retained
+            .as_mut()
+            .ok_or(Error::State)?
+            .qualify_board(factory, domain)
     }
     async fn initialize(
         &self,

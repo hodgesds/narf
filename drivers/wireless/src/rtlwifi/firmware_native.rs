@@ -135,7 +135,7 @@ impl PciIo {
         .map_err(|_| Error::Access)?
     }
     pub(super) fn packet_kick(&self, queue_bit: u16) -> Result<(), Error> {
-        if !matches!(queue_bit, 2 | 64) {
+        if !matches!(queue_bit, 2 | 16 | 64) {
             return Err(Error::Gate);
         }
         self.packet_authority(true, || {

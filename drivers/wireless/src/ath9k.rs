@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! AR9285 reset/EEPROM, inactive INI/PLL/RF and signed-policy calibration.
 //! Linux ath9k is the reference. The one-shot channel1 analog/AGC/IQ owner
-//! retains partial attempts; packet DMA and station service remain separate.
+//! retains partial attempts through native DMA, host RSNA and station service.
 
 use alloc::sync::Arc;
 use core::fmt::Write as _;
@@ -10,9 +10,15 @@ use narf_capabilities::{Cap, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 mod calibration;
+mod descriptor;
 mod identity;
 mod initvals;
+mod interface;
+mod mac;
+mod packet;
+mod packet_native;
 mod phy;
+mod station;
 pub use calibration::{Report as RadioCalibration, State as RadioState};
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
 pub use phy::Prepared as BasebandPrepared;
@@ -31,6 +37,8 @@ pub struct Ath9k {
     pub baseband: BasebandPrepared,
     calibration: [u8; EEPROM_4K_BYTES],
     radio: calibration::Calibration,
+    station: Option<RetainedRadio>,
+    packet_attempted: bool,
 }
 
 impl Ath9k {
@@ -45,6 +53,9 @@ impl Ath9k {
     }
 }
 
+type NativeRadio = station::Radio<packet_native::Native, station::NativeEnvironment>;
+type RetainedRadio = Arc<Mutex<NativeRadio>>;
+
 struct Retained {
     state: Mutex<Ath9k>,
 }
@@ -57,12 +68,44 @@ pub fn with_controller<R>(callback: impl FnOnce(&Ath9k) -> R) -> Option<R> {
     Some(callback(&controller))
 }
 
-/// Retry policy provisioning only before a calibration attempt has begun.
-/// A pending attempt is Running; failure/drop records Failed without cleanup.
-/// Neither can be replayed or replaced without a separately proved reset.
+/// Continue the same retained calibration/MAC/packet owner through native NIC
+/// publication. Missing policy may be provisioned before calibration begins;
+/// a completed calibration receipt can continue only before packet preparation
+/// starts. Partial/failed calibration or packet work is never replayed.
 pub async fn calibrate_radio() -> Result<RadioCalibration, BringUpError> {
     let owner = { CONTROLLER.lock().clone() }.ok_or(BringUpError::BadState)?;
-    calibrate_owner(&owner).await
+    initialize_owner(&owner).await
+}
+async fn initialize_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
+    let report = {
+        let controller = owner.state.lock().await;
+        match controller.radio.state() {
+            RadioState::New if !controller.packet_attempted => None,
+            RadioState::Ready if !controller.packet_attempted => controller.radio.report(),
+            _ => return Err(BringUpError::BadState),
+        }
+    };
+    let report = match report {
+        Some(report) => report,
+        None => calibrate_owner(owner).await?,
+    };
+    let station = prepare_packets(owner).await.map_err(|error| {
+        let _ = writeln!(
+            narf_console::Writer,
+            "ath9k: native packet preparation closed: {:?}",
+            error
+        );
+        BringUpError::BadState
+    })?;
+    interface::publish(station).map_err(|error| {
+        let _ = writeln!(
+            narf_console::Writer,
+            "ath9k: native station publication closed: {:?}",
+            error
+        );
+        BringUpError::BadState
+    })?;
+    Ok(report)
 }
 async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
     let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
@@ -87,6 +130,46 @@ async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpEr
     // published packet DMA. Current PCI parking was verified above; an async
     // mutex, rather than an IRQ-disabling guard, serializes the full attempt.
     unsafe { controller.radio.run(&mut io, &image, permission, xe2).await }
+}
+
+async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Error> {
+    let mut controller = owner.state.lock().await;
+    if controller.packet_attempted || controller.station.is_some() {
+        return Err(packet::Error::State);
+    }
+    let report = controller.radio.report().ok_or(packet::Error::State)?;
+    if controller.radio.state() != RadioState::Ready {
+        return Err(packet::Error::State);
+    }
+    // Retain the attempt before any MAC mutation. Even an allocation error
+    // cannot reconstruct another transport over partially configured hardware.
+    controller.packet_attempted = true;
+    // SAFETY: same retained sole function/cap/BAR/factory image as the exact
+    // successful calibration; this async mutex serializes all native access.
+    let native = unsafe {
+        packet_native::Native::new(
+            controller._device,
+            controller._cap,
+            controller._mmio,
+            report,
+            &controller.calibration,
+        )
+    }?;
+    mac::prepare(&native, &controller.calibration, controller.identity.mac)?;
+    // SAFETY: factory calibration and complete parked MAC/key-cache/queue
+    // preparation succeeded on this same non-cloneable native adapter. Probe
+    // never published packet DMA; prepare allocates but does not start DMA.
+    let packet = unsafe { packet::Packet::prepare(native, controller.identity.mac) }?;
+    let station = Arc::new(Mutex::new(station::Radio::new(
+        packet,
+        controller.identity.mac,
+        report.noise_dbm,
+        station::NativeEnvironment,
+    )));
+    // The exact native owner is retained before packet start or NIC exposure.
+    // Interface/control/drain callers clone only this same Arc.
+    controller.station = Some(station.clone());
+    Ok(station)
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -149,6 +232,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             baseband,
             calibration,
             radio: calibration::Calibration::default(),
+            station: None,
+            packet_attempted: false,
         }),
     });
     *CONTROLLER.lock() = Some(retained.clone());
@@ -160,11 +245,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
     narf_scheduler::spawn(async move {
-        match calibrate_owner(&retained).await {
+        match initialize_owner(&retained).await {
             Ok(report) => {
-                let _ = writeln!(narf_console::Writer,
-                "ath9k: channel1 calibration ready: IQ {}/{} PA {:?} NF {} dBm; packet service pending",
-                report.iq_i, report.iq_q, report.pa_offset, report.measured_noise_dbm);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ath9k: channel1 native station published: IQ {}/{} PA {:?} NF {} dBm",
+                    report.iq_i,
+                    report.iq_q,
+                    report.pa_offset,
+                    report.measured_noise_dbm
+                );
             }
             Err(error) => {
                 let _ = writeln!(

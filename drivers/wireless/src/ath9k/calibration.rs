@@ -75,6 +75,11 @@ pub(super) struct Permission {
     ceiling: u8,
 }
 impl Permission {
+    pub(super) fn allows_report(self, report: Report) -> bool {
+        self.country == report.country
+            && report.frequency_mhz == 2412
+            && self.ceiling >= report.max_power_half_dbm
+    }
     pub(super) fn from_domain(domain: &RegulatoryDomain) -> Result<Self, BringUpError> {
         // The first one-shot profile is channel1/full-rate/20MHz. The entire
         // occupied span must be covered; every overlapping limit constrains it.

@@ -60,6 +60,7 @@ mod firmware_native;
 pub mod firmware_transport;
 pub mod fw;
 pub mod h2c;
+mod interface;
 pub mod irq;
 pub mod mac;
 mod packet_mac;
@@ -72,6 +73,7 @@ pub mod radio;
 pub mod regs;
 pub mod rf;
 pub mod rx;
+mod station_control;
 pub mod tx;
 pub mod vht;
 

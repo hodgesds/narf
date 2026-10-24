@@ -62,6 +62,7 @@ struct Wire {
     next_pn: u64,
     fault: Fault,
     held: Option<(u8, u8, u16)>,
+    held_tx: Option<(u16, u16)>,
     m4: bool,
     error: Option<&'static str>,
 }
@@ -363,6 +364,7 @@ impl Wire {
                     self.m4 = true;
                     require(self.keys == 2, "Sc M4 before key receipts")?;
                     if self.fault == Fault::HoldM4 {
+                        self.held_tx = Some((p.queue, p.pointer));
                         return Ok(());
                     }
                 }
@@ -484,12 +486,18 @@ fn run<F: Future>(future: F, mut progress: impl FnMut() -> R<bool>) -> R<F::Outp
 
 struct Guard {
     device: Option<Arc<Device>>,
+    #[cfg(feature = "kernel-test")]
+    owner: Option<narf_wireless::nl80211::ConnectionOwnerFixture>,
 }
 impl Guard {
     fn new(secured: bool, fault: Fault) -> R<Self> {
+        Self::new_named(secured, fault, None)
+    }
+    fn new_named(secured: bool, fault: Fault, name: Option<&'static str>) -> R<Self> {
         require(
             ACTIVE.lock().is_none()
-                && narf_net::iface::lookup(super::super::iwl_ifname()).is_none(),
+                && narf_net::iface::lookup(super::super::iwl_ifname()).is_none()
+                && name.is_none_or(|name| narf_net::iface::lookup(name).is_none()),
             "live iwlwifi owner exists",
         )?;
         let versions = super::super::firmware_golden_tests::sc103_commands();
@@ -519,6 +527,7 @@ impl Guard {
             next_pn: 0,
             fault,
             held: None,
+            held_tx: None,
             m4: false,
             error: None,
         };
@@ -552,6 +561,7 @@ impl Guard {
             IrqSafeSpinLock::new(Some(producer))
         });
         let device = Arc::new(Device {
+            test_name: name,
             state: Mutex::new(state),
             control: Mutex::new(None),
             publication: AtomicBool::new(true),
@@ -575,29 +585,62 @@ impl Guard {
         narf_net::iface::install_rx_drain(drain);
         Ok(Self {
             device: Some(device),
+            #[cfg(feature = "kernel-test")]
+            owner: None,
         })
     }
     fn device(&self) -> &Arc<Device> {
         self.device.as_ref().unwrap()
     }
+    #[cfg(feature = "kernel-test")]
+    fn register_owner(&mut self, portid: u32) -> R {
+        let device = self.device();
+        require(
+            !narf_wireless::registry::list()
+                .iter()
+                .any(|i| i.name() == device.name()),
+            "Sc owner-close wireless name already registered",
+        )?;
+        narf_wireless::nl80211::register();
+        narf_wireless::registry::register(device.clone());
+        self.owner = Some(narf_wireless::nl80211::__connection_owner_for_test(
+            device.name(),
+            0,
+            portid,
+            AP,
+        ));
+        Ok(())
+    }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
+        #[cfg(feature = "kernel-test")]
+        if self.owner.take().is_some() {
+            narf_wireless::registry::unregister(self.device().name());
+        }
         if let Some(device) = &self.device {
             narf_net::iface::unregister(device.name());
         }
-        let harness = HARNESS.lock().take();
-        drop(harness);
+        let wire = HARNESS.lock().take().map(|(device, wire)| {
+            drop(device);
+            wire
+        });
         let active = ACTIVE.lock().take();
         drop(active);
         if let Some(device) = self.device.take() {
-            let device = Arc::try_unwrap(device).expect("Sc fixture retained unexpected owner");
+            let Ok(device) = Arc::try_unwrap(device) else {
+                // A failed lifecycle regression must retain the device-side
+                // model storage while a spawned owner still holds Hardware.
+                core::mem::forget(wire);
+                return;
+            };
             // SAFETY: all futures and fixture pointer views are gone; model
             // Hardware was never armed or published to a physical PCI device.
             unsafe {
                 model::destroy(device.state.into_inner().hardware);
             }
         }
+        drop(wire);
     }
 }
 
@@ -1033,4 +1076,112 @@ fn smoke_sc_disconnect_overrides_waiting_old_link_publication() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/dhcp",
     smoke_sc_disconnect_overrides_waiting_old_link_publication
+);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_sc_socket_owner_close_waits_for_native_m4_then_tears_down() -> TestResult {
+    check(|| {
+        const NAME: &str = "sc-owner-close-test";
+        const PORTID: u32 = 0x5343_c103;
+        let mut guard = Guard::new_named(true, Fault::HoldM4, Some(NAME))?;
+        guard.register_owner(PORTID)?;
+        let device = guard.device();
+        scan(device)?;
+        let domain = policy();
+        let mut association = Box::pin(device.associate_in_domain(request(true), &domain));
+        let mut cx = Context::from_waker(Waker::noop());
+        let deadline = narf_time::Deadline::after_ms(3000);
+        loop {
+            require(
+                association.as_mut().poll(&mut cx).is_pending(),
+                "Sc owner-close setup completed without M4 receipt",
+            )?;
+            service()?;
+            if HARNESS.lock().as_ref().unwrap().1.held_tx.is_some() {
+                break;
+            }
+            if deadline.expired() {
+                return Err("Sc owner-close setup stalled before native M4");
+            }
+        }
+        carrier(device, false)?;
+        // No control-slot work owns association: it holds state independently.
+        require(
+            device.control.try_lock().is_some_and(|slot| slot.is_none())
+                && device.state.try_lock().is_none(),
+            "Sc owner-close fixture did not hold native association state",
+        )?;
+        let baseline = Arc::strong_count(device);
+        // This is the actual registered NETLINK_URELEASE -> autodisconnect
+        // worker, not a copied decision or a direct disassociate() invocation.
+        narf_net::netlink_generic::notify_release(0, PORTID);
+        narf_scheduler::poll_one_round();
+        let waited_for_association = Arc::strong_count(device) == baseline + 1;
+        {
+            let mut harness = HARNESS.lock();
+            let wire = &mut harness.as_mut().unwrap().1;
+            let (queue, pointer) = wire.held_tx.take().unwrap();
+            wire.fault = Fault::None;
+            // Release precisely the M4 descriptor observed from actual DMA.
+            wire.firmware.tx_complete(queue, pointer);
+        }
+        let association_result = run(association.as_mut(), service);
+        // On a failing association, drop its state guard before driving the
+        // independently retained socket-close worker to terminal completion.
+        drop(association);
+        let deadline = narf_time::Deadline::after_ms(3000);
+        let mut worker_complete = false;
+        loop {
+            let _ = service();
+            narf_scheduler::poll_one_round();
+            if Arc::strong_count(device) == baseline {
+                worker_complete = true;
+                break;
+            }
+            if deadline.expired() {
+                break;
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        require(worker_complete, "Sc socket-close worker retained its task")?;
+        association_result?.map_err(|_| "Sc owner-close setup association failed")?;
+        require(
+            waited_for_association,
+            "Sc socket-close worker returned Busy and abandoned pending association",
+        )?;
+        carrier(device, false)?;
+        let state = device
+            .state
+            .try_lock()
+            .ok_or("Sc owner-close state retained")?;
+        require(
+            device.connected_bssid().is_none()
+                && state.connection.is_none()
+                && !state.needs_reset
+                && !state.hardware.is_failed()
+                && model::retained(&state.hardware) == (0, 0, 0),
+            "Sc socket close left an authorized peer or native DMA owners",
+        )?;
+        drop(state);
+        let probe = udp_ipv4(
+            AP,
+            OWN,
+            NETWORK.lease_ip,
+            NETWORK.server_ip,
+            49154,
+            7,
+            b"sc-owner-closed",
+        );
+        require(
+            send_frame(&probe, narf_net::TxMeta::default()).is_err()
+                && narf_net::iface::send_on(NAME, &probe).is_err()
+                && HARNESS.lock().as_ref().unwrap().1.data.is_empty(),
+            "Sc socket close admitted orphan IP data",
+        )
+    })
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/dhcp",
+    smoke_sc_socket_owner_close_waits_for_native_m4_then_tears_down
 );

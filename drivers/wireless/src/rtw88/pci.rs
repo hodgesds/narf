@@ -226,6 +226,29 @@ fn probe_exclusive(
             if let Err(error) = firmware.initialize_registered().await {
                 use core::fmt::Write as _;
                 let _ = writeln!(narf_console::Writer, "rtw88-8822ce firmware: {:?}", error);
+                return;
+            }
+            if let Err(error) = firmware.prepare_mac().await {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "rtw88-8822ce inactive MAC: {:?}",
+                    error
+                );
+                return;
+            }
+            if let Err(error) = firmware.prepare_phy_tables().await {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "rtw88-8822ce PHY tables: {:?}", error);
+                return;
+            }
+            if let Err(error) = firmware.qualify_board().await {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "rtw88-8822ce board qualification: {:?}",
+                    error
+                );
             }
         });
     }
@@ -265,7 +288,7 @@ pub unsafe fn bring_up(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<Rtw88Device, ProbeError> {
-    let (registers, mac) = super::pci_park::invoke(cap, || -> Result<_, ProbeError> {
+    let (registers, mac, factory) = super::pci_park::invoke(cap, || -> Result<_, ProbeError> {
         let registers = map_registers_with(device, |device, index| {
             super::pci_park::map_bar_control(device, cap, index)
         })?;
@@ -279,10 +302,24 @@ pub unsafe fn bring_up(
 
         // Decode the sparse physical EFUSE map and select this chip's PCI MAC.
         // SAFETY: BAR2 control registers mapped, power-on done.
-        let mac =
-            unsafe { efuse::read_mac(&registers, device.id.device) }.map_err(ProbeError::Efuse)?;
+        let factory = if device.id.device == RTL_DEV_8822CE {
+            // SAFETY: the same powered/exclusive BAR2 invocation above owns
+            // this one physical map read, including factory radio identity.
+            Some(
+                unsafe { efuse::read_factory(&registers, device.id.device) }
+                    .map_err(ProbeError::Efuse)?,
+            )
+        } else {
+            None
+        };
+        let mac = match &factory {
+            Some(factory) => factory.mac(),
+            // SAFETY: same powered/exclusive BAR2 invocation, sibling geometry.
+            None => unsafe { efuse::read_mac(&registers, device.id.device) }
+                .map_err(ProbeError::Efuse)?,
+        };
 
-        Ok((registers, mac))
+        Ok((registers, mac, factory))
     })
     .map_err(|_| ProbeError::PciAccess)??;
 
@@ -291,7 +328,12 @@ pub unsafe fn bring_up(
         // power reset and factory EFUSE above, with PCI BME/IRQs parked. No
         // previous native owner exists; every later access rechecks authority.
         Some(Arc::new(unsafe {
-            super::firmware_native::Firmware::new(*device, *cap, registers)
+            super::firmware_native::Firmware::new(
+                *device,
+                *cap,
+                registers,
+                factory.ok_or(ProbeError::Efuse(efuse::EfuseError::MacUninitialized))?,
+            )
         }))
     } else {
         None

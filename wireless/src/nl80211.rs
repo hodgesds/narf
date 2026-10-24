@@ -1441,6 +1441,30 @@ pub fn register() -> bool {
     registered
 }
 
+/// Private driver fixtures stage only cfg80211's socket-owner metadata. This
+/// grants no network authority and does not perform or simulate driver work.
+#[cfg(any(test, feature = "kernel-test"))]
+#[doc(hidden)]
+pub fn __connection_owner_for_test(
+    name: &str,
+    namespace: u64,
+    portid: u32,
+    bssid: [u8; 6],
+) -> ConnectionOwnerFixture {
+    control::set_owner_for_test(name, namespace, portid, bssid);
+    ConnectionOwnerFixture(alloc::string::String::from(name))
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[doc(hidden)]
+pub struct ConnectionOwnerFixture(alloc::string::String);
+#[cfg(any(test, feature = "kernel-test"))]
+impl Drop for ConnectionOwnerFixture {
+    fn drop(&mut self) {
+        control::unregister_owner_for_test(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

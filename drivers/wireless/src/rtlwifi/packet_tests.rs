@@ -12,6 +12,7 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 include!("radio/packet_golden.rs");
+include!("radio/station_golden.rs");
 
 #[derive(Clone)]
 struct Region {
@@ -76,6 +77,14 @@ struct Model {
     kicks: Vec<u16>,
     observed: Vec<Vec<u8>>,
     slots: [usize; 7],
+    commands: Vec<(u8, Vec<u8>)>,
+    reserved: Vec<Vec<u8>>,
+    hold_command: Option<u8>,
+    hold_beacon: bool,
+    peer: Option<Arc<IrqSafeSpinLock<station_tests::Peer>>>,
+    rx_next: usize,
+    held: Option<(usize, usize, u32)>,
+    error: Option<&'static str>,
 }
 #[derive(Clone)]
 struct PacketPort {
@@ -98,9 +107,38 @@ impl PacketPort {
                 kicks: Vec::new(),
                 observed: Vec::new(),
                 slots: [0; 7],
+                commands: Vec::new(),
+                reserved: Vec::new(),
+                hold_command: None,
+                hold_beacon: false,
+                peer: None,
+                rx_next: 0,
+                held: None,
+                error: None,
             })),
             drops: Arc::new(AtomicUsize::new(0)),
         }
+    }
+    fn emit(&self, bytes: &[u8]) -> Result<(), Error> {
+        let slot = {
+            let mut model = self.model.lock();
+            let slot = model.rx_next;
+            model.rx_next = (slot + 1) % 4;
+            slot
+        };
+        let ring = self.region(u64::from(self.radio.word(LINUX_RX_BASE)));
+        if word(&ring.bytes.lock(), slot * 32) & OWN == 0 {
+            return Err(Error::Descriptor);
+        }
+        let mut wire = bytes.to_vec();
+        wire.extend_from_slice(&[0; 4]);
+        self.inject(slot, &wire, 1 << 27, 0, 0);
+        Ok(())
+    }
+    fn release_held(&self) {
+        let (queue, slot, control) = self.model.lock().held.take().unwrap();
+        self.tx_word(queue, slot, 0, control & !OWN);
+        self.model.lock().slots[queue] = (slot + 1) % 4;
     }
     fn check(&self) -> Result<(), AccessError> {
         if self.model.lock().live {
@@ -191,16 +229,69 @@ impl Io for PacketPort {
     }
     fn write32(&self, reg: u16, value: u32) -> Result<(), AccessError> {
         self.check()?;
-        self.radio.write32(reg, value)
+        self.radio.write32(reg, value)?;
+        let hold_cam = {
+            let model = self.model.lock();
+            model.wait && model.hold_command.is_none()
+        };
+        if reg == 0x670 && value == 0xc0000000 && !hold_cam {
+            self.radio.hardware_word(reg, 0);
+        }
+        Ok(())
     }
     fn write_bytes(&self, reg: u16, bytes: &[u8]) -> Result<(), AccessError> {
         self.check()?;
-        self.radio.write_bytes(reg, bytes)
+        self.radio.write_bytes(reg, bytes)?;
+        if (0x1d0..=0x1dc).contains(&reg) && reg & 3 == 0 && bytes.len() == 4 {
+            // Firmware reads the actually published MMIO lanes, never the
+            // caller's source buffer. All extension lanes are observed too.
+            let command = self.radio.hardware_read8(reg);
+            let length = match command {
+                0 | 0x20 => 5,
+                1 => 1,
+                3 => 2,
+                _ => return Err(AccessError::Unsupported),
+            };
+            let slot = (reg - 0x1d0) / 4;
+            let mask = 1 << slot;
+            self.radio
+                .hardware_byte(0x1cc, self.radio.hardware_read8(0x1cc) | mask);
+            let mut payload = Vec::new();
+            for at in 0..length {
+                payload.push(self.radio.hardware_read8(if at < 3 {
+                    reg + 1 + at
+                } else {
+                    0x1f0 + slot * 4 + at - 3
+                }));
+            }
+            let hold = {
+                let mut model = self.model.lock();
+                model.commands.push((command, payload));
+                model.hold_command == Some(command)
+            };
+            if !hold {
+                self.radio
+                    .hardware_byte(0x1cc, self.radio.hardware_read8(0x1cc) & !mask);
+            }
+        }
+        Ok(())
     }
     async fn delay_us(&self, micros: u64) {
-        let wait = { self.model.lock().wait };
-        if wait {
-            core::future::pending::<()>().await;
+        if micros != 1 {
+            // A held device wait can be cancelled or explicitly released by
+            // the fixture. Re-read the latch while polling: pending() would
+            // permanently strand the already-entered production continuation
+            // even after the fixture clears CAM/HMETFR and releases the wait.
+            core::future::poll_fn(|cx| {
+                let wait = { self.model.lock().wait };
+                if wait {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
         }
         self.radio.delay_us(micros).await;
     }
@@ -236,6 +327,7 @@ impl Port for PacketPort {
         self.check()?;
         // Independent Linux queue dispatch, not the driver's vector index.
         let (base, queue) = match bit {
+            16 => (LINUX_TX_BASES[0], 0),
             64 => (LINUX_TX_BASES[1], 1),
             2 => (LINUX_TX_BASES[4], 4),
             _ => return Err(Error::Descriptor),
@@ -255,7 +347,12 @@ impl Port for PacketPort {
         if control & 0x8c000000 != 0x8c000000
             || (control >> 16) & 255 != 32
             || word(&descriptor, 28) & 0xffff != length as u32
-            || (word(&descriptor, 4) >> 8) & 31 != if bit == 64 { 0x12 } else { 0 }
+            || (word(&descriptor, 4) >> 8) & 31
+                != match bit {
+                    64 => 0x12,
+                    16 => 0x10,
+                    _ => 0,
+                }
             || word(&descriptor, 36) != 0
             || word(&descriptor, 40) != ring.address as u32 + (((slot + 1) % 4) * 64) as u32
         {
@@ -268,8 +365,51 @@ impl Port for PacketPort {
             .get(..length)
             .ok_or(Error::Descriptor)?
             .to_vec();
-        self.model.lock().observed.push(bytes);
-        if complete {
+        if bit == 16 {
+            if length != 768
+                || word(&descriptor, 4) >> 16 & 15 != 7
+                || word(&descriptor, 12) & (1 << 31) == 0
+                || self.radio.read8(0x101)? & 1 == 0
+                || self.radio.read8(0x550)? & 24 != 16
+                || self.radio.read8(0x422)? & 64 != 0
+                || self.radio.read8(0x20a)? & 1 != 0
+            {
+                return Err(Error::Descriptor);
+            }
+            let hold = {
+                let mut model = self.model.lock();
+                model.reserved.push(bytes);
+                model.hold_beacon
+            };
+            if !hold {
+                self.radio.hardware_byte(0x20a, 1);
+            }
+            // The command-beacon OWN bit may stay set even on completed
+            // SRAM upload. Ordinary TX retirement must never consume it.
+            return Ok(());
+        }
+        self.model.lock().observed.push(bytes.clone());
+        let peer = { self.model.lock().peer.clone() };
+        let mut held = false;
+        if let Some(peer) = peer {
+            let result = { peer.lock().react(&bytes) };
+            match result {
+                Ok((replies, hold)) => {
+                    for reply in replies {
+                        self.emit(&reply)?;
+                    }
+                    held = hold;
+                }
+                Err(error) => {
+                    self.model.lock().error = Some(error);
+                    return Err(Error::Packet);
+                }
+            }
+        }
+        if held {
+            self.model.lock().held = Some((queue, slot, control));
+        }
+        if complete && !held {
             let mut bytes = ring.bytes.lock();
             put(&mut bytes, slot * 64, control & !OWN);
             self.model.lock().slots[queue] = (slot + 1) % 4;
@@ -504,3 +644,178 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/packet",
     smoke_rtl8188ee_native_rebinding_authority_and_terminal_failure
 );
+
+fn control_owner() -> (Prepared<PacketPort, Block>, PacketPort) {
+    let (owner, port) = owner();
+    port.radio.w1c(0x20a);
+    port.radio.hardware_word(0x6c, 1 << 31);
+    (owner, port)
+}
+const PEER: [u8; 6] = [2, 1, 2, 3, 4, 5];
+fn join_control(owner: &mut Prepared<PacketPort, Block>) -> Result<(), Error> {
+    run(owner.awake_station())?;
+    owner.start_packets()?;
+    run(owner.prepare_station_peer(PEER, 0xfff, 0x151, 0x420))?;
+    run(owner.complete_station_peer(PEER, 42))
+}
+pub(crate) fn smoke_rtl8188ee_station_native_mailbox_pages_match_original_linux() -> TestResult {
+    let (mut owner, port) = control_owner();
+    if join_control(&mut owner).is_err() {
+        return TestResult::Fail("native EE awake/peer/JOIN continuation failed");
+    }
+    let ring = port.descriptor(0, 0);
+    let mut descriptor = LINUX_RESERVED_DESCRIPTOR;
+    descriptor[8] = word(&ring, 32);
+    descriptor[10] = word(&ring, 40);
+    if (0..12).any(|index| word(&ring, index * 4) != descriptor[index]) {
+        return TestResult::Fail("native BCN DMA descriptor differs from original EE C function");
+    }
+    let exact = {
+        let model = port.model.lock();
+        model.reserved.len() == 1 && model.reserved[0] == LINUX_RESERVED_BODY
+    };
+    if !exact
+        || owner.packet.reserved.is_none()
+        || port.radio.word(0x608) != super::super::super::packet_mac::RCR | 0xc0
+        || port.radio.word(0x508) != 0xa41c
+        || port.radio.read8(0x102).unwrap() & 3 != 2
+        || port.radio.word(0x6a8) & 0x3fff != 42
+        || port.radio.read8(0x20a).unwrap() & 1 != 0
+    {
+        return TestResult::Fail(
+            "native EE reserved body/legacy timing/media/peer commit mismatch",
+        );
+    }
+    if run(owner.disconnect_station_peer()).is_err() {
+        return TestResult::Fail("native EE disconnect command/park failed");
+    }
+    let writes: Vec<_> = port
+        .radio
+        .trace()
+        .into_iter()
+        .filter(|(width, reg, _)| {
+            *width == 8 && ((0x1d0..0x1e0).contains(reg) || (0x1f0..0x200).contains(reg))
+        })
+        .collect();
+    if writes != LINUX_MAILBOX || owner.phase() != Phase::Stopped || port.model.lock().master {
+        return TestResult::Fail(
+            "actual MMIO mailbox byte lanes/order differ from original Linux C",
+        );
+    }
+    drop(owner);
+    if port.drops.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("JOIN beacon OWN was reclaimed by an ordinary receipt");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/station",
+    smoke_rtl8188ee_station_native_mailbox_pages_match_original_linux
+);
+
+pub(crate) fn smoke_rtl8188ee_station_native_mailbox_and_beacon_cancel_retain_owner() -> TestResult
+{
+    for hold in [0x20, 3, 0, 1, 0xff] {
+        let (mut owner, port) = control_owner();
+        if hold == 0x20 {
+            {
+                let mut model = port.model.lock();
+                model.hold_command = Some(hold);
+                model.wait = true;
+            }
+            let mut future = Box::pin(owner.awake_station());
+            if future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return TestResult::Fail("awake cancellation fixture did not wait");
+            }
+            drop(future);
+        } else {
+            run(owner.awake_station()).unwrap();
+            owner.start_packets().unwrap();
+            run(owner.prepare_station_peer(PEER, 0xfff, 0x151, 0x420)).unwrap();
+            {
+                let mut model = port.model.lock();
+                model.wait = true;
+                if hold == 0xff {
+                    model.hold_beacon = true;
+                } else {
+                    model.hold_command = Some(hold);
+                }
+            }
+            let mut future = Box::pin(owner.complete_station_peer(PEER, 42));
+            if future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return TestResult::Fail(
+                    "JOIN cancellation fixture did not await native hardware status",
+                );
+            }
+            drop(future);
+        }
+        if owner.phase() != Phase::Failed || owner.start_packets() != Err(Error::State) {
+            return TestResult::Fail("cancelled firmware/BCN owner reopened packet admission");
+        }
+        owner.stop_packets().unwrap();
+        drop(owner);
+        if port.drops.load(Ordering::SeqCst) != 0 {
+            return TestResult::Fail("cancelled firmware/BCN continuation released published DMA");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/station",
+    smoke_rtl8188ee_station_native_mailbox_and_beacon_cancel_retain_owner
+);
+
+pub(crate) fn smoke_rtl8188ee_station_native_stale_status_timeout_and_radio_off_close() -> TestResult
+{
+    let (mut owner, port) = control_owner();
+    port.radio.hardware_word(0x6c, 0);
+    if run(owner.awake_station()) != Err(Error::RadioOff) || port.model.lock().master {
+        return TestResult::Fail("hardware radio-off authorized native station start");
+    }
+    for stale in [false, true] {
+        let (mut owner, port) = control_owner();
+        run(owner.awake_station()).unwrap();
+        owner.start_packets().unwrap();
+        run(owner.prepare_station_peer(PEER, 0xfff, 0x151, 0x420)).unwrap();
+        if stale {
+            port.radio.hardware_byte(0x20a, 1);
+            port.radio.ignore(0x20a);
+        } else {
+            port.model.lock().hold_beacon = true;
+        }
+        let expected = if stale {
+            Error::Readback
+        } else {
+            Error::CommandTimeout
+        };
+        if run(owner.complete_station_peer(PEER, 42)) != Err(expected)
+            || owner.phase() != Phase::Failed
+        {
+            return TestResult::Fail("stale/absent beacon-valid became an acknowledged station");
+        }
+        if stale && !port.model.lock().reserved.is_empty() {
+            return TestResult::Fail("stale BCN_VALID was not rejected before publication");
+        }
+        owner.stop_packets().unwrap();
+        drop(owner);
+        if port.drops.load(Ordering::SeqCst) != 0 {
+            return TestResult::Fail("ambiguous JOIN completion reclaimed native DMA");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/station",
+    smoke_rtl8188ee_station_native_stale_status_timeout_and_radio_off_close
+);
+
+#[path = "packet_station_tests.rs"]
+pub(crate) mod station_tests;

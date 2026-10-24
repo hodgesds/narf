@@ -27,6 +27,8 @@ pub(super) struct State<M: Memory> {
     receive: usize,
     serial: u64,
     pending: Option<Pending<M>>,
+    mailbox: super::super::station_control::Mailbox,
+    reserved: Option<M>,
 }
 impl<M: Memory> State<M> {
     pub(super) fn new() -> Self {
@@ -36,12 +38,15 @@ impl<M: Memory> State<M> {
             receive: 0,
             serial: 0,
             pending: None,
+            mailbox: super::super::station_control::Mailbox::default(),
+            reserved: None,
         }
     }
     pub(super) fn retain(&mut self) {
         // Published descriptors may still name the current TX allocation.
         // BME clear alone never permits releasing it at a terminal stop.
         core::mem::forget(self.pending.take());
+        core::mem::forget(self.reserved.take());
     }
 }
 struct Pending<M: Memory> {
@@ -62,6 +67,12 @@ pub struct Delivery {
 pub struct Mpdu {
     bytes: Vec<u8>,
     channel: u8,
+}
+/// Consuming a rejected packet/report is progress, never a receive-idle
+/// proof. Station output waits for a genuine OWN-owned next descriptor.
+pub(crate) struct ReceiveStep {
+    pub consumed: bool,
+    pub packet: Option<Mpdu>,
 }
 impl Mpdu {
     pub fn bytes(&self) -> &[u8] {
@@ -105,6 +116,200 @@ fn queue(frame: &[u8], local: [u8; 6]) -> Result<(usize, u16, u8), Error> {
 }
 
 impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
+    pub(crate) fn local(&self) -> Option<[u8; 6]> {
+        self.packet.local
+    }
+    pub(crate) fn transmit_ready(&self) -> bool {
+        self.phase == Phase::Running && self.packet.pending.is_none() && !self.packet.mailbox.failed
+    }
+    pub(crate) async fn awake_station(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::MacConfigured {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        self.packet.mailbox.awake(&self.io).await?;
+        self.phase = Phase::MacConfigured;
+        Ok(())
+    }
+    pub(crate) async fn prepare_station_peer(
+        &mut self,
+        peer: [u8; 6],
+        rates: u16,
+        basic: u16,
+        capability: u16,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.reserved.is_some() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        super::super::station_control::prepare_peer(&self.io, peer, rates, basic, capability)
+            .await?;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// Keep the command-beacon DMA body for the lifetime of this firmware
+    /// claim. Its OWN bit may remain set: fresh BCN_VALID is its separate
+    /// upload receipt and never retires ordinary MGMT/BE payload ownership.
+    pub(crate) async fn complete_station_peer(
+        &mut self,
+        peer: [u8; 6],
+        aid: u16,
+    ) -> Result<(), Error> {
+        self.complete_station_peer_admitted(peer, aid, None, |_| Ok(()))
+            .await
+    }
+    pub(crate) async fn complete_station_peer_admitted(
+        &mut self,
+        peer: [u8; 6],
+        aid: u16,
+        admission: Option<&super::station::Admission>,
+        policy: impl Fn(&Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() || self.packet.reserved.is_some() {
+            return Err(Error::State);
+        }
+        let bytes = super::super::station_control::reserved_pages(
+            self.local().ok_or(Error::State)?,
+            peer,
+            aid,
+        )?;
+        let mut buffer = self.io.allocate_packet(bytes.len())?;
+        let address = extent(&buffer, bytes.len(), 4)?;
+        let end = u64::from(address) + bytes.len() as u64;
+        if self
+            .tx
+            .iter()
+            .chain(self.receive.iter())
+            .chain(self.buffers.iter())
+            .any(|other| {
+                u64::from(address) < other.address() + other.len() as u64 && other.address() < end
+            })
+        {
+            return Err(Error::Address);
+        }
+        self.io.authority(true, || {
+            buffer.write_bytes(0, &bytes)?;
+            buffer.sync();
+            Ok(())
+        })?;
+        self.packet.reserved = Some(buffer);
+        self.phase = Phase::Failed;
+        super::super::station_control::radio_on(&self.io)?;
+        // Source core.c enables keepalive before its media/JOIN continuation.
+        // The firmware still has no connected media or reserved-page location.
+        self.packet
+            .mailbox
+            .send_admitted(&self.io, 3, &[0xff, 10], admission)
+            .await?;
+        if admission
+            .is_some_and(|control| control.closed.load(core::sync::atomic::Ordering::Acquire))
+        {
+            return Err(Error::State);
+        }
+        super::super::station_control::associated(&self.io, aid)?;
+        let cr = self.io.read8(0x101)?;
+        let txq = self.io.read8(0x422)?;
+        let beacon = self.io.read8(0x550)?;
+        self.io.write8(0x101, cr | 1)?;
+        self.io.write8(0x550, (beacon & !8) | 16)?;
+        self.io.write8(0x422, txq & !64)?;
+        let stale = self.io.read8(0x20a)?;
+        self.io.write8(0x20a, stale | 1)?;
+        if self.io.read8(0x20a)? & 1 != 0 {
+            return Err(Error::Readback);
+        }
+        let mut prefix = [0u32; 10];
+        prefix[0] = 768 | (32 << 16) | (1 << 26) | (1 << 27);
+        prefix[1] = (7 << 16) | (0x10 << 8);
+        prefix[3] = 1 << 31;
+        prefix[4] = 1 << 8;
+        prefix[7] = 768;
+        prefix[8] = address;
+        {
+            let _publication = admission.map(|control| control.publication.lock());
+            if admission
+                .is_some_and(|control| control.closed.load(core::sync::atomic::Ordering::Acquire))
+            {
+                return Err(Error::State);
+            }
+            policy(self)?;
+            let ring = &mut self.tx[0];
+            self.io.authority(true, || {
+                ring.sync();
+                if ring.read32(0)? & OWN != 0 {
+                    return Err(Error::Descriptor);
+                }
+                for (index, value) in prefix.into_iter().enumerate() {
+                    ring.write32(index * 4, value)?;
+                }
+                ring.sync();
+                ring.write32(0, prefix[0] | OWN)?;
+                ring.sync();
+                Ok(())
+            })?;
+            self.io.kick(1 << 4)?;
+        }
+        self.packet
+            .mailbox
+            .send_admitted(&self.io, 0, &[4, 2, 3, 0, 0], admission)
+            .await?;
+        let mut complete = false;
+        for _ in 0..100 {
+            if admission
+                .is_some_and(|control| control.closed.load(core::sync::atomic::Ordering::Acquire))
+            {
+                return Err(Error::State);
+            }
+            super::super::station_control::radio_on(&self.io)?;
+            let status = self.io.read8(0x20a)?;
+            if status == 255 {
+                return Err(Error::Access(super::AccessError::Gone));
+            }
+            if status & 1 != 0 {
+                complete = true;
+                break;
+            }
+            self.io.delay_us(10).await;
+        }
+        if !complete {
+            return Err(Error::CommandTimeout);
+        }
+        self.io.write8(0x20a, 1)?;
+        self.io.write8(0x550, (beacon | 8) & !16)?;
+        if txq & 64 != 0 {
+            self.io.write8(0x422, txq)?;
+        }
+        self.io.write8(0x101, cr & !1)?;
+        if self.io.read8(0x20a)? & 1 != 0
+            || self.io.read8(0x101)? != cr & !1
+            || self.io.read8(0x550)? != (beacon | 8) & !16
+            || self.io.read8(0x422)? != txq
+        {
+            return Err(Error::Readback);
+        }
+        policy(self)?;
+        self.packet
+            .mailbox
+            .send_admitted(&self.io, 1, &[1], admission)
+            .await?;
+        if admission
+            .is_some_and(|control| control.closed.load(core::sync::atomic::Ordering::Acquire))
+        {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    pub(crate) async fn disconnect_station_peer(&mut self) -> Result<(), Error> {
+        if !matches!(self.phase, Phase::Running | Phase::Failed) {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let report = self.packet.mailbox.send(&self.io, 1, &[0]).await;
+        let mac = super::super::station_control::disconnected(&self.io);
+        let stopped = self.stop_packets();
+        report.and(mac).and(stopped)
+    }
     /// Open the already owned native rings. The one-shot operational MAC,
     /// factory IQ/LC calibration and opaque channel/power grant are required.
     /// Device interrupts remain masked; no native netdev is raised here.
@@ -323,6 +528,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Err(Error::PacketTimeout)
     }
     pub(crate) fn poll_receive(&mut self) -> Result<Option<Mpdu>, Error> {
+        self.poll_receive_step().map(|step| step.packet)
+    }
+    pub(crate) fn poll_receive_step(&mut self) -> Result<ReceiveStep, Error> {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
@@ -394,7 +602,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.packet.receive = (slot + 1) % self.depth;
         }
         self.phase = Phase::Running;
-        Ok(packet)
+        Ok(ReceiveStep { consumed, packet })
     }
     /// Terminal stop closes host admission first, attempts all independent
     /// packet/IRQ/PCI gates, and retains every published allocation. A parked

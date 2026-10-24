@@ -216,6 +216,13 @@ B's real power-k marker and secure fuse selection; independently compiled
 original Linux packed types establish all four AX field offsets. ECV must
 agree with the corrected 8851B cut. No I/O error becomes erased fuse/calibration
 defaults. Unknown/failed/cancelled snapshots expose no identity and reject reuse.
+8852B additionally reads the complete separate physical PHY-cap window
+`0x580..0x5ff`; its control bytes supply the same power-k/secure decisions.
+The retained raw map and logical snapshot feed `factory_b::Calibration`'s exact
+TSSI groups, signed RX-gain offsets/compensation and thermal/PA-bias trims.
+Only a completed native read permits Linux's explicit erased-map interpretation;
+partial I/O never produces trim defaults. Independent packed-C offsets and
+byte-preservation/failure/cancellation fixtures cover the extended source.
 
 `cold::Cold` retains one backend through actual normalized discovery power,
 factory reading, confirmed MAC-OFF, factory-only calibration qualification,
@@ -235,12 +242,100 @@ constants and check that no intermediate write enables either RX layer.
 Composed power/factory tests exercise every access failure and cancellable edge,
 including inherited ON state, RFE5 and corrected ECV.
 
+`Startup::prepare_mac` continues the same initialized firmware/native backend
+for the initial RTL8852B PCI profile. It drains actual CH12 consumption with a
+bounded wait before replacing the DLFW DLE/HFC configuration; the ring indices,
+published command mappings and eight-entry multi-tag quarantine remain owned.
+The retained `mac_runtime::Mac` requires actual WCPU status7, autoload-valid
+factory/RFE and the completed PHY-cap snapshot, then ports B's BB/RF-enable
+callback, MAC system enables and complete SCC DMAC/CMAC0 initialization.
+This includes the98,304-byte active DLE carve plus98,304-byte reservation,
+normal host-flow quotas/status, scheduler/MPDU/security, CAM/BA resets, filters,
+CCA/NAV/protocol settings, internal error masks and host-RPQ routing. Linux's
+PCI preload and BA-feature callbacks are no-ops for this exact B profile.
+The poll budgets remain bounded; BA-CAM timeout rejects readiness rather than
+accepting Linux's warning-only continuation. Critical function/HFC/DLE writes
+require readback. Every packet channel and both RX HCI layers remain stopped,
+and no RX base, PCI interrupt delivery or station is published.
+
+Four original-Linux-C traces cover the full B register width/value/order with
+zero/A5 inherited fields and both initial cuts. Tests cover every register
+failure and cancellable delay, all controller deadlines, ignored configuration
+writes, WCPU status6/gone, dirty RX prerequisites and actual revoked NativeIo
+authority. Failure/cancellation closes the enclosing startup attempt while
+retaining published DMA. `MacPrepared` is an internal system/TRX prerequisite;
+RF tables/calibration and policy-qualified channel/rate/station activation
+still precede usable hardware.
+
+`Startup::prepare_receive` advances only the same actual B firmware/MAC owner
+to internal `Receiving`. `rx_dma::Rx` retains both RXQ/RPQ descriptor rings and
+their fresh DMA buffers (Linux's11,498-byte extent), verifies
+zero indices, publishes bases/counts with readback, and enables only those two
+RX channels and both independent RX HCI layers. LTR follows the actual PCIe
+DEVCTL2 host enable through the bounded capability walker; invalid LTR state
+fails before base publication. Baseline eight-byte address-info is configured.
+WPDMA and every packet TX queue stay stopped; this is a selective RX continuation,
+not the complete Linux all-queues PCI post-init. PCI interrupt delivery and
+network-interface publication remain absent. Failure/cancellation is terminal
+and retains any possibly published descriptors/buffers; stop bits or BME-off
+do not release memory.
+
+Each private polling invocation bounds both rings' descriptor work. Host-only
+16-bit WP doorbells preserve hardware RP, reject invalid/stale index movement,
+and require repost readback. `rx_packet::Assembler` checks actual RXBD write
+extents, short/long RXD and driver-info offsets and bounded FS/LS assembly.
+It strips exactly four FCS bytes only from native Wi-Fi packets, and drops bad
+CRC/ICV or unsupported aggregate/hardware-crypto/nonlegacy profiles. RPQ uses
+the actual RXBD write length for complete four-byte release records, independently
+of RXD packet length. C2H envelopes retain their full bytes and decode receive
+versus execution ACK identities separately; neither a transport read pointer
+nor a receive ACK establishes firmware execution. Events remain private; the
+packet TX owner and identity-matched RPQ completion dispatcher are still required.
+
+Independent compiled original Linux functions/types provide48 RXD layouts,
+64 ring-wrap/index cases, four RXBD address encodings, nine C2H envelopes,
+240 RPQ identities/channel mappings and enabled/disabled zero/A5 LTR traces.
+The RAM device model follows actual published ring bases/descriptors and only
+writes buffers after matching complete addresses/extents to retained allocations.
+Tests mutate the real DMA body, reject unwritten/out-of-owner descriptors,
+exercise ignored reposts, every register failure, cancellable config reads,
+malformed metadata and actual revoked NativeIo authority before allocation
+or DMA packet inspection. Actual native CH12/RX allocations stay below36 bits,
+matching Linux's device DMA negotiation; the40-bit baseline descriptor encoding
+alone never grants a wider address limit. These are software/model proofs, not physical radio
+validation.
+
+`rf_access::Rf` implements B's actual RF-v1 analog SWSI and direct RF register
+transactions independently of the PCIe PHY MDIO/DBI owner. AX PHY addresses add
+0x10000; native access therefore requires current authority over BAR2 through
+0x1f3ff, rather than inheriting RF authority from the MAC-sized minimum mapping.
+The native adapter additionally requires the retained completed B factory/MAC/RX
+continuation. It preserves the20-bit masks, path selection, actual SWSI busy/done
+polls at1us/30us and2us read settle, and1us direct-write delay. No fabricated
+readback supplies a calibration value. A failed or cancelled transaction never
+replays; analog write success means issuance, and the next transaction checks
+actual busy.48 compiled original Linux callback traces cover both paths,
+analog/direct, zero/A5 inherited fields and full/sparse masks. Tests cover each
+access failure and cancellation point, all busy/done deadlines, invalid paths,
+the actual native aperture and revoked authority. `radio_tables_b` retains the
+actual B BB1,013, gain66, RF-A8,295, RF-B8,392 and NCTL1,320 pair entries.
+`radio_table::program` validates/selects the entire immutable program before
+its first device write, preserving exact/wildcard/max-cut headline ordering
+and conditional branch selection.160 compiled original Linux selector cases
+compare full selected-stream counts and order-sensitive digests across RFE/cut
+inputs; malformed grammar or an unsupported package never yields a successful
+partial program. Table execution, BB gain/reset/power-unit composition, RF
+firmware upload, calibration, channel/power policy and station software remain
+required; table selection itself grants no hardware readiness.
+
 This cold/WCPU path still requires an independently established old-DMA fence
 and exclusive function claim: BME-off, MAC-OFF and these retained receipts do
 not establish reclamation. It is private and does not run in the diagnostic
-probe, enable MSI/IRQ delivery, publish RX rings or register a network interface.
+probe, enable MSI/IRQ delivery or register a network interface. Only its explicit
+B receive continuation publishes RX rings.
 A/51 programmed secure boot still needs authenticated board blacklist-policy
-loading; B/C retain Linux's version0 policy. Full MAC sys/TRX initialization,
+loading; B/C retain Linux's version0 policy. B's retained MAC sys/TRX preparation
+does not complete other AX profiles. Native packet TX/RPQ completion composition,
 RF/BB tables/calibration, channel/power policy and station/IP composition remain
 separate software prerequisites before physical Wi-Fi acceptance.
 
@@ -308,12 +403,12 @@ bring-up scaffolding and does not establish a working station runtime.
 | Prerequisite | State |
 |---|---|
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
-| Complete per-chip power/PCIe initialization | Native power-on/off, inherited-state normalization, DLFW DLE/HFC and retained internal BDRAM/index setup implemented with Linux-C traces; exact AX PCIe MAC-pre-init PHY/quirk/mode policy also implemented; PCI basic_cfg and actual factory-qualified cold discovery/runtime-power composition implemented; full MAC/RF startup and probe integration remain |
+| Complete per-chip power/PCIe initialization | Native power-on/off, inherited-state normalization, DLFW DLE/HFC and internal BDRAM/index setup, AX PCIe pre-init/basic_cfg and actual qualified cold-to-WCPU composition implemented; B-only SCC MAC system/TRX plus selective LTR/address-info/RX continuation added with original-C evidence; packet TX/WPDMA/full PCI post-init, RF startup and probe integration remain |
 | Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans, native CH12 ownership and retained WCPU loading implemented; owned cold-to-CH12/WCPU composition and TX-only BME activation implemented; full packet/RF startup and A/51 secure-policy loading remain |
 | Ring quiesce/publication, BDRAM setup, IRQ ownership and recovery | Internal BDRAM partition/reset and actual zero-index readback implemented; independent old-DMA fencing, full ring/IRQ ownership and recovery remain |
 | AX initial native TX layout and bounded completion ownership | Shared production backend implemented and model-tested; not yet activated by station/firmware owner |
-| RPQ release handling, RX assembly/validation and frame delivery | Incomplete |
-| RF/BB calibration, regulatory channel/power and coexistence | Missing |
+| RPQ release handling, RX assembly/validation and frame delivery | B retained native RXQ/RPQ publication/polling, checked segmented RX/FCS, RPQ records and bounded C2H/ACK decoding implemented; packet-TX completion dispatch and station frame delivery remain |
+| RF/BB calibration, regulatory channel/power and coexistence | B's actual complete PHY-cap/logical calibration inputs, bounded current-capability/full-aperture RF-v1 access and real BB/gain/RF/NCTL snapshots/checked conditional selection implemented; table execution, gain/reset/power-unit/RF-upload/calibration composition, policy-qualified channel/power and coexistence remain |
 | Scan, real management MLME, WPA2 keys/controlled port, Ethernet data | Missing |
 | BE EFUSE/block format and BE transport | Missing |
 | Reset/removal/suspend and multi-device lifetime | Missing |

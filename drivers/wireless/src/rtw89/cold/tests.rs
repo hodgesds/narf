@@ -153,6 +153,10 @@ impl Source for Hardware {
         match (start, output.len()) {
             (0, 1216) => output.copy_from_slice(&self.raw),
             (0x5e9, 5) => output.copy_from_slice(&[0xff, (self.cut << 4) | 15, 255, 255, 255]),
+            (0x580, 128) => {
+                output.fill(255);
+                output[0x69..0x6e].copy_from_slice(&[255, (self.cut << 4) | 15, 255, 255, 255]);
+            }
             _ => panic!("incomplete physical factory read"),
         };
         Ok(())

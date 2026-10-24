@@ -85,6 +85,8 @@ impl Fixture {
             depth: 4,
             armed: false,
             state: State::Configuring,
+            receive: super::super::rx_dma::Rx::default(),
+            radio: super::super::rf_access::Rf::default(),
         };
         Ok(Self { native, words })
     }

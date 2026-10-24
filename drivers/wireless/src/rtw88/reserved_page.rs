@@ -39,6 +39,18 @@ pub unsafe trait Registers: Send {
     async fn lte_backup(&mut self) -> Result<u32, Error>;
     async fn lte_restore(&mut self, value: u32) -> Result<(), Error>;
     async fn finish_dma(&mut self) -> Result<(), Error>;
+    fn begin_mac(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_mac(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn begin_phy(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_phy(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageState {
@@ -224,6 +236,24 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     async fn finish_dma(&mut self) -> Result<(), Error> {
         self.io.finish_dma().await
+    }
+    fn begin_mac(&mut self) -> Result<(), Error> {
+        if self.state != PageState::Idle {
+            return Err(Error::State);
+        }
+        // Firmware pages may never overwrite the parked beacon owner during
+        // a later MAC/packet continuation, including cancellation.
+        self.state = PageState::Terminal;
+        self.io.begin_mac()
+    }
+    fn finish_mac(&mut self) -> Result<(), Error> {
+        self.io.finish_mac()
+    }
+    fn begin_phy(&mut self) -> Result<(), Error> {
+        self.io.begin_phy()
+    }
+    fn finish_phy(&mut self) -> Result<(), Error> {
+        self.io.finish_phy()
     }
     async fn delay_us(&mut self, us: u64) {
         self.io.delay_us(us).await;

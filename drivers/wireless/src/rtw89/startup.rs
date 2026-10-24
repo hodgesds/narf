@@ -22,6 +22,10 @@ pub enum Phase {
     CommandPreparation,
     Firmware,
     Running,
+    MacPreparation,
+    MacPrepared,
+    ReceivePreparation,
+    Receiving,
     Terminal,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +36,8 @@ pub enum Error {
     Image(FwError),
     Plan(download_plan::Error),
     Boot(firmware_boot::Error),
+    Mac(power::Error),
+    Receive(super::rx_dma::Error),
     Terminal,
 }
 pub struct Startup {
@@ -40,6 +46,7 @@ pub struct Startup {
     native: Option<Native>,
     firmware: Option<Firmware<Native>>,
     identity: Option<Identity>,
+    mac: super::mac_runtime::Mac,
 }
 impl core::fmt::Debug for Startup {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -100,6 +107,7 @@ impl Startup {
             native: None,
             firmware: None,
             identity: None,
+            mac: super::mac_runtime::Mac::default(),
         })
     }
     pub fn phase(&self) -> Phase {
@@ -107,6 +115,84 @@ impl Startup {
     }
     pub fn identity(&self) -> Option<Identity> {
         self.identity
+    }
+    /// Publish only private RXQ/RPQ rings after actual B MAC preparation. The
+    /// result is a polling transport, not qualified RF/channel/station service.
+    pub async fn prepare_receive(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::MacPrepared {
+            return Err(Error::Terminal);
+        }
+        self.phase = Phase::ReceivePreparation;
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let firmware = attempt.owner.firmware.as_mut().ok_or(Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(Error::Terminal);
+            }
+            // SAFETY: same retained actual cold/firmware/MAC attempt. Its Drop
+            // closes both RX layers and preserves published memory on failure.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .prepare_receive(&attempt.owner.mac)
+                    .await
+            }
+            .map_err(Error::Receive)?;
+            attempt.owner.phase = Phase::Receiving;
+            Ok(())
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
+    }
+    pub fn poll_receive(
+        &mut self,
+        budget: usize,
+    ) -> Result<alloc::vec::Vec<super::rx_packet::Event>, Error> {
+        if self.phase != Phase::Receiving {
+            return Err(Error::Terminal);
+        }
+        let result = self
+            .firmware
+            .as_mut()
+            .ok_or(Error::Terminal)?
+            .transport_mut()
+            .poll_receive(budget)
+            .map_err(Error::Receive);
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    /// Complete B's post-WCPU MAC0/SCC setup on the same actual backend.
+    /// MAC preparation is not RF/channel, packet, IRQ or station readiness.
+    pub async fn prepare_mac(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::Terminal);
+        }
+        self.phase = Phase::MacPreparation;
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let firmware = attempt.owner.firmware.as_mut().ok_or(Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(Error::Terminal);
+            }
+            // SAFETY: this is the same retained cold/firmware attempt. Its
+            // Drop/failure closes command DMA, retains mappings and forbids
+            // any IRQ/reset/packet/radio producer through this private owner.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .prepare_mac(&mut attempt.owner.mac)
+                    .await
+            }
+            .map_err(Error::Mac)?;
+            attempt.owner.phase = Phase::MacPrepared;
+            Ok(())
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
     }
     /// One attempt; cancellation parks any published command path while
     /// retaining its ring/packets. No channel/radio/IRQ/network producer starts.

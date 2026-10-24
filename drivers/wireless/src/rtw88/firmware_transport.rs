@@ -3,6 +3,7 @@
 //! Requires an exclusively retained, pristine PCIe reserved-page DMA backend.
 //! It does not itself enable PCI bus mastering or supply a packet runtime.
 use alloc::boxed::Box;
+use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::FirmwareError;
 const HEADER: usize = 64;
 const CHECKSUM: usize = 8;
@@ -22,11 +23,14 @@ pub enum Error {
     Cancelled,
     Memory,
     Firmware(FirmwareError),
+    Power(super::power_policy::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     New,
     Ready,
+    MacPrepared,
+    PhyTablesPrepared,
     Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +64,25 @@ fn filename(did: u16) -> Result<&'static str, Error> {
         Err(Error::Unsupported)
     }
 }
+struct Snapshot(u16);
+impl CapOp<narf_firmware::FirmwareBlob, Read> for Snapshot {
+    type Output = Result<alloc::vec::Vec<u8>, Error>;
+    fn execute(
+        self,
+        cap: &Cap<narf_firmware::FirmwareBlob, Read>,
+    ) -> Result<Self::Output, CapError> {
+        Ok((|| {
+            let view = narf_firmware::view_of(cap).map_err(Error::Firmware)?;
+            parse(self.0, view.bytes)?;
+            let mut bytes = alloc::vec::Vec::new();
+            bytes
+                .try_reserve_exact(view.bytes.len())
+                .map_err(|_| Error::Memory)?;
+            bytes.extend_from_slice(view.bytes);
+            Ok(bytes)
+        })())
+    }
+}
 fn registered_image(did: u16) -> Result<alloc::vec::Vec<u8>, Error> {
     let name = filename(did)?;
     let loader = narf_firmware::trusted_loader_authority()
@@ -68,14 +91,8 @@ fn registered_image(did: u16) -> Result<alloc::vec::Vec<u8>, Error> {
         .derive()
         .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
     let cap = narf_firmware::open(name, &authority).map_err(Error::Firmware)?;
-    let view = narf_firmware::view_of(&cap).map_err(Error::Firmware)?;
-    parse(did, view.bytes)?;
-    let mut bytes = alloc::vec::Vec::new();
-    bytes
-        .try_reserve_exact(view.bytes.len())
-        .map_err(|_| Error::Memory)?;
-    bytes.extend_from_slice(view.bytes);
-    Ok(bytes)
+    cap.invoke(Snapshot(did))
+        .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?
 }
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
@@ -152,6 +169,20 @@ pub unsafe trait Io: Send {
     async fn lte_backup(&mut self) -> Result<u32, Error>;
     async fn lte_restore(&mut self, value: u32) -> Result<(), Error>;
     async fn finish_dma(&mut self) -> Result<(), Error>;
+    /// Continue only the exact successfully parked firmware owner, with BME,
+    /// host packet queues and interrupts closed. No reconstruction is allowed.
+    fn begin_mac(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_mac(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn begin_phy(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_phy(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     async fn delay_us(&mut self, us: u64) {
         narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(us.saturating_mul(1000))).await;
     }
@@ -169,6 +200,11 @@ pub struct Owner<I: Io> {
     did: u16,
     phase: Phase,
     info: Option<Info>,
+    mac: Option<super::mac::Info>,
+    hardware: Option<super::hardware::Features>,
+    phy: Option<super::phy::Info>,
+    image_digest: Option<[u8; 32]>,
+    power: Option<super::power_policy::Calibration>,
 }
 impl<I: Io> core::fmt::Debug for Owner<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -185,10 +221,124 @@ impl<I: Io> Owner<I> {
             did,
             phase: Phase::New,
             info: None,
+            mac: None,
+            hardware: None,
+            phy: None,
+            image_digest: None,
+            power: None,
         }
     }
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+    pub fn mac_info(&self) -> Option<super::mac::Info> {
+        matches!(self.phase, Phase::MacPrepared | Phase::PhyTablesPrepared)
+            .then_some(self.mac)
+            .flatten()
+    }
+    pub(super) fn hardware_info(&self) -> Option<super::hardware::Features> {
+        if matches!(self.phase, Phase::MacPrepared | Phase::PhyTablesPrepared) {
+            self.hardware
+        } else {
+            None
+        }
+    }
+    pub async fn prepare_mac(&mut self) -> Result<super::mac::Info, Error> {
+        if self.phase != Phase::Ready {
+            return Err(Error::State);
+        }
+        // Fail before the first MMIO/await. Cancellation cannot replay LLT
+        // or queue setup over an ambiguous current hardware state.
+        self.phase = Phase::Failed;
+        self.io.begin_mac()?;
+        let hardware = super::hardware::Features::read(&mut self.io)?;
+        let info = super::mac::prepare(&mut self.io).await?;
+        self.io.finish_mac()?;
+        self.mac = Some(info);
+        self.hardware = Some(hardware);
+        self.phase = Phase::MacPrepared;
+        Ok(info)
+    }
+    pub fn phy_info(&self) -> Option<super::phy::Info> {
+        if self.phase == Phase::PhyTablesPrepared {
+            self.phy
+        } else {
+            None
+        }
+    }
+    pub(super) fn image_digest(&self) -> Option<[u8; 32]> {
+        match self.phase {
+            Phase::Ready | Phase::MacPrepared | Phase::PhyTablesPrepared => self.image_digest,
+            _ => None,
+        }
+    }
+    pub(super) fn qualify_board(
+        &mut self,
+        factory: &super::efuse::Factory,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<super::power_policy::Permission, Error> {
+        self.qualify_with(factory, domain, super::power_policy::Source::Registered)
+    }
+    pub(super) fn qualify_with(
+        &mut self,
+        factory: &super::efuse::Factory,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        source: super::power_policy::Source,
+    ) -> Result<super::power_policy::Permission, Error> {
+        if self.phase != Phase::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        let board = super::power_policy::Board::new(
+            factory,
+            self.phy.ok_or(Error::State)?,
+            self.hardware.ok_or(Error::State)?,
+            self.image_digest.ok_or(Error::State)?,
+        )
+        .map_err(Error::Power)?;
+        if let Some(calibration) = &self.power {
+            if !calibration.matches(board) {
+                return Err(Error::Power(super::power_policy::Error::Identity));
+            }
+            return calibration.permission(domain).map_err(Error::Power);
+        }
+        let calibration = source.load(board).map_err(Error::Power)?;
+        let permission = calibration.permission(domain).map_err(Error::Power)?;
+        self.power = Some(calibration);
+        Ok(permission)
+    }
+    pub(super) fn current_power(
+        &self,
+        permission: super::power_policy::Permission,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<[u8; 2], Error> {
+        if self.phase != Phase::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        self.power
+            .as_ref()
+            .ok_or(Error::State)?
+            .gains(permission, domain)
+            .map_err(Error::Power)
+    }
+    pub async fn prepare_phy_tables(
+        &mut self,
+        factory: &super::efuse::Factory,
+    ) -> Result<super::phy::Info, Error> {
+        if self.phase != Phase::MacPrepared {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let info = super::phy::Info::from_factory(
+            factory,
+            self.mac.ok_or(Error::State)?.cut,
+            self.hardware.ok_or(Error::State)?,
+        )?;
+        self.io.begin_phy()?;
+        let info = super::phy::prepare(&mut self.io, info).await?;
+        self.io.finish_phy()?;
+        self.phy = Some(info);
+        self.phase = Phase::PhyTablesPrepared;
+        Ok(info)
     }
     /// Production always opens exactly the NIC image through current firmware
     /// authority; the same signature/header can occur in WoW or sibling files.
@@ -212,6 +362,9 @@ impl<I: Io> Owner<I> {
     }
     async fn download_inner(&mut self, bytes: &[u8]) -> Result<Info, Error> {
         let image = parse(self.did, bytes)?;
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(bytes);
+        self.image_digest = Some(hash.finalize());
         self.io.claim_pristine()?;
         narf_time::timeout(narf_time::Deadline::after_ms(2000), self.run(&image))
             .await
@@ -341,6 +494,15 @@ impl<I: Io> Owner<I> {
         self.io.finish_dma().await
     }
 }
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "mac/tests.rs"]
+mod mac_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "phy/tests.rs"]
+mod phy_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "power_policy_tests.rs"]
+mod power_policy_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "firmware_transport_tests.rs"]
 mod tests;

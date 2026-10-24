@@ -12,6 +12,10 @@ use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent_masked, DmaBuffer};
 use narf_lib::id::DomainId;
 
+// Linux pci.c::rtw89_pci_setup_mapping negotiates36 bits (then32). The
+// baseline TXBD/RXBD wire fields can encode40; that is not a device DMA grant.
+const DEVICE_DMA_MASK: u64 = (1u64 << 36) - 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Unpublished,
@@ -37,6 +41,8 @@ pub struct Native {
     depth: u16,
     armed: bool,
     state: State,
+    receive: super::rx_dma::Rx,
+    radio: super::rf_access::Rf,
 }
 fn barrier() {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -125,7 +131,7 @@ impl Native {
         }
         let queue = CommandQueue::new(depth)?;
         let ring =
-            alloc_coherent_masked(usize::from(depth) * 8, DomainId::DRIVER_0, (1u64 << 40) - 1)
+            alloc_coherent_masked(usize::from(depth) * 8, DomainId::DRIVER_0, DEVICE_DMA_MASK)
                 .map_err(|_| Error::NoMemory)?;
         // SAFETY: fresh, owned coherent allocation covers all depth*8 bytes.
         unsafe {
@@ -149,10 +155,56 @@ impl Native {
             depth,
             armed: false,
             state: State::Unpublished,
+            receive: super::rx_dma::Rx::default(),
+            radio: super::rf_access::Rf::default(),
         })
     }
     pub(super) fn identity(&self) -> Option<super::factory::Identity> {
         self.factory.as_ref().and_then(|factory| factory.identity())
+    }
+    /// Continue the same cold/firmware backend; never reset its ring indices or
+    /// release the multi-tag quarantine merely because WCPU reports initialized.
+    /// # Safety
+    /// Only the retained Startup attempt may call this after its Firmware is
+    /// Running. That caller terminalizes this Native on failure/cancellation,
+    /// retains all published DMA and excludes packet/IRQ/reset/radio producers.
+    pub(super) async unsafe fn prepare_mac(
+        &mut self,
+        mac: &mut super::mac_runtime::Mac,
+    ) -> Result<(), super::power::Error> {
+        use super::power::Error as RegisterError;
+        if self.state != State::Active
+            || self.chip != ChipId::Rtl8852B
+            || self
+                .factory
+                .as_ref()
+                .is_none_or(|factory| factory.b_phycap().is_none())
+        {
+            return Err(RegisterError::Unsupported);
+        }
+        let command = self.command().map_err(|_| RegisterError::Access)?;
+        if command & (narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE)
+            != narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE
+        {
+            return Err(RegisterError::Access);
+        }
+        let start = self.io.now_us();
+        loop {
+            self.poll().map_err(|_| RegisterError::Access)?;
+            if self.queue.pending() == 0 {
+                break;
+            }
+            if self.io.now_us().saturating_sub(start) >= 400_000 {
+                return Err(RegisterError::Timeout);
+            }
+            self.io.delay_us(50).await;
+        }
+        // SAFETY: the actual retained startup/firmware owner above has drained
+        // CH12 consumption and keeps all old rings/quarantined DMA alive.
+        unsafe {
+            mac.prepare(&mut self.io, self.factory.as_ref().unwrap())
+                .await
+        }
     }
     /// Activate only the retained CH12 path. No RX base is published: both RX
     /// HCI layers stay disabled, WPDMA and every packet TX channel stay stopped.
@@ -199,10 +251,108 @@ impl Native {
         }
         self.activate_registers()
     }
+    /// Same native cold/MAC owner, with fresh private RX buffers. This does
+    /// not enable any packet TX channel, PCI interrupt, radio or station.
+    /// # Safety
+    /// The enclosing Startup attempt retains/terminalizes all DMA on error or
+    /// cancellation and excludes independent reset/PHY/IRQ/packet producers.
+    pub(super) async unsafe fn prepare_receive(
+        &mut self,
+        mac: &super::mac_runtime::Mac,
+    ) -> Result<(), super::rx_dma::Error> {
+        use super::{power::Error as RegisterError, rx_dma::Error as ReceiveError};
+        if self.state != State::Active
+            || self.chip != ChipId::Rtl8852B
+            || mac.state() != super::mac_runtime::State::Ready
+            || self.identity().is_none()
+        {
+            return Err(ReceiveError::Register(RegisterError::Unsupported));
+        }
+        let command = self
+            .command()
+            .map_err(|_| ReceiveError::Register(RegisterError::Access))?;
+        if command & (narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE)
+            != (narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE)
+        {
+            return Err(ReceiveError::Register(RegisterError::Access));
+        }
+        let mut access = super::pcie_native::Native {
+            io: &mut self.io,
+            device: &self.device,
+            authority: &self.authority,
+        };
+        // SAFETY: retained exact cold/MAC owner above; every RX allocation is
+        // stored in self before publication and survives the outer attempt.
+        unsafe { self.receive.prepare(&mut access, 64).await }
+    }
+    pub(super) fn poll_receive(
+        &mut self,
+        budget: usize,
+    ) -> Result<alloc::vec::Vec<super::rx_packet::Event>, super::rx_dma::Error> {
+        if self.state != State::Active {
+            return Err(super::rx_dma::Error::Terminal);
+        }
+        let result = self.receive.poll(&mut self.io, budget);
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    fn radio_access(&self) -> Result<(), super::power::Error> {
+        if self.state != State::Active
+            || self.chip != ChipId::Rtl8852B
+            || self.receive.state() != super::rx_dma::State::Polling
+            || self.factory.as_ref().is_none_or(|f| f.b_phycap().is_none())
+        {
+            return Err(super::power::Error::Unsupported);
+        }
+        self.io.b_phy_window()
+    }
+    /// # Safety
+    /// Enclosing composed radio attempt excludes reset/PHY/channel operations
+    /// and terminalizes this same Native on failure or cancellation.
+    pub(super) async unsafe fn read_rf(
+        &mut self,
+        path: u8,
+        address: u32,
+        mask: u32,
+    ) -> Result<u32, super::power::Error> {
+        self.radio_access()?;
+        // SAFETY: actual cold/MAC/RX owner and complete current B PHY aperture
+        // above; the enclosing retained radio attempt handles cancellation.
+        let result = unsafe { self.radio.read(&mut self.io, path, address, mask).await };
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    /// # Safety
+    /// Same serialized retained radio-attempt contract as read_rf.
+    pub(super) async unsafe fn write_rf(
+        &mut self,
+        path: u8,
+        address: u32,
+        mask: u32,
+        value: u32,
+    ) -> Result<(), super::power::Error> {
+        self.radio_access()?;
+        // SAFETY: same actual full-aperture/current B radio owner; no parallel
+        // producer and outer attempt retains DMA on failure/cancellation.
+        let result = unsafe {
+            self.radio
+                .write(&mut self.io, path, address, mask, value)
+                .await
+        };
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
     /// Best-effort closure only. All published DMA remains retained because
     /// register stop/BME-off alone does not prove posted transactions drained.
     pub(super) fn fail(&mut self) {
         self.state = State::Terminal;
+        self.receive.fail();
         if let Ok(value) = self.io.read32(0x1010) {
             if value != u32::MAX {
                 let tx = if matches!(self.chip, ChipId::Rtl8852A | ChipId::Rtl8852C) {
@@ -210,7 +360,7 @@ impl Native {
                 } else {
                     0x70f00
                 };
-                let _ = self.io.write32(0x1010, value | tx | (1 << 19));
+                let _ = self.io.write32(0x1010, value | tx | (1 << 19) | 3);
             }
         }
         let mask = if self.chip == ChipId::Rtl8852C {
@@ -221,6 +371,16 @@ impl Native {
         if let Ok(value) = self.io.read32(0x1000) {
             if value != u32::MAX {
                 let _ = self.io.write32(0x1000, value & !mask);
+            }
+        }
+        let hci = if self.chip == ChipId::Rtl8852C {
+            0x7880
+        } else {
+            0x8380
+        };
+        if let Ok(value) = self.io.read32(hci) {
+            if value != u32::MAX {
+                let _ = self.io.write32(hci, value & !3);
             }
         }
         let _ = crate::rtw88::pci_park::invoke(&self.authority, || {
@@ -462,7 +622,7 @@ impl Native {
         let packet = alloc_coherent_masked(
             header.len() + bytes.len(),
             DomainId::DRIVER_0,
-            (1u64 << 40) - 1,
+            DEVICE_DMA_MASK,
         )
         .map_err(|_| Error::NoMemory)?;
         let bd = command_queue::txbd(packet.dma_addr().raw(), header.len() + bytes.len())?;

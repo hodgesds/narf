@@ -94,13 +94,30 @@ six dialects, including early EAPOL, withheld receipts, occupied bounce slots,
 policy restriction and close/publication interleavings. Separate EU, CYW and
 Intel regressions exercise old-link publication while actual disconnect waits
 for device state ownership, checking terminal closure before a repair poll.
+Intel also exercises actual socket-owner release through the spawned
+auto-disconnect worker while the native M4 receipt holds state ownership;
+the worker waits for that owner and then tears down instead of losing Busy.
+AR9285 and RTL8188EE now compose their exact retained packet owners, shared
+MLME/RSNA/CCMP and public Device through the real kernel DHCP client and exact
+bidirectional IP. Their fixtures consume actual published DMA and generate
+native RX descriptors. They check held/modified/cancelled M4 bytes and terminal
+receipts, consumed error frames versus genuine RX-idle fences, entropy and peer
+deadlines, live policy, concurrent publication/close and storage retention.
+EE additionally checks actual CAM/mailbox and reserved-beacon prerequisites,
+including cancellation while an async operation owns the driver. The shared
+raw BSS observer checks bounded original RSN/RSNX/rate/channel/peer facts before
+driver-specific profile admission; it grants no radio or transmit authority.
 AR9285 channel/calibration, RTL8188EE radio/channel/power and RTW89 PCI basic,
 cold/factory and TX-only download owners additionally compare native
 register/delay or numeric results against extracted original Linux C functions.
 AR9285 includes 32 calibration traces and 35 signed/wrapping IQ vectors;
 RTL8188EE checks its actual ring-register map independently of the generic
 8192EE scaffolds. Native packet/stop models check ownership, width and current
-authority. These preparation checks cannot grant station or RF readiness.
+authority. AR9285 adds 72 original C TX descriptors, ten RX-status vectors and
+ten complete MAC traces. RTL8822CE factory/OTP/feature/MAC/PHY-table and signed
+board-power checks cover actual retained continuations; RTL8852B checks
+post-WCPU MAC, 36-bit RXBD/RPQ/C2H, RF-v1 and conditional table selection.
+These software checks cannot establish RF readiness.
 
 `narf_wifi_fixtures::firmware::metadata_replay(image_len, fragments)` builds
 parser-only structural images up to 16 MiB. It validates nonempty, ordered,

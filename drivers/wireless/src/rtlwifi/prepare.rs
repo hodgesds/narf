@@ -17,6 +17,8 @@ pub enum Error {
     Packet,
     Descriptor,
     PacketTimeout,
+    CommandTimeout,
+    RadioOff,
 }
 impl From<AccessError> for Error {
     fn from(error: AccessError) -> Self {
@@ -97,6 +99,7 @@ pub struct Prepared<I: Io, M: Memory> {
     radio: Option<super::radio::Report>,
     permission: Option<super::channel_power::Permission>,
     packet: packet::State<M>,
+    station: station::State,
 }
 impl<I: Io, M: Memory> core::fmt::Debug for Prepared<I, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -179,6 +182,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             radio: None,
             permission: None,
             packet: packet::State::new(),
+            station: station::State::new(),
         })
     }
     pub fn phase(&self) -> Phase {
@@ -360,6 +364,8 @@ impl<I: Io, M: Memory> Drop for Prepared<I, M> {
 
 #[path = "packet.rs"]
 pub mod packet;
+#[path = "station.rs"]
+pub(crate) mod station;
 /// Retain the complete owner before the first device-visible base write.
 /// This is the actual native worker's shared storage/await boundary. An async
 /// mutex, unlike an IRQ-disabling guard, may span the self-driven LLT wait.

@@ -85,7 +85,7 @@ impl Basic {
         Ok(())
     }
 }
-async fn pcie_capability(io: &mut impl Interface) -> Result<u16, Error> {
+pub(super) async fn pcie_capability(io: &mut impl Interface) -> Result<u16, Error> {
     let mut pointer = u16::from(io.config_read8(0x34).await?);
     let mut visited = 0u64;
     for _ in 0..48 {

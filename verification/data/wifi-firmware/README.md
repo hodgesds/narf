@@ -65,8 +65,12 @@ names cannot change the selected bytes through traversal or `--skip-existing`.
 The importer maps flat Intel source names into `iwlwifi/` registry keys and
 preserves board NVRAM `.txt` files. It produces unsigned developer NRFW wrappers.
 Production provisioning uses the existing externally signed `pack-firmware`
-command and build-time trusted public keys. RTL8188EU additionally requires the
-signed, measured per-factory-MAC board-power artifact; neither these fixtures
-nor unsigned developer firmware can satisfy that requirement. Keep proprietary
+command and build-time trusted public keys. RTL8188EU, RTL8188EE and RTL8822CE
+additionally require signed, measured per-factory-MAC board-power artifacts;
+neither these fixtures nor unsigned developer firmware can satisfy that
+requirement. EE uses `rtlwifi/rtl8188ee-cal-v1-<12 lowercase MAC hex digits>.bin`;
+8822CE uses `rtw88/rtw8822ce-cal-v1-<12 lowercase MAC hex digits>.bin`. The family
+specifications describe the exact factory, firmware and profile binding.
+Keep proprietary
 originals and deployment calibration outside git and apply their distribution
 terms when packaging them.

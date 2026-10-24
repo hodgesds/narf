@@ -18,6 +18,16 @@ pub struct Bss {
     pub beacon_interval: u16,
     pub information_elements: Vec<u8>,
 }
+/// Decoded raw beacon/probe facts. These carry no channel, transmit, key or
+/// association authority; the driver supplies its immutable receive channel.
+#[derive(Clone, Debug)]
+pub struct ObservedBss {
+    pub bss: Bss,
+    pub ap_rsne: Option<Vec<u8>>,
+    pub ap_rsnxe: Option<Vec<u8>>,
+    pub rates: u16,
+    pub basic_rates: u16,
+}
 const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
 
 /// Negotiated mode without retaining a PMK in a management-frame plan.
@@ -115,6 +125,89 @@ fn ies(
         bytes = &bytes[2 + len..];
     }
     Ok(())
+}
+/// Observe one unmodified legacy management MPDU, without FCS. The channel
+/// comes from the retained radio, never a caller RX label or an untrusted IE.
+/// Signal is already converted to dBm by that driver's native status decoder.
+pub fn observe(
+    frame: &impl crate::station_security::RawFrame,
+    channel: u8,
+    own: [u8; 6],
+    signal_dbm: Option<i8>,
+) -> Result<ObservedBss, Error> {
+    let bytes = frame.bytes();
+    if !frame.unmodified()
+        || channel::band(channel).is_none()
+        || !unicast(own)
+        || !(36..=2084).contains(&bytes.len())
+        || !matches!(bytes[0], 0x50 | 0x80)
+        || bytes[1] & 0xc7 != 0
+        || bytes[22] & 15 != 0
+        || bytes[10..16] == own
+        || !unicast(bytes[10..16].try_into().map_err(|_| Error::InvalidBss)?)
+        || bytes[10..16] != bytes[16..22]
+        || bytes[0] == 0x80 && bytes[4..10] != [255; 6]
+        || bytes[0] == 0x50 && bytes[4..10] != own
+    {
+        return Err(Error::InvalidBss);
+    }
+    let capability = u16::from_le_bytes([bytes[34], bytes[35]]);
+    let beacon_interval = u16::from_le_bytes([bytes[32], bytes[33]]);
+    if capability & 3 != 1 || beacon_interval == 0 {
+        return Err(Error::InvalidBss);
+    }
+    let (mut ssid, mut ap_rsne, mut ap_rsnxe) = (None, None, None);
+    let mut ds_seen = false;
+    let mut rates = RateElements::default();
+    ies(&bytes[36..], |id, body| {
+        match id {
+            0 => {
+                if ssid.is_some() || body.len() > 32 {
+                    return Err(Error::InvalidBss);
+                }
+                ssid = Some(body.to_vec());
+            }
+            1 | 50 => rates.observe(id, body)?,
+            3 => {
+                if ds_seen || body != [channel] {
+                    return Err(Error::InvalidBss);
+                }
+                ds_seen = true;
+            }
+            48 => {
+                if ap_rsne.is_some() {
+                    return Err(Error::InvalidBss);
+                }
+                ap_rsne = Some(body.to_vec());
+            }
+            244 => {
+                if ap_rsnxe.is_some() || body.is_empty() {
+                    return Err(Error::InvalidBss);
+                }
+                ap_rsnxe = Some(body.to_vec());
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    if !rates.supported || rates.rates == 0 || rates.basic == 0 {
+        return Err(Error::UnsupportedRates);
+    }
+    Ok(ObservedBss {
+        bss: Bss {
+            bssid: bytes[10..16].try_into().map_err(|_| Error::InvalidBss)?,
+            ssid: ssid.ok_or(Error::InvalidBss)?,
+            channel,
+            signal_dbm,
+            capability,
+            beacon_interval,
+            information_elements: bytes[36..].to_vec(),
+        },
+        ap_rsne,
+        ap_rsnxe,
+        rates: rates.rates,
+        basic_rates: rates.basic,
+    })
 }
 pub fn validate_sme_ies(bytes: &[u8], protected: bool) -> Result<(), Error> {
     if bytes.len() > 2048 {
@@ -426,3 +519,7 @@ impl JoinPlan {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "association_tests.rs"]
 mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "association/observe_tests.rs"]
+mod observe_tests;

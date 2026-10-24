@@ -15,6 +15,8 @@ enum State {
     Configuring,
     Active,
     Parked,
+    MacPrepared,
+    PhyTablesPrepared,
     Terminal,
 }
 struct Tx {
@@ -212,7 +214,10 @@ impl Native {
         width: usize,
         operation: impl FnOnce(MmioRegion) -> T,
     ) -> Result<T, Error> {
-        if !matches!(self.state, State::Configuring | State::Active) {
+        if !matches!(
+            self.state,
+            State::Configuring | State::Active | State::MacPrepared | State::PhyTablesPrepared
+        ) {
             return Err(Error::State);
         }
         let active = self.state == State::Active;
@@ -345,7 +350,15 @@ unsafe impl Registers for Native {
         }
         self.state = State::Configuring;
         self.beacon = Some(beacon);
-        let result = self.registers(beacon).and_then(|()| self.activate());
+        let result = self
+            .registers(beacon)
+            .and_then(|()| self.activate())
+            .and_then(|()| {
+                // Linux main.c::rtw_chip_efuse_enable requests this report before
+                // loading/starting the MCU. It binds later antenna/NSS selection
+                // to a real response from this exact retained firmware generation.
+                self.write8(0x1a0, 0xfd)
+            });
         if result.is_err() {
             self.state = State::Terminal;
         }
@@ -407,6 +420,76 @@ unsafe impl Registers for Native {
             self.state = State::Terminal;
         }
         result
+    }
+    fn begin_mac(&mut self) -> Result<(), Error> {
+        if self.state != State::Parked {
+            return Err(Error::State);
+        }
+        self.state = State::Configuring;
+        let result = (|| {
+            // All accesses still invoke the retained current PCI capability.
+            // Reuse only the actual firmware-ready/parked native generation.
+            if self.read16(0x80)? & 0xcfff != 0xc078
+                || self.read8(0x303)? != 255
+                || self.read8(0x100)? & 0xcf != 0
+            {
+                return Err(Error::Prerequisite);
+            }
+            for register in [0xb0, 0xb8, 0x10b8] {
+                if self.read32(register)? != 0 {
+                    return Err(Error::Prerequisite);
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.state = State::Terminal;
+        }
+        result
+    }
+    fn finish_mac(&mut self) -> Result<(), Error> {
+        if self.state != State::Configuring {
+            return Err(Error::State);
+        }
+        let result = (|| {
+            if self.read8(0x303)? != 255
+                || self.read8(0x100)? & 0xcf != 0
+                || self.read8(0x522)? != 255
+            {
+                return Err(Error::Prerequisite);
+            }
+            for register in [0xb0, 0xb8, 0x10b8] {
+                if self.read32(register)? != 0 {
+                    return Err(Error::Prerequisite);
+                }
+            }
+            Ok(())
+        })();
+        self.state = if result.is_ok() {
+            State::MacPrepared
+        } else {
+            State::Terminal
+        };
+        result
+    }
+    fn begin_phy(&mut self) -> Result<(), Error> {
+        if self.state != State::MacPrepared {
+            return Err(Error::State);
+        }
+        if self.mmio.len < 0x5000 {
+            return Err(Error::Unsupported);
+        }
+        self.state = State::Configuring;
+        if self.read8(0x100)? & 0xcf != 0 || self.read8(0x303)? != 255 {
+            self.state = State::Terminal;
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
+    }
+    fn finish_phy(&mut self) -> Result<(), Error> {
+        self.finish_mac()?;
+        self.state = State::PhyTablesPrepared;
+        Ok(())
     }
 }
 impl Drop for Native {

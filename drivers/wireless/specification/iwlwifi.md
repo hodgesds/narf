@@ -197,6 +197,14 @@ after acquiring device state, serializing with association/roam up publication.
 The Sc composition fixture holds control/state to interleave that early close
 with the old authorized publisher, then drives actual teardown receipts and
 checks cached BSSID/carrier closure before another progress poll can repair it.
+Disconnect waits for an in-flight association's state owner rather than
+returning Busy: socket-owner release invokes teardown once outside the normal
+netlink operation reservation. The actual `NETLINK_URELEASE` regression closes
+a unique registered fixture socket while native M4 is unacknowledged, confirms
+the spawned autodisconnect worker stays retained, releases that exact DMA
+receipt and requires complete peer/queue teardown with IP admission closed.
+The test stages only private cfg80211 owner metadata; regulatory admission,
+RSNA, native queues and teardown execute through the existing real owners.
 
 Tests cover retained waiter cancellation, bounded pending-packet retries, and
 actual Device.step over RFH/DataQueue completions: a full TX queue still delivers

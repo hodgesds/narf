@@ -47,11 +47,18 @@ mod firmware_lifecycle;
 mod firmware_native;
 mod firmware_transport;
 pub mod fw;
+mod hardware;
+mod mac;
 mod pci_firmware;
+mod phy;
+mod power_policy;
 mod probe_guard;
 mod reserved_page;
 pub use firmware_lifecycle::{Stage as FirmwareStage, Status as FirmwareStatus};
 pub use firmware_transport::{Error as FirmwareError, Info as FirmwareInfo};
+pub use mac::Info as MacInfo;
+pub use phy::Info as PhyTablesInfo;
+pub use power_policy::{Error as PowerError, Permission as PowerPermission};
 pub mod pci;
 pub(crate) mod pci_park;
 

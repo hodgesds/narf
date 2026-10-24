@@ -20,6 +20,8 @@ use narf_wireless::{
 };
 
 pub struct Device {
+    #[cfg(any(test, feature = "kernel-test"))]
+    test_name: Option<&'static str>,
     state: Mutex<State>,
     control: Mutex<Option<Work>>,
     publication: AtomicBool,
@@ -142,6 +144,8 @@ impl Device {
         let nvm = Self::configure(&mut hardware, mac).await?;
         let irq_vector = hardware.irq_vector();
         Ok(Arc::new(Self {
+            #[cfg(any(test, feature = "kernel-test"))]
+            test_name: None,
             state: Mutex::new(State {
                 hardware,
                 scan_uid: 0,
@@ -543,6 +547,10 @@ fn queue_ethernet(
 
 impl Interface for Device {
     fn name(&self) -> &str {
+        #[cfg(any(test, feature = "kernel-test"))]
+        if let Some(name) = self.test_name {
+            return name;
+        }
         super::iwl_ifname()
     }
     fn mac(&self) -> [u8; 6] {
@@ -900,7 +908,10 @@ impl WirelessNetIface for Device {
     async fn disassociate(&self) -> Result<(), WirelessError> {
         self.set_link(false);
         self.finish_control().await;
-        let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
+        // Socket-owner release is a terminal request even while association
+        // owns state. Waiting serializes its eventual publication and teardown;
+        // returning Busy here would discard that one-shot release notification.
+        let mut state = self.state.lock().await;
         // Association/roam publish up under state. Repeat the close after
         // acquiring it in case an earlier owner finished while we waited.
         self.set_link(false);

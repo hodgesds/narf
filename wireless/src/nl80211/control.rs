@@ -22,6 +22,16 @@ mod tests;
 pub(super) mod station;
 
 #[cfg(any(test, feature = "kernel-test"))]
+pub(super) fn set_owner_for_test(name: &str, namespace: u64, portid: u32, bssid: [u8; 6]) {
+    station::set_owner(name, namespace, portid, Some(bssid));
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(super) fn unregister_owner_for_test(name: &str) {
+    station::unregister_wdev(name);
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
 #[path = "station_tests.rs"]
 mod station_tests;
 
