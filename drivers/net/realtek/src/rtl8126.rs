@@ -1087,9 +1087,9 @@ fn rtl8126_link_sample(status: u8) -> crate::publish::LinkSample {
         carrier: true,
         speed_mbps,
         duplex: Some(if s.full_duplex {
-            narf_net::LinkDuplex::Full
+            narf_net::iface::LinkDuplex::Full
         } else {
-            narf_net::LinkDuplex::Half
+            narf_net::iface::LinkDuplex::Half
         }),
     }
 }
