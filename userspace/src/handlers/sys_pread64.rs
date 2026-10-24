@@ -77,6 +77,7 @@ pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
     // where Linux transfers the whole thing.
     const CHUNK: usize = 64 * 1024;
     let mut total = 0usize;
+    let read_start = offset;
     let mut offset = offset;
     let mut staging = alloc::vec![0u8; core::cmp::min(CHUNK, count)];
     while total < count {
@@ -124,5 +125,12 @@ pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
             break; // short read / EOF
         }
     }
+    // A positioned read does not move the description's offset, but it
+    // is still evidence about the description's access pattern: Linux
+    // keys `f_ra` off the transfer position, not `f_pos`. Feed the
+    // same read(2)-path readahead state machine (#743); a `pread` at
+    // an unexpected offset resets the pattern exactly as a
+    // non-sequential `read` does.
+    handler_sys_read::note_read_for_readahead(&endpoint, read_start, total);
     ctx.set_return(SyscallReturn::ok(total as u64));
 }

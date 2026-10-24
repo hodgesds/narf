@@ -47,6 +47,11 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
     } else {
         None
     };
+    // Every successful seek below also calls
+    // `description.reset_readahead()`: a seek is a deliberate break of
+    // the read(2) sequential pattern (#743), even a seek to the offset
+    // the stream would have continued at.
+    //
     // `vfs_llseek` → `file->f_op->llseek`. A file whose llseek owns f_pos
     // (`/proc/<pid>/mem`'s `mem_lseek`) gets the current position and its
     // answer becomes the new one.
@@ -54,6 +59,7 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
         match result {
             Ok(v) => {
                 description.set_offset(v);
+                description.reset_readahead();
                 ctx.set_return(SyscallReturn::ok(v));
             }
             Err(errno) => ctx.set_return(errno_ret(errno)),
@@ -108,6 +114,7 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
         match poll_blocking(ops.seek(offset as u64, whence as u32)) {
             Some(Ok(new_off)) => {
                 description.set_offset(new_off);
+                description.reset_readahead();
                 ctx.set_return(SyscallReturn::ok(new_off));
                 return;
             }
@@ -124,6 +131,7 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
         // virtual one at EOF.
         let new_off = if whence == SEEK_HOLE { eof } else { offset as u64 };
         description.set_offset(new_off);
+        description.reset_readahead();
         ctx.set_return(SyscallReturn::ok(new_off));
         return;
     }
@@ -145,6 +153,7 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
             }
         };
         description.set_offset(new_off as u64);
+        description.reset_readahead();
         SyscallReturn::ok(new_off as u64)
     };
     ctx.set_return(outcome);
