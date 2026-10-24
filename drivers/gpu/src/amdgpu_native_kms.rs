@@ -7,6 +7,12 @@ fn navi22() -> bool {
     crate::amdgpu_navi22_kms::active()
 }
 
+/// The DCN30 linear-primary card, whose GEM frames are copied rather than
+/// scanned out with DCN401's modifier/plane machinery.
+pub(crate) fn linear_gem_card(card: &crate::drm::card::Card) -> bool {
+    card.driver_name == "amdgpu" && card.native_atomic && !card.gfx12_modifiers
+}
+
 pub fn crtc_display(crtc_id: u32) -> Option<u8> {
     if navi22() {
         crate::amdgpu_navi22_kms::crtc_display(crtc_id)
@@ -143,7 +149,14 @@ pub fn present_planes(
         crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
     ticket: Option<u64>,
 ) -> bool {
-    !navi22() && crate::amdgpu_navi48_platform::present_planes(display, primary, overlays, ticket)
+    if navi22() {
+        if overlays.iter().any(Option::is_some) {
+            return false;
+        }
+        crate::amdgpu_navi22_platform::present_plane(display, primary, ticket)
+    } else {
+        crate::amdgpu_navi48_platform::present_planes(display, primary, overlays, ticket)
+    }
 }
 /// The display the console runs on.
 pub fn console_pipe() -> u8 {

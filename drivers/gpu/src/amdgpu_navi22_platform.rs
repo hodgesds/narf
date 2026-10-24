@@ -1557,14 +1557,19 @@ static PRESENT: PresentSlot = PresentSlot {
     presenting: AtomicBool::new(false),
     next: narf_lib::sync::IrqSafeSpinLock::new(None),
 };
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct Frame {
     phys: u64,
     pitch: u32,
     width: u32,
     height: u32,
+    offset: u64,
+    bo: Option<alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>>,
     ticket: Option<u64>,
 }
+
+#[path = "amdgpu_navi22_frame_copy.rs"]
+mod frame_copy;
 
 /// Whether `present_frame` would present through a hardware flip now.
 pub fn native_present_ready(display: u8) -> bool {
@@ -1610,24 +1615,40 @@ pub fn present_frame(
     height: u32,
     ticket: Option<u64>,
 ) -> bool {
-    if !native_present_ready(display)
-        || width == 0
-        || height == 0
-        || pitch < width.saturating_mul(4)
-    {
-        complete_flip(display, ticket, None);
-        return false;
-    }
-    {
-        let mut next = PRESENT.next.lock();
-        let ticket = ticket.max(next.and_then(|f| f.ticket));
-        *next = Some(Frame {
+    present_plane(
+        display,
+        Some(crate::amdgpu_navi48_platform::PlaneFrame::linear(
             phys,
             pitch,
             width,
             height,
-            ticket,
-        });
+            0x3432_5258,
+        )),
+        ticket,
+    )
+}
+
+/// One linear 8888 primary, including a pinned GEM framebuffer. The pin
+/// remains live while queued, during any readback, and through the flip.
+pub(crate) fn present_plane(
+    display: u8,
+    plane: Option<crate::amdgpu_navi48_platform::PlaneFrame>,
+    ticket: Option<u64>,
+) -> bool {
+    let Some(plane) = plane else {
+        complete_flip(display, ticket, None);
+        return true;
+    };
+    let Some(mut frame) =
+        Frame::from_plane(plane, ticket).filter(|_| native_present_ready(display))
+    else {
+        complete_flip(display, ticket, None);
+        return false;
+    };
+    {
+        let mut next = PRESENT.next.lock();
+        frame.ticket = ticket.max(next.as_ref().and_then(|f| f.ticket));
+        *next = Some(frame);
     }
     if !PRESENT.presenting.swap(true, Ordering::AcqRel) {
         narf_scheduler::spawn(presenter());
@@ -1649,22 +1670,29 @@ async fn presenter() {
             complete_flip(0, frame.ticket, None);
             continue;
         }
-        let result = {
+        let result = async {
+            // Wait on rendering and perform hidden-VRAM SDMA readback
+            // before taking OWNER: the producer/transfer also needs it.
+            let source = frame_copy::source(&frame).await?;
             let mut owner = OWNER.lock().await;
             match owner.as_mut() {
-                // SAFETY: the owner lock serializes display writers; the
-                // dumb buffer stays valid under DRM's buffer rules.
-                Some(boot) => match unsafe { present_native(boot, frame) }.await {
-                    Ok((before, after)) => {
-                        let latched = read_vblank(boot);
-                        follow_flip(before, after).await;
-                        Ok(latched)
+                Some(boot) => {
+                    // SAFETY: OWNER serializes display/reset; the frame
+                    // retains its GEM pin or the trusted DRM dumb backing,
+                    // and source readback completed outside this lock.
+                    match unsafe { present_native(boot, &frame, source.as_deref()) }.await {
+                        Ok((before, after)) => {
+                            let latched = read_vblank(boot);
+                            follow_flip(before, after).await;
+                            Ok(latched)
+                        }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
-                },
+                }
                 None => Err(ScanError::Busy),
             }
-        };
+        }
+        .await;
         match result {
             Ok(latched) => complete_flip(0, frame.ticket, latched),
             Err(e) => {
@@ -1687,24 +1715,35 @@ async fn presenter() {
 /// The caller holds the owner lock; `frame` names a mapped dumb buffer.
 async unsafe fn present_native(
     boot: &mut boot::ColdBoot,
-    frame: Frame,
+    frame: &Frame,
+    source: Option<&crate::amdgpu_gem::GemPlacement>,
 ) -> Result<(GenericFb, GenericFb), ScanError> {
     // A cancelled presenter may have left the old front's views draining.
     crate::scanout_access::wait_retired().await;
+    if frame.bo.is_some() {
+        // Reuse the queue reader's checked HDP read-cache invalidation
+        // before sampling client GPU writes through the CPU BAR window.
+        boot.client_fence_reader()
+            .ok_or(ScanError::Busy)?
+            .completed(0)
+            .map_err(|_| ScanError::DeviceGone)?;
+    }
     let scanout = boot.display_scanout()?;
     let back = scanout.back().ok_or(ScanError::Invalid)?.fb;
     let width = frame.width.min(back.width);
+    let mut pixels = alloc::vec::Vec::new();
+    pixels
+        .try_reserve_exact(width as usize)
+        .map_err(|_| ScanError::Allocation)?;
+    pixels.resize(width as usize, 0u32);
     for y in 0..frame.height.min(back.height) {
-        let at = frame.phys + u64::from(y) * u64::from(frame.pitch);
-        // SAFETY: a kernel-mapped dumb buffer row of at least `width`
-        // pixels (pitch >= 4 * width was checked when queued).
-        let row = unsafe {
-            core::slice::from_raw_parts(
-                narf_memory::PhysAddr::new(at).kernel_ptr::<u32>(),
-                width as usize,
-            )
-        };
-        boot.display_scanout()?.upload_back(0, y, row)?;
+        // OWNER excludes reset while CPU reads a visible VRAM source.
+        boot.access_vram(|| {
+            frame_copy::row(frame, source, y, &mut pixels)
+                .map_err(|_| narf_filesystem::FsError::InvalidData)
+        })
+        .map_err(|_| ScanError::DeviceGone)?;
+        boot.display_scanout()?.upload_back(0, y, &pixels)?;
         if y % 64 == 63 {
             narf_scheduler::yield_now().await;
         }

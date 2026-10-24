@@ -32,6 +32,8 @@ const DCSURF_PRIMARY_SURFACE_ADDRESS: u64 = 0x060a;
 // linux: mmHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH
 const DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH: u64 = 0x060b;
 const DCSURF_SURFACE_CONTROL: u64 = 0x061a; // linux: mmHUBPREQ0_DCSURF_SURFACE_CONTROL
+const VMID_SETTINGS_0: u64 = 0x0609; // linux: mmHUBPREQ0_VMID_SETTINGS_0
+const DCSURF_FLIP_CONTROL: u64 = 0x061b; // linux: mmHUBPREQ0_DCSURF_FLIP_CONTROL
 const DCN_EXPANSION_MODE: u64 = 0x0629; // linux: mmHUBPREQ0_DCN_EXPANSION_MODE
 const DCN_TTU_QOS_WM: u64 = 0x062a; // linux: mmHUBPREQ0_DCN_TTU_QOS_WM
 const DCN_GLOBAL_TTU_CNTL: u64 = 0x062b; // linux: mmHUBPREQ0_DCN_GLOBAL_TTU_CNTL
@@ -315,9 +317,12 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         if surface.pitch == 0
+            || surface.pitch > 0x4000
             || surface.pitch < surface.viewport_width
             || surface.viewport_width == 0
             || surface.viewport_height == 0
+            || surface.viewport_width > 0x3fff
+            || surface.viewport_height > 0x3fff
         {
             return Err(Error::Invalid);
         }
@@ -328,11 +333,14 @@ impl<I: Io> Engine<I> {
         {
             return Err(Error::Invalid);
         }
-        // linux-lit: 0x7f=HUBP0_DCSURF_SURFACE_CONFIG__SURFACE_PIXEL_FORMAT_MASK
-        self.update(DCSURF_SURFACE_CONFIG, 0x7f, pixel_format(surface.format))?;
+        // hubp2_program_rotation and hubp3_program_surface_config: one
+        // unrotated RGB plane, without a separate alpha plane. The GOP or
+        // a previous modeset need not have left those fields at reset.
+        // linux-lit: 0xf7f=HUBP0_DCSURF_SURFACE_CONFIG__SURFACE_PIXEL_FORMAT_MASK | HUBP0_DCSURF_SURFACE_CONFIG__ROTATION_ANGLE_MASK | HUBP0_DCSURF_SURFACE_CONFIG__H_MIRROR_EN_MASK | HUBP0_DCSURF_SURFACE_CONFIG__ALPHA_PLANE_EN_MASK
+        self.update(DCSURF_SURFACE_CONFIG, 0xf7f, pixel_format(surface.format))?;
         // Linear, with no meta surface and no pipe alignment to inherit.
-        // linux-lit: 0x1f=HUBP0_DCSURF_TILING_CONFIG__SW_MODE_MASK
-        self.update(DCSURF_TILING_CONFIG, 0x1f, SW_MODE_LINEAR)?;
+        // linux-lit: 0xa1f=HUBP0_DCSURF_TILING_CONFIG__SW_MODE_MASK | HUBP0_DCSURF_TILING_CONFIG__META_LINEAR_MASK | HUBP0_DCSURF_TILING_CONFIG__PIPE_ALIGNED_MASK
+        self.update(DCSURF_TILING_CONFIG, 0xa1f, SW_MODE_LINEAR)?;
         // The pitch register holds one less, and there is no meta pitch.
         self.set(DCSURF_SURFACE_PITCH, surface.pitch - 1)?;
         self.set(DCSURF_PRI_VIEWPORT_START, x)?;
@@ -342,8 +350,15 @@ impl<I: Io> Engine<I> {
             surface.viewport_width | surface.viewport_height << 16,
         )?;
         // Not a trusted-memory surface, and no DCC to decompress.
-        // linux-lit: 0x3=HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_SURFACE_TMZ_MASK | HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_SURFACE_DCC_EN_MASK
-        self.update(DCSURF_SURFACE_CONTROL, 0x3, 0)?;
+        // linux-lit: 0x10003=HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_SURFACE_TMZ_MASK | HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_SURFACE_DCC_EN_MASK | HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_META_SURFACE_TMZ_MASK
+        self.update(DCSURF_SURFACE_CONTROL, 0x10003, 0)?;
+        // Initial activation needs the same VMID/stereo setup as later
+        // hubp3_program_surface_flip_and_addr calls. No previous surface
+        // update lock or VUPDATE skip count belongs to this new owner.
+        // linux-lit: 0xf=HUBPREQ0_VMID_SETTINGS_0__VMID_MASK
+        self.update(VMID_SETTINGS_0, 0xf, 0)?;
+        // linux-lit: 0x130f3=HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_UPDATE_LOCK_MASK | HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_TYPE_MASK | HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_VUPDATE_SKIP_NUM_MASK | HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_MODE_FOR_STEREOSYNC_MASK | HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_IN_STEREOSYNC_MASK
+        self.update(DCSURF_FLIP_CONTROL, 0x130f3, 0)?;
         self.set(
             DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH,
             (surface.address >> 32) as u32,

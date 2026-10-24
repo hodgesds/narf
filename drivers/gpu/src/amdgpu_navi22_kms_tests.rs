@@ -77,6 +77,57 @@ fn admitted(_: &Port, _: &[u8]) -> Option<Vec<Timing>> {
     Some(vec![hd(), xga()])
 }
 
+fn navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers() -> TestResult {
+    let mut card = Card::new("amdgpu", "DCN30 publication fixture", (3, 60, 0));
+    let edid = [1; 128];
+    let timing = hd();
+    let offered = [timing];
+    let crtcs = [Some(crate::amdgpu_navi48_kms::Sink {
+        edid: &edid,
+        timing: &timing,
+        offered: &offered,
+    })];
+    let connectors = [crate::amdgpu_navi48_kms::RoutedConnector {
+        index: 3,
+        kind: ConnectorType::HdmiA,
+        edid: Some(&edid),
+        offered: &offered,
+        crtc: Some(0),
+        possible_crtcs: 1,
+    }];
+    apply_card(&mut card, &crtcs, &connectors);
+    if card.gfx12_modifiers || !card.native_planes.is_empty() || card.overlay_formats.is_some() {
+        return TestResult::Fail("DCN30 advertised RDNA4-only KMS operations");
+    }
+    if !card.native_atomic
+        || card.plane_formats != Some(&PLANE_FORMATS[..])
+        || !crate::amdgpu_native_kms::linear_gem_card(&card)
+    {
+        return TestResult::Fail("DCN30 linear primary/atomic capability missing");
+    }
+    let Some(blob) = crate::drm_native_planes::in_formats_blob(
+        &card,
+        crate::drm_native_planes::in_formats_blob_id(0x40),
+    ) else {
+        return TestResult::Fail("DCN30 primary has no explicit LINEAR format blob");
+    };
+    let word = |i| u32::from_le_bytes(blob[i..i + 4].try_into().unwrap());
+    let modifiers = word(20) as usize;
+    if word(8) != 2 || word(16) != 1 || blob[modifiers + 16..modifiers + 24] != [0u8; 8] {
+        return TestResult::Fail("DCN30 format blob advertises a tiled layout");
+    }
+    // Re-publishing must not reintroduce the shared helper's capabilities.
+    apply_card(&mut card, &crtcs, &connectors);
+    if card.gfx12_modifiers || !card.native_planes.is_empty() {
+        return TestResult::Fail("republication changed the DCN30 plane ABI");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers
+);
+
 fn navi22_kms_routes_the_hdmi_sink_and_offers_admitted_modes() -> TestResult {
     let mut k = Kms::new();
     k.reconcile(&reports(true, 1), admitted);

@@ -4504,7 +4504,7 @@ fn handle_obj_getproperties(
                 .map(|f| f.height)
                 .or_else(|| crtc.mode.map(|m| m.height))
                 .unwrap_or(0);
-            (
+            let (mut props, mut values) = (
                 vec![
                     PLANE_TYPE_PROP_ID,
                     PLANE_FB_ID_PROP_ID,
@@ -4539,7 +4539,16 @@ fn handle_obj_getproperties(
                     // matching drm_atomic_plane_get_property.
                     (-1i64) as u64,
                 ],
-            )
+            );
+            if crate::amdgpu_native_kms::linear_gem_card(&card) {
+                // GBM must choose LINEAR explicitly for the DCN30 copy
+                // presenter rather than infer an AMD tiled layout.
+                props.push(crate::drm_native_planes::IN_FORMATS_PROP_ID);
+                values.push(u64::from(crate::drm_native_planes::in_formats_blob_id(
+                    obj_id,
+                )));
+            }
+            (props, values)
         } else if obj_type == DRM_MODE_OBJECT_CRTC {
             let crtc = card.crtc(obj_id).map_err(|_| FsError::InvalidData)?;
             let mut props = vec![
@@ -5764,6 +5773,9 @@ fn atomic_commit(
                         card.dumb_backing(gem_handle).map(|backing| backing.phys),
                         (fb.pitch, fb.width, fb.height, fb.format as u32),
                         fb_id,
+                        fb.bo
+                            .as_ref()
+                            .and_then(|_| prepared_frame(&card, fb, &prepared)),
                         flip_tickets
                             .iter()
                             .find(|(id, _)| *id == crtc_id)
@@ -5815,11 +5827,20 @@ fn atomic_commit(
     }
     #[cfg(not(feature = "amdgpu"))]
     let _ = &native_presentation;
-    for (crtc_id, resource, src_phys, (pitch, width, height, format), fb_id, flip_ticket) in
-        presentation.into_iter().flatten()
+    for (
+        crtc_id,
+        resource,
+        src_phys,
+        (pitch, width, height, format),
+        fb_id,
+        gem_frame,
+        flip_ticket,
+    ) in presentation.into_iter().flatten()
     {
         if let Some(resource) = resource {
             present_virgl_frame(&resource, width, height)?;
+        } else if let Some(frame) = gem_frame {
+            present_frame(card_index, crtc_id, frame, flip_ticket);
         } else if let Some(src_phys) = src_phys {
             present_frame(
                 card_index,

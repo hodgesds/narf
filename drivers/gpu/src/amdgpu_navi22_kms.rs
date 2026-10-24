@@ -491,9 +491,7 @@ pub fn publish() {
         })
         .collect();
     with_card(|card| {
-        crate::amdgpu_navi48_kms::apply_routed(card, &crtcs, &connectors);
-        card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
-        card.plane_formats = Some(&PLANE_FORMATS);
+        apply_card(card, &crtcs, &connectors);
         for &d in &off {
             crate::amdgpu_navi48_kms::set_crtc_active(card, d, false);
         }
@@ -501,10 +499,26 @@ pub fn publish() {
     ACTIVE.store(true, Ordering::Release);
 }
 
+fn apply_card(
+    card: &mut Card,
+    crtcs: &[Option<crate::amdgpu_navi48_kms::Sink<'_>>],
+    connectors: &[crate::amdgpu_navi48_kms::RoutedConnector<'_>],
+) {
+    crate::amdgpu_navi48_kms::apply_routed(card, crtcs, connectors);
+    card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
+    card.plane_formats = Some(&PLANE_FORMATS);
+    // Share connector/CRTC bookkeeping, not DCN401's plane capabilities.
+    // This presenter copies one linear 8888 primary into its DCN30 back
+    // buffer; overlays, GFX12 tiling and native plane geometry have no
+    // implementation here. Keep the generic atomic primary/cursor ABI.
+    card.native_planes.clear();
+    card.overlay_formats = None;
+    card.gfx12_modifiers = false;
+}
+
 type CardState = alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<Card>>;
 fn amdgpu_card() -> Option<(u32, Option<CardState>)> {
-    let index = (0..crate::drm_registry::count() as u32)
-        .find(|&i| crate::drm_registry::driver_name(i) == Some("amdgpu"))?;
+    let index = crate::amdgpu_navi22_cs::drm_card()?;
     Some((index, crate::drm_registry::mode_state(index)))
 }
 fn with_card(update: impl FnOnce(&mut Card)) {

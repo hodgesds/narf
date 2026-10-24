@@ -7541,6 +7541,29 @@ failure enters `State::Failed` with both buffers reserved.
 then enables them; vectors only shorten the wait. `set_cursor`,
 `move_cursor`, `hide_cursor`, `position()`, `stop()` and `unsafe release()`.
 
+DCN30 KMS publication shares connector/CRTC bookkeeping with DCN401, but
+publishes only linear XRGB8888/ARGB8888 primary planes and the generic cursor
+ABI. It clears the shared helper's GFX12 modifiers, overlays and native plane
+geometry, and provides a LINEAR-only `IN_FORMATS` blob. Publication selects
+the same PCI-identified RDNA2 card as the submission backend.
+
+`Card::addfb2_bo` accepts those linear GEM framebuffers on a native atomic
+amdgpu card without GFX12 capabilities. Nonlinear modifiers, DCC and other
+formats are rejected. The async KMS entry resolves synthetic-primary targets
+as well as native-plane targets, prepares their VRAM placement outside the
+KMS lock, and revalidates master and targets before commit. TEST_ONLY prepares
+no placement and publishes no state. Atomic, SETCRTC and PAGE_FLIP preserve
+the pinned GEM source through the presentation handoff.
+
+The DCN30 presenter waits for implicit WRITE fences before taking the GPU
+owner. CPU-visible placements are copied by bounded rows, honoring pitch and
+offset; hidden VRAM uses the existing SDMA transfer into private system
+staging, also outside the owner. The frame retains its `ScanoutPin` through
+queueing, readback, copying and the completed native back-buffer flip.
+Unsupported format/extent checks precede queueing. GEM sources never fall
+through to a raw physical pointer. This is a copy presenter, not direct
+scanout of client buffers; secondary CRTCs still cannot present.
+
 `ColdBoot::{modeset_display(connector, sink, want, draw), stop_display(),
 display_scanout(), display_admitted(), display_output(),
 prepare_display_back_buffer(), flip_display(), set_display_cursor()}` own
@@ -9382,6 +9405,10 @@ pitch register holds one less than the pitch, the format code is not the bit
 depth, and the primary address's low half is written last because that is what
 arms it. A surface off a 256-byte request boundary, past the pipe's 48-bit
 addressing, at address zero, or narrower than its own viewport is refused. The
+14-bit pitch and viewport fields are checked before writes. Initial activation
+normalizes rotation, mirroring, separate alpha, metadata alignment, trusted
+metadata, VMID and stereo/flip controls before arming the address; it does not
+depend on a firmware owner's reset values. Unrelated fields are preserved. The
 chroma request sizes are cleared rather than left behind, so a previous owner's
 chroma plane cannot keep fetching. `blank` waits up to 100 ms for the pipe's
 outstanding requests to retire; a power-gated pipe reads back zero and needs no
@@ -9392,7 +9419,13 @@ counted (`blank_stalls()`) and blanked anyway.
 DCN base index 2 while the MPC bank is index 3. `Dpp::program` enables the pipe
 clock, sets the converter format and bypasses the scaler outright rather than
 programming unity taps, with the recout and combiner size matching the active
-area. `Mpc::mux_plane` binds one combiner to one DPP and one OPP and points that
+area. It initializes CNVC zero expansion and RGB routing, disables inherited
+separate-alpha processing and ROM degamma, and bypasses the color-management
+block. Scaling-444 bypass still initializes autocal/boundary mode and the
+opaque RGB line buffer (all three banks, 63 maximum partitions). These fields
+and constructor bounds are shared by the verified DCN30/DCN314 layouts.
+`Mpc::mux_plane` bypasses any inherited output-gamma LUT, binds one combiner to
+one DPP and one OPP and points that
 OPP's output mux at it, with the bottom select parked so a stale value cannot
 blend another pipe's output in, and opaque passthrough with no alpha;
 `release` unroutes both ends. `Opp::program` leaves truncation, spatial dither

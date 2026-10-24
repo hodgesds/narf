@@ -186,6 +186,48 @@ kernel_test_in!(
     hubp_surface_programming_uses_the_owned_instance
 );
 
+fn hubp_first_surface_replaces_inherited_fetch_state() -> TestResult {
+    for profile in [Profile::Navi22, Profile::Dcn314] {
+        let mut hubp = engine(2);
+        hubp.profile = profile;
+        let at = |reg: u64| (reg + 2 * STRIDE) as usize;
+        // A previously rotated, mirrored, separately-alpha, compressed plane.
+        // Keep unrelated fields set to catch writes that clobber the register.
+        hubp.io.values[at(DCSURF_SURFACE_CONFIG)] = 0x8000_0f00;
+        hubp.io.values[at(DCSURF_TILING_CONFIG)] = 0x8000_0b9f;
+        hubp.io.values[at(DCSURF_SURFACE_CONTROL)] = 0x8001_0003;
+        // VMID 7, stereo flip and a held surface update lock must not survive
+        // adoption of a single VMID-0 RGB surface. These are the Linux DCN30
+        // / DCN314 VMID_SETTINGS_0 and DCSURF_FLIP_CONTROL registers.
+        hubp.io.values[at(0x0609)] = 0x8000_0007;
+        hubp.io.values[at(0x061b)] = 0x8001_3003;
+        if hubp.program_surface(&surface()).is_err() {
+            return TestResult::Fail("inherited surface programming rejected");
+        }
+        if hubp.io.values[at(DCSURF_SURFACE_CONFIG)] != 0x8000_0008 {
+            return TestResult::Fail("inherited rotation/mirror/alpha plane survived");
+        }
+        if hubp.io.values[at(DCSURF_TILING_CONFIG)] != 0x8000_0180 {
+            return TestResult::Fail("inherited metadata/pipe alignment survived");
+        }
+        if hubp.io.values[at(DCSURF_SURFACE_CONTROL)] != 0x8000_0000 {
+            return TestResult::Fail("inherited DCC or trusted metadata survived");
+        }
+        if hubp.io.values[at(0x0609)] != 0x8000_0000 || hubp.io.values[at(0x061b)] != 0x8000_0000 {
+            return TestResult::Fail("first surface kept a client VMID/stereo flip");
+        }
+        let low = DCSURF_PRIMARY_SURFACE_ADDRESS + 2 * STRIDE;
+        if hubp.io.writes.last().map(|w| w.0) != Some(low) {
+            return TestResult::Fail("fetch configuration changed after address latch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-hubp",
+    hubp_first_surface_replaces_inherited_fetch_state
+);
+
 fn hubp_rejects_surfaces_the_pipe_cannot_fetch() -> TestResult {
     let mut hubp = engine(0);
     for bad in [
@@ -213,13 +255,31 @@ fn hubp_rejects_surfaces_the_pipe_cannot_fetch() -> TestResult {
             pitch: 0,
             ..surface()
         },
+        // The pitch's 14-bit field must not spill into META_PITCH.
+        Surface {
+            pitch: 0x4001,
+            ..surface()
+        },
+        Surface {
+            pitch: 0x4000,
+            viewport_width: 0x4000,
+            ..surface()
+        },
+        Surface {
+            viewport_height: 0x4000,
+            ..surface()
+        },
         Surface {
             viewport_height: 0,
             ..surface()
         },
     ] {
+        let writes = hubp.io.writes.len();
         if hubp.program_surface(&bad) != Err(Error::Invalid) {
             return TestResult::Fail("unfetchable surface accepted");
+        }
+        if hubp.io.writes.len() != writes {
+            return TestResult::Fail("invalid surface changed hardware");
         }
     }
     TestResult::Pass

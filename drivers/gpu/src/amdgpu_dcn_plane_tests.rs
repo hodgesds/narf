@@ -64,19 +64,7 @@ fn plane_dpp_bypasses_the_scaler_for_an_unscaled_plane() -> TestResult {
     // Inherited scaler mode 6, `DSCL_MODE_DSCL_BYPASS` — the highest value
     // `enum dscl_mode_sel` defines. A two-bit mask would leave 4 behind.
     dpp.io.values[at(SCL_MODE) as usize] = 6;
-    if dpp.update(at(DPP_CONTROL), 1 << 4, 1 << 4).is_err()
-        || dpp
-            .update(
-                at(CNVC_SURFACE_PIXEL_FORMAT),
-                0x7f,
-                cnvc_format(Format::Rgb32),
-            )
-            .is_err()
-        || dpp.update(at(SCL_MODE), DSCL_MODE, SCALER_BYPASS).is_err()
-        || dpp.set(at(RECOUT_START), 0).is_err()
-        || dpp.set(at(RECOUT_SIZE), width | height << 16).is_err()
-        || dpp.set(at(MPC_SIZE), width | height << 16).is_err()
-    {
+    if dpp.dpp_program(Format::Rgb32, width, height).is_err() {
         return TestResult::Fail("DPP programming rejected");
     }
     // The DPP clock has to be running before it processes anything.
@@ -109,8 +97,58 @@ kernel_test_in!(
     plane_dpp_bypasses_the_scaler_for_an_unscaled_plane
 );
 
+fn plane_dpp_normalizes_inherited_conversion_and_color() -> TestResult {
+    for profile in [Profile::Navi22, Profile::Dcn314] {
+        for format in [Format::Rgb16, Format::Rgb32, Format::Rgb64] {
+            // The same fields/offsets exist in both Linux register headers.
+            let mut dpp = block(2, (0x0d21 + 3 * DPP_STRIDE) as u32);
+            dpp.profile = profile;
+            let at = |reg: u64| (reg + 2 * DPP_STRIDE) as usize;
+            dpp.io.values[at(CNVC_SURFACE_PIXEL_FORMAT)] = 0x8000_0100;
+            dpp.io.values[at(0x0cd0)] = 0xbf03_3111; // FORMAT_CONTROL
+            dpp.io.values[at(0x0cde)] = 0x8000_0011; // PRE_DEALPHA
+            dpp.io.values[at(0x0ced)] = 0x8000_0073; // PRE_DEGAM
+            dpp.io.values[at(0x0cee)] = 0x8000_0011; // PRE_REALPHA
+            dpp.io.values[at(0x0d20)] = 0x8000_0000; // CM_CONTROL: LUTs active
+            dpp.io.values[at(0x0d0c)] = 0x8000_3303; // DSCL_AUTOCAL
+            dpp.io.values[at(0x0cfd)] = 0x8000_0001; // DSCL_CONTROL
+            dpp.io.values[at(0x0d14)] = 0x8000_0011; // LB_DATA_FORMAT
+            dpp.io.values[at(0x0d15)] = 0x0000_0003; // 4:2:0 LB banks
+            if dpp.dpp_program(format, 3840, 2160).is_err() {
+                return TestResult::Fail("DPP conversion setup rejected");
+            }
+            let alpha = u32::from(format != Format::Rgb16) << 8;
+            if dpp.io.values[at(CNVC_SURFACE_PIXEL_FORMAT)] != 0x8000_0000 | cnvc_format(format)
+                || dpp.io.values[at(0x0cd0)] != 0xa400_0001 | alpha
+            {
+                return TestResult::Fail("inherited CNVC conversion/crossbar/alpha survived");
+            }
+            if dpp.io.values[at(0x0cde)] != 0x8000_0000
+                || dpp.io.values[at(0x0ced)] != 0x8000_0000
+                || dpp.io.values[at(0x0cee)] != 0x8000_0000
+                || dpp.io.values[at(0x0d20)] != 0x8000_0001
+            {
+                return TestResult::Fail("inherited alpha processing or color LUT survived");
+            }
+            if dpp.io.values[at(0x0d0c)] != 0x8000_0000
+                || dpp.io.values[at(0x0cfd)] != 0x8000_0000
+                || dpp.io.values[at(0x0d14)] != 0x8000_0000
+                || dpp.io.values[at(0x0d15)] != 0x3f00
+            {
+                return TestResult::Fail("inherited scaler/line-buffer state survived");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_dpp_normalizes_inherited_conversion_and_color
+);
+
 fn plane_mpc_binds_one_pipe_with_nothing_beneath_it() -> TestResult {
     let mut mpc = block(2, MPC_LAST_REG);
+    mpc.io.values[(0x0100 + 2 * 0x80) as usize] = 0x8000_0002;
     // Seed MPCC_CONTROL's reserved bits 3:2 and an inherited FMT-style
     // subsampling value so an over-wide mask shows up as a cleared bit.
     mpc.io.values[(MPCC_CONTROL + 2 * MPCC_STRIDE) as usize] = 0x0000_000C;
@@ -121,6 +159,9 @@ fn plane_mpc_binds_one_pipe_with_nothing_beneath_it() -> TestResult {
     let mux = MPC_OUT_MUX + opp as u64 * MPC_OUT_STRIDE;
     if mpc.mpc_mux_plane(dpp as u8, opp).is_err() {
         return TestResult::Fail("MPC programming rejected");
+    }
+    if mpc.io.values[(0x0100 + 2 * 0x80) as usize] != 0x8000_0000 {
+        return TestResult::Fail("inherited output gamma LUT survived");
     }
     if mpc.io.values[at(MPCC_TOP_SEL) as usize] & 0xf != 3 {
         return TestResult::Fail("top select");
