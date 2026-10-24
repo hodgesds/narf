@@ -115,6 +115,50 @@ fn signed_key(m4: bool) -> Vec<u8> {
     frame
 }
 
+case!(
+    wifi_fixture_basic1_profile_matches_beacon_response_and_request,
+    {
+        for secured in [false, true] {
+            let mut ap = if secured {
+                FakeAp::wpa2(PLAN, b"narf", 1, 42, [0x55; 32], [0xaa; 32])
+            } else {
+                FakeAp::open(PLAN, b"narf", 1, 42)
+            }
+            .map_err(|_| "basic1 AP configuration")?
+            .with_basic_1mbps()
+            .map_err(|_| "basic1 fixture profile selection")?;
+            ensure!(
+                ap.beacon().windows(3).any(|b| b == [1, 1, 0x82]),
+                "basic1 beacon rate missing"
+            );
+            ap.receive(&auth()).map_err(|_| "basic1 authentication")?;
+            let old = assoc(secured);
+            ensure!(
+                ap.receive(&old) == Err(ApError::Association),
+                "OFDM-only offer admitted basic1 AP"
+            );
+            let mut request = station_header(0);
+            request.extend_from_slice(&[if secured { 0x11 } else { 1 }, 0, 10, 0]);
+            request.extend_from_slice(&[0, 4, b'n', b'a', b'r', b'f', 1, 1, 0x82]);
+            if secured {
+                request.extend_from_slice(RSN);
+            }
+            let replies = ap
+                .receive(&request)
+                .map_err(|_| "actual basic1 offer rejected")?;
+            ensure!(
+                replies[0][30..] == [1, 1, 0x82],
+                "basic1 response advertised other mandatory rates"
+            );
+            ensure!(
+                ap.with_basic_1mbps().is_err(),
+                "rate profile changed after authentication"
+            );
+        }
+        Ok(())
+    }
+);
+
 case!(wifi_fixture_dhcp_transaction_and_identity, {
     let mut server = DhcpServer::new(PLAN);
     let selecting = request(

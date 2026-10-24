@@ -1,6 +1,9 @@
 use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[path = "reg/policy.rs"]
+pub mod policy;
+
 #[derive(Clone)]
 pub struct RegulatoryDomain {
     pub country_code: [u8; 2],
@@ -86,6 +89,27 @@ pub mod db {
             country_code: d.country_code,
             rules: d.rules.clone(),
         })
+    }
+
+    /// Use the caller-installed domain, or bootstrap the staged signed policy
+    /// when no domain exists. No device or other driver must have run first.
+    pub fn ensure_domain() -> Result<RegulatoryDomain, policy::Error> {
+        ensure_with(&ACTIVE_DOMAIN, policy::load)
+    }
+
+    pub(super) fn ensure_with(
+        database: &IrqSafeSpinLock<Option<RegulatoryDomain>>,
+        load: impl FnOnce() -> Result<RegulatoryDomain, policy::Error>,
+    ) -> Result<RegulatoryDomain, policy::Error> {
+        if let Some(domain) = database.lock().as_ref().cloned() {
+            return Ok(domain);
+        }
+        // Firmware lookup/invocation and decoding must happen without the
+        // database's IRQ-disabling lock. Failed loads publish no partial state.
+        let loaded = load()?;
+        let mut guard = database.lock();
+        // A concurrently installed caller policy wins over this bootstrap.
+        Ok(guard.get_or_insert(loaded).clone())
     }
 }
 

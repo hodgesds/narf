@@ -148,7 +148,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Unsupported)?;
-    let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Unsupported)?;
+    let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
     let station = Station::initialize(runtime, clm, domain).await?;
     let (rx_producer, rx_consumer) = narf_ipc::channel();
     let (tx_producer, tx_consumer) = narf_ipc::channel();
@@ -636,3 +636,7 @@ impl<R: Fullmac + 'static> Interface for Registered<R> {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "interface_dhcp_tests.rs"]
 mod dhcp_composition_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "../brcmfmac/station_dhcp_tests.rs"]
+mod pcie_dhcp_composition_tests;

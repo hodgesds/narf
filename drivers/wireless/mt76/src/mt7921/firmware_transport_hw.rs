@@ -809,7 +809,7 @@ impl Transport {
         security: crate::mt7921::association::Security,
         extra_ies: &[u8],
     ) -> Result<u16, Error> {
-        let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Authority)?;
+        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
         let permission =
             crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
                 .ok_or(Error::Authority)?;

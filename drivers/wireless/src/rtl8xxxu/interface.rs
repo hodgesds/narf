@@ -133,6 +133,7 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
         let up = peer.is_some();
         let was_up = self.up.swap(up, Ordering::AcqRel);
         narf_net::iface::set_link_state(&self.name, up);
+        narf_net::iface::set_link_metadata(&self.name, up, None, None);
         if was_up && !up {
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
@@ -162,7 +163,7 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
         }
         frames
     }
-    fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    pub(super) fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
         if !self.up.load(Ordering::Acquire)
             || !transmit_admitted(bytes, self.mac)
             || !offloads_admitted(meta)
@@ -180,6 +181,14 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             .try_send(frame)
             .map_err(|_| ())
     }
+    pub(super) fn drain(&self) -> bool {
+        let frames = self.progress();
+        let progress = !frames.is_empty();
+        for mut frame in frames {
+            narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+        }
+        progress
+    }
 }
 trait Endpoint: Send + Sync {
     fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
@@ -192,12 +201,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> En
         self.enqueue(bytes, meta)
     }
     fn drain(&self) -> bool {
-        let frames = self.progress();
-        let progress = !frames.is_empty();
-        for mut frame in frames {
-            narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
-        }
-        progress
+        Device::drain(self)
     }
 }
 static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
@@ -211,18 +215,9 @@ fn drain() -> bool {
     active.is_some_and(|owner| owner.drain())
 }
 fn authenticated_domain() -> Result<narf_wireless::reg::RegulatoryDomain, service_runtime::Error> {
-    let loader =
-        narf_firmware::trusted_loader_authority().ok_or(service_runtime::Error::Profile)?;
-    let authority = loader
-        .derive()
-        .map_err(|_| service_runtime::Error::Profile)?;
-    let cap = narf_firmware::open("wireless-regulatory.bin", &authority)
-        .map_err(|_| service_runtime::Error::Profile)?;
-    let view = narf_firmware::view_of(&cap).map_err(|_| service_runtime::Error::Profile)?;
-    if view.signer.is_none() {
-        return Err(service_runtime::Error::Profile);
-    }
-    narf_wireless::reg::parse_policy(view.bytes).map_err(|_| service_runtime::Error::Profile)
+    // This profile requires a fresh signed deployment artifact per attach;
+    // preserve that stronger contract instead of consulting the shared cache.
+    narf_wireless::reg::policy::load().map_err(|_| service_runtime::Error::Profile)
 }
 /// Publish only after actual firmware/IQK, signed board-power data and signed
 /// deployment policy have admitted this exact device. No real curve is shipped.

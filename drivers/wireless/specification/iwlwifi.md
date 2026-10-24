@@ -94,6 +94,57 @@ acceptance gates and are not enabled by this profile's station tests.
   scan, station association and IP-traffic acceptance. Software tests
   exercise these contracts without emulating the Intel radio.
 
+### 3.0 Sc station composition evidence
+
+The retained Sc c103 profile now composes the real post-INIT `Device` owner,
+NVM/runtime configuration, passive scan, `Connection` authentication and
+association, Open/WPA2-PSK controlled port, pairwise/group-key receipts, IPC,
+native TFH TX/RFH RX, the kernel DHCP client and exact Ethernet/IPv4 traffic in
+both directions against a legacy 2.4-GHz AP. The independent firmware-side
+fixture reacts only after descriptor and doorbell publication, validates packed
+TFH extents and command versions from the pinned Sc WH c103 metadata, and
+returns correlated receipts
+through actual posted RFH buffers. The shared AP validates M2/M4 MICs and replay
+counters; its DHCP server validates DISCOVER/REQUEST and all lease terms.
+Observations read the actual retained DMA body and published descriptor slot,
+check addresses against the owning allocation, and derive the observed byte
+extent from the DMA descriptor. Encoder source buffers cannot substitute for
+these reads. A separate regression rejects unwritten slots and mismatched
+device addresses and proves that snapshots reflect the actual DMA contents.
+Firmware CCMP encryption/decryption is modelled, with native protection flags,
+installed-key identity and host RX packet-number checks retained.
+
+The EAPOL envelope accepts protocol versions 1–3, including IEEE 802.1X-2010
+version 3 emitted by the shared AP. This outer byte is distinct from the exact
+negotiated AKM's EAPOL-Key descriptor version. Replies retain the received
+protocol version; MIC verification authenticates it. Independent vectors reject
+unknown envelope versions, wrong descriptors and protocol-byte MIC tampering,
+and prove that valid M3 retries do not reinstall keys.
+
+The owner publishes physical carrier separately from administrative link state:
+carrier remains down until association and, for WPA2, the terminal M4 TX receipt.
+Disconnect and failure close it before teardown. Public association and active
+scan retry the shared signed regulatory bootstrap, so policy staged after an
+early probe failure is usable without another driver's initialization. A
+private explicit model policy enters the same complete association owner; tests
+never install a permissive global policy or bypass firmware MCC intersection.
+
+Composition regressions withhold the M4 receipt and cancel its waiter, proving
+closed IP admission and retained queue/TX DMA. A cancelled queue-removal wait
+retains command and queue ownership; a mismatched correlated receipt fails the
+transport without releasing them. Successful disconnect requires all native
+queue/peer/link/PHY receipts and leaves no station queues or pending commands.
+
+This fixture starts after firmware-ready and installs the ordinary `send_frame`
+and common `Device.step` network seams without spawning a permanent worker.
+It does not substitute for the separately tested one-shot capability publication,
+native firmware/bootstrap/restart or interrupt ownership contracts. Physical
+acceptance still requires Sc firmware/PNVM/NVM/platform power and regulatory
+acceptance, boot/ALIVE and MSI/RFH/TFH operation, scan and Open/WPA2 association,
+real CCMP, DHCP/bidirectional IP, and disconnect/failure/recovery on hardware.
+These tests do not admit Ty/So/Bz firmware tables rejected by the exact MLD
+station-version gate, nor enable Gen2/MVM native station publication.
+
 ### 3.1 Native PCI and current authority
 
 Probe reserves one PCI function, leaves repeated owned-BDF dispatch untouched,

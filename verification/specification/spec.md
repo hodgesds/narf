@@ -56,15 +56,31 @@ fragment, replay and MIC checks gate authorization. `DhcpServer` provides an
 initial lease only after a MAC- and transaction-correlated DISCOVER/REQUEST,
 checking Ethernet/IPv4/UDP framing and control options. `NetworkPlan` defines
 the expected address, mask, gateway, DNS and duration; `udp_ipv4` builds test
-data. The kit has no device, driver-registration or carrier authority.
+data. `FakeAp::with_basic_1mbps()` selects a checked CCK basic-rate profile
+before authentication for RTL8188EU; the default OFDM profile is unchanged.
+The kit has no device, driver-registration or carrier authority.
 Driver adapters retain native RX/TX framing, completions and controlled-port
 admission. MT76 and ath11k compose production station/security paths through a
 lease and exact bidirectional Ethernet data; ath11k retains its x86_64 native
-ring fixture. CYW composes its FullMAC path on both architectures, with WPA2
-explicitly represented by firmware key-completion events. Kernel-test-only
-codec/peer negatives run on both architectures; these kernel-dependent types
-are not a host test executable and none of these checks establish RF or real
-firmware/silicon acceptance.
+ring fixture. Intel Sc c103 composes its post-INIT Device/Connection through
+native TFH/RFH command/data queues, the shared AP and kernel DHCP. Its model
+does not replace the separate firmware-boot/PCI/MSI checks or admit other Intel
+command tables. RTL8188EU composes channel1/20-MHz/basic1Mbps native USB,
+Station/Service, RSNA and software CCMP through the same AP and DHCP client.
+CYW SDPCM/BDC and BCM43602 CR4/msgbuf shared5/6 with zero descriptor prefix
+compose the common FullMAC station and DHCP path. Their WPA2 proof is
+firmware-offloaded key completion, including both association/key-event orders
+for PCIe; it does not simulate firmware-internal cryptography.
+
+These conversations check carrier and IPv4 binding retirement, controlled-port
+closure before the terminal M4/key receipt, stale authorization, disconnect
+failure and retained DMA after ambiguous completion. Test-only policy,
+qualification, firmware and board inputs cannot authorize a real device.
+The shared signed-policy bootstrap additionally uses a real isolated firmware
+registry entry and current capability invocation, with missing/unsigned/invalid
+asset, revocation, cache and concurrent caller-policy checks. These
+kernel-dependent types are not a host test executable, and none of these
+checks establish RF or real firmware/silicon acceptance.
 
 `narf_wifi_fixtures::firmware::metadata_replay(image_len, fragments)` builds
 parser-only structural images up to 16 MiB. It validates nonempty, ordered,

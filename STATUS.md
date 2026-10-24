@@ -69,6 +69,17 @@ software work. No off-box radio, DHCP or AP interoperability has been demonstrat
 
 All eleven in-tree families are covered by the current audit and dependency
 ledger in `drivers/wireless/specification/spec.md` and its family documents.
+The current target is **hardware-validation readiness** for each documented
+initial station profile: scan, Open/WPA2-PSK, DHCP and bidirectional IP, with
+controlled-port closure and safe transport ownership on disconnect/failure.
+Automatic recovery, wider PHY/chip coverage and power management are separate
+follow-ups where the initial profile deliberately requires a fresh device
+lifecycle. Six families have composed station/data paths (Intel Sc, MT76,
+ath11k, RTL8188EU, CYW43439 and BCM43602); exact authenticated firmware,
+board/calibration/policy provisioning and the family-specific gaps below
+still prevent an all-driver hardware-ready claim. Ath9k, ath10k, RTL8188EE,
+RTW88 and RTW89 still need substantial radio/station/packet implementation.
+
 Intel now sends versioned coexistence, SoC latency and awake-power setup.
 A retained Gen2 context-v1/RFH/TFH boot owner now covers APM, ALIVE6, unified
 NVM and MVM post-init configuration. Its API77 passive-scan owner now composes
@@ -185,7 +196,7 @@ families. This host has 60 assets present and 15 required assets missing
 board calibration, policy and exact board/PNVM matching remain separate gates.
 See [the firmware evidence and provisioning guide](verification/data/wifi-firmware/README.md).
 
-The next station checkpoint adds 21 software smokes. The shared legacy join
+The preceding station checkpoint added 21 software smokes. The shared legacy join
 plan now intersects successful response rates with the offered set, preserves
 beacon-mandatory rates and rejects unsupported response requirements before
 committing AID/rates. MT76 reads that negotiated state for its native peer/RA
@@ -194,16 +205,37 @@ sets. Independent Linux C layout/trace checks cover the Intel peer, ath10k
 teardown and RTW89 BDRAM prerequisites described above. Full station, IRQ,
 reset/rejoin and physical acceptance still require the remaining family work.
 
+The native-station checkpoint adds 20 software smokes. New conversations cover
+Intel Sc c103 after firmware INIT, RTL8188EU's channel1/20-MHz/basic1Mbps USB
+profile and BCM43602's shared5/6 zero-prefix msgbuf profile. Each composes its native
+transport, production station owner and kernel DHCP client through exact
+bidirectional IP, plus withheld completions, controlled-port closure and
+retained ownership on cancellation/disconnect failure. Intel and RTL8188EU
+now publish actual carrier metadata, which their previous administrative
+link updates did not supply. Intel accepts EAPOL outer protocol versions 1–3
+while preserving exact WPA2 descriptor, MIC, replay and no-reinstall checks.
+The shared AP's basic1Mbps option keeps RTL8188EU within its admitted rate
+profile. Synthetic board/calibration and firmware inputs remain test-only.
+
+A shared regulatory bootstrap now loads `wireless-regulatory.bin` through
+current firmware capability invocation, requires a verified signer even in
+unsigned development builds, and publishes only a complete decoded policy.
+Intel, MT76, ath10k and both FullMAC transports can obtain that policy without
+another Wi-Fi driver having probed first. Missing or invalid assets grant no
+new transmit permission; an existing caller-installed domain keeps the
+documented cached-domain contract. Isolated real-registry tests cover signed
+loading, revocation, failure, cache reuse and concurrent caller policy.
+
 The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
-wireless, network, crypto, RNG and shared-fixture QEMU gates: x86_64 reports
-2634 pass / 0 fail / 10 skip; aarch64 reports 1932 pass / 0 fail / 3 skip.
+wireless, network, crypto, RNG, firmware and shared-fixture QEMU gates:
+x86_64 reports 2704 pass / 0 fail / 22 skip; aarch64 reports
+2000 pass / 0 fail / 16 skip. All 20 new smokes pass on both architectures.
 Both include a clean production boot and btrfs interoperability postflight.
-The final strict Intel command/response-ABI checks also pass a focused
-x86_64 Gen2 rerun (33 pass / 0 fail) after the primary boot/postflight gate.
-Release/debug builds, targeted Clippy across the kernel feature contexts,
-workspace formatting, and the MT76 module build pass on both architectures.
-These are software/model checks; the skipped physical-device cases remain
-unvalidated and the missing driver stages above remain open.
+Host tests, release/debug builds, targeted Clippy across the kernel feature
+contexts, workspace formatting, and MT76 module build/Clippy pass.
+These are software/model checks. Expected skips include missing physical
+devices and unsigned-development firmware fixtures in the signed configuration;
+physical acceptance and the missing driver stages above remain open.
 
 ## Loadable e1000 datapath
 

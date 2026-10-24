@@ -116,11 +116,7 @@ impl State {
 }
 
 impl Device {
-    pub async fn initialize(
-        mut hardware: Hardware,
-        parsed: &super::ParsedUcode<'_>,
-        firmware: &[u8],
-    ) -> Result<Arc<Self>, &'static str> {
+    fn validate_station_profile(hardware: &Hardware) -> Result<(), &'static str> {
         for (group, command, version) in [
             (3, 8, 3),
             (3, 9, 8),
@@ -133,6 +129,15 @@ impl Device {
                 return Err("unsupported MLD station command version");
             }
         }
+        Ok(())
+    }
+
+    pub async fn initialize(
+        mut hardware: Hardware,
+        parsed: &super::ParsedUcode<'_>,
+        firmware: &[u8],
+    ) -> Result<Arc<Self>, &'static str> {
+        Self::validate_station_profile(&hardware)?;
         let mac = hardware.start(parsed).await?;
         let nvm = Self::configure(&mut hardware, mac).await?;
         let irq_vector = hardware.irq_vector();
@@ -291,6 +296,7 @@ impl Device {
         drop(state);
         drop(active);
         narf_net::iface::register(self.name(), self.mac, send_frame);
+        narf_net::iface::set_link_metadata(self.name(), false, None, None);
         narf_net::iface::set_link_state(self.name(), false);
         narf_net::iface::install_rx_drain(drain_network);
         let device = self.clone();
@@ -302,6 +308,7 @@ impl Device {
 
     fn set_link(&self, up: bool) {
         let was_up = self.up.swap(up, Ordering::AcqRel);
+        narf_net::iface::set_link_metadata(self.name(), up, None, None);
         narf_net::iface::set_link_state(self.name(), up);
         if !up {
             self.bssid.store(0, Ordering::Release);
@@ -555,6 +562,85 @@ impl Interface for Device {
     }
 }
 
+impl Device {
+    async fn associate_in_domain(
+        &self,
+        request: AssociateRequest,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), WirelessError> {
+        use super::connection::AuthMethod;
+        let auth = match request.security {
+            narf_wireless::SecurityConfig::Open => AuthMethod::Open,
+            narf_wireless::SecurityConfig::Wpa2 { psk } => AuthMethod::Wpa2Psk(psk),
+            narf_wireless::SecurityConfig::Wpa3 { password } => AuthMethod::Wpa3Sae { password },
+            // No external-supplicant mode (the MLD firmware path runs the
+            // handshake itself; nl80211 never builds this for it).
+            narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
+        };
+        if request.ssid.len() > 32 || request.bssid[0] & 1 != 0 {
+            return Err(WirelessError::InvalidArgs);
+        }
+        self.finish_control().await;
+        let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
+        if state.needs_reset
+            || state.hardware.is_failed()
+            || state
+                .connection
+                .as_ref()
+                .is_some_and(|connection| !connection.authorized)
+        {
+            self.recover(&mut state).await?;
+        }
+        if state.connection.is_some() {
+            return Err(WirelessError::Busy);
+        }
+        let beacon = state
+            .beacons
+            .iter()
+            .find(|b| {
+                b.bssid == request.bssid
+                    && b.ssid == request.ssid
+                    && b.channel as u32 == request.channel
+            })
+            .cloned()
+            .ok_or(WirelessError::InvalidArgs)?;
+        // Cancellation leaves this set. The pump fails closed rather
+        // than driving partially configured station/queue state.
+        state.needs_reset = true;
+        let bssid = request.bssid;
+        match Connection::associate_in_domain(
+            &mut state.hardware,
+            self.mac,
+            beacon,
+            auth,
+            self.tx_chains,
+            self.phy,
+            None,
+            domain,
+        )
+        .await
+        {
+            Ok(connection) => {
+                state.connection = Some(connection);
+                state.needs_reset = false;
+                self.store_bssid(bssid);
+                self.set_link(true);
+                Ok(())
+            }
+            Err(error) => {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "iwlwifi: association failed: {}",
+                    error
+                );
+                state.hardware.fail();
+                Err(WirelessError::HardwareError)
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
@@ -662,7 +748,7 @@ impl WirelessNetIface for Device {
             let mut body = scan_api::passive(version, uid, &channels)
                 .map_err(|_| WirelessError::NotSupported)?;
             if request.active {
-                if let Some(domain) = narf_wireless::reg::db::get_domain() {
+                if let Ok(domain) = narf_wireless::reg::db::ensure_domain() {
                     let permissions = super::connection::regulatory_channels(hw)
                         .await
                         .map_err(|_| WirelessError::HardwareError)?;
@@ -806,75 +892,9 @@ impl WirelessNetIface for Device {
     }
 
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
-        use super::connection::AuthMethod;
-        let auth = match request.security {
-            narf_wireless::SecurityConfig::Open => AuthMethod::Open,
-            narf_wireless::SecurityConfig::Wpa2 { psk } => AuthMethod::Wpa2Psk(psk),
-            narf_wireless::SecurityConfig::Wpa3 { password } => AuthMethod::Wpa3Sae { password },
-            // No external-supplicant mode (the MLD firmware path runs the
-            // handshake itself; nl80211 never builds this for it).
-            narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
-        };
-        if request.ssid.len() > 32 || request.bssid[0] & 1 != 0 {
-            return Err(WirelessError::InvalidArgs);
-        }
-        self.finish_control().await;
-        let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
-        if state.needs_reset
-            || state.hardware.is_failed()
-            || state
-                .connection
-                .as_ref()
-                .is_some_and(|connection| !connection.authorized)
-        {
-            self.recover(&mut state).await?;
-        }
-        if state.connection.is_some() {
-            return Err(WirelessError::Busy);
-        }
-        let beacon = state
-            .beacons
-            .iter()
-            .find(|b| {
-                b.bssid == request.bssid
-                    && b.ssid == request.ssid
-                    && b.channel as u32 == request.channel
-            })
-            .cloned()
-            .ok_or(WirelessError::InvalidArgs)?;
-        // Cancellation leaves this set. The pump fails closed rather
-        // than driving partially configured station/queue state.
-        state.needs_reset = true;
-        let bssid = request.bssid;
-        match Connection::associate(
-            &mut state.hardware,
-            self.mac,
-            beacon,
-            auth,
-            self.tx_chains,
-            self.phy,
-            None,
-        )
-        .await
-        {
-            Ok(connection) => {
-                state.connection = Some(connection);
-                state.needs_reset = false;
-                self.store_bssid(bssid);
-                self.set_link(true);
-                Ok(())
-            }
-            Err(error) => {
-                use core::fmt::Write;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "iwlwifi: association failed: {}",
-                    error
-                );
-                state.hardware.fail();
-                Err(WirelessError::HardwareError)
-            }
-        }
+        let domain =
+            narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::HardwareError)?;
+        self.associate_in_domain(request, &domain).await
     }
 
     async fn disassociate(&self) -> Result<(), WirelessError> {
@@ -1054,3 +1074,7 @@ impl Interface for RegisteredDevice {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "device_tests.rs"]
 mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "dhcp_composition_tests.rs"]
+mod dhcp_composition;

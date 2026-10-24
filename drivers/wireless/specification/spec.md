@@ -26,7 +26,12 @@ matching a PCI ID or testing a command encoder does not establish a WLAN.
 | **brcmfmac** | Explicit BCM43602 PCIe board profiles | CR4/msgbuf transport and constrained native FullMAC station path | Common CYW station/security logic, correlated data/control and ACK-fenced flow reuse are implemented; actual board selection, broader silicon, recovery and PM remain software work — `brcmfmac.md` |
 | **cyw43439** | Infineon SDIO FullMAC | Standard PCI SDHCI/explicit card bootstrap through F2 station attachment | Owned PIO enumeration, trusted firmware/NVRAM/CLM, discovered cores/RAM, mailbox/FIFO control and station/data; board wiring, gSPI host, reset/reload/PM remain — `cyw43439.md` |
 
-All eleven families are included in the software bring-up scope. Several
+All eleven families are included in the software bring-up scope. The current
+acceptance target is each documented initial station profile through scan,
+Open/WPA2, DHCP and bidirectional IP, with safe disconnect/failure ownership.
+Profiles that deliberately stop after an ambiguous failure may require a fresh
+device lifecycle for the first hardware validation; broader PHY/chip coverage,
+automatic recovery and PM are separate work. Several
 entries still require a substantial hardware-driver port before physical
 station validation is meaningful; build and model-test success must not be
 reported as having closed those software gaps. The family documents list the
@@ -731,9 +736,17 @@ in this implementation pass.
 ## 6. Regulatory Enforcement
 
 Drivers must not transmit until a regulatory domain is set.
-1. The userspace Wireless Daemon reads a signed regulatory DB.
-2. It sends a `SetRegulatory(CountryCode)` command to the kernel.
-3. The kernel validates the signature and passes the frequency/power limits to the driver via `WirelessDriver::set_regulatory_limits()`.
+The implemented bootstrap is `narf_wireless::reg::db::ensure_domain()`
+([shared wireless §3.5](../../../wireless/specification/spec.md#35-deployment-regulatory-policy)).
+It preserves a caller-installed domain or loads the exact signed
+`wireless-regulatory.bin` through the firmware registry. Intel, MT76, ath10k
+and the CYW/BCM FullMAC station entrypoints use it independently of probe
+ordering; missing/unsigned/invalid policy grants no new transmit permission.
+Board calibration and firmware channel permissions remain separate mandatory
+intersections. The image builder supplies deployment signing keys and policy;
+driver startup does not infer a country from an AP or rely on a userspace
+wireless daemon to establish that authority. The shared wireless specification
+owns the in-kernel station/security and capability-gated nl80211 contract.
 
 ## 7. Stage Assignment
 

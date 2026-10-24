@@ -69,7 +69,7 @@ pub fn register() {
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
-mod runtime_tests;
+pub(crate) mod runtime_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod data_wire_tests;

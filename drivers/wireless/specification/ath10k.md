@@ -86,7 +86,11 @@ packet service are not yet attached.
   key installation, carrier or a registered NIC. A prepared context cannot
   be scanned/replaced until owned teardown/reset is implemented. Any ambiguous
   command, cancellation, malformed map or failed response closes its owner
-  while retaining DMA.
+  while retaining DMA. Station prepare, management exchange and association
+  bootstrap a staged signed `wireless-regulatory.bin` through
+  `reg::db::ensure_domain()` when the caller has not installed a domain.
+  Missing/invalid policy fails before station publication; another driver
+  is not required to initialize regulatory state.
 - `pci::exchange_initial_management(frame)` exchanges initial unprotected
   Open-System Authentication and then Association Request on that prepared
   peer. Requests must use its BSSID and local station address; association

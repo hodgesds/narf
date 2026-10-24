@@ -225,6 +225,24 @@ state and DMA retirement, wide RX offset/reposting, stale/wrong-flow completions
 control-pressure fairness, invalid indices, cancellation,
 and allocation cleanup before versus mapping retention after publication.
 
+The retained shared5/6, zero-prefix BCM43602 profile also has a complete
+station/IP conversation fixture. An explicitly synthetic board profile goes
+through production CR4 claim/boot, message-ring attachment and RX posting;
+the independent firmware model consumes the actual control/flow descriptors
+and DMA bodies and posts native IOCTL/event/TX/RX completions. The production
+FullMAC `Station`, `Device`, controlled port, network drain and kernel DHCP
+client run unchanged. Shared `DhcpServer` supplies a correlated lease, followed
+by exact bidirectional Ethernet/IPv4 payload checks. Open and WPA2-PSK/CCMP
+firmware offload run on both shared versions; SET_SSID and FWSUP_COMPLETED are
+checked in either order. The fixture does not simulate firmware-internal EAPOL
+or cryptography. TX payload allocations remain live until their matching
+TX-status completion, and disconnect waits for actual link-down while old
+flows retire only on native delete responses. Missing keys/cancelled waits,
+link loss with queued TX and same-poll RX, and refused disconnect plus stale
+authorization events keep the port closed and published DMA retained. These
+are composition checks: no fixture firmware/NVRAM is registered for deployment
+and no actual board calibration or hardware interoperability is inferred.
+
 Primary references: `/usr/src/linux/drivers/net/wireless/broadcom/brcm80211/`
 `brcmfmac/chip.c`, `pcie.c`, `firmware.c`, `msgbuf.c`, `commonring.c`, and
 `include/brcm_hw_ids.h` in the same source tree. Actual board firmware and

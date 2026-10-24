@@ -16,6 +16,7 @@ narf-ipc = { path = "../ipc" }
 narf-io = { path = "../io" }
 narf-scheduler = { path = "../scheduler" }
 narf-drivers = { path = "../drivers" }
+narf-firmware = { path = "../firmware" }
 async-trait = "0.1"
 futures = { version = "0.3", default-features = false }
 narf-kernel-test = { path = "../verification/kernel-test" }

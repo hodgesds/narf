@@ -1556,28 +1556,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             if let Some(format) = rx_rfh::CompletionFormat::for_mac(chip.mac) {
                 // Country selection is deployment policy, not inferred from
                 // a language/timezone or an unauthenticated AP beacon.
-                if narf_wireless::reg::db::get_domain().is_none() {
-                    if let Ok(policy) = narf_firmware::open("wireless-regulatory.bin", &auth) {
-                        if let Ok(policy) = narf_firmware::view_of(&policy) {
-                            if policy.signer.is_some() {
-                                match narf_wireless::reg::parse_policy(policy.bytes) {
-                                    Ok(domain) => narf_wireless::reg::db::set_domain(domain),
-                                    Err(error) => {
-                                        let _ = writeln!(
-                                            narf_console::Writer,
-                                            "iwlwifi: regulatory policy: {}",
-                                            error
-                                        );
-                                    }
-                                }
-                            } else {
-                                let _ = writeln!(
-                                    narf_console::Writer,
-                                    "iwlwifi: regulatory policy must be signed"
-                                );
-                            }
-                        }
-                    }
+                if let Err(error) = narf_wireless::reg::db::ensure_domain() {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "iwlwifi: regulatory policy: {}",
+                        error
+                    );
                 }
                 // Startup waits for DMA responses; it must run in executor
                 // context, without blocking probe or holding an IRQ lock.

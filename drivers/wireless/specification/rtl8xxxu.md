@@ -17,6 +17,9 @@ probe. Initialization powers the RF blocks for register-table setup while
 MAC TX/RX stays closed until the separately admitted retained service starts.
 The initial service requires signed per-device board qualification and signed
 deployment policy; broader software prerequisites are listed below.
+Policy decoding uses `narf_wireless::reg::policy::load()` inside current
+firmware capability invocation. Each attach still requires a fresh signed
+artifact rather than accepting the shared cached regulatory domain.
 
 ## 3. Public interface
 
@@ -192,6 +195,33 @@ poll the same USB receipts/RSNA/crypto path; the latter uses `try_lock`, never
 driver/ring guards are released, so ARP/ND may reenter transmit safely. Native
 plaintext crosses to Ethernet only through checked RFC1042/address/profile
 admission. Packet queues and per-step RX processing are bounded.
+
+The composed Open/WPA2 fixture now drives the production `Device`, `Service`,
+`Station`, register initialization and native bulk descriptor/receipt owners
+through channel1 passive scan, authentication/association and shared RSNA to
+the real kernel DHCP client. A shared `FakeAp` in its explicitly selected
+basic1Mbps profile verifies management/EAPOL, while `DhcpServer` supplies a
+transaction-bound lease. WPA2 data crosses the native USB seam as actual
+software CCMP ciphertext; the peer checks MIC/replay before observing DHCP.
+Exact uplink bytes at the AP and downlink bytes in both Narf-Ring and stack
+dispatch prove post-lease bidirectional Ethernet/IP composition. The adapter
+publishes physical carrier metadata only after station authorization and clears
+it on disconnect or terminal failure, independently of the host DHCP lease.
+Quiet polls preserve the RX receipt; held M4 prevents DHCP; timed-out data and
+failed USB stop retain uncertain RX/TX receipts and reject reuse. Successful
+disconnect closes MAC admission and retires the actual native receipts.
+
+Inert EP0/bulk registers, synthetic firmware bytes and explicit private
+qualification/entropy inputs supply the hardware seam; the AP and DHCP server
+are test peers. Vendor firmware execution is not simulated. The fixture's
+synthetic signed-metadata parser boundary neither installs a registry blob nor
+qualifies a real board; production `attach` still
+requires current authority, signed exact-device calibration and signed policy.
+This establishes one-shot channel1 software composition, not RF delivery,
+radio ACK, xHCI/silicon acceptance or reset/rejoin readiness. Hardware validation
+must provision real board evidence and use a fresh USB lifecycle after stop or
+failure; broader channels, rate modes, automatic recovery and PM remain outside
+the minimum initial profile.
 
 Explicit disconnect closes host admission before awaiting Linux TSF-disable
 and disconnected media state, verifies MAC TX/RX/filter closure, then uses

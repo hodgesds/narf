@@ -38,6 +38,7 @@ pub struct FakeAp {
     anonce: [u8; 32],
     ptk: Option<Ptk>,
     phase: ApPhase,
+    basic_1mbps: bool,
 }
 
 impl core::fmt::Debug for FakeAp {
@@ -107,7 +108,27 @@ impl FakeAp {
             anonce,
             ptk: None,
             phase: ApPhase::Authentication,
+            basic_1mbps: false,
         })
+    }
+
+    /// Select the fixed channel-1-era legacy 1Mbps fixture profile before
+    /// authentication. Default constructors retain their OFDM6/12/24 profile.
+    /// This configures only the fake peer; it grants no driver/radio authority.
+    pub fn with_basic_1mbps(mut self) -> Result<Self, ApError> {
+        if self.phase != ApPhase::Authentication || self.ptk.is_some() {
+            return Err(ApError::Phase);
+        }
+        self.basic_1mbps = true;
+        Ok(self)
+    }
+
+    fn basic_rates(&self) -> &'static [u8] {
+        if self.basic_1mbps {
+            &[0x82]
+        } else {
+            &[0x8c, 0x98, 0xb0]
+        }
     }
 
     pub fn phase(&self) -> ApPhase {
@@ -160,7 +181,8 @@ impl FakeAp {
                 response.extend_from_slice(&self.capabilities().to_le_bytes());
                 response.extend_from_slice(&0u16.to_le_bytes());
                 response.extend_from_slice(&(self.aid | 0xc000).to_le_bytes());
-                response.extend_from_slice(&[1, 3, 0x8c, 0x98, 0xb0]);
+                response.extend_from_slice(&[1, self.basic_rates().len() as u8]);
+                response.extend_from_slice(self.basic_rates());
                 if self.protected() {
                     let mut m1 = KeyFrame::empty(16);
                     m1.key_information = eapol::KI_KEY_TYPE_PAIRWISE
@@ -214,7 +236,9 @@ impl FakeAp {
     fn ies(&self) -> Vec<u8> {
         let mut out = vec![0, self.ssid.len() as u8];
         out.extend_from_slice(&self.ssid);
-        out.extend_from_slice(&[1, 3, 0x8c, 0x98, 0xb0, 3, 1, self.channel]);
+        out.extend_from_slice(&[1, self.basic_rates().len() as u8]);
+        out.extend_from_slice(self.basic_rates());
+        out.extend_from_slice(&[3, 1, self.channel]);
         if self.protected() {
             out.extend_from_slice(&self.rsn_ie());
         }
@@ -247,10 +271,10 @@ impl FakeAp {
         }
         if ssid != Some(self.ssid.as_slice())
             || !rates.is_some_and(|r| {
-                [12, 24, 48].iter().all(|basic| {
+                self.basic_rates().iter().all(|basic| {
                     r.iter()
                         .chain(extended_rates.unwrap_or_default())
-                        .any(|x| x & 0x7f == *basic)
+                        .any(|x| x & 0x7f == basic & 0x7f)
                 })
             })
             || if self.protected() {

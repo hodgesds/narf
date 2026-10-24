@@ -432,3 +432,6 @@ kernel_test_in!(
 
 #[path = "station_tests.rs"]
 mod station_tests;
+
+#[path = "dhcp_composition_tests.rs"]
+mod dhcp_composition_tests;

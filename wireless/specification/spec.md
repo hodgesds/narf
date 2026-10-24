@@ -859,10 +859,25 @@ fixtures use explicit injected material and do not depend on target entropy.
 ### 3.5 Deployment regulatory policy
 
 `reg::parse_policy` decodes an NRGD v1 policy; parsing alone conveys no
-authority. The iwlwifi probe optionally opens `wireless-regulatory.bin`
-through its trusted firmware-registry capability. It installs the policy
-only after the registry verifies its signature and the view identifies a
-signer. Unsigned policies are rejected even in unsigned-firmware builds.
+authority. `reg::policy::load()` opens the exact `wireless-regulatory.bin`
+through trusted firmware-registry authority, invokes the blob's current
+capability, requires verified signer metadata and returns a fully decoded
+owned domain. Unsigned policies are rejected even in unsigned-firmware builds.
+`reg::db::ensure_domain()` preserves an existing caller-installed domain,
+otherwise performs that signed bootstrap without holding the database lock.
+Only successful loads install state; a caller policy installed during lookup
+wins the race. Existing `set_domain` callers retain responsibility for their
+policy's authority. This cache does not attest the origin of arbitrary domains
+installed through that existing API or implement live policy revocation.
+
+Intel probe, MT76 publication/TX admission, ath10k station-control entry points
+and the common CYW/Broadcom FullMAC attachment use this bootstrap. A standalone
+driver no longer requires another wireless driver to populate the database.
+FullMAC attachment and TX admission fail when policy is missing/invalid;
+Intel/MT76 diagnostic/passive receive paths retain their existing closed-TX
+behavior. No calibration, country or default transmit authority is inferred.
+RTL8188EU uses `policy::load()` directly on every attach, preserving its
+fresh-signed-artifact requirement independently of the shared domain cache.
 Deployment public keys are baked into the image with
 `NARF_FIRMWARE_TRUSTED_KEYS`; the firmware packer accepts a verified
 detached signature. No deployment country or signing key is chosen by
@@ -946,5 +961,5 @@ Management frames (Beacons, Probe Requests) are voluminous.
 
 ## 9. Dependencies
 
-- **Consumes**: `net/` (base interface), `drivers/`, `capabilities/`, `ipc/`, `io/`.
+- **Consumes**: `net/` (base interface), `drivers/`, `capabilities/`, `ipc/`, `io/`, and `firmware/` for authenticated deployment-policy bootstrap.
 - **Provides**: Wireless-specific control plane to userspace daemons.

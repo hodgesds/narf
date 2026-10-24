@@ -295,8 +295,8 @@ pub async fn prepare_station(
     bssid: [u8; 6],
     frequency: u16,
 ) -> Result<super::wmi_runtime::PeerPrepared, super::wmi_runtime::Error> {
-    let domain =
-        narf_wireless::reg::db::get_domain().ok_or(super::wmi_runtime::Error::Unsupported)?;
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let Some(DriverSession::Radio(owner)) = session.as_mut() else {
         return Err(super::wmi_runtime::Error::Failed);
@@ -320,8 +320,8 @@ pub async fn prepare_station(
 pub async fn exchange_initial_management(
     frame: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, super::wmi_runtime::Error> {
-    let domain =
-        narf_wireless::reg::db::get_domain().ok_or(super::wmi_runtime::Error::Unsupported)?;
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let Some(DriverSession::Radio(owner)) = session.as_mut() else {
         return Err(super::wmi_runtime::Error::Failed);
@@ -346,8 +346,8 @@ pub async fn associate_station(
     security: narf_wireless::association::SecurityMode,
     sme_ies: &[u8],
 ) -> Result<super::wmi_runtime::StationAssociated, super::wmi_runtime::Error> {
-    let domain =
-        narf_wireless::reg::db::get_domain().ok_or(super::wmi_runtime::Error::Unsupported)?;
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let Some(DriverSession::Radio(owner)) = session.as_mut() else {
         return Err(super::wmi_runtime::Error::Failed);

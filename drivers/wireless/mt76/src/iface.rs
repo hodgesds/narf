@@ -420,7 +420,7 @@ impl WirelessNetIface for Mt76Iface {
             .cloned()
             .ok_or(WirelessError::InvalidArgs)?;
 
-        let domain = narf_wireless::reg::db::get_domain().ok_or(WirelessError::Denied)?;
+        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::Denied)?;
         crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
             .ok_or(WirelessError::Denied)?;
 
@@ -580,6 +580,13 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
         return Err(WirelessError::Busy);
     }
     let mut iface = Mt76Iface::new(String::new(), info)?;
+    // Bootstrap before control-plane discovery/association can query the
+    // domain. Missing deployment policy still permits the receive-only scan
+    // interface; TX admission retries the same signed bootstrap and fails shut.
+    if let Err(error) = narf_wireless::reg::db::ensure_domain() {
+        use core::fmt::Write;
+        let _ = writeln!(narf_console::Writer, "mt76: regulatory policy: {}", error);
+    }
     iface.name = narf_net::iface::register("wlan%d", info.capabilities.mac, send_frame);
     publish_link(&iface.name, false);
     let iface = Arc::new(iface);

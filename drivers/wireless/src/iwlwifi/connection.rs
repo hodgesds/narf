@@ -151,6 +151,27 @@ impl Connection {
         local_phy: super::ht_vht::Local,
         roam_from: Option<[u8; 6]>,
     ) -> Result<Self, &'static str> {
+        let domain = narf_wireless::reg::db::ensure_domain()
+            .map_err(|_| "wireless regulatory domain is not configured")?;
+        Self::associate_in_domain(
+            hw, local, beacon, auth, tx_chains, local_phy, roam_from, &domain,
+        )
+        .await
+    }
+
+    // The private model supplies its explicit policy through the same full
+    // association owner; public callers always snapshot the authenticated db.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn associate_in_domain(
+        hw: &mut Hardware,
+        local: [u8; 6],
+        beacon: Beacon,
+        auth: AuthMethod,
+        tx_chains: u32,
+        local_phy: super::ht_vht::Local,
+        roam_from: Option<[u8; 6]>,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<Self, &'static str> {
         let secure = !matches!(auth, AuthMethod::Open);
         let akm = match &auth {
             AuthMethod::Open => None,
@@ -198,16 +219,14 @@ impl Connection {
             None
         };
         let qos = super::qos::Parameters::parse(&beacon.information_elements)?;
-        let domain = narf_wireless::reg::db::get_domain()
-            .ok_or("wireless regulatory domain is not configured")?;
-        let permissions = regulatory_channels(hw).await?;
+        let permissions = regulatory_channels_in_domain(hw, domain).await?;
         let phy = super::ht_vht::Negotiated::parse(
             local_phy,
             &beacon.information_elements,
             beacon.channel,
             qos.is_some(),
             |width, center| {
-                channel_power_width(&domain, beacon.channel, width, center, &permissions).is_some()
+                channel_power_width(domain, beacon.channel, width, center, &permissions).is_some()
             },
         )?;
         let rates = super::rates::Rates::parse_for_phy(
@@ -216,7 +235,7 @@ impl Connection {
             phy.mode,
         )?;
         let max_power =
-            channel_power_width(&domain, beacon.channel, phy.width, phy.center, &permissions)
+            channel_power_width(domain, beacon.channel, phy.width, phy.center, &permissions)
                 .ok_or("channel transmission prohibited by host/firmware regulatory policy")?;
         let mut phy_command = station_api::phy(1, beacon.channel);
         phy.apply_phy(&mut phy_command, beacon.channel);
@@ -381,7 +400,7 @@ impl Connection {
         // The response can choose a different secondary channel while
         // narrowing bandwidth. Revalidate the resulting entire span.
         let final_power = channel_power_width(
-            &domain,
+            domain,
             this.beacon.channel,
             this.phy.width,
             this.phy.center,
@@ -1265,8 +1284,15 @@ async fn install_key(
 
 /// Firmware permission is refreshed once per scan/association operation.
 pub(super) async fn regulatory_channels(hw: &mut Hardware) -> Result<Vec<u32>, &'static str> {
-    let domain = narf_wireless::reg::db::get_domain()
-        .ok_or("wireless regulatory domain is not configured")?;
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| "wireless regulatory domain is not configured")?;
+    regulatory_channels_in_domain(hw, &domain).await
+}
+
+async fn regulatory_channels_in_domain(
+    hw: &mut Hardware,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+) -> Result<Vec<u32>, &'static str> {
     if hw.version(1, 0xc8).map(|v| v.1) != Some(8) {
         return Err("unsupported regulatory response");
     }

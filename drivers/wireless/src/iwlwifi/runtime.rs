@@ -229,6 +229,8 @@ pub struct CommandQueue {
     // only its low eight bits. DMA slots wrap at the allocated depth.
     write: u16,
     outstanding: usize,
+    #[cfg(any(test, feature = "kernel-test"))]
+    trace: Option<model::TxTrace>,
 }
 
 impl CommandQueue {
@@ -238,6 +240,8 @@ impl CommandQueue {
             pending: (0..COMMAND_DEPTH).map(|_| None).collect(),
             write: 0,
             outstanding: 0,
+            #[cfg(any(test, feature = "kernel-test"))]
+            trace: None,
         })
     }
 
@@ -296,6 +300,20 @@ impl CommandQueue {
         self.write = self.write.wrapping_add(1);
         dma_barrier();
         mmio.write(tx_gen2::HBUS_TARG_WRPTR, self.write as u32);
+        #[cfg(any(test, feature = "kernel-test"))]
+        if let Some(trace) = &self.trace {
+            trace.published(
+                0,
+                self.write,
+                &self.pending[slot]
+                    .as_ref()
+                    .ok_or("private command DMA absent")?
+                    ._dma,
+                &self.descriptors,
+                slot,
+                mmio.read(tx_gen2::HBUS_TARG_WRPTR),
+            )?;
+        }
         Ok(sequence)
     }
 
@@ -983,6 +1001,8 @@ impl Hardware {
             return Err("unsupported queue allocation version");
         }
         let mut queue = super::data_queue::DataQueue::for_format(self.format)?;
+        #[cfg(any(test, feature = "kernel-test"))]
+        queue.trace_for_model(self.resources.commands.trace.clone());
         let body = queue.configure(station, tid)?;
         let index = self.resources.data.len();
         // Pin BEFORE publishing the allocation command. Timeout does
