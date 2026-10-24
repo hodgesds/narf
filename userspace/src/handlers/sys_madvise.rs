@@ -5,8 +5,9 @@ use super::*;
 /// MADV_DONTNEED (4) as "release backing frames; next access reads zero"
 /// and MADV_FREE (8) as Linux's lazy variant: pages are marked discardable
 /// but stay mapped until memory pressure harvests the ones never rewritten
-/// (`AddressSpace::madvise_free` / `discard_lazyfree_pages`). Implemented
-/// performance-only hints are accepted as no-ops. Unknown values and
+/// (`AddressSpace::madvise_free` / `discard_lazyfree_pages`). MADV_WILLNEED
+/// (3) populates the page cache behind file-backed ranges (#731); the
+/// remaining performance-only hints are accepted as no-ops. Unknown values and
 /// semantic controls NARF cannot honor return EINVAL instead of claiming a
 /// state transition that did not happen.
 ///
@@ -189,7 +190,22 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
                 Err(_) => ctx.set_return(errno_ret(ENOMEM)),
             }
         }
-        // These values are performance hints only. NARF has no readahead,
+        // MADV_WILLNEED: populate the page cache behind the range so the
+        // caller's upcoming scan does not fault page by page (#731).
+        // Coverage keeps the hint contract below — an unmapped range is
+        // ENOMEM, as `madvise_walk_vmas` reports for hints too — and the
+        // population itself is advisory: ranges with no generic-fallback
+        // file owner (anonymous, private, direct-provider) have nothing
+        // to populate and stay a successful no-op.
+        MADV_WILLNEED => {
+            if as_ref.range_fully_mapped(base, len) {
+                crate::mapped_file::populate_mapped_range(as_ref.identity(), base.as_u64(), len);
+                ctx.set_return(SyscallReturn::ok(0));
+            } else {
+                ctx.set_return(errno_ret(ENOMEM));
+            }
+        }
+        // The remaining values are performance hints only. NARF has no
         // KSM, THP promotion, or active LRU aging policy to tune yet, so a
         // successful no-op preserves their contract.
         //

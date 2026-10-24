@@ -1312,6 +1312,128 @@ fn fault_error(error: FsError) -> FileFaultError {
     }
 }
 
+/// Whether the canonical cache already holds a page a fault for
+/// `(identity, offset)` would reuse: the same validity rule
+/// [`reserve_cached_shared_file_pages`] applies (a mapped or pending page
+/// counts regardless of generation; an idle one must still carry the
+/// file's current generation), but without taking a pending hold, so a
+/// population scan does not perturb the retention state it is only
+/// observing.
+fn shared_file_page_present(identity: usize, offset: u64, generation: u64) -> bool {
+    let pages = SHARED_FILE_PAGES.lock();
+    let key = SharedFilePages::key(identity, offset);
+    let Some(&phys) = pages.by_file.get(&key) else {
+        return false;
+    };
+    let Some(page) = pages.by_phys.get(&phys) else {
+        return false;
+    };
+    shared_page_matches_ops(page, identity)
+        && (page.mappings != 0 || page.pending != 0 || page.cache_generation == Some(generation))
+}
+
+/// Populate the shared page cache for `[offset, offset + len)` of a
+/// generic-fallback file without mapping anything: the `readahead(2)` /
+/// `MADV_WILLNEED` primitive (#731). Each missing page is filled by the
+/// fault path's own machinery — [`load_file_demand_page`] then
+/// [`publish_shared_file_pages`] — so a populated page is
+/// indistinguishable from a fault-filled one: same EOF clamping (the
+/// final partial page is filled exactly as a fault fills it, nothing is
+/// loaded at or past `i_size`), same generation stamp, same
+/// `note_file_written` fold and invalidation afterwards. A page already
+/// present is never reloaded or overwritten, and population never
+/// dirties anything.
+///
+/// Retention is inherited from the cache discipline, not reinvented:
+/// only a filesystem that opted into a cache generation can keep an
+/// idle populated page (see [`should_retire_idle_shared_page`]), so
+/// files without one — and direct `mmap_fault` providers, whose pages
+/// are provider-owned and never consult this cache — are deliberate
+/// no-ops. Advisory throughout: the first fill error stops the scan
+/// and is not reported, mirroring Linux `page_cache_ra`, which treats
+/// readahead I/O failure as "the fault will surface it later". Returns
+/// the number of pages newly populated.
+///
+/// Locking mirrors [`demand_frame`]: no cache or owner lock is held
+/// across the fill I/O (`load_file_demand_page` may park in
+/// `poll_io_to_completion`); the cache lock is taken only inside the
+/// presence check and the publication, in the fault path's order.
+pub(crate) fn populate_file_cache(ops: &Arc<dyn FileOps>, offset: u64, len: u64) -> u64 {
+    if len == 0 || ops.supports_mmap_fault() {
+        return 0;
+    }
+    let Some(generation) = ops.mmap_cache_generation() else {
+        return 0;
+    };
+    let size = ops.stat().size;
+    let first = offset & !0xFFF;
+    let end = offset.saturating_add(len).min(size);
+    if end <= first {
+        return 0;
+    }
+    let identity = ops.mmap_backing_identity();
+    let mut populated = 0u64;
+    let mut page = first;
+    while page < end {
+        if !shared_file_page_present(identity, page, generation) {
+            let mut candidates = Vec::new();
+            if candidates.try_reserve_exact(1).is_err() {
+                break;
+            }
+            let candidate = match crate::handlers::load_file_demand_page(ops, page) {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            candidates.push(candidate);
+            let (_phys, publication) =
+                publish_shared_file_pages(ops, page, candidates, Some(generation));
+            publication.commit();
+            populated += 1;
+        }
+        page += 4096;
+    }
+    populated
+}
+
+/// Populate the cache behind the generic-fallback shared owners that
+/// cover `[base, base + len)` of an address space — the `MADV_WILLNEED`
+/// walk. The owner bucket lock is dropped after snapshotting the
+/// covering owners (Arc clones only, no FileOps calls under the lock),
+/// and each owner's intersection is populated through
+/// [`populate_file_cache`], clamped per owner to its mapping and, inside
+/// the primitive, to the file's current `i_size`. Private mappings are
+/// skipped (their faults copy through `load_file_demand_page` directly
+/// and never consult this cache) and so are direct-provider owners
+/// (no writeback state); anonymous ranges have no owner and are a no-op.
+pub(crate) fn populate_mapped_range(address_space_id: u64, base: u64, len: u64) {
+    let Some(bucket) = existing_mapping_owners(address_space_id) else {
+        return;
+    };
+    let owners: Vec<(u64, u64, u64, Arc<dyn FileOps>)> = {
+        let owners = bucket.lock();
+        owners
+            .iter()
+            .filter(|mapping| mapping.writeback.is_some() && !mapping.private_copy)
+            .map(|mapping| {
+                (
+                    mapping.base,
+                    mapping.len,
+                    mapping.file_offset,
+                    Arc::clone(&mapping.ops),
+                )
+            })
+            .collect()
+    };
+    let end = base.saturating_add(len);
+    for (owner_base, owner_len, file_offset, ops) in owners {
+        let start = base.max(owner_base);
+        let stop = end.min(owner_base.saturating_add(owner_len));
+        if start < stop {
+            populate_file_cache(&ops, file_offset + (start - owner_base), stop - start);
+        }
+    }
+}
+
 /// Publish freshly loaded fallback pages into the process-independent file
 /// page cache. A concurrent/overlapping mapper may already have published a
 /// page; in that case use its physical page and return the unused allocation

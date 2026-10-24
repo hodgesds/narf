@@ -1142,6 +1142,81 @@ kernel_test_in!(
     smoke_fat_mmap_cache_generation_tracks_mutations
 );
 
+/// Generations must never repeat across volume *instances* (#732):
+/// the page cache's `(identity, generation)` guard is only sound if a
+/// volume mounted after another was dropped cannot reissue the dead
+/// volume's values, because the identity half (an anchor's address)
+/// may be recycled for the new volume's same-position file. Each
+/// volume therefore issues ticks inside a boot-global epoch: every
+/// generation of the later-mounted volume exceeds every generation
+/// the earlier one ever issued, however far the earlier one climbed.
+fn smoke_fat_mmap_cache_generation_unique_across_volumes() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    let mount = |img: alloc::vec::Vec<u8>| {
+        let device = RamBlockDevice::from_image(512, img);
+        match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+            Some(Ok(v)) => Some(v),
+            _ => None,
+        }
+    };
+    let first = match mount(build_fat12_image(128, b"narf\n")) {
+        Some(v) => v,
+        None => return TestResult::Fail("first mount failed"),
+    };
+    let file_a = match poll_once(first.root().lookup_async("NARF.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup on first volume failed"),
+    };
+    let a0 = match file_a.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("first volume reports no cache generation"),
+    };
+    // Drive the first volume's counter forward, then drop the volume:
+    // its retained-page generations are the values a later volume must
+    // never reissue.
+    if poll_once(file_a.write(0, b"NARF!")).and_then(|r| r.ok()) != Some(5) {
+        return TestResult::Fail("write on first volume failed");
+    }
+    let a1 = match file_a.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("first volume lost its generation"),
+    };
+    if a1 <= a0 {
+        return TestResult::Fail("generation did not climb within one volume");
+    }
+    drop(file_a);
+    drop(first);
+
+    let second = match mount(build_fat12_image(128, b"narf\n")) {
+        Some(v) => v,
+        None => return TestResult::Fail("second mount failed"),
+    };
+    let file_b = match poll_once(second.root().lookup_async("NARF.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup on second volume failed"),
+    };
+    let b0 = match file_b.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("second volume reports no cache generation"),
+    };
+    if b0 == a0 || b0 == a1 {
+        return TestResult::Fail("second volume reissued a dead volume's generation");
+    }
+    if b0 < a1 {
+        return TestResult::Fail("second volume's generations overlap the first volume's range");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_mmap_cache_generation_unique_across_volumes
+);
+
 /// The shared page cache keys retained pages by
 /// `mmap_backing_identity`, so the identity must belong to the file,
 /// not to the node an open minted (issue #679): two opens of one file

@@ -19,6 +19,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
 use narf_capabilities::{Cap, Read, Write};
@@ -114,6 +115,25 @@ pub struct FatVolume<B: BlockDevice> {
     mmap_anchors: IrqSafeSpinLock<BTreeMap<u64, Weak<MmapAnchor>>>,
 }
 
+/// Boot-global source of generation epochs (#732). A generation is
+/// `(epoch << 32) | per-volume tick`; each volume instance draws one
+/// epoch at construction and further epochs only if it exhausts the
+/// previous one's tick range. Epochs are handed out monotonically and
+/// never reused, so two volume instances can never issue the same
+/// generation value — the property the page cache's
+/// `(identity, generation)` guard needs when the *identity* half (an
+/// anchor's address) is recycled after its volume is gone.
+static NEXT_GENERATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Bits of per-volume tick range under one epoch. A volume would need
+/// 2^32 generation assignments to exhaust an epoch; the draw-on-exhaust
+/// path in `fresh_tick` covers even that.
+const GENERATION_EPOCH_SHIFT: u32 = 32;
+
+fn draw_generation_epoch() -> u64 {
+    NEXT_GENERATION_EPOCH.fetch_add(1, Ordering::Relaxed) << GENERATION_EPOCH_SHIFT
+}
+
 /// Content-generation counters for one volume. Values are NOT per-key
 /// counters: every assignment — the first read of a key, a content
 /// mutation, an occupant change (create / rename) — draws a fresh
@@ -124,28 +144,43 @@ pub struct FatVolume<B: BlockDevice> {
 /// instance that published it. That uniqueness is what makes the
 /// generation half of the page cache's (identity, generation) guard
 /// sound even when an identity anchor's address is recycled.
+///
+/// The uniqueness is boot-wide, not just per-volume (#732): ticks are
+/// issued inside a per-instance epoch drawn from
+/// [`NEXT_GENERATION_EPOCH`], so a volume mounted after another was
+/// dropped cannot reissue a dead volume's generations — before this,
+/// every volume's counter restarted at the same values and a retained
+/// page from the dead volume could satisfy a new volume's guard when
+/// its anchor address was also recycled.
 #[derive(Debug)]
 struct CacheGenerations {
     values: BTreeMap<u64, u64>,
-    /// Next tick to issue. Starts at 1: 0 is never a real generation,
-    /// so a key with no entry yet cannot alias an issued one.
+    /// Next tick to issue, in `[epoch + 1, epoch_end)`. The low bits
+    /// are never 0 at issue: 0 is never a real generation, so a key
+    /// with no entry yet cannot alias an issued one.
     next_tick: u64,
+    /// End (exclusive) of this instance's current epoch range.
+    epoch_end: u64,
 }
 
 impl CacheGenerations {
     fn new() -> Self {
+        let epoch = draw_generation_epoch();
         Self {
             values: BTreeMap::new(),
-            next_tick: 1,
+            next_tick: epoch + 1,
+            epoch_end: epoch + (1 << GENERATION_EPOCH_SHIFT),
         }
     }
 
     fn fresh_tick(&mut self) -> u64 {
-        let tick = self.next_tick;
-        self.next_tick = self.next_tick.wrapping_add(1);
-        if self.next_tick == 0 {
-            self.next_tick = 1;
+        if self.next_tick == self.epoch_end {
+            let epoch = draw_generation_epoch();
+            self.next_tick = epoch + 1;
+            self.epoch_end = epoch + (1 << GENERATION_EPOCH_SHIFT);
         }
+        let tick = self.next_tick;
+        self.next_tick += 1;
         tick
     }
 }
