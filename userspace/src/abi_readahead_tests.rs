@@ -570,3 +570,206 @@ kernel_test_in!(
     "syscall_abi/readahead/write_coherence",
     smoke_readahead_write_coherence
 );
+
+// ── Read(2)-path readahead (#743) ──────────────────────────────────
+//
+// The tests above advise population explicitly (`readahead(2)`,
+// `MADV_WILLNEED`). These prove the implicit path: an ordinary
+// sequential `read(2)` stream populates ahead of itself through the
+// per-open-description pattern state, with the same counting device
+// as the witness. Sector arithmetic throughout: one page is 8 data
+// sectors in this fixture; the initial window is 128 KiB = 32 pages
+// = 256 sectors; the window doubles after each populated window.
+
+fn read_into(fd: u64, buf: &mut [u8]) -> Option<i64> {
+    call(
+        Syscall::Read.raw(),
+        a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+    )
+}
+
+fn pread_into(fd: u64, buf: &mut [u8], offset: u64) -> Option<i64> {
+    call(
+        Syscall::Pread64.raw(),
+        a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, offset),
+    )
+}
+
+fn lseek_set(fd: u64, offset: u64) -> Option<i64> {
+    call(Syscall::Lseek.raw(), a2(fd, offset, 0))
+}
+
+/// Two sequential page reads open the initial window: the first only
+/// candidates the stream (no speculative I/O), the second confirms it
+/// and populates 128 KiB ahead of the consumed bytes. The served
+/// bytes still come from the ordinary read path and are unchanged.
+fn smoke_read_readahead_sequential_populates() -> TestResult {
+    let bytes = content(0x31, 512 * 1024);
+    with_fat_file(&bytes, |fx| {
+        let mut buf = alloc::vec![0u8; PAGE as usize];
+        if fx.data_blocks_read() != 0 {
+            return Err("the fixture read file data before any read");
+        }
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64) {
+            return Err("first sequential read did not return a full page");
+        }
+        if buf[..] != bytes[..PAGE as usize] {
+            return Err("first sequential read served the wrong bytes");
+        }
+        // Candidate only: exactly the requested page's 8 sectors moved.
+        if fx.data_blocks_read() != 8 {
+            return Err("the first read of a stream already speculated");
+        }
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64) {
+            return Err("second sequential read did not return a full page");
+        }
+        if buf[..] != bytes[PAGE as usize..2 * PAGE as usize] {
+            return Err("second sequential read served the wrong bytes");
+        }
+        // 16 served sectors + the 256-sector initial window (pages
+        // 2..34) populated ahead of the consumption offset.
+        if fx.data_blocks_read() != 272 {
+            return Err("the confirmed stream did not populate the initial window");
+        }
+        let window_lo = DATA_LBA + 16;
+        if fx.device.blocks_read_between(window_lo, window_lo + 256) != 256 {
+            return Err("the populated window is not the span ahead of the stream");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/read_readahead/sequential_populates",
+    smoke_read_readahead_sequential_populates
+);
+
+/// Scattered positioned reads never confirm a stream, so they cause
+/// no speculative device reads at all; and a seek — even to the exact
+/// offset the stream would have continued at — resets the pattern,
+/// so the read after it only candidates afresh.
+fn smoke_read_readahead_random_and_seek_no_speculation() -> TestResult {
+    let bytes = content(0x52, 512 * 1024);
+    with_fat_file(&bytes, |fx| {
+        let mut buf = alloc::vec![0u8; PAGE as usize];
+        for page in [0u64, 64, 32, 96] {
+            if pread_into(fx.fd, &mut buf, page * PAGE) != Some(PAGE as i64) {
+                return Err("a scattered pread did not return a full page");
+            }
+        }
+        // Four requested pages, 8 sectors each, and nothing else.
+        if fx.data_blocks_read() != 32 {
+            return Err("scattered reads caused speculative device reads");
+        }
+        let fd2 = fx.reopen()?;
+        if read_into(fd2, &mut buf) != Some(PAGE as i64) {
+            return Err("the seek-test stream's first read failed");
+        }
+        if lseek_set(fd2, PAGE) != Some(PAGE as i64) {
+            return Err("lseek to the continuation offset failed");
+        }
+        if read_into(fd2, &mut buf) != Some(PAGE as i64) {
+            return Err("the read after the seek failed");
+        }
+        // Two more served pages (16 sectors) and — because the seek
+        // reset the pattern — no 256-sector window behind the second.
+        if fx.data_blocks_read() != 48 {
+            return Err("a seek to the continuation offset did not reset the pattern");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/read_readahead/random_and_seek",
+    smoke_read_readahead_random_and_seek_no_speculation
+);
+
+/// A page populated by a sequential read stream is already in the
+/// shared cache when an mmap fault reaches it: the fault installs it
+/// (and its fault-around window, itself fully populated) with zero
+/// new device reads.
+fn smoke_read_readahead_populates_for_mmap() -> TestResult {
+    let bytes = content(0x74, 512 * 1024);
+    with_fat_file(&bytes, |fx| {
+        let mut buf = alloc::vec![0u8; PAGE as usize];
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64)
+            || read_into(fx.fd, &mut buf) != Some(PAGE as i64)
+        {
+            return Err("the sequential reads that open the window failed");
+        }
+        if fx.data_blocks_read() != 272 {
+            return Err("the stream did not populate the initial window");
+        }
+        let base = map_shared(fx.fd, 512 * 1024)?;
+        let before = fx.data_blocks_read();
+        // Page 20 sits inside the populated window (pages 2..34); its
+        // fault-around window (pages 16..32) is populated too.
+        fault(&fx.aspace, base + 20 * PAGE)?;
+        if fx.data_blocks_read() != before {
+            return Err("faulting a read-ahead page re-read data sectors");
+        }
+        let want = &bytes[20 * PAGE as usize..21 * PAGE as usize];
+        if mapped_bytes(&fx.aspace, base + 20 * PAGE, PAGE as usize)? != want {
+            return Err("the faulted read-ahead page serves the wrong bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/read_readahead/populates_for_mmap",
+    smoke_read_readahead_populates_for_mmap
+);
+
+/// Pattern state is per open description: two opens of the same file
+/// interleaved read-by-read keep independent streams. The exact total
+/// also pins window growth — the first stream's second window is the
+/// doubled 256 KiB, not another 128 KiB.
+fn smoke_read_readahead_per_open_state() -> TestResult {
+    let bytes = content(0x96, 512 * 1024);
+    with_fat_file(&bytes, |fx| {
+        let mut buf = alloc::vec![0u8; PAGE as usize];
+        let fd_b = fx.reopen()?;
+        // A candidates (page 0); B candidates elsewhere (page 40).
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64) {
+            return Err("A's first read failed");
+        }
+        if pread_into(fd_b, &mut buf, 40 * PAGE) != Some(PAGE as i64) {
+            return Err("B's first read failed");
+        }
+        if buf[..] != bytes[40 * PAGE as usize..41 * PAGE as usize] {
+            return Err("B's read served the wrong bytes");
+        }
+        // A confirms at page 1: 8 served + 256 populated (pages 2..34).
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64) {
+            return Err("A's second read failed");
+        }
+        if fx.data_blocks_read() != 280 {
+            return Err("A's window did not open on its own stream");
+        }
+        // B jumps to page 100: a reset for B, no speculation, and A's
+        // state undisturbed.
+        if pread_into(fd_b, &mut buf, 100 * PAGE) != Some(PAGE as i64) {
+            return Err("B's scattered read failed");
+        }
+        if fx.data_blocks_read() != 288 {
+            return Err("B's scattered read speculated or disturbed A's state");
+        }
+        // A continues at page 2: 8 served, then the doubled window
+        // populates pages 34..67 (264 sectors).
+        if read_into(fx.fd, &mut buf) != Some(PAGE as i64) {
+            return Err("A's third read failed");
+        }
+        // B reads page 41 — sequential for nobody (B expects 101):
+        // 8 served sectors and no window.
+        if pread_into(fd_b, &mut buf, 41 * PAGE) != Some(PAGE as i64) {
+            return Err("B's final read failed");
+        }
+        if fx.data_blocks_read() != 568 {
+            return Err("interleaved opens did not keep independent pattern state");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/read_readahead/per_open_state",
+    smoke_read_readahead_per_open_state
+);

@@ -42,6 +42,41 @@ pub struct FdEntry {
     pub status_flags: u32,
 }
 
+/// Initial read(2)-path readahead window: 128 KiB. Linux's default
+/// `VM_READAHEAD_PAGES` is also 128 KiB (`mm/readahead.c`: 32 pages).
+const READ_READAHEAD_INITIAL_BYTES: u64 = 128 * 1024;
+/// Cap for the exponentially grown read(2)-path readahead window.
+/// Linux grows an on-demand window by doubling toward the device /
+/// file readahead limit; 2 MiB is a conservative in-kernel cap for a
+/// first slice — large enough to cluster a meaningful span of FAT
+/// sectors, small enough that a misdetected "sequential" stream cannot
+/// pin an unbounded run of idle cache pages.
+const READ_READAHEAD_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Per-open-description sequential-read pattern for read(2)-path
+/// readahead (#743) — NARF's analogue of Linux `struct file::f_ra`.
+///
+/// The state machine is deliberately conservative: a single read only
+/// *candidates* a stream (recording where it ended); a second read
+/// starting exactly there *confirms* sequential access and only then
+/// may population run ahead. That keeps isolated random reads — and
+/// the one-block probes libraries do while sniffing a file — from
+/// causing speculative device I/O, at the cost of one read of latency
+/// before the window opens.
+#[derive(Debug, Default)]
+struct ReadReadaheadState {
+    /// Offset the next read must start at to continue this stream.
+    expected_next: Option<u64>,
+    /// Whether a second consecutive read has confirmed the stream.
+    confirmed: bool,
+    /// Window to apply at the next confirmed read; doubles after each
+    /// populated window toward [`READ_READAHEAD_MAX_BYTES`].
+    window_bytes: u64,
+    /// Furthest offset population has been scheduled through, so a
+    /// confirmed stream never re-schedules the same span.
+    populated_until: u64,
+}
+
 /// State owned by a Linux open-file description (`struct file`), rather than
 /// by one descriptor-table slot.  `dup*` and `fork` install another reference
 /// to this object, so file position and mutable status flags remain shared;
@@ -49,6 +84,7 @@ pub struct FdEntry {
 #[derive(Debug)]
 struct OpenFileState {
     offset: u64,
+    readahead: ReadReadaheadState,
 }
 
 /// Shared `struct file` analogue. The async mutex serializes sequential I/O
@@ -237,6 +273,70 @@ impl OpenFileDescription {
 
     pub(crate) fn set_offset(&self, offset: u64) {
         self.state.lock().offset = offset;
+    }
+
+    /// Forget any sequential-read pattern. Called by `lseek` on every
+    /// successful seek (a seek is a deliberate pattern break, even to
+    /// the offset the stream would have continued at) and by the read
+    /// path for an `O_DIRECT` read, which bypasses the page cache the
+    /// pattern exists to feed.
+    ///
+    /// Deliberately *not* folded into [`OpenFileDescription::set_offset`]:
+    /// `sys_read` commits the advanced position at the end of every
+    /// transfer, so a reset there would wipe the candidate state the
+    /// previous syscall's `note_readahead_read` recorded — a plain
+    /// sequential stream could never confirm itself.
+    pub(crate) fn reset_readahead(&self) {
+        self.state.lock().readahead = ReadReadaheadState::default();
+    }
+
+    /// Record one successful read of `len` bytes starting at `start`
+    /// and, if it confirms or continues a sequential stream, return
+    /// the `(offset, len)` range the caller should populate ahead of
+    /// the stream. The caller performs the population *after* this
+    /// returns: this method only takes the description's IRQ-safe
+    /// state lock briefly and never does I/O under it.
+    ///
+    /// Policy (see [`ReadReadaheadState`]): a read that does not start
+    /// at the expected offset — including the first read on a fresh
+    /// description — only candidates a stream and returns `None`. A
+    /// read that starts at the expected offset opens the window at
+    /// [`READ_READAHEAD_INITIAL_BYTES`]; each subsequent confirmed
+    /// read doubles the stored window toward
+    /// [`READ_READAHEAD_MAX_BYTES`]. Population is scheduled from the
+    /// furthest offset already scheduled (or the end of this read,
+    /// whichever is later) through `end + window`, so overlapping
+    /// ranges are never scheduled twice.
+    pub(crate) fn note_readahead_read(&self, start: u64, len: u64) -> Option<(u64, u64)> {
+        if len == 0 {
+            return None;
+        }
+        let end = start.checked_add(len)?;
+        let mut state = self.state.lock();
+        let readahead = &mut state.readahead;
+        if readahead.expected_next != Some(start) {
+            readahead.expected_next = Some(end);
+            readahead.confirmed = false;
+            readahead.window_bytes = READ_READAHEAD_INITIAL_BYTES;
+            readahead.populated_until = end;
+            return None;
+        }
+        readahead.expected_next = Some(end);
+        if !readahead.confirmed {
+            readahead.confirmed = true;
+            if readahead.window_bytes == 0 {
+                readahead.window_bytes = READ_READAHEAD_INITIAL_BYTES;
+            }
+        }
+        let window = readahead.window_bytes;
+        let target = end.saturating_add(window);
+        let populate_from = readahead.populated_until.max(end);
+        if target <= populate_from {
+            return None;
+        }
+        readahead.populated_until = target;
+        readahead.window_bytes = window.saturating_mul(2).min(READ_READAHEAD_MAX_BYTES);
+        Some((populate_from, target - populate_from))
     }
 
     pub(crate) fn status_flags(&self) -> u32 {
@@ -620,6 +720,7 @@ impl FdTable {
         Arc::new(OpenFileDescription {
             state: IrqSafeSpinLock::new(OpenFileState {
                 offset: entry.offset,
+                readahead: ReadReadaheadState::default(),
             }),
             status_flags: AtomicU32::new(entry.status_flags),
             position_lock: narf_lib::mutex::Mutex::new(()),
