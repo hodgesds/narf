@@ -4881,11 +4881,15 @@ struct LivenessObservation {
 /// historical serial-silence-only behaviour rather than letting an
 /// unsamplable guest run until the overall phase cap.
 fn liveness_decision(observation: LivenessObservation) -> LivenessDecision {
-    if observation.idle_timeout.is_zero() || observation.serial_silence < observation.idle_timeout {
-        LivenessDecision::Alive
-    } else if observation
-        .cpu_activity
-        .is_some_and(CpuActivityObservation::is_busy)
+    // Two independent signs of life, one verdict: fresh serial output
+    // within the idle timeout (or the check disabled entirely), or — once
+    // serial has been quiet past the timeout — a CPU-busy QEMU, which
+    // under TCG means the guest is computing, not hung.
+    if observation.idle_timeout.is_zero()
+        || observation.serial_silence < observation.idle_timeout
+        || observation
+            .cpu_activity
+            .is_some_and(CpuActivityObservation::is_busy)
     {
         LivenessDecision::Alive
     } else {
