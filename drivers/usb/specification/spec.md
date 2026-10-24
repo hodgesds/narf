@@ -289,8 +289,12 @@ also consult upstream Linux GPL sources.
   verified registry using the controller-reported ROM/RAM/board identity.
 - `MSC_DEVICES` entries are tombstoned on detach, never shifted: a bind
   reuses the first tombstone, so the `usb-msc{idx}` block name is stable
-  across unplug/replug and a stale `UsbMscBlockDevice` adapter fails with
-  `BlockIoError::DeviceRemoved` after its device is detached.
+  across unplug/replug. Each entry carries a monotonic bind generation
+  stamped at bind; a `UsbMscBlockDevice` adapter captures it and fails
+  with `BlockIoError::DeviceRemoved` once its device is detached *or*
+  its index is reused by a later bind — a held adapter is never served
+  by the next disk to occupy its index, and a rebind of the same disk
+  (a new bind, a new generation) does not resurrect it.
 - `msc::detach_msc(slot_id)` is MSC's publication teardown — tombstone the
   slot's entries, then unregister the `usb-msc{idx}` disk and its partition
   children (children first) from the block registry. It is registered as a

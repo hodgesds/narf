@@ -157,6 +157,16 @@ pub struct MscDevice {
     pub lba_bytes: u32,
     /// Last LBA reported by READ CAPACITY(10).
     pub last_lba: u32,
+    /// Bind generation, stamped by [`insert_device`] from a
+    /// process-wide monotonic counter. Zero means "not yet
+    /// inserted" (a freshly attached or test-constructed device);
+    /// every live registry entry carries a unique non-zero value,
+    /// and an adapter's transfer snapshot copies its entry's. [`UsbMscBlockDevice`] captures the
+    /// generation at construction and refuses to operate when the
+    /// entry at its index carries a different one, so a held
+    /// adapter can never be silently retargeted at the next disk
+    /// to reuse its index after a replug.
+    pub generation: u64,
     /// Sequence counter for `dCBWTag` (matched by the device in CSW).
     tag: IrqSafeSpinLock<u32>,
 }
@@ -247,6 +257,7 @@ impl MscDevice {
             bulk_out,
             lba_bytes: 0,
             last_lba: 0,
+            generation: 0,
             tag: IrqSafeSpinLock::new(1),
         };
         let cap = dev.read_capacity_10(xhci).await?;
@@ -256,6 +267,7 @@ impl MscDevice {
             bulk_out,
             lba_bytes: cap.0,
             last_lba: cap.1,
+            generation: 0,
             tag: IrqSafeSpinLock::new(2),
         })
     }
@@ -583,13 +595,27 @@ impl MscDevice {
 /// (`usb-msc{idx}`) hold the index for the device's whole lifetime,
 /// so a removal must not renumber the survivors. A later bind
 /// reuses the first tombstone (see [`insert_device`]), which keeps
-/// the published name stable across an unplug/replug cycle.
+/// the published name stable across an unplug/replug cycle. Index
+/// reuse is safe for held adapters only because each entry carries
+/// a bind generation (see [`MscDevice::generation`]): an adapter
+/// captured from a previous occupant of the index fails
+/// `DeviceRemoved` instead of being retargeted at the new disk.
 pub static MSC_DEVICES: IrqSafeSpinLock<Vec<Option<MscDevice>>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Monotonic bind-generation source for [`MscDevice::generation`].
+/// Incremented once per [`insert_device`] and never reused, so a
+/// generation identifies one *bind*, not one disk: even the same
+/// physical device detached and rebound gets a fresh generation,
+/// and adapters held from its earlier bind stay stale.
+static MSC_BIND_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Insert a freshly bound device, reusing the first tombstoned
 /// slot when one exists so indices (and therefore `usb-msc{idx}`
-/// names) stay bounded and stable across replug. Returns the index.
-fn insert_device(dev: MscDevice) -> usize {
+/// names) stay bounded and stable across replug. Stamps the device
+/// with the next bind generation before publishing it. Returns
+/// the index.
+fn insert_device(mut dev: MscDevice) -> usize {
+    dev.generation = MSC_BIND_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     let mut g = MSC_DEVICES.lock();
     if let Some((idx, slot)) = g.iter_mut().enumerate().find(|(_, s)| s.is_none()) {
         *slot = Some(dev);
@@ -716,7 +742,16 @@ pub fn unregister_msc_block_device(idx: usize) {
 /// in-flight `UsbMscBlockDevice` read/write that still holds the
 /// (about-to-be-unregistered) adapter fails cleanly with
 /// `BlockIoError::DeviceRemoved` instead of driving a dead slot.
-/// Idempotent: detaching an unbound slot is a no-op.
+/// The tombstone is only a liveness check, though — it covers the
+/// window until the next bind, and [`insert_device`] deliberately
+/// reuses the first tombstone, so a replugged disk lands on the
+/// same index. The identity check for that window is the bind
+/// generation ([`MscDevice::generation`]): the adapter compares
+/// its captured generation against the live entry on every op
+/// and fails `DeviceRemoved` on mismatch, so a filesystem that
+/// keeps its adapter across an unplug/replug is never silently
+/// served by the new disk. Idempotent: detaching an unbound slot
+/// is a no-op.
 pub fn detach_msc(slot_id: u8) {
     let mut indices = Vec::new();
     {
@@ -909,6 +944,7 @@ pub fn __insert_msc_for_test(slot_id: u8) -> usize {
         bulk_out: 2,
         lba_bytes: 512,
         last_lba: 2047,
+        generation: 0,
         tag: IrqSafeSpinLock::new(1),
     };
     let idx = insert_device(dev);
@@ -1055,6 +1091,17 @@ pub struct UsbMscBlockDevice {
     /// reads/writes through a stale adapter fail with
     /// `BlockIoError::DeviceRemoved`.
     idx: usize,
+    /// Bind generation of the entry this adapter was built from,
+    /// captured at construction. Filesystems retain this adapter
+    /// for the mount's whole life, across detach and replug; since
+    /// a replug reuses the tombstoned index, the bare index cannot
+    /// distinguish "my disk" from "the next disk". Every op
+    /// compares this against the live entry's generation before
+    /// issuing anything and fails `DeviceRemoved` on mismatch, so
+    /// a stale adapter is never silently served by a different
+    /// disk (or by a rebind of the same disk — a rebind is a new
+    /// bind, with a new generation).
+    generation: u64,
     /// Cached lba_size_bytes — read from MscDevice::lba_bytes once
     /// at construction so we don't re-enter the registry on every
     /// `lba_size()` call.
@@ -1067,6 +1114,7 @@ impl core::fmt::Debug for UsbMscBlockDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UsbMscBlockDevice")
             .field("idx", &self.idx)
+            .field("generation", &self.generation)
             .field("lba_size", &self.lba_size)
             .field("capacity", &self.capacity)
             .finish()
@@ -1085,6 +1133,7 @@ impl UsbMscBlockDevice {
         }
         Some(Self {
             idx,
+            generation: dev.generation,
             lba_size: dev.lba_bytes,
             capacity: dev.last_lba as u64 + 1,
         })
@@ -1092,31 +1141,51 @@ impl UsbMscBlockDevice {
 
     /// Snapshot the (controller, device-fields) pair a BOT exchange
     /// needs, without holding any registry lock across the transfer
-    /// (the same shape `read`/`write` build inline; `flush` and
-    /// `write_fua` share this helper). The snapshot's tag counter
-    /// restarts at 1 — safe because `MscIoClaim` serialises
-    /// exchanges per device, so the tag only has to match the CSW
-    /// of the exchange in flight.
+    /// (`flush` and `write_fua` share this helper; `read`/`write`
+    /// build the same snapshot inline). The snapshot is the
+    /// identity gate, identical to `read`/`write`: the registry is
+    /// consulted before the controller lookup and before the caller
+    /// takes the I/O claim — the entry must be live *and* still the
+    /// bind this adapter was built from (generation match), so a
+    /// flush or FUA write through a stale adapter fails
+    /// `DeviceRemoved` instead of draining or forcing a write on
+    /// the disk that reused its index after a replug. The
+    /// snapshot's tag counter restarts at 1 — safe because
+    /// `MscIoClaim` serialises exchanges per device, so the tag
+    /// only has to match the CSW of the exchange in flight.
     fn transport_snapshot(
         &self,
     ) -> Result<(alloc::sync::Arc<Xhci>, MscDevice), narf_block::BlockIoError> {
+        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation) = {
+            let g = MSC_DEVICES.lock();
+            let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
+                Some(d) => d,
+                None => return Err(narf_block::BlockIoError::DeviceRemoved),
+            };
+            if dev.generation != self.generation {
+                return Err(narf_block::BlockIoError::DeviceRemoved);
+            }
+            (
+                dev.slot_id,
+                dev.bulk_in,
+                dev.bulk_out,
+                dev.lba_bytes,
+                dev.generation,
+            )
+        };
         let c = match xhci::controller() {
             Some(c) => c,
-            None => return Err(narf_block::BlockIoError::DeviceRemoved),
-        };
-        let g = MSC_DEVICES.lock();
-        let dev = match g.get(self.idx) {
-            Some(d) => d,
             None => return Err(narf_block::BlockIoError::DeviceRemoved),
         };
         Ok((
             c,
             MscDevice {
-                slot_id: dev.slot_id,
-                bulk_in: dev.bulk_in,
-                bulk_out: dev.bulk_out,
-                lba_bytes: dev.lba_bytes,
+                slot_id,
+                bulk_in: bulk_in_dci,
+                bulk_out: bulk_out_dci,
+                lba_bytes,
                 last_lba: 0,
+                generation,
                 tag: IrqSafeSpinLock::new(1),
             },
         ))
@@ -1280,21 +1349,36 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         if out.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        // Snapshot the (controller, device) handles outside the
-        // registry locks so we can drive the async read_blocks via
-        // `sync_bridge` without holding any IrqSafeSpinLock across the
-        // .await (see `sync_bridge` for the in-poll callers).
-        let c = match xhci::controller() {
-            Some(c) => c,
-            None => return Err(narf_block::BlockIoError::DeviceRemoved),
-        };
-        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes) = {
+        // Snapshot the device handle outside the registry locks so
+        // we can drive the async read_blocks via `sync_bridge`
+        // without holding any IrqSafeSpinLock across the .await
+        // (see `sync_bridge` for the in-poll callers). The snapshot
+        // is the identity gate, and it runs before the I/O claim is
+        // taken: the entry must be live *and* still the bind this
+        // adapter was built from (generation match). A tombstone
+        // or a generation mismatch — the index was reused by a
+        // replugged disk — fails DeviceRemoved without issuing
+        // anything against the current occupant.
+        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
                 None => return Err(narf_block::BlockIoError::DeviceRemoved),
             };
-            (dev.slot_id, dev.bulk_in, dev.bulk_out, dev.lba_bytes)
+            if dev.generation != self.generation {
+                return Err(narf_block::BlockIoError::DeviceRemoved);
+            }
+            (
+                dev.slot_id,
+                dev.bulk_in,
+                dev.bulk_out,
+                dev.lba_bytes,
+                dev.generation,
+            )
+        };
+        let c = match xhci::controller() {
+            Some(c) => c,
+            None => return Err(narf_block::BlockIoError::DeviceRemoved),
         };
         let dev_snapshot = MscDevice {
             slot_id,
@@ -1302,6 +1386,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             bulk_out: bulk_out_dci,
             lba_bytes,
             last_lba: 0,
+            generation,
             tag: IrqSafeSpinLock::new(1),
         };
         let Some(_claim) = MscIoClaim::acquire(self.idx) else {
@@ -1330,17 +1415,30 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         if data.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        let c = match xhci::controller() {
-            Some(c) => c,
-            None => return Err(narf_block::BlockIoError::DeviceRemoved),
-        };
-        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes) = {
+        // Identity gate, identical to `read`: snapshot the live
+        // entry and compare bind generations before the I/O claim
+        // is taken, so a stale adapter never issues a write against
+        // the disk that reused its index after a replug.
+        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
                 None => return Err(narf_block::BlockIoError::DeviceRemoved),
             };
-            (dev.slot_id, dev.bulk_in, dev.bulk_out, dev.lba_bytes)
+            if dev.generation != self.generation {
+                return Err(narf_block::BlockIoError::DeviceRemoved);
+            }
+            (
+                dev.slot_id,
+                dev.bulk_in,
+                dev.bulk_out,
+                dev.lba_bytes,
+                dev.generation,
+            )
+        };
+        let c = match xhci::controller() {
+            Some(c) => c,
+            None => return Err(narf_block::BlockIoError::DeviceRemoved),
         };
         let dev_snapshot = MscDevice {
             slot_id,
@@ -1348,6 +1446,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
             bulk_out: bulk_out_dci,
             lba_bytes,
             last_lba: 0,
+            generation,
             tag: IrqSafeSpinLock::new(1),
         };
         let Some(_claim) = MscIoClaim::acquire(self.idx) else {
