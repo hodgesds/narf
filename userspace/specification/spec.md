@@ -439,7 +439,17 @@ for any hole without quadratically cloning a VMA's complete backing list once
 per queried page.
 `msync(2)` validates its complete rounded mapping, rejects unknown flags and
 the mutually exclusive `MS_ASYNC|MS_SYNC` combination, then flushes retained
-shared-file pages. `madvise(2)` accepts unimplemented performance-only hints
+shared-file pages. `madvise(MADV_POPULATE_READ|MADV_POPULATE_WRITE)` installs
+the whole range through the bulk fault API and returns 0 only if every page
+was populated: segments are processed per VMA in address order, the first
+error in that order is returned, and pages installed before a failure stay
+installed. A segment the caller may not populate this way (insufficient
+access permission, or a device mapping) fails with `EINVAL`; a hole, an
+unpopulatable page, or a range extending past a file's EOF fails with
+`ENOMEM` — `madvise` never raises the `SIGBUS` a touch past EOF would.
+`POPULATE_WRITE` resolves COW sharing in place so a successful return means
+the pages are writable; `POPULATE_READ` leaves COW sharing intact.
+`madvise(2)` accepts unimplemented performance-only hints
 as no-ops, but unknown advice and semantic state controls such as DONTFORK or
 WIPEONFORK fail with `EINVAL` until their observable behavior exists.
 

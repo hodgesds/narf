@@ -151,6 +151,7 @@ mod abi_pathx_tests;
 mod abi_perf_tests;
 mod abi_pid_alloc_tests;
 mod abi_pidns_tests;
+mod abi_populate_tests;
 mod abi_proc2_tests;
 mod abi_proc_tests;
 mod abi_readahead_tests;
