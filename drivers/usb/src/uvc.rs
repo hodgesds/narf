@@ -699,10 +699,23 @@ pub struct UvcDevice {
     pub active_stream: Option<UvcStreamingEndpoint>,
     /// `/dev/video<N>` minor registered for this camera.
     pub video_node: usize,
-    /// Prevents duplicate capture tasks when a caller repeats negotiation.
-    pub capture_pump_running: bool,
-    /// Set by STREAMOFF teardown; the capture pump checks it once per
-    /// packet iteration and exits, clearing it on the way out.
+    /// Generation of the current stream: bumped by every successful
+    /// activation (and only by activation). A capture pump captures
+    /// the generation it was spawned for and exits as soon as the
+    /// device's generation no longer matches — a STREAMOFF →
+    /// STREAMON toggle therefore retires the old pump by construction,
+    /// however long it stays parked in a transfer.
+    pub stream_generation: u64,
+    /// Generation of the capture pump currently marked as running, or
+    /// 0 when none is. The mark is generation-scoped: a stale pump's
+    /// exit clears it only when it still names that pump's own
+    /// generation, never a successor's.
+    pub capture_pump_generation: u64,
+    /// Stop request for the *current* generation, set by STREAMOFF
+    /// teardown. The current generation's pump observes it at its next
+    /// wake (loop top, and again before delivering a completed frame)
+    /// and exits, consuming it. A new activation supersedes it: it
+    /// targeted the stream being replaced, so activation clears it.
     pub capture_stop_requested: bool,
 }
 
@@ -911,7 +924,8 @@ pub async fn try_bind_video_with_transport<T: UvcTransport>(
         formats: stream_formats,
         active_stream: None,
         video_node,
-        capture_pump_running: false,
+        stream_generation: 0,
+        capture_pump_generation: 0,
         capture_stop_requested: false,
     });
     Ok(idx)
@@ -1127,6 +1141,13 @@ pub async fn activate_video_stream_with<T: UvcTransport>(
     let mut devices = UVC_DEVICES.lock();
     let device = devices.get_mut(idx).ok_or(UvcError::NotVideo)?;
     device.active_stream = Some(endpoint);
+    // A successful activation starts a new stream generation: pumps
+    // of older generations are now stale (they exit at their next
+    // wake without delivering), and a stop request still standing
+    // from the superseded stream's teardown is void — it must not
+    // kill the pump this activation is about to spawn.
+    device.stream_generation = device.stream_generation.wrapping_add(1);
+    device.capture_stop_requested = false;
     Ok(endpoint)
 }
 
@@ -1141,8 +1162,13 @@ pub async fn deactivate_video_stream(
 
 /// Transport-generic core of [`deactivate_video_stream`].
 ///
-/// Requests the capture pump to stop first (it observes
-/// `capture_stop_requested` at its next packet iteration), then
+/// Requests the current generation's capture pump to stop first (it
+/// observes `capture_stop_requested` at its next wake — a pump parked
+/// in a transfer on the now-silent interface may not wake until the
+/// next stream sources packets, which is safe: the generation
+/// protocol in [`pump_video_frames_with`] keeps a late-waking pump
+/// from delivering into, or consuming the lifecycle state of, any
+/// successor stream), then
 /// selects the zero-bandwidth alternate setting 0 on the
 /// VideoStreaming interface — the exact reverse of activation's
 /// `configure_endpoints` → `SET_INTERFACE(alt)` order, minus endpoint
@@ -1295,49 +1321,94 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
     })
 }
 
-/// Spawn the packet-to-frame pump once for an activated camera. Completed
-/// frames are delivered to the camera's registered `/dev/video<N>` queue.
-fn start_video_capture_pump(idx: usize) {
-    let should_spawn = {
-        let mut devices = UVC_DEVICES.lock();
-        let Some(device) = devices.get_mut(idx) else {
-            return;
-        };
-        if device.capture_pump_running {
-            false
-        } else {
-            device.capture_pump_running = true;
-            // A fresh stream supersedes any earlier stop request.
-            device.capture_stop_requested = false;
-            true
-        }
-    };
-    if !should_spawn {
-        return;
+/// Claim the capture-pump slot for the device's current stream
+/// generation. Returns the generation a new pump must run (and later
+/// release) under, or `None` when a pump for *this* generation is
+/// already marked or no stream has ever been activated.
+///
+/// The claim is generation-scoped, not a boolean: a pump of an older
+/// generation still marked — e.g. parked in a transfer that only the
+/// new stream's packets will resolve — never blocks the claim. The
+/// stale pump retires itself at its next wake (see
+/// [`pump_video_frames_with`]); until then two pumps may briefly
+/// coexist, which the generation checks in the pump make harmless.
+pub fn claim_capture_pump(idx: usize) -> Option<u64> {
+    let mut devices = UVC_DEVICES.lock();
+    let device = devices.get_mut(idx)?;
+    let generation = device.stream_generation;
+    if generation == 0 || device.capture_pump_generation == generation {
+        return None;
     }
+    device.capture_pump_generation = generation;
+    Some(generation)
+}
+
+/// Release a capture-pump claim taken under `generation`. The mark
+/// is cleared only when it still names `generation`: a stale pump's
+/// exit must never clear the mark of the successor pump that
+/// superseded it.
+pub fn release_capture_pump(idx: usize, generation: u64) {
+    if let Some(device) = UVC_DEVICES.lock().get_mut(idx) {
+        if device.capture_pump_generation == generation {
+            device.capture_pump_generation = 0;
+        }
+    }
+}
+
+/// Spawn the packet-to-frame pump for the activated camera's current
+/// stream generation. Completed frames are delivered to the camera's
+/// registered `/dev/video<N>` queue.
+fn start_video_capture_pump(idx: usize) {
+    let Some(generation) = claim_capture_pump(idx) else {
+        return;
+    };
     narf_scheduler::spawn(async move {
-        let result = pump_video_frames(idx).await;
+        let result = pump_video_frames(idx, generation).await;
         if result.is_err() {
             let _ = core::fmt::write(
                 &mut narf_console::Writer,
                 format_args!("  usb-uvc: capture pump stopped for device {idx}\n"),
             );
         }
-        if let Some(device) = UVC_DEVICES.lock().get_mut(idx) {
-            device.capture_pump_running = false;
-        }
+        release_capture_pump(idx, generation);
     });
 }
 
 /// Continuously receive UVC payloads, reassemble frames, and enqueue them on
 /// the corresponding V4L2-style devfs node. The task sleeps in xHCI's event
 /// future between packets; it does not poll the controller in a spin loop.
-async fn pump_video_frames(idx: usize) -> Result<(), UvcError> {
+async fn pump_video_frames(idx: usize, generation: u64) -> Result<(), UvcError> {
     let controller = crate::xhci::controller().ok_or(UvcError::CaptureFailed)?;
-    pump_video_frames_with(idx, &*controller).await
+    pump_video_frames_with(idx, &*controller, generation).await
 }
 
-/// Transport-generic core of the capture pump.
+/// Lifecycle check for a capture pump running under `generation`:
+/// true when the pump must exit without delivering anything further.
+///
+/// Two retirement causes, one check: the pump's generation has been
+/// superseded by a newer activation (STREAMOFF → STREAMON while this
+/// pump was parked in a transfer), or STREAMOFF requested a stop for
+/// the pump's own, still-current generation. A stop request is
+/// consumed only by the pump it targets — a stale pump leaves it
+/// standing for the current generation's pump — and a stale pump
+/// touches no lifecycle state at all.
+fn take_pump_exit_request(idx: usize, generation: u64) -> bool {
+    let mut devices = UVC_DEVICES.lock();
+    let Some(device) = devices.get_mut(idx) else {
+        return true;
+    };
+    if device.stream_generation != generation {
+        return true;
+    }
+    if device.capture_stop_requested {
+        device.capture_stop_requested = false;
+        return true;
+    }
+    false
+}
+
+/// Transport-generic core of the capture pump, running under the
+/// stream `generation` it was spawned for.
 ///
 /// #808 seam: packet reception goes through the single
 /// [`UvcTransport::isoch_in`] call site in this loop — one packet
@@ -1347,12 +1418,19 @@ async fn pump_video_frames(idx: usize) -> Result<(), UvcError> {
 /// delivery; nothing here bakes in a single-shot assumption beyond
 /// that one call.
 ///
-/// The loop exits cleanly with `Ok(())` when STREAMOFF teardown sets
-/// `capture_stop_requested`; the flag is consumed here so a later
-/// STREAMON starts from a clean state.
+/// Lifecycle: the loop exits cleanly with `Ok(())` when
+/// [`take_pump_exit_request`] fires — checked at every loop top, and
+/// again after a frame completes, before it is delivered. The second
+/// check is load-bearing: the pump parks inside `isoch_in` with no
+/// timeout, so STREAMOFF (and a whole STREAMOFF → STREAMON toggle)
+/// can run while a packet is in flight; a frame that completes from
+/// such a packet belongs to a stream whose buffers were already
+/// reset, and delivering it would plant a stale frame in the fresh
+/// stream's queue.
 pub async fn pump_video_frames_with<T: UvcTransport>(
     idx: usize,
     transport: &T,
+    generation: u64,
 ) -> Result<(), UvcError> {
     let (slot_id, endpoint, video_node) = {
         let devices = UVC_DEVICES.lock();
@@ -1371,20 +1449,22 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
     let mut consecutive_errors = 0u8;
 
     loop {
-        {
-            let mut devices = UVC_DEVICES.lock();
-            if let Some(device) = devices.get_mut(idx) {
-                if device.capture_stop_requested {
-                    device.capture_stop_requested = false;
-                    return Ok(());
-                }
-            }
+        if take_pump_exit_request(idx, generation) {
+            return Ok(());
         }
         match transport.isoch_in(slot_id, endpoint.dci, &mut packet).await {
             Ok(received) if received != 0 => {
                 consecutive_errors = 0;
                 if reassembler.push(&packet[..received]) == ReassemblerOutcome::FrameComplete {
                     let frame = reassembler.take_frame();
+                    // The transfer that completed this frame may
+                    // have straddled STREAMOFF (or a whole stream
+                    // toggle): re-check before delivering, and drop
+                    // the frame rather than deliver it into the
+                    // successor stream's reset queues.
+                    if take_pump_exit_request(idx, generation) {
+                        return Ok(());
+                    }
                     let device = narf_drivers_video::devfs_bridge::get_device(video_node)
                         .ok_or(UvcError::CaptureFailed)?;
                     device.lock().deliver_frame(frame);

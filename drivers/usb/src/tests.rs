@@ -5090,6 +5090,44 @@ impl FixtureTransport {
     fn log(&self) -> Vec<FixtureXfer> {
         self.state.lock().log.clone()
     }
+
+    /// Stage a packet for the modelled device to source, as if it
+    /// arrived after the fixture was set up — including while a pump
+    /// is parked waiting for one.
+    fn stage_packet(&self, packet: Vec<u8>) {
+        self.state.lock().packets.push_back(packet);
+    }
+
+    /// Packets currently staged (consumed one per `isoch_in`).
+    fn pending_packets(&self) -> usize {
+        self.state.lock().packets.len()
+    }
+}
+
+/// A future that pends until the modelled device has a packet staged.
+///
+/// Real isochronous transfers complete only when the device sources a
+/// packet; on the silent alternate setting 0 a parked transfer may
+/// not resolve until the *next* stream starts. Modelling the park
+/// faithfully (rather than returning empty reads) is what lets the
+/// generation-toggle smoke hold a pump mid-await across
+/// STREAMOFF/STREAMON — the interleave the stream-generation
+/// protocol exists for. The fixture re-polls manually in place of the
+/// transfer-event wake.
+struct PacketStaged<'a> {
+    state: &'a IrqSafeSpinLock<FixtureState>,
+}
+
+impl Future for PacketStaged<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.state.lock().packets.is_empty() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
 }
 
 impl crate::uvc::UvcTransport for FixtureTransport {
@@ -5188,16 +5226,15 @@ impl crate::uvc::UvcTransport for FixtureTransport {
         _dci: u8,
         out: &mut [u8],
     ) -> Result<usize, crate::xhci::XhciError> {
+        // Park until the device sources a packet, like the real
+        // transfer: never an empty read.
+        PacketStaged { state: &self.state }.await;
         let mut state = self.state.lock();
         state.log.push(FixtureXfer::IsochIn);
-        match state.packets.pop_front() {
-            Some(packet) => {
-                let n = packet.len().min(out.len());
-                out[..n].copy_from_slice(&packet[..n]);
-                Ok(n)
-            }
-            None => Ok(0),
-        }
+        let packet = state.packets.pop_front().unwrap_or_default();
+        let n = packet.len().min(out.len());
+        out[..n].copy_from_slice(&packet[..n]);
+        Ok(n)
     }
 }
 
@@ -5512,7 +5549,12 @@ fn smoke_uvc_streamon_composition_e2e() -> TestResult {
     }
     // Drive the capture pump, interleaved with nonblocking DQBUF, until
     // the modelled frame lands in a queued buffer.
-    let mut pump = Box::pin(crate::uvc::pump_video_frames_with(idx, &*transport));
+    let generation = crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    let mut pump = Box::pin(crate::uvc::pump_video_frames_with(
+        idx,
+        &*transport,
+        generation,
+    ));
     let mut dequeued = false;
     for _ in 0..10_000 {
         let _ = fixture_poll(pump.as_mut());
@@ -5559,6 +5601,13 @@ fn smoke_uvc_streamon_composition_e2e() -> TestResult {
     if dev.lock().streaming {
         return TestResult::Fail("STREAMOFF should clear streaming");
     }
+    // The pump is parked in `isoch_in` (the modelled device sources
+    // nothing on alt 0), so stage one packet to wake it — the same
+    // wake the next stream's traffic would give it on hardware. The
+    // frame it completes belongs to the stopped stream: the pump
+    // must drop it at the pre-delivery lifecycle check, not deliver
+    // it into the reset queues, and exit cleanly.
+    transport.stage_packet(alloc::vec![2u8, 0x83, b'W', b'A', b'K', b'E', b'!']);
     // The pump observes the stop request and exits cleanly.
     let mut pump_done = None;
     for _ in 0..10_000 {
@@ -5736,3 +5785,285 @@ kernel_test_in!(
     "drivers/usb/uvc",
     smoke_uvc_streamon_activation_failure_unwinds
 );
+
+// ── Generation-toggle fixture helpers ─────────────────────────────
+
+/// Poll a hand-driven future until it completes; `None` = still
+/// pending after the poll budget (a fixture failure, never a hang).
+fn fixture_poll_until_ready<F: Future>(mut fut: Pin<&mut F>) -> Option<F::Output> {
+    for _ in 0..10_000 {
+        if let Poll::Ready(v) = fixture_poll(fut.as_mut()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// QBUF both capture buffers (STREAMOFF returns them to the
+/// dequeued state, so a fresh stream needs them re-queued).
+fn fixture_qbuf_all(
+    dev: &FixtureDevice,
+    events: &FixtureEvents,
+    ctx: &FixtureCtx,
+) -> Result<(), &'static str> {
+    for index in 0..2u32 {
+        ctx.put_u32(0, index);
+        ctx.put_u32(4, 1);
+        ctx.put_u32(60, 1);
+        if fixture_ioctl(dev, events, ctx, fixture_ioc(3, 15, 88))? != 0 {
+            return Err("QBUF should succeed");
+        }
+    }
+    Ok(())
+}
+
+/// Outcome of one nonblocking DQBUF against the fixture device.
+enum FixtureDqbuf {
+    Frame(Vec<u8>),
+    Again,
+    Failed(&'static str),
+}
+
+fn fixture_dqbuf(dev: &FixtureDevice, events: &FixtureEvents, ctx: &FixtureCtx) -> FixtureDqbuf {
+    ctx.put_u32(4, 1);
+    ctx.put_u32(60, 1);
+    match fixture_ioctl(dev, events, ctx, fixture_ioc(3, 17, 88)) {
+        Ok(0) => {}
+        Ok(r) if r == fixture_eno(11) => return FixtureDqbuf::Again,
+        Ok(_) => return FixtureDqbuf::Failed("DQBUF should succeed or EAGAIN"),
+        Err(e) => return FixtureDqbuf::Failed(e),
+    }
+    let index = ctx.get_u32(0) as usize;
+    let used = ctx.get_u32(8) as usize;
+    if used > 4096 {
+        return FixtureDqbuf::Failed("DQBUF reported an implausible bytesused");
+    }
+    let bytes = {
+        let g = dev.lock();
+        let f0 = g.buffers[index].frames[0];
+        let p = f0.start_address().kernel_ptr::<u8>();
+        let mut buf = alloc::vec![0u8; used];
+        // SAFETY: f0 is an allocated frame owned by the dequeued
+        // buffer; its direct-map pointer is valid for the `used`
+        // bytes the V4L2 layer recorded from the delivered frame.
+        unsafe { core::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), used) };
+        buf
+    };
+    FixtureDqbuf::Frame(bytes)
+}
+
+/// One UVC payload packet: 2-byte header (length, `flags`) + payload.
+fn uvc_fixture_packet(flags: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = alloc::vec![2u8, flags];
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// The stream-generation protocol under a STREAMOFF → STREAMON
+/// toggle, driven at the state-machine level with faithfully parked
+/// pumps. This is the interleave the composition e2e cannot see: its
+/// modelled transport used to answer empty reads immediately, so its
+/// pump always observed teardown at a loop top before STREAMOFF
+/// returned. Here `isoch_in` parks like hardware, so a pump can be
+/// held mid-await across the whole toggle.
+///
+/// Phase A (stale delivery): a frame in flight across STREAMOFF
+/// completes only after the buffer reset; the pump must drop it at
+/// the pre-delivery check, and it must not surface in the next
+/// stream's queue.
+///
+/// Phase B (the wedge): STREAMON for generation 2, park its pump,
+/// STREAMOFF, STREAMON for generation 3. The pump claim must succeed
+/// for generation 3 despite the generation-2 pump still being marked
+/// (the old boolean protocol declined the spawn here and left the
+/// device streaming with no pump — a silent black stream). The
+/// parked pump then wakes on the new stream's packets, exits without
+/// delivering and without consuming generation-3 state, and its
+/// exit bookkeeping must not clear the generation-3 pump's mark.
+fn smoke_uvc_streamon_generation_toggle() -> TestResult {
+    let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(false, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let stream_generation = |idx: usize| crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    let pump_mark = |idx: usize| crate::uvc::UVC_DEVICES.lock()[idx].capture_pump_generation;
+
+    // ── Phase A: in-flight frame across STREAMOFF is dropped ─────
+    if fixture_streamon(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMON (gen 1) should succeed");
+    }
+    if stream_generation(idx) != 1 {
+        return TestResult::Fail("first activation should bump the stream generation to 1");
+    }
+    // Mirror the production spawn wrapper: claim, then drive the
+    // pump by hand.
+    if crate::uvc::claim_capture_pump(idx) != Some(1) {
+        return TestResult::Fail("pump claim for generation 1 should succeed");
+    }
+    let mut pump1 = Box::pin(crate::uvc::pump_video_frames_with(idx, &*transport, 1));
+    // The bind staged one frame (UVC-E2E-FRAME!): pump it to DQBUF.
+    let mut frame_a = None;
+    for _ in 0..10_000 {
+        let _ = fixture_poll(pump1.as_mut());
+        match fixture_dqbuf(&dev, &events, &ctx) {
+            FixtureDqbuf::Frame(bytes) => {
+                frame_a = Some(bytes);
+                break;
+            }
+            FixtureDqbuf::Again => continue,
+            FixtureDqbuf::Failed(e) => return TestResult::Fail(e),
+        }
+    }
+    if frame_a.as_deref() != Some(b"UVC-E2E-FRAME!".as_slice()) {
+        return TestResult::Fail("gen-1 pump should deliver the staged frame");
+    }
+    // Start a second gen-1 frame (FID flips to 0) but stage only its
+    // first packet: the frame is in flight, straddling the STREAMOFF.
+    transport.stage_packet(uvc_fixture_packet(0x80, b"STALE-"));
+    for _ in 0..1_000 {
+        if transport.pending_packets() == 0 {
+            break;
+        }
+        let _ = fixture_poll(pump1.as_mut());
+    }
+    if transport.pending_packets() != 0 {
+        return TestResult::Fail("gen-1 pump should consume the in-flight packet");
+    }
+    if !matches!(fixture_dqbuf(&dev, &events, &ctx), FixtureDqbuf::Again) {
+        return TestResult::Fail("the in-flight frame must not be delivered before EOF");
+    }
+    // STREAMOFF: stop requested for gen 1, buffers reset. The pump
+    // is parked in `isoch_in`, waiting for the frame's second packet.
+    if fixture_streamoff(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMOFF (gen 1) should succeed");
+    }
+    // The frame completes *after* the reset. The pump wakes, hits the
+    // pre-delivery lifecycle check, drops it, and exits.
+    transport.stage_packet(uvc_fixture_packet(0x82, b"FRAME"));
+    match fixture_poll_until_ready(pump1.as_mut()) {
+        Some(Ok(())) => {}
+        _ => {
+            return TestResult::Fail("gen-1 pump should exit Ok once its in-flight frame resolves")
+        }
+    }
+    // Mirror the wrapper's exit bookkeeping.
+    crate::uvc::release_capture_pump(idx, 1);
+    if pump_mark(idx) != 0 {
+        return TestResult::Fail("a current-generation pump's exit should clear the pump mark");
+    }
+
+    // ── Phase B: the toggle must not wedge ───────────────────────
+    if fixture_qbuf_all(&dev, &events, &ctx).is_err() {
+        return TestResult::Fail("QBUF before gen-2 STREAMON should succeed");
+    }
+    if fixture_streamon(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMON (gen 2) should succeed");
+    }
+    if stream_generation(idx) != 2 {
+        return TestResult::Fail("second activation should bump the stream generation to 2");
+    }
+    // The stale gen-1 frame was dropped, not left for this stream:
+    // DQBUF on the fresh stream must find nothing.
+    if !matches!(fixture_dqbuf(&dev, &events, &ctx), FixtureDqbuf::Again) {
+        return TestResult::Fail("the stale gen-1 frame must not surface in the gen-2 stream");
+    }
+    if crate::uvc::claim_capture_pump(idx) != Some(2) {
+        return TestResult::Fail("pump claim for generation 2 should succeed");
+    }
+    let mut pump2 = Box::pin(crate::uvc::pump_video_frames_with(idx, &*transport, 2));
+    // Park the gen-2 pump mid-await: no packets staged, every poll
+    // pends inside `isoch_in`.
+    let mut parked = true;
+    for _ in 0..16 {
+        if !matches!(fixture_poll(pump2.as_mut()), Poll::Pending) {
+            parked = false;
+        }
+    }
+    if !parked {
+        return TestResult::Fail("gen-2 pump should be parked in isoch_in with nothing staged");
+    }
+    // The format-change toggle: STREAMOFF, then STREAMON again —
+    // while the gen-2 pump is still parked and still marked.
+    if fixture_streamoff(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMOFF (gen 2) should succeed");
+    }
+    if pump_mark(idx) != 2 {
+        return TestResult::Fail("the parked gen-2 pump should still be marked before gen 3");
+    }
+    if fixture_qbuf_all(&dev, &events, &ctx).is_err() {
+        return TestResult::Fail("QBUF before gen-3 STREAMON should succeed");
+    }
+    if fixture_streamon(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMON (gen 3) should succeed");
+    }
+    if stream_generation(idx) != 3 {
+        return TestResult::Fail("third activation should bump the stream generation to 3");
+    }
+    // THE wedge pin: a pump for the new generation must be claimable
+    // even though the gen-2 pump never exited.
+    if crate::uvc::claim_capture_pump(idx) != Some(3) {
+        return TestResult::Fail(
+            "pump claim for generation 3 must not be declined for a stale pump",
+        );
+    }
+    let mut pump3 = Box::pin(crate::uvc::pump_video_frames_with(idx, &*transport, 3));
+    // The new stream's first traffic wakes the parked gen-2 pump (a
+    // sacrificial errored packet stands in for it). It must exit on
+    // the generation check — delivering nothing, consuming nothing
+    // of generation 3's lifecycle state.
+    transport.stage_packet(uvc_fixture_packet(0xC1, b"X"));
+    match fixture_poll_until_ready(pump2.as_mut()) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("gen-2 pump should exit Ok when woken by gen-3 traffic"),
+    }
+    if !matches!(fixture_dqbuf(&dev, &events, &ctx), FixtureDqbuf::Again) {
+        return TestResult::Fail("the stale gen-2 pump must not deliver into the gen-3 stream");
+    }
+    // Its exit bookkeeping (wrapper mirror) must not clear the
+    // generation-3 pump's mark.
+    crate::uvc::release_capture_pump(idx, 2);
+    if pump_mark(idx) != 3 {
+        return TestResult::Fail("a stale pump's exit must not clear its successor's mark");
+    }
+    // The gen-3 pump delivers the gen-3 frame.
+    transport.stage_packet(uvc_fixture_packet(0x81, b"GEN3-"));
+    transport.stage_packet(uvc_fixture_packet(0x83, b"FRAME"));
+    let mut frame_3 = None;
+    for _ in 0..10_000 {
+        let _ = fixture_poll(pump3.as_mut());
+        match fixture_dqbuf(&dev, &events, &ctx) {
+            FixtureDqbuf::Frame(bytes) => {
+                frame_3 = Some(bytes);
+                break;
+            }
+            FixtureDqbuf::Again => continue,
+            FixtureDqbuf::Failed(e) => return TestResult::Fail(e),
+        }
+    }
+    if frame_3.as_deref() != Some(b"GEN3-FRAME".as_slice()) {
+        return TestResult::Fail("gen-3 pump should deliver the gen-3 frame");
+    }
+    // Final state: streaming, generation 3, exactly the gen-3 pump
+    // marked alive.
+    if !dev.lock().streaming {
+        return TestResult::Fail("device should still be streaming after the toggle");
+    }
+    if stream_generation(idx) != 3 || pump_mark(idx) != 3 {
+        return TestResult::Fail("exactly the gen-3 pump should be marked after the toggle");
+    }
+    // Cleanup: STREAMOFF + a wake packet retires the gen-3 pump.
+    if fixture_streamoff(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("final STREAMOFF should succeed");
+    }
+    transport.stage_packet(uvc_fixture_packet(0x83, b"DONE!"));
+    match fixture_poll_until_ready(pump3.as_mut()) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("gen-3 pump should exit Ok after the final STREAMOFF"),
+    }
+    crate::uvc::release_capture_pump(idx, 3);
+    if pump_mark(idx) != 0 {
+        return TestResult::Fail("pump mark should be clear after the final exit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_generation_toggle);
