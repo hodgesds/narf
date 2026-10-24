@@ -3,9 +3,10 @@
 //! Each PCIe driver registers a `PciMatch` describing which devices
 //! it claims (by exact `(vendor, device)`, by class triple, or by
 //! vendor-only) plus a probe function. At boot, a TCB-trusted entry
-//! point — `probe_all` — walks `bus::devices()`, finds the first
-//! match for each device, mints a `Cap<BusDeviceCap, Write>`, and
-//! invokes the probe.
+//! point — `probe_all` — walks `bus::devices()`, orders each
+//! device's matches by specificity, mints a `Cap<BusDeviceCap,
+//! Write>` per attempt, and invokes the probes in order until one
+//! binds the device or the candidates run out.
 //!
 //! This is the bus-level analogue of Linux's `pci_driver` table +
 //! `pci_register_driver`. It's distinct from `narf_drivers::Driver`,
@@ -45,8 +46,9 @@ pub enum ProbeError {
     /// this instead of `BadDevice` keeps the probe trace clean —
     /// `probe_log` skips this variant so a real-HW boot doesn't get
     /// flooded with `BadDevice` lines for every cross-vendor class
-    /// match. Not a failure in any meaningful sense; a more
-    /// specific match should pick the device up.
+    /// match. Not a failure in any meaningful sense: the dispatcher
+    /// returns the device to the candidate list and attempts the
+    /// next-most-specific match (bus spec §9.3).
     NotForThisDriver,
     /// Generic free-form error message — useful when a probe wants to
     /// surface a one-line reason without a typed variant.
@@ -186,14 +188,25 @@ pub fn count() -> usize {
     REGISTRY.lock().len()
 }
 
-/// Walk every device in the bus registry, find the highest-specificity
-/// matching `PciMatch`, mint a `Cap<BusDeviceCap, Write>`, and invoke
-/// the probe. Returns the count of probes that returned `Ok(())`.
+/// Walk every device in the bus registry and bind a driver to it.
 ///
-/// Probes that error are logged via `log_probe_failure` (Wave 3a stub)
-/// and the walk continues. A device with no matching driver is
-/// silently skipped — drivers can be loaded later, and a re-run of
-/// `probe_all` will pick it up.
+/// For each device, the matching `PciMatch` entries form a
+/// candidate list ordered by specificity — highest first,
+/// registration order breaking ties (bus spec §9.2). Candidates
+/// are attempted in order, each with a freshly minted
+/// `Cap<BusDeviceCap, Write>`: a probe returning `Ok(())` binds
+/// the device; a probe returning `Err(ProbeError::NotForThisDriver)`
+/// declines it, and the next-most-specific candidate is attempted
+/// (bus spec §9.3); any other error is logged via
+/// `log_probe_failure` (Wave 3a stub) and ends the attempts for
+/// that device — the driver engaged the hardware and failed, so
+/// handing the same device to a second driver in the same walk
+/// is not arbitrated (bus spec §9.3). Returns the count of
+/// devices bound by a successful probe.
+///
+/// A device with no matching driver is silently skipped —
+/// drivers can be loaded later, and a re-run of `probe_all`
+/// will pick it up.
 pub fn probe_all(
     authority: &Cap<BusRegistryCap, Grant>,
 ) -> Result<u32, narf_capabilities::CapError> {
@@ -203,57 +216,61 @@ pub fn probe_all(
     let mut bound = 0u32;
 
     for d in &devs {
-        // Find the most specific matching driver.
-        let mut best: Option<&PciMatch> = None;
-        for m in &drivers {
-            if m.kind.matches(d) {
-                best = Some(match best {
-                    None => m,
-                    Some(prev) if m.kind.specificity() > prev.kind.specificity() => m,
-                    Some(prev) => prev,
-                });
-            }
-        }
-        let Some(m) = best else {
-            continue;
-        };
+        // Candidate matches in arbitration order. `sort_by_key`
+        // is stable, so equal-specificity candidates keep their
+        // registration order — the pre-existing tie behaviour.
+        let mut candidates: Vec<&PciMatch> = drivers.iter().filter(|m| m.kind.matches(d)).collect();
+        candidates.sort_by_key(|m| core::cmp::Reverse(m.kind.specificity()));
 
-        // Mint the per-device cap. We're inside a TCB-trusted
-        // entry point (probe_all itself is cap-gated), so calling
-        // claim_device_cap with our authority is the canonical
-        // path.
-        let (_handle, cap) = match claim_device_cap(authority, d.addr) {
-            Ok(ok) => ok,
-            Err(e) => {
-                let _ = e;
-                continue;
+        for m in candidates {
+            // Mint the per-device cap. We're inside a TCB-trusted
+            // entry point (probe_all itself is cap-gated), so calling
+            // claim_device_cap with our authority is the canonical
+            // path. A fresh cap per attempt: a declining probe drops
+            // its cap unconsumed, exactly as a failed probe did when
+            // only the best match was attempted.
+            let (_handle, cap) = match claim_device_cap(authority, d.addr) {
+                Ok(ok) => ok,
+                Err(e) => {
+                    let _ = e;
+                    break;
+                }
+            };
+            // Per-device probe trace through the optional `LogHook`.
+            // Off by default; the kernel-test runner / bring-up
+            // path enables it via `set_probe_log` to localise hangs
+            // inside an individual driver's probe.
+            let _name = m.name;
+            let _vid = d.id.vendor;
+            let _did = d.id.device;
+            if PROBE_LOG.load(core::sync::atomic::Ordering::Acquire) {
+                probe_log(_name, _vid, _did, /*pre=*/ true, None);
             }
-        };
-        // Per-device probe trace through the optional `LogHook`.
-        // Off by default; the kernel-test runner / bring-up
-        // path enables it via `set_probe_log` to localise hangs
-        // inside an individual driver's probe.
-        let _name = m.name;
-        let _vid = d.id.vendor;
-        let _did = d.id.device;
-        if PROBE_LOG.load(core::sync::atomic::Ordering::Acquire) {
-            probe_log(_name, _vid, _did, /*pre=*/ true, None);
-        }
-        let result = (m.probe)(*d, cap);
-        if PROBE_LOG.load(core::sync::atomic::Ordering::Acquire) {
-            // NotForThisDriver = class-backstop saw a device the
-            // driver isn't responsible for. Suppress the post-call
-            // log line so the trace stays useful on real HW where
-            // every VGA / NIC / class-matched device would otherwise
-            // emit a `BadDevice`-flavour line per backstop.
-            if !matches!(result, Err(ProbeError::NotForThisDriver)) {
-                let err_dbg: Option<ProbeError> = result.err();
-                probe_log(_name, _vid, _did, /*pre=*/ false, err_dbg);
+            let result = (m.probe)(*d, cap);
+            if PROBE_LOG.load(core::sync::atomic::Ordering::Acquire) {
+                // NotForThisDriver = class-backstop saw a device the
+                // driver isn't responsible for. Suppress the post-call
+                // log line so the trace stays useful on real HW where
+                // every VGA / NIC / class-matched device would otherwise
+                // emit a `BadDevice`-flavour line per backstop.
+                if !matches!(result, Err(ProbeError::NotForThisDriver)) {
+                    let err_dbg: Option<ProbeError> = result.err();
+                    probe_log(_name, _vid, _did, /*pre=*/ false, err_dbg);
+                }
             }
-        }
-        match result {
-            Ok(()) => bound += 1,
-            Err(e) => log_probe_failure(m, d, e),
+            match result {
+                Ok(()) => {
+                    bound += 1;
+                    break;
+                }
+                // Declined: return the device to the candidate
+                // list and attempt the next-most-specific match.
+                Err(ProbeError::NotForThisDriver) => continue,
+                Err(e) => {
+                    log_probe_failure(m, d, e);
+                    break;
+                }
+            }
         }
     }
     Ok(bound)

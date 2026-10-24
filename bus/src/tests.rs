@@ -2745,3 +2745,143 @@ fn smoke_recovery_no_driver_blocks_subtree() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus/pcie_aer", smoke_recovery_no_driver_blocks_subtree);
+
+// ---------------------------------------------------------------------------
+// SDHCI arbitration fixture (issue #824). The real pair this mirrors:
+// the SDIO stack registers ClassFull 08:05:00 (specificity 2) and
+// can only tell at probe time — from the card behind the host
+// controller — whether the host is its to drive, while the storage
+// SDHCI driver registers a class-08 backstop (specificity 1).
+// Before the fix, probe_all attempted only the single best match:
+// the SDIO stack claimed empty hosts vacuously and terminally
+// failed memory-card hosts, so the storage driver never ran and
+// every SD slot was dead. The fixture pins bus spec §9.3 in both
+// directions: an SDIO card stays with SDIO; a decline falls
+// through to the next-most-specific candidate.
+
+/// What sits behind the synthetic host controller.
+static ARB_SDIO_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Attempt-order tickets: each mirror probe stamps its slot with
+/// the next sequence number, so the test can assert who was
+/// attempted, and in which order.
+static ARB_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static ARB_SDIO_TICKET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static ARB_STORAGE_TICKET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+const ARB_MODE_SDIO_CARD: u8 = 0;
+const ARB_MODE_MEMORY_CARD: u8 = 1;
+const ARB_MODE_EMPTY_SLOT: u8 = 2;
+
+fn arb_ticket(slot: &core::sync::atomic::AtomicU32) {
+    use core::sync::atomic::Ordering;
+    slot.store(ARB_SEQ.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+}
+
+/// Mirror of the SDIO stack's probe contract: bind only when the
+/// card behind the host is an SDIO card; decline memory cards and
+/// empty slots so arbitration can fall through to storage.
+fn arb_sdio_probe(
+    _device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::driver_match::ProbeError> {
+    use core::sync::atomic::Ordering;
+    arb_ticket(&ARB_SDIO_TICKET);
+    match ARB_SDIO_MODE.load(Ordering::SeqCst) {
+        ARB_MODE_SDIO_CARD => Ok(()),
+        _ => Err(crate::driver_match::ProbeError::NotForThisDriver),
+    }
+}
+
+/// Mirror of the storage SDHCI probe: binds any SD host
+/// controller it is offered.
+fn arb_storage_probe(
+    _device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::driver_match::ProbeError> {
+    arb_ticket(&ARB_STORAGE_TICKET);
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_probe_all_sdhci_arbitration() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    use crate::driver_match::{__reset_for_test, probe_all, MatchKind, PciMatch};
+    use crate::registry::{bootstrap_registry_authority, install};
+
+    let _restore = RegistryRestore::capture();
+
+    // Hermetic match table, mirroring the real registrations and
+    // their real order (the SDIO stack registers before storage).
+    __reset_for_test();
+    crate::driver_match::register(PciMatch {
+        name: "arb-sdio",
+        kind: MatchKind::ClassFull {
+            class: 0x08,
+            subclass: 0x05,
+            prog_if: 0x00,
+        },
+        probe: arb_sdio_probe,
+    });
+    crate::driver_match::register(PciMatch {
+        name: "arb-storage",
+        kind: MatchKind::Class {
+            class: 0x08,
+            mask: 0xFF,
+        },
+        probe: arb_storage_probe,
+    });
+
+    // One synthetic SD host controller (PCI class 08:05:00). The
+    // cfg_phys is never dereferenced: both mirror probes are pure,
+    // and claim_device_cap is a registry lookup.
+    let addr = crate::addr::PcieAddr::new(0, 0x7f, 0, 0);
+    install(alloc::vec![crate::BusDevice {
+        addr: crate::addr::BusAddr::Pcie(addr),
+        id: crate::DeviceId {
+            vendor: 0x8086,
+            device: 0x9c35,
+            class: 0x080500,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: crate::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    }]);
+
+    let authority = bootstrap_registry_authority();
+
+    for (mode, want_storage) in [
+        (ARB_MODE_SDIO_CARD, false),
+        (ARB_MODE_MEMORY_CARD, true),
+        (ARB_MODE_EMPTY_SLOT, true),
+    ] {
+        ARB_SDIO_MODE.store(mode, Ordering::SeqCst);
+        ARB_SEQ.store(0, Ordering::SeqCst);
+        ARB_SDIO_TICKET.store(0, Ordering::SeqCst);
+        ARB_STORAGE_TICKET.store(0, Ordering::SeqCst);
+        let bound = match probe_all(&authority) {
+            Ok(n) => n,
+            Err(_) => return TestResult::Fail("probe_all lost the bootstrap authority"),
+        };
+        if bound != 1 {
+            return TestResult::Fail("arbitration bound != 1 driver for the SD host");
+        }
+        let sdio_ticket = ARB_SDIO_TICKET.load(Ordering::SeqCst);
+        let storage_ticket = ARB_STORAGE_TICKET.load(Ordering::SeqCst);
+        if sdio_ticket == 0 {
+            return TestResult::Fail("SDIO candidate was not attempted first");
+        }
+        if want_storage {
+            if storage_ticket == 0 || storage_ticket < sdio_ticket {
+                return TestResult::Fail("declined SD host never fell through to storage");
+            }
+        } else if storage_ticket != 0 {
+            return TestResult::Fail("storage backstop attempted after SDIO bound the host");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_pci_probe_all_sdhci_arbitration);
