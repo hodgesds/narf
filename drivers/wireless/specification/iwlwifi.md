@@ -94,6 +94,39 @@ acceptance gates and are not enabled by this profile's station tests.
   scan, station association and IP-traffic acceptance. Software tests
   exercise these contracts without emulating the Intel radio.
 
+### Native deferred firmware admission
+
+`probe` retains the exact accepted Gen3 BDF/device/current PCI cap before initial
+parking and schedules the same startup owner; it does not resolve firmware during
+Stage::Device. Executor-time resolution follows the normal Stage::Late firmware
+scan. Retry remains closed in Parking until the initial command-register
+readback succeeds; a concurrent caller cannot race that transition. `provision_state()` reports Parking/Parked/Starting/Ready/Failed, and
+`provision().await` retries newly staged inputs only while Parked. Missing authority,
+missing images or invalid source/container inputs leave the same binding parked;
+cancellation while waiting for its async mutex cannot consume an attempt. Initial
+parking failure, or failure/cancellation after the first mapped/runtime startup
+attempt, remains terminal without reconstructing a native owner.
+
+The existing filename ladder and highest-present-image semantics remain exact:
+absent candidates may fall through, while a present invalid image fails. Registry
+lookup and bounded firmware/sibling-PNVM byte copies occur inside current registry
+and blob `Cap::invoke` operations. All TLV parsing uses owned copied bytes; no
+borrowed registry view escapes invocation. Source epochs are checked again before
+starting the actual native `Hardware`/`Device` lifecycle. Optional external PNVM
+retains its existing firmware/SKU requirement; unsupported command/profile gates
+remain unchanged. Existing Gen2 boot/passive/peer owners are separate and native
+MVM station publication stays disabled.
+
+The retained startup stores the exact initialized `Arc<Device>` before pump/netdev
+publication, and the wireless registry receives that same Arc. Missing host policy
+retains the previous receive/firmware behavior; active scan and association still
+bootstrap authenticated policy and fail closed. Real signed registry fixtures cover
+assets staged after the first attempt, a cancelled pre-attempt waiter, exact
+firmware/PNVM copies, present-invalid ladder refusal, and actual PCI/source epoch
+revocation before deliberately invalid ECAM or native startup publication. The
+minimal test TLV contains no executable firmware and never crosses a valid native
+PCI boundary.
+
 ### 3.0 Sc station composition evidence
 
 The retained Sc c103 profile now composes the real post-INIT `Device` owner,
@@ -400,6 +433,12 @@ This is a firmware table-ownership prerequisite, with the link inactive and
 transmit disabled. Active station PHY/link, management, rate/key/BA/security,
 authenticated platform power/SAR, recovery and native Gen2 publication remain
 software work.
+
+Physical carrier/peer publication does not change operator `IFF_UP` and never
+invokes administrative open/stop hooks while retained driver state is locked.
+Explicit registration, operator up/down and autoconnect remain administrative
+events. Disconnect/failure clears carrier and peer identity while preserving an
+operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
 ## 4. References
 

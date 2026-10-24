@@ -427,6 +427,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 }
                 Phase::FourWay | Phase::Open => {
                     if let Some(security) = &mut self.security {
+                        let handshake_active = security.handshake_active();
                         let environment = &self.environment;
                         let initial = &mut self.initial_nonce;
                         match security.receive_with_nonce(&frame, || {
@@ -446,7 +447,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                                 }
                             }
                             station_security::Rx::ReplyReady => {
-                                if self.established {
+                                if self.established && !handshake_active {
                                     self.deadline = now.saturating_add(5000);
                                 }
                             }
@@ -495,7 +496,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         && self
                             .security
                             .as_ref()
-                            .is_some_and(|security| security.pending_frame().is_some())
+                            .is_some_and(Security::handshake_active)
             } else {
                 now >= self.deadline
             };

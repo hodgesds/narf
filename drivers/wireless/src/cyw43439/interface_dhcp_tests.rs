@@ -192,9 +192,9 @@ impl Harness {
             tx: IrqSafeSpinLock::new(Some(tx_producer)),
         });
         *ACTIVE_TEST.lock() = Some(device.clone());
-        narf_net::iface::set_link_state(&name, false);
-        // Install the same dispatch pointer as production without re-running
-        // stack initialization or registering another netfilter/timer hook.
+        narf_net::iface::set_link_state(&name, true); // operator IFF_UP
+                                                      // Install the same dispatch pointer as production without re-running
+                                                      // stack initialization or registering another netfilter/timer hook.
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
         Ok(Self { device, bus, name })
@@ -236,6 +236,12 @@ impl Harness {
         {
             return Err("CYW composition did not authorize the connected port");
         }
+        narf_net::iface::set_link_state(&self.name, false);
+        self.device.drain();
+        if narf_net::iface::lookup(&self.name).is_none_or(|iface| iface.link_up || !iface.carrier) {
+            return Err("CYW physical carrier overwrote operator DOWN");
+        }
+        narf_net::iface::set_link_state(&self.name, true);
         Ok(())
     }
 
@@ -277,7 +283,8 @@ fn composition(secured: bool) -> Result<(), &'static str> {
         b"cyw-a2-uplink",
     );
     if harness.device.link_up()
-        || narf_net::iface::lookup(&harness.name).is_none_or(|iface| iface.link_up || iface.carrier)
+        || narf_net::iface::lookup(&harness.name)
+            .is_none_or(|iface| !iface.link_up || iface.carrier)
         || harness.device.enqueue(&uplink).is_ok()
         || narf_net::dhcp::acquire(&harness.name, 0).is_ok()
         || !harness.bus.ap.lock().uplink.is_empty()
@@ -348,7 +355,7 @@ fn composition(secured: bool) -> Result<(), &'static str> {
         || harness.bus.ap.lock().uplink.len() != tx_before
         || harness.received(&downlink)
         || narf_net::iface::lookup(&harness.name).is_none_or(|iface| {
-            iface.link_up
+            !iface.link_up
                 || iface.carrier
                 || iface.stats.rx_packets != rx_before_loss
                 || iface.carrier_changes != 2
@@ -426,7 +433,7 @@ fn disconnect_overrides_waiting_old_publisher() -> Result<(), &'static str> {
         || h.device.enqueue(&probe).is_ok()
         || narf_net::iface::send_on(&h.name, &probe).is_ok()
         || narf_net::iface::lookup(&h.name).is_none_or(|i| {
-            i.link_up || i.carrier || i.carrier_up_count != 2 || i.carrier_down_count != 2
+            !i.link_up || i.carrier || i.carrier_up_count != 2 || i.carrier_down_count != 2
         })
         || !h.bus.ap.lock().uplink.is_empty()
     {

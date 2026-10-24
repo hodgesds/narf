@@ -38,7 +38,11 @@ TX/RX IQ coefficients only after successful completion. `Owner::factory()` retur
 and calibration snapshot. `initialize_device(blob)` runs the production
 factory/FIFO/firmware/table/calibration sequence for authenticated-byte owners/tests.
 The firmware-only `initialize(blob)` remains a diagnostic entry point.
-A second attempt returns `AlreadyStarted` without I/O. Dropping an
+Registered-source lookup/copy/header parsing finishes before the atomic hardware
+attempt begins. Missing, revoked or invalid staged inputs leave Detected retryable
+without USB requests; a later valid installation continues the same owner. Once
+hardware has begun, a second attempt returns `AlreadyStarted` before any new
+registry lookup or I/O. Dropping an
 active attempt records `Cancelled`; it cannot silently replay. Deadline,
 transport errors (including ambiguous xHCI errors) and cancellation poison the
 one-shot owner: no cleanup read/write, retry, or other EP0 operation follows.
@@ -47,8 +51,12 @@ lifecycle; a new software owner alone is insufficient.
 
 Image validation requires the complete 32-byte little-endian RTL8188E header,
 signature family `0x88e0`, nonempty exact `ramcodesize` and at most eight 4 KiB
-pages. Validation/unsupported-family failures occur before USB. Registry bytes
-are validated and copied into owned storage before awaiting USB transfers.
+pages. Validation/unsupported-family failures occur before USB. Registry lookup and the bounded owned copy occur inside actual current registry
+and firmware-blob capability invocations; pure image parsing and USB awaits use
+only that owned storage. No borrowed blob view escapes invocation. Signed board
+qualification uses the same current lookup/copy boundary, retaining its existing
+mandatory signer and exact factory/VID/PID binding. Executable developer policy
+remains the firmware registry/build contract.
 
 `ControlIo` provides configuration-descriptor reads, async exact-count
 register reads/writes and delay; `UsbControl`
@@ -266,6 +274,12 @@ the WPA2 controlled port only through retained shared RSNA.
 
 Legacy synchronous stripped-payload loading returns `UseAsyncOwner`; the old
 unverified all-radio helper returns `NotImplemented` before transport access.
+
+Physical carrier/peer publication does not change operator `IFF_UP` and never
+invokes administrative open/stop hooks while retained driver state is locked.
+Explicit registration, operator up/down and autoconnect remain administrative
+events. Disconnect/failure clears carrier and peer identity while preserving an
+operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
 ## 4. Invariants
 

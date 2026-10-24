@@ -580,6 +580,7 @@ impl Guard {
         *ACTIVE.lock() = Some(device.clone());
         *HARNESS.lock() = Some((device.clone(), wire));
         narf_net::iface::register(device.name(), OWN, send_frame);
+        narf_net::iface::set_link_state(device.name(), true); // operator IFF_UP
         device.set_link(false);
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
@@ -693,7 +694,7 @@ fn carrier(device: &Device, expected: bool) -> R {
     require(
         device.link_up() == expected
             && narf_net::iface::lookup(device.name())
-                .is_some_and(|iface| iface.carrier == expected),
+                .is_some_and(|iface| iface.link_up && iface.carrier == expected),
         "Sc owner/registered carrier mismatch",
     )
 }
@@ -721,6 +722,18 @@ fn composition(secured: bool) -> R {
     )?
     .map_err(|_| "Sc native association failed")?;
     carrier(device, true)?;
+    narf_net::iface::set_link_state(device.name(), false);
+    // This is the same production physical publication used by station
+    // activation, under the retained owner lock just as on native progress.
+    {
+        let _owner = device.state.try_lock().unwrap();
+        device.set_link(true);
+    }
+    require(
+        narf_net::iface::lookup(device.name()).is_some_and(|iface| !iface.link_up && iface.carrier),
+        "Sc physical carrier overwrote operator DOWN",
+    )?;
+    narf_net::iface::set_link_state(device.name(), true);
     require(
         device.connected_bssid() == Some(AP),
         "Sc association BSSID publication",
@@ -1057,7 +1070,7 @@ fn smoke_sc_disconnect_overrides_waiting_old_link_publication() -> TestResult {
         require(
             device.connected_bssid().is_none()
                 && narf_net::iface::lookup(device.name()).is_some_and(|i| {
-                    !i.link_up && i.carrier_up_count == 2 && i.carrier_down_count == 2
+                    i.link_up && i.carrier_up_count == 2 && i.carrier_down_count == 2
                 }),
             "Sc old publisher reopened cached peer after completed disconnect",
         )?;

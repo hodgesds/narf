@@ -177,7 +177,7 @@ unsafe impl Io for Model {
         }
     }
 }
-fn firmware() -> Vec<u8> {
+pub(super) fn firmware() -> Vec<u8> {
     let mut bytes = vec![0; 64 + 9 + 9];
     bytes[..2].copy_from_slice(&[0x22, 0x88]);
     for (offset, value) in [

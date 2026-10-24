@@ -229,6 +229,13 @@ another executor task. IRQ throughput and power management are separate profiles
   versions. `Files` supplies owned immutable bytes; production uses
   capability-authorized verified firmware-registry blobs. The highest
   present API is parsed; a malformed present blob fails explicitly.
+- Production `RegistryFiles::load` invokes both registry lookup and bounded
+  blob copying under the actual current capabilities; only owned vectors reach
+  firmware/board parsers and BMI work. `board.bin` and `board-2.bin` always require
+  a verified signer, including unsigned-executable developer builds. Executables
+  retain the registry/build policy. Actual signed-registry tests exercise both
+  board roles, developer executable behavior and registry epoch revocation before
+  source access; no test profile installs calibration for deployment.
 - `hw::HwRev::registers()` returns the correct per-family windows;
   `Registers::ce_base(pipe)` rejects an out-of-range CE index. The RTC
   chip-ID helper now returns the complete BAR-relative address.
@@ -403,6 +410,12 @@ owned-ID rebinding and late MAP, native command errors/cancellation and bounded
 progress floods. Original ring/firmware allocations remain retained in every
 case, including success. These fixtures establish the terminal teardown
 contract without radio or whole-device reset acceptance.
+
+Physical carrier/peer publication does not change operator `IFF_UP` and never
+invokes administrative open/stop hooks while retained driver state is locked.
+Explicit registration, operator up/down and autoconnect remain administrative
+events. Disconnect/failure clears carrier and peer identity while preserving an
+operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
 ## 4. Invariants
 

@@ -41,8 +41,23 @@ struct Harness {
 }
 impl Harness {
     fn new(version: u32, secured: bool, keys_first: bool) -> Result<Self, &'static str> {
-        let (adapter, bus) =
-            firmware::create(version, secured).map_err(|_| "CR4/common-ring native ownership")?;
+        Self::new_selected(version, secured, keys_first, false)
+    }
+    fn new_selected(
+        version: u32,
+        secured: bool,
+        keys_first: bool,
+        selected: bool,
+    ) -> Result<Self, &'static str> {
+        let (adapter, bus) = if selected {
+            let (selection, assets) = crate::brcmfmac::provision::tests::selected_fixture(
+                crate::brcmfmac::provision::Family::Pcie43602,
+            )?;
+            firmware::create_selected(version, secured, &selection, &assets)
+        } else {
+            firmware::create(version, secured)
+        }
+        .map_err(|_| "CR4/common-ring native ownership")?;
         bus.keys_first(keys_first);
         let station = ready(Station::initialize(adapter, &[], firmware::domain()))?
             .map_err(|_| "PCIe station firmware initialization")?;
@@ -75,7 +90,7 @@ impl Harness {
             tx: IrqSafeSpinLock::new(Some(producer)),
         });
         *ACTIVE_TEST.lock() = Some(device.clone());
-        narf_net::iface::set_link_state(&name, false);
+        narf_net::iface::set_link_state(&name, true); // operator IFF_UP
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
         Ok(Self { device, bus, name })
@@ -123,6 +138,12 @@ impl Harness {
         {
             return Err("PCIe association did not open exact peer/carrier");
         }
+        narf_net::iface::set_link_state(&self.name, false);
+        self.device.drain();
+        if narf_net::iface::lookup(&self.name).is_none_or(|iface| iface.link_up || !iface.carrier) {
+            return Err("PCIe physical carrier overwrote operator DOWN");
+        }
+        narf_net::iface::set_link_state(&self.name, true);
         Ok(())
     }
     fn pump(&self) {
@@ -151,7 +172,7 @@ impl Harness {
             && self.device.enqueue(frame).is_err()
             && narf_net::iface::send_on(&self.name, frame).is_err()
             && narf_net::iface::lookup(&self.name)
-                .is_some_and(|iface| !iface.link_up && !iface.carrier)
+                .is_some_and(|iface| iface.link_up && !iface.carrier)
     }
 }
 impl Drop for Harness {
@@ -185,7 +206,15 @@ fn packets() -> (Vec<u8>, Vec<u8>) {
     )
 }
 fn composition(version: u32, secured: bool, keys_first: bool) -> Result<(), &'static str> {
-    let harness = Harness::new(version, secured, keys_first)?;
+    composition_selected(version, secured, keys_first, false)
+}
+fn composition_selected(
+    version: u32,
+    secured: bool,
+    keys_first: bool,
+    selected: bool,
+) -> Result<(), &'static str> {
+    let harness = Harness::new_selected(version, secured, keys_first, selected)?;
     let (uplink, downlink) = packets();
     if !harness.closed(&uplink)
         || narf_net::dhcp::acquire(&harness.name, 0).is_ok()
@@ -264,6 +293,20 @@ fn smoke_brcmf_native_open_station_to_dhcp_and_bidirectional_ip() -> TestResult 
     }
     TestResult::Pass
 }
+fn smoke_brcmf_signed_board_registry_selection_to_native_open_wpa2_dhcp_ip() -> TestResult {
+    for version in [5, 6] {
+        for secured in [false, true] {
+            if let Err(reason) = composition_selected(version, secured, false, true) {
+                return TestResult::Fail(reason);
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/provision",
+    smoke_brcmf_signed_board_registry_selection_to_native_open_wpa2_dhcp_ip
+);
 kernel_test_in!(
     "drivers/wireless/brcmfmac/station",
     smoke_brcmf_native_open_station_to_dhcp_and_bidirectional_ip

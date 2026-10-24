@@ -227,12 +227,35 @@ fn smoke_rtw89_b_post_wcpu_mac_matches_original_linux_c() -> TestResult {
         if result != Some(Ok(())) || mac.state() != State::Ready {
             return TestResult::Fail("B post-WCPU MAC did not reach confirmed Ready");
         }
-        if io.trace != case.trace {
+        // Deliberate initial-profile deviation: retain the complete original
+        // C stream, with only the independently named global CMAC TX gate
+        // parked on each CMAC enable write. No transient autonomous TX enable.
+        let expected: Vec<_> = case
+            .trace
+            .iter()
+            .map(|&(width, address, value)| {
+                (
+                    width,
+                    address,
+                    if address == R_AX_CMAC_FUNC_EN {
+                        value & !B_AX_CMAC_TXEN
+                    } else {
+                        value
+                    },
+                )
+            })
+            .collect();
+        if io.trace != expected {
             return TestResult::Fail("B post-WCPU MAC differs from original Linux C trace");
         }
         if io.raw(0x1010, 4) != 0xb0f00
             || io.raw(0x1000, 4) & (1 << 13) != 0
             || io.raw(0x8380, 4) & 2 != 0
+            || io.raw(R_AX_CMAC_FUNC_EN, 4) & B_AX_CMAC_TXEN != 0
+            || io
+                .trace
+                .iter()
+                .any(|&(_, a, v)| a == R_AX_CMAC_FUNC_EN && v & B_AX_CMAC_TXEN != 0)
         {
             return TestResult::Fail("B MAC init activated unowned packet/RX DMA");
         }

@@ -8,6 +8,7 @@ use core::{
 use narf_bus::{BusAddr, BusKind, DeviceId, PcieAddr};
 use narf_capabilities::{object_table, CapKind, CapSlot, Rights};
 use narf_kernel_test::{kernel_test_in, TestResult};
+include!("radio_init/header_golden.rs");
 
 fn cap() -> Cap<BusDeviceCap, Write> {
     let (index, generation) = object_table::register(CapKind::BusDevice);
@@ -50,12 +51,15 @@ struct Fixture {
 }
 impl Fixture {
     fn new(chip: ChipId) -> Result<Self, Error> {
-        let mut words = vec![0u32; 16384];
+        Self::aperture(chip, 65536)
+    }
+    fn aperture(chip: ChipId, extent: usize) -> Result<Self, Error> {
+        let mut words = vec![0u32; extent / 4];
         let authority = cap();
         let region = MmioRegion {
             phys: narf_memory::PhysAddr::new(0),
             virt: words.as_mut_ptr() as u64,
-            len: 65536,
+            len: extent as u64,
             kind: narf_bus::BarKind::Mmio32 {
                 prefetchable: false,
             },
@@ -87,6 +91,14 @@ impl Fixture {
             state: State::Configuring,
             receive: super::super::rx_dma::Rx::default(),
             radio: super::super::rf_access::Rf::default(),
+            runtime_sequence: 0,
+            calibration: None,
+            coex_ready: false,
+            nctl_ready: false,
+            calibrating: None,
+            scheduler: Some(super::super::scheduler_mailbox::Mailbox::default()),
+            gain_bases: None,
+            radio_started: false,
         };
         Ok(Self { native, words })
     }
@@ -96,6 +108,16 @@ impl Fixture {
         self.native.configure_registers()?;
         self.native.state = State::Terminal;
         self.native.activate_registers()
+    }
+    fn words_after_fenced_drop(mut self) -> Vec<u32> {
+        // SAFETY: exclusively owned inert RAM has never had hardware DMA,
+        // prefetch or another producer; all fixture calls have completed.
+        unsafe {
+            self.native.reclaim_fenced();
+        }
+        // Keep this same MMIO allocation alive across Fixture/Native Drop.
+        // Vec moves preserve its heap pointer; the returned owner holds it.
+        core::mem::take(&mut self.words)
     }
 }
 impl Drop for Fixture {
@@ -310,6 +332,7 @@ fn smoke_rtw89_cancelled_startup_closes_mmio_and_retains_published_command_dma()
         return TestResult::Fail("startup cancellation native command baseline");
     }
     let ring = fixture.native.ring.as_ref().unwrap().dma_addr().raw();
+    fixture.words[0xc000 / 4] = 1 << 29;
     let retained = fixture.native.queue.pending();
     let packet = fixture
         .native
@@ -337,6 +360,7 @@ fn smoke_rtw89_cancelled_startup_closes_mmio_and_retains_published_command_dma()
             .is_none_or(|memory| memory.dma_addr().raw() != packet)
         || fixture.native.ring.as_ref().unwrap().dma_addr().raw() != ring
         || fixture.words[0x1010 / 4] & 0xF0F00 != 0xF0F00
+        || fixture.words[0xc000 / 4] & (1 << 29) != 0
         || ready(fixture.native.send(Kind::Header, &[1; 32])) != Some(Err(Error::Terminal))
     {
         return TestResult::Fail("cancelled startup reused or freed uncertain native DMA");
@@ -346,4 +370,290 @@ fn smoke_rtw89_cancelled_startup_closes_mmio_and_retains_published_command_dma()
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_cancelled_startup_closes_mmio_and_retains_published_command_dma
+);
+
+fn smoke_rtw89_native_runtime_rf_headers_match_original_linux_c() -> TestResult {
+    let mut f = Fixture::new(ChipId::Rtl8852B).unwrap();
+    for &(sequence, path, page, length, expected) in HEADERS {
+        f.native.runtime_sequence = u16::from(sequence);
+        let body = vec![0x5a; length as usize];
+        let packet = f.native.radio_page_packet(path, page, &body).unwrap();
+        if packet[..8] != expected
+            || packet[8..] != body
+            || f.native.runtime_sequence != u16::from(sequence) + 1
+        {
+            return TestResult::Fail(
+                "runtime RF page header/automatic ACK/sequence differs from original C",
+            );
+        }
+    }
+    f.native.runtime_sequence = 256;
+    if f.native.radio_page_packet(0, 0, &[0; 4]) != Err(super::super::radio_init::Error::Profile) {
+        return TestResult::Fail("initial RF runtime command sequence was reused after wrap");
+    }
+    f.native.runtime_sequence = 0;
+    if ready(f.native.upload_radio_page(0, 0, &[0; 4]))
+        != Some(Err(super::super::radio_init::Error::Register(
+            super::super::power::Error::Unsupported,
+        )))
+        || f.native.runtime_sequence != 0
+        || f.native.armed
+    {
+        return TestResult::Fail("unqualified RF owner reached runtime sequence/DMA publication");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_runtime_rf_headers_match_original_linux_c
+);
+
+fn smoke_rtw89_native_rf_page_observes_actual_descriptor_body_and_cancel_retention() -> TestResult {
+    let mut f = Fixture::new(ChipId::Rtl8852B).unwrap();
+    if f.activate().is_err() {
+        return TestResult::Fail("RF native command model activation");
+    }
+    let body: Vec<u8> = (0..2000).map(|v| v as u8).collect();
+    // This established private RAM backend seam replaces only cold/PCI
+    // qualification, as Fixture::activate does for firmware-download smokes.
+    // The actual runtime sender, capability, DMA allocations/descriptor and
+    // outer cancellation guard are all production paths.
+    let result = {
+        let future = async {
+            let mut attempt = super::super::startup::Attempt::new(&mut f.native);
+            attempt.owner_mut().transmit_radio_page(1, 2, &body).await
+        };
+        ready(future)
+    };
+    if result.is_some()
+        || f.native.state != State::Terminal
+        || f.native.queue.pending() != 1
+        || f.native.runtime_sequence != 1
+    {
+        return TestResult::Fail("RF command cancellation lost retained native owner");
+    }
+    let packet = f.native.queue.model_resource(0).unwrap();
+    let bytes = packet.as_slice();
+    let ring = f.native.ring.as_ref().unwrap();
+    let bd = &ring.as_slice()[..8];
+    let length = u16::from_le_bytes(bd[..2].try_into().unwrap()) as usize;
+    let option = u16::from_le_bytes(bd[2..4].try_into().unwrap());
+    let address = u32::from_le_bytes(bd[4..8].try_into().unwrap()) as u64
+        | (((option >> 6) & 255) as u64) << 32;
+    if length != 24 + 8 + 2000
+        || address != packet.dma_addr().raw()
+        || address + length as u64 - 1 > DEVICE_DMA_MASK
+        || bytes[24..32] != [0x26, 2, 0, 0, 0xd8, 0x47, 0, 0]
+        || bytes[32..32 + body.len()] != body
+        || f.words[f.native.regs.idx as usize / 4] != 1
+    {
+        return TestResult::Fail(
+            "RF upload fixture did not observe actual retained TXBD/H2C/body/host WP",
+        );
+    }
+    let retained = packet.dma_addr().raw();
+    f.native.authority.revoke();
+    if ready(f.native.send(Kind::Header, &[0; 8])) != Some(Err(Error::Terminal))
+        || f.native.queue.model_resource(0).unwrap().dma_addr().raw() != retained
+    {
+        return TestResult::Fail("cancelled/revoked RF upload reopened or released DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_rf_page_observes_actual_descriptor_body_and_cancel_retention
+);
+
+fn smoke_rtw89_native_revoked_calibration_blocks_register_and_command_publication() -> TestResult {
+    let mut f = Fixture::new(ChipId::Rtl8852B).unwrap();
+    if f.activate().is_err() {
+        return TestResult::Fail("calibration revocation native baseline");
+    }
+    let (calibration, authority) = super::super::calibration_policy::tests::revocable_model();
+    f.native.calibration = Some(calibration);
+    f.native.coex_ready = true;
+    f.native.nctl_ready = true;
+    authority.revoke();
+    let words = f.words.clone();
+    let ring = f.native.ring.as_ref().unwrap().dma_addr().raw();
+    let command = ready(f.native.coex_command(3, &[0; 26], true));
+    if command
+        != Some(Err(super::super::coex_native::Error::Register(
+            super::super::power::Error::Access,
+        )))
+        || super::super::rfk::Interface::admit(&mut f.native)
+            != Err(super::super::rfk::Error::Register(
+                super::super::power::Error::Access,
+            ))
+        || Io::write32(&mut f.native, 0x8000, 4) != Err(super::super::power::Error::Access)
+        || f.words != words
+        || f.native.runtime_sequence != 0
+        || f.native.queue.pending() != 0
+        || f.native.ring.as_ref().unwrap().dma_addr().raw() != ring
+    {
+        return TestResult::Fail(
+            "revoked actual calibration capability reached Native registers/sequence/DMA",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_revoked_calibration_blocks_register_and_command_publication
+);
+
+fn smoke_rtw89_native_queued_command_rechecks_qualification_after_wait() -> TestResult {
+    let mut f = Fixture::new(ChipId::Rtl8852B).unwrap();
+    if f.activate().is_err() {
+        return TestResult::Fail("queued qualification native baseline");
+    }
+    let (calibration, authority) = super::super::calibration_policy::tests::revocable_model();
+    f.native.calibration = Some(calibration);
+    // Existing explicit RAM transport boundary: actual capability, queue,
+    // allocations, TXBD bytes and doorbell; no real device/attach is admitted.
+    for _ in 0..f.native.depth {
+        if f.native.queue.is_full() {
+            break;
+        }
+        if ready(f.native.send(Kind::Header, &[3; 16])) != Some(Ok(())) {
+            return TestResult::Fail("retained native queue fill");
+        }
+    }
+    if !f.native.queue.is_full() {
+        return TestResult::Fail("finite actual command ring never filled");
+    }
+    let retained = f.native.queue.pending();
+    let index = f.native.regs.idx as usize / 4;
+    let wp = f.words[index] & 65535;
+    let descriptors = f.native.ring.as_ref().unwrap().as_slice().to_vec();
+    let result = {
+        let native = &mut f.native;
+        let words = &mut f.words;
+        let future = async {
+            let mut attempt = super::super::startup::Attempt::new(native);
+            attempt.owner_mut().send(Kind::Header, &[7; 16]).await
+        };
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        if !matches!(future.as_mut().poll(&mut context), Poll::Pending) {
+            return TestResult::Fail("full actual command queue did not wait");
+        }
+        authority.revoke();
+        // The device frees a real TXBD while the sending future waits. It must
+        // recheck the now-revoked qualification before even retiring/reusing it.
+        words[index] = (words[index] & !0x0fff0000) | (1 << 16);
+        // Use the shared finite time primitive solely to expire this real50us
+        // future; no test-local hardware loop or executor bridge is involved.
+        narf_time::busy_wait_cycles(narf_time::wall::ns_to_cycles(100_000));
+        future.as_mut().poll(&mut context)
+    };
+    if result != Poll::Ready(Err(Error::Access))
+        || f.native.state != State::Terminal
+        || f.native.queue.pending() != retained
+        || f.words[index] & 65535 != wp
+        || f.native.ring.as_ref().unwrap().as_slice() != descriptors.as_slice()
+    {
+        return TestResult::Fail(
+            "paused native command published/reused DMA after qualification revocation",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_queued_command_rechecks_qualification_after_wait
+);
+
+fn smoke_rtw89_native_terminal_radio_closure_uses_current_cap_and_retains_dma() -> TestResult {
+    for revoked in [false, true] {
+        let mut f = Fixture::aperture(ChipId::Rtl8852B, 0x20000).unwrap();
+        if f.activate().is_err() || ready(f.native.send(Kind::Header, &[0x5a; 16])) != Some(Ok(()))
+        {
+            return TestResult::Fail("native radio closure baseline");
+        }
+        let ring = f.native.ring.as_ref().unwrap().dma_addr().raw();
+        let packet = f.native.queue.model_resource(0).unwrap().dma_addr().raw();
+        let pending = f.native.queue.pending();
+        // Established inert RAM-only qualification boundary. Actual native MMIO,
+        // capability, real retained command DMA and outer cancellation guard run.
+        f.native.radio_started = true;
+        for (address, mask) in [
+            (0x109c4, 0x11),
+            (0x10980, 0x10001),
+            (0x15864, 0x20000000),
+            (0x18010, 255),
+            (0x18088, 0x12345678),
+            (0x2f0, 0x20000),
+            (0, 3 << 16),
+        ] {
+            f.words[address / 4] |= mask;
+        }
+        let before = f.words.clone();
+        if revoked {
+            f.native.authority.revoke();
+        }
+        {
+            let _attempt = super::super::startup::Attempt::new(&mut f.native);
+        }
+        if f.native.state != State::Terminal
+            || f.native.queue.pending() != pending
+            || f.native.ring.as_ref().unwrap().dma_addr().raw() != ring
+            || f.native.queue.model_resource(0).unwrap().dma_addr().raw() != packet
+        {
+            return TestResult::Fail("radio closure discarded uncertain command DMA");
+        }
+        if revoked {
+            if f.words != before {
+                return TestResult::Fail("revoked radio stop touched Native BAR");
+            }
+        } else if f.words[0x109c4 / 4] & 0x11 != 0
+            || f.words[0x10980 / 4] & 0x10001 != 0
+            || f.words[0x15864 / 4] & 0x20000000 != 0
+            || f.words[0x18010 / 4] & 255 != 0
+            || f.words[0x18088 / 4] != 0x80000000
+            || f.words[0x2f0 / 4] & 0x20000 != 0
+            || f.words[0] & 0x30000 != 0
+        {
+            return TestResult::Fail(
+                "actual terminal Native left PMAC/NCTL/BB clock/reset controls open",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_terminal_radio_closure_uses_current_cap_and_retains_dma
+);
+
+fn smoke_rtw89_native_dma_fence_does_not_suppress_radio_drop_closure() -> TestResult {
+    let mut f = Fixture::aperture(ChipId::Rtl8852B, 0x20000).unwrap();
+    if f.activate().is_err() {
+        return TestResult::Fail("radio Drop fence baseline");
+    }
+    f.native.radio_started = true;
+    for (address, mask) in [
+        (0x109c4, 0x11),
+        (0x15864, 0x20000000),
+        (0x18010, 255),
+        (0x2f0, 0x20000),
+        (0, 0x30000),
+    ] {
+        f.words[address / 4] |= mask;
+    }
+    let words = f.words_after_fenced_drop();
+    if words[0x109c4 / 4] & 0x11 != 0
+        || words[0x15864 / 4] & 0x20000000 != 0
+        || words[0x18010 / 4] & 255 != 0
+        || words[0x2f0 / 4] & 0x20000 != 0
+        || words[0] & 0x30000 != 0
+    {
+        return TestResult::Fail("reclaimed command DMA hid independently started radio from Drop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_dma_fence_does_not_suppress_radio_drop_closure
 );

@@ -27,7 +27,7 @@ pub unsafe trait Memory: Send {
 /// inherited, unrelated or cached DMA mapping may remain runnable. Cancellation
 /// and Drop retain every host mapping with uncertain device ownership.
 #[async_trait::async_trait]
-pub unsafe trait Registers: Send {
+pub(super) unsafe trait Registers: Send {
     fn claim_firmware_dma(&mut self, beacon_base: u32) -> Result<(), Error>;
     fn read8(&mut self, reg: u16) -> Result<u8, Error>;
     fn read16(&mut self, reg: u16) -> Result<u16, Error>;
@@ -51,6 +51,62 @@ pub unsafe trait Registers: Send {
     fn finish_phy(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn begin_commands(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn submit_h2c(&mut self, _: &[u8; 32]) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn poll_h2c(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_radio(&mut self, _: super::power_policy::Gate) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn park_radio(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn parked_cpu<T>(&mut self, _: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        Err(Error::Unsupported)
+    }
+
+    fn station_allowed(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_own(&mut self) -> Result<[u8; 6], Error> {
+        Err(Error::Unsupported)
+    }
+    fn mailbox_ready(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn mailbox_submit(&mut self, _: [u8; 8]) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn mailbox_pending(&self) -> bool {
+        false
+    }
+
+    fn packet_prepare(&mut self, _: [u8; 6], _: u8) -> Result<(), super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
+    fn packet_start(&mut self) -> Result<(), super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
+    fn packet_ready(&self) -> bool {
+        false
+    }
+    fn packet_submit(&mut self, _: &[u8], _: bool) -> Result<u64, super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
+    fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
+    fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageState {
@@ -58,13 +114,14 @@ enum PageState {
     Idle,
     Terminal,
 }
-pub struct Backend<R: Registers, M: Memory> {
+pub(super) struct Backend<R: Registers, M: Memory> {
     io: R,
     ring: Option<M>,
     frame: Option<M>,
     state: PageState,
     published: bool,
     boundary: u16,
+    completed: bool,
 }
 impl<R: Registers, M: Memory> core::fmt::Debug for Backend<R, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -105,6 +162,7 @@ impl<R: Registers, M: Memory> Backend<R, M> {
             state: PageState::Unclaimed,
             published: false,
             boundary,
+            completed: false,
         })
     }
     fn word(memory: &mut M, offset: usize, value: u32) -> Result<(), Error> {
@@ -178,6 +236,7 @@ impl<R: Registers, M: Memory> Backend<R, M> {
         // MMIO's inner-shareable load ordering alone is insufficient on ARM.
         // Order the exact device completion before any restoration/reuse.
         ring.acquire();
+        self.completed = true;
         frame.acquire();
         // Fresh beacon-valid proves the exact serially published page reached
         // device TXBUF. Only completed transfers restore registers/reopen reuse.
@@ -254,6 +313,87 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn finish_phy(&mut self) -> Result<(), Error> {
         self.io.finish_phy()
+    }
+    fn begin_commands(&mut self) -> Result<(), Error> {
+        self.io.begin_commands()
+    }
+    fn submit_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
+        self.io.submit_h2c(packet)
+    }
+    fn poll_h2c(&mut self) -> Result<bool, Error> {
+        self.io.poll_h2c()
+    }
+    fn finish_radio(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
+        if self.state != PageState::Idle || !self.completed {
+            return Err(Error::State);
+        }
+        self.io.park_radio()?;
+        // Only after the exact successful BCN_VALID receipt and native BMEoff
+        // parking may the original completed beacon descriptor be disarmed.
+        // Published mappings remain retained; this is not reclamation/reset.
+        let ring = self.ring.as_mut().ok_or(Error::State)?;
+        let frame = self.frame.as_mut().ok_or(Error::State)?;
+        self.io.parked_cpu(|| {
+            ring.write(0, &[0; 16])?;
+            ring.sync();
+            frame.write(0, &[0; DESC])?;
+            frame.sync();
+            Ok(())
+        })?;
+        let work = self.io.read8(0x383)?;
+        self.io.write8(0x383, work & !0x10)?;
+        let beacon = self.io.read8(0x550)?;
+        self.io.write8(0x550, beacon & !8)?;
+        if self.io.read8(0x383)? & 0x10 != 0 || self.io.read8(0x550)? & 8 != 0 {
+            return Err(Error::Prerequisite);
+        }
+        self.state = PageState::Terminal;
+        self.io.finish_radio(gate)
+    }
+
+    fn station_allowed(&mut self) -> Result<(), Error> {
+        self.io.station_allowed()
+    }
+    fn station_own(&mut self) -> Result<[u8; 6], Error> {
+        self.io.station_own()
+    }
+    fn mailbox_ready(&mut self) -> Result<bool, Error> {
+        self.io.mailbox_ready()
+    }
+    fn mailbox_submit(&mut self, p: [u8; 8]) -> Result<(), Error> {
+        self.io.mailbox_submit(p)
+    }
+    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
+        self.io.mailbox_consumed()
+    }
+    fn mailbox_pending(&self) -> bool {
+        self.io.mailbox_pending()
+    }
+    fn packet_prepare(
+        &mut self,
+        own: [u8; 6],
+        mac_id: u8,
+    ) -> Result<(), super::packet_core::Error> {
+        self.io.packet_prepare(own, mac_id)
+    }
+    fn packet_start(&mut self) -> Result<(), super::packet_core::Error> {
+        self.io.packet_start()
+    }
+    fn packet_ready(&self) -> bool {
+        self.io.packet_ready()
+    }
+    fn packet_submit(
+        &mut self,
+        frame: &[u8],
+        report: bool,
+    ) -> Result<u64, super::packet_core::Error> {
+        self.io.packet_submit(frame, report)
+    }
+    fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
+        self.io.packet_poll()
+    }
+    fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
+        self.io.packet_stop()
     }
     async fn delay_us(&mut self, us: u64) {
         self.io.delay_us(us).await;

@@ -1336,3 +1336,51 @@ pub(super) fn initialized_firmware() -> (Fake, Arc<Owner<Fake>>) {
     narf_scheduler::block_on(owner.initialize_device(&image(123))).unwrap();
     (control, owner)
 }
+
+fn smoke_rtl8188eu_registered_asset_denial_precedes_attempt_and_same_owner_retries() -> TestResult {
+    let io = Fake::new();
+    let owner = Owner::new(io.clone(), ChipFamily::Rtl8188eu);
+    let (write, read) = narf_firmware::bootstrap_authority();
+    let name = "narf-test/rtl8xxxu/deferred-eu.bin";
+    if narf_scheduler::block_on(owner.initialize_registered_from(&read, name))
+        != Err(Error::Firmware(narf_firmware::FirmwareError::NotFound))
+        || owner.status().stage != Stage::Detected
+        || !io.0.lock().ops.is_empty()
+    {
+        return TestResult::Fail(
+            "missing registered EU firmware consumed attempt or performed USB",
+        );
+    }
+    crate::firmware_asset::tests::install(&write, name, &image(17), true).unwrap();
+    read.revoke();
+    if narf_scheduler::block_on(owner.initialize_registered_from(&read, name))
+        != Err(Error::Firmware(
+            narf_firmware::FirmwareError::AuthorityRevoked,
+        ))
+        || owner.status().stage != Stage::Detected
+        || !io.0.lock().ops.is_empty()
+    {
+        return TestResult::Fail("revoked registered EU authority consumed pre-attempt owner");
+    }
+    let (_, fresh) = narf_firmware::bootstrap_authority();
+    if narf_scheduler::block_on(owner.initialize_registered_from(&fresh, name)).is_err()
+        || owner.status().stage != Stage::RadioReady
+    {
+        return TestResult::Fail(
+            "newly staged current EU bytes could not continue same firmware/radio owner",
+        );
+    }
+    let before = io.0.lock().ops.len();
+    fresh.revoke();
+    if narf_scheduler::block_on(owner.initialize_registered_from(&fresh, name))
+        != Err(Error::AlreadyStarted)
+        || io.0.lock().ops.len() != before
+    {
+        return TestResult::Fail("begun EU owner resolved new assets or replayed hardware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/firmware",
+    smoke_rtl8188eu_registered_asset_denial_precedes_attempt_and_same_owner_retries
+);

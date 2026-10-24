@@ -126,11 +126,9 @@ impl Calibration {
         let auth = loader
             .derive()
             .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
-        let cap = narf_firmware::open(&name, &auth).map_err(Error::Firmware)?;
-        let view = narf_firmware::view_of(&cap).map_err(Error::Firmware)?;
-        // Even development firmware profiles may accept unsigned blobs. An
-        // RF power qualification always requires an authenticated signer.
-        Self::from_verified(view.bytes, view.signer, view.sha256, factory, vid, pid)
+        let asset = crate::firmware_asset::load(&auth, &name, HEADER + MAX_ROWS * ROW, true)
+            .map_err(Error::Firmware)?;
+        Self::from_verified(&asset.bytes, asset.signer, asset.digest, factory, vid, pid)
     }
     /// Called only after narf_firmware authenticated the current cap view.
     /// It is deliberately private; the kernel-test child exercises this same

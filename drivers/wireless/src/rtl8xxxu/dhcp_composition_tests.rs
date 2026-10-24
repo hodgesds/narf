@@ -423,6 +423,7 @@ impl Harness {
         ))?
         .map_err(|_| "EU fixture native service initialization")?;
         let name = narf_net::iface::register("wlan%d", factory.mac, send);
+        narf_net::iface::set_link_state(&name, true); // operator IFF_UP
         let device = Arc::new(Device::new(&name, service));
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
@@ -492,6 +493,13 @@ impl Harness {
                 && i.carrier_down_count == 0),
             "EU netdev carrier metadata missing"
         );
+        narf_net::iface::set_link_state(&self.name, false);
+        self.device.drain();
+        ensure!(
+            narf_net::iface::lookup(&self.name).is_some_and(|i| !i.link_up && i.carrier),
+            "EU physical carrier overwrote operator DOWN"
+        );
+        narf_net::iface::set_link_state(&self.name, true);
         Ok(())
     }
     fn pump(&self) {
@@ -503,7 +511,7 @@ impl Harness {
         !self.device.link_up()
             && self.device.connected_bssid().is_none()
             && narf_net::iface::lookup(&self.name).is_some_and(|i| {
-                !i.link_up && !i.carrier && i.carrier_up_count == 1 && i.carrier_down_count == 1
+                i.link_up && !i.carrier && i.carrier_up_count == 1 && i.carrier_down_count == 1
             })
     }
 }
@@ -826,7 +834,7 @@ fn disconnect_overrides_waiting_old_publisher() -> Result<(), &'static str> {
         !h.device.link_up()
             && h.device.connected_bssid().is_none()
             && narf_net::iface::lookup(&h.name).is_some_and(|i| {
-                !i.link_up && !i.carrier && i.carrier_up_count == 2 && i.carrier_down_count == 2
+                i.link_up && !i.carrier && i.carrier_up_count == 2 && i.carrier_down_count == 2
             })
             && narf_net::iface::send_on(&h.name, &probe).is_err(),
         "EU old publisher reopened carrier/BSSID after completed disconnect"

@@ -9,7 +9,7 @@ use alloc::{vec, vec::Vec};
 use narf_capabilities::{Cap, Read};
 use narf_firmware::FirmwareBlob;
 use narf_kernel_test::{kernel_test_in, TestResult};
-fn make_factory(rfe: u8, base: u8) -> Factory {
+pub(super) fn make_factory(rfe: u8, base: u8) -> Factory {
     let mut raw = [255; 768];
     raw[0x120..0x126].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
     raw[0xb9] = 0x33;
@@ -20,7 +20,7 @@ fn make_factory(rfe: u8, base: u8) -> Factory {
     raw[0x10 + 42] = base.saturating_add(1);
     Factory::for_test_with_trims(raw, [1; 19]).unwrap()
 }
-fn domain() -> narf_wireless::reg::RegulatoryDomain {
+pub(super) fn domain() -> narf_wireless::reg::RegulatoryDomain {
     narf_wireless::reg::RegulatoryDomain {
         country_code: *b"US",
         rules: vec![narf_wireless::reg::RegRule {
@@ -32,18 +32,18 @@ fn domain() -> narf_wireless::reg::RegulatoryDomain {
         }],
     }
 }
-fn image(board: Board, factory: &Factory) -> Vec<u8> {
+pub(super) fn image(board: Board, factory: &Factory) -> Vec<u8> {
     let mut bytes = vec![0; 640];
     bytes[..4].copy_from_slice(b"N22C");
-    for (at, value) in [(4, 1u16), (6, 128), (12, 0x10ec), (14, 0xc822), (60, 1)] {
+    for (at, value) in [(4, 2u16), (6, 128), (12, 0x10ec), (14, 0xc822), (60, 2)] {
         bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
     }
     bytes[8..12].copy_from_slice(&640u32.to_le_bytes());
     bytes[16..48].copy_from_slice(&board.identity());
     bytes[48..54].copy_from_slice(&factory.mac());
     bytes[54] = 1;
-    bytes[55] = 1;
-    for (at, value) in [(56, 4i16), (58, 76), (62, 40)] {
+    bytes[55] = 3;
+    for (at, value) in [(56, 4i16), (58, 76), (62, 40), (64, 40)] {
         bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
     }
     for path in 0..2 {
@@ -55,7 +55,7 @@ fn image(board: Board, factory: &Factory) -> Vec<u8> {
     }
     bytes
 }
-fn source(bytes: Vec<u8>, cap: Cap<FirmwareBlob, Read>) -> Source {
+pub(super) fn source(bytes: Vec<u8>, cap: Cap<FirmwareBlob, Read>) -> Source {
     Source::Verified {
         bytes,
         signer: Some([7; 32]),
@@ -149,7 +149,7 @@ fn smoke_rtw8822ce_power_qualification_rejects_unsigned_malformed_and_foreign_id
 ) -> TestResult {
     let (owner, factory, board) = prepared();
     let good = image(board, &factory);
-    for mutation in 0..16 {
+    for mutation in 0..20 {
         let mut bytes = good.clone();
         let mut signer = Some([7; 32]);
         match mutation {
@@ -164,13 +164,17 @@ fn smoke_rtw8822ce_power_qualification_rejects_unsigned_malformed_and_foreign_id
             6 => bytes[48] ^= 2,
             7 => bytes[54] = 2,
             8 => bytes[55] = 0,
-            9 => bytes[60] = 2,
-            10 => bytes[64] = 1,
+            9 => bytes[60] = 1,
+            10 => bytes[66] = 1,
             11 => bytes[56..58].copy_from_slice(&(-1i16).to_le_bytes()),
             12 => bytes[58..60].copy_from_slice(&257i16.to_le_bytes()),
             13 => bytes[128..130].copy_from_slice(&32766i16.to_le_bytes()),
             14 => bytes[62..64].copy_from_slice(&32767i16.to_le_bytes()),
-            _ => bytes[8] ^= 1,
+            15 => bytes[8] ^= 1,
+            16 => bytes[4] = 1,
+            17 => bytes[64..66].copy_from_slice(&i16::MAX.to_le_bytes()),
+            18 => bytes[64..66].copy_from_slice(&257i16.to_le_bytes()),
+            _ => bytes[55] = 1,
         }
         let cap = Cap::<FirmwareBlob, Read>::bootstrap();
         if (Source::Verified { bytes, signer, cap })
@@ -179,6 +183,12 @@ fn smoke_rtw8822ce_power_qualification_rejects_unsigned_malformed_and_foreign_id
         {
             return TestResult::Fail("unqualified board envelope became a TX grant");
         }
+    }
+    let mut response = good.clone();
+    response[64..66].copy_from_slice(&76i16.to_le_bytes());
+    let response = source(response, Cap::bootstrap()).load(board).unwrap();
+    if response.permission(&domain()) != Err(PowerError::Policy) {
+        return TestResult::Fail("unqualified hardware automatic-response RF peak authorized RX");
     }
     let cap = Cap::<FirmwareBlob, Read>::bootstrap();
     cap.revoke();

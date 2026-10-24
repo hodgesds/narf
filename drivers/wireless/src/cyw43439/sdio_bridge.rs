@@ -65,6 +65,7 @@ fn map_err(e: SdioError) -> TransportError {
 /// `F` is any type that implements `SdioFunction` — in production
 /// it wraps the SDHCI host; in tests it is a `MockSdio`.
 pub struct SdioTransport<F: SdioFunction> {
+    proof: Option<alloc::sync::Arc<crate::brcmfmac::provision::Proof>>,
     func: F,
     packet_core: Option<u32>,
     rx_pending: bool,
@@ -83,6 +84,7 @@ impl<F: SdioFunction> core::fmt::Debug for SdioTransport<F> {
 impl<F: SdioFunction> SdioTransport<F> {
     pub fn new(func: F) -> Self {
         Self {
+            proof: None,
             func,
             packet_core: None,
             rx_pending: false,
@@ -90,9 +92,31 @@ impl<F: SdioFunction> SdioTransport<F> {
             failed: false,
         }
     }
+    pub(crate) fn qualify(
+        mut self,
+        proof: alloc::sync::Arc<crate::brcmfmac::provision::Proof>,
+    ) -> Self {
+        self.proof = Some(proof);
+        self
+    }
+    fn check_qualification(&mut self) -> Result<(), TransportError> {
+        if self.failed {
+            return Err(TransportError::NotReady);
+        }
+        if self
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.validate().is_err())
+        {
+            self.failed = true;
+            return Err(TransportError::NotReady);
+        }
+        Ok(())
+    }
     /// F1 is enabled before any backplane command. The host retains matching
     /// enable/block-size state; raw CCCR writes cannot bypass its lifecycle.
     pub fn prepare(&mut self) -> Result<(), TransportError> {
+        self.check_qualification()?;
         self.func.enable_func(1).map_err(map_err)?;
         self.func
             .set_block_size(1, F1_BLOCK_SIZE)
@@ -102,6 +126,7 @@ impl<F: SdioFunction> SdioTransport<F> {
             .map_err(map_err)
     }
     pub fn enable_wlan(&mut self) -> Result<(), TransportError> {
+        self.check_qualification()?;
         self.func.enable_func(2).map_err(map_err)
     }
     pub fn read_backplane(&mut self, address: u32) -> Result<u32, TransportError> {
@@ -113,6 +138,7 @@ impl<F: SdioFunction> SdioTransport<F> {
         self.write32(Function::Backplane, address & 0x7fff, value)
     }
     fn window(&mut self, address: u32) -> Result<(), TransportError> {
+        self.check_qualification()?;
         for write in super::backplane::window_writes(address) {
             self.func
                 .cmd52_write(1, write.address, write.data)
@@ -214,6 +240,7 @@ impl<F: SdioFunction> crate::brcmfmac::chip::Backplane for SdioTransport<F> {
 }
 impl<F: SdioFunction> Transport for SdioTransport<F> {
     fn read32(&mut self, function: Function, address: u32) -> Result<u32, TransportError> {
+        self.check_qualification()?;
         let mut bytes = [0; 4];
         if function == Function::Backplane && address < 0x10000 {
             if address & 3 != 0 || address & 0x7fff > 0x7ffc {
@@ -233,6 +260,7 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
         address: u32,
         value: u32,
     ) -> Result<(), TransportError> {
+        self.check_qualification()?;
         if function == Function::Backplane && address < 0x10000 {
             if address & 3 != 0 || address & 0x7fff > 0x7ffc {
                 return Err(TransportError::AddressOverflow);
@@ -250,6 +278,7 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
         address: u32,
         buf: &mut [u8],
     ) -> Result<(), TransportError> {
+        self.check_qualification()?;
         if address > 0x1ffff || buf.len() > (0x20000 - address) as usize {
             return Err(TransportError::AddressOverflow);
         }
@@ -280,6 +309,7 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
         address: u32,
         buf: &[u8],
     ) -> Result<(), TransportError> {
+        self.check_qualification()?;
         if address > 0x1ffff || buf.len() > (0x20000 - address) as usize {
             return Err(TransportError::AddressOverflow);
         }

@@ -188,7 +188,7 @@ impl Harness {
         device.admit_for_test();
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::register(name, device.mac(), send);
-        narf_net::iface::set_link_state(name, false);
+        narf_net::iface::set_link_state(name, true); // operator IFF_UP
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
@@ -237,6 +237,11 @@ impl Harness {
         assert!(self.device.link_up());
         assert_eq!(self.device.connected_bssid(), Some(PEER));
         assert_eq!(self.peer.lock().ap.phase(), ApPhase::Authorized);
+        narf_net::iface::set_link_state(self.device.name(), false);
+        self.device.drain();
+        assert!(narf_net::iface::lookup(self.device.name())
+            .is_some_and(|iface| !iface.link_up && iface.carrier));
+        narf_net::iface::set_link_state(self.device.name(), true);
     }
     fn pump(&self) {
         for _ in 0..16 {
@@ -247,7 +252,7 @@ impl Harness {
         !self.device.link_up()
             && self.device.connected_bssid().is_none()
             && narf_net::iface::lookup(self.device.name())
-                .is_some_and(|iface| !iface.link_up && !iface.carrier)
+                .is_some_and(|iface| iface.link_up && !iface.carrier)
     }
     fn received(&self) -> Vec<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -644,6 +649,107 @@ pub(crate) fn smoke_rtl8188ee_native_device_rekey_reply_gates_data_without_carri
 kernel_test_in!(
     "drivers/wireless/rtlwifi/device",
     smoke_rtl8188ee_native_device_rekey_reply_gates_data_without_carrier_flap
+);
+
+pub(crate) fn smoke_rtl8188ee_native_rekey_missing_m3_expires_despite_fresh_beacons() -> TestResult
+{
+    let h = Harness::new(true);
+    h.join();
+    let plan = h.peer.lock().plan;
+    let mut m1 = KeyFrame::empty(16);
+    m1.key_information = narf_wireless::eapol::KI_KEY_TYPE_PAIRWISE
+        | narf_wireless::eapol::KI_KEY_ACK
+        | narf_wireless::eapol::KI_VERSION_HMAC_SHA1_AES;
+    m1.key_length = 16;
+    m1.replay_counter = 3;
+    m1.key_nonce = [0xbb; 32];
+    let mut ethernet = plan.station.to_vec();
+    ethernet.extend_from_slice(&PEER);
+    ethernet.extend_from_slice(&[0x88, 0x8e]);
+    ethernet.extend_from_slice(&m1.into_eapol());
+    let wire = h.peer.lock().downlink(&ethernet).unwrap();
+    h.packet.emit(&wire).unwrap();
+    h.pump();
+    let m2 = h.peer.lock().uplink.last().cloned().unwrap_or_default();
+    let reply = m2.get(18..).and_then(|bytes| KeyFrame::decode(bytes, 16));
+    if reply.is_none_or(|key| {
+        key.replay_counter != 3 || key.key_information & narf_wireless::eapol::KI_KEY_MIC == 0
+    }) || m2.get(12..14) != Some(&[0x88, 0x8e])
+        || h.packet.model.lock().held.is_some()
+        || !h
+            .device
+            .prepared
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .station_transmit_ready()
+        || !h.device.link_up()
+    {
+        return TestResult::Fail(
+            "EE rekey lacks real terminal old-key M2 and reopened old-key port",
+        );
+    }
+    let start = h.env.now.load(Ordering::Acquire);
+    for delta in [1000, 2000, 3000, 4000, 4999] {
+        h.env.now.store(start + delta, Ordering::Release);
+        let beacon = h.peer.lock().ap.beacon();
+        h.packet.emit(&beacon).unwrap();
+        h.pump();
+        if !h.device.link_up()
+            || !h
+                .device
+                .prepared
+                .try_lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .station_transmit_ready()
+        {
+            return TestResult::Fail(
+                "EE valid beacons failed to retain the pre-deadline old-key station",
+            );
+        }
+    }
+    h.env.now.store(start + 5001, Ordering::Release);
+    let beacon = h.peer.lock().ap.beacon();
+    h.packet.emit(&beacon).unwrap();
+    h.pump();
+    let probe = udp_ipv4(
+        PEER,
+        plan.station,
+        plan.lease_ip,
+        plan.server_ip,
+        49152,
+        7,
+        b"ee-missing-rekey-m3",
+    );
+    if !h.closed()
+        || h.packet.model.lock().master
+        || h.device.enqueue(&probe, TxMeta::default()).is_ok()
+        || h.device
+            .prepared
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .station_transmit_ready()
+    {
+        return TestResult::Fail("EE fresh beacons hid M3 timeout or left native data admitted");
+    }
+    let before = h.packet.drops.load(Ordering::SeqCst);
+    let packet = h.packet.clone();
+    drop(h);
+    if packet.drops.load(Ordering::SeqCst) != before {
+        return TestResult::Fail(
+            "EE terminal M3 timeout released native DMA before reset quiescence",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/device",
+    smoke_rtl8188ee_native_rekey_missing_m3_expires_despite_fresh_beacons
 );
 
 pub(crate) fn smoke_rtl8188ee_native_device_paused_publisher_cannot_outlive_close() -> TestResult {

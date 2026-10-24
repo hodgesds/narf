@@ -776,7 +776,15 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
                 return Err(WlfwError::new(step::BDF_FETCH, e as u32, e));
             }
         };
-        let data = &blob.as_ref()[off..off + len];
+        // One current owned snapshot for this operation. Source revocation
+        // after the name parser ran may make a later AsRef empty; never trust
+        // the old extent across that boundary or let it become a slice panic.
+        let snapshot = blob.as_ref();
+        let data = off
+            .checked_add(len)
+            .and_then(|end| snapshot.get(off..end))
+            .filter(|data| !data.is_empty())
+            .ok_or(WlfwError::new(step::BDF_FETCH, EINVAL as u32, EINVAL))?;
         let bdf_type = bdf_type_for(data, regdb);
         let fw_size = data.len().min(self.cfg.hw.board_size);
         self.log(format_args!(
@@ -834,6 +842,9 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
             },
         };
         let data = blob.as_ref();
+        if data.is_empty() {
+            return Err(WlfwError::new(step::CALDATA_FETCH, EINVAL as u32, EINVAL));
+        }
         let fw_size = data.len().min(self.cfg.hw.board_size);
         self.load_file_target_mem(
             &data[..fw_size],
@@ -877,6 +888,9 @@ impl<P: QrtrPipe, F: FirmwareLoader, A: DmaAllocator> Wlfw<P, F, A> {
                 blob.as_ref()
             }
         };
+        if data.is_empty() {
+            return Err(WlfwError::new(step::M3_LOAD, EINVAL as u32, EINVAL));
+        }
         let Some(mut mem) = self.dma.alloc_coherent(data.len()) else {
             self.client.pipe.log(format_args!(
                 "failed to allocate memory for M3 with size {}",
@@ -1218,13 +1232,15 @@ impl DmaAllocator for Dma32 {
 
 /// A firmware blob held open by its read cap.
 #[derive(Debug)]
-pub struct FwBlob(narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>);
+pub struct FwBlob(crate::firmware_asset::Asset);
 
 impl AsRef<[u8]> for FwBlob {
     fn as_ref(&self) -> &[u8] {
-        narf_firmware::view_of(&self.0)
-            .map(|v| v.bytes)
-            .unwrap_or(&[])
+        if self.0.current() {
+            &self.0.bytes
+        } else {
+            &[]
+        }
     }
 }
 
@@ -1245,13 +1261,226 @@ impl NarfFirmware {
 impl FirmwareLoader for NarfFirmware {
     type Blob = FwBlob;
     fn request(&mut self, path: &str) -> Result<FwBlob, i32> {
-        let cap = narf_firmware::open(path, &self.auth).map_err(|e| match e {
-            narf_firmware::FirmwareError::NotFound => ENOENT,
-            narf_firmware::FirmwareError::OutOfMemory => ENOMEM,
-            _ => EINVAL,
-        })?;
-        // Check it is viewable now, so `as_ref` never sees an error.
-        narf_firmware::view_of(&cap).map_err(|_| EINVAL)?;
-        Ok(FwBlob(cap))
+        let file = path.rsplit('/').next().ok_or(EINVAL)?;
+        let board = matches!(
+            file,
+            "board.bin" | "board-2.bin" | "regdb.bin" | "caldata.bin"
+        ) || file.starts_with("cal-") && file.ends_with(".bin");
+        crate::firmware_asset::load(&self.auth, path, 16 * 1024 * 1024, board)
+            .map(FwBlob)
+            .map_err(|error| match error {
+                narf_firmware::FirmwareError::NotFound => ENOENT,
+                narf_firmware::FirmwareError::OutOfMemory => ENOMEM,
+                _ => EINVAL,
+            })
     }
+}
+
+#[cfg(feature = "kernel-test")]
+mod asset_authority_tests {
+    use super::*;
+    use crate::firmware_asset::tests::install;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_ath11k_board_calibration_regdb_require_signer_and_owned_blob_honors_epoch(
+    ) -> TestResult {
+        let (write, read) = narf_firmware::bootstrap_authority();
+        let mut files = NarfFirmware { auth: read };
+        for name in [
+            "ath11k/narf-test/board-2.bin",
+            "ath11k/narf-test/board.bin",
+            "ath11k/narf-test/caldata.bin",
+            "ath11k/narf-test/cal-pci-fffe:fc:1b.0.bin",
+            "ath11k/narf-test/regdb.bin",
+        ] {
+            match install(&write, name, b"inert-board-policy", false) {
+                Ok(()) => {
+                    if files.request(name).is_ok() {
+                        return TestResult::Fail(
+                            "developer unsigned Qualcomm board/cal/regdb was admitted",
+                        );
+                    }
+                }
+                Err(narf_firmware::FirmwareError::UnsignedRejected) => {}
+                Err(_) => return TestResult::Fail("unexpected board fixture installation failure"),
+            }
+            install(&write, name, b"inert-board-policy", true).unwrap();
+            let blob = files.request(name).unwrap();
+            if blob.as_ref() != b"inert-board-policy" {
+                return TestResult::Fail("signed board bytes changed during owned current copy");
+            }
+            blob.0.cap.revoke();
+            if !blob.as_ref().is_empty() {
+                return TestResult::Fail("revoked board cap still exposed active request bytes");
+            }
+        }
+        let executable = "ath11k/narf-test/amss.bin";
+        match install(&write, executable, b"inert-executable", false) {
+            Ok(()) => {
+                if files.request(executable).unwrap().as_ref() != b"inert-executable" {
+                    return TestResult::Fail("explicit developer executable policy changed");
+                }
+            }
+            Err(narf_firmware::FirmwareError::UnsignedRejected) => {}
+            Err(_) => {
+                return TestResult::Fail("unexpected executable fixture installation failure")
+            }
+        }
+        read.revoke();
+        if files.request("ath11k/narf-test/board-2.bin").is_ok() {
+            return TestResult::Fail("revoked ath11k registry read bypassed current invocation");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/ath11k/wlfw",
+        smoke_ath11k_board_calibration_regdb_require_signer_and_owned_blob_honors_epoch
+    );
+    // Revoke an actual installed blob cap precisely between board-offset
+    // parsing and the operation's second snapshot. No borrowed registry view
+    // or fabricated signer metadata participates in this fixture.
+    struct RevokingBlob {
+        blob: FwBlob,
+        reads: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+        revoke_on: usize,
+    }
+    impl AsRef<[u8]> for RevokingBlob {
+        fn as_ref(&self) -> &[u8] {
+            let read = self
+                .reads
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if read == self.revoke_on {
+                self.blob.0.cap.revoke();
+            }
+            self.blob.as_ref()
+        }
+    }
+    struct RevokingFiles {
+        registry: NarfFirmware,
+        reads: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+        revoke_on: usize,
+        issued:
+            Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
+    }
+    impl FirmwareLoader for RevokingFiles {
+        type Blob = RevokingBlob;
+        fn request(&mut self, path: &str) -> Result<Self::Blob, i32> {
+            let blob = self.registry.request(path)?;
+            self.issued = Some(blob.0.cap);
+            Ok(RevokingBlob {
+                blob,
+                reads: self.reads.clone(),
+                revoke_on: self.revoke_on,
+            })
+        }
+    }
+    struct NoTargetTraffic(alloc::sync::Arc<core::sync::atomic::AtomicUsize>);
+    impl QrtrPipe for NoTargetTraffic {
+        fn send(&mut self, _: &[u8]) -> Result<(), i32> {
+            self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Err(EINVAL)
+        }
+        fn poll(&mut self) {}
+        fn recv(&mut self) -> Option<Vec<u8>> {
+            None
+        }
+        fn wait(&mut self, _: u32) -> impl core::future::Future<Output = ()> + Send {
+            core::future::ready(())
+        }
+        fn now_ms(&self) -> u64 {
+            0
+        }
+    }
+    struct NoTargetDma(alloc::sync::Arc<core::sync::atomic::AtomicUsize>);
+    impl DmaAllocator for NoTargetDma {
+        type Mem = narf_io::DmaBuffer;
+        fn alloc_coherent(&mut self, _: usize) -> Option<Self::Mem> {
+            self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+    fn smoke_ath11k_actual_board_epoch_between_parse_and_snapshot_fails_before_target_io(
+    ) -> TestResult {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use core::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let (write, read) = narf_firmware::bootstrap_authority();
+        install(
+            &write,
+            "ath11k/narf-epoch-boundary/board.bin",
+            b"inert-board-policy",
+            true,
+        )
+        .unwrap();
+        install(
+            &write,
+            "ath11k/narf-epoch-boundary/m3.bin",
+            b"inert-m3",
+            true,
+        )
+        .unwrap();
+        for (file, revoke_on) in [("board", 2), ("m3", 1)] {
+            let calls = alloc::sync::Arc::new(AtomicUsize::new(0));
+            let reads = alloc::sync::Arc::new(AtomicUsize::new(0));
+            let files = RevokingFiles {
+                registry: NarfFirmware { auth: read },
+                reads: reads.clone(),
+                revoke_on,
+                issued: None,
+            };
+            let mut cfg = WlfwConfig::pci(
+                HwRev::Wcn6855Hw21,
+                0x17cb,
+                0x1103,
+                0x17aa,
+                0xffff,
+                String::from("fffe:fc:1b.0"),
+                Vec::new(),
+            )
+            .unwrap();
+            cfg.fw_dir = "narf-epoch-boundary";
+            let mut owner = Wlfw::new(
+                NoTargetTraffic(calls.clone()),
+                files,
+                NoTargetDma(calls.clone()),
+                cfg,
+            )
+            .unwrap();
+            let (result, expected) = if file == "board" {
+                let mut future = core::pin::pin!(owner.load_bdf_qmi(false));
+                let result = match future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                {
+                    Poll::Ready(value) => value,
+                    Poll::Pending => return TestResult::Fail("revoked board reached target wait"),
+                };
+                (result, step::BDF_FETCH)
+            } else {
+                (owner.m3_load(), step::M3_LOAD)
+            };
+            if !matches!(result,Err(WlfwError {step,errno:EINVAL,..}) if step==expected)
+                || reads.load(Ordering::Acquire) != revoke_on
+                || owner
+                    .fw
+                    .issued
+                    .is_none_or(|cap| cap.invoke(narf_capabilities::NoopOp).is_ok())
+                || calls.load(Ordering::Acquire) != 0
+                || owner.board_choice.is_some()
+                || owner.m3.is_some()
+                || owner.m3_size != 0
+            {
+                return TestResult::Fail(
+                    "revoked owned blob panicked, published readiness, or reached target DMA/QMI",
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/ath11k/wlfw",
+        smoke_ath11k_actual_board_epoch_between_parse_and_snapshot_fails_before_target_io
+    );
 }

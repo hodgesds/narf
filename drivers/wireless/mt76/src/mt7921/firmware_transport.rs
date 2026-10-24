@@ -580,11 +580,9 @@ impl Firmware {
         auth: &narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<Self, Error> {
         let (patch, ram) = super::pci::firmware_blobs_for(did);
-        let p = narf_firmware::open(patch, auth).map_err(|_| Error::InvalidFirmware)?;
-        let r = narf_firmware::open(ram, auth).map_err(|_| Error::InvalidFirmware)?;
-        let p = narf_firmware::view_of(&p).map_err(|_| Error::Authority)?;
-        let r = narf_firmware::view_of(&r).map_err(|_| Error::Authority)?;
-        Self::prepare(p.bytes, r.bytes)
+        let patch = super::firmware_assets::load(auth, patch)?;
+        let ram = super::firmware_assets::load(auth, ram)?;
+        Self::prepare(&patch, &ram)
     }
 }
 

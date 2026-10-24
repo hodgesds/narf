@@ -17,13 +17,13 @@ matching a PCI ID or testing a command encoder does not establish a WLAN.
 | **iwlwifi** | Gen3 MLD station (Sc/BE211), retained Gen2 boot/passive-scan/disabled-peer prerequisites | Live Gen3 station runtime; hardware acceptance pending | Firmware CPU release, versioned setup, retained maintenance/EAPOL and credit-independent packet progress; Gen2 context-v1/RFH/TFH boot, policy-bound API77 passive scans and retained TX-disabled AP-peer ADD/REMOVE are implemented, with automatic Gen2 station admission still gated — `iwlwifi.md` |
 | **ath11k** | WCN6855-family and native QCA6390 profiles | Live station/runtime profiles; hardware acceptance pending | QCA6390 uses native IPQ8074 RX descriptors and four-vdev resources; QCN9074 remains gated pending its HAL/DP path — `ath11k.md` |
 | **mt76** | MT7921/MT7922 CONNAC2 | Retained legacy 2.4/5 GHz station service on both architectures | Host-policy power/channel requests, UNI station/key commands, peer-bound RSNA, hardware CCMP replay checks, kernel/frame-ring service and verified reset/reload — `mt7921.md` |
-| **rtw88** | RTL8821CE/RTL8822BE/RTL8822CE | RTL8822CE retained authenticated firmware, complete factory/OTP/feature response, inactive MAC/PHY tables and signed board-power qualification | Calibration/firmware H2C, ordinary packet rings and station control remain software work; no packet TX is admitted — `rtw88.md` |
-| **rtw89** | RTL8852A/B/C, RTL8851B AX | Retained cold discovery, factory, PCI/CH12/WCPU and RTL8852B SCC MAC/RXBD/RPQ/C2H prerequisites | RF-v1 and source table selection are checked; full table execution/RFK/channel, packet TX/station service and probe attachment remain software work — `rtw89.md` |
+| **rtw88** | RTL8822CE initial station; RTL8821CE/RTL8822BE identification | Signed-board-power-gated channel1 native station through actual kernel DHCP | Retained firmware/MAC/PHY/calibration/H2C, host RSNA/CCMP, exact DMA plus CCX M4 receipts and terminal disconnect are implemented; measured deployment assets and physical qualification remain — `rtw88.md` |
+| **rtw89** | RTL8852B initial profile; RTL8852A/C, RTL8851B prerequisites | Retained cold/factory/PCI/WCPU, SCC MAC/RXBD/RPQ/C2H, source BB/gain/RF tables and bounded basic calibration | Current measured calibration qualification and firmware-confirmed coexistence keep ordinary CMAC TX gated; full RF/channel/power, packet TX/station service and probe attachment remain software work — `rtw89.md` |
 | **rtlwifi** | RTL8188EE PCIe | Factory-qualified channel1 native polled station through actual kernel DHCP | Signed board curves, native mailbox/beacon prerequisites, exact DMA M4/RX-idle admission and terminal retained disconnect are implemented; physical qualification and wider profiles remain — `rtlwifi.md` |
 | **rtl8xxxu** | RTL8188EU USB firmware profile | Signed-board-power-gated channel1 native station service, Open/WPA2-PSK CCMP with retained RSNA and persistent USB RX/TX | Actual board calibration artifacts/physical qualification, reset/rejoin, broader channels/rates and other silicon profiles remain — `rtl8xxxu.md` |
 | **ath10k** | QCA988x/QCA6174 and related PCIe parts | Retained RAW/non-PFC legacy native station service through kernel DHCP | All six dialects compose synchronous CE/HTC/HTT, scan/join, host RSNA/CCMP, current policy, exact packet receipts and terminal connection-loss/teardown; authenticated assets, physical acceptance and wider profiles remain — `ath10k.md` |
 | **ath9k** | AR9285 | Retained EEPROM/calibration, native non-EDMA and channel1 basic1Mbps soft-MAC station through actual kernel DHCP | Current capability/policy, factory RF-silent input, exact M4 receipt/RX-idle fencing and terminal retained stop are implemented; physical acceptance and wider profiles remain — `ath9k.md` |
-| **brcmfmac** | Explicit BCM43602 PCIe board profiles | CR4/msgbuf transport and constrained native FullMAC station path | Common CYW station/security logic, correlated data/control and ACK-fenced flow reuse are implemented; actual board selection, broader silicon, recovery and PM remain software work — `brcmfmac.md` |
+| **brcmfmac** | Explicit BCM43602 PCIe board profiles | Signed exact-host board selection, retained CR4/msgbuf and native FullMAC station through kernel DHCP | Common CYW station/security logic, correlated data/control and ACK-fenced flow reuse are implemented; actual deployment assets, physical qualification, broader silicon, recovery and PM remain — `brcmfmac.md` |
 | **cyw43439** | Infineon SDIO FullMAC | Standard PCI SDHCI/explicit card bootstrap through F2 station attachment | Owned PIO enumeration, trusted firmware/NVRAM/CLM, discovered cores/RAM, mailbox/FIFO control and station/data; board wiring, gSPI host, reset/reload/PM remain — `cyw43439.md` |
 
 All eleven families are included in the software bring-up scope. The current
@@ -31,9 +31,9 @@ acceptance target is each documented initial station profile through scan,
 Open/WPA2, DHCP and bidirectional IP, with safe disconnect/failure ownership.
 Profiles that deliberately stop after an ambiguous failure may require a fresh
 device lifecycle for the first hardware validation; broader PHY/chip coverage,
-automatic recovery and PM are separate work. Several
-entries still require a substantial hardware-driver port before physical
-station validation is meaningful; build and model-test success must not be
+automatic recovery and PM are separate work. RTL8852B
+still requires substantial implementation before physical station validation
+is meaningful; build and model-test success must not be
 reported as having closed those software gaps. The family documents list the
 ordered missing implementations. The current loadable MT76 module likewise
 registers PCI IDs only; its packet ABI integration remains software work.

@@ -44,6 +44,7 @@ impl Harness {
         device.admit_for_test();
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::register(name, plan.station, send);
+        narf_net::iface::set_link_state(name, true); // operator IFF_UP
         device.link(None);
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
@@ -91,6 +92,12 @@ impl Harness {
         tests::complete(self.device.associate(self.request())).unwrap();
         assert!(self.device.link_up());
         assert_eq!(self.device.connected_bssid(), Some(AP));
+        // Operator DOWN must survive another real radio carrier sample.
+        narf_net::iface::set_link_state(self.device.name(), false);
+        self.device.drain();
+        assert!(narf_net::iface::lookup(self.device.name())
+            .is_some_and(|iface| !iface.link_up && iface.carrier));
+        narf_net::iface::set_link_state(self.device.name(), true);
     }
     fn pump(&self) {
         for _ in 0..16 {
@@ -101,7 +108,7 @@ impl Harness {
         !self.device.link_up()
             && self.device.connected_bssid().is_none()
             && narf_net::iface::lookup(self.device.name())
-                .is_some_and(|iface| !iface.carrier && !iface.link_up)
+                .is_some_and(|iface| !iface.carrier && iface.link_up)
     }
     fn received(&self) -> Vec<Vec<u8>> {
         let mut result = Vec::new();
@@ -404,4 +411,93 @@ fn smoke_ar9285_native_device_entropy_and_peer_deadline_fail_closed() -> TestRes
 kernel_test_in!(
     "drivers/wireless/ath9k/device",
     smoke_ar9285_native_device_entropy_and_peer_deadline_fail_closed
+);
+
+fn smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons() -> TestResult {
+    use narf_wireless::eapol::{
+        KeyFrame, KI_KEY_ACK, KI_KEY_MIC, KI_KEY_TYPE_PAIRWISE, KI_VERSION_HMAC_SHA1_AES,
+    };
+    let h = Harness::new(true);
+    h.join();
+    let mappings = h
+        .model
+        .regions
+        .borrow()
+        .iter()
+        .map(|r| (r.bus, r.cpu, r.len))
+        .collect::<Vec<_>>();
+    let before = h.model.transmitted.borrow().len();
+    let mut m1 = KeyFrame::empty(16);
+    m1.key_information = KI_KEY_TYPE_PAIRWISE | KI_KEY_ACK | KI_VERSION_HMAC_SHA1_AES;
+    m1.key_length = 16;
+    m1.replay_counter = 3;
+    m1.key_nonce = [0xbb; 32];
+    let mut ethernet = h.plan.station.to_vec();
+    ethernet.extend_from_slice(&AP);
+    ethernet.extend_from_slice(&[0x88, 0x8e]);
+    ethernet.extend_from_slice(&m1.into_eapol());
+    let wire = h.peer.lock().downlink(&ethernet).unwrap();
+    h.model.inject(&wire, 0).unwrap();
+    h.pump();
+    let m2 = h.peer.lock().uplink.last().cloned().unwrap_or_default();
+    let reply = m2.get(18..).and_then(|bytes| KeyFrame::decode(bytes, 16));
+    if reply.is_none_or(|key| key.replay_counter != 3 || key.key_information & KI_KEY_MIC == 0)
+        || m2.get(12..14) != Some(&[0x88, 0x8e])
+        || h.model.transmitted.borrow().len() != before + 1
+        || h.model.tx.get().is_some()
+        || !h.device.radio.try_lock().unwrap().ready()
+        || !h.device.link_up()
+    {
+        return TestResult::Fail(
+            "AR9285 rekey lacks real terminal old-key M2 and reopened old-key port",
+        );
+    }
+    let start = h.env.now.load(Ordering::Acquire);
+    for delta in [1000, 2000, 3000, 4000, 4999] {
+        h.env.now.store(start + delta, Ordering::Release);
+        let beacon = h.peer.lock().ap.beacon();
+        h.model.inject(&beacon, 0).unwrap();
+        h.pump();
+        if !h.device.link_up() || !h.device.radio.try_lock().unwrap().ready() {
+            return TestResult::Fail(
+                "AR9285 valid beacons failed to retain the pre-deadline old-key station",
+            );
+        }
+    }
+    h.env.now.store(start + 5001, Ordering::Release);
+    let beacon = h.peer.lock().ap.beacon();
+    h.model.inject(&beacon, 0).unwrap();
+    h.pump();
+    let probe = udp_ipv4(
+        AP,
+        h.plan.station,
+        h.plan.lease_ip,
+        h.plan.server_ip,
+        49152,
+        7,
+        b"ar9285-missing-rekey-m3",
+    );
+    let retained = h
+        .model
+        .regions
+        .borrow()
+        .iter()
+        .map(|r| (r.bus, r.cpu, r.len))
+        .collect::<Vec<_>>();
+    if !h.closed()
+        || h.model.master.get()
+        || h.device.enqueue(&probe, Default::default()).is_ok()
+        || h.device.radio.try_lock().unwrap().ready()
+        || retained != mappings
+        || h.model.tx.get().is_some()
+    {
+        return TestResult::Fail(
+            "AR9285 fresh beacons hid M3 timeout or terminal failure lost retained DMA",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/device",
+    smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons
 );

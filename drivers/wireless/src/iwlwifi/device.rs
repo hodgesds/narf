@@ -313,7 +313,8 @@ impl Device {
     fn set_link(&self, up: bool) {
         let was_up = self.up.swap(up, Ordering::AcqRel);
         narf_net::iface::set_link_metadata(self.name(), up, None, None);
-        narf_net::iface::set_link_state(self.name(), up);
+        // Physical carrier preserves operator-controlled IFF_UP and never
+        // invokes an administrative open/stop hook under retained locks.
         if !up {
             self.bssid.store(0, Ordering::Release);
         }

@@ -69,8 +69,29 @@ command and build-time trusted public keys. RTL8188EU, RTL8188EE and RTL8822CE
 additionally require signed, measured per-factory-MAC board-power artifacts;
 neither these fixtures nor unsigned developer firmware can satisfy that
 requirement. EE uses `rtlwifi/rtl8188ee-cal-v1-<12 lowercase MAC hex digits>.bin`;
-8822CE uses `rtw88/rtw8822ce-cal-v1-<12 lowercase MAC hex digits>.bin`. The family
-specifications describe the exact factory, firmware and profile binding.
+8822CE uses `rtw88/rtw8822ce-cal-v2-<12 lowercase MAC hex digits>.bin`. Its v2
+qualification binds both calibration emission and the complete reachable
+autonomous response-rate envelope; a fixed1Mbps host data rate does not narrow
+hardware ACK/CTS power. The older v1 artifact cannot grant this station profile.
+The family specifications describe the exact factory, firmware and profile binding.
+
+BCM43602 and CYW43439 require an explicit board selection before firmware
+upload. The signed `brcm/wifi-board-selection-v1.bin` manifest binds the actual
+PCI or SDIO host/card identity, chip revisions and exact canonical asset keys,
+lengths and SHA256 digests. NVRAM and CLM must be signed even in an unsigned
+developer build. Executable-image development policy remains separate. Encode
+verified deployment records with
+`drivers/wireless/src/brcmfmac/provision/make_manifest.py`, then use the existing
+`pack-firmware` workflow to sign the manifest and selected board assets. The
+generator takes explicit host, board and file facts; it does not discover
+wiring, select a board by filename or create measured calibration. A trusted
+platform must still supply CYW power, clock and reset wiring.
+
+Registry staging may happen after device detection. Intel, BCM43602 and CYW
+retain parked startup owners; RTL8188EE exposes a bounded `pci::provision`
+continuation for its existing detected owner. Missing assets before the first
+hardware attempt remain retryable. A consumed, failed or cancelled native
+attempt cannot be replaced by reopening an asset name or reconstructing an owner.
 Keep proprietary
 originals and deployment calibration outside git and apply their distribution
 terms when packaging them.

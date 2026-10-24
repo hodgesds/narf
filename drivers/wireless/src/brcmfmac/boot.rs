@@ -98,12 +98,30 @@ impl<B: Bus> core::fmt::Debug for Cr4<B> {
 impl<B: Bus> Cr4<B> {
     /// Policy/identity admission precedes writes; actual cores come from
     /// EROM. Missing calibration policy is a software gate, not a fallback.
-    pub fn claim(mut bus: B, pci: PciIdentity, profile: BoardProfile) -> Result<Self, Error> {
+    pub fn claim(bus: B, pci: PciIdentity, profile: BoardProfile) -> Result<Self, Error> {
+        Self::claim_checked(bus, |chip| profile.admits(chip, pci))
+    }
+    pub(super) fn claim_selected(
+        bus: B,
+        pci: PciIdentity,
+        selection: &super::provision::Selection,
+    ) -> Result<Self, Error> {
+        let expected = selection.host().id;
+        Self::claim_checked(bus, |chip| {
+            selection.family() == super::provision::Family::Pcie43602
+                && expected.vendor == pci.vendor
+                && expected.device == pci.device
+                && expected.subsystem_vendor == pci.subsystem_vendor
+                && expected.subsystem_id == pci.subsystem_device
+                && selection.admits_chip(chip.id, chip.revision)
+        })
+    }
+    fn claim_checked(mut bus: B, admitted: impl FnOnce(&Chip) -> bool) -> Result<Self, Error> {
         if bus.dma_enabled()? {
             return Err(Error::State);
         }
         let chip = Chip::discover(&mut bus).map_err(Error::Chip)?;
-        if !profile.admits(&chip, pci) {
+        if !admitted(&chip) {
             return Err(Error::Board);
         }
         let mut arms = chip

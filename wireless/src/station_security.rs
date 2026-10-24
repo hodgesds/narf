@@ -151,6 +151,15 @@ impl Security {
             && self.pair.is_some()
             && self.group.iter().any(Option::is_some)
     }
+    /// A reply still awaits terminal delivery, or M2 has been delivered and
+    /// the retained supplicant still awaits M3. During an established rekey,
+    /// the old-key controlled port may reopen before this exchange finishes.
+    /// Drivers use this independently of carrier/port state for their timeout.
+    pub fn handshake_active(&self) -> bool {
+        !self.failed
+            && (self.pending.is_some()
+                || self.supplicant.state == crate::eapol::FourWayState::WaitM3)
+    }
     pub fn fail(&mut self) {
         self.failed = true;
         self.established = false;

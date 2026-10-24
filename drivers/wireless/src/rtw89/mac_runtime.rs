@@ -145,7 +145,10 @@ impl<I: Io> Access<'_, I> {
             | B_AX_RMAC_EN
             | B_AX_CMAC_CRPRT;
         self.m32(R_AX_CK_EN, clock, clock)?;
-        self.m32(R_AX_CMAC_FUNC_EN, function, function)?;
+        // Packet DMA stops do not suppress autonomous ACK/CTS. Keep global
+        // CMAC TX parked from this first enable until a measured current
+        // channel/response envelope authorizes ordinary RF transmission.
+        self.m32(R_AX_CMAC_FUNC_EN, function, function & !B_AX_CMAC_TXEN)?;
         self.m32(R_AX_SPS_DIG_ON_CTRL0, B_AX_OCP_L1_MASK, B_AX_OCP_L1_MASK)
     }
     async fn scc(&mut self) -> Result<(), Error> {
@@ -668,7 +671,8 @@ impl Mac {
             | B_AX_TMAC_EN
             | B_AX_RMAC_EN
             | B_AX_CMAC_CRPRT;
-        if a.r32(R_AX_DMAC_FUNC_EN)? & dmac != dmac || a.r32(R_AX_CMAC_FUNC_EN)? & cmac != cmac {
+        let functions = a.r32(R_AX_CMAC_FUNC_EN)?;
+        if a.r32(R_AX_DMAC_FUNC_EN)? & dmac != dmac || functions & cmac != cmac & !B_AX_CMAC_TXEN {
             return Err(Error::Access);
         }
         if a.r32(0x1010)? & 0x000b_0f00 != 0x000b_0f00

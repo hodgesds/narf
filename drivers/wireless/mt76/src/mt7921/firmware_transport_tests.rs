@@ -9,7 +9,7 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-fn firmware(bytes: usize) -> Firmware {
+pub(super) fn firmware(bytes: usize) -> Firmware {
     let mut patch = vec![0u8; 96 + 64 + bytes];
     patch[44..48].copy_from_slice(&1u32.to_be_bytes());
     patch[96..100].copy_from_slice(&2u32.to_be_bytes());

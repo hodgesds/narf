@@ -4,8 +4,8 @@
 //! per-board signed upper envelopes qualify every final conducted gain.
 use super::{efuse::Factory, radio};
 use alloc::{format, vec::Vec};
-use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_firmware::{FirmwareBlob, FirmwareError};
+use narf_capabilities::Read;
+use narf_firmware::FirmwareError;
 const HEADER: usize = 96;
 const ROW: usize = 260;
 const UNKNOWN: i16 = i16::MAX;
@@ -79,15 +79,6 @@ fn half(bytes: &[u8], at: usize) -> u16 {
 fn signed(bytes: &[u8], at: usize) -> i16 {
     i16::from_le_bytes(bytes[at..at + 2].try_into().unwrap())
 }
-struct ReadCalibration<'a>(&'a Factory);
-impl CapOp<FirmwareBlob, Read> for ReadCalibration<'_> {
-    type Output = Result<Calibration, Error>;
-    fn execute(self, cap: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
-        Ok(narf_firmware::view_of(cap)
-            .map_err(Error::Firmware)
-            .and_then(|view| Calibration::from_verified(view.bytes, view.signer, self.0)))
-    }
-}
 impl Calibration {
     pub fn load_registered(factory: &Factory) -> Result<Self, Error> {
         let name = format!(
@@ -102,9 +93,9 @@ impl Calibration {
         let authority = narf_firmware::trusted_loader_authority()
             .and_then(|cap| cap.derive::<Read>().ok())
             .ok_or(Error::Authority)?;
-        let cap = narf_firmware::open(&name, &authority).map_err(Error::Firmware)?;
-        cap.invoke(ReadCalibration(factory))
-            .map_err(|_| Error::Authority)?
+        let asset = crate::firmware_asset::load(&authority, &name, HEADER + 11 * ROW, true)
+            .map_err(Error::Firmware)?;
+        Self::from_verified(&asset.bytes, asset.signer, factory)
     }
     fn from_verified(
         bytes: &[u8],

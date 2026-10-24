@@ -53,6 +53,8 @@ use core::fmt;
 pub mod aggregation;
 pub mod bcast;
 pub mod boot_context;
+mod bootstrap;
+pub use bootstrap::{provision, provision_state, ProvisionState};
 pub mod connection;
 mod context_v1;
 pub mod data_queue;
@@ -101,7 +103,7 @@ use crate::iwlwifi::transport::IwlMmio;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_io::DmaBuffer;
-use narf_ipc::{channel, Consumer, Producer};
+use narf_ipc::{Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
@@ -1413,11 +1415,9 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
 
 // ── PCI probe (skeleton) ────────────────────────────────────────────
 
-/// PCI probe entry. Records the bound driver and resolves a
-/// firmware blob by walking the filename ladder. Hardware bring-up
-/// (BAR0 mapping, MMIO programming, ALIVE handshake) is deferred
-/// until the gen2/gen3 transport paths land — this commit only
-/// validates that we can match the device + find its firmware.
+/// PCI probe retains and parks the exact native binding, then defers all
+/// firmware resolution/startup to its retained executor-time continuation.
+/// Gen2 native station publication remains gated.
 static OWNED: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -1437,9 +1437,24 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             }
         }
     };
-    mmio::park(&device, &cap).map_err(narf_bus::ProbeError::Other)?;
+    // Retain the exact current native binding before even initial parking.
+    // Gen2's existing boot/passive APIs remain separate from native station publication.
+    let startup = if !extra && rx_rfh::CompletionFormat::for_mac(chip.mac).is_some() {
+        Some(bootstrap::retain(device, cap, chip.clone()))
+    } else {
+        None
+    };
+    if let Err(error) = mmio::park(&device, &cap) {
+        if let Some(owner) = &startup {
+            owner.fail();
+        }
+        return Err(narf_bus::ProbeError::Other(error));
+    }
     if extra {
         return Ok(());
+    }
+    if let Some(owner) = &startup {
+        owner.parked();
     }
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("iwlwifi"),
@@ -1469,340 +1484,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         return Ok(());
     }
 
-    // Walk the firmware ladder. First match wins — the registry's
-    // `open` returns NotFound for absent blobs, so we just iterate
-    // until something resolves or we run out of candidates.
-    let ladder = firmware_filename_ladder(&chip);
-    let auth = match narf_firmware::trusted_loader_authority() {
-        Some(a) => a.derive().ok(),
-        None => None,
-    };
-    let auth = match auth {
-        Some(a) => a,
-        None => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "  iwlwifi: no trusted-loader authority — skipping firmware load"
-            );
-            return Ok(());
-        }
-    };
-    let mut matched_name: Option<String> = None;
-    for candidate in &ladder {
-        if narf_firmware::open(candidate.as_str(), &auth).is_ok() {
-            matched_name = Some(candidate.clone());
-            break;
-        }
+    if let Some(owner) = startup {
+        bootstrap::schedule(owner);
     }
-    let matched_name = match matched_name {
-        Some(n) => n,
-        None => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "  iwlwifi: no firmware found ({} candidates tried)",
-                ladder.len(),
-            );
-            return Ok(());
-        }
-    };
-    let _ = writeln!(
-        narf_console::Writer,
-        "  iwlwifi: firmware resolved to {}",
-        matched_name,
-    );
-
-    // Parse + summarise the firmware to confirm the registry blob
-    // is actually a valid Intel TLV container.
-    let fw_cap = match narf_firmware::open(matched_name.as_str(), &auth) {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
-    };
-    let view = match narf_firmware::view_of(&fw_cap) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
-    match parse_ucode(view.bytes) {
-        Ok(parsed) => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "  iwlwifi:   header.version={:#x} build={} hr={:?}",
-                parsed.header.version,
-                parsed.header.build,
-                parsed.header.human_readable,
-            );
-            let _ = writeln!(
-                narf_console::Writer,
-                "  iwlwifi:   {} init sec, {} rt sec, num_cpu={}, pnvm={:?}, unk_tlvs={}",
-                parsed.init_sections.len(),
-                parsed.rt_sections.len(),
-                parsed.num_of_cpu,
-                parsed.pnvm_version,
-                parsed.unknown_tlv_count,
-            );
-            if let Some((ma, mi, api)) = parsed.fw_version {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  iwlwifi:   fw_version={}.{} api={}",
-                    ma,
-                    mi,
-                    api,
-                );
-            }
-
-            // ── Hardware bring-up ──
-
-            // Verify parking before BAR sizing and enable checked Device memory.
-            let mmio_region = mmio::map(&device, &cap).map_err(narf_bus::ProbeError::Other)?;
-            if let Some(format) = rx_rfh::CompletionFormat::for_mac(chip.mac) {
-                // Country selection is deployment policy, not inferred from
-                // a language/timezone or an unauthenticated AP beacon.
-                if let Err(error) = narf_wireless::reg::db::ensure_domain() {
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "iwlwifi: regulatory policy: {}",
-                        error
-                    );
-                }
-                // Startup waits for DMA responses; it must run in executor
-                // context, without blocking probe or holding an IRQ lock.
-                let firmware = view.bytes.to_vec();
-                let external_pnvm = if parsed.api.pnvm.is_none() {
-                    matched_name.rsplit_once('-').and_then(|(prefix, _)| {
-                        let name = format!("{}.pnvm", prefix);
-                        let cap = narf_firmware::open(&name, &auth).ok()?;
-                        let view = narf_firmware::view_of(&cap).ok()?;
-                        Some(view.bytes.to_vec())
-                    })
-                } else {
-                    None
-                };
-                narf_scheduler::spawn(async move {
-                    let result = async {
-                        let mut parsed = parse_ucode(&firmware).map_err(|_| "invalid firmware")?;
-                        if parsed.api.pnvm.is_none() {
-                            parsed.api.pnvm = external_pnvm.as_deref();
-                        }
-                        let hardware =
-                            runtime::Hardware::new(device, cap, mmio_region, &parsed, format)?;
-                        device::Device::initialize(hardware, &parsed, &firmware).await
-                    }
-                    .await;
-                    match result {
-                        Ok(interface) => {
-                            let _ = writeln!(
-                                narf_console::Writer,
-                                "  iwlwifi: MLD firmware initialized, MAC {:02x?}",
-                                interface.mac()
-                            );
-                            match interface.start_pumps() {
-                                Ok(()) => narf_wireless::registry::register(interface),
-                                Err(error) => {
-                                    let _ = writeln!(
-                                        narf_console::Writer,
-                                        "iwlwifi: interface registration: {}",
-                                        error
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let _ = writeln!(
-                                narf_console::Writer,
-                                "  iwlwifi: startup failed: {}",
-                                error
-                            );
-                        }
-                    }
-                });
-                return Ok(());
-            }
-            let mut mmio = IwlMmioImpl::new(mmio_region, cap);
-
-            // 2. APM Init (clocks + reset prologue).
-            transport::apm_init(&mut mmio).map_err(|e| {
-                let _ = writeln!(narf_console::Writer, "  iwlwifi: APM init failed: {:?}", e);
-                narf_bus::ProbeError::Other("APM init failed")
-            })?;
-
-            // 3. Firmware load + ALIVE handshake.
-            let mut allocator = fw_loader::DmaAllocatorImpl::new();
-            let mut alive = transport::PollingAliveSink::new(mmio_region, cap);
-
-            match fw_loader::load_firmware(&mut mmio, &chip, &parsed, &mut allocator, &mut alive) {
-                Ok(()) => {
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "  iwlwifi: ALIVE handshake successful"
-                    );
-                }
-                Err(e) => {
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "  iwlwifi: firmware load failed: {:?}",
-                        e
-                    );
-                    return Err(narf_bus::ProbeError::Other("Firmware load failed"));
-                }
-            }
-
-            // 3b. Flush the BCAST_FILTER cache so the firmware starts
-            //     forwarding beacons/probe-responses up to the host
-            //     RX queue (required before scan can collect BSSes).
-            //     The TX queue isn't fully wired this early so we
-            //     stash the encoded body for later dispatch by the
-            //     scan path. (cmd id 0xCD, group 0.)
-            let _bcast_flush_body = bcast::build_flush_cmd();
-            let _ = writeln!(
-                narf_console::Writer,
-                "  iwlwifi: BCAST_FILTER flush staged (cmd 0x{:02X})",
-                bcast::BCAST_FILTER_CMD,
-            );
-
-            // 4. Hardware Initialization (RX/TX rings).
-
-            // Allocate RX ring memory.
-            let rx_ring_mem = narf_io::alloc_coherent(
-                rx::RX_RING_SIZE * core::mem::size_of::<rx::RxDescriptor>(),
-                narf_lib::id::DomainId::DRIVER_0,
-            )
-            .map_err(|_| narf_bus::ProbeError::Other("RX ring alloc failed"))?;
-
-            // Allocate RX buffers.
-            let mut rx_buffers = Vec::with_capacity(rx::RX_RING_SIZE);
-            for _ in 0..rx::RX_RING_SIZE {
-                let buf = narf_io::alloc_coherent(rx::RXB_SIZE, narf_lib::id::DomainId::DRIVER_0)
-                    .map_err(|_| narf_bus::ProbeError::Other("RX buffer alloc failed"))?;
-                rx_buffers.push(buf);
-            }
-
-            // Fill RX descriptors.
-            let rx_descs = rx_ring_mem.as_mut_ptr() as *mut rx::RxDescriptor;
-            for (i, buf) in rx_buffers.iter().enumerate() {
-                // SAFETY: `rx_ring_mem` is a coherent buffer of exactly
-                // `RX_RING_SIZE` `RxDescriptor`s, and `i` ranges over
-                // `0..rx_buffers.len()` which equals `RX_RING_SIZE`, so
-                // `rx_descs.add(i)` points at descriptor `i` in bounds
-                // and is properly aligned for `RxDescriptor`.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                unsafe {
-                    (*rx_descs.add(i)).host_phys = buf.dma_addr().raw();
-                }
-            }
-
-            // Allocate TX ring memory (queue 0).
-            let tx_ring0_mem = narf_io::alloc_coherent(
-                tx::TX_RING_SIZE * core::mem::size_of::<tx::Tfd>(),
-                narf_lib::id::DomainId::DRIVER_0,
-            )
-            .map_err(|_| narf_bus::ProbeError::Other("TX ring alloc failed"))?;
-
-            // Allocate TX command buffers (queue 0).
-            let tx_cmd0_mem =
-                narf_io::alloc_coherent(tx::TX_RING_SIZE * 32, narf_lib::id::DomainId::DRIVER_0)
-                    .map_err(|_| narf_bus::ProbeError::Other("TX cmd buffer alloc failed"))?;
-
-            // ── 4a. Interrupt setup ──
-            //
-            // iwlwifi exposes up to 32 MSI-X vectors with per-cause
-            // routing. The bring-up path uses three causes (RX/ALIVE,
-            // TX completion, fatal errors); see `iwl_msix.rs`.
-            // PCI-side: allocate three CPU vectors and program the
-            // first three MSI-X table entries. BAR0-side: program the
-            // per-cause IVAR bytes via `iwl_msix::program_default_causes`.
-            let mut irq_vector = None;
-            if let Ok(v) = narf_interrupts::vector::alloc() {
-                if let Ok(mut msix) = narf_bus::msix::enable_msix(&cap, &device) {
-                    // SAFETY: `msix` is the MSI-X capability just enabled
-                    // for `device`, which this driver owns exclusively
-                    // during probe, so we're the sole writer of its
-                    // table. `v`/`v_tx`/`v_err` are CPU vectors freshly
-                    // allocated from `narf_interrupts::vector::alloc`,
-                    // and the table indices (RX_ALIVE/TX/ERR) are within
-                    // iwlwifi's MSI-X table size.
-                    // SAFETY: Valid MMIO bounds or trusted driver environment
-                    unsafe {
-                        let _ = msix.program_vector(iwl_msix::VECTOR_RX_ALIVE as u16, 0, v);
-                        // Try to allocate two more CPU vectors for TX
-                        // and ERR; fall through if we can't get them.
-                        if let Ok(v_tx) = narf_interrupts::vector::alloc() {
-                            let _ = msix.program_vector(iwl_msix::VECTOR_TX as u16, 0, v_tx);
-                            narf_interrupts::install_handler(v_tx, || {});
-                        }
-                        if let Ok(v_err) = narf_interrupts::vector::alloc() {
-                            let _ = msix.program_vector(iwl_msix::VECTOR_ERR as u16, 0, v_err);
-                            narf_interrupts::install_handler(v_err, || {});
-                        }
-                        let _ = msix.enable();
-                    }
-                    // Program the per-cause IVAR bytes via BAR0.
-                    iwl_msix::program_default_causes(&mut mmio);
-                    irq_vector = Some(v);
-                } else if let Ok(mut msi) = narf_bus::msi::enable_msi(&cap, &device, 1) {
-                    // SAFETY: `msi` is the MSI capability just enabled
-                    // for `device`, whose cfg window this driver owns
-                    // exclusively during probe; `v` is a freshly
-                    // allocated CPU vector. So programming the single
-                    // MSI message and enabling it has no concurrent
-                    // writer.
-                    // SAFETY: Valid MMIO bounds or trusted driver environment
-                    unsafe {
-                        let _ = narf_bus::msi::program_msi(&mut msi, 0, v);
-                        let _ = narf_bus::msi::enable(&msi);
-                    }
-                    irq_vector = Some(v);
-                }
-
-                if let Some(v) = irq_vector {
-                    narf_interrupts::install_handler(v, || {});
-                }
-            }
-
-            // Program hardware RX registers.
-            mmio.write(
-                rx::CSR_FH_MEM_RSCSR_CHNL0_RBDCB_BASE_REG,
-                rx_ring_mem.dma_addr().raw() as u32,
-            );
-            mmio.write(rx::CSR_FH_RSCSR_CHNL0_WPTR, (rx::RX_RING_SIZE - 1) as u32);
-
-            // 5. Instantiate and register the device.
-            // TODO: Read real MAC from hardware/firmware.
-            let mac_addr = [0x00, 0x16, 0xEA, 0x12, 0x34, 0x56];
-
-            let rx_q = rx::RxQueue::new(rx_descs, rx_ring_mem.dma_addr().raw());
-            let tx_q0 = tx::TxQueue::new(0, tx_ring0_mem.as_mut_ptr() as *mut tx::Tfd);
-
-            let device = Arc::new(IwlDevice::new(
-                mmio_region,
-                cap,
-                chip,
-                mac_addr,
-                rx_q,
-                tx_q0,
-                rx_ring_mem,
-                alloc::vec![tx_ring0_mem],
-                alloc::vec![tx_cmd0_mem],
-                rx_buffers,
-                irq_vector,
-            ));
-
-            // Initialize IPC rings.
-            let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
-            let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
-
-            *device.rx_ring.lock() = Some(rx_cons);
-            *device.tx_ring.lock() = Some(tx_prod);
-
-            // Register with the wireless subsystem.
-            narf_wireless::registry::register(device.clone());
-
-            // 6. Spawn data pumps.
-            spawn_pumps(device, rx_prod, tx_cons);
-        }
-        Err(e) => {
-            let _ = writeln!(narf_console::Writer, "  iwlwifi:   parse failed: {}", e);
-        }
-    }
-
     Ok(())
 }
 

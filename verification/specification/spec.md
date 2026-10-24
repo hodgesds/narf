@@ -119,6 +119,27 @@ board-power checks cover actual retained continuations; RTL8852B checks
 post-WCPU MAC, 36-bit RXBD/RPQ/C2H, RF-v1 and conditional table selection.
 These software checks cannot establish RF readiness.
 
+RTL8822CE now composes that retained firmware/factory/radio owner through
+source station mailbox control, native raw packet DMA and CCX receipts into
+the same public Device and actual kernel DHCP client. Open/WPA2 fixtures
+consume published DMA and verify exact bidirectional IP. Held, altered and
+cancelled M4, queued peer loss, current policy and actual calibration-epoch
+revocation between descriptor write and doorbell close the controlled port.
+Its independently extracted original C fixtures check TXD/BD/RXD/CCX,
+calibration, source non-QoS DCF and mailbox fields.
+
+Signed FullMAC board-selection fixtures bind exact PCI/SDIO host/card facts
+and actual asset SHA256 before CR4/CM3 upload, then compose the selected
+native owner through DHCP/IP. Missing or revoked assets leave pre-attempt
+owners retryable; malformed executable extents fail before hardware admission.
+Separate retained-startup regressions cover Intel firmware staged after
+detection and RTL8188EU/EE asset retry on the same owner. Current firmware
+copies and native PCI/MMIO operations execute inside actual capability
+invocation, with revocation tests at the operation boundary. Physical carrier
+updates preserve operator IFF_UP and cannot invoke administrative hooks under
+driver locks. Whole rekey deadlines are tracked independently of pending
+reply/port state, including the old-key-open wait between M2 and M3.
+
 `narf_wifi_fixtures::firmware::metadata_replay(image_len, fragments)` builds
 parser-only structural images up to 16 MiB. It validates nonempty, ordered,
 nonoverlapping fragment extents before allocation and zeroes every opaque gap.

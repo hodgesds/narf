@@ -67,10 +67,29 @@ RTL8188EE probe retains `firmware_transport::Owner<firmware_native::PciIo>`
 before spawning `initialize_registered()`. `RtlwifiDevice::firmware_status()`
 returns the shared attempt state; other profiles return None. Registry selection
 uses exactly `rtlwifi/rtl8188efw.bin`, authenticated through firmware authority.
+Registry lookup and bounded image copying run inside actual current registry/blob
+`Cap::invoke`; only owned bytes reach the image parser or an awaited uploader.
 The complete 32-byte header, exact nonempty declared RAM-code length, 88E1
-signature and at most eight 4096-byte pages are checked before allocation/I/O.
+signature and at most eight 4096-byte pages are checked before native DMA
+allocation or register I/O. The measured board-envelope loader uses the same
+current lookup/copy boundary and still requires a verified signer; executable
+signature policy remains the firmware registry/build contract.
 The EE filename remains mandatory because the signature alone cannot distinguish
 USB EU firmware. Supplied-byte `initialize` is for authenticated owners/tests.
+Registered-source resolution, owned copy and complete header parsing precede the
+atomic attempt claim. Missing/revoked/invalid inputs leave the same Detected owner
+retryable without MMIO; genuinely begun owners return AlreadyStarted before
+resolving any new source. Real signed-registry fixtures cover denial followed by
+valid restaging and the unchanged one-shot hardware boundary.
+`pci::provision().await` exposes that bounded retry for the existing native
+controller only while its firmware is Detected. Probe's worker uses the same
+serialized entry. It clones the original firmware/Prepared/factory Arcs under
+CONTROLLER, releases the IRQ-safe lock before awaiting, and calls the existing
+native initializer; it never reconstructs ownership or resets/replays a begun
+attempt. Cancellation while waiting for the regular async admission mutex
+changes no owner state. Absent/non-EE/non-Detected controllers fail admission.
+The private native admission fixture checks exact Arc identity, cancelled wait
+and real one-shot Failed-owner denial with revoked, unreachable hardware.
 
 The one-shot owner closes CR HCI/TX/RX DMA and MAC packet gates and verifies
 readback, enables the CPU clock, performs 8051 reset when replacing a running
@@ -265,6 +284,11 @@ DHCP caller prevents other executor tasks from running. Both native-owner and
 endpoint-state mutexes are released before stack dispatch/reentrant ARP/ND TX.
 Missing signed board calibration or staged host policy can be retried from the
 retained parked radio/MAC boundary; a dirty/cancelled operation cannot retry.
+The existing public scan/associate facade invokes `Device::ready` before arming
+station cancellation. From RadioConfigured/ChannelConfigured it reloads the
+signed envelope/current domain, continues channel/MAC setup and stages station
+calibration on that same retained Prepared owner. It performs no firmware reset,
+owner reconstruction or second association attempt.
 
 Public passive scan validates channel/frequency, filters and bounded dwell;
 beacons/probe responses come only from actual consumed native RX descriptors.
@@ -331,6 +355,12 @@ Inert MMIO/DMA/AP and private signed-envelope fixtures establish software
 composition, not authenticated firmware execution on silicon or RF/power
 measurement. Physical operation still requires exact signed EE firmware,
 canonical signed regulatory policy and a measured matching NEPC board envelope.
+
+Physical carrier/peer publication does not change operator `IFF_UP` and never
+invokes administrative open/stop hooks while retained driver state is locked.
+Explicit registration, operator up/down and autoconnect remain administrative
+events. Disconnect/failure clears carrier and peer identity while preserving an
+operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
 ## 4. Invariants
 

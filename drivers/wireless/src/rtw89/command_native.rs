@@ -24,6 +24,15 @@ enum State {
     Active,
     Terminal,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CalibrationError {
+    Policy(super::calibration_policy::Error),
+    Coex(super::coex_native::Error),
+    Radio(super::radio_init::Error),
+    Rfk(super::rfk::Error),
+    Register(super::power::Error),
+    Profile,
+}
 pub struct Native {
     io: NativeIo,
     bdram: super::bdram::Bdram,
@@ -43,6 +52,14 @@ pub struct Native {
     state: State,
     receive: super::rx_dma::Rx,
     radio: super::rf_access::Rf,
+    runtime_sequence: u16,
+    calibration: Option<super::calibration_policy::Calibration>,
+    coex_ready: bool,
+    nctl_ready: bool,
+    calibrating: Option<super::rfk::Kind>,
+    scheduler: Option<super::scheduler_mailbox::Mailbox>,
+    gain_bases: Option<[i8; 2]>,
+    radio_started: bool,
 }
 fn barrier() {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -157,6 +174,14 @@ impl Native {
             state: State::Unpublished,
             receive: super::rx_dma::Rx::default(),
             radio: super::rf_access::Rf::default(),
+            runtime_sequence: 0,
+            calibration: None,
+            coex_ready: false,
+            nctl_ready: false,
+            calibrating: None,
+            scheduler: Some(super::scheduler_mailbox::Mailbox::default()),
+            gain_bases: None,
+            radio_started: false,
         })
     }
     pub(super) fn identity(&self) -> Option<super::factory::Identity> {
@@ -298,7 +323,7 @@ impl Native {
         }
         result
     }
-    fn radio_access(&self) -> Result<(), super::power::Error> {
+    fn radio_access(&mut self) -> Result<(), super::power::Error> {
         if self.state != State::Active
             || self.chip != ChipId::Rtl8852B
             || self.receive.state() != super::rx_dma::State::Polling
@@ -306,7 +331,244 @@ impl Native {
         {
             return Err(super::power::Error::Unsupported);
         }
-        self.io.b_phy_window()
+        self.io.b_phy_window()?;
+        let functions = self.io.read32(0xc000)?;
+        if functions == u32::MAX || functions & (1 << 29) != 0 {
+            return Err(super::power::Error::Access);
+        }
+        Ok(())
+    }
+    fn calibration_access(&mut self) -> Result<(), super::power::Error> {
+        self.calibration
+            .as_ref()
+            .ok_or(super::power::Error::Access)?
+            .current()
+            .map_err(|_| super::power::Error::Access)?;
+        self.radio_access()
+    }
+    fn register_access(&self) -> Result<(), super::power::Error> {
+        if self.state != State::Active {
+            return Err(super::power::Error::Terminal);
+        }
+        if let Some(calibration) = self.calibration.as_ref() {
+            calibration
+                .current()
+                .map_err(|_| super::power::Error::Access)?;
+        }
+        Ok(())
+    }
+    fn command_admission(&mut self) -> Result<(), Error> {
+        if self
+            .calibration
+            .as_ref()
+            .is_some_and(|c| c.current().is_err())
+        {
+            self.state = State::Terminal;
+            return Err(Error::Access);
+        }
+        Ok(())
+    }
+    /// # Safety
+    /// Same retained Startup, completed actual tables and exclusive radio
+    /// ownership. Cancellation/failure terminalizes this Native and retains
+    /// all possibly referenced DMA. This is calibration only, not TX admission.
+    pub(super) async unsafe fn prepare_basic_rfk(
+        &mut self,
+        tables: &super::radio_init::Init,
+        assets: &super::radio_assets::Assets,
+        coex: &mut super::coex_native::Coex,
+        rfk: &mut super::rfk::Rfk,
+    ) -> Result<(), CalibrationError> {
+        use CalibrationError as E;
+        self.radio_access().map_err(E::Register)?;
+        if tables.state() != super::radio_init::State::TablesLoaded
+            || self.calibration.is_some()
+            || self.coex_ready
+            || self.nctl_ready
+            || rfk.state() != super::rfk::State::New
+        {
+            return Err(E::Profile);
+        }
+        let factory = self.factory.as_ref().ok_or(E::Profile)?;
+        let identity = factory.identity().ok_or(E::Profile)?;
+        let board = super::calibration_policy::Board::new(factory, self.device.id, assets)
+            .map_err(E::Policy)?;
+        let calibration = super::calibration_policy::Calibration::load(board).map_err(E::Policy)?;
+        calibration.current().map_err(E::Policy)?;
+        let protocol = super::coex_native::Protocol::for_version(assets.firmware_version())
+            .ok_or(E::Profile)?;
+        let rfe = identity.calibration().rfe_type;
+        let cut = identity.cut();
+        self.calibration = Some(calibration);
+        // SAFETY: actual current signed measured calibration envelope above,
+        // same retained exact factory/B radio backend and CMAC TX closed.
+        unsafe { coex.prepare(self, rfe, cut, protocol).await }.map_err(E::Coex)?;
+        self.coex_ready = true;
+        // Exact bb_sethw prefix; full channel/CCA/TRX controls remain later.
+        self.gain_bases = Some(super::radio_init::controls(self).map_err(E::Radio)?);
+        let nctl = super::radio_table::program(assets.table(4).ok_or(E::Profile)?, rfe, cut)
+            .map_err(|_| E::Profile)?;
+        super::radio_init::nctl(self, &nctl)
+            .await
+            .map_err(E::Radio)?;
+        self.nctl_ready = true;
+        // SAFETY: actual NCTL, source WLAN-only owner and currently valid
+        // measured recipe/channel policy are retained on this same Native.
+        unsafe { rfk.prepare(self).await }.map_err(E::Rfk)
+    }
+    /// # Safety
+    /// Same retained Startup radio attempt; cancellation closes this Native
+    /// while keeping every published DMA mapping and quarantine alive.
+    pub(super) async unsafe fn prepare_radio_tables(
+        &mut self,
+        owner: &mut super::radio_init::Init,
+        assets: &super::radio_assets::Assets,
+    ) -> Result<(), super::radio_init::Error> {
+        self.radio_access()?;
+        let qualified = super::radio_init::Qualified::from_factory(
+            self.factory
+                .as_ref()
+                .ok_or(super::radio_init::Error::Profile)?,
+        )
+        .ok_or(super::radio_init::Error::Profile)?;
+        // Latch before the first possible BB/RF write; cancellation cannot
+        // hide independent PMAC/NCTL state from terminal emission closure.
+        self.radio_started = true;
+        // SAFETY: actual factory, MAC/RX backend and full current B aperture
+        // above; outer retained Startup attempt handles cancellation/failure.
+        unsafe { owner.prepare(self, qualified, assets).await }
+    }
+    async fn upload_radio_page(
+        &mut self,
+        path: u8,
+        page: u8,
+        bytes: &[u8],
+    ) -> Result<(), super::radio_init::Error> {
+        self.radio_access()?;
+        self.transmit_radio_page(path, page, bytes).await
+    }
+    fn radio_page_packet(
+        &mut self,
+        path: u8,
+        page: u8,
+        bytes: &[u8],
+    ) -> Result<alloc::vec::Vec<u8>, super::radio_init::Error> {
+        use super::radio_init::Error as RadioError;
+        if path > 1
+            || page >= 3
+            || bytes.is_empty()
+            || bytes.len() > 2000
+            || bytes.len() % 4 != 0
+            || self.runtime_sequence >= 256
+        {
+            return Err(RadioError::Profile);
+        }
+        let sequence = self.runtime_sequence as u8;
+        // No sequence reuse within this one-shot initial profile, including
+        // failed/ambiguous publication. Future station commands share it.
+        self.runtime_sequence += 1;
+        let mut packet = alloc::vec![0;8+bytes.len()];
+        super::txrx::encode_h2c_header(
+            2,
+            8 + path,
+            page,
+            sequence,
+            bytes.len() as u16,
+            sequence % 4 == 0,
+            false,
+            &mut packet,
+        )
+        .ok_or(RadioError::Profile)?;
+        packet[8..].copy_from_slice(bytes);
+        Ok(packet)
+    }
+    async fn transmit_radio_page(
+        &mut self,
+        path: u8,
+        page: u8,
+        bytes: &[u8],
+    ) -> Result<(), super::radio_init::Error> {
+        use super::radio_init::Error as RadioError;
+        let packet = self.radio_page_packet(path, page, bytes)?;
+        self.send(Kind::Header, &packet)
+            .await
+            .map_err(|_| RadioError::Register(super::power::Error::Access))?;
+        let start = self.io.now_us();
+        loop {
+            self.poll()
+                .map_err(|_| RadioError::Register(super::power::Error::Access))?;
+            if self.queue.pending() == 0 {
+                return Ok(());
+            }
+            if self.io.now_us().saturating_sub(start) >= 400_000 {
+                return Err(super::power::Error::Timeout.into());
+            }
+            self.io.delay_us(50).await;
+        }
+    }
+    /// Serialized ordinary runtime command; source DONE_ACK means execution,
+    /// while CH12 RP retirement proves only descriptor consumption. Every ACK
+    /// identity and status must match this never-reused runtime sequence.
+    async fn coex_command(
+        &mut self,
+        function: u8,
+        bytes: &[u8],
+        done: bool,
+    ) -> Result<(), super::coex_native::Error> {
+        use super::coex_native::Error as E;
+        self.calibration_access()?;
+        if self.runtime_sequence >= 256 || bytes.is_empty() || bytes.len() > 2000 {
+            return Err(E::Profile);
+        }
+        let sequence = self.runtime_sequence as u8;
+        self.runtime_sequence += 1;
+        let mut packet = alloc::vec![0;8+bytes.len()];
+        super::txrx::encode_h2c_header(
+            2,
+            0x10,
+            function,
+            sequence,
+            bytes.len() as u16,
+            sequence % 4 == 0,
+            done,
+            &mut packet,
+        )
+        .ok_or(E::Profile)?;
+        packet[8..].copy_from_slice(bytes);
+        self.send(Kind::Header, &packet)
+            .await
+            .map_err(|_| E::Firmware)?;
+        let start = self.io.now_us();
+        let mut completed = !done;
+        loop {
+            self.calibration_access()?;
+            self.poll().map_err(|_| E::Firmware)?;
+            // RX is the actual owned RXQ/RPQ path. No synthetic firmware
+            // response is admitted by an RP change or by transmitted bytes.
+            for event in self.poll_receive(64).map_err(|_| E::Firmware)? {
+                if let super::rx_packet::Event::Firmware(message) = event {
+                    if let Some(ack) = message.ack().map_err(|_| E::Firmware)? {
+                        if (ack.category, ack.class, ack.function, ack.sequence)
+                            == (2, 0x10, function, sequence)
+                        {
+                            if let Some(status) = ack.result {
+                                if !done || status != 0 || completed {
+                                    return Err(E::Firmware);
+                                }
+                                completed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if completed && self.queue.pending() == 0 {
+                return Ok(());
+            }
+            if self.io.now_us().saturating_sub(start) >= 400_000 {
+                return Err(super::power::Error::Timeout.into());
+            }
+            self.io.delay_us(50).await;
+        }
     }
     /// # Safety
     /// Enclosing composed radio attempt excludes reset/PHY/channel operations
@@ -353,6 +615,12 @@ impl Native {
     pub(super) fn fail(&mut self) {
         self.state = State::Terminal;
         self.receive.fail();
+        // Autonomous ACK/CTS does not depend on a packet DMA doorbell.
+        if let Ok(value) = self.io.read32(0xc000) {
+            if !matches!(value, u32::MAX | 0xeaea_eaea) {
+                let _ = self.io.write32(0xc000, value & !(1 << 29));
+            }
+        }
         if let Ok(value) = self.io.read32(0x1010) {
             if value != u32::MAX {
                 let tx = if matches!(self.chip, ChipId::Rtl8852A | ChipId::Rtl8852C) {
@@ -390,6 +658,12 @@ impl Native {
                 narf_bus::pci::cmd::BUS_MASTER,
             )
         });
+        if self.chip == ChipId::Rtl8852B {
+            if self.radio_started {
+                let _ = super::radio_stop::engines(&mut self.io);
+            }
+            let _ = super::radio_stop::clocks(&mut self.io);
+        }
     }
     fn command(&self) -> Result<u16, Error> {
         crate::rtw88::pci_park::invoke(&self.authority, || {
@@ -608,6 +882,7 @@ impl Native {
         if self.state != State::Active {
             return Err(Error::Terminal);
         }
+        self.command_admission()?;
         self.poll()?;
         let start = self.io.now_us();
         while self.queue.is_full() {
@@ -616,8 +891,10 @@ impl Native {
                 return Err(Error::Timeout);
             }
             self.io.delay_us(50).await;
+            self.command_admission()?;
             self.poll()?;
         }
+        self.command_admission()?;
         let header = command_queue::descriptor(self.chip, kind, bytes.len())?;
         let packet = alloc_coherent_masked(
             header.len() + bytes.len(),
@@ -637,18 +914,27 @@ impl Native {
         }
         packet.sync(0, header.len() + bytes.len());
         let ring = self.ring.as_ref().ok_or(Error::Terminal)?;
+        let calibration = &self.calibration;
+        let authority = &self.authority;
         let io = &mut self.io;
         let idx = self.regs.idx as u32;
         let result = self.queue.submit(packet, |slot, next, _packet| {
-            let offset = usize::from(slot) * 8;
-            // SAFETY: validated queue slot is below ring depth; eight-byte BD.
-            unsafe {
-                core::ptr::copy_nonoverlapping(bd.as_ptr(), ring.as_mut_ptr().add(offset), 8);
-            }
-            ring.sync(offset, 8);
-            barrier();
-            // Only write the HOST half. A32-bit RMW would also overwrite HW RP.
-            io.write16(idx, next).map_err(|_| Error::Access)
+            crate::rtw88::pci_park::invoke(authority, || {
+                if let Some(calibration) = calibration.as_ref() {
+                    calibration.current().map_err(|_| Error::Access)?;
+                }
+                let offset = usize::from(slot) * 8;
+                // SAFETY: current device/qualification invocation above and
+                // validated slot below retained ring depth; eight-byte BD.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bd.as_ptr(), ring.as_mut_ptr().add(offset), 8);
+                }
+                ring.sync(offset, 8);
+                barrier();
+                // Only write HOST; a dword RMW could overwrite actual HW RP.
+                io.write16(idx, next).map_err(|_| Error::Access)
+            })
+            .map_err(|_| Error::Access)?
         });
         match result {
             Ok(_) => Ok(()),
@@ -673,12 +959,174 @@ impl Native {
 }
 impl Drop for Native {
     fn drop(&mut self) {
-        if self.armed {
+        if self.armed || self.radio_started {
             self.fail();
-            if let Some(ring) = self.ring.take() {
-                core::mem::forget(ring);
+            if self.armed {
+                if let Some(ring) = self.ring.take() {
+                    core::mem::forget(ring);
+                }
             }
         }
+    }
+}
+impl super::power::Io for Native {
+    fn read8(&mut self, a: u32) -> Result<u8, super::power::Error> {
+        self.register_access()?;
+        self.io.read8(a)
+    }
+    fn read16(&mut self, a: u32) -> Result<u16, super::power::Error> {
+        self.register_access()?;
+        self.io.read16(a)
+    }
+    fn read32(&mut self, a: u32) -> Result<u32, super::power::Error> {
+        self.register_access()?;
+        self.io.read32(a)
+    }
+    fn write8(&mut self, a: u32, v: u8) -> Result<(), super::power::Error> {
+        self.register_access()?;
+        self.io.write8(a, v)
+    }
+    fn write16(&mut self, a: u32, v: u16) -> Result<(), super::power::Error> {
+        self.register_access()?;
+        self.io.write16(a, v)
+    }
+    fn write32(&mut self, a: u32, v: u32) -> Result<(), super::power::Error> {
+        self.register_access()?;
+        self.io.write32(a, v)
+    }
+    fn now_us(&self) -> u64 {
+        self.io.now_us()
+    }
+    async fn delay_us(&mut self, us: u64) {
+        self.io.delay_us(us).await;
+    }
+    async fn read_ecv(&mut self) -> Result<Option<u8>, super::power::Error> {
+        Err(super::power::Error::Unsupported)
+    }
+}
+impl super::radio_init::Interface for Native {
+    async fn radio_write(
+        &mut self,
+        path: u8,
+        address: u32,
+        mask: u32,
+        value: u32,
+    ) -> Result<(), super::radio_init::Error> {
+        // SAFETY: this private adapter is used by the same retained radio
+        // preparation attempt, whose Drop closes/retains all native DMA.
+        unsafe { self.write_rf(path, address, mask, value).await }.map_err(Into::into)
+    }
+    async fn radio_page(
+        &mut self,
+        path: u8,
+        page: u8,
+        bytes: &[u8],
+    ) -> Result<(), super::radio_init::Error> {
+        self.upload_radio_page(path, page, bytes).await
+    }
+}
+
+impl super::coex_native::Interface for Native {
+    fn admit(&mut self) -> Result<(), super::coex_native::Error> {
+        self.calibration_access().map_err(Into::into)
+    }
+    async fn rf_write(
+        &mut self,
+        path: u8,
+        address: u32,
+        mask: u32,
+        value: u32,
+    ) -> Result<(), super::coex_native::Error> {
+        self.calibration_access()?;
+        // SAFETY: actual signed calibration admission above, same serialized
+        // retained radio attempt and complete current-capability B aperture.
+        unsafe { self.write_rf(path, address, mask, value).await }.map_err(Into::into)
+    }
+    async fn command(
+        &mut self,
+        function: u8,
+        bytes: &[u8],
+        done: bool,
+    ) -> Result<(), super::coex_native::Error> {
+        self.coex_command(function, bytes, done).await
+    }
+}
+impl super::scheduler_mailbox::Interface for Native {
+    fn admit(&mut self) -> Result<(), super::power::Error> {
+        self.calibration_access()
+    }
+}
+impl super::rfk::Interface for Native {
+    fn admit(&mut self) -> Result<(), super::rfk::Error> {
+        if !self.coex_ready || !self.nctl_ready {
+            return Err(super::rfk::Error::Policy);
+        }
+        self.calibration_access().map_err(Into::into)
+    }
+    async fn rf_read(
+        &mut self,
+        path: u8,
+        address: u32,
+        mask: u32,
+    ) -> Result<u32, super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        // SAFETY: retained exact current admitted NCTL/coexistence/RFK owner.
+        unsafe { self.read_rf(path, address, mask).await }.map_err(Into::into)
+    }
+    async fn rf_write(
+        &mut self,
+        path: u8,
+        address: u32,
+        mask: u32,
+        value: u32,
+    ) -> Result<(), super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        // SAFETY: same actual serialized qualified B calibration attempt.
+        unsafe { self.write_rf(path, address, mask, value).await }.map_err(Into::into)
+    }
+    async fn begin(&mut self, kind: super::rfk::Kind) -> Result<(), super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        if self.calibrating.is_some() {
+            return Err(super::rfk::Error::Terminal);
+        }
+        self.calibrating = Some(kind);
+        super::coex_native::scoreboard(self, 0x4803)
+            .await
+            .map_err(|_| super::rfk::Error::Policy)?;
+        super::coex_native::enforce(self)
+            .await
+            .map_err(|_| super::rfk::Error::Policy)
+    }
+    async fn end(&mut self, kind: super::rfk::Kind) -> Result<(), super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        if self.calibrating != Some(kind) {
+            return Err(super::rfk::Error::Terminal);
+        }
+        super::coex_native::scoreboard(self, 0x4003)
+            .await
+            .map_err(|_| super::rfk::Error::Policy)?;
+        super::coex_native::enforce(self)
+            .await
+            .map_err(|_| super::rfk::Error::Policy)?;
+        self.calibrating = None;
+        Ok(())
+    }
+    async fn pause(&mut self) -> Result<u32, super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        let saved = self.io.read16(0xc348)?;
+        let mut mailbox = self.scheduler.take().ok_or(super::rfk::Error::Terminal)?;
+        let result = mailbox.scheduler(self, 0).await;
+        self.scheduler = Some(mailbox);
+        result?;
+        Ok(u32::from(saved))
+    }
+    async fn resume(&mut self, saved: u32) -> Result<(), super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        let saved = u16::try_from(saved).map_err(|_| super::rfk::Error::Table)?;
+        let mut mailbox = self.scheduler.take().ok_or(super::rfk::Error::Terminal)?;
+        let result = mailbox.scheduler(self, saved).await;
+        self.scheduler = Some(mailbox);
+        result.map_err(Into::into)
     }
 }
 

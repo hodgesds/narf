@@ -149,6 +149,7 @@ pub struct MsiState {
 pub struct Ath11kDevice {
     address: narf_bus::BusAddr,
     pub mmio_bar0: MmioRegion,
+    pub(super) native: NativeIo,
     pub chip: ChipInfo,
     pub hw_rev: HwRev,
     /// PCI device id we matched on.
@@ -161,19 +162,79 @@ pub struct Ath11kDevice {
     pub power: PowerUpReport,
 }
 
-/// The device's BAR0 as a [`ChipIo`].
+/// The exact PCI binding retained through MHI, CE and DP. Raw mappings
+/// alone never prove current access authority.
+#[derive(Copy, Clone, Debug)]
+pub struct NativeIo {
+    mmio: MmioRegion,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+}
+impl NativeIo {
+    fn invoke<T>(&self, operation: impl FnOnce() -> T) -> Result<T, narf_capabilities::CapError> {
+        crate::qualcomm_pci::invoke(&self.cap, operation)
+    }
+    fn valid(&self, offset: u32, direct: bool) -> bool {
+        let at = if direct || offset < hw::ATH11K_PCI_WINDOW_START {
+            offset
+        } else {
+            windowed_bar_offset(offset)
+        };
+        offset & 3 == 0
+            && u64::from(at) + 4 <= self.mmio.len
+            && (direct || u64::from(hw::ATH11K_PCI_WINDOW_REG_ADDRESS) + 4 <= self.mmio.len)
+    }
+    fn read(&self, offset: u32, direct: bool) -> u32 {
+        if !self.valid(offset, direct) {
+            return u32::MAX;
+        }
+        self.invoke(|| {
+            // SAFETY: full exact-width bound and current retained PCI invocation;
+            // the windowed helper serializes select/read as one transaction.
+            unsafe {
+                if direct {
+                    self.mmio.read32(u64::from(offset))
+                } else {
+                    read32(&self.mmio, offset)
+                }
+            }
+        })
+        .unwrap_or(u32::MAX)
+    }
+    fn write(&self, offset: u32, value: u32, direct: bool) {
+        if !self.valid(offset, direct) {
+            return;
+        }
+        let _ = self.invoke(|| {
+            // SAFETY: same checked extent and invocation; select/write stays owned.
+            unsafe {
+                if direct {
+                    self.mmio.write32(u64::from(offset), value)
+                } else {
+                    write32(&self.mmio, offset, value)
+                }
+            }
+        });
+    }
+    fn restore(&self) {
+        if !self.valid(hw::ATH11K_PCI_WINDOW_REG_ADDRESS, true) {
+            return;
+        }
+        let _ = self.invoke(|| {
+            // SAFETY: selector extent and current owner; helper serializes WINDOW.
+            unsafe { restore_window(&self.mmio) }
+        });
+    }
+}
+/// The device's currently authorized BAR0 as a [`ChipIo`].
 #[derive(Debug)]
-pub struct Bar0Io<'a>(pub &'a MmioRegion);
-
+pub struct Bar0Io<'a>(pub &'a NativeIo);
 impl ChipIo for Bar0Io<'_> {
     fn read32(&self, offset: u32) -> u32 {
-        // SAFETY: Bar0Io wraps the driver-owned live BAR0 mapping;
-        // offsets come from Linux's register tables.
-        unsafe { read32(self.0, offset) }
+        self.0.read(offset, false)
     }
     fn write32(&self, offset: u32, value: u32) {
-        // SAFETY: as `read32`.
-        unsafe { write32(self.0, offset, value) }
+        self.0.write(offset, value, false)
     }
     fn delay_ms(&self, ms: u32) {
         let deadline = narf_time::Deadline::after_ms(ms as u64);
@@ -184,7 +245,7 @@ impl ChipIo for Bar0Io<'_> {
     }
     fn restore_window(&self) {
         // SAFETY: as `read32`.
-        unsafe { restore_window(self.0) }
+        self.0.restore()
     }
 }
 
@@ -299,11 +360,17 @@ fn quarantine_msi_vectors(n_vectors: u8, base_irq: u8) {
 /// Disable MSI delivery and return the interrupt resources owned by a failed
 /// ath11k probe.  This is deliberately usable before the controller has been
 /// published: no MHI DMA buffers exist yet, but the IRQ plumbing does.
-fn teardown_msi(state: &MsiState) {
+fn teardown_msi(state: &MsiState, cap: &Cap<BusDeviceCap, Write>) {
     // SAFETY: the caller still owns this function's cfg space.  If the cfg
     // write fails (for example, a surprise-removed function), do not recycle
     // its vector: its MSI source cannot be proven quiesced.
-    if unsafe { narf_bus::msi::disable(&state.bus_cfg) }.is_ok() {
+    if matches!(
+        crate::qualcomm_pci::invoke(cap, || {
+            // SAFETY: current original PCI cap owns this configured MSI capability.
+            unsafe { narf_bus::msi::disable(&state.bus_cfg) }
+        }),
+        Ok(Ok(()))
+    ) {
         teardown_msi_vectors(
             state.config,
             state.ep_base_data,
@@ -341,30 +408,14 @@ impl Future for MhiIrqWait {
 /// window), the MHI vectors, time and entropy.
 #[derive(Debug)]
 pub struct Bar0Mhi {
-    mmio: MmioRegion,
+    io: NativeIo,
 }
-
-impl Bar0Mhi {
-    fn in_bar(&self, offset: u32) -> bool {
-        offset as u64 + 4 <= self.mmio.len && offset % 4 == 0
-    }
-}
-
 impl MhiBus for Bar0Mhi {
     fn read32(&self, offset: u32) -> u32 {
-        if !self.in_bar(offset) {
-            return u32::MAX;
-        }
-        // SAFETY: `mmio` is the driver-owned live BAR0 mapping and the
-        // access is inside it (checked above).
-        unsafe { self.mmio.read32(offset as u64) }
+        self.io.read(offset, true)
     }
     fn write32(&self, offset: u32, value: u32) {
-        if !self.in_bar(offset) {
-            return;
-        }
-        // SAFETY: as `read32`.
-        unsafe { self.mmio.write32(offset as u64, value) }
+        self.io.write(offset, value, true)
     }
     fn take_irqs(&self) -> u32 {
         MHI_IRQ_PENDING.swap(0, Ordering::AcqRel)
@@ -374,7 +425,7 @@ impl MhiBus for Bar0Mhi {
     }
     fn hif_power(&self, step: HifPower) {
         use core::fmt::Write as _;
-        let io = Bar0Io(&self.mmio);
+        let io = Bar0Io(&self.io);
         match step {
             // ath11k_pci_power_down: "restore aspm in case firmware
             // bootup fails", force wake, MSI off (then ath11k_mhi_stop).
@@ -484,17 +535,23 @@ fn pci_aspm_restore() {
     if a.restore {
         a.restore = false;
         let lnkctl = narf_bus::pci_express::LNKCTL_ASPMC;
-        let r = narf_bus::pci_express::clear_and_set_link_control(
-            &a.cap,
-            &a.device,
-            lnkctl,
-            a.link_ctl & lnkctl,
-        );
+        let r = crate::qualcomm_pci::invoke(&a.cap, || {
+            narf_bus::pci_express::clear_and_set_link_control(
+                &a.cap,
+                &a.device,
+                lnkctl,
+                a.link_ctl & lnkctl,
+            )
+        });
         let _ = writeln!(
             narf_console::Writer,
             "  ath11k: ASPM restored (link_ctl {:#06x}): {}",
             a.link_ctl,
-            if r.is_ok() { "ok" } else { "failed" }
+            if matches!(r, Ok(Ok(_))) {
+                "ok"
+            } else {
+                "failed"
+            }
         );
     }
     *ASPM_RESTORE.lock() = Some(a);
@@ -506,12 +563,14 @@ fn pci_aspm_disable() {
     let Some(mut a) = ASPM_RESTORE.lock().take() else {
         return;
     };
-    if let Ok(cur) = narf_bus::pci_express::clear_and_set_link_control(
-        &a.cap,
-        &a.device,
-        narf_bus::pci_express::LNKCTL_ASPMC,
-        0,
-    ) {
+    if let Ok(Ok(cur)) = crate::qualcomm_pci::invoke(&a.cap, || {
+        narf_bus::pci_express::clear_and_set_link_control(
+            &a.cap,
+            &a.device,
+            narf_bus::pci_express::LNKCTL_ASPMC,
+            0,
+        )
+    }) {
         a.link_ctl = cur;
         a.restore = true;
     }
@@ -524,13 +583,16 @@ fn msi_set(enable: bool) {
         // SAFETY: the bound device's cfg space belongs to this driver
         // (probe claimed it); the MSI capability was set up by
         // `alloc_msi` and is only toggled here and at power-up.
-        let r = unsafe {
-            if enable {
-                narf_bus::msi::enable(&d.msi.bus_cfg)
-            } else {
-                narf_bus::msi::disable(&d.msi.bus_cfg)
+        let r = d.native.invoke(|| {
+            // SAFETY: current original PCI binding owns the configured MSI capability.
+            unsafe {
+                if enable {
+                    narf_bus::msi::enable(&d.msi.bus_cfg)
+                } else {
+                    narf_bus::msi::disable(&d.msi.bus_cfg)
+                }
             }
-        };
+        });
         let _ = r;
     });
 }
@@ -567,13 +629,13 @@ fn request_fw(
     file: &str,
 ) -> Result<alloc::vec::Vec<u8>, i32> {
     let name = alloc::format!("ath11k/{}/{}", fw_dir, file);
-    let cap = narf_firmware::open(&name, auth).map_err(|e| match e {
-        narf_firmware::FirmwareError::NotFound => wlfw::ENOENT,
-        narf_firmware::FirmwareError::OutOfMemory => wlfw::ENOMEM,
-        _ => wlfw::EINVAL,
-    })?;
-    let view = narf_firmware::view_of(&cap).map_err(|_| wlfw::EINVAL)?;
-    Ok(view.bytes.to_vec())
+    crate::firmware_asset::load(auth, &name, 16 * 1024 * 1024, false)
+        .map(|asset| asset.bytes)
+        .map_err(|error| match error {
+            narf_firmware::FirmwareError::NotFound => wlfw::ENOENT,
+            narf_firmware::FirmwareError::OutOfMemory => wlfw::ENOMEM,
+            _ => wlfw::EINVAL,
+        })
 }
 
 /// The MHI image and `ab->fw`: `ath11k_fw_pre_init` (`firmware-2.bin`;
@@ -666,7 +728,7 @@ async fn load_firmware(fw_dir: &str) -> Result<(alloc::vec::Vec<u8>, FwApi), Mhi
 /// What [`mhi_task`] needs from the bound device.
 #[derive(Copy, Clone, Debug)]
 pub struct MhiStart {
-    pub mmio: MmioRegion,
+    pub io: NativeIo,
     pub hw_rev: HwRev,
     pub fw_dir: &'static str,
     /// `nr_irqs` (the "MHI" MSI user's vector count).
@@ -691,8 +753,8 @@ async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), Mh
         mhi_host::errno::EINVAL,
     ))?;
     let (fw, api) = load_firmware(s.fw_dir).await?;
-    let params = ControllerParams::ath11k(s.mmio.len.min(u32::MAX as u64) as u32, s.nr_irqs);
-    let mut ctrl = MhiController::new(Bar0Mhi { mmio: s.mmio }, cfg, params)?;
+    let params = ControllerParams::ath11k(s.io.mmio.len.min(u32::MAX as u64) as u32, s.nr_irqs);
+    let mut ctrl = MhiController::new(Bar0Mhi { io: s.io }, cfg, params)?;
     let result: Result<(), MhiError> = async {
         ctrl.prepare_for_power_up()?;
         let (bhi, bhie) = ctrl.bhi_offsets();
@@ -747,7 +809,7 @@ async fn abort_mhi_bring_up(ctrl: &mut MhiController<Bar0Mhi>) {
 /// [`MhiController`] exists.  They can still fail after PCI power-up enabled
 /// MSI and disabled ASPM, so quiesce that PCI half here as well.
 fn abort_unowned_mhi_bring_up(s: MhiStart) {
-    Bar0Mhi { mmio: s.mmio }.hif_power(HifPower::Down);
+    Bar0Mhi { io: s.io }.hif_power(HifPower::Down);
     reset_mhi_task_state();
 }
 
@@ -949,15 +1011,25 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let result = unsafe { bring_up(&device, &cap, chip) }.and_then(|dev| {
         // The silicon and all software profiles have now been accepted;
         // no firmware DMA was enabled during identification or reset.
-        if narf_bus::pci::set_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER).is_err() {
-            teardown_msi(&dev.msi);
+        if !matches!(
+            crate::qualcomm_pci::invoke(&cap, || {
+                narf_bus::pci::set_command(&cap,&device,narf_bus::pci::cmd::BUS_MASTER)?;
+                narf_bus::pci::read_command(&cap,&device)
+            }),
+            Ok(Ok(command)) if command!=u16::MAX
+                && command&(narf_bus::pci::cmd::BUS_MASTER|narf_bus::pci::cmd::MEM_SPACE|narf_bus::pci::cmd::INTX_DISABLE)
+                    ==narf_bus::pci::cmd::BUS_MASTER|narf_bus::pci::cmd::MEM_SPACE|narf_bus::pci::cmd::INTX_DISABLE
+        ) {
+            teardown_msi(&dev.msi, &cap);
             if let Some(link_ctl) = dev.saved_link_ctl {
-                let _ = narf_bus::pci_express::clear_and_set_link_control(
-                    &cap,
-                    &device,
-                    narf_bus::pci_express::LNKCTL_ASPMC,
-                    link_ctl & narf_bus::pci_express::LNKCTL_ASPMC,
-                );
+                let _ = crate::qualcomm_pci::invoke(&cap, || {
+                    narf_bus::pci_express::clear_and_set_link_control(
+                        &cap,
+                        &device,
+                        narf_bus::pci_express::LNKCTL_ASPMC,
+                        link_ctl & narf_bus::pci_express::LNKCTL_ASPMC,
+                    )
+                });
             }
             return Err(ProbeError::PciConfiguration);
         }
@@ -969,11 +1041,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // No controller was published, so no later lifecycle path will
             // revoke the command bits.  In particular, leaving BUS_MASTER
             // set after a rejected probe would let an unbound function DMA.
-            let _ = narf_bus::pci::clear_command(
-                &cap,
-                &device,
-                narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-            );
+            let _ = crate::qualcomm_pci::invoke(&cap, || {
+                narf_bus::pci::clear_command(
+                    &cap,
+                    &device,
+                    narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
+                )
+            });
             let (code, detail) = e.diag_code();
             diag::latch_wifi_error(code, detail);
             let _ = writeln!(
@@ -1048,7 +1122,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         _ => (0, 0, 0, 0),
     };
     let start = mhi_vectors(&dev.msi).map(|(nr_irqs, _, _)| MhiStart {
-        mmio: dev.mmio_bar0,
+        io: dev.native,
         hw_rev: dev.hw_rev,
         fw_dir: dev.params.fw_dir,
         nr_irqs,
@@ -1089,6 +1163,14 @@ pub unsafe fn bring_up(
     cap: &Cap<BusDeviceCap, Write>,
     chip: ChipInfo,
 ) -> Result<Ath11kDevice, ProbeError> {
+    crate::qualcomm_pci::invoke(cap, || bring_up_current(device, cap, chip))
+        .map_err(|_| ProbeError::PciConfiguration)?
+}
+fn bring_up_current(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    chip: ChipInfo,
+) -> Result<Ath11kDevice, ProbeError> {
     // SAFETY: `bring_up`'s contract is that the caller owns the device's BARs
     // exclusively — exactly the precondition `map_bar_control` requires.
     let mmio_bar0 = crate::qualcomm_pci::map_bar_control(device, cap, 0)
@@ -1097,9 +1179,14 @@ pub unsafe fn bring_up(
         return Err(ProbeError::Bar0MapFailed);
     }
 
+    let native = NativeIo {
+        mmio: mmio_bar0,
+        device: *device,
+        cap: *cap,
+    };
     // SAFETY: BAR0 mapped + owned; TCSR_SOC_HW_VERSION is a readable
     // chip register.
-    let version = unsafe { read32(&mmio_bar0, hw::TCSR_SOC_HW_VERSION) };
+    let version = native.read(hw::TCSR_SOC_HW_VERSION, false);
     if version == 0xFFFF_FFFF {
         return Err(ProbeError::LinkDown);
     }
@@ -1110,7 +1197,7 @@ pub unsafe fn bring_up(
     let sub_version = if hw::needs_sub_version(chip.did, major, minor) {
         // SAFETY: BAR0 mapped + owned; TCSR_SOC_HW_SUB_VER is readable
         // (Linux reads it at the same point in `ath11k_pci_probe`).
-        unsafe { read32(&mmio_bar0, hw::TCSR_SOC_HW_SUB_VER) }
+        native.read(hw::TCSR_SOC_HW_SUB_VER, false)
     } else {
         0
     };
@@ -1126,7 +1213,7 @@ pub unsafe fn bring_up(
 
     // ── Linux `ath11k_pci_power_up`, minus `ath11k_mhi_start` ──
     *WINDOW.lock() = 0; // `ab_pci->register_window = 0`
-    let report = power::sw_reset(&Bar0Io(&mmio_bar0), true, params.fix_l1ss.as_ref());
+    let report = power::sw_reset(&Bar0Io(&native), true, params.fix_l1ss.as_ref());
     // "Disable ASPM during firmware download due to problems
     // switching to AMSS state."
     let saved_link_ctl = narf_bus::pci_express::clear_and_set_link_control(
@@ -1149,7 +1236,7 @@ pub unsafe fn bring_up(
                 link_ctl & narf_bus::pci_express::LNKCTL_ASPMC,
             );
         }
-        teardown_msi(&msi);
+        teardown_msi(&msi, cap);
         return Err(ProbeError::MsiUnavailable);
     }
     diag::set_wifi_stage(WifiStage::PowerUp);
@@ -1157,6 +1244,7 @@ pub unsafe fn bring_up(
     Ok(Ath11kDevice {
         address: device.addr,
         mmio_bar0,
+        native,
         chip,
         hw_rev,
         device_id: chip.did,
@@ -1224,7 +1312,7 @@ unsafe fn alloc_msi(
     }
     // SAFETY: caller owns cfg space exclusively.
     if unsafe { narf_bus::msi::disable(&state.bus_cfg) }.is_err() {
-        teardown_msi(&state);
+        teardown_msi(&state, cap);
         return Err(ProbeError::MsiUnavailable);
     }
     Ok(state)
@@ -1368,4 +1456,79 @@ pub fn with_controller<R>(f: impl FnOnce(&Ath11kDevice) -> R) -> Option<R> {
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
     *WINDOW.lock() = u32::MAX;
+}
+
+#[cfg(feature = "kernel-test")]
+mod native_authority_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_ath11k_same_current_pci_cap_fences_mhi_ce_dp_and_probe() -> TestResult {
+        let mut words = alloc::vec![0u32;0x100000/4];
+        let address = narf_bus::PcieAddr::new(0xfffe, 0xfc, 0x1b, 0);
+        let device = BusDevice {
+            addr: narf_bus::BusAddr::Pcie(address),
+            id: narf_bus::DeviceId {
+                vendor: QCOM_VENDOR,
+                device: 0x1103,
+                subsystem_vendor: QCOM_VENDOR,
+                subsystem_id: 0xffff,
+                class: 0x028000,
+            },
+            kind: narf_bus::BusKind::Pcie {
+                addr: address,
+                cfg_phys: narf_memory::PhysAddr::new(0),
+            },
+        };
+        let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+        let io = NativeIo {
+            device,
+            cap,
+            mmio: MmioRegion {
+                phys: narf_memory::PhysAddr::new(0),
+                virt: words.as_mut_ptr() as u64,
+                len: 0x100000,
+                kind: narf_bus::BarKind::Mmio32 {
+                    prefetchable: false,
+                },
+            },
+        };
+        let mhi = Bar0Mhi { io };
+        let core = super::super::core::Bar0(io);
+        words[0x100 / 4] = 0x12345678;
+        if MhiBus::read32(&mhi, 0x100) != 0x12345678 || ChipIo::read32(&core, 0x100) != 0x12345678 {
+            return TestResult::Fail("MHI and CE/DP native adapters lost shared actual aperture");
+        }
+        ChipIo::write32(&core, 0x104, 0x11223344);
+        if words[0x104 / 4] != 0x11223344 {
+            return TestResult::Fail("live native CE/DP write did not reach actual aperture");
+        }
+        cap.revoke();
+        MhiBus::write32(&mhi, 0x104, 0);
+        ChipIo::write32(&core, 0x104, 0);
+        // Revoked window operations must not program or restore the selector.
+        let before = words[hw::ATH11K_PCI_WINDOW_REG_ADDRESS as usize / 4];
+        ChipIo::write32(&core, 0x1900000, 0);
+        ChipIo::restore_window(&core);
+        if MhiBus::read32(&mhi, 0x100) != u32::MAX
+            || ChipIo::read32(&core, 0x100) != u32::MAX
+            || ChipIo::read32(&core, 0x1900000) != u32::MAX
+            || words[0x104 / 4] != 0x11223344
+            || words[hw::ATH11K_PCI_WINDOW_REG_ADDRESS as usize / 4] != before
+        {
+            return TestResult::Fail(
+                "revoked original PCI epoch reached MHI/CE/DP/selector accesses",
+            );
+        }
+        let chip = hw::chip_for_pci_id(QCOM_VENDOR, 0x1103).unwrap();
+        // SAFETY: revoked authority must refuse before invalid ECAM/BAR sizing;
+        // no synthetic device is presented as a real mapped or active radio.
+        if unsafe { bring_up(&device, &cap, chip) }.is_ok() {
+            return TestResult::Fail("revoked ath11k probe authority reached native bring-up");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/ath11k/pci",
+        smoke_ath11k_same_current_pci_cap_fences_mhi_ce_dp_and_probe
+    );
 }

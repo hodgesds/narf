@@ -264,27 +264,38 @@ impl<I: ControlIo> Owner<I> {
     /// The production probe path obtains the blob from the capability-gated
     /// firmware registry. Keep its cap alive through every USB transfer.
     pub async fn initialize_registered(&self) -> Result<FirmwareInfo, Error> {
-        let _attempt = self.begin()?;
-        let result = async {
-            if self.chip != ChipFamily::Rtl8188eu {
-                return Err(Error::UnsupportedChip);
-            }
-            let loader = narf_firmware::trusted_loader_authority()
-                .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
-            let auth = loader
-                .derive()
-                .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
-            let cap =
-                narf_firmware::open("rtlwifi/rtl8188eufw.bin", &auth).map_err(Error::Firmware)?;
-            let view = narf_firmware::view_of(&cap).map_err(Error::Firmware)?;
-            // Own the validated bytes before awaiting USB so registry
-            // revocation cannot invalidate an outstanding borrowed view.
-            let _ = parse_image(self.chip, view.bytes)?;
-            let bytes = view.bytes.to_vec();
-            self.run_device_before(&bytes, narf_time::Deadline::after_ms(30_000))
-                .await
+        if self.started.load(Ordering::Acquire) {
+            return Err(Error::AlreadyStarted);
         }
-        .await;
+        let loader = narf_firmware::trusted_loader_authority()
+            .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
+        let authority = loader
+            .derive()
+            .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
+        self.initialize_registered_from(&authority, "rtlwifi/rtl8188eufw.bin")
+            .await
+    }
+    pub(super) async fn initialize_registered_from(
+        &self,
+        authority: &narf_capabilities::Cap<
+            narf_firmware::FirmwareRegistry,
+            narf_capabilities::Read,
+        >,
+        name: &str,
+    ) -> Result<FirmwareInfo, Error> {
+        if self.started.load(Ordering::Acquire) {
+            return Err(Error::AlreadyStarted);
+        }
+        if self.chip != ChipFamily::Rtl8188eu {
+            return Err(Error::UnsupportedChip);
+        }
+        let asset = crate::firmware_asset::load(authority, name, HEADER_LEN + MAX_PAYLOAD, false)
+            .map_err(Error::Firmware)?;
+        let _ = parse_image(self.chip, &asset.bytes)?;
+        let _attempt = self.begin()?;
+        let result = self
+            .run_device_before(&asset.bytes, narf_time::Deadline::after_ms(30_000))
+            .await;
         self.finish(result)
     }
 

@@ -241,6 +241,11 @@ impl Rx {
             return Err(Error::Terminal);
         }
         let result = (|| {
+            // Until the later signed station/response owner takes over, RX
+            // transport alone must not permit an autonomous CMAC ACK/CTS.
+            if read(io, 0xc000)? & (1 << 29) != 0 {
+                return Err(power::Error::Access.into());
+            }
             let rings = self.rings.as_mut().ok_or(Error::Terminal)?;
             let mut events = rings[1].poll(io, budget, true)?;
             events.extend(rings[0].poll(io, budget, false)?);
@@ -323,6 +328,7 @@ fn stopped(io: &mut impl Io) -> Result<(), power::Error> {
     if read(io, 0x1000)? & (1 << 13) != 0
         || read(io, 0x8380)? & 2 != 0
         || read(io, 0x1010)? & 0xb0f00 != 0xb0f00
+        || read(io, 0xc000)? & (1 << 29) != 0
     {
         return Err(power::Error::Access);
     }

@@ -46,14 +46,20 @@ impl Board {
                 .power_path(path as u8)
                 .and_then(|p| p.first())
                 .ok_or(Error::FactoryPower)?;
-            let bound = i16::from(base) + values::CCK1_ADJUST[usize::from(info.rfe)][path];
+            let bound = i16::from(base) + values::CCK_RESPONSE_ADJUST[usize::from(info.rfe)][path];
             if base > 127 || !(0..=127).contains(&bound) {
                 return Err(Error::FactoryPower);
             }
             *limit = bound as u8;
         }
         let mut hash = narf_crypto::sha256::Sha256::new();
-        hash.update(b"NARF RTL8822CE awake ch1 legacy20 basic1 txA rxAB v1");
+        hash.update(b"NARF RTL8822CE awake ch1 legacy20 basic1 txA rxAB v2");
+        hash.update(b"fresh DACK IQK; no GAPK DPD tracking; software CCMP raw RX");
+        // Bind actual native automatic-response programming as well as host
+        // TXDs: all four CCK response indices are bounded, OFDM reference0
+        // and all legacy relative differences0, source fixed1M RRSR mask1f.
+        hash.update(b"RRSR=1f CCKref=selected OFDMref=0 legacydiff=0 native response envelope");
+        hash.update(b"IGI=1c EDCCA=40/33 fixed maximum-coverage adaptive bound");
         hash.update(factory.logical());
         hash.update(factory.trims());
         hash.update(&[info.cut, info.rfe, info.paths, info.crystal]);
@@ -114,6 +120,7 @@ pub(super) struct Calibration {
     antenna: i16,
     qualified: i16,
     calibration_peak: i16,
+    response_peak: i16,
     curves: [[i16; 128]; 2],
 }
 impl core::fmt::Debug for Calibration {
@@ -130,6 +137,41 @@ pub struct Permission {
     calibration: [u8; 32],
     gains: [u8; 2],
     eirp: i16,
+}
+/// Sealed retained calibration grant. Only the enclosing successful radio
+/// continuation can supply one to the native packet owner.
+#[derive(Clone)]
+pub struct Gate {
+    calibration: alloc::sync::Arc<Calibration>,
+    permission: Permission,
+    own: [u8; 6],
+}
+impl Gate {
+    pub(super) fn new(
+        calibration: alloc::sync::Arc<Calibration>,
+        permission: Permission,
+        own: [u8; 6],
+    ) -> Self {
+        Self {
+            calibration,
+            permission,
+            own,
+        }
+    }
+    pub(super) fn own(&self) -> [u8; 6] {
+        self.own
+    }
+    pub(super) fn current(&self) -> Result<(), Error> {
+        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Policy)?;
+        self.calibration.validate(self.permission, &domain)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn current_with_policy_for_test(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), Error> {
+        self.calibration.validate(self.permission, domain)
+    }
 }
 impl Permission {
     pub fn eirp_limit_qdbm(&self) -> i16 {
@@ -156,7 +198,7 @@ impl Calibration {
     fn load_registered(board: Board) -> Result<Self, Error> {
         let m = board.mac;
         let name = format!(
-            "rtw88/rtw8822ce-cal-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            "rtw88/rtw8822ce-cal-v2-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
             m[0], m[1], m[2], m[3], m[4], m[5]
         );
         let authority = narf_firmware::trusted_loader_authority()
@@ -176,15 +218,15 @@ impl Calibration {
         signer.ok_or(Error::Unsigned)?;
         if bytes.len() != LENGTH
             || &bytes[..4] != b"N22C"
-            || half(bytes, 4) != 1
+            || half(bytes, 4) != 2
             || half(bytes, 6) != HEADER as u16
             || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize != LENGTH
             || half(bytes, 12) != 0x10ec
             || half(bytes, 14) != 0xc822
             || bytes[54] != 1
-            || bytes[55] != 1
-            || half(bytes, 60) != 1
-            || bytes[64..HEADER] != [0; HEADER - 64]
+            || bytes[55] != 3
+            || half(bytes, 60) != 2
+            || bytes[66..HEADER] != [0; HEADER - 66]
         {
             return Err(Error::Format);
         }
@@ -194,9 +236,11 @@ impl Calibration {
         let antenna = signed(bytes, 56);
         let qualified = signed(bytes, 58);
         let calibration_peak = signed(bytes, 62);
+        let response_peak = signed(bytes, 64);
         if !(0..=128).contains(&antenna)
             || !(-512..=256).contains(&qualified)
             || !(-512..=256).contains(&calibration_peak)
+            || !(-512..=256).contains(&response_peak)
         {
             return Err(Error::Format);
         }
@@ -219,6 +263,7 @@ impl Calibration {
             antenna,
             qualified,
             calibration_peak,
+            response_peak,
             curves,
         })
     }
@@ -254,6 +299,9 @@ impl Calibration {
         // factory/PG/region restrictions were already applied to each index.
         let eirp = ceiling.ok_or(Error::Policy)?.min(self.qualified).min(80);
         if i32::from(self.calibration_peak) + i32::from(self.antenna) > i32::from(eirp) {
+            return Err(Error::Policy);
+        }
+        if i32::from(self.response_peak) + i32::from(self.antenna) > i32::from(eirp) {
             return Err(Error::Policy);
         }
         let mut gains = [0; 2];

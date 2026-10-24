@@ -19,7 +19,7 @@
 //!
 //! Production-glue audit result: no glue was missing. The seam is
 //! exactly the one production uses — association gates the send path
-//! (the controlled port), `set_link_state` publishes carrier, and the
+//! (the controlled port), `set_link_metadata` publishes carrier, and the
 //! DHCP client is an ordinary `narf_net` client over the registered
 //! netdev. The one substitution is forced by the fixture environment:
 //! production's bridge (`Mt76Iface` + the `BOOT_OWNER` globals) is
@@ -312,6 +312,7 @@ fn composition(wpa2: bool) -> TestResult {
     // family's routes, timers or netfilter hooks in the shared test guest.
     narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
     let name = narf_net::iface::register("wlan%d", OWN, harness_send);
+    narf_net::iface::set_link_state(&name, true); // operator IFF_UP
     narf_net::iface::install_rx_drain(harness_drain);
     *HARNESS.lock() = Some(Harness {
         session: Some(session),
@@ -332,7 +333,7 @@ fn composition(wpa2: bool) -> TestResult {
     *HARNESS.lock() = None;
     let closed = crate::iface::publish_link(&name, false)
         && narf_net::iface::lookup(&name).is_some_and(|snap| {
-            !snap.link_up
+            snap.link_up
                 && !snap.carrier
                 && snap.carrier_up_count == 1
                 && snap.carrier_down_count == 1
@@ -350,7 +351,7 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
     // keeps DHCP off the air entirely (audit §4.3.1 S1: "no DHCP
     // before PORT_SECURE" — here, before association completes).
     match narf_net::iface::lookup(name) {
-        Some(snap) if !snap.link_up && !snap.carrier => {}
+        Some(snap) if snap.link_up && !snap.carrier => {}
         _ => return TestResult::Fail("interface must start with carrier down"),
     }
     if narf_net::dhcp::acquire(name, 400).is_ok() {
@@ -405,6 +406,13 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
     {
         return TestResult::Fail("carrier did not come up after association");
     }
+    narf_net::iface::set_link_state(name, false);
+    if !crate::iface::publish_link(name, true)
+        || !narf_net::iface::lookup(name).is_some_and(|snap| !snap.link_up && snap.carrier)
+    {
+        return TestResult::Fail("physical carrier overwrote operator DOWN");
+    }
+    narf_net::iface::set_link_state(name, true);
 
     // ── The lease: production DHCP client over the associated link,
     // fake AP as the server. `dhcp_acquire` also binds the address

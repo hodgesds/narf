@@ -4,6 +4,7 @@ use super::{
     firmware_transport::{Error, Info},
     pci_firmware::{self, Transport},
 };
+use alloc::sync::Arc;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 pub(super) struct Firmware {
@@ -11,7 +12,7 @@ pub(super) struct Firmware {
     cap: Cap<BusDeviceCap, Write>,
     mmio: MmioRegion,
     factory: super::efuse::Factory,
-    lifecycle: Lifecycle<Transport>,
+    lifecycle: Arc<Lifecycle<Transport>>,
 }
 impl core::fmt::Debug for Firmware {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -36,11 +37,14 @@ impl Firmware {
             cap,
             mmio,
             factory,
-            lifecycle: Lifecycle::new(device.id.device),
+            lifecycle: Arc::new(Lifecycle::new(device.id.device)),
         }
     }
     pub(super) fn status(&self) -> Status {
         self.lifecycle.status()
+    }
+    pub(super) fn lifecycle(&self) -> Arc<Lifecycle<Transport>> {
+        self.lifecycle.clone()
     }
     pub(super) fn factory(&self) -> &super::efuse::Factory {
         &self.factory
@@ -64,5 +68,13 @@ impl Firmware {
         let domain = narf_wireless::reg::db::ensure_domain()
             .map_err(|_| Error::Power(super::power_policy::Error::Policy))?;
         self.lifecycle.qualify_board(&self.factory, &domain).await
+    }
+    pub(super) async fn prepare_radio(
+        &self,
+        permission: super::power_policy::Permission,
+    ) -> Result<super::radio::Info, Error> {
+        self.lifecycle
+            .prepare_radio(&self.factory, permission)
+            .await
     }
 }

@@ -31,6 +31,8 @@ pub enum Phase {
     Ready,
     MacPrepared,
     PhyTablesPrepared,
+    Calibrated,
+    Station,
     Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +159,7 @@ fn parse(did: u16, bytes: &[u8]) -> Result<Image<'_>, Error> {
 /// mapping that hardware can still access. Ordinary MAC TX/RX and IRQs stay
 /// closed throughout; no unrelated command/reset/ring client may race it.
 #[async_trait::async_trait]
-pub unsafe trait Io: Send {
+pub(super) unsafe trait Io: Send {
     fn claim_pristine(&mut self) -> Result<(), Error>;
     fn read8(&mut self, reg: u16) -> Result<u8, Error>;
     fn read16(&mut self, reg: u16) -> Result<u16, Error>;
@@ -183,6 +185,55 @@ pub unsafe trait Io: Send {
     fn finish_phy(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn begin_commands(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn submit_h2c(&mut self, _: &[u8; 32]) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn poll_h2c(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_radio(&mut self, _: super::power_policy::Gate) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_allowed(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_own(&mut self) -> Result<[u8; 6], Error> {
+        Err(Error::Unsupported)
+    }
+    fn mailbox_ready(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn mailbox_submit(&mut self, _: [u8; 8]) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn mailbox_pending(&self) -> bool {
+        false
+    }
+    fn packet_prepare(&mut self, _: [u8; 6], _: u8) -> Result<(), super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
+    fn packet_start(&mut self) -> Result<(), super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
+    fn packet_ready(&self) -> bool {
+        false
+    }
+    fn packet_submit(&mut self, _: &[u8], _: bool) -> Result<u64, super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
+    fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
+    fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
+        Err(super::packet_core::Error::State)
+    }
+
     async fn delay_us(&mut self, us: u64) {
         narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(us.saturating_mul(1000))).await;
     }
@@ -195,7 +246,7 @@ struct Backup {
     rqpn: u32,
     beacon: u8,
 }
-pub struct Owner<I: Io> {
+pub(super) struct Owner<I: Io> {
     io: I,
     did: u16,
     phase: Phase,
@@ -204,7 +255,9 @@ pub struct Owner<I: Io> {
     hardware: Option<super::hardware::Features>,
     phy: Option<super::phy::Info>,
     image_digest: Option<[u8; 32]>,
-    power: Option<super::power_policy::Calibration>,
+    power: Option<alloc::sync::Arc<super::power_policy::Calibration>>,
+    radio: Option<super::radio::Info>,
+    station: Option<super::station::State>,
 }
 impl<I: Io> core::fmt::Debug for Owner<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -226,18 +279,136 @@ impl<I: Io> Owner<I> {
             phy: None,
             image_digest: None,
             power: None,
+            radio: None,
+            station: None,
         }
     }
     pub fn phase(&self) -> Phase {
         self.phase
     }
+    pub(super) async fn start_station(
+        &mut self,
+        environment: alloc::sync::Arc<dyn super::station::Environment>,
+        admission: super::station_control::Admission,
+    ) -> Result<super::station_control::Admission, super::station::Error> {
+        if self.phase != Phase::Calibrated || self.station.is_some() {
+            return Err(super::station::Error::State);
+        }
+        let own = self.io.station_own()?;
+        self.phase = Phase::Failed; // poison before the first awaited prerequisite
+        self.station = Some(super::station::State::new(own, environment, admission));
+        let station = self.station.as_mut().ok_or(super::station::Error::State)?;
+        station.start(&mut self.io).await?;
+        self.phase = Phase::Station;
+        Ok(station.admission())
+    }
+    pub(super) fn station_local(&self) -> Option<[u8; 6]> {
+        self.station.as_ref().map(super::station::State::local)
+    }
+    pub(super) fn station_peer(&self) -> Option<[u8; 6]> {
+        self.station.as_ref().and_then(super::station::State::peer)
+    }
+    pub(super) fn station_ready(&self) -> bool {
+        self.station
+            .as_ref()
+            .is_some_and(super::station::State::ready)
+    }
+    pub(super) fn station_check(&mut self) -> Result<(), super::station::Error> {
+        let station = self.station.as_ref().ok_or(super::station::Error::State)?;
+        if self.phase != Phase::Station
+            || matches!(
+                station.phase(),
+                super::station::Phase::Prepared
+                    | super::station::Phase::Failed
+                    | super::station::Phase::Stopped
+            )
+        {
+            return Err(super::station::Error::State);
+        }
+        self.io
+            .station_allowed()
+            .map_err(super::station::Error::Native)
+    }
+    pub(super) fn station_phase(&self) -> Option<super::station::Phase> {
+        self.station.as_ref().map(super::station::State::phase)
+    }
+    pub(super) fn station_candidates(
+        &self,
+    ) -> alloc::vec::Vec<narf_wireless::association::ObservedBss> {
+        self.station
+            .as_ref()
+            .map_or_else(alloc::vec::Vec::new, super::station::State::candidates)
+    }
+    pub(super) fn station_information_elements(
+        &self,
+        peer: [u8; 6],
+    ) -> Option<alloc::vec::Vec<u8>> {
+        self.station.as_ref()?.information_elements(peer)
+    }
+    pub(super) fn station_poll(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, super::station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .poll(&mut self.io)
+    }
+    pub(super) fn station_send(&mut self, frame: &[u8]) -> Result<(), super::station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .send(&mut self.io, frame)
+    }
+    pub(super) fn station_stop(&mut self) -> Result<(), super::station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .stop(&mut self.io)
+    }
+    pub(super) async fn station_disconnect(&mut self) -> Result<(), super::station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .disconnect(&mut self.io)
+            .await
+    }
+    pub(super) async fn station_scan(
+        &mut self,
+        dwell_ms: u64,
+    ) -> Result<alloc::vec::Vec<narf_wireless::association::ObservedBss>, super::station::Error>
+    {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .scan_for(&mut self.io, dwell_ms)
+            .await
+    }
+    pub(super) async fn station_associate(
+        &mut self,
+        bssid: [u8; 6],
+        ssid: &[u8],
+        pmk: Option<zeroize::Zeroizing<[u8; 32]>>,
+        ies: &[u8],
+    ) -> Result<(), super::station::Error> {
+        self.station
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .associate(&mut self.io, bssid, ssid, pmk, ies)
+            .await
+    }
     pub fn mac_info(&self) -> Option<super::mac::Info> {
-        matches!(self.phase, Phase::MacPrepared | Phase::PhyTablesPrepared)
-            .then_some(self.mac)
-            .flatten()
+        matches!(
+            self.phase,
+            Phase::MacPrepared | Phase::PhyTablesPrepared | Phase::Calibrated | Phase::Station
+        )
+        .then_some(self.mac)
+        .flatten()
     }
     pub(super) fn hardware_info(&self) -> Option<super::hardware::Features> {
-        if matches!(self.phase, Phase::MacPrepared | Phase::PhyTablesPrepared) {
+        if matches!(
+            self.phase,
+            Phase::MacPrepared | Phase::PhyTablesPrepared | Phase::Calibrated | Phase::Station
+        ) {
             self.hardware
         } else {
             None
@@ -260,7 +431,10 @@ impl<I: Io> Owner<I> {
         Ok(info)
     }
     pub fn phy_info(&self) -> Option<super::phy::Info> {
-        if self.phase == Phase::PhyTablesPrepared {
+        if matches!(
+            self.phase,
+            Phase::PhyTablesPrepared | Phase::Calibrated | Phase::Station
+        ) {
             self.phy
         } else {
             None
@@ -268,7 +442,11 @@ impl<I: Io> Owner<I> {
     }
     pub(super) fn image_digest(&self) -> Option<[u8; 32]> {
         match self.phase {
-            Phase::Ready | Phase::MacPrepared | Phase::PhyTablesPrepared => self.image_digest,
+            Phase::Ready
+            | Phase::MacPrepared
+            | Phase::PhyTablesPrepared
+            | Phase::Calibrated
+            | Phase::Station => self.image_digest,
             _ => None,
         }
     }
@@ -285,7 +463,7 @@ impl<I: Io> Owner<I> {
         domain: &narf_wireless::reg::RegulatoryDomain,
         source: super::power_policy::Source,
     ) -> Result<super::power_policy::Permission, Error> {
-        if self.phase != Phase::PhyTablesPrepared {
+        if !matches!(self.phase, Phase::PhyTablesPrepared | Phase::Calibrated) {
             return Err(Error::State);
         }
         let board = super::power_policy::Board::new(
@@ -303,7 +481,7 @@ impl<I: Io> Owner<I> {
         }
         let calibration = source.load(board).map_err(Error::Power)?;
         let permission = calibration.permission(domain).map_err(Error::Power)?;
-        self.power = Some(calibration);
+        self.power = Some(alloc::sync::Arc::new(calibration));
         Ok(permission)
     }
     pub(super) fn current_power(
@@ -311,7 +489,7 @@ impl<I: Io> Owner<I> {
         permission: super::power_policy::Permission,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<[u8; 2], Error> {
-        if self.phase != Phase::PhyTablesPrepared {
+        if !matches!(self.phase, Phase::PhyTablesPrepared | Phase::Calibrated) {
             return Err(Error::State);
         }
         self.power
@@ -319,6 +497,63 @@ impl<I: Io> Owner<I> {
             .ok_or(Error::State)?
             .gains(permission, domain)
             .map_err(Error::Power)
+    }
+    pub fn radio_info(&self) -> Option<super::radio::Info> {
+        matches!(self.phase, Phase::Calibrated | Phase::Station)
+            .then_some(self.radio)
+            .flatten()
+    }
+    pub(super) async fn prepare_radio(
+        &mut self,
+        factory: &super::efuse::Factory,
+        permission: super::power_policy::Permission,
+    ) -> Result<super::radio::Info, Error> {
+        self.prepare_radio_with_policy(factory, permission, || {
+            narf_wireless::reg::db::ensure_domain()
+                .map_err(|_| Error::Power(super::power_policy::Error::Policy))
+        })
+        .await
+    }
+    pub(super) async fn prepare_radio_with_policy<F>(
+        &mut self,
+        factory: &super::efuse::Factory,
+        permission: super::power_policy::Permission,
+        policy: F,
+    ) -> Result<super::radio::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        if self.phase != Phase::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        let gain = self.current_power(permission, &policy()?)?;
+        let calibration = self.power.clone().ok_or(Error::State)?;
+        let board = super::power_policy::Board::new(
+            factory,
+            self.phy.ok_or(Error::State)?,
+            self.hardware.ok_or(Error::State)?,
+            self.image_digest.ok_or(Error::State)?,
+        )
+        .map_err(Error::Power)?;
+        if !calibration.matches(board) {
+            return Err(Error::Power(super::power_policy::Error::Identity));
+        }
+        let gate = super::power_policy::Gate::new(calibration.clone(), permission, factory.mac());
+        let mac = self.mac.ok_or(Error::State)?;
+        let phy = self.phy.ok_or(Error::State)?;
+        // Poison before any radio/calibration register or await. A partial
+        // calibration never grants replay, ordinary packet or carrier access.
+        self.phase = Phase::Failed;
+        let mut io = super::radio::Checked {
+            io: &mut self.io,
+            calibration: &calibration,
+            permission,
+            policy,
+        };
+        let info = super::radio::prepare(&mut io, factory, mac, phy, gain, gate).await?;
+        self.radio = Some(info);
+        self.phase = Phase::Calibrated;
+        Ok(info)
     }
     pub async fn prepare_phy_tables(
         &mut self,
@@ -503,6 +738,12 @@ mod phy_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "power_policy_tests.rs"]
 mod power_policy_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "radio/tests.rs"]
+mod radio_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "station_composition_tests.rs"]
+mod station_composition_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "firmware_transport_tests.rs"]
 mod tests;

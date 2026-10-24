@@ -15,11 +15,11 @@ use narf_wireless::{
     scan::BssInfo, AssociateRequest, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
 
-/// Publish the association's physical carrier along with the interface's
-/// existing up/down state. Shared by production and its composition fixture.
+/// Publish physical carrier while preserving operator-controlled IFF_UP.
+/// No administrative open/stop callback runs under the caller's driver locks.
+/// Shared by production and its composition fixture.
 pub(crate) fn publish_link(name: &str, up: bool) -> bool {
-    let carrier = narf_net::iface::set_link_metadata(name, up, None, None);
-    narf_net::iface::set_link_state(name, up) && carrier
+    narf_net::iface::set_link_metadata(name, up, None, None)
 }
 
 /// One retained legacy 2.4/5 GHz station, with carrier gated by association.
@@ -649,6 +649,74 @@ mod tests {
     use super::*;
     use crate::mt7921::firmware_transport::{NicCapabilities, PhyCapabilities, Report};
     use narf_kernel_test::{kernel_test_in, TestResult};
+    static ADMIN_CALLS: AtomicU32 = AtomicU32::new(0);
+    static ADMIN_BLOCKED: AtomicBool = AtomicBool::new(false);
+    static DRIVER_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
+    fn admin_hook(_: &str, _: bool) {
+        ADMIN_CALLS.fetch_add(1, Ordering::AcqRel);
+        if DRIVER_LOCK.try_lock().is_none() {
+            ADMIN_BLOCKED.store(true, Ordering::Release);
+        }
+    }
+    fn reject(_: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
+        Err(())
+    }
+    struct Registration;
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            narf_net::iface::unregister("mt76-carrier-admin-model");
+        }
+    }
+    fn mt76_physical_carrier_preserves_admin_and_never_calls_hook_under_driver_lock() -> TestResult
+    {
+        let name = "mt76-carrier-admin-model";
+        narf_net::iface::register(name, [2, 0, 0, 0, 0, 7], reject);
+        let _registration = Registration;
+        ADMIN_CALLS.store(0, Ordering::Release);
+        ADMIN_BLOCKED.store(false, Ordering::Release);
+        if !narf_net::iface::set_open_stop(name, admin_hook) {
+            return TestResult::Fail("MT76 could not install actual administrative hook");
+        }
+        {
+            let _driver = DRIVER_LOCK.lock();
+            if !publish_link(name, true) {
+                return TestResult::Fail("MT76 could not publish carrier on registered interface");
+            }
+        }
+        if narf_net::iface::lookup(name).is_none_or(|i| i.link_up || !i.carrier)
+            || ADMIN_CALLS.load(Ordering::Acquire) != 0
+        {
+            return TestResult::Fail("MT76 carrier-up changed IFF_UP or reentered driver lock");
+        }
+        narf_net::iface::set_link_state(name, true); // operator transition
+        if ADMIN_CALLS.load(Ordering::Acquire) != 1 || ADMIN_BLOCKED.load(Ordering::Acquire) {
+            return TestResult::Fail(
+                "MT76 real administrative hook could not reenter unlocked gate",
+            );
+        }
+        {
+            let _driver = DRIVER_LOCK.lock();
+            if !publish_link(name, false) || !publish_link(name, false) {
+                return TestResult::Fail(
+                    "MT76 carrier-down failed on retained registered interface",
+                );
+            }
+        }
+        if narf_net::iface::lookup(name).is_none_or(|i| {
+            !i.link_up || i.carrier || i.carrier_up_count != 1 || i.carrier_down_count != 1
+        }) || ADMIN_CALLS.load(Ordering::Acquire) != 1
+            || ADMIN_BLOCKED.load(Ordering::Acquire)
+        {
+            return TestResult::Fail(
+                "MT76 carrier-down changed admin state or duplicated transition",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/scan",
+        mt76_physical_carrier_preserves_admin_and_never_calls_hook_under_driver_lock
+    );
     fn radio() -> RadioInfo {
         RadioInfo {
             firmware: Report {

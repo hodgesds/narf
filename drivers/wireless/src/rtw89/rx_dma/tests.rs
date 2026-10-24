@@ -260,6 +260,16 @@ kernel_test_in!(
 );
 
 fn smoke_rtw89_rx_publication_failure_cancel_and_stale_indices_are_terminal() -> TestResult {
+    let mut unqualified = Fixture::new();
+    unqualified.model.bytes[0xc000..0xc004].copy_from_slice(&(1u32 << 29).to_le_bytes());
+    if unqualified.prepare() != Some(Err(Error::Register(power::Error::Access)))
+        || unqualified.rx.armed
+        || unqualified.rx.rings.is_some()
+    {
+        return TestResult::Fail(
+            "RX publication accepted an unqualified autonomous response TX gate",
+        );
+    }
     let mut baseline = Fixture::new();
     if baseline.prepare() != Some(Ok(())) {
         return TestResult::Fail("RX baseline");
@@ -372,6 +382,19 @@ fn smoke_rtw89_rx_device_model_rejects_unowned_dma_and_ignored_repost() -> TestR
     f.model.ignore = Some(0x1050);
     if f.rx.poll(&mut f.model, 1) != Err(Error::Index) || f.rx.state() != State::Terminal {
         return TestResult::Fail("ignored host RX repost returned frame success");
+    }
+    let mut f = Fixture::new();
+    if f.prepare() != Some(Ok(())) || !f.model.inject(&f.rx, 0, 0, &bytes) {
+        return TestResult::Fail("RX response-policy negative baseline");
+    }
+    f.model.bytes[0xc000..0xc004].copy_from_slice(&(1u32 << 29).to_le_bytes());
+    if f.rx.poll(&mut f.model, 1) != Err(Error::Register(power::Error::Access))
+        || f.model.raw(0x1050) != 0x10000
+        || f.rx.state() != State::Terminal
+    {
+        return TestResult::Fail(
+            "RX poll returned frame evidence after autonomous TX gate changed",
+        );
     }
     TestResult::Pass
 }

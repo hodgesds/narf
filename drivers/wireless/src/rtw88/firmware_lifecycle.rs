@@ -1,5 +1,6 @@
 //! Retain the exact native firmware owner before its first device publication.
 use super::firmware_transport::{Error, Info, Io, Owner};
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,6 +13,10 @@ pub enum Stage {
     MacPrepared,
     PreparingPhy,
     PhyTablesPrepared,
+    Calibrating,
+    Calibrated,
+    StationPreparation,
+    StationReady,
     Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,7 +27,7 @@ pub struct Status {
 }
 pub(super) struct Lifecycle<I: Io> {
     started: AtomicBool,
-    retained: Mutex<Option<Owner<I>>>,
+    pub(super) retained: Mutex<Option<Owner<I>>>,
     status: IrqSafeSpinLock<Status>,
     did: u16,
 }
@@ -44,7 +49,12 @@ impl<I: Io> Drop for Attempt<'_, I> {
         let mut status = self.0.status.lock();
         if !matches!(
             status.stage,
-            Stage::Ready | Stage::MacPrepared | Stage::PhyTablesPrepared | Stage::Failed
+            Stage::Ready
+                | Stage::MacPrepared
+                | Stage::PhyTablesPrepared
+                | Stage::Calibrated
+                | Stage::StationReady
+                | Stage::Failed
         ) {
             *status = Status {
                 stage: Stage::Failed,
@@ -75,6 +85,96 @@ impl<I: Io> Lifecycle<I> {
         allocate: impl FnOnce() -> Result<I, Error> + Send,
     ) -> Result<Info, Error> {
         self.initialize(allocate, Source::Registered).await
+    }
+    pub(super) async fn start_station(
+        &self,
+        environment: Arc<dyn super::station::Environment>,
+        admission: super::station_control::Admission,
+    ) -> Result<(), super::station::Error> {
+        admission.check()?;
+        let mut retained = self.retained.lock().await;
+        admission.check()?;
+        if self.status().stage != Stage::Calibrated {
+            return Err(super::station::Error::State);
+        }
+        self.status.lock().stage = Stage::StationPreparation;
+        let _attempt = Attempt(self);
+        let result = retained
+            .as_mut()
+            .ok_or(super::station::Error::State)?
+            .start_station(environment, admission)
+            .await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::StationReady,
+            Err(_) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(Error::Prerequisite),
+                }
+            }
+        }
+        result.map(|_| ())
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) async fn initialize_bytes(
+        &self,
+        allocate: impl FnOnce() -> Result<I, Error> + Send,
+        bytes: alloc::vec::Vec<u8>,
+    ) -> Result<Info, Error> {
+        self.initialize(allocate, Source::Bytes(bytes)).await
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) async fn qualify_board_with_source(
+        &self,
+        factory: &super::efuse::Factory,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        source: super::power_policy::Source,
+    ) -> Result<super::power_policy::Permission, Error> {
+        if self.status().stage != Stage::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        self.retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .qualify_with(factory, domain, source)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) async fn prepare_radio_with_policy<F>(
+        &self,
+        factory: &super::efuse::Factory,
+        permission: super::power_policy::Permission,
+        policy: F,
+    ) -> Result<super::radio::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        self.status.lock().stage = Stage::Calibrating;
+        let _attempt = Attempt(self);
+        let result = retained
+            .as_mut()
+            .ok_or(Error::State)?
+            .prepare_radio_with_policy(factory, permission, policy)
+            .await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Calibrated,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
     }
     pub(super) async fn prepare_mac(&self) -> Result<super::mac::Info, Error> {
         let mut retained = self.retained.lock().await;
@@ -136,6 +236,35 @@ impl<I: Io> Lifecycle<I> {
             .as_mut()
             .ok_or(Error::State)?
             .qualify_board(factory, domain)
+    }
+    pub(super) async fn prepare_radio(
+        &self,
+        factory: &super::efuse::Factory,
+        permission: super::power_policy::Permission,
+    ) -> Result<super::radio::Info, Error> {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        self.status.lock().stage = Stage::Calibrating;
+        let _attempt = Attempt(self);
+        let result = retained
+            .as_mut()
+            .ok_or(Error::State)?
+            .prepare_radio(factory, permission)
+            .await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Calibrated,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
     }
     async fn initialize(
         &self,

@@ -1451,7 +1451,7 @@ impl<Io: ChipIo, Irq: CeIrq> Hif for CeHif<Io, Irq> {
 
 /// BAR0 by value (the PCI glue's [`ChipIo`]).
 #[derive(Copy, Clone, Debug)]
-pub struct Bar0(pub narf_bus::MmioRegion);
+pub struct Bar0(pub super::pci::NativeIo);
 
 impl ChipIo for Bar0 {
     fn read32(&self, offset: u32) -> u32 {
@@ -1557,7 +1557,7 @@ pub async fn pci_start(w: super::pci::Wlfw) {
         *STRANDED.lock() = Some(w);
         return;
     }
-    let mmio = super::pci::with_controller(|d| d.mmio_bar0);
+    let mmio = super::pci::with_controller(|d| d.native);
     let Some(mmio) = mmio else {
         TransportError::new(step::NO_DEVICE, 1, ENODEV).report("ath11k core");
         *STRANDED.lock() = Some(w);

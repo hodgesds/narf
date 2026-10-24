@@ -74,11 +74,11 @@ initial station profile: scan, Open/WPA2-PSK, DHCP and bidirectional IP, with
 controlled-port closure and safe transport ownership on disconnect/failure.
 Automatic recovery, wider PHY/chip coverage and power management are separate
 follow-ups where the initial profile deliberately requires a fresh device
-lifecycle. Nine families have composed kernel-DHCP paths (Intel Sc, MT76,
-ath11k, ath10k, AR9285, RTL8188EE, RTL8188EU, CYW43439 and BCM43602); exact authenticated firmware,
+lifecycle. Ten families have composed kernel-DHCP paths (Intel Sc, MT76,
+ath11k, ath10k, AR9285, RTL8188EE, RTL8188EU, RTL8822CE, CYW43439 and BCM43602); exact authenticated firmware,
 board/calibration/policy provisioning and the family-specific gaps below
-still prevent an all-driver hardware-ready claim. RTW88 and RTW89 still need
-substantial radio/station/packet implementation.
+still prevent an all-driver hardware-ready claim. RTL8852B still needs
+full RF/channel/power and ordinary packet/station integration.
 
 Intel now sends versioned coexistence, SoC latency and awake-power setup.
 A retained Gen2 context-v1/RFH/TFH boot owner now covers APM, ALIVE6, unified
@@ -192,10 +192,14 @@ all-ring-owned beacon reserved pages and IDDMA. Success parks DMA; ambiguous or
 cancelled mappings stay pinned. It continues through inactive MAC/LLT/FIFO setup,
 complete logical factory EFUSE and protected OTP, an actual firmware hardware
 feature response, source-selected BB/AGC/RFK-init/RF tables and a signed exact-board
-power qualification. Forty-nine cut/RFE traces check table application. No
-measured gain curve or transmit permission is inferred from factory indices.
-Calibration/firmware H2C, ordinary packet/station paths and other RTW88 chips
-remain software work.
+power qualification. Forty-nine cut/RFE traces check table application. It now
+continues through fresh bounded DACK/IQK, H2C, awake software-crypto setup and
+the same registered Device through scan, Open/WPA2, actual kernel DHCP and
+exact bidirectional IP. Actual TXBD consumption plus matching CCX ACK and DMA
+bytes gate security replies; a genuine RX-idle fence excludes queued peer loss.
+Current policy and the signed v2 calibration/response envelope are checked at
+publication. No measured gain curve or transmit permission is inferred from
+factory indices. RTL8821CE/RTL8822BE remain identification-only profiles.
 RTW89 has checked owned AX firmware selection, cold-power/DDV primitives and
 fuse-selected immutable header/section download plans with host blacklist
 enforcement. Power-off/normalization and DLE/HFC primitives now have Linux-C
@@ -214,9 +218,11 @@ CH12/WCPU startup with RX closed and PCI bus mastering last. Another 40 Linux C
 cases cover PCI basic configuration. The RTL8852B continuation now reads actual
 physical PHY-cap trims and composes post-WCPU SCC MAC setup with retained
 36-bit RXBD/RPQ/C2H ownership. Source C vectors check actual RX envelopes,
-release records and index wrap. RF-v1 access and original conditional BB/gain/
-RF/NCTL table selection are implemented with current authority and retained
-failure. Full table execution/RFK/channel, packet TX/station service and probe
+release records and index wrap. RF-v1 access, original conditional BB/gain/
+RF table execution and actual runtime RF-table H2C uploads share that owner.
+Signed measured basic-calibration qualification, firmware-confirmed WLAN-only
+coexistence and bounded NCTL/RCK/DACK/RXDCK keep global CMAC TX disabled.
+Full RF/channel/power, packet TX/station service and probe
 attachment remain. Its diagnostic probe retains unpublished storage without
 activating rings, IRQs or a NIC.
 Scoped native PCIe PHY/DBI operations now provide bounded MDIO/RAC access with
@@ -292,10 +298,11 @@ loading, revocation, failure, cache reuse and concurrent caller policy.
 
 The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
 wireless, network, crypto, RNG, firmware and shared-fixture QEMU gates:
-x86_64 reports 2820 pass / 0 fail / 22 skip; aarch64 reports
-2116 pass / 0 fail / 16 skip. The latest continuation adds65 smokes covering
-AR9285 and RTL8188EE station/DHCP, actual Intel socket-owner close, raw BSS
-observation and retained RTL8822CE/RTL8852B radio/transport prerequisites;
+x86_64 reports 2900 pass / 0 fail / 22 skip; aarch64 reports
+2196 pass / 0 fail / 16 skip. The latest continuation adds80 smokes covering
+RTL8822CE native station/DHCP and source DCF, signed FullMAC board selection,
+retained asset staging, current capability invocation, physical carrier versus
+administrative state, whole-rekey deadlines and RTL8852B radio/transport owners;
 all pass on both architectures alongside the prior coverage.
 Both include a clean production boot and btrfs interoperability postflight.
 Host tests, release/debug builds, targeted Clippy across the kernel feature

@@ -130,7 +130,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             .store(u64::from_le_bytes(packed), Ordering::Release);
         let up = peer.is_some();
         let was = self.up.swap(up, Ordering::AcqRel);
-        narf_net::iface::set_link_state(&self.name, up);
+        // Physical carrier preserves operator-controlled IFF_UP and never
+        // invokes an administrative open/stop hook under retained locks.
         narf_net::iface::set_link_metadata(&self.name, up, None, None);
         if was && !up {
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
@@ -584,7 +585,7 @@ pub(super) mod publication_test {
         if device.link_up()
             || device.connected_bssid().is_some()
             || narf_net::iface::lookup(device.name())
-                .is_some_and(|iface| iface.link_up || iface.carrier)
+                .is_none_or(|iface| !iface.link_up || iface.carrier)
         {
             return Err("EE paused publisher survived completed close");
         }
@@ -618,7 +619,7 @@ pub(super) mod publication_test {
         if device.link_up()
             || device.connected_bssid().is_some()
             || narf_net::iface::lookup(device.name())
-                .is_some_and(|iface| iface.carrier || iface.link_up)
+                .is_none_or(|iface| iface.carrier || !iface.link_up)
         {
             return Err("EE stale native publisher reopened closed station");
         }

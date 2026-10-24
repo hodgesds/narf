@@ -143,7 +143,8 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             .store(u64::from_le_bytes(packed), Ordering::Release);
         let up = peer.is_some();
         let was = self.up.swap(up, Ordering::AcqRel);
-        narf_net::iface::set_link_state(&self.name, up);
+        // Physical carrier preserves operator-controlled IFF_UP and never
+        // invokes an administrative open/stop hook under retained locks.
         narf_net::iface::set_link_metadata(&self.name, up, None, None);
         if was && !up {
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);

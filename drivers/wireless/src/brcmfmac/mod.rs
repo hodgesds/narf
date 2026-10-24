@@ -52,6 +52,7 @@ pub mod fwil;
 pub mod msgbuf;
 pub mod native_runtime;
 pub mod pcie;
+pub mod provision;
 pub mod ringbuf;
 pub mod runtime;
 pub mod shared;

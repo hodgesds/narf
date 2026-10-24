@@ -47,21 +47,14 @@ impl RegistryFiles {
 }
 impl Files for RegistryFiles {
     fn load(&mut self, name: &str) -> Result<Vec<u8>, Error> {
-        let cap = narf_firmware::open(name, &self.authority).map_err(|error| match error {
-            narf_firmware::FirmwareError::NotFound => Error::Missing,
-            narf_firmware::FirmwareError::OutOfMemory => Error::NoMemory,
-            _ => Error::Authority,
-        })?;
-        let view = narf_firmware::view_of(&cap).map_err(|_| Error::Authority)?;
-        if view.bytes.len() > 16 * 1024 * 1024 {
-            return Err(Error::InvalidContainer);
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(view.bytes.len())
-            .map_err(|_| Error::NoMemory)?;
-        bytes.extend_from_slice(view.bytes);
-        Ok(bytes)
+        let board = matches!(name.rsplit('/').next(), Some("board.bin" | "board-2.bin"));
+        crate::firmware_asset::load(&self.authority, name, 16 * 1024 * 1024, board)
+            .map(|asset| asset.bytes)
+            .map_err(|error| match error {
+                narf_firmware::FirmwareError::NotFound => Error::Missing,
+                narf_firmware::FirmwareError::OutOfMemory => Error::NoMemory,
+                _ => Error::Authority,
+            })
     }
 }
 
@@ -409,5 +402,52 @@ mod metadata_tests {
     kernel_test_in!(
         "drivers/wireless/ath10k",
         smoke_ath10k_installed_board_metadata_replays
+    );
+}
+
+#[cfg(feature = "kernel-test")]
+mod asset_authority_tests {
+    use super::*;
+    use crate::firmware_asset::tests::install;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_ath10k_board_data_requires_signer_and_current_registry_invocation() -> TestResult {
+        let (write, read) = narf_firmware::bootstrap_authority();
+        let mut files = RegistryFiles { authority: read };
+        for name in ["ath10k/narf-test/board-2.bin", "ath10k/narf-test/board.bin"] {
+            match install(&write, name, b"inert-board", false) {
+                Ok(()) => {
+                    if files.load(name).is_ok() {
+                        return TestResult::Fail("unsigned developer ath10k calibration admitted");
+                    }
+                }
+                Err(narf_firmware::FirmwareError::UnsignedRejected) => {}
+                Err(_) => return TestResult::Fail("unexpected board fixture installation failure"),
+            }
+            install(&write, name, b"inert-board", true).unwrap();
+            if files.load(name).as_deref() != Ok(b"inert-board".as_slice()) {
+                return TestResult::Fail("signed exact ath10k board copy changed");
+            }
+        }
+        let executable = "ath10k/narf-test/firmware-6.bin";
+        match install(&write, executable, b"inert-code", false) {
+            Ok(()) => {
+                if files.load(executable).as_deref() != Ok(b"inert-code".as_slice()) {
+                    return TestResult::Fail("ath10k developer executable policy changed");
+                }
+            }
+            Err(narf_firmware::FirmwareError::UnsignedRejected) => {}
+            Err(_) => {
+                return TestResult::Fail("unexpected executable fixture installation failure")
+            }
+        }
+        read.revoke();
+        if files.load("ath10k/narf-test/board-2.bin").is_ok() {
+            return TestResult::Fail("ath10k firmware read ignored current registry epoch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/ath10k/firmware",
+        smoke_ath10k_board_data_requires_signer_and_current_registry_invocation
     );
 }

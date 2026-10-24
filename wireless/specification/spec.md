@@ -835,6 +835,13 @@ accepts local Ethernet data only while authorized and consumes its PN before
 transport publication. Each driver's stop/cancellation/DMA ownership remains
 that driver's responsibility.
 
+`Security::handshake_active()` reports a retained reply awaiting terminal
+delivery or the supplicant waiting for M3 after M2 delivery. It is false after
+terminal failure. During an established pairwise rekey, the old-key data port
+can reopen after the exact M2 receipt while this exchange remains active;
+drivers must track the handshake deadline independently of `port_open()` and
+established carrier. The matching M4 terminal receipt finishes that exchange.
+
 ### 3.5 EAPOL supplicant (`eapol.rs`)
 
 `Supplicant` runs the 4-way handshake (`handle`) and, once it completed,

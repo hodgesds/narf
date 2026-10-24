@@ -15,16 +15,18 @@
 //! 1. PCI device match via the existing `bus::driver_match` table.
 //! 2. **BAR2** Device MMIO mapping (both rtw88 and rtw89 use BAR2). Linux `pci.c:rtw89_pci_claim_device` walks
 //!    `bar_id = 2` directly.
-//! 3. Diagnostic baseline power prologue; complete AX power-on/off and
-//!    DLE/HFC primitives await the composed boot owner.
+//! 3. Parked diagnostic power prologue and a separate retained actual AX
+//!    cold/factory/PCI/BDRAM/CH12/WCPU startup owner.
 //! 4. Chip-ID detection from `R_AX_SYS_CFG1` so subsequent stages can
 //!    branch on the AX (8852A/B/C, 8851B) vs BE (8922A) generation.
 //! 5. EFUSE read for MAC + the 6-byte address copy. Logical map
 //!    offsets follow the per-chip layout in
 //!    `rtw89/rtw8852a.h::rtw8852ae_efuse`.
 //! 6. Retained unpublished ring storage, without a registered NIC or IRQ.
-//! 7. Checked immutable secure firmware plans and native CH12 ownership,
-//!    still inactive pending full PCIe/BDRAM/WCPU composition and RF/MLME.
+//! 7. Checked firmware plans, active private CH12/WCPU/MAC/RX ownership and
+//!    B BB/RF tables plus signed basic calibration. Diagnostic DMA stays parked.
+//! 8. Full qualified channel/RF/power and packet/station composition remains
+//!    required before a usable NIC or IRQ is published.
 //!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later as of
 //! 2026-05-20 per the root `LICENSE`)
@@ -56,7 +58,10 @@ extern crate alloc;
 
 mod bdram;
 pub mod btc;
+mod calibration_policy;
 pub mod chan;
+mod channel_rf;
+mod coex_native;
 mod cold;
 mod cold_native;
 mod command_native;
@@ -94,11 +99,19 @@ mod power_native;
 mod power_regs;
 mod power_tables;
 mod prepared;
+mod radio_assets;
+mod radio_gain;
+mod radio_init;
+mod radio_stop;
 mod radio_table;
 mod radio_tables_b;
 mod rf_access;
+mod rfk;
+mod rfk_regs;
+mod rfk_tables;
 mod rx_dma;
 mod rx_packet;
+mod scheduler_mailbox;
 mod secure;
 mod startup;
 pub mod tx_transport;

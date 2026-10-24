@@ -55,7 +55,7 @@ impl Harness {
             move || current.lock().clone(),
         ));
         *ACTIVE_TEST.lock() = Some(device.clone());
-        narf_net::iface::set_link_state(&name, false);
+        narf_net::iface::set_link_state(&name, true); // operator IFF_UP
         narf_net::iface::set_link_metadata(&name, false, None, None);
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
@@ -108,11 +108,18 @@ impl Harness {
             return Err("native Device management/early-M1/RSNA failed");
         }
         if !self.device.link_up()
-            || narf_net::iface::lookup(&self.name)
-                .is_none_or(|i| !i.carrier || i.carrier_up_count != 1 || i.carrier_down_count != 0)
+            || narf_net::iface::lookup(&self.name).is_none_or(|i| {
+                !i.link_up || !i.carrier || i.carrier_up_count != 1 || i.carrier_down_count != 0
+            })
         {
             return Err("real Device carrier did not follow exact authorization");
         }
+        narf_net::iface::set_link_state(&self.name, false);
+        self.device.drain();
+        if narf_net::iface::lookup(&self.name).is_none_or(|i| i.link_up || !i.carrier) {
+            return Err("native Device physical carrier overwrote operator DOWN");
+        }
+        narf_net::iface::set_link_state(&self.name, true);
         Ok(())
     }
     fn pump(&self) {
@@ -127,7 +134,7 @@ impl Harness {
     fn closed(&self) -> bool {
         !self.device.link_up()
             && narf_net::iface::lookup(&self.name).is_some_and(|i| {
-                !i.carrier && !i.link_up && i.carrier_up_count == 1 && i.carrier_down_count == 1
+                !i.carrier && i.link_up && i.carrier_up_count == 1 && i.carrier_down_count == 1
             })
     }
     fn received(&self, expected: &[u8]) -> bool {

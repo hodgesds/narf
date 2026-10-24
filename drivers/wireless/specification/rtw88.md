@@ -1,7 +1,8 @@
 # rtw88 — Specification
 
-> Status: **v0.4** (RTL8822CE retained firmware, inactive MAC/PHY tables and
-> signed board-power prerequisites; radio/packet/station work remains).
+> Status: **v0.6** (RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
+> signed operating-power qualification, native packets and channel1 station
+> integration; composed software gates and physical acceptance remain distinct).
 >
 > Realtek Wi-Fi 5 (802.11ac) driver for PCIe silicon
 > (RTL8821CE / RTL8822CE). Adapted from Linux
@@ -11,12 +12,15 @@
 
 **Owns:** PCI matching, baseline power-on, and factory identity for
 RTL8821CE / RTL8822BE / RTL8822CE, plus the retained native firmware
-loader, inactive MAC/FIFO/PHY and board-power continuations for RTL8822CE.
+loader, MAC/FIFO/PHY, H2C, calibrated radio/board-power continuations and a
+single awake channel1 legacy20 station for RTL8822CE. The retained station
+supports Open and WPA2-PSK with host RSNA/CCMP; its ordinary host TX rate is
+fixed at 1 Mbps and requires an AP advertising that basic rate.
 The probe decodes physical EFUSE programming
 records to obtain the correct PCIe MAC.
 
-**Does NOT own:** Data path, H2C command set, or regulatory
-compliance.
+**Does NOT own:** Trusted deployment policy, measured board calibration
+artifacts or their signing authority. Factory country hints supply no policy.
 
 ## 2. Assumptions
 
@@ -84,16 +88,22 @@ Nineteen separate source-defined protected OTP cells retain the actual thermal,
 sparse-map decoding; protected cells can never be interpreted as map records.
 The same current PCI invocation covers the original map and trim capture.
 
-The probe registers a diagnostic interface with carrier down. Scan,
-association, channel/power configuration, and packet TX remain unsupported.
-For RTL8822CE, the controller and registered interface share the exact
-`Arc` firmware owner before the probe spawns one asynchronous registered
-load attempt. `Rtw88Device::firmware_status()` returns its
+For RTL8822CE, `bring_up` creates one named, unpublished station shell sharing
+the exact `Arc<Lifecycle>` retained by the firmware owner. Probe acquires frame
+registry authority and registers the shell in the frame, kernel IP and wireless
+registries before spawning the firmware worker or activating packet DMA. The
+controller view delegates control, carrier and frame rings to this same shell.
+Carrier stays down until actual peer association and security admission.
+RTL8821CE/RTL8822BE remain diagnostic interfaces with wireless controls and
+packet TX unsupported.
+`Rtw88Device::firmware_status()` returns its
 `FirmwareStatus { stage, info, error }`; `FirmwareStage` is `Detected`,
 `Allocating`, `Loading`, `Ready`, `PreparingMac`, `MacPrepared`,
-`PreparingPhy`, `PhyTablesPrepared`, or `Failed`. `Ready` identifies firmware
+`PreparingPhy`, `PhyTablesPrepared`, `Calibrating`, `Calibrated`,
+`StationPreparation`, `StationReady`, or `Failed`. `Ready` identifies firmware
 completion and parked host DMA, independently of station/radio readiness.
-RTL8821CE/RTL8822BE have no native firmware owner. The safe
+`StationReady` identifies completed packet preparation, not an associated peer
+or authorized controlled port. RTL8821CE/RTL8822BE have no native firmware owner. The safe
 `fw::download_firmware(registers, pci_device_id)` helper returns
 `FwError::Unsupported` before registry or MMIO access for every device:
 raw MMIO alone cannot prove exclusive DMA/ring/reset ownership.
@@ -114,11 +124,15 @@ checksums and the exact final `0xc078` firmware-ready status.
 Before BME, the native owner allocates all seven non-beacon TX BD rings,
 512 RX buffers plus their BD array, and the beacon BD/frame (522 coherent
 mappings). Every mapping is below 4 GiB; bases, counts and reset indices
-are checked while MAC TX/RX, all packet queues and interrupts are parked.
+are checked while MAC TX/RX and interrupts are parked and ordinary host
+producer indices remain empty.
 Only the retained beacon queue runs during download. Completion closes
-HCI/MAC DMA and every queue, verifies BME clear, and restores exact ring
-bases/counts/reset indices. H2C/C2H, native packet TX/RX and IRQ delivery
-are not started.
+HCI/MAC DMA, verifies BME clear, and restores exact ring
+bases/counts/reset indices. Native packet TX/RX and IRQ delivery are not started by firmware readiness.
+PCI control `0x303 | 0xf7` is the source DMA configuration, not a queue-stop
+bitmap. Parking relies on CR DMA/MAC gates and verified BME clear; only owned
+producer indices may advance while BME is enabled. No pause bitmap is inferred
+from another chip family, and RX-tag configuration at `0x301[7]` is preserved.
 
 The same retained firmware `Owner` then executes one `prepare_mac` continuation;
 it cannot reconstruct the PCI function or reuse firmware pages. `PreparingMac`
@@ -152,18 +166,18 @@ intersect them with the exact chip/factory profile and trusted policy.
 geometry requires both physical RF paths (reported2 or Linux IGNORE), RFE0..6,
 the checked silicon cut and non-erased crystal/board/thermal factory fields.
 The native backend requires the complete `0x5000` RF aperture before any PHY
-write and keeps BME, MAC TX/RX, packet queues and IRQs closed. It powers the
+write and keeps BME, MAC TX/RX and IRQs closed with empty ordinary
+producer indices. It powers the
 BB/RF configuration domain, runs source-selected BB/AGC/RFK-init/RF tables,
 applies the actual crystal value, and restores the source header-file mode.
 RF0 uses SIPI and other RF registers use direct20-bit read/modify/write, with
 the actual source delays. Final parked readbacks precede `PhyTablesPrepared`.
 Missing factory data, unsupported geometry, access error and cancellation are
 terminal. This state means table loading only; DAC/IQ/LO calibration, trims,
-channel/power qualification, H2C/C2H packet service and station activation
-remain required. No packet/carrier interface is enabled by this continuation.
+channel/power qualification and station activation remain separate steps. No packet/carrier interface is enabled by this continuation.
 
 The native continuation next loads the exact per-device
-`rtw88/rtw8822ce-cal-v1-<12 lowercase MAC hex digits>.bin` qualification through
+`rtw88/rtw8822ce-cal-v2-<12 lowercase MAC hex digits>.bin` qualification through
 current firmware authority. Loading and metadata parsing execute inside the
 blob's `Cap::invoke`; a signer is mandatory even in builds that admit unsigned
 device firmware. The retained calibration cap is invoked again before every
@@ -174,7 +188,8 @@ state and does not claim hardware calibration complete.
 logical map, nineteen protected trims, cut/RFE/crystal/two-path geometry,
 decoded firmware hardware capabilities, exact loaded-image SHA256, selected
 PHY tables and source-derived factory ceilings. Source PG decoding and
-normalization constrain each channel1/1Mbps gain by the minimum of all source
+normalization constrain each channel 1 CCK gain by the minimum of all four
+CCK response rates and all source
 regional rows, including the stricter RFE5 table. A country hint cannot raise
 an index. Erased or underflowing factory values are refused; indices are never
 interpreted as dBm. Signed measured upper bounds must additionally fit current
@@ -182,21 +197,133 @@ host policy, antenna gain, qualified EIRP and the conservative20dBm initial
 profile ceiling. Every overlapping rule must cover the complete20MHz channel;
 DFS, environmental/unknown restrictions and missing coverage keep TX closed.
 `NO_P2P` does not prevent the retained STA profile. Unknown measurements never
-mean zero power. The qualification also supplies a separate upper bound for
-calibration transients, which must fit the current EIRP limit before a grant.
+mean zero power. The qualification also supplies separate measured upper bounds for aggregate
+calibration transients and hardware automatic control responses. Both must fit
+the current EIRP limit before a grant; rejecting a host RX frame cannot prevent
+an automatic hardware ACK or CTS.
 Policy changes and actual cap revocation invalidate prior gain tokens.
 
-The family-specific `N22C`v1 record is exactly640 bytes: magic[4], version:u16,
-header128:u16, length:u32, vendor/device:u16 each, board identity[32], MAC[6],
-channel:u8 (1), operating-envelope flag:u8 (1), antenna gain:i16 in quarterdBi,
-qualified EIRP:i16 in quarterdBm, profile:u16 (1), calibration conducted peak:i16
-in quarterdBm, and64 zero reserved bytes. Two128-entry signed-i16 conducted
-upper-envelope arrays follow, for pathsA andB. `i16::MAX` denotes unmeasured;
-all other bounds must lie in[-512,256] quarterdBm. Antenna gain lies in[0,128]
-quarterdBi. The operating-envelope flag attests the complete fixed awake,
-channel1, legacy20, basic1Mbps, TX-A/RX-AB profile and its calibration transitions,
-including uncertainty and retained environmental limits. No real measurement
-artifact is provided or inferred by the implementation.
+The family-specific `N22C` version 2 record is exactly 640 bytes: magic[4],
+version:u16 (2), header128:u16, length:u32, vendor/device:u16 each, board
+identity[32], MAC[6], channel:u8 (1), operating-envelope flags:u8 (3), antenna
+gain:i16 in quarterdBi, qualified EIRP:i16 in quarterdBm, profile:u16 (2),
+aggregate calibration conducted peak:i16, native-response conducted peak:i16,
+and 62 zero reserved bytes. Two 128-entry signed-i16 conducted upper-envelope
+arrays follow, for paths A and B. `i16::MAX` denotes unmeasured curve entries;
+all measured bounds, including both peaks, lie in [-512,256] quarterdBm.
+Antenna gain lies in [0,128] quarterdBi. Version 1, missing response attestation,
+unknown peaks and altered profiles are refused. No real measured artifact is
+provided or inferred by the implementation.
+
+The exact version 2 identity binds awake channel 1, legacy 20 MHz, software
+1 Mbps TX-A/RX-AB, fresh DACK/IQK, no GAPK/DPD/power tracking, software CCMP/raw
+RX, fixed source IGI `0x1c` and conservative adaptive EDCCA thresholds 40/33.
+It also binds source `RRSR=0x1f`, selected CCK references, OFDM reference zero
+and zero relative differences for all twelve legacy rates. Source RRSR
+selection at 1 Mbps retains CCK rates and mandatory OFDM responses; this is
+not a claim that hardware transmits only at the host TXD rate. The response
+peak must bound every native control-response mode over the entire admitted
+CCK index range and OFDM reference zero, including uncertainty and retained
+environmental limits. The separate calibration peak bounds all calibration
+emissions, including any path combination. Neither is derived from an index.
+
+`prepare_radio` continues the same `PhyTablesPrepared` owner after a current
+version 2 board grant. It poisons the owner before its first radio write or
+await, configures TX-A/RX-AB and the actual channel 1 MAC/BB/RF registers,
+programs qualified references, performs fresh ADC/DAC DC calibration and X2
+checks, and applies the nineteen retained OTP trims with source erased-cell
+semantics. Fresh DACK requires complete bounded sampling, stable samples,
+actual hardware IQ-vector receipts and residual convergence. It preserves
+separate per-path RF originals; Linux's `path*i+i` backup alias cannot overwrite
+path A with path B. No vector-cache restore, reset or recalibration is claimed.
+The fixed CCK profile keeps source low-rate DPD disabled and selects the source
+no-GAPK/no-DPK branch; it does not claim broad PHY calibration coverage.
+
+H2C packet DMA uses the original retained 128-entry ring and one additional
+80-byte coherent command mapping allocated while BME is off. All command
+payload/BD mutations and MMIO publications invoke current PCI authority.
+Occupancy commits before any reusable copy; one command remains pending until
+its exact bounded hardware head advances. Foreign, stale or out-of-range heads,
+timeout and cancellation cannot unlock a buffer. Original GeneralInfo and
+PHYDM packets precede IQK. DMA retirement proves command transport only:
+IQK additionally requires a non-stale pre-submit report and the firmware's
+actual `RPT_CIP=0xaa` completion within 300 ms. A host write never fabricates
+that receipt.
+
+Before `Calibrated`, the continuation requires a fresh RPWM/CPWM awake toggle,
+invalidates all 32 source CAM entries with bounded command completion, disables
+CR/SECCFG hardware crypto and default-key search, and selects native RX with
+PHY metadata and trailing FCS. MAC TX/RX and IRQs remain disabled. On completion
+it parks BME and seals the completed firmware beacon BD and packet descriptor
+inside current PCI authority, clears its work trigger and disables the beacon
+function. Only then can it transfer the sealed, retained calibration `Gate`
+to the same native packet owner. `Calibrated` describes that exact parked radio;
+it does not assert association, carrier, DHCP or hardware acceptance.
+
+A checked radio adapter re-invokes retained calibration authority and samples
+the current authenticated policy before each host radio write across awaits.
+The native packet gate likewise rechecks that same calibration and current
+policy; no enum state or copied gain alone grants TX. The explicit model policy
+closure is isolated from the native authenticated database.
+
+`station_control::Admission` shares a closed flag and publication lock with
+the station/device owner. Every asynchronous control helper checks admission
+after waits and serializes the final synchronous MMIO/mailbox publication with
+close; no publication lock spans an await. Port 0 binds the sealed factory MAC,
+actual BSSID, checked AID and managed link type. Source awake/keep-alive-disable,
+fixed CCK1 RA, media-status and default-port commands use the original four-box
+HMEBOX protocol. The cursor and pending identity remain in the native owner;
+actual HMETFR consumption is required before reuse and never presented as an
+applied-command acknowledgement. Close prevents later peer publications;
+terminal disconnect may drain a previously published mailbox and send media-down
+without reopening the data port. Initial MLME uses the source long-slot20
+setting; short-slot9 is selected only after the successful association response.
+
+`StationPreparation` borrows the exact retained owner's backend; it never moves
+or reconstructs that owner. It prepares one additional bounded packet buffer
+with BME off, reuses the original management/BE TX rings and 512 RX mappings,
+verifies the sealed firmware beacon request and source PCI configuration, then
+enables MAC/HCI DMA and BME last. Interrupts remain masked. Every synchronous
+poll advances a bounded amount of native DMA/RX/CCX work, so kernel DHCP and
+ARP/ND callbacks can make progress without a second executor task. Frame
+callbacks use nonblocking owner/ring locks; stack receive callbacks run only
+after those locks and publication guards have dropped.
+
+Native TX descriptors select fixed CCK1 and software security. A consumed TX
+buffer proves transport retirement only. Authentication, association and EAPOL
+security replies additionally require the matching fresh CCX identity and ACK,
+the exact immutable MPDU bytes, and the receive-idle reuse fence; DMA retirement
+alone cannot commit M4. RX descriptors must prove original legacy20 native MPDU
+bytes without hardware decryption or decapsulation. Wi-Fi FCS is stripped
+exactly once; C2H bytes are never treated as Wi-Fi payload. Current PCI authority,
+the retained signed calibration cap and fresh authenticated policy are checked
+before every native packet publication and progress step.
+
+Passive scan admits channel1/2412 MHz only, bounded dwell and SSID filters.
+Active/random-MAC/6 GHz scanning and probe extra IEs are refused. The shared
+association parser validates actual beacons, authentication and association
+responses, including mandatory supported rates. Open and WPA2-PSK use that same
+retained peer transition. WPA2 uses shared host RSNA and packet-key owners for
+nonce, replay, CCMP and controlled-port admission; no hardware key-cache fallback
+is available. Kernel Ethernet enqueue admits the sealed local source MAC,
+bounded Ethernet-II frames and no checksum/TSO/VLAN offloads. It rechecks current
+authority before CPU queue publication and native DMA checks independently.
+Explicit channel/power changes outside the retained profile are refused.
+
+The shell and station share one `Admission`. Activation, scan and association
+future cancellation closes it terminally before releasing the retained owner.
+Public disconnect reserves teardown under the publication lock and publishes
+link-down before awaiting the lifecycle mutex. Closed workers retain native
+cleanup access while that reservation exists: source NoLink/media-down precedes
+packet stop. Dropping a cancelled reservation leaves admission closed and allows
+the next worker to stop the retained packet owner. No disconnect or error
+reopens the one-shot radio. Deauthentication, peer liveness/security deadline,
+native failure and policy/cap revocation close the data port and carrier.
+Temporary WPA2 rekey closure preserves established carrier while blocking
+ordinary data. New frames and returned RX are suppressed after terminal close.
+Hardware carrier publication changes only the carrier metadata, preserving
+operator-controlled IFF_UP. It cannot invoke an administrative open/stop hook
+while the retained owner or metadata lock is held.
 
 One atomic lifecycle claim prevents concurrent/repeated reconstruction.
 The exact inner owner is retained before its first DMA publication.
@@ -239,24 +366,33 @@ aarch64.
 `narf-bus` owns BAR/configuration access, `narf-io` supplies coherent
 DMA storage, `narf-firmware` supplies authenticated image snapshots,
 `narf-scheduler` owns the asynchronous continuation, and `narf-time`
-provides bounded completion waits.
+provides bounded completion waits. Shared `narf-wireless` association,
+station-security and packet-key owners supply bounded MLME, RSNA and CCMP;
+`narf-net` supplies frame registration and the kernel IP/DHCP stack.
 
 ## 7. Stage assignment
 
 - **Stage 1**: PCI match table + sparse EFUSE MAC read (software covered;
   physical hardware acceptance pending).
-- **Stage 2 (Partial)**: Per-chip PCI power lifecycle and retained
-  RTL8822CE section firmware/reserved-page/IDDMA loading are implemented;
-  native bring-up still needs silicon qualification and complete MAC/RF.
-- **Stage 3 (Planned)**: H2C command queue + INIT command.
-- **Stage 4 (Planned)**: RX/TX fast path.
+- **Retained RTL8822CE software profile**: section firmware/reserved-page/
+  IDDMA, MAC/PHY/radio, signed operating power, H2C/mailbox, ordinary packet
+  rings and the channel1 Open/WPA2 station shell are implemented. Composed
+  software gates and physical acceptance are tracked separately.
+- **Additional profiles**: RTL8821CE/RTL8822BE native station support, broader
+  PHY/rates/channels, power management and recovery remain outside this gate.
 
 ## 8. Open questions and references
 
 RTL8822CE firmware now has a retained native owner; other chips remain
 unsupported. BAR2 contains registers, so firmware travels through beacon
-host DMA and IDDMA rather than whole-blob BAR writes. Complete MAC/RF
-initialization, H2C and packet runtime remain bring-up blockers.
+host DMA and IDDMA rather than whole-blob BAR writes. The initial hardware
+target is exclusively RTL8822CE, awake channel1/20 MHz, host CCK1 data and
+qualified native legacy responses, Open or WPA2-PSK, software CCMP and bounded
+polling. A signed measured version2 envelope for the actual board/environment,
+authenticated firmware and deployment policy are mandatory before any RF
+qualification or packet transmission. No default country, curve or calibration
+authority is supplied. Physical scan/association/DHCP/bidirectional IP and safe
+disconnect/failure on that exact board remain hardware acceptance obligations.
 
 Remaining software ledger:
 
@@ -266,14 +402,16 @@ Remaining software ledger:
 | Beacon reserved-page DMA owner, descriptors, successful park | Implemented for RTL8822CE; terminal failures retain mappings |
 | Authenticated section loading, IDDMA validation | Implemented for RTL8822CE; other chips and raw-MMIO helper reject |
 | Inactive PCIe MAC/FIFO/LLT/internal H2C queue setup | Implemented in same retained firmware owner; packet DMA stays closed |
-| H2C/C2H dispatch and command correlation | Missing |
+| H2C packet ring and port0 command mailbox | Same retained native owner; bounded exact transport receipts and separate IQK completion |
 | Retained complete RTL8822CE factory map | Implemented from same probe EFUSE read; original Linux packed geometry checked |
 | Factory-selected inactive BB/AGC/RFK-init/RF tables | Same-owner port implemented; original Linux-C selection/callback oracles and composed stage failure/cancellation regressions |
 | Current signed per-board gain/operating-envelope qualification | Implemented loader, exact identity/source ceilings, cap revocation and current-policy checks; real measured signed artifact is an external deployment gate |
-| DAC/IQ/LO calibration, trim application and regulatory channel | Missing |
-| Passive scan, authentication/association, WPA2 controlled port | Missing |
-| Native management/data TX, RX, completion and ring ownership | Missing |
-| Reset/suspend/removal, retained-map reclamation and multi-device lifetime | Missing |
+| Fixed awake ch1 radio/DACK/IQK/OTP/qualified power | Implemented for the explicit version2 CCK/control-response profile; real signed measured envelope remains a deployment gate |
+| Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
+| Passive scan, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
+| Native management/data TX, RX, completion and ring ownership | Implemented original rings, source descriptors, exact DMA plus CCX security receipt and current-authority publication |
+| Device/frame/kernel IP integration | One shell before activation, same Arc lifecycle, bounded synchronous progress; Open/WPA2 real kernel DHCP and exact bidirectional IP pass composed model tests |
+| Reset/suspend/removal, retained-map reclamation and multi-device lifetime | Outside the one-shot awake profile; published mappings remain retained |
 
 Power-table rows were ported from each Linux chip's `trans_*` arrays.
 Their numeric expressions were checked with a C oracle compiled from those
@@ -295,8 +433,8 @@ Two independently seeded register images cover cut-A and cut-D traces,
 including preserved unrelated bits. Kernel smokes compare the actual Rust
 continuation with those traces and run real firmware-download-to-MAC ownership,
 every access failure, LLT cancellation and invalid H2C pointers. These checks
-establish register/ownership contracts; RF and station readiness still require
-the remaining ports above.
+establish register/ownership contracts; they do not replace the later composed
+radio/station gates or physical acceptance.
 
 The PHY table generator compiles Linux's original condition setup/check/parser
 for every supported cut/RFE PCIe profile and interns identical resulting tables.
@@ -313,3 +451,31 @@ distinct from successful hardware calibration and station readiness.
 - Linux `rtw88/fw.c`, `mac.c`, and `pci.c` (remaining firmware lifecycle).
 - Linux `rtw88/pci.c::rtw_pci_io_mapping` (mandatory BAR2 register aperture).
 - Realtek RTL8822C public datasheet.
+
+The radio oracle compiles the original fresh DACK, TRX/channel/trim, H2C,
+reference/difference/RRSR and IGI/EDCCA source functions. Registered regressions
+compare those actual callbacks, compose the retained firmware owner through
+current signed qualification into bounded calibration, and cover missing
+receipts, pending-command cancellation, restrictive live policy, real cap
+revocation, distinct RF path backup and H2C wrap/foreign-head ownership.
+A separate original-C fixture checks station mailbox command fields; control
+regressions cover held readiness/consumption, close during a wait, retained
+cancelled commands and teardown after close. These are software evidence;
+latest combined gates and physical acceptance remain distinct obligations.
+Shell-future regressions additionally cover unpublished activation, cancelled
+activation before owner-mutex acquisition, public disconnect reservation before
+the mutex, nonblocking drain, cancellation release and terminal cleanup without
+owner reconstruction. Their empty lifecycle cannot fabricate a firmware,
+calibration or station-ready receipt.
+
+The complete station fixture earns firmware, MAC, PHY, board qualification and
+radio receipts on that same lifecycle before Device activation. Its simulated
+AP consumes the current real DMA bytes at each doorbell and generates native
+RXBD/RXD and identity-matched CCX events. Open and WPA2 run the actual kernel
+DHCP client and exchange exact IP payloads through host frame rings and the
+registered stack. Negative cases retain M4 DMA across cancellation, alter its
+actual receipt bytes, queue peer loss before RX idle, revoke the actual
+calibration epoch between descriptor write and doorbell, remove current power
+policy and serialize disconnect against synchronous workers. Administrative
+IFF_UP remains independent of physical carrier. These are software/model
+results; no fixture creates deployable board measurements or physical evidence.

@@ -1,7 +1,7 @@
 use super::*;
-use alloc::{rc::Rc, vec, vec::Vec};
-use core::cell::RefCell;
+use alloc::{sync::Arc, vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_lib::sync::IrqSafeSpinLock;
 
 struct State {
     registers: [u8; 256],
@@ -10,6 +10,7 @@ struct State {
     words: Vec<u32>,
     left: usize,
     reject_data: bool,
+    refuse_commands: bool,
 }
 impl State {
     fn set32(&mut self, a: u32, v: u32) {
@@ -38,7 +39,17 @@ impl State {
     }
 }
 #[derive(Clone)]
-struct Model(Rc<RefCell<State>>);
+pub struct Model(
+    Arc<IrqSafeSpinLock<State>>,
+    Option<crate::pio::HostIdentity>,
+);
+impl core::fmt::Debug for Model {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SdioCardModel")
+            .field("host", &self.1)
+            .finish_non_exhaustive()
+    }
+}
 impl Model {
     fn new() -> Self {
         let mut s = State {
@@ -48,6 +59,7 @@ impl Model {
             words: Vec::new(),
             left: 0,
             reject_data: false,
+            refuse_commands: false,
         };
         s.set32(CAPABILITIES, (50 << 8) | CAPS_CAN_VDD_330);
         s.registers[HOST_VERSION as usize] = SPEC_300 as u8;
@@ -72,18 +84,21 @@ impl Model {
             }
             s.common[cis + 44] = 0xff;
         }
-        Self(Rc::new(RefCell::new(s)))
+        Self(Arc::new(IrqSafeSpinLock::new(s)), None)
     }
 }
 impl Registers for Model {
+    fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
+        self.1
+    }
     fn read8(&mut self, a: u32) -> u8 {
-        self.0.borrow().registers[a as usize]
+        self.0.lock().registers[a as usize]
     }
     fn read16(&mut self, a: u32) -> u16 {
-        self.0.borrow().get16(a)
+        self.0.lock().get16(a)
     }
     fn read32(&mut self, a: u32) -> u32 {
-        let mut s = self.0.borrow_mut();
+        let mut s = self.0.lock();
         if a == BUFFER {
             s.words.push(0x44332211);
             s.moved();
@@ -93,10 +108,10 @@ impl Registers for Model {
         }
     }
     fn write8(&mut self, a: u32, value: u8) {
-        self.0.borrow_mut().registers[a as usize] = if a == SOFTWARE_RESET { 0 } else { value };
+        self.0.lock().registers[a as usize] = if a == SOFTWARE_RESET { 0 } else { value };
     }
     fn write16(&mut self, a: u32, value: u16) {
-        let mut s = self.0.borrow_mut();
+        let mut s = self.0.lock();
         let stored = if a == CLOCK_CONTROL && value & CLK_INT_EN != 0 {
             value | CLK_INT_STABLE
         } else {
@@ -110,6 +125,10 @@ impl Registers for Model {
         let arg = s.get32(ARGUMENT);
         let mode = s.get16(TRANSFER_MODE);
         s.commands.push((cmd, arg, mode));
+        if s.refuse_commands {
+            s.set32(INT_STATUS, INT_ERROR | INT_TIMEOUT);
+            return;
+        }
         let status = s.get32(INT_STATUS) | INT_RESPONSE;
         s.set32(INT_STATUS, status);
         let response = match cmd {
@@ -147,7 +166,7 @@ impl Registers for Model {
         }
     }
     fn write32(&mut self, a: u32, value: u32) {
-        let mut s = self.0.borrow_mut();
+        let mut s = self.0.lock();
         if a == INT_STATUS {
             let new = s.get32(a) & !value;
             s.set32(a, new);
@@ -176,7 +195,7 @@ fn smoke_sdio_owned_card_enumeration_and_fifo() -> TestResult {
     {
         return TestResult::Fail("actual card response/CIS not retained");
     }
-    if shared.borrow().commands[..5]
+    if shared.lock().commands[..5]
         .iter()
         .map(|v| v.0)
         .collect::<Vec<_>>()
@@ -184,7 +203,7 @@ fn smoke_sdio_owned_card_enumeration_and_fifo() -> TestResult {
     {
         return TestResult::Fail("SDIO card command order differs");
     }
-    if shared.borrow().common[CCCR_IO_ENABLE as usize] != 0 {
+    if shared.lock().common[CCCR_IO_ENABLE as usize] != 0 {
         return TestResult::Fail("inherited functions remained enabled across host reset");
     }
     if card.cmd53_write(2, 0, &[1; 8]) != Err(SdioError::NotEnabled)
@@ -200,7 +219,7 @@ fn smoke_sdio_owned_card_enumeration_and_fifo() -> TestResult {
     {
         return TestResult::Fail("fixed FIFO read failed");
     }
-    let s = shared.borrow();
+    let s = shared.lock();
     let last = s.commands.last().unwrap();
     if last.0 != 53
         || last.1 & (1 << 26) != 0
@@ -212,7 +231,7 @@ fn smoke_sdio_owned_card_enumeration_and_fifo() -> TestResult {
     }
     drop(s);
     drop(card);
-    let s = shared.borrow();
+    let s = shared.lock();
     if s.get16(CLOCK_CONTROL) != 0 || s.registers[POWER_CONTROL as usize] != 0 {
         return TestResult::Fail("owned card drop did not power down");
     }
@@ -233,17 +252,17 @@ fn smoke_sdio_card_invalid_extent_and_r5_no_fifo() -> TestResult {
     if card.enable_func(1).is_err() {
         return TestResult::Fail("enable");
     }
-    let before = shared.borrow().commands.len();
+    let before = shared.lock().commands.len();
     if card.cmd52_read(1, 0x20000) != Err(SdioError::AddressOverflow)
         || card.cmd53_write(1, 0x1ffff, &[1; 2]) != Err(SdioError::AddressOverflow)
         || card.cmd53_write(1, 0, &[1; 65]) != Err(SdioError::LengthOverflow)
-        || shared.borrow().commands.len() != before
+        || shared.lock().commands.len() != before
     {
         return TestResult::Fail("invalid address reached command register");
     }
-    shared.borrow_mut().reject_data = true;
+    shared.lock().reject_data = true;
     if card.cmd53_write(1, 0, &[1; 4]) != Err(SdioError::ResponseError(2))
-        || !shared.borrow().words.is_empty()
+        || !shared.lock().words.is_empty()
         || !card.is_failed()
     {
         return TestResult::Fail("R5 rejection touched FIFO or allowed reuse");
@@ -269,11 +288,11 @@ fn smoke_sdio_card_cis_bounds_and_clock_limits() -> TestResult {
     }
     let model = Model::new();
     let shared = model.0.clone();
-    shared.borrow_mut().common[0x1000..0x1400].fill(0);
+    shared.lock().common[0x1000..0x1400].fill(0);
     if !matches!(Card::initialize(model, Config::default()), Err(Error::Cis)) {
         return TestResult::Fail("unterminated CIS accepted");
     }
-    let s = shared.borrow();
+    let s = shared.lock();
     if s.commands.len() > 1050 || s.registers[POWER_CONTROL as usize] != 0 {
         return TestResult::Fail("CIS work unbounded or failed init not powered down");
     }
@@ -283,3 +302,22 @@ kernel_test_in!(
     "drivers/sdio/card",
     smoke_sdio_card_cis_bounds_and_clock_limits
 );
+
+/// Isolated standard-register/CIS model for composed consumer denial tests.
+/// No fixture identity is installed as a production platform profile.
+pub fn initialized_fixture(identity: Option<crate::pio::HostIdentity>) -> (Card<Model>, Model) {
+    let mut model = Model::new();
+    model.1 = identity;
+    let card =
+        Card::initialize(model.clone(), Config::default()).expect("SDIO model initialization");
+    (card, model)
+}
+impl Model {
+    /// Fail every later published command at the controller completion.
+    pub fn refuse_commands(&self) {
+        self.0.lock().refuse_commands = true;
+    }
+    pub fn command_count(&self) -> usize {
+        self.0.lock().commands.len()
+    }
+}

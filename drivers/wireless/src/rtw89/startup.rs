@@ -26,6 +26,10 @@ pub enum Phase {
     MacPrepared,
     ReceivePreparation,
     Receiving,
+    RadioTablesPreparation,
+    RadioTablesLoaded,
+    BasicCalibration,
+    BasicCalibrated,
     Terminal,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +42,9 @@ pub enum Error {
     Boot(firmware_boot::Error),
     Mac(power::Error),
     Receive(super::rx_dma::Error),
+    Assets(super::radio_assets::Error),
+    Radio(super::radio_init::Error),
+    Calibration(super::command_native::CalibrationError),
     Terminal,
 }
 pub struct Startup {
@@ -47,6 +54,10 @@ pub struct Startup {
     firmware: Option<Firmware<Native>>,
     identity: Option<Identity>,
     mac: super::mac_runtime::Mac,
+    radio: super::radio_init::Init,
+    assets: Option<super::radio_assets::Assets>,
+    coex: super::coex_native::Coex,
+    rfk: super::rfk::Rfk,
 }
 impl core::fmt::Debug for Startup {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -69,6 +80,9 @@ impl<'a, T: Terminalize> Attempt<'a, T> {
             owner,
             committed: false,
         }
+    }
+    pub(super) fn owner_mut(&mut self) -> &mut T {
+        self.owner
     }
 }
 impl<T: Terminalize> Drop for Attempt<'_, T> {
@@ -108,6 +122,10 @@ impl Startup {
             firmware: None,
             identity: None,
             mac: super::mac_runtime::Mac::default(),
+            radio: super::radio_init::Init::default(),
+            assets: None,
+            coex: super::coex_native::Coex::default(),
+            rfk: super::rfk::Rfk::default(),
         })
     }
     pub fn phase(&self) -> Phase {
@@ -115,6 +133,68 @@ impl Startup {
     }
     pub fn identity(&self) -> Option<Identity> {
         self.identity
+    }
+    /// Exact initial B measured calibration continuation; packet/response TX,
+    /// full channel calibration and station publication remain closed.
+    pub async fn prepare_basic_calibration(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::RadioTablesLoaded {
+            return Err(Error::Terminal);
+        }
+        self.phase = Phase::BasicCalibration;
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let firmware = attempt.owner.firmware.as_mut().ok_or(Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(Error::Terminal);
+            }
+            // SAFETY: same actual cold/MAC/table/RX owner and retained outer
+            // guard; signed board/current policy is checked before transitions.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .prepare_basic_rfk(
+                        &attempt.owner.radio,
+                        attempt.owner.assets.as_ref().ok_or(Error::Terminal)?,
+                        &mut attempt.owner.coex,
+                        &mut attempt.owner.rfk,
+                    )
+                    .await
+            }
+            .map_err(Error::Calibration)?;
+            attempt.owner.phase = Phase::BasicCalibrated;
+            Ok(())
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
+    }
+    pub async fn prepare_radio_tables(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Receiving {
+            return Err(Error::Terminal);
+        }
+        self.phase = Phase::RadioTablesPreparation;
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let firmware = attempt.owner.firmware.as_mut().ok_or(Error::Terminal)?;
+            if firmware.phase() != firmware_boot::Phase::Running {
+                return Err(Error::Terminal);
+            }
+            let assets = attempt.owner.assets.as_ref().ok_or(Error::Terminal)?;
+            // SAFETY: same retained actual cold/firmware/MAC/RX attempt. Its
+            // Drop terminalizes both the radio and all possibly published DMA.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .prepare_radio_tables(&mut attempt.owner.radio, assets)
+                    .await
+            }
+            .map_err(Error::Radio)?;
+            attempt.owner.phase = Phase::RadioTablesLoaded;
+            Ok(())
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
     }
     /// Publish only private RXQ/RPQ rings after actual B MAC preparation. The
     /// result is a polling transport, not qualified RF/channel/station service.
@@ -149,7 +229,10 @@ impl Startup {
         &mut self,
         budget: usize,
     ) -> Result<alloc::vec::Vec<super::rx_packet::Event>, Error> {
-        if self.phase != Phase::Receiving {
+        if !matches!(
+            self.phase,
+            Phase::Receiving | Phase::RadioTablesLoaded | Phase::BasicCalibrated
+        ) {
             return Err(Error::Terminal);
         }
         let result = self
@@ -227,6 +310,10 @@ impl Startup {
         // blacklist policy; no all-clear default is created for those chips.
         let image =
             firmware_registry::load(identity.chip(), identity.cut()).map_err(Error::Image)?;
+        if identity.chip() == super::mac::ChipId::Rtl8852B {
+            self.assets =
+                Some(super::radio_assets::Assets::from_prepared(&image).map_err(Error::Assets)?);
+        }
         let plan = DownloadPlan::new(
             image,
             identity.fuses(),

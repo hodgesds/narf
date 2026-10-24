@@ -247,7 +247,11 @@ fn smoke_station_rsna_peer_binding_and_bad_delivery_fail_closed() -> TestResult 
     let mut s = security();
     s.receive(&mpdu(m1), SN).unwrap();
     let n = s.pending_frame().unwrap().len();
-    if s.reply_delivered(n - 1) != Err(Error::Protocol) || s.port_open() || !s.failed {
+    if s.reply_delivered(n - 1) != Err(Error::Protocol)
+        || s.port_open()
+        || s.handshake_active()
+        || !s.failed
+    {
         return TestResult::Fail("short host reply delivery opened port");
     }
     TestResult::Pass
@@ -258,6 +262,9 @@ kernel_test_in!(
 );
 fn smoke_station_rsna_rekey_reply_uses_old_packet_key_then_commits_new() -> TestResult {
     let mut s = established();
+    if s.handshake_active() {
+        return TestResult::Fail("established owner retained a completed handshake");
+    }
     let old = ptk(AN, SN);
     let new = ptk([0x33; 32], [0x44; 32]);
     let m1 = encrypt(
@@ -266,7 +273,10 @@ fn smoke_station_rsna_rekey_reply_uses_old_packet_key_then_commits_new() -> Test
         1,
         0,
     );
-    if s.receive(&mpdu(m1), [0x44; 32]) != Ok(Rx::ReplyReady) || s.port_open() {
+    if s.receive(&mpdu(m1), [0x44; 32]) != Ok(Rx::ReplyReady)
+        || s.port_open()
+        || !s.handshake_active()
+    {
         return TestResult::Fail("rekey M1 did not serialize reply");
     }
     let m2 = decrypt(s.pending_frame().unwrap(), &old.tk);
@@ -274,6 +284,9 @@ fn smoke_station_rsna_rekey_reply_uses_old_packet_key_then_commits_new() -> Test
         return TestResult::Fail("M2 did not use installed old packet key");
     }
     deliver(&mut s);
+    if s.pending_frame().is_some() || !s.port_open() || !s.handshake_active() {
+        return TestResult::Fail("M2 receipt lost M3 wait while old-key port reopened");
+    }
     let m3 = encrypt(
         &native(
             &key_frame(0x13ca, 4, [0x33; 32], &kde([0x7d; 16]), Some(&new)),
@@ -285,12 +298,15 @@ fn smoke_station_rsna_rekey_reply_uses_old_packet_key_then_commits_new() -> Test
     );
     if s.receive(&mpdu(m3), [0x44; 32]) != Ok(Rx::ReplyReady)
         || s.pair.as_ref().unwrap().material.as_slice() != old.tk
+        || s.port_open()
+        || !s.handshake_active()
     {
         return TestResult::Fail("new PTK committed before M4 terminal delivery");
     }
     decrypt(s.pending_frame().unwrap(), &old.tk);
     deliver(&mut s);
     if !s.port_open()
+        || s.handshake_active()
         || s.pair.as_ref().unwrap().material.as_slice() != new.tk
         || s.history.len() != 4
     {

@@ -440,6 +440,28 @@ impl Handle {
     }
 }
 pub(crate) fn create(version: u32, secured: bool) -> Result<(TestAdapter, Handle), runtime::Error> {
+    create_inner(version, secured, None)
+}
+pub(crate) fn create_selected(
+    version: u32,
+    secured: bool,
+    selection: &crate::brcmfmac::provision::Selection,
+    assets: &crate::brcmfmac::provision::Assets,
+) -> Result<(TestAdapter, Handle), runtime::Error> {
+    assets
+        .proof
+        .validate()
+        .map_err(|_| runtime::Error::Access)?;
+    create_inner(version, secured, Some((selection, assets)))
+}
+fn create_inner(
+    version: u32,
+    secured: bool,
+    selected: Option<(
+        &crate::brcmfmac::provision::Selection,
+        &crate::brcmfmac::provision::Assets,
+    )>,
+) -> Result<(TestAdapter, Handle), runtime::Error> {
     assert!(matches!(version, 5 | 6));
     let (bus, state) = model();
     {
@@ -455,9 +477,14 @@ pub(crate) fn create(version: u32, secured: bool) -> Result<(TestAdapter, Handle
     }
     // Explicit synthetic board policy exercises the actual CR4 boot owner;
     // these fixture bytes are never registered as deployable firmware/NVRAM.
-    let nvram = boot::pack_nvram(b"boardrev=1\n").unwrap();
-    let boot = boot::Cr4::claim(bus, pci(), profile())?
-        .boot(&[0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6], &nvram)?;
+    let boot = if let Some((selection, assets)) = selected {
+        let nvram = boot::pack_nvram(&assets.nvram)?;
+        boot::Cr4::claim_selected(bus, pci(), selection)?.boot(&assets.firmware, &nvram)?
+    } else {
+        let nvram = boot::pack_nvram(b"boardrev=1\n").unwrap();
+        boot::Cr4::claim(bus, pci(), profile())?
+            .boot(&[0x44, 0x33, 0x22, 0x11, 9, 8, 7, 6], &nvram)?
+    };
     let runtime = runtime::Runtime::attach(boot)?;
     Adapter::new(runtime)
         .map(|adapter| (adapter, Handle(state)))

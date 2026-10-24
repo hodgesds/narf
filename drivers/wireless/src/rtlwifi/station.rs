@@ -599,6 +599,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.station.phase == Phase::Open && now.saturating_sub(self.station.last_peer) >= 5000 {
             return Err(Error::PeerLost);
         }
+        if self.station.admitted
+            && now >= self.station.deadline
+            && self
+                .station
+                .security
+                .as_ref()
+                .is_some_and(Security::handshake_active)
+        {
+            return Err(Error::Timeout);
+        }
         if let Some(pending) = &self.station.pending {
             if now >= pending.deadline {
                 return Err(Error::Timeout);
@@ -718,6 +728,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 }
                 Phase::FourWay | Phase::Open => {
                     if let Some(security) = &mut self.station.security {
+                        let handshake_active = security.handshake_active();
                         match security
                             .receive_with_nonce(&frame, || environment.fresh_nonce())
                             .map_err(Error::Security)?
@@ -725,6 +736,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             station_security::Rx::Ignored => {}
                             station_security::Rx::ReplyReady => {
                                 let reply = security.pending_frame().ok_or(Error::State)?.to_vec();
+                                if self.station.admitted && !handshake_active {
+                                    self.station.deadline = now.saturating_add(5000);
+                                }
                                 self.queue_station(reply, Kind::Eapol, now, false, environment)?;
                                 self.station.last_peer = now;
                             }

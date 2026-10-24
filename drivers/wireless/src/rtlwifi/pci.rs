@@ -264,17 +264,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     } else {
         *IFNAME.lock() = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
     }
-    if let (Some(firmware), Some(prepared), Some(factory)) = (firmware, prepared, factory) {
-        // The retained controller/interface own this attempt before its first
-        // register access. No IRQ-disabling guard survives into the task.
-        narf_scheduler::spawn(async move {
-            if let Err(error) =
-                super::prepare_native::initialize_registered(firmware, prepared, factory).await
-            {
-                use core::fmt::Write as _;
+    if firmware.is_some() && prepared.is_some() && factory.is_some() {
+        // Initial boot and a later missing-input retry share the exact same
+        // retained binding and async admission lock.
+        narf_scheduler::spawn(async {
+            if let Err(error) = provision().await {
+                use core::fmt::Write;
                 let _ = writeln!(
                     narf_console::Writer,
-                    "rtlwifi-8188ee firmware/native preparation: {:?}",
+                    "rtlwifi-8188ee native preparation: {:?}",
                     error
                 );
             }
@@ -422,8 +420,179 @@ pub fn with_controller<R>(f: impl FnOnce(&RtlwifiDevice) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
 }
 
+struct Provisioning {
+    firmware: Arc<FirmwareOwner<PciIo>>,
+    prepared: Arc<super::prepare_native::Retained>,
+    factory: Arc<efuse::Factory>,
+}
+fn provisioning(controller: Option<&RtlwifiDevice>) -> Result<Provisioning, super::prepare::Error> {
+    let controller = controller.ok_or(super::prepare::Error::State)?;
+    if controller.device_id != RTL_DEV_8188EE {
+        return Err(super::prepare::Error::State);
+    }
+    let firmware = controller
+        .firmware
+        .as_ref()
+        .ok_or(super::prepare::Error::State)?;
+    if firmware.status().stage != super::firmware_transport::Stage::Detected {
+        return Err(super::prepare::Error::State);
+    }
+    Ok(Provisioning {
+        firmware: firmware.clone(),
+        prepared: controller
+            .prepared
+            .as_ref()
+            .ok_or(super::prepare::Error::State)?
+            .clone(),
+        factory: controller
+            .factory
+            .as_ref()
+            .ok_or(super::prepare::Error::State)?
+            .clone(),
+    })
+}
+static PROVISIONING: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
+async fn provision_with(
+    control: &narf_lib::mutex::Mutex<()>,
+    binding: impl FnOnce() -> Result<Provisioning, super::prepare::Error>,
+) -> Result<(), super::prepare::Error> {
+    let _control = control.lock().await;
+    let binding = binding()?;
+    super::prepare_native::initialize_registered(
+        binding.firmware,
+        binding.prepared,
+        binding.factory,
+    )
+    .await
+}
+/// Retry staged firmware only while the exact retained EE owner is Detected.
+/// Started/failed firmware and existing preparation are never replayed/reset.
+pub async fn provision() -> Result<(), super::prepare::Error> {
+    provision_with(&PROVISIONING, || {
+        let controller = CONTROLLER.lock();
+        provisioning(controller.as_ref())
+    })
+    .await
+}
+
 /// Test-only reset.
 #[cfg(any(test, feature = "kernel-test"))]
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
+}
+
+#[cfg(feature = "kernel-test")]
+mod provision_tests {
+    use super::*;
+    use core::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn fixture() -> RtlwifiDevice {
+        let address = narf_bus::PcieAddr::new(0xfffe, 0xfd, 0x19, 0);
+        let device = BusDevice {
+            addr: narf_bus::BusAddr::Pcie(address),
+            id: narf_bus::DeviceId {
+                vendor: 0x10ec,
+                device: RTL_DEV_8188EE,
+                class: 0x028000,
+                subsystem_vendor: 0x10ec,
+                subsystem_id: 0xffff,
+            },
+            kind: narf_bus::BusKind::Pcie {
+                addr: address,
+                cfg_phys: narf_memory::PhysAddr::new(0),
+            },
+        };
+        let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+        cap.revoke();
+        let registers = MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 0x2000,
+            kind: narf_bus::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        // SAFETY: inert revoked-cap fixture; no admission test may access the
+        // deliberately invalid config/BAR or present it as a live radio.
+        let io = unsafe { PciIo::new(device, cap, registers) };
+        RtlwifiDevice {
+            bus_addr: device.addr,
+            registers,
+            mac: [2, 1, 2, 3, 4, 5],
+            device_id: RTL_DEV_8188EE,
+            firmware: Some(Arc::new(FirmwareOwner::new(io, RTL_DEV_8188EE))),
+            prepared: Some(Arc::new(narf_lib::mutex::Mutex::new(None))),
+            factory: Some(Arc::new(efuse::Factory {
+                mac: [2, 1, 2, 3, 4, 5],
+                logical: [0xff; 512],
+            })),
+            native: None,
+            link_up: AtomicBool::new(false),
+            rx_ring: IrqSafeSpinLock::new(None),
+            tx_ring: IrqSafeSpinLock::new(None),
+        }
+    }
+    fn smoke_rtl8188ee_public_provision_admission_retains_exact_arcs_and_cancelled_wait(
+    ) -> TestResult {
+        if provisioning(None).is_ok() {
+            return TestResult::Fail("EE retry admitted absent controller");
+        }
+        let controller = fixture();
+        let admitted = provisioning(Some(&controller)).unwrap();
+        if !Arc::ptr_eq(&admitted.firmware, controller.firmware.as_ref().unwrap())
+            || !Arc::ptr_eq(&admitted.prepared, controller.prepared.as_ref().unwrap())
+            || !Arc::ptr_eq(&admitted.factory, controller.factory.as_ref().unwrap())
+        {
+            return TestResult::Fail("EE retry cloned a new hardware/prepared/factory owner");
+        }
+        drop(admitted);
+        let control = narf_lib::mutex::Mutex::new(());
+        let guard = control.try_lock().unwrap();
+        let entered = core::cell::Cell::new(false);
+        {
+            let mut future = core::pin::pin!(provision_with(&control, || {
+                entered.set(true);
+                provisioning(Some(&controller))
+            }));
+            if !matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ) {
+                return TestResult::Fail("EE public retry bypassed retained async admission lock");
+            }
+        }
+        drop(guard);
+        if entered.get()
+            || controller.firmware_status().unwrap().stage
+                != super::super::firmware_transport::Stage::Detected
+            || !Arc::ptr_eq(
+                &provisioning(Some(&controller)).unwrap().firmware,
+                controller.firmware.as_ref().unwrap(),
+            )
+        {
+            return TestResult::Fail("cancelled EE pre-admission wait consumed or replaced owner");
+        }
+        let firmware = controller.firmware.as_ref().unwrap();
+        // The supplied-byte diagnostic retains its original one-shot rule:
+        // invalid input consumes that attempt before native I/O, making this
+        // genuinely Failed owner ineligible for the public staging retry.
+        if narf_scheduler::block_on(firmware.initialize(&[])).is_ok()
+            || firmware.status().stage != super::super::firmware_transport::Stage::Failed
+            || provisioning(Some(&controller)).is_ok()
+        {
+            return TestResult::Fail(
+                "EE public retry admitted an owner whose attempt already began",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtlwifi/provision",
+        smoke_rtl8188ee_public_provision_admission_retains_exact_arcs_and_cancelled_wait
+    );
 }

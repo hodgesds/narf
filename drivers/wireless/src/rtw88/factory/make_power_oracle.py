@@ -1,4 +1,4 @@
-"""Conservative ch1/1Mbps factory ceilings using original Linux PG decoder.
+"""Conservative ch1/CCK response factory ceilings using original Linux PG decoder.
 
 The initial profile uses the minimum over every source regulatory row, so an
 EEPROM country hint cannot promote a gain. These remain indices, not dBm.
@@ -47,7 +47,7 @@ const struct rtw_phy_pg_cfg_pair*p=&rtw8822c_bb_pg_type{pg}[i];if(p->band||p->rf
 rtw_phy_get_rate_values_of_txpwr_by_rate(&dev,p->addr,p->bitmask,p->data,rate,power,&n);for(int j=0;j<n;j++)hal.tx_pwr_by_rate_offset_2g[p->rf_path][rate[j]]=(s8)power[j];}}
 for(int p=0;p<2;p++)rtw_phy_tx_power_by_rate_config_by_path(&hal,p,0,4,rates);
 int minimum=127,count=0;for(int i=0;i<sizeof(rtw8822c_txpwr_lmt_type{lmt})/sizeof(struct rtw_txpwr_lmt_cfg_pair);i++){{const struct rtw_txpwr_lmt_cfg_pair*p=&rtw8822c_txpwr_lmt_type{lmt}[i];if(p->band||p->bw||p->rs||p->ch!=1)continue;if(p->txpwr_lmt<minimum)minimum=p->txpwr_lmt;count++;}}if(!count)return 1;
-int limit=minimum-hal.tx_pwr_by_rate_base_2g[0][0];printf("[");for(int p=0;p<2;p++){{int byrate=hal.tx_pwr_by_rate_offset_2g[p][DESC_RATE1M];int adjust=byrate<limit?byrate:limit;if(adjust>0)adjust=0;printf("%d,",adjust);}}printf("],\\n");}}
+int limit=minimum-hal.tx_pwr_by_rate_base_2g[0][0];printf("[");for(int p=0;p<2;p++){{int byrate=127;for(int r=0;r<4;r++)if(hal.tx_pwr_by_rate_offset_2g[p][rates[r]]<byrate)byrate=hal.tx_pwr_by_rate_offset_2g[p][rates[r]];int adjust=byrate<limit?byrate:limit;if(adjust>0)adjust=0;printf("%d,",adjust);}}printf("],\\n");}}
 '''
 post += 'return 0;}\n'
 with tempfile.TemporaryDirectory() as temp:
@@ -56,5 +56,5 @@ with tempfile.TemporaryDirectory() as temp:
     subprocess.run(['cc','-O2','-o',str(exe),str(source)],check=True)
     output = subprocess.check_output([str(exe)]).decode()
 target = HERE/'power_values.rs'
-target.write_text('// SPDX-License-Identifier: GPL-2.0-or-later\n// Original Linux PG decode/normalization and minimum over every ch1/CCK/20MHz region row.\npub(super) const CCK1_ADJUST: [[i16;2];7] = [\n'+output+'];\n')
+target.write_text('// SPDX-License-Identifier: GPL-2.0-or-later\n// Original Linux PG decode/normalization and minimum over every ch1/CCK/20MHz region row.\npub(super) const CCK_RESPONSE_ADJUST: [[i16;2];7] = [\n'+output+'];\n')
 subprocess.run(['rustfmt','--edition','2021',str(target)],check=True)
