@@ -287,6 +287,22 @@ also consult upstream Linux GPL sources.
   running the full mandatory HCI sequence, adopting the ready controller, and
   publishing `/sys/class/bluetooth/hci<N>`. Firmware is selected from the
   verified registry using the controller-reported ROM/RAM/board identity.
+- `MSC_DEVICES` entries are tombstoned on detach, never shifted: a bind
+  reuses the first tombstone, so the `usb-msc{idx}` block name is stable
+  across unplug/replug and a stale `UsbMscBlockDevice` adapter fails with
+  `BlockIoError::DeviceRemoved` after its device is detached.
+- `msc::detach_msc(slot_id)` is MSC's publication teardown — tombstone the
+  slot's entries, then unregister the `usb-msc{idx}` disk and its partition
+  children (children first) from the block registry. It is registered as a
+  class-registry unbind hook (`register_class_driver_with_unbind`, BOT
+  class triple) and reached via `dispatch_unbind` on the supervisor's
+  detach path; MSC binding itself stays in the attach cascade, and the
+  registry probe always declines. `msc::unbind_all_msc()` is the wholesale
+  variant for controller-recovery teardown.
+- `serial::devfs_bridge::unregister_tty_usb(index)` is the detach half of
+  `register_tty_usb`: it removes the port from the ttyUSB node table and
+  withdraws the `/sys/class/tty/ttyUSB<N>` kobject. Indices are not
+  recycled; a replugged adapter republishes under a fresh index.
 
 ## Scope
 
