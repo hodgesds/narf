@@ -3151,7 +3151,7 @@ fn smoke_power_service_lid_close_requests_suspend() -> TestResult {
     use alloc::vec::Vec;
     use narf_lib::sync::IrqSafeSpinLock;
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct Recorder(IrqSafeSpinLock<Vec<PowerAction>>);
     impl service::ActionExecutor for Recorder {
         fn execute(&self, action: PowerAction) {
@@ -3161,7 +3161,7 @@ fn smoke_power_service_lid_close_requests_suspend() -> TestResult {
 
     service::__reset_for_test();
     let cap = bootstrap_power_authority();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder(IrqSafeSpinLock::new(Vec::new())));
     if service::install_action_executor(&cap, recorder.clone()).is_err() {
         return TestResult::Fail("install_action_executor rejected the bootstrap cap");
     }
