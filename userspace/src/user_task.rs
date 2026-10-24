@@ -887,7 +887,7 @@ pub struct ExecRequest {
     /// future's `pending_page_in` when it applies this request; the
     /// first Initial-state entry then drives it through the bulk fault
     /// API, once the new root is the live one.
-    pub page_in_plan: alloc::vec::Vec<(u64, u64)>,
+    pub page_in_plan: crate::loader::PageInPlan,
 }
 
 /// Per-CPU in-flight-task slot. The polling routine on each CPU
@@ -2504,7 +2504,7 @@ pub struct UserTaskFuture {
     /// first Initial-state entry after the new AS is activated. Empty
     /// for every non-exec lifecycle — spawn and fork/clone resumes
     /// never fill it, so only an execve'd image is ever clustered.
-    pending_page_in: alloc::vec::Vec<(u64, u64)>,
+    pending_page_in: crate::loader::PageInPlan,
 }
 
 #[cfg(target_arch = "x86_64")]

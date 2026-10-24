@@ -112,7 +112,7 @@ pub struct UserProcess {
     /// test fixtures construct it empty: a child's pages are the
     /// parent's, already resident or shared, so there is nothing to
     /// cluster.
-    pub page_in_plan: alloc::vec::Vec<(u64, u64)>,
+    pub page_in_plan: crate::loader::PageInPlan,
     /// Load bias applied to the program image: 0 for ET_EXEC, and the
     /// randomised PML4[1] base for ET_DYN. Callers that need to know
     /// where a PIE actually landed (auxv construction, `/proc` maps, a
@@ -252,8 +252,13 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // The image comes back parsed: with a file-backed source, re-parsing it
     // here would re-read the header and program headers from the device for
     // bytes the loader already had.
-    let (address_space, program_entry, program_bias, image, page_in_plan) =
-        unsafe { crate::loader::load_elf_bytes_file(src, file) }?;
+    let crate::loader::LoadedElf {
+        address_space,
+        program_entry,
+        program_bias,
+        image,
+        page_in_plan,
+    } = unsafe { crate::loader::load_elf_bytes_file(src, file) }?;
 
     // PT_INTERP follow-through: if the program names an interpreter
     // and we have its bytes registered, load it at a fixed bias and
