@@ -58,6 +58,8 @@ mod context_v1;
 pub mod data_queue;
 pub mod device;
 pub mod firmware_api;
+#[cfg(any(test, feature = "kernel-test"))]
+mod firmware_golden_tests;
 pub mod frame_api;
 pub mod fw_loader;
 mod gen2_prepare;
@@ -1050,15 +1052,9 @@ pub fn firmware_filename_ladder(chip: &ChipConfig) -> Vec<String> {
         // matches the core-numbering family.
         let mut api = chip.api_max;
         loop {
-            // Bundle prefix matches `xtask import-firmware`'s
-            // staging layout, which preserves Linux's
-            // `/lib/firmware/<vendor>/...` subdirectory under
-            // `target/firmware/`. The kernel's
-            // `firmware-scan-initramfs` initcall registers each
-            // blob under its full path-relative-to-`firmware/`,
-            // so we look up `iwlwifi/iwlwifi-...` (matching
-            // `/lib/firmware/iwlwifi/iwlwifi-...`) not just the
-            // bare filename.
+            // NARF uses vendor-qualified registry keys. `xtask
+            // import-firmware` maps linux-firmware's flat Intel files
+            // into this iwlwifi/ namespace, including sibling PNVM.
             out.push(format!(
                 "iwlwifi/iwlwifi-{}-{}-{}{}.ucode",
                 chip.mac.prefix(),
@@ -1088,10 +1084,9 @@ pub fn firmware_filename_ladder(chip: &ChipConfig) -> Vec<String> {
 pub const IWL_TLV_UCODE_MAGIC: u32 = 0x0a4c_5749;
 
 /// Header preceding the TLV stream — fields per
-/// `iwl_tlv_ucode_header` in `fw/file.h`. Layout is fixed at 36
-/// bytes (4 zero + 4 magic + 64 human_readable + 4 ver + 4 build +
-/// 8 ignore — but the TLV stream sits at byte offset 36, not 88,
-/// per the typedef padding rules).
+/// `iwl_tlv_ucode_header` in `fw/file.h`. Its packed fields occupy
+/// 88 bytes (4 zero + 4 magic + 64 human_readable + 4 ver + 4 build +
+/// 8 ignore); the TLV stream starts immediately afterward.
 pub const TLV_HEADER_BYTES: usize = 4 + 4 + 64 + 4 + 4 + 8;
 
 /// Parsed firmware header.

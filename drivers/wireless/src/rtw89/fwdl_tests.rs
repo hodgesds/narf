@@ -8,6 +8,119 @@ use super::prepared::{self, Files};
 use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[allow(dead_code)]
+mod firmware_metadata {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../verification/data/wifi-firmware/realtek/metadata.rs"
+    ));
+}
+
+fn smoke_rtw89_raw_source_metadata_parser_goldens() -> TestResult {
+    // Source hashes belong to complete originals. Only TOCs, headers and
+    // security-pool geometry survive in these zero-payload parser replays.
+    // They never enter prepared::load, the firmware registry or hardware.
+    let source_hashes = include_str!("firmware_fixture_sha256.json");
+    let mut images = 0;
+    let mut formatted_pools = 0;
+    for source in firmware_metadata::AX {
+        let provenance = alloc::format!("\"/lib/firmware/{}\": \"{}\"", source.name, source.sha256);
+        if !source_hashes.contains(&provenance) {
+            return TestResult::Fail("AX original-source SHA256 provenance changed");
+        }
+        let mut bytes =
+            match narf_wifi_fixtures::firmware::metadata_replay(source.length, source.fragments) {
+                Ok(bytes) => bytes,
+                Err(_) => return TestResult::Fail("AX metadata replay geometry"),
+            };
+        for image in source.images {
+            images += 1;
+            let body = &bytes[image.offset..image.offset + image.length];
+            let mut sections = output();
+            let header = match parse_auto(body, &mut sections) {
+                Ok(header) => header,
+                Err(_) => return TestResult::Fail("AX raw-source image layout rejected"),
+            };
+            if header.version != image.version
+                || header.fw_major != image.major
+                || header.fw_minor != image.minor
+                || usize::from(header.section_num) != image.sections.len()
+                || header.hdr_len != image.header_length
+                || header.dynamic_hdr != image.dynamic
+                || header.part_size != 2020
+            {
+                return TestResult::Fail("AX independently extracted image header facts");
+            }
+            for (index, expected) in image.sections.iter().enumerate() {
+                let actual = sections[index];
+                if actual.kind != expected.kind
+                    || actual.dladdr != expected.address
+                    || actual.len != expected.length
+                    || actual.chksum != expected.checksum
+                    || actual.redl != expected.redownload
+                    || actual.payload_off != expected.offset
+                {
+                    return TestResult::Fail("AX independently extracted section geometry");
+                }
+                let expected_pool = expected.pool.as_ref().map(|pool| {
+                    formatted_pools += usize::from(pool.bitmap);
+                    super::fwdl::SignaturePool {
+                        offset: pool.offset,
+                        len: pool.length,
+                        signatures_offset: pool.signatures_offset,
+                        signature_len: pool.signature_length,
+                        signature_count: pool.signature_count,
+                        bitmap: pool.bitmap,
+                    }
+                });
+                if header.signature_pools[index] != expected_pool {
+                    return TestResult::Fail("AX independently extracted signature-pool geometry");
+                }
+            }
+            // Check header and final section/pool truncations without replacing
+            // caller metadata on failure; executable byte values play no role.
+            for end in [0, 31, image.header_length - 1, body.len() - 1] {
+                let mut untouched = output();
+                if parse_auto(&body[..end], &mut untouched).is_ok() || untouched != output() {
+                    return TestResult::Fail("AX truncated source geometry mutated output");
+                }
+            }
+        }
+        // Probe every physical-cut value and supported outer suit type. The
+        // expected nearest non-manufacturing CV comes from the original TOC.
+        for cut in 0..=15 {
+            for kind in [1, 3, 5, 64, 65] {
+                let expected = source
+                    .images
+                    .iter()
+                    .filter(|image| image.kind == kind && !image.manufacturing && image.cut <= cut)
+                    .max_by_key(|image| image.cut);
+                match (select_image(&bytes, cut, kind), expected) {
+                    (Ok(selected), Some(image))
+                        if selected.len() == image.length
+                            && selected.as_ptr() as usize - bytes.as_ptr() as usize
+                                == image.offset => {}
+                    (Err(FwError::ImageMissing), None) => {}
+                    _ => return TestResult::Fail("AX raw-source TOC cut/suit selection differs"),
+                }
+            }
+        }
+        // Even an unselected entry may not overlap its own table.
+        bytes[20..24].copy_from_slice(&0u32.to_le_bytes());
+        if !matches!(select_image(&bytes, 15, 1), Err(FwError::BadFormat)) {
+            return TestResult::Fail("AX malformed source TOC extent admitted");
+        }
+    }
+    if images != 46 || formatted_pools != 6 {
+        return TestResult::Fail("AX raw-source fixture coverage changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_raw_source_metadata_parser_goldens
+);
+
 fn put(bytes: &mut [u8], at: usize, value: u32) {
     bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }

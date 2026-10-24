@@ -1,0 +1,2420 @@
+{
+  "format": 1,
+  "provenance": "raw Linux firmware metadata; opaque bytes omitted",
+  "sources": [
+    {
+      "name": "rtlwifi/rtl8188eufw.bin",
+      "sha256": "2ff74315287529dec2e50eb57d6e0c97d2116f28ae166773ccdf93b6360000c4",
+      "length": 15262,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "e18810001c000000050514277e3b0000a54b0000000000000000000000000000"
+        }
+      ],
+      "images": [],
+      "legacy": {
+        "signature": 35041,
+        "version": 28,
+        "subversion": 0,
+        "payload": 15230
+      }
+    },
+    {
+      "name": "rtlwifi/rtl8188efw.bin",
+      "sha256": "ca778610db58042c395141918b319c76df10a83dbd0aa9b3db6a9bb01c477cce",
+      "length": 11216,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "e18810000800000010252156b02b0000a2040000000000000000000000000000"
+        }
+      ],
+      "images": [],
+      "legacy": {
+        "signature": 35041,
+        "version": 8,
+        "subversion": 0,
+        "payload": 11184
+      }
+    },
+    {
+      "name": "rtw88/rtw8822c_fw.bin",
+      "sha256": "3deecb31210986d98cdbfb000391e08d602a6eee4ffc883969faa2b907ab03ba",
+      "length": 202600,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "228800000900090fffffffffe701000003100d31e7070000180000000f00000000002080804b0000000001000000000030d3000060f801000000108000000380"
+        }
+      ],
+      "images": [],
+      "ce": {
+        "version": 9,
+        "subversion": 9,
+        "h2c": 15,
+        "sections": [
+          {
+            "address": 2097152,
+            "length": 19336,
+            "offset": 64
+          },
+          {
+            "address": 196608,
+            "length": 54072,
+            "offset": 19400
+          },
+          {
+            "address": 1048576,
+            "length": 129128,
+            "offset": 73472
+          }
+        ]
+      }
+    },
+    {
+      "name": "rtw89/rtw8851b_fw-1.bin",
+      "sha256": "1c4ccb5fa06bf5649146025e95993db66876a1fbc0bd766ec05686587f69c1b7",
+      "length": 1408706,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "ff050000001d290500000000000000000005000060000000005d04000000000001050000605d0400305d0400000000000003000090ba0800d81e0400000000000103000068d90c00401f04000000000000ff0000a8f81000f0cb000000000000"
+        },
+        {
+          "offset": 96,
+          "hex": "01015188001d2905acebd64b201090000a1d0f0ce907000000035000e4070100000097b8d02904420000000000000000002ce1b8e02e004100000000000000004816e1b8c003000900000000000000004000000001000000"
+        },
+        {
+          "offset": 286048,
+          "hex": "02015188001d2905acebd64b201090000a1d0f0de907000000035000e4070100000097b8002a04420000000000000000002ce1b8e02e004100000000000000004816e1b8c003000900000000000000004000000001000000"
+        },
+        {
+          "offset": 572048,
+          "hex": "01015188001d2905acebd64b201090000a1d0f0ce907000000038000e4070100000097b8b8eb03420000000000000000002ce1b8d02e004100000000000000004816e1b8c003000900000000000000004000000001000000"
+        },
+        {
+          "offset": 842088,
+          "hex": "02015188001d2905acebd64b201090000a1d0f0ee907000000038000e4070100000097b820ec03420000000000000000002ce1b8d02e004100000000000000004816e1b8c003000900000000000000004000000001000000"
+        }
+      ],
+      "images": [
+        {
+          "cut": 0,
+          "kind": 5,
+          "manufacturing": false,
+          "offset": 96,
+          "length": 285952,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 272848,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417410048,
+              "length": 12000,
+              "checksum": false,
+              "redownload": false,
+              "offset": 272992,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417404488,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 284992,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 5,
+          "manufacturing": false,
+          "offset": 286048,
+          "length": 286000,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 272896,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417410048,
+              "length": 12000,
+              "checksum": false,
+              "redownload": false,
+              "offset": 273040,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417404488,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 285040,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 0,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 572048,
+          "length": 270040,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 256952,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417410048,
+              "length": 11984,
+              "checksum": false,
+              "redownload": false,
+              "offset": 257096,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417404488,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 269080,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 842088,
+          "length": 270144,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 257056,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417410048,
+              "length": 11984,
+              "checksum": false,
+              "redownload": false,
+              "offset": 257200,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417404488,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 269184,
+              "pool": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rtw89/rtw8851b_fw.bin",
+      "sha256": "945c854d7cf69dd97bf1da0181b011787d9b3c5d59c47e8b9dbea4eb4eee170b",
+      "length": 1164440,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "ff050000001d290500000000000000000005000060000000005d04000000000001050000605d0400305d0400000000000003000090ba0800d81e0400000000000103000068d90c00401f04000000000000ff0000a8f81000f0cb000000000000"
+        },
+        {
+          "offset": 96,
+          "hex": "01015188001d2905acebd64b201090000a1d0f0ce907000000035000e4070100000097b8d02904420000000000000000002ce1b8e02e004100000000000000004816e1b8c003000900000000000000004000000001000000"
+        },
+        {
+          "offset": 286048,
+          "hex": "02015188001d2905acebd64b201090000a1d0f0de907000000035000e4070100000097b8002a04420000000000000000002ce1b8e02e004100000000000000004816e1b8c003000900000000000000004000000001000000"
+        },
+        {
+          "offset": 572048,
+          "hex": "01015188001d2905acebd64b201090000a1d0f0ce907000000038000e4070100000097b8b8eb03420000000000000000002ce1b8d02e004100000000000000004816e1b8c003000900000000000000004000000001000000"
+        },
+        {
+          "offset": 842088,
+          "hex": "02015188001d2905acebd64b201090000a1d0f0ee907000000038000e4070100000097b820ec03420000000000000000002ce1b8d02e004100000000000000004816e1b8c003000900000000000000004000000001000000"
+        }
+      ],
+      "images": [
+        {
+          "cut": 0,
+          "kind": 5,
+          "manufacturing": false,
+          "offset": 96,
+          "length": 285952,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 272848,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417410048,
+              "length": 12000,
+              "checksum": false,
+              "redownload": false,
+              "offset": 272992,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417404488,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 284992,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 5,
+          "manufacturing": false,
+          "offset": 286048,
+          "length": 286000,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 272896,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417410048,
+              "length": 12000,
+              "checksum": false,
+              "redownload": false,
+              "offset": 273040,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417404488,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 285040,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 0,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 572048,
+          "length": 270040,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 256952,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417410048,
+              "length": 11984,
+              "checksum": false,
+              "redownload": false,
+              "offset": 257096,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417404488,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 269080,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 842088,
+          "length": 270144,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 257056,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417410048,
+              "length": 11984,
+              "checksum": false,
+              "redownload": false,
+              "offset": 257200,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417404488,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 269184,
+              "pool": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rtw89/rtw8852a_fw-1.bin",
+      "sha256": "241320fae9ca40781abb3e5368da91232e11c1c96609563822442b533348ccab",
+      "length": 1958048,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "ff040000000000000000000000000000010100005000000040e80500000000000201000090e8050000e50500000000000103000090cd0b00300005000000000002030000c0cd100070fd040000000000"
+        },
+        {
+          "offset": 80,
+          "hex": "02005288000d240207c8ac52201050000b050f3be807000000031000f8070000000097b8107b050200000000000000000000e1b8206900010000000000000000007ce1b8c00300290000000000000000"
+        },
+        {
+          "offset": 387216,
+          "hex": "02005288000d240207c8ac52201050000b051000e807000000031000f8070000000097b8e077050200000000000000000000e1b8106900010000000000000000007ce1b8c00300290000000000000000"
+        },
+        {
+          "offset": 773520,
+          "hex": "02005288000d240207c8ac52201050000b050f3be807000000033000f8070000000097b888a0040200000000000000000000e1b8985b00010000000000000000007ce1b8c00300290000000000000000"
+        },
+        {
+          "offset": 1101248,
+          "hex": "02005288000d240207c8ac52201050000b051000e807000000033000f8070000000097b8d89d040200000000000000000000e1b8885b00010000000000000000007ce1b8c00300290000000000000000"
+        }
+      ],
+      "images": [
+        {
+          "cut": 1,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 80,
+          "length": 387136,
+          "version": 0,
+          "major": 0,
+          "minor": 13,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 359184,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417398784,
+              "length": 26912,
+              "checksum": false,
+              "redownload": false,
+              "offset": 359264,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 960,
+              "checksum": false,
+              "redownload": true,
+              "offset": 386176,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 387216,
+          "length": 386304,
+          "version": 0,
+          "major": 0,
+          "minor": 13,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 358368,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417398784,
+              "length": 26896,
+              "checksum": false,
+              "redownload": false,
+              "offset": 358448,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 960,
+              "checksum": false,
+              "redownload": true,
+              "offset": 385344,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 773520,
+          "length": 327728,
+          "version": 0,
+          "major": 0,
+          "minor": 13,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 303240,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417398784,
+              "length": 23448,
+              "checksum": false,
+              "redownload": false,
+              "offset": 303320,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 960,
+              "checksum": false,
+              "redownload": true,
+              "offset": 326768,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 1101248,
+          "length": 327024,
+          "version": 0,
+          "major": 0,
+          "minor": 13,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 302552,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417398784,
+              "length": 23432,
+              "checksum": false,
+              "redownload": false,
+              "offset": 302632,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 960,
+              "checksum": false,
+              "redownload": true,
+              "offset": 326064,
+              "pool": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rtw89/rtw8852a_fw.bin",
+      "sha256": "7eb1fe457f5a704b7a4f05a66c67cfa6af2f1142566b640c8e402445d04b0159",
+      "length": 1428272,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "ff040000000000000000000000000000010100005000000040e80500000000000201000090e8050000e50500000000000103000090cd0b00300005000000000002030000c0cd100070fd040000000000"
+        },
+        {
+          "offset": 80,
+          "hex": "02005288000d240207c8ac52201050000b050f3be807000000031000f8070000000097b8107b050200000000000000000000e1b8206900010000000000000000007ce1b8c00300290000000000000000"
+        },
+        {
+          "offset": 387216,
+          "hex": "02005288000d240207c8ac52201050000b051000e807000000031000f8070000000097b8e077050200000000000000000000e1b8106900010000000000000000007ce1b8c00300290000000000000000"
+        },
+        {
+          "offset": 773520,
+          "hex": "02005288000d240207c8ac52201050000b050f3be807000000033000f8070000000097b888a0040200000000000000000000e1b8985b00010000000000000000007ce1b8c00300290000000000000000"
+        },
+        {
+          "offset": 1101248,
+          "hex": "02005288000d240207c8ac52201050000b051000e807000000033000f8070000000097b8d89d040200000000000000000000e1b8885b00010000000000000000007ce1b8c00300290000000000000000"
+        }
+      ],
+      "images": [
+        {
+          "cut": 1,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 80,
+          "length": 387136,
+          "version": 0,
+          "major": 0,
+          "minor": 13,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 359184,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417398784,
+              "length": 26912,
+              "checksum": false,
+              "redownload": false,
+              "offset": 359264,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 960,
+              "checksum": false,
+              "redownload": true,
+              "offset": 386176,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 387216,
+          "length": 386304,
+          "version": 0,
+          "major": 0,
+          "minor": 13,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 358368,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417398784,
+              "length": 26896,
+              "checksum": false,
+              "redownload": false,
+              "offset": 358448,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 960,
+              "checksum": false,
+              "redownload": true,
+              "offset": 385344,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 773520,
+          "length": 327728,
+          "version": 0,
+          "major": 0,
+          "minor": 13,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 303240,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417398784,
+              "length": 23448,
+              "checksum": false,
+              "redownload": false,
+              "offset": 303320,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 960,
+              "checksum": false,
+              "redownload": true,
+              "offset": 326768,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 1101248,
+          "length": 327024,
+          "version": 0,
+          "major": 0,
+          "minor": 13,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 302552,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417398784,
+              "length": 23432,
+              "checksum": false,
+              "redownload": false,
+              "offset": 302632,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 960,
+              "checksum": false,
+              "redownload": true,
+              "offset": 326064,
+              "pool": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rtw89/rtw8852b_fw-2.bin",
+      "sha256": "6ff6aeb56bb5b85cba333b755f8cc1dbfe9ff6e5b16e39f6ba01ce7f1eaa7714",
+      "length": 1554594,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "ff050000001d1d12000000000000000000ff000060000000f0ce0000000000000105000050cf000048fc0400000000000103000098cb0500a01e0400000000000203000038ea0900501e0400000000000205000088080e00f8fb040000000000"
+        },
+        {
+          "offset": 53072,
+          "hex": "02015288001d1d127f773d9e201090000409140dea07000000035000e4070100000097b840bf044200000000000000000024e1b87834004100000000000000002819e1b80008000900000000000000004000000001000000"
+        },
+        {
+          "offset": 379800,
+          "hex": "02015288001d1d127f773d9e201090000409140eea07000000038000e4070100000097b870e1034200000000000000000024e1b8a034004100000000000000002819e1b80008000900000000000000004000000001000000"
+        },
+        {
+          "offset": 649784,
+          "hex": "03015288001d1d127f773d9e2010900004091410ea07000000038000e4070100000097b860e1034200000000000000000024e1b86034004100000000000000002019e1b80008000900000000000000004000000001000000"
+        },
+        {
+          "offset": 919688,
+          "hex": "03015288001d1d127f773d9e201090000409140fea07000000035000e4070100000097b830bf044200000000000000000024e1b83834004100000000000000002019e1b80008000900000000000000004000000001000000"
+        }
+      ],
+      "images": [
+        {
+          "cut": 1,
+          "kind": 5,
+          "manufacturing": false,
+          "offset": 53072,
+          "length": 326728,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 311104,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417408000,
+              "length": 13432,
+              "checksum": false,
+              "redownload": false,
+              "offset": 311248,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417405224,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 324680,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 379800,
+          "length": 269984,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 254320,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417408000,
+              "length": 13472,
+              "checksum": false,
+              "redownload": false,
+              "offset": 254464,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417405224,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 267936,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 649784,
+          "length": 269904,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 254304,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417408000,
+              "length": 13408,
+              "checksum": false,
+              "redownload": false,
+              "offset": 254448,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417405216,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 267856,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 5,
+          "manufacturing": false,
+          "offset": 919688,
+          "length": 326648,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 311088,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417408000,
+              "length": 13368,
+              "checksum": false,
+              "redownload": false,
+              "offset": 311232,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417405216,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 324600,
+              "pool": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rtw89/rtw8852b_fw-1.bin",
+      "sha256": "5b68415e3bfe72715d63a70703d4471b04b5475b8ff69cfdc8cdf48233cd5d3a",
+      "length": 1245944,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "ff050000001d1d0f00000000000000000105000060000000d8fb0400000000000205000038fc040088fb04000000000001030000c0f70900481e0400000000000203000008160e00001e04000000000000ff000008341200f0ce000000000000"
+        },
+        {
+          "offset": 96,
+          "hex": "02015288001d1d0f41ecb36f201090000b110a39e907000000035000e4070100000097b8d0be044200000000000000000024e1b87834004100000000000000002819e1b80008000900000000000000004000000001000000"
+        },
+        {
+          "offset": 326712,
+          "hex": "03015288001d1d0f41ecb36f201090000b110a3be907000000035000e4070100000097b8c0be044200000000000000000024e1b83834004100000000000000002019e1b80008000900000000000000004000000001000000"
+        },
+        {
+          "offset": 653248,
+          "hex": "02015288001d1d0f41ecb36f201090000b110a39e907000000038000e4070100000097b818e1034200000000000000000024e1b8a034004100000000000000002819e1b80008000900000000000000004000000001000000"
+        },
+        {
+          "offset": 923144,
+          "hex": "03015288001d1d0f41ecb36f201090000b110a3be907000000038000e4070100000097b810e1034200000000000000000024e1b86034004100000000000000002019e1b80008000900000000000000004000000001000000"
+        }
+      ],
+      "images": [
+        {
+          "cut": 1,
+          "kind": 5,
+          "manufacturing": false,
+          "offset": 96,
+          "length": 326616,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 310992,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417408000,
+              "length": 13432,
+              "checksum": false,
+              "redownload": false,
+              "offset": 311136,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417405224,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 324568,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 5,
+          "manufacturing": false,
+          "offset": 326712,
+          "length": 326536,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 310976,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417408000,
+              "length": 13368,
+              "checksum": false,
+              "redownload": false,
+              "offset": 311120,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417405216,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 324488,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 653248,
+          "length": 269896,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 254232,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417408000,
+              "length": 13472,
+              "checksum": false,
+              "redownload": false,
+              "offset": 254376,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417405224,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 267848,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 923144,
+          "length": 269824,
+          "version": 0,
+          "major": 0,
+          "minor": 29,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 254224,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417408000,
+              "length": 13408,
+              "checksum": false,
+              "redownload": false,
+              "offset": 254368,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417405216,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 267776,
+              "pool": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rtw89/rtw8852b_fw.bin",
+      "sha256": "5b9c224ae014e0aeade8701412d820e213c8880e08615b3905dba89659f21baf",
+      "length": 1035232,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "ff0400000000000000000000000000000201000050000000f81a04000000000001010000481b0400c01a040000000000020300000836080008cb0300000000000103000010010c00d0ca030000000000"
+        },
+        {
+          "offset": 80,
+          "hex": "03015288001b2001a32079ef201050000a0e110ce607000000035000e4070000000097b890e4034200000000000000000020e1b8182e00410000000000000000007ce1b8000800090000000000000000"
+        },
+        {
+          "offset": 269128,
+          "hex": "02015288001b2001a32079ef201050000a0e1108e607000000035000e4070000000097b858e4034200000000000000000020e1b8182e00410000000000000000007ce1b8000800090000000000000000"
+        },
+        {
+          "offset": 538120,
+          "hex": "03015288001b2001a32079ef201050000a0e110de607000000033000e4070000000097b82097034200000000000000000020e1b8982b00410000000000000000007ce1b8000800090000000000000000"
+        },
+        {
+          "offset": 786704,
+          "hex": "02015288001b2001a32079ef201050000a0e110ae607000000033000e4070000000097b8e896034200000000000000000020e1b8982b00410000000000000000007ce1b8000800090000000000000000"
+        }
+      ],
+      "images": [
+        {
+          "cut": 2,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 80,
+          "length": 269048,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 255120,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417406976,
+              "length": 11800,
+              "checksum": false,
+              "redownload": false,
+              "offset": 255200,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 267000,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 269128,
+          "length": 268992,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 255064,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417406976,
+              "length": 11800,
+              "checksum": false,
+              "redownload": false,
+              "offset": 255144,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 266944,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 538120,
+          "length": 248584,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 235296,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417406976,
+              "length": 11160,
+              "checksum": false,
+              "redownload": false,
+              "offset": 235376,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 246536,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 786704,
+          "length": 248528,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 80,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 412549120,
+              "length": 235240,
+              "checksum": false,
+              "redownload": false,
+              "offset": 80,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 417406976,
+              "length": 11160,
+              "checksum": false,
+              "redownload": false,
+              "offset": 235320,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 417430528,
+              "length": 2048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 246480,
+              "pool": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rtw89/rtw8852c_fw-2.bin",
+      "sha256": "916e87d1470bce5400712f53d419ae68a0f44d858670c57e118d4f0b1d89c5b4",
+      "length": 2644326,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "ff070000001b810400000000000000000001000080000000a8940500000000000101000028950500d02805000000000002010000f8bd0a00f01805000000000000030000e8d60f00b88904000000000001030000a0601400c8120400000000000203000068731800280504000000000000ff000090781c0040e0000000000000"
+        },
+        {
+          "offset": 128,
+          "hex": "01025288001b810402531a3f201090000807121be907000000031000e4070500000010204051054200000000ad00000000b02120f03900410000000008000000007c2320c0030049ff000000010000004000000002000000"
+        },
+        {
+          "offset": 363644,
+          "hex": "0000"
+        },
+        {
+          "offset": 364544,
+          "hex": "4d53534b504f4f4c200000002801000001ffffff0004020020001000ffffffff"
+        },
+        {
+          "offset": 365864,
+          "hex": "02025288001b810402531a3f201090000807121be907000000031000e40705000000102020e20442000000009f00000000b02120383d00410000000008000000007c2320c0030049ff000000010000004000000002000000"
+        },
+        {
+          "offset": 701772,
+          "hex": "0000"
+        },
+        {
+          "offset": 702672,
+          "hex": "4d53534b504f4f4c200000002801000001ffffff0004020020001000ffffffff"
+        },
+        {
+          "offset": 703992,
+          "hex": "03025288001b810402531a3f201090000807121ce907000000031000e407050000001020e0d20442000000009d00000000b02120983c00410000000008000000007c2320c0030049ff000000010000004000000002000000"
+        },
+        {
+          "offset": 1035836,
+          "hex": "0000"
+        },
+        {
+          "offset": 1036736,
+          "hex": "4d53534b504f4f4c200000002801000001ffffff0004020020001000ffffffff"
+        },
+        {
+          "offset": 1038056,
+          "hex": "01025288001b810402531a3f201090000807121be907000000033000e407010000001020e04d0442000000008c00000000b02120603200410000000007000000007c2320c0030049ff000000010000004000000002000000"
+        },
+        {
+          "offset": 1333236,
+          "hex": "0000"
+        },
+        {
+          "offset": 1334136,
+          "hex": "4d53534b504f4f4c200000002801000001ffffff0004020020001000ffffffff"
+        },
+        {
+          "offset": 1335456,
+          "hex": "02025288001b810402531a3f201090000807121ce907000000033000e40701000000102018d60342000000007d00000000b02120383300410000000007000000007c2320c0030049ff000000010000004000000002000000"
+        },
+        {
+          "offset": 1600188,
+          "hex": "0000"
+        },
+        {
+          "offset": 1601088,
+          "hex": "4d53534b504f4f4c200000002801000001ffffff0004020020001000ffffffff"
+        },
+        {
+          "offset": 1602408,
+          "hex": "03025288001b810402531a3f201090000807121de907000000033000e407010000001020c0c80342000000007b00000000b02120f03200410000000007000000007c2320c0030049ff000000010000004000000002000000"
+        },
+        {
+          "offset": 1863652,
+          "hex": "0000"
+        },
+        {
+          "offset": 1864552,
+          "hex": "4d53534b504f4f4c200000002801000001ffffff0004020020001000ffffffff"
+        }
+      ],
+      "images": [
+        {
+          "cut": 0,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 128,
+          "length": 365736,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 348480,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 14832,
+              "checksum": false,
+              "redownload": false,
+              "offset": 348624,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 363456,
+              "pool": {
+                "offset": 364416,
+                "length": 1320,
+                "signatures_offset": 364712,
+                "signature_length": 512,
+                "signature_count": 2,
+                "bitmap": true
+              }
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 365864,
+          "length": 338128,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 320032,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 15672,
+              "checksum": false,
+              "redownload": false,
+              "offset": 320176,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 335848,
+              "pool": {
+                "offset": 336808,
+                "length": 1320,
+                "signatures_offset": 337104,
+                "signature_length": 512,
+                "signature_count": 2,
+                "bitmap": true
+              }
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 703992,
+          "length": 334064,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 316128,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 15512,
+              "checksum": false,
+              "redownload": false,
+              "offset": 316272,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 331784,
+              "pool": {
+                "offset": 332744,
+                "length": 1320,
+                "signatures_offset": 333040,
+                "signature_length": 512,
+                "signature_count": 2,
+                "bitmap": true
+              }
+            }
+          ]
+        },
+        {
+          "cut": 0,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 1038056,
+          "length": 297400,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 282080,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 12896,
+              "checksum": false,
+              "redownload": false,
+              "offset": 282224,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 295120,
+              "pool": {
+                "offset": 296080,
+                "length": 1320,
+                "signatures_offset": 296376,
+                "signature_length": 512,
+                "signature_count": 2,
+                "bitmap": true
+              }
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 1335456,
+          "length": 266952,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 251416,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 13112,
+              "checksum": false,
+              "redownload": false,
+              "offset": 251560,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 264672,
+              "pool": {
+                "offset": 265632,
+                "length": 1320,
+                "signatures_offset": 265928,
+                "signature_length": 512,
+                "signature_count": 2,
+                "bitmap": true
+              }
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 1602408,
+          "length": 263464,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 248000,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 13040,
+              "checksum": false,
+              "redownload": false,
+              "offset": 248144,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 261184,
+              "pool": {
+                "offset": 262144,
+                "length": 1320,
+                "signatures_offset": 262440,
+                "signature_length": 512,
+                "signature_count": 2,
+                "bitmap": true
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rtw89/rtw8852c_fw-1.bin",
+      "sha256": "95e4226f7a4c2a506a5ea2bb8b6247842dd12fc312639750881c5bfdec7bbec5",
+      "length": 2375560,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "ff070000001b7a0000000000000000000001000080000000707e05000000000001010000f07e0500081005000000000002010000f88e0a00280005000000000000030000208f0f00506b0400000000000103000070fa130050f103000000000002030000c0eb1700b8e303000000000000ff000078cf1b00c0dd000000000000"
+        },
+        {
+          "offset": 128,
+          "hex": "01025288001b7a00f20e4a8d201090000c021005e807000000031000e407050000001020b840054200000000ab00000000b02120683900410000000008000000007c2320c003004900000000010000004000000002000000"
+        },
+        {
+          "offset": 360176,
+          "hex": "02025288001b7a00f20e4a8d201090000c021005e807000000031000e40705000000102028cf0442000000009d00000000b02120903c00410000000008000000007c2320c003004900000000010000004000000002000000"
+        },
+        {
+          "offset": 691960,
+          "hex": "03025288001b7a00f20e4a8d201090000c021006e807000000031000e407050000001020e8bf0442000000009b00000000b02120f03b00410000000008000000007c2320c003004900000000010000004000000002000000"
+        },
+        {
+          "offset": 1019680,
+          "hex": "01025288001b7a00f20e4a8d201090000c021005e807000000033000e40701000000102018350442000000008900000000b02120e83100410000000007000000007c2320c003004900000000010000004000000002000000"
+        },
+        {
+          "offset": 1309296,
+          "hex": "02025288001b7a00f20e4a8d201090000c021005e807000000033000e40701000000102068ba0342000000007900000000b02120983200410000000007000000007c2320c003004900000000010000004000000002000000"
+        },
+        {
+          "offset": 1567680,
+          "hex": "03025288001b7a00f20e4a8d201090000c021006e807000000033000e40701000000102018ad0342000000007800000000b02120503200410000000007000000007c2320c003004900000000010000004000000002000000"
+        }
+      ],
+      "images": [
+        {
+          "cut": 0,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 128,
+          "length": 360048,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 344248,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 14696,
+              "checksum": false,
+              "redownload": false,
+              "offset": 344392,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 359088,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 360176,
+          "length": 331784,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 315176,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 15504,
+              "checksum": false,
+              "redownload": false,
+              "offset": 315320,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 330824,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 691960,
+          "length": 327720,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 311272,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 15344,
+              "checksum": false,
+              "redownload": false,
+              "offset": 311416,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 326760,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 0,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 1019680,
+          "length": 289616,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 275736,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 12776,
+              "checksum": false,
+              "redownload": false,
+              "offset": 275880,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 288656,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 1309296,
+          "length": 258384,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 244328,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 12952,
+              "checksum": false,
+              "redownload": false,
+              "offset": 244472,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 257424,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 1567680,
+          "length": 254904,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 144,
+          "dynamic": true,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 240920,
+              "checksum": false,
+              "redownload": false,
+              "offset": 144,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 12880,
+              "checksum": false,
+              "redownload": false,
+              "offset": 241064,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 253944,
+              "pool": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rtw89/rtw8852c_fw.bin",
+      "sha256": "e05e704911ec5d6523e2951416290cc2189444d48a0420e637de6acf5bf21228",
+      "length": 1532656,
+      "fragments": [
+        {
+          "offset": 0,
+          "hex": "ff060000001b380e00000000000000000201000070000000a02d04000000000001010000102e0400383d04000000000000030000486b080050d103000000000000010000983c0c00f0d5040000000000020300008812110088210300000000000103000010341400e02e030000000000"
+        },
+        {
+          "offset": 112,
+          "hex": "03025288001b380e27d9421920106000030f0e2fe807000000045000e40700000000102098e80342000000000000000098e81320080a0067000000000000000000b02120e03600410000000000000000007c2320c00300090000000000000000"
+        },
+        {
+          "offset": 273936,
+          "hex": "02025288001b380e27d9421920106000030f0e2de807000000045000e407000000001020a8f703420000000000000000a8f71320080a0067000000000000000000b02120683700410000000000000000007c2320c00300090000000000000000"
+        },
+        {
+          "offset": 551752,
+          "hex": "01025288001b380e27d9421920106000030f0e2ce807000000043000e407000000001020809b03420000000000000000809b132098030067000000000000000000b02120182e00410000000000000000007c2320c00300090000000000000000"
+        },
+        {
+          "offset": 801944,
+          "hex": "01025288001b380e27d9421920106000030f0e2be807000000045000e407000000001020c08604420000000000000000c0861420f8150067000000000000000000b02120183500410000000000000000007c2320c00300090000000000000000"
+        },
+        {
+          "offset": 1118856,
+          "hex": "03025288001b380e27d9421920106000030f0e30e807000000043000e40700000000102050ec0242000000000000000050ec122098030067000000000000000000b02120802d00410000000000000000007c2320c00300090000000000000000"
+        },
+        {
+          "offset": 1324048,
+          "hex": "02025288001b380e27d9421920106000030f0e2ee807000000043000e40700000000102060f90242000000000000000060f9122098030067000000000000000000b02120c82d00410000000000000000007c2320c00300090000000000000000"
+        }
+      ],
+      "images": [
+        {
+          "cut": 2,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 112,
+          "length": 273824,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 96,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 256152,
+              "checksum": false,
+              "redownload": false,
+              "offset": 96,
+              "pool": null
+            },
+            {
+              "kind": 7,
+              "address": 1304728,
+              "length": 2568,
+              "checksum": false,
+              "redownload": true,
+              "offset": 256248,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 14048,
+              "checksum": false,
+              "redownload": false,
+              "offset": 258816,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 272864,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 273936,
+          "length": 277816,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 96,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 260008,
+              "checksum": false,
+              "redownload": false,
+              "offset": 96,
+              "pool": null
+            },
+            {
+              "kind": 7,
+              "address": 1308584,
+              "length": 2568,
+              "checksum": false,
+              "redownload": true,
+              "offset": 260104,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 14184,
+              "checksum": false,
+              "redownload": false,
+              "offset": 262672,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 276856,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 0,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 551752,
+          "length": 250192,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 96,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 236416,
+              "checksum": false,
+              "redownload": false,
+              "offset": 96,
+              "pool": null
+            },
+            {
+              "kind": 7,
+              "address": 1284992,
+              "length": 920,
+              "checksum": false,
+              "redownload": true,
+              "offset": 236512,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 11800,
+              "checksum": false,
+              "redownload": false,
+              "offset": 237432,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 249232,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 0,
+          "kind": 1,
+          "manufacturing": false,
+          "offset": 801944,
+          "length": 316912,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 96,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 296640,
+              "checksum": false,
+              "redownload": false,
+              "offset": 96,
+              "pool": null
+            },
+            {
+              "kind": 7,
+              "address": 1345216,
+              "length": 5624,
+              "checksum": false,
+              "redownload": true,
+              "offset": 296736,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 13592,
+              "checksum": false,
+              "redownload": false,
+              "offset": 302360,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 315952,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 2,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 1118856,
+          "length": 205192,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 96,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 191568,
+              "checksum": false,
+              "redownload": false,
+              "offset": 96,
+              "pool": null
+            },
+            {
+              "kind": 7,
+              "address": 1240144,
+              "length": 920,
+              "checksum": false,
+              "redownload": true,
+              "offset": 191664,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 11648,
+              "checksum": false,
+              "redownload": false,
+              "offset": 192584,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 204232,
+              "pool": null
+            }
+          ]
+        },
+        {
+          "cut": 1,
+          "kind": 3,
+          "manufacturing": false,
+          "offset": 1324048,
+          "length": 208608,
+          "version": 0,
+          "major": 0,
+          "minor": 27,
+          "header_length": 96,
+          "dynamic": false,
+          "sections": [
+            {
+              "kind": 2,
+              "address": 1048576,
+              "length": 194912,
+              "checksum": false,
+              "redownload": false,
+              "offset": 96,
+              "pool": null
+            },
+            {
+              "kind": 7,
+              "address": 1243488,
+              "length": 920,
+              "checksum": false,
+              "redownload": true,
+              "offset": 195008,
+              "pool": null
+            },
+            {
+              "kind": 1,
+              "address": 2207744,
+              "length": 11720,
+              "checksum": false,
+              "redownload": false,
+              "offset": 195928,
+              "pool": null
+            },
+            {
+              "kind": 9,
+              "address": 2325504,
+              "length": 960,
+              "checksum": false,
+              "redownload": false,
+              "offset": 207648,
+              "pool": null
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

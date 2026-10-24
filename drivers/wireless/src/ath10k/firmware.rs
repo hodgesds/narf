@@ -378,3 +378,7 @@ pub(super) async fn prepare<T: Transport>(
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "firmware_metadata_tests.rs"]
+mod metadata_tests;

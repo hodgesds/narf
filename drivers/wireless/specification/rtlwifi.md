@@ -61,7 +61,7 @@ require their complete reset/power qualification.
 RTL8188EE probe retains `firmware_transport::Owner<firmware_native::PciIo>`
 before spawning `initialize_registered()`. `RtlwifiDevice::firmware_status()`
 returns the shared attempt state; other profiles return None. Registry selection
-uses exactly `rtlwifi/rtl8188eefw.bin`, authenticated through firmware authority.
+uses exactly `rtlwifi/rtl8188efw.bin`, authenticated through firmware authority.
 The complete 32-byte header, exact nonempty declared RAM-code length, 88E1
 signature and at most eight 4096-byte pages are checked before allocation/I/O.
 The EE filename remains mandatory because the signature alone cannot distinguish

@@ -1,0 +1,1171 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "id": "ath9k",
+      "family": "ath9k",
+      "assets": [],
+      "requirements": [
+        "No external executable firmware: validate the actual device EEPROM/calibration, supported silicon and regulatory policy.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath10k-qca988x-hw2.0",
+      "family": "ath10k",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA988X/hw2.0/firmware-6.bin",
+            "ath10k/QCA988X/hw2.0/firmware-5.bin",
+            "ath10k/QCA988X/hw2.0/firmware-4.bin",
+            "ath10k/QCA988X/hw2.0/firmware-3.bin",
+            "ath10k/QCA988X/hw2.0/firmware-2.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA988X/hw2.0/board-2.bin",
+            "ath10k/QCA988X/hw2.0/board.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Board-container presence does not prove an exact board-name/OTP/calibration match; codeswap and firmware features must match the device.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath10k-qca6174-hw3.0",
+      "family": "ath10k",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA6174/hw3.0/firmware-6.bin",
+            "ath10k/QCA6174/hw3.0/firmware-5.bin",
+            "ath10k/QCA6174/hw3.0/firmware-4.bin",
+            "ath10k/QCA6174/hw3.0/firmware-3.bin",
+            "ath10k/QCA6174/hw3.0/firmware-2.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA6174/hw3.0/board-2.bin",
+            "ath10k/QCA6174/hw3.0/board.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Board-container presence does not prove an exact board-name/OTP/calibration match; codeswap and firmware features must match the device.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath10k-qca9887-hw1.0",
+      "family": "ath10k",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA9887/hw1.0/firmware-6.bin",
+            "ath10k/QCA9887/hw1.0/firmware-5.bin",
+            "ath10k/QCA9887/hw1.0/firmware-4.bin",
+            "ath10k/QCA9887/hw1.0/firmware-3.bin",
+            "ath10k/QCA9887/hw1.0/firmware-2.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA9887/hw1.0/board-2.bin",
+            "ath10k/QCA9887/hw1.0/board.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Board-container presence does not prove an exact board-name/OTP/calibration match; codeswap and firmware features must match the device.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath10k-qca6174-hw2.1",
+      "family": "ath10k",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA6174/hw2.1/firmware-6.bin",
+            "ath10k/QCA6174/hw2.1/firmware-5.bin",
+            "ath10k/QCA6174/hw2.1/firmware-4.bin",
+            "ath10k/QCA6174/hw2.1/firmware-3.bin",
+            "ath10k/QCA6174/hw2.1/firmware-2.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA6174/hw2.1/board-2.bin",
+            "ath10k/QCA6174/hw2.1/board.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Board-container presence does not prove an exact board-name/OTP/calibration match; codeswap and firmware features must match the device.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath10k-qca99x0-hw2.0",
+      "family": "ath10k",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA99X0/hw2.0/firmware-6.bin",
+            "ath10k/QCA99X0/hw2.0/firmware-5.bin",
+            "ath10k/QCA99X0/hw2.0/firmware-4.bin",
+            "ath10k/QCA99X0/hw2.0/firmware-3.bin",
+            "ath10k/QCA99X0/hw2.0/firmware-2.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA99X0/hw2.0/board-2.bin",
+            "ath10k/QCA99X0/hw2.0/board.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Board-container presence does not prove an exact board-name/OTP/calibration match; codeswap and firmware features must match the device.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath10k-qca9984-hw1.0",
+      "family": "ath10k",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA9984/hw1.0/firmware-6.bin",
+            "ath10k/QCA9984/hw1.0/firmware-5.bin",
+            "ath10k/QCA9984/hw1.0/firmware-4.bin",
+            "ath10k/QCA9984/hw1.0/firmware-3.bin",
+            "ath10k/QCA9984/hw1.0/firmware-2.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA9984/hw1.0/board-2.bin",
+            "ath10k/QCA9984/hw1.0/board.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Board-container presence does not prove an exact board-name/OTP/calibration match; codeswap and firmware features must match the device.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath10k-qca9888-hw2.0",
+      "family": "ath10k",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA9888/hw2.0/firmware-6.bin",
+            "ath10k/QCA9888/hw2.0/firmware-5.bin",
+            "ath10k/QCA9888/hw2.0/firmware-4.bin",
+            "ath10k/QCA9888/hw2.0/firmware-3.bin",
+            "ath10k/QCA9888/hw2.0/firmware-2.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA9888/hw2.0/board-2.bin",
+            "ath10k/QCA9888/hw2.0/board.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Board-container presence does not prove an exact board-name/OTP/calibration match; codeswap and firmware features must match the device.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath10k-qca9377-hw1.0",
+      "family": "ath10k",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA9377/hw1.0/firmware-6.bin",
+            "ath10k/QCA9377/hw1.0/firmware-5.bin",
+            "ath10k/QCA9377/hw1.0/firmware-4.bin",
+            "ath10k/QCA9377/hw1.0/firmware-3.bin",
+            "ath10k/QCA9377/hw1.0/firmware-2.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath10k/QCA9377/hw1.0/board-2.bin",
+            "ath10k/QCA9377/hw1.0/board.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Board-container presence does not prove an exact board-name/OTP/calibration match; codeswap and firmware features must match the device.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath11k-qca6390-hw2.0",
+      "family": "ath11k",
+      "assets": [
+        {
+          "role": "split AMSS",
+          "required": true,
+          "candidates": [
+            "ath11k/QCA6390/hw2.0/amss.bin"
+          ]
+        },
+        {
+          "role": "split M3",
+          "required": true,
+          "candidates": [
+            "ath11k/QCA6390/hw2.0/m3.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath11k/QCA6390/hw2.0/board-2.bin",
+            "ath11k/QCA6390/hw2.0/board.bin"
+          ]
+        },
+        {
+          "role": "optional REGDB",
+          "required": false,
+          "candidates": [
+            "ath11k/QCA6390/hw2.0/regdb.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "This inventories the split/API1 layout. A firmware-2.bin container requires independent IE/content validation and is not substituted for these assets.",
+        "Select exact QMI/PCI/board identity and authenticated calibration/regulatory records; verify AMSS/M3 compatibility.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath11k-wcn6855-hw2.0",
+      "family": "ath11k",
+      "assets": [
+        {
+          "role": "split AMSS",
+          "required": true,
+          "candidates": [
+            "ath11k/WCN6855/hw2.0/amss.bin"
+          ]
+        },
+        {
+          "role": "split M3",
+          "required": true,
+          "candidates": [
+            "ath11k/WCN6855/hw2.0/m3.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath11k/WCN6855/hw2.0/board-2.bin",
+            "ath11k/WCN6855/hw2.0/board.bin"
+          ]
+        },
+        {
+          "role": "optional REGDB",
+          "required": false,
+          "candidates": [
+            "ath11k/WCN6855/hw2.0/regdb.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "This inventories the split/API1 layout. A firmware-2.bin container requires independent IE/content validation and is not substituted for these assets.",
+        "Select exact QMI/PCI/board identity and authenticated calibration/regulatory records; verify AMSS/M3 compatibility.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath11k-wcn6855-hw2.1",
+      "family": "ath11k",
+      "assets": [
+        {
+          "role": "split AMSS",
+          "required": true,
+          "candidates": [
+            "ath11k/WCN6855/hw2.1/amss.bin"
+          ]
+        },
+        {
+          "role": "split M3",
+          "required": true,
+          "candidates": [
+            "ath11k/WCN6855/hw2.1/m3.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath11k/WCN6855/hw2.1/board-2.bin",
+            "ath11k/WCN6855/hw2.1/board.bin"
+          ]
+        },
+        {
+          "role": "optional REGDB",
+          "required": false,
+          "candidates": [
+            "ath11k/WCN6855/hw2.1/regdb.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "This inventories the split/API1 layout. A firmware-2.bin container requires independent IE/content validation and is not substituted for these assets.",
+        "Select exact QMI/PCI/board identity and authenticated calibration/regulatory records; verify AMSS/M3 compatibility.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath11k-qcn9074-hw1.0",
+      "family": "ath11k",
+      "assets": [
+        {
+          "role": "split AMSS",
+          "required": true,
+          "candidates": [
+            "ath11k/QCN9074/hw1.0/amss.bin"
+          ]
+        },
+        {
+          "role": "split M3",
+          "required": true,
+          "candidates": [
+            "ath11k/QCN9074/hw1.0/m3.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath11k/QCN9074/hw1.0/board-2.bin",
+            "ath11k/QCN9074/hw1.0/board.bin"
+          ]
+        },
+        {
+          "role": "optional REGDB",
+          "required": false,
+          "candidates": [
+            "ath11k/QCN9074/hw1.0/regdb.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "This inventories the split/API1 layout. A firmware-2.bin container requires independent IE/content validation and is not substituted for these assets.",
+        "Select exact QMI/PCI/board identity and authenticated calibration/regulatory records; verify AMSS/M3 compatibility.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath11k-qca2066-hw2.1",
+      "family": "ath11k",
+      "assets": [
+        {
+          "role": "split AMSS",
+          "required": true,
+          "candidates": [
+            "ath11k/QCA2066/hw2.1/amss.bin"
+          ]
+        },
+        {
+          "role": "split M3",
+          "required": true,
+          "candidates": [
+            "ath11k/QCA2066/hw2.1/m3.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath11k/QCA2066/hw2.1/board-2.bin",
+            "ath11k/QCA2066/hw2.1/board.bin"
+          ]
+        },
+        {
+          "role": "optional REGDB",
+          "required": false,
+          "candidates": [
+            "ath11k/QCA2066/hw2.1/regdb.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "This inventories the split/API1 layout. A firmware-2.bin container requires independent IE/content validation and is not substituted for these assets.",
+        "Select exact QMI/PCI/board identity and authenticated calibration/regulatory records; verify AMSS/M3 compatibility.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "ath11k-qca6698aq-hw2.1",
+      "family": "ath11k",
+      "assets": [
+        {
+          "role": "split AMSS",
+          "required": true,
+          "candidates": [
+            "ath11k/QCA6698AQ/hw2.1/amss.bin"
+          ]
+        },
+        {
+          "role": "split M3",
+          "required": true,
+          "candidates": [
+            "ath11k/QCA6698AQ/hw2.1/m3.bin"
+          ]
+        },
+        {
+          "role": "board candidates",
+          "required": true,
+          "candidates": [
+            "ath11k/QCA6698AQ/hw2.1/board-2.bin",
+            "ath11k/QCA6698AQ/hw2.1/board.bin"
+          ]
+        },
+        {
+          "role": "optional REGDB",
+          "required": false,
+          "candidates": [
+            "ath11k/QCA6698AQ/hw2.1/regdb.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "This inventories the split/API1 layout. A firmware-2.bin container requires independent IE/content validation and is not substituted for these assets.",
+        "Select exact QMI/PCI/board identity and authenticated calibration/regulatory records; verify AMSS/M3 compatibility.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "brcm43602-pcie",
+      "family": "brcmfmac",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "brcm/brcmfmac43602-pcie.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Platform must register a BCM43602 BoardProfile with exact firmware/NVRAM names and certified board/antenna/country data. No board NVRAM is guessed by chip ID.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "cyw43439",
+      "family": "cyw43439",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "brcm/brcmfmac43439-sdio.bin",
+            "43439A0.bin"
+          ]
+        },
+        {
+          "role": "board NVRAM",
+          "required": true,
+          "candidates": [
+            "brcm/brcmfmac43439-sdio.txt",
+            "43439A0.txt"
+          ]
+        },
+        {
+          "role": "CLM",
+          "required": true,
+          "candidates": [
+            "brcm/brcmfmac43439-sdio.clm_blob",
+            "43439A0_clm.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Supply exact-board NVRAM, factory MAC/country/antenna calibration and matching CLM; never substitute another Broadcom chip or board.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-QuZ-a0-hr-b0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-QuZ-a0-hr-b0-100.ucode"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-Qu-b0-hr-b0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-Qu-b0-hr-b0-100.ucode"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-ty-a0-gf-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-ty-a0-gf-a0-89.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-ty-a0-gf-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-ty-a0-gf4-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-ty-a0-gf4-a0-89.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-ty-a0-gf4-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-so-a0-gf-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-so-a0-gf-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-so-a0-gf4-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-so-a0-gf4-a0-89.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-so-a0-gf4-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-ma-a0-gf-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-ma-a0-gf-a0-100.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-ma-a0-gf-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-ma-a0-gf4-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-ma-a0-gf4-a0-100.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-ma-a0-gf4-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-ma-b0-gf-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-ma-b0-gf-a0-100.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-ma-b0-gf-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-ma-b0-gf4-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-ma-b0-gf4-a0-100.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-ma-b0-gf4-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-bz-a0-gf-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-bz-a0-gf-a0-102.ucode",
+            "iwlwifi/iwlwifi-bz-a0-gf-a0-101.ucode",
+            "iwlwifi/iwlwifi-bz-a0-gf-a0-100.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-bz-a0-gf-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-bz-a0-gf4-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-bz-a0-gf4-a0-102.ucode",
+            "iwlwifi/iwlwifi-bz-a0-gf4-a0-101.ucode",
+            "iwlwifi/iwlwifi-bz-a0-gf4-a0-100.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-bz-a0-gf4-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-bz-a0-fm-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-bz-a0-fm-a0-102.ucode",
+            "iwlwifi/iwlwifi-bz-a0-fm-a0-101.ucode",
+            "iwlwifi/iwlwifi-bz-a0-fm-a0-100.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-bz-a0-fm-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-sc-a0-wh-b0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-sc-a0-wh-b0-c107.ucode",
+            "iwlwifi/iwlwifi-sc-a0-wh-b0-c106.ucode",
+            "iwlwifi/iwlwifi-sc-a0-wh-b0-c105.ucode",
+            "iwlwifi/iwlwifi-sc-a0-wh-b0-c104.ucode",
+            "iwlwifi/iwlwifi-sc-a0-wh-b0-c103.ucode",
+            "iwlwifi/iwlwifi-sc-a0-wh-b0-c102.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-sc-a0-wh-b0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-sc-a0-fm-c0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-sc-a0-fm-c0-c107.ucode",
+            "iwlwifi/iwlwifi-sc-a0-fm-c0-c106.ucode",
+            "iwlwifi/iwlwifi-sc-a0-fm-c0-c105.ucode",
+            "iwlwifi/iwlwifi-sc-a0-fm-c0-c104.ucode",
+            "iwlwifi/iwlwifi-sc-a0-fm-c0-c103.ucode",
+            "iwlwifi/iwlwifi-sc-a0-fm-c0-c102.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-sc-a0-fm-c0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-sc-a0-fm-b0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-sc-a0-fm-b0-c107.ucode",
+            "iwlwifi/iwlwifi-sc-a0-fm-b0-c106.ucode",
+            "iwlwifi/iwlwifi-sc-a0-fm-b0-c105.ucode",
+            "iwlwifi/iwlwifi-sc-a0-fm-b0-c104.ucode",
+            "iwlwifi/iwlwifi-sc-a0-fm-b0-c103.ucode",
+            "iwlwifi/iwlwifi-sc-a0-fm-b0-c102.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-sc-a0-fm-b0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "iwlwifi-sc-a0-gf-a0",
+      "family": "iwlwifi",
+      "assets": [
+        {
+          "role": "ucode",
+          "required": true,
+          "candidates": [
+            "iwlwifi/iwlwifi-sc-a0-gf-a0-c107.ucode",
+            "iwlwifi/iwlwifi-sc-a0-gf-a0-c106.ucode",
+            "iwlwifi/iwlwifi-sc-a0-gf-a0-c105.ucode",
+            "iwlwifi/iwlwifi-sc-a0-gf-a0-c104.ucode",
+            "iwlwifi/iwlwifi-sc-a0-gf-a0-c103.ucode",
+            "iwlwifi/iwlwifi-sc-a0-gf-a0-c102.ucode"
+          ]
+        },
+        {
+          "role": "conditional external PNVM",
+          "required": false,
+          "candidates": [
+            "iwlwifi/iwlwifi-sc-a0-gf-a0.pnvm"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical MAC/RF/step and supported firmware API/command profile. A parser fixture for cc-a0 or bz-b0 does not enable a QuZ or bz-a0 device.",
+        "External sibling PNVM is required when requested and not embedded; validate the selected image and matching PNVM.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "mt7920",
+      "family": "mt7921",
+      "assets": [
+        {
+          "role": "patch",
+          "required": true,
+          "candidates": [
+            "mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin"
+          ]
+        },
+        {
+          "role": "RAM",
+          "required": true,
+          "candidates": [
+            "mediatek/WIFI_RAM_CODE_MT7961_1a.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match supported CONNAC2 silicon and exact patch/RAM pair; qualify actual EEPROM/board calibration and reset/radio transport.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "mt7921",
+      "family": "mt7921",
+      "assets": [
+        {
+          "role": "patch",
+          "required": true,
+          "candidates": [
+            "mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin"
+          ]
+        },
+        {
+          "role": "RAM",
+          "required": true,
+          "candidates": [
+            "mediatek/WIFI_RAM_CODE_MT7961_1.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match supported CONNAC2 silicon and exact patch/RAM pair; qualify actual EEPROM/board calibration and reset/radio transport.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "mt7922",
+      "family": "mt7921",
+      "assets": [
+        {
+          "role": "patch",
+          "required": true,
+          "candidates": [
+            "mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin"
+          ]
+        },
+        {
+          "role": "RAM",
+          "required": true,
+          "candidates": [
+            "mediatek/WIFI_RAM_CODE_MT7922_1.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match supported CONNAC2 silicon and exact patch/RAM pair; qualify actual EEPROM/board calibration and reset/radio transport.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "rtl8188eu",
+      "family": "rtl8xxxu",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "rtlwifi/rtl8188eufw.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Signed measured board-power artifact rtl8xxxu/rtl8188eu-cal-v1-<factory MAC lowercase hex>.bin is mandatory and must match factory identity; unsigned developer mode does not qualify it.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "rtl8188ee",
+      "family": "rtlwifi",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "rtlwifi/rtl8188efw.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "This is the retained EE preparation profile; other rtlwifi profiles remain gated. Firmware CPU readiness does not admit packet TX.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "rtl8822ce",
+      "family": "rtw88",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "rtw88/rtw8822c_fw.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "This is the retained 8822CE preparation profile; other rtw88 profiles remain gated. Validate physical efuse/power/transport before station admission.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "rtw8852a",
+      "family": "rtw89",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "rtw89/rtw8852a_fw-1.bin",
+            "rtw89/rtw8852a_fw.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical cut and non-manufacturing suit; validate secure-fuse, signatures, WCPU power and transport. 8922A is unsupported; prepared firmware does not admit packet TX.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "rtw8852b",
+      "family": "rtw89",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "rtw89/rtw8852b_fw-2.bin",
+            "rtw89/rtw8852b_fw-1.bin",
+            "rtw89/rtw8852b_fw.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical cut and non-manufacturing suit; validate secure-fuse, signatures, WCPU power and transport. 8922A is unsupported; prepared firmware does not admit packet TX.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "rtw8852c",
+      "family": "rtw89",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "rtw89/rtw8852c_fw-2.bin",
+            "rtw89/rtw8852c_fw-1.bin",
+            "rtw89/rtw8852c_fw.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical cut and non-manufacturing suit; validate secure-fuse, signatures, WCPU power and transport. 8922A is unsupported; prepared firmware does not admit packet TX.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "rtw8851b",
+      "family": "rtw89",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "rtw89/rtw8851b_fw-1.bin",
+            "rtw89/rtw8851b_fw.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match physical cut and non-manufacturing suit; validate secure-fuse, signatures, WCPU power and transport. 8922A is unsupported; prepared firmware does not admit packet TX.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    }
+  ]
+}

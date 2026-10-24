@@ -197,7 +197,8 @@ kernel_test_in!("drivers/wireless/rtlwifi", smoke_rtlwifi_rx_desc_layout);
 
 fn smoke_rtlwifi_fw_blob_name_by_chip() -> TestResult {
     let cases: &[(u16, &str)] = &[
-        (RTL_DEV_8188EE, "rtlwifi/rtl8188eefw.bin"),
+        // Linux's PCIe 8188EE image is `rtl8188efw`, without a second `e`.
+        (RTL_DEV_8188EE, "rtlwifi/rtl8188efw.bin"),
         (RTL_DEV_8192CE, "rtlwifi/rtl8192cfw.bin"),
         (RTL_DEV_8192CE_ALT, "rtlwifi/rtl8192cfw.bin"),
         (RTL_DEV_8192DE, "rtlwifi/rtl8192defw.bin"),

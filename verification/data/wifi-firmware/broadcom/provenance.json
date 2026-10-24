@@ -1,0 +1,27 @@
+{
+  "decoder": "independent Python struct decoder; Linux brcmfmac/pcie.c BRCMF_RAMSIZE_{MAGIC,OFFSET}",
+  "facts": {
+    "embedded_ramsize": null,
+    "ram_metadata_magic": 4210752250,
+    "ram_metadata_offset": 108,
+    "reset_vector_word": 3091263872,
+    "trx_wrapped": false
+  },
+  "metadata_sha256": "c7ff85dd9fa312f150610b1cdac1233ba904a5f65be7877b376e7d3330806b34",
+  "metadata_size": 12,
+  "open": "No exact CYW43439 firmware/NVRAM/CLM source and no qualified BCM43602 board NVRAM here. No other board NVRAM is substituted. Physical radio validation remains open.",
+  "policy": "Only reset-vector word and optional RAM metadata window retained; opaque executable payload zeroed. Parser tests only: never firmware registry, boot input, or BCM43602 board admission.",
+  "schema": "narf-wifi-metadata-replay-v1",
+  "source": "brcm/brcmfmac43602-pcie.bin",
+  "source_sha256": "bf4cfc23ee952a3d82ef33a0f5f87853201c98f1bed034876a910f354f37862d",
+  "source_size": 635449,
+  "unavailable": [
+    "brcm/brcmfmac43439-sdio.bin",
+    "43439A0.bin",
+    "brcm/brcmfmac43439-sdio.txt",
+    "43439A0.txt",
+    "brcm/brcmfmac43439-sdio.clm_blob",
+    "43439A0_clm.bin",
+    "brcm/brcmfmac43602-pcie.txt"
+  ]
+}

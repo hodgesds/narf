@@ -9,6 +9,7 @@
 extern crate alloc;
 
 mod ap;
+pub mod firmware;
 mod network;
 
 pub use ap::{ApError, ApPhase, FakeAp};

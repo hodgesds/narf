@@ -370,7 +370,7 @@ pub const fn name_for(did: u16) -> &'static str {
 pub fn firmware_blobs_for(did: u16) -> (&'static str, &'static str) {
     match did {
         MTK_DEV_MT7922 | MTK_DEV_MT7921_ALT => (MT7922_ROM_PATCH, MT7922_FIRMWARE_WM),
-        MTK_DEV_MT7920 => (MT7920_ROM_PATCH, MT7961_FIRMWARE_WM),
+        MTK_DEV_MT7920 => (MT7920_ROM_PATCH, MT7920_FIRMWARE_WM),
         // MT7921 + MT7961 share the 7961 patch and RAM code.
         _ => (MT7961_ROM_PATCH, MT7961_FIRMWARE_WM),
     }

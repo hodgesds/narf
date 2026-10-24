@@ -28,8 +28,8 @@ use super::regs::*;
 // kernel's MODULE_FIRMWARE declarations in the corresponding `sw.c` files.
 
 /// Firmware blob for RTL8188EE.
-/// Linux `rtl8188ee/sw.c::MODULE_FIRMWARE("rtlwifi/rtl8188eefw.bin")`.
-pub const FW_8188EE: &str = "rtlwifi/rtl8188eefw.bin";
+/// Linux `rtl8188ee/sw.c::MODULE_FIRMWARE("rtlwifi/rtl8188efw.bin")`.
+pub const FW_8188EE: &str = "rtlwifi/rtl8188efw.bin";
 
 /// Firmware blob for RTL8192CE.
 /// Linux `rtl8192ce/sw.c::MODULE_FIRMWARE("rtlwifi/rtl8192cfw.bin")`.

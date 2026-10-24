@@ -30,3 +30,9 @@ peer. CYW retains its SDPCM/BDC FullMAC firmware model; its WPA2 evidence is
 firmware-offloaded key completion, rather than firmware-internal EAPOL or
 radio cryptography. Each path runs the production DHCP client and verifies
 the resulting lease and exact post-lease Ethernet data in both directions.
+
+`firmware::metadata_replay` also supports firmware parser fixtures. It rebuilds
+the original image geometry from bounded metadata fragments while zeroing all
+omitted executable/calibration bytes. These synthetic images must never be
+registered or loaded onto a device. See the [fixture provenance and audit
+instructions](../data/wifi-firmware/README.md).

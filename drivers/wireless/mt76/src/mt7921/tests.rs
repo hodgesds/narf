@@ -216,9 +216,9 @@ fn smoke_mt7921_firmware_blobs_for_each_chip() -> TestResult {
     if p != MT7922_ROM_PATCH || r != MT7922_FIRMWARE_WM {
         return TestResult::Fail("MT7922 firmware blob names drift");
     }
-    // MT7920 (DBDC) uses 7961 RAM code with a chip-specific patch.
+    // MT7920 (DBDC) requires its distinct `1a` RAM code and ROM patch.
     let (p, r) = firmware_blobs_for(MTK_DEV_MT7920);
-    if p != MT7920_ROM_PATCH || r != MT7961_FIRMWARE_WM {
+    if p != MT7920_ROM_PATCH || r != MT7920_FIRMWARE_WM {
         return TestResult::Fail("MT7920 firmware blob names drift");
     }
     // PCI alias 0616 selects MT7922 firmware, as in the Linux match table.

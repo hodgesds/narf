@@ -199,6 +199,8 @@ pub const DRV_OWN_POLL_MS: u64 = 50;
 
 /// Runtime ("WM") firmware blob name for MT7961-class silicon.
 pub const MT7961_FIRMWARE_WM: &str = "mediatek/WIFI_RAM_CODE_MT7961_1.bin";
+/// MT7920's distinct WM image, paired with its `1a_2` ROM patch (Linux mt7921).
+pub const MT7920_FIRMWARE_WM: &str = "mediatek/WIFI_RAM_CODE_MT7961_1a.bin";
 /// Runtime ("WM") firmware blob name for MT7922-class silicon.
 pub const MT7922_FIRMWARE_WM: &str = "mediatek/WIFI_RAM_CODE_MT7922_1.bin";
 /// ROM patch blob for MT7961.
