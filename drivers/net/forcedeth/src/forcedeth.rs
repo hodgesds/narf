@@ -715,7 +715,8 @@ impl ForcedethNic {
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
 
-        // Spawn pumps
+        // Spawn the device's only pump pair — probe spawns none, so the
+        // pair fed here is the pair whose halves occupy the ring slots.
         spawn_pumps(nic.clone(), rx_prod, tx_cons);
 
         Arc::try_unwrap(nic).map_err(|_| NicError::NoMemory)
@@ -1009,9 +1010,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
-    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
-
     // SAFETY: `bring_up` requires exclusive ownership of the device's
     // BAR/config windows for the duration of init. This is the probe
     // entry point for `device`/`cap`: nothing else has touched the BARs
@@ -1022,18 +1020,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-
-    {
-        // SAFETY: `nic` was just created above and no clone has been
-        // published yet (the `CONTROLLER` store and `spawn_pumps` happen
-        // later), so this is the unique `Arc` and forming a `&mut` to its
-        // contents cannot alias. We only assign the two IPC-ring fields,
-        // each guarded by its own lock.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let d = unsafe { &mut *(Arc::as_ptr(&nic) as *mut ForcedethNic) };
-        *d.rx_ipc_ring.lock() = Some(rx_cons);
-        *d.tx_ipc_ring.lock() = Some(tx_prod);
-    }
 
     *CONTROLLER.lock() = Some(nic.clone());
 
@@ -1049,8 +1035,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // name + carrier metadata via the shared helper. This wires the
     // LinkChg re-evaluation the bring-up comment deferred: the
     // datapath's interrupts are masked in this stage, so the polled
-    // RX pump below is the observer that republishes on a transition
-    // (issue #791). The frame-ring registration below stays.
+    // RX pump (spawned by `bring_up`) is the observer that republishes
+    // on a transition (issue #791). The frame-ring registration below
+    // stays.
     let name = crate::publish::publish_netdev(
         nic.mac,
         forcedeth_send_frame,
@@ -1067,8 +1054,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         let _ = narf_net::registry().register(&auth, ForcedethHwNic);
     }
 
-    // Spawn pumps
-    spawn_pumps(nic, rx_prod, tx_cons);
+    // No pump spawn here: `bring_up` spawned the device's single RX/TX
+    // pump pair, fed by the channel pair whose halves occupy the
+    // `rx_ipc_ring`/`tx_ipc_ring` slots (igc's discipline). A second
+    // pair spawned from probe would drain the same descriptor ring
+    // while its mirror sink's consumer is overwritten away — silently
+    // losing frames an attached ring consumer must see.
 
     Ok(())
 }

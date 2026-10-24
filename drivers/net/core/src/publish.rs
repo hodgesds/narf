@@ -183,7 +183,9 @@ pub fn deliver_rx(name: &str, frame: &mut [u8]) {
 /// moment in its own `rx_ring()`. Keyed by name because the singleton
 /// families' pumps hold no per-device mirror state of their own —
 /// only the published name. Attach is one-way (Stage-3 rings are
-/// never handed back), matching e1000's flag, which is never cleared.
+/// never handed back), matching e1000's flag, which is never cleared;
+/// [`clear_rx_mirror_attached`] exists for the future detach path
+/// (issue #789) and has no caller yet.
 static RX_MIRROR_ATTACHED: IrqSafeSpinLock<Vec<&'static str>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Record that a frame-ring consumer has attached to `name` (it took
@@ -204,6 +206,25 @@ pub fn note_rx_mirror_attached(name: &'static str) {
 /// pump-side query, mirroring e1000's `rx_mirror_enabled` load.
 pub fn rx_mirror_attached(name: &str) -> bool {
     RX_MIRROR_ATTACHED.lock().contains(&name)
+}
+
+/// Forget a previous [`note_rx_mirror_attached`] for `name`,
+/// disabling the ring mirror for that interface again.
+///
+/// No caller exists yet: attach is one-way today (no dual-published
+/// family has a detach/re-probe path), matching e1000's
+/// never-cleared flag. This operation exists for the detach work
+/// (issue #789), and a future detach path is obliged to call it:
+/// `eth%d` names are lowest-free-allocated and reused, so a device
+/// re-probed under a recycled name would otherwise inherit the
+/// stale note and mirror frames into its fresh ring before any
+/// consumer attaches — the eventual consumer would then inherit up
+/// to a ring's worth of stale frames. The clear has to live in
+/// this layer: `narf_net::iface::unregister` cannot call up into
+/// the driver-core layer that owns the registry, so the family-side
+/// detach path must call it alongside unregistering.
+pub fn clear_rx_mirror_attached(name: &str) {
+    RX_MIRROR_ATTACHED.lock().retain(|n| *n != name);
 }
 
 /// The RX fan-out every dual-published family's pump runs per frame —

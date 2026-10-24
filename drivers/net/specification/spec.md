@@ -62,7 +62,15 @@ attached (it took the interface's RX consumer in `rx_ring()`, recorded via
 dispatch is mirrored to the ring. The mirror is an observer's copy: it
 carries the raw hardware bytes regardless of the stack's verdict, a full
 ring drops the mirror rather than the stack's packet, and no copy is made
-while no consumer is attached.
+while no consumer is attached. Each device runs exactly one RX/TX pump
+pair, fed by the channel pair whose halves occupy the device's
+`rx_ipc_ring`/`tx_ipc_ring` slots; a second pair draining the same
+descriptor ring would mirror into a ring no consumer holds. Any future
+detach path for a dual-published family (issue #789) must call
+`publish::clear_rx_mirror_attached` for the interface's name when it
+unregisters the interface: `eth%d` names are lowest-free-allocated and
+reused, and a stale attach note would mirror frames into a re-probed
+device's fresh ring before any consumer attaches.
 
 Carrier is a live signal, not a probe-time photograph (issue #791). A family
 republishes its link sample on every transition it can observe, through the

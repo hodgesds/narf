@@ -643,7 +643,8 @@ impl Tg3Nic {
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
 
-        // Spawn pumps
+        // Spawn the device's only pump pair — probe spawns none, so the
+        // pair fed here is the pair whose halves occupy the ring slots.
         spawn_pumps(tg3.clone(), rx_prod, tx_cons);
 
         Arc::try_unwrap(tg3).map_err(|_| NicError::NoMemory)
@@ -1035,9 +1036,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
-    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
-
     // SAFETY: this probe path owns `device`/`cap` exclusively — no other
     // driver has bound this function yet (guarded by the `CONTROLLER` check
     // above) — so we hold the device's BAR + cfg windows for the duration of
@@ -1047,18 +1045,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-
-    {
-        // SAFETY: `dev` was just created and has not been cloned or published
-        // yet, so this `Arc` is the unique owner and `Arc::as_ptr` yields a
-        // pointer to a live, exclusively-owned `Tg3Nic`. The `&mut` borrow is
-        // confined to this block and only touches the lock-guarded IPC-ring
-        // fields, so no aliasing `&`/`&mut` exists concurrently.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Tg3Nic) };
-        *d.rx_ipc_ring.lock() = Some(rx_cons);
-        *d.tx_ipc_ring.lock() = Some(tx_prod);
-    }
 
     *CONTROLLER.lock() = Some(dev.clone());
 
@@ -1089,8 +1075,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         let _ = narf_net::registry().register(&auth, Tg3HwNic);
     }
 
-    // Spawn pumps
-    spawn_pumps(dev, rx_prod, tx_cons);
+    // No pump spawn here: `bring_up` spawned the device's single RX/TX
+    // pump pair, fed by the channel pair whose halves occupy the
+    // `rx_ipc_ring`/`tx_ipc_ring` slots (igc's discipline). A second
+    // pair spawned from probe would drain the same descriptor ring
+    // while its mirror sink's consumer is overwritten away — silently
+    // losing frames an attached ring consumer must see.
 
     Ok(())
 }

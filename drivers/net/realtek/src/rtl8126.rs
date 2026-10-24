@@ -849,6 +849,8 @@ impl Rtl8126Nic {
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
 
+        // Spawn the device's only pump pair — probe spawns none, so the
+        // pair fed here is the pair whose halves occupy the ring slots.
         spawn_pumps(nic.clone(), rx_prod, tx_cons);
 
         Arc::try_unwrap(nic).map_err(|_| NicError::NoMemory)
@@ -1108,25 +1110,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
-    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
-
     // SAFETY: caller-authority over the device.
     let dev = match unsafe { Rtl8126Nic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-
-    {
-        // SAFETY: `dev` was just created here and has not been published
-        // (CONTROLLER is set below, no clones exist yet), so its Arc
-        // refcount is 1 and this is the only reference — forming a unique
-        // `&mut Rtl8126Nic` from the as_ptr pointer does not alias.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Rtl8126Nic) };
-        *d.rx_ipc_ring.lock() = Some(rx_cons);
-        *d.tx_ipc_ring.lock() = Some(tx_prod);
-    }
 
     *CONTROLLER.lock() = Some(dev.clone());
 
@@ -1154,7 +1142,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         let _ = narf_net::registry().register(&auth, Rtl8126NicIface);
     }
 
-    spawn_pumps(dev, rx_prod, tx_cons);
+    // No pump spawn here: `bring_up` spawned the device's single RX/TX
+    // pump pair, fed by the channel pair whose halves occupy the
+    // `rx_ipc_ring`/`tx_ipc_ring` slots (igc's discipline). A second
+    // pair spawned from probe would drain the same descriptor ring
+    // while its mirror sink's consumer is overwritten away — silently
+    // losing frames an attached ring consumer must see.
 
     Ok(())
 }

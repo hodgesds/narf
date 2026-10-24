@@ -2036,7 +2036,8 @@ fn fixture_rx_handler(_name: &str, frame: &mut [u8]) {
 
 fn smoke_netdev_rx_dispatch_mirror_contract() -> TestResult {
     use crate::publish::{
-        dispatch_rx, note_rx_mirror_attached, publish_netdev, rx_mirror_attached, LinkSample,
+        clear_rx_mirror_attached, dispatch_rx, note_rx_mirror_attached, publish_netdev,
+        rx_mirror_attached, LinkSample,
     };
     use core::sync::atomic::Ordering;
 
@@ -2060,6 +2061,14 @@ fn smoke_netdev_rx_dispatch_mirror_contract() -> TestResult {
             "mirror attach registry did not record the note for that name only",
         );
     }
+    // The detach-side clear (issue #789's obligation) forgets the
+    // note for that name only; clearing an unnoted name is a no-op.
+    clear_rx_mirror_attached("eth-fixture-mirror");
+    clear_rx_mirror_attached("eth-fixture-never");
+    if rx_mirror_attached("eth-fixture-mirror") {
+        return TestResult::Fail("mirror attach registry did not forget the cleared name");
+    }
+    note_rx_mirror_attached("eth-fixture-mirror");
 
     narf_net::iface::install_rx_handler(fixture_rx_handler);
     FIXTURE_RX_CALLS.store(0, Ordering::SeqCst);
@@ -2102,9 +2111,11 @@ fn smoke_netdev_rx_dispatch_mirror_contract() -> TestResult {
     // Case 2 — ring consumer attached: the handler still sees the
     // frame exactly once, the mirror sink is called exactly once,
     // and the mirrored bytes are the PRISTINE pattern even though
-    // the handler rewrote (and, verdict-wise, consumed) its copy.
-    // That is e1000's documented mirror contract: the ring observes
-    // raw hardware frames; the stack's verdict does not reach it.
+    // the handler rewrote its copy in place. The `RxHandler` seam
+    // returns `()`, so no stack verdict is exercised at this seam;
+    // the contract pinned is e1000's — the mirror is allocated and
+    // sunk before `deliver_rx` runs, so the ring observes raw
+    // hardware frames whatever the stack does with its own copy.
     let Some(mut frame) = build(&pattern) else {
         return TestResult::Fail("fixture frame allocation failed (case 2)");
     };
@@ -2133,3 +2144,65 @@ fn smoke_netdev_rx_dispatch_mirror_contract() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/core", smoke_netdev_rx_dispatch_mirror_contract);
+
+// ── Single-pump construction invariant (issue #784) ───────────────
+//
+// The mirror contract above has a precondition no runtime fixture
+// in this tree can observe: exactly one RX pump drains a device's
+// descriptor ring, fed by the channel pair whose consumer the ring
+// consumer attaches to in `rx_ring()`. A second pump pair (the
+// pre-fix shape: `bring_up` spawned one pair, `probe` overwrote the
+// ring slots with another pair and spawned again) drains the same
+// ring but mirrors into the orphaned pair — the attached consumer
+// silently misses a scheduling-dependent subset of frames, and the
+// carrier observer runs twice. It cannot be caught at runtime
+// here: there is no MMIO device model for these families in-tree,
+// so `probe` never executes in a smoke, and the scheduler exposes
+// no per-driver task census a fixture could attribute pumps to.
+//
+// What can be pinned is the construction, for the representative
+// family (r8169; the other six formerly-double-spawning families —
+// ixgbe, rtl8125, rtl8126, tg3, atheros, forcedeth — share the
+// shape and are held to it by the same code discipline): the
+// driver source holds exactly one IPC channel pair creation and
+// exactly one `spawn_pumps` call, and the `probe` body creates
+// nothing and spawns nothing — the surviving pair is `bring_up`'s,
+// whose halves occupy the `rx_ipc_ring`/`tx_ipc_ring` slots.
+fn smoke_netdev_single_pump_construction_r8169() -> TestResult {
+    const SRC: &str = include_str!("../realtek/src/r8169.rs");
+
+    // One channel pair per device: one RX channel + one TX channel.
+    if SRC.matches("channel::<Frame").count() != 2 {
+        return TestResult::Fail(
+            "r8169 creates more (or fewer) than one IPC channel pair — duplicate-pump risk",
+        );
+    }
+    // One `spawn_pumps` definition + exactly one call site.
+    if SRC.matches("spawn_pumps(").count() != 2 {
+        return TestResult::Fail(
+            "r8169 has more (or fewer) than one spawn_pumps call site — duplicate-pump risk",
+        );
+    }
+    // The probe body — from `pub fn probe(` up to the `spawn_pumps`
+    // definition that follows it — must create no channels and
+    // spawn no pumps.
+    let Some(probe_start) = SRC.find("pub fn probe(") else {
+        return TestResult::Fail(
+            "r8169 probe not found — source layout changed, re-verify the single-pump invariant",
+        );
+    };
+    let Some(spawn_def) = SRC[probe_start..].find("\nfn spawn_pumps(") else {
+        return TestResult::Fail("r8169 spawn_pumps no longer follows probe — source layout changed, re-verify the single-pump invariant");
+    };
+    let probe_body = &SRC[probe_start..probe_start + spawn_def];
+    if probe_body.contains("channel::") || probe_body.contains("spawn_pumps(") {
+        return TestResult::Fail(
+            "r8169 probe creates channels or spawns pumps — a second pump pair would orphan the mirror sink",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/core",
+    smoke_netdev_single_pump_construction_r8169
+);
