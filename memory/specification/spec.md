@@ -1030,7 +1030,23 @@ impl AddressSpace {
     /// the VMA -> shared-owner lock-order proof explicitly.
     pub unsafe fn punch_fixed_locked_for_syscall_with_shared(/* ... */)
         -> Result<(), AddressSpaceError>;
+    /// Transaction-held truncate zap for a SHARED range: retire the
+    /// window's resident leaves and release their frames (shared-owner
+    /// release hook after one cross-CPU invalidation, as in the punch) but
+    /// keep every overlapping region — base, len, perms, backing
+    /// descriptor, guard markers, page tables — so a file that grows again
+    /// faults the range back in place (Linux `unmap_mapping_range`). The
+    /// outcome distinguishes retention from the fallback to full range
+    /// removal (windows intersecting swap-backed pages or a huge leaf),
+    /// so upper file-owner tables mirror exactly what memory did.
+    pub unsafe fn zap_mapping_range_locked_for_syscall_with_shared(/* ... */)
+        -> Result<ZapOutcome, AddressSpaceError>;
 }
+
+/// How a truncate zap disposed of its window; upper owner tables mirror
+/// the two outcomes differently (row kept, window backing forgotten vs.
+/// row retired like a punch).
+pub enum ZapOutcome { Retained, RangeRemoved }
 
 /// Clear a contiguous x86_64 leaf range under one per-root mutation-lock hold;
 /// each present leaf still receives a local INVLPG and the caller performs the
@@ -1377,9 +1393,9 @@ x86_64 is rejected at runtime.
   concurrent last-owner decrement may conservatively leave a leaf read-only;
   a sole-owner frame cannot become newly shared without that same region
   transaction, so the snapshot cannot incorrectly grant WRITE to shared
-  backing. Region teardown, MAP_FIXED punching, and MADV_DONTNEED retire leaves
-  and complete the required TLB flush before dropping backing owners through
-  the allocator's batch interface.
+  backing. Region teardown, MAP_FIXED punching, the truncate zap, and
+  MADV_DONTNEED retire leaves and complete the required TLB flush before
+  dropping backing owners through the allocator's batch interface.
   The bounded MAX_CPUS demand-fault claim table is separately preallocated so
   faults through the common table remain allocation-free without embedding a
   KiB-scale array in every by-value `AddressSpace` temporary. Construction

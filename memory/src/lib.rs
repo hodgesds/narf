@@ -83,7 +83,7 @@ pub use address_space::{
     with_shared_mapping_transaction, AddressSpace, AddressSpaceError, BrkUpdateResult,
     FileFaultError, FixedRelocationError, FutureLockPolicy, HugeRegion, MappingReceipt,
     MremapLimits, NumaRegionSnapshot, Region, RegionPerms, RemoteAccess, RemoteBuf,
-    SharedMremapMode, StackGrowthLimits,
+    SharedMremapMode, StackGrowthLimits, ZapOutcome,
 };
 pub use memtype::{ram_alias_refusals, MemoryType};
 

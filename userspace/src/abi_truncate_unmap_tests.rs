@@ -15,14 +15,16 @@
 //! Scenario per filesystem:
 //!
 //!   1. map 3 pages `MAP_SHARED`, fault all three in;
-//!   2. `ftruncate` to the middle of page 1: page 2 must be unmapped and
-//!      a fresh fault of it must be refused, while page 1 (straddling
-//!      the new EOF) stays mapped;
-//!   3. `ftruncate` back up: the revoked tail stays unmapped (the
-//!      in-tree revoke removes the VMA, as it does for ext2); a fresh
-//!      mapping faults the truncated range in as a hole where the
+//!   2. `ftruncate` to the middle of page 1: page 2's frame must be
+//!      revoked and a fresh fault of it must be refused, while page 1
+//!      (straddling the new EOF) stays mapped;
+//!   3. `ftruncate` back up: the zapped tail faults back in through the
+//!      SAME mapping — the truncate zap keeps the VMA (#691), where the
+//!      #678-era revoke removed it outright — as a hole where the
 //!      filesystem materialises holes (tmpfs), and after a rewrite the
-//!      range serves the new bytes — never the pre-truncate content.
+//!      range serves the new bytes, never the pre-truncate content. A
+//!      second shrink/grow cycle repeats the zap, and a `MAP_FIXED`
+//!      mapping over the zapped window replaces the retained tail.
 
 use alloc::sync::Arc;
 
@@ -36,6 +38,7 @@ use crate::abi_test_support::*;
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const MAP_SHARED: u64 = 1;
+const MAP_FIXED: u64 = 0x10;
 const O_RDWR: u32 = 2;
 const PAGE: u64 = 4096;
 
@@ -113,6 +116,28 @@ fn map_shared(fd: u64, len: u64) -> Result<u64, &'static str> {
     }
 }
 
+/// `mmap(addr, len, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, fd, offset)`.
+fn map_fixed_shared(fd: u64, addr: u64, len: u64, offset: u64) -> Result<u64, &'static str> {
+    let args = SyscallArgs {
+        arg0: addr,
+        arg1: len,
+        arg2: PROT_READ | PROT_WRITE,
+        arg3: MAP_SHARED | MAP_FIXED,
+        arg4: fd,
+        arg5: offset,
+    };
+    match call(Syscall::Mmap.raw(), args) {
+        Some(placed) if placed > 0 => Ok(placed as u64),
+        _ => Err("MAP_FIXED mmap failed"),
+    }
+}
+
+/// Whether a region still covers `va` — the retention half of the zap
+/// contract (the #678-era revoke removed the tail region outright).
+fn region_present(aspace: &AddressSpace, va: u64) -> bool {
+    aspace.lookup(VirtAddr::new(va)).is_some()
+}
+
 /// The frame currently backing `va` (0 / `None` = unbacked).
 fn mapped_frame(aspace: &AddressSpace, va: u64) -> Option<u64> {
     let region = aspace.lookup(VirtAddr::new(va))?;
@@ -175,8 +200,9 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
     const NEW_LEN: u64 = PAGE + 904;
     ftruncate(fx.fd, NEW_LEN)?;
 
-    // The page wholly past the new EOF is unmapped, and re-faulting it
-    // is refused (the SIGBUS case) rather than served stale bytes.
+    // The page wholly past the new EOF is zapped — its frame retired
+    // while its VMA stays — and re-faulting it is refused (the SIGBUS
+    // case) rather than served stale bytes.
     if mapped_frame(&fx.aspace, base + 2 * PAGE).is_some() {
         return Err("a page wholly past the new EOF is still mapped after truncate");
     }
@@ -196,29 +222,33 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
         return Err("truncate damaged bytes before the new EOF");
     }
 
-    // Re-extending must not resurrect the truncated bytes. Note the
-    // in-tree primitive's semantics (shared with ext2): the truncate
-    // revoke removes the tail VMA outright, so the range stays unmapped
-    // until it is mapped again — it does not fault back in place.
+    // Re-extending must not resurrect the truncated bytes — but the
+    // truncate zap (#691) keeps the tail VMA, where the #678-era revoke
+    // removed it outright: the region is still there, still unbacked
+    // (growing a file faults nothing in), and the SAME mapping faults
+    // the range back in place, exactly like Linux.
     ftruncate(fx.fd, 3 * PAGE)?;
-    if mapped_frame(&fx.aspace, base + 2 * PAGE).is_some() {
-        return Err("re-extending the file remapped the revoked tail");
+    if !region_present(&fx.aspace, base + 2 * PAGE) {
+        return Err("truncate destroyed the tail VMA instead of zapping it");
     }
-    let base2 = map_shared(fx.fd, 3 * PAGE)?;
+    if mapped_frame(&fx.aspace, base + 2 * PAGE).is_some() {
+        return Err("re-extending the file remapped the zapped tail");
+    }
     if fx.hole_fault_zero {
         // A filesystem whose fault path materialises holes serves the
-        // truncated range as zeros, never as the pre-truncate bytes.
-        fault(&fx.aspace, base2 + 2 * PAGE)?;
-        let regrown = mapped_bytes(&fx.aspace, base2 + 2 * PAGE, PAGE as usize)?;
+        // truncated range as zeros through the original mapping, never
+        // as the pre-truncate bytes.
+        fault(&fx.aspace, base + 2 * PAGE)?;
+        let regrown = mapped_bytes(&fx.aspace, base + 2 * PAGE, PAGE as usize)?;
         if regrown.iter().any(|&b| b != 0) {
             return Err("re-extending the file resurrected stale bytes in the truncated range");
         }
     }
     // Rewrite the truncated range with new bytes through `pwrite64`;
-    // a fresh fault must serve those, never the pre-truncate content.
-    // The write goes through the syscall surface on purpose: write(2)
-    // coherence for generic-fallback filesystems lives in the
-    // handler's `note_file_written` fold (#688), so a raw
+    // a fault through the original mapping must serve those, never the
+    // pre-truncate content. The write goes through the syscall surface
+    // on purpose: write(2) coherence for generic-fallback filesystems
+    // lives in the handler's `note_file_written` fold (#688), so a raw
     // `FileOps::write` here would model a sequence no user program can
     // produce — one whose bytes reach the disk but never the retained
     // cache frame (#724).
@@ -235,13 +265,66 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
         Some(n) if n == PAGE as i64 => {}
         _ => return Err("rewrite of the truncated range failed or was short"),
     }
-    fault(&fx.aspace, base2 + 2 * PAGE)?;
-    if mapped_bytes(&fx.aspace, base2 + 2 * PAGE, PAGE as usize)? != new_bytes {
+    fault(&fx.aspace, base + 2 * PAGE)?;
+    if mapped_bytes(&fx.aspace, base + 2 * PAGE, PAGE as usize)? != new_bytes {
         return Err("the rewritten range does not serve the new bytes");
     }
-    fault(&fx.aspace, base2)?;
-    if mapped_bytes(&fx.aspace, base2, 32)? != bytes[..32] {
+    if mapped_bytes(&fx.aspace, base, 32)? != bytes[..32] {
         return Err("truncate damaged the file's surviving head bytes");
+    }
+
+    // A second shrink -> grow cycle over the same mapping: the zap is
+    // repeatable, and the range the rewrite populated is discarded by
+    // the second shrink (those bytes were the file's tail again), so
+    // the second regrow faults zeros back in — in place, no fresh mmap.
+    ftruncate(fx.fd, NEW_LEN)?;
+    if mapped_frame(&fx.aspace, base + 2 * PAGE).is_some() {
+        return Err("the second shrink left the tail mapped");
+    }
+    // SAFETY: live user root, paging enabled.
+    if unsafe { fx.aspace.demand_alloc_page(VirtAddr::new(base + 2 * PAGE)) }.is_ok() {
+        return Err("a fault past the second shrink's EOF was served instead of raising SIGBUS");
+    }
+    ftruncate(fx.fd, 3 * PAGE)?;
+    if !region_present(&fx.aspace, base + 2 * PAGE) {
+        return Err("the second truncate destroyed the tail VMA");
+    }
+    if fx.hole_fault_zero {
+        fault(&fx.aspace, base + 2 * PAGE)?;
+        let regrown = mapped_bytes(&fx.aspace, base + 2 * PAGE, PAGE as usize)?;
+        if regrown.iter().any(|&b| b != 0) {
+            return Err("the second regrow resurrected bytes the second shrink discarded");
+        }
+    }
+
+    // MAP_FIXED over the zapped window: the fixed-remap machinery keeps
+    // its range-removing semantics over a retained region — the new
+    // mapping lands exactly on the window and serves the file's current
+    // bytes there. The range is materialised with a write first, as on
+    // the first pass, so both filesystem fixtures read real content.
+    let fixed_bytes = alloc::vec![0x5Au8; PAGE as usize];
+    let args = SyscallArgs {
+        arg0: fx.fd,
+        arg1: fixed_bytes.as_ptr() as u64,
+        arg2: PAGE,
+        arg3: 2 * PAGE,
+        arg4: 0,
+        arg5: 0,
+    };
+    match call(Syscall::Pwrite64.raw(), args) {
+        Some(n) if n == PAGE as i64 => {}
+        _ => return Err("rewrite before the MAP_FIXED case failed or was short"),
+    }
+    let fixed = map_fixed_shared(fx.fd, base + 2 * PAGE, PAGE, 2 * PAGE)?;
+    if fixed != base + 2 * PAGE {
+        return Err("MAP_FIXED did not land on the zapped window");
+    }
+    fault(&fx.aspace, fixed)?;
+    if mapped_bytes(&fx.aspace, fixed, PAGE as usize)? != fixed_bytes {
+        return Err("the MAP_FIXED replacement does not serve the file's current bytes");
+    }
+    if mapped_bytes(&fx.aspace, base, 32)? != bytes[..32] {
+        return Err("MAP_FIXED over the zapped window damaged the surviving head");
     }
     Ok(())
 }

@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use narf_filesystem::{FileOps, FsError, FsFuture, MmapLifetime, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::{AddressSpaceError, FileFaultError, MappingReceipt, PhysAddr};
+use narf_memory::{AddressSpaceError, FileFaultError, MappingReceipt, PhysAddr, ZapOutcome};
 
 const ANON_SHARED_INLINE_PAGES: usize = 4;
 
@@ -910,6 +910,71 @@ pub(crate) fn publish_current_punch(
     let result = publish();
     if result.is_ok() {
         commit_prepared_punch_locked(&mut owners, base, len, suffixes);
+    }
+    result
+}
+
+/// Drop only the window's recorded writeback frames from every overlapping
+/// owner row, keeping each row's base, length and file offset — the owner
+/// mirror of a memory-side zap that retained the VMA. Zeroing is the
+/// "no fallback frame here" state every writeback consumer already
+/// honours (flush skips zero entries; a later fault re-publishes the slot
+/// through the ordinary demand path), so the row stays truthful about the
+/// surviving mapping while forgetting the frames the zap just released.
+/// Without this, msync would write back through a retired folio's frame
+/// and a re-fault could adopt it as the mapping's backing again.
+fn zap_owner_rows_locked(owners: &mut [MappingOwner], base: u64, len: u64) {
+    let Some(end) = base.checked_add(len) else {
+        return;
+    };
+    for mapping in owners.iter_mut() {
+        let Some(mapping_end) = mapping.base.checked_add(mapping.len) else {
+            continue;
+        };
+        if mapping_end <= base || mapping.base >= end {
+            continue;
+        }
+        let Some(writeback) = mapping.writeback.as_mut() else {
+            continue;
+        };
+        let first = ((base.max(mapping.base) - mapping.base) / 4096) as usize;
+        let last =
+            (((end.min(mapping_end) - mapping.base) / 4096) as usize).min(writeback.phys.len());
+        for slot in writeback.phys.iter_mut().take(last).skip(first) {
+            *slot = PhysAddr::new(0);
+        }
+    }
+}
+
+/// Publish a transaction-held truncate zap and mirror its outcome in the
+/// file-owner rows before the caller releases the VMA transaction.
+///
+/// The memory zap reports which of its two shapes ran, because the owner
+/// mirror differs: [`ZapOutcome::Retained`] keeps every row and drops only
+/// the window's writeback entries ([`zap_owner_rows_locked`]);
+/// [`ZapOutcome::RangeRemoved`] (the swap/huge fallback to the full punch)
+/// retires rows exactly like [`publish_current_punch`]. The removal shape
+/// needs its split suffixes prepared before memory becomes destructive —
+/// the retention shape needs no allocation at all — so, like the punch,
+/// preparation happens up front and the commit follows the outcome.
+pub(crate) fn publish_current_zap(
+    address_space_id: u64,
+    base: u64,
+    len: u64,
+    publish: impl FnOnce() -> Result<ZapOutcome, AddressSpaceError>,
+) -> Result<ZapOutcome, AddressSpaceError> {
+    let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
+        return publish();
+    };
+    let mut owners = owner_bucket.lock();
+    let suffixes = prepare_punch_locked(&mut owners, base, len, 0)?;
+    let result = publish();
+    match &result {
+        Ok(ZapOutcome::Retained) => zap_owner_rows_locked(&mut owners, base, len),
+        Ok(ZapOutcome::RangeRemoved) => {
+            commit_prepared_punch_locked(&mut owners, base, len, suffixes)
+        }
+        Err(_) => {}
     }
     result
 }
@@ -2366,10 +2431,14 @@ pub(crate) fn flush_current_range(base: u64, len: u64) -> Result<(), ()> {
     Ok(())
 }
 
-/// Linux `unmap_mapping_range` for a shrinking direct-mapped file. Remove the
-/// page-aligned suffix of every VMA whose file offsets are wholly beyond the
-/// new EOF. This runs before the filesystem removes cache folios, balancing
-/// their external mapping holds while the frames are still owned.
+/// Linux `unmap_mapping_range` for a shrinking direct-mapped file. Zap the
+/// page-aligned suffix of every VMA whose file offsets are wholly beyond
+/// the new EOF — frames retired, VMAs kept, so a later grow lets the same
+/// mapping fault the range back in (#691). Windows the memory zap cannot
+/// retain (swap-backed, huge) fall back to full removal inside the zap
+/// itself and are mirrored as punches in the owner rows. This runs before
+/// the filesystem removes cache folios, balancing their external mapping
+/// holds while the frames are still owned.
 pub fn truncate_file_mappings(
     file: &dyn FileOps,
     new_len: u64,
@@ -2394,7 +2463,7 @@ pub fn truncate_file_mappings(
             narf_memory::with_address_space_shared_mapping_transaction(id, || {
                 // Snapshot only after both transactions are held. Otherwise a
                 // concurrent unmap/remap could replace one of these virtual
-                // ranges between the identity check and the punch, and a file
+                // ranges between the identity check and the zap, and a file
                 // truncation would tear down the unrelated replacement VMA.
                 let ranges: Vec<(u64, u64)> = owner_bucket
                     .lock()
@@ -2412,11 +2481,15 @@ pub fn truncate_file_mappings(
                     })
                     .collect();
                 for (base, len) in ranges {
-                    publish_current_punch(id, base, len, || {
+                    // The outcome is consumed by the owner mirror inside
+                    // `publish_current_zap`; the truncate itself succeeds
+                    // either way (retained-and-zapped, or removed by the
+                    // zap's fallback punch).
+                    let _ = publish_current_zap(id, base, len, || {
                         // SAFETY: the enclosing closures hold this address
                         // space's VMA and shared-owner transactions in order.
                         unsafe {
-                            address_space.punch_fixed_locked_for_syscall_with_shared(
+                            address_space.zap_mapping_range_locked_for_syscall_with_shared(
                                 narf_memory::VirtAddr::new(base),
                                 len,
                                 true,
@@ -2851,6 +2924,91 @@ mod tests {
         "userspace",
         smoke_mapped_file_fixed_remap_mirrors_target_outcome
     );
+
+    fn smoke_mapped_file_zap_mirrors_all_outcomes() -> TestResult {
+        const ADDRESS_SPACE: u64 = u64::MAX - 21;
+        const BASE: u64 = 0x1_0000;
+        drop_address_space(ADDRESS_SPACE);
+        let owner: Arc<dyn FileOps> = Arc::new(FixedRemapOwner);
+        register(
+            ADDRESS_SPACE,
+            BASE,
+            0x3000,
+            0,
+            Arc::clone(&owner),
+            None,
+            Some(FileWriteback {
+                offset: 0,
+                phys: alloc::vec![
+                    PhysAddr::new(0x11_000),
+                    PhysAddr::new(0x12_000),
+                    PhysAddr::new(0x13_000),
+                ],
+            }),
+        );
+        let snapshot = || {
+            existing_mapping_owners(ADDRESS_SPACE).map(|bucket| {
+                bucket
+                    .lock()
+                    .iter()
+                    .map(|mapping| {
+                        (
+                            mapping.base,
+                            mapping.len,
+                            mapping
+                                .writeback
+                                .as_ref()
+                                .map(|writeback| writeback.phys.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        // Retained: the row survives whole; only the window's recorded
+        // writeback frame is forgotten.
+        let retained = publish_current_zap(ADDRESS_SPACE, BASE + 0x1000, 0x1000, || {
+            Ok(ZapOutcome::Retained)
+        });
+        // Failure: owner rows must not move at all.
+        let failed = publish_current_zap(ADDRESS_SPACE, BASE, 0x1000, || {
+            Err(AddressSpaceError::AllocationFailed)
+        });
+        let after_retained = snapshot();
+        // RangeRemoved (the memory fallback to a full punch): rows retire
+        // exactly like a punch — the window tail goes away and the
+        // surviving prefix keeps its (already zapped) frame list.
+        let removed = publish_current_zap(ADDRESS_SPACE, BASE + 0x2000, 0x1000, || {
+            Ok(ZapOutcome::RangeRemoved)
+        });
+        let after_removed = snapshot();
+        drop_address_space(ADDRESS_SPACE);
+        if retained != Ok(ZapOutcome::Retained)
+            || failed != Err(AddressSpaceError::AllocationFailed)
+            || removed != Ok(ZapOutcome::RangeRemoved)
+            || after_retained
+                != Some(alloc::vec![(
+                    BASE,
+                    0x3000,
+                    Some(alloc::vec![
+                        PhysAddr::new(0x11_000),
+                        PhysAddr::new(0),
+                        PhysAddr::new(0x13_000),
+                    ]),
+                )])
+            || after_removed
+                != Some(alloc::vec![(
+                    BASE,
+                    0x2000,
+                    Some(alloc::vec![PhysAddr::new(0x11_000), PhysAddr::new(0)]),
+                )])
+        {
+            return TestResult::Fail("truncate zap owner mirror diverged from the memory outcome");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!("userspace", smoke_mapped_file_zap_mirrors_all_outcomes);
 
     fn smoke_mapped_file_shared_relocation_mirrors_all_outcomes() -> TestResult {
         const ADDRESS_SPACE: u64 = u64::MAX - 16;
