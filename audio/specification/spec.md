@@ -166,9 +166,13 @@ glitchless bank switching mid-stream is out of scope.
 
 `acp63_sdw::probe`, `register_pci_driver`, `is_probed`, `capture_card`
 bind the ACP 6.3 function's SDW0 manager for pin configurations without
-PDM (the PDM probe declines those and probe fall-through reaches this
-driver; configurations where PDM and SoundWire coexist stay with the
-PDM binding). Probe powers the ACP up, initialises the manager (enable,
+PDM (the PDM probe declines those, and this driver is the next candidate
+for the function — but note the dispatcher dependency: `probe_all` as
+of this writing attempts only the single best match per device, so
+this binding is inert until the candidate-walking dispatcher (PR #852)
+is on main; required merge order is #852 before this binding.
+Configurations where PDM and SoundWire coexist stay with the PDM
+binding). Probe powers the ACP up, initialises the manager (enable,
 bus reset, 50×10 frame shape, interrupt masks), enumerates, and
 publishes one sound card per enumerated codec through the registry,
 using the generic codec profile (DP1 sink + DP1 source, stereo S16LE

@@ -511,6 +511,7 @@ impl<T: Transport + 'static> PcmDevice for CodecCard<T> {
             claim,
             port: self.port_for(direction).unwrap().port,
             params: None,
+            prepared: false,
             enabled: false,
         }))
     }
@@ -530,6 +531,7 @@ struct SdwPcm<T: Transport> {
     claim: Arc<IrqSafeSpinLock<bool>>,
     port: u8,
     params: Option<HwParams>,
+    prepared: bool,
     enabled: bool,
 }
 
@@ -548,11 +550,14 @@ impl<T: Transport> SdwPcm<T> {
 
 impl<T: Transport> PcmHardware for SdwPcm<T> {
     fn configure(&mut self, params: HwParams) -> Result<(), SoundError> {
+        // The card advertises a fixed contract (see `capabilities`):
+        // exactly the default period geometry. Reject anything the
+        // advertised capabilities deny, as acp63 does.
         if params.format != SampleFormat::S16LE
             || params.rate != SampleRate::R48000
             || params.channels != ChannelCount::Stereo
             || params.periods != 4
-            || !(512..=1024).contains(&params.period_size)
+            || params.period_size != 1024
         {
             return Err(SoundError::InvalidParams);
         }
@@ -560,6 +565,9 @@ impl<T: Transport> PcmHardware for SdwPcm<T> {
             return Err(SoundError::BadState);
         }
         self.params = Some(params);
+        // A fresh configuration invalidates any earlier prepare, the
+        // same way acp63's configure builds a fresh (unprepared) ring.
+        self.prepared = false;
         Ok(())
     }
     fn prepare(&mut self) -> Result<(), SoundError> {
@@ -572,10 +580,25 @@ impl<T: Transport> PcmHardware for SdwPcm<T> {
         }
         let config = self.card.stream;
         let mask = self.ch_mask();
-        self.bus_op(|bus| bus.port_prepare(self.card.dev_num, self.port, mask, config))
+        let result =
+            self.bus_op(|bus| bus.port_prepare(self.card.dev_num, self.port, mask, config));
+        if result.is_err() {
+            // `Bus::port_prepare`'s contract: a failed prepare leaves
+            // the port unprepared-or-unknown and it must be deprepared
+            // before reuse. Do that here so an in-lease retry starts
+            // from a known state.
+            let _ = self.bus_op(|bus| bus.port_deprepare(self.card.dev_num, self.port));
+            self.prepared = false;
+            return result;
+        }
+        self.prepared = true;
+        Ok(())
     }
     fn start(&mut self) -> Result<(), SoundError> {
-        if self.params.is_none() {
+        // Mirror acp63: start requires a prepared, not-yet-running
+        // stream. Configure alone never programs the port's transport
+        // parameters, so configure→start must not enable a channel.
+        if self.params.is_none() || !self.prepared || self.enabled {
             return Err(SoundError::BadState);
         }
         let mask = self.ch_mask();

@@ -1,8 +1,10 @@
 //! AMD ACP 6.3 SoundWire binding: the ACP's SDW manager instances,
 //! bound for the SoundWire configurations of 1022:15e2 rev 0x63 that
 //! [`crate::acp63`] leaves unbound (its probe requires the PDM mux;
-//! SoundWire-only pin configurations decline there and fall through to
-//! this driver).
+//! SoundWire-only pin configurations decline there and this driver is
+//! the next candidate — reachable once the candidate-walking probe
+//! dispatcher, PR #852, is on main; until then this binding is
+//! registered but inert, see audio spec §3.2).
 //!
 //! The manager register model and the immediate-command framing are
 //! the ACP SDW manager's, as in Linux `drivers/soundwire/amd_manager.c`
@@ -355,16 +357,23 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         return Err(ProbeError::NotForThisDriver);
     }
     let transport = AcpSdwTransport::new(mmio);
-    transport
-        .init_manager()
-        .map_err(|_| ProbeError::BadDevice)?;
+    if transport.init_manager().is_err() {
+        // Leave no powered-but-dead manager behind, mirroring the
+        // empty-enumeration path below (disable waits are ignored,
+        // so this is safe on a stuck manager).
+        transport.disable_manager();
+        return Err(ProbeError::BadDevice);
+    }
     let mut bus = Bus::new(transport);
     let enumerated = match bus.enumerate() {
         Ok(found) => found
             .iter()
             .map(|peripheral| peripheral.dev_num)
             .collect::<Vec<u8>>(),
-        Err(_) => return Err(ProbeError::BadDevice),
+        Err(_) => {
+            bus.transport().disable_manager();
+            return Err(ProbeError::BadDevice);
+        }
     };
     if enumerated.is_empty() {
         // Fail closed: no codec answered, publish nothing.

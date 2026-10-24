@@ -535,8 +535,10 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     // ACP 6.3 SoundWire for the pin configurations the PDM probe
-    // declines; registered after it so probe fall-through lets the
-    // PDM driver refuse first.
+    // declines; registered after it. Note: probe_all currently
+    // attempts only the single best match, so this binding stays
+    // inert until the candidate-walking dispatcher (PR #852) merges —
+    // merge order: #852 first (see audio spec §3.2).
     narf_init::register(Stage::Subsys, "acp63-sdw-pci", || {
         acp63_sdw::register_pci_driver();
         InitResult::Ok
