@@ -3488,6 +3488,66 @@ kernel_test_in!(
     smoke_btrfs_mmap_cache_generation_tracks_mutations
 );
 
+/// The rename-replace half of the btrfs generation contract (#742):
+/// when a rename destroys the destination inode, the generation of
+/// the destroyed file must move for a node that still holds it open —
+/// the #718 bump enumeration lists "a rename whose destination is
+/// destroyed" alongside `unlink`, but the main smoke never exercises
+/// it. (The renamed file itself keeps its inode and its generation:
+/// same file, new name.)
+fn smoke_btrfs_mmap_cache_generation_moves_on_rename_replace() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let root = vol.root();
+
+    let dst = match poll_once(root.create("ren-dst.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create ren-dst.dat failed"),
+    };
+    if !matches!(poll_once(dst.write(0, b"old")), Some(Ok(3))) {
+        return TestResult::Fail("write ren-dst.dat failed");
+    }
+    let dg = match dst.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("destination reports no cache generation"),
+    };
+    let src = match poll_once(root.create("ren-src.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create ren-src.dat failed"),
+    };
+    if !matches!(poll_once(src.write(0, b"new")), Some(Ok(3))) {
+        return TestResult::Fail("write ren-src.dat failed");
+    }
+    let sg = match src.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("source reports no cache generation"),
+    };
+    if !matches!(
+        poll_once(root.rename("ren-src.dat", "ren-dst.dat")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("rename-replace failed");
+    }
+    match dst.mmap_cache_generation() {
+        Some(g) if g != dg => {}
+        Some(_) => {
+            return TestResult::Fail("rename-replace did not move the destroyed file's generation")
+        }
+        None => return TestResult::Fail("generation vanished after rename-replace"),
+    }
+    if src.mmap_cache_generation() != Some(sg) {
+        return TestResult::Fail("the renamed file's generation moved across its own rename");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_mmap_cache_generation_moves_on_rename_replace
+);
+
 fn smoke_btrfs_write_rejections() -> TestResult {
     use narf_filesystem::{FsError, FsInstance};
     let vol = match mount_fixture() {
