@@ -3361,7 +3361,7 @@ fn build_execve_elf(declared_pages: u64, present_pages: usize) -> alloc::vec::Ve
 /// Stage `elf` in a fresh MemFs mount and execve its path through the
 /// real handler, returning the syscall's raw return value.
 #[cfg(target_arch = "x86_64")]
-fn execve_staged(mount_point: &str, elf: &[u8]) -> Option<crate::syscall::SyscallReturn> {
+fn execve_staged(mount_point: &'static str, elf: &[u8]) -> Option<crate::syscall::SyscallReturn> {
     use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
     let auth = bootstrap_mount_authority();
     let mount = registry()
