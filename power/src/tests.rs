@@ -3107,3 +3107,261 @@ kernel_test_in!(
     "power/shutdown",
     smoke_power_button_reports_key_power_or_falls_back
 );
+
+// ── Power service (event → policy → action) ─────────────────────────
+
+fn service_test_battery(
+    critical: bool,
+) -> (
+    narf_acpi::battery::BatteryInfo,
+    narf_acpi::battery::BatteryState,
+) {
+    use narf_acpi::battery::{BatteryInfo, BatteryState, BatteryStatus, BatteryTech, PowerUnit};
+    let mut bits = BatteryStatus::DISCHARGING;
+    if critical {
+        bits |= BatteryStatus::CRITICAL;
+    }
+    (
+        BatteryInfo {
+            power_unit: PowerUnit::MilliWatt,
+            design_capacity: 100,
+            last_full_capacity: 100,
+            technology: BatteryTech::Secondary,
+            design_voltage_mv: 12_000,
+            design_capacity_warning: 10,
+            design_capacity_low: 5,
+            model_number: alloc::string::String::from("TEST"),
+            serial_number: alloc::string::String::from("1"),
+            battery_type: alloc::string::String::from("Li-ion"),
+            oem_info: alloc::string::String::from("narf"),
+        },
+        BatteryState {
+            status: BatteryStatus(bits),
+            present_rate: 1_000,
+            remaining_capacity: 50,
+            present_voltage_mv: 12_000,
+        },
+    )
+}
+
+fn smoke_power_service_lid_close_requests_suspend() -> TestResult {
+    use crate::bootstrap_power_authority;
+    use crate::service::{self, PowerAction, PowerPolicy};
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    #[derive(Debug, Default)]
+    struct Recorder(IrqSafeSpinLock<Vec<PowerAction>>);
+    impl service::ActionExecutor for Recorder {
+        fn execute(&self, action: PowerAction) {
+            self.0.lock().push(action);
+        }
+    }
+
+    service::__reset_for_test();
+    let cap = bootstrap_power_authority();
+    let recorder = Arc::new(Recorder::default());
+    if service::install_action_executor(&cap, recorder.clone()).is_err() {
+        return TestResult::Fail("install_action_executor rejected the bootstrap cap");
+    }
+
+    // No executor action until a pump; intake only queues.
+    service::on_lid_changed(true);
+    if service::pending_actions() != 1 {
+        // 1 = the Suspend bit of the pending-action mask.
+        return TestResult::Fail("lid close did not queue a suspend request");
+    }
+    if service::pump_pending() != 1 {
+        return TestResult::Fail("pump did not execute exactly one action");
+    }
+    {
+        let got = recorder.0.lock();
+        if got.as_slice() != [PowerAction::Suspend] {
+            return TestResult::Fail("executor did not receive exactly [Suspend]");
+        }
+    }
+    if service::pump_pending() != 0 {
+        return TestResult::Fail("second pump executed a phantom action");
+    }
+
+    // Lid open requests nothing.
+    service::on_lid_changed(false);
+    if service::pending_actions() != 0 {
+        return TestResult::Fail("lid open queued an action");
+    }
+
+    // Policy off: lid close is counted but requests nothing.
+    let mut off = PowerPolicy::default();
+    off.suspend_on_lid_close = false;
+    if service::set_policy(&cap, off).is_err() {
+        return TestResult::Fail("set_policy rejected the bootstrap cap");
+    }
+    service::on_lid_changed(true);
+    if service::pending_actions() != 0 {
+        return TestResult::Fail("lid close queued a suspend with the policy off");
+    }
+    let stats = service::stats();
+    if stats.lid_closes != 2 || stats.lid_opens != 1 || stats.suspend_requests != 1 {
+        return TestResult::Fail("service stats do not match the event sequence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/service",
+    smoke_power_service_lid_close_requests_suspend
+);
+
+fn smoke_power_service_buttons_policy() -> TestResult {
+    use crate::bootstrap_power_authority;
+    use crate::service::{self, ButtonAction, PowerPolicy};
+
+    service::__reset_for_test();
+    let cap = bootstrap_power_authority();
+
+    // Sleep button: default policy requests suspend (queued; with no
+    // executor installed the request stays pending, never dropped).
+    service::on_sleep_button_press();
+    if service::pending_actions() == 0 {
+        return TestResult::Fail("sleep button did not queue an action");
+    }
+    if service::pump_pending() != 0 {
+        return TestResult::Fail("pump executed without an executor installed");
+    }
+    if service::pending_actions() == 0 {
+        return TestResult::Fail("queued request was dropped without an executor");
+    }
+
+    // Power button: default policy requests nothing (crate::button's
+    // KEY_POWER / orderly path owns it) but the press is counted.
+    service::__reset_for_test();
+    service::on_power_button_press();
+    if service::pending_actions() != 0 {
+        return TestResult::Fail("power button queued an action under the default policy");
+    }
+    if service::stats().power_presses != 1 {
+        return TestResult::Fail("power press was not counted");
+    }
+
+    // Re-policied power button: press requests power-off.
+    let mut policy = PowerPolicy::default();
+    policy.power_button = ButtonAction::PowerOff;
+    if service::set_policy(&cap, policy).is_err() {
+        return TestResult::Fail("set_policy rejected the bootstrap cap");
+    }
+    service::on_power_button_press();
+    if service::pending_actions() == 0 || service::stats().poweroff_requests != 1 {
+        return TestResult::Fail("re-policied power button did not queue a power-off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/service", smoke_power_service_buttons_policy);
+
+fn smoke_power_service_snapshot_fusion_and_drain() -> TestResult {
+    use crate::bootstrap_power_authority;
+    use crate::service::{self, StateProviders};
+    use alloc::sync::Arc;
+    use narf_acpi::ac_adapter::AcAdapterState;
+    use narf_acpi::lid::LidState;
+
+    service::__reset_for_test();
+    let cap = bootstrap_power_authority();
+    let providers = StateProviders {
+        ac_adapter: Some(Arc::new(|| Some(AcAdapterState::Online))),
+        lid: Some(Arc::new(|| Some(LidState::Open))),
+        battery: Some(Arc::new(|| Some(service_test_battery(false)))),
+        cpu_temp_mc: Some(Arc::new(|| Some(55_000))),
+        gpu_temp_mc: None,
+    };
+    if service::register_state_providers(&cap, providers).is_err() {
+        return TestResult::Fail("register_state_providers rejected the bootstrap cap");
+    }
+
+    service::on_power_button_press();
+    service::on_power_button_press();
+    service::on_sleep_button_press();
+
+    let snap = service::snapshot();
+    if snap.ac_adapter != Some(AcAdapterState::Online) {
+        return TestResult::Fail("snapshot AC state did not come from the provider");
+    }
+    if snap.lid != Some(LidState::Open) {
+        return TestResult::Fail("snapshot lid state did not come from the provider");
+    }
+    if snap.battery_percent() != Some(50) {
+        return TestResult::Fail("snapshot battery percent is not the fused _BIF/_BST ratio");
+    }
+    if snap.cpu_tdie_mc != Some(55_000) || snap.gpu_temp_mc.is_some() {
+        return TestResult::Fail("snapshot temperatures do not match the providers");
+    }
+    if snap.power_button_presses != 2 || snap.sleep_button_presses != 1 {
+        return TestResult::Fail("snapshot did not drain the press counters");
+    }
+
+    // Drained counters report zero on the next snapshot.
+    let snap2 = service::snapshot();
+    if snap2.power_button_presses != 0 || snap2.sleep_button_presses != 0 {
+        return TestResult::Fail("press counters were reported twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/service",
+    smoke_power_service_snapshot_fusion_and_drain
+);
+
+fn smoke_power_service_critical_battery_warning_edge() -> TestResult {
+    use crate::bootstrap_power_authority;
+    use crate::service::{self, StateProviders};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use narf_acpi::ac_adapter::AcAdapterState;
+
+    service::__reset_for_test();
+    let cap = bootstrap_power_authority();
+
+    let critical = Arc::new(AtomicBool::new(true));
+    let crit = critical.clone();
+    let providers = StateProviders {
+        ac_adapter: Some(Arc::new(|| Some(AcAdapterState::Offline))),
+        battery: Some(Arc::new(move || {
+            Some(service_test_battery(crit.load(Ordering::Acquire)))
+        })),
+        ..Default::default()
+    };
+    if service::register_state_providers(&cap, providers).is_err() {
+        return TestResult::Fail("register_state_providers rejected the bootstrap cap");
+    }
+    let warnings = Arc::new(AtomicU64::new(0));
+    let w = warnings.clone();
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        w.fetch_add(1, Ordering::AcqRel);
+    });
+    if service::install_warning_hook(&cap, hook).is_err() {
+        return TestResult::Fail("install_warning_hook rejected the bootstrap cap");
+    }
+
+    // Critical + offline: first snapshot fires exactly once.
+    let _ = service::snapshot();
+    if warnings.load(Ordering::Acquire) != 1 || service::stats().warnings_fired != 1 {
+        return TestResult::Fail("critical battery did not fire the warning hook");
+    }
+    // Still critical: no re-fire (edge, not level).
+    let _ = service::snapshot();
+    if warnings.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("warning hook re-fired while still critical");
+    }
+    // Recover, then go critical again: fires a second time.
+    critical.store(false, Ordering::Release);
+    let _ = service::snapshot();
+    critical.store(true, Ordering::Release);
+    let _ = service::snapshot();
+    if warnings.load(Ordering::Acquire) != 2 {
+        return TestResult::Fail("warning hook did not re-fire on a fresh critical transition");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/service",
+    smoke_power_service_critical_battery_warning_edge
+);
