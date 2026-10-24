@@ -410,10 +410,22 @@ fn smoke_readahead_eof_clamp() -> TestResult {
             return Err("readahead wholly past EOF read from the device");
         }
         let base = map_shared(fx.fd, 3 * PAGE)?;
-        let before = fx.data_blocks_read();
+        // Fault-around (#734) legitimately installs pages 0–1 during
+        // this fault — their sectors move then, for the first time, by
+        // design. The claim under test is narrower: the *populated*
+        // page's own sectors are not read again, so count only page
+        // 2's sector range (8 sectors per page in this fixture).
+        let page2_lo = DATA_LBA + 2 * (PAGE / SECTOR);
+        let before = fx
+            .device
+            .blocks_read_between(page2_lo, page2_lo + PAGE / SECTOR);
         fault(&fx.aspace, base + 2 * PAGE)?;
-        if fx.data_blocks_read() != before {
-            return Err("faulting the populated last page re-read data sectors");
+        if fx
+            .device
+            .blocks_read_between(page2_lo, page2_lo + PAGE / SECTOR)
+            != before
+        {
+            return Err("faulting the populated last page re-read its data sectors");
         }
         let tail = mapped_bytes(&fx.aspace, base + 2 * PAGE, PAGE as usize)?;
         if tail[..PAGE as usize - 100] != bytes[2 * PAGE as usize..] {
@@ -506,7 +518,9 @@ kernel_test_in!(
 /// generation is stale. The fault reloads from the device and serves
 /// the new bytes. The untouched neighbour page is invalidated by the
 /// same bump (the generation is per file, not per page) and also
-/// reloads, serving its original bytes.
+/// reloads, serving its original bytes — since fault-around (#734),
+/// that reload happens inside the first fault's window, not at the
+/// neighbour's own fault; the assertions below model both steps.
 fn smoke_readahead_write_coherence() -> TestResult {
     let bytes = content(0x29, 3 * PAGE as usize);
     with_fat_file(&bytes, |fx| {
@@ -530,13 +544,24 @@ fn smoke_readahead_write_coherence() -> TestResult {
         if fx.data_blocks_read() <= before {
             return Err("the post-write fault reused the stale populated page");
         }
+        // Fault-around (#734) widened the page-1 fault above into its
+        // window, so the neighbour's invalidation already happened
+        // *there*: its stale populated copy was reloaded from the
+        // device during that fault (part of the read increase the
+        // step above asserted) and the fresh page installed. What
+        // remains to pin here is the guarantee itself — the stale
+        // copy is never served: the neighbour is backed, faulting it
+        // reads nothing more, and it serves its original bytes.
+        if mapped_frame(&fx.aspace, base).is_none() {
+            return Err("the neighbour page was not installed by fault-around");
+        }
         let before0 = fx.data_blocks_read();
         fault(&fx.aspace, base)?;
         if mapped_bytes(&fx.aspace, base, 64)? != bytes[..64] {
             return Err("the untouched page does not serve its original bytes");
         }
-        if fx.data_blocks_read() <= before0 {
-            return Err("the neighbour page was not invalidated by the generation bump");
+        if fx.data_blocks_read() != before0 {
+            return Err("faulting the reloaded neighbour re-read data sectors");
         }
         Ok(())
     })

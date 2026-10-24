@@ -16,7 +16,7 @@
 //! `memory/src/bpf_arena.rs`'s `Arena::drop` names the test that pins it.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -1184,7 +1184,7 @@ fn current_address_space_id() -> Option<u64> {
 pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
     let page = vaddr & !0xFFFu64;
     let owner_bucket = existing_mapping_owners(address_space_id).ok_or(FileFaultError::NoOwner)?;
-    let (offset, ops, generic_fallback, private_copy, zero_from) = {
+    let (offset, ops, generic_fallback, private_copy, zero_from, owner_base, owner_len) = {
         let owners = owner_bucket.lock();
         let owner = owners
             .iter()
@@ -1199,6 +1199,8 @@ pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, Fil
             owner.writeback.is_some(),
             owner.private_copy,
             owner.zero_from,
+            owner.base,
+            owner.len,
         )
     };
     if private_copy {
@@ -1300,7 +1302,121 @@ pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, Fil
         debug_assert!(released);
         return Err(FileFaultError::NoOwner);
     }
+    // The faulting page is fully published and no lock is held: widen the
+    // win for a sequential reader by installing the surrounding window
+    // before the fault returns (`do_fault_around`, #734).
+    fault_around(address_space_id, page, owner_base, owner_len, &ops, offset);
     Ok(phys.raw())
+}
+
+/// Linux's `fault_around_bytes` (64 KiB): the window one fault tries to
+/// make resident around itself, the faulting page included.
+const FAULT_AROUND_PAGES: u64 = 16;
+
+/// Address spaces whose fault-around expansion is currently running.
+///
+/// [`fault_around`] installs neighbours through
+/// `AddressSpace::demand_alloc_page`, and every one of those calls
+/// re-enters [`demand_frame`] through the fault hook. Without this set
+/// the nested fault would expand a window around itself in turn, and the
+/// recursion would stop only at the mapping's edge. The set is keyed by
+/// address space — not CPU or task — because a faulting task parked on
+/// I/O can resume on another CPU, while a sibling thread's fault on the
+/// same space merely skips expansion for its duration, which costs
+/// nothing: expansion is advisory.
+static FAULT_AROUND_ACTIVE: IrqSafeSpinLock<BTreeSet<u64>> = IrqSafeSpinLock::new(BTreeSet::new());
+
+/// RAII removal for [`FAULT_AROUND_ACTIVE`]: every expansion exit —
+/// including an early return — must release the address space, or
+/// fault-around would stay disabled there for the space's lifetime.
+struct FaultAroundGuard(u64);
+
+impl Drop for FaultAroundGuard {
+    fn drop(&mut self) {
+        FAULT_AROUND_ACTIVE.lock().remove(&self.0);
+    }
+}
+
+fn fault_around_enter(address_space_id: u64) -> Option<FaultAroundGuard> {
+    if !FAULT_AROUND_ACTIVE.lock().insert(address_space_id) {
+        return None;
+    }
+    Some(FaultAroundGuard(address_space_id))
+}
+
+/// `mm/filemap.c::do_fault_around`: after a generic shared fault has
+/// resolved its page, install a bounded window of neighbours so a
+/// sequential scan stops trapping once per page (#734).
+///
+/// The window is [`FAULT_AROUND_PAGES`] pages, aligned in the mapping's
+/// own page space (first index `fault_index & !(FAULT_AROUND_PAGES - 1)`,
+/// the alignment Linux applies in file-offset space), clamped to the
+/// owner row that served the fault and to the file's current `i_size`:
+/// a page at or past EOF can only SIGBUS, so there is nothing to install
+/// for it, and a mapping may legitimately extend past EOF.
+///
+/// Each neighbour is installed through `AddressSpace::demand_alloc_page`
+/// — the same ticketed fault path a real touch takes, and the entry
+/// `mlock` population already drives page by page — so an installed
+/// neighbour is indistinguishable from a faulted one: same claim
+/// discipline (a peer mid-fault on that page makes the call a no-op),
+/// same cache fill, same generation stamp, same writeback registration.
+/// The nested `demand_frame` that each call drives is kept from
+/// expanding in turn by [`FAULT_AROUND_ACTIVE`]. Every result is
+/// deliberately discarded: a neighbour that cannot be installed (racing
+/// unmap, reclaim pressure, a fill error) fails silently and its next
+/// real touch faults it in the ordinary way. Only the faulting page's
+/// own outcome, already decided by the caller, is ever reported, so a
+/// fill error here can never fail the original fault.
+///
+/// Installation needs the faulting space's page-table root live on this
+/// CPU — the normal-fault case `demand_alloc_page`'s contract names.
+/// When the space active here is a different one (a ptrace remote access
+/// faulting a stopped tracee's page through this hook), expansion is
+/// skipped and the fault keeps its single-page service.
+fn fault_around(
+    address_space_id: u64,
+    fault_page: u64,
+    owner_base: u64,
+    owner_len: u64,
+    ops: &Arc<dyn FileOps>,
+    fault_offset: u64,
+) {
+    let Some(aspace) = crate::handlers::active_user_as() else {
+        return;
+    };
+    if aspace.identity() != address_space_id {
+        return;
+    }
+    let Some(_guard) = fault_around_enter(address_space_id) else {
+        return;
+    };
+    let owner_pages = owner_len.div_ceil(4096);
+    if owner_pages <= 1 {
+        return;
+    }
+    let fault_index = (fault_page - owner_base) / 4096;
+    let window_first = fault_index & !(FAULT_AROUND_PAGES - 1);
+    let window_last = (window_first + FAULT_AROUND_PAGES).min(owner_pages);
+    let owner_file_offset = fault_offset - fault_index * 4096;
+    let size = ops.stat().size;
+    for index in window_first..window_last {
+        if index == fault_index {
+            continue;
+        }
+        // The file offset this page would fault from; at or past i_size
+        // it is SIGBUS territory, never installable content.
+        if owner_file_offset + index * 4096 >= size {
+            continue;
+        }
+        let va = owner_base + index * 4096;
+        // SAFETY: `aspace` is the space active on this CPU (identity
+        // checked above) inside its own page fault, so its root is the
+        // live one and paging is enabled — the same contract the trap
+        // path's `demand_page` call on this fault satisfies. The result
+        // is advisory and discarded by design (see above).
+        let _ = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(va)) };
+    }
 }
 
 /// `vmf_error`: `-ENOMEM` waits for reclaim and retries (`VM_FAULT_OOM`);
