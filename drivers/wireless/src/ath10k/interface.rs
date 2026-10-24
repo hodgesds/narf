@@ -512,20 +512,49 @@ fn drain() -> bool {
     let device = ACTIVE.lock().clone();
     device.is_some_and(|d| d.drain())
 }
-pub(super) fn publish(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Admission {
+    Ready,
+    PendingAssets,
+}
+pub(super) fn classify_domain_admission(
+    result: Result<narf_wireless::reg::RegulatoryDomain, narf_wireless::reg::policy::Error>,
+    has_loader_authority: bool,
+) -> Result<Admission, Error> {
+    match result {
+        Ok(_) => Ok(Admission::Ready),
+        Err(narf_wireless::reg::policy::Error::Firmware(
+            narf_firmware::FirmwareError::NotFound,
+        )) => Ok(Admission::PendingAssets),
+        Err(narf_wireless::reg::policy::Error::Authority) if !has_loader_authority => {
+            Ok(Admission::PendingAssets)
+        }
+        Err(_) => Err(Error::Unsupported),
+    }
+}
+fn check_admission() -> Result<Admission, Error> {
+    if classify_domain_admission(
+        narf_wireless::reg::db::ensure_domain(),
+        narf_firmware::trusted_loader_authority().is_some(),
+    )? == Admission::PendingAssets
+    {
+        return Ok(Admission::PendingAssets);
+    }
+    let Some(root) = narf_net::trusted_net_authority() else {
+        return Ok(Admission::PendingAssets);
+    };
+    root.derive::<narf_capabilities::Write>()
+        .map_err(|_| Error::Unsupported)?;
+    Ok(Admission::Ready)
+}
+fn publish_with_mac(
     radio: Arc<Mutex<Radio<super::boot::PciBoot>>>,
+    mac: [u8; 6],
 ) -> Result<Arc<Native>, Error> {
     narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Unsupported)?;
-    let mac = {
-        let r = radio.try_lock().ok_or(Error::Failed)?;
-        if !r.data_supported() {
-            return Err(Error::Unsupported);
-        }
-        r.ready.ok_or(Error::Failed)?.mac
-    };
     let mut active = ACTIVE.lock();
     if active.is_some() {
         return Err(Error::Failed);
@@ -550,6 +579,38 @@ pub(super) fn publish(
         }
     });
     Ok(device)
+}
+pub(super) fn publish(
+    radio: Arc<Mutex<Radio<super::boot::PciBoot>>>,
+) -> Result<Arc<Native>, Error> {
+    let r = radio.try_lock().ok_or(Error::Failed)?;
+    let mac = r.station_publishable()?;
+    let result = publish_with_mac(radio.clone(), mac);
+    drop(r);
+    result
+}
+pub(super) async fn wait_publish(
+    radio: Arc<Mutex<Radio<super::boot::PciBoot>>>,
+) -> Result<Arc<Native>, Error> {
+    loop {
+        {
+            let r = radio.lock().await;
+            r.station_publishable()?;
+        }
+        if ACTIVE.lock().is_some() {
+            return Err(Error::Failed);
+        }
+        match check_admission()? {
+            Admission::Ready => {
+                let r = radio.lock().await;
+                let mac = r.station_publishable()?;
+                let result = publish_with_mac(radio.clone(), mac);
+                drop(r);
+                return result;
+            }
+            Admission::PendingAssets => super::firmware::staging_pause().await,
+        }
+    }
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for Native {

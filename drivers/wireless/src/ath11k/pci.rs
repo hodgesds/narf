@@ -638,87 +638,150 @@ fn request_fw(
         })
 }
 
+fn request_board_fw(
+    auth: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    fw_dir: &str,
+    file: &str,
+) -> Result<(), i32> {
+    let name = alloc::format!("ath11k/{}/{}", fw_dir, file);
+    crate::firmware_asset::load(auth, &name, 16 * 1024 * 1024, true)
+        .map(|_| ())
+        .map_err(|error| match error {
+            narf_firmware::FirmwareError::NotFound => wlfw::ENOENT,
+            narf_firmware::FirmwareError::OutOfMemory => wlfw::ENOMEM,
+            _ => wlfw::EINVAL,
+        })
+}
+
+fn try_load_firmware_bundle(
+    auth: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    fw_dir: &str,
+    reported: &mut bool,
+) -> Result<(alloc::vec::Vec<u8>, FwApi, bool), (&'static str, i32)> {
+    use core::fmt::Write as _;
+    let (api, refused) = FwApi::pre_init(|file| request_fw(auth, fw_dir, file));
+    if let (Some(e), false) = (refused, *reported) {
+        // ath11k_fw_request_firmware_api_n's ath11k_err; pre_init
+        // still succeeds, with api 1.
+        *reported = true;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  ath11k: ath11k/{}/{}: {:?} (-{}), using fw api 1",
+            fw_dir,
+            ATH11K_FW_API2_FILE,
+            e,
+            e.errno()
+        );
+    }
+    let (img, from_api2) = match api.amss() {
+        Some(img) => (img.to_vec(), true),
+        None => (
+            request_fw(auth, fw_dir, ATH11K_AMSS_FILE).map_err(|e| (ATH11K_AMSS_FILE, e))?,
+            false,
+        ),
+    };
+    if api.m3().is_none() {
+        let m3 = request_fw(auth, fw_dir, super::board::ATH11K_M3_FILE)
+            .map_err(|e| (super::board::ATH11K_M3_FILE, e))?;
+        if m3.is_empty() {
+            return Err((super::board::ATH11K_M3_FILE, wlfw::EINVAL));
+        }
+    }
+    match request_board_fw(auth, fw_dir, super::board::ATH11K_BOARD_API2_FILE) {
+        Ok(()) => {}
+        Err(wlfw::ENOENT) => {
+            request_board_fw(auth, fw_dir, super::board::ATH11K_DEFAULT_BOARD_FILE)
+                .map_err(|e| (super::board::ATH11K_DEFAULT_BOARD_FILE, e))?;
+        }
+        Err(e) => return Err((super::board::ATH11K_BOARD_API2_FILE, e)),
+    }
+    Ok((img, api, from_api2))
+}
+
 /// The MHI image and `ab->fw`: `ath11k_fw_pre_init` (`firmware-2.bin`;
 /// `ath11k_core_pre_init` runs it before `ath11k_mhi_register`), then the
 /// image `ath11k_mhi_register` picks — the container's AMSS IE when it is
-/// non-empty, else `request_firmware(ath11k/<fw_dir>/amss.bin)`. Both are
-/// retried together while the store fills (spec §8).
+/// non-empty, else `request_firmware(ath11k/<fw_dir>/amss.bin)`. Companion
+/// `m3.bin` and signed `board-2.bin`/`board.bin` are checked together before
+/// MHI power-up so partial staging does not boot AMSS without QMI assets.
 async fn load_firmware(fw_dir: &str) -> Result<(alloc::vec::Vec<u8>, FwApi), MhiError> {
     use core::fmt::Write as _;
-    let auth = match narf_firmware::trusted_loader_authority().and_then(|a| a.derive().ok()) {
-        Some(a) => a,
-        None => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "  ath11k: no firmware authority for ath11k/{}",
-                fw_dir
-            );
-            return Err(MhiError::new(
-                mhi_host::step::FW_NOT_FOUND,
-                1,
-                mhi_host::errno::EIO,
-            ));
-        }
-    };
     let start = narf_time::wall::monotonic_ns() / 1_000_000;
     let mut reported = false;
     loop {
-        let (api, refused) = FwApi::pre_init(|file| request_fw(&auth, fw_dir, file));
-        if let (Some(e), false) = (refused, reported) {
-            // ath11k_fw_request_firmware_api_n's ath11k_err; pre_init
-            // still succeeds, with api 1.
-            reported = true;
-            let _ = writeln!(
-                narf_console::Writer,
-                "  ath11k: ath11k/{}/{}: {:?} (-{}), using fw api 1",
-                fw_dir,
-                ATH11K_FW_API2_FILE,
-                e,
-                e.errno()
-            );
-        }
-        if let Some(img) = api.amss() {
-            // "use MHI firmware file from firmware-N.bin"
-            let img = img.to_vec();
-            let _ = writeln!(
-                narf_console::Writer,
-                "  ath11k: firmware ath11k/{}/{} (fw api 2: amss {} bytes, m3 {} bytes)",
-                fw_dir,
-                ATH11K_FW_API2_FILE,
-                img.len(),
-                api.m3().map_or(0, |m| m.len())
-            );
-            return Ok((img, api));
-        }
-        // "use the old separate mhi.bin MHI firmware file"
-        match request_fw(&auth, fw_dir, ATH11K_AMSS_FILE) {
-            Ok(bytes) => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  ath11k: firmware ath11k/{}/{} ({} bytes, fw api {})",
-                    fw_dir,
-                    ATH11K_AMSS_FILE,
-                    bytes.len(),
-                    api.api_version
-                );
-                return Ok((bytes, api));
-            }
-            Err(e) => {
-                let now = narf_time::wall::monotonic_ns() / 1_000_000;
-                if now.saturating_sub(start) >= FW_WAIT_MS {
+        let auth = match narf_firmware::trusted_loader_authority() {
+            Some(root) => match root.derive() {
+                Ok(auth) => Some(auth),
+                Err(_) => {
                     let _ = writeln!(
                         narf_console::Writer,
-                        "  ath11k: firmware ath11k/{}/{} not found (-{})",
-                        fw_dir,
-                        ATH11K_AMSS_FILE,
-                        e
+                        "  ath11k: revoked firmware authority for ath11k/{}",
+                        fw_dir
                     );
                     return Err(MhiError::new(
                         mhi_host::step::FW_NOT_FOUND,
-                        3,
+                        1,
                         mhi_host::errno::EIO,
                     ));
                 }
+            },
+            None => None,
+        };
+        if let Some(auth) = auth {
+            match try_load_firmware_bundle(&auth, fw_dir, &mut reported) {
+                Ok((img, api, true)) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  ath11k: firmware ath11k/{}/{} (fw api 2: amss {} bytes, m3 {} bytes)",
+                        fw_dir,
+                        ATH11K_FW_API2_FILE,
+                        img.len(),
+                        api.m3().map_or(0, |m| m.len())
+                    );
+                    return Ok((img, api));
+                }
+                Ok((bytes, api, false)) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  ath11k: firmware ath11k/{}/{} ({} bytes, fw api {})",
+                        fw_dir,
+                        ATH11K_AMSS_FILE,
+                        bytes.len(),
+                        api.api_version
+                    );
+                    return Ok((bytes, api));
+                }
+                Err((file, e)) => {
+                    let now = narf_time::wall::monotonic_ns() / 1_000_000;
+                    if e != wlfw::ENOENT || now.saturating_sub(start) >= FW_WAIT_MS {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "  ath11k: firmware ath11k/{}/{} not ready (-{})",
+                            fw_dir,
+                            file,
+                            e
+                        );
+                        return Err(MhiError::new(
+                            mhi_host::step::FW_NOT_FOUND,
+                            3,
+                            mhi_host::errno::EIO,
+                        ));
+                    }
+                }
+            }
+        } else {
+            let now = narf_time::wall::monotonic_ns() / 1_000_000;
+            if now.saturating_sub(start) >= FW_WAIT_MS {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  ath11k: no firmware authority for ath11k/{}",
+                    fw_dir
+                );
+                return Err(MhiError::new(
+                    mhi_host::step::FW_NOT_FOUND,
+                    1,
+                    mhi_host::errno::EIO,
+                ));
             }
         }
         narf_time::SleepUntil::new(narf_time::Deadline::after_ms(FW_RETRY_MS).as_instant()).await;
@@ -1524,6 +1587,56 @@ mod native_authority_tests {
         // no synthetic device is presented as a real mapped or active radio.
         if unsafe { bring_up(&device, &cap, chip) }.is_ok() {
             return TestResult::Fail("revoked ath11k probe authority reached native bring-up");
+        }
+        let (write, read) = narf_firmware::bootstrap_authority();
+        let dir = "narf-staged-bundle";
+        let mut reported = false;
+        if try_load_firmware_bundle(&read, dir, &mut reported)
+            != Err((ATH11K_AMSS_FILE, wlfw::ENOENT))
+        {
+            return TestResult::Fail("empty ath11k directory did not wait on amss.bin");
+        }
+        crate::firmware_asset::tests::install(
+            &write,
+            "ath11k/narf-staged-bundle/amss.bin",
+            b"inert-amss",
+            true,
+        )
+        .unwrap();
+        if try_load_firmware_bundle(&read, dir, &mut reported)
+            != Err((crate::ath11k::board::ATH11K_M3_FILE, wlfw::ENOENT))
+        {
+            return TestResult::Fail("ath11k bundle admitted amss.bin before m3.bin was staged");
+        }
+        crate::firmware_asset::tests::install(
+            &write,
+            "ath11k/narf-staged-bundle/m3.bin",
+            b"inert-m3",
+            true,
+        )
+        .unwrap();
+        if try_load_firmware_bundle(&read, dir, &mut reported)
+            != Err((
+                crate::ath11k::board::ATH11K_DEFAULT_BOARD_FILE,
+                wlfw::ENOENT,
+            ))
+        {
+            return TestResult::Fail(
+                "ath11k bundle admitted amss.bin + m3.bin before board data was staged",
+            );
+        }
+        crate::firmware_asset::tests::install(
+            &write,
+            "ath11k/narf-staged-bundle/board-2.bin",
+            b"inert-board",
+            true,
+        )
+        .unwrap();
+        if !matches!(
+            try_load_firmware_bundle(&read, dir, &mut reported),
+            Ok((ref bytes, ref api, false)) if bytes == b"inert-amss" && api.api_version == 1
+        ) {
+            return TestResult::Fail("complete staged ath11k bundle was not admitted");
         }
         TestResult::Pass
     }

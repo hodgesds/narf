@@ -178,8 +178,12 @@ pub fn rtl8xxxu_probe(
     );
 
     if family == regs::ChipFamily::Rtl8188eu {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8188eu:   firmware required at /firmware/rtlwifi/rtl8188eufw.bin"
+        );
         narf_scheduler::spawn(async move {
-            let result = firmware.initialize_registered().await;
+            let result = firmware.wait_initialize_registered().await;
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
@@ -187,7 +191,14 @@ pub fn rtl8xxxu_probe(
                 result
             );
             if result.is_ok() {
-                let service = interface::attach(firmware.clone()).await;
+                if let Some(factory) = firmware.factory() {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  rtl8188eu:   calibration required at /firmware/{}",
+                        power_policy::Calibration::asset_name(factory),
+                    );
+                }
+                let service = interface::wait_attach(firmware.clone()).await;
                 let _ = writeln!(
                     narf_console::Writer,
                     "  rtl8188eu: channel1 station service {:?}",

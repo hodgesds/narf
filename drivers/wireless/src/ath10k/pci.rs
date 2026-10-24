@@ -662,18 +662,8 @@ async fn boot_task(
             let prepared = async {
                 let profile = super::profile::Profile::select(device.id.device, info.version)
                     .ok_or(super::firmware::Error::Unsupported)?;
-                let mut files = super::firmware::RegistryFiles::new()?;
-                let deadline = Deadline::after_ms(60_000);
-                let image = loop {
-                    match super::firmware::Image::load(&mut files, profile) {
-                        Ok(image) => break image,
-                        Err(super::firmware::Error::Missing) if !deadline.expired() => {
-                            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
-                                .await;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                };
+                let mut files = super::firmware::RegistryFiles::wait_authority().await?;
+                let image = super::firmware::Image::wait_load(&mut files, profile).await?;
                 let identity = super::firmware::Identity {
                     vendor: device.id.vendor,
                     device: device.id.device,
@@ -738,20 +728,12 @@ async fn boot_task(
                                             }
                                             let _=writeln!(narf_console::Writer,"  ath10k: HTT {}.{} with retained packet DMA; station registration pending",ready.major,ready.minor);
                                             let (owner, result) = initialize_radio(owner).await;
-                                            if result.is_ok() {
-                                                if let DriverSession::Radio(radio) = &owner {
-                                                    match super::interface::publish(
-                                                        radio.radio.clone(),
-                                                    ) {
-                                                        Ok(_) => {
-                                                            let _ = writeln!(narf_console::Writer,"  ath10k: retained legacy RAW station interface registered, carrier closed");
-                                                        }
-                                                        Err(error) => {
-                                                            let _ = writeln!(narf_console::Writer,"  ath10k: station interface admission: {:?}",error);
-                                                        }
-                                                    }
+                                            let radio = match (&owner, &result) {
+                                                (DriverSession::Radio(radio), Ok(_)) => {
+                                                    Some(radio.radio.clone())
                                                 }
-                                            }
+                                                _ => None,
+                                            };
                                             *SESSION.lock().await = Some(owner);
                                             match result {
                                                 Ok(ready) => {
@@ -761,6 +743,18 @@ async fn boot_task(
                                                         controller.scan_ready = Some(ready);
                                                     }
                                                     let _=writeln!(narf_console::Writer,"  ath10k: retained passive scan vdev with {} receive-only channels; station closed",ready.channels);
+                                                    if let Some(radio) = radio {
+                                                        match super::interface::wait_publish(radio)
+                                                            .await
+                                                        {
+                                                            Ok(_) => {
+                                                                let _ = writeln!(narf_console::Writer,"  ath10k: retained legacy RAW station interface registered, carrier closed");
+                                                            }
+                                                            Err(error) => {
+                                                                let _ = writeln!(narf_console::Writer,"  ath10k: station interface admission: {:?}",error);
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                                 Err(error) => {
                                                     if let Some(controller) =

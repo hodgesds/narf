@@ -220,6 +220,70 @@ fn authenticated_domain() -> Result<narf_wireless::reg::RegulatoryDomain, servic
     // preserve that stronger contract instead of consulting the shared cache.
     narf_wireless::reg::policy::load().map_err(|_| service_runtime::Error::Profile)
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Admission {
+    Ready,
+    PendingAssets,
+}
+pub(super) fn classify_attach_admission(
+    has_net_authority: bool,
+    has_loader_authority: bool,
+    domain: Result<narf_wireless::reg::RegulatoryDomain, narf_wireless::reg::policy::Error>,
+    calibration: Result<power_policy::Calibration, power_policy::Error>,
+) -> Result<Admission, service_runtime::Error> {
+    let domain = match domain {
+        Ok(_) => true,
+        Err(narf_wireless::reg::policy::Error::Firmware(
+            narf_firmware::FirmwareError::NotFound,
+        )) => false,
+        Err(narf_wireless::reg::policy::Error::Authority) if !has_loader_authority => false,
+        Err(_) => return Err(service_runtime::Error::Profile),
+    };
+    let calibration = match calibration {
+        Ok(_) => true,
+        Err(power_policy::Error::Firmware(narf_firmware::FirmwareError::NotFound)) => false,
+        Err(power_policy::Error::Firmware(narf_firmware::FirmwareError::AuthorityRevoked))
+            if !has_loader_authority =>
+        {
+            false
+        }
+        Err(_) => return Err(service_runtime::Error::Profile),
+    };
+    if has_net_authority && domain && calibration {
+        Ok(Admission::Ready)
+    } else {
+        Ok(Admission::PendingAssets)
+    }
+}
+pub async fn wait_attach(
+    firmware: Arc<Firmware<UsbControl>>,
+) -> Result<Arc<Device<UsbControl, UsbIo, NativeEnvironment>>, service_runtime::Error> {
+    loop {
+        if firmware.status().stage != super::firmware_transport::Stage::RadioReady
+            || firmware.calibration().is_none()
+            || CLAIMED.load(Ordering::Acquire)
+        {
+            return Err(service_runtime::Error::State);
+        }
+        let factory = firmware.factory().ok_or(service_runtime::Error::State)?;
+        let (vid, pid) = firmware
+            .usb_identity()
+            .ok_or(service_runtime::Error::State)?;
+        let has_loader = narf_firmware::trusted_loader_authority().is_some();
+        let has_net = narf_net::trusted_net_authority().is_some();
+        match classify_attach_admission(
+            has_net,
+            has_loader,
+            narf_wireless::reg::policy::load(),
+            power_policy::Calibration::load_registered(factory, vid, pid),
+        )? {
+            Admission::Ready => return attach(firmware).await,
+            Admission::PendingAssets => {
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
+            }
+        }
+    }
+}
 /// Publish only after actual firmware/IQK, signed board-power data and signed
 /// deployment policy have admitted this exact device. No real curve is shipped.
 /// The initial profile retains one association per firmware claim; reset and

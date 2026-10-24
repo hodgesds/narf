@@ -184,6 +184,11 @@ another executor task. IRQ throughput and power management are separate profiles
 - `interface::Device` implements the registered legacy station profile after
   calibrated boot, WMI/HTT/scan setup, RAW/non-PFC firmware admission, signed
   regulatory bootstrap and current network-registry capability admission.
+  `boot_task` publishes the retained `SESSION` and `scan_ready` immediately after
+  `initialize_radio`, then runs `interface::wait_publish` so RAW/non-PFC radios
+  wait for missing `wireless-regulatory.bin`, loader authority or network
+  registry authority without blocking passive-scan diagnostics; non-RAW/PFC
+  images and invalid/unsigned regulatory policy fail immediately without waiting.
   `RadioSession` retains an `Arc<Mutex<Radio<PciBoot>>>` with the selected image
   and board profile; native PCI APIs and the Device share this single owner.
   The Device exposes passive scan and Open/WPA2-PSK/CCMP on channels1–11,
@@ -226,9 +231,13 @@ another executor task. IRQ throughput and power management are separate profiles
   not add a PCI match or runtime support for that part.
 - `firmware::Image::{parse, load}` own the API 2–6 container and expose
   bounded image/OTP/code-swap slices, feature bits and WMI/HTT operation
-  versions. `Files` supplies owned immutable bytes; production uses
+  versions. `Files` supplies owned immutable bytes and `Files::wait_missing`
+  waits only at pure asset-lookup checkpoints; production uses
   capability-authorized verified firmware-registry blobs. The highest
   present API is parsed; a malformed present blob fails explicitly.
+  `RegistryFiles::wait_authority`, `Image::wait_load` and `prepare`'s base and
+  extended board lookups wait across staged registry population while preserving
+  any already completed PLL and OTP BMI transactions on the live target.
 - Production `RegistryFiles::load` invokes both registry lookup and bounded
   blob copying under the actual current capabilities; only owned vectors reach
   firmware/board parsers and BMI work. `board.bin` and `board-2.bin` always require

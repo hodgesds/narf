@@ -55,6 +55,10 @@ impl Interface for ExtStub {
 
 #[async_trait::async_trait]
 impl crate::WirelessNetIface for ExtStub {
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+
     fn supports_userspace_mlme(&self) -> bool {
         true
     }
@@ -946,6 +950,7 @@ fn smoke_nl80211_ext_connect_owner_release() -> TestResult {
         cipher_suites: &[crate::CIPHER_SUITE_CCMP],
         scan_random_mac: false,
         connected: false,
+        max_scan_ssids: 0,
     };
     let parse = |a: &[u8]| parse_operation_caps(CONNECT, &attributes(a).unwrap(), caps, OWNER);
     let ok = matches!(

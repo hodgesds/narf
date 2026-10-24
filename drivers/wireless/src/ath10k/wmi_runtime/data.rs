@@ -118,6 +118,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub fn data_supported(&self) -> bool {
         self.htt.data_profile()
     }
+    pub fn station_publishable(&self) -> Result<[u8; 6], Error> {
+        if !self.data_supported() {
+            return Err(Error::Unsupported);
+        }
+        if self.failed || self.peer.is_some() || self.data.is_some() {
+            return Err(Error::Failed);
+        }
+        Ok(self.ready.ok_or(Error::Failed)?.mac)
+    }
     pub fn fail_station_data(&mut self) {
         self.failed = true;
         if let Some(data) = &mut self.data {

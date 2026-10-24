@@ -275,6 +275,22 @@ impl<I: ControlIo> Owner<I> {
         self.initialize_registered_from(&authority, "rtlwifi/rtl8188eufw.bin")
             .await
     }
+    pub async fn wait_initialize_registered(&self) -> Result<FirmwareInfo, Error> {
+        loop {
+            match self.initialize_registered().await {
+                Err(error)
+                    if !self.started.load(Ordering::Acquire)
+                        && firmware_missing(
+                            error,
+                            narf_firmware::trusted_loader_authority().is_some(),
+                        ) =>
+                {
+                    self.io.delay_us(500_000).await;
+                }
+                result => return result,
+            }
+        }
+    }
     pub(super) async fn initialize_registered_from(
         &self,
         authority: &narf_capabilities::Cap<
@@ -600,4 +616,10 @@ impl Owner<UsbControl> {
     pub(super) fn usb_device(&self) -> Arc<USBDevice> {
         self.io.device.clone()
     }
+}
+
+pub(super) fn firmware_missing(error: Error, has_loader_authority: bool) -> bool {
+    matches!(error, Error::Firmware(FirmwareError::NotFound))
+        || (matches!(error, Error::Firmware(FirmwareError::AuthorityRevoked))
+            && !has_loader_authority)
 }

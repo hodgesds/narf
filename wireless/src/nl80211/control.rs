@@ -623,6 +623,7 @@ struct ConnectCaps {
     cipher_suites: &'static [u32],
     scan_random_mac: bool,
     connected: bool,
+    max_scan_ssids: u8,
 }
 
 impl ConnectCaps {
@@ -634,6 +635,7 @@ impl ConnectCaps {
             cipher_suites: iface.cipher_suites(),
             scan_random_mac: iface.supports_scan_random_mac(),
             connected: iface.connected_bssid().is_some(),
+            max_scan_ssids: iface.max_scan_ssids(),
         }
     }
 }
@@ -655,6 +657,7 @@ fn parse_operation(
             cipher_suites: &[],
             scan_random_mac: false,
             connected: false,
+            max_scan_ssids: 16,
         },
         0,
     )
@@ -713,7 +716,7 @@ fn parse_operation_caps(
                     Ok::<u32, i32>(frequency_mhz)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if ssids.len() > 16 || frequencies_mhz.len() > 68 {
+            if ssids.len() > usize::from(caps.max_scan_ssids) || frequencies_mhz.len() > 68 {
                 return Err(EINVAL);
             }
             let duration_tu = u16_attr(attrs, 221)?;
@@ -3590,12 +3593,20 @@ async fn execute(
                     })
                 };
                 if selected.is_none() {
+                    // CONNECT requests discovery, not a particular scan form.
+                    // Passive-only radios cannot service a directed probe, and
+                    // a failed active attempt is not a safe fallback boundary.
+                    let active = iface.max_scan_ssids() != 0;
                     let mut results = iface
                         .scan(crate::ScanRequest {
-                            ssids: alloc::vec![ssid.clone()],
+                            ssids: if active {
+                                alloc::vec![ssid.clone()]
+                            } else {
+                                Vec::new()
+                            },
                             frequencies_mhz: frequency_mhz.into_iter().collect(),
                             channels: Vec::new(),
-                            active: true,
+                            active,
                             random_mac: None,
                             colocated_6ghz: false,
                             duration_tu: None,

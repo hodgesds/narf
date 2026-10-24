@@ -408,6 +408,13 @@ pub trait WirelessNetIface: Interface {
         Err(EOPNOTSUPP)
     }
 
+    /// Maximum SSID entries in an active scan, including the empty wildcard.
+    /// Zero means passive-only discovery. CONNECT chooses that form before
+    /// invoking a driver; explicit active scans are never silently changed.
+    fn max_scan_ssids(&self) -> u8 {
+        0
+    }
+
     /// Whether an unassociated `NL80211_CMD_TRIGGER_SCAN` may use a random
     /// source address (`NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR`).  The default
     /// is deliberately conservative: a request carrying RANDOM_ADDR is

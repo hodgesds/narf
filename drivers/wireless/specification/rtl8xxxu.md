@@ -24,10 +24,14 @@ artifact rather than accepting the shared cached regulatory domain.
 ## 3. Public interface
 
 `rtl8xxxu_probe` retains the handle and `firmware_transport::Owner<UsbControl>`.
-For RTL8188EU it spawns `initialize_registered()` after releasing the device
-registry lock. That production path now continues through factory identity,
-FIFO/queue boundaries, firmware, MAC/BB/AGC/RF tables and checked post-table
-MAC/LC/IQK initialization. Duplicate
+For RTL8188EU it spawns `wait_initialize_registered()` and `interface::wait_attach()`
+after releasing the device registry lock, logging the discovered eFuse calibration
+key `power_policy::Calibration::asset_name(factory)`. That production path continues
+through factory identity, FIFO/queue boundaries, firmware, MAC/BB/AGC/RF tables
+and checked post-table MAC/LC/IQK initialization, pausing at the pre-attempt
+`Detected` and post-IQK `RadioReady` checkpoints when `rtlwifi/rtl8188eufw.bin`,
+`rtl8xxxu/rtl8188eu-cal-v1-<mac>.bin` or `wireless-regulatory.bin` has not been
+staged yet while failing immediately on invalid or unsigned artifacts. Duplicate
 registration compares the retained Arc identity, instead of conflating equal slot numbers on different USB controllers.
 
 `Owner::status()` reports detected, validated, factory-ready, powered,

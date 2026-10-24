@@ -652,6 +652,10 @@ impl Device {
 
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
+    fn max_scan_ssids(&self) -> u8 {
+        20
+    }
+
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
         self.phy.capabilities(band_mhz)
     }

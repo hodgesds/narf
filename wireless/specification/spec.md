@@ -125,6 +125,17 @@ consumer and its negotiated hardware queue. AP admission control may downgrade
 a class; non-WMM links use the best-effort hardware queue. The generic network
 interface's `tx_ring()` remains the BestEffort ring.
 
+`WirelessNetIface::max_scan_ssids() -> u8` reports the active-scan SSID limit,
+including wildcard entries. The conservative default is zero (passive-only).
+nl80211 advertises this exact limit in `MAX_NUM_SCAN_SSIDS` and rejects explicit
+requests which exceed it before driver dispatch. A CONNECT without a cached BSS
+chooses a directed active scan only when the limit is nonzero; otherwise it
+requests passive discovery without SSID entries and applies the requested SSID,
+BSSID, frequency and security filters to the observed results. This does not
+downgrade explicit active scans or grant probe-transmit authority. Intel exposes
+20 entries; ath11k and the shared CYW/BCM FullMAC facade expose 16. The initial
+MT76, ath10k, AR9285 and Realtek profiles retain passive-only discovery.
+
 `WirelessNetIface::phy_capabilities(band_mhz) -> Option<PhyCapabilities>`
 returns band-specific IEEE HT (26-byte) and optional VHT (12-byte) capability
 bodies. The default returns `None`. Band identifiers are 2400, 5000, and

@@ -1378,6 +1378,52 @@ fn smoke_rtl8188eu_registered_asset_denial_precedes_attempt_and_same_owner_retri
     {
         return TestResult::Fail("begun EU owner resolved new assets or replayed hardware");
     }
+    if !super::firmware_transport::firmware_missing(
+        Error::Firmware(narf_firmware::FirmwareError::NotFound),
+        true,
+    ) || !super::firmware_transport::firmware_missing(
+        Error::Firmware(narf_firmware::FirmwareError::AuthorityRevoked),
+        false,
+    ) || super::firmware_transport::firmware_missing(
+        Error::Firmware(narf_firmware::FirmwareError::AuthorityRevoked),
+        true,
+    ) || super::firmware_transport::firmware_missing(
+        Error::Firmware(narf_firmware::FirmwareError::UnsignedRejected),
+        true,
+    ) {
+        return TestResult::Fail("EU firmware staging classifier mishandled missing/revoked state");
+    }
+    if super::interface::classify_attach_admission(
+        true,
+        true,
+        Err(narf_wireless::reg::policy::Error::Firmware(
+            narf_firmware::FirmwareError::NotFound,
+        )),
+        Err(super::power_policy::Error::Firmware(
+            narf_firmware::FirmwareError::NotFound,
+        )),
+    ) != Ok(super::interface::Admission::PendingAssets)
+        || super::interface::classify_attach_admission(
+            true,
+            true,
+            Err(narf_wireless::reg::policy::Error::Firmware(
+                narf_firmware::FirmwareError::NotFound,
+            )),
+            Err(super::power_policy::Error::Unsigned),
+        ) != Err(super::service_runtime::Error::Profile)
+        || super::interface::classify_attach_admission(
+            true,
+            true,
+            Err(narf_wireless::reg::policy::Error::Format("bad")),
+            Err(super::power_policy::Error::Firmware(
+                narf_firmware::FirmwareError::NotFound,
+            )),
+        ) != Err(super::service_runtime::Error::Profile)
+    {
+        return TestResult::Fail(
+            "EU attach staging classifier admitted invalid calibration/policy",
+        );
+    }
     TestResult::Pass
 }
 kernel_test_in!(

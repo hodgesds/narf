@@ -24,6 +24,10 @@ pub trait Fullmac: Send {
         maximum: usize,
     ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a;
     fn configure_bus(&mut self) -> impl Future<Output = Result<(), Error>> + Send;
+    /// Consumed transport records, bounded per call. Positive progress may
+    /// leave more RX/events beyond the budget. Zero requires an actual current
+    /// FIFO/completion-ring idle observation, not an empty decoded host queue;
+    /// queued events/data remain available to their pop methods.
     fn poll(&mut self) -> Result<usize, Error>;
     fn fail(&mut self);
     fn pop_event(&mut self) -> Option<Event>;

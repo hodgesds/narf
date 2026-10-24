@@ -326,6 +326,10 @@ impl<R: Fullmac + 'static> Interface for Device<R> {
 }
 #[async_trait::async_trait]
 impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+
     fn supports_handshake_offload(&self) -> bool {
         self.supplicant
     }

@@ -21,6 +21,8 @@ pub(in crate::cyw43439) struct Bus {
     wpa_ie: Option<Vec<u8>>,
     roam_off: bool,
     disconnect_error: bool,
+    preauthorization_packets: usize,
+    preauthorization_loss: bool,
 }
 impl Bus {
     pub(in crate::cyw43439) fn new() -> Self {
@@ -35,6 +37,8 @@ impl Bus {
             wpa_ie: None,
             roam_off: false,
             disconnect_error: false,
+            preauthorization_packets: 0,
+            preauthorization_loss: false,
         }
     }
     pub(in crate::cyw43439) fn set_secured(&mut self, secured: bool) {
@@ -174,6 +178,22 @@ impl PacketTransport for Bus {
         let mut control = header.encode().to_vec();
         control.extend_from_slice(&response);
         self.queue(0, maximum, &control);
+        if request.cmd == 26 {
+            // Actual SDPCM FIFO records follow the correlated control reply.
+            // Its waiter can return at its16-packet budget with data/events
+            // still unread; neither the host queue nor command ACK is idle.
+            let mut data = [0x71; 4 + 14];
+            data[..4].copy_from_slice(&[0x20, 0, 0, 0]);
+            data[4..10].copy_from_slice(&OWN);
+            data[10..16].copy_from_slice(&AP);
+            data[16..18].copy_from_slice(&[8, 0]);
+            for _ in 0..self.preauthorization_packets {
+                self.queue(CHANNEL_DATA, maximum, &data);
+            }
+            if self.preauthorization_loss {
+                self.event(16, 0, 0, &[], maximum);
+            }
+        }
         Ok(())
     }
 }
@@ -334,6 +354,85 @@ fn smoke_cyw_station_wpa2_waits_for_firmware_keys() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/cyw43439/station",
     smoke_cyw_station_wpa2_waits_for_firmware_keys
+);
+
+fn preauthorization_fixture(
+    secured: bool,
+    packets: usize,
+    loss: bool,
+) -> Result<Station<Runtime<Bus>>, &'static str> {
+    let mut bus = Bus::new();
+    bus.secured = secured;
+    bus.preauthorization_packets = packets;
+    bus.preauthorization_loss = loss;
+    let mut station =
+        narf_scheduler::block_on(Station::initialize(Runtime::new(bus), &[1], domain()))
+            .map_err(|_| "preauthorization fixture init")?;
+    narf_scheduler::block_on(station.scan(scan_request()))
+        .map_err(|_| "preauthorization fixture scan")?;
+    Ok(station)
+}
+fn smoke_cyw_station_idle_fence_drops_fifo_backlog_beyond_control_and_receive_budgets() -> TestResult
+{
+    for secure in [false, true] {
+        let Ok(mut station) = preauthorization_fixture(secure, 64, false) else {
+            return TestResult::Fail("SDPCM idle fixture");
+        };
+        if narf_scheduler::block_on(station.associate(join_request(secure))) != Ok(())
+            || station.bssid != Some(AP)
+            || station.runtime.poll() != Ok(0)
+            || station.runtime.pop_data().is_some()
+        {
+            return TestResult::Fail("SDPCM port opened before genuine FIFO idle or leaked old RX");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/station",
+    smoke_cyw_station_idle_fence_drops_fifo_backlog_beyond_control_and_receive_budgets
+);
+
+fn smoke_cyw_station_idle_fence_observes_peer_loss_after_more_than_one_rx_budget() -> TestResult {
+    let Ok(mut station) = preauthorization_fixture(true, 64, true) else {
+        return TestResult::Fail("SDPCM delayed peer-loss fixture");
+    };
+    if narf_scheduler::block_on(station.associate(join_request(true))).is_ok()
+        || station.bssid.is_some()
+        || !station.runtime.is_failed()
+        || station.poll().is_ok()
+    {
+        return TestResult::Fail("join/key events hid terminal peer loss beyond the SDPCM budget");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/station",
+    smoke_cyw_station_idle_fence_observes_peer_loss_after_more_than_one_rx_budget
+);
+
+fn smoke_cyw_station_cancel_during_idle_fence_never_publishes_port() -> TestResult {
+    let Ok(mut station) = preauthorization_fixture(true, 128, false) else {
+        return TestResult::Fail("SDPCM cancelled-idle fixture");
+    };
+    {
+        let mut future = pin!(station.associate(join_request(true)));
+        if !future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+        {
+            return TestResult::Fail("unretired SDPCM backlog did not yield with port closed");
+        }
+    }
+    if station.bssid.is_some() || station.poll().is_ok() || !station.runtime.is_failed() {
+        return TestResult::Fail("cancelled idle fence reopened FullMAC controlled port");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/station",
+    smoke_cyw_station_cancel_during_idle_fence_never_publishes_port
 );
 
 fn smoke_cyw_station_rejects_inconsistent_association_ies() -> TestResult {

@@ -393,8 +393,9 @@ impl<R: Fullmac> Station<R> {
                 .await?;
             let deadline = narf_time::Deadline::after_ms(15000);
             let (mut associated, mut keys) = (false, !secure);
+            let mut drain_batches = 0;
             loop {
-                self.runtime.poll()?;
+                let consumed = self.runtime.poll()?;
                 while let Some(event) = self.runtime.pop_event() {
                     if event.header.source_mac != request.bssid {
                         continue;
@@ -426,15 +427,25 @@ impl<R: Fullmac> Station<R> {
                         _ => {}
                     }
                 }
-                if associated && keys {
+                // A bounded poll can expose join/key events while older RX
+                // remains beyond its packet/completion budget. Retire ALL
+                // unauthorized data and process peer loss through an actual
+                // current FIFO/ring idle sample before opening the host port.
+                while self.runtime.pop_data().is_some() {}
+                if associated && keys && consumed == 0 {
                     self.runtime.set_link(Some(request.bssid));
                     self.bssid = Some(request.bssid);
-                    // No packets captured before authorization reach the stack.
-                    while self.runtime.pop_data().is_some() {}
                     return Ok(());
                 }
                 if deadline.expired() {
                     return Err(Error::Timeout);
+                }
+                if associated && keys {
+                    drain_batches += 1;
+                    if drain_batches < 4 {
+                        continue;
+                    }
+                    drain_batches = 0;
                 }
                 wait().await;
             }

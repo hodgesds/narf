@@ -2344,6 +2344,10 @@ pub(super) fn supported_interface_combinations() -> Vec<narf_wireless::Interface
 
 #[async_trait]
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, Q> {
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+
     fn wiphy_id(&self) -> u64 {
         self.shared.radio_id
     }

@@ -151,6 +151,10 @@ them.
 
 - `register()` — registers the three Linux PCI ids.
 - `pci::probe` — identify, power up, spawn the MHI bring-up task.
+  `pci::load_firmware` retries within `FW_WAIT_MS` until trusted loader
+  authority, the MHI AMSS image (`firmware-2.bin` or `amss.bin`), companion
+  `m3.bin` (when not embedded in `firmware-2.bin`) and signed `board-2.bin` or
+  `board.bin` are present before MHI power-up begins.
 - `pci::NativeIo` retains the exact original BusDevice/PCI cap/BAR binding through
   `MhiStart`, `Bar0Mhi` and `core::Bar0`. MHI direct accesses and CE/DP ChipIo
   accesses execute inside current `Cap::invoke`; complete width/alignment bounds

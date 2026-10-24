@@ -111,7 +111,10 @@ retain parked startup owners; RTL8188EE exposes a bounded `pci::provision`
 continuation for its existing detected owner. RTL8822CE's `rtw88::pci::provision`
 continues that same owner at completed firmware/MAC/PHY/calibration boundaries;
 MT76's `mt7921::firmware_transport::provision_boot_radio` resumes its parked
-binding after firmware preflight was missing or invalid. Intel Sc selects only
+binding after firmware preflight was missing or invalid. `ath10k` and `rtl8xxxu`
+wait at their pure firmware, board/calibration and regulatory asset checkpoints
+without repeating completed ROM/USB initialization, and `ath11k` waits for its
+complete AMSS/M3/signed-board bundle before MHI power-up. Intel Sc selects only
 the actual CSR MAC/RF/step's firmware ladder, even if other Sc images are present.
 Missing assets before the first hardware attempt remain retryable. A consumed
 or failed native attempt cannot be replaced by reopening an asset name or

@@ -38,6 +38,12 @@ remain separate gates; source/model results do not establish RF acceptance.
 The family documents retain the wider-profile work. The current loadable MT76 module likewise
 registers PCI IDs only; its packet ABI integration remains software work.
 
+The public nl80211 scan limit follows each facade's `max_scan_ssids`: Intel
+admits 20 active SSID entries, ath11k and common FullMAC admit 16, and the other
+documented initial profiles advertise zero. A cache-miss CONNECT uses passive
+discovery for those profiles rather than issuing an unsupported active probe;
+explicit active-scan requests still fail before dispatch when the limit is zero.
+
 ## 1. Purpose & scope
 
 **Owns:**

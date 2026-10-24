@@ -632,3 +632,57 @@ kernel_test_in!(
     "drivers/wireless/ath10k/station",
     smoke_ath10k_current_policy_restriction_fences_native_station_publication
 );
+
+fn smoke_ath10k_station_publish_admission_stages_missing_regulatory_only_for_raw_radio() -> TestResult {
+    use crate::ath10k::interface::{classify_domain_admission, Admission};
+    use narf_firmware::FirmwareError;
+    use narf_wireless::reg::policy::Error as RegPolicyError;
+
+    if classify_domain_admission(
+        Err(RegPolicyError::Firmware(FirmwareError::NotFound)),
+        true,
+    ) != Ok(Admission::PendingAssets)
+        || classify_domain_admission(Err(RegPolicyError::Authority), false)
+            != Ok(Admission::PendingAssets)
+        || classify_domain_admission(Err(RegPolicyError::Authority), true)
+            != Err(crate::ath10k::wmi_runtime::Error::Unsupported)
+        || classify_domain_admission(Err(RegPolicyError::Unsigned), true)
+            != Err(crate::ath10k::wmi_runtime::Error::Unsupported)
+        || classify_domain_admission(Err(RegPolicyError::Format("bad")), true)
+            != Err(crate::ath10k::wmi_runtime::Error::Unsupported)
+        || classify_domain_admission(Ok(station_tests::policy()), true)
+            != Ok(Admission::Ready)
+    {
+        return TestResult::Fail("ath10k regulatory staging classification mishandled error states");
+    }
+
+    let mut non_raw = radio_boot_features(4, Dialect::Tlv, 1 << 2);
+    assert!(matches!(
+        drive(non_raw.start(&[2412, 5180])),
+        Poll::Ready(Ok(_))
+    ));
+    if non_raw.station_publishable() != Err(crate::ath10k::wmi_runtime::Error::Unsupported) {
+        return TestResult::Fail("non-RAW ath10k radio was admitted as station-publishable");
+    }
+
+    let mut raw = radio_boot_features(4, Dialect::Tlv, (1 << 10) | (1 << 2) | (1 << 18));
+    if raw.station_publishable() != Err(crate::ath10k::wmi_runtime::Error::Failed) {
+        return TestResult::Fail("unstarted ath10k radio was admitted as station-publishable");
+    }
+    assert!(matches!(
+        drive(raw.start(&[2412, 5180])),
+        Poll::Ready(Ok(_))
+    ));
+    if raw.station_publishable() != Ok(OWN) {
+        return TestResult::Fail("started RAW ath10k radio was not station-publishable");
+    }
+    raw.fail_station_data();
+    if raw.station_publishable() != Err(crate::ath10k::wmi_runtime::Error::Failed) {
+        return TestResult::Fail("failed ath10k radio remained station-publishable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/station",
+    smoke_ath10k_station_publish_admission_stages_missing_regulatory_only_for_raw_radio
+);

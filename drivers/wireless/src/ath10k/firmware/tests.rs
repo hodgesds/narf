@@ -60,6 +60,8 @@ struct Target {
     downloads: Vec<Vec<u8>>,
     compressed: Vec<u8>,
     failed_otp: bool,
+    otp_identity: Option<u32>,
+    extended_board_id: u32,
     soc: BTreeMap<u32, u32>,
     sequence: Vec<(u32, u32, u32)>,
     codeswap: Option<SwapMemory>,
@@ -120,7 +122,9 @@ impl Transport for Target {
                 let parameter = word(request, 8).unwrap();
                 self.executions.push((address, parameter));
                 let value = if parameter == 0x10 {
-                    0x8c00u32
+                    self.otp_identity.unwrap_or(0x8c00)
+                } else if parameter == 0x40000 {
+                    self.extended_board_id
                 } else {
                     u32::from(self.failed_otp)
                 };
@@ -456,4 +460,165 @@ fn smoke_ath10k_zero_length_legacy_board_tail_publishes_rom_config() -> TestResu
 kernel_test_in!(
     "drivers/wireless/ath10k/firmware",
     smoke_ath10k_zero_length_legacy_board_tail_publishes_rom_config
+);
+
+struct StagedStore {
+    files: BTreeMap<String, Vec<u8>>,
+    stages: Vec<Vec<(String, Vec<u8>)>>,
+    waits: usize,
+}
+impl Files for StagedStore {
+    fn load(&mut self, name: &str) -> Result<Vec<u8>, Error> {
+        self.files.get(name).cloned().ok_or(Error::Missing)
+    }
+    async fn wait_missing(&mut self) -> Result<(), Error> {
+        let stage = self.stages.get(self.waits).cloned().ok_or(Error::Missing)?;
+        self.waits += 1;
+        for (name, bytes) in stage {
+            self.files.insert(name, bytes);
+        }
+        Ok(())
+    }
+}
+
+fn board_with_extended(
+    base_name: &str,
+    base_bytes: &[u8],
+    ext_name: &str,
+    ext_bytes: &[u8],
+) -> Vec<u8> {
+    let mut base_nested = Vec::new();
+    ie(&mut base_nested, 0, base_name.as_bytes());
+    ie(&mut base_nested, 1, base_bytes);
+    let mut ext_nested = Vec::new();
+    ie(&mut ext_nested, 0, ext_name.as_bytes());
+    ie(&mut ext_nested, 1, ext_bytes);
+    let mut out = b"QCA-ATH10K-BOARD\0".to_vec();
+    out.resize(out.len().next_multiple_of(4), 0);
+    ie(&mut out, 0, &base_nested);
+    ie(&mut out, 1, &ext_nested);
+    out
+}
+
+fn smoke_ath10k_staged_firmware_and_extended_board_preserve_rom_state() -> TestResult {
+    let mut p = Profile::select(0x3e, 0x05030000).unwrap();
+    p.extended_board = 2048;
+    let fw_bytes = image(1 << 9, 4, 3);
+    let base_name = "bus=pci,bmi-chip-id=1,bmi-board-id=3";
+    let ext_name = "bus=pci,bmi-chip-id=1,bmi-eboard-id=7";
+    let base_board = board(base_name, &vec![0x55; p.board]);
+    let full_board = board_with_extended(
+        base_name,
+        &vec![0x55; p.board],
+        ext_name,
+        &vec![0xaa; p.extended_board],
+    );
+
+    let mut non_staging = Store::default();
+    non_staging
+        .0
+        .insert(format!("{}/board-2.bin", p.directory), base_board.clone());
+    let parsed = Image::parse(fw_bytes.clone(), 6).unwrap();
+    let mut target = Target {
+        otp_identity: Some(0x48c00),
+        extended_board_id: 7,
+        ..Target::default()
+    };
+    target.soc.insert(0xb2c, 2 << 8);
+    target.soc.insert(0xaf4, 0xf0000000);
+    target.soc.insert(0x1018, 0xf0000000);
+    target.soc.insert(0x914, 0xf0000000);
+    target.soc.insert(0x1014, 1 << 16);
+    target.soc.insert(0x820, 0xf0000000);
+    let mut bmi = Bmi::new(target);
+    if ready(prepare(
+        &mut bmi,
+        &mut non_staging,
+        p,
+        identity(),
+        "",
+        &parsed,
+    )) != Some(Err(Error::BoardNotFound))
+    {
+        return TestResult::Fail("missing extended board record did not report BoardNotFound");
+    }
+
+    let mut staged = StagedStore {
+        files: BTreeMap::new(),
+        stages: vec![
+            vec![(format!("{}/firmware-6.bin", p.directory), fw_bytes)],
+            vec![(format!("{}/board-2.bin", p.directory), base_board)],
+            vec![(format!("{}/board-2.bin", p.directory), full_board)],
+        ],
+        waits: 0,
+    };
+    let Some(Ok(loaded)) = ready(Image::wait_load(&mut staged, p)) else {
+        return TestResult::Fail("staged Image::wait_load did not recover when firmware arrived");
+    };
+    if staged.waits != 1 || loaded.api != 6 {
+        return TestResult::Fail(
+            "Image::wait_load did not pause exactly once for missing firmware",
+        );
+    }
+
+    let mut target = Target {
+        otp_identity: Some(0x48c00),
+        extended_board_id: 7,
+        ..Target::default()
+    };
+    target.soc.insert(0xb2c, 2 << 8);
+    target.soc.insert(0xaf4, 0xf0000000);
+    target.soc.insert(0x1018, 0xf0000000);
+    target.soc.insert(0x914, 0xf0000000);
+    target.soc.insert(0x1014, 1 << 16);
+    target.soc.insert(0x820, 0xf0000000);
+    let mut bmi = Bmi::new(target);
+    if ready(prepare(&mut bmi, &mut staged, p, identity(), "", &loaded))
+        != Some(Ok(Some(OtpIdentity {
+            board: 3,
+            chip: 1,
+            extended: true,
+        })))
+    {
+        return TestResult::Fail("staged base/extended board preparation failed");
+    }
+    if staged.waits != 3
+        || bmi.transport.executions
+            != [
+                (p.patch, 0x10),
+                (p.patch, 0x40000),
+                (p.patch, p.otp_parameter),
+            ]
+        || bmi
+            .transport
+            .sequence
+            .iter()
+            .filter(|&&(cmd, addr, val)| cmd == 3 && addr == 0x404024 && val == 176_000_000)
+            .count()
+            != 1
+    {
+        return TestResult::Fail("staged board wait re-executed PLL or OTP BMI transactions");
+    }
+    let mut downloaded_base = Vec::new();
+    let mut downloaded_ext = Vec::new();
+    for (address, bytes) in &bmi.transport.writes {
+        if (0x430000..0x430000 + p.board as u32).contains(address) {
+            downloaded_base.extend_from_slice(bytes);
+        } else if (0x433000..0x433000 + p.extended_board as u32).contains(address) {
+            downloaded_ext.extend_from_slice(bytes);
+        }
+    }
+    if downloaded_base != vec![0x55; p.board]
+        || downloaded_ext != vec![0xaa; p.extended_board]
+        || bmi.transport.commands.contains(&1)
+    {
+        return TestResult::Fail(
+            "staged base or extended board bytes were not written at ROM offsets",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/firmware",
+    smoke_ath10k_staged_firmware_and_extended_board_preserve_rom_state
 );

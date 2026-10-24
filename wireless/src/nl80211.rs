@@ -669,8 +669,12 @@ fn wiphy_attrs(
         push_attr(&mut bands, band_id | NLA_F_NESTED, &body);
     }
     push_attr(&mut attrs, 22 | NLA_F_NESTED, &bands);
-    push_attr(&mut attrs, 43, &[16]); // max scan SSIDs
-                                      // ath11k_mac_register: WLAN_SCAN_PARAMS_MAX_IE_LEN.
+    push_attr(
+        &mut attrs,
+        43,
+        &[iface.map_or(0, |iface| iface.max_scan_ssids())],
+    );
+    // ath11k_mac_register: WLAN_SCAN_PARAMS_MAX_IE_LEN.
     push_attr(&mut attrs, 56, &512u16.to_ne_bytes());
     if let Some(max) = iface
         .map(|iface| iface.max_remain_on_channel_duration_ms())

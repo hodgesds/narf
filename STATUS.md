@@ -312,6 +312,16 @@ RTL8852B temporal reset/probe ownership, actual firmware PHY capability, static
 operating and full radio/current-power qualification, source peer controls,
 native packet/Device DHCP/IP, exact M4 and whole-rekey/disconnect ownership;
 all pass on both architectures alongside the prior coverage.
+Passive-only wiphys now advertise `NL80211_ATTR_MAX_NUM_SCAN_SSIDS = 0`, reject
+active SSID lists at `TRIGGER_SCAN` and use passive discovery on `CONNECT` cache
+misses, while Intel (20) and ath11k/FullMAC (16) advertise their active probe
+limits. Common FullMAC (`cyw43439`/`brcmfmac`) association now fences host port
+publication on an actual zero-consumption FIFO/completion-ring poll so backlog
+beyond a single RX budget is drained and late peer loss or cancellation is
+observed before opening carrier. `ath10k` and `rtl8xxxu` now wait at their pure
+firmware, board/extended-board, per-MAC calibration and regulatory checkpoints
+without repeating completed ROM/PLL/OTP or USB table/IQK initialization, and
+`ath11k` waits for its complete AMSS/M3/signed-board bundle before MHI power-up.
 Both include a clean production boot and btrfs interoperability postflight.
 Host tests, release/debug builds, targeted Clippy across the kernel feature
 contexts, workspace formatting, and MT76 module build/Clippy pass.
