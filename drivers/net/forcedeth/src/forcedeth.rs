@@ -858,6 +858,20 @@ impl ForcedethNic {
         Some(out)
     }
 
+    /// Live carrier read: the same BMSR double-read
+    /// [`Self::refresh_link_state`] performs, without the `&mut`
+    /// store. The RX pump holds only an `Arc<ForcedethNic>`, so the
+    /// publication path (issue #791) samples through this.
+    pub fn live_link_up(&self) -> bool {
+        if self.phy_addr >= 32 {
+            return false;
+        }
+        // sticky-low: double-read, as in refresh_link_state.
+        let _ = mii_rw(&self.mmio, self.phy_addr, MII_BMSR, None);
+        let bmsr = mii_rw(&self.mmio, self.phy_addr, MII_BMSR, None).unwrap_or(0);
+        (bmsr as u16) & BMSR_LINK_UP != 0
+    }
+
     /// Re-evaluate the link state by re-reading BMSR.
     pub fn refresh_link_state(&mut self) -> bool {
         if self.phy_addr >= 32 {
@@ -957,6 +971,26 @@ fn mii_rw(mmio: &MmioRegion, addr: u8, reg: u32, value: Option<u32>) -> Result<u
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<ForcedethNic>>> = IrqSafeSpinLock::new(None);
 
+/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
+/// `dev_alloc_name`). Set once at probe; the device lives as long as
+/// the kernel, so the name is leaked into a `&'static str`.
+static FORCEDETH_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
+
+/// This NIC's interface name; empty until it has registered.
+pub fn forcedeth_ifname() -> &'static str {
+    FORCEDETH_IFNAME.get()
+}
+
+/// SendFn registered with `narf_net::iface` at probe time. Routes the
+/// kernel-side TCP stack's outbound frames through
+/// `ForcedethNic::transmit`. The Arc is cloned out rather than holding
+/// the IRQ-masking CONTROLLER lock across `transmit` (same reasoning
+/// as e1000's send path).
+fn forcedeth_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+    ctrl.transmit(frame, &meta).map_err(|_| ())
+}
+
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -1011,6 +1045,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
+    // name + carrier metadata via the shared helper. This wires the
+    // LinkChg re-evaluation the bring-up comment deferred: the
+    // datapath's interrupts are masked in this stage, so the polled
+    // RX pump below is the observer that republishes on a transition
+    // (issue #791). The frame-ring registration below stays.
+    let name = crate::publish::publish_netdev(
+        nic.mac,
+        forcedeth_send_frame,
+        crate::publish::LinkSample::carrier_only(nic.live_link_up()),
+    );
+    FORCEDETH_IFNAME.set(name);
+
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
         Some(a) => a.derive().ok(),
@@ -1043,12 +1090,26 @@ fn spawn_pumps(
 }
 
 async fn forcedeth_rx_pump(device: Arc<ForcedethNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    // Carrier refresh (issue #791): see the probe comment — with IRQ
+    // delivery masked in this stage, this polled pump is the family's
+    // link observer; a BMSR transition republishes the metadata.
+    let mut last_up = device.live_link_up();
     loop {
+        let up = device.live_link_up();
+        if up != last_up {
+            last_up = up;
+            crate::publish::publish_link(
+                forcedeth_ifname(),
+                crate::publish::LinkSample::carrier_only(up),
+            );
+        }
         if let Some(pkt) = device.receive() {
             let dma_buf =
                 alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
+            // Dual delivery (issue #784), as on e1000.
+            crate::publish::deliver_rx(forcedeth_ifname(), frame.payload_mut());
             let _ = rx_prod.send(frame).await;
         }
         narf_scheduler::yield_now().await;
@@ -1110,7 +1171,14 @@ pub struct ForcedethHwNic;
 
 impl narf_net::Interface for ForcedethHwNic {
     fn name(&self) -> &str {
-        "eth6"
+        // The dynamic `eth%d` name once published (issue #784); the
+        // old frame-ring name before probe gets that far.
+        let n = forcedeth_ifname();
+        if n.is_empty() {
+            "eth6"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -1147,7 +1215,12 @@ impl narf_net::Interface for ForcedethHwNic {
 
 impl crate::HwNic for ForcedethHwNic {
     fn name(&self) -> &'static str {
-        "eth6" // TODO: dynamic naming
+        let n = forcedeth_ifname();
+        if n.is_empty() {
+            "eth6"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])

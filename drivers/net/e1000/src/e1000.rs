@@ -1057,6 +1057,37 @@ impl core::fmt::Debug for E1000 {
     }
 }
 
+/// Link Status Change pending, set by the ISR when ICR reports LSC.
+/// The ISR does no lock or allocation work; the RX pump (task
+/// context) consumes the flag, re-samples STATUS, and republishes the
+/// iface link metadata — before this, carrier was a probe-time
+/// photograph because the ISR read ICR only to acknowledge it
+/// (issue #791).
+static LSC_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Decode a STATUS word into a publication sample. Shared by probe
+/// (initial state) and the RX pump's LSC drain (every transition).
+fn link_sample_from_status(status: u32) -> crate::publish::LinkSample {
+    if status & STATUS_LU == 0 {
+        return crate::publish::LinkSample::DOWN;
+    }
+    let speed_mbps = match status & STATUS_SPEED_MASK {
+        STATUS_SPEED_1000 => 1000,
+        STATUS_SPEED_100 => 100,
+        _ => 10,
+    };
+    let duplex = if status & STATUS_FD != 0 {
+        narf_net::iface::LinkDuplex::Full
+    } else {
+        narf_net::iface::LinkDuplex::Half
+    };
+    crate::publish::LinkSample {
+        carrier: true,
+        speed_mbps: Some(speed_mbps),
+        duplex: Some(duplex),
+    }
+}
+
 /// MMIO base of the IRQ-attached e1000, shared with the static ISR
 /// so it can read ICR (auto-clear, §13.4.17) and deassert legacy
 /// INTx. 0 = no controller bound (handler short-circuits).
@@ -1082,8 +1113,12 @@ fn e1000_isr() {
     // level-triggered INTx delivery and a no-op for MSI-X (which
     // is edge-triggered but tolerates the read).
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    unsafe {
-        let _icr = narf_arch::mmio::read32(base + REG_ICR);
+    let icr = unsafe { narf_arch::mmio::read32(base + REG_ICR) };
+    // LSC is in the default IMS mask, so a link transition reaches
+    // this read; record it for the pump instead of discarding the
+    // cause word (issue #791).
+    if icr & IMS_LSC != 0 {
+        LSC_PENDING.store(true, Ordering::Release);
     }
 }
 
@@ -2026,18 +2061,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     narf_net::iface::set_driver_info(&name, "e1000", None, bus_info);
     let status = dev.read_status();
-    let carrier = status & STATUS_LU != 0;
-    let speed_mbps = carrier.then_some(match status & STATUS_SPEED_MASK {
-        STATUS_SPEED_1000 => 1000,
-        STATUS_SPEED_100 => 100,
-        _ => 10,
-    });
-    let duplex = carrier.then_some(if status & STATUS_FD != 0 {
-        narf_net::iface::LinkDuplex::Full
-    } else {
-        narf_net::iface::LinkDuplex::Half
-    });
-    narf_net::iface::set_link_metadata(&name, carrier, speed_mbps, duplex);
+    crate::publish::publish_link(&name, link_sample_from_status(status));
     narf_net::iface::set_offloads(
         &name,
         narf_net::OffloadCapabilities {
@@ -2107,6 +2131,14 @@ async fn e1000_rx_pump(device: Arc<E1000>) {
     const IRQ_FALLBACK_MS: u64 = 10;
     let poll_fallback_cycles = narf_time::ns_to_cycles(1_000_000);
     loop {
+        // Link Status Change drain (issue #791): the ISR flagged a
+        // transition; re-sample STATUS in task context and republish.
+        // The pump wakes on the same interrupt (LSC is in IMS_DEFAULT)
+        // or on the 10 ms fallback, so this adds no polling loop.
+        if LSC_PENDING.swap(false, Ordering::AcqRel) {
+            let status = device.read_status();
+            crate::publish::publish_link(e1000_ifname(), link_sample_from_status(status));
+        }
         let irq_waiter = device.irq_vector.map(|vector| {
             narf_interrupts::wait_for_irq_until(
                 vector,
@@ -2648,4 +2680,25 @@ mod tests {
         "drivers/net/e1000",
         smoke_partial_tso_ring_requires_deferred_batch_flush
     );
+
+    fn smoke_link_sample_from_status_decodes() -> TestResult {
+        // The decode shared by probe and the LSC drain (issue #791):
+        // LU | SPEED_1000 | FD publishes carrier at 1000 Full; without
+        // LU the sample is DOWN no matter what the other bits say.
+        let up = super::link_sample_from_status(
+            super::STATUS_LU | super::STATUS_SPEED_1000 | super::STATUS_FD,
+        );
+        if !up.carrier
+            || up.speed_mbps != Some(1000)
+            || up.duplex != Some(narf_net::iface::LinkDuplex::Full)
+        {
+            return TestResult::Fail("e1000 STATUS decode lost carrier/speed/duplex");
+        }
+        let down = super::link_sample_from_status(super::STATUS_SPEED_1000 | super::STATUS_FD);
+        if down.carrier || down.speed_mbps.is_some() {
+            return TestResult::Fail("e1000 STATUS decode reported carrier without LU");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_link_sample_from_status_decodes);
 }

@@ -386,7 +386,14 @@ pub struct Rtl8139Nic;
 
 impl narf_net::Interface for Rtl8139Nic {
     fn name(&self) -> &str {
-        "rtl8139"
+        // The dynamic `eth%d` name once published (issue #784); the
+        // family name before probe gets that far.
+        let n = rtl8139_ifname();
+        if n.is_empty() {
+            "rtl8139"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -423,7 +430,12 @@ impl narf_net::Interface for Rtl8139Nic {
 
 impl crate::HwNic for Rtl8139Nic {
     fn name(&self) -> &'static str {
-        "rtl8139"
+        let n = rtl8139_ifname();
+        if n.is_empty() {
+            "rtl8139"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -455,6 +467,25 @@ impl crate::HwNic for Rtl8139Nic {
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtl8139>>> = IrqSafeSpinLock::new(None);
 
+/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
+/// `dev_alloc_name`). Set once at probe; the device lives as long as
+/// the kernel, so the name is leaked into a `&'static str`.
+static RTL8139_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
+
+/// This NIC's interface name; empty until it has registered.
+pub fn rtl8139_ifname() -> &'static str {
+    RTL8139_IFNAME.get()
+}
+
+/// SendFn registered with `narf_net::iface` at probe time. Routes the
+/// kernel-side TCP stack's outbound frames through `Rtl8139::tx`. The
+/// Arc is cloned out rather than holding the IRQ-masking CONTROLLER
+/// lock across `tx` (same reasoning as e1000's send path).
+fn rtl8139_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+    ctrl.tx(frame).map_err(|_| ())
+}
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
@@ -485,6 +516,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(RTL8139_DEVICE),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+
+    // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
+    // name + carrier metadata via the shared helper. `link_up()` is a
+    // live MSR read on this family, so the initial sample is current,
+    // and the polled RX pump keeps it current (issue #791). The
+    // frame-ring registration below stays.
+    let name = crate::publish::publish_netdev(
+        dev.mac,
+        rtl8139_send_frame,
+        crate::publish::LinkSample::carrier_only(dev.link_up()),
+    );
+    RTL8139_IFNAME.set(name);
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -519,12 +562,26 @@ fn spawn_pumps(
 
 async fn rtl8139_rx_pump(device: Arc<Rtl8139>, mut rx_prod: Producer<Frame, RX_RING_N>) {
     let mut buf = [0u8; 2048];
+    // Carrier refresh (issue #791): the datapath is polled, so this
+    // pump is the family's link observer; `link_up()` is a live MSR
+    // read, and a transition republishes the iface metadata.
+    let mut last_up = device.link_up();
     loop {
+        let up = device.link_up();
+        if up != last_up {
+            last_up = up;
+            crate::publish::publish_link(
+                rtl8139_ifname(),
+                crate::publish::LinkSample::carrier_only(up),
+            );
+        }
         let n = device.rx(&mut buf);
         if n > 0 {
             let dma_buf = alloc_coherent(n, DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, n as u32);
             frame.payload_mut().copy_from_slice(&buf[..n]);
+            // Dual delivery (issue #784), as on e1000.
+            crate::publish::deliver_rx(rtl8139_ifname(), frame.payload_mut());
             let _ = rx_prod.send(frame).await;
         }
         narf_scheduler::yield_now().await;

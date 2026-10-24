@@ -44,6 +44,29 @@ bring-up and passes carrier, negotiated Mbps, and duplex to the central net
 registry; sysfs and rtnetlink do not infer those values from the fact that an
 administrator opened the interface.
 
+Every wired PCIe family dual-publishes (issue #784). The capability-gated
+frame-ring registration above is unchanged — stack-daemon and XDP consumers
+depend on it — and alongside it each family's probe registers with
+`narf_net::iface` through the shared helper in `narf_drivers_net_core::publish`
+(`publish_netdev`, or `publish_netdev_with_context` for multi-instance
+families such as i40e, whose send path resolves its PF by cookie). The iface
+registration allocates a dynamic `eth%d` name from the central allocator;
+hardcoded frame-ring names (`eth3`, `eth4`, per-chip labels) survive only as
+pre-publication fallbacks. RX paths dual-deliver each received frame to
+`iface::on_rx_frame_from` in addition to the frame ring.
+
+Carrier is a live signal, not a probe-time photograph (issue #791). A family
+republishes its link sample on every transition it can observe, through the
+observer that already runs: the LSC interrupt flags the RX pump on e1000 and
+igb (the ISR records the cause and returns; the pump re-samples in task
+context), i40e's admin-queue pump publishes each firmware link-status event,
+and the polled datapaths (igc, ixgbe,
+rtl8139, tg3, atheros, forcedeth, and the Realtek modules) re-read their
+in-band link state in the RX pump and publish on change. Speed and duplex are
+published only when the family's in-band state decodes them; a rate is never
+guessed from the part number, and an in-band lower bound (e.g. Realtek's
+≥1G bit) is published as that bound.
+
 E1000 uses a 256-entry legacy TX ring with one slot reserved to distinguish
 full from empty. Its zero-copy callback transfers DMA-buffer ownership into
 the descriptor slot and returns after publication; ordered DD reclaim returns

@@ -810,7 +810,14 @@ impl Ixgbe {
 
 impl narf_net::Interface for Ixgbe {
     fn name(&self) -> &str {
-        name_for(self.did)
+        // The dynamic `eth%d` name once published (issue #784); the
+        // per-chip name before probe gets that far.
+        let n = ixgbe_ifname();
+        if n.is_empty() {
+            name_for(self.did)
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         self.mac
@@ -831,7 +838,12 @@ impl narf_net::Interface for Ixgbe {
 
 impl crate::HwNic for Ixgbe {
     fn name(&self) -> &'static str {
-        name_for(self.did)
+        let n = ixgbe_ifname();
+        if n.is_empty() {
+            name_for(self.did)
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         self.mac
@@ -870,7 +882,12 @@ pub struct IxgbeNic;
 
 impl narf_net::Interface for IxgbeNic {
     fn name(&self) -> &str {
-        with_controller(|c| name_for(c.did)).unwrap_or("ixgbe")
+        let n = ixgbe_ifname();
+        if n.is_empty() {
+            with_controller(|c| name_for(c.did)).unwrap_or("ixgbe")
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -965,6 +982,33 @@ fn read_mac_from_rar(mmio: &MmioRegion) -> [u8; 6] {
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Ixgbe>>> = IrqSafeSpinLock::new(None);
 
+/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
+/// `dev_alloc_name`). Set once at probe; the device lives as long as
+/// the kernel, so the name is leaked into a `&'static str`.
+static IXGBE_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
+
+/// This NIC's interface name; empty until it has registered.
+pub fn ixgbe_ifname() -> &'static str {
+    IXGBE_IFNAME.get()
+}
+
+/// SendFn registered with `narf_net::iface` at probe time. Routes the
+/// kernel-side TCP stack's outbound frames through `Ixgbe::tx`. The
+/// Arc is cloned out rather than holding the IRQ-masking CONTROLLER
+/// lock across `tx` (same reasoning as e1000's send path).
+fn ixgbe_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+    ctrl.tx(frame, &meta).map_err(|_| ())
+}
+
+/// Decode a `LINKS` word into a publication sample. LINKS reports
+/// carrier in-band; its speed encoding is not decoded anywhere in the
+/// tree yet (PHY work, issue #790), so the sample is carrier-only
+/// rather than a guessed rate.
+fn ixgbe_link_sample(links: u32) -> crate::publish::LinkSample {
+    crate::publish::LinkSample::carrier_only(links & LINKS_UP != 0)
+}
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
@@ -1012,6 +1056,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
+    // name + carrier metadata via the shared helper that generalises
+    // the e1000/igb pattern. The frame-ring registration below stays.
+    let name = crate::publish::publish_netdev(
+        dev.mac,
+        ixgbe_send_frame,
+        ixgbe_link_sample(dev.read_links()),
+    );
+    IXGBE_IFNAME.set(name);
+
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
         Some(a) => a.derive().ok(),
@@ -1047,9 +1101,25 @@ async fn ixgbe_rx_pump(device: Arc<Ixgbe>, mut rx_prod: Producer<Frame, RX_RING_
     // Zero-copy (P-F): take the device-filled DMA buffer straight out of the RX
     // descriptor as a Frame (refilling the slot), with no copy through a scratch
     // buffer + freshly-allocated frame.
+    //
+    // Carrier refresh (issue #791): the datapath is polled — MSI-X is
+    // enabled in bring-up but no production path consumes link
+    // interrupts — so this already-running pump is the family's link
+    // observer. It re-reads LINKS each pass and republishes only on a
+    // transition, so `iface` metadata tracks cable pull/replug instead
+    // of staying a probe-time photograph. Seeded from the probe-time
+    // sample so a steady link publishes nothing.
+    let mut last_sample = ixgbe_link_sample(device.read_links());
     loop {
+        let sample = ixgbe_link_sample(device.read_links());
+        if sample != last_sample {
+            last_sample = sample;
+            crate::publish::publish_link(ixgbe_ifname(), sample);
+        }
         match device.rx_recv_frame() {
-            Some(frame) => {
+            Some(mut frame) => {
+                // Dual delivery (issue #784), as on e1000.
+                crate::publish::deliver_rx(ixgbe_ifname(), frame.payload_mut());
                 let _ = rx_prod.send(frame).await;
             }
             None => narf_scheduler::yield_now().await,

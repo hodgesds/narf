@@ -1057,7 +1057,14 @@ pub struct IgcNic;
 
 impl narf_net::Interface for IgcNic {
     fn name(&self) -> &str {
-        "igc"
+        // The dynamic `eth%d` name once published (issue #784); the
+        // family name before probe gets that far.
+        let n = igc_ifname();
+        if n.is_empty() {
+            "igc"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac()).unwrap_or([0; 6])
@@ -1094,7 +1101,12 @@ impl narf_net::Interface for IgcNic {
 
 impl crate::HwNic for IgcNic {
     fn name(&self) -> &'static str {
-        "igc"
+        let n = igc_ifname();
+        if n.is_empty() {
+            "igc"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac()).unwrap_or([0; 6])
@@ -1106,7 +1118,7 @@ impl crate::HwNic for IgcNic {
         with_controller(|c| c.link_up()).unwrap_or(false)
     }
     fn model(&self) -> crate::NicModel {
-        crate::NicModel::IntelIgb
+        crate::NicModel::IntelIgc
     }
     fn caps(&self) -> crate::NicCaps {
         crate::NicCaps::TX_CSUM | crate::NicCaps::RX_CSUM
@@ -1125,6 +1137,25 @@ impl crate::HwNic for IgcNic {
 // ── Driver-match registration ────────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Igc>>> = IrqSafeSpinLock::new(None);
+
+/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
+/// `dev_alloc_name`). Set once at probe; the device lives as long as
+/// the kernel, so the name is leaked into a `&'static str`.
+static IGC_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
+
+/// This NIC's interface name; empty until it has registered.
+pub fn igc_ifname() -> &'static str {
+    IGC_IFNAME.get()
+}
+
+/// SendFn registered with `narf_net::iface` at probe time. Routes the
+/// kernel-side TCP stack's outbound frames through `Igc::tx`. The Arc
+/// is cloned out rather than holding the IRQ-masking CONTROLLER lock
+/// across `tx` (same reasoning as e1000's send path).
+fn igc_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+    ctrl.tx(frame, &meta).map_err(|_| ())
+}
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -1151,6 +1182,29 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+
+    // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
+    // name + carrier metadata via the shared helper that generalises
+    // the e1000/igb pattern. The frame-ring registration below stays —
+    // stack-daemon / XDP consumers depend on it. igc's link source
+    // reports carrier only; negotiated-speed decode is PHY work
+    // (issue #790), so the sample is carrier-only rather than a
+    // guessed rate.
+    let (mac, link_up) = with_controller(|c| (c.mac(), c.link_up())).unwrap_or(([0; 6], false));
+    let name = crate::publish::publish_netdev(
+        mac,
+        igc_send_frame,
+        crate::publish::LinkSample::carrier_only(link_up),
+    );
+    narf_net::iface::set_offloads(
+        &name,
+        narf_net::OffloadCapabilities {
+            tx_checksum: true,
+            rx_checksum: true,
+            ..Default::default()
+        },
+    );
+    IGC_IFNAME.set(name);
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -1255,7 +1309,21 @@ async fn igc_rx_pump(device: Arc<Igc>, mut rx_prod: Producer<Frame, RX_RING_N>) 
     // bounded burst and publish its RDT once; on quiescence, rearm MSI-X,
     // recheck DD, then park on the prebuilt waiter. Systems without a usable
     // vector retain a bounded 1-ms polling fallback.
+    //
+    // Carrier refresh (issue #791): `link_up()` is a live STATUS read
+    // on this family, so each pass of this already-running pump
+    // republishes the iface metadata on a transition instead of
+    // leaving the probe-time sample in place.
+    let mut last_up = device.link_up();
     loop {
+        let up = device.link_up();
+        if up != last_up {
+            last_up = up;
+            crate::publish::publish_link(
+                igc_ifname(),
+                crate::publish::LinkSample::carrier_only(up),
+            );
+        }
         let irq_waiter = device.irq_vector.map(|vector| {
             narf_interrupts::wait_for_irq_until(
                 vector,
@@ -1264,7 +1332,11 @@ async fn igc_rx_pump(device: Arc<Igc>, mut rx_prod: Producer<Frame, RX_RING_N>) 
         });
         let frames = device.rx_drain_frames(RX_DRAIN_BUDGET);
         let drained = frames.len();
-        for frame in frames {
+        for mut frame in frames {
+            // Dual delivery (issue #784): the frame-ring consumer keeps
+            // its copy via the ring below; the kernel-side stack gets
+            // the same frame through the iface RX hook, as on e1000.
+            crate::publish::deliver_rx(igc_ifname(), frame.payload_mut());
             if rx_prod.send(frame).await.is_err() {
                 return;
             }

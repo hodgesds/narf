@@ -676,6 +676,19 @@ impl AtlNic {
         self.link_up
     }
 
+    /// Live carrier read: the same BMSR sample
+    /// [`Self::refresh_link_state`] takes, without the `&mut` store.
+    /// The RX pump holds only an `Arc<AtlNic>`, so the publication
+    /// path (issue #791) samples through this. BMSR's link bit is
+    /// sticky-low, so — as at bring-up — the first read latches and
+    /// the second is current.
+    pub fn live_link_up(&self) -> bool {
+        let _ = self.phy_read(MII_BMSR);
+        self.phy_read(MII_BMSR)
+            .map(|bmsr| bmsr & BMSR_LINK_STATUS != 0)
+            .unwrap_or(false)
+    }
+
     /// Read a PHY register over MDIO.
     pub fn phy_read(&self, reg: u8) -> Result<u16, NicError> {
         // SAFETY: identity-mapped MMIO.
@@ -791,6 +804,25 @@ pub const fn mac_from_sta_addr(hi: u32, lo: u32) -> [u8; 6] {
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<AtlNic>>> = IrqSafeSpinLock::new(None);
 
+/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
+/// `dev_alloc_name`). Set once at probe; the device lives as long as
+/// the kernel, so the name is leaked into a `&'static str`.
+static ATHEROS_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
+
+/// This NIC's interface name; empty until it has registered.
+pub fn atheros_ifname() -> &'static str {
+    ATHEROS_IFNAME.get()
+}
+
+/// SendFn registered with `narf_net::iface` at probe time. Routes the
+/// kernel-side TCP stack's outbound frames through `AtlNic::transmit`.
+/// The Arc is cloned out rather than holding the IRQ-masking
+/// CONTROLLER lock across `transmit` (same reasoning as e1000).
+fn atheros_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+    ctrl.transmit(frame).map_err(|_| ())
+}
+
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -843,6 +875,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
+    // name + carrier metadata via the shared helper. The frame-ring
+    // registration below stays.
+    let name = crate::publish::publish_netdev(
+        dev.mac,
+        atheros_send_frame,
+        crate::publish::LinkSample::carrier_only(dev.live_link_up()),
+    );
+    ATHEROS_IFNAME.set(name);
+
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
         Some(a) => a.derive().ok(),
@@ -875,12 +917,26 @@ fn spawn_pumps(
 }
 
 async fn atheros_rx_pump(device: Arc<AtlNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    // Carrier refresh (issue #791): the datapath is polled, so this
+    // pump is the family's link observer; a BMSR transition
+    // republishes the iface metadata.
+    let mut last_up = device.live_link_up();
     loop {
+        let up = device.live_link_up();
+        if up != last_up {
+            last_up = up;
+            crate::publish::publish_link(
+                atheros_ifname(),
+                crate::publish::LinkSample::carrier_only(up),
+            );
+        }
         if let Some(pkt) = device.receive() {
             let dma_buf =
                 alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
+            // Dual delivery (issue #784), as on e1000.
+            crate::publish::deliver_rx(atheros_ifname(), frame.payload_mut());
             let _ = rx_prod.send(frame).await;
         }
         narf_scheduler::yield_now().await;
@@ -927,7 +983,14 @@ pub struct AtlHwNic;
 
 impl narf_net::Interface for AtlHwNic {
     fn name(&self) -> &str {
-        "eth7"
+        // The dynamic `eth%d` name once published (issue #784); the
+        // old frame-ring name before probe gets that far.
+        let n = atheros_ifname();
+        if n.is_empty() {
+            "eth7"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -964,7 +1027,12 @@ impl narf_net::Interface for AtlHwNic {
 
 impl crate::HwNic for AtlHwNic {
     fn name(&self) -> &'static str {
-        "eth7" // TODO: dynamic naming
+        let n = atheros_ifname();
+        if n.is_empty() {
+            "eth7"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])

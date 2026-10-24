@@ -1901,3 +1901,106 @@ kernel_test_in!(
     "drivers/net/rtl8127",
     smoke_rtl8127_phy_firmware_runs_after_firmware_scans
 );
+
+// ── netdev publication (issues #784 / #791) ────────────────────────
+//
+// Every wired family now probes through the shared helper in
+// `narf_drivers_net_core::publish`; these fixtures pin the helper's
+// contract at the mechanism level. Per-family probe fixtures would
+// need MMIO device models that don't exist in-tree for these
+// families, so the families' own wiring is covered by their existing
+// probe smokes plus this contract.
+
+fn fixture_send_a(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    Ok(())
+}
+
+fn fixture_send_b(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    Ok(())
+}
+
+fn smoke_netdev_publication_two_families() -> TestResult {
+    use crate::publish::{publish_netdev, LinkSample};
+    // Two distinct locally-administered MACs, as two families probing
+    // back to back would present. Assertions are relative to the
+    // returned names — other tests share the global iface table.
+    let mac_a = [0x02, 0x78, 0x40, 0x00, 0x00, 0x01];
+    let mac_b = [0x02, 0x78, 0x40, 0x00, 0x00, 0x02];
+    let a = publish_netdev(mac_a, fixture_send_a, LinkSample::DOWN);
+    let b = publish_netdev(mac_b, fixture_send_b, LinkSample::carrier_only(true));
+    if a == b {
+        return TestResult::Fail("publication allocated the same eth name twice");
+    }
+    if !a.starts_with("eth") || !b.starts_with("eth") {
+        return TestResult::Fail("publication did not allocate dynamic eth%d names");
+    }
+    let Some(ea) = narf_net::iface::lookup(&a) else {
+        return TestResult::Fail("published iface not found by lookup (a)");
+    };
+    if ea.mac != mac_a || ea.carrier {
+        return TestResult::Fail("published iface has wrong MAC or carrier (a)");
+    }
+    let Some(eb) = narf_net::iface::lookup(&b) else {
+        return TestResult::Fail("published iface not found by lookup (b)");
+    };
+    if eb.mac != mac_b || !eb.carrier {
+        return TestResult::Fail("published iface has wrong MAC or carrier (b)");
+    }
+    // Route resolution: a /32 connected address on A (TEST-NET-3,
+    // chosen narrow so no other test's routes are disturbed) makes
+    // for_dst resolve that exact destination through A.
+    narf_net::iface::add_addr(&a, [203, 0, 113, 7], 32);
+    let Some(dst) = narf_net::iface::for_dst([203, 0, 113, 7]) else {
+        return TestResult::Fail("for_dst found no iface for the published address");
+    };
+    if dst.name != a {
+        return TestResult::Fail("for_dst resolved to a different iface than published");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/core", smoke_netdev_publication_two_families);
+
+fn smoke_netdev_carrier_transitions() -> TestResult {
+    use crate::publish::{publish_link, publish_netdev, LinkSample};
+    // The carrier contract the LSC / LinkChg / poll paths drive
+    // (issue #791): publish DOWN, flip up with a decoded rate, flip
+    // back down; the metadata and the change counter follow.
+    let name = publish_netdev(
+        [0x02, 0x78, 0x40, 0x00, 0x00, 0x03],
+        fixture_send_a,
+        LinkSample::DOWN,
+    );
+    let Some(down0) = narf_net::iface::lookup(&name) else {
+        return TestResult::Fail("carrier fixture iface missing after publish");
+    };
+    if down0.carrier || down0.speed_mbps.is_some() {
+        return TestResult::Fail("carrier fixture did not start DOWN");
+    }
+    if !publish_link(
+        &name,
+        LinkSample {
+            carrier: true,
+            speed_mbps: Some(1000),
+            duplex: Some(narf_net::iface::LinkDuplex::Full),
+        },
+    ) {
+        return TestResult::Fail("publish_link rejected the up transition");
+    }
+    let Some(up) = narf_net::iface::lookup(&name) else {
+        return TestResult::Fail("carrier fixture iface missing after up");
+    };
+    if !up.carrier || up.speed_mbps != Some(1000) || up.carrier_changes <= down0.carrier_changes {
+        return TestResult::Fail("up transition did not reach iface metadata");
+    }
+    if !publish_link(&name, LinkSample::DOWN) {
+        return TestResult::Fail("publish_link rejected the down transition");
+    }
+    let Some(down1) = narf_net::iface::lookup(&name) else {
+        return TestResult::Fail("carrier fixture iface missing after down");
+    };
+    if down1.carrier || down1.speed_mbps.is_some() || down1.carrier_changes <= up.carrier_changes {
+        return TestResult::Fail("down transition did not reach iface metadata");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/core", smoke_netdev_carrier_transitions);

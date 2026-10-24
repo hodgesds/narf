@@ -1769,6 +1769,16 @@ pub fn desc_buf_addr(d: &AqDesc) -> u64 {
 static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<I40eNic>>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
+/// SendCtxFn registered with `narf_net::iface` at probe time; the
+/// cookie is the PF's index in `CONTROLLERS`. The `Arc` is cloned out
+/// of the lock before transmitting (same reasoning as e1000's send
+/// path), and the stable-interface NIC leases its current hardware
+/// generation inside `transmit_with_meta`.
+fn i40e_send_frame(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let nic = CONTROLLERS.lock().get(cookie as usize).cloned().ok_or(())?;
+    nic.transmit_with_meta(frame, meta).map_err(|_| ())
+}
+
 /// Probe entry — installed via `bus::register_pci_driver`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if device.id.vendor != I40E_VENDOR || !is_supported_device(device.id.device) {
@@ -1866,6 +1876,20 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         g.len() - 1
     };
 
+    // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
+    // name + carrier/speed metadata via the shared helper, keyed by
+    // the CONTROLLERS index so each PF's send path resolves to its own
+    // NIC. The frame-ring registration below stays. Unlike the
+    // registry's fixed name table, `iface` naming is unbounded, so
+    // every PF publishes — including any beyond the first sixteen.
+    let eth_name = crate::publish::publish_netdev_with_context(
+        nic.mac,
+        index as u64,
+        i40e_send_frame,
+        runtime::link_sample(link),
+    );
+    nic.set_ifname(eth_name);
+
     // Every PF is published under its own name. The X710 presents one
     // PF per port and the MS-03 has two, so this is the difference
     // between one usable 10G port and two.
@@ -1936,7 +1960,14 @@ impl I40eNicIface {
 
 impl narf_net::Interface for I40eNicIface {
     fn name(&self) -> &str {
-        self.name
+        // The dynamic `eth%d` name once published (issue #784); the
+        // per-port frame-ring name before probe gets that far.
+        let n = self.nic.ifname();
+        if n.is_empty() {
+            self.name
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         self.nic.mac

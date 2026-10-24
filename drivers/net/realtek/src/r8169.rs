@@ -939,6 +939,33 @@ impl RtlNic {
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<RtlNic>>> = IrqSafeSpinLock::new(None);
 
+/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
+/// `dev_alloc_name`). Set once at probe; the device lives as long as
+/// the kernel, so the name is leaked into a `&'static str`.
+static R8169_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
+
+/// This NIC's interface name; empty until it has registered.
+pub fn r8169_ifname() -> &'static str {
+    R8169_IFNAME.get()
+}
+
+/// SendFn registered with `narf_net::iface` at probe time. Routes the
+/// kernel-side TCP stack's outbound frames through `RtlNic::transmit`.
+/// The Arc is cloned out rather than holding the IRQ-masking
+/// CONTROLLER lock across `transmit` (same reasoning as e1000).
+fn r8169_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+    ctrl.transmit(frame, &meta).map_err(|_| ())
+}
+
+/// Decode a PHYStatus byte into a publication sample. Only the link
+/// bit is decoded in-tree for this family (`PHYSTAT_LINKSTS`);
+/// speed/duplex decode is PHY work (issue #790), so the sample is
+/// carrier-only rather than a guessed rate.
+fn r8169_link_sample(status: u8) -> crate::publish::LinkSample {
+    crate::publish::LinkSample::carrier_only(status & PHYSTAT_LINKSTS != 0)
+}
+
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -993,6 +1020,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
+    // name + carrier metadata via the shared helper. The frame-ring
+    // registration below stays.
+    let mac = with_controller(|c| c.mac).unwrap_or([0; 6]);
+    let status = with_controller(|c| c.phy_status()).unwrap_or(0);
+    let name = crate::publish::publish_netdev(mac, r8169_send_frame, r8169_link_sample(status));
+    R8169_IFNAME.set(name);
+
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
         Some(a) => a.derive().ok(),
@@ -1025,12 +1060,27 @@ fn spawn_pumps(
 }
 
 async fn r8169_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    // Carrier refresh (issue #791): the production datapath is polled
+    // (probe never enables MSI-X, so the LinkChg bit in the ISR has no
+    // consumer), which makes this pump the family's link observer.
+    // `phy_status()` is an `&self` MMIO read — unlike
+    // `refresh_link_state(&mut self)`, it is safe to call while pumps
+    // hold Arc clones. A transition republishes the iface metadata;
+    // the cached `Interface::link_up` snapshot is left as-is.
+    let mut last_sample = r8169_link_sample(device.phy_status());
     loop {
+        let sample = r8169_link_sample(device.phy_status());
+        if sample != last_sample {
+            last_sample = sample;
+            crate::publish::publish_link(r8169_ifname(), sample);
+        }
         if let Some(pkt) = device.receive() {
             let dma_buf =
                 alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
+            // Dual delivery (issue #784), as on e1000.
+            crate::publish::deliver_rx(r8169_ifname(), frame.payload_mut());
             let _ = rx_prod.send(frame).await;
         }
         narf_scheduler::yield_now().await;
@@ -1063,7 +1113,14 @@ pub struct Rtl8168Nic;
 
 impl narf_net::Interface for Rtl8168Nic {
     fn name(&self) -> &str {
-        "eth3"
+        // The dynamic `eth%d` name once published (issue #784); the
+        // old frame-ring name before probe gets that far.
+        let n = r8169_ifname();
+        if n.is_empty() {
+            "eth3"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -1100,7 +1157,12 @@ impl narf_net::Interface for Rtl8168Nic {
 
 impl crate::HwNic for Rtl8168Nic {
     fn name(&self) -> &'static str {
-        "eth3"
+        let n = r8169_ifname();
+        if n.is_empty() {
+            "eth3"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
