@@ -5020,3 +5020,485 @@ kernel_test_in!(
     "drivers/usb/hub",
     smoke_usb_hub_set_feature_port_power_encode
 );
+
+// ── UAC topology / bind / card fixtures (queue 29, #777) ───────────
+//
+// Modelled devices: a UAC1 headset (playback + capture) and a
+// UAC2 playback DAC with a programmable clock source. The blobs
+// are hand-assembled configuration descriptors; the assertions
+// pin the topology walk, the bind conversation ORDER, card
+// publication, the pump, and detach.
+
+/// UAC1 headset: AC iface 0 (IT 1 USB-streaming → FU 2 → OT 3
+/// speaker; IT 4 mic → FU 5 → OT 6 USB-streaming), AS iface 1
+/// playback (alt 1: stereo 16-bit 44.1/48 kHz, OUT ep 0x01,
+/// 192 B packets), AS iface 2 capture (alt 1: mono 16-bit
+/// 48 kHz, IN ep 0x82, 96 B packets).
+fn uac1_headset_config() -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::new();
+    let mut add = |d: &[u8]| v.extend_from_slice(d);
+    add(&[9, 0x02, 0, 0, 3, 1, 0, 0x80, 50]); // CONFIGURATION
+    add(&[9, 0x04, 0, 0, 0, 0x01, 0x01, 0x00, 0]); // iface 0 AC (UAC1)
+    add(&[10, 0x24, 0x01, 0x00, 0x01, 62, 0, 2, 1, 2]); // AC HEADER
+    add(&[12, 0x24, 0x02, 1, 0x01, 0x01, 0, 2, 0x03, 0x00, 0, 0]); // IT 1
+    add(&[
+        13, 0x24, 0x06, 2, 1, 2, 0x03, 0x00, 0x02, 0x00, 0x02, 0x00, 0,
+    ]); // FU 2
+    add(&[9, 0x24, 0x03, 3, 0x01, 0x03, 0, 2, 0]); // OT 3 speaker
+    add(&[12, 0x24, 0x02, 4, 0x01, 0x02, 0, 1, 0x01, 0x00, 0, 0]); // IT 4 mic
+    add(&[11, 0x24, 0x06, 5, 4, 2, 0x03, 0x00, 0x02, 0x00, 0]); // FU 5
+    add(&[9, 0x24, 0x03, 6, 0x01, 0x01, 0, 5, 0]); // OT 6 streaming
+    add(&[9, 0x04, 1, 0, 0, 0x01, 0x02, 0x00, 0]); // AS 1 alt 0
+    add(&[7, 0x24, 0x01, 1, 0, 0x01, 0x00]); // AS_GENERAL link 1 PCM
+    add(&[9, 0x04, 1, 1, 1, 0x01, 0x02, 0x00, 0]); // AS 1 alt 1
+    add(&[7, 0x24, 0x01, 1, 0, 0x01, 0x00]);
+    // FORMAT_TYPE_I: stereo, subframe 2, 16-bit, {44100, 48000}
+    add(&[
+        14, 0x24, 0x02, 0x01, 2, 2, 16, 2, 0x44, 0xAC, 0x00, 0x80, 0xBB, 0x00,
+    ]);
+    add(&[9, 0x05, 0x01, 0x05, 0xC0, 0x00, 1, 0, 0]); // EP OUT 192 B
+    add(&[7, 0x25, 0x01, 0x01, 0, 0x00, 0x00]); // CS_ENDPOINT freq ctl
+    add(&[9, 0x04, 2, 0, 0, 0x01, 0x02, 0x00, 0]); // AS 2 alt 0
+    add(&[7, 0x24, 0x01, 6, 0, 0x01, 0x00]); // AS_GENERAL link 6 PCM
+    add(&[9, 0x04, 2, 1, 1, 0x01, 0x02, 0x00, 0]); // AS 2 alt 1
+    add(&[7, 0x24, 0x01, 6, 0, 0x01, 0x00]);
+    // FORMAT_TYPE_I: mono, subframe 2, 16-bit, {48000}
+    add(&[11, 0x24, 0x02, 0x01, 1, 2, 16, 1, 0x80, 0xBB, 0x00]);
+    add(&[9, 0x05, 0x82, 0x05, 96, 0x00, 1, 0, 0]); // EP IN 96 B
+    v
+}
+
+/// UAC2 playback DAC: AC iface 0 (clock source 9 → IT 1
+/// USB-streaming → FU 2 → OT 3 speaker), AS iface 1 (alt 1:
+/// stereo 24-in-32, OUT ep 0x01, 768 B packets).
+fn uac2_dac_config() -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::new();
+    let mut add = |d: &[u8]| v.extend_from_slice(d);
+    add(&[9, 0x02, 0, 0, 2, 1, 0, 0x80, 50]); // CONFIGURATION
+    add(&[9, 0x04, 0, 0, 0, 0x01, 0x01, 0x20, 0]); // iface 0 AC (UAC2)
+    add(&[9, 0x24, 0x01, 0x00, 0x02, 0x09, 55, 0, 0]); // HEADER v2
+    add(&[8, 0x24, 0x0A, 9, 2, 0x03, 1, 0]); // CLOCK_SOURCE 9, programmable
+    add(&[
+        18, 0x24, 0x02, 1, 0x01, 0x01, 0, 2, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]); // IT 1
+    add(&[
+        18, 0x24, 0x06, 2, 1, 0x0F, 0, 0, 0, 0x0C, 0, 0, 0, 0x0C, 0, 0, 0, 0,
+    ]); // FU 2
+    add(&[12, 0x24, 0x03, 3, 0x01, 0x03, 0, 2, 0, 0, 0, 0]); // OT 3 speaker
+    add(&[9, 0x04, 1, 0, 0, 0x01, 0x02, 0x20, 0]); // AS 1 alt 0
+    add(&[16, 0x24, 0x01, 1, 0, 1, 1, 0, 0, 0, 2, 3, 0, 0, 0, 0]); // AS_GENERAL v2
+    add(&[9, 0x04, 1, 1, 1, 0x01, 0x02, 0x20, 0]); // AS 1 alt 1
+    add(&[16, 0x24, 0x01, 1, 0, 1, 1, 0, 0, 0, 2, 3, 0, 0, 0, 0]);
+    add(&[6, 0x24, 0x02, 0x01, 4, 24]); // FORMAT_TYPE_I v2: 24-in-32
+    add(&[9, 0x05, 0x01, 0x05, 0x00, 0x03, 1, 0, 0]); // EP OUT 768 B
+    v
+}
+
+fn smoke_uac_topology_walk_uac1_headset() -> TestResult {
+    use crate::uac::{UacTopology, UacVersion};
+    let cfg = uac1_headset_config();
+    let topo = match UacTopology::parse(&cfg) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("UAC1 topology parse"),
+    };
+    if topo.version != UacVersion::V1 || topo.ac_iface != 0 {
+        return TestResult::Fail("UAC1 version / AC iface");
+    }
+    if topo.terminals.len() != 4 || topo.feature_units.len() != 2 {
+        return TestResult::Fail("UAC1 terminal / FU counts");
+    }
+    if topo.streams.len() != 2 {
+        return TestResult::Fail("UAC1 stream count");
+    }
+    let pb = &topo.streams[0];
+    let cap = &topo.streams[1];
+    if pb.iface != 1 || pb.terminal_link != 1 || pb.is_capture() != Some(false) {
+        return TestResult::Fail("UAC1 playback stream shape");
+    }
+    if cap.iface != 2 || cap.terminal_link != 6 || cap.is_capture() != Some(true) {
+        return TestResult::Fail("UAC1 capture stream shape");
+    }
+    if pb.alts.len() != 2 || pb.alts[1].ep_addr != 0x01 || pb.alts[1].ep_max_packet != 192 {
+        return TestResult::Fail("UAC1 playback alts");
+    }
+    let choice = match crate::uac::choose_stream_default(pb, topo.version) {
+        Some(c) => c,
+        None => return TestResult::Fail("UAC1 playback default choice"),
+    };
+    if choice.alt_setting != 1 || choice.rate_hz != 48_000 || choice.channels != 2 {
+        return TestResult::Fail("UAC1 playback choice = alt 1, 48 kHz stereo");
+    }
+    let fu = match topo.feature_unit_for(1) {
+        Some(f) => f,
+        None => return TestResult::Fail("UAC1 FU on playback path"),
+    };
+    if fu.id != 2 || fu.master_controls & crate::uac::FEATURE_VOLUME == 0 {
+        return TestResult::Fail("UAC1 playback FU id / volume bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_topology_walk_uac1_headset);
+
+fn smoke_uac_topology_walk_uac2_clock() -> TestResult {
+    use crate::uac::{UacTopology, UacVersion};
+    let cfg = uac2_dac_config();
+    let topo = match UacTopology::parse(&cfg) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("UAC2 topology parse"),
+    };
+    if topo.version != UacVersion::V2 {
+        return TestResult::Fail("UAC2 version");
+    }
+    if topo.terminals.len() != 2 || topo.feature_units.len() != 1 {
+        return TestResult::Fail("UAC2 terminal / FU counts");
+    }
+    if topo.clocks.len() != 1 {
+        return TestResult::Fail("UAC2 clock count");
+    }
+    let clock = match topo.clock_for_terminal(1) {
+        Some(c) => c,
+        None => return TestResult::Fail("UAC2 clock resolution for terminal 1"),
+    };
+    if clock.id != 9 || !clock.freq_programmable {
+        return TestResult::Fail("UAC2 clock id / programmable");
+    }
+    let stream = &topo.streams[0];
+    let choice = match crate::uac::choose_stream_default(stream, topo.version) {
+        Some(c) => c,
+        None => return TestResult::Fail("UAC2 default choice"),
+    };
+    if choice.rate_hz != 48_000 || choice.channels != 2 || choice.subframe_size != 4 {
+        return TestResult::Fail("UAC2 choice = 48 kHz, 24-in-32 stereo");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_topology_walk_uac2_clock);
+
+fn smoke_uac_clock_rate_choice() -> TestResult {
+    use crate::uac::{choose_clock_rate, ClockSubrange};
+    let r = |min_hz, max_hz, res_hz| ClockSubrange {
+        min_hz,
+        max_hz,
+        res_hz,
+    };
+    if choose_clock_rate(&[r(44_100, 48_000, 100)]) != Some(48_000) {
+        return TestResult::Fail("clock choice prefers 48k in range");
+    }
+    if choose_clock_rate(&[r(96_000, 192_000, 0)]) != Some(96_000) {
+        return TestResult::Fail("clock choice falls to lowest subrange min");
+    }
+    if choose_clock_rate(&[r(44_100, 44_100, 0), r(48_000, 48_000, 0)]) != Some(48_000) {
+        return TestResult::Fail("clock choice scans all subranges");
+    }
+    if choose_clock_rate(&[]).is_some() {
+        return TestResult::Fail("clock choice empty = None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_clock_rate_choice);
+
+fn smoke_uac_bind_plan_uac1_order() -> TestResult {
+    use crate::uac::{build_bind_plan, StepData, UacTopology};
+    let cfg = uac1_headset_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    choices.sort_by_key(|c| c.capture);
+    let plan = build_bind_plan(&topo, 1, &choices);
+    // SET_CONFIGURATION + per direction (SET_INTERFACE, SET_CUR
+    // freq, GET_MIN, GET_MAX, GET_RES, SET_CUR vol, SET_CUR mute).
+    if plan.len() != 15 {
+        return TestResult::Fail("UAC1 plan length = 15");
+    }
+    let s0 = &plan[0];
+    if s0.request_type != 0x00 || s0.request != 0x09 || s0.value != 1 || !s0.fatal {
+        return TestResult::Fail("plan[0] = SET_CONFIGURATION");
+    }
+    let s1 = &plan[1];
+    if s1.request != crate::control::REQ_SET_INTERFACE || s1.value != 1 || s1.index != 1 {
+        return TestResult::Fail("plan[1] = SET_INTERFACE playback alt 1");
+    }
+    let s2 = &plan[2];
+    if s2.request_type != 0x22 || s2.request != crate::uac::REQ_SET_CUR || s2.index != 0x01 {
+        return TestResult::Fail("plan[2] = SET_CUR freq on OUT ep");
+    }
+    match &s2.data {
+        StepData::Out(b) if b.as_slice() == [0x80, 0xBB, 0x00] => {}
+        _ => return TestResult::Fail("plan[2] payload = 48000 24-bit LE"),
+    }
+    let s3 = &plan[3];
+    if s3.request != crate::uac::REQ_GET_MIN || s3.fatal {
+        return TestResult::Fail("plan[3] = non-fatal GET_MIN");
+    }
+    if s3.index != crate::uac::fu_windex(2, 0) {
+        return TestResult::Fail("plan[3] targets playback FU 2");
+    }
+    let s6 = &plan[6];
+    if s6.request != crate::uac::REQ_SET_CUR
+        || s6.value != crate::uac::fu_wvalue(crate::uac::FU_CS_VOLUME, 0)
+    {
+        return TestResult::Fail("plan[6] = SET_CUR volume");
+    }
+    let s7 = &plan[7];
+    if s7.value != crate::uac::fu_wvalue(crate::uac::FU_CS_MUTE, 0) {
+        return TestResult::Fail("plan[7] = SET_CUR mute");
+    }
+    let s8 = &plan[8];
+    if s8.request != crate::control::REQ_SET_INTERFACE || s8.index != 2 {
+        return TestResult::Fail("plan[8] = SET_INTERFACE capture");
+    }
+    let last = &plan[14];
+    if last.index != crate::uac::fu_windex(5, 0) {
+        return TestResult::Fail("plan[14] targets capture FU 5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_bind_plan_uac1_order);
+
+fn smoke_uac_bind_plan_uac2_clock() -> TestResult {
+    use crate::uac::{build_bind_plan, ResponseSlot, StepData, UacTopology};
+    let cfg = uac2_dac_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let choice = crate::uac::choose_stream_default(&topo.streams[0], topo.version).expect("choice");
+    let plan = build_bind_plan(&topo, 1, &[choice]);
+    // SET_CONFIGURATION, SET_INTERFACE, GET_RANGE, SET_CUR clock,
+    // GET_MIN, GET_MAX, GET_RES, SET_CUR vol, SET_CUR mute.
+    if plan.len() != 9 {
+        return TestResult::Fail("UAC2 plan length = 9");
+    }
+    let rng = &plan[2];
+    if rng.request != crate::uac::REQ_RANGE || rng.request_type != 0xA1 || rng.fatal {
+        return TestResult::Fail("plan[2] = non-fatal GET_RANGE");
+    }
+    if rng.index != (9 << 8) || rng.slot != (ResponseSlot::ClockRange { capture: false }) {
+        return TestResult::Fail("plan[2] addresses clock 9, range slot");
+    }
+    let set = &plan[3];
+    if set.request != crate::uac::REQ_CUR || set.index != (9 << 8) {
+        return TestResult::Fail("plan[3] = SET_CUR on clock 9");
+    }
+    if set.resolve_rate_from_range != Some(false) {
+        return TestResult::Fail("plan[3] resolves rate from RANGE");
+    }
+    match &set.data {
+        StepData::Out(b) if b.as_slice() == 48_000u32.to_le_bytes() => {}
+        _ => return TestResult::Fail("plan[3] payload = 48000 u32 LE"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_bind_plan_uac2_clock);
+
+fn smoke_uac_card_publication() -> TestResult {
+    use crate::uac::{BindOutcome, UacTopology};
+    let cfg = uac1_headset_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    let state =
+        crate::uac_card::UacCardState::from_bind(7, &topo, &choices, &BindOutcome::default());
+    let idx = match crate::uac_card::register_card(&state) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("register_card"),
+    };
+    let pb = match narf_drivers_sound::default_hw_params(idx, false) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("card visible in sound registry (playback)"),
+    };
+    if pb.rate != narf_drivers_sound::SampleRate::R48000
+        || pb.channels != narf_drivers_sound::ChannelCount::Stereo
+        || pb.format != narf_drivers_sound::format::SampleFormat::S16LE
+    {
+        return TestResult::Fail("playback default params = 48k stereo S16LE");
+    }
+    let cap = match narf_drivers_sound::default_hw_params(idx, true) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("card visible in sound registry (capture)"),
+    };
+    if cap.channels != narf_drivers_sound::ChannelCount::Mono {
+        return TestResult::Fail("capture default params = mono");
+    }
+    state.detach();
+    if narf_drivers_sound::default_hw_params(idx, false).is_ok() {
+        return TestResult::Fail("card gone after detach");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_card_publication);
+
+#[derive(Clone)]
+struct FakeIsoState {
+    out_log: alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>>,
+    in_queue: alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>>,
+}
+
+impl FakeIsoState {
+    fn new() -> Self {
+        Self {
+            out_log: alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                alloc::vec::Vec::new(),
+            )),
+            in_queue: alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                alloc::vec::Vec::new(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FakeIso(FakeIsoState);
+
+impl core::fmt::Debug for FakeIso {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("FakeIso")
+    }
+}
+
+impl crate::uac_card::IsoTransfer for FakeIso {
+    fn isoch_out(&self, data: &[u8]) -> Result<usize, narf_drivers_sound::SoundError> {
+        self.0.out_log.lock().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn isoch_in(&self, out: &mut [u8]) -> Result<usize, narf_drivers_sound::SoundError> {
+        let mut q = self.0.in_queue.lock();
+        let n = out.len().min(q.len());
+        out[..n].copy_from_slice(&q[..n]);
+        q.drain(..n);
+        Ok(n)
+    }
+}
+
+fn smoke_uac_pump_moves_frames() -> TestResult {
+    use crate::uac::{BindOutcome, UacTopology};
+    use narf_drivers_sound::hardware::PcmHardware;
+    let cfg = uac1_headset_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    let state =
+        crate::uac_card::UacCardState::from_bind(7, &topo, &choices, &BindOutcome::default());
+
+    // Playback: 48 frames of pattern → one packet out; an empty
+    // ring still clocks a full silence packet.
+    let pb_iso = FakeIso(FakeIsoState::new());
+    let mut pb = match crate::uac_card::UacStream::with_iso(
+        state.clone(),
+        false,
+        alloc::boxed::Box::new(pb_iso.clone()),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("playback lease"),
+    };
+    let dev: &dyn narf_drivers_sound::hardware::PcmDevice =
+        &crate::uac_card::UsbAudioCard(state.clone());
+    let params = dev.default_params(false);
+    if pb.configure(params).is_err() || pb.prepare().is_err() || pb.start().is_err() {
+        return TestResult::Fail("playback configure/prepare/start");
+    }
+    let pattern: alloc::vec::Vec<u8> = (0..192u32).map(|i| (i % 251) as u8).collect();
+    if pb.write(&pattern) != Ok(192) {
+        return TestResult::Fail("playback write accepts 192 B");
+    }
+    if pb.pump_once().is_err() {
+        return TestResult::Fail("playback pump step");
+    }
+    {
+        let log = pb_iso.0.out_log.lock();
+        if log.as_slice() != pattern.as_slice() {
+            return TestResult::Fail("pump moved the exact queued bytes");
+        }
+    }
+    if pb.pointer() != 48 {
+        return TestResult::Fail("pointer advanced 48 frames");
+    }
+    if pb.pump_once().is_err() {
+        return TestResult::Fail("playback underrun pump step");
+    }
+    {
+        let log = pb_iso.0.out_log.lock();
+        if log.len() != 384 || log[192..].iter().any(|b| *b != 0) {
+            return TestResult::Fail("underrun clocks silence");
+        }
+    }
+    if pb.stop().is_err() {
+        return TestResult::Fail("playback stop");
+    }
+
+    // Capture: a queued device packet lands in the ring and
+    // read() returns it verbatim.
+    let cap_iso = FakeIso(FakeIsoState::new());
+    let mic: alloc::vec::Vec<u8> = (0..96u32).map(|i| (200 - i) as u8).collect();
+    cap_iso.0.in_queue.lock().extend_from_slice(&mic);
+    let mut cap = match crate::uac_card::UacStream::with_iso(
+        state.clone(),
+        true,
+        alloc::boxed::Box::new(cap_iso),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("capture lease"),
+    };
+    let cparams = dev.default_params(true);
+    if cap.configure(cparams).is_err() || cap.prepare().is_err() || cap.start().is_err() {
+        return TestResult::Fail("capture configure/prepare/start");
+    }
+    if cap.pump_once().is_err() {
+        return TestResult::Fail("capture pump step");
+    }
+    let mut out = [0u8; 96];
+    match cap.read(&mut out) {
+        Ok(96) if out == mic.as_slice() => {}
+        _ => return TestResult::Fail("capture read returns the device packet"),
+    }
+    if cap.pointer() != 48 {
+        return TestResult::Fail("capture pointer advanced 48 frames");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_pump_moves_frames);
+
+fn smoke_uac_detach_removes_registry_and_card() -> TestResult {
+    use crate::uac::{BindOutcome, UacTopology};
+    crate::uac::__reset_uac_for_test();
+    let cfg = uac1_headset_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    let state =
+        crate::uac_card::UacCardState::from_bind(9, &topo, &choices, &BindOutcome::default());
+    let idx = match crate::uac_card::register_card(&state) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("register card for detach fixture"),
+    };
+    let (out_dci, in_dci) = crate::uac::find_audio_streaming_iso_eps(&cfg);
+    crate::uac::__push_uac_for_test(crate::uac::UacDevice {
+        slot_id: 9,
+        ac_iface: 0,
+        iso_out_dci: out_dci,
+        iso_in_dci: in_dci,
+        card: Some(state),
+    });
+    if crate::uac::attached_uac_count() != 1 {
+        return TestResult::Fail("registry holds the bound device");
+    }
+    if crate::uac::unbind_all_uac() != 1 {
+        return TestResult::Fail("unbind removes one entry");
+    }
+    if crate::uac::attached_uac_count() != 0 {
+        return TestResult::Fail("registry empty after unbind");
+    }
+    if narf_drivers_sound::default_hw_params(idx, false).is_ok() {
+        return TestResult::Fail("card unregistered after unbind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_uac_detach_removes_registry_and_card
+);

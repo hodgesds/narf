@@ -21,7 +21,8 @@ without invalidating outstanding stream leases. `default_hw_params(card,
 capture)` returns a backend's supported starting configuration.
 `register_hardware_card_at(info, backend, Option<BusAddr>)` associates a card
 with its physical bus parent. HDA, ACP and VirtIO use this entry point; the
-parentless entry point remains available for virtual cards. The static ALSA
+parentless entry point remains available for virtual cards and for USB
+Audio (`snd-usb-audio`), whose slots have no `BusAddr`. The static ALSA
 device-number layout supports at most eight PCM devices per direction per
 card; registration asserts this driver-supplied bound. Control minors are
 `card * 32`, playback minors `card * 32 + 16 + device`, and capture minors
