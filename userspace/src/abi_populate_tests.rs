@@ -450,10 +450,17 @@ fn smoke_populate_write_breaks_cow() -> TestResult {
             unsafe {
                 *narf_memory::PhysAddr::new(child0).kernel_mut_ptr::<u32>() = 0xDEAD_BEEF;
             }
+            // SAFETY: `parent0` still backs the parent's page in
+            // the live parent space; the read is the frame's first
+            // word through the direct-map alias.
             let parent_word = unsafe { *narf_memory::PhysAddr::new(parent0).kernel_ptr::<u32>() };
             if parent_word != 0xCAFE_BABE {
                 return Err("the child's post-populate write leaked into the parent");
             }
+            // SAFETY: `child0` is the child's private frame after
+            // the split (checked distinct from `parent0` above),
+            // still mapped in the live child space; the read is
+            // its first word through the direct-map alias.
             let child_word = unsafe { *narf_memory::PhysAddr::new(child0).kernel_ptr::<u32>() };
             if child_word != 0xDEAD_BEEF {
                 return Err("the child's private frame did not retain the write");
