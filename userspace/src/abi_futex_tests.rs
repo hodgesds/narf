@@ -276,23 +276,37 @@ kernel_test_in!(
 );
 
 /// Anonymous `MAP_SHARED` is one shmem object shared across `fork`: the
-/// parent's waiter is reached from the child. An UNRELATED process with its
-/// own anonymous shared mapping at the same address is a different object
-/// and must not reach it.
+/// parent's waiter is reached from the child, and a waiter queued from the
+/// child is reached from the parent. An UNRELATED process with its own
+/// anonymous shared mapping at the same address is a different object and
+/// must not reach it.
 fn smoke_abi_futex_shared_anon_follows_fork_not_va() -> TestResult {
     with_setup(|| {
         const VA: u64 = 0x0000_0100_5f20_0000;
         const TID: u64 = 0x7e_0031;
+        const TID2: u64 = 0x7e_0032;
         let parent = new_as()?;
         let stranger = new_as()?;
         let body = || -> Result<(), &'static str> {
             switch_to(&parent);
             mmap(VA, 4096, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, u64::MAX)?;
             // SAFETY: paging is live; the child is an inactive copy whose
-            // region table is all this test consults.
+            // region table and inherited owner rows are all this test
+            // consults.
             let child = unsafe { parent.clone_for_fork() }
                 .map(Arc::new)
                 .map_err(|_| "clone_for_fork failed")?;
+            // `clone_for_fork` is only the memory half of a fork. The fork
+            // and clone handlers pair it with the mapping-owner inheritance
+            // below (`sys_fork` and the clone handler in core.inc.rs:
+            // "Publish inherited mapping owners before the child becomes
+            // runnable") — the owner registry lives in this crate, keyed by
+            // address-space identity, so the memory layer cannot carry it.
+            // Without this step the child has no owner row for the shared
+            // mapping, its shared-op `get_futex_key` cannot resolve the
+            // object, and the wake below misses for a harness-modelling
+            // reason, not the semantics this test pins (#733).
+            crate::mapped_file::fork_address_space(parent.identity(), child.identity());
             let hits = queue(false, VA + 4, MATCH_ANY, TID)?;
             switch_to(&stranger);
             mmap(VA, 4096, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, u64::MAX)?;
@@ -307,6 +321,18 @@ fn smoke_abi_futex_shared_anon_follows_fork_not_va() -> TestResult {
             if woke != Some(1) || hits.load(Ordering::Acquire) != 1 {
                 crate::handlers::__test_futex_drop_current(false, VA + 4, TID);
                 return Err("the fork child's FUTEX_WAKE missed the parent's waiter");
+            }
+            // The reverse direction rides the same object key: a waiter
+            // queued FROM the child — whose `get_futex_key` resolves the
+            // inherited owner row — is reached by the parent's wake.
+            switch_to(&child);
+            let hits2 = queue(false, VA + 4, MATCH_ANY, TID2)?;
+            switch_to(&parent);
+            if futex(VA + 4, FUTEX_WAKE, 1, 0) != Some(1) || hits2.load(Ordering::Acquire) != 1 {
+                switch_to(&child);
+                crate::handlers::__test_futex_drop_current(false, VA + 4, TID2);
+                switch_to(&parent);
+                return Err("the parent's FUTEX_WAKE missed the fork child's waiter");
             }
             Ok(())
         };
