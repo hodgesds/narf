@@ -1620,6 +1620,9 @@ argument = "The MADV_DONTNEED deferred-flush change stays inside memory/, an exi
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The change performs no new kernel-side data access: it reads no additional memory, invokes no capability, and changes no domain tag, mapping permission, or task state. It invokes the pre-existing defer_punch_flush/drain_deferred_batch path (one IrqSafeSpinLock acquisition on the address space's own quarantine) in place of a synchronous shootdown plus immediate batched free. MADV_FREE's lazy-marking flush and the shared/file munmap paths are deliberately left synchronous: the former's invalidation is what forces a peer CPU's post-mark store to re-set the PTE DIRTY bit before the reclaim discard pass can judge the page clean, and the latter's frame release is ordered inside the per-AS shared-mapping transaction against the external owner's alias publication, so neither is deferred."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
 agent = "OpenAI Codex GPT-6"
 prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
 argument = "The WC prerequisite extends existing frame boot initialization, architecture cache-attribute encoders and memory user-leaf installation. No subsystem joins the TCB. Device mmap providers request only a cache type for frames they already own; this grants no new mapping or capability authority."
