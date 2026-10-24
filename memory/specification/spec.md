@@ -1060,7 +1060,15 @@ impl AddressSpace {
     /// faults the range back in place (Linux `unmap_mapping_range`). The
     /// outcome distinguishes retention from the fallback to full range
     /// removal (windows intersecting swap-backed pages or a huge leaf),
-    /// so upper file-owner tables mirror exactly what memory did.
+    /// so upper file-owner tables mirror exactly what memory did. The
+    /// pass also cancels in-flight demand claims in the window (the
+    /// removal paths' `retain_outside` discipline, applied to the
+    /// retained window under the same lock hold), so a fault that
+    /// claimed before the pass cannot finish into the window afterwards:
+    /// its finish refuses and the fault path releases the frame its
+    /// lock-free fill fetched against the pre-truncate file. Single and
+    /// batch claims share the ticket table and the finish transaction,
+    /// so the one cancellation covers both.
     pub unsafe fn zap_mapping_range_locked_for_syscall_with_shared(/* ... */)
         -> Result<ZapOutcome, AddressSpaceError>;
 }

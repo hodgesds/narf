@@ -1390,37 +1390,87 @@ fn demand_frame_inner(
     }
     publication.commit();
 
-    let registered = {
+    // Recording the fetched frame as the owner row's writeback fallback
+    // has three outcomes, because this fill ran lock-free and the world
+    // may have moved since its entry checks:
+    //
+    // - `Recorded`: the slot now names the frame. It is written only for
+    //   a fill publication can still adopt — see `Revoked`.
+    // - `Revoked`: the file changed under the fill — its size shrank
+    //   past this page, or its cache generation moved (any content
+    //   mutation bumps it). The filesystems publish the new EOF and bump
+    //   the generation BEFORE revoking mappings (the #690 truncate
+    //   ordering), and this check runs under the same owner-bucket lock
+    //   as the zap's owner mirror (`zap_owner_rows_locked`), so a
+    //   shrink that crossed this page is always visible here by the
+    //   time registration could land after the mirror pass. In that
+    //   interleave the truncate zap has cancelled this fault's demand
+    //   claim, `finish_demand_page` will refuse publication, and the
+    //   fault path will release the frame's mapping hold through its
+    //   false path; writing the slot anyway would leave the RETAINED
+    //   row naming a frame no mapping holds, and a later msync would
+    //   write back through it. So the slot is left empty — the "no
+    //   fallback frame" state every consumer already honours — and the
+    //   frame is still returned, with its hold, for memory's finish to
+    //   dispose of. A generation move without a shrink (a racing write)
+    //   takes the same branch: the page may well publish, just without
+    //   a fallback record; the frame remains the canonical cache page,
+    //   reachable by the cache-side flush (`flush_shared_pages_for_ops`),
+    //   which is the same reach the flush lifecycle gives any fallback
+    //   page whose owner has unmapped it.
+    // - `Failed`: the row (or its writeback table, or the capacity to
+    //   extend it) is gone, so no publication may proceed — the
+    //   historical outcome: release the hold here and fail the fault.
+    enum Registration {
+        Recorded,
+        Revoked,
+        Failed,
+    }
+    let registration = {
         let mut owners = owner_bucket.lock();
-        owners
-            .iter_mut()
-            .find(|mapping| {
-                page >= mapping.base
-                    && page < mapping.base.saturating_add(mapping.len)
-                    && Arc::ptr_eq(&mapping.ops, &ops)
-                    && mapping.file_offset.checked_add(page - mapping.base) == Some(offset)
-            })
-            .and_then(|mapping| {
-                let writeback = mapping.writeback.as_mut()?;
-                let index = ((page - mapping.base) >> 12) as usize;
-                if index >= writeback.phys.len() {
-                    writeback
-                        .phys
-                        .try_reserve_exact(index + 1 - writeback.phys.len())
-                        .ok()?;
-                    writeback.phys.resize(index + 1, PhysAddr::new(0));
+        let found = owners.iter_mut().find(|mapping| {
+            page >= mapping.base
+                && page < mapping.base.saturating_add(mapping.len)
+                && Arc::ptr_eq(&mapping.ops, &ops)
+                && mapping.file_offset.checked_add(page - mapping.base) == Some(offset)
+        });
+        match found {
+            None => Registration::Failed,
+            Some(mapping) => match mapping.writeback.as_mut() {
+                None => Registration::Failed,
+                Some(writeback) => {
+                    let index = ((page - mapping.base) >> 12) as usize;
+                    if index >= writeback.phys.len()
+                        && writeback
+                            .phys
+                            .try_reserve_exact(index + 1 - writeback.phys.len())
+                            .is_err()
+                    {
+                        Registration::Failed
+                    } else {
+                        if index >= writeback.phys.len() {
+                            writeback.phys.resize(index + 1, PhysAddr::new(0));
+                        }
+                        if offset >= ops.stat().size
+                            || ops.mmap_cache_generation() != expected_generation
+                        {
+                            Registration::Revoked
+                        } else {
+                            let slot = &mut writeback.phys[index];
+                            // A prior leaf-install failure can leave a safe,
+                            // unretained cache identity in this writeback
+                            // slot. The memory fault path balanced that
+                            // page's mapping reference; overwrite the stale
+                            // identity on retry before publication.
+                            *slot = phys;
+                            Registration::Recorded
+                        }
+                    }
                 }
-                let slot = &mut writeback.phys[index];
-                // A prior leaf-install failure can leave a safe, unretained
-                // cache identity in this writeback slot. The memory fault
-                // path balanced that page's mapping reference; overwrite the
-                // stale identity on retry before publication.
-                *slot = phys;
-                Some(())
-            })
-            .is_some()
+            },
+        }
     };
-    if !registered {
+    if matches!(registration, Registration::Failed) {
         let released = release_shared_file_page(phys.raw());
         debug_assert!(released);
         return Err(FileFaultError::NoOwner);
@@ -3009,6 +3059,285 @@ mod tests {
     }
 
     kernel_test_in!("userspace", smoke_mapped_file_zap_mirrors_all_outcomes);
+
+    /// A generation-disciplined generic-fallback file whose `read` can
+    /// be armed to land a shrink-truncate in the middle of a demand
+    /// fill: the fill's entry checks pass against the old size, then
+    /// the read publishes the new EOF and bumps the generation (the
+    /// #690 filesystem ordering) and runs the real truncate revoke
+    /// composition — VMA transaction → shared-owner transaction →
+    /// `publish_current_zap` over the zap primitive — before returning
+    /// the pre-shrink bytes. That is the parked-fill interleave of
+    /// #691's second review, modelled on one stack: claim and finish
+    /// are memory's real code, the fill is the real hook, and only the
+    /// scheduling of the truncate is modelled.
+    struct ZapRaceOwner {
+        size: AtomicU64,
+        generation: AtomicU64,
+        store: IrqSafeSpinLock<alloc::vec::Vec<u8>>,
+        identity: usize,
+        zap_as: IrqSafeSpinLock<Option<Arc<narf_memory::AddressSpace>>>,
+        zap_base: AtomicU64,
+        zap_armed: core::sync::atomic::AtomicBool,
+        zap_outcome: AtomicU64,
+    }
+
+    impl FileOps for ZapRaceOwner {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            if offset == 4096 && self.zap_armed.swap(false, Ordering::AcqRel) {
+                // The shrink lands mid-fill. Generation bump and EOF
+                // publication first, then the revoke — a filesystem
+                // that revoked first would let this fill's registration
+                // check (below) observe a state no real truncate
+                // produces.
+                self.generation.fetch_add(1, Ordering::Release);
+                self.size.store(4096, Ordering::Release);
+                if let Some(aspace) = self.zap_as.lock().clone() {
+                    let id = aspace.identity();
+                    let base = self.zap_base.load(Ordering::Acquire);
+                    let outcome = aspace.with_vma_transaction(|| {
+                        narf_memory::with_address_space_shared_mapping_transaction(id, || {
+                            publish_current_zap(id, base, 4096, || {
+                                // SAFETY: this closure runs under the
+                                // VMA -> shared-owner transaction order
+                                // `truncate_file_mappings` itself uses.
+                                unsafe {
+                                    aspace.zap_mapping_range_locked_for_syscall_with_shared(
+                                        narf_memory::VirtAddr::new(base),
+                                        4096,
+                                        true,
+                                    )
+                                }
+                            })
+                        })
+                    });
+                    self.zap_outcome.store(
+                        match outcome {
+                            Ok(ZapOutcome::Retained) => 1,
+                            Ok(ZapOutcome::RangeRemoved) => 2,
+                            Err(_) => 3,
+                        },
+                        Ordering::Release,
+                    );
+                }
+            }
+            let n = {
+                let store = self.store.lock();
+                let start = (offset as usize).min(store.len());
+                let n = buf.len().min(store.len() - start);
+                buf[..n].copy_from_slice(&store[start..start + n]);
+                n
+            };
+            Box::pin(async move { Ok(n) })
+        }
+
+        fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            let mut store = self.store.lock();
+            let start = offset as usize;
+            if store.len() < start + buf.len() {
+                store.resize(start + buf.len(), 0);
+            }
+            store[start..start + buf.len()].copy_from_slice(buf);
+            Box::pin(async move { Ok(buf.len()) })
+        }
+
+        fn stat(&self) -> Stat {
+            Stat {
+                size: self.size.load(Ordering::Acquire),
+                blocks: 0,
+                mode: Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+
+        fn mmap_cache_generation(&self) -> Option<u64> {
+            Some(self.generation.load(Ordering::Acquire))
+        }
+
+        fn mmap_backing_identity(&self) -> usize {
+            self.identity
+        }
+    }
+
+    /// The userspace half of the zap straddle: a fault parked in its
+    /// fill while a shrink crosses its page must not end up resident,
+    /// must refuse at EOF while the file stays shrunk, must serve the
+    /// file's CURRENT bytes after a regrow (never the pre-shrink
+    /// folio), and must leave the retained owner row's writeback slot
+    /// EMPTY — the cancelled fill's frame had its mapping hold released
+    /// by the fault path's false path, so a slot naming it would let a
+    /// later msync write back through an unheld frame.
+    fn smoke_mapped_file_zap_cancels_straddling_fill() -> TestResult {
+        const VB: u64 = 0x0000_0080_6000_0000;
+        // SAFETY: kernel tests run with paging enabled; the new root is
+        // owned by this fixture, as in the syscall-ABI fixtures.
+        let aspace = match unsafe { narf_memory::AddressSpace::new_for_user() } {
+            Ok(a) => Arc::new(a),
+            Err(_) => return TestResult::Skip("new_for_user failed"),
+        };
+        let id = aspace.identity();
+        drop_address_space(id);
+        // The anchor stand-in, as in the cache tests: a dedicated
+        // static whose address is this file's volume-anchored identity.
+        static ANCHOR: AtomicU64 = AtomicU64::new(0);
+        let identity = &ANCHOR as *const AtomicU64 as usize;
+        let owner = Arc::new(ZapRaceOwner {
+            size: AtomicU64::new(8192),
+            generation: AtomicU64::new(11),
+            store: IrqSafeSpinLock::new(alloc::vec![0xA1u8; 8192]),
+            identity,
+            zap_as: IrqSafeSpinLock::new(Some(Arc::clone(&aspace))),
+            zap_base: AtomicU64::new(VB + 4096),
+            zap_armed: core::sync::atomic::AtomicBool::new(true),
+            zap_outcome: AtomicU64::new(0),
+        });
+        let ops: Arc<dyn FileOps> = owner.clone();
+        register(
+            id,
+            VB,
+            8192,
+            0,
+            Arc::clone(&ops),
+            None,
+            Some(FileWriteback {
+                offset: 0,
+                phys: alloc::vec![],
+            }),
+        );
+        if aspace
+            .map_region(narf_memory::Region {
+                base: narf_memory::VirtAddr::new(VB),
+                len: 8192,
+                perms: narf_memory::RegionPerms::READ
+                    | narf_memory::RegionPerms::WRITE
+                    | narf_memory::RegionPerms::SHARED
+                    | narf_memory::RegionPerms::FILE_DEMAND,
+                phys: alloc::vec![].into(),
+            })
+            .is_err()
+        {
+            drop_address_space(id);
+            return TestResult::Fail("map_region rejected the fixture region");
+        }
+        // The real hook (the same function the syscall layer installs).
+        let _ = narf_memory::install_file_fault_hook(demand_frame);
+
+        let slot_of = |index: usize| {
+            aspace
+                .lookup(narf_memory::VirtAddr::new(VB))
+                .and_then(|r| r.phys.get(index).copied())
+        };
+        let writeback_slot_of = |index: usize| {
+            existing_mapping_owners(id).and_then(|bucket| {
+                bucket
+                    .lock()
+                    .iter()
+                    .find(|mapping| mapping.base == VB)
+                    .and_then(|mapping| mapping.writeback.as_ref()?.phys.get(index).copied())
+            })
+        };
+
+        // The straddling fault. It returns Ok — finish refusal is the
+        // fault path's silent drop, with SIGBUS deferred to the retry —
+        // but nothing may be left published behind it.
+        // SAFETY: live user root, paging enabled.
+        let first = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(VB + 4096)) };
+        let zap_outcome = owner.zap_outcome.load(Ordering::Relaxed);
+        let slot_after = slot_of(1);
+        let writeback_after = writeback_slot_of(1);
+        // The fetched frame's cache hold must be balanced: either the
+        // idle page was retired outright, or it sits with zero mappings.
+        let hold_balanced = {
+            let pages = SHARED_FILE_PAGES.lock();
+            match pages.by_file.get(&SharedFileKey {
+                file: identity,
+                offset: 4096,
+            }) {
+                None => true,
+                Some(phys) => pages
+                    .by_phys
+                    .get(phys)
+                    .is_some_and(|page| page.mappings == 0),
+            }
+        };
+        // While the file stays shrunk, the same fault refuses at EOF:
+        // the SIGBUS shape, and still nothing published.
+        // SAFETY: as above.
+        let refault = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(VB + 4096)) };
+        let slot_refault = slot_of(1);
+
+        // Regrow with current content (the write a user would land
+        // before touching the range again).
+        {
+            let mut store = owner.store.lock();
+            store[4096..].fill(0xB2);
+        }
+        owner.generation.fetch_add(1, Ordering::Release);
+        owner.size.store(8192, Ordering::Release);
+        // SAFETY: as above.
+        let regrown = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(VB + 4096)) };
+        let slot_regrown = slot_of(1);
+        let regrown_bytes_ok = slot_regrown.is_some_and(|phys| {
+            phys.raw() != 0 && {
+                // SAFETY: `phys` is the frame the mapping now holds.
+                let bytes = unsafe { core::slice::from_raw_parts(phys.kernel_ptr::<u8>(), 4096) };
+                bytes.iter().all(|&b| b == 0xB2)
+            }
+        });
+        let writeback_regrown = writeback_slot_of(1);
+        // A flush over the row must not push anything stale over the
+        // current content.
+        let flush_ok = existing_mapping_owners(id)
+            .and_then(|bucket| {
+                bucket
+                    .lock()
+                    .iter()
+                    .find(|mapping| mapping.base == VB)
+                    .and_then(|mapping| mapping.writeback.clone())
+            })
+            .is_some_and(|writeback| flush_mappings(&ops, alloc::vec![writeback]).is_ok());
+        let store_intact = {
+            let store = owner.store.lock();
+            store[4096..].iter().all(|&b| b == 0xB2)
+        };
+
+        drop_address_space(id);
+        drop(aspace);
+
+        if first != Ok(()) {
+            return TestResult::Fail("the straddled fault did not take the silent-drop outcome");
+        }
+        if zap_outcome != 1 {
+            return TestResult::Fail("the mid-fill zap did not run and retain the region");
+        }
+        if slot_after.is_some_and(|phys| phys.raw() != 0) {
+            return TestResult::Fail("the straddled fault left its pre-shrink frame resident");
+        }
+        if writeback_after.is_some_and(|phys| phys.raw() != 0) {
+            return TestResult::Fail("the cancelled fill left a dangling writeback slot");
+        }
+        if !hold_balanced {
+            return TestResult::Fail("the cancelled fill's cache hold was not balanced");
+        }
+        if refault != Err(AddressSpaceError::Bus) {
+            return TestResult::Fail("a fault past the shrunk EOF was not refused as SIGBUS");
+        }
+        if slot_refault.is_some_and(|phys| phys.raw() != 0) {
+            return TestResult::Fail("the refused fault left a frame behind");
+        }
+        if regrown != Ok(()) || !regrown_bytes_ok {
+            return TestResult::Fail("the regrown range does not serve the file's current bytes");
+        }
+        if writeback_regrown != slot_regrown || slot_regrown.is_none_or(|phys| phys.raw() == 0) {
+            return TestResult::Fail("the healthy fault did not record its writeback frame");
+        }
+        if !flush_ok || !store_intact {
+            return TestResult::Fail("a flush after the interleave disturbed current content");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!("userspace", smoke_mapped_file_zap_cancels_straddling_fill);
 
     fn smoke_mapped_file_shared_relocation_mirrors_all_outcomes() -> TestResult {
         const ADDRESS_SPACE: u64 = u64::MAX - 16;
