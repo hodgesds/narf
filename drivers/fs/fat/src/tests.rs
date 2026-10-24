@@ -639,6 +639,80 @@ kernel_test_in!(
     smoke_fat_create_write_read_unlink_round_trip
 );
 
+fn smoke_fat_truncate_grow_extends_chain_and_reads_zero() -> TestResult {
+    // #692 regression: the grow branch of truncate used to publish
+    // the new i_size without extending the cluster chain, so a read
+    // (or mmap fault) inside the grown range walked off the end of
+    // the chain and returned EIO where Linux serves zeros. Linux
+    // FAT extends the chain on grow and the grown range reads as
+    // zeros — including the tail of the boundary cluster past the
+    // shrunk EOF, and including clusters recycled from the range the
+    // shrink just freed (they still hold the pre-shrink bytes on
+    // disk, so extending without zeroing would resurrect them).
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    const PAGE: u64 = 4096;
+    let img = build_fat12_image(256, &[]);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.create("GROW.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create GROW.TXT failed"),
+    };
+
+    // Seed 3 pages of a non-zero pattern, shrink to ~1.2 pages
+    // (frees the tail clusters), then grow back to 3 pages.
+    let seed = alloc::vec![0x5Au8; (3 * PAGE) as usize];
+    if !matches!(poll_once(file.write(0, &seed)), Some(Ok(n)) if n == seed.len()) {
+        return TestResult::Fail("seed write failed");
+    }
+    if !matches!(poll_once(file.truncate(PAGE + PAGE / 5)), Some(Ok(()))) {
+        return TestResult::Fail("shrink truncate failed");
+    }
+    if !matches!(poll_once(file.truncate(3 * PAGE)), Some(Ok(()))) {
+        return TestResult::Fail("grow truncate failed");
+    }
+    if file.stat().size != 3 * PAGE {
+        return TestResult::Fail("stat.size after grow wrong");
+    }
+
+    // The surviving head (up to the shrunk EOF) is intact.
+    let mut head = alloc::vec![0u8; (PAGE + PAGE / 5) as usize];
+    match poll_once(file.read(0, &mut head)) {
+        Some(Ok(n)) if n == head.len() => {}
+        _ => return TestResult::Fail("read of surviving head failed"),
+    }
+    if head.iter().any(|&b| b != 0x5A) {
+        return TestResult::Fail("grow damaged bytes before the shrunk EOF");
+    }
+
+    // Everything from the shrunk EOF to the regrown size reads as
+    // zeros — first the boundary-cluster straddle, then the third
+    // page (the range that returned EIO before the fix).
+    let grown_len = (3 * PAGE - (PAGE + PAGE / 5)) as usize;
+    let mut grown = alloc::vec![0xFFu8; grown_len];
+    match poll_once(file.read(PAGE + PAGE / 5, &mut grown)) {
+        Some(Ok(n)) if n == grown_len => {}
+        _ => return TestResult::Fail("read of the grown range failed (EIO regression)"),
+    }
+    if grown.iter().any(|&b| b != 0) {
+        return TestResult::Fail("grown range does not read as zeros");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_truncate_grow_extends_chain_and_reads_zero
+);
+
 // ── Timestamps ──────────────────────────────────────────────────────
 //
 // Linux `fat_fill_inode` (vfat): mtime = ctime = `fat_time_fat2unix`
