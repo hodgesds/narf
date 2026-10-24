@@ -37,9 +37,28 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-#[cfg(any(test, feature = "kernel-test"))]
+#[cfg(all(any(test, feature = "kernel-test"), narf_wifi_goldens_qualcomm))]
 #[path = "board_metadata_tests.rs"]
 mod metadata_tests;
+
+// Stub selected when the extracted Qualcomm golden fixtures are absent
+// from this checkout (see drivers/wireless/build.rs, issue #739): the
+// same test registers and reports Skip instead of the build failing on
+// `include_bytes!` of a missing `*.metadata.bin`.
+#[cfg(all(any(test, feature = "kernel-test"), not(narf_wifi_goldens_qualcomm)))]
+mod metadata_tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_ath11k_installed_board_metadata_replays() -> TestResult {
+        TestResult::Skip(
+            "Qualcomm wifi-firmware golden fixtures absent from this checkout (issue #739)",
+        )
+    }
+    kernel_test_in!(
+        "drivers/wireless/ath11k",
+        smoke_ath11k_installed_board_metadata_replays
+    );
+}
 
 /// `ATH11K_BOARD_MAGIC`.
 pub const ATH11K_BOARD_MAGIC: &[u8] = b"QCA-ATH11K-BOARD";
