@@ -161,9 +161,23 @@ This work publishes missing MT76/CYW carrier changes and prevents removed
 interfaces from leaving their IPv4 address/gateway/DNS behind for name reuse.
 It does not close the remaining driver stages or establish physical acceptance.
 
+Phase A3 adds parser goldens from 36 SHA256-pinned vendor originals, retaining
+only 60,371 bytes of structural metadata and independently decoded facts.
+Sixteen new kernel smokes cover Intel, MediaTek, Qualcomm, Broadcom and Realtek
+layouts plus bounded replay construction; no synthetic replay enters a registry
+or device loader. RTL8188EE now requests `rtl8188efw.bin`, and MT7920 selects its
+distinct `WIFI_RAM_CODE_MT7961_1a.bin` RAM image. The firmware importer preserves
+board NVRAM text, maps flat Intel names into canonical registry keys, bounds raw
+and zstd input, and resolves duplicate aliases deterministically. The new
+`cargo xtask wifi-firmware` audit covers 44 payload profiles across all eleven
+families. This host has 60 assets present and 15 required assets missing
+(twelve Intel firmware combinations and the three CYW43439 assets); signed
+board calibration, policy and exact board/PNVM matching remain separate gates.
+See [the firmware evidence and provisioning guide](verification/data/wifi-firmware/README.md).
+
 The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
 wireless, network, crypto, RNG and shared-fixture QEMU gates: x86_64 reports
-2597 pass / 0 fail / 10 skip; aarch64 reports 1895 pass / 0 fail / 3 skip.
+2613 pass / 0 fail / 10 skip; aarch64 reports 1911 pass / 0 fail / 3 skip.
 Both include a clean production boot and btrfs interoperability postflight.
 Release/debug builds, targeted Clippy across the kernel feature contexts,
 workspace formatting, and the MT76 module build pass on both architectures.

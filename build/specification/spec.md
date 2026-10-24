@@ -46,6 +46,26 @@ and CI compiler-cache integration.
   --public-key KEY` verifies an externally signed BLAKE3 payload digest
   and stages the NRFW blob in `target/firmware/NAME`. `SIG` and `KEY` are
   raw 64- and 32-byte files. Without both options, the blob is unsigned.
+- `cargo xtask wifi-firmware --source /lib/firmware [--profile ID,...]
+  [--report FILE] [--require-assets]` inventories the fixed-name payloads
+  in `verification/data/wifi-firmware/profiles.json`. It resolves raw/zstd
+  files and contained file aliases, reports decompressed lengths/SHA256 and
+  canonical registry keys, and lists external board/calibration/policy gates.
+  Missing files permit the next candidate; existing corrupt, empty, oversized
+  or escaping inputs fail. `--require-assets` fails for missing required
+  payloads; conditional PNVM and board qualification remain explicit manual
+  gates. A JSON report must be a new file outside the source tree. Inventory
+  does not verify signatures, parse firmware or establish hardware readiness.
+- `cargo xtask import-firmware --vendor iwlwifi` accepts linux-firmware's
+  flat `iwlwifi-*.ucode/.pnvm` names and stages `iwlwifi/<name>` registry keys.
+  The importer retains board NVRAM `.txt` files, filters documentation after
+  stripping `.zst`, bounds decoded payloads and zstd windows, and imports only
+  file aliases resolving inside the source root. It emits unsigned developer
+  NRFW wrappers without inventing firmware versions from the host kernel.
+  Audit and import share a deterministic order: canonical raw, canonical zstd,
+  then Intel flat raw/zstd aliases. An existing invalid primary stops fallback.
+  Production blobs still use externally signed `pack-firmware` and trusted
+  public keys; neither tool qualifies board-power or regulatory artifacts.
 
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot. Optimized
   builds strip debug-only ELF sections by default while retaining ordinary

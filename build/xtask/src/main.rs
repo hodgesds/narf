@@ -48,6 +48,7 @@ mod net_robust;
 mod passthrough;
 mod relocs;
 mod usb_image;
+mod wifi_firmware;
 
 #[derive(Parser)]
 #[command(author, version, about = "NARF build orchestrator")]
@@ -334,11 +335,13 @@ enum Cmd {
     /// (default `/lib/firmware/`) into `target/firmware/`.
     /// Recursively walks, decompresses `.zst` entries on the fly
     /// (Arch's linux-firmware ships everything zstd-compressed), and
-    /// wraps each with the NARF trailer. `xtask image` then splits
+    /// wraps each with an unsigned developer NARF trailer. `xtask image` then splits
     /// the result: blobs matched by `--initramfs-firmware` go into
     /// the initramfs CPIO; everything else stages onto the root
     /// partition's /lib/firmware/ (Linux hybrid model).
     ImportFirmware(ImportFirmwareArgs),
+    /// Inventory Wi-Fi firmware payloads and unresolved deployment prerequisites.
+    WifiFirmware(wifi_firmware::Args),
 }
 
 #[derive(Parser, Clone)]
@@ -350,7 +353,8 @@ struct ImportFirmwareArgs {
 
     /// Output dir under the workspace. Each blob lands at
     /// `<out>/<rel>` where `<rel>` is the path relative to `--source`
-    /// with any `.zst` suffix stripped. Default `target/firmware`
+    /// with any `.zst` suffix stripped and flat Intel ucode/PNVM
+    /// aliases placed under `iwlwifi/`. Default `target/firmware`
     /// keeps imported blobs out of the source tree (workspace's
     /// `firmware/` crate dir would collide) and inside `target/`
     /// which is already gitignored.
@@ -359,7 +363,8 @@ struct ImportFirmwareArgs {
 
     /// Optional vendor / subdirectory filter (e.g. `amdgpu`,
     /// `iwlwifi`, `mt76`). Only files whose path under `--source`
-    /// starts with this prefix are imported. Use to build smaller
+    /// or canonical registry key starts with this component prefix
+    /// are imported. Use to build smaller
     /// targeted ISOs (e.g. AMD-laptop-only).
     #[arg(long)]
     vendor: Option<String>,
@@ -11345,9 +11350,8 @@ fn wrap_firmware_trailer(payload: &[u8], version: Option<&str>) -> Vec<u8> {
         let bytes = ver.as_bytes();
         // Per signature::decode the metadata len byte is u8 (max
         // 255). Anything longer gets silently truncated for the
-        // bulk-import path — version strings from kernel `uname -r`
-        // are well under that, and bulk-import has no human in the
-        // loop to surface "too long" warnings to.
+        // bulk-import path. Explicit pack-firmware versions are validated
+        // before reaching this helper; bulk imports supply no version.
         let n = bytes.len().min(255);
         metadata.push(0x01); // TLV tag: ASCII version
         metadata.push(n as u8);
@@ -11454,10 +11458,527 @@ mod firmware_pack_tests {
     }
 }
 
+/// Resolve transport compression and the registry's Intel directory prefix.
+/// Linux commonly installs Intel firmware flat; NARF requests iwlwifi/<name>.
+fn firmware_import_key(relative: &Path) -> PathBuf {
+    let key = if relative.extension().is_some_and(|ext| ext == "zst") {
+        relative.with_extension("")
+    } else {
+        relative.to_path_buf()
+    };
+    let flat = key
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty());
+    let intel = key
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with("iwlwifi-") && (name.ends_with(".ucode") || name.ends_with(".pnvm"))
+        });
+    if flat && intel {
+        Path::new("iwlwifi").join(key)
+    } else {
+        key
+    }
+}
+
+/// Shared audit/import precedence. A canonical path wins over Intel's flat
+/// Linux aliases, and a raw source wins over its compressed sibling.
+fn firmware_source_candidates(key: &Path) -> Vec<PathBuf> {
+    fn compressed(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".zst");
+        PathBuf::from(name)
+    }
+    let mut candidates = vec![key.to_path_buf(), compressed(key)];
+    if key.parent() == Some(Path::new("iwlwifi")) {
+        if let Some(name) = key.file_name().and_then(|name| name.to_str()) {
+            if name.starts_with("iwlwifi-") && (name.ends_with(".ucode") || name.ends_with(".pnvm"))
+            {
+                let flat = PathBuf::from(name);
+                let flat_compressed = compressed(&flat);
+                candidates.extend([flat, flat_compressed]);
+            }
+        }
+    }
+    candidates
+}
+
+/// Existence is lexical: a dangling or otherwise invalid primary source
+/// must be diagnosed, rather than silently replaced by lower-priority bytes.
+fn firmware_preferred_source(root: &Path, key: &Path) -> Result<Option<PathBuf>> {
+    for candidate in firmware_source_candidates(key) {
+        let path = root.join(candidate);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", path.display()))
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Board NVRAM is often text. Identify documentation by its basename rather
+/// than rejecting every .txt blob, including when the source is compressed.
+fn firmware_import_is_blob(key: &Path) -> bool {
+    if key.components().any(|part| {
+        part.as_os_str()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.'))
+    }) {
+        return false;
+    }
+    let Some(name) = key.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    let documentation = [
+        "whence",
+        "readme",
+        "license",
+        "licence",
+        "copyright",
+        "copying",
+    ]
+    .iter()
+    .any(|prefix| {
+        name == *prefix
+            || name
+                .strip_prefix(*prefix)
+                .is_some_and(|suffix| suffix.starts_with(['.', '-', '_']))
+    });
+    !documentation && !name.ends_with(".md") && !name.ends_with(".rst") && !name.ends_with(".cfg")
+}
+
+fn firmware_import_vendor_matches(relative: &Path, key: &Path, prefix: &Path) -> bool {
+    relative.starts_with(prefix) || key.starts_with(prefix)
+}
+
+/// Keep aliases under their requested name, but read only regular files
+/// contained by the already-canonicalized source root. Directory aliases are
+/// never traversed by the importer.
+fn firmware_import_source(root: &Path, path: &Path) -> Result<PathBuf> {
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+    if !resolved.starts_with(root) {
+        bail!(
+            "firmware alias {} escapes source root {}",
+            path.display(),
+            root.display()
+        );
+    }
+    if !resolved.is_file() {
+        bail!("firmware source {} is not a regular file", path.display());
+    }
+    Ok(resolved)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirmwarePayloadError {
+    Empty,
+    TooLarge,
+}
+impl std::fmt::Display for FirmwarePayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("firmware payload is empty"),
+            Self::TooLarge => f.write_str("firmware payload exceeds configured size limit"),
+        }
+    }
+}
+impl std::error::Error for FirmwarePayloadError {}
+
+fn read_firmware_payload_bounded(reader: impl Read, max_payload_bytes: u64) -> Result<Vec<u8>> {
+    let read_limit = max_payload_bytes
+        .checked_add(1)
+        .context("firmware payload limit is too large")?;
+    let mut payload = Vec::new();
+    reader.take(read_limit).read_to_end(&mut payload)?;
+    if payload.len() as u64 > max_payload_bytes {
+        return Err(FirmwarePayloadError::TooLarge.into());
+    }
+    if payload.is_empty() {
+        return Err(FirmwarePayloadError::Empty.into());
+    }
+    Ok(payload)
+}
+
+/// Bound memory by limiting the decoded stream before reading into a Vec.
+/// The extra byte distinguishes an exact fit from a payload that is too big.
+fn read_firmware_payload(path: &Path, max_payload_bytes: u64) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let payload = if path.extension().is_some_and(|ext| ext == "zst") {
+        let mut decoder = zstd::stream::read::Decoder::new(file)
+            .with_context(|| format!("decoding {}", path.display()))?;
+        // Bound decoder state as well as decoded output. Registry images use
+        // a 16MiB profile; hostile frame headers must not request a huge window.
+        decoder
+            .window_log_max(24)
+            .with_context(|| format!("limiting zstd window for {}", path.display()))?;
+        read_firmware_payload_bounded(decoder, max_payload_bytes)
+    } else {
+        read_firmware_payload_bounded(file, max_payload_bytes)
+    };
+    payload.with_context(|| format!("reading firmware payload {}", path.display()))
+}
+
+#[cfg(test)]
+mod firmware_import_tests {
+    use super::*;
+
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "narf-firmware-import-{}-{stamp}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn board_text_survives_and_compressed_documentation_is_filtered() {
+        for name in [
+            "brcm/brcmfmac43430-sdio.raspberrypi,3-model-b.txt",
+            "brcm/brcmfmac43430-sdio.raspberrypi,3-model-b.txt.zst",
+            "brcm/board-LICENSE-tag.bin",
+            "board-README-tag/firmware.bin",
+        ] {
+            assert!(
+                firmware_import_is_blob(&firmware_import_key(Path::new(name))),
+                "{name}"
+            );
+        }
+        for name in [
+            "brcm/README",
+            "brcm/README.txt.zst",
+            "LICENCE.broadcom_bcm43xx.zst",
+            "rtw89/LICENSE.txt",
+            "WHENCE.zst",
+            "copyright",
+            ".git/config",
+            "brcm/.cache/blob.bin",
+            "brcm/notes.md.zst",
+        ] {
+            assert!(
+                !firmware_import_is_blob(&firmware_import_key(Path::new(name))),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn intel_flat_aliases_have_canonical_keys_and_vendor_matching() {
+        for (name, expected) in [
+            (
+                "iwlwifi-so-a0-gf-a0-89.ucode",
+                "iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode",
+            ),
+            (
+                "iwlwifi-so-a0-gf-a0.pnvm.zst",
+                "iwlwifi/iwlwifi-so-a0-gf-a0.pnvm",
+            ),
+            (
+                "iwlwifi/iwlwifi-so-a0-gf-a0.pnvm",
+                "iwlwifi/iwlwifi-so-a0-gf-a0.pnvm",
+            ),
+        ] {
+            let relative = Path::new(name);
+            let key = firmware_import_key(relative);
+            assert_eq!(key, Path::new(expected));
+            assert!(firmware_import_vendor_matches(
+                relative,
+                &key,
+                Path::new("iwlwifi")
+            ));
+            assert!(!firmware_import_vendor_matches(
+                relative,
+                &key,
+                Path::new("iwl")
+            ));
+            assert!(!firmware_import_vendor_matches(
+                relative,
+                &key,
+                Path::new("amdgpu")
+            ));
+        }
+        assert_eq!(
+            firmware_import_key(Path::new("iwlwifi-notes.bin")),
+            Path::new("iwlwifi-notes.bin")
+        );
+        assert_eq!(
+            firmware_import_key(Path::new("amdgpu/phoenix.bin.zst")),
+            Path::new("amdgpu/phoenix.bin")
+        );
+    }
+
+    #[test]
+    fn source_candidates_prioritize_canonical_raw_and_limit_intel_aliases() {
+        for name in ["iwlwifi-so-a0-gf-a0-89.ucode", "iwlwifi-so-a0-gf-a0.pnvm"] {
+            assert_eq!(
+                firmware_source_candidates(&Path::new("iwlwifi").join(name)),
+                [
+                    format!("iwlwifi/{name}"),
+                    format!("iwlwifi/{name}.zst"),
+                    name.to_owned(),
+                    format!("{name}.zst")
+                ]
+                .map(PathBuf::from)
+            );
+        }
+        for key in [
+            "brcm/firmware.bin",
+            "iwlwifi/notes.bin",
+            "other/iwlwifi-test.ucode",
+            "iwlwifi/sub/iwlwifi-test.ucode",
+        ] {
+            assert_eq!(
+                firmware_source_candidates(Path::new(key)),
+                [PathBuf::from(key), PathBuf::from(format!("{key}.zst"))]
+            );
+        }
+    }
+
+    #[test]
+    fn intel_collision_import_uses_canonical_bytes_even_with_skip_existing() {
+        let dir = TestDir::new();
+        let source = dir.0.join("source");
+        std::fs::create_dir(&source).unwrap();
+        // Flat sources are visited before the queued canonical subdirectory,
+        // reproducing the previous walk-order-dependent --skip-existing bug.
+        let name = "iwlwifi-test-89.ucode";
+        std::fs::write(source.join(name), b"flat raw").unwrap();
+        std::fs::write(
+            source.join(format!("{name}.zst")),
+            zstd::stream::encode_all(&b"flat zstd"[..], 1).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir(source.join("iwlwifi")).unwrap();
+        let canonical = source.join("iwlwifi").join(name);
+        std::fs::write(&canonical, b"canonical raw").unwrap();
+        std::fs::write(
+            canonical.with_extension("ucode.zst"),
+            zstd::stream::encode_all(&b"canonical zstd"[..], 1).unwrap(),
+        )
+        .unwrap();
+        for skip_existing in [false, true] {
+            let out = dir.0.join(format!("out-raw-{skip_existing}"));
+            import_firmware_cmd(&ImportFirmwareArgs {
+                source: source.to_string_lossy().into_owned(),
+                out: out.to_string_lossy().into_owned(),
+                vendor: Some("iwlwifi".into()),
+                skip_existing,
+                clean: false,
+                max_payload_bytes: 128,
+            })
+            .unwrap();
+            assert_eq!(
+                std::fs::read(out.join("iwlwifi").join(name)).unwrap(),
+                wrap_firmware_trailer(b"canonical raw", None)
+            );
+        }
+        // Missing canonical raw admits canonical compressed, still ahead of
+        // both differing flat aliases. Every output starts fresh.
+        std::fs::remove_file(&canonical).unwrap();
+        for skip_existing in [false, true] {
+            let out = dir.0.join(format!("out-zstd-{skip_existing}"));
+            import_firmware_cmd(&ImportFirmwareArgs {
+                source: source.to_string_lossy().into_owned(),
+                out: out.to_string_lossy().into_owned(),
+                vendor: Some("iwlwifi".into()),
+                skip_existing,
+                clean: false,
+                max_payload_bytes: 128,
+            })
+            .unwrap();
+            assert_eq!(
+                std::fs::read(out.join("iwlwifi").join(name)).unwrap(),
+                wrap_firmware_trailer(b"canonical zstd", None)
+            );
+        }
+    }
+
+    #[test]
+    fn non_intel_raw_source_wins_over_compressed_collision() {
+        let dir = TestDir::new();
+        let source = dir.0.join("source");
+        std::fs::create_dir_all(source.join("brcm")).unwrap();
+        let key = Path::new("brcm/board.txt");
+        let compressed = source.join("brcm/board.txt.zst");
+        std::fs::write(
+            &compressed,
+            zstd::stream::encode_all(&b"compressed"[..], 1).unwrap(),
+        )
+        .unwrap();
+        let raw = source.join(key);
+        std::fs::write(&raw, b"raw").unwrap();
+        assert_eq!(
+            firmware_preferred_source(&source, key).unwrap(),
+            Some(raw.clone())
+        );
+        std::fs::remove_file(raw).unwrap();
+        assert_eq!(
+            firmware_preferred_source(&source, key).unwrap(),
+            Some(compressed)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_primary_stops_import_instead_of_falling_back_to_flat_bytes() {
+        let dir = TestDir::new();
+        let source = dir.0.join("source");
+        std::fs::create_dir_all(source.join("iwlwifi")).unwrap();
+        let name = "iwlwifi-test-89.ucode";
+        std::fs::write(source.join(name), b"valid lower-priority flat firmware").unwrap();
+        let primary = source.join("iwlwifi").join(name);
+        std::os::unix::fs::symlink("missing.ucode", &primary).unwrap();
+        let key = Path::new("iwlwifi").join(name);
+        assert_eq!(
+            firmware_preferred_source(&source, &key).unwrap(),
+            Some(primary.clone())
+        );
+        let out = dir.0.join("out-dangling");
+        import_firmware_cmd(&ImportFirmwareArgs {
+            source: source.to_string_lossy().into_owned(),
+            out: out.to_string_lossy().into_owned(),
+            vendor: Some("iwlwifi".into()),
+            skip_existing: true,
+            clean: false,
+            max_payload_bytes: 128,
+        })
+        .unwrap();
+        assert!(!out.join(&key).exists());
+
+        std::fs::remove_file(&primary).unwrap();
+        std::fs::write(
+            primary.with_extension("ucode.zst"),
+            b"corrupt preferred compressed firmware",
+        )
+        .unwrap();
+        let out = dir.0.join("out-corrupt");
+        import_firmware_cmd(&ImportFirmwareArgs {
+            source: source.to_string_lossy().into_owned(),
+            out: out.to_string_lossy().into_owned(),
+            vendor: Some("iwlwifi".into()),
+            skip_existing: true,
+            clean: false,
+            max_payload_bytes: 128,
+        })
+        .unwrap();
+        assert!(!out.join(&key).exists());
+    }
+
+    #[test]
+    fn bounded_reader_stops_at_limit_plus_one() {
+        struct Endless<'a>(&'a std::cell::Cell<usize>);
+        impl Read for Endless<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                out.fill(0x5a);
+                self.0.set(self.0.get() + out.len());
+                Ok(out.len())
+            }
+        }
+        let count = std::cell::Cell::new(0);
+        let error = read_firmware_payload_bounded(Endless(&count), 1024).unwrap_err();
+        assert_eq!(error.downcast_ref(), Some(&FirmwarePayloadError::TooLarge));
+        assert_eq!(count.get(), 1025);
+        assert!(read_firmware_payload_bounded(Endless(&count), u64::MAX).is_err());
+        assert_eq!(count.get(), 1025);
+    }
+
+    #[test]
+    fn raw_and_zstd_payloads_enforce_decoded_size_and_reject_empty() {
+        let dir = TestDir::new();
+        for compressed in [false, true] {
+            let path = dir.0.join(if compressed {
+                "firmware.bin.zst"
+            } else {
+                "firmware.bin"
+            });
+            for (payload, limit) in [(vec![7; 128], 128), (vec![0; 100_000], 1024), (vec![], 128)] {
+                let disk = if compressed {
+                    zstd::stream::encode_all(payload.as_slice(), 1).unwrap()
+                } else {
+                    payload.clone()
+                };
+                std::fs::write(&path, disk).unwrap();
+                let result = read_firmware_payload(&path, limit);
+                if payload.is_empty() {
+                    assert_eq!(
+                        result.unwrap_err().downcast_ref(),
+                        Some(&FirmwarePayloadError::Empty)
+                    );
+                } else if payload.len() as u64 > limit {
+                    assert_eq!(
+                        result.unwrap_err().downcast_ref(),
+                        Some(&FirmwarePayloadError::TooLarge)
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), payload);
+                }
+            }
+        }
+        let path = dir.0.join("corrupt.bin.zst");
+        std::fs::write(&path, b"not zstd firmware").unwrap();
+        assert!(read_firmware_payload(&path, 128).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_aliases_are_retained_only_within_the_canonical_source_root() {
+        let dir = TestDir::new();
+        let source = dir.0.join("source");
+        std::fs::create_dir(&source).unwrap();
+        let root = source.canonicalize().unwrap();
+        let target = root.join("firmware.bin");
+        std::fs::write(&target, b"firmware").unwrap();
+        let alias = root.join("alias.bin");
+        std::os::unix::fs::symlink("firmware.bin", &alias).unwrap();
+        assert_eq!(firmware_import_source(&root, &alias).unwrap(), target);
+        assert_eq!(
+            firmware_import_key(alias.strip_prefix(&root).unwrap()),
+            Path::new("alias.bin")
+        );
+        assert_eq!(
+            read_firmware_payload(&firmware_import_source(&root, &alias).unwrap(), 128).unwrap(),
+            b"firmware"
+        );
+
+        let outside = dir.0.join("outside.bin");
+        std::fs::write(&outside, b"outside").unwrap();
+        let escaped = root.join("escape.bin");
+        std::os::unix::fs::symlink("../outside.bin", &escaped).unwrap();
+        assert!(firmware_import_source(&root, &escaped).is_err());
+        let sibling = dir.0.join("source-other");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(sibling.join("firmware.bin"), b"sibling").unwrap();
+        let prefix_escape = root.join("prefix-escape.bin");
+        std::os::unix::fs::symlink("../source-other/firmware.bin", &prefix_escape).unwrap();
+        assert!(firmware_import_source(&root, &prefix_escape).is_err());
+        assert!(firmware_import_source(&root, &root).is_err());
+    }
+}
+
 /// Bulk-import firmware blobs. Walks the source tree, decompresses
 /// any `.zst` entries, wraps each with the NARF trailer, and writes
-/// the result under the workspace's `firmware/` dir so subsequent
-/// `xtask image` runs auto-bundle the lot into the initramfs CPIO.
+/// the result under the output directory for `xtask image` staging.
 fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
     let source = PathBuf::from(&args.source);
     if !source.is_dir() {
@@ -11466,6 +11987,9 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
             source.display()
         );
     }
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("resolving source root {}", source.display()))?;
     let root = workspace_root()?;
     let out_root = root.join(&args.out);
 
@@ -11477,25 +12001,17 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
     std::fs::create_dir_all(&out_root)
         .with_context(|| format!("creating {}", out_root.display()))?;
 
-    // Optional version stamp baked into each blob's trailer. Uses
-    // the host kernel's release string so post-mortem inspection
-    // (BoundFirmware.version) ties a NARF boot back to the Linux
-    // firmware drop it was sourced from.
-    let host_uname = std::process::Command::new("uname")
-        .arg("-r")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string());
-
     let vendor_prefix: Option<PathBuf> = args.vendor.as_ref().map(PathBuf::from);
 
     let mut imported: usize = 0;
     let mut skipped_existing: usize = 0;
     let mut skipped_too_big: usize = 0;
     let mut skipped_non_blob: usize = 0;
+    let mut skipped_unsafe_alias: usize = 0;
+    let mut skipped_source_alias: usize = 0;
     let mut decomp_failed: usize = 0;
     let mut total_payload_bytes: u64 = 0;
+    let mut considered = std::collections::BTreeSet::new();
 
     let mut stack: Vec<PathBuf> = vec![source.clone()];
     while let Some(dir) = stack.pop() {
@@ -11511,22 +12027,15 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            if ft.is_symlink() {
-                // Firmware symlinks are alias names drivers request by
-                // the alias (linux-firmware ships every
-                // `ath11k/WCN6855/hw2.1/*` as a link to `../hw2.0/*`,
-                // and ath11k loads `WCN6855/hw2.1/amss.bin`), so a link
-                // to a regular file is imported under the link's own
-                // path. Links to directories are never followed: that
-                // would risk loops on circular aliases.
-                match std::fs::metadata(&path) {
-                    Ok(m) if m.is_file() => {}
-                    _ => continue,
-                }
-            } else if ft.is_dir() {
+            if ft.is_dir() {
                 stack.push(path);
                 continue;
-            } else if !ft.is_file() {
+            }
+            // Linux firmware links are aliases requested by their own name.
+            // Resolve after selecting the preferred source: dangling aliases
+            // stop fallback, while directory links fail firmware_import_source
+            // and are never traversed.
+            if !ft.is_file() && !ft.is_symlink() {
                 continue;
             }
 
@@ -11538,40 +12047,38 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
             // requested prefix (path-component-wise, so `--vendor
             // amdgpu` matches `amdgpu/phoenix_*` but not
             // `amd-ucode/microcode_amd.bin` or stray `amdfoo` blobs).
+            // Resolve compression before filtering: board NVRAM .txt is data,
+            // while README.txt.zst remains documentation. Intel's flat Linux
+            // aliases map to the directory-prefixed keys NARF requests.
+            let dest_rel = firmware_import_key(rel);
             if let Some(prefix) = &vendor_prefix {
-                if !rel.starts_with(prefix) {
+                if !firmware_import_vendor_matches(rel, &dest_rel, prefix) {
                     continue;
                 }
             }
 
-            // Skip well-known non-firmware files. linux-firmware
-            // ships .txt licenses, WHENCE manifests, etc. — none
-            // are firmware blobs and packing them just bloats the
-            // CPIO.
-            let rel_str = rel.to_str().unwrap_or("");
-            if rel_str.ends_with(".txt")
-                || rel_str.ends_with(".md")
-                || rel_str.ends_with(".rst")
-                || rel_str.ends_with(".cfg")
-                || rel_str.contains("WHENCE")
-                || rel_str.contains("README")
-                || rel_str.contains("LICENSE")
-                || rel_str.contains("LICENCE")
-                || rel_str.contains("copyright")
-                || rel_str.starts_with(".")
-            {
+            if !firmware_import_is_blob(&dest_rel) {
                 skipped_non_blob += 1;
                 continue;
             }
 
-            // Compute destination path. Strip `.zst` if present
-            // so the canonical registry key matches what drivers
-            // request (e.g. `amdgpu/phoenix_dmcub.bin`, not
-            // `amdgpu/phoenix_dmcub.bin.zst`).
-            let dest_rel: PathBuf = if rel_str.ends_with(".zst") {
-                PathBuf::from(&rel_str[..rel_str.len() - 4])
-            } else {
-                rel.to_path_buf()
+            // Attempt each registry key once, using shared source precedence
+            // even when an inferior flat/compressed alias is walked first.
+            if !considered.insert(dest_rel.clone()) {
+                skipped_source_alias += 1;
+                continue;
+            }
+            let preferred = match firmware_preferred_source(&source, &dest_rel) {
+                Ok(Some(path)) => path,
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "import-firmware: skipping {}: {error:#}",
+                        dest_rel.display()
+                    );
+                    skipped_unsafe_alias += 1;
+                    continue;
+                }
             };
             let dest_path = out_root.join(&dest_rel);
 
@@ -11580,39 +12087,34 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
                 continue;
             }
 
-            // Read payload (decompressing on the fly if .zst).
-            let raw = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let payload: Vec<u8> = if rel_str.ends_with(".zst") {
-                match zstd::stream::decode_all(raw.as_slice()) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        decomp_failed += 1;
-                        continue;
-                    }
+            let resolved = match firmware_import_source(&source, &preferred) {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!(
+                        "import-firmware: skipping {}: {error:#}",
+                        preferred.display()
+                    );
+                    skipped_unsafe_alias += 1;
+                    continue;
                 }
-            } else {
-                raw
+            };
+            let payload = match read_firmware_payload(&resolved, args.max_payload_bytes) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    match error.downcast_ref::<FirmwarePayloadError>() {
+                        Some(FirmwarePayloadError::TooLarge) => skipped_too_big += 1,
+                        Some(FirmwarePayloadError::Empty) => skipped_non_blob += 1,
+                        None if resolved.extension().is_some_and(|ext| ext == "zst") => {
+                            decomp_failed += 1;
+                        }
+                        None => {}
+                    }
+                    continue;
+                }
             };
 
-            if (payload.len() as u64) > args.max_payload_bytes {
-                skipped_too_big += 1;
-                continue;
-            }
-            if payload.is_empty() {
-                // Empty payloads fail at narf_firmware decode
-                // (signature::decode rejects blobs < 104 bytes
-                // total, but even after trailer add an empty
-                // payload trips load_firmware's size==0 check on
-                // amdgpu). Skip rather than ship a deliberately-
-                // broken blob.
-                skipped_non_blob += 1;
-                continue;
-            }
-
-            let wrapped = wrap_firmware_trailer(&payload, host_uname.as_deref());
+            // The host kernel release is not this firmware's version.
+            let wrapped = wrap_firmware_trailer(&payload, None);
 
             if let Some(parent) = dest_path.parent() {
                 std::fs::create_dir_all(parent)
@@ -11650,13 +12152,19 @@ fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
     if decomp_failed > 0 {
         println!("  zstd-decompression failed on {} file(s)", decomp_failed);
     }
-    println!("  output dir: {}", out_root.display());
-    if host_uname.is_some() {
+    if skipped_unsafe_alias > 0 {
         println!(
-            "  trailer version stamp: {}",
-            host_uname.as_deref().unwrap_or("")
+            "  skipped {} (unresolvable or out-of-root firmware aliases)",
+            skipped_unsafe_alias
         );
     }
+    if skipped_source_alias > 0 {
+        println!(
+            "  skipped {} (duplicate or lower-priority source aliases)",
+            skipped_source_alias
+        );
+    }
+    println!("  output dir: {}", out_root.display());
     Ok(())
 }
 
@@ -13733,6 +14241,7 @@ fn main() -> Result<()> {
         }
         Cmd::PackFirmware(args) => pack_firmware_cmd(&args),
         Cmd::ImportFirmware(args) => import_firmware_cmd(&args),
+        Cmd::WifiFirmware(args) => wifi_firmware::run(args),
         Cmd::Demo(mut args) => {
             if args.features.is_empty() {
                 args.features = "kernel-test,user-mode-testbin".into();

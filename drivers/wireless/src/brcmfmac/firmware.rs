@@ -42,6 +42,10 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "firmware_metadata_tests.rs"]
+mod metadata_tests;
+
 // ── TRX firmware container ────────────────────────────────────────
 
 /// `'HDR0'` little-endian — magic at the start of a TRX-wrapped

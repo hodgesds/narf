@@ -37,6 +37,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "board_metadata_tests.rs"]
+mod metadata_tests;
+
 /// `ATH11K_BOARD_MAGIC`.
 pub const ATH11K_BOARD_MAGIC: &[u8] = b"QCA-ATH11K-BOARD";
 /// `ATH11K_BOARD_API2_FILE`.

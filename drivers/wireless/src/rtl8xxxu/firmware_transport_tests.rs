@@ -12,6 +12,57 @@ use narf_lib::sync::IrqSafeSpinLock;
 use super::firmware_transport::{parse_image, ControlIo, Error, Owner, Stage};
 use super::regs::*;
 
+#[allow(dead_code)]
+mod firmware_metadata {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../verification/data/wifi-firmware/realtek/metadata.rs"
+    ));
+}
+
+fn smoke_rtl8188eu_raw_source_metadata_parser_golden() -> TestResult {
+    // Only the original header is retained. The body is zeroed, so this
+    // structural parser replay must never enter the registry or USB owner.
+    let source = &firmware_metadata::SOURCE_0;
+    if super::fw::firmware_name(ChipFamily::Rtl8188eu) != Some(source.name)
+        || source.sha256 != "2ff74315287529dec2e50eb57d6e0c97d2116f28ae166773ccdf93b6360000c4"
+    {
+        return TestResult::Fail("RTL8188EU source identity/provenance changed");
+    }
+    let mut bytes =
+        match narf_wifi_fixtures::firmware::metadata_replay(source.length, source.fragments) {
+            Ok(bytes) => bytes,
+            Err(_) => return TestResult::Fail("RTL8188EU metadata replay geometry"),
+        };
+    let (info, payload) = match parse_image(ChipFamily::Rtl8188eu, &bytes) {
+        Ok(value) => value,
+        Err(_) => return TestResult::Fail("RTL8188EU raw-source header rejected"),
+    };
+    if info.signature != 0x88e1
+        || info.major != 28
+        || info.minor != 0
+        || info.payload_bytes != 15230
+        || payload.len() != 15230
+        || payload.iter().any(|&byte| byte != 0)
+    {
+        return TestResult::Fail("RTL8188EU independently extracted header facts");
+    }
+    for end in [0, 31, 32, bytes.len() - 1] {
+        if parse_image(ChipFamily::Rtl8188eu, &bytes[..end]).is_ok() {
+            return TestResult::Fail("RTL8188EU truncated source geometry admitted");
+        }
+    }
+    bytes[12] ^= 1;
+    if parse_image(ChipFamily::Rtl8188eu, &bytes).is_ok() {
+        return TestResult::Fail("RTL8188EU source payload extent ignored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/fw",
+    smoke_rtl8188eu_raw_source_metadata_parser_golden
+);
+
 #[derive(Clone, Debug)]
 pub(super) enum Op {
     Read(u16, usize),

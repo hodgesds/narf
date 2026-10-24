@@ -25,6 +25,10 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "fw_metadata_tests.rs"]
+mod metadata_tests;
+
 /// `ATH11K_FW_API2_FILE`.
 pub const ATH11K_FW_API2_FILE: &str = "firmware-2.bin";
 /// `ATH11K_FIRMWARE_MAGIC` (the container also carries its NUL).

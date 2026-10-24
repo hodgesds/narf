@@ -59,6 +59,17 @@ codec/peer negatives run on both architectures; these kernel-dependent types
 are not a host test executable and none of these checks establish RF or real
 firmware/silicon acceptance.
 
+`narf_wifi_fixtures::firmware::metadata_replay(image_len, fragments)` builds
+parser-only structural images up to 16 MiB. It validates nonempty, ordered,
+nonoverlapping fragment extents before allocation and zeroes every opaque gap.
+The independent extractors in `verification/data/wifi-firmware` pin complete
+raw-source SHA256 hashes and preserve headers/TLV geometry, version/API facts,
+section addresses and board-name metadata. Their generated expectations are
+independent of production Rust encoders. Kernel smokes feed these images only
+to parsers, never a firmware registry, board-calibration authority or hardware
+loader. Passing proves layout handling; signatures, instructions and RF/board
+acceptance require original authenticated assets and physical validation.
+
 | Category        | Runs on       | Who gates | What it protects against                     |
 | --------------- | ------------- | --------- | -------------------------------------------- |
 | Unit            | host          | every PR  | pure-logic regressions in a single module    |

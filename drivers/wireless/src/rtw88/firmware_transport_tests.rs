@@ -5,6 +5,75 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
+
+#[allow(dead_code)]
+mod firmware_metadata {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../verification/data/wifi-firmware/realtek/metadata.rs"
+    ));
+}
+
+fn smoke_rtw8822ce_raw_source_metadata_parser_golden() -> TestResult {
+    // Replays retain the 64-byte source header only; zero sections/checksums
+    // are parser geometry, never executable/provisionable firmware.
+    let source = &firmware_metadata::SOURCE_2;
+    if filename(0xc822) != Ok(source.name)
+        || source.sha256 != "3deecb31210986d98cdbfb000391e08d602a6eee4ffc883969faa2b907ab03ba"
+    {
+        return TestResult::Fail("RTL8822CE source identity/provenance changed");
+    }
+    let mut bytes =
+        match narf_wifi_fixtures::firmware::metadata_replay(source.length, source.fragments) {
+            Ok(bytes) => bytes,
+            Err(_) => return TestResult::Fail("RTL8822CE metadata replay geometry"),
+        };
+    let image = match parse(0xc822, &bytes) {
+        Ok(image) => image,
+        Err(_) => return TestResult::Fail("RTL8822CE raw-source header rejected"),
+    };
+    if image.info
+        != (Info {
+            version: 9,
+            subversion: 9,
+            h2c: 15,
+            sections: 3,
+        })
+    {
+        return TestResult::Fail("RTL8822CE independently extracted header facts");
+    }
+    for (section, (kind, address, length, offset)) in image.sections.iter().zip([
+        (Kind::Dmem, 0x200000, 19336, 64),
+        (Kind::Imem, 0x30000, 54072, 19400),
+        (Kind::Emem, 0x100000, 129128, 73472),
+    ]) {
+        let Some(section) = section else {
+            return TestResult::Fail("RTL8822CE source section missing");
+        };
+        if section.kind != kind
+            || section.address != address
+            || section.bytes.len() != length
+            || section.bytes.as_ptr() as usize - bytes.as_ptr() as usize != offset
+            || section.bytes.iter().any(|&byte| byte != 0)
+        {
+            return TestResult::Fail("RTL8822CE source section/checksum boundaries");
+        }
+    }
+    for end in [0, 63, 64, bytes.len() - 1] {
+        if parse(0xc822, &bytes[..end]).is_ok() {
+            return TestResult::Fail("RTL8822CE truncated source geometry admitted");
+        }
+    }
+    bytes[0x20] ^= 1;
+    if parse(0xc822, &bytes).is_ok() {
+        return TestResult::Fail("RTL8822CE source memory profile ignored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/fw",
+    smoke_rtw8822ce_raw_source_metadata_parser_golden
+);
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Op {
     Claim,

@@ -5,6 +5,57 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
+
+#[allow(dead_code)]
+mod firmware_metadata {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../verification/data/wifi-firmware/realtek/metadata.rs"
+    ));
+}
+
+fn smoke_rtl8188ee_raw_source_metadata_parser_golden() -> TestResult {
+    // Original header plus inert zero body: this exercises only the parser,
+    // not authentication, firmware execution or physical device acceptance.
+    let source = &firmware_metadata::SOURCE_1;
+    let did = super::super::regs::RTL_DEV_8188EE;
+    if super::super::fw::FW_8188EE != source.name
+        || source.sha256 != "ca778610db58042c395141918b319c76df10a83dbd0aa9b3db6a9bb01c477cce"
+    {
+        return TestResult::Fail("RTL8188EE source identity/provenance changed");
+    }
+    let mut bytes =
+        match narf_wifi_fixtures::firmware::metadata_replay(source.length, source.fragments) {
+            Ok(bytes) => bytes,
+            Err(_) => return TestResult::Fail("RTL8188EE metadata replay geometry"),
+        };
+    let (info, payload) = match parse(did, &bytes) {
+        Ok(value) => value,
+        Err(_) => return TestResult::Fail("RTL8188EE raw-source header rejected"),
+    };
+    if info.version != 8
+        || info.subversion != 0
+        || info.payload != 11184
+        || payload.len() != 11184
+        || payload.iter().any(|&byte| byte != 0)
+    {
+        return TestResult::Fail("RTL8188EE independently extracted header facts");
+    }
+    for end in [0, 31, 32, bytes.len() - 1] {
+        if parse(did, &bytes[..end]).is_ok() {
+            return TestResult::Fail("RTL8188EE truncated source geometry admitted");
+        }
+    }
+    bytes[12] ^= 1;
+    if parse(did, &bytes).is_ok() {
+        return TestResult::Fail("RTL8188EE source payload extent ignored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/fw",
+    smoke_rtl8188ee_raw_source_metadata_parser_golden
+);
 #[derive(Debug, Clone)]
 enum Op {
     Read(u16),
