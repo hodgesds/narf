@@ -27,7 +27,6 @@ use crate::mixer::{self, ControlKind, ControlValue};
 use crate::pcm::{PcmSubstream, SubstreamState};
 use crate::sysfs_bridge::{render_card_id_attr, SNDRV_MAJOR};
 use crate::{list_cards, mixer as mixer_open, open_playback, register_card, SoundError};
-use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 // ── Fake HDA MMIO ────────────────────────────────────────────────────────
