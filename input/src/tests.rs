@@ -671,6 +671,120 @@ fn smoke_evdev_capability_bitmap() -> TestResult {
 }
 kernel_test_in!("input/evdev", smoke_evdev_capability_bitmap);
 
+// ── 4b. Identity + properties round-trip through the router ──────────────────
+
+fn smoke_evdev_identity_round_trips_through_router() -> TestResult {
+    use crate::evdev::{bus, prop, DeviceCaps, InputId, ROUTER};
+
+    let mut caps = DeviceCaps::new();
+    // The synthetic default every unplumbed producer still reports.
+    if caps.name != "narf-input" || caps.id.bustype != bus::VIRTUAL {
+        return TestResult::Fail("default caps must keep the virtual narf-input identity");
+    }
+    caps.set_identity(
+        "ELAN09BD I2C-HID Touchpad",
+        "i2c-ELAN0001/input0",
+        "",
+        InputId::new(bus::I2C, 0x04F3, 0x3045, 0x0001),
+    );
+    caps.add_prop(prop::POINTER);
+    caps.add_prop(prop::BUTTONPAD);
+    let (id, _node) = ROUTER.register_device(caps);
+    let got = ROUTER.caps(id).expect("caps");
+    ROUTER.unregister_device(id);
+    if got.name != "ELAN09BD I2C-HID Touchpad"
+        || got.phys != "i2c-ELAN0001/input0"
+        || got.id != InputId::new(bus::I2C, 0x04F3, 0x3045, 0x0001)
+        || !got.has_prop(prop::BUTTONPAD)
+        || !got.has_prop(prop::POINTER)
+        || got.has_prop(prop::DIRECT)
+    {
+        return TestResult::Fail("registered identity/properties did not round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "input/evdev",
+    smoke_evdev_identity_round_trips_through_router
+);
+
+// ── 4c. MT slot-protocol-B frame: two contacts, move, primary hand-off ───────
+
+fn smoke_evdev_mt_frame_two_contacts_and_release() -> TestResult {
+    use crate::abs;
+    use crate::evdev::{DeviceCaps, EventType, MtContactUpdate, MtEvdevState, ROUTER};
+
+    let (id, node) = ROUTER.register_device(DeviceCaps::new());
+    let reader = ROUTER.open_reader(id).expect("reader");
+    let mut state = MtEvdevState::new(2);
+    let upd = |slot, active, tracking_id, x, y| MtContactUpdate {
+        slot,
+        active,
+        tracking_id,
+        x,
+        y,
+        pressure: None,
+    };
+
+    // Frame 1: two contacts down — the frame the old I2C-HID path
+    // collapsed to a single relative pointer.
+    let n = state.dispatch_frame(
+        &node,
+        &[upd(0, true, 7, 100, 200), upd(1, true, 9, 300, 400)],
+        false,
+        false,
+    );
+    if n == 0 || state.active_contacts() != 2 {
+        return TestResult::Fail("two-contact frame emitted nothing");
+    }
+    let mut events = alloc::vec::Vec::new();
+    while let Some(ev) = reader.poll_event() {
+        events.push(ev);
+    }
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    if !has(EventType::Abs, abs::ABS_MT_SLOT, 1)
+        || !has(EventType::Abs, abs::ABS_MT_TRACKING_ID, 9)
+        || !has(EventType::Abs, abs::ABS_MT_POSITION_X, 300)
+        || !has(EventType::Abs, abs::ABS_X, 100)
+        || !has(EventType::Key, crate::evdev::key::BTN_TOUCH, 1)
+    {
+        return TestResult::Fail("two-contact frame missing MT/ST events");
+    }
+    if events.iter().filter(|e| e.type_ == EventType::Syn).count() != 1 {
+        return TestResult::Fail("frame must carry exactly one SYN_REPORT");
+    }
+
+    // Frame 2: release slot 0 — tracking id -1, ABS_X/Y hand off to the
+    // surviving slot-1 contact, BTN_TOUCH stays down.
+    let n = state.dispatch_frame(&node, &[upd(0, false, 7, 100, 200)], true, false);
+    if n == 0 || state.active_contacts() != 1 {
+        return TestResult::Fail("release frame emitted nothing");
+    }
+    let mut events = alloc::vec::Vec::new();
+    while let Some(ev) = reader.poll_event() {
+        events.push(ev);
+    }
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    if !has(EventType::Abs, abs::ABS_MT_TRACKING_ID, -1)
+        || !has(EventType::Abs, abs::ABS_X, 300)
+        || !has(EventType::Key, crate::evdev::key::BTN_LEFT, 1)
+        || has(EventType::Key, crate::evdev::key::BTN_TOUCH, 0)
+    {
+        return TestResult::Fail("release frame must hand off primary and keep BTN_TOUCH");
+    }
+    ROUTER.unregister_device(id);
+    TestResult::Pass
+}
+kernel_test_in!("input/evdev", smoke_evdev_mt_frame_two_contacts_and_release);
+
 // ── 5. Reader blocking-wait future yields when an event arrives ────────────────
 
 fn smoke_evdev_reader_wait_future_resolves() -> TestResult {

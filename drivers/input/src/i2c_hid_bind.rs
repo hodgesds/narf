@@ -323,28 +323,88 @@ fn bind_one(path: &str) -> bool {
 
     let device_path = path.to_string();
     let driver = I2cHidDriver::new(bus, addr, hid_desc_register);
+    // Identity context for the evdev nodes the pump registers: the
+    // ACPI _HID names the device, the ACPI leaf names its slot in the
+    // I2C topology. Vendor/product/version join them once the pump
+    // reads the HID descriptor.
+    let identity = I2cHidIdentity {
+        acpi_hid: narf_aml::device_hid(path).unwrap_or_else(|| String::from("PNP0C50")),
+        phys: {
+            let leaf = path
+                .trim_end_matches('\\')
+                .rsplit(['\\', '.'])
+                .next()
+                .unwrap_or("hid");
+            alloc::format!("i2c-{leaf}/input0")
+        },
+    };
     // Stackful: per-device i2c-hid input pump.
-    narf_scheduler::spawn_stackful(pump_task(device_path, driver, wake_flag, wired_irq));
+    narf_scheduler::spawn_stackful(pump_task(
+        device_path,
+        identity,
+        driver,
+        wake_flag,
+        wired_irq,
+    ));
     true
+}
+
+/// ACPI-derived identity shared by every evdev collection one
+/// HID-over-I2C device presents.
+#[derive(Clone, Debug)]
+struct I2cHidIdentity {
+    acpi_hid: String,
+    phys: String,
+}
+
+impl I2cHidIdentity {
+    /// A caps template carrying this device's real identity for one
+    /// collection class (`"Touchpad"`, `"Touchscreen"`, `"Pen"`,
+    /// `"Keyboard"`): `<_HID> <class>` as the name, the I2C topology
+    /// string as phys, and the HID descriptor's vendor/product/version
+    /// on `BUS_I2C`.
+    fn caps(
+        &self,
+        class: &str,
+        desc: &crate::i2c_hid::HidDescriptor,
+    ) -> narf_input::evdev::DeviceCaps {
+        let mut caps = narf_input::evdev::DeviceCaps::new();
+        caps.set_identity(
+            &alloc::format!("{} I2C-HID {}", self.acpi_hid, class),
+            &self.phys,
+            "",
+            narf_input::evdev::InputId::new(
+                narf_input::evdev::bus::I2C,
+                desc.w_vendor_id,
+                desc.w_product_id,
+                desc.w_version_id,
+            ),
+        );
+        caps
+    }
 }
 
 /// Per-device pump future. Owns the driver. Loops forever — exits
 /// only if the bus returns a fatal error.
 async fn pump_task(
     path: String,
+    identity: I2cHidIdentity,
     mut driver: I2cHidDriver,
     wake: &'static AtomicBool,
     irq_wired: bool,
 ) {
-    if let Err(e) = driver.read_descriptor().await {
-        let _ = writeln!(
-            narf_console::Writer,
-            "  i2c-hid-pump: {}: read_descriptor failed ({:?}); pump exiting",
-            path,
-            e
-        );
-        return;
-    }
+    let hid_desc = match driver.read_descriptor().await {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i2c-hid-pump: {}: read_descriptor failed ({:?}); pump exiting",
+                path,
+                e
+            );
+            return;
+        }
+    };
     if let Err(e) = driver.reset().await {
         let _ = writeln!(
             narf_console::Writer,
@@ -416,6 +476,8 @@ async fn pump_task(
         if consumer.is_some() {
             crate::i2c_hid_keyboard::add_consumer_caps(&mut caps);
         }
+        let template = identity.caps("Keyboard", &hid_desc);
+        caps.set_identity(&template.name, &template.phys, &template.uniq, template.id);
         let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
         if let Some(kp) = &keyboard {
             crate::i2c_hid_keyboard::log_boot_summary(
@@ -429,6 +491,31 @@ async fn pump_task(
     } else {
         None
     };
+
+    // Register evdev nodes for the digitizer collections so userspace
+    // (libinput) enumerates a real touchpad / touchscreen / pen with
+    // this device's identity — previously these collections reached
+    // only the in-kernel global ring and no `/dev/input/event*` node
+    // existed for them at all (issue #764).
+    let ptp_node = ptp.as_ref().map(|profile| {
+        let caps =
+            crate::i2c_hid_touch::build_ptp_caps(profile, &identity.caps("Touchpad", &hid_desc));
+        let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
+        node
+    });
+    let touch_node = touchscreen.as_ref().map(|profile| {
+        let caps = crate::i2c_hid_touch::build_touchscreen_caps(
+            profile,
+            &identity.caps("Touchscreen", &hid_desc),
+        );
+        let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
+        node
+    });
+    let pen_node = pen.as_ref().map(|profile| {
+        let caps = crate::i2c_hid_touch::build_pen_caps(profile, &identity.caps("Pen", &hid_desc));
+        let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
+        node
+    });
 
     if let Some(profile) = &ptp {
         log_ptp_mode_set_result(&path, set_ptp_multi_touch_mode(&driver, profile).await);
@@ -458,6 +545,11 @@ async fn pump_task(
     let mut last_x: Option<i32> = None;
     let mut last_y: Option<i32> = None;
     let mut last_button = false;
+    // Per-device PTP evdev slot tracker (the evdev node gets every
+    // contact; the global-ring feed above it keeps first-contact
+    // relative-pointer semantics for in-kernel consumers).
+    let mut ptp_state =
+        crate::i2c_hid_touch::PtpPumpState::new(ptp.as_ref().map(|p| p.contacts_max).unwrap_or(1));
     // Per-device touchscreen slot tracker (touchscreen path emits
     // TouchEvent per contact with normalised coordinates).
     let mut touch_state = crate::i2c_hid_touch::TouchPumpState::new();
@@ -531,6 +623,14 @@ async fn pump_task(
             if payload.first() == Some(&profile.input_report_id) {
                 if let Ok(decoded) = narf_hid::ptp::decode_input(profile, payload) {
                     push_ptp_pointer(&decoded, &mut last_x, &mut last_y, &mut last_button);
+                    if let Some(node) = &ptp_node {
+                        crate::i2c_hid_touch::pump_ptp_report_to_evdev(
+                            profile,
+                            &mut ptp_state,
+                            node,
+                            &decoded,
+                        );
+                    }
                 }
                 continue;
             }
@@ -543,7 +643,12 @@ async fn pump_task(
                 || payload.first() == Some(&ts_profile.input_report_id)
             {
                 if let Ok(decoded) = narf_hid::touchscreen::decode_input(ts_profile, payload) {
-                    crate::i2c_hid_touch::pump_report(ts_profile, &mut touch_state, &decoded);
+                    crate::i2c_hid_touch::pump_report_to_evdev(
+                        ts_profile,
+                        &mut touch_state,
+                        &decoded,
+                        touch_node.as_deref(),
+                    );
                 }
                 continue;
             }
@@ -553,7 +658,11 @@ async fn pump_task(
             // devices; the decode rejects mismatched IDs for us.
             if payload.first() == Some(&pen_profile.input_report_id) {
                 if let Ok(decoded) = narf_hid::pen::decode_input(pen_profile, payload) {
-                    crate::i2c_hid_touch::pump_pen_report(&mut pen_state, &decoded);
+                    crate::i2c_hid_touch::pump_pen_report_to_evdev(
+                        &mut pen_state,
+                        &decoded,
+                        pen_node.as_deref(),
+                    );
                 }
             }
         }

@@ -168,6 +168,58 @@ fn smoke_sysfs_abs_pointer_tagged_id_input_mouse() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_sysfs_abs_pointer_tagged_id_input_mouse);
 
+/// Property-driven classification: a BUTTONPAD device (ABS_MT + ABS +
+/// BTN_LEFT — the shape a PTP touchpad publishes) must be tagged
+/// `ID_INPUT_TOUCHPAD`, not fall through the caps heuristic to
+/// touchscreen/mouse; a DIRECT + BTN_TOOL_PEN device is a tablet.
+fn smoke_sysfs_prop_classification_touchpad_and_tablet() -> TestResult {
+    use narf_input::evdev::{key, prop, DeviceCaps};
+    use narf_input::{abs, AxisInfo};
+
+    let range = AxisInfo {
+        min: 0,
+        max: 0x7FFF,
+        fuzz: 0,
+        flat: 0,
+        res: 0,
+    };
+    let mut pad = DeviceCaps::new();
+    pad.add_abs_info(abs::ABS_X, range);
+    pad.add_abs_info(abs::ABS_Y, range);
+    pad.add_abs_info(abs::ABS_MT_POSITION_X, range);
+    pad.add_abs_info(abs::ABS_MT_POSITION_Y, range);
+    pad.add_key(key::BTN_LEFT);
+    pad.add_key(key::BTN_TOUCH);
+    pad.add_prop(prop::POINTER);
+    pad.add_prop(prop::BUTTONPAD);
+    let uevent = crate::sysfs::evdev_caps_uevent(&pad);
+    if !uevent.contains("ID_INPUT_TOUCHPAD=1") {
+        return TestResult::Fail("BUTTONPAD device not tagged ID_INPUT_TOUCHPAD");
+    }
+    if uevent.contains("ID_INPUT_TOUCHSCREEN") || uevent.contains("ID_INPUT_MOUSE") {
+        return TestResult::Fail("BUTTONPAD device double-tagged by the heuristic");
+    }
+    if !uevent.contains("PROP=") {
+        return TestResult::Fail("uevent must carry the PROP bitmap");
+    }
+
+    let mut pen = DeviceCaps::new();
+    pen.add_abs_info(abs::ABS_X, range);
+    pen.add_abs_info(abs::ABS_Y, range);
+    pen.add_key(key::BTN_TOOL_PEN);
+    pen.add_key(key::BTN_TOUCH);
+    pen.add_prop(prop::DIRECT);
+    let pue = crate::sysfs::evdev_caps_uevent(&pen);
+    if !pue.contains("ID_INPUT_TABLET=1") {
+        return TestResult::Fail("DIRECT pen device not tagged ID_INPUT_TABLET");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_sysfs_prop_classification_touchpad_and_tablet
+);
+
 // ── Test 2: Kobject attr show ──────────────────────────────────────────
 
 fn smoke_sysfs_kobject_attr_show() -> TestResult {
