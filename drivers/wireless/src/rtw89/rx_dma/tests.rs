@@ -259,6 +259,36 @@ kernel_test_in!(
     smoke_rtw89_rx_rings_original_linux_geometry_and_real_dma
 );
 
+fn smoke_rtw89_rx_partial_descriptor_is_progress_not_idle() -> TestResult {
+    let mut f = Fixture::new();
+    if f.prepare() != Some(Ok(())) {
+        return TestResult::Fail("RX preparation");
+    }
+    let mut bytes = packet(0, &[0x56; 40]);
+    // FIRST without LAST: assembler owns an incomplete actual DMA record.
+    bytes.truncate(40); // RXD promises40 bytes, this first fragment carries20.
+    let first = bytes.len() as u32 | 1 << 15;
+    bytes[..4].copy_from_slice(&first.to_le_bytes());
+    if !f.model.inject(&f.rx, 0, 0, &bytes) {
+        return TestResult::Fail("RX injection");
+    }
+    let Ok(batch) = f.rx.poll_step(&mut f.model, 1) else {
+        return TestResult::Fail("valid partial native RX record was rejected");
+    };
+    if !batch.consumed || !batch.events.is_empty() {
+        return TestResult::Fail("partial FS/LS record became an event or idle fence");
+    }
+    let idle = f.rx.poll_step(&mut f.model, 1).unwrap();
+    if idle.consumed || !idle.events.is_empty() {
+        return TestResult::Fail("fresh RXQ/RPQ idle indices invented progress");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_rx_partial_descriptor_is_progress_not_idle
+);
+
 fn smoke_rtw89_rx_publication_failure_cancel_and_stale_indices_are_terminal() -> TestResult {
     let mut unqualified = Fixture::new();
     unqualified.model.bytes[0xc000..0xc004].copy_from_slice(&(1u32 << 29).to_le_bytes());

@@ -360,3 +360,51 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_basic_rfk_handshake_deadlines_are_fail_closed
 );
+
+fn smoke_rtw89_b_channel_rxdck_uses_same_original_source_and_keeps_partial_owner() -> TestResult {
+    for &(seed, count, hash) in RXDCK_CASES {
+        let mut io = Model::new(seed, false, false);
+        let mut owner = ChannelRxDck::default();
+        // SAFETY: private owned exact B RF/BB model, explicit measured boundary.
+        if ready(unsafe { owner.prepare(&mut io) }) != Some(Ok(()))
+            || owner.state() != State::BasicCalibrated
+            || io.count != count
+            || io.hash != hash
+        {
+            return TestResult::Fail("fresh channel RXDCK differs from original C");
+        }
+        for failed in 0..io.operations {
+            let mut io = Model::new(seed, false, false);
+            io.fail = Some(failed);
+            let mut owner = ChannelRxDck::default();
+            // SAFETY: each actual source access failure must keep one partial attempt.
+            let result = ready(unsafe { owner.prepare(&mut io) });
+            if !matches!(result, Some(Err(_))) || owner.state() != State::Calibrating {
+                return TestResult::Fail("partial channel RXDCK completed");
+            }
+        }
+        for pending in 0..2 {
+            let mut io = Model::new(seed, false, false);
+            io.pending = Some(pending);
+            let mut owner = ChannelRxDck::default();
+            // SAFETY: dropped actual A/B settling waits must retain partial state.
+            if ready(unsafe { owner.prepare(&mut io) }).is_some()
+                || owner.state() != State::Calibrating
+            {
+                return TestResult::Fail("cancelled channel RXDCK completed");
+            }
+            let n = io.operations;
+            // SAFETY: partial one-shot owner must refuse a fresh channel attempt.
+            if ready(unsafe { owner.prepare(&mut io) }) != Some(Err(Error::Terminal))
+                || io.operations != n
+            {
+                return TestResult::Fail("cancelled channel RXDCK replayed");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_channel_rxdck_uses_same_original_source_and_keeps_partial_owner
+);

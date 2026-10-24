@@ -24,6 +24,10 @@ impl From<power::Error> for Error {
 pub(super) enum Kind {
     Dack,
     Rxdck,
+    Iqk,
+    IqkPath,
+    Tssi,
+    Dpk,
 }
 pub(super) trait Interface: Io {
     /// Recheck current signed board envelope and host channel policy. The
@@ -370,6 +374,27 @@ impl<I: Interface> Access<'_, I> {
         }
         Ok(())
     }
+    async fn channel_rxdck(&mut self) -> Result<(), Error> {
+        self.0.admit()?;
+        self.0.begin(Kind::Rxdck).await?;
+        let saved = self.0.pause().await?;
+        for path in 0..2 {
+            let start = self.0.now_us();
+            loop {
+                if self.rr(path, RR_MOD, RR_MOD_MASK).await? != 2 {
+                    break;
+                }
+                if self.0.now_us().saturating_sub(start) >= 5000 {
+                    return Err(power::Error::Timeout.into());
+                }
+                self.delay(2).await?;
+            }
+        }
+        self.rx_dck().await?;
+        self.0.resume(saved).await?;
+        self.0.end(Kind::Rxdck).await?;
+        Ok(())
+    }
 }
 impl Rfk {
     pub fn state(&self) -> State {
@@ -406,24 +431,31 @@ impl Rfk {
         access.0.begin(Kind::Dack).await?;
         access.dac(&mut self.results).await?;
         access.0.end(Kind::Dack).await?;
-        access.0.admit()?;
-        access.0.begin(Kind::Rxdck).await?;
-        let saved = access.0.pause().await?;
-        for path in 0..2 {
-            let start = access.0.now_us();
-            loop {
-                if access.rr(path, RR_MOD, RR_MOD_MASK).await? != 2 {
-                    break;
-                }
-                if access.0.now_us().saturating_sub(start) >= 5000 {
-                    return Err(power::Error::Timeout.into());
-                }
-                access.delay(2).await?;
-            }
+        access.channel_rxdck().await?;
+        self.state = State::BasicCalibrated;
+        Ok(())
+    }
+}
+
+/// Fresh one-shot channel RXDCK, distinct from the earlier RF-init occurrence.
+#[derive(Default)]
+pub(super) struct ChannelRxDck {
+    state: State,
+}
+impl ChannelRxDck {
+    pub fn state(&self) -> State {
+        self.state
+    }
+    /// # Safety
+    /// Same qualified B/PHY0/ch1/20 basic/channel owner, TSSI still disabled,
+    /// actual WLAN-only/current measured full recipe, exclusive RF/reset state.
+    /// Enclosing owner closes independent engines and retains DMA on drop/error.
+    pub async unsafe fn prepare(&mut self, io: &mut impl Interface) -> Result<(), Error> {
+        if self.state != State::New {
+            return Err(Error::Terminal);
         }
-        access.rx_dck().await?;
-        access.0.resume(saved).await?;
-        access.0.end(Kind::Rxdck).await?;
+        self.state = State::Calibrating;
+        Access(io).channel_rxdck().await?;
         self.state = State::BasicCalibrated;
         Ok(())
     }

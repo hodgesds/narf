@@ -106,6 +106,13 @@ main=r'''int main(void){
   for(int p=0;p<2;p++)for(int k=0;k<2;k++){u16 v=d.dack.addck_d[p][k];printf("%u,%u,",v&255,v>>8);}
   for(int p=0;p<2;p++)for(int k=0;k<2;k++){u16 v=d.dack.biask_d[p][k];printf("%u,%u,",v&255,v>>8);}
   printf("%u]),\n",d.dpk.dpk_gs[0]);
+ }puts("];");
+ puts("pub(super) const RXDCK_CASES: &[(u8,u32,u64)] = &[");
+ for(int seed=0;seed<2;seed++){
+  static struct rtw89_dev d;memset(&d,0,sizeof(d));u32 s=seed?0xa5a5a5a5:0;
+  for(u32 i=0;i<0x20000/4;i++)d.words[i]=s;for(int p=0;p<2;p++)for(u32 a=0;a<0x10100;a++)d.rf[p][a]=(s&0xfffff);
+  hash=14695981039346656037ULL;count=0;rtw8852b_rx_dck(&d,0,0);
+  printf("(%u,%u,0x%llx),\n",seed?165:0,count,(unsigned long long)hash);
  }puts("];");return 0;
 }'''
 code=prefix+enum+'\n'+definitions+'\n'+dack_type+'\n'+macros+'\n'+shim+'\n'+table_declarations+'\n'+functions+'\n'+main

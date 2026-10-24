@@ -50,6 +50,13 @@ impl NativeIo {
         }
         self.checked(0x1f3fc, 4, |_, _| ())
     }
+    pub(super) fn b_station_window(&self, indirect: bool) -> Result<(), Error> {
+        self.b_phy_window()?;
+        if indirect {
+            self.checked(0x4001c, 4, |_, _| ())?;
+        }
+        Ok(())
+    }
     fn checked<T>(
         &self,
         address: u32,

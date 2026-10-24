@@ -60,7 +60,10 @@ source=pre+regs+'\n'+shim+body+main
 with tempfile.TemporaryDirectory(prefix='rtw89-rfchannel-c-') as td:
  td=Path(td);(td/'o.c').write_text(source);subprocess.run(['cc','-std=gnu11','-O2',str(td/'o.c'),'-o',str(td/'o')],check=True);out=subprocess.check_output([str(td/'o')]).decode()
 reg_out,cases=out.removeprefix('REGS\n').split('CASES\n');comment='// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause\n// Original Linux B RF channel SHA256 '+hashlib.sha256((body+regs).encode()).hexdigest()+'\n'
-for name,value in [('regs.rs',comment+reg_out),('golden.rs',comment+cases)]:
+digest=hashlib.sha256((body+regs).encode()).digest()
+recipe='// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause\npub(super) const RECIPE:[u8;32]=['+','.join(map(str,digest))+'];\n'
+recipe=subprocess.check_output(['rustfmt','--edition','2021','--emit','stdout'],input=recipe.encode()).decode()
+for name,value in [('recipe.rs',recipe),('regs.rs',comment+reg_out),('golden.rs',comment+cases)]:
  if a.check:
   if (d/name).read_text()!=value:raise SystemExit(name+' differs')
  else:(d/name).write_text(value)

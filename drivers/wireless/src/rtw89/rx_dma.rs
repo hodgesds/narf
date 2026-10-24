@@ -94,7 +94,7 @@ impl Ring {
         io: &mut impl Io,
         budget: usize,
         reports: bool,
-    ) -> Result<Vec<Event>, Error> {
+    ) -> Result<(Vec<Event>, usize), Error> {
         let index = read(io, self.regs.idx as u32)?;
         let count = available(self.buffers.len() as u16, self.wp, index)?;
         let count = usize::from(count).min(budget);
@@ -131,7 +131,7 @@ impl Ring {
                 return Err(Error::Index);
             }
         }
-        Ok(events)
+        Ok((events, count))
     }
     fn retain(&mut self) {
         if let Some(memory) = self.descriptors.take() {
@@ -146,6 +146,12 @@ pub(super) struct Rx {
     state: State,
     rings: Option<[Ring; 2]>,
     armed: bool,
+}
+pub(super) struct Batch {
+    pub(super) events: Vec<Event>,
+    /// Descriptor progress remains observable for partial FS/LS assemblies
+    /// and reports that emit no Wifi event. It cannot become an idle fence.
+    pub(super) consumed: bool,
 }
 impl Default for Rx {
     fn default() -> Self {
@@ -237,19 +243,45 @@ impl Rx {
     /// Two finite queues, at most budget descriptors from each per invocation.
     /// Events remain private to the composed startup/station owner.
     pub fn poll(&mut self, io: &mut impl Io, budget: usize) -> Result<Vec<Event>, Error> {
+        self.poll_inner(io, budget, false).map(|batch| batch.events)
+    }
+    pub(super) fn poll_step(&mut self, io: &mut impl Io, budget: usize) -> Result<Batch, Error> {
+        self.poll_inner(io, budget, false)
+    }
+    /// # Safety
+    /// Caller is the same retained native station owner and encloses the
+    /// complete operation in its current device invocation. The sealed full
+    /// RF/response qualification is current; basic calibration is insufficient.
+    pub(super) unsafe fn poll_station_step(
+        &mut self,
+        io: &mut impl Io,
+        budget: usize,
+    ) -> Result<Batch, Error> {
+        self.poll_inner(io, budget, true)
+    }
+    fn poll_inner(
+        &mut self,
+        io: &mut impl Io,
+        budget: usize,
+        qualified_station: bool,
+    ) -> Result<Batch, Error> {
         if self.state != State::Polling || budget == 0 || budget > 256 {
             return Err(Error::Terminal);
         }
         let result = (|| {
             // Until the later signed station/response owner takes over, RX
             // transport alone must not permit an autonomous CMAC ACK/CTS.
-            if read(io, 0xc000)? & (1 << 29) != 0 {
+            if !qualified_station && read(io, 0xc000)? & (1 << 29) != 0 {
                 return Err(power::Error::Access.into());
             }
             let rings = self.rings.as_mut().ok_or(Error::Terminal)?;
-            let mut events = rings[1].poll(io, budget, true)?;
-            events.extend(rings[0].poll(io, budget, false)?);
-            Ok(events)
+            let (mut events, reports) = rings[1].poll(io, budget, true)?;
+            let (wifi, received) = rings[0].poll(io, budget, false)?;
+            events.extend(wifi);
+            Ok(Batch {
+                events,
+                consumed: reports != 0 || received != 0,
+            })
         })();
         if result.is_err() {
             self.state = State::Terminal;

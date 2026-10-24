@@ -75,6 +75,25 @@ autonomous response-rate envelope; a fixed1Mbps host data rate does not narrow
 hardware ACK/CTS power. The older v1 artifact cannot grant this station profile.
 The family specifications describe the exact factory, firmware and profile binding.
 
+RTL8852B's initial2T2R profile requires both the current basic
+`rtw89/rtw8852b-cal-v1-<12 lowercase MAC hex digits>.bin` and full
+`rtw89/rtw8852b-radio-v2-<12 lowercase MAC hex digits>.bin`. Full N52B v2 binds
+actual firmware PHY capability, the complete channel/calibration/operating and
+power recipes, measured calibration/ordinary/autonomous-response maxima, and
+signed maximum antenna gain. Its old basic artifact cannot grant ordinary RF.
+The worker prints the exact requested filename and actual board digest when
+staging is incomplete. These are provisioning facts; the measurement/signing
+authority must supply the real peaks. Static source WW power tables supply no
+country authority or measured dBm conversion.
+
+Generic RTL8852B attachment requires a real advertised and completed PCIe FLR.
+For a platform that instead proves an actual function/slot power reset and
+posted-traffic drainage, the unsafe `rtw89::pci::attach_cold` entry must be
+called before generic binding. A board flag, a claimed cold boot and BME-off
+do not supply that temporal proof. Published DMA remains retained on terminal
+failure; the first fixed1Mbps profile is bounded to512 packets per queue and
+does not implement automatic reset/rejoin.
+
 BCM43602 and CYW43439 require an explicit board selection before firmware
 upload. The signed `brcm/wifi-board-selection-v1.bin` manifest binds the actual
 PCI or SDIO host/card identity, chip revisions and exact canonical asset keys,

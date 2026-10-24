@@ -19,6 +19,7 @@ use narf_capabilities::{Cap, Write};
 pub enum Phase {
     New,
     Cold,
+    Discovered,
     CommandPreparation,
     Firmware,
     Running,
@@ -30,6 +31,8 @@ pub enum Phase {
     RadioTablesLoaded,
     BasicCalibration,
     BasicCalibrated,
+    FullRadioPreparing,
+    RadioReady,
     Terminal,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +61,9 @@ pub struct Startup {
     assets: Option<super::radio_assets::Assets>,
     coex: super::coex_native::Coex,
     rfk: super::rfk::Rfk,
+    full_radio: super::radio_full::Radio,
+    station_controller: Option<super::station_control::Controller>,
+    station_binding: Option<[u8; 6]>,
 }
 impl core::fmt::Debug for Startup {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -126,6 +132,9 @@ impl Startup {
             assets: None,
             coex: super::coex_native::Coex::default(),
             rfk: super::rfk::Rfk::default(),
+            full_radio: super::radio_full::Radio::default(),
+            station_controller: None,
+            station_binding: None,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -134,12 +143,38 @@ impl Startup {
     pub fn identity(&self) -> Option<Identity> {
         self.identity
     }
+    /// Read-only provisioning facts from this exact retained factory/image.
+    /// These values confer no calibration, RF or readiness authority.
+    pub(super) fn qualification_request(
+        &self,
+    ) -> Result<super::command_native::QualificationRequest, power::Error> {
+        let full = match self.phase {
+            Phase::RadioTablesLoaded => false,
+            Phase::BasicCalibrated => true,
+            _ => return Err(power::Error::Terminal),
+        };
+        self.firmware
+            .as_ref()
+            .ok_or(power::Error::Terminal)?
+            .transport()
+            .qualification_request(self.assets.as_ref().ok_or(power::Error::Terminal)?, full)
+    }
     /// Exact initial B measured calibration continuation; packet/response TX,
     /// full channel calibration and station publication remain closed.
     pub async fn prepare_basic_calibration(&mut self) -> Result<(), Error> {
         if self.phase != Phase::RadioTablesLoaded {
             return Err(Error::Terminal);
         }
+        let firmware = self.firmware.as_mut().ok_or(Error::Terminal)?;
+        if firmware.phase() != firmware_boot::Phase::Running {
+            return Err(Error::Terminal);
+        }
+        // Resolve exact signed board authority before consuming the hardware
+        // attempt. Staging a missing asset later reuses this same owner.
+        let preflight = firmware
+            .transport_mut()
+            .preflight_basic_rfk(self.assets.as_ref().ok_or(Error::Terminal)?)
+            .map_err(Error::Calibration)?;
         self.phase = Phase::BasicCalibration;
         let mut attempt = Attempt::new(self);
         let result = async {
@@ -157,11 +192,57 @@ impl Startup {
                         attempt.owner.assets.as_ref().ok_or(Error::Terminal)?,
                         &mut attempt.owner.coex,
                         &mut attempt.owner.rfk,
+                        preflight,
                     )
                     .await
             }
             .map_err(Error::Calibration)?;
             attempt.owner.phase = Phase::BasicCalibrated;
+            Ok(())
+        }
+        .await;
+        attempt.committed = result.is_ok();
+        result
+    }
+    /// Full channel/calibration/power preparation consumes the pure measured
+    /// v2 preflight only after all exact external assets and policy are current.
+    pub async fn prepare_full_radio(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::BasicCalibrated {
+            return Err(Error::Terminal);
+        }
+        let firmware = self.firmware.as_mut().ok_or(Error::Terminal)?;
+        if firmware.phase() != firmware_boot::Phase::Running {
+            return Err(Error::Terminal);
+        }
+        let preflight: super::command_native::RadioPreflight = firmware
+            .transport_mut()
+            .preflight_full_radio(
+                &self.radio,
+                &self.rfk,
+                self.assets.as_ref().ok_or(Error::Terminal)?,
+            )
+            .map_err(Error::Register)?;
+        self.phase = Phase::FullRadioPreparing;
+        let mut attempt = Attempt::new(self);
+        let result = async {
+            let firmware = attempt.owner.firmware.as_mut().ok_or(Error::Terminal)?;
+            // SAFETY: exact same retained factory/firmware/table/basic owner;
+            // full measured preflight above is consumed by one attempt. The
+            // outer guard closes and retains Native on failure/cancellation.
+            unsafe {
+                firmware
+                    .transport_mut()
+                    .prepare_full_radio(
+                        &mut attempt.owner.full_radio,
+                        &attempt.owner.radio,
+                        &attempt.owner.rfk,
+                        attempt.owner.assets.as_ref().ok_or(Error::Terminal)?,
+                        preflight,
+                    )
+                    .await
+            }
+            .map_err(Error::Register)?;
+            attempt.owner.phase = Phase::RadioReady;
             Ok(())
         }
         .await;
@@ -179,6 +260,13 @@ impl Startup {
             if firmware.phase() != firmware_boot::Phase::Running {
                 return Err(Error::Terminal);
             }
+            // Actual firmware GET_FEATURE precedes all BB/RF table and
+            // two-path calibration transitions on this retained owner.
+            firmware
+                .transport_mut()
+                .query_firmware_phycap()
+                .await
+                .map_err(Error::Register)?;
             let assets = attempt.owner.assets.as_ref().ok_or(Error::Terminal)?;
             // SAFETY: same retained actual cold/firmware/MAC/RX attempt. Its
             // Drop terminalizes both the radio and all possibly published DMA.
@@ -277,20 +365,20 @@ impl Startup {
         attempt.committed = result.is_ok();
         result
     }
-    /// One attempt; cancellation parks any published command path while
-    /// retaining its ring/packets. No channel/radio/IRQ/network producer starts.
-    /// `ber` must be the qualified platform's exact PCI_BER quirk.
-    pub async fn start(&mut self, ber: bool) -> Result<(), Error> {
+    /// Cold discovery ends before firmware/packet BME. The actual factory
+    /// MAC can therefore name and register the same retained station shell
+    /// before any asynchronous firmware producer becomes visible.
+    pub async fn discover(&mut self) -> Result<Identity, Error> {
         if self.phase != Phase::New {
             return Err(Error::Terminal);
         }
         self.phase = Phase::Cold;
         let mut attempt = Attempt::new(self);
-        let result = attempt.owner.start_inner(ber).await;
+        let result = attempt.owner.discover_inner().await;
         attempt.committed = result.is_ok();
         result
     }
-    async fn start_inner(&mut self, ber: bool) -> Result<(), Error> {
+    async fn discover_inner(&mut self) -> Result<Identity, Error> {
         // SAFETY: claim's fence/exclusivity persists inside this single owner;
         // no DMA has yet been published and actual PCI BME remains parked.
         unsafe { self.cold.as_mut().ok_or(Error::Terminal)?.prepare().await }
@@ -305,15 +393,31 @@ impl Startup {
         let identity = native.identity().ok_or(Error::Terminal)?;
         self.identity = Some(identity);
         self.native = Some(native);
+        self.phase = Phase::Discovered;
+        Ok(identity)
+    }
+    /// One hardware attempt after exact authenticated firmware preflight.
+    /// Missing/replaced assets before that attempt leave the discovered owner
+    /// intact. Cancellation after command preparation terminalizes it.
+    /// `ber` must be the qualified platform's exact PCI_BER quirk.
+    pub async fn start(&mut self, ber: bool) -> Result<(), Error> {
+        if self.phase == Phase::New {
+            self.discover().await?;
+        }
+        if self.phase != Phase::Discovered {
+            return Err(Error::Terminal);
+        }
+        let identity = self.identity.ok_or(Error::Terminal)?;
         // Selection follows ECV-corrected physical cut and actual secure fuses.
         // A/51 programmed secure boot still requires authenticated host board
         // blacklist policy; no all-clear default is created for those chips.
         let image =
             firmware_registry::load(identity.chip(), identity.cut()).map_err(Error::Image)?;
-        if identity.chip() == super::mac::ChipId::Rtl8852B {
-            self.assets =
-                Some(super::radio_assets::Assets::from_prepared(&image).map_err(Error::Assets)?);
-        }
+        let assets = if identity.chip() == super::mac::ChipId::Rtl8852B {
+            Some(super::radio_assets::Assets::from_prepared(&image).map_err(Error::Assets)?)
+        } else {
+            None
+        };
         let plan = DownloadPlan::new(
             image,
             identity.fuses(),
@@ -321,6 +425,13 @@ impl Startup {
         )
         .map_err(Error::Plan)?;
         self.phase = Phase::CommandPreparation;
+        self.assets = assets;
+        let mut attempt = Attempt::new(self);
+        let result = attempt.owner.start_plan(ber, plan).await;
+        attempt.committed = result.is_ok();
+        result
+    }
+    async fn start_plan(&mut self, ber: bool, plan: DownloadPlan) -> Result<(), Error> {
         let native = self.native.as_mut().ok_or(Error::Terminal)?;
         // SAFETY: the same cold-qualified backend and independent DMA fence
         // stay retained; no IRQ, power/reset or packet operation can coexist.
@@ -356,6 +467,8 @@ impl Drop for Startup {
         self.fail();
     }
 }
+#[path = "startup_station.rs"]
+mod station;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {

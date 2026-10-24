@@ -140,6 +140,20 @@ updates preserve operator IFF_UP and cannot invoke administrative hooks under
 driver locks. Whole rekey deadlines are tracked independently of pending
 reply/port state, including the old-key-open wait between M2 and M3.
 
+RTL8852B adds the exact source controller and fresh native packet core through
+the public Device and actual kernel DHCP for Open/WPA2, exact bidirectional IP,
+held/altered/cancelled M4, queued peer loss and terminal disconnect/rekey cases.
+This controller/packet fixture cannot create a production full-radio grant.
+Independent original-C and composed RF models execute the actual retained
+channel/BB/trim/RXDCK/IQK/TSSI/DPK/power owners on the same register backing;
+faults, current epoch loss and cancelled real PMAC waits cannot publish Ready.
+Actual PHY-capability mailbox replies, source awake status, measured v2 peaks
+and publication inside current device plus signed-record invocations remain
+independent prerequisites. The temporal FLR suite verifies the full quiet
+interval, restore/readbacks and cancellation without config access; a retained
+probe test rejects replacement or re-parking during reset ownership. Software
+evidence does not establish real firmware instruction execution or RF acceptance.
+
 `narf_wifi_fixtures::firmware::metadata_replay(image_len, fragments)` builds
 parser-only structural images up to 16 MiB. It validates nonempty, ordered,
 nonoverlapping fragment extents before allocation and zeroes every opaque gap.

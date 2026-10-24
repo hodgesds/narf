@@ -92,6 +92,7 @@ impl Fixture {
             receive: super::super::rx_dma::Rx::default(),
             radio: super::super::rf_access::Rf::default(),
             runtime_sequence: 0,
+            station_runtime: station::Runtime::default(),
             calibration: None,
             coex_ready: false,
             nctl_ready: false,
@@ -99,6 +100,12 @@ impl Fixture {
             scheduler: Some(super::super::scheduler_mailbox::Mailbox::default()),
             gain_bases: None,
             radio_started: false,
+            radio_shutdown: super::super::radio_shutdown::Shutdown::default(),
+            ordinary: None,
+            full_qualification: None,
+            operating: Some(super::super::phy_operating::Operating::default()),
+            phycap: None,
+            phycap_attempted: false,
         };
         Ok(Self { native, words })
     }
@@ -136,6 +143,46 @@ fn ready<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
+fn smoke_rtw89_native_station_cannot_convert_basic_or_dma_into_ordinary_rf() -> TestResult {
+    let mut f = Fixture::aperture(ChipId::Rtl8852B, 0x40020).unwrap();
+    f.activate().unwrap();
+    let before = f.words.clone();
+    if f.native.ordinary_current() != Err(super::super::power::Error::Unsupported)
+        || f.native.prepare_packets([2, 4, 6, 8, 10, 12], 0)
+            != Err(super::super::packet_core::Error::Access)
+        || f.words != before
+        || f.native.station_runtime.core.is_some()
+    {
+        return TestResult::Fail(
+            "native DMA readiness manufactured ordinary RF/response authority",
+        );
+    }
+    let admission = super::super::station_control::Admission::new();
+    if ready(
+        f.native
+            .send_permit(Kind::Header, &[1; 16], station::Permit::Station(&admission)),
+    ) != Some(Err(Error::Access))
+        || f.native.queue.pending() != 0
+        || f.words != before
+    {
+        return TestResult::Fail("station command reached DMA without the sealed ordinary grant");
+    }
+    f.native.authority.revoke();
+    let mut access = f.native.station_access();
+    let mut called = false;
+    let result = super::super::station_control::Interface::with_current(&mut access, |_| {
+        called = true;
+        Ok(())
+    });
+    if result != Err(super::super::power::Error::Access) || called || f.words != before {
+        return TestResult::Fail("revoked actual station authority reached a register closure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_station_cannot_convert_basic_or_dma_into_ordinary_rf
+);
 fn smoke_rtw89_native_ch12_program_publish_and_revocation() -> TestResult {
     for chip in [
         ChipId::Rtl8852A,
@@ -394,7 +441,7 @@ fn smoke_rtw89_native_runtime_rf_headers_match_original_linux_c() -> TestResult 
     f.native.runtime_sequence = 0;
     if ready(f.native.upload_radio_page(0, 0, &[0; 4]))
         != Some(Err(super::super::radio_init::Error::Register(
-            super::super::power::Error::Unsupported,
+            super::super::power::Error::Terminal,
         )))
         || f.native.runtime_sequence != 0
         || f.native.armed
@@ -656,4 +703,157 @@ fn smoke_rtw89_native_dma_fence_does_not_suppress_radio_drop_closure() -> TestRe
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_native_dma_fence_does_not_suppress_radio_drop_closure
+);
+
+fn smoke_rtw89_native_xtal_shutdown_observes_actual_commands_and_keeps_dma() -> TestResult {
+    for revoked in [false, true] {
+        let mut f = Fixture::aperture(ChipId::Rtl8852B, 0x20000).unwrap();
+        if f.activate().is_err() || ready(f.native.send(Kind::Header, &[9; 16])) != Some(Ok(())) {
+            return TestResult::Fail("native XTAL shutdown baseline");
+        }
+        f.native.radio_started = true;
+        f.native.fail();
+        let pending = f.native.queue.pending();
+        let packet = f.native.queue.model_resource(0).unwrap().dma_addr().raw();
+        let before = f.words.clone();
+        if revoked {
+            f.native.authority.revoke();
+        }
+        let mut result = None;
+        let mut xtal = [0xa5u8, 0x5a];
+        let mut commands = 0;
+        {
+            let native = &mut f.native;
+            let words = &mut f.words;
+            let mut future = pin!(native.finish_radio_shutdown());
+            let mut context = Context::from_waker(Waker::noop());
+            for _ in 0..8 {
+                match future.as_mut().poll(&mut context) {
+                    Poll::Ready(value) => {
+                        result = Some(value);
+                        break;
+                    }
+                    Poll::Pending => {}
+                }
+                // Device model reads the *actual issued* native register command and
+                // completes exactly that address/mode/mask against its independent RF
+                // bytes. No pre-publication source or DMA-address-to-VA cast is used.
+                let command = words[0x270 / 4];
+                if command & (1 << 31) == 0 || !matches!(command as u8, 0x80 | 0x81) {
+                    return TestResult::Fail(
+                        "native shutdown did not publish a real bounded XTAL command",
+                    );
+                }
+                let path = usize::from((command as u8) - 0x80);
+                let data = if command & (1 << 24) != 0 {
+                    xtal[path]
+                } else {
+                    if command >> 16 & 255 != 255 {
+                        return TestResult::Fail(
+                            "native RF shutdown write mask differs from source",
+                        );
+                    }
+                    xtal[path] = (command >> 8) as u8;
+                    xtal[path]
+                };
+                words[0x270 / 4] = (command & !(1 << 31) & !0xff00) | (u32::from(data) << 8);
+                commands += 1;
+                narf_time::busy_wait_cycles(narf_time::wall::ns_to_cycles(100_000));
+            }
+        }
+        if f.native.queue.pending() != pending
+            || f.native.queue.model_resource(0).unwrap().dma_addr().raw() != packet
+            || f.native.state != State::Terminal
+        {
+            return TestResult::Fail("RF shutdown released uncertain actual native command DMA");
+        }
+        if revoked {
+            if result != Some(Err(super::super::power::Error::Access))
+                || commands != 0
+                || f.words != before
+            {
+                return TestResult::Fail("revoked actual shutdown accessed native MMIO");
+            }
+        } else if result != Some(Ok(()))
+            || commands != 6
+            || xtal.iter().any(|v| v & 7 != 0)
+            || f.native.radio_shutdown.state()
+                != super::super::radio_shutdown::State::ShutdownAcknowledged
+        {
+            return TestResult::Fail("actual native XTAL disable/verify did not complete");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_xtal_shutdown_observes_actual_commands_and_keeps_dma
+);
+
+struct MetadataFiles;
+impl super::super::prepared::Files for MetadataFiles {
+    fn load(&mut self, _: &'static str) -> Result<Vec<u8>, super::super::fw::FwError> {
+        let mut bytes = vec![0; 52];
+        bytes[4..8].copy_from_slice(&[0, 29, 29, 18]);
+        bytes[24..28].copy_from_slice(&0x100u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&0x8000u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&4u32.to_le_bytes());
+        Ok(bytes)
+    }
+}
+fn smoke_rtw89_native_qualification_requests_are_exact_current_and_read_only() -> TestResult {
+    let Ok(mut f) = Fixture::aperture(ChipId::Rtl8852B, 0x20000) else {
+        return TestResult::Fail("qualification metadata fixture");
+    };
+    let image = super::super::prepared::load(&mut MetadataFiles, ChipId::Rtl8852B, 0).unwrap();
+    let assets = super::super::radio_assets::Assets::from_prepared(&image).unwrap();
+    f.native.factory = Some(super::super::station_control::tests::factory_with_profile(
+        0, 0x33, 5, false,
+    ));
+    f.native.phycap =
+        Some(super::super::firmware_phycap::Receipt::decode([0x403, 0, 0, 0]).unwrap());
+    f.native.state = State::Active;
+    let before = f.words.clone();
+    let basic = f.native.qualification_request(&assets, false).unwrap();
+    let full = f.native.qualification_request(&assets, true).unwrap();
+    let mac = f.native.factory.as_ref().unwrap().identity().unwrap().mac();
+    let suffix = alloc::format!(
+        "-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5]
+    );
+    if basic.version() != 1
+        || full.version() != 2
+        || basic.mac() != mac
+        || full.mac() != mac
+        || basic.digest() == full.digest()
+        || !basic.name().starts_with("rtw89/rtw8852b-cal-v1-")
+        || !full.name().starts_with("rtw89/rtw8852b-radio-v2-")
+        || !basic.name().ends_with(&suffix)
+        || !full.name().ends_with(&suffix)
+        || f.words != before
+        || f.native.radio_started
+        || f.native.calibration.is_some()
+        || f.native.full_qualification.is_some()
+        || f.native.ordinary.is_some()
+        || f.native.operating.as_ref().unwrap().state() != super::super::phy_operating::State::New
+    {
+        return TestResult::Fail("qualification metadata granted or changed hardware state");
+    }
+    f.native.authority.revoke();
+    if f.native.qualification_request(&assets, false).is_ok()
+        || f.native.qualification_request(&assets, true).is_ok()
+        || f.words != before
+    {
+        return TestResult::Fail("revoked native metadata request touched registers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_qualification_requests_are_exact_current_and_read_only
 );

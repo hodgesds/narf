@@ -309,7 +309,8 @@ pub fn prepare_header(
     }
     let fc = u16::from_le_bytes([frame[0], frame[1]]);
     // Initial transport profile: native management or ordinary non-QoS
-    // three-address data, no encryption/fragmentation/HT-control extras.
+    // three-address data, without fragmentation/HT-control extras. Only B's
+    // retained ordinary station path admits already encrypted host CCMP.
     if !matches!(
         fc & 0x00fc,
         0x0000
@@ -325,7 +326,7 @@ pub fn prepare_header(
             | 0x00c0
             | 0x00d0
             | 0x0008
-    ) || fc & (0x4000 | 0x8000 | 0x0400) != 0
+    ) || fc & (0x8000 | 0x0400) != 0
         || fc & 0x0300 == 0x0300
         || frame[22] & 0xf != 0
     {
@@ -334,7 +335,21 @@ pub fn prepare_header(
     if fc & 0x000c == 0 && fc & 0x0300 != 0 {
         return Err(Error::BadFrame);
     }
-    let dma_mask = if chip == ChipId::Rtl8852C {
+    if fc & 0x4000 != 0
+        && (chip != ChipId::Rtl8852B
+            || fc & 0x00fc != 8
+            || fc & 0x0300 != 0x0100
+            //24 native header +8 CCMP IV +>=8 ciphertext +8 MIC.
+            || frame.len() < 48
+            || frame[26] != 0
+            || frame[27] & 0x3f != 0x20
+            || [frame[24], frame[25], frame[28], frame[29], frame[30], frame[31]] == [0; 6])
+    {
+        return Err(Error::BadFrame);
+    }
+    // B uses the AX baseline descriptor encoding, but its retained/native
+    // device mask is36 bits. Encoding capacity is not device DMA authority.
+    let dma_mask = if matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C) {
         0xf_ffff_ffff
     } else {
         0xff_ffff_ffff

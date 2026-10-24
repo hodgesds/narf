@@ -8,6 +8,9 @@ use super::{
 #[path = "channel_rf/regs.rs"]
 mod regs;
 use regs::*;
+#[path = "channel_rf/recipe.rs"]
+mod recipe;
+pub(super) const RECIPE: [u8; 32] = recipe::RECIPE;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
     Rfk(rfk::Error),

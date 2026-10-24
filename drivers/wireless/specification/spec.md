@@ -18,7 +18,7 @@ matching a PCI ID or testing a command encoder does not establish a WLAN.
 | **ath11k** | WCN6855-family and native QCA6390 profiles | Live station/runtime profiles; hardware acceptance pending | QCA6390 uses native IPQ8074 RX descriptors and four-vdev resources; QCN9074 remains gated pending its HAL/DP path — `ath11k.md` |
 | **mt76** | MT7921/MT7922 CONNAC2 | Retained legacy 2.4/5 GHz station service on both architectures | Host-policy power/channel requests, UNI station/key commands, peer-bound RSNA, hardware CCMP replay checks, kernel/frame-ring service and verified reset/reload — `mt7921.md` |
 | **rtw88** | RTL8822CE initial station; RTL8821CE/RTL8822BE identification | Signed-board-power-gated channel1 native station through actual kernel DHCP | Retained firmware/MAC/PHY/calibration/H2C, host RSNA/CCMP, exact DMA plus CCX M4 receipts and terminal disconnect are implemented; measured deployment assets and physical qualification remain — `rtw88.md` |
-| **rtw89** | RTL8852B initial profile; RTL8852A/C, RTL8851B prerequisites | Retained cold/factory/PCI/WCPU, SCC MAC/RXBD/RPQ/C2H, source BB/gain/RF tables and bounded basic calibration | Current measured calibration qualification and firmware-confirmed coexistence keep ordinary CMAC TX gated; full RF/channel/power, packet TX/station service and probe attachment remain software work — `rtw89.md` |
+| **rtw89** | RTL8852B initial2T2R profile; other AX/BE prerequisites | Retained reset/cold/firmware/full radio/native station with source-controller/packet kernel DHCP models | Actual PHY capability, measured v1/v2 qualification, IQK/TSSI/DPK, source power, joint TXBD/RPQ and terminal disconnect are implemented; exact assets, reset handoff and physical qualification remain — `rtw89.md` |
 | **rtlwifi** | RTL8188EE PCIe | Factory-qualified channel1 native polled station through actual kernel DHCP | Signed board curves, native mailbox/beacon prerequisites, exact DMA M4/RX-idle admission and terminal retained disconnect are implemented; physical qualification and wider profiles remain — `rtlwifi.md` |
 | **rtl8xxxu** | RTL8188EU USB firmware profile | Signed-board-power-gated channel1 native station service, Open/WPA2-PSK CCMP with retained RSNA and persistent USB RX/TX | Actual board calibration artifacts/physical qualification, reset/rejoin, broader channels/rates and other silicon profiles remain — `rtl8xxxu.md` |
 | **ath10k** | QCA988x/QCA6174 and related PCIe parts | Retained RAW/non-PFC legacy native station service through kernel DHCP | All six dialects compose synchronous CE/HTC/HTT, scan/join, host RSNA/CCMP, current policy, exact packet receipts and terminal connection-loss/teardown; authenticated assets, physical acceptance and wider profiles remain — `ath10k.md` |
@@ -31,11 +31,11 @@ acceptance target is each documented initial station profile through scan,
 Open/WPA2, DHCP and bidirectional IP, with safe disconnect/failure ownership.
 Profiles that deliberately stop after an ambiguous failure may require a fresh
 device lifecycle for the first hardware validation; broader PHY/chip coverage,
-automatic recovery and PM are separate work. RTL8852B
-still requires substantial implementation before physical station validation
-is meaningful; build and model-test success must not be
-reported as having closed those software gaps. The family documents list the
-ordered missing implementations. The current loadable MT76 module likewise
+automatic recovery and PM are separate work. All eleven documented initial
+profiles have retained station/packet paths and composed DHCP/IP software
+evidence. Actual assets, board wiring, reset handoff and physical acceptance
+remain separate gates; source/model results do not establish RF acceptance.
+The family documents retain the wider-profile work. The current loadable MT76 module likewise
 registers PCI IDs only; its packet ABI integration remains software work.
 
 ## 1. Purpose & scope

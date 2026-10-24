@@ -44,6 +44,7 @@ impl Board {
         hash.update(b"NARF RTL8852B cold ch1 legacy20 awake WLAN-only calibration v1");
         hash.update(b"CMAC TXEN=0; NCTL RCK DACK RXDCK; no ordinary packet/response grant");
         hash.update(&super::rfk_tables::RECIPE);
+        hash.update(&super::phy_operating::RECIPE);
         hash.update(&super::coex_native::RECIPE);
         hash.update(&device.vendor.to_le_bytes());
         hash.update(&device.device.to_le_bytes());
@@ -158,6 +159,43 @@ impl Calibration {
         }
         let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Policy)?;
         self.check(&domain)
+    }
+    /// Keep actual publication inside this exact signed capability invocation.
+    /// Metadata/current-policy sampling alone cannot authorize later MMIO.
+    pub fn with_current<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, super::power::Error>,
+    ) -> Result<T, super::power::Error> {
+        struct Invoke<'a, F> {
+            qualification: &'a Calibration,
+            operation: F,
+        }
+        impl<T, F: FnOnce() -> Result<T, super::power::Error>> CapOp<FirmwareBlob, Read> for Invoke<'_, F> {
+            type Output = Result<T, super::power::Error>;
+            fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((|| {
+                    #[cfg(any(test, feature = "kernel-test"))]
+                    if let Some(domain) = self.qualification.model_domain.as_ref() {
+                        self.qualification
+                            .check(domain)
+                            .map_err(|_| super::power::Error::Access)?;
+                        return (self.operation)();
+                    }
+                    let domain = narf_wireless::reg::db::ensure_domain()
+                        .map_err(|_| super::power::Error::Access)?;
+                    self.qualification
+                        .check(&domain)
+                        .map_err(|_| super::power::Error::Access)?;
+                    (self.operation)()
+                })())
+            }
+        }
+        self.authority
+            .invoke(Invoke {
+                qualification: self,
+                operation,
+            })
+            .map_err(|_| super::power::Error::Access)?
     }
     fn check(&self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
         if !domain.country_code.iter().all(u8::is_ascii_uppercase) {

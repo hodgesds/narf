@@ -21,6 +21,53 @@ impl Mailbox {
     pub fn state(&self) -> State {
         self.state
     }
+    /// RTL8852B is AX: GET_FEATURE part0 has no content bytes. Its reply
+    /// contains the complete four-word PHY capability record; AX has no part1
+    /// query in mac.c::rtw89_mac_setup_phycap.
+    pub(super) async fn phycap(
+        &mut self,
+        io: &mut impl Interface,
+    ) -> Result<super::firmware_phycap::Receipt, power::Error> {
+        if self.state != State::Idle {
+            return Err(power::Error::Terminal);
+        }
+        self.state = State::Pending;
+        let mut a = Access(io);
+        if a.r8(0x8164)? != 0 {
+            return Err(power::Error::Access);
+        }
+        a.poll(0x8160, 0, 1000, 5000).await?;
+        // Recheck after the possibly awaited previous-command consumption.
+        if a.r8(0x8164)? != 0 {
+            return Err(power::Error::Access);
+        }
+        for (index, value) in [0x103, 0, 0, 0].into_iter().enumerate() {
+            a.w32(0x8140 + index as u32 * 4, value)?;
+        }
+        self.h2c = self.h2c.wrapping_add(1);
+        a.counter(15, self.h2c)?;
+        if a.r8(0x8164)? != 0 {
+            return Err(power::Error::Access);
+        }
+        a.w8(0x8160, 1)?;
+        a.poll(0x8164, 1, 1, 1_000_000).await?;
+        let mut words = [0; 4];
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = a.r32(0x8150 + index as u32 * 4)?;
+        }
+        // There is no H2CREG sequence echo contract in AX. A fresh response,
+        // exact function/full length, exclusive producer and actual command
+        // consumption bind this one-shot query; source counters are retained.
+        let receipt = super::firmware_phycap::Receipt::decode(words)?;
+        a.w8(0x8164, 0)?;
+        self.c2h = self.c2h.wrapping_add(1);
+        a.counter(0xf0, self.c2h)?;
+        if a.r8(0x8164)? != 0 || a.r8(0x8160)? != 0 {
+            return Err(power::Error::Access);
+        }
+        self.state = State::Idle;
+        Ok(receipt)
+    }
     pub async fn scheduler(
         &mut self,
         io: &mut impl Interface,

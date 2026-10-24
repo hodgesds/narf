@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Original Linux static B operating PHY SHA256 7e06a4526adee41ee1d39ed51e6737a35b6cc6dea05b8e28b48d6904a3c2a895
+pub(super) const B_AX_PWR_UL_CFO_MASK: u32 = 0x7;
+pub(super) const B_BMODE_PDTH_LIMIT_EN_MSK_V1: u32 = 0x40000000;
+pub(super) const B_BMODE_PDTH_LOWER_BOUND_MSK_V1: u32 = 0xff000000;
+pub(super) const B_DCFO_OPT_EN: u32 = 0x20000000;
+pub(super) const B_DCFO_WEIGHT_MSK: u32 = 0xf000000;
+pub(super) const B_PATH0_P20_FOLLOW_BY_PAGCUGC_EN_MSK: u32 = 0x20;
+pub(super) const B_PATH0_S20_FOLLOW_BY_PAGCUGC_EN_MSK: u32 = 0x20;
+pub(super) const B_PATH1_P20_FOLLOW_BY_PAGCUGC_EN_MSK: u32 = 0x20;
+pub(super) const B_PATH1_S20_FOLLOW_BY_PAGCUGC_EN_MSK: u32 = 0x20;
+pub(super) const B_SEG0R_PD_LOWER_BOUND_MSK: u32 = 0x7c0;
+pub(super) const B_SEG0R_PD_SPATIAL_REUSE_EN_MSK_V1: u32 = 0x40000000;
+pub(super) const B_STS_DIS_TRIG_BY_BRK: u32 = 0x4;
+pub(super) const B_STS_DIS_TRIG_BY_FAIL: u32 = 0x8;
+pub(super) const B_TX_COLLISION_T2R_ST_M: u32 = 0x3f00000;
+pub(super) const R_AX_PWR_UL_CTRL2: u32 = 0xd248;
+pub(super) const R_BMODE_PDTH_EN_V1: u32 = 0x4b74;
+pub(super) const R_BMODE_PDTH_V1: u32 = 0x4b64;
+pub(super) const R_DCFO_OPT: u32 = 0x4494;
+pub(super) const R_DCFO_WEIGHT: u32 = 0x4490;
+pub(super) const R_PATH0_P20_FOLLOW_BY_PAGCUGC_V2: u32 = 0x46e8;
+pub(super) const R_PATH0_S20_FOLLOW_BY_PAGCUGC_V2: u32 = 0x46ec;
+pub(super) const R_PATH1_P20_FOLLOW_BY_PAGCUGC_V2: u32 = 0x47a8;
+pub(super) const R_PATH1_S20_FOLLOW_BY_PAGCUGC_V2: u32 = 0x47ac;
+pub(super) const R_PHY_STS_BITMAP_ADDR_START: u32 = 0x73c;
+pub(super) const R_PLCP_HISTOGRAM: u32 = 0x738;
+pub(super) const R_SEG0R_PD_V1: u32 = 0x4860;
+pub(super) const R_TX_COLLISION_T2R_ST: u32 = 0xc70;

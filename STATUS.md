@@ -74,11 +74,11 @@ initial station profile: scan, Open/WPA2-PSK, DHCP and bidirectional IP, with
 controlled-port closure and safe transport ownership on disconnect/failure.
 Automatic recovery, wider PHY/chip coverage and power management are separate
 follow-ups where the initial profile deliberately requires a fresh device
-lifecycle. Ten families have composed kernel-DHCP paths (Intel Sc, MT76,
-ath11k, ath10k, AR9285, RTL8188EE, RTL8188EU, RTL8822CE, CYW43439 and BCM43602); exact authenticated firmware,
-board/calibration/policy provisioning and the family-specific gaps below
-still prevent an all-driver hardware-ready claim. RTL8852B still needs
-full RF/channel/power and ordinary packet/station integration.
+lifecycle. Eleven families have composed kernel-DHCP paths (Intel Sc, MT76,
+ath11k, ath10k, AR9285, RTL8188EE, RTL8188EU, RTL8822CE, RTL8852B, CYW43439 and BCM43602); exact authenticated firmware,
+board/calibration/policy provisioning, reset/wiring handoff and physical
+validation remain required. The initial software paths are
+implemented; broader chip/PHY/lifecycle coverage remains a separate target.
 
 Intel now sends versioned coexistence, SoC latency and awake-power setup.
 A retained Gen2 context-v1/RFH/TFH boot owner now covers APM, ALIVE6, unified
@@ -222,8 +222,16 @@ release records and index wrap. RF-v1 access, original conditional BB/gain/
 RF table execution and actual runtime RF-table H2C uploads share that owner.
 Signed measured basic-calibration qualification, firmware-confirmed WLAN-only
 coexistence and bounded NCTL/RCK/DACK/RXDCK keep global CMAC TX disabled.
-Full RF/channel/power, packet TX/station service and probe
-attachment remain. Its diagnostic probe retains unpublished storage without
+The RTL8852B initial path now continues through actual firmware PHY capability,
+static operating setup, channel/BB/RF, IQK/TSSI/DPK and exact source power
+configuration under a separate signed measured v2 envelope. The same retained
+startup reaches source peer controls and fresh BE/MGMT packet rings, with
+joint TXBD/RPQ retirement, host RSNA/CCMP, public Device and kernel DHCP/IP
+models. Generic probe uses actual FLR before cold discovery; a separate unsafe
+platform entry requires an independently verified temporal reset handoff.
+The first profile is awake/polled, fixed1Mbps, channel1/20MHz TX-A/RX-AB and
+bounded to512 identities per queue. Terminal closure requires a fresh claim.
+Other AX/BE profiles retain diagnostic storage without
 activating rings, IRQs or a NIC.
 Scoped native PCIe PHY/DBI operations now provide bounded MDIO/RAC access with
 retained failure/cancellation exclusion.
@@ -236,10 +244,10 @@ generations and implements explicit Stop/Set-Dequeue fencing for the supported
 bulk profile; halt/reset/replug and broader reclamation remain software work.
 Broadcom BCM43602 now connects explicit board-selected CR4/msgbuf transport to
 the common CYW FullMAC station/security lifecycle, with generation-safe retained
-flow-ring reuse after delete acknowledgment. Actual board selection, broader
-silicon, reset/recovery and PM remain software work. These gates
-cannot be closed by physical testing alone. No physical device validation is
-part of the current software-only work.
+flow-ring reuse after delete acknowledgment. Signed exact-host board selection
+and retained asset staging are implemented; actual deployment assets and
+physical validation remain. Broader silicon, reset/recovery and PM remain
+software follow-ups outside the initial profile.
 
 The shared A2 conversation kit now supplies a reactive legacy Open/WPA2 AP
 and a transaction-bound DHCP peer. MT76 uses the shared management/EAPOL peer;
@@ -298,18 +306,18 @@ loading, revocation, failure, cache reuse and concurrent caller policy.
 
 The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
 wireless, network, crypto, RNG, firmware and shared-fixture QEMU gates:
-x86_64 reports 2900 pass / 0 fail / 22 skip; aarch64 reports
-2196 pass / 0 fail / 16 skip. The latest continuation adds80 smokes covering
-RTL8822CE native station/DHCP and source DCF, signed FullMAC board selection,
-retained asset staging, current capability invocation, physical carrier versus
-administrative state, whole-rekey deadlines and RTL8852B radio/transport owners;
+x86_64 reports 2962 pass / 0 fail / 22 skip; aarch64 reports
+2258 pass / 0 fail / 16 skip. The latest continuation adds62 smokes covering
+RTL8852B temporal reset/probe ownership, actual firmware PHY capability, static
+operating and full radio/current-power qualification, source peer controls,
+native packet/Device DHCP/IP, exact M4 and whole-rekey/disconnect ownership;
 all pass on both architectures alongside the prior coverage.
 Both include a clean production boot and btrfs interoperability postflight.
 Host tests, release/debug builds, targeted Clippy across the kernel feature
 contexts, workspace formatting, and MT76 module build/Clippy pass.
 These are software/model checks. Expected skips include missing physical
 devices and unsigned-development firmware fixtures in the signed configuration;
-physical acceptance and the missing driver stages above remain open.
+physical acceptance and the documented wider-profile follow-ups remain open.
 
 ## Loadable e1000 datapath
 

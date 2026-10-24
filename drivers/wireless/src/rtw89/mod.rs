@@ -1,4 +1,4 @@
-//! Realtek RTW89 family Wi-Fi 6 (802.11ax) PCIe — Stage-0/1 driver.
+//! RTW89 PCIe discovery and retained RTL8852B initial station.
 //!
 //! Targets the Realtek 11ax silicon found on current Zen3+ / Phoenix
 //! HawkPoint1 laptops:
@@ -10,23 +10,14 @@
 //! - **RTL8922AE** — 2x2 Wi-Fi 7 (`10ec:8922`, `10ec:892b`). The "BE"
 //!   generation; we still match it under rtw89 because Linux does.
 //!
-//! ## Scope (this commit set)
-//!
-//! 1. PCI device match via the existing `bus::driver_match` table.
-//! 2. **BAR2** Device MMIO mapping (both rtw88 and rtw89 use BAR2). Linux `pci.c:rtw89_pci_claim_device` walks
-//!    `bar_id = 2` directly.
-//! 3. Parked diagnostic power prologue and a separate retained actual AX
-//!    cold/factory/PCI/BDRAM/CH12/WCPU startup owner.
-//! 4. Chip-ID detection from `R_AX_SYS_CFG1` so subsequent stages can
-//!    branch on the AX (8852A/B/C, 8851B) vs BE (8922A) generation.
-//! 5. EFUSE read for MAC + the 6-byte address copy. Logical map
-//!    offsets follow the per-chip layout in
-//!    `rtw89/rtw8852a.h::rtw8852ae_efuse`.
-//! 6. Retained unpublished ring storage, without a registered NIC or IRQ.
-//! 7. Checked firmware plans, active private CH12/WCPU/MAC/RX ownership and
-//!    B BB/RF tables plus signed basic calibration. Diagnostic DMA stays parked.
-//! 8. Full qualified channel/RF/power and packet/station composition remains
-//!    required before a usable NIC or IRQ is published.
+//! RTL8852B retains the same reset/cold/factory/firmware/radio owner through
+//! actual PHY capability, source calibration and measured signed qualification
+//! into an awake channel1 legacy20 TX-A/RX-AB Open/WPA2 station. Native TXBD/RPQ
+//! receipts drive host RSNA/CCMP and the registered kernel DHCP/IP path. The
+//! bounded first profile uses fixed1Mbps and512 identities per queue, with a
+//! fresh reset lifecycle after terminal closure. Physical acceptance and exact
+//! deployment assets remain required. Other AX/BE profiles are diagnostic or
+//! preparation paths; no packet or radio authority follows from ID matching.
 //!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later as of
 //! 2026-05-20 per the root `LICENSE`)
@@ -57,10 +48,13 @@
 extern crate alloc;
 
 mod bdram;
+mod bootstrap;
 pub mod btc;
 mod calibration_policy;
 pub mod chan;
+mod channel_bb;
 mod channel_rf;
+mod channel_transition;
 mod coex_native;
 mod cold;
 mod cold_native;
@@ -71,28 +65,36 @@ mod ddv;
 pub mod dma;
 mod download_dma;
 mod download_plan;
+mod dpk;
 pub mod efuse;
 mod factory;
 mod factory_b;
 mod fifo;
 mod fifo_regs;
 mod firmware_boot;
+mod firmware_phycap;
 mod firmware_registry;
 pub mod fw;
 pub mod fwdl;
 pub mod h2c;
+mod interface;
+mod iqk;
 pub mod mac;
 pub mod mac_init;
 mod mac_runtime;
 mod mac_runtime_regs;
+mod packet_core;
+mod packet_format;
 pub mod pci;
 mod pci_basic;
 mod pci_basic_regs;
+mod pci_reset;
 mod pcie;
 mod pcie_native;
 mod pcie_regs;
 pub mod phy;
 mod phy_access;
+mod phy_operating;
 pub mod phy_table;
 mod power;
 mod power_native;
@@ -100,11 +102,16 @@ mod power_regs;
 mod power_tables;
 mod prepared;
 mod radio_assets;
+mod radio_full;
 mod radio_gain;
 mod radio_init;
+mod radio_policy;
+mod radio_power;
+mod radio_shutdown;
 mod radio_stop;
 mod radio_table;
 mod radio_tables_b;
+mod radio_trim;
 mod rf_access;
 mod rfk;
 mod rfk_regs;
@@ -114,6 +121,12 @@ mod rx_packet;
 mod scheduler_mailbox;
 mod secure;
 mod startup;
+mod station;
+#[cfg(feature = "kernel-test")]
+mod station_composition_tests;
+pub(super) mod station_control;
+mod station_lifecycle;
+mod tssi;
 pub mod tx_transport;
 pub mod txrx;
 
