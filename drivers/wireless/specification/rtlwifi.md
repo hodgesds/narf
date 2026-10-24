@@ -1,7 +1,8 @@
 # rtlwifi — Specification
 
-> Status: PCI/EFUSE identity, retained RTL8188EE paged firmware and inactive native rings;
-> native packet/RF/station software remains incomplete.
+> Status: retained RTL8188EE firmware, inactive native rings and factory-qualified
+> MAC/BB/RF tables with IQ/LC calibration; channel/power, packet/IRQ and station
+> software remains incomplete.
 
 ## 1. Purpose & scope
 
@@ -105,8 +106,41 @@ are retained on every error/Drop until a future reset/quiescence proof; no
 firmware/reset helper may reconstruct a second packet owner.
 
 `initialize_registered` now composes authenticated firmware boot with that
-retained inactive preparation in the real probe worker. Ready firmware plus
-Prepared rings remains below RF/BB/calibration and active packet admission.
+retained inactive preparation in the real probe worker, then continues through
+`Prepared::configure_radio(profile)` under the same retained async owner.
+`efuse::Factory` retains the complete decoded logical map alongside its validated
+MAC. The radio profile checks EEPROM8129/VID10ec/DID8179 and applies Linux's
+HP197d RF52 override only for default-customer103c:197d factory identity.
+Other silicon is not dispatched through this continuation.
+
+The radio continuation loads all90 MAC,191 BB,128 AGC and95 RF table rows,
+including exact50ms RF settling intervals, and retains all88 PG triples for
+the later channel-power owner. It uses 8-bit-address/20-bit LSSI and the actual
+HSSI edge/readback protocol, with 10/120us waits and PI/SI register selection.
+The previous unused family scaffolds do not supply any of these operations.
+Single-path IQK backs up and restores MAC/ADDA/BB state, performs bounded TX
+and RX retries over up to three samples, compares Linux's tolerance and fallback
+candidates, applies the signed TX/RX matrix and retains recovery registers.
+Missing/unstable TX or RX measurements fail rather than reporting calibrated
+hardware through Linux's TX-only/default fallback. LCK follows Linux's paused
+or continuous-TX sequence and its100ms calibration interval; elapsed time alone
+does not establish physical oscillator convergence.
+
+The one-shot transition installs terminal Failed before its first await and
+commits `RadioConfigured` plus `radio_report()` only after all operations and
+final parked-gate checks succeed. Every native register still executes under
+current PCI authority with BME off. PCIe DMA0x301 staysff, CR packet gates and
+both interrupt masks stay closed; error, cancellation and Drop retain all
+published mappings. Repeated configuration does no I/O. An independent C oracle
+executes original Linux calibration functions; the register/RF model checks its
+complete write/delay trace, signed matrix, HP variant, factory negatives,
+transaction failures and cancellation at RF/IQK/LCK waits.
+
+`RadioConfigured` remains below EFUSE/regulatory channel-power programming,
+antenna/PA-bias and thermal policy, full MAC operational configuration, active
+DMA/IRQ ownership and station admission. It cannot scan, transmit ordinary
+packets, associate or raise carrier. Physical table/calibration acceptance also
+remains unvalidated.
 
 ## 4. Invariants
 
@@ -126,8 +160,8 @@ The scheduler's responsive wait supplies bounded EFUSE completion/settling.
 
 ## 7. Stage assignment
 
-Factory identity, RTL8188EE CPU firmware and inactive LLT/linked-ring
-preparation are software covered.
+Factory identity, RTL8188EE CPU firmware, inactive LLT/linked-ring preparation
+and retained factory-qualified table/IQK/LCK continuation are software covered.
 Complete station software and physical
 board qualification remain required.
 
@@ -139,7 +173,7 @@ board qualification remain required.
 | Complete source-matched per-chip power/reset qualification | RTL8188EE PCI enable prefix/flow implemented; other families remain incomplete |
 | Authenticated image/header selection and runtime firmware loading | RTL8188EE retained probe owner implemented; other profiles missing |
 | DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE DMA32 inactive linked rings/LLT and retained publication implemented; active DMA, quiesce/recovery, IRQ and H2C/C2H missing |
-| RF/BB tables, calibration, channel/power and rate control | Missing |
+| RF/BB tables, calibration, channel/power and rate control | RTL8188EE complete tables and retained1T IQK/LCK implemented; EFUSE/regulatory channel power, antenna/PA bias, thermal tracking and rate control remain missing |
 | Scan, management RX/TX, authentication/association and WPA2 | Missing |
 | Ethernet packet path and terminal TX completion ownership | Missing |
 | Multi-radio, removal, suspend/reset/recovery | Missing |

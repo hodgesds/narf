@@ -37,6 +37,9 @@ AR9285-specific writes follow a checked silicon revision.
   EEPROM modal/RF board values, the interpolated detector/PDADC table, and
   legacy20 CCK/OFDM/HT20 target-power registers limited by factory CTL and
   an explicit zero-dBm ceiling.
+  It includes native 20MHz mode/timeout overrides, single RX/calibration/TX
+  chain masks, RF mode, frequency-dependent delta slope and EEPROM spur
+  filtering/mask programming after the full INI tables.
   It records inactive register preparation, not channel authorization or
   a calibrated/operational PHY.
 - Errors distinguish absent/mismatched silicon, timeout, invalid EEPROM
@@ -142,12 +145,24 @@ documents usage and all nine rate cases. They compare existing literals and
 exhaustive hashes without rewriting expected values.
 They do not prove RF or packet operation.
 
+The complete override/channel/chain/RF/synth/delta-slope/spur write sequence
+matches 48 independently compiled original Linux C cases: channels1/6/13,
+eight signed spur offsets (including both strict boundaries) and zero/nonzero
+inherited registers. The packed EEPROM spur offset is obtained from the native
+C type, not a Rust layout. Exact legacy Viterbi packing, including repeated
+indices, is retained. Invalid channels fail before register access; access loss
+at every write and absent registers stop publication. Revoked native authority
+is checked before an invalid MMIO address. The reproducible
+`phy/channel/make_linux_oracle.py` records source/function SHA256 provenance
+and writes only to an explicitly selected or temporary output directory.
+Production currently invokes this sequence only for the inactive2412MHz
+reference after full INI setup; it does not implement fast retuning.
+
 ## 8. Remaining software and physical acceptance
 
 Software still required before AR9285 is ready for physical Wi-Fi testing:
 
-1. Complete the partially prepared PHY: channel-mode overrides, chain
-   masks and delta slope/spur handling, authenticated power/antenna/channel
+1. Complete the partially prepared PHY: authenticated power/antenna/channel
    policy, noise-floor/IQ/PA calibration and current regulatory limits.
    Initial factory CTL/rate preparation does not implement those live rules.
    The fixed inactive reference synth setting does not implement channel

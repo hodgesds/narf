@@ -82,6 +82,18 @@ asset, revocation, cache and concurrent caller-policy checks. These
 kernel-dependent types are not a host test executable, and none of these
 checks establish RF or real firmware/silicon acceptance.
 
+The retained host WPA2/CCMP key and terminal-reply suites live with shared
+`wireless::{packet_key, station_security}`; RTL8188EU adapters preserve their
+raw-profile admission before those owners. Ath10k's RAW/non-PFC legacy model
+composes native management/HTT, the shared security owner and exact
+bidirectional Ethernet/IP across six WMI dialects. Its firmware model consumes
+actual retained referenced-management DMA, including bytes beyond the64-byte
+TLV command prefetch. That async transport conversation does not yet prove a
+kernel-DHCP/netdev service. AR9285 channel preparation, RTL8188EE complete
+radio/calibration and RTW89 PCIe pre-init/mode owners additionally compare
+native register/delay traces against extracted original Linux C functions;
+these inactive/preparation checks cannot grant packet or RF readiness.
+
 `narf_wifi_fixtures::firmware::metadata_replay(image_len, fragments)` builds
 parser-only structural images up to 16 MiB. It validates nonempty, ordered,
 nonoverlapping fragment extents before allocation and zeroes every opaque gap.

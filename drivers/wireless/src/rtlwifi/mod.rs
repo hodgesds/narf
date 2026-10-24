@@ -66,6 +66,7 @@ pub mod phy;
 pub mod power;
 pub mod prepare;
 mod prepare_native;
+pub mod radio;
 pub mod regs;
 pub mod rf;
 pub mod rx;

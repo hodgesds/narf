@@ -1,6 +1,6 @@
 use super::*;
+use crate::eapol::{self, KeyFrame, KeyMgmt, Ptk};
 use narf_kernel_test::{kernel_test_in, TestResult};
-use narf_wireless::eapol::{self, KeyFrame, KeyMgmt, Ptk};
 const OWN: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const AP: [u8; 6] = [2, 0, 0, 0, 0, 2];
 const PMK: [u8; 32] = [0x55; 32];
@@ -8,7 +8,7 @@ const AN: [u8; 32] = [0x11; 32];
 const SN: [u8; 32] = [0x22; 32];
 const GTK: [u8; 16] = [0x7c; 16];
 fn rsne() -> Vec<u8> {
-    narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body()
+    crate::rsn::RsnIe::wpa2_psk_ccmp().encode_body()
 }
 fn security() -> Security {
     Security::new(OWN, AP, &PMK, &rsne(), &rsne(), None, 2).unwrap()
@@ -60,32 +60,33 @@ fn native(body: &[u8], multicast: bool) -> Vec<u8> {
     frame.extend_from_slice(body);
     frame
 }
-fn mpdu(bytes: Vec<u8>) -> Mpdu {
-    Mpdu {
-        bytes,
-        phy: Vec::new(),
-        rate: 0,
-        ht: false,
-        bandwidth40: false,
-        tid: 0,
-        decrypted: false,
-        timestamp: 0,
+struct Mpdu {
+    bytes: Vec<u8>,
+    raw: bool,
+}
+impl RawFrame for Mpdu {
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    fn unmodified(&self) -> bool {
+        self.raw
     }
 }
+fn mpdu(bytes: Vec<u8>) -> Mpdu {
+    Mpdu { bytes, raw: true }
+}
 struct Ccm;
-impl narf_wireless::ccmp::AesCcm for Ccm {
+impl crate::ccmp::AesCcm for Ccm {
     fn encrypt(
         &self,
         key: &[u8; 16],
         nonce: &[u8; 13],
         aad: &[u8],
         body: &mut [u8],
-    ) -> Result<[u8; 8], narf_wireless::ccmp::CcmpError> {
+    ) -> Result<[u8; 8], crate::ccmp::CcmpError> {
         narf_crypto::aes_ccm::seal(key, nonce, aad, body).map_err(|error| match error {
-            narf_crypto::aes_ccm::Error::Length => narf_wireless::ccmp::CcmpError::TooLong,
-            narf_crypto::aes_ccm::Error::Authentication => {
-                narf_wireless::ccmp::CcmpError::AuthFailed
-            }
+            narf_crypto::aes_ccm::Error::Length => crate::ccmp::CcmpError::TooLong,
+            narf_crypto::aes_ccm::Error::Authentication => crate::ccmp::CcmpError::AuthFailed,
         })
     }
     fn decrypt(
@@ -95,16 +96,16 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
         aad: &[u8],
         body: &mut [u8],
         tag: &[u8; 8],
-    ) -> Result<(), narf_wireless::ccmp::CcmpError> {
+    ) -> Result<(), crate::ccmp::CcmpError> {
         narf_crypto::aes_ccm::open(key, nonce, aad, body, tag)
-            .map_err(|_| narf_wireless::ccmp::CcmpError::AuthFailed)
+            .map_err(|_| crate::ccmp::CcmpError::AuthFailed)
     }
 }
 fn encrypt(frame: &[u8], tk: &[u8], pn: u64, id: u8) -> Vec<u8> {
     let mut header = frame[..24].to_vec();
     header[1] |= 0x40;
     let mut body = frame[24..].to_vec();
-    let wire = narf_wireless::ccmp::protect(
+    let wire = crate::ccmp::protect(
         &Ccm,
         &header,
         tk.try_into().unwrap(),
@@ -119,9 +120,9 @@ fn encrypt(frame: &[u8], tk: &[u8], pn: u64, id: u8) -> Vec<u8> {
     header
 }
 fn decrypt(frame: &[u8], tk: &[u8]) -> Vec<u8> {
-    let mut window = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
+    let mut window = crate::ccmp::ReplayWindow { last_seen_pn: 0 };
     let mut wire = frame[24..].to_vec();
-    narf_wireless::ccmp::unprotect(
+    crate::ccmp::unprotect(
         &Ccm,
         &frame[..24],
         tk.try_into().unwrap(),
@@ -157,7 +158,34 @@ fn established() -> Security {
     deliver(&mut s);
     s
 }
-fn smoke_rtl8188eu_retained_rsna_commits_only_after_exact_m4_delivery() -> TestResult {
+fn smoke_station_raw_admission_precedes_nonce_and_key_state() -> TestResult {
+    let mut security = security();
+    let mut frame = mpdu(native(&key_frame(0x8a, 1, AN, &[], None), false));
+    frame.raw = false;
+    let mut requested = false;
+    let result = security.receive_with_nonce(&frame, || {
+        requested = true;
+        Some(SN)
+    });
+    if result != Ok(Rx::Ignored)
+        || requested
+        || security.pending_frame().is_some()
+        || security.pair.is_some()
+        || security.port_open()
+    {
+        return TestResult::Fail("non-raw descriptor admission changed nonce/key/port ownership");
+    }
+    frame.raw = true;
+    if security.receive(&frame, SN) != Ok(Rx::ReplyReady) {
+        return TestResult::Fail("rejected descriptor poisoned subsequent valid native EAPOL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/station_security",
+    smoke_station_raw_admission_precedes_nonce_and_key_state
+);
+fn smoke_station_retained_rsna_commits_only_after_exact_m4_delivery() -> TestResult {
     let mut s = security();
     let p = ptk(AN, SN);
     if s.port_open() {
@@ -200,10 +228,10 @@ fn smoke_rtl8188eu_retained_rsna_commits_only_after_exact_m4_delivery() -> TestR
     TestResult::Pass
 }
 kernel_test_in!(
-    "wireless",
-    smoke_rtl8188eu_retained_rsna_commits_only_after_exact_m4_delivery
+    "wireless/station_security",
+    smoke_station_retained_rsna_commits_only_after_exact_m4_delivery
 );
-fn smoke_rtl8188eu_rsna_peer_binding_and_bad_delivery_fail_closed() -> TestResult {
+fn smoke_station_rsna_peer_binding_and_bad_delivery_fail_closed() -> TestResult {
     let m1 = native(&key_frame(0x8a, 1, AN, &[], None), false);
     for offset in [4, 10, 16, 22] {
         let mut s = security();
@@ -225,10 +253,10 @@ fn smoke_rtl8188eu_rsna_peer_binding_and_bad_delivery_fail_closed() -> TestResul
     TestResult::Pass
 }
 kernel_test_in!(
-    "wireless",
-    smoke_rtl8188eu_rsna_peer_binding_and_bad_delivery_fail_closed
+    "wireless/station_security",
+    smoke_station_rsna_peer_binding_and_bad_delivery_fail_closed
 );
-fn smoke_rtl8188eu_rsna_rekey_reply_uses_old_packet_key_then_commits_new() -> TestResult {
+fn smoke_station_rsna_rekey_reply_uses_old_packet_key_then_commits_new() -> TestResult {
     let mut s = established();
     let old = ptk(AN, SN);
     let new = ptk([0x33; 32], [0x44; 32]);
@@ -271,10 +299,10 @@ fn smoke_rtl8188eu_rsna_rekey_reply_uses_old_packet_key_then_commits_new() -> Te
     TestResult::Pass
 }
 kernel_test_in!(
-    "wireless",
-    smoke_rtl8188eu_rsna_rekey_reply_uses_old_packet_key_then_commits_new
+    "wireless/station_security",
+    smoke_station_rsna_rekey_reply_uses_old_packet_key_then_commits_new
 );
-fn smoke_rtl8188eu_controlled_port_and_ccmp_replay_survive_forgery() -> TestResult {
+fn smoke_station_controlled_port_and_ccmp_replay_survive_forgery() -> TestResult {
     let mut s = established();
     let p = ptk(AN, SN);
     let mut plain = native(&[0x45; 20], false);
@@ -307,11 +335,11 @@ fn smoke_rtl8188eu_controlled_port_and_ccmp_replay_survive_forgery() -> TestResu
     TestResult::Pass
 }
 kernel_test_in!(
-    "wireless",
-    smoke_rtl8188eu_controlled_port_and_ccmp_replay_survive_forgery
+    "wireless/station_security",
+    smoke_station_controlled_port_and_ccmp_replay_survive_forgery
 );
 
-fn smoke_rtl8188eu_retired_temporal_key_cannot_restart_packet_numbers() -> TestResult {
+fn smoke_station_retired_temporal_key_cannot_restart_packet_numbers() -> TestResult {
     let mut s = established();
     let first = ptk(AN, SN);
     let second = ptk([0x33; 32], [0x44; 32]);
@@ -376,10 +404,10 @@ fn smoke_rtl8188eu_retired_temporal_key_cannot_restart_packet_numbers() -> TestR
     TestResult::Pass
 }
 kernel_test_in!(
-    "wireless",
-    smoke_rtl8188eu_retired_temporal_key_cannot_restart_packet_numbers
+    "wireless/station_security",
+    smoke_station_retired_temporal_key_cannot_restart_packet_numbers
 );
-fn smoke_rtl8188eu_rsna_retry_does_not_reset_installed_key_state() -> TestResult {
+fn smoke_station_rsna_retry_does_not_reset_installed_key_state() -> TestResult {
     let mut s = established();
     let p = ptk(AN, SN);
     let mut eth = vec![2, 0, 0, 0, 0, 3];
@@ -405,10 +433,10 @@ fn smoke_rtl8188eu_rsna_retry_does_not_reset_installed_key_state() -> TestResult
     TestResult::Pass
 }
 kernel_test_in!(
-    "wireless",
-    smoke_rtl8188eu_rsna_retry_does_not_reset_installed_key_state
+    "wireless/station_security",
+    smoke_station_rsna_retry_does_not_reset_installed_key_state
 );
-fn smoke_rtl8188eu_group_rekey_zero_is_receive_only_and_keeps_replay_separate() -> TestResult {
+fn smoke_station_group_rekey_zero_is_receive_only_and_keeps_replay_separate() -> TestResult {
     let mut s = established();
     let p = ptk(AN, SN);
     let mut data = kde([0x7d; 16]);
@@ -434,11 +462,11 @@ fn smoke_rtl8188eu_group_rekey_zero_is_receive_only_and_keeps_replay_separate() 
     TestResult::Pass
 }
 kernel_test_in!(
-    "wireless",
-    smoke_rtl8188eu_group_rekey_zero_is_receive_only_and_keeps_replay_separate
+    "wireless/station_security",
+    smoke_station_group_rekey_zero_is_receive_only_and_keeps_replay_separate
 );
 
-fn smoke_rtl8188eu_rsna_forged_m3_and_original_ap_rsne_binding() -> TestResult {
+fn smoke_station_rsna_forged_m3_and_original_ap_rsne_binding() -> TestResult {
     let p = ptk(AN, SN);
     let mut s = security();
     s.receive(&mpdu(native(&key_frame(0x8a, 1, AN, &[], None), false)), SN)
@@ -456,7 +484,7 @@ fn smoke_rtl8188eu_rsna_forged_m3_and_original_ap_rsne_binding() -> TestResult {
     if s.receive(&mpdu(native(&valid, false)), SN) != Ok(Rx::ReplyReady) {
         return TestResult::Fail("forged M3 poisoned authentic handshake");
     }
-    let mut ap = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp();
+    let mut ap = crate::rsn::RsnIe::wpa2_psk_ccmp();
     ap.rsn_capabilities = 0x80;
     let mut s = Security::new(OWN, AP, &PMK, &rsne(), &ap.encode_body(), None, 2).unwrap();
     s.receive(&mpdu(native(&key_frame(0x8a, 1, AN, &[], None), false)), SN)
@@ -471,6 +499,6 @@ fn smoke_rtl8188eu_rsna_forged_m3_and_original_ap_rsne_binding() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "wireless",
-    smoke_rtl8188eu_rsna_forged_m3_and_original_ap_rsne_binding
+    "wireless/station_security",
+    smoke_station_rsna_forged_m3_and_original_ap_rsne_binding
 );

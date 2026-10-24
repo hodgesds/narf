@@ -348,7 +348,7 @@ fn resources(
     caps: &Capabilities,
     features: u64,
 ) -> Result<Resources, Error> {
-    let (values, vdevs, peers, active_peers) = match d {
+    let (mut values, vdevs, peers, active_peers) = match d {
         Dialect::Main => (
             words(&[
                 8, 24, 0, 0, 2, 48, 16, 7, 7, 100, 100, 100, 40, 1, 4, 3, 3, 8, 0, 0, 0, 1024, 32,
@@ -449,6 +449,17 @@ fn resources(
             )
         }
     };
+    if features & (1 << 10) != 0 {
+        // Linux core.c::ath10k_core_init_firmware_features selects RAW for
+        // software crypto only with RAW_MODE_SUPPORT. These are the packed
+        // resource_config{,_10x,_10_4}/TLV rx_decap_mode word offsets.
+        let index = match d {
+            Dialect::Main | Dialect::Tlv => 13,
+            Dialect::TenOne | Dialect::TenTwo | Dialect::TenTwoFour => 11,
+            Dialect::TenFour => 14,
+        };
+        values[index] = 0; // ATH10K_HW_TXRX_RAW
+    }
     Ok(Resources {
         words: values,
         vdevs,
@@ -545,6 +556,9 @@ pub(super) struct Runtime<T> {
     failed: bool,
 }
 impl<T: Hif + HostMemory> Runtime<T> {
+    pub fn raw_mode(&self) -> bool {
+        self.ready.is_some() && self.features & (1 << 10) != 0
+    }
     pub fn new(htc: Session<T>, dialect: Dialect, hardware: HwRev, features: u64) -> Self {
         Self {
             htc,

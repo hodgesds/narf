@@ -173,6 +173,11 @@ pub(super) struct RxBatch {
     pub tid: u8,
     pub frames: Vec<(u8, rx::Msdu)>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TxReceipt {
+    pub id: u16,
+    pub status: u8,
+}
 #[derive(Debug)]
 pub(super) struct Runtime<T> {
     pub wmi: wmi_boot::Runtime<T>,
@@ -180,6 +185,7 @@ pub(super) struct Runtime<T> {
     pub ready: Option<Ready>,
     pub early_htt: VecDeque<Vec<u8>>,
     pub wmi_events: VecDeque<Vec<u8>>,
+    tx_receipts: VecDeque<TxReceipt>,
     failed: bool,
 }
 impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
@@ -190,6 +196,7 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
             ready: None,
             early_htt: VecDeque::new(),
             wmi_events: VecDeque::new(),
+            tx_receipts: VecDeque::new(),
             failed: false,
         }
     }
@@ -334,9 +341,23 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         }
         self.failed = true;
         let (status, ids) = tx::completion(bytes)?;
+        if self.tx_receipts.len() + ids.len() > usize::from(self.config.pending) {
+            return Err(Error::Busy);
+        }
+        self.tx_receipts
+            .try_reserve(ids.len())
+            .map_err(|_| Error::NoMemory)?;
         self.wmi.htc.transport.complete_htt_tx(&ids, false)?;
+        self.tx_receipts
+            .extend(ids.into_iter().map(|id| TxReceipt { id, status }));
         self.failed = false;
         Ok(status)
+    }
+    pub fn take_tx_receipt(&mut self) -> Option<TxReceipt> {
+        self.tx_receipts.pop_front()
+    }
+    pub fn data_profile(&self) -> bool {
+        self.wmi.raw_mode() && !self.config.pfc
     }
     pub async fn start(&mut self) -> Result<Ready, Error> {
         if self.failed || self.ready.is_some() || self.wmi.ready.is_none() {
@@ -388,7 +409,10 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         self.wmi.htc.send_htt(&rx_config(dma)?).await?;
         // Linux defaults64 AMPDU/3 AMSDU. Station admission remains closed
         // until actual RX deaggregation and reorder ownership are implemented.
-        self.wmi.htc.send_htt(&[5, 64, 3]).await?;
+        // Linux disables A-MSDU in RAW mode: firmware RAW aggregation can
+        // produce malformed frames. The legacy station advertises no HT BA.
+        let amsdu = if self.wmi.raw_mode() { 1 } else { 3 };
+        self.wmi.htc.send_htt(&[5, 64, amsdu]).await?;
         self.config.major = version.major;
         self.ready = Some(version);
         self.failed = false;

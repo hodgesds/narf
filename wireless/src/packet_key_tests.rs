@@ -28,7 +28,7 @@ fn wire(key: &[u8; 16], h: &[u8], pn: u64, id: u8) -> Vec<u8> {
     )
     .unwrap()
 }
-fn smoke_rtl_ccmp_forgery_cannot_poison_key_tid() -> TestResult {
+fn smoke_station_ccmp_forgery_cannot_poison_key_tid() -> TestResult {
     let h = header(PEER, Some(7));
     let tk = [5; 16];
     let mut key = Key::new(&tk, 0, Role::Pairwise, LOCAL, PEER, 3).unwrap();
@@ -50,10 +50,10 @@ fn smoke_rtl_ccmp_forgery_cannot_poison_key_tid() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtl8xxxu/ccmp",
-    smoke_rtl_ccmp_forgery_cannot_poison_key_tid
+    "wireless/ccmp/key",
+    smoke_station_ccmp_forgery_cannot_poison_key_tid
 );
-fn smoke_rtl_ccmp_replay_is_per_key_and_tid() -> TestResult {
+fn smoke_station_ccmp_replay_is_per_key_and_tid() -> TestResult {
     let tk = [5; 16];
     let gtk = [6; 16];
     let mut pair = Key::new(&tk, 0, Role::Pairwise, LOCAL, PEER, 0).unwrap();
@@ -85,10 +85,10 @@ fn smoke_rtl_ccmp_replay_is_per_key_and_tid() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtl8xxxu/ccmp",
-    smoke_rtl_ccmp_replay_is_per_key_and_tid
+    "wireless/ccmp/key",
+    smoke_station_ccmp_replay_is_per_key_and_tid
 );
-fn smoke_rtl_ccmp_tx_pn_exhaustion_and_failed_admission() -> TestResult {
+fn smoke_station_ccmp_tx_pn_exhaustion_and_failed_admission() -> TestResult {
     let tk = [8; 16];
     let mut key = Key::new(&tk, 0, Role::Pairwise, LOCAL, PEER, 0).unwrap();
     let h = header(LOCAL, None);
@@ -109,7 +109,7 @@ fn smoke_rtl_ccmp_tx_pn_exhaustion_and_failed_admission() -> TestResult {
     {
         return TestResult::Fail("invalid header/length consumed PN or reached encryption");
     }
-    let first = fresh.protect(&h, &[1]).unwrap(); // Drop before USB submission.
+    let first = fresh.protect(&h, &[1]).unwrap(); // Drop before transport submission.
     let second = fresh.protect(&h, &[1]).unwrap();
     if first[..8] == second[..8] || fresh.tx_pn != 2 {
         return TestResult::Fail("failed/dropped TX can reuse PN");
@@ -117,10 +117,10 @@ fn smoke_rtl_ccmp_tx_pn_exhaustion_and_failed_admission() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtl8xxxu/ccmp",
-    smoke_rtl_ccmp_tx_pn_exhaustion_and_failed_admission
+    "wireless/ccmp/key",
+    smoke_station_ccmp_tx_pn_exhaustion_and_failed_admission
 );
-fn smoke_rtl_ccmp_reinstall_preserves_live_counters() -> TestResult {
+fn smoke_station_ccmp_reinstall_preserves_live_counters() -> TestResult {
     let tk = [9; 16];
     let mut key = Key::new(&tk, 0, Role::Pairwise, LOCAL, PEER, 0).unwrap();
     let outgoing = header(LOCAL, Some(3));
@@ -153,10 +153,10 @@ fn smoke_rtl_ccmp_reinstall_preserves_live_counters() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtl8xxxu/ccmp",
-    smoke_rtl_ccmp_reinstall_preserves_live_counters
+    "wireless/ccmp/key",
+    smoke_station_ccmp_reinstall_preserves_live_counters
 );
-fn smoke_rtl_ccmp_strict_header_and_key_admission() -> TestResult {
+fn smoke_station_ccmp_strict_header_and_key_admission() -> TestResult {
     let tk = [11; 16];
     let mut key = Key::new(&tk, 0, Role::Pairwise, LOCAL, PEER, 0).unwrap();
     let h = header(PEER, Some(2));
@@ -196,11 +196,11 @@ fn smoke_rtl_ccmp_strict_header_and_key_admission() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtl8xxxu/ccmp",
-    smoke_rtl_ccmp_strict_header_and_key_admission
+    "wireless/ccmp/key",
+    smoke_station_ccmp_strict_header_and_key_admission
 );
 
-fn smoke_rtl_ccmp_station_role_and_address_admission() -> TestResult {
+fn smoke_station_ccmp_station_role_and_address_admission() -> TestResult {
     let tk = [12; 16];
     for id in 1..=3 {
         if !matches!(
@@ -260,11 +260,11 @@ fn smoke_rtl_ccmp_station_role_and_address_admission() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtl8xxxu/ccmp",
-    smoke_rtl_ccmp_station_role_and_address_admission
+    "wireless/ccmp/key",
+    smoke_station_ccmp_station_role_and_address_admission
 );
 
-fn smoke_rtl_ccmp_seal_failure_is_a_typed_error() -> TestResult {
+fn smoke_station_ccmp_seal_failure_is_a_typed_error() -> TestResult {
     // The production Ccm adapter: a body over the CCM two-octet
     // length bound (65535) makes narf-crypto's seal refuse. That
     // refusal must reach callers as CcmpError::TooLong (wrapped as
@@ -296,6 +296,6 @@ fn smoke_rtl_ccmp_seal_failure_is_a_typed_error() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "drivers/wireless/rtl8xxxu/ccmp",
-    smoke_rtl_ccmp_seal_failure_is_a_typed_error
+    "wireless/ccmp/key",
+    smoke_station_ccmp_seal_failure_is_a_typed_error
 );

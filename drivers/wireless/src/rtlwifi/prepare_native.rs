@@ -85,8 +85,16 @@ pub(super) use super::prepare::retain_and_prepare as prepare_retained;
 pub(super) async fn initialize_registered(
     firmware: Arc<Owner<PciIo>>,
     retained: Arc<Retained>,
+    factory: Arc<super::efuse::Factory>,
 ) -> Result<(), Error> {
+    let profile = super::radio::Profile::from_factory(&factory).map_err(Error::Radio)?;
     firmware.initialize_registered().await?;
     let prepared = allocate(firmware, 128)?;
-    prepare_retained(&retained, prepared).await
+    prepare_retained(&retained, prepared).await?;
+    let mut storage = retained.lock().await;
+    storage
+        .as_mut()
+        .ok_or(Error::State)?
+        .configure_radio(profile)
+        .await
 }

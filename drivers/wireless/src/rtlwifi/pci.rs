@@ -44,6 +44,7 @@ pub struct RtlwifiDevice {
     /// One retained authenticated firmware attempt for the qualified 8188EE profile.
     pub(super) firmware: Option<Arc<FirmwareOwner<PciIo>>>,
     pub(super) prepared: Option<Arc<super::prepare_native::Retained>>,
+    pub(super) factory: Option<Arc<super::efuse::Factory>>,
     pub link_up: AtomicBool,
     pub rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -201,6 +202,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let did = dev.device_id;
     let firmware = dev.firmware.clone();
     let prepared = dev.prepared.clone();
+    let factory = dev.factory.clone();
     *CONTROLLER.lock() = Some(dev);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -212,12 +214,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
 
     *IFNAME.lock() = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
-    if let (Some(firmware), Some(prepared)) = (firmware, prepared) {
+    if let (Some(firmware), Some(prepared), Some(factory)) = (firmware, prepared, factory) {
         // The retained controller/interface own this attempt before its first
         // register access. No IRQ-disabling guard survives into the task.
         narf_scheduler::spawn(async move {
             if let Err(error) =
-                super::prepare_native::initialize_registered(firmware, prepared).await
+                super::prepare_native::initialize_registered(firmware, prepared, factory).await
             {
                 use core::fmt::Write as _;
                 let _ = writeln!(
@@ -244,7 +246,7 @@ pub unsafe fn bring_up(
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<RtlwifiDevice, ProbeError> {
     let did = device.id.device;
-    let (registers, mac) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
+    let (registers, factory) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
         let registers = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
             .map_err(|_| ProbeError::RegisterBarMapFailed)?;
         if registers.len < REG_EFUSE_ACCESS + 1
@@ -272,12 +274,14 @@ pub unsafe fn bring_up(
         };
         // SAFETY: BAR2 mapped and owned, with EFUSE read clocks configured by
         // the helper. PCI function selects the dual-MAC 8192DE factory address.
-        let mac =
-            unsafe { efuse::read_mac(&registers, did, function) }.map_err(ProbeError::Efuse)?;
+        let factory =
+            unsafe { efuse::read_factory(&registers, did, function) }.map_err(ProbeError::Efuse)?;
 
-        Ok((registers, mac))
+        Ok((registers, factory))
     })
     .map_err(|_| ProbeError::PciAccess)??;
+    let mac = factory.mac;
+    let factory = (did == RTL_DEV_8188EE).then(|| Arc::new(factory));
 
     let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
@@ -302,6 +306,7 @@ pub unsafe fn bring_up(
         device_id: device.id.device,
         firmware: firmware.clone(),
         prepared: prepared.clone(),
+        factory: factory.clone(),
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(Some(rx_cons)),
         tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -315,6 +320,7 @@ pub unsafe fn bring_up(
         device_id: device.id.device,
         firmware,
         prepared,
+        factory,
         link_up: AtomicBool::new(false),
         rx_ring: IrqSafeSpinLock::new(None),
         tx_ring: IrqSafeSpinLock::new(None),

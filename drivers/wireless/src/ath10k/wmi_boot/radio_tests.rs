@@ -23,6 +23,7 @@ struct RadioModel {
     sequence: u8,
     scan: u16,
     sent: Vec<Vec<u8>>,
+    native_management: Vec<Vec<u8>>,
     stall: Option<u8>,
     reason: u32,
     malformed: bool,
@@ -37,6 +38,7 @@ struct RadioModel {
     mlme: Option<mlme_tests::Fixture>,
     teardown: Option<teardown_tests::Fixture>,
     ce: Option<crate::ath10k::boot::CeFixture>,
+    data: Option<data_tests::Fixture>,
 }
 impl HostMemory for RadioModel {
     fn retain_wmi_memory(&mut self, p: &[MemoryPlan]) -> Result<Vec<MemoryChunk>, Error> {
@@ -175,6 +177,7 @@ fn management(model: &mut RadioModel, bad_ie: bool) {
 }
 impl Hif for RadioModel {
     async fn poll(&mut self, b: u64) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        data_tests::poll(self)?;
         if self.mismatch_rx && self.inner.inner.rx.is_empty() {
             // Literal TLV management RX containing an otherwise valid Open
             // Authentication response for a different local recipient.
@@ -209,6 +212,9 @@ impl Hif for RadioModel {
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
         if let Some(ce) = &mut self.ce {
             ce.send(pipe, bytes).await?;
+        }
+        if pipe == 4 && self.data.is_some() {
+            return data_tests::send(self, bytes).await;
         }
         if pipe == 4 && self.management.is_some() {
             return management_htt_send(self, bytes).await;
@@ -348,6 +354,17 @@ fn radio_boot_options(
     };
     let c = htt::Config::new(hardware, version, htt_version, 0).unwrap();
     let mut inner = HttModel::new(dialect, c, hardware);
+    let raw = features & (1 << 10) != 0;
+    inner.raw = raw;
+    if raw {
+        let at = match dialect {
+            Dialect::Main => 4 + 52,
+            Dialect::TenOne | Dialect::TenTwo | Dialect::TenTwoFour => 4 + 44,
+            Dialect::TenFour => 4 + 56,
+            Dialect::Tlv => 4 + 32 + 4 + 52,
+        };
+        inner.inner.expected[at..at + 4].fill(0);
+    }
     inner.version = major;
     let model = RadioModel {
         inner,
@@ -355,6 +372,7 @@ fn radio_boot_options(
         sequence: 1,
         scan: 0,
         sent: Vec::new(),
+        native_management: Vec::new(),
         stall: None,
         reason: 0,
         malformed: false,
@@ -369,10 +387,11 @@ fn radio_boot_options(
         mlme: None,
         teardown: None,
         ce: None,
+        data: None,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));
-    let mut wmi = Runtime::new(htc, dialect, hardware, 0);
+    let mut wmi = Runtime::new(htc, dialect, hardware, if raw { 1 << 10 } else { 0 });
     assert!(matches!(once(wmi.start()), Poll::Ready(Ok(_))));
     let mut htt = htt::Runtime::new(wmi, c);
     assert!(matches!(once(htt.start()), Poll::Ready(Ok(_))));
@@ -630,3 +649,6 @@ mod mlme_tests;
 
 #[path = "teardown_tests.rs"]
 mod teardown_tests;
+
+#[path = "data_tests.rs"]
+mod data_tests;

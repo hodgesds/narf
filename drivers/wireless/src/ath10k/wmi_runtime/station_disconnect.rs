@@ -27,6 +27,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // This happens before any await, including receive quiescence. A
         // cancelled waiter can never restore association or replay DELETE.
         self.failed = true;
+        if let Some(data) = &mut self.data {
+            data.fail();
+        }
         self.peer.as_mut().ok_or(Error::Failed)?.associated = None;
 
         // Drain events received before DELETE. In particular, a stale STOPPED

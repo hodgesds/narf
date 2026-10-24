@@ -18,11 +18,11 @@ matching a PCI ID or testing a command encoder does not establish a WLAN.
 | **ath11k** | WCN6855-family and native QCA6390 profiles | Live station/runtime profiles; hardware acceptance pending | QCA6390 uses native IPQ8074 RX descriptors and four-vdev resources; QCN9074 remains gated pending its HAL/DP path — `ath11k.md` |
 | **mt76** | MT7921/MT7922 CONNAC2 | Retained legacy 2.4/5 GHz station service on both architectures | Host-policy power/channel requests, UNI station/key commands, peer-bound RSNA, hardware CCMP replay checks, kernel/frame-ring service and verified reset/reload — `mt7921.md` |
 | **rtw88** | RTL8821CE/RTL8822BE/RTL8822CE | Real chip/cut power/EFUSE and RTL8822CE retained authenticated section firmware, beacon DMA and IDDMA | Complete MAC/RF, command dispatch, ordinary packet rings and station control remain software work — `rtw88.md` |
-| **rtw89** | RTL8852A/B/C, RTL8851B AX | Factory identity, fuse-selected immutable firmware plans, cold-power, scoped PCIe PHY/DBI, owned AX BDRAM/index setup and retained native TX/WCPU prerequisites | Full PCIe mode/calibration and power/BDRAM/CH12/WCPU startup composition, native RX/RPQ pump and station integration remain software work — `rtw89.md` |
-| **rtlwifi** | Legacy Realtek PCIe | Factory identity, RTL8188EE retained power/firmware and exact inactive LLT/linked-DMA preparation | Active DMA/IRQ, full MAC/BB/RF/calibration, station runtime and other silicon profiles remain software work — `rtlwifi.md` |
+| **rtw89** | RTL8852A/B/C, RTL8851B AX | Factory identity, authenticated firmware plans, cold-power primitives and retained DLFW DLE/HFC + PCIe pre-init/mode + BDRAM/CH12/WCPU prerequisites | Native preparation requires all retained receipts before ring configuration; PCI basic configuration, complete cold startup, packet/RF/IRQ and station service remain software work — `rtw89.md` |
+| **rtlwifi** | RTL8188EE PCIe | Factory identity, retained power/firmware, inactive LLT/linked-DMA and complete MAC/BB/AGC/RF + 1T IQK/LCK configuration | Channel/EFUSE power, active DMA/IRQ, station runtime and other silicon profiles remain software work — `rtlwifi.md` |
 | **rtl8xxxu** | RTL8188EU USB firmware profile | Signed-board-power-gated channel1 native station service, Open/WPA2-PSK CCMP with retained RSNA and persistent USB RX/TX | Actual board calibration artifacts/physical qualification, reset/rejoin, broader channels/rates and other silicon profiles remain — `rtl8xxxu.md` |
-| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Owned CE/BMI/HTC/WMI/HTT, correlated passive scanning and station association contexts | Native packet ownership, six-dialect WMI management, response-negotiated PEER_ASSOC/VDEV_UP and terminal peer/vdev teardown are implemented; PFC events, security/decapsulation, reset/rejoin, remaining MLME and station registration remain software work — `ath10k.md` |
-| **ath9k** | AR9285 | Retained EEPROM identity, inactive PHY/PLL/RF INI, modal, PDADC and CTL/rate-power programming | Live-capability access and independent Linux traces are checked; inactive rates use a zero-dBm ceiling, while analog calibration, DMA/IRQ and soft-MAC station runtime remain software work — `ath9k.md` |
+| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Owned CE/BMI/HTC/WMI/HTT, scan/join/terminal teardown and RAW/non-PFC legacy host-CCMP packet owner | All six dialects compose native receipts, RSNA and exact bidirectional Ethernet/IP; synchronous packet progress, kernel-DHCP/interface attachment and connection-loss service remain software work — `ath10k.md` |
+| **ath9k** | AR9285 | Retained EEPROM identity, inactive INI/modal/PDADC/CTL power and legacy20 mode/chain/synth/slope/spur preparation | Live-capability access and independent Linux traces are checked; inactive rates use a zero-dBm ceiling, while analog calibration, DMA/IRQ and soft-MAC station runtime remain software work — `ath9k.md` |
 | **brcmfmac** | Explicit BCM43602 PCIe board profiles | CR4/msgbuf transport and constrained native FullMAC station path | Common CYW station/security logic, correlated data/control and ACK-fenced flow reuse are implemented; actual board selection, broader silicon, recovery and PM remain software work — `brcmfmac.md` |
 | **cyw43439** | Infineon SDIO FullMAC | Standard PCI SDHCI/explicit card bootstrap through F2 station attachment | Owned PIO enumeration, trusted firmware/NVRAM/CLM, discovered cores/RAM, mailbox/FIFO control and station/data; board wiring, gSPI host, reset/reload/PM remain — `cyw43439.md` |
 
@@ -46,11 +46,13 @@ registers PCI IDs only; its packet ABI integration remains software work.
 - **WNM / RRM Hooks** — hardware-assisted network/radio resource management.
 - **Hardware Queues** — mapping 802.11 Access Categories (AC_VO, AC_VI, AC_BE, AC_BK) to device rings.
 
-**Target split:** MLME and the WPA supplicant belong in a userspace
-Wireless Daemon. The current iwlwifi MLD bring-up path implements the
-station state machine inside the driver behind `WirelessNetIface`.
-Moving it across the management-frame interface remains follow-up work;
-the present implementation must not be described as a userspace supplicant.
+**Station/security placement:** The in-kernel shared station/RSNA primitives
+and per-driver or FullMAC firmware station owners implement `WirelessNetIface`.
+Userspace configures connections through capability-gated nl80211; the
+canonical placement decision is in `wireless/specification/spec.md` §8.3.
+The shared retained native CCMP/RSNA owner can be reused by raw-capable
+SoftMAC transports, while each driver still owns descriptor admission,
+terminal delivery receipts, radio policy and DMA lifetime.
 
 **Does NOT own:**
 - IP/TCP stack — lives in stack daemons.

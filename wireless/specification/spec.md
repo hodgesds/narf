@@ -794,6 +794,36 @@ header bounds, key role/ID, native station addresses, nonce uniqueness and
 PN exhaustion, and retain independent replay trackers per key/TID (including
 a separate non-QoS tracker). These helpers do not grant controlled-port access.
 
+### 3.4.2 Retained native station security
+
+`packet_key::{Key, Role}` owns a software CCMP key's immutable peer/KeyID
+binding, non-wrapping 48-bit transmit PN and seventeen receive replay trackers
+(sixteen QoS TIDs plus non-QoS). Pairwise keys transmit only local ToDS data;
+group keys are receive-only. Full header, fragment, A-MSDU and CCMP extents
+are checked before crypto; identical-key reinstall preserves counters, and
+authentication failure changes neither replay state nor ciphertext.
+
+`station_security::{Security, RawFrame, Rx}` composes the shared WPA2-PSK
+supplicant with those keys. Drivers supply already-negotiated station/AP RSNEs
+and original descriptor-validated native MPDUs. `RawFrame::unmodified()` must
+reject hardware-decrypted/decapsulated packets and frames outside the adapter's
+admitted peer/channel/PHY profile before nonce or key state can advance. The
+security owner additionally checks native addresses, DS direction, fragments,
+EAPOL envelope and negotiated crypto. It grants no radio or carrier authority.
+
+`receive_with_nonce` lazily requests fallible secure SNonce material through
+the existing supplicant contract. `pending_frame` retains each exact M2/M4 or
+group-key response; the transport calls `reply_delivered(native_bytes)` only
+after a matching terminal delivery receipt. Submission and DMA consumption
+alone cannot commit keys or open the controlled port. Old-key rekey replies
+remain protected with the installed key until that receipt; identical key
+retries preserve PN/replay state. A bounded owner-lifetime history rejects
+retired temporal-key reuse. Exhaustion, entropy or protocol failures close
+admission, and key/nonce material is zeroized on drop. `transmit_ethernet`
+accepts local Ethernet data only while authorized and consumes its PN before
+transport publication. Each driver's stop/cancellation/DMA ownership remains
+that driver's responsibility.
+
 ### 3.5 EAPOL supplicant (`eapol.rs`)
 
 `Supplicant` runs the 4-way handshake (`handle`) and, once it completed,

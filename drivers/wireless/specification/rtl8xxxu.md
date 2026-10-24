@@ -128,7 +128,11 @@ teardown terminates the plan. Returned management frames still require a
 policy-admitted transmitter; `Associated` does not open the controlled port.
 
 `ccmp_runtime::Key` is the software CCMP dependency for the retained station
-runtime. `Role::Pairwise` admits KeyID0; `Role::Group` admits IDs0–3 but is
+runtime. `ccmp_runtime` and `security_runtime` retain their public paths as
+reexports of shared `narf_wireless::{packet_key, station_security}` owners.
+`packet_codec::Mpdu` supplies the shared raw-frame admission contract while
+preserving the exact RTL8188EU legacy/20-MHz, rate, and no-hardware-decryption
+checks. `Role::Pairwise` admits KeyID0; `Role::Group` admits IDs0–3 but is
 receive-only. TX requires ToDS, peer RA/local TA; RX requires FromDS, peer TA,
 a unicast source and local RA for PTK or multicast RA for GTK. Only Data/QoS
 Data with exact native header extents is admitted; fragments/A-MSDU fail.

@@ -1,0 +1,27 @@
+{
+  "sources": {
+    "ar5008_phy.c": "1042af18f89aec9df5b2c60abac02b5f4c35509266ea32bbdcc44fbb565e078e",
+    "ar9002_phy.c": "a4fe2b040163d5700607657d9c14d200d046b90ca20a39eeda1c0ba6838abe5b",
+    "hw.c": "8d06b4a22733dedd2d2a46247128f254b9345efae659de14189a8c2c0fd4731f",
+    "eeprom_4k.c": "c14f741663cf27677838d1a62219b1de1f864473606bc7160e66831ed2d70277",
+    "eeprom.h": "b6bc5f1bffd56f5b8828d14635eac4846487ff6f2ef06344d474ac4c1c11b7b0",
+    "ar9002_phy.h": "d2cceaa4340087d8bd961f9704d4361d9e22e737d038076294f1b172deb8f5fd",
+    "reg.h": "629a6df177d63b2a99202ab97a3641c488b5f1ac738f6f15612c7b4ebacebade",
+    "phy.h": "edab45a51cfa37c1226a90d59d1f7474a65758802518b0d00f6e34fd93ddddf2",
+    "hw.h": "95498a7e664cf66e99edcdfa9225a147ec4bb77b0458bfb726b5b0c26c1ebe85"
+  },
+  "functions": {
+    "ath9k_hw_get_delta_slope_vals": "30203332183bac105bfc91147d9db55e30cc937624ca40927f66d6454884988b",
+    "ath9k_hw_set11nmac2040": "fba783f292d73788acba3106a46f3c8f8278e399f758c174427f633819ba7781",
+    "ath9k_hw_4k_get_spur_channel": "941d6400dd9adf66a07d7d01d7f4c132aef0f7560b0dbbb6e144117158a59620",
+    "ar5008_hw_cmn_spur_mitigate": "0378c358d09d29f7cb8355fcab1e25eebbd422d85c621a17cba5aafbc40f0678",
+    "ar5008_hw_init_chain_masks": "d36b48040cb300df15e5171f43724cf6c5492420bd52a0f48c1aacdd87f39ccd",
+    "ar5008_hw_override_ini": "a8cb12f85cc94bf1c6ab7e930fd189c1294d0df6f915db0283b7797ca4f7ac1f",
+    "ar5008_hw_set_channel_regs": "9cf75596ca0004b19579a6f35ccf09275dfcef467f32e4b041924c6850c3f70f",
+    "ar5008_hw_set_rfmode": "b365a7031bb759d69dcdd4cf50d3098c351d7648d41ef983d5d58de7adfd1e4e",
+    "ar5008_hw_set_delta_slope": "58be00da8434910a2274b86f338b6ff80b80f99741ac4586c824f4fe264756ec",
+    "ar9002_hw_set_channel": "673548a0cdc905634d06839be272adec064692ebf41632a6a206cbfc836c6725",
+    "ar9002_hw_spur_mitigate": "798bbe5c2b24afdbb0201e5bc2138541f26d5a92a22b8047556cc40c56a52cb4"
+  },
+  "profile": "AR9285 one-chain 2GHz full-rate 20MHz, 3 channels x8 signed spur offsets x2 inherited seeds"
+}

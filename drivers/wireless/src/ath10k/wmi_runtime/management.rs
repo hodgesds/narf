@@ -229,6 +229,15 @@ impl<B: Memory> Pool<B> {
     pub fn pending(&self) -> usize {
         self.slots.iter().filter(|p| p.is_some()).count()
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub fn snapshot(&self, id: u32) -> Option<(u64, Vec<u8>)> {
+        let pending = self.slots.iter().flatten().find(|p| p.id == id)?;
+        let memory = &pending._payload;
+        Some((
+            memory.dma_address(),
+            (0..memory.len()).map(|at| memory.read(at)).collect(),
+        ))
+    }
     /// The mission owner retains a newly copied payload even if authority
     /// disappears during allocation/copy. Its address never escapes then.
     pub fn prepare_authorized(

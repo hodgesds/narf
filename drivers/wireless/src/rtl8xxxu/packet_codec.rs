@@ -29,6 +29,14 @@ pub struct Mpdu {
     pub decrypted: bool,
     pub timestamp: u32,
 }
+impl narf_wireless::station_security::RawFrame for Mpdu {
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    fn unmodified(&self) -> bool {
+        !self.decrypted && !self.ht && !self.bandwidth40 && self.rate <= 11
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
     Frame(Mpdu),

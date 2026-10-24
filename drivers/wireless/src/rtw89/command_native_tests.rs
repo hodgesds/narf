@@ -71,6 +71,9 @@ impl Fixture {
         let native = Native {
             io,
             bdram: super::super::bdram::Bdram::default(),
+            pcie: super::super::pcie::Pcie::default(),
+            fifo: super::super::fifo::Fifo::default(),
+            cut: 0,
             device: device(chip),
             authority,
             chip,
@@ -259,13 +262,13 @@ fn smoke_rtw89_native_bdram_requires_preparation_and_current_authority() -> Test
     fixture.native.authority.revoke();
     // SAFETY: no actual device exists; revocation must stop the exact native
     // entry before it can access the deliberately unmapped PCI configuration.
-    if ready(unsafe { fixture.native.prepare_bdram() }) != Some(Err(Error::Access))
+    if ready(unsafe { fixture.native.prepare_bdram(false) }) != Some(Err(Error::Access))
         || fixture.native.state != State::Terminal
         || fixture.native.bdram.state() != super::super::bdram::State::Preparing
         || fixture.words != before
         // SAFETY: the same exclusive inert model remains revoked and terminal;
         // this retry must reject before its unmapped PCI configuration access.
-        || ready(unsafe { fixture.native.prepare_bdram() }) != Some(Err(Error::Terminal))
+        || ready(unsafe { fixture.native.prepare_bdram(false) }) != Some(Err(Error::Terminal))
     {
         return TestResult::Fail("revoked native BDRAM entry accessed PCI/MMIO or reopened");
     }

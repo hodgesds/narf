@@ -5,8 +5,9 @@
 > runs OTP calibration and downloads the image. It retains runtime CE DMA
 > before BMI_DONE, negotiates HTC endpoints, handles firmware host-memory
 > requests and completes WMI INIT/READY. Retained HTT RX/TX and a passive
-> scan vdev follow. Station control/security, the live packet service and
-> interface registration remain; this is not usable Wi-Fi.
+> scan vdev follow. Retained legacy station association and an async
+> raw/software-CCMP packet owner follow. The synchronous packet service and
+> interface registration remain; this is not yet a NIC usable by DHCP.
 
 ## 1. Purpose & scope
 
@@ -145,6 +146,34 @@ packet service are not yet attached.
   Teardown sends no over-air deauthentication and makes no key, carrier, PM,
   DMA reclamation or rejoin claim. All six native WMI dialects are covered;
   only TLV advertises the extra synchronous delete service.
+- `pci::start_station_data(pmk)` starts the retained packet owner after native
+  association, with `None` for Open or the caller's WPA2 PMK. It requires
+  firmware `RAW_MODE_SUPPORT` (bit10), RAW RX selected during WMI INIT, and a
+  non-PFC HTT profile. All six WMI resource layouts use their actual decap
+  field; HTT disables A-MSDU for Linux's raw-mode workaround. Other images
+  retain native-WiFi RX and cannot enter this software-CCMP owner. Shared
+  `station_security::Security` owns the supplicant, fallible nonce acquisition,
+  software CCMP, per-key/TID replay, PN and retired-key history. M2/M4/group
+  replies use native raw HTT with NO_ENCRYPT and retain their DMA payload and
+  fragment owners after CE completion. Only the matching successful terminal
+  HTT ID commits the pending security change. No hardware key receipt is
+  fabricated. `StationLink { bssid, frequency, protected }` requires the live
+  peer and controlled port; it publishes no netdev.
+- `pci::transmit_ethernet(bytes)` submits one admitted Ethernet frame through
+  this owner and returns its actual HTT publication ID. ToDS/RFC1042 and
+  optional software CCMP preserve packet identity; externally supplied EAPOL
+  stays closed. `pci::poll_ethernet()` drives the same HTC/HTT owner and returns
+  Ethernet only after receive quiescence with a still-owned peer. Native v1
+  descriptors and indications must agree on sparse peer, TID, DS, sequence,
+  length, RAW decap and an unfragmented legacy standalone MPDU. CRC errors,
+  foreign identities, hardware-decrypted RX, PADDR offload/fragments and
+  aggregation are excluded. RAW FCS is stripped before CCMP verification;
+  only authenticated, replay-checked data reaches RFC1042 decapsulation.
+  Last-peer UNMAP, bound deauthentication, failed terminal TX, timeout,
+  malformed state and cancellation close the retained radio. Disconnect
+  closes security before awaiting firmware retirement. These APIs remain
+  async: split-submit/nonblocking physical CE progress is still required
+  before the synchronous network drain can run DHCP without another task.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have

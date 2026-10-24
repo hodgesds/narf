@@ -23,6 +23,9 @@ enum State {
 pub struct Native {
     io: NativeIo,
     bdram: super::bdram::Bdram,
+    pcie: super::pcie::Pcie,
+    fifo: super::fifo::Fifo,
+    cut: u8,
     device: BusDevice,
     authority: Cap<BusDeviceCap, Write>,
     chip: ChipId,
@@ -95,6 +98,9 @@ impl Native {
         Ok(Self {
             io,
             bdram: super::bdram::Bdram::default(),
+            pcie: super::pcie::Pcie::default(),
+            fifo: super::fifo::Fifo::default(),
+            cut,
             device,
             authority,
             chip,
@@ -118,10 +124,16 @@ impl Native {
     ///
     /// # Safety
     /// Same independently fenced, powered, exclusive device contract as new.
-    /// PCIe power/PHY quirks and mode configuration must already be complete;
-    /// this bounded subset does not establish full PCIe or DMA readiness.
-    pub async unsafe fn prepare_bdram(&mut self) -> Result<(), Error> {
-        if self.state != State::Unpublished || self.bdram.state() != super::bdram::State::New {
+    /// PCI basic_cfg and qualified platform quirks must already be known;
+    /// `ber` carries the exact platform PCI_BER quirk. This composes DLFW
+    /// DLE/HFC, AX PCIe pre-init and stopped BDRAM/mode preparation, but does
+    /// not establish full PCIe basic configuration or DMA readiness.
+    pub async unsafe fn prepare_bdram(&mut self, ber: bool) -> Result<(), Error> {
+        if self.state != State::Unpublished
+            || self.bdram.state() != super::bdram::State::New
+            || self.pcie.state() != super::pcie::State::New
+            || self.fifo.state() != super::fifo::State::New
+        {
             return Err(Error::Terminal);
         }
         match self.command() {
@@ -136,14 +148,36 @@ impl Native {
         }
         // SAFETY: caller's retained reset/serialization contract and the live
         // PCI command check above. NativeIo invokes authority for every MMIO.
-        let result = unsafe { self.bdram.prepare(&mut self.io, self.chip).await }.map_err(
-            |error| match error {
-                super::power::Error::Timeout => Error::Timeout,
-                super::power::Error::Unsupported => Error::Unsupported,
-                super::power::Error::Terminal => Error::Terminal,
-                _ => Error::Access,
-            },
-        );
+        let result = async {
+            // SAFETY: retained fenced, powered, BME-off exclusive device.
+            unsafe {
+                self.fifo.prepare(&mut self.io, self.chip).await?;
+            }
+            let mut access = super::pcie_native::Native {
+                io: &mut self.io,
+                device: &self.device,
+                authority: &self.authority,
+            };
+            // SAFETY: same exclusive device, current authority per transaction.
+            unsafe {
+                self.pcie
+                    .prepare(&mut access, self.chip, self.cut, ber)
+                    .await?;
+            }
+            // SAFETY: no ring or BME publication; exact mode follows idle/zero.
+            unsafe {
+                self.bdram
+                    .prepare_with_mode(&mut self.io, self.chip, self.cut)
+                    .await
+            }
+        }
+        .await
+        .map_err(|error| match error {
+            super::power::Error::Timeout => Error::Timeout,
+            super::power::Error::Unsupported => Error::Unsupported,
+            super::power::Error::Terminal => Error::Terminal,
+            _ => Error::Access,
+        });
         if result.is_err() {
             self.state = State::Terminal;
         }
@@ -154,7 +188,11 @@ impl Native {
     /// indices were prepared by this owner's prepare_bdram, with CH12 DMA
     /// disabled and the rest of the PCIe setup still retained.
     pub unsafe fn configure(&mut self) -> Result<(), Error> {
-        if self.state != State::Unpublished || self.bdram.state() != super::bdram::State::Ready {
+        if self.state != State::Unpublished
+            || self.bdram.state() != super::bdram::State::Ready
+            || self.pcie.state() != super::pcie::State::Ready
+            || self.fifo.state() != super::fifo::State::Ready
+        {
             return Err(Error::Terminal);
         }
         self.state = State::Configuring;

@@ -384,6 +384,45 @@ pub async fn disconnect_station(
     result
 }
 
+/// Start retained Open/software-CCMP data after checked native association.
+/// This grants no netdev; the caller must keep polling the retained owner.
+pub async fn start_station_data(
+    pmk: Option<&[u8; 32]>,
+) -> Result<super::wmi_runtime::StationLink, super::wmi_runtime::Error> {
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    owner.radio.start_station_data(&domain, pmk).await
+}
+
+/// Submit Ethernet through the same retained RAW-mode data owner. The ID is
+/// an HTT publication identity, never a fabricated firmware delivery receipt.
+pub async fn transmit_ethernet(bytes: &[u8]) -> Result<u16, super::wmi_runtime::Error> {
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    owner.radio.transmit_ethernet(&domain, bytes).await
+}
+
+/// Drive actual peer/completion/RAW RX and return admitted Ethernet only after
+/// receive quiescence. This API is async; it is not a synchronous netdev hook.
+pub async fn poll_ethernet(
+) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, super::wmi_runtime::Error> {
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    owner.radio.poll_ethernet(&domain).await
+}
+
 /// Human-readable driver name keyed on the matched `(vendor, device)`.
 /// Used as `PciMatch.name` + `BoundDriver.name`. Must be a `'static`
 /// string — the bus registry stores it by reference.

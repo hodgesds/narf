@@ -16,10 +16,12 @@ pub mod iface;
 pub mod mfp;
 pub mod mlme;
 pub mod nl80211;
+pub mod packet_key;
 pub mod reg;
 pub mod rsn;
 pub mod sae;
 pub mod scan;
+pub mod station_security;
 
 pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
 pub use scan::{BssInfo, ScanRandomMac, ScanRequest, ScanResult};

@@ -67,6 +67,37 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
     if phase >= 4 || bytes[8..] != *expected(phase, dialect, protected, fixture.downgrade) {
         return Err(BmiError::BadResponse);
     }
+    if phase < 2 {
+        let command = &bytes[8..];
+        let word = |at: usize| u32::from_le_bytes(command[at..at + 4].try_into().unwrap());
+        let frame = if dialect == Dialect::Tlv {
+            // Linux's referenced command contains at most64 prefetch bytes.
+            // The full72-byte WPA2 association lives in retained DMA, not
+            // after that prefix. Consume it before its real WMI completion.
+            let length = word(28) as usize;
+            let (address, payload) = m
+                .management_memory
+                .as_ref()
+                .ok_or(BmiError::BadResponse)?
+                .snapshot(word(12))
+                .ok_or(BmiError::BadResponse)?;
+            let prefix = length.min(64).next_multiple_of(4);
+            if address != u64::from(word(20)) | (u64::from(word(24)) << 32)
+                || word(32) as usize != prefix
+                || command.len() != 40 + prefix
+                || command.get(40..40 + length.min(64)) != payload.get(..length.min(64))
+            {
+                return Err(BmiError::BadResponse);
+            }
+            payload.get(..length).ok_or(BmiError::BadResponse)?.to_vec()
+        } else {
+            command
+                .get(28..28 + word(24) as usize)
+                .ok_or(BmiError::BadResponse)?
+                .to_vec()
+        };
+        m.native_management.push(frame);
+    }
     m.sent.push(bytes.to_vec());
     m.mlme.as_mut().unwrap().phase += 1;
     if m.mlme.as_ref().unwrap().fail == Some(phase) {
@@ -178,7 +209,17 @@ pub(super) fn prepared(
     dialect: Dialect,
     protected: bool,
 ) -> radio::Radio<RadioModel> {
-    let features = (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 };
+    prepared_profile(version, dialect, protected, false)
+}
+pub(super) fn prepared_profile(
+    version: u32,
+    dialect: Dialect,
+    protected: bool,
+    raw: bool,
+) -> radio::Radio<RadioModel> {
+    let features = (1 << 2)
+        | if dialect == Dialect::Tlv { 1 << 18 } else { 0 }
+        | if raw { 1 << 10 } else { 0 };
     let mut r = radio_boot_features(version, dialect, features);
     r.htt.wmi.htc.transport.mlme_beacon = Some(protected);
     assert!(matches!(drive(r.start(&[2412, 5180])), Poll::Ready(Ok(_))));

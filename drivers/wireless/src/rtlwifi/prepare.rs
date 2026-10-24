@@ -12,6 +12,7 @@ pub enum Error {
     State,
     LltTimeout,
     Readback,
+    Radio(super::radio::Error),
 }
 impl From<AccessError> for Error {
     fn from(error: AccessError) -> Self {
@@ -22,6 +23,7 @@ impl From<AccessError> for Error {
 pub enum Phase {
     Allocated,
     Prepared,
+    RadioConfigured,
     Failed,
 }
 /// # Safety
@@ -78,6 +80,7 @@ pub struct Prepared<I: Io, M: Memory> {
     depth: usize,
     phase: Phase,
     published: bool,
+    radio: Option<super::radio::Report>,
 }
 impl<I: Io, M: Memory> core::fmt::Debug for Prepared<I, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -157,10 +160,30 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             depth,
             phase: Phase::Allocated,
             published: false,
+            radio: None,
         })
     }
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+    pub fn radio_report(&self) -> Option<&super::radio::Report> {
+        self.radio.as_ref()
+    }
+
+    /// Continue the same retained PacketIo/ring owner through exact EE radio
+    /// tables and calibration. Cancellation is terminal before the first wait;
+    /// published DMA remains owned even when no report can be committed.
+    pub async fn configure_radio(&mut self, profile: super::radio::Profile) -> Result<(), Error> {
+        if self.phase != Phase::Prepared {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let report = super::radio::configure(&self.io, profile)
+            .await
+            .map_err(Error::Radio)?;
+        self.radio = Some(report);
+        self.phase = Phase::RadioConfigured;
+        Ok(())
     }
     /// Prepare internal SRAM and masked, inactive native rings. The native
     /// Io validates current PCI authority/BME at each actual access. No helper
