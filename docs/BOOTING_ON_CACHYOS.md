@@ -395,6 +395,45 @@ ELF header, batches metadata into one sequential write, and emits a
 capture; it does not fix or identify the underlying greeter fault. Preserve
 the core's timestamp and collect the new record before planning another fix.
 
+The next capture, `plasma-3d4989b5-b779-479e-b312-fe4a7b24ccbb`, fails earlier:
+the journal records eight `SIGBUS` page faults in `timeout` and
+`systemd-executor`. Their instruction bytes match the installed dynamic
+loader at offset `0x1d778`, reading the first bytes of `/etc/ld.so.cache`.
+The mapping is readable/private, starts at `0x409000002000`, and covers
+`0x2e000` bytes; the loader's file-size operand is 187,287 bytes. `/core`
+now retains its notes and identifies another `systemd-executor` instance
+at that same loader offset. D-Bus startup times out; no Plasma start was
+saved for this boot. This is a file-backed demand-page refusal, not an
+unsupported instruction. The capture does not retain the backing filesystem
+error or inode, so its precise cause must not be inferred from SIGBUS alone.
+
+Two local checks expose relevant replacement defects. First, the VFS dentry
+table has 2,048 buckets but the old mutation guard records only 64 bits:
+high-bucket shifts panic in checked builds and miss the correct active-writer
+counter/generation in release builds. A lookup started before replacement
+can therefore publish a stale inode afterwards. Mutation tracking must span
+the full table. Second, the Btrfs retained-handle experiment reads a fresh
+replacement successfully but gets `NotFound` reading the replaced file
+through an existing handle, both before and after `syncfs`. Last-link
+replacement currently reclaims the old inode immediately. Linux retains an
+unlinked inode and its data until its final open/mapping reference is gone.
+Correcting the dentry mask does not implement that missing Btrfs lifetime.
+The subsequent upstream Btrfs cache-generation change invalidates retained
+generic shared-cache pages; it does not preserve an unlinked inode. The
+failing loader mapping is private and enters the private demand-read branch,
+so that upstream change alone does not establish a fix for this refusal.
+
+The production Limine VM smoke validates built-in login/shell startup. It
+does not boot this installed KDE root or race `ldconfig` against process
+startup. The recent full CachyOS fixture attempts instead stop at a PID 1
+invalid-opcode fault because its loader uses AVX-512 absent from the TCG CPU.
+Neither result establishes working cache replacement. A representative gate
+must cover open/map/close, replacement before first touch, old and new
+contents through their respective handles, concurrent lookup publication,
+and a real dynamic executable after cache rebuild on writable Btrfs.
+The root smoke's `ldconfig | head | sed` command is a diagnostic report:
+it does not assert `ldconfig`'s exit status or concurrent loader correctness.
+
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 
 ```sh
