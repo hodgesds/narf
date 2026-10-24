@@ -183,6 +183,15 @@ also consult upstream Linux GPL sources.
   terminal completions and copy-out. Error/cancellation keeps EP0 busy; a new
   software firmware owner cannot reuse an ambiguous TD's buffer. Disable Slot
   invalidates handles before command publication and retains all mappings.
+- USB Ethernet class drivers (`r8152`, `cdc_ncm`) publish each bound device
+  through `narf_net::iface::register_with_context` as `usb-rtl{N}` /
+  `usb-ncm{N}`, where `N` is the driver's device-record index and the
+  registration cookie is that same index. The send hook resolves the cookie
+  to the bound device's own record (slot + bulk-OUT DCI) — there is no
+  shared or default-device TX path. The published station address is read
+  from the device at bind (never synthesised); a device that reports no
+  valid address fails the bind. Link state is republished through
+  `iface::set_link_metadata` as the driver samples it.
 - Address Device reserves a slot before DMA setup, retains Input/Device
   Contexts plus EP0 ring/page before DCBAA publication, and adopts them only
   after the exact command TRB succeeds. Address, Configure, Evaluate, Disable

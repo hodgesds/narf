@@ -492,6 +492,10 @@ pub enum NcmError {
     NotNcm,
     /// SET_CONFIGURATION control transfer failed during bind.
     SetConfigFailed,
+    /// Neither GET_NET_ADDRESS nor the iMACAddress string
+    /// descriptor yielded a valid station address during bind.
+    /// The bind fails rather than inventing an address.
+    NoMacAddress,
 }
 
 // ── NTB encoder ──────────────────────────────────────────────────
@@ -604,12 +608,86 @@ impl<'a> ParsedNtb<'a> {
     pub fn is_empty(&self) -> bool {
         self.ndp.entries.is_empty()
     }
+
+    /// True when the NDP signature marks CRC mode (`NCM1`): each
+    /// datagram in this NTB carries a trailing CRC-32.
+    pub fn uses_crc(&self) -> bool {
+        self.ndp.signature == NDP16_SIGNATURE_CRC
+    }
+}
+
+// ── CRC mode support (NCM 1.0 §3.2) ──────────────────────────────
+//
+// When CRC mode is negotiated on, the sender appends a CRC-32
+// (IEEE 802.3, reflected polynomial 0xEDB88320 — the Ethernet FCS
+// polynomial) to each datagram, and the datagram lengths in the
+// NDP include those 4 bytes. The receiver verifies and strips
+// them; a datagram whose CRC fails is dropped, never delivered.
+
+/// IEEE 802.3 CRC-32 of `data` (init/xorout 0xFFFFFFFF).
+pub fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// `frame` with its CRC-32 appended (little-endian) — the wire
+/// form of a datagram under CRC mode.
+pub fn append_crc(frame: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(frame.len() + 4);
+    out.extend_from_slice(frame);
+    out.extend_from_slice(&crc32_ieee(frame).to_le_bytes());
+    out
+}
+
+/// Walk every frame in a received NTB, invoking `f` on each.
+/// Entries are located through the NDP pointer table, so padding
+/// between datagrams is skipped. Under CRC mode the trailing
+/// CRC-32 is verified and stripped first; CRC-failing datagrams
+/// are dropped. Returns `(delivered, dropped)`.
+pub fn for_each_frame(ntb: &[u8], f: &mut dyn FnMut(&[u8])) -> Result<(usize, usize), NcmError> {
+    let parsed = ParsedNtb::parse(ntb)?;
+    let crc = parsed.uses_crc();
+    let mut delivered = 0usize;
+    let mut dropped = 0usize;
+    for i in 0..parsed.len() {
+        let Some(dg) = parsed.datagram(i) else {
+            continue;
+        };
+        if crc {
+            if dg.len() < 4 {
+                dropped += 1;
+                continue;
+            }
+            let (frame, tail) = dg.split_at(dg.len() - 4);
+            let want = u32::from_le_bytes(tail.try_into().unwrap());
+            if crc32_ieee(frame) != want {
+                dropped += 1;
+                continue;
+            }
+            f(frame);
+        } else {
+            f(dg);
+        }
+        delivered += 1;
+    }
+    Ok((delivered, dropped))
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
     use crate::cdc::CS_INTERFACE;
+    use alloc::vec::Vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_ncm_descriptor() -> TestResult {
@@ -826,18 +904,262 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/cdc_ncm", smoke_set_packet_filter_encode);
+
+    fn smoke_crc32_ieee_check_vector() -> TestResult {
+        // The standard CRC-32 check value: CRC32("123456789").
+        if crc32_ieee(b"123456789") != 0xCBF4_3926 {
+            return TestResult::Fail("CRC-32 check vector mismatch");
+        }
+        if crc32_ieee(b"") != 0 {
+            return TestResult::Fail("CRC-32 of empty input must be 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_crc32_ieee_check_vector);
+
+    fn smoke_ntb_crc_round_trip_and_drop() -> TestResult {
+        // TX shape under CRC mode: each datagram carries its
+        // appended CRC; the RX walker verifies + strips.
+        let f1: &[u8] = b"crc-frame-one-0123456789";
+        let f2: &[u8] = b"second-frame";
+        let d1 = append_crc(f1);
+        let d2 = append_crc(f2);
+        let ntb = match build_ntb16(5, &[&d1, &d2], true) {
+            Ok(n) => n,
+            Err(_) => return TestResult::Fail("CRC NTB build rejected"),
+        };
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let r = for_each_frame(&ntb, &mut |f| got.push(f.to_vec()));
+        match r {
+            Ok((2, 0)) => {}
+            _ => return TestResult::Fail("CRC NTB walk counts wrong"),
+        }
+        if got.len() != 2 || got[0] != f1 || got[1] != f2 {
+            return TestResult::Fail("CRC-stripped frames mismatch");
+        }
+        // Corrupt the first datagram's CRC tail: that datagram
+        // must be dropped, the other still delivered.
+        let mut bad = ntb.clone();
+        let crc_off = Nth16::LEN + f1.len();
+        bad[crc_off] ^= 0xFF;
+        let mut got2: Vec<Vec<u8>> = Vec::new();
+        let r2 = for_each_frame(&bad, &mut |f| got2.push(f.to_vec()));
+        match r2 {
+            Ok((1, 1)) => {}
+            _ => return TestResult::Fail("corrupt-CRC walk counts wrong"),
+        }
+        if got2.len() != 1 || got2[0] != f2 {
+            return TestResult::Fail("wrong datagram survived CRC failure");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ntb_crc_round_trip_and_drop);
+
+    fn smoke_ntb_padded_reassembly() -> TestResult {
+        // Hand-built NTB with 2 padding bytes between datagrams:
+        // the walker must follow the NDP offsets, not assume
+        // datagrams are tightly packed.
+        let a: [u8; 20] = [0xAA; 20];
+        let b: [u8; 30] = [0xBB; 30];
+        let ndp_index = 12 + 20 + 2 + 30; // 64
+        let total = ndp_index + 20; // NDP16: 8 + 3 entries * 4
+        let mut ntb = alloc::vec![0u8; total];
+        ntb[0..4].copy_from_slice(&NTH16_SIGNATURE.to_le_bytes());
+        ntb[4..6].copy_from_slice(&12u16.to_le_bytes());
+        ntb[6..8].copy_from_slice(&9u16.to_le_bytes()); // sequence
+        ntb[8..10].copy_from_slice(&(total as u16).to_le_bytes());
+        ntb[10..12].copy_from_slice(&(ndp_index as u16).to_le_bytes());
+        ntb[12..32].copy_from_slice(&a);
+        // bytes 32..34 are the padding (left zeroed)
+        ntb[34..64].copy_from_slice(&b);
+        let n = ndp_index;
+        ntb[n..n + 4].copy_from_slice(&NDP16_SIGNATURE_NO_CRC.to_le_bytes());
+        ntb[n + 4..n + 6].copy_from_slice(&20u16.to_le_bytes());
+        ntb[n + 6..n + 8].copy_from_slice(&0u16.to_le_bytes());
+        ntb[n + 8..n + 10].copy_from_slice(&12u16.to_le_bytes());
+        ntb[n + 10..n + 12].copy_from_slice(&20u16.to_le_bytes());
+        ntb[n + 12..n + 14].copy_from_slice(&34u16.to_le_bytes());
+        ntb[n + 14..n + 16].copy_from_slice(&30u16.to_le_bytes());
+        // n+16..n+20: {0,0} sentinel (zeroed)
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let r = for_each_frame(&ntb, &mut |f| got.push(f.to_vec()));
+        match r {
+            Ok((2, 0)) => {}
+            _ => return TestResult::Fail("padded NTB walk counts wrong"),
+        }
+        if got.len() != 2 || got[0] != a || got[1] != b {
+            return TestResult::Fail("padded NTB frames mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ntb_padded_reassembly);
+
+    fn smoke_mac_string_descriptor_parse() -> TestResult {
+        // Build a string descriptor for "001A2B3C4D5E" (UTF-16LE).
+        let text = b"001A2B3C4D5E";
+        let mut desc = alloc::vec![0u8; 2 + text.len() * 2];
+        desc[0] = desc.len() as u8;
+        desc[1] = 0x03;
+        for (i, &ch) in text.iter().enumerate() {
+            desc[2 + i * 2] = ch;
+            desc[3 + i * 2] = 0;
+        }
+        if parse_mac_string_descriptor(&desc) != Some([0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E]) {
+            return TestResult::Fail("iMACAddress string not decoded");
+        }
+        // Non-hex character → reject.
+        let mut bad = desc.clone();
+        bad[2] = b'Z';
+        if parse_mac_string_descriptor(&bad).is_some() {
+            return TestResult::Fail("non-hex MAC string accepted");
+        }
+        // All-zero address in string form → reject (unprogrammed).
+        let mut zero = alloc::vec![0u8; 26];
+        zero[0] = 26;
+        zero[1] = 0x03;
+        for i in 0..12 {
+            zero[2 + i * 2] = b'0';
+        }
+        if parse_mac_string_descriptor(&zero).is_some() {
+            return TestResult::Fail("all-zero MAC string accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_mac_string_descriptor_parse);
+
+    /// Modelled NCM configuration blob shared by the finder
+    /// fixtures: Comm iface 0 (NCM), data iface 1 alt 0 (no
+    /// endpoints) + alt 1 (bulk pair).
+    fn modelled_ncm_cfg() -> Vec<u8> {
+        #[rustfmt::skip]
+        let cfg: &[u8] = &[
+            9, 2, 0, 0, 2, 1, 0, 0x80, 0x32, // config (len patched below)
+            // Comm interface 0, subclass NCM, 1 endpoint
+            9, 4, 0, 0, 1, 0x02, 0x0D, 0, 0,
+            // NCM functional descriptor, caps 0x13
+            6, 0x24, 0x1A, 0x00, 0x01, 0x13,
+            // Ethernet Networking descriptor, iMACAddress = 5
+            13, 0x24, 0x0F, 5, 0, 0, 0, 0, 0xEA, 0x05, 0, 0, 0,
+            // interrupt endpoint of the Comm interface
+            7, 5, 0x83, 3, 16, 0, 8,
+            // Data interface 1, alt 0, no endpoints
+            9, 4, 1, 0, 0, 0x0A, 0, 0, 0,
+            // Data interface 1, alt 1, bulk pair
+            9, 4, 1, 1, 2, 0x0A, 0, 0, 0,
+            7, 5, 0x81, 2, 64, 0, 0,
+            7, 5, 0x02, 2, 64, 0, 0,
+        ];
+        let mut v = cfg.to_vec();
+        let total = v.len() as u16;
+        v[2..4].copy_from_slice(&total.to_le_bytes());
+        v
+    }
+
+    fn smoke_ncm_functional_descriptor_finder() -> TestResult {
+        let cfg = modelled_ncm_cfg();
+        let (ncm, eth) = find_ncm_functional_descriptors(&cfg, 0);
+        let ncm = match ncm {
+            Some(d) => d,
+            None => return TestResult::Fail("NCM functional descriptor not found"),
+        };
+        if !ncm.capabilities.packet_filter
+            || !ncm.capabilities.net_address
+            || !ncm.capabilities.crc_mode
+        {
+            return TestResult::Fail("modelled capabilities decoded wrong");
+        }
+        let eth = match eth {
+            Some(d) => d,
+            None => return TestResult::Fail("Ethernet descriptor not found"),
+        };
+        if eth.mac_string_index != 5 {
+            return TestResult::Fail("modelled iMACAddress index wrong");
+        }
+        // Wrong comm interface → nothing found.
+        let (n2, e2) = find_ncm_functional_descriptors(&cfg, 9);
+        if n2.is_some() || e2.is_some() {
+            return TestResult::Fail("descriptors found under wrong interface");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/cdc_ncm",
+        smoke_ncm_functional_descriptor_finder
+    );
+
+    fn smoke_ncm_data_alt_setting_finder() -> TestResult {
+        let cfg = modelled_ncm_cfg();
+        // The endpoint-bearing instance is alt 1 of interface 1.
+        if find_ncm_data_alt_setting(&cfg) != Some((1, 1)) {
+            return TestResult::Fail("data alt setting not resolved to alt 1");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_data_alt_setting_finder);
+
+    fn smoke_ncm_tx_routing_two_devices() -> TestResult {
+        // The device-0 routing bug, pinned as fixed: with TWO
+        // modelled devices registered, TX state resolution for
+        // device 1 must return device 1's slot/endpoint, and its
+        // sequence counter must advance independently of device
+        // 0's.
+        __reset_ncm_for_test();
+        let mk = |slot_id: u8, out_dci: u8| CdcNcmDevice {
+            slot_id,
+            comm_iface: 0,
+            data_iface: 1,
+            bulk_in_dci: 3,
+            bulk_out_dci: out_dci,
+            tx_sequence: 0,
+            mac: [0x02, 0, 0, 0, 0, slot_id],
+            ntb_in_max_size: 4096,
+            ntb_out_max_size: 16384,
+            crc_enabled: false,
+            iface_name: alloc::format!("usb-ncm-model-{}", slot_id),
+            pump_running: false,
+        };
+        {
+            let mut g = CDC_NCM_DEVICES.lock();
+            g.push(mk(7, 4));
+            g.push(mk(9, 6));
+        }
+        let t0 = tx_target(0);
+        let t1 = tx_target(1);
+        let s1a = take_tx_state(1);
+        let s1b = take_tx_state(1);
+        let s0 = take_tx_state(0);
+        __reset_ncm_for_test();
+        if t0 != Some((7, 4)) || t1 != Some((9, 6)) {
+            return TestResult::Fail("tx_target mis-routed between devices");
+        }
+        match (s1a, s1b, s0) {
+            (
+                Some((9, 6, 0, false, 4096)),
+                Some((9, 6, 1, false, 4096)),
+                Some((7, 4, 0, false, 4096)),
+            ) => {}
+            _ => return TestResult::Fail("per-device TX state wrong or shared"),
+        }
+        if tx_target(0).is_some() {
+            return TestResult::Fail("tx_target resolved after reset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_tx_routing_two_devices);
 }
 
 // ── Class enumeration + bind ───────────────────────────────────────
 //
-// Minimal "is this an NCM device, and if so claim it" path. The
-// full TX/RX surface (NCM Set-Net-Address class request + per-
-// endpoint NTB pipelines) is a follow-up.
+// Full bind path: SET_CONFIGURATION (+ SET_INTERFACE to the
+// endpoint-bearing data alt setting), endpoint configuration,
+// NTB parameter negotiation, station-address acquisition from the
+// device, netdev publication with per-device TX routing, and a
+// supervised RX pump.
 
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// One bound CDC-NCM device — slot id + Comm interface number.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct CdcNcmDevice {
     pub slot_id: u8,
     /// `bInterfaceNumber` of the CDC-Comm/NCM interface.
@@ -852,6 +1174,23 @@ pub struct CdcNcmDevice {
     pub bulk_out_dci: u8,
     /// Sequence counter for outbound NTBs. Increments per send.
     pub tx_sequence: u16,
+    /// Station address read from the device at bind
+    /// (GET_NET_ADDRESS, or the iMACAddress string descriptor).
+    pub mac: [u8; 6],
+    /// Negotiated host→device NTB size cap (`dwNtbInMaxSize`);
+    /// 0 = the device never answered GET_NTB_PARAMETERS.
+    pub ntb_in_max_size: u32,
+    /// Negotiated device→host NTB size (`dwNtbOutMaxSize`);
+    /// sizes the RX pump's buffer.
+    pub ntb_out_max_size: u32,
+    /// CRC mode negotiated on (SET_CRC_MODE accepted): TX
+    /// datagrams carry an appended CRC-32 and RX datagrams are
+    /// CRC-verified and stripped.
+    pub crc_enabled: bool,
+    /// Assigned `narf_net::iface` name (`usb-ncm{N}`).
+    pub iface_name: alloc::string::String,
+    /// RX pump liveness flag (pump clears it on exit).
+    pub pump_running: bool,
 }
 
 /// System-wide registry of bound CDC-NCM devices.
@@ -877,8 +1216,229 @@ pub fn find_ncm_comm_interface(cfg: &[u8]) -> Option<u8> {
     None
 }
 
-/// Bind to an already-addressed CDC-NCM device. SET_CONFIGURATION,
-/// then record the slot/interface pair.
+/// Locate the NCM + Ethernet Networking functional descriptors
+/// in the descriptor set that follows the Comm interface
+/// `comm_iface` within `cfg`.
+pub fn find_ncm_functional_descriptors(
+    cfg: &[u8],
+    comm_iface: u8,
+) -> (Option<NcmDescriptor>, Option<EthernetNetworkingDescriptor>) {
+    let mut in_comm = false;
+    let mut ncm = None;
+    let mut eth = None;
+    let mut i = 0usize;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        let desc_type = cfg[i + 1];
+        if desc_type == 0x04 && len >= 9 {
+            // INTERFACE descriptor — byte 2 is bInterfaceNumber.
+            in_comm = cfg[i + 2] == comm_iface;
+        } else if desc_type == 0x24 && in_comm {
+            // CS_INTERFACE functional descriptor.
+            match cfg[i + 2] {
+                0x1A if ncm.is_none() => {
+                    ncm = NcmDescriptor::parse(&cfg[i..i + len]).ok();
+                }
+                0x0F if eth.is_none() => {
+                    eth = EthernetNetworkingDescriptor::parse(&cfg[i..i + len]).ok();
+                }
+                _ => {}
+            }
+        }
+        i += len;
+    }
+    (ncm, eth)
+}
+
+/// Find the CDC-Data interface instance that owns bulk endpoints
+/// and report `(interface_number, bAlternateSetting)`. NCM data
+/// interfaces commonly ship alt 0 with no endpoints (inactive)
+/// and alt 1 with the bulk pair (active); the host must
+/// SET_INTERFACE to the endpoint-bearing setting before the data
+/// pipe runs.
+pub fn find_ncm_data_alt_setting(cfg: &[u8]) -> Option<(u8, u8)> {
+    let mut current: Option<(u8, u8, bool)> = None; // (num, alt, is_data)
+    let mut i = 0usize;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        let desc_type = cfg[i + 1];
+        if desc_type == 0x04 && len >= 9 {
+            current = Some((
+                cfg[i + 2],
+                cfg[i + 3],
+                cfg[i + 5] == crate::cdc::USB_CLASS_CDC_DATA,
+            ));
+        } else if desc_type == 0x05 && len >= 7 {
+            if let Some((num, alt, true)) = current {
+                // Bulk endpoint under the current Data interface.
+                if cfg[i + 3] & 0x03 == 2 {
+                    return Some((num, alt));
+                }
+            }
+        }
+        i += len;
+    }
+    None
+}
+
+/// A station address is usable when it is neither unprogrammed
+/// (all-zero / all-ones) nor a multicast address.
+pub fn is_valid_station_address(mac: &[u8; 6]) -> bool {
+    !mac.iter().all(|&b| b == 0) && !mac.iter().all(|&b| b == 0xFF) && mac[0] & 1 == 0
+}
+
+/// Decode an iMACAddress string descriptor (USB string format:
+/// bLength, bDescriptorType 0x03, then UTF-16LE hex digits —
+/// "001A2B3C4D5E") into a station address.
+pub fn parse_mac_string_descriptor(desc: &[u8]) -> Option<[u8; 6]> {
+    if desc.len() < 2 || desc[1] != 0x03 {
+        return None;
+    }
+    let total = (desc[0] as usize).min(desc.len());
+    let body = &desc[2..total];
+    if body.len() < 24 || body.len() % 2 != 0 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for nib in 0..12usize {
+        let lo = body[nib * 2];
+        let hi = body[nib * 2 + 1];
+        if hi != 0 {
+            return None;
+        }
+        let v = match lo {
+            b'0'..=b'9' => lo - b'0',
+            b'a'..=b'f' => lo - b'a' + 10,
+            b'A'..=b'F' => lo - b'A' + 10,
+            _ => return None,
+        };
+        if nib % 2 == 0 {
+            mac[nib / 2] = v << 4;
+        } else {
+            mac[nib / 2] |= v;
+        }
+    }
+    if is_valid_station_address(&mac) {
+        Some(mac)
+    } else {
+        None
+    }
+}
+
+/// Fetch the iMACAddress string descriptor (`index`) from the
+/// device and decode it. The LANGID is read from the string-0
+/// table first, falling back to en-US (0x0409).
+async fn fetch_mac_string(xhci_dev: &crate::xhci::Xhci, slot_id: u8, index: u8) -> Option<[u8; 6]> {
+    if index == 0 {
+        return None;
+    }
+    let mut lang = [0u8; 4];
+    let langid = match xhci_dev
+        .control_in(slot_id, 0x80, 6, 0x0300, 0, &mut lang)
+        .await
+    {
+        Ok(n) if n >= 4 => u16::from_le_bytes([lang[2], lang[3]]),
+        _ => 0x0409,
+    };
+    let mut buf = [0u8; 64];
+    let n = xhci_dev
+        .control_in(slot_id, 0x80, 6, 0x0300 | index as u16, langid, &mut buf)
+        .await
+        .ok()?;
+    parse_mac_string_descriptor(&buf[..n])
+}
+
+/// Outcome of the bind-time class-request negotiation.
+struct Negotiated {
+    ntb_in_max_size: u32,
+    ntb_out_max_size: u32,
+    crc_enabled: bool,
+}
+
+/// Run the NCM class-request negotiation against the Comm
+/// interface: GET_NTB_PARAMETERS, then — as the parameters and
+/// the functional descriptor's capabilities offer — select
+/// NTB-16, set the input size, and enable CRC mode. Individual
+/// SET failures are tolerated (the device keeps its defaults);
+/// only the returned sizes/CRC state reflect what stuck.
+async fn negotiate_ncm(
+    xhci_dev: &crate::xhci::Xhci,
+    slot_id: u8,
+    comm_iface: u8,
+    caps: &NetworkCapabilities,
+) -> Negotiated {
+    // Defaults when the device never answers: our TX NTBs stay
+    // single-frame sized; the pump posts a 16 KiB buffer.
+    let mut out = Negotiated {
+        ntb_in_max_size: 0,
+        ntb_out_max_size: 16 * 1024,
+        crc_enabled: false,
+    };
+    let mut raw = [0u8; NtbParameters::WIRE_LEN];
+    let params = match xhci_dev
+        .control_in(
+            slot_id,
+            0xA1,
+            REQ_GET_NTB_PARAMETERS,
+            0,
+            comm_iface as u16,
+            &mut raw,
+        )
+        .await
+    {
+        Ok(_) => NtbParameters::decode(&raw).ok(),
+        Err(_) => None,
+    };
+    let Some(params) = params else {
+        return out;
+    };
+    out.ntb_in_max_size = params.ntb_in_max_size;
+    if params.ntb_out_max_size > 0 {
+        out.ntb_out_max_size = params.ntb_out_max_size;
+    }
+    // Select NTB-16 (format index 0) when the device offers it.
+    if params.formats_supported & 0x01 != 0 {
+        let _ = xhci_dev
+            .control_out(slot_id, 0x21, REQ_SET_NTB_FORMAT, 0, comm_iface as u16, &[])
+            .await;
+    }
+    // Tell the device the largest NTB we will send: the device's
+    // own cap, clamped to what this TX path builds (single-frame
+    // NTBs, generous headroom).
+    if params.ntb_in_max_size > 0 {
+        let input_size = params.ntb_in_max_size.min(4096);
+        let _ = xhci_dev
+            .control_out(
+                slot_id,
+                0x21,
+                REQ_SET_NTB_INPUT_SIZE,
+                0,
+                comm_iface as u16,
+                &input_size.to_le_bytes(),
+            )
+            .await;
+    }
+    // CRC mode when the functional descriptor offers it.
+    if caps.crc_mode {
+        let crc_on = xhci_dev
+            .control_out(slot_id, 0x21, REQ_SET_CRC_MODE, 1, comm_iface as u16, &[])
+            .await;
+        out.crc_enabled = crc_on.is_ok();
+    }
+    out
+}
+
+/// Bind to an already-addressed CDC-NCM device:
+/// SET_CONFIGURATION (+ SET_INTERFACE to the endpoint-bearing
+/// data alt setting), endpoint configuration, NTB negotiation,
+/// station-address acquisition from the device, netdev
+/// publication with per-device TX routing, and the RX pump.
 pub async fn try_bind_ncm_already_addressed(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
@@ -909,6 +1469,16 @@ pub async fn try_bind_ncm_already_addressed(
         Some(t) => t,
         None => return Err(NcmError::NotNcm),
     };
+    // Activate the data interface's endpoint-bearing alt setting
+    // (commonly alt 1; alt 0 carries no endpoints and leaves the
+    // data pipe inert on real firmware).
+    if let Some((alt_iface, alt)) = find_ncm_data_alt_setting(cfg) {
+        if alt > 0 {
+            let _ = xhci_dev
+                .control_out(slot_id, 0x01, 0x0B, alt as u16, alt_iface as u16, &[])
+                .await;
+        }
+    }
     // Configure the bulk pair so the controller wires up its
     // Transfer Rings. Mirrors the MSC bind path.
     if xhci_dev
@@ -920,6 +1490,56 @@ pub async fn try_bind_ncm_already_addressed(
     }
     let bulk_in_dci = ((bulk_in_ep.ep_addr & 0x0F) * 2) + 1;
     let bulk_out_dci = (bulk_out_ep.ep_addr & 0x0F) * 2;
+
+    // Functional descriptors drive negotiation + MAC acquisition.
+    let (ncm_desc, eth_desc) = find_ncm_functional_descriptors(cfg, comm_iface);
+    let caps = ncm_desc.map(|d| d.capabilities).unwrap_or_default();
+    let negotiated = negotiate_ncm(xhci_dev, slot_id, comm_iface, &caps).await;
+
+    // Station address from the device itself: GET_NET_ADDRESS
+    // when offered, else the iMACAddress string descriptor. No
+    // valid address → the bind fails; one is never invented.
+    let mut mac: Option<[u8; 6]> = None;
+    if caps.net_address {
+        let mut raw = [0u8; 6];
+        if xhci_dev
+            .control_in(
+                slot_id,
+                0xA1,
+                REQ_GET_NET_ADDRESS,
+                0,
+                comm_iface as u16,
+                &mut raw,
+            )
+            .await
+            .is_ok()
+            && is_valid_station_address(&raw)
+        {
+            mac = Some(raw);
+        }
+    }
+    if mac.is_none() {
+        if let Some(eth) = eth_desc {
+            mac = fetch_mac_string(xhci_dev, slot_id, eth.mac_string_index).await;
+        }
+    }
+    let mac = mac.ok_or(NcmError::NoMacAddress)?;
+
+    // Normal receive filtering (directed + broadcast + multicast)
+    // when the device offers the request.
+    if caps.packet_filter {
+        let _ = xhci_dev
+            .control_out(
+                slot_id,
+                0x21,
+                REQ_SET_PACKET_FILTER,
+                PacketFilter::NORMAL.encode(),
+                comm_iface as u16,
+                &[],
+            )
+            .await;
+    }
+
     let idx = {
         let mut g = CDC_NCM_DEVICES.lock();
         let idx = g.len();
@@ -930,15 +1550,81 @@ pub async fn try_bind_ncm_already_addressed(
             bulk_in_dci,
             bulk_out_dci,
             tx_sequence: 0,
+            mac,
+            ntb_in_max_size: negotiated.ntb_in_max_size,
+            ntb_out_max_size: negotiated.ntb_out_max_size,
+            crc_enabled: negotiated.crc_enabled,
+            iface_name: alloc::format!("usb-ncm{}", idx),
+            pump_running: false,
         });
         idx
     };
-    // Register against the net iface registry as "usb-ncm{idx}".
-    // The send_fn is a static trampoline that dispatches to
-    // CDC_NCM_DEVICES[0] — sufficient for the single-NIC bring-up
-    // arc; multi-NIC routing will swap to per-iface trampolines.
-    register_ncm_iface(idx);
+    // Publish with per-device TX routing: the registration cookie
+    // is this record's index, and the send hook resolves it back
+    // to this device — and only this device.
+    let assigned = register_ncm_iface(idx, mac);
+    {
+        let mut g = CDC_NCM_DEVICES.lock();
+        g[idx].iface_name = assigned;
+        g[idx].pump_running = true;
+    }
+    narf_scheduler::spawn(async move {
+        ncm_rx_pump(idx).await;
+    });
     Ok(idx)
+}
+
+/// Supervised RX pump for one bound NCM device: post bulk-IN
+/// reads sized by the negotiated OUT NTB maximum, walk each NTB
+/// with [`for_each_frame`], and hand every datagram to the stack
+/// as its own frame. Stops after a bounded run of consecutive
+/// transfer errors (a removed device surfaces as persistent
+/// errors) or when the record vanishes.
+async fn ncm_rx_pump(idx: usize) {
+    let (slot_id, bulk_in_dci, name, buf_len) = {
+        let g = CDC_NCM_DEVICES.lock();
+        let Some(dev) = g.get(idx) else {
+            return;
+        };
+        (
+            dev.slot_id,
+            dev.bulk_in_dci,
+            dev.iface_name.clone(),
+            (dev.ntb_out_max_size as usize).clamp(4096, 64 * 1024),
+        )
+    };
+    let Some(c) = crate::xhci::controller() else {
+        let mut g = CDC_NCM_DEVICES.lock();
+        if let Some(dev) = g.get_mut(idx) {
+            dev.pump_running = false;
+        }
+        return;
+    };
+    let mut buf = alloc::vec![0u8; buf_len];
+    let mut errors = 0u32;
+    loop {
+        match c.bulk_in(slot_id, bulk_in_dci, &mut buf).await {
+            Ok(n) if n > 0 => {
+                errors = 0;
+                let _ = for_each_frame(&buf[..n], &mut |frame| {
+                    let mut owned = frame.to_vec();
+                    narf_net::iface::on_rx_frame_from(&name, &mut owned);
+                });
+            }
+            Ok(_) => narf_scheduler::yield_now().await,
+            Err(_) => {
+                errors += 1;
+                if errors >= 16 {
+                    break;
+                }
+                narf_scheduler::yield_now().await;
+            }
+        }
+    }
+    let mut g = CDC_NCM_DEVICES.lock();
+    if let Some(dev) = g.get_mut(idx) {
+        dev.pump_running = false;
+    }
 }
 
 /// Walk the config blob for the first CDC-Data interface (class
@@ -1000,18 +1686,51 @@ pub fn find_ncm_bulk_endpoints(
     }
 }
 
-/// Send one Ethernet frame over the bound NCM device at `idx`.
-/// Wraps the frame in an NTB-16 (single-datagram NDP) and ships
-/// it on the bulk-OUT endpoint.
+/// Resolve a device-record index to its TX target
+/// `(slot_id, bulk_out_dci)`.
+pub fn tx_target(idx: usize) -> Option<(u8, u8)> {
+    let g = CDC_NCM_DEVICES.lock();
+    g.get(idx).map(|d| (d.slot_id, d.bulk_out_dci))
+}
+
+/// Snapshot + advance the TX bookkeeping for device `idx`:
+/// `(slot_id, bulk_out_dci, sequence, crc_enabled,
+/// ntb_in_max_size)`. The sequence bump happens here, under the
+/// registry lock, so concurrent sends on one device never reuse
+/// a sequence number — and never touch another device's counter.
+pub fn take_tx_state(idx: usize) -> Option<(u8, u8, u16, bool, u32)> {
+    let mut g = CDC_NCM_DEVICES.lock();
+    let dev = g.get_mut(idx)?;
+    let seq = dev.tx_sequence;
+    dev.tx_sequence = dev.tx_sequence.wrapping_add(1);
+    Some((
+        dev.slot_id,
+        dev.bulk_out_dci,
+        seq,
+        dev.crc_enabled,
+        dev.ntb_in_max_size,
+    ))
+}
+
+/// Send one Ethernet frame over the bound NCM device at `idx` —
+/// and only that device: the endpoint comes from the device's
+/// own record via [`take_tx_state`]. Wraps the frame in an
+/// NTB-16 (single-datagram NDP; CRC appended when CRC mode was
+/// negotiated) and ships it on the bulk-OUT endpoint.
 pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
-    let (slot_id, bulk_out_dci, sequence) = {
-        let mut g = CDC_NCM_DEVICES.lock();
-        let dev = g.get_mut(idx).ok_or(NcmError::NotNcm)?;
-        let seq = dev.tx_sequence;
-        dev.tx_sequence = dev.tx_sequence.wrapping_add(1);
-        (dev.slot_id, dev.bulk_out_dci, seq)
+    let (slot_id, bulk_out_dci, sequence, crc, in_max) =
+        take_tx_state(idx).ok_or(NcmError::NotNcm)?;
+    let with_crc;
+    let datagram: &[u8] = if crc {
+        with_crc = append_crc(eth_frame);
+        &with_crc
+    } else {
+        eth_frame
     };
-    let ntb = build_ntb16(sequence, &[eth_frame], /*crc*/ false)?;
+    let ntb = build_ntb16(sequence, &[datagram], crc)?;
+    if in_max > 0 && ntb.len() > in_max as usize {
+        return Err(NcmError::NtbTooLarge);
+    }
     // The net stack's `SendFn` is sync — bridge to the now-async
     // bulk_out via block_on. Safe here because the trampoline is
     // called from netstack TX paths that are not themselves inside
@@ -1067,32 +1786,23 @@ pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, NcmEr
     Ok(Some(&scratch[off..off + dlen]))
 }
 
-/// Trampoline used by [`narf_net::iface`]'s `SendFn` slot. Sends
-/// via NCM device 0 (the bring-up arc binds at most one USB-NCM
-/// device). Multi-NIC routing will replace this with a per-iface
-/// closure-equivalent dispatch table.
-fn ncm_send_static_trampoline(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
-    match send_frame(0, frame) {
+/// `SendCtxFn` trampoline for [`narf_net::iface`]: the cookie is
+/// the device-record index captured at registration, so a frame
+/// submitted on interface N is emitted by device N — the previous
+/// device-0-hardwired trampoline is gone.
+fn ncm_send_ctx(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    match send_frame(cookie as usize, frame) {
         Ok(_) => Ok(()),
         Err(_) => Err(()),
     }
 }
 
-/// Register the NCM device at `idx` as a network interface. The
-/// MAC address is resolved via GET_DESCRIPTOR(STRING, iMACAddress)
-/// in a follow-up; for now we register a placeholder MAC the
-/// stack can ARP-reply with — the device will overwrite this once
-/// the SET_NET_ADDRESS path lands.
-fn register_ncm_iface(idx: usize) {
+/// Register the NCM device at `idx` as a network interface under
+/// `usb-ncm{idx}`, publishing the device-supplied station
+/// address `mac`. Returns the assigned interface name.
+fn register_ncm_iface(idx: usize, mac: [u8; 6]) -> alloc::string::String {
     let name = alloc::format!("usb-ncm{}", idx);
-    // Placeholder locally-administered MAC. Bit 1 of byte 0 = 1
-    // (LAA flag), bit 0 = 0 (unicast). Device-specific MAC takes
-    // over once GET_NET_ADDRESS lands.
-    let mac = [0x02, 0x4E, 0x41, 0x52, 0x46, idx as u8];
-    // narf_net's register() interface takes &str — we leak the
-    // String so its lifetime spans the kernel.
-    let static_name: &'static str = alloc::boxed::Box::leak(name.into_boxed_str());
-    narf_net::iface::register(static_name, mac, ncm_send_static_trampoline);
+    narf_net::iface::register_with_context(&name, mac, idx as u64, ncm_send_ctx)
 }
 
 pub fn attached_ncm_count() -> usize {
@@ -1139,8 +1849,7 @@ pub async fn try_bind_cdc_ncm_already_addressed(
 pub struct CdcNcmIface {
     /// Index into [`CDC_NCM_DEVICES`].
     pub idx: usize,
-    /// Locally-administered placeholder MAC (until `GET_NET_ADDRESS`
-    /// populates the real one).
+    /// Station address read from the device at bind.
     pub mac: [u8; 6],
 }
 
@@ -1149,9 +1858,8 @@ impl CdcNcmIface {
     /// is out of range.
     pub fn from_idx(idx: usize) -> Option<Self> {
         let g = CDC_NCM_DEVICES.lock();
-        g.get(idx)?;
-        let mac = [0x02, 0x4E, 0x41, 0x52, 0x46, idx as u8];
-        Some(Self { idx, mac })
+        let dev = g.get(idx)?;
+        Some(Self { idx, mac: dev.mac })
     }
 
     /// Send `eth_frame` via the bound NCM device. Wraps the frame
