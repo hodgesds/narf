@@ -500,12 +500,123 @@ impl<B: BlockDevice + 'static> FatNode<B> {
             }
         }
 
+        if len > old_size {
+            // Grow (#692): publishing the larger size alone leaves
+            // the chain shorter than i_size, and `read`'s cluster
+            // walk then falls off the end of the chain with EIO
+            // inside the grown range. Linux FAT extends the chain on
+            // grow and the new range reads as zeros, so extend the
+            // chain to cover `len` and zero [old_size, len) —
+            // including the tail of the boundary cluster past the old
+            // EOF and any cluster recycled from a just-freed range,
+            // whose on-disk bytes are the pre-shrink contents. A
+            // failure mid-extension leaves the size unpublished; the
+            // partially extended chain stays linked and reachable by
+            // later walks, so nothing is corrupted or leaked.
+            self.extend_chain_and_zero(old_size, len).await?;
+        }
+
         {
             let mut g = self.state.lock();
             g.stat.size = len;
             g.stat.blocks = len.div_ceil(self.volume.bpb.bytes_per_sec as u64);
         }
         self.sync_metadata().await?;
+        Ok(())
+    }
+
+    /// Extend this file's cluster chain so it covers `len` bytes,
+    /// zeroing every byte in `[old_size, len)`. Allocation mirrors
+    /// `write`'s walk: follow `Next`, and on `EndOfChain` allocate a
+    /// fresh cluster and link it in. Used only by the grow branch of
+    /// `truncate_async`; `old_size` is the size before the grow and
+    /// the caller publishes the new size only after this succeeds.
+    async fn extend_chain_and_zero(&self, old_size: u64, len: u64) -> Result<(), FsError> {
+        let lbs = self.volume.bpb.bytes_per_sec as u64;
+        let bytes_per_cluster = lbs * self.volume.bpb.sec_per_clus as u64;
+        let io_err = || FsError::Io(narf_block::BlockError::IOError);
+
+        let mut cluster = {
+            let g = self.state.lock();
+            g.first_cluster
+        };
+        if cluster == 0 {
+            // Empty file: allocate the head cluster, as `write` does.
+            let new_clus = self.volume.allocate_cluster().await?;
+            {
+                let mut g = self.state.lock();
+                g.first_cluster = new_clus;
+            }
+            cluster = new_clus;
+        }
+        if cluster < 2 {
+            return Err(io_err());
+        }
+
+        // Walk to the cluster holding the first grown byte. A chain
+        // left shorter than `old_size` by an earlier desync (or by
+        // the pre-#692 grow path on an existing image) is extended
+        // on the way, exactly as `write` extends it.
+        let start_index = old_size / bytes_per_cluster;
+        let max_clusters = self.volume.total_data_clusters() + 2;
+        let mut walked = 0;
+        for _ in 0..start_index {
+            match self.volume.next_cluster(cluster).await? {
+                super::fat::FatEntry::Next(next) => cluster = next,
+                super::fat::FatEntry::EndOfChain => {
+                    let next = self.volume.allocate_cluster().await?;
+                    self.volume.update_fat_entry(cluster, next).await?;
+                    cluster = next;
+                }
+                _ => return Err(io_err()),
+            }
+            walked += 1;
+            if walked > max_clusters {
+                return Err(io_err());
+            }
+        }
+
+        // Zero [old_size, len) sector by sector. Partial sectors at
+        // the range edges are read-modify-written so live bytes
+        // before `old_size` in the first sector survive; whole
+        // sectors inside the range are written from the zero buffer.
+        let zeros = vec![0u8; lbs as usize];
+        let mut sector = vec![0u8; lbs as usize];
+        let mut pos = old_size;
+        let mut cluster_offset = old_size % bytes_per_cluster;
+        while pos < len {
+            let lba_start = self.volume.first_sector_of_cluster(cluster) as u64;
+            let mut sector_in_cluster = (cluster_offset / lbs) as u32;
+            let mut sector_offset = (cluster_offset % lbs) as usize;
+            while sector_in_cluster < self.volume.bpb.sec_per_clus as u32 && pos < len {
+                let lba = lba_start + sector_in_cluster as u64;
+                let n = core::cmp::min(len - pos, lbs - sector_offset as u64) as usize;
+                if n == lbs as usize {
+                    self.volume.write_sector(lba, &zeros).await?;
+                } else {
+                    self.volume.read_sector(lba, &mut sector).await?;
+                    sector[sector_offset..sector_offset + n].fill(0);
+                    self.volume.write_sector(lba, &sector).await?;
+                }
+                pos += n as u64;
+                sector_in_cluster += 1;
+                sector_offset = 0;
+            }
+            if pos < len {
+                match self.volume.next_cluster(cluster).await? {
+                    super::fat::FatEntry::Next(next) => {
+                        cluster = next;
+                    }
+                    super::fat::FatEntry::EndOfChain => {
+                        let next = self.volume.allocate_cluster().await?;
+                        self.volume.update_fat_entry(cluster, next).await?;
+                        cluster = next;
+                    }
+                    _ => return Err(io_err()),
+                }
+                cluster_offset = 0;
+            }
+        }
         Ok(())
     }
 
