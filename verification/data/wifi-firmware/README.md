@@ -7,6 +7,17 @@ calibration, cryptographic signatures and opaque payloads are omitted. A replay
 with zero-filled gaps is a parser input, never a loadable or qualified firmware
 image. Full-image authentication and hardware acceptance remain separate.
 
+**Checkout state (issue #739):** the intel and mediatek `*.metadata.bin`
+extracts are committed. The qualcomm and broadcom extracts are **not** in
+git: the root `*.bin` gitignore rule silently excluded them when the tables
+landed (intel/mediatek carry a nested `!*.metadata.bin` negation; qualcomm
+and broadcom now carry one too, so regenerated extracts are committable).
+Until they are regenerated from the pinned originals and committed, a clean
+checkout has no qualcomm/broadcom extracts: `narf-drivers-wireless` builds
+regardless — its `build.rs` detects the absence and the affected golden
+replay tests report `Skip` — and the build prints a warning naming the
+regen command below.
+
 Each vendor directory contains an independent Python extractor and provenance
 with complete raw-source hashes. Regeneration requires those exact originals;
 the scripts do not download or silently update their pins:
