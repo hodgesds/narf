@@ -113,6 +113,10 @@ pub struct FatVolume<B: BlockDevice> {
     /// one (safe: generations, below, distinguish file instances even
     /// if an anchor address is recycled).
     mmap_anchors: IrqSafeSpinLock<BTreeMap<u64, Weak<MmapAnchor>>>,
+    /// Live directory-entry locators by entry key (see
+    /// [`EntryLocator`]). Weak for the same reason as `mmap_anchors`:
+    /// a file no open node references gives its locator up.
+    entry_locators: IrqSafeSpinLock<BTreeMap<u64, Weak<EntryLocator>>>,
 }
 
 /// Boot-global source of generation epochs (#732). A generation is
@@ -197,6 +201,41 @@ pub struct MmapAnchor {
     /// anchor identifies. Carried for debug identity only; the
     /// anchor's address is the identity.
     _key: u64,
+}
+
+/// Where one file's directory entry currently lives — the shared,
+/// mutable half of a node's identity (#697). A node's metadata sync
+/// stamps size / first-cluster into the entry at the position the
+/// node was minted with; rename moves the entry to a new slot and
+/// tombstones the old one, and the tombstoned slot is the first one
+/// `create` reuses, so a pre-rename node left pointing at mint time
+/// stamps the renamed file's metadata into the next tenant's entry.
+/// Every node of a file therefore resolves its slot through this one
+/// locator: `rename` re-keys it to the new slot, `unlink` / `rmdir`
+/// detach it (sync then no-ops, as for the root), and slot reuse can
+/// never resurrect it — a later tenant mints its own locator because
+/// rename / unlink remove the old key from the volume table first.
+#[derive(Debug)]
+pub struct EntryLocator {
+    slot: IrqSafeSpinLock<Option<(u64, usize)>>,
+}
+
+impl EntryLocator {
+    fn new(slot: (u64, usize)) -> Self {
+        Self {
+            slot: IrqSafeSpinLock::new(Some(slot)),
+        }
+    }
+
+    /// The entry's current position, or `None` once the entry has
+    /// been unlinked out from under the open nodes.
+    pub fn get(&self) -> Option<(u64, usize)> {
+        *self.slot.lock()
+    }
+
+    fn set(&self, slot: Option<(u64, usize)>) {
+        *self.slot.lock() = slot;
+    }
 }
 
 impl<B: BlockDevice + 'static> FatVolume<B> {
@@ -294,6 +333,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             opts,
             cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
             mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
+            entry_locators: IrqSafeSpinLock::new(BTreeMap::new()),
         }))
     }
 
@@ -357,6 +397,53 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         let anchor = Arc::new(MmapAnchor { _key: key });
         anchors.insert(key, Arc::downgrade(&anchor));
         anchor
+    }
+
+    /// The live [`EntryLocator`] for the file whose directory entry
+    /// sits at `(lba, offset)`, created on first use. Every node
+    /// minted for one entry shares the one locator, so a rename is
+    /// visible to all of the file's open nodes at once. Dead entries
+    /// are pruned as the table grows.
+    pub fn entry_locator(&self, lba: u64, offset: usize) -> Arc<EntryLocator> {
+        let key = self.entry_key(lba, offset);
+        let mut locators = self.entry_locators.lock();
+        if let Some(locator) = locators.get(&key).and_then(Weak::upgrade) {
+            return locator;
+        }
+        if locators.len() >= 256 && locators.len().is_power_of_two() {
+            locators.retain(|_, locator| locator.strong_count() != 0);
+        }
+        let locator = Arc::new(EntryLocator::new((lba, offset)));
+        locators.insert(key, Arc::downgrade(&locator));
+        locator
+    }
+
+    /// `rename` moved the entry at `old` to `new`: point the shared
+    /// locator at the new slot and re-key the table, so the file's
+    /// open nodes stamp the new slot and later lookups of the new
+    /// position resolve to the same locator. No live locator (the
+    /// file is not open) is a no-op — the next lookup mints one keyed
+    /// by the new position.
+    pub fn move_entry_locator(&self, old: (u64, usize), new: (u64, usize)) {
+        let old_key = self.entry_key(old.0, old.1);
+        let new_key = self.entry_key(new.0, new.1);
+        let mut locators = self.entry_locators.lock();
+        if let Some(locator) = locators.remove(&old_key).and_then(|w| w.upgrade()) {
+            locator.set(Some(new));
+            locators.insert(new_key, Arc::downgrade(&locator));
+        }
+    }
+
+    /// `unlink` / `rmdir` destroyed the entry at `at`: detach its
+    /// locator so still-open nodes stop stamping metadata (their
+    /// position is gone; a later tenant of the slot mints its own
+    /// locator under the freed key).
+    pub fn detach_entry_locator(&self, at: (u64, usize)) {
+        let key = self.entry_key(at.0, at.1);
+        let mut locators = self.entry_locators.lock();
+        if let Some(locator) = locators.remove(&key).and_then(|w| w.upgrade()) {
+            locator.set(None);
+        }
     }
 
     pub fn first_data_sector(&self) -> u32 {
