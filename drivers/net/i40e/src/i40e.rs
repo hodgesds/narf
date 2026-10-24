@@ -1886,7 +1886,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         nic.mac,
         index as u64,
         i40e_send_frame,
-        runtime::link_sample(link),
+        runtime::link_sample(nic.link_status()),
     );
     nic.set_ifname(eth_name);
 

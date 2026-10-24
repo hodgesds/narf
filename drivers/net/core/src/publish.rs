@@ -85,6 +85,12 @@ impl LinkSample {
 #[derive(Debug)]
 pub struct IfName(IrqSafeSpinLock<Option<&'static str>>);
 
+impl Default for IfName {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IfName {
     /// An empty slot (pre-probe).
     pub const fn new() -> Self {
