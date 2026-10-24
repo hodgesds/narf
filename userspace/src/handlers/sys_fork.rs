@@ -301,6 +301,9 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
         gs_base: 0,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
+        // No page-in plan (#740): the child's pages are the parent's —
+        // already resident or shared — so there is nothing to cluster.
+        page_in_plan: alloc::vec::Vec::new(),
     };
 
     // Register the child under its TaskId but defer scheduler publication

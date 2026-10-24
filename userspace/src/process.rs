@@ -103,6 +103,16 @@ pub struct UserProcess {
     pub entry_arg: Option<u64>,
     /// Exact PT_LOAD and stack VMAs committed by the loader.
     pub loaded_mappings: alloc::vec::Vec<LoadedMapping>,
+    /// Exec page-in plan (#740): `(region base, pages)` runs over the
+    /// image's demand-paged PT_LOAD segments, built by the loader and
+    /// driven through the bulk fault API by an exec completion path
+    /// once the new address space is live (see `loader::page_in_plan`).
+    /// Empty unless the image was loaded file-backed with a
+    /// demand-paged segment — in particular, fork/clone children and
+    /// test fixtures construct it empty: a child's pages are the
+    /// parent's, already resident or shared, so there is nothing to
+    /// cluster.
+    pub page_in_plan: alloc::vec::Vec<(u64, u64)>,
     /// Load bias applied to the program image: 0 for ET_EXEC, and the
     /// randomised PML4[1] base for ET_DYN. Callers that need to know
     /// where a PIE actually landed (auxv construction, `/proc` maps, a
@@ -242,7 +252,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // The image comes back parsed: with a file-backed source, re-parsing it
     // here would re-read the header and program headers from the device for
     // bytes the loader already had.
-    let (address_space, program_entry, program_bias, image) =
+    let (address_space, program_entry, program_bias, image, page_in_plan) =
         unsafe { crate::loader::load_elf_bytes_file(src, file) }?;
 
     // PT_INTERP follow-through: if the program names an interpreter
@@ -860,6 +870,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         entry_arg: None,
         loaded_mappings,
         program_bias,
+        page_in_plan,
     })
 }
 

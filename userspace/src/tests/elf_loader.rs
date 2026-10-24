@@ -3329,6 +3329,125 @@ kernel_test_in!(
     smoke_userspace_execve_loads_elf_then_bails_without_user_ctx
 );
 
+/// Byte-built ET_EXEC for the execve page-in smokes (#740): one PT_LOAD
+/// R|X, file offset 0x1000 → vaddr 0x80_0000_1000, entry +0x111. The
+/// header DECLARES `declared_pages` of filesz/memsz; the byte vector
+/// carries only `present_pages` of segment content, so
+/// `present < declared` builds a truncated image.
+#[cfg(target_arch = "x86_64")]
+fn build_execve_elf(declared_pages: u64, present_pages: usize) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![0u8; 0x1000 + present_pages * 0x1000];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // e_type ET_EXEC
+    b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes()); // e_machine x86_64
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // e_version
+    b[0x18..0x20].copy_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&0x1000u64.to_le_bytes()); // p_offset
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes()); // p_vaddr
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes()); // p_paddr
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&(declared_pages * 0x1000).to_le_bytes()); // p_filesz
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&(declared_pages * 0x1000).to_le_bytes()); // p_memsz
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+    b
+}
+
+/// Stage `elf` in a fresh MemFs mount and execve its path through the
+/// real handler, returning the syscall's raw return value.
+#[cfg(target_arch = "x86_64")]
+fn execve_staged(mount_point: &str, elf: &[u8]) -> Option<crate::syscall::SyscallReturn> {
+    use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+    let auth = bootstrap_mount_authority();
+    let mount = registry()
+        .mount(
+            &auth,
+            mount_point,
+            MemFs::with_seeds(mount_point, &[("init", elf)]),
+        )
+        .ok();
+    let path = alloc::format!("{mount_point}/init\0");
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: 0, // argv = NULL → empty (POSIX)
+            arg2: 0, // envp = NULL → empty
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
+    if let Some(h) = &mount {
+        let _ = narf_filesystem::registry().unmount(h, mount_point);
+    }
+    ctx.ret
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_demand_image_loads_and_bails() -> TestResult {
+    // The handler-level half of #740: a 32-page image is over the
+    // loader's demand floor, so the execve handler's load demand-pages
+    // it and packages the page-in plan for the completion paths. In
+    // the kernel-test harness there is no user ctx, so — exactly like
+    // the minimal-ELF smoke above — success is the -ENOSYS bail AFTER
+    // the load. The plan's contents and the batch's effects are proven
+    // in `abi_execve_pagein_tests`, which drives the same load through
+    // `ExecSource::File` directly.
+    crate::syscall::__test_clear_global();
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_execve_elf(32, 32);
+    let r = execve_staged("/execve-pagein", &elf);
+    crate::syscall::__test_clear_global();
+    match r {
+        Some(r) if r == errno_ret(ENOSYS) => TestResult::Pass,
+        _ => TestResult::Fail("expected the -ENOSYS bail after a demand-sized load"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_demand_image_loads_and_bails
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_truncated_eager_elf_enoexec() -> TestResult {
+    // Exec-semantics regression (#740): an 8-page segment is below the
+    // demand floor and loads EAGERLY, so truncating it (4 of 8 pages
+    // present) must keep failing execve synchronously with -ENOEXEC —
+    // the answer it gave before page-in clustering existed. The
+    // loader-level twin (same fixture shape, error-variant assertion)
+    // is `smoke_execve_pagein_truncated_eager_fails_load`.
+    crate::syscall::__test_clear_global();
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_execve_elf(8, 4);
+    let r = execve_staged("/execve-trunc", &elf);
+    crate::syscall::__test_clear_global();
+    match r {
+        Some(r) if r == errno_ret(ENOEXEC) => TestResult::Pass,
+        _ => TestResult::Fail("expected -ENOEXEC for a truncated eager image"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_truncated_eager_elf_enoexec
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_rejects_inline_elf_pointer() -> TestResult {
     // Legacy-ABI guard. execve was (elf_ptr, elf_len); it is now Linux
