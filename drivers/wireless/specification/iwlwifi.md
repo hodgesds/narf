@@ -192,6 +192,12 @@ continuous IRQ stream. The pump re-enters common progress on IPC/control wakes.
 Roam closes packet admission before replacing the previous peer/queue/key owner;
 a failed old disconnect prevents a new association until transport recovery.
 
+Disconnect publishes down before waiting for control work and repeats the close
+after acquiring device state, serializing with association/roam up publication.
+The Sc composition fixture holds control/state to interleave that early close
+with the old authorized publisher, then drives actual teardown receipts and
+checks cached BSSID/carrier closure before another progress poll can repair it.
+
 Tests cover retained waiter cancellation, bounded pending-packet retries, and
 actual Device.step over RFH/DataQueue completions: a full TX queue still delivers
 RX, validated credit resumes the exact pending packet, disconnect clears queued

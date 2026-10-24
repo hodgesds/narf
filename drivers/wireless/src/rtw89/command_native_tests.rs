@@ -72,6 +72,8 @@ impl Fixture {
             io,
             bdram: super::super::bdram::Bdram::default(),
             pcie: super::super::pcie::Pcie::default(),
+            basic: super::super::pci_basic::Basic::default(),
+            factory: None,
             fifo: super::super::fifo::Fifo::default(),
             cut: 0,
             device: device(chip),
@@ -250,6 +252,13 @@ fn smoke_rtw89_native_bdram_requires_preparation_and_current_authority() -> Test
     let mut fixture = Fixture::new(ChipId::Rtl8852B).unwrap();
     fixture.native.state = State::Unpublished;
     let before = fixture.words.clone();
+    // The safe activation entry rejects missing cold factory/configuration
+    // receipts before even consulting deliberately unmapped PCI configuration.
+    fixture.native.state = State::Configured;
+    if fixture.native.enable_download() != Err(Error::Terminal) || fixture.words != before {
+        return TestResult::Fail("CH12 activation accepted an unqualified cold owner");
+    }
+    fixture.native.state = State::Unpublished;
     // SAFETY: exclusively owned inert model has no DMA or other producer.
     // The deliberately unmapped PCI configuration must not be accessed here:
     // a missing owned BDRAM receipt rejects before base publication/config I/O.
@@ -289,4 +298,50 @@ fn smoke_rtw89_native_bdram_requires_preparation_and_current_authority() -> Test
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_native_bdram_requires_preparation_and_current_authority
+);
+
+fn smoke_rtw89_cancelled_startup_closes_mmio_and_retains_published_command_dma() -> TestResult {
+    let mut fixture = Fixture::new(ChipId::Rtl8852B).unwrap();
+    if fixture.activate().is_err()
+        || ready(fixture.native.send(Kind::Header, &[0x5a; 32])) != Some(Ok(()))
+    {
+        return TestResult::Fail("startup cancellation native command baseline");
+    }
+    let ring = fixture.native.ring.as_ref().unwrap().dma_addr().raw();
+    let retained = fixture.native.queue.pending();
+    let packet = fixture
+        .native
+        .queue
+        .model_resource(0)
+        .unwrap()
+        .dma_addr()
+        .raw();
+    {
+        let future = async {
+            let _attempt = super::super::startup::Attempt::new(&mut fixture.native);
+            core::future::pending::<()>().await;
+        };
+        if ready(future).is_some() {
+            return TestResult::Fail("startup cancellation did not retain waiter");
+        }
+    }
+    if fixture.native.state != State::Terminal
+        || retained != 1
+        || fixture.native.queue.pending() != retained
+        || fixture
+            .native
+            .queue
+            .model_resource(0)
+            .is_none_or(|memory| memory.dma_addr().raw() != packet)
+        || fixture.native.ring.as_ref().unwrap().dma_addr().raw() != ring
+        || fixture.words[0x1010 / 4] & 0xF0F00 != 0xF0F00
+        || ready(fixture.native.send(Kind::Header, &[1; 32])) != Some(Err(Error::Terminal))
+    {
+        return TestResult::Fail("cancelled startup reused or freed uncertain native DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_cancelled_startup_closes_mmio_and_retains_published_command_dma
 );

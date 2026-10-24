@@ -236,6 +236,13 @@ firmware claim; a stopped or failed owner cannot construct fresh keys/radio
 state for rejoin. Controller-proven EP0 reset/recovery and safe rejoin remain
 software work; successful initial association is not that recovery proof.
 
+Disconnect publishes down immediately and repeats that publication after
+acquiring device state, the same mutex held by every up publisher. A previous
+association/progress owner therefore cannot leave stale carrier or BSSID after
+teardown. A deterministic composed-USB regression holds that mutex, polls the
+early close, publishes the old authorized peer, then releases teardown; it
+checks down metadata, rejected TX and retired receipts before any repair poll.
+
 `packet_codec::{receive,transmit}` and `packet_transport::Owner<UsbIo>` are
 the native USB transport dependency. RX uses the physically 24-byte
 `rxdesc16`, complete PHY/shift extents, packet count and 128-byte aggregate

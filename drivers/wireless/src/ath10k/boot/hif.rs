@@ -17,6 +17,7 @@ pub(super) struct Pipe<B> {
     pub maximum: u16,
     pub ring: Ring<B>,
     pub buffer: B,
+    pub pending: Option<narf_time::Deadline>,
 }
 #[derive(Debug)]
 pub(super) struct Runtime<B> {
@@ -62,6 +63,7 @@ impl<B: Memory> Runtime<B> {
                 maximum,
                 ring,
                 buffer,
+                pending: None,
             });
         }
         Ok(Self {
@@ -84,6 +86,9 @@ impl<B: Memory> Runtime<B> {
     }
     pub fn poll(&mut self, io: &mut impl Ath10kMmio) -> Result<(), BmiError> {
         for pipe in &mut self.pipes {
+            if pipe.direction == Direction::Source && pipe.pending.is_some() {
+                source_ready(pipe, io)?;
+            }
             if pipe.direction == Direction::Destination {
                 if let Some(frame) = receive(&mut pipe.ring, &mut pipe.buffer, io, pipe.maximum)? {
                     if self.received.len() >= 32 {
@@ -98,6 +103,41 @@ impl<B: Memory> Runtime<B> {
         }
         Ok(())
     }
+}
+fn source_ready<B: Memory>(pipe: &mut Pipe<B>, io: &mut impl Ath10kMmio) -> Result<bool, BmiError> {
+    if let Some(deadline) = pipe.pending {
+        if pipe.ring.completion(io)?.is_some() {
+            pipe.pending = None;
+        } else if deadline.expired() {
+            return Err(BmiError::Timeout);
+        }
+    }
+    Ok(pipe.pending.is_none() && !pipe.ring.busy())
+}
+fn begin_send<B: Memory>(
+    pipe: &mut Pipe<B>,
+    io: &mut impl Ath10kMmio,
+    bytes: &[u8],
+) -> Result<(), BmiError> {
+    if !io.authorized() {
+        return Err(BmiError::Pci);
+    }
+    if !source_ready(pipe, io)? {
+        return Err(super::super::dma::DmaError::Busy.into());
+    }
+    if bytes.is_empty() || bytes.len() > pipe.buffer.len() {
+        return Err(BmiError::BadResponse);
+    }
+    // Occupancy is checked before touching the still-device-owned bounce.
+    // Store the terminal deadline before any descriptor becomes visible.
+    pipe.pending = Some(narf_time::Deadline::after_ms(3000));
+    for (at, &byte) in bytes.iter().enumerate() {
+        pipe.buffer.write(at, byte);
+    }
+    barrier();
+    pipe.ring
+        .post(io, pipe.buffer.dma_address() as u32, bytes.len() as u16)?;
+    Ok(())
 }
 fn receive<B: Memory>(
     ring: &mut Ring<B>,
@@ -131,6 +171,9 @@ async fn send<B: Memory>(
     if *poisoned || bytes.is_empty() || bytes.len() > buffer.len() {
         return Err(BmiError::BadResponse);
     }
+    if ring.busy() {
+        return Err(crate::ath10k::dma::DmaError::Busy.into());
+    }
     *poisoned = true; // Cancellation cannot turn a pending DMA buffer reusable.
     for (offset, &byte) in bytes.iter().enumerate() {
         buffer.write(offset, byte);
@@ -151,6 +194,76 @@ async fn send<B: Memory>(
 }
 
 impl PciBoot {
+    pub fn hif_source_ready(&mut self, number: u8) -> Result<bool, BmiError> {
+        if !self.mmio.authorized() || self.poisoned || !self.hif_live {
+            return Err(BmiError::Pci);
+        }
+        let pipe = self
+            .hif
+            .as_mut()
+            .ok_or(BmiError::BadResponse)?
+            .pipes
+            .iter_mut()
+            .find(|p| p.number == number && p.direction == Direction::Source)
+            .ok_or(BmiError::Unsupported)?;
+        let result = source_ready(pipe, &mut self.mmio);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+    pub fn hif_begin_send(&mut self, number: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        if !self.mmio.authorized() || self.poisoned || !self.hif_live {
+            return Err(BmiError::Pci);
+        }
+        let pipe = self
+            .hif
+            .as_mut()
+            .ok_or(BmiError::BadResponse)?
+            .pipes
+            .iter_mut()
+            .find(|p| p.number == number && p.direction == Direction::Source)
+            .ok_or(BmiError::Unsupported)?;
+        let result = begin_send(pipe, &mut self.mmio, bytes);
+        if result.is_err_and(|e| e != BmiError::Dma(crate::ath10k::dma::DmaError::Busy)) {
+            self.poisoned = true;
+        }
+        result
+    }
+    fn poll_packets(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        if !self.mmio.authorized() {
+            return Err(BmiError::Pci);
+        }
+        let hif = self.hif.as_mut().ok_or(BmiError::BadResponse)?;
+        hif.poll(&mut self.mmio)?;
+        let resources = &mut *self.resources;
+        if let Some(frame) = receive(
+            &mut resources.rx,
+            &mut resources.response,
+            &mut self.mmio,
+            2048,
+        )? {
+            if hif.received.len() >= 32 {
+                return Err(BmiError::BadResponse);
+            }
+            hif.received
+                .try_reserve(1)
+                .map_err(|_| BmiError::NoMemory)?;
+            hif.received.push_back((1, frame));
+        }
+        Ok(hif.received.pop_front())
+    }
+    pub fn hif_poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        if self.poisoned || !self.hif_live || self.hif.is_none() {
+            return Err(BmiError::BadResponse);
+        }
+        self.poisoned = true;
+        let result = self.poll_packets();
+        if result.is_ok() {
+            self.poisoned = false;
+        }
+        result
+    }
     pub fn prepare_hif(&mut self) -> Result<(), BmiError> {
         if !self.mmio.authorized() {
             return Err(BmiError::Pci);
@@ -201,6 +314,9 @@ impl PciBoot {
             .iter_mut()
             .find(|p| p.number == pipe && p.direction == Direction::Source)
             .ok_or(BmiError::Unsupported)?;
+        if !source_ready(port, &mut self.mmio)? {
+            return Err(crate::ath10k::dma::DmaError::Busy.into());
+        }
         send(
             &mut port.ring,
             &mut port.buffer,
@@ -229,27 +345,7 @@ impl PciBoot {
         self.poisoned = true; // A cancelled protocol wait requires reset, not replay.
         let deadline = narf_time::Deadline::after_ms(budget_ms);
         loop {
-            if !self.mmio.authorized() {
-                return Err(BmiError::Pci);
-            }
-            let hif = self.hif.as_mut().unwrap();
-            hif.poll(&mut self.mmio)?;
-            let resources = &mut *self.resources;
-            if let Some(frame) = receive(
-                &mut resources.rx,
-                &mut resources.response,
-                &mut self.mmio,
-                2048,
-            )? {
-                if hif.received.len() >= 32 {
-                    return Err(BmiError::BadResponse);
-                }
-                hif.received
-                    .try_reserve(1)
-                    .map_err(|_| BmiError::NoMemory)?;
-                hif.received.push_back((1, frame));
-            }
-            if let Some(frame) = hif.received.pop_front() {
+            if let Some(frame) = self.poll_packets()? {
                 self.poisoned = false;
                 return Ok(Some(frame));
             }

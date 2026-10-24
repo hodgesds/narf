@@ -80,6 +80,9 @@ impl<T: Transport> Firmware<T> {
     pub fn phase(&self) -> Phase {
         self.phase
     }
+    pub(super) fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
     /// One-shot: errors and cancellation preserve the owner but prohibit retry.
     /// Recovery requires a separate, complete fenced PCIe/chip reset owner.
     pub async fn start(&mut self) -> Result<(), Error> {

@@ -57,11 +57,14 @@ pub(crate) fn park(
     memory: bool,
     owner: Option<narf_bus::BusAddr>,
 ) -> Result<(), narf_bus::ProbeError> {
-    prepare_for_probe(
-        &mut Function { cap, device },
-        memory,
-        owner == Some(device.addr),
-    )
+    invoke(cap, || {
+        prepare_for_probe(
+            &mut Function { cap, device },
+            memory,
+            owner == Some(device.addr),
+        )
+    })
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?
     .map_err(|_| narf_bus::ProbeError::BadDevice)
 }
 

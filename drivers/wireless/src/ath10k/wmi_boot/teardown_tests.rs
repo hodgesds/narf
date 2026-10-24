@@ -184,6 +184,21 @@ pub(super) async fn send(model: &mut RadioModel, bytes: &[u8]) -> Result<(), Bmi
     }
     Ok(())
 }
+pub(super) fn arm_data_disconnect(model: &mut RadioModel, fail: bool) {
+    model.mlme = None;
+    model.station = None;
+    model.teardown = Some(Fixture {
+        phase: 0,
+        fault: Fault::None,
+        sync: false,
+        ack_first: false,
+        fail: if fail { Some(0) } else { None },
+        progress: 0,
+    });
+}
+pub(super) fn data_disconnect_completed(model: &RadioModel) -> bool {
+    model.teardown.as_ref().is_some_and(|f| f.phase == 3)
+}
 fn prepared(
     version: u32,
     dialect: Dialect,

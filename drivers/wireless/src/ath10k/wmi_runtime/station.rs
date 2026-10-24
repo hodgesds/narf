@@ -482,6 +482,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     pub(super) async fn station_progress(&mut self) -> Result<htt::Event, Error> {
         let event = self.htt.poll().await?;
+        self.station_event(event)
+    }
+    pub(super) fn station_event(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
         if let htt::Event::Wmi(bytes) = &event {
             if self.wire.dialect == Dialect::Tlv {
                 if let Some(reports) = management::completions(bytes)? {

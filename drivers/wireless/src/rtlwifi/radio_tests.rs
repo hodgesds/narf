@@ -17,7 +17,7 @@ enum Mode {
     BadRx,
     Unstable,
 }
-struct Model {
+pub(crate) struct Model {
     registers: Vec<u8>,
     rf: [u32; 256],
     trace: Vec<(u8, u16, u32)>,
@@ -28,10 +28,14 @@ struct Model {
     pass: u16,
     delays: usize,
     pause: Option<usize>,
+    ignore: Option<u16>,
 }
 #[derive(Clone)]
-struct Port(Arc<IrqSafeSpinLock<Model>>);
+pub(crate) struct Port(Arc<IrqSafeSpinLock<Model>>);
 impl Port {
+    pub(crate) fn stable() -> Self {
+        Self::new(Mode::Stable)
+    }
     fn new(mode: Mode) -> Self {
         let mut registers = vec![0; 0x1000];
         registers[0x100] = 0xff;
@@ -46,6 +50,7 @@ impl Port {
             pass: 0,
             delays: 0,
             pause: None,
+            ignore: None,
         })))
     }
 }
@@ -88,6 +93,9 @@ impl Io for Port {
         let mut model = self.0.lock();
         access(&mut model)?;
         model.trace.push((8, reg, u32::from(data)));
+        if model.ignore == Some(reg) {
+            return Ok(());
+        }
         model.registers[usize::from(reg)] = data;
         Ok(())
     }
@@ -95,6 +103,9 @@ impl Io for Port {
         let mut model = self.0.lock();
         access(&mut model)?;
         model.trace.push((32, reg, data));
+        if model.ignore == Some(reg) {
+            return Ok(());
+        }
         store(&mut model, reg, data);
         if reg == 0x840 {
             model.rf[((data >> 20) & 255) as usize] = data & 0xfffff;
@@ -151,7 +162,7 @@ impl Io for Port {
         }
     }
 }
-struct Block {
+pub(crate) struct Block {
     address: u64,
     bytes: Vec<u8>,
     drops: Arc<AtomicUsize>,
@@ -209,6 +220,43 @@ fn profile() -> Profile {
     factory.logical[0xd6..0xd8].copy_from_slice(&0x10ecu16.to_le_bytes());
     factory.logical[0xd8..0xda].copy_from_slice(&0x8179u16.to_le_bytes());
     Profile::from_factory(&factory).unwrap()
+}
+pub(crate) fn channel_owner(
+    factory: &super::super::efuse::Factory,
+) -> (super::super::prepare::Prepared<Port, Block>, Port) {
+    let port = Port::new(Mode::Stable);
+    let mut owner = prepared(port.clone(), Arc::new(AtomicUsize::new(0)));
+    assert!(run(owner.configure_radio(Profile::from_factory(factory).unwrap())).is_ok());
+    {
+        let mut model = port.0.lock();
+        model.trace.clear();
+        model.accesses = 0;
+    }
+    (owner, port)
+}
+impl Port {
+    pub(crate) fn trace(&self) -> Vec<(u8, u16, u32)> {
+        self.0.lock().trace.clone()
+    }
+    pub(crate) fn accesses(&self) -> usize {
+        self.0.lock().accesses
+    }
+    pub(crate) fn fail_at(&self, at: usize) {
+        self.0.lock().fail = Some(at);
+    }
+    pub(crate) fn ignore(&self, reg: u16) {
+        self.0.lock().ignore = Some(reg);
+    }
+    pub(crate) fn pause_after(&self, delays: usize) {
+        let mut model = self.0.lock();
+        model.pause = Some(model.delays + delays);
+    }
+    pub(crate) fn word(&self, reg: u16) -> u32 {
+        value(&self.0.lock(), reg)
+    }
+    pub(crate) fn rf(&self, reg: u8) -> u32 {
+        self.0.lock().rf[usize::from(reg)]
+    }
 }
 fn run<F: Future>(future: F) -> F::Output {
     let mut future = core::pin::pin!(future);
@@ -433,7 +481,7 @@ pub(super) fn smoke_rtl8188ee_factory_profile_and_hp_rf_variant_are_exact() -> T
         return TestResult::Fail("HP197d RF override absent from retained native path");
     }
     factory.logical[0xc5] = 2;
-    if Profile::from_factory(&factory) != Ok(profile()) {
+    if !Profile::from_factory(&factory).is_ok_and(|profile| !profile.is_hp()) {
         return TestResult::Fail("non-default OEM selected HP RF override");
     }
     TestResult::Pass

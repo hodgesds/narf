@@ -12,6 +12,29 @@ use super::{
 pub trait Interface: Io {
     async fn config_read8(&mut self, address: u16) -> Result<u8, Error>;
     async fn config_write8(&mut self, address: u16, value: u8) -> Result<(), Error>;
+    async fn config_read16(&mut self, address: u16) -> Result<u16, Error> {
+        let low = self.config_read8(address).await?;
+        let high = self
+            .config_read8(address.checked_add(1).ok_or(Error::Access)?)
+            .await?;
+        Ok(u16::from_le_bytes([low, high]))
+    }
+    async fn config_read32(&mut self, address: u16) -> Result<u32, Error> {
+        let low = self.config_read16(address).await?;
+        let high = self
+            .config_read16(address.checked_add(2).ok_or(Error::Access)?)
+            .await?;
+        Ok(u32::from(low) | (u32::from(high) << 16))
+    }
+    async fn config_write16(&mut self, address: u16, value: u16) -> Result<(), Error> {
+        self.config_write8(address, value as u8).await?;
+        self.config_write8(
+            address.checked_add(1).ok_or(Error::Access)?,
+            (value >> 8) as u8,
+        )
+        .await
+    }
+
     async fn phy_read(&mut self, generation: Generation, address: u8) -> Result<u16, Error>;
     async fn phy_write(
         &mut self,

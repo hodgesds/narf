@@ -33,7 +33,8 @@ names = ['_rtl88e_phy_rf_serial_read','_rtl88e_phy_rf_serial_write',
     '_rtl88e_phy_reload_mac_registers','_rtl88e_phy_path_adda_on',
     '_rtl88e_phy_mac_setting_calibration','_rtl88e_phy_path_a_standby',
     '_rtl88e_phy_pi_mode_switch','_rtl88e_phy_simularity_compare',
-    '_rtl88e_phy_iq_calibrate','_rtl88e_phy_lc_calibrate','rtl88e_phy_iq_calibrate']
+    '_rtl88e_phy_iq_calibrate','_rtl88e_phy_lc_calibrate','rtl88e_phy_iq_calibrate',
+    '_rtl88e_phy_set_rfpath_switch']
 pre = r'''
 #include <stdint.h>
 #include <stdbool.h>
@@ -63,6 +64,10 @@ struct rtl_phy { struct bb_reg_def phyreg_def[2]; u32 adda_backup[16],iqk_mac_ba
   u8 rfpi_enable; long reg_eb4,reg_ebc,reg_e94,reg_e9c;
   struct { long value[1][8]; bool iqk_done; } iqk_matrix[1]; };
 struct rtl_priv { struct rtl_phy phy; }; struct rtl_hal { int version; };
+struct rtl_efuse { int antenna_div_type; }; static struct rtl_efuse efuse={1};
+#define rtl_efuse(p) (&efuse)
+#define is_hal_stop(h) false
+#define CGCS_RX_HW_ANTDIV 2
 struct ieee80211_hw { int unused; }; static struct rtl_priv priv;
 static struct rtl_hal hal;
 #define rtl_priv(hw) (&priv)
@@ -109,6 +114,7 @@ int main(void){struct ieee80211_hw h;priv.phy.phyreg_def[0]=(struct bb_reg_def){
  for(unsigned i=0;i<sizeof(RTL8188EE_RADIOA_1TARRAY)/4;i+=2)_rtl8188e_config_rf_radio_a(&h,RTL8188EE_RADIOA_1TARRAY[i],RTL8188EE_RADIOA_1TARRAY[i+1]);
  rtl_set_bbreg(&h,0x870,BIT(4),env);
  (void)rtl_get_rfreg(&h,0,0x18,RFREG_OFFSET_MASK);
+ _rtl88e_phy_set_rfpath_switch(&h,false,false);
  rtl88e_phy_iq_calibrate(&h,false);_rtl88e_phy_lc_calibrate(&h,false);
  return 0;}
 '''

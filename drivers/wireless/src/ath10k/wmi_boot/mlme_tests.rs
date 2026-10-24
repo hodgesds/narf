@@ -57,6 +57,37 @@ fn expected(phase: u8, dialect: Dialect, protected: bool, downgrade: bool) -> &'
         _ => panic!("unexpected MLME fixture phase"),
     }
 }
+pub(super) fn native_frame(m: &RadioModel, command: &[u8]) -> Result<Vec<u8>, BmiError> {
+    let word = |at: usize| u32::from_le_bytes(command[at..at + 4].try_into().unwrap());
+    let frame = if m.inner.inner.dialect == Dialect::Tlv {
+        // Linux's referenced command contains at most64 prefetch bytes.
+        // The full72-byte WPA2 association lives in retained DMA, not
+        // after that prefix. Consume it before its real WMI completion.
+        let length = word(28) as usize;
+        let (address, payload) = m
+            .management_memory
+            .as_ref()
+            .ok_or(BmiError::BadResponse)?
+            .snapshot(word(12))
+            .ok_or(BmiError::BadResponse)?;
+        let prefix = length.min(64).next_multiple_of(4);
+        if address != u64::from(word(20)) | (u64::from(word(24)) << 32)
+            || word(32) as usize != prefix
+            || command.len() != 40 + prefix
+            || command.get(40..40 + length.min(64)) != payload.get(..length.min(64))
+        {
+            return Err(BmiError::BadResponse);
+        }
+        payload.get(..length).ok_or(BmiError::BadResponse)?.to_vec()
+    } else {
+        command
+            .get(28..28 + word(24) as usize)
+            .ok_or(BmiError::BadResponse)?
+            .to_vec()
+    };
+
+    Ok(frame)
+}
 pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
     let fixture = m.mlme.as_ref().unwrap();
     let phase = fixture.phase;
@@ -68,34 +99,7 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
         return Err(BmiError::BadResponse);
     }
     if phase < 2 {
-        let command = &bytes[8..];
-        let word = |at: usize| u32::from_le_bytes(command[at..at + 4].try_into().unwrap());
-        let frame = if dialect == Dialect::Tlv {
-            // Linux's referenced command contains at most64 prefetch bytes.
-            // The full72-byte WPA2 association lives in retained DMA, not
-            // after that prefix. Consume it before its real WMI completion.
-            let length = word(28) as usize;
-            let (address, payload) = m
-                .management_memory
-                .as_ref()
-                .ok_or(BmiError::BadResponse)?
-                .snapshot(word(12))
-                .ok_or(BmiError::BadResponse)?;
-            let prefix = length.min(64).next_multiple_of(4);
-            if address != u64::from(word(20)) | (u64::from(word(24)) << 32)
-                || word(32) as usize != prefix
-                || command.len() != 40 + prefix
-                || command.get(40..40 + length.min(64)) != payload.get(..length.min(64))
-            {
-                return Err(BmiError::BadResponse);
-            }
-            payload.get(..length).ok_or(BmiError::BadResponse)?.to_vec()
-        } else {
-            command
-                .get(28..28 + word(24) as usize)
-                .ok_or(BmiError::BadResponse)?
-                .to_vec()
-        };
+        let frame = native_frame(m, &bytes[8..])?;
         m.native_management.push(frame);
     }
     m.sent.push(bytes.to_vec());

@@ -53,6 +53,7 @@ extern crate alloc;
 
 pub mod btcoex;
 pub mod channel;
+pub mod channel_power;
 pub mod dma;
 pub mod efuse;
 mod firmware_native;
@@ -61,6 +62,7 @@ pub mod fw;
 pub mod h2c;
 pub mod irq;
 pub mod mac;
+mod packet_mac;
 pub mod pci;
 pub mod phy;
 pub mod power;

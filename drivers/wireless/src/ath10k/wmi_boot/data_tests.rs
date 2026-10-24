@@ -1,6 +1,6 @@
 //! Firmware-side RAW packet conversation over actual HTT TX/RX DMA storage.
 use super::*;
-use narf_wifi_fixtures::{udp_ipv4, ApPhase, FakeAp, NetworkPlan};
+use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
 use narf_wireless::eapol::{KeyFrame, KeyMgmt, Ptk};
 const OWN: [u8; 6] = [2, 3, 4, 5, 6, 7];
 const AP: [u8; 6] = [2, 8, 9, 10, 11, 12];
@@ -41,6 +41,10 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
     }
 }
 pub(super) struct Fixture {
+    pub(super) automatic: bool,
+    control_phase: u8,
+    group_replies: usize,
+    server: DhcpServer,
     ap: FakeAp,
     ptk: Option<Ptk>,
     queue: VecDeque<Vec<u8>>,
@@ -73,6 +77,10 @@ impl Fixture {
         }
         .unwrap();
         Self {
+            automatic: false,
+            control_phase: 0,
+            group_replies: 0,
+            server: DhcpServer::new(network()),
             ap,
             ptk: None,
             queue: VecDeque::new(),
@@ -89,6 +97,9 @@ impl Fixture {
             next_peer: None,
             next_tid: None,
         }
+    }
+    pub(super) fn beacon(&self) -> Vec<u8> {
+        self.ap.beacon()
     }
     fn react(&mut self, frame: &[u8]) -> Result<bool, BmiError> {
         if self.ap.phase() != ApPhase::Authorized {
@@ -141,10 +152,35 @@ impl Fixture {
         if body.get(..6) != Some(&[0xaa, 0xaa, 3, 0, 0, 0]) {
             return Err(BmiError::BadResponse);
         }
+        if body.get(6..8) == Some(&[0x88, 0x8e]) {
+            let pdu = body.get(8..).ok_or(BmiError::BadResponse)?;
+            let key = KeyFrame::decode(pdu.get(4..).ok_or(BmiError::BadResponse)?, 16)
+                .ok_or(BmiError::BadResponse)?;
+            if key.key_information != 0x302 || key.replay_counter != 3 {
+                return Err(BmiError::BadResponse);
+            }
+            let mut checked = pdu.to_vec();
+            let mic = checked.get(81..97).ok_or(BmiError::BadResponse)?.to_vec();
+            checked[81..97].fill(0);
+            if mic
+                != narf_crypto::pbkdf2_sha1::hmac_sha1(
+                    &self.ptk.as_ref().ok_or(BmiError::BadResponse)?.kck,
+                    &checked,
+                )[..16]
+            {
+                return Err(BmiError::BadResponse);
+            }
+            self.group_replies += 1;
+            return Ok(false);
+        }
         let mut ethernet = frame[16..22].to_vec();
         ethernet.extend_from_slice(&frame[10..16]);
         ethernet.extend_from_slice(&body[6..]);
-        self.uplink.push(ethernet);
+        self.uplink.push(ethernet.clone());
+        if let Some(reply) = self.server.receive(&ethernet) {
+            let frame = self.downlink(&reply);
+            self.queue.push_back(frame);
+        }
         Ok(false)
     }
     fn downlink(&mut self, ethernet: &[u8]) -> Vec<u8> {
@@ -164,6 +200,142 @@ impl Fixture {
         frame.extend_from_slice(&body);
         frame
     }
+    fn group_rekey(&mut self) -> Vec<u8> {
+        let ptk = self.ptk.as_ref().unwrap();
+        let mut clear = vec![48, 20];
+        clear.extend_from_slice(&narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body());
+        clear.extend_from_slice(&[0xdd, 22, 0, 0x0f, 0xac, 1, 2, 0]);
+        clear.extend_from_slice(&[0x66; 16]);
+        if clear.len() % 8 != 0 {
+            clear.push(0xdd);
+        }
+        while clear.len() % 8 != 0 {
+            clear.push(0);
+        }
+        let mut key = KeyFrame::empty(16);
+        key.key_information = 0x1382;
+        key.key_length = 16;
+        key.replay_counter = 3;
+        key.key_data =
+            narf_crypto::aes_kw::aes_wrap(ptk.kek.as_slice().try_into().unwrap(), &clear).unwrap();
+        let mut pdu = key.into_eapol();
+        pdu[0] = 2;
+        let mic = narf_crypto::pbkdf2_sha1::hmac_sha1(&ptk.kck, &pdu);
+        pdu[81..97].copy_from_slice(&mic[..16]);
+        let mut ethernet = OWN.to_vec();
+        ethernet.extend_from_slice(&AP);
+        ethernet.extend_from_slice(&[0x88, 0x8e]);
+        ethernet.extend_from_slice(&pdu);
+        self.downlink(&ethernet)
+    }
+}
+pub(super) fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+    let dialect = m.inner.inner.dialect;
+    let command = &bytes[8..];
+    let word = |at: usize| u32::from_le_bytes(command[at..at + 4].try_into().unwrap());
+    let phase = m.data.as_ref().unwrap().control_phase;
+    let mut replies = Vec::new();
+    if phase < 2 {
+        let expected = match dialect {
+            Dialect::Main => 0x7006,
+            Dialect::TenOne => 0x9028,
+            Dialect::TenTwo | Dialect::TenTwoFour => 0x9029,
+            Dialect::TenFour => 0x9031,
+            Dialect::Tlv => 0x7008,
+        };
+        if word(0) != expected {
+            return Err(BmiError::BadResponse);
+        }
+        let frame = mlme_tests::native_frame(m, command)?;
+        m.native_management.push(frame.clone());
+        replies = m
+            .data
+            .as_mut()
+            .unwrap()
+            .ap
+            .receive(&frame)
+            .map_err(|_| BmiError::BadResponse)?;
+        if dialect == Dialect::Tlv {
+            let mut terminal = vec![16, 0, 0xa7, 1];
+            terminal.extend_from_slice(&word(12).to_le_bytes());
+            terminal.extend_from_slice(&[0; 12]);
+            add_event(m, 0x7006, &terminal);
+        }
+    } else if phase == 2 {
+        let (expected, size) = match dialect {
+            Dialect::Main => (0x6005, 360),
+            Dialect::TenOne => (0x9020, 352),
+            Dialect::TenTwo | Dialect::TenTwoFour => (0x9020, 356),
+            Dialect::TenFour => (0x9026, 360),
+            Dialect::Tlv => (0x6005, 116),
+        };
+        let at = if dialect == Dialect::Tlv { 8 } else { 4 };
+        let secured = m.data.as_ref().unwrap().ap.protected();
+        if word(0) != expected
+            || command.len() != size
+            || command[at..at + 6] != AP
+            || word(at + 12) != 1
+            || word(at + 16) != 7
+            || word(at + 20) != (if secured { 5 } else { 1 })
+            || word(at + 24) != (if secured { 0x11 } else { 1 })
+        {
+            return Err(BmiError::BadResponse);
+        }
+        let count = at + if dialect == Dialect::Tlv { 68 } else { 48 };
+        let rates = count + if dialect == Dialect::Tlv { 12 } else { 4 };
+        if word(count) != 3 || command[rates..rates + 3] != [12, 24, 48] {
+            return Err(BmiError::BadResponse);
+        }
+    } else if phase == 3 {
+        let expected = match dialect {
+            Dialect::Main | Dialect::Tlv => 0x5005,
+            Dialect::TenOne => 0x9015,
+            Dialect::TenTwo | Dialect::TenTwoFour => 0x9014,
+            Dialect::TenFour => 0x9017,
+        };
+        let at = if dialect == Dialect::Tlv { 8 } else { 4 };
+        if word(0) != expected
+            || command.len() != at + 16
+            || word(at) != 0
+            || word(at + 4) != 7
+            || command[at + 8..at + 14] != AP
+        {
+            return Err(BmiError::BadResponse);
+        }
+    } else {
+        return Err(BmiError::BadResponse);
+    }
+    m.data.as_mut().unwrap().control_phase += 1;
+    m.sent.push(bytes.to_vec());
+    m.inner.inner.rx.push_back((
+        2,
+        vec![
+            2,
+            2,
+            8,
+            0,
+            8,
+            0,
+            0,
+            0,
+            1,
+            4,
+            0,
+            0,
+            2,
+            bytes.len().div_ceil(256) as u8,
+            0,
+            0,
+        ],
+    ));
+    for frame in replies {
+        if frame[0] == 8 {
+            m.data.as_mut().unwrap().queue.push_back(frame);
+        } else {
+            management_frame(m, frame);
+        }
+    }
+    Ok(())
 }
 fn complete(m: &mut RadioModel, id: u16, status: u8) {
     let mut b = vec![7, status, 1, 0];
@@ -175,6 +347,13 @@ fn complete(m: &mut RadioModel, id: u16, status: u8) {
         .push_back((m.inner.receive_pipe, header(1, &b)));
 }
 pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+    send_now(m, bytes)?;
+    if m.data.as_ref().unwrap().stall_ce {
+        core::future::pending::<()>().await;
+    }
+    Ok(())
+}
+pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
     let body = bytes.get(8..).ok_or(BmiError::BadResponse)?;
     if bytes[0] != 1
         || bytes[1] != 0
@@ -215,9 +394,6 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
     } else {
         let status = fixture.status;
         complete(m, id, status);
-    }
-    if m.data.as_ref().unwrap().stall_ce {
-        core::future::pending::<()>().await;
     }
     Ok(())
 }
@@ -532,3 +708,6 @@ kernel_test_in!(
     "drivers/wireless/ath10k/data",
     smoke_ath10k_m4_receipt_and_cancel_close_data_with_native_dma_retained
 );
+
+#[path = "dhcp_tests.rs"]
+mod dhcp_tests;

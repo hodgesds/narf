@@ -13,6 +13,10 @@ pub enum Error {
     LltTimeout,
     Readback,
     Radio(super::radio::Error),
+    Power(super::channel_power::Error),
+    Packet,
+    Descriptor,
+    PacketTimeout,
 }
 impl From<AccessError> for Error {
     fn from(error: AccessError) -> Self {
@@ -24,6 +28,11 @@ pub enum Phase {
     Allocated,
     Prepared,
     RadioConfigured,
+    ChannelConfigured,
+    MacConfigured,
+    Running,
+    Stopping,
+    Stopped,
     Failed,
 }
 /// # Safety
@@ -37,28 +46,33 @@ pub unsafe trait Memory: Send {
         self.len() == 0
     }
     fn write32(&mut self, offset: usize, value: u32) -> Result<(), Error>;
+    fn read32(&self, _offset: usize) -> Result<u32, Error> {
+        Err(Error::Memory)
+    }
+    fn write_bytes(&mut self, _offset: usize, _bytes: &[u8]) -> Result<(), Error> {
+        Err(Error::Memory)
+    }
+    fn read_bytes(&self, _offset: usize, _bytes: &mut [u8]) -> Result<(), Error> {
+        Err(Error::Memory)
+    }
     fn sync(&self);
 }
 const TX_BYTES: usize = 64;
 const RX_BYTES: usize = 32;
 const RX_BUFFER: usize = 4096;
-// Descriptor-base registers follow mac.rs's named register map
-// (source: rtl8192ee/reg.h:143..165): TX queues BCNQ..BKQ occupy
-// 0x308..0x330, RX sits at 0x338 (REG_RX_DESA), and the high-priority
-// TX queue is at 0x340 (REG_HQ0_DESA) — after RX, not in sequence.
-// The bases are taken from mac.rs so this publication path and the
-// dma.rs programming path can never diverge. Every queue gets a
-// distinct, valid linked ring, including presently idle queues.
+// Exact RTL8188EE linked-ring map. The unused generic mac.rs/dma.rs
+// scaffolds carry the different RTL8192EE TXBD map and cannot authorize
+// this retained EE transport. Every queue has a distinct linked ring.
 const TX_BASES: [u16; 7] = [
-    super::mac::REG_BCNQ_DESA as u16,
-    super::mac::REG_MGQ_DESA as u16,
-    super::mac::REG_VOQ_DESA as u16,
-    super::mac::REG_VIQ_DESA as u16,
-    super::mac::REG_BEQ_DESA as u16,
-    super::mac::REG_BKQ_DESA as u16,
-    super::mac::REG_HQ0_DESA as u16,
+    super::rtl8188ee::REG_BCNQ_DESA,
+    super::rtl8188ee::REG_MGQ_DESA,
+    super::rtl8188ee::REG_VOQ_DESA,
+    super::rtl8188ee::REG_VIQ_DESA,
+    super::rtl8188ee::REG_BEQ_DESA,
+    super::rtl8188ee::REG_BKQ_DESA,
+    super::rtl8188ee::REG_HQ_DESA,
 ];
-const RX_BASE: u16 = super::mac::REG_RX_DESA as u16;
+const RX_BASE: u16 = super::rtl8188ee::REG_RX_DESA;
 fn extent(memory: &impl Memory, needed: usize, alignment: u64) -> Result<u32, Error> {
     let base = memory.address();
     if needed == 0
@@ -81,6 +95,8 @@ pub struct Prepared<I: Io, M: Memory> {
     phase: Phase,
     published: bool,
     radio: Option<super::radio::Report>,
+    permission: Option<super::channel_power::Permission>,
+    packet: packet::State<M>,
 }
 impl<I: Io, M: Memory> core::fmt::Debug for Prepared<I, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -161,6 +177,8 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             phase: Phase::Allocated,
             published: false,
             radio: None,
+            permission: None,
+            packet: packet::State::new(),
         })
     }
     pub fn phase(&self) -> Phase {
@@ -168,6 +186,47 @@ impl<I: Io, M: Memory> Prepared<I, M> {
     }
     pub fn radio_report(&self) -> Option<&super::radio::Report> {
         self.radio.as_ref()
+    }
+    pub fn channel_permission(&self) -> Option<super::channel_power::Permission> {
+        self.permission
+    }
+    /// The same factory identity qualifies radio, gain and the operational
+    /// MAC. MAC readiness leaves BME, CR packet gates and IRQs closed.
+    pub fn configure_mac(&mut self, factory: &super::efuse::Factory) -> Result<(), Error> {
+        if self.phase != Phase::ChannelConfigured {
+            return Err(Error::State);
+        }
+        self.permission
+            .ok_or(Error::State)?
+            .check(super::radio::factory_identity(factory))
+            .map_err(Error::Power)?;
+        self.phase = Phase::Failed;
+        super::packet_mac::configure(&self.io, factory)?;
+        self.packet.local = Some(factory.mac);
+        self.phase = Phase::MacConfigured;
+        Ok(())
+    }
+    pub async fn configure_channel(
+        &mut self,
+        permission: super::channel_power::Permission,
+    ) -> Result<(), Error> {
+        if !matches!(
+            self.phase,
+            Phase::RadioConfigured | Phase::ChannelConfigured
+        ) {
+            return Err(Error::State);
+        }
+        let report = self.radio.as_ref().ok_or(Error::State)?;
+        permission.check(report.identity).map_err(Error::Power)?;
+        self.phase = Phase::Failed;
+        self.permission = None;
+        let rf = super::radio::channel(&self.io, report, permission)
+            .await
+            .map_err(Error::Radio)?;
+        self.radio.as_mut().ok_or(Error::State)?.channel_rf = rf;
+        self.permission = Some(permission);
+        self.phase = Phase::ChannelConfigured;
+        Ok(())
     }
 
     /// Continue the same retained PacketIo/ring owner through exact EE radio
@@ -294,9 +353,13 @@ impl<I: Io, M: Memory> Drop for Prepared<I, M> {
             core::mem::forget(core::mem::take(&mut self.tx));
             core::mem::forget(self.receive.take());
             core::mem::forget(core::mem::take(&mut self.buffers));
+            self.packet.retain();
         }
     }
 }
+
+#[path = "packet.rs"]
+pub mod packet;
 /// Retain the complete owner before the first device-visible base write.
 /// This is the actual native worker's shared storage/await boundary. An async
 /// mutex, unlike an IRQ-disabling guard, may span the self-driven LLT wait.
@@ -314,4 +377,4 @@ pub(super) async fn retain_and_prepare<I: Io, M: Memory>(
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "prepare_tests.rs"]
-mod tests;
+pub(crate) mod tests;

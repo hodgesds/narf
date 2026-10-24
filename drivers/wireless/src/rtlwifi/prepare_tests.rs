@@ -133,7 +133,8 @@ fn allocated(port: Port, depth: usize, drops: Arc<AtomicUsize>) -> Prepared<Port
 fn word(block: &Block, offset: usize) -> u32 {
     u32::from_le_bytes(block.bytes[offset..offset + 4].try_into().unwrap())
 }
-fn smoke_rtl8188ee_distinct_linked_rings_and_rx_storage_before_publication() -> TestResult {
+pub(crate) fn smoke_rtl8188ee_distinct_linked_rings_and_rx_storage_before_publication() -> TestResult
+{
     for depth in [4, 16, 256] {
         let port = Port::new();
         let drops = Arc::new(AtomicUsize::new(0));
@@ -178,7 +179,8 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8188ee_distinct_linked_rings_and_rx_storage_before_publication
 );
-fn smoke_rtl8188ee_fifo_llt_matches_actual_linux_and_pins_published_rings() -> TestResult {
+pub(crate) fn smoke_rtl8188ee_fifo_llt_matches_actual_linux_and_pins_published_rings() -> TestResult
+{
     let port = Port::new();
     let drops = Arc::new(AtomicUsize::new(0));
     let mut owner = allocated(port.clone(), 16, drops.clone());
@@ -195,30 +197,18 @@ fn smoke_rtl8188ee_fifo_llt_matches_actual_linux_and_pins_published_rings() -> T
     {
         return TestResult::Fail("actual Linux 8188EE FIFO/0xab-0xaf LLT trace differs");
     }
-    // Expected bases come from mac.rs's named register map
-    // (rtl8192ee/reg.h:143..165) — deliberately NOT prepare's own
-    // TX_BASES/RX_BASE constants, so a swapped TX/RX base in
-    // prepare fails here instead of being rubber-stamped.
-    let expected_tx_bases: [u16; 7] = [
-        super::super::mac::REG_BCNQ_DESA as u16,
-        super::super::mac::REG_MGQ_DESA as u16,
-        super::super::mac::REG_VOQ_DESA as u16,
-        super::super::mac::REG_VIQ_DESA as u16,
-        super::super::mac::REG_BEQ_DESA as u16,
-        super::super::mac::REG_BKQ_DESA as u16,
-        super::super::mac::REG_HQ0_DESA as u16,
-    ];
-    for (address, ring) in expected_tx_bases.iter().zip(&owner.tx) {
+    // Independently compiled original RTL8188EE reg.h and actual hw.c
+    // init_mac base-publication order. Never share the driver's Rust map.
+    for (address, ring) in LINUX_TX_BASES.iter().zip(&owner.tx) {
         if !m.trace.contains(&(32, *address, ring.address as u32)) {
             return TestResult::Fail("per-chip distinct native queue base omitted");
         }
     }
     let receive = owner.receive.as_ref().unwrap();
-    if !m.trace.contains(&(
-        32,
-        super::super::mac::REG_RX_DESA as u16,
-        receive.address as u32,
-    )) {
+    if !m
+        .trace
+        .contains(&(32, LINUX_RX_BASE, receive.address as u32))
+    {
         return TestResult::Fail("RX ring base not published at REG_RX_DESA");
     }
     if m.regs[0x301] != 255
@@ -248,7 +238,7 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8188ee_fifo_llt_matches_actual_linux_and_pins_published_rings
 );
-fn smoke_rtl8188ee_prepare_every_io_failure_and_cancel_are_terminal() -> TestResult {
+pub(crate) fn smoke_rtl8188ee_prepare_every_io_failure_and_cancel_are_terminal() -> TestResult {
     let reference = Port::new();
     let mut ready = allocated(reference.clone(), 4, Arc::new(AtomicUsize::new(0)));
     narf_scheduler::block_on(ready.prepare()).unwrap();
@@ -309,7 +299,7 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8188ee_prepare_every_io_failure_and_cancel_are_terminal
 );
-fn smoke_rtl8188ee_prepare_rejects_dma_geometry_before_bar_access() -> TestResult {
+pub(crate) fn smoke_rtl8188ee_prepare_rejects_dma_geometry_before_bar_access() -> TestResult {
     for (address, len) in [(0x10001, 256), (0xffff_ff00, 512), (0x10000, 128)] {
         let port = Port::new();
         let drops = Arc::new(AtomicUsize::new(0));
@@ -372,7 +362,7 @@ kernel_test_in!(
     smoke_rtl8188ee_prepare_rejects_dma_geometry_before_bar_access
 );
 
-fn smoke_rtl8188ee_prepare_timeout_gone_and_readback_retain_boundary() -> TestResult {
+pub(crate) fn smoke_rtl8188ee_prepare_timeout_gone_and_readback_retain_boundary() -> TestResult {
     for (stall, gone, ignore, wanted, published) in [
         (true, false, None, Error::LltTimeout, false),
         (false, true, None, Error::Access(AccessError::Gone), false),
@@ -415,7 +405,7 @@ kernel_test_in!(
     smoke_rtl8188ee_prepare_timeout_gone_and_readback_retain_boundary
 );
 
-fn smoke_rtl8188ee_retained_worker_cancel_keeps_terminal_owner() -> TestResult {
+pub(crate) fn smoke_rtl8188ee_retained_worker_cancel_keeps_terminal_owner() -> TestResult {
     let port = Port::new();
     {
         let mut model = port.0.lock();

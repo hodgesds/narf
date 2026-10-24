@@ -800,3 +800,51 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/dhcp",
     smoke_rtl8188eu_failed_disconnect_retains_both_usb_receipts
 );
+
+fn disconnect_overrides_waiting_old_publisher() -> Result<(), &'static str> {
+    let h = Harness::new(false)?;
+    h.scan()?;
+    h.join()?;
+    let network = h.link.0.lock().network;
+    let probe = udp_ipv4(
+        AP,
+        network.station,
+        network.lease_ip,
+        network.server_ip,
+        12347,
+        7,
+        b"eu-disconnect-publication",
+    );
+    narf_net::iface::send_on(&h.name, &probe).map_err(|_| "EU queue before racing disconnect")?;
+    complete(
+        crate::rtl8xxxu::interface::publication_test::disconnect_after_old_publication(
+            &h.device, AP,
+        ),
+    )??;
+    // Inspect before any later progress() can repair stale cached metadata.
+    ensure!(
+        !h.device.link_up()
+            && h.device.connected_bssid().is_none()
+            && narf_net::iface::lookup(&h.name).is_some_and(|i| {
+                !i.link_up && !i.carrier && i.carrier_up_count == 2 && i.carrier_down_count == 2
+            })
+            && narf_net::iface::send_on(&h.name, &probe).is_err(),
+        "EU old publisher reopened carrier/BSSID after completed disconnect"
+    );
+    let p = h.link.0.lock();
+    ensure!(
+        p.rx.is_none() && p.tx.is_none() && p.stops != 0 && p.uplink.is_empty(),
+        "EU racing disconnect did not retire USB ownership or discard queued data"
+    );
+    Ok(())
+}
+fn smoke_rtl8188eu_disconnect_overrides_waiting_old_link_publication() -> TestResult {
+    match disconnect_overrides_waiting_old_publisher() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/dhcp",
+    smoke_rtl8188eu_disconnect_overrides_waiting_old_link_publication
+);

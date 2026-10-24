@@ -88,11 +88,19 @@ raw-profile admission before those owners. Ath10k's RAW/non-PFC legacy model
 composes native management/HTT, the shared security owner and exact
 bidirectional Ethernet/IP across six WMI dialects. Its firmware model consumes
 actual retained referenced-management DMA, including bytes beyond the64-byte
-TLV command prefetch. That async transport conversation does not yet prove a
-kernel-DHCP/netdev service. AR9285 channel preparation, RTL8188EE complete
-radio/calibration and RTW89 PCIe pre-init/mode owners additionally compare
-native register/delay traces against extracted original Linux C functions;
-these inactive/preparation checks cannot grant packet or RF readiness.
+TLV command prefetch. Its retained Device now additionally drives synchronous
+CE/HTC/HTT progress and the real kernel DHCP client for Open/WPA2 across all
+six dialects, including early EAPOL, withheld receipts, occupied bounce slots,
+policy restriction and close/publication interleavings. Separate EU, CYW and
+Intel regressions exercise old-link publication while actual disconnect waits
+for device state ownership, checking terminal closure before a repair poll.
+AR9285 channel/calibration, RTL8188EE radio/channel/power and RTW89 PCI basic,
+cold/factory and TX-only download owners additionally compare native
+register/delay or numeric results against extracted original Linux C functions.
+AR9285 includes 32 calibration traces and 35 signed/wrapping IQ vectors;
+RTL8188EE checks its actual ring-register map independently of the generic
+8192EE scaffolds. Native packet/stop models check ownership, width and current
+authority. These preparation checks cannot grant station or RF readiness.
 
 `narf_wifi_fixtures::firmware::metadata_replay(image_len, fragments)` builds
 parser-only structural images up to 16 MiB. It validates nonempty, ordered,

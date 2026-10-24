@@ -1,8 +1,8 @@
 # rtw89 — Specification
 
 > Status: AX factory identity, checked firmware preparation, native cold-power
-> primitives and bounded native TX ownership are implemented. The composed
-> firmware/station owner remains incomplete.
+> primitives, composed cold discovery/CH12/WCPU startup and bounded native TX
+> ownership are implemented. Packet/RF/station startup remains incomplete.
 
 ## 1. Purpose & scope
 
@@ -11,10 +11,11 @@ identity code implements AX DDV EFUSE; BE has a different read/block layout.
 
 ## 2. Assumptions
 
-The caller owns BAR2, mapped with Device attributes and covering the register
-window. The diagnostic probe still uses its existing power prologue; the new
-cold-power owner must be composed with firmware/secure-fuse and CH12 setup
-before replacing that path. No factory-MAC result establishes station readiness.
+The diagnostic caller owns BAR2, mapped with Device attributes and covering the
+register window. The private cold claim instead parks PCI DMA, maps BAR2 and
+reads the actual chip cut itself. The diagnostic probe still uses its existing
+power prologue; the composed cold/WCPU path does not replace it until packet,
+RF and complete startup prerequisites are implemented. No factory-MAC result establishes station readiness.
 
 ## 3. Public interface
 
@@ -24,7 +25,8 @@ and read back the command register. Any access failure, retained BME or missing
 requested decoding fails before BAR mapping. Bus mastering remains disabled
 on success and every later error; identity and ring allocation do not authorize
 DMA. A repeat probe of the retained bus address returns without configuration access; a distinct additional singleton match parks only its own PCI function. Re-enabling
-BME requires a future complete firmware/ring/reset owner.
+BME requires the composed owned cold/firmware-download path or a future
+complete packet/ring/reset owner.
 The complete diagnostic mapping/power/identity operation runs within actual
 capability invocation. It retains unpublished storage, with no ring base/index
 publication, enabled MSI-X delivery, RX pump or network-interface registration.
@@ -68,9 +70,12 @@ without an invented H2C/last flag. The plan alone performs no hardware I/O.
 
 The private `command_native::Native` CH12 backend owns checked coherent packet
 and ring allocations. Constructor/configuration require independently fenced
-DMA and verified PCI BME-off; activation separately requires completed
-PCIe/BDRAM/DLE/HFC setup, CH12-only TX DMA and verified BME-on. The backend
-does not enable BME itself, and rejects the incomplete per-domain IOMMU path.
+DMA and verified PCI BME-off. `enable_download` requires the actual completed
+cold/factory/basic/PCIe/BDRAM/DLE/HFC owners and an empty CH12 ring; it enables
+only CH12 TX DMA, verifies both independent RX layers remain disabled, then
+sets and reads back PCI BME as the final publication. WPDMA and all packet
+channels remain stopped. The backend rejects the incomplete per-domain IOMMU
+path.
 All register operations invoke current device authority and check complete
 width/alignment extents. Real revocation rejects the constructor before
 unmapped configuration access and prevents later packet publication.
@@ -87,17 +92,17 @@ or bus-master activation is part of preparation. Failure or dropped waits leave
 Preparing and reject reuse before I/O; a replacement requires an independently
 verified reset. BE is rejected before any register access.
 `Native::prepare_bdram(ber)` invokes current PCI authority to verify BME-off/MEM
-decoding, then composes DLFW DLE/HFC, exact AX PCIe MAC-pre-init policy and
+decoding, retains PCI basic configuration, then composes DLFW DLE/HFC,
+exact AX PCIe MAC-pre-init policy and
 BDRAM/index preparation through capability-scoped accesses. Mode programming
 occurs after DMA idle and index clear, before partition/reset. `Native::configure`
-requires that same retained owner's PCIe, FIFO and BDRAM Ready receipts before
+requires that same retained owner's basic/PCIe, FIFO and BDRAM Ready receipts before
 system-memory ring publication. The diagnostic probe still does not call it.
 Linux-C traces cover the four AX profiles and nonzero inherited register fields;
 negative models cover every access failure, ignored writes, dirty indices,
 device disappearance, both wait deadlines, cancellation and actual revocation.
 This closes internal partition/index and PCIe MAC-pre-init preparation only:
-PCI basic configuration, cold-power/startup composition, RX and IRQ ownership
-remain required, and Ready is neither a DMA-reclamation nor station proof.
+full post-firmware MAC/RF startup, RX and IRQ ownership remain required, and Ready is neither a DMA-reclamation nor station proof.
 
 Firmware commands have a24-byte TXWD body on A/B/51 and a16-byte RX-like
 descriptor on C. TXBD length includes descriptor plus command bytes; there
@@ -108,8 +113,9 @@ before retirement, and preserves the last eight consumed commands for the
 Linux multi-tag delay. Failed publication and Drop retain queued/quarantined
 DMA and the published ring. Only an independent hardware stop/idle/prefetch
 fence permits explicit reclamation; capability revocation or BME-off alone
-does not establish that proof. The backend remains inactive in the diagnostic
-probe until the complete PCIe/BDRAM/startup composition is implemented.
+does not establish that proof. The private cold/download composition activates
+this backend, while the diagnostic probe keeps it inactive until complete
+post-firmware MAC/RF and packet/station startup is implemented.
 
 The private `firmware_boot::Firmware<Transport>` retains the plan and prepared
 CH12 transport through one WCPU reset/download attempt. It checks chip identity
@@ -152,8 +158,9 @@ all four AX profiles with inherited zero and nonzero register seeds. The
 operation requires a powered, serialized, DMA-fenced device with PCI BME off;
 it publishes no system-memory rings. Failure or cancellation retains
 Configuring and refuses replay. The native CH12 preparation now retains this receipt with AX PCIe pre-init
-and BDRAM/mode setup. Cold-power/basic_cfg and WCPU activation composition
-remain necessary before this private primitive can be activated.
+and BDRAM/mode setup. The private cold/download owner now composes these with
+factory-qualified power/basic_cfg and WCPU activation; it grants no packet or
+station admission.
 
 The private `phy_access::Access` and its `NativeIo` adapter serialize AX PCIe
 PHY transactions: A/B/51 MDIO uses the exact Gen1/Gen2 page and five-bit
@@ -166,9 +173,9 @@ prevent failure or cancellation from reopening the same owner. Replacement
 requires an independently verified reset. Extracted Linux C traces cover
 MDIO read/write/masked writes and DBI byte enables; actual-capability RAM
 fixtures check native RAC offsets and revoked access before dereference.
-These access prerequisites now support exact AX MAC-pre-init PHY/quirk policy;
-PCI basic configuration, complete startup composition and packet/station
-ownership remain open.
+These access prerequisites now support exact AX MAC-pre-init PHY/quirk policy
+and PCI basic configuration within the private cold/download composition.
+Post-firmware MAC/RF startup and packet/station ownership remain open.
 
 The retained `pcie::Pcie` ports Linux AX MAC-pre-init PHY/power quirks,
 per-chip recovery/watchdog/debug settings and the exact truncated-BD,
@@ -188,6 +195,54 @@ negative models cover every access failure, each cancellable transaction edge,
 unsupported profiles/rates, ignored mode writes, disappearance and native
 revocation. This is PCIe MAC-pre-init policy, not PCI `basic_cfg` equalization,
 ASPM/L1SS, RF calibration, full MAC initialization or station readiness.
+
+`pci_basic::Basic` ports AX PCI basic_cfg independently of MAC-pre-init:
+C equalization/OOBS/offset and Gen2 gray-code filter calibration, completion
+timeout control and Realtek's internal CLKREQ/ASPM/L1SS modules follow actual
+host PCI capability enables. Standard/extended capability discovery is bounded,
+checks alignment/extents/cycles and refuses unavailable PCIe v2 controls.
+Native config words/dwords use naturally aligned, current-capability ECAM
+access; byte writes retain the explicit AX DBI fallback. A temporary C ASPM
+backup is restored on returned calibration failures; cancellation retains a
+non-reusable owner. Forty independent original-Linux-C cases cover all AX
+profiles, both link speeds, inherited zero/nonzero fields, calibrated versus
+uncalibrated C and host PM enabled/disabled. Fault/cancellation at every access,
+malformed capability lists and ignored control writes keep preparation closed.
+
+`factory::Factory` commits a complete actual DDV snapshot only after the
+1216-byte physical map, autoload-valid bit and physical0x5e9..0x5ed controls
+have been read successfully. It decodes factory MAC, logical RFE/XTAL/country,
+B's real power-k marker and secure fuse selection; independently compiled
+original Linux packed types establish all four AX field offsets. ECV must
+agree with the corrected 8851B cut. No I/O error becomes erased fuse/calibration
+defaults. Unknown/failed/cancelled snapshots expose no identity and reject reuse.
+
+`cold::Cold` retains one backend through actual normalized discovery power,
+factory reading, confirmed MAC-OFF, factory-only calibration qualification,
+PCI basic configuration and calibrated second power-on. Only that completed
+owner can transfer its backend and factory/basic receipts into native CH12
+ownership. `startup::Startup::claim` actually parks the function, maps BAR2 and
+reads its physical cut; A/C require the full watchdog aperture. `start` loads
+firmware after ECV correction, builds the fuse-bound download plan and composes
+owned FIFO/PCIe/BDRAM/mode/CH12 setup and WCPU initialization. It does not build
+a powered receipt from caller booleans or replace the retained PHY/DDV state.
+Returned failures and a dropped attempt run best-effort command-DMA/BME closure;
+published rings, command packets and uncertain multi-tag references remain
+retained. Revocation is checked before unmapped native claim access; the actual
+native cancellation fixture retains a published descriptor ring and packet.
+The shared TX-only activation models use independent original Linux profile
+constants and check that no intermediate write enables either RX layer.
+Composed power/factory tests exercise every access failure and cancellable edge,
+including inherited ON state, RFE5 and corrected ECV.
+
+This cold/WCPU path still requires an independently established old-DMA fence
+and exclusive function claim: BME-off, MAC-OFF and these retained receipts do
+not establish reclamation. It is private and does not run in the diagnostic
+probe, enable MSI/IRQ delivery, publish RX rings or register a network interface.
+A/51 programmed secure boot still needs authenticated board blacklist-policy
+loading; B/C retain Linux's version0 policy. Full MAC sys/TRX initialization,
+RF/BB tables/calibration, channel/power policy and station/IP composition remain
+separate software prerequisites before physical Wi-Fi acceptance.
 
 `efuse::read_mac(registers, ChipId, cut)` runs the AX DDV read lifecycle and
 decodes the two-byte sparse records. All four AX profiles use a 1216-byte
@@ -253,8 +308,8 @@ bring-up scaffolding and does not establish a working station runtime.
 | Prerequisite | State |
 |---|---|
 | AX DDV factory identity and cleanup | Implemented; shared-path regressions |
-| Complete per-chip power/PCIe initialization | Native power-on/off, inherited-state normalization, DLFW DLE/HFC and retained internal BDRAM/index setup implemented with Linux-C traces; exact AX PCIe MAC-pre-init PHY/quirk/mode policy also implemented; PCI basic_cfg and cold-power/probe composition remain |
-| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans, native CH12 ownership and retained WCPU loading implemented; full PCIe activation and startup composition remain |
+| Complete per-chip power/PCIe initialization | Native power-on/off, inherited-state normalization, DLFW DLE/HFC and retained internal BDRAM/index setup implemented with Linux-C traces; exact AX PCIe MAC-pre-init PHY/quirk/mode policy also implemented; PCI basic_cfg and actual factory-qualified cold discovery/runtime-power composition implemented; full MAC/RF startup and probe integration remain |
+| Firmware container/profile selection, CH12 DMA, WCPU handshakes | Checked AX selection, native fuse reads, coupled secure plans, native CH12 ownership and retained WCPU loading implemented; owned cold-to-CH12/WCPU composition and TX-only BME activation implemented; full packet/RF startup and A/51 secure-policy loading remain |
 | Ring quiesce/publication, BDRAM setup, IRQ ownership and recovery | Internal BDRAM partition/reset and actual zero-index readback implemented; independent old-DMA fencing, full ring/IRQ ownership and recovery remain |
 | AX initial native TX layout and bounded completion ownership | Shared production backend implemented and model-tested; not yet activated by station/firmware owner |
 | RPQ release handling, RX assembly/validation and frame delivery | Incomplete |

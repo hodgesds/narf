@@ -117,6 +117,16 @@ pub(super) fn program(
     prepare(&mut Registers::new(mmio, cap), image)
 }
 
+pub(super) fn program_live_power(
+    io: &mut impl RegisterIo,
+    image: &[u8; EEPROM_4K_BYTES],
+    ceiling: u8,
+) -> Result<(), BringUpError> {
+    // Detector geometry already belongs to the unchanged channel1 reference.
+    // Re-plan all factory/CTL/antenna-limited rates before live calibration.
+    rates::program(io, image, 2412, ceiling)
+}
+
 mod channel;
 mod modal;
 mod power;

@@ -396,6 +396,9 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
     async fn disassociate(&self) -> Result<(), WirelessError> {
         self.link(None);
         let mut state = self.state.lock().await;
+        // A previous association/progress owner may have published up while
+        // this caller waited. Serialize the final close with those publishers.
+        self.link(None);
         state.clear_transmit();
         state.service.disconnect().await.map_err(wireless_error)
     }
@@ -405,6 +408,47 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         } else {
             Err(WirelessError::NotSupported)
         }
+    }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(super) mod publication_test {
+    use super::*;
+    use core::{future::Future, pin::pin, task::Context};
+
+    /// The composed USB fixture supplies the joined production service. Keep
+    /// private state access here rather than exposing it to sibling fixtures.
+    pub(in crate::rtl8xxxu) async fn disconnect_after_old_publication<
+        C: ControlIo + 'static,
+        B: PacketIo + 'static,
+        E: Environment + 'static,
+    >(
+        device: &Device<C, B, E>,
+        peer: [u8; 6],
+    ) -> Result<(), &'static str> {
+        let state = device.state.try_lock().ok_or("EU fixture state busy")?;
+        let mut disconnect = pin!(device.disassociate());
+        if disconnect
+            .as_mut()
+            .poll(&mut Context::from_waker(core::task::Waker::noop()))
+            .is_ready()
+            || device.link_up()
+            || device.connected_bssid().is_some()
+        {
+            return Err("EU disconnect did not close before waiting for state");
+        }
+        if state.service.connected_peer() != Some(peer) {
+            return Err("EU fixture lacks the previous authorized publisher");
+        }
+        // The same publication as progress(), still under its state guard.
+        device.link(state.service.connected_peer());
+        if !device.link_up() || device.connected_bssid() != Some(peer) {
+            return Err("EU previous publisher did not recreate the interleaving");
+        }
+        drop(state);
+        disconnect
+            .await
+            .map_err(|_| "EU interleaved USB disconnect")
     }
 }
 fn validate_scan(request: &ScanRequest) -> Result<u64, WirelessError> {

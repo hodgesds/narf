@@ -901,6 +901,9 @@ impl WirelessNetIface for Device {
         self.set_link(false);
         self.finish_control().await;
         let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
+        // Association/roam publish up under state. Repeat the close after
+        // acquiring it in case an earlier owner finished while we waited.
+        self.set_link(false);
         state.clear_transmit();
         state.eapol.clear();
         if let Some(connection) = state.connection.take() {

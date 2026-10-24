@@ -25,8 +25,13 @@ impl From<AccessError> for Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Profile {
     hp: bool,
+    antenna: u8,
+    identity: [u8; 32],
 }
 impl Profile {
+    pub(super) fn is_hp(self) -> bool {
+        self.hp
+    }
     pub fn from_factory(factory: &super::efuse::Factory) -> Result<Self, Error> {
         let map = &factory.logical;
         let word = |at| u16::from_le_bytes([map[at], map[at + 1]]);
@@ -35,6 +40,8 @@ impl Profile {
         }
         Ok(Self {
             hp: matches!(map[0xc5], 0 | 255) && word(0xda) == 0x103c && word(0xdc) == 0x197d,
+            antenna: if map[0xc9] == 255 { 1 } else { map[0xc9] },
+            identity: factory_identity(factory),
         })
     }
 }
@@ -45,6 +52,13 @@ pub struct Report {
     pub recovery: [u32; 9],
     pub channel_rf: u32,
     pub cck_high_power: bool,
+    pub(super) identity: [u8; 32],
+}
+pub(super) fn factory_identity(factory: &super::efuse::Factory) -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(&factory.mac);
+    hash.update(&factory.logical);
+    hash.finalize()
 }
 /// Read-only per-rate PG offsets are kept for the later EFUSE/channel power
 /// owner; these are NOT hardware-register writes and grant no TX authority.
@@ -131,6 +145,56 @@ pub(super) fn parked(io: &impl Io) -> Result<(), Error> {
     Ok(())
 }
 
+pub(super) async fn channel(
+    io: &impl Io,
+    report: &Report,
+    permission: super::channel_power::Permission,
+) -> Result<u32, Error> {
+    parked(io)?;
+    let (cck, ofdm) = permission.gains();
+    io.write8(0x522, 0xff)?;
+    bb(io, 0xe08, 0x0000ff00, u32::from(cck[0])).await?;
+    bb(
+        io,
+        0x86c,
+        0xffffff00,
+        u32::from(cck[1]) | (u32::from(cck[2]) << 8) | (u32::from(cck[3]) << 16),
+    )
+    .await?;
+    for (reg, bytes) in [0xe00, 0xe04].into_iter().zip(ofdm.chunks_exact(4)) {
+        io.write32(reg, u32::from_le_bytes(bytes.try_into().unwrap()))?;
+    }
+    // This initial profile emits legacy rates only; no MCS descriptor is
+    // admitted and no unqualified HT power envelope is assumed.
+    for reg in [0xe10, 0xe14, 0xe18, 0xe1c] {
+        io.write32(reg, 0)?;
+    }
+    let opmode = io.read8(0x603)?;
+    io.write8(0x603, opmode | 4)?;
+    bb(io, 0x800, 1, 0).await?;
+    bb(io, 0x900, 1, 0).await?;
+    let rf = (report.channel_rf & !0xfff) | 0xc00 | u32::from(permission.channel());
+    rf_write(io, 0x18, rf).await?;
+    io.delay_us(10_000).await;
+    if rf_read(io, 0x18).await? != rf
+        || io.read8(0x603)? & 4 == 0
+        || read(io, 0x800)? & 1 != 0
+        || read(io, 0x900)? & 1 != 0
+        || (read(io, 0xe08)? >> 8) & 255 != u32::from(cck[0])
+        || read(io, 0x86c)? >> 8
+            != u32::from(cck[1]) | (u32::from(cck[2]) << 8) | (u32::from(cck[3]) << 16)
+    {
+        return Err(Error::Gate);
+    }
+    for (reg, bytes) in [0xe00, 0xe04].into_iter().zip(ofdm.chunks_exact(4)) {
+        if read(io, reg)? != u32::from_le_bytes(bytes.try_into().unwrap()) {
+            return Err(Error::Gate);
+        }
+    }
+    parked(io)?;
+    Ok(rf)
+}
+
 pub(super) async fn configure(io: &impl Io, profile: Profile) -> Result<Report, Error> {
     parked(io)?;
     for &[reg, value] in tables::MAC {
@@ -186,6 +250,17 @@ pub(super) async fn configure(io: &impl Io, profile: Profile) -> Result<Report, 
     }
     bb(io, 0x870, 1 << 4, environment).await?;
     let channel_rf = rf_read(io, 0x18).await? & 0xfff00fff;
+    // hw_init selects the factory/OEM idle antenna before IQK. Keep the
+    // static path throughout this measured legacy profile; dynamic antenna
+    // selection and its descriptor overrides are not admitted.
+    let main = profile.antenna == 2 || (profile.antenna == 1 && profile.hp);
+    bb(io, 0x870, 0x300, 0).await?;
+    bb(io, 0x914, 0xffff, 0x201).await?;
+    bb(io, 0x860, 0x7000, u32::from(!main)).await?;
+    bb(io, 0x864, 0x38, u32::from(!main)).await?;
+    if profile.antenna == 2 {
+        bb(io, 0xb2c, 1 << 31, u32::from(!main)).await?;
+    }
     let (iqk, recovery) = calibrate(io).await?;
     lck(io).await?;
     parked(io)?;
@@ -194,6 +269,7 @@ pub(super) async fn configure(io: &impl Io, profile: Profile) -> Result<Report, 
         recovery,
         channel_rf,
         cck_high_power,
+        identity: profile.identity,
     })
 }
 
@@ -501,4 +577,4 @@ async fn lck(io: &impl Io) -> Result<(), Error> {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "radio_tests.rs"]
-mod tests;
+pub(super) mod tests;

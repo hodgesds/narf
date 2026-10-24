@@ -24,6 +24,8 @@ pub struct Native {
     io: NativeIo,
     bdram: super::bdram::Bdram,
     pcie: super::pcie::Pcie,
+    basic: super::pci_basic::Basic,
+    factory: Option<super::factory::Factory>,
     fifo: super::fifo::Fifo,
     cut: u8,
     device: BusDevice,
@@ -71,8 +73,43 @@ impl Native {
             return Err(Error::Unsupported);
         }
         // SAFETY: caller's exclusive, same-device Device-mapped BAR contract.
-        let mut io =
-            unsafe { NativeIo::new(mmio, authority, chip, cut) }.map_err(|_| Error::Access)?;
+        let io = unsafe { NativeIo::new(mmio, authority, chip, cut) }.map_err(|_| Error::Access)?;
+        Self::allocate(
+            super::cold_native::Owned {
+                io,
+                device,
+                authority,
+            },
+            depth,
+            super::pci_basic::Basic::default(),
+            None,
+        )
+    }
+    pub(super) fn from_cold(
+        prepared: super::cold::Prepared<super::cold_native::Owned>,
+        depth: u16,
+    ) -> Result<Self, Error> {
+        let (backend, basic, factory) = prepared.into_parts();
+        let identity = factory.identity().ok_or(Error::Terminal)?;
+        if backend.io.profile() != (identity.chip(), identity.cut())
+            || basic.state() != super::pci_basic::State::Ready
+        {
+            return Err(Error::Terminal);
+        }
+        Self::allocate(backend, depth, basic, Some(factory))
+    }
+    fn allocate(
+        backend: super::cold_native::Owned,
+        depth: u16,
+        basic: super::pci_basic::Basic,
+        factory: Option<super::factory::Factory>,
+    ) -> Result<Self, Error> {
+        let super::cold_native::Owned {
+            mut io,
+            device,
+            authority,
+        } = backend;
+        let (chip, cut) = io.profile();
         let regs = addr_set_for_chip(chip).tx[12];
         // Actual register operation invokes current authority before allocating.
         if io.read32(regs.idx as u32).map_err(|_| Error::Access)? == u32::MAX {
@@ -99,6 +136,8 @@ impl Native {
             io,
             bdram: super::bdram::Bdram::default(),
             pcie: super::pcie::Pcie::default(),
+            basic,
+            factory,
             fifo: super::fifo::Fifo::default(),
             cut,
             device,
@@ -112,6 +151,86 @@ impl Native {
             state: State::Unpublished,
         })
     }
+    pub(super) fn identity(&self) -> Option<super::factory::Identity> {
+        self.factory.as_ref().and_then(|factory| factory.identity())
+    }
+    /// Activate only the retained CH12 path. No RX base is published: both RX
+    /// HCI layers stay disabled, WPDMA and every packet TX channel stay stopped.
+    /// PCI BME is the final publication and is read back under current authority.
+    pub(super) fn enable_download(&mut self) -> Result<(), Error> {
+        if self.state != State::Configured
+            || self.identity().is_none()
+            || self.basic.state() != super::pci_basic::State::Ready
+            || self.pcie.state() != super::pcie::State::Ready
+            || self.bdram.state() != super::bdram::State::Ready
+            || self.fifo.state() != super::fifo::State::Ready
+        {
+            return Err(Error::Terminal);
+        }
+        self.state = State::Terminal;
+        let command = self.command()?;
+        if command & (narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE)
+            != narf_bus::pci::cmd::MEM_SPACE
+        {
+            return Err(Error::Busy);
+        }
+        let index = self
+            .io
+            .read32(self.regs.idx as u32)
+            .map_err(|_| Error::Access)?;
+        if index == u32::MAX || index & 0x0fff_0fff != 0 {
+            return Err(Error::BadIndex);
+        }
+        super::download_dma::prepare(&mut self.io, self.chip).map_err(|_| Error::Access)?;
+        crate::rtw88::pci_park::invoke(&self.authority, || {
+            narf_bus::pci::set_command(
+                &self.authority,
+                &self.device,
+                narf_bus::pci::cmd::BUS_MASTER,
+            )?;
+            narf_bus::pci::read_command(&self.authority, &self.device)
+        })
+        .map_err(|_| Error::Access)?
+        .map_err(|_| Error::Access)?;
+        if self.command()? & (narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE)
+            != (narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE)
+        {
+            return Err(Error::Access);
+        }
+        self.activate_registers()
+    }
+    /// Best-effort closure only. All published DMA remains retained because
+    /// register stop/BME-off alone does not prove posted transactions drained.
+    pub(super) fn fail(&mut self) {
+        self.state = State::Terminal;
+        if let Ok(value) = self.io.read32(0x1010) {
+            if value != u32::MAX {
+                let tx = if matches!(self.chip, ChipId::Rtl8852A | ChipId::Rtl8852C) {
+                    0x7ff00
+                } else {
+                    0x70f00
+                };
+                let _ = self.io.write32(0x1010, value | tx | (1 << 19));
+            }
+        }
+        let mask = if self.chip == ChipId::Rtl8852C {
+            (1 << 15) | (1 << 7)
+        } else {
+            (1 << 13) | (1 << 11)
+        };
+        if let Ok(value) = self.io.read32(0x1000) {
+            if value != u32::MAX {
+                let _ = self.io.write32(0x1000, value & !mask);
+            }
+        }
+        let _ = crate::rtw88::pci_park::invoke(&self.authority, || {
+            narf_bus::pci::clear_command(
+                &self.authority,
+                &self.device,
+                narf_bus::pci::cmd::BUS_MASTER,
+            )
+        });
+    }
     fn command(&self) -> Result<u16, Error> {
         crate::rtw88::pci_park::invoke(&self.authority, || {
             narf_bus::pci::read_command(&self.authority, &self.device)
@@ -124,15 +243,16 @@ impl Native {
     ///
     /// # Safety
     /// Same independently fenced, powered, exclusive device contract as new.
-    /// PCI basic_cfg and qualified platform quirks must already be known;
+    /// Qualified platform quirks must already be known;
     /// `ber` carries the exact platform PCI_BER quirk. This composes DLFW
     /// DLE/HFC, AX PCIe pre-init and stopped BDRAM/mode preparation, but does
-    /// not establish full PCIe basic configuration or DMA readiness.
+    /// includes retained PCI basic_cfg and does not establish DMA readiness.
     pub async unsafe fn prepare_bdram(&mut self, ber: bool) -> Result<(), Error> {
         if self.state != State::Unpublished
             || self.bdram.state() != super::bdram::State::New
             || self.pcie.state() != super::pcie::State::New
             || self.fifo.state() != super::fifo::State::New
+            || self.basic.state() == super::pci_basic::State::Preparing
         {
             return Err(Error::Terminal);
         }
@@ -149,6 +269,18 @@ impl Native {
         // SAFETY: caller's retained reset/serialization contract and the live
         // PCI command check above. NativeIo invokes authority for every MMIO.
         let result = async {
+            if self.basic.state() == super::pci_basic::State::New {
+                let mut access = super::pcie_native::Native {
+                    io: &mut self.io,
+                    device: &self.device,
+                    authority: &self.authority,
+                };
+                // SAFETY: same function, independently fenced old DMA and live
+                // BME-off command proof above; no producer or PM/reset owner.
+                unsafe {
+                    self.basic.prepare(&mut access, self.chip).await?;
+                }
+            }
             // SAFETY: retained fenced, powered, BME-off exclusive device.
             unsafe {
                 self.fifo.prepare(&mut self.io, self.chip).await?;
@@ -192,6 +324,7 @@ impl Native {
             || self.bdram.state() != super::bdram::State::Ready
             || self.pcie.state() != super::pcie::State::Ready
             || self.fifo.state() != super::fifo::State::Ready
+            || self.basic.state() != super::pci_basic::State::Ready
         {
             return Err(Error::Terminal);
         }
@@ -381,6 +514,7 @@ impl Native {
 impl Drop for Native {
     fn drop(&mut self) {
         if self.armed {
+            self.fail();
             if let Some(ring) = self.ring.take() {
                 core::mem::forget(ring);
             }

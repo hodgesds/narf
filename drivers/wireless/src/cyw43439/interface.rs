@@ -380,6 +380,9 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     async fn disassociate(&self) -> Result<(), WirelessError> {
         self.link(None);
         let mut state = self.state.lock().await;
+        // Close again under the same lock as association/progress publication:
+        // an earlier owner may have published up while disconnect waited.
+        self.link(None);
         state.clear_transmit();
         state.station.disconnect().await.map_err(wireless_error)
     }

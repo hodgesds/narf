@@ -74,10 +74,10 @@ initial station profile: scan, Open/WPA2-PSK, DHCP and bidirectional IP, with
 controlled-port closure and safe transport ownership on disconnect/failure.
 Automatic recovery, wider PHY/chip coverage and power management are separate
 follow-ups where the initial profile deliberately requires a fresh device
-lifecycle. Six families have composed kernel-DHCP paths (Intel Sc, MT76,
-ath11k, RTL8188EU, CYW43439 and BCM43602); exact authenticated firmware,
+lifecycle. Seven families have composed kernel-DHCP paths (Intel Sc, MT76,
+ath11k, ath10k, RTL8188EU, CYW43439 and BCM43602); exact authenticated firmware,
 board/calibration/policy provisioning and the family-specific gaps below
-still prevent an all-driver hardware-ready claim. Ath9k, ath10k, RTL8188EE,
+still prevent an all-driver hardware-ready claim. Ath9k, RTL8188EE,
 RTW88 and RTW89 still need substantial radio/station/packet implementation.
 
 Intel now sends versioned coexistence, SoC latency and awake-power setup.
@@ -125,15 +125,24 @@ A RAW-capable, non-PFC legacy station owner now composes descriptor/peer/TID
 admission, shared host RSNA/CCMP, exact native HTT delivery receipts and
 bidirectional Ethernet/IP across all six dialects. Firmware RAW INIT and
 A-MSDU1 are required before software crypto; opaque native-WiFi RX is not
-treated as ciphertext. Synchronous CE/HTC/HTT packet progress, kernel-DHCP
-interface attachment and bounded connection-loss service remain software work.
+treated as ciphertext. The same retained native owner now implements bounded
+synchronous CE/HTC/HTT packet progress, netdev attachment, kernel DHCP and
+connection-loss closure. All six dialects compose Open/WPA2 with a reactive
+AP through a real lease and exact bidirectional IP. Current signed policy is
+resampled before control and packet progress; tightening or removal closes
+the initial profile permanently. Publication is serialized with terminal
+closure, while M4 waits for its exact HTT receipt rather than CE consumption.
 PFC, broader RX/security profiles and reset/rejoin remain separate follow-ups.
 Ath9k programs AR9285 inactive PHY/PLL/RF INI, EEPROM modal and PDADC detector
 tables with current-capability register access. Factory CTL edges and target
 power now bound the rate-power registers under an explicit zero-dBm ceiling.
 Native legacy20 mode/timeouts, single-chain masks, delta slope and EEPROM
 spur filtering now match 48 original Linux C traces after full INI setup;
-analog calibration and packet/station ownership remain open. Ath11k QCA6390 has
+signed-policy channel1 calibration now additionally composes SerDes, synth
+settling, AGC/carrier-leakage retry, PA, noise-floor and IQ correction. Thirty-two
+original Linux C traces and 35 IQ vectors cover that sequence; per-access
+failures, deadlines, cancellation and revocation leave the same retained
+attempt closed. Packet DMA and station ownership remain open. Ath11k QCA6390 has
 its native IPQ8074 RX path and four-vdev resources; QCN9074 remains gated.
 Realtek has per-family identity/power work, a retained RTL8188EU factory/FIFO/
 firmware/MAC/BB/RF/LLT plus LC/IQK worker and bounded native RTW89 TX ownership.
@@ -156,8 +165,12 @@ through LLT and distinct linked TX/RX ring preparation, retained before native
 publication. Its factory-qualified continuation now programs complete native
 MAC/BB/AGC/RF tables and runs 1T IQK/LCK with retained matrix and per-rate PG
 offsets. Native C traces cover the full register/delay sequence, while failure
-and cancellation keep DMA parked. Channel/EFUSE power, active DMA/IRQ and
-station service remain software work.
+and cancellation keep DMA parked. Its channel/power owner now binds factory
+EFUSE/PG indices to an authenticated exact-board curve, current host policy and
+the independent Linux EE world ceiling. A native polled packet core retains
+those same linked descriptors and buffers through publication and stop. Its
+EE-only ring map, complete DMA extents, terminal OWN receipts and RX admission
+are checked independently; native station/security/DHCP attachment remains open.
 RTL8822CE now retains an authenticated section-firmware attempt through native
 all-ring-owned beacon reserved pages and IDDMA. Success parks DMA; ambiguous or
 cancelled mappings stay pinned. Complete MAC/RF, firmware commands, ordinary
@@ -174,11 +187,18 @@ and gates CH12 ring-base publication on its retained Ready receipt. Native
 preparation now retains DLFW DLE/HFC, exact AX PCIe policy/PHY quirks and the
 stopped mode/BDRAM sequence together before CH12 ring configuration. Forty
 original Linux C cases cover all four AX profiles, cuts, PHY generations and
-inherited fields. PCI basic configuration, complete cold-power/firmware startup,
-packet/RF/IRQ and station work remain. Its diagnostic probe retains unpublished storage without activating
+inherited fields. The private cold path now composes actual cut/factory reads,
+confirmed power-off qualification, complete PCI basic/PHY policy and TX-only
+CH12/WCPU startup with RX closed and PCI bus mastering last. Another 40 Linux C
+cases cover PCI basic configuration. Post-firmware MAC/TRX, RF/channel,
+packet/station service and probe attachment remain. Its diagnostic probe retains unpublished storage without activating
 rings, IRQs or a NIC.
 Scoped native PCIe PHY/DBI operations now provide bounded MDIO/RAC access with
 retained failure/cancellation exclusion.
+EU, CYW/common FullMAC and Intel teardown now repeat carrier closure under
+the device state mutex, preventing a waiting old publisher from raising stale
+carrier during disconnect. Deterministic interleaving tests check the actual
+teardown result before any later maintenance poll repairs state.
 USB retains published address/configuration/control/bulk DMA, checks slot
 generations and implements explicit Stop/Set-Dequeue fencing for the supported
 bulk profile; halt/reset/replug and broader reclamation remain software work.
@@ -246,9 +266,9 @@ loading, revocation, failure, cache reuse and concurrent caller policy.
 
 The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
 wireless, network, crypto, RNG, firmware and shared-fixture QEMU gates:
-x86_64 reports 2720 pass / 0 fail / 22 skip; aarch64 reports
-2016 pass / 0 fail / 16 skip. The radio/data continuation adds 16 smokes;
-all pass on both architectures alongside the prior native-station coverage.
+x86_64 reports 2755 pass / 0 fail / 22 skip; aarch64 reports
+2051 pass / 0 fail / 16 skip. The native-service/calibration continuation
+adds 35 smokes; all pass on both architectures alongside the prior coverage.
 Both include a clean production boot and btrfs interoperability postflight.
 Host tests, release/debug builds, targeted Clippy across the kernel feature
 contexts, workspace formatting, and MT76 module build/Clippy pass.

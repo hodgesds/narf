@@ -39,6 +39,9 @@ impl NativeIo {
             phy: super::phy_access::Access::default(),
         })
     }
+    pub(super) fn profile(&self) -> (ChipId, u8) {
+        (self.chip, self.cut)
+    }
     fn checked<T>(
         &self,
         address: u32,

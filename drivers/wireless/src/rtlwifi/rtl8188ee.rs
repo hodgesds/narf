@@ -26,6 +26,18 @@ pub const MMIO_SIZE: usize = 0x4000;
 /// Source: `rtl8188ee/hw.c` — `EFUSE_MAP_SIZE` is 256 for 88E.
 pub const EFUSE_MAP_SIZE: usize = 256;
 
+// Exact linked-ring base register map, rtl8188ee/reg.h:138..145.
+// RTL8192EE instead uses TXBDs and moves HQ/RX; its mac.rs map must not
+// supply these offsets merely because the descriptor bases start at308.
+pub const REG_BCNQ_DESA: u16 = 0x308;
+pub const REG_HQ_DESA: u16 = 0x310;
+pub const REG_MGQ_DESA: u16 = 0x318;
+pub const REG_VOQ_DESA: u16 = 0x320;
+pub const REG_VIQ_DESA: u16 = 0x328;
+pub const REG_BEQ_DESA: u16 = 0x330;
+pub const REG_BKQ_DESA: u16 = 0x338;
+pub const REG_RX_DESA: u16 = 0x340;
+
 // ── Chip version identifiers ──────────────────────────────────────────────
 //
 // Source: `rtl8188ee/def.h::enum version_8188e`.

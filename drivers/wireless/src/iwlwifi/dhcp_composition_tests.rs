@@ -970,3 +970,67 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/dhcp",
     smoke_sc_disconnect_cancellation_and_wrong_receipt_retain_queue_owner
 );
+
+fn smoke_sc_disconnect_overrides_waiting_old_link_publication() -> TestResult {
+    check(|| {
+        let guard = Guard::new(false, Fault::None)?;
+        let device = guard.device();
+        scan(device)?;
+        run(
+            device.associate_in_domain(request(false), &policy()),
+            service,
+        )?
+        .map_err(|_| "Sc racing disconnect setup association")?;
+        carrier(device, true)?;
+        let control = device.control.try_lock().ok_or("Sc fixture control busy")?;
+        let state = device.state.try_lock().ok_or("Sc fixture state busy")?;
+        let mut disconnect = Box::pin(device.disassociate());
+        require(
+            disconnect
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "Sc disconnect did not wait for prior control owner",
+        )?;
+        carrier(device, false)?;
+        require(
+            device.connected_bssid().is_none(),
+            "Sc early disconnect left cached BSSID",
+        )?;
+        // Complete the old association's publication under its state guard,
+        // after disconnect's early close but before it can acquire state.
+        require(
+            state.connection.as_ref().is_some_and(|c| c.authorized),
+            "Sc fixture lacks the previous authorized publisher",
+        )?;
+        device.store_bssid(AP);
+        device.set_link(true);
+        carrier(device, true)?;
+        drop(state);
+        drop(control);
+        run(disconnect, service)?.map_err(|_| "Sc interleaved native disconnect")?;
+        // No Device.step runs between teardown and these observations.
+        carrier(device, false)?;
+        require(
+            device.connected_bssid().is_none()
+                && narf_net::iface::lookup(device.name()).is_some_and(|i| {
+                    !i.link_up && i.carrier_up_count == 2 && i.carrier_down_count == 2
+                }),
+            "Sc old publisher reopened cached peer after completed disconnect",
+        )?;
+        let state = device
+            .state
+            .try_lock()
+            .ok_or("Sc teardown retained state lock")?;
+        require(
+            state.connection.is_none()
+                && !state.needs_reset
+                && model::retained(&state.hardware) == (0, 0, 0),
+            "Sc racing disconnect left native peer/queue ownership",
+        )
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/dhcp",
+    smoke_sc_disconnect_overrides_waiting_old_link_publication
+);

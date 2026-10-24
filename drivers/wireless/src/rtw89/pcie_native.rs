@@ -16,8 +16,16 @@ pub(super) struct Native<'a> {
 }
 impl Native<'_> {
     fn config<T>(&self, address: u16, operation: impl FnOnce(*mut u8) -> T) -> Result<T, Error> {
+        self.config_width(address, 1, operation)
+    }
+    fn config_width<T>(
+        &self,
+        address: u16,
+        width: u16,
+        operation: impl FnOnce(*mut u8) -> T,
+    ) -> Result<T, Error> {
         crate::rtw88::pci_park::invoke(self.authority, || {
-            if address >= 4096 {
+            if address & (width - 1) != 0 || u32::from(address) + u32::from(width) > 4096 {
                 return Err(Error::Access);
             }
             let narf_bus::BusKind::Pcie { cfg_phys, .. } = self.device.kind else {
@@ -57,6 +65,26 @@ impl Interface for Native<'_> {
             Ok(()) => Ok(()),
             Err(_) => self.io.write_dbi(address, value).await,
         }
+    }
+    async fn config_read16(&mut self, address: u16) -> Result<u16, Error> {
+        self.config_width(address, 2, |pointer| {
+            // SAFETY: complete aligned same-function ECAM word in current invocation.
+            u16::from_le(unsafe { core::ptr::read_volatile(pointer.cast::<u16>()) })
+        })
+    }
+    async fn config_read32(&mut self, address: u16) -> Result<u32, Error> {
+        self.config_width(address, 4, |pointer| {
+            // SAFETY: complete aligned same-function ECAM dword in current invocation.
+            u32::from_le(unsafe { core::ptr::read_volatile(pointer.cast::<u32>()) })
+        })
+    }
+    async fn config_write16(&mut self, address: u16, value: u16) -> Result<(), Error> {
+        self.config_width(address, 2, |pointer| {
+            // SAFETY: exact aligned control word; adjacent RW1C status is untouched.
+            unsafe {
+                core::ptr::write_volatile(pointer.cast::<u16>(), value.to_le());
+            }
+        })
     }
     async fn phy_read(&mut self, generation: Generation, address: u8) -> Result<u16, Error> {
         self.io.read_phy(generation, address).await
@@ -177,6 +205,15 @@ mod tests {
         {
             return TestResult::Fail("revoked PCIe owner touched BAR");
         }
+        let mut basic = super::super::pci_basic::Basic::default();
+        // SAFETY: the revoked model must reject before direct RAC or ECAM access.
+        if ready(unsafe { basic.prepare(&mut access, ChipId::Rtl8852C) })
+            != Some(Err(Error::Access))
+            || basic.state() != super::super::pci_basic::State::Preparing
+            || words != before
+        {
+            return TestResult::Fail("revoked PCI basic configuration touched hardware");
+        }
         let mut called = false;
         if access
             .config(0x719, |_| {
@@ -187,6 +224,18 @@ mod tests {
             || words != before
         {
             return TestResult::Fail("revoked byte configuration accessed ECAM");
+        }
+        for (address, width) in [(1, 2), (4095, 2), (4094, 4)] {
+            let mut called = false;
+            if access
+                .config_width(address, width, |_| {
+                    called = true;
+                })
+                .is_ok()
+                || called
+            {
+                return TestResult::Fail("invalid native config width reached ECAM");
+            }
         }
         TestResult::Pass
     }

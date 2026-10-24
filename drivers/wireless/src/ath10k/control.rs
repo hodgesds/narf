@@ -4,6 +4,7 @@
 //! on cancellation or malformed replies.
 use super::{bmi::BmiError, hw::HwRev};
 use alloc::{collections::VecDeque, vec::Vec};
+pub(super) type ReceiveProgress = (bool, Option<(u8, Vec<u8>)>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -21,6 +22,15 @@ impl From<BmiError> for Error {
     }
 }
 pub(super) trait Hif {
+    fn source_ready(&mut self, _pipe: u8) -> Result<bool, BmiError> {
+        Err(BmiError::Unsupported)
+    }
+    fn begin_send(&mut self, _pipe: u8, _bytes: &[u8]) -> Result<(), BmiError> {
+        Err(BmiError::Unsupported)
+    }
+    fn poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        Err(BmiError::Unsupported)
+    }
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError>;
     async fn receive(&mut self, budget_ms: u64) -> Result<(u8, Vec<u8>), BmiError>;
     /// Optional idle-safe progress. A timeout of an outstanding protocol wait
@@ -30,6 +40,15 @@ pub(super) trait Hif {
     }
 }
 impl Hif for super::boot::PciBoot {
+    fn source_ready(&mut self, pipe: u8) -> Result<bool, BmiError> {
+        self.hif_source_ready(pipe)
+    }
+    fn begin_send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        self.hif_begin_send(pipe, bytes)
+    }
+    fn poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        self.hif_poll_now()
+    }
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
         self.hif_send(pipe, bytes).await
     }
@@ -363,6 +382,13 @@ impl<T: Hif> Session<T> {
         if !self.started || self.failed {
             return Err(Error::Failed);
         }
+        let frame = self.htt_frame(payload)?;
+        self.failed = true;
+        self.transport.send(4, &frame).await?;
+        self.failed = false;
+        Ok(())
+    }
+    fn htt_frame(&mut self, payload: &[u8]) -> Result<Vec<u8>, Error> {
         let endpoint = &mut self.endpoints[self.htt as usize];
         if endpoint.service != 0x300
             || endpoint.flow
@@ -371,7 +397,6 @@ impl<T: Hif> Session<T> {
         {
             return Err(Error::Malformed);
         }
-        self.failed = true;
         let mut frame = owned(&[0; 8])?;
         frame
             .try_reserve_exact(payload.len())
@@ -381,16 +406,51 @@ impl<T: Hif> Session<T> {
         frame[5] = endpoint.sequence;
         endpoint.sequence = endpoint.sequence.wrapping_add(1);
         frame.extend_from_slice(payload);
-        self.transport.send(endpoint.pipe, &frame).await?;
+        Ok(frame)
+    }
+    pub fn htt_source_ready(&mut self) -> Result<bool, Error> {
+        if !self.started || self.failed {
+            return Err(Error::Failed);
+        }
+        self.transport.source_ready(4).map_err(Error::from)
+    }
+    pub fn begin_htt(&mut self, payload: &[u8]) -> Result<(), Error> {
+        if !self.htt_source_ready()? {
+            return Err(Error::Transport(BmiError::Dma(super::dma::DmaError::Busy)));
+        }
+        let frame = self.htt_frame(payload)?;
+        self.failed = true;
+        self.transport.begin_send(4, &frame)?;
         self.failed = false;
         Ok(())
+    }
+    pub fn poll_now(&mut self) -> Result<ReceiveProgress, Error> {
+        if !self.started || self.failed {
+            return Err(Error::Failed);
+        }
+        self.failed = true;
+        if let Some(payload) = self.payloads.pop_front() {
+            self.failed = false;
+            return Ok((true, Some(payload)));
+        }
+        let wire = match self.pending_wire.pop_front() {
+            Some(wire) => Some(wire),
+            None => self.transport.poll_now()?,
+        };
+        let progressed = wire.is_some();
+        if let Some((pipe, bytes)) = wire {
+            self.accept(pipe, &bytes)?;
+        }
+        let payload = self.payloads.pop_front();
+        self.failed = false;
+        Ok((progressed, payload))
     }
     pub async fn poll(&mut self) -> Result<Option<(u8, Vec<u8>)>, Error> {
         self.poll_with_progress().await.map(|(_, payload)| payload)
     }
     /// Credit-only input is progress, even though it carries no payload.
     /// Only an empty nonblocking HIF poll establishes receive quiescence.
-    pub async fn poll_with_progress(&mut self) -> Result<(bool, Option<(u8, Vec<u8>)>), Error> {
+    pub async fn poll_with_progress(&mut self) -> Result<ReceiveProgress, Error> {
         if !self.started || self.failed {
             return Err(Error::Failed);
         }

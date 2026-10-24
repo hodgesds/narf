@@ -1,8 +1,8 @@
 # rtlwifi — Specification
 
-> Status: retained RTL8188EE firmware, inactive native rings and factory-qualified
-> MAC/BB/RF tables with IQ/LC calibration; channel/power, packet/IRQ and station
-> software remains incomplete.
+> Status: retained RTL8188EE firmware, factory-qualified MAC/BB/RF/IQ/LC,
+> signed channel/power, parked operational MAC and native polled packet/stop
+> core are software covered. Station service and physical validation remain.
 
 ## 1. Purpose & scope
 
@@ -21,9 +21,11 @@ DMA, unmask device IRQs or report association success.
 Realtek command policy: clear `BUS_MASTER`, enable `MEM_SPACE | INTX_DISABLE`,
 and read back the command register. Any access failure, retained BME or missing
 requested decoding fails before BAR mapping. Bus mastering remains disabled
-on success and every later error; identity and ring allocation do not authorize
-DMA. A repeat probe of the retained bus address returns without configuration access; a distinct additional singleton match parks only its own PCI function. Re-enabling
-BME requires a future complete firmware/ring/reset owner.
+through probe and the native worker's `MacConfigured` boundary; identity and
+allocation alone do not authorize DMA. A repeat probe of the retained bus address
+returns without configuration access; a distinct additional singleton match
+parks only its own PCI function. Only the retained qualified packet owner below
+has a one-shot transition that can enable BME.
 
 `RtlwifiDevice::registers` is the mandatory BAR2 `map_bar_control` mapping;
 it must cover through EFUSE access gate `0xcf`. Probe enables MEM decoding,
@@ -89,7 +91,13 @@ It validates DMA32 full extents, alignment and overlap before MMIO, constructs
 seven distinct linked 64-byte TX rings (DW10 next pointers, all OWN clear),
 one 32-byte RX ring and separately retained 4096-byte RX buffers (DW6 address,
 OWN/EOR). Exact Linux `_rtl88ee_llt_table_init` uses boundary0xab/max-page0xaf;
-all seven queue bases and RX base use the 8188EE register map. No 8192EE TXBD
+all seven queue bases and RX base use the 8188EE register map: BCN308, HIGH310,
+MGMT318, VO320, VI328, BE330, BK338 and RX340. The retained owner uses explicit
+EE-only constants, independent of the inactive generic8192EE scaffolds.
+An oracle compiles actual EE `reg.h` definitions in `hw.c::init_mac` publication
+order; the native device model also resolves those independently generated
+addresses. The former8192EE base publication is a rejected packet-admission
+regression. No 8192EE TXBD
 count registers or aliased queue bases are used. BME stays off, PCIe DMA byte
 0x301 stays0xff, CR packet gates and both interrupt masks remain closed.
 
@@ -99,8 +107,10 @@ never reopen that claim. Every actual allocation/register access uses current
 PCI authority and verifies parked bus mastering; unsupported per-domain IOMMU
 mode is rejected. The controller and diagnostic interface share an async
 mutex that retains the complete native owner before its first base write.
-`RtlwifiDevice::native_preparation_status()` reports its Allocated/Prepared/
-terminal Failed state; None covers unallocated state (including allocation
+`RtlwifiDevice::native_preparation_status()` reports the retained Allocated,
+Prepared, RadioConfigured, ChannelConfigured, MacConfigured or terminal Failed
+state; the packet core additionally has Running/Stopping/Stopped phases.
+None covers unallocated state (including allocation
 failure) or initialization holding the async guard. Cancellation installs Failed before awaiting LLT. Published mappings
 are retained on every error/Drop until a future reset/quiescence proof; no
 firmware/reset helper may reconstruct a second packet owner.
@@ -118,6 +128,8 @@ including exact50ms RF settling intervals, and retains all88 PG triples for
 the later channel-power owner. It uses 8-bit-address/20-bit LSSI and the actual
 HSSI edge/readback protocol, with 10/120us waits and PI/SI register selection.
 The previous unused family scaffolds do not supply any of these operations.
+The factory antenna type and HP identity select Linux's static MAIN/AUX path
+before IQK; dynamic antenna selection is outside this fixed measured profile.
 Single-path IQK backs up and restores MAC/ADDA/BB state, performs bounded TX
 and RX retries over up to three samples, compares Linux's tolerance and fallback
 candidates, applies the signed TX/RX matrix and retains recovery registers.
@@ -136,11 +148,107 @@ executes original Linux calibration functions; the register/RF model checks its
 complete write/delay trace, signed matrix, HP variant, factory negatives,
 transaction failures and cancellation at RF/IQK/LCK waits.
 
-`RadioConfigured` remains below EFUSE/regulatory channel-power programming,
-antenna/PA-bias and thermal policy, full MAC operational configuration, active
-DMA/IRQ ownership and station admission. It cannot scan, transmit ordinary
-packets, associate or raise carrier. Physical table/calibration acceptance also
+`RadioConfigured` remains below full MAC operational configuration, active
+packet ownership and station admission. It cannot scan, transmit ordinary
+packets, associate or raise carrier. Physical table/calibration acceptance
 remains unvalidated.
+
+`Prepared::configure_channel(permission)` continues the retained owner through
+the initial legacy1T20 profile on channels1–11. PathA factory gains come from
+all six CCK bases, five BW40 bases and signed OFDM nibbles; per-rate PG groups
+follow the EEPROM regulatory mode. Erased gains or signed arithmetic outside
+the hardware range fail before I/O instead of selecting defaults or wrapping.
+The original Linux EFUSE/PG functions independently generate192 numeric cases.
+The driver does not use Linux's scan turbo, HT rates or thermal gain boosts.
+
+Raw gain indices and Linux's index-to-dBm reporting estimate do not establish
+an EIRP bound. `channel_power::Calibration::load_registered` reads exactly
+`rtlwifi/rtl8188ee-cal-v1-<factory-mac-as-12-hex-digits>.bin` through current
+firmware capability invocation and requires an authenticated signer. The
+artifact qualifies the complete board operating envelope for fixed legacy20,
+1T1R, continuously awake software-crypto operation without gain tracking.
+It binds VID10ec/DID8179, the MAC and SHA256(MAC || full512-byte decoded EFUSE
+map), including channel-plan, power, antenna and thermal identity. EU/other-bus
+artifacts cannot supply this permission.
+
+The NEPC v1 blob has a96-byte little-endian header: magic[4], version:u16,
+header-size:u16, total-size:u32, VID:u16, DID:u16, factory-digest[32], MAC[6],
+reserved[2], nonnegative antenna upper bound:i16 in quarter-dBi, qualified
+EIRP upper bound:i16 in quarter-dBm, row-count:u16, profile:u16=1 and reserved[32].
+Each260-byte row contains channel:u8, reserved[3], and64 signed quarter-dBm
+conducted upper bounds for each CCK and OFDM gain index. Unknown bounds are
+INT16_MAX; channels must be strictly increasing and within1–11. These are
+measured conservative upper envelopes across the qualified operating range,
+not curves inferred from factory indices or another chip.
+
+Each final rate gain is bounded by the exact factory/PG result, the matching
+measured envelope plus antenna gain, the artifact EIRP ceiling and every
+overlapping signed host rule, with an independent20dBm ceiling from Linux's
+`RTL819x_2GHZ_CH01_11` shared by every retained channel-plan/world mapping.
+Neither a board signer nor a more permissive host rule raises that bound.
+Partial-span, unsupported flags, absent curves
+or an uncovered channel deny TX permission. The opaque permission binds the
+same retained radio report's full factory identity. A mismatched grant does
+no device access; accepted programming installs terminal Failed before await.
+Actual CCK/OFDM gains, MAC/BB20MHz and RF18 channel are read back before
+`ChannelConfigured` is committed. MCS slots are zero and no HT packet profile
+is admitted. TX remains paused, BME/PCIe DMA/CR packet gates and IRQ masks
+stay closed. Missing staged calibration/policy leaves the native worker's
+radio owner retained and without channel/transmit admission. Initial worker
+qualification selects channel1; later station control must obtain its own
+matching channel permission. Cancellation/failure never commits a permission
+or reuses the uncertain owner.
+
+`Prepared::configure_mac(factory)` checks the same opaque factory identity and
+continues `ChannelConfigured` to `MacConfigured` without opening packet gates.
+It supplies the remaining operational clock/watchdog/queue/MAC prefix, exact
+legacy receive/transmit configuration, legacy response rates and factory MAC.
+Host sequence numbers, software crypto and no early-mode prefix are explicit;
+CAM encryption/decryption and both interrupt masks stay disabled. Readbacks
+qualify all stable configuration fields. Linux's `efuse_read_1byte(0x1fa)`
+PA-bias call is guarded by this chip's256-byte physical geometry and returns
+ff without I/O, so no out-of-range/protected-tail read or bias write is invented.
+The real probe worker reaches this boundary after signed board/channel policy.
+
+`prepare::packet` extends that same retained owner, rings and unique `PacketIo`.
+Its crate-private `start_packets` validates actual retained descriptor links,
+DMA32 addresses, base registers, RX postings and operational MAC readbacks before
+the one-shot current-capability BME transition and CR/PCIe DMA opening. Device
+IRQs stay masked. This is a bounded polling transport core; the registered
+diagnostic netdev still has no station service and remains down.
+
+Management and non-QoS legacy data use distinct retained rings. Linux queue
+IDs MGNT6/BE1 supply doorbell bits64/2; allocation-vector indices1/4 never
+substitute those IDs. One pending native payload is retained before OWN
+publication, along with its exact queue, slot, serial, length and address.
+The host copies through the actual retained DMA mapping and preserves DW10's
+linked-next pointer. Terminal OWN clear is checked against stable descriptor
+identity, and the delivery carries bytes read from that retained payload.
+This is terminal host/DMA delivery, not an AP acknowledgement. Independent C
+receipts execute original Linux descriptor setters and `rtl88ee_tx_polling`;
+the device model reacts to actual published descriptors/body, including ring
+wrap. It does not complete from a saved encoder/source byte vector.
+
+RX reads OWN-cleared32-byte descriptors, checks retained DW6 address/high-word,
+EOR, complete length/driver-info/shift extents and current fixed channel. It
+rejects CRC/ICV, fragments, aggregates, HT/40MHz and non-normal report types.
+Protected MPDUs require the native SWDEC bit; open frames may legitimately
+have it clear. It retains original MPDU bytes for shared station security,
+removes the four appended FCS bytes and reposts the same owned buffer only
+after processing/copy and device barriers. Malformed ownership/address/extent
+data is terminal. Invalid ordinary packet profiles are consumed without
+admitting bytes to management or security.
+
+`wait_delivery` installs terminal Failed before its first actual wait; timeout,
+cancellation, stale PCI authority or descriptor rebinding cannot reopen TX or
+release pending DMA. `stop_packets` closes host admission first, attempts all
+independent IRQ/TX-pause/CR/PCIe-DMA/BME gates and verifies the accessible
+readbacks. Success commits terminal `Stopped`, with no reuse/restart. Every
+published ring/RX buffer and pending payload remains retained on stop, failure,
+cancellation and Drop: parked BME is not claimed as a prefetch-quiescence or
+reclamation proof. The next station facade must invoke this terminal stop on
+all association/disconnect/error paths; transport readiness alone raises no
+carrier or controlled port.
 
 ## 4. Invariants
 
@@ -172,10 +280,10 @@ board qualification remain required.
 | Correct BAR2/read-only EFUSE lifecycle and per-chip identity | Implemented; shared-path regressions |
 | Complete source-matched per-chip power/reset qualification | RTL8188EE PCI enable prefix/flow implemented; other families remain incomplete |
 | Authenticated image/header selection and runtime firmware loading | RTL8188EE retained probe owner implemented; other profiles missing |
-| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE DMA32 inactive linked rings/LLT and retained publication implemented; active DMA, quiesce/recovery, IRQ and H2C/C2H missing |
-| RF/BB tables, calibration, channel/power and rate control | RTL8188EE complete tables and retained1T IQK/LCK implemented; EFUSE/regulatory channel power, antenna/PA bias, thermal tracking and rate control remain missing |
+| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 linked rings/LLT, one-shot active polled core, exact terminal host delivery and terminal gate-close/retention implemented; station/native service integration remains. Reclamation/reset/recovery and optional IRQ/H2C/C2H work remain |
+| RF/BB tables, calibration, channel/power and rate control | RTL8188EE complete tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 channel power and parked operational MAC implemented; negotiated peer/rate/filter integration remains. Optional gain tracking is excluded by measured profile |
 | Scan, management RX/TX, authentication/association and WPA2 | Missing |
-| Ethernet packet path and terminal TX completion ownership | Missing |
+| Ethernet packet path and terminal TX completion ownership | Native raw-MPDU terminal ownership implemented; shared station-security and Ethernet/DHCP/IP service composition remains |
 | Multi-radio, removal, suspend/reset/recovery | Missing |
 
 References: Linux `rtlwifi/efuse.c`, per-chip `sw.c`/`reg.h`,

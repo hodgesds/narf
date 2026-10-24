@@ -90,6 +90,12 @@ pub(super) struct Radio<T> {
     failed: bool,
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    pub fn information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
+        self.scan_cache
+            .iter()
+            .find(|b| b.bssid == bssid)
+            .map(|b| b.information_elements.clone())
+    }
     pub fn new(htt: htt::Runtime<T>, dialect: Dialect, features: u64) -> Self {
         Self {
             htt,

@@ -262,3 +262,6 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_power_off_cancel_timeout_and_inherited_normalize
 );
+
+#[path = "cold/tests.rs"]
+mod cold_tests;

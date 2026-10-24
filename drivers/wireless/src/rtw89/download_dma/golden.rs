@@ -1,0 +1,7 @@
+// Original Linux AX DMA/profile expression SHA256 3f09236a98471430ec0bd72fccaa252fc3e4f944eba36ebed00d2556642dc3cd
+const CASES:&[Case]=&[
+Case{chip:ChipId::Rtl8852A,init:0x1000,tx:0x800,rx:0x2000,hci:0x8380,tx_internal:0x1,rx_internal:0x2,io_address:0x1010,io_stop:0x100000,stop_address:0x1010,channels:0x7ff00,wpdma:0x80000,fw:0x40000},
+Case{chip:ChipId::Rtl8852B,init:0x1000,tx:0x800,rx:0x2000,hci:0x8380,tx_internal:0x1,rx_internal:0x2,io_address:0x1010,io_stop:0x100000,stop_address:0x1010,channels:0x70f00,wpdma:0x80000,fw:0x40000},
+Case{chip:ChipId::Rtl8852C,init:0x1000,tx:0x80,rx:0x8000,hci:0x7880,tx_internal:0x1,rx_internal:0x2,io_address:0x1000,io_stop:0x20000,stop_address:0x1010,channels:0x7ff00,wpdma:0x80000,fw:0x40000},
+Case{chip:ChipId::Rtl8851B,init:0x1000,tx:0x800,rx:0x2000,hci:0x8380,tx_internal:0x1,rx_internal:0x2,io_address:0x1010,io_stop:0x100000,stop_address:0x1010,channels:0x70f00,wpdma:0x80000,fw:0x40000},
+];

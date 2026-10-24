@@ -43,12 +43,77 @@ unsafe impl Memory for Coherent {
         }
         Ok(())
     }
+    fn read32(&self, offset: usize) -> Result<u32, Error> {
+        if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > self.0.len()) {
+            return Err(Error::Address);
+        }
+        // SAFETY: complete aligned extent in this retained coherent CPU map.
+        Ok(u32::from_le(unsafe {
+            self.0.cpu_ptr_at::<u32>(offset as u64).read_volatile()
+        }))
+    }
+    fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
+        if offset
+            .checked_add(bytes.len())
+            .is_none_or(|end| end > self.0.len())
+        {
+            return Err(Error::Address);
+        }
+        for (index, value) in bytes.iter().copied().enumerate() {
+            // SAFETY: bounded exclusively owned CPU mapping; no DMA address cast.
+            unsafe {
+                self.0
+                    .cpu_mut_ptr_at::<u8>((offset + index) as u64)
+                    .write_volatile(value)
+            };
+        }
+        Ok(())
+    }
+    fn read_bytes(&self, offset: usize, bytes: &mut [u8]) -> Result<(), Error> {
+        if offset
+            .checked_add(bytes.len())
+            .is_none_or(|end| end > self.0.len())
+        {
+            return Err(Error::Address);
+        }
+        for (index, value) in bytes.iter_mut().enumerate() {
+            // SAFETY: bounded retained CPU mapping, after native device barrier.
+            *value = unsafe {
+                self.0
+                    .cpu_ptr_at::<u8>((offset + index) as u64)
+                    .read_volatile()
+            };
+        }
+        Ok(())
+    }
     fn sync(&self) {
         self.0.sync(0, self.0.len());
         device_barrier();
     }
 }
 pub(super) type NativePrepared = Prepared<PacketIo<PciIo>, Coherent>;
+
+impl super::prepare::packet::Port for PacketIo<PciIo> {
+    type Buffer = Coherent;
+    fn authority<T>(
+        &self,
+        active: bool,
+        operation: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.with_io(|io| io.packet_authority(active, operation))?
+    }
+    fn allocate_packet(&self, bytes: usize) -> Result<Coherent, Error> {
+        Ok(Coherent(self.with_io(|io| io.allocate_dma(bytes))?))
+    }
+    fn master(&self, enabled: bool) -> Result<(), Error> {
+        self.with_io(|io| io.packet_master(enabled))?;
+        Ok(())
+    }
+    fn kick(&self, queue_bit: u16) -> Result<(), Error> {
+        self.with_io(|io| io.packet_kick(queue_bit))?;
+        Ok(())
+    }
+}
 
 /// Consume the sole successful firmware owner's native continuation claim
 /// before allocation. DMA addresses are allocated under that same live PCI
@@ -96,5 +161,19 @@ pub(super) async fn initialize_registered(
         .as_mut()
         .ok_or(Error::State)?
         .configure_radio(profile)
-        .await
+        .await?;
+    let calibration =
+        super::channel_power::Calibration::load_registered(&factory).map_err(Error::Power)?;
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
+    let permission = calibration.permission(&domain, 1).map_err(Error::Power)?;
+    storage
+        .as_mut()
+        .ok_or(Error::State)?
+        .configure_channel(permission)
+        .await?;
+    storage
+        .as_mut()
+        .ok_or(Error::State)?
+        .configure_mac(&factory)
 }

@@ -40,6 +40,11 @@ struct RadioModel {
     ce: Option<crate::ath10k::boot::CeFixture>,
     data: Option<data_tests::Fixture>,
 }
+// SAFETY: This private firmware fixture owns its complete graph of CE-model
+// Rc/RefCell buffers; no reference-counted alias escapes the model. Moving the
+// graph to another CPU is safe. Device's async mutex serializes all access,
+// including fixture observation; production transports have no such impl.
+unsafe impl Send for RadioModel {}
 impl HostMemory for RadioModel {
     fn retain_wmi_memory(&mut self, p: &[MemoryPlan]) -> Result<Vec<MemoryChunk>, Error> {
         self.inner.retain_wmi_memory(p)
@@ -142,9 +147,15 @@ fn management(model: &mut RadioModel, bad_ie: bool) {
             ]);
         }
     }
+    if model.data.as_ref().is_some_and(|d| d.automatic) {
+        frame = model.data.as_ref().unwrap().beacon();
+    }
     if bad_ie {
         frame.push(0xff);
     }
+    management_frame(model, frame);
+}
+fn management_frame(model: &mut RadioModel, frame: Vec<u8>) {
     let dialect = model.inner.inner.dialect;
     let extra = usize::from(dialect == Dialect::TenFour) * 4;
     let mut head = vec![
@@ -176,6 +187,34 @@ fn management(model: &mut RadioModel, bad_ie: bool) {
     add_event(model, id, &body);
 }
 impl Hif for RadioModel {
+    fn source_ready(&mut self, pipe: u8) -> Result<bool, BmiError> {
+        match &mut self.ce {
+            Some(ce) => ce.source_ready(pipe),
+            None => Ok(true),
+        }
+    }
+    fn begin_send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        if pipe != 4 || self.data.is_none() {
+            return Err(BmiError::Unsupported);
+        }
+        if let Some(ce) = &mut self.ce {
+            ce.begin_send(pipe, bytes)?;
+        }
+        data_tests::send_now(self, bytes)
+    }
+    fn poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        if let Some(ce) = &mut self.ce {
+            ce.poll_now()?;
+        }
+        data_tests::poll(self)?;
+        match self.inner.inner.rx.pop_front() {
+            Some((pipe, bytes)) => match &mut self.ce {
+                Some(ce) => ce.receive(pipe, &bytes).map(Some),
+                None => Ok(Some((pipe, bytes))),
+            },
+            None => Ok(None),
+        }
+    }
     async fn poll(&mut self, b: u64) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
         data_tests::poll(self)?;
         if self.mismatch_rx && self.inner.inner.rx.is_empty() {
@@ -234,6 +273,14 @@ impl Hif for RadioModel {
         if self.teardown.is_some() {
             return teardown_tests::send(self, bytes).await;
         }
+        if self.data.as_ref().is_some_and(|d| d.automatic) && self.phase >= 3 {
+            if self.station.is_none() {
+                self.station = Some(StationFixture::new());
+            }
+            if self.station.as_ref().is_some_and(|s| s.phase >= 4) {
+                return data_tests::control(self, bytes);
+            }
+        }
         if self.mlme.is_some() {
             return mlme_tests::send(self, bytes).await;
         }
@@ -265,6 +312,24 @@ impl Hif for RadioModel {
         }
         .to_vec();
         if self.phase >= 2 {
+            if self.data.as_ref().is_some_and(|d| d.automatic) {
+                let (base, common) = if dialect == Dialect::Tlv {
+                    (8, 100)
+                } else if matches!(dialect, Dialect::Main | Dialect::TenFour) {
+                    (4, 64)
+                } else {
+                    (4, 60)
+                };
+                let at = base + common;
+                if dialect == Dialect::Tlv {
+                    u32at(&mut expected, base + 64, 1);
+                    u32at(&mut expected, at, (16 << 16) | 4);
+                    expected.drain(at + 8..at + 12);
+                } else {
+                    u32at(&mut expected, at + 4, 1);
+                    expected.drain(at + 12..at + 16);
+                }
+            }
             self.scan += 1;
             u32at(
                 &mut expected,

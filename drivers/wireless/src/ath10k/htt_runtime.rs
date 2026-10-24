@@ -221,6 +221,13 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
             self.wmi.htc.poll_with_progress().await?
         };
         self.failed = false;
+        self.dispatch(progressed, packet)
+    }
+    fn dispatch(
+        &mut self,
+        progressed: bool,
+        packet: Option<(u8, Vec<u8>)>,
+    ) -> Result<Event, Error> {
         let Some((endpoint, bytes)) = packet else {
             return Ok(if progressed {
                 Event::Progress
@@ -250,6 +257,45 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
                 Err(Error::Malformed)
             }
         }
+    }
+    pub fn source_ready(&mut self) -> Result<bool, Error> {
+        if self.failed || self.ready.is_none() {
+            return Err(Error::Failed);
+        }
+        self.wmi.htc.htt_source_ready().map_err(Error::from)
+    }
+    pub fn begin_transmit(
+        &mut self,
+        parameters: tx::Parameters,
+        bytes: &[u8],
+    ) -> Result<u16, Error> {
+        if !self.source_ready()? {
+            return Err(Error::Busy);
+        }
+        let (id, body) = self
+            .wmi
+            .htc
+            .transport
+            .prepare_htt_tx(self.config, parameters, bytes)?;
+        self.failed = true;
+        self.wmi.htc.begin_htt(&body)?;
+        self.failed = false;
+        Ok(id)
+    }
+    pub fn poll_now(&mut self) -> Result<Event, Error> {
+        if self.failed || self.ready.is_none() {
+            return Err(Error::Failed);
+        }
+        self.failed = true;
+        let (progressed, packet) = if let Some(bytes) = self.early_htt.pop_front() {
+            (true, Some((self.wmi.htc.htt, bytes)))
+        } else if let Some(bytes) = self.wmi_events.pop_front() {
+            (true, Some((self.wmi.htc.wmi, bytes)))
+        } else {
+            self.wmi.htc.poll_now()?
+        };
+        self.failed = false;
+        self.dispatch(progressed, packet)
     }
     pub async fn transmit(
         &mut self,

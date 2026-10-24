@@ -1,13 +1,13 @@
 # ath10k — Specification
 
-> Status: **ROM/HTC/WMI/HTT and passive scan implemented; WLAN software incomplete.**
+> Status: **Retained legacy RAW station implemented; physical acceptance pending.**
 > The live PCI task obtains BMI identity, selects trusted firmware/BDF,
 > runs OTP calibration and downloads the image. It retains runtime CE DMA
 > before BMI_DONE, negotiates HTC endpoints, handles firmware host-memory
 > requests and completes WMI INIT/READY. Retained HTT RX/TX and a passive
-> scan vdev follow. Retained legacy station association and an async
-> raw/software-CCMP packet owner follow. The synchronous packet service and
-> interface registration remain; this is not yet a NIC usable by DHCP.
+> scan vdev follow. Raw-capable non-PFC images can publish a retained legacy
+> station interface with Open/WPA2, bounded native packet progress and terminal
+> disconnect. Hardware-validation readiness is scoped to this exact profile.
 
 ## 1. Purpose & scope
 
@@ -20,8 +20,10 @@ Linux `drivers/net/wireless/ath/ath10k/` is the reference implementation.
 Probe owns the PCI function exclusively. BAR0 is mapped with device
 attributes and must cover the selected RTC, core, PCI-local and CE
 windows. Boot uses coherent DMA32 storage and keeps the target awake.
-Boot messages are serialized and polled asynchronously; runtime IRQ and
-packet service are not yet attached.
+Boot messages are serialized and polled asynchronously. The initial native
+packet service polls with CE interrupts masked; synchronous network drains
+and the periodic worker drive the same bounded state without waiting on
+another executor task. IRQ throughput and power management are separate profiles.
 
 ## 3. Public interface
 
@@ -47,7 +49,8 @@ packet service are not yet attached.
   `htt_error` retains setup failure. `scan_ready` records submitted native
   station-vdev0 and passive channel setup, without claiming a firmware
   vdev-create acknowledgement; `scan_error` retains setup/scan failure.
-  No netdev is registered.
+  These metadata alone register no netdev; raw/non-PFC admission below follows
+  successful scan-vdev setup.
 - `pci::scan_passive(frequencies_mhz)` serializes a receive-only scan over
   the retained physical HTC/WMI/HTT owner. It accepts only configured IEEE
   2.4/5 GHz centre frequencies within SERVICE_READY hardware ranges. Channel
@@ -102,8 +105,8 @@ packet service are not yet attached.
   failed status, malformed transport, timeout or dropped future closes the
   retained radio. Each phase advances at most once. The returned raw peer
   response is a transport prerequisite; use `pci::associate_station` to run
-  the checked negotiation and native peer/vdev commands. Keys, data admission
-  and a NIC remain software work.
+  the checked negotiation and native peer/vdev commands. This exchange API
+  alone grants no key, data admission or interface carrier.
   Internal `ManagementReceipt` distinguishes inline submission (no terminal
   air ACK fabricated), HTT packet IDs and referenced-WMI descriptor IDs;
   `ManagementCompletion` keeps the actual firmware status with its ID.
@@ -143,8 +146,9 @@ packet service are not yet attached.
   leave this owner closed. `StationDisconnected { bssid, frequency,
   synchronous_delete }` reports firmware peer/vdev retirement only; all CE/HTT/
   WMI/firmware DMA stays retained until a future whole-device reset/drain proof.
-  Teardown sends no over-air deauthentication and makes no key, carrier, PM,
-  DMA reclamation or rejoin claim. All six native WMI dialects are covered;
+  Teardown sends no over-air deauthentication and makes no PM, DMA reclamation
+  or rejoin claim. The registered Device closes host carrier and security
+  before awaiting this firmware transaction. All six native WMI dialects are covered;
   only TLV advertises the extra synchronous delete service.
 - `pci::start_station_data(pmk)` starts the retained packet owner after native
   association, with `None` for Open or the caller's WPA2 PMK. It requires
@@ -157,8 +161,11 @@ packet service are not yet attached.
   replies use native raw HTT with NO_ENCRYPT and retain their DMA payload and
   fragment owners after CE completion. Only the matching successful terminal
   HTT ID commits the pending security change. No hardware key receipt is
-  fabricated. `StationLink { bssid, frequency, protected }` requires the live
-  peer and controlled port; it publishes no netdev.
+  fabricated. An early association-era M1 is preserved only after full native
+  descriptor/peer/TID/header and unprotected-unicast EAPOL admission; all
+  preauthorization IP is discarded. `StationLink { bssid, frequency, protected }`
+  requires the live peer and first completed authorization. Temporary GTK/PTK
+  reply waits close the data port without flapping established physical carrier.
 - `pci::transmit_ethernet(bytes)` submits one admitted Ethernet frame through
   this owner and returns its actual HTT publication ID. ToDS/RFC1042 and
   optional software CCMP preserve packet identity; externally supplied EAPOL
@@ -171,9 +178,47 @@ packet service are not yet attached.
   only authenticated, replay-checked data reaches RFC1042 decapsulation.
   Last-peer UNMAP, bound deauthentication, failed terminal TX, timeout,
   malformed state and cancellation close the retained radio. Disconnect
-  closes security before awaiting firmware retirement. These APIs remain
-  async: split-submit/nonblocking physical CE progress is still required
-  before the synchronous network drain can run DHCP without another task.
+  closes security before awaiting firmware retirement. Their async diagnostic
+  surface and the nonblocking network drain share the same packet parsing,
+  peer events, terminal receipts and security state.
+- `interface::Device` implements the registered legacy station profile after
+  calibrated boot, WMI/HTT/scan setup, RAW/non-PFC firmware admission, signed
+  regulatory bootstrap and current network-registry capability admission.
+  `RadioSession` retains an `Arc<Mutex<Radio<PciBoot>>>` with the selected image
+  and board profile; native PCI APIs and the Device share this single owner.
+  The Device exposes passive scan and Open/WPA2-PSK/CCMP on channels1–11,
+  legacy20 only. Unsupported scan options, PHY modes, external EAPOL and
+  checksum/TSO/VLAN requests are rejected, including direct frame-ring clients.
+  Native control and each bounded packet-progress pass sample the current
+  trusted regulatory database rather than an attachment-time clone. Passive
+  scan requires complete receive-channel coverage; association resamples
+  between preparation, management and security stages and before carrier.
+  Packet progress refuses a removed channel or changed programmed power
+  ceiling before consuming host TX or publishing native DMA. Such a change
+  closes carrier and discards queued traffic; restoring policy cannot reopen
+  the terminal owner. Disconnect can still send DOWN/DELETE/STOP independently
+  of policy. A cfg-only policy-source seam exercises isolated live changes
+  without installing fixture policy in the global database.
+  Carrier starts closed and opens only after actual authorization. Disconnect,
+  cancelled control operations, peer loss, malformed state and native progress
+  failure close carrier permanently; another join requires a future reset owner.
+- Physical packet HIF supplies bounded source-ready, begin-send and poll-now
+  operations. Each source pipe retains its bounce occupancy/deadline before
+  publication. An occupied source is rejected before any buffer copy; its CE
+  terminal completion releases bounce capacity only. Independent RX/credit
+  progress continues while CE4 is pending; actual HTT IDs still fence payload
+  retirement and M4 commits. Async WMI/BMI transactions keep their original
+  fail-stop cancellation semantics. Both packet service paths use the same
+  HTC/HTT decoders and native peer correlation.
+- The Device's synchronous drain uses try-locks, bounded poll/submit and Narf
+  frame rings, and releases its Radio/ring state before stack callbacks. It
+  never uses block_on and can complete the actual kernel DHCP conversation
+  without a scheduled worker. A masked-interrupt periodic poll also supplies
+  idle RX/security progress. A five-second no-peer deadline is refreshed by
+  bound BSS beacons or admitted native peer traffic; stale/replayed/forged
+  CCMP cannot refresh it. Expiry closes the port and carrier while retaining
+  uncertain CE/HTT DMA. The owner deliberately does not reset/reclaim firmware,
+  preserve connectivity across suspend, or admit a second association.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
@@ -432,33 +477,31 @@ variants, concurrent terminal HTT completion and dropped/failed ownership.
 
 ## 8. Remaining software and hardware acceptance
 
-The following are software work, not gates that a physical boot can close:
+The retained validation profile is calibrated BMI boot with a signed board
+file, firmware advertising RAW_MODE_SUPPORT, non-PFC HTT, legacy20 station on
+host-permitted channels1–11, passive scan, Open or WPA2-PSK/CCMP, DHCP and
+bidirectional IP. Peer/vdev retirement is terminal; firmware and DMA allocations
+remain owned until full-device reset. Interrupts remain masked and the bounded
+polling path is the initial packet service. No country, real calibration data,
+firmware asset or credential is invented by the driver or its models.
 
-1. Alternate pre-cal/cal sources (file/DT/EEPROM), non-BMI images and diagnostic fast download are
-   not implemented; the supported ROM path requires a valid OTP image and
-   calibrated BDF. Missing board files currently fail the boot session.
-2. Complete per-firmware-family feature/dialect operation tables and
-   optional board/clock/UART quirks, with real firmware validation of the
-   current OTP/BDF/PLL/code-swap path.
-3. A retained station worker composing the native packet/event owner with
-   complete WMI operation handling, higher-capacity CE service, HIF IRQ/MSI,
-   recovery and full DMA/firmware PM/teardown. Terminal peer/vdev disconnect is
-   implemented, but it does not reset or reclaim the retained hardware owner.
-   HTT setup alone does not publish an interface.
-4. Station/runtime WMI maps beyond scan, context preparation and initial
-   legacy association;
-   complete HTT peer/BA/security routing,
-   PFC fetch/mode/host-queue handling, native packet conversion, RX security
-   and replay/reorder policy. Existing standalone WMI/HTT codecs are not the
-   production station implementation.
-5. Extend the initial authenticated channels 1–11 factory/host context policy
-   to all claimed bands and widths, beacon hints/DFS and complete station
-   control, active/
-   directed scan and richer scan options, complete management/EAPOL/key exchange,
-   packet conversion, and `WirelessNetIface`/netdev registration.
+Native composition tests consume actual generic CE descriptors, HTT DMA payloads
+and RX descriptors through the retained Radio and Device. One independent AP
+supplies scan/management/EAPOL/CCMP and a shared DHCP server, while the real
+kernel DHCP client and IP dispatch run through the registered callbacks. Cases
+cover all six WMI dialects with Open/WPA2, exact lease/IP bytes, occupied CE4
+bounce preservation while RX proceeds, separate CE/HTT retirement, held-M4
+cancellation, connection-loss expiry and failed terminal disconnect. These are
+software evidence; they do not attest a physical board or firmware image.
 
-After those are integrated, physical acceptance must exercise ROM/BMI,
-board calibration, IRQ/DMA, scan, association, IP traffic, link loss and
-reset/PM on each claimed family. Current bootstrap still needs silicon
-validation; success in the offline suite does not remove the software
-requirements above.
+Physical acceptance still must validate exact PCI/BMI identity, trusted firmware
+and board calibration, ROM/OTP/PLL/code-swap, native CE/HTC/WMI/HTT progress,
+scan, Open/WPA2 and actual DHCP/IP with a real AP, idle/beacon liveness, link loss,
+revocation and terminal teardown without DMA reuse. No such run is recorded.
+An image lacking RAW support, or requiring PFC, remains a diagnostic scan owner
+and must not be counted as a usable station under this profile.
+
+Broader bands/widths, HT/VHT/BA aggregation, PFC fetch/queue ownership, alternate
+calibration sources, interrupt throughput, active/richer scanning, recoverable
+reset/rejoin and firmware power management remain explicit later profiles. They
+are not prerequisites for validating the bounded station profile above.

@@ -209,6 +209,9 @@ impl<B: Memory> Ring<B> {
         Ok(())
     }
 
+    pub fn busy(&self) -> bool {
+        self.pending.is_some()
+    }
     pub fn post(
         &mut self,
         mmio: &mut impl Ath10kMmio,

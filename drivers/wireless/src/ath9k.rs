@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! AR9285 PCIe reset, EEPROM identity and inactive INI/PLL/RF preparation.
-//! Linux ath9k is the reference. Modal/RF, detector and factory CTL/rate
-//! tables are prepared at a zero-dBm ceiling; calibration, PHY activation
-//! and packet DMA remain open.
+//! AR9285 reset/EEPROM, inactive INI/PLL/RF and signed-policy calibration.
+//! Linux ath9k is the reference. The one-shot channel1 analog/AGC/IQ owner
+//! retains partial attempts; packet DMA and station service remain separate.
 
+use alloc::sync::Arc;
 use core::fmt::Write as _;
-use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BusAddr, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
-use narf_lib::sync::IrqSafeSpinLock;
+use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
+mod calibration;
 mod identity;
 mod initvals;
 mod phy;
+pub use calibration::{Report as RadioCalibration, State as RadioState};
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
 pub use phy::Prepared as BasebandPrepared;
 
@@ -28,28 +30,80 @@ pub struct Ath9k {
     pub identity: Identity,
     pub baseband: BasebandPrepared,
     calibration: [u8; EEPROM_4K_BYTES],
+    radio: calibration::Calibration,
 }
 
 impl Ath9k {
     pub fn calibration(&self) -> &[u8; EEPROM_4K_BYTES] {
         &self.calibration
     }
+    pub fn radio_state(&self) -> RadioState {
+        self.radio.state()
+    }
+    pub fn radio_calibration(&self) -> Option<RadioCalibration> {
+        self.radio.report()
+    }
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<Ath9k>> = IrqSafeSpinLock::new(None);
+struct Retained {
+    state: Mutex<Ath9k>,
+}
+static CLAIMED_ADDRESS: IrqSafeSpinLock<Option<BusAddr>> = IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Arc<Retained>>> = IrqSafeSpinLock::new(None);
 
 pub fn with_controller<R>(callback: impl FnOnce(&Ath9k) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(callback)
+    let owner = { CONTROLLER.lock().clone() }?;
+    let controller = owner.state.try_lock()?;
+    Some(callback(&controller))
+}
+
+/// Retry policy provisioning only before a calibration attempt has begun.
+/// A pending attempt is Running; failure/drop records Failed without cleanup.
+/// Neither can be replayed or replaced without a separately proved reset.
+pub async fn calibrate_radio() -> Result<RadioCalibration, BringUpError> {
+    let owner = { CONTROLLER.lock().clone() }.ok_or(BringUpError::BadState)?;
+    calibrate_owner(&owner).await
+}
+async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
+    let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
+    let permission = calibration::Permission::from_domain(&domain)?;
+    let mut controller = owner.state.try_lock().ok_or(BringUpError::BadState)?;
+    let command = identity::invoke(&controller._cap, || {
+        narf_bus::pci::read_command(&controller._cap, &controller._device)
+    })
+    .map_err(|_| BringUpError::DeviceGone)?
+    .map_err(|_| BringUpError::DeviceGone)?;
+    let mask = narf_bus::pci::cmd::BUS_MASTER
+        | narf_bus::pci::cmd::MEM_SPACE
+        | narf_bus::pci::cmd::INTX_DISABLE;
+    if command & mask != (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE) {
+        return Err(BringUpError::BadState);
+    }
+    let mut io = identity::Registers::new(controller._mmio, controller._cap);
+    let image = controller.calibration;
+    let xe2 = controller.baseband.xe2_gain;
+    // SAFETY: the retained native probe identified this single-chain AR9285,
+    // completed full INI/modal/detector preparation, and never allocated or
+    // published packet DMA. Current PCI parking was verified above; an async
+    // mutex, rather than an IRQ-disabling guard, serializes the full attempt.
+    unsafe { controller.radio.run(&mut io, &image, permission, xe2).await }
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if device.id.vendor != ATHEROS_PCI_VENDOR || device.id.device != ATHEROS_AR9285_DEVICE {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
-    let owner = CONTROLLER
-        .lock()
-        .as_ref()
-        .map(|controller| controller._device.addr);
+    // Reserve the address before any hardware access, including an attempt
+    // that fails part-way through native reset/EEPROM preparation. Concurrent
+    // dispatch cannot replace the retained singleton or replay uncertain state.
+    let owner = {
+        let mut claimed = CLAIMED_ADDRESS.lock();
+        let previous = *claimed;
+        if previous.is_none() {
+            *claimed = Some(device.addr);
+        }
+        previous
+    };
     let occupied = owner.is_some();
     crate::qualcomm_pci::park(&device, &cap, false, owner)?;
     if occupied {
@@ -86,20 +140,40 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     );
     let vendor = device.id.vendor;
     let device_id = device.id.device;
-    *CONTROLLER.lock() = Some(Ath9k {
-        _mmio: mmio,
-        _device: device,
-        _cap: cap,
-        identity,
-        baseband,
-        calibration,
+    let retained = Arc::new(Retained {
+        state: Mutex::new(Ath9k {
+            _mmio: mmio,
+            _device: device,
+            _cap: cap,
+            identity,
+            baseband,
+            calibration,
+            radio: calibration::Calibration::default(),
+        }),
     });
+    *CONTROLLER.lock() = Some(retained.clone());
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("ath9k-ar9285"),
         kind: narf_drivers::BoundKind::Net,
         pci_vid: Some(vendor),
         pci_did: Some(device_id),
         domain: narf_drivers::BoundKind::Net.default_domain(),
+    });
+    narf_scheduler::spawn(async move {
+        match calibrate_owner(&retained).await {
+            Ok(report) => {
+                let _ = writeln!(narf_console::Writer,
+                "ath9k: channel1 calibration ready: IQ {}/{} PA {:?} NF {} dBm; packet service pending",
+                report.iq_i, report.iq_q, report.pa_offset, report.measured_noise_dbm);
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ath9k: channel1 calibration closed: {:?}",
+                    error
+                );
+            }
+        }
     });
     Ok(())
 }
