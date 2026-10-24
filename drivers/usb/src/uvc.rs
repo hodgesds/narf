@@ -641,6 +641,10 @@ impl FrameMjpeg {
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+
+use core::future::Future;
+
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Transport exposed by a VideoStreaming alternate setting.
@@ -684,6 +688,12 @@ pub struct UvcDevice {
     /// alternate setting. Bind retains these until PROBE/COMMIT tells
     /// the driver how much payload bandwidth to request.
     pub streaming_endpoints: Vec<UvcStreamingEndpoint>,
+    /// Parsed VideoStreaming format table retained from bind. The
+    /// STREAMON composition maps the S_FMT-committed V4L2 format back
+    /// to UVC (format index, frame index, frame interval) through this
+    /// table; the V4L2 `FmtEntry` table alone has already dropped the
+    /// UVC indices negotiation needs.
+    pub formats: Vec<narf_drivers_video::uvc::StreamFormat>,
     /// Endpoint whose xHCI context has been configured and whose
     /// alternate setting has been selected, if streaming is active.
     pub active_stream: Option<UvcStreamingEndpoint>,
@@ -691,10 +701,122 @@ pub struct UvcDevice {
     pub video_node: usize,
     /// Prevents duplicate capture tasks when a caller repeats negotiation.
     pub capture_pump_running: bool,
+    /// Set by STREAMOFF teardown; the capture pump checks it once per
+    /// packet iteration and exits, clearing it on the way out.
+    pub capture_stop_requested: bool,
 }
 
 /// System-wide registry of bound UVC devices.
 pub static UVC_DEVICES: IrqSafeSpinLock<Vec<UvcDevice>> = IrqSafeSpinLock::new(Vec::new());
+
+/// The slice of the xHCI surface the UVC streaming composition needs.
+///
+/// Production code runs against the live [`crate::xhci::Xhci`]; the
+/// end-to-end fixture (`smoke_uvc_streamon_composition_e2e` in
+/// `crate::tests`) runs the *same* bind / negotiate / activate /
+/// deactivate / pump code against a modelled device implementing this
+/// trait, so the composition is validated without silicon. The seam is
+/// deliberately narrow — four operations, no controller state — so a
+/// modelled transport stays a faithful device conversation (control
+/// transfers, endpoint configuration, isochronous packets), not a
+/// re-implementation of the composition itself.
+pub trait UvcTransport {
+    /// Host-to-device control transfer with an OUT data stage.
+    fn control_out<'a>(
+        &'a self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a;
+    /// Device-to-host control transfer; returns the byte count read.
+    fn control_in<'a>(
+        &'a self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a;
+    /// Configure the given endpoints on the slot.
+    fn configure_endpoints<'a>(
+        &'a self,
+        slot_id: u8,
+        endpoints: &'a [crate::xhci::EndpointConfig],
+    ) -> impl Future<Output = Result<(), crate::xhci::XhciError>> + Send + 'a;
+    /// Receive one isochronous IN packet into `out`; returns the byte
+    /// count (0 = no packet this service interval).
+    fn isoch_in<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a;
+}
+
+impl UvcTransport for crate::xhci::Xhci {
+    fn control_out<'a>(
+        &'a self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a {
+        // Fully-qualified inherent method (same name) — not this
+        // trait method.
+        crate::xhci::Xhci::control_out(
+            self,
+            slot_id,
+            bm_request_type,
+            b_request,
+            w_value,
+            w_index,
+            data,
+        )
+    }
+
+    fn control_in<'a>(
+        &'a self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a {
+        crate::xhci::Xhci::control_in(
+            self,
+            slot_id,
+            bm_request_type,
+            b_request,
+            w_value,
+            w_index,
+            out,
+        )
+    }
+
+    fn configure_endpoints<'a>(
+        &'a self,
+        slot_id: u8,
+        endpoints: &'a [crate::xhci::EndpointConfig],
+    ) -> impl Future<Output = Result<(), crate::xhci::XhciError>> + Send + 'a {
+        crate::xhci::Xhci::configure_endpoints(self, slot_id, endpoints)
+    }
+
+    fn isoch_in<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a {
+        crate::xhci::Xhci::isoch_in(self, slot_id, dci, out)
+    }
+}
 
 /// Find the first VideoControl interface in `cfg`.
 pub fn find_video_control_interface(cfg: &[u8]) -> Option<u8> {
@@ -738,17 +860,18 @@ pub fn find_video_streaming_interface(cfg: &[u8]) -> Option<u8> {
     None
 }
 
-/// Bind to an already-addressed UVC device. SET_CONFIGURATION,
-/// then record the slot/interface pair.
-pub async fn try_bind_video_already_addressed(
-    xhci_dev: &crate::xhci::Xhci,
+/// Transport-generic core of [`try_bind_video_already_addressed`]:
+/// SET_CONFIGURATION, then record the slot/interface pair, the parsed
+/// streaming format table, and register the `/dev/video<N>` node.
+pub async fn try_bind_video_with_transport<T: UvcTransport>(
+    transport: &T,
     slot_id: u8,
     cfg: &[u8],
 ) -> Result<usize, UvcError> {
     let vc_iface = find_video_control_interface(cfg).ok_or(UvcError::NotVideo)?;
     let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
     let nothing = [0u8; 0];
-    if xhci_dev
+    if transport
         .control_out(
             slot_id,
             0x00,
@@ -767,13 +890,15 @@ pub async fn try_bind_video_already_addressed(
     // Advertise the camera's real formats/resolutions by parsing its
     // VideoStreaming class-specific descriptors; fall back to the default table
     // (inside register_video_with_formats) if the probe or parse yields nothing.
-    let formats = narf_drivers_video::uvc::probe_uvc(cfg)
+    // The parsed table itself is retained on the device: STREAMON maps the
+    // S_FMT-committed format back to UVC indices through it.
+    let stream_formats = narf_drivers_video::uvc::probe_uvc(cfg)
         .ok()
         .map(|p| {
             narf_drivers_video::uvc::parse_streaming_descriptors(&p.vs_cs_blob).unwrap_or_default()
         })
-        .map(|f| narf_drivers_video::v4l2_ioctl::uvc_to_v4l2_formats(&f))
         .unwrap_or_default();
+    let formats = narf_drivers_video::v4l2_ioctl::uvc_to_v4l2_formats(&stream_formats);
     let video_node =
         narf_drivers_video::devfs_bridge::register_video_with_formats("USB Video Device", formats);
     let mut g = UVC_DEVICES.lock();
@@ -783,10 +908,32 @@ pub async fn try_bind_video_already_addressed(
         vc_iface,
         vs_iface,
         streaming_endpoints,
+        formats: stream_formats,
         active_stream: None,
         video_node,
         capture_pump_running: false,
+        capture_stop_requested: false,
     });
+    Ok(idx)
+}
+
+/// Bind to an already-addressed UVC device. SET_CONFIGURATION,
+/// then record the slot/interface pair. Also installs the V4L2
+/// streaming hooks on the registered node, so `VIDIOC_STREAMON` /
+/// `VIDIOC_STREAMOFF` drive this device's negotiation and teardown.
+pub async fn try_bind_video_already_addressed(
+    xhci_dev: &crate::xhci::Xhci,
+    slot_id: u8,
+    cfg: &[u8],
+) -> Result<usize, UvcError> {
+    let idx = try_bind_video_with_transport(xhci_dev, slot_id, cfg).await?;
+    let video_node = {
+        let devices = UVC_DEVICES.lock();
+        devices.get(idx).map(|device| device.video_node)
+    };
+    if let Some(video_node) = video_node {
+        narf_drivers_video::devfs_bridge::set_stream_ops(video_node, video_stream_ops());
+    }
     Ok(idx)
 }
 
@@ -919,6 +1066,15 @@ pub async fn activate_video_stream(
     idx: usize,
     required_payload: u32,
 ) -> Result<UvcStreamingEndpoint, UvcError> {
+    activate_video_stream_with(xhci_dev, idx, required_payload).await
+}
+
+/// Transport-generic core of [`activate_video_stream`].
+pub async fn activate_video_stream_with<T: UvcTransport>(
+    transport: &T,
+    idx: usize,
+    required_payload: u32,
+) -> Result<UvcStreamingEndpoint, UvcError> {
     let (slot_id, endpoint) = {
         let devices = UVC_DEVICES.lock();
         let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
@@ -950,11 +1106,11 @@ pub async fn activate_video_stream(
         kind: crate::xhci::EndpointKind::IsochIn,
         interval: endpoint.interval,
     };
-    xhci_dev
+    transport
         .configure_endpoints(slot_id, &[endpoint_config])
         .await
         .map_err(|_| UvcError::ConfigureEndpointFailed)?;
-    xhci_dev
+    transport
         .control_out(
             slot_id,
             crate::control::RT_DIR_OUT
@@ -974,6 +1130,55 @@ pub async fn activate_video_stream(
     Ok(endpoint)
 }
 
+/// Reverse [`activate_video_stream`]: stop the capture pump and
+/// release the streaming alternate setting (STREAMOFF teardown).
+pub async fn deactivate_video_stream(
+    xhci_dev: &crate::xhci::Xhci,
+    idx: usize,
+) -> Result<(), UvcError> {
+    deactivate_video_stream_with(xhci_dev, idx).await
+}
+
+/// Transport-generic core of [`deactivate_video_stream`].
+///
+/// Requests the capture pump to stop first (it observes
+/// `capture_stop_requested` at its next packet iteration), then
+/// selects the zero-bandwidth alternate setting 0 on the
+/// VideoStreaming interface — the exact reverse of activation's
+/// `configure_endpoints` → `SET_INTERFACE(alt)` order, minus endpoint
+/// deconfiguration (xHCI has no drop-endpoint path in-tree; alt 0
+/// already stops the device sourcing packets). The software
+/// `active_stream` record is cleared before the control transfer: if
+/// SET_INTERFACE fails the stream is unusable either way, and a stale
+/// record would wedge every later STREAMON with `AlreadyStreaming`.
+pub async fn deactivate_video_stream_with<T: UvcTransport>(
+    transport: &T,
+    idx: usize,
+) -> Result<(), UvcError> {
+    let (slot_id, active) = {
+        let mut devices = UVC_DEVICES.lock();
+        let device = devices.get_mut(idx).ok_or(UvcError::NotVideo)?;
+        device.capture_stop_requested = true;
+        (device.slot_id, device.active_stream.take())
+    };
+    if let Some(endpoint) = active {
+        transport
+            .control_out(
+                slot_id,
+                crate::control::RT_DIR_OUT
+                    | crate::control::RT_TYPE_STANDARD
+                    | crate::control::RT_RECIP_INTERFACE,
+                crate::control::REQ_SET_INTERFACE,
+                0,
+                u16::from(endpoint.interface_number),
+                &[],
+            )
+            .await
+            .map_err(|_| UvcError::SetInterfaceFailed)?;
+    }
+    Ok(())
+}
+
 /// Result of a complete UVC streaming negotiation and alternate activation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct UvcNegotiatedStream {
@@ -983,9 +1188,25 @@ pub struct UvcNegotiatedStream {
 
 /// Run the UVC 1.0/1.1 26-byte negotiation sequence, then configure and
 /// select the least-bandwidth isochronous alternate that satisfies the
-/// device-accepted maximum payload size.
+/// device-accepted maximum payload size, and start the capture pump.
 pub async fn negotiate_and_activate_video_stream(
     xhci_dev: &crate::xhci::Xhci,
+    idx: usize,
+    desired: VsProbeCommit,
+) -> Result<UvcNegotiatedStream, UvcError> {
+    let negotiated = negotiate_and_activate_video_stream_with(xhci_dev, idx, desired).await?;
+    start_video_capture_pump(idx);
+    Ok(negotiated)
+}
+
+/// Transport-generic core of [`negotiate_and_activate_video_stream`] —
+/// everything except the capture-pump spawn, so fixtures can drive the
+/// pump themselves. If activation fails after COMMIT succeeded, the
+/// VideoStreaming interface is returned to its zero-bandwidth
+/// alternate setting (best effort) before the error propagates: the
+/// device must not be left committed to a stream nobody opened.
+pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
+    transport: &T,
     idx: usize,
     desired: VsProbeCommit,
 ) -> Result<UvcNegotiatedStream, UvcError> {
@@ -1001,7 +1222,7 @@ pub async fn negotiate_and_activate_video_stream(
         | crate::control::RT_TYPE_CLASS
         | crate::control::RT_RECIP_INTERFACE;
     let desired_bytes = desired.encode();
-    xhci_dev
+    transport
         .control_out(
             slot_id,
             request_type_out,
@@ -1014,7 +1235,7 @@ pub async fn negotiate_and_activate_video_stream(
         .map_err(|_| UvcError::ProbeFailed)?;
 
     let mut accepted_bytes = [0u8; VsProbeCommit::LEN_V10];
-    let accepted_len = xhci_dev
+    let accepted_len = transport
         .control_in(
             slot_id,
             request_type_in,
@@ -1030,7 +1251,7 @@ pub async fn negotiate_and_activate_video_stream(
     }
     let accepted = VsProbeCommit::decode(&accepted_bytes).map_err(|_| UvcError::ProbeFailed)?;
     let accepted_encoded = accepted.encode();
-    xhci_dev
+    transport
         .control_out(
             slot_id,
             request_type_out,
@@ -1042,8 +1263,32 @@ pub async fn negotiate_and_activate_video_stream(
         .await
         .map_err(|_| UvcError::CommitFailed)?;
 
-    let endpoint = activate_video_stream(xhci_dev, idx, accepted.max_payload_transfer_size).await?;
-    start_video_capture_pump(idx);
+    let endpoint = match activate_video_stream_with(
+        transport,
+        idx,
+        accepted.max_payload_transfer_size,
+    )
+    .await
+    {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            // Unwind the commit: best-effort SET_INTERFACE to the
+            // zero-bandwidth alternate before reporting the failure.
+            let _ = transport
+                .control_out(
+                    slot_id,
+                    crate::control::RT_DIR_OUT
+                        | crate::control::RT_TYPE_STANDARD
+                        | crate::control::RT_RECIP_INTERFACE,
+                    crate::control::REQ_SET_INTERFACE,
+                    0,
+                    u16::from(vs_iface),
+                    &[],
+                )
+                .await;
+            return Err(e);
+        }
+    };
     Ok(UvcNegotiatedStream {
         control: accepted,
         endpoint,
@@ -1062,6 +1307,8 @@ fn start_video_capture_pump(idx: usize) {
             false
         } else {
             device.capture_pump_running = true;
+            // A fresh stream supersedes any earlier stop request.
+            device.capture_stop_requested = false;
             true
         }
     };
@@ -1086,6 +1333,27 @@ fn start_video_capture_pump(idx: usize) {
 /// the corresponding V4L2-style devfs node. The task sleeps in xHCI's event
 /// future between packets; it does not poll the controller in a spin loop.
 async fn pump_video_frames(idx: usize) -> Result<(), UvcError> {
+    let controller = crate::xhci::controller().ok_or(UvcError::CaptureFailed)?;
+    pump_video_frames_with(idx, &*controller).await
+}
+
+/// Transport-generic core of the capture pump.
+///
+/// #808 seam: packet reception goes through the single
+/// [`UvcTransport::isoch_in`] call site in this loop — one packet
+/// outstanding at a time. The depth-4 `IsocScheduler` pipelining work
+/// slots in behind this seam (a pipelined transport receive) without
+/// changing negotiation, activation, the stop protocol, or frame
+/// delivery; nothing here bakes in a single-shot assumption beyond
+/// that one call.
+///
+/// The loop exits cleanly with `Ok(())` when STREAMOFF teardown sets
+/// `capture_stop_requested`; the flag is consumed here so a later
+/// STREAMON starts from a clean state.
+pub async fn pump_video_frames_with<T: UvcTransport>(
+    idx: usize,
+    transport: &T,
+) -> Result<(), UvcError> {
     let (slot_id, endpoint, video_node) = {
         let devices = UVC_DEVICES.lock();
         let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
@@ -1095,7 +1363,6 @@ async fn pump_video_frames(idx: usize) -> Result<(), UvcError> {
             device.video_node,
         )
     };
-    let controller = crate::xhci::controller().ok_or(UvcError::CaptureFailed)?;
     let packet_size = usize::try_from(endpoint.max_payload_size)
         .unwrap_or(4096)
         .clamp(1, 4096);
@@ -1104,10 +1371,16 @@ async fn pump_video_frames(idx: usize) -> Result<(), UvcError> {
     let mut consecutive_errors = 0u8;
 
     loop {
-        match controller
-            .isoch_in(slot_id, endpoint.dci, &mut packet)
-            .await
         {
+            let mut devices = UVC_DEVICES.lock();
+            if let Some(device) = devices.get_mut(idx) {
+                if device.capture_stop_requested {
+                    device.capture_stop_requested = false;
+                    return Ok(());
+                }
+            }
+        }
+        match transport.isoch_in(slot_id, endpoint.dci, &mut packet).await {
             Ok(received) if received != 0 => {
                 consecutive_errors = 0;
                 if reassembler.push(&packet[..received]) == ReassemblerOutcome::FrameComplete {
@@ -1159,6 +1432,148 @@ pub fn attached_uvc_count() -> usize {
 #[doc(hidden)]
 pub fn __reset_uvc_for_test() {
     UVC_DEVICES.lock().clear();
+}
+
+// ── V4L2 streaming hooks (VIDIOC_STREAMON / STREAMOFF composition) ────
+//
+// Installed on the bound device's /dev/video<N> node at bind time (see
+// `try_bind_video_already_addressed`). The V4L2 layer awaits `start`
+// before marking the device streaming, so a negotiation failure fails
+// the ioctl instead of silently black-streaming; it awaits `stop`
+// before resetting local buffer state on STREAMOFF.
+
+/// Linux errno values (asm-generic) returned through the stream hooks.
+const ERRNO_EIO: i64 = 5;
+const ERRNO_EBUSY: i64 = 16;
+const ERRNO_ENODEV: i64 = 19;
+
+fn uvc_errno(error: UvcError) -> i64 {
+    match error {
+        UvcError::NotVideo => ERRNO_ENODEV,
+        UvcError::AlreadyStreaming => ERRNO_EBUSY,
+        _ => ERRNO_EIO,
+    }
+}
+
+/// Registry index of the bound device owning `/dev/video<node>`.
+pub fn uvc_index_for_video_node(node: usize) -> Option<usize> {
+    UVC_DEVICES
+        .lock()
+        .iter()
+        .position(|device| device.video_node == node)
+}
+
+/// Build the desired VS PROBE payload for the S_FMT-committed format.
+///
+/// The V4L2 format is mapped back through the format table retained at
+/// bind (the advertised `FmtEntry` table has no UVC indices). No
+/// frame-rate surface reaches STREAMON — `VIDIOC_S_PARM` is
+/// report-only in the V4L2 layer — so the frame's interval nearest
+/// 30 fps is requested, with the hint bit set for `dwFrameInterval`.
+fn desired_probe_commit(
+    device: &UvcDevice,
+    format: narf_drivers_video::v4l2_ioctl::PixFormat,
+) -> Option<VsProbeCommit> {
+    use narf_drivers_video::uvc::PixelFmt;
+    let pixel = if format.fourcc == u32::from_le_bytes(*b"YUYV") {
+        PixelFmt::Yuyv
+    } else if format.fourcc == u32::from_le_bytes(*b"NV12") {
+        PixelFmt::Nv12
+    } else if format.fourcc == u32::from_le_bytes(*b"MJPG") {
+        PixelFmt::Mjpeg
+    } else if format.fourcc == u32::from_le_bytes(*b"H264") {
+        PixelFmt::FrameBased
+    } else {
+        return None;
+    };
+    let stream_format = device
+        .formats
+        .iter()
+        .find(|candidate| candidate.pixel_fmt == pixel)?;
+    let (frame_index, frame_interval) =
+        stream_format.find_frame(format.width as u16, format.height as u16, 30)?;
+    Some(VsProbeCommit {
+        hint: 1,
+        format_index: stream_format.format_index,
+        frame_index,
+        frame_interval,
+        ..Default::default()
+    })
+}
+
+/// Negotiation half of the STREAMON composition over an arbitrary
+/// transport: resolve the device + desired stream parameters, then run
+/// PROBE/COMMIT + activation. The production hook additionally spawns
+/// the capture pump on success; fixtures drive
+/// [`pump_video_frames_with`] themselves instead.
+pub async fn stream_start_with<T: UvcTransport>(
+    transport: &T,
+    node: usize,
+    format: narf_drivers_video::v4l2_ioctl::PixFormat,
+) -> Result<(), i64> {
+    let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
+    let desired = {
+        let devices = UVC_DEVICES.lock();
+        let device = devices.get(idx).ok_or(ERRNO_ENODEV)?;
+        desired_probe_commit(device, format).ok_or(ERRNO_EIO)?
+    };
+    negotiate_and_activate_video_stream_with(transport, idx, desired)
+        .await
+        .map_err(uvc_errno)?;
+    Ok(())
+}
+
+/// Teardown half of the STREAMON composition over an arbitrary
+/// transport (STREAMOFF): stop the pump + release the alternate
+/// setting via [`deactivate_video_stream_with`].
+pub async fn stream_stop_with<T: UvcTransport>(transport: &T, node: usize) -> Result<(), i64> {
+    let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
+    deactivate_video_stream_with(transport, idx)
+        .await
+        .map_err(uvc_errno)
+}
+
+fn video_stream_start(
+    node: usize,
+    format: narf_drivers_video::v4l2_ioctl::PixFormat,
+) -> narf_drivers_video::v4l2_ioctl::StreamHookFuture {
+    Box::pin(async move {
+        let controller = crate::xhci::controller().ok_or(ERRNO_ENODEV)?;
+        stream_start_with(&*controller, node, format).await?;
+        if let Some(idx) = uvc_index_for_video_node(node) {
+            start_video_capture_pump(idx);
+        }
+        Ok(())
+    })
+}
+
+fn video_stream_stop(node: usize) -> narf_drivers_video::v4l2_ioctl::StreamHookFuture {
+    Box::pin(async move {
+        match crate::xhci::controller() {
+            Some(controller) => stream_stop_with(&*controller, node).await,
+            None => {
+                // Controller is gone, so the device is too: only the
+                // software teardown remains.
+                if let Some(idx) = uvc_index_for_video_node(node) {
+                    let mut devices = UVC_DEVICES.lock();
+                    if let Some(device) = devices.get_mut(idx) {
+                        device.capture_stop_requested = true;
+                        device.active_stream = None;
+                    }
+                }
+                Ok(())
+            }
+        }
+    })
+}
+
+/// The [`narf_drivers_video::v4l2_ioctl::StreamOps`] installed on every
+/// UVC-bound `/dev/video<N>` node.
+pub fn video_stream_ops() -> narf_drivers_video::v4l2_ioctl::StreamOps {
+    narf_drivers_video::v4l2_ioctl::StreamOps {
+        start: video_stream_start,
+        stop: video_stream_stop,
+    }
 }
 
 // ── UVC payload header (§2.4.3.3) ──────────────────────────────────

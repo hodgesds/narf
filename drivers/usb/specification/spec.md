@@ -264,6 +264,29 @@ also consult upstream Linux GPL sources.
   26-byte SET_CUR(PROBE) / GET_CUR(PROBE) / SET_CUR(COMMIT) sequence, configures
   the accepted endpoint, issues `SET_INTERFACE`, and starts an IRQ-driven
   packet/frame pump into the camera's registered `/dev/video<N>` queue.
+- The V4L2 surface drives that composition. Bind
+  (`try_bind_video_already_addressed`) retains the parsed `StreamFormat`
+  table on the device and installs `video_stream_ops()` on the registered
+  `/dev/video<N>` node. `VIDIOC_STREAMON` awaits the start hook — which
+  maps the `VIDIOC_S_FMT`-committed format back through the retained
+  table (frame interval: nearest 30 fps; no frame-rate surface reaches
+  STREAMON) and runs the negotiation above — *before* the device is
+  marked streaming; a negotiation or activation failure fails the ioctl
+  (`EIO`, or `ENODEV` when the device/controller is gone) and leaves the
+  device non-streaming. If activation fails after COMMIT succeeded, the
+  VideoStreaming interface is returned to alternate setting 0 before the
+  error propagates. `VIDIOC_STREAMOFF` awaits the reverse teardown
+  (`deactivate_video_stream`: capture-pump stop request, then
+  `SET_INTERFACE` to alternate setting 0) before local buffer state is
+  reset. The composition (bind, negotiate, activate, deactivate, pump)
+  is generic over the narrow `UvcTransport` seam (control in/out,
+  endpoint configuration, isochronous receive); production implements
+  it on `Xhci`, and the end-to-end kernel fixture
+  (`smoke_uvc_streamon_composition_e2e`) implements it on a modelled
+  camera and asserts the transfer conversation through the real V4L2
+  dispatch. The pump receives through the single `UvcTransport::isoch_in`
+  call site, behind which the depth-4 isochronous pipelining work (#808)
+  slots in without changing the composition.
 - `try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
   config)` binds the standard Bluetooth USB interface. For a recognised
   WCN6855 ID it completes the Qualcomm USB firmware/status protocol before

@@ -5020,3 +5020,719 @@ kernel_test_in!(
     "drivers/usb/hub",
     smoke_usb_hub_set_feature_port_power_encode
 );
+
+// ── UVC streaming composition: end-to-end fixture (#803 + #812) ──────
+//
+// A modelled UVC camera (descriptor set + probe/commit state machine
+// + isochronous packet source) behind the `UvcTransport` seam, driven
+// through the REAL V4L2 ioctl dispatch: S_FMT → REQBUFS → QBUF →
+// STREAMON must run the probe/commit negotiation, configure the
+// endpoint, and select the streaming alternate before any frame can
+// land; DQBUF must return the modelled payload bytes; STREAMOFF must
+// stop the pump and release the alternate. The transfer log asserts
+// the conversation order, not just the outcomes. The composition code
+// under test is the production code — only the transport differs.
+
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// One recorded transfer in the modelled device conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FixtureXfer {
+    SetConfiguration,
+    SetCurProbe { payload: [u8; 26] },
+    GetCurProbe,
+    SetCurCommit { payload: [u8; 26] },
+    ConfigureEndpoints { ep_addr: u8 },
+    SetInterface { interface: u16, alt: u16 },
+    IsochIn,
+    OtherControlOut { request: u8, value: u16 },
+    OtherControlIn { request: u8, value: u16 },
+}
+
+struct FixtureState {
+    log: Vec<FixtureXfer>,
+    /// Last SET_CUR(PROBE) payload; GET_CUR(PROBE) answers from it.
+    probe: Option<[u8; 26]>,
+    fail_probe: bool,
+    fail_set_interface: bool,
+    packets: VecDeque<Vec<u8>>,
+}
+
+/// Modelled UVC device behind the [`crate::uvc::UvcTransport`] seam.
+/// Its GET_CUR(PROBE) behaves like a real device: it accepts the
+/// host's format/frame/interval and fills in its own
+/// `dwMaxVideoFrameSize` (640×480 YUYV) and
+/// `dwMaxPayloadTransferSize` (1024, matching the alt-1 endpoint).
+struct FixtureTransport {
+    state: IrqSafeSpinLock<FixtureState>,
+}
+
+impl FixtureTransport {
+    fn new(fail_probe: bool, fail_set_interface: bool, packets: Vec<Vec<u8>>) -> Self {
+        Self {
+            state: IrqSafeSpinLock::new(FixtureState {
+                log: Vec::new(),
+                probe: None,
+                fail_probe,
+                fail_set_interface,
+                packets: packets.into(),
+            }),
+        }
+    }
+
+    fn log(&self) -> Vec<FixtureXfer> {
+        self.state.lock().log.clone()
+    }
+}
+
+impl crate::uvc::UvcTransport for FixtureTransport {
+    async fn control_out(
+        &self,
+        _slot_id: u8,
+        _bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &[u8],
+    ) -> Result<usize, crate::xhci::XhciError> {
+        use crate::xhci::XhciError;
+        let mut state = self.state.lock();
+        if b_request == crate::hid::STD_REQ_SET_CONFIGURATION {
+            state.log.push(FixtureXfer::SetConfiguration);
+            return Ok(data.len());
+        }
+        if b_request == crate::control::REQ_SET_INTERFACE {
+            state.log.push(FixtureXfer::SetInterface {
+                interface: w_index,
+                alt: w_value,
+            });
+            if state.fail_set_interface && w_value != 0 {
+                return Err(XhciError::CmdFailed(0xE1));
+            }
+            return Ok(data.len());
+        }
+        if b_request == crate::uvc::VS_REQ_SET_CUR && w_value == crate::uvc::VS_PROBE_CONTROL {
+            let mut payload = [0u8; 26];
+            payload.copy_from_slice(&data[..26.min(data.len())]);
+            state.log.push(FixtureXfer::SetCurProbe { payload });
+            if state.fail_probe {
+                return Err(XhciError::CmdFailed(0xE2));
+            }
+            state.probe = Some(payload);
+            return Ok(data.len());
+        }
+        if b_request == crate::uvc::VS_REQ_SET_CUR && w_value == crate::uvc::VS_COMMIT_CONTROL {
+            let mut payload = [0u8; 26];
+            payload.copy_from_slice(&data[..26.min(data.len())]);
+            state.log.push(FixtureXfer::SetCurCommit { payload });
+            return Ok(data.len());
+        }
+        state.log.push(FixtureXfer::OtherControlOut {
+            request: b_request,
+            value: w_value,
+        });
+        Ok(data.len())
+    }
+
+    async fn control_in(
+        &self,
+        _slot_id: u8,
+        _bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        _w_index: u16,
+        out: &mut [u8],
+    ) -> Result<usize, crate::xhci::XhciError> {
+        let mut state = self.state.lock();
+        if b_request == crate::uvc::VS_REQ_GET_CUR && w_value == crate::uvc::VS_PROBE_CONTROL {
+            state.log.push(FixtureXfer::GetCurProbe);
+            let mut accepted = state.probe.unwrap_or([0u8; 26]);
+            // The device fills in its own frame size + payload size.
+            accepted[18..22].copy_from_slice(&614_400u32.to_le_bytes());
+            accepted[22..26].copy_from_slice(&1024u32.to_le_bytes());
+            let n = out.len().min(26);
+            out[..n].copy_from_slice(&accepted[..n]);
+            return Ok(n);
+        }
+        state.log.push(FixtureXfer::OtherControlIn {
+            request: b_request,
+            value: w_value,
+        });
+        Ok(0)
+    }
+
+    async fn configure_endpoints(
+        &self,
+        _slot_id: u8,
+        endpoints: &[crate::xhci::EndpointConfig],
+    ) -> Result<(), crate::xhci::XhciError> {
+        let mut state = self.state.lock();
+        for endpoint in endpoints {
+            state.log.push(FixtureXfer::ConfigureEndpoints {
+                ep_addr: endpoint.ep_addr,
+            });
+        }
+        Ok(())
+    }
+
+    async fn isoch_in(
+        &self,
+        _slot_id: u8,
+        _dci: u8,
+        out: &mut [u8],
+    ) -> Result<usize, crate::xhci::XhciError> {
+        let mut state = self.state.lock();
+        state.log.push(FixtureXfer::IsochIn);
+        match state.packets.pop_front() {
+            Some(packet) => {
+                let n = packet.len().min(out.len());
+                out[..n].copy_from_slice(&packet[..n]);
+                Ok(n)
+            }
+            None => Ok(0),
+        }
+    }
+}
+
+/// The modelled camera currently installed for the fixture stream
+/// hooks (fn pointers cannot capture, so the hooks resolve it here).
+static UVC_FIXTURE_TRANSPORT: IrqSafeSpinLock<Option<Arc<FixtureTransport>>> =
+    IrqSafeSpinLock::new(None);
+
+fn uvc_fixture_stream_start(
+    node: usize,
+    format: narf_drivers_video::v4l2_ioctl::PixFormat,
+) -> narf_drivers_video::v4l2_ioctl::StreamHookFuture {
+    Box::pin(async move {
+        let transport = UVC_FIXTURE_TRANSPORT.lock().clone().ok_or(19)?;
+        // Same composition as production, minus the pump spawn: the
+        // fixture drives `pump_video_frames_with` itself, interleaved
+        // with DQBUF, because a smoke cannot rely on executor
+        // scheduling (block_on does not drive the executor).
+        crate::uvc::stream_start_with(&*transport, node, format).await
+    })
+}
+
+fn uvc_fixture_stream_stop(node: usize) -> narf_drivers_video::v4l2_ioctl::StreamHookFuture {
+    Box::pin(async move {
+        let transport = UVC_FIXTURE_TRANSPORT.lock().clone().ok_or(19)?;
+        crate::uvc::stream_stop_with(&*transport, node).await
+    })
+}
+
+fn uvc_fixture_stream_ops() -> narf_drivers_video::v4l2_ioctl::StreamOps {
+    narf_drivers_video::v4l2_ioctl::StreamOps {
+        start: uvc_fixture_stream_start,
+        stop: uvc_fixture_stream_stop,
+    }
+}
+
+/// Configuration descriptor set for the modelled camera: VC interface
+/// 0, VS interface 1 with one uncompressed YUYV 640×480 @30 fps format
+/// and an isochronous alt-1 endpoint (0x81, 1024-byte packets).
+fn uvc_fixture_config_blob() -> Vec<u8> {
+    let mut cfg = alloc::vec::Vec::new();
+    // Configuration header (wTotalLength patched at the end).
+    cfg.extend_from_slice(&[9, 2, 0, 0, 2, 1, 0, 0x80, 50]);
+    // Interface 0: VideoControl.
+    cfg.extend_from_slice(&[9, 4, 0, 0, 0, 0x0E, 0x01, 0x00, 0]);
+    // VC_HEADER: bcdUVC 1.0, one streaming interface (1).
+    cfg.extend_from_slice(&[13, 0x24, 0x01, 0x00, 0x01, 13, 0, 0x40, 0x9C, 0x47, 1, 1]);
+    // Interface 1 alt 0: VideoStreaming, zero bandwidth.
+    cfg.extend_from_slice(&[9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0]);
+    // VS_INPUT_HEADER: 1 format, CS total 71, endpoint 0x81, terminal 1.
+    cfg.extend_from_slice(&[14, 0x24, 0x01, 1, 71, 0, 0x81, 0, 1, 0, 0, 0, 1, 0]);
+    // VS_FORMAT_UNCOMPRESSED: index 1, 1 frame, YUY2 GUID, 16 bpp.
+    cfg.extend_from_slice(&[27, 0x24, 0x04, 1, 1]);
+    cfg.extend_from_slice(&crate::uvc::GUID_FORMAT_YUY2);
+    cfg.extend_from_slice(&[16, 1, 0, 0, 0, 0]);
+    // VS_FRAME_UNCOMPRESSED: index 1, 640×480, default + only interval
+    // 333333 (30 fps), max frame buffer 614400 bytes.
+    cfg.extend_from_slice(&[30, 0x24, 0x05, 1, 0]);
+    cfg.extend_from_slice(&640u16.to_le_bytes());
+    cfg.extend_from_slice(&480u16.to_le_bytes());
+    cfg.extend_from_slice(&0u32.to_le_bytes()); // dwMinBitRate
+    cfg.extend_from_slice(&0u32.to_le_bytes()); // dwMaxBitRate
+    cfg.extend_from_slice(&614_400u32.to_le_bytes());
+    cfg.extend_from_slice(&333_333u32.to_le_bytes()); // default interval
+    cfg.push(1); // one discrete interval
+    cfg.extend_from_slice(&333_333u32.to_le_bytes());
+    // Interface 1 alt 1: VideoStreaming, one isochronous IN endpoint.
+    cfg.extend_from_slice(&[9, 4, 1, 1, 1, 0x0E, 0x02, 0x00, 0]);
+    cfg.extend_from_slice(&[7, 5, 0x81, 0x01, 0x00, 0x04, 1]);
+    let total = cfg.len() as u16;
+    cfg[2..4].copy_from_slice(&total.to_le_bytes());
+    cfg
+}
+
+/// The frame the modelled camera emits: two payload packets carrying
+/// `UVC-E2E-FRAME!` (FID set on both, EOF on the second).
+fn uvc_fixture_frame_packets() -> Vec<Vec<u8>> {
+    let mut first = alloc::vec![2u8, 0x81];
+    first.extend_from_slice(b"UVC-E2E-");
+    let mut second = alloc::vec![2u8, 0x83];
+    second.extend_from_slice(b"FRAME!");
+    alloc::vec![first, second]
+}
+
+// ── Fixture ioctl plumbing (mirrors the video crate's v4l2 mock) ────
+
+const FIXTURE_ARG: u64 = 512;
+
+fn fixture_eno(e: i64) -> u64 {
+    (-e) as u64
+}
+
+fn fixture_ioc(dir: u32, nr: u32, size: u32) -> u32 {
+    (dir << 30) | (size << 16) | ((b'V' as u32) << 8) | nr
+}
+
+struct FixtureCtx {
+    mem: IrqSafeSpinLock<Vec<u8>>,
+}
+
+impl FixtureCtx {
+    fn new() -> Self {
+        Self {
+            mem: IrqSafeSpinLock::new(alloc::vec![0u8; 8192]),
+        }
+    }
+    fn put_u32(&self, off: usize, v: u32) {
+        self.mem.lock()[FIXTURE_ARG as usize + off..FIXTURE_ARG as usize + off + 4]
+            .copy_from_slice(&v.to_ne_bytes());
+    }
+    fn get_u32(&self, off: usize) -> u32 {
+        let m = self.mem.lock();
+        let a = FIXTURE_ARG as usize + off;
+        u32::from_ne_bytes([m[a], m[a + 1], m[a + 2], m[a + 3]])
+    }
+}
+
+impl narf_filesystem::IoctlContext for FixtureCtx {
+    fn read(&self, a: u64, b: &mut [u8]) -> Result<(), narf_filesystem::FsError> {
+        let m = self.mem.lock();
+        let a = a as usize;
+        b.copy_from_slice(
+            m.get(a..a + b.len())
+                .ok_or(narf_filesystem::FsError::BadAddress)?,
+        );
+        Ok(())
+    }
+    fn write(&self, a: u64, b: &[u8]) -> Result<(), narf_filesystem::FsError> {
+        let mut m = self.mem.lock();
+        let a = a as usize;
+        m.get_mut(a..a + b.len())
+            .ok_or(narf_filesystem::FsError::BadAddress)?
+            .copy_from_slice(b);
+        Ok(())
+    }
+    fn nonblocking(&self) -> bool {
+        true
+    }
+}
+
+/// Poll a future once with a no-op waker.
+fn fixture_poll<F: Future>(fut: Pin<&mut F>) -> Poll<F::Output> {
+    fn raw() -> RawWaker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            raw()
+        }
+        unsafe fn noop(_: *const ()) {}
+        const V: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        RawWaker::new(core::ptr::null(), &V)
+    }
+    // SAFETY: the vtable's clone returns an equivalent waker and
+    // wake/drop are no-ops over a null data pointer that is never read.
+    let waker = unsafe { Waker::from_raw(raw()) };
+    let mut cx = Context::from_waker(&waker);
+    fut.poll(&mut cx)
+}
+
+/// Drive a future that must complete without external wakes (every
+/// modelled transfer is immediately ready). `None` = still pending
+/// after the poll budget — a fixture failure, never a hang.
+fn fixture_drive<F: Future>(fut: F) -> Option<F::Output> {
+    let mut fut = Box::pin(fut);
+    for _ in 0..100_000 {
+        if let Poll::Ready(v) = fixture_poll(fut.as_mut()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+type FixtureDevice = Arc<IrqSafeSpinLock<narf_drivers_video::devfs_bridge::VideoDevice>>;
+type FixtureEvents = Arc<IrqSafeSpinLock<narf_drivers_video::v4l2_ioctl::FdEvents>>;
+
+fn fixture_ioctl(
+    dev: &FixtureDevice,
+    events: &FixtureEvents,
+    ctx: &FixtureCtx,
+    cmd: u32,
+) -> Result<u64, &'static str> {
+    fixture_drive(narf_drivers_video::v4l2_ioctl::dispatch(
+        dev.clone(),
+        cmd,
+        FIXTURE_ARG,
+        ctx,
+        events.clone(),
+    ))
+    .ok_or("ioctl future pended")?
+    .map_err(|_| "ioctl faulted")
+}
+
+/// Reset all streaming state, bind the modelled camera, install the
+/// fixture stream hooks, and run S_FMT + REQBUFS(2) + QBUF×2 — the
+/// state from which STREAMON is meaningful.
+fn uvc_fixture_bound(
+    fail_probe: bool,
+    fail_set_interface: bool,
+) -> Result<
+    (
+        Arc<FixtureTransport>,
+        usize,
+        FixtureDevice,
+        FixtureCtx,
+        FixtureEvents,
+    ),
+    &'static str,
+> {
+    narf_drivers_video::devfs_bridge::__reset_for_test();
+    crate::uvc::__reset_uvc_for_test();
+    let transport = Arc::new(FixtureTransport::new(
+        fail_probe,
+        fail_set_interface,
+        uvc_fixture_frame_packets(),
+    ));
+    *UVC_FIXTURE_TRANSPORT.lock() = Some(transport.clone());
+
+    let blob = uvc_fixture_config_blob();
+    let idx = narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        7,
+        &blob,
+    ))
+    .map_err(|_| "bind against the modelled camera failed")?;
+    let (node, format_count) = {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = devices.get(idx).ok_or("bound device missing")?;
+        (device.video_node, device.formats.len())
+    };
+    if format_count != 1 {
+        return Err("bind should retain the parsed format table");
+    }
+    if !narf_drivers_video::devfs_bridge::set_stream_ops(node, uvc_fixture_stream_ops()) {
+        return Err("installing fixture stream hooks failed");
+    }
+    let dev = narf_drivers_video::devfs_bridge::get_device(node)
+        .ok_or("registered video device missing")?;
+    let events: FixtureEvents = Arc::new(IrqSafeSpinLock::new(
+        narf_drivers_video::v4l2_ioctl::FdEvents::new(),
+    ));
+    let ctx = FixtureCtx::new();
+
+    // S_FMT: YUYV 640×480 (v4l2_format pix fields at offset 8).
+    let yuyv = u32::from_le_bytes(*b"YUYV");
+    ctx.put_u32(0, 1);
+    ctx.put_u32(8, 640);
+    ctx.put_u32(12, 480);
+    ctx.put_u32(16, yuyv);
+    if fixture_ioctl(&dev, &events, &ctx, fixture_ioc(1, 5, 208))? != 0 {
+        return Err("S_FMT should succeed");
+    }
+    // REQBUFS: 2 MMAP buffers.
+    ctx.put_u32(0, 2);
+    ctx.put_u32(4, 1);
+    ctx.put_u32(8, 1);
+    if fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 8, 20))? != 0 {
+        return Err("REQBUFS should succeed");
+    }
+    // QBUF both buffers.
+    for index in 0..2u32 {
+        ctx.put_u32(0, index);
+        ctx.put_u32(4, 1);
+        ctx.put_u32(60, 1);
+        if fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 15, 88))? != 0 {
+            return Err("QBUF should succeed");
+        }
+    }
+    Ok((transport, idx, dev, ctx, events))
+}
+
+fn fixture_streamon(
+    dev: &FixtureDevice,
+    events: &FixtureEvents,
+    ctx: &FixtureCtx,
+) -> Result<u64, &'static str> {
+    ctx.put_u32(0, 1);
+    fixture_ioctl(dev, events, ctx, fixture_ioc(1, 18, 4))
+}
+
+fn fixture_streamoff(
+    dev: &FixtureDevice,
+    events: &FixtureEvents,
+    ctx: &FixtureCtx,
+) -> Result<u64, &'static str> {
+    ctx.put_u32(0, 1);
+    fixture_ioctl(dev, events, ctx, fixture_ioc(1, 19, 4))
+}
+
+/// Position of the first occurrence of `needle` in the transfer log.
+fn fixture_log_pos(log: &[FixtureXfer], needle: &FixtureXfer) -> Option<usize> {
+    log.iter().position(|x| x == needle)
+}
+
+fn smoke_uvc_streamon_composition_e2e() -> TestResult {
+    let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(false, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // STREAMON must run the hardware composition, not just flip state.
+    match fixture_streamon(&dev, &events, &ctx) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("STREAMON should succeed"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if !dev.lock().streaming {
+        return TestResult::Fail("device should be streaming after STREAMON");
+    }
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        match devices[idx].active_stream {
+            Some(ep) if ep.alternate_setting == 1 && ep.dci == 3 => {}
+            _ => return TestResult::Fail("STREAMON should activate alt 1 (DCI 3)"),
+        }
+    }
+    // Drive the capture pump, interleaved with nonblocking DQBUF, until
+    // the modelled frame lands in a queued buffer.
+    let mut pump = Box::pin(crate::uvc::pump_video_frames_with(idx, &*transport));
+    let mut dequeued = false;
+    for _ in 0..10_000 {
+        let _ = fixture_poll(pump.as_mut());
+        ctx.put_u32(4, 1);
+        ctx.put_u32(60, 1);
+        match fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 17, 88)) {
+            Ok(0) => {
+                dequeued = true;
+                break;
+            }
+            Ok(r) if r == fixture_eno(11) => continue,
+            Ok(_) => return TestResult::Fail("DQBUF should succeed or EAGAIN"),
+            Err(e) => return TestResult::Fail(e),
+        }
+    }
+    if !dequeued {
+        return TestResult::Fail("DQBUF never returned the modelled frame");
+    }
+    if ctx.get_u32(0) != 0 {
+        return TestResult::Fail("dequeued buffer should be index 0");
+    }
+    if ctx.get_u32(8) as usize != b"UVC-E2E-FRAME!".len() {
+        return TestResult::Fail("bytesused should equal the modelled frame length");
+    }
+    let bytes_ok = {
+        let g = dev.lock();
+        let f0 = g.buffers[0].frames[0];
+        let p = f0.start_address().kernel_ptr::<u8>();
+        let mut buf = [0u8; 14];
+        // SAFETY: f0 is an allocated frame owned by buffer 0; its
+        // direct-map pointer is valid for the 14 delivered bytes.
+        unsafe { core::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), 14) };
+        &buf == b"UVC-E2E-FRAME!"
+    };
+    if !bytes_ok {
+        return TestResult::Fail("buffer should contain the modelled frame bytes");
+    }
+    // STREAMOFF reverses the composition.
+    match fixture_streamoff(&dev, &events, &ctx) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("STREAMOFF should succeed"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if dev.lock().streaming {
+        return TestResult::Fail("STREAMOFF should clear streaming");
+    }
+    // The pump observes the stop request and exits cleanly.
+    let mut pump_done = None;
+    for _ in 0..10_000 {
+        if let Poll::Ready(r) = fixture_poll(pump.as_mut()) {
+            pump_done = Some(r);
+            break;
+        }
+    }
+    if !matches!(pump_done, Some(Ok(()))) {
+        return TestResult::Fail("pump should exit Ok after STREAMOFF");
+    }
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        if devices[idx].active_stream.is_some() {
+            return TestResult::Fail("STREAMOFF should clear the active stream");
+        }
+    }
+    // The transfer conversation: probe before commit, commit carries
+    // the device-accepted values, SET_INTERFACE after commit, isoc
+    // only after activation, alt 0 released at teardown.
+    let log = transport.log();
+    let desired = crate::uvc::VsProbeCommit {
+        hint: 1,
+        format_index: 1,
+        frame_index: 1,
+        frame_interval: 333_333,
+        ..Default::default()
+    };
+    let mut accepted = desired;
+    accepted.max_video_frame_size = 614_400;
+    accepted.max_payload_transfer_size = 1024;
+    let probe_payload = log.iter().find_map(|x| match x {
+        FixtureXfer::SetCurProbe { payload } => Some(*payload),
+        _ => None,
+    });
+    if probe_payload != Some(desired.encode()) {
+        return TestResult::Fail("SET_CUR(PROBE) should carry the desired stream parameters");
+    }
+    let commit_payload = log.iter().find_map(|x| match x {
+        FixtureXfer::SetCurCommit { payload } => Some(*payload),
+        _ => None,
+    });
+    if commit_payload != Some(accepted.encode()) {
+        return TestResult::Fail("SET_CUR(COMMIT) should carry the device-accepted parameters");
+    }
+    let pos = |needle: &FixtureXfer| fixture_log_pos(&log, needle);
+    let positions = [
+        pos(&FixtureXfer::SetConfiguration),
+        log.iter()
+            .position(|x| matches!(x, FixtureXfer::SetCurProbe { .. })),
+        pos(&FixtureXfer::GetCurProbe),
+        log.iter()
+            .position(|x| matches!(x, FixtureXfer::SetCurCommit { .. })),
+        pos(&FixtureXfer::ConfigureEndpoints { ep_addr: 0x81 }),
+        pos(&FixtureXfer::SetInterface {
+            interface: 1,
+            alt: 1,
+        }),
+        pos(&FixtureXfer::IsochIn),
+    ];
+    let mut order = Vec::new();
+    for position in positions {
+        match position {
+            Some(p) => order.push(p),
+            None => return TestResult::Fail("conversation is missing a required transfer"),
+        }
+    }
+    if !order.windows(2).all(|w| w[0] < w[1]) {
+        return TestResult::Fail("transfer conversation is out of order");
+    }
+    let last_set_interface = log.iter().rev().find_map(|x| match x {
+        FixtureXfer::SetInterface { alt, .. } => Some(*alt),
+        _ => None,
+    });
+    if last_set_interface != Some(0) {
+        return TestResult::Fail("teardown should end with SET_INTERFACE alt 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_composition_e2e);
+
+fn smoke_uvc_streamon_probe_failure_fails_ioctl() -> TestResult {
+    let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(true, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // A failed PROBE negotiation must fail STREAMON — the pre-#803
+    // behaviour (silent local-state success) is the black-stream bug.
+    match fixture_streamon(&dev, &events, &ctx) {
+        Ok(r) if r == fixture_eno(5) => {}
+        Ok(_) => return TestResult::Fail("STREAMON should fail with EIO when PROBE fails"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if dev.lock().streaming {
+        return TestResult::Fail("device must not be streaming after a failed STREAMON");
+    }
+    let log = transport.log();
+    if !log
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetCurProbe { .. }))
+    {
+        return TestResult::Fail("the failed PROBE attempt should be in the log");
+    }
+    if log
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetCurCommit { .. }))
+    {
+        return TestResult::Fail("COMMIT must not follow a failed PROBE");
+    }
+    if log
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::ConfigureEndpoints { .. }))
+    {
+        return TestResult::Fail("no endpoint may be configured after a failed PROBE");
+    }
+    if crate::uvc::UVC_DEVICES.lock()[idx].active_stream.is_some() {
+        return TestResult::Fail("no stream may be active after a failed STREAMON");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_streamon_probe_failure_fails_ioctl
+);
+
+fn smoke_uvc_streamon_activation_failure_unwinds() -> TestResult {
+    let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(false, true) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // SET_INTERFACE(alt 1) stalls after a successful COMMIT: STREAMON
+    // fails, and the composition unwinds the commit by returning the
+    // interface to its zero-bandwidth alternate.
+    match fixture_streamon(&dev, &events, &ctx) {
+        Ok(r) if r == fixture_eno(5) => {}
+        Ok(_) => return TestResult::Fail("STREAMON should fail with EIO when activation fails"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if dev.lock().streaming {
+        return TestResult::Fail("device must not be streaming after a failed STREAMON");
+    }
+    if crate::uvc::UVC_DEVICES.lock()[idx].active_stream.is_some() {
+        return TestResult::Fail("no stream may be active after a failed STREAMON");
+    }
+    let log = transport.log();
+    if !log
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetCurCommit { .. }))
+    {
+        return TestResult::Fail("COMMIT should have succeeded before activation");
+    }
+    let alt1 = fixture_log_pos(
+        &log,
+        &FixtureXfer::SetInterface {
+            interface: 1,
+            alt: 1,
+        },
+    );
+    let alt0 = fixture_log_pos(
+        &log,
+        &FixtureXfer::SetInterface {
+            interface: 1,
+            alt: 0,
+        },
+    );
+    match (alt1, alt0) {
+        (Some(a1), Some(a0)) if a0 > a1 => {}
+        _ => {
+            return TestResult::Fail("failed activation should be unwound with SET_INTERFACE alt 0")
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_streamon_activation_failure_unwinds
+);
