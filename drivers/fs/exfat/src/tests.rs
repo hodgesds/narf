@@ -961,3 +961,92 @@ fn smoke_exfat_time_decode_edges() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/exfat", smoke_exfat_time_decode_edges);
+
+/// Page-cache generation + writable-epoch tripwire (#681): exFAT
+/// mutations all return `Unsupported` today, so a file's generation
+/// is constant across opens — and the moment any mutation succeeds
+/// this test fails, forcing the writable-epoch design (see
+/// `ExfatVolume::bump_writable_epoch`) to be wired in with the
+/// write support instead of letting a stale constant through.
+fn smoke_exfat_cache_generation_constant_until_writable() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::ExfatVolume;
+
+    let payload: &[u8] = b"hello exfat\n";
+    let img = build_exfat_image("HELLO.TXT", payload);
+    let device = RamBlockDevice::from_image(LBS as u32, img);
+    let volume = match poll_once(ExfatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("ExfatVolume::mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hello.txt failed"),
+    };
+
+    // TRIPWIRE: the constant generation is sound only while every
+    // mutation is refused. If a future change makes either of these
+    // succeed, the generation must become dynamic in the same
+    // change — this test failing is the alarm.
+    match poll_once(file.write(0, b"x")) {
+        Some(Err(FsError::Unsupported)) => {}
+        _ => return TestResult::Fail("write must be Unsupported while generation is constant"),
+    }
+    match poll_once(file.truncate(0)) {
+        Some(Err(FsError::Unsupported)) => {}
+        _ => return TestResult::Fail("truncate must be Unsupported while generation is constant"),
+    }
+
+    let g0 = match file.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("regular file reports no cache generation"),
+    };
+    let id0 = file.mmap_backing_identity();
+
+    // A second lookup is a second node object for the same file;
+    // the values must agree or cross-open retention cannot work.
+    let reopened = match poll_once(root.lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second lookup failed"),
+    };
+    if reopened.mmap_cache_generation() != Some(g0) {
+        return TestResult::Fail("two opens of one file disagree on generation");
+    }
+    if reopened.mmap_backing_identity() != id0 {
+        return TestResult::Fail("two opens of one file disagree on backing identity");
+    }
+
+    // A different key (the root directory's slot position) draws a
+    // different generation from the same volume.
+    if volume.cache_generation(1) == g0 {
+        return TestResult::Fail("root key and file key share a generation");
+    }
+
+    // The writable epoch: bumping it (the future write path's
+    // mandatory first step) changes every file's generation at
+    // once, while identities stay put.
+    volume.bump_writable_epoch();
+    let g1 = match file.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("generation vanished after epoch bump"),
+    };
+    if g1 == g0 {
+        return TestResult::Fail("writable-epoch bump did not change the generation");
+    }
+    if reopened.mmap_cache_generation() != Some(g1) {
+        return TestResult::Fail("second open disagrees after epoch bump");
+    }
+    if file.mmap_backing_identity() != id0 {
+        return TestResult::Fail("epoch bump moved the backing identity");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/exfat",
+    smoke_exfat_cache_generation_constant_until_writable
+);

@@ -3160,4 +3160,154 @@ mod tests {
         "userspace/perf",
         smoke_shared_file_cache_survives_publisher_close
     );
+
+    /// Build the minimal ISO 9660 image the driver crate's own
+    /// tests use (PVD at sector 16, terminator at 17, root
+    /// directory at 18, `TEST.TXT;1` contents at 20), so the test
+    /// below can mount a real immutable filesystem in userspace.
+    fn iso681_image() -> alloc::vec::Vec<u8> {
+        const SECTOR: usize = 2048;
+        fn be_le32(buf: &mut [u8], off: usize, v: u32) {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&v.to_be_bytes());
+        }
+        fn be_le16(buf: &mut [u8], off: usize, v: u16) {
+            buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+            buf[off + 2..off + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        fn record(
+            dst: &mut [u8],
+            off: usize,
+            extent: u32,
+            len: u32,
+            flags: u8,
+            id: &[u8],
+        ) -> usize {
+            let mut total = 33 + id.len();
+            if total % 2 != 0 {
+                total += 1;
+            }
+            dst[off] = total as u8;
+            be_le32(dst, off + 2, extent);
+            be_le32(dst, off + 10, len);
+            dst[off + 25] = flags;
+            be_le16(dst, off + 28, 1);
+            dst[off + 32] = id.len() as u8;
+            dst[off + 33..off + 33 + id.len()].copy_from_slice(id);
+            total
+        }
+        let payload: &[u8] = b"narf-iso\n";
+        let mut img = alloc::vec![0u8; SECTOR * 24];
+        let root_off = 18 * SECTOR;
+        let mut cursor = 0usize;
+        cursor += record(&mut img[root_off..], cursor, 18, SECTOR as u32, 2, &[0x00]);
+        cursor += record(&mut img[root_off..], cursor, 18, SECTOR as u32, 2, &[0x01]);
+        let _ = record(
+            &mut img[root_off..],
+            cursor,
+            20,
+            payload.len() as u32,
+            0,
+            b"TEST.TXT;1",
+        );
+        let pvd = 16 * SECTOR;
+        img[pvd] = 1;
+        img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        img[pvd + 6] = 1;
+        be_le32(&mut img, pvd + 80, 24);
+        be_le16(&mut img, pvd + 120, 1);
+        be_le16(&mut img, pvd + 124, 1);
+        be_le16(&mut img, pvd + 128, SECTOR as u16);
+        let _ = record(&mut img, pvd + 156, 18, SECTOR as u32, 2, &[0x00]);
+        img[pvd + 881] = 1;
+        let term = 17 * SECTOR;
+        img[term] = 0xFF;
+        img[term + 1..term + 6].copy_from_slice(b"CD001");
+        img[term + 6] = 1;
+        let data_off = 20 * SECTOR;
+        img[data_off..data_off + payload.len()].copy_from_slice(payload);
+        img
+    }
+
+    /// End-to-end cross-open retention with a REAL driver (#681):
+    /// two lookups of one ISO 9660 file are two node objects; a page
+    /// published under the first open must be reservable through the
+    /// second — the property the constant generation + stable
+    /// backing identity exist to provide, and the one that silently
+    /// never engaged while these filesystems reported no generation
+    /// and per-open identities.
+    fn smoke_shared_file_iso9660_cross_open_retention() -> TestResult {
+        use narf_filesystem::FsInstance as _;
+
+        const OFFSET: u64 = 0x7ffd_0000;
+        let device = narf_block::ram::RamBlockDevice::from_image(2048, iso681_image());
+        let volume = match crate::handlers::poll_io_to_completion(
+            narf_drivers_fs_iso9660::volume::Iso9660Volume::mount(
+                device,
+                narf_lib::id::DomainId::DRIVER_0,
+            ),
+        ) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("mounting the test ISO image failed"),
+        };
+        let root = volume.root();
+        let open1 = match crate::handlers::poll_io_to_completion(root.lookup_async("TEST.TXT")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("first lookup of TEST.TXT failed"),
+        };
+        let open2 = match crate::handlers::poll_io_to_completion(root.lookup_async("TEST.TXT")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("second lookup of TEST.TXT failed"),
+        };
+        // The #681 contract, on real driver nodes.
+        let generation = match open1.mmap_cache_generation() {
+            Some(g) => g,
+            None => return TestResult::Fail("ISO file reports no cache generation"),
+        };
+        if open2.mmap_cache_generation() != Some(generation) {
+            return TestResult::Fail("two opens disagree on the generation");
+        }
+        if open1.mmap_backing_identity() != open2.mmap_backing_identity() {
+            return TestResult::Fail("two opens disagree on the backing identity");
+        }
+
+        let candidate = match narf_memory::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        let (published, publication) =
+            publish_shared_file_pages(&open1, OFFSET, alloc::vec![candidate], Some(generation));
+        let canonical = published == alloc::vec![candidate];
+        let retained = retain_shared_file_page(candidate.raw());
+        publication.commit();
+        let released = release_shared_file_page(candidate.raw());
+
+        // The second open must find the page the first published.
+        let hit = reserve_cached_shared_file_pages(&open2, OFFSET, 1);
+        let hit_same = hit
+            .as_ref()
+            .is_some_and(|(phys, _)| phys == &alloc::vec![candidate]);
+        if let Some((phys, publication)) = hit {
+            let _ = retain_shared_file_page(phys[0].raw());
+            publication.commit();
+            let _ = release_shared_file_page(phys[0].raw());
+        }
+        let retired = SHARED_FILE_PAGES.lock().remove_phys(candidate.raw());
+        let retired_final = retired.is_some();
+        if let Some(page) = retired {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(page.phys));
+        }
+
+        if !canonical || !retained || !released || !hit_same || !retired_final {
+            return TestResult::Fail(
+                "ISO 9660 page published under one open was not reservable under another",
+            );
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "userspace/perf",
+        smoke_shared_file_iso9660_cross_open_retention
+    );
 }

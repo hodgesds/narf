@@ -5,6 +5,7 @@
 //! `squashfs_read_inode` -> `squashfs_read_metadata`, and
 //! `squashfs_readpage_block`/`squashfs_frag_lookup` -> decompressor.
 
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -154,6 +155,76 @@ pub struct SquashfsVolume<B: BlockDevice> {
     fragment_indexes: Vec<u64>,
     xattrs: Option<XattrTable>,
     root_inode: IrqSafeSpinLock<Option<DiskInode>>,
+    /// Content-generation counters for the generic page cache (the
+    /// FAT construction, #668/#681). SquashFS has no mutation path —
+    /// every mutating op returns `ReadOnly` (node.rs) and the image
+    /// is authored offline — so a key's value is assigned once and
+    /// never bumped: the generation is constant per file instance.
+    /// Volume scope keyed by the inode's on-disk reference
+    /// (`InodeRef::encode`) is the one place all opens of a file
+    /// share.
+    cache_generations: IrqSafeSpinLock<CacheGenerations>,
+    /// Live `MAP_SHARED` identity anchors by inode reference, the
+    /// other half of `FileOps::mmap_backing_identity`: the generic
+    /// page cache keys retained pages by the anchor's address, so
+    /// every open of one file must report the one live anchor for
+    /// its inode while any node of the file exists. Weak so a file
+    /// no open references gives its anchor up; a later open mints a
+    /// fresh one (safe: generations distinguish file instances even
+    /// if an anchor address is recycled).
+    mmap_anchors: IrqSafeSpinLock<BTreeMap<u64, Weak<MmapAnchor>>>,
+}
+
+/// One SquashFS file's `MAP_SHARED` identity. Every lookup mints a
+/// fresh [`crate::node::SquashfsNode`], but `MAP_SHARED` mappings of the same
+/// file must share pages across those opens. The address of the
+/// single live anchor per inode reference is what
+/// `FileOps::mmap_backing_identity` reports; every node of the file
+/// holds it, so it cannot be reused while any mapping exists.
+#[derive(Debug)]
+pub struct MmapAnchor {
+    _key: u64,
+}
+
+/// Content-generation counters for one volume (the FAT construction).
+/// A key's first read draws a fresh volume-wide tick; the value is
+/// then fixed for the key. A generation therefore names one file
+/// *instance*: two different files can never hold the same value, so
+/// a retained page's recorded generation can only ever match the
+/// file instance that published it. SquashFS never bumps — there is
+/// no mutation to bump for — so unlike FAT this map has no writer
+/// other than first assignment.
+#[derive(Debug)]
+struct CacheGenerations {
+    values: BTreeMap<u64, u64>,
+    /// Next tick to issue. Starts at 1: 0 is never a real generation,
+    /// so a key with no entry yet cannot alias an issued one.
+    next_tick: u64,
+}
+
+impl CacheGenerations {
+    fn new() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            next_tick: 1,
+        }
+    }
+
+    /// The generation for `key`, assigned on first read.
+    fn value(&mut self, key: u64) -> u64 {
+        match self.values.get(&key) {
+            Some(&generation) => generation,
+            None => {
+                let generation = self.next_tick;
+                self.next_tick = self.next_tick.wrapping_add(1);
+                if self.next_tick == 0 {
+                    self.next_tick = 1;
+                }
+                self.values.insert(key, generation);
+                generation
+            }
+        }
+    }
 }
 
 impl<B: BlockDevice + 'static> SquashfsVolume<B> {
@@ -271,6 +342,8 @@ impl<B: BlockDevice + 'static> SquashfsVolume<B> {
             fragment_indexes,
             xattrs,
             root_inode: IrqSafeSpinLock::new(None),
+            cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
+            mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
         });
 
         // Linux mounts only after the root inode decodes as a directory.
@@ -280,6 +353,29 @@ impl<B: BlockDevice + 'static> SquashfsVolume<B> {
         }
         *volume.root_inode.lock() = Some(root);
         Ok(volume)
+    }
+
+    /// The page-cache generation for the file with inode reference
+    /// `key`: assigned once from the volume tick map and constant
+    /// thereafter — SquashFS content cannot change within a mount.
+    pub fn cache_generation(&self, key: u64) -> u64 {
+        self.cache_generations.lock().value(key)
+    }
+
+    /// The live [`MmapAnchor`] for the file with inode reference
+    /// `key`, created on first use. Dead entries are pruned as the
+    /// table grows.
+    pub fn mmap_anchor(&self, key: u64) -> Arc<MmapAnchor> {
+        let mut anchors = self.mmap_anchors.lock();
+        if let Some(anchor) = anchors.get(&key).and_then(Weak::upgrade) {
+            return anchor;
+        }
+        if anchors.len() >= 256 && anchors.len().is_power_of_two() {
+            anchors.retain(|_, anchor| anchor.strong_count() != 0);
+        }
+        let anchor = Arc::new(MmapAnchor { _key: key });
+        anchors.insert(key, Arc::downgrade(&anchor));
+        anchor
     }
 
     pub fn root_ref(&self) -> InodeRef {

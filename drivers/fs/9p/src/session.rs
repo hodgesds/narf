@@ -7,6 +7,8 @@
 //! - `attach(5)` — fid allocation discipline.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -111,6 +113,28 @@ pub struct P9Session {
     /// The mount's superblock `st_dev` (one session per mount, as Linux
     /// has one `v9fs_session_info` per superblock).
     dev: u64,
+    /// Live `MAP_SHARED` identity anchors by `qid.path`, the session
+    /// half of `FileOps::mmap_backing_identity` (#681): the generic
+    /// page cache keys retained pages by the anchor's address, so
+    /// every node for one server file must report the one live
+    /// anchor for its qid.path while any node of the file exists.
+    /// Weak so a file no node references gives its anchor up; a later
+    /// node mints a fresh one (safe: the qid.version-derived
+    /// generation distinguishes file instances even if an anchor
+    /// address is recycled).
+    mmap_anchors: narf_lib::sync::IrqSafeSpinLock<BTreeMap<u64, Weak<MmapAnchor>>>,
+}
+
+/// One 9P server file's `MAP_SHARED` identity within a session.
+/// Every lookup mints a fresh [`crate::node::NinepNode`], but
+/// `MAP_SHARED` mappings of the same file must share pages across
+/// those opens. The address of the single live anchor per qid.path
+/// is what `FileOps::mmap_backing_identity` reports; every node of
+/// the file holds it, so it cannot be reused while any mapping
+/// exists.
+#[derive(Debug)]
+pub struct MmapAnchor {
+    _path: u64,
 }
 
 impl Default for P9Session {
@@ -134,7 +158,24 @@ impl P9Session {
             next_fid: AtomicU32::new(1),
             // Default cap before Tversion negotiates a real value.
             msize: AtomicU32::new(8192),
+            mmap_anchors: narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new()),
         }
+    }
+
+    /// The live [`MmapAnchor`] for the server file with `qid.path`
+    /// `path`, created on first use. Dead entries are pruned as the
+    /// table grows.
+    pub fn mmap_anchor(&self, path: u64) -> Arc<MmapAnchor> {
+        let mut anchors = self.mmap_anchors.lock();
+        if let Some(anchor) = anchors.get(&path).and_then(Weak::upgrade) {
+            return anchor;
+        }
+        if anchors.len() >= 256 && anchors.len().is_power_of_two() {
+            anchors.retain(|_, anchor| anchor.strong_count() != 0);
+        }
+        let anchor = Arc::new(MmapAnchor { _path: path });
+        anchors.insert(path, Arc::downgrade(&anchor));
+        anchor
     }
 
     /// Allocate a fresh tag, wrapping past `NOTAG - 1`.

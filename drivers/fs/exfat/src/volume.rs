@@ -15,9 +15,11 @@
 //!   §7.1 Allocation Bitmap, §7.2 Up-case Table.
 //!   <https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification>
 
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
 use narf_capabilities::{Cap, Read, Write};
@@ -89,6 +91,89 @@ pub struct ExfatVolume<B: BlockDevice> {
     /// The root directory's times: the mount time, as Linux's
     /// `exfat_read_root` stamps it (the root has no file entry).
     pub root_times: super::dir::ExfatTimes,
+    /// Content-generation counters for the generic page cache (the
+    /// FAT construction, #668/#681). exFAT content is immutable
+    /// *today* — `write`/`truncate` return `Unsupported` and the
+    /// crate has no create/unlink/rename — so a key's value is
+    /// assigned once and never bumped by any current code path: the
+    /// generation is constant per file instance. Volume scope keyed
+    /// by the entry's slot position (the node's `st_ino`) is the one
+    /// place all opens of a file share.
+    cache_generations: IrqSafeSpinLock<CacheGenerations>,
+    /// Live `MAP_SHARED` identity anchors by entry slot position,
+    /// the other half of `FileOps::mmap_backing_identity`: the
+    /// generic page cache keys retained pages by the anchor's
+    /// address, so every open of one file must report the one live
+    /// anchor for its entry while any node of the file exists. Weak
+    /// so a file no open references gives its anchor up; a later open
+    /// mints a fresh one (safe: generations distinguish file
+    /// instances even if an anchor address is recycled).
+    mmap_anchors: IrqSafeSpinLock<BTreeMap<u64, Weak<MmapAnchor>>>,
+    /// The write-support tripwire for the constant generation above
+    /// (#681). The generation every node reports folds this epoch
+    /// in, so bumping it invalidates every retained page on the
+    /// volume at once. It is 0 while the driver is read-only. **The
+    /// future write path must call
+    /// [`ExfatVolume::bump_writable_epoch`] before its first
+    /// mutation** (and grow per-file bumps from there); the
+    /// `write`/`truncate` stubs in node.rs and the
+    /// `smoke_exfat_cache_generation_constant_until_writable` test
+    /// exist to make forgetting this loud, not silent.
+    writable_epoch: AtomicU64,
+}
+
+/// One exFAT file's `MAP_SHARED` identity. Every lookup mints a
+/// fresh [`crate::node::ExfatNode`], but `MAP_SHARED` mappings of
+/// the same file must share pages across those opens. The address of
+/// the single live anchor per entry slot position is what
+/// `FileOps::mmap_backing_identity` reports; every node of the file
+/// holds it, so it cannot be reused while any mapping exists.
+#[derive(Debug)]
+pub struct MmapAnchor {
+    _key: u64,
+}
+
+/// Content-generation counters for one volume (the FAT construction).
+/// A key's first read draws a fresh volume-wide tick; the value is
+/// then fixed for the key. A generation therefore names one file
+/// *instance*: two different files can never hold the same value, so
+/// a retained page's recorded generation can only ever match the
+/// file instance that published it. exFAT never bumps a key — there
+/// is no mutation to bump for today — so unlike FAT this map has no
+/// writer other than first assignment; the volume-wide
+/// `writable_epoch` fold in `ExfatVolume::cache_generation` is the
+/// guard against the day that stops being true.
+#[derive(Debug)]
+struct CacheGenerations {
+    values: BTreeMap<u64, u64>,
+    /// Next tick to issue. Starts at 1: 0 is never a real generation,
+    /// so a key with no entry yet cannot alias an issued one.
+    next_tick: u64,
+}
+
+impl CacheGenerations {
+    fn new() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            next_tick: 1,
+        }
+    }
+
+    /// The generation for `key`, assigned on first read.
+    fn value(&mut self, key: u64) -> u64 {
+        match self.values.get(&key) {
+            Some(&generation) => generation,
+            None => {
+                let generation = self.next_tick;
+                self.next_tick = self.next_tick.wrapping_add(1);
+                if self.next_tick == 0 {
+                    self.next_tick = 1;
+                }
+                self.values.insert(key, generation);
+                generation
+            }
+        }
+    }
 }
 
 impl<B: BlockDevice + 'static> ExfatVolume<B> {
@@ -177,7 +262,50 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
             root_times: super::dir::ExfatTimes::root_at(
                 narf_time::now_wall().as_nanos().max(0) as u64
             ),
+            cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
+            mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
+            writable_epoch: AtomicU64::new(0),
         }))
+    }
+
+    /// The page-cache generation for the file whose entry sits at
+    /// slot position `key`: the key's once-assigned tick, folded
+    /// with the volume's writable epoch. While the driver is
+    /// read-only the epoch is 0 and the value is constant per file;
+    /// the epoch fold is what keeps the constant honest if write
+    /// support ever lands (see the `writable_epoch` field).
+    pub fn cache_generation(&self, key: u64) -> u64 {
+        let tick = self.cache_generations.lock().value(key);
+        tick ^ self
+            .writable_epoch
+            .load(Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
+    /// Advance the writable epoch, invalidating every page retained
+    /// from this volume. **The future write path must call this
+    /// before its first mutation** — it is the tripwire that keeps
+    /// the constant per-file generations sound across the read-only
+    /// → writable transition (#681). Per-file generation bumps are
+    /// the writable design's next step after this.
+    pub fn bump_writable_epoch(&self) {
+        self.writable_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The live [`MmapAnchor`] for the file whose entry sits at slot
+    /// position `key`, created on first use. Dead entries are pruned
+    /// as the table grows.
+    pub fn mmap_anchor(&self, key: u64) -> Arc<MmapAnchor> {
+        let mut anchors = self.mmap_anchors.lock();
+        if let Some(anchor) = anchors.get(&key).and_then(Weak::upgrade) {
+            return anchor;
+        }
+        if anchors.len() >= 256 && anchors.len().is_power_of_two() {
+            anchors.retain(|_, anchor| anchor.strong_count() != 0);
+        }
+        let anchor = Arc::new(MmapAnchor { _key: key });
+        anchors.insert(key, Arc::downgrade(&anchor));
+        anchor
     }
 
     /// LBA of the first sector of `cluster` in the cluster heap.

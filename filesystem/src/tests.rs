@@ -138,6 +138,56 @@ fn smoke_fs_initramfs_read() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_initramfs_read);
 
+/// Page-cache generation (#681): an initramfs file's bytes are a
+/// slice of the immutable boot archive, so every lookup must report
+/// the same constant generation and a backing identity anchored on
+/// the archive span itself (each lookup rebuilds the node object,
+/// so an object-address identity would never repeat — the #679
+/// trap). Two lookups agreeing is what lets retained pages be
+/// reserved across opens.
+fn smoke_fs_initramfs_cache_generation_stable() -> TestResult {
+    use crate::{bootstrap_mount_authority, registry, resolve, Initramfs};
+
+    let fs = match Initramfs::from_cpio("smoke-fs-gen", SMOKE_INITRAMFS) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("CPIO parse failed at fixture build"),
+    };
+    let authority = bootstrap_mount_authority();
+    let _handle = match registry().mount(&authority, "/smoke-gen", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount() refused a live authority"),
+    };
+
+    let pair = registry()
+        .with_mount("/smoke-gen", |fs| {
+            let root = fs.root();
+            let first = resolve(root.clone(), "hello").ok()?;
+            let second = resolve(root, "hello").ok()?;
+            Some((
+                first.mmap_cache_generation(),
+                first.mmap_backing_identity(),
+                second.mmap_cache_generation(),
+                second.mmap_backing_identity(),
+            ))
+        })
+        .flatten();
+    let (g1, id1, g2, id2) = match pair {
+        Some(p) => p,
+        None => return TestResult::Fail("resolve(hello) failed inside mounted FS"),
+    };
+    if g1.is_none() {
+        return TestResult::Fail("initramfs file reports no cache generation");
+    }
+    if g1 != g2 {
+        return TestResult::Fail("two lookups disagree on the generation");
+    }
+    if id1 != id2 || id1 == 0 {
+        return TestResult::Fail("two lookups disagree on the backing identity");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_initramfs_cache_generation_stable);
+
 fn smoke_fs_lookup_missing() -> TestResult {
     use crate::{bootstrap_mount_authority, registry, resolve, FsError, Initramfs};
 

@@ -640,3 +640,101 @@ fn smoke_9p_stat_time_conversion_edges() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/9p", smoke_9p_stat_time_conversion_edges);
+
+/// Page-cache generation from `qid.version` (#681): the loopback
+/// server starts files at version 0 (no version maintained → the
+/// node reports `None` and stays out of the retained cache); a
+/// `Twrite` bumps the server version, an `Rstat` refresh makes the
+/// node report a generation; a simulated external change
+/// (`replace_data`) bumps it again and the generation must move —
+/// that move is what invalidates retained pages. Identity (the
+/// session anchor for `qid.path`) stays fixed across opens and
+/// across version changes.
+fn smoke_9p_cache_generation_tracks_qid_version() -> TestResult {
+    let transport = LoopbackTransport::new(&[("greet", b"initial-content"), ("other", b"x")]);
+    let t: Arc<dyn crate::session::Transport> = transport.clone();
+    let vol = match poll_once(NinepVolume::mount(t, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = vol.root();
+    let file = match poll_once(root.lookup_async("greet")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup greet failed"),
+    };
+
+    // Version 0: no generation — the file must not enter the cache.
+    if file.mmap_cache_generation().is_some() {
+        return TestResult::Fail("version-0 file must report no cache generation");
+    }
+    let id0 = file.mmap_backing_identity();
+
+    // A write through the protocol bumps the server-side version;
+    // the next Rstat refresh surfaces it as a generation.
+    let payload = b"changed";
+    match poll_once(file.write(0, payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("write failed"),
+    }
+    match poll_once(file.stat_async()) {
+        Some(Ok(_)) => {}
+        _ => return TestResult::Fail("stat_async after write failed"),
+    }
+    let g1 = match file.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("no generation after version bump + stat refresh"),
+    };
+
+    // A second open of the same server file: same identity, and
+    // after its own stat refresh the same generation.
+    let reopened = match poll_once(root.lookup_async("greet")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second lookup failed"),
+    };
+    if reopened.mmap_backing_identity() != id0 {
+        return TestResult::Fail("two opens of one server file disagree on identity");
+    }
+    match poll_once(reopened.stat_async()) {
+        Some(Ok(_)) => {}
+        _ => return TestResult::Fail("stat_async on second open failed"),
+    }
+    if reopened.mmap_cache_generation() != Some(g1) {
+        return TestResult::Fail("two opens disagree on generation at the same version");
+    }
+
+    // A different server file has a different identity.
+    let other = match poll_once(root.lookup_async("other")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup other failed"),
+    };
+    if other.mmap_backing_identity() == id0 {
+        return TestResult::Fail("different server files share an identity");
+    }
+
+    // An external (server-side) change bumps the version again;
+    // after a stat refresh the generation must move — retained
+    // pages published under g1 are thereby invalidated — while the
+    // identity stays put.
+    if !transport.replace_data("greet", b"external-edit") {
+        return TestResult::Fail("replace_data failed");
+    }
+    match poll_once(file.stat_async()) {
+        Some(Ok(_)) => {}
+        _ => return TestResult::Fail("stat_async after external change failed"),
+    }
+    let g2 = match file.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("generation vanished after external change"),
+    };
+    if g2 == g1 {
+        return TestResult::Fail("generation did not move after the qid.version changed");
+    }
+    if file.mmap_backing_identity() != id0 {
+        return TestResult::Fail("identity moved across a version change");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/9p",
+    smoke_9p_cache_generation_tracks_qid_version
+);

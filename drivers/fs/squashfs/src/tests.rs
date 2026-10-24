@@ -416,3 +416,61 @@ fn smoke_squashfs_always_read_only() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/squashfs", smoke_squashfs_always_read_only);
+
+/// Page-cache generation (#681): a SquashFS file's bytes cannot
+/// change within a mount, so every open must report the same
+/// constant generation and the same stable backing identity — the
+/// two values the generic page cache needs to retain a file's pages
+/// across opens (the #679 shape). A second file must not share the
+/// (identity, generation) pair.
+fn smoke_squashfs_mmap_cache_generation_constant_across_opens() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let volume = match mount_image(FIXTURE.to_vec()) {
+        Ok(volume) => volume,
+        Err(_) => return TestResult::Fail("Linux mksquashfs fixture did not mount"),
+    };
+    let root = volume.root();
+
+    let file = match poll_once(root.lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("hello lookup failed"),
+    };
+    let g0 = match file.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("regular file reports no cache generation"),
+    };
+    let id0 = file.mmap_backing_identity();
+
+    // A second lookup is a second node object for the same file;
+    // the values must agree or cross-open retention cannot work.
+    let reopened = match poll_once(root.lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second hello lookup failed"),
+    };
+    if reopened.mmap_cache_generation() != Some(g0) {
+        return TestResult::Fail("two opens of one file disagree on generation");
+    }
+    if reopened.mmap_backing_identity() != id0 {
+        return TestResult::Fail("two opens of one file disagree on backing identity");
+    }
+    if file.mmap_cache_generation() != Some(g0) {
+        return TestResult::Fail("generation is not constant across calls");
+    }
+
+    // A different file must not share the (identity, generation)
+    // pair, or a retained page could be served for the wrong file.
+    let other = match poll_once(root.lookup_async("sparse.bin")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("sparse.bin lookup failed"),
+    };
+    if other.mmap_backing_identity() == id0 && other.mmap_cache_generation() == Some(g0) {
+        return TestResult::Fail("two different files alias one cache key");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/squashfs",
+    smoke_squashfs_mmap_cache_generation_constant_across_opens
+);
