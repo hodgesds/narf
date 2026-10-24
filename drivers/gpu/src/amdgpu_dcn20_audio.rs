@@ -27,9 +27,10 @@
 //!   the laptop sequence covers.
 //! - In-tree: `amdgpu_dcn30_audio` (the dGPU owner's sequence shape
 //!   and Azalia field values), `amdgpu_hdmi_audio` (DTO math),
-//!   `amdgpu_dcn401_hdmi_audio::acr` / `::channels` (ACR tables and
-//!   the speaker→channel-enable conversion, shared rather than
-//!   re-derived).
+//!   `amdgpu_dcn401_otg::acr` / `::channels` (the ACR tables and
+//!   speaker→channel-enable conversion defined in
+//!   `amdgpu_dcn401_hdmi_audio` and re-exported by the OTG owner,
+//!   shared rather than re-derived).
 //!
 //! ## Write-list discipline
 //!
@@ -60,6 +61,7 @@
 
 extern crate alloc;
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::amdgpu_dcn::DcnWrite;
@@ -267,7 +269,7 @@ fn az_enable_writes(base2: u32, req: &Dcn20AudioRequest) -> Vec<DcnWrite> {
         IX_PIN_CONTROL_CHANNEL_SPEAKER,
         u32::from(req.speakers) | connection,
     );
-    let channel_mask = crate::amdgpu_dcn401_hdmi_audio::channels(req.speakers);
+    let channel_mask = crate::amdgpu_dcn401_otg::channels(req.speakers);
     az_push(
         &mut writes,
         base2,
@@ -339,7 +341,7 @@ pub fn dcn20_audio_enable_sequence(
         return Vec::new();
     };
     let d = req.dig;
-    let channel_enable = u32::from(crate::amdgpu_dcn401_hdmi_audio::channels(req.speakers)) << 8;
+    let channel_enable = u32::from(crate::amdgpu_dcn401_otg::channels(req.speakers)) << 8;
     // AFMT clock first — the encoder blocks are unclocked until this.
     writes.push(DcnWrite {
         addr: dig(dcn_base2, d, AFMT_CNTL),
@@ -364,7 +366,7 @@ pub fn dcn20_audio_enable_sequence(
                 value: HDMI_ACR_PACKET_CONTROL_ENABLE,
             });
             // ACR (N, CTS) pairs for 32 / 44.1 / 48 kHz, 8 bpc tables.
-            let acr = crate::amdgpu_dcn401_hdmi_audio::acr(
+            let acr = crate::amdgpu_dcn401_otg::acr(
                 crate::amdgpu_dmub_navi48::TmdsDepth::Bpc8,
                 req.pixel_clock_khz,
             );
