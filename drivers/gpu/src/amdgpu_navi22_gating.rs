@@ -349,14 +349,20 @@ impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
     }
 }
 
-/// Register access with Linux's sequence shape: every read is checked for
-/// device loss before its value can feed a write.
+/// Checked register access. An all-set RLC override is data for Linux's
+/// RMW; only that word uses an independent, fresh RLC control probe.
 struct Seq<'a, I: Io> {
     io: &'a mut I,
 }
 impl<I: Io> Seq<'_, I> {
     fn rd(&mut self, reg: Reg) -> Result<u32, Error> {
         match self.io.read(reg) {
+            u32::MAX if reg == RLC_CGTT_MGCG_OVERRIDE => {
+                if self.rd(RLC_CNTL)? & RLC_ENABLE_F32 == 0 {
+                    return Err(Error::RlcHalted);
+                }
+                Ok(u32::MAX)
+            }
             u32::MAX => Err(Error::DeviceGone),
             value => Ok(value),
         }

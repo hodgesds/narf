@@ -244,6 +244,9 @@ impl Bench {
             },
         };
         let model = Arc::new(Model(IrqSafeSpinLock::new(State::default())));
+        // Representative Navi22 GB_ADDR_CONFIG: 8 pipes / 8 packers,
+        // 256-byte interleave and 2 compressed fragments.
+        model.0.lock().mem.insert(0x263e, 0x343);
         let attached = model::attach(regs.virt, model.clone());
         let ip = |hw_id, v: (u8, u8, u8), bases: &[u32]| {
             let mut base_addrs = [0; d::MAX_BASE_ADDRS];

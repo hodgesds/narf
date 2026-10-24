@@ -367,7 +367,10 @@ reports
 selector ownership with RLC booted and GFX powered. It samples the NBIO
 revision strap, GB_ADDR_CONFIG, per-SE/SA fused and user RB/WGP disables and
 the TCC disables, restores SE/SA broadcast within one capability operation,
-and `derive(Limits, &Sample)` reproduces `gfx_v10_0_setup_rb`,
+and checks selector readback using only GRBM_GFX_INDEX's defined fields;
+reserved read bits cannot invalidate a correct selection. A mismatch in a
+defined selector or broadcast field still fails with `Readback`.
+`derive(Limits, &Sample)` reproduces `gfx_v10_0_setup_rb`,
 `gfx_v10_0_get_cu_info` and `gfx_v10_0_get_tcc_info`. A zero or non-256 B
 interleave GB_ADDR_CONFIG, zero CUs/RBs, or GC dimensions beyond the GFX10
 DRM layout are refused; only device loss or revoked authority fails the
@@ -6732,7 +6735,10 @@ smu_cmn_feature_update_enable_state with running-set and protection checks),
 the initial `DisallowGfxOff`, and UCLK/FCLK hard minimums at the admitted
 floors (`ClockManager::hard_min`). It then starts the GFXOFF controller.
 An all-ones gating read logs its discovery block, BAR5 byte address and the
-number of register writes by that gating owner before returning `DeviceGone`.
+number of register writes by that gating owner. Status/control reads fail
+with `DeviceGone`. RLC_CGTT_MGCG_OVERRIDE alone is a full-word RMW operand:
+an all-set value is retained only after a fresh RLC_CNTL read proves the
+RLC F32 is running; a missing or halted RLC still refuses programming.
 The gating owner remains terminal `Failed`: earlier IP blocks may already be
 programmed, and no successful rollback is implied. Failure returns before
 subsequent SMU feature enables, floor reductions or GFXOFF startup.
@@ -7057,6 +7063,17 @@ DCN314. DPP/OPP/MPC ids, strides and used fields match the two Linux headers.
 DCCG supports all six DPP DTOs and the shared DENTIST divider read/resync;
 Phoenix-only pixel-rate and DPIA mux methods return `Unsupported` before I/O
 on Navi22. These blocks do not by themselves establish a native display mode.
+
+`Hubp::initialize(gb_addr_config)` admits only a blank DCN30 pipe with a GC10
+256-byte-interleave configuration. It applies `hubp3_init`'s HUBPREQ_DEBUG
+ECO and TTU-enable step, then derives DCSURF_ADDR_CONFIG's pipe, compressed
+fragment and packer fields from this device's GB_ADDR_CONFIG. Unsupported
+profiles, interleaves, a live fetch or missing-device input fail before any
+write. The RDNA2 pipeline calls this after domain power-up and HUBP clock
+enable, before surface setup. Plane/DSC power-request brackets preserve an
+inherited IP_REQUEST_EN and unrelated bits; errors and dropped transition
+futures clear only a request that the bracket itself raised. Revocation or
+device loss can prevent cleanup and never establish successful retirement.
 
 `amdgpu_dcn30_clk::ClockManager` owns Navi22's separate DAL mailbox and DCCG.
 Its unsafe constructor requires the same exclusive physical GPU ownership as

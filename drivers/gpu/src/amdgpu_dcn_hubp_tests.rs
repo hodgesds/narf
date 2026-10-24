@@ -228,6 +228,41 @@ kernel_test_in!(
     hubp_first_surface_replaces_inherited_fetch_state
 );
 
+fn hubp_initialization_uses_device_geometry_and_checks_before_writes() -> TestResult {
+    let mut hubp = engine(1);
+    if hubp.initialize(0x343) != Err(Error::Unsupported) || !hubp.io.writes.is_empty() {
+        return TestResult::Fail("RDNA2 initialization admitted a Phoenix pipe");
+    }
+    hubp.profile = Profile::Navi22;
+    let at = |r: u64| (r + STRIDE) as usize;
+    hubp.io.values[at(DCSURF_ADDR_CONFIG)] = 0x8007_30c7;
+    hubp.io.values[at(DCHUBP_CNTL)] = 0x1100;
+    if hubp.initialize(0x343).is_err()
+        || hubp.io.values[at(DCSURF_ADDR_CONFIG)] != 0x8003_1003
+        || hubp.io.values[at(HUBPREQ_DEBUG)] != 1 << 26
+        || hubp.io.values[at(DCHUBP_CNTL)] & 0x1100 != 0x100
+    {
+        return TestResult::Fail("HUBP init lost fabric geometry, ECO or TTU state");
+    }
+    let count = hubp.io.writes.len();
+    if hubp.initialize(u32::MAX) != Err(Error::DeviceGone)
+        || hubp.initialize(1 << 3) != Err(Error::Unsupported)
+        || hubp.initialize(4 << 3) != Err(Error::Unsupported)
+        || hubp.io.writes.len() != count
+    {
+        return TestResult::Fail("unsupported HUBP geometry changed registers");
+    }
+    hubp.blanked = false;
+    if hubp.initialize(0x343) != Err(Error::Busy) || hubp.io.writes.len() != count {
+        return TestResult::Fail("HUBP init changed a fetching pipe");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-hubp",
+    hubp_initialization_uses_device_geometry_and_checks_before_writes
+);
+
 fn hubp_rejects_surfaces_the_pipe_cannot_fetch() -> TestResult {
     let mut hubp = engine(0);
     for bad in [

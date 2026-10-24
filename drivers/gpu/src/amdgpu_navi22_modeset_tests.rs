@@ -1,6 +1,7 @@
 use super::*;
 use crate::amdgpu_navi22_modeset_model::{self as m, d1, d2, d3, Bench, DpSink, Vram, MARK};
 use alloc::{vec, vec::Vec};
+use core::task::{Context, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn soc() -> dml30::Soc {
@@ -996,6 +997,98 @@ fn navi22_modeset_models_every_pipe_and_dig_route() -> TestResult {
     }
     TestResult::Pass
 }
+
+fn navi22_plane_power_up_preserves_an_inherited_ip_request() -> TestResult {
+    for original in [0, 1, 0x100, 0x101] {
+        let bench = Bench::new();
+        bench.set(d2(0xb2), original);
+        let connector = m::connector(Signal::Hdmi, 3, 3);
+        let r = Resources::new().acquire(&connector).unwrap();
+        let mut p = pipeline(&bench, connector, r);
+        if run(p.power_on_plane()).is_err() || bench.get(d2(0xb2)) != original {
+            return TestResult::Fail("plane activation overwrote the previous IP request");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_plane_power_up_preserves_an_inherited_ip_request
+);
+
+fn navi22_plane_power_up_initializes_hubp_before_surface_fetch() -> TestResult {
+    let bench = Bench::new();
+    // GB_ADDR_CONFIG: eight pipes, 256-byte interleave, two compressed
+    // fragments, eight packers; the codes are the Linux GC10 fields.
+    bench.set(0x263e, 0x343);
+    bench.set(d2(0x5e6), 0x8007_30c7);
+    let connector = m::connector(Signal::Hdmi, 3, 3);
+    let r = Resources::new().acquire(&connector).unwrap();
+    let mut p = pipeline(&bench, connector, r);
+    if run(p.power_on_plane()).is_err() {
+        return TestResult::Fail("plane activation rejected");
+    }
+    if bench.get(d2(0x5f7)) != 1 << 26 {
+        return TestResult::Fail("hubp3_init ECO workaround was skipped");
+    }
+    if bench.get(d2(0x5e6)) != 0x8003_1003 {
+        return TestResult::Fail("HUBP fabric configuration was inherited from firmware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_plane_power_up_initializes_hubp_before_surface_fetch
+);
+
+fn navi22_plane_power_request_is_released_on_error_and_cancellation() -> TestResult {
+    for original in [0x100, 0x101] {
+        for cancelled in [false, true] {
+            let bench = Bench::new();
+            bench.set(d2(0xb2), original);
+            bench.stall(
+                0,
+                d2(0x83),
+                u32::MAX,
+                if cancelled { 0xc000_0000 } else { u32::MAX },
+            );
+            let connector = m::connector(Signal::Hdmi, 3, 3);
+            let r = Resources::new().acquire(&connector).unwrap();
+            let mut p = pipeline(&bench, connector, r);
+            if cancelled {
+                {
+                    let mut future = core::pin::pin!(p.power_on_plane());
+                    if future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_ready()
+                    {
+                        return TestResult::Fail(
+                            "power transition did not suspend for cancellation",
+                        );
+                    }
+                    if bench.get(d2(0xb2)) != original | 1 {
+                        return TestResult::Fail("power transition did not hold its request");
+                    }
+                }
+            } else if run(p.power_on_plane())
+                != Err(Error::Block(crate::amdgpu_dcn_clk::Error::DeviceGone))
+            {
+                return TestResult::Fail("power status read error was lost");
+            }
+            if bench.get(d2(0xb2)) != original {
+                return TestResult::Fail(
+                    "interrupted power transition changed the previous request",
+                );
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-modeset",
+    navi22_plane_power_request_is_released_on_error_and_cancellation
+);
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-modeset",
     navi22_modeset_models_every_pipe_and_dig_route

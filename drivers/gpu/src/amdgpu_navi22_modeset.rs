@@ -48,7 +48,7 @@ use crate::{
     amdgpu_dcn30_dp_link as dp_link,
     amdgpu_dcn30_hdmi::{self as hdmi, DigMode, Hdmi},
     amdgpu_dcn30_hubbub::{self as hubbub, Hubbub},
-    amdgpu_dcn30_takeover::{self as takeover, Inherited, Regs, Takeover},
+    amdgpu_dcn30_takeover::{self as takeover, Inherited, IpRequest, Regs, Takeover},
     amdgpu_dcn_hubp::{Hubp, Surface},
     amdgpu_dcn_otg::{GlobalSync, Otg},
     amdgpu_dcn_plane::{Dpp, Encoding, Mpc, Opp},
@@ -1035,35 +1035,43 @@ impl Pipeline {
     /// de-featured and may hard-reset the GPU).
     async fn power_on_plane(&mut self) -> Result<(), Error> {
         let pipe = u64::from(self.route.pipe);
-        let request = self.d2(DC_IP_REQUEST_CNTL);
-        if !crate::amdgpu_dcn_profile::Profile::resolve(&self.gpu)?.has_plane_power_gating() {
-            let clock = self.d2(HUBP0_HUBP_CLK_CNTL + pipe * HUBP_STRIDE);
-            return self
-                .regs
-                .update(clock, HUBP_CLOCK_ENABLE, HUBP_CLOCK_ENABLE);
-        }
-        self.regs.write(request, 1)?; // linux-lit: 1=DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK
-        if self.route.pipe != 5 {
-            // linux: n/a (pipe 5 power gating de-featured, dcn20_hwseq.c)
-            // linux-lit: 2=mmDOMAIN1_PG_CONFIG - mmDOMAIN0_PG_CONFIG
-            for domain in [2 * pipe + 1, 2 * pipe] {
-                let config = self.d2(DOMAIN0_PG_CONFIG + 2 * domain);
-                self.regs.update(config, DOMAIN_POWER_GATE, 0)?;
-                if !self
-                    .regs
-                    // linux-lit: 4=(mmDOMAIN0_PG_STATUS - mmDOMAIN0_PG_CONFIG) * 4
-                    .wait(config + 4, DOMAIN_PGFSM_PWR_STATUS, 0, 1, 1000)
-                    .await?
-                {
-                    let _ = self.regs.write(request, 0);
-                    return Err(Error::Block(crate::amdgpu_dcn_clk::Error::Timeout));
+        if crate::amdgpu_dcn_profile::Profile::resolve(&self.gpu)?.has_plane_power_gating() {
+            let mut request = IpRequest::acquire(self.regs, self.d2(DC_IP_REQUEST_CNTL))?;
+            if self.route.pipe != 5 {
+                // linux: n/a (pipe 5 power gating de-featured, dcn20_hwseq.c)
+                // linux-lit: 2=mmDOMAIN1_PG_CONFIG - mmDOMAIN0_PG_CONFIG
+                for domain in [2 * pipe + 1, 2 * pipe] {
+                    let config = self.d2(DOMAIN0_PG_CONFIG + 2 * domain);
+                    self.regs.update(config, DOMAIN_POWER_GATE, 0)?;
+                    if !self
+                        .regs
+                        // linux-lit: 4=(mmDOMAIN0_PG_STATUS - mmDOMAIN0_PG_CONFIG) * 4
+                        .wait(config + 4, DOMAIN_PGFSM_PWR_STATUS, 0, 1, 1000)
+                        .await?
+                    {
+                        return Err(Error::Block(crate::amdgpu_dcn_clk::Error::Timeout));
+                    }
                 }
             }
+            request.release()?;
         }
-        self.regs.write(request, 0)?;
         let clock = self.d2(HUBP0_HUBP_CLK_CNTL + pipe * HUBP_STRIDE);
         self.regs
-            .update(clock, HUBP_CLOCK_ENABLE, HUBP_CLOCK_ENABLE)
+            .update(clock, HUBP_CLOCK_ENABLE, HUBP_CLOCK_ENABLE)?;
+        // hubp3_program_tiling derives the display fabric geometry from
+        // this ASIC's GB_ADDR_CONFIG, not the GOP's previous surface.
+        let profile = crate::amdgpu_rdna2::for_pci_id(self.gpu.chip.vid, self.gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        let gc0 = crate::amdgpu_psp_ring::bank(
+            &self.gpu,
+            crate::amdgpu_discovery::HW_ID_GC,
+            &[profile.gc_version],
+            0,
+            0x13de, // linux-lit: 0x13de=mmGB_ADDR_CONFIG@gc101
+        )
+        .map_err(|_| Error::Unsupported)?;
+        let config = self.regs.read(gc0 + 0x13de * 4)?;
+        self.hubp.initialize(config).map_err(Error::Block)
     }
     /// `hubp2_program_deadline`'s cursor half: the cursor's request pacing
     /// from the plan, so a cursor shown later fetches on the budget the

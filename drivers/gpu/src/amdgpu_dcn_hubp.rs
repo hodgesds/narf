@@ -19,13 +19,15 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 // both Linux offset and mask headers. Generation differences stay explicit.
 // linux-ctx: hdr=dcn seg=2
 const DCSURF_SURFACE_CONFIG: u64 = 0x05e5; // linux: mmHUBP0_DCSURF_SURFACE_CONFIG
+const DCSURF_ADDR_CONFIG: u64 = 0x05e6; // linux: mmHUBP0_DCSURF_ADDR_CONFIG
 const DCSURF_TILING_CONFIG: u64 = 0x05e7; // linux: mmHUBP0_DCSURF_TILING_CONFIG
 const DCSURF_PRI_VIEWPORT_START: u64 = 0x05e9; // linux: mmHUBP0_DCSURF_PRI_VIEWPORT_START
 const DCSURF_PRI_VIEWPORT_DIMENSION: u64 = 0x05ea; // linux: mmHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
 const DCHUBP_REQ_SIZE_CONFIG: u64 = 0x05f1; // linux: mmHUBP0_DCHUBP_REQ_SIZE_CONFIG
 const DCHUBP_REQ_SIZE_CONFIG_C: u64 = 0x05f2; // linux: mmHUBP0_DCHUBP_REQ_SIZE_CONFIG_C
 const DCHUBP_CNTL: u64 = 0x05f3; // linux: mmHUBP0_DCHUBP_CNTL
-                                 // HUBPREQ block, same stride.
+const HUBPREQ_DEBUG: u64 = 0x05f7; // linux: mmHUBP0_HUBPREQ_DEBUG
+                                   // HUBPREQ block, same stride.
 const DCSURF_SURFACE_PITCH: u64 = 0x0607; // linux: mmHUBPREQ0_DCSURF_SURFACE_PITCH
                                           // linux: mmHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS
 const DCSURF_PRIMARY_SURFACE_ADDRESS: u64 = 0x060a;
@@ -189,6 +191,37 @@ struct Engine<I: Io> {
     blank_stalls: u32,
 }
 impl<I: Io> Engine<I> {
+    /// hubp3_init plus the device-derived part of hubp3_program_tiling.
+    /// Called after power/clock enable and before programming a surface.
+    fn initialize(&mut self, gb_addr_config: u32) -> Result<(), Error> {
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        if !self.blanked {
+            return Err(Error::Busy);
+        }
+        if gb_addr_config == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        // GC10 GB_ADDR_CONFIG fields are log2 codes. Admit the same
+        // 256-byte interleave as the RDNA2 topology path; other sizes
+        // need separate validation. Repack into HUBP's field positions.
+        let interleave = (gb_addr_config >> 3) & 7;
+        if interleave != 0 {
+            return Err(Error::Unsupported);
+        }
+        let geometry = (gb_addr_config & 7)
+            | (interleave << 6)
+            | (((gb_addr_config >> 6) & 3) << 12)
+            | (((gb_addr_config >> 8) & 7) << 16);
+        // DEDCN21-133: align DPTE and metadata row starts across flips.
+        // linux: n/a (literal 1 << 26 in dcn30_hubp.c:hubp3_init)
+        self.set(HUBPREQ_DEBUG, 1 << 26)?;
+        // linux-lit: 0x1000=HUBP0_DCHUBP_CNTL__HUBP_TTU_DISABLE_MASK
+        self.update(DCHUBP_CNTL, 0x1000, 0)?;
+        // linux-lit: 0x730c7=HUBP0_DCSURF_ADDR_CONFIG__NUM_PIPES_MASK | HUBP0_DCSURF_ADDR_CONFIG__PIPE_INTERLEAVE_MASK | HUBP0_DCSURF_ADDR_CONFIG__MAX_COMPRESSED_FRAGS_MASK | HUBP0_DCSURF_ADDR_CONFIG__NUM_PKRS_MASK
+        self.update(DCSURF_ADDR_CONFIG, 0x730c7, geometry)
+    }
     fn reg(&self, reg: u64) -> u64 {
         reg + self.instance as u64 * STRIDE
     }
@@ -422,6 +455,12 @@ impl<I: Io> Engine<I> {
 #[derive(Debug)]
 pub struct Hubp(Engine<Mmio>);
 impl Hubp {
+    /// Initialize a newly powered, blank DCN30 pipe using this GPU's GC10
+    /// GB_ADDR_CONFIG. The caller has enabled the HUBP clock and excluded
+    /// other display/reset writers; the current owner has no live fetch.
+    pub fn initialize(&mut self, gb_addr_config: u32) -> Result<(), Error> {
+        self.0.initialize(gb_addr_config)
+    }
     /// # Safety
     /// Caller exclusively owns this HUBP instance for the object's lifetime,
     /// holds matching PCI authority and a permanent register mapping, and must
