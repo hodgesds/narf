@@ -20,6 +20,7 @@
 //! 13. YUYV frame size calculation
 //! 14. NV12 frame size calculation
 //! 15. MJPEG validity check
+//! 16. Control routing: PU/CT unit selection, missing-unit rejection
 
 #![cfg(target_arch = "x86_64")]
 
@@ -675,3 +676,56 @@ fn smoke_uvc_mjpeg_validity() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/video/uvc", smoke_uvc_mjpeg_validity);
+
+// ── Smoke 16: Control routing (migrated from v4l2::Camera, #810) ────
+
+fn smoke_uvc_control_routing_units() -> TestResult {
+    use crate::uvc::control::{
+        route_control, ControlId, CT_FOCUS_ABSOLUTE_CONTROL, CT_ZOOM_ABSOLUTE_CONTROL,
+        PU_BRIGHTNESS_CONTROL, PU_GAIN_CONTROL,
+    };
+
+    // PU controls route to the Processing Unit with the PU selector.
+    match route_control(ControlId::Brightness, 5, 7) {
+        Some((unit, selector)) if unit == 5 && selector == PU_BRIGHTNESS_CONTROL => {}
+        _ => return TestResult::Fail("brightness must route to (pu, PU_BRIGHTNESS)"),
+    }
+    match route_control(ControlId::Gain, 5, 7) {
+        Some((unit, selector)) if unit == 5 && selector == PU_GAIN_CONTROL => {}
+        _ => return TestResult::Fail("gain must route to (pu, PU_GAIN)"),
+    }
+    // CT controls route to the Camera Terminal with the CT selector.
+    match route_control(ControlId::Focus, 5, 7) {
+        Some((unit, selector)) if unit == 7 && selector == CT_FOCUS_ABSOLUTE_CONTROL => {}
+        _ => return TestResult::Fail("focus must route to (ct, CT_FOCUS_ABSOLUTE)"),
+    }
+    match route_control(ControlId::Zoom, 5, 7) {
+        Some((unit, selector)) if unit == 7 && selector == CT_ZOOM_ABSOLUTE_CONTROL => {}
+        _ => return TestResult::Fail("zoom must route to (ct, CT_ZOOM_ABSOLUTE)"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video/uvc", smoke_uvc_control_routing_units);
+
+fn smoke_uvc_control_routing_missing_unit() -> TestResult {
+    use crate::uvc::control::{route_control, ControlId};
+
+    // A PU control with no Processing Unit (id 0) must not route —
+    // issuing a transfer to unit 0 would address the wrong entity.
+    if route_control(ControlId::Brightness, 0, 7).is_some() {
+        return TestResult::Fail("PU control with pu_unit_id 0 must not route");
+    }
+    // A CT control with no Camera Terminal (id 0) must not route.
+    if route_control(ControlId::Focus, 5, 0).is_some() {
+        return TestResult::Fail("CT control with ct_unit_id 0 must not route");
+    }
+    // The absent *other* unit does not block routing.
+    if route_control(ControlId::Brightness, 5, 0).is_none() {
+        return TestResult::Fail("PU control must route when only the CT is absent");
+    }
+    if route_control(ControlId::Focus, 0, 7).is_none() {
+        return TestResult::Fail("CT control must route when only the PU is absent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video/uvc", smoke_uvc_control_routing_missing_unit);

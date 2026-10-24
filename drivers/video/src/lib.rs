@@ -63,9 +63,6 @@ mod tests;
 // ── USB Video Class (UVC) webcam driver ─────────────────────────────
 pub mod uvc;
 
-// ── V4L2-equivalent userspace surface ───────────────────────────────
-pub mod v4l2;
-
 mod uvc_tests;
 
 // ── V4L2-compatible buffer-queue types ─────────────────────────────
