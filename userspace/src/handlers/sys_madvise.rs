@@ -6,7 +6,9 @@ use super::*;
 /// and MADV_FREE (8) as Linux's lazy variant: pages are marked discardable
 /// but stay mapped until memory pressure harvests the ones never rewritten
 /// (`AddressSpace::madvise_free` / `discard_lazyfree_pages`). MADV_WILLNEED
-/// (3) populates the page cache behind file-backed ranges (#731); the
+/// (3) populates the page cache behind file-backed ranges (#731);
+/// MADV_POPULATE_READ (22) and MADV_POPULATE_WRITE (23) install the range
+/// itself through the bulk fault API, all-or-nothing (#741); the
 /// remaining performance-only hints are accepted as no-ops. Unknown values and
 /// semantic controls NARF cannot honor return EINVAL instead of claiming a
 /// state transition that did not happen.
@@ -60,6 +62,8 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
     const MADV_NOHUGEPAGE: i32 = 15;
     const MADV_COLD: i32 = 20;
     const MADV_PAGEOUT: i32 = 21;
+    const MADV_POPULATE_READ: i32 = 22;
+    const MADV_POPULATE_WRITE: i32 = 23;
     const MADV_GUARD_INSTALL: i32 = 102;
     const MADV_GUARD_REMOVE: i32 = 103;
 
@@ -77,10 +81,12 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
             | MADV_NOHUGEPAGE
             | MADV_COLD
             | MADV_PAGEOUT
+            | MADV_POPULATE_READ
+            | MADV_POPULATE_WRITE
             | MADV_GUARD_INSTALL
             | MADV_GUARD_REMOVE
     );
-    // DONTFORK/DOFORK, WIPEONFORK/KEEPONFORK, DONTDUMP/DODUMP, POPULATE_*,
+    // DONTFORK/DOFORK, WIPEONFORK/KEEPONFORK, DONTDUMP/DODUMP,
     // REMOVE, COLLAPSE, and unknown values have observable
     // semantics beyond a hint. Fail explicitly until those state machines
     // exist. LINUX-GAP: Linux accepts the named ones; only a genuinely
@@ -203,6 +209,36 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
                 ctx.set_return(errno_ret(ENOMEM));
+            }
+        }
+        // MADV_POPULATE_READ / MADV_POPULATE_WRITE (Linux 5.14): fault
+        // the whole range in now, as if the caller touched every page
+        // for reading (resp. writing — COW splits included), and
+        // report 0 only if the *entire* range ended up populated.
+        // Unlike WILLNEED this is not a hint: a hole, an unpopulatable
+        // page, or a range running past a file's EOF fails the call
+        // (ENOMEM; EINVAL for a segment the caller may not populate
+        // this way, such as a read-only mapping under POPULATE_WRITE
+        // or a device mapping), and pages installed before the
+        // failure stay installed — the man page's contract, not a
+        // rollback. The walk itself lives with the mapping owners
+        // (`mapped_file::populate_range`); it composes the #735 cache
+        // population with the #737 batch installation and verifies
+        // every page afterwards, because the batch alone is advisory.
+        MADV_POPULATE_READ | MADV_POPULATE_WRITE => {
+            match crate::mapped_file::populate_range(
+                &as_ref,
+                base.as_u64(),
+                len,
+                advice == MADV_POPULATE_WRITE,
+            ) {
+                Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+                Err(crate::mapped_file::PopulateError::Invalid) => {
+                    ctx.set_return(errno_ret(EINVAL))
+                }
+                Err(crate::mapped_file::PopulateError::NoMemory) => {
+                    ctx.set_return(errno_ret(ENOMEM))
+                }
             }
         }
         // The remaining values are performance hints only. NARF has no
