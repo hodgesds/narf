@@ -49,7 +49,7 @@ pub use descriptor::{
 };
 
 pub use control::{
-    bm_request_type, w_index, w_value, ControlId, ControlRange, ProbeCommit,
+    bm_request_type, route_control, w_index, w_value, ControlId, ControlRange, ProbeCommit,
     BM_REQUEST_TYPE_CLASS_IN, BM_REQUEST_TYPE_CLASS_OUT, GET_CUR, GET_DEF, GET_INFO, GET_LEN,
     GET_MAX, GET_MIN, GET_RES, PROBE_COMMIT_LEN_V10, PROBE_COMMIT_LEN_V15, PU_BRIGHTNESS_CONTROL,
     PU_CONTRAST_CONTROL, PU_GAIN_CONTROL, PU_SATURATION_CONTROL,

@@ -296,13 +296,6 @@ the USB download itself remains a target-silicon gate.
   Device Descriptor protocol, TT think-time propagation, and downstream
   route addressing so low/full-speed devices behind high-speed hubs are
   visible.
-- **UVC stream** (`uvc_stream`): clean-room payload-header
-  encoder + decoder for the per-isoch-transaction UVC header
-  (bHeaderLength + Bit Field Header), with optional PTS (LE u32)
-  and SCR (LE u32 SOF tick + 11-bit clock counter) fields. A
-  `FrameReassembler` turns FID toggles into "new frame started" /
-  "end of frame" / "error" steps the host driver feeds into the
-  buffer manager.
 - **UVC 1.5** (`uvc`): UVC descriptor parser and USB 2.0 streaming-alternate
   activation. VC HEADER (bcdUVC,
   clock frequency, controlled VS interfaces), INPUT_TERMINAL with

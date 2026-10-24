@@ -318,3 +318,30 @@ impl ControlId {
         }
     }
 }
+
+// ── Control routing ──────────────────────────────────────────────────
+
+/// Route a logical control to the `(unit_id, selector)` pair a UVC
+/// class control transfer must address.
+///
+/// Processing-unit controls are sent to the Processing Unit
+/// (`pu_unit_id`); camera-terminal controls to the Camera Terminal
+/// (`ct_unit_id`). The selector byte comes from
+/// [`ControlId::selector_and_is_ct`]; pair the result with
+/// [`w_value`] / [`w_index`] to build the transfer.
+///
+/// Returns `None` when the addressed unit is absent (unit ID 0) —
+/// the caller must not issue a transfer to unit 0.
+///
+/// This logic is the survivor of the excised `v4l2::Camera`
+/// abstraction (#810): its `control_routing` was the only production
+/// asset that layer held, and the V4L2 control path (#809) routes
+/// through here.
+pub fn route_control(id: ControlId, pu_unit_id: u8, ct_unit_id: u8) -> Option<(u8, u8)> {
+    let (selector, is_ct) = id.selector_and_is_ct();
+    let unit_id = if is_ct { ct_unit_id } else { pu_unit_id };
+    if unit_id == 0 {
+        return None;
+    }
+    Some((unit_id, selector))
+}
