@@ -1928,7 +1928,7 @@ pub(crate) fn record_advice_range(address_space_id: u64, base: u64, len: u64) {
 /// misses, the fault-side current-owner re-check makes inert: a record
 /// can only ever widen a fault into pages a single fault at the same
 /// address would serve identically.
-fn scrub_advice_range(address_space_id: u64, base: u64, len: u64) {
+pub(crate) fn scrub_advice_range(address_space_id: u64, base: u64, len: u64) {
     let Some(records) = existing_advice_records(address_space_id) else {
         return;
     };
