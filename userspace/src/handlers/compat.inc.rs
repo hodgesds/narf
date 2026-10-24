@@ -2957,6 +2957,11 @@ fn do_execve_resolved(
         // persistent reference that keeps the new AS alive while the task
         // runs; this local clone only bridges the activate() below.
         let new_as = new_proc.address_space.clone();
+        // The exec page-in plan (#740), cloned out before `new_proc` is
+        // hand-dropped below: a partial move would break the manual
+        // drop sequence, and the plan is a handful of (base, pages)
+        // pairs, so the clone is the cheap honest option.
+        let page_in_plan = new_proc.page_in_plan.clone();
         // Borrow-holders first, then owners.
         drop(argv_refs);
         drop(envp_refs);
@@ -2969,6 +2974,18 @@ fn do_execve_resolved(
         drop(envp_strs);
         drop(path_owned);
         let _ = new_as.activate();
+        // Exec page-in clustering (#740): the new root is live on this
+        // CPU now — the bulk batch's contract — and the exec is long
+        // past its point of no return, so the advisory batch runs here:
+        // pages it installs are resident at first touch instead of
+        // faulting, and any page it skips faults exactly as it would
+        // have without the cluster. The installed count is deliberately
+        // discarded, and the plan is dropped by hand right after use,
+        // like every heap local on this diverging path.
+        // SAFETY: activate() above made `new_as` the live root, and
+        // the plan came from loading the image mapped in it.
+        unsafe { crate::loader::page_in_plan(&new_as, &page_in_plan) };
+        drop(page_in_plan);
         // Publish the new CR3 so a later preempt/park resume re-activates the
         // post-execve AS (not the pre-execve one) — see set_current_user_cr3.
         #[cfg(target_arch = "x86_64")]
@@ -3045,6 +3062,11 @@ fn do_execve_resolved(
         entry: new_proc.entry.0.as_u64(),
         stack_top: new_proc.stack_top.as_u64(),
         fs_base: new_proc.fs_base,
+        // The loader's page-in plan (#740) rides along: the polling
+        // routine drives it when it applies this request and first
+        // enters the new image. Cloned — `new_proc` is still live here
+        // and is hand-dropped on the hook path below.
+        page_in_plan: new_proc.page_in_plan.clone(),
     });
     let uctx_ptr = match crate::user_task::current_user_task() {
         Some(p) => p,
