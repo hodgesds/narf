@@ -5483,6 +5483,7 @@ fn smoke_uac_detach_removes_registry_and_card() -> TestResult {
         iso_out_dci: out_dci,
         iso_in_dci: in_dci,
         card: Some(state),
+        card_error: None,
     });
     if crate::uac::attached_uac_count() != 1 {
         return TestResult::Fail("registry holds the bound device");
@@ -5502,3 +5503,345 @@ kernel_test_in!(
     "drivers/usb/uac",
     smoke_uac_detach_removes_registry_and_card
 );
+
+fn smoke_uac_pump_generation_stop_start() -> TestResult {
+    use crate::uac::{BindOutcome, UacTopology};
+    use narf_drivers_sound::hardware::PcmHardware;
+    let cfg = uac1_headset_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    let state =
+        crate::uac_card::UacCardState::from_bind(7, &topo, &choices, &BindOutcome::default());
+    let pb_iso = FakeIso(FakeIsoState::new());
+    let mut pb = match crate::uac_card::UacStream::with_iso(
+        state.clone(),
+        false,
+        alloc::boxed::Box::new(pb_iso.clone()),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("playback lease"),
+    };
+    let dev: &dyn narf_drivers_sound::hardware::PcmDevice =
+        &crate::uac_card::UsbAudioCard(state.clone());
+    let params = dev.default_params(false);
+    if pb.configure(params).is_err() || pb.prepare().is_err() || pb.start().is_err() {
+        return TestResult::Fail("configure/prepare/start");
+    }
+    let shared = match state.stream(false).and_then(|d| d.live.lock().clone()) {
+        Some(s) => s,
+        None => return TestResult::Fail("live pump shared"),
+    };
+    let gen1 = shared.generation();
+    if gen1 == 0 || !shared.is_current(gen1) {
+        return TestResult::Fail("start establishes the current generation");
+    }
+    // Queue distinctive frames, then park a gen1 cycle
+    // mid-transfer: the packet is built (begin) but its
+    // transfer has not committed.
+    let pattern: alloc::vec::Vec<u8> = (0..192u32).map(|i| (i % 251) as u8).collect();
+    if pb.write(&pattern) != Ok(192) {
+        return TestResult::Fail("write accepts 192 B");
+    }
+    let (packet, frames) = match shared.begin_playback(gen1, 48_000, 4) {
+        Some(p) => p,
+        None => return TestResult::Fail("gen1 begins a cycle"),
+    };
+    if packet != pattern || frames != 48 {
+        return TestResult::Fail("gen1 packet = the queued pattern, 48 frames");
+    }
+    // The standard ALSA recovery sequence lands while the gen1
+    // transfer is still in flight: stop -> prepare -> start.
+    if pb.stop().is_err() || pb.prepare().is_err() || pb.start().is_err() {
+        return TestResult::Fail("stop/prepare/start cycle");
+    }
+    let gen2 = shared.generation();
+    if gen2 == gen1 || !shared.is_current(gen2) || shared.is_current(gen1) {
+        return TestResult::Fail("start supersedes gen1 with a fresh generation");
+    }
+    // Double-start while running: no new generation, no second
+    // owner of the ring.
+    if pb.start().is_err() || shared.generation() != gen2 {
+        return TestResult::Fail("double-start keeps the running generation");
+    }
+    // The parked gen1 transfer resolves now: its commit is
+    // refused, it cannot begin again, and the pointer has not
+    // moved. Its packet is dropped, never delivered.
+    if shared.commit_playback(gen1, frames) {
+        return TestResult::Fail("stale generation commit refused");
+    }
+    if shared.begin_playback(gen1, 48_000, 4).is_some() {
+        return TestResult::Fail("stale generation cannot begin");
+    }
+    if pb.pointer() != 0 {
+        return TestResult::Fail("pointer unmoved by the superseded pump");
+    }
+    if !pb_iso.0.out_log.lock().is_empty() {
+        return TestResult::Fail("superseded packet never delivered");
+    }
+    // The successor generation owns the ring: one cycle clocks
+    // a full (silence) packet and moves the pointer by itself.
+    if pb.pump_once().is_err() {
+        return TestResult::Fail("gen2 pump cycle");
+    }
+    if pb.pointer() != 48 {
+        return TestResult::Fail("pointer advanced by gen2 alone");
+    }
+    {
+        let log = pb_iso.0.out_log.lock();
+        if log.len() != 192 || log.iter().any(|b| *b != 0) {
+            return TestResult::Fail("gen2 clocks silence (pattern died with gen1)");
+        }
+    }
+    if pb.stop().is_err() {
+        return TestResult::Fail("final stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_pump_generation_stop_start);
+
+fn smoke_uac_pump_detach_while_running() -> TestResult {
+    use crate::uac::{BindOutcome, UacTopology};
+    use narf_drivers_sound::hardware::PcmHardware;
+    let cfg = uac1_headset_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    let state =
+        crate::uac_card::UacCardState::from_bind(9, &topo, &choices, &BindOutcome::default());
+
+    // Playback: a cycle parked mid-transfer when detach lands.
+    let mut pb = match crate::uac_card::UacStream::with_iso(
+        state.clone(),
+        false,
+        alloc::boxed::Box::new(FakeIso(FakeIsoState::new())),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("playback lease"),
+    };
+    let dev: &dyn narf_drivers_sound::hardware::PcmDevice =
+        &crate::uac_card::UsbAudioCard(state.clone());
+    let pb_params = dev.default_params(false);
+    if pb.configure(pb_params).is_err() || pb.prepare().is_err() || pb.start().is_err() {
+        return TestResult::Fail("playback configure/prepare/start");
+    }
+    let pb_shared = match state.stream(false).and_then(|d| d.live.lock().clone()) {
+        Some(s) => s,
+        None => return TestResult::Fail("playback live shared"),
+    };
+    let pb_gen = pb_shared.generation();
+    let (_packet, frames) = match pb_shared.begin_playback(pb_gen, 48_000, 4) {
+        Some(p) => p,
+        None => return TestResult::Fail("playback cycle begins"),
+    };
+
+    // Capture: a cycle begun, its packet not yet committed.
+    let mut cap = match crate::uac_card::UacStream::with_iso(
+        state.clone(),
+        true,
+        alloc::boxed::Box::new(FakeIso(FakeIsoState::new())),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("capture lease"),
+    };
+    let cap_params = dev.default_params(true);
+    if cap.configure(cap_params).is_err() || cap.prepare().is_err() || cap.start().is_err() {
+        return TestResult::Fail("capture configure/prepare/start");
+    }
+    let cap_shared = match state.stream(true).and_then(|d| d.live.lock().clone()) {
+        Some(s) => s,
+        None => return TestResult::Fail("capture live shared"),
+    };
+    let cap_gen = cap_shared.generation();
+    if cap_shared.begin_capture(cap_gen, 48_000) != Some(48) {
+        return TestResult::Fail("capture cycle begins (48 frames)");
+    }
+
+    state.detach();
+
+    // Both in-flight cycles are disowned: commits refused,
+    // no new cycle begins, pointers frozen.
+    if pb_shared.commit_playback(pb_gen, frames) {
+        return TestResult::Fail("detached playback commit refused");
+    }
+    if cap_shared.commit_capture(cap_gen, &[0xABu8; 192], 2) {
+        return TestResult::Fail("detached capture commit refused");
+    }
+    if pb_shared.begin_playback(pb_gen, 48_000, 4).is_some()
+        || cap_shared.begin_capture(cap_gen, 48_000).is_some()
+    {
+        return TestResult::Fail("no cycle begins after detach");
+    }
+    if pb.pointer() != 0 || cap.pointer() != 0 {
+        return TestResult::Fail("pointers frozen by detach");
+    }
+    // And the detached card refuses new leases.
+    match dev.open(false, 0) {
+        Err(narf_drivers_sound::SoundError::NoSuchCard) => {}
+        _ => return TestResult::Fail("open after detach = NoSuchCard"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_pump_detach_while_running);
+
+fn smoke_uac_clock_rate_snap() -> TestResult {
+    use crate::uac::{clock_rate_admitted, snap_clock_rate, ClockSubrange};
+    let r = |min_hz, max_hz, res_hz| ClockSubrange {
+        min_hz,
+        max_hz,
+        res_hz,
+    };
+    let grid = [r(44_100, 48_000, 100)];
+    if !clock_rate_admitted(&grid, 44_100) || !clock_rate_admitted(&grid, 48_000) {
+        return TestResult::Fail("grid admits its endpoints");
+    }
+    if clock_rate_admitted(&grid, 44_150) || clock_rate_admitted(&grid, 96_000) {
+        return TestResult::Fail("grid refuses off-grid and out-of-range");
+    }
+    if snap_clock_rate(&grid, 48_000) != Some(48_000) {
+        return TestResult::Fail("admitted rate passes unchanged");
+    }
+    if snap_clock_rate(&grid, 44_140) != Some(44_100)
+        || snap_clock_rate(&grid, 44_160) != Some(44_200)
+    {
+        return TestResult::Fail("covered off-grid rate snaps to the nearest grid point");
+    }
+    if snap_clock_rate(&grid, 47_999) != Some(48_000) {
+        return TestResult::Fail("snap may land on the subrange max");
+    }
+    if snap_clock_rate(&grid, 96_000).is_some() || snap_clock_rate(&grid, 32_000).is_some() {
+        return TestResult::Fail("uncovered rate has no snap (prepare must fail)");
+    }
+    let continuous = [r(32_000, 192_000, 0)];
+    if snap_clock_rate(&continuous, 123_457) != Some(123_457) {
+        return TestResult::Fail("zero-resolution subrange admits its whole interval");
+    }
+    let discrete = [r(44_100, 44_100, 0), r(96_000, 96_000, 0)];
+    if snap_clock_rate(&discrete, 96_000) != Some(96_000)
+        || snap_clock_rate(&discrete, 48_000).is_some()
+    {
+        return TestResult::Fail("disjoint subranges snap independently");
+    }
+    if snap_clock_rate(&[], 48_000).is_some() || clock_rate_admitted(&[], 48_000) {
+        return TestResult::Fail("no subranges admit nothing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_clock_rate_snap);
+
+fn smoke_uac_bind_outcome_reaches_card() -> TestResult {
+    use crate::uac::{record_response, BindOutcome, ClockSubrange, ResponseSlot, UacTopology};
+    use narf_drivers_sound::mixer::{ControlId, ControlKind};
+
+    // Feed synthetic bind-conversation responses through the
+    // executor's own record path: FU range reads with
+    // non-default values in both directions.
+    let mut outcome = BindOutcome::default();
+    let feed = |outcome: &mut BindOutcome, slot, v: i16| {
+        record_response(outcome, slot, &v.to_le_bytes());
+    };
+    feed(
+        &mut outcome,
+        ResponseSlot::FuVolumeMin { capture: false },
+        -25_600,
+    );
+    feed(
+        &mut outcome,
+        ResponseSlot::FuVolumeMax { capture: false },
+        3_072,
+    );
+    feed(
+        &mut outcome,
+        ResponseSlot::FuVolumeRes { capture: false },
+        128,
+    );
+    feed(
+        &mut outcome,
+        ResponseSlot::FuVolumeMin { capture: true },
+        -5_120,
+    );
+    feed(&mut outcome, ResponseSlot::FuVolumeMax { capture: true }, 0);
+    feed(
+        &mut outcome,
+        ResponseSlot::FuVolumeRes { capture: true },
+        64,
+    );
+
+    let cfg = uac1_headset_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    let state = crate::uac_card::UacCardState::from_bind(7, &topo, &choices, &outcome);
+    let dev: &dyn narf_drivers_sound::hardware::PcmDevice =
+        &crate::uac_card::UsbAudioCard(state.clone());
+    let vol = |kind| dev.control_info(ControlId { index: 0, kind });
+    match vol(ControlKind::MasterVolume) {
+        Ok(info) if (info.value_min, info.value_max, info.step) == (-25_600, 3_072, 128) => {}
+        _ => return TestResult::Fail("playback dB range reaches control_info (not the default)"),
+    }
+    match vol(ControlKind::CaptureVolume) {
+        Ok(info) if (info.value_min, info.value_max, info.step) == (-5_120, 0, 64) => {}
+        _ => return TestResult::Fail("capture dB range reaches control_info"),
+    }
+
+    // UAC2: a RANGE response and a clock GET_CUR readback land
+    // on the stream state — ranges retained for the runtime
+    // discipline, rate recorded, capabilities intersected.
+    let mut outcome2 = BindOutcome::default();
+    let mut range_bytes = alloc::vec![1u8, 0];
+    range_bytes.extend_from_slice(&44_100u32.to_le_bytes());
+    range_bytes.extend_from_slice(&48_000u32.to_le_bytes());
+    range_bytes.extend_from_slice(&100u32.to_le_bytes());
+    record_response(
+        &mut outcome2,
+        ResponseSlot::ClockRange { capture: false },
+        &range_bytes,
+    );
+    record_response(
+        &mut outcome2,
+        ResponseSlot::ClockCur { capture: false },
+        &44_100u32.to_le_bytes(),
+    );
+    let cfg2 = uac2_dac_config();
+    let topo2 = UacTopology::parse(&cfg2).expect("topo2");
+    let mut choices2 = alloc::vec::Vec::new();
+    for s in &topo2.streams {
+        choices2.push(crate::uac::choose_stream_default(s, topo2.version).expect("choice2"));
+    }
+    let state2 = crate::uac_card::UacCardState::from_bind(7, &topo2, &choices2, &outcome2);
+    let dir = match state2.stream(false) {
+        Some(d) => d,
+        None => return TestResult::Fail("UAC2 playback stream state"),
+    };
+    if dir.clock_ranges
+        != [ClockSubrange {
+            min_hz: 44_100,
+            max_hz: 48_000,
+            res_hz: 100,
+        }]
+    {
+        return TestResult::Fail("clock ranges retained on the stream state");
+    }
+    let dev2: &dyn narf_drivers_sound::hardware::PcmDevice =
+        &crate::uac_card::UsbAudioCard(state2.clone());
+    if dev2.default_params(false).rate != narf_drivers_sound::SampleRate::R44100 {
+        return TestResult::Fail("read-back clock rate recorded on the card");
+    }
+    let caps = dev2.capabilities(false);
+    if caps.rates
+        != [
+            narf_drivers_sound::SampleRate::R44100,
+            narf_drivers_sound::SampleRate::R48000,
+        ]
+    {
+        return TestResult::Fail("capabilities = descriptor rates intersected with clock ranges");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_bind_outcome_reaches_card);

@@ -712,20 +712,52 @@ pub fn parse_clock_ranges(buf: &[u8]) -> Vec<ClockSubrange> {
     out
 }
 
+/// Does any subrange admit `hz` exactly (inside [min, max] and
+/// on the resolution grid; a zero resolution admits the whole
+/// interval)?
+pub fn clock_rate_admitted(ranges: &[ClockSubrange], hz: u32) -> bool {
+    ranges.iter().any(|r| {
+        hz >= r.min_hz && hz <= r.max_hz && (r.res_hz == 0 || (hz - r.min_hz) % r.res_hz == 0)
+    })
+}
+
+/// Validate a runtime rate request against the learned
+/// subranges: an admitted rate passes unchanged; a rate inside
+/// a subrange's [min, max] but off its resolution grid snaps to
+/// the nearest grid point of that subrange; anything no
+/// subrange covers returns `None` (the caller must refuse the
+/// request rather than issue an out-of-range SET_CUR a clamping
+/// device would silently misreport as success).
+pub fn snap_clock_rate(ranges: &[ClockSubrange], hz: u32) -> Option<u32> {
+    if clock_rate_admitted(ranges, hz) {
+        return Some(hz);
+    }
+    for r in ranges {
+        if hz < r.min_hz || hz > r.max_hz || r.res_hz == 0 {
+            continue;
+        }
+        let res = r.res_hz as u64;
+        let lo = r.min_hz as u64 + ((hz - r.min_hz) as u64 / res) * res;
+        let hi = lo + res;
+        let cand = if hi <= r.max_hz as u64 && (hz as u64 - lo) > (hi - hz as u64) {
+            hi
+        } else {
+            lo
+        };
+        return Some(cand as u32);
+    }
+    None
+}
+
 /// Choose the rate to program from the advertised subranges:
 /// prefer exactly 48 kHz when a subrange admits it (respecting
 /// the resolution grid), else 44.1 kHz, else the lowest admitted
 /// rate. `None` when the clock admits nothing.
 pub fn choose_clock_rate(ranges: &[ClockSubrange]) -> Option<u32> {
-    let admits = |hz: u32| -> bool {
-        ranges.iter().any(|r| {
-            hz >= r.min_hz && hz <= r.max_hz && (r.res_hz == 0 || (hz - r.min_hz) % r.res_hz == 0)
-        })
-    };
-    if admits(48_000) {
+    if clock_rate_admitted(ranges, 48_000) {
         return Some(48_000);
     }
-    if admits(44_100) {
+    if clock_rate_admitted(ranges, 44_100) {
         return Some(44_100);
     }
     ranges.iter().map(|r| r.min_hz).min()
@@ -1272,6 +1304,12 @@ pub struct UacDevice {
     /// Sound-card state when the bind published a card (`None`
     /// for AudioControl-only devices with no usable stream).
     pub card: Option<alloc::sync::Arc<crate::uac_card::UacCardState>>,
+    /// Why no card was published although the device has usable
+    /// streams: `Some` when `register_card` failed and the bind
+    /// degraded to registry-only, `None` when a card was
+    /// published — and also `None` for AudioControl-only
+    /// devices, which publish no card by design.
+    pub card_error: Option<narf_drivers_sound::SoundError>,
 }
 
 /// System-wide registry of bound UAC devices.
@@ -1684,7 +1722,7 @@ pub async fn execute_bind_plan(
     Ok(outcome)
 }
 
-fn record_response(outcome: &mut BindOutcome, slot: ResponseSlot, data: &[u8]) {
+pub(crate) fn record_response(outcome: &mut BindOutcome, slot: ResponseSlot, data: &[u8]) {
     let rd_i16 = |d: &[u8]| -> Option<i32> {
         if d.len() >= 2 {
             Some(i16::from_le_bytes([d[0], d[1]]) as i32)
@@ -1791,6 +1829,7 @@ pub async fn try_bind_audio_already_addressed(
     // in that case the iso DCIs stay 0.
     let (iso_out_dci, iso_in_dci) = find_audio_streaming_iso_eps(cfg);
 
+    let mut card_error = None;
     let card = if choices.is_empty() {
         None
     } else {
@@ -1805,6 +1844,10 @@ pub async fn try_bind_audio_already_addressed(
                     slot_id,
                     e
                 );
+                // Degrade to registry-only, but surface the
+                // failure on the registry entry — typed, like
+                // the plan's other outcomes — not just the log.
+                card_error = Some(e);
                 None
             }
         }
@@ -1818,6 +1861,7 @@ pub async fn try_bind_audio_already_addressed(
         iso_out_dci,
         iso_in_dci,
         card,
+        card_error,
     });
     Ok(idx)
 }

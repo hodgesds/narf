@@ -30,8 +30,9 @@ use sound::mixer::{ControlId, ControlInfo, ControlKind, ControlValue};
 use sound::{CardInfo, SoundError};
 
 use crate::uac::{
-    alt_sound_rates, BindOutcome, PcmFormat, PcmRing, StreamChoice, UacAlt, UacTopology,
-    UacVersion, CHANNEL_MASTER, FEATURE_MUTE, FEATURE_VOLUME, FU_CS_MUTE, FU_CS_VOLUME,
+    alt_sound_rates, clock_rate_admitted, snap_clock_rate, BindOutcome, ClockSubrange, PcmFormat,
+    PcmRing, StreamChoice, UacAlt, UacTopology, UacVersion, CHANNEL_MASTER, FEATURE_MUTE,
+    FEATURE_VOLUME, FU_CS_MUTE, FU_CS_VOLUME,
 };
 
 // ── Format mapping (descriptor shape → sound enums) ────────────────
@@ -72,8 +73,17 @@ pub fn channels_enum(n: u8) -> Option<ChannelCount> {
 
 /// Find the alt of `stream` serving exactly (format, channels,
 /// rate) — the configure-time selection. `alts` are the stream's
-/// recorded alt settings.
-pub fn find_alt_for(alts: &[UacAlt], version: UacVersion, params: &HwParams) -> Option<(u8, u8)> {
+/// recorded alt settings. `clock_ranges` are the UAC2 clock
+/// subranges learned at bind (empty for UAC1, or when the RANGE
+/// read failed): a rate the clock cannot reach — exactly or by
+/// snapping to its grid — serves no alt, however well the alt's
+/// own shape fits.
+pub fn find_alt_for(
+    alts: &[UacAlt],
+    version: UacVersion,
+    clock_ranges: &[ClockSubrange],
+    params: &HwParams,
+) -> Option<(u8, u8)> {
     // Returns (alt_setting, ep_addr).
     for alt in alts {
         if alt.ep_addr == 0 {
@@ -89,6 +99,9 @@ pub fn find_alt_for(alts: &[UacAlt], version: UacVersion, params: &HwParams) -> 
             continue;
         }
         if !alt_sound_rates(alt, version).contains(&params.rate.hz()) {
+            continue;
+        }
+        if !clock_ranges.is_empty() && snap_clock_rate(clock_ranges, params.rate.hz()).is_none() {
             continue;
         }
         let frame_bytes = params.channels.count() as u32 * fmt.subframe_size as u32;
@@ -139,6 +152,13 @@ pub struct StreamState {
     /// UAC2 clock entity driving this stream, if any.
     pub clock_id: Option<u8>,
     pub clock_programmable: bool,
+    /// Clock subranges learned from the bind-time RANGE
+    /// response (UAC2; empty for UAC1 or when the read failed).
+    /// Retained for the card's whole life: prepare-time rate
+    /// programming and capability advertisement are checked
+    /// against them, exactly as the bind path checked its own
+    /// SET_CUR.
+    pub clock_ranges: Vec<ClockSubrange>,
     /// Rate currently programmed on the device (Hz).
     pub current_rate_hz: IrqSafeSpinLock<u32>,
     /// Alt setting currently selected on the device (0 = idle).
@@ -199,6 +219,7 @@ impl UacCardState {
                 fu,
                 clock_id: clock.map(|c| c.id),
                 clock_programmable: clock.map(|c| c.freq_programmable).unwrap_or(false),
+                clock_ranges: outcome.clock_ranges[dir].clone(),
                 current_rate_hz: IrqSafeSpinLock::new(rate_hz),
                 active_alt: AtomicU8::new(choice.alt_setting),
                 claimed: AtomicBool::new(false),
@@ -224,10 +245,12 @@ impl UacCardState {
         }
     }
 
-    /// Detach: stop live pumps and unregister the card. Open
-    /// leases keep their `Arc`s (and the hardware contract) alive
-    /// until they stop, per the sound layer's unregister
-    /// semantics.
+    /// Detach: invalidate live pumps' generations (a pump
+    /// mid-transfer drops its packet at the commit gate and
+    /// exits; it can never move the ring again) and unregister
+    /// the card. Open leases keep their `Arc`s (and the
+    /// hardware contract) alive until they stop, per the sound
+    /// layer's unregister semantics.
     pub fn detach(&self) {
         self.detached.store(true, Ordering::SeqCst);
         for s in [self.playback.as_ref(), self.capture.as_ref()]
@@ -235,7 +258,7 @@ impl UacCardState {
             .flatten()
         {
             if let Some(shared) = s.live.lock().as_ref() {
-                shared.stop.store(true, Ordering::SeqCst);
+                shared.invalidate_generation();
             }
         }
         if let Some(idx) = self.card_index.lock().take() {
@@ -292,28 +315,62 @@ impl UacCardState {
     /// Program the sampling frequency for one direction: UAC1
     /// endpoint control, or the UAC2 clock entity when the clock
     /// is programmable (a fixed clock rejects with BadState and
-    /// the caller keeps the bind-time rate).
-    pub fn set_rate(&self, dir: &StreamState, hz: u32) -> Result<(), SoundError> {
+    /// the caller keeps the bind-time rate). Returns the rate
+    /// the device was actually left running at, which the
+    /// caller records: for a programmable UAC2 clock the
+    /// request is first validated against the bind-time
+    /// subranges (`snap_clock_rate` — an out-of-range SET_CUR is
+    /// never issued, because a clamping device would report
+    /// success while running at a different rate), and the
+    /// programmed rate is verified by GET_CUR readback when the
+    /// device answers it. When no subranges were learned at
+    /// bind (the RANGE read is non-fatal there) the request
+    /// passes unchecked, exactly as the bind path programmed
+    /// its own preference in that case.
+    pub fn set_rate(&self, dir: &StreamState, hz: u32) -> Result<u32, SoundError> {
         match self.version {
-            UacVersion::V1 => self.control_out(
-                0x22,
-                crate::uac::REQ_SET_CUR,
-                (crate::uac::SAMPLING_FREQUENCY_CONTROL as u16) << 8,
-                dir.choice.ep_addr as u16,
-                &crate::uac::encode_sampling_freq(hz),
-            ),
+            UacVersion::V1 => {
+                self.control_out(
+                    0x22,
+                    crate::uac::REQ_SET_CUR,
+                    (crate::uac::SAMPLING_FREQUENCY_CONTROL as u16) << 8,
+                    dir.choice.ep_addr as u16,
+                    &crate::uac::encode_sampling_freq(hz),
+                )?;
+                Ok(hz)
+            }
             UacVersion::V2 => {
                 let clock = dir.clock_id.ok_or(SoundError::BadState)?;
                 if !dir.clock_programmable {
                     return Err(SoundError::BadState);
                 }
+                let programmed = if dir.clock_ranges.is_empty() {
+                    hz
+                } else {
+                    snap_clock_rate(&dir.clock_ranges, hz).ok_or(SoundError::InvalidParams)?
+                };
+                let value = (crate::uac::CLOCK_CS_SAMPLING_FREQUENCY as u16) << 8;
+                let index = ((clock as u16) << 8) | self.ac_iface as u16;
                 self.control_out(
                     0x21,
                     crate::uac::REQ_CUR,
-                    (crate::uac::CLOCK_CS_SAMPLING_FREQUENCY as u16) << 8,
-                    ((clock as u16) << 8) | self.ac_iface as u16,
-                    &hz.to_le_bytes(),
-                )
+                    value,
+                    index,
+                    &programmed.to_le_bytes(),
+                )?;
+                // Read back the rate the clock is actually
+                // running at; a device that clamped silently is
+                // recorded truthfully. Non-fatal, mirroring the
+                // bind path's fixed-clock readback: when the
+                // device doesn't answer, the programmed
+                // (snapped) rate stands.
+                let mut buf = [0u8; 4];
+                if let Ok(n) = self.control_in(0xA1, crate::uac::REQ_CUR, value, index, &mut buf) {
+                    if n >= 4 {
+                        return Ok(u32::from_le_bytes(buf));
+                    }
+                }
+                Ok(programmed)
             }
         }
     }
@@ -359,9 +416,21 @@ pub fn register_card(state: &Arc<UacCardState>) -> Result<u32, SoundError> {
 // ── Pump plumbing ──────────────────────────────────────────────────
 
 /// State shared between a stream lease and its pump.
+///
+/// Pump liveness is a GENERATION discipline, not a stop flag:
+/// every `start` advances the generation and the pump runs
+/// under the value it captured; `stop`, lease drop and card
+/// detach invalidate it. A pump checks its generation before
+/// each transfer (`begin_*`) and again before committing ring
+/// movement (`commit_*`), so a task parked mid-transfer across
+/// a stop → start cycle wakes to find itself superseded: it
+/// drops its packet at the commit gate and exits, and the
+/// successor generation is the only one that can move the
+/// ring. A shared stop flag cannot express this — `start`
+/// would have to clear it, resurrecting the parked task.
 #[derive(Debug)]
 pub struct PumpShared {
-    pub stop: AtomicBool,
+    generation: AtomicU64,
     pub frames_clocked: AtomicU64,
     pub ring: IrqSafeSpinLock<PcmRing>,
     /// Fractional frame accumulator for rates like 44.1 kHz
@@ -372,11 +441,36 @@ pub struct PumpShared {
 impl PumpShared {
     pub fn new(format: PcmFormat, capacity_bytes: usize) -> Self {
         Self {
-            stop: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             frames_clocked: AtomicU64::new(0),
             ring: IrqSafeSpinLock::new(PcmRing::new(format, capacity_bytes)),
             phase: IrqSafeSpinLock::new(0),
         }
+    }
+
+    /// Advance to a fresh generation and return it. Called by
+    /// `start`; the returned value is the only generation a
+    /// newly spawned pump may run under.
+    pub fn advance_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Invalidate the current generation without designating a
+    /// successor: any live pump is now stale and exits at its
+    /// next gate without moving the ring again.
+    pub fn invalidate_generation(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The current generation (0 before the first `start`).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Is `gen` the live generation? Generation 0 (never
+    /// started) is never current.
+    pub fn is_current(&self, gen: u64) -> bool {
+        gen != 0 && self.generation.load(Ordering::SeqCst) == gen
     }
 
     /// Frames in the next 1 ms packet at `rate_hz`, with the
@@ -388,20 +482,69 @@ impl PumpShared {
         (acc / 1000) as usize
     }
 
-    /// Take the next playback packet: queued frames first,
-    /// silence for the underrun remainder. The packet is always
-    /// full-length — a running USB stream clocks silence, it
-    /// does not stall.
-    pub fn take_playback_packet(&self, rate_hz: u32, frame_bytes: usize) -> Vec<u8> {
+    /// Begin a playback cycle for generation `gen`: build the
+    /// next packet — queued frames first, silence for the
+    /// underrun remainder; a running stream clocks silence, it
+    /// does not stall — WITHOUT advancing the ALSA pointer.
+    /// Returns the packet and its frame count, or `None` when
+    /// `gen` is already stale (nothing is built, the ring is
+    /// untouched). The caller transfers the packet, then calls
+    /// `commit_playback`: the pointer moves only there, and
+    /// only for the live generation.
+    pub fn begin_playback(
+        &self,
+        gen: u64,
+        rate_hz: u32,
+        frame_bytes: usize,
+    ) -> Option<(Vec<u8>, usize)> {
+        if !self.is_current(gen) {
+            return None;
+        }
         let frames = self.next_packet_frames(rate_hz);
         let mut buf = alloc::vec![0u8; frames * frame_bytes];
         {
             let mut ring = self.ring.lock();
             let _ = ring.pop(&mut buf);
         }
+        Some((buf, frames))
+    }
+
+    /// Commit a transferred playback packet: advance the ALSA
+    /// pointer by `frames` iff `gen` is still the live
+    /// generation. `false` means the generation was stopped or
+    /// superseded while the transfer was in flight — the
+    /// packet is disowned and neither the pointer nor the
+    /// successor's stream state is touched.
+    pub fn commit_playback(&self, gen: u64, frames: usize) -> bool {
+        if !self.is_current(gen) {
+            return false;
+        }
         self.frames_clocked
             .fetch_add(frames as u64, Ordering::SeqCst);
-        buf
+        true
+    }
+
+    /// Begin a capture cycle for generation `gen`: the frame
+    /// count of the next 1 ms packet, or `None` when `gen` is
+    /// already stale.
+    pub fn begin_capture(&self, gen: u64, rate_hz: u32) -> Option<usize> {
+        if !self.is_current(gen) {
+            return None;
+        }
+        Some(self.next_packet_frames(rate_hz))
+    }
+
+    /// Commit a received capture packet: ingest its whole
+    /// frames and advance the pointer iff `gen` is still the
+    /// live generation. `false` means the packet arrived
+    /// across a stop or detach — it is dropped, never ingested
+    /// into the successor's ring.
+    pub fn commit_capture(&self, gen: u64, data: &[u8], frame_bytes: usize) -> bool {
+        if !self.is_current(gen) {
+            return false;
+        }
+        self.ingest_capture(data, frame_bytes);
+        true
     }
 
     /// Ingest one capture packet's bytes; whole frames only,
@@ -455,29 +598,57 @@ impl IsoTransfer for XhciIso {
     }
 }
 
-/// Run one pump cycle against an explicit transport: playback
-/// ships the next packet out, capture pulls one packet in. This
-/// is the exact step the fixture drives; the production pump
-/// task performs the same ring movement around direct awaits.
+/// Outcome of one pump cycle.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PumpStep {
+    /// The cycle transferred a packet and committed its ring
+    /// movement under the live generation.
+    Moved,
+    /// The cycle's generation was stopped or superseded before
+    /// the transfer or while it was in flight: nothing was
+    /// committed — no pointer movement, no ring ingest.
+    Stale,
+}
+
+/// Run one pump cycle for generation `gen` against an explicit
+/// transport: playback ships the next packet out, capture pulls
+/// one packet in, each as a `begin → transfer → commit` cycle
+/// on `shared`. This is the exact step the fixture drives; the
+/// production pump task performs the same gated cycle around
+/// direct awaits.
 pub fn pump_step(
     shared: &PumpShared,
+    gen: u64,
     iso: &dyn IsoTransfer,
     capture: bool,
     rate_hz: u32,
     frame_bytes: usize,
     ep_max_packet: usize,
-) -> Result<(), SoundError> {
+) -> Result<PumpStep, SoundError> {
     if capture {
-        let frames = shared.next_packet_frames(rate_hz);
+        let Some(frames) = shared.begin_capture(gen, rate_hz) else {
+            return Ok(PumpStep::Stale);
+        };
         let want = (frames * frame_bytes).min(ep_max_packet.max(frame_bytes));
         let mut buf = alloc::vec![0u8; want];
         let n = iso.isoch_in(&mut buf)?;
-        shared.ingest_capture(&buf[..n.min(want)], frame_bytes);
-        Ok(())
+        Ok(
+            if shared.commit_capture(gen, &buf[..n.min(want)], frame_bytes) {
+                PumpStep::Moved
+            } else {
+                PumpStep::Stale
+            },
+        )
     } else {
-        let packet = shared.take_playback_packet(rate_hz, frame_bytes);
+        let Some((packet, frames)) = shared.begin_playback(gen, rate_hz, frame_bytes) else {
+            return Ok(PumpStep::Stale);
+        };
         iso.isoch_out(&packet)?;
-        Ok(())
+        Ok(if shared.commit_playback(gen, frames) {
+            PumpStep::Moved
+        } else {
+            PumpStep::Stale
+        })
     }
 }
 
@@ -558,6 +729,18 @@ impl PcmDevice for UsbAudioCard {
         }
         if formats.is_empty() {
             return PcmCapabilities::fixed(self.default_params(capture));
+        }
+        // UAC2: the advertised rates are the intersection of
+        // the alts' descriptor set with the rates the stream's
+        // clock actually admits (the bind-time RANGE response,
+        // retained on the stream). Advertising a rate the
+        // clock would clamp or refuse would repeat the bind
+        // path's silent-wrong-rate failure at the ALSA surface.
+        if self.0.version == UacVersion::V2 && !dir.clock_ranges.is_empty() {
+            rates.retain(|r| clock_rate_admitted(&dir.clock_ranges, r.hz()));
+            if rates.is_empty() {
+                return PcmCapabilities::fixed(self.default_params(capture));
+            }
         }
         let frame = max_frame_bytes.max(1) as u32;
         PcmCapabilities {
@@ -734,6 +917,7 @@ impl PcmDevice for UsbAudioCard {
                 dci: choice.dci,
             }),
             spawn_pump: true,
+            generation: 0,
             params: None,
             chosen_alt: None,
             prepared: false,
@@ -756,6 +940,10 @@ pub struct UacStream {
     /// Production leases spawn the pump task; fixture leases are
     /// stepped explicitly via `pump_once`.
     spawn_pump: bool,
+    /// Pump generation this lease's current run owns (assigned
+    /// by `start` from `PumpShared::advance_generation`; 0 =
+    /// never started).
+    generation: u64,
     params: Option<HwParams>,
     chosen_alt: Option<u8>,
     prepared: bool,
@@ -799,6 +987,7 @@ impl UacStream {
             shared,
             iso,
             spawn_pump: false,
+            generation: 0,
             params: None,
             chosen_alt: None,
             prepared: false,
@@ -806,7 +995,10 @@ impl UacStream {
         })
     }
 
-    /// One pump cycle (fixture path; production uses the task).
+    /// One pump cycle under the lease's current generation
+    /// (fixture path; production uses the task). A cycle that
+    /// finds its generation superseded (detach raced the
+    /// fixture) moves nothing and is not an error.
     pub fn pump_once(&mut self) -> Result<(), SoundError> {
         if !self.running {
             return Err(SoundError::BadState);
@@ -814,12 +1006,14 @@ impl UacStream {
         let params = self.params.ok_or(SoundError::BadState)?;
         pump_step(
             &self.shared,
+            self.generation,
             &*self.iso,
             self.dir.capture,
             params.rate.hz(),
             params.format.bytes_per_sample() * params.channels.count() as usize,
             1024,
-        )
+        )?;
+        Ok(())
     }
 
     fn program_device(&mut self, alt: u8, rate_hz: u32) -> Result<(), SoundError> {
@@ -828,12 +1022,15 @@ impl UacStream {
             self.dir.active_alt.store(alt, Ordering::SeqCst);
         }
         if *self.dir.current_rate_hz.lock() != rate_hz {
-            match self.card.set_rate(&self.dir, rate_hz) {
-                Ok(()) => *self.dir.current_rate_hz.lock() = rate_hz,
-                // A fixed UAC2 clock cannot move; refuse params
-                // the bind did not negotiate.
-                Err(e) => return Err(e),
-            }
+            // Record the rate the device was actually left
+            // running at (post-snap, readback-verified), never
+            // the bare request. A fixed UAC2 clock cannot move
+            // (BadState) and an out-of-range request on a
+            // programmable one is refused (InvalidParams):
+            // either way, params the hardware won't run fail
+            // prepare instead of running silently wrong.
+            let programmed = self.card.set_rate(&self.dir, rate_hz)?;
+            *self.dir.current_rate_hz.lock() = programmed;
         }
         Ok(())
     }
@@ -841,8 +1038,13 @@ impl UacStream {
 
 impl PcmHardware for UacStream {
     fn configure(&mut self, params: HwParams) -> Result<(), SoundError> {
-        let (alt, _ep) = find_alt_for(&self.dir.alts, self.card.version, &params)
-            .ok_or(SoundError::InvalidParams)?;
+        let (alt, _ep) = find_alt_for(
+            &self.dir.alts,
+            self.card.version,
+            &self.dir.clock_ranges,
+            &params,
+        )
+        .ok_or(SoundError::InvalidParams)?;
         self.params = Some(params);
         self.chosen_alt = Some(alt);
         self.prepared = false;
@@ -868,9 +1070,28 @@ impl PcmHardware for UacStream {
             self.program_device(alt, params.rate.hz())?;
         } else {
             // Fixture lease: no hardware to program; mirror the
-            // bookkeeping so lifecycle assertions hold.
+            // bookkeeping — including the rate discipline, so a
+            // fixture prepare fails exactly where production's
+            // would — so lifecycle assertions hold.
             self.dir.active_alt.store(alt, Ordering::SeqCst);
-            *self.dir.current_rate_hz.lock() = params.rate.hz();
+            let programmed = if self.card.version == UacVersion::V2
+                && self.dir.clock_id.is_some()
+                && !self.dir.clock_programmable
+            {
+                // Fixed clock: only the bind-negotiated rate
+                // prepares (production's set_rate: BadState).
+                let cur = *self.dir.current_rate_hz.lock();
+                if params.rate.hz() != cur {
+                    return Err(SoundError::BadState);
+                }
+                cur
+            } else if self.dir.clock_ranges.is_empty() {
+                params.rate.hz()
+            } else {
+                snap_clock_rate(&self.dir.clock_ranges, params.rate.hz())
+                    .ok_or(SoundError::InvalidParams)?
+            };
+            *self.dir.current_rate_hz.lock() = programmed;
         }
         self.prepared = true;
         Ok(())
@@ -881,9 +1102,15 @@ impl PcmHardware for UacStream {
             return Err(SoundError::BadState);
         }
         if self.running {
+            // Already running under this lease's generation:
+            // no second task, no new generation — exactly one
+            // pump can ever own the ring.
             return Ok(());
         }
-        self.shared.stop.store(false, Ordering::SeqCst);
+        // A fresh generation for this run. Any pump task left
+        // over from a previous run is now stale by construction
+        // and exits at its next gate, whatever this start does.
+        self.generation = self.shared.advance_generation();
         self.running = true;
         if self.spawn_pump {
             spawn_pump(
@@ -891,13 +1118,19 @@ impl PcmHardware for UacStream {
                 self.dir.clone(),
                 self.shared.clone(),
                 self.params.unwrap(),
+                self.generation,
             );
         }
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), SoundError> {
-        self.shared.stop.store(true, Ordering::SeqCst);
+        // Invalidate the generation FIRST: a pump parked
+        // mid-transfer is disowned before the interface is
+        // idled, so its late completion hits the commit gate
+        // and drops — it can never transfer or advance the
+        // ring against (or after) the alt-0 below.
+        self.shared.invalidate_generation();
         self.running = false;
         if self.spawn_pump && self.dir.active_alt.load(Ordering::SeqCst) != 0 {
             // Release the streaming interface: alt 0 is the
@@ -963,7 +1196,7 @@ impl PcmHardware for UacStream {
 
 impl Drop for UacStream {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::SeqCst);
+        self.shared.invalidate_generation();
         let mut live = self.dir.live.lock();
         if let Some(cur) = live.as_ref() {
             if Arc::ptr_eq(cur, &self.shared) {
@@ -974,15 +1207,20 @@ impl Drop for UacStream {
     }
 }
 
-/// Spawn the production pump task for a running stream. The task
-/// awaits the xHCI directly (executor context — no `block_on`),
-/// moving one packet per millisecond tick with the same ring
-/// helpers the fixture path uses.
+/// Spawn the production pump task for a running stream, under
+/// pump generation `gen`. The task awaits the xHCI directly
+/// (executor context — no `block_on`), moving one packet per
+/// millisecond tick as a `begin → transfer → commit` cycle:
+/// the generation is checked before each transfer and again
+/// before the ring movement commits, so a task superseded
+/// while parked in a transfer drops its packet and exits
+/// instead of clocking a ring it no longer owns.
 fn spawn_pump(
     card: Arc<UacCardState>,
     dir: Arc<StreamState>,
     shared: Arc<PumpShared>,
     params: HwParams,
+    gen: u64,
 ) {
     let frame_bytes = params.format.bytes_per_sample() * params.channels.count() as usize;
     let rate_hz = params.rate.hz();
@@ -992,20 +1230,30 @@ fn spawn_pump(
     narf_scheduler::spawn(async move {
         let ctrl = crate::xhci::controller();
         loop {
-            if shared.stop.load(Ordering::SeqCst) {
+            if !shared.is_current(gen) {
                 break;
             }
             if let Some(c) = &ctrl {
                 if capture {
-                    let frames = shared.next_packet_frames(rate_hz);
+                    let Some(frames) = shared.begin_capture(gen, rate_hz) else {
+                        break;
+                    };
                     let mut buf = alloc::vec![0u8; frames * frame_bytes];
                     if let Ok(n) = c.isoch_in(slot, dci, &mut buf).await {
                         let n = n.min(buf.len());
-                        shared.ingest_capture(&buf[..n], frame_bytes);
+                        if !shared.commit_capture(gen, &buf[..n], frame_bytes) {
+                            break;
+                        }
                     }
                 } else {
-                    let packet = shared.take_playback_packet(rate_hz, frame_bytes);
+                    let Some((packet, frames)) = shared.begin_playback(gen, rate_hz, frame_bytes)
+                    else {
+                        break;
+                    };
                     let _ = c.isoch_out(slot, dci, &packet).await;
+                    if !shared.commit_playback(gen, frames) {
+                        break;
+                    }
                 }
             }
             narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
