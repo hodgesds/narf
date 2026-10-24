@@ -167,6 +167,51 @@ undo partial quiescing, and return the phase to `Idle` without blanking the
 framebuffer or entering platform sleep. `arm_s3_resume` uses the synchronous
 compatibility path and does not suspend devices twice.
 
+Suspend-to-idle (the `Freeze` target above) is implemented in `s2idle`:
+
+```rust
+pub fn suspend_to_idle(cap: &Cap<Power, Invoke>) -> Result<(), SuspendError>;
+pub async fn suspend_to_idle_async(cap: &Cap<Power, Invoke>) -> Result<(), SuspendError>;
+pub fn s2idle_supported() -> bool;
+pub fn note_wake_event(source: WakeSource);
+pub fn enable_production_s2idle(cap: &Cap<Power, Invoke>) -> Result<bool, SuspendError>;
+```
+
+s2idle shares the S3 transition claim, phase observable, `device_pm` /
+`system_pm` fan-outs, framebuffer hooks, and production-gating posture (test
+arm, cap-gated opt-in, `S2IDLE_VALIDATED` boot token). It differs where the
+semantics differ: no `\_S3_` / FADT requirement (`s2idle_supported()` needs
+only an arch park primitive), no CPU context save or resume trampoline (the
+CPU never loses power — execution stays in the caller's frame), no TSC
+snapshot, no `\_PTS` / FACS / PM1 write. The platform step masks every IRQ
+vector except the wake allowlist (`wake_irq_allowlist()`: the ACPI SCI) and
+parks via `narf_arch::idle_halt_then_disable` until a wake source latches an
+event with `note_wake_event`. An unarmed request walks the phases and returns
+`NotImplemented`, exactly like unarmed S3.
+
+Userspace requests a sleep state through `/sys/power/state`
+(`sysfs_bridge::populate_power_state`), the kernel's only userspace suspend
+trigger:
+
+```rust
+pub enum SleepState { Freeze, Mem }            // sleep_request
+pub fn request_sleep(state: SleepState) -> Result<(), SleepRequestError>;
+pub fn set_sleep_request_hook(hook: SleepRequestHook);
+```
+
+`show` lists exactly the supported states (`freeze` iff `s2idle_supported()`,
+`mem` iff `s3_supported()`); `store` takes the first whitespace-delimited
+token and returns `EINVAL` for an unknown or unsupported state, `ENODEV` when
+no request consumer is installed, and `EPERM` when the consumer refuses. The
+attr is root-owned 0644 like every writable sysfs attr — that mode/ownership
+pair is the write-access decision, the analogue of the reboot handler's
+CAP_SYS_BOOT gate. The store only *queues* the request with the policy path
+(the composition-installed hook forwards to the power service, whose executor
+owns the `Cap<Power, Invoke>` and executes the transition from task context);
+the write therefore returns once the request is queued rather than blocking
+until resume as Linux's does — a deliberate divergence required by the
+capability model, since the writer holds no Power cap.
+
 ### 3.4 Thermal
 
 ```rust
