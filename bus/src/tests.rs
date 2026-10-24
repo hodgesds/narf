@@ -2802,7 +2802,6 @@ fn arb_storage_probe(
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
 fn smoke_pci_probe_all_sdhci_arbitration() -> TestResult {
     use core::sync::atomic::Ordering;
 
