@@ -73,6 +73,16 @@ impl UdfNodeState {
 pub struct UdfNode<B: BlockDevice> {
     pub volume: Arc<UdfVolume<B>>,
     pub state: IrqSafeSpinLock<UdfNodeState>,
+    /// Absolute LSN of this file's ICB, mirrored out of the state at
+    /// construction (it never changes for a node) so the page-cache
+    /// identity/generation key needs no lock.
+    icb_lsn: u64,
+    /// The volume's shared `MAP_SHARED` identity anchor for this
+    /// file's ICB, minted on first use (see
+    /// `UdfVolume::mmap_anchor`). Every node of the same file holds
+    /// the same anchor, so `mmap_backing_identity` is stable across
+    /// opens.
+    mmap_anchor: narf_lib::sync::OnceLock<Arc<super::volume::MmapAnchor>>,
 }
 
 impl<B: BlockDevice + 'static> UdfNode<B> {
@@ -102,8 +112,10 @@ impl<B: BlockDevice + 'static> UdfNode<B> {
         };
         state.apply(&decoded.0, decoded.1, &volume.opts);
         Self {
+            icb_lsn: lsn,
             volume,
             state: IrqSafeSpinLock::new(state),
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
 
@@ -122,6 +134,7 @@ impl<B: BlockDevice + 'static> UdfNode<B> {
             mtime_cycles: 0,
         };
         Ok(Self {
+            icb_lsn,
             volume,
             state: IrqSafeSpinLock::new(UdfNodeState {
                 icb_lsn,
@@ -130,6 +143,7 @@ impl<B: BlockDevice + 'static> UdfNode<B> {
                 recorded_ids: (crate::icb::UDF_INVALID_ID, crate::icb::UDF_INVALID_ID),
                 times: EntryTimes::default(),
             }),
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         })
     }
 
@@ -386,6 +400,29 @@ impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
     /// Intentionally read-only. See `write` for the spec citations.
     fn truncate<'a>(&'a self, _len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    /// Generic-fallback mmap opt-in (#681): this file's bytes cannot
+    /// change within the mount — this driver implements no write
+    /// path at all (`write`/`truncate` above return `ReadOnly`, and
+    /// there is no create/unlink/rename) — so the volume assigns
+    /// this ICB's generation once and it never moves. A node for the
+    /// same file minted by a later lookup therefore reports the same
+    /// generation, and pages retained through one open are reusable
+    /// through any other.
+    fn mmap_cache_generation(&self) -> Option<u64> {
+        Some(self.volume.cache_generation(self.icb_lsn))
+    }
+
+    /// The shared-page cache key for this file: the volume anchor
+    /// for its ICB LSN, stable across opens, so retained pages are
+    /// keyed by the file and not by whichever node object an open
+    /// happened to mint.
+    fn mmap_backing_identity(&self) -> usize {
+        let anchor = self
+            .mmap_anchor
+            .get_or_init(|| self.volume.mmap_anchor(self.icb_lsn));
+        Arc::as_ptr(anchor) as usize
     }
 }
 

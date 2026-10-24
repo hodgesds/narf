@@ -774,6 +774,77 @@ fn smoke_udf_write_paths_are_read_only() -> TestResult {
 
 kernel_test_in!("drivers/fs/udf", smoke_udf_write_paths_are_read_only);
 
+/// Page-cache generation (#681): a UDF file's bytes cannot change
+/// within a mount (the driver implements no write path at all), so
+/// every open must report the same constant generation and the same
+/// stable backing identity — the two values the generic page cache
+/// needs to retain a file's pages across opens (the #679 shape). A
+/// second file must not share the (identity, generation) pair.
+fn smoke_udf_mmap_cache_generation_constant_across_opens() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let (img, _) = build_udf_image();
+    let volume = match mount_udf(img) {
+        Some(v) => v,
+        None => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+
+    let file = match poll_once(root.lookup_async("TEST.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup TEST.TXT failed"),
+    };
+    let g0 = match file.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("regular file reports no cache generation"),
+    };
+    let id0 = file.mmap_backing_identity();
+
+    // A second lookup is a second node object for the same file;
+    // the values must agree or cross-open retention cannot work.
+    let reopened = match poll_once(root.lookup_async("TEST.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second lookup failed"),
+    };
+    if reopened.mmap_cache_generation() != Some(g0) {
+        return TestResult::Fail("two opens of one file disagree on generation");
+    }
+    if reopened.mmap_backing_identity() != id0 {
+        return TestResult::Fail("two opens of one file disagree on backing identity");
+    }
+    if file.mmap_cache_generation() != Some(g0) {
+        return TestResult::Fail("generation is not constant across calls");
+    }
+
+    // A different file (the dated image's SUB directory) must not
+    // share the (identity, generation) pair, or a retained page
+    // could be served for the wrong file.
+    let volume2 = match mount_udf(build_udf_dated_image()) {
+        Some(v) => v,
+        None => return TestResult::Fail("dated mount failed"),
+    };
+    let root2 = volume2.root();
+    let file2 = match poll_once(root2.lookup_async("TEST.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("dated lookup TEST.TXT failed"),
+    };
+    let other = match poll_once(root2.lookup_async("SUB")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("dated lookup SUB failed"),
+    };
+    if other.mmap_backing_identity() == file2.mmap_backing_identity()
+        && other.mmap_cache_generation() == file2.mmap_cache_generation()
+    {
+        return TestResult::Fail("two different files alias one cache key");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/udf",
+    smoke_udf_mmap_cache_generation_constant_across_opens
+);
+
 // ── Exact timestamps (ECMA-167 §1/7.3, Linux `udf_disk_stamp_to_time`) ─
 
 /// Encode a 12-byte ECMA-167 `timestamp`.

@@ -86,6 +86,12 @@ pub struct ExfatNode<B: BlockDevice> {
     /// the same on every lookup, and never 0 or 1 (the boot region
     /// precedes the cluster heap).
     ino: u64,
+    /// The volume's shared `MAP_SHARED` identity anchor for this
+    /// file's entry slot position, minted on first use (see
+    /// `ExfatVolume::mmap_anchor`). Every node of the same file
+    /// holds the same anchor, so `mmap_backing_identity` is stable
+    /// across opens.
+    mmap_anchor: narf_lib::sync::OnceLock<Arc<super::volume::MmapAnchor>>,
 }
 
 const EXFAT_ROOT_INO: u64 = 1;
@@ -119,6 +125,7 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
                 },
                 times,
             }),
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
 
@@ -156,6 +163,7 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
                 stat,
                 times,
             }),
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
 }
@@ -466,6 +474,16 @@ impl<B: BlockDevice + 'static> FileOps for ExfatNode<B> {
         // directory's entry group for this file, recomputing its
         // §7.4.3 SetChecksum after editing DataLength, and walking
         // the FAT to extend the chain — is deferred to follow-up.
+        //
+        // TRIPWIRE (#681): the page-cache generation below is
+        // constant only because this stub (and `truncate`, and the
+        // absence of create/unlink/rename) makes exFAT content
+        // immutable. Implementing this method MUST first call
+        // `self.volume.bump_writable_epoch()` before the first
+        // mutation — and grow per-file generation bumps — or
+        // retained pages go silently stale. The
+        // `smoke_exfat_cache_generation_constant_until_writable`
+        // test fails the day this returns `Ok`, as a reminder.
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
@@ -475,7 +493,34 @@ impl<B: BlockDevice + 'static> FileOps for ExfatNode<B> {
     }
 
     fn truncate<'a>(&'a self, _len: u64) -> FsFuture<'a, ()> {
+        // TRIPWIRE (#681): see `write` — a working truncate is a
+        // mutation and must bump the writable epoch (then per-file
+        // generations) before it lands.
         Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Generic-fallback mmap opt-in (#681): this file's bytes cannot
+    /// change within the mount *today* — `write`/`truncate` above
+    /// return `Unsupported` and the crate has no create/unlink/
+    /// rename at all — so the volume assigns this entry's generation
+    /// once and it never moves. A node for the same file minted by a
+    /// later lookup therefore reports the same generation, and pages
+    /// retained through one open are reusable through any other.
+    /// The value folds in the volume's writable epoch, the tripwire
+    /// that keeps this constant honest if write support lands.
+    fn mmap_cache_generation(&self) -> Option<u64> {
+        Some(self.volume.cache_generation(self.ino))
+    }
+
+    /// The shared-page cache key for this file: the volume anchor
+    /// for its entry slot position, stable across opens, so retained
+    /// pages are keyed by the file and not by whichever node object
+    /// an open happened to mint.
+    fn mmap_backing_identity(&self) -> usize {
+        let anchor = self
+            .mmap_anchor
+            .get_or_init(|| self.volume.mmap_anchor(self.ino));
+        Arc::as_ptr(anchor) as usize
     }
 }
 

@@ -50,6 +50,12 @@ pub struct Iso9660Node<B: BlockDevice> {
     /// value) in wall-clock nanoseconds, from the §9.1.5 recording date of
     /// the record Linux reads this inode from.
     mtime_ns: u64,
+    /// The volume's shared `MAP_SHARED` identity anchor for this
+    /// file's inode number, minted on first use (see
+    /// `Iso9660Volume::mmap_anchor`). Every node of the same file
+    /// holds the same anchor, so `mmap_backing_identity` is stable
+    /// across opens.
+    mmap_anchor: narf_lib::sync::OnceLock<Arc<super::volume::MmapAnchor>>,
 }
 
 /// `log2(SECTOR_SIZE)`: Linux's `ISOFS_BUFFER_BITS` for 2 KiB blocks.
@@ -114,6 +120,7 @@ impl<B: BlockDevice + 'static> Iso9660Node<B> {
                 stat,
             }),
             mtime_ns: 0,
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
         .with_date(&record.recording_date_time)
     }
@@ -249,6 +256,29 @@ impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
     /// fixed at authoring time.
     fn truncate<'a>(&'a self, _len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    /// Generic-fallback mmap opt-in (#681): this file's bytes cannot
+    /// change within the mount — `write`/`truncate` above return
+    /// `ReadOnly`, the driver has no create/unlink/rename, and the
+    /// medium is authored offline — so the volume assigns this
+    /// inode's generation once and it never moves. A node for the
+    /// same file minted by a later lookup therefore reports the same
+    /// generation, and pages retained through one open are reusable
+    /// through any other.
+    fn mmap_cache_generation(&self) -> Option<u64> {
+        Some(self.volume.cache_generation(self.ino))
+    }
+
+    /// The shared-page cache key for this file: the volume anchor
+    /// for its inode number, stable across opens, so retained pages
+    /// are keyed by the file and not by whichever node object an
+    /// open happened to mint.
+    fn mmap_backing_identity(&self) -> usize {
+        let anchor = self
+            .mmap_anchor
+            .get_or_init(|| self.volume.mmap_anchor(self.ino));
+        Arc::as_ptr(anchor) as usize
     }
 }
 

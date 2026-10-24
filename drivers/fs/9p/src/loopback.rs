@@ -43,6 +43,11 @@ pub struct LoopbackFile {
     pub data: Vec<u8>,
     /// Numeric path id used in the qid. Stable across a session.
     pub path_id: u64,
+    /// The qid `version` the server reports for this file. Starts
+    /// at 0 ("no version maintained") and is bumped on every
+    /// mutation, per intro(5) — `Twrite`s through the protocol and
+    /// `replace_data`'s simulated external changes alike.
+    pub version: u32,
     /// stat(5) `atime` / `mtime`, seconds since the epoch.
     pub atime: u32,
     pub mtime: u32,
@@ -98,6 +103,7 @@ impl LoopbackTransport {
                 // Path id 1 is reserved for the root directory; child
                 // ids start at 2.
                 path_id: 2 + i as u64,
+                version: 0,
                 atime: 0,
                 mtime: 0,
             });
@@ -135,6 +141,23 @@ impl LoopbackTransport {
         }
     }
 
+    /// Replace child `name`'s bytes *outside* the protocol, as if
+    /// another client (or the server itself) changed the file.
+    /// Bumps the file's qid version like any real modification, so a
+    /// client's next `Rstat` observes the change. Returns `false`
+    /// if no such child exists.
+    pub fn replace_data(&self, name: &str, data: &[u8]) -> bool {
+        let mut inner = self.inner.lock();
+        match inner.files.iter_mut().find(|f| f.name == name) {
+            Some(f) => {
+                f.data = data.to_vec();
+                f.version = f.version.wrapping_add(1);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Number of RPCs the synthetic server has handled. Useful for
     /// asserting on test traffic shape.
     pub fn rpc_count(&self) -> u64 {
@@ -152,7 +175,7 @@ impl LoopbackTransport {
     fn file_qid(file: &LoopbackFile) -> Qid {
         Qid {
             qid_type: qtype::FILE,
-            version: 0,
+            version: file.version,
             path: file.path_id,
         }
     }
@@ -380,6 +403,10 @@ impl LoopbackTransport {
                     file.data.resize(new_end, 0);
                 }
                 file.data[offset..new_end].copy_from_slice(&data);
+                // intro(5): the qid version changes on every
+                // modification, so later Rstat/Rwalk replies report
+                // the bump and clients can invalidate cached state.
+                file.version = file.version.wrapping_add(1);
                 drop(inner);
                 frame_message(self.cap(), MsgType::Rwrite, tag, |w| {
                     w.write_u32(count as u32)

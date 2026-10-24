@@ -6326,9 +6326,46 @@ impl fmt::Debug for InitramfsFile {
     }
 }
 
+/// The page-cache generation every initramfs file reports (#681).
+/// Sound as a bare constant — with no per-file component — because
+/// of the identity it pairs with: `InitramfsFile::mmap_backing_identity`
+/// is the address of the file's bytes inside the `'static` CPIO
+/// archive. That memory is never freed or reused, and distinct
+/// entries occupy disjoint spans of it, so the identity can never
+/// be reissued to a different content-bearing file; the bytes behind
+/// it can never change either (the archive is immutable and this
+/// driver's `write` returns `ReadOnly`, `truncate` the trait
+/// default `Unsupported`, and there is no create/unlink). The
+/// (identity, generation) pair therefore names one immutable file
+/// instance for the life of the boot.
+const INITRAMFS_CACHE_GENERATION: u64 = 1;
+
 impl FileOps for InitramfsFile {
     fn ino(&self) -> u64 {
         self.ino
+    }
+
+    /// Generic-fallback mmap opt-in (#681): initramfs content is
+    /// borrowed from the static archive image and cannot change
+    /// within the boot, so the constant generation never moves and
+    /// pages retained through one open are reusable through any
+    /// other. See [`INITRAMFS_CACHE_GENERATION`] for why a constant
+    /// is sound here without a per-file component.
+    fn mmap_cache_generation(&self) -> Option<u64> {
+        Some(INITRAMFS_CACHE_GENERATION)
+    }
+
+    /// The shared-page cache key for this file: the address of its
+    /// bytes in the `'static` archive, identical on every lookup
+    /// (each lookup rebuilds this object around the same entry
+    /// slice). Distinct content-bearing entries occupy disjoint
+    /// archive spans, so the value is unique per file; the only
+    /// files that can share a pointer are zero-length ones
+    /// (including the synthesized virtual directories, which use a
+    /// shared empty slice) — and a zero-length file has no pages to
+    /// retain, so the alias can never key cached content.
+    fn mmap_backing_identity(&self) -> usize {
+        self.data.as_ptr() as usize
     }
 
     fn inode_attrs(&self) -> InodeAttrs {

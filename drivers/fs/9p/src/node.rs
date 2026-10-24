@@ -58,6 +58,19 @@ pub struct NinepNode {
     /// refreshed by every `stat_async`. The sync `inode_attrs` /
     /// `dir_mtime_ns` report them; `None` only if never stat'd.
     times: IrqSafeSpinLock<Option<P9Times>>,
+    /// The file's `qid.version` as last learned from the server:
+    /// the walk that minted this node first, then every `Rstat`
+    /// reply's qid (`stat_child` / `stat_async`). Per intro(5) the
+    /// server changes it on every modification, so it is the
+    /// page-cache generation source (#681) — a per-node cell because
+    /// the server, not this client, is authoritative for it.
+    version: IrqSafeSpinLock<u32>,
+    /// The session's shared `MAP_SHARED` identity anchor for this
+    /// file's `qid.path`, minted on first use (see
+    /// `P9Session::mmap_anchor`). Every node of the same server file
+    /// holds the same anchor, so `mmap_backing_identity` is stable
+    /// across opens.
+    mmap_anchor: narf_lib::sync::OnceLock<Arc<super::session::MmapAnchor>>,
 }
 
 impl core::fmt::Debug for NinepNode {
@@ -81,8 +94,10 @@ impl NinepNode {
             transport,
             session,
             fid,
+            version: IrqSafeSpinLock::new(qid.version),
             qid,
             times: IrqSafeSpinLock::new(times),
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
 
@@ -106,6 +121,12 @@ impl NinepNode {
             Ok(st) => {
                 let node = self.child_node(fid, qid);
                 *node.times.lock() = Some(P9Times::from_stat(&st));
+                // The Rstat's qid is fresher than the walk's: adopt
+                // its version so the new node's page-cache generation
+                // starts current (#681).
+                if st.qid.path == qid.path {
+                    *node.version.lock() = st.qid.version;
+                }
                 Ok(node)
             }
             Err(e) => {
@@ -294,8 +315,10 @@ impl NinepNode {
             transport: self.transport.clone(),
             session: self.session.clone(),
             fid,
+            version: IrqSafeSpinLock::new(qid.version),
             qid,
             times: IrqSafeSpinLock::new(None),
+            mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
 
@@ -435,6 +458,12 @@ impl FileOps for NinepNode {
             let st = self.tstat(self.fid).await?;
             let times = P9Times::from_stat(&st);
             *self.times.lock() = Some(times);
+            // Refresh the cached qid.version from the reply: this is
+            // how a node learns the server changed the file, and the
+            // page-cache generation follows it (#681).
+            if st.qid.path == self.qid.path {
+                *self.version.lock() = st.qid.version;
+            }
             let ft = if (st.mode & super::message::statmode::DIR) != 0 {
                 FileType::Dir
             } else {
@@ -454,6 +483,50 @@ impl FileOps for NinepNode {
             })
         })
     }
+
+    /// Generic-fallback mmap opt-in (#681): the generation is the
+    /// protocol's own coherency token — `qid.version`, which per
+    /// intro(5) the server changes on every modification — folded
+    /// with `qid.path` (see [`qid_cache_generation`]). The server is
+    /// authoritative and can mutate the file externally, so neither
+    /// a local counter nor a constant would be sound; the version is
+    /// refreshed from walk and `Rstat` replies (see the `version`
+    /// field). A server that reports version 0 is not maintaining
+    /// the token — 0 there is indistinguishable from "no version" —
+    /// so such files keep `None` and stay out of the retained cache.
+    fn mmap_cache_generation(&self) -> Option<u64> {
+        let version = *self.version.lock();
+        if version == 0 {
+            None
+        } else {
+            Some(qid_cache_generation(self.qid.path, version))
+        }
+    }
+
+    /// The shared-page cache key for this file: the session anchor
+    /// for its `qid.path`, stable across opens (every lookup mints a
+    /// fresh node around a fresh fid, but the server file is the
+    /// same), so retained pages are keyed by the file and not by
+    /// whichever node object an open happened to mint.
+    fn mmap_backing_identity(&self) -> usize {
+        let anchor = self
+            .mmap_anchor
+            .get_or_init(|| self.session.mmap_anchor(self.qid.path));
+        Arc::as_ptr(anchor) as usize
+    }
+}
+
+/// Fold a qid into a page-cache generation: `path` names the file
+/// instance, `version` its mutation epoch. The splitmix64 finalizer
+/// is a bijection on the combined input, so at a fixed `path` every
+/// distinct `version` yields a distinct generation — a server-side
+/// change can never fold back onto the value a retained page was
+/// published under.
+fn qid_cache_generation(path: u64, version: u32) -> u64 {
+    let mut z = path ^ (u64::from(version) << 32) ^ 0x9E37_79B9_7F4A_7C15;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 impl DirOps for NinepNode {
