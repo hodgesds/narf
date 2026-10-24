@@ -130,7 +130,8 @@ pub struct AcpDevice {
     pub version: AcpVersion,
     pub fw_loaded: bool,
     /// I2S TX engine has been programmed + ring buffer allocated.
-    /// Set by `acp6_pcm::prepare_i2s0_tx`; cleared on stop.
+    /// (The PCM helper that set this was excised with the dead ACP6
+    /// scaffold in #783; the field stays for the ACP 6.3 engine.)
     pub(crate) i2s_tx_prepared: bool,
 }
 
