@@ -399,6 +399,8 @@ pub(crate) fn drop_address_space(address_space_id: u64) {
         .lock()
         .remove(&address_space_id);
     drop(retired);
+    // The space's recorded batches die with it (#737 step 2).
+    drop_advice_records(address_space_id);
 }
 
 /// Distinct files with a non-private mapping of `address_space_id`
@@ -515,6 +517,12 @@ pub(crate) fn publish_current_mapping(
         punch_locked(&mut owners, base, len);
         return Err(error);
     }
+    if replace {
+        // The range's previous mappings were retired by this
+        // publication; batches recorded against them are stale (#737
+        // step 2).
+        scrub_advice_range(address_space_id, base, len);
+    }
     Ok(receipt)
 }
 
@@ -564,6 +572,9 @@ pub(crate) fn publish_current_unowned_mapping<T: Copy>(
     punch_locked(&mut owners, base, len);
     drop(owners);
     finish(receipt)?;
+    // The replaced range's batches described the retired owners
+    // (#737 step 2).
+    scrub_advice_range(address_space_id, base, len);
     Ok(receipt)
 }
 
@@ -626,6 +637,9 @@ fn publish_fixed_remap<T>(
     let result = publish();
     if result.is_ok() || result.as_ref().is_err_and(|failure| failure.target_punched) {
         commit_prepared_punch_locked(&mut owners, base, len, suffixes);
+        drop(owners);
+        // The target range was retired or reshaped (#737 step 2).
+        scrub_advice_range(address_space_id, base, len);
     }
     result
 }
@@ -760,16 +774,30 @@ fn publish_owner_relocation<T>(
                 commit_prepared_punch_locked(&mut owners, old_addr, old_len, source_suffixes);
                 owners.extend(destination);
             }
+            drop(owners);
+            // The source range moved away and the fixed target was
+            // replaced: batches recorded against either are stale
+            // (#737 step 2).
+            scrub_advice_range(address_space_id, old_addr, old_len);
+            if fixed {
+                scrub_advice_range(address_space_id, new_addr, new_len);
+            }
         }
         Err(failure) if failure.target_punched => {
             commit_prepared_punch_locked(&mut owners, new_addr, new_len, target_suffixes);
-            if failure.source_shrunk && old_len > new_len && source_owned {
+            let shrunk = failure.source_shrunk && old_len > new_len && source_owned;
+            if shrunk {
                 commit_prepared_punch_locked(
                     &mut owners,
                     old_addr + new_len,
                     old_len - new_len,
                     shrink_suffixes,
                 );
+            }
+            drop(owners);
+            scrub_advice_range(address_space_id, new_addr, new_len);
+            if shrunk {
+                scrub_advice_range(address_space_id, old_addr + new_len, old_len - new_len);
             }
         }
         Err(_) => {}
@@ -812,6 +840,15 @@ pub(crate) fn publish_current_owner_resize<T>(
     if result.is_ok() {
         commit_prepared_punch_locked(&mut owners, base, old_len, suffixes);
         owners.extend(replacement);
+        drop(owners);
+        // The row's extent changed: a batch recorded against the old
+        // extent is stale past the point the extents agree (#737
+        // step 2).
+        let keep = old_len.min(new_len);
+        let span = old_len.max(new_len) - keep;
+        if span != 0 {
+            scrub_advice_range(address_space_id, base + keep, span);
+        }
     }
     result
 }
@@ -878,13 +915,21 @@ fn publish_owner_alias<T>(
                 commit_prepared_punch_locked(&mut owners, new_addr, len, suffixes);
             }
             owners.extend(aliases);
+            drop(owners);
+            if fixed {
+                // The fixed target was retired and replaced (#737
+                // step 2).
+                scrub_advice_range(address_space_id, new_addr, len);
+            }
         }
         Err(failure) if failure.target_punched => {
             if let Some(suffixes) = suffixes {
                 commit_prepared_punch_locked(&mut owners, new_addr, len, suffixes);
             }
+            drop(owners);
             // `aliases` drops without publication: memory did not establish a
             // destination VMA even though it destructively retired the target.
+            scrub_advice_range(address_space_id, new_addr, len);
         }
         Err(_) => {
             // Every allocation was only a prepared clone; preserve source and
@@ -910,6 +955,11 @@ pub(crate) fn publish_current_punch(
     let result = publish();
     if result.is_ok() {
         commit_prepared_punch_locked(&mut owners, base, len, suffixes);
+        drop(owners);
+        // The punched range's mappings are gone or reshaped; recorded
+        // batches over it must not survive in their old shape (#737
+        // step 2).
+        scrub_advice_range(address_space_id, base, len);
     }
     result
 }
@@ -1266,6 +1316,14 @@ struct FaultExpansion {
 pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
     let (phys, expansion) = demand_frame_inner(address_space_id, vaddr)?;
     if let Some(expansion) = expansion {
+        // A recorded batch (#737 step 2) outranks the fixed window:
+        // the caller once named this whole range as its upcoming scan,
+        // so the first fault inside it restores the batch in one bulk
+        // operation. Only when no batch covers the fault does the
+        // window heuristic run.
+        if restore_recorded_batch(address_space_id, vaddr & !0xFFF) {
+            return Ok(phys);
+        }
         fault_around(
             address_space_id,
             vaddr & !0xFFF,
@@ -1706,6 +1764,308 @@ pub(crate) fn populate_mapped_range(address_space_id: u64, base: u64, len: u64) 
     }
 }
 
+/// One recorded batch (#737 step 2): a VA range `MADV_WILLNEED` advised,
+/// remembered so a later fault inside it can page the whole batch back
+/// in as one bulk operation instead of the fixed fault-around window.
+struct AdviceRecord {
+    base: u64,
+    len: u64,
+    /// The file the range was advised against. Advisory identity only:
+    /// the fault-side lookup re-resolves the *current* owner row and
+    /// requires it to be this same file before any batch is driven, so
+    /// a record can never name a mapping that has since been replaced.
+    /// (Linux has no such record — `mm/madvise.c` readaheads and
+    /// forgets; NARF's batch API asks for the batch to be named again
+    /// at fault time, so it is recorded. The `Arc` is dropped with the
+    /// record, which is short-lived and capped — see below.)
+    ops: Arc<dyn FileOps>,
+}
+
+/// Recorded batches per address space, sharded exactly like the
+/// mapping-owner buckets: the two tables describe the same mappings,
+/// so they share a lifetime discipline — a space's records are dropped
+/// with its owner bucket at teardown ([`drop_address_space`]) and are
+/// deliberately not inherited by `fork` ([`fork_address_space`]): a
+/// batch is one task's stated intent about *its* upcoming scan, the
+/// child re-derives it with its own first fault's window, and not
+/// inheriting keeps a parent's records from installing pages in a
+/// space that never asked for them.
+///
+/// The store is metadata-only — VAs plus the advised file's identity;
+/// it holds no frames and pins no pages. Records go stale the same way
+/// mappings change: `munmap`/`mremap` (the punch path), mapping
+/// replacement, `mprotect`, and file truncate all scrub or trim them
+/// at the moment the mapping state changes (see the call sites), and
+/// whatever those miss, the fault-side current-owner re-check makes
+/// inert. The per-space cap keeps a pathological advise loop from
+/// growing kernel memory: at the cap the oldest records are dropped —
+/// the only cost is falling back to the fault-around window.
+type AdviceRecords = Arc<IrqSafeSpinLock<Vec<AdviceRecord>>>;
+
+const ADVICE_RECORD_SHARDS: usize = 64;
+/// Most batches one address space may hold at once.
+const MAX_ADVICE_RECORDS: usize = 8;
+
+#[repr(align(64))]
+struct AdviceRecordShard {
+    buckets: IrqSafeSpinLock<BTreeMap<u64, AdviceRecords>>,
+}
+
+impl AdviceRecordShard {
+    const fn new() -> Self {
+        Self {
+            buckets: IrqSafeSpinLock::new(BTreeMap::new()),
+        }
+    }
+}
+
+static ADVICE_RECORD_BUCKETS: [AdviceRecordShard; ADVICE_RECORD_SHARDS] =
+    [const { AdviceRecordShard::new() }; ADVICE_RECORD_SHARDS];
+
+#[inline]
+fn advice_record_shard(address_space_id: u64) -> &'static AdviceRecordShard {
+    &ADVICE_RECORD_BUCKETS[address_space_id as usize & (ADVICE_RECORD_SHARDS - 1)]
+}
+
+fn advice_records(address_space_id: u64) -> AdviceRecords {
+    if let Some(existing) = existing_advice_records(address_space_id) {
+        return existing;
+    }
+    let candidate = Arc::new(IrqSafeSpinLock::new(Vec::new()));
+    let mut buckets = advice_record_shard(address_space_id).buckets.lock();
+    Arc::clone(buckets.entry(address_space_id).or_insert_with(|| candidate))
+}
+
+fn existing_advice_records(address_space_id: u64) -> Option<AdviceRecords> {
+    advice_record_shard(address_space_id)
+        .buckets
+        .lock()
+        .get(&address_space_id)
+        .map(Arc::clone)
+}
+
+fn drop_advice_records(address_space_id: u64) {
+    let retired = advice_record_shard(address_space_id)
+        .buckets
+        .lock()
+        .remove(&address_space_id);
+    drop(retired);
+}
+
+/// Insert one batch record, merging it with any same-file record it
+/// overlaps or abuts (an advise walk over consecutive VMAs, or a
+/// re-advise of a growing range, stays one batch). Runs under the
+/// record lock; allocation failure simply declines to record — the
+/// advise itself already succeeded, and an unrecorded batch costs only
+/// the window fallback at fault time.
+fn insert_advice_record(records: &mut Vec<AdviceRecord>, mut record: AdviceRecord) {
+    let mut index = 0;
+    while index < records.len() {
+        let existing = &records[index];
+        let existing_end = existing.base.saturating_add(existing.len);
+        let record_end = record.base.saturating_add(record.len);
+        if Arc::ptr_eq(&existing.ops, &record.ops)
+            && existing.base <= record_end
+            && record.base <= existing_end
+        {
+            record.base = record.base.min(existing.base);
+            record.len = record_end.max(existing_end) - record.base;
+            records.swap_remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    if records.len() >= MAX_ADVICE_RECORDS {
+        // Full: drop the oldest. Which batch is sacrificed is a pure
+        // performance choice — every record is re-derivable.
+        records.remove(0);
+    }
+    records.push(record);
+}
+
+/// Record the batches behind a `MADV_WILLNEED` of `[base, base + len)`:
+/// one record per generic-fallback shared owner row the range covers
+/// — exactly the rows [`populate_mapped_range`] populates. Rows of any
+/// other kind (direct-provider, private, anonymous) serve their pages
+/// without the shared cache and have no bulk restore to record.
+pub(crate) fn record_advice_range(address_space_id: u64, base: u64, len: u64) {
+    let end = base.saturating_add(len);
+    if end <= base {
+        return;
+    }
+    let Some(bucket) = existing_mapping_owners(address_space_id) else {
+        return;
+    };
+    let intersections: Vec<(u64, u64, Arc<dyn FileOps>)> = {
+        let owners = bucket.lock();
+        owners
+            .iter()
+            .filter(|mapping| mapping.writeback.is_some() && !mapping.private_copy)
+            .filter_map(|mapping| {
+                let start = base.max(mapping.base);
+                let stop = end.min(mapping.base.saturating_add(mapping.len));
+                (start < stop).then(|| (start, stop - start, Arc::clone(&mapping.ops)))
+            })
+            .collect()
+    };
+    if intersections.is_empty() {
+        return;
+    }
+    let records = advice_records(address_space_id);
+    let mut records = records.lock();
+    for (base, len, ops) in intersections {
+        insert_advice_record(&mut records, AdviceRecord { base, len, ops });
+    }
+}
+
+/// Drop every record this space holds over `[base, base + len)`,
+/// splitting records the range cuts through. Called wherever the
+/// mapping state changes under a recorded range — the punch path
+/// (`munmap`, `mremap`, truncate's unmap), mapping replacement,
+/// `mprotect`, a single-page owner retirement, and `fork` (for the
+/// child, which inherits no batches) — so a record never describes
+/// mappings that no longer exist in that shape. Whatever a scrub
+/// misses, the fault-side current-owner re-check makes inert: a record
+/// can only ever widen a fault into pages a single fault at the same
+/// address would serve identically.
+fn scrub_advice_range(address_space_id: u64, base: u64, len: u64) {
+    let Some(records) = existing_advice_records(address_space_id) else {
+        return;
+    };
+    let end = base.saturating_add(len);
+    let mut records = records.lock();
+    let old = core::mem::take(&mut *records);
+    for record in old {
+        let record_end = record.base.saturating_add(record.len);
+        if record_end <= base || record.base >= end {
+            records.push(record);
+            continue;
+        }
+        if record.base < base {
+            records.push(AdviceRecord {
+                base: record.base,
+                len: base - record.base,
+                ops: Arc::clone(&record.ops),
+            });
+        }
+        if record_end > end {
+            records.push(AdviceRecord {
+                base: end,
+                len: record_end - end,
+                ops: record.ops,
+            });
+        }
+    }
+}
+
+/// Drop every record in every address space against the file
+/// `identity` names (`FileOps::mmap_backing_identity` — the same key
+/// [`truncate_file_mappings`] matches owners by, so a filesystem
+/// whose opens are separate objects still trims every record for the
+/// inode): a truncate may have shrunk the file under any process's
+/// recorded batch, and the record store is VA-only, so the per-file
+/// trim drops the file's records wholesale. A batch whose pages moved
+/// past EOF is never served stale besides (the restore clamps to the
+/// *current* `i_size` before driving the batch) — this trim is the
+/// prompt half of the invalidation discipline, the clamp is the
+/// guarantee.
+fn trim_advice_records_for_file(identity: usize) {
+    for shard in &ADVICE_RECORD_BUCKETS {
+        let spaces: Vec<AdviceRecords> = shard.buckets.lock().values().map(Arc::clone).collect();
+        for records in spaces {
+            records
+                .lock()
+                .retain(|record| record.ops.mmap_backing_identity() != identity);
+        }
+    }
+}
+
+/// If a fault at `fault_page` in `address_space_id` lands inside a
+/// recorded batch, restore the whole batch: consume the record and
+/// install the current owner's extent of it as ONE
+/// `AddressSpace::demand_alloc_range` batch (#737 step 2), returning
+/// `true`. Returns `false` — record untouched — when no batch covers
+/// the fault or the restore is declined, so the caller falls back to
+/// the fixed fault-around window.
+///
+/// The extent is re-derived against the *current* mapping state, not
+/// the record's memory of it: the owner row serving the faulting page
+/// must still be the recorded file's generic-fallback shared row, and
+/// the batch is clamped to that row and to the file's current
+/// `i_size`, exactly as [`fault_around`] clamps its window. A stale
+/// record therefore installs nothing a single fault at the same
+/// address would not serve — the batch changes *how many* pages are
+/// installed, never *which* bytes any page serves. Consumption is
+/// once-only: the first fault in a batch pays for the restore, and
+/// later faults in the same range take the ordinary window path (the
+/// pages are installed by then anyway). The batch skips the faulting
+/// page itself (its ticket is held by the fault that triggered this)
+/// and is advisory throughout, like the window.
+///
+/// As in [`fault_around`], installation needs the faulting space's
+/// root live on this CPU, so a ptrace-remote fault keeps single-page
+/// service and leaves the record for the tracee's own faults.
+fn restore_recorded_batch(address_space_id: u64, fault_page: u64) -> bool {
+    let Some(aspace) = crate::handlers::active_user_as() else {
+        return false;
+    };
+    if aspace.identity() != address_space_id {
+        return false;
+    }
+    let Some(records) = existing_advice_records(address_space_id) else {
+        return false;
+    };
+    let index = {
+        let records = records.lock();
+        records
+            .iter()
+            .position(|record| fault_page >= record.base && fault_page - record.base < record.len)
+    };
+    let Some(index) = index else {
+        return false;
+    };
+    let record = records.lock().remove(index);
+    let Some(bucket) = existing_mapping_owners(address_space_id) else {
+        return false;
+    };
+    let (first_va, pages) = {
+        let owners = bucket.lock();
+        let Some(owner) = owners.iter().find(|mapping| {
+            fault_page >= mapping.base
+                && fault_page - mapping.base < mapping.len
+                && mapping.writeback.is_some()
+                && !mapping.private_copy
+                && Arc::ptr_eq(&mapping.ops, &record.ops)
+        }) else {
+            return false;
+        };
+        let start = record.base.max(owner.base);
+        let size = owner.ops.stat().size;
+        if size <= owner.file_offset {
+            return false;
+        }
+        let owner_pages = (size - owner.file_offset).div_ceil(4096);
+        let stop = record
+            .base
+            .saturating_add(record.len)
+            .min(owner.base.saturating_add(owner.len))
+            .min(owner.base + owner_pages * 4096);
+        if stop <= start {
+            return false;
+        }
+        (start, (stop - start) / 4096)
+    };
+    if pages == 0 {
+        return false;
+    }
+    // SAFETY: `aspace` is the space active on this CPU (identity
+    // checked above) inside its own page fault, so its root is the
+    // live one and paging is enabled — the batch's contract, as in
+    // `fault_around`. The result is advisory and discarded by design.
+    let _ = unsafe { aspace.demand_alloc_range(narf_memory::VirtAddr::new(first_va), pages) };
+    true
+}
+
 /// Publish freshly loaded fallback pages into the process-independent file
 /// page cache. A concurrent/overlapping mapper may already have published a
 /// page; in that case use its physical page and return the unused allocation
@@ -1917,8 +2277,22 @@ fn register(
 }
 
 pub(crate) fn unmap_current(base: u64) {
-    if let Some(owners) = current_address_space_id().and_then(existing_mapping_owners) {
-        owners.lock().retain(|mapping| mapping.base != base);
+    if let Some(address_space_id) = current_address_space_id() {
+        if let Some(owners) = existing_mapping_owners(address_space_id) {
+            let retired_len = {
+                let mut owners = owners.lock();
+                let retired_len = owners
+                    .iter()
+                    .find(|mapping| mapping.base == base)
+                    .map(|mapping| mapping.len)
+                    .unwrap_or(0);
+                owners.retain(|mapping| mapping.base != base);
+                retired_len
+            };
+            if retired_len != 0 {
+                scrub_advice_range(address_space_id, base, retired_len);
+            }
+        }
     }
 }
 
@@ -2402,6 +2776,10 @@ pub(crate) fn fork_address_space(parent_id: u64, child_id: u64) {
         })
         .collect();
     mapping_owners(child_id).lock().extend(inherited);
+    // Recorded batches are NOT inherited (#737 step 2): clear any the
+    // child somehow already holds, so a parent's advise can never
+    // install pages in the child's space.
+    drop_advice_records(child_id);
 }
 
 fn owner_count(address_space_id: u64) -> usize {
@@ -2552,6 +2930,13 @@ pub fn truncate_file_mappings(
         });
         result.map_err(|_| narf_filesystem::FsError::OutOfMemory)?;
     }
+    // The file shrank: recorded batches against it are stale in every
+    // space (#737 step 2). The per-space punches above already trimmed
+    // the ranges they unmapped; this drops the file's records
+    // wholesale (including batches for ranges that stayed mapped but
+    // moved past EOF). The fault-side clamp to the current i_size is
+    // the guarantee either way.
+    trim_advice_records_for_file(file.mmap_backing_identity());
     Ok(())
 }
 
