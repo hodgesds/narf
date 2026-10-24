@@ -221,13 +221,11 @@ fn smoke_exfat_write_and_truncate_are_unsupported() -> TestResult {
             arg4: 0,
             arg5: 0,
         };
-        match call(Syscall::Pwrite64.raw(), args) {
-            Some(16) => return Err("pwrite64 on an exFAT file unexpectedly succeeded"),
-            Some(_) | None => {}
+        if let Some(16) = call(Syscall::Pwrite64.raw(), args) {
+            return Err("pwrite64 on an exFAT file unexpectedly succeeded");
         }
-        match call(Syscall::Ftruncate.raw(), a1(fx.fd1, PAGE)) {
-            Some(0) => return Err("ftruncate on an exFAT file unexpectedly succeeded"),
-            Some(_) | None => {}
+        if let Some(0) = call(Syscall::Ftruncate.raw(), a1(fx.fd1, PAGE)) {
+            return Err("ftruncate on an exFAT file unexpectedly succeeded");
         }
         let mut disk = alloc::vec![0u8; 600];
         pread(fx.fd2, &mut disk, 0)?;
