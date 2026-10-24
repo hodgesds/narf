@@ -60,6 +60,14 @@
 //!   installed vector must stay unmasked (see
 //!   [`wake_irq_allowlist`]).
 //!
+//! Platform scope: that wake model is x86_64's. An aarch64 park
+//! would mask every SPI and — the latch's only setters being IRQ
+//! handlers — could never observe a wake event, so
+//! [`s2idle_supported`] reports the state unavailable there until
+//! an aarch64 wake source exists (#868). The shared park
+//! machinery is arch-neutral and stays exercised on aarch64 by
+//! the bounded test entry; no production park is offered there.
+//!
 //! Task freezing: like the S3 core today, the phase progression
 //! marks `FreezingUserspace` / `ThawingUserspace` but no scheduler
 //! freezer exists yet to reuse; the executor's worker task is the
@@ -82,14 +90,35 @@ use crate::Power;
 /// Whether suspend-to-idle is available on this platform.
 ///
 /// Unlike [`suspend::s3_supported`] there is no firmware contract
-/// to probe: s2idle needs only a wait-for-interrupt park primitive,
-/// which both shipped architectures provide
-/// (`narf_arch::idle_halt_then_disable`). This stays a query
-/// function — rather than callers assuming `true` — so a future
-/// platform without a park primitive narrows it in one place, and
-/// so `/sys/power/state` can list exactly the states that exist.
+/// to probe, but a park primitive alone does not make a sleep
+/// state. s2idle needs two things, and both must hold:
+///
+/// - a wait-for-interrupt park primitive
+///   (`narf_arch::idle_halt_then_disable`) — both shipped
+///   architectures provide one; and
+/// - at least one wake source whose interrupt can still be
+///   delivered under the park's IRQ mask, so a handler can call
+///   [`note_wake_event`]. x86_64 has one today: the ACPI SCI,
+///   whose installed vector [`wake_irq_allowlist`] exempts from
+///   the mask. aarch64 has none yet: its allowlist is empty, so
+///   the park snapshot masks every SPI (INTID 32..=255), the
+///   latch's only setters are IRQ handlers, and a production
+///   (unbounded) park could never observe a wake event — a
+///   one-way door, not a sleep state. (The unmasked PPIs, e.g.
+///   the timer, still wake each WFI; the loop would re-check an
+///   unsettable latch and re-halt forever.)
+///
+/// So this returns `true` on x86_64 only, until an aarch64 wake
+/// source (an allowlist entry plus a handler that latches) lands
+/// — tracked in #868. Failing closed here makes every surface
+/// agree: `/sys/power/state` neither lists nor accepts `freeze`
+/// on aarch64, and [`suspend_to_idle`] refuses with
+/// `NotImplemented` even when armed. This stays a query function
+/// — rather than callers assuming `true` — so the predicate
+/// narrows or widens in exactly one place, and so
+/// `/sys/power/state` can list exactly the states that exist.
 pub fn s2idle_supported() -> bool {
-    cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+    cfg!(target_arch = "x86_64")
 }
 
 // ── Production gate ─────────────────────────────────────────────────
@@ -381,8 +410,14 @@ pub async fn suspend_to_idle_async(
 /// Bounded test entry: identical to [`suspend_to_idle`] except the
 /// park gives up after `max_halts` halts with no wake event and
 /// reports [`ParkExit::BoundExhausted`], so a harness can prove the
-/// CPU stays parked when no wake source fires. Production code
-/// must use the unbounded entries — a real park has no timeout.
+/// CPU stays parked when no wake source fires. It also models the
+/// park where [`s2idle_supported`] is `false` (aarch64, #868), so
+/// the shared machinery stays exercised there — a model, not a
+/// production path: its success on such a platform is not evidence
+/// a production park exists. Production code must use the
+/// unbounded entries — a real park has no timeout, and the
+/// unbounded entries refuse with `NotImplemented` wherever
+/// `s2idle_supported()` is `false`.
 #[doc(hidden)]
 pub fn __test_suspend_to_idle_bounded(
     cap: &Cap<Power, narf_capabilities::Invoke>,
@@ -428,7 +463,13 @@ fn s2idle_after_claim(
     suspend::set_phase(SuspendPhase::SavingCpuState);
     suspend::set_phase(SuspendPhase::PlatformOff);
 
-    if !(s2idle_armed() && s2idle_supported()) {
+    // The bounded test entry models the park even where production
+    // s2idle is not offered (aarch64, #868), so the shared machinery
+    // stays exercised there; production entries (`max_halts` is
+    // `None`) additionally require `s2idle_supported()` and fail
+    // closed wherever it is false.
+    let may_park = s2idle_armed() && (s2idle_supported() || max_halts.is_some());
+    if !may_park {
         // Unarmed / unsupported: ping-pong through the remaining
         // phases without parking, so paired drivers observe a clean
         // cycle — byte-for-byte the S3 core's unarmed shape.

@@ -181,7 +181,8 @@ s2idle shares the S3 transition claim, phase observable, `device_pm` /
 `system_pm` fan-outs, framebuffer hooks, and production-gating posture (test
 arm, cap-gated opt-in, `S2IDLE_VALIDATED` boot token). It differs where the
 semantics differ: no `\_S3_` / FADT requirement (`s2idle_supported()` needs
-only an arch park primitive), no CPU context save or resume trampoline (the
+an arch park primitive plus a wake source deliverable under the park mask),
+no CPU context save or resume trampoline (the
 CPU never loses power — execution stays in the caller's frame), no TSC
 snapshot, no `\_PTS` / FACS / PM1 write. The platform step masks every IRQ
 vector except the wake allowlist (`wake_irq_allowlist()`: the vector the
@@ -190,6 +191,16 @@ install path — not a FADT-derived value) and
 parks via `narf_arch::idle_halt_then_disable` until a wake source latches an
 event with `note_wake_event`. An unarmed request walks the phases and returns
 `NotImplemented`, exactly like unarmed S3.
+
+Platform scope: the s2idle park is x86_64-only today. No aarch64 wake source
+exists yet — the allowlist is empty there, so the park snapshot would mask
+every SPI (INTID 32..=255) while the wake latch's only setters are IRQ
+handlers, and a production park could never observe a wake event.
+`s2idle_supported()` therefore returns `false` on aarch64 until an aarch64
+wake source (allowlist entry plus a latching handler) lands (#868); the
+`/sys/power/state` surface below inherits the gate, so `freeze` is neither
+listed nor accepted there. The park machinery itself is arch-neutral and
+stays exercised on aarch64 through the bounded test entry only.
 
 Userspace requests a sleep state through `/sys/power/state`
 (`sysfs_bridge::populate_power_state`), the kernel's only userspace suspend

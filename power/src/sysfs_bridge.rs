@@ -1221,14 +1221,27 @@ mod tests {
             Some(k) => k,
             None => return TestResult::Fail("/sys/power kobject missing after populate"),
         };
-        match kobj.attr_store("state", b"freeze\n") {
+        // Store whichever state this platform supports (freeze
+        // where s2idle is offered, else mem). Where neither is
+        // supported — the aarch64 harness, where freeze is gated
+        // off until a wake source exists (#868) and S3 does not
+        // parse — there is no positive store to exercise; that
+        // refusal side is pinned by the refusals fixture instead.
+        let (bytes, want_last): (&[u8], u8) = if crate::s2idle::s2idle_supported() {
+            (b"freeze\n", 1)
+        } else if crate::suspend::s3_supported() {
+            (b"mem\n", 2)
+        } else {
+            return TestResult::Skip("no supported sleep state on this platform");
+        };
+        match kobj.attr_store("state", bytes) {
             Some(Ok(())) => {}
             _ => return TestResult::Fail("store of a supported state was refused"),
         }
         if STATE_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst) != 1
-            || STATE_HOOK_LAST.load(core::sync::atomic::Ordering::SeqCst) != 1
+            || STATE_HOOK_LAST.load(core::sync::atomic::Ordering::SeqCst) != want_last
         {
-            return TestResult::Fail("sleep request did not reach the policy hook as Freeze");
+            return TestResult::Fail("sleep request did not reach the policy hook as stored");
         }
         TestResult::Pass
     }
@@ -1245,11 +1258,23 @@ mod tests {
             Some(k) => k,
             None => return TestResult::Fail("/sys/power kobject missing after populate"),
         };
-        // No consumer installed: the request must be refused
-        // (ENODEV), never silently dropped.
-        match kobj.attr_store("state", b"freeze") {
-            Some(Err(FsError::NoDevice)) => {}
-            _ => return TestResult::Fail("unwired store was not refused with NoDevice"),
+        // No consumer installed: a supported state's request must
+        // be refused (ENODEV), never silently dropped. Where freeze
+        // itself is unsupported (aarch64 until a wake source lands,
+        // #868) the same write is refused one step earlier, as
+        // EINVAL — unsupported is checked before consumer presence.
+        if crate::s2idle::s2idle_supported() {
+            match kobj.attr_store("state", b"freeze") {
+                Some(Err(FsError::NoDevice)) => {}
+                _ => return TestResult::Fail("unwired store was not refused with NoDevice"),
+            }
+        } else {
+            match kobj.attr_store("state", b"freeze") {
+                Some(Err(FsError::InvalidData)) => {}
+                _ => {
+                    return TestResult::Fail("unsupported freeze was not refused with InvalidData")
+                }
+            }
         }
         // Garbage and empty writes are EINVAL even with a consumer.
         crate::sleep_request::set_sleep_request_hook(recording_sleep_hook);
@@ -1271,11 +1296,20 @@ mod tests {
                 return TestResult::Fail("refused stores reached the policy hook");
             }
         }
-        // A policy refusal propagates as EPERM.
-        STATE_HOOK_REFUSE.store(true, core::sync::atomic::Ordering::SeqCst);
-        match kobj.attr_store("state", b"freeze") {
-            Some(Err(FsError::OperationNotPermitted)) => {}
-            _ => return TestResult::Fail("policy refusal was not mapped to OperationNotPermitted"),
+        // A policy refusal propagates as EPERM. (Reachable only
+        // through a supported state; in this harness that is
+        // freeze on x86_64 — on aarch64 the unsupported-write
+        // refusal above already pinned the freeze path.)
+        if crate::s2idle::s2idle_supported() {
+            STATE_HOOK_REFUSE.store(true, core::sync::atomic::Ordering::SeqCst);
+            match kobj.attr_store("state", b"freeze") {
+                Some(Err(FsError::OperationNotPermitted)) => {}
+                _ => {
+                    return TestResult::Fail(
+                        "policy refusal was not mapped to OperationNotPermitted",
+                    )
+                }
+            }
         }
         crate::sleep_request::__test_reset_sleep_request_hook();
         TestResult::Pass

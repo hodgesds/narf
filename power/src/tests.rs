@@ -551,18 +551,23 @@ fn smoke_s2idle_wake_event_resumes() -> TestResult {
     // Armed, and a wake source fires while parked (the step hook
     // latches it on the third iteration): the park exits via the
     // wake, the resume fan-out runs, and the call returns Ok.
+    // Entered through the bounded test entry so the fixture
+    // exercises the shared machinery on aarch64 too, where the
+    // production entry refuses (pinned by
+    // smoke_s2idle_unsupported_on_aarch64); the budget is never
+    // the exit reason here — the wake lands on iteration three.
     use narf_capabilities::{Cap, Invoke};
 
     s2idle_fixture_reset();
     crate::s2idle::__test_arm_s2idle();
     crate::s2idle::__test_set_park_step_hook(Some(s2idle_hook_wake_on_third_step));
     let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
-    match crate::s2idle::suspend_to_idle(&cap) {
-        Ok(()) => {}
-        Err(e) => {
-            let _ = e;
-            return TestResult::Fail("armed s2idle with a wake event should return Ok");
-        }
+    let (result, exit) = crate::s2idle::__test_suspend_to_idle_bounded(&cap, 16);
+    if result.is_err() {
+        return TestResult::Fail("armed s2idle with a wake event should return Ok");
+    }
+    if exit != crate::s2idle::ParkExit::WakeEvent {
+        return TestResult::Fail("park with a latched wake event did not exit via the wake");
     }
     let stats = crate::s2idle::stats();
     if stats.parks != 1 || stats.wakes != 1 || stats.last_exit != crate::s2idle::ParkExit::WakeEvent
@@ -649,16 +654,20 @@ kernel_test_in!("power/s2idle", smoke_s2idle_revoked_cap_refused);
 fn smoke_s2idle_reentrant_request_refused() -> TestResult {
     // s2idle shares the S3 core's one global transition claim: a
     // second request issued from inside the park is refused with
-    // AlreadySuspending, and the outer park still completes.
+    // AlreadySuspending, and the outer park still completes. The
+    // outer entry is the bounded test entry (shared-machinery
+    // coverage on aarch64, as in smoke_s2idle_wake_event_resumes);
+    // the re-entrant call inside the hook uses the production
+    // entry and is refused at the claim, before any other gate.
     use narf_capabilities::{Cap, Invoke};
 
     s2idle_fixture_reset();
     crate::s2idle::__test_arm_s2idle();
     crate::s2idle::__test_set_park_step_hook(Some(s2idle_hook_reenter));
     let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
-    match crate::s2idle::suspend_to_idle(&cap) {
-        Ok(()) => {}
-        _ => return TestResult::Fail("outer s2idle park should complete Ok"),
+    let (result, exit) = crate::s2idle::__test_suspend_to_idle_bounded(&cap, 16);
+    if result.is_err() || exit != crate::s2idle::ParkExit::WakeEvent {
+        return TestResult::Fail("outer s2idle park should complete Ok via the wake");
     }
     if S2IDLE_HOOK_REENTRANT.load(core::sync::atomic::Ordering::SeqCst) != 1 {
         return TestResult::Fail("re-entrant s2idle was not refused AlreadySuspending");
@@ -669,6 +678,66 @@ fn smoke_s2idle_reentrant_request_refused() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power/s2idle", smoke_s2idle_reentrant_request_refused);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_s2idle_supported_on_x86_64() -> TestResult {
+    // The inverse of the aarch64 pin below: x86_64 has a wake
+    // source deliverable under the park mask (the ACPI SCI,
+    // exempted via the installed-vector allowlist), so s2idle
+    // reports supported there, and the sysfs trigger's view
+    // agrees. If the predicate is ever narrowed by accident,
+    // this fixture is what says so.
+    if !crate::s2idle::s2idle_supported() {
+        return TestResult::Fail("s2idle must report supported on x86_64");
+    }
+    if !crate::sleep_request::SleepState::Freeze.supported() {
+        return TestResult::Fail("freeze must report supported on x86_64");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/s2idle", smoke_s2idle_supported_on_x86_64);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_s2idle_unsupported_on_aarch64() -> TestResult {
+    // aarch64 has no allowlistable wake source yet: the wake
+    // allowlist is empty there, so a park's IRQ snapshot masks
+    // every SPI (INTID 32..=255) and the wake latch — whose only
+    // setters are IRQ handlers — could never be set during a
+    // production (unbounded) park. s2idle must therefore fail
+    // closed on aarch64: report unsupported, refuse even an
+    // armed production request with NotImplemented (never enter
+    // an exit-less park), and keep `freeze` off the trigger's
+    // supported set. The bounded fixtures above still exercise
+    // the shared machinery through the test entry; that is a
+    // model, not a production park. Revisit when an aarch64
+    // wake source lands (#868).
+    use narf_capabilities::{Cap, Invoke};
+
+    s2idle_fixture_reset();
+    if crate::s2idle::s2idle_supported() {
+        return TestResult::Fail(
+            "s2idle must report unsupported on aarch64 until a wake source exists",
+        );
+    }
+    crate::s2idle::__test_arm_s2idle();
+    let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
+    match crate::s2idle::suspend_to_idle(&cap) {
+        Err(crate::SuspendError::NotImplemented) => {}
+        _ => {
+            return TestResult::Fail("armed aarch64 s2idle should surface NotImplemented, not park")
+        }
+    }
+    if crate::s2idle::stats().last_exit != crate::s2idle::ParkExit::NotParked {
+        return TestResult::Fail("unsupported aarch64 s2idle recorded a park");
+    }
+    if crate::sleep_request::SleepState::Freeze.supported() {
+        return TestResult::Fail("freeze reported supported on aarch64");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("power/s2idle", smoke_s2idle_unsupported_on_aarch64);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_s2idle_allowlist_matches_installed_sci_vector() -> TestResult {
