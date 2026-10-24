@@ -251,9 +251,9 @@ pub fn mark_ports_bound(parent_hub_idx: usize, bits: u64) {
 ///      supervisor's attach walk — no interleaving can observe
 ///      a half-detached registry or bind a child under a hub
 ///      whose entry is being removed.
-/// A stale live entry would have to survive its occupant's
-/// detach, which pillar 2 makes impossible: removal strictly
-/// precedes reuse.
+///      A stale live entry would have to survive its occupant's
+///      detach, which pillar 2 makes impossible: removal strictly
+///      precedes reuse.
 pub fn hub_index_for_slot(slot_id: u8) -> Option<usize> {
     let g = HUBS.lock();
     g.iter().position(|h| h.hub.slot_id == slot_id)
