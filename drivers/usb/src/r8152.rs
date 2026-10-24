@@ -234,14 +234,14 @@ async fn ocp_read_dword(dev: &USBDevice, mcu: u16, addr: u16) -> Result<u32, ()>
     Ok(u32::from_le_bytes(buf))
 }
 
-/// Word read: aligned dword fetch with the word byte-enable in
-/// `wIndex`, per the reference access model; the wanted half is
-/// extracted after the transfer.
+/// Word read: plain dword fetch, word extracted locally (the
+/// reference model passes no byte-enable for reads — byte-enables
+/// appear only in write `wIndex` values).
 async fn ocp_read_word(dev: &USBDevice, mcu: u16, addr: u16) -> Result<u16, ()> {
     let shift = (addr & 2) as u16;
     let (rt, req, _, _) = ocp_read_setup(mcu, addr);
     let mut buf = [0u8; 4];
-    dev.control_in(rt, req, addr & !3, mcu | (BYTE_EN_WORD << shift), &mut buf)
+    dev.control_in(rt, req, addr & !3, mcu, &mut buf)
         .await
         .map_err(|_| ())?;
     Ok((u32::from_le_bytes(buf) >> (shift * 8)) as u16)

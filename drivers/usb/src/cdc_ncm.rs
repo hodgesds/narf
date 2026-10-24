@@ -1749,9 +1749,14 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
 
 /// Pull one Ethernet frame off the bound NCM device's bulk-IN
 /// endpoint. Reads an NTB into `scratch`, parses it, returns the
-/// first datagram (if any). Caller polls this periodically; on
-/// real silicon the bulk-IN ring continuously holds an NTB-sized
-/// read posted so frames stream in.
+/// first deliverable datagram (if any). CRC handling matches the
+/// production pump path ([`for_each_frame`]): under CRC mode each
+/// datagram's trailing CRC-32 is verified and stripped, and a
+/// CRC-failing datagram is skipped in favour of the next one
+/// rather than delivered with the FCS still attached. Caller
+/// polls this periodically; on real silicon the bulk-IN ring
+/// continuously holds an NTB-sized read posted so frames stream
+/// in.
 pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, NcmError> {
     let (slot_id, bulk_in_dci) = {
         let g = CDC_NCM_DEVICES.lock();
@@ -1774,16 +1779,35 @@ pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, NcmEr
         return Ok(None);
     }
     let ntb = ParsedNtb::parse(&scratch[..n])?;
-    if ntb.is_empty() {
-        return Ok(None);
+    // Walk the datagrams with the pump path's semantics
+    // (for_each_frame): out-of-bounds entries are skipped, and
+    // under CRC mode the trailing CRC-32 is verified and stripped
+    // — a too-short or CRC-failing datagram is skipped, never
+    // delivered with the FCS still attached.
+    for i in 0..ntb.len() {
+        let Some(dg) = ntb.datagram(i) else {
+            continue;
+        };
+        let frame: &[u8] = if ntb.uses_crc() {
+            if dg.len() < 4 {
+                continue;
+            }
+            let (frame, tail) = dg.split_at(dg.len() - 4);
+            let want = u32::from_le_bytes(tail.try_into().unwrap());
+            if crc32_ieee(frame) != want {
+                continue;
+            }
+            frame
+        } else {
+            dg
+        };
+        // Re-borrow against the scratch lifetime — Ntb16 borrows
+        // immutably; the lifetime path is straightforward here
+        // because frame points into &scratch[..n].
+        let off = frame.as_ptr() as usize - scratch.as_ptr() as usize;
+        return Ok(Some(&scratch[off..off + frame.len()]));
     }
-    let dg = ntb.datagram(0).ok_or(NcmError::DatagramOutOfBounds)?;
-    // Re-borrow against the scratch lifetime — Ntb16 borrows
-    // immutably; the lifetime path is straightforward here because
-    // dg points into &scratch[..n].
-    let off = dg.as_ptr() as usize - scratch.as_ptr() as usize;
-    let dlen = dg.len();
-    Ok(Some(&scratch[off..off + dlen]))
+    Ok(None)
 }
 
 /// `SendCtxFn` trampoline for [`narf_net::iface`]: the cookie is
