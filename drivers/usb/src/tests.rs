@@ -518,6 +518,163 @@ fn smoke_msc_csw_decode_variants() -> TestResult {
 }
 kernel_test_in!("drivers/usb/msc", smoke_msc_csw_decode_variants);
 
+/// SYNCHRONIZE CACHE(10) flush conversation against a scripted
+/// fake device, at the byte level (the in-tree MSC fixture style):
+/// the CDB encoder emits the whole-medium form, the CBW carries it
+/// with no data stage, and the CSW replies the scripted device
+/// sends back are judged by the transport's own status mapping —
+/// Command Passed is Ok, Command Failed / Phase Error come back
+/// as `MscError::CswStatus`, never as success (#829: a flush the
+/// device refused must surface as a failed flush).
+fn smoke_msc_sync_cache_flush_conversation() -> TestResult {
+    use crate::msc::{
+        check_csw_status, decode_csw, encode_cbw, encode_synchronize_cache10, MscError,
+        CBW_SIGNATURE, CSW_SIGNATURE,
+    };
+
+    // Whole-medium flush CDB: opcode 0x35, LBA = 0, NUMBER OF
+    // BLOCKS = 0 ("all blocks to the end of the medium"), IMD
+    // clear so completion means the flush actually finished.
+    let cdb = encode_synchronize_cache10();
+    if cdb != [0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
+        return TestResult::Fail("SYNCHRONIZE CACHE(10) CDB wrong");
+    }
+
+    // The CBW for it: no data stage, so dCBWDataTransferLength = 0
+    // and the direction bit stays OUT; the CDB rides in CBWCB.
+    let tag: u32 = 0x0BAD_F00D;
+    let cbw = encode_cbw(tag, 0, false, &cdb);
+    if u32::from_le_bytes([cbw[0], cbw[1], cbw[2], cbw[3]]) != CBW_SIGNATURE {
+        return TestResult::Fail("flush CBW signature wrong");
+    }
+    if u32::from_le_bytes([cbw[4], cbw[5], cbw[6], cbw[7]]) != tag {
+        return TestResult::Fail("flush CBW tag mismatch");
+    }
+    if u32::from_le_bytes([cbw[8], cbw[9], cbw[10], cbw[11]]) != 0 {
+        return TestResult::Fail("flush CBW data length non-zero");
+    }
+    if cbw[12] & 0x80 != 0 {
+        return TestResult::Fail("flush CBW direction bit set (no data stage expected)");
+    }
+    if cbw[13] != 0 {
+        return TestResult::Fail("flush CBW LUN non-zero");
+    }
+    if cbw[14] != 10 || cbw[15..25] != cdb[..] {
+        return TestResult::Fail("flush CBW does not embed the SYNCHRONIZE CACHE CDB");
+    }
+    if cbw[25..31].iter().any(|b| *b != 0) {
+        return TestResult::Fail("flush CBW trailing bytes non-zero");
+    }
+
+    // Scripted replies: build the CSW the fake device returns for
+    // each outcome and run it through decode + status mapping,
+    // exactly as the transport does.
+    let scripted_csw = |status: u8| -> [u8; 13] {
+        let mut buf = [0u8; 13];
+        buf[0..4].copy_from_slice(&CSW_SIGNATURE.to_le_bytes());
+        buf[4..8].copy_from_slice(&tag.to_le_bytes());
+        buf[12] = status;
+        buf
+    };
+    for (status, expect_ok) in [(0u8, true), (1u8, false), (2u8, false)] {
+        let fields = match decode_csw(&scripted_csw(status)) {
+            Some(f) => f,
+            None => return TestResult::Fail("decode_csw rejected scripted flush CSW"),
+        };
+        if fields.tag != tag || fields.status != status {
+            return TestResult::Fail("scripted flush CSW fields mismatch");
+        }
+        match check_csw_status(fields.status) {
+            Ok(()) if expect_ok => {}
+            Err(MscError::CswStatus(s)) if !expect_ok && s == status => {}
+            _ => return TestResult::Fail("flush CSW status mapped to the wrong result"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_sync_cache_flush_conversation);
+
+/// WRITE(10) FUA encoding: the FUA form differs from the plain
+/// form in exactly one bit (byte 1 bit 3); the plain encoder must
+/// stay flag-free so non-FUA writes are unchanged (#829).
+fn smoke_msc_write10_fua_encode() -> TestResult {
+    use crate::msc::{encode_write10, encode_write10_fua};
+
+    let plain = encode_write10(0x0102_0304, 3);
+    let fua = encode_write10_fua(0x0102_0304, 3);
+    if fua[0] != 0x2A {
+        return TestResult::Fail("FUA WRITE(10) opcode wrong");
+    }
+    if fua[1] != 0x08 {
+        return TestResult::Fail("FUA WRITE(10) missing the FUA bit (byte 1 bit 3)");
+    }
+    if plain[1] != 0 {
+        return TestResult::Fail("plain WRITE(10) gained CDB flags");
+    }
+    if fua[2..10] != plain[2..10] {
+        return TestResult::Fail("FUA WRITE(10) changed fields beyond the FUA bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_write10_fua_encode);
+
+/// Live flush conversation: on a QEMU-attached stick the block
+/// adapter must advertise the Flush/FUA it performs, `flush()`
+/// must complete a real SYNCHRONIZE CACHE(10), and a FUA write
+/// must round-trip. Skips (like the attach smoke) when no xHCI /
+/// no MSC device is present. The FUA probe uses the last block
+/// and restores its original contents, leaving the scratch
+/// image as it found it.
+fn smoke_msc_flush_via_xhci_qemu() -> TestResult {
+    use crate::{msc, xhci};
+    use narf_block::BlockDeviceSync;
+
+    if !xhci::is_probed() {
+        return TestResult::Skip("xhci not probed");
+    }
+    msc::__reset_msc_for_test();
+    let attached = match xhci::controller() {
+        Some(c) => narf_scheduler::block_on(async { msc::enumerate_and_attach_msc(&c).await }),
+        None => 0,
+    };
+    if attached == 0 {
+        return TestResult::Skip("no MSC device attached to xhci");
+    }
+    let dev = match msc::UsbMscBlockDevice::from_index(0) {
+        Some(d) => d,
+        None => return TestResult::Fail("block adapter refused attached device"),
+    };
+    let caps = dev.capabilities();
+    if !caps.volatile_cache || !caps.fua {
+        return TestResult::Fail("adapter does not advertise the Flush/FUA it performs");
+    }
+    if dev.flush().is_err() {
+        return TestResult::Fail("SYNCHRONIZE CACHE(10) flush failed on live device");
+    }
+    let lba_size = dev.lba_size() as usize;
+    let last = dev.capacity() - 1;
+    let mut original = alloc::vec![0u8; lba_size];
+    if dev.read(last, 1, &mut original).is_err() {
+        return TestResult::Fail("read of last block failed");
+    }
+    let mut pattern = alloc::vec![0u8; lba_size];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0xA5;
+    }
+    if dev.write_fua(last, 1, &pattern).is_err() {
+        return TestResult::Fail("FUA write failed on live device");
+    }
+    let mut back = alloc::vec![0u8; lba_size];
+    if dev.read(last, 1, &mut back).is_err() || back != pattern {
+        return TestResult::Fail("FUA-written block did not read back");
+    }
+    if dev.write_fua(last, 1, &original).is_err() || dev.flush().is_err() {
+        return TestResult::Fail("restore/flush failed on live device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_flush_via_xhci_qemu);
+
 /// INQUIRY response decoder: space-padded vendor/product/revision
 /// fields are trimmed; peripheral type and removable bit are correct.
 fn smoke_msc_inquiry_response_decode() -> TestResult {
