@@ -1,38 +1,36 @@
-//! Realtek ALC-family codec bring-up.
+//! Realtek codec fixup data — per-chip init coef tables and
+//! per-laptop pin-override quirks.
 //!
-//! Tables for ALC233 / ALC235 / ALC236 / ALC255 / ALC256 / ALC270 /
-//! ALC280 / ALC282 / ALC283 / ALC285 / ALC286 / ALC287 / ALC289 /
-//! ALC290 / ALC292 / ALC293 / ALC294 / ALC295 / ALC298 / ALC3204 /
-//! ALC3225 / ALC3236 / ALC3254 / ALC3266 / ALC3268 / ALC3286 /
-//! ALC3287 — the codec family that ships on essentially every modern
-//! AMD and Intel laptop motherboard.
+//! ## Provenance (#783 rescue)
 //!
-//! ## Sources
+//! This module is the data rescued from the retired legacy audio
+//! stack in `narf-drivers-sound` (`codec/quirks.rs` +
+//! `codec/realtek.rs`), excised in #783. The legacy stack's
+//! transport/walker code was deliberately *not* ported — the live
+//! equivalents live in [`crate::hda_codec`] and this crate's
+//! `hda::runtime` — but its tables are the only copies in the tree,
+//! distilled from Linux `sound/pci/hda/patch_realtek.c`
+//! (`alc269_fixup_models[]`, per-chip `alc*_init` sequences), and
+//! they are an asset, not garbage.
 //!
-//! - Linux `sound/hda/codecs/realtek/realtek.c` + per-`alc<N>.c` files
-//!   (post-2026-05-20 GPL-link allowance). Each chip's init verb
-//!   sequence is the distilled form of its `alc<N>_init` /
-//!   `alc<N>_shutup` plus the "standard" fixups every laptop OEM
-//!   applies (HP, Dell, Lenovo).
-//! - Realtek ALC* datasheets — vendor-specific COEF index map (the
-//!   set of `(idx, value)` pokes that the chip needs at boot before
-//!   any analog output is audible).
-//! - HDA Spec §7.3.3 — verb opcodes the COEF pokes layer on top of.
+//! ## Status: staged data, not yet consumed
+//!
+//! The live HDA path ([`super::routing`]) currently routes from BIOS
+//! pin defaults only and applies no vendor fixups — that is #776.
+//! Nothing in the running system reads these tables yet; they are
+//! preserved here, in the live crate that will consume them, so the
+//! #776 lane wires fixups into `routing.rs` against data that
+//! already has a home and a content test. The kernel tests under
+//! `audio/hda-quirks` pin the table contents (counts + spot
+//! entries) so an accidental edit of the data fails loudly.
 
-use alloc::vec::Vec;
+// ── Chip identity ───────────────────────────────────────────────────
 
-use crate::codec::generic::{
-    encode_verb, set_amp_gain_mute_verb, AmpGainMute, CodecVerbBus, VerbError, PARAM_VENDOR_ID,
-    VERB_GET_PARAMETER, VERB_SET_EAPD_BTL, VERB_SET_PIN_WIDGET_CONTROL, VERB_SET_POWER_STATE,
-    VERB_SET_UNSOLICITED_RESPONSE,
-};
-
-/// Realtek vendor ID (HDA `VENDOR_ID` response high 16 bits).
+/// Realtek vendor ID (high half of the VENDOR_ID parameter response).
 pub const REALTEK_VENDOR_ID: u16 = 0x10EC;
 
-/// Concrete ALC chip variants this module knows how to bring up.
-/// One enum entry per ALC* SKU; the discriminant value matches the
-/// low 16 bits of the Realtek `VENDOR_ID` parameter.
+/// Realtek ALC-family codec SKUs known to the fixup tables. The
+/// discriminants are the codec device IDs (low half of VENDOR_ID).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum RealtekChip {
@@ -148,42 +146,16 @@ impl RealtekChip {
     }
 }
 
-// ── COEF helpers ────────────────────────────────────────────────────
+// ── Per-chip init coef tables ───────────────────────────────────────
 //
-// Realtek codecs expose an internal Processing Coefficient table that
-// is the entire chip configuration surface. The HDA spec exposes the
-// table through two verbs:
-//   - VERB_SET_COEF_INDEX (0x500) — write the 16-bit index register.
-//   - VERB_SET_PROC_COEF  (0x400) — write the 16-bit data register.
-//
-// Most Realtek init sequences are an `(idx, value)` table that this
-// helper walks. Some entries are `(coef_addr, idx, value)` triples
-// for the "extended" COEF range — those land via the GET_COEF_INDEX
-// alias 0xD00 + an extra byte, but we don't need that for the
-// universal bring-up tables here.
-
-/// Write a COEF register: drive SET_COEF_INDEX, then SET_PROC_COEF.
-pub fn write_coef(
-    bus: &mut dyn CodecVerbBus,
-    cad: u8,
-    nid: u8,
-    idx: u16,
-    value: u16,
-) -> Result<(), VerbError> {
-    // SET_COEF_INDEX is a 4-byte verb whose payload is the low byte
-    // of the COEF index. The high byte rides in the verb_id low
-    // nibble per HDA §7.3.3.13.
-    let coef_idx_verb_id = (0x5 << 8) | ((idx >> 8) & 0xFF);
-    bus.send_verb(encode_verb(cad, nid, coef_idx_verb_id, (idx & 0xFF) as u8))?;
-    let coef_data_verb_id = (0x4 << 8) | ((value >> 8) & 0xFF);
-    bus.send_verb(encode_verb(
-        cad,
-        nid,
-        coef_data_verb_id,
-        (value & 0xFF) as u8,
-    ))?;
-    Ok(())
-}
+// Realtek codecs expose an internal Processing Coefficient table
+// that is the entire chip configuration surface, written through
+// VERB_SET_COEF_INDEX (0x500) + VERB_SET_PROC_COEF (0x400). Most
+// Realtek init sequences are an `(idx, value)` table. These are
+// the universal "speaker comes up at boot" baselines; they are NOT
+// the full per-OEM fixup tables — those are the pin quirks below,
+// picked by codec subsystem ID. Without these baseline pokes, the
+// chip won't produce sound even with a correctly-routed graph.
 
 /// One (index, value) row in a Realtek init table.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -197,21 +169,6 @@ impl CoefRow {
         CoefRow { idx, value }
     }
 }
-
-/// Apply a sequence of COEF writes against the codec's AFG node.
-pub fn apply_coef_table(
-    bus: &mut dyn CodecVerbBus,
-    cad: u8,
-    afg_nid: u8,
-    rows: &[CoefRow],
-) -> Result<(), VerbError> {
-    for row in rows {
-        write_coef(bus, cad, afg_nid, row.idx, row.value)?;
-    }
-    Ok(())
-}
-
-// ── Default pin widget control values ───────────────────────────────
 
 /// Pin Widget Control — "Output Enable" (HDA §7.3.3.13, bit 6).
 pub const PIN_WIDGET_OUT: u8 = 0x40;
@@ -228,14 +185,6 @@ pub const EAPD_ENABLE: u8 = 0x02;
 /// Setting bit 0 of EAPD/BTL puts the codec amp into BTL (bridge-tied
 /// load) mode — used by some laptop speakers.
 pub const BTL_ENABLE: u8 = 0x01;
-
-// ── Per-chip init sequences ─────────────────────────────────────────
-//
-// These are the universal "speaker comes up at boot" baselines.
-// They are NOT the full per-OEM fixup tables — those live in
-// `quirks` and are picked by PCI subsystem ID. Without these baseline
-// pokes, the chip won't produce sound even with a correctly-routed
-// graph.
 
 /// ALC256 init verb sequence (Linux `alc269.c::alc256_init` distilled).
 pub const ALC256_INIT: &[CoefRow] = &[
@@ -367,129 +316,215 @@ pub fn init_table_for(chip: RealtekChip) -> &'static [CoefRow] {
     }
 }
 
-/// Apply the per-chip init table plus the universal "speaker comes up"
-/// path: full power → unmute → drive pin to OUT → enable EAPD on
-/// speaker pins.
-///
-/// `dac_nid` / `speaker_pin_nid` / `headphone_pin_nid` come from the
-/// graph walker; on a fresh codec they are typically `0x02`, `0x14`,
-/// and `0x21` respectively (the same NIDs Linux's
-/// `auto_parse_config` discovers for ALC256/285/295/298).
-pub fn bring_up(
-    bus: &mut dyn CodecVerbBus,
-    cad: u8,
-    afg_nid: u8,
-    chip: RealtekChip,
-    dac_nid: u8,
-    speaker_pin_nid: u8,
-    headphone_pin_nid: u8,
-) -> Result<(), VerbError> {
-    // 1) Vendor-specific COEF table.
-    apply_coef_table(bus, cad, afg_nid, init_table_for(chip))?;
-    // 2) Power-state D0 on AFG, DAC, both pins.
-    for nid in [afg_nid, dac_nid, speaker_pin_nid, headphone_pin_nid] {
-        bus.send_verb(encode_verb(cad, nid, VERB_SET_POWER_STATE, 0x00))?;
-    }
-    // 3) Unmute the DAC output amp.
-    let unmute = set_amp_gain_mute_verb(
-        cad,
-        dac_nid,
-        AmpGainMute {
-            set_output: true,
-            set_input: false,
-            left: true,
-            right: true,
-            index: 0,
-            mute: false,
-            gain: 0,
-        },
-    );
-    bus.send_verb(unmute)?;
-    // 4) Drive speaker pin OUT enabled.
-    bus.send_verb(encode_verb(
-        cad,
-        speaker_pin_nid,
-        VERB_SET_PIN_WIDGET_CONTROL,
-        PIN_WIDGET_OUT,
-    ))?;
-    // 5) Drive headphone pin OUT + HP enabled (so jack-detect mux
-    //    routes correctly when nothing's plugged in).
-    bus.send_verb(encode_verb(
-        cad,
-        headphone_pin_nid,
-        VERB_SET_PIN_WIDGET_CONTROL,
-        PIN_WIDGET_OUT_HP,
-    ))?;
-    // 6) Enable EAPD on the speaker pin so the external amp powers up.
-    bus.send_verb(encode_verb(
-        cad,
-        speaker_pin_nid,
-        VERB_SET_EAPD_BTL,
-        EAPD_ENABLE,
-    ))?;
-    // 7) Enable unsolicited-response on the headphone pin so a jack
-    //    plug event arrives via the RIRB unsolicited path.
-    bus.send_verb(encode_verb(
-        cad,
-        headphone_pin_nid,
-        VERB_SET_UNSOLICITED_RESPONSE,
-        /*enable=*/ 0x80 | /*tag=*/ 0x01,
-    ))?;
-    Ok(())
+// ── Per-laptop pin-override quirks ──────────────────────────────────
+//
+// HDA codecs ship with a vendor-default pin / connection layout that
+// is correct on the chip's reference board. Every laptop OEM
+// re-routes pins to fit their physical jack layout, but the codec's
+// Get-Config-Default response is the OEM's value — so a stock
+// `alc_init` only produces sound on the literal Realtek reference
+// board. Linux solves this with a giant `alc269_fixup_models[]`
+// table; we ship a smaller distilled version for the codecs +
+// laptop families the user actually runs.
+//
+// Each entry is `(codec_subsystem_id, override_table)`. The
+// `subsystem_id` comes from `VERB_GET_SUBSYSTEM_ID` (codec response,
+// formatted as `subvendor << 16 | subdevice`); a match swaps in a
+// per-laptop override of the chip's pin defaults.
+
+/// One pin override — `(nid, config_default)`. We re-issue the pin's
+/// SET_CONFIG_DEFAULT_* verb chain with this value.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PinOverride {
+    pub nid: u8,
+    pub cfg: u32,
 }
 
-/// Vendor-ID detection — read VENDOR_ID (Get Parameter 0x00) and
-/// match against the known SKU table.
-pub fn detect(bus: &mut dyn CodecVerbBus, cad: u8) -> Result<Option<RealtekChip>, VerbError> {
-    // Root NID is always 0x00 for the Get-Parameter VENDOR_ID query.
-    let v = bus.send_verb(encode_verb(cad, 0x00, VERB_GET_PARAMETER, PARAM_VENDOR_ID))?;
-    Ok(RealtekChip::from_vendor_id(v))
+/// One quirk entry.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Quirk {
+    /// Codec subsystem ID = `(subvendor << 16) | subdevice`.
+    pub subsystem_id: u32,
+    /// Matching codec.
+    pub chip: RealtekChip,
+    /// Pin overrides to apply.
+    pub pins: &'static [PinOverride],
+    /// Friendly identifier (e.g. `"Lenovo X1 Carbon Gen 7"`).
+    pub name: &'static str,
 }
 
-/// EAPD verb encoder used by tests.
-pub const fn eapd_verb(cad: u8, pin_nid: u8, enable: bool) -> u32 {
-    encode_verb(
-        cad,
-        pin_nid,
-        VERB_SET_EAPD_BTL,
-        if enable { EAPD_ENABLE } else { 0 },
-    )
+// ── Lenovo ThinkPad bring-up tables ─────────────────────────────────
+//
+// Source: Linux `alc269_fixup_models[]` entries
+// ALC285_FIXUP_THINKPAD_X1_GEN7,
+// ALC285_FIXUP_LENOVO_HEADPHONE_NOISE,
+// ALC287_FIXUP_LENOVO_THINKPAD_T14_GEN3.
+
+pub const QUIRK_X1_CARBON_GEN7: &[PinOverride] = &[
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    }, // speaker @ "Internal mid"
+    PinOverride {
+        nid: 0x17,
+        cfg: 0x90170150,
+    }, // boost amp speaker
+    PinOverride {
+        nid: 0x19,
+        cfg: 0x03A11030,
+    }, // mic @ jack
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x03211020,
+    }, // headphone @ jack
+];
+
+pub const QUIRK_THINKPAD_T14_GEN3: &[PinOverride] = &[
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    },
+    PinOverride {
+        nid: 0x17,
+        cfg: 0x90170150,
+    },
+    PinOverride {
+        nid: 0x19,
+        cfg: 0x04A11040,
+    },
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x04211020,
+    },
+];
+
+// ── HP EliteBook / Pavilion bring-up tables ─────────────────────────
+
+pub const QUIRK_HP_ELITEBOOK_845_G8: &[PinOverride] = &[
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    },
+    PinOverride {
+        nid: 0x19,
+        cfg: 0x03a11020,
+    },
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x03211030,
+    },
+];
+
+// ── Dell Latitude / XPS bring-up tables ─────────────────────────────
+
+pub const QUIRK_DELL_LATITUDE_5430: &[PinOverride] = &[
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    },
+    PinOverride {
+        nid: 0x19,
+        cfg: 0x90a60140,
+    }, // internal mic.
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x03211020,
+    },
+];
+
+// ── ASUS ROG / Zephyrus bring-up tables ─────────────────────────────
+
+pub const QUIRK_ASUS_ROG: &[PinOverride] = &[
+    PinOverride {
+        nid: 0x12,
+        cfg: 0x90A60130,
+    },
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    },
+    PinOverride {
+        nid: 0x17,
+        cfg: 0x90170120,
+    },
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x03211020,
+    },
+];
+
+// ── MSI bring-up tables ─────────────────────────────────────────────
+
+pub const QUIRK_MSI: &[PinOverride] = &[
+    PinOverride {
+        nid: 0x14,
+        cfg: 0x90170110,
+    },
+    PinOverride {
+        nid: 0x19,
+        cfg: 0x03A11040,
+    },
+    PinOverride {
+        nid: 0x21,
+        cfg: 0x03211020,
+    },
+];
+
+// ── Quirk table ─────────────────────────────────────────────────────
+
+/// Static quirk table. Indexed by subsystem ID through `find_quirk`.
+pub const QUIRK_TABLE: &[Quirk] = &[
+    Quirk {
+        subsystem_id: 0x17AA_22BE, // Lenovo X1 Carbon Gen 7
+        chip: RealtekChip::Alc285,
+        pins: QUIRK_X1_CARBON_GEN7,
+        name: "Lenovo ThinkPad X1 Carbon Gen 7",
+    },
+    Quirk {
+        subsystem_id: 0x17AA_22F0,
+        chip: RealtekChip::Alc287,
+        pins: QUIRK_THINKPAD_T14_GEN3,
+        name: "Lenovo ThinkPad T14 Gen 3",
+    },
+    Quirk {
+        subsystem_id: 0x103C_8716, // HP EliteBook 845 G8 (AMD Renoir)
+        chip: RealtekChip::Alc285,
+        pins: QUIRK_HP_ELITEBOOK_845_G8,
+        name: "HP EliteBook 845 G8",
+    },
+    Quirk {
+        subsystem_id: 0x1028_0AB9, // Dell Latitude 5430
+        chip: RealtekChip::Alc256,
+        pins: QUIRK_DELL_LATITUDE_5430,
+        name: "Dell Latitude 5430",
+    },
+    Quirk {
+        subsystem_id: 0x1043_1A30, // ASUS ROG Strix
+        chip: RealtekChip::Alc295,
+        pins: QUIRK_ASUS_ROG,
+        name: "ASUS ROG Strix",
+    },
+    Quirk {
+        subsystem_id: 0x1462_1234, // MSI generic
+        chip: RealtekChip::Alc256,
+        pins: QUIRK_MSI,
+        name: "MSI laptop",
+    },
+];
+
+/// Look up a quirk by codec subsystem ID. Returns the first matching
+/// entry — the table is short enough that a linear scan is fine.
+pub fn find_quirk(subsystem_id: u32) -> Option<&'static Quirk> {
+    QUIRK_TABLE.iter().find(|q| q.subsystem_id == subsystem_id)
 }
 
-// ── Test-only FakeCorb ──────────────────────────────────────────────
-
-/// Records every verb sent — round-trip tests rebind the bus to this
-/// and read out the verb history.
-#[derive(Debug, Default)]
-pub struct VerbRecorder {
-    pub history: Vec<u32>,
-    /// Static responses returned by `send_verb`. Indexed by verb-history
-    /// position; missing entries default to 0.
-    pub responses: Vec<u32>,
+/// Find a quirk for a known chip ignoring subsystem ID. Used by the
+/// bring-up path as a fallback when no exact match exists.
+pub fn first_for_chip(chip: RealtekChip) -> Option<&'static Quirk> {
+    QUIRK_TABLE.iter().find(|q| q.chip == chip)
 }
 
-impl VerbRecorder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn set_response(&mut self, at: usize, value: u32) {
-        if self.responses.len() <= at {
-            self.responses.resize(at + 1, 0);
-        }
-        self.responses[at] = value;
-    }
-    pub fn with_initial_responses(responses: Vec<u32>) -> Self {
-        VerbRecorder {
-            history: Vec::new(),
-            responses,
-        }
-    }
-}
-
-impl CodecVerbBus for VerbRecorder {
-    fn send_verb(&mut self, verb: u32) -> Result<u32, VerbError> {
-        let idx = self.history.len();
-        self.history.push(verb);
-        Ok(self.responses.get(idx).copied().unwrap_or(0))
-    }
+/// Number of registered quirks.
+pub const fn quirk_count() -> usize {
+    QUIRK_TABLE.len()
 }

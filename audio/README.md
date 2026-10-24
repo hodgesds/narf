@@ -22,20 +22,23 @@ starts recording — a design that keeps microphone access explicit.
 Beyond the abstract surface, the crate carries the native hardware
 engines. These include an Intel/AMD HDA (High Definition Audio)
 controller and codec path — CORB/RIRB command rings, stream descriptors,
-the codec widget graph, and Realtek ALC codec routing — and the AMD
-Phoenix ACP 6.3 audio co-processor path for digital-microphone (PDM)
-capture, with its buffer-descriptor, codec-link, and PCM submodules.
-Supporting codec logic (generic AFG bring-up, Realtek ALC, WM8960, I2S)
-and the SBC/mSBC Bluetooth audio codecs also live here. Native PCM and
-mixer endpoints are published through `narf-drivers-sound`'s card and
-file bridge; VirtIO retains precedence as a backend when present.
+the codec widget graph, and pin routing driven from BIOS pin defaults —
+and the AMD Phoenix ACP 6.3 audio co-processor path for
+digital-microphone (PDM) capture. The Realtek ALC codec fixup tables
+(per-chip coef init sequences and per-laptop pin quirks) are staged in
+`hda::quirks`, rescued from the legacy sound-crate codec layer in #783
+and awaiting consumption by the codec-fixup work in #776. The SBC/mSBC
+Bluetooth audio codecs also live here. Native PCM and mixer endpoints
+are published through `narf-drivers-sound`'s card and file bridge;
+VirtIO retains precedence as a backend when present.
 
 The crate depends broadly across the kernel — capabilities, memory and
 shared memory, PCI/bus enumeration, ACPI/AML (to confirm ACP identity
 and pin configuration), interrupts, firmware loading, the scheduler and
 timekeeping, plus `drivers/virtio` and `drivers/sound`. The implemented
-native profile is analog HDA plus ACP PDM; HDMI/DisplayPort audio,
-SoundWire, vendor smart-amplifier fixups, and DSP firmware execution are
-out of this profile. The crate is `no_std`.
+native profile is analog HDA plus ACP PDM, with the ATI HDMI codec
+side (`hda::hdmi`) for display audio; SoundWire, vendor smart-amplifier
+fixups, and DSP firmware execution are out of this profile. The crate
+is `no_std`.
 
 - Spec: [`specification/spec.md`](./specification/spec.md)
