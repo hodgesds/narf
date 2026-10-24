@@ -4067,6 +4067,27 @@ impl Xhci {
         Some((d.port, d.speed, d.max_packet_ep0))
     }
 
+    /// First addressed slot id bound to `root_port` whose retained
+    /// topology has exactly `route_string`, or `None`. Root-hub
+    /// devices have route 0; a hub's downstream child is identified
+    /// by the route `Topology::for_downstream` computed at address
+    /// time. The supervisor's detach path uses this to map a
+    /// (root port, route) pair back to the slot to tear down.
+    pub fn slot_for_route(&self, root_port: u8, route_string: u32) -> Option<u8> {
+        let g = self.devices.lock();
+        for (idx, slot) in g.iter().enumerate() {
+            if let Some(d) = slot {
+                if d.port == root_port
+                    && d.generation != 0
+                    && d.topology.route_string == route_string
+                {
+                    return Some(idx as u8);
+                }
+            }
+        }
+        None
+    }
+
     /// First addressed slot id bound to `port`, or `None` if no slot
     /// is currently bound. Used by test cleanup to recycle stale port
     /// bindings left over by prior tests.

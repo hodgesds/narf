@@ -511,6 +511,29 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
     total
 }
 
+/// Detach the boot mouse bound to `slot_id`: unregister its evdev
+/// node (so `/dev/input/event<N>` disappears) and drop the binding
+/// so `pump_all` stops polling the dead slot. Returns true when a
+/// binding was removed.
+pub fn detach_mouse(slot_id: u8) -> bool {
+    let mut g = MICE.lock();
+    if let Some(pos) = g.iter().position(|m| m.slot_id == slot_id) {
+        let mouse = g.remove(pos);
+        mouse.unregister_evdev();
+        return true;
+    }
+    false
+}
+
+/// Drop every mouse binding, unregistering each evdev node.
+/// Called on a controller recovery epoch change.
+pub fn clear_mice() {
+    let mut g = MICE.lock();
+    for mouse in g.drain(..) {
+        mouse.unregister_evdev();
+    }
+}
+
 #[doc(hidden)]
 pub fn __reset_mice_for_test() {
     MICE.lock().clear();

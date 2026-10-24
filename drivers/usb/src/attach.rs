@@ -360,6 +360,95 @@ pub async fn try_attach_via_hub(
     .await
 }
 
+/// Tear down whatever is bound to `slot_id` — the disconnect-side
+/// counterpart of [`try_attach_root`] / [`try_attach_via_hub`],
+/// driven by the supervisor when a claimed port's connection
+/// disappears (or a bound hub port's does).
+///
+/// Order is load-bearing:
+///   1. Class bindings first, while the slot is still addressed:
+///      every supervisor-pumped class drops its binding for the
+///      slot (evdev nodes unregister, so `/dev/input/event<N>`
+///      disappears), and registered class drivers get their
+///      `dispatch_unbind` hook. After this step nothing polls the
+///      slot.
+///   2. Hub subtree: if the slot is a hub, every bound downstream
+///      device is detached recursively (their ports die with the
+///      hub), then the hub's own [`HUBS`] entry is removed.
+///   3. Controller teardown: Disable Slot (its completion is the
+///      hardware-quiescence proof), then `reclaim_slot` releases
+///      all of the slot's DMA and returns the id to the pool, so a
+///      replug re-runs attach from scratch — possibly on the same
+///      slot id, always under a fresh generation.
+///
+/// Errors from the controller steps are deliberately swallowed: on
+/// a genuine unplug the device is gone either way, and a slot whose
+/// reclaim refuses (Disable Slot failed) stays retired rather than
+/// returning to the pool half-alive. Classes the supervisor does
+/// not pump (MSC / UAC / UVC / CDC-NCM / btusb / CCID) have no
+/// per-class binding removal yet — their slot is disabled and
+/// reclaimed here, but their class-level registries are a
+/// documented follow-up in #748.
+pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
+    // 1. Class bindings.
+    hid::detach_boot_keyboard(slot_id);
+    hid::keyboard::unregister_keyboard_evdev(slot_id);
+    mouse::detach_mouse(slot_id);
+    hid::touchpad::unregister_touchpad_evdev(slot_id);
+    hid::consumer::detach_consumer(slot_id);
+    hid::generic::unregister_generic_evdev(slot_id);
+    crate::cdc_acm::detach_acm(slot_id);
+    crate::xpad::detach_xpad(slot_id);
+    crate::class_registry::dispatch_unbind(slot_id);
+
+    // 2. Hub subtree, then the hub's own registry entry.
+    let subtree: Vec<u8> = {
+        let g = HUBS.lock();
+        let mut out = Vec::new();
+        if let Some(h) = g.iter().find(|h| h.hub.slot_id == slot_id) {
+            for dp in 1..=h.hub.descriptor.num_ports.min(64) {
+                let bit = 1u64 << (dp as u32 & 63);
+                if h.bound_downstream & bit == 0 {
+                    continue;
+                }
+                let child_route =
+                    xhci::Topology::for_downstream(h.route_string, h.tier, dp).route_string;
+                if let Some(child) = xhci_dev.slot_for_route(h.root_hub_port, child_route) {
+                    out.push(child);
+                }
+            }
+        }
+        out
+    };
+    for child in subtree {
+        alloc::boxed::Box::pin(detach_slot(xhci_dev, child)).await;
+    }
+    HUBS.lock().retain(|h| h.hub.slot_id != slot_id);
+
+    // 3. Controller teardown + DMA reclamation (queue 10).
+    let _ = xhci_dev.disable_slot(slot_id).await;
+    let _ = xhci_dev.reclaim_slot(slot_id);
+}
+
+/// Drop every binding the supervisor owns, without touching the
+/// controller. Called when the controller recovery epoch changes
+/// (`Xhci::recover_controller` has already invalidated every
+/// generation, dropped every `Device` and reset the slot table, so
+/// all bindings reference dead slots by construction). Registered
+/// class drivers' unbind hooks are NOT called: their devices are
+/// gone wholesale, and they re-probe on re-enumeration.
+pub fn detach_all_bindings() {
+    hid::clear_boot_keyboards();
+    hid::keyboard::unregister_all_keyboards();
+    mouse::clear_mice();
+    hid::touchpad::unregister_all_touchpads();
+    hid::consumer::clear_consumers();
+    hid::generic::unregister_all_generic();
+    crate::cdc_acm::clear_acm();
+    crate::xpad::clear_xpad();
+    HUBS.lock().clear();
+}
+
 /// Free function so the dispatcher logic stays one place. `port` is
 /// the per-hub port number used purely for HID-side error logging
 /// dedup; `root_port` is the root-hub port that anchors the path.

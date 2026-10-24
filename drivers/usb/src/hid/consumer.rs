@@ -781,6 +781,28 @@ pub fn attached_consumer_count() -> usize {
     ATTACHED_CONSUMER_COUNT.load(core::sync::atomic::Ordering::Acquire) as usize
 }
 
+/// Detach the consumer-control device bound to `slot_id`.
+/// Consumer devices feed the shared input ring and own no evdev
+/// node, so dropping the binding is the whole detach. Returns true
+/// when a binding was removed.
+pub fn detach_consumer(slot_id: u8) -> bool {
+    let mut g = CONSUMER_DEVICES.lock();
+    let before = g.len();
+    g.retain(|d| d.slot_id != slot_id);
+    let removed = g.len() != before;
+    if removed {
+        ATTACHED_CONSUMER_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+    }
+    removed
+}
+
+/// Drop every consumer-control binding. Called on a controller
+/// recovery epoch change.
+pub fn clear_consumers() {
+    CONSUMER_DEVICES.lock().clear();
+    ATTACHED_CONSUMER_COUNT.store(0, core::sync::atomic::Ordering::Release);
+}
+
 #[doc(hidden)]
 pub fn __reset_consumers_for_test() {
     CONSUMER_DEVICES.lock().clear();

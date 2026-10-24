@@ -2175,6 +2175,28 @@ pub async fn try_bind_xpad_already_addressed(
     Ok(())
 }
 
+/// Detach the gamepad bound to `slot_id`: unregister its evdev
+/// node and drop the binding so `pump_all` stops polling the dead
+/// slot. Returns true when a binding was removed.
+pub fn detach_xpad(slot_id: u8) -> bool {
+    let mut g = XPAD_DEVICES_BOUND.lock();
+    if let Some(pos) = g.iter().position(|d| d.slot_id == slot_id) {
+        let dev = g.remove(pos);
+        narf_input::evdev::ROUTER.unregister_device(dev.evdev_id);
+        return true;
+    }
+    false
+}
+
+/// Drop every gamepad binding, unregistering each evdev node.
+/// Called on a controller recovery epoch change.
+pub fn clear_xpad() {
+    let mut g = XPAD_DEVICES_BOUND.lock();
+    for dev in g.drain(..) {
+        narf_input::evdev::ROUTER.unregister_device(dev.evdev_id);
+    }
+}
+
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
     let mut total = 0;
     let pads: Vec<Arc<XpadBoundDevice>> = {
