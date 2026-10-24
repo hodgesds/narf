@@ -19,7 +19,6 @@ use crate::hda::streams::{
 use crate::mixer::{self, ControlInfo, ControlKind, ControlValue};
 use crate::pcm::{PcmSubstream, SubstreamState};
 use crate::{list_cards, mixer as mixer_open, open_playback, register_card, SoundError};
-use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 // ── #5: BDL entry encode ────────────────────────────────────────────
