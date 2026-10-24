@@ -1,0 +1,74 @@
+# cargo-fuzz harness for NARF's untrusted-input parsers.
+#
+# Implements verification/specification/spec.md §7 ("Fuzz targets"):
+# cargo-fuzz (libFuzzer) on host, corpus in-tree under fuzz/corpus/,
+# crash reports become regression unit tests. The §3 taxonomy gates
+# the Fuzz category on the nightly, which is what
+# .github/workflows/fuzz-nightly.yml provides.
+#
+# This package is deliberately its own workspace (the [workspace]
+# table below): the kernel workspace builds for *-unknown-none via
+# cargo xtask and must not absorb host libFuzzer binaries, and the
+# root workspace's member list stays untouched.
+[package]
+name = "narf-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "GPL-2.0-or-later"
+repository = "https://github.com/hodgesds/narf"
+description = "libFuzzer targets for NARF parsers that consume untrusted bytes (ELF, filesystem images, BTF)."
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+libc = "0.2"
+
+# The surfaces under fuzz. Path deps straight into the tree, exactly
+# as verification/btrfs-host (the existing host harness for the fs
+# stack) references them.
+narf-bpf-btf = { path = "../bpf/btf" }
+narf-userspace = { path = "../userspace" }
+narf-drivers-fs-fat = { path = "../drivers/fs/fat" }
+narf-drivers-fs-minix = { path = "../drivers/fs/minix" }
+narf-block = { path = "../block" }
+narf-filesystem = { path = "../filesystem" }
+narf-lib = { path = "../lib" }
+narf-memory = { path = "../memory" }
+narf-scheduler = { path = "../scheduler" }
+
+# The targets. test/doc/bench disabled per cargo-fuzz convention so
+# `cargo test` / `cargo build` at the repo root never try to build
+# libFuzzer binaries.
+[[bin]]
+name = "elf_loader"
+path = "fuzz_targets/elf_loader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fat_image"
+path = "fuzz_targets/fat_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "minix_image"
+path = "fuzz_targets/minix_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "btf_parse"
+path = "fuzz_targets/btf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

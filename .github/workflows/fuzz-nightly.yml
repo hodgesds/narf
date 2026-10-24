@@ -1,0 +1,67 @@
+name: fuzz-nightly
+
+# The Fuzz row of verification/specification/spec.md §3's taxonomy:
+# host, nightly. §7 prescribes cargo-fuzz (libFuzzer) targets with
+# the corpus in-tree under fuzz/corpus/; this workflow is that
+# gate. Each target gets its own job and a bounded run — a crash or
+# timeout fails that target's job and uploads the reproducing
+# input as an artifact. Per §7, a crash then becomes a regression
+# unit test in the owning crate (and, once fixed, a corpus entry);
+# it is not silently absorbed into the corpus.
+on:
+  schedule:
+    # 05:30 UTC daily — ahead of nightly-oci (07:00) so a fuzz
+    # crash is visible before the OCI signal lands.
+    - cron: "30 5 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ""
+
+jobs:
+  fuzz:
+    name: fuzz / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - elf_loader
+          - fat_image
+          - minix_image
+          - btf_parse
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Bounded per target: 300 s of fuzzing after the build,
+      # 30 s per-input timeout (a hang is a finding, reported by
+      # libFuzzer as a timeout crash), input size capped at the
+      # largest target's MAX_IMAGE, ASan RSS capped so a memory
+      # blow-up fails as a crash instead of an OOM-killed job.
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: fuzz
+        run: >-
+          cargo fuzz run ${{ matrix.target }} --
+          -max_total_time=300
+          -timeout=30
+          -max_len=4194304
+          -rss_limit_mb=4096
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
