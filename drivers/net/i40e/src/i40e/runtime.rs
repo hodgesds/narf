@@ -400,9 +400,28 @@ async fn queue_pump(
             let delivered = if let Some((buffer, len, meta)) = packet {
                 let mut frame = Frame::new(buffer, len as u32);
                 frame.set_rx_meta(meta);
-                // Dual delivery (issue #784), as on e1000.
-                crate::publish::deliver_rx(device.ifname(), frame.payload_mut());
-                rx.lock().try_send(frame).is_ok()
+                // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
+                // shape via the shared helper: an attached ring
+                // consumer gets a pristine pre-dispatch copy; the
+                // original goes to the kernel stack in place. i40e
+                // exposes its RX consumer directly through `rx_ring()`
+                // (no take-into-static moment to hook), so attach is
+                // observed here instead: the consumer slot is `Some`
+                // from construction until a consumer takes it, and
+                // Stage-3 consumers never hand it back. The mirror is
+                // non-blocking — a full ring drops its copy, never
+                // the stack's packet — so a mirror failure is not an
+                // RX drop; `delivered` tracks the stack dispatch.
+                let mirror_attached = device.rx_ipc_ring.lock().is_none();
+                crate::publish::dispatch_rx(
+                    device.ifname(),
+                    &mut frame,
+                    mirror_attached,
+                    |mirror| {
+                        let _ = rx.lock().try_send(mirror);
+                    },
+                );
+                true
             } else {
                 false
             };

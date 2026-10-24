@@ -1082,6 +1082,11 @@ impl narf_net::Interface for IgcNic {
             let mut r = RING.lock();
             if r.is_none() {
                 *r = c.rx_ipc_ring.lock().take();
+                if r.is_some() {
+                    // A ring consumer has attached: enable the RX
+                    // mirror (e1000's `rx_mirror_enabled` moment).
+                    crate::publish::note_rx_mirror_attached(igc_ifname());
+                }
             }
         });
         &RING
@@ -1333,13 +1338,22 @@ async fn igc_rx_pump(device: Arc<Igc>, mut rx_prod: Producer<Frame, RX_RING_N>) 
         let frames = device.rx_drain_frames(RX_DRAIN_BUDGET);
         let drained = frames.len();
         for mut frame in frames {
-            // Dual delivery (issue #784): the frame-ring consumer keeps
-            // its copy via the ring below; the kernel-side stack gets
-            // the same frame through the iface RX hook, as on e1000.
-            crate::publish::deliver_rx(igc_ifname(), frame.payload_mut());
-            if rx_prod.send(frame).await.is_err() {
-                return;
-            }
+            // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
+            // shape via the shared helper: an attached ring consumer
+            // gets a pristine pre-dispatch copy; the original goes to
+            // the kernel stack in place. The mirror is non-blocking —
+            // a full/closed ring drops its copy, never the stack's
+            // packet — so unlike the pre-publication pump this loop
+            // no longer exits when the ring closes.
+            let name = igc_ifname();
+            crate::publish::dispatch_rx(
+                name,
+                &mut frame,
+                crate::publish::rx_mirror_attached(name),
+                |mirror| {
+                    let _ = rx_prod.try_send(mirror);
+                },
+            );
         }
         if drained == RX_DRAIN_BUDGET {
             narf_scheduler::yield_now().await;

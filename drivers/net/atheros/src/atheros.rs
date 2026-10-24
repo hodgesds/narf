@@ -935,9 +935,21 @@ async fn atheros_rx_pump(device: Arc<AtlNic>, mut rx_prod: Producer<Frame, RX_RI
                 alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
-            // Dual delivery (issue #784), as on e1000.
-            crate::publish::deliver_rx(atheros_ifname(), frame.payload_mut());
-            let _ = rx_prod.send(frame).await;
+            // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
+            // shape via the shared helper: an attached ring consumer
+            // gets a pristine pre-dispatch copy; the original goes to
+            // the kernel stack in place. The mirror is non-blocking —
+            // a full/closed ring drops its copy, never the stack's
+            // packet.
+            let name = atheros_ifname();
+            crate::publish::dispatch_rx(
+                name,
+                &mut frame,
+                crate::publish::rx_mirror_attached(name),
+                |mirror| {
+                    let _ = rx_prod.try_send(mirror);
+                },
+            );
         }
         narf_scheduler::yield_now().await;
     }
@@ -1008,6 +1020,11 @@ impl narf_net::Interface for AtlHwNic {
             let mut r = RING.lock();
             if r.is_none() {
                 *r = c.rx_ipc_ring.lock().take();
+                if r.is_some() {
+                    // Ring consumer attached: enable the RX mirror
+                    // (e1000's `rx_mirror_enabled` moment).
+                    crate::publish::note_rx_mirror_attached(atheros_ifname());
+                }
             }
         });
         &RING
@@ -1059,6 +1076,11 @@ impl crate::HwNic for AtlHwNic {
             let mut r = RING.lock();
             if r.is_none() {
                 *r = c.rx_ipc_ring.lock().take();
+                if r.is_some() {
+                    // Ring consumer attached: enable the RX mirror
+                    // (e1000's `rx_mirror_enabled` moment).
+                    crate::publish::note_rx_mirror_attached(atheros_ifname());
+                }
             }
         });
         &RING

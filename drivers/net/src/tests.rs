@@ -2004,3 +2004,132 @@ fn smoke_netdev_carrier_transitions() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/core", smoke_netdev_carrier_transitions);
+
+// ── RX dispatch mirror contract (issue #784) ──────────────────────
+//
+// `publish::dispatch_rx` is the fan-out every dual-published family's
+// pump runs. These statics back the counting/mutating RX handler the
+// fixture installs at the `iface` seam (the handler is a plain fn
+// pointer, so its observations live in statics).
+
+static FIXTURE_RX_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static FIXTURE_RX_FIRST_BYTE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Stand-in for the kernel stack's RX handler. Counts the delivery,
+/// records the first byte it was handed, then rewrites the first four
+/// bytes in place — the XDP shape `dispatch_rx` must defend the ring
+/// mirror against. Returning at all also stands in for a classifier
+/// "consumed" verdict: from the pump's side the frame is gone either
+/// way, so the mirror contract (below) is what is pinned, not the
+/// verdict plumbing inside the stack.
+fn fixture_rx_handler(_name: &str, frame: &mut [u8]) {
+    use core::sync::atomic::Ordering;
+    FIXTURE_RX_CALLS.fetch_add(1, Ordering::SeqCst);
+    if let Some(first) = frame.first() {
+        FIXTURE_RX_FIRST_BYTE.store(*first as usize, Ordering::SeqCst);
+    }
+    for b in frame.iter_mut().take(4) {
+        *b = 0xEE;
+    }
+}
+
+fn smoke_netdev_rx_dispatch_mirror_contract() -> TestResult {
+    use crate::publish::{
+        dispatch_rx, note_rx_mirror_attached, publish_netdev, rx_mirror_attached, LinkSample,
+    };
+    use core::sync::atomic::Ordering;
+
+    // A fresh published name has no ring consumer attached; noting
+    // the attach flips the gate — for that name only.
+    let name = publish_netdev(
+        [0x02, 0x78, 0x40, 0x00, 0x00, 0x04],
+        fixture_send_a,
+        LinkSample::DOWN,
+    );
+    if rx_mirror_attached(&name) {
+        return TestResult::Fail("fresh iface reported a ring consumer already attached");
+    }
+    // The note takes the family's leaked &'static name; this literal
+    // pins the registry round-trip without consuming the fixture's
+    // dynamic name (dispatch below takes its gate as a parameter,
+    // which is what the pumps feed from this same registry).
+    note_rx_mirror_attached("eth-fixture-mirror");
+    if !rx_mirror_attached("eth-fixture-mirror") || rx_mirror_attached("eth-fixture-never") {
+        return TestResult::Fail(
+            "mirror attach registry did not record the note for that name only",
+        );
+    }
+
+    narf_net::iface::install_rx_handler(fixture_rx_handler);
+    FIXTURE_RX_CALLS.store(0, Ordering::SeqCst);
+
+    // 64-byte pattern; first byte 0x10, distinct from the handler's
+    // 0xEE rewrite stamp.
+    let mut pattern = [0u8; 64];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = 0x10 + i as u8;
+    }
+    let build = |pattern: &[u8; 64]| -> Option<narf_net::Frame> {
+        let buf = narf_io::alloc_coherent(pattern.len(), narf_lib::id::DomainId::DRIVER_0).ok()?;
+        let mut frame = narf_net::Frame::new(buf, pattern.len() as u32);
+        frame.payload_mut().copy_from_slice(pattern);
+        Some(frame)
+    };
+
+    // Case 1 — no ring consumer attached: the stack handler is the
+    // only delivery, exactly once, on the original buffer (its
+    // in-place rewrite is visible afterwards); no mirror is made.
+    let Some(mut frame) = build(&pattern) else {
+        return TestResult::Fail("fixture frame allocation failed (case 1)");
+    };
+    let mut mirrored1: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    dispatch_rx(&name, &mut frame, false, |mirror| {
+        mirrored1.push(alloc::vec::Vec::from(mirror.payload()));
+    });
+    if FIXTURE_RX_CALLS.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail(
+            "unattached dispatch did not reach the stack handler exactly once",
+        );
+    }
+    if !mirrored1.is_empty() {
+        return TestResult::Fail("unattached dispatch mirrored to a ring with no consumer");
+    }
+    if frame.payload()[..4] != [0xEE; 4] {
+        return TestResult::Fail("stack handler's in-place rewrite missing on the original frame");
+    }
+
+    // Case 2 — ring consumer attached: the handler still sees the
+    // frame exactly once, the mirror sink is called exactly once,
+    // and the mirrored bytes are the PRISTINE pattern even though
+    // the handler rewrote (and, verdict-wise, consumed) its copy.
+    // That is e1000's documented mirror contract: the ring observes
+    // raw hardware frames; the stack's verdict does not reach it.
+    let Some(mut frame) = build(&pattern) else {
+        return TestResult::Fail("fixture frame allocation failed (case 2)");
+    };
+    let mut mirrored2: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    dispatch_rx(&name, &mut frame, true, |mirror| {
+        mirrored2.push(alloc::vec::Vec::from(mirror.payload()));
+    });
+    if FIXTURE_RX_CALLS.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("attached dispatch did not reach the stack handler exactly once");
+    }
+    if FIXTURE_RX_FIRST_BYTE.load(Ordering::SeqCst) != 0x10 {
+        return TestResult::Fail("stack handler was not handed the original first byte");
+    }
+    if mirrored2.len() != 1 {
+        return TestResult::Fail("attached dispatch did not mirror exactly once");
+    }
+    if mirrored2[0][..] != pattern[..] {
+        return TestResult::Fail("ring mirror does not hold the pristine pre-dispatch bytes");
+    }
+    if frame.payload()[..4] != [0xEE; 4] {
+        return TestResult::Fail("stack handler's rewrite missing on the original (case 2)");
+    }
+
+    // Restore the real stack handler for any later test in the boot.
+    narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/core", smoke_netdev_rx_dispatch_mirror_contract);

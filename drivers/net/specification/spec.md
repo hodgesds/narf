@@ -52,8 +52,17 @@ depend on it — and alongside it each family's probe registers with
 families such as i40e, whose send path resolves its PF by cookie). The iface
 registration allocates a dynamic `eth%d` name from the central allocator;
 hardcoded frame-ring names (`eth3`, `eth4`, per-chip labels) survive only as
-pre-publication fallbacks. RX paths dual-deliver each received frame to
-`iface::on_rx_frame_from` in addition to the frame ring.
+pre-publication fallbacks. RX fan-out follows e1000's `dispatch_rx_frame`
+contract, generalised in `publish::dispatch_rx`: each received frame is
+dispatched to the kernel stack in place via `iface::on_rx_frame_from` — a
+path whose XDP program may rewrite or resize the frame and whose classifier
+may consume, drop or redirect it — and, only when a frame-ring consumer has
+attached (it took the interface's RX consumer in `rx_ring()`, recorded via
+`publish::note_rx_mirror_attached`), a pristine copy made *before* that
+dispatch is mirrored to the ring. The mirror is an observer's copy: it
+carries the raw hardware bytes regardless of the stack's verdict, a full
+ring drops the mirror rather than the stack's packet, and no copy is made
+while no consumer is attached.
 
 Carrier is a live signal, not a probe-time photograph (issue #791). A family
 republishes its link sample on every transition it can observe, through the

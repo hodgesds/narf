@@ -24,6 +24,7 @@ path = "src/lib.rs"
 narf-net = { path = "../../../net" }
 narf-ipc = { path = "../../../ipc" }
 narf-lib = { path = "../../../lib" }
+narf-io  = { path = "../../../io" }
 
 [lints]
 workspace = true

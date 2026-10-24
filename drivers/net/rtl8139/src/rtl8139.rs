@@ -411,6 +411,11 @@ impl narf_net::Interface for Rtl8139Nic {
             let mut r = RING.lock();
             if r.is_none() {
                 *r = c.rx_ipc_ring.lock().take();
+                if r.is_some() {
+                    // Ring consumer attached: enable the RX mirror
+                    // (e1000's `rx_mirror_enabled` moment).
+                    crate::publish::note_rx_mirror_attached(rtl8139_ifname());
+                }
             }
         });
         &RING
@@ -580,9 +585,21 @@ async fn rtl8139_rx_pump(device: Arc<Rtl8139>, mut rx_prod: Producer<Frame, RX_R
             let dma_buf = alloc_coherent(n, DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, n as u32);
             frame.payload_mut().copy_from_slice(&buf[..n]);
-            // Dual delivery (issue #784), as on e1000.
-            crate::publish::deliver_rx(rtl8139_ifname(), frame.payload_mut());
-            let _ = rx_prod.send(frame).await;
+            // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
+            // shape via the shared helper: an attached ring consumer
+            // gets a pristine pre-dispatch copy; the original goes to
+            // the kernel stack in place. The mirror is non-blocking —
+            // a full/closed ring drops its copy, never the stack's
+            // packet.
+            let name = rtl8139_ifname();
+            crate::publish::dispatch_rx(
+                name,
+                &mut frame,
+                crate::publish::rx_mirror_attached(name),
+                |mirror| {
+                    let _ = rx_prod.try_send(mirror);
+                },
+            );
         }
         narf_scheduler::yield_now().await;
     }
