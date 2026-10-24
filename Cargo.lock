@@ -3137,6 +3137,7 @@ dependencies = [
  "narf-bpf-verifier",
  "narf-capabilities",
  "narf-console",
+ "narf-drivers-fs-9p",
  "narf-drivers-fs-btrfs",
  "narf-drivers-fs-exfat",
  "narf-drivers-fs-ext2",
