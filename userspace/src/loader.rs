@@ -234,6 +234,15 @@ pub unsafe fn load_elf_into_at(
     Ok(entry)
 }
 
+/// Exec page-in plan (#740): `(region base, pages)` runs over an
+/// image's demand-paged `PT_LOAD` segments, in segment order. The
+/// loader produces the plan as data — the address space is not live
+/// on any CPU yet, and the bulk fault API requires a live root — and
+/// an exec completion path drives it once the new image has been
+/// activated (see [`page_in_plan`]). Empty unless a segment
+/// demand-paged, which requires a file-backed load.
+pub type PageInPlan = alloc::vec::Vec<(u64, u64)>;
+
 /// [`load_elf_into_at`], optionally demand-paging the file image.
 ///
 /// With `file = Some(ops)`, a PT_LOAD whose biased vaddr is page-congruent
@@ -273,7 +282,7 @@ pub unsafe fn load_elf_into_at_file<S: crate::elf::ExecBytes + ?Sized>(
     addr_space: &AddressSpace,
     vaddr_bias: u64,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
-) -> Result<(u64, alloc::vec::Vec<(u64, u64)>), LoadBytesError> {
+) -> Result<(u64, PageInPlan), LoadBytesError> {
     let image = crate::elf::parse_from(src)?;
     // SAFETY: forwarding this function's own contract.
     unsafe { load_image_into_at(&image, src, addr_space, vaddr_bias, file) }
@@ -310,7 +319,7 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
     addr_space: &AddressSpace,
     vaddr_bias: u64,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
-) -> Result<(u64, alloc::vec::Vec<(u64, u64)>), LoadBytesError> {
+) -> Result<(u64, PageInPlan), LoadBytesError> {
     if image.segments.is_empty() {
         return Err(LoadBytesError::Load(LoadError::NoSegments));
     }
@@ -567,7 +576,7 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
     // is not live on any CPU yet, and the batch's safety contract
     // requires a live root, so an exec completion path drives the plan
     // after activating the new image (see `page_in_plan`).
-    let mut page_in_plan: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    let mut page_in_plan = PageInPlan::new();
     let mut page_in_budget: u64 = EXEC_PAGEIN_MAX_PAGES;
     for (index, &(_, memory_pages)) in page_counts.iter().enumerate() {
         if page_in_budget == 0 {
@@ -643,6 +652,27 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
     Ok((image.entry.wrapping_add(vaddr_bias), page_in_plan))
 }
 
+/// Everything [`load_elf_bytes_file`] hands back for a loaded image.
+/// A struct rather than a tuple so each piece is named at the call
+/// site — in particular `program_bias`, which is the bias the loader
+/// actually used (see [`program_load_bias`]) and must not be confused
+/// with the entry point it sits next to.
+pub struct LoadedElf {
+    /// The fresh address space, with every `PT_LOAD` installed and
+    /// materialized, ready to attach to a `spawn_user` task.
+    pub address_space: Arc<AddressSpace>,
+    /// Entry point (already biased) to hand to the scheduler.
+    pub program_entry: EntryPoint,
+    /// Load bias actually applied to the image's segments: 0 for
+    /// `ET_EXEC`, the randomised base for `ET_DYN`.
+    pub program_bias: u64,
+    /// The parsed image the address space was built from.
+    pub image: ExecImage,
+    /// Exec page-in plan (#740) for the image's demand-paged
+    /// segments; empty on the eager path.
+    pub page_in_plan: PageInPlan,
+}
+
 /// One-shot: parse ELF bytes, allocate a fresh user `AddressSpace`, map every
 /// `PT_LOAD` segment, materialize its file image, and leave full BSS pages
 /// demand-zero. Segment data is copied from `bytes` into the file-image
@@ -663,7 +693,13 @@ pub unsafe fn load_elf_bytes(
     bytes: &[u8],
 ) -> Result<(Arc<AddressSpace>, EntryPoint, u64), LoadBytesError> {
     // SAFETY: forwarding this function's contract; `None` keeps the eager path.
-    unsafe { load_elf_bytes_file(bytes, None) }.map(|(a, e, b, _image, _plan)| (a, e, b))
+    unsafe { load_elf_bytes_file(bytes, None) }.map(|loaded| {
+        (
+            loaded.address_space,
+            loaded.program_entry,
+            loaded.program_bias,
+        )
+    })
 }
 
 /// [`load_elf_bytes`], demand-paging the program image from `file` when it is
@@ -674,16 +710,7 @@ pub unsafe fn load_elf_bytes(
 pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
     src: &S,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
-) -> Result<
-    (
-        Arc<AddressSpace>,
-        EntryPoint,
-        u64,
-        ExecImage,
-        alloc::vec::Vec<(u64, u64)>,
-    ),
-    LoadBytesError,
-> {
+) -> Result<LoadedElf, LoadBytesError> {
     // SAFETY: `new_for_user` contract — caller is in kernel mode
     // with paging up.
     // SAFETY: Valid memory or trusted environment
@@ -727,13 +754,13 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
     unsafe { addr_space.materialize() }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
-    Ok((
-        Arc::new(addr_space),
-        EntryPoint(VirtAddr::new(entry)),
-        bias,
+    Ok(LoadedElf {
+        address_space: Arc::new(addr_space),
+        program_entry: EntryPoint(VirtAddr::new(entry)),
+        program_bias: bias,
         image,
         page_in_plan,
-    ))
+    })
 }
 
 /// Drive an exec page-in plan (built by [`load_image_into_at`], #740)
