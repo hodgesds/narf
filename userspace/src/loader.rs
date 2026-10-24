@@ -657,6 +657,7 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
 /// site — in particular `program_bias`, which is the bias the loader
 /// actually used (see [`program_load_bias`]) and must not be confused
 /// with the entry point it sits next to.
+#[derive(Debug)]
 pub struct LoadedElf {
     /// The fresh address space, with every `PT_LOAD` installed and
     /// materialized, ready to attach to a `spawn_user` task.
