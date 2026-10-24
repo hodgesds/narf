@@ -131,6 +131,7 @@ mod abi_aio_tests;
 mod abi_async_tests;
 mod abi_bpf_btf_tests;
 mod abi_bpf_tests;
+mod abi_btrfs_loading_tests;
 mod abi_coherence_9p_tests;
 mod abi_coherence_btrfs_tests;
 mod abi_coherence_exfat_tests;

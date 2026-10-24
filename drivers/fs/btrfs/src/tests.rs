@@ -3431,8 +3431,7 @@ fn smoke_btrfs_mmap_cache_generation_tracks_mutations() -> TestResult {
     if other.mmap_cache_generation() != og {
         return TestResult::Fail("a write to one file moved another file's generation");
     }
-    // A final unlink moves the generation for a node that still has
-    // the file open (the engine bumps when the last link drops).
+    // Unlink changes a name, not the contents of a still-open inode.
     let doomed = match poll_once(root.create("gen-doomed.dat")) {
         Some(Ok(f)) => f,
         _ => return TestResult::Fail("create gen-doomed.dat failed"),
@@ -3444,8 +3443,8 @@ fn smoke_btrfs_mmap_cache_generation_tracks_mutations() -> TestResult {
     if !matches!(poll_once(root.unlink("gen-doomed.dat")), Some(Ok(()))) {
         return TestResult::Fail("unlink gen-doomed.dat failed");
     }
-    if doomed.mmap_cache_generation() == dg || doomed.mmap_cache_generation().is_none() {
-        return TestResult::Fail("final unlink did not move the generation");
+    if doomed.mmap_cache_generation() != dg || read_all(&doomed, 8).as_deref() != Some(b"bye") {
+        return TestResult::Fail("unlink invalidated a still-open inode's contents");
     }
     // Inode numbers are issued max+1: the next create reuses the
     // highest freed number, and the recycled file must not inherit
@@ -3461,6 +3460,18 @@ fn smoke_btrfs_mmap_cache_generation_tracks_mutations() -> TestResult {
     };
     if !matches!(poll_once(root.unlink("gen-last.dat")), Some(Ok(()))) {
         return TestResult::Fail("unlink gen-last.dat failed");
+    }
+    let still_open = match poll_once(root.create("gen-while-open.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create while victim open failed"),
+    };
+    if still_open.ino() == victim_ino {
+        return TestResult::Fail("still-open inode number was recycled");
+    }
+    drop(victim);
+    drop(still_open);
+    if !matches!(poll_once(root.unlink("gen-while-open.dat")), Some(Ok(()))) {
+        return TestResult::Fail("unlink higher-numbered test inode failed");
     }
     let recycled = match poll_once(root.create("gen-recycled.dat")) {
         Some(Ok(f)) => f,
@@ -11812,10 +11823,11 @@ fn smoke_btrfs_block_group_tree_write() -> TestResult {
         return TestResult::Fail("data block group used did not grow with the write");
     }
 
-    // Free: unlinking the file returns its extents; tree 11's `used` drops.
+    // Unlink keeps an open inode's extents; final close permits reclamation.
     if poll_once(vol.root().unlink("bgt-big.dat")).is_none_or(|r| r.is_err()) {
         return TestResult::Fail("unlink on block-group-tree fs failed");
     }
+    drop(file);
     for i in 0..4 {
         if !matches!(
             poll_once(vol.root().create(&format!("bgt-small-{i}.txt"))),
@@ -11834,7 +11846,6 @@ fn smoke_btrfs_block_group_tree_write() -> TestResult {
     if data_used(&bgs2) >= used_after_write {
         return TestResult::Fail("freeing data did not lower tree-11 used");
     }
-    drop(file);
     drop(vol);
 
     // Remount (re-validates every block group against its chunk) and write

@@ -131,6 +131,7 @@ macro_rules! autogrow {
         if !$vol.admits_writes() {
             return Err(FsError::ReadOnly);
         }
+        $vol.reap_orphans().await?;
         let mut r = $op;
         let mut tries = 0u32;
         // Under `narf.disks=root-rw` the whole-tree-repacking growth path is
@@ -230,15 +231,8 @@ pub struct BtrfsNode<B: BlockDevice + 'static> {
     tree_root: Option<u64>,
     tree_id: Option<u64>,
     ino: u64,
-    /// The inode as last looked up or changed through this node (chmod,
-    /// chown and utimens refresh it so `stat` follows).
-    inode: narf_lib::sync::IrqSafeSpinLock<InodeItem>,
-    /// The file size as of this node's latest write: `inode` is the item as
-    /// looked up, and `stat` has no tree access.
-    live_size: core::sync::atomic::AtomicU64,
-    /// This inode's shared `MAP_SHARED` identity, taken on first use (see
-    /// [`crate::volume::MmapAnchor`]).
-    mmap_anchor: narf_lib::sync::OnceLock<Arc<crate::volume::MmapAnchor>>,
+    /// Shared inode metadata and lifetime, held by every lookup and mapping.
+    anchor: Arc<crate::volume::MmapAnchor>,
 }
 
 impl<B: BlockDevice + 'static> BtrfsNode<B> {
@@ -248,14 +242,14 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         ino: u64,
         inode: InodeItem,
     ) -> Arc<Self> {
+        let volume = vol.upgrade().expect("node constructed from a live volume");
+        let anchor = volume.mmap_anchor(volume.fs_tree_id(), ino, inode);
         Arc::new(BtrfsNode {
             vol,
             tree_root,
             tree_id: None,
             ino,
-            live_size: core::sync::atomic::AtomicU64::new(inode.size),
-            inode: narf_lib::sync::IrqSafeSpinLock::new(inode),
-            mmap_anchor: narf_lib::sync::OnceLock::new(),
+            anchor,
         })
     }
 
@@ -266,20 +260,35 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         ino: u64,
         inode: InodeItem,
     ) -> Arc<Self> {
+        let volume = vol.upgrade().expect("node constructed from a live volume");
+        let anchor = volume.mmap_anchor(tree_id, ino, inode);
         Arc::new(BtrfsNode {
             vol,
             tree_root: Some(tree_root),
             tree_id: Some(tree_id),
             ino,
-            live_size: core::sync::atomic::AtomicU64::new(inode.size),
-            inode: narf_lib::sync::IrqSafeSpinLock::new(inode),
-            mmap_anchor: narf_lib::sync::OnceLock::new(),
+            anchor,
         })
     }
 
     /// Snapshot of the cached inode.
     fn inode(&self) -> InodeItem {
-        *self.inode.lock()
+        *self.anchor.inode.lock()
+    }
+
+    fn cache_inode(&self, inode: InodeItem) {
+        *self.anchor.inode.lock() = inode;
+        self.anchor
+            .live_size
+            .store(inode.size, core::sync::atomic::Ordering::Release);
+    }
+
+    async fn refresh_inode(&self) -> Result<InodeItem, FsError> {
+        let vol = self.volume()?;
+        let _op = vol.op_lock().lock().await;
+        let inode = with_root_retry!(self, vol, |root| vol.load_inode_in(root, self.ino).await)?;
+        self.cache_inode(inode);
+        Ok(inode)
     }
 
     /// Change mode / owners / timestamps of this inode and refresh the cache
@@ -289,12 +298,15 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             return Err(FsError::ReadOnly);
         }
         let vol = self.volume()?;
-        let updated = autogrow!(
+        autogrow!(
             vol,
-            crate::write::set_inode_attrs(&vol, self.ino, change).await
-        )?;
-        *self.inode.lock() = updated;
-        Ok(())
+            async {
+                let updated = crate::write::set_inode_attrs(&vol, self.ino, change).await?;
+                self.cache_inode(updated);
+                Ok(())
+            }
+            .await
+        )
     }
 
     fn volume(&self) -> Result<Arc<BtrfsVolume<B>>, FsError> {
@@ -795,14 +807,14 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let vol = self.volume()?;
+            let _op = vol.op_lock().lock().await;
             with_root_retry!(self, vol, |root| {
                 // The size is re-read from the tree: this node's cached inode
                 // predates any write made through it (or through another open
                 // file of the same inode).
                 match vol.load_inode_in(root, self.ino).await {
                     Ok(inode) => {
-                        self.live_size
-                            .store(inode.size, core::sync::atomic::Ordering::Relaxed);
+                        self.cache_inode(inode);
                         crate::extent::read_file(&vol, root, self.ino, inode.size, offset, buf)
                             .await
                     }
@@ -827,15 +839,17 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             // in an error must still invalidate retained cache pages
             // (the `mmap_cache_generation` contract; the minix rule).
             self.bump_cache_generation(&vol);
-            let written = autogrow!(
+            autogrow!(
                 vol,
-                crate::write::cow_write_file(&vol, self.ino, &self.inode(), offset, buf).await
-            )?;
-            self.live_size.fetch_max(
-                offset.saturating_add(written as u64),
-                core::sync::atomic::Ordering::Relaxed,
-            );
-            Ok(written)
+                async {
+                    let result =
+                        crate::write::cow_write_file(&vol, self.ino, &self.inode(), offset, buf)
+                            .await;
+                    self.cache_inode(vol.load_inode(self.ino).await?);
+                    result
+                }
+                .await
+            )
         })
     }
 
@@ -851,25 +865,33 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             let vol = self.volume()?;
             // Bump before the length moves (see `write`).
             self.bump_cache_generation(&vol);
-            let old_size = self.live_size.load(core::sync::atomic::Ordering::Relaxed);
+            let old_size = self
+                .anchor
+                .live_size
+                .load(core::sync::atomic::Ordering::Relaxed);
             if len < old_size {
                 // Publish the new EOF, then revoke every installed PTE
                 // past it before the extents are retired — the ordering
                 // ext2's truncate uses. Without the revoke, an
                 // already-mapped page keeps serving its retired extent
                 // instead of faulting SIGBUS.
-                self.live_size
+                self.anchor
+                    .live_size
                     .store(len, core::sync::atomic::Ordering::Relaxed);
                 if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
-                    self.live_size
-                        .store(old_size, core::sync::atomic::Ordering::Relaxed);
+                    self.refresh_inode().await?;
                     return Err(error);
                 }
             }
-            autogrow!(vol, crate::write::truncate_file(&vol, self.ino, len).await)?;
-            self.live_size
-                .store(len, core::sync::atomic::Ordering::Relaxed);
-            Ok(())
+            autogrow!(
+                vol,
+                async {
+                    let result = crate::write::truncate_file(&vol, self.ino, len).await;
+                    self.cache_inode(vol.load_inode(self.ino).await?);
+                    result
+                }
+                .await
+            )
         })
     }
 
@@ -890,7 +912,13 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             self.bump_cache_generation(&vol);
             autogrow!(
                 vol,
-                crate::write::fallocate_file(&vol, self.ino, mode, offset, len).await
+                async {
+                    let result =
+                        crate::write::fallocate_file(&vol, self.ino, mode, offset, len).await;
+                    self.cache_inode(vol.load_inode(self.ino).await?);
+                    result
+                }
+                .await
             )?;
             if mode & (crate::write::FALLOC_FL_PUNCH_HOLE | crate::write::FALLOC_FL_ZERO_RANGE) != 0
             {
@@ -903,12 +931,6 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                     (offset / narf_filesystem::PAGE_SIZE as u64)
                         * narf_filesystem::PAGE_SIZE as u64,
                 )?;
-            }
-            if mode & crate::write::FALLOC_FL_KEEP_SIZE == 0 {
-                self.live_size.fetch_max(
-                    offset.saturating_add(len),
-                    core::sync::atomic::Ordering::Relaxed,
-                );
             }
             Ok(())
         })
@@ -928,8 +950,12 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 
     fn stat(&self) -> Stat {
         Stat {
-            size: self.live_size.load(core::sync::atomic::Ordering::Relaxed),
+            size: self
+                .anchor
+                .live_size
+                .load(core::sync::atomic::Ordering::Relaxed),
             blocks: self
+                .anchor
                 .live_size
                 .load(core::sync::atomic::Ordering::Relaxed)
                 .div_ceil(512),
@@ -941,6 +967,13 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             // 1970). The exact value travels in `InodeAttrs::mtime_ns`.
             mtime_cycles: narf_time::ns_to_cycles(self.inode().mtime_ns()),
         }
+    }
+
+    fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
+        Box::pin(async move {
+            self.refresh_inode().await?;
+            Ok(self.stat())
+        })
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
@@ -955,14 +988,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     /// (journald writing, `journalctl` reading) must map the same
     /// `MAP_SHARED` pages, as they share one page cache on Linux.
     fn mmap_backing_identity(&self) -> usize {
-        let Ok(vol) = self.volume() else {
-            return self as *const Self as *const () as usize;
-        };
-        let anchor = self.mmap_anchor.get_or_init(|| {
-            let tree = self.tree_id.unwrap_or_else(|| vol.fs_tree_id());
-            vol.mmap_anchor(tree, self.ino)
-        });
-        Arc::as_ptr(anchor) as *const () as usize
+        Arc::as_ptr(&self.anchor) as *const () as usize
     }
 
     /// Generic-fallback mmap opt-in for regular files. The mutation
@@ -1048,6 +1074,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 
     fn statx_async<'a>(&'a self, _flags: u32, _mask: u32) -> FsFuture<'a, FsStatx> {
         Box::pin(async move {
+            self.refresh_inode().await?;
             let ts = |seconds, nanoseconds| FsStatxTimestamp {
                 seconds,
                 nanoseconds,
@@ -1061,8 +1088,12 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 gid: self.inode().gid,
                 mode: (self.inode().mode & 0xffff) as u16,
                 ino: self.ino,
-                size: self.live_size.load(core::sync::atomic::Ordering::Relaxed),
+                size: self
+                    .anchor
+                    .live_size
+                    .load(core::sync::atomic::Ordering::Relaxed),
                 blocks: self
+                    .anchor
                     .live_size
                     .load(core::sync::atomic::Ordering::Relaxed)
                     .div_ceil(512),
@@ -1210,6 +1241,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             let vol = self.volume()?;
+            let _op = vol.op_lock().lock().await;
             let entry = self.find_child(name).await?;
             let node = self.load_child(&vol, &entry).await?;
             Ok(node as Arc<dyn FileOps>)
@@ -1219,6 +1251,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
             let vol = self.volume()?;
+            let _op = vol.op_lock().lock().await;
             let entry = self.find_child(name).await?;
             let node = self.load_child(&vol, &entry).await?;
             if !node.inode().is_dir() {
@@ -1296,15 +1329,17 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             }
             let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
-            let (ino, inode) =
-                autogrow!(vol, crate::write::create_file(&vol, self.ino, name).await)?;
-            // Inode numbers are issued max+1 (`next_inode_number`),
-            // so `ino` may be a freed file's number: issue the new
-            // file's instance generation now, so pages the previous
-            // tenant left in the shared page cache can never validate
-            // against this file.
-            vol.bump_cache_generation(vol.fs_tree_id(), ino);
-            Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+            autogrow!(
+                vol,
+                async {
+                    let (ino, inode) = crate::write::create_file(&vol, self.ino, name).await?;
+                    vol.bump_cache_generation(vol.fs_tree_id(), ino);
+                    // Pin before releasing op_lock: another task may immediately
+                    // unlink the new name, but this returned handle must survive.
+                    Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+                }
+                .await
+            )
         })
     }
 
@@ -1326,8 +1361,14 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             }
             let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
-            let (ino, inode) = autogrow!(vol, crate::write::mkdir_dir(&vol, self.ino, name).await)?;
-            Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn DirOps>)
+            autogrow!(
+                vol,
+                async {
+                    let (ino, inode) = crate::write::mkdir_dir(&vol, self.ino, name).await?;
+                    Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn DirOps>)
+                }
+                .await
+            )
         })
     }
 
@@ -1457,11 +1498,15 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             }
             let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
-            let (ino, inode) = autogrow!(
+            autogrow!(
                 vol,
-                crate::write::symlink_node(&vol, self.ino, name, target).await
-            )?;
-            Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+                async {
+                    let (ino, inode) =
+                        crate::write::symlink_node(&vol, self.ino, name, target).await?;
+                    Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+                }
+                .await
+            )
         })
     }
 
@@ -1493,11 +1538,15 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 glibc_to_kernel_dev(rdev)
             };
             let vol = self.volume()?;
-            let (ino, inode) = autogrow!(
+            autogrow!(
                 vol,
-                crate::write::mknod_node(&vol, self.ino, name, mode, ft, kdev).await
-            )?;
-            Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+                async {
+                    let (ino, inode) =
+                        crate::write::mknod_node(&vol, self.ino, name, mode, ft, kdev).await?;
+                    Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+                }
+                .await
+            )
         })
     }
 
@@ -1510,11 +1559,16 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             let vol = self.volume()?;
             // S_IFSOCK | perms; no device number.
             let mode = 0o140000 | u32::from(perms & 0o7777);
-            let (ino, inode) = autogrow!(
+            autogrow!(
                 vol,
-                crate::write::mknod_node(&vol, self.ino, name, mode, format::FT_SOCK, 0).await
-            )?;
-            Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+                async {
+                    let (ino, inode) =
+                        crate::write::mknod_node(&vol, self.ino, name, mode, format::FT_SOCK, 0)
+                            .await?;
+                    Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+                }
+                .await
+            )
         })
     }
 

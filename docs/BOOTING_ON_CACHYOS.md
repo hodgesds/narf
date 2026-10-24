@@ -414,8 +414,8 @@ counter/generation in release builds. A lookup started before replacement
 can therefore publish a stale inode afterwards. Mutation tracking must span
 the full table. Second, the Btrfs retained-handle experiment reads a fresh
 replacement successfully but gets `NotFound` reading the replaced file
-through an existing handle, both before and after `syncfs`. Last-link
-replacement currently reclaims the old inode immediately. Linux retains an
+through an existing handle, both before and after `syncfs`. At audit time,
+last-link replacement reclaimed the old inode immediately. Linux retains an
 unlinked inode and its data until its final open/mapping reference is gone.
 Correcting the dentry mask does not implement that missing Btrfs lifetime.
 The subsequent upstream Btrfs cache-generation change invalidates retained
@@ -433,6 +433,23 @@ contents through their respective handles, concurrent lookup publication,
 and a real dynamic executable after cache rebuild on writable Btrfs.
 The root smoke's `ldconfig | head | sed` command is a diagnostic report:
 it does not assert `ldconfig`'s exit status or concurrent loader correctness.
+
+The Btrfs file-loading fix retains shared inode metadata and a lifetime anchor
+for every node, including nodes held only by mappings. A separate open sees
+size changes immediately; async stat refreshes attributes from the tree.
+Replacement and unlink persist `nlink=0` with an `ORPHAN_ITEM`, leaving old
+handles and unfaulted mapping pages attached to their original data. Explicit
+sync, later operations and the commit timer reclaim an orphan after its final
+reference; a writable mount recovers persisted orphan items after a crash.
+Drop flushes accepted changes without starting an additional cleanup transaction.
+
+The regression tests cover old/new contents, writes through an unlinked open
+file, cross-open size changes, ordinary loader-style symlinks, and crash
+recovery on the CachyOS-shaped Btrfs fixture. The syscall-level QEMU case uses
+a small writable Btrfs fixture and exercises private mmap, fd close,
+replacement, first touch, new-file mapping and final-unmap reclamation. These
+checks address the file-loading defects; physical HDMI output and a completed
+KDE session still require native verification.
 
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 

@@ -66,12 +66,12 @@ real laptop's btrfs root looks like.
   its intersected extents and preserves all other data refs/checksums. Writes are
   **Linux-interoperable**: the resulting filesystem mounts read-write on a real
   kernel and passes `btrfs check` — see below.
-- **Namespace mutations**: `create` (new empty regular file), `unlink` (freeing a
-  file's data extent + checksums on its last link, else just decrementing
+- **Namespace mutations**: `create` (new empty regular file), `unlink` (orphaning a
+  file on its last link until its open/mapping references disappear, else decrementing
   `nlink`), `mkdir` (new empty
   directory), `rmdir` (of an empty directory), `rename` (same- or
   cross-directory, of a file or directory, atomically replacing an existing target
-  — freeing a last-link target's data/checksums/xattrs, or removing just one name
+  — retaining an open last-link target's data/checksums/xattrs, or removing just one name
   and decrementing `nlink` for a hardlinked target; packed same-parent hardlink
   refs are preserved; a directory cannot move into its own subtree), `symlink`
   (target stored inline), `mknod` /
@@ -208,8 +208,11 @@ partial extent references are read, dropped by exact backref identity, and COWed
 without reclaiming other roots' data; a read-only or traversal-pinned subvolume
 returns `ReadOnly`.
 Namespace operations add, remove, link, and re-key files and directories in the
-mounted writable subvolume through the same transaction. `unlink` frees all
-data extents and checksums when the last link disappears; `rmdir` refuses a
+mounted writable subvolume through the same transaction. Last-link `unlink`
+persists a Linux orphan item; data, checksums and xattrs remain until no open
+node or mapping holds the inode. Explicit sync, subsequent operations and the
+commit timer reclaim closed orphans; writable mounts recover persisted ones.
+Every open shares the inode's metadata and size. `rmdir` refuses a
 non-empty directory with `Busy`; rename works within or across directories and
 atomically replaces supported targets. `create` + `write` therefore compose
 into a real new file and `mkdir` + `create` into a populated subdirectory.
