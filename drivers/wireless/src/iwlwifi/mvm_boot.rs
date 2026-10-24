@@ -13,6 +13,9 @@ pub enum Phase {
     PreparingChannel,
     ChannelPrepared,
     ReleasingChannel,
+    PreparingPeer,
+    PeerPrepared,
+    RemovingPeer,
     Failed,
 }
 pub struct Owner {
@@ -25,6 +28,7 @@ pub struct Owner {
     beacons: Vec<super::connection::Beacon>,
     scan: scan::ScanContext,
     channel: channel::ChannelContext,
+    peer: Option<peer::ApPeer>,
 }
 impl core::fmt::Debug for Owner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -74,6 +78,7 @@ impl Owner {
             beacons: Vec::new(),
             scan: scan::ScanContext::new(&parsed.api),
             channel: channel::ChannelContext::new(&parsed.api),
+            peer: None,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -163,3 +168,6 @@ mod scan;
 
 #[path = "mvm_channel.rs"]
 mod channel;
+
+#[path = "mvm_peer.rs"]
+mod peer;

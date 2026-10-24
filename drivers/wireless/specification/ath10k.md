@@ -117,10 +117,30 @@ packet service are not yet attached.
   yields, and credit-only or consumed terminal/MAP events are progress rather
   than receive quiescence. Already queued UNMAPs are processed before exposing
   the result; the last UNMAP clears association, and a later MAP cannot revive
-  it. The current shared plan derives peer rates from the scanned BSS; response
-  Supported Rates negotiation/downgrade remains shared MLME work before full
-  station admission. This remains a one-shot owner until disconnect/reset is
-  implemented.
+  it. The shared plan intersects response Supported/Extended Rates with the
+  original offer, preserving every beacon-mandatory basic rate. The resulting
+  negotiated set, including optional-rate downgrades, enters native PEER_ASSOC.
+  Association remains one-shot; confirmed terminal teardown does not permit
+  another join without a future full reset/generation-fencing owner.
+- `pci::disconnect_station()` retires the current prepared/associated peer and
+  stops station vdev0 through the retained `Radio`. It closes peer visibility
+  before its first await, drains stale prerequest events, submits native
+  VDEV_DOWN and PEER_DELETE, then waits for every owned sparse HTT ID to UNMAP.
+  Matching in-flight MAPs extend that ownership set; duplicate UNMAPs cannot
+  retire another ID and rebinding an owned ID to another identity fails.
+  Advertised TLV `SYNC_DELETE_CMDS` additionally requires the exact vdev0/BSSID
+  PEER_DELETE_RESP, independent of UNMAP order. Native VDEV_STOP follows only
+  after peer retirement and receive quiescence; matching VDEV_STOPPED plus a
+  second receive-quiescence check confirms terminal stop. Foreign events and
+  stale pre-STOP receipts cannot substitute for these events. A late peer MAP
+  invalidates the stop transaction. Every receive iteration yields and has a
+  deadline plus event bound. Failure, cancellation and even successful teardown
+  leave this owner closed. `StationDisconnected { bssid, frequency,
+  synchronous_delete }` reports firmware peer/vdev retirement only; all CE/HTT/
+  WMI/firmware DMA stays retained until a future whole-device reset/drain proof.
+  Teardown sends no over-air deauthentication and makes no key, carrier, PM,
+  DMA reclamation or rejoin claim. All six native WMI dialects are covered;
+  only TLV advertises the extra synchronous delete service.
 - `profile::Profile::select(device, version)` binds the PCI device ID and
   exact BMI target version to Linux's PCI firmware directory, board sizes,
   OTP parameters and clock operation. The Ubiquiti ID and QCA6164 have
@@ -285,8 +305,9 @@ permits release.
 The checked association path uses the shared secret-free JoinPlan for
 Open/WPA2-PSK legacy management and translates only validated rates, AID and
 capabilities into each native PEER_ASSOC/VDEV_UP layout. Full unmodified Linux
-C serializers generate 40 literal management/association fixtures, including
-single-rate 11B/11G and TLV padding. The accompanying generator records native
+C serializers generate 45 literal management/association fixtures, including
+single-rate 11B/11G, an eleven-rate response downgrade and TLV padding. The
+accompanying generator records native
 source SHA-256 provenance and runs independently of Rust encoders. Retained
 composition fixtures exercise actual CE3 source descriptor publication and
 completion, CE2/CE1/CE5 destination completion/copy/repost, HTC framing and
@@ -294,6 +315,16 @@ credits, WMI commands and terminal referenced-management retirement. They
 cover cancellation after native PEER_ASSOC/VDEV_UP descriptor publication,
 send errors, invalid AP capability, queued peer loss, stale remap, and a
 post-UP credit-only flood. AP association does not open a controlled port.
+
+Twenty-one further fixtures compile unmodified Linux VDEV_DOWN, PEER_DELETE
+and VDEV_STOP generators together with packed STOPPED/delete-response events,
+enum IDs, TLV tags and the synchronous-delete service bit. Native CE/HTC/WMI/
+HTT composition checks all six dialects, ACK/UNMAP ordering and sparse/in-flight
+IDs, wrong/malformed/missing receipts, stale prerequest events, duplicate UNMAP,
+owned-ID rebinding and late MAP, native command errors/cancellation and bounded
+progress floods. Original ring/firmware allocations remain retained in every
+case, including success. These fixtures establish the terminal teardown
+contract without radio or whole-device reset acceptance.
 
 ## 4. Invariants
 
@@ -378,7 +409,9 @@ The following are software work, not gates that a physical boot can close:
    current OTP/BDF/PLL/code-swap path.
 3. A retained station worker composing the native packet/event owner with
    complete WMI operation handling, higher-capacity CE service, HIF IRQ/MSI,
-   recovery and PM/teardown. HTT setup alone does not publish an interface.
+   recovery and full DMA/firmware PM/teardown. Terminal peer/vdev disconnect is
+   implemented, but it does not reset or reclaim the retained hardware owner.
+   HTT setup alone does not publish an interface.
 4. Station/runtime WMI maps beyond scan, context preparation and initial
    legacy association;
    complete HTT peer/BA/security routing,

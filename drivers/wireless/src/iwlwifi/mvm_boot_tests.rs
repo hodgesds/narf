@@ -30,6 +30,7 @@ impl Fixture {
                 phase: Phase::Starting,
                 mac: None,
                 nvm: None,
+                peer: None,
                 beacons: Vec::new(),
                 channel: super::channel::ChannelContext::new(
                     &super::super::firmware_api::FirmwareApi::default(),

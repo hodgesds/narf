@@ -1,0 +1,104 @@
+{
+  "linux_makefile": [
+    "# SPDX-License-Identifier: GPL-2.0",
+    "VERSION = 7",
+    "PATCHLEVEL = 3",
+    "SUBLEVEL = 0",
+    "EXTRAVERSION = -rc4",
+    "NAME = Baby Opossum Posse"
+  ],
+  "source_sha256": {
+    "wmi.h": "fff0e5749d68c461ed08e69060321942d68bdb050954c39b2a57c0045457106c",
+    "wmi-tlv.h": "4e399314c47c93552159a948873cb22166ab38649e6560d7fa55d21b363f1fbc",
+    "wmi.c": "68a4fedc3d0cd815c209dda9c0eb3aa3869bd3d35847c633e0c458ba53c320f4",
+    "wmi-tlv.c": "02309cad56513a1ef0975c9d73e568e343c874d35124f39111ddd26d8a75c5bb"
+  },
+  "oracle_c_sha256": "2017b65cb128cf38767c3c28a0617e6b29b5a86db224f0580b1e1af4bc6ea678",
+  "fixtures": {
+    "DOWN_MAIN": {
+      "length": 8,
+      "sha256": "27825f4f017a3216a1f790222a89d5726e2146210865b0435d51526a58ebe541"
+    },
+    "DELETE_MAIN": {
+      "length": 16,
+      "sha256": "9700763c25d706908bdb1628c2eda66d605f2a0b8910577b9b59ffe8d1905456"
+    },
+    "STOP_MAIN": {
+      "length": 8,
+      "sha256": "79acbb9f4ac2743a902bd5a21b7756c6d9557c1b79cb8fbf381c6aac3168408d"
+    },
+    "STOPPED_MAIN": {
+      "length": 8,
+      "sha256": "e1f9ba5af4170f574e194cacf71a93193470386635d135b837905fbde3e52d43"
+    },
+    "DOWN_10X": {
+      "length": 8,
+      "sha256": "a65d2901a964878c825a2e37d9323707cc510d81b1fe979ecf24774ad1a7cb8d"
+    },
+    "DELETE_10X": {
+      "length": 16,
+      "sha256": "a26d5942903499c850c0e4702a7b71bab0b0804fc025e87582dba2786394397d"
+    },
+    "STOP_10X": {
+      "length": 8,
+      "sha256": "dc1ee68f80e9eef2676806733706302e052e8d12bcea93b6e0a14617843bcb4e"
+    },
+    "STOPPED_10X": {
+      "length": 8,
+      "sha256": "881496dc82ccee880e882e57dad6281c626b6bec531f503f171aa020120027b3"
+    },
+    "DOWN_102": {
+      "length": 8,
+      "sha256": "dc1ee68f80e9eef2676806733706302e052e8d12bcea93b6e0a14617843bcb4e"
+    },
+    "DELETE_102": {
+      "length": 16,
+      "sha256": "a26d5942903499c850c0e4702a7b71bab0b0804fc025e87582dba2786394397d"
+    },
+    "STOP_102": {
+      "length": 8,
+      "sha256": "7df444bf2b58b4de0e6a5c41dd53f5415c12e5691249411c73b2b74704395b6f"
+    },
+    "STOPPED_102": {
+      "length": 8,
+      "sha256": "e7512d1d127af51b41345c008b2e0d82a5719b838c7d2b236b2bab543b3b8def"
+    },
+    "DOWN_104": {
+      "length": 8,
+      "sha256": "331d2958fe8b16eed778ac335f3596a2e2a8d4dbe8e66088ee362672618c53fd"
+    },
+    "DELETE_104": {
+      "length": 16,
+      "sha256": "cc3fed4164452049e20d8f1f094f0c6fc417f2addf9c06685dd95a450fb91ea7"
+    },
+    "STOP_104": {
+      "length": 8,
+      "sha256": "46c3ea56fb5bd07fea4a6ee9b5c9b5b8ae165f4d11fc5137cb0dc7a500fae0f0"
+    },
+    "STOPPED_104": {
+      "length": 8,
+      "sha256": "e7512d1d127af51b41345c008b2e0d82a5719b838c7d2b236b2bab543b3b8def"
+    },
+    "DOWN_TLV": {
+      "length": 12,
+      "sha256": "b42fcaae150ce53fb4dc05b6a70eeee936d8596154c34d4370f519d1f17bddc7"
+    },
+    "DELETE_TLV": {
+      "length": 20,
+      "sha256": "bce9089385618ef3bce374d7bcef0609eae01b482c42f705c20218d4c1ecd306"
+    },
+    "STOP_TLV": {
+      "length": 12,
+      "sha256": "ef59091210492746390ebe8f369f0a523d54867ebe854fb4862914535b5cfbe1"
+    },
+    "STOPPED_TLV": {
+      "length": 12,
+      "sha256": "b573fdb6b84a929297dcfaddaa1bb917ef739f61cd1975c9e1f88e8ad2049143"
+    },
+    "DELETE_RESPONSE_TLV": {
+      "length": 20,
+      "sha256": "327f65f958320c4e608b58fa1aba053baa73ec24e257ece859abb4234fa4c11c"
+    }
+  },
+  "sync_delete_service": 92
+}

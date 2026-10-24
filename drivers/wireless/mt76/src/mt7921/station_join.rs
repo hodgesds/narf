@@ -712,6 +712,7 @@ impl<B: Backend> Session<B> {
                 })
                 .await?;
 
+            self.management_rate = plan.management_rate();
             let bss_record =
                 crate::mt7921::association::bss_record(bss, true).map_err(|_| Error::Bounds)?;
             self.exchange(Command::Unified { id: 2 }, &bss_record)

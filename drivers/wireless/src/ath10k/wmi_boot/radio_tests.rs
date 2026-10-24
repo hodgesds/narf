@@ -35,6 +35,7 @@ struct RadioModel {
     mismatched: u32,
     mlme_beacon: Option<bool>,
     mlme: Option<mlme_tests::Fixture>,
+    teardown: Option<teardown_tests::Fixture>,
     ce: Option<crate::ath10k::boot::CeFixture>,
 }
 impl HostMemory for RadioModel {
@@ -224,6 +225,9 @@ impl Hif for RadioModel {
             return Err(BmiError::BadResponse);
         }
         self.sequence = self.sequence.wrapping_add(1);
+        if self.teardown.is_some() {
+            return teardown_tests::send(self, bytes).await;
+        }
         if self.mlme.is_some() {
             return mlme_tests::send(self, bytes).await;
         }
@@ -363,6 +367,7 @@ fn radio_boot_options(
         mismatched: 0,
         mlme_beacon: None,
         mlme: None,
+        teardown: None,
         ce: None,
     };
     let mut htc = Session::new(model, hardware);
@@ -622,3 +627,6 @@ use management_tests::{management_htt_send, management_send, ManagementFixture};
 
 #[path = "mlme_tests.rs"]
 mod mlme_tests;
+
+#[path = "teardown_tests.rs"]
+mod teardown_tests;

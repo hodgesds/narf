@@ -12,7 +12,7 @@ pub(super) struct Peer {
     associated: Option<StationAssociated>,
 }
 impl Peer {
-    fn mapped(&self) -> Option<u16> {
+    pub(super) fn mapped(&self) -> Option<u16> {
         self.ids
             .iter()
             .enumerate()
@@ -60,6 +60,10 @@ impl Peer {
         }
     }
 }
+
+#[path = "station_disconnect.rs"]
+mod disconnect;
+pub use disconnect::Disconnected;
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub fn associated_station(&self) -> Option<StationAssociated> {
         if self.failed {

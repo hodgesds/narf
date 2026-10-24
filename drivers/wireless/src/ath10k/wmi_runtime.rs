@@ -16,6 +16,7 @@ pub use management::{
 };
 mod mlme;
 pub use mlme::Associated as StationAssociated;
+pub use station::Disconnected as StationDisconnected;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Htt(htt::Error),

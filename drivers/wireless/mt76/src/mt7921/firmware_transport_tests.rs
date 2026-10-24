@@ -1230,8 +1230,8 @@ fn mcu_live_join_open_dispatches_auth_assoc_and_sta_record() -> TestResult {
         capability: 1, // ESS, open
         beacon_interval: 100,
         information_elements: vec![
-            0, 9, b'n', b'a', b'r', b'f', b'-', b'j', b'o', b'i', b'n', 1, 4, 0x82, 0x84, 0x8b,
-            0x96, 3, 1, 6,
+            0, 9, b'n', b'a', b'r', b'f', b'-', b'j', b'o', b'i', b'n', 1, 8, 0x82, 0x84, 0x8b,
+            0x96, 12, 24, 48, 108, 3, 1, 6,
         ],
     };
     // Packet 1: unrelated beacon
@@ -1265,6 +1265,7 @@ fn mcu_live_join_open_dispatches_auth_assoc_and_sta_record() -> TestResult {
     assoc_resp[24..26].copy_from_slice(&1u16.to_le_bytes()); // Capability: ESS
     assoc_resp[26..28].copy_from_slice(&0u16.to_le_bytes()); // Status: 0
     assoc_resp[28..30].copy_from_slice(&(42u16 | 0xc000).to_le_bytes()); // AID 42
+    assoc_resp.extend_from_slice(&[1, 4, 0x82, 0x84, 0x8b, 0x96]);
     let mut assoc_packet = vec![0u8; 32 + assoc_resp.len()];
     let len = assoc_packet.len();
     assoc_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
@@ -1305,11 +1306,19 @@ fn mcu_live_join_open_dispatches_auth_assoc_and_sta_record() -> TestResult {
     if ch_switch.is_none() {
         return TestResult::Fail("channel switch command not emitted");
     }
-    let sta_rec = frames
-        .iter()
-        .find(|(scatter, f)| !scatter && f.len() >= 48 && f[34..36] == [3, 0] && f[43] == 7);
-    if sta_rec.is_none() {
-        return TestResult::Fail("STA_REC_UPDATE not emitted");
+    // Actual unified command payload starts at48. The Open associated
+    // peer has CONN_STATE_PORT_SECURE=2 and AID42, unlike initial setup.
+    let sta_rec = frames.iter().find(|(scatter, f)| {
+        !scatter
+            && f.len() >= 168
+            && f[34..36] == [3, 0]
+            && f[43] == 7
+            && f[64] == 2
+            && f[66..68] == [42, 0]
+    });
+    match sta_rec {
+        Some((_, frame)) if frame[80..82] == [15, 0] && frame[92..94] == [15, 0] => {}
+        _ => return TestResult::Fail("native STA_REC retained optional rates removed by response"),
     }
 
     if run(session.disassociate_station()).is_err() {
@@ -1456,6 +1465,11 @@ fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult 
     assoc_resp[24..26].copy_from_slice(&0x0031u16.to_le_bytes());
     assoc_resp[26..28].copy_from_slice(&0u16.to_le_bytes());
     assoc_resp[28..30].copy_from_slice(&(42u16 | 0xc000).to_le_bytes());
+    assoc_resp.extend_from_slice(if ofdm {
+        &[1, 3, 0x8c, 0x98, 0xb0][..]
+    } else {
+        &[1, 4, 0x82, 0x84, 0x8b, 0x96][..]
+    });
     let mut assoc_packet = vec![0u8; 32 + assoc_resp.len()];
     let len = assoc_packet.len();
     assoc_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());

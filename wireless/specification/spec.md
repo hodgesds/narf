@@ -78,6 +78,17 @@ no PMK. Fragmented responses (including a final fragment with nonzero
 SequenceControl fragment number) leave the phase unchanged.
 `append_sme_ies` accepts checked optional elements before first TX;
 `legacy_rates()` returns IEEE-rate bitmaps rather than hardware indices.
+Before association those bitmaps describe the offered scan-time set. A
+successful legacy association response must contain one nonempty Supported
+Rates element (at most eight rates) and at most one nonempty Extended Supported
+Rates element. Negotiation intersects the response with the actual offer,
+preserves every beacon-mandatory basic rate and admits a new basic rate only
+if it was offered. Unknown mandatory rates/membership selectors, empty
+intersections, lost mandatory rates and mandatory CCK on 5GHz fail closed.
+Missing Basic flags retain beacon requirements. Malformed or duplicate rate
+elements fail the transaction; neither the AID nor rate bitmaps commit until
+all checks pass. A matching invalid response leaves the plan Failed and its
+old bitmaps unchanged. Response rates cannot grant PHY, key or port authority.
 `association::channel` exposes the existing 2.4/5GHz legacy 20MHz geometry.
 Drivers retain their own rate-index mapping, radio/regulatory authority,
 firmware peer records, retained supplicant, key installation and controlled

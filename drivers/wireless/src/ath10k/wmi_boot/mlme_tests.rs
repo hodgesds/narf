@@ -11,8 +11,18 @@ pub(super) struct Fixture {
     unmap: bool,
     final_progress: usize,
     fail: Option<u8>,
+    downgrade: bool,
 }
-fn expected(phase: u8, dialect: Dialect, protected: bool) -> &'static [u8] {
+fn expected(phase: u8, dialect: Dialect, protected: bool, downgrade: bool) -> &'static [u8] {
+    if phase == 2 && downgrade {
+        return match dialect {
+            Dialect::Main => DOWNGRADE_MAIN,
+            Dialect::TenOne => DOWNGRADE_10X,
+            Dialect::TenTwo | Dialect::TenTwoFour => DOWNGRADE_102,
+            Dialect::TenFour => DOWNGRADE_104,
+            Dialect::Tlv => DOWNGRADE_TLV,
+        };
+    }
     match (phase, dialect, protected) {
         (0, Dialect::Main, _) => AUTH_MAIN,
         (0, Dialect::TenOne, _) => AUTH_10X,
@@ -54,7 +64,7 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
     let bad_assoc = fixture.bad_assoc;
     let unmap = fixture.unmap;
     let dialect = m.inner.inner.dialect;
-    if phase >= 4 || bytes[8..] != *expected(phase, dialect, protected) {
+    if phase >= 4 || bytes[8..] != *expected(phase, dialect, protected, fixture.downgrade) {
         return Err(BmiError::BadResponse);
     }
     m.sent.push(bytes.to_vec());
@@ -108,6 +118,12 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
             };
             response[24..26].copy_from_slice(&capability.to_le_bytes());
             response[28..30].copy_from_slice(&0xc007u16.to_le_bytes());
+            response.extend_from_slice(&[1, 8, 0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36]);
+            response.extend_from_slice(if m.mlme.as_ref().unwrap().downgrade {
+                &[50, 3, 48, 72, 96]
+            } else {
+                &[50, 4, 48, 72, 96, 108]
+            });
         }
         let mut head = vec![
             0;
@@ -124,7 +140,7 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
         u32at(
             &mut head,
             16 + usize::from(dialect == Dialect::TenFour) * 4,
-            30,
+            response.len() as u32,
         );
         let body = if dialect == Dialect::Tlv {
             let mut b = Vec::new();
@@ -157,7 +173,11 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
     }
     Ok(())
 }
-fn prepared(version: u32, dialect: Dialect, protected: bool) -> radio::Radio<RadioModel> {
+pub(super) fn prepared(
+    version: u32,
+    dialect: Dialect,
+    protected: bool,
+) -> radio::Radio<RadioModel> {
     let features = (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 };
     let mut r = radio_boot_features(version, dialect, features);
     r.htt.wmi.htc.transport.mlme_beacon = Some(protected);
@@ -179,6 +199,7 @@ fn prepared(version: u32, dialect: Dialect, protected: bool) -> radio::Radio<Rad
         unmap: false,
         final_progress: 0,
         fail: None,
+        downgrade: false,
     });
     r
 }
@@ -229,6 +250,44 @@ fn smoke_ath10k_join_plan_auth_assoc_peer_assoc_and_vdev_up_all_native_dialects(
 kernel_test_in!(
     "drivers/wireless/ath10k/wmi-runtime",
     smoke_ath10k_join_plan_auth_assoc_peer_assoc_and_vdev_up_all_native_dialects
+);
+
+fn smoke_ath10k_assoc_response_rate_downgrade_reaches_native_peer_all_dialects() -> TestResult {
+    for (version, dialect, hardware) in [
+        (1, Dialect::Main, HwRev::Qca988x),
+        (2, Dialect::TenOne, HwRev::Qca988x),
+        (3, Dialect::TenTwo, HwRev::Qca988x),
+        (4, Dialect::Tlv, HwRev::Qca6174),
+        (5, Dialect::TenTwoFour, HwRev::Qca988x),
+        (6, Dialect::TenFour, HwRev::Qca9984),
+    ] {
+        let mut r = prepared(version, dialect, false);
+        r.htt.wmi.htc.transport.mlme.as_mut().unwrap().downgrade = true;
+        r.htt.wmi.htc.transport.ce = Some(crate::ath10k::boot::CeFixture::new(hardware));
+        if !matches!(
+            drive(r.associate_station(&station_tests::policy(), b"narf", SecurityMode::Open, &[])),
+            Poll::Ready(Ok(_))
+        ) {
+            return TestResult::Fail(
+                "native PEER_ASSOC did not use the literal AP response's eleven-rate intersection",
+            );
+        }
+        let transport = &r.htt.wmi.htc.transport;
+        let actual = &transport.sent[transport.sent.len() - 2][8..];
+        if actual != expected(2, dialect, false, true)
+            || actual == expected(2, dialect, false, false)
+            || transport.ce.as_ref().unwrap().sent != 4
+        {
+            return TestResult::Fail(
+                "AP rate downgrade bypassed exact Linux PEER_ASSOC or native CE publication",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wmi-runtime",
+    smoke_ath10k_assoc_response_rate_downgrade_reaches_native_peer_all_dialects
 );
 
 fn smoke_ath10k_join_plan_rejects_policy_or_sme_before_new_publication() -> TestResult {

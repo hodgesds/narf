@@ -190,6 +190,9 @@ impl Io for Link {
                     let mut b = mgmt(0x10, self.own);
                     b.extend_from_slice(&(if self.protected { 0x11u16 } else { 1 }).to_le_bytes());
                     b.extend_from_slice(&[0, 0, 42, 0xc0]);
+                    // This AP's beacon offers only basic1Mbps. A response
+                    // cannot make unoffered2/5.5/11Mbps mandatory.
+                    b.extend_from_slice(&[1, 1, 0x82]);
                     m.queue.push_back(b);
                     if self.protected {
                         m.queue.push_back(native(self.own, &ap_key(0x8a, 1, None)));
@@ -754,7 +757,7 @@ fn smoke_rtl8188eu_interface_uses_controlled_port_rings_and_synchronous_usb_prog
     if device.link_up() || device.connected_bssid().is_some() {
         return TestResult::Fail("unassociated native interface published carrier");
     }
-    narf_scheduler::block_on(device.associate(AssociateRequest {
+    if narf_scheduler::block_on(device.associate(AssociateRequest {
         bssid: AP,
         ssid: b"narf".to_vec(),
         frequency_mhz: 2412,
@@ -762,7 +765,10 @@ fn smoke_rtl8188eu_interface_uses_controlled_port_rings_and_synchronous_usb_prog
         security: SecurityConfig::Wpa2 { psk: PMK },
         ie: Vec::new(),
     }))
-    .unwrap();
+    .is_err()
+    {
+        return TestResult::Fail("native interface association failed before carrier admission");
+    }
     if !device.link_up() || device.connected_bssid() != Some(AP) {
         return TestResult::Fail("actual M4 delivery did not publish interface carrier");
     }

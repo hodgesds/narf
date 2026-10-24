@@ -118,6 +118,7 @@ fn smoke_shared_join_fragmented_responses_leave_phase_unchanged() -> TestResult 
         0x10, 0, 0, 0, 2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 2, 1, 0, 1, 0, 0, 0, 1,
         0xc0,
     ];
+    assoc.extend_from_slice(&[1, 4, 0x82, 0x84, 0x8b, 0x96]);
     if plan.association_response(&assoc) != Ok(None) || plan.phase() != Phase::AwaitAssociation {
         return TestResult::Fail("fragmented matching association advanced phase");
     }
@@ -132,4 +133,132 @@ fn smoke_shared_join_fragmented_responses_leave_phase_unchanged() -> TestResult 
 kernel_test_in!(
     "wireless/association",
     smoke_shared_join_fragmented_responses_leave_phase_unchanged
+);
+
+fn awaiting_association(ap: &Bss) -> JoinPlan {
+    let mut plan = JoinPlan::prepare(ap, OWN, b"narf", SecurityMode::Open).unwrap();
+    plan.start_authentication().unwrap();
+    let mut response = management(0xb0, AP, OWN);
+    response[16..22].copy_from_slice(&AP);
+    response.extend_from_slice(&[0, 0, 2, 0, 0, 0]);
+    plan.authentication_response(&response).unwrap().unwrap();
+    plan
+}
+
+fn association_reply(elements: &[u8]) -> Vec<u8> {
+    // Literal IEEE AssocResp: peer/local/BSSID, ESS, success and AID42.
+    let mut response = vec![
+        0x10, 0, 0, 0, 2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 2, 0, 0, 1, 0, 0, 0, 42,
+        0xc0,
+    ];
+    response.extend_from_slice(elements);
+    response
+}
+
+fn offered_bss() -> Bss {
+    let mut ap = bss();
+    // Basic 1/2Mbps; optional 5.5/11/6/12/24/54Mbps.
+    ap.information_elements = vec![
+        0, 4, b'n', b'a', b'r', b'f', 1, 8, 0x82, 0x84, 11, 22, 12, 24, 48, 108,
+    ];
+    ap
+}
+
+fn smoke_shared_join_response_narrows_rates_transactionally() -> TestResult {
+    let mut plan = awaiting_association(&offered_bss());
+    if plan.legacy_rates() != (0x95f, 3) {
+        return TestResult::Fail("request's literal offered rate set changed");
+    }
+    // Retain 1/2/6/24Mbps; new optional 36Mbps and unknown optional55.5
+    // were not offered and cannot broaden the firmware rate set. 24 is
+    // newly mandatory and the beacon's mandatory1/2 remain supported.
+    let response = association_reply(&[1, 5, 0x82, 0x84, 12, 72, 111, 50, 1, 0xb0]);
+    if plan.association_response(&response) != Ok(Some(42))
+        || plan.legacy_rates() != (0x113, 0x103)
+        || plan.phase() != (Phase::Associated { aid: 42 })
+    {
+        return TestResult::Fail("response did not narrow the offered rates/basic set");
+    }
+    if plan.association_response(&response) != Err(Error::Busy)
+        || plan.legacy_rates() != (0x113, 0x103)
+    {
+        return TestResult::Fail("duplicate response altered negotiated rates");
+    }
+    // Some APs omit Basic flags in the response; keep the checked beacon
+    // requirements instead of guessing a new mandatory rate.
+    let mut plan = awaiting_association(&offered_bss());
+    if plan.association_response(&association_reply(&[1, 3, 2, 4, 12])) != Ok(Some(42))
+        || plan.legacy_rates() != (0x13, 3)
+    {
+        return TestResult::Fail("response without Basic flags lost beacon requirements");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/association",
+    smoke_shared_join_response_narrows_rates_transactionally
+);
+
+fn smoke_shared_join_bad_response_rates_fail_without_committing() -> TestResult {
+    for (elements, expected) in [
+        (&[][..], Error::UnsupportedRates),
+        (&[50, 2, 0x82, 0x84], Error::UnsupportedRates),
+        (&[1, 0], Error::Protocol),
+        (&[1, 9, 2, 4, 11, 22, 12, 24, 48, 96, 108], Error::Protocol),
+        (&[1, 1, 0x82, 1, 1, 0x84], Error::Protocol),
+        (&[1, 2, 0x82, 0x84, 50, 1, 12, 50, 1, 24], Error::Protocol),
+        (&[1, 2, 0x82, 0x84, 50, 0], Error::Protocol),
+        (&[1, 2, 0x82, 0x84, 127, 3, 0], Error::Protocol),
+        (&[1, 2, 0x82, 0x84, 50], Error::Protocol),
+        (&[1, 2, 0x82, 0xfe], Error::UnsupportedRates),
+        (&[1, 1, 0x82], Error::UnsupportedRates),
+        (&[1, 2, 0x82, 0x84, 50, 1, 0xc8], Error::UnsupportedRates),
+        (&[1, 2, 0x8c, 0x98], Error::UnsupportedRates),
+        (&[1, 2, 111, 112], Error::UnsupportedRates),
+    ] {
+        let mut plan = awaiting_association(&offered_bss());
+        let offered = plan.legacy_rates();
+        if plan.association_response(&association_reply(elements)) != Err(expected)
+            || plan.phase() != Phase::Failed
+            || plan.legacy_rates() != offered
+            || plan.association_response(&association_reply(&[1, 2, 0x82, 0x84]))
+                != Err(Error::Busy)
+        {
+            return TestResult::Fail("invalid response committed rates or reopened association");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/association",
+    smoke_shared_join_bad_response_rates_fail_without_committing
+);
+
+fn smoke_shared_join_response_keeps_five_ghz_rates_in_band() -> TestResult {
+    let mut ap = bss();
+    ap.channel = 36;
+    ap.information_elements = vec![
+        0, 4, b'n', b'a', b'r', b'f', 1, 5, 0x8c, 0x98, 0xb0, 96, 108,
+    ];
+    let mut plan = awaiting_association(&ap);
+    if plan.association_response(&association_reply(&[1, 5, 0x8c, 0x98, 0xb0, 96, 2]))
+        != Ok(Some(42))
+        || plan.legacy_rates() != (0x550, 0x150)
+    {
+        return TestResult::Fail("five-GHz response rates were not intersected in band");
+    }
+    let mut plan = awaiting_association(&ap);
+    let offered = plan.legacy_rates();
+    if plan.association_response(&association_reply(&[1, 4, 0x8c, 0x98, 0xb0, 0x82]))
+        != Err(Error::UnsupportedRates)
+        || plan.phase() != Phase::Failed
+        || plan.legacy_rates() != offered
+    {
+        return TestResult::Fail("five-GHz response admitted mandatory CCK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/association",
+    smoke_shared_join_response_keeps_five_ghz_rates_in_band
 );

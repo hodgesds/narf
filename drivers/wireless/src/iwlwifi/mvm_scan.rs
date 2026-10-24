@@ -24,7 +24,7 @@ pub(super) struct ScanContext {
     smart_fifo_offload: bool,
     beacon_filter_v4: bool,
     pub(super) nvm_lar: bool,
-    ready: bool,
+    pub(super) ready: bool,
     pub(super) permissions: Option<Vec<u32>>,
 }
 impl ScanContext {
@@ -251,25 +251,7 @@ impl Owner {
         if !self.scan.ready && self.scan.dqa {
             self.hardware.command(5, 0, &[0; 4]).await?; // DQA HCMD queue0
         }
-        // The firmware can change its current profile after a successful
-        // scan (e.g. CHUB/MCC updates). Requery every operation; an earlier
-        // successful scan never turns its channel map into lasting policy.
-        if self.scan.lar && self.scan.nvm_lar {
-            let version = self.hardware.version(1, 0xc8).map(|v| v.1).unwrap_or(0);
-            let version = if version >= 8 {
-                if version != 8 {
-                    return Err("unsupported MCC API");
-                }
-                8
-            } else if self.scan.mcc_he {
-                4
-            } else {
-                3
-            };
-            let query = mcc_query(self.scan.multi_mcc);
-            let reply = self.hardware.command(1, 0xc8, &query).await?;
-            self.scan.permissions = Some(mcc_permissions(version, &reply.payload)?);
-        }
+        self.refresh_mcc().await?;
         if self.scan.ready {
             return Ok(());
         }
@@ -298,6 +280,28 @@ impl Owner {
         self.hardware.command(3, 9, &idle_link(local)).await?;
         self.hardware.command(1, 0xa9, &awake_mac_power()).await?;
         self.scan.ready = true;
+        Ok(())
+    }
+    pub(super) async fn refresh_mcc(&mut self) -> Result<(), &'static str> {
+        // The firmware can change its current profile after a successful
+        // scan (e.g. CHUB/MCC updates). Requery every operation; an earlier
+        // successful scan never turns its channel map into lasting policy.
+        if self.scan.lar && self.scan.nvm_lar {
+            let version = self.hardware.version(1, 0xc8).map(|v| v.1).unwrap_or(0);
+            let version = if version >= 8 {
+                if version != 8 {
+                    return Err("unsupported MCC API");
+                }
+                8
+            } else if self.scan.mcc_he {
+                4
+            } else {
+                3
+            };
+            let query = mcc_query(self.scan.multi_mcc);
+            let reply = self.hardware.command(1, 0xc8, &query).await?;
+            self.scan.permissions = Some(mcc_permissions(version, &reply.payload)?);
+        }
         Ok(())
     }
     async fn passive_scan_inner(

@@ -14,7 +14,7 @@
     "wmi.c": "68a4fedc3d0cd815c209dda9c0eb3aa3869bd3d35847c633e0c458ba53c320f4",
     "wmi-tlv.c": "02309cad56513a1ef0975c9d73e568e343c874d35124f39111ddd26d8a75c5bb"
   },
-  "oracle_c_sha256": "b46bec1bda7a439cb651f05a3d391db723525b5d512323621f63c46ade9a5e18",
+  "oracle_c_sha256": "d148cdadb4d2d5a8fbef0087faa52322b53f1c272060606321aa4e6c1496a9a3",
   "fixtures": {
     "AUTH_MAIN": {
       "length": 60,
@@ -175,6 +175,26 @@
     "OFDM_TLV": {
       "length": 116,
       "sha256": "3628784fa7b6405791f35e1bb8f8bd8f02e40f02d1030b67dba248ec4971a569"
+    },
+    "DOWNGRADE_MAIN": {
+      "length": 360,
+      "sha256": "a47ab09cc9ccf77119711af2149f5090f688f92a5d9f8c2f6d06650c58271525"
+    },
+    "DOWNGRADE_10X": {
+      "length": 352,
+      "sha256": "be8a75d87325cf5a239b4282a394cb0bc1712f6e31e79ef7466a21dbfc7a671f"
+    },
+    "DOWNGRADE_102": {
+      "length": 356,
+      "sha256": "e1051d179713e60a5cc3c30239c5981daa0b67c1e2053dfcd3238761310833b8"
+    },
+    "DOWNGRADE_104": {
+      "length": 360,
+      "sha256": "e580c3f681db4f738a1567c8b843ad4a674fc751c2b30648016ae3dceb72f54d"
+    },
+    "DOWNGRADE_TLV": {
+      "length": 124,
+      "sha256": "50f8865a99225d25e1b04de241b96aa6f2af16b003618c60c5bcba7f241c2385"
     }
   }
 }
