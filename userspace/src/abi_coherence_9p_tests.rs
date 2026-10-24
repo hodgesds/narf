@@ -81,7 +81,7 @@ fn with_9p(seed: &[u8], body: impl FnOnce(&Fixture) -> Result<(), &'static str>)
         let result = (|| {
             let transport =
                 narf_drivers_fs_9p::loopback::LoopbackTransport::new(&[("narf.txt", seed)]);
-            let t: Arc<dyn narf_drivers_fs_9p::session::Transport> = Arc::clone(&transport);
+            let t: Arc<dyn narf_drivers_fs_9p::session::Transport> = transport.clone();
             let volume = crate::handlers::poll_io_to_completion(
                 narf_drivers_fs_9p::volume::NinepVolume::mount(t, narf_lib::id::DomainId::DRIVER_0),
             )
