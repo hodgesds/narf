@@ -53,6 +53,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use async_trait::async_trait;
 use narf_tpm::{TpmDevice, TpmError as HighLevelTpmError, TpmInfo};
@@ -534,11 +535,19 @@ impl TpmDevice for Tpm {
 
 // ── Singleton ──────────────────────────────────────────────────────
 
-static TPM: IrqSafeSpinLock<Option<Tpm>> = IrqSafeSpinLock::new(None);
+static TPM: IrqSafeSpinLock<Option<Arc<Tpm>>> = IrqSafeSpinLock::new(None);
 
 /// Best-effort initialisation against `TPM_BASE_LOCALITY_0`. Used
 /// from the Stage::Subsys initcall — silently no-ops on hosts
 /// without a TPM.
+///
+/// On a successful probe the device is published through two handles
+/// on the SAME `Arc<Tpm>`: this crate's singleton (backing
+/// `with_tpm` / `is_present` / `kind`) and `narf_tpm::registry` —
+/// the dispatch target `frame::measure` consults for hardware PCR
+/// extends. Registration happens exactly once, on the None→Some
+/// transition guarded by the early return above, so a repeated
+/// initcall can never double-register the device.
 pub fn try_init_default() {
     if !cfg!(target_arch = "x86_64") {
         return;
@@ -550,6 +559,8 @@ pub fn try_init_default() {
     // is identity-mapped on x86_64.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     if let Ok(dev) = unsafe { Tpm::probe(TPM_BASE_LOCALITY_0) } {
+        let dev = Arc::new(dev);
+        narf_tpm::registry::register(dev.clone());
         *TPM.lock() = Some(dev);
     }
 }
@@ -563,9 +574,13 @@ pub fn kind() -> Option<TpmKind> {
 }
 
 pub fn with_tpm<R>(f: impl FnOnce(&Tpm) -> R) -> Option<R> {
-    TPM.lock().as_ref().map(f)
+    TPM.lock().as_ref().map(|t| f(t.as_ref()))
 }
 
+/// Test-only: drop the singleton handle. The `narf_tpm::registry`
+/// registration made at probe time is a second handle on the same
+/// device; fixtures that need the full no-TPM state must also call
+/// `narf_tpm::registry::__reset_for_test`.
 #[doc(hidden)]
 pub fn __reset_for_test() {
     *TPM.lock() = None;
