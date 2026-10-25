@@ -191,6 +191,34 @@ pub fn register_pci_driver() {
     }
 }
 
+/// Map a card-initialisation outcome onto the bus arbitration
+/// contract (bus spec §9.3). The PCI device is always an SD *host
+/// controller* (class 08:05); whether it belongs to this stack
+/// depends on the card behind it, which only initialisation can
+/// reveal — so the non-SDIO outcomes are declines, not failures:
+///
+/// - `NoCard`: the slot is empty. This stack has nothing to
+///   drive; declining (instead of the vacuous `Ok(())` claim this
+///   replaces) leaves the host to the storage SDHCI driver, which
+///   owns empty and memory-card hosts.
+/// - `Unsupported`: initialisation proved the inserted card is
+///   not an SDIO card — CMD5 answered with zero functions or the
+///   memory-present bit set, i.e. a memory card (see
+///   `card::Card::start`). Decline so `probe_all` falls through
+///   to the storage driver.
+///
+/// Anything else is a genuine initialisation failure on a host
+/// this stack was prepared to own: `BadDevice`, which ends the
+/// match attempts for the device.
+fn init_error_to_probe_error(e: crate::card::Error) -> narf_bus::ProbeError {
+    match e {
+        crate::card::Error::NoCard | crate::card::Error::Unsupported => {
+            narf_bus::ProbeError::NotForThisDriver
+        }
+        _ => narf_bus::ProbeError::BadDevice,
+    }
+}
+
 /// Bus-dispatch entry. No borrowed MMIO/DMA handle escapes. Initialization
 /// and callback execute without registry locks held. An unclaimed card is
 /// powered down; no network device is published by this host driver.
@@ -259,8 +287,7 @@ fn probe_claimed(
         Config::default(),
     ) {
         Ok(card) => card,
-        Err(crate::card::Error::NoCard) => return Ok(()),
-        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
+        Err(e) => return Err(init_error_to_probe_error(e)),
     };
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: "sdhci-pio".into(),
@@ -363,4 +390,30 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/sdio/native", smoke_sdhci_pci_slot_contract);
+
+    fn smoke_sdhci_init_error_maps_to_arbitration() -> TestResult {
+        // The arbitration contract (issue #824, bus spec §9.3): a
+        // host whose slot is empty or whose card proved to be a
+        // memory card is *declined*, so probe_all falls through to
+        // the storage SDHCI driver; a genuine initialisation
+        // failure on an SDIO host stays a terminal BadDevice.
+        if init_error_to_probe_error(crate::card::Error::NoCard)
+            != narf_bus::ProbeError::NotForThisDriver
+            || init_error_to_probe_error(crate::card::Error::Unsupported)
+                != narf_bus::ProbeError::NotForThisDriver
+        {
+            return TestResult::Fail("non-SDIO host was not declined to the storage driver");
+        }
+        if init_error_to_probe_error(crate::card::Error::Cis) != narf_bus::ProbeError::BadDevice
+            || init_error_to_probe_error(crate::card::Error::Response)
+                != narf_bus::ProbeError::BadDevice
+        {
+            return TestResult::Fail("genuine init failure lost its terminal BadDevice");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/sdio/native",
+        smoke_sdhci_init_error_maps_to_arbitration
+    );
 }
