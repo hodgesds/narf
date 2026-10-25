@@ -2559,6 +2559,19 @@ kernel_test_in!(
 /// Slab detachment is page-denominated and releases the class lock before the
 /// buddy/cgroup path: grow a class, detach exactly one frame, prove the lock is
 /// available, and only then free the detached frame.
+///
+/// Determinism (#898): `detach_class_frames` is best-effort by contract — a
+/// persistent per-class scan cursor plus the `SLAB_RECLAIM_SCAN_BLOCKS`
+/// latency bound mean a single call may legitimately return 0 when boot
+/// history left an un-completable candidate ahead of this scenario's frames,
+/// and every production caller tolerates that short return. Asserting
+/// exactly-one on one call is therefore only sound on a class state the
+/// scenario controls, so this smoke first parks the class's central list
+/// (free queue AND scan cursor) under its lock and drains the current CPU's
+/// magazine into live holdings. The scenario then runs against a fresh
+/// central list (see `slab_detaches_before_free_scenario`), and the parked
+/// list is restored afterwards with the scenario's leftover free blocks
+/// merged behind it — no free block is lost or duplicated.
 fn smoke_slab_shrinker_detaches_before_free() -> narf_kernel_test::TestResult {
     use core::alloc::Layout;
     use narf_kernel_test::TestResult;
@@ -2566,11 +2579,109 @@ fn smoke_slab_shrinker_detaches_before_free() -> narf_kernel_test::TestResult {
     // residency yet less trafficked than the 16 B / page-size classes.
     let c = 6usize;
     let block_size = class_size(c);
-    let n_blocks = PAGE_SIZE_USIZE / block_size;
     let layout = match Layout::from_size_align(block_size, 16) {
         Ok(l) => l,
         Err(_) => return TestResult::Fail("bad layout"),
     };
+
+    // Park the class's central list. The parked blocks stay exactly as
+    // they were — frames never freed, canaries still armed — they are
+    // simply unreachable while parked, under the same single-threaded
+    // harness quiescence the sibling magazine smokes already assume.
+    let mut parked = {
+        let mut guard = CLASSES[c].head.lock();
+        core::mem::replace(&mut *guard, CentralList::new())
+    };
+
+    // Drain the current CPU's magazine into live holdings, so no stale
+    // block can be handed to the scenario and later sit at the head of
+    // its central list with its frame's siblings elsewhere. Bounded by
+    // MAG_SIZE: while `top > 0` an alloc can only pop the magazine.
+    // The drained blocks are freed last, after the restore.
+    let cpu = current_cpu();
+    let mut drained: [Option<NonNull<u8>>; MAG_SIZE] = [None; MAG_SIZE];
+    let mut drained_len = 0usize;
+    let mut drain_failed = false;
+    while _test_magazine_top(c, cpu) > 0 {
+        if drained_len >= MAG_SIZE {
+            drain_failed = true;
+            break;
+        }
+        match alloc(layout) {
+            Ok(p) => {
+                drained[drained_len] = Some(p);
+                drained_len += 1;
+            }
+            Err(_) => {
+                drain_failed = true;
+                break;
+            }
+        }
+    }
+
+    let result = if drain_failed {
+        TestResult::Fail("magazine drain alloc failed")
+    } else {
+        slab_detaches_before_free_scenario(c, layout)
+    };
+
+    // Restore. First return any candidate blocks the scenario's scan is
+    // still holding to its queue — the same re-queue `detach_class_frames`
+    // performs when a snapshot drains — then merge the scenario's
+    // leftover queue behind the parked queue and put the parked list
+    // back. The parked scan cursor and its `remaining` snapshot count
+    // are untouched: appended blocks join behind a snapshot exactly as
+    // ordinary frees do, so a parked candidate resumes against the same
+    // finite snapshot it had before the scenario ran.
+    let mut current = {
+        let mut guard = CLASSES[c].head.lock();
+        core::mem::replace(&mut *guard, CentralList::new())
+    };
+    if current.scan.active {
+        let head = current.scan.pending_head;
+        let tail = current.scan.pending_tail;
+        let count = current.scan.pending_count;
+        current.scan.clear();
+        // SAFETY: the scan exclusively owns this chain; every node is a
+        // free scenario block being returned to the queue.
+        unsafe { current.append_chain(head, tail, count) };
+    }
+    // SAFETY: `current`'s chain is a valid class-`c` free-block chain,
+    // exclusively owned here; appending preserves each block once.
+    unsafe { parked.append_chain(current.head, current.tail, current.len) };
+    {
+        let mut guard = CLASSES[c].head.lock();
+        *guard = parked;
+    }
+
+    // Only now free the drained magazine blocks: they re-enter the class
+    // through the ordinary paths, on top of the restored state.
+    for p in drained.iter().flatten() {
+        // SAFETY: allocated above with `layout` and held live since.
+        unsafe { dealloc(*p, layout) };
+    }
+    result
+}
+
+/// The detach-before-free scenario, run by
+/// `smoke_slab_shrinker_detaches_before_free` on class state it
+/// controls: the central list is empty with an inactive scan and the
+/// current CPU's magazine is empty. Under that precondition the 128
+/// allocations grow fresh frames in order (each frame's four blocks are
+/// handed out consecutively) and the 128 frees spill onto the central
+/// list in the same order — all but the magazine's final 16 — so the
+/// queue head is a scenario frame whose siblings sit adjacent behind
+/// it. The single measured detach must complete exactly that frame,
+/// four pops into a 2,048-pop budget; `detached == 0` is unreachable
+/// unless the detach path itself is broken, which is the assertion's
+/// point.
+fn slab_detaches_before_free_scenario(
+    c: usize,
+    layout: core::alloc::Layout,
+) -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let block_size = class_size(c);
+    let n_blocks = PAGE_SIZE_USIZE / block_size;
     const M: usize = 128;
     let mut ptrs: [Option<NonNull<u8>>; M] = [None; M];
     for slot in ptrs.iter_mut() {
