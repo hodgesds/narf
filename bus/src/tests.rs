@@ -2885,7 +2885,7 @@ fn smoke_pci_probe_all_sdhci_arbitration() -> TestResult {
 }
 kernel_test_in!("bus", smoke_pci_probe_all_sdhci_arbitration);
 
-// ── Remove hooks + detach (bus spec §9.5) ────────────────────────
+// ── Remove hooks + detach (bus spec §9.6) ────────────────────────
 //
 // probe_all records every binding it makes; `detach` drops the
 // record and invokes the bound driver's registered remove hook with
@@ -3010,3 +3010,217 @@ fn smoke_pci_detach_runs_remove_hook() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus", smoke_pci_detach_runs_remove_hook);
+
+
+// ---------------------------------------------------------------------------
+// VMD child-binding fixture (issue #933). The real shape this
+// mirrors: the Intel VMD bridge sits in the boot-time device list;
+// its probe enumerates the functions behind the bridge and appends
+// them to the registry under a synthetic segment
+// (`VMD_SEGMENT_BASE` = 0x8000) — from inside `probe_all`'s own
+// walk. Before the fix, `probe_all` iterated a snapshot taken
+// before the walk started, so the appended children were never
+// attempted and a VMD-mode machine's storage never bound. The
+// fixture pins bus spec §9.5: the walk observes mid-walk appends,
+// attempts every device exactly once, and attempts children only
+// after the bridge that appended them.
+
+/// Attempt-order tickets + per-probe attempt counters for the
+/// mirror probes below.
+static APPEND_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static APPEND_BRIDGE_TICKET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static APPEND_BRIDGE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static APPEND_NVME_TICKET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static APPEND_NVME_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static APPEND_AHCI_TICKET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static APPEND_AHCI_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static APPEND_NIC_TICKET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static APPEND_NIC_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn append_ticket(ticket: &core::sync::atomic::AtomicU32, calls: &core::sync::atomic::AtomicU32) {
+    use core::sync::atomic::Ordering;
+    calls.fetch_add(1, Ordering::SeqCst);
+    ticket.store(
+        APPEND_SEQ.fetch_add(1, Ordering::SeqCst) + 1,
+        Ordering::SeqCst,
+    );
+}
+
+/// Synthetic PCIe function. `cfg_phys` is never dereferenced: the
+/// mirror probes are pure, and `claim_device_cap` is a registry
+/// lookup.
+fn synthetic_pcie(
+    segment: u16,
+    device: u8,
+    vendor: u16,
+    device_id: u16,
+    class: u32,
+) -> crate::BusDevice {
+    let addr = crate::addr::PcieAddr::new(segment, 0, device, 0);
+    crate::BusDevice {
+        addr: crate::addr::BusAddr::Pcie(addr),
+        id: crate::DeviceId {
+            vendor,
+            device: device_id,
+            class,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: crate::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    }
+}
+
+/// Mirror of the VMD probe's registry effect: bind the bridge and
+/// append its enumerated children — an NVMe function and an AHCI
+/// function under the synthetic VMD segment — from inside the
+/// walk, exactly as `vmd::Vmd::install_children` does through
+/// `append_devices`.
+fn append_bridge_probe(
+    _device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::driver_match::ProbeError> {
+    append_ticket(&APPEND_BRIDGE_TICKET, &APPEND_BRIDGE_CALLS);
+    crate::registry::append_devices(alloc::vec![
+        synthetic_pcie(0x8000, 0, 0x144d, 0xa808, 0x010802),
+        synthetic_pcie(0x8000, 1, 0x8086, 0x2822, 0x010601),
+    ]);
+    Ok(())
+}
+
+fn append_nvme_probe(
+    _device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::driver_match::ProbeError> {
+    append_ticket(&APPEND_NVME_TICKET, &APPEND_NVME_CALLS);
+    Ok(())
+}
+
+fn append_ahci_probe(
+    _device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::driver_match::ProbeError> {
+    append_ticket(&APPEND_AHCI_TICKET, &APPEND_AHCI_CALLS);
+    Ok(())
+}
+
+fn append_nic_probe(
+    _device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::driver_match::ProbeError> {
+    append_ticket(&APPEND_NIC_TICKET, &APPEND_NIC_CALLS);
+    Ok(())
+}
+
+fn smoke_pci_probe_all_binds_appended_children() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    use crate::driver_match::{__reset_for_test, probe_all, MatchKind, PciMatch};
+    use crate::registry::{bootstrap_registry_authority, install};
+
+    let _restore = RegistryRestore::capture();
+
+    for s in [
+        &APPEND_SEQ,
+        &APPEND_BRIDGE_TICKET,
+        &APPEND_BRIDGE_CALLS,
+        &APPEND_NVME_TICKET,
+        &APPEND_NVME_CALLS,
+        &APPEND_AHCI_TICKET,
+        &APPEND_AHCI_CALLS,
+        &APPEND_NIC_TICKET,
+        &APPEND_NIC_CALLS,
+    ] {
+        s.store(0, Ordering::SeqCst);
+    }
+
+    // Hermetic match table mirroring the real registrations: the
+    // VMD bridge by exact (vendor, device), the children by the
+    // full class triples the NVMe / AHCI drivers register, and a
+    // class backstop for the pre-existing NIC.
+    __reset_for_test();
+    crate::driver_match::register(PciMatch {
+        name: "append-vmd-bridge",
+        kind: MatchKind::VendorDevice {
+            vendor: 0x8086,
+            device: 0x9A0B,
+        },
+        probe: append_bridge_probe,
+    });
+    crate::driver_match::register(PciMatch {
+        name: "append-child-nvme",
+        kind: MatchKind::ClassFull {
+            class: 0x01,
+            subclass: 0x08,
+            prog_if: 0x02,
+        },
+        probe: append_nvme_probe,
+    });
+    crate::driver_match::register(PciMatch {
+        name: "append-child-ahci",
+        kind: MatchKind::ClassFull {
+            class: 0x01,
+            subclass: 0x06,
+            prog_if: 0x01,
+        },
+        probe: append_ahci_probe,
+    });
+    crate::driver_match::register(PciMatch {
+        name: "append-plain-nic",
+        kind: MatchKind::Class {
+            class: 0x02,
+            mask: 0xFF,
+        },
+        probe: append_nic_probe,
+    });
+
+    // Boot-time device list: the VMD bridge (class 0x010400, its
+    // usual 00:1c.0 seat) and one ordinary NIC behind it in
+    // registry order. The children are NOT here — the bridge's
+    // probe appends them mid-walk.
+    install(alloc::vec![
+        synthetic_pcie(0, 28, 0x8086, 0x9A0B, 0x010400),
+        synthetic_pcie(0, 29, 0x8086, 0x10d3, 0x020000),
+    ]);
+
+    let authority = bootstrap_registry_authority();
+    let bound = match probe_all(&authority) {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("probe_all lost the bootstrap authority"),
+    };
+
+    // The pre-fix walk bound only the two devices in its snapshot
+    // (bound == 2, child attempt counters 0).
+    if bound != 4 {
+        return TestResult::Fail(
+            "walk must bind bridge + pre-existing device + both appended children",
+        );
+    }
+    for (calls, msg) in [
+        (&APPEND_BRIDGE_CALLS, "bridge probe attempted != 1 time"),
+        (&APPEND_NIC_CALLS, "pre-existing device attempted != 1 time"),
+        (
+            &APPEND_NVME_CALLS,
+            "appended NVMe child attempted != 1 time",
+        ),
+        (
+            &APPEND_AHCI_CALLS,
+            "appended AHCI child attempted != 1 time",
+        ),
+    ] {
+        if calls.load(Ordering::SeqCst) != 1 {
+            return TestResult::Fail(msg);
+        }
+    }
+    let bridge_ticket = APPEND_BRIDGE_TICKET.load(Ordering::SeqCst);
+    if bridge_ticket == 0
+        || APPEND_NVME_TICKET.load(Ordering::SeqCst) <= bridge_ticket
+        || APPEND_AHCI_TICKET.load(Ordering::SeqCst) <= bridge_ticket
+    {
+        return TestResult::Fail("appended children attempted before the bridge probe ran");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_pci_probe_all_binds_appended_children);

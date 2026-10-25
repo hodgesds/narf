@@ -5,9 +5,10 @@
 //! a standard PCIe ECAM region. Every discovered function gets pushed
 //! into the global `narf-bus` registry tagged with a synthetic
 //! `segment` so its (B, D, F) key cannot collide with the host
-//! PCIe domain. From there, existing drivers (NVMe, etc.) can be
-//! bound by a later `probe_all_pci` pass — but Stage-0 stops at
-//! enumerate + log; no child probe is triggered from here.
+//! PCIe domain. From there, existing drivers (NVMe, etc.) bind
+//! to the children through the same `probe_all_pci` walk that
+//! probed this bridge: the walk observes mid-walk appends
+//! (bus spec §9.5, issue #933).
 //!
 //! Spec / reference: Linux `drivers/pci/controller/vmd.c`. The pieces
 //! we reproduce are the PCI ID table (vmd_ids[]), the `VMD_CFGBAR`
@@ -41,9 +42,13 @@
 //!   restricts to 0-127 / 128-255 / 224-255 on certain SKUs. The
 //!   BAR0 walk on Stage-0 simply scans every bus the BAR size
 //!   accounts for, so it's tolerant of the restriction.
-//! - Child probe re-trigger. The user wants Stage-0 to stop at
-//!   "log how many children we found"; binding NVMe to them is the
-//!   next stage and needs VMD-domain addressing in `read_bar` etc.
+//! - Child config addressing is *not* deferred: config-space
+//!   access resolves through each child's `cfg_phys`, which the
+//!   enumeration captured inside this CFGBAR window, so
+//!   `set_command` / `read_bar` on a child already land in
+//!   VMD-domain config space. (Binding itself was the missing
+//!   piece — the `probe_all` walk never saw the appended
+//!   children until bus spec §9.5 / issue #933.)
 
 use core::sync::atomic::{AtomicU32, Ordering};
 

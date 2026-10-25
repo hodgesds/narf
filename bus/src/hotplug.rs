@@ -137,7 +137,7 @@ pub fn __clear_listeners() {
 //   * On `Detach`: routes the detach through
 //     `driver_match::detach`, which clears the binding record for
 //     that address and invokes the bound driver's registered remove
-//     hook (bus spec §9.5) so the driver tears the device down.
+//     hook (bus spec §9.6) so the driver tears the device down.
 //
 // Real PCIe hot-plug ISRs (Attention Button / Presence Detect
 // Changed at the bridge) wire into `dispatch_event` once the Stage-4
@@ -162,7 +162,7 @@ impl HotplugListener for DefaultDispatcher {
                 // Route the detach to the driver that bound the
                 // device: `driver_match::detach` drops the binding
                 // record `probe_all` made and invokes the driver's
-                // registered remove hook (bus spec §9.5) — NVMe's
+                // registered remove hook (bus spec §9.6) — NVMe's
                 // hook tears its controller down. The separate
                 // `narf_drivers::BoundDriver` inventory (vendor/device
                 // pairs, no bus coordinate) is still not reaped here;
