@@ -84,6 +84,16 @@ impl Fake {
     }
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model executes the submitted packets synchronously in
+        // write() (the RB_WPTR store), so the IB proof and the trap
+        // completion both sample done on the first poll. A wait still
+        // incomplete after sixteen polls is a designed non-completion
+        // (complete = false) whose outcome is the timeout — reached by
+        // count instead of burning the wall-clock deadline under the
+        // spin executor (#879).
+        Some(16)
+    }
     async fn reset_delay(&mut self) {
         narf_scheduler::yield_now().await;
     }

@@ -126,6 +126,12 @@ trait Io {
     fn write(&mut self, address: u64, value: u32);
     fn read_memory(&mut self, map: MmioRegion, offset: u64) -> u32;
     fn write_memory(&mut self, map: MmioRegion, offset: u64, value: u32);
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
     /// Hardware reset settling time. Models may yield deterministically so
     /// cancellation tests need not win a 50-us scheduling window under QEMU.
     async fn reset_delay(&mut self) {
@@ -393,6 +399,8 @@ impl<I: Io> Engine<I> {
         })?;
         // linux: n/a (AMDGPU_IB_TEST_TIMEOUT-style 1 s NARF bound)
         let deadline = narf_time::Deadline::after_ms(1000);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let proof = self.access(|io| {
                 invalidate(io, l);
@@ -421,6 +429,15 @@ impl<I: Io> Engine<I> {
             })?;
             if let Some(proof) = proof {
                 return Ok(proof);
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);
@@ -465,6 +482,8 @@ impl<I: Io> Engine<I> {
             Ok(())
         })?;
         let deadline = narf_time::Deadline::after_ms(100); // linux: n/a (NARF bound)
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let done = self.access(|io| {
                 invalidate(io, l);
@@ -475,6 +494,15 @@ impl<I: Io> Engine<I> {
             })?;
             if done {
                 return Ok(());
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);

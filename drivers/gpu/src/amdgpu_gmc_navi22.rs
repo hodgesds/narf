@@ -172,6 +172,12 @@ impl Layout {
 trait Io {
     fn read(&mut self, address: u64) -> u32;
     fn write(&mut self, address: u64, value: u32);
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
     fn memory(&mut self, map: MmioRegion, offset: u64, value: u32);
     /// One 64-bit BAR store (Linux `amdgpu_gmc_set_pte_pde` uses writeq), so
     /// the GPU never observes a torn PTE/PDE.
@@ -458,9 +464,20 @@ impl<I: Io> Engine<I> {
     }
     async fn wait(&mut self, address: u64, mask: u32) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_ms(100); // linux: n/a (adev->usec_timeout 100 ms)
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             if self.access(|io| checked(io.read(address)))? & mask == mask {
                 return Ok(());
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);

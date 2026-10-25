@@ -15,6 +15,16 @@ pub(super) struct Fake {
     pub(super) stores: usize,
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model presets the semaphore to acquired and acknowledges
+        // an invalidate request synchronously in write(), so both TLB
+        // waits complete on the first read. A wait still incomplete
+        // after sixteen polls is a designed non-completion (a stalled
+        // register) whose outcome is the timeout — reached by count
+        // instead of burning the wall-clock deadline under the spin
+        // executor (#879).
+        Some(16)
+    }
     fn read(&mut self, address: u64) -> u32 {
         if self.stall == Some(address) {
             0
