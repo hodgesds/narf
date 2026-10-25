@@ -179,7 +179,8 @@ Warm → 128, Critical → 255) drives every registered `CoolingDevice`
 inline on a band crossing.
 
 ```rust
-pub fn init();   // create registry + install StepPolicy; idempotent
+pub fn init();   // create registry + install StepPolicy; safe to call
+                 // more than once — re-init clears the zone tables
 pub fn register_zone(cap: &Cap<Thermal, Grant>, name: &str,
                      warn_milli: i32, crit_milli: i32)
     -> Result<u32, ThermalError>;
@@ -195,7 +196,7 @@ pub fn subscribe(reg: &Cap<TopicRegistry, Read>)
 pub fn install_active_cooling<P: CoolingPolicy>(
     cap: &Cap<Thermal, Grant>, policy: P) -> Result<(), ThermalError>;
 
-pub trait CoolingDevice: Send + Sync {
+pub trait CoolingDevice: Send + Sync + core::fmt::Debug {
     fn name(&self) -> &'static str;
     fn set_level(&self, level: u8);   // 0 = off, 255 = max
 }

@@ -154,7 +154,8 @@ pub fn init() {
                 let _ = writeln!(
                     narf_console::Writer,
                     "  acpi-fan: {} discovered but cooling-device registration failed: {:?}",
-                    label, e
+                    label,
+                    e
                 );
             }
         }

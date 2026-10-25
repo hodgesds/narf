@@ -447,7 +447,8 @@ pub fn register_with_generic_registry(cap: &Cap<generic::Thermal, Grant>) -> usi
         let _ = writeln!(
             narf_console::Writer,
             "  acpi-thermal: zone {} failed to register with the generic registry: {:?}",
-            path, e
+            path,
+            e
         );
     }
     newly_registered

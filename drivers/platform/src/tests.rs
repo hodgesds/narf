@@ -372,11 +372,11 @@ fn smoke_thermal_loop_end_to_end() -> TestResult {
     // producers first), registration in a real boot fails
     // NotInitialised and the loop is dead.
     let postcore = narf_init::registered_names(narf_init::Stage::PostCore);
-    if !postcore.iter().any(|n| *n == "thermal-registry") {
+    if !postcore.contains(&"thermal-registry") {
         return TestResult::Fail("thermal-registry initcall missing at Stage::PostCore");
     }
     let subsys = narf_init::registered_names(narf_init::Stage::Subsys);
-    if subsys.iter().any(|n| *n == "thermal-registry") {
+    if subsys.contains(&"thermal-registry") {
         return TestResult::Fail("thermal-registry must not sit at Stage::Subsys");
     }
 
