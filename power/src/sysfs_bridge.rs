@@ -25,10 +25,13 @@
 //!   `read()` syscall — no per-bridge cache, matching Linux's lazy
 //!   generation in `power_supply_show_property`.
 //! - For cooling devices the current level is stored in an
-//!   `IrqSafeSpinLock<u64>` inside `CoolingDeviceNode` (writes via
-//!   `cur_state_store`-equivalent are modelled in the test harness;
-//!   sysfs `write` is still `ReadOnly` on the VFS layer per NARF
-//!   Wave-19 scope).
+//!   `IrqSafeSpinLock<u64>` inside `CoolingDeviceNode`; its
+//!   `cur_state_store`-equivalent is still modelled in the test
+//!   harness only — the attr is registered read-only here, so a
+//!   userspace write gets `ReadOnly`. (The VFS layer itself has
+//!   dispatched writes to registered store fns since the sysfs
+//!   store path landed in `narf_filesystem::sysfs`; this bridge's
+//!   one production store today is `/sys/power/state`, below.)
 //! - `mode` is always "enabled\n" (NARF has no runtime thermal-zone
 //!   disable; modelling the flag is deferred).
 //!
@@ -48,7 +51,10 @@ use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
+use narf_filesystem::sysfs::{
+    class_device_register, class_register, get_or_create_child, get_root, kobject_add_attr,
+    kobject_add_writable_attr,
+};
 
 use crate::ac::AcAdapter;
 use crate::acpi_thermal::{ThermalTripPoints, ThermalZone};
@@ -564,6 +570,80 @@ pub fn register_ec_sysfs() {
     });
 }
 
+// ── /sys/power/state ──────────────────────────────────────────────────
+//
+// Linux ref: `kernel/power/main.c` — the `power` kobj at the sysfs
+// root with a writable `state` attr (`state_show` / `state_store`).
+// This is the userspace suspend trigger: before it, nothing in
+// userspace could request a sleep transition at all.
+//
+// Access control is the file itself: like every writable sysfs
+// attr, `state` is reported root-owned 0644 by the generic sysfs
+// FileOps, and for a path-reachable file that mode/ownership pair
+// IS the access decision (see the `Mode::FILE_RW` note in
+// narf-filesystem) — the same discipline as Linux's root-owned
+// /sys/power/state, and the analogue of the reboot handler's
+// CAP_SYS_BOOT gate for this surface. The store therefore does not
+// (and, receiving only bytes, cannot) re-check credentials; it
+// validates the request and forwards it to the policy path via
+// `crate::sleep_request`.
+
+/// `state_show`: the sleep states this platform actually supports,
+/// space-separated, newline-terminated — `freeze` when s2idle is
+/// available, `mem` when S3 parses. Nothing else is ever listed:
+/// an unsupported state must not be writable either (see store).
+fn power_state_show() -> String {
+    let mut out = String::new();
+    if crate::s2idle::s2idle_supported() {
+        out.push_str(crate::sleep_request::SleepState::Freeze.name());
+    }
+    if crate::suspend::s3_supported() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(crate::sleep_request::SleepState::Mem.name());
+    }
+    out.push('\n');
+    out
+}
+
+/// `state_store`: parse the first whitespace-delimited token and
+/// queue the corresponding sleep request with the policy path.
+///
+/// Errors mirror Linux: unknown or unsupported state → `EINVAL`
+/// (`InvalidData`); no policy consumer installed → `ENODEV`
+/// (`NoDevice`); consumer refusal → `EPERM`
+/// (`OperationNotPermitted`). A successful write means the request
+/// was *queued* — execution is the policy executor's, under its
+/// own capability (see `crate::sleep_request` module docs for why
+/// the write does not block until resume as Linux's does).
+fn power_state_store(data: &[u8]) -> Result<(), narf_filesystem::FsError> {
+    use crate::sleep_request::{request_sleep, SleepRequestError, SleepState};
+    use narf_filesystem::FsError;
+
+    let text = core::str::from_utf8(data).map_err(|_| FsError::InvalidData)?;
+    let token = text.split_whitespace().next().ok_or(FsError::InvalidData)?;
+    let state = SleepState::parse(token).ok_or(FsError::InvalidData)?;
+    if !state.supported() {
+        return Err(FsError::InvalidData);
+    }
+    match request_sleep(state) {
+        Ok(()) => Ok(()),
+        Err(SleepRequestError::NoConsumer) => Err(FsError::NoDevice),
+        Err(SleepRequestError::Refused) => Err(FsError::OperationNotPermitted),
+    }
+}
+
+/// Register `/sys/power/state`. Called from
+/// [`populate_power_supply_and_thermal`] so the existing Stage::Late
+/// "power-sysfs-bridge" initcall remains the single population
+/// entry for everything in this module.
+pub fn populate_power_state() {
+    let root = get_root();
+    let power = get_or_create_child(&root, "power");
+    kobject_add_writable_attr(&power, "state", power_state_show, power_state_store);
+}
+
 // ── Top-level populate ────────────────────────────────────────────────
 
 /// Discover and register all ACPI batteries, AC adapters, and thermal
@@ -592,6 +672,10 @@ pub fn populate_power_supply_and_thermal() {
 
     // EC debug surface: /sys/class/ec/ec0/
     register_ec_sysfs();
+
+    // Userspace suspend trigger: /sys/power/state (not a class
+    // tree — a top-level `power` kobject, as in Linux).
+    populate_power_state();
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -1057,4 +1141,178 @@ mod tests {
         }
     }
     kernel_test_in!("power/sysfs_bridge", smoke_sysfs_ec_state_attr_format);
+
+    // ── /sys/power/state ─────────────────────────────────────────
+    //
+    // The hook is a plain fn pointer, so the recording state lives
+    // in statics: call count + last state + a mode flag (accept /
+    // refuse).
+
+    static STATE_HOOK_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static STATE_HOOK_LAST: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    static STATE_HOOK_REFUSE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    fn recording_sleep_hook(
+        state: crate::sleep_request::SleepState,
+    ) -> Result<(), crate::sleep_request::SleepRequestError> {
+        STATE_HOOK_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        STATE_HOOK_LAST.store(
+            match state {
+                crate::sleep_request::SleepState::Freeze => 1,
+                crate::sleep_request::SleepState::Mem => 2,
+            },
+            core::sync::atomic::Ordering::SeqCst,
+        );
+        if STATE_HOOK_REFUSE.load(core::sync::atomic::Ordering::SeqCst) {
+            Err(crate::sleep_request::SleepRequestError::Refused)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn power_state_fixture_reset() {
+        __reset_for_test();
+        crate::sleep_request::__test_reset_sleep_request_hook();
+        STATE_HOOK_CALLS.store(0, core::sync::atomic::Ordering::SeqCst);
+        STATE_HOOK_LAST.store(0, core::sync::atomic::Ordering::SeqCst);
+        STATE_HOOK_REFUSE.store(false, core::sync::atomic::Ordering::SeqCst);
+        populate_power_state();
+    }
+
+    fn power_state_kobj() -> Option<Arc<narf_filesystem::sysfs::Kobject>> {
+        get_root().get_child("power")
+    }
+
+    fn smoke_sysfs_power_state_show_lists_supported() -> TestResult {
+        power_state_fixture_reset();
+        let kobj = match power_state_kobj() {
+            Some(k) => k,
+            None => return TestResult::Fail("/sys/power kobject missing after populate"),
+        };
+        // The show list is composed from the same support queries
+        // the store enforces — build the expectation from them so
+        // the fixture tracks the platform instead of hardcoding it.
+        let mut expected = String::new();
+        if crate::s2idle::s2idle_supported() {
+            expected.push_str("freeze");
+        }
+        if crate::suspend::s3_supported() {
+            if !expected.is_empty() {
+                expected.push(' ');
+            }
+            expected.push_str("mem");
+        }
+        expected.push('\n');
+        match kobj.attr_show("state") {
+            Some(s) if s == expected => TestResult::Pass,
+            _ => TestResult::Fail("/sys/power/state show does not match supported states"),
+        }
+    }
+    kernel_test_in!(
+        "power/sysfs_bridge",
+        smoke_sysfs_power_state_show_lists_supported
+    );
+
+    fn smoke_sysfs_power_state_store_reaches_policy_hook() -> TestResult {
+        power_state_fixture_reset();
+        crate::sleep_request::set_sleep_request_hook(recording_sleep_hook);
+        let kobj = match power_state_kobj() {
+            Some(k) => k,
+            None => return TestResult::Fail("/sys/power kobject missing after populate"),
+        };
+        // Store whichever state this platform supports (freeze
+        // where s2idle is offered, else mem). Where neither is
+        // supported — the aarch64 harness, where freeze is gated
+        // off until a wake source exists (#868) and S3 does not
+        // parse — there is no positive store to exercise; that
+        // refusal side is pinned by the refusals fixture instead.
+        let (bytes, want_last): (&[u8], u8) = if crate::s2idle::s2idle_supported() {
+            (b"freeze\n", 1)
+        } else if crate::suspend::s3_supported() {
+            (b"mem\n", 2)
+        } else {
+            return TestResult::Skip("no supported sleep state on this platform");
+        };
+        match kobj.attr_store("state", bytes) {
+            Some(Ok(())) => {}
+            _ => return TestResult::Fail("store of a supported state was refused"),
+        }
+        if STATE_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst) != 1
+            || STATE_HOOK_LAST.load(core::sync::atomic::Ordering::SeqCst) != want_last
+        {
+            return TestResult::Fail("sleep request did not reach the policy hook as stored");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "power/sysfs_bridge",
+        smoke_sysfs_power_state_store_reaches_policy_hook
+    );
+
+    fn smoke_sysfs_power_state_store_refusals() -> TestResult {
+        use narf_filesystem::FsError;
+
+        power_state_fixture_reset();
+        let kobj = match power_state_kobj() {
+            Some(k) => k,
+            None => return TestResult::Fail("/sys/power kobject missing after populate"),
+        };
+        // No consumer installed: a supported state's request must
+        // be refused (ENODEV), never silently dropped. Where freeze
+        // itself is unsupported (aarch64 until a wake source lands,
+        // #868) the same write is refused one step earlier, as
+        // EINVAL — unsupported is checked before consumer presence.
+        if crate::s2idle::s2idle_supported() {
+            match kobj.attr_store("state", b"freeze") {
+                Some(Err(FsError::NoDevice)) => {}
+                _ => return TestResult::Fail("unwired store was not refused with NoDevice"),
+            }
+        } else {
+            match kobj.attr_store("state", b"freeze") {
+                Some(Err(FsError::InvalidData)) => {}
+                _ => {
+                    return TestResult::Fail("unsupported freeze was not refused with InvalidData")
+                }
+            }
+        }
+        // Garbage and empty writes are EINVAL even with a consumer.
+        crate::sleep_request::set_sleep_request_hook(recording_sleep_hook);
+        match kobj.attr_store("state", b"bogus\n") {
+            Some(Err(FsError::InvalidData)) => {}
+            _ => return TestResult::Fail("garbage state was not refused with InvalidData"),
+        }
+        match kobj.attr_store("state", b"") {
+            Some(Err(FsError::InvalidData)) => {}
+            _ => return TestResult::Fail("empty store was not refused with InvalidData"),
+        }
+        // An unsupported state is EINVAL and never reaches the hook.
+        if !crate::suspend::s3_supported() {
+            match kobj.attr_store("state", b"mem") {
+                Some(Err(FsError::InvalidData)) => {}
+                _ => return TestResult::Fail("unsupported mem was not refused with InvalidData"),
+            }
+            if STATE_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst) != 0 {
+                return TestResult::Fail("refused stores reached the policy hook");
+            }
+        }
+        // A policy refusal propagates as EPERM. (Reachable only
+        // through a supported state; in this harness that is
+        // freeze on x86_64 — on aarch64 the unsupported-write
+        // refusal above already pinned the freeze path.)
+        if crate::s2idle::s2idle_supported() {
+            STATE_HOOK_REFUSE.store(true, core::sync::atomic::Ordering::SeqCst);
+            match kobj.attr_store("state", b"freeze") {
+                Some(Err(FsError::OperationNotPermitted)) => {}
+                _ => {
+                    return TestResult::Fail(
+                        "policy refusal was not mapped to OperationNotPermitted",
+                    )
+                }
+            }
+        }
+        crate::sleep_request::__test_reset_sleep_request_hook();
+        TestResult::Pass
+    }
+    kernel_test_in!("power/sysfs_bridge", smoke_sysfs_power_state_store_refusals);
 }

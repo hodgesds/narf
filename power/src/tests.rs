@@ -445,6 +445,377 @@ fn smoke_s3_suspend_unarmed_walks_phases() -> TestResult {
 }
 kernel_test_in!("power/suspend", smoke_s3_suspend_unarmed_walks_phases);
 
+// ── s2idle fixtures ─────────────────────────────────────────────────
+//
+// The park-step hook is what makes a synchronous harness able to
+// model "a wake source fires while the CPU is parked": the hook
+// runs inside the park loop, on the parked task, once per halt.
+
+static S2IDLE_DEV_SUSPENDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S2IDLE_DEV_RESUMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S2IDLE_HOOK_STEPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S2IDLE_HOOK_PHASE_MASK: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static S2IDLE_HOOK_REENTRANT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+fn s2idle_counting_suspend() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    S2IDLE_DEV_SUSPENDS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+fn s2idle_counting_resume() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    S2IDLE_DEV_RESUMES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// Full isolation for an s2idle fixture: empty device registry with
+/// one counting device, shared phase back at Idle, all s2idle state
+/// (gates, latch, stats, hook) cleared.
+fn s2idle_fixture_reset() {
+    crate::device_pm::__reset_for_test();
+    crate::suspend::__test_reset();
+    crate::s2idle::__test_reset();
+    S2IDLE_DEV_SUSPENDS.store(0, core::sync::atomic::Ordering::SeqCst);
+    S2IDLE_DEV_RESUMES.store(0, core::sync::atomic::Ordering::SeqCst);
+    S2IDLE_HOOK_STEPS.store(0, core::sync::atomic::Ordering::SeqCst);
+    S2IDLE_HOOK_PHASE_MASK.store(0, core::sync::atomic::Ordering::SeqCst);
+    S2IDLE_HOOK_REENTRANT.store(0, core::sync::atomic::Ordering::SeqCst);
+    crate::device_pm::register_device_pm(
+        "s2idle-counting",
+        s2idle_counting_suspend,
+        s2idle_counting_resume,
+    );
+}
+
+/// Park-step hook: latch a wake event on the third park iteration —
+/// a wake source firing while the CPU is parked.
+fn s2idle_hook_wake_on_third_step() {
+    let n = S2IDLE_HOOK_STEPS.fetch_add(1, core::sync::atomic::Ordering::SeqCst) + 1;
+    if n == 3 {
+        crate::s2idle::note_wake_event(crate::s2idle::WakeSource::TestInjected);
+    }
+}
+
+/// Park-step hook: record every phase observed while parked.
+fn s2idle_hook_record_phase() {
+    let p = crate::suspend::current_phase() as u32;
+    S2IDLE_HOOK_PHASE_MASK.fetch_or(1 << p, core::sync::atomic::Ordering::SeqCst);
+    S2IDLE_HOOK_STEPS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Park-step hook: try to start a second sleep transition from
+/// inside the park (must be refused — the transition is claimed),
+/// then latch a wake event so the outer park can exit.
+fn s2idle_hook_reenter() {
+    use narf_capabilities::{Cap, Invoke};
+    let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
+    match crate::s2idle::suspend_to_idle(&cap) {
+        Err(crate::SuspendError::AlreadySuspending) => {
+            S2IDLE_HOOK_REENTRANT.store(1, core::sync::atomic::Ordering::SeqCst);
+        }
+        _ => {
+            S2IDLE_HOOK_REENTRANT.store(2, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    crate::s2idle::note_wake_event(crate::s2idle::WakeSource::TestInjected);
+}
+
+fn smoke_s2idle_unarmed_walks_phases() -> TestResult {
+    // Unarmed s2idle mirrors unarmed S3 exactly: NotImplemented,
+    // phase back at Idle, and the counting device saw a paired
+    // suspend + resume (the ping-pong cycle).
+    use narf_capabilities::{Cap, Invoke};
+
+    s2idle_fixture_reset();
+    let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
+    match crate::s2idle::suspend_to_idle(&cap) {
+        Err(crate::SuspendError::NotImplemented) => {}
+        _ => return TestResult::Fail("unarmed s2idle should surface NotImplemented"),
+    }
+    if crate::suspend::current_phase() != crate::SuspendPhase::Idle {
+        return TestResult::Fail("phase did not return to Idle after unarmed s2idle");
+    }
+    if S2IDLE_DEV_SUSPENDS.load(core::sync::atomic::Ordering::SeqCst) != 1
+        || S2IDLE_DEV_RESUMES.load(core::sync::atomic::Ordering::SeqCst) != 1
+    {
+        return TestResult::Fail("unarmed s2idle did not run a paired device fan-out");
+    }
+    if crate::s2idle::stats().last_exit != crate::s2idle::ParkExit::NotParked {
+        return TestResult::Fail("unarmed s2idle recorded a park");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/s2idle", smoke_s2idle_unarmed_walks_phases);
+
+fn smoke_s2idle_wake_event_resumes() -> TestResult {
+    // Armed, and a wake source fires while parked (the step hook
+    // latches it on the third iteration): the park exits via the
+    // wake, the resume fan-out runs, and the call returns Ok.
+    // Entered through the bounded test entry so the fixture
+    // exercises the shared machinery on aarch64 too, where the
+    // production entry refuses (pinned by
+    // smoke_s2idle_unsupported_on_aarch64); the budget is never
+    // the exit reason here — the wake lands on iteration three.
+    use narf_capabilities::{Cap, Invoke};
+
+    s2idle_fixture_reset();
+    crate::s2idle::__test_arm_s2idle();
+    crate::s2idle::__test_set_park_step_hook(Some(s2idle_hook_wake_on_third_step));
+    let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
+    let (result, exit) = crate::s2idle::__test_suspend_to_idle_bounded(&cap, 16);
+    if result.is_err() {
+        return TestResult::Fail("armed s2idle with a wake event should return Ok");
+    }
+    if exit != crate::s2idle::ParkExit::WakeEvent {
+        return TestResult::Fail("park with a latched wake event did not exit via the wake");
+    }
+    let stats = crate::s2idle::stats();
+    if stats.parks != 1 || stats.wakes != 1 || stats.last_exit != crate::s2idle::ParkExit::WakeEvent
+    {
+        return TestResult::Fail("s2idle stats do not record one woken park");
+    }
+    if crate::s2idle::last_wake_source() != Some(crate::s2idle::WakeSource::TestInjected) {
+        return TestResult::Fail("wake source was not recorded");
+    }
+    if S2IDLE_DEV_SUSPENDS.load(core::sync::atomic::Ordering::SeqCst) != 1
+        || S2IDLE_DEV_RESUMES.load(core::sync::atomic::Ordering::SeqCst) != 1
+    {
+        return TestResult::Fail("woken s2idle did not run a paired device fan-out");
+    }
+    if crate::suspend::current_phase() != crate::SuspendPhase::Idle {
+        return TestResult::Fail("phase did not return to Idle after s2idle resume");
+    }
+    if crate::s2idle::wake_event_pending() {
+        return TestResult::Fail("wake latch left set after resume");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/s2idle", smoke_s2idle_wake_event_resumes);
+
+fn smoke_s2idle_no_wake_stays_parked() -> TestResult {
+    // Armed but no wake source ever fires: the bounded test entry
+    // exhausts its halt budget *inside* the park — every observed
+    // phase during the park is PlatformOff — then unwinds cleanly
+    // through the resume fan-out. Proves the park does not fall
+    // through on its own.
+    use narf_capabilities::{Cap, Invoke};
+
+    s2idle_fixture_reset();
+    crate::s2idle::__test_arm_s2idle();
+    crate::s2idle::__test_set_park_step_hook(Some(s2idle_hook_record_phase));
+    let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
+    let (result, exit) = crate::s2idle::__test_suspend_to_idle_bounded(&cap, 4);
+    if result.is_err() {
+        return TestResult::Fail("bounded s2idle park should unwind with Ok");
+    }
+    if exit != crate::s2idle::ParkExit::BoundExhausted {
+        return TestResult::Fail("park without a wake event did not stay parked");
+    }
+    let mask = S2IDLE_HOOK_PHASE_MASK.load(core::sync::atomic::Ordering::SeqCst);
+    if mask != 1 << (crate::SuspendPhase::PlatformOff as u32) {
+        return TestResult::Fail("park observed a phase other than PlatformOff");
+    }
+    if S2IDLE_HOOK_STEPS.load(core::sync::atomic::Ordering::SeqCst) != 4 {
+        return TestResult::Fail("park did not spend its full halt budget parked");
+    }
+    if crate::s2idle::stats().wakes != 0 {
+        return TestResult::Fail("wake counted although no wake source fired");
+    }
+    if S2IDLE_DEV_RESUMES.load(core::sync::atomic::Ordering::SeqCst) != 1 {
+        return TestResult::Fail("bounded park did not resume devices on unwind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/s2idle", smoke_s2idle_no_wake_stays_parked);
+
+fn smoke_s2idle_revoked_cap_refused() -> TestResult {
+    // A revoked Power cap is refused before the claim: no phase
+    // movement, no device fan-out, no park.
+    use narf_capabilities::{Cap, Invoke};
+
+    s2idle_fixture_reset();
+    crate::s2idle::__test_arm_s2idle();
+    let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
+    cap.revoke();
+    match crate::s2idle::suspend_to_idle(&cap) {
+        Err(crate::SuspendError::AuthorityRevoked) => {}
+        _ => return TestResult::Fail("revoked cap accepted by suspend_to_idle"),
+    }
+    if crate::suspend::current_phase() != crate::SuspendPhase::Idle {
+        return TestResult::Fail("revoked s2idle moved the phase machine");
+    }
+    if S2IDLE_DEV_SUSPENDS.load(core::sync::atomic::Ordering::SeqCst) != 0 {
+        return TestResult::Fail("revoked s2idle quiesced devices");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/s2idle", smoke_s2idle_revoked_cap_refused);
+
+fn smoke_s2idle_reentrant_request_refused() -> TestResult {
+    // s2idle shares the S3 core's one global transition claim: a
+    // second request issued from inside the park is refused with
+    // AlreadySuspending, and the outer park still completes. The
+    // outer entry is the bounded test entry (shared-machinery
+    // coverage on aarch64, as in smoke_s2idle_wake_event_resumes);
+    // the re-entrant call inside the hook uses the production
+    // entry and is refused at the claim, before any other gate.
+    use narf_capabilities::{Cap, Invoke};
+
+    s2idle_fixture_reset();
+    crate::s2idle::__test_arm_s2idle();
+    crate::s2idle::__test_set_park_step_hook(Some(s2idle_hook_reenter));
+    let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
+    let (result, exit) = crate::s2idle::__test_suspend_to_idle_bounded(&cap, 16);
+    if result.is_err() || exit != crate::s2idle::ParkExit::WakeEvent {
+        return TestResult::Fail("outer s2idle park should complete Ok via the wake");
+    }
+    if S2IDLE_HOOK_REENTRANT.load(core::sync::atomic::Ordering::SeqCst) != 1 {
+        return TestResult::Fail("re-entrant s2idle was not refused AlreadySuspending");
+    }
+    if crate::s2idle::stats().parks != 1 {
+        return TestResult::Fail("re-entrant request started a second park");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/s2idle", smoke_s2idle_reentrant_request_refused);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_s2idle_supported_on_x86_64() -> TestResult {
+    // The inverse of the aarch64 pin below: x86_64 has a wake
+    // source deliverable under the park mask (the ACPI SCI,
+    // exempted via the installed-vector allowlist), so s2idle
+    // reports supported there, and the sysfs trigger's view
+    // agrees. If the predicate is ever narrowed by accident,
+    // this fixture is what says so.
+    if !crate::s2idle::s2idle_supported() {
+        return TestResult::Fail("s2idle must report supported on x86_64");
+    }
+    if !crate::sleep_request::SleepState::Freeze.supported() {
+        return TestResult::Fail("freeze must report supported on x86_64");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/s2idle", smoke_s2idle_supported_on_x86_64);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_s2idle_unsupported_on_aarch64() -> TestResult {
+    // aarch64 has no allowlistable wake source yet: the wake
+    // allowlist is empty there, so a park's IRQ snapshot masks
+    // every SPI (INTID 32..=255) and the wake latch — whose only
+    // setters are IRQ handlers — could never be set during a
+    // production (unbounded) park. s2idle must therefore fail
+    // closed on aarch64: report unsupported, refuse even an
+    // armed production request with NotImplemented (never enter
+    // an exit-less park), and keep `freeze` off the trigger's
+    // supported set. The bounded fixtures above still exercise
+    // the shared machinery through the test entry; that is a
+    // model, not a production park. Revisit when an aarch64
+    // wake source lands (#868).
+    use narf_capabilities::{Cap, Invoke};
+
+    s2idle_fixture_reset();
+    if crate::s2idle::s2idle_supported() {
+        return TestResult::Fail(
+            "s2idle must report unsupported on aarch64 until a wake source exists",
+        );
+    }
+    crate::s2idle::__test_arm_s2idle();
+    let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
+    match crate::s2idle::suspend_to_idle(&cap) {
+        Err(crate::SuspendError::NotImplemented) => {}
+        _ => {
+            return TestResult::Fail("armed aarch64 s2idle should surface NotImplemented, not park")
+        }
+    }
+    if crate::s2idle::stats().last_exit != crate::s2idle::ParkExit::NotParked {
+        return TestResult::Fail("unsupported aarch64 s2idle recorded a park");
+    }
+    if crate::sleep_request::SleepState::Freeze.supported() {
+        return TestResult::Fail("freeze reported supported on aarch64");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("power/s2idle", smoke_s2idle_unsupported_on_aarch64);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_s2idle_allowlist_matches_installed_sci_vector() -> TestResult {
+    // Pin the wake allowlist to the vector the platform ACTUALLY
+    // installed the SCI handler on. The install
+    // (drivers/platform `init_sci`) resolves SCI_INT through the
+    // MADT interrupt-source-override table — a matching entry
+    // remaps the line to a different GSI — and installs
+    // `dispatch_sci` at a dynamically allocated vector, so no
+    // FADT/GSI arithmetic (`32 + sci_int`, `32 + gsi`) can name the
+    // live vector. The old allowlist used `32 + sci_int`: it
+    // exempted a vector nothing wakes on while the real SCI stayed
+    // masked, and no park could ever wake. This fixture models the
+    // install's effect — allocate a vector exactly as `init_sci`
+    // does and record it exactly where `init_sci` records it — and
+    // pins the allowlist to the record.
+    s2idle_fixture_reset();
+    let saved = narf_acpi::sci_vector();
+    let mut fail: Option<&'static str> = None;
+
+    // Pre-install shape: with no install recorded, nothing is
+    // exempted — there is no FADT-derived fallback guess.
+    narf_acpi::record_sci_vector(0);
+    if !crate::s2idle::wake_irq_allowlist().is_empty() {
+        fail = Some("allowlist not empty with no SCI install recorded");
+    }
+
+    // Model the install: dynamic allocation, as in `init_sci`.
+    let installed = match narf_interrupts::vector::alloc() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            fail = Some("vector::alloc failed modelling the SCI install");
+            None
+        }
+    };
+    if let Some(installed) = installed {
+        narf_acpi::record_sci_vector(installed);
+        if narf_acpi::sci_vector() != Some(installed) {
+            fail = Some("installed SCI vector not readable from narf_acpi");
+        }
+        let allowlist = crate::s2idle::wake_irq_allowlist();
+        if allowlist.len() != 1 || allowlist[0] != installed {
+            fail = Some("allowlist does not exempt exactly the installed SCI vector");
+        }
+        // The FADT-derived vector must NOT be the exempted one
+        // (the allocator's range starts above the legacy
+        // `32 + sci_int` window, so the two can never coincide).
+        if fail.is_none() {
+            if let Some(pm) = narf_acpi::fadt_pm() {
+                if pm.sci_int != 0 {
+                    let naive = 32u32 + pm.sci_int as u32;
+                    if naive != installed as u32 {
+                        if let Ok(naive) = u8::try_from(naive) {
+                            if allowlist.contains(&naive) {
+                                fail =
+                                    Some("allowlist exempts the FADT-derived vector, not the installed one");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = narf_interrupts::vector::free(installed);
+    }
+
+    // Restore whatever install state the environment had.
+    narf_acpi::record_sci_vector(saved.unwrap_or(0));
+    match fail {
+        None => TestResult::Pass,
+        Some(msg) => TestResult::Fail(msg),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "power/s2idle",
+    smoke_s2idle_allowlist_matches_installed_sci_vector
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_s3_resume_context_save_captures_cr3() -> TestResult {
     // save_resume_context() captures CR0/CR3/CR4/GDTR/IDTR/RSP.
@@ -2098,6 +2469,12 @@ fn smoke_arm_s3_resume_refuses_without_armed_real_sleep() -> TestResult {
     use crate::suspend::{arm_s3_resume, SuspendError, __test_reset};
     use crate::Power;
     use narf_capabilities::{Cap, Invoke};
+    // Isolate from the boot's real devices: NVMe refuses system
+    // suspend, and the orchestrator's device fan-out runs before
+    // the arm check — its failure would surface as Aborted and
+    // mask the refusal this smoke pins. Same isolation as
+    // smoke_s3_suspend_unarmed_walks_phases.
+    crate::device_pm::__reset_for_test();
     __test_reset();
     let cap: Cap<Power, Invoke> = Cap::bootstrap();
     match arm_s3_resume(&cap) {

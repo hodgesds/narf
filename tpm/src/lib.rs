@@ -77,6 +77,16 @@ pub mod registry {
     pub fn list() -> Vec<Arc<dyn TpmDevice>> {
         REGISTRY.lock().clone()
     }
+
+    /// Test-only: drop every registered device, restoring the
+    /// no-TPM state a TPM-less boot observes. Production
+    /// registration is boot-lifetime (the platform probe registers
+    /// once, at Stage::Subsys); fixtures that register a mock must
+    /// call this on exit so later smokes are not dispatched to it.
+    #[doc(hidden)]
+    pub fn __reset_for_test() {
+        REGISTRY.lock().clear();
+    }
 }
 
 /// Force-link hook.
@@ -182,6 +192,32 @@ mod tests {
         }
     }
     kernel_test_in!("tpm", smoke_tpm_cap_kind);
+
+    fn smoke_tpm_registry_register_list_and_reset() -> TestResult {
+        // The registry is the composition point the measured-boot
+        // dispatch consults: registration must make the exact device
+        // visible to list(), and the test reset must restore the
+        // empty state. Reset on entry AND exit — the registry is
+        // global, and a leaked mock would silently become the
+        // dispatch target for later smokes.
+        registry::__reset_for_test();
+        if !registry::list().is_empty() {
+            return TestResult::Fail("registry not empty after reset");
+        }
+        let mock: Arc<dyn TpmDevice> = Arc::new(MockTpm::new());
+        registry::register(mock.clone());
+        let list = registry::list();
+        if list.len() != 1 || !Arc::ptr_eq(&list[0], &mock) {
+            registry::__reset_for_test();
+            return TestResult::Fail("registered device not returned by list()");
+        }
+        registry::__reset_for_test();
+        if !registry::list().is_empty() {
+            return TestResult::Fail("registry not empty after final reset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm", smoke_tpm_registry_register_list_and_reset);
 
     // ── TPM 2.0 codec smokes ──────────────────────────────────────
 
@@ -397,6 +433,14 @@ mod tests {
         if u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]) != CommandCode::PcrExtend as u32 {
             return TestResult::Fail("cc != PcrExtend");
         }
+        // Tag = TPM_ST_SESSIONS (0x8002). pcrHandle is an
+        // authorization handle: under TPM_ST_NO_SESSIONS the TPM
+        // parses the authorizationSize as the digest count and
+        // rejects the frame (#937). This assertion is the one whose
+        // absence let the malformed encoding pass its own fixture.
+        if u16::from_be_bytes([buf[0], buf[1]]) != crate::commands::TPM_ST_SESSIONS {
+            return TestResult::Fail("tag != TPM_ST_SESSIONS");
+        }
         // pcrHandle BE u32 at body[0..4]
         if u32::from_be_bytes([buf[10], buf[11], buf[12], buf[13]]) != 3 {
             return TestResult::Fail("pcrHandle != 3");
@@ -424,6 +468,47 @@ mod tests {
     kernel_test_in!(
         "tpm/commands",
         smoke_tpm_command_builder_pcr_extend_carries_digest
+    );
+
+    fn smoke_tpm_command_builder_pcr_extend_exact_bytes() -> TestResult {
+        use crate::commands::CommandBuilder;
+        // PCR 4 (the measured-boot PCR) + a digest of distinct bytes
+        // so any transposition in the frame shows up in the diff.
+        let digest: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+            0x1C, 0x1D, 0x1E, 0x1F,
+        ];
+        let buf = CommandBuilder::pcr_extend(4, &digest);
+        // The full frame, laid out by hand per TPM 2.0 Part 3 §22.2 —
+        // byte-identical in structure to the reference encoding in
+        // drivers/tpm/src/tpm2/commands.rs::pcr_extend:
+        //   tag TPM_ST_SESSIONS, TPM_RS_PW session (authSize 9),
+        //   TPML_DIGEST_VALUES { count 1, { SHA256, digest } }.
+        let expected: [u8; 65] = [
+            0x80, 0x02, // tag = TPM_ST_SESSIONS
+            0x00, 0x00, 0x00, 0x41, // commandSize = 65
+            0x00, 0x00, 0x01, 0x82, // cc = TPM_CC_PCR_Extend
+            0x00, 0x00, 0x00, 0x04, // pcrHandle = 4
+            0x00, 0x00, 0x00, 0x09, // authorizationSize = 9
+            0x40, 0x00, 0x00, 0x09, // sessionHandle = TPM_RS_PW
+            0x00, 0x00, // nonceSize = 0
+            0x00, // sessionAttributes = 0
+            0x00, 0x00, // hmacSize = 0
+            0x00, 0x00, 0x00, 0x01, // TPML_DIGEST_VALUES.count = 1
+            0x00, 0x0B, // hashAlg = TPM_ALG_SHA256
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+            0x1C, 0x1D, 0x1E, 0x1F, // digest
+        ];
+        if buf.as_slice() != expected.as_slice() {
+            return TestResult::Fail("pcr_extend frame != reference encoding");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "tpm/commands",
+        smoke_tpm_command_builder_pcr_extend_exact_bytes
     );
 
     fn smoke_tpm_response_parser_rejects_short_buf() -> TestResult {

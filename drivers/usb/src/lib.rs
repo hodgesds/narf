@@ -32,6 +32,7 @@ pub mod ohci;
 pub mod r8152;
 pub mod serial;
 pub mod uac;
+pub mod uac_card;
 pub mod uhci;
 pub mod uvc;
 pub mod wbdi;
@@ -639,25 +640,39 @@ fn spawn_supervisor_task() {
                     }
                 }
                 if new_bound_bits != 0 {
-                    let mut g = HUBS.lock();
-                    if let Some(h) = g.get_mut(idx) {
-                        h.bound_downstream |= new_bound_bits;
-                    }
+                    // Sets the bound bits AND stamps each newly
+                    // bound port's activity tick — a port's idle
+                    // window runs from bind, not from the boot
+                    // epoch its tick initialised to (#840).
+                    attach::mark_ports_bound(idx, new_bound_bits);
                 }
             }
 
             SUPERVISOR_PHASE.store(7, core::sync::atomic::Ordering::Relaxed);
+            // Wake hub ports a live HID binding sits on before
+            // the pumps poll them: a suspended port gates the
+            // device's interrupt endpoint, so without this a hub
+            // keyboard that idled into suspend would stay dead
+            // even though it is bound and pumped every cycle
+            // (#840). The wake opens a fresh idle window; see
+            // `hid::resume_suspended_hub_ports`.
+            hid::resume_suspended_hub_ports(c).await;
             hid::pump_all(c);
             hid::mouse::pump_all(c);
             hid::touchpad::pump_all(c);
+            hid::consumer::pump_all(c);
             cdc_acm::pump_all(c);
             xpad::pump_all(c);
             SUPERVISOR_PHASE.store(8, core::sync::atomic::Ordering::Relaxed);
             // Power management: suspend any downstream port whose
             // last activity is older than IDLE_SUSPEND_NS. Pumps
             // above touch `last_activity_tick` via mark_port_activity
-            // on each completed transfer, so an actively-used keyboard
-            // never gets suspended; an idle USB stick / hub does.
+            // on each completed transfer, suspended HID ports are
+            // resumed just before the pumps (opening a fresh idle
+            // window), and the MSC BOT path feeds activity on each
+            // completed transaction (resuming its port first if
+            // suspended), so an actively-used device never gets
+            // suspended; an idle USB stick / hub does.
             attach::idle_suspend_pass(c).await;
             SUPERVISOR_PHASE.store(9, core::sync::atomic::Ordering::Relaxed);
             // Inter-cycle delay: PARK on the timer wheel for ~100 ms

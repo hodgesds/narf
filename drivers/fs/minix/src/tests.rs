@@ -884,3 +884,860 @@ kernel_test_in!(
     "drivers/fs/minix",
     smoke_minix_mmap_identity_inode_reuse_after_unlink
 );
+
+// ── Truncate-shrink fixtures (issue #844) ────────────────────────
+//
+// Before the fix, shrink only moved `i_size`: every zone past the
+// new EOF stayed allocated, the partial tail zone kept its bytes,
+// and a later regrow (a size-only bump) re-served the stale
+// pre-shrink bytes instead of zeros. These fixtures pin the
+// release-and-zero semantics at driver level, mirroring the
+// syscall-level coherence pin for the same defect (Refs #742).
+
+use narf_filesystem::FsInstance as _;
+
+use super::volume::MinixVolume;
+
+/// Position-dependent pattern that never produces a zero byte, so
+/// any zero in a read range is proof of zero-fill and any stale
+/// pre-shrink byte is distinguishable from it.
+fn shrink_pattern_at(off: usize) -> u8 {
+    (1 + (off % 250)) as u8
+}
+
+fn shrink_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(shrink_pattern_at).collect()
+}
+
+/// Zone-bitmap probe for the test images: the zone bitmap is
+/// block 3 and `first_data_zone` is 5; the allocation ordinal for
+/// zone `z` is `z - first_data_zone + 1` (see `free_zone`).
+fn image_zone_used(img: &[u8], zone: u32) -> bool {
+    let ordinal = zone - 5 + 1;
+    img[3 * 1024 + (ordinal / 8) as usize] & (1u8 << (ordinal % 8)) != 0
+}
+
+/// Absolute zone numbers backing file-zone indices `0..count` of
+/// `inode`, in index order (holes skipped — fixtures use fully
+/// allocated files, and callers assert the count).
+async fn file_zones(
+    volume: &MinixVolume<narf_block::ram::RamBlockDevice>,
+    inode: &Inode,
+    count: u32,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    for idx in 0..count {
+        if let Ok(Some(z)) = volume.map_block(inode, idx).await {
+            out.push(z);
+        }
+    }
+    out
+}
+
+/// The #862 pin scenario at driver level: write a pattern across
+/// multiple zones, shrink mid-zone, regrow — the regrown range
+/// must read as zeros, the kept range as the pattern, and the
+/// partial tail zone must be zeroed on disk (the regrow is a
+/// size-only bump, so the zeros have to come from the shrink).
+fn smoke_minix_truncate_shrink_regrow_reads_zeros() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    let device = RamBlockDevice::from_image(512, build_minix3_image_writable());
+    let volume = match poll_once(MinixVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hi.txt failed"),
+    };
+    let data = shrink_pattern(3 * 4096);
+    match poll_once(file.write(0, &data)) {
+        Some(Ok(12288)) => {}
+        _ => return TestResult::Fail("write pattern failed"),
+    }
+    let before = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read inode failed"),
+    };
+    let zones = match poll_once(file_zones(&volume, &before, 12)) {
+        Some(z) => z,
+        _ => return TestResult::Fail("zone walk failed"),
+    };
+    if zones.len() != 12 {
+        return TestResult::Fail("fixture file does not span 12 zones");
+    }
+    match poll_once(file.truncate(5000)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("shrink to 5000 failed"),
+    }
+    let img = device.snapshot();
+    for (idx, zone) in zones.iter().enumerate() {
+        if image_zone_used(&img, *zone) != (idx < 5) {
+            return TestResult::Fail("kept/released zone bitmap state wrong after shrink");
+        }
+    }
+    // Partial tail zone (index 4, file bytes 4096..5120): [0, 904)
+    // preserved, [904, 1024) zeroed on disk.
+    let tail = &img[zones[4] as usize * 1024..zones[4] as usize * 1024 + 1024];
+    for (i, b) in tail.iter().enumerate() {
+        let want = if i < 904 {
+            shrink_pattern_at(4096 + i)
+        } else {
+            0
+        };
+        if *b != want {
+            return TestResult::Fail("partial tail zone not zeroed on disk by shrink");
+        }
+    }
+    let shrunk = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read shrunk inode failed"),
+    };
+    if shrunk.size != 5000 || shrunk.zones[5] != 0 || shrunk.zones[6] != 0 {
+        return TestResult::Fail("on-disk inode not shrunk / direct tail slots not cleared");
+    }
+    match poll_once(file.truncate(3 * 4096)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("regrow failed"),
+    }
+    let mut back = vec![0u8; 3 * 4096];
+    match poll_once(file.read(0, &mut back)) {
+        Some(Ok(12288)) => {}
+        _ => return TestResult::Fail("read back failed"),
+    }
+    for (off, b) in back.iter().enumerate() {
+        let want = if off < 5000 {
+            shrink_pattern_at(off)
+        } else {
+            0
+        };
+        if *b != want {
+            return TestResult::Fail("regrown range resurrected stale pre-shrink bytes");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_truncate_shrink_regrow_reads_zeros
+);
+
+/// Shrink from the indirect range back into the direct range: the
+/// whole single-indirect chain detaches — its data zones AND the
+/// indirect block itself are freed — and the freed zones are
+/// genuinely reusable by a later file.
+fn smoke_minix_truncate_shrink_releases_indirect_zones() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    let device = RamBlockDevice::from_image(512, build_minix3_image_writable());
+    let volume = match poll_once(MinixVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hi.txt failed"),
+    };
+    let data = shrink_pattern(20480);
+    match poll_once(file.write(0, &data)) {
+        Some(Ok(20480)) => {}
+        _ => return TestResult::Fail("write pattern failed"),
+    }
+    let before = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read inode failed"),
+    };
+    let ind_block = before.zones[super::inode::IND_SLOT];
+    if ind_block == 0 {
+        return TestResult::Fail("fixture did not reach the indirect range");
+    }
+    let zones = match poll_once(file_zones(&volume, &before, 20)) {
+        Some(z) => z,
+        _ => return TestResult::Fail("zone walk failed"),
+    };
+    if zones.len() != 20 {
+        return TestResult::Fail("fixture file does not span 20 zones");
+    }
+    match poll_once(file.truncate(5000)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("shrink to 5000 failed"),
+    }
+    let after = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read shrunk inode failed"),
+    };
+    if after.size != 5000
+        || after.zones[super::inode::IND_SLOT] != 0
+        || after.zones[5] != 0
+        || after.zones[6] != 0
+    {
+        return TestResult::Fail("indirect root / direct tail slots not detached on disk");
+    }
+    let img = device.snapshot();
+    for (idx, zone) in zones.iter().enumerate() {
+        if image_zone_used(&img, *zone) != (idx < 5) {
+            return TestResult::Fail("kept/released zone bitmap state wrong after shrink");
+        }
+    }
+    if image_zone_used(&img, ind_block) {
+        return TestResult::Fail("the indirect block itself was not freed");
+    }
+    // Freed zones are reusable: a fresh file allocates and reads
+    // back cleanly, and the shrunk file's kept range is undisturbed.
+    let other = match poll_once(volume.root().create("o.bin")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create o.bin failed"),
+    };
+    let payload = shrink_pattern(3000);
+    match poll_once(other.write(0, &payload)) {
+        Some(Ok(3000)) => {}
+        _ => return TestResult::Fail("write o.bin failed"),
+    }
+    let mut back = vec![0u8; 3000];
+    match poll_once(other.read(0, &mut back)) {
+        Some(Ok(3000)) => {}
+        _ => return TestResult::Fail("read o.bin failed"),
+    }
+    if back != payload {
+        return TestResult::Fail("file written into freed zones reads back wrong");
+    }
+    let mut kept = vec![0u8; 5000];
+    match poll_once(file.read(0, &mut kept)) {
+        Some(Ok(5000)) => {}
+        _ => return TestResult::Fail("read kept range failed"),
+    }
+    if kept != shrink_pattern(5000) {
+        return TestResult::Fail("shrunk file's kept range was disturbed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_truncate_shrink_releases_indirect_zones
+);
+
+/// Shrink to a size still inside the single-indirect range: the
+/// indirect block survives, only its out-of-range slots are
+/// cleared (on disk) and their zones freed; the last kept indirect
+/// zone's tail is zeroed.
+fn smoke_minix_truncate_shrink_inside_indirect_keeps_block() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    let device = RamBlockDevice::from_image(512, build_minix3_image_writable());
+    let volume = match poll_once(MinixVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hi.txt failed"),
+    };
+    let data = shrink_pattern(20480);
+    match poll_once(file.write(0, &data)) {
+        Some(Ok(20480)) => {}
+        _ => return TestResult::Fail("write pattern failed"),
+    }
+    let before = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read inode failed"),
+    };
+    let ind_block = before.zones[super::inode::IND_SLOT];
+    if ind_block == 0 {
+        return TestResult::Fail("fixture did not reach the indirect range");
+    }
+    let zones = match poll_once(file_zones(&volume, &before, 20)) {
+        Some(z) => z,
+        _ => return TestResult::Fail("zone walk failed"),
+    };
+    if zones.len() != 20 {
+        return TestResult::Fail("fixture file does not span 20 zones");
+    }
+    // keep = ceil(10340 / 1024) = 11 zones (indices 0..10).
+    match poll_once(file.truncate(10340)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("shrink to 10340 failed"),
+    }
+    let after = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read shrunk inode failed"),
+    };
+    if after.size != 10340 || after.zones[super::inode::IND_SLOT] != ind_block {
+        return TestResult::Fail("indirect block did not survive a shrink into its range");
+    }
+    let img = device.snapshot();
+    // On-disk indirect slots: slot s backs file index 7 + s; slots
+    // for indices 7..10 live, indices 11.. cleared.
+    let ind_off = ind_block as usize * 1024;
+    for slot in 0..13usize {
+        let off = ind_off + slot * 4;
+        let val = u32::from_le_bytes(img[off..off + 4].try_into().unwrap());
+        let want = if slot < 4 { zones[7 + slot] } else { 0 };
+        if val != want {
+            return TestResult::Fail("on-disk indirect slots wrong after partial shrink");
+        }
+    }
+    for (idx, zone) in zones.iter().enumerate() {
+        if image_zone_used(&img, *zone) != (idx < 11) {
+            return TestResult::Fail("kept/released zone bitmap state wrong after shrink");
+        }
+    }
+    if !image_zone_used(&img, ind_block) {
+        return TestResult::Fail("kept indirect block was freed");
+    }
+    // Partial tail: index 10 covers 10240..11264; the new EOF is
+    // 100 bytes in, so [100, 1024) of that zone is zeroed on disk.
+    let tail_zone = zones[10] as usize * 1024;
+    for i in 0..1024 {
+        let want = if i < 100 {
+            shrink_pattern_at(10240 + i)
+        } else {
+            0
+        };
+        if img[tail_zone + i] != want {
+            return TestResult::Fail("indirect partial tail zone not zeroed on disk");
+        }
+    }
+    let mut back = vec![0u8; 10340];
+    match poll_once(file.read(0, &mut back)) {
+        Some(Ok(10340)) => {}
+        _ => return TestResult::Fail("read back failed"),
+    }
+    if back != shrink_pattern(10340) {
+        return TestResult::Fail("kept range reads back wrong after partial shrink");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_truncate_shrink_inside_indirect_keeps_block
+);
+
+/// Shrink to zero takes the existing full-release path; pin that
+/// it still releases every zone and clears the inode.
+fn smoke_minix_truncate_shrink_to_zero_releases_all_zones() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    let device = RamBlockDevice::from_image(512, build_minix3_image_writable());
+    let volume = match poll_once(MinixVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hi.txt failed"),
+    };
+    let data = shrink_pattern(3000);
+    match poll_once(file.write(0, &data)) {
+        Some(Ok(3000)) => {}
+        _ => return TestResult::Fail("write pattern failed"),
+    }
+    let before = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read inode failed"),
+    };
+    let zones = match poll_once(file_zones(&volume, &before, 3)) {
+        Some(z) => z,
+        _ => return TestResult::Fail("zone walk failed"),
+    };
+    if zones.len() != 3 {
+        return TestResult::Fail("fixture file does not span 3 zones");
+    }
+    match poll_once(file.truncate(0)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("shrink to zero failed"),
+    }
+    let after = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read inode failed"),
+    };
+    if after.size != 0 || after.zones.iter().any(|z| *z != 0) {
+        return TestResult::Fail("size-0 inode still claims zones");
+    }
+    let img = device.snapshot();
+    for zone in &zones {
+        if image_zone_used(&img, *zone) {
+            return TestResult::Fail("zone not freed by shrink to zero");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_truncate_shrink_to_zero_releases_all_zones
+);
+
+/// Test-only block device that delegates to a RAM device but fails
+/// write submissions once an armed budget of successful writes is
+/// spent — used to fail a shrink mid-flight. `u32::MAX` budget
+/// means disarmed.
+struct FailWritesDevice {
+    inner: alloc::sync::Arc<narf_block::ram::RamBlockDevice>,
+    writes_left: alloc::sync::Arc<core::sync::atomic::AtomicU32>,
+}
+
+impl narf_block::BlockDevice for FailWritesDevice {
+    fn logical_block_size(&self) -> u32 {
+        self.inner.logical_block_size()
+    }
+    fn physical_block_size(&self) -> u32 {
+        self.inner.physical_block_size()
+    }
+    fn capacity_blocks(&self) -> u64 {
+        self.inner.capacity_blocks()
+    }
+    fn supports(&self, feature: narf_block::BlockFeature) -> bool {
+        self.inner.supports(feature)
+    }
+    fn submit(
+        &self,
+        req: narf_block::BlockRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        use core::sync::atomic::Ordering;
+        let fail = if matches!(req.op, narf_block::BlockOp::Write { .. }) {
+            // Spend one write from the armed budget. The observed
+            // value is the budget before this write: u32::MAX =
+            // disarmed (pass), n > 0 = spent one (pass), 0 = budget
+            // exhausted (fail). `fetch_update` reports the value
+            // via Ok when the closure updated it and via Err when
+            // it declined (MAX / 0), so read both arms the same way.
+            let observed =
+                match self
+                    .writes_left
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                        if v == u32::MAX || v == 0 {
+                            None
+                        } else {
+                            Some(v - 1)
+                        }
+                    }) {
+                    Ok(prev) => prev,
+                    Err(cur) => cur,
+                };
+            observed == 0
+        } else {
+            false
+        };
+        let inner = self.inner.clone();
+        async move {
+            if fail {
+                return narf_block::BlockCompletion {
+                    tag: 0,
+                    user_tag: req.user_tag,
+                    result: Err(narf_block::BlockError::IOError),
+                };
+            }
+            inner.submit(req).await
+        }
+    }
+    async fn flush(&self) {}
+    async fn discard(&self, _range: narf_block::LbaRange) {}
+    async fn cancel(&self, _tag: u64) -> narf_block::CancelResult {
+        narf_block::CancelResult::NotFound
+    }
+}
+
+/// A write failure mid-shrink must leave the volume consistent:
+/// the on-disk inode still claims the old size, every zone it
+/// references is still allocated, and the kept data is intact.
+/// (Zones detached before the failure may leak — marked used but
+/// unreferenced — never the reverse.)
+fn smoke_minix_truncate_shrink_failure_keeps_size_and_zones() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    let inner = RamBlockDevice::from_image(512, build_minix3_image_writable());
+    let budget = alloc::sync::Arc::new(AtomicU32::new(u32::MAX));
+    let device = alloc::sync::Arc::new(FailWritesDevice {
+        inner: inner.clone(),
+        writes_left: budget.clone(),
+    });
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hi.txt failed"),
+    };
+    let data = shrink_pattern(20480);
+    match poll_once(file.write(0, &data)) {
+        Some(Ok(20480)) => {}
+        _ => return TestResult::Fail("write pattern failed"),
+    }
+    // Budget: the shrink's indirect-block write-back (one 1024-byte
+    // block = two 512-byte sector writes) plus one more write
+    // succeed; the detach-persisting inode write then fails.
+    budget.store(3, Ordering::SeqCst);
+    match poll_once(file.truncate(5000)) {
+        Some(Err(_)) => {}
+        _ => return TestResult::Fail("armed device did not fail the shrink"),
+    }
+    if file.stat().size != 20480 {
+        return TestResult::Fail("size moved despite the failed shrink");
+    }
+    let mut kept = vec![0u8; 5000];
+    match poll_once(file.read(0, &mut kept)) {
+        Some(Ok(5000)) => {}
+        _ => return TestResult::Fail("read kept range failed"),
+    }
+    if kept != shrink_pattern(5000) {
+        return TestResult::Fail("kept data damaged by the failed shrink");
+    }
+    let on_disk = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read inode failed"),
+    };
+    if on_disk.size != 20480 {
+        return TestResult::Fail("on-disk size moved despite the failed shrink");
+    }
+    let img = inner.snapshot();
+    for idx in 0..20 {
+        let zone = match poll_once(volume.map_block(&on_disk, idx)) {
+            Some(Ok(z)) => z,
+            _ => return TestResult::Fail("zone walk failed"),
+        };
+        if let Some(zone) = zone {
+            if !image_zone_used(&img, zone) {
+                return TestResult::Fail("a zone referenced by the live inode was freed");
+            }
+        }
+    }
+    // The volume is still usable: disarmed, the same shrink now
+    // succeeds and the regrow reads zeros.
+    budget.store(u32::MAX, Ordering::SeqCst);
+    match poll_once(file.truncate(5000)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("retry shrink failed"),
+    }
+    match poll_once(file.truncate(12288)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("regrow failed"),
+    }
+    let mut back = vec![0u8; 12288];
+    match poll_once(file.read(0, &mut back)) {
+        Some(Ok(12288)) => {}
+        _ => return TestResult::Fail("read back failed"),
+    }
+    for (off, b) in back.iter().enumerate() {
+        let want = if off < 5000 {
+            shrink_pattern_at(off)
+        } else {
+            0
+        };
+        if *b != want {
+            return TestResult::Fail("post-recovery regrow resurrected stale bytes");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_truncate_shrink_failure_keeps_size_and_zones
+);
+
+/// Minimal V1 (0x138F, 30-char names) image in the V3 fixtures'
+/// layout: 32 inodes, imap block 2, zmap block 3, inode table at
+/// block 4, first data zone 5, root inode 1 (zone 5), `hi.txt`
+/// inode 2 with zone 6 preassigned and size 0.
+fn build_minix1_image_writable() -> Vec<u8> {
+    const BS: usize = 1024;
+    const NBLOCKS: usize = 32;
+    let mut img = vec![0u8; BS * NBLOCKS];
+    let sb = BS;
+    img[sb..sb + 2].copy_from_slice(&32u16.to_le_bytes()); // s_ninodes
+    img[sb + 2..sb + 4].copy_from_slice(&(NBLOCKS as u16).to_le_bytes()); // s_nzones
+    img[sb + 4..sb + 6].copy_from_slice(&1u16.to_le_bytes()); // s_imap_blocks
+    img[sb + 6..sb + 8].copy_from_slice(&1u16.to_le_bytes()); // s_zmap_blocks
+    img[sb + 8..sb + 10].copy_from_slice(&5u16.to_le_bytes()); // s_firstdatazone
+    img[sb + 10..sb + 12].copy_from_slice(&0u16.to_le_bytes()); // s_log_zone_size
+    img[sb + 12..sb + 16].copy_from_slice(&0x7fff_ffffu32.to_le_bytes()); // s_max_size
+    img[sb + 16..sb + 18].copy_from_slice(&0x138Fu16.to_le_bytes()); // V1, 30-char names
+    img[BS * 2] = 0b0000_0111; // inode bitmap: reserved + inodes 1, 2
+    img[BS * 3] = 0b0000_0111; // zone bitmap: reserved + zones 5, 6
+                               // V1 inodes are 32 bytes; 32 per block, table at block 4.
+    let put_inode = |img: &mut [u8], ino: usize, mode: u16, size: u32, nlinks: u8, zone0: u16| {
+        let off = BS * 4 + (ino - 1) * 32;
+        img[off..off + 2].copy_from_slice(&mode.to_le_bytes());
+        img[off + 4..off + 8].copy_from_slice(&size.to_le_bytes());
+        img[off + 8..off + 12].copy_from_slice(&0xcafeu32.to_le_bytes());
+        img[off + 13] = nlinks;
+        img[off + 14..off + 16].copy_from_slice(&zone0.to_le_bytes());
+    };
+    put_inode(&mut img, 1, 0o040755, 96, 2, 5); // root dir: 3 entries x 32 bytes
+    put_inode(&mut img, 2, 0o100644, 0, 1, 6);
+    let root_off = BS * 5;
+    let put_entry = |img: &mut [u8], idx: usize, ino: u16, name: &str| {
+        let off = root_off + idx * 32;
+        img[off..off + 2].copy_from_slice(&ino.to_le_bytes());
+        img[off + 2..off + 2 + name.len()].copy_from_slice(name.as_bytes());
+    };
+    put_entry(&mut img, 0, 1, ".");
+    put_entry(&mut img, 1, 1, "..");
+    put_entry(&mut img, 2, 2, "hi.txt");
+    img
+}
+
+/// The same shrink semantics through the V1 on-disk widths: u16
+/// zone pointers in the inode and in indirect blocks.
+fn smoke_minix_truncate_shrink_regrow_v1() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    let device = RamBlockDevice::from_image(512, build_minix1_image_writable());
+    let volume = match poll_once(MinixVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hi.txt failed"),
+    };
+    let data = shrink_pattern(10240);
+    match poll_once(file.write(0, &data)) {
+        Some(Ok(10240)) => {}
+        _ => return TestResult::Fail("write pattern failed"),
+    }
+    let before = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read inode failed"),
+    };
+    if before.zones[super::inode::IND_SLOT] == 0 {
+        return TestResult::Fail("fixture did not reach the indirect range");
+    }
+    let zones = match poll_once(file_zones(&volume, &before, 10)) {
+        Some(z) => z,
+        _ => return TestResult::Fail("zone walk failed"),
+    };
+    if zones.len() != 10 {
+        return TestResult::Fail("fixture file does not span 10 zones");
+    }
+    match poll_once(file.truncate(5000)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("shrink to 5000 failed"),
+    }
+    let after = match poll_once(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read shrunk inode failed"),
+    };
+    if after.size != 5000
+        || after.zones[super::inode::IND_SLOT] != 0
+        || after.zones[5] != 0
+        || after.zones[6] != 0
+    {
+        return TestResult::Fail("V1 indirect root / direct tail slots not detached");
+    }
+    let img = device.snapshot();
+    for (idx, zone) in zones.iter().enumerate() {
+        if image_zone_used(&img, *zone) != (idx < 5) {
+            return TestResult::Fail("V1 kept/released zone bitmap state wrong after shrink");
+        }
+    }
+    match poll_once(file.truncate(10240)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("regrow failed"),
+    }
+    let mut back = vec![0u8; 10240];
+    match poll_once(file.read(0, &mut back)) {
+        Some(Ok(10240)) => {}
+        _ => return TestResult::Fail("read back failed"),
+    }
+    for (off, b) in back.iter().enumerate() {
+        let want = if off < 5000 {
+            shrink_pattern_at(off)
+        } else {
+            0
+        };
+        if *b != want {
+            return TestResult::Fail("V1 regrown range resurrected stale pre-shrink bytes");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_truncate_shrink_regrow_v1);
+
+// ── Cross-open inode coherence (#962) ─────────────────────────────
+//
+// Every lookup mints a fresh `MinixNode`. Before the fix each node
+// held a private decode of the inode that was never revalidated, so
+// a size change through one open was invisible to every other open:
+// reads through the second node clamped to the stale size, `stat`
+// reported it, and a stale node could read (or write back) past a
+// shrink another open had performed. The nodes now share one inode
+// cell per (volume, ino) on the volume, so there is a single copy
+// to keep current. Each test below mints BOTH nodes before the
+// mutation — minting the second node afterwards would decode the
+// post-mutation inode from disk and mask the defect — and every
+// assertion keys on the second node's view.
+
+fn smoke_minix_cross_open_truncate_grow_visible() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image(&[b'x'; 100]);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let a = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup A failed"),
+    };
+    let b = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup B failed"),
+    };
+    // Grow through A only: 100 bytes → 3 zones (zone = block = 1024).
+    if poll_once(a.truncate(3072)).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("truncate grow through A failed");
+    }
+    // B's stat must report the grown size.
+    let stat = match poll_once(b.stat_async()) {
+        Some(Ok(s)) => s,
+        _ => return TestResult::Fail("stat through B failed"),
+    };
+    if stat.size != 3072 {
+        return TestResult::Fail("B's stat reports the pre-grow size");
+    }
+    // B must read the grown tail as zeros — a full zone at offset
+    // 2048, not the short read a stale size=100 snapshot produces.
+    let mut tail = [0xAAu8; 1024];
+    let n = match poll_once(b.read(2048, &mut tail)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read of grown tail through B failed"),
+    };
+    if n != 1024 || tail.iter().any(|&c| c != 0) {
+        return TestResult::Fail("B's read of the grown tail was short or non-zero");
+    }
+    // And the seeded prefix must still read through B, zero-filled
+    // up to the zone end.
+    let mut head = [0xAAu8; 128];
+    let n = match poll_once(b.read(0, &mut head)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read of head through B failed"),
+    };
+    if n != 128 || head[..100].iter().any(|&c| c != b'x') || head[100..].iter().any(|&c| c != 0) {
+        return TestResult::Fail("B's read of the seeded prefix is wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_cross_open_truncate_grow_visible
+);
+
+fn smoke_minix_cross_open_truncate_shrink_clamps() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image(&[b'y'; 600]);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let a = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup A failed"),
+    };
+    let b = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup B failed"),
+    };
+    // Shrink through A only: 600 → 100.
+    if poll_once(a.truncate(100)).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("truncate shrink through A failed");
+    }
+    let stat = match poll_once(b.stat_async()) {
+        Some(Ok(s)) => s,
+        _ => return TestResult::Fail("stat through B failed"),
+    };
+    if stat.size != 100 {
+        return TestResult::Fail("B's stat reports the pre-shrink size");
+    }
+    // B's read must clamp at the new EOF: exactly 100 bytes, and a
+    // read starting at the new EOF returns 0 — a stale snapshot
+    // would serve the 500 bytes past it that are still on disk.
+    let mut buf = [0u8; 600];
+    let n = match poll_once(b.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read through B failed"),
+    };
+    if n != 100 || buf[..100].iter().any(|&c| c != b'y') {
+        return TestResult::Fail("B's read was not clamped at the shrunken EOF");
+    }
+    let mut past = [0u8; 16];
+    let n = match poll_once(b.read(100, &mut past)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("past-EOF read through B failed"),
+    };
+    if n != 0 {
+        return TestResult::Fail("B read past the shrunken EOF");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_cross_open_truncate_shrink_clamps
+);
+
+fn smoke_minix_cross_open_write_visible() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image(b"hello minix\n");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let a = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup A failed"),
+    };
+    let b = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup B failed"),
+    };
+    // Extending write through A only: 12 → 21 bytes.
+    let ext = b" and more";
+    if poll_once(a.write(12, ext)).and_then(|r| r.ok()) != Some(ext.len()) {
+        return TestResult::Fail("extending write through A failed");
+    }
+    let stat = match poll_once(b.stat_async()) {
+        Some(Ok(s)) => s,
+        _ => return TestResult::Fail("stat through B failed"),
+    };
+    if stat.size != 21 {
+        return TestResult::Fail("B's stat reports the pre-write size");
+    }
+    let mut buf = [0u8; 32];
+    let n = match poll_once(b.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read through B failed"),
+    };
+    if n != 21 || &buf[..n] != b"hello minix\n and more" {
+        return TestResult::Fail("B did not read the bytes A wrote");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_cross_open_write_visible);

@@ -1,12 +1,15 @@
-//! USB Audio Class 1.0 — descriptor parsing (clean-room).
+//! USB Audio Class 1.0 / 2.0 — descriptor parsing, topology walk,
+//! bind conversation, and sound-card publication (clean-room).
 //!
 //! References (public-only):
 //! - "Universal Serial Bus Device Class Definition for Audio Devices"
 //!   Release 1.0, March 18, 1998. Public document, usb.org.
 //!   <https://www.usb.org/document-library/audio-class-document-10>
+//! - "Universal Serial Bus Device Class Definition for Audio Devices"
+//!   Release 2.0, May 31, 2006. Public document, usb.org.
+//!   <https://www.usb.org/document-library/audio-class-document-20>
 //! - "Universal Serial Bus Device Class Definition for Audio Data
-//!   Formats" Release 1.0, March 18, 1998. Public, usb.org.
-//!   <https://www.usb.org/document-library/audio-class-document-10>
+//!   Formats" Release 1.0 / 2.0. Public, usb.org.
 //! - "Universal Serial Bus Specification" 2.0, §9 (standard
 //!   descriptors). Public, usb.org.
 //!
@@ -20,8 +23,9 @@
 //!   - 0x02 AUDIOSTREAMING (AS) — isochronous PCM/MIDI data path
 //!   - 0x03 MIDISTREAMING (MS) — MIDI data path
 //!
-//! Protocol byte is 0x00 for UAC1; UAC2 is 0x20 (we don't decode
-//! UAC2 here).
+//! Protocol byte is 0x00 for UAC1 and 0x20 for UAC2; both are
+//! decoded here (the v2 AC/AS descriptor layouts and the v2 clock
+//! entity model live below the v1 decoders).
 //!
 //! ## Class-specific AC interface descriptor layout (§4.3.2)
 //!
@@ -54,6 +58,7 @@ pub const USB_AUDIO_SUBCLASS_AUDIOCONTROL: u8 = 0x01;
 pub const USB_AUDIO_SUBCLASS_AUDIOSTREAMING: u8 = 0x02;
 pub const USB_AUDIO_SUBCLASS_MIDISTREAMING: u8 = 0x03;
 pub const USB_AUDIO_PROTOCOL_UAC1: u8 = 0x00;
+pub const USB_AUDIO_PROTOCOL_UAC2: u8 = 0x20;
 
 // ── Descriptor types ───────────────────────────────────────────────
 
@@ -380,21 +385,913 @@ fn check_class_specific(buf: &[u8], expect_subtype: u8) -> Result<(), UacError> 
     Ok(())
 }
 
+// ── UAC2 class-specific descriptors (Release 2.0) ──────────────────
+//
+// The v2 AC block reuses the v1 subtype numbering for HEADER /
+// INPUT_TERMINAL / OUTPUT_TERMINAL / FEATURE_UNIT with wider
+// layouts, and adds the clock entity family that replaces the v1
+// endpoint sampling-frequency control:
+//   - 0x0A CLOCK_SOURCE    — the programmable (or fixed) clock
+//   - 0x0B CLOCK_SELECTOR  — picks one of N source pins
+//   - 0x0C CLOCK_MULTIPLIER — derives a rate from another clock
+
+/// AC subtype: CLOCK_SOURCE (UAC2 §4.7.2.10).
+pub const AC_SUBTYPE_CLOCK_SOURCE: u8 = 0x0A;
+/// AC subtype: CLOCK_SELECTOR (UAC2 §4.7.2.11).
+pub const AC_SUBTYPE_CLOCK_SELECTOR: u8 = 0x0B;
+/// AC subtype: CLOCK_MULTIPLIER (UAC2 §4.7.2.12).
+pub const AC_SUBTYPE_CLOCK_MULTIPLIER: u8 = 0x0C;
+
+/// Sampling-frequency control selector for clock entities (UAC2
+/// §5.2.2): SET_CUR / GET_CUR / GET_RANGE address it on the AC
+/// interface with `wIndex = (clock_id << 8) | interface`.
+pub const CLOCK_CS_SAMPLING_FREQUENCY: u8 = 0x01;
+/// UAC2 class request: RANGE (returns subranges for a control).
+pub const REQ_RANGE: u8 = 0x02;
+/// UAC2 class request: CUR.
+pub const REQ_CUR: u8 = 0x01;
+
+/// UAC2 AC HEADER descriptor (§4.7.2). Unlike v1 there is no
+/// interface collection list — every AS interface in the
+/// configuration belongs to the single AC interface.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AcHeader2 {
+    /// bcd Audio Class spec — 0x0200 for UAC2.
+    pub bcd_adc: u16,
+    /// Device category (function code, e.g. 0x05 = headset).
+    pub category: u8,
+    /// Total length of the AC descriptor block.
+    pub total_length: u16,
+    /// Latency / sync control bitmap.
+    pub controls: u8,
+}
+
+impl AcHeader2 {
+    pub fn parse(buf: &[u8]) -> Result<Self, UacError> {
+        if buf.len() < 9 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AC_SUBTYPE_HEADER)?;
+        Ok(Self {
+            bcd_adc: u16::from_le_bytes([buf[3], buf[4]]),
+            category: buf[5],
+            total_length: u16::from_le_bytes([buf[6], buf[7]]),
+            controls: buf[8],
+        })
+    }
+}
+
+/// UAC2 INPUT_TERMINAL descriptor (§4.7.2.4). The fields this
+/// driver consumes (id, type, association, source, channel count)
+/// sit at the same leading offsets the v2 layout shares with the
+/// walker's expectations; trailing clock-control fields are
+/// informational here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct InputTerminal2 {
+    pub terminal_id: u8,
+    pub terminal_type: u16,
+    pub assoc_terminal: u8,
+    pub nr_channels: u8,
+    pub channel_config: u32,
+    /// `bmControls` — copy-protect / connector / overload bits.
+    pub controls: u16,
+}
+
+impl InputTerminal2 {
+    pub fn parse(buf: &[u8]) -> Result<Self, UacError> {
+        if buf.len() < 16 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AC_SUBTYPE_INPUT_TERMINAL)?;
+        Ok(Self {
+            terminal_id: buf[3],
+            terminal_type: u16::from_le_bytes([buf[4], buf[5]]),
+            assoc_terminal: buf[6],
+            nr_channels: buf[7],
+            channel_config: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            controls: u16::from_le_bytes([buf[13], buf[14]]),
+        })
+    }
+}
+
+/// UAC2 OUTPUT_TERMINAL descriptor (§4.7.2.5).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OutputTerminal2 {
+    pub terminal_id: u8,
+    pub terminal_type: u16,
+    pub assoc_terminal: u8,
+    pub source_id: u8,
+    pub controls: u16,
+}
+
+impl OutputTerminal2 {
+    pub fn parse(buf: &[u8]) -> Result<Self, UacError> {
+        if buf.len() < 10 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AC_SUBTYPE_OUTPUT_TERMINAL)?;
+        Ok(Self {
+            terminal_id: buf[3],
+            terminal_type: u16::from_le_bytes([buf[4], buf[5]]),
+            assoc_terminal: buf[6],
+            source_id: buf[7],
+            controls: u16::from_le_bytes([buf[8], buf[9]]),
+        })
+    }
+}
+
+/// UAC2 FEATURE_UNIT descriptor (§4.7.2.8). Control bitmaps are
+/// 4 bytes per logical channel (channel 0 = master), in the same
+/// bit positions as v1 (bit 0 mute, bit 1 volume, …).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeatureUnit2 {
+    pub unit_id: u8,
+    pub source_id: u8,
+    /// Per-logical-channel control bitmaps (u32 each).
+    pub controls: Vec<u32>,
+}
+
+impl FeatureUnit2 {
+    pub fn parse(buf: &[u8]) -> Result<Self, UacError> {
+        if buf.len() < 6 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AC_SUBTYPE_FEATURE_UNIT)?;
+        let body = &buf[5..buf.len() - 1]; // exclude trailing iFeature
+        if body.len() % 4 != 0 {
+            return Err(UacError::Truncated);
+        }
+        let mut controls = Vec::new();
+        for chunk in body.chunks_exact(4) {
+            controls.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(Self {
+            unit_id: buf[3],
+            source_id: buf[4],
+            controls,
+        })
+    }
+
+    /// Master-channel (logical channel 0) control bitmap, widened
+    /// to the v1 `u16` shape the shared bind/card code consumes.
+    pub fn master_controls(&self) -> u16 {
+        self.controls.first().map(|c| *c as u16).unwrap_or(0)
+    }
+}
+
+/// UAC2 CLOCK_SOURCE descriptor (§4.7.2.10, fixed 8 bytes).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ClockSource {
+    pub clock_id: u8,
+    /// `bmAttributes`: clock type (0 internal fixed, 1 internal
+    /// variable, 2 internal programmable, 3 external).
+    pub attributes: u8,
+    /// `bmControls` — see `CLOCK_CTRL_*` (2 bits per control).
+    pub controls: u8,
+    pub assoc_terminal: u8,
+}
+
+impl ClockSource {
+    pub fn parse(buf: &[u8]) -> Result<Self, UacError> {
+        if buf.len() < 8 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AC_SUBTYPE_CLOCK_SOURCE)?;
+        Ok(Self {
+            clock_id: buf[3],
+            attributes: buf[4],
+            controls: buf[5],
+            assoc_terminal: buf[6],
+        })
+    }
+
+    /// True when the host may program the sampling frequency
+    /// (bmControls field for control 1 (frequency) == 0b10 read/
+    /// write in its low two bits, per table 4-36 encoding where
+    /// each control occupies 2 bits: bits [1:0] = frequency).
+    pub fn freq_programmable(&self) -> bool {
+        self.controls & 0x03 == 0x03 || self.controls & 0x02 != 0
+    }
+}
+
+/// UAC2 CLOCK_SELECTOR descriptor (§4.7.2.11).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClockSelector {
+    pub clock_id: u8,
+    /// Source clock IDs, one per input pin.
+    pub pins: Vec<u8>,
+    pub controls: u8,
+}
+
+impl ClockSelector {
+    pub fn parse(buf: &[u8]) -> Result<Self, UacError> {
+        if buf.len() < 5 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AC_SUBTYPE_CLOCK_SELECTOR)?;
+        let n = buf[4] as usize;
+        if buf.len() < 5 + n + 2 {
+            return Err(UacError::Truncated);
+        }
+        Ok(Self {
+            clock_id: buf[3],
+            pins: buf[5..5 + n].to_vec(),
+            controls: buf[5 + n],
+        })
+    }
+}
+
+/// UAC2 CLOCK_MULTIPLIER descriptor (§4.7.2.12). Only the graph
+/// edge (which clock it derives from) is consumed here; the
+/// numerator/denominator controls are programmed by the device.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ClockMultiplier {
+    pub clock_id: u8,
+    pub source_clock_id: u8,
+}
+
+impl ClockMultiplier {
+    pub fn parse(buf: &[u8]) -> Result<Self, UacError> {
+        if buf.len() < 5 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AC_SUBTYPE_CLOCK_MULTIPLIER)?;
+        Ok(Self {
+            clock_id: buf[3],
+            source_clock_id: buf[4],
+        })
+    }
+}
+
+/// UAC2 AS_GENERAL descriptor (§4.8.2.1, fixed 16 bytes).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AsGeneral2 {
+    pub terminal_link: u8,
+    pub controls: u8,
+    pub format_type: u8,
+    /// `bmFormats` bitmask (bit 0 = PCM, 1 = PCM8, 2 = IEEE_FLOAT,
+    /// 3 = ALAW, 4 = MULAW).
+    pub formats: u32,
+    pub nr_channels: u8,
+    pub channel_config: u32,
+}
+
+impl AsGeneral2 {
+    pub fn parse(buf: &[u8]) -> Result<Self, UacError> {
+        if buf.len() < 16 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AS_SUBTYPE_GENERAL)?;
+        Ok(Self {
+            terminal_link: buf[3],
+            controls: buf[4],
+            format_type: buf[5],
+            formats: u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]),
+            nr_channels: buf[10],
+            channel_config: u32::from_le_bytes([buf[11], buf[12], buf[13], buf[14]]),
+        })
+    }
+}
+
+/// UAC2 Type-I FORMAT_TYPE descriptor (§3.6.1 of the Formats
+/// document, fixed 6 bytes): subslot size + bit resolution; the
+/// sampling frequency lives on the clock entity, not here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FormatTypeI2 {
+    pub subslot_size: u8,
+    pub bit_resolution: u8,
+}
+
+impl FormatTypeI2 {
+    pub fn parse(buf: &[u8]) -> Result<Self, UacError> {
+        if buf.len() < 6 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AS_SUBTYPE_FORMAT_TYPE)?;
+        if buf[3] != FORMAT_TYPE_I {
+            return Err(UacError::BadSubtype(buf[3]));
+        }
+        Ok(Self {
+            subslot_size: buf[4],
+            bit_resolution: buf[5],
+        })
+    }
+}
+
+/// One sampling-frequency subrange from a UAC2 RANGE response:
+/// the clock accepts `min + k * res` up to `max`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ClockSubrange {
+    pub min_hz: u32,
+    pub max_hz: u32,
+    pub res_hz: u32,
+}
+
+/// Parse a UAC2 RANGE response for the sampling-frequency
+/// control: `wNumSubRanges` (u16) followed by that many
+/// `{dMIN, dMAX, dRES}` u32 triplets.
+pub fn parse_clock_ranges(buf: &[u8]) -> Vec<ClockSubrange> {
+    let mut out = Vec::new();
+    if buf.len() < 2 {
+        return out;
+    }
+    let n = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    let mut off = 2;
+    for _ in 0..n {
+        if off + 12 > buf.len() {
+            break;
+        }
+        let rd = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        out.push(ClockSubrange {
+            min_hz: rd(off),
+            max_hz: rd(off + 4),
+            res_hz: rd(off + 8),
+        });
+        off += 12;
+    }
+    out
+}
+
+/// Does any subrange admit `hz` exactly (inside [min, max] and
+/// on the resolution grid; a zero resolution admits the whole
+/// interval)?
+pub fn clock_rate_admitted(ranges: &[ClockSubrange], hz: u32) -> bool {
+    ranges.iter().any(|r| {
+        hz >= r.min_hz && hz <= r.max_hz && (r.res_hz == 0 || (hz - r.min_hz) % r.res_hz == 0)
+    })
+}
+
+/// Validate a runtime rate request against the learned
+/// subranges: an admitted rate passes unchanged; a rate inside
+/// a subrange's [min, max] but off its resolution grid snaps to
+/// the nearest grid point of that subrange; anything no
+/// subrange covers returns `None` (the caller must refuse the
+/// request rather than issue an out-of-range SET_CUR a clamping
+/// device would silently misreport as success).
+pub fn snap_clock_rate(ranges: &[ClockSubrange], hz: u32) -> Option<u32> {
+    if clock_rate_admitted(ranges, hz) {
+        return Some(hz);
+    }
+    for r in ranges {
+        if hz < r.min_hz || hz > r.max_hz || r.res_hz == 0 {
+            continue;
+        }
+        let res = r.res_hz as u64;
+        let lo = r.min_hz as u64 + ((hz - r.min_hz) as u64 / res) * res;
+        let hi = lo + res;
+        let cand = if hi <= r.max_hz as u64 && (hz as u64 - lo) > (hi - hz as u64) {
+            hi
+        } else {
+            lo
+        };
+        return Some(cand as u32);
+    }
+    None
+}
+
+/// Choose the rate to program from the advertised subranges:
+/// prefer exactly 48 kHz when a subrange admits it (respecting
+/// the resolution grid), else 44.1 kHz, else the lowest admitted
+/// rate. `None` when the clock admits nothing.
+pub fn choose_clock_rate(ranges: &[ClockSubrange]) -> Option<u32> {
+    if clock_rate_admitted(ranges, 48_000) {
+        return Some(48_000);
+    }
+    if clock_rate_admitted(ranges, 44_100) {
+        return Some(44_100);
+    }
+    ranges.iter().map(|r| r.min_hz).min()
+}
+
+// ── Unified topology ───────────────────────────────────────────────
+//
+// One version-tagged model the bind plan and the sound card are
+// both built from. The walker composes the per-descriptor parsers
+// above over a whole configuration blob.
+
+/// Which Audio Class revision a device speaks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UacVersion {
+    V1,
+    V2,
+}
+
+/// A terminal in the AC topology (either revision, unified).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UacTerminal {
+    pub id: u8,
+    pub terminal_type: u16,
+    /// For output terminals: the unit/terminal feeding this one.
+    /// Zero for input terminals.
+    pub source_id: u8,
+    pub is_input: bool,
+    pub nr_channels: u8,
+}
+
+/// A Feature Unit in the AC topology (either revision).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UacFeatureUnit {
+    pub id: u8,
+    pub source_id: u8,
+    /// Master-channel control bitmap (FEATURE_MUTE / FEATURE_VOLUME
+    /// bits), widened from either revision's layout.
+    pub master_controls: u16,
+    /// Number of logical channels with control bitmaps (including
+    /// the master channel at index 0).
+    pub channels: u8,
+}
+
+/// A clock entity (UAC2 only).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UacClock {
+    pub id: u8,
+    pub kind: UacClockKind,
+    /// For a source: whether SET_CUR frequency is accepted.
+    pub freq_programmable: bool,
+    /// Terminal this clock is associated with (source only).
+    pub assoc_terminal: u8,
+    /// For selectors: candidate source clock IDs.
+    pub pins: Vec<u8>,
+    /// For multipliers: the clock it derives from.
+    pub derives_from: u8,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UacClockKind {
+    Source,
+    Selector,
+    Multiplier,
+}
+
+/// The PCM shape of one alternate setting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UacAltFormat {
+    pub channels: u8,
+    pub subframe_size: u8,
+    pub bit_resolution: u8,
+    /// UAC1: discrete rates from FORMAT_TYPE (empty = continuous,
+    /// see `range`). UAC2: always empty — rates live on the clock.
+    pub rates: Vec<u32>,
+    /// UAC1 continuous range (lower, upper).
+    pub range: Option<(u32, u32)>,
+}
+
+/// One alternate setting of a streaming interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UacAlt {
+    pub alt_setting: u8,
+    pub format: Option<UacAltFormat>,
+    /// Iso endpoint address (0 = this alt has no endpoint, the
+    /// zero-bandwidth alt 0 shape).
+    pub ep_addr: u8,
+    pub ep_max_packet: u16,
+    pub ep_interval: u8,
+    /// Sampling-frequency control present on the endpoint
+    /// (CS_ENDPOINT bmAttributes bit 0; assumed true when the
+    /// device carries no CS_ENDPOINT descriptor).
+    pub ep_freq_control: bool,
+}
+
+impl UacAlt {
+    /// Endpoint Control Sequence ID on the xHCI — `(ep * 2) + dir`.
+    pub fn dci(&self) -> u8 {
+        let ep = self.ep_addr & 0x0F;
+        let is_in = self.ep_addr & 0x80 != 0;
+        (ep * 2) + (if is_in { 1 } else { 0 })
+    }
+    pub fn is_capture_ep(&self) -> bool {
+        self.ep_addr & 0x80 != 0
+    }
+}
+
+/// One AudioStreaming interface with all of its alt settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UacStream {
+    pub iface: u8,
+    /// Terminal (in the AC topology) this stream connects to.
+    pub terminal_link: u8,
+    pub alts: Vec<UacAlt>,
+}
+
+impl UacStream {
+    /// Direction from the first endpoint-bearing alt: an IN
+    /// endpoint means the device sends audio (capture).
+    pub fn is_capture(&self) -> Option<bool> {
+        self.alts
+            .iter()
+            .find(|a| a.ep_addr != 0)
+            .map(|a| a.is_capture_ep())
+    }
+}
+
+/// A whole device's parsed audio topology.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UacTopology {
+    pub version: UacVersion,
+    pub ac_iface: u8,
+    pub terminals: Vec<UacTerminal>,
+    pub feature_units: Vec<UacFeatureUnit>,
+    pub clocks: Vec<UacClock>,
+    pub streams: Vec<UacStream>,
+}
+
+impl UacTopology {
+    /// Walk a configuration descriptor blob and build the
+    /// topology. Finds the AC interface first (its protocol byte
+    /// selects the v1/v2 layouts), then decodes the AC block and
+    /// every AS interface's alt settings.
+    pub fn parse(cfg: &[u8]) -> Result<Self, UacError> {
+        // First pass: locate the AC interface + its protocol.
+        let mut version = UacVersion::V1;
+        let mut ac_iface = None;
+        let mut i = 0;
+        while i + 2 <= cfg.len() {
+            let len = cfg[i] as usize;
+            if len < 2 || i + len > cfg.len() {
+                break;
+            }
+            if cfg[i + 1] == 0x04 && len >= 9 {
+                let (num, _alt, cls, sub, proto) =
+                    (cfg[i + 2], cfg[i + 3], cfg[i + 5], cfg[i + 6], cfg[i + 7]);
+                if cls == USB_CLASS_AUDIO && sub == USB_AUDIO_SUBCLASS_AUDIOCONTROL {
+                    ac_iface = Some(num);
+                    version = if proto == USB_AUDIO_PROTOCOL_UAC2 {
+                        UacVersion::V2
+                    } else {
+                        UacVersion::V1
+                    };
+                    break;
+                }
+            }
+            i += len;
+        }
+        let ac_iface = ac_iface.ok_or(UacError::NotAudio)?;
+
+        let mut topo = UacTopology {
+            version,
+            ac_iface,
+            terminals: Vec::new(),
+            feature_units: Vec::new(),
+            clocks: Vec::new(),
+            streams: Vec::new(),
+        };
+
+        // Second pass: decode everything, tracking the current
+        // interface / alt setting.
+        #[derive(PartialEq)]
+        enum Ctx {
+            None,
+            Ac,
+            As,
+            Other,
+        }
+        let mut ctx = Ctx::None;
+        let mut cur_stream: Option<usize> = None; // index into topo.streams
+        let mut i = 0;
+        while i + 2 <= cfg.len() {
+            let len = cfg[i] as usize;
+            if len < 2 || i + len > cfg.len() {
+                break;
+            }
+            let desc = &cfg[i..i + len];
+            let dtype = desc[1];
+            match dtype {
+                0x04 if len >= 9 => {
+                    // INTERFACE
+                    let (num, alt, cls, sub) = (desc[2], desc[3], desc[5], desc[6]);
+                    if cls == USB_CLASS_AUDIO && sub == USB_AUDIO_SUBCLASS_AUDIOCONTROL {
+                        ctx = Ctx::Ac;
+                        cur_stream = None;
+                    } else if cls == USB_CLASS_AUDIO && sub == USB_AUDIO_SUBCLASS_AUDIOSTREAMING {
+                        ctx = Ctx::As;
+                        // One UacStream per interface number; alt
+                        // settings append to it.
+                        let idx = match topo.streams.iter().position(|s| s.iface == num) {
+                            Some(p) => p,
+                            None => {
+                                topo.streams.push(UacStream {
+                                    iface: num,
+                                    terminal_link: 0,
+                                    alts: Vec::new(),
+                                });
+                                topo.streams.len() - 1
+                            }
+                        };
+                        topo.streams[idx].alts.push(UacAlt {
+                            alt_setting: alt,
+                            format: None,
+                            ep_addr: 0,
+                            ep_max_packet: 0,
+                            ep_interval: 0,
+                            ep_freq_control: true,
+                        });
+                        cur_stream = Some(idx);
+                    } else {
+                        ctx = Ctx::Other;
+                        cur_stream = None;
+                    }
+                }
+                0x24 if ctx == Ctx::Ac => {
+                    topo.parse_ac_descriptor(desc);
+                }
+                0x24 if ctx == Ctx::As => {
+                    if let Some(si) = cur_stream {
+                        topo.parse_as_descriptor(si, desc);
+                    }
+                }
+                0x05 if ctx == Ctx::As && len >= 7 => {
+                    // ENDPOINT under the current alt.
+                    if let Some(si) = cur_stream {
+                        let attrs = desc[3];
+                        if attrs & 0x03 == 0x01 {
+                            // Isochronous.
+                            let alt = topo.streams[si].alts.last_mut().unwrap();
+                            alt.ep_addr = desc[2];
+                            alt.ep_max_packet = u16::from_le_bytes([desc[4], desc[5]]);
+                            alt.ep_interval = desc[6];
+                        }
+                    }
+                }
+                0x25 if ctx == Ctx::As && len >= 3 => {
+                    // CS_ENDPOINT (EP_GENERAL): bmAttributes bit 0
+                    // = sampling-frequency control.
+                    if let Some(si) = cur_stream {
+                        if desc[2] == 0x01 {
+                            let alt = topo.streams[si].alts.last_mut().unwrap();
+                            alt.ep_freq_control = desc[3] & 0x01 != 0;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += len;
+        }
+        Ok(topo)
+    }
+
+    fn parse_ac_descriptor(&mut self, desc: &[u8]) {
+        if desc.len() < 3 {
+            return;
+        }
+        match (self.version, desc[2]) {
+            (UacVersion::V1, AC_SUBTYPE_INPUT_TERMINAL) => {
+                if let Ok(t) = InputTerminal::parse(desc) {
+                    self.terminals.push(UacTerminal {
+                        id: t.terminal_id,
+                        terminal_type: t.terminal_type,
+                        source_id: 0,
+                        is_input: true,
+                        nr_channels: t.nr_channels,
+                    });
+                }
+            }
+            (UacVersion::V1, AC_SUBTYPE_OUTPUT_TERMINAL) => {
+                if let Ok(t) = OutputTerminal::parse(desc) {
+                    self.terminals.push(UacTerminal {
+                        id: t.terminal_id,
+                        terminal_type: t.terminal_type,
+                        source_id: t.source_id,
+                        is_input: false,
+                        nr_channels: 0,
+                    });
+                }
+            }
+            (UacVersion::V1, AC_SUBTYPE_FEATURE_UNIT) => {
+                if let Ok(f) = FeatureUnit::parse(desc) {
+                    self.feature_units.push(UacFeatureUnit {
+                        id: f.unit_id,
+                        source_id: f.source_id,
+                        master_controls: f.controls.first().copied().unwrap_or(0),
+                        channels: f.controls.len() as u8,
+                    });
+                }
+            }
+            (UacVersion::V2, AC_SUBTYPE_INPUT_TERMINAL) => {
+                if let Ok(t) = InputTerminal2::parse(desc) {
+                    self.terminals.push(UacTerminal {
+                        id: t.terminal_id,
+                        terminal_type: t.terminal_type,
+                        source_id: 0,
+                        is_input: true,
+                        nr_channels: t.nr_channels,
+                    });
+                }
+            }
+            (UacVersion::V2, AC_SUBTYPE_OUTPUT_TERMINAL) => {
+                if let Ok(t) = OutputTerminal2::parse(desc) {
+                    self.terminals.push(UacTerminal {
+                        id: t.terminal_id,
+                        terminal_type: t.terminal_type,
+                        source_id: t.source_id,
+                        is_input: false,
+                        nr_channels: 0,
+                    });
+                }
+            }
+            (UacVersion::V2, AC_SUBTYPE_FEATURE_UNIT) => {
+                if let Ok(f) = FeatureUnit2::parse(desc) {
+                    self.feature_units.push(UacFeatureUnit {
+                        id: f.unit_id,
+                        source_id: f.source_id,
+                        master_controls: f.master_controls(),
+                        channels: f.controls.len() as u8,
+                    });
+                }
+            }
+            (UacVersion::V2, AC_SUBTYPE_CLOCK_SOURCE) => {
+                if let Ok(c) = ClockSource::parse(desc) {
+                    self.clocks.push(UacClock {
+                        id: c.clock_id,
+                        kind: UacClockKind::Source,
+                        freq_programmable: c.freq_programmable(),
+                        assoc_terminal: c.assoc_terminal,
+                        pins: Vec::new(),
+                        derives_from: 0,
+                    });
+                }
+            }
+            (UacVersion::V2, AC_SUBTYPE_CLOCK_SELECTOR) => {
+                if let Ok(c) = ClockSelector::parse(desc) {
+                    self.clocks.push(UacClock {
+                        id: c.clock_id,
+                        kind: UacClockKind::Selector,
+                        freq_programmable: false,
+                        assoc_terminal: 0,
+                        pins: c.pins,
+                        derives_from: 0,
+                    });
+                }
+            }
+            (UacVersion::V2, AC_SUBTYPE_CLOCK_MULTIPLIER) => {
+                if let Ok(c) = ClockMultiplier::parse(desc) {
+                    self.clocks.push(UacClock {
+                        id: c.clock_id,
+                        kind: UacClockKind::Multiplier,
+                        freq_programmable: false,
+                        assoc_terminal: 0,
+                        pins: Vec::new(),
+                        derives_from: c.source_clock_id,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn parse_as_descriptor(&mut self, stream_idx: usize, desc: &[u8]) {
+        if desc.len() < 3 {
+            return;
+        }
+        match desc[2] {
+            AS_SUBTYPE_GENERAL => match self.version {
+                UacVersion::V1 => {
+                    if let Ok(g) = AsGeneral::parse(desc) {
+                        let s = &mut self.streams[stream_idx];
+                        s.terminal_link = g.terminal_link;
+                        // PCM alts get a placeholder format the
+                        // FORMAT_TYPE descriptor that follows fills
+                        // in; non-PCM alts stay format-less (and
+                        // therefore unusable to the sound layer).
+                        if g.format_tag == FORMAT_TAG_PCM {
+                            if let Some(a) = s.alts.last_mut() {
+                                if a.format.is_none() {
+                                    a.format = Some(UacAltFormat {
+                                        channels: 0,
+                                        subframe_size: 0,
+                                        bit_resolution: 0,
+                                        rates: Vec::new(),
+                                        range: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                UacVersion::V2 => {
+                    if let Ok(g) = AsGeneral2::parse(desc) {
+                        let s = &mut self.streams[stream_idx];
+                        s.terminal_link = g.terminal_link;
+                        if g.formats & 0x01 != 0 {
+                            // PCM present.
+                            if let Some(a) = s.alts.last_mut() {
+                                a.format = Some(UacAltFormat {
+                                    channels: g.nr_channels,
+                                    subframe_size: 2,
+                                    bit_resolution: 16,
+                                    rates: Vec::new(),
+                                    range: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            },
+            AS_SUBTYPE_FORMAT_TYPE => match self.version {
+                UacVersion::V1 => {
+                    if let Ok(f) = FormatTypeI::parse(desc) {
+                        let s = &mut self.streams[stream_idx];
+                        if let Some(a) = s.alts.last_mut() {
+                            if let Some(fmt) = a.format.as_mut() {
+                                fmt.channels = f.nr_channels;
+                                fmt.subframe_size = f.subframe_size;
+                                fmt.bit_resolution = f.bit_resolution;
+                                fmt.rates = f.sample_rates.clone();
+                                if let (Some(lo), Some(hi)) = (f.range_lower_hz, f.range_upper_hz) {
+                                    fmt.range = Some((lo, hi));
+                                }
+                            }
+                        }
+                    }
+                }
+                UacVersion::V2 => {
+                    if let Ok(f) = FormatTypeI2::parse(desc) {
+                        let s = &mut self.streams[stream_idx];
+                        if let Some(a) = s.alts.last_mut() {
+                            if let Some(fmt) = a.format.as_mut() {
+                                fmt.subframe_size = f.subslot_size;
+                                fmt.bit_resolution = f.bit_resolution;
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// The Feature Unit on the path feeding `terminal_id`:
+    /// follows `source_id` edges (FU → its source) until a unit
+    /// whose source is the terminal itself, or the FU whose own
+    /// source chain reaches it. Headset topologies are a direct
+    /// IT → FU → OT chain; selector/mixer units are traversed
+    /// through their recorded source edges where present.
+    pub fn feature_unit_for(&self, terminal_id: u8) -> Option<&UacFeatureUnit> {
+        // Direct: an FU whose source is the terminal.
+        if let Some(f) = self
+            .feature_units
+            .iter()
+            .find(|f| f.source_id == terminal_id)
+        {
+            return Some(f);
+        }
+        // One hop: FU feeding the terminal that feeds this one.
+        let feeder = self.terminals.iter().find(|t| t.id == terminal_id)?;
+        if feeder.source_id != 0 {
+            return self
+                .feature_units
+                .iter()
+                .find(|f| f.source_id == feeder.source_id || f.id == feeder.source_id);
+        }
+        None
+    }
+
+    /// Resolve the clock entity that drives the stream linked to
+    /// `terminal_id` (UAC2): a source associated with the
+    /// terminal, else the selector/multiplier chain pointing at
+    /// one, else the device's only clock source.
+    pub fn clock_for_terminal(&self, terminal_id: u8) -> Option<&UacClock> {
+        if let Some(c) = self
+            .clocks
+            .iter()
+            .find(|c| c.kind == UacClockKind::Source && c.assoc_terminal == terminal_id)
+        {
+            return Some(c);
+        }
+        if self.clocks.len() == 1 {
+            return self.clocks.first();
+        }
+        // A selector whose (single) pin set includes a source
+        // associated with the terminal.
+        for c in self
+            .clocks
+            .iter()
+            .filter(|c| c.kind == UacClockKind::Selector)
+        {
+            for pin in &c.pins {
+                if let Some(src) = self.clocks.iter().find(|s| {
+                    s.id == *pin
+                        && s.kind == UacClockKind::Source
+                        && s.assoc_terminal == terminal_id
+                }) {
+                    return Some(src);
+                }
+            }
+        }
+        None
+    }
+}
+
 // ── Class enumeration + bind ───────────────────────────────────────
 //
-// Minimal "is this a UAC device, and if so claim it" path. The
-// full streaming surface (iso playback / capture rings) is a
-// follow-up — this commit makes the device visible in the
-// registry so it stops being logged as UnknownClass.
+// "Is this a UAC device, and if so claim it": topology walk →
+// bind conversation → sound-card publication → registry entry.
 
 extern crate alloc;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// One bound UAC device — slot id + AudioControl interface number.
-/// The streaming-interface enumeration + iso endpoint open lives
-/// behind this once the iso path lands.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct UacDevice {
     pub slot_id: u8,
     /// `bInterfaceNumber` of the AudioControl interface.
@@ -404,10 +1301,473 @@ pub struct UacDevice {
     pub iso_out_dci: u8,
     /// DCI of the iso-IN endpoint (capture / microphone). 0 = none.
     pub iso_in_dci: u8,
+    /// Sound-card state when the bind published a card (`None`
+    /// for AudioControl-only devices with no usable stream).
+    pub card: Option<alloc::sync::Arc<crate::uac_card::UacCardState>>,
+    /// Why no card was published although the device has usable
+    /// streams: `Some` when `register_card` failed and the bind
+    /// degraded to registry-only, `None` when a card was
+    /// published — and also `None` for AudioControl-only
+    /// devices, which publish no card by design.
+    pub card_error: Option<narf_drivers_sound::SoundError>,
 }
 
 /// System-wide registry of bound UAC devices.
 pub static UAC_DEVICES: IrqSafeSpinLock<Vec<UacDevice>> = IrqSafeSpinLock::new(Vec::new());
+
+/// The negotiated shape of one direction, chosen at bind time.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct StreamChoice {
+    pub iface: u8,
+    pub alt_setting: u8,
+    pub ep_addr: u8,
+    pub dci: u8,
+    pub channels: u8,
+    pub subframe_size: u8,
+    pub bit_resolution: u8,
+    /// Sampling rate to program at bind (Hz). For UAC2 this is
+    /// the preferred rate; the RANGE response may adjust it (see
+    /// `BindOutcome::clock_rate_hz`).
+    pub rate_hz: u32,
+    /// Terminal the stream links to (FU lookup + clock lookup).
+    pub terminal_link: u8,
+    pub capture: bool,
+}
+
+/// Rates (Hz) one alt can serve through the sound layer: UAC1
+/// from its FORMAT_TYPE discrete list / continuous range,
+/// intersected with the sound layer's rate set; UAC2 the full
+/// standard set (the clock RANGE response narrows it at bind).
+/// Empty when the alt's shape is not sound-representable.
+pub fn alt_sound_rates(alt: &UacAlt, version: UacVersion) -> Vec<u32> {
+    let Some(fmt) = &alt.format else {
+        return Vec::new();
+    };
+    if !matches!(fmt.channels, 1 | 2 | 4 | 6 | 8) {
+        return Vec::new();
+    }
+    if !matches!(
+        (fmt.subframe_size, fmt.bit_resolution),
+        (2, 1..=16) | (3, 20) | (3, 24) | (4, 1..=32)
+    ) {
+        return Vec::new();
+    }
+    const STD: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+    match version {
+        UacVersion::V1 => {
+            if !fmt.rates.is_empty() {
+                return STD.into_iter().filter(|r| fmt.rates.contains(r)).collect();
+            }
+            match fmt.range {
+                Some((lo, hi)) => STD.into_iter().filter(|r| *r >= lo && *r <= hi).collect(),
+                None => Vec::new(),
+            }
+        }
+        UacVersion::V2 => STD.to_vec(),
+    }
+}
+
+/// Pick the default (alt, rate) for one stream: prefer 48 kHz,
+/// then 44.1 kHz, then the highest representable rate; among alts
+/// serving the chosen rate pick the smallest max-packet that
+/// still fits one millisecond of audio (bandwidth economy).
+pub fn choose_stream_default(stream: &UacStream, version: UacVersion) -> Option<StreamChoice> {
+    let capture = stream.is_capture()?;
+    let mut best: Option<(u32, &UacAlt)> = None;
+    for alt in &stream.alts {
+        if alt.ep_addr == 0 {
+            continue;
+        }
+        let Some(fmt) = &alt.format else {
+            continue;
+        };
+        for rate in alt_sound_rates(alt, version) {
+            let frame_bytes = fmt.channels as u32 * fmt.subframe_size as u32;
+            let need = (rate * frame_bytes).div_ceil(1000);
+            if (alt.ep_max_packet as u32) < need {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((br, ba)) => {
+                    rate_pref(rate) < rate_pref(br)
+                        || (rate == br && alt.ep_max_packet < ba.ep_max_packet)
+                }
+            };
+            if better {
+                best = Some((rate, alt));
+            }
+        }
+    }
+    let (rate, alt) = best?;
+    let fmt = alt.format.as_ref()?;
+    Some(StreamChoice {
+        iface: stream.iface,
+        alt_setting: alt.alt_setting,
+        ep_addr: alt.ep_addr,
+        dci: alt.dci(),
+        channels: fmt.channels,
+        subframe_size: fmt.subframe_size,
+        bit_resolution: fmt.bit_resolution,
+        rate_hz: rate,
+        terminal_link: stream.terminal_link,
+        capture,
+    })
+}
+
+fn rate_pref(hz: u32) -> u32 {
+    match hz {
+        48_000 => 0,
+        44_100 => 1,
+        r => 100 + (192_000 - r.min(192_000)),
+    }
+}
+
+// ── Bind conversation (plan + executor) ────────────────────────────
+//
+// The bind is a pure, ordered plan of control transfers built
+// from the topology; the executor is a trivial loop over it.
+// Fatal steps abort the bind (no half-configured card is ever
+// registered); informational GETs are non-fatal and fall back to
+// spec defaults.
+
+/// One control transfer in a bind plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlStep {
+    pub request_type: u8,
+    pub request: u8,
+    pub value: u16,
+    pub index: u16,
+    pub data: StepData,
+    /// A failed fatal step aborts the bind.
+    pub fatal: bool,
+    /// What an IN response means, for the outcome record.
+    pub slot: ResponseSlot,
+    /// For a UAC2 clock SET_CUR: resolve the OUT payload against
+    /// this direction's stored RANGE response at execution time.
+    pub resolve_rate_from_range: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepData {
+    /// No data stage, or an OUT stage with these bytes.
+    Out(Vec<u8>),
+    /// IN stage of up to this many bytes.
+    In(usize),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResponseSlot {
+    None,
+    /// Sampling-frequency RANGE response of the stream's clock.
+    ClockRange {
+        capture: bool,
+    },
+    /// Current sampling frequency of a fixed (non-programmable)
+    /// clock.
+    ClockCur {
+        capture: bool,
+    },
+    FuVolumeMin {
+        capture: bool,
+    },
+    FuVolumeMax {
+        capture: bool,
+    },
+    FuVolumeRes {
+        capture: bool,
+    },
+}
+
+/// Facts gathered while executing a bind plan.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BindOutcome {
+    /// Per direction [playback, capture]: (min, max, res) in
+    /// dB×256 as read from the Feature Unit.
+    pub volume_range: [Option<(i32, i32, i32)>; 2],
+    /// Rate actually programmed (or read back) on a UAC2 clock,
+    /// per direction [playback, capture].
+    pub clock_rate_hz: [Option<u32>; 2],
+    /// Clock subranges seen (UAC2), per direction.
+    pub clock_ranges: [Vec<ClockSubrange>; 2],
+    /// Steps completed (attempted non-fatal failures included).
+    pub steps_executed: usize,
+}
+
+impl BindOutcome {
+    pub fn dir_idx(capture: bool) -> usize {
+        if capture {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+/// Build the full ordered bind conversation for a device:
+/// SET_CONFIGURATION, then per direction (in `choices` order)
+/// SET_INTERFACE → sampling frequency → FeatureUnit range + set.
+pub fn build_bind_plan(
+    topo: &UacTopology,
+    cfg_value: u8,
+    choices: &[StreamChoice],
+) -> Vec<ControlStep> {
+    let plain =
+        |request_type: u8, request: u8, value: u16, index: u16, data: StepData, fatal: bool| {
+            ControlStep {
+                request_type,
+                request,
+                value,
+                index,
+                data,
+                fatal,
+                slot: ResponseSlot::None,
+                resolve_rate_from_range: None,
+            }
+        };
+    let mut steps = alloc::vec![plain(
+        0x00,
+        crate::hid::STD_REQ_SET_CONFIGURATION,
+        cfg_value as u16,
+        0,
+        StepData::Out(Vec::new()),
+        true,
+    )];
+    for choice in choices {
+        steps.push(plain(
+            0x01,
+            crate::control::REQ_SET_INTERFACE,
+            choice.alt_setting as u16,
+            choice.iface as u16,
+            StepData::Out(Vec::new()),
+            true,
+        ));
+        // Sampling frequency.
+        match topo.version {
+            UacVersion::V1 => {
+                steps.push(plain(
+                    0x22,
+                    REQ_SET_CUR,
+                    (SAMPLING_FREQUENCY_CONTROL as u16) << 8,
+                    choice.ep_addr as u16,
+                    StepData::Out(encode_sampling_freq(choice.rate_hz).to_vec()),
+                    true,
+                ));
+            }
+            UacVersion::V2 => {
+                if let Some(clock) = topo.clock_for_terminal(choice.terminal_link) {
+                    let idx = ((clock.id as u16) << 8) | topo.ac_iface as u16;
+                    let val = (CLOCK_CS_SAMPLING_FREQUENCY as u16) << 8;
+                    if clock.freq_programmable {
+                        let mut get_range =
+                            plain(0xA1, REQ_RANGE, val, idx, StepData::In(2 + 12 * 8), false);
+                        get_range.slot = ResponseSlot::ClockRange {
+                            capture: choice.capture,
+                        };
+                        steps.push(get_range);
+                        let mut set_cur = plain(
+                            0x21,
+                            REQ_CUR,
+                            val,
+                            idx,
+                            StepData::Out(choice.rate_hz.to_le_bytes().to_vec()),
+                            true,
+                        );
+                        set_cur.resolve_rate_from_range = Some(choice.capture);
+                        steps.push(set_cur);
+                    } else {
+                        // Fixed clock: read the rate the card must
+                        // advertise. GET_CUR on a UAC2 clock uses
+                        // bRequest CUR (0x01) with an IN stage.
+                        let mut get_cur = plain(0xA1, REQ_CUR, val, idx, StepData::In(4), false);
+                        get_cur.slot = ResponseSlot::ClockCur {
+                            capture: choice.capture,
+                        };
+                        steps.push(get_cur);
+                    }
+                }
+            }
+        }
+        // Feature Unit on this direction's path: learn the volume
+        // range, then program 0 dB (the card clamps against the
+        // learned range) and unmute.
+        if let Some(fu) = topo.feature_unit_for(choice.terminal_link) {
+            let idx = fu_windex(fu.id, topo.ac_iface);
+            let mc = fu.master_controls;
+            if mc & FEATURE_VOLUME != 0 {
+                for (req, slot) in [
+                    (
+                        REQ_GET_MIN,
+                        ResponseSlot::FuVolumeMin {
+                            capture: choice.capture,
+                        },
+                    ),
+                    (
+                        REQ_GET_MAX,
+                        ResponseSlot::FuVolumeMax {
+                            capture: choice.capture,
+                        },
+                    ),
+                    (
+                        REQ_GET_RES,
+                        ResponseSlot::FuVolumeRes {
+                            capture: choice.capture,
+                        },
+                    ),
+                ] {
+                    let mut s = plain(
+                        0xA1,
+                        req,
+                        fu_wvalue(FU_CS_VOLUME, CHANNEL_MASTER),
+                        idx,
+                        StepData::In(2),
+                        false,
+                    );
+                    s.slot = slot;
+                    steps.push(s);
+                }
+                steps.push(plain(
+                    0x21,
+                    REQ_SET_CUR,
+                    fu_wvalue(FU_CS_VOLUME, CHANNEL_MASTER),
+                    idx,
+                    StepData::Out(encode_volume(0).to_vec()),
+                    true,
+                ));
+            }
+            if mc & FEATURE_MUTE != 0 {
+                steps.push(plain(
+                    0x21,
+                    REQ_SET_CUR,
+                    fu_wvalue(FU_CS_MUTE, CHANNEL_MASTER),
+                    idx,
+                    StepData::Out(encode_mute(false).to_vec()),
+                    true,
+                ));
+            }
+        }
+    }
+    steps
+}
+
+/// Execute a bind plan against the xHCI. RANGE-aware rate
+/// resolution happens when a flagged clock SET_CUR step runs:
+/// its coded payload is the preferred rate, re-resolved via
+/// `choose_clock_rate` against the stored RANGE response.
+pub async fn execute_bind_plan(
+    ctrl: &crate::xhci::Xhci,
+    slot_id: u8,
+    steps: &[ControlStep],
+) -> Result<BindOutcome, UacError> {
+    let mut outcome = BindOutcome::default();
+    for step in steps {
+        let res: Result<Vec<u8>, UacError> = match &step.data {
+            StepData::Out(bytes) => {
+                let mut payload = bytes.clone();
+                if let Some(capture) = step.resolve_rate_from_range {
+                    let i = BindOutcome::dir_idx(capture);
+                    if !outcome.clock_ranges[i].is_empty() {
+                        if let Some(hz) = choose_clock_rate(&outcome.clock_ranges[i]) {
+                            payload = hz.to_le_bytes().to_vec();
+                            outcome.clock_rate_hz[i] = Some(hz);
+                        }
+                    }
+                }
+                ctrl.control_out(
+                    slot_id,
+                    step.request_type,
+                    step.request,
+                    step.value,
+                    step.index,
+                    &payload,
+                )
+                .await
+                .map(|_| Vec::new())
+                .map_err(|_| UacError::SetConfigFailed)
+            }
+            StepData::In(len) => {
+                let mut buf = alloc::vec![0u8; *len];
+                match ctrl
+                    .control_in(
+                        slot_id,
+                        step.request_type,
+                        step.request,
+                        step.value,
+                        step.index,
+                        &mut buf,
+                    )
+                    .await
+                {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Ok(buf)
+                    }
+                    Err(_) => Err(UacError::SetConfigFailed),
+                }
+            }
+        };
+        match res {
+            Ok(data) => {
+                outcome.steps_executed += 1;
+                record_response(&mut outcome, step.slot, &data);
+            }
+            Err(e) => {
+                if step.fatal {
+                    return Err(e);
+                }
+                outcome.steps_executed += 1; // attempted; defaults apply
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+pub(crate) fn record_response(outcome: &mut BindOutcome, slot: ResponseSlot, data: &[u8]) {
+    let rd_i16 = |d: &[u8]| -> Option<i32> {
+        if d.len() >= 2 {
+            Some(i16::from_le_bytes([d[0], d[1]]) as i32)
+        } else {
+            None
+        }
+    };
+    // Default FU range until a read lands: −128 dB .. 0 dB, 1 dB steps.
+    const DEFAULT_RANGE: (i32, i32, i32) = (i16::MIN as i32, 0, 256);
+    match slot {
+        ResponseSlot::None => {}
+        ResponseSlot::ClockRange { capture } => {
+            let i = BindOutcome::dir_idx(capture);
+            outcome.clock_ranges[i] = parse_clock_ranges(data);
+        }
+        ResponseSlot::ClockCur { capture } => {
+            let i = BindOutcome::dir_idx(capture);
+            if data.len() >= 4 {
+                outcome.clock_rate_hz[i] =
+                    Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
+            }
+        }
+        ResponseSlot::FuVolumeMin { capture } => {
+            let i = BindOutcome::dir_idx(capture);
+            let cur = outcome.volume_range[i].unwrap_or(DEFAULT_RANGE);
+            if let Some(v) = rd_i16(data) {
+                outcome.volume_range[i] = Some((v, cur.1, cur.2));
+            }
+        }
+        ResponseSlot::FuVolumeMax { capture } => {
+            let i = BindOutcome::dir_idx(capture);
+            let cur = outcome.volume_range[i].unwrap_or(DEFAULT_RANGE);
+            if let Some(v) = rd_i16(data) {
+                outcome.volume_range[i] = Some((cur.0, v, cur.2));
+            }
+        }
+        ResponseSlot::FuVolumeRes { capture } => {
+            let i = BindOutcome::dir_idx(capture);
+            let cur = outcome.volume_range[i].unwrap_or(DEFAULT_RANGE);
+            if let Some(v) = rd_i16(data) {
+                outcome.volume_range[i] = Some((cur.0, cur.1, v));
+            }
+        }
+    }
+}
 
 /// Walk a configuration descriptor blob looking for the first
 /// interface whose `bInterfaceClass:SubClass` matches Audio /
@@ -433,34 +1793,66 @@ pub fn find_audio_control_interface(cfg: &[u8]) -> Option<u8> {
     None
 }
 
-/// Bind to an already-addressed UAC device. Issues SET_CONFIGURATION
-/// so the device exits Default state, then records the slot/interface
-/// pair in UAC_DEVICES. Returns the new index on success.
+/// Bind to an already-addressed UAC device: walk the topology,
+/// run the full bind conversation (SET_CONFIGURATION → per-stream
+/// SET_INTERFACE alt selection → sampling-frequency SET_CUR →
+/// FeatureUnit range read + SET_CUR program), register the sound
+/// card, then record the slot in UAC_DEVICES. Returns the new
+/// registry index on success.
+///
+/// AudioControl-only devices (USB volume knobs and friends, no
+/// usable stream) still bind registry-only after
+/// SET_CONFIGURATION, exactly as before.
 pub async fn try_bind_audio_already_addressed(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
     cfg: &[u8],
 ) -> Result<usize, UacError> {
-    let ac_iface = find_audio_control_interface(cfg).ok_or(UacError::NotAudio)?;
+    let topo = UacTopology::parse(cfg)?;
+    let ac_iface = topo.ac_iface;
     let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
-    if xhci_dev
-        .control_out(
-            slot_id,
-            0x00,
-            crate::hid::STD_REQ_SET_CONFIGURATION,
-            cfg_value as u16,
-            0,
-            &[],
-        )
-        .await
-        .is_err()
-    {
-        return Err(UacError::SetConfigFailed);
+
+    let mut choices: Vec<StreamChoice> = Vec::new();
+    for stream in &topo.streams {
+        if let Some(c) = choose_stream_default(stream, topo.version) {
+            choices.push(c);
+        }
     }
+    // Playback streams first, matching the plan's documented order.
+    choices.sort_by_key(|c| c.capture);
+
+    let plan = build_bind_plan(&topo, cfg_value, &choices);
+    let outcome = execute_bind_plan(xhci_dev, slot_id, &plan).await?;
+
     // Find iso endpoints in any AudioStreaming alt setting. May be
     // absent (UAC AudioControl-only devices like USB volume knobs);
     // in that case the iso DCIs stay 0.
     let (iso_out_dci, iso_in_dci) = find_audio_streaming_iso_eps(cfg);
+
+    let mut card_error = None;
+    let card = if choices.is_empty() {
+        None
+    } else {
+        let state = crate::uac_card::UacCardState::from_bind(slot_id, &topo, &choices, &outcome);
+        match crate::uac_card::register_card(&state) {
+            Ok(_) => Some(state),
+            Err(e) => {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "uac: card registration failed slot={} err={:?}",
+                    slot_id,
+                    e
+                );
+                // Degrade to registry-only, but surface the
+                // failure on the registry entry — typed, like
+                // the plan's other outcomes — not just the log.
+                card_error = Some(e);
+                None
+            }
+        }
+    };
+
     let mut g = UAC_DEVICES.lock();
     let idx = g.len();
     g.push(UacDevice {
@@ -468,8 +1860,62 @@ pub async fn try_bind_audio_already_addressed(
         ac_iface,
         iso_out_dci,
         iso_in_dci,
+        card,
+        card_error,
     });
     Ok(idx)
+}
+
+/// Unbind every UAC device on `slot_id`: unregister its sound
+/// card (outstanding leases keep the hardware alive until they
+/// stop, per the sound layer's contract) and drop the registry
+/// entries. Returns how many entries were removed.
+///
+/// There is no supervisor caller on main yet — the USB detach
+/// passes (PRs #846/#847) call this from their per-slot teardown
+/// once they land.
+pub fn unbind_audio(slot_id: u8) -> usize {
+    let removed: Vec<UacDevice> = {
+        let mut reg = UAC_DEVICES.lock();
+        let mut taken = Vec::new();
+        let mut i = 0;
+        while i < reg.len() {
+            if reg[i].slot_id == slot_id {
+                taken.push(reg.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        taken
+    };
+    for dev in &removed {
+        if let Some(state) = &dev.card {
+            state.detach();
+        }
+    }
+    removed.len()
+}
+
+/// Unbind every bound UAC device (all slots). See `unbind_audio`.
+pub fn unbind_all_uac() -> usize {
+    let removed: Vec<UacDevice> = {
+        let mut reg = UAC_DEVICES.lock();
+        reg.drain(..).collect()
+    };
+    for dev in &removed {
+        if let Some(state) = &dev.card {
+            state.detach();
+        }
+    }
+    removed.len()
+}
+
+/// Test-only: push a pre-built registry entry without running a
+/// bind conversation (fixture companion to
+/// `__reset_uac_for_test`).
+#[doc(hidden)]
+pub fn __push_uac_for_test(dev: UacDevice) {
+    UAC_DEVICES.lock().push(dev);
 }
 
 /// Scan the config blob for the first AudioStreaming interface's
@@ -591,6 +2037,12 @@ pub fn __reset_uac_for_test() {
 pub const REQ_SET_CUR: u8 = 0x01;
 /// `GET_CUR` class request code.
 pub const REQ_GET_CUR: u8 = 0x81;
+/// `GET_MIN` class request code (Feature Unit range query).
+pub const REQ_GET_MIN: u8 = 0x82;
+/// `GET_MAX` class request code.
+pub const REQ_GET_MAX: u8 = 0x83;
+/// `GET_RES` class request code.
+pub const REQ_GET_RES: u8 = 0x84;
 /// Control selector for sampling-frequency endpoint control.
 pub const SAMPLING_FREQUENCY_CONTROL: u8 = 0x01;
 

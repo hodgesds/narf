@@ -203,6 +203,72 @@ fn smoke_fdt_chosen_bootargs() -> TestResult {
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_chosen_bootargs);
 
+/// The guest cmdline xtask builds on an affected-filter test run
+/// (#960): a ~430-byte `test_subsystem=` include list followed by the
+/// `test_subsystem_exclude=` token. The exclude token starts past
+/// byte 440, so the old 256-byte `chosen_bootargs` cap silently
+/// dropped it (and the last wanted subsystems) on the FDT path.
+fn affected_filter_append() -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"test_subsystem=");
+    v.extend_from_slice(b"aarch64,audio,bluetooth,drivers/gpu,drivers/graphics,drivers/input,drivers/sound,drivers/usb,drivers/virtio,drivers/wireless/ath10k,drivers/wireless/ath11k,drivers/wireless/ath9k,drivers/wireless/brcmfmac,drivers/wireless/cyw43439,drivers/wireless/e2e,drivers/wireless/iwlwifi,drivers/wireless/qualcomm,drivers/wireless/rtl8xxxu,drivers/wireless/rtlwifi,drivers/wireless/rtw88,drivers/wireless/rtw89,fb,frame,verification,wireless");
+    v.extend_from_slice(b" test_subsystem_exclude=drivers/gpu");
+    v
+}
+
+fn smoke_fdt_chosen_bootargs_long_append_survives() -> TestResult {
+    let append = affected_filter_append();
+    // Shape sanity: the append must actually exercise the old cap —
+    // the exclude token has to start past byte 255.
+    let exclude_len = b"test_subsystem_exclude=drivers/gpu".len();
+    if append.len() <= 256 || append.len() - exclude_len <= 255 {
+        return TestResult::Fail("fixture append does not cross the old 256-byte cap");
+    }
+    let mut value = append.clone();
+    value.push(0);
+    let nodes = &[("chosen", &[("bootargs", value.as_slice())][..])];
+    let blob = build_blob(0, &[], &[], nodes);
+    let bargs = fdt::chosen_bootargs(&blob).expect("bootargs");
+    if bargs.len() != append.len() {
+        return TestResult::Fail("long bootargs truncated at the FDT layer");
+    }
+    if bargs.as_bytes() != append.as_slice() {
+        return TestResult::Fail("long bootargs content mismatch");
+    }
+    if !bargs
+        .as_str()
+        .ends_with("test_subsystem_exclude=drivers/gpu")
+    {
+        return TestResult::Fail("trailing exclude token lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "firmware/fdt",
+    smoke_fdt_chosen_bootargs_long_append_survives
+);
+
+fn smoke_fdt_chosen_bootargs_oversized_clips_at_cap() -> TestResult {
+    // A bootargs past BOOTARGS_CAP is clipped to exactly the cap.
+    // That exact-width result is the signal the boot store's
+    // truncation warning relies on (its keep-limit is one byte below
+    // the cap, so a clipped value can never fit silently).
+    let mut value = Vec::new();
+    value.resize(fdt::BOOTARGS_CAP + 64, b'a');
+    value.push(0);
+    let nodes = &[("chosen", &[("bootargs", value.as_slice())][..])];
+    let blob = build_blob(0, &[], &[], nodes);
+    let bargs = fdt::chosen_bootargs(&blob).expect("bootargs");
+    if bargs.len() != fdt::BOOTARGS_CAP {
+        return TestResult::Fail("oversized bootargs not clipped at BOOTARGS_CAP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "firmware/fdt",
+    smoke_fdt_chosen_bootargs_oversized_clips_at_cap
+);
+
 fn smoke_fdt_memory_ranges() -> TestResult {
     // DTSpec 2.3.5: root-default cells are <2> (8-byte addr) and <1> (4-byte size).
     let mut reg = Vec::new();

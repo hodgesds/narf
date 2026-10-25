@@ -53,6 +53,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use async_trait::async_trait;
 use narf_tpm::{TpmDevice, TpmError as HighLevelTpmError, TpmInfo};
@@ -489,20 +490,7 @@ impl TpmDevice for Tpm {
     }
 
     async fn extend_pcr(&self, pcr: u32, digest: &[u8]) -> Result<(), HighLevelTpmError> {
-        // TPM2_CC_PCR_Extend: tag=0x8001, cc=0x00000182, pcrIndex=u32, auth=0, count=1, alg=SHA256, digest
-        let mut req = Vec::new();
-        req.extend_from_slice(&0x8001u16.to_be_bytes());
-        req.extend_from_slice(&(10 + 4 + 4 + 4 + 2 + 32u32).to_be_bytes()); // size
-        req.extend_from_slice(&0x0000_0182u32.to_be_bytes());
-        req.extend_from_slice(&pcr.to_be_bytes());
-        // authArea (empty session)
-        req.extend_from_slice(&0u32.to_be_bytes());
-        // digestCount = 1
-        req.extend_from_slice(&1u32.to_be_bytes());
-        // alg = SHA256 (0x000B)
-        req.extend_from_slice(&0x000Bu16.to_be_bytes());
-        req.extend_from_slice(digest);
-
+        let req = build_pcr_extend_request(pcr, digest);
         let _resp = self.submit_raw(&req).await?;
         Ok(())
     }
@@ -532,13 +520,38 @@ impl TpmDevice for Tpm {
     }
 }
 
+/// Build the `TPM2_PCR_Extend` request submitted by `extend_pcr`.
+///
+/// The frame comes from the canonical `narf_tpm` builder — the
+/// `TPM_ST_SESSIONS` + `TPM_RS_PW` encoding of TPM 2.0 Part 3
+/// §22.2, identical in structure to
+/// `drivers/tpm/src/tpm2/commands.rs::pcr_extend`. A hand-rolled
+/// copy here previously emitted `TPM_ST_NO_SESSIONS` with a zero
+/// authorizationSize (and a commandSize hardcoded to a 32-byte
+/// digest): a real TPM parses the digest count as 0 and rejects
+/// the command with `TPM_RC_VALUE` (#937). Factored out of the
+/// trait method so the kernel-test fixture
+/// (`smoke_tpm_pcr_extend_request_bytes`) can pin the exact wire
+/// bytes at this seam without hardware.
+pub fn build_pcr_extend_request(pcr: u32, digest: &[u8]) -> Vec<u8> {
+    narf_tpm::commands::CommandBuilder::pcr_extend(pcr, digest)
+}
+
 // ── Singleton ──────────────────────────────────────────────────────
 
-static TPM: IrqSafeSpinLock<Option<Tpm>> = IrqSafeSpinLock::new(None);
+static TPM: IrqSafeSpinLock<Option<Arc<Tpm>>> = IrqSafeSpinLock::new(None);
 
 /// Best-effort initialisation against `TPM_BASE_LOCALITY_0`. Used
 /// from the Stage::Subsys initcall — silently no-ops on hosts
 /// without a TPM.
+///
+/// On a successful probe the device is published through two handles
+/// on the SAME `Arc<Tpm>`: this crate's singleton (backing
+/// `with_tpm` / `is_present` / `kind`) and `narf_tpm::registry` —
+/// the dispatch target `frame::measure` consults for hardware PCR
+/// extends. Registration happens exactly once, on the None→Some
+/// transition guarded by the early return above, so a repeated
+/// initcall can never double-register the device.
 pub fn try_init_default() {
     if !cfg!(target_arch = "x86_64") {
         return;
@@ -550,6 +563,8 @@ pub fn try_init_default() {
     // is identity-mapped on x86_64.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     if let Ok(dev) = unsafe { Tpm::probe(TPM_BASE_LOCALITY_0) } {
+        let dev = Arc::new(dev);
+        narf_tpm::registry::register(dev.clone());
         *TPM.lock() = Some(dev);
     }
 }
@@ -563,9 +578,13 @@ pub fn kind() -> Option<TpmKind> {
 }
 
 pub fn with_tpm<R>(f: impl FnOnce(&Tpm) -> R) -> Option<R> {
-    TPM.lock().as_ref().map(f)
+    TPM.lock().as_ref().map(|t| f(t.as_ref()))
 }
 
+/// Test-only: drop the singleton handle. The `narf_tpm::registry`
+/// registration made at probe time is a second handle on the same
+/// device; fixtures that need the full no-TPM state must also call
+/// `narf_tpm::registry::__reset_for_test`.
 #[doc(hidden)]
 pub fn __reset_for_test() {
     *TPM.lock() = None;

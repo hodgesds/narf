@@ -100,6 +100,17 @@ pub struct MinixVolume<B: BlockDevice> {
     /// distinguish file instances even if an anchor address is
     /// recycled).
     mmap_anchors: IrqSafeSpinLock<BTreeMap<u64, Weak<MmapAnchor>>>,
+    /// The one cached inode decode per inode number, shared by
+    /// every node of the inode (see [`InodeCell`]). Nodes are
+    /// minted per lookup, so the decode cannot live on the node:
+    /// two opens of one file are two objects, and a size change
+    /// through one must be visible to the other — a per-node copy
+    /// is never revalidated and goes stale the moment another
+    /// open writes or truncates (#962). Weak, like the anchors:
+    /// an inode no open references gives its cell up, and
+    /// `free_inode` drops the entry outright so a recycled inode
+    /// number mints a fresh cell for its new tenant.
+    inode_cells: IrqSafeSpinLock<BTreeMap<u64, Weak<InodeCell>>>,
 }
 
 /// Content-generation counters for one volume. Values are NOT
@@ -150,6 +161,60 @@ pub struct MmapAnchor {
     /// The inode number this anchor identifies. Carried for debug
     /// identity only; the anchor's address is the identity.
     _ino: u64,
+}
+
+/// One minix inode's cached decode, shared by every node of the
+/// inode. Where [`MmapAnchor`] shares *identity*, this shares the
+/// *metadata*: there is exactly one in-memory copy of the inode per
+/// inode number, so a mutation published through any open — or
+/// through `MinixVolume::write_inode` directly — is the copy every
+/// other open reads. Coherence by construction rather than by
+/// invalidation: no per-node snapshot exists that could go stale.
+///
+/// The lock is held only synchronously to copy the `Copy` inode in
+/// or out, never across an await — the same discipline the per-node
+/// cache this replaces used.
+#[derive(Debug)]
+pub struct InodeCell {
+    inode: IrqSafeSpinLock<Option<super::inode::Inode>>,
+}
+
+impl InodeCell {
+    fn new() -> Self {
+        Self {
+            inode: IrqSafeSpinLock::new(None),
+        }
+    }
+
+    fn seeded(inode: super::inode::Inode) -> Self {
+        Self {
+            inode: IrqSafeSpinLock::new(Some(inode)),
+        }
+    }
+
+    /// The cached decode, if any node (or `write_inode`) has
+    /// published one yet.
+    pub fn get(&self) -> Option<super::inode::Inode> {
+        *self.inode.lock()
+    }
+
+    /// Publish `inode` as the inode's current decode.
+    pub fn store(&self, inode: super::inode::Inode) {
+        *self.inode.lock() = Some(inode);
+    }
+
+    /// Fill the cell from a fresh decode, unless another node
+    /// already published one. Used when a node is minted carrying
+    /// a decode: the cell's existing contents, when present, are
+    /// at least as current (every mutation publishes through
+    /// `write_inode` before it completes), so the decode a lookup
+    /// just made is only a seed for an empty cell.
+    fn seed(&self, inode: super::inode::Inode) {
+        let mut slot = self.inode.lock();
+        if slot.is_none() {
+            *slot = Some(inode);
+        }
+    }
 }
 
 impl<B: BlockDevice + 'static> MinixVolume<B> {
@@ -209,6 +274,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             root_inode: IrqSafeSpinLock::new(None),
             cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
             mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
+            inode_cells: IrqSafeSpinLock::new(BTreeMap::new()),
         });
         let root = volume.read_inode(super::MINIX_ROOT_INO).await?;
         *volume.root_inode.lock() = Some(root);
@@ -261,6 +327,52 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         let anchor = Arc::new(MmapAnchor { _ino: key });
         anchors.insert(key, Arc::downgrade(&anchor));
         anchor
+    }
+
+    /// The live [`InodeCell`] for inode `ino`, created empty on
+    /// first use. Dead entries are pruned as the table grows (same
+    /// cadence as [`MinixVolume::mmap_anchor`]).
+    pub fn inode_cell(&self, ino: u32) -> Arc<InodeCell> {
+        let key = u64::from(ino);
+        let mut cells = self.inode_cells.lock();
+        if let Some(cell) = cells.get(&key).and_then(Weak::upgrade) {
+            return cell;
+        }
+        if cells.len() >= 256 && cells.len().is_power_of_two() {
+            cells.retain(|_, cell| cell.strong_count() != 0);
+        }
+        let cell = Arc::new(InodeCell::new());
+        cells.insert(key, Arc::downgrade(&cell));
+        cell
+    }
+
+    /// The live [`InodeCell`] for inode `ino`, seeded with `inode`
+    /// when the cell is newly created or still empty. A cell that
+    /// already holds a decode keeps it — see [`InodeCell::seed`].
+    pub fn inode_cell_seeded(&self, ino: u32, inode: super::inode::Inode) -> Arc<InodeCell> {
+        let key = u64::from(ino);
+        let mut cells = self.inode_cells.lock();
+        if let Some(cell) = cells.get(&key).and_then(Weak::upgrade) {
+            drop(cells);
+            cell.seed(inode);
+            return cell;
+        }
+        if cells.len() >= 256 && cells.len().is_power_of_two() {
+            cells.retain(|_, cell| cell.strong_count() != 0);
+        }
+        let cell = Arc::new(InodeCell::seeded(inode));
+        cells.insert(key, Arc::downgrade(&cell));
+        cell
+    }
+
+    /// The live [`InodeCell`] for inode `ino`, if one exists —
+    /// never creates one. For publishers (write_inode, free_inode)
+    /// that must not mint state for an inode nobody holds open.
+    fn live_inode_cell(&self, ino: u32) -> Option<Arc<InodeCell>> {
+        self.inode_cells
+            .lock()
+            .get(&u64::from(ino))
+            .and_then(Weak::upgrade)
     }
 
     /// Read one device sector (LBS bytes) into `dst`. `dst.len()`
@@ -597,6 +709,13 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         if ino == super::MINIX_ROOT_INO {
             *self.root_inode.lock() = Some(*inode);
         }
+        // Publish into the shared cell, so every open of this inode
+        // reads the decode just persisted — including writes that
+        // bypass the inode's own node (unlink/rmdir publish the
+        // victim's decremented link count through here).
+        if let Some(cell) = self.live_inode_cell(ino) {
+            cell.store(*inode);
+        }
         Ok(())
     }
 
@@ -684,7 +803,15 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
     pub async fn free_inode(&self, ino: u32) -> Result<(), FsError> {
         let imap_start = self.sb.imap_first_block();
         let n = self.sb.imap_blocks;
-        self.free_bitmap_bit(imap_start, n, ino).await
+        self.free_bitmap_bit(imap_start, n, ino).await?;
+        // The number is free now: drop its cell entry so the next
+        // tenant of the number mints a fresh cell instead of
+        // inheriting this file's decode. Nodes still holding the
+        // freed inode open keep their Arc to the old cell — their
+        // unlinked file keeps its last published state, exactly the
+        // snapshot semantics an open of a deleted file has today.
+        self.inode_cells.lock().remove(&u64::from(ino));
+        Ok(())
     }
 
     /// Allocate a fresh zone. Returns the absolute zone number.
@@ -900,6 +1027,264 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         }
         inode.size = 0;
         Ok(())
+    }
+
+    /// Release the tail of `inode` for a truncate shrink to
+    /// `new_size` (issue #844): every zone at file-zone index
+    /// `ceil(new_size / zone_size)` or beyond is detached and freed,
+    /// and the bytes of the last kept zone past `new_size` are
+    /// zeroed on disk. Without this, shrink only moved `i_size` and
+    /// a later regrow (a size-only bump) re-served the retained
+    /// zones' pre-shrink bytes instead of zeros.
+    ///
+    /// `inode.size` is deliberately NOT updated here — the caller
+    /// commits the new size with its final `write_inode`, last, so
+    /// a failure below never leaves a persisted inode claiming a
+    /// size whose zones are half-released. The phases are ordered
+    /// so every intermediate state is safe:
+    ///
+    /// 1. **Detach.** Zone pointers at index >= keep are cleared —
+    ///    indirect blocks are rewritten on disk as they are
+    ///    detached; direct slots and indirect roots are cleared in
+    ///    the in-memory inode. Nothing is freed yet, so a failure
+    ///    here changes no allocation state (the tail simply reads
+    ///    as holes where its pointers were already cleared).
+    /// 2. **Persist the detach.** The inode is written back with
+    ///    the cleared slots and the OLD size. After this write no
+    ///    persisted pointer references a detached zone.
+    /// 3. **Free.** Detached zones are released in the zone bitmap
+    ///    (contents before the indirect blocks that listed them,
+    ///    `truncate_inode`'s order). A failure here can only leak
+    ///    zones — marked used but unreferenced — never alias one:
+    ///    phase 2 guarantees nothing persisted points at them.
+    /// 4. **Zero the partial tail.** The last kept zone's bytes
+    ///    past the new EOF are zeroed, so the size-only regrow path
+    ///    serves zeros from the retained zone. Done after the frees
+    ///    so an abort before this point leaves the kept data —
+    ///    including the partial zone — byte-identical.
+    ///
+    /// On error the caller restores its cached inode to the
+    /// pre-truncate copy (as the `unmap_mapping_range` failure path
+    /// in `node::truncate` does); the on-disk inode still claims
+    /// the old size and every zone it references is still allocated.
+    pub async fn truncate_shrink(
+        &self,
+        ino: u32,
+        inode: &mut super::inode::Inode,
+        new_size: u64,
+    ) -> Result<(), FsError> {
+        use super::inode::{DBL_SLOT, DIRECT_ZONES, IND_SLOT, TRI_SLOT};
+        if new_size >= u64::from(inode.size) {
+            // Not a shrink (the caller routes equality here too):
+            // nothing to release.
+            return Ok(());
+        }
+        if new_size == 0 {
+            // The caller's len==0 path normally takes
+            // `truncate_inode`; keep this entry point total anyway.
+            return self.truncate_inode(inode).await;
+        }
+        let zs = self.sb.zone_size() as u64;
+        let keep = new_size.div_ceil(zs) as u32;
+        let zpb = self.sb.zone_ptrs_per_block();
+        let mut pending_free: Vec<u32> = Vec::new();
+
+        // Phase 1 — detach (see the ordering contract above).
+        for i in 0..DIRECT_ZONES {
+            if (i as u32) >= keep && inode.zones[i] != 0 {
+                pending_free.push(inode.zones[i]);
+                inode.zones[i] = 0;
+            }
+        }
+        let ind_base = DIRECT_ZONES as u32;
+        let ind = inode.zones[IND_SLOT];
+        if ind != 0
+            && self
+                .detach_indirect_from(ind, ind_base, keep, &mut pending_free)
+                .await?
+        {
+            pending_free.push(ind);
+            inode.zones[IND_SLOT] = 0;
+        }
+        let dbl_base = ind_base + zpb;
+        let dbl = inode.zones[DBL_SLOT];
+        if dbl != 0
+            && self
+                .detach_double_from(dbl, dbl_base, keep, &mut pending_free)
+                .await?
+        {
+            pending_free.push(dbl);
+            inode.zones[DBL_SLOT] = 0;
+        }
+        if !matches!(self.sb.version, super::MinixVersion::V1) {
+            let tri_base = dbl_base + zpb * zpb;
+            let tri = inode.zones[TRI_SLOT];
+            if tri != 0
+                && self
+                    .detach_triple_from(tri, tri_base, keep, &mut pending_free)
+                    .await?
+            {
+                pending_free.push(tri);
+                inode.zones[TRI_SLOT] = 0;
+            }
+        }
+
+        // Phase 2 — persist the detach, old size still in place.
+        self.write_inode(ino, inode).await?;
+
+        // Phase 3 — free the detached zones.
+        for zone in pending_free {
+            self.free_zone(zone).await?;
+        }
+
+        // Phase 4 — zero the partial tail of the last kept zone.
+        // A hole there has nothing to zero.
+        let tail_off = (new_size % zs) as usize;
+        if tail_off != 0 {
+            if let Some(zone_no) = self.map_block(inode, keep - 1).await? {
+                let mut zbuf = vec![0u8; zs as usize];
+                self.read_zone(zone_no, &mut zbuf).await?;
+                for b in &mut zbuf[tail_off..] {
+                    *b = 0;
+                }
+                self.write_zone(zone_no, &zbuf).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Detach every zone pointer at file-zone index >= `keep` in
+    /// the single-indirect block `block_no`, which covers file-zone
+    /// indices `[base, base + zpb)`. Cleared slots are persisted
+    /// before returning; detached data zones are pushed to
+    /// `pending_free` (the caller frees them only after the whole
+    /// detach is persisted). Returns true when the block carries
+    /// no live pointer afterwards — every slot is zero — so the
+    /// caller may detach the block itself. That is sound even for
+    /// slots below `keep`: they were holes, which read as zeros
+    /// with or without the block.
+    async fn detach_indirect_from(
+        &self,
+        block_no: u32,
+        base: u32,
+        keep: u32,
+        pending_free: &mut Vec<u32>,
+    ) -> Result<bool, FsError> {
+        let bs = self.sb.block_size as usize;
+        let zpb = self.sb.zone_ptrs_per_block();
+        let mut buf = vec![0u8; bs];
+        self.read_block(block_no, &mut buf).await?;
+        let mut changed = false;
+        let mut all_zero = true;
+        for i in 0..zpb {
+            let z = self.read_indirect_slot(&buf, i);
+            if z == 0 {
+                continue;
+            }
+            if base + i >= keep {
+                pending_free.push(z);
+                self.clear_indirect_slot(&mut buf, i);
+                changed = true;
+            } else {
+                all_zero = false;
+            }
+        }
+        if changed {
+            self.write_block(block_no, &buf).await?;
+        }
+        Ok(all_zero)
+    }
+
+    /// Double-indirect half of the shrink detach: `block_no` covers
+    /// file-zone indices `[base, base + zpb * zpb)`. Inner blocks
+    /// left carrying no live pointer are detached from this block
+    /// (and pushed to `pending_free` after their contents, matching
+    /// `truncate_inode`'s free order). Returns true when this block
+    /// itself carries no live pointer afterwards.
+    async fn detach_double_from(
+        &self,
+        block_no: u32,
+        base: u32,
+        keep: u32,
+        pending_free: &mut Vec<u32>,
+    ) -> Result<bool, FsError> {
+        let bs = self.sb.block_size as usize;
+        let zpb = self.sb.zone_ptrs_per_block();
+        let mut buf = vec![0u8; bs];
+        self.read_block(block_no, &mut buf).await?;
+        let mut changed = false;
+        let mut all_zero = true;
+        for o in 0..zpb {
+            let inner = self.read_indirect_slot(&buf, o);
+            if inner == 0 {
+                continue;
+            }
+            if self
+                .detach_indirect_from(inner, base + o * zpb, keep, pending_free)
+                .await?
+            {
+                pending_free.push(inner);
+                self.clear_indirect_slot(&mut buf, o);
+                changed = true;
+            } else {
+                all_zero = false;
+            }
+        }
+        if changed {
+            self.write_block(block_no, &buf).await?;
+        }
+        Ok(all_zero)
+    }
+
+    /// Triple-indirect half of the shrink detach (V2/V3 only):
+    /// `block_no` covers file-zone indices
+    /// `[base, base + zpb * zpb * zpb)`. Same contract as
+    /// [`Self::detach_double_from`], one level up.
+    async fn detach_triple_from(
+        &self,
+        block_no: u32,
+        base: u32,
+        keep: u32,
+        pending_free: &mut Vec<u32>,
+    ) -> Result<bool, FsError> {
+        let bs = self.sb.block_size as usize;
+        let zpb = self.sb.zone_ptrs_per_block();
+        let mut buf = vec![0u8; bs];
+        self.read_block(block_no, &mut buf).await?;
+        let mut changed = false;
+        let mut all_zero = true;
+        for o in 0..zpb {
+            let mid = self.read_indirect_slot(&buf, o);
+            if mid == 0 {
+                continue;
+            }
+            if self
+                .detach_double_from(mid, base + o * zpb * zpb, keep, pending_free)
+                .await?
+            {
+                pending_free.push(mid);
+                self.clear_indirect_slot(&mut buf, o);
+                changed = true;
+            } else {
+                all_zero = false;
+            }
+        }
+        if changed {
+            self.write_block(block_no, &buf).await?;
+        }
+        Ok(all_zero)
+    }
+
+    /// Zero the `idx`-th zone pointer in an indirect block buffer
+    /// (inverse of the write half of `alloc_indirect`). Width comes
+    /// from the superblock, so V1's u16 and V2/V3's u32 pointers are
+    /// both covered.
+    fn clear_indirect_slot(&self, buf: &mut [u8], idx: u32) {
+        let zps = self.sb.zone_ptr_size();
+        let off = idx as usize * zps;
+        for b in &mut buf[off..off + zps] {
+            *b = 0;
+        }
     }
 
     /// Free every zone listed in a single-indirect block (does not

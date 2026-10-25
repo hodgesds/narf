@@ -87,6 +87,13 @@ pub struct PtpTouchpad {
     /// DCI of the interrupt-IN endpoint that carries reports.
     pub interrupt_in_dci: u8,
     pub interface_num: u8,
+    /// Hub context — (index into `attach::HUBS`, downstream
+    /// port) — when the touchpad sits behind a hub; `None` on
+    /// a root port, whose ports are never idle-suspended. The
+    /// pump feeds `attach::mark_port_activity` with it whenever
+    /// a report completes, so an in-use touchpad's port never
+    /// idle-suspends mid-gesture (#840).
+    pub hub_port: Option<(usize, u8)>,
     /// Cached profile — the report-byte → field mapping derived
     /// from the device's Report Descriptor.
     pub profile: PtpProfile,
@@ -196,6 +203,7 @@ pub async fn try_bind_touchpad_already_addressed(
     hid_desc_off: usize,
     cfg: &[u8],
     ep: EndpointConfig,
+    hub_port: Option<(usize, u8)>,
 ) -> Result<(), HidError> {
     let report_len = report_descriptor_length(cfg, hid_desc_off).ok_or(HidError::NoInterruptIn)?;
     if report_len == 0 || report_len > 4096 {
@@ -327,6 +335,7 @@ pub async fn try_bind_touchpad_already_addressed(
         slot_id,
         interrupt_in_dci: dci,
         interface_num,
+        hub_port,
         profile,
         last_xy: IrqSafeSpinLock::new(None),
         last_button: IrqSafeSpinLock::new(false),
@@ -356,6 +365,14 @@ pub fn unregister_all_touchpads() {
     }
 }
 
+/// Hub contexts of all live touchpad bindings (root-attached
+/// bindings omitted). Aggregated by `hid::hub_ports` for the
+/// supervisor's HID wake step.
+pub fn hub_ports() -> alloc::vec::Vec<(usize, u8)> {
+    let g = TOUCHPADS.lock();
+    g.iter().filter_map(|p| p.hub_port).collect()
+}
+
 /// Drain reports from every bound touchpad. Each successful poll
 /// drives `ptp::decode_input` over the report bytes and pushes a
 /// `PointerEvent` (relative dx/dy + button state) onto the global
@@ -372,15 +389,26 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
     let mut total = 0usize;
     for pad in &pads {
         let mut buf = alloc::vec![0u8; PTP_REPORT_BUF_BYTES];
+        let mut reports = 0usize;
         loop {
             match xhci_dev.poll_interrupt_in(pad.slot_id, pad.interrupt_in_dci, &mut buf) {
                 Ok(Some(_)) => {
+                    reports += 1;
                     if let Ok(decoded) = ptp::decode_input(&pad.profile, &buf) {
                         total += emit_events(pad, decoded);
                     }
                 }
                 Ok(None) => break,
                 Err(_) => break,
+            }
+        }
+        // Completed interrupt-IN transfers are activity on the
+        // pad's hub port (#840) — feed even when a report
+        // decoded to zero emitted events. No-op when
+        // root-attached.
+        if reports > 0 {
+            if let Some((hub_idx, port)) = pad.hub_port {
+                crate::attach::mark_port_activity(hub_idx, port);
             }
         }
     }

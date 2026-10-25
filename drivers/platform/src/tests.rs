@@ -486,6 +486,47 @@ fn smoke_tpm_init_default() -> TestResult {
 }
 kernel_test_in!("drivers/platform/tpm", smoke_tpm_init_default);
 
+fn smoke_tpm_pcr_extend_request_bytes() -> TestResult {
+    use crate::tpm;
+    // PCR 4 (the measured-boot PCR) + a digest of distinct bytes so
+    // any transposition in the frame shows up in the diff.
+    let digest: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+        0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+        0x1E, 0x1F,
+    ];
+    let buf = tpm::build_pcr_extend_request(4, &digest);
+    // The exact frame a real TPM accepts for TPM2_PCR_Extend
+    // (Part 3 §22.2), matching the reference encoding in
+    // drivers/tpm/src/tpm2/commands.rs::pcr_extend:
+    //   tag TPM_ST_SESSIONS, TPM_RS_PW session (authSize 9),
+    //   TPML_DIGEST_VALUES { count 1, { SHA256, digest } }.
+    // The hand-rolled frame this replaced used TPM_ST_NO_SESSIONS
+    // with authorizationSize 0 and is rejected with TPM_RC_VALUE
+    // on silicon (#937).
+    let expected: [u8; 65] = [
+        0x80, 0x02, // tag = TPM_ST_SESSIONS
+        0x00, 0x00, 0x00, 0x41, // commandSize = 65
+        0x00, 0x00, 0x01, 0x82, // cc = TPM_CC_PCR_Extend
+        0x00, 0x00, 0x00, 0x04, // pcrHandle = 4
+        0x00, 0x00, 0x00, 0x09, // authorizationSize = 9
+        0x40, 0x00, 0x00, 0x09, // sessionHandle = TPM_RS_PW
+        0x00, 0x00, // nonceSize = 0
+        0x00, // sessionAttributes = 0
+        0x00, 0x00, // hmacSize = 0
+        0x00, 0x00, 0x00, 0x01, // TPML_DIGEST_VALUES.count = 1
+        0x00, 0x0B, // hashAlg = TPM_ALG_SHA256
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+        0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+        0x1E, 0x1F, // digest
+    ];
+    if buf.as_slice() != expected.as_slice() {
+        return TestResult::Fail("platform pcr_extend frame != reference encoding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/tpm", smoke_tpm_pcr_extend_request_bytes);
+
 // ── AMD AOAC ───────────────────────────────────────────────────────
 
 /// IP-index → bit-position table: each IP's 2-bit field starts at

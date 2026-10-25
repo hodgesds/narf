@@ -126,6 +126,24 @@ also consult upstream Linux GPL sources.
 - `HubDescriptor::tt_think_time()` returns the USB 2.0
   `wHubCharacteristics[6:5]` encoding used directly in a low/full-speed
   child's xHCI Slot Context.
+- Hub downstream idle-suspend: the supervisor marks ports bound via
+  `attach::mark_ports_bound`, which also stamps each port's
+  last-activity tick (a port's idle window runs from bind). Class
+  drivers feed `attach::mark_port_activity` on each completed
+  transfer and call `attach::resume_port` before a transfer to a
+  port that may be suspended. `msc::try_bind_msc_already_addressed`
+  takes the device's hub context — (index into `attach::HUBS`,
+  downstream port), `None` on a root port — and `MscDevice` records
+  it as `hub_port`; its BOT funnels resume-then-feed on every
+  transaction. The pumped HID classes (boot keyboard, boot mouse,
+  PTP touchpad, consumer control) record the same `hub_port`
+  context through their `try_bind_*_already_addressed` binders;
+  their pumps feed on each completed interrupt-IN report, and the
+  supervisor resumes suspended HID-bound ports immediately before
+  the pumps each cycle (`hid::resume_suspended_hub_ports`),
+  opening a fresh idle window — a suspended port gates the very
+  interrupt endpoint the pump polls, so the resume has to come
+  from the supervisor side of the pump, not from report traffic.
 - `Xhci::address_device_with(..., Topology)` retains the topology for later
   Evaluate Context operations; marking a downstream device as a hub must not
   erase its route string or parent-TT fields.
@@ -424,12 +442,22 @@ the USB download itself remains a target-silicon gate.
   SET_INTERFACE. Its capture task reassembles UVC payloads and delivers complete
   frames to the registered `/dev/video<N>` queue. STREAMOFF/cancellation and
   bulk-streaming orchestration remain follow-ups.
-- **UAC1** (`uac`): USB Audio Class 1.0 descriptor parser. AC
-  HEADER, INPUT_TERMINAL, OUTPUT_TERMINAL, FEATURE_UNIT (per-channel
-  control bitmaps), AS_GENERAL, Type-I FORMAT_TYPE (discrete sample-
-  rate list and continuous-range form). Class triple constants for
-  bus probing. Pure descriptor decode — pairs with a future
-  isochronous-endpoint scheduler in `xhci` to ship audio data.
+- **UAC1 + UAC2** (`uac`, `uac_card`): USB Audio Class descriptor
+  decode for both protocol revisions — v1 AC HEADER, INPUT_TERMINAL,
+  OUTPUT_TERMINAL, FEATURE_UNIT (per-channel control bitmaps),
+  AS_GENERAL, Type-I FORMAT_TYPE (discrete sample-rate list and
+  continuous-range form), and the v2 layouts including the clock
+  entity family (CLOCK_SOURCE / SELECTOR / MULTIPLIER). A topology
+  walker composes the decoders over a whole configuration. Bind is
+  a pure, ordered control-transfer plan executed against the xHCI:
+  SET_CONFIGURATION, per-stream SET_INTERFACE alt selection,
+  sampling-frequency SET_CUR (v1 endpoint control; v2 clock entity,
+  RANGE-resolved), and FeatureUnit GET_MIN/MAX/RES + SET_CUR
+  volume/mute. The bound device registers as a sound card
+  (`narf-drivers-sound`, driver `snd-usb-audio`): PCM leases select
+  alts at prepare, program rates, and run a per-stream isochronous
+  pump; FeatureUnit volume/mute surface as ALSA controls. Unbind
+  unregisters the card and drops the registry entry.
 - **CDC** (`cdc`): shared CDC functional-descriptor parser
   (Header / Union / Country / ACM / NCM / ECM subtypes), CDC-Comm
   + CDC-Data class-triple constants. Used by the per-subclass
@@ -456,8 +484,8 @@ the USB download itself remains a target-silicon gate.
   size limits.
 
 ### Out of scope (deferred)
-- UAC2 / UAC3 (newer protocol byte; descriptor layouts differ).
-- End-to-end UAC audio streaming; the xHCI periodic endpoint machinery now
-  exists, but the audio sample pump is still pending.
+- UAC3 (protocol byte 0x30; descriptor layouts differ again).
+- UAC mixer/selector-unit routing beyond Feature Units, and runtime
+  clock-selector switching (bind resolves one clock per stream).
 - Non-QCA Bluetooth vendor firmware protocols (Intel, Realtek, MediaTek,
   Broadcom).

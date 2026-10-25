@@ -65,6 +65,16 @@ pub struct NinepNode {
     /// page-cache generation source (#681) — a per-node cell because
     /// the server, not this client, is authoritative for it.
     version: IrqSafeSpinLock<u32>,
+    /// The file's length as last learned from the server: taken
+    /// from the lookup `Rstat` (`stat_child`) and refreshed by
+    /// every `stat_async`, in the same calls that refresh `times`
+    /// and `version`, so the three never move independently. The
+    /// synchronous `stat()` reports it because the generic fault
+    /// path's EOF check consults the sync stat and cannot do a
+    /// round trip per fault (#903). A server-side resize goes
+    /// stale until the next `Rstat` refresh, exactly the way
+    /// `times`/`version` do.
+    length: IrqSafeSpinLock<u64>,
     /// The session's shared `MAP_SHARED` identity anchor for this
     /// file's `qid.path`, minted on first use (see
     /// `P9Session::mmap_anchor`). Every node of the same server file
@@ -89,6 +99,7 @@ impl NinepNode {
         fid: u32,
         qid: Qid,
         times: Option<P9Times>,
+        length: u64,
     ) -> Self {
         Self {
             transport,
@@ -97,6 +108,7 @@ impl NinepNode {
             version: IrqSafeSpinLock::new(qid.version),
             qid,
             times: IrqSafeSpinLock::new(times),
+            length: IrqSafeSpinLock::new(length),
             mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
@@ -121,6 +133,7 @@ impl NinepNode {
             Ok(st) => {
                 let node = self.child_node(fid, qid);
                 *node.times.lock() = Some(P9Times::from_stat(&st));
+                *node.length.lock() = st.length;
                 // The Rstat's qid is fresher than the walk's: adopt
                 // its version so the new node's page-cache generation
                 // starts current (#681).
@@ -318,6 +331,7 @@ impl NinepNode {
             version: IrqSafeSpinLock::new(qid.version),
             qid,
             times: IrqSafeSpinLock::new(None),
+            length: IrqSafeSpinLock::new(0),
             mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
@@ -438,9 +452,14 @@ impl FileOps for NinepNode {
         } else {
             FileType::File
         };
+        // The cached length from the last Rstat (lookup /
+        // stat_async): the generic fault path's EOF check reads
+        // this synchronously, so a hardcoded 0 would refuse every
+        // fault (#903). `blocks` follows stat_async's derivation.
+        let size = *self.length.lock();
         Stat {
-            size: 0,
-            blocks: 0,
+            size,
+            blocks: size.div_ceil(512),
             mode: if ft == FileType::Dir {
                 Mode::DIR_RO
             } else {
@@ -458,6 +477,7 @@ impl FileOps for NinepNode {
             let st = self.tstat(self.fid).await?;
             let times = P9Times::from_stat(&st);
             *self.times.lock() = Some(times);
+            *self.length.lock() = st.length;
             // Refresh the cached qid.version from the reply: this is
             // how a node learns the server changed the file, and the
             // page-cache generation follows it (#681).
