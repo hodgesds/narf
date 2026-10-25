@@ -19,6 +19,14 @@ impl Fake {
     }
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model acknowledges synchronously in write(), so the first
+        // poll after the divider write already reads done; sixteen polls
+        // is pure margin, and an unacknowledged divider reaches its
+        // Timeout by count instead of burning the 100 ms deadline under
+        // the spin executor (#879).
+        Some(16)
+    }
     fn read(&mut self, reg: u64) -> u32 {
         if self.gone {
             return u32::MAX;

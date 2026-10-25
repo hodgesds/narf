@@ -101,6 +101,12 @@ impl Depth {
 trait Io: Send {
     fn read(&mut self, reg: u64) -> u32;
     fn write(&mut self, reg: u64, value: u32);
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
 }
 #[derive(Debug)]
 struct Mmio {
@@ -288,6 +294,8 @@ impl<I: Io> Engine<I> {
         self.update(DP_VID_STREAM_CNTL, 1, 0)?;
         let status = self.reg(DP_VID_STREAM_CNTL);
         let deadline = narf_time::Deadline::after_ms(50);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let value = self.access(|io| io.read(status))?;
             if value == u32::MAX {
@@ -296,6 +304,15 @@ impl<I: Io> Engine<I> {
             // linux-lit: 16=DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_STATUS__SHIFT
             if value & 1 << 16 == 0 {
                 break;
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);
@@ -328,6 +345,8 @@ impl<I: Io> Engine<I> {
         self.update(DP_VID_STREAM_CNTL, 1, 0)?;
         let status = self.reg(DP_VID_STREAM_CNTL);
         let deadline = narf_time::Deadline::after_ms(50);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let value = self.access(|io| io.read(status))?;
             if value == u32::MAX {
@@ -337,6 +356,15 @@ impl<I: Io> Engine<I> {
             if value & 1 << 16 == 0 {
                 self.state = State::Programmed;
                 return Ok(());
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);

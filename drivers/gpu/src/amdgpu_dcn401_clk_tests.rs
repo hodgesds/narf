@@ -23,6 +23,15 @@ struct Fake {
     umc_channels: u32,
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model answers every message synchronously in write() and
+        // delays a hard-min acknowledgement by at most ack_delay further
+        // message writes (fixtures use at most 2), so a wait still
+        // unanswered after sixteen polls is a designed non-response whose
+        // outcome is the timeout — reached by count instead of burning
+        // the wall-clock deadline under the spin executor (#879).
+        Some(16)
+    }
     fn read(&mut self, at: u64) -> u32 {
         *self.regs.get(&at).unwrap_or(&0)
     }
@@ -1142,6 +1151,8 @@ fn dcn401_sent_optional_timeouts_continue_without_reusing_cancelled_commands() -
         start(&mut e);
         e.io.commands.clear();
         e.io.stall = Some(step);
+        // The model's poll cap bounds the stalled send's settled wait
+        // (#879), so the first poll pends inside it by construction.
         {
             let mut cx = Context::from_waker(Waker::noop());
             let mut f = core::pin::pin!(e.notify_wm_ranges(0x8_0040_1000));

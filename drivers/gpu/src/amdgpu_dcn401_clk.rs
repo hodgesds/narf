@@ -349,6 +349,12 @@ impl Layout {
 trait Io {
     fn read(&mut self, at: u64) -> u32;
     fn write(&mut self, at: u64, value: u32);
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
 }
 #[derive(Debug)]
 struct Mmio(MmioRegion);
@@ -415,10 +421,21 @@ impl<I: Io> Engine<I> {
     }
     async fn settled(&mut self, deadline: narf_time::Deadline) -> Result<u32, Error> {
         let at = self.layout.mp1 + u64::from(RESPONSE) * 4;
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let value = self.access(|io| checked(io.read(at)))?;
             if value != 0 {
                 return Ok(value);
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);
@@ -597,6 +614,8 @@ impl<I: Io> Engine<I> {
         // Mailbox OK only accepts the request. ReturnHardMinStatus acknowledges
         // that this specific PPCLK floor has actually taken effect.
         let deadline = narf_time::Deadline::after_ms(1000);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let bits = self.command_until(0x15, 0, deadline).await.map_err(|e| {
                 if e == Error::Timeout {
@@ -607,6 +626,15 @@ impl<I: Io> Engine<I> {
             })?;
             if bits & (1 << clock as u32) != 0 {
                 break;
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::HardMinTimeout(clock));
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::HardMinTimeout(clock));
@@ -680,6 +708,8 @@ impl<I: Io> Engine<I> {
     /// acknowledgement is recorded and logged as ignored.
     async fn hard_min_settled_ignored(&mut self, message: u32, clock: Clock) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_ms(1000);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let bits = match self.optional_result(0x15, 0).await? {
                 Ok(bits) => bits,
@@ -695,6 +725,16 @@ impl<I: Io> Engine<I> {
             };
             if bits & (1 << clock as u32) != 0 {
                 return Ok(());
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    self.ignore(message, Error::HardMinTimeout(clock));
+                    return Ok(());
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 self.ignore(message, Error::HardMinTimeout(clock));
