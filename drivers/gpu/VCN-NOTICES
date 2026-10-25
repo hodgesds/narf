@@ -123,20 +123,19 @@ SHA-256: bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9
 
 src/amd/common/ac_vcn_dec.h and ac_vcn_dec.c:
   HEVC message/layout/reference and context sizing in
-  amdgpu_vcn_navi48_hevc_words.rs; unchanged source extracted by hevc_check.py.
+  amdgpu_vcn_navi48_hevc_words.rs; retained Rust adaptation and fixture data.
   Copyright 2017 Advanced Micro Devices, Inc.
 src/amd/common/ac_vcn_enc.h and ac_vcn_enc.c;
 src/gallium/drivers/radeonsi/mm/radeon_vcn_enc.c,
 radeon_vcn_enc_1_2.c, radeon_vcn_enc_2_0.c, radeon_vcn_enc_5_0.c:
   HEVC encoder packet/reference and reconstruction/metadata sizing adapted in
-  amdgpu_vcn_navi48_hevc_encode_words.rs; unchanged source extracted by
-  hevc_encode_check.py.
+  amdgpu_vcn_navi48_hevc_encode_words.rs; retained Rust adaptation.
   Copyright 2017, 2024 Advanced Micro Devices, Inc.
 src/gallium/drivers/radeonsi/mm/radeon_bitstream.c and radeon_bitstream.h:
   VPS/SPS/PPS fixture generation and exact fixed HEVC slice template reference.
   Copyright 2025 Advanced Micro Devices, Inc.
 src/amd/common/ac_video_dec.h:
-  HEVC input type extracted unchanged by hevc_check.py.
+  HEVC input-type source reference for the retained Rust adaptation.
   Copyright 2026 Advanced Micro Devices, Inc.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

@@ -99,8 +99,27 @@ pub enum ProbeError {
 /// Single-instance live device.
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtw89Device>>> = IrqSafeSpinLock::new(None);
 
+/// Attach the initial B station after a trusted platform reset handoff.
+/// Generic PCI matching always requires actual advertised and completed FLR.
+///
+/// # Safety
+/// Caller independently proved actual function/slot power reset, posted DMA
+/// drainage, and no firmware/driver DMA since, and holds this exact function
+/// and capability exclusively before generic binding. A board flag or PCI
+/// bus-master-off readback does not establish this temporal contract.
+pub unsafe fn attach_cold(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    // SAFETY: delegated qualified platform temporal-reset/exclusivity proof.
+    unsafe { super::bootstrap::attach_cold(device, cap) }
+}
+
 /// Probe entry called by `narf-bus::driver_match`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if device.id.vendor == 0x10ec && matches!(device.id.device, 0xb852 | 0xb85b) {
+        return super::bootstrap::probe(device, cap);
+    }
     let bound = CONTROLLER.lock().as_ref().map(|owner| owner.bus_addr);
     match crate::rtw88::pci_park::admission(bound, device.addr) {
         crate::rtw88::pci_park::Admission::Bound => return Ok(()),

@@ -210,6 +210,15 @@ fn smoke_ht_vht_regulatory_whole_channel() -> TestResult {
     if connection::channel_power_width(&domain, 36, 1, 38, &permissions).is_some() {
         return TestResult::Fail("wide PHY ignored signed bandwidth ceiling");
     }
+    domain.rules[0].max_bandwidth_mhz = 80;
+    let mut overlap = domain.rules[0].clone();
+    overlap.freq_start_mhz = 5201;
+    overlap.freq_end_mhz = 5205;
+    overlap.flags = RegFlags::NO_IR;
+    domain.rules.push(overlap);
+    if connection::channel_power_width(&domain, 36, 1, 38, &permissions).is_some() {
+        return TestResult::Fail("wide Intel TX ignored partial overlapping NO_IR restriction");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

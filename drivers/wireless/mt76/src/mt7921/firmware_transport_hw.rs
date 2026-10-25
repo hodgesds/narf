@@ -390,19 +390,44 @@ impl Hardware {
         Ok(result)
     }
     fn read(&self, addr: u32) -> Result<u32, Error> {
-        self.check()?;
-        // SAFETY: constructor's exclusive device/latch ownership; checked access.
-        let value = unsafe { registers::read32(&self.mmio, addr) }.map_err(|_| Error::Register)?;
-        if value == u32::MAX {
-            Err(Error::DeviceGone)
-        } else {
-            Ok(value)
-        }
+        crate::mt7921::pci::invoke(&self.authority, || {
+            // SAFETY: exclusive retained aperture/L1 latch inside current invocation.
+            let value =
+                unsafe { registers::read32(&self.mmio, addr) }.map_err(|_| Error::Register)?;
+            if value == u32::MAX {
+                Err(Error::DeviceGone)
+            } else {
+                Ok(value)
+            }
+        })
+        .map_err(|_| Error::Authority)?
     }
     fn write(&self, addr: u32, value: u32) -> Result<(), Error> {
-        self.check()?;
-        // SAFETY: constructor retains exclusive device/latch authority.
-        unsafe { registers::write32(&self.mmio, addr, value) }.map_err(|_| Error::Register)
+        crate::mt7921::pci::invoke(&self.authority, || {
+            // SAFETY: bounded register plan and current retained PCI invocation.
+            unsafe { registers::write32(&self.mmio, addr, value) }.map_err(|_| Error::Register)
+        })
+        .map_err(|_| Error::Authority)?
+    }
+    fn command(&self, clear: u16, set: u16) -> Result<u16, Error> {
+        crate::mt7921::pci::invoke(&self.authority, || {
+            if clear != 0 {
+                narf_bus::pci::clear_command(&self.authority, &self.device, clear)
+                    .map_err(|_| Error::Authority)?;
+            }
+            if set != 0 {
+                narf_bus::pci::set_command(&self.authority, &self.device, set)
+                    .map_err(|_| Error::Authority)?;
+            }
+            let value = narf_bus::pci::read_command(&self.authority, &self.device)
+                .map_err(|_| Error::Authority)?;
+            if value == u16::MAX {
+                Err(Error::DeviceGone)
+            } else {
+                Ok(value)
+            }
+        })
+        .map_err(|_| Error::Authority)?
     }
     fn update(&self, addr: u32, clear: u32, set: u32) -> Result<(), Error> {
         self.write(addr, (self.read(addr)? & !clear) | set)
@@ -435,20 +460,10 @@ impl Backend for Hardware {
         narf_time::wall::monotonic_ns()
     }
     fn check(&self) -> Result<(), Error> {
-        self.authority.check_live().map_err(|_| Error::Authority)
+        crate::mt7921::pci::invoke(&self.authority, || ()).map_err(|_| Error::Authority)
     }
     fn park_bus_master(&mut self) -> Result<(), Error> {
-        narf_bus::pci::clear_command(
-            &self.authority,
-            &self.device,
-            narf_bus::pci::cmd::BUS_MASTER,
-        )
-        .map_err(|_| Error::Authority)?;
-        if narf_bus::pci::read_command(&self.authority, &self.device)
-            .map_err(|_| Error::Authority)?
-            & narf_bus::pci::cmd::BUS_MASTER
-            != 0
-        {
+        if self.command(narf_bus::pci::cmd::BUS_MASTER, 0)? & narf_bus::pci::cmd::BUS_MASTER != 0 {
             return Err(Error::Busy);
         }
         Ok(())
@@ -480,11 +495,7 @@ impl Backend for Hardware {
         if self.owner.published || !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
             return Err(Error::Busy);
         }
-        if narf_bus::pci::read_command(&self.authority, &self.device)
-            .map_err(|_| Error::Authority)?
-            & narf_bus::pci::cmd::BUS_MASTER
-            != 0
-        {
+        if self.command(0, 0)? & narf_bus::pci::cmd::BUS_MASTER != 0 {
             return Err(Error::Busy);
         }
         self.owner.storage.as_mut().ok_or(Error::Busy)?.recycle();
@@ -555,12 +566,12 @@ impl Backend for Hardware {
         self.update(0x54000120, 0, 2)?;
         self.update(MT_PCIE_MAC_PM, 0, MT_PCIE_MAC_PM_L0S_DIS)?;
         // All published addresses are owned and bounded before enabling DMA.
-        narf_bus::pci::set_command(
-            &self.authority,
-            &self.device,
-            narf_bus::pci::cmd::BUS_MASTER,
-        )
-        .map_err(|_| Error::Authority)?;
+        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        if self.command(0, BUS_MASTER)? & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+            != BUS_MASTER | MEM_SPACE | INTX_DISABLE
+        {
+            return Err(Error::Authority);
+        }
         self.update(GLOBAL, 0, ENABLE)?;
         let _ = self.read(GLOBAL)?;
         Ok(())
@@ -670,19 +681,7 @@ impl Backend for Hardware {
         if !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
             return Err(Error::Busy);
         }
-        narf_bus::pci::clear_command(
-            &self.authority,
-            &self.device,
-            narf_bus::pci::cmd::BUS_MASTER,
-        )
-        .map_err(|_| Error::Authority)?;
-        if narf_bus::pci::read_command(&self.authority, &self.device)
-            .map_err(|_| Error::Authority)?
-            & narf_bus::pci::cmd::BUS_MASTER
-            != 0
-        {
-            return Err(Error::Busy);
-        }
+        self.park_bus_master()?;
         self.clear_rings()?;
         let _ = self.read(GLOBAL)?;
         self.owner.published = false;
@@ -729,54 +728,57 @@ impl Transport {
         authority: Cap<BusDeviceCap, Write>,
         firmware: Firmware,
     ) -> Result<Self, Error> {
-        authority.check_live().map_err(|_| Error::Authority)?;
-        if !matches!(device.id.vendor, 0x14c3 | 0x0e8d)
-            || !matches!(device.id.device, 0x0616 | 0x0608 | 0x7922 | 0x7961 | 0x7920)
-        {
-            return Err(Error::Bounds);
-        }
-        if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain {
-            return Err(Error::DmaAddress);
-        }
-        if narf_bus::pci::read_command(&authority, &device).map_err(|_| Error::Authority)?
-            & narf_bus::pci::cmd::BUS_MASTER
-            != 0
-        {
-            return Err(Error::Busy);
-        }
-        // Highest programmed register and the L1 selector must be mapped.
-        for addr in [0xd46ff, MT_HIF_REMAP_L1] {
-            if u64::from(addr) + 4 > mmio.len {
+        crate::mt7921::pci::invoke(&authority, || {
+            authority.check_live().map_err(|_| Error::Authority)?;
+            if !matches!(device.id.vendor, 0x14c3 | 0x0e8d)
+                || !matches!(device.id.device, 0x0616 | 0x0608 | 0x7922 | 0x7961 | 0x7920)
+            {
                 return Err(Error::Bounds);
             }
-        }
-        let storage = Storage {
-            wm: Ring::allocate(TX_WM, false)?,
-            fwdl: Ring::allocate(TX_FWDL, false)?,
-            data: Ring::allocate(TX_DATA, false)?,
-            tokens: packet_tx::Tokens::new(),
-            pending_events: VecDeque::new(),
-            pending_data: VecDeque::new(),
-            rx: [
-                Ring::allocate(RX_PRE, true)?,
-                Ring::allocate(RX_POST, true)?,
-                Ring::allocate(RX_DATA, true)?,
-            ],
-        };
-        Ok(Self {
-            session: Session::new(
-                Hardware {
-                    mmio,
-                    device,
-                    authority,
-                    owner: Retained {
-                        storage: Some(storage),
-                        published: false,
+            if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain {
+                return Err(Error::DmaAddress);
+            }
+            if narf_bus::pci::read_command(&authority, &device).map_err(|_| Error::Authority)?
+                & narf_bus::pci::cmd::BUS_MASTER
+                != 0
+            {
+                return Err(Error::Busy);
+            }
+            // Highest programmed register and the L1 selector must be mapped.
+            for addr in [0xd46ff, MT_HIF_REMAP_L1] {
+                if u64::from(addr) + 4 > mmio.len {
+                    return Err(Error::Bounds);
+                }
+            }
+            let storage = Storage {
+                wm: Ring::allocate(TX_WM, false)?,
+                fwdl: Ring::allocate(TX_FWDL, false)?,
+                data: Ring::allocate(TX_DATA, false)?,
+                tokens: packet_tx::Tokens::new(),
+                pending_events: VecDeque::new(),
+                pending_data: VecDeque::new(),
+                rx: [
+                    Ring::allocate(RX_PRE, true)?,
+                    Ring::allocate(RX_POST, true)?,
+                    Ring::allocate(RX_DATA, true)?,
+                ],
+            };
+            Ok(Self {
+                session: Session::new(
+                    Hardware {
+                        mmio,
+                        device,
+                        authority,
+                        owner: Retained {
+                            storage: Some(storage),
+                            published: false,
+                        },
                     },
-                },
-                firmware,
-            ),
+                    firmware,
+                ),
+            })
         })
+        .map_err(|_| Error::Authority)?
     }
     /// Start once. Dropping this borrowed future requests no reset/replay.
     pub async fn run(&mut self) -> Result<Report, Error> {
@@ -790,6 +792,29 @@ impl Transport {
     /// Perform a bounded, receive-only scan on world 2.4 GHz channels 1..=11.
     pub async fn scan_passive(&mut self, channels: &[u8]) -> Result<super::ScanReport, Error> {
         self.session.scan_passive(channels).await
+    }
+    /// Directed/wildcard probes on currently policy-authorized 20 MHz channels.
+    /// Nonempty SSID lists (up to four, including wildcard entries) select
+    /// active scanning. A completed scan returns to a NO_IR-only idle domain.
+    pub async fn scan_active(
+        &mut self,
+        channels: &[u8],
+        ssids: &[Vec<u8>],
+    ) -> Result<super::ScanReport, Error> {
+        self.session
+            .scan_active_with_policy(channels, ssids, || {
+                narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)
+            })
+            .await
+    }
+    /// Prepare the bounded native HT20 RX/A-MSDU owner from actual radio/AP
+    /// capabilities. This does not enable HT MLME, peer firmware state or TX.
+    /// Legacy association invalidates the preparation; no HT facade is exposed.
+    pub fn prepare_ht20_receive(
+        &mut self,
+        bss: &super::ScanBss,
+    ) -> Result<super::Ht20ReceiveInfo, Error> {
+        self.session.prepare_ht20_receive(bss)
     }
     /// Associate with an Access Point using legacy rates on channels 1..=11.
     pub async fn associate_station(
@@ -809,7 +834,7 @@ impl Transport {
         security: crate::mt7921::association::Security,
         extra_ies: &[u8],
     ) -> Result<u16, Error> {
-        let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Authority)?;
+        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
         let permission =
             crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
                 .ok_or(Error::Authority)?;

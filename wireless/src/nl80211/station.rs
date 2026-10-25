@@ -1058,6 +1058,13 @@ pub(super) fn power_save(
 
 // ── regulatory ───────────────────────────────────────────────────────
 
+/// Host-policy flags mapped to Linux enum nl80211_reg_rule_flags.
+pub(super) fn regulatory_rule_flags(flags: crate::reg::RegFlags) -> u32 {
+    u32::from(flags.contains(crate::reg::RegFlags::DFS)) << 4
+        | u32::from(flags.contains(crate::reg::RegFlags::INDOOR_ONLY)) << 3
+        | u32::from(flags.contains(crate::reg::RegFlags::NO_IR)) << 7
+}
+
 /// The global regulatory domain (`cfg80211_regdomain`): the deployment
 /// policy NARF installed ([`crate::reg::db`]), else cfg80211's
 /// `world_regdom`.
@@ -1071,15 +1078,7 @@ pub(super) fn global_regdom() -> crate::RegDomainInfo {
                 .rules
                 .iter()
                 .map(|r| crate::RegRuleInfo {
-                    flags: if r.flags.contains(crate::reg::RegFlags::DFS) {
-                        1 << 4
-                    } else {
-                        0
-                    } | if r.flags.contains(crate::reg::RegFlags::INDOOR_ONLY) {
-                        1 << 3 // NL80211_RRF_NO_OUTDOOR
-                    } else {
-                        0
-                    },
+                    flags: regulatory_rule_flags(r.flags),
                     start_khz: r.freq_start_mhz * 1000,
                     end_khz: r.freq_end_mhz * 1000,
                     max_bw_khz: r.max_bandwidth_mhz * 1000,

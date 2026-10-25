@@ -19,7 +19,7 @@
 //!
 //! Production-glue audit result: no glue was missing. The seam is
 //! exactly the one production uses — association gates the send path
-//! (the controlled port), `set_link_state` publishes carrier, and the
+//! (the controlled port), `set_link_metadata` publishes carrier, and the
 //! DHCP client is an ordinary `narf_net` client over the registered
 //! netdev. The one substitution is forced by the fixture environment:
 //! production's bridge (`Mt76Iface` + the `BOOT_OWNER` globals) is
@@ -93,6 +93,9 @@ struct Harness {
     /// WPA2 composition: downlink data is presented as
     /// hardware-decrypted CCMP. Open composition: plaintext.
     protected_link: bool,
+    /// Model-only activation of the completed receive prerequisite after
+    /// legacy MLME authorizes the station; this is not HT association evidence.
+    aggregate_rx: bool,
     server: DhcpServer,
     received: Vec<Vec<u8>>,
 }
@@ -191,7 +194,40 @@ impl Harness {
             }
         }
         for reply in replies {
-            let packet = self.downlink_packet(&reply);
+            self.queue_downlink(session, &reply);
+        }
+    }
+
+    fn queue_downlink(&mut self, session: &mut Session<Model>, eth: &[u8]) {
+        if self.aggregate_rx {
+            let pn = self.next_pn;
+            self.next_pn += 1;
+            let seq = pn as u16 & 0xfff;
+            // The second MSDU is an unrelated, bounded Ethernet-II frame.
+            // Both belong to one MPDU/CCMP PN; DHCP sees only its own reply.
+            let second = super::amsdu_rx_tests::ethernet(0x55, 3);
+            session
+                .backend
+                .packets
+                .push_back(super::amsdu_rx_tests::packet(
+                    eth,
+                    self.protected_link,
+                    pn,
+                    3,
+                    seq,
+                ));
+            session
+                .backend
+                .packets
+                .push_back(super::amsdu_rx_tests::packet(
+                    &second,
+                    self.protected_link,
+                    pn,
+                    1,
+                    seq,
+                ));
+        } else {
+            let packet = self.downlink_packet(eth);
             session.backend.packets.push_back(packet);
         }
     }
@@ -286,7 +322,7 @@ fn push_beacon(session: &mut Session<Model>) {
 
 // ── The composition ────────────────────────────────────────────────
 
-fn composition(wpa2: bool) -> TestResult {
+fn composition(wpa2: bool, aggregate_rx: bool) -> TestResult {
     let mut model = Model::new();
     model.station_channel = CHANNEL;
     model.access_point = Some(
@@ -312,6 +348,7 @@ fn composition(wpa2: bool) -> TestResult {
     // family's routes, timers or netfilter hooks in the shared test guest.
     narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
     let name = narf_net::iface::register("wlan%d", OWN, harness_send);
+    narf_net::iface::set_link_state(&name, true); // operator IFF_UP
     narf_net::iface::install_rx_drain(harness_drain);
     *HARNESS.lock() = Some(Harness {
         session: Some(session),
@@ -320,11 +357,12 @@ fn composition(wpa2: bool) -> TestResult {
         ap_cursor: 0,
         next_pn: 1,
         protected_link: wpa2,
+        aggregate_rx,
         server: DhcpServer::new(NETWORK),
         received: Vec::new(),
     });
 
-    let result = composition_body(&name, wpa2);
+    let result = composition_body(&name, wpa2, aggregate_rx);
 
     // Teardown in reverse order: session first (no drain/send can
     // fire against a half-removed interface), then carrier, then
@@ -332,7 +370,7 @@ fn composition(wpa2: bool) -> TestResult {
     *HARNESS.lock() = None;
     let closed = crate::iface::publish_link(&name, false)
         && narf_net::iface::lookup(&name).is_some_and(|snap| {
-            !snap.link_up
+            snap.link_up
                 && !snap.carrier
                 && snap.carrier_up_count == 1
                 && snap.carrier_down_count == 1
@@ -345,12 +383,12 @@ fn composition(wpa2: bool) -> TestResult {
     }
 }
 
-fn composition_body(name: &str, wpa2: bool) -> TestResult {
+fn composition_body(name: &str, wpa2: bool, aggregate_rx: bool) -> TestResult {
     // ── Before association: no carrier, and the controlled port
     // keeps DHCP off the air entirely (audit §4.3.1 S1: "no DHCP
     // before PORT_SECURE" — here, before association completes).
     match narf_net::iface::lookup(name) {
-        Some(snap) if !snap.link_up && !snap.carrier => {}
+        Some(snap) if snap.link_up && !snap.carrier => {}
         _ => return TestResult::Fail("interface must start with carrier down"),
     }
     if narf_net::dhcp::acquire(name, 400).is_ok() {
@@ -396,6 +434,9 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
         put_session(session);
         return TestResult::Fail("associated state/aid mismatch");
     }
+    if aggregate_rx {
+        super::amsdu_rx_tests::activate_receive(&mut session);
+    }
     put_session(session);
 
     // ── Carrier up, exactly where `Mt76Iface::associate` raises it:
@@ -405,6 +446,13 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
     {
         return TestResult::Fail("carrier did not come up after association");
     }
+    narf_net::iface::set_link_state(name, false);
+    if !crate::iface::publish_link(name, true)
+        || !narf_net::iface::lookup(name).is_some_and(|snap| !snap.link_up && snap.carrier)
+    {
+        return TestResult::Fail("physical carrier overwrote operator DOWN");
+    }
+    narf_net::iface::set_link_state(name, true);
 
     // ── The lease: production DHCP client over the associated link,
     // fake AP as the server. `dhcp_acquire` also binds the address
@@ -476,9 +524,9 @@ fn composition_body(name: &str, wpa2: bool) -> TestResult {
         let Some(harness) = slot.as_mut() else {
             return TestResult::Fail("harness vanished before downlink");
         };
-        let packet = harness.downlink_packet(&downlink);
-        let session = harness.session.as_mut().expect("session parked");
-        session.backend.packets.push_back(packet);
+        let mut session = harness.session.take().expect("session parked");
+        harness.queue_downlink(&mut session, &downlink);
+        harness.session = Some(session);
     }
     while narf_net::iface::drain_pump() {}
     if rx_packets(name) <= rx_before {
@@ -503,7 +551,7 @@ fn rx_packets(name: &str) -> u64 {
 }
 
 fn mt76_wifi_open_association_dhcp_lease_composition() -> TestResult {
-    composition(false)
+    composition(false, false)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/dhcp",
@@ -511,9 +559,25 @@ kernel_test_in!(
 );
 
 fn mt76_wifi_wpa2_association_dhcp_lease_composition() -> TestResult {
-    composition(true)
+    composition(true, false)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/dhcp",
     mt76_wifi_wpa2_association_dhcp_lease_composition
+);
+
+fn mt76_open_amsdu_receive_prerequisite_dhcp_lease_composition() -> TestResult {
+    composition(false, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/ht_receive",
+    mt76_open_amsdu_receive_prerequisite_dhcp_lease_composition
+);
+
+fn mt76_wpa2_amsdu_receive_prerequisite_dhcp_lease_composition() -> TestResult {
+    composition(true, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/ht_receive",
+    mt76_wpa2_amsdu_receive_prerequisite_dhcp_lease_composition
 );

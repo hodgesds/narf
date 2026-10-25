@@ -1,9 +1,9 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 fn smoke_ath10k_factory_regulatory_identity_matches_linux_all_u16() -> TestResult {
-    // Independently compiled, unmodified __ath_regd_init and its lookup /
-    // sanitization helpers over every 16-bit EEPROM value, not a copy of
-    // the Rust resolver. Hash includes all success fields or a failure byte.
+    // Frozen source-cited reference over every 16-bit EEPROM value, not
+    // regenerated from the Rust resolver. The stored digest includes all
+    // successful fields or a failure byte; no reference source is executed.
     let mut hash = 0xcbf29ce484222325u64;
     let mut byte = |value: u8| {
         hash = (hash ^ u64::from(value)).wrapping_mul(0x100000001b3);

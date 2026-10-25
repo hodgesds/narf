@@ -353,14 +353,10 @@ kernel_test_in!(
     rdna4_firmware_table_selects_by_discovery_and_kicker
 );
 
-/// Shared with tests/rdna4_family/check.sh, which regenerates both from the
-/// Linux tree.
 const POLICY: &str = include_str!("../tests/rdna4_family/policy.txt");
 const FIRMWARE: &str = include_str!("../tests/rdna4_family/firmware.txt");
-/// Linux's resource pool per CC_DC_PIPE_DIS value (pipe_pool.c).
 const PIPE_POOL: &str = include_str!("../tests/rdna4_family/pipe_pool.txt");
 
-/// The pool line pipe_pool.c prints for `fuses`.
 fn pool_line(fuses: u32) -> alloc::string::String {
     use alloc::{format, string::String, vec::Vec};
     let pool = PipePool::from_fuses(fuses);

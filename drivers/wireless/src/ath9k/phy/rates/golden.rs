@@ -1,5 +1,5 @@
-// Reproduce with make_linux_oracle.py; source/function SHA256 in
-// linux_oracle_provenance.json. See ORACLE.md; literal outputs are unchanged.
+// Fixed Rust reference vectors; historical source/function SHA256 in
+// linux_oracle_provenance.json. See REFERENCE.md; literal outputs are unchanged.
 //cck=183 ofdm=198 ht20=213 ht40=240 ctlIndex=267 ctlData=279 antenna=60
 const RATE_GOLDEN_0: &[[u32; 2]] = &[
     [0x9934, 0x1e1e1e1e],

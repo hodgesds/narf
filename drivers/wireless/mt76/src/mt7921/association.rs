@@ -302,15 +302,26 @@ impl TxPermission {
             return None;
         }
         let center = super::channel::frequency(channel)?;
+        let overlaps = |rule: &&narf_wireless::reg::RegRule| {
+            rule.freq_start_mhz < center + 10 && center - 10 < rule.freq_end_mhz
+        };
+        // A permissive wide rule cannot erase a restrictive overlapping rule.
+        if domain.rules.iter().filter(overlaps).any(|rule| {
+            rule.flags.intersects(RegFlags::DFS | RegFlags::NO_IR) || rule.max_bandwidth_mhz < 20
+        }) {
+            return None;
+        }
+        if !domain.rules.iter().any(|rule| {
+            rule.freq_start_mhz <= center - 10
+                && center + 10 <= rule.freq_end_mhz
+                && rule.max_bandwidth_mhz >= 20
+        }) {
+            return None;
+        }
         let power_dbm = domain
             .rules
             .iter()
-            .filter(|rule| {
-                rule.freq_start_mhz <= center - 10
-                    && center + 10 <= rule.freq_end_mhz
-                    && rule.max_bandwidth_mhz >= 20
-                    && !rule.flags.contains(RegFlags::DFS)
-            })
+            .filter(overlaps)
             .map(|rule| rule.max_power_dbm)
             .min()?;
         // Signed half-dBm table entries must be representable. This profile

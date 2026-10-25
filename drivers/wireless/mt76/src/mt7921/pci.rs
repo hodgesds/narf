@@ -24,11 +24,25 @@ use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
-use narf_capabilities::{Cap, Write};
+use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::mac;
 use super::regs::*;
+
+pub(super) fn invoke<T>(
+    cap: &Cap<BusDeviceCap, Write>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, CapError> {
+    struct Registers<F>(F);
+    impl<T, F: FnOnce() -> T> CapOp<BusDeviceCap, Write> for Registers<F> {
+        type Output = T;
+        fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+            Ok(self.0())
+        }
+    }
+    cap.invoke(Registers(operation))
+}
 
 /// One bound MT7921 controller — what the driver retains after probe.
 ///
@@ -68,6 +82,8 @@ impl core::fmt::Debug for Mt7921Device {
 /// Errors raised by the Stage-0/Stage-1 probe path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProbeError {
+    /// Current PCI invocation or command-policy validation failed.
+    Authority,
     /// The register window cannot contain all required probe accesses.
     UnsupportedRegisterWindow,
     /// The hardware did not latch the requested indirect register page.
@@ -143,34 +159,31 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // Rediscovery must not park a function whose retained owner is active.
         return Ok(());
     }
-    // Discovery does not publish DMA rings. Keep bus mastering disabled
-    // and memory decode off until parking has been verified. This applies to
-    // skipped singleton matches as well as the function selected for probe.
-    use narf_bus::pci::{self, cmd};
-    pci::clear_command(&cap, &device, cmd::BUS_MASTER | cmd::MEM_SPACE)
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    pci::set_command(&cap, &device, cmd::INTX_DISABLE)
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    let policy = cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE;
-    if pci::read_command(&cap, &device).map_err(|_| narf_bus::ProbeError::BadDevice)? & policy
-        != cmd::INTX_DISABLE
-    {
-        return Err(narf_bus::ProbeError::BadDevice);
-    }
-    if CONTROLLER.lock().is_some() {
-        return Ok(());
-    }
-    pci::set_command(&cap, &device, cmd::MEM_SPACE).map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    if pci::read_command(&cap, &device).map_err(|_| narf_bus::ProbeError::BadDevice)? & policy
-        != cmd::MEM_SPACE | cmd::INTX_DISABLE
-    {
-        return Err(narf_bus::ProbeError::BadDevice);
-    }
-
-    // SAFETY: bus dispatch hands us exclusive BusDeviceCap authority
-    // for this device's cfg + BARs for the duration of probe.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let result = unsafe { bring_up(&device) };
+    // No BAR sizing with decode enabled, and no probe-time access outside
+    // current invocation. Skipped singleton functions remain parked.
+    let result = invoke(&cap, || {
+        use narf_bus::pci::{self, cmd};
+        pci::clear_command(&cap, &device, cmd::BUS_MASTER | cmd::MEM_SPACE)
+            .map_err(|_| ProbeError::Authority)?;
+        pci::set_command(&cap, &device, cmd::INTX_DISABLE).map_err(|_| ProbeError::Authority)?;
+        if pci::read_command(&cap, &device).map_err(|_| ProbeError::Authority)?
+            & (cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE)
+            != cmd::INTX_DISABLE
+        {
+            return Err(ProbeError::Authority);
+        }
+        if CONTROLLER.lock().is_some() {
+            return Ok(None);
+        }
+        // SAFETY: exact exclusive PCI invocation; inherited DMA/decode parked.
+        unsafe { bring_up(&device, &cap) }.map(Some)
+    })
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let result = match result {
+        Ok(Some(device)) => Ok(device),
+        Ok(None) => return Ok(()),
+        Err(error) => Err(error),
+    };
     let dev = match result {
         Ok(d) => d,
         Err(e) => {
@@ -178,11 +191,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // revoke the command bits. Leave the rejected function inert:
             // bus mastering must remain off, and a failed probe does not need
             // memory decoding left enabled either.
-            let _ = narf_bus::pci::clear_command(
-                &cap,
-                &device,
-                narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-            );
+            let _ = invoke(&cap, || {
+                narf_bus::pci::clear_command(
+                    &cap,
+                    &device,
+                    narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
+                )
+            });
             let _ = writeln!(
                 narf_console::Writer,
                 "  mt7921: bring-up failed ({:04x}:{:04x}): {:?}",
@@ -235,13 +250,38 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// # Safety
 /// Caller owns the device's BARs exclusively for the duration of the
 /// call.
-pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
+pub unsafe fn bring_up(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+) -> Result<Mt7921Device, ProbeError> {
+    invoke(cap, || bring_up_current(device, cap)).map_err(|_| ProbeError::Authority)?
+}
+
+fn bring_up_current(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+) -> Result<Mt7921Device, ProbeError> {
+    use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+    let parked = narf_bus::pci::read_command(cap, device).map_err(|_| ProbeError::Authority)?;
+    if parked == u16::MAX || parked & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != INTX_DISABLE {
+        return Err(ProbeError::Authority);
+    }
     // ── Stage 0: BAR0 mapping ───────────────────────────────────
     //
     // SAFETY: caller-asserted BAR exclusivity.
     let mmio_bar0 = unsafe { map_bar_control(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
 
     validate_probe_window(mmio_bar0.len)?;
+    use narf_bus::pci::{self, cmd};
+    pci::set_command(cap, device, cmd::MEM_SPACE).map_err(|_| ProbeError::Authority)?;
+    let command = pci::read_command(cap, device).map_err(|_| ProbeError::Authority)?;
+    if command == u16::MAX
+        || command & (cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE)
+            != cmd::MEM_SPACE | cmd::INTX_DISABLE
+    {
+        return Err(ProbeError::Authority);
+    }
+
     let _ = writeln!(
         narf_console::Writer,
         "  mt7921: BAR0 mapped ({} bytes); reading identity",
@@ -384,10 +424,11 @@ pub fn is_probed() -> bool {
 /// Borrow discovery state before the exclusive firmware transport handoff.
 /// Returns `None` if probe hasn't run or the transport owns the device.
 pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
+    let controller = CONTROLLER.lock();
     if TRANSPORT_CLAIMED.load(Ordering::Acquire) {
         return None;
     }
-    CONTROLLER.lock().as_ref().map(f)
+    controller.as_ref().map(f)
 }
 
 pub(super) fn claim_firmware_transport(
@@ -409,16 +450,24 @@ pub(super) fn claim_firmware_transport(
         .derive()
         .map_err(|_| Error::Authority)?;
     let firmware = Firmware::open(did, &registry)?;
-    // SAFETY: final single-CPU boot handoff after discovery and firmware scan,
-    // before executor polling; no MT76 rings exist and bus mastering is off.
-    let transport = unsafe { Transport::new(mmio, device, authority, firmware)? };
-    if TRANSPORT_CLAIMED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
     {
-        return Err(Error::Busy);
+        // Match with_controller's lock so a reader which observed an earlier
+        // unclaimed value cannot enter after the runtime handoff.
+        let _controller = CONTROLLER.lock();
+        TRANSPORT_CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::Busy)?;
     }
-    Ok(Some(transport))
+    // SAFETY: the boot provisioning mutex and owner/work locks serialize this
+    // handoff with later provisioning callers. Discovery has parked BME; no
+    // transport has been claimed and no MT76 rings have been published.
+    let transport = unsafe { Transport::new(mmio, device, authority, firmware) };
+    if transport.is_err() {
+        // Construction only validates/read-checks and allocates unpublished
+        // rings. No hardware references exist, so discovery may be retried.
+        TRANSPORT_CLAIMED.store(false, Ordering::Release);
+    }
+    transport.map(Some)
 }
 
 /// Test-only reset of the bound slot. Available in the built-in build (which

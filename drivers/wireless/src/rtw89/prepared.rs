@@ -41,6 +41,9 @@ impl PreparedFirmware {
     pub fn image(&self) -> &[u8] {
         &self.bytes[self.image.clone()]
     }
+    pub(super) fn container(&self) -> &[u8] {
+        &self.bytes
+    }
     pub fn header(&self) -> &FwHeader {
         &self.header
     }

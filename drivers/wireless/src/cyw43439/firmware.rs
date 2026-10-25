@@ -29,6 +29,9 @@ use super::sdio::{BusWidth, CCCR_BUS_IFACE_CTRL, CCCR_IO_ENABLE, CCCR_IO_READY, 
 use super::transport::{Function, Transport, TransportError};
 use crate::brcmfmac::chip::{Backplane, Chip, Core};
 
+/// Existing loader image-size ceiling, also checked before native F1 setup.
+pub(crate) const MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
+
 /// Errors specific to firmware loading on top of the underlying
 /// [`TransportError`] surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +190,7 @@ pub struct FirmwareLoader<'fw, T: Transport> {
     layout: Option<(Core, Core)>,
     next_step: usize,
     failed: bool,
+    revision_mask: Option<u16>,
 }
 
 impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
@@ -206,6 +210,7 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
             layout: None,
             next_step: 0,
             failed: false,
+            revision_mask: None,
         }
     }
 
@@ -213,6 +218,10 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
     /// once the loader has finished).
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
+    }
+    pub(crate) fn require_revisions(mut self, mask: u16) -> Self {
+        self.revision_mask = Some(mask);
+        self
     }
 
     /// Transfer the retained host adapter to the packet runtime after boot.
@@ -236,7 +245,7 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
 
     fn validate_images(&self) -> Result<(), LoadError> {
         if self.firmware.is_empty()
-            || self.firmware.len() > 4 * 1024 * 1024
+            || self.firmware.len() > MAX_IMAGE_SIZE
             || self.nvram.len() < 8
             || self.nvram.len() % 4 != 0
         {
@@ -314,6 +323,12 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
         let mut bus = LoaderBackplane(&mut self.transport);
         let chip = Chip::discover_ai(&mut bus).map_err(LoadError::Chip)?;
         if chip.id != 43439 {
+            return Err(LoadError::UnsupportedChip);
+        }
+        if self
+            .revision_mask
+            .is_some_and(|mask| chip.revision >= 16 || mask & (1 << chip.revision) == 0)
+        {
             return Err(LoadError::UnsupportedChip);
         }
         let unique = |id| {
@@ -566,6 +581,7 @@ ccode=US
         let mock = MockTransport {
             log: Vec::new(),
             poll_call: 0,
+            word_writes: 0,
             window: 0,
             words: alloc::collections::BTreeMap::new(),
         };
@@ -628,6 +644,7 @@ ccode=US
         // For status reads the loader expects to eventually flip:
         // we return the polled bit on the second read.
         poll_call: u32,
+        word_writes: usize,
         window: u32,
         words: alloc::collections::BTreeMap<u32, u32>,
     }
@@ -640,6 +657,7 @@ ccode=US
                 .unwrap_or(&0))
         }
         fn write32(&mut self, _f: Function, addr: u32, value: u32) -> Result<(), TransportError> {
+            self.word_writes += 1;
             self.words.insert(self.window | (addr & 0x7fff), value);
             Ok(())
         }
@@ -685,16 +703,11 @@ ccode=US
         }
     }
 
-    fn smoke_loader_drives_full_sequence() -> TestResult {
-        let firmware = [0xAAu8; 64];
-        let nvram_text = "ccode=US\n";
-        let nvram_blob = match build_nvram_blob(nvram_text) {
-            Ok(b) => b,
-            Err(_) => return TestResult::Fail("NVRAM build failed"),
-        };
+    fn mock() -> MockTransport {
         let mut mock = MockTransport {
             log: alloc::vec::Vec::new(),
             poll_call: 0,
+            word_writes: 0,
             window: 0,
             words: alloc::collections::BTreeMap::new(),
         };
@@ -710,6 +723,17 @@ ccode=US
         }
         mock.words.insert(0x18004000, 0x40); // four 64-KiB banks.
         mock.words.insert(0x18004040, 7);
+        mock
+    }
+
+    fn smoke_loader_drives_full_sequence() -> TestResult {
+        let firmware = [0xAAu8; 64];
+        let nvram_text = "ccode=US\n";
+        let nvram_blob = match build_nvram_blob(nvram_text) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("NVRAM build failed"),
+        };
+        let mock = mock();
         let mut loader = FirmwareLoader::new(
             mock,
             &firmware,
@@ -752,5 +776,52 @@ ccode=US
     kernel_test_in!(
         "drivers/wireless/cyw43439/firmware",
         smoke_loader_drives_full_sequence
+    );
+    fn smoke_cyw_signed_selected_chip_revision_precedes_core_mutation_and_payload() -> TestResult {
+        use crate::brcmfmac::provision::{tests::selected_fixture, Family};
+        let (selection, assets) = match selected_fixture(Family::Sdio43439) {
+            Ok(value) => value,
+            Err(reason) => return TestResult::Fail(reason),
+        };
+        let nvram = crate::brcmfmac::boot::pack_nvram(&assets.nvram).unwrap();
+        let mut rejected =
+            FirmwareLoader::new(mock(), &assets.firmware, &nvram, 0, false).require_revisions(2); // signed fixture admits A0, not A1.
+        if rejected.run() != Err(LoadError::UnsupportedChip)
+            || rejected.transport.word_writes != 0
+            || rejected
+                .transport
+                .log
+                .iter()
+                .any(|(_, _, body)| body == &assets.firmware || body == &nvram)
+            || rejected.run() != Err(LoadError::InvalidState)
+        {
+            return TestResult::Fail(
+                "unselected CM3 revision reset a core, streamed payload, or retried failed loader",
+            );
+        }
+        let mut accepted = FirmwareLoader::new(mock(), &assets.firmware, &nvram, 0, false)
+            .require_revisions(selection.revisions());
+        if accepted.run().is_err()
+            || accepted.packet_core() != Some(0x18011000)
+            || !accepted
+                .transport
+                .log
+                .iter()
+                .any(|(_, _, body)| body == &assets.firmware)
+            || !accepted
+                .transport
+                .log
+                .iter()
+                .any(|(_, _, body)| body == &nvram)
+        {
+            return TestResult::Fail(
+                "signed selected CM3 bytes did not reach actual discovered loader",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/firmware",
+        smoke_cyw_signed_selected_chip_revision_precedes_core_mutation_and_payload
     );
 }

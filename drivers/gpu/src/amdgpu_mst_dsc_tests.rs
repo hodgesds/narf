@@ -5,8 +5,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 const VECTORS: &str = include_str!("../tests/dcn401_dsc/mst_vectors.txt");
 
-/// One mst_harness.c line through `compute_link`, with dc_dsc_compute_config
-/// as the only shape check (the Linux harness has no pipeline limits). With
+/// With
 /// `depth` each stream also gives its bpc (mst_depth_vectors.txt).
 fn run_vector(input: &str, depth: bool) -> Option<String> {
     let w: Vec<&str> = input.split_whitespace().collect();
@@ -108,9 +107,6 @@ kernel_test_in!("drivers/gpu/dsc", mst_dsc_fairness_matches_linux_vectors);
 
 const DEPTH_VECTORS: &str = include_str!("../tests/dcn401_dsc/mst_depth_vectors.txt");
 
-/// The fairness search with 8-, 10- and 12-bpc streams sharing a link
-/// (mst_harness.c built with STREAM_BPC): each stream's uncompressed
-/// bandwidth and DSC input are its own depth's.
 fn mst_dsc_fairness_matches_linux_at_every_depth() -> TestResult {
     match fairness_vectors(DEPTH_VECTORS, true) {
         Some((checked, compressed, refused))

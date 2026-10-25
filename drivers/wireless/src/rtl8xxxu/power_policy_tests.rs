@@ -163,9 +163,14 @@ fn smoke_rtl8188eu_power_intersects_all_regulatory_restrictions() -> TestResult 
         return TestResult::Fail("part-band restriction ignored");
     }
     d.rules.pop();
-    d.rules[0].flags = narf_wireless::reg::RegFlags::DFS;
-    if c.permission(&d, 1).err() != Some(Error::Policy) {
-        return TestResult::Fail("unsupported rule flag ignored");
+    for flag in [
+        narf_wireless::reg::RegFlags::DFS,
+        narf_wireless::reg::RegFlags::NO_IR,
+    ] {
+        d.rules[0].flags = flag;
+        if c.permission(&d, 1).err() != Some(Error::Policy) {
+            return TestResult::Fail("unsupported rule flag ignored");
+        }
     }
     if c.permission(&domain(20), 6).err() != Some(Error::Policy) {
         return TestResult::Fail("runtime profile silently retuned");
@@ -432,3 +437,6 @@ kernel_test_in!(
 
 #[path = "station_tests.rs"]
 mod station_tests;
+
+#[path = "dhcp_composition_tests.rs"]
+mod dhcp_composition_tests;

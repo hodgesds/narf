@@ -1,4 +1,4 @@
-# Linux HDR / colorimetry reference vectors; see check.sh and harness.c.
+# Linux HDR / colorimetry reference vectors; retained regression snapshot.
 meta h 000000000000f661cffb6a7622c97ea311d45ca4a939f1f5b6d4e8d1c441af35 1e = ret 0 valid 1 87011a005c0000f661cffb6a7622c97ea311d45ca4a939f1f5b6d4e8d1c4410000000000
 meta h 070000000001db70ddd1bf1844a9c953a731958c02b67ef01145a16b4fa7daa9 fa = ret 0 valid 1 87011a000d0001db70ddd1bf1844a9c953a731958c02b67ef01145a16b4fa70000000000
 meta h 0000000000ff6bc4150cdbbddc4104dfea17b207ebc871d04a518c98356e1079 95 = ret 0 valid 1 87011a006700ff6bc4150cdbbddc4104dfea17b207ebc871d04a518c98356e0000000000

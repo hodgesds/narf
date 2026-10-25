@@ -22,7 +22,163 @@ pub enum EfuseError {
     MalformedMap,
 }
 
+/// Original RTL8821CE 512-byte factory map. The one-path radio's RFE/package
+/// and power records deliberately have their own type; they cannot be used as
+/// RTL8822CE calibration or authorize any transmission.
+#[derive(Clone)]
+pub struct Factory8821c {
+    logical: [u8; 512],
+}
+impl core::fmt::Debug for Factory8821c {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Rtw8821ceFactory")
+            .field("mac", &self.mac())
+            .field("rfe", &self.rfe())
+            .field("package", &self.package())
+            .finish_non_exhaustive()
+    }
+}
+impl Factory8821c {
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn for_test(logical: [u8; 512]) -> Result<Self, EfuseError> {
+        let factory = Self { logical };
+        if !mac_is_valid(factory.mac()) {
+            return Err(EfuseError::MacUninitialized);
+        }
+        Ok(factory)
+    }
+
+    pub fn mac(&self) -> [u8; 6] {
+        self.logical[0xd0..0xd6].try_into().unwrap()
+    }
+    pub fn rfe(&self) -> u8 {
+        self.logical[0xca] & 0x1f
+    }
+    pub fn raw_rfe(&self) -> u8 {
+        self.logical[0xca]
+    }
+    pub fn package(&self) -> u8 {
+        (self.logical[0xca] >> 5) & 1
+    }
+    pub fn crystal(&self) -> u8 {
+        self.logical[0xb9]
+    }
+    pub fn thermal(&self) -> u8 {
+        self.logical[0xba]
+    }
+    pub fn board_option(&self) -> u8 {
+        self.logical[0xc1]
+    }
+    pub fn bt_setting(&self) -> u8 {
+        self.logical[0xc3]
+    }
+    pub fn channel_plan(&self) -> u8 {
+        self.logical[0xb8]
+    }
+    pub fn country(&self) -> [u8; 2] {
+        self.logical[0xcb..0xcd].try_into().unwrap()
+    }
+    /// Preserve source records without applying Linux's RFE-specific 2G
+    /// path substitution or manufacturing erased-value defaults.
+    pub fn power_path(&self, path: u8) -> Option<&[u8]> {
+        if path > 3 {
+            return None;
+        }
+        let at = 0x10 + usize::from(path) * 42;
+        Some(&self.logical[at..at + 42])
+    }
+    pub fn logical(&self) -> &[u8; 512] {
+        &self.logical
+    }
+}
+
 const EFUSE_POLL_MS: u64 = 5;
+
+/// Original RTL8822CE logical factory map, retained from the same physical
+/// read that established the PCI MAC. Factory data selects hardware tables;
+/// it does not authenticate a country or grant a conducted-power limit.
+#[derive(Clone)]
+pub struct Factory {
+    logical: [u8; 768],
+    trims: [u8; 19],
+}
+// Linux rtw8822c.h PPG_* locations. These are raw protected OTP cells,
+// never sparse-map programming records: thermalA/B,2G gainL/M/H,
+// 5G gainA/B (low1,low2,mid1,mid2,high1), PA bias2GA/B then5GA/B.
+pub(super) const TRIM_ADDRESSES: [u16; 19] = [
+    0x1ef, 0x1b0, 0x1d4, 0x1ee, 0x1d2, 0x1ec, 0x1e8, 0x1e4, 0x1e0, 0x1dc, 0x1eb, 0x1e7, 0x1e3,
+    0x1df, 0x1db, 0x1d6, 0x1d5, 0x1d8, 0x1d7,
+];
+impl core::fmt::Debug for Factory {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Rtw8822ceFactory")
+            .field("mac", &self.mac())
+            .field("rfe", &self.rfe())
+            .field("crystal", &self.crystal())
+            .field("thermal", &self.thermal())
+            .finish_non_exhaustive()
+    }
+}
+impl Factory {
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn for_test(logical: [u8; 768]) -> Result<Self, EfuseError> {
+        let factory = Self {
+            logical,
+            trims: [255; 19],
+        };
+        if !mac_is_valid(factory.mac()) {
+            return Err(EfuseError::MacUninitialized);
+        }
+        Ok(factory)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn for_test_with_trims(
+        logical: [u8; 768],
+        trims: [u8; 19],
+    ) -> Result<Self, EfuseError> {
+        let mut factory = Self::for_test(logical)?;
+        factory.trims = trims;
+        Ok(factory)
+    }
+    pub fn mac(&self) -> [u8; 6] {
+        self.logical[0x120..0x126].try_into().unwrap()
+    }
+    pub fn rfe(&self) -> u8 {
+        self.logical[0xca]
+    }
+    /// Raw OTP value. An erased value remains erased; no default is supplied.
+    pub fn crystal(&self) -> u8 {
+        self.logical[0xb9]
+    }
+    pub fn board_option(&self) -> u8 {
+        self.logical[0xc1]
+    }
+    pub fn bt_setting(&self) -> u8 {
+        self.logical[0xc3]
+    }
+    pub fn thermal(&self) -> [u8; 2] {
+        self.logical[0xd0..0xd2].try_into().unwrap()
+    }
+    pub fn channel_plan(&self) -> u8 {
+        self.logical[0xb8]
+    }
+    pub fn country(&self) -> [u8; 2] {
+        self.logical[0xcb..0xcd].try_into().unwrap()
+    }
+    pub(super) fn logical(&self) -> &[u8; 768] {
+        &self.logical
+    }
+    pub(super) fn trims(&self) -> &[u8; 19] {
+        &self.trims
+    }
+    pub(super) fn power_path(&self, path: u8) -> Option<&[u8]> {
+        if path > 3 {
+            return None;
+        }
+        let at = 0x10 + usize::from(path) * 42;
+        Some(&self.logical[at..at + 42])
+    }
+}
 
 /// Sizes/protected tails from the Linux per-chip `rtw_chip_info` tables.
 #[derive(Clone, Copy, Debug)]
@@ -111,6 +267,32 @@ fn read_physical(io: &mut impl EfuseIo, chip: Geometry, out: &mut [u8]) -> Resul
     }
     Ok(())
 }
+fn read_trims(io: &mut impl EfuseIo, chip: Geometry) -> Result<[u8; 19], EfuseError> {
+    let bank = io.read32(REG_LDO_EFUSE_CTRL);
+    io.write32(REG_LDO_EFUSE_CTRL, bank & !EFUSE_BANK_MASK);
+    let ldo = io.read8(chip.ldo_addr);
+    io.write8(chip.ldo_addr, ldo & !chip.ldo_mask);
+    let mut control = io.read32(REG_EFUSE_CTRL);
+    let mut trims = [255; 19];
+    for (address, byte) in TRIM_ADDRESSES.into_iter().zip(&mut trims) {
+        control &= !(EFUSE_CTRL_DATA_MASK
+            | (EFUSE_CTRL_ADDR_MASK << EFUSE_CTRL_ADDR_SHIFT)
+            | EFUSE_CTRL_VALID);
+        control |= u32::from(address) << EFUSE_CTRL_ADDR_SHIFT;
+        io.write32(REG_EFUSE_CTRL, control);
+        if !narf_scheduler::responsive_spin_until(
+            || {
+                control = io.read32(REG_EFUSE_CTRL);
+                control & EFUSE_CTRL_VALID != 0
+            },
+            Deadline::after_ms(EFUSE_POLL_MS),
+        ) {
+            return Err(EfuseError::Timeout);
+        }
+        *byte = (control & EFUSE_CTRL_DATA_MASK) as u8;
+    }
+    Ok(trims)
+}
 
 /// Decode one-/two-byte headers, sparse word enables, and later word
 /// overrides. Protected physical bytes must be excluded by the caller.
@@ -159,19 +341,63 @@ pub(super) fn read_mac_with(
     io: &mut impl EfuseIo,
     did: u16,
 ) -> Result<[u8; MAC_ADDR_LEN], EfuseError> {
-    // Reject unknown geometry before touching hardware. Read only the
-    // unprotected programming area; the protected tail is not map records.
     let chip = geometry(did)?;
-    let mut physical = [0xff; 1024];
-    read_physical(io, chip, &mut physical[..chip.readable])?;
-    let mut logical = [0xff; 768];
-    decode_map(&physical[..chip.readable], &mut logical[..chip.logical])?;
+    let logical = read_map_with(io, chip)?;
     let mut mac = [0; MAC_ADDR_LEN];
     mac.copy_from_slice(&logical[chip.mac..chip.mac + MAC_ADDR_LEN]);
     if !mac_is_valid(mac) {
         return Err(EfuseError::MacUninitialized);
     }
     Ok(mac)
+}
+fn read_map_with(io: &mut impl EfuseIo, chip: Geometry) -> Result<[u8; 768], EfuseError> {
+    // Read only the unprotected programming area. Protected bytes cannot
+    // masquerade as sparse programming records or radio calibration.
+    let mut physical = [0xff; 1024];
+    read_physical(io, chip, &mut physical[..chip.readable])?;
+    let mut logical = [0xff; 768];
+    decode_map(&physical[..chip.readable], &mut logical[..chip.logical])?;
+    Ok(logical)
+}
+pub(super) fn read_factory_with(io: &mut impl EfuseIo, did: u16) -> Result<Factory, EfuseError> {
+    if did != RTL_DEV_8822CE {
+        return Err(EfuseError::UnsupportedChip);
+    }
+    let chip = geometry(did)?;
+    let logical = read_map_with(io, chip)?;
+    if !mac_is_valid(logical[0x120..0x126].try_into().unwrap()) {
+        return Err(EfuseError::MacUninitialized);
+    }
+    Ok(Factory {
+        logical,
+        trims: read_trims(io, chip)?,
+    })
+}
+pub(super) fn read_factory8821c_with(
+    io: &mut impl EfuseIo,
+    did: u16,
+) -> Result<Factory8821c, EfuseError> {
+    if did != RTL_DEV_8821CE {
+        return Err(EfuseError::UnsupportedChip);
+    }
+    let map = read_map_with(io, geometry(did)?)?;
+    let factory = Factory8821c {
+        logical: map[..512].try_into().unwrap(),
+    };
+    if !mac_is_valid(factory.mac()) {
+        return Err(EfuseError::MacUninitialized);
+    }
+    Ok(factory)
+}
+/// # Safety
+/// Same powered, exclusive BAR2 ownership contract as `read_mac`.
+pub unsafe fn read_factory8821c(mmio: &MmioRegion, did: u16) -> Result<Factory8821c, EfuseError> {
+    read_factory8821c_with(&mut MmioEfuse(mmio), did)
+}
+/// # Safety
+/// Same powered, exclusive BAR2 ownership contract as `read_mac`.
+pub unsafe fn read_factory(mmio: &MmioRegion, did: u16) -> Result<Factory, EfuseError> {
+    read_factory_with(&mut MmioEfuse(mmio), did)
 }
 
 /// Read and decode the chip-specific PCIe factory MAC.

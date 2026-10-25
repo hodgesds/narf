@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use super::efuse::{decode_map, read_mac_with, EfuseError, EfuseIo};
+use super::efuse::{decode_map, read_factory_with, read_mac_with, EfuseError, EfuseIo};
 use super::regs::*;
 
 #[derive(Debug)]
@@ -75,6 +75,184 @@ impl EfuseIo for FakeEfuse {
         }
     }
 }
+
+include!("factory/golden.rs");
+include!("factory/rtl8821c_golden.rs");
+
+fn smoke_rtw8821ce_retained_factory_uses_actual_packed_one_path_geometry() -> TestResult {
+    let mut logical = [255; 768];
+    for (offset, length) in LINUX_8821C_FACTORY {
+        for (i, byte) in logical[*offset..offset + length].iter_mut().enumerate() {
+            *byte = (*offset as u8).wrapping_add(i as u8);
+        }
+    }
+    logical[0xca] = 0xa4;
+    logical[0xd0..0xd6].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
+    let records = sparse_factory(&logical);
+    let mut io = FakeEfuse::new(&records);
+    let factory = match super::efuse::read_factory8821c_with(&mut io, RTL_DEV_8821CE) {
+        Ok(factory) => factory,
+        Err(_) => return TestResult::Fail("8821C retained original factory map rejected"),
+    };
+    if factory.logical() != &logical[..512]
+        || factory.mac() != [2, 4, 6, 8, 10, 12]
+        || factory.raw_rfe() != 0xa4
+        || factory.rfe() != 4
+        || factory.package() != 1
+        || factory.thermal() != logical[LINUX_8821C_FACTORY[3].0]
+        || factory.crystal() != logical[LINUX_8821C_FACTORY[2].0]
+        || factory.country() != logical[0xcb..0xcd]
+        || factory.channel_plan() != logical[0xb8]
+        || factory.board_option() != logical[0xc1]
+        || factory.bt_setting() != logical[0xc3]
+        || factory.power_path(4).is_some()
+    {
+        return TestResult::Fail("8821C factory offsets/package extraction diverged from Linux");
+    }
+    for path in 0..4 {
+        let at = 0x10 + path * 42;
+        if factory.power_path(path as u8) != Some(&logical[at..at + 42]) {
+            return TestResult::Fail("8821C raw factory power path was substituted/defaulted");
+        }
+    }
+    if io
+        .writes
+        .iter()
+        .filter(|(reg, _)| *reg == REG_EFUSE_CTRL)
+        .count()
+        != 416
+    {
+        return TestResult::Fail("8821C read C22 trims or reread its factory map");
+    }
+    let before = io.writes.len();
+    if !matches!(
+        super::efuse::read_factory8821c_with(&mut io, RTL_DEV_8822CE),
+        Err(EfuseError::UnsupportedChip)
+    ) || io.writes.len() != before
+    {
+        return TestResult::Fail("8821C factory type accepted another chip before validation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_retained_factory_uses_actual_packed_one_path_geometry
+);
+fn sparse_factory(logical: &[u8; 768]) -> Vec<u8> {
+    let mut records = Vec::new();
+    for (block, bytes) in logical.chunks_exact(8).enumerate() {
+        let mut disabled = 0u8;
+        for word in 0..4 {
+            if bytes[word * 2..word * 2 + 2] == [255; 2] {
+                disabled |= 1 << word;
+            }
+        }
+        if disabled == 15 {
+            continue;
+        }
+        if block < 16 {
+            records.push((block as u8) << 4 | disabled);
+        } else {
+            records.push(((block as u8 & 7) << 5) | 15);
+            records.push(((block as u8 & 0x78) << 1) | disabled);
+        }
+        for word in 0..4 {
+            if disabled & (1 << word) == 0 {
+                records.extend_from_slice(&bytes[word * 2..word * 2 + 2]);
+            }
+        }
+    }
+    records.push(255);
+    records
+}
+fn smoke_rtw8822ce_retains_same_physical_factory_map_with_linux_packed_geometry() -> TestResult {
+    let mut logical = [255; 768];
+    let (power, length) = LINUX_FACTORY[0];
+    if LINUX_POWER_PATH * 4 != length {
+        return TestResult::Fail("actual Linux factory power-path geometry");
+    }
+    for (i, byte) in logical[power..power + length].iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(13).wrapping_add(7);
+    }
+    for (index, value) in [
+        (1, 6),
+        (2, 0xb3),
+        (3, 0x42),
+        (4, 0x17),
+        (5, 5),
+        (7, 25),
+        (8, 27),
+    ] {
+        logical[LINUX_FACTORY[index].0] = value;
+    }
+    let country = LINUX_FACTORY[6].0;
+    logical[country..country + 2].copy_from_slice(b"US");
+    let mac = LINUX_FACTORY[9].0;
+    logical[mac..mac + 6].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
+    let records = sparse_factory(&logical);
+    if records.len() > 388 {
+        return TestResult::Fail("factory fixture exceeded actual unprotected OTP");
+    }
+    let mut io = FakeEfuse::new(&records);
+    // A plausible protected-tail record cannot override retained RFE data.
+    io.physical[388..394].copy_from_slice(&[0x2f, 0x1e, 0x99, 0x99, 0xff, 0xff]);
+    let expected_trims =
+        core::array::from_fn::<_, 19, _>(|i| (i as u8).wrapping_mul(19).wrapping_add(3));
+    for (address, value) in LINUX_TRIM_ADDRESSES.into_iter().zip(expected_trims) {
+        io.physical[usize::from(address)] = value;
+    }
+    let factory = match read_factory_with(&mut io, RTL_DEV_8822CE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("factory source read/decode failed"),
+    };
+    if factory.logical() != &logical
+        || super::efuse::TRIM_ADDRESSES != LINUX_TRIM_ADDRESSES
+        || factory.trims() != &expected_trims
+        || factory.mac() != [2, 4, 6, 8, 10, 12]
+        || factory.channel_plan() != 6
+        || factory.crystal() != 0xb3
+        || factory.board_option() != 0x42
+        || factory.bt_setting() != 0x17
+        || factory.rfe() != 5
+        || factory.country() != *b"US"
+        || factory.thermal() != [25, 27]
+        || (0..4).any(|path| {
+            let at = power + usize::from(path) * LINUX_POWER_PATH;
+            factory.power_path(path) != Some(&logical[at..at + LINUX_POWER_PATH])
+        })
+        || factory.power_path(4).is_some()
+    {
+        return TestResult::Fail("retained factory fields did not match actual packed Linux map");
+    }
+    let mut erased = FakeEfuse::new(&sparse_factory(&{
+        let mut bytes = [255; 768];
+        bytes[mac..mac + 6].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
+        bytes
+    }));
+    let factory = read_factory_with(&mut erased, RTL_DEV_8822CE).unwrap();
+    if factory.crystal() != 255
+        || factory.rfe() != 255
+        || factory.thermal() != [255; 2]
+        || factory.power_path(0) != Some(&[255; 42][..])
+    {
+        return TestResult::Fail("erased factory calibration became a guessed default");
+    }
+    for did in [RTL_DEV_8821CE, RTL_DEV_8822BE, 0xffff] {
+        let mut io = FakeEfuse::new(&records);
+        if !matches!(
+            read_factory_with(&mut io, did),
+            Err(EfuseError::UnsupportedChip)
+        ) || !io.writes.is_empty()
+        {
+            return TestResult::Fail("foreign factory geometry reached EFUSE access");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw8822ce_retains_same_physical_factory_map_with_linux_packed_geometry
+);
 
 fn smoke_rtw88_efuse_sparse_words_and_overrides() -> TestResult {
     // Block 1 word 0 + word 2; then override word 0. Two-byte header

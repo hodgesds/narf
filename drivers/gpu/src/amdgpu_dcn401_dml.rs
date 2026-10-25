@@ -633,9 +633,8 @@ pub struct Arbiter {
 /// line. Every pipe runs at `clocks.dppclk_khz` with `det_bytes` of DET and
 /// the same `ttu` and `dlg`, except that each further pipe's
 /// `refcyc_h_blank_end` is its `odm_refcyc_h_blank_end` entry
-/// ([`Plan::pipe_dlg`]); Linux DML21 programs no other per-pipe difference
-/// (check.sh verifies every register of every further pipe against the
-/// first). A plane in ODM bypass may still take two DPPs (MPC combine,
+/// ([`Plan::pipe_dlg`]); the DML21 policy has no other per-pipe difference.
+/// A plane in ODM bypass may still take two DPPs (MPC combine,
 /// [`PlanePlan::dpps`]); both program identical values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {

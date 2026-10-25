@@ -1395,7 +1395,7 @@ kernel_test_in!("drivers/usb/hid", smoke_hid_modifier_byte_to_modifiers);
 fn smoke_hid_diff_press_release_repeat() -> TestResult {
     use crate::hid::{self, BootKeyboard, KbdReport};
     use narf_input::{
-        InputEvent, KeyCode, __reset_global_ring_for_test, init_global_ring, pop_global,
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, KeyCode,
     };
 
     init_global_ring(64);
@@ -1539,7 +1539,7 @@ kernel_test_in!("drivers/usb/hid", smoke_hid_rollover_suppressed);
 fn smoke_hid_modifier_only_transition() -> TestResult {
     use crate::hid::{self, BootKeyboard, KbdReport};
     use narf_input::{
-        InputEvent, KeyCode, Modifiers, __reset_global_ring_for_test, init_global_ring, pop_global,
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, KeyCode, Modifiers,
     };
 
     init_global_ring(64);
@@ -2047,8 +2047,8 @@ kernel_test_in!("drivers/usb/hid", smoke_hid_boot_mouse_parse);
 fn smoke_hid_boot_mouse_translate_diff() -> TestResult {
     use crate::hid::mouse::{self, boot_mouse_evdev_caps, BootMouse, MouseReport};
     use narf_input::{
-        evdev::ROUTER, init_global_ring, pop_global, InputEvent, PointerButtons,
-        __reset_global_ring_for_test,
+        __reset_global_ring_for_test, evdev::ROUTER, init_global_ring, pop_global, InputEvent,
+        PointerButtons,
     };
 
     init_global_ring(64);

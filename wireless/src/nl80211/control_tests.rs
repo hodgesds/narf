@@ -36,6 +36,10 @@ impl Interface for InterfaceStub {
 }
 #[async_trait::async_trait]
 impl crate::WirelessNetIface for InterfaceStub {
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+
     fn phy_capabilities(&self, band: u32) -> Option<crate::iface::PhyCapabilities> {
         let mut ht = [0; 26];
         ht[..5].copy_from_slice(&[0x6e, 0, 0x13, 0xff, 0xff]);
@@ -400,6 +404,10 @@ impl Interface for OffloadStub {
 }
 #[async_trait::async_trait]
 impl crate::WirelessNetIface for OffloadStub {
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+
     fn supports_handshake_offload(&self) -> bool {
         true
     }
@@ -876,6 +884,10 @@ impl Interface for RoamStub {
 }
 #[async_trait::async_trait]
 impl crate::WirelessNetIface for RoamStub {
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+
     fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
         crate::WirelessIfaceInfo {
             base_name: ROAM_NAME.into(),
@@ -970,6 +982,10 @@ impl Interface for SmeStub {
 }
 #[async_trait::async_trait]
 impl crate::WirelessNetIface for SmeStub {
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+
     fn supports_userspace_mlme(&self) -> bool {
         true
     }
@@ -1524,6 +1540,10 @@ impl Interface for ApStub {
 }
 #[async_trait::async_trait]
 impl crate::WirelessNetIface for ApStub {
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+
     fn supports_ap(&self) -> bool {
         true
     }
@@ -1799,3 +1819,162 @@ fn smoke_nl80211_connect_to_new_bss_roams() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("wireless/nl80211", smoke_nl80211_connect_to_new_bss_roams);
+
+const PASSIVE_NAME: &str = "wlan-passive";
+const PASSIVE_MAC: [u8; 6] = [2, 0x70, 0x71, 0x72, 0x73, 0x74];
+const PASSIVE_BSSID: [u8; 6] = [2, 0x80, 0x81, 0x82, 0x83, 0x84];
+
+struct PassiveOnlyStub {
+    rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    associated: core::sync::atomic::AtomicBool,
+}
+impl Interface for PassiveOnlyStub {
+    fn name(&self) -> &str {
+        PASSIVE_NAME
+    }
+    fn mac(&self) -> [u8; 6] {
+        PASSIVE_MAC
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        self.associated.load(core::sync::atomic::Ordering::SeqCst)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx
+    }
+}
+#[async_trait::async_trait]
+impl crate::WirelessNetIface for PassiveOnlyStub {
+    fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
+        crate::WirelessIfaceInfo {
+            base_name: PASSIVE_NAME.into(),
+            base_mac: PASSIVE_MAC,
+            bands: alloc::vec![crate::iface::WirelessBand {
+                freq_mhz: 2400,
+                channels: alloc::vec![1, 6, 11],
+            }],
+            modes: crate::iface::WirelessModes::STATION,
+            hw_caps: crate::iface::HwCaps {
+                ht_supported: false,
+                vht_supported: false,
+                he_supported: false,
+                eht_supported: false,
+            },
+        }
+    }
+    async fn scan(
+        &self,
+        req: crate::ScanRequest,
+    ) -> Result<Vec<crate::BssInfo>, crate::WirelessError> {
+        if req.active || !req.ssids.is_empty() {
+            return Err(crate::WirelessError::NotSupported);
+        }
+        Ok(alloc::vec![crate::BssInfo {
+            bssid: PASSIVE_BSSID,
+            ssid: b"passive-ap".to_vec(),
+            frequency_mhz: 2412,
+            channel: 1,
+            rssi: -48,
+            security: crate::scan::BssSecurity::Open,
+        }])
+    }
+    async fn associate(&self, req: crate::AssociateRequest) -> Result<(), crate::WirelessError> {
+        if req.bssid != PASSIVE_BSSID || req.ssid != b"passive-ap" || req.frequency_mhz != 2412 {
+            return Err(crate::WirelessError::InvalidArgs);
+        }
+        self.associated
+            .store(true, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn disassociate(&self) -> Result<(), crate::WirelessError> {
+        self.associated
+            .store(false, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn set_config(&self, _: crate::WirelessConfig) -> Result<(), crate::WirelessError> {
+        Err(crate::WirelessError::NotSupported)
+    }
+}
+
+fn smoke_nl80211_passive_only_wiphy_scan_limit_and_connect_discovery() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_net::netlink_generic::install_event_sink;
+    super::register();
+    let _restore = SinkRestore(install_event_sink(interop_sink));
+    let stub = Arc::new(PassiveOnlyStub {
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+        associated: core::sync::atomic::AtomicBool::new(false),
+    });
+    let iface: Arc<dyn crate::WirelessNetIface> = stub.clone();
+    narf_net::iface::register(PASSIVE_NAME, PASSIVE_MAC, |_, _| Ok(()));
+    crate::registry::register(iface.clone());
+    let ifindex = match narf_net::netlink_route::ifindex_for_name(PASSIVE_NAME) {
+        Some(index) => index,
+        None => return TestResult::Fail("passive iface has no ifindex"),
+    };
+    let wattrs = wiphy_attrs(0, &iface.get_wireless_info(), Some(iface.as_ref()));
+    if find_attr(&wattrs, 43) != Some(&[0u8][..]) {
+        return TestResult::Fail("passive-only wiphy advertised non-zero MAX_NUM_SCAN_SSIDS");
+    }
+    let mut ssids = Vec::new();
+    push_attr(&mut ssids, 1, b"hidden");
+    let mut active_scan = Vec::new();
+    push_attr(&mut active_scan, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut active_scan, 45 | NLA_F_NESTED, &ssids);
+    if parse_operation_caps(
+        SCAN,
+        &attributes(&active_scan).unwrap(),
+        ConnectCaps::of(iface.as_ref()),
+        0,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("passive-only wiphy accepted TRIGGER_SCAN SSIDs");
+    }
+
+    CACHE.lock().retain(|c| c.name != PASSIVE_NAME);
+    CACHE.lock().push(Cache {
+        name: PASSIVE_NAME.into(),
+        namespace: 0,
+        busy: true,
+        results: Vec::new(),
+    });
+    INTEROP_EVENTS.lock().clear();
+    narf_scheduler::block_on_spin(execute(
+        iface.clone(),
+        narf_net::kernel_admin(PASSIVE_NAME).unwrap(),
+        0,
+        ifindex,
+        Operation::Connect {
+            ssid: b"passive-ap".to_vec(),
+            bssid: None,
+            frequency_mhz: Some(2412),
+            cred: Credential::Open,
+            ie: Vec::new(),
+            owner: None,
+        },
+    ));
+    let connected = INTEROP_EVENTS.lock().iter().any(|(ns, group, msg)| {
+        *ns == 0
+            && *group == 19
+            && msg.get(16) == Some(&CONNECT)
+            && find_attr(&msg[20..], 72) == Some(&0u16.to_ne_bytes()[..])
+            && find_attr(&msg[20..], 6) == Some(&PASSIVE_BSSID[..])
+    });
+    CACHE.lock().retain(|c| c.name != PASSIVE_NAME);
+    if !connected || !stub.associated.load(Ordering::SeqCst) {
+        return TestResult::Fail("passive-only CONNECT cache miss did not use passive discovery");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_passive_only_wiphy_scan_limit_and_connect_discovery
+);

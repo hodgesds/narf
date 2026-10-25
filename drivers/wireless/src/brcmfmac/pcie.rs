@@ -148,6 +148,7 @@ pub struct BrcmfmacDevice {
 /// select/access pair. Future async firmware work must own this value or
 /// put it behind an async mutex, never await under CONTROLLER's IRQ lock.
 pub(super) struct PcieBackplane {
+    pub(super) proof: Option<alloc::sync::Arc<super::provision::Proof>>,
     pub(super) bar0: MmioRegion,
     pub(super) bar2: Option<MmioRegion>,
     pub(super) device: BusDevice,
@@ -172,6 +173,12 @@ pub(super) fn invoke_registers<T>(
 }
 
 impl PcieBackplane {
+    pub(super) fn qualified(&self) -> Result<(), chip::Error> {
+        if let Some(proof) = &self.proof {
+            proof.validate().map_err(|_| chip::Error::Access)?;
+        }
+        Ok(())
+    }
     fn select(&mut self, address: u32) -> Result<u64, chip::Error> {
         if !chip::valid_address(address) {
             return Err(chip::Error::Address);
@@ -207,6 +214,7 @@ impl PcieBackplane {
 
 impl Backplane for PcieBackplane {
     fn read32(&mut self, address: u32) -> Result<u32, chip::Error> {
+        self.qualified()?;
         let cap = self.cap;
         invoke_registers(&cap, || {
             let offset = self.select(address)?;
@@ -218,6 +226,7 @@ impl Backplane for PcieBackplane {
     }
 
     fn write32(&mut self, address: u32, value: u32) -> Result<(), chip::Error> {
+        self.qualified()?;
         let cap = self.cap;
         invoke_registers(&cap, || {
             let offset = self.select(address)?;
@@ -369,7 +378,10 @@ pub unsafe fn bring_up(
     if bar0.len < 4096 {
         return Err(ProbeError::Bar0TooSmall);
     }
-    let bar2 = if super::native_runtime::selected_profile(&device).is_some() {
+    let bar2 = if matches!(
+        device.id.device,
+        BRCM_PCIE_43602_DEVICE_ID | BRCM_PCIE_43602_2G_DEVICE_ID | BRCM_PCIE_43602_5G_DEVICE_ID
+    ) {
         // BAR2 is both dongle RAM and firmware control metadata; Device mapping
         // preserves the required index/descriptor publication ordering.
         // SAFETY: caller owns this function's BARs/config exclusively and
@@ -387,6 +399,7 @@ pub unsafe fn bring_up(
     };
     park_command(&device, &cap, true)?;
     let mut backplane = PcieBackplane {
+        proof: None,
         bar0,
         bar2,
         device,
@@ -564,6 +577,7 @@ mod command_tests {
             },
         };
         let mut bus = PcieBackplane {
+            proof: None,
             bar0: region,
             bar2: Some(region),
             device,

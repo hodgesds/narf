@@ -541,13 +541,6 @@ kernel_test_in!(
 
 const RAW_VECTORS: &str = include_str!("../tests/dcn401_dsc/mst_raw_vectors.txt");
 
-/// mst_raw_vectors.txt (mst_harness.c built with RAW_DEPTH): Linux's
-/// uncompressed MST stream depth (create_validate_stream_for_sink's mask
-/// with dm_dp_mst_is_port_support_mode) and its PBN and slots
-/// (dm_encoder_helper_atomic_check's drm_dp_calc_pbn_mode at
-/// convert_color_depth_from_display_info of max_requested_bpc), through
-/// `raw_mst_choice`; a stream no depth carries, or whose slots exceed the
-/// link's, is none.
 fn navi48_mst_raw_depth_matches_linux_vectors() -> TestResult {
     let (mut checked, mut carried, mut stepped) = (0, 0, 0);
     for line in RAW_VECTORS

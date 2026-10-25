@@ -62,7 +62,7 @@ impl Permission {
             // permissive rule cannot erase DFS, narrow bandwidth or power.
             if r.freq_start_mhz >= r.freq_end_mhz
                 || r.max_bandwidth_mhz < 20
-                || r.flags.contains(RegFlags::DFS)
+                || r.flags.intersects(RegFlags::DFS | RegFlags::NO_IR)
             {
                 return Err(Error::Unsupported);
             }

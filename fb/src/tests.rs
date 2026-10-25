@@ -1029,8 +1029,8 @@ fn smoke_cursor_renderer_moves_on_pointer_event() -> TestResult {
         FbWriter,
     };
     use narf_input::{
-        init_global_ring, push_global, InputEvent, PointerButtons, PointerEvent,
-        __reset_global_ring_for_test,
+        __reset_global_ring_for_test, init_global_ring, push_global, InputEvent, PointerButtons,
+        PointerEvent,
     };
 
     install_test_scanout(64, 64);
@@ -1086,8 +1086,8 @@ fn smoke_cursor_renderer_restores_under_sprite_on_move() -> TestResult {
     };
     use narf_graphics::Pixel32;
     use narf_input::{
-        init_global_ring, push_global, InputEvent, PointerButtons, PointerEvent,
-        __reset_global_ring_for_test,
+        __reset_global_ring_for_test, init_global_ring, push_global, InputEvent, PointerButtons,
+        PointerEvent,
     };
 
     install_test_scanout(64, 64);
@@ -1162,8 +1162,8 @@ kernel_test_in!(
 fn smoke_cursor_renderer_clamps_to_fb_bounds() -> TestResult {
     use crate::{bootstrap_writer, clear_test_scanout, cursor, install_test_scanout, FbWriter};
     use narf_input::{
-        init_global_ring, push_global, InputEvent, PointerButtons, PointerEvent,
-        __reset_global_ring_for_test,
+        __reset_global_ring_for_test, init_global_ring, push_global, InputEvent, PointerButtons,
+        PointerEvent,
     };
 
     install_test_scanout(64, 64);

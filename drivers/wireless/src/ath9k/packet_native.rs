@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! Private PCI adapter transferred from the retained calibrated AR9285 owner.
+use super::{
+    identity,
+    packet::{Error, Port},
+};
+use core::sync::atomic::{AtomicBool, Ordering};
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
+use narf_capabilities::{Cap, Write};
+pub(super) struct Native {
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    bar: MmioRegion,
+    active: AtomicBool,
+    report: super::calibration::Report,
+    rf_silent: Option<(u8, bool)>,
+}
+impl Native {
+    /// # Safety
+    /// Caller retains the sole AR9285 function and exact mapped BAR through
+    /// calibration/MAC/packet composition. This adapter cannot be cloned.
+    pub(super) unsafe fn new(
+        device: BusDevice,
+        cap: Cap<BusDeviceCap, Write>,
+        bar: MmioRegion,
+        report: super::calibration::Report,
+        image: &[u8; super::EEPROM_4K_BYTES],
+    ) -> Result<Self, Error> {
+        if device.id.vendor != 0x168c || device.id.device != 0x002b || report.frequency_mhz != 2412
+        {
+            return Err(Error::Packet);
+        }
+        let bytes = [image[20], image[21]];
+        let rf = if image[7] & 1 != 0 {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        };
+        let rf_silent = if rf & 1 != 0 {
+            if rf & !31 != 0 {
+                return Err(Error::Packet);
+            }
+            Some((((rf >> 2) & 7) as u8, rf & 2 != 0))
+        } else {
+            None
+        };
+        Ok(Self {
+            device,
+            cap,
+            bar,
+            active: AtomicBool::new(false),
+            report,
+            rf_silent,
+        })
+    }
+    fn command(&self) -> Result<u16, Error> {
+        let command =
+            narf_bus::pci::read_command(&self.cap, &self.device).map_err(|_| Error::Access)?;
+        if command == u16::MAX
+            || command & (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE)
+                != narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE
+        {
+            return Err(Error::Access);
+        }
+        Ok(command)
+    }
+    fn extent(&self, reg: u64) -> Result<(), Error> {
+        if reg & 3 != 0 || reg.checked_add(4).is_none_or(|end| end > self.bar.len) {
+            Err(Error::Address)
+        } else {
+            Ok(())
+        }
+    }
+    fn invoke<T>(&self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        identity::invoke(&self.cap, operation).map_err(|_| Error::Access)?
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+fn smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio(
+) -> narf_kernel_test::TestResult {
+    use narf_bus::{BarKind, BusAddr, BusKind, DeviceId, PcieAddr};
+    let address = PcieAddr::new(0, 0, 7, 0);
+    let device = BusDevice {
+        addr: BusAddr::Pcie(address),
+        id: DeviceId {
+            vendor: 0x168c,
+            device: 0x002b,
+            class: 0x028000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Pcie {
+            addr: address,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    };
+    let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+    let bar = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: 0,
+        len: super::phy::REQUIRED_BAR,
+        kind: BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    let report = super::calibration::Report {
+        country: *b"US",
+        frequency_mhz: 2412,
+        max_power_half_dbm: 34,
+        pa_offset: None,
+        iq_i: 0,
+        iq_q: 0,
+        measured_noise_dbm: -115,
+        noise_dbm: -115,
+    };
+    cap.revoke();
+    // SAFETY: invalid config/BAR addresses are deliberately unreachable with
+    // the revoked real object-table capability. No physical DMA is published.
+    let Ok(native) =
+        (unsafe { Native::new(device, cap, bar, report, &[0; super::EEPROM_4K_BYTES]) })
+    else {
+        return narf_kernel_test::TestResult::Fail("native fixture shape");
+    };
+    let mut entered = false;
+    if native.access(false, || {
+        entered = true;
+        Ok(())
+    }) != Err(Error::Access)
+        || entered
+        || native.read(0x4020) != Err(Error::Access)
+        || native.write(0xc, 0x1000) != Err(Error::Access)
+        || native.allocate(128).is_ok()
+        || native.master(true) != Err(Error::Access)
+        || native.master(false) != Err(Error::Access)
+    {
+        return narf_kernel_test::TestResult::Fail(
+            "revoked packet authority reached config, DMA or BAR",
+        );
+    }
+    narf_kernel_test::TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "drivers/wireless/ath9k/packet",
+    smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio
+);
+impl Port for Native {
+    fn transmit_allowed(&self) -> Result<(), Error> {
+        let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Access)?;
+        let permission =
+            super::calibration::Permission::from_domain(&domain).map_err(|_| Error::Access)?;
+        if !permission.allows_report(self.report) {
+            return Err(Error::Access);
+        }
+        if let Some((gpio, polarity)) = self.rf_silent {
+            if (self.read(0x4048)? & (1 << (12 + gpio)) != 0) == polarity {
+                return Err(Error::Access);
+            }
+        }
+        Ok(())
+    }
+    fn access<T>(
+        &self,
+        active: bool,
+        operation: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.invoke(|| {
+            let command = self.command()?;
+            if (command & narf_bus::pci::cmd::BUS_MASTER != 0) != active
+                || self.active.load(Ordering::Acquire) != active
+            {
+                return Err(Error::Access);
+            }
+            operation()
+        })
+    }
+    fn read(&self, reg: u64) -> Result<u32, Error> {
+        self.access(self.active.load(Ordering::Acquire), || {
+            self.extent(reg)?;
+            // SAFETY: complete aligned BAR extent inside current invocation.
+            let value = unsafe { self.bar.read32(reg) };
+            if value == u32::MAX {
+                self.extent(0x4020)?;
+                // SAFETY: checked immutable silicon-ID dword in same BAR and invocation.
+                if unsafe { self.bar.read32(0x4020) } == u32::MAX {
+                    return Err(Error::Access);
+                }
+            }
+            Ok(value)
+        })
+    }
+    fn write(&self, reg: u64, value: u32) -> Result<(), Error> {
+        self.access(self.active.load(Ordering::Acquire), || {
+            self.extent(reg)?;
+            // SAFETY: full aligned extent, exact exclusive retained PCI capability.
+            unsafe {
+                self.bar.write32(reg, value);
+            }
+            Ok(())
+        })
+    }
+    fn allocate(&self, bytes: usize) -> Result<narf_io::DmaBuffer, Error> {
+        self.access(false, || {
+            if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain {
+                return Err(Error::Access);
+            }
+            narf_io::alloc_coherent_masked(
+                bytes,
+                narf_lib::id::DomainId::DRIVER_0,
+                u64::from(u32::MAX),
+            )
+            .map_err(|_| Error::Memory)
+        })
+    }
+    fn master(&self, enabled: bool) -> Result<(), Error> {
+        self.invoke(|| {
+            self.command()?;
+            // Mark before the possibly ambiguous activation. Stopping remains
+            // available independently, even after a failed BME readback.
+            self.active.store(enabled, Ordering::Release);
+            if enabled {
+                narf_bus::pci::set_command(&self.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
+            } else {
+                narf_bus::pci::clear_command(
+                    &self.cap,
+                    &self.device,
+                    narf_bus::pci::cmd::BUS_MASTER,
+                )
+            }
+            .map_err(|_| Error::Access)?;
+            if (self.command()? & narf_bus::pci::cmd::BUS_MASTER != 0) != enabled {
+                return Err(Error::Access);
+            }
+            Ok(())
+        })
+    }
+    fn now_us(&self) -> u64 {
+        narf_time::monotonic_ns() / 1000
+    }
+}

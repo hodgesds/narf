@@ -11,26 +11,20 @@ Pinned primary tools:
 
 - libvpx 1.15.2, official archive
   <https://chromium.googlesource.com/webm/libvpx/+archive/refs/tags/v1.15.2.tar.gz>,
-  SHA-256 `b6c70df4026cd1c3cfa006bb7ec96c3ad4716c2530fd82c78c763cb97a4496c9`.
-  Configure `--target=generic-gnu --disable-vp8 --enable-vp9-highbitdepth
+  SHA-256 `b6c70df4026cd1c3cfa006bb7ec96c3ad4716c2530fd82c78c763cb97a4496c9`. Configure `--target=generic-gnu --disable-vp8 --enable-vp9-highbitdepth
   --disable-unit-tests --disable-docs --disable-webm-io --disable-shared
   --enable-static`, then `make -j2`. No encoder logic changes.
 - FFmpeg 8.0, official archive <https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz>,
-  SHA-256 `b2751fccb6cc4c77708113cd78b561059b6fa904b24162fa0be2d60273d27b8e`.
-  Include VP9 decoder/parser/IVF demuxer, rawvideo output and the
+  SHA-256 `b2751fccb6cc4c77708113cd78b561059b6fa904b24162fa0be2d60273d27b8e`. Include VP9 decoder/parser/IVF demuxer, rawvideo output and the
   `vp9_metadata,trace_headers` bitstream filters for the strict CBS trace.
-- Mesa 26.2.4, archive/hash and MIT notices in `../../VCN-NOTICES`.
-  The actual generic/codec builder, context formula, initialization table,
-  tier3 reference-list package and IB constructors are extracted unchanged
-  by `../../tests/vcn5/decode_primary.py` and executed by `vp9_check.py`.
-  Both gfx1200/gfx1201 surface layouts come from actual GFX12 Addrlib.
+- Mesa 26.2.4, archive/hash and MIT notices in `../../VCN-NOTICES`. Both gfx1200/gfx1201 surface layouts come from actual GFX12 Addrlib.
 
-Regenerate with `regenerate.py --vpxenc /path/to/vpxenc --ffmpeg /path/to/ffmpeg`.
-Run the independent source/fixture oracle with
-`../../tests/vcn5/vp9_check.py /path/to/mesa-26.2.4 --ffmpeg /path/to/ffmpeg`.
-It compares every create/decode/destroy byte, 2072 initialized default
-probability bytes, all three complete IBs and tier3 reference package,
-actual surface geometry, and every independently decoded NV12 byte.
+Regenerate the picture asset with `regenerate.py --vpxenc /path/to/vpxenc
+--ffmpeg /path/to/ffmpeg`. This invokes supplied codec executables and checks
+the original decoded picture. It neither compiles sources nor validates Rust
+driver commands. Native Rust tests exercise the production message, probability
+initialization and IB/arena paths using retained data; external conformance
+remains an acceptance requirement.
 
 Raw payload: 64 bytes, SHA-256
 `8720e79f246912d0d8001e0517b68f81be764b9d0102334ddf500f613ee6e453`.
@@ -63,8 +57,8 @@ Independent FFmpeg decode matches all original samples; packed MSB-aligned
 P010 is 49152 bytes, SHA-256
 `7c8a710cc653140480b728b7769d34d2f77c46cc30766530e9fc7b6742646c01`.
 
-Run both scripts with `--profile2` to select this fixture. The same unchanged
-Mesa builder executes its 10-bit P010 path and adds 65536 bytes to the actual
+Run the picture generator with `--profile2` to select this fixture. The
+retained Rust P010 profile adds 65536 bytes to its
 context, totaling 10923264 bytes; complete arena 11161600 bytes. Actual Addrlib
 surfaces yield Y pitch 128/UV pitch 64 in samples and UV offset 32768 bytes.
 Firmware header sizes remain compressed 10/uncompressed 18 bytes; strict CBS

@@ -64,7 +64,6 @@ const DEEP_SLEEP_WALK: [(u64, &str); 5] = [
 const PPCLK_GFXCLK: u32 = 0;
 const PPCLK_UCLK: u32 = 2;
 const FEATURE_DPM_UCLK: u64 = 1 << 3;
-// smu_v14_0_2_ppsmc.h; checked by tests/smu14_baco.c.
 const MSG_ENTER_BACO: u32 = 0x15;
 const MSG_EXIT_BACO: u32 = 0x16;
 const MSG_ARM_D3: u32 = 0x17;

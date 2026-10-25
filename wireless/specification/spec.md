@@ -95,6 +95,21 @@ firmware peer records, retained supplicant, key installation and controlled
 port. `Associated` alone grants none of those. MT76 preserves its existing
 public driver API through a wrapper; RTL8188EU uses the common plan directly.
 
+`association::observe(&impl RawFrame, channel, own, signal_dbm)` decodes a
+bounded unmodified legacy beacon/probe response into `ObservedBss`, retaining
+the original IEs and AP RSNE/RSNXE bodies plus IEEE supported/basic rate
+bitmaps. It binds receiver/transmitter/BSSID and optional DS channel IEs to
+the supplied retained radio channel; malformed or duplicate SSID/rate/security
+elements, fragments, modified RX and unsupported mandatory rates fail.
+The caller supplies native signal converted to dBm, or None. Hardware
+channel/PHY qualification, mandatory driver rates, signed radio policy,
+connection state and transmit/key authority remain driver-owned. Observed
+facts still pass through `JoinPlan` security and association negotiation.
+
+`wireless::register_initcalls()` installs the bootstrap `trusted_net_authority` into `narf_net`
+and registers nl80211 during boot initialization, ensuring network interface registration authority
+is available before any device driver probes.
+
 ### 3.1 Interface Specialization
 
 ```rust
@@ -113,6 +128,17 @@ The iwlwifi MLD implementation owns four Narf-Rings, each with an async TX
 consumer and its negotiated hardware queue. AP admission control may downgrade
 a class; non-WMM links use the best-effort hardware queue. The generic network
 interface's `tx_ring()` remains the BestEffort ring.
+
+`WirelessNetIface::max_scan_ssids() -> u8` reports the active-scan SSID limit,
+including wildcard entries. The conservative default is zero (passive-only).
+nl80211 advertises this exact limit in `MAX_NUM_SCAN_SSIDS` and rejects explicit
+requests which exceed it before driver dispatch. A CONNECT without a cached BSS
+chooses a directed active scan only when the limit is nonzero; otherwise it
+requests passive discovery without SSID entries and applies the requested SSID,
+BSSID, frequency and security filters to the observed results. This does not
+downgrade explicit active scans or grant probe-transmit authority. Intel exposes
+20 entries; ath11k and the shared CYW/BCM FullMAC facade expose 16. The initial
+MT76, ath10k, AR9285 and Realtek profiles retain passive-only discovery.
 
 `WirelessNetIface::phy_capabilities(band_mhz) -> Option<PhyCapabilities>`
 returns band-specific IEEE HT (26-byte) and optional VHT (12-byte) capability
@@ -655,6 +681,16 @@ failure counters, and RX / TX PPDU duration), the scan record's signal
 otherwise. A driver leaves an unavailable measurement absent rather than
 synthesising one.
 
+The common CYW43439/BCM43602 FullMAC station supplies an awake power-save
+default and accepts PS changes through its retained control worker. GET reports
+the accepted desired policy; the station's applied state changes only after
+correlated PM_FAST/PM_OFF and sleep-retention replies. Requests coalesce and
+an in-flight completion preserves a newer desired policy. Firmware failure or
+cancelled command ownership closes carrier and queued TX and prevents session
+reuse. This ordinary firmware station power save does not suspend the host bus
+or provide system suspend/WoW. Native SDPCM and PCIe-msgbuf models cover the
+commands, failures and Open/WPA2 DHCP/IP traffic with power save enabled.
+
 `SET_CQM` accepts the station/P2P-client RSSI form: a binary native-endian
 signed threshold array plus its required native-endian u32 hysteresis. Values
 must be non-positive and strictly increasing. A zero/empty array disables it;
@@ -794,6 +830,43 @@ header bounds, key role/ID, native station addresses, nonce uniqueness and
 PN exhaustion, and retain independent replay trackers per key/TID (including
 a separate non-QoS tracker). These helpers do not grant controlled-port access.
 
+### 3.4.2 Retained native station security
+
+`packet_key::{Key, Role}` owns a software CCMP key's immutable peer/KeyID
+binding, non-wrapping 48-bit transmit PN and seventeen receive replay trackers
+(sixteen QoS TIDs plus non-QoS). Pairwise keys transmit only local ToDS data;
+group keys are receive-only. Full header, fragment, A-MSDU and CCMP extents
+are checked before crypto; identical-key reinstall preserves counters, and
+authentication failure changes neither replay state nor ciphertext.
+
+`station_security::{Security, RawFrame, Rx}` composes the shared WPA2-PSK
+supplicant with those keys. Drivers supply already-negotiated station/AP RSNEs
+and original descriptor-validated native MPDUs. `RawFrame::unmodified()` must
+reject hardware-decrypted/decapsulated packets and frames outside the adapter's
+admitted peer/channel/PHY profile before nonce or key state can advance. The
+security owner additionally checks native addresses, DS direction, fragments,
+EAPOL envelope and negotiated crypto. It grants no radio or carrier authority.
+
+`receive_with_nonce` lazily requests fallible secure SNonce material through
+the existing supplicant contract. `pending_frame` retains each exact M2/M4 or
+group-key response; the transport calls `reply_delivered(native_bytes)` only
+after a matching terminal delivery receipt. Submission and DMA consumption
+alone cannot commit keys or open the controlled port. Old-key rekey replies
+remain protected with the installed key until that receipt; identical key
+retries preserve PN/replay state. A bounded owner-lifetime history rejects
+retired temporal-key reuse. Exhaustion, entropy or protocol failures close
+admission, and key/nonce material is zeroized on drop. `transmit_ethernet`
+accepts local Ethernet data only while authorized and consumes its PN before
+transport publication. Each driver's stop/cancellation/DMA ownership remains
+that driver's responsibility.
+
+`Security::handshake_active()` reports a retained reply awaiting terminal
+delivery or the supplicant waiting for M3 after M2 delivery. It is false after
+terminal failure. During an established pairwise rekey, the old-key data port
+can reopen after the exact M2 receipt while this exchange remains active;
+drivers must track the handshake deadline independently of `port_open()` and
+established carrier. The matching M4 terminal receipt finishes that exchange.
+
 ### 3.5 EAPOL supplicant (`eapol.rs`)
 
 `Supplicant` runs the 4-way handshake (`handle`) and, once it completed,
@@ -859,10 +932,49 @@ fixtures use explicit injected material and do not depend on target entropy.
 ### 3.5 Deployment regulatory policy
 
 `reg::parse_policy` decodes an NRGD v1 policy; parsing alone conveys no
-authority. The iwlwifi probe optionally opens `wireless-regulatory.bin`
-through its trusted firmware-registry capability. It installs the policy
-only after the registry verifies its signature and the view identifies a
-signer. Unsigned policies are rejected even in unsigned-firmware builds.
+authority. `reg::policy::load()` opens the exact `wireless-regulatory.bin`
+through trusted firmware-registry authority, invokes the blob's current
+capability, requires verified signer metadata and returns a fully decoded
+owned domain. Unsigned policies are rejected even in unsigned-firmware builds.
+`reg::db::ensure_domain()` preserves an existing caller-installed domain,
+otherwise performs that signed bootstrap without holding the database lock.
+Only successful loads install state; a caller policy installed during lookup
+wins the race. A clear during lookup invalidates that in-flight bootstrap;
+a later explicit bootstrap may load afresh. Saturated revisions reject bootstrap
+rather than alias a previous empty installation. Existing `set_domain` callers retain responsibility for their
+policy's authority. `reg::db::Database::{new,install,clear,snapshot}` supplies
+isolated or shared immutable `Arc<RegulatoryDomain>` snapshots. An unchanged
+installation preserves pointer identity; replacement allocates a new snapshot,
+and clear removes current authority while existing readers retain safe storage.
+Global `snapshot`, `ensure_snapshot` and `clear_domain` complement the existing
+owned-value APIs. Lookup, decoding, rule cloning and retired-snapshot destruction
+happen outside the database's IRQ-disabling lock. This cache does not authenticate
+arbitrary caller-installed domains or automatically observe firmware-blob
+capability revocation: a trusted installer/source must replace or clear policy.
+
+Native CYW43439/BCM43602 attachment observes the live shared installation through
+`Station::initialize_live` and a `PolicySource`; explicit `Station::initialize`
+retains its fixed-domain contract. Live setup requires the original snapshot
+before/after WLC_UP and before interface publication. Scan, join, disconnect,
+power-save and packet progress observe replacement/absence, including every
+resume of native control futures (before credit-delayed publication), command
+receipts and final host-port fences. Country changes, removal, NO_IR/DFS or power
+below an acknowledged TX grant close the host port and poison that firmware
+lifetime, retaining uncertain DMA. Reinstallation and late firmware events cannot
+reopen it. Same-country changes that still cover the acknowledged ceiling preserve
+the connection without increasing firmware power. These checks close host
+admission when a change is observed; they do not retract in-flight commands or
+prove autonomous firmware RF quiescence. Other families retain their documented
+policy-observation contracts.
+
+Intel probe, MT76 publication/TX admission, ath10k station-control entry points
+and the common CYW/Broadcom FullMAC attachment use this bootstrap. A standalone
+driver no longer requires another wireless driver to populate the database.
+FullMAC attachment and TX admission fail when policy is missing/invalid;
+Intel/MT76 diagnostic/passive receive paths retain their existing closed-TX
+behavior. No calibration, country or default transmit authority is inferred.
+RTL8188EU uses `policy::load()` directly on every attach, preserving its
+fresh-signed-artifact requirement independently of the shared domain cache.
 Deployment public keys are baked into the image with
 `NARF_FIRMWARE_TRUSTED_KEYS`; the firmware packer accepts a verified
 detached signature. No deployment country or signing key is chosen by
@@ -876,6 +988,13 @@ rule count `u16`, reserved `u16=0`, followed by 1–64 rules of 16 bytes:
 start MHz `u32`, end MHz `u32`, maximum bandwidth MHz `u32`, power dBm
 `i8`, `RegFlags` `u8`, reserved `u16=0`. Integers are little-endian;
 unknown flags, malformed ranges and length mismatches are rejected.
+`RegFlags` assigns DFS=bit0, INDOOR_ONLY=bit1, NO_P2P=bit2 and NO_IR=bit3.
+NO_IR permits passive reception but denies active probes and host-initiated
+station TX in the current host-policy profiles. Drivers must not discard an
+overlapping restriction because another rule grants a wider channel span;
+future relaxation needs an explicit firmware/regulatory proof. nl80211
+GET_REG maps this flag to Linux `NL80211_RRF_NO_IR` (bit7). Older readers that
+do not recognize NRGD bit3 reject the policy rather than ignore it.
 The driver intersects the selected host rule with firmware MCC permission
 and applies its power ceiling before transmitting association frames.
 
@@ -946,5 +1065,5 @@ Management frames (Beacons, Probe Requests) are voluminous.
 
 ## 9. Dependencies
 
-- **Consumes**: `net/` (base interface), `drivers/`, `capabilities/`, `ipc/`, `io/`.
+- **Consumes**: `net/` (base interface), `drivers/`, `capabilities/`, `ipc/`, `io/`, and `firmware/` for authenticated deployment-policy bootstrap.
 - **Provides**: Wireless-specific control plane to userspace daemons.

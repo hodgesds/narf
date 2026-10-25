@@ -52,6 +52,7 @@ pub mod fwil;
 pub mod msgbuf;
 pub mod native_runtime;
 pub mod pcie;
+pub mod provision;
 pub mod ringbuf;
 pub mod runtime;
 pub mod shared;
@@ -69,7 +70,7 @@ pub fn register() {
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
-mod runtime_tests;
+pub(crate) mod runtime_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod data_wire_tests;

@@ -655,3 +655,35 @@ kernel_test_in!(
     "drivers/wireless/mt7921/transport",
     mcu_tx_completion_pump_preserves_queued_and_fresh_command_replies
 );
+
+fn smoke_mt76_native_revocation_precedes_current_config_bar_and_dma_start() -> TestResult {
+    let (mut words, hw) = match rig() {
+        Ok(value) => value,
+        Err(_) => return TestResult::Fail("native fixture allocation"),
+    };
+    hw.authority.revoke();
+    words[(TX_WM + 8) as usize / 4] = 0x12345678;
+    if hw.read(TX_WM + 8) != Err(Error::Authority)
+        || hw.write(TX_WM + 8, 0).is_ok()
+        || hw.command(narf_bus::pci::cmd::BUS_MASTER, 0).is_ok()
+        || words[(TX_WM + 8) as usize / 4] != 0x12345678
+    {
+        return TestResult::Fail("revoked native MT76 access reached actual BAR/configuration");
+    }
+    // SAFETY: this revoked-cap negative must reject before the deliberately
+    // invalid ECAM and before any attempted BAR sizing or DMA allocation.
+    if unsafe { crate::mt7921::pci::bring_up(&hw.device, &hw.authority) }.is_ok() {
+        return TestResult::Fail("revoked MT76 probe authority sized a BAR");
+    }
+    let firmware = super::super::tests::firmware(16);
+    // SAFETY: same revoked-cap boundary; native constructor must never reach
+    // bogus configuration or allocate/publish queues under stale authority.
+    if unsafe { Transport::new(hw.mmio, hw.device, hw.authority, firmware) }.is_ok() {
+        return TestResult::Fail("revoked MT76 constructor admitted DMA owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport",
+    smoke_mt76_native_revocation_precedes_current_config_bar_and_dma_start
+);

@@ -132,7 +132,9 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             .store(u64::from_le_bytes(packed), Ordering::Release);
         let up = peer.is_some();
         let was_up = self.up.swap(up, Ordering::AcqRel);
-        narf_net::iface::set_link_state(&self.name, up);
+        // Physical carrier preserves operator-controlled IFF_UP and never
+        // invokes an administrative open/stop hook under retained locks.
+        narf_net::iface::set_link_metadata(&self.name, up, None, None);
         if was_up && !up {
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
@@ -162,7 +164,7 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
         }
         frames
     }
-    fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    pub(super) fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
         if !self.up.load(Ordering::Acquire)
             || !transmit_admitted(bytes, self.mac)
             || !offloads_admitted(meta)
@@ -180,6 +182,14 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             .try_send(frame)
             .map_err(|_| ())
     }
+    pub(super) fn drain(&self) -> bool {
+        let frames = self.progress();
+        let progress = !frames.is_empty();
+        for mut frame in frames {
+            narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+        }
+        progress
+    }
 }
 trait Endpoint: Send + Sync {
     fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
@@ -192,12 +202,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> En
         self.enqueue(bytes, meta)
     }
     fn drain(&self) -> bool {
-        let frames = self.progress();
-        let progress = !frames.is_empty();
-        for mut frame in frames {
-            narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
-        }
-        progress
+        Device::drain(self)
     }
 }
 static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
@@ -211,18 +216,73 @@ fn drain() -> bool {
     active.is_some_and(|owner| owner.drain())
 }
 fn authenticated_domain() -> Result<narf_wireless::reg::RegulatoryDomain, service_runtime::Error> {
-    let loader =
-        narf_firmware::trusted_loader_authority().ok_or(service_runtime::Error::Profile)?;
-    let authority = loader
-        .derive()
-        .map_err(|_| service_runtime::Error::Profile)?;
-    let cap = narf_firmware::open("wireless-regulatory.bin", &authority)
-        .map_err(|_| service_runtime::Error::Profile)?;
-    let view = narf_firmware::view_of(&cap).map_err(|_| service_runtime::Error::Profile)?;
-    if view.signer.is_none() {
-        return Err(service_runtime::Error::Profile);
+    // This profile requires a fresh signed deployment artifact per attach;
+    // preserve that stronger contract instead of consulting the shared cache.
+    narf_wireless::reg::policy::load().map_err(|_| service_runtime::Error::Profile)
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Admission {
+    Ready,
+    PendingAssets,
+}
+pub(super) fn classify_attach_admission(
+    has_net_authority: bool,
+    has_loader_authority: bool,
+    domain: Result<narf_wireless::reg::RegulatoryDomain, narf_wireless::reg::policy::Error>,
+    calibration: Result<power_policy::Calibration, power_policy::Error>,
+) -> Result<Admission, service_runtime::Error> {
+    let domain = match domain {
+        Ok(_) => true,
+        Err(narf_wireless::reg::policy::Error::Firmware(
+            narf_firmware::FirmwareError::NotFound,
+        )) => false,
+        Err(narf_wireless::reg::policy::Error::Authority) if !has_loader_authority => false,
+        Err(_) => return Err(service_runtime::Error::Profile),
+    };
+    let calibration = match calibration {
+        Ok(_) => true,
+        Err(power_policy::Error::Firmware(narf_firmware::FirmwareError::NotFound)) => false,
+        Err(power_policy::Error::Firmware(narf_firmware::FirmwareError::AuthorityRevoked))
+            if !has_loader_authority =>
+        {
+            false
+        }
+        Err(_) => return Err(service_runtime::Error::Profile),
+    };
+    if has_net_authority && domain && calibration {
+        Ok(Admission::Ready)
+    } else {
+        Ok(Admission::PendingAssets)
     }
-    narf_wireless::reg::parse_policy(view.bytes).map_err(|_| service_runtime::Error::Profile)
+}
+pub async fn wait_attach(
+    firmware: Arc<Firmware<UsbControl>>,
+) -> Result<Arc<Device<UsbControl, UsbIo, NativeEnvironment>>, service_runtime::Error> {
+    loop {
+        if firmware.status().stage != super::firmware_transport::Stage::RadioReady
+            || firmware.calibration().is_none()
+            || CLAIMED.load(Ordering::Acquire)
+        {
+            return Err(service_runtime::Error::State);
+        }
+        let factory = firmware.factory().ok_or(service_runtime::Error::State)?;
+        let (vid, pid) = firmware
+            .usb_identity()
+            .ok_or(service_runtime::Error::State)?;
+        let has_loader = narf_firmware::trusted_loader_authority().is_some();
+        let has_net = narf_net::trusted_net_authority().is_some();
+        match classify_attach_admission(
+            has_net,
+            has_loader,
+            narf_wireless::reg::policy::load(),
+            power_policy::Calibration::load_registered(factory, vid, pid),
+        )? {
+            Admission::Ready => return attach(firmware).await,
+            Admission::PendingAssets => {
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
+            }
+        }
+    }
 }
 /// Publish only after actual firmware/IQK, signed board-power data and signed
 /// deployment policy have admitted this exact device. No real curve is shipped.
@@ -401,6 +461,9 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
     async fn disassociate(&self) -> Result<(), WirelessError> {
         self.link(None);
         let mut state = self.state.lock().await;
+        // A previous association/progress owner may have published up while
+        // this caller waited. Serialize the final close with those publishers.
+        self.link(None);
         state.clear_transmit();
         state.service.disconnect().await.map_err(wireless_error)
     }
@@ -410,6 +473,47 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         } else {
             Err(WirelessError::NotSupported)
         }
+    }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(super) mod publication_test {
+    use super::*;
+    use core::{future::Future, pin::pin, task::Context};
+
+    /// The composed USB fixture supplies the joined production service. Keep
+    /// private state access here rather than exposing it to sibling fixtures.
+    pub(in crate::rtl8xxxu) async fn disconnect_after_old_publication<
+        C: ControlIo + 'static,
+        B: PacketIo + 'static,
+        E: Environment + 'static,
+    >(
+        device: &Device<C, B, E>,
+        peer: [u8; 6],
+    ) -> Result<(), &'static str> {
+        let state = device.state.try_lock().ok_or("EU fixture state busy")?;
+        let mut disconnect = pin!(device.disassociate());
+        if disconnect
+            .as_mut()
+            .poll(&mut Context::from_waker(core::task::Waker::noop()))
+            .is_ready()
+            || device.link_up()
+            || device.connected_bssid().is_some()
+        {
+            return Err("EU disconnect did not close before waiting for state");
+        }
+        if state.service.connected_peer() != Some(peer) {
+            return Err("EU fixture lacks the previous authorized publisher");
+        }
+        // The same publication as progress(), still under its state guard.
+        device.link(state.service.connected_peer());
+        if !device.link_up() || device.connected_bssid() != Some(peer) {
+            return Err("EU previous publisher did not recreate the interleaving");
+        }
+        drop(state);
+        disconnect
+            .await
+            .map_err(|_| "EU interleaved USB disconnect")
     }
 }
 fn validate_scan(request: &ScanRequest) -> Result<u64, WirelessError> {

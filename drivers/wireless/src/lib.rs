@@ -7,6 +7,7 @@ pub mod ath11k;
 pub mod ath9k;
 pub mod brcmfmac;
 pub mod cyw43439;
+mod firmware_asset;
 pub mod iwlwifi;
 mod qualcomm_pci;
 mod qualcomm_regulatory;

@@ -14,7 +14,9 @@ mod wire;
 pub use management::{
     Completion as ManagementCompletion, Receipt as ManagementReceipt, Token as ManagementToken,
 };
+mod data;
 mod mlme;
+pub use data::Link as StationLink;
 pub use mlme::Associated as StationAssociated;
 pub use station::Disconnected as StationDisconnected;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +79,7 @@ pub(super) struct Radio<T> {
     scan_cache: Vec<ScanBss>,
     management_done: VecDeque<ManagementCompletion>,
     peer: Option<station::Peer>,
+    data: Option<data::State>,
     pub htt: htt::Runtime<T>,
     wire: wire::Wire,
     features: u64,
@@ -87,6 +90,12 @@ pub(super) struct Radio<T> {
     failed: bool,
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    pub fn information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
+        self.scan_cache
+            .iter()
+            .find(|b| b.bssid == bssid)
+            .map(|b| b.information_elements.clone())
+    }
     pub fn new(htt: htt::Runtime<T>, dialect: Dialect, features: u64) -> Self {
         Self {
             htt,
@@ -96,6 +105,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             scan_cache: Vec::new(),
             management_done: VecDeque::new(),
             peer: None,
+            data: None,
             channels: Vec::new(),
             sequence: 0,
             pending: VecDeque::new(),

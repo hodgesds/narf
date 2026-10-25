@@ -15,8 +15,8 @@ use alloc::sync::Arc;
 
 // Re-export the canonical LED types from narf-drivers-leds.
 pub use narf_drivers_leds::class::{
-    led_devices, lookup_led_by_name as led_device, register_led, unregister_led, LedDevice,
-    SimpleLed, __reset_for_test,
+    __reset_for_test, led_devices, lookup_led_by_name as led_device, register_led, unregister_led,
+    LedDevice, SimpleLed,
 };
 pub use narf_drivers_leds::triggers::Trigger;
 

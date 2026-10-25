@@ -1,6 +1,6 @@
 # Linux DML21 reference vectors for amdgpu_dcn401_dml.rs `admit_all` with
-# scaled and several planes per stream; verify with check.sh
-# (harness_planes.c, RAISED). Inputs: the nine SoC values, then per
+# scaled and several planes per stream; retained regression snapshot
+# (fixture schema, RAISED). Inputs: the nine SoC values, then per
 # stream its timing (pclk hact htotal hfp hsync vact vtotal vfp vsync)
 # and plane count, then per plane: surface_width surface_height pitch_px
 # bytes_per_pixel viewport_width viewport_height h_ratio v_ratio h_taps

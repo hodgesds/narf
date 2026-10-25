@@ -25,6 +25,8 @@ pub struct DataQueue {
     aggregated: bool,
     read: u16,
     write: u16,
+    #[cfg(any(test, feature = "kernel-test"))]
+    trace: Option<super::runtime::model::TxTrace>,
 }
 
 impl DataQueue {
@@ -44,6 +46,8 @@ impl DataQueue {
             aggregated: false,
             read: 0,
             write: 0,
+            #[cfg(any(test, feature = "kernel-test"))]
+            trace: None,
         })
     }
 
@@ -59,6 +63,11 @@ impl DataQueue {
         put64(&mut bytes, 28, self.descriptors.dma_addr().raw());
         self.station_tid = Some((station, tid));
         Ok(bytes)
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn trace_for_model(&mut self, trace: Option<super::runtime::model::TxTrace>) {
+        self.trace = trace;
     }
 
     pub fn enable_aggregation(&mut self) {
@@ -120,6 +129,18 @@ impl DataQueue {
 
     pub fn is_idle(&self) -> bool {
         self.read == self.write
+    }
+
+    pub(super) fn belongs_to(&self, station: u8, tid: u8) -> bool {
+        self.station_tid == Some((station, tid))
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn model_dma_addresses(&self) -> (u64, u64) {
+        (
+            self.byte_counts.dma_addr().raw(),
+            self.descriptors.dma_addr().raw(),
+        )
     }
 
     pub fn has_space(&self) -> bool {
@@ -215,6 +236,19 @@ impl DataQueue {
             tx_gen2::HBUS_TARG_WRPTR,
             tx_gen2::tx_doorbell(id as u32, self.write as u32),
         );
+        #[cfg(any(test, feature = "kernel-test"))]
+        if let Some(trace) = &self.trace {
+            trace.published(
+                id,
+                self.write,
+                self.pending[slot]
+                    .as_ref()
+                    .ok_or("private packet DMA absent")?,
+                &self.descriptors,
+                slot,
+                mmio.read(tx_gen2::HBUS_TARG_WRPTR),
+            )?;
+        }
         Ok(self.write)
     }
 

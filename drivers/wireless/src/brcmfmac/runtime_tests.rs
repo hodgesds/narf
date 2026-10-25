@@ -1,7 +1,7 @@
 use super::{boot, chip, runtime, shared};
 use alloc::sync::Arc as Rc;
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     vec,
     vec::Vec,
 };
@@ -25,6 +25,7 @@ struct Firmware {
     completion_write: u16,
     responses: VecDeque<(u32, u64)>,
     commands: Vec<(u32, Vec<u8>, u16)>,
+    station: Option<station_model::Firmware>,
 }
 #[derive(Default)]
 struct State {
@@ -33,9 +34,11 @@ struct State {
     dma: BTreeMap<u64, Vec<u8>>,
     writes: Vec<(u32, u32)>,
     dma_enable: bool,
+    dma_enables: usize,
     next: u64,
     allocated: usize,
     dropped: usize,
+    dropped_addresses: BTreeSet<u64>,
     doorbells: usize,
     fail_allocate: Option<usize>,
     fail_tcm: bool,
@@ -44,8 +47,8 @@ struct State {
     unsafe_free: usize,
     firmware: Option<Firmware>,
 }
-struct Model(Rc<IrqSafeSpinLock<State>>);
-struct Mem {
+pub(crate) struct Model(Rc<IrqSafeSpinLock<State>>);
+pub(crate) struct Mem {
     state: Rc<IrqSafeSpinLock<State>>,
     address: u64,
     len: usize,
@@ -54,6 +57,7 @@ impl Drop for Mem {
     fn drop(&mut self) {
         let mut state = self.state.lock();
         state.dropped += 1;
+        state.dropped_addresses.insert(self.address);
         if state.unreleased_read {
             state.unsafe_free += 1;
         }
@@ -166,6 +170,7 @@ impl runtime::Bus for Model {
             return Err(runtime::Error::Protocol);
         }
         s.dma_enable = true;
+        s.dma_enables += 1;
         Ok(())
     }
     fn park_dma(&mut self) -> Result<(), runtime::Error> {
@@ -201,9 +206,14 @@ fn firmware_step(state: &mut State) {
                     id,
                     u64::from_le_bytes(descriptor[16..24].try_into().unwrap()),
                 ));
+            } else if descriptor[0] == 0xd && firmware.station.is_some() {
+                firmware.station.as_mut().unwrap().post_event(&descriptor);
             } else if matches!(descriptor[0], 3 | 5) {
                 let field = if descriptor[0] == 3 { 22 } else { 8 };
                 let flow = u16::from_le_bytes(descriptor[field..field + 2].try_into().unwrap());
+                if let Some(station) = firmware.station.as_mut() {
+                    station.flow(&descriptor);
+                }
                 flow_reply(
                     state,
                     usize::from(firmware.completion_write),
@@ -221,23 +231,36 @@ fn firmware_step(state: &mut State) {
                 let input_dma = u64::from_le_bytes(descriptor[24..32].try_into().unwrap());
                 let input = state.dma[&input_dma][..usize::from(input_len)].to_vec();
                 firmware.commands.push((command, input.clone(), output_len));
-                let response = match command {
-                    1 => 2u32.to_le_bytes().to_vec(),
-                    217 => [3u32, 1, 6, 11]
-                        .into_iter()
-                        .flat_map(u32::to_le_bytes)
-                        .collect(),
-                    262 if input.starts_with(b"cur_etheraddr\0") => {
-                        // Include the physical query tail: the common station
-                        // must still receive exactly its six requested bytes.
-                        let mut bytes = vec![0; usize::from(output_len)];
-                        bytes[..6].copy_from_slice(&[2, 6, 7, 8, 9, 10]);
-                        bytes
+                let response = if let Some(station) = firmware.station.as_mut() {
+                    station.command(command, &input, output_len)
+                } else {
+                    match command {
+                        1 => 2u32.to_le_bytes().to_vec(),
+                        217 => [3u32, 1, 6, 11]
+                            .into_iter()
+                            .flat_map(u32::to_le_bytes)
+                            .collect(),
+                        262 if input.starts_with(b"cur_etheraddr\0") => {
+                            // Include the physical query tail: the common station
+                            // must still receive exactly its six requested bytes.
+                            let mut bytes = vec![0; usize::from(output_len)];
+                            bytes[..6].copy_from_slice(&[2, 6, 7, 8, 9, 10]);
+                            bytes
+                        }
+                        262 if input.starts_with(b"sup_wpa\0") => vec![0; usize::from(output_len)],
+                        262 if input.starts_with(b"bw_cap\0") => {
+                            let mut bytes = vec![0; usize::from(output_len)];
+                            bytes[..4].copy_from_slice(&1u32.to_le_bytes());
+                            bytes
+                        }
+                        _ => Vec::new(),
                     }
-                    262 if input.starts_with(b"sup_wpa\0") => vec![0; usize::from(output_len)],
-                    _ => Vec::new(),
                 };
                 let (response_id, response_dma) = firmware.responses.pop_front().unwrap();
+                let status = firmware
+                    .station
+                    .as_ref()
+                    .map_or(0, |station| station.status(command));
                 state.dma.get_mut(&response_dma).unwrap()[..response.len()]
                     .copy_from_slice(&response);
                 complete(
@@ -245,7 +268,7 @@ fn firmware_step(state: &mut State) {
                     usize::from(firmware.completion_write),
                     0xc,
                     response_id,
-                    (0, response.len() as u16),
+                    (status, response.len() as u16),
                     transaction,
                     command,
                 );
@@ -256,6 +279,10 @@ fn firmware_step(state: &mut State) {
             firmware.control_read = (firmware.control_read + 1) % depth;
             put(state, H2DR, &firmware.control_read.to_le_bytes());
         }
+    }
+    if let Some(mut station) = firmware.station.take() {
+        station.step(state, &mut firmware);
+        firmware.station = Some(station);
     }
     state.firmware = Some(firmware);
 }
@@ -1234,6 +1261,9 @@ fn smoke_fullmac_station_initializes_over_actual_msgbuf() -> TestResult {
     }
     TestResult::Pass
 }
+
+#[path = "station_model.rs"]
+pub(crate) mod station_model;
 #[cfg(feature = "kernel-test")]
 kernel_test_in!(
     "drivers/wireless/brcmfmac",

@@ -21,6 +21,13 @@ pub(in crate::cyw43439) struct Bus {
     wpa_ie: Option<Vec<u8>>,
     roam_off: bool,
     disconnect_error: bool,
+    preauthorization_packets: usize,
+    preauthorization_loss: bool,
+    power_save_error: u32,
+    hold_power_save: u32,
+    power_save_held: bool,
+    valid_channels: Vec<u32>,
+    policy_clear: Option<(u32, alloc::sync::Arc<narf_wireless::reg::db::Database>)>,
 }
 impl Bus {
     pub(in crate::cyw43439) fn new() -> Self {
@@ -35,6 +42,13 @@ impl Bus {
             wpa_ie: None,
             roam_off: false,
             disconnect_error: false,
+            preauthorization_packets: 0,
+            preauthorization_loss: false,
+            power_save_error: 0,
+            hold_power_save: 0,
+            power_save_held: false,
+            valid_channels: vec![1, 6],
+            policy_clear: None,
         }
     }
     pub(in crate::cyw43439) fn set_secured(&mut self, secured: bool) {
@@ -75,6 +89,61 @@ impl Bus {
     pub(in crate::cyw43439) fn sent_data(&self) -> usize {
         self.tx.iter().filter(|packet| packet[5] & 15 == 2).count()
     }
+
+    pub(in crate::cyw43439) fn power_commands(&self) -> Vec<(u32, Vec<u8>)> {
+        self.tx
+            .iter()
+            .filter_map(|bytes| {
+                if bytes[5] & 15 != 0 {
+                    return None;
+                }
+                let size = usize::from(HwHeader::decode(bytes).unwrap().length);
+                let command = BcdcHeader::decode(&bytes[12..]).unwrap().cmd;
+                let body = &bytes[28..size];
+                (command == 86 || command == 263 && body.starts_with(b"pm2_sleep_ret\0"))
+                    .then(|| (command, body.to_vec()))
+            })
+            .collect()
+    }
+
+    pub(in crate::cyw43439) fn clear_policy_on(
+        &mut self,
+        command: u32,
+        database: alloc::sync::Arc<narf_wireless::reg::db::Database>,
+    ) {
+        self.policy_clear = Some((command, database));
+    }
+    pub(in crate::cyw43439) fn command_count(&self, command: u32) -> usize {
+        self.tx
+            .iter()
+            .filter(|bytes| {
+                bytes[5] & 15 == 0 && BcdcHeader::decode(&bytes[12..]).unwrap().cmd == command
+            })
+            .count()
+    }
+    pub(in crate::cyw43439) fn qtxpowers(&self) -> Vec<Vec<u8>> {
+        self.tx
+            .iter()
+            .filter(|bytes| bytes[5] & 15 == 0)
+            .filter_map(|bytes| {
+                let size = usize::from(HwHeader::decode(bytes).unwrap().length);
+                let command = BcdcHeader::decode(&bytes[12..]).unwrap().cmd;
+                let body = &bytes[28..size];
+                (command == 263 && body.starts_with(b"qtxpower\0")).then(|| body[9..].to_vec())
+            })
+            .collect()
+    }
+
+    pub(in crate::cyw43439) fn reject_power_save(&mut self, command: u32) {
+        self.power_save_error = command;
+    }
+
+    pub(in crate::cyw43439) fn hold_power_save(&mut self, command: u32) {
+        self.hold_power_save = command;
+        if command == 0 {
+            self.power_save_held = false;
+        }
+    }
 }
 impl Transport for Bus {
     fn read32(&mut self, _: Function, _: u32) -> Result<u32, TransportError> {
@@ -92,6 +161,9 @@ impl Transport for Bus {
 }
 impl PacketTransport for Bus {
     fn receive_packet(&mut self, bytes: &mut [u8]) -> Result<usize, TransportError> {
+        if self.power_save_held {
+            return Ok(0);
+        }
         let Some(packet) = self.rx.pop_front() else {
             return Ok(0);
         };
@@ -106,11 +178,28 @@ impl PacketTransport for Bus {
         let size = usize::from(HwHeader::decode(bytes).unwrap().length);
         let request = BcdcHeader::decode(&bytes[12..]).unwrap();
         let body = &bytes[28..size];
+        if self
+            .policy_clear
+            .as_ref()
+            .is_some_and(|(command, _)| *command == request.cmd)
+        {
+            self.policy_clear.take().unwrap().1.clear();
+        }
+        if request.cmd == self.hold_power_save
+            && (request.cmd == 86 || body.starts_with(b"pm2_sleep_ret\0"))
+        {
+            self.power_save_held = true;
+        }
         let maximum = bytes[4].wrapping_add(8);
         let mut response = Vec::new();
         match request.cmd {
             1 => response.extend_from_slice(&2u32.to_le_bytes()),
-            217 => response.extend_from_slice(&[2, 0, 0, 0, 1, 0, 0, 0, 6, 0, 0, 0]),
+            217 => {
+                response.extend_from_slice(&(self.valid_channels.len() as u32).to_le_bytes());
+                for channel in &self.valid_channels {
+                    response.extend_from_slice(&channel.to_le_bytes());
+                }
+            }
             262 => {
                 if body.starts_with(b"cur_etheraddr\0") {
                     response.extend_from_slice(&OWN);
@@ -167,13 +256,32 @@ impl PacketTransport for Bus {
         }
         let mut header = request;
         header.len = response.len() as u32;
-        if request.cmd == 52 && self.disconnect_error {
+        if request.cmd == 52 && self.disconnect_error
+            || request.cmd == self.power_save_error
+                && (request.cmd == 86 || body.starts_with(b"pm2_sleep_ret\0"))
+        {
             header.flags |= bcdc_flag::ERROR;
             header.status = 1;
         }
         let mut control = header.encode().to_vec();
         control.extend_from_slice(&response);
         self.queue(0, maximum, &control);
+        if request.cmd == 26 {
+            // Actual SDPCM FIFO records follow the correlated control reply.
+            // Its waiter can return at its16-packet budget with data/events
+            // still unread; neither the host queue nor command ACK is idle.
+            let mut data = [0x71; 4 + 14];
+            data[..4].copy_from_slice(&[0x20, 0, 0, 0]);
+            data[4..10].copy_from_slice(&OWN);
+            data[10..16].copy_from_slice(&AP);
+            data[16..18].copy_from_slice(&[8, 0]);
+            for _ in 0..self.preauthorization_packets {
+                self.queue(CHANNEL_DATA, maximum, &data);
+            }
+            if self.preauthorization_loss {
+                self.event(16, 0, 0, &[], maximum);
+            }
+        }
         Ok(())
     }
 }
@@ -336,6 +444,85 @@ kernel_test_in!(
     smoke_cyw_station_wpa2_waits_for_firmware_keys
 );
 
+fn preauthorization_fixture(
+    secured: bool,
+    packets: usize,
+    loss: bool,
+) -> Result<Station<Runtime<Bus>>, &'static str> {
+    let mut bus = Bus::new();
+    bus.secured = secured;
+    bus.preauthorization_packets = packets;
+    bus.preauthorization_loss = loss;
+    let mut station =
+        narf_scheduler::block_on(Station::initialize(Runtime::new(bus), &[1], domain()))
+            .map_err(|_| "preauthorization fixture init")?;
+    narf_scheduler::block_on(station.scan(scan_request()))
+        .map_err(|_| "preauthorization fixture scan")?;
+    Ok(station)
+}
+fn smoke_cyw_station_idle_fence_drops_fifo_backlog_beyond_control_and_receive_budgets() -> TestResult
+{
+    for secure in [false, true] {
+        let Ok(mut station) = preauthorization_fixture(secure, 64, false) else {
+            return TestResult::Fail("SDPCM idle fixture");
+        };
+        if narf_scheduler::block_on(station.associate(join_request(secure))) != Ok(())
+            || station.bssid != Some(AP)
+            || station.runtime.poll() != Ok(0)
+            || station.runtime.pop_data().is_some()
+        {
+            return TestResult::Fail("SDPCM port opened before genuine FIFO idle or leaked old RX");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/station",
+    smoke_cyw_station_idle_fence_drops_fifo_backlog_beyond_control_and_receive_budgets
+);
+
+fn smoke_cyw_station_idle_fence_observes_peer_loss_after_more_than_one_rx_budget() -> TestResult {
+    let Ok(mut station) = preauthorization_fixture(true, 64, true) else {
+        return TestResult::Fail("SDPCM delayed peer-loss fixture");
+    };
+    if narf_scheduler::block_on(station.associate(join_request(true))).is_ok()
+        || station.bssid.is_some()
+        || !station.runtime.is_failed()
+        || station.poll().is_ok()
+    {
+        return TestResult::Fail("join/key events hid terminal peer loss beyond the SDPCM budget");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/station",
+    smoke_cyw_station_idle_fence_observes_peer_loss_after_more_than_one_rx_budget
+);
+
+fn smoke_cyw_station_cancel_during_idle_fence_never_publishes_port() -> TestResult {
+    let Ok(mut station) = preauthorization_fixture(true, 128, false) else {
+        return TestResult::Fail("SDPCM cancelled-idle fixture");
+    };
+    {
+        let mut future = pin!(station.associate(join_request(true)));
+        if !future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+        {
+            return TestResult::Fail("unretired SDPCM backlog did not yield with port closed");
+        }
+    }
+    if station.bssid.is_some() || station.poll().is_ok() || !station.runtime.is_failed() {
+        return TestResult::Fail("cancelled idle fence reopened FullMAC controlled port");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/station",
+    smoke_cyw_station_cancel_during_idle_fence_never_publishes_port
+);
+
 fn smoke_cyw_station_rejects_inconsistent_association_ies() -> TestResult {
     use narf_wireless::rsn::*;
     let encoded = |rsn: RsnIe| {
@@ -449,6 +636,86 @@ fn smoke_cyw_scan_wire_bounds_and_offsets() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/cyw43439/station",
     smoke_cyw_scan_wire_bounds_and_offsets
+);
+
+fn smoke_cyw_single_band_profile_rejects_firmware_five_ghz_aliases() -> TestResult {
+    let mut bus = Bus::new();
+    bus.valid_channels = vec![6, 36, 149];
+    let mut policy = domain();
+    policy.rules.push(narf_wireless::reg::RegRule {
+        freq_start_mhz: 5170,
+        freq_end_mhz: 5835,
+        max_bandwidth_mhz: 20,
+        max_power_dbm: 17,
+        flags: narf_wireless::reg::RegFlags::empty(),
+    });
+    let Some(Ok(mut station)) = ready(Station::initialize(Runtime::new(bus), &[1], policy)) else {
+        return TestResult::Fail("single-band profile initialization");
+    };
+    let mut request = scan_request();
+    request.channels = vec![36];
+    request.frequencies_mhz = vec![5180];
+    if station.channels != [6]
+        || !matches!(ready(station.scan(request)), Some(Err(Error::Malformed)))
+    {
+        return TestResult::Fail("CYW43439 acquired 5 GHz from an unexpected firmware channel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/station",
+    smoke_cyw_single_band_profile_rejects_firmware_five_ghz_aliases
+);
+
+fn smoke_cyw_no_ir_preserves_passive_scan_without_association_authority() -> TestResult {
+    let mut policy = domain();
+    policy.rules[0].flags = narf_wireless::reg::RegFlags::NO_IR;
+    let Some(Ok(mut station)) = ready(Station::initialize(Runtime::new(Bus::new()), &[1], policy))
+    else {
+        return TestResult::Fail("NO_IR passive profile initialization");
+    };
+    if station.channels != [1, 6]
+        || !matches!(ready(station.scan(scan_request())), Some(Ok(_)))
+        || ready(station.associate(join_request(false))) != Some(Err(Error::Unsupported))
+        || station.bssid.is_some()
+    {
+        return TestResult::Fail("NO_IR either hid passive receive or granted station TX");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/station",
+    smoke_cyw_no_ir_preserves_passive_scan_without_association_authority
+);
+
+fn smoke_fullmac_transmit_policy_intersects_partial_restrictions() -> TestResult {
+    use narf_wireless::reg::{RegFlags, RegRule};
+    let mut policy = domain();
+    policy.rules.push(RegRule {
+        freq_start_mhz: 2410,
+        freq_end_mhz: 2420,
+        max_bandwidth_mhz: 20,
+        max_power_dbm: 4,
+        flags: RegFlags::empty(),
+    });
+    if channel_power(&policy, 1) != Some(4) {
+        return TestResult::Fail("partial overlapping power ceiling was ignored");
+    }
+    for flags in [RegFlags::DFS, RegFlags::NO_IR] {
+        policy.rules[1].flags = flags;
+        for _ in 0..2 {
+            if channel_power(&policy, 1).is_some() || channel_ceiling(&policy, 1, false) != Some(4)
+            {
+                return TestResult::Fail("overlap restriction lost or passive receive was closed");
+            }
+            policy.rules.reverse();
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/station",
+    smoke_fullmac_transmit_policy_intersects_partial_restrictions
 );
 
 fn smoke_cyw_station_rejected_disconnect_cannot_reuse_link() -> TestResult {

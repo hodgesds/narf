@@ -1,4 +1,4 @@
-//! Exact Linux C traces plus cancellation/authority fault injection.
+//! Frozen Linux reference traces plus native cancellation/authority fault injection.
 use super::{
     mac::ChipId,
     power::{Calibration, Error, Io, Phase, Power},

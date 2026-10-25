@@ -17,14 +17,21 @@ probe. Initialization powers the RF blocks for register-table setup while
 MAC TX/RX stays closed until the separately admitted retained service starts.
 The initial service requires signed per-device board qualification and signed
 deployment policy; broader software prerequisites are listed below.
+Policy decoding uses `narf_wireless::reg::policy::load()` inside current
+firmware capability invocation. Each attach still requires a fresh signed
+artifact rather than accepting the shared cached regulatory domain.
 
 ## 3. Public interface
 
 `rtl8xxxu_probe` retains the handle and `firmware_transport::Owner<UsbControl>`.
-For RTL8188EU it spawns `initialize_registered()` after releasing the device
-registry lock. That production path now continues through factory identity,
-FIFO/queue boundaries, firmware, MAC/BB/AGC/RF tables and checked post-table
-MAC/LC/IQK initialization. Duplicate
+For RTL8188EU it spawns `wait_initialize_registered()` and `interface::wait_attach()`
+after releasing the device registry lock, logging the discovered eFuse calibration
+key `power_policy::Calibration::asset_name(factory)`. That production path continues
+through factory identity, FIFO/queue boundaries, firmware, MAC/BB/AGC/RF tables
+and checked post-table MAC/LC/IQK initialization, pausing at the pre-attempt
+`Detected` and post-IQK `RadioReady` checkpoints when `rtlwifi/rtl8188eufw.bin`,
+`rtl8xxxu/rtl8188eu-cal-v1-<mac>.bin` or `wireless-regulatory.bin` has not been
+staged yet while failing immediately on invalid or unsigned artifacts. Duplicate
 registration compares the retained Arc identity, instead of conflating equal slot numbers on different USB controllers.
 
 `Owner::status()` reports detected, validated, factory-ready, powered,
@@ -35,7 +42,11 @@ TX/RX IQ coefficients only after successful completion. `Owner::factory()` retur
 and calibration snapshot. `initialize_device(blob)` runs the production
 factory/FIFO/firmware/table/calibration sequence for authenticated-byte owners/tests.
 The firmware-only `initialize(blob)` remains a diagnostic entry point.
-A second attempt returns `AlreadyStarted` without I/O. Dropping an
+Registered-source lookup/copy/header parsing finishes before the atomic hardware
+attempt begins. Missing, revoked or invalid staged inputs leave Detected retryable
+without USB requests; a later valid installation continues the same owner. Once
+hardware has begun, a second attempt returns `AlreadyStarted` before any new
+registry lookup or I/O. Dropping an
 active attempt records `Cancelled`; it cannot silently replay. Deadline,
 transport errors (including ambiguous xHCI errors) and cancellation poison the
 one-shot owner: no cleanup read/write, retry, or other EP0 operation follows.
@@ -44,8 +55,12 @@ lifecycle; a new software owner alone is insufficient.
 
 Image validation requires the complete 32-byte little-endian RTL8188E header,
 signature family `0x88e0`, nonempty exact `ramcodesize` and at most eight 4 KiB
-pages. Validation/unsupported-family failures occur before USB. Registry bytes
-are validated and copied into owned storage before awaiting USB transfers.
+pages. Validation/unsupported-family failures occur before USB. Registry lookup and the bounded owned copy occur inside actual current registry
+and firmware-blob capability invocations; pure image parsing and USB awaits use
+only that owned storage. No borrowed blob view escapes invocation. Signed board
+qualification uses the same current lookup/copy boundary, retaining its existing
+mandatory signer and exact factory/VID/PID binding. Executable developer policy
+remains the firmware registry/build contract.
 
 `ControlIo` provides configuration-descriptor reads, async exact-count
 register reads/writes and delay; `UsbControl`
@@ -125,7 +140,11 @@ teardown terminates the plan. Returned management frames still require a
 policy-admitted transmitter; `Associated` does not open the controlled port.
 
 `ccmp_runtime::Key` is the software CCMP dependency for the retained station
-runtime. `Role::Pairwise` admits KeyID0; `Role::Group` admits IDs0–3 but is
+runtime. `ccmp_runtime` and `security_runtime` retain their public paths as
+reexports of shared `narf_wireless::{packet_key, station_security}` owners.
+`packet_codec::Mpdu` supplies the shared raw-frame admission contract while
+preserving the exact RTL8188EU legacy/20-MHz, rate, and no-hardware-decryption
+checks. `Role::Pairwise` admits KeyID0; `Role::Group` admits IDs0–3 but is
 receive-only. TX requires ToDS, peer RA/local TA; RX requires FromDS, peer TA,
 a unicast source and local RA for PTK or multicast RA for GTK. Only Data/QoS
 Data with exact native header extents is admitted; fragments/A-MSDU fail.
@@ -193,6 +212,33 @@ driver/ring guards are released, so ARP/ND may reenter transmit safely. Native
 plaintext crosses to Ethernet only through checked RFC1042/address/profile
 admission. Packet queues and per-step RX processing are bounded.
 
+The composed Open/WPA2 fixture now drives the production `Device`, `Service`,
+`Station`, register initialization and native bulk descriptor/receipt owners
+through channel1 passive scan, authentication/association and shared RSNA to
+the real kernel DHCP client. A shared `FakeAp` in its explicitly selected
+basic1Mbps profile verifies management/EAPOL, while `DhcpServer` supplies a
+transaction-bound lease. WPA2 data crosses the native USB seam as actual
+software CCMP ciphertext; the peer checks MIC/replay before observing DHCP.
+Exact uplink bytes at the AP and downlink bytes in both Narf-Ring and stack
+dispatch prove post-lease bidirectional Ethernet/IP composition. The adapter
+publishes physical carrier metadata only after station authorization and clears
+it on disconnect or terminal failure, independently of the host DHCP lease.
+Quiet polls preserve the RX receipt; held M4 prevents DHCP; timed-out data and
+failed USB stop retain uncertain RX/TX receipts and reject reuse. Successful
+disconnect closes MAC admission and retires the actual native receipts.
+
+Inert EP0/bulk registers, synthetic firmware bytes and explicit private
+qualification/entropy inputs supply the hardware seam; the AP and DHCP server
+are test peers. Vendor firmware execution is not simulated. The fixture's
+synthetic signed-metadata parser boundary neither installs a registry blob nor
+qualifies a real board; production `attach` still
+requires current authority, signed exact-device calibration and signed policy.
+This establishes one-shot channel1 software composition, not RF delivery,
+radio ACK, xHCI/silicon acceptance or reset/rejoin readiness. Hardware validation
+must provision real board evidence and use a fresh USB lifecycle after stop or
+failure; broader channels, rate modes, automatic recovery and PM remain outside
+the minimum initial profile.
+
 Explicit disconnect closes host admission before awaiting Linux TSF-disable
 and disconnected media state, verifies MAC TX/RX/filter closure, then uses
 proven USB Stop/SetDeq to retire outstanding native receipts. Cancellation
@@ -201,6 +247,13 @@ loss close the carrier. This first service allows one association per
 firmware claim; a stopped or failed owner cannot construct fresh keys/radio
 state for rejoin. Controller-proven EP0 reset/recovery and safe rejoin remain
 software work; successful initial association is not that recovery proof.
+
+Disconnect publishes down immediately and repeats that publication after
+acquiring device state, the same mutex held by every up publisher. A previous
+association/progress owner therefore cannot leave stale carrier or BSSID after
+teardown. A deterministic composed-USB regression holds that mutex, polls the
+early close, publishes the old authorized peer, then releases teardown; it
+checks down metadata, rejected TX and retired receipts before any repair poll.
 
 `packet_codec::{receive,transmit}` and `packet_transport::Owner<UsbIo>` are
 the native USB transport dependency. RX uses the physically 24-byte
@@ -225,6 +278,12 @@ the WPA2 controlled port only through retained shared RSNA.
 
 Legacy synchronous stripped-payload loading returns `UseAsyncOwner`; the old
 unverified all-radio helper returns `NotImplemented` before transport access.
+
+Physical carrier/peer publication does not change operator `IFF_UP` and never
+invokes administrative open/stop hooks while retained driver state is locked.
+Explicit registration, operator up/down and autoconnect remain administrative
+events. Disconnect/failure clears carrier and peer identity while preserving an
+operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
 ## 4. Invariants
 

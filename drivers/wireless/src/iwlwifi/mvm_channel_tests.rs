@@ -51,6 +51,8 @@ impl Fixture {
                 mac: Some([2; 6]),
                 nvm: Some(nvm()),
                 peer: None,
+                management_queue: None,
+                power: super::super::power::Context::new(&FirmwareApi::default()),
                 beacons: vec![],
                 scan: super::super::scan::ScanContext::new(&api),
                 channel: ChannelContext::new(&api),

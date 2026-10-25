@@ -10,7 +10,7 @@ fn smoke_i8042_decode_a_keystroke() -> TestResult {
     // Make code for KEY_A in set 1 = 0x1E. Release sets the 0x80 bit.
     use crate::i8042;
     use narf_input::{
-        InputEvent, KeyCode, __reset_global_ring_for_test, init_global_ring, pop_global,
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, KeyCode,
     };
 
     init_global_ring(8);
@@ -45,7 +45,7 @@ fn smoke_i8042_modifier_tracking() -> TestResult {
     // The 'A' press event should carry SHIFT in its modifier bitset.
     use crate::i8042;
     use narf_input::{
-        InputEvent, KeyCode, Modifiers, __reset_global_ring_for_test, init_global_ring, pop_global,
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, KeyCode, Modifiers,
     };
 
     init_global_ring(8);
@@ -156,7 +156,7 @@ kernel_test_in!("drivers/input", smoke_i8042_mouse_drops_unsynced_byte);
 fn smoke_virtio_input_decode_synthetic() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
     use narf_input::{
-        InputEvent, KeyCode, __reset_global_ring_for_test, init_global_ring, pop_global,
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, KeyCode,
     };
 
     init_global_ring(8);
@@ -189,7 +189,7 @@ kernel_test_in!("drivers/input", smoke_virtio_input_decode_synthetic);
 fn smoke_virtio_input_btn_left_emits_pointer() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
     use narf_input::{
-        InputEvent, PointerButtons, __reset_global_ring_for_test, init_global_ring, pop_global,
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, PointerButtons,
     };
     init_global_ring(8);
     __reset_global_ring_for_test();
@@ -220,8 +220,8 @@ kernel_test_in!("drivers/input", smoke_virtio_input_btn_left_emits_pointer);
 fn smoke_virtio_input_shift_a_stamps_modifier() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
     use narf_input::{
-        KeyCode, Modifiers, __reset_global_ring_for_test, __reset_modifiers_for_test,
-        init_global_ring, pop_key,
+        __reset_global_ring_for_test, __reset_modifiers_for_test, init_global_ring, pop_key,
+        KeyCode, Modifiers,
     };
     init_global_ring(8);
     __reset_global_ring_for_test();
@@ -365,7 +365,7 @@ kernel_test_in!(
 fn smoke_virtio_input_extra_mouse_buttons() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
     use narf_input::{
-        InputEvent, PointerButtons, __reset_global_ring_for_test, init_global_ring, pop_global,
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, PointerButtons,
     };
     init_global_ring(8);
     __reset_global_ring_for_test();
@@ -443,7 +443,7 @@ kernel_test_in!("drivers/input", smoke_virtio_input_device_name_populated);
 
 fn smoke_virtio_input_hwheel_emits_horizontal_scroll() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
-    use narf_input::{InputEvent, __reset_global_ring_for_test, init_global_ring, pop_global};
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, InputEvent};
     init_global_ring(8);
     __reset_global_ring_for_test();
     // EV_REL REL_HWHEEL=6 value=+1 → ScrollEvent{dx:+1,dy:0}.
@@ -1129,7 +1129,7 @@ mod i2c_hid_bind_smokes {
     use alloc::vec::Vec;
     use narf_hid::ptp::{DecodedContact, DecodedReport};
     use narf_input::{
-        InputEvent, PointerButtons, __reset_global_ring_for_test, init_global_ring, pop_global,
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, PointerButtons,
     };
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -1361,7 +1361,7 @@ mod i2c_hid_bind_smokes {
 // on top of the decoder.
 
 mod i2c_hid_touch_smokes {
-    use narf_input::{TouchState, __reset_global_ring_for_test, init_global_ring, pop_touch};
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch, TouchState};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use crate::i2c_hid_touch::{
@@ -2529,8 +2529,8 @@ kernel_test_in!(
 
 fn smoke_mt_nsmu_quirk_synthesises_release_for_unseen_contact() -> TestResult {
     use crate::hid_multitouch::{
-        MtClass, MtQuirks, __attach_synth_pad_for_test, __build_ptp_decoded_for_test,
-        __reset_registry_for_test, lookup_class,
+        __attach_synth_pad_for_test, __build_ptp_decoded_for_test, __reset_registry_for_test,
+        lookup_class, MtClass, MtQuirks,
     };
     use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch, TouchState};
     init_global_ring(16);

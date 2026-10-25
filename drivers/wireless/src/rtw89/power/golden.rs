@@ -1,4 +1,5 @@
-// Independent Linux C callback traces; regenerate with make_linux_oracle.py.
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
+// Frozen Linux rtw89 MAC power callback reference traces.
 pub const CASES: &[Case] = &[
 Case { chip:0, cut:0, rfe:0, valid:false, power_k_valid:false, ecv:0, pad:0, result_cut:0, trace:&[
 (8,0x5,0x0),

@@ -1,7 +1,7 @@
 # Every MODULE_FIRMWARE / FIRMWARE_* image Linux declares for the RDNA4 IP
 # versions (GC 12.0.0/12.0.1, MP 14.0.2/14.0.3, SDMA 7.0.0/7.0.1, VCN 5.0.0,
-# DCN 4.0.1). check.sh regenerates this list from the Linux tree and fails on
-# any difference; amdgpu_rdna4_tests.rs requires amdgpu_rdna4's tables to name
+# DCN 4.0.1). Retained Linux source-derived snapshot;
+# amdgpu_rdna4_tests.rs requires amdgpu_rdna4's tables to name
 # exactly these (the RLC-backdoor-autoload *_toc.bin images aside).
 amdgpu/dcn_4_0_1_dmcub.bin
 amdgpu/gc_12_0_0_imu.bin

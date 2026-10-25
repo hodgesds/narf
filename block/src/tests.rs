@@ -499,8 +499,8 @@ fn smoke_block_registry_uniform_read() -> TestResult {
     // synthetic stubs under the canonical names before checking.
     use crate::block_devices;
     use crate::registry::{
-        block_device_count, register_block_device, unregister_block_device, BlockDeviceSync,
-        BlockIoError, __reset_for_test, __restore_for_test, __snapshot_for_test,
+        __reset_for_test, __restore_for_test, __snapshot_for_test, block_device_count,
+        register_block_device, unregister_block_device, BlockDeviceSync, BlockIoError,
     };
     use alloc::sync::Arc;
 
@@ -820,8 +820,9 @@ fn smoke_block_registry_register_find_round_trip() -> TestResult {
     // Re-register with the same name replaces in place (no double-
     // count).
     use crate::registry::{
-        block_device_count, find_block_device, find_block_device_indexed, register_block_device,
-        BlockDeviceSync, BlockIoError, __reset_for_test, __restore_for_test, __snapshot_for_test,
+        __reset_for_test, __restore_for_test, __snapshot_for_test, block_device_count,
+        find_block_device, find_block_device_indexed, register_block_device, BlockDeviceSync,
+        BlockIoError,
     };
     use alloc::sync::Arc;
 

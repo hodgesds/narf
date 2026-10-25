@@ -111,8 +111,8 @@ fn factory_bytes(factory: Factory, vid: u16, pid: u16) -> [u8; 29] {
     bytes
 }
 impl Calibration {
-    pub fn load_registered(factory: Factory, vid: u16, pid: u16) -> Result<Self, Error> {
-        let name = format!(
+    pub fn asset_name(factory: Factory) -> alloc::string::String {
+        format!(
             "rtl8xxxu/rtl8188eu-cal-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
             factory.mac[0],
             factory.mac[1],
@@ -120,17 +120,18 @@ impl Calibration {
             factory.mac[3],
             factory.mac[4],
             factory.mac[5]
-        );
+        )
+    }
+    pub fn load_registered(factory: Factory, vid: u16, pid: u16) -> Result<Self, Error> {
+        let name = Self::asset_name(factory);
         let loader = narf_firmware::trusted_loader_authority()
             .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
         let auth = loader
             .derive()
             .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
-        let cap = narf_firmware::open(&name, &auth).map_err(Error::Firmware)?;
-        let view = narf_firmware::view_of(&cap).map_err(Error::Firmware)?;
-        // Even development firmware profiles may accept unsigned blobs. An
-        // RF power qualification always requires an authenticated signer.
-        Self::from_verified(view.bytes, view.signer, view.sha256, factory, vid, pid)
+        let asset = crate::firmware_asset::load(&auth, &name, HEADER + MAX_ROWS * ROW, true)
+            .map_err(Error::Firmware)?;
+        Self::from_verified(&asset.bytes, asset.signer, asset.digest, factory, vid, pid)
     }
     /// Called only after narf_firmware authenticated the current cap view.
     /// It is deliberately private; the kernel-test child exercises this same

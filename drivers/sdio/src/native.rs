@@ -8,7 +8,7 @@ use crate::{
 };
 use alloc::vec::Vec;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
-use narf_capabilities::{Cap, Write};
+use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 pub type NativeCard = Card<Mmio>;
@@ -18,7 +18,9 @@ pub type NativeCard = Card<Mmio>;
 pub struct Mmio {
     region: MmioRegion,
     authority: Cap<BusDeviceCap, Write>,
+    device: BusDevice,
     gone: bool,
+    identity: crate::pio::HostIdentity,
 }
 impl core::fmt::Debug for Mmio {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -27,59 +29,92 @@ impl core::fmt::Debug for Mmio {
             .finish_non_exhaustive()
     }
 }
+fn invoke<T>(cap: &Cap<BusDeviceCap, Write>, operation: impl FnOnce() -> T) -> Result<T, CapError> {
+    struct Operation<F>(F);
+    impl<T, F: FnOnce() -> T> CapOp<BusDeviceCap, Write> for Operation<F> {
+        type Output = T;
+        fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+            Ok(self.0())
+        }
+    }
+    cap.invoke(Operation(operation))
+}
 impl Mmio {
-    fn check(&mut self, offset: u32, width: u32) -> bool {
+    fn access<T>(
+        &mut self,
+        offset: u32,
+        width: u32,
+        operation: impl FnOnce(&MmioRegion) -> T,
+    ) -> Option<T> {
         if self.gone
             || offset % width != 0
-            || u64::from(offset) + u64::from(width) > self.region.len
-            || self.authority.check_live().is_err()
+            || u64::from(offset)
+                .checked_add(u64::from(width))
+                .is_none_or(|end| end > self.region.len)
         {
             self.gone = true;
-            false
-        } else {
-            true
+            return None;
+        }
+        match invoke(&self.authority, || {
+            use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+            let command = narf_bus::pci::read_command(&self.authority, &self.device).ok()?;
+            if command == u16::MAX
+                || command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE
+            {
+                return None;
+            }
+            Some(operation(&self.region))
+        }) {
+            Ok(Some(value)) => Some(value),
+            _ => {
+                self.gone = true;
+                None
+            }
         }
     }
 }
 impl Registers for Mmio {
-    fn read8(&mut self, o: u32) -> u8 {
-        if !self.check(o, 1) {
-            return u8::MAX;
-        }
-        // SAFETY: private owned aperture, exact width/alignment and live cap checked above.
-        unsafe { self.region.read8(u64::from(o)) }
+    fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
+        Some(self.identity)
     }
-    fn read16(&mut self, o: u32) -> u16 {
-        if !self.check(o, 2) {
-            return u16::MAX;
-        }
-        // SAFETY: as read8.
-        unsafe { self.region.read16(u64::from(o)) }
+    fn read8(&mut self, offset: u32) -> u8 {
+        self.access(offset, 1, |region| {
+            // SAFETY: complete exact-width extent and current PCI invocation.
+            unsafe { region.read8(u64::from(offset)) }
+        })
+        .unwrap_or(u8::MAX)
     }
-    fn read32(&mut self, o: u32) -> u32 {
-        if !self.check(o, 4) {
-            return u32::MAX;
-        }
-        // SAFETY: as read8.
-        unsafe { self.region.read32(u64::from(o)) }
+    fn read16(&mut self, offset: u32) -> u16 {
+        self.access(offset, 2, |region| {
+            // SAFETY: complete aligned extent and current PCI invocation.
+            unsafe { region.read16(u64::from(offset)) }
+        })
+        .unwrap_or(u16::MAX)
     }
-    fn write8(&mut self, o: u32, v: u8) {
-        if self.check(o, 1) {
-            // SAFETY: as read8.
-            unsafe { self.region.write8(u64::from(o), v) };
-        }
+    fn read32(&mut self, offset: u32) -> u32 {
+        self.access(offset, 4, |region| {
+            // SAFETY: complete aligned extent and current PCI invocation.
+            unsafe { region.read32(u64::from(offset)) }
+        })
+        .unwrap_or(u32::MAX)
     }
-    fn write16(&mut self, o: u32, v: u16) {
-        if self.check(o, 2) {
-            // SAFETY: as read8.
-            unsafe { self.region.write16(u64::from(o), v) };
-        }
+    fn write8(&mut self, offset: u32, value: u8) {
+        let _ = self.access(offset, 1, |region| {
+            // SAFETY: complete exact-width extent and current PCI invocation.
+            unsafe { region.write8(u64::from(offset), value) }
+        });
     }
-    fn write32(&mut self, o: u32, v: u32) {
-        if self.check(o, 4) {
-            // SAFETY: as read8.
-            unsafe { self.region.write32(u64::from(o), v) };
-        }
+    fn write16(&mut self, offset: u32, value: u16) {
+        let _ = self.access(offset, 2, |region| {
+            // SAFETY: complete aligned extent and current PCI invocation.
+            unsafe { region.write16(u64::from(offset), value) }
+        });
+    }
+    fn write32(&mut self, offset: u32, value: u32) {
+        let _ = self.access(offset, 4, |region| {
+            // SAFETY: complete aligned extent and current PCI invocation.
+            unsafe { region.write32(u64::from(offset), value) }
+        });
     }
 }
 
@@ -137,7 +172,16 @@ fn configure_pio(
     if update(BUS_MASTER | MEM_SPACE, INTX_DISABLE)? & mask != INTX_DISABLE {
         return Err(());
     }
-    if activate && update(0, MEM_SPACE)? & mask != MEM_SPACE | INTX_DISABLE {
+    if activate {
+        activate_pio(update)?;
+    }
+    Ok(())
+}
+
+/// Decode may be enabled only after sizing/mapping the owned control BAR.
+fn activate_pio(mut update: impl FnMut(u16, u16) -> Result<u16, ()>) -> Result<(), ()> {
+    use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+    if update(0, MEM_SPACE)? & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE {
         return Err(());
     }
     Ok(())
@@ -256,33 +300,56 @@ fn probe_claimed(
     authority: Cap<BusDeviceCap, Write>,
     claim: Claim,
 ) -> Result<(), narf_bus::ProbeError> {
-    configure_pio(claim == Claim::New, |clear, set| {
-        if clear != 0 {
-            narf_bus::pci::clear_command(&authority, &device, clear).map_err(|_| ())?;
-        }
-        narf_bus::pci::set_command(&authority, &device, set).map_err(|_| ())?;
-        narf_bus::pci::read_command(&authority, &device).map_err(|_| ())
+    invoke(&authority, || {
+        configure_pio(false, |clear, set| {
+            if clear != 0 {
+                narf_bus::pci::clear_command(&authority, &device, clear).map_err(|_| ())?;
+            }
+            narf_bus::pci::set_command(&authority, &device, set).map_err(|_| ())?;
+            narf_bus::pci::read_command(&authority, &device).map_err(|_| ())
+        })
     })
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // Even an extra unclaimed function has inherited DMA parked. Existing
     // owners returned before any PCI/MMIO access and are never reset here.
     if claim == Claim::Full {
         return Err(narf_bus::ProbeError::Other("SDHCI host limit"));
     }
-    let info = narf_bus::pci::read_config32(&authority, &device, 0x40)
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let info = invoke(&authority, || {
+        narf_bus::pci::read_config32(&authority, &device, 0x40)
+    })
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     let bar = slot_bar(info as u8).ok_or(narf_bus::ProbeError::NotForThisDriver)?;
     // SAFETY: exclusive bus dispatcher authority; BME disabled before BAR sizing.
-    let region = unsafe { narf_bus::map_bar_control(&device, bar) }
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let region = invoke(&authority, || {
+        // SAFETY: exclusive current PCI invocation; inherited DMA remains off.
+        unsafe { narf_bus::map_bar_control(&device, bar) }
+    })
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     if region.len < 0x100 {
         return Err(narf_bus::ProbeError::BadDevice);
     }
+    invoke(&authority, || {
+        activate_pio(|_, set| {
+            narf_bus::pci::set_command(&authority, &device, set).map_err(|_| ())?;
+            narf_bus::pci::read_command(&authority, &device).map_err(|_| ())
+        })
+    })
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     let card = match Card::initialize(
         Mmio {
             region,
             authority,
+            device,
             gone: false,
+            identity: crate::pio::HostIdentity {
+                address: device.addr,
+                id: device.id,
+            },
         },
         Config::default(),
     ) {
@@ -306,6 +373,70 @@ fn probe_claimed(
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_sdhci_native_revocation_blocks_configuration_and_mmio() -> TestResult {
+        let address = narf_bus::PcieAddr::new(0xfffe, 0xfa, 0x1c, 2);
+        let identity = crate::pio::HostIdentity {
+            address: narf_bus::BusAddr::Pcie(address),
+            id: narf_bus::DeviceId {
+                vendor: 0x1abc,
+                device: 0x1234,
+                class: 0x080500,
+                subsystem_vendor: 0x1234,
+                subsystem_id: 0x5678,
+            },
+        };
+        let device = BusDevice {
+            addr: identity.address,
+            id: identity.id,
+            kind: narf_bus::BusKind::Pcie {
+                addr: address,
+                cfg_phys: narf_memory::PhysAddr::new(0),
+            },
+        };
+        let authority = Cap::<BusDeviceCap, Write>::bootstrap();
+        authority.revoke();
+        let region = MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 256,
+            kind: narf_bus::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        let mut io = Mmio {
+            region,
+            authority,
+            device,
+            gone: false,
+            identity,
+        };
+        let mut entered = false;
+        if io
+            .access(0x10, 4, |_| {
+                entered = true;
+                0
+            })
+            .is_some()
+            || entered
+            || !io.gone
+            || io.read32(0x10) != u32::MAX
+        {
+            return TestResult::Fail(
+                "revoked SDHCI owner reached PCI configuration or invalid MMIO",
+            );
+        }
+        io.write8(0x29, 0);
+        io.write16(0x2c, 0);
+        io.write32(0x38, 0);
+        if io.host_identity() != Some(identity) {
+            return TestResult::Fail("SDHCI immutable host identity changed with authority");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/sdio/native",
+        smoke_sdhci_native_revocation_blocks_configuration_and_mmio
+    );
     fn smoke_sdhci_pio_parking_and_duplicate_ownership() -> TestResult {
         use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
         let mut calls = Vec::new();

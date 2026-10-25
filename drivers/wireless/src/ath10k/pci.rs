@@ -138,7 +138,8 @@ struct HttSession {
     profile: super::profile::Profile,
 }
 struct RadioSession {
-    radio: super::wmi_runtime::Radio<super::boot::PciBoot>,
+    radio:
+        alloc::sync::Arc<narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>>,
     image: super::firmware::Image,
     profile: super::profile::Profile,
 }
@@ -257,12 +258,13 @@ async fn initialize_radio(
             )
         }
     };
-    let mut owner = RadioSession {
-        radio: super::wmi_runtime::Radio::new(htt.htt, dialect, htt.image.features),
+    let mut radio = super::wmi_runtime::Radio::new(htt.htt, dialect, htt.image.features);
+    let result = radio.start_from_hardware().await;
+    let owner = RadioSession {
+        radio: alloc::sync::Arc::new(narf_lib::mutex::Mutex::new(radio)),
         image: htt.image,
         profile: htt.profile,
     };
-    let result = owner.radio.start_from_hardware().await;
     (DriverSession::Radio(alloc::boxed::Box::new(owner)), result)
 }
 
@@ -277,7 +279,8 @@ pub async fn scan_passive(
     let Some(DriverSession::Radio(owner)) = session.as_mut() else {
         return Err(super::wmi_runtime::Error::Failed);
     };
-    let result = owner.radio.passive_scan(frequencies).await;
+    let mut radio = owner.radio.lock().await;
+    let result = radio.passive_scan(frequencies).await;
     if let Err(error) = &result {
         if let Some(controller) = CONTROLLER.lock().as_mut() {
             controller.scan_error = Some(*error);
@@ -295,15 +298,16 @@ pub async fn prepare_station(
     bssid: [u8; 6],
     frequency: u16,
 ) -> Result<super::wmi_runtime::PeerPrepared, super::wmi_runtime::Error> {
-    let domain =
-        narf_wireless::reg::db::get_domain().ok_or(super::wmi_runtime::Error::Unsupported)?;
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let Some(DriverSession::Radio(owner)) = session.as_mut() else {
         return Err(super::wmi_runtime::Error::Failed);
     };
-    let result = owner.radio.prepare_station(&domain, bssid, frequency).await;
+    let mut radio = owner.radio.lock().await;
+    let result = radio.prepare_station(&domain, bssid, frequency).await;
     if let Some(controller) = CONTROLLER.lock().as_mut() {
-        controller.station_prepared = owner.radio.prepared_peer();
+        controller.station_prepared = radio.prepared_peer();
         if let Err(error) = &result {
             controller.station_error = Some(*error);
         }
@@ -320,18 +324,16 @@ pub async fn prepare_station(
 pub async fn exchange_initial_management(
     frame: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, super::wmi_runtime::Error> {
-    let domain =
-        narf_wireless::reg::db::get_domain().ok_or(super::wmi_runtime::Error::Unsupported)?;
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let Some(DriverSession::Radio(owner)) = session.as_mut() else {
         return Err(super::wmi_runtime::Error::Failed);
     };
-    let result = owner
-        .radio
-        .exchange_initial_management(&domain, frame)
-        .await;
+    let mut radio = owner.radio.lock().await;
+    let result = radio.exchange_initial_management(&domain, frame).await;
     if let Some(controller) = CONTROLLER.lock().as_mut() {
-        controller.station_prepared = owner.radio.prepared_peer();
+        controller.station_prepared = radio.prepared_peer();
         if let Err(error) = &result {
             controller.station_error = Some(*error);
         }
@@ -346,18 +348,18 @@ pub async fn associate_station(
     security: narf_wireless::association::SecurityMode,
     sme_ies: &[u8],
 ) -> Result<super::wmi_runtime::StationAssociated, super::wmi_runtime::Error> {
-    let domain =
-        narf_wireless::reg::db::get_domain().ok_or(super::wmi_runtime::Error::Unsupported)?;
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let Some(DriverSession::Radio(owner)) = session.as_mut() else {
         return Err(super::wmi_runtime::Error::Failed);
     };
-    let result = owner
-        .radio
+    let mut radio = owner.radio.lock().await;
+    let result = radio
         .associate_station(&domain, ssid, security, sme_ies)
         .await;
     if let Some(controller) = CONTROLLER.lock().as_mut() {
-        controller.station_prepared = owner.radio.prepared_peer();
+        controller.station_prepared = radio.prepared_peer();
         if let Err(error) = &result {
             controller.station_error = Some(*error);
         }
@@ -374,14 +376,57 @@ pub async fn disconnect_station(
     let Some(DriverSession::Radio(owner)) = session.as_mut() else {
         return Err(super::wmi_runtime::Error::Failed);
     };
-    let result = owner.radio.disconnect_station().await;
+    let mut radio = owner.radio.lock().await;
+    let result = radio.disconnect_station().await;
     if let Some(controller) = CONTROLLER.lock().as_mut() {
-        controller.station_prepared = owner.radio.prepared_peer();
+        controller.station_prepared = radio.prepared_peer();
         if let Err(error) = &result {
             controller.station_error = Some(*error);
         }
     }
     result
+}
+
+/// Start retained Open/software-CCMP data after checked native association.
+/// This grants no netdev; the caller must keep polling the retained owner.
+pub async fn start_station_data(
+    pmk: Option<&[u8; 32]>,
+) -> Result<super::wmi_runtime::StationLink, super::wmi_runtime::Error> {
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    let mut radio = owner.radio.lock().await;
+    radio.start_station_data(&domain, pmk).await
+}
+
+/// Submit Ethernet through the same retained RAW-mode data owner. The ID is
+/// an HTT publication identity, never a fabricated firmware delivery receipt.
+pub async fn transmit_ethernet(bytes: &[u8]) -> Result<u16, super::wmi_runtime::Error> {
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    let mut radio = owner.radio.lock().await;
+    radio.transmit_ethernet(&domain, bytes).await
+}
+
+/// Drive actual peer/completion/RAW RX and return admitted Ethernet only after
+/// receive quiescence. This API is async; it is not a synchronous netdev hook.
+pub async fn poll_ethernet(
+) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, super::wmi_runtime::Error> {
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(super::wmi_runtime::Error::Failed);
+    };
+    let mut radio = owner.radio.lock().await;
+    radio.poll_ethernet(&domain).await
 }
 
 /// Human-readable driver name keyed on the matched `(vendor, device)`.
@@ -617,18 +662,8 @@ async fn boot_task(
             let prepared = async {
                 let profile = super::profile::Profile::select(device.id.device, info.version)
                     .ok_or(super::firmware::Error::Unsupported)?;
-                let mut files = super::firmware::RegistryFiles::new()?;
-                let deadline = Deadline::after_ms(60_000);
-                let image = loop {
-                    match super::firmware::Image::load(&mut files, profile) {
-                        Ok(image) => break image,
-                        Err(super::firmware::Error::Missing) if !deadline.expired() => {
-                            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
-                                .await;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                };
+                let mut files = super::firmware::RegistryFiles::wait_authority().await?;
+                let image = super::firmware::Image::wait_load(&mut files, profile).await?;
                 let identity = super::firmware::Identity {
                     vendor: device.id.vendor,
                     device: device.id.device,
@@ -693,6 +728,12 @@ async fn boot_task(
                                             }
                                             let _=writeln!(narf_console::Writer,"  ath10k: HTT {}.{} with retained packet DMA; station registration pending",ready.major,ready.minor);
                                             let (owner, result) = initialize_radio(owner).await;
+                                            let radio = match (&owner, &result) {
+                                                (DriverSession::Radio(radio), Ok(_)) => {
+                                                    Some(radio.radio.clone())
+                                                }
+                                                _ => None,
+                                            };
                                             *SESSION.lock().await = Some(owner);
                                             match result {
                                                 Ok(ready) => {
@@ -702,6 +743,18 @@ async fn boot_task(
                                                         controller.scan_ready = Some(ready);
                                                     }
                                                     let _=writeln!(narf_console::Writer,"  ath10k: retained passive scan vdev with {} receive-only channels; station closed",ready.channels);
+                                                    if let Some(radio) = radio {
+                                                        match super::interface::wait_publish(radio)
+                                                            .await
+                                                        {
+                                                            Ok(_) => {
+                                                                let _ = writeln!(narf_console::Writer,"  ath10k: retained legacy RAW station interface registered, carrier closed");
+                                                            }
+                                                            Err(error) => {
+                                                                let _ = writeln!(narf_console::Writer,"  ath10k: station interface admission: {:?}",error);
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                                 Err(error) => {
                                                     if let Some(controller) =

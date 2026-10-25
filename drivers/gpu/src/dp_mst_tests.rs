@@ -25,7 +25,7 @@ fn num(w: &str) -> u32 {
     w.parse().unwrap()
 }
 
-/// Linux's `print_reply` (harness.c) of a parse result.
+/// A parse result formatted in the retained sideband fixture grammar.
 fn reply_line(out: &mut String, parsed: Option<Reply>, kind_byte: u8) {
     let kind = kind_byte & 0x7f;
     let nak = kind_byte & 0x80 != 0;

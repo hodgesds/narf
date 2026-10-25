@@ -226,7 +226,6 @@ pub(crate) struct PspGcRegisters {
     pub rlc_base_index: usize,
 }
 
-// Linux gc_10_3_0_offset.h; checked from compiled values by check_rdna2_profiles.py.
 pub(crate) const PSP_GC_REGISTERS: PspGcRegisters = PspGcRegisters {
     fb_base: 0x16fc,
     fb_top: 0x16fd,
@@ -256,6 +255,10 @@ pub fn for_pci_id(vendor: u16, device: u16) -> Option<&'static Profile> {
 pub fn native_start_available(vendor: u16, device: u16) -> bool {
     for_pci_id(vendor, device).is_some()
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "amdgpu_rdna2_contract_tests.rs"]
+mod contract_tests;
 
 #[cfg(test)]
 mod tests {

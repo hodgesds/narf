@@ -1,5 +1,5 @@
 # Linux DML21 reference vectors for amdgpu_dcn401_dml.rs with ODM 3:1 and 4:1;
-# verify with check.sh (harness_multi.c, RAISED). Each line is
+# retained source-derived snapshot (fixture schema, RAISED). Each line is
 # <bytes per pixel> <DSC slices> <DSC bpp_x16> <4:2:0> then a multi_vectors.txt
 # input line: every stream's plane at that depth (PIXEL_BYTES), compressed
 # with those slices unless 0 (DSC), and leaving as HDMI 4:2:0 if 1 (FMT420).

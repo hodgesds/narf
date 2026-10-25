@@ -1,7 +1,6 @@
-//! Generated from Linux drivers/gpu/drm/amd/display/dc/sspl/dc_spl_scl_filters.c
-//! and dc_spl_scl_easf_filters.c (the S1.12 EASF tables) by
-//! drivers/gpu/tests/dcn401_spl/gen_filters.py; do not edit. Each table is
-//! 33 phases of `taps` S1.12 coefficients.
+//! Reviewed static scaler data from Linux dc/sspl/dc_spl_scl_filters.c and
+//! dc_spl_scl_easf_filters.c. Each table has 33 phases of `taps` S1.12
+//! coefficients. Preserve the data and provenance when reviewing changes.
 pub static FILTER_2TAP_64P: [u16; 66] = [
     0x1000, 0x0000, 0x1000, 0x0000, 0x0ffc, 0x0004, 0x0ff8, 0x0008, 0x0ff0, 0x0010, 0x0fe4, 0x001c,
     0x0fd8, 0x0028, 0x0fc4, 0x003c, 0x0fb0, 0x0050, 0x0f98, 0x0068, 0x0f7c, 0x0084, 0x0f58, 0x00a8,

@@ -279,7 +279,7 @@ fn smoke_ath10k_station_policy_and_cached_bss_precede_publication() -> TestResul
     let mut r = scanned(1, Dialect::Main);
     let original = r.htt.wmi.htc.transport.sent.len();
     let mut domain = policy();
-    for case in 0..5 {
+    for case in 0..6 {
         let (peer, frequency) = match case {
             0 => ([2, 8, 9, 10, 11, 13], 2412),
             1 => ([2, 8, 9, 10, 11, 12], 5180),
@@ -294,6 +294,16 @@ fn smoke_ath10k_station_policy_and_cached_bss_precede_publication() -> TestResul
             4 => {
                 domain.rules[0].flags = narf_wireless::reg::RegFlags::empty();
                 domain.rules[0].freq_start_mhz = 2403;
+            }
+            5 => {
+                domain = policy();
+                domain.rules.push(narf_wireless::reg::RegRule {
+                    freq_start_mhz: 2410,
+                    freq_end_mhz: 2420,
+                    max_bandwidth_mhz: 20,
+                    max_power_dbm: 17,
+                    flags: narf_wireless::reg::RegFlags::NO_IR,
+                });
             }
             _ => {}
         }

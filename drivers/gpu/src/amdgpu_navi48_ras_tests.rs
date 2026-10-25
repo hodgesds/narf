@@ -180,7 +180,6 @@ fn navi48_ras_block_mask_matches_linux_check_supported() -> TestResult {
     assert_eq!(hw_enabled(MEM), 1 << UMC | 1 << DF);
     let sram = BLOCK_MASK & !(1 << UMC | 1 << DF | 1 << VCN | 1 << JPEG | 1 << XGMI_WAFL);
     assert_eq!(hw_enabled(SRAM), sram);
-    // Literal vectors shared with tests/navi48_ras.c.
     assert_eq!((hw_enabled(MEM), sram), (0x101, 0xe7e7e));
     assert!(sram & (1 << GFX | 1 << SDMA | 1 << MMHUB | 1 << PCIE_BIF | 1 << MMSCH) != 0);
     let both = Caps {

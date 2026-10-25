@@ -22,9 +22,7 @@
 //! dst = output = the addressable timing.
 //!
 //! Everything is Linux's integer arithmetic on `Fixed31_32`; nothing here
-//! touches hardware. `drivers/gpu/tests/dcn401_spl/check.sh` compares the
-//! register words programmed from these values with Linux SPL compiled on
-//! the host.
+//! touches hardware.
 use crate::amdgpu_dcn401_spl_filters as filters;
 use crate::amdgpu_dcn_color::Fixed31_32 as Fx;
 

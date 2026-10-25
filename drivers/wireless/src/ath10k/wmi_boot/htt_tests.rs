@@ -30,12 +30,13 @@ struct HttModel {
     receive_pipe: u8,
     tx_next: u64,
     stall_tx: bool,
+    raw: bool,
 }
 impl HttModel {
     fn new(d: Dialect, c: htt::Config, hardware: HwRev) -> Self {
         let mut inner = Model::new(d);
         if c.pfc {
-            inner.expected = INIT_TEN_FOUR_PFC;
+            inner.expected = INIT_TEN_FOUR_PFC.to_vec();
         }
         Self {
             inner,
@@ -46,6 +47,7 @@ impl HttModel {
             version: 3,
             tx_next: 0x800000,
             stall_tx: false,
+            raw: false,
             receive_pipe: if matches!(hardware, HwRev::Qca6174 | HwRev::Qca9377) {
                 1
             } else {
@@ -249,7 +251,7 @@ impl Hif for HttModel {
             if self.stall_rx {
                 core::future::pending::<()>().await;
             }
-        } else if payload != [5, 64, 3] {
+        } else if payload != [5, 64, if self.raw { 1 } else { 3 }] {
             return Err(BmiError::BadResponse);
         }
         Ok(())

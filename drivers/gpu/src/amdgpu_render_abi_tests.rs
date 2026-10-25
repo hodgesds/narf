@@ -1344,7 +1344,7 @@ kernel_test_in!(
 /// `dumb_layout`, `DUMB_DOMAIN` and `DUMB_CREATE_FLAGS` give Linux's
 /// CREATE_DUMB answer for every line of tests/amdgpu_dumb/vectors.txt
 /// (drm_mode_create_dumb and amdgpu_mode_dumb_create compiled verbatim on a
-/// dGPU; see check.sh there).
+/// dGPU).
 fn amdgpu_dumb_layout_matches_linux_vectors() -> TestResult {
     use core::fmt::Write as _;
     const VECTORS: &str = include_str!("../tests/amdgpu_dumb/vectors.txt");

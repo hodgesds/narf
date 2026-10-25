@@ -13,10 +13,7 @@
 //! curve). DCN 4.0.1 exposes no CRTC DEGAMMA_LUT (amdgpu_dm_crtc.c), so no
 //! other GAMCOR curve is built.
 //! Everything is pure integer arithmetic on the heap; nothing touches
-//! hardware. `drivers/gpu/tests/dcn401_color/check.sh` checks the outputs
-//! against Linux compiled on the host.
-//!
-//! C's signed overflow (undefined, two's-complement on every Linux target)
+//! hardware. C's signed overflow (undefined, two's-complement on every Linux target)
 //! is reproduced with wrapping arithmetic. Where Linux would divide by zero
 //! or loop forever (inputs these entry points never produce), the port
 //! returns zero or stops after a bound instead of trapping.

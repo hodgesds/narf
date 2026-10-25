@@ -853,8 +853,10 @@ kernel_test_in!(
 
 fn smoke_rtlwifi_unready_control_plane_fails_closed() -> TestResult {
     let device = super::pci::RtlwifiDevice {
+        native: None,
         firmware: None,
         prepared: None,
+        factory: None,
         bus_addr: narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0, 0, 1, 0)),
         registers: MmioRegion {
             phys: PhysAddr::new(0),

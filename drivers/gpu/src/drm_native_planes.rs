@@ -1967,10 +1967,9 @@ mod tests {
 
     const CURSOR_VECTORS: &str = include_str!("../tests/dcn401_cursor_plane/vectors.txt");
 
-    /// `check_cursor` against amdgpu_dm_check_native_cursor_state,
-    /// dm_check_cursor_fb and the DCN 4.x scaling rule compiled from Linux
-    /// (tests/dcn401_cursor_plane): the same answer for every framebuffer
-    /// size, pitch, tiling, source and CRTC size there.
+    /// Production `check_cursor` over retained Linux-derived cases covering
+    /// framebuffer size, pitch, tiling, source and CRTC size. This regression
+    /// snapshot is not a current external-source conformance check.
     fn drm_native_planes_check_cursor_matches_linux() -> TestResult {
         let mut n = 0;
         for line in CURSOR_VECTORS

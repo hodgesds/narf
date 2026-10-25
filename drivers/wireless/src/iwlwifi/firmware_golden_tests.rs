@@ -49,6 +49,18 @@ pub(super) fn api77_replay() -> Vec<u8> {
     )
 }
 
+/// Sc c103's recorded command table, decoded by the production image parser.
+/// The replay contains no executable bytes and is never passed to start().
+pub(super) fn sc103_commands() -> Vec<u8> {
+    let bytes = replay(
+        GOLDENS
+            .iter()
+            .find(|golden| golden.source == "iwlwifi-sc-a0-wh-b0-c103.ucode")
+            .expect("pinned Sc c103 metadata is present"),
+    );
+    parse_ucode(&bytes).unwrap().api.commands.to_vec()
+}
+
 fn smoke_iwlwifi_real_metadata_structural_replays() -> TestResult {
     for golden in GOLDENS {
         if !golden.source.ends_with(".ucode") || golden.source_sha256.len() != 64 {

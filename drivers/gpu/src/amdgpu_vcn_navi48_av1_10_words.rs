@@ -19,7 +19,6 @@ pub(super) const STREAM: &[u8] = &[
 ];
 pub(super) const DEFAULT_CDF: &[u8] = include_bytes!("../fixtures/av1/default_cdf.bin");
 pub(super) const TARGET_BYTES: u64 = 256 * 128 * 3;
-// Actual Mesa RDECODE_AV1_VER_2 sizing; independently executed in av1_check.py.
 pub(super) const FRAME_CONTEXT_BYTES: u64 = 20480;
 pub(super) const CONTEXT_BYTES: u64 = {
     let pitch64 = (32u64 * 68).div_ceil(256) * 256 * 2;

@@ -171,6 +171,64 @@ pub(in crate::ath10k) struct CeFixture {
     pub stall: Option<usize>,
 }
 impl CeFixture {
+    pub fn source_ready(&mut self, number: u8) -> Result<bool, BmiError> {
+        let pipe = self
+            .runtime
+            .pipes
+            .iter_mut()
+            .find(|p| p.number == number && p.direction == Direction::Source)
+            .ok_or(BmiError::Unsupported)?;
+        super::source_ready(pipe, &mut self.io)
+    }
+    pub fn source_bytes(&self, number: u8) -> Vec<u8> {
+        self.runtime
+            .pipes
+            .iter()
+            .find(|p| p.number == number)
+            .unwrap()
+            .buffer
+            .bytes
+            .borrow()
+            .clone()
+    }
+    pub fn begin_send(&mut self, number: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        if self.poisoned {
+            return Err(BmiError::BadResponse);
+        }
+        let pipe = self
+            .runtime
+            .pipes
+            .iter_mut()
+            .find(|p| p.number == number && p.direction == Direction::Source)
+            .ok_or(BmiError::Unsupported)?;
+        super::begin_send(pipe, &mut self.io, bytes)?;
+        self.sent += 1;
+        Ok(())
+    }
+    pub fn poll_now(&mut self) -> Result<(), BmiError> {
+        self.runtime.poll(&mut self.io)
+    }
+    pub fn hold_source(&mut self, hold: bool) {
+        self.io.source_bases = if hold {
+            Vec::new()
+        } else {
+            [3, 4]
+                .into_iter()
+                .map(|pipe| self.hardware.registers().unwrap().ce_base(pipe).unwrap())
+                .collect()
+        };
+        if !hold {
+            // Device-side release must acknowledge descriptors published while
+            // automatic completions were held. Reenabling future doorbells
+            // alone would leave their old CURRENT_SRRI permanently behind.
+            for base in &self.io.source_bases {
+                let producer = self.io.regs[&(base + crate::ath10k::hw::ce_off::SR_WR_INDEX)];
+                self.io
+                    .regs
+                    .insert(base + crate::ath10k::hw::ce_off::CURRENT_SRRI, producer);
+            }
+        }
+    }
     pub fn new(hardware: HwRev) -> Self {
         let (mut runtime, mut allocations) = allocate_runtime(hardware);
         // PciBoot retains CE1 from BMI as the additional runtime RX pipe.
@@ -190,6 +248,7 @@ impl CeFixture {
             maximum: 2048,
             ring: Ring::new(allocate(128 * 8), hardware, 1, 128, Direction::Destination).unwrap(),
             buffer: allocate(2048),
+            pending: None,
         });
         let mut io = Io::default();
         runtime.initialize(&mut io, hardware).unwrap();

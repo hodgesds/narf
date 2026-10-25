@@ -39,6 +39,24 @@ impl NativeIo {
             phy: super::phy_access::Access::default(),
         })
     }
+    pub(super) fn profile(&self) -> (ChipId, u8) {
+        (self.chip, self.cut)
+    }
+    /// Actual AX PHY adds0x10000; B path-B's last direct RF dword is1f3fc.
+    /// The MAC-sized minimum BAR receipt alone never authorizes RF access.
+    pub(super) fn b_phy_window(&self) -> Result<(), Error> {
+        if self.chip != ChipId::Rtl8852B {
+            return Err(Error::Unsupported);
+        }
+        self.checked(0x1f3fc, 4, |_, _| ())
+    }
+    pub(super) fn b_station_window(&self, indirect: bool) -> Result<(), Error> {
+        self.b_phy_window()?;
+        if indirect {
+            self.checked(0x4001c, 4, |_, _| ())?;
+        }
+        Ok(())
+    }
     fn checked<T>(
         &self,
         address: u32,

@@ -1,5 +1,5 @@
 # Linux GFX12 DCC VRAM placement vectors for amdgpu_gem.rs; see
-# check.sh and harness.c.
+# Retained regression snapshot.
 D 0 1 4096 0 = 0 4096 0
 D 0 1 4096 4096 = 0 4096 4096
 D 0 1 4096 2097152 = 0 4096 2097152

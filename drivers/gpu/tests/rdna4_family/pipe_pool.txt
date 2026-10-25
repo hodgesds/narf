@@ -1,4 +1,4 @@
-# drivers/gpu/tests/rdna4_family/check.sh --generate, third section: Linux's
+# Retained RDNA4 pipe-pool fixture derived from Linux DC.
 # DCN401 resource pool for every CC_DC_PIPE_DIS value (see pipe_pool.c).
 0 pipes=4 mpccs=4 streams=4 hubp=0,1,2,3 dpp=0,1,2,3 opp=0,1,2,3 tg=0,1,2,3 abm=0,1,2,3 mpcc=0,1,2,3 dsc=0,1,2,3
 0x1 pipes=3 mpccs=4 streams=3 hubp=1,2,3 dpp=1,2,3 opp=1,2,3 tg=1,2,3 abm=1,2,3 mpcc=1,2,3 dsc=0,1,2

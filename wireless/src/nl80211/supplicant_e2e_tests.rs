@@ -153,6 +153,10 @@ impl narf_net::Interface for PskStub {
 }
 #[async_trait::async_trait]
 impl crate::WirelessNetIface for PskStub {
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+
     fn supports_handshake_offload(&self) -> bool {
         true
     }

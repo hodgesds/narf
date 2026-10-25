@@ -1,0 +1,18 @@
+{
+  "sources": {
+    "mac.h": "10025cb48d6443f8c21a841326742562b6394a6df820c1499a5370f059ed9cd9",
+    "mac.c": "58267e6ca24c00e4fe0b15bdbbbe9b708c0a8e5dc9a1865f3e94a64225df3b9f",
+    "hw.h": "95498a7e664cf66e99edcdfa9225a147ec4bb77b0458bfb726b5b0c26c1ebe85",
+    "ar9002_mac.c": "dbc3e33788d7a3630489bde3467f7a8cd77fc1e89b34ef78271dfbad3ea0fcb1",
+    "hw.c": "8d06b4a22733dedd2d2a46247128f254b9345efae659de14189a8c2c0fd4731f",
+    "common-init.c": "c6f047abac0931612ed3e392d2fc5c4839d46a6fbf5175d54ad2c3c3ffc0ed80",
+    "xmit.c": "04fe3e49040050f2f9ec290167135f64fd57f7cc48ee6630c57dccad1602af89"
+  },
+  "functions": {
+    "ar9002_set_txdesc": "416524cb87f2585db0c61a1a801a5784114e3e391739835d3c233af5b7b8635f",
+    "ath9k_hw_clear_rxdesc_status": "5a181a99982a408d2fb84a9fe9405455086ef6404e4679c0906990f34c918c73",
+    "ath9k_hw_setuprxdesc": "bd263a58467bd5a8d1b2d2c2cde84494bc8a8bc358a968304f5f3dfea8b80ee9",
+    "ath9k_hw_computetxtime": "39feeb4a54598c27f9b0ea44525ad82ff7c6a8175f359a6c780b975852542aa1",
+    "ath9k_hw_rxprocdesc": "3d42914f35f3d20b0e8dc2a98b8cb5fe010ccab5d21fc8d4ae32ec91088b7522"
+  }
+}

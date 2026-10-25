@@ -229,6 +229,8 @@ pub struct CommandQueue {
     // only its low eight bits. DMA slots wrap at the allocated depth.
     write: u16,
     outstanding: usize,
+    #[cfg(any(test, feature = "kernel-test"))]
+    trace: Option<model::TxTrace>,
 }
 
 impl CommandQueue {
@@ -238,6 +240,8 @@ impl CommandQueue {
             pending: (0..COMMAND_DEPTH).map(|_| None).collect(),
             write: 0,
             outstanding: 0,
+            #[cfg(any(test, feature = "kernel-test"))]
+            trace: None,
         })
     }
 
@@ -296,6 +300,20 @@ impl CommandQueue {
         self.write = self.write.wrapping_add(1);
         dma_barrier();
         mmio.write(tx_gen2::HBUS_TARG_WRPTR, self.write as u32);
+        #[cfg(any(test, feature = "kernel-test"))]
+        if let Some(trace) = &self.trace {
+            trace.published(
+                0,
+                self.write,
+                &self.pending[slot]
+                    .as_ref()
+                    .ok_or("private command DMA absent")?
+                    ._dma,
+                &self.descriptors,
+                slot,
+                mmio.read(tx_gen2::HBUS_TARG_WRPTR),
+            )?;
+        }
         Ok(sequence)
     }
 
@@ -537,6 +555,7 @@ pub struct Hardware {
     device: narf_bus::BusDevice,
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     format: rx_rfh::CompletionFormat,
+    sc_identity: Option<super::firmware_identity::Sc>,
     interrupts: Option<super::iwl_msix::Interrupts>,
     pub notifications: alloc::collections::VecDeque<Packet>,
     responses: alloc::collections::VecDeque<Packet>,
@@ -556,18 +575,30 @@ impl core::fmt::Debug for Hardware {
 }
 
 impl Hardware {
-    pub fn new(
+    pub(super) fn new(
         device: narf_bus::BusDevice,
         cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
         region: narf_bus::MmioRegion,
         parsed: &ParsedUcode<'_>,
         format: rx_rfh::CompletionFormat,
+        sc_identity: Option<super::firmware_identity::Sc>,
     ) -> Result<Self, &'static str> {
+        let sc = super::chip_config_for_pci_id(device.id.vendor, device.id.device)
+            .is_some_and(|chip| chip.mac == super::MacFamily::ScA0);
+        if sc && sc_identity.is_none() {
+            return Err("Sc startup requires selected hardware identity");
+        }
+        if !sc && sc_identity.is_some() {
+            return Err("Sc firmware binding on another PCI profile");
+        }
         // Stop inherited DMA before allocating buffers or rejecting an
         // unsupported firmware profile. Early initialization failures must
         // not leave a previous boot's bus-master state running.
         super::mmio::set_master(&device, &cap, false)?;
         let mut mmio = super::IwlMmioImpl::new(region, cap);
+        if let Some(identity) = sc_identity {
+            identity.check(&mut mmio)?;
+        }
         if format == rx_rfh::CompletionFormat::Qu {
             super::gen2_profile::select(
                 device.id.device,
@@ -600,6 +631,7 @@ impl Hardware {
             device,
             cap,
             format,
+            sc_identity,
             interrupts: None,
             notifications: alloc::collections::VecDeque::new(),
             responses: alloc::collections::VecDeque::new(),
@@ -621,6 +653,32 @@ impl Hardware {
         )
         .map_err(|_| "unsupported Gen2 identity")
     }
+    /// Actual live PCI/MAC/RF facts for binding signed platform power inputs.
+    /// Read-only identity is never transmit or calibration authority.
+    pub(super) fn gen2_power_facts(
+        &mut self,
+    ) -> Result<(super::gen2_profile::Profile, [u8; 16]), &'static str> {
+        if self.format != rx_rfh::CompletionFormat::Qu || !self.mmio.authorized() {
+            return Err("MVM power identity unavailable");
+        }
+        let revision = self.mmio.read(super::regs::CSR_HW_REV);
+        let radio = self.mmio.read(0x9c);
+        let profile = super::gen2_profile::select(self.device.id.device, revision, radio)
+            .map_err(|_| "MVM power identity changed or disappeared")?;
+        let mut facts = [0; 16];
+        for (offset, value) in [
+            (0, self.device.id.vendor),
+            (2, self.device.id.device),
+            (4, self.device.id.subsystem_vendor),
+            (6, self.device.id.subsystem_id),
+        ] {
+            facts[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        facts[8..12].copy_from_slice(&revision.to_le_bytes());
+        facts[12..].copy_from_slice(&radio.to_le_bytes());
+        Ok((profile, facts))
+    }
+
     pub(super) fn matches_firmware(&self, parsed: &ParsedUcode<'_>) -> bool {
         if self.format != rx_rfh::CompletionFormat::Qu
             || self.versions != parsed.api.commands
@@ -710,6 +768,15 @@ impl Hardware {
 
     pub async fn start(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
         use super::regs::*;
+        if super::chip_config_for_pci_id(self.device.id.vendor, self.device.id.device)
+            .is_some_and(|chip| chip.mac == super::MacFamily::ScA0)
+            && self.sc_identity.is_none()
+        {
+            return Err("Sc startup requires selected hardware identity");
+        }
+        if let Some(identity) = self.sc_identity {
+            identity.check(&mut self.mmio)?;
+        }
         super::mmio::set_master(&self.device, &self.cap, false)?;
         if self.format == rx_rfh::CompletionFormat::Qu {
             let hw_rev = self.mmio.read(CSR_HW_REV);
@@ -794,6 +861,9 @@ impl Hardware {
             .unwrap()
             .enable(self.format == rx_rfh::CompletionFormat::Bz)?;
 
+        if let Some(identity) = self.sc_identity {
+            identity.check(&mut self.mmio)?;
+        }
         super::mmio::set_master(&self.device, &self.cap, true)?;
         self.armed = true;
         self.resources.rx.publish(&mut self.mmio)?;
@@ -983,6 +1053,8 @@ impl Hardware {
             return Err("unsupported queue allocation version");
         }
         let mut queue = super::data_queue::DataQueue::for_format(self.format)?;
+        #[cfg(any(test, feature = "kernel-test"))]
+        queue.trace_for_model(self.resources.commands.trace.clone());
         let body = queue.configure(station, tid)?;
         let index = self.resources.data.len();
         // Pin BEFORE publishing the allocation command. Timeout does
@@ -1033,6 +1105,56 @@ impl Hardware {
         );
         boot_context::put32(&mut body, 8, tid as u32);
         self.command(5, 0x17, &body).await?;
+        self.resources.data.remove(index);
+        Ok(())
+    }
+
+    /// Retire an unused prerequisite queue only after its exact firmware
+    /// remove receipt. Caller cancellation retains both queue DMA and the
+    /// command allocation. Active station teardown uses its separate drain.
+    pub(super) async fn remove_idle_tx(
+        &mut self,
+        id: u16,
+        station: u8,
+        tid: u8,
+    ) -> Result<(), &'static str> {
+        if self.failed || self.version(5, 0x17) != Some((3, 2)) {
+            return Err("unsupported or failed idle TX queue retirement");
+        }
+        let index = self
+            .resources
+            .data
+            .iter()
+            .position(|q| q.id() == Some(id))
+            .ok_or("unknown idle TX queue")?;
+        let queue = &self.resources.data[index];
+        if !queue.belongs_to(station, tid) || !queue.is_idle() {
+            return Err("idle TX queue ownership or outstanding descriptor mismatch");
+        }
+        let mut body = [0; 36];
+        boot_context::put32(&mut body, 0, 1);
+        boot_context::put32(
+            &mut body,
+            4,
+            1u32.checked_shl(u32::from(station))
+                .ok_or("invalid idle TX station")?,
+        );
+        boot_context::put32(&mut body, 8, u32::from(tid));
+        let reply = self.command(5, 0x17, &body).await?;
+        // fw/api/datapath.h documents the API-v2 iwl_tx_queue_cfg_rsp
+        // for allocation/config/removal, not an empty status-less ACK.
+        // REMOVE must name this retained queue and report success. Its
+        // initial-write-pointer field belongs to ADD and is not adopted
+        // when retiring an idle queue.
+        let response = &reply.payload;
+        if response.len() != 8
+            || u16::from_le_bytes(response[..2].try_into().unwrap()) != id
+            || response[2..4] != [0; 2]
+            || response[6..8] != [0; 2]
+        {
+            self.failed = true;
+            return Err("invalid idle TX queue remove receipt");
+        }
         self.resources.data.remove(index);
         Ok(())
     }

@@ -17,6 +17,57 @@ mod cs_tests;
 mod decode_tests;
 const MM: u64 = 0x68000;
 const OSS: u64 = 0x4e000;
+
+fn jpeg5_native_ib_words_preserve_address_halves_and_fence_order() -> TestResult {
+    // Distinct upper/lower halves detect swapped ring/IB/fence addresses.
+    let (ring, ib, fence) = (0x12_3456_7800, 0x23_4567_8900, 0x34_5678_9a00);
+    for sequence in [1, u32::MAX] {
+        let frame = words::ib_frame(ring, ib, fence, sequence, 16);
+        if frame.len() != 52
+            || frame[..8]
+                != [
+                    0x1bfff, 0x69004, 0x18000, 0x80010000, 0x1bfff, 0x7f000, 0x18000, 0,
+                ]
+            || frame[12..22]
+                != [
+                    0x40b6,
+                    ib as u32,
+                    0x40b7,
+                    (ib >> 32) as u32,
+                    0x4082,
+                    16,
+                    0x42d4,
+                    ring as u32,
+                    0x42d5,
+                    (ring >> 32) as u32,
+                ]
+            || frame[30..42]
+                != [
+                    0x404e,
+                    sequence,
+                    0x404f,
+                    sequence,
+                    0x40ab,
+                    fence as u32,
+                    0x40ac,
+                    (fence >> 32) as u32,
+                    0x404d,
+                    8,
+                    0x4000404d,
+                    0,
+                ]
+            || frame[46..] != [0x70000000, 0, 0x1bfff, 0x69004, 0x18000, 0x10000]
+        {
+            return TestResult::Fail("JPEG5 native HDP/IB/address/fence/TRAP word contract");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/jpeg5",
+    jpeg5_native_ib_words_preserve_address_halves_and_fence_order
+);
+
 fn jpeg5_layout_rejects_wrong_mmhub_or_truncated_jpeg_banks() -> TestResult {
     let descriptor = || {
         let mut backing = vec![0; 0x80000 / 4];

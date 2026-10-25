@@ -9,18 +9,12 @@ The repository build selects Mesa26.2.4 and libdrm2.4.134 in
 is <https://archive.mesa3d.org/mesa-26.2.4.tar.xz>, verified against that
 recipe's SHA256:
 `bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9`.
-Selected common initialization is now built and executed by the host replay
-below. No source or fixture was run against physical hardware.
+The former source-extraction/host-shim replay is removed. Native Rust tests
+exercise the actual INFO dispatch, query construction and owner admission.
+Selected Mesa/libdrm must run against the real NARF device/ioctl boundary for
+external compatibility acceptance. No physical execution is claimed here.
 
-## Executed loader contract replay
-
-The separate `tests/mesa_info/check.py` now links the actual selected Mesa
-common initialization and libdrm 2.4.134 library to host-compiled production
-Rust INFO dispatch/builders. Representative observed-state inputs and narrow
-host transport adapters are explicit; this is not captured board state or a
-new expected-field C model. Forty-two positive/negative cases cover both
-GFX1200/Navi44 and GFX1201/Navi48 and pass the fully published query contract
-only in an explicit hypothetical host DRM 3.54 plus acceleration envelope.
+## Loader contract source audit
 
 The real production refusal is earlier than a RADV KHR_display-only check:
 `ac_drm_device_initialize` calls libdrm `amdgpu_device_initialize`, then
@@ -36,26 +30,23 @@ firmware query while its ring is exposed; a withdrawn media owner correctly
 permits graphics-only initialization without a VCN firmware query. MAX_IBS
 refusal is optional to Mesa and takes its own fallback. NARF still supplies
 its actual bound, preventing that larger fallback from becoming an assumed
-submission capacity. No additional mandatory fully published query gap was
-found by this replay; API rendering and physical acceptance remain separate.
+submission capacity. The source audit is guidance for remaining implementation review; actual
+userspace initialization, API rendering and physical acceptance remain open.
 
 Raw VCN firmware interface minors8/9/10/11 reach Mesa unchanged. Selected Mesa
 `radeon_vcn_enc_5_0.c:988–994` chooses min(reported minor,10), so1.8 selects1.8.
 The AVC IGT proof now selects the retained authenticated interface the same
 way as HEVC/AV1: major1, minor>=8, clamped to1.10. Missing or unsupported
 interface is refused before fresh allocation or publication; preclaimed
-unpublished storage is preserved. The original full IGT1.9 command body still
-matches, and unchanged Mesa version assignments/selection/session-info
-constructors independently check1.8/1.9/1.10 headers (including rawminor11
-clamping). Native-model regressions cover all sessions, restart, cancellation
+unpublished storage is preserved. Reviewed IGT1.9 command data and the native Rust version-selection tests
+cover1.8/1.9/1.10 headers, including rawminor11 clamping. Native-model regressions cover all sessions, restart, cancellation
 and no-side-effect refusal. This fixes software interface selection; no
-physical compatibility or capability follows from the INFO or model replay.
+physical compatibility or capability follows from internal INFO models.
 
 ## Application software requirements
 
 - `src/amd/common/ac_gpu_info.c::ac_query_gpu_info`, lines1471–1477,
-  refuses DRMminor<54. Advertising3.42 would still fail initialization.
-  At1496, user queues remain opt-in through AMD_USERQ and the device's
+  refuses DRMminor<54. Advertising3.42 would still fail initialization. At1496, user queues remain opt-in through AMD_USERQ and the device's
   `userq_ip_mask`; they are separate from normal graphics/compute CS.
 - At1539–1546, a nonzero VCN decoder or unified ring additionally requires
   `FW_VERSION/FW_VCN`; otherwise common GPU initialization fails before
@@ -80,31 +71,20 @@ physical compatibility or capability follows from the INFO or model replay.
   a loader string; each enabled contract needs an implementation audit.
 - Kernel VMID0 compute proof is separate from the opt-in client-space
   diagnostic. The latter exercises actual owned GEM/context/VM roots and
-  native VMID/PASID Job submission on both graphics and compute queues.
-  Its models and dual gfx1200/gfx1201 LLVM check are software evidence.
-  Real completion/readback remains a physical test. It does not establish
+  native VMID/PASID Job submission on both graphics and compute queues. Its Rust models are internal software evidence. Real completion/readback remains a physical test. It does not establish
   a rendered image, texture/resource coverage, Mesa API conformance,
   compositor presentation or application rendering-to-scanout ordering.
-- The opt-in native rectangle diagnostic now uses actual Mesa26.2.4
-  META `CmdClearAttachments`, ACO NGG/PS, graphics preamble, GE rings,
-  Addrlib3 CB layout and draw/cache-completion constructors. The offline,
-  hash-pinned `tests/gfx12_render/generate.sh` reproduces both gfx1200 and
-  gfx1201 fixtures and both PFP2680 constructor branches. The shim records
-  gfx1201; the target family/SE inputs are explicit constructor inputs,
-  rather than a claimed gfx1200 hardware profile. All 4096 pixel addresses
-  are checked through Addrlib3 and the two shader ISAs through LLVM.
-  Two native client roots verify rendered/untouched pixels and guards,
-  while failure/cancellation retain ownership until proved reset.
-  IGT2.4's `lib/amdgpu/shaders/amd_shaders.c` supplies compute programs;
-  this separate draw fixture comes from current-generation RADV state.
-  Physical image execution, Mesa API conformance and capability promotion
-  remain open acceptance work.
+- The opt-in native rectangle diagnostic uses reviewed fixed shader/PM4 data
+  originating from Mesa26.2.4 META `CmdClearAttachments`, ACO NGG/PS and
+  Addrlib3 layout. Its source pins and upstream license are retained in
+  `tests/gfx12_render/README.md`; no compiler/shim regeneration gate remains.
+  The model's explicit target/SE inputs are not captured board profiles.
+  Native client roots check ownership, rendered/untouched pixels and guards,
+  while failure/cancellation retain resources until proven reset. Physical
+  image execution, Mesa API conformance and capability promotion remain open.
 
 Local Linux primary paths are
-`/usr/src/linux/drivers/gpu/drm/amd/amdgpu/{gfx_v12_0.c,gmc_v12_0.c,amdgpu_cs.c,amdgpu_job.c}`.
-The GC12 header contract is shared by GC12.0.0 and12.0.1. LLVM22 independently
-assembles the fixed shader for both `gfx1200` and `gfx1201` in
-`drivers/gpu/tests/gfx12_shader/check.sh`; identical encodings are required.
+`/usr/src/linux/drivers/gpu/drm/amd/amdgpu/{gfx_v12_0.c,gmc_v12_0.c,amdgpu_cs.c,amdgpu_job.c}`. The GC12 header contract is shared by GC12.0.0 and12.0.1.
 
 ## Codec work versus transport work
 

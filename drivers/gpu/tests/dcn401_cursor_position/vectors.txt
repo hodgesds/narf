@@ -1,4 +1,4 @@
-# Linux DCN4 cursor registers per pipe for amdgpu_dcn401_cursor.rs; see check.sh.
+# Linux DCN4 cursor registers per pipe for amdgpu_dcn401_cursor.rs; retained regression snapshot.
 # cx cy cw ch ref pix n (seg layer rx ry rw rh vx vy vw vh ratio src_w src_h slice_w){n}
 #   = (enable x y hot_x hot_y dst_x_offset cur0_enable){n}
 # single

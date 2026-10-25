@@ -16,10 +16,12 @@ pub mod iface;
 pub mod mfp;
 pub mod mlme;
 pub mod nl80211;
+pub mod packet_key;
 pub mod reg;
 pub mod rsn;
 pub mod sae;
 pub mod scan;
+pub mod station_security;
 
 pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
 pub use scan::{BssInfo, ScanRandomMac, ScanRequest, ScanResult};
@@ -404,6 +406,13 @@ pub trait WirelessNetIface: Interface {
     /// type, range indices and duplicate entries before this is called.
     fn set_sar_power_limits(&self, _limits: &[SarPowerLimit]) -> Result<(), i32> {
         Err(EOPNOTSUPP)
+    }
+
+    /// Maximum SSID entries in an active scan, including the empty wildcard.
+    /// Zero means passive-only discovery. CONNECT chooses that form before
+    /// invoking a driver; explicit active scans are never silently changed.
+    fn max_scan_ssids(&self) -> u8 {
+        0
     }
 
     /// Whether an unassociated `NL80211_CMD_TRIGGER_SCAN` may use a random
@@ -1688,6 +1697,7 @@ pub mod registry {
 
 /// Force-link hook.
 pub fn register_initcalls() {
+    narf_net::install_trusted_net_authority(narf_net::bootstrap_authority());
     let _ = nl80211::register();
 }
 

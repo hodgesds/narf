@@ -1,4 +1,5 @@
-// Extracted Linux C command descriptor outputs.
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
+// Frozen Linux rtw89 command-descriptor reference bytes.
 const GOLDEN:&[Case]=&[
 Case{chip:ChipId::Rtl8852A,kind:Kind::Header,length:1,descriptor:&[0,0,12,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},
 Case{chip:ChipId::Rtl8852A,kind:Kind::Header,length:72,descriptor:&[0,0,12,0,0,0,0,0,72,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},

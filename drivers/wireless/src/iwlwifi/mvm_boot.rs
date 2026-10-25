@@ -15,6 +15,11 @@ pub enum Phase {
     ReleasingChannel,
     PreparingPeer,
     PeerPrepared,
+    PreparingManagementQueue,
+    ManagementQueuePrepared,
+    PreparingTransmitPower,
+    TransmitPowerPrepared,
+    RemovingManagementQueue,
     RemovingPeer,
     Failed,
 }
@@ -29,6 +34,8 @@ pub struct Owner {
     scan: scan::ScanContext,
     channel: channel::ChannelContext,
     peer: Option<peer::ApPeer>,
+    management_queue: Option<queue::ManagementQueue>,
+    power: power::Context,
 }
 impl core::fmt::Debug for Owner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -79,6 +86,8 @@ impl Owner {
             scan: scan::ScanContext::new(&parsed.api),
             channel: channel::ChannelContext::new(&parsed.api),
             peer: None,
+            management_queue: None,
+            power: power::Context::new(&parsed.api),
         })
     }
     pub fn phase(&self) -> Phase {
@@ -127,6 +136,12 @@ impl Owner {
         self.hardware.command(1, 0x77, &[0; 4]).await?;
         // DQA/LAR and the idle station MAC are owned by the scan preparation
         // transaction. SCAN_CFG is sent there after those prerequisites.
+        self.power.nvm_permissions = Some(
+            packet.payload[28..]
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect(),
+        );
         self.mac = Some(mac);
         self.nvm = Some(nvm);
         self.phase = Phase::Configured;
@@ -171,3 +186,11 @@ mod channel;
 
 #[path = "mvm_peer.rs"]
 mod peer;
+
+#[path = "mvm_queue.rs"]
+mod queue;
+
+#[path = "mvm_power.rs"]
+mod power;
+pub type PowerRequest = power::PowerRequest;
+pub type PowerStatus = power::PowerStatus;

@@ -151,6 +151,27 @@ impl Connection {
         local_phy: super::ht_vht::Local,
         roam_from: Option<[u8; 6]>,
     ) -> Result<Self, &'static str> {
+        let domain = narf_wireless::reg::db::ensure_domain()
+            .map_err(|_| "wireless regulatory domain is not configured")?;
+        Self::associate_in_domain(
+            hw, local, beacon, auth, tx_chains, local_phy, roam_from, &domain,
+        )
+        .await
+    }
+
+    // The private model supplies its explicit policy through the same full
+    // association owner; public callers always snapshot the authenticated db.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn associate_in_domain(
+        hw: &mut Hardware,
+        local: [u8; 6],
+        beacon: Beacon,
+        auth: AuthMethod,
+        tx_chains: u32,
+        local_phy: super::ht_vht::Local,
+        roam_from: Option<[u8; 6]>,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<Self, &'static str> {
         let secure = !matches!(auth, AuthMethod::Open);
         let akm = match &auth {
             AuthMethod::Open => None,
@@ -198,16 +219,14 @@ impl Connection {
             None
         };
         let qos = super::qos::Parameters::parse(&beacon.information_elements)?;
-        let domain = narf_wireless::reg::db::get_domain()
-            .ok_or("wireless regulatory domain is not configured")?;
-        let permissions = regulatory_channels(hw).await?;
+        let permissions = regulatory_channels_in_domain(hw, domain).await?;
         let phy = super::ht_vht::Negotiated::parse(
             local_phy,
             &beacon.information_elements,
             beacon.channel,
             qos.is_some(),
             |width, center| {
-                channel_power_width(&domain, beacon.channel, width, center, &permissions).is_some()
+                channel_power_width(domain, beacon.channel, width, center, &permissions).is_some()
             },
         )?;
         let rates = super::rates::Rates::parse_for_phy(
@@ -216,7 +235,7 @@ impl Connection {
             phy.mode,
         )?;
         let max_power =
-            channel_power_width(&domain, beacon.channel, phy.width, phy.center, &permissions)
+            channel_power_width(domain, beacon.channel, phy.width, phy.center, &permissions)
                 .ok_or("channel transmission prohibited by host/firmware regulatory policy")?;
         let mut phy_command = station_api::phy(1, beacon.channel);
         phy.apply_phy(&mut phy_command, beacon.channel);
@@ -381,7 +400,7 @@ impl Connection {
         // The response can choose a different secondary channel while
         // narrowing bandwidth. Revalidate the resulting entire span.
         let final_power = channel_power_width(
-            &domain,
+            domain,
             this.beacon.channel,
             this.phy.width,
             this.phy.center,
@@ -1265,8 +1284,15 @@ async fn install_key(
 
 /// Firmware permission is refreshed once per scan/association operation.
 pub(super) async fn regulatory_channels(hw: &mut Hardware) -> Result<Vec<u32>, &'static str> {
-    let domain = narf_wireless::reg::db::get_domain()
-        .ok_or("wireless regulatory domain is not configured")?;
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| "wireless regulatory domain is not configured")?;
+    regulatory_channels_in_domain(hw, &domain).await
+}
+
+async fn regulatory_channels_in_domain(
+    hw: &mut Hardware,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+) -> Result<Vec<u32>, &'static str> {
     if hw.version(1, 0xc8).map(|v| v.1) != Some(8) {
         return Err("unsupported regulatory response");
     }
@@ -1291,7 +1317,9 @@ pub(super) async fn regulatory_channels(hw: &mut Hardware) -> Result<Vec<u32>, &
 }
 
 /// Host policy is intersected with firmware permission, with the lowest
-/// matching power ceiling. Probes never initiate radiation on DFS channels.
+/// matching power ceiling. NO_IR closes all host TX/association; probes also
+/// reject DFS. Every intersecting restriction applies, including a narrower
+/// restrictive rule overlapping an otherwise permissive covering rule.
 pub(super) fn channel_power(
     domain: &narf_wireless::reg::RegulatoryDomain,
     channel: u8,
@@ -1302,6 +1330,17 @@ pub(super) fn channel_power(
     if flags & 5 != 5 || (probe && (flags & (1 << 3) == 0 || flags & (1 << 4) != 0)) {
         return None;
     }
+    host_channel_power(domain, channel, probe)
+}
+
+/// Host-only preflight; it cannot replace the current NVM/MCC permission
+/// checked by channel_power before any transmit-capable firmware transition.
+pub(super) fn host_channel_power(
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: u8,
+    probe: bool,
+) -> Option<i8> {
+    station_api::channel_index(channel)?;
     let frequency = if channel == 14 {
         2484
     } else if channel <= 13 {
@@ -1310,18 +1349,24 @@ pub(super) fn channel_power(
         5000 + 5 * channel as u32
     };
     let mut power = None;
+    let low = frequency.saturating_sub(10);
+    let high = frequency + 10;
+    let mut covering = false;
     for rule in &domain.rules {
-        if rule.freq_start_mhz <= frequency.saturating_sub(10)
-            && rule.freq_end_mhz >= frequency + 10
-            && rule.max_bandwidth_mhz >= 20
-        {
-            if probe && rule.flags.contains(narf_wireless::reg::RegFlags::DFS) {
-                return None;
-            }
-            power = Some(power.map_or(rule.max_power_dbm, |old: i8| old.min(rule.max_power_dbm)));
+        if rule.freq_end_mhz <= low || rule.freq_start_mhz >= high {
+            continue;
         }
+        if rule.freq_end_mhz <= rule.freq_start_mhz
+            || rule.max_bandwidth_mhz < 20
+            || rule.flags.contains(narf_wireless::reg::RegFlags::NO_IR)
+            || probe && rule.flags.contains(narf_wireless::reg::RegFlags::DFS)
+        {
+            return None;
+        }
+        covering |= rule.freq_start_mhz <= low && rule.freq_end_mhz >= high;
+        power = Some(power.map_or(rule.max_power_dbm, |old: i8| old.min(rule.max_power_dbm)));
     }
-    power
+    covering.then_some(power).flatten()
 }
 
 /// Every occupied 20 MHz subchannel and the full spectral span must be
@@ -1366,16 +1411,24 @@ pub(super) fn channel_power_width(
     let mhz = 20u32 << width;
     let frequency = if primary <= 14 { 2407 } else { 5000 } + 5 * u32::from(center);
     let mut span_power = None;
+    let low = frequency - mhz / 2;
+    let high = frequency + mhz / 2;
+    let mut covering = false;
     for rule in &domain.rules {
-        if rule.freq_start_mhz <= frequency - mhz / 2
-            && rule.freq_end_mhz >= frequency + mhz / 2
-            && rule.max_bandwidth_mhz >= mhz
-        {
-            span_power =
-                Some(span_power.map_or(rule.max_power_dbm, |old: i8| old.min(rule.max_power_dbm)));
+        if rule.freq_end_mhz <= low || rule.freq_start_mhz >= high {
+            continue;
         }
+        if rule.freq_end_mhz <= rule.freq_start_mhz
+            || rule.max_bandwidth_mhz < mhz
+            || rule.flags.contains(narf_wireless::reg::RegFlags::NO_IR)
+        {
+            return None;
+        }
+        covering |= rule.freq_start_mhz <= low && rule.freq_end_mhz >= high;
+        span_power =
+            Some(span_power.map_or(rule.max_power_dbm, |old: i8| old.min(rule.max_power_dbm)));
     }
-    Some(power.min(span_power?))
+    covering.then_some(power.min(span_power?))
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

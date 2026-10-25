@@ -164,6 +164,24 @@ impl Bdram {
     /// does not establish a DMA reclamation proof. A replacement requires an
     /// independently verified device reset. No IRQ-disabling guard may span await.
     pub async unsafe fn prepare(&mut self, io: &mut impl Io, chip: ChipId) -> Result<(), Error> {
+        // SAFETY: the same stopped/fenced exclusive-device contract applies.
+        unsafe { self.prepare_inner(io, chip, None).await }
+    }
+    pub(super) async unsafe fn prepare_with_mode(
+        &mut self,
+        io: &mut impl Io,
+        chip: ChipId,
+        cut: u8,
+    ) -> Result<(), Error> {
+        // SAFETY: delegated caller contract, with the exact retained AX mode.
+        unsafe { self.prepare_inner(io, chip, Some(cut)).await }
+    }
+    async unsafe fn prepare_inner(
+        &mut self,
+        io: &mut impl Io,
+        chip: ChipId,
+        cut: Option<u8>,
+    ) -> Result<(), Error> {
         if self.state != State::New {
             return Err(Error::Terminal);
         }
@@ -184,6 +202,9 @@ impl Bdram {
             a.modify(profile.tx_clear2, 0, 3)?;
         }
         a.modify(profile.rx_clear, 0, 3)?;
+        if let Some(cut) = cut {
+            super::pcie::mode(a.0, chip, cut)?;
+        }
 
         let registers = addr_set_for_chip(chip);
         // Only the internal partition subset of reset_trx_rings is applied.

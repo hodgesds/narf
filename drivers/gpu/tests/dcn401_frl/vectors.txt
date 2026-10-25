@@ -1,4 +1,4 @@
-# Linux HDMI FRL capacity check reference vectors; see check.sh.
+# Linux HDMI FRL capacity check reference vectors; retained regression snapshot.
 3 3 270000 720 138 8 0 2 0 0 = 0 1 0
 3 3 270000 720 138 8 0 2 48000 0 = 0 1 0
 3 3 270000 720 138 8 0 2 192000 1 = -1 7 0

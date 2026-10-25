@@ -44,6 +44,16 @@ impl<B: Memory> Pool<B> {
     pub fn pending(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub fn snapshot(&self, id: u16) -> Option<(u64, Vec<u8>)> {
+        let slot = self.slots.get(usize::from(id))?.as_ref()?;
+        Some((
+            slot._payload.dma_address(),
+            (0..slot._payload.len())
+                .map(|at| slot._payload.read(at))
+                .collect(),
+        ))
+    }
     pub fn prepare(
         &mut self,
         config: Config,

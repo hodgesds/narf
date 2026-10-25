@@ -16,6 +16,13 @@ pub enum EfuseError {
     MalformedMap,
 }
 
+/// One decoded read-only factory map, retained for radio calibration/power.
+#[derive(Debug, Clone)]
+pub struct Factory {
+    pub mac: [u8; 6],
+    pub logical: [u8; 512],
+}
+
 pub(super) trait Io {
     fn read8(&mut self, addr: u64) -> u8;
     fn write8(&mut self, addr: u64, value: u8);
@@ -56,6 +63,14 @@ pub(super) fn read_mac_with(
     did: u16,
     function: u8,
 ) -> Result<[u8; 6], EfuseError> {
+    Ok(read_factory_with(io, did, function)?.mac)
+}
+
+pub(super) fn read_factory_with(
+    io: &mut impl Io,
+    did: u16,
+    function: u8,
+) -> Result<Factory, EfuseError> {
     let (physical, logical_size, mac_offset, access_gate) = match did {
         RTL_DEV_8188EE | RTL_DEV_8192EE | RTL_DEV_8723BE | RTL_DEV_8821AE => {
             (256 - 18, 512, 0xd0, true)
@@ -127,7 +142,17 @@ pub(super) fn read_mac_with(
     if !mac_is_valid(mac) {
         return Err(EfuseError::MacUninitialized);
     }
-    Ok(mac)
+    Ok(Factory { mac, logical })
+}
+
+/// # Safety
+/// Same exclusive powered BAR2 contract as read_mac; no programming occurs.
+pub unsafe fn read_factory(
+    mmio: &MmioRegion,
+    did: u16,
+    function: u8,
+) -> Result<Factory, EfuseError> {
+    read_factory_with(&mut Mmio(mmio), did, function)
 }
 
 /// Read the appropriate logical factory MAC, including dual-MAC PCI function.

@@ -11,8 +11,11 @@ pub use station::{NicCapabilities, PhyCapabilities, RadioInfo};
 #[path = "passive_scan.rs"]
 mod scan;
 pub use scan::{rx_frame, ScanBss, ScanReport};
+#[path = "amsdu_rx.rs"]
+mod amsdu;
 #[path = "station_join.rs"]
 mod join;
+pub use amsdu::Ht20ReceiveInfo;
 pub use join::to_ethernet;
 #[path = "recovery.rs"]
 mod recovery;
@@ -23,6 +26,9 @@ mod hardware;
 pub use hardware::Transport;
 
 static BOOT_OWNER: narf_lib::mutex::Mutex<Option<Transport>> = narf_lib::mutex::Mutex::new(None);
+// Serializes publication and initial preparation. The work itself lives in
+// KEY_WORK, so cancelling a provisioning caller never drops a started owner.
+static PROVISION: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
 
 type KeyFuture<T> = core::pin::Pin<
     alloc::boxed::Box<dyn core::future::Future<Output = (T, Result<(), Error>)> + Send>,
@@ -34,6 +40,17 @@ struct KeyWork<T> {
 }
 
 impl<T> KeyWork<T> {
+    fn prepare(
+        prepare: impl FnOnce() -> Result<T, Error>,
+        start: impl FnOnce(T) -> KeyFuture<T>,
+    ) -> Result<Self, Error> {
+        let owner = prepare()?;
+        Ok(Self {
+            future: Some(start(owner)),
+            completed: None,
+        })
+    }
+
     fn poll(&mut self, cx: &mut core::task::Context<'_>) -> Poll<()> {
         if let Some(future) = self.future.as_mut() {
             if let Poll::Ready(result) = future.as_mut().poll(cx) {
@@ -82,6 +99,60 @@ async fn finish_boot_keys() -> Result<(), Error> {
     poll_fn(poll_boot_keys).await
 }
 
+/// Continue initial firmware provisioning on the same parked PCI binding.
+/// Missing/invalid assets leave discovery unclaimed and can be replaced before
+/// retry. Started work stays retained across caller cancellation; failed work
+/// requires the separate verified-reset recovery path, never a fresh claim.
+/// Repeating this on an initialized radio preserves its current station state.
+pub async fn provision_boot_radio() -> Result<RadioInfo, Error> {
+    let Some(_provision) = PROVISION.try_lock() else {
+        return Err(Error::Busy);
+    };
+    finish_boot_keys().await?;
+    {
+        let Some(mut work) = KEY_WORK.try_lock() else {
+            return Err(Error::Busy);
+        };
+        if work.is_some() {
+            return Err(Error::Busy);
+        }
+        let Some(owner) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        if owner.is_none() {
+            // No await between the exclusive claim and retained installation.
+            // Firmware preflight completes before PCI/DMA transport creation.
+            *work = Some(KeyWork::prepare(
+                || super::pci::claim_firmware_transport()?.ok_or(Error::DeviceGone),
+                |mut transport| {
+                    alloc::boxed::Box::pin(async move {
+                        let result = async {
+                            transport.run().await?;
+                            transport.initialize_radio().await.map(|_| ())
+                        }
+                        .await;
+                        (transport, result)
+                    })
+                },
+            )?);
+        }
+    }
+    finish_boot_keys().await?;
+    let info = {
+        let Some(owner) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        match owner.as_ref().map(Transport::state) {
+            Some(State::RadioReady(info) | State::ScanReady(info))
+            | Some(State::Associated { info, .. }) => info,
+            Some(State::Failed { error, .. }) => return Err(error),
+            _ => return Err(Error::Busy),
+        }
+    };
+    crate::iface::register_scan_iface(info).map_err(|_| Error::Authority)?;
+    Ok(info)
+}
+
 /// Boot-only retained transport diagnostics, independent of radio readiness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootStatus {
@@ -115,6 +186,19 @@ pub async fn scan_boot_passive(channels: &[u8]) -> Result<ScanReport, Error> {
         .as_mut()
         .ok_or(Error::DeviceGone)?
         .scan_passive(channels)
+        .await
+}
+
+/// Policy-authorized active scan through the same retained radio owner.
+pub async fn scan_boot_active(channels: &[u8], ssids: &[Vec<u8>]) -> Result<ScanReport, Error> {
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .scan_active(channels, ssids)
         .await
 }
 
@@ -273,45 +357,92 @@ async fn reset_boot_transport(expected_mac: Option<[u8; 6]>) -> Result<(), Error
     finish_boot_keys().await
 }
 
+pub(super) async fn retry_preflight_until<Step, StepFut, Wait, WaitFut>(
+    max_attempts: usize,
+    mut status: impl FnMut() -> BootStatus,
+    mut step: Step,
+    mut wait: Wait,
+) -> Result<RadioInfo, Error>
+where
+    Step: FnMut() -> StepFut,
+    StepFut: core::future::Future<Output = Result<RadioInfo, Error>>,
+    Wait: FnMut() -> WaitFut,
+    WaitFut: core::future::Future<Output = ()>,
+{
+    let mut last_err = Error::InvalidFirmware;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            wait().await;
+        }
+        match step().await {
+            Ok(info) => return Ok(info),
+            Err(err) => {
+                last_err = err;
+                if !matches!(
+                    status(),
+                    BootStatus::Absent | BootStatus::Retained(State::RadioReady(_))
+                ) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
 pub(super) fn start_boot() -> narf_init::InitResult {
     use core::fmt::Write;
     use narf_init::InitResult;
-    let Some(mut owner) = BOOT_OWNER.try_lock() else {
-        return InitResult::Error("MT76 owner busy");
-    };
-    if owner.is_some() {
-        return InitResult::Error("MT76 firmware already attempted");
-    }
-    match super::pci::claim_firmware_transport() {
-        Ok(None) => return InitResult::NotPresent,
-        Err(error) => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "mt76: firmware preparation refused: {error:?}"
-            );
-            return InitResult::Error("MT76 firmware preflight");
-        }
-        Ok(Some(transport)) => *owner = Some(transport),
-    }
-    let Some(transport) = owner.as_mut() else {
-        return InitResult::Error("MT76 owner missing");
-    };
     // Before executor polling, regular Mutex (no IRQ spinlock) retained.
     // This future is self-waking and never depends on another executor task.
-    let result = narf_scheduler::block_on_spin(async {
-        transport.run().await?;
-        transport.initialize_radio().await
-    });
+    let result = narf_scheduler::block_on_spin(provision_boot_radio());
+    if result == Err(Error::DeviceGone) && !super::pci::is_probed() {
+        return InitResult::NotPresent;
+    }
     let _ = writeln!(
         narf_console::Writer,
         "mt76: firmware {result:?}; retained {:?}; station idle; packet service awaits association",
-        transport.state()
+        boot_status()
     );
-    if let Ok(info) = result {
-        if crate::iface::register_scan_iface(info).is_err() {
-            return InitResult::Error("MT76 scan interface identity");
-        }
+    if result.is_ok() {
         InitResult::Ok
+    } else if matches!(
+        boot_status(),
+        BootStatus::Absent | BootStatus::Retained(State::RadioReady(_))
+    ) {
+        // No firmware attempt yet (or net authority arrived after radio bring-up):
+        // retry the same parked binding in the background as late firmware scans
+        // or userspace staging complete, falling back to verified reset recovery
+        // if the subsequent first hardware attempt fails.
+        narf_scheduler::spawn(async {
+            let outcome = retry_preflight_until(120, boot_status, provision_boot_radio, || {
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
+            })
+            .await;
+            if outcome.is_ok() {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "mt76: staged firmware provisioned; retained {:?}",
+                    boot_status()
+                );
+                return;
+            }
+            if !matches!(boot_status(), BootStatus::Absent) {
+                for delay_ns in [1_000_000_000, 5_000_000_000, 30_000_000_000] {
+                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ns)).await;
+                    let result = reset_boot_transport(None).await;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "mt76: initial radio recovery {result:?}"
+                    );
+                    if result.is_ok() {
+                        let _ = provision_boot_radio().await;
+                        return;
+                    }
+                }
+            }
+        });
+        InitResult::Error("MT76 firmware preflight (provisioning available)")
     } else {
         // Recovery after initial firmware/radio failure has no registered
         // interface yet. Keep ownership in the same retained worker and only
@@ -325,16 +456,7 @@ pub(super) fn start_boot() -> narf_init::InitResult {
                     "mt76: initial radio recovery {result:?}"
                 );
                 if result.is_ok() {
-                    let info = {
-                        let owner = BOOT_OWNER.lock().await;
-                        match owner.as_ref().map(Transport::state) {
-                            Some(State::RadioReady(info)) => Some(info),
-                            _ => None,
-                        }
-                    };
-                    if let Some(info) = info {
-                        let _ = crate::iface::register_scan_iface(info);
-                    }
+                    let _ = provision_boot_radio().await;
                     return;
                 }
             }
@@ -580,11 +702,9 @@ impl Firmware {
         auth: &narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<Self, Error> {
         let (patch, ram) = super::pci::firmware_blobs_for(did);
-        let p = narf_firmware::open(patch, auth).map_err(|_| Error::InvalidFirmware)?;
-        let r = narf_firmware::open(ram, auth).map_err(|_| Error::InvalidFirmware)?;
-        let p = narf_firmware::view_of(&p).map_err(|_| Error::Authority)?;
-        let r = narf_firmware::view_of(&r).map_err(|_| Error::Authority)?;
-        Self::prepare(p.bytes, r.bytes)
+        let patch = super::firmware_assets::load(auth, patch)?;
+        let ram = super::firmware_assets::load(auth, ram)?;
+        Self::prepare(&patch, &ram)
     }
 }
 
@@ -664,6 +784,8 @@ struct Session<B: Backend> {
     data_pending: Option<u64>,
     peer_lost: bool,
     station_bss: Option<ScanBss>,
+    ht20_rx: Option<amsdu::Receiver>,
+    received_msdu: VecDeque<Vec<u8>>,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -681,6 +803,8 @@ impl<B: Backend> Session<B> {
             data_pending: None,
             peer_lost: false,
             station_bss: None,
+            ht20_rx: None,
+            received_msdu: VecDeque::new(),
         }
     }
     fn stage(&mut self, stage: Stage) {

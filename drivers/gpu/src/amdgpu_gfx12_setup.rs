@@ -173,8 +173,7 @@ fn preflight(io: &mut impl Io, l: Layout) -> Result<u8, Error> {
 /// `golden_settings_gc_12_0` and, at NBIO strap revision 0,
 /// `golden_settings_gc_12_0_rev0` (gfx_v12_0.c): one sequence for both GC
 /// 12.0.0 (Navi44) and 12.0.1 (Navi48), as gfx_v12_0_init_golden_registers
-/// runs it. `(GC BASE_IDX, offset, mask, value)`; tests/rdna4_family/check.sh
-/// regenerates them from Linux.
+/// runs it.
 pub(crate) const GOLDEN: [(u8, u32, u32, u32); 1] = [(0, 0x13d2, 0x8000, 0x8000)]; // regDB_MEM_CONFIG
 pub(crate) const GOLDEN_REV0: [(u8, u32, u32, u32); 3] = [
     (0, 0x13d2, 0xf, 0xf),                 // regDB_MEM_CONFIG

@@ -27,14 +27,13 @@ frame contexts and 36688896-byte total context. The full retained arena is
 37076992 bytes; it includes 128 KiB stream capacity and per-frame segment/film-
 grain storage (20736 bytes, padded 24576), even though film grain is disabled.
 
-Regenerate the original fixture with `regenerate.py --aomenc /path/to/aomenc
---ffmpeg /path/to/ffmpeg`. Regenerate the CDF with `cdf_regenerate.py /path/to/
-mesa-26.2.4 --output /path/to/default_cdf.bin`. The primary comparison is
-`../../tests/vcn5/av1_check.py /path/to/mesa-26.2.4 --ffmpeg /path/to/ffmpeg`.
-It compares complete create/decode/destroy messages, all initialized CDF bytes,
-real gfx1200/gfx1201 Addrlib surfaces and complete IBs/tier3 references. A
-nonzero synthetic metadata case checks signed quant/filter/tx field mapping;
-it does not claim that those metadata describe the fixed lossless stream.
+Regenerate the original picture asset with `regenerate.py --aomenc
+/path/to/aomenc --ffmpeg /path/to/ffmpeg`. This invokes supplied codec tools;
+it does not compile sources or validate Rust driver commands. The reviewed
+CDF data above is retained unchanged; its former C generation helper is
+removed. Native Rust tests exercise message construction, context initialization,
+IB ownership and nonzero metadata field placement. Their synthetic metadata
+does not describe the fixed lossless stream or establish external conformance.
 
 Pinned tools:
 

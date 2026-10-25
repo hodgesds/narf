@@ -12,10 +12,6 @@
 //!   DC color space (amdgpu_dm_get_output_color_space), and how DC signals
 //!   that color space: set_avi_info_frame's C/EC/Q/YQ, the DCN401 DIO
 //!   stream encoder's MSA MISC0/MISC1 and mod_build_vsc_infopacket's VSC SDP.
-//!
-//! `tests/dcn401_hdr/check.sh` compiles those Linux functions on the host
-//! and `tests/dcn401_hdr/vectors.txt` holds their answers, which the kernel
-//! tests replay against this module.
 
 /// sizeof(struct hdr_output_metadata): a u32 descriptor ID and the 26-byte
 /// `hdr_metadata_infoframe`, padded to the u32's alignment.

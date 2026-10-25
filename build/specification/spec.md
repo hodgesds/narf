@@ -103,12 +103,25 @@ and CI compiler-cache integration.
   than the legacy VGA text console. Headless 2D and full-profile 2D fixtures
   retain their legacy display coverage.
 - `cargo xtask test --arch=aarch64` — boot + run all kernel tests.
-- `cargo xtask gpu-reference --linux-tree PATH --linux-revision FULL_SHA`
-  runs the GPU primary-source `*/check.sh` harnesses against that explicit
-  Linux Git commit. The tree must be clean, including untracked and ignored
-  files, and remain at that revision throughout the run. It never downloads
-  or modifies Linux. This opt-in command is separate from checked-in vector
-  replay, which needs no host Linux source checkout.
+  The host launcher places the module initramfs above the actual kernel ELF
+  physical PT_LOAD memory end (including BSS), aligned to 1 MiB and below the
+  DTB. A native Rust FDT helper updates both `/chosen/linux,initrd-{start,end}`
+  properties and the loader uses the same address. Missing/malformed ranges,
+  overflow and insufficient space fail before QEMU; the dummy kernel used for
+  DTB generation is never used to infer the real image's occupied memory.
+- GPU validation uses native Rust kernel tests through
+  `cargo xtask test --arch=x86_64 --subsystem drivers/gpu` (and aarch64).
+  Driver builds/tests do not extract Linux/Mesa functions, invoke host C shims,
+  or compile temporary Rust source slices for reference comparison. Fixed
+  hardware data and reviewed Rust vectors retain their provenance; physical
+  hardware and external userspace interoperability require separate acceptance.
+- `cargo xtask wifi-fixtures check|write [--vendor VENDOR] [--source PATH]`
+  checks or reproduces structural metadata from explicit SHA256-pinned vendor
+  blobs using native Rust parsers. Normal driver builds do not require vendor
+  originals. `extract` requires an explicit input/name/hash/output directory;
+  `board-manifest` encodes explicit deployment facts as unsigned NBSP v1 data
+  for the existing `pack-firmware` signing flow. Neither command invents board
+  calibration, grants device authority or extracts/compiles reference source.
 - `cargo xtask test --arch=x86_64 --subsystem userspace` — run that subsystem
   and its `/`-delimited children, then perform the normal whole-kernel boot
   smoke. Comma-separated filters select the union of those subtrees.

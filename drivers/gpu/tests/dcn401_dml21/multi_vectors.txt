@@ -1,5 +1,5 @@
 # Linux DML21 multi-stream reference vectors for amdgpu_dcn401_dml.rs
-# `admit_all`; verify with check.sh (harness_multi.c).
+# `admit_all`; retained regression snapshot (fixture schema).
 # Inputs (kHz unless noted): dcfclk_min dcfclk_max fclk_min fclk_max uclk
 #   dispclk_max dppclk_max socclk umc_channels, the stream count, then per
 #   stream: pclk hact htotal hfp hsync vact vtotal vfp vsync pitch_px.

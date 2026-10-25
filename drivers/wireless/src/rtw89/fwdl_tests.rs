@@ -1,5 +1,5 @@
 //! Independent Linux packed-layout fixtures plus adversarial owned preparation.
-//! fw.h C sizeof oracle: AX v0 header32/section16, v1 header48/section16;
+//! Frozen Linux fw.h layout reference: AX v0 header32/section16, v1 header48/section16;
 //! MFW header16/entry16. Fixtures use literal offsets, not parser constants.
 use super::fw::FwError;
 use super::fwdl::{parse_auto, select_image, FwSection};

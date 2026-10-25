@@ -1,8 +1,6 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-/// Shared with tests/dcn401_dml21/check.sh, which verifies every line
-/// against Linux DML21 built on the host.
 const VECTORS: &str = include_str!("../tests/dcn401_dml21/vectors.txt");
 /// Deep-sleep DCFCLK and the three urgent-bandwidth fractions truncate a
 /// double in Linux and a fixed-point value here; they may differ by one.
@@ -24,8 +22,8 @@ fn wide_odm(result: &Result<Vec<Plan>, Error>) -> bool {
 }
 /// Whether a rejection matches a vector's `name`. Before the port admitted
 /// 3:1 and 4:1 it named every configuration needing them `Unsupported`;
-/// Linux rejects those configurations too (check.sh verifies it), and the
-/// port now names the check they fail (pipes, DISPCLK, bandwidth).
+/// The retained rejection fixtures use that old name; the port now names
+/// the check they fail (pipes, DISPCLK, bandwidth).
 fn rejected_as(e: Error, name: &str) -> bool {
     name == "REJECT" || name == "Unsupported" || error_name(e) == name
 }
@@ -163,8 +161,7 @@ pub(super) fn parse<'a>(words: &mut impl Iterator<Item = &'a str>, out: &mut [u3
 }
 /// A plane's values end with "/<n>" and each further pipe's
 /// refcyc_h_blank_end when DML puts it on n > 1 DPPs, ODM segments or MPC
-/// slices (check.sh has verified every further pipe's other registers
-/// equal the first's); otherwise the plan's first plane must be
+/// slices; other registers must equal the first pipe's. Otherwise the first plane must be
 /// single-pipe.
 pub(super) fn pipes_match<'a, I: Iterator<Item = &'a str>>(
     words: &mut core::iter::Peekable<I>,
@@ -419,10 +416,8 @@ kernel_test_in!(
     dcn401_dml_rejects_invalid_and_unmodeled_inputs
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c).
 const MULTI_VECTORS: &str = include_str!("../tests/dcn401_dml21/multi_vectors.txt");
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, FMT420).
 const YCBCR420_VECTORS: &str = include_str!("../tests/dcn401_dml21/ycbcr420_vectors.txt");
 
 /// Check `vectors` (multi_vectors.txt format) with every stream's 4:2:0
@@ -641,7 +636,6 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_ycbcr420_vectors
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC).
 const DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/dsc_vectors.txt");
 
 /// DSC streams as DC passes them to DML21: one DSC per ODM pipe (at most
@@ -659,11 +653,8 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_dsc_vectors
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c).
 const ODM_VECTORS: &str = include_str!("../tests/dcn401_dml21/odm_vectors.txt");
-/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC).
 const ODM_DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/odm_dsc_vectors.txt");
-/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, FMT420).
 const ODM_YCBCR420_VECTORS: &str = include_str!("../tests/dcn401_dml21/odm_ycbcr420_vectors.txt");
 
 /// ODM 2:1 as DML21's auto policy chooses it: pixel clocks past one pipe's
@@ -702,7 +693,6 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_odm_dsc_vectors
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC, DP2P0).
 const UHBR_DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/uhbr_dsc_vectors.txt");
 
 /// The DSC streams the UHBR DSC policy picks (8K60 and 4K240 at 16 bpp on
@@ -721,7 +711,6 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_uhbr_dsc_vectors
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, DSC, HDMIFRL).
 const FRL_DSC_VECTORS: &str = include_str!("../tests/dcn401_dml21/frl_dsc_vectors.txt");
 
 /// The DSC streams the HDMI FRL DSC policy picks (8K60 VIC 199 at its
@@ -755,7 +744,6 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_odm_ycbcr420_vectors
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, PIXEL_BYTES).
 const FORMAT_VECTORS: &str = include_str!("../tests/dcn401_dml21/format_vectors.txt");
 
 /// RGB565 (dml2_444_16) and FP16 (dml2_444_64) planes: the request width,
@@ -1061,7 +1049,6 @@ kernel_test_in!(
     dcn401_dml_joint_plans_share_global_state
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_planes.c, RAISED).
 const PLANE_VECTORS: &str = include_str!("../tests/dcn401_dml21/plane_vectors.txt");
 
 /// `plan` as plane `k` of its stream sees it: the plane's DPPCLK, DLG,
@@ -1212,13 +1199,8 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_plane_vectors
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_surfaces.c, RAISED).
 const SURFACE_VECTORS: &str = include_str!("../tests/dcn401_dml21/surface_vectors.txt");
 
-/// The 90 values harness_surfaces.c prints after a plane's 62: the chroma
-/// DLG/TTU delivery, both surfaces' rq_regs, the expansion modes, the DET's
-/// chroma base, unbounded requesting, the arbiter's hw_debug5, the whole
-/// mcache allocation and four pipes' mcache registers.
 const SURFACE_VALUES: usize = 27 + 2 + 4 * (MAX_MCACHES + 1) + 1 + 4 * 6;
 fn surface_values(plan: &Plan, k: usize, p: &PlanePlan, rotation: u32) -> [u32; SURFACE_VALUES] {
     let mut out = [0u32; SURFACE_VALUES];
@@ -1235,11 +1217,6 @@ fn surface_values(plan: &Plan, k: usize, p: &PlanePlan, rotation: u32) -> [u32; 
     }
     v.push(u32::from(a.shared));
     let plane = plan.mode.plane_list().nth(k).unwrap_or_default();
-    // The production path's viewports (`SurfaceRequest::mcache_viewports`,
-    // as `deadline::pipe_mcache` takes them): SPL on each pipe's ODM
-    // segment or MPC slice of the plane, its source the viewport at the
-    // surface origin and its destination the whole stream
-    // (harness_surfaces.c / spl_viewport.c).
     let request = surface_request(plan, &plane, rotation, p.dpps);
     let n = u32::from(p.dpps);
     for j in 0..4u32 {
@@ -1376,8 +1353,6 @@ fn surface_rq_values(plan: &Plan, p: &PlanePlan) -> [u32; 28] {
     ]
 }
 
-/// One harness_surfaces.c plane: the plane_vectors.txt values, then source,
-/// swizzle, DCC, rotation and the chroma plane.
 fn surface_plane(p: &[u32; 23]) -> Option<Plane> {
     let source = match p[10] {
         0 => Source::Rgb,
@@ -1570,8 +1545,6 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_surface_vectors
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_surfaces.c, RAISED,
-/// MPC_AUTO).
 const SURFACE_MPC_VECTORS: &str = include_str!("../tests/dcn401_dml21/surface_mpc_vectors.txt");
 
 /// MPC combine of GFX12 tiled, DCC, rotated (scanned vertically) and 4:2:0
@@ -1617,8 +1590,6 @@ kernel_test_in!(
     dcn401_dml_mcache_phase_splits_dcc_planes
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_planes.c, RAISED,
-/// MPC_AUTO).
 const MPC_VECTORS: &str = include_str!("../tests/dcn401_dml21/mpc_vectors.txt");
 
 /// MPC combine as DML21's auto factor chooses it: a plane in ODM bypass
@@ -1642,8 +1613,6 @@ kernel_test_in!(
     dcn401_dml_matches_linux_dml21_mpc_vectors
 );
 
-/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, RAISED, with
-/// each line's PIXEL_BYTES, DSC and FMT420).
 const ODM34_VECTORS: &str = include_str!("../tests/dcn401_dml21/odm34_vectors.txt");
 
 /// ODM 3:1 and 4:1 as DML21's auto policy chooses them: pixel clocks past

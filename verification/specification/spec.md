@@ -42,6 +42,17 @@ build orchestration (`build/`), release sign-off (`process/`).
 
 ## 3. Test taxonomy
 
+Wi-Fi and GPU implementations and maintained validation execute native Rust.
+They do not extract Linux/Mesa C functions, compile C shims, slice Rust source
+into temporary adapters, or invoke Python/compiler wrappers for comparisons.
+Fixed source-cited reference vectors and required hardware tables remain reviewed
+data. Native tests exercise production APIs with literal wire cases, property
+and boundary checks, register/transport models, failure/cancellation and ownership
+invariants. Expected results must not be regenerated from the implementation
+under test. Historical fixture provenance identifies sources; it is not an active
+source-equivalence proof. Real hardware and external userspace interoperability
+remain separate acceptance work.
+
 The affected-plan outputs and full-run fallback rules are specified in
 `build/specification/spec.md` §3. Secondary large-memory, xAPIC, virtio-mmio,
 and user-mode configurations run when their inputs are affected or the plan
@@ -56,23 +67,114 @@ fragment, replay and MIC checks gate authorization. `DhcpServer` provides an
 initial lease only after a MAC- and transaction-correlated DISCOVER/REQUEST,
 checking Ethernet/IPv4/UDP framing and control options. `NetworkPlan` defines
 the expected address, mask, gateway, DNS and duration; `udp_ipv4` builds test
-data. The kit has no device, driver-registration or carrier authority.
+data. `FakeAp::with_basic_1mbps()` selects a checked CCK basic-rate profile
+before authentication for RTL8188EU; the default OFDM profile is unchanged.
+The kit has no device, driver-registration or carrier authority.
 Driver adapters retain native RX/TX framing, completions and controlled-port
 admission. MT76 and ath11k compose production station/security paths through a
 lease and exact bidirectional Ethernet data; ath11k retains its x86_64 native
-ring fixture. CYW composes its FullMAC path on both architectures, with WPA2
-explicitly represented by firmware key-completion events. Kernel-test-only
-codec/peer negatives run on both architectures; these kernel-dependent types
-are not a host test executable and none of these checks establish RF or real
-firmware/silicon acceptance.
+ring fixture. Intel Sc c103 composes its post-INIT Device/Connection through
+native TFH/RFH command/data queues, the shared AP and kernel DHCP. Its model
+does not replace the separate firmware-boot/PCI/MSI checks or admit other Intel
+command tables. RTL8188EU composes channel1/20-MHz/basic1Mbps native USB,
+Station/Service, RSNA and software CCMP through the same AP and DHCP client.
+CYW SDPCM/BDC and BCM43602 CR4/msgbuf shared5/6 with zero descriptor prefix
+compose the common FullMAC station and DHCP path. Their WPA2 proof is
+firmware-offloaded key completion, including both association/key-event orders
+for PCIe; it does not simulate firmware-internal cryptography.
+
+These conversations check carrier and IPv4 binding retirement, controlled-port
+closure before the terminal M4/key receipt, stale authorization, disconnect
+failure and retained DMA after ambiguous completion. Test-only policy,
+qualification, firmware and board inputs cannot authorize a real device.
+The shared signed-policy bootstrap additionally uses a real isolated firmware
+registry entry and current capability invocation, with missing/unsigned/invalid
+asset, revocation, cache and concurrent caller-policy checks. These
+kernel-dependent types are not a host test executable, and none of these
+checks establish RF or real firmware/silicon acceptance.
+
+The retained host WPA2/CCMP key and terminal-reply suites live with shared
+`wireless::{packet_key, station_security}`; RTL8188EU adapters preserve their
+raw-profile admission before those owners. Ath10k's RAW/non-PFC legacy model
+composes native management/HTT, the shared security owner and exact
+bidirectional Ethernet/IP across six WMI dialects. Its firmware model consumes
+actual retained referenced-management DMA, including bytes beyond the64-byte
+TLV command prefetch. Its retained Device now additionally drives synchronous
+CE/HTC/HTT progress and the real kernel DHCP client for Open/WPA2 across all
+six dialects, including early EAPOL, withheld receipts, occupied bounce slots,
+policy restriction and close/publication interleavings. Separate EU, CYW and
+Intel regressions exercise old-link publication while actual disconnect waits
+for device state ownership, checking terminal closure before a repair poll.
+Intel also exercises actual socket-owner release through the spawned
+auto-disconnect worker while the native M4 receipt holds state ownership;
+the worker waits for that owner and then tears down instead of losing Busy.
+AR9285 and RTL8188EE now compose their exact retained packet owners, shared
+MLME/RSNA/CCMP and public Device through the real kernel DHCP client and exact
+bidirectional IP. Their fixtures consume actual published DMA and generate
+native RX descriptors. They check held/modified/cancelled M4 bytes and terminal
+receipts, consumed error frames versus genuine RX-idle fences, entropy and peer
+deadlines, live policy, concurrent publication/close and storage retention.
+EE additionally checks actual CAM/mailbox and reserved-beacon prerequisites,
+including cancellation while an async operation owns the driver. The shared
+raw BSS observer checks bounded original RSN/RSNX/rate/channel/peer facts before
+driver-specific profile admission; it grants no radio or transmit authority.
+AR9285 channel/calibration, RTL8188EE radio/channel/power and RTW89 PCI basic,
+cold/factory and TX-only download owners compare native register/delay or
+numeric results with fixed Rust reference vectors and explicit invariants.
+AR9285 includes 32 calibration traces and 35 signed/wrapping IQ vectors;
+RTL8188EE checks its actual ring-register map independently of the generic
+8192EE scaffolds. Native packet/stop models check ownership, width and current
+authority. AR9285 retains 72 fixed TX descriptor vectors, ten RX-status vectors and
+ten complete MAC traces. RTL8822CE factory/OTP/feature/MAC/PHY-table and signed
+board-power checks cover actual retained continuations; RTL8852B checks
+post-WCPU MAC, 36-bit RXBD/RPQ/C2H, RF-v1 and conditional table selection.
+These software checks cannot establish RF readiness.
+
+RTL8822CE now composes that retained firmware/factory/radio owner through
+source station mailbox control, native raw packet DMA and CCX receipts into
+the same public Device and actual kernel DHCP client. Open/WPA2 fixtures
+consume published DMA and verify exact bidirectional IP. Held, altered and
+cancelled M4, queued peer loss, current policy and actual calibration-epoch
+revocation between descriptor write and doorbell close the controlled port.
+Fixed Rust reference vectors check TXD/BD/RXD/CCX, calibration, non-QoS DCF
+and mailbox fields alongside actual DMA/receipt and ownership assertions.
+
+Signed FullMAC board-selection fixtures bind exact PCI/SDIO host/card facts
+and actual asset SHA256 before CR4/CM3 upload, then compose the selected
+native owner through DHCP/IP. Missing or revoked assets leave pre-attempt
+owners retryable; malformed executable extents fail before hardware admission.
+Separate retained-startup regressions cover Intel firmware staged after
+detection and RTL8188EU/EE asset retry on the same owner. Current firmware
+copies and native PCI/MMIO operations execute inside actual capability
+invocation, with revocation tests at the operation boundary. Physical carrier
+updates preserve operator IFF_UP and cannot invoke administrative hooks under
+driver locks. Whole rekey deadlines are tracked independently of pending
+reply/port state, including the old-key-open wait between M2 and M3.
+
+RTL8852B adds the exact source controller and fresh native packet core through
+the public Device and actual kernel DHCP for Open/WPA2, exact bidirectional IP,
+held/altered/cancelled M4, queued peer loss and terminal disconnect/rekey cases.
+This controller/packet fixture cannot create a production full-radio grant.
+Native Rust RF models exercise the actual retained
+channel/BB/trim/RXDCK/IQK/TSSI/DPK/power owners on the same register backing;
+faults, current epoch loss and cancelled real PMAC waits cannot publish Ready.
+Actual PHY-capability mailbox replies, source awake status, measured v2 peaks
+and publication inside current device plus signed-record invocations remain
+independent prerequisites. The temporal FLR suite verifies the full quiet
+interval, restore/readbacks and cancellation without config access; a retained
+probe test rejects replacement or re-parking during reset ownership. Software
+evidence does not establish real firmware instruction execution or RF acceptance.
 
 `narf_wifi_fixtures::firmware::metadata_replay(image_len, fragments)` builds
 parser-only structural images up to 16 MiB. It validates nonempty, ordered,
 nonoverlapping fragment extents before allocation and zeroes every opaque gap.
-The independent extractors in `verification/data/wifi-firmware` pin complete
-raw-source SHA256 hashes and preserve headers/TLV geometry, version/API facts,
-section addresses and board-name metadata. Their generated expectations are
-independent of production Rust encoders. Kernel smokes feed these images only
+The native Rust `cargo xtask wifi-fixtures` tool reads explicit SHA256-pinned
+vendor blobs and retains structural headers/TLV geometry, version/API facts,
+section addresses and board-name metadata. Its host parsers are independent of
+production driver parsers and do not harvest or compile reference source.
+`check` verifies existing data; `write` reproduces it without silently updating
+source pins; `extract` requires an explicit format, input, name, hash and new
+output directory. Kernel smokes feed these images only
 to parsers, never a firmware registry, board-calibration authority or hardware
 loader. Passing proves layout handling; signatures, instructions and RF/board
 acceptance require original authenticated assets and physical validation.

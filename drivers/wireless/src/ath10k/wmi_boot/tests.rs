@@ -123,7 +123,7 @@ struct Model {
     rx: VecDeque<(u8, Vec<u8>)>,
     sent: Vec<(u8, Vec<u8>)>,
     retained: Option<Vec<MemoryPlan>>,
-    expected: &'static [u8],
+    expected: Vec<u8>,
     stall_init: bool,
 }
 impl Model {
@@ -140,7 +140,7 @@ impl Model {
             rx: VecDeque::from([(1, header(0, &[1, 0, 32, 0, 0, 1, 9, 0]))]),
             sent: Vec::new(),
             retained: None,
-            expected,
+            expected: expected.to_vec(),
             stall_init: false,
         }
     }

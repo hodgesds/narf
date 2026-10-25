@@ -4,13 +4,15 @@ use super::{
     firmware_transport::{Error, Info},
     pci_firmware::{self, Transport},
 };
+use alloc::sync::Arc;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 pub(super) struct Firmware {
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
     mmio: MmioRegion,
-    lifecycle: Lifecycle<Transport>,
+    factory: super::efuse::Factory,
+    lifecycle: Arc<Lifecycle<Transport>>,
 }
 impl core::fmt::Debug for Firmware {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -28,16 +30,24 @@ impl Firmware {
         device: BusDevice,
         cap: Cap<BusDeviceCap, Write>,
         mmio: MmioRegion,
+        factory: super::efuse::Factory,
     ) -> Self {
         Self {
             device,
             cap,
             mmio,
-            lifecycle: Lifecycle::new(device.id.device),
+            factory,
+            lifecycle: Arc::new(Lifecycle::new(device.id.device)),
         }
     }
     pub(super) fn status(&self) -> Status {
         self.lifecycle.status()
+    }
+    pub(super) fn lifecycle(&self) -> Arc<Lifecycle<Transport>> {
+        self.lifecycle.clone()
+    }
+    pub(super) fn factory(&self) -> &super::efuse::Factory {
+        &self.factory
     }
     pub(super) async fn initialize_registered(&self) -> Result<Info, Error> {
         self.lifecycle
@@ -46,6 +56,25 @@ impl Firmware {
                 // ownership; Lifecycle invokes this factory at most once.
                 unsafe { pci_firmware::allocate(self.device, self.cap, self.mmio) }
             })
+            .await
+    }
+    pub(super) async fn prepare_mac(&self) -> Result<super::mac::Info, Error> {
+        self.lifecycle.prepare_mac().await
+    }
+    pub(super) async fn prepare_phy_tables(&self) -> Result<super::phy::Info, Error> {
+        self.lifecycle.prepare_phy_tables(&self.factory).await
+    }
+    pub(super) async fn qualify_board(&self) -> Result<super::power_policy::Permission, Error> {
+        let domain = narf_wireless::reg::db::ensure_domain()
+            .map_err(|_| Error::Power(super::power_policy::Error::Policy))?;
+        self.lifecycle.qualify_board(&self.factory, &domain).await
+    }
+    pub(super) async fn prepare_radio(
+        &self,
+        permission: super::power_policy::Permission,
+    ) -> Result<super::radio::Info, Error> {
+        self.lifecycle
+            .prepare_radio(&self.factory, permission)
             .await
     }
 }

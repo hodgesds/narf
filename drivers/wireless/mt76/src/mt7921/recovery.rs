@@ -87,6 +87,8 @@ impl<B: Backend> Session<B> {
         self.stage(Stage::RecoveryRearm);
         self.backend.recycle()?;
         self.security = None;
+        self.ht20_rx = None;
+        self.received_msdu.clear();
         self.station_bss = None;
         self.data_pending = None;
         self.peer_lost = false;

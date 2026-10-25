@@ -10,7 +10,8 @@ use super::{
 };
 
 /// Registers prepared on a quiescent device, including modal/RF and the
-/// EEPROM detector table. CTL/rate power and calibration remain; PHY stays off.
+/// EEPROM detector/rate tables and legacy20 mode/chain/synth/slope/spur setup.
+/// Live channel authorization and analog calibration remain; PHY stays off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Prepared {
     pub reference_frequency: u16,
@@ -84,18 +85,9 @@ fn prepare(
     table(io, AR9285_MODES_9285_1_2, 4, &mut writes); // 2GHz HT20.
     table(io, gain, 4, &mut writes);
     table(io, AR9285_COMMON_9285_1_2, 1, &mut writes);
-    // The common INI deliberately clears DIAG_SW; keep receive blocked.
-    rmw(io, 0x8048, 0, 0x02000020)?;
-    io.write32(0xa200, 4); // AR_PHY_MODE_DYNAMIC.
-    rmw(io, 0xa204, 0x10, 0)?; // Reference channel is not Japan channel 14.
-    let synth = io.read32(0x9874);
-    if synth == u32::MAX {
-        return Err(BringUpError::DeviceGone);
-    }
-    io.write32(
-        0x9874,
-        (synth & 0xc0000000) | (1 << 29) | (1 << 28) | ((2412 * 0x10000) / 15),
-    );
+    // Full-reset INI precedes mode/chain/synth/slope/spur preparation.
+    // No fast retune or live PHY activation is implied by this call.
+    channel::prepare(io, image, 2412)?;
     modal::prepare(io, image, false, false)?;
     power::program(io, image, 2412)?;
     // Inactive reference preparation supplies no positive transmit budget.
@@ -125,6 +117,17 @@ pub(super) fn program(
     prepare(&mut Registers::new(mmio, cap), image)
 }
 
+pub(super) fn program_live_power(
+    io: &mut impl RegisterIo,
+    image: &[u8; EEPROM_4K_BYTES],
+    ceiling: u8,
+) -> Result<(), BringUpError> {
+    // Detector geometry already belongs to the unchanged channel1 reference.
+    // Re-plan all factory/CTL/antenna-limited rates before live calibration.
+    rates::program(io, image, 2412, ceiling)
+}
+
+mod channel;
 mod modal;
 mod power;
 mod rates;

@@ -10683,7 +10683,7 @@ kernel_test_in!("memory/kaslr", smoke_kaslr_tsc_mix_advances);
 // ── ro_after_init smokes ──────────────────────────────────────────────
 
 fn smoke_ro_after_init_rw_before_latch() -> TestResult {
-    use crate::ro_after_init::{is_init_complete, mark_init_complete, RoCell, _reset_for_test};
+    use crate::ro_after_init::{_reset_for_test, is_init_complete, mark_init_complete, RoCell};
     _reset_for_test();
     let cell = RoCell::new(42u32);
     if *cell.get() != 42 {

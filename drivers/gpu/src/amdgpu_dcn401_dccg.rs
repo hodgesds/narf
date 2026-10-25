@@ -1,5 +1,4 @@
-//! Native Navi48 pixel/DPP dividers. Register layout: dcn_4_1_0 headers;
-//! sequencing: Linux dcn401_dccg.c and dce_clock_source.c. All consumers must
+//! Native Navi48 pixel/DPP dividers. All consumers must
 //! be retired. This prepares clocks; it does not enable a stream or HDMI PLL.
 use crate::{amdgpu::AmdGpu, amdgpu_dcn401_clk as clocks, amdgpu_discovery as ip};
 use narf_bus::{BusDeviceCap, MmioRegion};

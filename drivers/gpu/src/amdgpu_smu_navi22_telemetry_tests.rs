@@ -8,8 +8,6 @@ fn put16(b: &mut [u8], at: usize, v: u16) {
 fn put32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
-/// A metrics table filled through the Linux field offsets of
-/// smu11_driver_if_sienna_cichlid.h (see tests/smu11_metrics.c).
 fn table(layout: Layout) -> Vec<u8> {
     let mut b = vec![0u8; METRICS_BYTES];
     for (i, mhz) in [2400, 1000, 2000, 1940, 0, 0, 0, 0, 1200]

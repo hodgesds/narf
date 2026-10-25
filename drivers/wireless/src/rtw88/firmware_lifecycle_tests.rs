@@ -79,10 +79,13 @@ fn image() -> Vec<u8> {
     bytes
 }
 fn smoke_rtw88_retained_native_firmware_lifecycle_cancel_and_no_reconstruction() -> TestResult {
+    retained_cancel(0xc822)
+}
+fn retained_cancel(did: u16) -> TestResult {
     let calls = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
     let published = Arc::new(AtomicBool::new(false));
-    let lifecycle = Lifecycle::new(0xc822);
+    let lifecycle = Lifecycle::new(did);
     let allocations = AtomicUsize::new(0);
     let mut future = Box::pin(lifecycle.initialize(
         || {
@@ -93,7 +96,11 @@ fn smoke_rtw88_retained_native_firmware_lifecycle_cancel_and_no_reconstruction()
                 published: published.clone(),
             })
         },
-        Source::Bytes(image()),
+        Source::Bytes({
+            let mut bytes = image();
+            bytes[0] = if did == 0xc821 { 0x21 } else { 0x22 };
+            bytes
+        }),
     ));
     if future
         .as_mut()
@@ -146,6 +153,13 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_retained_native_firmware_lifecycle_cancel_and_no_reconstruction
 );
+fn smoke_rtw8821ce_cancel_retains_exact_outer_and_inner_firmware_owners() -> TestResult {
+    retained_cancel(0xc821)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_cancel_retains_exact_outer_and_inner_firmware_owners
+);
 fn smoke_rtw88_failed_native_factory_is_terminal_without_io() -> TestResult {
     let lifecycle = Lifecycle::<Model>::new(0xc822);
     let allocations = AtomicUsize::new(0);
@@ -174,4 +188,84 @@ fn smoke_rtw88_failed_native_factory_is_terminal_without_io() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_failed_native_factory_is_terminal_without_io
+);
+
+fn smoke_rtw88_registered_preflight_can_stage_later_without_allocating_or_replaying() -> TestResult
+{
+    let lifecycle = Lifecycle::<Model>::new(0xc822);
+    let allocations = AtomicUsize::new(0);
+    for error in [
+        Error::Firmware(narf_firmware::FirmwareError::NotFound),
+        Error::Firmware(narf_firmware::FirmwareError::AuthorityRevoked),
+        Error::Image,
+    ] {
+        let result = narf_scheduler::block_on(lifecycle.initialize_registered_with(
+            || {
+                allocations.fetch_add(1, Ordering::SeqCst);
+                Err(Error::Memory)
+            },
+            || Err(error),
+        ));
+        if result != Err(error)
+            || allocations.load(Ordering::SeqCst) != 0
+            || lifecycle.started.load(Ordering::Acquire)
+            || lifecycle.status()
+                != (Status {
+                    stage: Stage::Detected,
+                    info: None,
+                    error: Some(error),
+                })
+            || lifecycle.retained.try_lock().is_none_or(|r| r.is_some())
+        {
+            return TestResult::Fail("registered preflight consumed/allocated pristine lifecycle");
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let published = Arc::new(AtomicBool::new(false));
+    {
+        let mut future = core::pin::pin!(lifecycle.initialize_registered_with(
+            || {
+                allocations.fetch_add(1, Ordering::SeqCst);
+                Ok(Model {
+                    calls: calls.clone(),
+                    drops: drops.clone(),
+                    published: published.clone(),
+                })
+            },
+            || super::super::firmware_transport::preflight_image(0xc822, image())
+        ));
+        if !future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+            || !published.load(Ordering::Acquire)
+        {
+            return TestResult::Fail(
+                "later staged image failed to reach real retained publication",
+            );
+        }
+    }
+    let loads = AtomicUsize::new(0);
+    if lifecycle.status().stage != Stage::Failed
+        || drops.load(Ordering::Acquire) != 0
+        || allocations.load(Ordering::Acquire) != 1
+        || narf_scheduler::block_on(lifecycle.initialize_registered_with(
+            || Err(Error::Memory),
+            || {
+                loads.fetch_add(1, Ordering::SeqCst);
+                super::super::firmware_transport::preflight_image(0xc822, image())
+            },
+        )) != Err(Error::State)
+        || loads.load(Ordering::Acquire) != 0
+    {
+        return TestResult::Fail(
+            "started registered attempt reopened loader/allocation after cancel",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_registered_preflight_can_stage_later_without_allocating_or_replaying
 );

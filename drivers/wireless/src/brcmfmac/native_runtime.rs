@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Native retained PCIe/TCM/DMA backend and explicit board-policy dispatch.
-//! No board profile is guessed from a PCI DID. Platform code must register
-//! verified chip/revision/subsystem-specific firmware and calibration names.
+//! Native retained PCIe/TCM/DMA backend and signed board-policy dispatch.
+//! Exact host/chip-qualified manifests or trusted platform registrations select
+//! verified calibration assets; no board profile is guessed from a PCI DID.
 use super::{
     boot::{self, BoardProfile},
     chip::Backplane,
     pcie::{invoke_registers, BrcmfmacDevice, PcieBackplane},
     runtime::{self, Memory},
 };
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::{
     fmt::Write,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, AtomicU8, Ordering},
 };
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 static PROFILES: IrqSafeSpinLock<Vec<BoardProfile>> = IrqSafeSpinLock::new(Vec::new());
@@ -47,105 +47,216 @@ fn identity(device: &narf_bus::BusDevice) -> boot::PciIdentity {
         subsystem_device: device.id.subsystem_id,
     }
 }
-fn blob(name: &str) -> Result<Vec<u8>, &'static str> {
-    let authority = narf_firmware::trusted_loader_authority()
-        .and_then(|c| c.derive().ok())
-        .ok_or("firmware authority unavailable")?;
-    let cap = narf_firmware::open(name, &authority)
-        .map_err(|_| "board-selected firmware/NVRAM unavailable")?;
-    Ok(narf_firmware::view_of(&cap)
-        .map_err(|_| "firmware authority revoked")?
-        .bytes
-        .to_vec())
+/// Startup is retryable only while no firmware/native DMA attempt has begun.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ProvisionState {
+    Parked = 0,
+    Starting = 1,
+    Ready = 2,
+    Failed = 3,
+}
+struct Bootstrap {
+    parked: Mutex<Option<PcieBackplane>>,
+    state: AtomicU8,
+    chip: u16,
+    revision: u8,
+}
+static BOOTSTRAP: IrqSafeSpinLock<Option<Arc<Bootstrap>>> = IrqSafeSpinLock::new(None);
+struct Attempt<'a>(&'a AtomicU8);
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        if self.0.load(Ordering::Acquire) == ProvisionState::Starting as u8 {
+            self.0
+                .store(ProvisionState::Failed as u8, Ordering::Release);
+        }
+    }
+}
+pub fn provision_state() -> Option<ProvisionState> {
+    let owner = BOOTSTRAP.lock().clone()?;
+    Some(match owner.state.load(Ordering::Acquire) {
+        0 => ProvisionState::Parked,
+        1 => ProvisionState::Starting,
+        2 => ProvisionState::Ready,
+        _ => ProvisionState::Failed,
+    })
+}
+pub(super) async fn drive_scheduled<Step, StepFut, Wait, WaitFut>(
+    max_attempts: usize,
+    mut state: impl FnMut() -> Option<ProvisionState>,
+    mut step: Step,
+    mut wait: Wait,
+) -> Result<(), &'static str>
+where
+    Step: FnMut() -> StepFut,
+    StepFut: core::future::Future<Output = Result<(), &'static str>>,
+    Wait: FnMut() -> WaitFut,
+    WaitFut: core::future::Future<Output = ()>,
+{
+    let mut last_err = "signed BCM43602 board selection unavailable or mismatched";
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            wait().await;
+        }
+        match step().await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = err;
+                if state() != Some(ProvisionState::Parked) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 pub(super) fn start(device: &mut BrcmfmacDevice) {
-    let Some(backplane) = device.backplane.as_ref() else {
+    // BAR mapping and immutable discovery need no board calibration guess.
+    // Registry payloads arrive in Stage::Late, after synchronous PCI matching.
+    if device.chip.id != 43602
+        || device
+            .backplane
+            .as_ref()
+            .is_none_or(|bus| bus.bar2.is_none())
+    {
+        return;
+    }
+    let Some(bus) = device.backplane.take() else {
         return;
     };
-    let Some(profile) = selected_profile(&backplane.device) else {
-        return;
-    };
-    let Some(backplane) = device.backplane.take() else {
-        return;
-    };
-    let pci = identity(&backplane.device);
-    narf_scheduler::spawn(async move {
-        let result: Result<runtime::Runtime<PcieBackplane>, &'static str> = (|| {
-            let firmware = blob(profile.firmware)?;
-            let nvram = boot::pack_nvram(&blob(profile.nvram)?)
-                .map_err(|_| "invalid/unsupported board NVRAM")?;
-            let boot = boot::Cr4::claim(backplane, pci, profile)
-                .map_err(|_| "CR4 passive/RAM discovery failed")?
-                .boot(&firmware, &nvram)
-                .map_err(|_| "CR4 firmware bootstrap failed")?;
-            let mut runtime =
-                runtime::Runtime::attach(boot).map_err(|_| "common-ring/DMA attachment failed")?;
-            runtime
-                .enable_data()
-                .map_err(|_| "RX buffer posting failed")?;
-            Ok(runtime)
-        })();
-        let runtime = match result {
-            Ok(owner) => owner,
-            Err(reason) => {
-                let _ = writeln!(narf_console::Writer, "brcmfmac: {}", reason);
-                return;
-            }
-        };
-        // Authenticated regulatory policy and exact board firmware are both
-        // prerequisites. Missing policy leaves only the diagnostic control
-        // owner; it cannot register a NIC or authorize a station.
-        if station_policy() {
-            let Some(name) = available_name() else {
-                let _ = writeln!(narf_console::Writer, "brcmfmac: no free interface name");
-                return;
-            };
-            let adapter = match super::station_transport::Adapter::new(runtime) {
-                Ok(a) => a,
-                Err(_) => {
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "brcmfmac: station transport setup failed"
-                    );
-                    return;
-                }
-            };
-            match crate::cyw43439::interface::attach_runtime(&name, adapter, &[]).await {
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "brcmfmac: station attachment failed: {:?}",
-                        error
-                    );
-                }
-            }
-            return;
-        }
-        *RUNTIME.lock().await = Some(runtime);
-        loop {
-            {
-                let mut slot = RUNTIME.lock().await;
-                let Some(owner) = slot.as_mut() else {
-                    return;
-                };
-                if owner.poll().is_err() {
-                    return;
-                }
-                // Bound the worker and its event retention. Overflow fail-stops
-                // the retained runtime instead of silently losing link state.
-                while let Some(event) = owner.pop_event() {
-                    let mut events = EVENTS.lock();
-                    if events.len() == 32 {
-                        owner.fail();
-                        return;
-                    }
-                    events.push_back(event);
-                }
-            }
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+    let owner = Arc::new(Bootstrap {
+        parked: Mutex::new(Some(bus)),
+        state: AtomicU8::new(ProvisionState::Parked as u8),
+        chip: device.chip.id,
+        revision: device.chip.revision,
+    });
+    *BOOTSTRAP.lock() = Some(owner);
+    narf_scheduler::spawn(async {
+        if let Err(reason) = drive_scheduled(120, provision_state, provision, || {
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
+        })
+        .await
+        {
+            let _ = writeln!(narf_console::Writer, "brcmfmac: {}", reason);
         }
     });
+}
+/// Retry newly staged signed provisioning only before a hardware attempt.
+/// The exact parked bus remains retained; this never resets/rebuilds an owner.
+pub async fn provision() -> Result<(), &'static str> {
+    let owner = BOOTSTRAP
+        .lock()
+        .clone()
+        .ok_or("no retained BCM43602 owner")?;
+    if narf_net::trusted_net_authority().is_none() {
+        return Err("network registration authority unavailable");
+    }
+    let authority = super::provision::authority().map_err(|_| "firmware authority unavailable")?;
+    provision_using(&owner, &authority, super::provision::MANIFEST).await
+}
+async fn provision_using(
+    owner: &Bootstrap,
+    authority: &narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    manifest: &str,
+) -> Result<(), &'static str> {
+    provision_checked(owner, authority, manifest, || {
+        narf_wireless::reg::db::ensure_domain()
+            .map(|_| ())
+            .map_err(|_| "signed regulatory policy unavailable")
+    })
+    .await
+}
+async fn provision_checked(
+    owner: &Bootstrap,
+    authority: &narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    manifest: &str,
+    policy: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    if owner.state.load(Ordering::Acquire) != ProvisionState::Parked as u8 {
+        return Err("BCM43602 provisioning already attempted");
+    }
+    let mut slot = owner.parked.lock().await;
+    if owner.state.load(Ordering::Acquire) != ProvisionState::Parked as u8 {
+        return Err("BCM43602 provisioning already attempted");
+    }
+    let bus = slot.as_ref().ok_or("parked BCM43602 owner unavailable")?;
+    let pci = identity(&bus.device);
+    let explicit = selected_profile(&bus.device);
+    let selection = if explicit.is_none() {
+        let host = narf_drivers_sdio::pio::HostIdentity {
+            address: bus.device.addr,
+            id: bus.device.id,
+        };
+        Some(
+            super::provision::select_using(
+                authority,
+                manifest,
+                super::provision::Family::Pcie43602,
+                host,
+                None,
+            )
+            .map_err(|_| "signed BCM43602 board selection unavailable or mismatched")?,
+        )
+    } else {
+        None
+    };
+    let assets = if let Some(profile) = explicit {
+        if profile.chip != owner.chip
+            || owner.revision >= 16
+            || profile.revision_mask & (1 << owner.revision) == 0
+        {
+            return Err("explicit BCM43602 chip/revision mismatch");
+        }
+        super::provision::trusted_assets_using(authority, profile.firmware, profile.nvram)
+            .map_err(|_| "board-selected firmware/signed NVRAM unavailable")?
+    } else {
+        let selection = selection.as_ref().unwrap();
+        if !selection.admits_chip(owner.chip, owner.revision) {
+            return Err("BCM43602 discovered chip/revision mismatch");
+        }
+        selection
+            .load_using(authority)
+            .map_err(|_| "selected BCM43602 asset signature/key/length/hash mismatch")?
+    };
+    let nvram = boot::pack_nvram(&assets.nvram).map_err(|_| "invalid selected BCM43602 NVRAM")?;
+    policy()?;
+    assets
+        .proof
+        .validate()
+        .map_err(|_| "BCM43602 provisioning revoked/replaced before boot")?;
+    // All provisioning failures above preserve the exact parked bus. From
+    // this point cancellation/error is one-shot and the device claim survives.
+    owner
+        .state
+        .store(ProvisionState::Starting as u8, Ordering::Release);
+    let _attempt = Attempt(&owner.state);
+    let mut bus = slot.take().ok_or("parked BCM43602 owner unavailable")?;
+    bus.proof = Some(assets.proof.clone());
+    let boot = if let Some(profile) = explicit {
+        boot::Cr4::claim(bus, pci, profile)
+    } else {
+        boot::Cr4::claim_selected(bus, pci, selection.as_ref().unwrap())
+    }
+    .map_err(|_| "CR4 passive/RAM/identity discovery failed")?;
+    let boot = boot
+        .boot(&assets.firmware, &nvram)
+        .map_err(|_| "CR4 firmware bootstrap failed")?;
+    let mut runtime =
+        runtime::Runtime::attach(boot).map_err(|_| "common-ring/DMA attachment failed")?;
+    runtime
+        .enable_data()
+        .map_err(|_| "RX buffer posting failed")?;
+    let adapter = super::station_transport::Adapter::new(runtime)
+        .map_err(|_| "station transport setup failed")?;
+    drop(slot);
+    let name = narf_net::iface::reserve_name("wlan%d");
+    crate::cyw43439::interface::attach_runtime(name, adapter, &[])
+        .await
+        .map_err(|_| "BCM43602 station attachment failed")?;
+    owner
+        .state
+        .store(ProvisionState::Ready as u8, Ordering::Release);
+    Ok(())
 }
 /// One serialized production control request. Cancellation makes the owner
 /// terminal while retaining all device-visible addresses and request bytes.
@@ -232,7 +343,10 @@ impl PcieBackplane {
         // additionally verifies that the retained memory aperture is enabled.
         let command = narf_bus::pci::read_command(&self.cap, &self.device)
             .map_err(|_| boot::Error::Access)?;
-        if command & narf_bus::pci::cmd::MEM_SPACE == 0 {
+        if command == u16::MAX
+            || command & (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE)
+                != (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE)
+        {
             return Err(boot::Error::Access);
         }
         let region = self.bar2.ok_or(boot::Error::Extent)?;
@@ -251,6 +365,7 @@ impl boot::Bus for PcieBackplane {
             .map_or(0, |bar| bar.len.min(u64::from(u32::MAX)) as u32)
     }
     fn dma_enabled(&mut self) -> Result<bool, boot::Error> {
+        self.qualified().map_err(|_| boot::Error::Access)?;
         let cap = self.cap;
         invoke_registers(&cap, || {
             narf_bus::pci::read_command(&self.cap, &self.device)
@@ -262,6 +377,7 @@ impl boot::Bus for PcieBackplane {
     // SAFETY for MMIO below: aperture checks exclusive retained authority and
     // the entire extent. Each branch separately proves natural width/alignment.
     fn read_tcm(&mut self, address: u32, out: &mut [u8]) -> Result<(), boot::Error> {
+        self.qualified().map_err(|_| boot::Error::Access)?;
         let cap = self.cap;
         invoke_registers(&cap, || {
             let region = self.aperture(address, out.len())?;
@@ -293,6 +409,7 @@ impl boot::Bus for PcieBackplane {
     }
     // SAFETY: same complete extent/authority and per-branch width proof as read.
     fn write_tcm(&mut self, address: u32, bytes: &[u8]) -> Result<(), boot::Error> {
+        self.qualified().map_err(|_| boot::Error::Access)?;
         let cap = self.cap;
         invoke_registers(&cap, || {
             let region = self.aperture(address, bytes.len())?;
@@ -334,23 +451,38 @@ impl boot::Bus for PcieBackplane {
 impl runtime::Bus for PcieBackplane {
     type Memory = narf_io::DmaBuffer;
     fn allocate(&mut self, length: usize) -> Result<Self::Memory, runtime::Error> {
-        narf_io::alloc_coherent(length, narf_lib::id::DomainId::DRIVER_0)
-            .map_err(|_| runtime::Error::Access)
+        self.qualified().map_err(|_| runtime::Error::Access)?;
+        invoke_registers(&self.cap, || {
+            let command = narf_bus::pci::read_command(&self.cap, &self.device)
+                .map_err(|_| runtime::Error::Access)?;
+            if command == u16::MAX
+                || command & (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE)
+                    != (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE)
+                || narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain
+            {
+                return Err(runtime::Error::Access);
+            }
+            narf_io::alloc_coherent(length, narf_lib::id::DomainId::DRIVER_0)
+                .map_err(|_| runtime::Error::Access)
+        })
+        .map_err(|_| runtime::Error::Access)?
     }
     fn enable_dma(&mut self) -> Result<(), runtime::Error> {
+        self.qualified().map_err(|_| runtime::Error::Access)?;
         let cap = self.cap;
         invoke_registers(&cap, || {
             narf_bus::pci::set_command(&self.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
                 .map_err(|_| runtime::Error::Access)?;
             let command = narf_bus::pci::read_command(&self.cap, &self.device)
                 .map_err(|_| runtime::Error::Access)?;
-            if command
-                & (narf_bus::pci::cmd::BUS_MASTER
-                    | narf_bus::pci::cmd::MEM_SPACE
-                    | narf_bus::pci::cmd::INTX_DISABLE)
-                != (narf_bus::pci::cmd::BUS_MASTER
-                    | narf_bus::pci::cmd::MEM_SPACE
-                    | narf_bus::pci::cmd::INTX_DISABLE)
+            if command == u16::MAX
+                || command
+                    & (narf_bus::pci::cmd::BUS_MASTER
+                        | narf_bus::pci::cmd::MEM_SPACE
+                        | narf_bus::pci::cmd::INTX_DISABLE)
+                    != (narf_bus::pci::cmd::BUS_MASTER
+                        | narf_bus::pci::cmd::MEM_SPACE
+                        | narf_bus::pci::cmd::INTX_DISABLE)
             {
                 return Err(runtime::Error::Access);
             }
@@ -441,28 +573,9 @@ pub async fn pop_tx_receipt() -> Option<runtime::TxReceipt> {
 }
 
 fn station_policy() -> bool {
-    if narf_wireless::reg::db::get_domain().is_some() {
-        return true;
-    }
-    let Some(authority) = narf_firmware::trusted_loader_authority().and_then(|c| c.derive().ok())
-    else {
-        return false;
-    };
-    let Ok(cap) = narf_firmware::open("wireless-regulatory.bin", &authority) else {
-        return false;
-    };
-    let Ok(view) = narf_firmware::view_of(&cap) else {
-        return false;
-    };
-    if view.signer.is_none() {
-        return false;
-    }
-    let Ok(domain) = narf_wireless::reg::parse_policy(view.bytes) else {
-        return false;
-    };
-    narf_wireless::reg::db::set_domain(domain);
-    true
+    narf_wireless::reg::db::ensure_domain().is_ok()
 }
+
 fn available_name() -> Option<alloc::string::String> {
     (0..16).map(|i| alloc::format!("wlan{}", i)).find(|name| {
         narf_net::iface::lookup(name).is_none()
@@ -470,4 +583,202 @@ fn available_name() -> Option<alloc::string::String> {
                 .iter()
                 .any(|iface| iface.name() == name)
     })
+}
+
+#[cfg(feature = "kernel-test")]
+mod provision_tests {
+    use super::*;
+    use crate::brcmfmac::provision::{tests::*, Family};
+    use core::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    use narf_capabilities::{Cap, Write};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn ready<F: Future>(future: F) -> Option<F::Output> {
+        let mut future = core::pin::pin!(future);
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(value) => Some(value),
+            Poll::Pending => None,
+        }
+    }
+    fn smoke_brcmf_board_provisioning_preboot_retry_retains_exact_owner_terminal_attempt_does_not_retry(
+    ) -> TestResult {
+        let (write, read) = registry().unwrap();
+        let selection = choose(&read, Family::Pcie43602).unwrap();
+        let host = selection.host();
+        let narf_bus::BusAddr::Pcie(address) = host.address else {
+            return TestResult::Fail("PCI fixture identity");
+        };
+        let cap = Cap::<narf_bus::BusDeviceCap, Write>::bootstrap();
+        let region = narf_bus::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 4096,
+            kind: narf_bus::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        let owner = Bootstrap {
+            parked: Mutex::new(Some(PcieBackplane {
+                proof: None,
+                bar0: region,
+                bar2: Some(region),
+                device: narf_bus::BusDevice {
+                    addr: host.address,
+                    id: host.id,
+                    kind: narf_bus::BusKind::Pcie {
+                        addr: address,
+                        cfg_phys: narf_memory::PhysAddr::new(0),
+                    },
+                },
+                cap,
+                pcie_core: None,
+            })),
+            state: AtomicU8::new(ProvisionState::Parked as u8),
+            chip: 43602,
+            revision: 3,
+        };
+        for _ in 0..2 {
+            if !matches!(
+                ready(provision_using(
+                    &owner,
+                    &read,
+                    "narf-test/brcm/missing-selection"
+                )),
+                Some(Err(_))
+            ) || owner.state.load(Ordering::Acquire) != ProvisionState::Parked as u8
+                || ready(async {
+                    owner
+                        .parked
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(|bus| bus.cap.slot().index)
+                }) != Some(Some(cap.slot().index))
+            {
+                return TestResult::Fail(
+                    "missing board selection lost or replaced exact parked PCI owner",
+                );
+            }
+        }
+        stage_invalid_executable(&write, Family::Pcie43602);
+        if !matches!(
+            ready(provision_checked(&owner, &read, TEST_MANIFEST, || Ok(()))),
+            Some(Err(_))
+        ) || owner.state.load(Ordering::Acquire) != ProvisionState::Parked as u8
+            || ready(async { owner.parked.lock().await.is_some() }) != Some(true)
+        {
+            return TestResult::Fail(
+                "exact signed short CR4 image consumed parked hardware attempt",
+            );
+        }
+        registry().unwrap(); // valid newly staged bytes can continue the same owner.
+        if !matches!(
+            ready(provision_checked(&owner, &read, TEST_MANIFEST, || Err(
+                "policy absent"
+            ))),
+            Some(Err(_))
+        ) || owner.state.load(Ordering::Acquire) != ProvisionState::Parked as u8
+        {
+            return TestResult::Fail(
+                "valid board assets without regulatory policy began CR4 attempt",
+            );
+        }
+        // Current revoked PCI authority must reject discovery before the
+        // deliberately invalid ECAM/BAR addresses. The admitted one-shot
+        // attempt then stays terminal, with no reconstructed hardware owner.
+        cap.revoke();
+        if !matches!(
+            ready(provision_checked(&owner, &read, TEST_MANIFEST, || Ok(()))),
+            Some(Err(_))
+        ) || owner.state.load(Ordering::Acquire) != ProvisionState::Failed as u8
+            || ready(async { owner.parked.lock().await.is_none() }) != Some(true)
+            || !matches!(
+                ready(provision_checked(&owner, &read, TEST_MANIFEST, || Ok(()))),
+                Some(Err(_))
+            )
+        {
+            return TestResult::Fail(
+                "failed CR4 native attempt became retryable or retained unsafe parked owner",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/brcmfmac/provision",
+        smoke_brcmf_board_provisioning_preboot_retry_retains_exact_owner_terminal_attempt_does_not_retry
+    );
+
+    fn smoke_brcmf_drive_scheduled_retries_and_terminates() -> TestResult {
+        let state = core::sync::atomic::AtomicU8::new(ProvisionState::Parked as u8);
+
+        // Case 1: retries while state() == Some(ProvisionState::Parked) and succeeds
+        let attempts = core::cell::Cell::new(0);
+        let waits = core::cell::Cell::new(0);
+        let result = narf_scheduler::block_on(drive_scheduled(
+            5,
+            || match state.load(Ordering::Acquire) {
+                0 => Some(ProvisionState::Parked),
+                1 => Some(ProvisionState::Starting),
+                2 => Some(ProvisionState::Ready),
+                _ => Some(ProvisionState::Failed),
+            },
+            || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                async move {
+                    if n < 2 {
+                        Err("missing asset")
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            || {
+                waits.set(waits.get() + 1);
+                async {}
+            },
+        ));
+        if result.is_err() || attempts.get() != 3 || waits.get() != 2 {
+            return TestResult::Fail("brcmfmac drive_scheduled failed to retry while parked");
+        }
+
+        // Case 2: exits immediately when state is unretryable (Failed)
+        state.store(ProvisionState::Failed as u8, Ordering::Release);
+        attempts.set(0);
+        waits.set(0);
+        let result = narf_scheduler::block_on(drive_scheduled(
+            10,
+            || match state.load(Ordering::Acquire) {
+                0 => Some(ProvisionState::Parked),
+                1 => Some(ProvisionState::Starting),
+                2 => Some(ProvisionState::Ready),
+                _ => Some(ProvisionState::Failed),
+            },
+            || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                async move { Err("missing asset") }
+            },
+            || {
+                waits.set(waits.get() + 1);
+                async {}
+            },
+        ));
+        if result != Err("missing asset") || attempts.get() != 1 || waits.get() != 0 {
+            return TestResult::Fail(
+                "brcmfmac drive_scheduled did not exit immediately when unretryable",
+            );
+        }
+
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/brcmfmac/provision",
+        smoke_brcmf_drive_scheduled_retries_and_terminates
+    );
 }

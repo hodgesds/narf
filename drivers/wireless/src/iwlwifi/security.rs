@@ -179,6 +179,64 @@ mod tests {
         smoke_wpa2_authenticated_key_install
     );
 
+    fn smoke_wpa2_eapol3_keeps_descriptor_mic_and_replay_gates() -> TestResult {
+        let (mut session, mut m1, _) = fixture();
+        // IEEE 802.1X-2010's outer protocol version is independent of the
+        // WPA2 EAPOL-Key descriptor version (HMAC-SHA1/AES remains 2).
+        m1[0] = 3;
+        for version in [0, 4, 255] {
+            let mut invalid = m1.clone();
+            invalid[0] = version;
+            if session.process(&invalid).is_ok() || session.ptk.is_some() {
+                return TestResult::Fail("unknown EAPOL envelope version changed key state");
+            }
+        }
+        let mut invalid = m1.clone();
+        invalid[6] = 0x8b;
+        if session.process(&invalid).is_ok() || session.ptk.is_some() {
+            return TestResult::Fail("EAPOL3 accepted a different WPA2 descriptor version");
+        }
+        let m2 = match session.process(&m1) {
+            Ok(reply) => reply,
+            Err(error) => return TestResult::Fail(error),
+        };
+        if m2.bytes[0] != 3 || m2.keys.is_some() || session.complete() {
+            return TestResult::Fail(
+                "EAPOL3 M1 opened the controlled port or changed reply version",
+            );
+        }
+        // Python hashlib/hmac PRF + MIC over the original independent wrapped
+        // GTK vector above. The changed protocol byte is authenticated too.
+        let m3 = hex("030300970213ca0010000000000000000222222222222222222222222222222222222222222222222222222222222222220000000000000000000000000000000000000000000000000000000000000000141c9f3d2a77fe734f184250cb5037a80038f46db379e9627aaf30c244132bcf973013fa695a53b39487397cd085fa6324776aba88cc6ba0fc0f8ccc41a59c9a5069ae43f5ffe26e975a");
+        let mut changed_envelope = m3.clone();
+        changed_envelope[0] = 2;
+        if session.process(&changed_envelope).is_ok() || session.complete() || session.replay != 1 {
+            return TestResult::Fail("EAPOL protocol byte escaped MIC authentication");
+        }
+        let m4 = match session.process(&m3) {
+            Ok(reply) => reply,
+            Err(error) => return TestResult::Fail(error),
+        };
+        if m4.bytes[0] != 3
+            || !session.complete()
+            || m4
+                .keys
+                .as_ref()
+                .and_then(|keys| keys.pairwise)
+                .is_none_or(|key| key.as_slice() != hex("f54200ef831912972fc8f81c95b606a7"))
+        {
+            return TestResult::Fail("independent EAPOL3 key-install vector mismatch");
+        }
+        match session.process(&m3) {
+            Ok(retry) if retry.keys.is_none() && retry.bytes == m4.bytes => TestResult::Pass,
+            _ => TestResult::Fail("EAPOL3 M3 retry changed key ownership"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/security",
+        smoke_wpa2_eapol3_keeps_descriptor_mic_and_replay_gates
+    );
+
     fn smoke_iwl_nonce_entropy_failure_keeps_rekey_and_retransmit_ownership() -> TestResult {
         let (mut session, m1, m3) = fixture();
         session.process(&m1).unwrap();
@@ -468,7 +526,7 @@ impl Session {
     ) -> Result<Response, &'static str> {
         if self.complete
             && pdu.len() >= 99
-            && matches!(pdu[0], 1 | 2)
+            && matches!(pdu[0], 1..=3)
             && pdu[1] == 3
             && u16::from_be_bytes([pdu[2], pdu[3]]) as usize == pdu.len() - 4
         {
@@ -520,7 +578,7 @@ impl Session {
 
     fn process_inner(&mut self, pdu: &[u8]) -> Result<Response, &'static str> {
         if pdu.len() < 99
-            || !matches!(pdu[0], 1 | 2)
+            || !matches!(pdu[0], 1..=3)
             || pdu[1] != 3
             || u16::from_be_bytes([pdu[2], pdu[3]]) as usize != pdu.len() - 4
         {

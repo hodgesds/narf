@@ -70,6 +70,31 @@ impl<I: Io> Power<I> {
     pub fn io(&mut self) -> &mut I {
         &mut self.io
     }
+    /// Apply only a completed factory snapshot after the initial discovery
+    /// power cycle actually reached Off. Physical identity/corrected cut stay
+    /// fixed; the next power-on uses actual RFE/power-k/autoload inputs.
+    pub(super) fn qualify_factory(
+        &mut self,
+        identity: super::factory::Identity,
+    ) -> Result<(), Error> {
+        let (chip, cut, _) = self.profile.ok_or(Error::Terminal)?;
+        if self.phase != Phase::Off {
+            return Err(Error::Terminal);
+        }
+        if identity.chip() != chip || identity.cut() != cut {
+            return Err(Error::Unsupported);
+        }
+        self.profile = Some((chip, cut, identity.calibration()));
+        Ok(())
+    }
+    pub(super) fn into_powered(self) -> Result<(I, ChipId, u8, Calibration), Error> {
+        if self.phase != Phase::Powered {
+            return Err(Error::Terminal);
+        }
+        let (chip, cut, calibration) = self.profile.ok_or(Error::Terminal)?;
+        Ok((self.io, chip, cut, calibration))
+    }
+
     fn modify8(&mut self, address: u32, mask: u8, value: u8) -> Result<(), Error> {
         let old = self.io.read8(address)?;
         self.io.write8(address, (old & !mask) | (value & mask))

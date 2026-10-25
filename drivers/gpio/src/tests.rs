@@ -16,10 +16,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_memory::PhysAddr;
 
-use crate::amd_fch::{recognised_hid, AmdFchGpio, __dispatch_for_test, __reset_dispatch_for_test};
+use crate::amd_fch::{__dispatch_for_test, __reset_dispatch_for_test, recognised_hid, AmdFchGpio};
 use crate::intel_pch::{
-    recognised_hids as intel_recognised_hids, IntelPchGpio, IntelPchGpioConfig,
     __new_for_test as intel_new_for_test, __probe_community_for_test as intel_probe_community,
+    recognised_hids as intel_recognised_hids, IntelPchGpio, IntelPchGpioConfig,
 };
 use crate::{registry, GpioController, GpioError, GpioIrqConfig, GpioPull};
 use narf_interrupts::IrqStatus;

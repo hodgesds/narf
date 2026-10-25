@@ -22,6 +22,11 @@ this does not configure platform clocks, pin muxes or power GPIOs.
 
 ## 3. Public interface
 
+- `pio::HostIdentity { address: BusAddr, id: DeviceId }` exposes immutable host
+  facts captured by its exclusive owner. `Registers::host_identity`,
+  `Controller::host_identity` and `Card::host_identity` return them without I/O
+  or authority. The default is None; non-PCI platforms must report actual
+  identity explicitly. This configures no pins, clocks, regulator or reset.
 - `pio::Registers` owns exact-width 8/16/32-bit accesses. No independent
   register handle may race a command or a window selection.
   `Controller::execute` validates command/data shape before I/O, waits for
@@ -53,13 +58,17 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   Adapters without fixed-read/block-size operations return `Unsupported`.
 - `native::register_pci_driver` registers class 08:05:00 and 08:05:01.
   `probe` reserves each BDF once, clears inherited BME and memory decode,
-  sets INTx disable, verifies all three before enabling/verifying memory
-  decode with BME off, and decodes first BAR/slot count from SLOT_INFO 0x40.
+  sets INTx disable and verifies all three before sizing/mapping the control
+  BAR with memory decode still off. SLOT_INFO 0x40 selects first BAR/slot count.
+  Only after a valid full mapping does it enable/verify memory decode with BME off.
   Repeated BDF probes leave the owner untouched; extra functions beyond the
   32-host bound remain parked with decode/BME off. New owners map control
   registers and initialize the card. `native::Mmio`
-  retains PCI authority and checks liveness/range/alignment per access;
-  revocation permanently closes it. The private handle cannot be cloned.
+  retains PCI authority and invokes its current validity for every exact-width
+  register access and PCI configuration transition. Inside that invocation,
+  command readback must be live (notffff), MEM and INTx-disable set, and BME
+  clear before MMIO. Range/alignment failure, revoked authority or invalid
+  decode permanently closes the adapter. The private handle cannot be cloned.
 - `native::register_function_driver(FunctionDriver)` registers up to 16
   exact `(function,vendor,device)` consumers. The matching callback receives
   the whole `NativeCard`, preserving shared F0/F1/F2 ownership. Registry
@@ -100,6 +109,10 @@ and packet runtime. Linux `mmc/host/sdhci.c`, `sdhci-pci-core.c` and
 Stage 5. Production-shared register models cover complete initialization,
 CIS, fixed FIFO read, block write, R5 rejection before FIFO, terminal
 controller failure, address rejection, clock divisors and bounded CIS.
+A revoked real PCI cap with deliberately invalid ECAM/MMIO proves current
+authority rejection occurs before those accesses. An Arc/IRQ-safe standard
+register/CIS fixture exposes the same initialized Card to composed wireless
+provisioning tests, including controller-command failure after preflight.
 They validate software contracts, not electrical/controller compatibility.
 
 ## 8. Open questions

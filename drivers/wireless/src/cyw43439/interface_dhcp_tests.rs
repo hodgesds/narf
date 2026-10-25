@@ -21,6 +21,9 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wifi_fixtures::{udp_ipv4, DhcpServer, NetworkPlan};
 
+#[path = "power_save_tests.rs"]
+mod power_save_tests;
+
 const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
 
@@ -160,12 +163,26 @@ struct Harness {
 
 impl Harness {
     fn new(secured: bool) -> Result<Self, &'static str> {
+        Self::new_policy(secured, None)
+    }
+    fn new_policy(
+        secured: bool,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+    ) -> Result<Self, &'static str> {
         let bus = Bus::new(secured);
-        let station = ready(Station::initialize(
-            Runtime::new(bus.clone()),
-            &[1],
-            firmware::domain(),
-        ))?
+        let station = if let Some(database) = database {
+            ready(Station::initialize_live(
+                Runtime::new(bus.clone()),
+                &[1],
+                database,
+            ))?
+        } else {
+            ready(Station::initialize(
+                Runtime::new(bus.clone()),
+                &[1],
+                firmware::domain(),
+            ))?
+        }
         .map_err(|_| "CYW composition firmware initialization")?;
         if station.mac != OWN {
             return Err("CYW composition firmware identity");
@@ -187,14 +204,15 @@ impl Harness {
             channels,
             supplicant,
             up: AtomicBool::new(false),
+            power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
             rx: IrqSafeSpinLock::new(Some(rx_consumer)),
             tx: IrqSafeSpinLock::new(Some(tx_producer)),
         });
         *ACTIVE_TEST.lock() = Some(device.clone());
-        narf_net::iface::set_link_state(&name, false);
-        // Install the same dispatch pointer as production without re-running
-        // stack initialization or registering another netfilter/timer hook.
+        narf_net::iface::set_link_state(&name, true); // operator IFF_UP
+                                                      // Install the same dispatch pointer as production without re-running
+                                                      // stack initialization or registering another netfilter/timer hook.
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
         Ok(Self { device, bus, name })
@@ -236,6 +254,12 @@ impl Harness {
         {
             return Err("CYW composition did not authorize the connected port");
         }
+        narf_net::iface::set_link_state(&self.name, false);
+        self.device.drain();
+        if narf_net::iface::lookup(&self.name).is_none_or(|iface| iface.link_up || !iface.carrier) {
+            return Err("CYW physical carrier overwrote operator DOWN");
+        }
+        narf_net::iface::set_link_state(&self.name, true);
         Ok(())
     }
 
@@ -277,7 +301,8 @@ fn composition(secured: bool) -> Result<(), &'static str> {
         b"cyw-a2-uplink",
     );
     if harness.device.link_up()
-        || narf_net::iface::lookup(&harness.name).is_none_or(|iface| iface.link_up || iface.carrier)
+        || narf_net::iface::lookup(&harness.name)
+            .is_none_or(|iface| !iface.link_up || iface.carrier)
         || harness.device.enqueue(&uplink).is_ok()
         || narf_net::dhcp::acquire(&harness.name, 0).is_ok()
         || !harness.bus.ap.lock().uplink.is_empty()
@@ -285,6 +310,23 @@ fn composition(secured: bool) -> Result<(), &'static str> {
         return Err("CYW admitted data or carrier before association");
     }
     harness.scan_and_associate(secured)?;
+    // Exercise ordinary station power save through the same native data
+    // owner before the real DHCP/IP conversation, for Open and WPA2.
+    harness
+        .device
+        .set_power_save(true)
+        .map_err(|_| "CYW power-save request")?;
+    ready(harness.device.apply_power_save())?;
+    if !harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .power_save()
+    {
+        return Err("CYW firmware never acknowledged station power save");
+    }
     let lease = narf_net::dhcp::dhcp_acquire(&harness.name, 0)
         .map_err(|_| "CYW association did not compose to a DHCP lease")?;
     if !plan.matches_lease(&lease) {
@@ -330,6 +372,21 @@ fn composition(secured: bool) -> Result<(), &'static str> {
     // Link loss must discard an already queued TX and an RX captured in the
     // same firmware poll, before either can cross the controlled port.
     let tx_before = harness.bus.ap.lock().uplink.len();
+    harness
+        .device
+        .set_power_save(false)
+        .map_err(|_| "CYW awake request")?;
+    ready(harness.device.apply_power_save())?;
+    if harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .power_save()
+    {
+        return Err("CYW firmware never acknowledged awake mode");
+    }
     let rx_before_loss = narf_net::iface::lookup(&harness.name)
         .ok_or("CYW composition interface disappeared before link loss")?
         .stats
@@ -348,7 +405,7 @@ fn composition(secured: bool) -> Result<(), &'static str> {
         || harness.bus.ap.lock().uplink.len() != tx_before
         || harness.received(&downlink)
         || narf_net::iface::lookup(&harness.name).is_none_or(|iface| {
-            iface.link_up
+            !iface.link_up
                 || iface.carrier
                 || iface.stats.rx_packets != rx_before_loss
                 || iface.carrier_changes != 2
@@ -382,3 +439,79 @@ kernel_test_in!(
     "drivers/wireless/cyw43439/interface",
     smoke_cyw_association_to_dhcp_wpa2_firmware_offload
 );
+
+fn disconnect_overrides_waiting_old_publisher() -> Result<(), &'static str> {
+    let h = Harness::new(false)?;
+    h.scan_and_associate(false)?;
+    let plan = network_plan();
+    let probe = udp_ipv4(
+        AP,
+        OWN,
+        plan.lease_ip,
+        plan.server_ip,
+        49153,
+        7,
+        b"cyw-disconnect-publication",
+    );
+    h.device
+        .enqueue(&probe)
+        .map_err(|_| "CYW queue before racing disconnect")?;
+    let state = h.device.state.try_lock().ok_or("CYW fixture state busy")?;
+    let mut disconnect = pin!(h.device.disassociate());
+    if disconnect
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_ready()
+        || h.device.link_up()
+        || h.device.connected_bssid().is_some()
+    {
+        return Err("CYW disconnect did not close before waiting for state");
+    }
+    // An earlier step()/associate() still owns state and publishes its peer.
+    if state.station.bssid != Some(AP) {
+        return Err("CYW fixture lacks the previous authorized publisher");
+    }
+    h.device.link(state.station.bssid);
+    if !h.device.link_up() || h.device.connected_bssid() != Some(AP) {
+        return Err("CYW previous publisher did not recreate the interleaving");
+    }
+    drop(state);
+    ready(disconnect)?.map_err(|_| "CYW interleaved firmware disconnect")?;
+    // No step() follows teardown before these cached-state observations.
+    if h.device.link_up()
+        || h.device.connected_bssid().is_some()
+        || h.device.enqueue(&probe).is_ok()
+        || narf_net::iface::send_on(&h.name, &probe).is_ok()
+        || narf_net::iface::lookup(&h.name).is_none_or(|i| {
+            !i.link_up || i.carrier || i.carrier_up_count != 2 || i.carrier_down_count != 2
+        })
+        || !h.bus.ap.lock().uplink.is_empty()
+    {
+        return Err("CYW old publisher reopened carrier/BSSID after completed disconnect");
+    }
+    let mut state = h
+        .device
+        .state
+        .try_lock()
+        .ok_or("CYW teardown retained state lock")?;
+    if state.station.bssid.is_some()
+        || state.pending.is_some()
+        || !matches!(state.tx.try_recv(), Ok(None))
+    {
+        return Err("CYW racing disconnect retained peer or queued data");
+    }
+    Ok(())
+}
+fn smoke_cyw_disconnect_overrides_waiting_old_link_publication() -> TestResult {
+    match disconnect_overrides_waiting_old_publisher() {
+        Ok(()) => TestResult::Pass,
+        Err(error) => TestResult::Fail(error),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/interface",
+    smoke_cyw_disconnect_overrides_waiting_old_link_publication
+);
+
+#[path = "live_policy_tests.rs"]
+mod live_policy_tests;

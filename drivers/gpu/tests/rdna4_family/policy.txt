@@ -1,5 +1,5 @@
 # Linux's per-die RDNA4 differences, keyed by GC IP version (12.0.0 Navi44,
-# 12.0.1 Navi48). check.sh regenerates this from soc24.c, dal_asic_id.h,
+# 12.0.1 Navi48). Source provenance: soc24.c, dal_asic_id.h,
 # dcn401_resource.c, dcn401_clk_mgr.c, kfd_device.c, amdgpu_ucode.c,
 # gfx_v12_0.c (+ gc_12_0_0_offset.h) and smu_v14_0_2_ppt.c; the kernel test
 # rdna4_tables_match_linux_policy_and_firmware holds amdgpu_rdna4 to it.

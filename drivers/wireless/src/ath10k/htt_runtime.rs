@@ -173,6 +173,11 @@ pub(super) struct RxBatch {
     pub tid: u8,
     pub frames: Vec<(u8, rx::Msdu)>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TxReceipt {
+    pub id: u16,
+    pub status: u8,
+}
 #[derive(Debug)]
 pub(super) struct Runtime<T> {
     pub wmi: wmi_boot::Runtime<T>,
@@ -180,6 +185,7 @@ pub(super) struct Runtime<T> {
     pub ready: Option<Ready>,
     pub early_htt: VecDeque<Vec<u8>>,
     pub wmi_events: VecDeque<Vec<u8>>,
+    tx_receipts: VecDeque<TxReceipt>,
     failed: bool,
 }
 impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
@@ -190,6 +196,7 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
             ready: None,
             early_htt: VecDeque::new(),
             wmi_events: VecDeque::new(),
+            tx_receipts: VecDeque::new(),
             failed: false,
         }
     }
@@ -214,6 +221,13 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
             self.wmi.htc.poll_with_progress().await?
         };
         self.failed = false;
+        self.dispatch(progressed, packet)
+    }
+    fn dispatch(
+        &mut self,
+        progressed: bool,
+        packet: Option<(u8, Vec<u8>)>,
+    ) -> Result<Event, Error> {
         let Some((endpoint, bytes)) = packet else {
             return Ok(if progressed {
                 Event::Progress
@@ -243,6 +257,45 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
                 Err(Error::Malformed)
             }
         }
+    }
+    pub fn source_ready(&mut self) -> Result<bool, Error> {
+        if self.failed || self.ready.is_none() {
+            return Err(Error::Failed);
+        }
+        self.wmi.htc.htt_source_ready().map_err(Error::from)
+    }
+    pub fn begin_transmit(
+        &mut self,
+        parameters: tx::Parameters,
+        bytes: &[u8],
+    ) -> Result<u16, Error> {
+        if !self.source_ready()? {
+            return Err(Error::Busy);
+        }
+        let (id, body) = self
+            .wmi
+            .htc
+            .transport
+            .prepare_htt_tx(self.config, parameters, bytes)?;
+        self.failed = true;
+        self.wmi.htc.begin_htt(&body)?;
+        self.failed = false;
+        Ok(id)
+    }
+    pub fn poll_now(&mut self) -> Result<Event, Error> {
+        if self.failed || self.ready.is_none() {
+            return Err(Error::Failed);
+        }
+        self.failed = true;
+        let (progressed, packet) = if let Some(bytes) = self.early_htt.pop_front() {
+            (true, Some((self.wmi.htc.htt, bytes)))
+        } else if let Some(bytes) = self.wmi_events.pop_front() {
+            (true, Some((self.wmi.htc.wmi, bytes)))
+        } else {
+            self.wmi.htc.poll_now()?
+        };
+        self.failed = false;
+        self.dispatch(progressed, packet)
     }
     pub async fn transmit(
         &mut self,
@@ -334,9 +387,23 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         }
         self.failed = true;
         let (status, ids) = tx::completion(bytes)?;
+        if self.tx_receipts.len() + ids.len() > usize::from(self.config.pending) {
+            return Err(Error::Busy);
+        }
+        self.tx_receipts
+            .try_reserve(ids.len())
+            .map_err(|_| Error::NoMemory)?;
         self.wmi.htc.transport.complete_htt_tx(&ids, false)?;
+        self.tx_receipts
+            .extend(ids.into_iter().map(|id| TxReceipt { id, status }));
         self.failed = false;
         Ok(status)
+    }
+    pub fn take_tx_receipt(&mut self) -> Option<TxReceipt> {
+        self.tx_receipts.pop_front()
+    }
+    pub fn data_profile(&self) -> bool {
+        self.wmi.raw_mode() && !self.config.pfc
     }
     pub async fn start(&mut self) -> Result<Ready, Error> {
         if self.failed || self.ready.is_some() || self.wmi.ready.is_none() {
@@ -388,7 +455,10 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         self.wmi.htc.send_htt(&rx_config(dma)?).await?;
         // Linux defaults64 AMPDU/3 AMSDU. Station admission remains closed
         // until actual RX deaggregation and reorder ownership are implemented.
-        self.wmi.htc.send_htt(&[5, 64, 3]).await?;
+        // Linux disables A-MSDU in RAW mode: firmware RAW aggregation can
+        // produce malformed frames. The legacy station advertises no HT BA.
+        let amsdu = if self.wmi.raw_mode() { 1 } else { 3 };
+        self.wmi.htc.send_htt(&[5, 64, amsdu]).await?;
         self.config.major = version.major;
         self.ready = Some(version);
         self.failed = false;

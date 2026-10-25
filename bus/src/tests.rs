@@ -1953,8 +1953,8 @@ fn smoke_hotplug_dispatch_fans_out_to_listeners() -> TestResult {
     use crate::addr::{BusAddr, PcieAddr};
     use crate::device::DeviceId;
     use crate::hotplug::{
-        dispatch_event, listener_count, register_listener, HotplugEvent, HotplugListener,
-        __clear_listeners,
+        __clear_listeners, dispatch_event, listener_count, register_listener, HotplugEvent,
+        HotplugListener,
     };
     use crate::registry::BusRegistryCap;
     use alloc::sync::Arc;

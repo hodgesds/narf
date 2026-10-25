@@ -199,32 +199,39 @@ impl<I: Io> Owner<I> {
         result
     }
     pub async fn initialize_registered(&self) -> Result<Info, Error> {
-        let _attempt = self.begin()?;
-        let result = async {
-            if self.did != super::regs::RTL_DEV_8188EE {
-                return Err(Error::Unsupported);
-            }
-            let loader = narf_firmware::trusted_loader_authority()
-                .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
-            let authority = loader
-                .derive()
-                .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
-            let cap =
-                narf_firmware::open(super::fw::FW_8188EE, &authority).map_err(Error::Firmware)?;
-            let view = narf_firmware::view_of(&cap).map_err(Error::Firmware)?;
-            // Validate the entire admitted file before allocation or register
-            // access. This rejects hostile registry extents without an OOM.
-            parse(self.did, view.bytes)?;
-            let mut bytes = alloc::vec::Vec::new();
-            bytes
-                .try_reserve_exact(view.bytes.len())
-                .map_err(|_| Error::NoMemory)?;
-            bytes.extend_from_slice(view.bytes);
-            self.run(&bytes).await
+        if self.started.load(Ordering::Acquire) {
+            return Err(Error::AlreadyStarted);
         }
-        .await;
+        let loader = narf_firmware::trusted_loader_authority()
+            .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
+        let authority = loader
+            .derive()
+            .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
+        self.initialize_registered_from(&authority, super::fw::FW_8188EE)
+            .await
+    }
+    pub(super) async fn initialize_registered_from(
+        &self,
+        authority: &narf_capabilities::Cap<
+            narf_firmware::FirmwareRegistry,
+            narf_capabilities::Read,
+        >,
+        name: &str,
+    ) -> Result<Info, Error> {
+        if self.started.load(Ordering::Acquire) {
+            return Err(Error::AlreadyStarted);
+        }
+        if self.did != super::regs::RTL_DEV_8188EE {
+            return Err(Error::Unsupported);
+        }
+        let asset = crate::firmware_asset::load(authority, name, HEADER + MAX_PAYLOAD, false)
+            .map_err(Error::Firmware)?;
+        parse(self.did, &asset.bytes)?;
+        let _attempt = self.begin()?;
+        let result = self.run(&asset.bytes).await;
         self.finish(result)
     }
+
     /// Caller already owns authenticated image bytes; probe uses registry.
     pub async fn initialize(&self, bytes: &[u8]) -> Result<Info, Error> {
         let _attempt = self.begin()?;

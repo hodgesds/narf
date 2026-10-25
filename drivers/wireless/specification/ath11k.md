@@ -151,7 +151,19 @@ them.
 
 - `register()` — registers the three Linux PCI ids.
 - `pci::probe` — identify, power up, spawn the MHI bring-up task.
-- `pci::{read32, write32}` — Linux-equivalent register access.
+  `pci::load_firmware` retries within `FW_WAIT_MS` until trusted loader
+  authority, the MHI AMSS image (`firmware-2.bin` or `amss.bin`), companion
+  `m3.bin` (when not embedded in `firmware-2.bin`) and signed `board-2.bin` or
+  `board.bin` are present before MHI power-up begins.
+- `pci::NativeIo` retains the exact original BusDevice/PCI cap/BAR binding through
+  `MhiStart`, `Bar0Mhi` and `core::Bar0`. MHI direct accesses and CE/DP ChipIo
+  accesses execute inside current `Cap::invoke`; complete width/alignment bounds
+  precede access, and dynamic-window select/data remain one invoked transaction.
+  Revoked reads return all ones, writes/selector restore do not reach hardware.
+  Probe/reset, MSI and ASPM configuration also retain current invocation. There
+  is no fresh/fake bus grant at the MHI→core→runtime handoff.
+- `pci::{read32, write32}` are unsafe Linux-equivalent raw register primitives;
+  production MHI/CE/DP adapters call them only under the retained current cap.
 - `pci::{is_probed, with_controller}` — bound-device inspection.
 - `pci::mhi_ready` — MHI reached mission mode with IPCR running.
 - After FW_READY the MHI task hands the [`wlfw::Wlfw`] session (owns
@@ -280,6 +292,22 @@ tables.
   `build_board2` (test fixtures). `pci::wlfw_bring_up` passes
   `check_smbios().bdf_ext` into `WlfwConfig::pci`, so the full board
   name carries `,variant=<v>` exactly as `__ath11k_core_create_board_name`.
+- `pci::request_fw` and `wlfw::NarfFirmware` use current registry/blob invocation
+  to make bounded owned payload copies before parsing or download. `FwBlob` owns
+  its copied bytes and original source cap; `AsRef` returns that owned storage
+  only while the source epoch remains current, never a registry slice around an
+  invocation. Board/calibration/regulatory roles (`board.bin`, `board-2.bin`,
+  `regdb.bin`, `caldata.bin`, `cal-*.bin`) always require a verified signer even
+  in unsigned-executable developer builds. Executable/container/M3 policy remains
+  the existing firmware registry/build policy; board identity/search order is
+  unchanged. Actual real-registry tests cover those strict roles, epoch denial
+  and owned bytes; native tests share one real cap across actual MHI/CE/DP MMIO
+  adapters and refuse revoked accesses before invalid ECAM/BAR sizing.
+  BDF selection captures one current owned slice, checks offset addition and
+  range before download, and rejects a revoked/empty snapshot with BDF_FETCH.
+  Caldata and M3 similarly reject empty current snapshots before target DMA/QMI.
+  A real-cap fixture revokes between board offset parsing and transfer snapshot,
+  proving bounded failure without a slice panic, target allocation or traffic.
 - `fw` — `firmware-N.bin` (Linux `fw.{c,h}`): `parse_api_n`
   (`ath11k_fw_request_firmware_api_n`: `"QCOM-ATH11K-FW\0"` padded to 4,
   then `{__le32 id, __le32 len, data}` IEs padded to 4; TIMESTAMP only

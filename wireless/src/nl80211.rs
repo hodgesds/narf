@@ -669,8 +669,12 @@ fn wiphy_attrs(
         push_attr(&mut bands, band_id | NLA_F_NESTED, &body);
     }
     push_attr(&mut attrs, 22 | NLA_F_NESTED, &bands);
-    push_attr(&mut attrs, 43, &[16]); // max scan SSIDs
-                                      // ath11k_mac_register: WLAN_SCAN_PARAMS_MAX_IE_LEN.
+    push_attr(
+        &mut attrs,
+        43,
+        &[iface.map_or(0, |iface| iface.max_scan_ssids())],
+    );
+    // ath11k_mac_register: WLAN_SCAN_PARAMS_MAX_IE_LEN.
     push_attr(&mut attrs, 56, &512u16.to_ne_bytes());
     if let Some(max) = iface
         .map(|iface| iface.max_remain_on_channel_duration_ms())
@@ -1439,6 +1443,30 @@ pub fn register() -> bool {
         narf_net::netlink_generic::register_release_notifier(control::station::release);
     }
     registered
+}
+
+/// Private driver fixtures stage only cfg80211's socket-owner metadata. This
+/// grants no network authority and does not perform or simulate driver work.
+#[cfg(any(test, feature = "kernel-test"))]
+#[doc(hidden)]
+pub fn __connection_owner_for_test(
+    name: &str,
+    namespace: u64,
+    portid: u32,
+    bssid: [u8; 6],
+) -> ConnectionOwnerFixture {
+    control::set_owner_for_test(name, namespace, portid, bssid);
+    ConnectionOwnerFixture(alloc::string::String::from(name))
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[doc(hidden)]
+pub struct ConnectionOwnerFixture(alloc::string::String);
+#[cfg(any(test, feature = "kernel-test"))]
+impl Drop for ConnectionOwnerFixture {
+    fn drop(&mut self) {
+        control::unregister_owner_for_test(&self.0);
+    }
 }
 
 #[cfg(test)]

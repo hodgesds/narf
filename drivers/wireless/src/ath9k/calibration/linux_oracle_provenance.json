@@ -1,0 +1,30 @@
+{
+  "sources": {
+    "ar9002_calib.c": "3629a1647d4577c81be321558ac1c29b2f5a8a72d2cd96388e0b63aa33a2d54b",
+    "ar9002_hw.c": "23882ecf6697160989aad52b26ce821deed10b7adac84c9ee01f6aee2eff2c29",
+    "ar5008_phy.c": "1042af18f89aec9df5b2c60abac02b5f4c35509266ea32bbdcc44fbb565e078e",
+    "calib.c": "bfd4fbf08710688bcd11e3230458da8b70fbf087ab45e67522dd2b06f2b0b8a9",
+    "hw.c": "8d06b4a22733dedd2d2a46247128f254b9345efae659de14189a8c2c0fd4731f",
+    "ar9002_initvals.h": "22b38579721b9d99372b2fe932be55ea0a0d2b0d8f4404dd9828ad5b37593903",
+    "reg.h": "629a6df177d63b2a99202ab97a3641c488b5f1ac738f6f15612c7b4ebacebade",
+    "ar9002_phy.h": "d2cceaa4340087d8bd961f9704d4361d9e22e737d038076294f1b172deb8f5fd",
+    "phy.h": "edab45a51cfa37c1226a90d59d1f7474a65758802518b0d00f6e34fd93ddddf2",
+    "hw.h": "95498a7e664cf66e99edcdfa9225a147ec4bb77b0458bfb726b5b0c26c1ebe85",
+    "calib.h": "f4316b58727cb50f7ce6d7c2ad827700a899cb329857c0d44b0e9f5e69d2121d",
+    "eeprom.h": "b6bc5f1bffd56f5b8828d14635eac4846487ff6f2ef06344d474ac4c1c11b7b0"
+  },
+  "functions": {
+    "ath9k_hw_synth_delay": "08427d00a9237ffddc0494a74bdc39a3028b160119441747ce9c15f63e8e8f6f",
+    "ar5008_hw_init_bb": "c4bd628431c75ed0260773ecbe1109416201e531182e99c78023317193cf4b97",
+    "ar9002_hw_configpcipowersave": "f45a0850c0e5634de64c6e521567b22197e43aa8ce15ef1b795259623dc1d4b5",
+    "ar9285_hw_cl_cal": "487b10cdf37f1aa58d4c21e59bda89a7ea52b06323bfc03714afef0f31f8f0bd",
+    "ar9285_hw_clc": "79636349b7ecafaea4cceb52b47ffda8526de106a5ddc9f76d7da16e895db2c3",
+    "ar9285_hw_pa_cal": "ea8656288e8002b8e5dc0da8fffa72eec542d9903e5c523b49440adecc346cf1",
+    "ath9k_hw_loadnf": "dfc24e1cdbe21c27b14660d70d218b7098e207501796a0832c4938180ba1df22",
+    "ath9k_hw_start_nfcal": "24827561fb46a6ba1df625dfacd1d1111bb48418c017c75d802c19851c0958ad",
+    "ar9002_hw_setup_calibration": "6820078731ad183ef8b519b82af0ba6237dbdf77daaf6d5cf547765d5283e838",
+    "ar9002_hw_iqcal_collect": "2fdd89f4ad361d5f56a116cb94c7814203a36fd91ba5ad457df40e9cde722cf4",
+    "ar9002_hw_iqcalibrate": "9708552fbe35bd2201dbe5e709e0ea4c9051fc4b9439d8e21798bd6305443d14"
+  },
+  "profile": "AR9285 20MHz single-chain; xe2/high-gain/CLC retry/register seed/correlation sign, 32 cases; fast self-clearing completion model"
+}

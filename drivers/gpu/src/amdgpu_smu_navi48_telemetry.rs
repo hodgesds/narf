@@ -1,10 +1,8 @@
 //! Navi48 PMFW telemetry decoding: SMU14.0.2 `SmuMetricsExternal_t` and the
-//! thermal/fan/power limits of the firmware board table. Layouts come from
-//! Linux smu14_driver_if_v14_0.h and smu_v14_0_2_pptable.h (checked by
-//! tests/smu14_metrics.c); the decoding follows smu_v14_0_2_ppt.c
-//! (`get_smu_metrics_data`, `get_thermal_temperature_range`,
-//! `get_fan_speed_pwm`, `init_ppt_limits`) and the amdgpu_pm.c hwmon units.
-//! Pure parsing; the retained SMU owner performs every transfer.
+//! thermal/fan/power limits of the firmware board table. Layout provenance is
+//! Linux smu14_driver_if_v14_0.h and smu_v14_0_2_pptable.h; decoding follows
+//! smu_v14_0_2_ppt.c and amdgpu_pm.c's hwmon units. Pure parsing; the retained
+//! SMU owner performs every transfer.
 
 /// `TABLE_SMU_METRICS`, `sizeof(SmuMetricsExternal_t)`.
 pub(crate) const METRICS_TABLE: u32 = 5;
@@ -49,7 +47,6 @@ const SOFTWARE_SHUTDOWN: usize = 43;
 const CUSTOM_SKU: usize = 4924;
 const PPT_AC: usize = CUSTOM_SKU; // SocketPowerLimitAc[PPT_THROTTLER_PPT0]
 const TEMPERATURE_LIMIT: usize = CUSTOM_SKU + 20;
-// SkuTable_t fields (offsets checked by tests/smu14_metrics.c).
 const MSG_PPT_AC: usize = 3976; // MsgLimits.Power[PPT_THROTTLER_PPT0][AC]
 const OD_MIN_PPT: usize = 4124; // OverDriveLimitsBasicMin.Ppt (percent)
 const OD_MAX_FEATURES: usize = 4188; // OverDriveLimitsBasicMax.FeatureCtrlMask

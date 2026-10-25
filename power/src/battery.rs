@@ -500,8 +500,8 @@ mod tests {
 
     fn smoke_battery_btp_trip_notify_fanout() -> TestResult {
         use super::{
-            notify, notify_capacity_low, subscribe, subscriber_count, BatteryTripEvent,
-            __reset_for_test,
+            __reset_for_test, notify, notify_capacity_low, subscribe, subscriber_count,
+            BatteryTripEvent,
         };
         use alloc::sync::Arc;
         use narf_lib::sync::IrqSafeSpinLock;

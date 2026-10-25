@@ -1,4 +1,4 @@
-# Linux amdgpu_dm cursor plane checks on DCN 4.0.1 for drm_native_planes.rs; see check.sh.
+# Linux amdgpu_dm cursor plane checks on DCN 4.0.1 for drm_native_planes.rs; retained regression snapshot.
 # fb_w fb_h pitch mods tiling src_x src_y src_w src_h crtc_w crtc_h = errno
 1 1 4 1 0 0 0 65536 65536 1 1 = -22
 1 1 4 0 0 0 0 65536 65536 1 1 = -22

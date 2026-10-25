@@ -20,9 +20,20 @@ pub enum Error {
     ShortTransfer,
 }
 
+/// Immutable identity captured by the exclusive host owner; no I/O authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostIdentity {
+    pub address: narf_bus::BusAddr,
+    pub id: narf_bus::DeviceId,
+}
 /// An owned register aperture. Accessors use the exact SDHCI register width.
 /// All waits are deadline-bounded and feed the scheduler's common pumps.
 pub trait Registers {
+    /// Immutable host facts captured by its exclusive platform/PCI owner.
+    /// This supplies no register handle or authority and configures no wiring.
+    fn host_identity(&self) -> Option<HostIdentity> {
+        None
+    }
     fn read8(&mut self, offset: u32) -> u8;
     fn read16(&mut self, offset: u32) -> u16;
     fn read32(&mut self, offset: u32) -> u32;
@@ -83,6 +94,9 @@ impl<R: Registers> Controller<R> {
     }
     pub fn registers(&mut self) -> &mut R {
         &mut self.io
+    }
+    pub fn host_identity(&self) -> Option<HostIdentity> {
+        self.io.host_identity()
     }
 
     pub(crate) fn wait(

@@ -1,4 +1,4 @@
-// Extracted actual Linux _rtl88ee_llt_table_init/_llt_write.
+// Extracted actual Linux EE hw.c LLT/init_mac and reg.h.
 const LINUX_LLT: &[(u8, u16, u32)] = &[
     (8, 0x214, 0x1),
     (32, 0x200, 0x80730d29),
@@ -186,3 +186,5 @@ const LINUX_LLT: &[(u8, u16, u32)] = &[
     (32, 0x1e0, 0x4000aeaf),
     (32, 0x1e0, 0x4000afab),
 ];
+const LINUX_TX_BASES: [u16; 7] = [0x308, 0x318, 0x320, 0x328, 0x330, 0x338, 0x310];
+const LINUX_RX_BASE: u16 = 0x340;

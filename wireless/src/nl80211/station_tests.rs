@@ -14,6 +14,21 @@ const NAME: &str = "wlan-ext";
 const MAC: [u8; 6] = [2, 0x0e, 0x0e, 0x0e, 0x0e, 0x01];
 const AP: [u8; 6] = [2, 0xa1, 0xa1, 0xa1, 0xa1, 0xa1];
 
+fn smoke_nl80211_host_regulatory_flags_preserve_no_ir() -> TestResult {
+    use crate::reg::RegFlags;
+    // Literal NRGD -> nl80211.h flag values, without global policy mutation.
+    for (host, linux) in [(0, 0), (1, 0x10), (2, 8), (4, 0), (8, 0x80), (15, 0x98)] {
+        if station::regulatory_rule_flags(RegFlags::from_bits(host).unwrap()) != linux {
+            return TestResult::Fail("host regulatory flag translation lost a restriction");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_host_regulatory_flags_preserve_no_ir
+);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
     AddKey(u8, bool, Option<[u8; 6]>, u32),
@@ -55,6 +70,10 @@ impl Interface for ExtStub {
 
 #[async_trait::async_trait]
 impl crate::WirelessNetIface for ExtStub {
+    fn max_scan_ssids(&self) -> u8 {
+        16
+    }
+
     fn supports_userspace_mlme(&self) -> bool {
         true
     }
@@ -946,6 +965,7 @@ fn smoke_nl80211_ext_connect_owner_release() -> TestResult {
         cipher_suites: &[crate::CIPHER_SUITE_CCMP],
         scan_random_mac: false,
         connected: false,
+        max_scan_ssids: 0,
     };
     let parse = |a: &[u8]| parse_operation_caps(CONNECT, &attributes(a).unwrap(), caps, OWNER);
     let ok = matches!(

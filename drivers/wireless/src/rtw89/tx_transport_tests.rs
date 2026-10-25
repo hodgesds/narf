@@ -48,8 +48,15 @@ fn resource(count: &Arc<AtomicUsize>) -> Resource {
 fn smoke_rtw89_native_pci_headers() -> TestResult {
     let frame = frame(4090);
     for chip in [ChipId::Rtl8852A, ChipId::Rtl8852B, ChipId::Rtl8851B] {
-        let header =
-            prepare_header(chip, info(frame.len()), 0x3456, 0xab_1234_5000, &frame).unwrap();
+        let high = if chip == ChipId::Rtl8852B { 0xb } else { 0xab };
+        let header = prepare_header(
+            chip,
+            info(frame.len()),
+            0x3456,
+            (high << 32) | 0x1234_5000,
+            &frame,
+        )
+        .unwrap();
         if header.len() != 40
             || word(&header, 0) != (12 << 11 | 1 << 7)
             || word(&header, 4) != 0
@@ -57,7 +64,7 @@ fn smoke_rtw89_native_pci_headers() -> TestResult {
             || word(&header, 12) != 0x123
             || header[24..32] != [0x56, 0xb4, 0, 0, 0, 0, 0, 0]
             || header[32..34] != 4090u16.to_le_bytes()
-            || header[34..36] != (0x8001u16 | (0xab << 6)).to_le_bytes()
+            || header[34..36] != (0x8001u16 | ((high as u16) << 6)).to_le_bytes()
             || word(&header, 36) != 0x1234_5000
         {
             return TestResult::Fail("baseline TXWD/WP/address-info differs from Linux layout");

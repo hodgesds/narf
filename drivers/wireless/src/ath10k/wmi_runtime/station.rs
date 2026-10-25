@@ -5,13 +5,16 @@ use crate::ath10k::regulatory::Permission;
 
 #[derive(Debug)]
 pub(super) struct Peer {
-    permission: Permission,
-    bssid: [u8; 6],
+    pub(super) permission: Permission,
+    pub(super) bssid: [u8; 6],
     ids: [u64; 32],
     exchange_stage: u8,
-    associated: Option<StationAssociated>,
+    pub(super) associated: Option<StationAssociated>,
 }
 impl Peer {
+    pub(super) fn owns(&self, id: u16) -> bool {
+        id < 2048 && self.ids[usize::from(id) / 64] & (1u64 << (id % 64)) != 0
+    }
     pub(super) fn mapped(&self) -> Option<u16> {
         self.ids
             .iter()
@@ -477,8 +480,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub fn take_management_completion(&mut self) -> Option<ManagementCompletion> {
         self.management_done.pop_front()
     }
-    async fn station_progress(&mut self) -> Result<htt::Event, Error> {
+    pub(super) async fn station_progress(&mut self) -> Result<htt::Event, Error> {
         let event = self.htt.poll().await?;
+        self.station_event(event)
+    }
+    pub(super) fn station_event(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
         if let htt::Event::Wmi(bytes) = &event {
             if self.wire.dialect == Dialect::Tlv {
                 if let Some(reports) = management::completions(bytes)? {

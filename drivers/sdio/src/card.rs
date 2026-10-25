@@ -87,6 +87,9 @@ impl<R: Registers> Card<R> {
     pub fn host(&self) -> &SdhciHost {
         &self.host
     }
+    pub fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
+        self.controller.host_identity()
+    }
     pub fn function(&self, number: u8) -> Option<FunctionInfo> {
         if number > self.host.func_count {
             None
@@ -510,4 +513,4 @@ impl<R: Registers> SdioFunction for Card<R> {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "card_tests.rs"]
-mod tests;
+pub mod tests;

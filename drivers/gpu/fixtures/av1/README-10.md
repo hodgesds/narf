@@ -18,15 +18,11 @@ Both aomdec and FFmpeg/libaom reproduce every original sample. Tool archive
 hashes and build provenance are in `README.md`; regeneration is
 `regenerate_10.py --aomenc /path/to/aomenc --ffmpeg /path/to/ffmpeg`.
 
-`../../tests/vcn5/av1_10_check.py /path/to/mesa-26.2.4 --ffmpeg /path/to/ffmpeg`
-executes actual unchanged Mesa VCN5/version2 generic/codec/CDF/context/tier3/IB
-code and the actual Addrlib/format constructors. It compares all messages,
-all CDF bytes, complete IBs and every independent decoded pixel. A separate
-nonzero metadata case covers signed quant/filter/transform field placement;
-that synthetic metadata does not describe the lossless fixture. The host C
-scaffolding uses distinct symbolic NV12/P010 tags because unchanged codec
-code only tests equality with NV12; real P010 geometry is independently
-obtained from the actual format helpers, not from those arbitrary host tags.
+Native Rust tests exercise production message/CDF construction, IB ownership,
+P010 layout and nonzero quant/filter/transform metadata placement. Synthetic
+metadata does not describe the lossless fixture. The former source extraction
+and C-shim comparison pipeline is removed; internal agreement does not establish
+external Mesa/Addrlib conformance or physical codec operation.
 
 The Main8 fixture, parsed `Keyframe` API and encoder's dynamic 320 helper are
 unchanged. The actual depth-independent hardware context remains 36,688,896

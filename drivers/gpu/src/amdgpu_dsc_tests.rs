@@ -96,7 +96,6 @@ kernel_test_in!("drivers/gpu/dsc", dsc_matches_linux_vectors);
 
 const FRL_VECTORS: &str = include_str!("../tests/dcn401_dsc/frl_vectors.txt");
 
-/// The configuration, rate control and PPS words of one frl_harness.c line.
 fn run_frl_vector(input: &str) -> Option<String> {
     let n: alloc::vec::Vec<u32> = input
         .split_whitespace()

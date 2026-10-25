@@ -3256,6 +3256,7 @@ dependencies = [
  "narf-capabilities",
  "narf-crypto",
  "narf-drivers",
+ "narf-firmware",
  "narf-io",
  "narf-ipc",
  "narf-kernel-test",

@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw88/REFERENCE_FIXTURES.md.
 // Actual Linux mac.c firmware callbacks; reserved-page PCI DMA is a separate backend.
 const LINUX_FW: &[(u8, u8, u16, u32)] = &[
     (3, 0, 0x0, 0x0),

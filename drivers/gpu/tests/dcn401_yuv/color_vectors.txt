@@ -1,4 +1,4 @@
-# Linux DCN4 plane input transfer function, input CSC set and cursor color vectors; see check.sh and color_input.c.
+# Linux DCN4 plane input transfer function, input CSC set and cursor color vectors; retained regression snapshot.
 XR24 0 0 0 0 = 0 0 0 - 0 0 0 0 461f506c
 XR24 0 0 0 1 = 0 0 0 - 0 0 0 0 461f506c
 XR24 0 0 1 0 = 0 0 0 - 0 0 0 0 461f506c

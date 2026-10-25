@@ -39,6 +39,7 @@ pub mod bringup;
 pub(crate) mod channel;
 pub mod cmd;
 pub mod dma;
+mod firmware_assets;
 mod firmware_golden_tests;
 pub mod firmware_transport;
 pub mod fwdl;

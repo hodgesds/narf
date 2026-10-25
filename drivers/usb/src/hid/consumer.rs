@@ -852,7 +852,7 @@ pub fn __push_consumer_for_test(slot_id: u8, hub_port: Option<(usize, u8)>) {
 #[cfg(target_arch = "x86_64")]
 mod tests {
     use super::*;
-    use narf_input::{KeyCode, __reset_global_ring_for_test, init_global_ring, pop_key};
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_key, KeyCode};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     // ── Smoke 1: usage-code → KeyCode mapping for the top-10 consumer keys ──

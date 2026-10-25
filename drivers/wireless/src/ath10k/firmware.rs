@@ -29,8 +29,19 @@ impl From<BmiError> for Error {
 
 /// Production implementation opens capability-authorized immutable firmware
 /// registry blobs and copies their verified bytes into owned storage.
+#[allow(async_fn_in_trait)]
 pub trait Files {
     fn load(&mut self, name: &str) -> Result<Vec<u8>, Error>;
+    /// Wait only at an asset lookup checkpoint. The caller retains the same
+    /// completed ROM state; this must never retry a BMI transaction. Stores
+    /// without a staging service preserve their ordinary terminal Missing.
+    async fn wait_missing(&mut self) -> Result<(), Error> {
+        Err(Error::Missing)
+    }
+}
+
+pub(super) async fn staging_pause() {
+    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
 }
 
 pub(super) struct RegistryFiles {
@@ -44,24 +55,34 @@ impl RegistryFiles {
                 .ok_or(Error::Authority)?,
         })
     }
+    /// Probe may precede installation of the trusted loader. No registry cap
+    /// has been acquired yet, so waiting here cannot replace a revoked cap.
+    pub async fn wait_authority() -> Result<Self, Error> {
+        loop {
+            match Self::new() {
+                Ok(files) => return Ok(files),
+                Err(Error::Authority) if narf_firmware::trusted_loader_authority().is_none() => {
+                    staging_pause().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 impl Files for RegistryFiles {
     fn load(&mut self, name: &str) -> Result<Vec<u8>, Error> {
-        let cap = narf_firmware::open(name, &self.authority).map_err(|error| match error {
-            narf_firmware::FirmwareError::NotFound => Error::Missing,
-            narf_firmware::FirmwareError::OutOfMemory => Error::NoMemory,
-            _ => Error::Authority,
-        })?;
-        let view = narf_firmware::view_of(&cap).map_err(|_| Error::Authority)?;
-        if view.bytes.len() > 16 * 1024 * 1024 {
-            return Err(Error::InvalidContainer);
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(view.bytes.len())
-            .map_err(|_| Error::NoMemory)?;
-        bytes.extend_from_slice(view.bytes);
-        Ok(bytes)
+        let board = matches!(name.rsplit('/').next(), Some("board.bin" | "board-2.bin"));
+        crate::firmware_asset::load(&self.authority, name, 16 * 1024 * 1024, board)
+            .map(|asset| asset.bytes)
+            .map_err(|error| match error {
+                narf_firmware::FirmwareError::NotFound => Error::Missing,
+                narf_firmware::FirmwareError::OutOfMemory => Error::NoMemory,
+                _ => Error::Authority,
+            })
+    }
+    async fn wait_missing(&mut self) -> Result<(), Error> {
+        staging_pause().await;
+        Ok(())
     }
 }
 
@@ -209,6 +230,14 @@ impl Image {
         }
         Err(Error::Missing)
     }
+    pub(super) async fn wait_load(files: &mut impl Files, profile: Profile) -> Result<Self, Error> {
+        loop {
+            match Self::load(files, profile) {
+                Err(Error::Missing) => files.wait_missing().await?,
+                result => return result,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,6 +320,63 @@ pub fn select_board<'a>(
 }
 
 const HI: u32 = 0x400800;
+
+fn load_board(
+    files: &mut impl Files,
+    profile: Profile,
+    names: &[String],
+) -> Result<Vec<u8>, Error> {
+    match files.load(&format!("{}/board-2.bin", profile.directory)) {
+        Ok(bytes) => match select_board(&bytes, names, false) {
+            Ok(board) => Ok(board.to_vec()),
+            Err(Error::BoardNotFound) => files.load(&format!("{}/board.bin", profile.directory)),
+            Err(error) => Err(error),
+        },
+        Err(Error::Missing) => files.load(&format!("{}/board.bin", profile.directory)),
+        Err(error) => Err(error),
+    }
+}
+
+async fn wait_board(
+    files: &mut impl Files,
+    profile: Profile,
+    names: &[String],
+) -> Result<Vec<u8>, Error> {
+    loop {
+        match load_board(files, profile, names) {
+            Err(Error::Missing) => files.wait_missing().await?,
+            result => return result,
+        }
+    }
+}
+
+async fn wait_extended_board(
+    files: &mut impl Files,
+    profile: Profile,
+    name: String,
+) -> Result<Vec<u8>, Error> {
+    loop {
+        match files.load(&format!("{}/board-2.bin", profile.directory)) {
+            Ok(bytes) => {
+                // A complete signed container for other boards is not a
+                // calibration receipt for the discovered extended identity.
+                match select_board(&bytes, core::slice::from_ref(&name), true) {
+                    Ok(board) => return Ok(board.to_vec()),
+                    Err(Error::BoardNotFound) => {
+                        files.wait_missing().await.map_err(|error| match error {
+                            Error::Missing => Error::BoardNotFound,
+                            error => error,
+                        })?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(Error::Missing) => files.wait_missing().await?,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Execute ROM-side boot preparation using the existing DMA-backed BMI.
 /// No DONE occurs here: the next owned HIF stage must publish all live CE
 /// buffers and arrange reset/IRQ teardown before firmware is permitted to run.
@@ -309,16 +395,9 @@ pub(super) async fn prepare<T: Transport>(
     bmi.fast_download(profile.patch, otp_bytes).await?;
     let otp = OtpIdentity::from_result(bmi.execute(profile.patch, 0x10).await?);
     let names = board_names(identity, otp, variant)?;
-    let board2 = files.load(&format!("{}/board-2.bin", profile.directory));
-    let board = match board2 {
-        Ok(bytes) => match select_board(&bytes, &names, false) {
-            Ok(board) => board.to_vec(),
-            Err(Error::BoardNotFound) => files.load(&format!("{}/board.bin", profile.directory))?,
-            Err(error) => return Err(error),
-        },
-        Err(Error::Missing) => files.load(&format!("{}/board.bin", profile.directory))?,
-        Err(error) => return Err(error),
-    };
+    // Keep this exact completed OTP identity while a signed board arrives.
+    // Restarting prepare would repeat PLL/OTP execution on the live target.
+    let board = wait_board(files, profile, &names).await?;
     if board.len() != profile.board + profile.board_tail {
         return Err(Error::Calibration);
     }
@@ -351,13 +430,12 @@ pub(super) async fn prepare<T: Transport>(
         if extended_id != 0 {
             let chip = otp.unwrap().chip;
             let name = format!("bus=pci,bmi-chip-id={chip},bmi-eboard-id={extended_id}");
-            let bytes = files.load(&format!("{}/board-2.bin", profile.directory))?;
-            let data = select_board(&bytes, &[name], true)?;
+            let data = wait_extended_board(files, profile, name).await?;
             if data.len() != profile.extended_board {
                 return Err(Error::Calibration);
             }
             let address = base.checked_add(0x3000).ok_or(Error::Address)?;
-            bmi.write_memory(address, data).await?;
+            bmi.write_memory(address, &data).await?;
         }
     }
     bmi.fast_download(profile.patch, otp_bytes).await?;
@@ -409,5 +487,52 @@ mod metadata_tests {
     kernel_test_in!(
         "drivers/wireless/ath10k",
         smoke_ath10k_installed_board_metadata_replays
+    );
+}
+
+#[cfg(feature = "kernel-test")]
+mod asset_authority_tests {
+    use super::*;
+    use crate::firmware_asset::tests::install;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_ath10k_board_data_requires_signer_and_current_registry_invocation() -> TestResult {
+        let (write, read) = narf_firmware::bootstrap_authority();
+        let mut files = RegistryFiles { authority: read };
+        for name in ["ath10k/narf-test/board-2.bin", "ath10k/narf-test/board.bin"] {
+            match install(&write, name, b"inert-board", false) {
+                Ok(()) => {
+                    if files.load(name).is_ok() {
+                        return TestResult::Fail("unsigned developer ath10k calibration admitted");
+                    }
+                }
+                Err(narf_firmware::FirmwareError::UnsignedRejected) => {}
+                Err(_) => return TestResult::Fail("unexpected board fixture installation failure"),
+            }
+            install(&write, name, b"inert-board", true).unwrap();
+            if files.load(name).as_deref() != Ok(b"inert-board".as_slice()) {
+                return TestResult::Fail("signed exact ath10k board copy changed");
+            }
+        }
+        let executable = "ath10k/narf-test/firmware-6.bin";
+        match install(&write, executable, b"inert-code", false) {
+            Ok(()) => {
+                if files.load(executable).as_deref() != Ok(b"inert-code".as_slice()) {
+                    return TestResult::Fail("ath10k developer executable policy changed");
+                }
+            }
+            Err(narf_firmware::FirmwareError::UnsignedRejected) => {}
+            Err(_) => {
+                return TestResult::Fail("unexpected executable fixture installation failure")
+            }
+        }
+        read.revoke();
+        if files.load("ath10k/narf-test/board-2.bin").is_ok() {
+            return TestResult::Fail("ath10k firmware read ignored current registry epoch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/ath10k/firmware",
+        smoke_ath10k_board_data_requires_signer_and_current_registry_invocation
     );
 }

@@ -1,7 +1,6 @@
 //! DisplayPort MST sideband messaging and bandwidth math, ported from
-//! Linux's drm_dp_mst_topology.c / drm_dp_helper.c and checked against
-//! them byte for byte (`tests/dp_mst/check.sh` builds Linux's functions on
-//! the host and writes the reference vectors this module's test replays).
+//! Linux's drm_dp_mst_topology.c / drm_dp_helper.c. Native Rust tests
+//! exercise production paths with retained static regression fixtures.
 //!
 //! - `Header` is drm_dp_sideband_msg_hdr with its CRC-4 encode/decode;
 //! - `Request::encode` is drm_dp_encode_sideband_req;

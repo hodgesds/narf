@@ -16,6 +16,9 @@ pub enum Family {
 pub trait Fullmac: Send {
     const FAMILY: Family;
     const EXTERNAL_CLM: bool;
+    /// Exact attached chip profile supports the firmware's 5 GHz channel set.
+    /// The SDIO CYW43439 profile remains 2.4 GHz only.
+    const BAND_5GHZ: bool = false;
     fn command<'a>(
         &'a mut self,
         direction: Direction,
@@ -24,6 +27,10 @@ pub trait Fullmac: Send {
         maximum: usize,
     ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + 'a;
     fn configure_bus(&mut self) -> impl Future<Output = Result<(), Error>> + Send;
+    /// Consumed transport records, bounded per call. Positive progress may
+    /// leave more RX/events beyond the budget. Zero requires an actual current
+    /// FIFO/completion-ring idle observation, not an empty decoded host queue;
+    /// queued events/data remain available to their pop methods.
     fn poll(&mut self) -> Result<usize, Error>;
     fn fail(&mut self);
     fn pop_event(&mut self) -> Option<Event>;

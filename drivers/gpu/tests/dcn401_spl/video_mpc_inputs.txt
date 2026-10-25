@@ -1,4 +1,4 @@
-# 4:2:0 planes split into MPC slices (check.sh --generate-video-mpc):
+# 4:2:0 planes split into MPC slices:
 # format src_x src_y src_w src_h dst_x dst_y dst_w dst_h stream_w stream_h odm_x odm_w rotation mirror alpha mpc_index mpc_count
 # format: 8 = NV12/NV21 (SPL_PIXEL_FORMAT_420BPP8), 10 = P010 (420BPP10).
 8 0 0 3840 2160 0 0 3840 2160 3840 2160 0 3840 0 0 0 0 2

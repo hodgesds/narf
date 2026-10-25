@@ -1,4 +1,4 @@
-//! Private RTL8822CE firmware-only PCI owner; Linux rtw88/pci.c/mac.c/util.c.
+//! Private RTL8821CE/RTL8822CE firmware-only PCI owner; Linux rtw88/pci.c/mac.c/util.c.
 //! All native rings are retained before BME. MAC TX/RX and IRQ stay closed.
 use super::{
     firmware_transport::Error,
@@ -9,12 +9,19 @@ use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent_masked, DmaBuffer};
 use narf_lib::id::DomainId;
+#[path = "pci_packet.rs"]
+mod packet;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Allocated,
     Configuring,
     Active,
     Parked,
+    MacPrepared,
+    PhyTablesPrepared,
+    Commands,
+    Calibrated,
+    Packets,
     Terminal,
 }
 struct Tx {
@@ -45,10 +52,16 @@ pub(super) struct Native {
     beacon: Option<u32>,
     state: State,
     published: bool,
+    command_buffer: Option<DmaBuffer>,
+    command_ring: super::command::Ring,
+    packet: Option<super::packet_core::Core>,
+    packet_gate: Option<super::power_policy::Gate>,
+    mailbox_cursor: u8,
+    mailbox_pending: bool,
 }
 impl core::fmt::Debug for Native {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Rtw8822ceFirmwarePci")
+        f.debug_struct("Rtw88FirmwarePci")
             .field("address", &self.device.addr)
             .field("state", &self.state)
             .finish_non_exhaustive()
@@ -115,7 +128,7 @@ fn dma_address(memory: &DmaBuffer, needed: usize) -> Result<u32, Error> {
 }
 impl Native {
     /// # Safety
-    /// The exact RTL8822CE just completed the real chip/cut card-disable→enable
+    /// The exact RTL8821CE/RTL8822CE completed the real chip/cut card-disable→enable
     /// cold power flow and factory EFUSE stage, exclusively under this cap.
     /// BME is parked; no previous firmware/packet/reset owner may exist.
     /// Coherent addresses must be physical/identity-mapped for this PCI device.
@@ -125,7 +138,7 @@ impl Native {
         mmio: MmioRegion,
     ) -> Result<Self, Error> {
         if device.id.vendor != 0x10ec
-            || device.id.device != 0xc822
+            || !matches!(device.id.device, 0xc821 | 0xc822)
             || mmio.len < 0x170c
             || narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain
         {
@@ -141,6 +154,12 @@ impl Native {
             beacon: None,
             state: State::Allocated,
             published: false,
+            command_buffer: None,
+            command_ring: super::command::Ring::default(),
+            packet: None,
+            packet_gate: None,
+            mailbox_cursor: 0,
+            mailbox_pending: false,
         };
         owner
             .tx
@@ -212,10 +231,19 @@ impl Native {
         width: usize,
         operation: impl FnOnce(MmioRegion) -> T,
     ) -> Result<T, Error> {
-        if !matches!(self.state, State::Configuring | State::Active) {
+        if !matches!(
+            self.state,
+            State::Configuring
+                | State::Active
+                | State::MacPrepared
+                | State::PhyTablesPrepared
+                | State::Commands
+                | State::Calibrated
+                | State::Packets
+        ) {
             return Err(Error::State);
         }
-        let active = self.state == State::Active;
+        let active = matches!(self.state, State::Active | State::Commands | State::Packets);
         let result = crate::rtw88::pci_park::invoke(&self.cap, || {
             self.command(active)?;
             if usize::from(reg) % width != 0 || u64::from(reg) + width as u64 > self.mmio.len {
@@ -232,7 +260,8 @@ impl Native {
     }
     fn registers(&mut self, beacon: u32) -> Result<(), Error> {
         self.published = true; // before any base can be visible to the device
-        self.write8(0x303, 0xff)?;
+        let config = self.read8(0x303)?;
+        self.write8(0x303, config | 0xf7)?;
         let cr = self.read8(0x100)?;
         self.write8(0x100, cr & !0xcf)?;
         for register in [0xb0, 0xb8, 0x10b8] {
@@ -241,7 +270,7 @@ impl Native {
                 return Err(Error::Prerequisite);
             }
         }
-        if self.read8(0x303)? != 255 || self.read8(0x100)? & 0xcf != 0 {
+        if self.read8(0x303)? & 0xf7 != 0xf7 || self.read8(0x100)? & 0xcf != 0 {
             return Err(Error::Prerequisite);
         }
         self.write32(0x308, beacon)?;
@@ -284,12 +313,9 @@ impl Native {
         Ok(())
     }
     fn activate(&mut self) -> Result<(), Error> {
-        // Firmware backup subsequently enables HCI TXDMA/TXDMA only. Leave
-        // every PCI queue stopped except its exclusively retained beacon BD.
-        self.write8(0x303, 0xf7)?;
-        if self.read8(0x303)? != 0xf7 {
-            return Err(Error::Prerequisite);
-        }
+        // The source303|f7 value is PCI DMA configuration, not a queue
+        // pause map. Empty producer indices and CR's MAC/RX gates constrain
+        // the retained firmware-only publication; BME is enabled last.
         use narf_bus::pci::cmd::BUS_MASTER;
         crate::rtw88::pci_park::invoke(&self.cap, || {
             self.command(false)?;
@@ -316,10 +342,11 @@ impl Native {
         Err(Error::Timeout)
     }
     fn park(&mut self) -> Result<(), Error> {
-        self.write8(0x303, 0xff)?;
+        let config = self.read8(0x303)?;
+        self.write8(0x303, config | 0xf7)?;
         let cr = self.read8(0x100)?;
         self.write8(0x100, cr & !0xcf)?;
-        if self.read8(0x303)? != 255 || self.read8(0x100)? & 0xcf != 0 {
+        if self.read8(0x303)? & 0xf7 != 0xf7 || self.read8(0x100)? & 0xcf != 0 {
             return Err(Error::Prerequisite);
         }
         crate::rtw88::pci_park::invoke(&self.cap, || {
@@ -345,7 +372,15 @@ unsafe impl Registers for Native {
         }
         self.state = State::Configuring;
         self.beacon = Some(beacon);
-        let result = self.registers(beacon).and_then(|()| self.activate());
+        let result = self
+            .registers(beacon)
+            .and_then(|()| self.activate())
+            .and_then(|()| {
+                // Linux main.c::rtw_chip_efuse_enable requests this report before
+                // loading/starting the MCU. It binds later antenna/NSS selection
+                // to a real response from this exact retained firmware generation.
+                self.write8(0x1a0, 0xfd)
+            });
         if result.is_err() {
             self.state = State::Terminal;
         }
@@ -408,6 +443,344 @@ unsafe impl Registers for Native {
         }
         result
     }
+    fn begin_mac(&mut self) -> Result<(), Error> {
+        if self.state != State::Parked {
+            return Err(Error::State);
+        }
+        self.state = State::Configuring;
+        let result = (|| {
+            // All accesses still invoke the retained current PCI capability.
+            // Reuse only the actual firmware-ready/parked native generation.
+            if self.read16(0x80)? & 0xcfff != 0xc078
+                || self.read8(0x303)? & 0xf7 != 0xf7
+                || self.read8(0x100)? & 0xcf != 0
+            {
+                return Err(Error::Prerequisite);
+            }
+            for register in [0xb0, 0xb8, 0x10b8] {
+                if self.read32(register)? != 0 {
+                    return Err(Error::Prerequisite);
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.state = State::Terminal;
+        }
+        result
+    }
+    fn finish_mac(&mut self) -> Result<(), Error> {
+        if self.state != State::Configuring {
+            return Err(Error::State);
+        }
+        let result = (|| {
+            if self.read8(0x303)? & 0xf7 != 0xf7
+                || self.read8(0x100)? & 0xcf != 0
+                || self.read8(0x522)? != 255
+            {
+                return Err(Error::Prerequisite);
+            }
+            for register in [0xb0, 0xb8, 0x10b8] {
+                if self.read32(register)? != 0 {
+                    return Err(Error::Prerequisite);
+                }
+            }
+            Ok(())
+        })();
+        self.state = if result.is_ok() {
+            State::MacPrepared
+        } else {
+            State::Terminal
+        };
+        result
+    }
+    fn begin_phy(&mut self) -> Result<(), Error> {
+        if self.state != State::MacPrepared {
+            return Err(Error::State);
+        }
+        let extent = if self.device.id.device == 0xc821 {
+            0x2000
+        } else {
+            0x5000
+        };
+        if self.mmio.len < extent {
+            return Err(Error::Unsupported);
+        }
+        self.state = State::Configuring;
+        if self.read8(0x100)? & 0xcf != 0 || self.read8(0x303)? & 0xf7 != 0xf7 {
+            self.state = State::Terminal;
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
+    }
+    fn finish_phy(&mut self) -> Result<(), Error> {
+        self.finish_mac()?;
+        self.state = State::PhyTablesPrepared;
+        Ok(())
+    }
+    fn begin_commands(&mut self) -> Result<(), Error> {
+        if self.state != State::PhyTablesPrepared || self.command_buffer.is_some() {
+            return Err(Error::State);
+        }
+        let result = (|| {
+            // Allocate and retain before BME can be set. This buffer is separate
+            // from the pinned firmware beacon bounce and all ordinary packets.
+            self.command_buffer = Some(self.allocate(80)?);
+            let tx = self.tx.first().ok_or(Error::State)?;
+            let base = dma_address(&tx.memory, tx.depth * 16)?;
+            if self.read32(0x1320)? != base
+                || self.read16(0x1328)? & 0xfff != 128
+                || self.read32(0x132c)? & 0x0fff_0fff != 0
+                || self.read8(0x303)? & 0xf7 != 0xf7
+                || self.read8(0x100)? & 0xcf != 0
+                || self.read8(0x522)? != 255
+            {
+                return Err(Error::Prerequisite);
+            }
+            for reg in [0xb0, 0xb8, 0x10b8] {
+                if self.read32(reg)? != 0 {
+                    return Err(Error::Prerequisite);
+                }
+            }
+            // Only the H2C producer can advance. All ordinary ring indices
+            // remain empty; MAC TX/RX and HCI RXDMA are disabled.303 is source
+            // PCI DMA configuration, not an inferred queue-pause bitmap.
+            self.write8(0x100, 0x33)?;
+            crate::rtw88::pci_park::invoke(&self.cap, || {
+                self.command(false)?;
+                barrier();
+                narf_bus::pci::set_command(&self.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
+                    .map_err(|_| Error::Access)?;
+                self.command(true)
+            })
+            .map_err(|_| Error::Access)??;
+            self.state = State::Commands;
+            if self.read8(0x100)? != 0x33 || self.read8(0x303)? & 0xf7 != 0xf7 {
+                return Err(Error::Prerequisite);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.state = State::Terminal;
+        }
+        result
+    }
+    fn submit_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
+        if self.state != State::Commands || self.command_ring.pending() {
+            return Err(Error::State);
+        }
+        let result = (|| {
+            let index = self.read32(0x132c)?;
+            if index == u32::MAX {
+                return Err(Error::Gone);
+            }
+            // Occupancy is committed before touching any reusable byte; errors
+            // and cancellation cannot treat an ambiguous descriptor as idle.
+            let (slot, next) = self.command_ring.reserve(index)?;
+            let cap = self.cap;
+            crate::rtw88::pci_park::invoke(&cap, || {
+                self.command(true)?;
+                let payload = self.command_buffer.as_mut().ok_or(Error::State)?;
+                let base = dma_address(payload, 80)?;
+                let descriptor = super::command::descriptor();
+                // SAFETY: exact retained80-byte mapping, single current CPU owner;
+                // the preceding hardware head proves the old command has retired.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        descriptor.as_ptr(),
+                        payload.cpu_mut_ptr_at::<u8>(0),
+                        48,
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        packet.as_ptr(),
+                        payload.cpu_mut_ptr_at::<u8>(48),
+                        32,
+                    );
+                }
+                payload.sync(0, 80);
+                let tx = self.tx.first().ok_or(Error::State)?;
+                let offset = u64::from(slot) * 16;
+                // SAFETY: producer is modulo128 and retained H2C BD storage is
+                //128×16 bytes. Both segments reference this retained command.
+                unsafe {
+                    let words = tx.memory.cpu_mut_ptr_at::<u32>(offset);
+                    words.write_volatile((48u32 | 1 << 16).to_le());
+                    words.add(1).write_volatile(base.to_le());
+                    words.add(2).write_volatile(32u32.to_le());
+                    words.add(3).write_volatile((base + 48).to_le());
+                }
+                tx.memory.sync(offset as usize, 16);
+                barrier();
+                Ok(())
+            })
+            .map_err(|_| Error::Access)??;
+            self.write16(0x132c, next)
+        })();
+        if result.is_err() {
+            self.state = State::Terminal;
+        }
+        result
+    }
+    fn poll_h2c(&mut self) -> Result<bool, Error> {
+        if self.state != State::Commands || !self.command_ring.pending() {
+            return Err(Error::State);
+        }
+        let result = (|| {
+            let index = self.read32(0x132c)?;
+            if index == u32::MAX {
+                return Err(Error::Gone);
+            }
+            if !self.command_ring.poll(index)? {
+                return Ok(false);
+            }
+            barrier(); // exact terminal DMA receipt precedes CPU buffer reuse.
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.state = State::Terminal;
+        }
+        result
+    }
+    fn park_radio(&mut self) -> Result<(), Error> {
+        if self.state != State::Commands || self.command_ring.pending() {
+            return Err(Error::State);
+        }
+        let result = (|| {
+            self.park()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.state = State::Terminal;
+        }
+        result
+    }
+    fn finish_radio(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
+        if self.state != State::Configuring {
+            return Err(Error::State);
+        }
+        let result = (|| {
+            gate.current().map_err(Error::Power)?;
+            self.finish_mac()?;
+            self.packet_gate = Some(gate);
+            self.state = State::Calibrated;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.state = State::Terminal;
+        }
+        result
+    }
+    fn station_allowed(&mut self) -> Result<(), Error> {
+        if !matches!(self.state, State::Calibrated | State::Packets) {
+            return Err(Error::State);
+        }
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.command(self.state == State::Packets)?;
+            self.check_packet_permission()
+        })
+        .map_err(|_| Error::Access)?
+    }
+    fn station_own(&mut self) -> Result<[u8; 6], Error> {
+        self.station_allowed()?;
+        Ok(self.packet_gate.as_ref().ok_or(Error::State)?.own())
+    }
+    fn mailbox_ready(&mut self) -> Result<bool, Error> {
+        if !matches!(self.state, State::Calibrated | State::Packets) || self.mailbox_pending {
+            return Err(Error::State);
+        }
+        let state = self.read8(0x1cc)?;
+        if state == 255 {
+            return Err(Error::Gone);
+        }
+        Ok(state & (1 << self.mailbox_cursor) == 0)
+    }
+    fn mailbox_submit(&mut self, words: [u8; 8]) -> Result<(), Error> {
+        if !self.mailbox_ready()? {
+            return Err(Error::State);
+        }
+        let cleanup = words == [1, 0, 0, 0, 0, 0, 0, 0];
+        if !cleanup {
+            self.check_packet_permission()?;
+        }
+        self.mailbox_pending = true;
+        let result = (|| {
+            let ext = u32::from_le_bytes(words[4..].try_into().unwrap());
+            let body = u32::from_le_bytes(words[..4].try_into().unwrap());
+            self.write32(0x1f0 + u16::from(self.mailbox_cursor) * 4, ext)?;
+            if !cleanup {
+                self.check_packet_permission()?;
+            }
+            self.write32(0x1d0 + u16::from(self.mailbox_cursor) * 4, body)
+        })();
+        if result.is_err() {
+            self.state = State::Terminal;
+        }
+        result
+    }
+    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
+        if !matches!(self.state, State::Calibrated | State::Packets) || !self.mailbox_pending {
+            return Err(Error::State);
+        }
+        let state = self.read8(0x1cc)?;
+        if state == 255 {
+            return Err(Error::Gone);
+        }
+        if state & (1 << self.mailbox_cursor) != 0 {
+            return Ok(false);
+        }
+        barrier();
+        self.mailbox_pending = false;
+        self.mailbox_cursor = (self.mailbox_cursor + 1) % 4;
+        Ok(true)
+    }
+    fn mailbox_pending(&self) -> bool {
+        self.mailbox_pending
+    }
+    fn packet_prepare(
+        &mut self,
+        own: [u8; 6],
+        mac_id: u8,
+    ) -> Result<(), super::packet_core::Error> {
+        self.prepare_packets(own, mac_id)
+    }
+    fn packet_start(&mut self) -> Result<(), super::packet_core::Error> {
+        self.start_packets()
+    }
+    fn packet_ready(&self) -> bool {
+        self.packets_ready()
+    }
+    fn packet_submit(
+        &mut self,
+        frame: &[u8],
+        report: bool,
+    ) -> Result<u64, super::packet_core::Error> {
+        self.submit_packet(frame, report)
+    }
+    fn packet_poll(&mut self) -> Result<super::packet_core::Step, super::packet_core::Error> {
+        self.poll_packets()
+    }
+    fn packet_stop(&mut self) -> Result<(), super::packet_core::Error> {
+        self.stop_packets()
+    }
+    fn parked_cpu<T>(&mut self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        if self.state != State::Configuring {
+            return Err(Error::State);
+        }
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.command(false)?;
+            operation()
+        })
+        .map_err(|_| Error::Access)?
+    }
+}
+impl Native {
+    fn check_packet_permission(&self) -> Result<(), Error> {
+        self.packet_gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .current()
+            .map_err(Error::Power)
+    }
 }
 impl Drop for Native {
     fn drop(&mut self) {
@@ -415,6 +788,7 @@ impl Drop for Native {
             core::mem::forget(core::mem::take(&mut self.tx));
             core::mem::forget(self.rx.take());
             core::mem::forget(core::mem::take(&mut self.buffers));
+            core::mem::forget(self.command_buffer.take());
         }
     }
 }

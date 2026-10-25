@@ -1,8 +1,8 @@
 # ath9k — Specification
 
-> Status: **AR9285 reset/EEPROM and inactive baseband preparation
-> implemented; radio software incomplete.** No network interface, PHY
-> activation or packet DMA is enabled.
+> Status: **AR9285 retained channel1 legacy station profile implemented through
+> kernel DHCP and bidirectional IP.** Physical EEPROM, calibration, RF and DMA
+> acceptance remains pending. Wider channels, recovery and other chips are separate.
 
 ## 1. Purpose & scope
 
@@ -26,7 +26,9 @@ AR9285-specific writes follow a checked silicon revision.
 - `probe()` reads the complete factory calibration image after Linux's
   bounded power-on/warm-reset sequence. It retains the controller instead
   of constructing and immediately discarding an `Arc`.
-- `with_controller()` provides read-only `Ath9k` inspection.
+- `with_controller()` provides read-only `Ath9k` inspection; it returns `None`
+  while the retained async mutex is busy. Address ownership remains retained
+  independently of that inspection lock, including after a failed probe.
 - `Ath9k::identity` exposes the silicon revision, validated unicast MAC,
   EEPROM version, factory regulatory-domain values, and chain masks.
 - `Ath9k::calibration()` exposes the complete 376-byte normalized
@@ -37,12 +39,52 @@ AR9285-specific writes follow a checked silicon revision.
   EEPROM modal/RF board values, the interpolated detector/PDADC table, and
   legacy20 CCK/OFDM/HT20 target-power registers limited by factory CTL and
   an explicit zero-dBm ceiling.
+  It includes native 20MHz mode/timeout overrides, single RX/calibration/TX
+  chain masks, RF mode, frequency-dependent delta slope and EEPROM spur
+  filtering/mask programming after the full INI tables.
   It records inactive register preparation, not channel authorization or
   a calibrated/operational PHY.
 - Errors distinguish absent/mismatched silicon, timeout, invalid EEPROM
   magic/length/checksum/version, invalid factory identity and
   `BadCalibration` for malformed or unusable detector intercepts, target
   power piers, CTL edges or unsupported factory regulatory identity.
+  `Policy` rejects missing/unqualified live channel permission and `BadState`
+  rejects an active engine or a repeated calibration attempt.
+- `calibrate_radio()` is the channel1/full-rate/20MHz continuation.
+  Probe queues the same retained owner in executor context and drives background
+  provisioning via `drive_scheduled` across 120 attempts with 500 ms intervals. It obtains the
+  shared authenticated regulatory policy, requires `trusted_net_authority`, intersects every overlapping rule
+  and the full occupied span, and requires the initial nonnegative budget
+  (at most20dBm) with no DFS/indoor-only qualification assumption. Factory
+  CTL, target powers and antenna reduction constrain every written rate before
+  PHY activation. Provisioning failures before the attempt leave it retryable;
+  a started, failed or dropped attempt cannot be replayed or replaced without
+  an independently proved reset.
+- `Ath9k::radio_state()` reports `New`, `Running`, `Ready` or `Failed`;
+  `radio_calibration()` returns country, frequency and selected host ceiling,
+  native PA offset, IQ correction and measured/sanitized noise floor only
+  after all phases complete. Those diagnostics do not bypass the later
+  packet owner. No factory key, country or transmit budget
+  is inferred from an unauthenticated AP.
+- The same retained calibration owner continues through MAC/PCU preparation,
+  complete hardware-key-cache clearing and owned non-EDMA TX/RX allocation.
+  `calibrate_radio()` can continue an already `Ready` calibration receipt when
+  packet preparation has not started; it never replays a partial packet attempt.
+  Native allocation and register/configuration access execute inside current
+  PCI capability invocation. Unsupported per-domain IOMMU mappings are refused.
+- The retained `station::Radio` and its `interface::Device` implement the
+  public wireless/netdev paths without replacing the packet owner. The initial
+  profile is passive channel1/2412MHz, 20MHz, legacy basic1Mbps, Open or
+  WPA2-PSK/CCMP with host MLME/RSNA/crypto. Entropy failure rejects authentication.
+  Original observed RSN/RSNX bodies reach shared security admission. Carrier,
+  controlled-port state and exact native terminal TX receipts precede kernel
+  DHCP and Ethernet/IP delivery. The exact transmitted M4 bytes must match
+  the retained reply before key/port commit.
+- Synchronous bounded packet progression services polled RX/TX with hardware
+  IRQs masked. Every transmit rechecks current signed policy and factory
+  RF-silent GPIO state; metadata and packet publication share terminal closure.
+  Disconnect, cancellation, peer loss, policy loss or ambiguous completion
+  closes the initial profile permanently and retains every published mapping.
 
 The former reset-only `Ath9k::new` constructor is removed. Construction
 goes through the PCI authority and identification path. Successful probe
@@ -50,7 +92,7 @@ records hardware identity and then programs Linux's AR9285 2GHz HT20
 mode/gain/common tables (655 writes), ordered PLL/analog shift setup and RF
 synth reference registers with bounded responsive settling delays. All
 four gain-table combinations use the actual factory TXGAIN and SYNTH9
-selection. It does not register a netdev or imply a WLAN.
+selection. This inactive preparation alone does not authorize a WLAN.
 The modal stage programs switch controls, IQ coefficients, RX attenuation
 and margins, EEPROM antenna-diversity controls, versioned OB/DB analog
 fields, settling/ADC/XPA/RX timing, CCA thresholds and baseband power scale.
@@ -72,9 +114,23 @@ reduction saturates rather than wrapping an unsigned zero ceiling upward.
 The pure immutable factory-domain resolver/table is shared with ath10k;
 no firmware transport or runtime driver is used to resolve EEPROM identity.
 
+The retained live continuation applies Linux's selected SerDes/PCIe wake
+sequence, activates only the prepared PHY, waits for synth settling, and runs
+AGC/filter/carrier-leakage calibration with its gain-table retry, normal-board
+PA calibration (high-power boards use Linux's skip), initial noise-floor
+load/measurement and single-sample IQ correction. Every wait is bounded and
+uses the async timer bridge with no IRQ-disabling guard across await. Hardware
+self-clearing completion precedes report publication; an invalid measurement
+is rejected rather than qualifying stale factory IQ values. A legitimate
+full-width correlation of -1 is distinguished from removal through an
+immutable current silicon-identity read. Error/drop records failure without
+MMIO cleanup. The same `Arc<Mutex<Ath9k>>` and factory image survive it.
+
 Native register reads and writes validate complete aligned BAR extents and
 execute inside `Cap::invoke`; revoked reads return all ones, revoked writes
 are refused, and preparation cannot report success after authority loss.
+Initial parking and the calibration's PCI parking read also execute inside
+current capability invocation, including the actual configuration accesses.
 
 ## 4. Invariants
 
@@ -83,10 +139,22 @@ are refused, and preparation cannot report success after authority loss.
   writes are restored; MMIO follows that readback. Additional
   matched singleton radios are parked with BME/memory decode off and rejected.
   Repeated dispatch of the owned address fails before parking.
-- BME remains disabled throughout identification and baseband preparation.
-  PHY activation, MAC RX, all ten TX queues and interrupts remain disabled;
-  no unowned DMA rings can run. The common table's cleared DIAG_SW is
-  followed by restored RX_ABORT/RX_DIS before any PHY activation.
+- BME, MAC RX, all ten TX queues and interrupts remain disabled throughout
+  identification, preparation and calibration. PHY activation is confined to
+  the policy-bound calibration continuation; packet rings are allocated only
+  after its complete retained receipt. The common table's cleared DIAG_SW is followed by restored
+  RX_ABORT/RX_DIS, which remain set through calibration.
+- Packet start requires complete aligned 32-bit DMA extents and verified ring
+  programming before BME activation. TX status is terminal only after descriptor
+  completion and queue idle; RX completion is acquired before status/payload.
+  A null-terminated RX list retains its last consumed descriptor until a
+  successor completes. Stop parks all queues, MAC RX and BME but does not
+  prove memory reclaimable; published mappings remain retained on drop.
+- Hardware key-cache entries remain invalid. Protected KeyMiss frames with no
+  other errors may lack FrameOK and reach software CCMP authentication;
+  unprotected frames require FrameOK. Neither path bypasses MIC/replay checks.
+  Consumed error/status frames do not establish an RX-idle fence. M4 commit and
+  staged plaintext delivery require a real native idle observation.
 - Register and EEPROM waits use the scheduler's bounded responsive wait;
   reset settling delays are measured in time, not CPU iteration counts.
 - EEPROM reads trigger by reading `0x2000 + word * 4` and accept data only
@@ -107,59 +175,66 @@ local Linux `ath9k/eeprom.h`.
 
 ## 6. Dependencies
 
-PCI authority and MMIO come from `bus/`, retained state from `lib/`, and
-responsive waits from scheduler/time. No packet-DMA allocation is made.
+PCI authority and MMIO come from `bus/`, coherent masked DMA from `io/`,
+retained state from `lib/`, and responsive waits from scheduler/time.
+Shared `wireless/` supplies policy, MLME, RSNA and packet keys; `crypto/`
+supplies fallible entropy and AES-CCM, and `net/` owns DHCP/Ethernet delivery.
 
 ## 7. Stage assignment
 
-Stage 5 identification/baseband prerequisites. Traced smokes exercise the live
+Stage 5 initial retained station profile. Traced smokes exercise the live
 identification helper, complete EEPROM extent, reset register order,
 endianness/checksum/version validation and invalid/busy hardware cases.
 Independent hashes from Linux cover every address/value pair for all four
 production INI choices; fixtures also verify PLL/RF values, analog delays,
 BAR bounds and that packet/PHY engines stay disabled.
-Complete modal/RF write traces match independently compiled local Linux
-`eeprom_4k.c` functions and register/EEPROM definitions for four EEPROM,
-modal-version, HT40 and diversity cases. Native MMIO tests revoke an actual
-object-table epoch before deliberately invalid BAR addresses, proving no
-post-revocation read/write occurs.
-Detector fixtures compare every register write with independently compiled
-Linux `eeprom.c` interpolation and `eeprom_4k.c` table-programming functions.
-They cover one/two gains, exact/interpolated/clamped frequency piers, legacy
-overlap sourcing, invalid calibration without partial table publication, and
-the actual INI/modal/detector/rate preparation chain with PHY and DMA disabled.
-Rate fixtures compile the complete Linux target-power and 4K TX-power
-generators and compare every rate-register value across exact/interpolated/
-clamped piers, CTL flags, specific/world regulatory groups, antenna gain and
-zero ceiling. All 65,536 EEPROM identifiers match an independent native C
-initial-CTL oracle. Actual object-table revocation before invalid native
-register addresses prevents rate publication; refusal during programming
-stops later writes.
-The reproducible `phy/rates/make_linux_oracle.py` and
-`make_regulatory_oracle.py` retain complete native C functions, generated
-artifacts and source/function SHA256 provenance; `phy/rates/ORACLE.md`
-documents usage and all nine rate cases. They compare existing literals and
-exhaustive hashes without rewriting expected values.
-They do not prove RF or packet operation.
+Native Rust tests exercise production modal/RF, detector, rate, channel,
+calibration, MAC and packet owners using fixed reference data and explicit
+hardware/protocol invariants. Rust tables and provenance retain source citations;
+no reference source is extracted or compiled for validation, and no temporary
+Rust comparison adapter is generated.
+
+Rate cases cover exact/interpolated/clamped target piers, CTL flags,
+specific/world regulatory groups, antenna gain and zero ceiling. All 65,536
+EEPROM identities exercise the shared factory resolver. Register models check
+actual capability revocation before invalid MMIO and stop later writes on access
+loss. Thirty-two calibration traces and 35 IQ vectors cover XE2 identity,
+high-power PA skip, carrier-leakage retry, inherited state, signed clipping and
+wrapping intermediates. Withheld completions, cancellation and policy overlap
+keep packet engines and bus mastering closed.
+
+Forty-eight channel cases cover channels 1/6/13, eight signed spur offsets and
+zero/nonzero inherited state, including Viterbi packing and boundary rejection.
+Production still invokes this sequence only for the inactive 2412 MHz reference;
+fast retuning remains open. Descriptor tests retain 72 TX vectors, ten RX-status
+vectors and ten MAC/PCU/queue/DMA traces. They check complete extents, status,
+current authority and terminal storage ownership independently of caller buffers.
+
+The shared AP consumes actual descriptor/DMA bytes and produces RX descriptors.
+Device conversations run Open/WPA2 through the real kernel DHCP client and exact
+bidirectional IP, including held/modified/cancelled M4, entropy/peer deadlines,
+policy restriction and concurrent disconnect/publication. Fixture assets cannot
+authorize real hardware.
+
+Adjacent `REFERENCE.md` files document fixed-vector coverage and update rules.
+Review fixture values independently against the documented contract. These
+software/model checks supply no physical calibration, RF, IRQ or interoperability
+measurements.
 
 ## 8. Remaining software and physical acceptance
 
-Software still required before AR9285 is ready for physical Wi-Fi testing:
+The initial one-shot channel1 calibration, polled packet owner and station
+profile are implemented. Hardware testing requires an exact EEPROM-bearing
+device, authenticated deployment policy and measured RF/calibration acceptance.
+No RF or AP interoperability has been demonstrated by the model tests.
 
-1. Complete the partially prepared PHY: channel-mode overrides, chain
-   masks and delta slope/spur handling, authenticated power/antenna/channel
-   policy, noise-floor/IQ/PA calibration and current regulatory limits.
-   Initial factory CTL/rate preparation does not implement those live rules.
-   The fixed inactive reference synth setting does not implement channel
-   switching or radio activation. PCIe power-save/PM setup also remains.
-2. Real TX queue/RX descriptor allocations and DMA ownership, IRQ service,
-   TX completion, RX status/decryption/replay/error handling, and complete
-   stop/reset/hot-remove/PM lifecycle before any memory can be reclaimed.
-3. Soft-MAC station management, authenticated scan/channel state,
-   management and data TX/RX, rate/retry/aggregation state, EAPOL/key
-   handling, and a real `WirelessNetIface`/netdev data path.
+Broader live channels/retuning, factory profiles, periodic calibration,
+interrupt-driven operation, aggregation/rate control and power transitions
+require separate continuations. Reset/rejoin, removal and DMA reclamation need
+an independently proved generation/reset owner; the initial profile retains
+storage and requires a fresh lifecycle after terminal closure.
 
 Other ath9k devices need their own EEPROM maps, reset/PHY tables and
 descriptor/runtime variants before they can be claimed supported.
-Physical acceptance then covers EEPROM, RF calibration, channel/IRQ/DMA,
-scan/association/IP traffic, link loss, reset and power transitions.
+Physical acceptance for the initial profile covers EEPROM, RF calibration,
+polled channel/DMA, scan/association/IP traffic and terminal link loss/stop.

@@ -94,6 +94,110 @@ acceptance gates and are not enabled by this profile's station tests.
   scan, station association and IP-traffic acceptance. Software tests
   exercise these contracts without emulating the Intel radio.
 
+### Native deferred firmware admission
+
+`probe` retains the exact accepted Gen3 BDF/device/current PCI cap before initial
+parking and schedules the same startup owner; it does not resolve firmware during
+Stage::Device. Executor-time resolution follows the normal Stage::Late firmware
+scan. Retry remains closed in Parking until the initial command-register
+readback succeeds; a concurrent caller cannot race that transition. `provision_state()` reports Parking/Parked/Starting/Ready/Failed, and
+`provision().await` requires `trusted_net_authority` and retries newly staged inputs only while Parked.
+The probe runner drives background provisioning via `drive_scheduled` across 120 attempts with 500 ms intervals.
+Missing authority, missing images or invalid source/container inputs leave the same binding parked;
+cancellation while waiting for its async mutex cannot consume an attempt. Initial
+parking failure, or failure/cancellation after the first firmware/runtime startup
+attempt, remains terminal without reconstructing a native owner.
+
+Before Sc asset lookup, the same retained owner maps BAR0 once with bus mastering
+still disabled and reads actual `CSR_HW_REV` and `CSR_HW_RF_ID` inside current PCI
+capability invocations. This bounded identity discovery grants no firmware, DMA,
+interrupt or station admission. Missing assets retain that same mapping and Parked
+owner. The native Sc ladder contains only the discovered MAC/RF/step pairing:
+Sc A0 with WH-b0, FM-b0, FM-c0 or GF-a0. GF firmware uses the source's fixed A
+suffix; unsupported MAC steps, RF pairings and CDB/GF4 variants fail closed. A
+different installed RF image can never satisfy an absent matching image. These
+names do not widen the exact firmware-command gates or the WH c103 composition
+evidence below. Non-Sc transport and the separate Gen2 profile are unchanged.
+
+Within that exact pairing, highest-present-image semantics remain exact:
+absent APIs may fall through, while a present invalid image fails. Registry
+lookup and bounded firmware/sibling-PNVM byte copies occur inside current registry
+and blob `Cap::invoke` operations. All TLV parsing uses owned copied bytes; no
+borrowed registry view escapes invocation. Source epochs are checked again before
+starting the actual native `Hardware`/`Device` lifecycle. The selected raw Sc
+identity is checked again before that transition and retained by `Hardware`;
+initial start and restart recheck it before enabling bus mastering or publishing
+boot DMA. A changed identity cannot reuse the previously selected image.
+Optional external PNVM
+retains its existing firmware/SKU requirement; unsupported command/profile gates
+remain unchanged. Existing Gen2 boot/passive/peer owners are separate and native
+MVM station publication stays disabled.
+
+The retained startup stores the exact initialized `Arc<Device>` before pump/netdev
+publication, and the wireless registry receives that same Arc. Missing host policy
+retains the previous receive/firmware behavior; active scan and association still
+bootstrap authenticated policy and fail closed. Real signed registry fixtures cover
+assets staged after the first attempt, a cancelled pre-attempt waiter, exact
+firmware/PNVM copies, present-invalid ladder refusal, and actual PCI/source epoch
+revocation before deliberately invalid ECAM or native startup publication. Native
+backed-MMIO/real-registry regressions additionally cover several RF images present,
+missing exact-image staging, exact sibling PNVM selection, MAC/RF/step/CDB refusal,
+identity changes and revoked current PCI authority. Inert image headers remain in
+a test-only registry namespace and never shadow production firmware. The
+minimal test TLV contains no executable firmware and never crosses a valid native
+PCI boundary.
+
+### 3.0 Sc station composition evidence
+
+The retained Sc c103 profile now composes the real post-INIT `Device` owner,
+NVM/runtime configuration, passive scan, `Connection` authentication and
+association, Open/WPA2-PSK controlled port, pairwise/group-key receipts, IPC,
+native TFH TX/RFH RX, the kernel DHCP client and exact Ethernet/IPv4 traffic in
+both directions against a legacy 2.4-GHz AP. The independent firmware-side
+fixture reacts only after descriptor and doorbell publication, validates packed
+TFH extents and command versions from the pinned Sc WH c103 metadata, and
+returns correlated receipts
+through actual posted RFH buffers. The shared AP validates M2/M4 MICs and replay
+counters; its DHCP server validates DISCOVER/REQUEST and all lease terms.
+Observations read the actual retained DMA body and published descriptor slot,
+check addresses against the owning allocation, and derive the observed byte
+extent from the DMA descriptor. Encoder source buffers cannot substitute for
+these reads. A separate regression rejects unwritten slots and mismatched
+device addresses and proves that snapshots reflect the actual DMA contents.
+Firmware CCMP encryption/decryption is modelled, with native protection flags,
+installed-key identity and host RX packet-number checks retained.
+
+The EAPOL envelope accepts protocol versions 1–3, including IEEE 802.1X-2010
+version 3 emitted by the shared AP. This outer byte is distinct from the exact
+negotiated AKM's EAPOL-Key descriptor version. Replies retain the received
+protocol version; MIC verification authenticates it. Independent vectors reject
+unknown envelope versions, wrong descriptors and protocol-byte MIC tampering,
+and prove that valid M3 retries do not reinstall keys.
+
+The owner publishes physical carrier separately from administrative link state:
+carrier remains down until association and, for WPA2, the terminal M4 TX receipt.
+Disconnect and failure close it before teardown. Public association and active
+scan retry the shared signed regulatory bootstrap, so policy staged after an
+early probe failure is usable without another driver's initialization. A
+private explicit model policy enters the same complete association owner; tests
+never install a permissive global policy or bypass firmware MCC intersection.
+
+Composition regressions withhold the M4 receipt and cancel its waiter, proving
+closed IP admission and retained queue/TX DMA. A cancelled queue-removal wait
+retains command and queue ownership; a mismatched correlated receipt fails the
+transport without releasing them. Successful disconnect requires all native
+queue/peer/link/PHY receipts and leaves no station queues or pending commands.
+
+This fixture starts after firmware-ready and installs the ordinary `send_frame`
+and common `Device.step` network seams without spawning a permanent worker.
+It does not substitute for the separately tested one-shot capability publication,
+native firmware/bootstrap/restart or interrupt ownership contracts. Physical
+acceptance still requires Sc firmware/PNVM/NVM/platform power and regulatory
+acceptance, boot/ALIVE and MSI/RFH/TFH operation, scan and Open/WPA2 association,
+real CCMP, DHCP/bidirectional IP, and disconnect/failure/recovery on hardware.
+These tests do not admit Ty/So/Bz firmware tables rejected by the exact MLD
+station-version gate, nor enable Gen2/MVM native station publication.
+
 ### 3.1 Native PCI and current authority
 
 Probe reserves one PCI function, leaves repeated owned-BDF dispatch untouched,
@@ -140,6 +244,20 @@ is already ready, so one retained-future poll cannot loop indefinitely through a
 continuous IRQ stream. The pump re-enters common progress on IPC/control wakes.
 Roam closes packet admission before replacing the previous peer/queue/key owner;
 a failed old disconnect prevents a new association until transport recovery.
+
+Disconnect publishes down before waiting for control work and repeats the close
+after acquiring device state, serializing with association/roam up publication.
+The Sc composition fixture holds control/state to interleave that early close
+with the old authorized publisher, then drives actual teardown receipts and
+checks cached BSSID/carrier closure before another progress poll can repair it.
+Disconnect waits for an in-flight association's state owner rather than
+returning Busy: socket-owner release invokes teardown once outside the normal
+netlink operation reservation. The actual `NETLINK_URELEASE` regression closes
+a unique registered fixture socket while native M4 is unacknowledged, confirms
+the spawned autodisconnect worker stays retained, releases that exact DMA
+receipt and requires complete peer/queue teardown with IP admission closed.
+The test stages only private cfg80211 owner metadata; regulatory admission,
+RSNA, native queues and teardown execute through the existing real owners.
 
 Tests cover retained waiter cancellation, bounded pending-packet retries, and
 actual Device.step over RFH/DataQueue completions: a full TX queue still delivers
@@ -255,8 +373,8 @@ cache size are bounded. Actual RAM/RFH/TFH fixtures cover native prerequisite
 receipts, optional DQA, current LAR denial/requery, completion before ACK,
 cancellation at each published prerequisite and successful scan reuse. Local
 policy fixtures use the same private admission path without global mutation.
-A retained C oracle compiled from actual Linux headers verifies complete
-MAC/link/SF/power/MCC and versioned channel packed geometry.
+Native Rust tests verify fixed MAC/link/SF/power/MCC and versioned-channel
+wire vectors alongside receipt, policy and ownership invariants.
 
 These contracts do not enable Gen2 native PCI publication. Active station PHY/link activation,
 association management TX/RX, peer/rate/key/Block-Ack and controlled-port
@@ -290,7 +408,7 @@ keep the phase closed and preserve the retained transport/DMA policy. These
 helpers never activate the link, allocate a station packet queue, install a
 peer/key or authorize transmit; active station and native PCI admission remain
 gated on the remaining power/SAR, peer/rate/key/BA, security and recovery work.
-Independent C fixtures compiled from actual Linux headers cover complete PHY
+Fixed source-cited Rust wire fixtures cover complete PHY
 and link/RLC payloads, both channel formats, both bands and each antenna mask.
 
 ### 3.8 Retained TX-disabled API77 AP peer
@@ -325,16 +443,164 @@ or removal stays in its in-progress phase, rejects retries, and prevents scan
 or PHY release. Any malformed, foreign or failed receipt makes the owner
 terminal while retaining its peer and transport/DMA teardown policy.
 
-Independent C output compiled from actual Linux `sta.h` checks the complete
+Fixed Rust vectors based on the documented `sta.h` contract check the complete
 ADD/REMOVE layouts and the disabled-transmit flags. Native RFH/TFH fixtures
 check status/command identity, fresh MCC denial, acknowledged peer reuse,
 invalid profile/BSSID/NVM/policy rejection and cancellation at MCC, ADD and
 REMOVE publication. A metadata-only replay of the SHA256-pinned real CC API77
 image drives the production version checks; opaque image bytes are never loaded.
 This is a firmware table-ownership prerequisite, with the link inactive and
-transmit disabled. Active station PHY/link, management, rate/key/BA/security,
+transmit disabled. The subsequent management-queue owner is specified in §3.9.
+Active station PHY/link, management transmission, rate/key/BA/security,
 authenticated platform power/SAR, recovery and native Gen2 publication remain
 software work.
+
+### 3.9 Retained API77 management queue
+
+`mvm_boot::Owner::prepare_management_queue()` requires the existing acknowledged
+TX-disabled station0 and inactive PHY, then reserves the sole management-queue
+operation before its first await. Actual CC API77 advertises
+`SCD_QUEUE_CONFIG_CMD` group5/command0x17 command3/response2. Other command or
+response profiles fail before allocation/publication. Linux TVQM maps management
+traffic to TID15; the existing native `Hardware`/`DataQueue` backend allocates
+the 128-entry Qu TFH ring and byte-count buffer and retains both before their
+addresses enter the 36-byte ADD command. Only the exact eight-byte firmware
+allocation response permits `ManagementQueuePrepared` and
+`prepared_management_queue()` metadata. Queue0, out-of-range IDs, failed flags,
+malformed extents and duplicate active identities are rejected by that backend.
+
+The queue has no public packet-submission surface. Its existence does not
+activate the link, clear `STA_FLG_DISABLE_TX`, install power/SAR/rate/key policy
+or authorize radio transmission. Passive receive policy, including NO_IR,
+continues to permit the inactive PHY/disabled-peer/queue prerequisites.
+
+`release_management_queue()` requires the same station0/TID15 binding and an
+actually idle native queue, sends the complete v3 REMOVE union and waits for
+the documented API-v2 eight-byte `iwl_tx_queue_cfg_rsp` before releasing queue
+DMA. The response must identify that exact queue and have zero failure flags
+and reserved bytes; its ADD-only initial-write-pointer field is not adopted
+during retirement. An empty status-less receipt cannot prove successful
+retirement and remains a terminal error. Only successful
+retirement returns to `PeerPrepared`; peer removal and PHY release cannot
+proceed while the queue operation or identity remains owned. Cancelled ADD or
+REMOVE leaves the corresponding in-progress phase, pending command and queue
+storage retained. A failed, malformed or foreign receipt makes the owner
+terminal without releasing uncertain queue/payload DMA. Unexpected outstanding
+packet ownership also prevents retirement rather than being silently freed.
+
+Fixed Rust vectors record operation/command/response fields and management TID
+from the documented firmware wire contract; historical source citations remain.
+Native RFH/TFH tests compose acknowledged disabled-peer ADD, actual queue
+allocation and source-matched DMA fields, native API-v2 response-fenced queue REMOVE and peer
+REMOVE. They also cover cancellation at both queue boundaries, malformed and
+foreign receipts, wrong queue/failure/reserved response fields, station/TID/idle
+rejection and actual CC77 metadata selection.
+These are software ownership results; active station admission, externally
+qualified platform power/SAR (§3.11), packet management exchanges,
+rate/key/BA/security, recovery and native Gen2 PCI publication remain gates.
+
+### 3.10 Host NO_IR policy
+
+Intel host transmit/association power admission rejects any intersecting NO_IR
+rule, including a narrower restrictive rule overlapped by a permissive covering
+rule. Active probes additionally reject intersecting DFS rules. Every occupied
+20 MHz subchannel and the full HT/VHT span apply these restrictions and the
+lowest intersecting power/bandwidth ceilings. The receive-only Gen2 scan/PHY/
+disabled-peer prerequisites continue to admit NO_IR while preserving their
+existing NVM/MCC and complete receive-bandwidth requirements. No beacon-derived
+NO_IR relaxation or automatic active Gen2 station admission is implied.
+
+Physical carrier/peer publication does not change operator `IFF_UP` and never
+invokes administrative open/stop hooks while retained driver state is locked.
+Explicit registration, operator up/down and autoconnect remain administrative
+events. Disconnect/failure clears carrier and peer identity while preserving an
+operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
+
+### 3.11 Retained API77 platform and host power preparation
+
+`mvm_boot::Owner::transmit_power_request(&mut self)` returns a `PowerRequest`
+containing the exact asset name
+`iwlwifi/mvm-api77-power-v1-<12 lowercase MAC hex digits>.bin` and a 32-byte
+binding digest. It requires the initialized NVM/MAC, currently authorized PCI
+identity, the unchanged supported Gen2 MAC/RF profile, and exactly one complete
+SMBIOS system, baseboard and BIOS identity. Identification grants no SAR or TX
+authority. The binding hashes, in order: the ASCII domain
+`NARF Intel MVM API77 qualified static legacy20 power v1`; actual PCI vendor,
+device, subsystem vendor and subsystem ID as LE16; actual CSR_HW_REV and RF-ID
+register 0x9c as LE32; the six-byte NVM MAC; TX/RX chain masks as LE32; the
+selected firmware prefix bytes; SHA-256 of the retained complete firmware
+image; and the platform digest. The platform digest hashes the ASCII domain
+`NARF Intel MVM platform identity v1` followed by the complete fixed-size,
+zero-padded SMBIOS system manufacturer/product/version/serial arrays and UUID,
+baseboard manufacturer/product/version/serial arrays, and BIOS vendor/version/
+release-date arrays. Missing or ambiguous records and zero/FF UUIDs fail closed.
+SMBIOS is a provisioning identity, not a measured-boot or calibration witness.
+
+`prepare_transmit_power().await` requires the acknowledged, unused management
+queue and its still-inactive PHY/TX-disabled peer. It loads the exact requested
+asset through the firmware registry and requires an authenticated NRFW signer.
+The signed payload is exactly 64 bytes:
+
+| Offset | Field |
+| --- | --- |
+| 0 | `NIPW` magic (4 bytes) |
+| 4, 6 | LE16 version 1 and length 64 |
+| 8 | exact request binding (32 bytes) |
+| 40 | exact NVM MAC (6 bytes) |
+| 46 | flags exactly 1: externally certified static worst-case qualification |
+| 47 | zero reserved byte |
+| 48 | two chains × five native v5 subband SAR limits, chain-major u8 in 1/8 dBm |
+| 58 | signed LE16 maximum conducted power, 1/8 dBm, range −1024…1016 |
+| 60 | signed LE16 maximum aggregate radiated gain above the firmware power metric, 1/8 dB, range 0…512 |
+| 62 | two zero reserved bytes |
+
+Flag 1 requires the signer to supply actual conservative SAR and radiated-gain
+limits for this exact device/platform/firmware, covering all platform postures,
+antenna/array behavior and autonomous response behavior permitted by this initial
+legacy 20 MHz profile. No qualification or measured board values are bundled.
+Absent ACPI WRDS/EWRD/WGDS/PPAG data never implies permissive power: this path
+requires an independently provisioned signed static worst-case qualification.
+Parsing a structurally valid record does not establish that its physical
+measurements are correct; deployment must supply that evidence and trusted key.
+
+The owner requires REDUCE_TX_POWER command5/response0 and firmware API change45,
+retains the qualification's actual source capability before awaiting anything,
+and refreshes firmware MCC once for this attempt when NVM/firmware LAR is active.
+The retained NVM must include the channel. The current firmware permission then
+requires VALID, ACTIVE and 20MHz; non-LAR NVM additionally requires IBSS because
+Linux maps its absence to NO_IR. Radar channels are excluded from this initial
+power stage. Current host policy must cover the complete 20 MHz span and obey
+all intersecting ceilings, including restrictive partial overlaps, DFS and NO_IR.
+
+It sends the genuine 44-byte pre-v9 v5 SET_CHAINS command with the signed SAR
+table, then a distinct SET_LINK command for MAC0 with the minimum of signed
+maximum conducted power and `(host dBm × 8 − certified aggregate gain)`.
+The source capability and current host policy are checked before each power
+publication and after the final receipt. A tighter final policy fails without
+publishing completed preparation. Each command requires its correlated native
+empty ACK; unexpected payloads, foreign receipts, lost authority or transport
+errors close the owner. Dropping the future retains the in-progress phase,
+qualification, pending command and queue DMA; a late receipt cannot reopen it.
+
+`prepared_transmit_power()` returns `PowerStatus { channel,
+conducted_eighth_dbm, qualification_digest }` only after both receipts while
+the qualification capability remains current. This is receipt metadata, not
+ongoing transmit admission: MCC is a query snapshot and later host/firmware
+policy changes require fresh admission before any future active operation.
+`release_transmit_power()` forgets only a completed inactive preparation and
+returns to the management-queue stage. It sends no permissive reset and leaves
+firmware power restrictions intact; queue retirement remains fenced until this
+step. Registry name replacement alone does not revoke an already retained blob.
+
+Native Rust RFH/TFH regressions check the 44-byte packed power wire contract and
+exercise signed registry inputs, CC77 negotiation,
+SAR/link DMA bytes, fresh MCC, NVM/LAR flag differences, restrictive host overlap,
+policy tightening, source-capability revocation, receipt correlation, cancellation
+at each native wait and power-before-queue ordered retirement. Automatic Gen2
+station TX remains disabled. Active PHY/link/peer transitions, management packet
+exchange and rate/key/BA/security, recovery, PM and native PCI station publication
+remain unimplemented gates. No physical SAR, RF compliance or hardware readiness
+claim follows from these software checks.
 
 ## 4. References
 

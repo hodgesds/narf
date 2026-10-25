@@ -1,4 +1,4 @@
-//! Realtek RTW88 family Wi-Fi 5 PCIe — baseline driver.
+//! Realtek RTW88 family PCIe bring-up and retained RTL8822CE station.
 //!
 //! Targets the three chips most common on AMD Zen2 laptops:
 //!
@@ -6,19 +6,16 @@
 //! - **RTL8822CE** — Wi-Fi 5 2x2 (`10ec:c822`).
 //! - **RTL8822BE** — Wi-Fi 5 2x2, older B-cut (`10ec:b822`).
 //!
-//! ## Scope (this commit)
+//! RTL8822CE retains one owner through factory/OTP capture, authenticated
+//! section firmware, MAC/PHY tables, signed measured board qualification,
+//! bounded calibration and an awake channel1 legacy20 station. Its native
+//! DMA/CCX receipts drive host Open/WPA2-PSK and software CCMP through the
+//! same registered Device used by kernel DHCP. The initial data profile
+//! requires basic1Mbps and a fresh lifecycle after terminal closure.
 //!
-//! 1. PCI device match via the existing `bus::driver_match` table.
-//! 2. BAR2 control-register MMIO mapping (Device memory attributes).
-//! 3. Baseline power-on sequence + chip-reset (CR.OPEN re-arm).
-//! 4. EFUSE physical read and sparse map decoding; chip-specific PCI MAC.
-//! 5. Hardware-identification registration with an offline `narf-net`
-//!    send function. The interface remains down and all wireless control
-//!    operations return `NotSupported` until firmware and packet rings land.
-//!
-//! RTL8822CE retains one authenticated section-firmware attempt using beacon
-//! host DMA/IDDMA and parks it afterward. Complete MAC/RF, station control
-//! and active packet rings remain follow-up work.
+//! RTL8821CE retains factory/firmware and inactive MAC ownership; its RF and
+//! station remain gated. RTL8822BE retains diagnostic identification. Physical
+//! validation and deployment board/power assets remain separate gates.
 //!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later)
 //!
@@ -42,16 +39,35 @@
 
 extern crate alloc;
 
+mod command;
+mod dack;
 pub mod efuse;
 mod firmware_lifecycle;
 mod firmware_native;
 mod firmware_transport;
 pub mod fw;
+mod hardware;
+pub(super) mod interface;
+mod mac;
+pub(super) mod packet_core;
+pub(super) mod packet_format;
 mod pci_firmware;
+mod phy;
+#[path = "phy/rtl8821c.rs"]
+mod phy8821c;
+mod power_policy;
 mod probe_guard;
+mod radio;
 mod reserved_page;
+mod sibling;
+mod station;
+pub(super) mod station_control;
 pub use firmware_lifecycle::{Stage as FirmwareStage, Status as FirmwareStatus};
 pub use firmware_transport::{Error as FirmwareError, Info as FirmwareInfo};
+pub use mac::Info as MacInfo;
+pub use phy::Info as PhyTablesInfo;
+pub use power_policy::{Error as PowerError, Permission as PowerPermission};
+pub use radio::Info as RadioInfo;
 pub mod pci;
 pub(crate) mod pci_park;
 
@@ -61,7 +77,7 @@ pub mod power;
 mod power_tables;
 pub mod regs;
 
-pub use pci::{name_for, probe, register_pci_driver, Rtw88Device};
+pub use pci::{name_for, probe, provision, register_pci_driver, Rtw88Device};
 pub use regs::{REALTEK_VENDOR, RTL_DEV_8821CE, RTL_DEV_8822BE, RTL_DEV_8822CE};
 
 /// Entry point invoked from the wireless crate's `register_initcalls`

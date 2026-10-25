@@ -1,6 +1,5 @@
 //! Discrete RDNA2 golden sequences, in Linux gfx_v10_0_init_golden_registers order.
-//! Register names resolve through gc_10_1_0_offset.h plus gfx_v10_0.c's local
-//! overrides. check_rdna2_profiles.py compares every compiled row with Linux.
+//! Register provenance: gc_10_1_0_offset.h and gfx_v10_0.c's local overrides.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Golden {

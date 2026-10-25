@@ -2,7 +2,6 @@ use super::*;
 #[path = "amdgpu_dcn401_requestor_tests.rs"]
 mod requestor;
 
-// Native bank-3 addresses, independently checked by tests/dcn401_mpc.c.
 fn rgb(p: u8, depth: ColorDepth) -> [(u64, u32, u32); 20] {
     let m = MPC_BASE + u64::from(p) * 0x15 * 4;
     let o = MPC_BASE + u64::from(p) * 0x5e * 4;

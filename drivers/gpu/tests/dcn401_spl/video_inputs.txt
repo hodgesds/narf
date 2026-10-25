@@ -1,4 +1,4 @@
-# 4:2:0 planes check.sh --generate-video answers with Linux SPL (video_vectors.txt):
+# 4:2:0 planes retained for Linux-derived SPL cases (video_vectors.txt):
 # format src_x src_y src_w src_h dst_x dst_y dst_w dst_h stream_w stream_h odm_x odm_w rotation mirror alpha
 # format: 8 = NV12/NV21 (SPL_PIXEL_FORMAT_420BPP8), 10 = P010 (420BPP10).
 # NV12: unscaled full frame (luma bypassed, chroma upscaled 2x).
