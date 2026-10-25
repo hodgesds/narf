@@ -36,9 +36,27 @@ const MADV_WILLNEED: u64 = 3;
 const O_RDWR: u32 = 2;
 const PAGE: u64 = 4096;
 const SECTOR: u64 = 512;
-/// First sector of the fixture image's data area (boot + 2 FATs + root
-/// directory occupy sectors 0..4 in `fat12_image`).
-const DATA_LBA: u64 = 4;
+/// Sectors in one FAT copy of a fixture image holding `clusters`
+/// clusters. FAT12 packs each entry into 1.5 bytes, so one sector
+/// covers 341 entries — and the builder writes entries
+/// `0..=clusters + 1` (the reserved pair plus the chain), so a longer
+/// chain needs a wider FAT. The 512 KiB fixtures below hold 1024
+/// clusters and need four sectors; their original one-sector FAT sent
+/// `fat12_set` out of bounds (entry 341 writes byte 512 of 512) and
+/// panicked the kernel inside the per-open-state smoke.
+fn fat_sectors(clusters: u32) -> u32 {
+    // The highest entry written is `clusters + 1`; it touches bytes
+    // `idx + idx / 2` and `idx + idx / 2 + 1`, so a FAT copy needs
+    // `last + last / 2 + 2` bytes.
+    let last = clusters + 1;
+    (last + last / 2 + 2).div_ceil(SECTOR as u32)
+}
+
+/// First sector of the fixture image's data area (boot sector, two
+/// FAT copies and the root directory precede it in `fat12_image`).
+fn fat12_data_lba(clusters: u32) -> u64 {
+    2 + 2 * u64::from(fat_sectors(clusters))
+}
 
 type FatVolume = narf_drivers_fs_fat::volume::FatVolume<CountingBlockDevice>;
 
@@ -184,12 +202,13 @@ fn with_fat_file(
                     .ok_or("lookup of NARF.TXT failed")?;
             let fd = install_rdwr(&ops)?;
             let clusters = (data.len() as u64).div_ceil(SECTOR);
+            let data_lba = fat12_data_lba(clusters as u32);
             body(&Fixture {
                 aspace,
                 device,
                 volume,
                 fd,
-                data_span: (DATA_LBA, DATA_LBA + clusters),
+                data_span: (data_lba, data_lba + clusters),
             })
         })();
         crate::handlers::restore_address_space_lookup(None);
@@ -213,12 +232,18 @@ fn install_rdwr(ops: &Arc<dyn FileOps>) -> Result<u64, &'static str> {
 }
 
 /// Byte-built FAT12 image holding one file, `NARF.TXT`, whose content is
-/// `data` spread over a cluster chain (512-byte clusters, one-sector
-/// FATs). Same builder as `abi_truncate_unmap_tests`.
+/// `data` spread over a cluster chain (512-byte clusters). Same builder
+/// as `abi_truncate_unmap_tests`, sizing included: each FAT copy is
+/// `fat_sectors(clusters)` sectors wide so the chain always fits — for
+/// the small files that is one sector and the layout is the historical
+/// boot + FAT + FAT + root directory + data.
 fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
     use alloc::vec;
     const LBS: usize = 512;
     fn fat12_set(fat: &mut [u8], idx: u32, val: u16) {
+        // Contract: `fat` covers entry `idx` — bytes `idx + idx / 2`
+        // and `idx + idx / 2 + 1`. The caller passes a whole FAT copy
+        // sized by `fat_sectors`, which covers every entry written.
         let off = (idx + idx / 2) as usize;
         let v = val & 0x0FFF;
         if idx % 2 == 0 {
@@ -230,7 +255,9 @@ fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
         }
     }
     let clusters = (data.len() as u32).div_ceil(LBS as u32);
-    let total_sectors = 4 + clusters;
+    let fat_secs = fat_sectors(clusters);
+    let data_sec = 2 + 2 * fat_secs;
+    let total_sectors = data_sec + clusters;
     let mut img = vec![0u8; LBS * total_sectors as usize];
     img[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
     img[3..11].copy_from_slice(b"NARFFAT ");
@@ -241,11 +268,12 @@ fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
     img[17..19].copy_from_slice(&16u16.to_le_bytes()); // root_ent_cnt
     img[19..21].copy_from_slice(&(total_sectors as u16).to_le_bytes());
     img[21] = 0xF8; // media
-    img[22..24].copy_from_slice(&1u16.to_le_bytes()); // fat_sz_16
+    img[22..24].copy_from_slice(&(fat_secs as u16).to_le_bytes()); // fat_sz_16
     img[510] = 0x55;
     img[511] = 0xAA;
-    for lba in [1usize, 2] {
-        let fat = &mut img[lba * LBS..lba * LBS + LBS];
+    for copy in 0..2 {
+        let fat_start = (1 + copy * fat_secs) as usize;
+        let fat = &mut img[fat_start * LBS..fat_start * LBS + fat_secs as usize * LBS];
         fat12_set(fat, 0, 0xFF8);
         fat12_set(fat, 1, 0xFFF);
         for c in 0..clusters {
@@ -254,12 +282,12 @@ fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
             fat12_set(fat, idx, val as u16);
         }
     }
-    let entry = &mut img[3 * LBS..3 * LBS + 32];
+    let entry = &mut img[(data_sec as usize - 1) * LBS..(data_sec as usize - 1) * LBS + 32];
     entry[0..11].copy_from_slice(b"NARF    TXT");
     entry[11] = 0x20; // ARCHIVE
     entry[26..28].copy_from_slice(&2u16.to_le_bytes()); // fst_clus_lo
     entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
-    img[4 * LBS..4 * LBS + data.len()].copy_from_slice(data);
+    img[data_sec as usize * LBS..data_sec as usize * LBS + data.len()].copy_from_slice(data);
     img
 }
 
@@ -415,7 +443,7 @@ fn smoke_readahead_eof_clamp() -> TestResult {
         // design. The claim under test is narrower: the *populated*
         // page's own sectors are not read again, so count only page
         // 2's sector range (8 sectors per page in this fixture).
-        let page2_lo = DATA_LBA + 2 * (PAGE / SECTOR);
+        let page2_lo = fx.data_span.0 + 2 * (PAGE / SECTOR);
         let before = fx
             .device
             .blocks_read_between(page2_lo, page2_lo + PAGE / SECTOR);
@@ -631,7 +659,7 @@ fn smoke_read_readahead_sequential_populates() -> TestResult {
         if fx.data_blocks_read() != 272 {
             return Err("the confirmed stream did not populate the initial window");
         }
-        let window_lo = DATA_LBA + 16;
+        let window_lo = fx.data_span.0 + 16;
         if fx.device.blocks_read_between(window_lo, window_lo + 256) != 256 {
             return Err("the populated window is not the span ahead of the stream");
         }
