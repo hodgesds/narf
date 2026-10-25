@@ -4503,12 +4503,13 @@ impl narf_power::device_pm::DevicePmOps for NvmePm {
         let Some(slot) = slot_of(self.instance) else {
             return Ok(());
         };
-        match suspend_slot(
-            slot,
-            &self.cap,
-            SHUTDOWN_DRAIN_TIMEOUT_MS,
-            &mut pm_drain_wait(&name),
-        ) {
+        // Bind the wait closure to a local rather than creating it
+        // inline in the `match` scrutinee: a temporary there lives in
+        // the block's tail expression and drops *after* the block's
+        // locals, but its type may access the `name` borrow on drop
+        // (E0597). Declared after `name`, the local drops first.
+        let mut wait = pm_drain_wait(&name);
+        match suspend_slot(slot, &self.cap, SHUTDOWN_DRAIN_TIMEOUT_MS, &mut wait) {
             SlotSuspend::Suspended(shutdown::ShutdownOutcome::Complete)
             | SlotSuspend::Suspended(shutdown::ShutdownOutcome::NotEnabled)
             | SlotSuspend::AlreadySuspended
@@ -4549,12 +4550,10 @@ impl narf_power::device_pm::DevicePmOps for NvmePm {
         let Some(slot) = slot_of(self.instance) else {
             return Ok(());
         };
-        match resume_slot(
-            slot,
-            &self.cap,
-            SHUTDOWN_DRAIN_TIMEOUT_MS,
-            &mut pm_drain_wait(&name),
-        ) {
+        // See `suspend`: the wait closure must be a local declared
+        // after `name`, not a block-tail temporary (E0597).
+        let mut wait = pm_drain_wait(&name);
+        match resume_slot(slot, &self.cap, SHUTDOWN_DRAIN_TIMEOUT_MS, &mut wait) {
             SlotResume::Resumed | SlotResume::NotSuspended => Ok(()),
             SlotResume::Busy => Err(PmErr::Busy),
             SlotResume::Failed => Err(PmErr::DriverError),
