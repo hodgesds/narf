@@ -1581,9 +1581,15 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // try_grow_stack requires a nearby real STACK_GUARD region, so
                 // a non-stack user vaddr still reaches the SEGV/panic surface.
                 if !file_fault_bus && !guard_fault && (from_user || cr2_in_user_half) {
-                    let limits = narf_userspace::handlers::current_stack_growth_limits();
                     // SAFETY: same identity-map argument.
-                    if unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok() {
+                    if unsafe {
+                        as_arc.try_grow_stack_with_limits(
+                            v,
+                            narf_userspace::handlers::current_stack_growth_limits,
+                        )
+                    }
+                    .is_ok()
+                    {
                         return;
                     }
                 }

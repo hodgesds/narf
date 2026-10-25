@@ -10009,15 +10009,10 @@ impl AddressSpace {
     /// - `self.root` must be a valid page-table root for the AS
     ///   currently active on this CPU.
     /// - Frame allocator must be initialised.
-    fn stack_growth_plan(
-        regions: &RegionTable,
-        huge_mapped_bytes: u64,
-        v_page: u64,
-        limits: StackGrowthLimits,
-    ) -> Result<StackGrowthPlan, AddressSpaceError> {
+    fn stack_guard_for_fault(regions: &RegionTable, v_page: u64) -> Option<u64> {
         const MAX_GROW: u64 = 256 * 1024;
 
-        let guard_base = regions
+        regions
             .containing(v_page)
             .or_else(|| regions.successor(v_page))
             .filter(|region| {
@@ -10027,7 +10022,16 @@ impl AddressSpace {
                 }
             })
             .map(|region| region.base.as_u64())
-            .ok_or(AddressSpaceError::Unmapped)?;
+    }
+
+    fn stack_growth_plan(
+        regions: &RegionTable,
+        huge_mapped_bytes: u64,
+        v_page: u64,
+        limits: StackGrowthLimits,
+    ) -> Result<StackGrowthPlan, AddressSpaceError> {
+        let guard_base =
+            Self::stack_guard_for_fault(regions, v_page).ok_or(AddressSpaceError::Unmapped)?;
         let new_guard_base = v_page
             .checked_sub(0x1000)
             .ok_or(AddressSpaceError::OutOfRange)?;
@@ -10146,7 +10150,31 @@ impl AddressSpace {
         vaddr: VirtAddr,
         limits: StackGrowthLimits,
     ) -> Result<(), AddressSpaceError> {
+        // SAFETY: forward the caller's live-root/alias/allocator contract.
+        unsafe { self.try_grow_stack_with_limits(vaddr, || limits) }
+    }
+
+    /// Resolve task limits only for faults near a real stack guard.
+    ///
+    /// Invalid user addresses need no credential or resource-limit lookup.
+    /// `limits` runs once, outside every VMA/page-table lock, after a read-only
+    /// candidate lookup. Both subsequent transactions still validate the full
+    /// topology and returned limits; the candidate is never admission authority.
+    ///
+    /// # Safety
+    /// Same requirements as [`Self::try_grow_stack`]. The provider must return
+    /// the limits applicable to the faulting task for this growth attempt.
+    pub unsafe fn try_grow_stack_with_limits(
+        &self,
+        vaddr: VirtAddr,
+        limits: impl FnOnce() -> StackGrowthLimits,
+    ) -> Result<(), AddressSpaceError> {
         let v_page = vaddr.as_u64() & !0xFFFu64;
+        {
+            let regions = self.regions.lock();
+            Self::stack_guard_for_fault(&regions, v_page).ok_or(AddressSpaceError::Unmapped)?;
+        }
+        let limits = limits();
         // Preflight under the VMA transaction. The final transaction repeats
         // every limit/topology check because a CLONE_VM peer may mutate the
         // stack between these critical sections.

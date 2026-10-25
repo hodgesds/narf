@@ -8729,6 +8729,85 @@ kernel_test_in!(
     smoke_memory_try_grow_stack_outside_region_is_unmapped
 );
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_stack_limit_provider_is_lazy_and_revalidated() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, StackGrowthLimits, VirtAddr,
+    };
+    use core::cell::Cell;
+
+    // SAFETY: the test boot supplies the live kernel aliases and allocator.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(space) => space,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let result = (|| {
+        let guard = 0x0000_0080_0380_0000;
+        let queried = Cell::new(0);
+        // SAFETY: no growth can occur in this empty address space.
+        let absent = unsafe {
+            address_space.try_grow_stack_with_limits(VirtAddr::new(guard), || {
+                queried.set(queried.get() + 1);
+                StackGrowthLimits::UNLIMITED
+            })
+        };
+        if absent != Err(AddressSpaceError::Unmapped) || queried.get() != 0 {
+            return TestResult::Fail("non-stack fault resolved task limits");
+        }
+        if address_space
+            .map_region(Region {
+                base: VirtAddr::new(guard),
+                len: 0x1000,
+                perms: RegionPerms::STACK_GUARD,
+                phys: alloc::vec![PhysAddr::new(0)].into(),
+            })
+            .is_err()
+        {
+            return TestResult::Fail("could not map stack guard");
+        }
+        // SAFETY: the returned zero stack limit rejects before PTE access.
+        let limited = unsafe {
+            address_space.try_grow_stack_with_limits(VirtAddr::new(guard), || {
+                queried.set(queried.get() + 1);
+                StackGrowthLimits {
+                    stack_bytes: 0,
+                    ..StackGrowthLimits::UNLIMITED
+                }
+            })
+        };
+        if limited != Err(AddressSpaceError::StackLimit) || queried.get() != 1 {
+            return TestResult::Fail("candidate bypassed limits or queried more than once");
+        }
+        // Mutating VMA metadata inside the provider proves that it runs outside
+        // the VMA locks and that the candidate cannot authorize stale topology.
+        // SAFETY: the injected neighbour makes final growth impossible.
+        let raced = unsafe {
+            address_space.try_grow_stack_with_limits(VirtAddr::new(guard), || {
+                address_space
+                    .map_region(Region {
+                        base: VirtAddr::new(guard - 0x1000),
+                        len: 0x1000,
+                        perms: RegionPerms::READ,
+                        phys: alloc::vec![PhysAddr::new(0)].into(),
+                    })
+                    .expect("provider must run outside VMA locks");
+                StackGrowthLimits::UNLIMITED
+            })
+        };
+        if raced != Err(AddressSpaceError::Overlap) {
+            return TestResult::Fail("stale candidate ignored a topology change");
+        }
+        TestResult::Pass
+    })();
+    core::mem::forget(address_space);
+    result
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_stack_limit_provider_is_lazy_and_revalidated
+);
+
 /// New guard one page below the current guard must NOT collide
 /// with an existing region. The grow surfaces Overlap so the trap
 /// handler reports a real stack-overflow SEGV.

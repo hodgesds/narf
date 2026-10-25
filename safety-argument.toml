@@ -1867,3 +1867,8 @@ argument = "Scheduler wake fast paths and WakeCell downcasts still require point
 ref = "security-model/specification/spec.md#L42"
 agent = "OpenAI Codex GPT-6"
 argument = "The task-local rlimit snapshot grants no authority: validation, cross-task permissions, hard-limit replacement, fork inheritance, and reap remain in the authoritative process store. Every row and process-key mutation release-advances a nonwrapping generation before completion. Cache hits acquire-check that generation; fills pair a complete locked row with a generation stable across identity resolution. A concurrent mutation can leave only an invalid old-generation snapshot, and no cache lock nests identity, task-registry, or store locks. Inline snapshots follow the stable TaskId lifetime and cannot resurrect retired rows. Tests cover completed remote updates and leader rebinding; the SMP check orders each writer completion before the other CPU's read."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-6"
+argument = "Both architecture fault handlers defer stack-limit and capability resolution until the region index identifies a real nearby STACK_GUARD using the existing distance predicate. The read-only candidate grants no mapping authority. The provider runs outside every VMA/page-table lock, and the existing preflight and final transaction still check all limits, region topology, guard collision, and absent-leaf ownership before mutation. Non-stack faults retain Unmapped and signal behavior; no domain state or exception frame changes. Tests prove no query for an absent stack, one query with enforced rejection for a real candidate, and topology revalidation when the provider itself adds a conflicting neighbour."

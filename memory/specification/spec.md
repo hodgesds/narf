@@ -1012,6 +1012,13 @@ impl AddressSpace {
     pub unsafe fn try_grow_stack_limited(
         &self, fault: VirtAddr, limits: StackGrowthLimits,
     ) -> Result<(), AddressSpaceError>;
+    /// Reject non-stack faults before resolving task credentials or limits.
+    /// The provider runs once outside VMA locks for a nearby real guard.
+    /// Candidate discovery grants no admission: preflight and final mutation
+    /// still revalidate topology, all returned limits, and PTE ownership.
+    pub unsafe fn try_grow_stack_with_limits(
+        &self, fault: VirtAddr, limits: impl FnOnce() -> StackGrowthLimits,
+    ) -> Result<(), AddressSpaceError>;
 }
 
 /// Install the external shared-page owner's per-alias lifetime hooks.
