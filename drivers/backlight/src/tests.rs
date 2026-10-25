@@ -634,20 +634,6 @@ mod smokes {
         register_backlight(fw.clone() as Arc<dyn BacklightDevice>);
         register_backlight(raw.clone() as Arc<dyn BacklightDevice>);
 
-        // Dispatch through the owner handle: only the winner's
-        // hardware moves.
-        let owner = match panel_owner() {
-            Some(o) => o,
-            None => return TestResult::Fail("no panel owner elected"),
-        };
-        owner.set_brightness(40);
-        if raw.sets() != 1 || raw.level() != 40 {
-            return TestResult::Fail("owner did not receive the dispatch");
-        }
-        if fw.sets() != 0 {
-            return TestResult::Fail("deferred candidate was dispatched");
-        }
-
         // Publication: only the owner gets a sysfs directory, so no
         // userspace write can reach the loser either.
         populate_backlight_class();
@@ -657,6 +643,22 @@ mod smokes {
         }
         if class.get_child("acpi_video0").is_some() {
             return TestResult::Fail("deferred candidate was published to sysfs");
+        }
+
+        // Dispatch through the public sysfs path: a brightness store
+        // on the owner's kobject moves only the winner's hardware.
+        let kobj = match class.get_child("amdgpu_bl0") {
+            Some(k) => k,
+            None => return TestResult::Fail("owner kobj missing"),
+        };
+        if !matches!(kobj.attr_store("brightness", b"40\n"), Some(Ok(()))) {
+            return TestResult::Fail("brightness store failed");
+        }
+        if raw.sets() != 1 || raw.level() != 40 {
+            return TestResult::Fail("owner did not receive the dispatch");
+        }
+        if fw.sets() != 0 || fw.level() != 0 {
+            return TestResult::Fail("deferred candidate was dispatched");
         }
 
         __reset_all_for_test();

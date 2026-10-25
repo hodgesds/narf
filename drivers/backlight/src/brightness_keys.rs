@@ -47,8 +47,6 @@ use core::fmt::Write as FmtWrite;
 
 use narf_input::{push_key, KeyCode};
 
-use crate::BacklightDevice;
-
 // ── Notify code constants ──────────────────────────────────────────
 
 /// ACPI Notify value: Brightness Increment (Fn+F6 / XF86BrightnessUp).
