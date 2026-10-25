@@ -7,16 +7,14 @@ calibration, cryptographic signatures and opaque payloads are omitted. A replay
 with zero-filled gaps is a parser input, never a loadable or qualified firmware
 image. Full-image authentication and hardware acceptance remain separate.
 
-**Checkout state (issue #739):** the intel and mediatek `*.metadata.bin`
-extracts are committed. The qualcomm and broadcom extracts are **not** in
-git: the root `*.bin` gitignore rule silently excluded them when the tables
-landed (intel/mediatek carry a nested `!*.metadata.bin` negation; qualcomm
-and broadcom now carry one too, so regenerated extracts are committable).
-Until they are regenerated from the pinned originals and committed, a clean
-checkout has no qualcomm/broadcom extracts: `narf-drivers-wireless` builds
-regardless — its `build.rs` detects the absence and the affected golden
-replay tests report `Skip` — and the build prints a warning naming the
-regen command below.
+All Intel, MediaTek, Qualcomm and Broadcom `*.metadata.bin` extracts are
+committed alongside their provenance and Rust fixture tables. The ten
+Qualcomm/Broadcom extracts previously omitted by the root `*.bin` ignore
+rule (issue #739) are included, so a clean checkout runs their parser replay
+tests without installed vendor firmware or regeneration. Each vendor directory
+allows only `*.metadata.bin` through that rule; raw firmware remains excluded.
+If Qualcomm or Broadcom extracts are removed locally, `narf-drivers-wireless`'s
+`build.rs` still warns and registers the affected tests as `Skip`.
 
 The native Rust host tool reads each vendor's explicit provenance pins and
 complete raw-source SHA256 hashes. It does not download originals, update pins,

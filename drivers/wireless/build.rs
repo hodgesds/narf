@@ -5,10 +5,9 @@
 //! embed `*.metadata.bin` extracts via `include_bytes!`. Those extracts
 //! are produced by the native Rust `cargo xtask wifi-fixtures` command from SHA256-pinned vendor
 //! originals under `/lib/firmware`, which are not part of this repo.
-//! The intel and mediatek extracts are committed; the qualcomm and
-//! broadcom extracts were silently dropped by the root `*.bin` gitignore
-//! rule when the tables landed (issue #739) and are absent from a clean
-//! checkout.
+//! All metadata extracts are committed. The Qualcomm and Broadcom extracts
+//! previously omitted by the root `*.bin` gitignore rule (issue #739) are
+//! included too; a clean checkout needs no vendor originals to run these tests.
 //!
 //! For each vendor whose extracts are all present, emit a cfg
 //! (`narf_wifi_goldens_qualcomm` / `narf_wifi_goldens_broadcom`) that
