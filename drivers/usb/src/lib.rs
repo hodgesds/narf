@@ -306,6 +306,12 @@ fn spawn_supervisor_task() {
         // 0xFF means "not yet sampled" so the first sample doesn't
         // trip a spurious "PLS changed" reset.
         let mut last_pls = [0xFFu8; 128];
+        // Last controller recovery epoch observed. u64::MAX is the
+        // not-yet-sampled sentinel: the first sample just records
+        // the epoch (bindings are empty at boot anyway). A later
+        // change means `recover_controller` wiped every slot, so
+        // all bindings + claims are dropped wholesale.
+        let mut last_epoch: u64 = u64::MAX;
         // Cursor into the connected-ports list — try ONE port per
         // loop iteration, then advance + pump + sleep. The earlier
         // "for &p in &connected_root" body ran try_attach_root for
@@ -339,11 +345,71 @@ fn spawn_supervisor_task() {
                 irq_vector = c.irq_vector;
             }
 
+            // ── Controller recovery (HCE) + epoch invalidation ───
+            // If the controller signalled an internal error, drive
+            // the with-devices recovery (queue 10): it invalidates
+            // every generation and resets the hardware. Its epoch
+            // bump then tells us every binding/claim we hold names
+            // a dead slot — drop them all and let the normal attach
+            // phases re-enumerate from scratch.
+            if c.needs_recovery() {
+                let _ = c.recover_controller();
+            }
+            let epoch = c.recovery_epoch();
+            if epoch != last_epoch {
+                if last_epoch != u64::MAX {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  usb-supervisor: controller recovery epoch {}→{} — dropping all bindings for re-enumeration",
+                        last_epoch,
+                        epoch
+                    );
+                    attach::detach_all_bindings();
+                    claimed_root = 0;
+                    root_fail_count = [0u8; 128];
+                    last_pls = [0xFFu8; 128];
+                    next_root_idx = 0;
+                }
+                last_epoch = epoch;
+            }
+
             // ── Phase 1: try ONE root-hub port, then move on. ──────
             SUPERVISOR_PHASE.store(3, core::sync::atomic::Ordering::Relaxed);
             let connected_root: alloc::vec::Vec<u8> =
                 c.connected_ports().iter().map(|(p, _)| *p).collect();
             SUPERVISOR_PHASE.store(4, core::sync::atomic::Ordering::Relaxed);
+            // Disconnect pass: a claimed root port that no longer
+            // reports a connection was unplugged. Tear the binding
+            // down (class unbind → Disable Slot → slot reclaim) and
+            // clear the claim + retry budget, so a replug re-runs
+            // attach from scratch. The bit position in
+            // `claimed_root` IS the port number (attach claims
+            // `1 << (port & 127)`).
+            if claimed_root != 0 {
+                let mut gone: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                let mut mask = claimed_root;
+                while mask != 0 {
+                    let p = mask.trailing_zeros() as u8;
+                    mask &= mask - 1;
+                    if !connected_root.contains(&p) {
+                        gone.push(p);
+                    }
+                }
+                for p in gone {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  usb-supervisor: root port {} disconnected — detaching",
+                        p
+                    );
+                    if let Some(slot) = c.slot_for_route(p, 0) {
+                        attach::detach_slot(c, slot).await;
+                    }
+                    claimed_root &= !(1u128 << (p as u32 & 127));
+                    root_fail_count[(p as usize) & 127] = 0;
+                }
+            }
             // PLS-transition decay pass: for every connected port,
             // sample PORTSC.PLS. If it transitioned into U0 (link
             // active) since we last looked, clear the per-port fail
@@ -481,22 +547,55 @@ fn spawn_supervisor_task() {
                     })
                     .collect()
             };
-            for (idx, (route, tier, root_port, _hub_slot, num_ports, bound_mask)) in
+            for (idx, (route, tier, root_port, hub_slot, num_ports, bound_mask)) in
                 walks.iter().enumerate()
             {
                 // Snapshot the UsbHub copy out of the registry lock so
                 // both connected_downstream_ports() and try_attach_via_hub
                 // can run their now-async control transfers without
-                // holding an IrqSafeSpinLock across the .await.
+                // holding an IrqSafeSpinLock across the .await. The
+                // slot check matters now that detach can REMOVE a
+                // HUBS entry between the walks snapshot and here:
+                // without it, a shifted index would hand us the
+                // wrong hub for this (route, tier) pair.
                 let hub_copy: Option<crate::hub::UsbHub> = {
                     let g = HUBS.lock();
-                    g.get(idx).map(|h| h.hub)
+                    g.get(idx)
+                        .filter(|h| h.hub.slot_id == *hub_slot)
+                        .map(|h| h.hub)
                 };
                 let hub_copy = match hub_copy {
                     Some(h) => h,
                     None => continue,
                 };
                 let connected = hub_copy.connected_downstream_ports(c).await;
+                // Downstream disconnect pass: bound ports that left
+                // the connected set were unplugged. Detach each
+                // (class unbind → Disable Slot → reclaim) and clear
+                // its bound/suspended bits so a replug re-attaches.
+                let mut cleared_bits: u64 = 0;
+                {
+                    let mut scan = *bound_mask;
+                    while scan != 0 {
+                        let dp = scan.trailing_zeros() as u8;
+                        scan &= scan - 1;
+                        if !connected.contains(&dp) {
+                            let child_route =
+                                xhci::Topology::for_downstream(*route, *tier, dp).route_string;
+                            if let Some(slot) = c.slot_for_route(*root_port, child_route) {
+                                attach::detach_slot(c, slot).await;
+                            }
+                            cleared_bits |= 1u64 << (dp as u32 & 63);
+                        }
+                    }
+                }
+                if cleared_bits != 0 {
+                    let mut g = HUBS.lock();
+                    if let Some(h) = g.get_mut(idx) {
+                        h.bound_downstream &= !cleared_bits;
+                        h.suspended_downstream &= !cleared_bits;
+                    }
+                }
                 let mut new_bound_bits: u64 = 0;
                 for &dp in &connected {
                     if (*num_ports != 0) && dp > *num_ports {

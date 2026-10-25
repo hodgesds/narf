@@ -104,6 +104,15 @@ pub enum UsbProbeError {
 /// the dispatcher continues to the next registered driver.
 pub type UsbProbeFn = fn(device: Arc<USBDevice>) -> Result<(), UsbProbeError>;
 
+/// Unbind function signature — synchronous. Called with the slot id
+/// of a device being detached (unplug / supervisor teardown). The
+/// driver drops any binding it holds for that slot; drivers that
+/// never bound it must no-op. A driver registers an unbind hook via
+/// [`register_class_driver_with_unbind`]; without one, detach
+/// cannot reach the driver's private state (its slot is still
+/// disabled and reclaimed by the dispatcher).
+pub type UsbUnbindFn = fn(slot_id: u8);
+
 // ── Registry internals ──────────────────────────────────────────────
 
 /// Maximum registered USB class drivers. 16 is more than enough for
@@ -116,6 +125,8 @@ struct DriverEntry {
     /// entry matches (OR logic, matching Linux `usb_match_id`).
     matches: &'static [UsbClassMatch],
     probe: UsbProbeFn,
+    /// Optional detach hook, invoked by `dispatch_unbind`.
+    unbind: Option<UsbUnbindFn>,
 }
 
 /// The global USB class-driver registry.
@@ -138,6 +149,27 @@ pub fn register_class_driver(
     matches: &'static [UsbClassMatch],
     probe: UsbProbeFn,
 ) -> Result<(), UsbProbeError> {
+    register_class_driver_inner(name, matches, probe, None)
+}
+
+/// Register a USB class driver together with its detach hook. The
+/// hook is called by [`dispatch_unbind`] whenever any device is
+/// detached, with that device's slot id.
+pub fn register_class_driver_with_unbind(
+    name: &'static str,
+    matches: &'static [UsbClassMatch],
+    probe: UsbProbeFn,
+    unbind: UsbUnbindFn,
+) -> Result<(), UsbProbeError> {
+    register_class_driver_inner(name, matches, probe, Some(unbind))
+}
+
+fn register_class_driver_inner(
+    name: &'static str,
+    matches: &'static [UsbClassMatch],
+    probe: UsbProbeFn,
+    unbind: Option<UsbUnbindFn>,
+) -> Result<(), UsbProbeError> {
     let mut g = REGISTRY.lock();
     if g.len() >= MAX_DRIVERS {
         return Err(UsbProbeError::RegistryFull);
@@ -146,8 +178,26 @@ pub fn register_class_driver(
         name,
         matches,
         probe,
+        unbind,
     });
     Ok(())
+}
+
+/// Invoke every registered driver's unbind hook for `slot_id`
+/// (broadcast: hooks self-filter, since the registry does not track
+/// which driver claimed which slot). Returns the number of hooks
+/// invoked. Hooks run after the registry lock is released, so a
+/// hook may itself touch the registry or class state.
+pub fn dispatch_unbind(slot_id: u8) -> usize {
+    let hooks: alloc::vec::Vec<UsbUnbindFn> = {
+        let g = REGISTRY.lock();
+        g.iter().filter_map(|entry| entry.unbind).collect()
+    };
+    let count = hooks.len();
+    for hook in hooks {
+        hook(slot_id);
+    }
+    count
 }
 
 /// Return whether one match entry accepts this device. A non-zero

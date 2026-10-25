@@ -347,6 +347,15 @@ pub fn unregister_touchpad_evdev(slot_id: u8) {
     }
 }
 
+/// Unregister every bound touchpad. Called on a controller
+/// recovery epoch change.
+pub fn unregister_all_touchpads() {
+    let slots: alloc::vec::Vec<u8> = TOUCHPADS.lock().iter().map(|p| p.slot_id).collect();
+    for slot in slots {
+        unregister_touchpad_evdev(slot);
+    }
+}
+
 /// Drain reports from every bound touchpad. Each successful poll
 /// drives `ptp::decode_input` over the report bytes and pushes a
 /// `PointerEvent` (relative dx/dy + button state) onto the global

@@ -652,6 +652,50 @@ pub fn register_msc_block_device(idx: usize) {
     let _ = narf_block::partition::scan_and_register_partitions(arc, static_name);
 }
 
+/// Withdraw MSC_DEVICES[idx]'s block-layer publication: unregister
+/// the partition children first, then the disk itself.
+/// `narf_block::unregister_block_device` removes a single entry and
+/// has no cascade, so the children are snapshotted from the
+/// registry (entries whose `parent` is this disk) before the disk
+/// entry goes. Safe to call for an index that was never registered.
+pub fn unregister_msc_block_device(idx: usize) {
+    let name = alloc::format!("usb-msc{}", idx);
+    let children: Vec<&'static str> = narf_block::block_devices()
+        .iter()
+        .filter(|e| e.parent.is_some_and(|p| p == name.as_str()))
+        .map(|e| e.name)
+        .collect();
+    for child in children {
+        narf_block::unregister_block_device(child);
+    }
+    narf_block::unregister_block_device(&name);
+}
+
+/// Wholesale MSC teardown for controller recovery: remove every
+/// bound device from [`MSC_DEVICES`] and withdraw its block-layer
+/// publication (disk + partitions). This is the MSC half of the
+/// supervisor's epoch path (`attach::detach_all_bindings`).
+///
+/// The registry is cleared before the block entries go, so an
+/// adapter op that resolves its index after the clear fails with
+/// `BlockIoError::DeviceRemoved` instead of driving a slot the
+/// recovery path has already invalidated. Without this, recovery
+/// leaves the pre-recovery entries in place and re-enumeration
+/// appends a *second* live entry for the same physical device —
+/// two registered adapters for one BOT device, each fabricating
+/// its CBW tag space from 1, on a protocol with no multiplexing.
+pub fn unbind_all_msc() {
+    let count = {
+        let mut g = MSC_DEVICES.lock();
+        let n = g.len();
+        g.clear();
+        n
+    };
+    for idx in 0..count {
+        unregister_msc_block_device(idx);
+    }
+}
+
 /// Walk every connected port on the supplied xHCI controller and
 /// try to bring up an MSC BOT device on each one. Per-port flow
 /// mirrors the HID keyboard path: port_reset → enable_slot →

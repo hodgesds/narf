@@ -256,6 +256,23 @@ also consult upstream Linux GPL sources.
   entries against the device descriptor and class-triple entries against
   Interface Descriptors in `config`. A class-only entry is an explicit
   `(0, 0)` VID/PID wildcard, not a match for an unrelated interface.
+- Disconnect lifecycle: the supervisor polls connection state each cycle.
+  A claimed root port (or bound hub downstream port) that leaves the
+  connected set is detached via `attach::detach_slot`: class bindings are
+  dropped first (evdev nodes unregister; registered drivers are reached
+  through `class_registry::dispatch_unbind`, a broadcast of the optional
+  hook from `register_class_driver_with_unbind`), a hub's bound subtree
+  is detached recursively and its `HUBS` entry removed, then the slot is
+  disabled and reclaimed (`Xhci::reclaim_slot`) so a replug re-runs
+  attach from scratch. A controller recovery epoch change drops every
+  binding wholesale (`attach::detach_all_bindings`) and re-enumeration
+  follows; on that path the pumped classes are cleared from their
+  registries and every MSC device is removed and unpublished
+  (`msc::unbind_all_msc`). On the per-slot detach path, classes the
+  supervisor does not pump (MSC / UAC / UVC / CDC-NCM / btusb / CCID)
+  get the slot disable + reclaim but no class-registry removal yet;
+  the remaining non-pumped classes keep their registries across
+  recovery as well.
 - `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
   endpoint with its owning interface and alternate setting.
   `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest

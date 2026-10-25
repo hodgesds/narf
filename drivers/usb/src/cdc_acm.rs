@@ -610,6 +610,22 @@ pub async fn try_bind_cdc_acm_already_addressed(
     Ok(())
 }
 
+/// Detach the ACM device bound to `slot_id` (unplugged or torn
+/// down by the supervisor): drop the binding so `pump_all` stops
+/// polling the dead slot. Returns true when a binding was removed.
+pub fn detach_acm(slot_id: u8) -> bool {
+    let mut g = ACM_DEVICES.lock();
+    let before = g.len();
+    g.retain(|d| d.slot_id != slot_id);
+    g.len() != before
+}
+
+/// Drop every ACM binding. Called on a controller recovery epoch
+/// change.
+pub fn clear_acm() {
+    ACM_DEVICES.lock().clear();
+}
+
 /// Drain one report from each bound ACM device's bulk-IN endpoint
 /// and forward the bytes to the global input ring as
 /// [`narf_input::InputEvent::AsciiByte`] events. `/dev/console` reads

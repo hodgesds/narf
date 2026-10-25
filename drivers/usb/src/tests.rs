@@ -2071,6 +2071,64 @@ kernel_test_in!(
     smoke_usb_class_registry_checks_interface_triples
 );
 
+// ── drivers/usb/class-registry unbind dispatch ────────────────────
+//
+// The disconnect lifecycle (attach::detach_slot) reaches registered
+// class drivers through dispatch_unbind. The hook is broadcast:
+// every registered hook sees the slot and self-filters. This test
+// registers a hook for an unmatchable VID/PID (its probe can never
+// fire for a real device) and deliberately leaves it registered —
+// resetting the global registry would wipe drivers registered by
+// the boot initcalls for later smokes.
+
+static UNBIND_HOOK_LAST_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static UNBIND_HOOK_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static UNBIND_TEST_MATCHES: [crate::class_registry::UsbClassMatch; 1] =
+    [crate::class_registry::UsbClassMatch::vid_pid(
+        0xFFFE, 0xFFFE,
+    )];
+
+fn unbind_hook_record(slot: u8) {
+    UNBIND_HOOK_LAST_SLOT.store(slot, core::sync::atomic::Ordering::SeqCst);
+    UNBIND_HOOK_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
+fn unbind_test_probe(
+    _dev: alloc::sync::Arc<crate::device::USBDevice>,
+) -> Result<(), crate::class_registry::UsbProbeError> {
+    Err(crate::class_registry::UsbProbeError::UnsupportedVariant)
+}
+
+fn smoke_usb_class_registry_unbind_dispatch() -> TestResult {
+    use crate::class_registry::{dispatch_unbind, register_class_driver_with_unbind};
+    if register_class_driver_with_unbind(
+        "test-unbind-hook",
+        &UNBIND_TEST_MATCHES,
+        unbind_test_probe,
+        unbind_hook_record,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("hooked driver registration failed");
+    }
+    let before = UNBIND_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst);
+    let invoked = dispatch_unbind(9);
+    if invoked == 0 {
+        return TestResult::Fail("dispatch_unbind invoked no hooks");
+    }
+    if UNBIND_HOOK_LAST_SLOT.load(core::sync::atomic::Ordering::SeqCst) != 9 {
+        return TestResult::Fail("unbind hook did not receive the detached slot");
+    }
+    if UNBIND_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst) != before + 1 {
+        return TestResult::Fail("unbind hook was not called exactly once per dispatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/class-registry",
+    smoke_usb_class_registry_unbind_dispatch
+);
+
 fn smoke_usb_uac_finder_picks_audiocontrol_interface() -> TestResult {
     use crate::uac::{
         find_audio_control_interface, USB_AUDIO_SUBCLASS_AUDIOCONTROL, USB_CLASS_AUDIO,
