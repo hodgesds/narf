@@ -32,6 +32,7 @@ pub mod ohci;
 pub mod r8152;
 pub mod serial;
 pub mod uac;
+pub mod uac_card;
 pub mod uhci;
 pub mod uvc;
 pub mod wbdi;

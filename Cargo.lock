@@ -2356,6 +2356,7 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-drivers",
+ "narf-drivers-sound",
  "narf-drivers-video",
  "narf-filesystem",
  "narf-firmware",
