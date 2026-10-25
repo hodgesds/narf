@@ -4811,14 +4811,302 @@ const PANIC_MARKERS: &[&str] = &[
     "unsafe precondition",
 ];
 
-/// How long the kernel-test phase may print nothing before it is treated as
-/// hung. Every smoke reports a line when it finishes; no single smoke runs
-/// anywhere near this. `0` disables the check.
+/// How long the kernel-test phase may print nothing *and* leave QEMU
+/// CPU-idle before it is treated as hung. Serial silence alone is not a
+/// reliable hang signal under TCG: a smoke can compute for minutes without
+/// emitting a line (#693). `0` disables the check.
 fn kernel_test_idle_secs() -> u64 {
     std::env::var("XTASK_QEMU_IDLE_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(300)
+}
+
+const QEMU_CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+const QEMU_CPU_ACTIVITY_WINDOW: Duration = Duration::from_secs(5);
+const QEMU_CPU_MIN_ACTIVITY_WINDOW: Duration = Duration::from_secs(1);
+
+/// QEMU process CPU use over a trailing observation window.
+///
+/// Linux reports a process's user + system time in `/proc/<pid>/stat` in
+/// clock ticks (USER_HZ: 100 ticks per second on the Linux platforms xtask
+/// supports). QEMU has several host threads, so this measures emulator work
+/// in aggregate rather than identifying a particular vCPU. That aggregate is
+/// the useful distinction here: a guest doing TCG compute keeps QEMU busy,
+/// while a blocked or wedged guest lets the emulator go idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuActivityObservation {
+    window: Duration,
+    process_cpu_ticks: u64,
+}
+
+impl CpuActivityObservation {
+    /// Whether QEMU averaged at least 10% of one host core over the window.
+    ///
+    /// The ticks/window comparison is arranged to avoid floating point:
+    /// CPU fraction is `ticks / (100 * window_seconds)`, so 10% is
+    /// `ticks * 100 >= window_milliseconds`.
+    fn is_busy(self) -> bool {
+        self.window >= QEMU_CPU_MIN_ACTIVITY_WINDOW
+            && u128::from(self.process_cpu_ticks).saturating_mul(100) >= self.window.as_millis()
+    }
+
+    fn one_core_percent(self) -> f64 {
+        if self.window.is_zero() {
+            0.0
+        } else {
+            (self.process_cpu_ticks as f64 * 1_000.0) / self.window.as_millis() as f64
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LivenessDecision {
+    Alive,
+    KillForIdleness,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LivenessObservation {
+    serial_silence: Duration,
+    idle_timeout: Duration,
+    cpu_activity: Option<CpuActivityObservation>,
+}
+
+/// The kernel-test idle-kill decision, factored out for unit tests.
+///
+/// Fresh serial output is always liveness. Once output has been absent for
+/// the configured timeout, a CPU-busy QEMU is still alive; a CPU-idle QEMU
+/// is killed. Hosts where process CPU cannot be sampled fall back to the
+/// historical serial-silence-only behaviour rather than letting an
+/// unsamplable guest run until the overall phase cap.
+fn liveness_decision(observation: LivenessObservation) -> LivenessDecision {
+    // Two independent signs of life, one verdict: fresh serial output
+    // within the idle timeout (or the check disabled entirely), or — once
+    // serial has been quiet past the timeout — a CPU-busy QEMU, which
+    // under TCG means the guest is computing, not hung.
+    if observation.idle_timeout.is_zero()
+        || observation.serial_silence < observation.idle_timeout
+        || observation
+            .cpu_activity
+            .is_some_and(CpuActivityObservation::is_busy)
+    {
+        LivenessDecision::Alive
+    } else {
+        LivenessDecision::KillForIdleness
+    }
+}
+
+/// Parse user + system CPU ticks from a Linux `/proc/<pid>/stat` record.
+///
+/// The command name is parenthesised and may itself contain spaces or
+/// parentheses, so fields are counted from the final `)`. After that point,
+/// field 14 (`utime`) is the twelfth token and field 15 (`stime`) is next.
+#[cfg(any(target_os = "linux", test))]
+fn parse_process_cpu_ticks(stat: &str) -> Option<u64> {
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+    let utime = fields.nth(11)?.parse::<u64>().ok()?;
+    let stime = fields.next()?.parse::<u64>().ok()?;
+    utime.checked_add(stime)
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_process_cpu_ticks(&stat)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_process_cpu_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Rolling QEMU-process CPU sampler used by the liveness check.
+struct QemuCpuLivenessTracker {
+    pid: u32,
+    samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+    next_sample: std::time::Instant,
+    last_successful_sample: Option<std::time::Instant>,
+}
+
+impl QemuCpuLivenessTracker {
+    fn new(pid: u32, now: std::time::Instant) -> Self {
+        let mut tracker = Self {
+            pid,
+            samples: std::collections::VecDeque::new(),
+            next_sample: now,
+            last_successful_sample: None,
+        };
+        tracker.sample(now);
+        tracker
+    }
+
+    fn sample(&mut self, now: std::time::Instant) {
+        if let Some(ticks) = read_process_cpu_ticks(self.pid) {
+            self.samples.push_back((now, ticks));
+            self.last_successful_sample = Some(now);
+        }
+        self.next_sample = now + QEMU_CPU_SAMPLE_INTERVAL;
+    }
+
+    fn observe(&mut self, now: std::time::Instant) -> Option<CpuActivityObservation> {
+        if now >= self.next_sample {
+            self.sample(now);
+        }
+        let last_successful_sample = self.last_successful_sample?;
+        if now.duration_since(last_successful_sample) > QEMU_CPU_SAMPLE_INTERVAL * 4 {
+            return None;
+        }
+        if let Some(cutoff) = now.checked_sub(QEMU_CPU_ACTIVITY_WINDOW) {
+            // Keep the newest sample at or before the cutoff as the baseline;
+            // it gives the delta a full-window span without retaining an
+            // unbounded history for a multi-hour phase.
+            let baseline = self
+                .samples
+                .iter()
+                .rposition(|(sample_at, _)| *sample_at <= cutoff)
+                .unwrap_or(0);
+            self.samples.drain(..baseline);
+        }
+        let (first_at, first_ticks) = self.samples.front().copied()?;
+        let (last_at, last_ticks) = self.samples.back().copied()?;
+        if first_at == last_at {
+            return None;
+        }
+        Some(CpuActivityObservation {
+            window: last_at.duration_since(first_at),
+            process_cpu_ticks: last_ticks.saturating_sub(first_ticks),
+        })
+    }
+}
+
+fn format_cpu_activity(activity: Option<CpuActivityObservation>) -> String {
+    match activity {
+        Some(activity) => format!(
+            "{} ({} process CPU ticks over {:.1}s; {:.1}% of one host core)",
+            if activity.is_busy() { "busy" } else { "idle" },
+            activity.process_cpu_ticks,
+            activity.window.as_secs_f64(),
+            activity.one_core_percent(),
+        ),
+        None => "unavailable (host process CPU sampling unsupported or unreadable)".to_string(),
+    }
+}
+
+fn idle_kill_reason(idle_secs: u64, cpu_activity: Option<CpuActivityObservation>) -> String {
+    match cpu_activity {
+        Some(activity) if !activity.is_busy() => format!(
+            "printed nothing for {idle_secs}s and QEMU was CPU-idle \
+             (kernel hang; XTASK_QEMU_IDLE_SECS adjusts)"
+        ),
+        Some(_) => format!(
+            "printed nothing for {idle_secs}s \
+             (kernel hang; XTASK_QEMU_IDLE_SECS adjusts)"
+        ),
+        None => format!(
+            "printed nothing for {idle_secs}s (kernel hang; \
+             XTASK_QEMU_IDLE_SECS adjusts; QEMU CPU sampling unavailable, \
+             so serial silence alone triggered the kill)"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod qemu_liveness_tests {
+    use super::{
+        format_cpu_activity, liveness_decision, parse_process_cpu_ticks, CpuActivityObservation,
+        LivenessDecision, LivenessObservation,
+    };
+    use std::time::Duration;
+
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+    fn cpu(window: Duration, process_cpu_ticks: u64) -> Option<CpuActivityObservation> {
+        Some(CpuActivityObservation {
+            window,
+            process_cpu_ticks,
+        })
+    }
+
+    fn decision(
+        serial_silence: Duration,
+        cpu_activity: Option<CpuActivityObservation>,
+    ) -> LivenessDecision {
+        liveness_decision(LivenessObservation {
+            serial_silence,
+            idle_timeout: IDLE_TIMEOUT,
+            cpu_activity,
+        })
+    }
+
+    #[test]
+    fn recent_serial_output_is_alive_even_when_qemu_is_cpu_idle() {
+        assert_eq!(
+            decision(
+                IDLE_TIMEOUT - Duration::from_secs(1),
+                cpu(Duration::from_secs(5), 0),
+            ),
+            LivenessDecision::Alive
+        );
+    }
+
+    #[test]
+    fn silent_but_cpu_busy_qemu_is_alive() {
+        // 50 ticks in five seconds is exactly 10% of one host core at
+        // Linux's 100-ticks-per-second process accounting rate.
+        assert_eq!(
+            decision(IDLE_TIMEOUT, cpu(Duration::from_secs(5), 50)),
+            LivenessDecision::Alive
+        );
+    }
+
+    #[test]
+    fn silent_and_cpu_idle_qemu_is_killed() {
+        assert_eq!(
+            decision(IDLE_TIMEOUT, cpu(Duration::from_secs(5), 49)),
+            LivenessDecision::KillForIdleness
+        );
+        assert_eq!(
+            decision(IDLE_TIMEOUT, cpu(Duration::from_secs(5), 0)),
+            LivenessDecision::KillForIdleness
+        );
+    }
+
+    #[test]
+    fn silent_qemu_without_cpu_sampling_uses_the_legacy_kill() {
+        assert_eq!(
+            decision(IDLE_TIMEOUT, None),
+            LivenessDecision::KillForIdleness
+        );
+    }
+
+    #[test]
+    fn cpu_activity_requires_a_full_second_of_observation() {
+        assert_eq!(
+            decision(IDLE_TIMEOUT, cpu(Duration::from_millis(999), 10)),
+            LivenessDecision::KillForIdleness
+        );
+        assert_eq!(
+            decision(IDLE_TIMEOUT, cpu(Duration::from_secs(1), 10)),
+            LivenessDecision::Alive
+        );
+    }
+
+    #[test]
+    fn parses_user_and_system_ticks_after_a_parenthesised_command_name() {
+        // After the command name, tokens are fields 3..; values 111 and 222
+        // occupy fields 14 (utime) and 15 (stime).
+        let stat = "4242 (qemu system (x86_64)) S 1 2 3 4 5 6 7 8 9 10 111 222 0";
+        assert_eq!(parse_process_cpu_ticks(stat), Some(333));
+    }
+
+    #[test]
+    fn kill_evidence_names_the_observed_cpu_state() {
+        assert!(format_cpu_activity(cpu(Duration::from_secs(5), 0)).starts_with("idle (0"));
+        assert!(format_cpu_activity(cpu(Duration::from_secs(5), 50)).starts_with("busy (50"));
+        assert!(format_cpu_activity(None).starts_with("unavailable"));
+    }
 }
 
 /// The last non-empty serial line: in the kernel-test phase, the last smoke
@@ -5039,6 +5327,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         .with_context(|| format!("failed to spawn {qemu}"))?;
     let tee_stdout = serial_tee_enabled();
     let started = std::time::Instant::now();
+    let mut cpu_liveness = QemuCpuLivenessTracker::new(child.id(), started);
     let progress = std::sync::Arc::new(SerialProgress::default());
     let reader_progress = progress.clone();
     let serial_reader = child.stdout.take().map(|stdout| {
@@ -5068,21 +5357,28 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         let silent_ms = (now - started)
             .as_millis()
             .saturating_sub(u128::from(progress.last_output_ms.load(Ordering::Acquire)));
+        let serial_silence = Duration::from_millis(u64::try_from(silent_ms).unwrap_or(u64::MAX));
+        let cpu_activity = cpu_liveness.observe(now);
         if progress.panicked.load(Ordering::Acquire) && panic_seen_at.is_none() {
             panic_seen_at = Some(now);
         }
         let reason = if now >= deadline {
             Some(format!("timed out after {secs}s (possible kernel hang)"))
-        } else if gate_exit && idle_secs != 0 && silent_ms >= u128::from(idle_secs) * 1000 {
-            Some(format!(
-                "printed nothing for {idle_secs}s (kernel hang; XTASK_QEMU_IDLE_SECS adjusts)"
-            ))
+        } else if gate_exit
+            && liveness_decision(LivenessObservation {
+                serial_silence,
+                idle_timeout: Duration::from_secs(idle_secs),
+                cpu_activity,
+            }) == LivenessDecision::KillForIdleness
+        {
+            Some(idle_kill_reason(idle_secs, cpu_activity))
         } else if panic_seen_at.is_some_and(|at| now - at >= PANIC_GRACE) {
             Some("reported a kernel panic/fault and did not exit".to_string())
         } else {
             None
         };
         if let Some(reason) = reason {
+            let cpu_state = format_cpu_activity(cpu_activity);
             child.kill()?;
             child.wait()?;
             let serial = serial_reader
@@ -5090,7 +5386,8 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
                 .unwrap_or_default();
             emit_serial_tail(&serial);
             bail!(
-                "xtask: {qemu} {reason} after {}s; last serial line: {}",
+                "xtask: {qemu} {reason} after {}s; QEMU process CPU at kill: {cpu_state}; \
+                 last serial line: {}",
                 started.elapsed().as_secs(),
                 last_serial_line(&serial)
             );
