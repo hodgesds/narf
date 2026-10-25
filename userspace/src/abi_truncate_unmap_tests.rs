@@ -385,13 +385,21 @@ kernel_test_in!(
 );
 
 /// Byte-built FAT12 image holding one file, `NARF.TXT`, whose content is
-/// `data` spread over a cluster chain (512-byte clusters, one-sector
-/// FATs). Modeled on `drivers/fs/fat`'s own test-image builder, extended
-/// to a multi-cluster chain.
+/// `data` spread over a cluster chain (512-byte clusters). Modeled on
+/// `drivers/fs/fat`'s own test-image builder, extended to a
+/// multi-cluster chain. Each FAT copy is sized to the chain (see the
+/// sizing note in the body): this fixture's file needs 24 clusters and
+/// one sector, but the identical one-sector builder in
+/// `abi_readahead_tests` panicked out of bounds on that fixture's
+/// 1024-cluster chain, so both copies derive the FAT size rather than
+/// assume it.
 fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
     use alloc::vec;
     const LBS: usize = 512;
     fn fat12_set(fat: &mut [u8], idx: u32, val: u16) {
+        // Contract: `fat` covers entry `idx` — bytes `idx + idx / 2`
+        // and `idx + idx / 2 + 1`. The caller passes a whole FAT copy
+        // sized to the chain, which covers every entry written.
         let off = (idx + idx / 2) as usize;
         let v = val & 0x0FFF;
         if idx % 2 == 0 {
@@ -403,7 +411,15 @@ fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
         }
     }
     let clusters = (data.len() as u32).div_ceil(LBS as u32);
-    let total_sectors = 4 + clusters;
+    // FAT12 packs each entry into 1.5 bytes and the chain writes
+    // entries 0..=clusters + 1 (reserved pair plus the chain), whose
+    // highest entry touches byte `last + last / 2 + 1` — so one FAT
+    // copy needs `last + last / 2 + 2` bytes, i.e. one sector per 341
+    // entries.
+    let last = clusters + 1;
+    let fat_secs = (last + last / 2 + 2).div_ceil(LBS as u32);
+    let data_sec = 2 + 2 * fat_secs;
+    let total_sectors = data_sec + clusters;
     let mut img = vec![0u8; LBS * total_sectors as usize];
     img[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
     img[3..11].copy_from_slice(b"NARFFAT ");
@@ -414,11 +430,12 @@ fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
     img[17..19].copy_from_slice(&16u16.to_le_bytes()); // root_ent_cnt
     img[19..21].copy_from_slice(&(total_sectors as u16).to_le_bytes());
     img[21] = 0xF8; // media
-    img[22..24].copy_from_slice(&1u16.to_le_bytes()); // fat_sz_16
+    img[22..24].copy_from_slice(&(fat_secs as u16).to_le_bytes()); // fat_sz_16
     img[510] = 0x55;
     img[511] = 0xAA;
-    for lba in [1usize, 2] {
-        let fat = &mut img[lba * LBS..lba * LBS + LBS];
+    for copy in 0..2 {
+        let fat_start = (1 + copy * fat_secs) as usize;
+        let fat = &mut img[fat_start * LBS..fat_start * LBS + fat_secs as usize * LBS];
         fat12_set(fat, 0, 0xFF8);
         fat12_set(fat, 1, 0xFFF);
         for c in 0..clusters {
@@ -427,12 +444,12 @@ fn fat12_image(data: &[u8]) -> alloc::vec::Vec<u8> {
             fat12_set(fat, idx, val as u16);
         }
     }
-    let entry = &mut img[3 * LBS..3 * LBS + 32];
+    let entry = &mut img[(data_sec as usize - 1) * LBS..(data_sec as usize - 1) * LBS + 32];
     entry[0..11].copy_from_slice(b"NARF    TXT");
     entry[11] = 0x20; // ARCHIVE
     entry[26..28].copy_from_slice(&2u16.to_le_bytes()); // fst_clus_lo
     entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
-    img[4 * LBS..4 * LBS + data.len()].copy_from_slice(data);
+    img[data_sec as usize * LBS..data_sec as usize * LBS + data.len()].copy_from_slice(data);
     img
 }
 
