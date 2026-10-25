@@ -60,10 +60,19 @@ struct Fixture {
     hole_fault_zero: bool,
 }
 
+/// A fixture's keep-alive anchor: state the installed ops only borrow,
+/// which must therefore outlive the scenario. btrfs nodes hold their
+/// mount view (`BtrfsVolume`) by `Weak` — a node whose view has been
+/// dropped answers every I/O op with `NotFound` — so the btrfs fixture
+/// returns its view here and `with_file` keeps it bound until `body`
+/// has run. memfs and FAT nodes own their backing (a FAT node holds
+/// its volume by `Arc`) and return `None`.
+type KeepAlive = Option<alloc::boxed::Box<dyn core::any::Any>>;
+
 /// Give the harness task an address space, install `ops` as an fd opened
 /// read-write, and run `body` against them.
 fn with_file(
-    make_ops: impl FnOnce() -> Result<Arc<dyn FileOps>, &'static str>,
+    make_ops: impl FnOnce() -> Result<(Arc<dyn FileOps>, KeepAlive), &'static str>,
     hole_fault_zero: bool,
     body: impl FnOnce(&Fixture) -> Result<(), &'static str>,
 ) -> TestResult {
@@ -77,7 +86,9 @@ fn with_file(
         *TRUNC_AS.lock() = Some(Arc::clone(&aspace));
         crate::handlers::install_address_space_lookup(lookup_trunc_as);
         let result = (|| {
-            let ops = make_ops()?;
+            // `_keep_alive` must stay bound until `body` has run: it is
+            // dropped at the end of this closure, after the scenario.
+            let (ops, _keep_alive) = make_ops()?;
             let fd = crate::fd::install(
                 FAKE_TASK,
                 crate::fd::FdEntry {
@@ -362,7 +373,7 @@ fn smoke_truncate_unmap_memfs() -> TestResult {
             if written != bytes.len() {
                 return Err("tmpfs seed write was short");
             }
-            Ok(file)
+            Ok((file, None))
         },
         true,
         run_scenario,
@@ -442,7 +453,7 @@ fn smoke_truncate_unmap_fat() -> TestResult {
                 crate::handlers::poll_io_to_completion(volume.root().lookup_async("NARF.TXT"))
                     .and_then(|r| r.ok())
                     .ok_or("lookup of NARF.TXT failed")?;
-            Ok(file)
+            Ok((file, None))
         },
         false,
         run_scenario,
@@ -573,7 +584,17 @@ fn smoke_truncate_unmap_btrfs() -> TestResult {
                 crate::handlers::poll_io_to_completion(volume.root().lookup_async("narf.txt"))
                     .and_then(|r| r.ok())
                     .ok_or("lookup of narf.txt failed")?;
-            Ok(file)
+            // The looked-up node holds the volume by `Weak` only, so
+            // the view itself is the keep-alive anchor: were it dropped
+            // with this closure, the scenario's first fault would meet
+            // a node whose every read answers `NotFound` (surfacing as
+            // a refused in-EOF fault, `Bus`) — the #863 seed fault-in
+            // failure. The sibling btrfs fixtures bind the volume
+            // across their scenario for the same reason.
+            Ok((
+                file,
+                Some(alloc::boxed::Box::new(volume) as alloc::boxed::Box<dyn core::any::Any>),
+            ))
         },
         // btrfs holes (dropped extents, never-allocated ranges) read
         // back as zeros, so a regrown range faults in as zero pages.
