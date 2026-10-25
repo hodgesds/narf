@@ -22,9 +22,29 @@ pub struct CommandBuilder {
 }
 
 impl CommandBuilder {
+    /// Start a command with the `TPM_ST_NO_SESSIONS` tag. Only valid
+    /// for commands without authorization handles (e.g. GetRandom,
+    /// PCR_Read): the TPM parses parameters immediately after the
+    /// handle area under this tag.
     pub fn new(cc: CommandCode) -> Self {
+        Self::with_tag(cc, TPM_ST_NO_SESSIONS)
+    }
+
+    /// Start a command with the `TPM_ST_SESSIONS` tag. Required for
+    /// every command whose handles carry an authorization area
+    /// (PCR_Extend, Create, …): the TPM reads the authorizationSize
+    /// field after the handles *only* under this tag — under
+    /// `TPM_ST_NO_SESSIONS` those bytes are parsed as the first
+    /// parameter instead (TCG Part 1 §18.5). Emitting a session area
+    /// under the no-sessions tag produces a malformed frame a real
+    /// TPM rejects (#937).
+    pub fn new_with_sessions(cc: CommandCode) -> Self {
+        Self::with_tag(cc, TPM_ST_SESSIONS)
+    }
+
+    fn with_tag(cc: CommandCode, tag: u16) -> Self {
         let mut buf = Vec::with_capacity(64);
-        buf.extend_from_slice(&TPM_ST_NO_SESSIONS.to_be_bytes());
+        buf.extend_from_slice(&tag.to_be_bytes());
         buf.extend_from_slice(&0u32.to_be_bytes()); // placeholder for size
         buf.extend_from_slice(&(cc as u32).to_be_bytes());
         Self { buf }
@@ -53,10 +73,17 @@ impl CommandBuilder {
     }
 
     /// Build TPM2_PCR_Extend command (§22.2).
+    ///
+    /// The pcrHandle is an authorization handle, so the frame uses
+    /// the `TPM_ST_SESSIONS` tag with the empty password session
+    /// (`TPM_RS_PW`) — the same encoding as
+    /// `drivers/tpm/src/tpm2/commands.rs::pcr_extend`. Under
+    /// `TPM_ST_NO_SESSIONS` the TPM would parse the authorizationSize
+    /// as the TPML_DIGEST_VALUES count and reject the command (#937).
     pub fn pcr_extend(pcr: u32, digest: &[u8]) -> Vec<u8> {
-        let mut cb = Self::new(CommandCode::PcrExtend);
+        let mut cb = Self::new_with_sessions(CommandCode::PcrExtend);
         cb.push_u32(pcr); // pcrHandle
-                          // authHandle (empty password session)
+                          // authorization area (empty password session)
         cb.push_u32(9); // size of authorizationArea
         cb.push_u32(0x40000009); // TPM_RS_PW
         cb.push_u16(0); // nonceSize

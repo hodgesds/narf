@@ -489,20 +489,7 @@ impl TpmDevice for Tpm {
     }
 
     async fn extend_pcr(&self, pcr: u32, digest: &[u8]) -> Result<(), HighLevelTpmError> {
-        // TPM2_CC_PCR_Extend: tag=0x8001, cc=0x00000182, pcrIndex=u32, auth=0, count=1, alg=SHA256, digest
-        let mut req = Vec::new();
-        req.extend_from_slice(&0x8001u16.to_be_bytes());
-        req.extend_from_slice(&(10 + 4 + 4 + 4 + 2 + 32u32).to_be_bytes()); // size
-        req.extend_from_slice(&0x0000_0182u32.to_be_bytes());
-        req.extend_from_slice(&pcr.to_be_bytes());
-        // authArea (empty session)
-        req.extend_from_slice(&0u32.to_be_bytes());
-        // digestCount = 1
-        req.extend_from_slice(&1u32.to_be_bytes());
-        // alg = SHA256 (0x000B)
-        req.extend_from_slice(&0x000Bu16.to_be_bytes());
-        req.extend_from_slice(digest);
-
+        let req = build_pcr_extend_request(pcr, digest);
         let _resp = self.submit_raw(&req).await?;
         Ok(())
     }
@@ -530,6 +517,23 @@ impl TpmDevice for Tpm {
         // The PCR value is at the end of the response for a single PCR read.
         Ok(resp[resp.len() - 32..].to_vec())
     }
+}
+
+/// Build the `TPM2_PCR_Extend` request submitted by `extend_pcr`.
+///
+/// The frame comes from the canonical `narf_tpm` builder — the
+/// `TPM_ST_SESSIONS` + `TPM_RS_PW` encoding of TPM 2.0 Part 3
+/// §22.2, identical in structure to
+/// `drivers/tpm/src/tpm2/commands.rs::pcr_extend`. A hand-rolled
+/// copy here previously emitted `TPM_ST_NO_SESSIONS` with a zero
+/// authorizationSize (and a commandSize hardcoded to a 32-byte
+/// digest): a real TPM parses the digest count as 0 and rejects
+/// the command with `TPM_RC_VALUE` (#937). Factored out of the
+/// trait method so the kernel-test fixture
+/// (`smoke_tpm_pcr_extend_request_bytes`) can pin the exact wire
+/// bytes at this seam without hardware.
+pub fn build_pcr_extend_request(pcr: u32, digest: &[u8]) -> Vec<u8> {
+    narf_tpm::commands::CommandBuilder::pcr_extend(pcr, digest)
 }
 
 // ── Singleton ──────────────────────────────────────────────────────
