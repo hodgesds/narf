@@ -451,7 +451,9 @@ the USB download itself remains a target-silicon gate.
   and 4 KiB logical-block media without exceeding the xHCI DMA buffer.
   The adapter also performs SYNCHRONIZE CACHE(10) for `flush()` and
   WRITE(10) with the FUA bit for `write_fua()`, so its advertised Flush/FUA
-  capabilities are issued on the wire (#829).
+  capabilities are issued on the wire (#829). FUA requests use the same
+  bounded chunks and whole-request range validation as ordinary writes;
+  every chunk carries FUA and the claim remains held until completion.
 - **Hub** (`hub`): hub class enumeration, multiple-TT detection from the
   Device Descriptor protocol, TT think-time propagation, and downstream
   route addressing so low/full-speed devices behind high-speed hubs are

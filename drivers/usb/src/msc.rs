@@ -1395,9 +1395,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        let lba32: u32 = lba
-            .try_into()
-            .map_err(|_| narf_block::BlockIoError::OutOfRange)?;
+        let chunks = block_chunks(lba, n_blocks, self.lba_size)?;
         let expected = n_blocks as usize * self.lba_size as usize;
         if data.len() < expected {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -1406,15 +1404,15 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
         let Some(_claim) = MscIoClaim::acquire(self.idx) else {
             return Err(narf_block::BlockIoError::DriverError);
         };
-        let result = sync_bridge(async {
-            dev_snapshot
-                .write_blocks_fua(&c, lba32, n_blocks, &data[..expected])
-                .await
-        });
-        match result {
-            Ok(()) => Ok(()),
-            Err(_) => Err(narf_block::BlockIoError::DriverError),
-        }
+        sync_bridge(async {
+            for (start, count, bytes) in chunks {
+                dev_snapshot
+                    .write_blocks_fua(&c, start, count, &data[bytes])
+                    .await
+                    .map_err(|_| narf_block::BlockIoError::DriverError)?;
+            }
+            Ok(())
+        })
     }
     fn read(
         &self,
@@ -1590,4 +1588,27 @@ mod block_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/msc", smoke_msc_filesystem_request_chunks);
+
+    fn smoke_msc_fua_preflights_whole_request() -> TestResult {
+        use narf_block::{BlockDeviceSync, BlockIoError};
+        let device = UsbMscBlockDevice {
+            idx: usize::MAX,
+            generation: 0,
+            lba_size: 512,
+            capacity: u64::MAX,
+        };
+        // The first LBA fits WRITE(10), but the final one does not. Refuse
+        // the whole request before looking up transport or taking a claim.
+        if device.write_fua(u32::MAX as u64, 2, &[0; 1024]) != Err(BlockIoError::OutOfRange) {
+            return TestResult::Fail("FUA did not validate the complete WRITE(10) range");
+        }
+        // An exactly representable request passes preflight and reaches
+        // the normal stale/missing-device gate, without touching a controller.
+        if device.write_fua(u32::MAX as u64 - 1, 2, &[0; 1024]) != Err(BlockIoError::DeviceRemoved)
+        {
+            return TestResult::Fail("FUA refused a valid boundary request before identity lookup");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/msc", smoke_msc_fua_preflights_whole_request);
 }
