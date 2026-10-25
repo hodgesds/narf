@@ -1345,14 +1345,14 @@ mod tests {
 
     const FE_P: Fe = [
         0xFFFF_FFFF_FFFF_FFFF,
-        0xFFFF_FFFF_FFFF_FFFF,
         0x0000_0000_FFFF_FFFF,
+        0x0000_0000_0000_0000,
         0xFFFF_FFFF_0000_0001,
     ];
     const FE_P_MINUS_2: Fe = [
         0xFFFF_FFFF_FFFF_FFFD,
-        0xFFFF_FFFF_FFFF_FFFF,
         0x0000_0000_FFFF_FFFF,
+        0x0000_0000_0000_0000,
         0xFFFF_FFFF_0000_0001,
     ];
     const FE_B: Fe = [
@@ -1886,7 +1886,14 @@ mod tests {
         {
             return Err("peer model self-check failed: CMAC RFC 4493 one-block vector");
         }
-        // P-256 anchors: 1·G = G, n·G = O, (n−1)·G = −G.
+        // P-256 anchors. G on the curve comes first: a wrong
+        // field prime fails this one check and names the modulus
+        // as the defect, instead of surfacing later as an n·G
+        // scalar failure.
+        if !peer_on_curve(&GEN_X, &GEN_Y) {
+            return Err("peer model self-check failed: generator is not on the curve");
+        }
+        // 1·G = G, n·G = O, (n−1)·G = −G.
         let one: Fe = [1, 0, 0, 0];
         if jac_to_affine(&jac_scalar_mul(&one, &GEN_X, &GEN_Y)) != Some((GEN_X, GEN_Y)) {
             return Err("peer model self-check failed: 1*G is not the generator");
