@@ -464,13 +464,30 @@ fn skip_props(blob: &[u8], mut cur: usize, end: usize) -> usize {
 // Convenience helpers
 // ───────────────────────────────────────────────────────────────────
 
-pub fn chosen_bootargs(blob: &[u8]) -> Option<heapless_str::Bytes<256>> {
-    let mut found: Option<heapless_str::Bytes<256>> = None;
+/// Capacity of the buffer [`chosen_bootargs`] copies `/chosen/bootargs`
+/// into. Sized to match the boot store's `CMDLINE_CAP` and Linux's
+/// `COMMAND_LINE_SIZE` (2048): tooling-built guest cmdlines (e.g.
+/// xtask's `test_subsystem=<list> test_subsystem_exclude=<prefix>`
+/// append on affected-filter test runs) run to ~480 bytes, and the
+/// previous 256-byte cap silently dropped every token past byte 255
+/// on the FDT path (#960).
+pub const BOOTARGS_CAP: usize = 2048;
+
+/// Copy `/chosen/bootargs` out of the blob.
+///
+/// A value longer than [`BOOTARGS_CAP`] is truncated to the cap, so a
+/// truncated result is exactly `BOOTARGS_CAP` bytes long. The one
+/// production caller (the aarch64 boot store) keeps at most
+/// `BOOTARGS_CAP - 1` bytes, so a full-width result never fits
+/// silently there — it trips the store's truncation warning instead
+/// of losing tokens quietly.
+pub fn chosen_bootargs(blob: &[u8]) -> Option<heapless_str::Bytes<BOOTARGS_CAP>> {
+    let mut found: Option<heapless_str::Bytes<BOOTARGS_CAP>> = None;
     walk_nodes(blob, |path, props| {
         if path.matches(&["chosen"]) {
             for (name, value) in props {
                 if name == "bootargs" {
-                    let mut out = heapless_str::Bytes::<256>::new();
+                    let mut out = heapless_str::Bytes::<BOOTARGS_CAP>::new();
                     let n = value.len().min(out.cap()).saturating_sub(0);
                     // strip trailing NUL if present
                     let n = if n > 0 && value[n - 1] == 0 { n - 1 } else { n };

@@ -27,9 +27,23 @@ static mut MEMORY_MAP: [MemRegion; MAX_MEM_REGIONS] = [MemRegion {
 }; MAX_MEM_REGIONS];
 static mut MEMORY_MAP_LEN: usize = 0;
 
-const CMDLINE_CAP: usize = 256;
+/// Backing buffer for the bootloader-supplied command-line. Copied
+/// out of the DTB during `parse_raw`, then borrowed as a `&'static
+/// str` for the rest of boot.
+///
+/// Sized to match Linux's `COMMAND_LINE_SIZE` (2048 on arm64) and the
+/// x86_64 store, so the full cmdline survives into `/proc/cmdline` —
+/// userspace (systemd's `systemd.*` params, etc.) reads its own
+/// tokens from there, so any truncation here silently drops them.
+/// The test harness's tokens ride the same string: on affected-filter
+/// runs xtask appends `test_subsystem=<~430-byte list>
+/// test_subsystem_exclude=drivers/gpu` (~480 bytes), and the previous
+/// 256-byte cap silently ate the exclude token — and the last wanted
+/// subsystems — on this arch only (#960).
+const CMDLINE_CAP: usize = 2048;
 static mut CMDLINE_BYTES: [u8; CMDLINE_CAP] = [0; CMDLINE_CAP];
 static mut CMDLINE_LEN: usize = 0;
+static mut CMDLINE_TRUNCATED: bool = false;
 
 /// Borrow the DTB-supplied command line as a `&'static str`.
 ///
@@ -54,6 +68,129 @@ pub fn cmdline() -> &'static str {
         let bytes =
             core::slice::from_raw_parts(core::ptr::addr_of!(CMDLINE_BYTES).cast::<u8>(), len);
         core::str::from_utf8(bytes).unwrap_or("")
+    }
+}
+
+/// Whether the stored cmdline was truncated by [`store_cmdline`]
+/// because the DTB's `bootargs` exceeded the buffer. Recorded on
+/// every store, so it always describes the currently stored string.
+///
+/// Truncation also emits a warning on the boot UART at store time
+/// (see [`warn_cmdline_truncated`]); this flag exists so the outcome
+/// is observable programmatically — and testable — after the fact.
+#[must_use]
+pub fn cmdline_truncated() -> bool {
+    // SAFETY: same single-writer contract as `cmdline()`.
+    unsafe { *core::ptr::addr_of!(CMDLINE_TRUNCATED) }
+}
+
+/// Copy a DTB-supplied cmdline byte slice into the static backing
+/// buffer. Truncates at `CMDLINE_CAP - 1` bytes, mirroring the
+/// x86_64 store's contract.
+///
+/// Truncation is LOUD, never silent (#960): the store records it in
+/// [`cmdline_truncated`] and prints a warning to the boot UART.
+/// Because the FDT layer's cap (`narf_firmware_fdt::BOOTARGS_CAP`)
+/// equals `CMDLINE_CAP`, a value clipped there arrives here at full
+/// width and trips this same warning — one check at the single
+/// consumer covers both layers.
+///
+/// # Safety
+/// Single-threaded boot path: caller must invoke before any other
+/// thread observes `cmdline()`.
+unsafe fn store_cmdline(src: &[u8]) {
+    let kept = src.len().min(CMDLINE_CAP - 1);
+    let truncated = kept < src.len();
+    // SAFETY: single-threaded boot initialization owns the statics.
+    unsafe {
+        let dst = &mut *core::ptr::addr_of_mut!(CMDLINE_BYTES);
+        dst[..kept].copy_from_slice(&src[..kept]);
+        core::ptr::addr_of_mut!(CMDLINE_LEN).write(kept);
+        core::ptr::addr_of_mut!(CMDLINE_TRUNCATED).write(truncated);
+    }
+    if truncated {
+        warn_cmdline_truncated(src.len(), kept);
+    }
+}
+
+/// Fixed-capacity `core::fmt::Write` sink for the truncation
+/// warning's single line — the boot crate has no allocator-backed
+/// formatting path at `parse_raw` time.
+#[derive(Debug)]
+struct LineBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> LineBuf<N> {
+    fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl<const N: usize> core::fmt::Write for LineBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let n = bytes.len().min(N - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// PL011 flag-register bit: transmit FIFO full.
+const PL011_FR_TXFF: u32 = 1 << 5;
+
+/// Write one byte to the PL011, polling the FIFO-full flag first.
+///
+/// The poll is generously bounded: a draining FIFO clears in a
+/// handful of iterations, and the bound exists only so a platform
+/// where the UART is not really at [`PL011_QEMU_VIRT`] cannot hang
+/// boot forever to deliver a warning — dropping the tail of the
+/// warning beats never booting.
+fn uart_putc(byte: u8) {
+    let fr = (PL011_QEMU_VIRT as *const u32).wrapping_byte_add(0x18);
+    let dr = (PL011_QEMU_VIRT as *mut u32).wrapping_byte_add(0x00);
+    for _ in 0..100_000 {
+        // SAFETY: identity-mapped UART base — the same access the
+        // console crate's early PL011 backend performs before
+        // `parse_raw` runs; FR is a read-only status register.
+        if unsafe { fr.read_volatile() } & PL011_FR_TXFF == 0 {
+            break;
+        }
+    }
+    // SAFETY: same mapping contract; DR is the transmit register.
+    unsafe { dr.write_volatile(u32::from(byte)) };
+}
+
+/// Emit the cmdline-truncation warning straight to the boot UART.
+///
+/// `narf-boot` cannot reach the console crate (frame owns it; boot
+/// is frame's dependency), but frame's Step 1 has already brought
+/// the PL011 up by the time `parse_raw` runs, and this module
+/// already hard-codes its address for `BootInfo` — so a polled
+/// register write is the available channel, and the line lands in
+/// the same serial boot log as every other early message, naming
+/// the sizes involved. Never silent: silent cmdline scope loss is
+/// the failure species #960 exists to retire.
+fn warn_cmdline_truncated(received: usize, kept: usize) {
+    use core::fmt::Write as _;
+    let mut line = LineBuf::<160>::new();
+    let _ = core::write!(
+        line,
+        "boot: WARN: kernel cmdline truncated: bootargs of {received} bytes \
+         exceeds the {CMDLINE_CAP}-byte capacity; kept the first {kept} \
+         bytes - trailing tokens dropped\r\n"
+    );
+    for &b in line.as_slice() {
+        uart_putc(b);
     }
 }
 
@@ -172,14 +309,9 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
             return Err(BootError::NoUsableRam);
         }
         if let Some(args) = narf_firmware_fdt::chosen_bootargs(blob) {
-            let bytes = args.as_bytes();
-            let len = bytes.len().min(CMDLINE_CAP - 1);
-            // SAFETY: single-threaded boot initialization.
-            unsafe {
-                let dst = &mut *core::ptr::addr_of_mut!(CMDLINE_BYTES);
-                dst[..len].copy_from_slice(&bytes[..len]);
-                core::ptr::addr_of_mut!(CMDLINE_LEN).write(len);
-            }
+            // SAFETY: single-threaded boot initialization; the store
+            // owns the CMDLINE statics from here on.
+            unsafe { store_cmdline(args.as_bytes()) };
         }
         // SAFETY: the static map was initialized immediately above.
         unsafe {
@@ -509,4 +641,65 @@ unsafe fn scan_for_dtb() -> Option<PhysAddr> {
         p += 4;
     }
     None
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// The guest cmdline xtask builds on an affected-filter test
+    /// run (#960): a ~430-byte `test_subsystem=` include list
+    /// followed by the `test_subsystem_exclude=` token, ~480 bytes
+    /// total — past both old 256-byte caps, well inside the new one.
+    const AFFECTED_FILTER_APPEND: &str = concat!(
+        "test_subsystem=",
+        "aarch64,audio,bluetooth,drivers/gpu,drivers/graphics,drivers/input,",
+        "drivers/sound,drivers/usb,drivers/virtio,drivers/wireless/ath10k,",
+        "drivers/wireless/ath11k,drivers/wireless/ath9k,drivers/wireless/brcmfmac,",
+        "drivers/wireless/cyw43439,drivers/wireless/e2e,drivers/wireless/iwlwifi,",
+        "drivers/wireless/qualcomm,drivers/wireless/rtl8xxxu,drivers/wireless/rtlwifi,",
+        "drivers/wireless/rtw88,drivers/wireless/rtw89,fb,frame,verification,wireless",
+        " test_subsystem_exclude=drivers/gpu",
+    );
+
+    /// Transport-layer regression for #960: a long bootargs must
+    /// survive the boot store whole — including the trailing
+    /// exclude token the 256-byte cap used to eat — and an oversized
+    /// one must trip the (loud) truncation path instead of losing
+    /// its tail silently.
+    fn smoke_aarch64_cmdline_store_keeps_long_bootargs() -> TestResult {
+        // The statics are global boot state; save the guest's real
+        // cmdline and restore it before returning so later smokes
+        // still observe the boot-provided string.
+        let mut saved = [0u8; CMDLINE_CAP];
+        let saved_str = cmdline();
+        saved[..saved_str.len()].copy_from_slice(saved_str.as_bytes());
+        let saved_len = saved_str.len();
+
+        // SAFETY: kernel-test smokes run single-threaded on the BSP
+        // before any secondary CPU or cmdline consumer races us; the
+        // save/restore brackets every mutation.
+        let result = unsafe {
+            store_cmdline(AFFECTED_FILTER_APPEND.as_bytes());
+            let kept_whole = cmdline() == AFFECTED_FILTER_APPEND && !cmdline_truncated();
+
+            let oversized = [b'a'; CMDLINE_CAP + 64];
+            store_cmdline(&oversized);
+            let capped_loudly = cmdline().len() == CMDLINE_CAP - 1 && cmdline_truncated();
+
+            store_cmdline(&saved[..saved_len]);
+            kept_whole && capped_loudly
+        };
+        if !result {
+            return TestResult::Fail(
+                "long bootargs truncated by the boot store, or oversized one not flagged",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "boot/aarch64",
+        smoke_aarch64_cmdline_store_keeps_long_bootargs
+    );
 }
