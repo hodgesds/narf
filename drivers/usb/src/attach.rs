@@ -80,7 +80,8 @@ pub enum AttachOutcome {
     VideoClass,
     /// Device bound as a CDC-NCM ethernet adapter (USB-Ethernet
     /// dongle, tethered phone). Slot stays alive; entry in
-    /// `cdc_ncm::CDC_NCM_DEVICES`. NTB TX/RX rings are a follow-up.
+    /// `cdc_ncm::CDC_NCM_DEVICES`; NTB TX/RX run through the
+    /// record's bulk endpoints (negotiated at bind).
     NetworkClass,
     /// Device bound as a USB Bluetooth HCI controller (class 0xE0 /
     /// 0x01 / 0x01). Slot stays alive; entry in
