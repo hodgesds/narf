@@ -320,9 +320,11 @@ fn smoke_bridge_name_attr_reads_k10temp() -> TestResult {
 }
 kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_name_attr_reads_k10temp);
 
-/// `temp1_input` attr exists and returns ASCII digits (the value may
-/// be 0 if no hardware is accessible in the test environment).
-fn smoke_bridge_temp1_input_returns_ascii() -> TestResult {
+/// `temp1_input` on a hardware-less k10temp (no ECAM window attached,
+/// so every SMN read fails) renders EMPTY — never a fabricated "0\n".
+/// Before the #909 fix this fixture asserted the opposite: it accepted
+/// the sentinel 0 the bridge invented for failed reads.
+fn smoke_bridge_temp1_input_failed_read_renders_empty() -> TestResult {
     use crate::k10temp::{chip_info, K10temp, AMD_PHOENIX_NB};
     use alloc::sync::Arc;
     narf_filesystem::sysfs::__reset_for_test();
@@ -342,20 +344,121 @@ fn smoke_bridge_temp1_input_returns_ascii() -> TestResult {
         None => return TestResult::Fail("hwmon0 not found"),
     };
     match kobj.attr_show("temp1_input") {
-        Some(s) => {
-            // Value must be a number (possibly "0\n" in test env).
-            let trimmed = s.trim();
-            if trimmed.parse::<i64>().is_err() {
-                return TestResult::Fail("temp1_input is not numeric ASCII");
-            }
-            TestResult::Pass
-        }
+        Some(s) if s.is_empty() => TestResult::Pass,
+        Some(_) => TestResult::Fail("temp1_input fabricated a value for a failed read"),
         None => TestResult::Fail("temp1_input attr missing from hwmon0"),
     }
 }
 kernel_test_in!(
     "drivers/hwmon/bridge",
-    smoke_bridge_temp1_input_returns_ascii
+    smoke_bridge_temp1_input_failed_read_renders_empty
+);
+
+// ── Bridge read honesty (#909) ──────────────────────────────────────
+
+/// Fake device whose every sensor read fails (returns `None`),
+/// like a chip whose hardware window is not attached.
+#[derive(Debug)]
+struct FakeFailDevice;
+
+impl crate::HwmonDevice for FakeFailDevice {
+    fn name(&self) -> &str {
+        "fakefail"
+    }
+
+    fn read_temp(&self, _label: &str) -> Option<i32> {
+        None
+    }
+
+    fn read_fan(&self, _label: &str) -> Option<u32> {
+        None
+    }
+
+    fn read_voltage(&self, _label: &str) -> Option<i32> {
+        None
+    }
+
+    fn set_fan(&self, _label: &str, _level: u8) -> bool {
+        false
+    }
+
+    fn list_labels(&self) -> alloc::vec::Vec<&str> {
+        alloc::vec!["Tdie", "fan1", "in0"]
+    }
+}
+
+/// Fake device whose every sensor read succeeds with a genuine zero.
+#[derive(Debug)]
+struct FakeZeroDevice;
+
+impl crate::HwmonDevice for FakeZeroDevice {
+    fn name(&self) -> &str {
+        "fakezero"
+    }
+
+    fn read_temp(&self, _label: &str) -> Option<i32> {
+        Some(0)
+    }
+
+    fn read_fan(&self, _label: &str) -> Option<u32> {
+        Some(0)
+    }
+
+    fn read_voltage(&self, _label: &str) -> Option<i32> {
+        Some(0)
+    }
+
+    fn set_fan(&self, _label: &str, _level: u8) -> bool {
+        false
+    }
+
+    fn list_labels(&self) -> alloc::vec::Vec<&str> {
+        alloc::vec!["Tdie", "fan1", "in0"]
+    }
+}
+
+/// #909: across all three sensor classes, a failed read renders empty
+/// while a genuine zero renders "0\n" — the two must never be
+/// indistinguishable again.
+fn smoke_bridge_failed_reads_empty_genuine_zero_renders() -> TestResult {
+    use alloc::sync::Arc;
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    crate::registry::register_device(Arc::new(FakeFailDevice));
+    crate::registry::register_device(Arc::new(FakeZeroDevice));
+    crate::sysfs_bridge::populate_hwmon_class();
+    let class_hwmon = match narf_filesystem::sysfs::sysfs_root()
+        .get_child("class")
+        .and_then(|c| c.get_child("hwmon"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("/sys/class/hwmon not found"),
+    };
+    let fail_kobj = match class_hwmon.get_child("hwmon0") {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 (failing device) not found"),
+    };
+    let zero_kobj = match class_hwmon.get_child("hwmon1") {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon1 (zero device) not found"),
+    };
+    for attr in ["temp1_input", "fan1_input", "in1_input"] {
+        match fail_kobj.attr_show(attr) {
+            Some(s) if s.is_empty() => {}
+            Some(_) => return TestResult::Fail("failed read rendered a value instead of empty"),
+            None => return TestResult::Fail("input attr missing on failing device"),
+        }
+        match zero_kobj.attr_show(attr) {
+            Some(s) if s == "0\n" => {}
+            Some(_) => return TestResult::Fail("genuine zero did not render as '0\\n'"),
+            None => return TestResult::Fail("input attr missing on zero device"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/hwmon/bridge",
+    smoke_bridge_failed_reads_empty_genuine_zero_renders
 );
 
 /// `temp1_label` returns the label string with a newline.
