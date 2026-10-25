@@ -106,9 +106,16 @@ impl CoolingDevice for AcpiFan {
 
 /// Walk the AML namespace, find devices with `_HID == "PNP0C0B"`, and
 /// register each as a cooling device.
+///
+/// The boot log must report the REAL state (#907): "no fans
+/// discovered" is printed only when discovery genuinely found none.
+/// A discovered fan whose registration fails is logged per-device
+/// with its error — previously every failure was swallowed and the
+/// log claimed the machine had no fans.
 pub fn init() {
     let cap = bootstrap_thermal_authority();
-    let mut count: u32 = 0;
+    let mut discovered: u32 = 0;
+    let mut registered: u32 = 0;
 
     for_each_node_of_kind(NodeKind::Device, |node| {
         // _HID is stored as a Name child of the Device.
@@ -128,25 +135,41 @@ pub fn init() {
         if !is_fan {
             return;
         }
+        discovered += 1;
 
         let fan = Arc::new(AcpiFan::probe(&node.path));
         let label = fan.path.clone();
         let fine = fan.fine_grained;
-        if register_cooling_device(&cap, fan).is_ok() {
-            count += 1;
-            let _ = writeln!(
-                narf_console::Writer,
-                "  acpi-fan: registered {} (fine-grained={})",
-                label,
-                fine
-            );
+        match register_cooling_device(&cap, fan) {
+            Ok(()) => {
+                registered += 1;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  acpi-fan: registered {} (fine-grained={})",
+                    label,
+                    fine
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  acpi-fan: {} discovered but cooling-device registration failed: {:?}",
+                    label, e
+                );
+            }
         }
     });
 
-    if count == 0 {
+    if discovered == 0 {
         let _ = writeln!(
             narf_console::Writer,
             "  acpi-fan: no PNP0C0B fans discovered"
+        );
+    } else if registered == 0 {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  acpi-fan: {} PNP0C0B fan(s) discovered, none registered (see failures above)",
+            discovered
         );
     }
 }

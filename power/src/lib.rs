@@ -155,6 +155,25 @@ extern "C" fn s3_resume_hook_entry() {
 
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // Thermal registry bring-up (#907). `thermal::init()` creates the
+    // generic zone registry and installs the default StepPolicy
+    // governor. It must run BEFORE the Stage::Subsys producers that
+    // register into it (drivers/platform's `acpi-thermal` bridge call
+    // and `acpi-fan` cooling-device registration): PostCore gives that
+    // ordering by stage. A Subsys slot would race the producers —
+    // frame's composition registers platform's initcalls before
+    // power's, so within-stage registration order runs the producers
+    // first and every registration fails NotInitialised (the registry
+    // was previously created only from tests, so the whole
+    // sense→decide→actuate loop could never run in production).
+    narf_init::register(Stage::PostCore, "thermal-registry", || {
+        thermal::init();
+        let _ = writeln!(
+            narf_console::Writer,
+            "  thermal-registry: zone registry initialised (StepPolicy governor installed)"
+        );
+        InitResult::Ok
+    });
     // Hook the arch crate's S3 wake trampoline so on resume the
     // device-PM fan-out runs from the asm continuation. Must run
     // before any suspend() can be issued; Stage::Subsys gives us
