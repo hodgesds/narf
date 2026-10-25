@@ -27,7 +27,13 @@
 //! - INQUIRY (0x12) — vendor / product / revision
 //! - START STOP UNIT (0x1B) — spin up / down / eject
 //! - READ CAPACITY(10) (0x25) — last LBA + block size
-//! - READ(10) (0x28) / WRITE(10) (0x2A) — single and multi-block
+//! - READ(10) (0x28) / WRITE(10) (0x2A) — single and multi-block;
+//!   WRITE(10) also in its FUA form (byte 1 bit 3) for
+//!   [`UsbMscBlockDevice`]'s native `write_fua`
+//! - SYNCHRONIZE CACHE(10) (0x35) — whole-medium cache flush
+//!   backing [`UsbMscBlockDevice`]'s `flush()`; without it the
+//!   block layer's Flush/FUA advertisement was a durability lie
+//!   (#829)
 //!
 //! Multi-LUN (LUN > 0), Reset Recovery (§5.3), and UAS (USB
 //! Attached SCSI) are deferred.
@@ -65,6 +71,12 @@ const SCSI_START_STOP_UNIT: u8 = 0x1B;
 const SCSI_READ_CAPACITY_10: u8 = 0x25;
 const SCSI_READ_10: u8 = 0x28;
 const SCSI_WRITE_10: u8 = 0x2A;
+const SCSI_SYNCHRONIZE_CACHE_10: u8 = 0x35;
+
+/// WRITE(10) CDB byte 1 bit 3: Force Unit Access — the device must
+/// write the data to the medium (not merely to its volatile cache)
+/// before reporting completion (SBC-3 §5.30, Table 92).
+const WRITE10_FUA: u8 = 0x08;
 
 /// Decoded standard INQUIRY response (SPC-4 §6.5 Table 82).
 /// Vendor (8 bytes), product (16 bytes), and revision (4 bytes)
@@ -289,16 +301,14 @@ impl MscDevice {
         Ok((status, resid))
     }
 
-    /// Run a SCSI command with no data stage. Used by TEST UNIT READY.
+    /// Run a SCSI command with no data stage. Used by TEST UNIT READY
+    /// and SYNCHRONIZE CACHE(10).
     async fn cmd_no_data(&self, xhci: &Xhci, cb: &[u8]) -> Result<(), MscError> {
         let tag = self.next_tag();
         let cbw = self.build_cbw(tag, 0, false, cb);
         xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
         let (status, _) = self.read_csw(xhci, tag).await?;
-        if status != 0 {
-            return Err(MscError::CswStatus(status));
-        }
-        Ok(())
+        check_csw_status(status)
     }
 
     /// Run a SCSI command with a host-bound (IN) data stage.
@@ -308,9 +318,7 @@ impl MscDevice {
         xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
         let n = xhci.bulk_in(self.slot_id, self.bulk_in, out).await?;
         let (status, _) = self.read_csw(xhci, tag).await?;
-        if status != 0 {
-            return Err(MscError::CswStatus(status));
-        }
+        check_csw_status(status)?;
         Ok(n)
     }
 
@@ -321,9 +329,7 @@ impl MscDevice {
         xhci.bulk_out(self.slot_id, self.bulk_out, &cbw).await?;
         let n = xhci.bulk_out(self.slot_id, self.bulk_out, data).await?;
         let (status, _) = self.read_csw(xhci, tag).await?;
-        if status != 0 {
-            return Err(MscError::CswStatus(status));
-        }
+        check_csw_status(status)?;
         Ok(n)
     }
 
@@ -366,6 +372,19 @@ impl MscDevice {
         let flags: u8 = if eject { 0x02 } else { 0x00 } | if start { 0x01 } else { 0x00 };
         self.cmd_no_data(xhci, &[SCSI_START_STOP_UNIT, 0, 0, 0, flags, 0])
             .await
+    }
+
+    /// `SYNCHRONIZE CACHE(10)` (SBC-3) over the whole medium: ask
+    /// the device to write every block sitting in its volatile
+    /// write cache to the medium. Encoded with LBA = 0 and
+    /// NUMBER OF BLOCKS = 0, which SBC-3 defines as "all blocks
+    /// from the LBA to the end of the medium" — a whole-device
+    /// flush. The IMD bit is clear, so the CSW only reports
+    /// completion once the flush has actually finished; a
+    /// non-zero CSW status surfaces as [`MscError::CswStatus`]
+    /// (a failed flush must never read as success — #829).
+    pub async fn synchronize_cache(&self, xhci: &Xhci) -> Result<(), MscError> {
+        self.cmd_no_data(xhci, &encode_synchronize_cache10()).await
     }
 
     /// `INQUIRY` (SPC-4 §6.5). Returns the standard 36-byte INQUIRY
@@ -493,6 +512,36 @@ impl MscDevice {
         nblocks: u16,
         data: &[u8],
     ) -> Result<(), MscError> {
+        self.write_blocks_inner(xhci, lba, nblocks, data, false)
+            .await
+    }
+
+    /// Multi-block `WRITE(10)` with Force Unit Access: identical to
+    /// [`Self::write_blocks`] except the CDB carries the FUA bit, so
+    /// the device must commit the data to the medium (not merely to
+    /// its volatile write cache) before the CSW reports completion.
+    /// FUA orders nothing written earlier — callers that need a
+    /// barrier issue [`Self::synchronize_cache`] first (the block
+    /// layer's `write_fua` contract, #829).
+    pub async fn write_blocks_fua(
+        &self,
+        xhci: &Xhci,
+        lba: u32,
+        nblocks: u16,
+        data: &[u8],
+    ) -> Result<(), MscError> {
+        self.write_blocks_inner(xhci, lba, nblocks, data, true)
+            .await
+    }
+
+    async fn write_blocks_inner(
+        &self,
+        xhci: &Xhci,
+        lba: u32,
+        nblocks: u16,
+        data: &[u8],
+        fua: bool,
+    ) -> Result<(), MscError> {
         if self.lba_bytes == 0
             || nblocks == 0
             || nblocks > MSC_MAX_BLOCKS_PER_XFER
@@ -504,7 +553,7 @@ impl MscDevice {
         let nb = nblocks.to_be_bytes();
         let cb = [
             SCSI_WRITE_10,
-            0,
+            if fua { WRITE10_FUA } else { 0 },
             lba_be[0],
             lba_be[1],
             lba_be[2],
@@ -759,6 +808,19 @@ pub fn decode_csw(buf: &[u8]) -> Option<CswFields> {
     })
 }
 
+/// Map a CSW `bCSWStatus` byte to the transport result: 0
+/// (Command Passed) is `Ok`; 1 (Command Failed) and 2 (Phase
+/// Error) become [`MscError::CswStatus`]. Every BOT exchange in
+/// this module funnels through here, so a device that refuses a
+/// command — a SYNCHRONIZE CACHE it cannot honour, say — can
+/// never be mistaken for success by a caller (#829).
+pub fn check_csw_status(status: u8) -> Result<(), MscError> {
+    if status != 0 {
+        return Err(MscError::CswStatus(status));
+    }
+    Ok(())
+}
+
 /// Encode a READ(10) CDB (SBC-3 §5.10). Returns the 10-byte
 /// command descriptor block. `lba` and `nblocks` are big-endian
 /// in the wire format.
@@ -778,6 +840,25 @@ pub fn encode_write10(lba: u32, nblocks: u16) -> [u8; 10] {
     [
         0x2A, 0, lba_be[0], lba_be[1], lba_be[2], lba_be[3], 0, nb[0], nb[1], 0,
     ]
+}
+
+/// Encode a WRITE(10) CDB with Force Unit Access set (byte 1
+/// bit 3): the device must commit the data to the medium before
+/// completing the command. Otherwise identical to
+/// [`encode_write10`].
+pub fn encode_write10_fua(lba: u32, nblocks: u16) -> [u8; 10] {
+    let mut cb = encode_write10(lba, nblocks);
+    cb[1] = WRITE10_FUA;
+    cb
+}
+
+/// Encode a SYNCHRONIZE CACHE(10) CDB (SBC-3) for a whole-medium
+/// flush: LBA = 0 and NUMBER OF BLOCKS = 0, which the standard
+/// defines as "all blocks from the LBA to the end of the medium".
+/// Byte 1 is zero — in particular IMD is clear, so the device
+/// reports completion only after the flush has finished.
+pub fn encode_synchronize_cache10() -> [u8; 10] {
+    [SCSI_SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 
 /// Decode a READ CAPACITY(10) response buffer (SBC-3 Table 56).
@@ -841,6 +922,38 @@ impl UsbMscBlockDevice {
             lba_size: dev.lba_bytes,
             capacity: dev.last_lba as u64 + 1,
         })
+    }
+
+    /// Snapshot the (controller, device-fields) pair a BOT exchange
+    /// needs, without holding any registry lock across the transfer
+    /// (the same shape `read`/`write` build inline; `flush` and
+    /// `write_fua` share this helper). The snapshot's tag counter
+    /// restarts at 1 — safe because `MscIoClaim` serialises
+    /// exchanges per device, so the tag only has to match the CSW
+    /// of the exchange in flight.
+    fn transport_snapshot(
+        &self,
+    ) -> Result<(alloc::sync::Arc<Xhci>, MscDevice), narf_block::BlockIoError> {
+        let c = match xhci::controller() {
+            Some(c) => c,
+            None => return Err(narf_block::BlockIoError::DeviceRemoved),
+        };
+        let g = MSC_DEVICES.lock();
+        let dev = match g.get(self.idx) {
+            Some(d) => d,
+            None => return Err(narf_block::BlockIoError::DeviceRemoved),
+        };
+        Ok((
+            c,
+            MscDevice {
+                slot_id: dev.slot_id,
+                bulk_in: dev.bulk_in,
+                bulk_out: dev.bulk_out,
+                lba_bytes: dev.lba_bytes,
+                last_lba: 0,
+                tag: IrqSafeSpinLock::new(1),
+            },
+        ))
     }
 }
 
@@ -913,6 +1026,74 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
     }
     fn capacity(&self) -> u64 {
         self.capacity
+    }
+    /// USB enclosures and bridges carry volatile write caches, and
+    /// this device now performs both advertised operations for
+    /// real: `flush` issues SYNCHRONIZE CACHE(10) and `write_fua`
+    /// sets the WRITE(10) FUA bit (#829). `volatile_cache` is the
+    /// conservative assumption — no caching mode page is probed at
+    /// attach; on a genuinely write-through device SYNCHRONIZE
+    /// CACHE simply completes with nothing to drain, so the cost
+    /// of assuming a cache is one extra command per flush, never
+    /// a correctness risk.
+    fn capabilities(&self) -> narf_block::BlockCaps {
+        narf_block::BlockCaps {
+            volatile_cache: true,
+            fua: true,
+        }
+    }
+    /// Drain the device's volatile write cache with
+    /// SYNCHRONIZE CACHE(10) over BOT. Returns only once the CSW
+    /// reports completion; a failed or phase-error CSW maps to
+    /// `DriverError` — a flush that did not happen must surface
+    /// as an error, never as success (#829).
+    fn flush(&self) -> Result<(), narf_block::BlockIoError> {
+        let (c, dev_snapshot) = self.transport_snapshot()?;
+        let Some(_claim) = MscIoClaim::acquire(self.idx) else {
+            return Err(narf_block::BlockIoError::DriverError);
+        };
+        let result = sync_bridge(async { dev_snapshot.synchronize_cache(&c).await });
+        match result {
+            Ok(()) => Ok(()),
+            Err(_) => Err(narf_block::BlockIoError::DriverError),
+        }
+    }
+    /// Native FUA write: WRITE(10) with the FUA bit set, so the
+    /// data is on the medium when the CSW completes — not the
+    /// trait default's write + flush emulation. Same range and
+    /// buffer contract as `write`.
+    fn write_fua(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        data: &[u8],
+    ) -> Result<(), narf_block::BlockIoError> {
+        if lba
+            .checked_add(n_blocks as u64)
+            .is_none_or(|end| end > self.capacity)
+        {
+            return Err(narf_block::BlockIoError::OutOfRange);
+        }
+        let lba32: u32 = lba
+            .try_into()
+            .map_err(|_| narf_block::BlockIoError::OutOfRange)?;
+        let expected = n_blocks as usize * self.lba_size as usize;
+        if data.len() < expected {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        let (c, dev_snapshot) = self.transport_snapshot()?;
+        let Some(_claim) = MscIoClaim::acquire(self.idx) else {
+            return Err(narf_block::BlockIoError::DriverError);
+        };
+        let result = sync_bridge(async {
+            dev_snapshot
+                .write_blocks_fua(&c, lba32, n_blocks, &data[..expected])
+                .await
+        });
+        match result {
+            Ok(()) => Ok(()),
+            Err(_) => Err(narf_block::BlockIoError::DriverError),
+        }
     }
     fn read(
         &self,

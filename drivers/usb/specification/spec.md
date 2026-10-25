@@ -292,6 +292,10 @@ the USB download itself remains a target-silicon gate.
   wheel + multi-touch land with the Report-Descriptor parser.
 - **MSC** (`msc`): Bulk-Only Transport CBW/CSW codec, INQUIRY,
   READ_CAPACITY(10), READ(10), WRITE(10) for single-block transfers.
+  The `BlockDeviceSync` adapter also performs SYNCHRONIZE
+  CACHE(10) for `flush()` and WRITE(10) with the FUA bit for
+  `write_fua()`, so the Flush/FUA capabilities it advertises are
+  issued on the wire, not merely promised (#829).
 - **Hub** (`hub`): hub class enumeration, multiple-TT detection from the
   Device Descriptor protocol, TT think-time propagation, and downstream
   route addressing so low/full-speed devices behind high-speed hubs are
