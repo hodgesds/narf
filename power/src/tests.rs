@@ -2469,6 +2469,12 @@ fn smoke_arm_s3_resume_refuses_without_armed_real_sleep() -> TestResult {
     use crate::suspend::{arm_s3_resume, SuspendError, __test_reset};
     use crate::Power;
     use narf_capabilities::{Cap, Invoke};
+    // Isolate from the boot's real devices: NVMe refuses system
+    // suspend, and the orchestrator's device fan-out runs before
+    // the arm check — its failure would surface as Aborted and
+    // mask the refusal this smoke pins. Same isolation as
+    // smoke_s3_suspend_unarmed_walks_phases.
+    crate::device_pm::__reset_for_test();
     __test_reset();
     let cap: Cap<Power, Invoke> = Cap::bootstrap();
     match arm_s3_resume(&cap) {

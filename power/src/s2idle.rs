@@ -259,14 +259,16 @@ pub fn last_wake_source() -> Option<WakeSource> {
 /// guess; the park then relies on the latch alone, which a test or
 /// a future non-ACPI source can still set.
 pub fn wake_irq_allowlist() -> Vec<u8> {
-    let mut v = Vec::new();
     #[cfg(target_arch = "x86_64")]
     {
+        let mut v = Vec::new();
         if let Some(vector) = narf_acpi::sci_vector() {
             v.push(vector);
         }
+        v
     }
-    v
+    #[cfg(not(target_arch = "x86_64"))]
+    Vec::new()
 }
 
 // ── Park statistics ─────────────────────────────────────────────────
@@ -553,10 +555,32 @@ fn park(max_halts: Option<u64>) -> ParkExit {
         if wake_event_pending() {
             break ParkExit::WakeEvent;
         }
-        // SAFETY: IRQs are disabled on entry (this function disabled
-        // them, and the primitive returns with them disabled) —
-        // exactly the primitive's documented precondition.
-        unsafe { narf_arch::idle_halt_then_disable() };
+        if max_halts.is_some() {
+            // Bounded test model: the wait between iterations must
+            // be one that always returns. A bare halt sleeps until
+            // an interrupt is *delivered*, and nothing in the
+            // kernel-test boot guarantees delivery — that path arms
+            // no periodic clockevent (it never reaches
+            // `select_primary`), so a halt can sleep past the
+            // harness's idle-kill in a quiet stretch even though
+            // nothing is wedged (PR #877's first CI run hung exactly
+            // here). Production parks are not exposed this way:
+            // there the wake event is itself an IRQ, so the
+            // delivery that latches the wake is the delivery that
+            // returns the halt. The model's budget counts
+            // iterations, so a bounded spin stands in for the halt;
+            // the latch checks, hook interleaving, and phase
+            // observations the fixtures pin are unchanged.
+            for _ in 0..1024 {
+                core::hint::spin_loop();
+            }
+        } else {
+            // SAFETY: IRQs are disabled on entry (this function
+            // disabled them, and the primitive returns with them
+            // disabled) — exactly the primitive's documented
+            // precondition.
+            unsafe { narf_arch::idle_halt_then_disable() };
+        }
         halts += 1;
     };
     // SAFETY: restores the caller's interrupt state; the park is
