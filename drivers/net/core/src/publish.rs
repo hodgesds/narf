@@ -236,6 +236,18 @@ pub fn clear_rx_mirror_attached(name: &str) {
 /// (`try_send`): a full or closed ring drops its mirror, never the
 /// packet destined for the live stack — the same choice e1000 makes.
 ///
+/// The mirror gate is the attach signal ALONE — never the
+/// publication `name`. e1000's flag is a per-device bool with no
+/// name involvement, and i40e's attach signal is likewise
+/// name-independent (its pump observes the taken consumer slot);
+/// gating the mirror on a non-empty name silently dropped ring
+/// delivery for an attached-but-unpublished device — the defect
+/// CI caught in the pre-existing `smoke_i40e_all_queues_deliver_
+/// and_rearm`, whose NIC is constructed without probe (empty name)
+/// with its consumer already taken. The name gates only the stack
+/// delivery, inside [`deliver_rx`], where an unpublished name is
+/// the documented no-op.
+///
 /// The copy is allocated from `DomainId::DRIVER_0`, the domain every
 /// one of these families already allocates its RX frames from, and
 /// carries the frame's `rx_meta` across (the payload copy is taken
@@ -247,7 +259,7 @@ pub fn dispatch_rx(
     mirror_attached: bool,
     mirror: impl FnOnce(Frame),
 ) {
-    if mirror_attached && !name.is_empty() {
+    if mirror_attached {
         if let Ok(dma_buf) = narf_io::alloc_coherent(frame.len() as usize, DomainId::DRIVER_0) {
             let mut copy = Frame::new(dma_buf, frame.len());
             copy.payload_mut().copy_from_slice(frame.payload());

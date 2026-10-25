@@ -2139,6 +2139,37 @@ fn smoke_netdev_rx_dispatch_mirror_contract() -> TestResult {
         return TestResult::Fail("stack handler's rewrite missing on the original (case 2)");
     }
 
+    // Case 3 — ring consumer attached but the device is UNPUBLISHED
+    // (empty name): the mirror gate is the attach signal alone,
+    // never the name — the i40e shape, whose pump observes attach
+    // from the taken consumer slot on a NIC that may have no
+    // published name at all. The mirror must still fire exactly
+    // once with pristine bytes, and the stack handler must NOT be
+    // reached (deliver_rx on an unpublished name is a no-op). This
+    // is the shape the pre-existing i40e queue-delivery smoke
+    // exercises end-to-end; an earlier build of `dispatch_rx`
+    // additionally required a non-empty name for the mirror and
+    // silently dropped this delivery entirely (CI kernel panic in
+    // `smoke_i40e_all_queues_deliver_and_rearm`).
+    let Some(mut frame) = build(&pattern) else {
+        return TestResult::Fail("fixture frame allocation failed (case 3)");
+    };
+    let mut mirrored3: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    dispatch_rx("", &mut frame, true, |mirror| {
+        mirrored3.push(alloc::vec::Vec::from(mirror.payload()));
+    });
+    if FIXTURE_RX_CALLS.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("unpublished-name dispatch reached the stack handler");
+    }
+    if mirrored3.len() != 1 {
+        return TestResult::Fail(
+            "attached dispatch with an empty name did not mirror exactly once",
+        );
+    }
+    if mirrored3[0][..] != pattern[..] {
+        return TestResult::Fail("empty-name ring mirror does not hold the pristine bytes");
+    }
+
     // Restore the real stack handler for any later test in the boot.
     narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
     TestResult::Pass
