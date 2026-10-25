@@ -3011,7 +3011,6 @@ fn smoke_pci_detach_runs_remove_hook() -> TestResult {
 }
 kernel_test_in!("bus", smoke_pci_detach_runs_remove_hook);
 
-
 // ---------------------------------------------------------------------------
 // VMD child-binding fixture (issue #933). The real shape this
 // mirrors: the Intel VMD bridge sits in the boot-time device list;
@@ -3224,3 +3223,154 @@ fn smoke_pci_probe_all_binds_appended_children() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus", smoke_pci_probe_all_binds_appended_children);
+
+// ---------------------------------------------------------------------------
+// Composition fixture (PRs #967 + #975): a device appended during
+// the walk (§9.5) is detachable (§9.6). #975's binding records are
+// populated from `probe_all`'s commit path, and #967's live-tail
+// walk attempts appended devices through that same per-device
+// body — so a bridge-enumerated child (the VMD shape) must end up
+// with a binding record exactly like a device present at walk
+// start, and `detach` must route its driver's remove hook. If the
+// walk ever grew a separate commit path for the appended tail,
+// the child would bind but be silently undetachable; this fixture
+// pins the seam.
+
+/// Probe attempts of the appended child below.
+static COMP_CHILD_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Remove-hook invocations for the appended child.
+static COMP_REMOVE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// (segment << 8) | device of the last device the hook ran for.
+static COMP_REMOVE_LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Mirror bridge probe: appends one NVMe child under the
+/// synthetic VMD segment from inside the walk.
+fn comp_bridge_probe(
+    _device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::driver_match::ProbeError> {
+    crate::registry::append_devices(alloc::vec![synthetic_pcie(
+        0x8000, 0, 0x144d, 0xa808, 0x010802,
+    )]);
+    Ok(())
+}
+
+fn comp_child_probe(
+    _device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::driver_match::ProbeError> {
+    use core::sync::atomic::Ordering;
+    COMP_CHILD_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+fn comp_child_remove_hook(
+    device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) {
+    use core::sync::atomic::Ordering;
+    if let crate::addr::BusAddr::Pcie(a) = device.addr {
+        COMP_REMOVE_LAST.store(
+            ((a.segment as u32) << 8) | a.device as u32,
+            Ordering::SeqCst,
+        );
+    }
+    COMP_REMOVE_CALLS.fetch_add(1, Ordering::SeqCst);
+}
+
+fn smoke_pci_appended_child_binds_and_detaches() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    use crate::driver_match::{
+        __reset_for_test, bound_count, detach, probe_all, MatchKind, PciMatch,
+    };
+    use crate::registry::{bootstrap_registry_authority, install};
+
+    let _restore = RegistryRestore::capture();
+    __reset_for_test();
+    crate::hotplug::__clear_listeners();
+    COMP_CHILD_CALLS.store(0, Ordering::SeqCst);
+    COMP_REMOVE_CALLS.store(0, Ordering::SeqCst);
+    COMP_REMOVE_LAST.store(0, Ordering::SeqCst);
+
+    crate::driver_match::register(PciMatch {
+        name: "comp-append-bridge",
+        kind: MatchKind::VendorDevice {
+            vendor: 0x8086,
+            device: 0x9A0B,
+        },
+        probe: comp_bridge_probe,
+    });
+    crate::driver_match::register(PciMatch {
+        name: "comp-appended-nvme",
+        kind: MatchKind::ClassFull {
+            class: 0x01,
+            subclass: 0x08,
+            prog_if: 0x02,
+        },
+        probe: comp_child_probe,
+    });
+    crate::driver_match::register_remove("comp-appended-nvme", comp_child_remove_hook);
+
+    // Only the bridge is in the boot-time list; the child exists
+    // solely as a mid-walk append.
+    install(alloc::vec![synthetic_pcie(0, 28, 0x8086, 0x9A0B, 0x010400)]);
+
+    let authority = bootstrap_registry_authority();
+    match probe_all(&authority) {
+        Ok(2) => {}
+        Ok(_) => return TestResult::Fail("probe_all did not bind bridge + appended child"),
+        Err(_) => return TestResult::Fail("probe_all lost the bootstrap authority"),
+    }
+    if COMP_CHILD_CALLS.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("appended child was not attempted exactly once");
+    }
+    // The composition assertion: the appended child's binding is
+    // recorded, not just committed.
+    if bound_count() != 2 {
+        return TestResult::Fail("appended child's binding was not recorded");
+    }
+
+    let child_addr = crate::addr::BusAddr::Pcie(crate::addr::PcieAddr::new(0x8000, 0, 0, 0));
+
+    // Detach the appended child through the production event
+    // path: the default dispatcher routes the Detach event to
+    // the child's remove hook.
+    if crate::hotplug::install_default_dispatcher().is_err() {
+        return TestResult::Fail("install_default_dispatcher failed");
+    }
+    crate::hotplug::dispatch_event(crate::hotplug::HotplugEvent::Detach { addr: child_addr });
+    if COMP_REMOVE_CALLS.load(Ordering::SeqCst) != 1
+        || COMP_REMOVE_LAST.load(Ordering::SeqCst) != 0x0080_0000
+    {
+        return TestResult::Fail("Detach event did not run the appended child's remove hook");
+    }
+    if bound_count() != 1 {
+        return TestResult::Fail("Detach event left the child's binding recorded");
+    }
+
+    // The record is gone: a direct detach finds nothing and does
+    // not re-run the hook.
+    match detach(&authority, child_addr) {
+        Ok(false) => {}
+        Ok(true) => return TestResult::Fail("second detach claimed the child's binding"),
+        Err(_) => return TestResult::Fail("second detach lost the bootstrap authority"),
+    }
+    if COMP_REMOVE_CALLS.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("remove hook ran for an unbound device");
+    }
+
+    // The bridge (hookless match) detaches as a plain unbind.
+    let bridge_addr = crate::addr::BusAddr::Pcie(crate::addr::PcieAddr::new(0, 0, 28, 0));
+    match detach(&authority, bridge_addr) {
+        Ok(true) => {}
+        Ok(false) => return TestResult::Fail("detach found no binding for the bridge"),
+        Err(_) => return TestResult::Fail("bridge detach lost the bootstrap authority"),
+    }
+    if bound_count() != 0 {
+        return TestResult::Fail("detach left bindings recorded");
+    }
+    crate::hotplug::__clear_listeners();
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_pci_appended_child_binds_and_detaches);
