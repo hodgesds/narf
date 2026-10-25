@@ -17,6 +17,12 @@
 **Does NOT own:**
 - Raw MMIO drivers (e.g., TIS/CRB) — these live in `drivers/platform/tpm`.
 - Crypto primitives (HMAC, SHA-256) — consumed from `crypto/`.
+- The extended command set (Create/Load/Unseal, NV, object models) and
+  the `/dev/tpm*` + `/sys/class/tpm` bridges — staged, fixture-tested,
+  and not production in `drivers/tpm` (see §3.4); they compose onto
+  this crate's trait/registry when their lanes (#940/#941/#944) land.
+- TPM2 ACPI table parsing — owned by `acpi/` (`tpm2_info()` /
+  `parse_tpm2`); no TPM crate carries a second parser.
 
 ## 2. Design Principles
 
@@ -75,6 +81,33 @@ consumers:
   only, so a fixture that registers a mock can restore the empty
   state for later tests.
 
+### 3.4 Composition: one production stack (#934)
+
+There is exactly one production TPM stack, and this section is its
+contract:
+
+- **Protocol/policy/codec — this crate (`narf-tpm`).** The
+  `TpmDevice` trait, the registry, the capability vocabulary, and
+  the canonical TPM 2.0 wire codec (`tpm2` header/constants +
+  `commands` builder/parser). Every command frame submitted in
+  production is built here — in particular `TPM2_PCR_Extend` exists
+  exactly once: `commands::CommandBuilder::pcr_extend`
+  (`TPM_ST_SESSIONS` + `TPM_RS_PW` session, §4).
+- **Production transport — `drivers/platform`.** The CRB/TIS MMIO
+  driver there is the only code that probes hardware, owns the
+  probed-device singleton, and submits frames; on probe success it
+  registers the device into this crate's registry (the §3.3
+  registry contract) for `frame::measure` to dispatch through.
+  Its probe/discovery semantics (PTP register map, host-programmed
+  CRB buffers, TPM2-table discovery via `narf_acpi::tpm2_info()`)
+  are #939's.
+- **`drivers/tpm` is not a stack.** It is a staged extension
+  surface (extended command set, devfs/sysfs bridges, register
+  models) with zero production dependents. It must not grow a
+  second `TpmDevice` trait, registry, transport, TPM2-table
+  parser, or PCR_Extend encoding; its follow-on lanes compose its
+  modules onto the two owners above.
+
 ## 4. Operation: PCR Extension
 
 Extending a PCR is a foundational operation for Measured Boot.
@@ -86,6 +119,18 @@ pub async fn extend_pcr(
 ) -> Result<(), TpmError>;
 ```
 The kernel validates that `pcr_index` is included in the capability's `PcrSet` before submitting the command to the hardware.
+
+The wire encoding is the canonical builder's
+(`commands::CommandBuilder::pcr_extend`, TCG Part 3 §22.2):
+`TPM_ST_SESSIONS` tag, the PCR handle, an authorization area of
+size 9 carrying the empty password session (`TPM_RS_PW`, empty
+nonce/HMAC), then `TPML_DIGEST_VALUES` (count 1, hashAlg SHA-256,
+digest). The `TPM_ST_NO_SESSIONS` tag with a session area appended
+— or with a zero authorizationSize — is malformed and a real TPM
+rejects it with `TPM_RC_VALUE` (#937). Transports validate the
+response (complete header, declared size within the buffer, zero
+response code) and surface failures as typed errors, never as
+silent success.
 
 ## 5. Security & Isolation
 
@@ -101,8 +146,11 @@ The kernel validates that `pcr_index` is included in the capability's `PcrSet` b
 
 ## 7. Dependencies
 
-- **Consumes**: `drivers/`, `capabilities/`, `crypto/`, `lib/`.
-- **Provides to**: Bootloader, Encrypted Storage, Identity Daemons.
+- **Consumes**: `capabilities/`, `crypto/`, `lib/`, `scheduler/`.
+- **Provides to**: `frame/` (measured boot, via the registry),
+  `drivers/platform` (the production transport implements
+  `TpmDevice` with this crate's builders), `block/` (encrypted
+  storage seam), `spdm/` (error type + measurement feed).
 
 ## 8. Sources (public only) for the `tpm2` codec sub-module
 

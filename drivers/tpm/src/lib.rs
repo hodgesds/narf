@@ -1,4 +1,26 @@
-//! narf-drivers-tpm — TPM 2.0 device drivers.
+//! narf-drivers-tpm — TPM 2.0 extension surface (NOT a production
+//! stack).
+//!
+//! ## Composition status (#934)
+//!
+//! NARF has exactly one production TPM stack: `narf-tpm` (the
+//! `TpmDevice` trait, registry, capability vocabulary, and the
+//! canonical wire codec) plus the production CRB/TIS transport in
+//! `drivers/platform`, which probes hardware, submits the frames
+//! `narf-tpm` builds, and registers the device for
+//! `frame::measure`. This crate is linked by nothing in the boot
+//! path and must not grow a second trait, registry, transport, or
+//! PCR_Extend encoding.
+//!
+//! What remains here is staged, fixture-tested surface for the
+//! follow-on lanes that will compose it onto the canonical stack:
+//! the extended command set (`tpm2/`: Create/Load/Unseal, NV,
+//! object/PCR models — #941/#944), the devfs/sysfs bridges
+//! (#940, over their own `TpmTransport` injection point), and the
+//! CRB/TIS register-sequence models (`crb.rs` / `tis.rs`) whose
+//! PTP register map the production probe converged onto (#939).
+//! TPM2-table parsing is NOT here anymore: `narf_acpi` owns it
+//! (see `probe.rs`).
 //!
 //! Covers two host-interface flavours:
 //!

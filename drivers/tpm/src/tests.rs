@@ -427,46 +427,40 @@ mod smokes {
     }
     kernel_test_in!("drivers/tpm/probe", smoke_acpi_probe_msft0101_match);
 
-    // ── TPM2 ACPI table parse ─────────────────────────────────────────
+    // ── TPM2 start-method classification ──────────────────────────────
+    //
+    // TPM2 *table parsing* is owned by `narf_acpi` (composition,
+    // #934): this crate's duplicate parser (`parse_tpm2_table`) and
+    // its smoke were deleted. What remains here is the start-method
+    // vocabulary used to classify a decoded table.
 
-    fn smoke_tpm2_table_parse() -> TestResult {
-        use crate::probe::{parse_tpm2_table, ACPI_TPM2_COMMAND_BUFFER, TPM2_TABLE_MIN_LEN};
-        // Build a synthetic TPM2 ACPI table.
-        let mut table = [0u8; TPM2_TABLE_MIN_LEN + 4];
-        // Signature "TPM2"
-        table[0..4].copy_from_slice(b"TPM2");
-        // Length (u32 LE at offset 4) — must be >= min
-        let len = (TPM2_TABLE_MIN_LEN + 4) as u32;
-        table[4..8].copy_from_slice(&len.to_le_bytes());
-        // control_address at offset 40 (LE u64) = 0xFED4_0000
-        let addr: u64 = 0xFED4_0000;
-        table[40..48].copy_from_slice(&addr.to_le_bytes());
-        // start_method at offset 48 (LE u32) = COMMAND_BUFFER (7)
-        table[48..52].copy_from_slice(&ACPI_TPM2_COMMAND_BUFFER.to_le_bytes());
-
-        let parsed = parse_tpm2_table(&table).expect("parse must succeed");
-        if parsed.control_address != 0xFED4_0000 {
-            return TestResult::Fail("control_address mismatch");
+    fn smoke_tpm2_start_method_is_crb() -> TestResult {
+        use crate::probe::{
+            start_method_is_crb, ACPI_TPM2_COMMAND_BUFFER, ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC,
+            ACPI_TPM2_COMMAND_BUFFER_WITH_START_METHOD, ACPI_TPM2_CRB_WITH_ARM_FFA,
+            ACPI_TPM2_MEMORY_MAPPED, ACPI_TPM2_NOT_ALLOWED,
+        };
+        for m in [
+            ACPI_TPM2_COMMAND_BUFFER,
+            ACPI_TPM2_COMMAND_BUFFER_WITH_START_METHOD,
+            ACPI_TPM2_MEMORY_MAPPED,
+        ] {
+            if !start_method_is_crb(m) {
+                return TestResult::Fail("CRB start method not recognised as CRB");
+            }
         }
-        if parsed.start_method != ACPI_TPM2_COMMAND_BUFFER {
-            return TestResult::Fail("start_method mismatch");
-        }
-        if !parsed.is_crb() {
-            return TestResult::Fail("start_method 7 must be recognised as CRB");
-        }
-        // Wrong signature must return None.
-        let mut bad = table;
-        bad[0..4].copy_from_slice(b"XSDT");
-        if parse_tpm2_table(&bad).is_some() {
-            return TestResult::Fail("wrong signature must fail");
-        }
-        // Short table must return None.
-        if parse_tpm2_table(&table[..10]).is_some() {
-            return TestResult::Fail("short table must return None");
+        for m in [
+            ACPI_TPM2_NOT_ALLOWED,
+            ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC,
+            ACPI_TPM2_CRB_WITH_ARM_FFA,
+        ] {
+            if start_method_is_crb(m) {
+                return TestResult::Fail("non-MMIO start method misclassified as CRB");
+            }
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/tpm/probe", smoke_tpm2_table_parse);
+    kernel_test_in!("drivers/tpm/probe", smoke_tpm2_start_method_is_crb);
 
     // ── PCR selection bitmap encoding ────────────────────────────────
 

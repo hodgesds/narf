@@ -1,3 +1,17 @@
+//! narf-tpm — the canonical TPM 2.0 protocol crate (composition,
+//! #934).
+//!
+//! This crate is the single protocol/policy surface for TPM in
+//! NARF: the `TpmDevice` trait, the device `registry` that
+//! `frame::measure` dispatches through, the capability vocabulary
+//! (`TpmRight`), and the canonical TPM 2.0 wire codec (`tpm2` +
+//! `commands`). The sole production transport — the CRB/TIS MMIO
+//! driver that probes hardware and registers a device here — lives
+//! in `drivers/platform` (`drivers/platform/src/tpm.rs`). There is
+//! no second registry, trait, or PCR_Extend encoding: transports
+//! submit frames built by this crate's builders, and consumers
+//! look devices up only through `registry`.
+
 #![no_std]
 
 extern crate alloc;
@@ -8,7 +22,6 @@ use async_trait::async_trait;
 use narf_capabilities::{CapKind, CapType};
 
 pub mod commands;
-pub mod crb;
 pub mod tpm2;
 pub mod types;
 
@@ -511,6 +524,44 @@ mod tests {
         smoke_tpm_command_builder_pcr_extend_exact_bytes
     );
 
+    fn smoke_tpm_pcr_extend_response_rejects_truncated_and_error_rc() -> TestResult {
+        use crate::commands::ResponseParser;
+        use crate::types::{TpmError, TpmRc};
+        // Negative fixture (#937): a malformed/truncated extend
+        // response must fail clean with a typed error, never panic
+        // and never be accepted as success.
+        // (a) Empty and header-truncated responses.
+        for short in [&[][..], &[0x80u8, 0x02][..], &[0u8; 9][..]] {
+            match ResponseParser::new(short) {
+                Err(TpmError::BadResponse) => {}
+                _ => return TestResult::Fail("truncated extend response not BadResponse"),
+            }
+        }
+        // (b) A well-framed header carrying TPM_RC_VALUE (0x184 —
+        // the exact rejection a real TPM returned for the old
+        // malformed encoding) maps to Rc(Value), not Ok.
+        let mut err_resp = [0u8; 10];
+        err_resp[0..2].copy_from_slice(&0x8002u16.to_be_bytes());
+        err_resp[2..6].copy_from_slice(&10u32.to_be_bytes());
+        err_resp[6..10].copy_from_slice(&0x184u32.to_be_bytes());
+        match ResponseParser::new(&err_resp) {
+            Err(TpmError::Rc(TpmRc::Value)) => {}
+            _ => return TestResult::Fail("TPM_RC_VALUE extend response not Rc(Value)"),
+        }
+        // (c) A success header (RC 0) is accepted.
+        let mut ok_resp = [0u8; 10];
+        ok_resp[0..2].copy_from_slice(&0x8002u16.to_be_bytes());
+        ok_resp[2..6].copy_from_slice(&10u32.to_be_bytes());
+        if ResponseParser::new(&ok_resp).is_err() {
+            return TestResult::Fail("success extend response rejected");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "tpm/commands",
+        smoke_tpm_pcr_extend_response_rejects_truncated_and_error_rc
+    );
+
     fn smoke_tpm_response_parser_rejects_short_buf() -> TestResult {
         use crate::commands::ResponseParser;
         use crate::types::{TpmError, TpmRc};
@@ -662,114 +713,4 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("tpm/types", smoke_tpm_error_variants_distinct);
-
-    // ── tpm/crb ────────────────────────────────────────────────────────
-
-    fn smoke_tpm_crb_acquire_locality_writes_request_and_polls() -> TestResult {
-        use crate::crb::{
-            acquire_locality, MockCrb, LOC_CTRL_REQUEST, LOC_STATE_LOC_ASSIGNED, REG_LOC_CTRL,
-            REG_LOC_STATE,
-        };
-        let mut m = MockCrb::new();
-        // Hook: after the host writes LOC_CTRL, simulate the TPM
-        // toggling LOC_STATE.locAssigned the next time it's read.
-        m.install_hook(REG_LOC_STATE, |regs| {
-            regs[REG_LOC_STATE / 4] |= LOC_STATE_LOC_ASSIGNED;
-        });
-        if acquire_locality(&mut m).is_err() {
-            return TestResult::Fail("acquire_locality errored on happy path");
-        }
-        // First write must be LOC_CTRL = Request.
-        if m.writes.first().copied() != Some((REG_LOC_CTRL, LOC_CTRL_REQUEST)) {
-            return TestResult::Fail("must write LOC_CTRL.Request first");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "tpm/crb",
-        smoke_tpm_crb_acquire_locality_writes_request_and_polls
-    );
-
-    fn smoke_tpm_crb_acquire_locality_times_out_on_no_response() -> TestResult {
-        use crate::crb::{acquire_locality, CrbError, MockCrb};
-        // No hook installed — LOC_STATE stays 0 forever.
-        let mut m = MockCrb::new();
-        match acquire_locality(&mut m) {
-            Err(CrbError::LocalityTimeout) => TestResult::Pass,
-            _ => TestResult::Fail("must time out when locAssigned never asserts"),
-        }
-    }
-    kernel_test_in!(
-        "tpm/crb",
-        smoke_tpm_crb_acquire_locality_times_out_on_no_response
-    );
-
-    fn smoke_tpm_crb_program_buffers_writes_size_and_phys_pairs() -> TestResult {
-        use crate::crb::{
-            program_buffers, MockCrb, REG_CMD_HADDR, REG_CMD_LADDR, REG_CMD_SIZE, REG_RSP_HADDR,
-            REG_RSP_LADDR, REG_RSP_SIZE,
-        };
-        let mut m = MockCrb::new();
-        let cmd_phys: u64 = 0x0000_0001_DEAD_0000;
-        let rsp_phys: u64 = 0x0000_0002_BEEF_0000;
-        program_buffers(&mut m, cmd_phys, 64, rsp_phys, 256);
-        // Verify each of the 6 expected writes lands with the right value.
-        let want = [
-            (REG_CMD_SIZE, 64),
-            (REG_CMD_LADDR, cmd_phys as u32),
-            (REG_CMD_HADDR, (cmd_phys >> 32) as u32),
-            (REG_RSP_SIZE, 256),
-            (REG_RSP_LADDR, rsp_phys as u32),
-            (REG_RSP_HADDR, (rsp_phys >> 32) as u32),
-        ];
-        for (addr, value) in want {
-            if !m.writes.iter().any(|w| w.0 == addr && w.1 == value) {
-                return TestResult::Fail("missing expected buffer-program write");
-            }
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "tpm/crb",
-        smoke_tpm_crb_program_buffers_writes_size_and_phys_pairs
-    );
-
-    fn smoke_tpm_crb_run_command_self_clears_and_returns_sts() -> TestResult {
-        use crate::crb::{run_command, MockCrb, CTRL_STS_IDLE, REG_CTRL_START, REG_CTRL_STS};
-        let mut m = MockCrb::new();
-        // Pre-load CTRL_STS = IDLE so the post-clear inspection finds idle.
-        m.regs[REG_CTRL_STS / 4] = CTRL_STS_IDLE;
-        // Hook on CTRL_START: clear the Go bit on the next read.
-        m.install_hook(REG_CTRL_START, |regs| {
-            regs[REG_CTRL_START / 4] = 0;
-        });
-        let sts = match run_command(&mut m) {
-            Ok(s) => s,
-            Err(_) => return TestResult::Fail("run_command errored on happy path"),
-        };
-        if sts & CTRL_STS_IDLE == 0 {
-            return TestResult::Fail("CTRL_STS.IDLE must be observed after Go clears");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "tpm/crb",
-        smoke_tpm_crb_run_command_self_clears_and_returns_sts
-    );
-
-    fn smoke_tpm_crb_run_command_surfaces_error_bit() -> TestResult {
-        use crate::crb::{
-            run_command, CrbError, MockCrb, CTRL_STS_ERROR, REG_CTRL_START, REG_CTRL_STS,
-        };
-        let mut m = MockCrb::new();
-        m.regs[REG_CTRL_STS / 4] = CTRL_STS_ERROR | 0x1234_0000; // error bit + diagnostic bits
-        m.install_hook(REG_CTRL_START, |regs| {
-            regs[REG_CTRL_START / 4] = 0;
-        });
-        match run_command(&mut m) {
-            Err(CrbError::Failed(s)) if s & CTRL_STS_ERROR != 0 => TestResult::Pass,
-            _ => TestResult::Fail("CTRL_STS.error must surface as CrbError::Failed"),
-        }
-    }
-    kernel_test_in!("tpm/crb", smoke_tpm_crb_run_command_surfaces_error_bit);
 }

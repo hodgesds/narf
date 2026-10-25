@@ -1,6 +1,6 @@
 [package]
 name         = "narf-drivers-tpm"
-description  = "TPM 2.0 drivers — CRB (fTPM) + TIS (discrete), full TPM2 command set, ACPI probe."
+description  = "TPM 2.0 extension surface — extended command set + devfs/sysfs bridges staged for composition onto the canonical narf-tpm + drivers/platform stack (#934). Not a production transport."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
