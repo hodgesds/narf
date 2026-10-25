@@ -153,8 +153,31 @@ Open/WPA2 DHCP/IP conversations include extra probe elements. Invalid input stay
 retryable; cancellation or policy loss after publication retains DMA and closes
 the owner. This does not expand the initial PHY/channel profile.
 
-The combined selected Wi-Fi/shared-fixture QEMU gates pass 1752 / 0 fail / 9 skip
-on x86_64 and 1289 / 0 fail / 3 skip on aarch64, with clean production boots
+The parallel driver continuation now adds Intel API77 active-link/deactivation
+with source-matched response rates and fresh power/MCC receipts, while retaining
+the TX-disabled peer and management/data gates. Gen2 Qu prerequisites now use
+native header0 independently of their negotiated payload versions; Gen3 is
+unchanged. MT76 negotiates driver-owned WMM
+Information/Parameter IEs, programs native BSS/peer/WTBL QoS and CE EDCA, and
+carries BE/TID0 QoS through actual Open/WPA2 DHCP/IP. HT/aggregation stays gated.
+Live policy clear/restriction fails old MT76 scan/station grants across command
+waits rather than reloading policy into them.
+RTL8821CE advances from inactive PHY tables through an exact-board signed
+calibration-only envelope, channel1/20 setup and real firmware IQK receipts;
+operating power/radio/station still need their separate grants. RTL8822CE's
+actual reserved backend now completes radio preparation through an explicit
+Continued lifecycle state, including failure/cancellation coverage.
+
+Ath10k manual recovery parks all CEs and verifies BME disable before scheduling
+fresh chip reset, authenticated ROM provisioning and a new runtime/interface.
+Retirement tokens, unique TX cookies and reserved old names fence cancelled
+control and late publication; old physical Drop cannot touch its successor.
+All old firmware/CE/WMI/HTT mappings remain pinned, with three attempts per boot
+bounding retained generations. Automatic/stable-interface recovery, DMA
+reclamation, broader PHY features and physical reset/RF acceptance remain open.
+
+The combined selected Wi-Fi/shared-fixture QEMU gates pass 1790 / 0 fail / 9 skip
+on x86_64 and 1327 / 0 fail / 3 skip on aarch64, with clean production boots
 and btrfs postflights. Scoped cross-architecture Clippy and changed-package
 formatting pass; default release and debug kernels build on both architectures.
 Native Rust tests cover the queue and v5 power ABIs, active scan requests/power

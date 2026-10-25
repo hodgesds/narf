@@ -51,14 +51,14 @@ feature inventory before it can be called ready.
 
 | Family | Required software beyond the initial station milestone |
 |---|---|
-| iwlwifi | Gen2/MVM station admission; remaining Gen3 command profiles; 6 GHz/HE/EHT, additional roles, RX/RSS and system PM |
+| iwlwifi | Gen2/MVM peer TX/management/association/data admission after retained active-link preparation; remaining Gen3 command profiles; 6 GHz/HE/EHT, additional roles, RX/RSS and system PM |
 | ath11k | QCN9074 static windows/HAL/DP and firmware profile; complete per-chip optional-feature inventory, remaining platform/BW-scaling paths and architecture coverage |
-| mt76 | Associated/off-channel and richer scans, 6 GHz/HT/VHT/HE, PMF/WPA3, fragmentation, production HT/A-MSDU activation, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
-| ath10k | Wider bands/widths, HT/VHT/aggregation, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, recoverable reset and firmware PM |
+| mt76 | Associated/off-channel and richer scans, 6 GHz/HT/VHT/HE, PMF/WPA3, fragmentation, production HT/A-MSDU activation, QoS beyond BE/TID0 and U-APSD/TSPEC, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
+| ath10k | Wider bands/widths, HT/VHT/aggregation, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, automatic/stable-interface recovery, DMA reclamation and firmware PM |
 | ath9k | Other chip/EEPROM/descriptor variants, channel retune, periodic calibration, rate control/aggregation, IRQs, reset/rejoin, removal and PM |
 | rtlwifi | Other matched chips; wider channel/rate profiles, IRQ/C2H expansion, multiple radios, reset/recovery, removal and suspend |
 | rtl8xxxu | Other matched USB chips, wider channels/rates, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
-| rtw88 | RTL8821CE/RTL8822BE station paths; broader channels/rates/roles/security, reset/suspend/removal, multiple devices and retained-map reclamation |
+| rtw88 | RTL8821CE operating-power/radio/station admission after qualified calibration-only IQK; RTL8822BE station path; broader channels/rates/roles/security, reset/suspend/removal, multiple devices and retained-map reclamation |
 | rtw89 | Other AX/BE profiles and BE transport/EFUSE, wider PHY/channel/rate/role/security profiles, periodic RF tracking, IRQs, reset/rejoin/removal/suspend and multiple functions |
 | brcmfmac | Other chip/CPU/RAM/OTP/shared-ring profiles, wider PHY/bandwidth, WPA3/AP and other supported roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
 | cyw43439 | Platform clocks/pins/regulators/reset and gSPI host, wider PHY/role/security coverage, reset/reload, system PM and host-bus power transitions |
@@ -70,6 +70,22 @@ live shared regulatory DB replacement/clear, including paused control futures an
 host data admission; firmware-cap epoch observation and firmware RF quiescence
 remain distinct gates. Actual authenticated assets, board wiring, reset handoff
 and physical acceptance remain deployment/test gates.
+
+The current parallel continuation adds actual API77 Intel active-link and
+deactivation receipts while peer TX stays disabled, MT76 driver-owned WMM
+negotiation and native BE/TID0 QoS through Open/WPA2 DHCP/IP, and exact-board
+qualified RTL8821CE calibration-only firmware IQK. RTL8822CE also reaches its
+actual retained backend's completed-radio transition through an explicit
+Continued state. Ath10k supplies bounded manual fresh-ROM replacement generations
+through `pci::recover()`: old interfaces are retired, old DMA remains pinned,
+and current authenticated provisioning plus all runtime initialization repeat
+before a new interface can be joined. These continuations preserve their stated
+initial PHY/security profiles and do not complete the remaining family ledger.
+The Gen2 Qu command path now separates the native zero wire-header version from
+negotiated payload layouts across the reached prerequisite chain; existing Gen3
+header behavior is preserved. MT76 live scan/station admission samples the
+installed policy and observes clear/restriction instead of bootstrapping an old
+grant through an in-flight command wait.
 
 The public nl80211 scan limit follows each facade's `max_scan_ssids`: Intel
 admits 20 active SSID entries, ath10k, ath11k and common FullMAC admit 16, MT76 admits
