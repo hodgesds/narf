@@ -165,19 +165,17 @@ interval, restore/readbacks and cancellation without config access; a retained
 probe test rejects replacement or re-parking during reset ownership. Software
 evidence does not establish real firmware instruction execution or RF acceptance.
 
-`narf_wifi_fixtures::firmware::metadata_replay(image_len, fragments)` builds
-parser-only structural images up to 16 MiB. It validates nonempty, ordered,
-nonoverlapping fragment extents before allocation and zeroes every opaque gap.
-The native Rust `cargo xtask wifi-fixtures` tool reads explicit SHA256-pinned
-vendor blobs and retains structural headers/TLV geometry, version/API facts,
-section addresses and board-name metadata. Its host parsers are independent of
-production driver parsers and do not harvest or compile reference source.
-`check` verifies existing data; `write` reproduces it without silently updating
-source pins; `extract` requires an explicit format, input, name, hash and new
-output directory. Kernel smokes feed these images only
-to parsers, never a firmware registry, board-calibration authority or hardware
-loader. Passing proves layout handling; signatures, instructions and RF/board
-acceptance require original authenticated assets and physical validation.
+Wi-Fi firmware parser tests use authored Rust byte literals and small builders
+for wire headers, IEs, sections and command-version tables. Their expectations
+are explicit protocol facts, independent of production encoders. Extracted
+firmware metadata binaries, their host extraction/regeneration pipeline and
+missing-fixture skip stubs are not maintained. The generic Rust
+`narf_wifi_fixtures::firmware::sparse_image(image_len, fragments)` helper checks
+nonempty, ordered, nonoverlapping extents before allocating a bounded zero-filled
+test image (at most 16 MiB). Existing reviewed Rust reference literals can use
+it without binary fixture files. These parser-only inputs never enter a firmware
+registry, board-calibration authority or hardware loader. Authenticated external
+assets and physical tests remain necessary for firmware and RF acceptance.
 
 | Category        | Runs on       | Who gates | What it protects against                     |
 | --------------- | ------------- | --------- | -------------------------------------------- |

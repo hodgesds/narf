@@ -164,7 +164,7 @@ impl Wire {
         match (group, cmd) {
             (0xc, 2) => {
                 require(body == [0; 4] && version == 1, "Sc NVM request")?;
-                // The pinned Sc table selects Linux iwl_nvm_get_info_rsp v4:
+                // The authored MLD table selects iwl_nvm_get_info_rsp v4:
                 // legacy-only single-chain NVM, 14 valid channels/110 entries.
                 response.resize(28 + 110 * 4, 0);
                 response[12..16].copy_from_slice(&1u32.to_le_bytes());
@@ -500,7 +500,7 @@ impl Guard {
                 && name.is_none_or(|name| narf_net::iface::lookup(name).is_none()),
             "live iwlwifi owner exists",
         )?;
-        let versions = super::super::firmware_golden_tests::sc103_commands();
+        let versions = super::super::firmware_parser_tests::mld_commands();
         let (mut hardware, firmware, trace) = model::station_model();
         model::versions(&mut hardware, &versions);
         Device::validate_station_profile(&hardware)?;

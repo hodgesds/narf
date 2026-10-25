@@ -115,13 +115,13 @@ and CI compiler-cache integration.
   or compile temporary Rust source slices for reference comparison. Fixed
   hardware data and reviewed Rust vectors retain their provenance; physical
   hardware and external userspace interoperability require separate acceptance.
-- `cargo xtask wifi-fixtures check|write [--vendor VENDOR] [--source PATH]`
-  checks or reproduces structural metadata from explicit SHA256-pinned vendor
-  blobs using native Rust parsers. Normal driver builds do not require vendor
-  originals. `extract` requires an explicit input/name/hash/output directory;
-  `board-manifest` encodes explicit deployment facts as unsigned NBSP v1 data
-  for the existing `pack-firmware` signing flow. Neither command invents board
-  calibration, grants device authority or extracts/compiles reference source.
+- Wi-Fi firmware parser tests construct small, explicit wire inputs in Rust.
+  No extracted metadata binaries, regeneration step or local vendor firmware
+  installation is required. `cargo xtask wifi-fixtures board-manifest` encodes
+  explicit deployment facts as unsigned NBSP v1 data for the existing
+  `pack-firmware` signing flow. It does not invent board calibration or grant
+  device authority. The former metadata `check`, `write` and `extract` commands
+  are removed.
 - `cargo xtask test --arch=x86_64 --subsystem userspace` — run that subsystem
   and its `/`-delimited children, then perform the normal whole-kernel boot
   smoke. Comma-separated filters select the union of those subtrees.

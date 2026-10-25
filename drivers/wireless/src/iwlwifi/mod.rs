@@ -60,9 +60,9 @@ mod context_v1;
 pub mod data_queue;
 pub mod device;
 pub mod firmware_api;
-#[cfg(any(test, feature = "kernel-test"))]
-mod firmware_golden_tests;
 mod firmware_identity;
+#[cfg(any(test, feature = "kernel-test"))]
+mod firmware_parser_tests;
 pub mod frame_api;
 pub mod fw_loader;
 mod gen2_prepare;

@@ -38,8 +38,8 @@ and exact post-lease Ethernet data in both directions. Synthetic board,
 calibration and firmware inputs remain private to these fixtures; physical
 acceptance still requires the exact authenticated deployment assets.
 
-`firmware::metadata_replay` also supports firmware parser fixtures. It rebuilds
-the original image geometry from bounded metadata fragments while zeroing all
-omitted executable/calibration bytes. These synthetic images must never be
-registered or loaded onto a device. See the [fixture provenance and audit
-instructions](../data/wifi-firmware/README.md).
+Firmware parser cases use Rust literals and small builders, without extracted
+binary files or a regeneration command. `firmware::sparse_image` assembles
+bounded test images from reviewed Rust fragments with zero-filled gaps. These
+inputs must never be registered or loaded onto a device. See the
+[firmware provisioning inventory](../data/wifi-firmware/README.md).

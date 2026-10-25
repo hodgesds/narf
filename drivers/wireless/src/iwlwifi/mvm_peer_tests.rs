@@ -453,7 +453,7 @@ kernel_test_in!(
     smoke_iwl_mvm_disabled_peer_identity_policy_and_abi_preflight
 );
 
-fn smoke_iwl_mvm_disabled_peer_linux_packed_body_and_captured_api() -> TestResult {
+fn smoke_iwl_mvm_disabled_peer_packed_body_and_authored_api() -> TestResult {
     // Fixed 48-byte wire vector; historical reference: Linux firmware sta.h.
     const LINUX_ADD: [u8; 48] = [
         0, 0, 255, 255, 0, 0, 0, 0, 2, 4, 6, 8, 10, 12, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 16, 0, 2,
@@ -462,10 +462,10 @@ fn smoke_iwl_mvm_disabled_peer_linux_packed_body_and_captured_api() -> TestResul
     if add_command(AP) != LINUX_ADD {
         return TestResult::Fail("disabled peer body differs from independent Linux C layout");
     }
-    let replay = super::super::super::firmware_golden_tests::api77_replay();
+    let replay = super::super::super::firmware_parser_tests::mvm_image();
     let parsed = match super::super::super::parse_ucode(&replay) {
         Ok(parsed) => parsed,
-        Err(_) => return TestResult::Fail("pinned API77 metadata failed decode"),
+        Err(_) => return TestResult::Fail("authored MVM TLV input failed decode"),
     };
     if parsed.api.versions(1, ADD_STA) != Some((12, 2))
         || parsed.api.versions(1, REMOVE_STA) != Some((2, 0))
@@ -481,18 +481,16 @@ fn smoke_iwl_mvm_disabled_peer_linux_packed_body_and_captured_api() -> TestResul
     {
         let mut operation = pin!(prepare(owner));
         if !poll(operation.as_mut()).is_pending() || fixture.firmware.tx_write() != 1 {
-            return TestResult::Fail(
-                "actual captured API77 profile could not publish disabled ADD",
-            );
+            return TestResult::Fail("authored API77 profile could not publish disabled ADD");
         }
         fixture.firmware.inject(ADD_STA, 0, 0, &[1, 0, 0, 0]);
         if poll(operation.as_mut()) != Poll::Ready(Ok(())) {
-            return TestResult::Fail("actual captured API77 profile rejected native ADD status");
+            return TestResult::Fail("authored API77 profile rejected native ADD status");
         }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2",
-    smoke_iwl_mvm_disabled_peer_linux_packed_body_and_captured_api
+    smoke_iwl_mvm_disabled_peer_packed_body_and_authored_api
 );

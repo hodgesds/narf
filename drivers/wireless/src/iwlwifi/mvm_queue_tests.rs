@@ -475,10 +475,10 @@ fn metadata() -> Result<(), &'static str> {
             return Err("queue ABI preflight changed peer state or published/retained new DMA");
         }
     }
-    let bytes = super::super::super::firmware_golden_tests::api77_replay();
+    let bytes = super::super::super::firmware_parser_tests::mvm_image();
     let parsed = super::super::super::parse_ucode(&bytes).unwrap();
     if parsed.api.versions(5, 0x17) != Some((3, 2)) {
-        return Err("actual CC API77 does not advertise native queue v3/response2");
+        return Err("authored MVM table does not advertise native queue v3/response2");
     }
     let mut fixture = Fixture::new();
     runtime::model::versions(
@@ -488,14 +488,14 @@ fn metadata() -> Result<(), &'static str> {
     fixture.prepare_peer()?;
     fixture.prepare_queue()?;
     if fixture.owner.as_ref().unwrap().prepared_management_queue() != Some(QUEUE) {
-        return Err("actual API77 negotiation did not reach retained native queue");
+        return Err("authored MVM negotiation did not reach retained native queue");
     }
     Ok(())
 }
-fn smoke_iwl_mvm_management_queue_uses_actual_api77_command_profile() -> TestResult {
+fn smoke_iwl_mvm_management_queue_uses_authored_api77_command_profile() -> TestResult {
     metadata().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2",
-    smoke_iwl_mvm_management_queue_uses_actual_api77_command_profile
+    smoke_iwl_mvm_management_queue_uses_authored_api77_command_profile
 );

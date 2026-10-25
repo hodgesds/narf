@@ -1,4 +1,4 @@
-use super::super::super::{firmware_golden_tests, runtime};
+use super::super::super::{firmware_parser_tests, runtime};
 use super::super::queue::tests::Fixture;
 use super::*;
 use alloc::vec;
@@ -66,12 +66,12 @@ fn copy(source: &Asset) -> Asset {
     }
 }
 fn fixture(lar: bool) -> Result<Fixture, &'static str> {
-    let bytes = firmware_golden_tests::api77_replay();
+    let bytes = firmware_parser_tests::mvm_image();
     let parsed = super::super::super::parse_ucode(&bytes).unwrap();
     if parsed.api.versions(1, REDUCE_TX_POWER) != Some((5, 0))
         || parsed.api.api_changes[1] & (1 << 13) == 0
     {
-        return Err("actual CC API77 lacks the negotiated native v5 power profile");
+        return Err("authored MVM table lacks the negotiated native v5 power profile");
     }
     let mut fixture = Fixture::new();
     let owner = fixture.owner.as_mut().unwrap();
