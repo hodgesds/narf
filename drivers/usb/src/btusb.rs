@@ -29,15 +29,17 @@
 //!    and the interrupt-IN event endpoint.
 //! 3. Configure those endpoints + issue SET_CONFIGURATION.
 //! 4. Apply required USB vendor firmware setup for recognised parts
-//!    (currently WCN6855) before exposing the HCI transport.
+//!    (Qualcomm WCN6855, Intel AX200/AX210-class, MediaTek
+//!    MT7921/MT7922) before exposing the HCI transport.
 //! 5. Drive mandatory HCI bring-up directly against the xHCI async
 //!    transfer paths: Reset → version → BD_ADDR → buffer sizes → event mask.
 //! 6. Log `bluetooth: $vendor adapter, HCI v$ver, Bluetooth $bt_ver`.
 //! 7. Register an `HciTransport` against the slot for Stage-1+ users.
 //!
-//! Out of scope for Stage 0: ACL data plane (L2CAP / GATT / pairing),
-//! SCO/eSCO isoch streaming, non-QCA vendor firmware, LE Advertising,
-//! and BR/EDR Inquiry. Those land as separate stages.
+//! Out of scope for Stage 0: SCO/eSCO isoch streaming, Realtek /
+//! Broadcom vendor firmware, LE Advertising, and BR/EDR Inquiry.
+//! Those land as separate stages. (The ACL data plane is driven by
+//! the `narf_bluetooth::pump` task registered at bring-up.)
 //!
 //! Why a per-driver async bring-up instead of routing through the
 //! existing `narf_bluetooth::controller::Controller::bring_up`:
@@ -391,7 +393,7 @@ impl HciTransport for UsbHciTransport {
 /// Issue one HCI Command on the control endpoint + wait for the
 /// matching Command Complete event on the interrupt-IN endpoint.
 /// Per Vol 4 Part E §6 the per-command budget is at least 5 s.
-async fn send_command_and_await_complete(
+pub(crate) async fn send_command_and_await_complete(
     xhci: &Xhci,
     slot_id: u8,
     interface: u8,
@@ -457,6 +459,117 @@ async fn send_command_and_await_complete(
             Err(_) => return Err(BtUsbError::CommandTransfer),
         }
     }
+}
+
+/// Issue one HCI Command + wait for a specific event code instead of
+/// Command Complete. MediaTek WMT commands (opcode 0xFC6F) are
+/// answered by a vendor WMT event (0xE4), not a Command Complete —
+/// Linux uses `__hci_cmd_sync_ev` for the same reason.
+///
+/// Unrelated events are skipped: this runs only during pre-bring-up
+/// vendor setup, when no host-stack traffic exists yet. A Command
+/// Complete / Command Status for our opcode with a non-zero status
+/// still fails the wait.
+pub(crate) async fn send_command_and_await_event(
+    xhci: &Xhci,
+    slot_id: u8,
+    interface: u8,
+    event_dci: u8,
+    opcode: u16,
+    params: &[u8],
+    want_code: u8,
+) -> Result<Event, BtUsbError> {
+    let cmd = Command::with_params(opcode, params);
+    let payload = cmd.encode();
+    xhci.control_out(
+        slot_id,
+        RT_HCI_COMMAND,
+        REQ_HCI_COMMAND,
+        0,
+        interface as u16,
+        &payload,
+    )
+    .await
+    .map_err(|_| BtUsbError::CommandTransfer)?;
+
+    let deadline = narf_time::Deadline::after_ms(5_500);
+    let mut buf = [0u8; 257];
+    loop {
+        match xhci.poll_interrupt_in(slot_id, event_dci, &mut buf) {
+            Ok(Some(n)) => {
+                let event = Event::decode(&buf[..n]).ok_or(BtUsbError::EventTimeout)?;
+                if event.code == want_code {
+                    return Ok(event);
+                }
+                if event.code == EventCode::CommandStatus as u8 {
+                    let status = CommandStatus::parse(&event).ok_or(BtUsbError::EventTimeout)?;
+                    if status.opcode == opcode && status.status != 0 {
+                        return Err(BtUsbError::BadStatus(status.status));
+                    }
+                }
+                if event.code == EventCode::CommandComplete as u8 {
+                    let cc = CommandComplete::parse(&event).ok_or(BtUsbError::EventTimeout)?;
+                    if cc.opcode == opcode {
+                        let status = cc.status().unwrap_or(0xFF);
+                        if status != 0x00 {
+                            return Err(BtUsbError::BadStatus(status));
+                        }
+                    }
+                }
+                // Any other event is not ours; keep waiting.
+            }
+            Ok(None) => {
+                if deadline.expired() {
+                    return Err(BtUsbError::EventTimeout);
+                }
+                narf_scheduler::yield_now().await;
+            }
+            Err(_) => return Err(BtUsbError::CommandTransfer),
+        }
+    }
+}
+
+/// Discard pending interrupt-IN events for up to `budget_ms`.
+///
+/// Vendor boot sequences leave asynchronous vendor events queued
+/// (e.g. the Intel bootup event 0xFF/0x02 emitted after the Intel
+/// Reset boots the operational image). The generic bring-up that
+/// follows expects the next event to be its own Command Complete, so
+/// vendor setup drains the queue first.
+pub(crate) async fn drain_pending_events(xhci: &Xhci, slot_id: u8, event_dci: u8, budget_ms: u64) {
+    let deadline = narf_time::Deadline::after_ms(budget_ms);
+    let mut buf = [0u8; 257];
+    loop {
+        match xhci.poll_interrupt_in(slot_id, event_dci, &mut buf) {
+            Ok(Some(_)) => {
+                if deadline.expired() {
+                    return;
+                }
+            }
+            Ok(None) => {
+                if deadline.expired() {
+                    return;
+                }
+                narf_scheduler::yield_now().await;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Open a firmware blob from the registry under the trusted-loader
+/// authority — the same capability path `btusb_qca` uses. `None` when
+/// the authority or the blob is unavailable; vendor setup treats
+/// that as a hard failure for chips that cannot run without their
+/// firmware.
+pub(crate) fn firmware_cap(
+    name: &str,
+) -> Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>> {
+    use narf_capabilities::Cap;
+    let write = narf_firmware::trusted_loader_authority()?;
+    let read: Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read> =
+        write.derive().ok()?;
+    narf_firmware::open(name, &read).ok()
 }
 
 /// Decode Read Local Version's Command Complete return parameters.
@@ -559,37 +672,12 @@ pub async fn try_bind_btusb_already_addressed(
     let acl_in_dci = ep_dci(eps.acl_in.ep_addr, /*is_in*/ true);
     let acl_out_dci = ep_dci(eps.acl_out.ep_addr, /*is_in*/ false);
 
-    if narf_bluetooth::btusb_quirks::identify(vendor_id, product_id)
-        == Some(narf_bluetooth::btusb_quirks::Quirk::QualcommWcn6855)
-    {
-        match crate::btusb_qca::setup_wcn6855(xhci_dev, slot_id, acl_out_dci).await {
-            Ok(version) => {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  btusb-qca: {:04x}:{:04x} ROM {:#010x}, patch {:#010x}",
-                    vendor_id,
-                    product_id,
-                    version.rom_version,
-                    version.patch_version,
-                );
-            }
-            Err(error) => {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  btusb-qca: {:04x}:{:04x} setup failed: {:?}",
-                    vendor_id,
-                    product_id,
-                    error,
-                );
-                return Err(BtUsbError::FirmwareSetup);
-            }
-        }
-    }
-
-    // Keep one interrupt-IN Event transfer outstanding across the whole
-    // mandatory command sequence. Every successful poll re-arms it.
+    // Keep one interrupt-IN Event transfer outstanding across the
+    // vendor setup and the whole mandatory command sequence. Every
+    // successful poll re-arms it. (Arming happens before vendor
+    // setup because the Intel / MediaTek sequences issue HCI
+    // commands; the QCA DFU sequence does not use the event endpoint
+    // and is unaffected.)
     if let Err(error) =
         xhci_dev.arm_interrupt_in(slot_id, event_dci, eps.event_in.max_packet.min(257) as u32)
     {
@@ -602,6 +690,85 @@ pub async fn try_bind_btusb_already_addressed(
             error
         );
         return Err(BtUsbError::CommandTransfer);
+    }
+
+    // Vendor firmware setup for recognised parts, before the generic
+    // bring-up: controllers that need their firmware downloaded do
+    // not answer normal HCI correctly until this has run. A failed
+    // vendor setup fails the bind (Linux does the same — proceeding
+    // to HCI Reset would register a controller that cannot work).
+    match narf_bluetooth::btusb_quirks::identify(vendor_id, product_id) {
+        Some(narf_bluetooth::btusb_quirks::Quirk::QualcommWcn6855) => {
+            match crate::btusb_qca::setup_wcn6855(xhci_dev, slot_id, acl_out_dci).await {
+                Ok(version) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  btusb-qca: {:04x}:{:04x} ROM {:#010x}, patch {:#010x}",
+                        vendor_id,
+                        product_id,
+                        version.rom_version,
+                        version.patch_version,
+                    );
+                }
+                Err(error) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  btusb-qca: {:04x}:{:04x} setup failed: {:?}",
+                        vendor_id,
+                        product_id,
+                        error,
+                    );
+                    return Err(BtUsbError::FirmwareSetup);
+                }
+            }
+        }
+        Some(narf_bluetooth::btusb_quirks::Quirk::Intel) => {
+            if let Err(error) = crate::btusb_intel::setup_intel(
+                xhci_dev,
+                slot_id,
+                eps.interface,
+                event_dci,
+                product_id,
+            )
+            .await
+            {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  btusb-intel: {:04x}:{:04x} setup failed: {:?}",
+                    vendor_id,
+                    product_id,
+                    error,
+                );
+                return Err(BtUsbError::FirmwareSetup);
+            }
+        }
+        Some(narf_bluetooth::btusb_quirks::Quirk::MediaTek) => {
+            if let Err(error) = crate::btusb_mtk::setup_mediatek(
+                xhci_dev,
+                slot_id,
+                eps.interface,
+                event_dci,
+                product_id,
+            )
+            .await
+            {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  btusb-mtk: {:04x}:{:04x} setup failed: {:?}",
+                    vendor_id,
+                    product_id,
+                    error,
+                );
+                return Err(BtUsbError::FirmwareSetup);
+            }
+        }
+        // Realtek / Broadcom / CSR / Marvell and unrecognised parts
+        // proceed without a vendor sequence for now, as before.
+        _ => {}
     }
 
     // HCI_Reset (§7.3.2) — no parameters, no return params beyond

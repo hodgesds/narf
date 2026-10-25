@@ -316,6 +316,10 @@ pub fn register_ready_transport(transport: Arc<dyn HciTransport>, info: Controll
     let _ = crate::sysfs_bridge::register_hci_controller(index, info, &[]);
     // Tell any open mgmt socket a controller appeared (MGMT_EV_INDEX_ADDED).
     narf_filesystem::bluetooth::publish_mgmt_event(&crate::mgmt::index_added(index as u16));
+    // Start the HCI event/ACL pump for this controller (task spawn
+    // happens only once the Stage::Late bluetooth-pump initcall has
+    // enabled it; before that the pump is registered for fixtures).
+    crate::pump::notify_controller_ready(index);
     index
 }
 
@@ -367,6 +371,7 @@ pub fn bring_up_all(cap: &Cap<Bluetooth, Grant>) -> alloc::vec::Vec<BringupOutco
             // Mirror the controller into /sys/class/bluetooth/hci<index>.
             let _ = crate::sysfs_bridge::register_hci_controller(index, info, &[]);
             narf_filesystem::bluetooth::publish_mgmt_event(&crate::mgmt::index_added(index as u16));
+            crate::pump::notify_controller_ready(index);
         }
         out.push(BringupOutcome {
             transport: name,
