@@ -31,6 +31,11 @@ pub struct I40eNic {
     rx_dropped: AtomicU64,
     pub(super) rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     pub(super) tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    /// The `eth%d` name `iface::register` assigned at probe (issue
+    /// #784). Publication survives hardware rebuilds like the MAC and
+    /// the ring endpoints do — it names this stable interface, not a
+    /// hardware generation.
+    ifname: crate::publish::IfName,
 }
 impl core::fmt::Debug for I40eNic {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -62,6 +67,7 @@ impl I40eNic {
             rx_dropped: AtomicU64::new(0),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx)),
+            ifname: crate::publish::IfName::new(),
         }
     }
     fn lease(&self) -> Option<(Arc<Hardware>, u64)> {
@@ -85,6 +91,14 @@ impl I40eNic {
     }
     pub fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+    /// The interface name `iface::register` gave this PF (`eth%d`);
+    /// empty until probe publishes it.
+    pub fn ifname(&self) -> &'static str {
+        self.ifname.get()
+    }
+    pub(super) fn set_ifname(&self, name: alloc::string::String) {
+        self.ifname.set(name);
     }
     pub fn link_status(&self) -> LinkStatus {
         self.lease()
@@ -126,6 +140,33 @@ impl I40eNic {
 
 async fn delay(ms: u64) {
     narf_time::sleep_cycles(narf_time::Deadline::after_ms(ms).remaining_cycles()).await;
+}
+
+/// Publication sample for a decoded AQ link status (issue #791):
+/// carrier + negotiated speed into `iface` metadata. The metadata
+/// schema has no media / phy_type fields, so those two stay
+/// unpublished — tracked by the follow-up issue referenced from the
+/// PR body.
+pub(super) fn link_sample(status: LinkStatus) -> crate::publish::LinkSample {
+    if !status.link_up {
+        return crate::publish::LinkSample::DOWN;
+    }
+    let speed_mbps = match status.speed() {
+        LinkSpeed::Speed100Mb => Some(100),
+        LinkSpeed::Speed1Gb => Some(1000),
+        LinkSpeed::Speed2_5Gb => Some(2500),
+        LinkSpeed::Speed5Gb => Some(5000),
+        LinkSpeed::Speed10Gb => Some(10000),
+        LinkSpeed::Speed20Gb => Some(20000),
+        LinkSpeed::Speed25Gb => Some(25000),
+        LinkSpeed::Speed40Gb => Some(40000),
+        LinkSpeed::Unknown => None,
+    };
+    crate::publish::LinkSample {
+        carrier: true,
+        speed_mbps,
+        duplex: None,
+    }
 }
 
 pub(super) fn spawn_pumps(
@@ -273,6 +314,11 @@ async fn admin_pump(device: Arc<I40eNic>) {
         if refresh {
             if let Ok(link) = hw.refresh_link_async().await {
                 refresh = false;
+                // Publish the fresh AQ state (issue #791): this event
+                // path is the family's link observer — firmware arms
+                // link-status events at probe (see the `lse_enabled`
+                // warning in probe for the degraded case).
+                crate::publish::publish_link(device.ifname(), link_sample(link));
                 use core::fmt::Write as _;
                 let _ = writeln!(
                     narf_console::Writer,
@@ -354,7 +400,28 @@ async fn queue_pump(
             let delivered = if let Some((buffer, len, meta)) = packet {
                 let mut frame = Frame::new(buffer, len as u32);
                 frame.set_rx_meta(meta);
-                rx.lock().try_send(frame).is_ok()
+                // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
+                // shape via the shared helper: an attached ring
+                // consumer gets a pristine pre-dispatch copy; the
+                // original goes to the kernel stack in place. i40e
+                // exposes its RX consumer directly through `rx_ring()`
+                // (no take-into-static moment to hook), so attach is
+                // observed here instead: the consumer slot is `Some`
+                // from construction until a consumer takes it, and
+                // Stage-3 consumers never hand it back. The mirror is
+                // non-blocking — a full ring drops its copy, never
+                // the stack's packet — so a mirror failure is not an
+                // RX drop; `delivered` tracks the stack dispatch.
+                let mirror_attached = device.rx_ipc_ring.lock().is_none();
+                crate::publish::dispatch_rx(
+                    device.ifname(),
+                    &mut frame,
+                    mirror_attached,
+                    |mirror| {
+                        let _ = rx.lock().try_send(mirror);
+                    },
+                );
+                true
             } else {
                 false
             };
