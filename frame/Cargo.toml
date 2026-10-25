@@ -44,6 +44,10 @@ narf-drivers-media = { path = "../drivers/media" }
 narf-drivers-thunderbolt = { path = "../drivers/thunderbolt" }
 narf-drivers-fingerprint = { path = "../drivers/fingerprint" }
 narf-drivers-platform = { path = "../drivers/platform" }
+# Hardware monitoring (k10temp & friends): the crate registers its
+# probes as initcalls, so it has to be linked for any hwmon device
+# to probe or publish at all.
+narf-drivers-hwmon    = { path = "../drivers/hwmon" }
 # The PCH SPI flash controller and the class-matched PCI serial ports
 # live here. Both register Stage::Subsys PCI drivers, so the crates
 # have to be linked for those probes to exist at all.

@@ -16,6 +16,17 @@
 //! - `in<i>_label`     — voltage label
 //! - `update_interval` — milliseconds between hardware reads (stub 1000)
 //!
+//! ## Failed reads
+//!
+//! When a device read fails (`read_temp` / `read_fan` / `read_voltage`
+//! returns `None`) the corresponding `*_input` attribute renders an
+//! **empty** value — never a fabricated `0`. Linux hwmon fails such a
+//! read with an error; this tree's sysfs show API
+//! (`narf_filesystem::sysfs::AttrShow`) is infallible, so an empty
+//! render is the honest representation available: consumers see EOF
+//! instead of a plausible-looking 0 °C / 0 RPM / 0 mV. A genuine zero
+//! reading still renders as `"0\n"`.
+//!
 //! Linux references:
 //! - `drivers/hwmon/hwmon.c:597`  `hwmon_device_register_with_info`
 //! - `Documentation/hwmon/sysfs-interface` attribute naming convention
@@ -198,10 +209,9 @@ fn add_temp_attrs(
         kobject_add_attr(kobj, attr_name, move || {
             match dev2.read_temp(label_owned) {
                 Some(mc) => format!("{}\n", mc),
-                // Return a sentinel: hwmon convention is to return the
-                // last known good value; we return 0 when hardware is
-                // not yet accessible (ECAM / MSR not wired).
-                None => "0\n".into(),
+                // Failed read: render empty, never a fabricated 0
+                // (see the module docs, "Failed reads").
+                None => String::new(),
             }
         });
     }
@@ -245,7 +255,9 @@ fn add_fan_attrs(
         let dev2 = dev.clone();
         kobject_add_attr(kobj, attr_name, move || match dev2.read_fan(label_owned) {
             Some(rpm) => format!("{}\n", rpm),
-            None => "0\n".into(),
+            // Failed read: render empty, never a fabricated 0
+            // (see the module docs, "Failed reads").
+            None => String::new(),
         });
     }
 
@@ -274,7 +286,9 @@ fn add_voltage_attrs(
         kobject_add_attr(kobj, attr_name, move || {
             match dev2.read_voltage(label_owned) {
                 Some(mv) => format!("{}\n", mv),
-                None => "0\n".into(),
+                // Failed read: render empty, never a fabricated 0
+                // (see the module docs, "Failed reads").
+                None => String::new(),
             }
         });
     }

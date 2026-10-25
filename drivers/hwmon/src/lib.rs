@@ -1,7 +1,7 @@
 //! Hardware monitoring drivers for NARF.
 //!
 //! Provides the [`HwmonDevice`] trait and concrete drivers for:
-//! - [`k10temp`] — AMD Family 17h/19h CPU (Zen2 + Zen4) temperature / voltage
+//! - [`k10temp`] — AMD Family 17h/19h CPU (Zen2 + Zen4) temperature
 //! - [`coretemp`] — Intel per-core thermal status via MSR 0x19C/0x1A2
 //! - [`nct6775`] — Nuvoton NCT6775/6776/6779/6791-6798 Super-I/O
 //! - [`dell_smm`] — Dell SMM/i8042 fan + temp interface (Dell laptops)

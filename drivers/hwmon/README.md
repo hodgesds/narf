@@ -5,7 +5,8 @@ read a machine's temperature sensors, fan tachometers, and voltage rails, and �
 where the hardware allows — set fan speeds. This is the kernel's equivalent of
 Linux's hwmon class, and it follows the same conventions so that userspace sees
 a familiar surface: temperatures in millidegrees Celsius, fan speeds in RPM,
-voltages in millivolts.
+voltages in millivolts. A sensor read that fails renders as an empty value in
+sysfs, never as a fabricated zero.
 
 All drivers register behind a single shared device contract that exposes the
 chip's name, enumerates its sensor labels (driver-defined strings such as
@@ -17,7 +18,7 @@ layout so existing monitoring tools work unmodified.
 
 The crate ships concrete drivers spanning the common sensor sources on real
 x86 hardware. `k10temp` reads AMD Family 17h/19h (Zen 2 through Zen 4) CPU
-temperature and voltage; `coretemp` reads Intel per-core thermal status through
+temperature (the SMN path does not expose voltages); `coretemp` reads Intel per-core thermal status through
 the thermal-status MSRs. `nct6775` and `it87` drive Nuvoton and ITE Super-I/O
 "environment controller" chips found on desktop motherboards — the chips that
 carry most board-level fan and voltage sensing. `dell_smm` speaks the Dell

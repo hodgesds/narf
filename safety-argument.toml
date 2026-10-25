@@ -1817,3 +1817,13 @@ argument = "The execution-liveness pairing is preserved exactly. Each user TaskS
 ref = "security-model/specification/spec.md#L39"
 agent = "Muse Wonder"
 argument = "The GPU kernel-test split's only frame/ change is inside the #[cfg(feature = \"kernel-test\")] dispatch in frame/src/bare_main.rs: it additionally reads the test_subsystem_exclude= cmdline key and routes the test boot to the exclude-aware runners in narf-verification. The kernel-test feature is never compiled into production images; with the key absent the dispatch takes the previous run-all / run-subsystems paths unchanged. It adds no TCB member, capability, domain transition, mapping, or scheduling state — it only narrows which already-registered test functions execute inside a test boot, and the excluded GPU fixtures still run in the dedicated CI job gated by cargo xtask affected."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "Muse Wonder"
+argument = "The #908 composition change adds no TCB member: frame/'s only edits are one line in the bare_main composition enumeration (narf_drivers_hwmon::register_initcalls(), alongside the ~35 existing driver-crate calls) and one path-dependency edge in frame/Cargo.toml (+ the matching Cargo.lock edge). narf-drivers-hwmon is a drivers/ crate, outside the TCB set this invariant fixes; frame's role stays 'enumerate the crates once + run every stage in order', and the set {frame/, memory/ domain manager, capabilities/ table code, scheduler/ executor core} is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "Muse Wonder"
+argument = "Composing hwmon grants no new authority and moves no trust boundary. The crate's initcalls only register bus match entries (k10temp PCI, Super-I/O, MSR/SMM, JC42 at Stage::Device) whose probes receive the same Cap<BusDeviceCap, Write> the bus framework hands every PCI driver, plus a Stage::Late sysfs bridge that reads through the existing HwmonDevice trait. No capability type, mapping authority, or domain transition is created. The companion #909 change is purely subtractive: sysfs_bridge no longer publishes a fabricated 0 for failed sensor reads (it renders an empty value), so published information strictly decreases."

@@ -2663,6 +2663,7 @@ dependencies = [
  "narf-drivers-fs-udf",
  "narf-drivers-gpio",
  "narf-drivers-gpu",
+ "narf-drivers-hwmon",
  "narf-drivers-i2c",
  "narf-drivers-i3c",
  "narf-drivers-leds",
