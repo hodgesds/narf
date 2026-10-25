@@ -101,6 +101,30 @@ pub trait BlockDeviceSync: Send + Sync {
         self.write(lba, n_blocks, data)?;
         self.flush()
     }
+    /// Whether [`Self::trim`] really deallocates on the device
+    /// (NVMe Dataset Management / ATA DATA SET MANAGEMENT with the
+    /// TRIM bit / SCSI UNMAP). The default is `false`: a device must
+    /// opt in only when its `trim` override issues the hardware
+    /// command. The [`SyncBlock`] adapter advertises
+    /// `BlockFeature::Discard` exactly when this returns `true` —
+    /// claiming Discard for a device whose trim is a no-op lies to
+    /// filesystems about deallocation (#841). Wrappers must forward
+    /// it together with [`Self::trim`].
+    fn supports_trim(&self) -> bool {
+        false
+    }
+    /// Deallocate `n_blocks` blocks starting at `lba` on the device
+    /// (Linux `REQ_OP_DISCARD`). Reads of a trimmed range afterwards
+    /// are device-defined (zeroes only when the device advertises
+    /// deterministic read-zero-after-trim). The default errors with
+    /// `DriverError`: an unimplemented trim must surface as a
+    /// failure, never as silent success (#841). Only called by the
+    /// adapter when [`Self::supports_trim`] is `true`; direct
+    /// callers must check it too.
+    fn trim(&self, lba: u64, n_blocks: u64) -> Result<(), BlockIoError> {
+        let _ = (lba, n_blocks);
+        Err(BlockIoError::DriverError)
+    }
 }
 
 /// Optional per-partition metadata attached to a registered block
@@ -607,15 +631,21 @@ impl BlockDevice for SyncBlock {
         self.0.is_read_only()
     }
     fn supports(&self, f: BlockFeature) -> bool {
-        // Sync trait doesn't expose feature flags. Mirror what
-        // RamBlockDevice exports (Flush + WriteZeroes are no-ops on
-        // a sync transport, fine to advertise; the FS layer relies
-        // on the call returning quickly more than on a hardware
-        // doorbell).
-        matches!(
-            f,
-            BlockFeature::Flush | BlockFeature::Fua | BlockFeature::WriteZeroes
-        )
+        match f {
+            // Flush + WriteZeroes are honest on every sync device:
+            // flush forwards to the device (a real cache drain where
+            // the device implements it, a no-op on write-through
+            // devices) and WriteZeroes is emulated below by writing
+            // zeroes, so claiming both cannot mislead the FS layer.
+            // Fua likewise: native where the device implements it,
+            // emulated as write + flush otherwise.
+            BlockFeature::Flush | BlockFeature::Fua | BlockFeature::WriteZeroes => true,
+            // Discard is claimed only when the device really issues
+            // its deallocation command — a no-op "Discard" would tell
+            // filesystems blocks were freed when they were not (#841).
+            BlockFeature::Discard => self.0.supports_trim(),
+            _ => false,
+        }
     }
 
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send {
@@ -638,7 +668,18 @@ impl BlockDevice for SyncBlock {
         let r = self.0.flush().map_err(map_io_err);
         async move { r }
     }
-    async fn discard(&self, _r: LbaRange) {}
+    /// Forwards to [`BlockDeviceSync::trim`] when the device
+    /// supports it; an error is dropped here (the trait returns
+    /// `()`) — errors surface on the `submit` path (`BlockOp::Trim`).
+    /// A device without trim support silently drops the range,
+    /// matching the trait's fire-and-forget contract, but such a
+    /// device never advertises `BlockFeature::Discard`, so no caller
+    /// can be misled into believing the range was deallocated (#841).
+    async fn discard(&self, r: LbaRange) {
+        if self.0.supports_trim() {
+            let _ = self.0.trim(r.start, r.blocks);
+        }
+    }
     async fn cancel(&self, _t: u64) -> CancelResult {
         CancelResult::NotFound
     }
@@ -689,7 +730,12 @@ impl SyncBlock {
                 }
                 self.0.write(req.lba, blocks, slice).map_err(map_err)
             }
-            BlockOp::Trim => Ok(()),
+            // Reaches the device's real deallocation command when
+            // the device supports trim; the trait default errors
+            // otherwise, so a Trim submitted to a trim-less device
+            // fails loudly instead of reporting a deallocation that
+            // never happened (#841).
+            BlockOp::Trim => self.0.trim(req.lba, blocks as u64).map_err(map_err),
         }
     }
 }
