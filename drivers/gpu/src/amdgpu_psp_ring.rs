@@ -98,6 +98,12 @@ impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
 trait Io {
     fn read(&mut self, reg: u32) -> u32;
     fn write(&mut self, reg: u32, value: u32);
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
     fn read_mem(&mut self, offset: u64) -> u32;
     fn write_mem(&mut self, offset: u64, value: u32);
     fn write_payload(&mut self, map: MmioRegion, offset: u64, value: u32) {
@@ -221,6 +227,8 @@ impl<I: Io> Engine<I> {
     }
     async fn response(&mut self, cleanup: bool) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_ms(500);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let value = if cleanup {
                 self.io.read(CTRL)
@@ -237,6 +245,15 @@ impl<I: Io> Engine<I> {
                 } else {
                     Err(Error::Rejected(value & 0xffff)) // linux-lit: 0xffff=GFX_CMD_STATUS_MASK
                 };
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);
@@ -341,6 +358,8 @@ impl<I: Io> Engine<I> {
             io.write(WPTR, (wptr + 16) % 1024); // linux-lit: 16=sizeof(struct psp_gfx_rb_frame) / 4
         })?;
         let deadline = narf_time::Deadline::after_ms(FENCE_TIMEOUT_MS);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             let done = self.access(|io| {
                 io.invalidate();
@@ -348,6 +367,16 @@ impl<I: Io> Engine<I> {
             })?;
             if done {
                 break;
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    self.state = State::Failed;
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 self.state = State::Failed;
@@ -1541,6 +1570,8 @@ impl<I: Io> Session<I> {
     }
     async fn wait_gfx_boot_inner(&mut self) -> Result<GfxBootStatus, Error> {
         let deadline = narf_time::Deadline::after_ms(1000);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.engine.io.wait_poll_limit();
         loop {
             let status = self.engine.access(|io| io.gfx_boot_status())??;
             self.gfx_status = Some(status);
@@ -1550,6 +1581,15 @@ impl<I: Io> Session<I> {
             // linux-lit: 31=RLC_RLCS_BOOTLOAD_STATUS__BOOTLOAD_COMPLETE__SHIFT
             if status.cp_stat == 0 && status.rlc_bootload & (1 << 31) != 0 {
                 return Ok(status);
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);

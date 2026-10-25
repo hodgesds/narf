@@ -211,6 +211,12 @@ fn board_features(b: &[u8]) -> Result<u64, Error> {
 trait Io {
     fn read(&mut self, reg: u32) -> u32;
     fn write(&mut self, reg: u32, value: u32);
+    /// Read-driven register models can use a bounded number of cooperative
+    /// polls instead of a wall-clock deadline. Real MMIO always uses time.
+    #[cfg(feature = "kernel-test")]
+    fn wait_poll_limit(&self) -> Option<u32> {
+        None
+    }
     fn check_policy(&mut self) -> Result<(), Error>;
     fn write_buffer(&mut self, offset: usize, bytes: &[u8]);
     fn read_buffer(&mut self, offset: usize, bytes: &mut [u8]);
@@ -338,12 +344,23 @@ impl<I: Io> Engine<I> {
             Ok(())
         })??;
         let deadline = narf_time::Deadline::after_ms(1000);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         loop {
             match self.access(|io| io.read(RESPONSE))? {
                 u32::MAX => return Err(Error::DeviceGone),
                 1 => return self.access(|io| io.read(ARGUMENT)),
                 0 => {}
                 value => return Err(Error::Rejected(value)),
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout);

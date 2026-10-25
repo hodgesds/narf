@@ -32,6 +32,17 @@ struct Fake {
     fw_reserve: [(u32, [u32; 3]); 2],
 }
 impl Io for Fake {
+    fn wait_poll_limit(&self) -> Option<u32> {
+        // The model completes every wait synchronously in write(): the
+        // response bit is set by the CTRL write, the fence word by the
+        // WPTR write, and the gfx boot status is a scripted sample list
+        // whose longest completion is the third read. A wait still
+        // incomplete after sixteen polls is a designed non-completion
+        // (a stalled command) whose outcome is the timeout — reached by
+        // count instead of burning the wall-clock deadline under the
+        // spin executor (#879).
+        Some(16)
+    }
     fn read(&mut self, reg: u32) -> u32 {
         self.regs[reg as usize]
     }
