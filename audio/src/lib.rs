@@ -29,6 +29,7 @@ extern crate alloc;
 
 pub mod acp6;
 pub mod acp63;
+pub mod acp63_sdw;
 pub mod acp6_bdl;
 pub mod acp6_codec_link;
 pub mod acp6_pcm;
@@ -43,6 +44,7 @@ mod native_pci;
 mod native_pcm;
 pub mod realtek_alc;
 pub mod sbc;
+pub mod soundwire;
 pub mod wm8960;
 
 mod hda_tests;
@@ -427,6 +429,7 @@ impl AudioReader {
     }
     fn open_live(cap: Cap<AudioStreamCap, Read>) -> Result<Self, AudioReadError> {
         let card = acp63::capture_card()
+            .or_else(acp63_sdw::capture_card)
             .or_else(hda::capture_card)
             .ok_or(AudioReadError::NoActiveStream)?;
         let params = narf_drivers_sound::default_hw_params(card, true)
@@ -529,6 +532,15 @@ pub fn register_initcalls() {
     // Native Phoenix ACP 6.3 PDM capture; PCI revision and ACPI gate probe.
     narf_init::register(Stage::Subsys, "acp6-pci", || {
         acp6::register_pci_driver();
+        InitResult::Ok
+    });
+    // ACP 6.3 SoundWire for the pin configurations the PDM probe
+    // declines; registered after it. Note: probe_all currently
+    // attempts only the single best match, so this binding stays
+    // inert until the candidate-walking dispatcher (PR #852) merges —
+    // merge order: #852 first (see audio spec §3.2).
+    narf_init::register(Stage::Subsys, "acp63-sdw-pci", || {
+        acp63_sdw::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "native-audio-devices", || {
