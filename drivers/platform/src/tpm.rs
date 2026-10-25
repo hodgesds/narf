@@ -49,6 +49,16 @@
 //! `submit(&[u8]) -> Vec<u8>` for callers that already speak the
 //! TPM2 wire protocol. A `tpm2_get_random(bytes)` convenience is
 //! built on top.
+//!
+//! ## Composition (#934)
+//!
+//! This is the sole production TPM transport. It owns the MMIO
+//! probe/submit paths and the probed-device singleton; it does NOT
+//! own a wire codec — every command frame it submits is built by
+//! the canonical builders in `narf_tpm` (`tpm2` / `commands`), and
+//! the device is exposed to consumers through `narf_tpm`'s
+//! `TpmDevice` trait and registry. (Registry registration on probe
+//! success is the keystone seam, #943/#934.)
 
 extern crate alloc;
 
@@ -439,16 +449,10 @@ impl Tpm {
     /// Returns up to `bytes` bytes of random data. The TPM may
     /// return fewer than requested.
     pub async fn tpm2_get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError> {
-        // TPM2 wire format §5.6:
-        //   tag: u16 BE = 0x8001 (TPM_ST_NO_SESSIONS)
-        //   commandSize: u32 BE
-        //   commandCode: u32 BE = 0x0000017B (TPM2_CC_GetRandom)
-        //   bytesRequested: u16 BE
-        let mut req = Vec::with_capacity(12);
-        req.extend_from_slice(&0x8001u16.to_be_bytes()); // tag
-        req.extend_from_slice(&12u32.to_be_bytes()); // size
-        req.extend_from_slice(&0x0000_017Bu32.to_be_bytes()); // GetRandom
-        req.extend_from_slice(&bytes.to_be_bytes());
+        // The frame comes from the canonical codec in `narf_tpm`
+        // (composition, #934) — this transport no longer hand-rolls
+        // its own copy of the GetRandom encoding.
+        let req = narf_tpm::tpm2::get_random(bytes);
         let resp = self.submit(&req).await?;
         if resp.len() < 12 {
             return Err(TpmError::BadResponse);
@@ -491,25 +495,21 @@ impl TpmDevice for Tpm {
 
     async fn extend_pcr(&self, pcr: u32, digest: &[u8]) -> Result<(), HighLevelTpmError> {
         let req = build_pcr_extend_request(pcr, digest);
-        let _resp = self.submit_raw(&req).await?;
-        Ok(())
+        let resp = self.submit_raw(&req).await?;
+        // The old hand-rolled path discarded the response unread, so
+        // even a well-framed TPM rejection (e.g. TPM_RC_VALUE) was
+        // reported to measured boot as success. Validate it.
+        validate_pcr_extend_response(&resp)
     }
 
     async fn read_pcr(&self, pcr: u32) -> Result<Vec<u8>, HighLevelTpmError> {
-        // TPM2_CC_PCR_Read: tag=0x8001, cc=0x0000017E
-        let mut req = Vec::new();
-        req.extend_from_slice(&0x8001u16.to_be_bytes());
-        req.extend_from_slice(&20u32.to_be_bytes()); // header + pcrSelection
-        req.extend_from_slice(&0x0000_017Eu32.to_be_bytes());
-        // pcrSelection: count=1, alg=SHA256, bitmask
-        req.extend_from_slice(&1u32.to_be_bytes());
-        req.extend_from_slice(&0x000Bu16.to_be_bytes()); // SHA256
-        req.push(3); // size of bitmask
+        // Canonical PCR_Read frame from `narf_tpm` (composition,
+        // #934); this transport previously hand-rolled a third copy.
         let mut mask = [0u8; 3];
         if pcr < 24 {
             mask[(pcr / 8) as usize] |= 1 << (pcr % 8);
         }
-        req.extend_from_slice(&mask);
+        let req = narf_tpm::tpm2::pcr_read(narf_tpm::tpm2::TPM_ALG_SHA256, &mask);
 
         let resp = self.submit_raw(&req).await?;
         if resp.len() < 30 {
@@ -535,6 +535,25 @@ impl TpmDevice for Tpm {
 /// bytes at this seam without hardware.
 pub fn build_pcr_extend_request(pcr: u32, digest: &[u8]) -> Vec<u8> {
     narf_tpm::commands::CommandBuilder::pcr_extend(pcr, digest)
+}
+
+/// Validate a `TPM2_PCR_Extend` response: a complete header, a
+/// declared size that fits the buffer, and a zero response code.
+///
+/// Malformed or truncated responses fail clean with a typed error
+/// (`BadResponse` for framing, `Rc(..)` for a TPM rejection) —
+/// never a panic, never silent success. Factored out so the
+/// negative fixture (`smoke_tpm_pcr_extend_response_validation`)
+/// can pin the behaviour without hardware.
+pub fn validate_pcr_extend_response(resp: &[u8]) -> Result<(), HighLevelTpmError> {
+    // Checks length >= 10 and maps a non-zero RC to a typed error.
+    let _ = narf_tpm::commands::ResponseParser::new(resp)?;
+    // ResponseParser guarantees the 10-byte header is present.
+    let size = u32::from_be_bytes([resp[2], resp[3], resp[4], resp[5]]) as usize;
+    if size < 10 || size > resp.len() {
+        return Err(HighLevelTpmError::BadResponse);
+    }
+    Ok(())
 }
 
 // ── Singleton ──────────────────────────────────────────────────────

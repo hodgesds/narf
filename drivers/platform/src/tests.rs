@@ -527,6 +527,53 @@ fn smoke_tpm_pcr_extend_request_bytes() -> TestResult {
 }
 kernel_test_in!("drivers/platform/tpm", smoke_tpm_pcr_extend_request_bytes);
 
+fn smoke_tpm_pcr_extend_response_validation() -> TestResult {
+    use crate::tpm::validate_pcr_extend_response;
+    use narf_tpm::{types::TpmRc, TpmError};
+    // Negative fixture (#937): malformed/truncated extend responses
+    // fail clean with a typed error — no panic, no silent success.
+    // (a) Empty / header-truncated.
+    for short in [&[][..], &[0x80u8, 0x02][..], &[0u8; 9][..]] {
+        match validate_pcr_extend_response(short) {
+            Err(TpmError::BadResponse) => {}
+            _ => return TestResult::Fail("truncated extend response not BadResponse"),
+        }
+    }
+    // (b) Header whose declared size overruns the buffer.
+    let mut lying = [0u8; 10];
+    lying[0..2].copy_from_slice(&0x8002u16.to_be_bytes());
+    lying[2..6].copy_from_slice(&65u32.to_be_bytes());
+    match validate_pcr_extend_response(&lying) {
+        Err(TpmError::BadResponse) => {}
+        _ => return TestResult::Fail("size-overrun extend response not BadResponse"),
+    }
+    // (c) TPM rejection: TPM_RC_VALUE (0x184) — the response a real
+    // TPM gave the old malformed encoding — surfaces as Rc(Value).
+    // The pre-fix platform path discarded the response unread and
+    // reported this as success.
+    let mut rejected = [0u8; 10];
+    rejected[0..2].copy_from_slice(&0x8002u16.to_be_bytes());
+    rejected[2..6].copy_from_slice(&10u32.to_be_bytes());
+    rejected[6..10].copy_from_slice(&0x184u32.to_be_bytes());
+    match validate_pcr_extend_response(&rejected) {
+        Err(TpmError::Rc(TpmRc::Value)) => {}
+        _ => return TestResult::Fail("TPM_RC_VALUE extend response not Rc(Value)"),
+    }
+    // (d) A complete success response (header + parameterSize +
+    // session area, as a sessions-tagged extend returns) passes.
+    let mut ok = [0u8; 23];
+    ok[0..2].copy_from_slice(&0x8002u16.to_be_bytes());
+    ok[2..6].copy_from_slice(&23u32.to_be_bytes());
+    if validate_pcr_extend_response(&ok).is_err() {
+        return TestResult::Fail("success extend response rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm",
+    smoke_tpm_pcr_extend_response_validation
+);
+
 // ── AMD AOAC ───────────────────────────────────────────────────────
 
 /// IP-index → bit-position table: each IP's 2-bit field starts at
