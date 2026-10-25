@@ -165,8 +165,8 @@ also consult upstream Linux GPL sources.
   Only then are old endpoint events discarded and the page/ring reopened.
   The old token becomes stale. It canonicalizes the Link-boundary enqueue
   cursor and preserves USB data-toggle state. Errors and Future Drop retain
-  the endpoint/page plus the slot claim; Halted endpoint/device reset, EP0
-  cancellation and stalled-device CLEAR_FEATURE recovery remain separate.
+  the endpoint/page plus the slot claim. Halted-endpoint recovery (including
+  a halted EP0) is the separate `Xhci::reset_endpoint` contract below.
   `USBDevice` bulk operations reject stale slot generations. Periodic transfer
   methods cannot target bulk endpoints. The xHCI layer owns DMA cache
   maintenance and device barriers, including outer-shareable ordering on ARM.
@@ -189,11 +189,42 @@ also consult upstream Linux GPL sources.
   and Enable command waits match originating command pointers. Evaluate
   Context also retains its Input Context across error/cancellation. EP0 Link
   initialization follows zeroing so the ring can wrap.
-- Readdress/reuse of an owned, published-failed or disabled slot is currently
-  refused. HCE soft reset is refused once any slot has reserved ownership.
-  Full reconnect, DMA-page reclamation and controller-reset recovery remain
-  software prerequisites. Successful bulk stop reuses retained pages only;
-  it does not free mappings, reopen a poisoned EP0 or enable slot reuse.
+- `Xhci::reset_endpoint(slot, generation, dci)` recovers a halted endpoint
+  (DCI 1 and bulk DCIs; interrupt/isochronous are refused). Under the slot's
+  configuration claim it quarantines the endpoint's retained TD (the EP0
+  claim in `ControlState`, the bulk token in its `bulk_owner::State`), issues
+  Reset Endpoint, requires the output-context readback to show Stopped,
+  issues Set TR Dequeue Pointer at the canonical Link-boundary enqueue
+  cursor, requires readback Stopped at exactly that dequeue, purges the
+  endpoint's queued Transfer Events, and only then releases the retained
+  claim — a recovered TD's token is stale from that point. Any error after
+  the claim leaves the claim in place (endpoint terminally busy), mirroring
+  the bulk-stop profile. `USBDevice::clear_endpoint_halt(endpoint)` pairs
+  it with the device-side CLEAR_FEATURE(ENDPOINT_HALT) so host and device
+  data toggles restart together; EP0 skips the CLEAR_FEATURE step.
+- `Xhci::reclaim_slot(slot)` is the explicit stop/drain/removal path that
+  makes a disabled slot reusable. It refuses any slot that has not
+  completed Disable Slot (the completion is the hardware-quiescence
+  proof). It drains the hardware event ring, zeroes the slot's DCBAA
+  entry, drops the retained `Device` — releasing the device/input
+  contexts, EP0 ring/page and every endpoint ring/buffer, including a TD
+  still posted at teardown — purges the slot's queued events, and only
+  then returns the id to the allocatable pool. A reclaimed id is always
+  re-addressed under a fresh generation from the monotonic
+  controller-global counter, so no prior handle can match it. Readdress
+  of an owned or published-failed slot that has not been disabled is
+  still refused.
+- HCE recovery has two paths. `soft_recover` (no reserved slots) halts,
+  resets and re-runs bring-up against the retained controller DMA.
+  `Xhci::recover_controller()` is the with-devices path: under the slot
+  reservation it invalidates every generation, halts + HCRSTs, zeroes
+  every live DCBAA entry and drops every `Device` (all slot DMA
+  released), clears retained command receipts (their ring restarts at
+  cursor 0), resets the slot table, re-runs bring-up, and bumps
+  `Xhci::recovery_epoch()`. Every pre-reset handle is stale by
+  construction; supervisors watch the epoch to trigger wholesale
+  re-enumeration. Successful bulk stop still reuses retained pages only;
+  it does not free mappings or enable slot reuse.
   Live Address Device/HID fixtures hold recycled hardware slots allocated
   until Enable Slot supplies a never-used software slot, using the same
   unused-generation predicate as production Address Device. They never clear

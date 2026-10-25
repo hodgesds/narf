@@ -108,6 +108,29 @@ pub const fn get_descriptor(desc_type: u8, desc_index: u8, lang_id: u16, len: u1
 }
 
 /// Build a standard SET_CONFIGURATION setup packet.
+/// Feature selectors for CLEAR_FEATURE / SET_FEATURE (USB 2.0
+/// §9.4, Table 9-6).
+pub const FEATURE_ENDPOINT_HALT: u16 = 0;
+pub const FEATURE_DEVICE_REMOTE_WAKEUP: u16 = 1;
+
+/// Build a standard CLEAR_FEATURE setup packet (USB 2.0 §9.4.1):
+/// host-to-device, recipient encoded in the low bits of
+/// `bmRequestType`, `wValue` = feature selector, `wIndex` =
+/// endpoint address (for ENDPOINT_HALT) or interface number.
+/// The device half of endpoint-halt recovery: clearing the
+/// device-side halt resets the endpoint's data toggle on the
+/// device; `USBDevice::clear_endpoint_halt` pairs it with the
+/// host-side Reset Endpoint sequence.
+pub const fn clear_feature(recipient: u8, feature: u16, index: u16) -> Setup {
+    Setup {
+        bm_request_type: RT_DIR_OUT | RT_TYPE_STANDARD | recipient,
+        b_request: REQ_CLEAR_FEATURE,
+        w_value: feature,
+        w_index: index,
+        w_length: 0,
+    }
+}
+
 pub const fn set_configuration(config: u8) -> Setup {
     Setup {
         bm_request_type: RT_DIR_OUT | RT_TYPE_STANDARD | RT_RECIP_DEVICE,

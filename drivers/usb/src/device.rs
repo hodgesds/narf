@@ -255,6 +255,54 @@ impl USBDevice {
             .map_err(UsbError::from_xhci)
     }
 
+    /// Recover a halted endpoint end to end. Host side first:
+    /// Reset Endpoint + Set TR Dequeue Pointer
+    /// (`Xhci::reset_endpoint`) stops the endpoint at the canonical
+    /// dequeue and discards the retained TD. Then, for non-control
+    /// endpoints, CLEAR_FEATURE(ENDPOINT_HALT) (USB 2.0 §9.4.1)
+    /// clears the device-side halt and resets the device's data
+    /// toggle, so host and device toggles restart together. The
+    /// order matters: the device-side clear runs only after the
+    /// host endpoint is proven Stopped, so no in-flight TD can race
+    /// the toggle reset.
+    ///
+    /// `endpoint` is the endpoint address as it appears in the
+    /// interface descriptor (bit 7 set = IN). For EP0 the
+    /// CLEAR_FEATURE step is skipped — the control pipe carries no
+    /// persistent toggle state, and the host-side Reset Endpoint
+    /// sequence is the whole recovery.
+    pub async fn clear_endpoint_halt(&self, endpoint: u8) -> Result<(), UsbError> {
+        let number = endpoint & 0x0f;
+        // `dci_for` covers DCI 2..=31; EP0 is DCI 1 by definition
+        // (the shared helper maps address 0 to the reserved DCI 0,
+        // which no caller passes it).
+        let dci = if number == 0 {
+            1
+        } else {
+            crate::bulk::dci_for(endpoint)
+        };
+        self.controller
+            .reset_endpoint(self.slot_id, self.generation, dci)
+            .await
+            .map_err(UsbError::from_xhci)?;
+        if number != 0 {
+            let setup = crate::control::clear_feature(
+                crate::control::RT_RECIP_ENDPOINT,
+                crate::control::FEATURE_ENDPOINT_HALT,
+                u16::from(endpoint),
+            );
+            self.control_out(
+                setup.bm_request_type,
+                setup.b_request,
+                setup.w_value,
+                setup.w_index,
+                &[],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     fn validate_bulk_token(&self, token: &BulkToken) -> Result<(), UsbError> {
         if token.slot() != self.slot_id || token.generation() != self.generation {
             return Err(UsbError::StaleSlot);

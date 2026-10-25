@@ -78,6 +78,17 @@ impl Commands {
     pub fn active(&self) -> bool {
         self.pending.iter().any(Option::is_some)
     }
+    /// Drop every retained receipt. Controller recovery calls this
+    /// after the hardware reset: the command ring's cursors restart
+    /// from zero, so a stale receipt could otherwise alias a recycled
+    /// ring entry's pointer and let a dead operation's waiter consume
+    /// a new command's completion. Waiters on cleared receipts time
+    /// out, which is the honest outcome for a reset controller.
+    pub fn clear(&mut self) {
+        for value in self.pending.iter_mut() {
+            *value = None;
+        }
+    }
     pub fn reserve(&mut self, entry: usize, pointer: u64, slot: u8) -> Result<(), Conflict> {
         let value = self.pending.get_mut(entry).ok_or(Conflict)?;
         if value.is_some() {

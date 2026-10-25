@@ -201,3 +201,25 @@ kernel_test_in!(
     "drivers/usb/xhci",
     smoke_xhci_command_receipt_precedes_publication_and_reuse
 );
+
+/// `Commands::clear` (controller recovery) drops every retained
+/// receipt: nothing stays active, and a recycled ring entry can be
+/// reserved again — the stale receipt must not alias its pointer.
+fn smoke_xhci_command_receipts_clear_for_recovery() -> TestResult {
+    let mut commands = Commands::new(4);
+    if commands.reserve(0, 0x3000, 5) != Ok(()) || !commands.active() {
+        return TestResult::Fail("receipt did not reserve");
+    }
+    commands.clear();
+    if commands.active() {
+        return TestResult::Fail("clear left an active receipt");
+    }
+    if commands.reserve(0, 0x3000, 5) != Ok(()) || !commands.active() {
+        return TestResult::Fail("cleared entry did not reserve again");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_command_receipts_clear_for_recovery
+);

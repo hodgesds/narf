@@ -243,6 +243,53 @@ impl State {
         Ok(())
     }
 
+    /// Begin halt recovery for the retained TD. Mirrors the Stop
+    /// coordinator's quarantine: while recovery runs, `record` keeps
+    /// every Transfer Event for this endpoint out of the lossy global
+    /// queues. Returns the stop identity when a TD is retained, or
+    /// `None` when the endpoint is idle (recovery then degenerates to
+    /// the bare hardware Reset Endpoint + Set Dequeue sequence).
+    /// A token for the retained TD becomes stale the moment
+    /// `finish_halt_recovery` clears `pending`.
+    pub fn begin_halt_recovery(&mut self, generation: u64) -> Result<Option<StopIdentity>, Error> {
+        let Some(p) = self.pending.as_mut() else {
+            return Ok(None);
+        };
+        if generation == 0 || p.identity.generation != generation {
+            return Err(Error::Stale);
+        }
+        if p.stopping {
+            return Err(Error::Busy);
+        }
+        p.stopping = true;
+        Ok(Some(StopIdentity {
+            generation,
+            serial: p.serial,
+            slot: p.identity.slot,
+            dci: p.identity.dci,
+        }))
+    }
+    /// Only the completed Reset Endpoint + Set Dequeue coordinator may
+    /// call this, after the output context readback showed the endpoint
+    /// Stopped with the requested dequeue pointer and the endpoint's
+    /// queued events were purged. Clears the retained TD; any token
+    /// for it fails validation as stale from here on.
+    pub fn finish_halt_recovery(&mut self, id: Option<StopIdentity>) -> Result<(), Error> {
+        match id {
+            Some(id) => {
+                self.validate_stop(id)?;
+                self.pending = None;
+                Ok(())
+            }
+            None => {
+                if self.pending.is_some() {
+                    return Err(Error::Stale);
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// A caller can poll indefinitely without imposing a timeout that drops
     /// the TD. Completion data is copied before reopening the scratch page.
     pub fn complete(
@@ -289,6 +336,19 @@ impl ControlState {
     }
     pub fn active(&self) -> bool {
         self.busy
+    }
+    /// Drop the EP0 claim without a terminal completion. Only the
+    /// halt-recovery coordinator may call this, after the Reset
+    /// Endpoint command for DCI 1 completed successfully and the
+    /// endpoint's output context read back Stopped: at that point the
+    /// retained TD is hardware-dead, and any waiter on its latches
+    /// times out instead of completing against a reset pipe. This is
+    /// the one sanctioned exception to the "an error does not call
+    /// complete" rule above — the hardware state it guards no longer
+    /// exists.
+    pub fn force_reset(&mut self) {
+        self.busy = false;
+        self.expected = [None, None];
     }
     pub fn begin(&mut self, actual: u64, expected: u64) -> Result<(), Error> {
         if actual == 0 || actual != expected {
@@ -354,9 +414,15 @@ impl ControlState {
     }
 }
 
-/// Slot reuse requires a future explicit controller stop/drain/removal API.
 /// Address attempts reserve a generation before publishing any device DMA;
 /// published/retired generations never silently return to the unused state.
+/// The single sanctioned return path is `reclaim`: the explicit
+/// stop/drain/removal API (`Xhci::reclaim_slot`) drives a slot through
+/// Disable Slot completion, hardware-event drain, queued-event purge and
+/// DMA release first, and only then calls `reclaim` to make the slot id
+/// allocatable again. A reclaimed slot is always re-addressed under a
+/// fresh, never-before-used generation (the controller-global generation
+/// counter is monotonic), so a stale handle can never match it.
 pub(super) struct Slots {
     generations: [u64; 256],
 }
@@ -392,6 +458,41 @@ impl Slots {
     }
     pub fn retire(&mut self, slot: u8) {
         self.generations[usize::from(slot)] = u64::MAX;
+    }
+    /// A slot is retired once `retire` has run (Disable Slot path) and
+    /// it has not yet been reclaimed. Only retired slots may reclaim.
+    pub fn is_retired(&self, slot: u8) -> bool {
+        slot != 0 && self.generations[usize::from(slot)] == u64::MAX
+    }
+    /// Return a retired slot to the unused state so a later `begin`
+    /// (under a fresh generation) may reserve it again. The caller
+    /// (`Xhci::reclaim_slot`) must already have proven the hardware
+    /// side quiesced: Disable Slot completed, the slot's queued and
+    /// in-ring events drained/purged, and every DMA page the slot
+    /// owned released. Reclaiming a live or unused slot is refused.
+    pub fn reclaim(&mut self, slot: u8) -> Result<(), Error> {
+        if !self.is_retired(slot) {
+            return Err(Error::Stale);
+        }
+        self.generations[usize::from(slot)] = 0;
+        Ok(())
+    }
+    /// Mark every slot retired. Controller recovery calls this before
+    /// the hardware reset so any operation still holding a generation
+    /// fails its next `matches` check instead of completing against a
+    /// controller whose state is about to be wiped.
+    pub fn invalidate_all(&mut self) {
+        for generation in self.generations.iter_mut() {
+            if *generation != 0 {
+                *generation = u64::MAX;
+            }
+        }
+    }
+    /// Clear every slot back to unused. Only valid after a completed
+    /// hardware reset with all per-slot DMA already released — the
+    /// recovery counterpart of `reclaim`, for all slots at once.
+    pub fn reset(&mut self) {
+        self.generations = [0; 256];
     }
 }
 

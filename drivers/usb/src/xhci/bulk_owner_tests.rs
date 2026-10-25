@@ -295,3 +295,108 @@ kernel_test_in!(
     "drivers/usb/xhci",
     smoke_xhci_context_commands_match_originating_trb
 );
+
+/// Slot lifecycle: a live slot refuses reclaim, a retired slot
+/// reclaims to unused, and a reclaimed id re-reserves only under a
+/// fresh generation — the old generation never matches again.
+/// `invalidate_all` + `reset` cover the controller-recovery sweep.
+fn smoke_xhci_slot_reclaim_cycle() -> TestResult {
+    let mut slots = Slots::new();
+    if slots.begin(5, 42).is_err() || slots.is_retired(5) {
+        return TestResult::Fail("fresh slot did not reserve");
+    }
+    if !matches!(slots.reclaim(5), Err(Error::Stale)) {
+        return TestResult::Fail("live slot reclaimed without Disable Slot");
+    }
+    slots.retire(5);
+    if !slots.is_retired(5) || slots.matches(5, 42) {
+        return TestResult::Fail("retired slot still matches its generation");
+    }
+    if slots.reclaim(5).is_err() || !slots.is_unused(5) {
+        return TestResult::Fail("retired slot did not reclaim to unused");
+    }
+    if slots.begin(5, 43).is_err() || !slots.matches(5, 43) || slots.matches(5, 42) {
+        return TestResult::Fail("reclaimed slot did not re-reserve under a fresh generation");
+    }
+    if slots.begin(7, 9).is_err() {
+        return TestResult::Fail("second slot did not reserve");
+    }
+    slots.invalidate_all();
+    if slots.matches(5, 43) || slots.matches(7, 9) || !slots.is_retired(7) {
+        return TestResult::Fail("invalidate_all left a live generation");
+    }
+    slots.reset();
+    if slots.any_reserved() || !slots.is_unused(5) || !slots.is_unused(7) {
+        return TestResult::Fail("reset left a slot reserved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_slot_reclaim_cycle);
+
+/// Halt recovery: an idle endpoint degenerates to no-ops; a retained
+/// TD enters quarantine under its stop identity (foreign generation
+/// is stale, a second begin is busy, the token validates busy while
+/// quarantined) and finishing recovery stales the token for good.
+fn smoke_xhci_halt_recovery_quarantine_and_finish() -> TestResult {
+    let mut idle = State::new();
+    if !matches!(idle.begin_halt_recovery(42), Ok(None)) {
+        return TestResult::Fail("idle endpoint reported a retained TD");
+    }
+    if idle.finish_halt_recovery(None).is_err() || idle.active() {
+        return TestResult::Fail("idle halt recovery did not finish clean");
+    }
+    let mut state = State::new();
+    let token = match state.begin(id(), Direction::Out, 512, || 0x1234_5000) {
+        Ok(token) => token,
+        Err(_) => return TestResult::Fail("bulk begin failed"),
+    };
+    if !matches!(state.begin_halt_recovery(43), Err(Error::Stale)) {
+        return TestResult::Fail("halt recovery accepted a foreign generation");
+    }
+    let identity = match state.begin_halt_recovery(42) {
+        Ok(Some(identity)) => identity,
+        _ => return TestResult::Fail("retained TD did not enter halt recovery"),
+    };
+    if identity.generation != 42 || identity.slot != 5 || identity.dci != 3 {
+        return TestResult::Fail("halt recovery identity mismatch");
+    }
+    if !matches!(state.begin_halt_recovery(42), Err(Error::Busy)) {
+        return TestResult::Fail("second halt recovery did not report busy");
+    }
+    if !matches!(state.validate(42, &token), Err(Error::Busy)) {
+        return TestResult::Fail("token validated during halt-recovery quarantine");
+    }
+    if state.finish_halt_recovery(Some(identity)).is_err() {
+        return TestResult::Fail("halt recovery finish rejected its identity");
+    }
+    if state.active() || !matches!(state.validate(42, &token), Err(Error::Stale)) {
+        return TestResult::Fail("token survived halt recovery");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_halt_recovery_quarantine_and_finish
+);
+
+/// `ControlState::force_reset` is the one sanctioned release of the
+/// EP0 claim without a terminal completion — after it, the pipe is
+/// unclaimed and a fresh claim completes normally.
+fn smoke_xhci_control_force_reset_releases_claim() -> TestResult {
+    let mut control = ControlState::new();
+    if control.begin(7, 7).is_err() || !control.active() {
+        return TestResult::Fail("control claim did not take");
+    }
+    control.force_reset();
+    if control.active() {
+        return TestResult::Fail("force_reset left the control pipe claimed");
+    }
+    if control.begin(9, 9).is_err() || control.complete(9, 9).is_err() {
+        return TestResult::Fail("control pipe did not reopen after force_reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_control_force_reset_releases_claim
+);
