@@ -14694,6 +14694,7 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                         if state.rows.remove(&tid).is_some() {
                             RLIMIT_CUSTOM_ROWS
                                 .fetch_sub(1, core::sync::atomic::Ordering::Release);
+                            publish_rlimit_change();
                         }
                     }
                     crate::task::release_task(tid);
@@ -14717,6 +14718,7 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                         m.remove(&tid);
                     }
                     tgid_member_remove(tid, child_pid);
+                    publish_rlimit_change();
                 }
             }
         }
@@ -15490,6 +15492,7 @@ fn set_task_pid_locked(task: u64, tgid: u64) {
             tgid_member_remove(task, o);
         }
         tgid_member_add(task, tgid);
+        publish_rlimit_change();
     }
 }
 
@@ -15554,6 +15557,7 @@ pub fn __test_forget_task_pid(task: u64) {
         .and_then(|m| m.remove(&task));
     if let Some(tgid) = old {
         tgid_member_remove(task, tgid);
+        publish_rlimit_change();
     }
 }
 
@@ -15619,6 +15623,7 @@ pub fn pid_task_map_init() {
         *shard.map.lock() = Some(BTreeMap::new());
     }
     *TGID_MEMBERS.lock() = Some(BTreeMap::new());
+    publish_rlimit_change();
 }
 
 pub fn pid_task_map_reset() {
@@ -15635,6 +15640,7 @@ pub fn pid_task_map_reset() {
         *shard.map.lock() = None;
     }
     *TGID_MEMBERS.lock() = None;
+    publish_rlimit_change();
 }
 
 /// Register a (ProcessId → TaskId) mapping. Called by `sys_fork` and
@@ -15652,6 +15658,7 @@ pub fn register_pid_task_mapping(pid_raw: u64, task_raw: u64) {
         .lock()
         .get_or_insert_with(BTreeMap::new)
         .insert(pid_raw, task_raw);
+    publish_rlimit_change();
 }
 
 pub fn register_task_to_pid(task_raw: u64, pid_raw: u64) {
@@ -15800,6 +15807,7 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
         m.remove(&tid);
     }
     tgid_member_remove(tid, pid);
+    publish_rlimit_change();
 }
 
 /// Linux `signal->live`: per-thread-group (per-`pid`) count of live
@@ -17710,7 +17718,7 @@ const RLIMIT_NOFILE_RESOURCE: usize = 7;
 /// Wire-shape pair: rlim_cur followed by rlim_max. Matches the
 /// glibc layout the libc shim already exposes.
 #[repr(C)]
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Debug, Default)]
 struct RLimitPair {
     cur: u64,
     max: u64,
@@ -17772,6 +17780,12 @@ struct RlimitState {
     rows: BTreeMap<u64, [RLimitPair; RLIMIT_COUNT]>,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct RlimitReadCache {
+    generation: u64,
+    limits: [RLimitPair; RLIMIT_COUNT],
+}
+
 impl RlimitState {
     fn new() -> Self {
         Self {
@@ -17784,16 +17798,37 @@ static RLIMIT_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<RlimitState>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 static RLIMIT_CUSTOM_ROWS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+static RLIMIT_GENERATION: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+/// Called after a limits-row or process-identity mutation, under its owning
+/// mutation lock. A reader may use an older snapshot only if its acquire
+/// generation load precedes this publication, just as a locked read may finish
+/// before a concurrent writer. Cache fills read matching generation before key
+/// resolution and with their complete row.
+fn publish_rlimit_change() {
+    RLIMIT_GENERATION
+        .fetch_update(
+            core::sync::atomic::Ordering::Release,
+            core::sync::atomic::Ordering::Relaxed,
+            |generation| generation.checked_add(1),
+        )
+        .expect("rlimit cache generation exhausted");
+}
 
 pub fn rlimit_init() {
-    *RLIMIT_TABLE.lock() = Some(RlimitState::new());
+    let mut table = RLIMIT_TABLE.lock();
+    *table = Some(RlimitState::new());
     RLIMIT_CUSTOM_ROWS.store(0, core::sync::atomic::Ordering::Release);
+    publish_rlimit_change();
 }
 
 #[doc(hidden)]
 pub fn __test_rlimit_reset() {
-    *RLIMIT_TABLE.lock() = Some(RlimitState::new());
+    let mut table = RLIMIT_TABLE.lock();
+    *table = Some(RlimitState::new());
     RLIMIT_CUSTOM_ROWS.store(0, core::sync::atomic::Ordering::Release);
+    publish_rlimit_change();
 }
 
 /// Test-only count of every lifetime-bearing record in the rlimit store.
@@ -17822,14 +17857,39 @@ fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
     if RLIMIT_CUSTOM_ROWS.load(core::sync::atomic::Ordering::Acquire) == 0 {
         return Some(default_rlimits()[resource]);
     }
+    let generation = RLIMIT_GENERATION.load(core::sync::atomic::Ordering::Acquire);
+    let cached = crate::task::with_task_local(task, |owner| {
+        let cached = owner.rlimit_read_cache.lock();
+        cached
+            .as_ref()
+            .filter(|snapshot| snapshot.generation == generation)
+            .map(|snapshot| snapshot.limits[resource])
+    })
+    .flatten();
+    if let Some(limit) = cached {
+        return Some(limit);
+    }
     let key = process_state_key(task);
-    let g = RLIMIT_TABLE.lock();
-    let state = g.as_ref()?;
-    let row = state
-        .rows
-        .get(&key)
-        .copied()
-        .unwrap_or_else(default_rlimits);
+    let (row, snapshot_generation) = {
+        let g = RLIMIT_TABLE.lock();
+        let state = g.as_ref()?;
+        (
+            state.rows.get(&key).copied().unwrap_or_else(default_rlimits),
+            RLIMIT_GENERATION.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    // Identity updates need not take RLIMIT_TABLE. If the epoch changed after
+    // resolving the key, return the ordinary locked read without caching it.
+    // A concurrent newer fill may otherwise be overwritten by an older one;
+    // its stale generation forces another miss rather than a stale cache hit.
+    if generation == snapshot_generation {
+        crate::task::with_task_local(task, |owner| {
+            *owner.rlimit_read_cache.lock() = Some(RlimitReadCache {
+                generation,
+                limits: row,
+            });
+        });
+    }
     Some(row[resource])
 }
 
@@ -18282,6 +18342,7 @@ fn update_rlimit_atomic(
         if new_row {
             RLIMIT_CUSTOM_ROWS.fetch_add(1, core::sync::atomic::Ordering::Release);
         }
+        publish_rlimit_change();
     }
     Ok(prior)
 }
@@ -18360,6 +18421,7 @@ fn rlimit_fork(parent: u64, child: u64) {
         if state.rows.insert(child_key, inherited).is_none() {
             RLIMIT_CUSTOM_ROWS.fetch_add(1, core::sync::atomic::Ordering::Release);
         }
+        publish_rlimit_change();
     }
 }
 

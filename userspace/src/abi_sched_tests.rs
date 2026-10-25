@@ -229,6 +229,101 @@ fn smoke_abi_sched_setrlimit_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setrlimit_pos);
 
+fn smoke_abi_rlimit_cache_observes_remote_update() -> TestResult {
+    with_setup(|| {
+        const OTHER: u64 = 0xA7_310;
+        let _owner = crate::task::Task::new_registered(OTHER, OTHER);
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        let result = (|| {
+            let initial = [128u64, 4096u64];
+            if call(Syscall::Setrlimit.raw(), a1(7, initial.as_ptr() as u64)) != Some(0) {
+                return Err("set initial rlimit failed");
+            }
+            let mut output = [0u64; 2];
+            if call(Syscall::Getrlimit.raw(), a1(7, output.as_mut_ptr() as u64)) != Some(0)
+                || output != initial
+            {
+                return Err("initial rlimit read failed");
+            }
+            if !crate::task::task_get(FAKE_TASK)
+                .is_some_and(|owner| owner.rlimit_read_cache.lock().is_some())
+            {
+                return Err("rlimit read did not populate the snapshot");
+            }
+            let changed = [64u64, 4096u64];
+            let mut prior = [0u64; 2];
+            set_task(OTHER);
+            let updated = call(
+                Syscall::Prlimit64.raw(),
+                a3(
+                    FAKE_TASK,
+                    7,
+                    changed.as_ptr() as u64,
+                    prior.as_mut_ptr() as u64,
+                ),
+            );
+            set_task(FAKE_TASK);
+            if updated != Some(0) || prior != initial {
+                return Err("remote prlimit did not atomically return the previous pair");
+            }
+            if call(Syscall::Getrlimit.raw(), a1(7, output.as_mut_ptr() as u64)) != Some(0)
+                || output != changed
+            {
+                return Err("cached limit survived a completed remote update");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::task::mark_zombie(OTHER);
+        crate::handlers::release_reaped_task(OTHER);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit",
+    smoke_abi_rlimit_cache_observes_remote_update
+);
+
+fn smoke_abi_rlimit_cache_observes_leader_rebinding() -> TestResult {
+    with_setup(|| {
+        const OTHER_TID: u64 = 0xA7_320;
+        const OTHER_PID: u64 = 0xA7_321;
+        let _owner = crate::task::Task::new_registered(OTHER_TID, OTHER_PID);
+        crate::handlers::register_pid_task_mapping(OTHER_PID, OTHER_TID);
+        let result = (|| {
+            if !crate::handlers::__test_set_rlimit(FAKE_TASK, 7, 128, 4096)
+                || !crate::handlers::__test_set_rlimit(OTHER_TID, 7, 64, 4096)
+            {
+                return Err("could not seed process limit rows");
+            }
+            let mut output = [0u64; 2];
+            if call(Syscall::Getrlimit.raw(), a1(7, output.as_mut_ptr() as u64)) != Some(0)
+                || output != [128, 4096]
+            {
+                return Err("could not warm the original leader snapshot");
+            }
+            // The process id now resolves to a different stable leader TaskId.
+            // No rlimit row changes, so identity publication must invalidate.
+            crate::handlers::register_pid_task_mapping(FAKE_TASK, OTHER_TID);
+            if call(Syscall::Getrlimit.raw(), a1(7, output.as_mut_ptr() as u64)) != Some(0)
+                || output != [64, 4096]
+            {
+                return Err("cached limits ignored a completed leader binding change");
+            }
+            Ok(())
+        })();
+        crate::handlers::register_pid_task_mapping(FAKE_TASK, FAKE_TASK);
+        crate::handlers::register_pid_task_mapping(OTHER_PID, OTHER_TID);
+        crate::task::mark_zombie(OTHER_TID);
+        crate::handlers::release_reaped_task(OTHER_PID);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit",
+    smoke_abi_rlimit_cache_observes_leader_rebinding
+);
+
 fn smoke_abi_sched_setrlimit_null_buf_neg() -> TestResult {
     with_setup(|| match call(Syscall::Setrlimit.raw(), a1(7, 0)) {
         Some(v) if v == EFAULT => Ok(()),

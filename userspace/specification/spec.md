@@ -400,6 +400,13 @@ by process fork/clone, and retired only when the process is reaped. Device/PFN
 mappings, vDSO/vvar, kernel control rings, guards, and hardware huge mappings
 are lock-exempt; inaccessible PROT_NONE reservations are not populated.
 `setrlimit` validation and replacement are one process-table transaction.
+Repeated rlimit reads may use a task-owned immutable snapshot after an acquire
+check of the store generation. Limits updates, inheritance, reap, and process
+identity mutations advance that generation. Cache fills pair the complete
+locked row with a stable generation across key resolution; a racing identity
+change leaves the ordinary read uncached. TaskId reuse cannot revive a cached
+row, and no cache lock is held while resolving identity or taking the store
+lock. Thread sharing, fork copying, and authority checks remain store-owned.
 `prlimit64` copies a proposed limit before PID/permission validation, returns
 `ESRCH` for a nonexistent target, and requires the caller's real uid+gid to
 match all representable target real/effective/saved IDs unless the target is

@@ -117,6 +117,11 @@ pub struct Task {
     /// CPU anchoring this task's process-child rotation. Established by its
     /// first process fork and retained if the parent later migrates.
     fork_base_cpu: AtomicU32,
+    /// Versioned read-only snapshot of the process rlimits. The authoritative
+    /// table serializes updates and advances its generation before returning;
+    /// repeated current-task reads then need neither its global lock nor PID
+    /// translation. Inline storage follows this never-reused TaskId's lifetime.
+    pub(crate) rlimit_read_cache: IrqSafeSpinLock<Option<crate::handlers::RlimitReadCache>>,
     /// Set by `exit_group(2)` (Linux `signal->group_exit`): the whole
     /// thread group is terminating. Consulted so a sibling that races
     /// the group exit reports the group's status.
@@ -187,6 +192,7 @@ impl Task {
             parked_this_slice: AtomicU32::new(0),
             fork_sequence: AtomicU64::new(0),
             fork_base_cpu: AtomicU32::new(u32::MAX),
+            rlimit_read_cache: IrqSafeSpinLock::new(None),
             group_exiting: core::sync::atomic::AtomicBool::new(false),
             uctx: UserTaskCtx::new(),
             poll_files: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
