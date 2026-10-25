@@ -584,11 +584,13 @@ errors close the owner. Dropping the future retains the in-progress phase,
 qualification, pending command and queue DMA; a late receipt cannot reopen it.
 
 `prepared_transmit_power()` returns `PowerStatus { channel,
-conducted_eighth_dbm, qualification_digest }` only after both receipts while
+conducted_eighth_dbm, qualification_digest }` after both receipts (including
+while the later link is active) while
 the qualification capability remains current. This is receipt metadata, not
 ongoing transmit admission: MCC is a query snapshot and later host/firmware
 policy changes require fresh admission before any future active operation.
-`release_transmit_power()` forgets only a completed inactive preparation and
+`release_transmit_power()` forgets only a completed inactive preparation,
+requires the later active-link owner to have completed deactivation, and
 returns to the management-queue stage. It sends no permissive reset and leaves
 firmware power restrictions intact; queue retirement remains fenced until this
 step. Registry name replacement alone does not revoke an already retained blob.
@@ -598,10 +600,100 @@ exercise signed registry inputs, CC77 negotiation,
 SAR/link DMA bytes, fresh MCC, NVM/LAR flag differences, restrictive host overlap,
 policy tightening, source-capability revocation, receipt correlation, cancellation
 at each native wait and power-before-queue ordered retirement. Automatic Gen2
-station TX remains disabled. Active PHY/link/peer transitions, management packet
+station TX remains disabled. The retained active-link transition is specified
+in §3.12; TX-enabled peer transitions, management packet
 exchange and rate/key/BA/security, recovery, PM and native PCI station publication
 remain unimplemented gates. No physical SAR, RF compliance or hardware readiness
 claim follows from these software checks.
+
+### 3.12 Retained API77 active link and receipt-fenced deactivation
+
+`mvm_boot::Owner::activate_link().await` continues the same acknowledged,
+inactive PHY0/link0, TX-disabled station0, unused station0/TID15 management
+queue and signed v5 power owner. It requires `TransmitPowerPrepared`, the exact
+retained peer/channel/power binding and a still-idle native queue. It does not
+create another PHY, peer or packet queue. MAC_POWER_TABLE command1/response0 is
+the existing awake API77 profile; other profiles fail before publication.
+
+LINK_CONFIG uses the pre-v2 v1 208-byte payload. The firmware table may omit the
+command or report UNKNOWN; Linux `fw/img.c` then defaults its payload-layout
+lookup to1. Explicit layout0/1 and UNKNOWN use the same retained prefix;
+other layouts or known nonzero response layouts fail before mutation. The wire
+header version is independently0, from Linux `mvm/link.c`'s `WIDE_ID(3,9)` and
+`fw/api/cmdhdr.h`'s command-ID version bits. Negotiated payload versions are not
+copied into that header. The internal `Hardware::command_with_header_version`
+expresses truly versioned command IDs. The retained Qu transport's ordinary
+`Hardware::command` now uses header0 throughout the reached boot/NVM/default,
+scan/MCC/MAC/PHY, disabled-peer, queue and v5 power prerequisites as well. Their
+payload versions and capability gates remain unchanged. Existing Gen3 header
+behavior is unchanged and retains its separate payload-layout/header-version
+audit gate. Literal native header tests cover every reached Gen2 command
+category and preserve the Gen3 branch.
+
+Activation derives its legacy basic rates from the original retained AP IEs.
+Supported Rates is required and bounded to1…8 entries; Extended Supported Rates
+is optional. Duplicate/empty rate elements, truncated IEs, missing actual basic
+bits, unsupported mandatory rates, HT/VHT membership selectors and CCK-only basic
+sets on5GHz fail. Basic bits are first intersected with the local/channel
+supported set through the existing strict legacy rate parser. Linux
+`mvm/mac-ctxt.c::iwl_mvm_ack_rates` then adds local mandatory response rates below
+the lowest basic rate in each modulation class: lower CCK rates and OFDM
+6/12/24Mbps. These are firmware control-response masks; they do not invent AP
+advertisements or grant ordinary packet-rate adaptation. The signed NIPW
+qualification must cover the complete resulting autonomous-response envelope;
+a1Mbps AP basic rate cannot narrow that qualification to1Mbps hardware behavior.
+
+Before any native wait, the owner reserves the exact link identity/rates and
+enters `ActivatingLink`. It requeries current firmware MCC when LAR applies,
+checks current NVM/MCC VALID/ACTIVE/20MHz and no-radar permission, and checks the
+retained source capability and current host NO_IR/DFS/overlap/power policy.
+The host ceiling must still cover the already acknowledged conducted power;
+this operation never raises power or silently treats a lower ceiling as applied.
+The actual source capability and host ceiling are checked before every poll of
+each native command future, including when no firmware receipt has arrived.
+Authority loss ends the waiter and retains its uncertain command and queue DMA.
+MCC remains a query snapshot; no live firmware-regulatory notification contract
+is claimed by this stage.
+
+The native sequence is LINK_CONFIG MODIFY with exactly MODIFY_ACTIVE |
+MODIFY_RATES_INFO, `active=1`, then the ordinary awake40-byte MAC-power update
+with25-second keep-alive, matching Linux's channel-context assignment order.
+It changes no QoS, HE/EHT, beacon timing, association, class/auth, key, BA or
+station TX-disable state. Both commands require exact correlated empty ACKs,
+followed by a final current qualification/host/firmware-permission check before
+`LinkActive` is published. Malformed or foreign receipts and authority/transport
+failures make the owner terminal without releasing uncertain resources.
+
+`prepared_active_link()` returns `ActiveLinkStatus { bssid, channel,
+cck_response_rates, ofdm_response_rates }` only after those receipts while the
+source capability remains current. This is firmware-receipt metadata, not
+carrier, association, a controlled port or continuing TX authority. There is no
+management/data submission surface and the peer remains TX-disabled. Host
+policy changes after publication require fresh admission before a future active
+operation; neither a cached status nor BSS entry can supply that authority.
+
+`deactivate_link().await` reserves `DeactivatingLink` and sends the same legacy
+LINK_CONFIG with only MODIFY_ACTIVE and `active=0`. It requires the exact empty
+native ACK before clearing the retained active binding and returning to
+`TransmitPowerPrepared`. This closing command remains available after the
+qualification capability is revoked; continuing TX policy is unnecessary to
+stop a completed link. Power, queue, peer and PHY retirement remain fenced until
+that receipt. Dropping either activation or deactivation leaves its in-progress
+phase, exact identity, qualification, queue and command DMA retained; a late ACK
+cannot permit replay or reinterpret the link as inactive. A completed close may
+be followed by a fresh qualified activation, which requeries MCC again.
+
+Native Rust TFH/RFH smokes compose the real disabled-peer/queue and signed-power
+commands through activation, MAC power, deactivation and ordered power/queue/
+peer/PHY retirement. They check fixed wire bytes/header versions, observed
+basic/mandatory rate masks, absent/UNKNOWN layout fallback, restrictive host and
+fresh firmware permissions, source revocation, each cancelled native wait,
+malformed/foreign receipts, final-publication tightening and closing after
+revocation. These tests use explicit isolated policy/qualification fixtures;
+they cannot authorize real hardware. No reset, DMA reclamation or autonomous RF
+quiescence follows from host failure. TX-enabled peer setup, actual management
+exchange, complete Gen2 TX/completion/MLME ownership, rate/key/BA/security,
+recovery/PM and native PCI station publication remain separate gates.
 
 ## 4. References
 

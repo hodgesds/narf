@@ -19,6 +19,9 @@ pub enum Phase {
     ManagementQueuePrepared,
     PreparingTransmitPower,
     TransmitPowerPrepared,
+    ActivatingLink,
+    LinkActive,
+    DeactivatingLink,
     RemovingManagementQueue,
     RemovingPeer,
     Failed,
@@ -194,3 +197,7 @@ mod queue;
 mod power;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
+
+#[path = "mvm_link.rs"]
+mod link;
+pub type ActiveLinkStatus = link::ActiveLinkStatus;

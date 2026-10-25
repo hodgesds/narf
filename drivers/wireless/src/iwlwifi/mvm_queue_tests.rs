@@ -145,15 +145,15 @@ fn add_wire(observed: &runtime::model::Published, owned: (u64, u64)) -> bool {
     if observed.queue != 0
         || observed.bytes.len() != 44
         || observed.bytes[..2] != [0x17, 5]
-        || observed.bytes[7] != 3
+        || observed.bytes[7] != 0
     {
         return false;
     }
     let body = &observed.bytes[8..];
     let byte_counts = u64::from_le_bytes(body[20..28].try_into().unwrap());
     let descriptors = u64::from_le_bytes(body[28..36].try_into().unwrap());
-    // Header and fixed fields are literals produced by the independent Linux
-    // struct oracle; dynamic addresses must be distinct aligned owned DMA.
+    // Source-cited literal v3 payload with WIDE_ID header0; dynamic addresses
+    // must be distinct, aligned and owned by this actual native queue.
     body[..20] == [0, 0, 0, 0, 1, 0, 0, 0, 15, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0]
         && byte_counts != 0
         && descriptors != 0

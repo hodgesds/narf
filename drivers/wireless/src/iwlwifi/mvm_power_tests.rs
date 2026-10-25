@@ -97,6 +97,48 @@ fn fixture(lar: bool) -> Result<Fixture, &'static str> {
     }
     Ok(fixture)
 }
+
+/// Compose actual disabled peer/queue ADD and both signed power receipts for
+/// the next native owner. No physical PCI function or global policy is used.
+pub(in crate::iwlwifi::mvm_boot) fn ready_link_fixture(lar: bool) -> Result<Fixture, &'static str> {
+    let mut fixture = fixture(false)?;
+    {
+        let owner = fixture.owner.as_mut().unwrap();
+        let mut operation =
+            pin!(owner.prepare_power_using(source(&record(), true)?, BINDING, || Ok(domain())));
+        if !poll(operation.as_mut()).is_pending() {
+            return Err("link prerequisite did not await SAR receipt");
+        }
+        fixture.firmware.inject(REDUCE_TX_POWER, 1, 2, &[]);
+        if !poll(operation.as_mut()).is_pending() {
+            return Err("link prerequisite did not await link-power receipt");
+        }
+        fixture.firmware.inject(REDUCE_TX_POWER, 1, 3, &[]);
+        if poll(operation.as_mut()) != Poll::Ready(Ok(())) {
+            return Err("link prerequisite power receipts failed");
+        }
+    }
+    for _ in 0..2 {
+        fixture
+            .trace
+            .take()
+            .ok_or("missing native power prerequisite DMA")?;
+    }
+    if lar {
+        let mut api = FirmwareApi::default();
+        api.capabilities[0] = 1 << 1;
+        let owner = fixture.owner.as_mut().unwrap();
+        owner.scan = super::super::scan::ScanContext::new(&api);
+        owner.scan.ready = true;
+        owner.scan.nvm_lar = true;
+    }
+    Ok(fixture)
+}
+pub(in crate::iwlwifi::mvm_boot) fn retained_source(
+    owner: &Owner,
+) -> narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read> {
+    owner.power.prepared.as_ref().unwrap().source.cap
+}
 fn mcc(flags: u32) -> Vec<u8> {
     let mut bytes = vec![0; 16 + 110 * 4];
     bytes[12..16].copy_from_slice(&110u32.to_le_bytes());
@@ -213,7 +255,7 @@ fn native_trace(
         || observed.bytes.len() != 52
         || observed.bytes[..2] != [REDUCE_TX_POWER, 1]
         || observed.bytes[2..4] != sequence.to_le_bytes()
-        || observed.bytes[7] != 5
+        || observed.bytes[7] != 0
         || observed.bytes[8..] != expected
         || observed.doorbell != u32::from(observed.pointer)
     {
