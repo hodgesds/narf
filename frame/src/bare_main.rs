@@ -3467,14 +3467,27 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         }
                     }
 
-                    // Log completion.
-
+                    // Log completion. Report the actual dispatch
+                    // state: the extends above reached hardware PCRs
+                    // only if a TPM registered itself (the platform
+                    // probe at Stage::Subsys); otherwise every
+                    // measurement lives in the software shadow alone
+                    // and the summary must say so instead of claiming
+                    // hardware anchoring that never happened.
                     let log = measure::get_log();
-                    let _ = writeln!(
-                        console::Writer,
-                        "  measured-boot: {} components anchored in hardware",
-                        log.len()
-                    );
+                    if measure::hardware_dispatch_active() {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  measured-boot: {} components extended into hardware TPM PCRs",
+                            log.len()
+                        );
+                    } else {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  measured-boot: {} components recorded in software shadow only (no TPM registered)",
+                            log.len()
+                        );
+                    }
                     let _ = writeln!(
                         console::Writer,
                         "  measured-boot: secure-boot enabled={}",

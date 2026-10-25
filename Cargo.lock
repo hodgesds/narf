@@ -2634,6 +2634,7 @@ dependencies = [
 name = "narf-frame"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "narf-accel",
  "narf-acpi",
  "narf-aml",

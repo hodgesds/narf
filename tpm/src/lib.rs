@@ -77,6 +77,16 @@ pub mod registry {
     pub fn list() -> Vec<Arc<dyn TpmDevice>> {
         REGISTRY.lock().clone()
     }
+
+    /// Test-only: drop every registered device, restoring the
+    /// no-TPM state a TPM-less boot observes. Production
+    /// registration is boot-lifetime (the platform probe registers
+    /// once, at Stage::Subsys); fixtures that register a mock must
+    /// call this on exit so later smokes are not dispatched to it.
+    #[doc(hidden)]
+    pub fn __reset_for_test() {
+        REGISTRY.lock().clear();
+    }
 }
 
 /// Force-link hook.
@@ -182,6 +192,32 @@ mod tests {
         }
     }
     kernel_test_in!("tpm", smoke_tpm_cap_kind);
+
+    fn smoke_tpm_registry_register_list_and_reset() -> TestResult {
+        // The registry is the composition point the measured-boot
+        // dispatch consults: registration must make the exact device
+        // visible to list(), and the test reset must restore the
+        // empty state. Reset on entry AND exit — the registry is
+        // global, and a leaked mock would silently become the
+        // dispatch target for later smokes.
+        registry::__reset_for_test();
+        if !registry::list().is_empty() {
+            return TestResult::Fail("registry not empty after reset");
+        }
+        let mock: Arc<dyn TpmDevice> = Arc::new(MockTpm::new());
+        registry::register(mock.clone());
+        let list = registry::list();
+        if list.len() != 1 || !Arc::ptr_eq(&list[0], &mock) {
+            registry::__reset_for_test();
+            return TestResult::Fail("registered device not returned by list()");
+        }
+        registry::__reset_for_test();
+        if !registry::list().is_empty() {
+            return TestResult::Fail("registry not empty after final reset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm", smoke_tpm_registry_register_list_and_reset);
 
     // ── TPM 2.0 codec smokes ──────────────────────────────────────
 
