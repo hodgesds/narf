@@ -679,6 +679,19 @@ mod tests {
         }
     }
 
+    /// Cap on the recorded transfer history. The conversation tests
+    /// assert the full log, but a stuck port's prepare poll spins the
+    /// model for the whole 100 ms budget — millions of reads under
+    /// TCG, where the guest clock crawls relative to executed
+    /// instructions — and an unbounded log grows until the test
+    /// guest's heap fails a doubling allocation (observed on
+    /// aarch64: the 2^23-entry step requests 64 MiB). Entries past
+    /// the cap are dropped; every asserted conversation is two
+    /// orders of magnitude below it, and a conversation that ever
+    /// reached the cap would fail its exact-log assertion loudly
+    /// on length, never pass silently.
+    const MAX_LOG_ENTRIES: usize = 1024;
+
     /// A modelled manager: peripherals wait at the enumeration address
     /// in queue order; a DEVNUMBER write to device 0 assigns the front
     /// peripheral. Prepare completes instantly unless `stuck_prepare`.
@@ -708,7 +721,12 @@ mod tests {
 
     impl Transport for ModelTransport {
         fn xfer(&self, dev: u8, addr: u32, write: Option<u8>) -> Result<Option<u8>, SdwError> {
-            self.log.lock().push(Xfer { dev, addr, write });
+            {
+                let mut log = self.log.lock();
+                if log.len() < MAX_LOG_ENTRIES {
+                    log.push(Xfer { dev, addr, write });
+                }
+            }
             if dev == ENUM_DEV_NUM {
                 if let Some(value) = write {
                     if addr == regs::SCP_DEVNUMBER {
@@ -969,7 +987,7 @@ mod tests {
         // Empty bus: enumeration completes with no peripherals.
         let mut empty = Bus::new(ModelTransport::new(&[]));
         match empty.enumerate() {
-            Ok(found) if found.is_empty() => {}
+            Ok([]) => {}
             _ => return TestResult::Fail("empty bus must enumerate clean"),
         }
         // A peripheral that stops answering mid-DevID aborts

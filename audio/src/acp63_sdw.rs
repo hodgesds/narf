@@ -507,7 +507,7 @@ mod tests {
             self.last_upper = upper;
             self.last_lower = lower;
             let dev = ((upper >> 8) & 0xF) as u8;
-            let addr = (((upper & 0xFF) << 8) | ((lower >> 24) & 0xFF)) as u32;
+            let addr = ((upper & 0xFF) << 8) | ((lower >> 24) & 0xFF);
             let is_write = upper & regs::MCP_CMD_WRITE == regs::MCP_CMD_WRITE;
             let mut ack = false;
             let mut data = 0u8;
@@ -721,7 +721,7 @@ mod tests {
         }
         let mut bus = Bus::new(transport);
         match bus.enumerate() {
-            Ok(found) if found.is_empty() => {}
+            Ok([]) => {}
             _ => return TestResult::Fail("absent peripheral must enumerate empty"),
         }
         drop(bus);
