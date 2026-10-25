@@ -12,43 +12,69 @@
 //!   1.59 — TPM2_GetRandom, TPM2_GetCapability, etc.
 //!   <https://trustedcomputinggroup.org/resource/tpm-library-specification/>
 //!
-//! ## Memory map
+//! ## Discovery
 //!
-//! Both TIS and CRB live in MMIO at the platform-fixed base
-//! `0xFED4_0000` for locality 0 (PC Client PTP §5.2.1.1, "PCR
-//! TPM Interface and physical address mapping"). Locality `n`
-//! starts at `0xFED4_n000`; we always use locality 0.
+//! The control-area address comes from firmware, in order:
 //!
-//! At offset `+0x30` is the CRB-specific block. The first 4 bytes
-//! at offset `+0xF00` (`TPM_INTERFACE_ID_x`) tell us which
-//! interface the silicon exposes — bits[3:0] = 0 means CRB,
-//! 0xF means TIS-only. Stage cut: probe both, prefer CRB.
+//! 1. The **TPM2 ACPI table** (`control_address` field), parsed by
+//!    `narf_acpi` — this is the only way to find an AMD fTPM whose
+//!    control area firmware publishes at a non-fixed address (TCG
+//!    ACPI spec; Linux `tpm_crb.c` discovers the same way). Start
+//!    methods 11 (ARM SMC) and 15 (CRB with ARM FF-A) are named in
+//!    `drivers/tpm/src/probe.rs` and are **not** driven here — they
+//!    have no transport in-tree yet, so a table advertising one is
+//!    skipped rather than probed as if it were MMIO CRB.
+//! 2. The platform-fixed locality-0 window `0xFED4_0000` (PC Client
+//!    PTP §5.2.1.1) when no usable table entry exists.
 //!
-//! ## CRB register layout (PTP §6.4.5)
+//! At the chosen base, `TPM_INTERFACE_ID` (offset `0x30`) tells us
+//! which interface the silicon exposes — bits[3:0] = 0 means CRB,
+//! 0xF means TIS-only. An undefined interface type is a clean
+//! `NotPresent`, never a guess.
 //!
-//! Locality 0 CRB block at `0xFED40000 + 0x40`:
+//! ## CRB register layout (PTP §6)
 //!
-//! | offset (rel 0xFED40040) | name                    | width |
-//! |-------------------------|-------------------------|-------|
-//! | 0x00                    | LOC_CTRL                | u32   |
-//! | 0x04                    | LOC_STS                 | u32   |
-//! | 0x40                    | INTF_ID                 | u32   |
-//! | 0x80                    | CTRL_REQ                | u32   |
-//! | 0x84                    | CTRL_STS                | u32   |
-//! | 0x88                    | CTRL_CANCEL             | u32   |
-//! | 0x8C                    | CTRL_START              | u32   |
-//! | 0x90                    | INT_ENABLE / STATUS     | u32×2 |
-//! | 0x98                    | CMD_SIZE                | u32   |
-//! | 0x9C                    | CMD_PA_LO               | u32   |
-//! | 0xA0                    | CMD_PA_HI               | u32   |
-//! | 0xA4                    | RSP_SIZE                | u32   |
-//! | 0xA8                    | RSP_PA_LO               | u32   |
-//! | 0xAC                    | RSP_PA_HI               | u32   |
+//! Offsets relative to the control-area base. This map is the one
+//! validated against Linux `tpm_crb.c`'s register structs and is
+//! identical to the reference model in `drivers/tpm/src/crb.rs`.
+//! (The map this file used before #939 based the block at `+0x40`,
+//! disagreeing with both other in-tree CRB implementations.)
 //!
-//! Stage cut: probe at `0xFED40000`, identify CRB vs TIS, expose
-//! `submit(&[u8]) -> Vec<u8>` for callers that already speak the
-//! TPM2 wire protocol. A `tpm2_get_random(bytes)` convenience is
-//! built on top.
+//! | offset | name                    | width |
+//! |--------|-------------------------|-------|
+//! | 0x00   | LOC_STATE               | u32   |
+//! | 0x08   | LOC_CTRL                | u32   |
+//! | 0x0C   | LOC_STS                 | u32   |
+//! | 0x30   | INTF_ID                 | u32   |
+//! | 0x40   | CTRL_REQ                | u32   |
+//! | 0x44   | CTRL_STS                | u32   |
+//! | 0x48   | CTRL_CANCEL             | u32   |
+//! | 0x4C   | CTRL_START              | u32   |
+//! | 0x58   | CMD_SIZE                | u32   |
+//! | 0x5C   | CMD_PA_LO               | u32   |
+//! | 0x60   | CMD_PA_HI               | u32   |
+//! | 0x68   | RSP_SIZE                | u32   |
+//! | 0x6C   | RSP_PA_LO               | u32   |
+//! | 0x70   | RSP_PA_HI               | u32   |
+//!
+//! ## CRB buffer contract (PTP §6)
+//!
+//! The `CMD_*` / `RSP_*` registers are **host-programmed**: the host
+//! allocates the command/response buffers and writes their physical
+//! addresses + sizes into the chip (cf.
+//! `drivers/tpm/src/crb.rs::program_buffers`, which writes all six).
+//! Probe therefore allocates host-owned coherent buffers and
+//! programs them; firmware is never expected to publish them. The
+//! pre-#939 probe *read* the registers as firmware-published and
+//! failed `NoCommandBuffer` whenever firmware had left them zero —
+//! the expected state — so CRB probe could never succeed on the
+//! target laptops.
+//!
+//! ## Scope
+//!
+//! x86_64 only for now: off-x86_64 `probe` reports `NotPresent`,
+//! preserving the previous stub behaviour. aarch64 CRB arrives via
+//! the FF-A/SMC start methods above, which need their own transport.
 //!
 //! ## Composition (#934)
 //!
@@ -71,39 +97,53 @@ use narf_tpm::{TpmDevice, TpmError as HighLevelTpmError, TpmInfo};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Platform-fixed locality 0 base for TPM 2.0 (PC Client PTP §5.2.1.1).
+/// Used only as the fallback when the TPM2 ACPI table publishes no
+/// usable control-area address.
 pub const TPM_BASE_LOCALITY_0: u64 = 0xFED4_0000;
 
-/// CRB interface identification offset (PTP §6.4.5). bits[3:0]:
-///   0x0 = CRB  0xF = TIS only.
-const REG_INTERFACE_ID: u64 = 0x30;
+/// One locality / control area is 4 KiB (PC Client PTP §5.2).
+const TPM_LOCALITY_LEN: u64 = 0x1000;
 
-// CRB control block (offsets relative to `TPM_BASE_LOCALITY_0`).
-const REG_LOC_CTRL: u64 = 0x40; // 0x40 + 0x00
-const REG_LOC_STS: u64 = 0x40 + 0x04;
-const REG_CRB_CTRL_REQ: u64 = 0x40 + 0x80;
-const REG_CRB_CTRL_STS: u64 = 0x40 + 0x84;
-const REG_CRB_CTRL_START: u64 = 0x40 + 0x8C;
-const REG_CRB_CMD_SIZE: u64 = 0x40 + 0x98;
-const REG_CRB_CMD_LO: u64 = 0x40 + 0x9C;
-const REG_CRB_CMD_HI: u64 = 0x40 + 0xA0;
-const REG_CRB_RSP_SIZE: u64 = 0x40 + 0xA4;
-const REG_CRB_RSP_LO: u64 = 0x40 + 0xA8;
-const REG_CRB_RSP_HI: u64 = 0x40 + 0xAC;
+/// Size of each host-owned CRB buffer. 4 KiB covers the largest
+/// TPM 2.0 command/response (TPM_BUFSIZE); CRB transfers are bounded
+/// by the programmed size, so this is the transfer ceiling.
+const CRB_BUFFER_LEN: usize = 4096;
+
+/// CRB interface identification offset (PTP §6). bits[3:0]:
+///   0x0 = CRB  0xF = TIS only.
+pub(crate) const REG_INTERFACE_ID: u64 = 0x30;
+
+// CRB control-area registers (offsets relative to the control-area
+// base). Identical to drivers/tpm/src/crb.rs — see the module doc.
+pub(crate) const REG_LOC_STATE: u64 = 0x00;
+pub(crate) const REG_LOC_CTRL: u64 = 0x08;
+pub(crate) const REG_CRB_CTRL_REQ: u64 = 0x40;
+pub(crate) const REG_CRB_CTRL_STS: u64 = 0x44;
+pub(crate) const REG_CRB_CTRL_CANCEL: u64 = 0x48;
+pub(crate) const REG_CRB_CTRL_START: u64 = 0x4C;
+pub(crate) const REG_CRB_CMD_SIZE: u64 = 0x58;
+pub(crate) const REG_CRB_CMD_LO: u64 = 0x5C;
+pub(crate) const REG_CRB_CMD_HI: u64 = 0x60;
+pub(crate) const REG_CRB_RSP_SIZE: u64 = 0x68;
+pub(crate) const REG_CRB_RSP_LO: u64 = 0x6C;
+pub(crate) const REG_CRB_RSP_HI: u64 = 0x70;
+
+pub(crate) const LOC_CTRL_REQ_ACCESS: u32 = 1 << 0;
+pub(crate) const LOC_STATE_LOC_ASSIGNED: u32 = 1 << 1;
 
 const CTRL_REQ_CMD_READY: u32 = 1 << 0;
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CTRL_REQ_GO_IDLE: u32 = 1 << 1;
+const CTRL_STS_ERROR: u32 = 1 << 0;
 const CTRL_STS_TPM_IDLE: u32 = 1 << 1;
 const CTRL_START_GO: u32 = 1 << 0;
 
-const LOC_CTRL_REQ_ACCESS: u32 = 1 << 0;
-const LOC_STS_GRANTED: u32 = 1 << 0;
-
-// TIS register layout (TIS v1.21 §5.6).
+// TIS register layout (TIS v1.21 §5.6), offsets relative to the same
+// window base.
 const REG_TIS_ACCESS: u64 = 0x00;
 const REG_TIS_STS: u64 = 0x18;
 const REG_TIS_DATA_FIFO: u64 = 0x24;
-const REG_TIS_DID_VID: u64 = 0xF00;
+pub(crate) const REG_TIS_DID_VID: u64 = 0xF00;
 
 const TIS_ACCESS_REQUEST_USE: u8 = 1 << 1;
 const TIS_ACCESS_ACTIVE: u8 = 1 << 5;
@@ -123,8 +163,14 @@ pub enum TpmError {
     NotPresent,
     LocalityTimeout,
     BusyTimeout,
-    /// CRB command/response buffer hasn't been published in cfg.
+    /// Retained for the `narf_tpm::TpmError` mapping. Probe no
+    /// longer produces it: since #939 the CRB buffers are
+    /// host-owned and host-programmed, so "firmware published no
+    /// buffer" is not a failure mode.
     NoCommandBuffer,
+    /// Host-side allocation of the CRB command/response buffers
+    /// failed.
+    BufferAlloc,
     BadResponse,
 }
 
@@ -150,128 +196,192 @@ async fn poll_yielding_until<F: FnMut() -> bool>(
     }
 }
 
+// ── CRB register window + probe core ────────────────────────────────
+//
+// The probe sequence is written against a minimal register-window
+// trait so kernel-test fixtures can drive it against a
+// firmware-shaped model of the control area — the same split
+// `drivers/tpm/src/crb.rs` uses with its `CrbMmio` trait. The
+// production implementation is [`MmioCrbRegs`] over an ioremap'd
+// window.
+
+/// A 32-bit register window over a TPM control area; offsets are
+/// relative to the control-area base.
+pub(crate) trait CrbRegs {
+    fn rd32(&self, offset: u64) -> u32;
+    fn wr32(&self, offset: u64, value: u32);
+}
+
+/// Production [`CrbRegs`]: volatile MMIO over an ioremap'd window.
+struct MmioCrbRegs {
+    va: u64,
+}
+
+impl MmioCrbRegs {
+    fn rd8(&self, offset: u64) -> u8 {
+        // SAFETY: `va` is the device window mapped at probe; `offset`
+        // is a register offset inside the 4 KiB locality window.
+        unsafe { core::ptr::read_volatile((self.va + offset) as *const u8) }
+    }
+    fn wr8(&self, offset: u64, value: u8) {
+        // SAFETY: as `rd8`.
+        unsafe { core::ptr::write_volatile((self.va + offset) as *mut u8, value) }
+    }
+}
+
+impl CrbRegs for MmioCrbRegs {
+    fn rd32(&self, offset: u64) -> u32 {
+        // SAFETY: as `rd8`.
+        unsafe { core::ptr::read_volatile((self.va + offset) as *const u32) }
+    }
+    fn wr32(&self, offset: u64, value: u32) {
+        // SAFETY: as `rd8`.
+        unsafe { core::ptr::write_volatile((self.va + offset) as *mut u32, value) }
+    }
+}
+
+/// Identify the interface a control area exposes, from its
+/// `INTF_ID` register. Fails cleanly (`NotPresent`) on an absent
+/// window (all-zero / all-ones reads with no TIS `DID_VID` behind
+/// them) and on an interface type the PTP does not define — the
+/// pre-#939 probe guessed CRB for undefined types.
+pub(crate) fn identify<R: CrbRegs>(regs: &R) -> Result<TpmKind, TpmError> {
+    let intf = regs.rd32(REG_INTERFACE_ID);
+    if intf == 0 || intf == u32::MAX {
+        // INTF_ID not implemented (or a floating bus): a TIS part
+        // still proves itself through DID_VID.
+        let did_vid = regs.rd32(REG_TIS_DID_VID);
+        if did_vid == 0 || did_vid == u32::MAX {
+            return Err(TpmError::NotPresent);
+        }
+        return Ok(TpmKind::Tis);
+    }
+    match intf & 0xF {
+        0x0 => Ok(TpmKind::Crb),
+        0xF => {
+            // TIS-only. Require a sane DID_VID as well, so a garbage
+            // control area cannot alias a TIS detection.
+            let did_vid = regs.rd32(REG_TIS_DID_VID);
+            if did_vid == 0 || did_vid == u32::MAX {
+                return Err(TpmError::NotPresent);
+            }
+            Ok(TpmKind::Tis)
+        }
+        _ => Err(TpmError::NotPresent),
+    }
+}
+
+/// CRB bring-up sequence (PTP §6.5, mirroring
+/// `drivers/tpm/src/crb.rs::acquire_locality` + `program_buffers`):
+/// request locality 0, wait for `LOC_STATE.locAssigned`, then
+/// program the six buffer registers with the host-owned buffers.
+pub(crate) fn crb_acquire_and_program<R: CrbRegs>(
+    regs: &R,
+    cmd_phys: u64,
+    cmd_size: u32,
+    rsp_phys: u64,
+    rsp_size: u32,
+    locality_deadline: narf_time::Deadline,
+) -> Result<(), TpmError> {
+    regs.wr32(REG_LOC_CTRL, LOC_CTRL_REQ_ACCESS);
+    let granted = narf_scheduler::responsive_spin_until(
+        || regs.rd32(REG_LOC_STATE) & LOC_STATE_LOC_ASSIGNED != 0,
+        locality_deadline,
+    );
+    if !granted {
+        return Err(TpmError::LocalityTimeout);
+    }
+    // The buffer registers are host-programmed (module doc): write
+    // all six. Nothing is read back as a precondition — firmware
+    // leaving them zero is the normal, expected state.
+    regs.wr32(REG_CRB_CMD_SIZE, cmd_size);
+    regs.wr32(REG_CRB_CMD_LO, cmd_phys as u32);
+    regs.wr32(REG_CRB_CMD_HI, (cmd_phys >> 32) as u32);
+    regs.wr32(REG_CRB_RSP_SIZE, rsp_size);
+    regs.wr32(REG_CRB_RSP_LO, rsp_phys as u32);
+    regs.wr32(REG_CRB_RSP_HI, (rsp_phys >> 32) as u32);
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Tpm {
     base: u64,
     kind: TpmKind,
-    /// Kernel VA of the CRB command buffer, whose physical address was
-    /// read from CRB_CMD_PA_*. The buffer is firmware-published memory
-    /// outside our allocator, so it is reached through an uncached
-    /// `ioremap` window rather than a raw physical address.
-    cmd_va: u64,
-    /// CRB command buffer max size (CRB_CMD_SIZE).
-    cmd_size: u32,
-    /// Kernel VA of the CRB response buffer.
-    rsp_va: u64,
-    rsp_size: u32,
+    /// Kernel VA of the ioremap'd control-area / locality window at
+    /// `base`. All register access for this device goes through it.
+    regs_va: u64,
+    /// Host-owned CRB command buffer (CRB kind only). Allocated at
+    /// probe and programmed into the `CMD_*` registers; kept alive
+    /// for the device's lifetime.
+    cmd_buf: Option<narf_io::DmaBuffer>,
+    /// Host-owned CRB response buffer (CRB kind only).
+    rsp_buf: Option<narf_io::DmaBuffer>,
 }
 
 impl Tpm {
-    /// Probe the TPM at `base`. On success returns either a CRB
-    /// or TIS implementation depending on what the silicon
-    /// advertises.
+    /// Probe the TPM whose control area / locality window is at
+    /// `base`. On success returns either a CRB or TIS implementation
+    /// depending on what the silicon advertises.
     ///
     /// # Safety
     /// Caller asserts `base` is a 4 KiB MMIO window backed by a
     /// TPM 2.0 device.
     pub unsafe fn probe(base: u64) -> Result<Self, TpmError> {
-        // SAFETY: caller-asserted MMIO window.
-        let intf = unsafe { read32(base + REG_INTERFACE_ID) };
-        if intf == 0 || intf == u32::MAX {
-            // TIS-only fallback: check DID_VID at +0xF00.
-            // SAFETY: same window, in-range.
-            let did_vid = unsafe { read32(base + REG_TIS_DID_VID) };
-            if did_vid == 0 || did_vid == u32::MAX {
-                return Err(TpmError::NotPresent);
-            }
-            return Ok(Self {
-                base,
-                kind: TpmKind::Tis,
-                cmd_va: 0,
-                cmd_size: 0,
-                rsp_va: 0,
-                rsp_size: 0,
-            });
+        if !cfg!(target_arch = "x86_64") {
+            // aarch64 CRB start methods are FF-A/SMC (TPM2 table
+            // start methods 11/15), which have no transport in-tree
+            // yet. Preserve the previous stub behaviour — probe
+            // reports NotPresent — instead of touching a window we
+            // cannot drive; see the module doc's scope note.
+            return Err(TpmError::NotPresent);
         }
-        let kind = match intf & 0xF {
-            0x0 => TpmKind::Crb,
-            0xF => TpmKind::Tis,
-            _ => TpmKind::Crb, // future variants — assume CRB.
-        };
+        // SAFETY: caller-asserted MMIO window; mapped Device
+        // (uncached) for the device's lifetime.
+        let mapped = unsafe {
+            narf_memory::ioremap::ioremap(
+                base,
+                TPM_LOCALITY_LEN,
+                narf_memory::ioremap::MmioAttrs::Device,
+            )
+        }
+        .map_err(|_| TpmError::NotPresent)?;
+        let regs = MmioCrbRegs { va: mapped.va() };
+        let kind = identify(&regs)?;
         match kind {
-            TpmKind::Crb => {
-                // Request locality.
-                // SAFETY: same.
-                unsafe {
-                    write32(base + REG_LOC_CTRL, LOC_CTRL_REQ_ACCESS);
-                }
-                // 750 ms wall-clock — TCG TPM 2.0 Library spec
-                // TIMEOUT_A (short timeout) covers locality
-                // grant. responsive_spin_until ticks sleep_pumps.
-                let granted = narf_scheduler::responsive_spin_until(
-                    // SAFETY: identity-mapped MMIO.
-                    || unsafe { read32(base + REG_LOC_STS) } & LOC_STS_GRANTED != 0,
-                    narf_time::Deadline::after_ms(750),
-                );
-                if !granted {
-                    return Err(TpmError::LocalityTimeout);
-                }
-                // Read CRB command + response buffer phys + size.
-                // SAFETY: same.
-                let cmd_size = unsafe { read32(base + REG_CRB_CMD_SIZE) };
-                // SAFETY: same.
-                let cmd_lo = unsafe { read32(base + REG_CRB_CMD_LO) };
-                // SAFETY: same.
-                let cmd_hi = unsafe { read32(base + REG_CRB_CMD_HI) };
-                let cmd_phys = ((cmd_hi as u64) << 32) | cmd_lo as u64;
-                // SAFETY: same.
-                let rsp_size = unsafe { read32(base + REG_CRB_RSP_SIZE) };
-                // SAFETY: same.
-                let rsp_lo = unsafe { read32(base + REG_CRB_RSP_LO) };
-                // SAFETY: same.
-                let rsp_hi = unsafe { read32(base + REG_CRB_RSP_HI) };
-                let rsp_phys = ((rsp_hi as u64) << 32) | rsp_lo as u64;
-                if cmd_phys == 0 || rsp_phys == 0 || cmd_size == 0 {
-                    return Err(TpmError::NoCommandBuffer);
-                }
-                // Map both windows once, here: the buffers live in
-                // firmware-published memory that the kernel never mapped.
-                // SAFETY: addresses and sizes come from the chip's own CRB
-                // registers, which describe buffers it owns.
-                let (cmd_map, rsp_map) = unsafe {
-                    (
-                        narf_memory::ioremap::ioremap(
-                            cmd_phys,
-                            cmd_size as u64,
-                            narf_memory::ioremap::MmioAttrs::Device,
-                        ),
-                        narf_memory::ioremap::ioremap(
-                            rsp_phys,
-                            rsp_size as u64,
-                            narf_memory::ioremap::MmioAttrs::Device,
-                        ),
-                    )
-                };
-                let (Ok(cmd_map), Ok(rsp_map)) = (cmd_map, rsp_map) else {
-                    return Err(TpmError::NoCommandBuffer);
-                };
-                Ok(Self {
-                    base,
-                    kind: TpmKind::Crb,
-                    cmd_va: cmd_map.virt,
-                    cmd_size,
-                    rsp_va: rsp_map.virt,
-                    rsp_size,
-                })
-            }
             TpmKind::Tis => Ok(Self {
                 base,
-                kind: TpmKind::Tis,
-                cmd_va: 0,
-                cmd_size: 0,
-                rsp_va: 0,
-                rsp_size: 0,
+                kind,
+                regs_va: mapped.va(),
+                cmd_buf: None,
+                rsp_buf: None,
             }),
+            TpmKind::Crb => {
+                // Host-owned buffers, programmed into the chip by
+                // `crb_acquire_and_program` (the CRB contract).
+                let cmd_buf =
+                    narf_io::alloc_coherent(CRB_BUFFER_LEN, narf_lib::id::DomainId::DRIVER_0)
+                        .map_err(|_| TpmError::BufferAlloc)?;
+                let rsp_buf =
+                    narf_io::alloc_coherent(CRB_BUFFER_LEN, narf_lib::id::DomainId::DRIVER_0)
+                        .map_err(|_| TpmError::BufferAlloc)?;
+                crb_acquire_and_program(
+                    &regs,
+                    cmd_buf.dma_addr().raw(),
+                    CRB_BUFFER_LEN as u32,
+                    rsp_buf.dma_addr().raw(),
+                    CRB_BUFFER_LEN as u32,
+                    // 750 ms wall-clock — TCG TPM 2.0 Library spec
+                    // TIMEOUT_A covers the locality grant.
+                    narf_time::Deadline::after_ms(750),
+                )?;
+                Ok(Self {
+                    base,
+                    kind,
+                    regs_va: mapped.va(),
+                    cmd_buf: Some(cmd_buf),
+                    rsp_buf: Some(rsp_buf),
+                })
+            }
         }
     }
 
@@ -282,13 +392,18 @@ impl Tpm {
         self.base
     }
 
+    fn regs(&self) -> MmioCrbRegs {
+        MmioCrbRegs { va: self.regs_va }
+    }
+
     /// Submit a TPM2 command (caller-encoded wire form starting
     /// with the 10-byte `TPM2_RC_HEADER`). Returns the response
     /// bytes (header + body).
     ///
-    /// CRB path: writes the command into the publishable
-    /// command-buffer phys, sets CRB_CTRL_START.GO, polls until
-    /// the start bit clears, reads response from rsp buffer.
+    /// CRB path: writes the command into the host-owned
+    /// command buffer programmed at probe, sets CRB_CTRL_START.GO,
+    /// polls until the start bit clears, reads the response from
+    /// the host-owned response buffer.
     ///
     /// TIS path: writes byte-by-byte into the data FIFO with
     /// EXPECT/VALID flow control, sets STS.GO, drains the FIFO
@@ -308,88 +423,89 @@ impl Tpm {
     }
 
     async fn submit_crb(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
-        if cmd.is_empty() || cmd.len() > self.cmd_size as usize {
+        let (Some(cmd_buf), Some(rsp_buf)) = (self.cmd_buf.as_ref(), self.rsp_buf.as_ref()) else {
+            // CRB device without its probe-time buffers: cannot
+            // happen through `probe`; fail rather than guess.
+            return Err(TpmError::BadResponse);
+        };
+        if cmd.is_empty() || cmd.len() > cmd_buf.len() {
             return Err(TpmError::BadResponse);
         }
+        let regs = self.regs();
         // 1. Set CMD_READY.
-        // SAFETY: identity-mapped MMIO window.
-        unsafe {
-            write32(self.base + REG_CRB_CTRL_REQ, CTRL_REQ_CMD_READY);
-        }
+        regs.wr32(REG_CRB_CTRL_REQ, CTRL_REQ_CMD_READY);
         // Wait until idle clears (TPM is in command-ready state).
         // 750 ms TIMEOUT_A. Timeout ignored, mirroring prior
         // behaviour — the GO write below will fail loudly if the
         // TPM never left idle.
         let _ = poll_yielding_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { read32(self.base + REG_CRB_CTRL_STS) } & CTRL_STS_TPM_IDLE == 0,
+            || regs.rd32(REG_CRB_CTRL_STS) & CTRL_STS_TPM_IDLE == 0,
             narf_time::Deadline::after_ms(750),
         )
         .await;
-        // 2. Write command into the command buffer.
-        // SAFETY: command buffer was published by firmware/ACPI and
-        // mapped at construction.
+        // 2. Write command into the host-owned command buffer.
+        // SAFETY: `cmd_buf` is a coherent DMA buffer of
+        // `cmd_buf.len()` bytes owned by this device; `cmd.len()`
+        // was bounded by it above.
         unsafe {
+            let dst = cmd_buf.cpu_mut_ptr::<u8>();
             for (i, b) in cmd.iter().enumerate() {
-                core::ptr::write_volatile((self.cmd_va + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(dst.add(i), *b);
             }
         }
         // 3. Kick CRB_CTRL_START.GO.
-        // SAFETY: same.
-        unsafe {
-            write32(self.base + REG_CRB_CTRL_START, CTRL_START_GO);
-        }
+        regs.wr32(REG_CRB_CTRL_START, CTRL_START_GO);
         // 4. Poll for start bit to self-clear (cmd complete).
         // 5 s wall-clock budget — TIMEOUT_C / TIMEOUT_D worst
         // cases (e.g. RSA keygen). Yields to the executor between
         // MMIO reads so peer tasks make progress during the wait.
         let done = poll_yielding_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { read32(self.base + REG_CRB_CTRL_START) } & CTRL_START_GO == 0,
+            || regs.rd32(REG_CRB_CTRL_START) & CTRL_START_GO == 0,
             narf_time::Deadline::after_ms(5_000),
         )
         .await;
         if !done {
+            // Cancel the wedged command before reporting, mirroring
+            // `drivers/tpm/src/crb.rs::run_command`.
+            regs.wr32(REG_CRB_CTRL_CANCEL, 1);
             return Err(TpmError::BusyTimeout);
         }
-        // 5. Read response. The size lives in bytes [2..6] of the
-        //    response header (TPM2 §5.6 paragraphSize).
+        if regs.rd32(REG_CRB_CTRL_STS) & CTRL_STS_ERROR != 0 {
+            return Err(TpmError::BadResponse);
+        }
+        // 5. Read response from the host-owned response buffer. The
+        //    size lives in bytes [2..6] of the response header
+        //    (TPM2 §5.6 paragraphSize).
         let mut header = [0u8; 10];
-        // SAFETY: rsp_va is the mapped CRB response buffer
-        // published by firmware (REG_CRB_RSP_LO/HI), identity-mapped at boot,
-        // and rsp_size >= 10 was checked when the buffer was set up, so
-        // rsp_va..rsp_va+10 are valid readable MMIO/DMA bytes.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
+        // SAFETY: `rsp_buf` is a coherent DMA buffer owned by this
+        // device, at least 10 bytes by construction (4096).
         unsafe {
+            let src = rsp_buf.cpu_ptr::<u8>();
             for (i, byte) in header.iter_mut().enumerate() {
-                *byte = core::ptr::read_volatile((self.rsp_va + i as u64) as *const u8);
+                *byte = core::ptr::read_volatile(src.add(i));
             }
         }
         let resp_size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
-        if resp_size < 10 || resp_size > self.rsp_size {
+        if resp_size < 10 || resp_size as usize > rsp_buf.len() {
             return Err(TpmError::BadResponse);
         }
         let mut out = alloc::vec![0u8; resp_size as usize];
         for (i, byte) in out.iter_mut().enumerate() {
-            // SAFETY: resp_size <= self.rsp_size was checked above, so every
-            // i in 0..resp_size addresses a byte inside the firmware-published
-            // CRB response buffer mapped at rsp_va.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            *byte = unsafe { core::ptr::read_volatile((self.rsp_va + i as u64) as *const u8) };
+            // SAFETY: `resp_size <= rsp_buf.len()` was checked
+            // above, so every `i` addresses a byte inside the
+            // host-owned response buffer.
+            *byte = unsafe { core::ptr::read_volatile(rsp_buf.cpu_ptr::<u8>().add(i)) };
         }
         Ok(out)
     }
 
     async fn submit_tis(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+        let regs = self.regs();
         // 1. Request locality 0.
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            write8(self.base + REG_TIS_ACCESS, TIS_ACCESS_REQUEST_USE);
-        }
+        regs.wr8(REG_TIS_ACCESS, TIS_ACCESS_REQUEST_USE);
         // 750 ms TIMEOUT_A — locality acknowledgement.
         let _ = poll_yielding_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { read8(self.base + REG_TIS_ACCESS) } & TIS_ACCESS_ACTIVE != 0,
+            || regs.rd8(REG_TIS_ACCESS) & TIS_ACCESS_ACTIVE != 0,
             narf_time::Deadline::after_ms(750),
         )
         .await;
@@ -398,27 +514,19 @@ impl Tpm {
             // Wait for STS.EXPECT before each byte. 750 ms
             // TIMEOUT_A — typical sub-microsecond on real TPMs.
             let _ = poll_yielding_until(
-                // SAFETY: identity-mapped MMIO.
-                || unsafe { read8(self.base + REG_TIS_STS) } & TIS_STS_EXPECT != 0,
+                || regs.rd8(REG_TIS_STS) & TIS_STS_EXPECT != 0,
                 narf_time::Deadline::after_ms(750),
             )
             .await;
-            // SAFETY: same.
-            unsafe {
-                write8(self.base + REG_TIS_DATA_FIFO, *b);
-            }
+            regs.wr8(REG_TIS_DATA_FIFO, *b);
         }
         // 3. Issue STS.GO.
-        // SAFETY: same.
-        unsafe {
-            write8(self.base + REG_TIS_STS, TIS_STS_GO);
-        }
+        regs.wr8(REG_TIS_STS, TIS_STS_GO);
         // 4. Wait for STS.DATA_AVAIL. 5 s wall-clock budget —
         // TIMEOUT_C / TIMEOUT_D worst cases (RSA keygen etc.).
         let done = poll_yielding_until(
             || {
-                // SAFETY: identity-mapped MMIO.
-                let s = unsafe { read8(self.base + REG_TIS_STS) };
+                let s = regs.rd8(REG_TIS_STS);
                 s & (TIS_STS_VALID | TIS_STS_DATA_AVAIL) == (TIS_STS_VALID | TIS_STS_DATA_AVAIL)
             },
             narf_time::Deadline::after_ms(5_000),
@@ -430,13 +538,11 @@ impl Tpm {
         // 5. Drain FIFO until DATA_AVAIL clears.
         let mut out: Vec<u8> = Vec::new();
         for _ in 0..0x4000u32 {
-            // SAFETY: same.
-            let s = unsafe { read8(self.base + REG_TIS_STS) };
+            let s = regs.rd8(REG_TIS_STS);
             if s & TIS_STS_DATA_AVAIL == 0 {
                 break;
             }
-            // SAFETY: same.
-            let b = unsafe { read8(self.base + REG_TIS_DATA_FIFO) };
+            let b = regs.rd8(REG_TIS_DATA_FIFO);
             out.push(b);
             if out.len() > 0x1000 {
                 return Err(TpmError::BadResponse);
@@ -483,6 +589,7 @@ impl TpmDevice for Tpm {
             TpmError::LocalityTimeout => HighLevelTpmError::LocalityTimeout,
             TpmError::BusyTimeout => HighLevelTpmError::BusyTimeout,
             TpmError::NoCommandBuffer => HighLevelTpmError::NoCommandBuffer,
+            TpmError::BufferAlloc => HighLevelTpmError::HardwareError,
             TpmError::BadResponse => HighLevelTpmError::BadResponse,
         })
     }
@@ -560,8 +667,38 @@ pub fn validate_pcr_extend_response(resp: &[u8]) -> Result<(), HighLevelTpmError
 
 static TPM: IrqSafeSpinLock<Option<Arc<Tpm>>> = IrqSafeSpinLock::new(None);
 
-/// Best-effort initialisation against `TPM_BASE_LOCALITY_0`. Used
-/// from the Stage::Subsys initcall — silently no-ops on hosts
+/// Firmware discovery for the default probe: the TPM2 ACPI table's
+/// `control_address`, when the table publishes one we can drive.
+///
+/// Ensures the table is parsed first — `narf_acpi::parse_tpm2` has
+/// no boot caller, so this initcall drives it from the RSDP the
+/// boot-time SRAT parse cached (the parse is idempotent; a failure
+/// just leaves the fixed-window fallback in place).
+fn discovered_base() -> Option<u64> {
+    if narf_acpi::tpm2_info().is_none() {
+        if let Some(rsdp) = narf_acpi::cached_rsdp() {
+            // SAFETY: `rsdp` comes from narf_acpi's own boot-parse
+            // cache; parse_tpm2 walks the table chain through the
+            // kernel phys map and only stores the parsed fields.
+            let _ = unsafe { narf_acpi::parse_tpm2(rsdp) };
+        }
+    }
+    let info = narf_acpi::tpm2_info()?;
+    // Start methods publishing a memory-mapped control area at
+    // `control_address`: 2 (ACPI start method), 6 (memory-mapped),
+    // 7 (CRB), 8 (CRB with start method). At that address the
+    // device's own INTF_ID decides CRB vs TIS in `probe`. Method 0
+    // is NOT_ALLOWED; 11 (ARM SMC) and 15 (CRB with ARM FF-A) have
+    // no transport in-tree and are deliberately not probed as MMIO.
+    match info.start_method {
+        2 | 6 | 7 | 8 if info.control_area_addr != 0 => Some(info.control_area_addr),
+        _ => None,
+    }
+}
+
+/// Best-effort initialisation: probe the TPM2-table control area
+/// when firmware published one, else the fixed locality-0 window.
+/// Used from the Stage::Subsys initcall — silently no-ops on hosts
 /// without a TPM.
 ///
 /// On a successful probe the device is published through two handles
@@ -578,10 +715,11 @@ pub fn try_init_default() {
     if TPM.lock().is_some() {
         return;
     }
-    // SAFETY: boot-time exclusive access; the locality-0 window
-    // is identity-mapped on x86_64.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    if let Ok(dev) = unsafe { Tpm::probe(TPM_BASE_LOCALITY_0) } {
+    let base = discovered_base().unwrap_or(TPM_BASE_LOCALITY_0);
+    // SAFETY: boot-time exclusive access; `base` is either the
+    // firmware-published TPM control area or the architectural
+    // locality-0 window, and `probe` maps it before touching it.
+    if let Ok(dev) = unsafe { Tpm::probe(base) } {
         let dev = Arc::new(dev);
         narf_tpm::registry::register(dev.clone());
         *TPM.lock() = Some(dev);
@@ -608,100 +746,3 @@ pub fn with_tpm<R>(f: impl FnOnce(&Tpm) -> R) -> Option<R> {
 pub fn __reset_for_test() {
     *TPM.lock() = None;
 }
-
-// ── helpers ─────────────────────────────────────────────────────────
-
-/// ioremap'd base of the locality-0 register block, or 0 before the first
-/// access. The TPM sits at a fixed low MMIO address (0xFED4_0000) that used
-/// to be reachable through the kernel identity map; that map is being removed,
-/// so the block is mapped Device (uncached) on first touch and every accessor
-/// translates through it.
-#[cfg(target_arch = "x86_64")]
-static TPM_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// One locality is 4 KiB (PC Client PTP §5.2); we only ever use locality 0.
-#[cfg(target_arch = "x86_64")]
-const TPM_LOCALITY_LEN: u64 = 0x1000;
-
-/// Translate a TPM register's physical address to its mapped VA, mapping the
-/// block on first use. Returns `None` if the window cannot be mapped or the
-/// address falls outside locality 0 — callers then read all-ones / skip the
-/// write rather than touching a raw physical address.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn tpm_ptr(phys: u64) -> Option<*mut u8> {
-    use core::sync::atomic::Ordering;
-    let offset = phys.checked_sub(TPM_BASE_LOCALITY_0)?;
-    if offset >= TPM_LOCALITY_LEN {
-        return None;
-    }
-    let mut va = TPM_VA.load(Ordering::Acquire);
-    if va == 0 {
-        // SAFETY: the architectural TPM locality-0 window, owned by us.
-        let mapped = unsafe {
-            narf_memory::ioremap::ioremap(
-                TPM_BASE_LOCALITY_0,
-                TPM_LOCALITY_LEN,
-                narf_memory::ioremap::MmioAttrs::Device,
-            )
-        }
-        .ok()?;
-        // A racing mapper wins; ioremap caches by range so both see one window.
-        match TPM_VA.compare_exchange(0, mapped.virt, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => va = mapped.virt,
-            Err(existing) => va = existing,
-        }
-    }
-    Some((va + offset) as *mut u8)
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn read32(phys: u64) -> u32 {
-    match tpm_ptr(phys) {
-        // SAFETY: caller-asserted register, reached through the ioremap window.
-        Some(p) => unsafe { core::ptr::read_volatile(p as *const u32) },
-        None => u32::MAX,
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn write32(phys: u64, v: u32) {
-    if let Some(p) = tpm_ptr(phys) {
-        // SAFETY: as above.
-        unsafe {
-            core::ptr::write_volatile(p as *mut u32, v);
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn read8(phys: u64) -> u8 {
-    match tpm_ptr(phys) {
-        // SAFETY: as above.
-        Some(p) => unsafe { core::ptr::read_volatile(p) },
-        None => u8::MAX,
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn write8(phys: u64, v: u8) {
-    if let Some(p) = tpm_ptr(phys) {
-        // SAFETY: as above.
-        unsafe {
-            core::ptr::write_volatile(p, v);
-        }
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn read32(_phys: u64) -> u32 {
-    0
-}
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn write32(_phys: u64, _v: u32) {}
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn read8(_phys: u64) -> u8 {
-    0
-}
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn write8(_phys: u64, _v: u8) {}
