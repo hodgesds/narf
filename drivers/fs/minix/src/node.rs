@@ -275,13 +275,27 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
             if len == 0 {
                 self.volume.truncate_inode(&mut inode).await?;
             } else if (len as u32) <= inode.size {
-                // Shrink — free zones past the new end.
-                let zs = self.volume.sb.zone_size() as u64;
-                let _last_zone = (len.div_ceil(zs)) as u32;
-                // For simplicity, just shrink size without freeing
-                // intermediate zones (matches Linux's behaviour for
-                // non-aligned truncates which leaves the partial
-                // tail zone allocated).
+                // Shrink (#844) — release every zone past the new
+                // EOF and zero the partial tail zone, so a later
+                // regrow reads zeros instead of resurrecting the
+                // pre-shrink bytes the zones used to hold. The new
+                // size is committed by the `write_inode` below,
+                // last: on a shrink error, restore the cached inode
+                // to the pre-truncate copy (the unmap-failure path
+                // above does the same) and leave the on-disk inode
+                // claiming the old size with its zones still
+                // allocated — `truncate_shrink`'s phase order
+                // guarantees that state is consistent.
+                let mut working = inode;
+                if let Err(error) = self
+                    .volume
+                    .truncate_shrink(self.ino, &mut working, len)
+                    .await
+                {
+                    *self.inode.lock() = Some(inode);
+                    return Err(error);
+                }
+                inode = working;
                 inode.size = len as u32;
             } else {
                 // Grow — write zero-fill is implicit via map_block
