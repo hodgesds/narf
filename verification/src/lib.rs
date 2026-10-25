@@ -110,6 +110,25 @@ pub use narf_kernel_test::{tests, KernelTest, Summary, TestResult};
 /// others. Iteration order matches link order within each
 /// subsystem; subsystems themselves are emitted in first-seen order.
 pub fn run_all() -> Summary {
+    run_all_impl(&[])
+}
+
+/// Run every registered test EXCEPT those under the `excluded`
+/// subsystem prefixes (same prefix matching as the include filter —
+/// see [`subsystem_selected`]). Everything else about the run —
+/// grouping, the failure record, the post-test buddy check — is
+/// [`run_all`]'s, so an include run over a prefix and an exclude run
+/// over the same prefix partition the registry between them.
+///
+/// CI's primary kernel-test boot uses this with `drivers/gpu`
+/// excluded: the GPU fixtures run in a dedicated job, so an
+/// intermittent GPU-fixture hang (issue #879) cannot stall the whole
+/// suite behind it.
+pub fn run_all_except(excluded: &[&str]) -> Summary {
+    run_all_impl(excluded)
+}
+
+fn run_all_impl(excluded: &[&str]) -> Summary {
     let _ = writeln!(Writer);
     let _ = writeln!(Writer, "── kernel_test harness ──────────────────────────");
     let ts = tests();
@@ -135,6 +154,11 @@ pub fn run_all() -> Summary {
     let mut failed_n: usize = 0;
 
     for t in ts {
+        // Excluded subsystems are skipped before any header/run logic,
+        // so an exclude run is `run_all` minus exactly the excluded set.
+        if subsystem_excluded(t.subsystem, excluded) {
+            continue;
+        }
         // Subsystem header — printed when we transition.
         if t.subsystem != current {
             let _ = writeln!(Writer, "── {} ─", t.subsystem);
@@ -275,6 +299,17 @@ pub fn run_all_and_exit() -> ! {
     unsafe { narf_arch::exit_kernel(code) }
 }
 
+/// Run every test except the excluded subsystems (see
+/// [`run_all_except`]) and immediately exit with the mapped code.
+pub fn run_all_except_and_exit(excluded: &[&str]) -> ! {
+    let code = match run_all_except(excluded) {
+        Summary::AllOk => 0,
+        Summary::SomeFailed => 1,
+    };
+    // SAFETY: this is the terminal action of the kernel-test boot.
+    unsafe { narf_arch::exit_kernel(code) }
+}
+
 /// Run one exact subsystem and immediately exit with the mapped status.
 pub fn run_subsystem_and_exit(wanted: &str) -> ! {
     let code = match run_subsystem(wanted) {
@@ -296,6 +331,15 @@ fn subsystem_selected(have: &str, want: &str) -> bool {
             && have.starts_with(want))
 }
 
+/// True if test subsystem `have` is excluded by the filter list
+/// `excluded`: any entry selecting it (see [`subsystem_selected`])
+/// excludes it. An include run and an exclude run over the same
+/// prefix therefore partition the registry exactly — every test is
+/// in precisely one of the two runs.
+fn subsystem_excluded(have: &str, excluded: &[&str]) -> bool {
+    excluded.iter().any(|w| subsystem_selected(have, w))
+}
+
 /// Run every test whose subsystem is selected (see [`subsystem_selected`])
 /// by ANY of the `wanted` filters. This is the change-based CI path: the
 /// `affected` command computes the affected subsystem set and CI passes it
@@ -304,13 +348,27 @@ fn subsystem_selected(have: &str, want: &str) -> bool {
 /// An empty `wanted` selects nothing; callers that want the whole suite
 /// call [`run_all`] instead.
 pub fn run_subsystems(wanted: &[&str]) -> Summary {
+    run_subsystems_impl(wanted, &[])
+}
+
+/// Like [`run_subsystems`], but a selected test is still skipped when
+/// its subsystem is excluded (see [`subsystem_excluded`]). CI composes
+/// the two filters: the affected-subsystem selection minus `drivers/gpu`,
+/// which runs in its own job.
+pub fn run_subsystems_except(wanted: &[&str], excluded: &[&str]) -> Summary {
+    run_subsystems_impl(wanted, excluded)
+}
+
+fn run_subsystems_impl(wanted: &[&str], excluded: &[&str]) -> Summary {
     let _ = writeln!(Writer);
     let _ = writeln!(Writer, "── kernel_test (filtered: {}) ──", wanted.len());
     let mut pass = 0usize;
     let mut fail = 0usize;
     let mut skip = 0usize;
     for t in tests() {
-        if !wanted.iter().any(|w| subsystem_selected(t.subsystem, w)) {
+        if !wanted.iter().any(|w| subsystem_selected(t.subsystem, w))
+            || subsystem_excluded(t.subsystem, excluded)
+        {
             continue;
         }
         // As in `run_all`: a test that hangs (an aarch64 stack overflow
@@ -347,6 +405,17 @@ pub fn run_subsystems(wanted: &[&str]) -> Summary {
 /// the mapped status.
 pub fn run_subsystems_and_exit(wanted: &[&str]) -> ! {
     let code = match run_subsystems(wanted) {
+        Summary::AllOk => 0,
+        Summary::SomeFailed => 1,
+    };
+    // SAFETY: this is the terminal action of the kernel-test boot.
+    unsafe { narf_arch::exit_kernel(code) }
+}
+
+/// Run the selected subsystems minus the excluded ones (see
+/// [`run_subsystems_except`]) and exit with the mapped status.
+pub fn run_subsystems_except_and_exit(wanted: &[&str], excluded: &[&str]) -> ! {
+    let code = match run_subsystems_except(wanted, excluded) {
         Summary::AllOk => 0,
         Summary::SomeFailed => 1,
     };
@@ -449,6 +518,17 @@ fn smoke_subsystem_prefix_selection() -> TestResult {
     let sel = |s: &str| wanted.iter().any(|w| subsystem_selected(s, w));
     if !sel("memory") || !sel("filesystem/page_cache") || sel("net/tcp") {
         return TestResult::Fail("multi-filter OR semantics wrong");
+    }
+    // Exclusion is the same predicate under `any`, so an include run
+    // and an exclude run over one prefix partition the registry.
+    if !subsystem_excluded("drivers/gpu/dcn401-otg", &["drivers/gpu"]) {
+        return TestResult::Fail("excluded parent must exclude child");
+    }
+    if subsystem_excluded("drivers/usb", &["drivers/gpu"]) {
+        return TestResult::Fail("exclusion must not leak to siblings");
+    }
+    if subsystem_excluded("drivers/gpu", &[]) {
+        return TestResult::Fail("empty exclusion list excludes nothing");
     }
     TestResult::Pass
 }

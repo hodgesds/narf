@@ -33,6 +33,7 @@ RUN_BOOT_SMOKE=true
 RUN_MUSL=true
 RUN_NET=true
 RUN_KERNEL_TEST=true
+RUN_GPU_TESTS=true
 RUN_FEATURE_MATRIX=true
 ARCHES='["x86_64","aarch64"]'
 SUBS=""
@@ -50,6 +51,7 @@ if [ "$AFFECTED" = 1 ]; then
   RUN_MUSL="$(get run_musl_demo)"
   RUN_NET="$(get run_net_smoke)"
   RUN_KERNEL_TEST="$(get run_kernel_test)"
+  RUN_GPU_TESTS="$(get run_gpu_tests)"
   RUN_FEATURE_MATRIX="$(get run_feature_matrix)"
   ARCHES="$(get clippy_arches)"
   SUBS="$(get subsystems)"
@@ -125,9 +127,9 @@ if should "$RUN_KERNEL_TEST"; then
   # behaviour is unconditional now, so there is no feature to add for it.
   # In --affected mode a non-empty subsystem filter runs only the relevant tests.
   if [ -n "$SUBS" ] && [ "$FULL" != "true" ]; then
-    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container --subsystem "$SUBS"
+    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container --subsystem "$SUBS" --exclude-subsystem drivers/gpu
   else
-    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container
+    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container --exclude-subsystem drivers/gpu
   fi
 
   # aarch64 too. CI's kernel-test job is a matrix over BOTH arches while this
@@ -143,9 +145,25 @@ if should "$RUN_KERNEL_TEST"; then
   if arch_on aarch64; then
     echo "Running kernel-test (aarch64)"
     if [ -n "$SUBS" ] && [ "$FULL" != "true" ]; then
-      XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=aarch64 --features cgroup-all,container --subsystem "$SUBS"
+      XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=aarch64 --features cgroup-all,container --subsystem "$SUBS" --exclude-subsystem drivers/gpu
     else
-      XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=aarch64 --features cgroup-all,container
+      XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=aarch64 --features cgroup-all,container --exclude-subsystem drivers/gpu
+    fi
+  fi
+
+  # GPU fixtures, mirroring CI's kernel-test-gpu job: the primary
+  # invocations above exclude `drivers/gpu` (the exclusion composes
+  # with the affected filter), and this shard runs exactly that group,
+  # so the union is the full suite and a GPU-fixture hang (issue #879)
+  # costs only this shard's smaller cap. `--kernel-tests-only` because
+  # the primary invocation already ran the production boot postflight.
+  if should "$RUN_GPU_TESTS"; then
+    echo "Running kernel-test GPU shard (x86_64)"
+    XTASK_QEMU_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container --subsystem drivers/gpu --kernel-tests-only
+
+    if arch_on aarch64; then
+      echo "Running kernel-test GPU shard (aarch64)"
+      XTASK_QEMU_TIMEOUT_SECS=1200 cargo xtask test --arch=aarch64 --features cgroup-all,container --subsystem drivers/gpu --kernel-tests-only
     fi
   fi
 fi

@@ -4665,18 +4665,30 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // `filesystem` selects `filesystem/page_cache` too). This is the
         // change-based CI path — `cargo xtask affected` computes the
         // affected set and CI threads it here. Absent/empty ⇒ run all.
+        //
+        // `test_subsystem_exclude=a,b,c` removes subsystems from whatever
+        // the selection (or the whole suite) would have run, with the
+        // same prefix matching. CI's primary kernel-test invocation
+        // always excludes `drivers/gpu`: the GPU fixtures run in a
+        // dedicated job instead, so an intermittent GPU-fixture hang
+        // (issue #879) cannot hold the whole suite hostage. Absent/empty
+        // ⇒ exclude nothing (the historical behaviour).
         let selected = narf_boot::args().value("test_subsystem");
-        match selected {
-            Some(list) if !list.is_empty() => {
-                let wanted: alloc::vec::Vec<&str> =
-                    list.split(',').filter(|s| !s.is_empty()).collect();
-                if wanted.is_empty() {
-                    narf_verification::run_all_and_exit()
-                } else {
-                    narf_verification::run_subsystems_and_exit(&wanted)
-                }
-            }
-            _ => narf_verification::run_all_and_exit(),
+        let wanted: alloc::vec::Vec<&str> = match selected {
+            Some(list) if !list.is_empty() => list.split(',').filter(|s| !s.is_empty()).collect(),
+            _ => alloc::vec::Vec::new(),
+        };
+        let excluded: alloc::vec::Vec<&str> = match narf_boot::args()
+            .value("test_subsystem_exclude")
+        {
+            Some(list) if !list.is_empty() => list.split(',').filter(|s| !s.is_empty()).collect(),
+            _ => alloc::vec::Vec::new(),
+        };
+        match (wanted.is_empty(), excluded.is_empty()) {
+            (false, false) => narf_verification::run_subsystems_except_and_exit(&wanted, &excluded),
+            (false, true) => narf_verification::run_subsystems_and_exit(&wanted),
+            (true, false) => narf_verification::run_all_except_and_exit(&excluded),
+            (true, true) => narf_verification::run_all_and_exit(),
         }
     }
 

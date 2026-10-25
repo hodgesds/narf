@@ -26,6 +26,12 @@ build orchestration (`build/`), release sign-off (`process/`).
   dependents. Equivalent prefixes compact large inventories without widening
   the selected set. Nightly/manual runs and conservative fallback cases retain
   the unfiltered suite; `ci-full` explicitly requests it for a PR.
+- `cargo xtask test --exclude-subsystem NAME` removes that subtree from
+  whatever the include filter (or the full suite) selects, with the same
+  prefix matching; the two filters compose. The primary CI invocation always
+  excludes `drivers/gpu`, which runs in a dedicated job gated on the affected
+  plan's `run_gpu_tests` output — the union of the two jobs is the full
+  suite, and a GPU-fixture hang (issue #879) costs only the GPU job's cap.
 - `cargo xtask test --kernel-tests-only` is restricted to secondary CI
   configuration shards after that architecture's primary invocation has run
   the production boot and host interoperability postflight. It does not
@@ -39,7 +45,8 @@ build orchestration (`build/`), release sign-off (`process/`).
 The affected-plan outputs and full-run fallback rules are specified in
 `build/specification/spec.md` §3. Secondary large-memory, xAPIC, virtio-mmio,
 and user-mode configurations run when their inputs are affected or the plan
-requires full coverage. The primary selected run still performs the normal
+requires full coverage; the GPU group runs as its own job under the same
+rule. The primary selected run still performs the normal
 production boot and host interoperability postflight.
 
 Wi-Fi conversation fixtures share the no_std `narf-wifi-fixtures` kit in

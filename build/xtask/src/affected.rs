@@ -58,6 +58,14 @@ const MUSL_CRATES: &[&str] = &[
 /// that `net-smoke` covers.
 const NET_CRATES: &[&str] = &["narf-net", "narf-ipc", "narf-io", "narf-drivers-net"];
 
+/// A change reaching any of these must run the dedicated GPU kernel-test
+/// job: the GPU driver crate owns every `drivers/gpu` test registration,
+/// and `narf-boot` parses the kernel cmdline keys (`test_subsystem=`,
+/// `test_subsystem_exclude=`) the GPU split threads. The GPU crate's hub
+/// dependencies (lib / arch / capabilities / kernel-test) force a full
+/// run anyway, so they need no entry here.
+const GPU_CRATES: &[&str] = &["narf-drivers-gpu", "narf-boot"];
+
 /// The final bootable binary. Its presence in the closure is the signal
 /// that a real kernel crate changed (as opposed to xtask/docs), which is
 /// what the boot-based gates (`boot-smoke`, `kernel-test`) key on.
@@ -166,6 +174,7 @@ pub struct Plan {
     pub run_xapic: bool,
     pub run_virtio_mmio: bool,
     pub run_user_mode: bool,
+    pub run_gpu_tests: bool,
     pub subsystems: BTreeSet<String>,
     pub run_clippy: bool,
     pub clippy_arches: Vec<String>,
@@ -191,6 +200,7 @@ impl Plan {
         push(self.run_uefi, "uefi-loader");
         push(self.run_boot_smoke, "boot-smoke");
         push(self.run_kernel_test, "kernel-test");
+        push(self.run_gpu_tests, "kernel-test-gpu");
         push(self.run_musl_demo, "musl-demo");
         push(self.run_net_smoke, "net-smoke");
         push(self.run_feature_matrix, "feature-matrix");
@@ -394,6 +404,15 @@ pub fn plan(
         || has_any(MUSL_CRATES)
         || seeds.contains(KERNEL_BIN)
         || seeds.contains(VERIFICATION);
+    // The GPU fixtures run in their own job (the primary kernel-test job
+    // excludes `drivers/gpu` unconditionally), so this gate decides
+    // whether they run at all for a change: GPU code or one of its
+    // non-hub inputs changed, a frame/verification change re-links the
+    // test harness (its registrations and cmdline dispatch included),
+    // or the run is full — infra and hub changes included, so a change
+    // to this split itself (ci.yml / build/xtask) exercises the GPU job.
+    p.run_gpu_tests =
+        p.full || has_any(GPU_CRATES) || seeds.contains(KERNEL_BIN) || seeds.contains(VERIFICATION);
 
     if p.full {
         p.crates = crates.iter().map(|c| c.name.clone()).collect();
@@ -440,6 +459,11 @@ pub fn plan(
                 "subsystem filter needs {} bytes > budget {} — running the full kernel-test suite",
                 filter_bytes, MAX_SUBSYSTEM_FILTER_BYTES
             ));
+            // The primary job runs the whole suite minus the GPU
+            // exclusion in this case, so the GPU job must run or the
+            // GPU group would silently drop out of this change's
+            // coverage entirely.
+            p.run_gpu_tests = true;
         } else {
             p.subsystems = collapsed;
         }
@@ -721,7 +745,7 @@ fn plan_value(p: &Plan) -> serde_json::Value {
         "run_net_smoke": p.run_net_smoke, "run_feature_matrix": p.run_feature_matrix,
         "run_uefi": p.run_uefi, "run_large_memory": p.run_large_memory,
         "run_xapic": p.run_xapic, "run_virtio_mmio": p.run_virtio_mmio,
-        "run_user_mode": p.run_user_mode,
+        "run_user_mode": p.run_user_mode, "run_gpu_tests": p.run_gpu_tests,
     })
 }
 
@@ -941,6 +965,65 @@ mod tests {
             p.clippy_arches,
             vec!["x86_64".to_string(), "aarch64".to_string()]
         );
+    }
+
+    #[test]
+    fn gpu_job_gate_follows_gpu_reachability() {
+        let cr = fixture();
+        // GPU code itself changed ⇒ the GPU job runs (the primary job
+        // excludes the group unconditionally, so this gate is the only
+        // thing that runs it).
+        let p = plan(
+            &["drivers/gpu/src/lib.rs".to_string()],
+            &cr,
+            &tags(),
+            "pull_request",
+            false,
+        );
+        assert!(p.run_gpu_tests, "gpu crate changed ⇒ GPU job");
+        // An unrelated change must not pay for the GPU job.
+        let p = plan(
+            &["filesystem/src/page_cache.rs".to_string()],
+            &cr,
+            &tags(),
+            "pull_request",
+            false,
+        );
+        assert!(!p.run_gpu_tests, "unrelated change skips the GPU job");
+        // Forced full (the ci-full label; infra changes land here too via
+        // `full`) always runs it, so a change to the split itself
+        // (ci.yml / build/xtask) exercises the GPU job.
+        let p = plan(
+            &["drivers/gpu/src/lib.rs".to_string()],
+            &cr,
+            &tags(),
+            "pull_request",
+            true,
+        );
+        assert!(p.run_gpu_tests, "forced full ⇒ GPU job");
+    }
+
+    #[test]
+    fn gpu_dependency_change_runs_gpu_job() {
+        // A change to a non-hub crate the GPU driver depends on puts
+        // narf-drivers-gpu in the reverse closure — the GPU fixtures can
+        // be affected even though no GPU file changed.
+        let mut crates = fixture();
+        crates.push(ci("narf-graphics", "graphics", &["narf-lib"]));
+        for c in &mut crates {
+            if c.name == "narf-drivers-gpu" {
+                c.deps.push("narf-graphics".to_string());
+            }
+        }
+        let p = plan(
+            &["graphics/src/lib.rs".to_string()],
+            &crates,
+            &tags(),
+            "pull_request",
+            false,
+        );
+        assert!(!p.full);
+        assert!(p.run_gpu_tests, "gpu depends on graphics ⇒ GPU job");
     }
 
     #[test]

@@ -60,6 +60,7 @@ jobs:
       run_user_mode: ${{ steps.affected.outputs.run_user_mode }}
       run_boot_smoke: ${{ steps.affected.outputs.run_boot_smoke }}
       run_kernel_test: ${{ steps.affected.outputs.run_kernel_test }}
+      run_gpu_tests: ${{ steps.affected.outputs.run_gpu_tests }}
       run_musl_demo: ${{ steps.affected.outputs.run_musl_demo }}
       run_net_smoke: ${{ steps.affected.outputs.run_net_smoke }}
       run_feature_matrix: ${{ steps.affected.outputs.run_feature_matrix }}
@@ -690,6 +691,13 @@ jobs:
       # still links the whole kernel; only the execution is filtered).
       # Empty (a full run) executes every subsystem.
       #
+      # `--exclude-subsystem drivers/gpu` is unconditional: the GPU
+      # fixtures run in the dedicated `kernel-test-gpu` job below, gated
+      # on `run_gpu_tests`. The exclusion composes with the affected
+      # filter (a GPU-scoped change runs its non-GPU subsystems here and
+      # the GPU group there), and the union of this job and the GPU job
+      # is the full suite — see the GPU job's comment.
+      #
       # The hardware tests that need capabilities GHA's old TCG qemu64
       # CPU lacks — x2APIC (the TLB-shootdown / IPI smokes) and the
       # cache-topology CPUID leaf — detect their absence and Skip.
@@ -707,9 +715,9 @@ jobs:
           SUBS="${{ needs.changes.outputs.subsystems }}"
           if [ -n "$SUBS" ]; then
             echo "kernel-test: affected-subsystem filter = $SUBS"
-            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container --subsystem "$SUBS"
+            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container --subsystem "$SUBS" --exclude-subsystem drivers/gpu
           else
-            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container
+            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container --exclude-subsystem drivers/gpu
           fi
 
       # QEMU's `virt` machine carries virtio-mmio transports in its DTB but
@@ -823,6 +831,78 @@ jobs:
         run: |
           cargo xtask test --arch=${{ matrix.arch }} --features user-mode-e2e \
             --subsystem verification,userspace --kernel-tests-only
+
+  # ── GPU kernel tests, split out of the primary kernel-test job ──────
+  # The `drivers/gpu` fixtures (DCN / VCN / navi register-model suites,
+  # ~2300 tests — about a sixth of the suite) intermittently hang under
+  # TCG until the QEMU cap — issue #879 — and in the primary job one
+  # hung fixture held the whole ~13000-test suite, and a 40-minute
+  # runner slot, hostage. The primary job above now always excludes
+  # `drivers/gpu`; this job runs exactly that group, so the union of
+  # the two jobs is the full suite and a GPU hang costs only this job's
+  # smaller cap. This is containment, not the #879 fix — the
+  # root-cause work continues on the issue.
+  #
+  # Gated on the affected plan's `run_gpu_tests`: the GPU crate or one
+  # of its non-hub inputs changed, the cmdline-parsing boot crate
+  # changed, a frame/verification change re-linked the test harness, or
+  # the run is full (infra / hub / nightly / manual). Infra forcing
+  # full is deliberate: `.github/` and `build/xtask/` are infra paths,
+  # so a change to this split itself exercises this job.
+  #
+  # `--kernel-tests-only`: the primary job already ran the production
+  # boot + postflight for this architecture.
+  kernel-test-gpu:
+    name: kernel-test (gpu) / ${{ matrix.arch }}
+    needs: changes
+    if: needs.changes.outputs.run_gpu_tests == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
+    # The GPU group is ~2300 tests; at the primary suite's per-test
+    # TCG rate that is on the order of 5-10 minutes, so 1200s of QEMU
+    # time carries real headroom while halving the worst-case cost of
+    # a #879 hang versus the primary job's 2400s cap.
+    # timeout-minutes is the second backstop (build + boot + slack).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
+
+      - name: Install host build deps
+        # Same set as the kernel-test job: the kernel-test image pulls
+        # the verification crate, whose build.rs compiles the musl-demo
+        # smokes (needs musl-tools + linux-libc-dev). QEMU + OVMF boot it.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-system-arm \
+            cpio \
+            mtools \
+            dosfstools \
+            e2fsprogs \
+            ovmf \
+            musl-tools \
+            linux-libc-dev
+
+      # Same QEMU instability workaround as the kernel-test job.
+      - name: Set up newer QEMU (past the 8.2 instability)
+        if: matrix.arch == 'x86_64'
+        uses: ./.github/actions/setup-qemu
+
+      - name: cargo xtask test — GPU fixtures only
+        env:
+          XTASK_QEMU_TIMEOUT_SECS: "1200"
+        run: |
+          cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container \
+            --subsystem drivers/gpu --kernel-tests-only
 
   feature-matrix:
     name: feature-check / ${{ matrix.features }}
