@@ -448,11 +448,12 @@ fn smoke_truncate_unmap_minix() -> TestResult {
         },
         // minix `read_file` zero-fills unmapped zones, so in-size
         // holes fault in as zero pages — the flag is the honest
-        // encoding of the read-path contract. NOTE (#742): the
-        // shrink branch of minix truncate frees nothing but the
-        // size, so the regrown range is backed by the *retained*
-        // pre-shrink zones, not holes — see the queue entry for the
-        // expected failure this produces.
+        // encoding of the read-path contract. The shrink branch of
+        // minix truncate frees every zone past the new EOF and
+        // zeroes the partial tail zone (#844, fixed by PR #880), so
+        // the regrown range is backed by holes, not the retained
+        // pre-shrink zones — this pin failed by design until that
+        // fix landed.
         true,
         run_scenario,
     )
