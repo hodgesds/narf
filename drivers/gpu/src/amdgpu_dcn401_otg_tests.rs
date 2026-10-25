@@ -386,7 +386,15 @@ pub(super) fn engine() -> Engine<Fake> {
             regs: BTreeMap::new(),
             writes: Vec::new(),
             stall: 0,
-            poll_limit: None,
+            // Every completion in this model lands on a read: side-effect
+            // completions on the first read after the enabling write, the
+            // delay counters (set to at most 3) by the fourth. Sixteen
+            // polls is over 3x the longest designed completion, and a wait
+            // the model never completes costs 17 polls instead of burning
+            // its whole wall-clock deadline under the spin executor
+            // (#879). Scenarios whose waits complete on the first read may
+            // still narrow this per fixture, as the clock-waits cases do.
+            poll_limit: Some(16),
             pause_wait: false,
             retiring: [false; 4],
             delay: [0; 4],
@@ -898,6 +906,8 @@ fn dcn401_otg_retirement_faults_and_cancel_never_release_resources() -> TestResu
     let mut e = engine();
     active(&mut e, 0);
     e.io.stall = 4;
+    // The engine default poll-caps the stalled retire wait (#879), so
+    // the first poll pends inside the wait by construction.
     {
         let mut f = core::pin::pin!(e.retire(0));
         assert!(f
@@ -1148,6 +1158,9 @@ fn dcn401_opp_partial_failures_and_cancellation_block_clock_reuse() -> TestResul
     assert_eq!(e.io.writes.len(), 1);
     let mut e = blank_engine(0);
     e.io.stall = 16;
+    // The engine default poll-caps the stalled OPP wait (#879), so the
+    // first poll pends inside the wait by construction rather than by
+    // wall-clock luck; the assertions below pin the preserved state.
     {
         let mut f = core::pin::pin!(e.prepare_blank(blank_request(0), clock(request(0))));
         assert!(f

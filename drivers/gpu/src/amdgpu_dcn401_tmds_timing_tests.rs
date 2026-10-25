@@ -28,6 +28,9 @@ impl Io for Model {
         }
         self.inner.read(at)
     }
+    fn wait_poll_limit(&self) -> Option<u32> {
+        self.inner.wait_poll_limit()
+    }
     fn write(&mut self, at: u64, value: u32) {
         if at == otg(self.pipe, 0x1b84) || at == odm(self.pipe, 0x1ad0) {
             assert_eq!(self.inner.regs[&otg(self.pipe, 0x1b43)] & 0x10001, 0);

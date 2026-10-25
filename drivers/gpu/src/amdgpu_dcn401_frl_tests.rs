@@ -50,6 +50,9 @@ impl Io for Model {
         }
         self.inner.read(at)
     }
+    fn wait_poll_limit(&self) -> Option<u32> {
+        self.inner.wait_poll_limit()
+    }
     fn write(&mut self, at: u64, value: u32) {
         // Never write timing, link, PHY, AFMT/VPG, clock routing or metadata.
         assert!(

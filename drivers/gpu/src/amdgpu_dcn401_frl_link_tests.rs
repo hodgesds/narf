@@ -50,6 +50,9 @@ impl Io for Model {
         }
         self.inner.read(at)
     }
+    fn wait_poll_limit(&self) -> Option<u32> {
+        self.inner.wait_poll_limit()
+    }
     fn write(&mut self, at: u64, value: u32) {
         assert!([0x965, 0x95b, 0x95c, 0x966].iter().any(|&r| at == frl(r)));
         if at == frl(0x95b) {

@@ -181,7 +181,18 @@ impl<I: Io> Engine<I> {
                 Ok(())
             })?;
             let deadline = narf_time::Deadline::after_ms(20);
+            #[cfg(feature = "kernel-test")]
+            let mut polls = self.io.wait_poll_limit();
             while !self.hpo_sat_empty(plan.result.link)? {
+                #[cfg(feature = "kernel-test")]
+                if let Some(left) = &mut polls {
+                    if *left == 0 {
+                        return Err(Error::Timeout(at(SAT_STATUS)));
+                    }
+                    *left -= 1;
+                    narf_scheduler::yield_now().await;
+                    continue;
+                }
                 if deadline.expired() {
                     return Err(Error::Timeout(at(SAT_STATUS)));
                 }

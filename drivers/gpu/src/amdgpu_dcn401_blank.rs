@@ -142,6 +142,8 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let p = blank.request.pipe;
         let deadline = narf_time::Deadline::after_us(timeout_us);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         let mut before = None;
         loop {
             // Recheck each witness together. A cleared pending bit without a
@@ -183,6 +185,15 @@ impl<I: Io> Engine<I> {
             #[cfg(feature = "kernel-test")]
             if self.io.pause_wait() {
                 core::future::pending::<()>().await;
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout(blocked.unwrap_or(l.otg(p, FRAME_COUNT))));
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
             if deadline.expired() {
                 return Err(Error::Timeout(blocked.unwrap_or(l.otg(p, FRAME_COUNT))));

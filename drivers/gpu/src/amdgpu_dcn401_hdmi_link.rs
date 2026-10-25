@@ -737,7 +737,18 @@ impl<I: Io> Engine<I> {
         let phy = path.transmitter;
         let lanes = phy_at(l, phy, 0x2943);
         let deadline = narf_time::Deadline::after_us(100_000);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
         while !lanes_active(self.read(lanes)?) {
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::Timeout(lanes));
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
+            }
             if deadline.expired() {
                 return Err(Error::Timeout(lanes));
             }

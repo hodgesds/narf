@@ -53,6 +53,9 @@ impl Io for Model {
         }
         self.inner.read(addr)
     }
+    fn wait_poll_limit(&self) -> Option<u32> {
+        self.inner.wait_poll_limit()
+    }
     fn write(&mut self, addr: u64, value: u32) {
         if addr == at(self.link, 0x36b4) {
             assert!(!self.pending_sat);
