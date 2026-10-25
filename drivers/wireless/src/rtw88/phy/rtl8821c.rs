@@ -39,6 +39,19 @@ impl Info {
         })
     }
 }
+pub(super) fn bind_tables(hash: &mut narf_crypto::sha256::Sha256, info: Info) -> Result<(), Error> {
+    for kind in 0..5 {
+        let rows =
+            tables::select(info.cut, info.package, info.rfe, kind).ok_or(Error::Unsupported)?;
+        hash.update(&[kind as u8]);
+        hash.update(&(rows.len() as u32).to_le_bytes());
+        for (address, value) in rows {
+            hash.update(&address.to_le_bytes());
+            hash.update(&value.to_le_bytes());
+        }
+    }
+    Ok(())
+}
 fn update(io: &mut impl Io, reg: u16, clear: u32, set: u32) -> Result<(), Error> {
     let value = io.read32(reg)?;
     if value == u32::MAX {

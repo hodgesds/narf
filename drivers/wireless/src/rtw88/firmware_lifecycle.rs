@@ -13,6 +13,8 @@ pub enum Stage {
     MacPrepared,
     PreparingPhy,
     PhyTablesPrepared,
+    PreparingCalibration8821c,
+    Calibration8821cPrepared,
     Calibrating,
     Calibrated,
     StationPreparation,
@@ -52,6 +54,7 @@ impl<I: Io> Drop for Attempt<'_, I> {
             Stage::Ready
                 | Stage::MacPrepared
                 | Stage::PhyTablesPrepared
+                | Stage::Calibration8821cPrepared
                 | Stage::Calibrated
                 | Stage::StationReady
                 | Stage::Failed
@@ -260,6 +263,78 @@ impl<I: Io> Lifecycle<I> {
         let mut status = self.status.lock();
         match result {
             Ok(_) => status.stage = Stage::PhyTablesPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn calibration_request8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::calibration8821c::Request, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(Error::State)?
+            .calibration_request8821c(factory)
+    }
+    pub(super) async fn calibration_info8821c(&self) -> Option<super::radio8821c::Info> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .and_then(Owner::calibration_info8821c)
+    }
+    pub(super) async fn prepare_calibration8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::radio8821c::Info, Error> {
+        // Bootstrap may run only before admission. A live policy clear never
+        // reloads policy from inside an active command/register continuation.
+        narf_wireless::reg::db::ensure_domain()
+            .map_err(|_| Error::Calibration8821c(super::calibration8821c::Error::Policy))?;
+        self.prepare_calibration8821c_with(
+            factory,
+            super::calibration8821c::Source::Registered,
+            || {
+                narf_wireless::reg::db::get_domain().ok_or(Error::Calibration8821c(
+                    super::calibration8821c::Error::Policy,
+                ))
+            },
+        )
+        .await
+    }
+    pub(super) async fn prepare_calibration8821c_with<F>(
+        &self,
+        factory: &super::efuse::Factory8821c,
+        source: super::calibration8821c::Source,
+        policy: F,
+    ) -> Result<super::radio8821c::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        // Exact immutable data, signer/current source and policy all qualify
+        // before the stage changes or any register/command can be published.
+        let envelope = owner.preflight_calibration8821c(factory, source, &policy()?)?;
+        self.status.lock().stage = Stage::PreparingCalibration8821c;
+        let _attempt = Attempt(self);
+        let result = owner
+            .prepare_calibration8821c(factory, envelope, policy)
+            .await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Calibration8821cPrepared,
             Err(error) => {
                 *status = Status {
                     stage: Stage::Failed,

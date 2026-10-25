@@ -69,6 +69,15 @@ struct Model {
     pending_rf: bool,
     revoke_on_rf: bool,
     rf_written: bool,
+    commands: Vec<[u8; 32]>,
+    command_ring: crate::rtw88::command::Ring,
+    command_index: u32,
+    command_stall: bool,
+    iqk_armed: bool,
+    iqk_complete: bool,
+    iqk_reads: usize,
+    hold_delay: Option<u64>,
+    ignore_rf: bool,
     ring: Arc<IrqSafeSpinLock<BlockState>>,
     frame: Arc<IrqSafeSpinLock<BlockState>>,
 }
@@ -115,8 +124,14 @@ unsafe impl Registers for Port {
     }
     fn read32(&mut self, reg: u16) -> Result<u32, Error> {
         self.access()?;
-        let model = self.0.lock();
+        let mut model = self.0.lock();
         let at = usize::from(reg);
+        if reg == 0x2820 && model.iqk_armed {
+            model.iqk_reads += 1;
+            if model.iqk_complete && model.iqk_reads >= 2 {
+                model.bytes[at..at + 4].copy_from_slice(&0xabcdeu32.to_le_bytes());
+            }
+        }
         let mut value = u32::from_le_bytes(model.bytes[at..at + 4].try_into().unwrap());
         if reg == 0x1208 {
             value &= !(1 << 31);
@@ -176,20 +191,31 @@ unsafe impl Registers for Port {
         model.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
         if reg == 0xc90 {
             model.rf_written = true;
+            if !model.ignore_rf {
+                let address = ((value >> 20) & 255) as usize;
+                let offset = 0x2800 + address * 4;
+                model.bytes[offset..offset + 4].copy_from_slice(&(value & 0xfffff).to_le_bytes());
+                if address == 8 && value & 0xfffff == 0 {
+                    model.iqk_armed = false;
+                }
+            }
             if model.revoke_on_rf {
                 model.fail = Some(model.calls);
             }
         }
         Ok(())
     }
-    async fn delay_us(&mut self, _: u64) {
-        let pending = {
+    async fn delay_us(&mut self, us: u64) {
+        core::future::poll_fn(|_| {
             let model = self.0.lock();
-            model.pending || model.pending_rf && model.rf_written
-        };
-        if pending {
-            core::future::pending::<()>().await;
-        }
+            if model.pending || model.pending_rf && model.rf_written || model.hold_delay == Some(us)
+            {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
     }
     async fn lte_backup(&mut self) -> Result<u32, Error> {
         self.access()?;
@@ -241,6 +267,69 @@ unsafe impl Registers for Port {
         model.continuation = 4;
         Ok(())
     }
+    fn begin_calibration8821c(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut model = self.0.lock();
+        if model.continuation != 4 || model.bytes[0x100] & 0xcf != 0 || model.bytes[0x522] != 255 {
+            return Err(Error::Prerequisite);
+        }
+        model.continuation = 5;
+        Ok(())
+    }
+    fn begin_commands(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut model = self.0.lock();
+        if model.continuation != 5 {
+            return Err(Error::State);
+        }
+        model.continuation = 6;
+        model.bytes[0x100] = 0x33;
+        Ok(())
+    }
+    fn submit_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
+        self.access()?;
+        let mut model = self.0.lock();
+        if model.continuation != 6 {
+            return Err(Error::State);
+        }
+        let index = model.command_index;
+        let (_, next) = model.command_ring.reserve(index)?;
+        model.commands.push(*packet);
+        model.command_index = (index & 0xffff0000) | u32::from(next);
+        Ok(())
+    }
+    fn poll_h2c(&mut self) -> Result<bool, Error> {
+        self.access()?;
+        let mut model = self.0.lock();
+        if !model.command_stall {
+            model.command_index = (model.command_index & 0xffff) * 0x10001;
+        }
+        let index = model.command_index;
+        let done = model.command_ring.poll(index)?;
+        if done && model.commands.len() == 3 {
+            model.iqk_armed = true;
+        }
+        Ok(done)
+    }
+    fn park_radio(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut model = self.0.lock();
+        if model.continuation != 6 || model.command_ring.pending() {
+            return Err(Error::State);
+        }
+        model.bytes[0x100] = 0;
+        model.continuation = 7;
+        Ok(())
+    }
+    fn finish_calibration8821c(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut model = self.0.lock();
+        if model.continuation != 7 || model.bytes[0x100] & 0xcf != 0 || model.bytes[0x522] != 255 {
+            return Err(Error::Prerequisite);
+        }
+        model.continuation = 8;
+        Ok(())
+    }
 }
 fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
     let drops = Arc::new(AtomicUsize::new(0));
@@ -261,7 +350,7 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         published_at: None,
     }));
     let port = Port(Arc::new(IrqSafeSpinLock::new(Model {
-        bytes: vec![0; 0x2000],
+        bytes: vec![0; 0x2c00],
         calls: 0,
         fail: None,
         pending: false,
@@ -274,6 +363,15 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         pending_rf: false,
         revoke_on_rf: false,
         rf_written: false,
+        commands: Vec::new(),
+        command_ring: crate::rtw88::command::Ring::default(),
+        command_index: 0,
+        command_stall: false,
+        iqk_armed: false,
+        iqk_complete: true,
+        iqk_reads: 0,
+        hold_delay: None,
+        ignore_rf: false,
         ring: ring.clone(),
         frame: frame.clone(),
     })));
@@ -635,3 +733,6 @@ kernel_test_in!(
     "drivers/wireless/rtw88/rtl8821c",
     smoke_rtw8821ce_real_reserved_dma_owner_survives_phy_success_cancel_and_revocation
 );
+
+#[path = "reserved_calibration8821c_tests.rs"]
+mod calibration8821c_tests;

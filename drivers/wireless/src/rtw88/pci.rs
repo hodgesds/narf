@@ -68,6 +68,24 @@ impl Rtw88Device {
     pub fn rtl8821c_factory(&self) -> Option<&efuse::Factory8821c> {
         self.sibling.as_ref().map(|owner| owner.factory())
     }
+    /// Exact retained calibration-program metadata for external measurement/signing.
+    /// This request is not an RF/operating-power authorization.
+    pub async fn rtl8821c_calibration_request(
+        &self,
+    ) -> Result<super::C21CalibrationRequest, super::FirmwareError> {
+        self.sibling
+            .as_ref()
+            .ok_or(super::FirmwareError::Unsupported)?
+            .calibration_request()
+            .await
+    }
+    /// Historical IQK receipt; it does not grant packet/automatic-response power.
+    pub async fn rtl8821c_calibration_info(&self) -> Option<super::C21CalibrationInfo> {
+        match &self.sibling {
+            Some(owner) => owner.calibration_info().await,
+            None => None,
+        }
+    }
 }
 
 impl Interface for Rtw88Device {
@@ -326,7 +344,11 @@ fn probe_exclusive(
                 || {
                     with_controller(|dev| {
                         dev.sibling.as_ref().is_some_and(|owner| {
-                            owner.status().stage == super::firmware_lifecycle::Stage::Detected
+                            matches!(
+                                owner.status().stage,
+                                super::firmware_lifecycle::Stage::Detected
+                                    | super::firmware_lifecycle::Stage::PhyTablesPrepared
+                            )
                         })
                     })
                     .unwrap_or(false)
@@ -337,7 +359,7 @@ fn probe_exclusive(
             .await
             {
                 narf_console::klog!(
-                    "rtw88-8821ce retained firmware/MAC provisioning: {:?}\n",
+                    "rtw88-8821ce retained calibration provisioning: {:?}\n",
                     error
                 );
             }

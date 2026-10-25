@@ -51,6 +51,12 @@ pub(super) unsafe trait Registers: Send {
     fn finish_phy(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn begin_calibration8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_calibration8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
@@ -112,6 +118,9 @@ pub(super) unsafe trait Registers: Send {
 enum PageState {
     Unclaimed,
     Idle,
+    /// Successful firmware-to-MAC transfer: beacon ownership is complete,
+    /// but it must never be republished as another firmware page.
+    Continued,
     Terminal,
 }
 pub(super) struct Backend<R: Registers, M: Memory> {
@@ -303,7 +312,9 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         // Firmware pages may never overwrite the parked beacon owner during
         // a later MAC/packet continuation, including cancellation.
         self.state = PageState::Terminal;
-        self.io.begin_mac()
+        self.io.begin_mac()?;
+        self.state = PageState::Continued;
+        Ok(())
     }
     fn finish_mac(&mut self) -> Result<(), Error> {
         self.io.finish_mac()
@@ -314,6 +325,12 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn finish_phy(&mut self) -> Result<(), Error> {
         self.io.finish_phy()
     }
+    fn begin_calibration8821c(&mut self) -> Result<(), Error> {
+        self.io.begin_calibration8821c()
+    }
+    fn finish_calibration8821c(&mut self) -> Result<(), Error> {
+        self.io.finish_calibration8821c()
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
         self.io.begin_commands()
     }
@@ -323,10 +340,19 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn poll_h2c(&mut self) -> Result<bool, Error> {
         self.io.poll_h2c()
     }
+    fn park_radio(&mut self) -> Result<(), Error> {
+        // The calibration-only continuation retains the completed beacon
+        // mappings unchanged and never admits ordinary packet producers.
+        self.io.park_radio()
+    }
     fn finish_radio(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
-        if self.state != PageState::Idle || !self.completed {
+        if self.state != PageState::Continued || !self.completed {
             return Err(Error::State);
         }
+        // Poison before parking/disarming: any ambiguous native failure must
+        // not reopen this one-shot transfer. Continued is never a generic
+        // exception for a failed/uncertain firmware descriptor.
+        self.state = PageState::Terminal;
         self.io.park_radio()?;
         // Only after the exact successful BCN_VALID receipt and native BMEoff
         // parking may the original completed beacon descriptor be disarmed.

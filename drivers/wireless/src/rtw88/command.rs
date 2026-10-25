@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! RTL8822C packet H2C protocol, Linux rtw88/fw.c and fw.h.
+//! RTL8821C/RTL8822C packet H2C protocol, Linux rtw88/fw.c and fw.h.
 //! Host DMA retirement alone is never an applied-command acknowledgement.
 use super::{
     firmware_transport::{Error, Io},
@@ -84,6 +84,21 @@ pub(super) fn phydm(info: phy::Info, sequence: u16) -> Result<[u8; BYTES], Error
     // TX_STATUS(antenna_rx). Retain those exact firmware bit positions.
     packet[11] = 1 | 3 << 4;
     Ok(packet)
+}
+pub(super) fn phydm8821c(info: super::phy8821c::Info, sequence: u16) -> Result<[u8; BYTES], Error> {
+    if info.cut > 6 || !matches!(info.rfe, 0 | 2 | 4 | 6) {
+        return Err(Error::Unsupported);
+    }
+    let mut packet = header(17, 16, sequence);
+    packet[8] = info.rfe;
+    packet[9] = 4; // fw.h::FW_RF_1T1R; this differs from the enum's host RF_1T1R=0.
+    packet[10] = info.cut;
+    packet[11] = 0x11; // source physical TX-A/RX-A antenna fields.
+    Ok(packet)
+}
+pub(super) fn iqk8821c(sequence: u16) -> [u8; BYTES] {
+    // rtw8821c_do_iqk: clear=0 and segment=0 before association.
+    header(14, 9, sequence)
 }
 pub(super) fn iqk(sequence: u16) -> [u8; BYTES] {
     let mut packet = header(14, 9, sequence);

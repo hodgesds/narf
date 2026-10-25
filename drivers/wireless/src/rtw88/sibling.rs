@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Retained RTL8821CE firmware/inactive-MAC/PHY continuation. No RF/station entry.
+//! Retained RTL8821CE firmware/PHY and measured calibration-only continuation.
 use super::{
     efuse::Factory8821c,
     firmware_lifecycle::{Lifecycle, Stage, Status},
@@ -43,6 +43,14 @@ impl Sibling {
     pub(super) fn factory(&self) -> &Factory8821c {
         &self.factory
     }
+    pub(super) async fn calibration_request(
+        &self,
+    ) -> Result<super::calibration8821c::Request, Error> {
+        self.lifecycle.calibration_request8821c(&self.factory).await
+    }
+    pub(super) async fn calibration_info(&self) -> Option<super::radio8821c::Info> {
+        self.lifecycle.calibration_info8821c().await
+    }
     pub(super) async fn provision(&self) -> Result<(), Error> {
         let _admission = self.admission.lock().await;
         loop {
@@ -62,7 +70,12 @@ impl Sibling {
                 Stage::MacPrepared => {
                     self.lifecycle.prepare_phy8821c(&self.factory).await?;
                 }
-                Stage::PhyTablesPrepared => return Ok(()),
+                Stage::PhyTablesPrepared => {
+                    self.lifecycle
+                        .prepare_calibration8821c(&self.factory)
+                        .await?;
+                }
+                Stage::Calibration8821cPrepared => return Ok(()),
                 _ => return Err(Error::State),
             }
         }

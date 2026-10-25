@@ -19,6 +19,8 @@ enum State {
     Parked,
     MacPrepared,
     PhyTablesPrepared,
+    Calibrating8821c,
+    Calibration8821cPrepared,
     Commands,
     Calibrated,
     Packets,
@@ -237,6 +239,8 @@ impl Native {
                 | State::Active
                 | State::MacPrepared
                 | State::PhyTablesPrepared
+                | State::Calibrating8821c
+                | State::Calibration8821cPrepared
                 | State::Commands
                 | State::Calibrated
                 | State::Packets
@@ -518,8 +522,39 @@ unsafe impl Registers for Native {
         self.state = State::PhyTablesPrepared;
         Ok(())
     }
+    fn begin_calibration8821c(&mut self) -> Result<(), Error> {
+        if self.device.id.device != 0xc821 || self.state != State::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        if self.mmio.len < 0x2c00 {
+            return Err(Error::Unsupported);
+        }
+        self.state = State::Calibrating8821c;
+        if self.read8(0x100)? & 0xcf != 0
+            || self.read8(0x522)? != 255
+            || self.read8(0x303)? & 0xf7 != 0xf7
+        {
+            self.state = State::Terminal;
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
+    }
+    fn finish_calibration8821c(&mut self) -> Result<(), Error> {
+        if self.device.id.device != 0xc821
+            || self.state != State::Configuring
+            || self.command_ring.pending()
+        {
+            return Err(Error::State);
+        }
+        self.finish_mac()?;
+        self.state = State::Calibration8821cPrepared;
+        Ok(())
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
-        if self.state != State::PhyTablesPrepared || self.command_buffer.is_some() {
+        if !(self.state == State::PhyTablesPrepared
+            || self.device.id.device == 0xc821 && self.state == State::Calibrating8821c)
+            || self.command_buffer.is_some()
+        {
             return Err(Error::State);
         }
         let result = (|| {

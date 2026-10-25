@@ -13,6 +13,8 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
+#[path = "retained_backend_tests.rs"]
+mod retained_backend_tests;
 include!("golden.rs");
 pub(super) struct RadioIo {
     base: Model,
