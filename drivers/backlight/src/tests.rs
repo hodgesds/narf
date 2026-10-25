@@ -14,8 +14,9 @@ mod smokes {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::{AtomicU32, Ordering};
 
+    use narf_filesystem::sysfs::__reset_for_test as sysfs_reset;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use crate::acpi_video::{__reset_for_test as av_reset, __test_install};
@@ -23,9 +24,10 @@ mod smokes {
     use crate::brightness_keys::{handle_notify, NOTIFY_BRIGHTNESS_DOWN, NOTIFY_BRIGHTNESS_UP};
     use crate::kbd_backlight::dell_encode_kbd_level;
     use crate::leds::{led_device, register_led, unregister_led, LedDevice, SimpleLed, Trigger};
+    use crate::sysfs_bridge::populate_backlight_class;
     use crate::{
-        __reset_all_for_test, backlight_device, backlight_devices, unregister_backlight,
-        BacklightDevice, BacklightKind,
+        __reset_all_for_test, backlight_device, backlight_devices, panel_owner, register_backlight,
+        unregister_backlight, BacklightDevice, BacklightKind, Ownership,
     };
 
     // ── 1. BacklightDevice registry add / remove ───────────────────
@@ -522,4 +524,265 @@ mod smokes {
         "drivers/backlight",
         smoke_lenovo_kbd_backlight_acpi_operations
     );
+
+    // ── 17+. Single-owner arbitration fixtures ─────────────────────
+
+    /// Mock panel candidate whose "hardware" is a level cell plus a
+    /// dispatch counter, so a fixture can prove a deferred candidate
+    /// is never driven by any subsystem path.
+    #[derive(Debug)]
+    struct MockPanel {
+        name: &'static str,
+        kind: BacklightKind,
+        max: u32,
+        level: AtomicU32,
+        set_count: AtomicU32,
+    }
+
+    impl MockPanel {
+        fn new(name: &'static str, kind: BacklightKind, max: u32) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                kind,
+                max,
+                level: AtomicU32::new(0),
+                set_count: AtomicU32::new(0),
+            })
+        }
+        fn sets(&self) -> u32 {
+            self.set_count.load(Ordering::Acquire)
+        }
+        fn level(&self) -> u32 {
+            self.level.load(Ordering::Acquire)
+        }
+    }
+
+    impl BacklightDevice for MockPanel {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn max_brightness(&self) -> u32 {
+            self.max
+        }
+        fn current_brightness(&self) -> u32 {
+            self.level.load(Ordering::Acquire)
+        }
+        fn set_brightness(&self, level: u32) {
+            self.level.store(level.min(self.max), Ordering::Release);
+            self.set_count.fetch_add(1, Ordering::Release);
+        }
+        fn kind(&self) -> BacklightKind {
+            self.kind
+        }
+    }
+
+    // ── 17. Racing candidates elect exactly one owner ─────────────
+
+    fn smoke_arbitration_race_single_owner() -> TestResult {
+        __reset_all_for_test();
+
+        // Firmware candidate registers first (the initcall order on
+        // a real boot) and owns the panel while it is alone.
+        let fw = MockPanel::new("acpi_video0", BacklightKind::Firmware, 100);
+        if register_backlight(fw.clone() as Arc<dyn BacklightDevice>) != Ownership::Owner {
+            return TestResult::Fail("sole firmware candidate should own the panel");
+        }
+        // The native (Raw) candidate arrives later (PCI probe) and
+        // preempts: still exactly one owner, now the raw device.
+        let raw = MockPanel::new("amdgpu_bl0", BacklightKind::Raw, 100);
+        if register_backlight(raw.clone() as Arc<dyn BacklightDevice>) != Ownership::Owner {
+            return TestResult::Fail("raw candidate should preempt the firmware candidate");
+        }
+        match panel_owner() {
+            Some(o) if o.name() == "amdgpu_bl0" => {}
+            _ => return TestResult::Fail("panel owner is not the raw candidate"),
+        }
+        // A platform candidate defers to the raw owner.
+        let plat = MockPanel::new("platform_bl", BacklightKind::Platform, 100);
+        if register_backlight(plat as Arc<dyn BacklightDevice>) != Ownership::Deferred {
+            return TestResult::Fail("platform candidate should defer to the raw owner");
+        }
+        // A second raw candidate also defers: ties keep the
+        // incumbent, so ownership never flaps on probe order.
+        let raw2 = MockPanel::new("intel_backlight", BacklightKind::Raw, 100);
+        if register_backlight(raw2 as Arc<dyn BacklightDevice>) != Ownership::Deferred {
+            return TestResult::Fail("tied raw candidate should defer to the incumbent");
+        }
+        match panel_owner() {
+            Some(o) if o.name() == "amdgpu_bl0" => {}
+            _ => return TestResult::Fail("owner changed after tied registrations"),
+        }
+        // Deferral is not deletion: all four candidates stay
+        // registered for diagnostics and failover.
+        if backlight_devices().len() != 4 {
+            return TestResult::Fail("deferred candidates were dropped from the registry");
+        }
+
+        __reset_all_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/backlight", smoke_arbitration_race_single_owner);
+
+    // ── 18. The loser never touches hardware ──────────────────────
+
+    fn smoke_arbitration_loser_never_drives_hardware() -> TestResult {
+        __reset_all_for_test();
+        sysfs_reset();
+
+        let fw = MockPanel::new("acpi_video0", BacklightKind::Firmware, 100);
+        let raw = MockPanel::new("amdgpu_bl0", BacklightKind::Raw, 100);
+        register_backlight(fw.clone() as Arc<dyn BacklightDevice>);
+        register_backlight(raw.clone() as Arc<dyn BacklightDevice>);
+
+        // Dispatch through the owner handle: only the winner's
+        // hardware moves.
+        let owner = match panel_owner() {
+            Some(o) => o,
+            None => return TestResult::Fail("no panel owner elected"),
+        };
+        owner.set_brightness(40);
+        if raw.sets() != 1 || raw.level() != 40 {
+            return TestResult::Fail("owner did not receive the dispatch");
+        }
+        if fw.sets() != 0 {
+            return TestResult::Fail("deferred candidate was dispatched");
+        }
+
+        // Publication: only the owner gets a sysfs directory, so no
+        // userspace write can reach the loser either.
+        populate_backlight_class();
+        let class = narf_filesystem::sysfs::class_register("backlight");
+        if class.get_child("amdgpu_bl0").is_none() {
+            return TestResult::Fail("owner missing from /sys/class/backlight");
+        }
+        if class.get_child("acpi_video0").is_some() {
+            return TestResult::Fail("deferred candidate was published to sysfs");
+        }
+
+        __reset_all_for_test();
+        sysfs_reset();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_arbitration_loser_never_drives_hardware
+    );
+
+    // ── 19. Owner drives brightness end to end through sysfs ──────
+
+    fn smoke_arbitration_owner_end_to_end_sysfs() -> TestResult {
+        __reset_all_for_test();
+        sysfs_reset();
+
+        // The production AMD shape: one raw owner, registered alone
+        // through arbitration.
+        let raw = MockPanel::new("amdgpu_bl0", BacklightKind::Raw, 100);
+        if register_backlight(raw.clone() as Arc<dyn BacklightDevice>) != Ownership::Owner {
+            return TestResult::Fail("sole raw candidate should own the panel");
+        }
+        populate_backlight_class();
+
+        let class = narf_filesystem::sysfs::class_register("backlight");
+        let kobj = match class.get_child("amdgpu_bl0") {
+            Some(k) => k,
+            None => return TestResult::Fail("owner kobj missing"),
+        };
+        let max = kobj.attr_show("max_brightness").unwrap_or_default();
+        if max.trim() != "100" {
+            return TestResult::Fail("max_brightness did not read through the owner");
+        }
+        // A sysfs store reaches the owner's hardware cell…
+        if !matches!(kobj.attr_store("brightness", b"42\n"), Some(Ok(()))) {
+            return TestResult::Fail("brightness store failed");
+        }
+        if raw.level() != 42 {
+            return TestResult::Fail("sysfs store did not reach the owner's hardware");
+        }
+        // …and reads back through the same path.
+        let shown = kobj.attr_show("brightness").unwrap_or_default();
+        if shown.trim() != "42" {
+            return TestResult::Fail("brightness read-back wrong after store");
+        }
+
+        __reset_all_for_test();
+        sysfs_reset();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_arbitration_owner_end_to_end_sysfs
+    );
+
+    // ── 20. Owner unregister promotes the next candidate ──────────
+
+    fn smoke_arbitration_failover_on_owner_unregister() -> TestResult {
+        __reset_all_for_test();
+
+        let fw = MockPanel::new("acpi_video0", BacklightKind::Firmware, 100);
+        let raw = MockPanel::new("amdgpu_bl0", BacklightKind::Raw, 100);
+        register_backlight(fw.clone() as Arc<dyn BacklightDevice>);
+        register_backlight(raw.clone() as Arc<dyn BacklightDevice>);
+
+        // Owner goes away (GPU unbind): the firmware candidate is
+        // promoted and becomes dispatchable — the panel is never
+        // left ownerless while a candidate remains.
+        unregister_backlight("amdgpu_bl0");
+        match panel_owner() {
+            Some(o) if o.name() == "acpi_video0" => {}
+            _ => return TestResult::Fail("firmware candidate not promoted after owner left"),
+        }
+        let owner = panel_owner().unwrap();
+        owner.set_brightness(30);
+        if fw.sets() != 1 || fw.level() != 30 {
+            return TestResult::Fail("promoted candidate did not receive the dispatch");
+        }
+
+        unregister_backlight("acpi_video0");
+        if panel_owner().is_some() {
+            return TestResult::Fail("owner present after all candidates unregistered");
+        }
+
+        __reset_all_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_arbitration_failover_on_owner_unregister
+    );
+
+    // ── 21. Brightness keys step the owner, never a loser ─────────
+
+    fn smoke_arbitration_keys_step_owner_only() -> TestResult {
+        __reset_all_for_test();
+
+        let fw = MockPanel::new("acpi_video0", BacklightKind::Firmware, 100);
+        let raw = MockPanel::new("amdgpu_bl0", BacklightKind::Raw, 100);
+        register_backlight(fw.clone() as Arc<dyn BacklightDevice>);
+        register_backlight(raw.clone() as Arc<dyn BacklightDevice>);
+        raw.level.store(50, Ordering::Release);
+
+        // Notify 0x86 steps the owner (50 + tenth-of-range 10 = 60)…
+        if !handle_notify(NOTIFY_BRIGHTNESS_UP) {
+            return TestResult::Fail("brightness-up notify not consumed");
+        }
+        if raw.level() != 60 {
+            return TestResult::Fail("owner not stepped by the key handler");
+        }
+        // …and the deferred firmware candidate is untouched: the
+        // keys must not fight the owner through the _BCM path.
+        if fw.sets() != 0 || fw.level() != 0 {
+            return TestResult::Fail("key handler stepped a deferred candidate");
+        }
+        // Notify 0x87 steps the owner back down.
+        if !handle_notify(NOTIFY_BRIGHTNESS_DOWN) {
+            return TestResult::Fail("brightness-down notify not consumed");
+        }
+        if raw.level() != 50 {
+            return TestResult::Fail("owner not stepped down by the key handler");
+        }
+
+        __reset_all_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/backlight", smoke_arbitration_keys_step_owner_only);
 }

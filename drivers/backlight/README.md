@@ -17,6 +17,15 @@ embedded-controller register). That distinction matters because it tells
 userspace and the kernel which device to prefer when several claim the same
 panel. Registration is into a global, allocation-backed registry guarded by an
 IRQ-safe spinlock, with name-based lookup and idempotent replacement.
+Registration is also an arbitration: exactly one candidate owns the panel —
+the highest-priority kind wins (Raw over Platform over Firmware, ties keep the
+incumbent), a strictly higher-priority candidate preempts, and unregistering
+the owner promotes the next candidate. Only the owner is published to sysfs
+and stepped by the brightness keys; deferred candidates are never dispatched,
+because on real laptops the firmware path routes to the same PWM the native
+driver drives and two live owners would fight over one panel. `register_backlight`
+returns the registrant's standing (`Ownership::Owner` / `Ownership::Deferred`),
+and `panel_owner()` returns the current owner.
 
 The crate implements the real brightness control paths found on PC hardware.
 The ACPI video path drives the `_BCL`/`_BCM`/`_BQC` methods — the firmware
@@ -25,8 +34,8 @@ brightness-level table, set, and query. The AMD GPU path bridges to the
 Intel PWM frequency/duty registers. Keyboard backlight is driven through vendor
 WMI and registered as a PWM-backed LED in the LED class. The brightness-key
 handler subscribes to ACPI Notify events and, on the standard
-brightness-up/brightness-down notifications (0x86/0x87), steps the active ACPI
-video device and emits the corresponding brightness key event into the input
+brightness-up/brightness-down notifications (0x86/0x87), steps the arbitrated
+panel owner and emits the corresponding brightness key event into the input
 layer.
 
 Because the keyboard backlight is an LED, this crate builds on `drivers/leds`:

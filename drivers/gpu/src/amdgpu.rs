@@ -2470,6 +2470,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         amdgpu_suspend_handler,
         amdgpu_resume_handler,
     );
+    // Panel backlight: an APU drives the internal panel, so register
+    // the production backlight owner through the backlight
+    // subsystem's single-owner arbitration (Raw priority — an ACPI
+    // firmware candidate defers to it). Discrete cards have no
+    // internal panel and register nothing. This is bookkeeping
+    // only; `set_backlight` still refuses until a mode is set.
+    if is_apu {
+        crate::amdgpu_panel_backlight::register_panel_owner();
+    }
     Ok(())
 }
 
