@@ -1,0 +1,6 @@
+# cargo-fuzz outputs. The corpus is checked in (spec §7: corpus
+# stored in-tree under fuzz/corpus/); crash artifacts are not —
+# a crash becomes a regression unit test in the owning crate and,
+# once fixed, a corpus entry added deliberately.
+artifacts/
+target/
