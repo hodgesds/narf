@@ -147,11 +147,28 @@ fn mapped_frame(aspace: &AddressSpace, va: u64) -> Option<u64> {
     (phys != 0).then_some(phys)
 }
 
-/// Fault `va` in the way a user access would.
-fn fault(aspace: &AddressSpace, va: u64) -> Result<(), &'static str> {
+/// Fault `va` in the way a user access would. `step` names the
+/// scenario step in the failure message: two steps fault the same
+/// `va`, so a bare va cannot tell them apart.
+fn fault(aspace: &AddressSpace, va: u64, step: &'static str) -> Result<(), &'static str> {
     // SAFETY: `aspace` is a live user root and paging is enabled.
-    unsafe { aspace.demand_alloc_page(VirtAddr::new(va)) }
-        .map_err(|_| "a fault inside the file's EOF was refused")?;
+    unsafe { aspace.demand_alloc_page(VirtAddr::new(va)) }.map_err(|e| {
+        // Surface the error variant (#863 discriminator): the fixed
+        // string this used to return discarded it, and the variant is
+        // the one observation that names the production site when an
+        // in-EOF fault is refused. The `&'static str` error type
+        // leaves a leaked format as the only carrier; the path runs at
+        // most once before the scenario aborts, so the leak is bounded.
+        &*alloc::boxed::Box::leak(
+            alloc::format!(
+                "a fault inside the file's EOF was refused (step: {}, va {:#x}): {:?}",
+                step,
+                va,
+                e
+            )
+            .into_boxed_str(),
+        )
+    })?;
     if mapped_frame(aspace, va).is_none() {
         return Err("the fault left the page unbacked");
     }
@@ -186,7 +203,7 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
     let bytes = content(3 * PAGE as usize - 100);
     let base = map_shared(fx.fd, 3 * PAGE)?;
     for page in 0..3 {
-        fault(&fx.aspace, base + page * PAGE)?;
+        fault(&fx.aspace, base + page * PAGE, "seed fault-in")?;
     }
     if mapped_bytes(&fx.aspace, base, 32)? != bytes[..32] {
         return Err("the mapping does not show the file's first bytes");
@@ -239,7 +256,7 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
         // A filesystem whose fault path materialises holes serves the
         // truncated range as zeros through the original mapping, never
         // as the pre-truncate bytes.
-        fault(&fx.aspace, base + 2 * PAGE)?;
+        fault(&fx.aspace, base + 2 * PAGE, "post-regrow hole fault")?;
         let regrown = mapped_bytes(&fx.aspace, base + 2 * PAGE, PAGE as usize)?;
         if regrown.iter().any(|&b| b != 0) {
             return Err("re-extending the file resurrected stale bytes in the truncated range");
@@ -266,7 +283,7 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
         Some(n) if n == PAGE as i64 => {}
         _ => return Err("rewrite of the truncated range failed or was short"),
     }
-    fault(&fx.aspace, base + 2 * PAGE)?;
+    fault(&fx.aspace, base + 2 * PAGE, "post-pwrite re-fault")?;
     if mapped_bytes(&fx.aspace, base + 2 * PAGE, PAGE as usize)? != new_bytes {
         return Err("the rewritten range does not serve the new bytes");
     }
@@ -291,7 +308,7 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
         return Err("the second truncate destroyed the tail VMA");
     }
     if fx.hole_fault_zero {
-        fault(&fx.aspace, base + 2 * PAGE)?;
+        fault(&fx.aspace, base + 2 * PAGE, "second-regrow hole fault")?;
         let regrown = mapped_bytes(&fx.aspace, base + 2 * PAGE, PAGE as usize)?;
         if regrown.iter().any(|&b| b != 0) {
             return Err("the second regrow resurrected bytes the second shrink discarded");
@@ -320,7 +337,7 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
     if fixed != base + 2 * PAGE {
         return Err("MAP_FIXED did not land on the zapped window");
     }
-    fault(&fx.aspace, fixed)?;
+    fault(&fx.aspace, fixed, "MAP_FIXED fault-in")?;
     if mapped_bytes(&fx.aspace, fixed, PAGE as usize)? != fixed_bytes {
         return Err("the MAP_FIXED replacement does not serve the file's current bytes");
     }
