@@ -262,7 +262,7 @@ fn smoke_xhci_address_device_qemu() -> TestResult {
                 return TestResult::Fail("address_device failed");
             }
             addressed_slot = Some(slot);
-            match hid::try_bind_kbd_already_addressed(&c, slot, port, speed).await {
+            match hid::try_bind_kbd_already_addressed(&c, slot, port, speed, None).await {
                 Ok(()) | Err(hid::HidError::NotBootKeyboard) => TestResult::Pass,
                 Err(_) => TestResult::Fail("HID bind after fresh Address Device failed"),
             }
@@ -327,7 +327,7 @@ fn smoke_xhci_hid_kbd_first_report() -> TestResult {
         if c.address_device(slot, port, speed).await.is_err() {
             return TestResult::Fail("HID Address Device failed");
         }
-        match hid::try_bind_kbd_already_addressed(&c, slot, port, speed).await {
+        match hid::try_bind_kbd_already_addressed(&c, slot, port, speed, None).await {
             Ok(()) => TestResult::Pass,
             Err(hid::HidError::NotBootKeyboard) => TestResult::Skip("port not a HID Boot Keyboard"),
             Err(_) => TestResult::Fail("HID configuration/transport failed"),
@@ -612,6 +612,272 @@ fn smoke_msc_stale_adapter_generation_gate() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/msc", smoke_msc_stale_adapter_generation_gate);
+
+// ── Hub idle-suspend PM (issue #840) ─────────────────────────────
+//
+// The wedge: hub-attached devices were suspended 30 s after hub
+// bind because `last_activity_tick` initialised to 0 (the boot
+// epoch) and nothing ever stamped it — `mark_port_activity` and
+// `resume_port` had no callers — and `MscDevice` recorded no hub
+// context, so MSC could not resume its port even in principle.
+//
+// These fixtures drive the suspend *decision* directly (the
+// harness has no wall-clock control): the pure candidate
+// selection over hand-built registry snapshots, plus the
+// registry-level bind/activity stamping the fix adds. The
+// transfer-path half of the fix (MSC funnels resume before the
+// CBW and feed on completion) is exercised end-to-end only on
+// real hub hardware; QEMU's xtask topology attaches storage to
+// root ports, where hub_port is None and the hooks are no-ops.
+//
+// The fix-round fixtures at the end of this section pin the
+// HID half the same way: HID bindings record hub context,
+// `hid::hub_ports` collects it across the pumped classes
+// (deduplicated), and the wake step's pure selection
+// (`suspended_ports_among`) picks out only bound,
+// currently-suspended ports to resume before the pumps run.
+// The pumps' feed itself calls the same `mark_port_activity`
+// the bind-stamps fixture already proves pushes the deadline
+// out.
+
+fn fake_hub_binding(slot_id: u8, num_ports: u8) -> crate::attach::HubBinding {
+    crate::attach::HubBinding {
+        hub: crate::hub::UsbHub {
+            slot_id,
+            iface_num: 0,
+            descriptor: crate::hub::HubDescriptor {
+                num_ports,
+                characteristics: 0,
+                poweron_time_2ms: 0,
+                controller_current: 0,
+            },
+            speed: crate::xhci::PortSpeed::High,
+            device_protocol: 1,
+        },
+        route_string: 0,
+        tier: 0,
+        root_hub_port: 1,
+        bound_downstream: 0,
+        suspended_downstream: 0,
+        last_activity_tick: [0u64; 64],
+    }
+}
+
+/// Candidate-selection matrix for `idle_suspend_candidates`,
+/// including the exact pre-fix failure shape (bound port, tick
+/// still at its initial 0) and the post-fix shape (tick stamped
+/// at bind).
+fn smoke_hub_idle_suspend_decision() -> TestResult {
+    use crate::attach::{idle_suspend_candidates, IDLE_SUSPEND_NS};
+    let now: u64 = 100 * 1_000_000_000; // uptime 100 s
+    let mut h = fake_hub_binding(7, 4);
+    // Port 1: bound, tick never stamped — the pre-#840 initial
+    // state (tick = boot epoch). Expired: this is the wedge.
+    h.bound_downstream |= 1 << 1;
+    h.last_activity_tick[1] = 0;
+    // Port 2: bound, stamped at bind 29 s ago of a 30 s window.
+    h.bound_downstream |= 1 << 2;
+    h.last_activity_tick[2] = now - (IDLE_SUSPEND_NS - 1_000_000_000);
+    // Port 3: bound but already suspended → not re-selected.
+    h.bound_downstream |= 1 << 3;
+    h.suspended_downstream |= 1 << 3;
+    h.last_activity_tick[3] = 0;
+    // Port 4: never bound, ancient tick → ignored.
+    h.last_activity_tick[4] = 0;
+    // Port 5 (beyond num_ports = 4): bound bit set spuriously →
+    // ignored, the pass only walks real ports.
+    h.bound_downstream |= 1 << 5;
+    h.last_activity_tick[5] = 0;
+    let cands = idle_suspend_candidates(&alloc::vec![h], now);
+    if cands != alloc::vec![(0usize, 1u8)] {
+        return TestResult::Fail("expected only the unstamped bound port");
+    }
+    // Exactly at the threshold the port is expired (>=).
+    let mut h2 = fake_hub_binding(8, 1);
+    h2.bound_downstream |= 1 << 1;
+    h2.last_activity_tick[1] = now - IDLE_SUSPEND_NS;
+    if idle_suspend_candidates(&alloc::vec![h2], now) != alloc::vec![(0usize, 1u8)] {
+        return TestResult::Fail("threshold boundary not expired");
+    }
+    // The post-resume sentinel never expires.
+    let mut h3 = fake_hub_binding(9, 1);
+    h3.bound_downstream |= 1 << 1;
+    h3.last_activity_tick[1] = u64::MAX;
+    if !idle_suspend_candidates(&alloc::vec![h3], now).is_empty() {
+        return TestResult::Fail("MAX sentinel selected for suspend");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hub_pm", smoke_hub_idle_suspend_decision);
+
+/// Registry-level: `mark_ports_bound` sets the bound bit AND
+/// stamps the activity tick (the supervisor's bind path), the
+/// stamped port survives until its tick ages past the window,
+/// and a `mark_port_activity` feed — what the MSC BOT funnels do
+/// on each completed transaction — pushes the deadline out.
+/// Pushes one fake binding and truncates it back off afterwards
+/// (the registry is append-only; the tail is ours).
+fn smoke_hub_bind_stamps_activity() -> TestResult {
+    use crate::attach::{
+        hub_index_for_slot, idle_suspend_candidates, mark_port_activity, mark_ports_bound, HUBS,
+        IDLE_SUSPEND_NS,
+    };
+    let base = HUBS.lock().len();
+    HUBS.lock().push(fake_hub_binding(0xC0, 2));
+    let result = (|| {
+        let idx = match hub_index_for_slot(0xC0) {
+            Some(i) => i,
+            None => return TestResult::Fail("hub_index_for_slot missed pushed hub"),
+        };
+        if idx != base {
+            return TestResult::Fail("hub index != append position");
+        }
+        if hub_index_for_slot(0x3F).is_some() {
+            return TestResult::Fail("phantom hub index");
+        }
+        // Bind port 1 the way the supervisor now does.
+        mark_ports_bound(idx, 1 << 1);
+        let tick = {
+            let g = HUBS.lock();
+            if g[idx].bound_downstream & (1 << 1) == 0 {
+                return TestResult::Fail("mark_ports_bound didn't set bound bit");
+            }
+            g[idx].last_activity_tick[1]
+        };
+        if tick == 0 {
+            return TestResult::Fail("mark_ports_bound didn't stamp activity");
+        }
+        // Inside the window: not a candidate. Past it: candidate —
+        // the port still suspends when genuinely idle. (Contains-
+        // checks: the scan covers the whole live registry.)
+        {
+            let g = HUBS.lock();
+            if idle_suspend_candidates(&g[..], tick + IDLE_SUSPEND_NS - 1_000_000_000)
+                .contains(&(idx, 1u8))
+            {
+                return TestResult::Fail("freshly bound port selected for suspend");
+            }
+            if !idle_suspend_candidates(&g[..], tick + IDLE_SUSPEND_NS + 1_000_000_000)
+                .contains(&(idx, 1u8))
+            {
+                return TestResult::Fail("idle-expired bound port not selected");
+            }
+        }
+        // A completed transfer feeds activity: tick moves to the
+        // feed instant and the deadline moves with it.
+        mark_port_activity(idx, 1);
+        let tick2 = {
+            let g = HUBS.lock();
+            g[idx].last_activity_tick[1]
+        };
+        if tick2 < tick {
+            return TestResult::Fail("activity feed moved the tick backwards");
+        }
+        {
+            let g = HUBS.lock();
+            if idle_suspend_candidates(&g[..], tick2 + IDLE_SUSPEND_NS - 1_000_000_000)
+                .contains(&(idx, 1u8))
+            {
+                return TestResult::Fail("activity feed didn't push the deadline out");
+            }
+        }
+        TestResult::Pass
+    })();
+    HUBS.lock().truncate(base);
+    result
+}
+kernel_test_in!("drivers/usb/hub_pm", smoke_hub_bind_stamps_activity);
+
+/// Wake-step selection matrix for `suspended_ports_among`, the
+/// pure filter behind `hid::resume_suspended_hub_ports`: only
+/// bound + currently-suspended ports are selected; duplicate
+/// pairs (two classes bound on one port) collapse; unknown
+/// hubs and suspended-but-unbound bits are ignored.
+fn smoke_hub_hid_wake_selection() -> TestResult {
+    use crate::attach::suspended_ports_among;
+    let mut h0 = fake_hub_binding(7, 4);
+    // Port 1: bound + suspended → selected.
+    h0.bound_downstream |= 1 << 1;
+    h0.suspended_downstream |= 1 << 1;
+    // Port 2: bound, awake → not selected.
+    h0.bound_downstream |= 1 << 2;
+    // Port 3: suspended bit set but never bound → ignored.
+    h0.suspended_downstream |= 1 << 3;
+    let mut h1 = fake_hub_binding(8, 2);
+    // Hub 1 port 2: bound + suspended → selected.
+    h1.bound_downstream |= 1 << 2;
+    h1.suspended_downstream |= 1 << 2;
+    let hubs = alloc::vec![h0, h1];
+    let bindings = alloc::vec![
+        (0usize, 1u8),
+        (0usize, 2u8),
+        (0usize, 3u8),
+        (1usize, 2u8),
+        (0usize, 1u8), // duplicate — collapses
+        (9usize, 1u8), // unknown hub
+    ];
+    let got = suspended_ports_among(&hubs, &bindings);
+    if got != alloc::vec![(0usize, 1u8), (1usize, 2u8)] {
+        return TestResult::Fail("wake selection mismatch");
+    }
+    // Nothing suspended → nothing woken (the wake step must
+    // never touch an awake port).
+    let mut h2 = fake_hub_binding(9, 1);
+    h2.bound_downstream |= 1 << 1;
+    if !suspended_ports_among(&alloc::vec![h2], &alloc::vec![(0usize, 1u8)]).is_empty() {
+        return TestResult::Fail("awake bound port selected for wake");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hub_pm", smoke_hub_hid_wake_selection);
+
+/// Registry-level: `hid::hub_ports` collects the hub contexts
+/// the dispatcher recorded on live HID bindings across the
+/// pumped classes, sorted + deduplicated (a composite device
+/// binds two classes on one port), and omits root-attached
+/// bindings. Seeds the keyboard + consumer registries via
+/// their test hooks and resets them afterwards.
+fn smoke_hub_hid_context_collection() -> TestResult {
+    use crate::hid::{self, BootKeyboard, KbdReport};
+    hid::__reset_keyboards_for_test();
+    hid::consumer::__reset_consumers_for_test();
+    let result = (|| {
+        hid::__push_keyboard_for_test(BootKeyboard {
+            slot_id: 11,
+            interrupt_in_ep: 3,
+            interface_num: 0,
+            hub_port: Some((0, 1)),
+            last_report: KbdReport::default(),
+        });
+        // A second binding on the same port — must collapse.
+        hid::__push_keyboard_for_test(BootKeyboard {
+            slot_id: 12,
+            interrupt_in_ep: 3,
+            interface_num: 0,
+            hub_port: Some((0, 1)),
+            last_report: KbdReport::default(),
+        });
+        // Root-attached keyboard — omitted.
+        hid::__push_keyboard_for_test(BootKeyboard {
+            slot_id: 13,
+            interrupt_in_ep: 3,
+            interface_num: 0,
+            hub_port: None,
+            last_report: KbdReport::default(),
+        });
+        // A second class on a different hub's port.
+        hid::consumer::__push_consumer_for_test(14, Some((1, 2)));
+        let got = hid::hub_ports();
+        if got != alloc::vec![(0usize, 1u8), (1usize, 2u8)] {
+            return TestResult::Fail("hub_ports aggregation mismatch");
+        }
+        TestResult::Pass
+    })();
+    hid::__reset_keyboards_for_test();
+    hid::consumer::__reset_consumers_for_test();
+    result
+}
+kernel_test_in!("drivers/usb/hub_pm", smoke_hub_hid_context_collection);
 
 // ── MSC BBB protocol codec unit tests ──────────────────────────────
 
@@ -1142,6 +1408,7 @@ fn smoke_hid_diff_press_release_repeat() -> TestResult {
         slot_id: 1,
         interrupt_in_ep: 3,
         interface_num: 0,
+        hub_port: None,
         last_report: KbdReport::default(),
     };
 
@@ -1252,6 +1519,7 @@ fn smoke_hid_rollover_suppressed() -> TestResult {
         slot_id: 1,
         interrupt_in_ep: 3,
         interface_num: 0,
+        hub_port: None,
         last_report: KbdReport::default(),
     };
     // The HID error roll-over: all six positions = 0x01 with no
@@ -1280,6 +1548,7 @@ fn smoke_hid_modifier_only_transition() -> TestResult {
         slot_id: 1,
         interrupt_in_ep: 3,
         interface_num: 0,
+        hub_port: None,
         last_report: KbdReport::default(),
     };
     // Press LCtrl alone → one event with CTRL set.
@@ -1789,6 +2058,7 @@ fn smoke_hid_boot_mouse_translate_diff() -> TestResult {
         slot_id: 1,
         interrupt_in_ep: 3,
         interface_num: 0,
+        hub_port: None,
         last_buttons: 0,
         evdev_id,
         evdev_node,

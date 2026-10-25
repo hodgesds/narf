@@ -145,10 +145,13 @@ pub struct HubBinding {
     /// suspended (the device is bound but idle long enough to
     /// be suspended for power-saving).
     pub suspended_downstream: u64,
-    /// Per-port last-activity tick. The supervisor records the
-    /// current `narf_time` tick whenever a port's bound device
-    /// sees an interrupt-IN transfer; if (now - last) exceeds
-    /// the idle threshold, the supervisor suspends the port.
+    /// Per-port last-activity tick. Stamped by
+    /// [`mark_ports_bound`] when the port binds (bind is activity —
+    /// a port's idle window runs from bind, not from the boot epoch
+    /// the array initialises to), then refreshed by
+    /// [`mark_port_activity`] whenever a port's bound device
+    /// completes a transfer; if (now - last) exceeds the idle
+    /// threshold, the supervisor suspends the port.
     /// `u64::MAX` means "active right now, never let it be
     /// suspended on the next pass" (used as a sentinel after
     /// `port_resume`).
@@ -196,6 +199,102 @@ pub fn mark_port_activity(parent_hub_idx: usize, port: u8) {
     }
 }
 
+/// Record that the downstream ports in `bits` of hub
+/// `parent_hub_idx` have just been bound, stamping each newly
+/// bound port's last-activity tick to *now*. Called by the
+/// supervisor in place of a bare `bound_downstream |= bits`:
+/// without the stamp the tick keeps its initial value of 0 (the
+/// boot epoch), so a device bound after the machine has been up
+/// for [`IDLE_SUSPEND_NS`] would be suspended on the very next
+/// pass — it never got an idle window (#840).
+pub fn mark_ports_bound(parent_hub_idx: usize, bits: u64) {
+    let now = narf_time::monotonic_ns();
+    let mut g = HUBS.lock();
+    if let Some(h) = g.get_mut(parent_hub_idx) {
+        h.bound_downstream |= bits;
+        let mut rest = bits;
+        while rest != 0 {
+            let p = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            if let Some(slot) = h.last_activity_tick.get_mut(p & 63) {
+                *slot = now;
+            }
+        }
+    }
+}
+
+/// Find the [`HUBS`] index of the hub occupying xHCI slot
+/// `slot_id`. Class drivers key their hub-PM calls
+/// ([`mark_port_activity`], [`resume_port`]) by this index.
+///
+/// First-match is unambiguous: at most one entry can carry a
+/// given slot id at any time, even once slot ids recycle — the
+/// composition this branch must stay correct under once slot
+/// reclamation (queue 10) and hub detach (queue 11) land. The
+/// invariant rests on four pillars, each verifiable in-tree:
+///   1. Entries are created at exactly one site — the hub arm
+///      of `dispatch_after_address` — one push per successful
+///      hub bind of an addressed slot.
+///   2. A slot id returns to the allocatable pool only via
+///      `Xhci::reclaim_slot`, whose sole caller is
+///      `detach_slot`; and `detach_slot` removes *every* HUBS
+///      entry for the slot (`retain`) strictly before it
+///      disables and reclaims the slot. Attach-failure paths
+///      call `disable_slot` but never `reclaim_slot`, so a
+///      failed bind's id stays retired rather than recycling
+///      under a live entry.
+///   3. Wholesale controller recovery clears HUBS entirely
+///      (`detach_all_bindings`) in the same supervisor step
+///      that observes the recovery-epoch change, before any
+///      re-enumeration can push a fresh entry.
+///   4. Attach and detach both run in the single supervisor
+///      task, and this helper's only production caller is the
+///      supervisor's attach walk — no interleaving can observe
+///      a half-detached registry or bind a child under a hub
+///      whose entry is being removed.
+///      A stale live entry would have to survive its occupant's
+///      detach, which pillar 2 makes impossible: removal strictly
+///      precedes reuse.
+pub fn hub_index_for_slot(slot_id: u8) -> Option<usize> {
+    let g = HUBS.lock();
+    g.iter().position(|h| h.hub.slot_id == slot_id)
+}
+
+/// Pure per-port suspend decision behind [`idle_suspend_pass`]:
+/// a port is idle-expired when its last-activity tick is at least
+/// [`IDLE_SUSPEND_NS`] old. The `u64::MAX` sentinel (stamped by
+/// [`resume_port`]) never expires — the class driver that resumed
+/// the port replaces it with a real tick on its next completed
+/// transfer via [`mark_port_activity`].
+pub(crate) fn port_idle_expired(last_activity_tick: u64, now: u64) -> bool {
+    last_activity_tick != u64::MAX && now.saturating_sub(last_activity_tick) >= IDLE_SUSPEND_NS
+}
+
+/// Select the (hub index, port) pairs [`idle_suspend_pass`]
+/// should suspend from a registry snapshot: bound, not already
+/// suspended, and idle-expired. Split out from the pass itself so
+/// the selection policy is unit-testable without a controller.
+pub(crate) fn idle_suspend_candidates(hubs: &[HubBinding], now: u64) -> Vec<(usize, u8)> {
+    let mut out = Vec::new();
+    for (idx, h) in hubs.iter().enumerate() {
+        let num_ports = h.hub.descriptor.num_ports.min(64);
+        for p in 1..=num_ports {
+            let bit = 1u64 << (p as u32 & 63);
+            // Only consider bound + non-suspended ports.
+            if h.bound_downstream & bit == 0 {
+                continue;
+            }
+            if h.suspended_downstream & bit != 0 {
+                continue;
+            }
+            if port_idle_expired(h.last_activity_tick[p as usize & 63], now) {
+                out.push((idx, p));
+            }
+        }
+    }
+    out
+}
+
 /// Walk every bound hub + suspend any downstream port whose last
 /// activity is older than `IDLE_SUSPEND_NS`. Called once per
 /// supervisor cycle. Suspended ports stay in `bound_downstream`
@@ -208,28 +307,7 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
     // transfers (which can sleep) don't hold the registry lock.
     let work: alloc::vec::Vec<(usize, u8)> = {
         let g = HUBS.lock();
-        let mut out = alloc::vec::Vec::new();
-        for (idx, h) in g.iter().enumerate() {
-            let num_ports = h.hub.descriptor.num_ports.min(64);
-            for p in 1..=num_ports {
-                let bit = 1u64 << (p as u32 & 63);
-                // Only consider bound + non-suspended ports.
-                if h.bound_downstream & bit == 0 {
-                    continue;
-                }
-                if h.suspended_downstream & bit != 0 {
-                    continue;
-                }
-                let last = h.last_activity_tick[p as usize & 63];
-                if last == u64::MAX {
-                    continue;
-                }
-                if now.saturating_sub(last) >= IDLE_SUSPEND_NS {
-                    out.push((idx, p));
-                }
-            }
-        }
-        out
+        idle_suspend_candidates(&g[..], now)
     };
     let mut suspended = 0;
     for (idx, p) in &work {
@@ -284,6 +362,45 @@ pub async fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_idx: usize, po
     }
 }
 
+/// True iff `port` of hub `parent_hub_idx` is currently marked
+/// suspended in the registry — the bookkeeping bit
+/// [`idle_suspend_pass`] sets and [`resume_port`] clears. This
+/// is a registry read, not a hardware probe (the hardware-side
+/// equivalent is `UsbHub::port_is_suspended`).
+pub fn hub_port_is_suspended(parent_hub_idx: usize, port: u8) -> bool {
+    let g = HUBS.lock();
+    match g.get(parent_hub_idx) {
+        Some(h) => h.suspended_downstream & (1u64 << (port as u32 & 63)) != 0,
+        None => false,
+    }
+}
+
+/// Pure selection behind the supervisor's HID wake step: the
+/// subset of `ports` — hub contexts recorded by class-driver
+/// bindings — that names a bound, currently-suspended port.
+/// Split out from `hid::resume_suspended_hub_ports` so the
+/// selection policy is unit-testable without a controller,
+/// mirroring [`idle_suspend_candidates`]. Duplicate pairs in
+/// `ports` (a composite device can bind two classes on one
+/// port) collapse to one entry.
+pub(crate) fn suspended_ports_among(
+    hubs: &[HubBinding],
+    ports: &[(usize, u8)],
+) -> Vec<(usize, u8)> {
+    let mut out: Vec<(usize, u8)> = Vec::new();
+    for &(idx, port) in ports {
+        let bit = 1u64 << (port as u32 & 63);
+        let selected = match hubs.get(idx) {
+            Some(h) => h.bound_downstream & bit != 0 && h.suspended_downstream & bit != 0,
+            None => false,
+        };
+        if selected && !out.contains(&(idx, port)) {
+            out.push((idx, port));
+        }
+    }
+    out
+}
+
 /// Drive enumeration for a device on root-hub `port`. Returns the
 /// outcome so the supervisor can update its claimed-bitmask state.
 /// Slot is freed on failure (UnknownClass / class-driver error).
@@ -307,6 +424,7 @@ pub async fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
     }
     dispatch_after_address(
         xhci_dev, slot_id, port, speed, /*route*/ 0, /*root_port*/ port,
+        /*parent_hub_idx*/ None,
     )
     .await
 }
@@ -357,6 +475,7 @@ pub async fn try_attach_via_hub(
         speed,
         topology.route_string,
         parent_root_port,
+        hub_index_for_slot(parent.slot_id),
     )
     .await
 }
@@ -466,6 +585,11 @@ pub fn detach_all_bindings() {
 /// Free function so the dispatcher logic stays one place. `port` is
 /// the per-hub port number used purely for HID-side error logging
 /// dedup; `root_port` is the root-hub port that anchors the path.
+/// `parent_hub_idx` is the [`HUBS`] index of the parent hub when
+/// the device sits behind one (`None` on a root port); class
+/// drivers that participate in hub idle-suspend (MSC and the
+/// pumped HID classes) record it with their port so they can
+/// resume / feed their port.
 async fn dispatch_after_address(
     xhci_dev: &Xhci,
     slot_id: u8,
@@ -473,6 +597,7 @@ async fn dispatch_after_address(
     speed: PortSpeed,
     this_route: u32,
     root_port: u8,
+    parent_hub_idx: Option<usize>,
 ) -> AttachOutcome {
     // GET_DESCRIPTOR(DEVICE) — bDeviceClass at offset +4 (USB 2.0
     // §9.6.1). 0x09 = Hub. 0x00 = "look at interface class" — most
@@ -605,9 +730,15 @@ async fn dispatch_after_address(
     // CDC-NCM → btusb → WBDI fingerprint. Keyboard and mouse use
     // class-at-interface match; the rest fingerprint via the config
     // descriptor blob.
-    if hid::try_bind_kbd_already_addressed(xhci_dev, slot_id, port, speed)
-        .await
-        .is_ok()
+    if hid::try_bind_kbd_already_addressed(
+        xhci_dev,
+        slot_id,
+        port,
+        speed,
+        parent_hub_idx.map(|idx| (idx, port)),
+    )
+    .await
+    .is_ok()
     {
         return AttachOutcome::Keyboard;
     }
@@ -621,7 +752,13 @@ async fn dispatch_after_address(
         // shape matching a precision-touchpad device.
         if let Some((iface, hid_off, ep)) = hid::touchpad::find_hid_interface(&cfg_blob) {
             if hid::touchpad::try_bind_touchpad_already_addressed(
-                xhci_dev, slot_id, iface, hid_off, &cfg_blob, ep,
+                xhci_dev,
+                slot_id,
+                iface,
+                hid_off,
+                &cfg_blob,
+                ep,
+                parent_hub_idx.map(|idx| (idx, port)),
             )
             .await
             .is_ok()
@@ -634,9 +771,15 @@ async fn dispatch_after_address(
         // report-descriptor shape) and before Boot Mouse (protocol 2)
         // because consumer interfaces present protocol=0 and would
         // look like a non-boot HID device to the mouse scanner.
-        if hid::consumer::try_bind_consumer_already_addressed(xhci_dev, slot_id, 0, &cfg_blob)
-            .await
-            .is_ok()
+        if hid::consumer::try_bind_consumer_already_addressed(
+            xhci_dev,
+            slot_id,
+            0,
+            &cfg_blob,
+            parent_hub_idx.map(|idx| (idx, port)),
+        )
+        .await
+        .is_ok()
         {
             return AttachOutcome::ConsumerControl;
         }
@@ -645,9 +788,14 @@ async fn dispatch_after_address(
         // demoted to a boot mouse, but before CDC-ACM so a USB mouse
         // isn't misclassified as a serial dongle.
         if mouse::find_boot_mouse(&cfg_blob).is_ok()
-            && mouse::try_bind_mouse_already_addressed(xhci_dev, slot_id, speed)
-                .await
-                .is_ok()
+            && mouse::try_bind_mouse_already_addressed(
+                xhci_dev,
+                slot_id,
+                speed,
+                parent_hub_idx.map(|idx| (idx, port)),
+            )
+            .await
+            .is_ok()
         {
             return AttachOutcome::Mouse;
         }
@@ -666,8 +814,13 @@ async fn dispatch_after_address(
         // SubClass=0x06, Protocol=0x50. `find_bot_endpoints`
         // walks the config blob; if it doesn't find an MSC
         // interface it returns EndpointsMissing and we fall through.
-        if let Ok(_idx) =
-            crate::msc::try_bind_msc_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        if let Ok(_idx) = crate::msc::try_bind_msc_already_addressed(
+            xhci_dev,
+            slot_id,
+            &cfg_blob,
+            parent_hub_idx.map(|idx| (idx, port)),
+        )
+        .await
         {
             return AttachOutcome::MassStorage;
         }

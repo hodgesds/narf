@@ -914,6 +914,7 @@ fn smoke_e2e_mouse_boot_report_to_router() -> TestResult {
         slot_id: 0,
         interrupt_in_ep: 0,
         interface_num: 0,
+        hub_port: None,
         last_buttons: 0,
         evdev_id,
         evdev_node,
@@ -1064,6 +1065,7 @@ fn smoke_e2e_detach_removes_boot_keyboard_binding() -> TestResult {
             slot_id: 7,
             interrupt_in_ep: 3,
             interface_num: 0,
+            hub_port: None,
             last_report: super::KbdReport::default(),
         });
     }
