@@ -304,12 +304,15 @@ fn captured_data(session: &Session<Model>) -> Vec<(Vec<u8>, bool)> {
 // ── Native packet adapter for the shared reactive AP ────────────────
 
 fn push_beacon(session: &mut Session<Model>) {
-    let frame = session
+    let mut frame = session
         .backend
         .access_point
         .as_ref()
         .expect("fixture AP")
         .beacon();
+    if let Some(parameters) = &session.backend.wmm_reply {
+        frame.extend_from_slice(parameters);
+    }
     let mut packet = vec![0u8; 32 + frame.len()];
     let len = packet.len();
     packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
@@ -322,8 +325,11 @@ fn push_beacon(session: &mut Session<Model>) {
 
 // ── The composition ────────────────────────────────────────────────
 
-fn composition(wpa2: bool, aggregate_rx: bool) -> TestResult {
+fn composition(wpa2: bool, aggregate_rx: bool, wmm: bool) -> TestResult {
     let mut model = Model::new();
+    if wmm {
+        model.wmm_reply = Some(super::wmm_tests::PARAMETERS.to_vec());
+    }
     model.station_channel = CHANNEL;
     model.access_point = Some(
         if wpa2 {
@@ -362,7 +368,7 @@ fn composition(wpa2: bool, aggregate_rx: bool) -> TestResult {
         received: Vec::new(),
     });
 
-    let result = composition_body(&name, wpa2, aggregate_rx);
+    let result = composition_body(&name, wpa2, aggregate_rx, wmm);
 
     // Teardown in reverse order: session first (no drain/send can
     // fire against a half-removed interface), then carrier, then
@@ -383,7 +389,7 @@ fn composition(wpa2: bool, aggregate_rx: bool) -> TestResult {
     }
 }
 
-fn composition_body(name: &str, wpa2: bool, aggregate_rx: bool) -> TestResult {
+fn composition_body(name: &str, wpa2: bool, aggregate_rx: bool, wmm: bool) -> TestResult {
     // ── Before association: no carrier, and the controlled port
     // keeps DHCP off the air entirely (audit §4.3.1 S1: "no DHCP
     // before PORT_SECURE" — here, before association completes).
@@ -430,6 +436,7 @@ fn composition_body(name: &str, wpa2: bool, aggregate_rx: bool) -> TestResult {
     if aid != 42
         || !matches!(session.state, State::Associated { .. })
         || session.backend.access_point.as_ref().map(FakeAp::phase) != Some(ApPhase::Authorized)
+        || session.wmm.is_some() != wmm
     {
         put_session(session);
         return TestResult::Fail("associated state/aid mismatch");
@@ -473,6 +480,11 @@ fn composition_body(name: &str, wpa2: bool, aggregate_rx: bool) -> TestResult {
             return TestResult::Fail("AP did not observe the full DISCOVER/REQUEST exchange");
         }
         let session = harness.session.as_ref().expect("session parked");
+        if session.backend.data_qos.len() != session.backend.data_protection.len()
+            || session.backend.data_qos.iter().any(|qos| *qos != wmm)
+        {
+            return TestResult::Fail("DHCP link used unnegotiated QoS metadata");
+        }
         let dhcp_frames = captured_data(session)
             .into_iter()
             .filter(|(frame, _)| dhcp_message_type(frame).is_some())
@@ -551,7 +563,7 @@ fn rx_packets(name: &str) -> u64 {
 }
 
 fn mt76_wifi_open_association_dhcp_lease_composition() -> TestResult {
-    composition(false, false)
+    composition(false, false, false)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/dhcp",
@@ -559,7 +571,7 @@ kernel_test_in!(
 );
 
 fn mt76_wifi_wpa2_association_dhcp_lease_composition() -> TestResult {
-    composition(true, false)
+    composition(true, false, false)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/dhcp",
@@ -567,7 +579,7 @@ kernel_test_in!(
 );
 
 fn mt76_open_amsdu_receive_prerequisite_dhcp_lease_composition() -> TestResult {
-    composition(false, true)
+    composition(false, true, false)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/ht_receive",
@@ -575,9 +587,25 @@ kernel_test_in!(
 );
 
 fn mt76_wpa2_amsdu_receive_prerequisite_dhcp_lease_composition() -> TestResult {
-    composition(true, true)
+    composition(true, true, false)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/ht_receive",
     mt76_wpa2_amsdu_receive_prerequisite_dhcp_lease_composition
+);
+
+fn mt76_open_wmm_qos_dhcp_lease_composition() -> TestResult {
+    composition(false, false, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/wmm",
+    mt76_open_wmm_qos_dhcp_lease_composition
+);
+
+fn mt76_wpa2_wmm_qos_dhcp_lease_composition() -> TestResult {
+    composition(true, false, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/wmm",
+    mt76_wpa2_wmm_qos_dhcp_lease_composition
 );

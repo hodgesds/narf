@@ -65,6 +65,20 @@ pub(super) fn ethernet(
     wcid: u16,
     protected: bool,
 ) -> Result<[u8; HEADER], Error> {
+    ethernet_qos(frame, payload, token, wcid, protected, false)
+}
+
+/// The retained WMM profile maps every Ethernet frame to BE/TID 0.
+/// Linux mt76_connac2_mac_write_txwi_8023 supplies QoS subtype in both
+/// TXD2/TXD7, while mt76_connac_lmac_mapping(IEEE80211_AC_BE) is queue 1.
+pub(super) fn ethernet_qos(
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    wcid: u16,
+    protected: bool,
+    qos: bool,
+) -> Result<[u8; HEADER], Error> {
     if !(14..=1514).contains(&frame.len()) {
         return Err(Error::Bounds);
     }
@@ -83,14 +97,14 @@ pub(super) fn ethernet(
     }
     let is_eth_802_3 = true;
     let words = [
-        (frame.len() as u32 + 32), // CT, LMAC AC00 (0 << 25 = 0)
+        (frame.len() as u32 + 32) | (u32::from(qos) << 25),
         (1 << 31) | (u32::from(is_eth_802_3) << 15) | u32::from(wcid),
-        2 << 4, // STA receiver is the unicast AP even for an Ethernet multicast DA.
+        (2 << 4) | if qos { 8 } else { 0 }, // DATA / QoS DATA; AP receiver is unicast.
         (15 << 11) | (u32::from(protected) << 1), // Only an installed PTK authorizes encryption.
         0,
         0,
         0,
-        2 << 20,
+        (2 << 20) | if qos { 8 << 16 } else { 0 },
     ];
     let mut bytes = [0; HEADER];
     for (i, word) in words.iter().enumerate() {

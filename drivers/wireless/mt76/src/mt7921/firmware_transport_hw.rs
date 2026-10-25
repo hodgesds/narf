@@ -315,7 +315,7 @@ impl Hardware {
         dma_barrier();
         self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
     }
-    fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
+    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
         self.check()?;
         if !self.owner.published {
             return Err(Error::Busy);
@@ -331,7 +331,11 @@ impl Hardware {
         let payload = address
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
-        let header = packet_tx::ethernet(frame, payload, token, 1, protected)?;
+        let header = if qos {
+            packet_tx::ethernet_qos(frame, payload, token, 1, protected, true)?
+        } else {
+            packet_tx::ethernet(frame, payload, token, 1, protected)?
+        };
         // SAFETY: fully validated lengths; this slot has neither DMA nor
         // firmware ownership until the publication below.
         unsafe {
@@ -461,6 +465,13 @@ impl Backend for Hardware {
     }
     fn check(&self) -> Result<(), Error> {
         crate::mt7921::pci::invoke(&self.authority, || ()).map_err(|_| Error::Authority)
+    }
+    fn check_tx_permission(
+        &self,
+        permission: crate::mt7921::association::TxPermission,
+    ) -> Result<(), Error> {
+        self.check()?;
+        super::current_station_permission(permission, narf_wireless::reg::db::snapshot())
     }
     fn park_bus_master(&mut self) -> Result<(), Error> {
         if self.command(narf_bus::pci::cmd::BUS_MASTER, 0)? & narf_bus::pci::cmd::BUS_MASTER != 0 {
@@ -695,8 +706,8 @@ impl Backend for Hardware {
     ) -> Result<(), Error> {
         self.submit_management(frame, wcid, rate)
     }
-    fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
-        self.submit_data(frame, protected)
+    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
+        self.submit_data(frame, protected, qos)
     }
     fn management_complete(
         &mut self,
@@ -801,9 +812,12 @@ impl Transport {
         channels: &[u8],
         ssids: &[Vec<u8>],
     ) -> Result<super::ScanReport, Error> {
+        // Bootstrap only at this explicit admission boundary. The running
+        // scan must observe a cleared installation rather than reload it.
+        narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
         self.session
             .scan_active_with_policy(channels, ssids, || {
-                narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)
+                narf_wireless::reg::db::get_domain().ok_or(Error::Authority)
             })
             .await
     }

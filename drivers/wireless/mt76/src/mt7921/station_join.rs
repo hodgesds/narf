@@ -304,7 +304,7 @@ impl<B: Backend> Session<B> {
         }
         let record = crate::mt7921::association::key_record(19, gtk.key_id, Some(&gtk.key))
             .map_err(|_| Error::MalformedEvent)?;
-        self.exchange(Command::Unified { id: 3 }, &record)
+        self.exchange_station(Command::Unified { id: 3 }, &record)
             .await
             .map(|_| ())
     }
@@ -360,7 +360,8 @@ impl<B: Backend> Session<B> {
                 if let Some(tk) = tk {
                     let record = crate::mt7921::association::key_record(1, 0, Some(&tk))
                         .map_err(|_| Error::MalformedEvent)?;
-                    self.exchange(Command::Unified { id: 3 }, &record).await?;
+                    self.exchange_station(Command::Unified { id: 3 }, &record)
+                        .await?;
                     security.supplicant.pairwise_key_installed();
                     security.pairwise.fill(0);
                 }
@@ -369,11 +370,14 @@ impl<B: Backend> Session<B> {
                     security.commit_group(&gtk)?;
                 }
             }
+            self.check_station_tx()?;
             Ok(())
         }
         .await;
         self.boot_started = None;
         if let Err(error) = result {
+            self.wmm = None;
+            self.station_permission = None;
             self.state = State::Failed {
                 stage: Stage::EapolHandshake,
                 error,
@@ -432,6 +436,27 @@ impl<B: Backend> Session<B> {
             let Some(header) = frame.get(..24) else {
                 continue;
             };
+            if let Some(parameters) = self.wmm {
+                if native.ccmp.is_none()
+                    && matches!(header[0], 0x80 | 0x50)
+                    && header[1] & 0xc7 == 0
+                    && header[22] & 15 == 0
+                    && (header[4..10] == own || header[4..10] == [0xff; 6])
+                    && header[10..16] == peer
+                    && header[16..22] == peer
+                    && frame.get(36..).is_some_and(|ies| {
+                        crate::mt7921::association::wmm::Parameters::parse(ies)
+                            != Ok(Some(parameters))
+                    })
+                {
+                    // No asynchronous beacon-driven EDCA reconfiguration
+                    // owner exists yet. A changed/missing/malformed bound AP
+                    // parameter set closes the port until a fresh join.
+                    self.peer_lost = true;
+                    self.clear_aggregate_receive();
+                    return Err(Error::DeviceGone);
+                }
+            }
             if native.ccmp.is_none()
                 && matches!(header[0], 0xa0 | 0xc0)
                 && header[1] & 0xc7 == 0
@@ -535,7 +560,17 @@ impl<B: Backend> Session<B> {
         frame: &[u8],
         wcid: u16,
     ) -> Result<packet_tx::Completion, Error> {
-        self.backend.check()?;
+        self.check_station_tx()?;
+        self.transmit_management(frame, wcid).await
+    }
+
+    /// Only callers that just checked their station or one-shot closing
+    /// permission may publish. The closing caller never restores a host grant.
+    async fn transmit_management(
+        &mut self,
+        frame: &[u8],
+        wcid: u16,
+    ) -> Result<packet_tx::Completion, Error> {
         self.backend
             .submit_management(frame, wcid, self.management_rate)?;
         let completion = self
@@ -583,8 +618,9 @@ impl<B: Backend> Session<B> {
         if self.data_pending.is_some() {
             return Err(Error::Busy);
         }
-        self.backend.check()?;
-        self.backend.submit_data(frame, self.security.is_some())?;
+        self.check_station_tx()?;
+        self.backend
+            .submit_data(frame, self.security.is_some(), self.wmm.is_some())?;
         self.data_pending = Some(self.backend.now_ns());
         Ok(())
     }
@@ -667,6 +703,7 @@ impl<B: Backend> Session<B> {
             _ => Error::Bounds,
         })?;
         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
+        self.backend.check_tx_permission(permission)?;
 
         self.management_rate = plan.management_rate();
         // The currently admitted MLME/peer remains legacy. A prepared HT
@@ -676,12 +713,15 @@ impl<B: Backend> Session<B> {
         self.received_msdu.clear();
         self.boot_started = Some(self.backend.now_ns());
         self.security = None;
+        self.wmm = None;
+        self.station_permission = Some(permission);
         let result = async {
             if setup {
                 self.stage(Stage::ScanSetup);
                 self.scan_setup(info).await?;
             }
             self.stage(Stage::ChannelSwitch);
+            self.check_station_tx()?;
             // 1. Authorize transmission on the target channel in channel domain (NO_IR = 0):
             let mut domain = vec![0u8; 12 + 8];
             domain[..2].copy_from_slice(&permission.country);
@@ -708,6 +748,8 @@ impl<B: Backend> Session<B> {
                 &permission.rate_limits(),
             )
             .await?;
+            self.confirm_command_progress().await?;
+            self.check_station_tx()?;
 
             // 2. Switch channel:
             let mut switch = [0u8; cmd::CHANNEL_SWITCH_SIZE];
@@ -721,7 +763,7 @@ impl<B: Backend> Session<B> {
                 &mut switch,
             )
             .ok_or(Error::Bounds)?;
-            self.exchange(
+            self.exchange_station(
                 Command::Extended {
                     id: crate::mt7921::regs::MCU_EXT_CMD_CHANNEL_SWITCH,
                     query: false,
@@ -732,12 +774,12 @@ impl<B: Backend> Session<B> {
 
             // Publish BSSID and an unauthorized AP WCID before management
             // or EAPOL RX; a scan-only BSS has no peer address installed.
-            let bss_record =
-                crate::mt7921::association::bss_record(bss, false).map_err(|_| Error::Bounds)?;
-            self.exchange(Command::Unified { id: 2 }, &bss_record)
+            let bss_record = crate::mt7921::association::bss_record_qos(bss, false, false)
+                .map_err(|_| Error::Bounds)?;
+            self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
             let peer_record = plan.peer_record(0, false).map_err(|_| Error::Bounds)?;
-            self.exchange(Command::Unified { id: 3 }, &peer_record)
+            self.exchange_station(Command::Unified { id: 3 }, &peer_record)
                 .await?;
 
             // 3. Send Authentication Request:
@@ -790,16 +832,33 @@ impl<B: Backend> Session<B> {
                 .await?;
 
             self.management_rate = plan.management_rate();
+            if let Some(parameters) = plan.wmm() {
+                self.check_station_tx()?;
+                // Native SET_EDCA_PARMS has no firmware reply. The following
+                // matching PSE read bounds command progress before QoS WCID
+                // publication; it is not an invented EDCA acceptance event.
+                self.notify(
+                    Command::Ce {
+                        id: 0x1d,
+                        query: false,
+                    },
+                    &parameters.edca(),
+                )
+                .await?;
+                self.confirm_command_progress().await?;
+                self.check_station_tx()?;
+            }
             let bss_record =
-                crate::mt7921::association::bss_record(bss, true).map_err(|_| Error::Bounds)?;
-            self.exchange(Command::Unified { id: 2 }, &bss_record)
+                crate::mt7921::association::bss_record_qos(bss, true, plan.wmm().is_some())
+                    .map_err(|_| Error::Bounds)?;
+            self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
             let peer_record = plan.peer_record(aid, true).map_err(|_| Error::Bounds)?;
-            self.exchange(Command::Unified { id: 3 }, &peer_record)
+            self.exchange_station(Command::Unified { id: 3 }, &peer_record)
                 .await?;
             let group_record = crate::mt7921::association::group_record(bss.bssid, aid)
                 .map_err(|_| Error::Bounds)?;
-            self.exchange(Command::Unified { id: 3 }, &group_record)
+            self.exchange_station(Command::Unified { id: 3 }, &group_record)
                 .await?;
 
             // 7. Update STA_REC / perform WPA2 4-way handshake:
@@ -809,7 +868,8 @@ impl<B: Backend> Session<B> {
                     let sta_rec = plan
                         .peer_record(aid, true)
                         .map_err(|_| Error::MalformedEvent)?;
-                    self.exchange(Command::Unified { id: 3 }, &sta_rec).await?;
+                    self.exchange_station(Command::Unified { id: 3 }, &sta_rec)
+                        .await?;
                 }
                 Security::Wpa2Psk { psk } => {
                     self.stage(Stage::EapolHandshake);
@@ -859,7 +919,8 @@ impl<B: Backend> Session<B> {
                                 let record = plan
                                     .secure_peer_record(aid, m3.tk.as_deref().unwrap())
                                     .map_err(|_| Error::MalformedEvent)?;
-                                self.exchange(Command::Unified { id: 3 }, &record).await?;
+                                self.exchange_station(Command::Unified { id: 3 }, &record)
+                                    .await?;
                                 security.supplicant.pairwise_key_installed();
                                 let gtk = m3.gtk.as_ref().unwrap();
                                 self.install_group_key(gtk).await?;
@@ -877,6 +938,7 @@ impl<B: Backend> Session<B> {
                 }
             }
 
+            self.check_station_tx()?;
             Ok(aid)
         }
         .await;
@@ -886,6 +948,7 @@ impl<B: Backend> Session<B> {
                 self.boot_started = None;
                 self.peer_lost = false;
                 self.station_bss = Some(bss.clone());
+                self.wmm = plan.wmm();
                 self.state = State::Associated {
                     info,
                     peer: bss.bssid,
@@ -896,9 +959,11 @@ impl<B: Backend> Session<B> {
             }
             Err(error) => {
                 self.security = None;
+                self.wmm = None;
+                self.station_permission = None;
                 plan.cancel();
                 let stage = match self.state {
-                    State::Running(stage) => stage,
+                    State::Running(stage) | State::Failed { stage, .. } => stage,
                     _ => Stage::Associate,
                 };
                 self.state = State::Failed { stage, error };
@@ -915,6 +980,11 @@ impl<B: Backend> Session<B> {
         };
         self.boot_started = Some(self.backend.now_ns());
         let secure = self.security.take().is_some();
+        let had_wmm = self.wmm.take().is_some();
+        // Retire the host grant before the first wait. This local copy can
+        // authorize only the closing deauth; a dropped waiter cannot leave a
+        // reusable station permission in the retained running owner.
+        let closing_permission = self.station_permission.take();
         self.ht20_rx = None;
         self.received_msdu.clear();
         let peer_lost = self.peer_lost;
@@ -932,7 +1002,9 @@ impl<B: Backend> Session<B> {
                 deauth[10..16].copy_from_slice(&info.capabilities.mac);
                 deauth[16..22].copy_from_slice(&peer);
                 deauth[24..26].copy_from_slice(&3u16.to_le_bytes());
-                match self.send_management(&deauth, 1).await {
+                self.backend
+                    .check_tx_permission(closing_permission.ok_or(Error::Authority)?)?;
+                match self.transmit_management(&deauth, 1).await {
                     Ok(_) | Err(Error::Rejected(_)) => {}
                     Err(error) => return Err(error),
                 }
@@ -955,14 +1027,26 @@ impl<B: Backend> Session<B> {
                 self.exchange(Command::Unified { id: 3 }, &record).await?;
             }
             if let Some(bss) = &self.station_bss {
-                let record = crate::mt7921::association::bss_record(bss, false)
+                let record = crate::mt7921::association::bss_record_qos(bss, false, false)
                     .map_err(|_| Error::Bounds)?;
                 self.exchange(Command::Unified { id: 2 }, &record).await?;
+            }
+            if had_wmm {
+                self.notify(
+                    Command::Ce {
+                        id: 0x1d,
+                        query: false,
+                    },
+                    &crate::mt7921::association::wmm::legacy_edca(),
+                )
+                .await?;
+                self.confirm_command_progress().await?;
             }
             Ok(())
         }
         .await;
         self.boot_started = None;
+        self.station_permission = None;
         if let Err(error) = result {
             self.state = State::Failed {
                 stage: Stage::StaRecord,
@@ -973,6 +1057,55 @@ impl<B: Backend> Session<B> {
         self.station_bss = None;
         self.peer_lost = false;
         self.state = State::ScanReady(info);
+        Ok(())
+    }
+
+    fn check_station_tx(&mut self) -> Result<(), Error> {
+        let result = self
+            .station_permission
+            .ok_or(Error::Authority)
+            .and_then(|permission| self.backend.check_tx_permission(permission));
+        if let Err(error) = result {
+            self.station_permission = None;
+            self.wmm = None;
+            self.security = None;
+            self.clear_aggregate_receive();
+            let stage = match self.state {
+                State::Running(stage) | State::Failed { stage, .. } => stage,
+                _ => Stage::StaRecord,
+            };
+            self.state = State::Failed { stage, error };
+        }
+        result
+    }
+
+    /// Every association/key/port publication earns fresh authority after
+    /// the preceding wait. Cleanup deliberately uses plain exchange instead.
+    async fn exchange_station(&mut self, command: Command, body: &[u8]) -> Result<Vec<u8>, Error> {
+        self.check_station_tx()?;
+        let reply = self.exchange(command, body).await?;
+        self.check_station_tx()?;
+        Ok(reply)
+    }
+
+    /// Linux drains the SKU command through MCU's PSE register read. Match
+    /// the actual register identity and exact native receipt, not merely any
+    /// command reply. The same bounded operation orders EDCA before QoS TX.
+    async fn confirm_command_progress(&mut self) -> Result<(), Error> {
+        let mut request = [0; 8];
+        request[..4].copy_from_slice(&0x820c8000u32.to_le_bytes());
+        let reply = self
+            .exchange(
+                Command::Ce {
+                    id: 0xc0,
+                    query: true,
+                },
+                &request,
+            )
+            .await?;
+        if reply.len() != 8 || reply[..4] != request[..4] {
+            return Err(Error::MalformedEvent);
+        }
         Ok(())
     }
 }

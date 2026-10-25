@@ -735,6 +735,10 @@ trait Backend {
     fn progress(&mut self, _stage: Stage) {}
     fn now_ns(&self) -> u64;
     fn check(&self) -> Result<(), Error>;
+    fn check_tx_permission(
+        &self,
+        permission: crate::mt7921::association::TxPermission,
+    ) -> Result<(), Error>;
     fn quiesce(&mut self) -> Result<(), Error>;
     fn idle(&mut self) -> Result<bool, Error>;
     fn initialize(&mut self) -> Result<(), Error>;
@@ -767,8 +771,23 @@ trait Backend {
     fn management_complete(
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error>;
-    fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error>;
+    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error>;
 }
+
+/// Active station checks consume only the currently installed snapshot.
+/// Policy bootstrapping belongs to explicit pre-admission entry points; a
+/// cleared database cannot silently recreate an earlier station's grant.
+fn current_station_permission(
+    permission: crate::mt7921::association::TxPermission,
+    current: Option<Arc<narf_wireless::reg::RegulatoryDomain>>,
+) -> Result<(), Error> {
+    if current.is_some_and(|domain| permission.current(&domain)) {
+        Ok(())
+    } else {
+        Err(Error::Authority)
+    }
+}
+
 #[derive(Debug)]
 struct Session<B: Backend> {
     backend: B,
@@ -784,6 +803,8 @@ struct Session<B: Backend> {
     data_pending: Option<u64>,
     peer_lost: bool,
     station_bss: Option<ScanBss>,
+    station_permission: Option<crate::mt7921::association::TxPermission>,
+    wmm: Option<crate::mt7921::association::wmm::Parameters>,
     ht20_rx: Option<amsdu::Receiver>,
     received_msdu: VecDeque<Vec<u8>>,
 }
@@ -803,6 +824,8 @@ impl<B: Backend> Session<B> {
             data_pending: None,
             peer_lost: false,
             station_bss: None,
+            station_permission: None,
+            wmm: None,
             ht20_rx: None,
             received_msdu: VecDeque::new(),
         }

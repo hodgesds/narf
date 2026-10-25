@@ -9,6 +9,9 @@ use narf_wireless::rsn::{self, RsnIe, Suite};
 #[cfg(any(test, feature = "builtin"))]
 const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
 
+#[path = "wmm.rs"]
+pub(crate) mod wmm;
+
 /// CONNAC2 legacy TX rate, selected from the AP's validated basic rates.
 /// Linux mt76_rates: OFDM hardware indices are deliberately not linear.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +63,8 @@ pub struct JoinPlan {
     peer: [u8; 6],
     channel: u8,
     security: SecurityMode,
+    wmm: Option<wmm::Parameters>,
+    wmm_association: Vec<u8>,
 }
 impl core::ops::Deref for JoinPlan {
     type Target = ManagementPlan;
@@ -113,11 +118,14 @@ impl JoinPlan {
             SecurityMode::Open
         };
         let common = ManagementPlan::prepare(bss, own, ssid, mode)?;
+        let wmm = wmm::Parameters::parse(&bss.information_elements)?;
         Ok(Self {
             common,
             peer: bss.bssid,
             channel: bss.channel,
             security: mode,
+            wmm,
+            wmm_association: Vec::new(),
         })
     }
     pub(crate) fn management_rate(&self) -> LegacyRate {
@@ -127,13 +135,41 @@ impl JoinPlan {
         self.common.start_authentication()
     }
     pub fn authentication_response(&mut self, bytes: &[u8]) -> Result<Option<&[u8]>, Error> {
-        self.common.authentication_response(bytes)
+        let Some(request) = self.common.authentication_response(bytes)? else {
+            return Ok(None);
+        };
+        if self.wmm.is_none() {
+            return Ok(Some(request));
+        }
+        self.wmm_association.clear();
+        self.wmm_association.extend_from_slice(request);
+        self.wmm_association.extend_from_slice(&wmm::INFORMATION);
+        Ok(Some(&self.wmm_association))
     }
     pub fn association_response(&mut self, bytes: &[u8]) -> Result<Option<u16>, Error> {
-        self.common.association_response(bytes)
+        let Some(aid) = self.common.association_response(bytes)? else {
+            return Ok(None);
+        };
+        if self.wmm.is_some() {
+            // Common receipt already bound peer, subtype, status, AID and
+            // legacy rates. An unrelated frame cannot change QoS admission.
+            match bytes.get(30..).map(wmm::Parameters::parse) {
+                Some(Ok(Some(parameters))) => self.wmm = Some(parameters),
+                _ => {
+                    self.cancel();
+                    return Err(Error::Protocol);
+                }
+            }
+        }
+        Ok(Some(aid))
     }
     pub fn cancel(&mut self) {
+        self.wmm = None;
+        self.wmm_association.clear();
         self.common.cancel();
+    }
+    pub(crate) fn wmm(&self) -> Option<wmm::Parameters> {
+        self.wmm
     }
     pub(crate) fn append_sme_ies(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.common.append_sme_ies(bytes)
@@ -163,6 +199,7 @@ impl JoinPlan {
         } else {
             1
         };
+        out[basic + 9] = u8::from(associated && self.wmm.is_some());
         out[basic + 10..basic + 12].copy_from_slice(&aid.to_le_bytes());
         out[basic + 12..basic + 18].copy_from_slice(&self.peer);
         out[basic + 18..basic + 20]
@@ -183,6 +220,7 @@ impl JoinPlan {
         out[wtbl + 6] = 3;
         let generic = tlv(&mut out, 0, 20);
         out[generic + 4..generic + 10].copy_from_slice(&self.peer);
+        out[generic + 13] = u8::from(associated && self.wmm.is_some());
         out[generic + 16..generic + 18].copy_from_slice(&aid.to_le_bytes());
         let rx = tlv(&mut out, 1, 12);
         out[rx + 5..rx + 8].fill(1); // RCA1, RCA2, RV
@@ -287,6 +325,15 @@ pub fn bss_record(bss: &ScanBss, connected: bool) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+/// Linux mt76_connac_mcu_uni_add_bss appends UNI_BSS_INFO_QBSS to
+/// BASIC. Set and retire BSS QoS explicitly, independently of peer WTBL.
+pub(crate) fn bss_record_qos(bss: &ScanBss, connected: bool, qos: bool) -> Result<Vec<u8>, Error> {
+    let mut out = bss_record(bss, connected)?;
+    let qbss = tlv(&mut out, 15, 8);
+    out[qbss + 4] = u8::from(connected && qos);
+    Ok(out)
+}
+
 /// A 20 MHz station transmission authorized by the installed host policy.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TxPermission {
@@ -338,6 +385,11 @@ impl TxPermission {
 
     pub fn permits(self, channel: u8) -> bool {
         self.channel == channel
+    }
+
+    pub(crate) fn current(self, domain: &narf_wireless::reg::RegulatoryDomain) -> bool {
+        Self::from_domain(domain, self.channel)
+            .is_some_and(|now| now.country == self.country && now.power_dbm >= self.power_dbm)
     }
 
     pub fn rate_limits(self) -> Vec<u8> {

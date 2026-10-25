@@ -4,7 +4,7 @@ use core::{
     cell::Cell,
     future::Future,
     pin::pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::{Context, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -14,6 +14,9 @@ mod active_scan_tests;
 
 #[path = "amsdu_rx_tests.rs"]
 mod amsdu_rx_tests;
+
+#[path = "wmm_tests.rs"]
+mod wmm_tests;
 
 fn mt76_late_preflight_retry_and_owned_start_survive_cancelled_waiter() -> TestResult {
     let allocations = Cell::new(0);
@@ -157,6 +160,12 @@ struct Model {
     management_resume: Option<u64>,
     management_rates: Vec<u16>,
     data_protection: Vec<bool>,
+    data_qos: Vec<bool>,
+    wmm_reply: Option<Vec<u8>>,
+    stall_edca: bool,
+    edca_progress_fault: u8,
+    deny_tx_after: Option<usize>,
+    tx_policy: Option<Arc<CurrentPolicy>>,
     station_channel: u8,
     rx_stall: bool,
     idle_stall: bool,
@@ -201,6 +210,12 @@ impl Model {
             management_resume: None,
             management_rates: Vec::new(),
             data_protection: Vec::new(),
+            data_qos: Vec::new(),
+            wmm_reply: None,
+            stall_edca: false,
+            edca_progress_fault: 0,
+            deny_tx_after: None,
+            tx_policy: None,
             station_channel: 6,
             rx_stall: false,
             idle_stall: false,
@@ -228,6 +243,16 @@ impl Model {
 }
 #[derive(Debug)]
 struct Lease(Arc<AtomicUsize>);
+
+struct CurrentPolicy {
+    database: narf_wireless::reg::db::Database,
+    hold_bss_ack: AtomicBool,
+}
+impl core::fmt::Debug for CurrentPolicy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CurrentPolicy")
+    }
+}
 impl Drop for Lease {
     fn drop(&mut self) {
         self.0.store(0, Ordering::SeqCst);
@@ -254,6 +279,23 @@ impl Backend for Model {
             Ok(())
         } else {
             Err(Error::Authority)
+        }
+    }
+    fn check_tx_permission(
+        &self,
+        permission: crate::mt7921::association::TxPermission,
+    ) -> Result<(), Error> {
+        self.check()?;
+        if let Some(policy) = &self.tx_policy {
+            current_station_permission(permission, policy.database.snapshot())?;
+        }
+        if self
+            .deny_tx_after
+            .is_some_and(|limit| self.frames.len() >= limit)
+        {
+            Err(Error::Authority)
+        } else {
+            Ok(())
         }
     }
     fn quiesce(&mut self) -> Result<(), Error> {
@@ -351,6 +393,7 @@ impl Backend for Model {
                     || cmd == 0x0f
                     || cmd == 0x5d
                     || cmd == 0x1b
+                    || cmd == 0x1d
                     || cmd == 3 && self.scan_stall)
                 {
                     self.replies.push_back(reply);
@@ -362,6 +405,12 @@ impl Backend for Model {
             .is_some_and(|limit| self.frames.len() >= limit)
         {
             self.tx_stall = true;
+        }
+        if self.stall_edca && frame.get(36) == Some(&0x1d) {
+            self.tx_stall = true;
+        }
+        if self.edca_progress_fault != 0 && frame.get(36) == Some(&0x1d) {
+            self.reg_reply_fault = self.edca_progress_fault;
         }
         if self.revoke_on_submit {
             self.live = false;
@@ -377,7 +426,13 @@ impl Backend for Model {
         }
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        if self.rx_stall {
+        let held = self.tx_policy.as_ref().is_some_and(|policy| {
+            policy.hold_bss_ack.load(Ordering::SeqCst)
+                && self.frames.last().is_some_and(|(_, frame)| {
+                    frame.len() == 92 && frame[34..36] == [2, 0] && frame[43] == 7 && frame[88] == 1
+                })
+        });
+        if self.rx_stall || held {
             Ok(None)
         } else {
             Ok(self.replies.pop_front())
@@ -453,9 +508,35 @@ impl Backend for Model {
         self.check()?;
         self.management_rates.push(rate.hardware());
         self.frames.push((false, frame.to_vec()));
+        if frame.first() == Some(&0xc0) {
+            if let Some(ap) = &self.access_point {
+                // The shared AP speaks auth/association/EAPOL through its
+                // Authorized phase, not disconnect. This native adapter
+                // validates the exact closing frame and retires that fixture
+                // peer; it adds no production RX or cleanup acceptance.
+                let beacon = ap.beacon();
+                if ap.phase() != narf_wifi_fixtures::ApPhase::Authorized
+                    || frame.len() != 26
+                    || frame[1..4] != [0; 3]
+                    || frame[4..10] != beacon[10..16]
+                    || frame[10..16] != [2, 0x11, 0x22, 0x33, 0x44, 0x55]
+                    || frame[16..22] != beacon[10..16]
+                    || frame[22..26] != [0, 0, 3, 0]
+                {
+                    return Err(Error::Bounds);
+                }
+                self.access_point = None;
+                return Ok(());
+            }
+        }
         if let Some(ap) = &mut self.access_point {
             let replies = ap.receive(frame).map_err(|_| Error::Bounds)?;
-            for reply in replies {
+            for mut reply in replies {
+                if reply.first() == Some(&0x10) {
+                    if let Some(parameters) = &self.wmm_reply {
+                        reply.extend_from_slice(parameters);
+                    }
+                }
                 let mut packet = vec![0u8; 32 + reply.len()];
                 let len = packet.len();
                 packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
@@ -541,7 +622,7 @@ impl Backend for Model {
         }
         Ok(())
     }
-    fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
+    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
         self.check()?;
         if self.access_point.as_ref().is_some_and(|ap| {
             ap.phase() != narf_wifi_fixtures::ApPhase::Authorized || ap.protected() != protected
@@ -550,6 +631,7 @@ impl Backend for Model {
         }
         self.frames.push((false, frame.to_vec()));
         self.data_protection.push(protected);
+        self.data_qos.push(qos);
         Ok(())
     }
     fn management_complete(
@@ -1754,6 +1836,7 @@ fn mcu_ethernet_tx_rx_frame_transport() -> TestResult {
     let State::RadioReady(info) = session.state else {
         return TestResult::Fail("radio state");
     };
+    session.station_permission = Some(test_permission());
     session.state = State::Associated {
         info,
         peer: [2, 1, 2, 3, 4, 5],
@@ -2063,6 +2146,7 @@ fn secure_model() -> Session<Model> {
         })
         .unwrap();
     session.security = Some(security);
+    session.station_permission = Some(test_permission());
     session.state = State::Associated {
         info,
         peer: bss.bssid,
