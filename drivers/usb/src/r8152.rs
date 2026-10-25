@@ -183,7 +183,7 @@ pub fn ocp_write_dword_pack(mcu: u16, addr: u16, value: u32) -> (u8, u8, u16, u1
 /// address is aligned down to a dword; the value is placed in its
 /// byte lanes and the word byte-enable is shifted to match.
 pub fn ocp_write_word_pack(mcu: u16, addr: u16, value: u16) -> (u8, u8, u16, u16, [u8; 4]) {
-    let shift = (addr & 2) as u16;
+    let shift = addr & 2;
     let packed = (value as u32) << (shift * 8);
     (
         REQT_WRITE,
@@ -196,7 +196,7 @@ pub fn ocp_write_word_pack(mcu: u16, addr: u16, value: u16) -> (u8, u8, u16, u16
 
 /// SETUP fields + data-stage bytes for an OCP byte write.
 pub fn ocp_write_byte_pack(mcu: u16, addr: u16, value: u8) -> (u8, u8, u16, u16, [u8; 4]) {
-    let shift = (addr & 3) as u16;
+    let shift = addr & 3;
     let packed = (value as u32) << (shift * 8);
     (
         REQT_WRITE,
@@ -238,7 +238,7 @@ async fn ocp_read_dword(dev: &USBDevice, mcu: u16, addr: u16) -> Result<u32, ()>
 /// reference model passes no byte-enable for reads — byte-enables
 /// appear only in write `wIndex` values).
 async fn ocp_read_word(dev: &USBDevice, mcu: u16, addr: u16) -> Result<u16, ()> {
-    let shift = (addr & 2) as u16;
+    let shift = addr & 2;
     let (rt, req, _, _) = ocp_read_setup(mcu, addr);
     let mut buf = [0u8; 4];
     dev.control_in(rt, req, addr & !3, mcu, &mut buf)
@@ -886,7 +886,7 @@ pub mod tests {
         let f1 = datagram_frame(60, 0xA5);
         let f2 = datagram_frame(100, 0x3C);
         let mut buf = alloc::vec::Vec::new();
-        let mut push_seg = |buf: &mut Vec<u8>, frame: &[u8]| {
+        let push_seg = |buf: &mut Vec<u8>, frame: &[u8]| {
             buf.extend_from_slice(&(frame.len() as u32).to_le_bytes()); // opts1
             buf.extend_from_slice(&[0u8; 20]); // opts2..opts6
             buf.extend_from_slice(frame);
