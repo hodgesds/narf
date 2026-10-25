@@ -66,6 +66,19 @@ sleep. Unsupported or synchronous no-op operations resolve immediately; an
 implementation must not represent them with a future that remains pending
 forever.
 
+The synchronous device trait (`BlockDeviceSync`, `block/src/registry.rs`)
+mirrors this surface for polled drivers, and the `SyncBlock` adapter
+bridges it to `BlockDevice`. Its discard contract is deliberately
+asymmetric (#841): `supports(BlockFeature::Discard)` is true exactly
+when the sync device reports `supports_trim()` — i.e. its `trim(lba,
+n_blocks)` override issues the hardware deallocation command (NVMe
+Dataset Management, ATA DATA SET MANAGEMENT/TRIM, SCSI UNMAP). The
+trait default `trim` errors, `submit` with `BlockOp::Trim` forwards to
+`trim` and surfaces that error, and the fire-and-forget `discard()`
+forwards only on trim-capable devices. A device must never advertise
+Discard for a no-op trim: filesystems would record blocks as freed
+while the device still holds them.
+
 ### 3.2 Request / completion
 
 ```rust

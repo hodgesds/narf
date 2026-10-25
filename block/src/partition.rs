@@ -462,6 +462,16 @@ impl BlockDeviceSync for PartitionBlockDevice {
     fn flush(&self) -> Result<(), BlockIoError> {
         self.parent.flush()
     }
+    fn supports_trim(&self) -> bool {
+        self.parent.supports_trim()
+    }
+    fn trim(&self, lba: u64, n_blocks: u64) -> Result<(), BlockIoError> {
+        let end = lba.checked_add(n_blocks);
+        if end.is_none_or(|end| end > self.sector_count) {
+            return Err(BlockIoError::OutOfRange);
+        }
+        self.parent.trim(self.start_lba + lba, n_blocks)
+    }
     fn capabilities(&self) -> crate::registry::BlockCaps {
         self.parent.capabilities()
     }

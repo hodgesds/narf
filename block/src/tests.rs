@@ -2579,6 +2579,98 @@ fn smoke_block_flush_and_fua_forwarding() -> TestResult {
 }
 kernel_test_in!("block/flush", smoke_block_flush_and_fua_forwarding);
 
+/// The #841 discard contract for the sync adapter: `SyncBlock`
+/// advertises `BlockFeature::Discard` exactly when the wrapped
+/// device really trims, `discard()` forwards to the device's
+/// `trim`, and the trait-default `trim` errors instead of silently
+/// succeeding — a filesystem must never be told blocks were
+/// deallocated when the device did nothing.
+fn smoke_sync_block_discard_forwarding() -> TestResult {
+    use alloc::sync::Arc;
+    #[derive(Debug)]
+    struct TrimProbe {
+        capable: bool,
+        trims: Arc<narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>>,
+    }
+    impl crate::BlockDeviceSync for TrimProbe {
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            1024
+        }
+        fn read(&self, _lba: u64, _n: u16, _out: &mut [u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+        fn write(&self, _lba: u64, _n: u16, _data: &[u8]) -> Result<(), crate::BlockIoError> {
+            Ok(())
+        }
+        fn supports_trim(&self) -> bool {
+            self.capable
+        }
+        fn trim(&self, lba: u64, n_blocks: u64) -> Result<(), crate::BlockIoError> {
+            self.trims.lock().push((lba, n_blocks));
+            Ok(())
+        }
+    }
+
+    // A trim-capable device: Discard is advertised and discard()
+    // reaches the device with the range intact.
+    let probe = TrimProbe {
+        capable: true,
+        trims: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new())),
+    };
+    let recorded = probe.trims.clone();
+    let bridge = crate::SyncBlock::new(Arc::new(probe));
+    if !crate::BlockDevice::supports(&*bridge, crate::BlockFeature::Discard) {
+        return TestResult::Fail("trim-capable sync device must advertise Discard");
+    }
+    let r = poll_ready_block(crate::BlockDevice::discard(
+        &*bridge,
+        crate::LbaRange {
+            start: 10,
+            blocks: 5,
+        },
+    ));
+    if r != Some(()) {
+        return TestResult::Fail("SyncBlock::discard must complete immediately");
+    }
+    if recorded.lock().as_slice() != [(10, 5)] {
+        return TestResult::Fail("discard() must forward (lba, blocks) to trim");
+    }
+
+    // A device without trim: Discard is NOT advertised, discard()
+    // is a no-op, and a direct trim() hits the erroring default.
+    let plain = TrimProbe {
+        capable: false,
+        trims: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new())),
+    };
+    let recorded = plain.trims.clone();
+    let bridge = crate::SyncBlock::new(Arc::new(plain));
+    if crate::BlockDevice::supports(&*bridge, crate::BlockFeature::Discard) {
+        return TestResult::Fail("trim-less sync device must NOT advertise Discard");
+    }
+    let _ = poll_ready_block(crate::BlockDevice::discard(
+        &*bridge,
+        crate::LbaRange {
+            start: 0,
+            blocks: 1,
+        },
+    ));
+    if !recorded.lock().is_empty() {
+        return TestResult::Fail("discard() must not call trim on a trim-less device");
+    }
+    let bare = VecBlock {
+        data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(alloc::vec![0u8; 512])),
+        lba_size: 512,
+    };
+    if crate::BlockDeviceSync::trim(&bare, 0, 1).is_ok() {
+        return TestResult::Fail("the default trim must error, never silently succeed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/discard", smoke_sync_block_discard_forwarding);
+
 fn poll_ready_block<F: core::future::Future>(fut: F) -> Option<F::Output> {
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     static VTABLE: RawWakerVTable =
