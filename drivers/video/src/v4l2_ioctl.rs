@@ -12,7 +12,12 @@
 //! - `VIDIOC_ENUM_FMT` / `ENUM_FRAMESIZES` / `ENUM_FRAMEINTERVALS`.
 //! - `VIDIOC_G_FMT` / `S_FMT` / `TRY_FMT` (single-planar capture).
 //! - `VIDIOC_REQBUFS` / `QUERYBUF` / `QBUF` / `DQBUF` (MMAP memory).
-//! - `VIDIOC_STREAMON` / `STREAMOFF`.
+//! - `VIDIOC_STREAMON` / `STREAMOFF`. When the device carries
+//!   [`StreamOps`] (installed by its class driver), STREAMON first
+//!   awaits the driver's hardware start — for UVC, the PROBE/COMMIT
+//!   negotiation, endpoint configuration, `SET_INTERFACE`, and
+//!   capture-pump start — and fails the ioctl if that fails; STREAMOFF
+//!   awaits the reverse teardown before resetting local buffer state.
 //! - `VIDIOC_G_PARM` / `S_PARM` (capture frame interval).
 //! - `VIDIOC_G_CTRL` / `S_CTRL` / `QUERYCTRL`.
 //! - `VIDIOC_ENUMINPUT` / `G_INPUT` / `S_INPUT`.
@@ -43,6 +48,9 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use core::future::Future;
+use core::pin::Pin;
+
 use narf_filesystem::{
     FileOps, FileType, FsError, FsFuture, IoctlContext, MmapLifetime, Mode, Stat,
 };
@@ -56,6 +64,7 @@ use crate::devfs_bridge::VideoDevice;
 
 const ENOENT: i64 = 2;
 const EINTR: i64 = 4;
+const EIO: i64 = 5;
 const EAGAIN: i64 = 11;
 const EBUSY: i64 = 16;
 const EINVAL: i64 = 22;
@@ -411,6 +420,38 @@ pub struct ControlState {
     pub step: i32,
     pub default: i32,
     pub value: i32,
+}
+
+/// Future returned by a [`StreamOps`] hook. `Err` carries the positive
+/// Linux errno the ioctl fails with (e.g. `EIO` when the device rejects
+/// or cannot complete the streaming negotiation).
+pub type StreamHookFuture = Pin<Box<dyn Future<Output = Result<(), i64>> + Send>>;
+
+/// Hardware streaming hooks for a video device, installed by the class
+/// driver that owns the hardware (e.g. the USB Video Class driver in
+/// `narf-drivers-usb`) via
+/// [`crate::devfs_bridge::set_stream_ops`].
+///
+/// The contract (see `drivers/usb/specification/spec.md` §3):
+///
+/// - `start` runs the full device streaming negotiation for the format
+///   most recently committed by `VIDIOC_S_FMT` — for UVC: VS
+///   PROBE/COMMIT, endpoint configuration, `SET_INTERFACE` to the
+///   negotiated alternate setting, and capture-pump start. It is
+///   awaited by `VIDIOC_STREAMON` *before* the device is marked
+///   streaming; an `Err` fails the ioctl and the device stays
+///   non-streaming (no silent black stream).
+/// - `stop` reverses `start`: it requests the capture pump to stop and
+///   releases the streaming alternate setting. It is awaited by
+///   `VIDIOC_STREAMOFF` before the local buffer state is reset; its
+///   result is ignored (stream-off always completes locally).
+///
+/// Devices with no hooks keep the historical local-state-only
+/// behaviour (synthetic/fixture nodes fed through `push_frame`).
+#[derive(Copy, Clone, Debug)]
+pub struct StreamOps {
+    pub start: fn(node: usize, format: PixFormat) -> StreamHookFuture,
+    pub stop: fn(node: usize) -> StreamHookFuture,
 }
 
 /// One queued V4L2 event: its type, matching id, running sequence, and the
@@ -945,8 +986,8 @@ async fn handle(
         VIDIOC_QBUF => qbuf(dev, b, ctx)?,
         VIDIOC_EXPBUF => expbuf(dev, b, ctx)?,
         VIDIOC_DQBUF => dqbuf(dev, b, ctx).await?,
-        VIDIOC_STREAMON => streamon(dev, b, true, events),
-        VIDIOC_STREAMOFF => streamon(dev, b, false, events),
+        VIDIOC_STREAMON => streamon(dev, b, true, events).await,
+        VIDIOC_STREAMOFF => streamon(dev, b, false, events).await,
         VIDIOC_G_PARM | VIDIOC_S_PARM => g_parm(dev, b),
         VIDIOC_G_CTRL => g_ctrl(dev, b),
         VIDIOC_S_CTRL => s_ctrl(dev, b, events),
@@ -1526,7 +1567,7 @@ async fn dqbuf(
     }
 }
 
-fn streamon(
+async fn streamon(
     dev: &Arc<IrqSafeSpinLock<VideoDevice>>,
     b: &mut [u8],
     on: bool,
@@ -1536,26 +1577,60 @@ fn streamon(
     if rd_u32(b, 0) != V4L2_BUF_TYPE_VIDEO_CAPTURE {
         return errno(EINVAL);
     }
-    let mut g = dev.lock();
     if on {
-        if g.buffers.is_empty() {
-            return errno(EINVAL);
+        // Snapshot the streaming hooks and the S_FMT-committed format
+        // under the lock; the device lock is never held across the
+        // hardware call (the capture pump takes it to deliver frames).
+        let (ops, node, format) = {
+            let g = dev.lock();
+            if g.buffers.is_empty() {
+                return errno(EINVAL);
+            }
+            if g.streaming {
+                // Already streaming: STREAMON is a no-op success and
+                // must not re-run the hardware negotiation.
+                return 0;
+            }
+            (g.stream_ops, g.index, g.format)
+        };
+        if let Some(ops) = ops {
+            // The hardware composition runs first; only a successful
+            // negotiation marks the device streaming. A failure fails
+            // the ioctl — a stream that never started must not look
+            // like one that is merely slow (no black streams).
+            if let Err(e) = (ops.start)(node, format).await {
+                return errno(if e > 0 { e } else { EIO });
+            }
         }
-        g.streaming = true;
-    } else {
-        g.streaming = false;
-        // STREAMOFF returns all buffers to the dequeued state and drops any
-        // pending captured frames (vb2_streamoff).
-        for buf in g.buffers.iter_mut() {
-            buf.state = QState::Dequeued;
-            buf.bytesused = 0;
-        }
-        g.clear_frames();
-        g.refresh_readiness();
-        drop(g);
-        // Signal end-of-stream to subscribers (vb2 queues V4L2_EVENT_EOS).
-        events.lock().enqueue(V4L2_EVENT_EOS, 0, [0u8; 64]);
+        dev.lock().streaming = true;
+        return 0;
     }
+    // STREAMOFF: reverse the composition first (stop the capture pump,
+    // release the streaming alternate setting), then reset local state.
+    // The hook's result is ignored — local teardown always completes.
+    let (ops, node, was_streaming) = {
+        let mut g = dev.lock();
+        let was = g.streaming;
+        g.streaming = false;
+        (g.stream_ops, g.index, was)
+    };
+    if was_streaming {
+        if let Some(ops) = ops {
+            let _ = (ops.stop)(node).await;
+        }
+    }
+    let mut g = dev.lock();
+    // STREAMOFF returns all buffers to the dequeued state and drops any
+    // pending captured frames (vb2_streamoff).
+    for buf in g.buffers.iter_mut() {
+        buf.state = QState::Dequeued;
+        buf.bytesused = 0;
+    }
+    g.clear_frames();
+    g.refresh_readiness();
+    drop(g);
+    // Signal end-of-stream to subscribers (vb2 queues V4L2_EVENT_EOS).
+    events.lock().enqueue(V4L2_EVENT_EOS, 0, [0u8; 64]);
     0
 }
 

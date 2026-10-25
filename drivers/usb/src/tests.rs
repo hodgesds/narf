@@ -406,6 +406,213 @@ fn smoke_msc_attach_via_xhci_qemu() -> TestResult {
 }
 kernel_test_in!("drivers/usb/msc", smoke_msc_attach_via_xhci_qemu);
 
+// ── MSC detach / replug publication ────────────────────────────────
+
+/// Minimal `BlockDeviceSync` standing in for a scanned partition
+/// child of a synthetic MSC disk (the real scanner cannot run
+/// against a fabricated device — it would issue BOT traffic).
+struct DummyPartition;
+impl narf_block::BlockDeviceSync for DummyPartition {
+    fn lba_size(&self) -> u32 {
+        512
+    }
+    fn capacity(&self) -> u64 {
+        1024
+    }
+    fn read(&self, _lba: u64, _n: u16, out: &mut [u8]) -> Result<(), narf_block::BlockIoError> {
+        out.fill(0);
+        Ok(())
+    }
+    fn write(&self, _lba: u64, _n: u16, _data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        Ok(())
+    }
+}
+
+/// The publication half of the USB detach lifecycle for MSC:
+/// bind publishes `usb-msc{idx}` (+ a partition child), the
+/// class-registry unbind dispatch tombstones the device and
+/// unregisters disk + partitions, and a replug on the same slot
+/// reuses the tombstoned index so the same name republishes.
+/// Runs without hardware via `msc::__insert_msc_for_test`.
+fn smoke_msc_detach_replug_publication() -> TestResult {
+    use crate::{class_registry, msc};
+    use alloc::sync::Arc;
+
+    msc::__reset_msc_for_test();
+    // Ensure the detach hook is in the class registry. A full boot
+    // registers it from the Stage::Subsys initcall; registering
+    // here too keeps the smoke independent of initcall order (a
+    // duplicate entry would only double-dispatch the detach, which
+    // is idempotent).
+    msc::register_initcalls();
+
+    // Slot 200: no real enumeration reaches it in the test kernel.
+    let idx = msc::__insert_msc_for_test(200);
+    let disk = alloc::format!("usb-msc{}", idx);
+    if msc::with_device(idx, |d| d.slot_id) != Some(200) {
+        return TestResult::Fail("synthetic MSC device not in registry");
+    }
+    if msc::attached_msc_count() != 1 {
+        return TestResult::Fail("attached count wrong after bind");
+    }
+    if narf_block::find_block_device(&disk).is_none() {
+        return TestResult::Fail("usb-msc disk not published after bind");
+    }
+    let child: &'static str =
+        alloc::boxed::Box::leak(alloc::format!("{}p1", disk).into_boxed_str());
+    narf_block::register_partition_device(
+        child,
+        &disk,
+        Arc::new(DummyPartition) as Arc<dyn narf_block::BlockDeviceSync>,
+        None,
+    );
+    if narf_block::find_block_device(child).is_none() {
+        return TestResult::Fail("partition child not published");
+    }
+
+    // Detach through the registry's unbind dispatch — the same
+    // entry the supervisor's detach path calls.
+    class_registry::dispatch_unbind(200);
+    if msc::with_device(idx, |d| d.slot_id).is_some() {
+        return TestResult::Fail("MSC entry not tombstoned after detach");
+    }
+    if msc::attached_msc_count() != 0 {
+        return TestResult::Fail("attached count nonzero after detach");
+    }
+    if narf_block::find_block_device(&disk).is_some() {
+        return TestResult::Fail("usb-msc disk still published after detach");
+    }
+    if narf_block::find_block_device(child).is_some() {
+        return TestResult::Fail("partition child still published after detach");
+    }
+    // Detach is idempotent, including for a never-bound slot.
+    msc::detach_msc(200);
+    msc::detach_msc(201);
+
+    // Replug: tombstone reuse republishes under the same name.
+    let idx2 = msc::__insert_msc_for_test(200);
+    if idx2 != idx {
+        return TestResult::Fail("replug did not reuse the tombstoned index");
+    }
+    if narf_block::find_block_device(&disk).is_none() {
+        return TestResult::Fail("usb-msc disk not republished after replug");
+    }
+    if msc::attached_msc_count() != 1 {
+        return TestResult::Fail("attached count wrong after replug");
+    }
+
+    // Clean up so later smokes see an empty MSC registry.
+    msc::detach_msc(200);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_detach_replug_publication);
+
+/// Finding A pin (queue 16 second-pass review): a held block
+/// adapter must never be silently retargeted at the next disk.
+/// Filesystems retain the `UsbMscBlockDevice` for the mount's
+/// whole life; the adapter re-resolves its target from
+/// `MSC_DEVICES[idx]` on every op, and `insert_device` reuses the
+/// first tombstone by design — so without a bind-identity check,
+/// unplug A / plug B serves A's mounted filesystem from B. The
+/// bind-generation gate is that check: stale adapters fail
+/// `DeviceRemoved`, including after the *same* disk rebinds (a
+/// rebind is a new bind with a new generation).
+fn smoke_msc_stale_adapter_generation_gate() -> TestResult {
+    use crate::msc::{self, UsbMscBlockDevice};
+    use narf_block::{BlockDeviceSync, BlockIoError};
+
+    msc::__reset_msc_for_test();
+
+    // Bind disk A (slot 202) and retain its adapter, the way a
+    // mounted filesystem retains it across detach/replug.
+    let idx = msc::__insert_msc_for_test(202);
+    let Some(stale) = UsbMscBlockDevice::from_index(idx) else {
+        return TestResult::Fail("adapter for freshly bound disk missing");
+    };
+    let mut buf = [0u8; 512];
+    let data = [0xA5u8; 512];
+
+    // Unplug A: the tombstone alone already fails the held adapter.
+    msc::detach_msc(202);
+    if stale.read(0, 1, &mut buf) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("held adapter read not DeviceRemoved while tombstoned");
+    }
+    if stale.write(0, 1, &data) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("held adapter write not DeviceRemoved while tombstoned");
+    }
+    if stale.flush() != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("held adapter flush not DeviceRemoved while tombstoned");
+    }
+    if stale.write_fua(0, 1, &data) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("held adapter FUA write not DeviceRemoved while tombstoned");
+    }
+
+    // Plug in a different disk B (slot 203): tombstone reuse lands
+    // it on the same index. The held adapter must NOT be served
+    // by B — this is the retargeting the generation gate exists
+    // to prevent.
+    let idx_b = msc::__insert_msc_for_test(203);
+    if idx_b != idx {
+        return TestResult::Fail("replug did not reuse the tombstoned index");
+    }
+    let Some(fresh) = UsbMscBlockDevice::from_index(idx) else {
+        return TestResult::Fail("adapter for replugged disk missing");
+    };
+    if stale.read(0, 1, &mut buf) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("stale adapter read silently served by replugged disk");
+    }
+    if stale.write(0, 1, &data) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("stale adapter write silently served by replugged disk");
+    }
+    if stale.flush() != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("stale adapter flush silently served by replugged disk");
+    }
+    if stale.write_fua(0, 1, &data) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("stale adapter FUA write silently served by replugged disk");
+    }
+
+    // B's own adapter is generation-current, so it must get PAST
+    // the identity gate. With a live controller (the harness's
+    // qemu-xhci) its ops fail in the transfer layer against the
+    // fabricated slot — DriverError, never DeviceRemoved. Without
+    // a controller the environment cannot distinguish the two, so
+    // this half is conditioned on one being present.
+    if crate::xhci::controller().is_some() {
+        if fresh.read(0, 1, &mut buf) != Err(BlockIoError::DriverError) {
+            return TestResult::Fail("fresh adapter read did not pass the generation gate");
+        }
+        if fresh.write(0, 1, &data) != Err(BlockIoError::DriverError) {
+            return TestResult::Fail("fresh adapter write did not pass the generation gate");
+        }
+        if fresh.flush() != Err(BlockIoError::DriverError) {
+            return TestResult::Fail("fresh adapter flush did not pass the generation gate");
+        }
+        if fresh.write_fua(0, 1, &data) != Err(BlockIoError::DriverError) {
+            return TestResult::Fail("fresh adapter FUA write did not pass the generation gate");
+        }
+    }
+
+    // Same disk out and back in (A returns on slot 202): a rebind
+    // is a new bind with a new generation, so NEITHER held adapter
+    // is resurrected — B's adapter is stale by generation too.
+    msc::detach_msc(203);
+    let idx_a2 = msc::__insert_msc_for_test(202);
+    if idx_a2 != idx {
+        return TestResult::Fail("same-disk replug did not reuse the tombstoned index");
+    }
+    if stale.read(0, 1, &mut buf) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("original adapter resurrected by same-disk rebind");
+    }
+    if fresh.read(0, 1, &mut buf) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("previous occupant's adapter not stale after rebind");
+    }
+
+    // Clean up so later smokes see an empty MSC registry.
+    msc::detach_msc(202);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_stale_adapter_generation_gate);
+
 // ── MSC BBB protocol codec unit tests ──────────────────────────────
 
 /// CBW encode round-trip: encode a READ(10) CBW and verify every
@@ -2069,6 +2276,64 @@ fn smoke_usb_class_registry_checks_interface_triples() -> TestResult {
 kernel_test_in!(
     "drivers/usb/class-registry",
     smoke_usb_class_registry_checks_interface_triples
+);
+
+// ── drivers/usb/class-registry unbind dispatch ────────────────────
+//
+// The disconnect lifecycle (attach::detach_slot) reaches registered
+// class drivers through dispatch_unbind. The hook is broadcast:
+// every registered hook sees the slot and self-filters. This test
+// registers a hook for an unmatchable VID/PID (its probe can never
+// fire for a real device) and deliberately leaves it registered —
+// resetting the global registry would wipe drivers registered by
+// the boot initcalls for later smokes.
+
+static UNBIND_HOOK_LAST_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static UNBIND_HOOK_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static UNBIND_TEST_MATCHES: [crate::class_registry::UsbClassMatch; 1] =
+    [crate::class_registry::UsbClassMatch::vid_pid(
+        0xFFFE, 0xFFFE,
+    )];
+
+fn unbind_hook_record(slot: u8) {
+    UNBIND_HOOK_LAST_SLOT.store(slot, core::sync::atomic::Ordering::SeqCst);
+    UNBIND_HOOK_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
+fn unbind_test_probe(
+    _dev: alloc::sync::Arc<crate::device::USBDevice>,
+) -> Result<(), crate::class_registry::UsbProbeError> {
+    Err(crate::class_registry::UsbProbeError::UnsupportedVariant)
+}
+
+fn smoke_usb_class_registry_unbind_dispatch() -> TestResult {
+    use crate::class_registry::{dispatch_unbind, register_class_driver_with_unbind};
+    if register_class_driver_with_unbind(
+        "test-unbind-hook",
+        &UNBIND_TEST_MATCHES,
+        unbind_test_probe,
+        unbind_hook_record,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("hooked driver registration failed");
+    }
+    let before = UNBIND_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst);
+    let invoked = dispatch_unbind(9);
+    if invoked == 0 {
+        return TestResult::Fail("dispatch_unbind invoked no hooks");
+    }
+    if UNBIND_HOOK_LAST_SLOT.load(core::sync::atomic::Ordering::SeqCst) != 9 {
+        return TestResult::Fail("unbind hook did not receive the detached slot");
+    }
+    if UNBIND_HOOK_CALLS.load(core::sync::atomic::Ordering::SeqCst) != before + 1 {
+        return TestResult::Fail("unbind hook was not called exactly once per dispatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/class-registry",
+    smoke_usb_class_registry_unbind_dispatch
 );
 
 fn smoke_usb_uac_finder_picks_audiocontrol_interface() -> TestResult {
@@ -5020,3 +5285,1051 @@ kernel_test_in!(
     "drivers/usb/hub",
     smoke_usb_hub_set_feature_port_power_encode
 );
+
+// ── UVC streaming composition: end-to-end fixture (#803 + #812) ──────
+//
+// A modelled UVC camera (descriptor set + probe/commit state machine
+// + isochronous packet source) behind the `UvcTransport` seam, driven
+// through the REAL V4L2 ioctl dispatch: S_FMT → REQBUFS → QBUF →
+// STREAMON must run the probe/commit negotiation, configure the
+// endpoint, and select the streaming alternate before any frame can
+// land; DQBUF must return the modelled payload bytes; STREAMOFF must
+// stop the pump and release the alternate. The transfer log asserts
+// the conversation order, not just the outcomes. The composition code
+// under test is the production code — only the transport differs.
+
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// One recorded transfer in the modelled device conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FixtureXfer {
+    SetConfiguration,
+    SetCurProbe { payload: [u8; 26] },
+    GetCurProbe,
+    SetCurCommit { payload: [u8; 26] },
+    ConfigureEndpoints { ep_addr: u8 },
+    SetInterface { interface: u16, alt: u16 },
+    IsochIn,
+    OtherControlOut { request: u8, value: u16 },
+    OtherControlIn { request: u8, value: u16 },
+}
+
+struct FixtureState {
+    log: Vec<FixtureXfer>,
+    /// Last SET_CUR(PROBE) payload; GET_CUR(PROBE) answers from it.
+    probe: Option<[u8; 26]>,
+    fail_probe: bool,
+    fail_set_interface: bool,
+    packets: VecDeque<Vec<u8>>,
+}
+
+/// Modelled UVC device behind the [`crate::uvc::UvcTransport`] seam.
+/// Its GET_CUR(PROBE) behaves like a real device: it accepts the
+/// host's format/frame/interval and fills in its own
+/// `dwMaxVideoFrameSize` (640×480 YUYV) and
+/// `dwMaxPayloadTransferSize` (1024, matching the alt-1 endpoint).
+struct FixtureTransport {
+    state: IrqSafeSpinLock<FixtureState>,
+}
+
+impl FixtureTransport {
+    fn new(fail_probe: bool, fail_set_interface: bool, packets: Vec<Vec<u8>>) -> Self {
+        Self {
+            state: IrqSafeSpinLock::new(FixtureState {
+                log: Vec::new(),
+                probe: None,
+                fail_probe,
+                fail_set_interface,
+                packets: packets.into(),
+            }),
+        }
+    }
+
+    fn log(&self) -> Vec<FixtureXfer> {
+        self.state.lock().log.clone()
+    }
+
+    /// Stage a packet for the modelled device to source, as if it
+    /// arrived after the fixture was set up — including while a pump
+    /// is parked waiting for one.
+    fn stage_packet(&self, packet: Vec<u8>) {
+        self.state.lock().packets.push_back(packet);
+    }
+
+    /// Packets currently staged (consumed one per `isoch_in`).
+    fn pending_packets(&self) -> usize {
+        self.state.lock().packets.len()
+    }
+}
+
+/// A future that pends until the modelled device has a packet staged.
+///
+/// Real isochronous transfers complete only when the device sources a
+/// packet; on the silent alternate setting 0 a parked transfer may
+/// not resolve until the *next* stream starts. Modelling the park
+/// faithfully (rather than returning empty reads) is what lets the
+/// generation-toggle smoke hold a pump mid-await across
+/// STREAMOFF/STREAMON — the interleave the stream-generation
+/// protocol exists for. The fixture re-polls manually in place of the
+/// transfer-event wake.
+struct PacketStaged<'a> {
+    state: &'a IrqSafeSpinLock<FixtureState>,
+}
+
+impl Future for PacketStaged<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.state.lock().packets.is_empty() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
+impl crate::uvc::UvcTransport for FixtureTransport {
+    async fn control_out(
+        &self,
+        _slot_id: u8,
+        _bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &[u8],
+    ) -> Result<usize, crate::xhci::XhciError> {
+        use crate::xhci::XhciError;
+        let mut state = self.state.lock();
+        if b_request == crate::hid::STD_REQ_SET_CONFIGURATION {
+            state.log.push(FixtureXfer::SetConfiguration);
+            return Ok(data.len());
+        }
+        if b_request == crate::control::REQ_SET_INTERFACE {
+            state.log.push(FixtureXfer::SetInterface {
+                interface: w_index,
+                alt: w_value,
+            });
+            if state.fail_set_interface && w_value != 0 {
+                return Err(XhciError::CmdFailed(0xE1));
+            }
+            return Ok(data.len());
+        }
+        if b_request == crate::uvc::VS_REQ_SET_CUR && w_value == crate::uvc::VS_PROBE_CONTROL {
+            let mut payload = [0u8; 26];
+            payload.copy_from_slice(&data[..26.min(data.len())]);
+            state.log.push(FixtureXfer::SetCurProbe { payload });
+            if state.fail_probe {
+                return Err(XhciError::CmdFailed(0xE2));
+            }
+            state.probe = Some(payload);
+            return Ok(data.len());
+        }
+        if b_request == crate::uvc::VS_REQ_SET_CUR && w_value == crate::uvc::VS_COMMIT_CONTROL {
+            let mut payload = [0u8; 26];
+            payload.copy_from_slice(&data[..26.min(data.len())]);
+            state.log.push(FixtureXfer::SetCurCommit { payload });
+            return Ok(data.len());
+        }
+        state.log.push(FixtureXfer::OtherControlOut {
+            request: b_request,
+            value: w_value,
+        });
+        Ok(data.len())
+    }
+
+    async fn control_in(
+        &self,
+        _slot_id: u8,
+        _bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        _w_index: u16,
+        out: &mut [u8],
+    ) -> Result<usize, crate::xhci::XhciError> {
+        let mut state = self.state.lock();
+        if b_request == crate::uvc::VS_REQ_GET_CUR && w_value == crate::uvc::VS_PROBE_CONTROL {
+            state.log.push(FixtureXfer::GetCurProbe);
+            let mut accepted = state.probe.unwrap_or([0u8; 26]);
+            // The device fills in its own frame size + payload size.
+            accepted[18..22].copy_from_slice(&614_400u32.to_le_bytes());
+            accepted[22..26].copy_from_slice(&1024u32.to_le_bytes());
+            let n = out.len().min(26);
+            out[..n].copy_from_slice(&accepted[..n]);
+            return Ok(n);
+        }
+        state.log.push(FixtureXfer::OtherControlIn {
+            request: b_request,
+            value: w_value,
+        });
+        Ok(0)
+    }
+
+    async fn configure_endpoints(
+        &self,
+        _slot_id: u8,
+        endpoints: &[crate::xhci::EndpointConfig],
+    ) -> Result<(), crate::xhci::XhciError> {
+        let mut state = self.state.lock();
+        for endpoint in endpoints {
+            state.log.push(FixtureXfer::ConfigureEndpoints {
+                ep_addr: endpoint.ep_addr,
+            });
+        }
+        Ok(())
+    }
+
+    async fn isoch_in(
+        &self,
+        _slot_id: u8,
+        _dci: u8,
+        out: &mut [u8],
+    ) -> Result<usize, crate::xhci::XhciError> {
+        // Park until the device sources a packet, like the real
+        // transfer: never an empty read.
+        PacketStaged { state: &self.state }.await;
+        let mut state = self.state.lock();
+        state.log.push(FixtureXfer::IsochIn);
+        let packet = state.packets.pop_front().unwrap_or_default();
+        let n = packet.len().min(out.len());
+        out[..n].copy_from_slice(&packet[..n]);
+        Ok(n)
+    }
+}
+
+/// The modelled camera currently installed for the fixture stream
+/// hooks (fn pointers cannot capture, so the hooks resolve it here).
+static UVC_FIXTURE_TRANSPORT: IrqSafeSpinLock<Option<Arc<FixtureTransport>>> =
+    IrqSafeSpinLock::new(None);
+
+fn uvc_fixture_stream_start(
+    node: usize,
+    format: narf_drivers_video::v4l2_ioctl::PixFormat,
+) -> narf_drivers_video::v4l2_ioctl::StreamHookFuture {
+    Box::pin(async move {
+        let transport = UVC_FIXTURE_TRANSPORT.lock().clone().ok_or(19)?;
+        // Same composition as production, minus the pump spawn: the
+        // fixture drives `pump_video_frames_with` itself, interleaved
+        // with DQBUF, because a smoke cannot rely on executor
+        // scheduling (block_on does not drive the executor).
+        crate::uvc::stream_start_with(&*transport, node, format).await
+    })
+}
+
+fn uvc_fixture_stream_stop(node: usize) -> narf_drivers_video::v4l2_ioctl::StreamHookFuture {
+    Box::pin(async move {
+        let transport = UVC_FIXTURE_TRANSPORT.lock().clone().ok_or(19)?;
+        crate::uvc::stream_stop_with(&*transport, node).await
+    })
+}
+
+fn uvc_fixture_stream_ops() -> narf_drivers_video::v4l2_ioctl::StreamOps {
+    narf_drivers_video::v4l2_ioctl::StreamOps {
+        start: uvc_fixture_stream_start,
+        stop: uvc_fixture_stream_stop,
+    }
+}
+
+/// Configuration descriptor set for the modelled camera: VC interface
+/// 0, VS interface 1 with one uncompressed YUYV 640×480 @30 fps format
+/// and an isochronous alt-1 endpoint (0x81, 1024-byte packets).
+fn uvc_fixture_config_blob() -> Vec<u8> {
+    let mut cfg = alloc::vec::Vec::new();
+    // Configuration header (wTotalLength patched at the end).
+    cfg.extend_from_slice(&[9, 2, 0, 0, 2, 1, 0, 0x80, 50]);
+    // Interface 0: VideoControl.
+    cfg.extend_from_slice(&[9, 4, 0, 0, 0, 0x0E, 0x01, 0x00, 0]);
+    // VC_HEADER (13 bytes): bcdUVC 1.0, wTotalLength 13,
+    // dwClockFrequency (4 bytes), one streaming interface (1).
+    cfg.extend_from_slice(&[13, 0x24, 0x01, 0x00, 0x01, 13, 0, 0x40, 0x9C, 0x47, 0, 1, 1]);
+    // Interface 1 alt 0: VideoStreaming, zero bandwidth.
+    cfg.extend_from_slice(&[9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0]);
+    // VS_INPUT_HEADER: 1 format, CS total 71, endpoint 0x81, terminal 1.
+    cfg.extend_from_slice(&[14, 0x24, 0x01, 1, 71, 0, 0x81, 0, 1, 0, 0, 0, 1, 0]);
+    // VS_FORMAT_UNCOMPRESSED: index 1, 1 frame, YUY2 GUID, 16 bpp.
+    cfg.extend_from_slice(&[27, 0x24, 0x04, 1, 1]);
+    cfg.extend_from_slice(&crate::uvc::GUID_FORMAT_YUY2);
+    cfg.extend_from_slice(&[16, 1, 0, 0, 0, 0]);
+    // VS_FRAME_UNCOMPRESSED: index 1, 640×480, default + only interval
+    // 333333 (30 fps), max frame buffer 614400 bytes.
+    cfg.extend_from_slice(&[30, 0x24, 0x05, 1, 0]);
+    cfg.extend_from_slice(&640u16.to_le_bytes());
+    cfg.extend_from_slice(&480u16.to_le_bytes());
+    cfg.extend_from_slice(&0u32.to_le_bytes()); // dwMinBitRate
+    cfg.extend_from_slice(&0u32.to_le_bytes()); // dwMaxBitRate
+    cfg.extend_from_slice(&614_400u32.to_le_bytes());
+    cfg.extend_from_slice(&333_333u32.to_le_bytes()); // default interval
+    cfg.push(1); // one discrete interval
+    cfg.extend_from_slice(&333_333u32.to_le_bytes());
+    // Interface 1 alt 1: VideoStreaming, one isochronous IN endpoint.
+    cfg.extend_from_slice(&[9, 4, 1, 1, 1, 0x0E, 0x02, 0x00, 0]);
+    cfg.extend_from_slice(&[7, 5, 0x81, 0x01, 0x00, 0x04, 1]);
+    let total = cfg.len() as u16;
+    cfg[2..4].copy_from_slice(&total.to_le_bytes());
+    cfg
+}
+
+/// The frame the modelled camera emits: two payload packets carrying
+/// `UVC-E2E-FRAME!` (FID set on both, EOF on the second).
+fn uvc_fixture_frame_packets() -> Vec<Vec<u8>> {
+    let mut first = alloc::vec![2u8, 0x81];
+    first.extend_from_slice(b"UVC-E2E-");
+    let mut second = alloc::vec![2u8, 0x83];
+    second.extend_from_slice(b"FRAME!");
+    alloc::vec![first, second]
+}
+
+// ── Fixture ioctl plumbing (mirrors the video crate's v4l2 mock) ────
+
+const FIXTURE_ARG: u64 = 512;
+
+fn fixture_eno(e: i64) -> u64 {
+    (-e) as u64
+}
+
+fn fixture_ioc(dir: u32, nr: u32, size: u32) -> u32 {
+    (dir << 30) | (size << 16) | ((b'V' as u32) << 8) | nr
+}
+
+struct FixtureCtx {
+    mem: IrqSafeSpinLock<Vec<u8>>,
+}
+
+impl FixtureCtx {
+    fn new() -> Self {
+        Self {
+            mem: IrqSafeSpinLock::new(alloc::vec![0u8; 8192]),
+        }
+    }
+    fn put_u32(&self, off: usize, v: u32) {
+        self.mem.lock()[FIXTURE_ARG as usize + off..FIXTURE_ARG as usize + off + 4]
+            .copy_from_slice(&v.to_ne_bytes());
+    }
+    fn get_u32(&self, off: usize) -> u32 {
+        let m = self.mem.lock();
+        let a = FIXTURE_ARG as usize + off;
+        u32::from_ne_bytes([m[a], m[a + 1], m[a + 2], m[a + 3]])
+    }
+}
+
+impl narf_filesystem::IoctlContext for FixtureCtx {
+    fn read(&self, a: u64, b: &mut [u8]) -> Result<(), narf_filesystem::FsError> {
+        let m = self.mem.lock();
+        let a = a as usize;
+        b.copy_from_slice(
+            m.get(a..a + b.len())
+                .ok_or(narf_filesystem::FsError::BadAddress)?,
+        );
+        Ok(())
+    }
+    fn write(&self, a: u64, b: &[u8]) -> Result<(), narf_filesystem::FsError> {
+        let mut m = self.mem.lock();
+        let a = a as usize;
+        m.get_mut(a..a + b.len())
+            .ok_or(narf_filesystem::FsError::BadAddress)?
+            .copy_from_slice(b);
+        Ok(())
+    }
+    fn nonblocking(&self) -> bool {
+        true
+    }
+}
+
+/// Poll a future once with a no-op waker.
+fn fixture_poll<F: Future>(fut: Pin<&mut F>) -> Poll<F::Output> {
+    fn raw() -> RawWaker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            raw()
+        }
+        unsafe fn noop(_: *const ()) {}
+        const V: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        RawWaker::new(core::ptr::null(), &V)
+    }
+    // SAFETY: the vtable's clone returns an equivalent waker and
+    // wake/drop are no-ops over a null data pointer that is never read.
+    let waker = unsafe { Waker::from_raw(raw()) };
+    let mut cx = Context::from_waker(&waker);
+    fut.poll(&mut cx)
+}
+
+/// Drive a future that must complete without external wakes (every
+/// modelled transfer is immediately ready). `None` = still pending
+/// after the poll budget — a fixture failure, never a hang.
+fn fixture_drive<F: Future>(fut: F) -> Option<F::Output> {
+    let mut fut = Box::pin(fut);
+    for _ in 0..100_000 {
+        if let Poll::Ready(v) = fixture_poll(fut.as_mut()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+type FixtureDevice = Arc<IrqSafeSpinLock<narf_drivers_video::devfs_bridge::VideoDevice>>;
+type FixtureEvents = Arc<IrqSafeSpinLock<narf_drivers_video::v4l2_ioctl::FdEvents>>;
+
+fn fixture_ioctl(
+    dev: &FixtureDevice,
+    events: &FixtureEvents,
+    ctx: &FixtureCtx,
+    cmd: u32,
+) -> Result<u64, &'static str> {
+    fixture_drive(narf_drivers_video::v4l2_ioctl::dispatch(
+        dev.clone(),
+        cmd,
+        FIXTURE_ARG,
+        ctx,
+        events.clone(),
+    ))
+    .ok_or("ioctl future pended")?
+    .map_err(|_| "ioctl faulted")
+}
+
+/// Reset all streaming state, bind the modelled camera, install the
+/// fixture stream hooks, and run S_FMT + REQBUFS(2) + QBUF×2 — the
+/// state from which STREAMON is meaningful.
+fn uvc_fixture_bound(
+    fail_probe: bool,
+    fail_set_interface: bool,
+) -> Result<
+    (
+        Arc<FixtureTransport>,
+        usize,
+        FixtureDevice,
+        FixtureCtx,
+        FixtureEvents,
+    ),
+    &'static str,
+> {
+    narf_drivers_video::devfs_bridge::__reset_for_test();
+    crate::uvc::__reset_uvc_for_test();
+    let transport = Arc::new(FixtureTransport::new(
+        fail_probe,
+        fail_set_interface,
+        uvc_fixture_frame_packets(),
+    ));
+    *UVC_FIXTURE_TRANSPORT.lock() = Some(transport.clone());
+
+    let blob = uvc_fixture_config_blob();
+    let idx = narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        7,
+        &blob,
+    ))
+    .map_err(|_| "bind against the modelled camera failed")?;
+    let (node, format_count) = {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = devices.get(idx).ok_or("bound device missing")?;
+        (device.video_node, device.formats.len())
+    };
+    if format_count != 1 {
+        return Err("bind should retain the parsed format table");
+    }
+    if !narf_drivers_video::devfs_bridge::set_stream_ops(node, uvc_fixture_stream_ops()) {
+        return Err("installing fixture stream hooks failed");
+    }
+    let dev = narf_drivers_video::devfs_bridge::get_device(node)
+        .ok_or("registered video device missing")?;
+    let events: FixtureEvents = Arc::new(IrqSafeSpinLock::new(
+        narf_drivers_video::v4l2_ioctl::FdEvents::new(),
+    ));
+    let ctx = FixtureCtx::new();
+
+    // S_FMT: YUYV 640×480 (v4l2_format pix fields at offset 8).
+    let yuyv = u32::from_le_bytes(*b"YUYV");
+    ctx.put_u32(0, 1);
+    ctx.put_u32(8, 640);
+    ctx.put_u32(12, 480);
+    ctx.put_u32(16, yuyv);
+    if fixture_ioctl(&dev, &events, &ctx, fixture_ioc(1, 5, 208))? != 0 {
+        return Err("S_FMT should succeed");
+    }
+    // REQBUFS: 2 MMAP buffers.
+    ctx.put_u32(0, 2);
+    ctx.put_u32(4, 1);
+    ctx.put_u32(8, 1);
+    if fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 8, 20))? != 0 {
+        return Err("REQBUFS should succeed");
+    }
+    // QBUF both buffers.
+    for index in 0..2u32 {
+        ctx.put_u32(0, index);
+        ctx.put_u32(4, 1);
+        ctx.put_u32(60, 1);
+        if fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 15, 88))? != 0 {
+            return Err("QBUF should succeed");
+        }
+    }
+    Ok((transport, idx, dev, ctx, events))
+}
+
+fn fixture_streamon(
+    dev: &FixtureDevice,
+    events: &FixtureEvents,
+    ctx: &FixtureCtx,
+) -> Result<u64, &'static str> {
+    ctx.put_u32(0, 1);
+    fixture_ioctl(dev, events, ctx, fixture_ioc(1, 18, 4))
+}
+
+fn fixture_streamoff(
+    dev: &FixtureDevice,
+    events: &FixtureEvents,
+    ctx: &FixtureCtx,
+) -> Result<u64, &'static str> {
+    ctx.put_u32(0, 1);
+    fixture_ioctl(dev, events, ctx, fixture_ioc(1, 19, 4))
+}
+
+/// Position of the first occurrence of `needle` in the transfer log.
+fn fixture_log_pos(log: &[FixtureXfer], needle: &FixtureXfer) -> Option<usize> {
+    log.iter().position(|x| x == needle)
+}
+
+fn smoke_uvc_streamon_composition_e2e() -> TestResult {
+    let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(false, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // STREAMON must run the hardware composition, not just flip state.
+    match fixture_streamon(&dev, &events, &ctx) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("STREAMON should succeed"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if !dev.lock().streaming {
+        return TestResult::Fail("device should be streaming after STREAMON");
+    }
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        match devices[idx].active_stream {
+            Some(ep) if ep.alternate_setting == 1 && ep.dci == 3 => {}
+            _ => return TestResult::Fail("STREAMON should activate alt 1 (DCI 3)"),
+        }
+    }
+    // Drive the capture pump, interleaved with nonblocking DQBUF, until
+    // the modelled frame lands in a queued buffer.
+    let generation = crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    let mut pump = Box::pin(crate::uvc::pump_video_frames_with(
+        idx,
+        &*transport,
+        generation,
+    ));
+    let mut dequeued = false;
+    for _ in 0..10_000 {
+        let _ = fixture_poll(pump.as_mut());
+        ctx.put_u32(4, 1);
+        ctx.put_u32(60, 1);
+        match fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 17, 88)) {
+            Ok(0) => {
+                dequeued = true;
+                break;
+            }
+            Ok(r) if r == fixture_eno(11) => continue,
+            Ok(_) => return TestResult::Fail("DQBUF should succeed or EAGAIN"),
+            Err(e) => return TestResult::Fail(e),
+        }
+    }
+    if !dequeued {
+        return TestResult::Fail("DQBUF never returned the modelled frame");
+    }
+    if ctx.get_u32(0) != 0 {
+        return TestResult::Fail("dequeued buffer should be index 0");
+    }
+    if ctx.get_u32(8) as usize != b"UVC-E2E-FRAME!".len() {
+        return TestResult::Fail("bytesused should equal the modelled frame length");
+    }
+    let bytes_ok = {
+        let g = dev.lock();
+        let f0 = g.buffers[0].frames[0];
+        let p = f0.start_address().kernel_ptr::<u8>();
+        let mut buf = [0u8; 14];
+        // SAFETY: f0 is an allocated frame owned by buffer 0; its
+        // direct-map pointer is valid for the 14 delivered bytes.
+        unsafe { core::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), 14) };
+        &buf == b"UVC-E2E-FRAME!"
+    };
+    if !bytes_ok {
+        return TestResult::Fail("buffer should contain the modelled frame bytes");
+    }
+    // STREAMOFF reverses the composition.
+    match fixture_streamoff(&dev, &events, &ctx) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("STREAMOFF should succeed"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if dev.lock().streaming {
+        return TestResult::Fail("STREAMOFF should clear streaming");
+    }
+    // The pump is parked in `isoch_in` (the modelled device sources
+    // nothing on alt 0), so stage one packet to wake it — the same
+    // wake the next stream's traffic would give it on hardware. The
+    // frame it completes belongs to the stopped stream: the pump
+    // must drop it at the pre-delivery lifecycle check, not deliver
+    // it into the reset queues, and exit cleanly.
+    transport.stage_packet(alloc::vec![2u8, 0x83, b'W', b'A', b'K', b'E', b'!']);
+    // The pump observes the stop request and exits cleanly.
+    let mut pump_done = None;
+    for _ in 0..10_000 {
+        if let Poll::Ready(r) = fixture_poll(pump.as_mut()) {
+            pump_done = Some(r);
+            break;
+        }
+    }
+    if !matches!(pump_done, Some(Ok(()))) {
+        return TestResult::Fail("pump should exit Ok after STREAMOFF");
+    }
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        if devices[idx].active_stream.is_some() {
+            return TestResult::Fail("STREAMOFF should clear the active stream");
+        }
+    }
+    // The transfer conversation: probe before commit, commit carries
+    // the device-accepted values, SET_INTERFACE after commit, isoc
+    // only after activation, alt 0 released at teardown.
+    let log = transport.log();
+    let desired = crate::uvc::VsProbeCommit {
+        hint: 1,
+        format_index: 1,
+        frame_index: 1,
+        frame_interval: 333_333,
+        ..Default::default()
+    };
+    let mut accepted = desired;
+    accepted.max_video_frame_size = 614_400;
+    accepted.max_payload_transfer_size = 1024;
+    let probe_payload = log.iter().find_map(|x| match x {
+        FixtureXfer::SetCurProbe { payload } => Some(*payload),
+        _ => None,
+    });
+    if probe_payload != Some(desired.encode()) {
+        return TestResult::Fail("SET_CUR(PROBE) should carry the desired stream parameters");
+    }
+    let commit_payload = log.iter().find_map(|x| match x {
+        FixtureXfer::SetCurCommit { payload } => Some(*payload),
+        _ => None,
+    });
+    if commit_payload != Some(accepted.encode()) {
+        return TestResult::Fail("SET_CUR(COMMIT) should carry the device-accepted parameters");
+    }
+    let pos = |needle: &FixtureXfer| fixture_log_pos(&log, needle);
+    let positions = [
+        pos(&FixtureXfer::SetConfiguration),
+        log.iter()
+            .position(|x| matches!(x, FixtureXfer::SetCurProbe { .. })),
+        pos(&FixtureXfer::GetCurProbe),
+        log.iter()
+            .position(|x| matches!(x, FixtureXfer::SetCurCommit { .. })),
+        pos(&FixtureXfer::ConfigureEndpoints { ep_addr: 0x81 }),
+        pos(&FixtureXfer::SetInterface {
+            interface: 1,
+            alt: 1,
+        }),
+        pos(&FixtureXfer::IsochIn),
+    ];
+    let mut order = Vec::new();
+    for position in positions {
+        match position {
+            Some(p) => order.push(p),
+            None => return TestResult::Fail("conversation is missing a required transfer"),
+        }
+    }
+    if !order.windows(2).all(|w| w[0] < w[1]) {
+        return TestResult::Fail("transfer conversation is out of order");
+    }
+    let last_set_interface = log.iter().rev().find_map(|x| match x {
+        FixtureXfer::SetInterface { alt, .. } => Some(*alt),
+        _ => None,
+    });
+    if last_set_interface != Some(0) {
+        return TestResult::Fail("teardown should end with SET_INTERFACE alt 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_composition_e2e);
+
+fn smoke_uvc_streamon_probe_failure_fails_ioctl() -> TestResult {
+    let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(true, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // A failed PROBE negotiation must fail STREAMON — the pre-#803
+    // behaviour (silent local-state success) is the black-stream bug.
+    match fixture_streamon(&dev, &events, &ctx) {
+        Ok(r) if r == fixture_eno(5) => {}
+        Ok(_) => return TestResult::Fail("STREAMON should fail with EIO when PROBE fails"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if dev.lock().streaming {
+        return TestResult::Fail("device must not be streaming after a failed STREAMON");
+    }
+    let log = transport.log();
+    if !log
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetCurProbe { .. }))
+    {
+        return TestResult::Fail("the failed PROBE attempt should be in the log");
+    }
+    if log
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetCurCommit { .. }))
+    {
+        return TestResult::Fail("COMMIT must not follow a failed PROBE");
+    }
+    if log
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::ConfigureEndpoints { .. }))
+    {
+        return TestResult::Fail("no endpoint may be configured after a failed PROBE");
+    }
+    if crate::uvc::UVC_DEVICES.lock()[idx].active_stream.is_some() {
+        return TestResult::Fail("no stream may be active after a failed STREAMON");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_streamon_probe_failure_fails_ioctl
+);
+
+fn smoke_uvc_streamon_activation_failure_unwinds() -> TestResult {
+    let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(false, true) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // SET_INTERFACE(alt 1) stalls after a successful COMMIT: STREAMON
+    // fails, and the composition unwinds the commit by returning the
+    // interface to its zero-bandwidth alternate.
+    match fixture_streamon(&dev, &events, &ctx) {
+        Ok(r) if r == fixture_eno(5) => {}
+        Ok(_) => return TestResult::Fail("STREAMON should fail with EIO when activation fails"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if dev.lock().streaming {
+        return TestResult::Fail("device must not be streaming after a failed STREAMON");
+    }
+    if crate::uvc::UVC_DEVICES.lock()[idx].active_stream.is_some() {
+        return TestResult::Fail("no stream may be active after a failed STREAMON");
+    }
+    let log = transport.log();
+    if !log
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetCurCommit { .. }))
+    {
+        return TestResult::Fail("COMMIT should have succeeded before activation");
+    }
+    let alt1 = fixture_log_pos(
+        &log,
+        &FixtureXfer::SetInterface {
+            interface: 1,
+            alt: 1,
+        },
+    );
+    let alt0 = fixture_log_pos(
+        &log,
+        &FixtureXfer::SetInterface {
+            interface: 1,
+            alt: 0,
+        },
+    );
+    match (alt1, alt0) {
+        (Some(a1), Some(a0)) if a0 > a1 => {}
+        _ => {
+            return TestResult::Fail("failed activation should be unwound with SET_INTERFACE alt 0")
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_streamon_activation_failure_unwinds
+);
+
+// ── Generation-toggle fixture helpers ─────────────────────────────
+
+/// Poll a hand-driven future until it completes; `None` = still
+/// pending after the poll budget (a fixture failure, never a hang).
+fn fixture_poll_until_ready<F: Future>(mut fut: Pin<&mut F>) -> Option<F::Output> {
+    for _ in 0..10_000 {
+        if let Poll::Ready(v) = fixture_poll(fut.as_mut()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// QBUF both capture buffers (STREAMOFF returns them to the
+/// dequeued state, so a fresh stream needs them re-queued).
+fn fixture_qbuf_all(
+    dev: &FixtureDevice,
+    events: &FixtureEvents,
+    ctx: &FixtureCtx,
+) -> Result<(), &'static str> {
+    for index in 0..2u32 {
+        ctx.put_u32(0, index);
+        ctx.put_u32(4, 1);
+        ctx.put_u32(60, 1);
+        if fixture_ioctl(dev, events, ctx, fixture_ioc(3, 15, 88))? != 0 {
+            return Err("QBUF should succeed");
+        }
+    }
+    Ok(())
+}
+
+/// Outcome of one nonblocking DQBUF against the fixture device.
+enum FixtureDqbuf {
+    Frame(Vec<u8>),
+    Again,
+    Failed(&'static str),
+}
+
+fn fixture_dqbuf(dev: &FixtureDevice, events: &FixtureEvents, ctx: &FixtureCtx) -> FixtureDqbuf {
+    ctx.put_u32(4, 1);
+    ctx.put_u32(60, 1);
+    match fixture_ioctl(dev, events, ctx, fixture_ioc(3, 17, 88)) {
+        Ok(0) => {}
+        Ok(r) if r == fixture_eno(11) => return FixtureDqbuf::Again,
+        Ok(_) => return FixtureDqbuf::Failed("DQBUF should succeed or EAGAIN"),
+        Err(e) => return FixtureDqbuf::Failed(e),
+    }
+    let index = ctx.get_u32(0) as usize;
+    let used = ctx.get_u32(8) as usize;
+    if used > 4096 {
+        return FixtureDqbuf::Failed("DQBUF reported an implausible bytesused");
+    }
+    let bytes = {
+        let g = dev.lock();
+        let f0 = g.buffers[index].frames[0];
+        let p = f0.start_address().kernel_ptr::<u8>();
+        let mut buf = alloc::vec![0u8; used];
+        // SAFETY: f0 is an allocated frame owned by the dequeued
+        // buffer; its direct-map pointer is valid for the `used`
+        // bytes the V4L2 layer recorded from the delivered frame.
+        unsafe { core::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), used) };
+        buf
+    };
+    FixtureDqbuf::Frame(bytes)
+}
+
+/// One UVC payload packet: 2-byte header (length, `flags`) + payload.
+fn uvc_fixture_packet(flags: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = alloc::vec![2u8, flags];
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// The stream-generation protocol under a STREAMOFF → STREAMON
+/// toggle, driven at the state-machine level with faithfully parked
+/// pumps. This is the interleave the composition e2e cannot see: its
+/// modelled transport used to answer empty reads immediately, so its
+/// pump always observed teardown at a loop top before STREAMOFF
+/// returned. Here `isoch_in` parks like hardware, so a pump can be
+/// held mid-await across the whole toggle.
+///
+/// Phase A (stale delivery): a frame in flight across STREAMOFF
+/// completes only after the buffer reset; the pump must drop it at
+/// the pre-delivery check, and it must not surface in the next
+/// stream's queue.
+///
+/// Phase B (the wedge): STREAMON for generation 2, park its pump,
+/// STREAMOFF, STREAMON for generation 3. The pump claim must succeed
+/// for generation 3 despite the generation-2 pump still being marked
+/// (the old boolean protocol declined the spawn here and left the
+/// device streaming with no pump — a silent black stream). The
+/// parked pump then wakes on the new stream's packets, exits without
+/// delivering and without consuming generation-3 state, and its
+/// exit bookkeeping must not clear the generation-3 pump's mark.
+fn smoke_uvc_streamon_generation_toggle() -> TestResult {
+    let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(false, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let stream_generation = |idx: usize| crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    let pump_mark = |idx: usize| crate::uvc::UVC_DEVICES.lock()[idx].capture_pump_generation;
+
+    // ── Phase A: in-flight frame across STREAMOFF is dropped ─────
+    if fixture_streamon(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMON (gen 1) should succeed");
+    }
+    if stream_generation(idx) != 1 {
+        return TestResult::Fail("first activation should bump the stream generation to 1");
+    }
+    // Mirror the production spawn wrapper: claim, then drive the
+    // pump by hand.
+    if crate::uvc::claim_capture_pump(idx) != Some(1) {
+        return TestResult::Fail("pump claim for generation 1 should succeed");
+    }
+    let mut pump1 = Box::pin(crate::uvc::pump_video_frames_with(idx, &*transport, 1));
+    // The bind staged one frame (UVC-E2E-FRAME!): pump it to DQBUF.
+    let mut frame_a = None;
+    for _ in 0..10_000 {
+        let _ = fixture_poll(pump1.as_mut());
+        match fixture_dqbuf(&dev, &events, &ctx) {
+            FixtureDqbuf::Frame(bytes) => {
+                frame_a = Some(bytes);
+                break;
+            }
+            FixtureDqbuf::Again => continue,
+            FixtureDqbuf::Failed(e) => return TestResult::Fail(e),
+        }
+    }
+    if frame_a.as_deref() != Some(b"UVC-E2E-FRAME!".as_slice()) {
+        return TestResult::Fail("gen-1 pump should deliver the staged frame");
+    }
+    // Start a second gen-1 frame (FID flips to 0) but stage only its
+    // first packet: the frame is in flight, straddling the STREAMOFF.
+    transport.stage_packet(uvc_fixture_packet(0x80, b"STALE-"));
+    for _ in 0..1_000 {
+        if transport.pending_packets() == 0 {
+            break;
+        }
+        let _ = fixture_poll(pump1.as_mut());
+    }
+    if transport.pending_packets() != 0 {
+        return TestResult::Fail("gen-1 pump should consume the in-flight packet");
+    }
+    if !matches!(fixture_dqbuf(&dev, &events, &ctx), FixtureDqbuf::Again) {
+        return TestResult::Fail("the in-flight frame must not be delivered before EOF");
+    }
+    // STREAMOFF: stop requested for gen 1, buffers reset. The pump
+    // is parked in `isoch_in`, waiting for the frame's second packet.
+    if fixture_streamoff(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMOFF (gen 1) should succeed");
+    }
+    // The frame completes *after* the reset. The pump wakes, hits the
+    // pre-delivery lifecycle check, drops it, and exits.
+    transport.stage_packet(uvc_fixture_packet(0x82, b"FRAME"));
+    match fixture_poll_until_ready(pump1.as_mut()) {
+        Some(Ok(())) => {}
+        _ => {
+            return TestResult::Fail("gen-1 pump should exit Ok once its in-flight frame resolves")
+        }
+    }
+    // Mirror the wrapper's exit bookkeeping.
+    crate::uvc::release_capture_pump(idx, 1);
+    if pump_mark(idx) != 0 {
+        return TestResult::Fail("a current-generation pump's exit should clear the pump mark");
+    }
+
+    // ── Phase B: the toggle must not wedge ───────────────────────
+    if fixture_qbuf_all(&dev, &events, &ctx).is_err() {
+        return TestResult::Fail("QBUF before gen-2 STREAMON should succeed");
+    }
+    if fixture_streamon(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMON (gen 2) should succeed");
+    }
+    if stream_generation(idx) != 2 {
+        return TestResult::Fail("second activation should bump the stream generation to 2");
+    }
+    // The stale gen-1 frame was dropped, not left for this stream:
+    // DQBUF on the fresh stream must find nothing.
+    if !matches!(fixture_dqbuf(&dev, &events, &ctx), FixtureDqbuf::Again) {
+        return TestResult::Fail("the stale gen-1 frame must not surface in the gen-2 stream");
+    }
+    if crate::uvc::claim_capture_pump(idx) != Some(2) {
+        return TestResult::Fail("pump claim for generation 2 should succeed");
+    }
+    let mut pump2 = Box::pin(crate::uvc::pump_video_frames_with(idx, &*transport, 2));
+    // Park the gen-2 pump mid-await: no packets staged, every poll
+    // pends inside `isoch_in`.
+    let mut parked = true;
+    for _ in 0..16 {
+        if !matches!(fixture_poll(pump2.as_mut()), Poll::Pending) {
+            parked = false;
+        }
+    }
+    if !parked {
+        return TestResult::Fail("gen-2 pump should be parked in isoch_in with nothing staged");
+    }
+    // The format-change toggle: STREAMOFF, then STREAMON again —
+    // while the gen-2 pump is still parked and still marked.
+    if fixture_streamoff(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMOFF (gen 2) should succeed");
+    }
+    if pump_mark(idx) != 2 {
+        return TestResult::Fail("the parked gen-2 pump should still be marked before gen 3");
+    }
+    if fixture_qbuf_all(&dev, &events, &ctx).is_err() {
+        return TestResult::Fail("QBUF before gen-3 STREAMON should succeed");
+    }
+    if fixture_streamon(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMON (gen 3) should succeed");
+    }
+    if stream_generation(idx) != 3 {
+        return TestResult::Fail("third activation should bump the stream generation to 3");
+    }
+    // THE wedge pin: a pump for the new generation must be claimable
+    // even though the gen-2 pump never exited.
+    if crate::uvc::claim_capture_pump(idx) != Some(3) {
+        return TestResult::Fail(
+            "pump claim for generation 3 must not be declined for a stale pump",
+        );
+    }
+    let mut pump3 = Box::pin(crate::uvc::pump_video_frames_with(idx, &*transport, 3));
+    // The new stream's first traffic wakes the parked gen-2 pump (a
+    // sacrificial errored packet stands in for it). It must exit on
+    // the generation check — delivering nothing, consuming nothing
+    // of generation 3's lifecycle state.
+    transport.stage_packet(uvc_fixture_packet(0xC1, b"X"));
+    match fixture_poll_until_ready(pump2.as_mut()) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("gen-2 pump should exit Ok when woken by gen-3 traffic"),
+    }
+    if !matches!(fixture_dqbuf(&dev, &events, &ctx), FixtureDqbuf::Again) {
+        return TestResult::Fail("the stale gen-2 pump must not deliver into the gen-3 stream");
+    }
+    // Its exit bookkeeping (wrapper mirror) must not clear the
+    // generation-3 pump's mark.
+    crate::uvc::release_capture_pump(idx, 2);
+    if pump_mark(idx) != 3 {
+        return TestResult::Fail("a stale pump's exit must not clear its successor's mark");
+    }
+    // The gen-3 pump delivers the gen-3 frame.
+    transport.stage_packet(uvc_fixture_packet(0x81, b"GEN3-"));
+    transport.stage_packet(uvc_fixture_packet(0x83, b"FRAME"));
+    let mut frame_3 = None;
+    for _ in 0..10_000 {
+        let _ = fixture_poll(pump3.as_mut());
+        match fixture_dqbuf(&dev, &events, &ctx) {
+            FixtureDqbuf::Frame(bytes) => {
+                frame_3 = Some(bytes);
+                break;
+            }
+            FixtureDqbuf::Again => continue,
+            FixtureDqbuf::Failed(e) => return TestResult::Fail(e),
+        }
+    }
+    if frame_3.as_deref() != Some(b"GEN3-FRAME".as_slice()) {
+        return TestResult::Fail("gen-3 pump should deliver the gen-3 frame");
+    }
+    // Final state: streaming, generation 3, exactly the gen-3 pump
+    // marked alive.
+    if !dev.lock().streaming {
+        return TestResult::Fail("device should still be streaming after the toggle");
+    }
+    if stream_generation(idx) != 3 || pump_mark(idx) != 3 {
+        return TestResult::Fail("exactly the gen-3 pump should be marked after the toggle");
+    }
+    // Cleanup: STREAMOFF + a wake packet retires the gen-3 pump.
+    if fixture_streamoff(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("final STREAMOFF should succeed");
+    }
+    transport.stage_packet(uvc_fixture_packet(0x83, b"DONE!"));
+    match fixture_poll_until_ready(pump3.as_mut()) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("gen-3 pump should exit Ok after the final STREAMOFF"),
+    }
+    crate::uvc::release_capture_pump(idx, 3);
+    if pump_mark(idx) != 0 {
+        return TestResult::Fail("pump mark should be clear after the final exit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_generation_toggle);

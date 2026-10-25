@@ -12,10 +12,11 @@ The sound-card registry, PCM lifecycle, mixer and file bridge live in
 Mixing, resampling and policy belong to a future userspace audio service.
 
 The implemented native profile is analog HDA, LPCM HDMI/DisplayPort audio
-(stereo to 7.1) on AMD GPU HD-Audio, and ACP PDM. Compressed (non-PCM/HBR)
-HDMI passthrough, user channel maps, SoundWire codecs, vendor smart-amplifier fixups and DSP firmware
-execution are outside this profile. PCI identity alone does not establish
-which codec or amplifier a laptop contains.
+(stereo to 7.1) on AMD GPU HD-Audio, ACP PDM, and SoundWire codecs on the
+ACP 6.3 SDW manager (generic codec conversation, §3.2). Compressed
+(non-PCM/HBR) HDMI passthrough, user channel maps, vendor smart-amplifier
+fixups and DSP firmware execution are outside this profile. PCI identity
+alone does not establish which codec or amplifier a laptop contains.
 
 ## 2. Assumptions
 
@@ -149,6 +150,45 @@ translated through 4 KiB scratch-RAM PTEs. It needs no DSP firmware.
 The previous generic I2S/RI-upload scaffold is unbound; its direct bring-up
 and firmware methods return UnsupportedDevice without touching hardware.
 
+`soundwire` is the MIPI SoundWire bus layer, transport-abstract (one
+command frame out, one classified ACK/ignored/timeout response back):
+`Bus::enumerate` reads the six DevID registers at the enumeration address,
+assigns device numbers 1..=11 through `SCP_DEVNUMBER` and verifies each
+assignment, ending cleanly when a DevID read goes unanswered and failing
+closed on any other transport error; `read_reg`/`write_reg` carry
+peripheral register access (broadcast writes permitted); the stream
+surface programs a data port's transport parameters (`DPn_BLOCKCTRL1`
+word length, `DPn_SAMPLECTRL1/2` sample interval), writes `DPn_PREPARE`
+and polls its NotFinished bits under a bounded wait, then sets
+`DPn_CHANNELEN` to enable and clears it to disable, clearing
+`DPN_PREPARE` on deprepare. Streams are configured while stopped;
+glitchless bank switching mid-stream is out of scope.
+
+`acp63_sdw::probe`, `register_pci_driver`, `is_probed`, `capture_card`
+bind the ACP 6.3 function's SDW0 manager for pin configurations without
+PDM (the PDM probe declines those, and this driver is the next candidate
+for the function — but note the dispatcher dependency: `probe_all` as
+of this writing attempts only the single best match per device, so
+this binding is inert until the candidate-walking dispatcher (PR #852)
+is on main; required merge order is #852 before this binding.
+Configurations where PDM and SoundWire coexist stay with the PDM
+binding). Probe powers the ACP up, initialises the manager (enable,
+bus reset, 50×10 frame shape, interrupt masks), enumerates, and
+publishes one sound card per enumerated codec through the registry,
+using the generic codec profile (DP1 sink + DP1 source, stereo S16LE
+48 kHz). A bus with no answering codec publishes nothing. The card
+implements the PCM lifecycle against the bus (configure/prepare/enable/
+disable/deprepare); moving PCM payload between host memory and the
+wire is the ACP SDW DMA engine's job, a separate hardware block whose
+register model is not in-tree yet, so payload reads/writes report
+BadState until that engine lands (follow-up to #780).
+
+Intel SoundWire links are not bound here: in the tree's platform model
+they are owned by the audio DSP (SOF), whose in-tree surface is a
+register-level stub with no link enumeration or firmware path. Binding
+them is a follow-up to #780, not a gap in the bus layer, which is
+controller-agnostic.
+
 ### 3.3 Registration and service
 
 The registered `PcmDevice::capabilities` supplies ALSA negotiation constraints.
@@ -233,7 +273,10 @@ proofs, not evidence of audible playback or microphone quality on Lenovo 50ee.
 
 Physical validation must establish the actual HDA codec, BIOS route quality,
 jack behavior and whether speaker amplifiers need a model-specific quirk.
-SoundWire, HDMI/DP and system power-transition reinitialization remain separate
-implementation work. PCM pause/resume preserves DMA buffers and position.
+HDMI/DP and system power-transition reinitialization remain separate
+implementation work. SoundWire follow-ups to #780 remain: the ACP SDW DMA
+payload engine, PDM+SoundWire coexisting ACP pin configurations, Intel
+DSP/SOF-owned SoundWire links, and vendor codec profiles (jack/amp
+sequences) beyond the generic conversation. PCM pause/resume preserves DMA buffers and position.
 The shared sound bridge supplies Linux ALSA ioctl/mmap/poll for the registered
 native endpoints, subject to its documented feature limits.

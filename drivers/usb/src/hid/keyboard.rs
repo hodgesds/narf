@@ -474,6 +474,16 @@ pub fn unregister_keyboard_evdev(slot_id: u8) {
     }
 }
 
+/// Unregister every bound report-protocol keyboard. Called on a
+/// controller recovery epoch change, where every slot is dead by
+/// construction.
+pub fn unregister_all_keyboards() {
+    let slots: alloc::vec::Vec<u8> = USB_KEYBOARDS.lock().iter().map(|k| k.slot_id).collect();
+    for slot in slots {
+        unregister_keyboard_evdev(slot);
+    }
+}
+
 /// Drain reports from all bound USB keyboards, push events. Returns
 /// total events across all keyboards.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {

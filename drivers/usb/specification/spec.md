@@ -183,6 +183,15 @@ also consult upstream Linux GPL sources.
   terminal completions and copy-out. Error/cancellation keeps EP0 busy; a new
   software firmware owner cannot reuse an ambiguous TD's buffer. Disable Slot
   invalidates handles before command publication and retains all mappings.
+- USB Ethernet class drivers (`r8152`, `cdc_ncm`) publish each bound device
+  through `narf_net::iface::register_with_context` as `usb-rtl{N}` /
+  `usb-ncm{N}`, where `N` is the driver's device-record index and the
+  registration cookie is that same index. The send hook resolves the cookie
+  to the bound device's own record (slot + bulk-OUT DCI) — there is no
+  shared or default-device TX path. The published station address is read
+  from the device at bind (never synthesised); a device that reports no
+  valid address fails the bind. Link state is republished through
+  `iface::set_link_metadata` as the driver samples it.
 - Address Device reserves a slot before DMA setup, retains Input/Device
   Contexts plus EP0 ring/page before DCBAA publication, and adopts them only
   after the exact command TRB succeeds. Address, Configure, Evaluate, Disable
@@ -256,6 +265,23 @@ also consult upstream Linux GPL sources.
   entries against the device descriptor and class-triple entries against
   Interface Descriptors in `config`. A class-only entry is an explicit
   `(0, 0)` VID/PID wildcard, not a match for an unrelated interface.
+- Disconnect lifecycle: the supervisor polls connection state each cycle.
+  A claimed root port (or bound hub downstream port) that leaves the
+  connected set is detached via `attach::detach_slot`: class bindings are
+  dropped first (evdev nodes unregister; registered drivers are reached
+  through `class_registry::dispatch_unbind`, a broadcast of the optional
+  hook from `register_class_driver_with_unbind`), a hub's bound subtree
+  is detached recursively and its `HUBS` entry removed, then the slot is
+  disabled and reclaimed (`Xhci::reclaim_slot`) so a replug re-runs
+  attach from scratch. A controller recovery epoch change drops every
+  binding wholesale (`attach::detach_all_bindings`) and re-enumeration
+  follows; on that path the pumped classes are cleared from their
+  registries and every MSC device is removed and unpublished
+  (`msc::unbind_all_msc`). On the per-slot detach path, classes the
+  supervisor does not pump (MSC / UAC / UVC / CDC-NCM / btusb / CCID)
+  get the slot disable + reclaim but no class-registry removal yet;
+  the remaining non-pumped classes keep their registries across
+  recovery as well.
 - `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
   endpoint with its owning interface and alternate setting.
   `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest
@@ -264,6 +290,29 @@ also consult upstream Linux GPL sources.
   26-byte SET_CUR(PROBE) / GET_CUR(PROBE) / SET_CUR(COMMIT) sequence, configures
   the accepted endpoint, issues `SET_INTERFACE`, and starts an IRQ-driven
   packet/frame pump into the camera's registered `/dev/video<N>` queue.
+- The V4L2 surface drives that composition. Bind
+  (`try_bind_video_already_addressed`) retains the parsed `StreamFormat`
+  table on the device and installs `video_stream_ops()` on the registered
+  `/dev/video<N>` node. `VIDIOC_STREAMON` awaits the start hook — which
+  maps the `VIDIOC_S_FMT`-committed format back through the retained
+  table (frame interval: nearest 30 fps; no frame-rate surface reaches
+  STREAMON) and runs the negotiation above — *before* the device is
+  marked streaming; a negotiation or activation failure fails the ioctl
+  (`EIO`, or `ENODEV` when the device/controller is gone) and leaves the
+  device non-streaming. If activation fails after COMMIT succeeded, the
+  VideoStreaming interface is returned to alternate setting 0 before the
+  error propagates. `VIDIOC_STREAMOFF` awaits the reverse teardown
+  (`deactivate_video_stream`: capture-pump stop request, then
+  `SET_INTERFACE` to alternate setting 0) before local buffer state is
+  reset. The composition (bind, negotiate, activate, deactivate, pump)
+  is generic over the narrow `UvcTransport` seam (control in/out,
+  endpoint configuration, isochronous receive); production implements
+  it on `Xhci`, and the end-to-end kernel fixture
+  (`smoke_uvc_streamon_composition_e2e`) implements it on a modelled
+  camera and asserts the transfer conversation through the real V4L2
+  dispatch. The pump receives through the single `UvcTransport::isoch_in`
+  call site, behind which the depth-4 isochronous pipelining work (#808)
+  slots in without changing the composition.
 - `try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
   config)` binds the standard Bluetooth USB interface. For a recognised
   WCN6855 ID it completes the Qualcomm USB firmware/status protocol before
@@ -278,6 +327,26 @@ also consult upstream Linux GPL sources.
   status from the 0xE4 WMT event); a failed vendor setup fails the bind.
   Firmware pairs are the `btusb_quirks::firmware_paths` names under the
   vendor prefix (`intel/`, `mediatek/`).
+- `MSC_DEVICES` entries are tombstoned on detach, never shifted: a bind
+  reuses the first tombstone, so the `usb-msc{idx}` block name is stable
+  across unplug/replug. Each entry carries a monotonic bind generation
+  stamped at bind; a `UsbMscBlockDevice` adapter captures it and fails
+  with `BlockIoError::DeviceRemoved` once its device is detached *or*
+  its index is reused by a later bind — a held adapter is never served
+  by the next disk to occupy its index, and a rebind of the same disk
+  (a new bind, a new generation) does not resurrect it.
+- `msc::detach_msc(slot_id)` is MSC's publication teardown — tombstone the
+  slot's entries, then unregister the `usb-msc{idx}` disk and its partition
+  children (children first) from the block registry. It is registered as a
+  class-registry unbind hook (`register_class_driver_with_unbind`, BOT
+  class triple) and reached via `dispatch_unbind` on the supervisor's
+  detach path; MSC binding itself stays in the attach cascade, and the
+  registry probe always declines. `msc::unbind_all_msc()` is the wholesale
+  variant for controller-recovery teardown.
+- `serial::devfs_bridge::unregister_tty_usb(index)` is the detach half of
+  `register_tty_usb`: it removes the port from the ttyUSB node table and
+  withdraws the `/sys/class/tty/ttyUSB<N>` kobject. Indices are not
+  recycled; a replugged adapter republishes under a fresh index.
 
 ## Scope
 

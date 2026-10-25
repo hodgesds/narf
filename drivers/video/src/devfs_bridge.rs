@@ -95,6 +95,11 @@ pub struct VideoDevice {
     pub controls: Vec<crate::v4l2_ioctl::ControlState>,
     /// Whether `VIDIOC_STREAMON` is active.
     pub streaming: bool,
+    /// Hardware streaming hooks installed by the owning class driver
+    /// (see [`crate::v4l2_ioctl::StreamOps`]). `None` for synthetic
+    /// nodes with no hardware behind them: STREAMON/STREAMOFF then
+    /// keep their local-state-only behaviour.
+    pub stream_ops: Option<crate::v4l2_ioctl::StreamOps>,
     /// `V4L2_MEMORY_MMAP` buffer pool (`VIDIOC_REQBUFS`).
     pub buffers: Vec<crate::v4l2_ioctl::V4l2Buffer>,
     /// Running capture sequence counter, stamped into dequeued buffers.
@@ -127,6 +132,7 @@ impl VideoDevice {
             formats,
             controls: crate::v4l2_ioctl::default_controls(),
             streaming: false,
+            stream_ops: None,
             buffers: Vec::new(),
             sequence: 0,
             readiness: Arc::new(Readiness::new(0)),
@@ -243,6 +249,20 @@ pub fn register_video_with_formats(name: &str, formats: Vec<crate::v4l2_ioctl::F
     VIDEO_NODES.lock().push(dev);
     register_sysfs(idx, name);
     idx
+}
+
+/// Install hardware streaming hooks on a registered video device (see
+/// [`crate::v4l2_ioctl::StreamOps`]). Called by the class driver that
+/// bound the hardware, right after registration. Returns `false` when
+/// no device with `index` is registered.
+pub fn set_stream_ops(index: usize, ops: crate::v4l2_ioctl::StreamOps) -> bool {
+    match get_device(index) {
+        Some(dev) => {
+            dev.lock().stream_ops = Some(ops);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Retrieve the device state for video<N>, if registered.
