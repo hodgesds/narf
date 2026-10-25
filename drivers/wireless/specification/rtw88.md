@@ -1,6 +1,6 @@
 # rtw88 — Specification
 
-> Status: **v0.6** (RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
+> Status: **v0.8** (RTL8821CE retained firmware/inactive MAC/PHY tables; RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
 > signed operating-power qualification, native packets and channel1 station
 > integration; composed software gates and physical acceptance remain distinct).
 >
@@ -11,7 +11,8 @@
 ## 1. Purpose & scope
 
 **Owns:** PCI matching, baseline power-on, and factory identity for
-RTL8821CE / RTL8822BE / RTL8822CE, plus the retained native firmware
+RTL8821CE / RTL8822BE / RTL8822CE, plus the retained RTL8821CE firmware/inactive
+MAC/PHY-table owner and RTL8822CE native firmware
 loader, MAC/FIFO/PHY, H2C, calibrated radio/board-power continuations and a
 single awake channel1 legacy20 station for RTL8822CE. The retained station
 supports Open and WPA2-PSK with host RSNA/CCMP; its ordinary host TX rate is
@@ -26,8 +27,8 @@ artifacts or their signing authority. Factory country hints supply no policy.
 
 The caller owns the PCI function and its BAR2 register aperture exclusively.
 `pci::bring_up` maps BAR2 with `map_bar_control` (Device memory attributes)
-and rejects windows smaller than `0x170c` for RTL8822CE (firmware
-LTE indirect data) or `0x1104` for other profiles before MMIO. Chip/cut-filtered
+and rejects windows smaller than `0x170c` for RTL8821CE/RTL8822CE (firmware
+LTE indirect data) or `0x1104` for RTL8822BE before MMIO. Chip/cut-filtered
 PCI power enable/disable tables and pre/system setup now follow Linux's
 actual flows. BAR2 is mandatory and is a control-register window. The
 device has no active firmware/packet DMA or IRQ handler during this reset.
@@ -103,10 +104,92 @@ packet TX unsupported.
 `StationPreparation`, `StationReady`, or `Failed`. `Ready` identifies firmware
 completion and parked host DMA, independently of station/radio readiness.
 `StationReady` identifies completed packet preparation, not an associated peer
-or authorized controlled port. RTL8821CE/RTL8822BE have no native firmware owner. The safe
+or authorized controlled port. RTL8822BE has no native firmware owner. The safe
 `fw::download_firmware(registers, pci_device_id)` helper returns
 `FwError::Unsupported` before registry or MMIO access for every device:
 raw MMIO alone cannot prove exclusive DMA/ring/reset ownership.
+
+### RTL8821CE retained firmware and inactive MAC/PHY tables
+
+Probe captures `efuse::Factory8821c` from the same single512-byte logical-map
+read that establishes its factory MAC. The distinct type retains raw4×42-byte
+power records, thermal/crystal/board/BT/channel/country fields and the original
+RFE byte. Its decoded RFE mask/package bit follows `rtw8821c_read_efuse`; erased
+values are never replaced, and RFE-specific power-path substitution is left to
+the future calibrated radio owner. `Rtw88Device::rtl8821c_factory()` borrows this exact
+retained identity. No protected C22 trim cells or C22 factory offsets are used.
+
+The diagnostic interface retains a separate native lifecycle before any
+firmware work. `firmware_status()` reports its stages just as for C22.
+`pci::provision()` serializes explicit calls with probe's bounded background
+worker and advances `Detected → Ready → MacPrepared → PhyTablesPrepared`; missing/revoked/malformed
+firmware remains at the pure retryable `Detected` checkpoint without allocating
+DMA. A repeated `PhyTablesPrepared` request is a no-op. Once native allocation or a
+hardware attempt starts, failure/cancellation is terminal and retains the exact
+inner owner and every published mapping; no cold-power/firmware reconstruction
+occurs. Existing IRQ-safe static locks never cross an await.
+
+This profile opens only `rtw88/rtw8821c_fw.bin`, validates its0x8821 signature and
+actual64-byte section header before native allocation, and uses the common Linux
+3081 reserved-page/IDDMA flow. The authenticated loaded bytes retain their
+digest. Original source matches the shared48-byte TX descriptors, seven
+non-beacon rings, RX geometry, LTE registers and firmware-ready predicate;
+those mechanisms are reused without treating the C22 firmware as a C21 image.
+DMA is parked and the host rings rechecked before the inactive-MAC continuation.
+
+The C21 MAC path uses its own Linux chip function and64KiB TX/16KiB RX FIFO
+profile: reserved boundary460, H2C page500, firmware TX page508 and16/16/16/14
+priority-page allocation. LLT completion and empty configured H2C pointers are
+required. Its EDCA/SIFS/receive configuration uses evaluated8821C constants;
+the C22 cut-D PCI quirk is excluded. DMA/MAC TX/RX, packet producers and IRQs
+remain closed throughout. An original-Linux C oracle checks complete inactive
+register traces for two seeded images/cuts. Native owner tests sweep MAC access
+failures, stale hardware reports, LLT cancellation and exact firmware/owner
+retention; packed-factory and pinned raw-firmware-header oracles are independent.
+
+The C21 continuation then executes the original `rtw8821c_phy_set_param`
+prefix through its three retained channel-filter snapshots. Admission requires
+cut0..6, original valid RFE0/2/4/6, non-erased crystal and a one-path antenna/
+stream report (Linux IGNORE0 is accepted). Both decoded package0/1 profiles
+are selected with Linux's original condition rules, including cut-A/package0
+mapping to condition15. A current SYS_CFG1 read must still match the retained
+cut and identify one physical RF path; firmware antenna narrowing cannot
+qualify two-path silicon. The native aperture must cover `0x2000` before any
+PHY write; C22 retains its separate `0x5000` requirement. Every register access
+invokes current PCI authority and checks parked BME, with a two-second outer
+budget for the C21 table sequence.
+
+The source BB-reset/RF-domain preamble, MAC/BB/AGC tables, RFE2/4 BTG AGC,
+one RF-A table, exact6-bit factory crystal and source postamble run in order.
+C21 writes all RF registers through SIPI `0xc90`, with source13us+1us delays.
+Every selected RF0 write is the source `0x10000`; the MAC TX/RX/DMA gates,
+TX pause, empty host producers and IRQ masks remain parked. C21 has no
+`rfk_init_tbl`, so no C22 RFK program, direct RF aperture, trims or calibration
+routine is substituted. The C21 BB table's own instruction RAM is preserved.
+The stage stops before dynamic PHY initialization, power tracking and
+beamforming setup, and retains its source TXSF2/TXSF6/TXFILTER snapshots for
+those later continuations. Successful parked readbacks alone earn
+`PhyTablesPrepared`; they do not prove hardware calibration.
+
+The independent generator compiles the actual Linux conditional parser,
+MAC/BB/AGC/RF callbacks, SIPI accessor, table loader and exact chip-function
+prefix for all56 cut/package/RFE profiles. Native traces and filter snapshots
+match those oracles; existing49 C22 callback profiles remain covered.
+Composed regressions preserve the actual reserved-page backend and its
+published firmware DMA buffers through firmware/MAC/PHY success, access
+revocation and cancellation before or during RF table loading. Failed or
+cancelled attempts retain the exact owner and refuse replay/reallocation.
+
+`PhyTablesPrepared` remains an inactive prerequisite. C21-specific dynamic
+PHY/power tracking/beamforming, RFE-selected calibration and trims, signed
+measured board gain/operating power, bounded chip-specific radio command
+receipts, packet geometry and station/data integration are still required.
+C21 PHY state has a distinct type and never populates the C22 PHY/power/radio
+fields; C22 calibration/station admission therefore stays closed. No C21
+scan/TX/HT/VHT/security capability is advertised. Physical firmware/board
+acceptance remains unrecorded.
+
+### RTL8822CE retained station provisioning
 
 `pci::provision()` (also re-exported as `rtw88::provision`) is the public
 staged-asset continuation for the already registered RTL8822CE. Probe's worker
@@ -123,7 +206,9 @@ owned snapshot and header/extent parsing complete before the lifecycle's
 single-use atomic begin and before allocating native rings. Missing, revoked
 or malformed registered assets leave `Detected` with a diagnostic error and
 no native allocation/I/O. A later provisioning call can load newly staged bytes
-on that same owner. Direct retained `Owner::initialize_registered` likewise
+on that same owner. Probe drives background provisioning via `drive_scheduled`
+across 120 attempts with 500 ms intervals, retrying while in `Stage::Detected` or `Stage::PhyTablesPrepared`.
+Direct retained `Owner::initialize_registered` likewise
 preserves `Phase::New` on preflight failure. The supplied-byte diagnostic path
 keeps its existing one-shot semantics. Once allocation/claim begins, failure or
 cancellation remains terminal and cannot reopen preflight or reuse DMA.
@@ -144,8 +229,9 @@ SHA256 of those exact loaded bytes for board-qualification binding. It
 parses the actual 64-byte `0x8822` header, exact DMEM/IMEM/optional EMEM
 extents and each eight-byte checksum trailer. Only fixed Linux OCP bases
 DMEM `0x200000`, IMEM `0x30000`, and EMEM `0x100000` are admitted;
-relocated or trailing data fails. RTL8821C/RTL8822B and WoW filename
-selection are unsupported. IDDMA consumes serial reserved pages of at
+relocated or trailing data fails. RTL8821C uses its separate exact image and
+inactive continuation above; RTL8822B and WoW filename selection remain
+unsupported. IDDMA consumes serial reserved pages of at
 most 4096 bytes, including section checksum tails, then validates section
 checksums and the exact final `0xc078` firmware-ready status.
 
@@ -406,13 +492,16 @@ station-security and packet-key owners supply bounded MLME, RSNA and CCMP;
   IDDMA, MAC/PHY/radio, signed operating power, H2C/mailbox, ordinary packet
   rings and the channel1 Open/WPA2 station shell are implemented. Composed
   software gates and physical acceptance are tracked separately.
+- **Retained RTL8821CE prerequisite**: exact firmware, inactive MAC and
+  chip-specific one-path PHY tables are implemented; calibrated radio,
+  qualified power and native station admission remain gated.
 - **Additional profiles**: RTL8821CE/RTL8822BE native station support, broader
   PHY/rates/channels, power management and recovery remain outside this gate.
 
 ## 8. Open questions and references
 
-RTL8822CE firmware now has a retained native owner; other chips remain
-unsupported. BAR2 contains registers, so firmware travels through beacon
+RTL8821CE and RTL8822CE firmware have retained native owners; RTL8822BE
+firmware remains unsupported. BAR2 contains registers, so firmware travels through beacon
 host DMA and IDDMA rather than whole-blob BAR writes. The initial hardware
 target is exclusively RTL8822CE, awake channel1/20 MHz, host CCK1 data and
 qualified native legacy responses, Open or WPA2-PSK, software CCMP and bounded
@@ -427,12 +516,12 @@ Remaining software ledger:
 | Prerequisite | State |
 |---|---|
 | PCI BAR2, power/cut sequencing, factory identity | Implemented; register-model and QEMU regressions |
-| Beacon reserved-page DMA owner, descriptors, successful park | Implemented for RTL8822CE; terminal failures retain mappings |
-| Authenticated section loading, IDDMA validation | Implemented for RTL8822CE; other chips and raw-MMIO helper reject |
-| Inactive PCIe MAC/FIFO/LLT/internal H2C queue setup | Implemented in same retained firmware owner; packet DMA stays closed |
+| Beacon reserved-page DMA owner, descriptors, successful park | Implemented for RTL8821CE/RTL8822CE; terminal failures retain mappings |
+| Authenticated section loading, IDDMA validation | Implemented with separate exact RTL8821CE/RTL8822CE images; RTL8822BE and raw-MMIO helper reject |
+| Inactive PCIe MAC/FIFO/LLT/internal H2C queue setup | Implemented in the same retained firmware owners with chip-specific FIFO/EDCA/SIFS and C22-only PCI quirk; packet DMA stays closed |
 | H2C packet ring and port0 command mailbox | Same retained native owner; bounded exact transport receipts and separate IQK completion |
 | Retained complete RTL8822CE factory map | Implemented from same probe EFUSE read; original Linux packed geometry checked |
-| Factory-selected inactive BB/AGC/RFK-init/RF tables | Same-owner port implemented; original Linux-C selection/callback oracles and composed stage failure/cancellation regressions |
+| Factory-selected inactive BB/AGC/RF tables | Same-owner C21 package/RFE/one-path SIPI and C22 two-path RFK-init/mixed-access ports; separate original-C oracles and composed failure/cancellation/DMA retention regressions |
 | Current signed per-board gain/operating-envelope qualification | Implemented loader, exact identity/source ceilings, cap revocation and current-policy checks; real measured signed artifact is an external deployment gate |
 | Fixed awake ch1 radio/DACK/IQK/OTP/qualified power | Implemented for the explicit version2 CCK/control-response profile; real signed measured envelope remains a deployment gate |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |

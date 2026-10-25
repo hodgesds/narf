@@ -65,6 +65,10 @@ struct Model {
     ready: bool,
     doorbells: usize,
     packets: Vec<Vec<u8>>,
+    continuation: u8,
+    pending_rf: bool,
+    revoke_on_rf: bool,
+    rf_written: bool,
     ring: Arc<IrqSafeSpinLock<BlockState>>,
     frame: Arc<IrqSafeSpinLock<BlockState>>,
 }
@@ -117,6 +121,9 @@ unsafe impl Registers for Port {
         if reg == 0x1208 {
             value &= !(1 << 31);
         }
+        if reg == 0x208 {
+            value &= !1;
+        }
         if reg == 0x80 && model.ready && value & 1 << 14 != 0 {
             value |= 1 << 15;
         }
@@ -126,6 +133,13 @@ unsafe impl Registers for Port {
         self.access()?;
         let mut model = self.0.lock();
         model.bytes[usize::from(reg)] = value;
+        // H2C initialization is an 8-bit REG_H2C_INFO write in mac.c.
+        // Its bit2 receipt exposes both empty pointers at the configured head.
+        if reg == 0x254 && value & 4 != 0 {
+            let head = word(&model.bytes, 0x244) & 0x3ffff;
+            model.bytes[0x10d0..0x10d4].copy_from_slice(&head.to_le_bytes());
+            model.bytes[0x10d4..0x10d8].copy_from_slice(&head.to_le_bytes());
+        }
         if reg == 0x383 && value & 16 != 0 {
             {
                 let mut ring = model.ring.lock();
@@ -160,10 +174,19 @@ unsafe impl Registers for Port {
         let mut model = self.0.lock();
         let at = usize::from(reg);
         model.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        if reg == 0xc90 {
+            model.rf_written = true;
+            if model.revoke_on_rf {
+                model.fail = Some(model.calls);
+            }
+        }
         Ok(())
     }
     async fn delay_us(&mut self, _: u64) {
-        let pending = self.0.lock().pending;
+        let pending = {
+            let model = self.0.lock();
+            model.pending || model.pending_rf && model.rf_written
+        };
         if pending {
             core::future::pending::<()>().await;
         }
@@ -181,6 +204,42 @@ unsafe impl Registers for Port {
     }
     async fn finish_dma(&mut self) -> Result<(), Error> {
         self.access()
+    }
+    fn begin_mac(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut model = self.0.lock();
+        if model.continuation != 0 {
+            return Err(Error::State);
+        }
+        model.continuation = 1;
+        Ok(())
+    }
+    fn finish_mac(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut model = self.0.lock();
+        if model.continuation != 1 || model.bytes[0x100] & 0xcf != 0 || model.bytes[0x522] != 255 {
+            return Err(Error::Prerequisite);
+        }
+        model.continuation = 2;
+        Ok(())
+    }
+    fn begin_phy(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut model = self.0.lock();
+        if model.continuation != 2 {
+            return Err(Error::State);
+        }
+        model.continuation = 3;
+        Ok(())
+    }
+    fn finish_phy(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut model = self.0.lock();
+        if model.continuation != 3 || model.bytes[0x100] & 0xcf != 0 || model.bytes[0x522] != 255 {
+            return Err(Error::Prerequisite);
+        }
+        model.continuation = 4;
+        Ok(())
     }
 }
 fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
@@ -202,7 +261,7 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         published_at: None,
     }));
     let port = Port(Arc::new(IrqSafeSpinLock::new(Model {
-        bytes: vec![0; 0x1400],
+        bytes: vec![0; 0x2000],
         calls: 0,
         fail: None,
         pending: false,
@@ -211,6 +270,10 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         ready: true,
         doorbells: 0,
         packets: Vec::new(),
+        continuation: 0,
+        pending_rf: false,
+        revoke_on_rf: false,
+        rf_written: false,
         ring: ring.clone(),
         frame: frame.clone(),
     })));
@@ -414,9 +477,18 @@ fn image() -> Vec<u8> {
     bytes
 }
 fn smoke_rtw88_actual_reserved_page_backend_composes_whole_firmware() -> TestResult {
+    for did in [0xc821, 0xc822] {
+        if let TestResult::Fail(error) = composed_firmware(did) {
+            return TestResult::Fail(error);
+        }
+    }
+    TestResult::Pass
+}
+fn composed_firmware(did: u16) -> TestResult {
     let (backend, port, _) = allocated();
-    let bytes = image();
-    let mut owner = firmware_transport::Owner::new(backend, 0xc822);
+    let mut bytes = image();
+    bytes[0] = if did == 0xc821 { 0x21 } else { 0x22 };
+    let mut owner = firmware_transport::Owner::new(backend, did);
     if narf_scheduler::block_on(owner.download(&bytes)).is_err()
         || owner.phase() != firmware_transport::Phase::Ready
     {
@@ -441,4 +513,125 @@ fn smoke_rtw88_actual_reserved_page_backend_composes_whole_firmware() -> TestRes
 kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_actual_reserved_page_backend_composes_whole_firmware
+);
+
+fn smoke_rtw8821ce_real_reserved_dma_owner_survives_phy_success_cancel_and_revocation() -> TestResult
+{
+    for outcome in 0..5 {
+        let (backend, port, drops) = allocated();
+        let mut bytes = image();
+        bytes[0] = 0x21;
+        let lifecycle = crate::rtw88::firmware_lifecycle::Lifecycle::new(0xc821);
+        if narf_scheduler::block_on(lifecycle.initialize_bytes(|| Ok(backend), bytes)).is_err() {
+            return TestResult::Fail("composed C21 fixture failed retained firmware setup");
+        }
+        {
+            let mut model = port.0.lock();
+            model.bytes[0xf0..0xf4].copy_from_slice(&(3u32 << 12).to_le_bytes());
+            model.bytes[0x1a0] = 0x19;
+            model.bytes[0x1a6..0x1aa]
+                .copy_from_slice(&((7u32 << 16) | (1 << 19) | (1 << 21) | (3 << 26)).to_le_bytes());
+        }
+        if narf_scheduler::block_on(lifecycle.prepare_mac()).is_err() {
+            return TestResult::Fail("composed C21 fixture failed inactive MAC/H2C setup");
+        }
+        {
+            let model = port.0.lock();
+            if word(&model.bytes, 0x10d0) & 0x3ffff != 500 << 7
+                || word(&model.bytes, 0x10d4) & 0x3ffff != 500 << 7
+            {
+                return TestResult::Fail(
+                    "C21 byte H2C initialization missed configured empty pointers",
+                );
+            }
+        }
+        let (frame, ring, doorbells) = {
+            let model = port.0.lock();
+            let frame = model.frame.lock().bytes.clone();
+            let ring = model.ring.lock().bytes.clone();
+            (frame, ring, model.doorbells)
+        };
+        let mut raw = [255; 512];
+        raw[0xd0..0xd6].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
+        raw[0xb9] = 0x33;
+        raw[0xca] = 4;
+        let factory = match crate::rtw88::efuse::Factory8821c::for_test(raw) {
+            Ok(factory) => factory,
+            Err(_) => return TestResult::Fail("composed C21 fixture has invalid factory identity"),
+        };
+        {
+            let mut model = port.0.lock();
+            model.pending = outcome == 1;
+            model.pending_rf = outcome == 2;
+            model.revoke_on_rf = outcome == 4;
+            if outcome == 3 {
+                model.fail = Some(model.calls);
+            }
+        }
+        if matches!(outcome, 1 | 2) {
+            let mut future = Box::pin(lifecycle.prepare_phy8821c(&factory));
+            if future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                != Poll::Pending
+            {
+                return TestResult::Fail(
+                    "composed C21 PHY cancellation missed real retained DMA owner",
+                );
+            }
+            drop(future);
+        } else {
+            let expected = if outcome == 0 {
+                None
+            } else {
+                Some(Error::Access)
+            };
+            if narf_scheduler::block_on(lifecycle.prepare_phy8821c(&factory)).err() != expected {
+                return TestResult::Fail(
+                    "composed C21 PHY success/current-authority failure differed",
+                );
+            }
+        }
+        let status = lifecycle.status();
+        if (outcome == 0
+            && status.stage != crate::rtw88::firmware_lifecycle::Stage::PhyTablesPrepared)
+            || (outcome != 0 && status.stage != crate::rtw88::firmware_lifecycle::Stage::Failed)
+            || drops.load(Ordering::SeqCst) != 0
+        {
+            return TestResult::Fail(
+                "C21 PHY result freed retained native DMA or claimed readiness",
+            );
+        }
+        let calls = {
+            let model = port.0.lock();
+            if model.frame.lock().bytes != frame
+                || model.ring.lock().bytes != ring
+                || model.doorbells != doorbells
+                || model.bytes[0x100] & 0xcf != 0
+                || model.bytes[0x522] != 255
+            {
+                return TestResult::Fail("C21 PHY rewrote retained page buffers or opened MAC");
+            }
+            model.calls
+        };
+        if narf_scheduler::block_on(lifecycle.prepare_phy8821c(&factory)) != Err(Error::State)
+            || narf_scheduler::block_on(lifecycle.initialize_bytes(|| Err(Error::Memory), vec![]))
+                != Err(Error::State)
+            || port.0.lock().calls != calls
+        {
+            return TestResult::Fail(
+                "C21 PHY replayed native DMA owner after terminal/completed result",
+            );
+        }
+        // Keep the actual Backend's published buffers pinned on destruction.
+        drop(lifecycle);
+        if drops.load(Ordering::SeqCst) != 0 {
+            return TestResult::Fail("C21 PHY terminal/completed owner reclaimed published DMA");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_real_reserved_dma_owner_survives_phy_success_cancel_and_revocation
 );

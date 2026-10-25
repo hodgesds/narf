@@ -153,34 +153,42 @@ pub(super) async fn initialize_registered(
     factory: Arc<super::efuse::Factory>,
 ) -> Result<(), Error> {
     let profile = super::radio::Profile::from_factory(&factory).map_err(Error::Radio)?;
-    firmware.initialize_registered().await?;
-    let prepared = allocate(firmware, 128)?;
-    prepare_retained(&retained, prepared).await?;
+    if firmware.status().stage == super::firmware_transport::Stage::Detected {
+        firmware.initialize_registered().await?;
+        let prepared = allocate(firmware, 128)?;
+        prepare_retained(&retained, prepared).await?;
+        let mut storage = retained.lock().await;
+        storage
+            .as_mut()
+            .ok_or(Error::State)?
+            .configure_radio(profile)
+            .await?;
+    } else if firmware.status().stage != super::firmware_transport::Stage::Ready {
+        return Err(Error::State);
+    }
     let mut storage = retained.lock().await;
-    storage
-        .as_mut()
-        .ok_or(Error::State)?
-        .configure_radio(profile)
-        .await?;
+    let prepared = storage.as_mut().ok_or(Error::State)?;
+    if prepared.phase() == super::prepare::Phase::MacConfigured && prepared.station_transmit_ready()
+    {
+        return Ok(());
+    }
     let calibration =
         super::channel_power::Calibration::load_registered(&factory).map_err(Error::Power)?;
     let domain = narf_wireless::reg::db::ensure_domain()
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
     let permission = calibration.permission(&domain, 1).map_err(Error::Power)?;
-    storage
-        .as_mut()
-        .ok_or(Error::State)?
-        .configure_channel(permission)
-        .await?;
-    storage
-        .as_mut()
-        .ok_or(Error::State)?
-        .configure_mac(&factory)?;
+    if prepared.phase() == super::prepare::Phase::RadioConfigured {
+        prepared.configure_channel(permission).await?;
+    }
+    if prepared.phase() == super::prepare::Phase::ChannelConfigured {
+        prepared.configure_mac(&factory)?;
+    }
+    if prepared.phase() != super::prepare::Phase::MacConfigured {
+        return Err(Error::State);
+    }
     // Preserve the exact signed board envelope with this same native owner;
     // station progress recomputes permission against current host policy.
-    storage
-        .as_mut()
-        .ok_or(Error::State)?
+    prepared
         .stage_station_calibration(calibration, &domain)
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))
 }

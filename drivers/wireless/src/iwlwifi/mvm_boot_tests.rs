@@ -31,6 +31,10 @@ impl Fixture {
                 mac: None,
                 nvm: None,
                 peer: None,
+                management_queue: None,
+                power: super::power::Context::new(
+                    &super::super::firmware_api::FirmwareApi::default(),
+                ),
                 beacons: Vec::new(),
                 channel: super::channel::ChannelContext::new(
                     &super::super::firmware_api::FirmwareApi::default(),

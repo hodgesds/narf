@@ -370,7 +370,7 @@ fn smoke_ath9k_calibration_policy_span_limits_and_current_cap() -> TestResult {
     if Permission::from_domain(&domain).map(|p| p.ceiling) != Ok(8) {
         return TestResult::Fail("overlapping stricter policy was ignored");
     }
-    for flag in [RegFlags::DFS, RegFlags::INDOOR_ONLY] {
+    for flag in [RegFlags::DFS, RegFlags::INDOOR_ONLY, RegFlags::NO_IR] {
         domain.rules[1].flags = flag;
         if Permission::from_domain(&domain) != Err(BringUpError::Policy) {
             return TestResult::Fail("unqualified calibration channel was authorized");

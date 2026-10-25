@@ -18,6 +18,7 @@ pub enum Error {
     Transport(TransportError),
     Malformed,
     Unsupported,
+    Authority,
     Busy,
     Timeout,
     Failed,

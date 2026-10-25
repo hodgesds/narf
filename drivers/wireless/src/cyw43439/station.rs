@@ -3,14 +3,14 @@
 //! References: Linux brcmfmac/{common,cfg80211}.c and fwil_types.h.
 
 use super::{
-    events,
+    channel, events,
     fullmac::Fullmac,
     ioctl::{self, Direction},
     runtime::Error,
 };
 #[cfg(any(test, feature = "kernel-test"))]
 use super::{runtime::Runtime, PacketTransport};
-use alloc::{vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use narf_wireless::{AssociateRequest, BssInfo, ScanRequest, SecurityConfig};
 
 #[derive(Debug, Clone)]
@@ -23,11 +23,14 @@ pub struct Station<R: Fullmac> {
     pub runtime: R,
     pub mac: [u8; 6],
     pub channels: Vec<u8>,
-    domain: narf_wireless::reg::RegulatoryDomain,
+    domain: Arc<narf_wireless::reg::RegulatoryDomain>,
+    policy: Option<Arc<dyn PolicySource>>,
+    connection: Option<policy::TxGrant>,
     pub bssid: Option<[u8; 6]>,
     pub cache: Vec<Bss>,
     scan_id: u16,
     pub supplicant: bool,
+    power_save: bool,
     operation: bool,
 }
 impl<R: Fullmac> core::fmt::Debug for Station<R> {
@@ -44,9 +47,18 @@ impl<R: Fullmac> Station<R> {
     /// The caller supplies a completed firmware-loader transport and an
     /// authenticated host policy; no interface may be published before success.
     pub async fn initialize(
-        mut runtime: R,
+        runtime: R,
         clm: &[u8],
         domain: narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<Self, Error> {
+        Self::initialize_inner(runtime, clm, Arc::new(domain), None).await
+    }
+
+    async fn initialize_inner(
+        mut runtime: R,
+        clm: &[u8],
+        domain: Arc<narf_wireless::reg::RegulatoryDomain>,
+        policy: Option<Arc<dyn PolicySource>>,
     ) -> Result<Self, Error> {
         if (R::EXTERNAL_CLM && clm.is_empty())
             || clm.len() > 1024 * 1024
@@ -80,7 +92,28 @@ impl<R: Fullmac> Station<R> {
         country[8..10].copy_from_slice(&domain.country_code);
         set_var(&mut runtime, "country", &country).await?;
         runtime.configure_bus().await?;
-        set_int(&mut runtime, 86, 0).await?; // WLC_SET_PM: continuously awake.
+        if R::BAND_5GHZ {
+            // A 20 MHz join chanspec alone is not a firmware bandwidth cap.
+            // Bound both actual BCM43602 bands before WLC_UP, and require
+            // readback; a wider automatic firmware policy cannot satisfy
+            // this retained 20 MHz host-policy profile.
+            for band in [2u32, 1u32] {
+                // WLC_BAND_2G, WLC_BAND_5G.
+                let mut cap = [0; 8];
+                cap[..4].copy_from_slice(&band.to_le_bytes());
+                cap[4..].copy_from_slice(&1u32.to_le_bytes()); // WLC_BW_CAP_20MHZ.
+                set_var(&mut runtime, "bw_cap", &cap).await?;
+                let mut query = b"bw_cap\0".to_vec();
+                query.extend_from_slice(&band.to_le_bytes());
+                let reply = runtime
+                    .command(Direction::Get, ioctl::WLC_GET_VAR, &query, 4)
+                    .await?;
+                if reply.as_slice() != 1u32.to_le_bytes() {
+                    return Err(Error::Unsupported);
+                }
+            }
+        }
+        set_int(&mut runtime, ioctl::WLC_SET_PM, 0).await?;
         set_int(&mut runtime, 20, 1).await?; // Infrastructure station.
         set_int(&mut runtime, 22, 0).await?; // Open-system 802.11 authentication.
                                              // This profile pins the selected BSSID and does not consume ROAM
@@ -101,7 +134,9 @@ impl<R: Fullmac> Station<R> {
             Err(Error::Firmware(code)) if code as i32 == -23 => false,
             Err(error) => return Err(error),
         };
-        set_int(&mut runtime, ioctl::WLC_UP, 0).await?;
+        policy::check_initial(&mut runtime, &policy, &domain)?;
+        policy::enable(&mut runtime, &policy, &domain).await?;
+        policy::check_initial(&mut runtime, &policy, &domain)?;
         let reply = runtime
             .command(Direction::Get, 217, &64u32.to_le_bytes(), 260)
             .await?;
@@ -112,27 +147,78 @@ impl<R: Fullmac> Station<R> {
         let mut channels = Vec::new();
         for index in 0..count {
             let channel = le32(&reply, 4 + index * 4)?;
-            if (1..=14).contains(&channel)
-                && channel_power(&domain, channel as u8).is_some()
-                && !channels.contains(&(channel as u8))
+            let Ok(channel) = u8::try_from(channel) else {
+                continue;
+            };
+            if (channel <= 14 || R::BAND_5GHZ)
+                && channel_ceiling(&domain, channel, false).is_some()
+                && !channels.contains(&channel)
             {
-                channels.push(channel as u8);
+                channels.push(channel);
             }
         }
         if channels.is_empty() {
             return Err(Error::Unsupported);
         }
+        policy::check_initial(&mut runtime, &policy, &domain)?;
         Ok(Self {
             runtime,
             mac,
             channels,
             domain,
+            policy,
+            connection: None,
             bssid: None,
             cache: Vec::new(),
             scan_id: 0,
             supplicant,
+            power_save: false,
             operation: false,
         })
+    }
+
+    /// Last firmware-acknowledged ordinary station power-save policy.
+    pub fn power_save(&self) -> bool {
+        self.power_save
+    }
+
+    /// Linux brcmf_cfg80211_set_power_mgmt: PM_FAST / PM_OFF followed by
+    /// pm2_sleep_ret with cfg80211's default (maximum) 2000 ms timeout.
+    /// This is firmware station PS; the host bus remains awake and polled.
+    pub async fn set_power_save(&mut self, enabled: bool) -> Result<(), Error> {
+        // Poll first to detect cancelled operations or transport failure, and
+        // consume queued peer loss before any control/state publication.
+        self.poll()?;
+        if self.power_save == enabled {
+            return Ok(());
+        }
+        self.operation = true;
+        let connection = self.connection;
+        let grants = connection.as_slice();
+        let result = async {
+            self.checked_command(
+                grants,
+                &[],
+                ioctl::WLC_SET_PM,
+                &(if enabled { 2u32 } else { 0 }).to_le_bytes(),
+            )
+            .await?;
+            self.checked_var(grants, &[], "pm2_sleep_ret", &2000u32.to_le_bytes())
+                .await
+        }
+        .await;
+        self.operation = false;
+        if let Err(error) = result {
+            // A partial/ambiguous transition must never be treated as the
+            // old applied policy or replayed on the same firmware lifetime.
+            self.runtime.fail();
+            self.bssid = None;
+            self.connection = None;
+            self.runtime.set_link(None);
+            return Err(error);
+        }
+        self.power_save = enabled;
+        self.poll()
     }
 
     pub async fn scan(&mut self, request: ScanRequest) -> Result<Vec<BssInfo>, Error> {
@@ -162,11 +248,8 @@ impl<R: Fullmac> Station<R> {
         for channel in if !request.frequencies_mhz.is_empty() {
             let mut selected = Vec::new();
             for &frequency in &request.frequencies_mhz {
-                let channel = match frequency {
-                    2484 => 14,
-                    2412..=2472 if (frequency - 2407) % 5 == 0 => (frequency - 2407) / 5,
-                    _ => return Err(Error::Unsupported),
-                };
+                let channel =
+                    u32::from(channel::from_frequency(frequency).ok_or(Error::Unsupported)?);
                 if !request.channels.is_empty() && !request.channels.contains(&channel) {
                     return Err(Error::Malformed);
                 }
@@ -186,30 +269,50 @@ impl<R: Fullmac> Station<R> {
                 channels.push(channel);
             }
         }
+        self.check_receive_policy(&channels)?;
         self.scan_id = self.scan_id.wrapping_add(1);
         let id = self.scan_id;
         let command = scan_command(id, &channels, &request.ssids, request.active)?;
         self.runtime.poll()?;
         while self.runtime.pop_event().is_some() {}
+        let mut grants = Vec::new();
         if request.active {
-            let power = channels
-                .iter()
-                .filter_map(|&ch| channel_power(&self.domain, ch))
-                .min()
-                .ok_or(Error::Unsupported)?;
-            set_var(
-                &mut self.runtime,
+            // Every requested active channel must permit TX. Filtering a
+            // restricted channel out of the power reduction would still send
+            // its probe request in the unchanged firmware channel list.
+            let mut power: Option<u8> = None;
+            for &channel in &channels {
+                let ceiling = channel_power(&self.domain, channel).ok_or(Error::Unsupported)?;
+                power = Some(power.map_or(ceiling, |old| old.min(ceiling)));
+            }
+            let power = power.ok_or(Error::Unsupported)?;
+            for &channel in &channels {
+                grants.push(self.grant(channel, power)?);
+            }
+            self.check_grants(&grants)?;
+            self.checked_var(
+                &grants,
+                &channels,
                 "qtxpower",
                 &(u32::from(power) * 4).to_le_bytes(),
             )
             .await?;
         }
+        self.check_receive_policy(&channels)?;
+        self.check_grants(&grants)?;
         self.cache.clear();
-        set_var(&mut self.runtime, "escan", &command).await?;
+        self.checked_var(&grants, &channels, "escan", &command)
+            .await?;
+        self.check_receive_policy(&channels)?;
+        self.check_grants(&grants)?;
         let deadline = narf_time::Deadline::after_ms(15000);
         let outcome = async {
             loop {
+                self.check_receive_policy(&channels)?;
+                self.check_grants(&grants)?;
                 self.runtime.poll()?;
+                self.check_receive_policy(&channels)?;
+                self.check_grants(&grants)?;
                 while let Some(event) = self.runtime.pop_event() {
                     if event.header.event_type != events::WLC_E_ESCAN_RESULT {
                         continue;
@@ -220,7 +323,7 @@ impl<R: Fullmac> Station<R> {
                         if event_id != id {
                             continue;
                         }
-                        if self.channels.contains(&(bss.info.channel as u8))
+                        if channels.contains(&(bss.info.channel as u8))
                             && (request.ssids.is_empty()
                                 || request
                                     .ssids
@@ -259,6 +362,8 @@ impl<R: Fullmac> Station<R> {
                             }
                         }
                         if event.header.status == 0 {
+                            self.check_receive_policy(&channels)?;
+                            self.check_grants(&grants)?;
                             return Ok(self.cache.iter().map(|b| b.info.clone()).collect());
                         }
                         return Err(Error::Firmware(event.header.status));
@@ -314,8 +419,10 @@ impl<R: Fullmac> Station<R> {
             })
             .ok_or(Error::Malformed)?
             .clone();
+        self.refresh_policy()?;
         let power =
             channel_power(&self.domain, bss.info.channel as u8).ok_or(Error::Unsupported)?;
+        let grant = self.grant(bss.info.channel as u8, power)?;
         let secure = match &request.security {
             SecurityConfig::Open
                 if matches!(bss.info.security, narf_wireless::scan::BssSecurity::Open) =>
@@ -338,16 +445,12 @@ impl<R: Fullmac> Station<R> {
             _ => return Err(Error::Unsupported),
         };
         validate_association_ies(&request.ie, secure)?;
-        set_var(
-            &mut self.runtime,
-            "qtxpower",
-            &(u32::from(power) * 4).to_le_bytes(),
-        )
-        .await?;
+        self.tx_var(grant, "qtxpower", &(u32::from(power) * 4).to_le_bytes())
+            .await?;
         self.runtime.poll()?;
         while self.runtime.pop_event().is_some() {}
         let result = async {
-            set_int(&mut self.runtime, 22, 0).await?;
+            self.tx_int(grant, 22, 0).await?;
             // Linux configures (and clears for Open) the association RSNE
             // before joining. Pin the firmware offload to this driver's
             // single PSK/CCMP, no-PMF profile even on a mixed-mode AP.
@@ -357,45 +460,43 @@ impl<R: Fullmac> Station<R> {
                 wpa_ie.extend_from_slice(&[48, body.len() as u8]);
                 wpa_ie.extend_from_slice(&body);
             }
-            set_var(&mut self.runtime, "wpaie", &wpa_ie).await?;
-            set_var(
-                &mut self.runtime,
+            self.tx_var(grant, "wpaie", &wpa_ie).await?;
+            self.tx_var(
+                grant,
                 "wpa_auth",
                 &if secure { 128u32 } else { 0 }.to_le_bytes(),
             )
             .await?;
-            set_int(&mut self.runtime, 134, if secure { 4 } else { 0 }).await?;
+            self.tx_int(grant, 134, if secure { 4 } else { 0 }).await?;
             if self.supplicant {
-                set_var(
-                    &mut self.runtime,
-                    "sup_wpa",
-                    &u32::from(secure).to_le_bytes(),
-                )
-                .await?;
+                self.tx_var(grant, "sup_wpa", &u32::from(secure).to_le_bytes())
+                    .await?;
             }
             if let SecurityConfig::Wpa2 { psk } = &request.security {
                 // CYW legacy wsec_pmk: length/flags + 64-byte key buffer.
                 let mut pmk = zeroize::Zeroizing::new([0; 68]);
                 pmk[..2].copy_from_slice(&32u16.to_le_bytes());
                 pmk[4..36].copy_from_slice(psk);
-                self.runtime
-                    .command(Direction::Set, 268, &pmk[..], MAX_REPLY)
-                    .await?;
+                self.tx_command(grant, 268, &pmk[..]).await?;
             }
             let mut join = [0; 50];
             join[..4].copy_from_slice(&(request.ssid.len() as u32).to_le_bytes());
             join[4..4 + request.ssid.len()].copy_from_slice(&request.ssid);
             join[36..42].copy_from_slice(&request.bssid);
             join[44..48].copy_from_slice(&1u32.to_le_bytes());
-            join[48..50].copy_from_slice(&(0x1000 | request.channel as u16).to_le_bytes());
-            self.runtime
-                .command(Direction::Set, 26, &join, MAX_REPLY)
-                .await?;
+            join[48..50].copy_from_slice(
+                &channel::encode20(bss.info.channel as u8)
+                    .ok_or(Error::Unsupported)?
+                    .to_le_bytes(),
+            );
+            self.tx_command(grant, 26, &join).await?;
             let deadline = narf_time::Deadline::after_ms(15000);
             let (mut associated, mut keys) = (false, !secure);
             let mut drain_batches = 0;
             loop {
+                self.check_grants(core::slice::from_ref(&grant))?;
                 let consumed = self.runtime.poll()?;
+                self.check_grants(core::slice::from_ref(&grant))?;
                 while let Some(event) = self.runtime.pop_event() {
                     if event.header.source_mac != request.bssid {
                         continue;
@@ -433,6 +534,8 @@ impl<R: Fullmac> Station<R> {
                 // current FIFO/ring idle sample before opening the host port.
                 while self.runtime.pop_data().is_some() {}
                 if associated && keys && consumed == 0 {
+                    self.check_grants(core::slice::from_ref(&grant))?;
+                    self.connection = Some(grant);
                     self.runtime.set_link(Some(request.bssid));
                     self.bssid = Some(request.bssid);
                     return Ok(());
@@ -453,6 +556,8 @@ impl<R: Fullmac> Station<R> {
         .await;
         if result.is_err() {
             self.bssid = None;
+            self.connection = None;
+            self.runtime.set_link(None);
             // SET_SSID/PSK events carry no join transaction ID. An ACK to
             // DISASSOC does not prove that old authorization events are
             // drained. Until recovery confirms a fresh firmware lifecycle,
@@ -477,14 +582,22 @@ impl<R: Fullmac> Station<R> {
     }
 
     async fn disconnect_inner(&mut self) -> Result<(), Error> {
+        self.check_connection_policy()?;
+        let grant = self.connection.take();
         let peer = self.bssid.take();
         self.runtime.set_link(None);
-        self.runtime
-            .command(Direction::Set, 52, &[], MAX_REPLY)
-            .await?;
+        if let Some(grant) = grant {
+            self.tx_command(grant, 52, &[]).await?;
+        } else {
+            self.checked_command(&[], &[], 52, &[]).await?;
+        }
         if let Some(peer) = peer {
             let deadline = narf_time::Deadline::after_ms(2000);
             'complete: loop {
+                self.refresh_policy()?;
+                if let Some(grant) = grant {
+                    self.check_grants(core::slice::from_ref(&grant))?;
+                }
                 self.runtime.poll()?;
                 while let Some(event) = self.runtime.pop_event() {
                     if event.header.source_mac == peer
@@ -511,12 +624,18 @@ impl<R: Fullmac> Station<R> {
         if self.operation {
             self.runtime.fail();
             self.bssid = None;
+            self.connection = None;
+            self.runtime.set_link(None);
             return Err(Error::Failed);
         }
+        self.check_connection_policy()?;
         if let Err(error) = self.runtime.poll() {
             self.bssid = None;
+            self.connection = None;
+            self.runtime.set_link(None);
             return Err(error);
         }
+        self.check_connection_policy()?;
         while let Some(event) = self.runtime.pop_event() {
             if let Some(peer) = self.bssid {
                 if event.header.source_mac == peer
@@ -525,13 +644,19 @@ impl<R: Fullmac> Station<R> {
                         || event.header.event_type == 46 && event.header.status != 6)
                 {
                     self.bssid = None;
+                    self.connection = None;
                 }
             }
         }
+        self.check_connection_policy()?;
         self.runtime.set_link(self.bssid);
         Ok(())
     }
 }
+
+#[path = "station_policy.rs"]
+mod policy;
+pub use policy::{GlobalPolicy, PolicySource};
 
 const MAX_REPLY: usize = 1502;
 
@@ -608,26 +733,33 @@ fn le32(bytes: &[u8], index: usize) -> Result<u32, Error> {
     ))
 }
 fn channel_power(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> Option<u8> {
-    if !(1..=14).contains(&channel) {
-        return None;
+    u8::try_from(channel_ceiling(domain, channel, true)?).ok()
+}
+fn channel_ceiling(
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: u8,
+    transmit: bool,
+) -> Option<i8> {
+    use narf_wireless::reg::RegFlags;
+    let frequency = channel::frequency(channel)?;
+    let low = frequency - 10;
+    let high = frequency + 10;
+    let mut covered = false;
+    let mut ceiling: Option<i8> = None;
+    for rule in &domain.rules {
+        if rule.freq_start_mhz >= high || rule.freq_end_mhz <= low {
+            continue;
+        }
+        if rule.freq_start_mhz >= rule.freq_end_mhz
+            || rule.max_bandwidth_mhz < 20
+            || transmit && rule.flags.intersects(RegFlags::DFS | RegFlags::NO_IR)
+        {
+            return None;
+        }
+        covered |= rule.freq_start_mhz <= low && rule.freq_end_mhz >= high;
+        ceiling = Some(ceiling.map_or(rule.max_power_dbm, |old| old.min(rule.max_power_dbm)));
     }
-    let frequency = if channel == 14 {
-        2484
-    } else {
-        2407 + 5 * u32::from(channel)
-    };
-    domain
-        .rules
-        .iter()
-        .filter(|r| {
-            r.freq_start_mhz <= frequency - 10
-                && r.freq_end_mhz >= frequency + 10
-                && r.max_bandwidth_mhz >= 20
-                && !r.flags.contains(narf_wireless::reg::RegFlags::DFS)
-        })
-        .map(|r| r.max_power_dbm)
-        .min()
-        .and_then(|power| u8::try_from(power).ok())
+    covered.then_some(ceiling).flatten()
 }
 fn rsn(ies: &[u8]) -> Option<narf_wireless::rsn::RsnIe> {
     let mut rest = ies;
@@ -649,7 +781,7 @@ fn scan_command(
     active: bool,
 ) -> Result<Vec<u8>, Error> {
     if channels.is_empty()
-        || channels.len() > 14
+        || channels.len() > 64
         || ssids.len() > 16
         || ssids.iter().any(|s| s.len() > 32)
     {
@@ -667,10 +799,8 @@ fn scan_command(
     out[68..72]
         .copy_from_slice(&((ssids.len() as u32) << 16 | channels.len() as u32).to_le_bytes());
     for (i, &ch) in channels.iter().enumerate() {
-        if !(1..=14).contains(&ch) {
-            return Err(Error::Malformed);
-        }
-        out[72 + i * 2..74 + i * 2].copy_from_slice(&(0x1000u16 | u16::from(ch)).to_le_bytes());
+        let chanspec = channel::encode20(ch).ok_or(Error::Malformed)?;
+        out[72 + i * 2..74 + i * 2].copy_from_slice(&chanspec.to_le_bytes());
     }
     for (i, ssid) in ssids.iter().enumerate() {
         let index = ssid_start + i * 36;
@@ -711,16 +841,7 @@ fn parse_scan_result(bytes: &[u8]) -> Result<(u16, Bss), Error> {
     }
     let chanspec = u16::from_le_bytes(b[72..74].try_into().unwrap());
     // Legacy APs can leave ctl_ch zero. Never use a wide center as primary.
-    let channel = if b[88] != 0 {
-        b[88]
-    } else if chanspec & 0xff00 == 0x1000 {
-        chanspec as u8
-    } else {
-        return Err(Error::Unsupported);
-    };
-    if !(1..=14).contains(&channel) {
-        return Err(Error::Unsupported);
-    }
+    let channel = channel::primary(chanspec, b[88]).ok_or(Error::Unsupported)?;
     let capability = u16::from_le_bytes(b[16..18].try_into().unwrap());
     let security = if rsn(ies).is_some() {
         narf_wireless::scan::BssSecurity::Wpa2
@@ -735,11 +856,7 @@ fn parse_scan_result(bytes: &[u8]) -> Result<(u16, Bss), Error> {
             info: BssInfo {
                 bssid: b[8..14].try_into().unwrap(),
                 ssid: b[19..19 + ssid_len].to_vec(),
-                frequency_mhz: if channel == 14 {
-                    2484
-                } else {
-                    2407 + 5 * u32::from(channel)
-                },
+                frequency_mhz: channel::frequency(channel).ok_or(Error::Unsupported)?,
                 channel: u32::from(channel),
                 rssi: i16::from_le_bytes(b[78..80].try_into().unwrap()).clamp(-128, 0) as i8,
                 security,

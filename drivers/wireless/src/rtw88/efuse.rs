@@ -22,6 +22,76 @@ pub enum EfuseError {
     MalformedMap,
 }
 
+/// Original RTL8821CE 512-byte factory map. The one-path radio's RFE/package
+/// and power records deliberately have their own type; they cannot be used as
+/// RTL8822CE calibration or authorize any transmission.
+#[derive(Clone)]
+pub struct Factory8821c {
+    logical: [u8; 512],
+}
+impl core::fmt::Debug for Factory8821c {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Rtw8821ceFactory")
+            .field("mac", &self.mac())
+            .field("rfe", &self.rfe())
+            .field("package", &self.package())
+            .finish_non_exhaustive()
+    }
+}
+impl Factory8821c {
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn for_test(logical: [u8; 512]) -> Result<Self, EfuseError> {
+        let factory = Self { logical };
+        if !mac_is_valid(factory.mac()) {
+            return Err(EfuseError::MacUninitialized);
+        }
+        Ok(factory)
+    }
+
+    pub fn mac(&self) -> [u8; 6] {
+        self.logical[0xd0..0xd6].try_into().unwrap()
+    }
+    pub fn rfe(&self) -> u8 {
+        self.logical[0xca] & 0x1f
+    }
+    pub fn raw_rfe(&self) -> u8 {
+        self.logical[0xca]
+    }
+    pub fn package(&self) -> u8 {
+        (self.logical[0xca] >> 5) & 1
+    }
+    pub fn crystal(&self) -> u8 {
+        self.logical[0xb9]
+    }
+    pub fn thermal(&self) -> u8 {
+        self.logical[0xba]
+    }
+    pub fn board_option(&self) -> u8 {
+        self.logical[0xc1]
+    }
+    pub fn bt_setting(&self) -> u8 {
+        self.logical[0xc3]
+    }
+    pub fn channel_plan(&self) -> u8 {
+        self.logical[0xb8]
+    }
+    pub fn country(&self) -> [u8; 2] {
+        self.logical[0xcb..0xcd].try_into().unwrap()
+    }
+    /// Preserve source records without applying Linux's RFE-specific 2G
+    /// path substitution or manufacturing erased-value defaults.
+    pub fn power_path(&self, path: u8) -> Option<&[u8]> {
+        if path > 3 {
+            return None;
+        }
+        let at = 0x10 + usize::from(path) * 42;
+        Some(&self.logical[at..at + 42])
+    }
+    pub fn logical(&self) -> &[u8; 512] {
+        &self.logical
+    }
+}
+
 const EFUSE_POLL_MS: u64 = 5;
 
 /// Original RTL8822CE logical factory map, retained from the same physical
@@ -302,6 +372,27 @@ pub(super) fn read_factory_with(io: &mut impl EfuseIo, did: u16) -> Result<Facto
         logical,
         trims: read_trims(io, chip)?,
     })
+}
+pub(super) fn read_factory8821c_with(
+    io: &mut impl EfuseIo,
+    did: u16,
+) -> Result<Factory8821c, EfuseError> {
+    if did != RTL_DEV_8821CE {
+        return Err(EfuseError::UnsupportedChip);
+    }
+    let map = read_map_with(io, geometry(did)?)?;
+    let factory = Factory8821c {
+        logical: map[..512].try_into().unwrap(),
+    };
+    if !mac_is_valid(factory.mac()) {
+        return Err(EfuseError::MacUninitialized);
+    }
+    Ok(factory)
+}
+/// # Safety
+/// Same powered, exclusive BAR2 ownership contract as `read_mac`.
+pub unsafe fn read_factory8821c(mmio: &MmioRegion, did: u16) -> Result<Factory8821c, EfuseError> {
+    read_factory8821c_with(&mut MmioEfuse(mmio), did)
 }
 /// # Safety
 /// Same powered, exclusive BAR2 ownership contract as `read_mac`.

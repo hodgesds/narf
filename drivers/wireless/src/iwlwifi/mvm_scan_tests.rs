@@ -36,6 +36,10 @@ impl Fixture {
                 mac: Some([2; 6]),
                 nvm: Some(station_api::Nvm::parse(4, &nvm).unwrap()),
                 peer: None,
+                management_queue: None,
+                power: super::super::power::Context::new(
+                    &super::super::super::firmware_api::FirmwareApi::default(),
+                ),
                 beacons: vec![],
                 channel: super::super::channel::ChannelContext::new(
                     &super::super::super::firmware_api::FirmwareApi::default(),
@@ -506,4 +510,25 @@ fn smoke_iwl_mvm_scan_actual_api77_metadata_and_optional_dqa() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2",
     smoke_iwl_mvm_scan_actual_api77_metadata_and_optional_dqa
+);
+
+fn smoke_iwl_mvm_no_ir_preserves_passive_receive_preparation() -> TestResult {
+    let mut domain = policy();
+    domain.rules[0].flags = narf_wireless::reg::RegFlags::NO_IR;
+    let mut overlap = domain.rules[0].clone();
+    overlap.freq_start_mhz = 2410;
+    overlap.freq_end_mhz = 2415;
+    domain.rules.push(overlap);
+    if !passive_permitted(&domain, 1) {
+        return TestResult::Fail("NO_IR incorrectly disabled receive-only Intel preparation");
+    }
+    domain.rules.last_mut().unwrap().max_bandwidth_mhz = 10;
+    if passive_permitted(&domain, 1) {
+        return TestResult::Fail("NO_IR bypassed restrictive receive-bandwidth overlap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2",
+    smoke_iwl_mvm_no_ir_preserves_passive_receive_preparation
 );

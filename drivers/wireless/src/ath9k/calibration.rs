@@ -93,7 +93,9 @@ impl Permission {
                 continue;
             }
             if rule.max_bandwidth_mhz < 20
-                || rule.flags.intersects(RegFlags::DFS | RegFlags::INDOOR_ONLY)
+                || rule
+                    .flags
+                    .intersects(RegFlags::DFS | RegFlags::INDOOR_ONLY | RegFlags::NO_IR)
                 || rule.max_power_dbm < 0
             {
                 return Err(BringUpError::Policy);

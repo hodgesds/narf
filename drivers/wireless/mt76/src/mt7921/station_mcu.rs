@@ -279,6 +279,14 @@ impl<B: Backend> Session<B> {
                 continue;
             }
             match command {
+                Command::Ce {
+                    id: 0xc0,
+                    query: true,
+                } => {
+                    if event[28] != 5 || len != 44 {
+                        return Err(Error::MalformedEvent);
+                    }
+                }
                 Command::Extended { id, query: true } => {
                     if event[28] != 0xed || event[32] != id {
                         return Err(Error::MalformedEvent);

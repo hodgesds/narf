@@ -1,5 +1,6 @@
 use super::super::{prepare::Phase, radio::tests::channel_owner};
 use super::*;
+use narf_wireless::reg::RegFlags;
 include!("radio/power_golden.rs");
 use alloc::{boxed::Box, vec};
 use core::{
@@ -134,6 +135,11 @@ pub(crate) fn smoke_rtl8188ee_signed_power_exact_board_identity_and_rules() -> T
     if calibration.permission(&rules, 1).unwrap().gains() != ([16; 4], [16; 8]) {
         return TestResult::Fail("narrower overlapping power limit ignored");
     }
+    rules.rules[1].flags = RegFlags::NO_IR;
+    if calibration.permission(&rules, 1) != Err(Error::Policy) {
+        return TestResult::Fail("NO_IR channel acquired measured TX permission");
+    }
+    rules.rules[1].flags = RegFlags::empty();
     rules.rules[1].freq_start_mhz = 2410;
     if calibration.permission(&rules, 1) != Err(Error::Policy)
         || calibration.permission(&domain(17), 12) != Err(Error::Policy)

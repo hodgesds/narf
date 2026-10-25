@@ -64,7 +64,7 @@ impl Mt76Iface {
             recovery_after_ns: AtomicU64::new(0),
         })
     }
-    /// Legacy 20 MHz channels on firmware-reported bands; scan remains passive.
+    /// Legacy 20 MHz channels on firmware-reported bands.
     pub fn bands(&self) -> Vec<WirelessBand> {
         let mut bands = Vec::new();
         if self.radio.capabilities.phy.bands & 1 != 0 {
@@ -314,6 +314,9 @@ impl Interface for Mt76Iface {
 }
 #[async_trait]
 impl WirelessNetIface for Mt76Iface {
+    fn max_scan_ssids(&self) -> u8 {
+        4
+    }
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
         WirelessIfaceInfo {
             base_name: self.name.clone(),
@@ -337,20 +340,38 @@ impl WirelessNetIface for Mt76Iface {
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let channels = passive_channels(&req, self.radio.capabilities.phy.bands)?;
+        let mut channels = scan_channels(&req, self.radio.capabilities.phy.bands)?;
+        let ssids = if req.active {
+            let domain =
+                narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::Denied)?;
+            channels = active_channels(&req, channels, &domain)?;
+            if req.ssids.is_empty() {
+                vec![Vec::new()]
+            } else {
+                req.ssids.clone()
+            }
+        } else {
+            Vec::new()
+        };
         let _control = self.control.lock().await;
+        if self.link_up() {
+            return Err(WirelessError::Busy);
+        }
         self.finish_teardown(true).await?;
         {
-            use crate::mt7921::firmware_transport::{scan_boot_passive, Error};
-            let report = scan_boot_passive(&channels)
-                .await
-                .map_err(|error| match error {
-                    Error::Bounds => WirelessError::InvalidArgs,
-                    Error::Busy => WirelessError::Busy,
-                    Error::Timeout => WirelessError::Timeout,
-                    Error::Authority => WirelessError::Denied,
-                    _ => WirelessError::HardwareError,
-                })?;
+            use crate::mt7921::firmware_transport::{scan_boot_active, scan_boot_passive, Error};
+            let result = if req.active {
+                scan_boot_active(&channels, &ssids).await
+            } else {
+                scan_boot_passive(&channels).await
+            };
+            let report = result.map_err(|error| match error {
+                Error::Bounds => WirelessError::InvalidArgs,
+                Error::Busy => WirelessError::Busy,
+                Error::Timeout => WirelessError::Timeout,
+                Error::Authority => WirelessError::Denied,
+                _ => WirelessError::HardwareError,
+            })?;
             let results = report
                 .bss
                 .iter()
@@ -485,16 +506,21 @@ impl WirelessNetIface for Mt76Iface {
         Err(WirelessError::NotSupported)
     }
 }
-fn passive_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessError> {
+fn scan_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessError> {
     use crate::mt7921::channel;
-    if req.active
-        || !req.ssids.is_empty()
-        || req.random_mac.is_some()
+    if req.random_mac.is_some()
         || req.colocated_6ghz
         || req.duration_mandatory
+        || req.duration_tu.is_some()
         || !req.extra_ies.is_empty()
     {
         return Err(WirelessError::NotSupported);
+    }
+    if !req.active && !req.ssids.is_empty()
+        || req.ssids.len() > 4
+        || req.ssids.iter().any(|ssid| ssid.len() > 32)
+    {
+        return Err(WirelessError::InvalidArgs);
     }
     let requested = if req.frequencies_mhz.is_empty() {
         req.channels.clone()
@@ -533,6 +559,25 @@ fn passive_channels(req: &ScanRequest, bands: u8) -> Result<Vec<u8>, WirelessErr
             return Err(WirelessError::InvalidArgs);
         }
         channels.push(value);
+    }
+    Ok(channels)
+}
+
+fn active_channels(
+    request: &ScanRequest,
+    mut channels: Vec<u8>,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+) -> Result<Vec<u8>, WirelessError> {
+    let allowed = |channel: &u8| {
+        crate::mt7921::association::TxPermission::from_domain(domain, *channel).is_some()
+    };
+    if request.channels.is_empty() && request.frequencies_mhz.is_empty() {
+        channels.retain(allowed);
+    } else if !channels.iter().all(allowed) {
+        return Err(WirelessError::Denied);
+    }
+    if channels.is_empty() {
+        return Err(WirelessError::Denied);
     }
     Ok(channels)
 }
@@ -909,6 +954,7 @@ mod tests {
             || info.hw_caps.eht_supported
             || !iface.supports_handshake_offload()
             || iface.supports_sae_offload()
+            || iface.max_scan_ssids() != 4
         {
             return TestResult::Fail("passive interface claims unfinished data/PHY support");
         }
@@ -927,7 +973,7 @@ mod tests {
         "drivers/wireless/mt7921/scan",
         mt76_scan_interface_reports_implemented_profile
     );
-    fn mt76_passive_scan_policy_rejects_active_and_non_world_channels() -> TestResult {
+    fn mt76_scan_policy_validates_active_ssids_and_channel_geometry() -> TestResult {
         let mut req = ScanRequest {
             ssids: Vec::new(),
             frequencies_mhz: Vec::new(),
@@ -939,36 +985,125 @@ mod tests {
             duration_mandatory: false,
             extra_ies: Vec::new(),
         };
-        if passive_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
             return TestResult::Fail("valid passive request");
         }
         req.active = true;
-        if passive_channels(&req, 3) != Err(WirelessError::NotSupported) {
-            return TestResult::Fail("active scan silently downgraded");
+        if scan_channels(&req, 3) != Ok(vec![1, 6, 11]) {
+            return TestResult::Fail("active wildcard geometry rejected");
         }
         req.active = false;
         req.ssids.push(Vec::new());
-        if passive_channels(&req, 3) != Err(WirelessError::NotSupported) {
-            return TestResult::Fail("directed probes allowed");
+        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+            return TestResult::Fail("inconsistent passive request with probe SSIDs accepted");
         }
         req.ssids.clear();
         req.channels = vec![35];
-        if passive_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("unimplemented band exposed");
         }
         req.channels = vec![1, 1];
-        if passive_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
+        if scan_channels(&req, 3) != Err(WirelessError::InvalidArgs) {
             return TestResult::Fail("duplicate channel");
         }
         req.channels.clear();
-        if passive_channels(&req, 3) != Ok(crate::mt7921::channel::channels(3)) {
+        if scan_channels(&req, 3) != Ok(crate::mt7921::channel::channels(3)) {
             return TestResult::Fail("default scan channels");
         }
         TestResult::Pass
     }
     kernel_test_in!(
         "drivers/wireless/mt7921/scan",
-        mt76_passive_scan_policy_rejects_active_and_non_world_channels
+        mt76_scan_policy_validates_active_ssids_and_channel_geometry
+    );
+
+    fn mt76_active_scan_default_filters_policy_and_explicit_denial_is_closed() -> TestResult {
+        use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
+        let mut request = ScanRequest {
+            ssids: vec![b"hidden".to_vec()],
+            frequencies_mhz: Vec::new(),
+            channels: Vec::new(),
+            active: true,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
+        };
+        let mut domain = RegulatoryDomain {
+            country_code: *b"US",
+            rules: vec![
+                RegRule {
+                    freq_start_mhz: 2402,
+                    freq_end_mhz: 2472,
+                    max_bandwidth_mhz: 20,
+                    max_power_dbm: 17,
+                    flags: RegFlags::empty(),
+                },
+                RegRule {
+                    freq_start_mhz: 5170,
+                    freq_end_mhz: 5895,
+                    max_bandwidth_mhz: 20,
+                    max_power_dbm: 14,
+                    flags: RegFlags::empty(),
+                },
+                RegRule {
+                    freq_start_mhz: 5250,
+                    freq_end_mhz: 5730,
+                    max_bandwidth_mhz: 20,
+                    max_power_dbm: 14,
+                    flags: RegFlags::DFS,
+                },
+            ],
+        };
+        let hardware = scan_channels(&request, 3).unwrap();
+        let channels = active_channels(&request, hardware, &domain).unwrap();
+        if channels.len() != 23
+            || !channels.contains(&6)
+            || !channels.contains(&36)
+            || channels.contains(&52)
+            || channels.contains(&144)
+        {
+            return TestResult::Fail(
+                "implicit active scan did not select current non-DFS hardware channels",
+            );
+        }
+        request.channels = vec![52];
+        if active_channels(&request, vec![52], &domain) != Err(WirelessError::Denied) {
+            return TestResult::Fail("explicit DFS scan was silently widened or downgraded");
+        }
+        domain.rules[2] = RegRule {
+            freq_start_mhz: 2427,
+            freq_end_mhz: 2447,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 17,
+            flags: RegFlags::NO_IR,
+        };
+        request.channels = vec![6];
+        if active_channels(&request, vec![6], &domain) != Err(WirelessError::Denied) {
+            return TestResult::Fail("explicit NO_IR scan obtained probe authority");
+        }
+        request.active = false;
+        request.ssids.clear();
+        if scan_channels(&request, 3) != Ok(vec![6]) {
+            return TestResult::Fail(
+                "NO_IR deployment restriction disabled passive receive geometry",
+            );
+        }
+        request.active = true;
+        request.ssids = vec![Vec::new(); 5];
+        if scan_channels(&request, 3) != Err(WirelessError::InvalidArgs) {
+            return TestResult::Fail("active scan accepted more than Linux's four SSIDs");
+        }
+        request.ssids = vec![vec![0; 33]];
+        if scan_channels(&request, 3) != Err(WirelessError::InvalidArgs) {
+            return TestResult::Fail("oversized active scan SSID accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/scan",
+        mt76_active_scan_default_filters_policy_and_explicit_denial_is_closed
     );
     fn mt76_iface_association_validation_and_link_state() -> TestResult {
         let iface = Mt76Iface::new(String::from("wlan0"), radio()).unwrap();

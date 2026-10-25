@@ -13,7 +13,8 @@
 //! same registered Device used by kernel DHCP. The initial data profile
 //! requires basic1Mbps and a fresh lifecycle after terminal closure.
 //!
-//! RTL8821CE and RTL8822BE retain diagnostic identification only. Physical
+//! RTL8821CE retains factory/firmware and inactive MAC ownership; its RF and
+//! station remain gated. RTL8822BE retains diagnostic identification. Physical
 //! validation and deployment board/power assets remain separate gates.
 //!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later)
@@ -52,10 +53,13 @@ pub(super) mod packet_core;
 pub(super) mod packet_format;
 mod pci_firmware;
 mod phy;
+#[path = "phy/rtl8821c.rs"]
+mod phy8821c;
 mod power_policy;
 mod probe_guard;
 mod radio;
 mod reserved_page;
+mod sibling;
 mod station;
 pub(super) mod station_control;
 pub use firmware_lifecycle::{Stage as FirmwareStage, Status as FirmwareStatus};

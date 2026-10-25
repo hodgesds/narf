@@ -1,6 +1,7 @@
+use super::super::db::Database;
 use super::*;
+use alloc::sync::Arc;
 use narf_kernel_test::{kernel_test_in, TestResult};
-use narf_lib::sync::IrqSafeSpinLock;
 
 include!("policy_fixture.rs");
 
@@ -60,15 +61,15 @@ kernel_test_in!(
 
 fn smoke_regulatory_bootstrap_independent_of_other_driver_initialization() -> TestResult {
     let authority = registry();
-    let database = IrqSafeSpinLock::new(None);
+    let database = Database::new();
     let calls = core::cell::Cell::new(0);
     let load = || {
         calls.set(calls.get() + 1);
         // Resolving a firmware capability must not happen under the DB lock.
-        let Some(guard) = database.try_lock() else {
+        let Some(guard) = database.state.try_lock() else {
             return Err(Error::Authority);
         };
-        if guard.is_some() {
+        if guard.domain.is_some() {
             return Err(Error::Authority);
         }
         drop(guard);
@@ -111,9 +112,9 @@ fn smoke_regulatory_bootstrap_rejects_unsigned_invalid_and_missing_assets() -> T
         Error::Unsigned,
         Error::Format("test invalid policy"),
     ] {
-        let database = IrqSafeSpinLock::new(None);
+        let database = Database::new();
         if !matches!(super::super::db::ensure_with(&database, || Err(error)), Err(e) if e == error)
-            || database.lock().is_some()
+            || database.snapshot().is_some()
         {
             return TestResult::Fail("failed policy bootstrap published partial/default domain");
         }
@@ -126,22 +127,22 @@ kernel_test_in!(
 );
 
 fn smoke_regulatory_bootstrap_preserves_policy_installed_during_lookup() -> TestResult {
-    let database = IrqSafeSpinLock::new(None);
+    let database = Database::new();
     let mut caller = parse_policy(&PAYLOAD).unwrap();
     caller.country_code = *b"CA";
     let result = super::super::db::ensure_with(&database, || {
-        let Some(mut guard) = database.try_lock() else {
+        let Some(guard) = database.state.try_lock() else {
             return Err(Error::Authority);
         };
-        *guard = Some(caller);
         drop(guard);
+        database.install(caller);
         decode(&PAYLOAD, Some(FINGERPRINT))
     });
     match result {
         Ok(domain)
             if domain.country_code == *b"CA"
                 && database
-                    .lock()
+                    .snapshot()
                     .as_ref()
                     .is_some_and(|d| d.country_code == *b"CA") =>
         {
@@ -153,4 +154,59 @@ fn smoke_regulatory_bootstrap_preserves_policy_installed_during_lookup() -> Test
 kernel_test_in!(
     "wireless/regulatory",
     smoke_regulatory_bootstrap_preserves_policy_installed_during_lookup
+);
+
+fn smoke_regulatory_immutable_snapshots_replace_clear_and_isolate() -> TestResult {
+    let database = Database::new();
+    let isolated = Database::new();
+    let domain = decode(&PAYLOAD, Some(FINGERPRINT)).unwrap();
+    database.install(domain.clone());
+    let old = database.snapshot().unwrap();
+    if !Arc::ptr_eq(&old, &database.snapshot().unwrap()) || isolated.snapshot().is_some() {
+        return TestResult::Fail("policy identity or isolated database ownership changed");
+    }
+    let mut changed = domain;
+    changed.rules[0].max_power_dbm = 10;
+    database.install(changed);
+    let new = database.snapshot().unwrap();
+    if Arc::ptr_eq(&old, &new) || !exact(&old) || new.rules[0].max_power_dbm != 10 {
+        return TestResult::Fail("policy replacement mutated a retained immutable snapshot");
+    }
+    database.clear();
+    if database.snapshot().is_some() || !exact(&old) || new.rules[0].max_power_dbm != 10 {
+        return TestResult::Fail("clear kept current authority or invalidated retained storage");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/regulatory",
+    smoke_regulatory_immutable_snapshots_replace_clear_and_isolate
+);
+
+fn smoke_regulatory_clear_wins_over_inflight_signed_bootstrap() -> TestResult {
+    let database = Database::new();
+    let loaded = super::super::db::ensure_with(&database, || {
+        database.clear();
+        decode(&PAYLOAD, Some(FINGERPRINT))
+    });
+    if !matches!(loaded, Err(Error::Authority)) || database.snapshot().is_some() {
+        return TestResult::Fail("in-flight signed loader undid an intervening policy clear");
+    }
+    // A later explicit bootstrap is independent work, not the stale loader.
+    if super::super::db::ensure_with(&database, || decode(&PAYLOAD, Some(FINGERPRINT))).is_err() {
+        return TestResult::Fail("fresh bootstrap after clear was incorrectly prohibited");
+    }
+    database.clear();
+    database.state.lock().revision = u64::MAX;
+    if !matches!(
+        super::super::db::ensure_with(&database, || decode(&PAYLOAD, Some(FINGERPRINT))),
+        Err(Error::Authority)
+    ) {
+        return TestResult::Fail("exhausted policy revision admitted bootstrap ABA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/regulatory",
+    smoke_regulatory_clear_wins_over_inflight_signed_bootstrap
 );

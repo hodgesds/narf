@@ -79,10 +79,13 @@ fn image() -> Vec<u8> {
     bytes
 }
 fn smoke_rtw88_retained_native_firmware_lifecycle_cancel_and_no_reconstruction() -> TestResult {
+    retained_cancel(0xc822)
+}
+fn retained_cancel(did: u16) -> TestResult {
     let calls = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
     let published = Arc::new(AtomicBool::new(false));
-    let lifecycle = Lifecycle::new(0xc822);
+    let lifecycle = Lifecycle::new(did);
     let allocations = AtomicUsize::new(0);
     let mut future = Box::pin(lifecycle.initialize(
         || {
@@ -93,7 +96,11 @@ fn smoke_rtw88_retained_native_firmware_lifecycle_cancel_and_no_reconstruction()
                 published: published.clone(),
             })
         },
-        Source::Bytes(image()),
+        Source::Bytes({
+            let mut bytes = image();
+            bytes[0] = if did == 0xc821 { 0x21 } else { 0x22 };
+            bytes
+        }),
     ));
     if future
         .as_mut()
@@ -145,6 +152,13 @@ fn smoke_rtw88_retained_native_firmware_lifecycle_cancel_and_no_reconstruction()
 kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_retained_native_firmware_lifecycle_cancel_and_no_reconstruction
+);
+fn smoke_rtw8821ce_cancel_retains_exact_outer_and_inner_firmware_owners() -> TestResult {
+    retained_cancel(0xc821)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_cancel_retains_exact_outer_and_inner_firmware_owners
 );
 fn smoke_rtw88_failed_native_factory_is_terminal_without_io() -> TestResult {
     let lifecycle = Lifecycle::<Model>::new(0xc822);

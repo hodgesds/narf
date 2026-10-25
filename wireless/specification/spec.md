@@ -106,6 +106,10 @@ channel/PHY qualification, mandatory driver rates, signed radio policy,
 connection state and transmit/key authority remain driver-owned. Observed
 facts still pass through `JoinPlan` security and association negotiation.
 
+`wireless::register_initcalls()` installs the bootstrap `trusted_net_authority` into `narf_net`
+and registers nl80211 during boot initialization, ensuring network interface registration authority
+is available before any device driver probes.
+
 ### 3.1 Interface Specialization
 
 ```rust
@@ -677,6 +681,16 @@ failure counters, and RX / TX PPDU duration), the scan record's signal
 otherwise. A driver leaves an unavailable measurement absent rather than
 synthesising one.
 
+The common CYW43439/BCM43602 FullMAC station supplies an awake power-save
+default and accepts PS changes through its retained control worker. GET reports
+the accepted desired policy; the station's applied state changes only after
+correlated PM_FAST/PM_OFF and sleep-retention replies. Requests coalesce and
+an in-flight completion preserves a newer desired policy. Firmware failure or
+cancelled command ownership closes carrier and queued TX and prevents session
+reuse. This ordinary firmware station power save does not suspend the host bus
+or provide system suspend/WoW. Native SDPCM and PCIe-msgbuf models cover the
+commands, failures and Open/WPA2 DHCP/IP traffic with power save enabled.
+
 `SET_CQM` accepts the station/P2P-client RSSI form: a binary native-endian
 signed threshold array plus its required native-endian u32 hysteresis. Values
 must be non-positive and strictly increasing. A zero/empty array disables it;
@@ -925,9 +939,33 @@ owned domain. Unsigned policies are rejected even in unsigned-firmware builds.
 `reg::db::ensure_domain()` preserves an existing caller-installed domain,
 otherwise performs that signed bootstrap without holding the database lock.
 Only successful loads install state; a caller policy installed during lookup
-wins the race. Existing `set_domain` callers retain responsibility for their
-policy's authority. This cache does not attest the origin of arbitrary domains
-installed through that existing API or implement live policy revocation.
+wins the race. A clear during lookup invalidates that in-flight bootstrap;
+a later explicit bootstrap may load afresh. Saturated revisions reject bootstrap
+rather than alias a previous empty installation. Existing `set_domain` callers retain responsibility for their
+policy's authority. `reg::db::Database::{new,install,clear,snapshot}` supplies
+isolated or shared immutable `Arc<RegulatoryDomain>` snapshots. An unchanged
+installation preserves pointer identity; replacement allocates a new snapshot,
+and clear removes current authority while existing readers retain safe storage.
+Global `snapshot`, `ensure_snapshot` and `clear_domain` complement the existing
+owned-value APIs. Lookup, decoding, rule cloning and retired-snapshot destruction
+happen outside the database's IRQ-disabling lock. This cache does not authenticate
+arbitrary caller-installed domains or automatically observe firmware-blob
+capability revocation: a trusted installer/source must replace or clear policy.
+
+Native CYW43439/BCM43602 attachment observes the live shared installation through
+`Station::initialize_live` and a `PolicySource`; explicit `Station::initialize`
+retains its fixed-domain contract. Live setup requires the original snapshot
+before/after WLC_UP and before interface publication. Scan, join, disconnect,
+power-save and packet progress observe replacement/absence, including every
+resume of native control futures (before credit-delayed publication), command
+receipts and final host-port fences. Country changes, removal, NO_IR/DFS or power
+below an acknowledged TX grant close the host port and poison that firmware
+lifetime, retaining uncertain DMA. Reinstallation and late firmware events cannot
+reopen it. Same-country changes that still cover the acknowledged ceiling preserve
+the connection without increasing firmware power. These checks close host
+admission when a change is observed; they do not retract in-flight commands or
+prove autonomous firmware RF quiescence. Other families retain their documented
+policy-observation contracts.
 
 Intel probe, MT76 publication/TX admission, ath10k station-control entry points
 and the common CYW/Broadcom FullMAC attachment use this bootstrap. A standalone
@@ -950,6 +988,13 @@ rule count `u16`, reserved `u16=0`, followed by 1–64 rules of 16 bytes:
 start MHz `u32`, end MHz `u32`, maximum bandwidth MHz `u32`, power dBm
 `i8`, `RegFlags` `u8`, reserved `u16=0`. Integers are little-endian;
 unknown flags, malformed ranges and length mismatches are rejected.
+`RegFlags` assigns DFS=bit0, INDOOR_ONLY=bit1, NO_P2P=bit2 and NO_IR=bit3.
+NO_IR permits passive reception but denies active probes and host-initiated
+station TX in the current host-policy profiles. Drivers must not discard an
+overlapping restriction because another rule grants a wider channel span;
+future relaxation needs an explicit firmware/regulatory proof. nl80211
+GET_REG maps this flag to Linux `NL80211_RRF_NO_IR` (bit7). Older readers that
+do not recognize NRGD bit3 reject the policy rather than ignore it.
 The driver intersects the selected host rule with firmware MCC permission
 and applies its power ceiling before transmitting association frames.
 

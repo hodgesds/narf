@@ -419,6 +419,24 @@ fn smoke_probe_regulatory_intersection() -> TestResult {
     {
         return TestResult::Fail("host channel/power intersection");
     }
+    let mut restrictive = domain.rules[0].clone();
+    restrictive.freq_start_mhz = 5181;
+    restrictive.freq_end_mhz = 5185;
+    restrictive.flags = RegFlags::NO_IR;
+    domain.rules.push(restrictive);
+    if connection::channel_power(&domain, 36, &flags, true).is_some()
+        || connection::channel_power(&domain, 36, &flags, false).is_some()
+    {
+        return TestResult::Fail("overlapping NO_IR did not prohibit Intel probes and host TX");
+    }
+    domain.rules.last_mut().unwrap().flags = RegFlags::DFS;
+    if connection::channel_power(&domain, 36, &flags, true).is_some()
+        || connection::channel_power(&domain, 36, &flags, false) != Some(9)
+    {
+        return TestResult::Fail(
+            "overlapping DFS did not prohibit initiation while preserving prior association policy",
+        );
+    }
     TestResult::Pass
 }
 kernel_test_in!(

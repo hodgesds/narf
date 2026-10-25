@@ -81,6 +81,35 @@ pub fn provision_state() -> Option<ProvisionState> {
         _ => ProvisionState::Failed,
     })
 }
+pub(super) async fn drive_scheduled<Step, StepFut, Wait, WaitFut>(
+    max_attempts: usize,
+    mut state: impl FnMut() -> Option<ProvisionState>,
+    mut step: Step,
+    mut wait: Wait,
+) -> Result<(), &'static str>
+where
+    Step: FnMut() -> StepFut,
+    StepFut: core::future::Future<Output = Result<(), &'static str>>,
+    Wait: FnMut() -> WaitFut,
+    WaitFut: core::future::Future<Output = ()>,
+{
+    let mut last_err = "signed BCM43602 board selection unavailable or mismatched";
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            wait().await;
+        }
+        match step().await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = err;
+                if state() != Some(ProvisionState::Parked) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
 pub(super) fn start(device: &mut BrcmfmacDevice) {
     // BAR mapping and immutable discovery need no board calibration guess.
     // Registry payloads arrive in Stage::Late, after synchronous PCI matching.
@@ -103,7 +132,11 @@ pub(super) fn start(device: &mut BrcmfmacDevice) {
     });
     *BOOTSTRAP.lock() = Some(owner);
     narf_scheduler::spawn(async {
-        if let Err(reason) = provision().await {
+        if let Err(reason) = drive_scheduled(120, provision_state, provision, || {
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
+        })
+        .await
+        {
             let _ = writeln!(narf_console::Writer, "brcmfmac: {}", reason);
         }
     });
@@ -115,6 +148,9 @@ pub async fn provision() -> Result<(), &'static str> {
         .lock()
         .clone()
         .ok_or("no retained BCM43602 owner")?;
+    if narf_net::trusted_net_authority().is_none() {
+        return Err("network registration authority unavailable");
+    }
     let authority = super::provision::authority().map_err(|_| "firmware authority unavailable")?;
     provision_using(&owner, &authority, super::provision::MANIFEST).await
 }
@@ -672,5 +708,77 @@ mod provision_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/wireless/brcmfmac/provision", smoke_brcmf_board_provisioning_preboot_retry_retains_exact_owner_terminal_attempt_does_not_retry);
+    kernel_test_in!(
+        "drivers/wireless/brcmfmac/provision",
+        smoke_brcmf_board_provisioning_preboot_retry_retains_exact_owner_terminal_attempt_does_not_retry
+    );
+
+    fn smoke_brcmf_drive_scheduled_retries_and_terminates() -> TestResult {
+        let state = core::sync::atomic::AtomicU8::new(ProvisionState::Parked as u8);
+
+        // Case 1: retries while state() == Some(ProvisionState::Parked) and succeeds
+        let attempts = core::cell::Cell::new(0);
+        let waits = core::cell::Cell::new(0);
+        let result = narf_scheduler::block_on(drive_scheduled(
+            5,
+            || match state.load(Ordering::Acquire) {
+                0 => Some(ProvisionState::Parked),
+                1 => Some(ProvisionState::Starting),
+                2 => Some(ProvisionState::Ready),
+                _ => Some(ProvisionState::Failed),
+            },
+            || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                async move {
+                    if n < 2 {
+                        Err("missing asset")
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            || {
+                waits.set(waits.get() + 1);
+                async {}
+            },
+        ));
+        if result.is_err() || attempts.get() != 3 || waits.get() != 2 {
+            return TestResult::Fail("brcmfmac drive_scheduled failed to retry while parked");
+        }
+
+        // Case 2: exits immediately when state is unretryable (Failed)
+        state.store(ProvisionState::Failed as u8, Ordering::Release);
+        attempts.set(0);
+        waits.set(0);
+        let result = narf_scheduler::block_on(drive_scheduled(
+            10,
+            || match state.load(Ordering::Acquire) {
+                0 => Some(ProvisionState::Parked),
+                1 => Some(ProvisionState::Starting),
+                2 => Some(ProvisionState::Ready),
+                _ => Some(ProvisionState::Failed),
+            },
+            || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                async move { Err("missing asset") }
+            },
+            || {
+                waits.set(waits.get() + 1);
+                async {}
+            },
+        ));
+        if result != Err("missing asset") || attempts.get() != 1 || waits.get() != 0 {
+            return TestResult::Fail(
+                "brcmfmac drive_scheduled did not exit immediately when unretryable",
+            );
+        }
+
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/brcmfmac/provision",
+        smoke_brcmf_drive_scheduled_retries_and_terminates
+    );
 }

@@ -94,7 +94,7 @@ fn smoke_rtw89_b_calibration_peak_obeys_every_current_channel_rule() -> TestResu
     let board = board();
     let bytes = image(board);
     let cal = Calibration::from_verified(&bytes, Some([3; 32]), board, authority()).unwrap();
-    for variant in 0..7 {
+    for variant in 0..8 {
         let mut d = domain();
         match variant {
             0 => d.rules[0].max_power_dbm = 10,
@@ -103,6 +103,7 @@ fn smoke_rtw89_b_calibration_peak_obeys_every_current_channel_rule() -> TestResu
             3 => d.rules[0].freq_start_mhz = 2403,
             4 => d.rules[0].freq_end_mhz = 2421,
             5 => d.rules.clear(),
+            7 => d.rules[0].flags = narf_wireless::reg::RegFlags::NO_IR,
             _ => d.rules.push(narf_wireless::reg::RegRule {
                 freq_start_mhz: 2402,
                 freq_end_mhz: 2422,

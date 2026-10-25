@@ -392,3 +392,63 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/bootstrap",
     smoke_iwlwifi_sc_csr_mac_step_rf_cdb_profile_boundaries
 );
+
+fn smoke_iwlwifi_drive_scheduled_retries_and_terminates() -> TestResult {
+    let owner = owner();
+    owner.parked();
+
+    // 1. Success on attempt 2 after transient missing firmware while Parked
+    let attempts = core::cell::Cell::new(0);
+    let waits = core::cell::Cell::new(0);
+    let result = narf_scheduler::block_on(drive_scheduled(
+        5,
+        || owner.phase(),
+        || {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            async move {
+                if n < 2 {
+                    Err("missing firmware")
+                } else {
+                    Ok(())
+                }
+            }
+        },
+        || {
+            waits.set(waits.get() + 1);
+            async {}
+        },
+    ));
+    if result.is_err() || attempts.get() != 3 || waits.get() != 2 {
+        return TestResult::Fail("iwlwifi drive_scheduled failed to retry while parked");
+    }
+
+    // 2. Terminates early when owner moves to unretryable state (Failed)
+    owner.fail();
+    attempts.set(0);
+    waits.set(0);
+    let result = narf_scheduler::block_on(drive_scheduled(
+        10,
+        || owner.phase(),
+        || {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            async move { Err("missing firmware") }
+        },
+        || {
+            waits.set(waits.get() + 1);
+            async {}
+        },
+    ));
+    if result != Err("missing firmware") || attempts.get() != 1 || waits.get() != 0 {
+        return TestResult::Fail(
+            "iwlwifi drive_scheduled did not exit immediately on unretryable state",
+        );
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/bootstrap",
+    smoke_iwlwifi_drive_scheduled_retries_and_terminates
+);

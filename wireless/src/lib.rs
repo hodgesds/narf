@@ -1697,6 +1697,7 @@ pub mod registry {
 
 /// Force-link hook.
 pub fn register_initcalls() {
+    narf_net::install_trusted_net_authority(narf_net::bootstrap_authority());
     let _ = nl80211::register();
 }
 

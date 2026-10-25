@@ -13,6 +13,58 @@ mod firmware_metadata {
         "/../../verification/data/wifi-firmware/realtek/metadata.rs"
     ));
 }
+include!("firmware/rtl8821c_metadata.rs");
+
+fn smoke_rtw8821ce_raw_source_header_and_exact_profile_binding() -> TestResult {
+    let bytes = narf_wifi_fixtures::firmware::metadata_replay(
+        SOURCE_8821C_LENGTH,
+        &[(0, SOURCE_8821C_HEADER)],
+    )
+    .unwrap();
+    if SOURCE_8821C_SHA256 != "2ef409bc418549fcf294061dd0cae1fc22fd9da79b60524950b25de18732f3f0"
+        || filename(0xc821) != Ok("rtw88/rtw8821c_fw.bin")
+        || parse(0xc822, &bytes).is_ok()
+    {
+        return TestResult::Fail("8821C original source identity or sibling separation");
+    }
+    let image = match parse(0xc821, &bytes) {
+        Ok(image) => image,
+        Err(_) => return TestResult::Fail("8821C original firmware section header rejected"),
+    };
+    if image.info
+        != (Info {
+            version: 24,
+            subversion: 11,
+            h2c: 12,
+            sections: 3,
+        })
+    {
+        return TestResult::Fail("8821C original firmware version/H2C facts");
+    }
+    for (part, (address, length)) in
+        image
+            .sections
+            .iter()
+            .zip([(0x200000, 31984), (0x30000, 63248), (0x100000, 44176)])
+    {
+        if part
+            .as_ref()
+            .is_none_or(|part| part.address != address || part.bytes.len() != length)
+        {
+            return TestResult::Fail("8821C original section/checksum boundaries");
+        }
+    }
+    let mut source22 = image_for_8821c(4093, 9, 5);
+    source22[0] = 0x22;
+    if parse(0xc821, &source22).is_ok() {
+        return TestResult::Fail("8821C accepted C22 source signature");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_raw_source_header_and_exact_profile_binding
+);
 
 fn smoke_rtw8822ce_raw_source_metadata_parser_golden() -> TestResult {
     // Replays retain the 64-byte source header only; zero sections/checksums
@@ -230,6 +282,63 @@ fn image(dmem: usize, imem: usize, emem: usize) -> Vec<u8> {
     }
     bytes
 }
+fn image_for_8821c(dmem: usize, imem: usize, emem: usize) -> Vec<u8> {
+    let mut bytes = image(dmem, imem, emem);
+    bytes[..2].copy_from_slice(&[0x21, 0x88]);
+    bytes
+}
+
+fn smoke_rtw8821ce_native_firmware_shared_source_order_failure_and_cancel() -> TestResult {
+    let bytes = image_for_8821c(4093, 9, 5);
+    let mut reference = Owner::new(Model::new(), 0xc821);
+    if narf_scheduler::block_on(reference.download(&bytes)).is_err()
+        || reference.phase() != Phase::Ready
+        || reference.io.trace.last() != Some(&Op::Finish)
+    {
+        return TestResult::Fail("8821C same native section/checksum loader failed");
+    }
+    for fail in 0..reference.io.calls {
+        let mut io = Model::new();
+        io.fail = Some(fail);
+        let mut owner = Owner::new(io, 0xc821);
+        if narf_scheduler::block_on(owner.download(&bytes)) != Err(Error::Access)
+            || owner.phase() != Phase::Failed
+            || owner.io.calls != fail + 1
+        {
+            return TestResult::Fail("8821C failed native firmware operation continued");
+        }
+    }
+    let mut io = Model::new();
+    io.packet_pending = true;
+    let mut owner = Owner::new(io, 0xc821);
+    {
+        let mut loading = core::pin::pin!(owner.download(&bytes));
+        if loading
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+        {
+            return TestResult::Fail(
+                "8821C reserved-page transfer did not retain pending ownership",
+            );
+        }
+    }
+    let calls = owner.io.calls;
+    let payload = owner.io.packet_data.clone();
+    if payload.is_empty()
+        || owner.phase() != Phase::Failed
+        || narf_scheduler::block_on(owner.download(&bytes)) != Err(Error::State)
+        || owner.io.calls != calls
+        || owner.io.packet_data != payload
+    {
+        return TestResult::Fail("8821C cancelled firmware transfer was replayed/overwritten");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_native_firmware_shared_source_order_failure_and_cancel
+);
 fn smoke_rtw88_sections_checksum_extents_and_native_iddma_order() -> TestResult {
     let bytes = image(4093, 9, 5);
     let parsed = parse(0xc822, &bytes).unwrap();

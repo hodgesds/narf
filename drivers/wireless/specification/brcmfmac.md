@@ -1,6 +1,6 @@
 # Broadcom FullMAC PCIe — software bring-up
 
-> Status: v0.7. Signed exact board provisioning, BCM43602 CR4 firmware, retained
+> Status: v0.8. Signed exact board provisioning, BCM43602 CR4 firmware, retained
 > PCIe control/flow/data rings and a constrained FullMAC station path are implemented. Recovery remains
 > software work; physical validation is pending.
 
@@ -70,7 +70,8 @@ and a named board to exact asset keys, lengths and SHA256 payload hashes.
 bytes. No generic chip NVRAM fallback supplies board authority.
 
 `native_runtime::provision_state()` reports Parked/Starting/Ready/Failed.
-`provision().await` retries newly staged assets/policy only while Parked. Missing,
+`provision().await` requires `trusted_net_authority` and retries newly staged assets/policy only while Parked.
+Probe drives background provisioning via `drive_scheduled` across 120 attempts with 500 ms intervals. Missing,
 unsigned, malformed, mismatched or revoked provisioning preserves the exact parked
 owner without a CR4/ring attempt. All selected assets, single-board NVRAM and an
 existing or signed regulatory domain validate before Starting. First hardware
@@ -235,6 +236,46 @@ Explicit registration, operator up/down and autoconnect remain administrative
 events. Disconnect/failure clears carrier and peer identity while preserving an
 operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
+### Dual-band 20 MHz station profile
+
+The exact BCM43602 `Fullmac::BAND_5GHZ` profile admits firmware-reported valid
+channels from Linux's 2.4/5 GHz tables, intersected with the retained host-policy
+snapshot. It first sets and reads back `bw_cap=20 MHz` on both firmware bands
+before `WLC_UP`; a join chanspec alone is not a bandwidth proof. An absent,
+failed or wider readback prevents interface/station publication. CYW43439's
+SDIO profile leaves this capability false and never gains 5 GHz from an
+unexpected valid-channel reply.
+
+Scan and join use the correct D11AC band bits and 20 MHz channel encodings.
+Wider AP BSS records decode their primary from center/sideband and require any
+reported ctl_ch to agree; 6 GHz/4.9 GHz numeric aliases, malformed widths and
+band mismatches fail. The facade splits genuine allowed channels into separate
+wiphy bands; HT/VHT metadata and wider operating widths are not inferred.
+The original Linux C codec oracle covers 43 encodings and 473 admitted primary
+layouts. Native shared5/6 models compose Open/WPA2, firmware station power save,
+DHCP and exact bidirectional IP on channels36/149, and validate bandwidth caps,
+wire values, NO_IR/passive discovery and restrictive-overlap rejection.
+
+NO_IR/DFS receive channels can remain visible for passive discovery; every
+active channel and association must independently obtain TX permission before
+power/scan/join dispatch. A permissive overlapping rule cannot erase a stricter
+limit. Fixed-domain initialization retains its policy snapshot; native attachment
+observes live shared DB replacement/clear as described below. Physical 5 GHz
+RF/width/power/AP acceptance is required in addition to these software results.
+
+The common FullMAC station now uses a live immutable host-policy source during
+native attachment. Shared DB replacement/clear is observed around setup, control
+receipts, scan/join idle fences and host data progress; fixed-domain explicit
+initialization remains snapshot-only. Source loss, country change, channel
+removal/NO_IR/DFS or a lower ceiling than acknowledged firmware power closes the
+host port and poisons the retained owner. Reinstalling policy or receiving late
+link/key events cannot reopen it. Same-country changes covering that original
+power grant preserve the peer without increasing power. Native msgbuf tests
+exercise queued-TX closure and replacement during actual join/PS receipts, with
+no uncertain DMA freed. This does not automatically follow revocation of a cached
+policy firmware capability or establish firmware RF quiescence; reset/reload and
+DMA reclamation remain separate gates. See `cyw43439.md` §3 and `wireless/` §3.5.
+
 ## 4. Invariants
 
 - No bus mastering without owned DMA mappings, ring lifetimes, and a
@@ -271,16 +312,25 @@ IOCTL/events/data ownership, generation-safe retained flow recycling, shared
 station/control-port lifecycle and native probe-to-interface dispatch.
 
 The retained initial profile is shared 5/6, zero descriptor prefix, polling,
-2.4 GHz Open or firmware-supplicant WPA2-PSK/CCMP, with one-shot terminal failure
+2.4/5 GHz Open or firmware-supplicant WPA2-PSK/CCMP, with one-shot terminal failure
 and permanent retention of published DMA. Its remaining deployment requirements
 are real target identity/calibration/firmware assets, a verified selection manifest
 (or trusted platform registration), authenticated regulatory policy and physical
 station acceptance. No deployment board is manufactured by these tests.
 
+The common FullMAC interface also exposes ordinary station power save, with
+an awake default and serialized/coalesced PM_FAST/PM_OFF plus the default
+2000 ms `pm2_sleep_ret` policy. Both native msgbuf replies are required before
+recording applied state; rejection/partial transition closes carrier/queued TX
+and leaves uncertain DMA retained. Shared5/6 models check exact command bytes,
+duplicate policy, authorized-peer preservation and firmware refusal at either
+step; Open/WPA2 DHCP/IP conversations run while PS is enabled. This implements
+firmware station PS only; host-bus PM, suspend/WoW and reset replay remain open.
+
 Additional software outside that retained profile remains: nonzero descriptor
-prefixes/shared 7, other CPU/RAM/chip/OTP selectors, broader bands/widths, native802.11
+prefixes/shared 7, other CPU/RAM/chip/OTP selectors, wider operating widths/PHY, native802.11
 RX/metadata, larger flow budgets, host-supplicant fallback, WPA3/AP, replayed
-recovery/PM, confirmed stop/IOMMU quiescence and DMA reclamation, and IRQ delivery.
+recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation, and IRQ delivery.
 These do not expand the initial polling/retained-failure acceptance claim.
 
 ## 7. Stage assignment

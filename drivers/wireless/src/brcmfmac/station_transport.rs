@@ -137,6 +137,7 @@ where
     // required for this exact chip profile. Valid channels still intersect
     // authenticated host policy before station publication.
     const EXTERNAL_CLM: bool = false;
+    const BAND_5GHZ: bool = true;
     async fn command<'a>(
         &'a mut self,
         direction: Direction,

@@ -456,3 +456,60 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8188ee_retained_worker_cancel_keeps_terminal_owner
 );
+
+fn smoke_rtl8188ee_drive_scheduled_retries_and_terminates() -> TestResult {
+    let attempts = core::cell::Cell::new(0);
+    let waits = core::cell::Cell::new(0);
+    let retryable = core::cell::Cell::new(true);
+
+    // Case 1: retries while retryable and succeeds
+    let result = narf_scheduler::block_on(crate::rtlwifi::pci::drive_scheduled(
+        5,
+        || retryable.get(),
+        || {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            async move {
+                if n < 2 {
+                    Err(Error::State)
+                } else {
+                    Ok(())
+                }
+            }
+        },
+        || {
+            waits.set(waits.get() + 1);
+            async {}
+        },
+    ));
+    if result.is_err() || attempts.get() != 3 || waits.get() != 2 {
+        return TestResult::Fail("rtlwifi drive_scheduled failed to retry");
+    }
+
+    // Case 2: stops early when retryable returns false
+    attempts.set(0);
+    waits.set(0);
+    retryable.set(false);
+    let result = narf_scheduler::block_on(crate::rtlwifi::pci::drive_scheduled(
+        10,
+        || retryable.get(),
+        || {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            async move { Err(Error::State) }
+        },
+        || {
+            waits.set(waits.get() + 1);
+            async {}
+        },
+    ));
+    if result != Err(Error::State) || attempts.get() != 1 || waits.get() != 0 {
+        return TestResult::Fail("rtlwifi drive_scheduled did not exit early when unretryable");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8188ee_drive_scheduled_retries_and_terminates
+);

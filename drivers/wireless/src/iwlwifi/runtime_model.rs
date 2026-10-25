@@ -257,9 +257,16 @@ pub(in crate::iwlwifi) fn versions(hardware: &mut Hardware, commands: &[u8]) {
 /// Post-firmware-ready Sc model with no pre-created station queues. The
 /// composition must allocate and retain every queue through real commands.
 pub(in crate::iwlwifi) fn station_model() -> (Hardware, Firmware, TxTrace) {
-    let (mut hardware, firmware) = create(false);
-    hardware.resources.data.clear();
+    let (mut hardware, firmware, trace) = station_model_for_format(rx_rfh::CompletionFormat::Bz);
     hardware.device.id.device = 0xe340;
+    (hardware, firmware, trace)
+}
+
+pub(in crate::iwlwifi) fn station_model_for_format(
+    format: rx_rfh::CompletionFormat,
+) -> (Hardware, Firmware, TxTrace) {
+    let (mut hardware, firmware) = create_for_format(false, format);
+    hardware.resources.data.clear();
     let trace = TxTrace(alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
         alloc::collections::VecDeque::new(),
     )));
@@ -278,6 +285,15 @@ pub(in crate::iwlwifi) fn retained(hardware: &Hardware) -> (usize, usize, usize)
             .filter(|queue| !queue.is_idle())
             .count(),
     )
+}
+
+pub(in crate::iwlwifi) fn queue_dma_addresses(hardware: &Hardware, id: u16) -> Option<(u64, u64)> {
+    hardware
+        .resources
+        .data
+        .iter()
+        .find(|queue| queue.id() == Some(id))
+        .map(super::super::data_queue::DataQueue::model_dma_addresses)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

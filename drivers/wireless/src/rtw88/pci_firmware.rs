@@ -1,4 +1,4 @@
-//! Private RTL8822CE firmware-only PCI owner; Linux rtw88/pci.c/mac.c/util.c.
+//! Private RTL8821CE/RTL8822CE firmware-only PCI owner; Linux rtw88/pci.c/mac.c/util.c.
 //! All native rings are retained before BME. MAC TX/RX and IRQ stay closed.
 use super::{
     firmware_transport::Error,
@@ -61,7 +61,7 @@ pub(super) struct Native {
 }
 impl core::fmt::Debug for Native {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Rtw8822ceFirmwarePci")
+        f.debug_struct("Rtw88FirmwarePci")
             .field("address", &self.device.addr)
             .field("state", &self.state)
             .finish_non_exhaustive()
@@ -128,7 +128,7 @@ fn dma_address(memory: &DmaBuffer, needed: usize) -> Result<u32, Error> {
 }
 impl Native {
     /// # Safety
-    /// The exact RTL8822CE just completed the real chip/cut card-disable→enable
+    /// The exact RTL8821CE/RTL8822CE completed the real chip/cut card-disable→enable
     /// cold power flow and factory EFUSE stage, exclusively under this cap.
     /// BME is parked; no previous firmware/packet/reset owner may exist.
     /// Coherent addresses must be physical/identity-mapped for this PCI device.
@@ -138,7 +138,7 @@ impl Native {
         mmio: MmioRegion,
     ) -> Result<Self, Error> {
         if device.id.vendor != 0x10ec
-            || device.id.device != 0xc822
+            || !matches!(device.id.device, 0xc821 | 0xc822)
             || mmio.len < 0x170c
             || narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain
         {
@@ -498,7 +498,12 @@ unsafe impl Registers for Native {
         if self.state != State::MacPrepared {
             return Err(Error::State);
         }
-        if self.mmio.len < 0x5000 {
+        let extent = if self.device.id.device == 0xc821 {
+            0x2000
+        } else {
+            0x5000
+        };
+        if self.mmio.len < extent {
             return Err(Error::Unsupported);
         }
         self.state = State::Configuring;

@@ -8,8 +8,10 @@ use super::{
     station::Station,
     PacketTransport,
 };
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(any(test, feature = "kernel-test"))]
+use alloc::vec;
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use narf_ipc::{Consumer, Producer};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
@@ -66,7 +68,7 @@ impl<R: Fullmac> State<R> {
         let result = if pending.deadline.expired() {
             Err(Error::Timeout)
         } else {
-            self.station.runtime.send_data(pending.frame.payload(), 0)
+            self.station.send_data(pending.frame.payload(), 0)
         };
         match result {
             Ok(()) => self.pending = None,
@@ -88,6 +90,9 @@ pub struct Device<R: Fullmac> {
     channels: Vec<u32>,
     supplicant: bool,
     up: AtomicBool,
+    // Requested PS policy: 0=awake, 1=PM_FAST, 2=terminal failure. The
+    // retained worker serializes firmware commands with scan/join/packets.
+    power_save: AtomicU8,
     bssid: AtomicU64,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -148,8 +153,9 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Unsupported)?;
-    let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
-    let station = Station::initialize(runtime, clm, domain).await?;
+    narf_wireless::reg::db::ensure_snapshot().map_err(|_| Error::Authority)?;
+    let station =
+        Station::initialize_live(runtime, clm, Arc::new(super::station::GlobalPolicy)).await?;
     let (rx_producer, rx_consumer) = narf_ipc::channel();
     let (tx_producer, tx_consumer) = narf_ipc::channel();
     let device = Arc::new(Device {
@@ -164,6 +170,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             pending: None,
         }),
         up: AtomicBool::new(false),
+        power_save: AtomicU8::new(0),
         bssid: AtomicU64::new(0),
         rx: IrqSafeSpinLock::new(Some(rx_consumer)),
         tx: IrqSafeSpinLock::new(Some(tx_producer)),
@@ -229,12 +236,19 @@ impl<R: Fullmac + 'static> Device<R> {
             return Vec::new();
         };
         if state.progress().is_err() {
+            self.power_save.store(2, Ordering::Release);
             self.link(None);
             return Vec::new();
         }
         self.link(state.station.bssid);
         let mut output = Vec::new();
         for _ in 0..32 {
+            if state.station.check_connection_policy().is_err() {
+                state.clear_transmit();
+                self.power_save.store(2, Ordering::Release);
+                self.link(None);
+                return Vec::new();
+            }
             let Some(bytes) = state.station.runtime.pop_data() else {
                 break;
             };
@@ -253,11 +267,40 @@ impl<R: Fullmac + 'static> Device<R> {
         output
     }
 
+    async fn apply_power_save(&self) {
+        let policy = self.power_save.load(Ordering::Acquire);
+        if policy > 1 {
+            return;
+        }
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
+        if state.station.power_save() == (policy == 1) {
+            return;
+        }
+        if let Err(error) = state.station.set_power_save(policy == 1).await {
+            self.power_save.store(2, Ordering::Release);
+            state.clear_transmit();
+            self.link(None);
+            narf_console::klog!(
+                "{}: FullMAC power-save transition failed: {:?}\n",
+                self.name,
+                error
+            );
+        } else if state.station.bssid.is_none() {
+            // A concurrent disconnect closes host admission before waiting
+            // for this mutex. A PS receipt has no authority to reopen it
+            // using the station's earlier peer; it may only publish loss.
+            self.link(None);
+        }
+    }
+
     async fn receive_worker(self: Arc<Self>) {
         loop {
             for mut frame in self.step() {
                 narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
             }
+            self.apply_power_save().await;
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
     }
@@ -326,6 +369,22 @@ impl<R: Fullmac + 'static> Interface for Device<R> {
 }
 #[async_trait::async_trait]
 impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
+    fn power_save_default(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
+        // The synchronous control plane accepts a desired policy, like the
+        // ath11k control worker. Coalesce changes while an IOCTL is in flight;
+        // never overwrite terminal failure with a new request.
+        self.power_save
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                (old < 2).then_some(u8::from(enabled))
+            })
+            .map(|_| ())
+            .map_err(|_| 19) // ENODEV
+    }
+
     fn max_scan_ssids(&self) -> u8 {
         16
     }
@@ -351,13 +410,22 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     }
     fn get_wireless_info(&self) -> narf_wireless::WirelessIfaceInfo {
         use narf_wireless::iface::*;
+        let mut bands = Vec::new();
+        for (freq_mhz, five_ghz) in [(2400, false), (5000, true)] {
+            let channels: Vec<u32> = self
+                .channels
+                .iter()
+                .copied()
+                .filter(|&channel| (channel > 14) == five_ghz)
+                .collect();
+            if !channels.is_empty() {
+                bands.push(WirelessBand { freq_mhz, channels });
+            }
+        }
         WirelessIfaceInfo {
             base_name: self.name.clone(),
             base_mac: self.mac,
-            bands: vec![WirelessBand {
-                freq_mhz: 2400,
-                channels: self.channels.clone(),
-            }],
+            bands,
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
                 ht_supported: false,
@@ -400,6 +468,7 @@ fn wireless_error(error: Error) -> WirelessError {
         Error::Busy => WirelessError::Busy,
         Error::Timeout => WirelessError::Timeout,
         Error::Unsupported => WirelessError::NotSupported,
+        Error::Authority => WirelessError::Denied,
         Error::Malformed => WirelessError::InvalidArgs,
         _ => WirelessError::HardwareError,
     }

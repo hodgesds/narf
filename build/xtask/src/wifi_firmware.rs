@@ -313,6 +313,12 @@ mod tests {
             .find(|p| p.id == "rtl8188ee")
             .unwrap();
         assert_eq!(ee.assets[0].candidates, ["rtlwifi/rtl8188efw.bin"]);
+        let c21 = catalog
+            .profiles
+            .iter()
+            .find(|p| p.id == "rtl8821ce")
+            .unwrap();
+        assert_eq!(c21.assets[0].candidates, ["rtw88/rtw8821c_fw.bin"]);
         // Cross-check the retained driver tables, including less common
         // Qualcomm revisions that may be absent from the local installation.
         for (family, source, prefix) in [

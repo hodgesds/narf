@@ -1,4 +1,5 @@
-//! Receive-only CONNAC2 scan. Reference: Linux ecd997b0189a
+//! Retained CONNAC2 passive and policy-authorized active scan.
+//! Reference: Linux ecd997b0189a
 //! mt76_connac_mcu.{c,h}, mt7921/{mac,mcu}.c and mt792x.h.
 use super::{station::Command, *};
 
@@ -41,9 +42,17 @@ pub(super) struct NativeRx<'a> {
     pub frame: &'a [u8],
     pub ccmp: Option<CcmpRx>,
     pub channel: u8,
+    pub amsdu: u8,
 }
 
 pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
+    let native = rx_native_with_amsdu(packet)?;
+    (native.amsdu == 0).then_some(native)
+}
+
+/// Decode ownership/security metadata without admitting A-MSDU payloads to
+/// legacy scan/auth/EAPOL paths. Their callers keep using rx_native above.
+pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     let r0 = word(packet, 0)?;
     let len = (r0 & 0xffff) as usize;
     let normal = r0 >> 27 == 2 || r0 >> 27 == 7 && (r0 >> 16) & 15 == 1;
@@ -61,7 +70,6 @@ pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
     if !matches!(cipher, 0 | 4) // MT_CIPHER_NONE / MT_CIPHER_AES_CCMP
         || r1 & (0x3f << 23) != 0
         || r2 & ((1 << 13) | (7 << 23) | (1 << 27)) != 0
-        || r4 & 3 != 0
     {
         return None;
     }
@@ -92,6 +100,7 @@ pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
     Some(NativeRx {
         frame: packet.get(offset..)?,
         channel,
+        amsdu: (r4 & 3) as u8,
         ccmp: if cipher == 4 {
             Some(CcmpRx {
                 pn: pn?,
@@ -231,6 +240,113 @@ pub(super) fn scan_request(sequence: u8, channels: &[u8]) -> Result<Vec<u8>, Err
     Ok(body)
 }
 
+/// Linux mt792x_init_wiphy advertises four SSIDs, despite the v1 structure
+/// reserving an additional six extension entries. Empty entries request the
+/// wildcard probe; nonempty entries use specified-only SSID semantics.
+pub(super) fn active_scan_request(
+    sequence: u8,
+    channels: &[u8],
+    ssids: &[Vec<u8>],
+) -> Result<Vec<u8>, Error> {
+    if ssids.is_empty() || ssids.len() > 4 || ssids.iter().any(|ssid| ssid.len() > 32) {
+        return Err(Error::Bounds);
+    }
+    let mut body = scan_request(sequence, channels)?;
+    body[2] = 1; // ACTIVE
+    body[5] = 2; // Two probes per SSID, including wildcard.
+    let mut count = 0usize;
+    for ssid in ssids.iter().filter(|ssid| !ssid.is_empty()) {
+        let offset = 8 + count * 36;
+        body[offset..offset + 4].copy_from_slice(&(ssid.len() as u32).to_le_bytes());
+        body[offset + 4..offset + 4 + ssid.len()].copy_from_slice(ssid);
+        count += 1;
+    }
+    body[3] = if count == 0 { 1 } else { 4 };
+    body[4] = count as u8;
+    body[1185] = u8::from(count != 0); // ssid_type_ext: specified-only.
+    Ok(body)
+}
+
+struct ActiveScan {
+    permissions: Vec<(u8, super::super::association::TxPermission)>,
+}
+
+fn passive_domain(info: RadioInfo) -> Vec<u8> {
+    let channels = super::super::channel::channels(info.capabilities.phy.bands);
+    let mut domain = vec![0u8; 12 + channels.len() * 8];
+    domain[..2].copy_from_slice(b"00");
+    domain[4..7].fill(1);
+    domain[8] = if info.capabilities.phy.bands & 1 != 0 {
+        11
+    } else {
+        0
+    };
+    domain[9] = if info.capabilities.phy.bands & 2 != 0 {
+        28
+    } else {
+        0
+    };
+    for (i, channel) in channels.into_iter().enumerate() {
+        domain[12 + i * 8..14 + i * 8].copy_from_slice(&u16::from(channel).to_le_bytes());
+        domain[16 + i * 8..20 + i * 8].copy_from_slice(&2u32.to_le_bytes()); // Linux NO_IR.
+    }
+    domain
+}
+impl ActiveScan {
+    fn prepare(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        channels: &[u8],
+    ) -> Result<Self, Error> {
+        let mut permissions = channels
+            .iter()
+            .map(|&channel| {
+                super::super::association::TxPermission::from_domain(domain, channel)
+                    .map(|permission| (channel, permission))
+                    .ok_or(Error::Authority)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Source set_rate_txpower programs 2GHz before5GHz regardless of scan
+        // channel order. last_msg remains global, set only on the final row.
+        permissions.sort_unstable_by_key(|(channel, _)| *channel);
+        Ok(Self { permissions })
+    }
+    fn current(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        _channels: &[u8],
+    ) -> Result<(), Error> {
+        for &(channel, old) in &self.permissions {
+            let new = super::super::association::TxPermission::from_domain(domain, channel)
+                .ok_or(Error::Authority)?;
+            if old.country != new.country || new.power_dbm < old.power_dbm {
+                return Err(Error::Authority);
+            }
+        }
+        Ok(())
+    }
+    fn domain(&self, channels: &[u8]) -> Vec<u8> {
+        let mut domain = vec![0; 12 + channels.len() * 8];
+        domain[..2].copy_from_slice(&self.permissions[0].1.country);
+        domain[4..7].fill(1); // Legacy20.
+        let mut index = 0;
+        for band in [
+            super::super::channel::Band::Ghz2,
+            super::super::channel::Band::Ghz5,
+        ] {
+            for &channel in channels
+                .iter()
+                .filter(|&&ch| super::super::channel::band(ch) == Some(band))
+            {
+                domain[7 + usize::from(band.scan_tag())] += 1;
+                domain[12 + index * 8..14 + index * 8]
+                    .copy_from_slice(&u16::from(channel).to_le_bytes());
+                index += 1;
+            }
+        }
+        domain
+    }
+}
+
 impl<B: Backend> Session<B> {
     pub(super) async fn notify(&mut self, command: Command, body: &[u8]) -> Result<(), Error> {
         self.seq = self.seq % 15 + 1;
@@ -252,25 +368,7 @@ impl<B: Backend> Session<B> {
         self.exchange(Command::Unified { id: 2 }, &bss).await?;
         // Every exposed band remains NO_IR during passive scan. Association
         // installs a separate authenticated host policy before transmission.
-        let channels = super::super::channel::channels(info.capabilities.phy.bands);
-        let mut domain = vec![0u8; 12 + channels.len() * 8];
-        domain[..2].copy_from_slice(b"00");
-        domain[4..7].fill(1); // 20 MHz only
-        domain[8] = if info.capabilities.phy.bands & 1 != 0 {
-            11
-        } else {
-            0
-        };
-        domain[9] = if info.capabilities.phy.bands & 2 != 0 {
-            28
-        } else {
-            0
-        };
-        for (i, channel) in channels.into_iter().enumerate() {
-            domain[12 + i * 8..14 + i * 8].copy_from_slice(&u16::from(channel).to_le_bytes());
-            domain[16 + i * 8..20 + i * 8].copy_from_slice(&2u32.to_le_bytes());
-            // NO_IR
-        }
+        let domain = passive_domain(info);
         self.notify(
             Command::Ce {
                 id: 0x0f,
@@ -304,8 +402,39 @@ impl<B: Backend> Session<B> {
     }
 
     pub(super) async fn scan_passive(&mut self, channels: &[u8]) -> Result<ScanReport, Error> {
+        self.scan_with_policy(channels, &[], || Err(Error::Authority))
+            .await
+    }
+
+    pub(super) async fn scan_active_with_policy(
+        &mut self,
+        channels: &[u8],
+        ssids: &[Vec<u8>],
+        policy: impl FnMut() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
+    ) -> Result<ScanReport, Error> {
+        if ssids.is_empty() {
+            return Err(Error::Bounds);
+        }
+        self.scan_with_policy(channels, ssids, policy).await
+    }
+
+    async fn scan_with_policy(
+        &mut self,
+        channels: &[u8],
+        ssids: &[Vec<u8>],
+        mut policy: impl FnMut() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
+    ) -> Result<ScanReport, Error> {
         let sequence = self.scan_seq % 127 + 1;
-        let request = scan_request(sequence, channels)?; // No writes on invalid input.
+        let request = if ssids.is_empty() {
+            scan_request(sequence, channels)?
+        } else {
+            active_scan_request(sequence, channels, ssids)?
+        }; // No writes on invalid input.
+        let active = if ssids.is_empty() {
+            None
+        } else {
+            Some(ActiveScan::prepare(&policy()?, channels)?)
+        };
         let (info, setup) = match self.state {
             State::RadioReady(info) => (info, true),
             State::ScanReady(info) => (info, false),
@@ -323,6 +452,54 @@ impl<B: Backend> Session<B> {
             if setup {
                 self.stage(Stage::ScanSetup);
                 self.scan_setup(info).await?;
+            }
+            if let Some(active) = &active {
+                // A repeat scan already has a VIF. It must still reserve the
+                // retained owner before power/PSE/domain DMA can suspend;
+                // cancellation at these earlier awaits cannot leave ScanReady.
+                if !setup {
+                    self.stage(Stage::ScanSetup);
+                }
+                for (index, (_, permission)) in active.permissions.iter().enumerate() {
+                    active.current(&policy()?, channels)?;
+                    let mut limits = permission.rate_limits();
+                    limits[6] = u8::from(index + 1 == active.permissions.len());
+                    self.notify(
+                        Command::Ce {
+                            id: 0x5d,
+                            query: false,
+                        },
+                        &limits,
+                    )
+                    .await?;
+                    // Linux drains each SKU batch via an MCU PSE register
+                    // read to avoid exhausting PSE command-buffer space.
+                    let mut request = [0; 8];
+                    request[..4].copy_from_slice(&0x820c8000u32.to_le_bytes());
+                    let reply = self
+                        .exchange(
+                            Command::Ce {
+                                id: 0xc0,
+                                query: true,
+                            },
+                            &request,
+                        )
+                        .await?;
+                    if reply.len() != 8 || reply[..4] != request[..4] {
+                        return Err(Error::MalformedEvent);
+                    }
+                }
+                active.current(&policy()?, channels)?;
+                self.notify(
+                    Command::Ce {
+                        id: 0x0f,
+                        query: false,
+                    },
+                    &active.domain(channels),
+                )
+                .await?;
+                // Scan is the first autonomous probe-producing command.
+                active.current(&policy()?, channels)?;
             }
             // Discard bounded stale completions before this scan's command.
             self.events.retain(|event| event.get(28) != Some(&0x0d));
@@ -342,6 +519,9 @@ impl<B: Backend> Session<B> {
                 truncated: false,
             };
             self.wait(15_000, |backend| {
+                if let Some(active) = &active {
+                    active.current(&policy()?, channels)?;
+                }
                 // Bound work per poll even if the device continuously receives.
                 for _ in 0..16 {
                     let Some(packet) = backend.receive_data()? else {
@@ -392,6 +572,18 @@ impl<B: Backend> Session<B> {
                 Ok(None)
             })
             .await?;
+            if active.is_some() {
+                // Probe permission belongs to this scan, not the idle VIF.
+                // Passive follow-up scans inherit a NO_IR-only domain.
+                self.notify(
+                    Command::Ce {
+                        id: 0x0f,
+                        query: false,
+                    },
+                    &passive_domain(info),
+                )
+                .await?;
+            }
             Ok(report)
         }
         .await;
@@ -405,6 +597,29 @@ impl<B: Backend> Session<B> {
                     State::Running(stage) => stage,
                     _ => Stage::ScanWait,
                 };
+                if active.is_some() {
+                    // Best effort only: neither DMA receipt proves firmware
+                    // scan-idle. Keep this attempt terminal and require reset
+                    // even when cancellation/domain closure can be submitted.
+                    let _ = self
+                        .notify(
+                            Command::Ce {
+                                id: 0x1b,
+                                query: false,
+                            },
+                            &[sequence, 0, 0, 0],
+                        )
+                        .await;
+                    let _ = self
+                        .notify(
+                            Command::Ce {
+                                id: 0x0f,
+                                query: false,
+                            },
+                            &passive_domain(info),
+                        )
+                        .await;
+                }
                 self.state = State::Failed { stage, error };
                 Err(error)
             }

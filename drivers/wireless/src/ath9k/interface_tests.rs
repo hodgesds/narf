@@ -501,3 +501,69 @@ kernel_test_in!(
     "drivers/wireless/ath9k/device",
     smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons
 );
+
+fn smoke_ar9285_drive_scheduled_retries_policy_and_stops_on_terminal_error() -> TestResult {
+    use crate::ath9k::{BringUpError, RadioCalibration};
+    let sample = RadioCalibration {
+        country: [b'U', b'S'],
+        frequency_mhz: 2412,
+        max_power_half_dbm: 40,
+        pa_offset: Some(0),
+        iq_i: 0,
+        iq_q: 0,
+        measured_noise_dbm: -95,
+        noise_dbm: -95,
+    };
+
+    // Case 1: retries on BringUpError::Policy and succeeds
+    let attempts = core::cell::Cell::new(0);
+    let waits = core::cell::Cell::new(0);
+    let result = narf_scheduler::block_on(crate::ath9k::drive_scheduled(
+        5,
+        || {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            async move {
+                if n < 2 {
+                    Err(BringUpError::Policy)
+                } else {
+                    Ok(sample)
+                }
+            }
+        },
+        || {
+            waits.set(waits.get() + 1);
+            async {}
+        },
+    ));
+    if result != Ok(sample) || attempts.get() != 3 || waits.get() != 2 {
+        return TestResult::Fail("ath9k drive_scheduled failed to retry on Policy");
+    }
+
+    // Case 2: terminates immediately on non-Policy error (e.g. BadState)
+    attempts.set(0);
+    waits.set(0);
+    let result = narf_scheduler::block_on(crate::ath9k::drive_scheduled(
+        10,
+        || {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            async move { Err(BringUpError::BadState) }
+        },
+        || {
+            waits.set(waits.get() + 1);
+            async {}
+        },
+    ));
+    if result != Err(BringUpError::BadState) || attempts.get() != 1 || waits.get() != 0 {
+        return TestResult::Fail(
+            "ath9k drive_scheduled did not terminate immediately on non-Policy error",
+        );
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/device",
+    smoke_ar9285_drive_scheduled_retries_policy_and_stops_on_terminal_error
+);

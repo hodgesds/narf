@@ -21,6 +21,9 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wifi_fixtures::{udp_ipv4, DhcpServer, NetworkPlan};
 
+#[path = "power_save_tests.rs"]
+mod power_save_tests;
+
 const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
 
@@ -160,12 +163,26 @@ struct Harness {
 
 impl Harness {
     fn new(secured: bool) -> Result<Self, &'static str> {
+        Self::new_policy(secured, None)
+    }
+    fn new_policy(
+        secured: bool,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+    ) -> Result<Self, &'static str> {
         let bus = Bus::new(secured);
-        let station = ready(Station::initialize(
-            Runtime::new(bus.clone()),
-            &[1],
-            firmware::domain(),
-        ))?
+        let station = if let Some(database) = database {
+            ready(Station::initialize_live(
+                Runtime::new(bus.clone()),
+                &[1],
+                database,
+            ))?
+        } else {
+            ready(Station::initialize(
+                Runtime::new(bus.clone()),
+                &[1],
+                firmware::domain(),
+            ))?
+        }
         .map_err(|_| "CYW composition firmware initialization")?;
         if station.mac != OWN {
             return Err("CYW composition firmware identity");
@@ -187,6 +204,7 @@ impl Harness {
             channels,
             supplicant,
             up: AtomicBool::new(false),
+            power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
             rx: IrqSafeSpinLock::new(Some(rx_consumer)),
             tx: IrqSafeSpinLock::new(Some(tx_producer)),
@@ -292,6 +310,23 @@ fn composition(secured: bool) -> Result<(), &'static str> {
         return Err("CYW admitted data or carrier before association");
     }
     harness.scan_and_associate(secured)?;
+    // Exercise ordinary station power save through the same native data
+    // owner before the real DHCP/IP conversation, for Open and WPA2.
+    harness
+        .device
+        .set_power_save(true)
+        .map_err(|_| "CYW power-save request")?;
+    ready(harness.device.apply_power_save())?;
+    if !harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .power_save()
+    {
+        return Err("CYW firmware never acknowledged station power save");
+    }
     let lease = narf_net::dhcp::dhcp_acquire(&harness.name, 0)
         .map_err(|_| "CYW association did not compose to a DHCP lease")?;
     if !plan.matches_lease(&lease) {
@@ -337,6 +372,21 @@ fn composition(secured: bool) -> Result<(), &'static str> {
     // Link loss must discard an already queued TX and an RX captured in the
     // same firmware poll, before either can cross the controlled port.
     let tx_before = harness.bus.ap.lock().uplink.len();
+    harness
+        .device
+        .set_power_save(false)
+        .map_err(|_| "CYW awake request")?;
+    ready(harness.device.apply_power_save())?;
+    if harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .power_save()
+    {
+        return Err("CYW firmware never acknowledged awake mode");
+    }
     let rx_before_loss = narf_net::iface::lookup(&harness.name)
         .ok_or("CYW composition interface disappeared before link loss")?
         .stats
@@ -462,3 +512,6 @@ kernel_test_in!(
     "drivers/wireless/cyw43439/interface",
     smoke_cyw_disconnect_overrides_waiting_old_link_publication
 );
+
+#[path = "live_policy_tests.rs"]
+mod live_policy_tests;

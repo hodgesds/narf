@@ -14,6 +14,11 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wifi_fixtures::udp_ipv4;
 
+#[path = "channel_station_tests.rs"]
+mod channel_station_tests;
+#[path = "power_save_tests.rs"]
+mod power_save_tests;
+
 type ModelDevice = Device<TestAdapter>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
 fn send(bytes: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
@@ -38,6 +43,7 @@ struct Harness {
     device: Arc<ModelDevice>,
     bus: Handle,
     name: String,
+    channel: u8,
 }
 impl Harness {
     fn new(version: u32, secured: bool, keys_first: bool) -> Result<Self, &'static str> {
@@ -49,6 +55,25 @@ impl Harness {
         keys_first: bool,
         selected: bool,
     ) -> Result<Self, &'static str> {
+        Self::new_channel(version, secured, keys_first, selected, 6)
+    }
+    fn new_channel(
+        version: u32,
+        secured: bool,
+        keys_first: bool,
+        selected: bool,
+        channel: u8,
+    ) -> Result<Self, &'static str> {
+        Self::new_channel_policy(version, secured, keys_first, selected, channel, None)
+    }
+    fn new_channel_policy(
+        version: u32,
+        secured: bool,
+        keys_first: bool,
+        selected: bool,
+        channel: u8,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+    ) -> Result<Self, &'static str> {
         let (adapter, bus) = if selected {
             let (selection, assets) = crate::brcmfmac::provision::tests::selected_fixture(
                 crate::brcmfmac::provision::Family::Pcie43602,
@@ -59,9 +84,36 @@ impl Harness {
         }
         .map_err(|_| "CR4/common-ring native ownership")?;
         bus.keys_first(keys_first);
-        let station = ready(Station::initialize(adapter, &[], firmware::domain()))?
-            .map_err(|_| "PCIe station firmware initialization")?;
-        if station.mac != OWN || station.channels != [1, 6, 11] || !station.supplicant {
+        bus.channel(channel);
+        let mut domain = firmware::domain();
+        if channel > 14 {
+            use narf_wireless::reg::{RegFlags, RegRule};
+            for (start, end, flags) in [
+                (5170, 5250, RegFlags::empty()),
+                (5250, 5330, RegFlags::DFS),
+                (5735, 5835, RegFlags::empty()),
+            ] {
+                domain.rules.push(RegRule {
+                    freq_start_mhz: start,
+                    freq_end_mhz: end,
+                    max_bandwidth_mhz: 20,
+                    max_power_dbm: 17,
+                    flags,
+                });
+            }
+        }
+        let station = if let Some(database) = database {
+            ready(Station::initialize_live(adapter, &[], database))?
+        } else {
+            ready(Station::initialize(adapter, &[], domain))?
+        }
+        .map_err(|_| "PCIe station firmware initialization")?;
+        let expected: &[u8] = if channel > 14 {
+            &[6, 36, 52, 149, 165]
+        } else {
+            &[1, 6, 11]
+        };
+        if station.mac != OWN || station.channels != expected || !station.supplicant {
             return Err("PCIe firmware identity/channel/key capabilities");
         }
         let channels = station
@@ -85,6 +137,7 @@ impl Harness {
             channels,
             supplicant,
             up: AtomicBool::new(false),
+            power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
@@ -93,13 +146,18 @@ impl Harness {
         narf_net::iface::set_link_state(&name, true); // operator IFF_UP
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
-        Ok(Self { device, bus, name })
+        Ok(Self {
+            device,
+            bus,
+            name,
+            channel,
+        })
     }
     fn scan(&self) -> Result<(), &'static str> {
         let bss = ready(self.device.scan(ScanRequest {
             ssids: vec![b"test".to_vec()],
-            frequencies_mhz: vec![2437],
-            channels: vec![6],
+            frequencies_mhz: vec![self.frequency()],
+            channels: vec![u32::from(self.channel)],
             active: false,
             random_mac: None,
             colocated_6ghz: false,
@@ -108,10 +166,17 @@ impl Harness {
             extra_ies: Vec::new(),
         }))?
         .map_err(|_| "PCIe native escan")?;
-        if bss.len() != 1 || bss[0].bssid != AP || bss[0].frequency_mhz != 2437 {
+        if bss.len() != 1 || bss[0].bssid != AP || bss[0].frequency_mhz != self.frequency() {
             return Err("PCIe scan did not return the native BSS event");
         }
         Ok(())
+    }
+    fn frequency(&self) -> u32 {
+        if self.channel <= 14 {
+            2407 + 5 * u32::from(self.channel)
+        } else {
+            5000 + 5 * u32::from(self.channel)
+        }
     }
     fn request(secured: bool) -> AssociateRequest {
         AssociateRequest {
@@ -129,8 +194,10 @@ impl Harness {
     }
     fn associate(&self, secured: bool) -> Result<(), &'static str> {
         self.scan()?;
-        ready(self.device.associate(Self::request(secured)))?
-            .map_err(|_| "PCIe native offloaded association")?;
+        let mut request = Self::request(secured);
+        request.channel = u32::from(self.channel);
+        request.frequency_mhz = self.frequency();
+        ready(self.device.associate(request))?.map_err(|_| "PCIe native offloaded association")?;
         if self.device.connected_bssid() != Some(AP)
             || !self.device.link_up()
             || narf_net::iface::lookup(&self.name)
@@ -214,7 +281,16 @@ fn composition_selected(
     keys_first: bool,
     selected: bool,
 ) -> Result<(), &'static str> {
-    let harness = Harness::new_selected(version, secured, keys_first, selected)?;
+    composition_channel(version, secured, keys_first, selected, 6)
+}
+fn composition_channel(
+    version: u32,
+    secured: bool,
+    keys_first: bool,
+    selected: bool,
+    channel: u8,
+) -> Result<(), &'static str> {
+    let harness = Harness::new_channel(version, secured, keys_first, selected, channel)?;
     let (uplink, downlink) = packets();
     if !harness.closed(&uplink)
         || narf_net::dhcp::acquire(&harness.name, 0).is_ok()
@@ -228,6 +304,21 @@ fn composition_selected(
         return Err("PCIe preauthorization RX escaped controlled port");
     }
     harness.associate(secured)?;
+    harness
+        .device
+        .set_power_save(true)
+        .map_err(|_| "PCIe power-save request")?;
+    ready(harness.device.apply_power_save())?;
+    if !harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .power_save()
+    {
+        return Err("PCIe firmware never acknowledged station power save");
+    }
     let lease = narf_net::dhcp::dhcp_acquire(&harness.name, 0)
         .map_err(|_| "PCIe native station did not obtain a DHCP lease")?;
     if !firmware::network_plan().matches_lease(&lease) || harness.bus.dhcp() != (1, 1) {
@@ -271,6 +362,21 @@ fn composition_selected(
         || harness.bus.stats().5 != 0
     {
         return Err("PCIe terminal TX status did not retire only its payload safely");
+    }
+    harness
+        .device
+        .set_power_save(false)
+        .map_err(|_| "PCIe awake request")?;
+    ready(harness.device.apply_power_save())?;
+    if harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .power_save()
+    {
+        return Err("PCIe firmware never acknowledged awake mode");
     }
     ready(harness.device.disassociate())?.map_err(|_| "PCIe confirmed disconnect")?;
     harness.pump();
@@ -459,3 +565,6 @@ kernel_test_in!(
     "drivers/wireless/brcmfmac/station",
     smoke_brcmf_native_failed_disconnect_and_late_keys_stay_closed
 );
+
+#[path = "live_policy_tests.rs"]
+mod live_policy_tests;

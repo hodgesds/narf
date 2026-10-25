@@ -7,6 +7,7 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 type Operation = (u8, u8, u16, u32);
 include!("golden.rs");
+include!("rtl8821c_golden.rs");
 include!("../factory/golden.rs");
 
 pub(super) struct Model {
@@ -17,6 +18,7 @@ pub(super) struct Model {
     mac_started: bool,
     ll_t_stall: bool,
     pub(super) suspend: bool,
+    pub(super) suspend_at: Option<usize>,
     bad_h2c: u8,
     pub(super) phy_started: bool,
 }
@@ -38,6 +40,7 @@ impl Model {
             mac_started: false,
             ll_t_stall: false,
             suspend: false,
+            suspend_at: None,
             bad_h2c: 0,
             phy_started: false,
         }
@@ -172,7 +175,7 @@ unsafe impl Io for Model {
     }
     async fn delay_us(&mut self, us: u64) {
         self.trace.push((8, 0, 0, us as u32));
-        if self.suspend {
+        if self.suspend || self.suspend_at == Some(self.trace.len() - 1) {
             core::future::pending::<()>().await;
         }
     }
@@ -190,6 +193,130 @@ pub(super) fn firmware() -> Vec<u8> {
     }
     bytes
 }
+pub(super) fn ready_8821c() -> Owner<Model> {
+    let mut io = Model::new(0, 3);
+    io.regs[0x1208..0x120c].fill(0);
+    io.regs[0x80..0x84].fill(0);
+    let mut bytes = firmware();
+    bytes[..2].copy_from_slice(&[0x21, 0x88]);
+    let mut owner = Owner::new(io, 0xc821);
+    narf_scheduler::block_on(owner.download(&bytes)).unwrap();
+    owner.io.regs[0x1a6..0x1aa]
+        .copy_from_slice(&((7u32 << 16) | (1 << 19) | (1 << 21) | (3 << 26)).to_le_bytes());
+    owner.io.trace.clear();
+    owner
+}
+
+fn smoke_rtw8821ce_inactive_mac_matches_original_chip_and_fifo_traces() -> TestResult {
+    for (seed, cut, expected) in [(0, 0, LINUX_8821C_MAC_0), (1, 3, LINUX_8821C_MAC_1)] {
+        let mut io = Model::new(seed, cut);
+        let info = match narf_scheduler::block_on(crate::rtw88::mac::prepare_for(&mut io, 0xc821)) {
+            Ok(info) => info,
+            Err(_) => return TestResult::Fail("8821C inactive MAC did not complete"),
+        };
+        if io.trace != expected
+            || info.reserved_boundary != 460
+            || info.h2c_page != 500
+            || info.firmware_tx_page != 508
+            || io.regs[0x100] & 0xcf != 0
+            || io.regs[0x522] != 255
+            || io.trace.iter().any(|op| op.0 == 1 && op.2 == 0x3fc)
+        {
+            return TestResult::Fail(
+                "8821C FIFO/chip sequence differs from original C or used a C22 quirk",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_inactive_mac_matches_original_chip_and_fifo_traces
+);
+
+fn smoke_rtw8821ce_same_firmware_owner_mac_failures_and_no_wrong_phy() -> TestResult {
+    let mut reference = ready_8821c();
+    if narf_scheduler::block_on(reference.prepare_mac()).is_err()
+        || reference.phase() != Phase::MacPrepared
+        || reference
+            .hardware_info()
+            .is_none_or(|caps| caps.streams != 1 || caps.antennas != 1)
+    {
+        return TestResult::Fail("8821C same firmware owner lost hardware report/MAC completion");
+    }
+    let total = reference.io.trace.len();
+    let mut wrong_factory = [255; 768];
+    wrong_factory[0x120..0x126].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
+    let wrong_factory = crate::rtw88::efuse::Factory::for_test(wrong_factory).unwrap();
+    if narf_scheduler::block_on(reference.prepare_phy_tables(&wrong_factory))
+        != Err(Error::Unsupported)
+        || reference.phase() != Phase::MacPrepared
+        || reference.io.trace.len() != total
+    {
+        return TestResult::Fail(
+            "8821C accepted C22 factory/PHY programming or lost parked checkpoint",
+        );
+    }
+    for fail in 0..total {
+        let mut owner = ready_8821c();
+        owner.io.fail = Some(fail);
+        if narf_scheduler::block_on(owner.prepare_mac()) != Err(Error::Access)
+            || owner.phase() != Phase::Failed
+            || owner.mac_info().is_some()
+            || owner.io.trace.len() != fail + 1
+        {
+            return TestResult::Fail("8821C native MAC error advanced/reopened ownership");
+        }
+        let before = owner.io.trace.len();
+        if narf_scheduler::block_on(owner.prepare_mac()) != Err(Error::State)
+            || owner.io.trace.len() != before
+        {
+            return TestResult::Fail("8821C terminal native MAC work was replayed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_same_firmware_owner_mac_failures_and_no_wrong_phy
+);
+
+fn smoke_rtw8821ce_llt_cancel_and_stale_hardware_report_remain_closed() -> TestResult {
+    let mut missing = ready_8821c();
+    missing.io.regs[0x1a0] = 0xfd;
+    if narf_scheduler::block_on(missing.prepare_mac()) != Err(Error::Prerequisite)
+        || missing.hardware_info().is_some()
+        || missing.io.trace.iter().any(|op| op.0 == 1)
+    {
+        return TestResult::Fail("8821C used an unreceived hardware report");
+    }
+    let mut owner = ready_8821c();
+    owner.io.ll_t_stall = true;
+    owner.io.suspend = true;
+    {
+        let mut prepare = core::pin::pin!(owner.prepare_mac());
+        if prepare
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+        {
+            return TestResult::Fail("8821C native LLT work failed to suspend after publication");
+        }
+    }
+    let before = owner.io.trace.len();
+    if owner.phase() != Phase::Failed
+        || owner.mac_info().is_some()
+        || narf_scheduler::block_on(owner.prepare_mac()) != Err(Error::State)
+        || owner.io.trace.len() != before
+    {
+        return TestResult::Fail("8821C cancelled LLT work claimed MAC readiness or restarted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_llt_cancel_and_stale_hardware_report_remain_closed
+);
 pub(super) fn ready() -> Owner<Model> {
     let mut io = Model::new(0, 3);
     io.regs[0x1208..0x120c].fill(0);

@@ -89,6 +89,9 @@ async fn initialize_owner(owner: &Retained) -> Result<RadioCalibration, BringUpE
         Some(report) => report,
         None => calibrate_owner(owner).await?,
     };
+    if narf_net::trusted_net_authority().is_none() {
+        return Err(BringUpError::Policy);
+    }
     let station = prepare_packets(owner).await.map_err(|error| {
         let _ = writeln!(
             narf_console::Writer,
@@ -106,6 +109,33 @@ async fn initialize_owner(owner: &Retained) -> Result<RadioCalibration, BringUpE
         BringUpError::BadState
     })?;
     Ok(report)
+}
+
+pub(crate) async fn drive_scheduled<Step, StepFut, Wait, WaitFut>(
+    max_attempts: usize,
+    mut step: Step,
+    mut wait: Wait,
+) -> Result<RadioCalibration, BringUpError>
+where
+    Step: FnMut() -> StepFut,
+    StepFut: core::future::Future<Output = Result<RadioCalibration, BringUpError>>,
+    Wait: FnMut() -> WaitFut,
+    WaitFut: core::future::Future<Output = ()>,
+{
+    let mut last_err = BringUpError::Policy;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            wait().await;
+        }
+        match step().await {
+            Ok(report) => return Ok(report),
+            Err(BringUpError::Policy) => {
+                last_err = BringUpError::Policy;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err)
 }
 async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
     let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
@@ -245,7 +275,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
     narf_scheduler::spawn(async move {
-        match initialize_owner(&retained).await {
+        match drive_scheduled(
+            120,
+            || initialize_owner(&retained),
+            || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
+        )
+        .await
+        {
             Ok(report) => {
                 let _ = writeln!(
                     narf_console::Writer,

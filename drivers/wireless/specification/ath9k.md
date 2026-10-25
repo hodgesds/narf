@@ -50,9 +50,10 @@ AR9285-specific writes follow a checked silicon revision.
   power piers, CTL edges or unsupported factory regulatory identity.
   `Policy` rejects missing/unqualified live channel permission and `BadState`
   rejects an active engine or a repeated calibration attempt.
-- `calibrate_radio()` is the one-shot channel1/full-rate/20MHz continuation.
-  Probe queues the same retained owner in executor context. It obtains the
-  shared authenticated regulatory policy, intersects every overlapping rule
+- `calibrate_radio()` is the channel1/full-rate/20MHz continuation.
+  Probe queues the same retained owner in executor context and drives background
+  provisioning via `drive_scheduled` across 120 attempts with 500 ms intervals. It obtains the
+  shared authenticated regulatory policy, requires `trusted_net_authority`, intersects every overlapping rule
   and the full occupied span, and requires the initial nonnegative budget
   (at most20dBm) with no DFS/indoor-only qualification assumption. Factory
   CTL, target powers and antenna reduction constrain every written rate before

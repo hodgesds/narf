@@ -39,7 +39,7 @@ BCM43602 board NVRAM was available. Synthetic tests for unsupported/unavailable
 formats remain distinct from real-source evidence. Intel cc77 and bz-b0 images
 exercise parsers without enabling differently named QuZ/bz-a0 device profiles.
 
-`profiles.json` inventories 44 currently named payload profiles across all 11
+`profiles.json` inventories 45 currently named payload profiles across all 11
 driver families. It is a provisioning catalog, not a declaration that every
 listed chip has a complete station driver. In particular, Realtek preparation
 profiles retain their station/TX admission gates, and ath9k uses on-device
@@ -74,6 +74,10 @@ qualification binds both calibration emission and the complete reachable
 autonomous response-rate envelope; a fixed1Mbps host data rate does not narrow
 hardware ACK/CTS power. The older v1 artifact cannot grant this station profile.
 The family specifications describe the exact factory, firmware and profile binding.
+
+RTL8821CE additionally has its own `rtw88/rtw8821c_fw.bin` provisioning entry.
+Its retained factory/firmware/inactive-MAC continuation does not authorize RF
+or station operation; those require its own PHY/calibration/board-power path.
 
 RTL8852B's initial2T2R profile requires both the current basic
 `rtw89/rtw8852b-cal-v1-<12 lowercase MAC hex digits>.bin` and full

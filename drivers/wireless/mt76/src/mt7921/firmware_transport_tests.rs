@@ -9,6 +9,12 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[path = "active_scan_tests.rs"]
+mod active_scan_tests;
+
+#[path = "amsdu_rx_tests.rs"]
+mod amsdu_rx_tests;
+
 fn mt76_late_preflight_retry_and_owned_start_survive_cancelled_waiter() -> TestResult {
     let allocations = Cell::new(0);
     // The exact queued-start constructor used by public provisioning must not
@@ -147,6 +153,7 @@ struct Model {
     replies: VecDeque<Vec<u8>>,
     loaded: bool,
     tx_stall: bool,
+    tx_stall_after: Option<usize>,
     management_resume: Option<u64>,
     management_rates: Vec<u16>,
     data_protection: Vec<bool>,
@@ -161,6 +168,7 @@ struct Model {
     clc_result: bool,
     packets: VecDeque<Vec<u8>>,
     scan_stall: bool,
+    reg_reply_fault: u8,
     resources: Arc<AtomicUsize>,
     psk: [u8; 32],
     anonce: [u8; 32],
@@ -189,6 +197,7 @@ impl Model {
             replies: VecDeque::new(),
             loaded: false,
             tx_stall: false,
+            tx_stall_after: None,
             management_resume: None,
             management_rates: Vec::new(),
             data_protection: Vec::new(),
@@ -203,6 +212,7 @@ impl Model {
             clc_result: false,
             packets: VecDeque::new(),
             scan_stall: false,
+            reg_reply_fault: 0,
             resources,
             psk: [0; 32],
             anonce: [0; 32],
@@ -306,6 +316,20 @@ impl Backend for Model {
                         caps[55] |= 1;
                     }
                     reply = runtime_event(0x8a, frame[39], 0, &caps);
+                } else if cmd == 0xc0 {
+                    let mut reg = [0; 8];
+                    reg[..4].copy_from_slice(&frame[64..68]);
+                    reg[4..].copy_from_slice(&0x01020304u32.to_le_bytes());
+                    reply = runtime_event(5, frame[39], 0, &reg);
+                    match self.reg_reply_fault {
+                        1 => reply[36] ^= 1,
+                        2 => reply[28] = 6,
+                        3 => {
+                            reply.pop();
+                            reply[24..26].copy_from_slice(&19u16.to_le_bytes());
+                        }
+                        _ => {}
+                    }
                 } else if cmd == 0xed && frame[41] == 1 {
                     let mut block = [0u8; 24];
                     block[..4].copy_from_slice(&frame[64..68]);
@@ -323,10 +347,21 @@ impl Backend for Model {
                 if self.malformed {
                     reply.truncate(10);
                 }
-                if !(cmd == 0x5c && frame[71] == 0 || cmd == 0x0f || cmd == 3 && self.scan_stall) {
+                if !(cmd == 0x5c && frame[71] == 0
+                    || cmd == 0x0f
+                    || cmd == 0x5d
+                    || cmd == 0x1b
+                    || cmd == 3 && self.scan_stall)
+                {
                     self.replies.push_back(reply);
                 }
             }
+        }
+        if self
+            .tx_stall_after
+            .is_some_and(|limit| self.frames.len() >= limit)
+        {
+            self.tx_stall = true;
         }
         if self.revoke_on_submit {
             self.live = false;
@@ -2684,6 +2719,82 @@ fn mt76_rekey_nonce_failure_closes_authorization_before_reply() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/join",
     mt76_rekey_nonce_failure_closes_authorization_before_reply
+);
+
+fn mt76_retry_preflight_until_recovers_or_terminates_on_unretryable() -> TestResult {
+    let session = secure_model();
+    let State::Associated {
+        info: sample_info, ..
+    } = session.state
+    else {
+        unreachable!()
+    };
+
+    // Case 1: succeeds after retries while remaining in Absent state
+    let attempts = Cell::new(0);
+    let waits = Cell::new(0);
+    let status_val = Cell::new(BootStatus::Absent);
+    let result = narf_scheduler::block_on(retry_preflight_until(
+        5,
+        || status_val.get(),
+        || {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            async move {
+                if n < 2 {
+                    Err(Error::InvalidFirmware)
+                } else {
+                    Ok(sample_info)
+                }
+            }
+        },
+        || {
+            waits.set(waits.get() + 1);
+            async {}
+        },
+    ));
+    if result != Ok(sample_info) || attempts.get() != 3 || waits.get() != 2 {
+        return TestResult::Fail(
+            "retry_preflight_until failed to succeed after transient preflight error",
+        );
+    }
+
+    // Case 2: stops early when status transitions to unretryable Failed state
+    attempts.set(0);
+    waits.set(0);
+    let result = narf_scheduler::block_on(retry_preflight_until(
+        10,
+        || {
+            if attempts.get() > 1 {
+                BootStatus::Retained(State::Failed {
+                    stage: Stage::PatchDownload,
+                    error: Error::InvalidFirmware,
+                })
+            } else {
+                BootStatus::Absent
+            }
+        },
+        || {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            async move { Err(Error::InvalidFirmware) }
+        },
+        || {
+            waits.set(waits.get() + 1);
+            async {}
+        },
+    ));
+    if result != Err(Error::InvalidFirmware) || attempts.get() != 2 || waits.get() != 1 {
+        return TestResult::Fail(
+            "retry_preflight_until did not terminate early on unretryable status",
+        );
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/firmware",
+    mt76_retry_preflight_until_recovers_or_terminates_on_unretryable
 );
 
 /// Association → carrier → DHCP composition (Wi-Fi program A1,

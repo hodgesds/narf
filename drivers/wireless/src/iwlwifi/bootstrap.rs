@@ -64,6 +64,9 @@ impl Owner {
         }
     }
     async fn provision(&self) -> Result<(), &'static str> {
+        if narf_net::trusted_net_authority().is_none() {
+            return Err("network registration authority unavailable");
+        }
         let authority = narf_firmware::trusted_loader_authority()
             .and_then(|cap| cap.derive().ok())
             .ok_or("firmware authority unavailable")?;
@@ -226,9 +229,46 @@ pub(super) fn retain(
     *NATIVE.lock() = Some(owner.clone());
     owner
 }
+pub(super) async fn drive_scheduled<Step, StepFut, Wait, WaitFut>(
+    max_attempts: usize,
+    mut phase: impl FnMut() -> ProvisionState,
+    mut step: Step,
+    mut wait: Wait,
+) -> Result<(), &'static str>
+where
+    Step: FnMut() -> StepFut,
+    StepFut: core::future::Future<Output = Result<(), &'static str>>,
+    Wait: FnMut() -> WaitFut,
+    WaitFut: core::future::Future<Output = ()>,
+{
+    let mut last_err = "Intel firmware not staged; parked owner retained";
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            wait().await;
+        }
+        match step().await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = err;
+                if !matches!(phase(), ProvisionState::Parking | ProvisionState::Parked) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
 pub(super) fn schedule(owner: Arc<Owner>) {
     narf_scheduler::spawn(async move {
-        if let Err(reason) = owner.provision().await {
+        let phase_owner = owner.clone();
+        if let Err(reason) = drive_scheduled(
+            120,
+            || phase_owner.phase(),
+            || owner.provision(),
+            || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
+        )
+        .await
+        {
             use core::fmt::Write;
             let _ = writeln!(
                 narf_console::Writer,

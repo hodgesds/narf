@@ -82,12 +82,14 @@ retryable without MMIO; genuinely begun owners return AlreadyStarted before
 resolving any new source. Real signed-registry fixtures cover denial followed by
 valid restaging and the unchanged one-shot hardware boundary.
 `pci::provision().await` exposes that bounded retry for the existing native
-controller only while its firmware is Detected. Probe's worker uses the same
-serialized entry. It clones the original firmware/Prepared/factory Arcs under
+controller while its firmware is Detected or Ready (resuming from `RadioConfigured`
+or `ChannelConfigured` checkpoints when policy or calibration arrives). Probe's worker drives
+background provisioning via `drive_scheduled` across 120 attempts with 500 ms intervals.
+It clones the original firmware/Prepared/factory Arcs under
 CONTROLLER, releases the IRQ-safe lock before awaiting, and calls the existing
 native initializer; it never reconstructs ownership or resets/replays a begun
 attempt. Cancellation while waiting for the regular async admission mutex
-changes no owner state. Absent/non-EE/non-Detected controllers fail admission.
+changes no owner state. Absent/non-EE controllers fail admission.
 The private native admission fixture checks exact Arc identity, cancelled wait
 and real one-shot Failed-owner denial with revoked, unreachable hardware.
 

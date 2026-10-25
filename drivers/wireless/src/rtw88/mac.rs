@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Inactive RTL8822CE MAC/FIFO continuation of the retained firmware owner.
+//! Inactive RTL8821CE/RTL8822CE MAC/FIFO continuation of the retained firmware owner.
 //! Linux mac.c::rtw_mac_init and rtw8822c.c::rtw8822c_mac_init, with DMA,
 //! MAC TX/RX and host queues deliberately held closed pending RF ownership.
 use super::firmware_transport::{Error, Io};
 #[path = "mac/values.rs"]
 mod values;
 use values::*;
+#[path = "mac/rtl8821c.rs"]
+mod rtl8821c;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Info {
@@ -15,15 +17,15 @@ pub struct Info {
     pub firmware_tx_page: u16,
 }
 impl Info {
-    fn new(cut: u8) -> Self {
+    fn new(cut: u8, did: u16) -> Self {
         // RTL8822C: 256KiB /128, minus CSI50, firmware4, H2CQ8,
         // H2C static8/extra24 and driver16. These are on-chip FIFO pages,
         // unrelated to the separately retained PCI host BD arrays.
         Self {
             cut,
-            reserved_boundary: 1938,
-            h2c_page: 1986,
-            firmware_tx_page: 1994,
+            reserved_boundary: if did == 0xc821 { 460 } else { 1938 },
+            h2c_page: if did == 0xc821 { 500 } else { 1986 },
+            firmware_tx_page: if did == 0xc821 { 508 } else { 1994 },
         }
     }
 }
@@ -48,7 +50,7 @@ fn u32(io: &mut impl Io, reg: u16, clear: u32, set: u32) -> Result<(), Error> {
     }
     io.write32(reg, value & !clear | set)
 }
-async fn fifo(io: &mut impl Io, info: Info) -> Result<(), Error> {
+async fn fifo(io: &mut impl Io, info: Info, did: u16) -> Result<(), Error> {
     // PCIe queue mapping from rqpn_table_8822c[1].
     w16(io, REG_TXDMA_PQ_MAP, 0xc5a0)?;
     w8(io, REG_CR, 0)?;
@@ -56,18 +58,26 @@ async fn fifo(io: &mut impl Io, info: Info) -> Result<(), Error> {
     // here: the existing firmware host rings, MAC and RF remain inactive.
     w8(io, REG_CR, MAC_TRX_ENABLE & !0xcf)?;
     io.write32(REG_H2CQ_CSR, BIT_H2CQ_FULL)?;
-    for reg in [
+    let pages = if did == 0xc821 {
+        [16, 16, 16, 14]
+    } else {
+        [64; 4]
+    };
+    for (reg, count) in [
         REG_FIFOPAGE_INFO_1,
         REG_FIFOPAGE_INFO_2,
         REG_FIFOPAGE_INFO_3,
         REG_FIFOPAGE_INFO_4,
-    ] {
-        w16(io, reg, 64)?;
+    ]
+    .into_iter()
+    .zip(pages)
+    {
+        w16(io, reg, count)?;
     }
     w16(
         io,
         REG_FIFOPAGE_INFO_5,
-        u32::from(info.reserved_boundary) - 4 * 64 - 1,
+        u32::from(info.reserved_boundary) - pages.iter().sum::<u32>() - 1,
     )?;
     u32(io, REG_RQPN_CTRL_2, 0, BIT_LD_RQPN)?;
     w16(io, REG_FIFOPAGE_CTRL_2, u32::from(info.reserved_boundary))?;
@@ -75,7 +85,10 @@ async fn fifo(io: &mut impl Io, info: Info) -> Result<(), Error> {
     for reg in [REG_BCNQ_BDNY_V1, REG_FIFOPAGE_CTRL_2 + 2, REG_BCNQ1_BDNY_V1] {
         w16(io, reg, u32::from(info.reserved_boundary))?;
     }
-    io.write32(REG_RXFF_BNDY, 24576 - C2H_PKT_BUF - 1)?;
+    io.write32(
+        REG_RXFF_BNDY,
+        (if did == 0xc821 { 16384 } else { 24576 }) - C2H_PKT_BUF - 1,
+    )?;
     u8(io, REG_AUTO_LLT_V1, 0, BIT_AUTO_INIT_LLT_V1)?;
     let deadline = narf_time::Deadline::after_ms(10);
     let mut complete = false;
@@ -256,6 +269,12 @@ fn chip(io: &mut impl Io) -> Result<(), Error> {
     Ok(())
 }
 pub(super) async fn prepare(io: &mut impl Io) -> Result<Info, Error> {
+    prepare_for(io, 0xc822).await
+}
+pub(super) async fn prepare_for(io: &mut impl Io, did: u16) -> Result<Info, Error> {
+    if !matches!(did, 0xc821 | 0xc822) {
+        return Err(Error::Unsupported);
+    }
     let cfg = io.read32(0xf0)?;
     if cfg == u32::MAX {
         return Err(Error::Gone);
@@ -264,14 +283,18 @@ pub(super) async fn prepare(io: &mut impl Io) -> Result<Info, Error> {
     if cut > 6 {
         return Err(Error::Unsupported);
     }
-    let info = Info::new(cut);
-    fifo(io, info).await?;
-    chip(io)?;
+    let info = Info::new(cut, did);
+    fifo(io, info, did).await?;
+    if did == 0xc821 {
+        rtl8821c::chip(io)?;
+    } else {
+        chip(io)?;
+    }
     w8(io, REG_RX_DRVINFO_SZ, PHY_STATUS_SIZE)?;
     u8(io, REG_TRXFF_BNDY + 1, 0x0f, 0x0f)?;
     u32(io, REG_RCR, 0, BIT_APP_PHYSTS)?;
     u32(io, REG_WMAC_OPTION_FUNCTION + 4, 1 << 8 | 1 << 9, 0)?;
-    if cut >= 3 {
+    if did == 0xc822 && cut >= 3 {
         u32(io, 0x3fc, 0, 1 << 26)?;
     }
     Ok(info)

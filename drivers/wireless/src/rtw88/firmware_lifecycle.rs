@@ -245,6 +245,31 @@ impl<I: Io> Lifecycle<I> {
         }
         result
     }
+    pub(super) async fn prepare_phy8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::phy8821c::Info, Error> {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::MacPrepared {
+            return Err(Error::State);
+        }
+        self.status.lock().stage = Stage::PreparingPhy;
+        let _attempt = Attempt(self);
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let result = owner.prepare_phy8821c(factory).await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::PhyTablesPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
     pub(super) async fn qualify_board(
         &self,
         factory: &super::efuse::Factory,

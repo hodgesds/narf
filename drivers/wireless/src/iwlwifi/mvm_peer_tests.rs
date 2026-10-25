@@ -63,6 +63,8 @@ impl Fixture {
                 scan,
                 channel,
                 peer: None,
+                management_queue: None,
+                power: super::super::power::Context::new(&FirmwareApi::default()),
             }),
             firmware,
         }

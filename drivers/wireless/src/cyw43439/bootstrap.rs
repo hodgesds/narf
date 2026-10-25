@@ -70,6 +70,9 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
         }
     }
     pub async fn provision(&self) -> Result<(), &'static str> {
+        if narf_net::trusted_net_authority().is_none() {
+            return Err("network registration authority unavailable");
+        }
         let authority = crate::brcmfmac::provision::authority()
             .map_err(|_| "firmware authority unavailable")?;
         self.provision_using(&authority, crate::brcmfmac::provision::MANIFEST)
@@ -169,6 +172,35 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
 static NATIVE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::sync::Arc<Provisioner<narf_drivers_sdio::native::Mmio>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
+pub(super) async fn drive_scheduled<Step, StepFut, Wait, WaitFut>(
+    max_attempts: usize,
+    mut state: impl FnMut() -> ProvisionState,
+    mut step: Step,
+    mut wait: Wait,
+) -> Result<(), &'static str>
+where
+    Step: FnMut() -> StepFut,
+    StepFut: core::future::Future<Output = Result<(), &'static str>>,
+    Wait: FnMut() -> WaitFut,
+    WaitFut: core::future::Future<Output = ()>,
+{
+    let mut last_err = "signed CYW43439 host/card board selection unavailable or mismatched";
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            wait().await;
+        }
+        match step().await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = err;
+                if state() != ProvisionState::Parked {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
 /// The native callback retains the exact card before the executor first polls
 /// provisioning. A missing Stage::Late asset never loses the host/card owner.
 fn probe(card: NativeCard) {
@@ -181,7 +213,15 @@ fn probe(card: NativeCard) {
         *slot = Some(owner.clone());
     }
     narf_scheduler::spawn(async move {
-        if let Err(reason) = owner.provision().await {
+        let state_owner = owner.clone();
+        if let Err(reason) = drive_scheduled(
+            120,
+            || state_owner.state(),
+            || owner.provision(),
+            || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
+        )
+        .await
+        {
             let _ = writeln!(narf_console::Writer, "cyw43439: {}", reason);
         }
     });
@@ -324,5 +364,70 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/cyw43439/bootstrap",
         smoke_cyw_board_provisioning_first_native_f1_failure_is_terminal
+    );
+
+    fn smoke_cyw_drive_scheduled_retries_and_terminates() -> TestResult {
+        let (_, read) = registry().unwrap();
+        let selection = choose(&read, Family::Sdio43439).unwrap();
+        let (card, _) = narf_drivers_sdio::card::tests::initialized_fixture(Some(selection.host()));
+        let owner = Provisioner::new(card);
+
+        // Case 1: retries while in ProvisionState::Parked and succeeds
+        let attempts = core::cell::Cell::new(0);
+        let waits = core::cell::Cell::new(0);
+        let result = narf_scheduler::block_on(drive_scheduled(
+            5,
+            || owner.state(),
+            || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                async move {
+                    if n < 2 {
+                        Err("missing asset")
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            || {
+                waits.set(waits.get() + 1);
+                async {}
+            },
+        ));
+        if result.is_err() || attempts.get() != 3 || waits.get() != 2 {
+            return TestResult::Fail("cyw43439 drive_scheduled failed to retry while parked");
+        }
+
+        // Case 2: exits immediately when state is unretryable (Failed)
+        use core::sync::atomic::Ordering;
+        owner
+            .state
+            .store(ProvisionState::Failed as u8, Ordering::Release);
+        attempts.set(0);
+        waits.set(0);
+        let result = narf_scheduler::block_on(drive_scheduled(
+            10,
+            || owner.state(),
+            || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                async move { Err("missing asset") }
+            },
+            || {
+                waits.set(waits.get() + 1);
+                async {}
+            },
+        ));
+        if result != Err("missing asset") || attempts.get() != 1 || waits.get() != 0 {
+            return TestResult::Fail(
+                "cyw43439 drive_scheduled did not exit immediately when unretryable",
+            );
+        }
+
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439/bootstrap",
+        smoke_cyw_drive_scheduled_retries_and_terminates
     );
 }

@@ -793,6 +793,29 @@ impl Transport {
     pub async fn scan_passive(&mut self, channels: &[u8]) -> Result<super::ScanReport, Error> {
         self.session.scan_passive(channels).await
     }
+    /// Directed/wildcard probes on currently policy-authorized 20 MHz channels.
+    /// Nonempty SSID lists (up to four, including wildcard entries) select
+    /// active scanning. A completed scan returns to a NO_IR-only idle domain.
+    pub async fn scan_active(
+        &mut self,
+        channels: &[u8],
+        ssids: &[Vec<u8>],
+    ) -> Result<super::ScanReport, Error> {
+        self.session
+            .scan_active_with_policy(channels, ssids, || {
+                narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)
+            })
+            .await
+    }
+    /// Prepare the bounded native HT20 RX/A-MSDU owner from actual radio/AP
+    /// capabilities. This does not enable HT MLME, peer firmware state or TX.
+    /// Legacy association invalidates the preparation; no HT facade is exposed.
+    pub fn prepare_ht20_receive(
+        &mut self,
+        bss: &super::ScanBss,
+    ) -> Result<super::Ht20ReceiveInfo, Error> {
+        self.session.prepare_ht20_receive(bss)
+    }
     /// Associate with an Access Point using legacy rates on channels 1..=11.
     pub async fn associate_station(
         &mut self,

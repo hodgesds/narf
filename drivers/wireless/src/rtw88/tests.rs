@@ -211,6 +211,7 @@ fn smoke_rtw88_unready_control_plane_fails_closed() -> TestResult {
         },
         mac: [0x00, 0xE0, 0x4C, 0x68, 0x12, 0x34],
         firmware: None,
+        sibling: None,
         interface: None,
         device_id: RTL_DEV_8822CE,
         link_up: core::sync::atomic::AtomicBool::new(false),

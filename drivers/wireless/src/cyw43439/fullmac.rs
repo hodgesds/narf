@@ -16,6 +16,9 @@ pub enum Family {
 pub trait Fullmac: Send {
     const FAMILY: Family;
     const EXTERNAL_CLM: bool;
+    /// Exact attached chip profile supports the firmware's 5 GHz channel set.
+    /// The SDIO CYW43439 profile remains 2.4 GHz only.
+    const BAND_5GHZ: bool = false;
     fn command<'a>(
         &'a mut self,
         direction: Direction,

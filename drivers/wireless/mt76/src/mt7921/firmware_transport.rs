@@ -11,8 +11,11 @@ pub use station::{NicCapabilities, PhyCapabilities, RadioInfo};
 #[path = "passive_scan.rs"]
 mod scan;
 pub use scan::{rx_frame, ScanBss, ScanReport};
+#[path = "amsdu_rx.rs"]
+mod amsdu;
 #[path = "station_join.rs"]
 mod join;
+pub use amsdu::Ht20ReceiveInfo;
 pub use join::to_ethernet;
 #[path = "recovery.rs"]
 mod recovery;
@@ -186,6 +189,19 @@ pub async fn scan_boot_passive(channels: &[u8]) -> Result<ScanReport, Error> {
         .await
 }
 
+/// Policy-authorized active scan through the same retained radio owner.
+pub async fn scan_boot_active(channels: &[u8], ssids: &[Vec<u8>]) -> Result<ScanReport, Error> {
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .scan_active(channels, ssids)
+        .await
+}
+
 /// Dispatch station association using the retained boot owner.
 pub async fn associate_boot_station(
     bss: &ScanBss,
@@ -341,6 +357,39 @@ async fn reset_boot_transport(expected_mac: Option<[u8; 6]>) -> Result<(), Error
     finish_boot_keys().await
 }
 
+pub(super) async fn retry_preflight_until<Step, StepFut, Wait, WaitFut>(
+    max_attempts: usize,
+    mut status: impl FnMut() -> BootStatus,
+    mut step: Step,
+    mut wait: Wait,
+) -> Result<RadioInfo, Error>
+where
+    Step: FnMut() -> StepFut,
+    StepFut: core::future::Future<Output = Result<RadioInfo, Error>>,
+    Wait: FnMut() -> WaitFut,
+    WaitFut: core::future::Future<Output = ()>,
+{
+    let mut last_err = Error::InvalidFirmware;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            wait().await;
+        }
+        match step().await {
+            Ok(info) => return Ok(info),
+            Err(err) => {
+                last_err = err;
+                if !matches!(
+                    status(),
+                    BootStatus::Absent | BootStatus::Retained(State::RadioReady(_))
+                ) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
 pub(super) fn start_boot() -> narf_init::InitResult {
     use core::fmt::Write;
     use narf_init::InitResult;
@@ -357,9 +406,42 @@ pub(super) fn start_boot() -> narf_init::InitResult {
     );
     if result.is_ok() {
         InitResult::Ok
-    } else if matches!(boot_status(), BootStatus::Absent) {
-        // No firmware attempt: public provisioning can retry this same parked
-        // binding once the actual missing payload/authority is installed.
+    } else if matches!(
+        boot_status(),
+        BootStatus::Absent | BootStatus::Retained(State::RadioReady(_))
+    ) {
+        // No firmware attempt yet (or net authority arrived after radio bring-up):
+        // retry the same parked binding in the background as late firmware scans
+        // or userspace staging complete, falling back to verified reset recovery
+        // if the subsequent first hardware attempt fails.
+        narf_scheduler::spawn(async {
+            let outcome = retry_preflight_until(120, boot_status, provision_boot_radio, || {
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
+            })
+            .await;
+            if outcome.is_ok() {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "mt76: staged firmware provisioned; retained {:?}",
+                    boot_status()
+                );
+                return;
+            }
+            if !matches!(boot_status(), BootStatus::Absent) {
+                for delay_ns in [1_000_000_000, 5_000_000_000, 30_000_000_000] {
+                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ns)).await;
+                    let result = reset_boot_transport(None).await;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "mt76: initial radio recovery {result:?}"
+                    );
+                    if result.is_ok() {
+                        let _ = provision_boot_radio().await;
+                        return;
+                    }
+                }
+            }
+        });
         InitResult::Error("MT76 firmware preflight (provisioning available)")
     } else {
         // Recovery after initial firmware/radio failure has no registered
@@ -702,6 +784,8 @@ struct Session<B: Backend> {
     data_pending: Option<u64>,
     peer_lost: bool,
     station_bss: Option<ScanBss>,
+    ht20_rx: Option<amsdu::Receiver>,
+    received_msdu: VecDeque<Vec<u8>>,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -719,6 +803,8 @@ impl<B: Backend> Session<B> {
             data_pending: None,
             peer_lost: false,
             station_bss: None,
+            ht20_rx: None,
+            received_msdu: VecDeque::new(),
         }
     }
     fn stage(&mut self, stage: Stage) {

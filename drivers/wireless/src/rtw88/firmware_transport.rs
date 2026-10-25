@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! RTL8822CE section firmware lifecycle, Linux rtw88/mac.c/fw.c.
+//! RTL8821CE/RTL8822CE section firmware lifecycle, Linux rtw88/mac.c/fw.c.
 //! Requires an exclusively retained, pristine PCIe reserved-page DMA backend.
 //! It does not itself enable PCI bus mastering or supply a packet runtime.
 use alloc::boxed::Box;
@@ -60,10 +60,10 @@ struct Image<'a> {
     sections: [Option<Section<'a>>; 3],
 }
 fn filename(did: u16) -> Result<&'static str, Error> {
-    if did == 0xc822 {
-        Ok("rtw88/rtw8822c_fw.bin")
-    } else {
-        Err(Error::Unsupported)
+    match did {
+        0xc821 => Ok("rtw88/rtw8821c_fw.bin"),
+        0xc822 => Ok("rtw88/rtw8822c_fw.bin"),
+        _ => Err(Error::Unsupported),
     }
 }
 struct Snapshot(u16);
@@ -128,10 +128,12 @@ fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 fn parse(did: u16, bytes: &[u8]) -> Result<Image<'_>, Error> {
-    if did != 0xc822 {
-        return Err(Error::Unsupported);
-    }
-    if !(HEADER..=MAX_IMAGE).contains(&bytes.len()) || bytes[..2] != [0x22, 0x88] {
+    let signature = match did {
+        0xc821 => [0x21, 0x88],
+        0xc822 => [0x22, 0x88],
+        _ => return Err(Error::Unsupported),
+    };
+    if !(HEADER..=MAX_IMAGE).contains(&bytes.len()) || bytes[..2] != signature {
         return Err(Error::Image);
     }
     let has_emem = bytes[0x18] & 0x10 != 0 && word(bytes, 0x34) != 0;
@@ -291,6 +293,7 @@ pub(super) struct Owner<I: Io> {
     mac: Option<super::mac::Info>,
     hardware: Option<super::hardware::Features>,
     phy: Option<super::phy::Info>,
+    phy8821c: Option<super::phy8821c::Info>,
     image_digest: Option<[u8; 32]>,
     power: Option<alloc::sync::Arc<super::power_policy::Calibration>>,
     radio: Option<super::radio::Info>,
@@ -314,6 +317,7 @@ impl<I: Io> Owner<I> {
             mac: None,
             hardware: None,
             phy: None,
+            phy8821c: None,
             image_digest: None,
             power: None,
             radio: None,
@@ -460,7 +464,7 @@ impl<I: Io> Owner<I> {
         self.phase = Phase::Failed;
         self.io.begin_mac()?;
         let hardware = super::hardware::Features::read(&mut self.io)?;
-        let info = super::mac::prepare(&mut self.io).await?;
+        let info = super::mac::prepare_for(&mut self.io, self.did).await?;
         self.io.finish_mac()?;
         self.mac = Some(info);
         self.hardware = Some(hardware);
@@ -642,10 +646,51 @@ impl<I: Io> Owner<I> {
         self.phase = Phase::Calibrated;
         Ok(info)
     }
+    pub(super) async fn prepare_phy8821c(
+        &mut self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::phy8821c::Info, Error> {
+        if self.did != 0xc821 {
+            return Err(Error::Unsupported);
+        }
+        if self.phase != Phase::MacPrepared {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let info = super::phy8821c::Info::from_factory(
+            factory,
+            self.mac.ok_or(Error::State)?.cut,
+            self.hardware.ok_or(Error::State)?,
+        )?;
+        self.io.begin_phy()?;
+        // The firmware antenna report can narrow a physical two-path chip in
+        // Linux. This continuation admits only genuine one-path C21 silicon,
+        // with the same current cut used by the original conditional parser.
+        let cfg = self.io.read32(0xf0)?;
+        if cfg == u32::MAX {
+            return Err(Error::Gone);
+        }
+        if cfg & (1 << 27) != 0 || (cfg >> 12) & 15 != u32::from(info.cut) {
+            return Err(Error::Unsupported);
+        }
+        let info = narf_time::timeout(
+            narf_time::Deadline::after_ms(2000),
+            super::phy8821c::prepare(&mut self.io, info),
+        )
+        .await
+        .map_err(|_| Error::Deadline)??;
+        self.io.finish_phy()?;
+        self.phy8821c = Some(info);
+        self.phase = Phase::PhyTablesPrepared;
+        Ok(info)
+    }
     pub async fn prepare_phy_tables(
         &mut self,
         factory: &super::efuse::Factory,
     ) -> Result<super::phy::Info, Error> {
+        if self.did != 0xc822 {
+            return Err(Error::Unsupported);
+        }
         if self.phase != Phase::MacPrepared {
             return Err(Error::State);
         }
@@ -853,3 +898,7 @@ mod station_composition_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "firmware_transport_tests.rs"]
 mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "phy/rtl8821c_tests.rs"]
+mod phy8821c_tests;

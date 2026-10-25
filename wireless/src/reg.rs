@@ -25,6 +25,9 @@ bitflags::bitflags! {
         const DFS        = 1 << 0;
         const INDOOR_ONLY = 1 << 1;
         const NO_P2P     = 1 << 2;
+        /// Receive/passive discovery only until a driver proves a supported
+        /// relaxation; no active probes or host-initiated station TX.
+        const NO_IR      = 1 << 3;
     }
 }
 
@@ -77,39 +80,116 @@ pub fn parse_policy(bytes: &[u8]) -> Result<RegulatoryDomain, &'static str> {
 
 pub mod db {
     use super::*;
+    use alloc::sync::Arc;
 
-    static ACTIVE_DOMAIN: IrqSafeSpinLock<Option<RegulatoryDomain>> = IrqSafeSpinLock::new(None);
+    /// Immutable snapshots permit cheap policy-change observation without
+    /// cloning the rule vector on each packet/progress poll. Installing a
+    /// domain still requires trusted caller authority, as with set_domain.
+    pub struct Database {
+        pub(super) state: IrqSafeSpinLock<State>,
+    }
+    pub(super) struct State {
+        pub(super) domain: Option<Arc<RegulatoryDomain>>,
+        pub(super) revision: u64,
+    }
+    impl Default for Database {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl Database {
+        pub const fn new() -> Self {
+            Self {
+                state: IrqSafeSpinLock::new(State {
+                    domain: None,
+                    revision: 0,
+                }),
+            }
+        }
+        pub fn install(&self, domain: RegulatoryDomain) {
+            let domain = Arc::new(domain);
+            let retired = {
+                let mut state = self.state.lock();
+                state.revision = state.revision.saturating_add(1);
+                state.domain.replace(domain)
+            };
+            // Free the retired rule storage outside the IRQ-safe DB lock.
+            drop(retired);
+        }
+        pub fn clear(&self) {
+            let retired = {
+                let mut state = self.state.lock();
+                state.revision = state.revision.saturating_add(1);
+                state.domain.take()
+            };
+            drop(retired);
+        }
+        pub fn snapshot(&self) -> Option<Arc<RegulatoryDomain>> {
+            self.state.lock().domain.clone()
+        }
+    }
+    static ACTIVE_DOMAIN: Database = Database::new();
 
     pub fn set_domain(domain: RegulatoryDomain) {
-        *ACTIVE_DOMAIN.lock() = Some(domain);
+        ACTIVE_DOMAIN.install(domain);
+    }
+
+    /// Retire the shared installation. Live consumers must close admission
+    /// on absence; a previously issued immutable snapshot is not current proof.
+    pub fn clear_domain() {
+        ACTIVE_DOMAIN.clear();
+    }
+
+    pub fn snapshot() -> Option<Arc<RegulatoryDomain>> {
+        ACTIVE_DOMAIN.snapshot()
     }
 
     pub fn get_domain() -> Option<RegulatoryDomain> {
-        ACTIVE_DOMAIN.lock().as_ref().map(|d| RegulatoryDomain {
-            country_code: d.country_code,
-            rules: d.rules.clone(),
-        })
+        snapshot().map(|domain| domain.as_ref().clone())
     }
 
     /// Use the caller-installed domain, or bootstrap the staged signed policy
     /// when no domain exists. No device or other driver must have run first.
     pub fn ensure_domain() -> Result<RegulatoryDomain, policy::Error> {
+        ensure_snapshot().map(|domain| domain.as_ref().clone())
+    }
+
+    pub fn ensure_snapshot() -> Result<Arc<RegulatoryDomain>, policy::Error> {
         ensure_with(&ACTIVE_DOMAIN, policy::load)
     }
 
     pub(super) fn ensure_with(
-        database: &IrqSafeSpinLock<Option<RegulatoryDomain>>,
+        database: &Database,
         load: impl FnOnce() -> Result<RegulatoryDomain, policy::Error>,
-    ) -> Result<RegulatoryDomain, policy::Error> {
-        if let Some(domain) = database.lock().as_ref().cloned() {
-            return Ok(domain);
-        }
+    ) -> Result<Arc<RegulatoryDomain>, policy::Error> {
+        let revision = {
+            let state = database.state.lock();
+            if let Some(domain) = &state.domain {
+                return Ok(domain.clone());
+            }
+            // Never let revision exhaustion create a bootstrap ABA.
+            if state.revision == u64::MAX {
+                return Err(policy::Error::Authority);
+            }
+            state.revision
+        };
         // Firmware lookup/invocation and decoding must happen without the
         // database's IRQ-disabling lock. Failed loads publish no partial state.
-        let loaded = load()?;
-        let mut guard = database.lock();
+        let loaded = Arc::new(load()?);
+        let mut guard = database.state.lock();
         // A concurrently installed caller policy wins over this bootstrap.
-        Ok(guard.get_or_insert(loaded).clone())
+        let selected = if let Some(domain) = &guard.domain {
+            Ok(domain.clone())
+        } else if guard.revision != revision {
+            // An explicit clear during lookup wins over stale loaded bytes.
+            Err(policy::Error::Authority)
+        } else {
+            guard.revision += 1;
+            guard.domain = Some(loaded.clone());
+            Ok(loaded.clone())
+        };
+        drop(guard);
+        selected
     }
 }
 
@@ -130,6 +210,13 @@ mod tests {
         let domain = parse_policy(&bytes).unwrap();
         if domain.country_code != *b"US" || domain.rules[0].max_power_dbm != 17 {
             return TestResult::Fail("regulatory policy decode");
+        }
+        bytes[25] = 1 << 3;
+        if parse_policy(&bytes)
+            .ok()
+            .is_none_or(|domain| domain.rules[0].flags != RegFlags::NO_IR)
+        {
+            return TestResult::Fail("NO_IR policy bit was lost or rejected");
         }
         bytes[25] = 0x80;
         if parse_policy(&bytes).is_ok() {

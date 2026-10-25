@@ -235,6 +235,60 @@ pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
 }
 
 impl<B: Backend> Session<B> {
+    pub(super) fn prepare_ht20_receive(
+        &mut self,
+        bss: &ScanBss,
+    ) -> Result<super::Ht20ReceiveInfo, Error> {
+        let info = match self.state {
+            State::RadioReady(info) | State::ScanReady(info) => info,
+            _ => return Err(Error::Busy),
+        };
+        self.backend.check()?;
+        let receiver = super::amsdu::Receiver::prepare(info, bss)?;
+        let info = receiver.info();
+        self.ht20_rx = Some(receiver);
+        self.received_msdu.clear();
+        Ok(info)
+    }
+
+    fn clear_aggregate_receive(&mut self) {
+        if let Some(receiver) = &mut self.ht20_rx {
+            receiver.clear();
+        }
+        self.received_msdu.clear();
+    }
+
+    fn receive_aggregate(
+        &mut self,
+        native: &super::scan::NativeRx<'_>,
+        own: [u8; 6],
+        peer: [u8; 6],
+        channel: u8,
+    ) -> Option<Vec<u8>> {
+        let receiver = self.ht20_rx.as_mut()?;
+        if !receiver.matches(own, peer, channel) {
+            receiver.clear();
+            return None;
+        }
+        let Some(qos) = native.frame.get(24) else {
+            receiver.clear();
+            return None;
+        };
+        let tid = usize::from(*qos & 15);
+        let floor = self
+            .security
+            .as_ref()
+            .map(|security| security.pairwise[tid]);
+        let complete = receiver.observe(native, floor, self.backend.now_ns())?;
+        // Only a complete, checked MPDU can consume its PN, and only once
+        // for all hardware-deaggregated MSDUs sharing that PN.
+        if let Some(replay) = complete.replay {
+            self.security.as_mut()?.pairwise[replay.tid] = replay.pn;
+        }
+        self.received_msdu = complete.frames;
+        self.received_msdu.pop_front()
+    }
+
     pub(super) fn keys_pending(&self) -> bool {
         !self.peer_lost
             && matches!(self.state, State::Associated { .. })
@@ -276,6 +330,7 @@ impl<B: Backend> Session<B> {
         // A cancelled key operation cannot leave an authorized session with
         // its RSNA owner missing. The pending/running state survives cancellation.
         self.stage(Stage::EapolHandshake);
+        self.clear_aggregate_receive();
         let Some(mut security) = self.security.take() else {
             return Ok(());
         };
@@ -335,6 +390,7 @@ impl<B: Backend> Session<B> {
     /// returned as a raw Ethernet frame. The budget also bounds malformed bursts.
     pub(super) fn receive_ethernet(&mut self) -> Result<Option<Vec<u8>>, Error> {
         if self.peer_lost {
+            self.clear_aggregate_receive();
             return Err(Error::DeviceGone);
         }
         let (own, peer, channel) = match self.state {
@@ -346,16 +402,31 @@ impl<B: Backend> Session<B> {
             } => (info.capabilities.mac, peer, channel),
             _ => return Err(Error::Busy),
         };
+        self.backend.check()?;
+        if let Some(frame) = self.received_msdu.pop_front() {
+            return Ok(Some(frame));
+        }
         for _ in 0..16 {
             self.backend.check()?;
             let Some(packet) = self.backend.receive_data()? else {
                 return Ok(None);
             };
-            let Some(native) = super::scan::rx_native(&packet) else {
+            let Some(native) = super::scan::rx_native_with_amsdu(&packet) else {
+                self.clear_aggregate_receive();
                 continue;
             };
             if native.channel != channel {
+                self.clear_aggregate_receive();
                 continue;
+            }
+            if native.amsdu != 0 {
+                if let Some(frame) = self.receive_aggregate(&native, own, peer, channel) {
+                    return Ok(Some(frame));
+                }
+                continue;
+            }
+            if let Some(receiver) = &mut self.ht20_rx {
+                receiver.clear();
             }
             let frame = native.frame;
             let Some(header) = frame.get(..24) else {
@@ -371,6 +442,7 @@ impl<B: Backend> Session<B> {
                 && frame.get(24..26).is_some_and(|reason| reason != [0, 0])
             {
                 self.peer_lost = true;
+                self.clear_aggregate_receive();
                 return Err(Error::DeviceGone);
             }
             if header[10..16] != peer
@@ -597,6 +669,11 @@ impl<B: Backend> Session<B> {
         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
 
         self.management_rate = plan.management_rate();
+        // The currently admitted MLME/peer remains legacy. A prepared HT
+        // receiver is not an HT association receipt and cannot survive into
+        // this legacy station's packet admission.
+        self.ht20_rx = None;
+        self.received_msdu.clear();
         self.boot_started = Some(self.backend.now_ns());
         self.security = None;
         let result = async {
@@ -838,6 +915,8 @@ impl<B: Backend> Session<B> {
         };
         self.boot_started = Some(self.backend.now_ns());
         let secure = self.security.take().is_some();
+        self.ht20_rx = None;
+        self.received_msdu.clear();
         let peer_lost = self.peer_lost;
         self.stage(Stage::StaRecord);
         let result = async {

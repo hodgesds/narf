@@ -131,6 +131,18 @@ impl DataQueue {
         self.read == self.write
     }
 
+    pub(super) fn belongs_to(&self, station: u8, tid: u8) -> bool {
+        self.station_tid == Some((station, tid))
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn model_dma_addresses(&self) -> (u64, u64) {
+        (
+            self.byte_counts.dma_addr().raw(),
+            self.descriptors.dma_addr().raw(),
+        )
+    }
+
     pub fn has_space(&self) -> bool {
         (self.write.wrapping_sub(self.read) as usize) < DEPTH - 1
     }

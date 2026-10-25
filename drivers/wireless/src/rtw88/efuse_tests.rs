@@ -77,6 +77,67 @@ impl EfuseIo for FakeEfuse {
 }
 
 include!("factory/golden.rs");
+include!("factory/rtl8821c_golden.rs");
+
+fn smoke_rtw8821ce_retained_factory_uses_actual_packed_one_path_geometry() -> TestResult {
+    let mut logical = [255; 768];
+    for (offset, length) in LINUX_8821C_FACTORY {
+        for (i, byte) in logical[*offset..offset + length].iter_mut().enumerate() {
+            *byte = (*offset as u8).wrapping_add(i as u8);
+        }
+    }
+    logical[0xca] = 0xa4;
+    logical[0xd0..0xd6].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
+    let records = sparse_factory(&logical);
+    let mut io = FakeEfuse::new(&records);
+    let factory = match super::efuse::read_factory8821c_with(&mut io, RTL_DEV_8821CE) {
+        Ok(factory) => factory,
+        Err(_) => return TestResult::Fail("8821C retained original factory map rejected"),
+    };
+    if factory.logical() != &logical[..512]
+        || factory.mac() != [2, 4, 6, 8, 10, 12]
+        || factory.raw_rfe() != 0xa4
+        || factory.rfe() != 4
+        || factory.package() != 1
+        || factory.thermal() != logical[LINUX_8821C_FACTORY[3].0]
+        || factory.crystal() != logical[LINUX_8821C_FACTORY[2].0]
+        || factory.country() != logical[0xcb..0xcd]
+        || factory.channel_plan() != logical[0xb8]
+        || factory.board_option() != logical[0xc1]
+        || factory.bt_setting() != logical[0xc3]
+        || factory.power_path(4).is_some()
+    {
+        return TestResult::Fail("8821C factory offsets/package extraction diverged from Linux");
+    }
+    for path in 0..4 {
+        let at = 0x10 + path * 42;
+        if factory.power_path(path as u8) != Some(&logical[at..at + 42]) {
+            return TestResult::Fail("8821C raw factory power path was substituted/defaulted");
+        }
+    }
+    if io
+        .writes
+        .iter()
+        .filter(|(reg, _)| *reg == REG_EFUSE_CTRL)
+        .count()
+        != 416
+    {
+        return TestResult::Fail("8821C read C22 trims or reread its factory map");
+    }
+    let before = io.writes.len();
+    if !matches!(
+        super::efuse::read_factory8821c_with(&mut io, RTL_DEV_8822CE),
+        Err(EfuseError::UnsupportedChip)
+    ) || io.writes.len() != before
+    {
+        return TestResult::Fail("8821C factory type accepted another chip before validation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_retained_factory_uses_actual_packed_one_path_geometry
+);
 fn sparse_factory(logical: &[u8; 768]) -> Vec<u8> {
     let mut records = Vec::new();
     for (block, bytes) in logical.chunks_exact(8).enumerate() {

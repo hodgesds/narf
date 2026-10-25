@@ -69,16 +69,89 @@ software work. No off-box radio, DHCP or AP interoperability has been demonstrat
 
 All eleven in-tree families are covered by the current audit and dependency
 ledger in `drivers/wireless/specification/spec.md` and its family documents.
-The current target is **hardware-validation readiness** for each documented
-initial station profile: scan, Open/WPA2-PSK, DHCP and bidirectional IP, with
-controlled-port closure and safe transport ownership on disconnect/failure.
-Automatic recovery, wider PHY/chip coverage and power management are separate
-follow-ups where the initial profile deliberately requires a fresh device
-lifecycle. Eleven families have composed kernel-DHCP paths (Intel Sc, MT76,
+The branch target is **all eleven Wi-Fi families with all hardware/firmware
+supported features ready for physical testing**. Each chip/revision, firmware API
+and board profile needs a feature inventory, reachable implementation and
+transition/failure evidence; PCI/USB matching alone is not support. The
+family software ledger in `drivers/wireless/specification/spec.md` records
+the open work. Recovery, wider PHY/chip coverage, security/roles and power
+management are part of this target where supported.
+
+The initial station milestone is scan, Open/WPA2-PSK, DHCP and bidirectional IP,
+with controlled-port closure and safe transport ownership on disconnect/failure.
+Eleven families have composed kernel-DHCP paths (Intel Sc, MT76,
 ath11k, ath10k, AR9285, RTL8188EE, RTL8188EU, RTL8822CE, RTL8852B, CYW43439 and BCM43602); exact authenticated firmware,
 board/calibration/policy provisioning, reset/wiring handoff and physical
 validation remain required. The initial software paths are
-implemented; broader chip/PHY/lifecycle coverage remains a separate target.
+implemented; broader chip/PHY/feature/lifecycle coverage remains required before
+the branch target is met.
+
+The first parallel feature wave adds retained API77 Intel management-queue
+ADD/REMOVE behind the inactive PHY/TX-disabled peer (including the actual native
+eight-byte removal response), MT7921/MT7922 active scans with four directed or
+wildcard SSIDs and current per-channel power/NO_IR policy, and a distinct
+RTL8821CE factory/firmware/inactive-MAC owner. Gen2 active station TX and C21
+PHY/RF/station admission remained gated after that wave on their documented
+prerequisites.
+The common FullMAC path now exposes BCM43602 firmware-reported 2.4/5 GHz
+channels with confirmed firmware 20 MHz caps, correct D11AC primary decoding
+and native Open/WPA2 DHCP/IP coverage on channels36/149. CYW43439 remains
+2.4 GHz only. Shared NRGD NO_IR policies preserve passive discovery while
+closing host-initiated TX. The second wave below adds live shared FullMAC
+policy replacement/clear observation.
+
+The second parallel feature wave implements retained Intel API77 v5
+SET_CHAINS/SET_LINK power preparation with a signed exact-platform static
+SAR/antenna-gain qualification, fresh firmware channel permissions and current
+host limits. It enables no Gen2 station TX. MT76 now has bounded native
+hardware-deaggregated A-MSDU receive ownership, atomic subframe release and a
+single CCMP PN commit per complete MPDU, with inactive HT20 receive preparation;
+production HT/WMM negotiation, STA_REC/WTBL/RA, EDCA and QoS TX remain open.
+RTL8821CE now reaches inactive PHY-table preparation using its own MAC/BB/AGC,
+optional BTG AGC and SIPI RF-A tables, exact package/RFE/cut/path selection and
+retained filter snapshots; emitting calibration/radio/station remain gated.
+
+Native CYW43439/BCM43602 FullMAC owners now observe live shared regulatory DB
+replacement/clear, including every resume of native control futures, actual
+receipt/idle fences and packet admission. Missing policy, country change,
+channel/NO_IR/DFS denial or a lower ceiling than acknowledged firmware power
+poisons the one-shot owner, closes host admission and clears queued host TX.
+Looser same-country policy preserves the original acknowledged power; reinstall
+and stale events cannot reopen a failed owner. An intervening clear also defeats
+an in-flight signed bootstrap. This does not automatically follow revocation of
+a cached policy firmware capability, retract in-flight RF or prove autonomous
+firmware radio quiescence; uncertain DMA remains retained.
+
+The combined selected Wi-Fi/shared-fixture QEMU gates pass 1736 / 0 fail / 9 skip
+on x86_64 and 1273 / 0 fail / 3 skip on aarch64, with clean production boots
+and btrfs postflights. Scoped cross-architecture Clippy and changed-package
+formatting pass; default release and debug kernels build on both architectures.
+Independent Linux C and actual production-Rust oracles cover the queue and
+v5 power ABIs, active scan requests/power ordering, native A-MSDU conversion,
+C21 factory/MAC/PHY tables and D11AC codec. The second wave adds 31 passing
+smokes on each architecture, including native control-credit policy changes,
+partial aggregation/replay cleanup and retained C21 DMA ownership. The payload catalog
+now contains 45 profiles across all eleven families, including the actual
+139472-byte RTL8821CE image; 15 required fixed payload entries remain absent.
+These are software/source/asset checks and do not establish physical acceptance
+or full hardware-feature completion.
+
+The preceding station power-save continuation added ordinary firmware station power save to the
+common CYW43439/BCM43602 owner. PM_FAST/PM_OFF and the default sleep-retention
+commands are serialized with station control; partial failure or cancellation
+closes packet admission without releasing uncertain DMA. Seven new native
+power-save smokes cover both transports, and the existing Open/WPA2 DHCP/IP
+conversations run with power save enabled. Its initial all-family wireless
+and shared-fixture QEMU suites passed: x86_64 1672 pass / 0 fail / 9 skip;
+aarch64 1209 pass / 0 fail / 3 skip. These remain software checks; actual
+power/DTIM behavior and system suspend/wake need their separate acceptance.
+The PS/disconnect-overlap regression also passed the focused FullMAC
+suites (x86_64 168 pass / 0 fail / 1 skip; aarch64 115 pass / 0 fail / 0 skip):
+an older firmware power receipt cannot reopen host admission closed by disconnect.
+The provisioning catalog now names the current EE/8822CE/8852B measured board
+artifacts and B reset handoff. Its local audit covers 44 profiles across all
+eleven families, with 15 required fixed payload entries absent (12 Intel and
+three CYW43439); payload presence does not establish signing/board qualification.
 
 Intel now sends versioned coexistence, SoC latency and awake-power setup.
 A retained Gen2 context-v1/RFH/TFH boot owner now covers APM, ALIVE6, unified
@@ -322,6 +395,14 @@ observed before opening carrier. `ath10k` and `rtl8xxxu` now wait at their pure
 firmware, board/extended-board, per-MAC calibration and regulatory checkpoints
 without repeating completed ROM/PLL/OTP or USB table/IQK initialization, and
 `ath11k` waits for its complete AMSS/M3/signed-board bundle before MHI power-up.
+`wireless::register_initcalls()` now installs the bootstrap `trusted_net_authority` into `narf_net`
+at boot before `Stage::Device` probes any driver. MT76 / MT7921 now drives background preflight retry
+via `retry_preflight_until` across 120 attempts with 500 ms intervals when firmware or net authority
+arrives late, falling back to verified reset recovery. `iwlwifi`, `cyw43439`, `brcmfmac`, `ath9k`,
+`rtlwifi` (RTL8188EE), and `rtw88` (RTL8822CE) now drive background provisioning retries via
+`drive_scheduled` across 120 attempts with 500 ms intervals while in their pure pre-attempt parked
+checkpoints, verifying network registration authority and resuming from completed radio/PHY preparation
+checkpoints when policy or calibration arrives late.
 Both include a clean production boot and btrfs interoperability postflight.
 Host tests, release/debug builds, targeted Clippy across the kernel feature
 contexts, workspace formatting, and MT76 module build/Clippy pass.

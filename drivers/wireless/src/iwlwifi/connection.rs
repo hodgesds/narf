@@ -1317,7 +1317,9 @@ async fn regulatory_channels_in_domain(
 }
 
 /// Host policy is intersected with firmware permission, with the lowest
-/// matching power ceiling. Probes never initiate radiation on DFS channels.
+/// matching power ceiling. NO_IR closes all host TX/association; probes also
+/// reject DFS. Every intersecting restriction applies, including a narrower
+/// restrictive rule overlapping an otherwise permissive covering rule.
 pub(super) fn channel_power(
     domain: &narf_wireless::reg::RegulatoryDomain,
     channel: u8,
@@ -1328,6 +1330,17 @@ pub(super) fn channel_power(
     if flags & 5 != 5 || (probe && (flags & (1 << 3) == 0 || flags & (1 << 4) != 0)) {
         return None;
     }
+    host_channel_power(domain, channel, probe)
+}
+
+/// Host-only preflight; it cannot replace the current NVM/MCC permission
+/// checked by channel_power before any transmit-capable firmware transition.
+pub(super) fn host_channel_power(
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: u8,
+    probe: bool,
+) -> Option<i8> {
+    station_api::channel_index(channel)?;
     let frequency = if channel == 14 {
         2484
     } else if channel <= 13 {
@@ -1336,18 +1349,24 @@ pub(super) fn channel_power(
         5000 + 5 * channel as u32
     };
     let mut power = None;
+    let low = frequency.saturating_sub(10);
+    let high = frequency + 10;
+    let mut covering = false;
     for rule in &domain.rules {
-        if rule.freq_start_mhz <= frequency.saturating_sub(10)
-            && rule.freq_end_mhz >= frequency + 10
-            && rule.max_bandwidth_mhz >= 20
-        {
-            if probe && rule.flags.contains(narf_wireless::reg::RegFlags::DFS) {
-                return None;
-            }
-            power = Some(power.map_or(rule.max_power_dbm, |old: i8| old.min(rule.max_power_dbm)));
+        if rule.freq_end_mhz <= low || rule.freq_start_mhz >= high {
+            continue;
         }
+        if rule.freq_end_mhz <= rule.freq_start_mhz
+            || rule.max_bandwidth_mhz < 20
+            || rule.flags.contains(narf_wireless::reg::RegFlags::NO_IR)
+            || probe && rule.flags.contains(narf_wireless::reg::RegFlags::DFS)
+        {
+            return None;
+        }
+        covering |= rule.freq_start_mhz <= low && rule.freq_end_mhz >= high;
+        power = Some(power.map_or(rule.max_power_dbm, |old: i8| old.min(rule.max_power_dbm)));
     }
-    power
+    covering.then_some(power).flatten()
 }
 
 /// Every occupied 20 MHz subchannel and the full spectral span must be
@@ -1392,16 +1411,24 @@ pub(super) fn channel_power_width(
     let mhz = 20u32 << width;
     let frequency = if primary <= 14 { 2407 } else { 5000 } + 5 * u32::from(center);
     let mut span_power = None;
+    let low = frequency - mhz / 2;
+    let high = frequency + mhz / 2;
+    let mut covering = false;
     for rule in &domain.rules {
-        if rule.freq_start_mhz <= frequency - mhz / 2
-            && rule.freq_end_mhz >= frequency + mhz / 2
-            && rule.max_bandwidth_mhz >= mhz
-        {
-            span_power =
-                Some(span_power.map_or(rule.max_power_dbm, |old: i8| old.min(rule.max_power_dbm)));
+        if rule.freq_end_mhz <= low || rule.freq_start_mhz >= high {
+            continue;
         }
+        if rule.freq_end_mhz <= rule.freq_start_mhz
+            || rule.max_bandwidth_mhz < mhz
+            || rule.flags.contains(narf_wireless::reg::RegFlags::NO_IR)
+        {
+            return None;
+        }
+        covering |= rule.freq_start_mhz <= low && rule.freq_end_mhz >= high;
+        span_power =
+            Some(span_power.map_or(rule.max_power_dbm, |old: i8| old.min(rule.max_power_dbm)));
     }
-    Some(power.min(span_power?))
+    covering.then_some(power.min(span_power?))
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

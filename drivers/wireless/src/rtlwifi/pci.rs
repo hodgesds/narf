@@ -268,7 +268,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // Initial boot and a later missing-input retry share the exact same
         // retained binding and async admission lock.
         narf_scheduler::spawn(async {
-            if let Err(error) = provision().await {
+            if let Err(error) = drive_scheduled(
+                120,
+                || with_controller(|dev| provisioning(Some(dev)).is_ok()).unwrap_or(false),
+                provision,
+                || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
+            )
+            .await
+            {
                 use core::fmt::Write;
                 let _ = writeln!(
                     narf_console::Writer,
@@ -434,22 +441,72 @@ fn provisioning(controller: Option<&RtlwifiDevice>) -> Result<Provisioning, supe
         .firmware
         .as_ref()
         .ok_or(super::prepare::Error::State)?;
-    if firmware.status().stage != super::firmware_transport::Stage::Detected {
+    let stage = firmware.status().stage;
+    if !matches!(
+        stage,
+        super::firmware_transport::Stage::Detected | super::firmware_transport::Stage::Ready
+    ) {
         return Err(super::prepare::Error::State);
+    }
+    let prepared = controller
+        .prepared
+        .as_ref()
+        .ok_or(super::prepare::Error::State)?
+        .clone();
+    if stage == super::firmware_transport::Stage::Ready {
+        let Some(guard) = prepared.try_lock() else {
+            return Err(super::prepare::Error::State);
+        };
+        let Some(owner) = guard.as_ref() else {
+            return Err(super::prepare::Error::State);
+        };
+        if !matches!(
+            owner.phase(),
+            super::prepare::Phase::RadioConfigured
+                | super::prepare::Phase::ChannelConfigured
+                | super::prepare::Phase::MacConfigured
+        ) {
+            return Err(super::prepare::Error::State);
+        }
     }
     Ok(Provisioning {
         firmware: firmware.clone(),
-        prepared: controller
-            .prepared
-            .as_ref()
-            .ok_or(super::prepare::Error::State)?
-            .clone(),
+        prepared,
         factory: controller
             .factory
             .as_ref()
             .ok_or(super::prepare::Error::State)?
             .clone(),
     })
+}
+pub(crate) async fn drive_scheduled<Step, StepFut, Wait, WaitFut>(
+    max_attempts: usize,
+    mut retryable: impl FnMut() -> bool,
+    mut step: Step,
+    mut wait: Wait,
+) -> Result<(), super::prepare::Error>
+where
+    Step: FnMut() -> StepFut,
+    StepFut: core::future::Future<Output = Result<(), super::prepare::Error>>,
+    Wait: FnMut() -> WaitFut,
+    WaitFut: core::future::Future<Output = ()>,
+{
+    let mut last_err = super::prepare::Error::State;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            wait().await;
+        }
+        match step().await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = err;
+                if !retryable() {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 static PROVISIONING: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
 async fn provision_with(

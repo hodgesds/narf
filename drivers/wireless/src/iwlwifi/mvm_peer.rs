@@ -35,7 +35,11 @@ impl Owner {
     /// Metadata is exposed only after firmware accepted the disabled AP entry.
     /// It grants no link, transmit, key, queue or controlled-port authority.
     pub fn prepared_ap_peer(&self) -> Option<([u8; 6], u8)> {
-        if self.phase != Phase::PeerPrepared || self.hardware.is_failed() {
+        if !matches!(
+            self.phase,
+            Phase::PeerPrepared | Phase::ManagementQueuePrepared | Phase::TransmitPowerPrepared
+        ) || self.hardware.is_failed()
+        {
             return None;
         }
         self.peer.map(|peer| (peer.bssid, peer.channel))
@@ -51,7 +55,7 @@ impl Owner {
         self.prepare_peer_in_domain(bssid, &domain).await
     }
 
-    async fn prepare_peer_in_domain(
+    pub(super) async fn prepare_peer_in_domain(
         &mut self,
         bssid: [u8; 6],
         domain: &RegulatoryDomain,
@@ -141,7 +145,11 @@ impl Owner {
     /// BA/key sessions to drain here; future active peers need their own ordered
     /// teardown. The PHY stays prepared until a separate acknowledged release.
     pub async fn release_ap_peer(&mut self) -> Result<(), &'static str> {
-        if self.phase != Phase::PeerPrepared || self.hardware.is_failed() || self.peer.is_none() {
+        if self.phase != Phase::PeerPrepared
+            || self.hardware.is_failed()
+            || self.peer.is_none()
+            || self.management_queue.is_some()
+        {
             return Err("MVM owner has no prepared AP peer");
         }
         if self.hardware.version(1, REMOVE_STA) != Some((2, 0)) {

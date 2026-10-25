@@ -67,6 +67,9 @@ pub const WLC_GET_CHANNEL: u32 = 29;
 /// `WLC_SET_CHANNEL` — set the channel for non-association
 /// (e.g. monitor / IBSS).
 pub const WLC_SET_CHANNEL: u32 = 30;
+
+/// `BRCMF_C_SET_PM` (Linux brcmfmac/fwil.h); u32 `PM_OFF=0`, `PM_FAST=2`.
+pub const WLC_SET_PM: u32 = 86;
 /// `WLC_SCAN` — issue a scan request. The payload describes the
 /// scan parameters; results are read via `WLC_SCAN_RESULTS`.
 pub const WLC_SCAN: u32 = 50;

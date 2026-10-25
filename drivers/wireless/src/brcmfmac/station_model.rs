@@ -42,6 +42,9 @@ pub(super) struct Firmware {
     keys_first: bool,
     hold_keys: bool,
     fail_disconnect: bool,
+    power_save_error: u32,
+    policy_clear: Option<(u32, alloc::sync::Arc<narf_wireless::reg::db::Database>)>,
+    last_power_save_error: bool,
     hold_tx: bool,
     wpa_ie: Option<Vec<u8>>,
     wpa_auth: Option<u32>,
@@ -49,6 +52,9 @@ pub(super) struct Firmware {
     supplicant: Option<u32>,
     psk: bool,
     roam_off: bool,
+    channel: u8,
+    bandwidth: [u32; 2],
+    bandwidth_stuck: bool,
     event_posts: VecDeque<(u32, u64)>,
     events: VecDeque<Vec<u8>>,
     rx_posts: VecDeque<(u32, u64)>,
@@ -72,6 +78,9 @@ impl Firmware {
             keys_first: false,
             hold_keys: false,
             fail_disconnect: false,
+            power_save_error: 0,
+            policy_clear: None,
+            last_power_save_error: false,
             hold_tx: false,
             wpa_ie: None,
             wpa_auth: None,
@@ -79,6 +88,9 @@ impl Firmware {
             supplicant: None,
             psk: false,
             roam_off: false,
+            channel: 6,
+            bandwidth: [7, 7],
+            bandwidth_stuck: false,
             event_posts: VecDeque::new(),
             events: VecDeque::new(),
             rx_posts: VecDeque::new(),
@@ -127,22 +139,55 @@ impl Firmware {
         }
     }
     pub(super) fn command(&mut self, command: u32, input: &[u8], maximum: u16) -> Vec<u8> {
+        if self
+            .policy_clear
+            .as_ref()
+            .is_some_and(|(target, _)| *target == command)
+        {
+            self.policy_clear.take().unwrap().1.clear();
+        }
+        self.last_power_save_error = command == self.power_save_error
+            && (command == 86 || input.starts_with(b"pm2_sleep_ret\0"));
         match command {
             1 => 2u32.to_le_bytes().to_vec(),
-            217 => [3u32, 1, 6, 11]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect(),
+            217 => {
+                let channels: &[u32] = if self.channel > 14 {
+                    &[6, 36, 52, 149, 165, 255]
+                } else {
+                    &[1, 6, 11]
+                };
+                core::iter::once(channels.len() as u32)
+                    .chain(channels.iter().copied())
+                    .flat_map(u32::to_le_bytes)
+                    .collect()
+            }
             262 => {
                 let mut out = vec![0; usize::from(maximum)];
                 if input.starts_with(b"cur_etheraddr\0") {
                     out[..6].copy_from_slice(&OWN);
+                } else if input.starts_with(b"bw_cap\0") {
+                    let band = u32::from_le_bytes(input[7..11].try_into().unwrap());
+                    assert!(matches!(band, 1 | 2));
+                    let cap = if self.bandwidth_stuck {
+                        7
+                    } else {
+                        self.bandwidth[(band - 1) as usize]
+                    };
+                    out[..4].copy_from_slice(&cap.to_le_bytes());
                 }
                 out
             }
+            263 if input.starts_with(b"bw_cap\0") => {
+                assert_eq!(input.len(), 15);
+                let band = u32::from_le_bytes(input[7..11].try_into().unwrap());
+                assert!(matches!(band, 1 | 2));
+                self.bandwidth[(band - 1) as usize] =
+                    u32::from_le_bytes(input[11..15].try_into().unwrap());
+                Vec::new()
+            }
             263 if input.starts_with(b"escan\0") => {
                 let id = u16::from_le_bytes(input[12..14].try_into().unwrap());
-                self.event(69, 8, 0, &scan_result(id, self.secured));
+                self.event(69, 8, 0, &scan_result(id, self.secured, self.channel));
                 self.event(69, 0, 0, &[]);
                 Vec::new()
             }
@@ -175,6 +220,13 @@ impl Firmware {
             26 => {
                 assert_eq!(&input[..8], &[4, 0, 0, 0, b't', b'e', b's', b't']);
                 assert_eq!(&input[36..42], &AP);
+                assert_eq!(input.len(), 50);
+                let chanspec = if self.channel <= 14 {
+                    0x1000u16
+                } else {
+                    0xd000u16
+                } | u16::from(self.channel);
+                assert_eq!(&input[48..50], &chanspec.to_le_bytes());
                 let expected: &[u8] = if self.secured {
                     &[
                         48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
@@ -207,7 +259,7 @@ impl Firmware {
         }
     }
     pub(super) fn status(&self, command: u32) -> i16 {
-        if command == 52 && self.fail_disconnect {
+        if command == 52 && self.fail_disconnect || self.last_power_save_error {
             5
         } else {
             0
@@ -314,7 +366,7 @@ impl Firmware {
         }
     }
 }
-fn scan_result(id: u16, secured: bool) -> Vec<u8> {
+fn scan_result(id: u16, secured: bool, channel: u8) -> Vec<u8> {
     let mut ies = vec![0, 4, b't', b'e', b's', b't'];
     if secured {
         ies.extend_from_slice(&[
@@ -334,9 +386,10 @@ fn scan_result(id: u16, secured: bool) -> Vec<u8> {
     bss[16] = if secured { 17 } else { 1 };
     bss[18] = 4;
     bss[19..23].copy_from_slice(b"test");
-    bss[72..74].copy_from_slice(&0x1006u16.to_le_bytes());
+    let chanspec = if channel <= 14 { 0x1000u16 } else { 0xd000u16 } | u16::from(channel);
+    bss[72..74].copy_from_slice(&chanspec.to_le_bytes());
     bss[78..80].copy_from_slice(&(-42i16).to_le_bytes());
-    bss[88] = 6;
+    bss[88] = channel;
     bss[116..118].copy_from_slice(&128u16.to_le_bytes());
     bss[120..124].copy_from_slice(&(ies.len() as u32).to_le_bytes());
     bss[128..].copy_from_slice(&ies);
@@ -354,6 +407,15 @@ impl Handle {
     pub(crate) fn keys_first(&self, value: bool) {
         self.change(|f| f.keys_first = value);
     }
+    pub(crate) fn channel(&self, channel: u8) {
+        self.change(|f| f.channel = channel);
+    }
+    pub(crate) fn hold_wide_bandwidth(&self) {
+        self.change(|f| f.bandwidth_stuck = true);
+    }
+    pub(crate) fn commands(&self) -> Vec<(u32, Vec<u8>, u16)> {
+        self.0.lock().firmware.as_ref().unwrap().commands.clone()
+    }
     pub(crate) fn hold_keys(&self, value: bool) {
         self.change(|f| f.hold_keys = value);
     }
@@ -362,6 +424,30 @@ impl Handle {
     }
     pub(crate) fn fail_disconnect(&self) {
         self.change(|f| f.fail_disconnect = true);
+    }
+    pub(crate) fn clear_policy_on(
+        &self,
+        command: u32,
+        database: alloc::sync::Arc<narf_wireless::reg::db::Database>,
+    ) {
+        self.change(|f| f.policy_clear = Some((command, database)));
+    }
+    pub(crate) fn reject_power_save(&self, command: u32) {
+        self.change(|f| f.power_save_error = command);
+    }
+    pub(crate) fn power_commands(&self) -> Vec<(u32, Vec<u8>)> {
+        self.0
+            .lock()
+            .firmware
+            .as_ref()
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|(command, body, _)| {
+                *command == 86 || *command == 263 && body.starts_with(b"pm2_sleep_ret\0")
+            })
+            .map(|(command, body, _)| (*command, body.clone()))
+            .collect()
     }
     pub(crate) fn downlink(&self, bytes: &[u8]) {
         self.change(|f| f.downlink.push_back(bytes.to_vec()));

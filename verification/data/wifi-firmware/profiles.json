@@ -1072,7 +1072,24 @@
         }
       ],
       "requirements": [
-        "This is the retained EE preparation profile; other rtlwifi profiles remain gated. Firmware CPU readiness does not admit packet TX.",
+        "The retained RTL8188EE channel1/basic1Mbps Open/WPA2 station requires signed measured rtlwifi/rtl8188ee-cal-v1-<factory MAC lowercase hex>.bin matching the factory identity and current power envelope; physical qualification remains required. Other rtlwifi chips remain gated.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
+      "id": "rtl8821ce",
+      "family": "rtw88",
+      "assets": [
+        {
+          "role": "firmware",
+          "required": true,
+          "candidates": [
+            "rtw88/rtw8821c_fw.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "RTL8821CE retains its distinct factory identity, exact 0x8821 firmware and native inactive MAC/FIFO lifecycle. PHY/RF tables, calibration, board-power qualification and station admission remain software prerequisites; RTL8822CE tables and measured artifacts cannot substitute for this chip.",
         "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
       ]
     },
@@ -1089,7 +1106,7 @@
         }
       ],
       "requirements": [
-        "This is the retained 8822CE preparation profile; other rtw88 profiles remain gated. Validate physical efuse/power/transport before station admission.",
+        "The retained RTL8822CE channel1/basic1Mbps Open/WPA2 station requires signed measured rtw88/rtw8822ce-cal-v2-<factory MAC lowercase hex>.bin covering calibration and autonomous response power; v1 does not qualify this profile. Physical qualification and other rtw88 chips remain open.",
         "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
       ]
     },
@@ -1126,7 +1143,8 @@
         }
       ],
       "requirements": [
-        "Match physical cut and non-manufacturing suit; validate secure-fuse, signatures, WCPU power and transport. 8922A is unsupported; prepared firmware does not admit packet TX.",
+        "The retained RTL8852B channel1/basic1Mbps Open/WPA2 station requires both signed measured rtw89/rtw8852b-cal-v1-<factory MAC lowercase hex>.bin and rtw89/rtw8852b-radio-v2-<factory MAC lowercase hex>.bin bound to actual firmware PHY capability and full calibration/operating/autonomous-response power. Match physical cut/non-manufacturing suit and qualify actual RF.",
+        "Generic RTL8852B attachment requires successful advertised PCIe FLR; an explicit trusted platform reset handoff must prove actual reset and posted-traffic drainage before generic binding. A cold-boot flag or BME-off is insufficient. Broader profiles and automatic reset/rejoin remain open.",
         "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
       ]
     },

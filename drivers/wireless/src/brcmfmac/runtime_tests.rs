@@ -248,6 +248,11 @@ fn firmware_step(state: &mut State) {
                             bytes
                         }
                         262 if input.starts_with(b"sup_wpa\0") => vec![0; usize::from(output_len)],
+                        262 if input.starts_with(b"bw_cap\0") => {
+                            let mut bytes = vec![0; usize::from(output_len)];
+                            bytes[..4].copy_from_slice(&1u32.to_le_bytes());
+                            bytes
+                        }
                         _ => Vec::new(),
                     }
                 };
