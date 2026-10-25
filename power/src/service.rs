@@ -152,6 +152,10 @@ pub trait ActionExecutor: Send + Sync {
     fn execute(&self, action: PowerAction);
 }
 
+/// Battery provider (`_BIF` + `_BST`): the static info and the
+/// dynamic state, polled as a pair.
+pub type BatteryProvider = Arc<dyn Fn() -> Option<(BatteryInfo, BatteryState)> + Send + Sync>;
+
 /// Providers for the fused [`LaptopStateSnapshot`]. Each is polled by
 /// [`snapshot`]; providers may evaluate AML (battery `_BIF`/`_BST`,
 /// AC `_PSR`) and are therefore **never called under the service
@@ -166,7 +170,7 @@ pub struct StateProviders {
     /// Lid state (`_LID`).
     pub lid: Option<Arc<dyn Fn() -> Option<LidState> + Send + Sync>>,
     /// Battery static info + dynamic state (`_BIF` + `_BST`).
-    pub battery: Option<Arc<dyn Fn() -> Option<(BatteryInfo, BatteryState)> + Send + Sync>>,
+    pub battery: Option<BatteryProvider>,
     /// CPU package temperature, milli-degrees Celsius.
     pub cpu_temp_mc: Option<Arc<dyn Fn() -> Option<i32> + Send + Sync>>,
     /// GPU package temperature, milli-degrees Celsius.
@@ -525,19 +529,29 @@ pub fn snapshot() -> LaptopStateSnapshot {
         (state.providers.clone(), state.cached_ac, state.cached_lid)
     };
 
-    let mut snap = LaptopStateSnapshot::default();
-    snap.ac_adapter = providers
+    // Poll providers in the service's fixed order (ac, lid, battery,
+    // cpu, gpu) into locals, then build the snapshot in one literal.
+    let ac_adapter = providers
         .ac_adapter
         .as_ref()
         .and_then(|p| p())
         .or(cached_ac);
-    snap.lid = providers.lid.as_ref().and_then(|p| p()).or(cached_lid);
-    if let Some(battery) = providers.battery.as_ref().and_then(|p| p()) {
-        snap.battery_info = Some(battery.0);
-        snap.battery_state = Some(battery.1);
-    }
-    snap.cpu_tdie_mc = providers.cpu_temp_mc.as_ref().and_then(|p| p());
-    snap.gpu_temp_mc = providers.gpu_temp_mc.as_ref().and_then(|p| p());
+    let lid = providers.lid.as_ref().and_then(|p| p()).or(cached_lid);
+    let (battery_info, battery_state) = match providers.battery.as_ref().and_then(|p| p()) {
+        Some((info, state)) => (Some(info), Some(state)),
+        None => (None, None),
+    };
+    let cpu_tdie_mc = providers.cpu_temp_mc.as_ref().and_then(|p| p());
+    let gpu_temp_mc = providers.gpu_temp_mc.as_ref().and_then(|p| p());
+    let mut snap = LaptopStateSnapshot {
+        ac_adapter,
+        lid,
+        battery_info,
+        battery_state,
+        cpu_tdie_mc,
+        gpu_temp_mc,
+        ..Default::default()
+    };
 
     let warning_hook = {
         let mut state = STATE.lock();

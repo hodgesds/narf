@@ -3192,8 +3192,10 @@ fn smoke_power_service_lid_close_requests_suspend() -> TestResult {
     }
 
     // Policy off: lid close is counted but requests nothing.
-    let mut off = PowerPolicy::default();
-    off.suspend_on_lid_close = false;
+    let off = PowerPolicy {
+        suspend_on_lid_close: false,
+        ..Default::default()
+    };
     if service::set_policy(&cap, off).is_err() {
         return TestResult::Fail("set_policy rejected the bootstrap cap");
     }
@@ -3244,8 +3246,10 @@ fn smoke_power_service_buttons_policy() -> TestResult {
     }
 
     // Re-policied power button: press requests power-off.
-    let mut policy = PowerPolicy::default();
-    policy.power_button = ButtonAction::PowerOff;
+    let policy = PowerPolicy {
+        power_button: ButtonAction::PowerOff,
+        ..Default::default()
+    };
     if service::set_policy(&cap, policy).is_err() {
         return TestResult::Fail("set_policy rejected the bootstrap cap");
     }
