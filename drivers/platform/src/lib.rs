@@ -55,6 +55,10 @@ pub mod lid;
 /// that only appear on Intel PCHs.
 #[cfg(target_arch = "x86_64")]
 pub mod mei;
+/// Power-service composition: wires lid/button events, snapshot
+/// providers, and the action executor into `narf_power::service`.
+#[cfg(target_arch = "x86_64")]
+pub mod power_service;
 /// Intel DTT — Dynamic Tuning Technology processor thermal device.
 #[cfg(target_arch = "x86_64")]
 pub mod proc_thermal;
@@ -163,6 +167,15 @@ pub fn register_initcalls() {
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "acpi-buttons", || {
         buttons::init();
+        InitResult::Ok
+    });
+    // Power-service wiring: subscribe the lid/button event sources
+    // and install the snapshot providers + action executor into
+    // narf_power::service. Stage::Late so it lands after both this
+    // crate's Subsys drivers and narf-power's service worker.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Late, "power-service-wiring", || {
+        power_service::init();
         InitResult::Ok
     });
     // EC hotkey bridge must register after acpi-ec (which installs

@@ -35,6 +35,10 @@ pub enum OrderlyReason {
     /// `reboot()` / `power_off()` was called from interrupt context, which
     /// is refused and turned into this request.
     IrqContextRequest,
+    /// The power service's policy requested a power-off (e.g. a
+    /// re-policied button action); executed by the service's action
+    /// executor in task context.
+    PowerService,
 }
 
 impl OrderlyReason {
@@ -43,6 +47,7 @@ impl OrderlyReason {
             OrderlyReason::PowerButton => 1,
             OrderlyReason::HwProtection => 2,
             OrderlyReason::IrqContextRequest => 3,
+            OrderlyReason::PowerService => 4,
         }
     }
 
@@ -51,6 +56,7 @@ impl OrderlyReason {
             1 => Some(OrderlyReason::PowerButton),
             2 => Some(OrderlyReason::HwProtection),
             3 => Some(OrderlyReason::IrqContextRequest),
+            4 => Some(OrderlyReason::PowerService),
             _ => None,
         }
     }
@@ -60,6 +66,7 @@ impl OrderlyReason {
             OrderlyReason::PowerButton => "power button",
             OrderlyReason::HwProtection => "hardware protection",
             OrderlyReason::IrqContextRequest => "power-off requested from interrupt context",
+            OrderlyReason::PowerService => "power service request",
         }
     }
 }
