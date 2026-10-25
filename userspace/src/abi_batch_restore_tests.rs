@@ -130,7 +130,6 @@ fn lookup_br_as() -> Option<Arc<AddressSpace>> {
 struct Fixture {
     aspace: Arc<AddressSpace>,
     device: Arc<CountingBlockDevice>,
-    volume: Arc<FatVolume>,
     fd: u64,
     /// Sector span `[lo, hi)` holding the file's data clusters.
     data_span: (u64, u64),
@@ -175,10 +174,17 @@ fn with_fat_file(
                     .ok_or("lookup of NARF.TXT failed")?;
             let fd = install_rdwr(&ops)?;
             let clusters = (data.len() as u64).div_ceil(SECTOR);
+            // No `volume` field on the fixture: nothing needs to
+            // anchor the volume here — the looked-up node cloned the
+            // volume's `Arc` for itself, and the fd entry holds the
+            // node for the whole body, so the volume (and through it
+            // the device) outlives every use below. (The fault-around
+            // fixture this file mirrors does carry the field, but
+            // only because its `reopen()` reads it; this fixture has
+            // no second open.)
             body(&Fixture {
                 aspace,
                 device,
-                volume,
                 fd,
                 data_span: (DATA_LBA, DATA_LBA + clusters),
             })
@@ -428,8 +434,9 @@ kernel_test_in!(
 /// Invalidation by unmap: WILLNEED 32 pages, munmap the first half,
 /// then fault in the surviving half. The record was trimmed at the
 /// munmap, so the restore covers only what remains mapped — and the
-/// munmapped half, remapped fresh, shows plain window behaviour with
-/// its sectors read at its own fault.
+/// munmapped half, remapped fresh, shows plain window behaviour,
+/// served from the cache the advise populated (munmap drops the
+/// mapping, never the file's cached pages).
 fn smoke_batch_restore_munmap_trims_record() -> TestResult {
     let bytes = content(0x8D, 32 * PAGE as usize);
     with_fat_file(&bytes, |fx| {
@@ -474,11 +481,17 @@ fn smoke_batch_restore_munmap_trims_record() -> TestResult {
             return Err("the remap did not land on the recorded range's first half");
         }
         // No record covers it any more: a fault installs only its
-        // window (the whole 16-page half), reading its sectors now.
+        // window (the whole 16-page half). It reads no sectors doing
+        // so — munmap dropped the *mapping*, not the file's cached
+        // pages, and the advise already moved every data sector
+        // exactly once; a fresh mapping of the same file is served
+        // from that cache like any other fault. The exact pin is
+        // therefore zero new reads: a re-read would mean this fault
+        // bypassed the cache `recorded_range` proves faults consult.
         let before = fx.data_blocks_read();
         fault(&fx.aspace, base)?;
-        if fx.data_blocks_read() != before + WINDOW_PAGES * PAGE_SECTORS {
-            return Err("the remapped half's fault did not read exactly its window's sectors");
+        if fx.data_blocks_read() != before {
+            return Err("the remapped half's fault re-read sectors the advise had populated");
         }
         for index in 0..WINDOW_PAGES {
             assert_backed(&fx.aspace, base, index)?;
