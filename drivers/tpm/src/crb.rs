@@ -19,14 +19,20 @@
 //! 0x044   CTRL_STS           TPM idle / error status
 //! 0x048   CTRL_CANCEL        Cancel current command
 //! 0x04C   CTRL_START         Start command (self-clearing Go bit)
-//! 0x080   CMD_SIZE           Command buffer size (bytes)
-//! 0x084   CMD_LADDR          Command buffer phys addr low 32 bits
-//! 0x088   CMD_HADDR          Command buffer phys addr high 32 bits
-//! 0x090   RSP_SIZE           Response buffer size (bytes)
-//! 0x094   RSP_LADDR          Response buffer phys addr low 32 bits
-//! 0x098   RSP_HADDR          Response buffer phys addr high 32 bits
-//! 0x0A0…  Data buffer        Command/response data (at least 4 KiB)
+//! 0x058   CMD_SIZE           Command buffer size (bytes)
+//! 0x05C   CMD_LADDR          Command buffer phys addr low 32 bits
+//! 0x060   CMD_HADDR          Command buffer phys addr high 32 bits
+//! 0x068   RSP_SIZE           Response buffer size (bytes)
+//! 0x06C   RSP_LADDR          Response buffer phys addr low 32 bits
+//! 0x070   RSP_HADDR          Response buffer phys addr high 32 bits
 //! ```
+//!
+//! (Doc fix, #934: this table previously listed the buffer
+//! registers at 0x080… — the divergent map the deleted
+//! `narf_tpm::crb` module also used — while this file's own
+//! constants below have always used the PTP offsets 0x058…, which
+//! are the offsets the production transport in `drivers/platform`
+//! converged onto in #939. Prose and constants now agree.)
 //!
 //! ## Command flow (PTP §6.5)
 //!

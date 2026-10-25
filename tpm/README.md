@@ -5,7 +5,8 @@ a *protocol and policy* crate, not a hardware driver: it owns the
 device-agnostic TPM 2.0 command/response model, the capability type that
 gates TPM access, and the PCR-selection and policy vocabulary that the
 rest of the kernel uses. The concrete MMIO transports — the CRB and TIS
-host interfaces — live in `drivers/tpm`, and the cryptographic primitives
+host interfaces — live in `drivers/platform` (the sole production
+transport, #934), and the cryptographic primitives
 (SHA-256, HMAC) are consumed from the `crypto` crate rather than
 reimplemented here. The implementation is clean-room, following the
 public TCG TPM 2.0 Library Specification without consulting non-free or
@@ -26,9 +27,10 @@ command/response code); another encodes the specific TPM 2.0 opcodes —
 Startup, GetRandom, GetCapability, PCR_Read, PCR_Extend and friends — and
 decodes their payloads. A types module defines the PCR-set bitmask, the
 policy-hash newtype, the error enum, and the categorization of TPM return
-codes into the typed VER1 and FMT1 families from TCG Part 2. A CRB helper
-module models the locality-acquisition and command-run register dance at
-a level the hardware driver can reuse and test against a mock.
+codes into the typed VER1 and FMT1 families from TCG Part 2. (A third,
+divergent CRB register model that lived here was deleted in #934: the
+production CRB register sequence lives with the transport in
+`drivers/platform`, on the PTP map.)
 
 Access is governed by NARF's capability model rather than being globally
 available. A dedicated TPM capability kind, with rights such as extending
