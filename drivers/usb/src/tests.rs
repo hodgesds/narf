@@ -5761,6 +5761,10 @@ fn smoke_uac_detach_removes_registry_and_card() -> TestResult {
     }
     if narf_drivers_sound::default_hw_params(idx, false).is_ok() {
         return TestResult::Fail("card unregistered after unbind");
+    }
+    TestResult::Pass
+}
+
 // ── UVC streaming composition: end-to-end fixture (#803 + #812) ──────
 //
 // A modelled UVC camera (descriptor set + probe/commit state machine
@@ -6815,6 +6819,7 @@ fn smoke_uac_bind_outcome_reaches_card() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uac", smoke_uac_bind_outcome_reaches_card);
+kernel_test_in!(
     "drivers/usb/uvc",
     smoke_uvc_streamon_probe_failure_fails_ioctl
 );
