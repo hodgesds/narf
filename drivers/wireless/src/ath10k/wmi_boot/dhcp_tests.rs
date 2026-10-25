@@ -34,8 +34,9 @@ impl Harness {
             (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
         );
         if active_scan {
-            radio.htt.wmi.htc.transport.active =
-                Some(super::super::active_scan_tests::Fixture::directed(1));
+            let mut fixture = super::super::active_scan_tests::Fixture::directed(1);
+            fixture.extra_ies = super::super::active_scan_tests::PROBE_IES.to_vec();
+            radio.htt.wmi.htc.transport.active = Some(fixture);
         }
         assert!(matches!(
             drive(radio.start(if active_scan {
@@ -111,7 +112,11 @@ impl Harness {
             colocated_6ghz: false,
             duration_tu: None,
             duration_mandatory: false,
-            extra_ies: Vec::new(),
+            extra_ies: if self.active_scan {
+                super::super::active_scan_tests::PROBE_IES.to_vec()
+            } else {
+                Vec::new()
+            },
         })) else {
             return Err("retained Device native scan failed");
         };

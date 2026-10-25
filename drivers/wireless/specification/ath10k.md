@@ -73,7 +73,7 @@ another executor task. IRQ throughput and power management are separate profiles
   narrow bandwidth or negative
   power ceiling denies probes. Implicit lists select only eligible channels;
   explicit denied channels and invalid SSID/geometry/options fail before I/O.
-  Random-MAC, dwell, colocated-6-GHz and extra-IE requests remain unsupported.
+  Random-MAC, dwell and colocated-6-GHz requests remain unsupported.
   The interface returns Busy for scans with a prepared/associated peer, without
   closing that live station or publishing scan commands.
   All six MAIN/10.1/10.2/10.2.4/10.4/TLV layouts encode real SSID arrays,
@@ -96,6 +96,23 @@ another executor task. IRQ throughput and power management are separate profiles
   owned reset. Command submission is not firmware-idle or RF-quiescence proof.
   This follows the shared cached-domain contract; it does not independently
   observe revocation of a cached regulatory firmware capability.
+- `pci::scan_active_with_ies(frequencies_mhz, ssids, extra_ies)` and active
+  `Device::scan(ScanRequest)` carry up to 256 bytes of caller-supplied probe
+  information elements on all six dialects. The facade reports
+  `max_scan_ie_len() == 256` to nl80211 for both discovery and its pre-dispatch
+  bound. Complete element boundaries,
+  vendor OUI and extension-ID presence are checked before transport access;
+  firmware-generated SSID/Supported Rates/Extended Rates elements cannot be
+  duplicated. Malformed native-interface input returns InvalidArgs; oversized
+  or firmware-owned elements and passive requests with extra IEs return
+  NotSupported. Rejected input reserves no scan ID, changes no firmware state
+  and leaves the owner retryable. Prepared plans own the immutable byte copy
+  before scan publication. Legacy WMI appends IE tag4 with raw length and zero
+  padding to a four-byte boundary; TLV sets the fixed raw `ie_len` and padded ARRAY_BYTE
+  length separately. Empty-IE requests preserve the existing packets.
+  These opaque probe elements grant no PHY, association, security or regulatory
+  authority. Current channel/power checks, terminal correlation/restoration,
+  failure/cancellation and retained-DMA rules are identical to `scan_active`.
 - The older public `wmi` MAIN-dialect codec now uses Linux's group IDs
   starting at index 1, with distinct scan/debug events and correct
   `VDEV_SET_PARAM` (0x5008), RTS, fragmentation, beacon and DTIM parameter

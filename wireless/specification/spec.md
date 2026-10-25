@@ -712,10 +712,15 @@ zero-length `_MANDATORY` flag. The request retains both; ath11k applies a
 nonzero duration to every active/passive WMI dwell field and bounds its scan
 timeout with Linux's per-channel event-overhead calculation.
 
-`TRIGGER_SCAN` additionally accepts up to 512 bytes of `NL80211_ATTR_IE`,
-matching `WLAN_SCAN_PARAMS_MAX_IE_LEN`. On an active ath11k scan these are
+`WirelessNetIface::max_scan_ie_len()` supplies the native-endian u16
+`NL80211_ATTR_MAX_SCAN_IE_LEN` and the parser's pre-dispatch byte limit.
+Its compatibility default is 512; ath10k overrides it with its firmware's
+256-byte budget. Longer `NL80211_ATTR_IE` input returns -EINVAL before driver
+dispatch. On an active ath11k scan the accepted bytes are
 appended after the host's standard Probe Request rates/capabilities and sent
-as WMI's extra-IE array; longer input is -EINVAL.
+as WMI's extra-IE array. Ath10k validates complete probe elements, rejects
+firmware-owned SSID/rate elements and passive extra-IE requests, and copies
+accepted bytes into its retained six-dialect active-scan plan before I/O.
 
 `WirelessNetIface::nl80211_feature_flags()` returns only defined physical
 `NL80211_FEATURE_*` bits; the generic wiphy response combines them with its

@@ -144,8 +144,17 @@ SSID bounds, cancellation, policy restriction, failed terminals and active-cache
 Open/WPA2 DHCP/IP/teardown. Associated/off-channel scanning, broader PHY/bands,
 reset/rejoin and physical acceptance remain open.
 
-The combined selected Wi-Fi/shared-fixture QEMU gates pass 1748 / 0 fail / 9 skip
-on x86_64 and 1285 / 0 fail / 3 skip on aarch64, with clean production boots
+The ath10k scan continuation adds caller probe information elements to the same
+six-dialect owner. Its 256-byte firmware budget now reaches nl80211 discovery
+and pre-dispatch validation through a per-driver limit; complete element checks
+and immutable plan ownership precede I/O. Authored Rust packets check raw versus
+padded lengths, binary/maximal content and all six dialects, while native CE
+Open/WPA2 DHCP/IP conversations include extra probe elements. Invalid input stays
+retryable; cancellation or policy loss after publication retains DMA and closes
+the owner. This does not expand the initial PHY/channel profile.
+
+The combined selected Wi-Fi/shared-fixture QEMU gates pass 1752 / 0 fail / 9 skip
+on x86_64 and 1289 / 0 fail / 3 skip on aarch64, with clean production boots
 and btrfs postflights. Scoped cross-architecture Clippy and changed-package
 formatting pass; default release and debug kernels build on both architectures.
 Native Rust tests cover the queue and v5 power ABIs, active scan requests/power

@@ -26,11 +26,18 @@ fn permission(
 pub(in crate::ath10k) struct Plan {
     channels: Vec<u16>,
     ssids: Vec<Vec<u8>>,
+    extra_ies: Vec<u8>,
     permissions: Vec<Permission>,
     setup: Vec<Vec<u8>>,
     restore: Vec<u8>,
 }
 impl Plan {
+    /// Own and validate all probe content before reserving an ID or touching HIF.
+    pub(in crate::ath10k) fn with_extra_ies(mut self, bytes: &[u8]) -> Result<Self, Error> {
+        wire::validate_probe_ies(bytes)?;
+        self.extra_ies = wire::owned(bytes)?;
+        Ok(self)
+    }
     fn validate(&self, caps: &Capabilities, domain: &RegulatoryDomain) -> Result<(), Error> {
         for previous in &self.permissions {
             let current = permission(caps, domain, previous.frequency)?;
@@ -128,6 +135,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         Ok(Plan {
             channels: frequencies,
             ssids: names,
+            extra_ies: Vec::new(),
             permissions,
             setup,
             restore,
@@ -150,7 +158,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let result = self
             .scan_run(
                 &plan.channels,
-                &plan.ssids,
+                (&plan.ssids, &plan.extra_ies),
                 &plan.setup,
                 Some(&plan.restore),
                 || plan.validate(&caps, &current()?),

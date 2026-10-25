@@ -624,6 +624,7 @@ struct ConnectCaps {
     scan_random_mac: bool,
     connected: bool,
     max_scan_ssids: u8,
+    max_scan_ie_len: u16,
 }
 
 impl ConnectCaps {
@@ -636,6 +637,7 @@ impl ConnectCaps {
             scan_random_mac: iface.supports_scan_random_mac(),
             connected: iface.connected_bssid().is_some(),
             max_scan_ssids: iface.max_scan_ssids(),
+            max_scan_ie_len: iface.max_scan_ie_len(),
         }
     }
 }
@@ -658,6 +660,7 @@ fn parse_operation(
             scan_random_mac: false,
             connected: false,
             max_scan_ssids: 16,
+            max_scan_ie_len: 512,
         },
         0,
     )
@@ -685,8 +688,7 @@ fn parse_operation_caps(
     }
     match command {
         SCAN => {
-            // ath11k_mac_register: WLAN_SCAN_PARAMS_MAX_IE_LEN.
-            if attr(attrs, 42).is_some_and(|ie| ie.len() > 512) {
+            if attr(attrs, 42).is_some_and(|ie| ie.len() > usize::from(caps.max_scan_ie_len)) {
                 return Err(EINVAL);
             }
             let flags = u32_attr(attrs, 158)?.unwrap_or(0);

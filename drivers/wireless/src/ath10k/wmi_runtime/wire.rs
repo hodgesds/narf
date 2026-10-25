@@ -5,6 +5,7 @@ use crate::ath10k::wmi_boot::{Capabilities, Dialect};
 use alloc::vec::Vec;
 
 pub(crate) const MAX_SCAN_SSIDS: usize = 16;
+pub(crate) const MAX_SCAN_IE_LEN: u16 = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Wire {
@@ -88,16 +89,18 @@ impl Wire {
         Ok(out)
     }
     pub fn scan(&self, sequence: u16, channels: &[u16]) -> Result<Vec<u8>, Error> {
-        self.scan_mode(sequence, channels, &[])
+        self.scan_mode(sequence, channels, &[], &[])
     }
     pub fn active_scan(
         &self,
         sequence: u16,
         channels: &[u16],
         ssids: &[Vec<u8>],
+        extra_ies: &[u8],
     ) -> Result<Vec<u8>, Error> {
         validate_ssids(ssids)?;
-        self.scan_mode(sequence, channels, ssids)
+        validate_probe_ies(extra_ies)?;
+        self.scan_mode(sequence, channels, ssids, extra_ies)
     }
     pub fn active_channels(
         &self,
@@ -127,6 +130,7 @@ impl Wire {
         sequence: u16,
         channels: &[u16],
         ssids: &[Vec<u8>],
+        extra_ies: &[u8],
     ) -> Result<Vec<u8>, Error> {
         validate_channels(channels)?;
         if sequence == 0 || sequence > 4095 {
@@ -142,7 +146,13 @@ impl Wire {
             60
         };
         let active = !ssids.is_empty();
-        let extra = 24 + channels.len() * 4 + ssids.len() * 36 + usize::from(active && !tlv) * 8;
+        let padded_ies = extra_ies.len().div_ceil(4) * 4;
+        let extra = 24
+            + channels.len() * 4
+            + ssids.len() * 36
+            + usize::from(active && !tlv) * 8
+            + padded_ies
+            + usize::from(!extra_ies.is_empty() && !tlv) * 8;
         let mut out = packet(self.scan, common + extra + usize::from(tlv) * 4)?;
         let base = if tlv {
             header(&mut out, 77, 100);
@@ -190,6 +200,7 @@ impl Wire {
             put(&mut out, base + 64, channels.len() as u32);
             put(&mut out, base + 68, 1); // num_bssids, preceding num_ssids.
             put(&mut out, base + 72, ssids.len() as u32);
+            put(&mut out, base + 76, extra_ies.len() as u32);
             put(&mut out, base + 80, 3); // num_probes, unused by PASSIVE.
             put(&mut out, at, (16 << 16) | (4 * channels.len()) as u32);
             at += 4;
@@ -226,9 +237,15 @@ impl Wire {
         out[at..at + 6].fill(0xff);
         at += 8;
         if tlv {
-            put(&mut out, at, 17 << 16);
+            put(&mut out, at, (17 << 16) | padded_ies as u32);
             at += 4;
+        } else if !extra_ies.is_empty() {
+            put(&mut out, at, 4); // WMI_IE_TAG (wmi.h).
+            put(&mut out, at + 4, extra_ies.len() as u32);
+            at += 8;
         }
+        out[at..at + extra_ies.len()].copy_from_slice(extra_ies);
+        at += padded_ies;
         if at != out.len() {
             return Err(Error::Malformed);
         }
@@ -370,6 +387,27 @@ pub(super) fn validate_channels(channels: &[u16]) -> Result<(), Error> {
         if frequency_to_channel(*f).is_none() || channels[..i].contains(f) {
             return Err(Error::Malformed);
         }
+    }
+    Ok(())
+}
+/// Linux wmi.h's WLAN_SCAN_PARAMS_MAX_IE_LEN is 256 for every dialect.
+/// Firmware owns SSID and legacy rate generation. Other complete elements
+/// remain opaque probe content and grant no station/PHY/policy authority.
+pub(in crate::ath10k) fn validate_probe_ies(mut bytes: &[u8]) -> Result<(), Error> {
+    if bytes.len() > usize::from(MAX_SCAN_IE_LEN) {
+        return Err(Error::Unsupported);
+    }
+    while !bytes.is_empty() {
+        let head = bytes.get(..2).ok_or(Error::Malformed)?;
+        let end = 2 + usize::from(head[1]);
+        let body = bytes.get(2..end).ok_or(Error::Malformed)?;
+        match head[0] {
+            0 | 1 | 50 => return Err(Error::Unsupported),
+            221 if body.len() < 3 => return Err(Error::Malformed),
+            255 if body.is_empty() => return Err(Error::Malformed),
+            _ => {}
+        }
+        bytes = &bytes[end..];
     }
     Ok(())
 }

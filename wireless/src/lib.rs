@@ -415,6 +415,13 @@ pub trait WirelessNetIface: Interface {
         0
     }
 
+    /// Caller probe-IE byte budget advertised as MAX_SCAN_IE_LEN and enforced
+    /// before scan dispatch. The default preserves the existing 512-byte ABI;
+    /// drivers with smaller firmware buffers override it.
+    fn max_scan_ie_len(&self) -> u16 {
+        512
+    }
+
     /// Whether an unassociated `NL80211_CMD_TRIGGER_SCAN` may use a random
     /// source address (`NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR`).  The default
     /// is deliberately conservative: a request carrying RANDOM_ADDR is

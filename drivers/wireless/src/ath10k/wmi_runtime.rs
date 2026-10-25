@@ -20,7 +20,8 @@ mod mlme;
 pub use data::Link as StationLink;
 pub use mlme::Associated as StationAssociated;
 pub use station::Disconnected as StationDisconnected;
-pub(crate) use wire::MAX_SCAN_SSIDS;
+pub(in crate::ath10k) use wire::validate_probe_ies;
+pub(crate) use wire::{MAX_SCAN_IE_LEN, MAX_SCAN_SSIDS};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Htt(htt::Error),
@@ -177,12 +178,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// Scan IDs never wrap within this firmware owner's lifetime. A timeout,
     /// failed scan or dropped future leaves the owner closed until reset.
     pub async fn passive_scan(&mut self, channels: &[u16]) -> Result<ScanReport, Error> {
-        self.scan_run(channels, &[], &[], None, || Ok(())).await
+        self.scan_run(channels, (&[], &[]), &[], None, || Ok(()))
+            .await
     }
     async fn scan_run(
         &mut self,
         channels: &[u16],
-        ssids: &[Vec<u8>],
+        probes: (&[Vec<u8>], &[u8]),
         setup: &[Vec<u8>],
         restore: Option<&[u8]>,
         validate: impl Fn() -> Result<(), Error>,
@@ -199,10 +201,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .checked_add(1)
             .filter(|n| *n <= 4095)
             .ok_or(Error::Exhausted)?;
+        let (ssids, extra_ies) = probes;
         let command = if ssids.is_empty() {
             self.wire.scan(sequence, channels)?
         } else {
-            self.wire.active_scan(sequence, channels, ssids)?
+            self.wire
+                .active_scan(sequence, channels, ssids, extra_ies)?
         };
         let mut report = ScanReport {
             bss: Vec::new(),

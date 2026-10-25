@@ -283,12 +283,16 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             || request.colocated_6ghz
             || request.duration_tu.is_some()
             || request.duration_mandatory
-            || !request.extra_ies.is_empty()
+            || (!request.active && !request.extra_ies.is_empty())
             || request.ssids.len() > wmi_runtime::MAX_SCAN_SSIDS
             || request.ssids.iter().any(|s| s.len() > 32)
         {
             return Err(WirelessError::NotSupported);
         }
+        wmi_runtime::validate_probe_ies(&request.extra_ies).map_err(|err| match err {
+            Error::Malformed => WirelessError::InvalidArgs,
+            err => error(err),
+        })?;
         if request.active && request.ssids.is_empty() {
             request
                 .ssids
@@ -337,6 +341,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             Some(
                 radio
                     .prepare_active_scan(&frequencies, &request.ssids, &domain)
+                    .and_then(|plan| plan.with_extra_ies(&request.extra_ies))
                     .map_err(error)?,
             )
         } else {
@@ -654,6 +659,9 @@ pub(super) async fn wait_publish(
 impl WirelessNetIface for Native {
     fn max_scan_ssids(&self) -> u8 {
         wmi_runtime::MAX_SCAN_SSIDS as u8
+    }
+    fn max_scan_ie_len(&self) -> u16 {
+        wmi_runtime::MAX_SCAN_IE_LEN
     }
     fn supports_handshake_offload(&self) -> bool {
         true

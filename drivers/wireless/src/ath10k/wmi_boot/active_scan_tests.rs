@@ -13,11 +13,14 @@ use narf_wireless::{
 include!("../wmi_runtime/station_wire_golden.rs");
 
 type Policy = Arc<IrqSafeSpinLock<Option<RegulatoryDomain>>>;
+// Literal Extended Capabilities + private vendor OUI/type, deliberately unaligned.
+pub(super) const PROBE_IES: &[u8] = &[127, 1, 0x80, 221, 4, 0x12, 0x34, 0x56, 0x7f];
 pub(super) struct Fixture {
     pub(super) done: bool,
     step: u8,
     sequence: u16,
     ssids: Vec<Vec<u8>>,
+    pub(super) extra_ies: Vec<u8>,
     limits: [u8; 2],
     global: u8,
     stall: Option<u8>,
@@ -34,6 +37,7 @@ impl Fixture {
             step: 0,
             sequence,
             ssids: vec![b"narf".to_vec(), Vec::new()],
+            extra_ies: Vec::new(),
             limits: [34, 34],
             global: 34,
             stall: None,
@@ -92,7 +96,7 @@ fn channels(dialect: Dialect, limits: [u8; 2]) -> Vec<u8> {
     }
     out
 }
-fn scan(dialect: Dialect, sequence: u16, ssids: &[Vec<u8>]) -> Vec<u8> {
+fn scan(dialect: Dialect, sequence: u16, ssids: &[Vec<u8>], ies: &[u8]) -> Vec<u8> {
     let mut out = match dialect {
         Dialect::Main => SCAN_MAIN,
         Dialect::Tlv => SCAN_TLV,
@@ -133,6 +137,20 @@ fn scan(dialect: Dialect, sequence: u16, ssids: &[Vec<u8>]) -> Vec<u8> {
     }
     let at = channels + 8 + usize::from(dialect == Dialect::Tlv) * 4;
     out.splice(at..at, names);
+    if dialect == Dialect::Tlv {
+        u32at(&mut out, 84, ies.len() as u32); // START_SCAN's raw ie_len.
+        let at = out.len() - 4;
+        u32at(
+            &mut out,
+            at,
+            (17 << 16) | (ies.len().div_ceil(4) * 4) as u32,
+        );
+    } else if !ies.is_empty() {
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&(ies.len() as u32).to_le_bytes());
+    }
+    out.extend_from_slice(ies);
+    out.resize(out.len().next_multiple_of(4), 0);
     out
 }
 fn stop(dialect: Dialect, sequence: u16) -> Vec<u8> {
@@ -249,7 +267,12 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
             3 => {
                 fixture.started = true;
                 fixture.started_signal.store(true, Ordering::Release);
-                scan(dialect, fixture.sequence, &fixture.ssids)
+                scan(
+                    dialect,
+                    fixture.sequence,
+                    &fixture.ssids,
+                    &fixture.extra_ies,
+                )
             }
             _ => return Err(BmiError::BadResponse),
         }
@@ -789,4 +812,159 @@ fn smoke_ath10k_active_scan_host_close_stops_retained_control_before_result() ->
 kernel_test_in!(
     "drivers/wireless/ath10k/active-scan",
     smoke_ath10k_active_scan_host_close_stops_retained_control_before_result
+);
+
+fn smoke_ath10k_probe_ies_all_dialects_padding_maximum_and_owned_bytes() -> TestResult {
+    for (version, dialect) in DIALECTS {
+        for length in [0, 2, 3, 4, 5, 9, 255, 256] {
+            let mut r = ready(version, dialect);
+            let names = vec![b"narf".to_vec(), Vec::new()];
+            let mut ies = if length == 0 {
+                Vec::new()
+            } else {
+                let mut bytes = vec![0xa5; length];
+                bytes[0] = 200; // Opaque element; arbitrary binary body.
+                bytes[1] = (length - 2) as u8;
+                bytes
+            };
+            r.htt.wmi.htc.transport.active.as_mut().unwrap().extra_ies = ies.clone();
+            let domain = station_tests::policy();
+            let plan = r
+                .prepare_active_scan(&[2412, 2437], &names, &domain)
+                .unwrap()
+                .with_extra_ies(&ies)
+                .unwrap();
+            // The prepared plan must own the caller bytes before suspension.
+            ies.fill(0xff);
+            if !matches!(drive(r.active_scan(plan, || Ok(domain.clone()))), Poll::Ready(Ok(ref report)) if report.bss.len() == 1)
+                || !r.htt.wmi.htc.transport.active.as_ref().unwrap().done
+            {
+                return TestResult::Fail("probe IE content/length/padding changed on native WMI");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/active-scan",
+    smoke_ath10k_probe_ies_all_dialects_padding_maximum_and_owned_bytes
+);
+
+fn smoke_ath10k_probe_ies_native_invalid_and_passive_preflight_remain_retryable() -> TestResult {
+    let mut r = ready(4, Dialect::Tlv);
+    r.htt.wmi.htc.transport.active.as_mut().unwrap().extra_ies = PROBE_IES.to_vec();
+    let before = r.htt.wmi.htc.transport.sent.len();
+    let owner = Arc::new(narf_lib::mutex::Mutex::new(r));
+    let device = crate::ath10k::interface::Device::for_test(
+        "narf-test-probe-ies",
+        [2, 3, 4, 5, 6, 7],
+        owner.clone(),
+        || Some(station_tests::policy()),
+    );
+    let request = |ies: Vec<u8>, active| narf_wireless::ScanRequest {
+        ssids: vec![b"narf".to_vec(), Vec::new()],
+        frequencies_mhz: vec![2412, 2437],
+        channels: vec![1, 6],
+        active,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: None,
+        duration_mandatory: false,
+        extra_ies: ies,
+    };
+    for malformed in [
+        vec![127],
+        vec![127, 2, 1],
+        vec![127, 0, 221],
+        vec![221, 2, 1, 2],
+        vec![255, 0],
+    ] {
+        if !matches!(
+            drive(device.scan(request(malformed, true))),
+            Poll::Ready(Err(WirelessError::InvalidArgs))
+        ) {
+            return TestResult::Fail("malformed probe element was published or misclassified");
+        }
+    }
+    for unsupported in [
+        vec![0, 0],
+        vec![1, 1, 0x82],
+        vec![50, 1, 12],
+        vec![200; 257],
+    ] {
+        if !matches!(
+            drive(device.scan(request(unsupported, true))),
+            Poll::Ready(Err(WirelessError::NotSupported))
+        ) {
+            return TestResult::Fail("oversized or firmware-owned probe element was accepted");
+        }
+    }
+    if !matches!(
+        drive(device.scan(request(PROBE_IES.to_vec(), false))),
+        Poll::Ready(Err(WirelessError::NotSupported))
+    ) || owner.try_lock().unwrap().htt.wmi.htc.transport.sent.len() != before
+        || !matches!(drive(device.scan(request(PROBE_IES.to_vec(), true))), Poll::Ready(Ok(ref bss)) if bss.len() == 1)
+    {
+        return TestResult::Fail(
+            "probe IE preflight wrote transport, ignored passive IEs or poisoned retry",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/active-scan",
+    smoke_ath10k_probe_ies_native_invalid_and_passive_preflight_remain_retryable
+);
+
+fn smoke_ath10k_probe_ies_sixteen_ssids_cancel_and_policy_failure_retain_dma() -> TestResult {
+    for (version, dialect) in DIALECTS {
+        for cancel in [false, true] {
+            let mut r = ready(version, dialect);
+            let names = vec![vec![0x80; 32]; 16];
+            let p = policy();
+            let mut ies = vec![0xa5; 256];
+            ies[0] = 221;
+            ies[1] = 254;
+            let fixture = r.htt.wmi.htc.transport.active.as_mut().unwrap();
+            fixture.ssids = names.clone();
+            fixture.extra_ies = ies.clone();
+            if cancel {
+                fixture.stall = Some(3); // Actual START publication with maximum arrays.
+            } else {
+                fixture.change = Some((3, p.clone()));
+            }
+            let plan = r
+                .prepare_active_scan(&[2412, 2437], &names, p.lock().as_ref().unwrap())
+                .unwrap()
+                .with_extra_ies(&ies)
+                .unwrap();
+            let result =
+                drive(r.active_scan(plan, || p.lock().clone().ok_or(radio::Error::Unsupported)));
+            let model = &r.htt.wmi.htc.transport;
+            let fixture = model.active.as_ref().unwrap();
+            let failed_as_expected = if cancel {
+                result.is_pending()
+            } else {
+                matches!(result, Poll::Ready(Err(radio::Error::Unsupported)))
+                    && fixture.stopped
+                    && fixture.done
+            };
+            if !failed_as_expected
+                || model.inner.inner.retained.is_none()
+                || model.inner.storage.as_ref().unwrap().filled != 1023
+                || r.prepare_active_scan(&[2412, 2437], &names, &station_tests::policy())
+                    .is_ok()
+                || r.information_elements([2, 8, 9, 10, 11, 12]).is_some()
+            {
+                return TestResult::Fail(
+                    "maximum IE/SSID failure reopened owner, exposed cache or freed DMA",
+                );
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/active-scan",
+    smoke_ath10k_probe_ies_sixteen_ssids_cancel_and_policy_failure_retain_dma
 );

@@ -614,6 +614,12 @@ receives the resulting WMI-facing value rather than trusting raw netlink
 attributes. Colocated 6-GHz is retained separately because it is valid
 without an nl80211 feature flag but only has an effect on firmware with
 per-channel scan configuration.
+
+`max_scan_ie_len()` also binds wiphy discovery and the pre-dispatch probe-IE
+byte limit: ath10k reports 256 and accepts bounded complete elements for active
+scans; the compatibility default remains 512. Its native PCI diagnostic API
+`scan_active_with_ies` uses the same validation and retained active-scan owner.
+
 ath11k supplies Linux WCN6855's 512-station `hw_params.num_peers` value as
 `max_ap_assoc_sta` to the generic wiphy encoder. This registration limit is
 intentionally distinct from the 16-peer startup resource request sent by

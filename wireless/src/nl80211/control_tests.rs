@@ -39,6 +39,9 @@ impl crate::WirelessNetIface for InterfaceStub {
     fn max_scan_ssids(&self) -> u8 {
         16
     }
+    fn max_scan_ie_len(&self) -> u16 {
+        256
+    }
 
     fn phy_capabilities(&self, band: u32) -> Option<crate::iface::PhyCapabilities> {
         let mut ht = [0; 26];
@@ -86,6 +89,50 @@ impl crate::WirelessNetIface for InterfaceStub {
         Err(crate::WirelessError::NotSupported)
     }
 }
+
+fn smoke_nl80211_scan_ie_budget_matches_wiphy_and_parser() -> TestResult {
+    let iface = InterfaceStub {
+        name: "wlan-ie-budget-test",
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+    };
+    let info = crate::WirelessNetIface::get_wireless_info(&iface);
+    let encoded = wiphy_attrs(0, &info, Some(&iface));
+    let fallback = wiphy_attrs(0, &info, None);
+    if find_attr(&encoded, 56) != Some(&256u16.to_ne_bytes()[..])
+        || find_attr(&fallback, 56) != Some(&512u16.to_ne_bytes()[..])
+    {
+        return TestResult::Fail("wiphy IE budget does not match the selected driver");
+    }
+    let mut ssids = Vec::new();
+    push_attr(&mut ssids, 1, b"narf");
+    for length in [0, 256, 257] {
+        let bytes = alloc::vec![0xa5; length];
+        let mut attrs = Vec::new();
+        push_attr(&mut attrs, 45 | NLA_F_NESTED, &ssids);
+        push_attr(&mut attrs, 42, &bytes);
+        let parsed = parse_operation_caps(
+            SCAN,
+            &attributes(&attrs).unwrap(),
+            ConnectCaps::of(&iface),
+            0,
+        );
+        if length <= 256 {
+            if !matches!(parsed, Ok(Operation::Scan(ref request)) if request.extra_ies == bytes) {
+                return TestResult::Fail(
+                    "advertised probe IE budget failed to reach driver request",
+                );
+            }
+        } else if !matches!(parsed, Err(EINVAL)) {
+            return TestResult::Fail("parser exceeded the advertised probe IE budget");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_scan_ie_budget_matches_wiphy_and_parser
+);
 
 fn smoke_nl80211_band_ht_vht_attributes() -> TestResult {
     let iface = InterfaceStub {

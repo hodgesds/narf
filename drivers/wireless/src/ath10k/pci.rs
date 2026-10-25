@@ -298,14 +298,28 @@ pub async fn scan_active(
     frequencies: &[u16],
     ssids: &[Vec<u8>],
 ) -> Result<super::wmi_runtime::ScanReport, super::wmi_runtime::Error> {
+    scan_active_with_ies(frequencies, ssids, &[]).await
+}
+
+/// Active scan with up to 256 bytes of complete caller probe IEs. Firmware
+/// generates SSID/rates; those elements cannot be duplicated by the caller.
+/// Probe content changes neither channel/power permission nor station admission.
+pub async fn scan_active_with_ies(
+    frequencies: &[u16],
+    ssids: &[Vec<u8>],
+    extra_ies: &[u8],
+) -> Result<super::wmi_runtime::ScanReport, super::wmi_runtime::Error> {
     use super::wmi_runtime::Error;
+    super::wmi_runtime::validate_probe_ies(extra_ies)?;
     let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let Some(DriverSession::Radio(owner)) = session.as_mut() else {
         return Err(Error::Failed);
     };
     let mut radio = owner.radio.lock().await;
-    let plan = radio.prepare_active_scan(frequencies, ssids, &domain)?;
+    let plan = radio
+        .prepare_active_scan(frequencies, ssids, &domain)?
+        .with_extra_ies(extra_ies)?;
     let result = radio
         .active_scan(plan, || {
             narf_wireless::reg::db::get_domain().ok_or(Error::Unsupported)
