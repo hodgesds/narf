@@ -47,8 +47,11 @@ const CMD_CAD_OFF: u64 = 0;
 ///
 /// LINUX-GAP: `LINUX_REBOOT_CMD_KEXEC` and `LINUX_REBOOT_CMD_SW_SUSPEND`
 /// are -EINVAL, as they are on a Linux built without CONFIG_KEXEC_CORE /
-/// CONFIG_HIBERNATION. NARF has suspend-to-idle in `narf_power` but no
-/// hibernation image writer, and no kexec.
+/// CONFIG_HIBERNATION. SW_SUSPEND is hibernation (suspend-to-disk):
+/// NARF has no hibernation image writer, and its sleep states —
+/// suspend-to-RAM (S3) and suspend-to-idle, both in `narf_power` —
+/// are requested via `/sys/power/state`, not via reboot(2). Kexec is
+/// likewise absent.
 pub(crate) fn sys_reboot(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
 

@@ -87,7 +87,12 @@ static PHASE: AtomicU8 = AtomicU8::new(SuspendPhase::Idle as u8);
 
 /// Claim the one global suspend transition before either the asynchronous
 /// firmware phase or synchronous device-PM phase begins.
-fn claim_suspend_transition() -> Result<(), SuspendError> {
+///
+/// `pub(crate)`: suspend-to-idle ([`crate::s2idle`]) is a second
+/// platform-off flavour of the *same* transition — it shares this
+/// claim and the phase observable below so an S3 request and an
+/// s2idle request can never interleave their fan-outs.
+pub(crate) fn claim_suspend_transition() -> Result<(), SuspendError> {
     PHASE
         .compare_exchange(
             SuspendPhase::Idle as u8,
@@ -241,6 +246,13 @@ fn suspend_after_claim(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<()
     PHASE.store(SuspendPhase::ThawingUserspace as u8, Ordering::Release);
     PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
     Err(SuspendError::NotImplemented)
+}
+
+/// Store the current phase. `pub(crate)` for the same reason as
+/// [`claim_suspend_transition`]: the s2idle path walks the identical
+/// phase progression and must publish to the same observable.
+pub(crate) fn set_phase(phase: SuspendPhase) {
+    PHASE.store(phase as u8, Ordering::Release);
 }
 
 /// Snapshot the current phase.

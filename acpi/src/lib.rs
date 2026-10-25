@@ -35,7 +35,7 @@ pub mod smbios;
 
 mod tests;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use narf_lib::percpu::MAX_CPUS;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -1506,6 +1506,7 @@ pub fn __reset_for_test() {
     }
     *MEMORY_RANGES.lock() = MemRangeTable::EMPTY;
     SRAT_PARSED.store(false, Ordering::Release);
+    SCI_VECTOR.store(0, Ordering::Release);
     NODE_COUNT.store(0, Ordering::Release);
     for c in APIC_IDS.iter() {
         c.store(u32::MAX, Ordering::Release);
@@ -1875,6 +1876,40 @@ pub unsafe fn parse_fadt_pm(rsdp_phys: PhysAddr) -> Result<FadtPm, AcpiError> {
 /// Last-parsed FADT power-management surface, if any.
 pub fn fadt_pm() -> Option<FadtPm> {
     *FADT_PM.lock()
+}
+
+// ── Installed SCI vector ────────────────────────────────────────────
+//
+// The FADT advertises the SCI as an ISA IRQ number (`FadtPm::sci_int`),
+// but that number is not the vector the SCI handler dispatches on:
+// the platform's install path first remaps SCI_INT through the MADT
+// interrupt-source-override table, then installs the handler at a
+// dynamically allocated vector (`narf_interrupts::vector::alloc`).
+// The install path records the vector it actually used here, and any
+// consumer that needs the live SCI vector (today: the s2idle IRQ-mask
+// allowlist in `narf_power`) reads the record. Deriving the vector
+// from the FADT (`32 + sci_int`) names a different vector entirely.
+
+static SCI_VECTOR: AtomicU8 = AtomicU8::new(0);
+
+/// Record the IDT vector the platform installed the SCI handler on.
+/// Called once by the platform's SCI install path, after the IOAPIC
+/// route to the vector is live. Vector 0 is the "not installed"
+/// sentinel — it is the #DE exception vector and can never be
+/// allocated to an IRQ — so recording 0 clears the record.
+pub fn record_sci_vector(vector: u8) {
+    SCI_VECTOR.store(vector, Ordering::Release);
+}
+
+/// The vector the SCI handler was installed on, or `None` when no
+/// SCI install has been recorded (install not run yet, or it bailed
+/// before its route went live — in both cases no SCI handler exists
+/// for a consumer to exempt or await).
+pub fn sci_vector() -> Option<u8> {
+    match SCI_VECTOR.load(Ordering::Acquire) {
+        0 => None,
+        v => Some(v),
+    }
 }
 
 // ── PM1 status / control I/O helpers ────────────────────────────────
