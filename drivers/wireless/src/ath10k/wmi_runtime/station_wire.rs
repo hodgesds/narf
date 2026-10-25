@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Linux WMI station preparation; every supported dialect has a native oracle.
+//! Native Rust WMI station preparation for each supported firmware dialect.
 use super::*;
 use crate::ath10k::regulatory::Permission;
 impl Wire {

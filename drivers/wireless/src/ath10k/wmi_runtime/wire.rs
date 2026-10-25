@@ -4,6 +4,8 @@ use super::{Error, Management, ScanEvent};
 use crate::ath10k::wmi_boot::{Capabilities, Dialect};
 use alloc::vec::Vec;
 
+pub(crate) const MAX_SCAN_SSIDS: usize = 16;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Wire {
     pub dialect: Dialect,
@@ -86,6 +88,46 @@ impl Wire {
         Ok(out)
     }
     pub fn scan(&self, sequence: u16, channels: &[u16]) -> Result<Vec<u8>, Error> {
+        self.scan_mode(sequence, channels, &[])
+    }
+    pub fn active_scan(
+        &self,
+        sequence: u16,
+        channels: &[u16],
+        ssids: &[Vec<u8>],
+    ) -> Result<Vec<u8>, Error> {
+        validate_ssids(ssids)?;
+        self.scan_mode(sequence, channels, ssids)
+    }
+    pub fn active_channels(
+        &self,
+        permissions: &[crate::ath10k::regulatory::Permission],
+    ) -> Result<Vec<u8>, Error> {
+        let mut frequencies = Vec::new();
+        frequencies
+            .try_reserve_exact(permissions.len())
+            .map_err(|_| Error::NoMemory)?;
+        frequencies.extend(permissions.iter().map(|p| p.frequency));
+        let mut out = self.channels(&frequencies)?;
+        let tlv = self.dialect == Dialect::Tlv;
+        let mut at = if tlv { 20 } else { 8 };
+        for permission in permissions {
+            // 11G, with no PASSIVE/IBSS/HT/VHT promotion. Power is half-dBm
+            // in max/reg/max_tx fields (wmi_channel), not whole dBm.
+            put(&mut out, at + 12, 1);
+            out[at + 17] = permission.half_dbm;
+            out[at + 18] = permission.half_dbm;
+            out[at + 21] = permission.half_dbm;
+            at += if tlv { 28 } else { 24 };
+        }
+        Ok(out)
+    }
+    fn scan_mode(
+        &self,
+        sequence: u16,
+        channels: &[u16],
+        ssids: &[Vec<u8>],
+    ) -> Result<Vec<u8>, Error> {
         validate_channels(channels)?;
         if sequence == 0 || sequence > 4095 {
             return Err(Error::Exhausted);
@@ -99,7 +141,8 @@ impl Wire {
         } else {
             60
         };
-        let extra = 24 + channels.len() * 4;
+        let active = !ssids.is_empty();
+        let extra = 24 + channels.len() * 4 + ssids.len() * 36 + usize::from(active && !tlv) * 8;
         let mut out = packet(self.scan, common + extra + usize::from(tlv) * 4)?;
         let base = if tlv {
             header(&mut out, 77, 100);
@@ -122,7 +165,20 @@ impl Wire {
             0,
             20_000,
             5,
-            if tlv { 0x11 } else { 0x31 },
+            // Keep passive wire compatibility. Active probes advertise CCK
+            // and OFDM legacy rates, skip DFS, and retain probe-RX filtering.
+            // TLV inverts FILTER_PROBE_REQ just as Linux wmi-tlv.c does.
+            if active {
+                if tlv {
+                    0x5c
+                } else {
+                    0x7c
+                }
+            } else if tlv {
+                0x11
+            } else {
+                0x31
+            },
         ]
         .iter()
         .enumerate()
@@ -133,6 +189,7 @@ impl Wire {
         if tlv {
             put(&mut out, base + 64, channels.len() as u32);
             put(&mut out, base + 68, 1); // num_bssids, preceding num_ssids.
+            put(&mut out, base + 72, ssids.len() as u32);
             put(&mut out, base + 80, 3); // num_probes, unused by PASSIVE.
             put(&mut out, at, (16 << 16) | (4 * channels.len()) as u32);
             at += 4;
@@ -146,8 +203,19 @@ impl Wire {
             at += 4;
         }
         if tlv {
-            put(&mut out, at, 19 << 16);
+            put(&mut out, at, (19 << 16) | (36 * ssids.len()) as u32);
             at += 4;
+        } else if active {
+            put(&mut out, at, 2); // WMI_SSID_LIST_TAG
+            put(&mut out, at + 4, ssids.len() as u32);
+            at += 8;
+        }
+        for ssid in ssids {
+            put(&mut out, at, ssid.len() as u32);
+            out[at + 4..at + 4 + ssid.len()].copy_from_slice(ssid);
+            at += 36;
+        }
+        if tlv {
             put(&mut out, at, (19 << 16) | 8);
             at += 4;
         } else {
@@ -245,6 +313,13 @@ impl Wire {
             frame: owned(frame)?,
         })
     }
+}
+
+pub(super) fn validate_ssids(ssids: &[Vec<u8>]) -> Result<(), Error> {
+    if ssids.is_empty() || ssids.len() > MAX_SCAN_SSIDS || ssids.iter().any(|s| s.len() > 32) {
+        return Err(Error::Unsupported);
+    }
+    Ok(())
 }
 pub(super) fn packet(id: u32, body: usize) -> Result<Vec<u8>, Error> {
     let mut v = Vec::new();

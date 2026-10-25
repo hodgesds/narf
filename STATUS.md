@@ -133,8 +133,19 @@ an in-flight signed bootstrap. This does not automatically follow revocation of
 a cached policy firmware capability, retract in-flight RF or prove autonomous
 firmware radio quiescence; uncertain DMA remains retained.
 
-The combined selected Wi-Fi/shared-fixture QEMU gates pass 1736 / 0 fail / 9 skip
-on x86_64 and 1273 / 0 fail / 3 skip on aarch64, with clean production boots
+Ath10k now supports directed and wildcard active discovery through its retained
+HTC/WMI/HTT owner on all six firmware dialects. The initial channel1–11 legacy20
+profile advertises sixteen SSIDs and requires current host policy plus the
+existing factory CTL/power bounds. Ordered domain, minimum band-power and
+per-channel half-dBm limits precede probes; every command/receive poll rechecks
+policy, and matching completion restores the entire receive-only channel list
+before publishing results. Rust packet and native CE models cover probe replies,
+SSID bounds, cancellation, policy restriction, failed terminals and active-cache
+Open/WPA2 DHCP/IP/teardown. Associated/off-channel scanning, broader PHY/bands,
+reset/rejoin and physical acceptance remain open.
+
+The combined selected Wi-Fi/shared-fixture QEMU gates pass 1748 / 0 fail / 9 skip
+on x86_64 and 1285 / 0 fail / 3 skip on aarch64, with clean production boots
 and btrfs postflights. Scoped cross-architecture Clippy and changed-package
 formatting pass; default release and debug kernels build on both architectures.
 Native Rust tests cover the queue and v5 power ABIs, active scan requests/power

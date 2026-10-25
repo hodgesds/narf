@@ -4,8 +4,9 @@
 > The live PCI task obtains BMI identity, selects trusted firmware/BDF,
 > runs OTP calibration and downloads the image. It retains runtime CE DMA
 > before BMI_DONE, negotiates HTC endpoints, handles firmware host-memory
-> requests and completes WMI INIT/READY. Retained HTT RX/TX and a passive
-> scan vdev follow. Raw-capable non-PFC images can publish a retained legacy
+> requests and completes WMI INIT/READY. Retained HTT RX/TX and a receive-only
+> scan vdev follow, with policy-authorized directed/wildcard active discovery.
+> Raw-capable non-PFC images can publish a retained legacy
 > station interface with Open/WPA2, bounded native packet progress and terminal
 > disconnect. Hardware-validation readiness is scoped to this exact profile.
 
@@ -61,6 +62,40 @@ another executor task. IRQ throughput and power management are separate profiles
   firmware requestor/scan/vdev identities and never reuses a 12-bit scan ID
   within an owner lifetime. A failed/malformed terminal, timeout or dropped
   post-publication future closes that owner until full reset, retaining DMA.
+- `pci::scan_active(frequencies_mhz, ssids)` uses the same retained physical
+  owner for 1–16 explicit SSID entries, each 0–32 arbitrary bytes; an empty
+  entry requests wildcard probes. The registered interface advertises
+  `max_scan_ssids() == 16` and normalizes an active request without entries to
+  one wildcard. The initial active profile is legacy20 on configured channels
+  1–11, within SERVICE_READY ranges and the existing strict factory-world
+  ceiling. An authenticated current host domain must cover every complete
+  channel interval. Any overlapping DFS, NO_IR, unproven indoor-only rule,
+  narrow bandwidth or negative
+  power ceiling denies probes. Implicit lists select only eligible channels;
+  explicit denied channels and invalid SSID/geometry/options fail before I/O.
+  Random-MAC, dwell, colocated-6-GHz and extra-IE requests remain unsupported.
+  The interface returns Busy for scans with a prepared/associated peer, without
+  closing that live station or publishing scan commands.
+  All six MAIN/10.1/10.2/10.2.4/10.4/TLV layouts encode real SSID arrays,
+  CCK/OFDM probe rates and DFS bypass. TLV's inverted probe-request-filter bit
+  is handled explicitly. Before START, ordered commands retain factory RD/CTL,
+  apply the minimum selected-channel ceiling to the 2-GHz PDEV limit, and
+  program each active channel's max/reg/max-TX power in half-dBm. Factory
+  calibration remains enforced by firmware. Matching terminal completion is
+  followed by restoration of the complete receive-only channel list before a
+  new scan cache is published; normal passive discovery can continue afterward.
+  Host country, channel geometry and power are checked on every command-future
+  poll (including credit waits), receive iteration and final restoration. A
+  host close/disconnect signal aborts the scan on its next poll, before returning
+  results or releasing the radio lock to teardown. A
+  lower ceiling or observed policy loss/restriction closes the owner; looser
+  same-country policy cannot increase the already selected power. On errors,
+  STOP_ONE for the reserved scan ID and receive-only restoration are attempted
+  when the control channel permits. Cancellation at any publication, timeout,
+  malformed/failed terminal or policy failure retains DMA and requires full
+  owned reset. Command submission is not firmware-idle or RF-quiescence proof.
+  This follows the shared cached-domain contract; it does not independently
+  observe revocation of a cached regulatory firmware capability.
 - The older public `wmi` MAIN-dialect codec now uses Linux's group IDs
   starting at index 1, with distinct scan/debug events and correct
   `VDEV_SET_PARAM` (0x5008), RTS, fragmentation, beacon and DTIM parameter
@@ -75,7 +110,7 @@ another executor task. IRQ throughput and power management are separate profiles
   oversized identifiers return `FactoryError::Unsupported`. Internal station
   permission construction maps that error to its existing unsupported error.
 - `pci::prepare_station(bssid, frequency_mhz)` prepares one native station
-  context selected from the last successful passive-scan cache. It requires
+  context selected from the last successful passive or active scan cache. It requires
   the installed authenticated host regulatory policy; initial geometry is
   legacy 20 MHz on channels 1–11 within firmware hardware limits. The strict
   initial factory-world 20 dBm ceiling and every overlapping host power,

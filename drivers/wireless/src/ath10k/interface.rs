@@ -272,26 +272,37 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         progressed
     }
-    pub(super) async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+    pub(super) async fn scan(
+        &self,
+        mut request: ScanRequest,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
-        if request.active
-            || request.random_mac.is_some()
+        if request.random_mac.is_some()
             || request.colocated_6ghz
             || request.duration_tu.is_some()
             || request.duration_mandatory
             || !request.extra_ies.is_empty()
+            || request.ssids.len() > wmi_runtime::MAX_SCAN_SSIDS
             || request.ssids.iter().any(|s| s.len() > 32)
         {
             return Err(WirelessError::NotSupported);
+        }
+        if request.active && request.ssids.is_empty() {
+            request
+                .ssids
+                .try_reserve(1)
+                .map_err(|_| error(Error::NoMemory))?;
+            request.ssids.push(Vec::new());
         }
         if request.frequencies_mhz.is_empty()
             && request.channels.iter().any(|ch| !(1..=11).contains(ch))
         {
             return Err(WirelessError::NotSupported);
         }
-        let frequencies = if !request.frequencies_mhz.is_empty() {
+        let implicit = request.frequencies_mhz.is_empty() && request.channels.is_empty();
+        let mut frequencies = if !request.frequencies_mhz.is_empty() {
             request
                 .frequencies_mhz
                 .iter()
@@ -313,14 +324,41 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         {
             return Err(WirelessError::NotSupported);
         }
+        let mut radio = self.radio.lock().await;
+        if radio.prepared_peer().is_some() {
+            return Err(WirelessError::Busy);
+        }
+        let domain = self.policy.current().map_err(error)?;
+        if request.active && implicit {
+            frequencies.retain(|f| radio.active_frequency_allowed(&domain, *f));
+        }
+        receive_permission(&domain, &frequencies).map_err(error)?;
+        let active = if request.active {
+            Some(
+                radio
+                    .prepare_active_scan(&frequencies, &request.ssids, &domain)
+                    .map_err(error)?,
+            )
+        } else {
+            None
+        };
         let mut attempt = Attempt {
             device: self,
             armed: true,
         };
-        let mut radio = self.radio.lock().await;
-        let domain = self.policy.current().map_err(error)?;
-        receive_permission(&domain, &frequencies).map_err(error)?;
-        let report = radio.passive_scan(&frequencies).await.map_err(error)?;
+        let report = if let Some(plan) = active {
+            radio
+                .active_scan(plan, || {
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(Error::Failed);
+                    }
+                    self.policy.current()
+                })
+                .await
+        } else {
+            radio.passive_scan(&frequencies).await
+        }
+        .map_err(error)?;
         let result = report
             .bss
             .into_iter()
@@ -614,6 +652,9 @@ pub(super) async fn wait_publish(
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for Native {
+    fn max_scan_ssids(&self) -> u8 {
+        wmi_runtime::MAX_SCAN_SSIDS as u8
+    }
     fn supports_handshake_offload(&self) -> bool {
         true
     }

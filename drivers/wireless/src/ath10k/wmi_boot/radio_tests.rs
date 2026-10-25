@@ -39,6 +39,7 @@ struct RadioModel {
     teardown: Option<teardown_tests::Fixture>,
     ce: Option<crate::ath10k::boot::CeFixture>,
     data: Option<data_tests::Fixture>,
+    active: Option<active_scan_tests::Fixture>,
 }
 // SAFETY: This private firmware fixture owns its complete graph of CE-model
 // Rc/RefCell buffers; no reference-counted alias escapes the model. Moving the
@@ -152,6 +153,12 @@ fn management(model: &mut RadioModel, bad_ie: bool) {
     }
     if bad_ie {
         frame.push(0xff);
+    }
+    if model.active.as_ref().is_some_and(|active| !active.done) {
+        // An active scan receives actual probe responses, including the native
+        // unicast receiver, through the same management descriptor decoder.
+        frame[0] = 0x50;
+        frame[4..10].copy_from_slice(&[2, 3, 4, 5, 6, 7]);
     }
     management_frame(model, frame);
 }
@@ -270,6 +277,13 @@ impl Hif for RadioModel {
             return Err(BmiError::BadResponse);
         }
         self.sequence = self.sequence.wrapping_add(1);
+        if self.phase >= 2
+            && self.active.as_ref().is_some_and(|active| {
+                active_scan_tests::handles(active, self.inner.inner.dialect, &bytes[8..])
+            })
+        {
+            return active_scan_tests::send(self, bytes).await;
+        }
         if self.teardown.is_some() {
             return teardown_tests::send(self, bytes).await;
         }
@@ -311,6 +325,9 @@ impl Hif for RadioModel {
             _ => SCAN_10X,
         }
         .to_vec();
+        if self.phase == 1 && self.active.is_some() {
+            expected = active_scan_tests::receive_channels(dialect);
+        }
         if self.phase >= 2 {
             if self.data.as_ref().is_some_and(|d| d.automatic) {
                 let (base, common) = if dialect == Dialect::Tlv {
@@ -453,6 +470,7 @@ fn radio_boot_options(
         teardown: None,
         ce: None,
         data: None,
+        active: None,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));
@@ -717,3 +735,6 @@ mod teardown_tests;
 
 #[path = "data_tests.rs"]
 mod data_tests;
+
+#[path = "active_scan_tests.rs"]
+mod active_scan_tests;

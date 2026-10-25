@@ -5,7 +5,7 @@ use crate::ath10k::interface::Device;
 use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
-use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig};
+use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
 type ModelDevice = Device<RadioModel>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
 fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
@@ -21,16 +21,28 @@ struct Harness {
     policy: Arc<IrqSafeSpinLock<Option<narf_wireless::reg::RegulatoryDomain>>>,
     name: String,
     secured: bool,
+    active_scan: bool,
 }
 impl Harness {
     fn new(version: u32, dialect: Dialect, secured: bool) -> Self {
+        Self::new_scan(version, dialect, secured, false)
+    }
+    fn new_scan(version: u32, dialect: Dialect, secured: bool, active_scan: bool) -> Self {
         let mut radio = radio_boot_features(
             version,
             dialect,
             (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
         );
+        if active_scan {
+            radio.htt.wmi.htc.transport.active =
+                Some(super::super::active_scan_tests::Fixture::directed(1));
+        }
         assert!(matches!(
-            drive(radio.start(&[2412, 5180])),
+            drive(radio.start(if active_scan {
+                &[2412, 2437, 5180]
+            } else {
+                &[2412, 5180]
+            })),
             Poll::Ready(Ok(_))
         ));
         let m = &mut radio.htt.wmi.htc.transport;
@@ -64,6 +76,7 @@ impl Harness {
             policy,
             name,
             secured,
+            active_scan,
         }
     }
     fn request(&self) -> AssociateRequest {
@@ -83,9 +96,17 @@ impl Harness {
     fn scan(&self) -> Result<(), &'static str> {
         let Poll::Ready(Ok(bss)) = drive(self.device.scan(ScanRequest {
             ssids: vec![b"narf".to_vec()],
-            frequencies_mhz: vec![2412],
-            channels: vec![1],
-            active: false,
+            frequencies_mhz: if self.active_scan {
+                vec![2412, 2437]
+            } else {
+                vec![2412]
+            },
+            channels: if self.active_scan {
+                vec![1, 6]
+            } else {
+                vec![1]
+            },
+            active: self.active_scan,
             random_mac: None,
             colocated_6ghz: false,
             duration_tu: None,
@@ -162,7 +183,15 @@ impl Drop for Harness {
     }
 }
 fn composition(version: u32, dialect: Dialect, secured: bool) -> Result<(), &'static str> {
-    let h = Harness::new(version, dialect, secured);
+    composition_scan(version, dialect, secured, false)
+}
+fn composition_scan(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    active_scan: bool,
+) -> Result<(), &'static str> {
+    let h = Harness::new_scan(version, dialect, secured, active_scan);
     let (uplink, downlink) = packets();
     if narf_net::dhcp::acquire(&h.name, 0).is_ok()
         || h.device.enqueue(&uplink, narf_net::TxMeta::plain()).is_ok()
@@ -170,6 +199,28 @@ fn composition(version: u32, dialect: Dialect, secured: bool) -> Result<(), &'st
         return Err("DHCP/data escaped preauthorization carrier");
     }
     h.join()?;
+    if active_scan {
+        let sent = h.model(|m| m.sent.len());
+        let request = ScanRequest {
+            ssids: vec![b"narf".to_vec()],
+            frequencies_mhz: vec![2412],
+            channels: vec![1],
+            active: true,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
+        };
+        if !matches!(
+            drive(h.device.scan(request)),
+            Poll::Ready(Err(WirelessError::Busy))
+        ) || !h.device.link_up()
+            || h.model(|m| m.sent.len()) != sent
+        {
+            return Err("associated active scan failed to preserve exclusive peer and carrier");
+        }
+    }
     let lease = narf_net::dhcp::dhcp_acquire(&h.name, 0)
         .map_err(|_| "actual kernel DHCP through CE/HTT failed")?;
     if !network().matches_lease(&lease)
@@ -238,6 +289,27 @@ fn smoke_ath10k_native_device_open_wpa2_dhcp_and_bidirectional_ip() -> TestResul
 kernel_test_in!(
     "drivers/wireless/ath10k/station",
     smoke_ath10k_native_device_open_wpa2_dhcp_and_bidirectional_ip
+);
+fn smoke_ath10k_active_probe_cache_native_open_wpa2_dhcp_ip_and_teardown() -> TestResult {
+    for (version, dialect) in [
+        (1, Dialect::Main),
+        (2, Dialect::TenOne),
+        (3, Dialect::TenTwo),
+        (4, Dialect::Tlv),
+        (5, Dialect::TenTwoFour),
+        (6, Dialect::TenFour),
+    ] {
+        for secured in [false, true] {
+            if let Err(error) = composition_scan(version, dialect, secured, true) {
+                return TestResult::Fail(error);
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/active-scan",
+    smoke_ath10k_active_probe_cache_native_open_wpa2_dhcp_ip_and_teardown
 );
 fn occupancy(htt_first: bool) -> Result<(), &'static str> {
     let h = Harness::new(4, Dialect::Tlv, true);
@@ -633,15 +705,14 @@ kernel_test_in!(
     smoke_ath10k_current_policy_restriction_fences_native_station_publication
 );
 
-fn smoke_ath10k_station_publish_admission_stages_missing_regulatory_only_for_raw_radio() -> TestResult {
+fn smoke_ath10k_station_publish_admission_stages_missing_regulatory_only_for_raw_radio(
+) -> TestResult {
     use crate::ath10k::interface::{classify_domain_admission, Admission};
     use narf_firmware::FirmwareError;
     use narf_wireless::reg::policy::Error as RegPolicyError;
 
-    if classify_domain_admission(
-        Err(RegPolicyError::Firmware(FirmwareError::NotFound)),
-        true,
-    ) != Ok(Admission::PendingAssets)
+    if classify_domain_admission(Err(RegPolicyError::Firmware(FirmwareError::NotFound)), true)
+        != Ok(Admission::PendingAssets)
         || classify_domain_admission(Err(RegPolicyError::Authority), false)
             != Ok(Admission::PendingAssets)
         || classify_domain_admission(Err(RegPolicyError::Authority), true)
@@ -650,10 +721,11 @@ fn smoke_ath10k_station_publish_admission_stages_missing_regulatory_only_for_raw
             != Err(crate::ath10k::wmi_runtime::Error::Unsupported)
         || classify_domain_admission(Err(RegPolicyError::Format("bad")), true)
             != Err(crate::ath10k::wmi_runtime::Error::Unsupported)
-        || classify_domain_admission(Ok(station_tests::policy()), true)
-            != Ok(Admission::Ready)
+        || classify_domain_admission(Ok(station_tests::policy()), true) != Ok(Admission::Ready)
     {
-        return TestResult::Fail("ath10k regulatory staging classification mishandled error states");
+        return TestResult::Fail(
+            "ath10k regulatory staging classification mishandled error states",
+        );
     }
 
     let mut non_raw = radio_boot_features(4, Dialect::Tlv, 1 << 2);

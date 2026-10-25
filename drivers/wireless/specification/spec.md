@@ -21,7 +21,7 @@ matching a PCI ID or testing a command encoder does not establish a WLAN.
 | **rtw89** | RTL8852B initial2T2R profile; other AX/BE prerequisites | Retained reset/cold/firmware/full radio/native station with source-controller/packet kernel DHCP models | Actual PHY capability, measured v1/v2 qualification, IQK/TSSI/DPK, source power, joint TXBD/RPQ and terminal disconnect are implemented; exact assets, reset handoff and physical qualification remain — `rtw89.md` |
 | **rtlwifi** | RTL8188EE PCIe | Factory-qualified channel1 native polled station through actual kernel DHCP | Signed board curves, native mailbox/beacon prerequisites, exact DMA M4/RX-idle admission and terminal retained disconnect are implemented; physical qualification and wider profiles remain — `rtlwifi.md` |
 | **rtl8xxxu** | RTL8188EU USB firmware profile | Signed-board-power-gated channel1 native station service, Open/WPA2-PSK CCMP with retained RSNA and persistent USB RX/TX | Actual board calibration artifacts/physical qualification, reset/rejoin, broader channels/rates and other silicon profiles remain — `rtl8xxxu.md` |
-| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Retained RAW/non-PFC legacy native station service through kernel DHCP | All six dialects compose synchronous CE/HTC/HTT, scan/join, host RSNA/CCMP, current policy, exact packet receipts and terminal connection-loss/teardown; authenticated assets, physical acceptance and wider profiles remain — `ath10k.md` |
+| **ath10k** | QCA988x/QCA6174 and related PCIe parts | Retained RAW/non-PFC legacy native station service through kernel DHCP | All six dialects compose synchronous CE/HTC/HTT, passive/policy-authorized active scan, join, host RSNA/CCMP, current policy, exact packet receipts and terminal connection-loss/teardown; authenticated assets, physical acceptance and wider profiles remain — `ath10k.md` |
 | **ath9k** | AR9285 | Retained EEPROM/calibration, native non-EDMA and channel1 basic1Mbps soft-MAC station through actual kernel DHCP | Current capability/policy, factory RF-silent input, exact M4 receipt/RX-idle fencing and terminal retained stop are implemented; physical acceptance and wider profiles remain — `ath9k.md` |
 | **brcmfmac** | Explicit BCM43602 PCIe board profiles | Signed exact-host board selection, retained CR4/msgbuf and native 2.4/5 GHz FullMAC station through kernel DHCP | Firmware-reported channels, confirmed 20 MHz bandwidth caps, common station/security/power-save logic and ACK-fenced flow reuse are implemented; actual deployment assets, physical qualification, broader silicon, recovery and system PM remain — `brcmfmac.md` |
 | **cyw43439** | Infineon SDIO FullMAC | Standard PCI SDHCI/explicit card bootstrap through F2 station attachment | Owned PIO enumeration, trusted firmware/NVRAM/CLM, discovered cores/RAM, mailbox/FIFO control, station/data and firmware station power save; board wiring, gSPI host, reset/reload/system PM remain — `cyw43439.md` |
@@ -54,7 +54,7 @@ feature inventory before it can be called ready.
 | iwlwifi | Gen2/MVM station admission; remaining Gen3 command profiles; 6 GHz/HE/EHT, additional roles, RX/RSS and system PM |
 | ath11k | QCN9074 static windows/HAL/DP and firmware profile; complete per-chip optional-feature inventory, remaining platform/BW-scaling paths and architecture coverage |
 | mt76 | Associated/off-channel and richer scans, 6 GHz/HT/VHT/HE, PMF/WPA3, fragmentation, production HT/A-MSDU activation, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
-| ath10k | Wider bands/widths, HT/VHT/aggregation, PFC, alternate calibration sources, active scan, IRQ operation, recoverable reset and firmware PM |
+| ath10k | Wider bands/widths, HT/VHT/aggregation, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, recoverable reset and firmware PM |
 | ath9k | Other chip/EEPROM/descriptor variants, channel retune, periodic calibration, rate control/aggregation, IRQs, reset/rejoin, removal and PM |
 | rtlwifi | Other matched chips; wider channel/rate profiles, IRQ/C2H expansion, multiple radios, reset/recovery, removal and suspend |
 | rtl8xxxu | Other matched USB chips, wider channels/rates, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
@@ -72,7 +72,7 @@ remain distinct gates. Actual authenticated assets, board wiring, reset handoff
 and physical acceptance remain deployment/test gates.
 
 The public nl80211 scan limit follows each facade's `max_scan_ssids`: Intel
-admits 20 active SSID entries, ath11k and common FullMAC admit 16, MT76 admits
+admits 20 active SSID entries, ath10k, ath11k and common FullMAC admit 16, MT76 admits
 four, and the other
 documented initial profiles advertise zero. A cache-miss CONNECT uses passive
 discovery for those profiles rather than issuing an unsupported active probe;

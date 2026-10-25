@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
@@ -281,6 +282,35 @@ pub async fn scan_passive(
     };
     let mut radio = owner.radio.lock().await;
     let result = radio.passive_scan(frequencies).await;
+    if let Err(error) = &result {
+        if let Some(controller) = CONTROLLER.lock().as_mut() {
+            controller.scan_error = Some(*error);
+        }
+    }
+    result
+}
+
+/// Probe up to sixteen explicit SSIDs (including an empty wildcard) on the
+/// initial 2.4-GHz legacy profile. Authenticated current host policy and the
+/// immutable factory CTL constrain every probe; prepared peers stay exclusive.
+/// Cancellation/failure closes the retained owner until verified full reset.
+pub async fn scan_active(
+    frequencies: &[u16],
+    ssids: &[Vec<u8>],
+) -> Result<super::wmi_runtime::ScanReport, super::wmi_runtime::Error> {
+    use super::wmi_runtime::Error;
+    let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
+    let mut session = SESSION.lock().await;
+    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
+        return Err(Error::Failed);
+    };
+    let mut radio = owner.radio.lock().await;
+    let plan = radio.prepare_active_scan(frequencies, ssids, &domain)?;
+    let result = radio
+        .active_scan(plan, || {
+            narf_wireless::reg::db::get_domain().ok_or(Error::Unsupported)
+        })
+        .await;
     if let Err(error) = &result {
         if let Some(controller) = CONTROLLER.lock().as_mut() {
             controller.scan_error = Some(*error);
