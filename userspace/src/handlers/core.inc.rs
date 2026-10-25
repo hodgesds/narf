@@ -384,14 +384,7 @@ fn wake_one_inner(task_id: u64, w: core::task::Waker, urgent_handoff: bool) {
     crate::user_task::with_user_task_ctx(task_id, |uctx| {
         uctx.sleep_deadline_ns.store(0, Ordering::Release);
     });
-    if urgent_handoff {
-        // Preserve exact-waiter wake-preemption even when a sleeping task is
-        // owned outside the runnable queue. The scheduler's synchronous wake
-        // activates a local waiter before note_urgent_wake_preempt probes it.
-        narf_scheduler::wake_urgent_task(&w, task_id);
-    } else {
-        w.wake();
-    }
+    w.wake();
     // Wake-preemption (Linux `wakeup_preempt`): this readiness/futex/IPC wake
     // just made `task_id` runnable, so ask the running task to cede at its next
     // syscall exit and let the wakee run promptly instead of after a fair

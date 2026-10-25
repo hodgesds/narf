@@ -4556,6 +4556,11 @@ pub mod tests {
         use core::task::{Context, Poll};
         use narf_memory::AddressSpace;
 
+        // The user fixture drives run_until_empty, whose resident set must be
+        // this finite graph. Stage::Late pumps or a previous smoke's sleepers
+        // would otherwise keep that call waiting after both yielders finish.
+        crate::__reset_queues_for_test();
+
         const N: usize = 4;
         static ORDER: [AtomicU32; 2 * N] = [const { AtomicU32::new(0xff) }; 2 * N];
         static SEQ: AtomicUsize = AtomicUsize::new(0);

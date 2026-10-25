@@ -385,21 +385,77 @@ hook (`FifoScheduler`, `PriorityScheduler`, `ClassScheduler`, and
 callback and its `TaskMeta` snapshot. Any external/wrapper policy remains
 observable by default. `ClassScheduler` selection may be fused into the core's
 mandatory eligibility scan, but produces the same class/priority/deadline/FIFO
-ordering and remains subordinate to core budget validation. The sole pre-scan
-executor selection is an exact synchronous-handoff hint for an awake task with
-no periodic budget: that state proves the highest eligibility tier without
-budget accounting, and wake-next already precedes class ordering within that
-tier. Before returning through the executor, an eligible bounded direct transfer
-may instead claim that same resident slot under its home queue lock; external
-policies, periodic/capped/donated targets, and non-default task classes always
-retain the full callback and validation scan. Under `ClassScheduler`, a
-monotone per-CPU mask of classes
-admitted or migrated there conservatively forces the full scan once a higher
-class could be present; a buddy is honored only within the winning class, as
-Linux applies CFS buddies only after core class selection. Stale class bits can
-only disable the shortcut. The fast path leaves the runnable-peer hint
-conservatively set until a later full scan, so it cannot erase a concurrent
-wake.
+ordering and remains subordinate to core budget validation. As in Linux's
+`activate_task`/`deactivate_task` split, only runnable tasks are present in the
+policy-visible per-CPU `READY` queue. A task that returns `Pending` without a
+self-wake moves to scheduler-owned `PARKED` storage. Reusable per-CPU slots
+provide O(1) park and activation without allocation after their high-water
+capacity has been reached. Each task publishes its `(CPU, slot index)` token;
+every lookup also checks the stable task id, so reuse cannot activate another
+task. Cold affinity/introspection operations may still search by id.
+
+An exact synchronous same-CPU wake under a built-in, non-observing policy may
+activate immediately under non-blocking policy→runnable→parked locks when the
+runnable deque already has capacity. Contention, remote ownership, capacity
+growth, and observing policies defer activation to the executor. This keeps
+local wake-preemption snapshots current without allocating or invoking
+arbitrary callbacks in an IRQ. The local wake-preemption probe also recognizes
+an eligible, awake parked owner whose activation is pending. Existing providers
+can therefore wake normally and then publish a local urgent hint without
+forcing remote waiters onto the caller's CPU. Broadcast and exit-spread wakes
+retain ordinary activation and placement.
+
+A deferred false→true waker publishes a task-owned intrusive activation node.
+One inbox `Arc` pins each queued node, repeated wakes coalesce, and node
+publication never allocates. Per-CPU inbox state occupies separate cache lines.
+A leaf inbox gate covers only publication/detachment; it is never held over
+ownership locks, policy callbacks, allocation, or teardown. The owner reverses
+a detached batch into arrival order, consumes each next link before releasing
+its node claim, then activates the unique parked slot under its policy/queue
+boundary. A round also drains pending activations after restoring its active
+address space and before deciding to steal or enter idle, so local work cannot
+be mistaken for an empty runnable queue. A delayed node follows a migrated
+task's current parked token; the CPU-offline path drains again after moving its
+resident owners, paired with producers' token recheck under the inbox gate.
+
+Home publication precedes the SeqCst parked-token store. The subsequent
+SeqCst awake-bit recheck pairs with the waker's SeqCst flag swap followed by
+token load: both sides cannot miss the transition. Node-claim release and
+recheck use the same ordering so a coalesced wake survives node reuse. Donation
+is an explicit activation source and performs the same ownership transition.
+Runnable dequeue, in-flight poll, parked ownership, and remote runnable staging
+are mutually exclusive slot states; a direct transfer instead pins its resident
+slot under an atomic claim. Releasing that claim re-stages any pending wake or
+completion. Sleeping residents continue to receive timer/pump maintenance,
+and a separate capped-slot index observes revocation without walking uncapped
+sleepers.
+
+`ClassScheduler` may detach the `READY` head in O(1) when there is no pending
+wake-next buddy and a monotone per-CPU guard proves that every slot published
+there since initialization was default-class, normal-priority, unbudgeted, and
+uncapped. Admission, activation, migration, demotion, and live priority
+mutation publish a false guard before exceptional state becomes runnable-queue
+visible; the guard is never restored outside a hermetic test reset.
+Consequently a stale false only disables the shortcut, while a true value
+proves the runnable head is the strict-class FIFO position. Any exceptional
+slot and every external policy retain the full validation scan.
+
+The other pre-scan executor selection is an exact synchronous-handoff hint for
+an awake task with no periodic budget: that state proves the highest
+eligibility tier without budget accounting, and wake-next already precedes
+class ordering within that tier. Before returning through the executor, an
+eligible bounded direct transfer may instead claim that same resident slot
+under its home queue lock; external policies, periodic/capped/donated targets,
+and non-default task classes always retain the full callback and validation
+scan. Under `ClassScheduler`, a monotone per-CPU mask of classes admitted or
+migrated there conservatively forces the full scan once a higher class could be
+present; a buddy is honored only within the winning class, as Linux applies CFS
+buddies only after core class selection. Stale class bits can only disable the
+shortcut. The homogeneous FIFO path refreshes the runnable-peer hint from
+queue cardinality before removal (one runnable slot has no peer; additional
+slots are peers), using the same store-before-wake ordering as the full scan.
+The exact-handoff path leaves the hint conservatively set until a later full
+scan. Neither can erase a later concurrent wake.
 
 Policy replacement is a first-class rolling operation ordered by an atomic
 generation ticket. `on_install` runs once before publication;

@@ -1864,6 +1864,11 @@ agent = "OpenAI Codex GPT-6"
 argument = "Scheduler wake fast paths and WakeCell downcasts still require pointer equality with the scheduler's own vtable. A static prevents const-promotion copies from spuriously rejecting genuine scheduler wakers; it admits no foreign callback table or data pointer, adds no authority, and leaves queue ownership, task claims, domain restoration, and all eligibility checks intact. Tests cover construction, cloning, and rejection of a foreign noop waker."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "OpenAI Codex gpt-6.1-sol"
+argument = "The runnable-only queue and O(1) head selection remain inside the scheduler's existing executor-core TCB boundary. They add only scheduler-owned task-state collections and per-CPU publication state; no subsystem, capability, domain, address-space, task-memory, or context-switch authority changes."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 agent = "OpenAI Codex GPT-6"
 argument = "The task-local rlimit snapshot grants no authority: validation, cross-task permissions, hard-limit replacement, fork inheritance, and reap remain in the authoritative process store. Every row and process-key mutation release-advances a nonwrapping generation before completion. Cache hits acquire-check that generation; fills pair a complete locked row with a generation stable across identity resolution. A concurrent mutation can leave only an invalid old-generation snapshot, and no cache lock nests identity, task-registry, or store locks. Inline snapshots follow the stable TaskId lifetime and cannot resurrect retired rows. Tests cover completed remote updates and leader rebinding; the SMP check orders each writer completion before the other CPU's read."
@@ -1872,3 +1877,13 @@ argument = "The task-local rlimit snapshot grants no authority: validation, cros
 ref = "security-model/specification/spec.md#L42"
 agent = "OpenAI Codex GPT-6"
 argument = "Both architecture fault handlers defer stack-limit and capability resolution until the region index identifies a real nearby STACK_GUARD using the existing distance predicate. The read-only candidate grants no mapping authority. The provider runs outside every VMA/page-table lock, and the existing preflight and final transaction still check all limits, region topology, guard collision, and absent-leaf ownership before mutation. Non-stack faults retain Unmapped and signal behavior; no domain state or exception frame changes. Tests prove no query for an absent stack, one query with enforced rejection for a real candidate, and topology revalidation when the provider itself adds a conflicting neighbour."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-6"
+argument = "Deferred activation does not suppress existing local wake-preemption: its advisory probe checks both READY and awake PARKED ownership under separate non-blocking locks, using the same budget, capability, and direct-claim eligibility predicate. Ordinary futex placement remains unchanged. The executor restores active_mm before draining wakes at its end-of-round ownership boundary, and drains before any idle or steal decision, so pending local work cannot be treated as idle. Policy callbacks remain outside the inbox gate and task address-space scope; the final dispatch still revalidates authoritative eligibility and affinity."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex gpt-6.1-sol"
+argument = "Each TaskSlot has one exclusive owner: READY, a remote runnable staging inbox, a reusable PARKED slot, the executor's in-flight poll, or destruction. Direct transfer pins its resident slot under a claim rather than creating another owner. Park publishes home before the SeqCst location token and then SeqCst-rechecks the awake bit; wake SeqCst-swaps the bit before reading the token, so the total order forbids both sides missing the transition. Slot indices are validated against immutable TaskId and WakeCell identity. Every queued intrusive activation node owns one Arc reference, consumes its next link before releasing its coalescing claim, and rechecks wake/claim state with SeqCst ordering so node reuse cannot lose a coalesced wake. Inbox publication/detachment uses only a leaf gate and allocates nothing; an offlining CPU's final drain pairs with producers' token recheck under that gate, preventing later publication to an obsolete owner. Migration forwarding, direct-claim release, and donation preserve exclusive activation; parked capped tasks retain revocation cleanup and sleeping residents retain timer service. ClassScheduler's head shortcut requires the acquire-observed monotone default-class, normal-priority, unbudgeted, uncapped guard and absence of a buddy. Exceptional admission, activation, migration, demotion, and priority mutation release-poison the guard before READY visibility; stale false only forces the full validation scan. Affinity, capability, address-space, saved-domain, task-lifetime, and context restoration remain authoritative."

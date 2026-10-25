@@ -50,7 +50,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::affinity::{CpuId, CpuSet};
 use crate::priority::Priority;
-use crate::{current_task_id, set_task_affinity, TaskId, READY};
+use crate::{current_task_id, set_task_affinity, TaskId, PARKED, READY};
 
 // ── memory-controller charge-PID provider ───────────────────────────
 //
@@ -200,8 +200,8 @@ pub fn install_memory_pid_provider() {
 
 /// Apply a nice-style priority to the task mapped from outer ProcessId `pid`.
 /// `nice` is the cgroup's `cpu.weight.nice` equivalent; it is wrapped into
-/// [`Priority`] verbatim. Returns `true` if a matching parked task was found
-/// and updated.
+/// [`Priority`] verbatim. Returns `true` if a matching queued or parked task
+/// was found and updated.
 ///
 /// Signature matches [`CpuPriorityHook`] so the controller can install
 /// it directly. REAL effect is policy-dependent: the
@@ -212,11 +212,24 @@ pub fn apply_priority(pid: u64, nice: i8) -> bool {
     let Some(want) = process_task(pid) else {
         return false;
     };
-    for q in READY.iter() {
+    for (cpu, q) in READY.iter().enumerate() {
         let mut g = q.lock();
         if let Some(ref mut dq) = *g {
             if let Some(slot) = dq.iter_mut().find(|s| s.id == want) {
                 slot.spec.priority = priority;
+                // The slot is already queue-visible. Poison the homogeneous
+                // ClassScheduler shortcut under the same queue lock before a
+                // later dispatch can observe a non-default priority.
+                crate::publish_class_fifo_shape(cpu, slot);
+                return true;
+            }
+        }
+    }
+    for q in PARKED.iter() {
+        let mut g = q.lock();
+        if let Some(ref mut parked) = *g {
+            if let Some(entry) = parked.get_mut(&want) {
+                entry.slot.spec.priority = priority;
                 return true;
             }
         }
@@ -245,7 +258,7 @@ pub fn apply_affinity(pid: u64, mask_bits: u64) -> bool {
     process_task(pid).is_some_and(|task| set_task_affinity(task, allowed).is_ok())
 }
 
-/// Sum of measured CPU cycles spent by the parked tasks whose raw ids
+/// Sum of measured CPU cycles spent by scheduler-owned tasks whose raw ids
 /// appear in `pids`. Used by the `cpu` controller's `cpu.stat`
 /// `usage_usec` line so it reports *real* per-cgroup usage rather than
 /// a zero stub.
@@ -263,6 +276,16 @@ pub fn cgroup_cycles_for(pids: &[u64]) -> u64 {
             for slot in dq.iter() {
                 if pids.contains(&slot.id.0) {
                     total = total.saturating_add(slot.account.cycles_spent);
+                }
+            }
+        }
+    }
+    for q in PARKED.iter() {
+        let g = q.lock();
+        if let Some(ref parked) = *g {
+            for entry in parked.values() {
+                if pids.contains(&entry.slot.id.0) {
+                    total = total.saturating_add(entry.slot.account.cycles_spent);
                 }
             }
         }
