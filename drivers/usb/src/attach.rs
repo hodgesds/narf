@@ -434,9 +434,21 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
 /// controller. Called when the controller recovery epoch changes
 /// (`Xhci::recover_controller` has already invalidated every
 /// generation, dropped every `Device` and reset the slot table, so
-/// all bindings reference dead slots by construction). Registered
-/// class drivers' unbind hooks are NOT called: their devices are
-/// gone wholesale, and they re-probe on re-enumeration.
+/// all bindings reference dead slots by construction).
+///
+/// What this drops, exactly: the supervisor-pumped classes are
+/// cleared from their own registries (boot + report keyboards,
+/// mouse, touchpad, consumer, generic, ACM, xpad), every bound
+/// MSC device is removed from `MSC_DEVICES` and unpublished via
+/// `msc::unbind_all_msc`, and the hub registry is cleared.
+/// Registered class drivers' per-slot unbind hooks are NOT called
+/// on this path, and classes with neither a pumped clear nor a
+/// wholesale unbind here (UAC / UVC / CDC-NCM / btusb / CCID)
+/// keep their class-level registries across recovery — the
+/// documented remainder of #748. The MSC call is load-bearing,
+/// not symmetry: a surviving `MSC_DEVICES` entry would make
+/// re-enumeration append a second live adapter for the same BOT
+/// device (queue 16, Concern C).
 pub fn detach_all_bindings() {
     hid::clear_boot_keyboards();
     hid::keyboard::unregister_all_keyboards();
@@ -446,6 +458,7 @@ pub fn detach_all_bindings() {
     hid::generic::unregister_all_generic();
     crate::cdc_acm::clear_acm();
     crate::xpad::clear_xpad();
+    crate::msc::unbind_all_msc();
     HUBS.lock().clear();
 }
 

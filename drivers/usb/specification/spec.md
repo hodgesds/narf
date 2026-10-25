@@ -266,9 +266,13 @@ also consult upstream Linux GPL sources.
   disabled and reclaimed (`Xhci::reclaim_slot`) so a replug re-runs
   attach from scratch. A controller recovery epoch change drops every
   binding wholesale (`attach::detach_all_bindings`) and re-enumeration
-  follows. Classes the supervisor does not pump (MSC / UAC / UVC /
-  CDC-NCM / btusb / CCID) get the slot disable + reclaim but no
-  class-registry removal yet.
+  follows; on that path the pumped classes are cleared from their
+  registries and every MSC device is removed and unpublished
+  (`msc::unbind_all_msc`). On the per-slot detach path, classes the
+  supervisor does not pump (MSC / UAC / UVC / CDC-NCM / btusb / CCID)
+  get the slot disable + reclaim but no class-registry removal yet;
+  the remaining non-pumped classes keep their registries across
+  recovery as well.
 - `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
   endpoint with its owning interface and alternate setting.
   `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest
