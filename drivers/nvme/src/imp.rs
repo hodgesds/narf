@@ -108,6 +108,14 @@ pub enum NvmeError {
     /// later I/O is refused; the buffers it may still DMA into are
     /// never freed.
     ControllerDead,
+    /// Reset/recovery re-identified the function and found a
+    /// *different* controller (serial / model / vendor changed) than
+    /// the one that was snapshotted before the reset — e.g. the
+    /// device was hot-swapped while it was wedged. The recovered
+    /// state was not trusted: the controller was stopped again and
+    /// the slot is treated as removed (see
+    /// [`Controller::reset_recover`]).
+    IdentityChanged,
     /// The namespace's LBA format cannot be used for block I/O (LBA
     /// size outside 512..=4096 bytes, or per-block metadata).
     NamespaceUnusable,
@@ -608,6 +616,50 @@ pub struct IdentifyController {
     pub vwc: u8,
 }
 
+/// What [`Controller::reset_recover`] found after re-identification.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// The namespace set that came back differs from the pre-reset
+    /// set (an NSID appeared / vanished, or a namespace's geometry
+    /// or EUI64/NGUID/UUID changed). The controller identity matched;
+    /// the caller re-publishes block devices from the fresh scan.
+    pub namespaces_changed: bool,
+}
+
+/// Identity verdict of a reset/recovery, comparing the pre-reset
+/// snapshot against the re-identified controller.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RecoveryVerdict {
+    /// Same controller, same namespace set.
+    Unchanged,
+    /// Same controller, namespace set changed.
+    NamespacesChanged,
+    /// A different controller (serial / model / vendor) answered.
+    ControllerChanged,
+}
+
+/// Compare a reset's before/after identity snapshots. Controller
+/// identity is serial + model + vendor (firmware revision excluded:
+/// it is not identity, and it is not part of what the block registry
+/// publishes). Namespace identity is the full registered set —
+/// NSID, geometry, usability and EUI64/NGUID/UUID — in ascending
+/// NSID order on both sides (the scan's order), so a slice compare
+/// is the whole check.
+fn recovery_verdict(
+    before: &IdentifyController,
+    before_ns: &[ns::NamespaceInfo],
+    after: &IdentifyController,
+    after_ns: &[ns::NamespaceInfo],
+) -> RecoveryVerdict {
+    if before.sn != after.sn || before.mn != after.mn || before.vid != after.vid {
+        return RecoveryVerdict::ControllerChanged;
+    }
+    if before_ns != after_ns {
+        return RecoveryVerdict::NamespacesChanged;
+    }
+    RecoveryVerdict::Unchanged
+}
+
 impl Controller {
     /// Skeleton constructor — used by the original
     /// `smoke_nvme_probe_stub_surfaces_not_implemented` test which
@@ -1099,6 +1151,62 @@ impl Controller {
             core::mem::forget(pages);
         }
         stopped
+    }
+
+    /// Reset a wedged controller and bring it back to live I/O in
+    /// place (Linux `nvme_reset_work`): stop it
+    /// ([`Self::disable_after_failure`]), run the full bring-up
+    /// again ([`Self::bring_up`]), recreate the I/O queue, and only
+    /// then trust it — after re-identification proves the function
+    /// still hosts the same controller.
+    ///
+    /// Identity gate: the pre-reset IDENTIFY snapshot (serial /
+    /// model / vendor — firmware revision deliberately excluded, it
+    /// is not identity) and the registered namespace set (NSID +
+    /// geometry + EUI64/NGUID/UUID, the comparison in
+    /// [`recovery_verdict`]) are taken before the reset. A different
+    /// controller serial/model/vendor afterwards means the function
+    /// was hot-swapped while wedged: the new device is stopped again
+    /// and [`NvmeError::IdentityChanged`] returned — its namespaces
+    /// are never adopted under the old controller's publications. A
+    /// changed namespace set on the *same* controller is reported in
+    /// [`RecoveryReport::namespaces_changed`] so the caller can
+    /// re-publish; the namespace data itself is re-read by the
+    /// bring-up scan either way.
+    ///
+    /// When the wedged controller cannot be shown stopped (CSTS
+    /// reads all-ones — the function is gone — or RDY never drops),
+    /// its DMA pages have been leaked by `disable_after_failure` and
+    /// there is nothing safe to re-initialise: returns
+    /// [`NvmeError::ControllerFailed`] with the controller left dead.
+    /// Every wait inside is bounded (CAP.TO-derived, as in bring-up).
+    pub fn reset_recover(
+        &mut self,
+        cap: &Cap<BusDeviceCap, Write>,
+    ) -> Result<RecoveryReport, NvmeError> {
+        let before_id = self.identify.ok_or(NvmeError::NotReady)?;
+        let before_ns = self.namespaces.clone();
+        if !self.disable_after_failure(cap) {
+            return Err(NvmeError::ControllerFailed);
+        }
+        // On failure `bring_up` has already stopped the controller.
+        self.bring_up(cap)?;
+        if let Err(e) = self.create_io_queue() {
+            self.disable_after_failure(cap);
+            return Err(e);
+        }
+        let after_id = self.identify.ok_or(NvmeError::NotReady)?;
+        match recovery_verdict(&before_id, &before_ns, &after_id, &self.namespaces) {
+            RecoveryVerdict::ControllerChanged => {
+                // Not the device we snapshotted: stop it again and
+                // let the caller treat the slot as removed.
+                self.disable_after_failure(cap);
+                Err(NvmeError::IdentityChanged)
+            }
+            verdict => Ok(RecoveryReport {
+                namespaces_changed: verdict == RecoveryVerdict::NamespacesChanged,
+            }),
+        }
     }
 
     /// Create a single I/O queue pair (qid=1, depth=`IO_Q_DEPTH`)
@@ -3052,6 +3160,16 @@ fn nvme_submit_blocking(
     // device's request gate, not the IRQ-masking CONTROLLERS lock.
     // See `InstalledController`.
     let mut ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    if ctrl.is_dead() {
+        // A previous command timed out. Reset/recover the controller
+        // in place before refusing this request too (see
+        // `recover_slot`); the timed-out request itself is never
+        // replayed — it may have partially completed. The guard is
+        // dropped first: recovery takes the gate itself.
+        drop(ctrl);
+        recover_slot(0).map_err(map_nvme_err)?;
+        ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    }
     let lba_bytes = ctrl.lba_bytes as u64;
     let total_bytes = (req.blocks as u64)
         .checked_mul(lba_bytes)
@@ -3085,6 +3203,12 @@ fn nvme_submit_blocking(
 
 fn nvme_flush_primary() -> Result<(), BlockError> {
     let mut ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    if ctrl.is_dead() {
+        // Same dead-controller recovery as the submit path.
+        drop(ctrl);
+        recover_slot(0).map_err(map_nvme_err)?;
+        ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    }
     let nsid = ctrl.primary_nsid;
     ctrl.flush_nsid(nsid).map_err(map_nvme_err)
 }
@@ -3496,6 +3620,19 @@ fn sync_io(
     if slot.removed.load(Ordering::Acquire) {
         return Err(BlockIoError::DeviceRemoved);
     }
+    if ctrl.is_dead() {
+        // A previous command timed out. Reset/recover the controller
+        // in place (dropping the guard first — recovery takes the
+        // gate itself), then re-acquire and resolve the namespace
+        // geometry fresh: the recovery re-scan may have changed it,
+        // and an identity mismatch will have removed the slot.
+        drop(ctrl);
+        recover_slot(instance).map_err(map_nvme_sync_err)?;
+        ctrl = acquire(slot);
+        if slot.removed.load(Ordering::Acquire) {
+            return Err(BlockIoError::DeviceRemoved);
+        }
+    }
     let ns = geom(&ctrl, nsid).ok_or(BlockIoError::DeviceRemoved)?;
     let lba_bytes = ns.lba_bytes as usize;
     let need = n_blocks as usize * lba_bytes;
@@ -3634,6 +3771,15 @@ fn sync_flush(instance: u32, nsid: Option<u32>) -> Result<(), narf_block::BlockI
     let mut ctrl = acquire(slot);
     if slot.removed.load(Ordering::Acquire) {
         return Err(narf_block::BlockIoError::DeviceRemoved);
+    }
+    if ctrl.is_dead() {
+        // Same dead-controller recovery as the I/O path.
+        drop(ctrl);
+        recover_slot(instance).map_err(map_nvme_sync_err)?;
+        ctrl = acquire(slot);
+        if slot.removed.load(Ordering::Acquire) {
+            return Err(narf_block::BlockIoError::DeviceRemoved);
+        }
     }
     let ns = geom(&ctrl, nsid).ok_or(narf_block::BlockIoError::DeviceRemoved)?;
     ctrl.flush_nsid(ns.nsid).map_err(map_nvme_sync_err)
@@ -3784,6 +3930,16 @@ fn register_controller(instance: u32, device: narf_bus::BusDevice) {
 pub fn remove_controller(instance: u32, cap: &Cap<BusDeviceCap, Write>) -> Option<bool> {
     let slot = slot_of(instance)?;
     slot.removed.store(true, Ordering::Release);
+    withdraw_controller_publications(instance);
+    let mut ctrl = acquire(slot);
+    Some(ctrl.disable_after_failure(cap))
+}
+
+/// Withdraw controller `instance`'s publications: every block device
+/// (namespaces + partitions) the registry holds for it, and its
+/// `/dev/nvme<C>` node. Shared by [`remove_controller`] and by
+/// recovery's re-publish path.
+fn withdraw_controller_publications(instance: u32) {
     let prefix = ns::controller_name(instance);
     for entry in narf_block::block_devices() {
         if entry
@@ -3795,8 +3951,86 @@ pub fn remove_controller(instance: u32, cap: &Cap<BusDeviceCap, Write>) -> Optio
         }
     }
     narf_filesystem::devfs::unregister_nvme_controller(instance);
-    let mut ctrl = acquire(slot);
-    Some(ctrl.disable_after_failure(cap))
+}
+
+/// Recover installed controller `instance` after it was marked
+/// dead (a command timed out): reset + re-init it in place via
+/// [`Controller::reset_recover`], minting the device cap from the
+/// bus bootstrap authority the way `probe_all` does.
+///
+/// Gate discipline: the reset runs under the slot's request gate,
+/// acquired here — callers (the block entry points) drop their
+/// guard before calling, because re-publication
+/// (`register_controller`) itself serialises on the gate and it is
+/// not reentrant. The gate is an atomic spun with interrupts
+/// enabled, and no registry lock is held across the reset's bounded
+/// waits. A racing caller that finds the controller already
+/// recovered returns `Ok` immediately.
+///
+/// On a namespace-set change the controller's publications are
+/// withdrawn and re-registered from the fresh scan. On
+/// [`NvmeError::IdentityChanged`] the function hosts a different
+/// device than the one that wedged: the slot is marked removed
+/// (before the gate is released, so no racing caller can adopt the
+/// foreign device) and its publications withdrawn — a later probe
+/// binds the new device under this instance, exactly as after
+/// [`remove_controller`].
+fn recover_slot(instance: u32) -> Result<(), NvmeError> {
+    use core::fmt::Write as _;
+    let slot = slot_of(instance).ok_or(NvmeError::NotReady)?;
+    let name = ns::controller_name(instance);
+    // The reset proper, under the gate; the outcome is acted on
+    // after the guard drops (see the gate note above).
+    let (device, outcome) = {
+        let mut ctrl = acquire(slot);
+        if !ctrl.is_dead() {
+            return Ok(());
+        }
+        let device = ctrl.bus_device().ok_or(NvmeError::NotReady)?;
+        let authority = narf_bus::bootstrap_registry_authority();
+        let (_handle, cap) = narf_bus::claim_device_cap(&authority, device.addr)
+            .map_err(|_| NvmeError::ControllerFailed)?;
+        let _ = writeln!(
+            narf_console::Writer,
+            "nvme: {name}: controller dead (command timeout); resetting in place"
+        );
+        let outcome = ctrl.reset_recover(&cap);
+        if matches!(outcome, Err(NvmeError::IdentityChanged)) {
+            slot.removed.store(true, Ordering::Release);
+        }
+        (device, outcome)
+    };
+    match outcome {
+        Ok(report) => {
+            if report.namespaces_changed {
+                withdraw_controller_publications(instance);
+                register_controller(instance, device);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "nvme: {name}: recovered; namespace set changed, re-published"
+                );
+            } else {
+                let _ = writeln!(narf_console::Writer, "nvme: {name}: recovered; I/O resumed");
+            }
+            Ok(())
+        }
+        Err(NvmeError::IdentityChanged) => {
+            withdraw_controller_publications(instance);
+            let _ = writeln!(
+                narf_console::Writer,
+                "nvme: {name}: ERROR: a different controller answered after reset; \
+                 treating the slot as removed (the new device binds on the next probe)"
+            );
+            Err(NvmeError::IdentityChanged)
+        }
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "nvme: {name}: ERROR: reset/recovery failed ({e:?}); controller stays dead"
+            );
+            Err(e)
+        }
+    }
 }
 
 /// How long the final shutdown waits for an in-flight command to release a
@@ -4189,4 +4423,28 @@ pub fn register_pci_driver() {
         },
         probe,
     });
+    // Remove hooks for the bus detach path (bus spec §9.5): a
+    // Detach event for a bound NVMe function reaches `remove` via
+    // the default dispatcher and tears the controller down.
+    for (name, _, _) in exact.iter().copied() {
+        narf_bus::register_pci_remove(name, remove);
+    }
+    narf_bus::register_pci_remove("nvme-class", remove);
+}
+
+/// Bus detach hook (registered for every NVMe match in
+/// [`register_pci_driver`]): the function at `device`'s address went
+/// away — tear its controller down. `remove_controller` withdraws
+/// the block devices + `/dev/nvme<C>` node and disables the
+/// controller with the same discipline as system shutdown.
+fn remove(
+    device: narf_bus::BusDevice,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) {
+    let narf_bus::BusAddr::Pcie(addr) = device.addr else {
+        return;
+    };
+    if let Some(instance) = instance_of(addr) {
+        let _ = remove_controller(instance, &cap);
+    }
 }

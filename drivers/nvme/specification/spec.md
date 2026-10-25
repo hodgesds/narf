@@ -68,6 +68,21 @@ multipath / fabrics (defer).
   otherwise; re-probe brings it back under the same instance).
   `with_controller` / `admin_passthrough` / `NvmeBlockSync` /
   `NvmeBlockDevice` address instance 0.
+- **Reset / recovery + hot-remove** (Linux `nvme_reset_work` / `remove`).
+  `Controller::reset_recover(cap) -> Result<RecoveryReport, NvmeError>`:
+  snapshot identity (IDENTIFY + namespace set), `disable_after_failure`,
+  full `bring_up`, I/O-queue recreation, then an identity gate —
+  serial / model / vendor must match the snapshot (firmware revision is
+  not identity); a mismatch stops the foreign device again and returns
+  `NvmeError::IdentityChanged`, and a changed namespace set on the same
+  controller is reported as `RecoveryReport::namespaces_changed` for
+  re-publication. The block entry points recover lazily: the first
+  submit / flush that finds the controller dead runs the recovery
+  under the slot's request gate before proceeding (the timed-out
+  request itself is never replayed). A controller that cannot be shown
+  stopped stays dead and I/O keeps failing. `remove_controller` is also
+  the driver's bus remove hook (bus §9.5): a `Detach` event for its
+  function withdraws its block devices and node and disables it.
 - **Namespace scan** (`imp::ns`, Linux `nvme_scan_work`): Active Namespace List
   (CNS 2) from NVMe 1.1, else `1..=NN`, capped at 1024; Identify Namespace per
   NSID, skipping NCAP=0 (inactive), NSZE=0 and unusable LBA formats; NGUID /
