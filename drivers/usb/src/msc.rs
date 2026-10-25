@@ -997,6 +997,7 @@ pub fn __insert_msc_for_test(slot_id: u8) -> usize {
         last_lba: 2047,
         generation: 0,
         tag: IrqSafeSpinLock::new(1),
+        hub_port: None,
     };
     let idx = insert_device(dev);
     register_msc_block_device(idx);
@@ -1200,14 +1201,16 @@ impl UsbMscBlockDevice {
     /// bind this adapter was built from (generation match), so a
     /// flush or FUA write through a stale adapter fails
     /// `DeviceRemoved` instead of draining or forcing a write on
-    /// the disk that reused its index after a replug. The
+    /// the disk that reused its index after a replug. The hub
+    /// context rides along so the snapshot's transfer funnels can
+    /// resume / feed the port (#840). The
     /// snapshot's tag counter restarts at 1 — safe because
     /// `MscIoClaim` serialises exchanges per device, so the tag
     /// only has to match the CSW of the exchange in flight.
     fn transport_snapshot(
         &self,
     ) -> Result<(alloc::sync::Arc<Xhci>, MscDevice), narf_block::BlockIoError> {
-        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation) = {
+        let (slot_id, bulk_in_dci, bulk_out_dci, lba_bytes, generation, hub_port) = {
             let g = MSC_DEVICES.lock();
             let dev = match g.get(self.idx).and_then(|slot| slot.as_ref()) {
                 Some(d) => d,
@@ -1222,6 +1225,7 @@ impl UsbMscBlockDevice {
                 dev.bulk_out,
                 dev.lba_bytes,
                 dev.generation,
+                dev.hub_port,
             )
         };
         let c = match xhci::controller() {
@@ -1238,7 +1242,7 @@ impl UsbMscBlockDevice {
                 last_lba: 0,
                 generation,
                 tag: IrqSafeSpinLock::new(1),
-                hub_port: dev.hub_port,
+                hub_port,
             },
         ))
     }
