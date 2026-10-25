@@ -359,6 +359,9 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
         // the hook is only meaningful once a FILE_DEMAND region exists.
         narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
         narf_memory::install_file_batch_fault_hook(crate::mapped_file::demand_frames_batch);
+        // Truncate hook: paired with the fault hooks (see `sys_mmap`'s
+        // deferred-shared branch for why).
+        narf_filesystem::install_mmap_truncate_hook(crate::mapped_file::truncate_file_mappings);
     }
 
     // Allocate only file-image frames up front, chunk by chunk. Linux maps
