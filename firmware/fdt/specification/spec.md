@@ -100,8 +100,17 @@ impl<'a> Iterator for PropIter<'a> {
 
 /// Convenience helpers atop `walk_nodes`:
 
-/// Look up `/chosen` and return `bootargs` as a `&str` if present.
-pub fn chosen_bootargs(blob: &[u8]) -> Option<&str>;
+/// Capacity of the owned buffer `chosen_bootargs` returns. Matches
+/// the boot store's `CMDLINE_CAP` and Linux's `COMMAND_LINE_SIZE`.
+pub const BOOTARGS_CAP: usize = 2048;
+
+/// Look up `/chosen` and copy `bootargs` into an owned buffer if
+/// present. A value longer than `BOOTARGS_CAP` is truncated to
+/// exactly `BOOTARGS_CAP` bytes, so a full-width result signals the
+/// clip to the caller (the boot store's keep-limit is one byte
+/// below the cap, so a clipped value trips its truncation warning
+/// instead of fitting silently).
+pub fn chosen_bootargs(blob: &[u8]) -> Option<Bytes<BOOTARGS_CAP>>;
 
 /// Decode Linux's 32-bit or 64-bit initrd start/end properties.
 pub fn chosen_initrd_range(blob: &[u8]) -> Option<Reservation>;
@@ -131,6 +140,8 @@ pub fn for_each_interrupt<F>(
 | `smoke_fdt_header_round_trip`      | hand-built header decodes         |
 | `smoke_fdt_walk_minimal`           | one node + one prop callback fires |
 | `smoke_fdt_chosen_bootargs`        | `/chosen.bootargs` extracted as &str |
+| `smoke_fdt_chosen_bootargs_long_append_survives` | ~480-byte tooling append (include list + trailing exclude token) survives whole (#960) |
+| `smoke_fdt_chosen_bootargs_oversized_clips_at_cap` | bootargs past `BOOTARGS_CAP` clipped to exactly the cap |
 | `smoke_fdt_memory_ranges`          | `/memory@N reg` decoded            |
 | `smoke_fdt_reservations`           | reserve-map decoded                |
 | `smoke_fdt_reserved_memory_static_ranges` | `/reserved-memory` static range + flags |
