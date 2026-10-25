@@ -2768,8 +2768,6 @@ fn edid_with_bpc(bpc: u8) -> [u8; 128] {
     e
 }
 
-/// One depth_vectors.txt line through `dp_sst_stream`, printed as
-/// depth_harness.c prints Linux's choice.
 fn run_depth_vector(input: &str) -> Option<alloc::string::String> {
     use core::fmt::Write;
     let w: Vec<&str> = input.split_whitespace().collect();
@@ -2837,10 +2835,6 @@ fn run_depth_vector(input: &str) -> Option<alloc::string::String> {
     Some(out)
 }
 
-/// Every depth_vectors.txt line: amdgpu_dm_create_validate_stream_for_sink's
-/// DP SST depth search as Linux built on the host runs it (depth_harness.c:
-/// the requested and EDID depths, uncompressed or DSC at each, the first
-/// that fits the maximum link), through `dp_sst_stream` and `dp_depths`.
 fn navi48_dp_sst_depth_search_matches_linux_vectors() -> TestResult {
     let mut checked = 0;
     for line in DEPTH_VECTORS

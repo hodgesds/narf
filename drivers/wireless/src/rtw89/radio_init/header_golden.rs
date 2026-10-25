@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux runtime H2C header SHA256 f37bde18609ef80af6b0e46e6fbcf7ebe9b8aed0b88ad23e0b48ca56f767601b
 type HeaderGolden = (u8,u8,u8,u16,[u8;8]);
 pub(super) const HEADERS: &[HeaderGolden] = &[

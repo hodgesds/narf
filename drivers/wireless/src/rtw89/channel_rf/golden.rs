@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux B RF channel SHA256 ab6e92b44665aa87e12e0e5e0ad8f471795dfc57ba63be5442b0102fc969877a
 pub(super) const CASES: &[(u8,u8,u8,u32,u64)] = &[
 (0,0,0,45,0x19e954b935bdea24),

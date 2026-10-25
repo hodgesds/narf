@@ -18,17 +18,22 @@ regardless — its `build.rs` detects the absence and the affected golden
 replay tests report `Skip` — and the build prints a warning naming the
 regen command below.
 
-Each vendor directory contains an independent Python extractor and provenance
-with complete raw-source hashes. Regeneration requires those exact originals;
-the scripts do not download or silently update their pins:
+The native Rust host tool reads each vendor's explicit provenance pins and
+complete raw-source SHA256 hashes. It does not download originals, update pins,
+harvest reference source, invoke a C compiler or use production driver parsers to
+obtain their own expected results:
 
 ```sh
-python3 verification/data/wifi-firmware/intel/regen.py --check
-python3 verification/data/wifi-firmware/mediatek/regen.py --check
-python3 verification/data/wifi-firmware/realtek/regenerate.py --check
-python3 verification/data/wifi-firmware/qualcomm/regen.py --check
-python3 verification/data/wifi-firmware/broadcom/regen.py --check
+cargo xtask wifi-fixtures check
+cargo xtask wifi-fixtures check --vendor intel,mediatek --source /lib/firmware
+cargo xtask wifi-fixtures write --vendor qualcomm,broadcom --source /lib/firmware
 ```
+
+`check` is read-only. `write` reproduces metadata, factual JSON and Rust data
+literals from those exact pinned originals. `extract` handles one explicit input
+with `--vendor`, `--key`, `--name`, `--input`, `--sha256` and a new `--output`
+directory. Neither structural extraction nor a matching hash grants firmware,
+board, calibration or radio authority.
 
 The kernel tests decode actual captured layouts and compare independently
 observed section extents, versions, API tables, firmware suits and board-name
@@ -104,9 +109,9 @@ PCI or SDIO host/card identity, chip revisions and exact canonical asset keys,
 lengths and SHA256 digests. NVRAM and CLM must be signed even in an unsigned
 developer build. Executable-image development policy remains separate. Encode
 verified deployment records with
-`drivers/wireless/src/brcmfmac/provision/make_manifest.py`, then use the existing
-`pack-firmware` workflow to sign the manifest and selected board assets. The
-generator takes explicit host, board and file facts; it does not discover
+`cargo xtask wifi-fixtures board-manifest --input records.json --output manifest.bin`,
+then use the existing `pack-firmware` workflow to sign the manifest and selected
+board assets. The Rust encoder takes explicit host, board and file facts; it does not discover
 wiring, select a board by filename or create measured calibration. A trusted
 platform must still supply CYW power, clock and reset wiring.
 

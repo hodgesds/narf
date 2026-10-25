@@ -405,7 +405,7 @@ fn smoke_rtw8852b_station_controls_match_linux_and_keep_packet_engines_closed() 
     .enumerate()
     {
         if model.packets[index][8..] != *expected {
-            return TestResult::Fail("B initial command payload differs from original C");
+            return TestResult::Fail("B initial command payload differs from the frozen reference");
         }
     }
     for (ac, expected) in LINUX_EDCA[..4].iter().enumerate() {

@@ -1,4 +1,4 @@
-// Extracted original Linux C. Regenerate with make_linux_oracle.py.
+// Fixed Rust descriptor reference vectors; see REFERENCE.md and provenance.json.
 pub const DESC_BYTES: usize = 96;
 pub const TX_STATUS_OFFSET: usize = 56;
 pub const RX_STATUS_OFFSET: usize = 16;

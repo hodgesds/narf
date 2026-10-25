@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw88/REFERENCE_FIXTURES.md.
 // Original Linux conditional parser, BB/AGC/RF callbacks and direct/SIPI RF accessors.
 const LINUX_PHY_HASHES: [[[u64; 5]; 7]; 7] = [
     [

@@ -422,7 +422,6 @@ mod tests {
         if boot.display_allowed().unwrap() & gated != 0 {
             return TestResult::Fail("display transition allows GFXOFF/gating/deep sleep");
         }
-        // Bits match smu11_driver_if_sienna_cichlid.h (tests/smu11_metrics.c).
         if SMU_GFXOFF != 1 << 20 || SMU_DPM_UCLK != 1 << 3 || SMU_HUB_PG != 3 << 40 {
             return TestResult::Fail("feature bit numbering");
         }

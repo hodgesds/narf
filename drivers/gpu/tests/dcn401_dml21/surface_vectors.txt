@@ -1,7 +1,7 @@
 # Linux DML21 reference vectors for amdgpu_dcn401_dml.rs `admit_all` with
-# GFX12 tiled, DCC and 4:2:0 (NV12, P010) planes; verify with check.sh
-# (harness_surfaces.c, RAISED), regenerate the results from these inputs
-# with check.sh --regenerate-surfaces. Inputs as plane_vectors.txt, each
+# GFX12 tiled, DCC and 4:2:0 (NV12, P010) planes; retained regression snapshot
+# (fixture schema, RAISED); retained policy inputs
+# Retained input grammar follows plane_vectors.txt, each
 # plane followed by: source (0 RGB, 1 dml2_420_8, 2 dml2_420_10), swizzle
 # (0 linear, 1 256B_2D, 2 4KB_2D, 3 64KB_2D, 4 256KB_2D), DCC (1 with
 # independent 64B blocks), rotation (1 and 3 scan vertically) and a 4:2:0

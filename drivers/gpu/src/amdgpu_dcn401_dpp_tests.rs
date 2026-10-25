@@ -5,8 +5,6 @@ mod mpc;
 fn d(p: u8, r: u64) -> u64 {
     BASE + (r + u64::from(p) * 0x16b) * 4
 }
-// Golden native unity RGB register values; offsets/masks are independently
-// asserted against AMD's headers by tests/dcn401_dpp.c.
 const RGB: [(u64, u32); 31] = [
     (0xcd0, 0x24000101),
     (0xccf, 8),

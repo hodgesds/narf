@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux RF callbacks/macros SHA256 196b65ea277cc024e0a2b8721ae58388a3fe237e5810238837178b128f819691
 type RfGolden = (bool,u8,u8,u32,u32,u32,&'static [(u8,u32,u32)]);
 pub(super) const CASES: &[RfGolden] = &[

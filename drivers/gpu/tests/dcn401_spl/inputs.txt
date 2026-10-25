@@ -1,4 +1,4 @@
-# Planes check.sh --generate answers with Linux SPL (vectors.txt):
+# Planes retained for Linux-derived SPL cases (vectors.txt):
 # src_x src_y src_w src_h dst_x dst_y dst_w dst_h stream_w stream_h odm_x odm_w rotation mirror alpha
 # Unscaled full screen, with and without per-pixel alpha.
 0 0 1920 1080 0 0 1920 1080 1920 1080 0 1920 0 0 0

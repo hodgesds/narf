@@ -76,7 +76,7 @@ fn smoke_ath9k_channel_preparation_matches_complete_linux_traces() -> TestResult
         }
         if io.writes.len() != count as usize || hash != expected {
             return TestResult::Fail(
-                "channel mode/synth/slope/spur writes differ from original Linux C",
+                "channel mode/synth/slope/spur writes differ from frozen reference data",
             );
         }
     }

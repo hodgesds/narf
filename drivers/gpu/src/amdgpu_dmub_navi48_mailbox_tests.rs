@@ -1266,9 +1266,6 @@ kernel_test_in!(
     dmub_navi48_fams2_config_matches_dmub_cmd_layout
 );
 
-/// The command lists Linux's dc_dmub_srv_rb_based_fams2_update_config posts
-/// (tests/dcn401_fams2/check.sh, built on the DMUB headers): one line per
-/// case, its inputs, " = ", then each 64-byte command in hex.
 const FAMS2_VECTORS: &str = include_str!("../tests/dcn401_fams2/vectors.txt");
 
 fn dmub_navi48_fams2_config_replays_linux_vectors() -> TestResult {

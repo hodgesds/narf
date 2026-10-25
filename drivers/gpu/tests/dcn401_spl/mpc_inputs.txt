@@ -1,4 +1,4 @@
-# MPC slices (check.sh, MPC set): the inputs.txt fields, then the slice index
+# MPC slices (MPC enabled): the inputs.txt fields, then the slice index
 # and the slice count (resource_get_mpc_slice_index/count).
 # src_x src_y src_w src_h dst_x dst_y dst_w dst_h stream_w stream_h odm_x odm_w rotation mirror alpha mpc_index mpc_count
 0 0 3840 2160 0 0 3840 2160 3840 2160 0 3840 0 0 0 0 2

@@ -497,7 +497,7 @@ kernel_test_in!(
     smoke_rtw89_cancelled_startup_closes_mmio_and_retains_published_command_dma
 );
 
-fn smoke_rtw89_native_runtime_rf_headers_match_original_linux_c() -> TestResult {
+fn smoke_rtw89_native_runtime_rf_headers_match_frozen_references() -> TestResult {
     let mut f = Fixture::new(ChipId::Rtl8852B).unwrap();
     for &(sequence, path, page, length, expected) in HEADERS {
         f.native.runtime_sequence = u16::from(sequence);
@@ -508,7 +508,7 @@ fn smoke_rtw89_native_runtime_rf_headers_match_original_linux_c() -> TestResult 
             || f.native.runtime_sequence != u16::from(sequence) + 1
         {
             return TestResult::Fail(
-                "runtime RF page header/automatic ACK/sequence differs from original C",
+                "runtime RF page header/automatic ACK/sequence differs from the frozen reference",
             );
         }
     }
@@ -530,7 +530,7 @@ fn smoke_rtw89_native_runtime_rf_headers_match_original_linux_c() -> TestResult 
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_native_runtime_rf_headers_match_original_linux_c
+    smoke_rtw89_native_runtime_rf_headers_match_frozen_references
 );
 
 fn smoke_rtw89_native_rf_page_observes_actual_descriptor_body_and_cancel_retention() -> TestResult {

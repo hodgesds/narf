@@ -1,4 +1,4 @@
-# Linux DP SST depth search reference vectors (DCN401 encoder); see check.sh and depth_harness.c.
+# Linux DP SST depth search reference vectors (DCN401 encoder); retained regression snapshot.
 0121019a1b030000001302520f040004 1200000 21515900 3840 3920 2160 2287 8 10 4 30 = FAIL
 0121004d1b02000000130e7112000001 3000000 20397930 7680 7760 4320 4381 8 8 2 30 = FAIL
 012100de1b01000000130ed20d010004 3000000 12542820 3840 3920 2160 2222 12 10 1 30 = FAIL

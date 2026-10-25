@@ -1,4 +1,4 @@
-# Linux DP MST sideband codec and PBN reference vectors; see check.sh.
+# Linux DP MST sideband codec and PBN reference vectors; retained regression snapshot.
 hdr 14 9 0b79fab9813de200 0 1 1 1 1 0 = e90b79fab9813de241c9 1
 hdr 5 4 1425000000000000 1 1 0 0 0 1 = 541425c014 0
 hdr 3 14 c800000000000000 0 1 39 1 0 1 = 3ec8679b 1

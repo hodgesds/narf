@@ -128,8 +128,8 @@ kernel_test_in!(
 );
 
 fn smoke_ath9k_initial_ctl_matches_linux_all_factory_domains() -> TestResult {
-    // The unmodified __ath_regd_init + ath_regd_get_band_ctl compiled from
-    // local Linux produce this oracle over all 65,536 EEPROM identifiers.
+    // Frozen source-cited CTL reference over all 65,536 EEPROM identifiers.
+    // Expected data is independent of this Rust resolver; no compiler runs.
     // Initial region is NL80211_DFS_UNSET; CTL_11G is applied by eeprom_4k.c.
     let mut hash = 0xcbf29ce484222325u64;
     let mut byte = |value: u8| {

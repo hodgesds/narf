@@ -74,14 +74,14 @@ fn run<F: Future>(future: F) -> F::Output {
     }
 }
 
-pub(crate) fn smoke_rtl8188ee_factory_gain_selection_matches_original_linux() -> TestResult {
+pub(crate) fn smoke_rtl8188ee_factory_gain_selection_matches_frozen_reference() -> TestResult {
     for &(channel, mode, nibble, cck, ofdm) in LINUX_POWER {
         let mut factory = factory();
         factory.logical[0xc1] = mode;
         factory.logical[0x1b] = 0x20 | nibble;
         if factory_gains(&factory, channel) != Ok((cck, ofdm)) {
             return TestResult::Fail(
-                "8188EE EFUSE/signed-nibble/PG gain arithmetic differs from original Linux C",
+                "8188EE EFUSE/signed-nibble/PG gain arithmetic differs from frozen reference data",
             );
         }
     }
@@ -100,7 +100,7 @@ pub(crate) fn smoke_rtl8188ee_factory_gain_selection_matches_original_linux() ->
 }
 kernel_test_in!(
     "drivers/wireless/rtlwifi/channel",
-    smoke_rtl8188ee_factory_gain_selection_matches_original_linux
+    smoke_rtl8188ee_factory_gain_selection_matches_frozen_reference
 );
 
 pub(crate) fn smoke_rtl8188ee_signed_power_exact_board_identity_and_rules() -> TestResult {

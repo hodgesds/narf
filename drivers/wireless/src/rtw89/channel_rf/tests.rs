@@ -158,7 +158,7 @@ fn ready<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_b_channel1_rf_synth_matches_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_channel1_rf_synth_matches_frozen_references() -> TestResult {
     for &(seed, lock, busy, count, hash) in CASES {
         let mut io = Model::new(seed, lock, u16::from(busy));
         let mut owner = Channel::default();
@@ -169,14 +169,14 @@ fn smoke_rtw89_b_channel1_rf_synth_matches_original_linux_c() -> TestResult {
             || io.count != count
             || io.hash != hash
         {
-            return TestResult::Fail("B channel1 RF synth/LCK differs from original C");
+            return TestResult::Fail("B channel1 RF synth/LCK differs from the frozen reference");
         }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_channel1_rf_synth_matches_original_linux_c
+    smoke_rtw89_b_channel1_rf_synth_matches_frozen_references
 );
 fn smoke_rtw89_b_rf_synth_fail_cancel_and_lock_deadline_are_terminal() -> TestResult {
     let mut baseline = Model::new(0x5a, 3, 2);

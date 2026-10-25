@@ -76,7 +76,7 @@ impl RadioIo {
             mailbox_cursor: 0,
         }
     }
-    fn oracle() -> Self {
+    fn reference() -> Self {
         let mut io = Self::new();
         io.radio = true;
         for (i, v) in io.base.regs.iter_mut().enumerate() {
@@ -381,9 +381,9 @@ unsafe impl Io for RadioIo {
     }
 }
 fn seeded_dack() -> RadioIo {
-    RadioIo::oracle()
+    RadioIo::reference()
 }
-fn smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_original_c() -> TestResult {
+fn smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_frozen_references() -> TestResult {
     let mut io = seeded_dack();
     let result = narf_scheduler::block_on(dack::calibrate(&mut io));
     if !matches!(
@@ -397,9 +397,9 @@ fn smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_original_c() -> TestRe
     }
     let trace: Vec<_> = io.base.trace.iter().copied().filter(|v| v.0 != 0).collect();
     if trace != LINUX_DACK {
-        return TestResult::Fail("DACK writes/delays diverged from original C");
+        return TestResult::Fail("DACK writes/delays diverged from the frozen reference");
     }
-    let mut io = RadioIo::oracle();
+    let mut io = RadioIo::reference();
     let mut raw = [255; 768];
     raw[0x120..0x126].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
     let trims = core::array::from_fn(|i| 0x21u8.wrapping_add(i as u8 * 7));
@@ -414,9 +414,9 @@ fn smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_original_c() -> TestRe
     }
     let trace: Vec<_> = io.base.trace.iter().copied().filter(|v| v.0 != 0).collect();
     if trace != LINUX_RADIO {
-        return TestResult::Fail("TRX/channel/OTP diverged from original C");
+        return TestResult::Fail("TRX/channel/OTP diverged from the frozen reference");
     }
-    let mut io = RadioIo::oracle();
+    let mut io = RadioIo::reference();
     if radio::gains(&mut io, [36, 32]).is_err() {
         return TestResult::Fail("source response gain plan rejected");
     }
@@ -424,7 +424,7 @@ fn smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_original_c() -> TestRe
     if trace != LINUX_GAIN {
         return TestResult::Fail("native response gain/RRSR plan diverged from source callbacks");
     }
-    let mut io = RadioIo::oracle();
+    let mut io = RadioIo::reference();
     if radio::receive_policy(&mut io).is_err() {
         return TestResult::Fail("source fixed EDCCA rejected");
     }
@@ -456,7 +456,7 @@ fn smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_original_c() -> TestRe
 }
 kernel_test_in!(
     "drivers/wireless/rtw88",
-    smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_original_c
+    smoke_rtw8822ce_radio_dack_channel_trims_and_h2c_match_frozen_references
 );
 fn smoke_rtw8822ce_h2c_native_ring_occupancy_wrap_and_exact_retirement() -> TestResult {
     let mut ring = command::Ring::default();

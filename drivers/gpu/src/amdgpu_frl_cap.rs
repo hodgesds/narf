@@ -7,12 +7,6 @@
 //! packets per line the HPO FRL stream encoder then needs. `dsc_borrow` is
 //! frl_modify_borrow_mode_for_dsc_padding, which hdmi_frl_decide_link_settings
 //! applies to the decided link.
-//!
-//! The arithmetic is Linux's own, operation for operation: IEEE doubles,
-//! with dml_max/dml_min/dml_floor/dml_ceil rounding through 32-bit floats as
-//! dcn_bw_max2/min2/floor2/ceil2 do (the ceiling adding a double 0.99999 to
-//! the float quotient). drivers/gpu/tests/dcn401_frl/check.sh verifies the
-//! reference vectors against the Linux source compiled on the host.
 
 /// TB_BORROWED_MAX, C_FRL_CB, TOLERANCE_FRL_BIT (ppm), ACR_RATE_MAX.
 const TB_BORROWED_MAX: f64 = 400.0;

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux packed MFW/PHY-element types SHA256 1de0bd1d27005d15ba183aefeda4e99e62a43818a18f18eb8a1391934d051382
 pub(super) const HEADER: usize = 32;
 pub(super) const SIZE: usize = 4;

@@ -38,14 +38,11 @@ Verified SHA256:
 - Independently decoded NV12:
   `af4b8817ee41af9585b6687e9969414a065e7f1a673e9204784daaab0820618b`.
 
-The primary ABI comparison is
-`tests/vcn5/hevc_check.py /path/to/mesa-26.2.4 --igt /path/to/igt-gpu-tools-2.4
---ffmpeg /path/to/ffmpeg`. It extracts Mesa's HEVC types and `build_hevc_msg`
-unchanged, checks complete create/decode/destroy message bytes and IGT's unified
-IB descriptors, verifies fixture hashes, independently decodes every pixel,
-and verifies SPS/PPS/IDR fields with FFmpeg `trace_headers`.
-Mesa source provenance is in `research/rdna4-mesa-26.2.4.md`; upstream notices
-are preserved in `VCN-NOTICES`.
+Native Rust tests exercise message/header construction, arena bounds and
+owned submission using these retained assets. Mesa source provenance remains
+in `research/rdna4-mesa-26.2.4.md`; upstream notices remain in `VCN-NOTICES`.
+The former source extraction/compiler comparison is removed, and internal
+fixture agreement does not establish external Mesa conformance.
 
 This single Main8 IDR is a proof input. It does not establish Main10, inter
 prediction, resolution/profile ranges, malformed-stream containment, concurrent
@@ -59,9 +56,7 @@ sessions, application API support or physical acceptance on either die.
 bits. Rebuild the same pinned x265 source with `HIGH_BIT_DEPTH=ON`,
 `MAIN12=OFF`; all other options are unchanged. Run `regenerate.py --main10
 --x265 /path/to/10bit/x265 --ffmpeg /path/to/ffmpeg`. It uses Main10 and QP0,
-then independently decodes yuv420p10le and interleaves/MSB-aligns it to P010.
-No lossless/RExt profile switch is used. `hevc_check.py` accepts the same
-`--main10` option for full primary message/descriptor/pixel/header comparison.
+then independently decodes yuv420p10le and interleaves/MSB-aligns it to P010. No lossless/RExt profile switch is used.
 
 Verified SHA256:
 
@@ -77,41 +72,17 @@ Main10 reuses no Main8 output/context/DPB storage. This companion does not
 establish inter prediction, full Main10/range/application or silicon acceptance;
 HEVC capability rows remain gated.
 
-## Independent surface allocation check
+## Retained surface geometry
 
-`tests/vcn5/hevc_surface_check.py /path/to/mesa-26.2.4 --gpu /path/to/drivers/gpu`
-compiles unchanged Mesa Addrlib with two workers and never opens a GPU.
-The normal `hevc_check.py` invokes it as well; `--surface-build-dir` optionally
-reuses objects keyed by all Addrlib source/header bytes and compiler flags.
-Mesa's unchanged format-helper generators and `si_get_plane_format` derive
-the two actual plane formats/dimensions from `u_format.yaml`. Actual
-`Addr3ComputeSurfaceInfo` and `Addr3ComputeSurfaceAddrFromCoord` then determine
-sample pitches, byte addresses, slice sizes, UV offsets and total target sizes
-for both GFX1200/GFX1201 revision ranges. The resulting surfaces are compared
-to the live Rust message bytes, independently of the fixed-message C reference.
+The reviewed compact linear proof geometry uses128-byte minimum alignment.
+Main8 Y/UV sample pitches are128/64; UV byte offset is16384 and target size
+is24576. Main10 P010 sample pitches are128/64 with256-byte row strides,
+UV offset32768 and target size49152. Pitch counts plane-format elements;
+the interleaved UV width is64. Mesa's general256-byte interoperability policy
+would enlarge Main8 to256/128 sample pitches and32768/49152 offset/size;
+those padded values must not replace the compact proof arena silently.
 
-The proof deliberately uses Addrlib's valid compact 128-byte minimum linear
-alignment. Main8 Y/UV sample pitches are 128/64; the UV byte offset is 16384
-and target size is 24576. Main10 P010 sample pitches are also 128/64, with
-256-byte row strides, UV offset 32768 and target size 49152. Pitch fields
-count plane-format elements, so the interleaved UV width is 64, not 128.
-The harness separately exercises Mesa's general 256-byte interoperability
-pitch policy: that enlarges Main8 rows/offset/size to 256/128 samples,
-32768/49152 bytes, while Main10 stays the same. Those padded surfaces must
-not be silently substituted for the compact proof arena. The original
-incorrect UV128 descriptors fail this surface-derived check.
-
-The generic-message reference also executes unchanged `ac_vcn_dec.c` blocks:
-create/decode headers and index offsets, full generic decode assignments,
-codec branch, tier0 swizzle selection, feedback initialization and final
-buffer/flag assignments. It calls unchanged `stream_type`,
-`calc_ctx_size_hevc`, `ac_vcn_dec_dpb_size`, `ac_vcn_dec_dpb_alignment` and
-`send_cmd`; VCN5 address mode comes from the actual decoder-init switch.
-Host adapters supply only fixture parameters and real Addrlib surface results,
-not expected generic-message fields. Surface heights/sizes/pitches/UV offsets
-are passed as machine-readable output from the independent surface process.
-This verifies tier0 DPB alignment/strides/sizes, hardware-context sizes,
-`db_swizzle_mode`, array mode and all bound-buffer flags without restating
-those expressions in the fixed-message C fixture. Header/source notices are
-preserved in extracted temporary code. Negative mutation checks reject wrong
-DPB swizzle, array mode, missing DPB binding flag, context size and DPB size.
+Rust models exercise actual descriptor, tier0 DPB, context, flags and ownership
+paths. The prior C/C++ Addrlib/shim comparison pipeline is removed. Source
+provenance and these frozen geometry values do not establish physical codec
+execution or selected-userspace conformance.

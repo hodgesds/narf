@@ -3,11 +3,10 @@ use alloc::string::String;
 use core::fmt::Write;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-/// Linux DC's DCN401 pipe acquisition over amdgpu_dm-shaped transactions
-/// (tests/dcn401_pipes: harness.c documents the format).
+/// Retained DCN401 pipe-acquisition transactions derived from Linux DC.
 const VECTORS: &str = include_str!("../tests/dcn401_pipes/vectors.txt");
 
-/// harness.c's dump of a committed state's pool pipes.
+/// A committed state's pool pipes in the retained fixture grammar.
 fn dump(s: &DcState) -> String {
     let mut out = String::from("commit");
     for p in &s.pipes[..usize::from(s.pipe_count)] {
@@ -50,10 +49,10 @@ fn targets(args: &str) -> Option<[(u8, Target); MAX_STREAMS]> {
     Some(out)
 }
 
-/// harness.c's resource_build_scaling_params: SPL on the pipe's slice of
+/// Production SPL on the pipe's slice of
 /// its plane (an RGB plane at its geometry, the slice its
 /// resource_get_odm_slice_src_rect and MPC slice), or true for a plane the
-/// script gave no geometry.
+/// fixture supplies no geometry.
 struct Geometry {
     timing: alloc::collections::BTreeMap<u8, (i32, i32)>,
     planes: alloc::collections::BTreeMap<u8, ([i32; 2], crate::amdgpu_dcn401_spl::Rect)>,
@@ -237,7 +236,7 @@ kernel_test_in!(
 );
 
 /// Linux DC's DCN401 stream-encoder acquisition over add/remove sequences
-/// (tests/dcn401_stream_enc: harness.c documents the format): each
+/// in the retained fixture grammar: each
 /// stream's DIO stream encoder, HPO DP stream encoder, its link's HPO DP
 /// link encoder and its audio endpoint after its OTG master, and their
 /// release; then find_first_free_audio over every acquisition state.

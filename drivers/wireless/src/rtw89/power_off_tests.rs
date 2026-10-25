@@ -1,4 +1,4 @@
-//! Exact Linux C traces plus cancellation/authority fault injection.
+//! Frozen Linux reference traces plus native cancellation/authority fault injection.
 use crate::rtw89::{
     mac::ChipId,
     power::{Calibration, Error, Io, Phase, Power},
@@ -165,7 +165,7 @@ fn smoke_rtw89_power_off_linux_and_retained_lifecycle() -> TestResult {
             || p.phase() != Phase::Off
             || p.io().trace != case.trace
         {
-            return TestResult::Fail("Linux C power-off trace/verified OFF");
+            return TestResult::Fail("frozen power-off trace/verified OFF");
         }
         let operations = p.io().operations;
         for at in 0..operations {

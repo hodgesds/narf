@@ -142,7 +142,7 @@ fn ready<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_b_xtal_shutdown_matches_original_linux_and_real_disable_readback() -> TestResult {
+fn smoke_rtw89_b_xtal_shutdown_matches_frozen_references_and_real_disable_readback() -> TestResult {
     for &(seed, busy, count, hash) in CASES {
         let mut io = Model::new(seed, busy);
         let mut owner = Shutdown::default();
@@ -155,14 +155,16 @@ fn smoke_rtw89_b_xtal_shutdown_matches_original_linux_and_real_disable_readback(
             || io.xtal[128] & 7 != 0
             || io.xtal[129] & 7 != 0
         {
-            return TestResult::Fail("complete B clock/XTAL shutdown differs from original C");
+            return TestResult::Fail(
+                "complete B clock/XTAL shutdown differs from the frozen reference",
+            );
         }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_xtal_shutdown_matches_original_linux_and_real_disable_readback
+    smoke_rtw89_b_xtal_shutdown_matches_frozen_references_and_real_disable_readback
 );
 fn smoke_rtw89_b_xtal_shutdown_error_cancel_busy_and_echo_never_grant_reset() -> TestResult {
     let mut baseline = Model::new(0xa5, 1);

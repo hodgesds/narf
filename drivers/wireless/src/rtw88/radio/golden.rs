@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw88/REFERENCE_FIXTURES.md.
 // Original Linux fresh DACK and TRX/channel/OTP callbacks; writes and delays.
 const LINUX_DACK: &[(u8, u8, u16, u32)] = &[
     (1, 32, 0x1d58, 0xefdeffb),

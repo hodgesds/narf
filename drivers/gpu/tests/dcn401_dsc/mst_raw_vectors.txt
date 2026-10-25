@@ -1,4 +1,4 @@
-# Linux uncompressed MST depth and PBN reference vectors; see check.sh and mst_harness.c.
+# Linux uncompressed MST depth and PBN reference vectors; retained regression snapshot.
 0 16761600 10 12 5868000 2560 2720 1440 1500 3615 = 8 2624 68
 0 8380800 12 12 2415000 2560 2720 1440 1481 1121 = 10 1296 67
 0 2095200 12 9 2415000 2560 2720 1440 1481 65535 = 0 864 179

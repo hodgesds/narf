@@ -1,0 +1,16 @@
+{
+  "source": "Linux mt76_connac_mcu_hw_scan, original packed structures",
+  "c_sha256": "52472fd20bc0a1d744f3eee7a28b7205609e160c479a9da1ec5afa4528e389ec",
+  "h_sha256": "2448b6c145f17397a717965eadf50c591934902f0b09684d37a8b0ae290b31ed",
+  "output_sha256": "ef87e870cf6b76b38ff830990360e21e03295ba3708565e4742741f7bf0365d2",
+  "fixture_bytes": 1186,
+  "power_order_source": "unchanged mt76_connac_mcu_set_rate_txpower with dual-band PHY",
+  "power_order_sha256": "a12871fee210fb8619291eaea194581cbd2531e4b23759d225f6806923f63222",
+  "cases": [
+    "passive",
+    "active wildcard",
+    "four directed binary SSIDs",
+    "39 channels/mixed empty SSIDs"
+  ],
+  "fixture_status": "Fixed source-cited regression data; native Rust tests consume it without reference-source compilation."
+}

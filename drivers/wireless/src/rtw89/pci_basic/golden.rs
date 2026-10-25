@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Linux basic_cfg helper SHA256 960f4904da946af426a86ae5042b1a641899cdda1f5c93694a790085ae13eede
 const CASES:&[Case]=&[
 Case{chip:ChipId::Rtl8852A,generation:1,seed:0,host:false,calibrated:false,trace:&[(16,0x200068,0x10),]},

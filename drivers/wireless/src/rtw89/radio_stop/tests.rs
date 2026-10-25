@@ -87,12 +87,12 @@ fn close(io: &mut Model) -> Result<(), Error> {
     let clock = clocks(io);
     engine.and(clock)
 }
-fn smoke_rtw89_b_terminal_engine_and_clock_controls_match_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_terminal_engine_and_clock_controls_match_frozen_references() -> TestResult {
     for &(seed, count, hash) in CASES {
         let mut io = Model::new(seed);
         if close(&mut io) != Ok(()) || io.writes.len() != count as usize || io.hash() != hash {
             return TestResult::Fail(
-                "B PMAC/NCTL/clock closure differs from original C widths/order",
+                "B PMAC/NCTL/clock closure differs from the frozen width/order reference",
             );
         }
     }
@@ -100,7 +100,7 @@ fn smoke_rtw89_b_terminal_engine_and_clock_controls_match_original_linux_c() -> 
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_terminal_engine_and_clock_controls_match_original_linux_c
+    smoke_rtw89_b_terminal_engine_and_clock_controls_match_frozen_references
 );
 fn smoke_rtw89_b_terminal_closure_continues_after_fault_and_checks_ignored_controls() -> TestResult
 {

@@ -1,5 +1,5 @@
-# drivers/gpu/tests/dcn401_pipes/check.sh --generate: Linux DC's DCN401
-# pipe acquisition over amdgpu_dm-shaped transactions (see harness.c).
+# Retained DCN401 pipe-acquisition fixture derived from Linux DC.
+# pipe acquisition over amdgpu_dm-shaped transactions.
 # One display lit, a second beside it, the first switched off and a third
 # lit beside the second: each new stream's OTG master is the lowest pipe
 # free in both states.

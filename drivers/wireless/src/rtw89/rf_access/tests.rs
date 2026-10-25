@@ -117,7 +117,7 @@ async fn execute(
         unsafe { rf.read(io, path, address, mask).await }
     }
 }
-fn smoke_rtw89_b_rf_transactions_match_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_rf_transactions_match_frozen_references() -> TestResult {
     for &(write, seed, path, address, mask, value, trace) in CASES {
         let mut rf = Rf::default();
         let mut io = Model::new(seed);
@@ -126,7 +126,7 @@ fn smoke_rtw89_b_rf_transactions_match_original_linux_c() -> TestResult {
             || rf.state() != State::Idle
         {
             return TestResult::Fail(
-                "actual B SWSI/direct RF access differs from original Linux C",
+                "actual B SWSI/direct RF access differs from the frozen reference",
             );
         }
     }
@@ -134,7 +134,7 @@ fn smoke_rtw89_b_rf_transactions_match_original_linux_c() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_rf_transactions_match_original_linux_c
+    smoke_rtw89_b_rf_transactions_match_frozen_references
 );
 
 fn smoke_rtw89_b_rf_error_deadline_and_cancellation_never_replay() -> TestResult {

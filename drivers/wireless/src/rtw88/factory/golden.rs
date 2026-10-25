@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw88/REFERENCE_FIXTURES.md.
 // sizeof/offsetof from actual Linux rtw8822c.h and main.h packed declarations.
 const LINUX_FACTORY: &[(usize, usize)] = &[
     (16, 168),

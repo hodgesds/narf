@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux AX DMA/profile expression SHA256 3f09236a98471430ec0bd72fccaa252fc3e4f944eba36ebed00d2556642dc3cd
 const CASES:&[Case]=&[
 Case{chip:ChipId::Rtl8852A,init:0x1000,tx:0x800,rx:0x2000,hci:0x8380,tx_internal:0x1,rx_internal:0x2,io_address:0x1010,io_stop:0x100000,stop_address:0x1010,channels:0x7ff00,wpdma:0x80000,fw:0x40000},

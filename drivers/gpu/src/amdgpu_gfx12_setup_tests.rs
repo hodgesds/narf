@@ -212,7 +212,6 @@ fn gfx12_setup_builds_linux_clearstate_and_preserves_controls() -> TestResult {
             .fold(0xcbf29ce484222325u64, |h, b| {
                 (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
             });
-        // Independently generated from installed Linux tables by gfx12_clearstate.c.
         assert_eq!(hash, 0xb0f45c3e7f714838);
         assert!(e.io.memory[75..].iter().all(|v| *v == 0));
         assert_eq!(run(e.initialize()), Err(Error::Busy));

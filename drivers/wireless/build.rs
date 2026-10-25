@@ -3,7 +3,7 @@
 //!
 //! The golden replay tests under `verification/data/wifi-firmware/`
 //! embed `*.metadata.bin` extracts via `include_bytes!`. Those extracts
-//! are produced by each vendor's `regen.py` from SHA256-pinned vendor
+//! are produced by the native Rust `cargo xtask wifi-fixtures` command from SHA256-pinned vendor
 //! originals under `/lib/firmware`, which are not part of this repo.
 //! The intel and mediatek extracts are committed; the qualcomm and
 //! broadcom extracts were silently dropped by the root `*.bin` gitignore
@@ -71,9 +71,8 @@ fn main() {
             println!(
                 "cargo:warning=narf-drivers-wireless: {label} Wi-Fi golden fixtures absent \
                  (verification/data/wifi-firmware/{dir_name}/*.metadata.bin) — the {label} \
-                 golden replay tests will report Skip. Regenerate with: python3 \
-                 verification/data/wifi-firmware/{dir_name}/regen.py (requires the \
-                 SHA256-pinned vendor originals under /lib/firmware)"
+                 golden replay tests will report Skip. Regenerate with: cargo xtask wifi-fixtures write --vendor {dir_name} \
+                 (requires the SHA256-pinned vendor originals under /lib/firmware)"
             );
         }
     }

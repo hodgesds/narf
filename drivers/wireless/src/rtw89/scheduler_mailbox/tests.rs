@@ -129,7 +129,7 @@ fn ready<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_b_firmware_scheduler_mailbox_matches_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_firmware_scheduler_mailbox_matches_frozen_references() -> TestResult {
     for &(seed, enable, count, hash) in CASES {
         let mut io = Model::new(seed);
         let mut owner = Mailbox::default();
@@ -140,7 +140,7 @@ fn smoke_rtw89_b_firmware_scheduler_mailbox_matches_original_linux_c() -> TestRe
             || io.hash != hash
         {
             return TestResult::Fail(
-                "actual scheduler register messages/counters differ from original C",
+                "actual scheduler register messages/counters differ from the frozen reference",
             );
         }
     }
@@ -148,7 +148,7 @@ fn smoke_rtw89_b_firmware_scheduler_mailbox_matches_original_linux_c() -> TestRe
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_firmware_scheduler_mailbox_matches_original_linux_c
+    smoke_rtw89_b_firmware_scheduler_mailbox_matches_frozen_references
 );
 fn smoke_rtw89_b_scheduler_stale_reply_fault_cancel_and_readback_are_terminal() -> TestResult {
     let mut baseline = Model::new(0);

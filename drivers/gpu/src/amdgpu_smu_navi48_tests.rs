@@ -635,7 +635,6 @@ kernel_test_in!(
 fn put16(b: &mut [u8], at: usize, v: u16) {
     b[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
-/// SmuMetrics_t sample at the offsets checked by tests/smu14_metrics.c.
 fn metrics(gfx_activity: u16, uclk_activity: u16) -> Vec<u8> {
     let mut m = vec![0; METRICS_BYTES];
     for (i, mhz) in [2400u32, 1200, 1258, 2000, 0, 0, 0, 0, 0, 1500, 0]

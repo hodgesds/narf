@@ -1,6 +1,6 @@
 # Linux DML21 reference vectors for amdgpu_dcn401_dml.rs `admit_all` with
 # MPC combine of GFX12 tiled, DCC, rotated and 4:2:0 (NV12, P010) planes;
-# verify with check.sh (harness_surfaces.c, RAISED, MPC_AUTO: DC's auto
+# retained source-derived snapshot (fixture schema, RAISED, MPC_AUTO: DC's auto
 # mpcc_combine_factor). Inputs and results as surface_vectors.txt: primaries
 # (and overlays over or under a 1:1 tiled primary, and beside a second
 # stream) at 1:1, 1.5:1 and 2:1 downscale on three DPPCLK/DISPCLK maximums

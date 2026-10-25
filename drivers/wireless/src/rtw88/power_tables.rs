@@ -2,7 +2,7 @@
 //!
 //! Source: rtw8821c.c, rtw8822b.c, rtw8822c.c trans_* sequences.
 //! Rows retain cut masks; USB/SDIO-only rows are excluded. Numeric fields
-//! were evaluated by compiling the original Linux arrays and definitions.
+//! are retained as fixed Rust constants from those source definitions.
 
 use super::power::Command;
 

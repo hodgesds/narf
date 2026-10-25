@@ -207,7 +207,7 @@ pub(super) fn ready_8821c() -> Owner<Model> {
     owner
 }
 
-fn smoke_rtw8821ce_inactive_mac_matches_original_chip_and_fifo_traces() -> TestResult {
+fn smoke_rtw8821ce_inactive_mac_matches_frozen_referenceship_and_fifo_traces() -> TestResult {
     for (seed, cut, expected) in [(0, 0, LINUX_8821C_MAC_0), (1, 3, LINUX_8821C_MAC_1)] {
         let mut io = Model::new(seed, cut);
         let info = match narf_scheduler::block_on(crate::rtw88::mac::prepare_for(&mut io, 0xc821)) {
@@ -223,7 +223,7 @@ fn smoke_rtw8821ce_inactive_mac_matches_original_chip_and_fifo_traces() -> TestR
             || io.trace.iter().any(|op| op.0 == 1 && op.2 == 0x3fc)
         {
             return TestResult::Fail(
-                "8821C FIFO/chip sequence differs from original C or used a C22 quirk",
+                "8821C FIFO/chip sequence differs from the frozen reference or used a C22 quirk",
             );
         }
     }
@@ -231,7 +231,7 @@ fn smoke_rtw8821ce_inactive_mac_matches_original_chip_and_fifo_traces() -> TestR
 }
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8821c",
-    smoke_rtw8821ce_inactive_mac_matches_original_chip_and_fifo_traces
+    smoke_rtw8821ce_inactive_mac_matches_frozen_referenceship_and_fifo_traces
 );
 
 fn smoke_rtw8821ce_same_firmware_owner_mac_failures_and_no_wrong_phy() -> TestResult {
@@ -326,7 +326,7 @@ pub(super) fn ready() -> Owner<Model> {
     owner.io.trace.clear();
     owner
 }
-fn smoke_rtw8822ce_inactive_mac_matches_actual_linux_fifo_and_chip_setup() -> TestResult {
+fn smoke_rtw8822ce_inactive_mac_matches_frozen_fifo_and_chip_setup() -> TestResult {
     for (word, fields) in LINUX_HW_FEATURES {
         let mut io = Model::new(0, 0);
         io.regs[0x1a0] = 0x19;
@@ -373,7 +373,7 @@ fn smoke_rtw8822ce_inactive_mac_matches_actual_linux_fifo_and_chip_setup() -> Te
 }
 kernel_test_in!(
     "drivers/wireless/rtw88",
-    smoke_rtw8822ce_inactive_mac_matches_actual_linux_fifo_and_chip_setup
+    smoke_rtw8822ce_inactive_mac_matches_frozen_fifo_and_chip_setup
 );
 
 fn smoke_rtw8822ce_same_firmware_owner_mac_continuation_and_every_access_failure() -> TestResult {

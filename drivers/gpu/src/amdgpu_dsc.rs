@@ -1,6 +1,5 @@
 //! Linux's Display Stream Compression decision and configuration for DCN401,
-//! ported to be bit-exact (verified against Linux built on the host, see
-//! `tests/dcn401_dsc/check.sh`):
+//! implemented in Rust with retained static regression fixtures:
 //!
 //! - `DscSinkCaps::parse` is dc_dsc_parse_dsc_dpcd on DPCD 0x060-0x06F and
 //!   the branch decoder caps (0x0A0-0x0A2, zero without a dongle);

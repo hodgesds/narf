@@ -1,4 +1,4 @@
-# Linux SPL reference vectors for amdgpu_dcn401_spl.rs; see check.sh and harness.c.
+# Linux SPL reference vectors for amdgpu_dcn401_spl.rs; retained regression snapshot.
 # src_x src_y src_w src_h dst_x dst_y dst_w dst_h stream_w stream_h odm_x odm_w rotation mirror alpha = writes
 0 0 1920 1080 0 0 1920 1080 1920 1080 0 1920 0 0 0 = OK d19&3303=0 d0a&1=0 d1e&3fff3fff=0 d1f&3fff3fff=4380780 d20&3fff3fff=4380780 d08&7=0 d21&11=0 d22&3f03=3f01 d29&1=0 d28&1=0 d62&7=4 wd62&30=0 d55&ffffa71=0 d62&7=0 5eb&3fff3fff=4380780 5e9&ffffffff=0 5ef&3fff3fff=4380780 5ee&ffffffff=0 5ed&3fff3fff=4380780 5ec&ffffffff=0 5f1&3fff3fff=4380780 5f0&ffffffff=0
 0 0 3840 2160 0 0 3840 2160 3840 2160 0 3840 0 0 1 = OK d19&3303=0 d0a&1=0 d1e&3fff3fff=0 d1f&3fff3fff=8700f00 d20&3fff3fff=8700f00 d08&7=0 d21&11=10 d22&3f03=3f01 d29&1=0 d28&1=0 d62&7=4 wd62&30=0 d55&ffffa71=0 d62&7=0 5eb&3fff3fff=8700f00 5e9&ffffffff=0 5ef&3fff3fff=8700f00 5ee&ffffffff=0 5ed&3fff3fff=8700f00 5ec&ffffffff=0 5f1&3fff3fff=8700f00 5f0&ffffffff=0

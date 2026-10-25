@@ -3,8 +3,6 @@ use super::*;
 use core::fmt::Write as _;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-/// Shared with tests/dcn401_dml21/check.sh, which answers every line
-/// again with Linux DML21 built on the host (harness_pstate.c).
 const VECTORS: &str = include_str!("../tests/dcn401_dml21/pstate_vectors.txt");
 
 struct Inputs {
@@ -335,8 +333,6 @@ kernel_test_in!(
     dcn401_pstate_matches_linux_dml21_vectors
 );
 
-/// pmo_dcn4_fams2_initialize's expanded strategy lists, as
-/// harness_pstate.c --strategies prints them.
 const STRATEGIES: &str = include_str!("../tests/dcn401_dml21/pstate_strategies.txt");
 
 fn dcn401_pstate_strategy_lists_match_linux() -> TestResult {

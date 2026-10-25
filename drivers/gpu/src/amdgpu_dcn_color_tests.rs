@@ -3,10 +3,9 @@ use alloc::string::String;
 use core::fmt::Write;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-/// Linux's output for each input; see tests/dcn401_color/check.sh.
 const VECTORS: &str = include_str!("../tests/dcn401_color/vectors.txt");
 
-/// harness.c's xorshift64 LUT generator, step for step.
+/// Deterministic xorshift64 inputs used by the retained LUT fixtures.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u32 {
@@ -21,7 +20,7 @@ fn ramp(i: u32, n: u32) -> u16 {
     (u64::from(i) * 0xffff / u64::from(n - 1)) as u16
 }
 
-/// harness.c's lut(): see its kinds there.
+/// LUT shapes selected by the retained fixture's kind field.
 fn lut(n: u32, kind: u32, seed: u64) -> Vec<DrmColorLut> {
     let mut rng = Rng(seed.wrapping_mul(2).wrapping_add(1));
     let mut acc = [0u32; 3];
@@ -87,7 +86,7 @@ fn fnv(mut h: u32, w: u32) -> u32 {
     h
 }
 
-/// One gamma vector's output, formatted as harness.c prints it.
+/// One gamma result formatted in the retained vector grammar.
 fn gamma_line(full: bool, n: u32, kind: u32, seed: u64) -> String {
     let l = lut(n, kind, seed);
     let Some(pwl) = regamma_pwl(&l) else {

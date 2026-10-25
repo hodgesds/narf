@@ -162,7 +162,7 @@ fn ready<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_b_channel_bb_signed_gain_and_rpl_match_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_channel_bb_signed_gain_and_rpl_match_frozen_references() -> TestResult {
     for &(seed, rx, flags, count, hash) in CASES {
         let mut io = Model::new(seed, rx);
         let mut owner = Channel::default();
@@ -174,14 +174,16 @@ fn smoke_rtw89_b_channel_bb_signed_gain_and_rpl_match_original_linux_c() -> Test
             || io.count != count
             || io.hash != hash
         {
-            return TestResult::Fail("B channel1 MAC/BB signed gains differ from original Linux C");
+            return TestResult::Fail(
+                "B channel1 MAC/BB signed gains differ from the frozen reference",
+            );
         }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_channel_bb_signed_gain_and_rpl_match_original_linux_c
+    smoke_rtw89_b_channel_bb_signed_gain_and_rpl_match_frozen_references
 );
 fn smoke_rtw89_b_channel_bb_error_cancel_and_readback_keep_attempt_terminal() -> TestResult {
     let (g, c) = inputs(3);

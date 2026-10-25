@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw88/REFERENCE_FIXTURES.md.
 // Original Linux C21 parser, callbacks, SIPI accessor and phy_set_param prefix.
 const LINUX_C21_HASHES: [[[[u64; 5]; 4]; 2]; 7] = [
     [

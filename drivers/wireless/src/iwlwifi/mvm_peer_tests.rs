@@ -454,7 +454,7 @@ kernel_test_in!(
 );
 
 fn smoke_iwl_mvm_disabled_peer_linux_packed_body_and_captured_api() -> TestResult {
-    // Full output of mvm_peer_linux_oracle.py compiled against Linux sta.h.
+    // Fixed 48-byte wire vector; historical reference: Linux firmware sta.h.
     const LINUX_ADD: [u8; 48] = [
         0, 0, 255, 255, 0, 0, 0, 0, 2, 4, 6, 8, 10, 12, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 16, 0, 2,
         60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,

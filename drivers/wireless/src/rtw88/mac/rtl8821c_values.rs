@@ -1,4 +1,5 @@
-// Evaluated from current Linux rtw88 headers and rtw8821c.c.
+// Frozen reference data; source provenance is recorded in this file and rtw88/REFERENCE_FIXTURES.md.
+// Frozen constants from Linux rtw88 headers and rtw8821c.c.
 pub const BIT_APP_PHYSTS: u32 = 0x10000000;
 pub const BIT_AUTO_INIT_LLT: u32 = 0x10000;
 pub const BIT_AUTO_INIT_LLT_V1: u32 = 0x1;

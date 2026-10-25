@@ -22,7 +22,7 @@ fn measurements(results: &[Path; 2]) -> [[u16; 8]; 2] {
         ]
     })
 }
-fn smoke_rtw89_b_dpk_both_paths_after_tssi_match_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_dpk_both_paths_after_tssi_match_frozen_references() -> TestResult {
     for &(seed, cut, gain, count, hash, result) in CASES {
         let (tssi, mut model) = source::fixture_with_seed(seed);
         model.reset_trace();
@@ -36,7 +36,7 @@ fn smoke_rtw89_b_dpk_both_paths_after_tssi_match_original_linux_c() -> TestResul
             || model.kind.is_some()
         {
             return TestResult::Fail(
-                "two-path DPK NCTL/AGC/IDL/restoration differs from original C after full TSSI",
+                "two-path DPK NCTL/AGC/IDL/restoration differs from the frozen post-TSSI reference",
             );
         }
     }
@@ -44,10 +44,10 @@ fn smoke_rtw89_b_dpk_both_paths_after_tssi_match_original_linux_c() -> TestResul
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_dpk_both_paths_after_tssi_match_original_linux_c
+    smoke_rtw89_b_dpk_both_paths_after_tssi_match_frozen_references
 );
 
-fn smoke_rtw89_b_dpk_digital_gain_complete_domain_matches_original_c() -> TestResult {
+fn smoke_rtw89_b_dpk_digital_gain_complete_domain_matches_frozen_references() -> TestResult {
     let mut hash = 14695981039346656037u64;
     for value in 0..4096 {
         for byte in u32::from(dgain_offset(value) as u8).to_le_bytes() {
@@ -56,13 +56,15 @@ fn smoke_rtw89_b_dpk_digital_gain_complete_domain_matches_original_c() -> TestRe
         }
     }
     if hash != DGAIN_HASH {
-        return TestResult::Fail("complete12-bit signed DPK gain mapping differs from original C");
+        return TestResult::Fail(
+            "complete12-bit signed DPK gain mapping differs from the frozen reference",
+        );
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_dpk_digital_gain_complete_domain_matches_original_c
+    smoke_rtw89_b_dpk_digital_gain_complete_domain_matches_frozen_references
 );
 
 fn smoke_rtw89_b_dpk_failed_sync_nctl_ignored_controls_and_current_epoch_no_result() -> TestResult {

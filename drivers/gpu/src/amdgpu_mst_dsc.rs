@@ -1,6 +1,6 @@
 //! amdgpu_dm's MST DSC fairness search (amdgpu_dm_mst_types.c), ported to
-//! be bit-exact against Linux built on the host (tests/dcn401_dsc/check.sh,
-//! mst_harness.c): `compute_link` is compute_mst_dsc_configs_for_link with
+//! run directly in Rust with retained regression fixtures:
+//! `compute_link` is compute_mst_dsc_configs_for_link with
 //! increase_dsc_bpp, try_disable_dsc and set_dsc_configs_from_fairness_vars;
 //! PBN from kbps_to_peak_pbn, the time slots drm_dp_atomic_find_time_slots
 //! gives them and drm_dp_mst_atomic_check's slot and path limits.

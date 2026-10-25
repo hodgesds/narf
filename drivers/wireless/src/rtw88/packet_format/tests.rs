@@ -11,7 +11,7 @@ pub(crate) fn frame(length: usize, management: bool) -> alloc::vec::Vec<u8> {
     frame[22..24].copy_from_slice(&[0xc0, 0xab]);
     frame
 }
-fn smoke_rtw8822ce_packet_geometry_and_original_pci_tx() -> TestResult {
+fn smoke_rtw8822ce_packet_geometry_and_reference_pci_tx() -> TestResult {
     if LINUX_GEOMETRY != [40, TX_BD, RX_DESC, RX_BD] {
         return TestResult::Fail("native packet geometry differs");
     }
@@ -22,7 +22,7 @@ fn smoke_rtw8822ce_packet_geometry_and_original_pci_tx() -> TestResult {
         };
         for (index, value) in expected.into_iter().enumerate() {
             if word(&actual, index * 4) != value {
-                return TestResult::Fail("packet TXD differs from original C");
+                return TestResult::Fail("packet TXD differs from the frozen reference");
             }
         }
         if queue
@@ -39,13 +39,13 @@ fn smoke_rtw8822ce_packet_geometry_and_original_pci_tx() -> TestResult {
         };
         for (index, value) in bd.into_iter().enumerate() {
             if word(&actual, index * 4) != value {
-                return TestResult::Fail("PCI TXBD differs from original C");
+                return TestResult::Fail("PCI TXBD differs from the frozen reference");
             }
         }
     }
     TestResult::Pass
 }
-fn smoke_rtw8822ce_raw_rx_and_ccx_original_c() -> TestResult {
+fn smoke_rtw8822ce_raw_rx_and_ccx_reference_vectors() -> TestResult {
     for &(words, start, length, c2h, decrypted) in RX_CASES {
         let mut descriptor = [0; RX_DESC];
         for (index, value) in words.into_iter().enumerate() {
@@ -63,7 +63,7 @@ fn smoke_rtw8822ce_raw_rx_and_ccx_original_c() -> TestResult {
                 rate: 11,
             })
         {
-            return TestResult::Fail("RX envelope differs from original C");
+            return TestResult::Fail("RX envelope differs from the frozen reference");
         }
     }
     for &(id, sequence, status, expected, ack) in REPORT_CASES {
@@ -83,7 +83,7 @@ fn smoke_rtw8822ce_raw_rx_and_ccx_original_c() -> TestResult {
                 acknowledged: ack,
             }))
         {
-            return TestResult::Fail("CCX result differs from original C");
+            return TestResult::Fail("CCX result differs from the frozen reference");
         }
     }
     TestResult::Pass
@@ -151,11 +151,11 @@ fn smoke_rtw8822ce_packet_metadata_extent_and_profile_refusals() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw88/packet",
-    smoke_rtw8822ce_packet_geometry_and_original_pci_tx
+    smoke_rtw8822ce_packet_geometry_and_reference_pci_tx
 );
 kernel_test_in!(
     "drivers/wireless/rtw88/packet",
-    smoke_rtw8822ce_raw_rx_and_ccx_original_c
+    smoke_rtw8822ce_raw_rx_and_ccx_reference_vectors
 );
 kernel_test_in!(
     "drivers/wireless/rtw88/packet",

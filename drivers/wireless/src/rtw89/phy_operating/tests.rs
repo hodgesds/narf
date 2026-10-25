@@ -130,7 +130,7 @@ fn identity(cut: u8, xtal: u8) -> Identity {
         .identity()
         .unwrap()
 }
-fn smoke_rtw8852b_static_phy_operating_matches_original_c_cut_and_crystal() -> TestResult {
+fn smoke_rtw8852b_static_phy_operating_matches_frozen_references_cut_and_crystal() -> TestResult {
     for &(seed, cut, xtal, count, hash, caps) in CASES {
         let mut model = Model::new(seed);
         let mut operating = Operating::default();
@@ -141,7 +141,9 @@ fn smoke_rtw8852b_static_phy_operating_matches_original_c_cut_and_crystal() -> T
             || model.count != count
             || model.hash != hash
         {
-            return TestResult::Fail("B static PHYSTS/DIG/CFO/EDCCA writes differ from original C");
+            return TestResult::Fail(
+                "B static PHYSTS/DIG/CFO/EDCCA writes differ from the frozen reference",
+            );
         }
         let Some(state) = operating.working() else {
             return TestResult::Fail("source static PHY preparation lacks retained state");
@@ -165,7 +167,7 @@ fn smoke_rtw8852b_static_phy_operating_matches_original_c_cut_and_crystal() -> T
 }
 kernel_test_in!(
     "drivers/wireless/rtw89/radio",
-    smoke_rtw8852b_static_phy_operating_matches_original_c_cut_and_crystal
+    smoke_rtw8852b_static_phy_operating_matches_frozen_references_cut_and_crystal
 );
 fn smoke_rtw8852b_static_phy_current_policy_ignored_writes_and_cancel_fail_closed() -> TestResult {
     let id = identity(1, 0x33);

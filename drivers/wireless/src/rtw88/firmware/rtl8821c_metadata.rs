@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw88/REFERENCE_FIXTURES.md.
 // Metadata only from raw rtw88/rtw8821c_fw.bin; no executable payload.
 const SOURCE_8821C_SHA256: &str =
     "2ef409bc418549fcf294061dd0cae1fc22fd9da79b60524950b25de18732f3f0";

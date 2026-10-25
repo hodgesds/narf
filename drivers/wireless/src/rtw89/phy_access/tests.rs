@@ -174,7 +174,7 @@ fn once<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_pcie_phy_and_dbi_match_linux_traces() -> TestResult {
+fn smoke_rtw89_pcie_phy_and_dbi_match_reference_traces() -> TestResult {
     for c in CASES {
         let mut owner = Access::default();
         let mut m = Model::new(c.seed);
@@ -205,7 +205,7 @@ fn smoke_rtw89_pcie_phy_and_dbi_match_linux_traces() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_pcie_phy_and_dbi_match_linux_traces
+    smoke_rtw89_pcie_phy_and_dbi_match_reference_traces
 );
 
 fn smoke_rtw89_pcie_phy_cancel_timeout_gone_and_unknown_request() -> TestResult {

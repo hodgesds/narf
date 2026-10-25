@@ -2,9 +2,9 @@ use super::*;
 use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-// FNV1a over all recognized tuples from the extracted Linux C recognizers,
-// normalized to all-zero for unrecognized/erased selections. Regenerate with
-// secure/make_linux_oracle.py; this oracle does not call the Rust decoder.
+// Frozen FNV1a digests over the captured physical-fuse recognition tuples,
+// with unrecognized/erased selections normalized to zero. The Rust decoder
+// is checked against stored data; see REFERENCE_FIXTURES.md.
 include!("secure/golden.rs");
 
 fn smoke_rtw89_all_physical_secure_selections() -> TestResult {
@@ -43,7 +43,7 @@ fn smoke_rtw89_all_physical_secure_selections() -> TestResult {
         }
     }
     if hash != LINUX_FUSE_HASH || unknown != LINUX_UNKNOWN_FUSES {
-        return TestResult::Fail("exhaustive Linux physical fuse oracle");
+        return TestResult::Fail("frozen exhaustive physical-fuse reference");
     }
     if Fuses::decode(ChipId::Rtl8922A, 255, 255) != Err(Error::UnsupportedChip) {
         return TestResult::Fail("BE interpreted as AX secure fuses");

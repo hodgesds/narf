@@ -1,4 +1,4 @@
-// Extracted complete original Linux C; no Rust encoder is used.
+// Extracted complete frozen reference data; no Rust encoder is used.
 pub const MAC_CASES: &[(u8,u32,u32,u64)] = &[
 (0,0x00000000,8,0xe1eaad46ce470766),
 (0,0x5a93a5c3,8,0x429f0948b7a0cf3b),

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Copyright(c) 2019-2020 Realtek Corporation
 // Original Linux table/selector SHA256 53113ca7eac616b71d8c3adcb604d698eb35a327d9d7f104aad3580bd93ba934
 pub(super) const CASES: &[(usize,u8,u8,u32,u64,bool)] = &[

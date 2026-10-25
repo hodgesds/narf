@@ -300,7 +300,7 @@ fn flatten(results: &Results) -> Vec<u32> {
     ]);
     out
 }
-fn smoke_rtw8852b_full_iqk_two_paths_matches_original_linux_dynamic_results() -> TestResult {
+fn smoke_rtw8852b_full_iqk_two_paths_matches_frozen_dynamic_references() -> TestResult {
     for &(seed, scenario, count, hash, measurements) in CASES {
         let mut model = Model::new(seed, scenario);
         let mut iqk = Iqk::default();
@@ -320,7 +320,7 @@ fn smoke_rtw8852b_full_iqk_two_paths_matches_original_linux_dynamic_results() ->
             || !model.ended
         {
             return TestResult::Fail(
-                "full B IQK dynamic LO/TX/RX/restore sequence differs from original C",
+                "full B IQK dynamic LO/TX/RX/restore sequence differs from the frozen reference",
             );
         }
         let expected_attempts = if matches!(scenario, 1 | 2) { 3 } else { 1 };
@@ -347,7 +347,7 @@ fn smoke_rtw8852b_full_iqk_two_paths_matches_original_linux_dynamic_results() ->
 }
 kernel_test_in!(
     "drivers/wireless/rtw89/radio",
-    smoke_rtw8852b_full_iqk_two_paths_matches_original_linux_dynamic_results
+    smoke_rtw8852b_full_iqk_two_paths_matches_frozen_dynamic_references
 );
 
 fn smoke_rtw8852b_iqk_poll_failure_current_admission_and_cancel_are_terminal() -> TestResult {

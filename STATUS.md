@@ -67,6 +67,15 @@ software work. No off-box radio, DHCP or AP interoperability has been demonstrat
 
 ## Wi-Fi family software bring-up
 
+Wi-Fi and GPU now maintain native Rust implementations and validation. The
+ad-hoc Python/C reference-compilation, source-extraction and temporary Rust
+comparison harnesses have been removed. Hardware tables and fixed source-cited
+fixtures remain reviewed data; Rust tests exercise actual production functions,
+wire contracts, boundaries and failure/ownership behavior. Historical source
+hashes do not assert current Linux/Mesa equivalence or physical acceptance.
+Essential Wi-Fi metadata extraction and board-manifest encoding use the native
+`cargo xtask wifi-fixtures` command, without reference-source compilation.
+
 All eleven in-tree families are covered by the current audit and dependency
 ledger in `drivers/wireless/specification/spec.md` and its family documents.
 The branch target is **all eleven Wi-Fi families with all hardware/firmware
@@ -126,9 +135,10 @@ The combined selected Wi-Fi/shared-fixture QEMU gates pass 1736 / 0 fail / 9 ski
 on x86_64 and 1273 / 0 fail / 3 skip on aarch64, with clean production boots
 and btrfs postflights. Scoped cross-architecture Clippy and changed-package
 formatting pass; default release and debug kernels build on both architectures.
-Independent Linux C and actual production-Rust oracles cover the queue and
-v5 power ABIs, active scan requests/power ordering, native A-MSDU conversion,
-C21 factory/MAC/PHY tables and D11AC codec. The second wave adds 31 passing
+Native Rust tests cover the queue and v5 power ABIs, active scan requests/power
+ordering, bounded A-MSDU conversion and C21 factory/MAC/PHY behavior using fixed
+reference data and explicit ownership invariants. D11AC coverage uses exhaustive
+geometry/round-trip checks and literal channel/sideband cases. The second wave adds 31 passing
 smokes on each architecture, including native control-credit policy changes,
 partial aggregation/replay cleanup and retained C21 DMA ownership. The payload catalog
 now contains 45 profiles across all eleven families, including the actual
@@ -220,7 +230,7 @@ cleared hardware keys and 32-bit non-EDMA packet rings into shared MLME,
 RSNA/CCMP, a retained Device and the actual kernel DHCP client. Open/WPA2
 conversations check exact IP, native M4 bytes/receipt, genuine RX-idle fencing,
 publication/close races, current policy, factory RF-silent GPIO and retained
-DMA after terminal failure. Seventy-two original C TX descriptors, ten RX
+DMA after terminal failure. Seventy-two fixed Rust TX descriptor vectors, ten RX
 status vectors and ten MAC traces independently check native formats.
 The initial channel1/basic1Mbps profile is polled, awake and terminal on
 disconnect; wider PHY, IRQ mode and reset/rejoin remain separate.
@@ -673,8 +683,8 @@ The same paths now cover the whole RX 9000 family: any AMD display function
 whose discovery reports GC 12.0.1 (Navi48: 9070/9070 XT/9070 GRE, AI PRO
 R9700) or GC 12.0.0 (Navi44: 9060 XT/9060) binds by discovery, with Linux's
 per-die firmware (including kicker boards), external revision, RAS, DCC-width
-and pipe-harvesting differences (`amdgpu_rdna4`, checked against Linux by
-`drivers/gpu/tests/rdna4_family/check.sh`). Model-tested on Navi44 and
+and pipe-harvesting differences (`amdgpu_rdna4`, covered by native Rust
+identity/discovery and fixed wire/register fixtures). Model-tested on Navi44 and
 harvested Navi48 profiles only; no Navi44 board has run it.
 
 The `codex/rx9000-completion` follow-up retains and publishes the VCN firmware
@@ -718,9 +728,8 @@ HDMI transport is an explicit admission input. Zero-stream release lowers
 DTBCLK, DISPCLK and DPPCLK, while optional DAL responses follow Linux's
 sent-timeout policy with retained failure ownership. Suspend gates/drains
 presenter and cursor pins, retires all display streams, and retains incomplete
-transitions through caller cancellation and rollback. An opt-in
-`cargo xtask gpu-reference` command checks primary harnesses against an
-explicit clean Linux Git revision. KMS preparation now snapshots exact targets,
+transitions through caller cancellation and rollback. Native Rust kernel tests exercise retained owners and reviewed reference data;
+there is no extracted-source C compilation or temporary Rust comparison gate. KMS preparation now snapshots exact targets,
 reclaims idle BOs without evicting another target, and rechecks master/identity
 before pinning. Per-card placement admission covers allocation, submission,
 transfer and reset; stale or cancelled transfers retain their staging/backing
@@ -2006,7 +2015,7 @@ These were software-tested foundations. User command submission, media
 submission, display-aware DPM gating and DCN3.0 modesetting have since landed
 (register and fake-engine models only); GDDR6 training resume, VCN dynamic
 power gating (DPG) and any hardware boot remain open. See the
-[PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram). The native path now follows Linux's global order end to end (model-tested over one combined register fake, failure/cancellation per step), retires a live GOP stream like `dcn30_init_hw`, enables OPTC/OTG clocks, lights DP SST (native-AUX 8b/10b training with fallback, DP DTO, MSA/VSC) on any of the six pipes/routes, and quarantines underflows black. HPD/HPD_RX now arrive over the IH ring (DCE src 9) and wake the display monitor, with polling kept as the fallback. A host-side Linux conformance gate (`drivers/gpu/tools/navi22-conformance.sh`) checks about 2.5k annotated Navi22 constants against the exact Linux headers and discovery segments. It also checks NARF's firmware parsers against Linux's parsing of the real blobs. The DP link layer now follows Linux DC (`amdgpu_dcn30_dp_link`): capabilities with LTTPR transparent/non-transparent modes per the VBIOS DCE_INFO bits, TPS3/TPS4 by sink capability, adjust and post-LT adjust requests, destructive link verification with Linux's fallback order, the least verified link per stream, and DP modes in KMS bounded by the verified link; the monitor tears an unplugged display down without AUX, re-detects on HPD changes (dark connectors keep their EDID inventory), and retrains on HPD-RX/polled link loss. Register/AUX models only.
+[PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram). The native path now follows Linux's global order end to end (model-tested over one combined register fake, failure/cancellation per step), retires a live GOP stream like `dcn30_init_hw`, enables OPTC/OTG clocks, lights DP SST (native-AUX 8b/10b training with fallback, DP DTO, MSA/VSC) on any of the six pipes/routes, and quarantines underflows black. HPD/HPD_RX now arrive over the IH ring (DCE src 9) and wake the display monitor, with polling kept as the fallback. Native Rust tests check documented Navi22 identity, register/discovery, firmware-layout and ownership contracts using fixed reference inputs. Historical source citations remain provenance rather than an executable Linux-conformance claim. The DP link layer now follows Linux DC (`amdgpu_dcn30_dp_link`): capabilities with LTTPR transparent/non-transparent modes per the VBIOS DCE_INFO bits, TPS3/TPS4 by sink capability, adjust and post-LT adjust requests, destructive link verification with Linux's fallback order, the least verified link per stream, and DP modes in KMS bounded by the verified link; the monitor tears an unplugged display down without AUX, re-detects on HPD changes (dark connectors keep their EDID inventory), and retrains on HPD-RX/polled link loss. Register/AUX models only.
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix
    HawkPoint1; exercise native AMDGPU modeset, keyboard and touchpad,

@@ -177,7 +177,7 @@ fn ready<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw8852b_firmware_phycap_and_shared_mailbox_match_original_linux() -> TestResult {
+fn smoke_rtw8852b_firmware_phycap_and_shared_mailbox_match_frozen_references() -> TestResult {
     for &(seed, words, expected, count, hash) in CASES {
         let mut model = Model::new(seed, words);
         let mut mailbox = Mailbox::default();
@@ -197,7 +197,7 @@ fn smoke_rtw8852b_firmware_phycap_and_shared_mailbox_match_original_linux() -> T
             || !model.requested
         {
             return TestResult::Fail(
-                "AX PHY_CAP part0 header/decoded NSS/antenna/diversity differs from original C",
+                "AX PHY_CAP part0 header/decoded NSS/antenna/diversity differs from the frozen reference",
             );
         }
         let admits = matches!(words[1] as u8, 0 | 2)
@@ -222,7 +222,7 @@ fn smoke_rtw8852b_firmware_phycap_and_shared_mailbox_match_original_linux() -> T
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw8852b_firmware_phycap_and_shared_mailbox_match_original_linux
+    smoke_rtw8852b_firmware_phycap_and_shared_mailbox_match_frozen_references
 );
 
 fn smoke_rtw8852b_phycap_fresh_full_reply_consumption_and_current_epoch_required() -> TestResult {

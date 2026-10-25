@@ -15,7 +15,7 @@ fn frame(length: usize, group: bool) -> Vec<u8> {
     bytes[22..24].copy_from_slice(&[0x30, 0]);
     bytes
 }
-fn check_tx_descriptor_matches_original_linux() -> Result<(), &'static str> {
+fn check_tx_descriptor_matches_frozen_reference() -> Result<(), &'static str> {
     if BYTES != DESC_BYTES || TX_STATUS_OFFSET != 14 * 4 || RX_STATUS_OFFSET != 4 * 4 {
         return Err("native descriptor geometry differs");
     }
@@ -204,8 +204,8 @@ fn check_raw_rx_profile_fcs_and_decrypt_admission() -> Result<(), &'static str> 
     Ok(())
 }
 
-fn smoke_ar9285_tx_descriptor_matches_original_linux() -> TestResult {
-    match check_tx_descriptor_matches_original_linux() {
+fn smoke_ar9285_tx_descriptor_matches_frozen_reference() -> TestResult {
+    match check_tx_descriptor_matches_frozen_reference() {
         Ok(()) => TestResult::Pass,
         Err(reason) => TestResult::Fail(reason),
     }
@@ -234,7 +234,7 @@ fn smoke_ar9285_raw_rx_profile_fcs_and_decrypt_admission() -> TestResult {
 
 kernel_test_in!(
     "drivers/wireless/ath9k/descriptor",
-    smoke_ar9285_tx_descriptor_matches_original_linux
+    smoke_ar9285_tx_descriptor_matches_frozen_reference
 );
 
 kernel_test_in!(

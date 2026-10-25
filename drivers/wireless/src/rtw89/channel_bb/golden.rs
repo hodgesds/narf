@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux B MAC/BB channel SHA256 9db851307f0d9ca5386f8136cf80a6edfb872a92ade90a4f539646a767494dbd
 pub(super) const CASES: &[(u8,u8,u8,u32,u64)] = &[
 (0,0,0,64,0xdefdc72f6bc5cadd),

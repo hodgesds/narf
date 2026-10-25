@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Linux pci.c extracted helper SHA256 433e2f9c32db3af230f51051a6960813823aad2a0dcc764a164101ce525f206d
 const CASES:&[Case]=&[
 Case{operation:0,address:0x0,speed:0,seed:0,result:0x0,trace:&[(8,0x10a0,0x0),(16,0x10a0,0x0),(16,0x10a0,0x200),]},

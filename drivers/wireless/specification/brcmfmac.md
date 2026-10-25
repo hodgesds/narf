@@ -115,7 +115,8 @@ Keys have no empty, dot or parent components; asset keys within one row differ.
 The manifest's SHA256 is independent of the registry's historically named
 `BlobView.sha256` field, which contains BLAKE3.
 
-`src/brcmfmac/provision/make_manifest.py input.json output.bin` encodes explicit
+`cargo xtask wifi-fixtures board-manifest --input input.json --output output.bin`
+encodes explicit
 board facts and hashes actual payload files. Input records supply family, board,
 revision mask, full host identity, SDIO card tuple when applicable and ordered
 asset key/path/signed entries. `wrapped:true` explicitly strips an existing NRFW
@@ -123,7 +124,7 @@ envelope before hashing; paths otherwise denote raw payloads. Sign/package the
 output with `cargo xtask pack-firmware --payload ... --name
 brcm/wifi-board-selection-v1.bin --signature ... --public-key ... --out ...` and
 stage that manifest plus exactly named assets through the existing firmware loader.
-The tool supplies no board default or signer authority; `--fixtures` emits only
+The tool supplies no board default or signer authority; `--synthetic-fixture` emits only
 synthetic private test identities.
 
 Selected source caps and exact copied bytes remain pinned across boot/runtime.
@@ -251,8 +252,8 @@ Wider AP BSS records decode their primary from center/sideband and require any
 reported ctl_ch to agree; 6 GHz/4.9 GHz numeric aliases, malformed widths and
 band mismatches fail. The facade splits genuine allowed channels into separate
 wiphy bands; HT/VHT metadata and wider operating widths are not inferred.
-The original Linux C codec oracle covers 43 encodings and 473 admitted primary
-layouts. Native shared5/6 models compose Open/WPA2, firmware station power save,
+Native Rust tests check the 43-channel inventory, exhaustive 16-bit geometry
+invariants, band/control consistency and literal wide-channel examples. Native shared5/6 models compose Open/WPA2, firmware station power save,
 DHCP and exact bidirectional IP on channels36/149, and validate bandwidth caps,
 wire values, NO_IR/passive discovery and restrictive-overlap rejection.
 
@@ -370,7 +371,7 @@ authorization events keep the port closed and published DMA retained. These
 are composition checks: no fixture firmware/NVRAM is registered for deployment
 and no actual board calibration or hardware interoperability is inferred.
 
-Independent Python `struct`/`hashlib` NBSP literals also feed actual Ed25519
+Fixed independently reviewed NBSP wire literals also feed actual Ed25519
 NRFW installation, registry lookup/invocation, SHA256 matching and pinned source
 caps. Regressions reject wrong host BDF/subsystem/F1 identity, chip revision,
 unsigned manifest/NVRAM/CLM, wrong hashes/lengths, missing selected keys, malformed

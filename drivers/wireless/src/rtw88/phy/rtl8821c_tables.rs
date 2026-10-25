@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Original Linux C21 conditional parser; regenerate with make_8821c_tables.py.
+// Frozen RTL8821C PCIe table selections from Linux phy.c/rtw8821c_table.c.
 const TABLE_0: &[(u16, u32)] = &[
     (0x10, 0x43),
     (0x25, 0x1d),

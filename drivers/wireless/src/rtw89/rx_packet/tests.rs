@@ -16,7 +16,7 @@ pub(super) fn packet(kind: u8, payload: &[u8], long: bool, driver: usize) -> Vec
     bytes[offset..].copy_from_slice(payload);
     bytes
 }
-fn smoke_rtw89_rx_metadata_matches_original_linux_c() -> TestResult {
+fn smoke_rtw89_rx_metadata_matches_frozen_references() -> TestResult {
     for &(input, expected) in RXD {
         let mut bytes = vec![0; 128];
         for (offset, value) in [4, 8, 16].into_iter().zip(input) {
@@ -33,7 +33,7 @@ fn smoke_rtw89_rx_metadata_matches_original_linux_c() -> TestResult {
             actual.icv_error as u32,
         ];
         if values != expected {
-            return TestResult::Fail("AX RXD layout differs from original Linux C");
+            return TestResult::Fail("AX RXD layout differs from the frozen reference");
         }
     }
     for &(words, expected) in C2H {
@@ -48,7 +48,7 @@ fn smoke_rtw89_rx_metadata_matches_original_linux_c() -> TestResult {
             parsed.bytes.len() as u16,
         ] != expected
         {
-            return TestResult::Fail("C2H envelope differs from original Linux C");
+            return TestResult::Fail("C2H envelope differs from the frozen reference");
         }
     }
     for &(word, expected) in RPP {
@@ -61,14 +61,14 @@ fn smoke_rtw89_rx_metadata_matches_original_linux_c() -> TestResult {
             parsed.mac_id as u16,
         ] != expected
         {
-            return TestResult::Fail("RPQ identity/channel differs from original Linux C");
+            return TestResult::Fail("RPQ identity/channel differs from the frozen reference");
         }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_rx_metadata_matches_original_linux_c
+    smoke_rtw89_rx_metadata_matches_frozen_references
 );
 
 fn smoke_rtw89_rx_segment_fcs_report_and_ack_boundaries() -> TestResult {

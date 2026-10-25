@@ -188,62 +188,38 @@ endianness/checksum/version validation and invalid/busy hardware cases.
 Independent hashes from Linux cover every address/value pair for all four
 production INI choices; fixtures also verify PLL/RF values, analog delays,
 BAR bounds and that packet/PHY engines stay disabled.
-Complete modal/RF write traces match independently compiled local Linux
-`eeprom_4k.c` functions and register/EEPROM definitions for four EEPROM,
-modal-version, HT40 and diversity cases. Native MMIO tests revoke an actual
-object-table epoch before deliberately invalid BAR addresses, proving no
-post-revocation read/write occurs.
-Detector fixtures compare every register write with independently compiled
-Linux `eeprom.c` interpolation and `eeprom_4k.c` table-programming functions.
-They cover one/two gains, exact/interpolated/clamped frequency piers, legacy
-overlap sourcing, invalid calibration without partial table publication, and
-the actual INI/modal/detector/rate preparation chain with PHY and DMA disabled.
-Rate fixtures compile the complete Linux target-power and 4K TX-power
-generators and compare every rate-register value across exact/interpolated/
-clamped piers, CTL flags, specific/world regulatory groups, antenna gain and
-zero ceiling. All 65,536 EEPROM identifiers match an independent native C
-initial-CTL oracle. Actual object-table revocation before invalid native
-register addresses prevents rate publication; refusal during programming
-stops later writes.
-The reproducible `phy/rates/make_linux_oracle.py` and
-`make_regulatory_oracle.py` retain complete native C functions, generated
-artifacts and source/function SHA256 provenance; `phy/rates/ORACLE.md`
-documents usage and all nine rate cases. They compare existing literals and
-exhaustive hashes without rewriting expected values.
-They do not prove RF or packet operation.
+Native Rust tests exercise production modal/RF, detector, rate, channel,
+calibration, MAC and packet owners using fixed reference data and explicit
+hardware/protocol invariants. Rust tables and provenance retain source citations;
+no reference source is extracted or compiled for validation, and no temporary
+Rust comparison adapter is generated.
 
-Thirty-two original Linux C calibration traces cover XE2 identity, high-power
-PA skip, carrier-leakage retry, inherited registers and correlation sign.
-Thirty-five separate original IQ vectors preserve signed division/clipping,
-unsigned intermediate wrap and full-width measurement values. Native models
-cover every register access loss, withheld AGC/NF/IQ completion, ten dropped
-wait points, overlapping policy limits and actual capability revocation before
-invalid MMIO. Report publication leaves packet engines and bus mastering
-closed. The source/function hashes and reproducible generator are in
-`calibration/`; these are software/model proofs, not measured RF acceptance.
+Rate cases cover exact/interpolated/clamped target piers, CTL flags,
+specific/world regulatory groups, antenna gain and zero ceiling. All 65,536
+EEPROM identities exercise the shared factory resolver. Register models check
+actual capability revocation before invalid MMIO and stop later writes on access
+loss. Thirty-two calibration traces and 35 IQ vectors cover XE2 identity,
+high-power PA skip, carrier-leakage retry, inherited state, signed clipping and
+wrapping intermediates. Withheld completions, cancellation and policy overlap
+keep packet engines and bus mastering closed.
 
-The complete override/channel/chain/RF/synth/delta-slope/spur write sequence
-matches 48 independently compiled original Linux C cases: channels1/6/13,
-eight signed spur offsets (including both strict boundaries) and zero/nonzero
-inherited registers. The packed EEPROM spur offset is obtained from the native
-C type, not a Rust layout. Exact legacy Viterbi packing, including repeated
-indices, is retained. Invalid channels fail before register access; access loss
-at every write and absent registers stop publication. Revoked native authority
-is checked before an invalid MMIO address. The reproducible
-`phy/channel/make_linux_oracle.py` records source/function SHA256 provenance
-and writes only to an explicitly selected or temporary output directory.
-Production currently invokes this sequence only for the inactive2412MHz
-reference after full INI setup; it does not implement fast retuning.
+Forty-eight channel cases cover channels 1/6/13, eight signed spur offsets and
+zero/nonzero inherited state, including Viterbi packing and boundary rejection.
+Production still invokes this sequence only for the inactive 2412 MHz reference;
+fast retuning remains open. Descriptor tests retain 72 TX vectors, ten RX-status
+vectors and ten MAC/PCU/queue/DMA traces. They check complete extents, status,
+current authority and terminal storage ownership independently of caller buffers.
 
-Original Linux C additionally supplies 72 legacy TX descriptor vectors,
-ten RX-status vectors and ten complete MAC/PCU/queue/DMA write traces over
-zero and inherited registers. Native models check completion/status order,
-ring recycling, authority loss, publication failure and retained stop storage.
-The shared AP fixture consumes actual published descriptor/DMA bytes and
-produces real RX descriptors. Device conversations run Open and WPA2 through
-the actual kernel DHCP client and exact bidirectional IP, with held, modified
-and cancelled M4, entropy/peer deadlines, policy restriction and concurrent
-disconnect/publication cases. Fixture assets cannot authorize real hardware.
+The shared AP consumes actual descriptor/DMA bytes and produces RX descriptors.
+Device conversations run Open/WPA2 through the real kernel DHCP client and exact
+bidirectional IP, including held/modified/cancelled M4, entropy/peer deadlines,
+policy restriction and concurrent disconnect/publication. Fixture assets cannot
+authorize real hardware.
+
+Adjacent `REFERENCE.md` files document fixed-vector coverage and update rules.
+Review fixture values independently against the documented contract. These
+software/model checks supply no physical calibration, RF, IRQ or interoperability
+measurements.
 
 ## 8. Remaining software and physical acceptance
 

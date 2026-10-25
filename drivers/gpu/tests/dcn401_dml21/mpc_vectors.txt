@@ -1,5 +1,5 @@
 # Linux DML21 reference vectors for amdgpu_dcn401_dml.rs `admit_all` with
-# MPC combine; verify with check.sh (harness_planes.c, RAISED, MPC_AUTO:
+# MPC combine; retained regression snapshot (fixture schema, RAISED, MPC_AUTO:
 # mpcc_combine_factor auto, as DC leaves it for DCN401). Inputs and results
 # as plane_vectors.txt: scaled primaries and overlays whose single DPP would
 # need more than the DPPCLK maximum or whose swath the line buffer cannot

@@ -64,8 +64,7 @@ fn config(
         cursors: 0,
     }
 }
-/// `drivers/gpu/tests/navi22_dml30/vectors.txt`: Linux's own DCN3.0 DML,
-/// compiled on the host by `check.sh`, run on each configuration.
+/// Retained DCN3.0 DML regression snapshot with original Linux provenance.
 const VECTORS: &str = include_str!("../tests/navi22_dml30/vectors.txt");
 
 /// One vector line's configuration: the SoC and its streams.
@@ -106,7 +105,7 @@ fn vector_inputs(fields: &[u32]) -> Option<(Soc, Vec<Stream>)> {
     Some((soc, streams))
 }
 
-/// The harness's PLAN tokens for `plan`, in its order (see harness.c).
+/// The retained fixture's PLAN tokens for `plan`, in their serialized order.
 fn observed_joint(plan: &JointPlan) -> Vec<u32> {
     let w = &plan.hubbub;
     let mut out = alloc::vec![

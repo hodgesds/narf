@@ -17,7 +17,7 @@ fn hash(trace: &[(u8, u8, u16, u32)]) -> u64 {
             (0, 32) => 0,
             (1, 32) => 1,
             (8, 0) => 2,
-            _ => panic!("non-PHY callback in table oracle"),
+            _ => panic!("non-PHY callback in table reference"),
         };
         for byte in core::iter::once(kind)
             .chain(u32::from(reg).to_le_bytes())
@@ -43,7 +43,7 @@ fn mac_ready() -> Owner<Model> {
     owner.io.trace.clear();
     owner
 }
-fn smoke_rtw8822ce_phy_callbacks_match_original_linux_all_cut_rfe_profiles() -> TestResult {
+fn smoke_rtw8822ce_phy_callbacks_match_frozen_references_all_cut_rfe_profiles() -> TestResult {
     for (cut, rfes) in LINUX_PHY_HASHES.iter().enumerate() {
         for (rfe, kinds) in rfes.iter().enumerate() {
             for (kind, expected) in kinds.iter().enumerate() {
@@ -61,7 +61,7 @@ fn smoke_rtw8822ce_phy_callbacks_match_original_linux_all_cut_rfe_profiles() -> 
                     || hash(&io.trace) != *expected
                 {
                     return TestResult::Fail(
-                        "native BB/AGC/RFK/RF callbacks diverged from original C accessors",
+                        "native BB/AGC/RFK/RF callbacks diverged from the frozen callback references",
                     );
                 }
             }
@@ -71,7 +71,7 @@ fn smoke_rtw8822ce_phy_callbacks_match_original_linux_all_cut_rfe_profiles() -> 
 }
 kernel_test_in!(
     "drivers/wireless/rtw88",
-    smoke_rtw8822ce_phy_callbacks_match_original_linux_all_cut_rfe_profiles
+    smoke_rtw8822ce_phy_callbacks_match_frozen_references_all_cut_rfe_profiles
 );
 fn smoke_rtw8822ce_same_owner_phy_tables_hold_mac_dma_closed_and_reject_replay() -> TestResult {
     let mut owner = mac_ready();

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux EFUSE type SHA256 67a5ef20d967e3760fbeaf0db5367a99b97fd606a50da39563b7246cdb73653a
 pub const A_RFE_TYPE: usize = 0x2ca;
 pub const A_XTAL_K: usize = 0x2b9;

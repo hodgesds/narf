@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux RTL8852B IQK SHA256 6521eb327d2a867125e53f81f5a9737cc90fddef608e0246d6fca3807510b8b3
 type Golden = (u8, u8, u32, u64, &'static [u32]);
 pub(super) const CASES: &[Golden] = &[

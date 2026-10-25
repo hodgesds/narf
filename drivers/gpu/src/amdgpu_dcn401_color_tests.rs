@@ -1,6 +1,4 @@
-//! Register-level model tests of the DCN401 CRTC color programming. The
-//! native offsets are written out here rather than borrowed from the driver
-//! (tests/dcn401_color_regs.c checks them against dcn_4_1_0).
+//! Register-level model tests of the DCN401 CRTC color programming.
 use super::*;
 use crate::amdgpu_dcn401_otg::tests::{engine, run, Fake};
 use alloc::vec::Vec;

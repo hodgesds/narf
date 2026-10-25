@@ -30,19 +30,11 @@
 - Which GPU class is realistic as NARF's first real graphics target.
 - Presentation / KMS equivalent in a capability OS with no-root model.
 
-## Reproducing Linux reference checks
+## Validation scope
 
-The RX 9000 completion work uses upstream Linux `v7.3-rc4`, commit
-`93f51579e7df248780214094418f205253383cc5`. All 27 existing Linux comparison
-harnesses pass against a clean Git checkout at that revision. Source archive
-comparisons do not establish this Git provenance.
-
-```sh
-cargo xtask gpu-reference --linux-tree /path/to/linux \
-    --linux-revision 93f51579e7df248780214094418f205253383cc5
-```
-
-The runner verifies the revision and checkout cleanliness before and after each
-harness. Keep generated files outside the Linux tree. These source comparisons
-complement the separate Mesa/Addrlib/codec checks and native execution tests;
-they do not establish physical board or application acceptance.
+RX9000 source review used Linux `v7.3-rc4`, commit
+`93f51579e7df248780214094418f205253383cc5`. The in-tree extraction/compiler
+comparison workflow is removed. Native Rust tests exercise production driver
+paths using retained static fixtures and models; external source conformance,
+actual selected-userspace compatibility and physical board acceptance remain
+separate requirements. See `../tests/README.md` for fixture provenance and limits.

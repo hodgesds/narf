@@ -11,7 +11,7 @@ fn frame(length: usize, management: bool) -> Vec<u8> {
     bytes[22..24].copy_from_slice(&0x1230u16.to_le_bytes());
     bytes
 }
-fn smoke_rtw89_b_packet_full_wd_info_matches_extracted_linux_c() -> TestResult {
+fn smoke_rtw89_b_packet_full_wd_info_matches_frozen_references() -> TestResult {
     for (index, expected) in HEADERS.iter().enumerate() {
         let bytes = frame(if index < 2 { 100 } else { 2304 }, index & 1 != 0);
         let result = transmit(
@@ -28,7 +28,7 @@ fn smoke_rtw89_b_packet_full_wd_info_matches_extracted_linux_c() -> TestResult {
         );
         if result.as_ref().map(|(bytes, _)| bytes.as_slice()) != Ok(expected.as_slice()) {
             return TestResult::Fail(
-                "B full body/info/WP/address-info differs from extracted Linux C",
+                "B full body/info/WP/address-info differs from the frozen reference",
             );
         }
     }
@@ -39,7 +39,7 @@ fn smoke_rtw89_b_packet_full_wd_info_matches_extracted_linux_c() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_packet_full_wd_info_matches_extracted_linux_c
+    smoke_rtw89_b_packet_full_wd_info_matches_frozen_references
 );
 
 fn smoke_rtw89_b_packet_raw_ccmp_extents_and_36bit_limits() -> TestResult {

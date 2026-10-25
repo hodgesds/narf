@@ -1,4 +1,4 @@
-//! Device-side 88EE BB/RF model and original Linux trace comparison.
+//! Native Rust 88EE BB/RF model, fixed reference traces and ownership checks.
 use super::*;
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
@@ -285,7 +285,7 @@ fn run<F: Future>(future: F) -> F::Output {
     }
 }
 
-pub(super) fn smoke_rtl8188ee_radio_matches_original_linux_trace_and_iq_matrix() -> TestResult {
+pub(super) fn smoke_rtl8188ee_radio_matches_frozen_reference_trace_and_iq_matrix() -> TestResult {
     let port = Port::new(Mode::Stable);
     let drops = Arc::new(AtomicUsize::new(0));
     let mut owner = prepared(port.clone(), drops.clone());
@@ -353,7 +353,7 @@ pub(super) fn smoke_rtl8188ee_radio_matches_original_linux_trace_and_iq_matrix()
 }
 kernel_test_in!(
     "drivers/wireless/rtlwifi/radio",
-    smoke_rtl8188ee_radio_matches_original_linux_trace_and_iq_matrix
+    smoke_rtl8188ee_radio_matches_frozen_reference_trace_and_iq_matrix
 );
 
 pub(super) fn smoke_rtl8188ee_radio_bad_measurements_and_access_failure_are_terminal() -> TestResult

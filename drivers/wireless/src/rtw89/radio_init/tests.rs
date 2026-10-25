@@ -199,7 +199,7 @@ fn ready<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_b_table_power_reset_rf_upload_and_nctl_match_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_table_power_reset_rf_upload_and_nctl_match_frozen_references() -> TestResult {
     for &(seed, rfe, cut, count, hash, nctl_count, nctl_hash, unsupported) in CASES {
         let (mut io, qualified, assets) = Model::setup(seed, rfe, cut);
         let mut owner = Init::default();
@@ -225,7 +225,7 @@ fn smoke_rtw89_b_table_power_reset_rf_upload_and_nctl_match_original_linux_c() -
             || io.hash != hash
         {
             return TestResult::Fail(
-                "full B BB/power/reset/RF page stream differs from original Linux C",
+                "full B BB/power/reset/RF page stream differs from the frozen reference",
             );
         }
         io.clear_trace();
@@ -234,14 +234,16 @@ fn smoke_rtw89_b_table_power_reset_rf_upload_and_nctl_match_original_linux_c() -
             || io.count != nctl_count
             || io.hash != nctl_hash
         {
-            return TestResult::Fail("B NCTL pre-init/table stream differs from original Linux C");
+            return TestResult::Fail(
+                "B NCTL pre-init/table stream differs from the frozen reference",
+            );
         }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_table_power_reset_rf_upload_and_nctl_match_original_linux_c
+    smoke_rtw89_b_table_power_reset_rf_upload_and_nctl_match_frozen_references
 );
 fn smoke_rtw89_b_table_failures_cancel_and_ignored_critical_writes_never_replay() -> TestResult {
     let (mut io, q, assets) = Model::setup(0, 1, 0);
@@ -347,11 +349,11 @@ kernel_test_in!(
 );
 
 include!("control_golden.rs");
-fn smoke_rtw89_b_bb_hardware_controls_match_original_linux_and_retain_bases() -> TestResult {
+fn smoke_rtw89_b_bb_hardware_controls_match_frozen_references_and_retain_bases() -> TestResult {
     for &(seed, count, hash, bases) in CONTROLS {
         let mut io = Model::new(seed, 1, 1);
         if controls(&mut io) != Ok(bases) || io.count != count || io.hash != hash {
-            return TestResult::Fail("B bb_sethw/MACID/RPL differs from original Linux C");
+            return TestResult::Fail("B bb_sethw/MACID/RPL differs from the frozen reference");
         }
         let operations = io.operations.len();
         for failed in 0..operations {
@@ -375,5 +377,5 @@ fn smoke_rtw89_b_bb_hardware_controls_match_original_linux_and_retain_bases() ->
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_bb_hardware_controls_match_original_linux_and_retain_bases
+    smoke_rtw89_b_bb_hardware_controls_match_frozen_references_and_retain_bases
 );

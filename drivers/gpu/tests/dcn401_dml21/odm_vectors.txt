@@ -1,8 +1,8 @@
 # Linux DML21 reference vectors for amdgpu_dcn401_dml.rs `admit_all` with
 # ODM combine (dml2_odm_mode_auto, dynamic ODM off): DP RGB streams whose
 # pixel clock outruns one pipe's DISPCLK, alone and beside other streams, on
-# boards with lower and lower DISPCLK maximums. Verify with check.sh
-# (harness_multi.c). Same format as multi_vectors.txt; a plane DML puts on
+# boards with lower and lower DISPCLK maximums. Retained regression snapshot
+# (fixture schema). Same format as multi_vectors.txt; a plane DML puts on
 # two pipes ends with "/2 <the second pipe's refcyc_h_blank_end>", and
 # "! Unsupported odm" means Linux plans a stream on three or four pipes.
 1564000 1564000 2500000 2500000 1250000 2000000 2000000 1200000 16 1 2217600 3840 4000 48 32 2160 2310 3 5 3840 = 562500 562500 558088 153014 950000 1250000 1250000 1200000 149 1000 409 597 224 2 147 9232 23088 84 0 11 1 1 11821 524288 524288 92 92 0 32767 2842 0 360 2850 14 5910 5910 8 8 139 2764 2114 20139 139 389 139 139 139 149 149 149 512 512 60 16 1 192 32 5000000 15 10 5 54 /4 24 45 67

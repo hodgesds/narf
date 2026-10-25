@@ -42,6 +42,17 @@ build orchestration (`build/`), release sign-off (`process/`).
 
 ## 3. Test taxonomy
 
+Wi-Fi and GPU implementations and maintained validation execute native Rust.
+They do not extract Linux/Mesa C functions, compile C shims, slice Rust source
+into temporary adapters, or invoke Python/compiler wrappers for comparisons.
+Fixed source-cited reference vectors and required hardware tables remain reviewed
+data. Native tests exercise production APIs with literal wire cases, property
+and boundary checks, register/transport models, failure/cancellation and ownership
+invariants. Expected results must not be regenerated from the implementation
+under test. Historical fixture provenance identifies sources; it is not an active
+source-equivalence proof. Real hardware and external userspace interoperability
+remain separate acceptance work.
+
 The affected-plan outputs and full-run fallback rules are specified in
 `build/specification/spec.md` §3. Secondary large-memory, xAPIC, virtio-mmio,
 and user-mode configurations run when their inputs are affected or the plan
@@ -108,12 +119,12 @@ including cancellation while an async operation owns the driver. The shared
 raw BSS observer checks bounded original RSN/RSNX/rate/channel/peer facts before
 driver-specific profile admission; it grants no radio or transmit authority.
 AR9285 channel/calibration, RTL8188EE radio/channel/power and RTW89 PCI basic,
-cold/factory and TX-only download owners additionally compare native
-register/delay or numeric results against extracted original Linux C functions.
+cold/factory and TX-only download owners compare native register/delay or
+numeric results with fixed Rust reference vectors and explicit invariants.
 AR9285 includes 32 calibration traces and 35 signed/wrapping IQ vectors;
 RTL8188EE checks its actual ring-register map independently of the generic
 8192EE scaffolds. Native packet/stop models check ownership, width and current
-authority. AR9285 adds 72 original C TX descriptors, ten RX-status vectors and
+authority. AR9285 retains 72 fixed TX descriptor vectors, ten RX-status vectors and
 ten complete MAC traces. RTL8822CE factory/OTP/feature/MAC/PHY-table and signed
 board-power checks cover actual retained continuations; RTL8852B checks
 post-WCPU MAC, 36-bit RXBD/RPQ/C2H, RF-v1 and conditional table selection.
@@ -125,8 +136,8 @@ the same public Device and actual kernel DHCP client. Open/WPA2 fixtures
 consume published DMA and verify exact bidirectional IP. Held, altered and
 cancelled M4, queued peer loss, current policy and actual calibration-epoch
 revocation between descriptor write and doorbell close the controlled port.
-Its independently extracted original C fixtures check TXD/BD/RXD/CCX,
-calibration, source non-QoS DCF and mailbox fields.
+Fixed Rust reference vectors check TXD/BD/RXD/CCX, calibration, non-QoS DCF
+and mailbox fields alongside actual DMA/receipt and ownership assertions.
 
 Signed FullMAC board-selection fixtures bind exact PCI/SDIO host/card facts
 and actual asset SHA256 before CR4/CM3 upload, then compose the selected
@@ -144,7 +155,7 @@ RTL8852B adds the exact source controller and fresh native packet core through
 the public Device and actual kernel DHCP for Open/WPA2, exact bidirectional IP,
 held/altered/cancelled M4, queued peer loss and terminal disconnect/rekey cases.
 This controller/packet fixture cannot create a production full-radio grant.
-Independent original-C and composed RF models execute the actual retained
+Native Rust RF models exercise the actual retained
 channel/BB/trim/RXDCK/IQK/TSSI/DPK/power owners on the same register backing;
 faults, current epoch loss and cancelled real PMAC waits cannot publish Ready.
 Actual PHY-capability mailbox replies, source awake status, measured v2 peaks
@@ -157,10 +168,13 @@ evidence does not establish real firmware instruction execution or RF acceptance
 `narf_wifi_fixtures::firmware::metadata_replay(image_len, fragments)` builds
 parser-only structural images up to 16 MiB. It validates nonempty, ordered,
 nonoverlapping fragment extents before allocation and zeroes every opaque gap.
-The independent extractors in `verification/data/wifi-firmware` pin complete
-raw-source SHA256 hashes and preserve headers/TLV geometry, version/API facts,
-section addresses and board-name metadata. Their generated expectations are
-independent of production Rust encoders. Kernel smokes feed these images only
+The native Rust `cargo xtask wifi-fixtures` tool reads explicit SHA256-pinned
+vendor blobs and retains structural headers/TLV geometry, version/API facts,
+section addresses and board-name metadata. Its host parsers are independent of
+production driver parsers and do not harvest or compile reference source.
+`check` verifies existing data; `write` reproduces it without silently updating
+source pins; `extract` requires an explicit format, input, name, hash and new
+output directory. Kernel smokes feed these images only
 to parsers, never a firmware registry, board-calibration authority or hardware
 loader. Passing proves layout handling; signatures, instructions and RF/board
 acceptance require original authenticated assets and physical validation.

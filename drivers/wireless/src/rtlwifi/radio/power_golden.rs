@@ -1,4 +1,4 @@
-// Executed original Linux hw.c/phy.c/rf.c EFUSE/PG gain arithmetic.
+// Fixed EFUSE/PG gain references; historical sources: Linux hw.c/phy.c/rf.c.
 type LinuxPowerCase = (u8, u8, u8, [u8; 4], [u8; 8]);
 const LINUX_POWER: &[LinuxPowerCase] = &[
     (1, 0, 0, [36, 30, 34, 32], [29, 28, 27, 26, 25, 24, 22, 22]),

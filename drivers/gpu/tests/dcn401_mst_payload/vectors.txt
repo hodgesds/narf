@@ -1,4 +1,4 @@
-# Linux DP MST payload table reference vectors; see check.sh.
+# Linux DP MST payload table reference vectors; retained regression snapshot.
 seq l 6480000 a1146 a1008 a1125 a1111 = 77=E28 68=E28 75=E28 75=E28 | -
 seq l 77368000 a547 a2496 r1 a253 a2451 r1 r2 a522 r1 a235 r1 a331 = 4=w1.1.4m1.547 14=w2.5.14m2.2496 m1.0w1.1.0 2=w1.15.2m1.253 14=w3.17.14m3.2451 m1.0w1.15.0 m2.0w2.1.0 3=w1.15.3m1.522 m1.0w1.15.0 2=w1.15.2m1.235 m1.0w1.15.0 2=w1.15.2m1.331 | 3@1+14,1@15+2
 seq u 38684000 a101 a4305 r1 = 2=w1.0.2m1.101 49=w2.2.49m2.4305 m1.0w1.0.0 | 2@0+49

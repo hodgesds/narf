@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw88/REFERENCE_FIXTURES.md.
 // Original Linux MAC/FIFO functions through an explicitly inactive bus adapter.
 const LINUX_8821C_MAC_0: &[(u8, u8, u16, u32)] = &[
     (0, 32, 0xf0, 0x0),

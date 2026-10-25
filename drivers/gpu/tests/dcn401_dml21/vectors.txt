@@ -1,4 +1,4 @@
-# Linux DML21 reference vectors for amdgpu_dcn401_dml.rs; verify with check.sh.
+# Linux DML21 reference vectors for amdgpu_dcn401_dml.rs; retained regression snapshot.
 # Inputs (kHz unless noted): pclk hact htotal hfp hsync vact vtotal vfp vsync
 #   dcfclk_min dcfclk_max fclk_min fclk_max uclk dispclk_max dppclk_max socclk
 #   umc_channels pitch_px. DENTIST VCO 4500 MHz, DCHUB reference 50 MHz.

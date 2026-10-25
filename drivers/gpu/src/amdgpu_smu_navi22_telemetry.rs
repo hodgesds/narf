@@ -1,10 +1,5 @@
 //! Discrete RDNA2 PMFW telemetry decoding: SMU11 (sienna_cichlid family) `SmuMetricsExternal_t` and the thermal/fan/power limits of
-//! the uploaded `PPTable_t`. Layouts come from Linux
-//! smu11_driver_if_sienna_cichlid.h (checked by tests/smu11_metrics.c); the
-//! decoding follows sienna_cichlid_ppt.c (`get_smu_metrics_data`,
-//! `get_throttler_status_locked`, `get_thermal_temperature_range`,
-//! `get_power_limit`) and smu_v11_0.c (`get_gfx_vdd`, `get_fan_speed_pwm`).
-//! Pure parsing; the retained SMU owner performs every transfer.
+//! the uploaded `PPTable_t`. Pure parsing; the retained SMU owner performs every transfer.
 
 /// `TABLE_SMU_METRICS`, `sizeof(SmuMetricsExternal_t)`.
 pub(crate) const METRICS_TABLE: u32 = 5; // linux: TABLE_SMU_METRICS

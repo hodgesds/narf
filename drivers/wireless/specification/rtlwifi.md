@@ -118,9 +118,8 @@ OWN/EOR). Exact Linux `_rtl88ee_llt_table_init` uses boundary0xab/max-page0xaf;
 all seven queue bases and RX base use the 8188EE register map: BCN308, HIGH310,
 MGMT318, VO320, VI328, BE330, BK338 and RX340. The retained owner uses explicit
 EE-only constants, independent of the inactive generic8192EE scaffolds.
-An oracle compiles actual EE `reg.h` definitions in `hw.c::init_mac` publication
-order; the native device model also resolves those independently generated
-addresses. The former8192EE base publication is a rejected packet-admission
+Fixed Rust EE-specific register vectors record the documented publication
+order; the native device model checks those addresses and register widths. The former8192EE base publication is a rejected packet-admission
 regression. No 8192EE TXBD
 count registers or aliased queue bases are used. BME stays off, PCIe DMA byte
 0x301 stays0xff, CR packet gates and both interrupt masks remain closed.
@@ -167,9 +166,8 @@ commits `RadioConfigured` plus `radio_report()` only after all operations and
 final parked-gate checks succeed. Every native register still executes under
 current PCI authority with BME off. PCIe DMA0x301 staysff, CR packet gates and
 both interrupt masks stay closed; error, cancellation and Drop retain all
-published mappings. Repeated configuration does no I/O. An independent C oracle
-executes original Linux calibration functions; the register/RF model checks its
-complete write/delay trace, signed matrix, HP variant, factory negatives,
+published mappings. Repeated configuration does no I/O. Native Rust tests compare the register/RF owner with fixed source-cited
+write/delay reference traces, signed matrix, HP variant, factory negatives,
 transaction failures and cancellation at RF/IQK/LCK waits.
 
 `RadioConfigured` remains below full MAC operational configuration, active
@@ -182,7 +180,7 @@ the initial legacy1T20 profile on channels1–11. PathA factory gains come from
 all six CCK bases, five BW40 bases and signed OFDM nibbles; per-rate PG groups
 follow the EEPROM regulatory mode. Erased gains or signed arithmetic outside
 the hardware range fail before I/O instead of selecting defaults or wrapping.
-The original Linux EFUSE/PG functions independently generate192 numeric cases.
+There are 192 fixed Rust numeric EFUSE/PG reference cases.
 The driver does not use Linux's scan turbo, HT rates or thermal gain boosts.
 
 Raw gain indices and Linux's index-to-dBm reporting estimate do not establish
@@ -248,9 +246,8 @@ publication, along with its exact queue, slot, serial, length and address.
 The host copies through the actual retained DMA mapping and preserves DW10's
 linked-next pointer. Terminal OWN clear is checked against stable descriptor
 identity, and the delivery carries bytes read from that retained payload.
-This is terminal host/DMA delivery, not an AP acknowledgement. Independent C
-receipts execute original Linux descriptor setters and `rtl88ee_tx_polling`;
-the device model reacts to actual published descriptors/body, including ring
+This is terminal host/DMA delivery, not an AP acknowledgement. Fixed Rust packet/reference vectors describe descriptor fields and polling
+contracts; the native device model reacts to actual published descriptors/body, including ring
 wrap. It does not complete from a saved encoder/source byte vector.
 
 RX reads OWN-cleared32-byte descriptors, checks retained DW6 address/high-word,
@@ -319,9 +316,8 @@ four rotating boxes and actual byte lanes, extension before inline; only
 demonstrated command IDs/body lengths are accepted. Command cancellation, stale
 authority, radio-off, timeout or readback failure installs terminal failure
 before awaiting. The reserved body stays retained for the firmware claim;
-beacon OWN clearing is not invented as its receipt. Independent oracles execute
-the original EE C mailbox/reserved-body/command-descriptor functions and check
-actual model MMIO/DMA, rather than comparing caller source buffers.
+beacon OWN clearing is not invented as its receipt. Native Rust tests check fixed mailbox/reserved-body/command-descriptor vectors
+and actual model MMIO/DMA, rather than comparing caller source buffers.
 
 WPA2-PSK/CCMP supplies original AP RSNE/RSNXE and fallible fresh entropy to
 shared RSNA/software CCMP. M4 must reach the exact terminal host receipt with

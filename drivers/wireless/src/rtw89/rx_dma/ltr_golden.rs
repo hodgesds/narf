@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux LTR callback/macros SHA256 f02e9687c42be6fba75345fce6c80a9c5d2e9d2312817bdb5f0e00a582efd094
 type LtrGolden = (bool,u8,&'static [(u32,u32)]);
 pub(super) const LTR: &[LtrGolden] = &[

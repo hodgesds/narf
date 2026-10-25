@@ -24,9 +24,7 @@
 //! never be selected (they need row bytes at least the row trip time); only
 //! cases 2 and 4 remain and are written out below. Everything else is the
 //! Linux formula, in checked fixed point, with Linux's own truncations at the
-//! register boundary (`(unsigned int)` casts floor). Reference vectors come
-//! from Linux's own DML compiled on the host
-//! (`drivers/gpu/tests/navi22_dml30/check.sh`).
+//! register boundary (`(unsigned int)` casts floor).
 use crate::{
     amdgpu_dml::{
         ceil_multiple, log2_floor, ClockState, Config, Error, Fx, Geometry, Prefetch, Watermarks,

@@ -150,7 +150,7 @@ fn ready<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_b_wlan_only_pta_matches_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_wlan_only_pta_matches_frozen_references() -> TestResult {
     for &(seed, rfe, count, hash) in CASES {
         let mut io = Model::new(seed);
         let mut owner = Coex::default();
@@ -161,7 +161,9 @@ fn smoke_rtw89_b_wlan_only_pta_matches_original_linux_c() -> TestResult {
             || io.count != count
             || io.hash != hash
         {
-            return TestResult::Fail("B PTA/grant/TRX/firmware policy differs from original C");
+            return TestResult::Fail(
+                "B PTA/grant/TRX/firmware policy differs from the frozen reference",
+            );
         }
     }
     for v in [[0, 29, 28, 255], [0, 29, 122, 0], [1, 0, 0, 0]] {
@@ -176,7 +178,7 @@ fn smoke_rtw89_b_wlan_only_pta_matches_original_linux_c() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_wlan_only_pta_matches_original_linux_c
+    smoke_rtw89_b_wlan_only_pta_matches_frozen_references
 );
 fn smoke_rtw89_b_wlan_only_fault_cancel_and_ignored_grant_never_replay() -> TestResult {
     let mut baseline = Model::new(0);

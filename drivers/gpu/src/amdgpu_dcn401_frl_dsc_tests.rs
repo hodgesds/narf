@@ -8,9 +8,6 @@ use crate::amdgpu_frl_cap::FrlBorrow;
 
 const CVTEM_VECTORS: &str = include_str!("../tests/dcn401_dsc/cvtem_vectors.txt");
 
-/// Every PPS of the FRL DSC vectors, as Linux's hpo_enc401_hdmi_set_dsc_config
-/// sends it (cvtem_harness.c): seven packet writes, stale buffer bytes and
-/// all.
 fn dcn401_frl_cvtem_packets_match_linux() -> TestResult {
     let mut checked = 0;
     for line in CVTEM_VECTORS

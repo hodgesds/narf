@@ -1,4 +1,4 @@
-# Linux DCN4 plane input conversion vectors; see check.sh and harness.c.
+# Linux DCN4 plane input conversion vectors; retained regression snapshot.
 XR24 0 0 = 8 2 3 8 1 0
 XR24 0 1 = 8 2 3 8 1 0
 XR24 1 0 = 8 2 3 8 1 0

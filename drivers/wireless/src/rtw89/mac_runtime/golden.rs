@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux callback SHA256 191938a6e039933841ae64c14a8f0c34489c8c7fb5ed5026a5595d4ab2de8161
 const CASES:&[Case]=&[
 Case{seed:0,cut:0,trace:&[

@@ -158,7 +158,7 @@ fn ready<F: Future>(future: F) -> Option<F::Output> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_pci_basic_matches_original_linux_policy() -> TestResult {
+fn smoke_rtw89_pci_basic_matches_frozen_references_policy() -> TestResult {
     for case in CASES {
         let mut model = Model::new(case.generation, case.seed, case.host, case.calibrated);
         let mut owner = Basic::default();
@@ -167,7 +167,7 @@ fn smoke_rtw89_pci_basic_matches_original_linux_policy() -> TestResult {
             || owner.state() != State::Ready
             || model.trace != case.trace
         {
-            return TestResult::Fail("PCI basic_cfg differs from extracted Linux C");
+            return TestResult::Fail("PCI basic_cfg differs from the frozen reference");
         }
         let before = model.operations;
         // SAFETY: same model; a ready owner must not replay configuration.
@@ -181,7 +181,7 @@ fn smoke_rtw89_pci_basic_matches_original_linux_policy() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_pci_basic_matches_original_linux_policy
+    smoke_rtw89_pci_basic_matches_frozen_references_policy
 );
 fn smoke_rtw89_pci_basic_errors_and_cancellation_remain_terminal() -> TestResult {
     for chip in [

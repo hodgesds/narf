@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Selected by original Linux phy.c parser from rtw8822c_table.c; regenerate with make_linux_tables.py.
+// Frozen RTL8822C PCIe table selections from Linux phy.c/rtw8822c_table.c.
 const TABLE_0: &[(u16, u32)] = &[
     (0x1d0c, 0x410000),
     (0x1c3c, 0x1038040),

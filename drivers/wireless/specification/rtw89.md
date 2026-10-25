@@ -103,8 +103,8 @@ and cannot be replayed or release that reservation. The existing unsafe cold
 claim remains only for a genuinely independently fenced platform power/PERST
 contract; an automatic probe cannot invent that fact from a static board ID.
 
-Six reset regressions compile unmodified Linux pending/FLR functions to
-independent timing fixtures and exercise the real config state machine with
+Six native Rust reset regressions use frozen pending/FLR timing references
+citing Linux `drivers/pci/pci.c` and exercise the actual config state machine with
 current-epoch operations. They cover minimum config silence, exact BAR ordering
 and restoration, unsupported FLR, pending timeout, malformed lists, cancellation,
 readiness timeout, changed identity, stuck FLR, ignored BARs and slot/BDF/ECAM/
@@ -176,7 +176,7 @@ BDRAM/index preparation through capability-scoped accesses. Mode programming
 occurs after DMA idle and index clear, before partition/reset. `Native::configure`
 requires that same retained owner's basic/PCIe, FIFO and BDRAM Ready receipts before
 system-memory ring publication. Non-B diagnostic profiles do not call it.
-Linux-C traces cover the four AX profiles and nonzero inherited register fields;
+Frozen reference traces cover all four AX profiles and nonzero inherited fields;
 negative models cover every access failure, ignored writes, dirty indices,
 device disappearance, both wait deadlines, cancellation and actual revocation.
 This closes internal partition/index and PCIe MAC-pre-init preparation only:
@@ -205,7 +205,7 @@ and bounded firmware-control status7 check precede `Running`; status6 alone
 does not authorize runtime commands. A/C watchdog accesses require the full
 indirect BAR aperture at0x40000, checked by the native register backend.
 Errors and cancellation retain a non-reusable owner and uncertain command DMA;
-retry requires a separate complete fenced reset. Linux C trace comparisons cover
+retry requires a separate complete fenced reset. Frozen reference comparisons cover
 all four AX profiles with zero/nonzero initial registers and secure mode, while
 models cover exact prepared transfers, every register-access failure, failed
 publication, path/final-status timeout and cancellation. This prerequisite does
@@ -230,7 +230,7 @@ activate CH12, publish a station or establish complete MAC/RF readiness.
 `fifo::Fifo::prepare` implements the AX firmware-download DLE/HFC pre-init:
 per-chip MAC/DMAC and internal AXI enables, WDE64/PLE128 geometry, DLFW quotas
 with the SCC WCPU minimum, bounded WDE/PLE readiness, and CH12-only host flow
-control. 8852C uses its V1 HFC register page. Independent Linux C traces cover
+control. 8852C uses its V1 HFC register page. Frozen reference traces cover
 all four AX profiles with inherited zero and nonzero register seeds. The
 operation requires a powered, serialized, DMA-fenced device with PCI BME off;
 it publishes no system-memory rings. Failure or cancellation retains
@@ -247,7 +247,7 @@ choose it after a failed primary configuration transaction. Idle checks reject
 unknown controller requests before data/address publication. Bounded async
 completion, capability-checked widths/extents, and a retained terminal state
 prevent failure or cancellation from reopening the same owner. Replacement
-requires an independently verified reset. Extracted Linux C traces cover
+requires an independently verified reset. Frozen reference traces cover
 MDIO read/write/masked writes and DBI byte enables; actual-capability RAM
 fixtures check native RAC offsets and revoked access before dereference.
 These access prerequisites now support exact AX MAC-pre-init PHY/quirk policy
@@ -266,7 +266,7 @@ readback rejects ignored programming. The native adapter accesses ECAM bytes
 inside actual current capability invocation (avoiding adjacent RW1C fields),
 and chooses the serialized DBI fallback only after a failed primary mapping
 transaction. PHY protocols retain their existing bounded async ownership.
-Independent extracted Linux-C traces cover all four AX profiles, both cuts,
+Frozen reference traces cover all four AX profiles, both cuts,
 Gen1/Gen2, zero/nonzero inherited fields, L1 enable/restore and C's BER quirk;
 negative models cover every access failure, each cancellable transaction edge,
 unsupported profiles/rates, ignored mode writes, disappearance and native
@@ -281,16 +281,15 @@ checks alignment/extents/cycles and refuses unavailable PCIe v2 controls.
 Native config words/dwords use naturally aligned, current-capability ECAM
 access; byte writes retain the explicit AX DBI fallback. A temporary C ASPM
 backup is restored on returned calibration failures; cancellation retains a
-non-reusable owner. Forty independent original-Linux-C cases cover all AX
-profiles, both link speeds, inherited zero/nonzero fields, calibrated versus
+non-reusable owner. Forty frozen reference cases cover all AX profiles, both link speeds, inherited zero/nonzero fields, calibrated versus
 uncalibrated C and host PM enabled/disabled. Fault/cancellation at every access,
 malformed capability lists and ignored control writes keep preparation closed.
 
 `factory::Factory` commits a complete actual DDV snapshot only after the
 1216-byte physical map, autoload-valid bit and physical0x5e9..0x5ed controls
 have been read successfully. It decodes factory MAC, logical RFE/XTAL/country,
-B's real power-k marker and secure fuse selection; independently compiled
-original Linux packed types establish all four AX field offsets. ECV must
+B's real power-k marker and secure fuse selection; fixed layout references
+from the Linux chip headers retain all four AX field offsets. ECV must
 agree with the corrected 8851B cut. No I/O error becomes erased fuse/calibration
 defaults. Unknown/failed/cancelled snapshots expose no identity and reject reuse.
 8852B additionally reads the complete separate physical PHY-cap window
@@ -298,7 +297,7 @@ defaults. Unknown/failed/cancelled snapshots expose no identity and reject reuse
 The retained raw map and logical snapshot feed `factory_b::Calibration`'s exact
 TSSI groups, signed RX-gain offsets/compensation and thermal/PA-bias trims.
 Only a completed native read permits Linux's explicit erased-map interpretation;
-partial I/O never produces trim defaults. Independent packed-C offsets and
+partial I/O never produces trim defaults. Frozen packed-layout references and
 byte-preservation/failure/cancellation fixtures cover the extended source.
 
 `cold::Cold` retains one backend through actual normalized discovery power,
@@ -336,11 +335,11 @@ require readback. Every packet channel and both RX HCI layers remain stopped,
 and no RX base, PCI interrupt delivery or station is published.
 The initial B profile additionally parks global `B_AX_CMAC_TXEN` from its first
 CMAC-enable write. Packet DMA stops alone do not suppress autonomous ACK/CTS.
-This is the single explicit gate adaptation to the original C MAC write stream;
+This is the single explicit gate adaptation to the Linux source MAC write stream;
 readback requires TXEN clear, and later measured response/channel authorization
 must precede enabling it. Native failure closes this gate independently of DMA.
 
-Four original-Linux-C traces cover the full B register width/value/order with
+Four frozen reference traces cover B register widths, values and ordering with
 zero/A5 inherited fields and both initial cuts. Tests cover every register
 failure and cancellable delay, all controller deadlines, ignored configuration
 writes, WCPU status6/gone, dirty RX prerequisites and actual revoked NativeIo
@@ -377,7 +376,7 @@ Before the signed ordinary packet/response owner exists, RX publication and each
 poll also reject a set global CMAC TX gate; CPU RX filtering cannot stand in
 for autonomous-response authorization.
 
-Independent compiled original Linux functions/types provide48 RXD layouts,
+Frozen source-derived references retain48 RXD layouts,
 64 ring-wrap/index cases, four RXBD address encodings, nine C2H envelopes,
 240 RPQ identities/channel mappings and enabled/disabled zero/A5 LTR traces.
 The RAM device model follows actual published ring bases/descriptors and only
@@ -399,14 +398,14 @@ continuation. It preserves the20-bit masks, path selection, actual SWSI busy/don
 polls at1us/30us and2us read settle, and1us direct-write delay. No fabricated
 readback supplies a calibration value. A failed or cancelled transaction never
 replays; analog write success means issuance, and the next transaction checks
-actual busy.48 compiled original Linux callback traces cover both paths,
+actual busy.48 frozen callback reference traces cover both paths,
 analog/direct, zero/A5 inherited fields and full/sparse masks. Tests cover each
 access failure and cancellation point, all busy/done deadlines, invalid paths,
 the actual native aperture and revoked authority. `radio_tables_b` retains the
 actual B BB1,013, gain66, RF-A8,295, RF-B8,392 and NCTL1,320 pair entries.
 `radio_table::program` validates/selects the entire immutable program before
 its first device write, preserving exact/wildcard/max-cut headline ordering
-and conditional branch selection.160 compiled original Linux selector cases
+and conditional branch selection.160 frozen selector reference cases
 compare full selected-stream counts and order-sensitive digests across RFE/cut
 inputs; malformed grammar or an unsupported package never yields a successful
 partial program. The composed B execution below closes BB gain/reset/power-unit
@@ -419,8 +418,8 @@ are checked; only absent overrides use Linux's explicit static-table fallback.
 B uses the AX aid0 layout (Linux assigns physical AID only on BE). The first
 matching embedded BB/gain/RF/NCTL table wins, and actual power/tracking/regulatory
 element bytes remain retained for their typed consumers. A malformed present
-element never falls back to invented static data. Original packed C types
-independently fix the offsets used by the fixture.
+element never falls back to invented static data. Frozen packed-layout
+references cite the original `fw.h` definitions.
 
 `Startup::prepare_radio_tables` advances from actual `Receiving` through one
 retained `radio_init::Init` to `RadioTablesLoaded`. It selects and validates all
@@ -435,15 +434,15 @@ or a calibrated radio. Error/cancellation closes the enclosing Native while
 retaining all possibly referenced DMA, and partial gain state cannot become a
 completed receipt. No packet TX queue, WPDMA, IRQ or NIC is activated.
 
-Independent original C traces cover successful zero/A5 RFE1/5 and both cuts,
-2,916 ordered BB/power/reset/RF-upload operations per case. C-rejected RFE16
+Frozen reference traces cover successful zero/A5 RFE1/5 and both cuts,
+2,916 ordered BB/power/reset/RF-upload operations per case. Unsupported RFE16
 profiles are rejected before partial BB programming. Original gain callbacks
 cover the full default table and all signed gain/receive-offset layouts;
 48 original runtime-header cases and the real Native descriptor/body model
 verify page identity, automatic ACK bits, current sequence and cancellation
-retention. NCTL pre-init and the real selected NCTL table match original C
-separately, including a bounded fail-closed1ms handshake. `RadioTablesLoaded`
-remains an intermediate prerequisite before the signed calibration continuation.
+retention. NCTL pre-init and the selected NCTL table have separate frozen
+reference coverage, including a bounded fail-closed1ms handshake.
+`RadioTablesLoaded` remains an intermediate prerequisite before the signed calibration continuation.
 
 `Startup::prepare_basic_calibration` continues only that same B table owner.
 The synchronous `Native::preflight_basic_rfk` stages an opaque owned plan before
@@ -492,12 +491,11 @@ stand in for firmware scheduler ownership. A dropped Startup attempt closes
 CMAC/host DMA/BME best-effort and retains all uncertain published DMA; it neither
 claims RF-off nor an independent reclamation fence.
 
-Eight independent original-C RFK traces include zero/A5 inherited fields,
+Eight frozen RFK reference traces include zero/A5 inherited fields,
 low/high actual backoff and both source S1-ready branches. They compare every
-BB/RF read/write, delay, ownership boundary and measured result. Four compiled
-original PTA/coexistence cases, six firmware-scheduler cases and original B
-bb_sethw traces independently verify packing/order/widths. Negatives cover
-faults, cancellation, ignored ownership/control writes, all handshake deadlines,
+BB/RF read/write, delay, ownership boundary and modeled measurement result.
+Four frozen PTA/coexistence cases, six firmware-scheduler cases and B bb_sethw
+reference traces check packing/order/widths. Negatives cover faults, cancellation, ignored ownership/control writes, all handshake deadlines,
 stale/wrong firmware replies, signed artifact extents/identity, overlapping
 regulatory restrictions and actual qualification-capability revocation before
 native registers, runtime sequence or DMA publication. A full actual CH12 queue
@@ -539,9 +537,9 @@ retains uncertain transport mappings. These source helpers do not activate
 ordinary CMAC/DMA, and they do not substitute for a complete current measured
 packet/all-response power qualification.
 
-Nine TSSI/DPK/RX-AB regressions use independently compiled unmodified Linux
-callbacks: eight full TSSI/PMAC write traces, two full RX-AB traces, eight DPK
-traces after the original full TSSI program, actual signed measurements and the
+Nine native Rust TSSI/DPK/RX-AB regressions retain frozen source-derived
+reference traces: eight full TSSI/PMAC traces, two RX-AB traces, eight DPK
+traces after the original full TSSI program, modeled signed measurements and the
 entire 12-bit digital-gain mapping domain. They cover erased/default/embedded
 tracking, signed DE/gain/thermal arithmetic, both cuts/backoff values, pending
 CW/NCTL cancellation, source deadlines, failed correlation/DC measurements,
@@ -557,7 +555,7 @@ for fixed channel1/20MHz: A/B analog and direct RF channel/bandwidth programming
 path-A LDO preservation, bounded1us/1ms LPF readiness, exact MMD/LCK/synth recovery
 and both RXBB bandwidth LUTs. It requires actual final synth lock and channel
 readback, rather than treating Linux's final debug message as success. Sixteen
-original-C traces cover zero/nonzero inherited RF words, each of the four lock
+frozen reference traces cover zero/nonzero inherited RF words, all four lock
 recovery outcomes and immediate/delayed LPF completion. Faults at every access,
 cancellation, lock/LPF deadlines, ignored writes and admission denial cannot
 publish `SynthConfigured` or replay the owner. Its native use is only inside the full retained channel/reset/ADC composition
@@ -569,7 +567,7 @@ core: MAC width/subcarrier/rate checks, CCK SCO/FIR, actual selected LNA/TIA
 gains, factory signed gain compensation/offsets, signed RPL averages, RX width
 and ADC settings, CCK/CCA and channel-index controls, 5MHz mask disable and the
 source BB reset sequence. Critical actual width/channel/reset readbacks are
-required. Thirty-two independent original-C traces cover both inherited seeds,
+required. Thirty-two frozen reference traces cover both inherited seeds,
 all RX-path selectors and all physical compensation/logical offset-valid
 combinations, including negative odd RPL sums and signed clamp boundaries.
 Access failures, dropped reset waits, ignored writes and denied admission leave
@@ -588,22 +586,23 @@ partial bracket and reject replay; this cannot grant packet or RF readiness.
 
 `radio_power::Plan` decodes the actual firmware byrate/2GHz limit/RU/shape
 configurations with source last-matching-RFE/default selection. Missing overrides
-use exact compiled B static defaults; malformed present data cannot fall back.
+use fixed B static default tables; malformed present data cannot fall back.
 The fixed WW0/channel1/20 profile programs all44 byrate bytes, both complete
 40-byte limit pages, both24-byte RU pages, source offsets and full flat/sharp
 CCK FIR/OFDM shape, then source equal-path reference0. Signed RF2-to-MAC1 shifts
 and zeroed unused page sections follow Linux. WW0 is only a concrete hardware
-configuration; it supplies no country or physical power authority. Eight
-original-C power traces cover both inherited seeds, negative source units and
-both FIR branches. RFE override/legacy zero-extension/invalid-data and each
+configuration; it supplies no country or physical power authority. Eight frozen
+power reference traces citing `rtw8852b.c` cover both inherited seeds, negative
+source units and both FIR branches. RFE override/legacy zero-extension/invalid-data and each
 access/ignored-control/admission regression keep partial preparation terminal.
 A signed measured full-recipe envelope still precedes native use and must cover
 calibration PMAC, ordinary TX-A and all reachable automatic response paths/rates.
 
 `radio_trim::Trim` applies only the retained real physical thermal and PA-bias
 bytes, preserving Linux's whole-map programmed/erased interpretation. Each RF
-trim write requires actual field readback; four original-C flag combinations
-and access/cancel/ignored-control/admission negatives reject partial completion.
+trim write requires actual field readback. Four frozen flag-combination references
+from `rtw8852b_rfk.c`, alongside access/cancel/ignored-control/admission negatives,
+reject partial completion.
 It requires the expanded measured recipe and provides no bypass or power grant.
 
 `Native::qualification_request(assets, full)` returns read-only version/MAC/
@@ -653,8 +652,8 @@ physical RF/link/DHCP validation still requires the exact real board assets.
 
 The source-shared `radio_stop` controls cover both PMAC modes/manual routing,
 RFCTM and NCTL closing fields, followed by B's exact AFC_AFEDIG clock gate and
-BB reset prefix. Independent original-C callbacks/statements verify both
-inherited register seeds and actual write widths/order. The finite synchronous
+BB reset prefix. Frozen source references from `rtw8852b.c` and
+`rtw8852b_rfk.c` check both inherited register seeds and write widths/order. The finite synchronous
 helpers continue independent closing operations after an error and require
 readback; ignored writes cannot claim successful closure. Native latches radio
 preparation before the first possible BB/RF write. Its terminal/Drop path stops
@@ -669,8 +668,9 @@ serializes actual XTAL idle/commands with50us/50ms budgets, disables RF00S/RF10S
 through the exact AX read/write callbacks, then checks both actual final fields.
 Wrong command echoes, ignored writes, busy deadlines, errors and cancellation
 leave Stopping and reject replay. ShutdownAcknowledged is neither RF/DMA idle
-nor reset/reclamation authority. Four original-C shutdown cases and actual
-Native register-command/current-cap/DMA-retention fixtures cover this path.
+nor reset/reclamation authority. Four frozen shutdown references citing
+`rtw8852b.c`, alongside Native register-command/current-cap/DMA-retention fixtures,
+cover this path.
 
 This cold/WCPU path still requires an independently established old-DMA fence
 and exclusive function claim: BME-off, MAC-OFF and these retained receipts do
@@ -704,9 +704,9 @@ programmed with masked readbacks. The corrected factory cut controls B's CCK-PD
 branch; crystal values retain the factory value masked exactly as Linux does.
 Working state records those actual cut/RFE/crystal facts and is published only
 after every transition succeeds. Failure/cancellation is terminal and cannot
-replay. A generated source/register/table recipe digest enters board policy.
-Twenty-four original-C cases cover seeded registers, corrected cuts and crystal
-values; negative models cover every current-admission frontier, ignored MMIO
+replay. A fixed source/register/table recipe digest enters board policy.
+Twenty-four frozen references citing `rtw8852b.c` cover seeded registers,
+corrected cuts and crystal values; negative models cover every current-admission frontier, ignored MMIO
 or XO/XI writes and cancellation at an actual analog request.
 
 B has no source `rfe_gpio` or AX BB-wrap callback, and the admitted two-path
@@ -735,7 +735,7 @@ zero fields retain Linux's actual B chip defaults. RF-B-only, path-diversity,
 NSS1 and reserved raw topologies are refused before any radio table access.
 All actual words are retained and their capability fingerprint enters full
 board qualification; this receipt alone supplies no wiring, calibration or
-power authority. Independently compiled original-C transport/decoder fixtures
+power authority. Frozen source-derived transport/decoder references
 cover 512 topology/seed cases and shared scheduler-counter continuation.
 
 `iqk::Iqk` owns the complete one-shot RTL8852B initial PHY0/channel1/20MHz,
@@ -754,7 +754,7 @@ the command register has no assumed stability or trigger-bit semantics. The
 state becomes failed before any await, so cancellation, timeout, current
 restriction or malformed result cannot replay or publish calibrated results.
 The owner exposes retained diagnostics separately from successful results.
-Eighteen independently compiled original-C traces cover seeded registers,
+Eighteen frozen reference traces cover seeded registers,
 LO retry success/failure, dynamic coarse/TX/RX/VBUFFER/restore flags and delayed
 NCTL completion; additional models cover stuck polls, ignored writes, current
 restriction and cancellation. Native full-recipe wiring, measured signed
@@ -810,8 +810,8 @@ future failure/cancellation is one-shot; a late completion or fresh admission
 cannot replay or revive that owner. These controls remain prerequisites to
 the enclosing retained packet/station/Device composition and physical tests.
 
-Compiled original Linux CAM/role/join/CCTL/EDCA helpers and default table writes
-independently fix serialized bytes and indirect register order. Control models
+Frozen references from Linux CAM/role/join/CCTL/EDCA helpers and default tables
+check serialized bytes and indirect register order in the Rust controls. Models
 earn their factory through actual sparse-DDV decoding, invoke real capability
 epochs around whole MMIO operations, and parse raw modeled C2H acknowledgements.
 The actual native control adapter also encloses the complete register operation
@@ -880,9 +880,8 @@ all published mappings; neither stop nor drop infers quiescence or reconstructs
 an owner. Buffered native RX events must drain before an actual RXQ/RPQ-idle
 observation can be reported.
 
-Seven packet-format/owner regressions include literal fixtures produced by
-compiling unmodified Linux AX body/info and PCI address-info functions, and a
-reactive device model that follows actual programmed TXBD bases, descriptor,
+Seven native Rust packet-format/owner regressions use frozen AX body/info and
+PCI address-info byte references, alongside a reactive device model that follows actual programmed TXBD bases, descriptor,
 header and native-body DMA. They cover both completion orders, DMA-read receipt
 bytes, wrong/duplicate/stale/failed releases, impossible pointers, revoked
 current epochs, late peer/RF closure, uncertain doorbells, stop retention and the
@@ -921,6 +920,17 @@ bounded waits, and the firmware registry will supply authenticated images.
 
 AX identity is software covered. Existing packet descriptor/ring code is
 bring-up scaffolding and does not establish a working station runtime.
+
+The hardware tables, register constants, recipe digests and regression fixtures
+are checked-in Rust data. Frozen references retain their source citations and
+existing SHA256 provenance in `src/rtw89/REFERENCE_FIXTURES.md` and the individual
+files. The Python/C extraction, generation and temporary-compiler pipelines have
+been removed. Native Rust tests require no Python, C compiler or Linux checkout,
+and compare with stored expected values rather than executing another driver.
+A reference change requires source/hardware contract review; recalculating its
+expected values from the Rust code under test is not validation. These fixed
+references do not prove continuing equivalence with an external Linux revision
+or physical hardware acceptance.
 
 ## 8. Open questions / remaining software
 

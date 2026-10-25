@@ -153,7 +153,7 @@ fn complete(owner: &mut Transition, io: &mut Model) -> Option<Result<(), Error>>
         }
     })
 }
-fn smoke_rtw89_b_channel_bracket_matches_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_channel_bracket_matches_frozen_references() -> TestResult {
     for &(seed, count, hash) in CASES {
         let mut io = Model::new(seed, 0);
         let mut owner = Transition::default();
@@ -163,14 +163,14 @@ fn smoke_rtw89_b_channel_bracket_matches_original_linux_c() -> TestResult {
             || io.hash != hash
             || io.now != 41
         {
-            return TestResult::Fail("B channel helper differs from original C");
+            return TestResult::Fail("B channel helper differs from the frozen reference");
         }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_channel_bracket_matches_original_linux_c
+    smoke_rtw89_b_channel_bracket_matches_frozen_references
 );
 fn smoke_rtw89_b_channel_bracket_errors_cancel_and_reset_readback_are_terminal() -> TestResult {
     let mut baseline = Model::new(0xa5, 0);

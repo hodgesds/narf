@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux B radio init callbacks/tables SHA256 bc1d7e9c1008e532af9ea0b5b6f1589afe6c5e6c97a71de9262a301c13521f27
 type InitGolden = (u8,u8,u8,u32,u64,u32,u64,bool);
 pub(super) const CASES: &[InitGolden] = &[

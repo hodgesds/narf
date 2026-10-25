@@ -5,8 +5,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-/// Shared with tests/dcn401_spl/check.sh, which answers every line with
-/// Linux SPL built on the host (see harness.c for the write tokens).
 const VECTORS: &str = include_str!("../tests/dcn401_spl/vectors.txt");
 
 fn input(a: &[i32]) -> Input {
@@ -92,7 +90,7 @@ fn dcn401_spl_matches_linux_vectors() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/dcn401-spl", dcn401_spl_matches_linux_vectors);
 
-/// 4:2:0 planes, shared with check.sh likewise: each line leads with the
+/// Retained 4:2:0 plane cases: each line leads with the
 /// format (8 NV12/NV21, 10 P010).
 const VIDEO_VECTORS: &str = include_str!("../tests/dcn401_spl/video_vectors.txt");
 
@@ -230,7 +228,6 @@ fn dcn401_spl_scaling_modes() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/dcn401-spl", dcn401_spl_scaling_modes);
 
-/// Shared with tests/dcn401_spl/check.sh (harness.c with MPC set).
 const MPC_VECTORS: &str = include_str!("../tests/dcn401_spl/mpc_vectors.txt");
 
 /// Every MPC slice of mpc_vectors.txt programs exactly Linux's writes:
@@ -274,7 +271,6 @@ kernel_test_in!(
     dcn401_spl_matches_linux_mpc_vectors
 );
 
-/// Shared with tests/dcn401_spl/check.sh (harness.c video with MPC set).
 const VIDEO_MPC_VECTORS: &str = include_str!("../tests/dcn401_spl/video_mpc_vectors.txt");
 
 /// Every MPC slice of an NV12/P010 plane in video_mpc_vectors.txt programs

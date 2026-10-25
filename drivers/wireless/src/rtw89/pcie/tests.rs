@@ -153,7 +153,7 @@ fn smoke_rtw89_pcie_preinit_and_mode_match_linux() -> TestResult {
             || mode(&mut model, case.chip, case.cut).is_err()
             || model.trace != case.trace
         {
-            return TestResult::Fail("AX PCIe pre-init/mode differs from independent Linux C");
+            return TestResult::Fail("AX PCIe pre-init/mode differs from the frozen reference");
         }
         let before = model.operations;
         // SAFETY: same exclusive model; completed owner must reject before I/O.

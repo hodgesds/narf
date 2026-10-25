@@ -115,7 +115,7 @@ fn check_oracles() -> Result<(), &'static str> {
         }
         .map_err(|_| "native register trace")?;
         if io.trace.borrow().len() != count as usize || io.hash() != hash {
-            return Err("MAC/queue/DMA differs from original Linux C");
+            return Err("MAC/queue/DMA differs from frozen reference data");
         }
     }
     Ok(())
@@ -189,7 +189,7 @@ fn check_failures() -> Result<(), &'static str> {
     }
     Ok(())
 }
-fn smoke_ar9285_mac_queue_dma_matches_original_linux() -> TestResult {
+fn smoke_ar9285_mac_queue_dma_matches_frozen_reference() -> TestResult {
     match check_oracles() {
         Ok(()) => TestResult::Pass,
         Err(reason) => TestResult::Fail(reason),
@@ -209,7 +209,7 @@ fn smoke_ar9285_mac_every_access_failure_stops_before_packet_activation() -> Tes
 }
 kernel_test_in!(
     "drivers/wireless/ath9k/mac",
-    smoke_ar9285_mac_queue_dma_matches_original_linux
+    smoke_ar9285_mac_queue_dma_matches_frozen_reference
 );
 kernel_test_in!(
     "drivers/wireless/ath9k/mac",

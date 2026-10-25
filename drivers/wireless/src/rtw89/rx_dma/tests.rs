@@ -200,15 +200,15 @@ fn packet(kind: u8, payload: &[u8]) -> Vec<u8> {
     bytes[20..].copy_from_slice(payload);
     bytes
 }
-fn smoke_rtw89_rx_rings_original_linux_geometry_and_real_dma() -> TestResult {
+fn smoke_rtw89_rx_rings_reference_geometry_and_real_dma() -> TestResult {
     for &(address, expected) in BD {
         if descriptor(address, BUFFER_SIZE) != Ok(expected) {
-            return TestResult::Fail("RXBD address geometry differs from Linux original C");
+            return TestResult::Fail("RXBD address geometry differs from the frozen reference");
         }
     }
     for &(depth, wp, index, expected) in INDEX {
         if available(depth, wp, index) != Ok(expected) {
-            return TestResult::Fail("RX ring count differs from Linux original C");
+            return TestResult::Fail("RX ring count differs from the frozen reference");
         }
     }
     let mut f = Fixture::new();
@@ -256,7 +256,7 @@ fn smoke_rtw89_rx_rings_original_linux_geometry_and_real_dma() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_rx_rings_original_linux_geometry_and_real_dma
+    smoke_rtw89_rx_rings_reference_geometry_and_real_dma
 );
 
 fn smoke_rtw89_rx_partial_descriptor_is_progress_not_idle() -> TestResult {
@@ -433,7 +433,7 @@ kernel_test_in!(
     smoke_rtw89_rx_device_model_rejects_unowned_dma_and_ignored_repost
 );
 
-fn smoke_rtw89_rx_ltr_follows_actual_host_policy_and_original_linux_c() -> TestResult {
+fn smoke_rtw89_rx_ltr_follows_actual_host_policy_and_frozen_references() -> TestResult {
     for &(host, seed, expected) in LTR {
         let mut f = Fixture::new();
         f.model.bytes[0x8410..0x8420].fill(seed);
@@ -477,7 +477,7 @@ fn smoke_rtw89_rx_ltr_follows_actual_host_policy_and_original_linux_c() -> TestR
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_rx_ltr_follows_actual_host_policy_and_original_linux_c
+    smoke_rtw89_rx_ltr_follows_actual_host_policy_and_frozen_references
 );
 
 fn smoke_rtw89_rx_current_native_authority_precedes_allocation_and_dma_reads() -> TestResult {

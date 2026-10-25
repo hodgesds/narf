@@ -84,8 +84,8 @@ fn model(protected: bool) -> Session<Model> {
     session
 }
 
-fn mt76_amsdu_native_layout_matches_original_linux_receive_oracle() -> TestResult {
-    let mut bytes = include_bytes!("amsdu_oracle.bytes").as_slice();
+fn mt76_amsdu_native_layout_matches_frozen_reference_receive_vectors() -> TestResult {
+    let mut bytes = include_bytes!("amsdu_reference.bytes").as_slice();
     let mut expected = Vec::new();
     let mut session = model(false);
     for marker in 0..4 {
@@ -115,7 +115,7 @@ fn mt76_amsdu_native_layout_matches_original_linux_receive_oracle() -> TestResul
         expected.push(eth.to_vec());
     }
     if !bytes.is_empty() {
-        return TestResult::Fail("source oracle record geometry");
+        return TestResult::Fail("fixed reference record geometry");
     }
     // Original source's first/middle/last markers, with each normalized
     // Ethernet-II result checked against the genuine conversion function.
@@ -130,14 +130,14 @@ fn mt76_amsdu_native_layout_matches_original_linux_receive_oracle() -> TestResul
     }
     for marker in [3u8, 2, 1] {
         if session.receive_ethernet() != Ok(Some(expected[usize::from(marker)].clone())) {
-            return TestResult::Fail("assembled Ethernet differs from original Linux oracle");
+            return TestResult::Fail("assembled Ethernet differs from fixed reference vector");
         }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/ht_receive",
-    mt76_amsdu_native_layout_matches_original_linux_receive_oracle
+    mt76_amsdu_native_layout_matches_frozen_reference_receive_vectors
 );
 
 fn mt76_ht_receive_preparation_has_no_activation_or_device_side_effects() -> TestResult {

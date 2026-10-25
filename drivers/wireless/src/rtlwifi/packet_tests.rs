@@ -699,7 +699,7 @@ pub(crate) fn smoke_rtl8188ee_station_native_mailbox_pages_match_original_linux(
         .collect();
     if writes != LINUX_MAILBOX || owner.phase() != Phase::Stopped || port.model.lock().master {
         return TestResult::Fail(
-            "actual MMIO mailbox byte lanes/order differ from original Linux C",
+            "actual MMIO mailbox byte lanes/order differ from frozen reference data",
         );
     }
     drop(owner);

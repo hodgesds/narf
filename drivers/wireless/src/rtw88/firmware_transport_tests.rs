@@ -530,7 +530,7 @@ kernel_test_in!(
     smoke_rtw88_firmware_checksum_iddma_busy_and_ready_failures
 );
 include!("firmware/golden.rs");
-fn smoke_rtw88_firmware_registers_match_actual_linux_callbacks() -> TestResult {
+fn smoke_rtw88_firmware_registers_match_frozen_callback_references() -> TestResult {
     let mut owner = Owner::new(Model::new(), 0xc822);
     narf_scheduler::block_on(owner.download(&image(4093, 9, 5))).unwrap();
     let trace: Vec<_> = owner
@@ -549,14 +549,14 @@ fn smoke_rtw88_firmware_registers_match_actual_linux_callbacks() -> TestResult {
         .collect();
     if trace != LINUX_FW {
         return TestResult::Fail(
-            "FW CPU/reset/backup/chunk/DDMA/checksum/start differs from actual Linux C",
+            "FW CPU/reset/backup/chunk/DDMA/checksum/start differs from the frozen reference",
         );
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtw88",
-    smoke_rtw88_firmware_registers_match_actual_linux_callbacks
+    smoke_rtw88_firmware_registers_match_frozen_callback_references
 );
 
 fn smoke_rtw88_registered_image_preflight_keeps_exact_owner_pristine_until_claim() -> TestResult {

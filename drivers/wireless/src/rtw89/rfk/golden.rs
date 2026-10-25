@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux B basic RFK callbacks/types SHA256 ae25a2682d61cbc5c2a9de3fcb948a874f9def7fa1779f9a88f782cfe1fad288
 type RfkGolden = (u8,bool,bool,u32,u64,&'static [u8]);
 pub(super) const CASES: &[RfkGolden] = &[

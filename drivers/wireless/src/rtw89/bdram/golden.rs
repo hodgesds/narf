@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Extracted Linux AX BDRAM helper/table/config SHA256 3d4220de52ee63c9e2b88139af45a50b776050d0cb55e092b97691d0333086cf
 #[rustfmt::skip]
 const CASES: &[Case] = &[

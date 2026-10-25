@@ -1,4 +1,5 @@
-// Original Linux C packet vectors; make_linux_oracle.py.
+// Frozen reference data; source provenance is recorded in this file and rtw88/REFERENCE_FIXTURES.md.
+// Frozen Linux rtw88 PCI TX/RX/CCX reference vectors; see REFERENCE.md.
 pub const LINUX_GEOMETRY: [usize; 4] = [40, 16, 24, 8];
 pub type TxCase = (usize, bool, u8, Option<u8>, [u32; 12], [u32; 4]);
 pub const TX_CASES: &[TxCase] = &[

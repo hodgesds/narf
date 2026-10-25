@@ -161,7 +161,7 @@ fn plan(negative: bool, sharp: u8) -> Plan {
     p.shape = [sharp, if sharp != 0 { 3 } else { 0 }];
     p
 }
-fn smoke_rtw89_b_power_source_units_and_full_pages_match_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_power_source_units_and_full_pages_match_frozen_references() -> TestResult {
     for &(seed, negative, sharp, count, hash) in CASES {
         let mut io = Model::new(seed, 0);
         let mut owner = Power::default();
@@ -170,7 +170,7 @@ fn smoke_rtw89_b_power_source_units_and_full_pages_match_original_linux_c() -> T
         if r != Ok(()) || owner.state() != State::Configured || io.count != count || io.hash != hash
         {
             return TestResult::Fail(
-                "B source power units/pages/shape/reference differ from original C",
+                "B source power units/pages/shape/reference differ from the frozen reference",
             );
         }
     }
@@ -217,7 +217,7 @@ fn smoke_rtw89_b_power_source_units_and_full_pages_match_original_linux_c() -> T
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_power_source_units_and_full_pages_match_original_linux_c
+    smoke_rtw89_b_power_source_units_and_full_pages_match_frozen_references
 );
 fn element(id: u32, rfe: u8, size: u8, entries: &[u8]) -> Element {
     let mut bytes = vec![0, 0, rfe, size];

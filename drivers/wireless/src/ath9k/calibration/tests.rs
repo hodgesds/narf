@@ -195,7 +195,7 @@ fn hash(trace: &[Op]) -> u64 {
     }
     hash
 }
-fn smoke_ath9k_retained_calibration_matches_original_linux_traces() -> TestResult {
+fn smoke_ath9k_retained_calibration_matches_frozen_reference_traces() -> TestResult {
     if CALIBRATION_CASES.len() != 32 {
         return TestResult::Fail("calibration oracle geometry changed");
     }
@@ -240,7 +240,7 @@ fn smoke_ath9k_retained_calibration_matches_original_linux_traces() -> TestResul
 }
 kernel_test_in!(
     "drivers/wireless/ath9k/calibration",
-    smoke_ath9k_retained_calibration_matches_original_linux_traces
+    smoke_ath9k_retained_calibration_matches_frozen_reference_traces
 );
 
 fn smoke_ath9k_calibration_failure_timeout_and_drop_are_terminal() -> TestResult {

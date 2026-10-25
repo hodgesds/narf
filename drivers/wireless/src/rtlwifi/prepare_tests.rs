@@ -197,8 +197,8 @@ pub(crate) fn smoke_rtl8188ee_fifo_llt_matches_actual_linux_and_pins_published_r
     {
         return TestResult::Fail("actual Linux 8188EE FIFO/0xab-0xaf LLT trace differs");
     }
-    // Independently compiled original RTL8188EE reg.h and actual hw.c
-    // init_mac base-publication order. Never share the driver's Rust map.
+    // Fixed RTL8188EE register-map reference and documented publication order.
+    // Never obtain expected addresses from the driver's Rust map.
     for (address, ring) in LINUX_TX_BASES.iter().zip(&owner.tx) {
         if !m.trace.contains(&(32, *address, ring.address as u32)) {
             return TestResult::Fail("per-chip distinct native queue base omitted");

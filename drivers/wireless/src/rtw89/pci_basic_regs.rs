@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-// Generated Linux pci.h/reg.h constants; see pci_basic/make_linux_oracle.py.
+// Frozen PCI basic-configuration constants from Linux rtw89/pci.h and reg.h.
 pub const ADDR_SEL_PINOUT_DIS_VAL: u32 = 0x3c4;
 pub const BAC_OOBS_SEL: u32 = 0x10;
 pub const BAC_RX_TEST_EN: u32 = 0x40;

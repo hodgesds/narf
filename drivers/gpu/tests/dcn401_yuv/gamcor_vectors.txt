@@ -1,4 +1,4 @@
-# Linux DCN4 plane input transfer function writes under legacy gamma; see check.sh and color_input.c.
+# Linux DCN4 plane input transfer function writes under legacy gamma; retained regression snapshot.
 XR24 0 = 3 ced:1 d67:0 d77:0
 XR24 20 = 3 ced:1 d67:0 d77:0
 XR24 60 = 3 ced:1 d67:0 d77:0

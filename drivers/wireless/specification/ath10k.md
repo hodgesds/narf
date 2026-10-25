@@ -364,9 +364,8 @@ peer IDs are bounded by the 2048-entry descriptor namespace rather than the
 resource peer count; multiple IDs for one BSSID remain owned until individual
 UNMAPs. The retained station progress path rejects an owned ID rebound to a
 different MAC/vdev. No MAP itself authenticates a peer or controlled port.
-Independent tests compile Linux's unmodified regulatory initialization over
-all 65,536 EEPROM values and native WMI generators/packed channel structs for
-all six supported dialects. Composed tests traverse actual scan/cache, host
+Native Rust tests evaluate all 65,536 EEPROM values against fixed source-cited
+reference data and check WMI wire-layout vectors for all six supported dialects. Composed tests traverse actual scan/cache, host
 policy, START status and HTT MAP/UNMAP; they cover cancellation after START
 publication, failed status, malformed/out-of-range map and retained DMA.
 
@@ -410,9 +409,9 @@ cover cancellation after native PEER_ASSOC/VDEV_UP descriptor publication,
 send errors, invalid AP capability, queued peer loss, stale remap, and a
 post-UP credit-only flood. AP association does not open a controlled port.
 
-Twenty-one further fixtures compile unmodified Linux VDEV_DOWN, PEER_DELETE
-and VDEV_STOP generators together with packed STOPPED/delete-response events,
-enum IDs, TLV tags and the synchronous-delete service bit. Native CE/HTC/WMI/
+Twenty-one fixed Rust fixtures retain VDEV_DOWN, PEER_DELETE and VDEV_STOP
+wire layouts, STOPPED/delete-response events, enum IDs, TLV tags and the
+synchronous-delete service bit. Native CE/HTC/WMI/
 HTT composition checks all six dialects, ACK/UNMAP ordering and sparse/in-flight
 IDs, wrong/malformed/missing receipts, stale prerequest events, duplicate UNMAP,
 owned-ID rebinding and late MAP, native command errors/cancellation and bounded
@@ -483,16 +482,16 @@ CE3 publication, DONE prerequisite/terminal hooks, and a literal-wire HTC
 model including credit starvation/refill, early service-ready, both HTT
 receive pipes and terminal duplicate/cancellation handling. These tests
 include actual HTC→WMI composition for all six dialects, INIT packets from
-an independently compiled C layout oracle, resource-dependent memory sizes,
+fixed source-cited Rust wire vectors, resource-dependent memory sizes,
 zero-unit skip, malformed ABI/count/extent handling and dropped INIT ownership.
 HTC→WMI→HTT fixtures exercise actual retained RX/fragment/PFC storage, native
-configuration and TX literals checked against independently compiled Linux
+configuration and TX literals checked against fixed Rust reference data
 structures, major-2 management, terminal TX ownership, idle progress,
 A-MSDU/chained RX, out-of-order PADDR ownership and malformed/duplicate batch
 retention. The composed models are architecture-neutral; they do not emulate
 a Qualcomm radio or establish reset/ROM interoperability. Composed scan
 fixtures cover all six dialects through actual HTC/WMI/HTT, native vdev and
-channel/scan commands checked against independently compiled Linux C
+channel/scan commands checked against fixed Rust reference data
 functions, production hardware-channel selection, two scans with distinct
 IDs, stale/wrong-requestor responses, malformed beacons, management header
 variants, concurrent terminal HTT completion and dropped/failed ownership.

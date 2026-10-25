@@ -1,5 +1,5 @@
 # Linux CREATE_DUMB reference vectors for amdgpu_gem.rs's dumb
-# buffers; see check.sh and harness.c.
+# buffers; retained regression snapshot.
 C 0 1 32 = -22
 C 1 0 32 = -22
 C 1 1 0 = -22

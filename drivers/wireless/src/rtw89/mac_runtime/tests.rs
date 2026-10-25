@@ -217,7 +217,7 @@ fn ready<F: Future>(future: F) -> Option<F::Output> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_b_post_wcpu_mac_matches_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_post_wcpu_mac_matches_frozen_references() -> TestResult {
     for case in CASES {
         let (mut io, factory) = Model::setup(case.seed, case.cut);
         let mut mac = Mac::default();
@@ -246,7 +246,7 @@ fn smoke_rtw89_b_post_wcpu_mac_matches_original_linux_c() -> TestResult {
             })
             .collect();
         if io.trace != expected {
-            return TestResult::Fail("B post-WCPU MAC differs from original Linux C trace");
+            return TestResult::Fail("B post-WCPU MAC differs from the frozen reference trace");
         }
         if io.raw(0x1010, 4) != 0xb0f00
             || io.raw(0x1000, 4) & (1 << 13) != 0
@@ -264,7 +264,7 @@ fn smoke_rtw89_b_post_wcpu_mac_matches_original_linux_c() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_post_wcpu_mac_matches_original_linux_c
+    smoke_rtw89_b_post_wcpu_mac_matches_frozen_references
 );
 fn smoke_rtw89_b_post_wcpu_mac_failures_and_cancel_never_replay() -> TestResult {
     let (mut baseline, factory) = Model::setup(0, 1);

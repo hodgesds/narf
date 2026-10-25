@@ -1,3 +1,4 @@
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Unmodified Linux DPK following original full TSSI.
 type DpkGolden = (u32, u8, u8, u32, u64, [[u16; 8]; 2]);
 pub(super) const CASES: &[DpkGolden] = &[

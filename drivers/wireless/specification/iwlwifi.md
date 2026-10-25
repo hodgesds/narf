@@ -373,8 +373,8 @@ cache size are bounded. Actual RAM/RFH/TFH fixtures cover native prerequisite
 receipts, optional DQA, current LAR denial/requery, completion before ACK,
 cancellation at each published prerequisite and successful scan reuse. Local
 policy fixtures use the same private admission path without global mutation.
-A retained C oracle compiled from actual Linux headers verifies complete
-MAC/link/SF/power/MCC and versioned channel packed geometry.
+Native Rust tests verify fixed MAC/link/SF/power/MCC and versioned-channel
+wire vectors alongside receipt, policy and ownership invariants.
 
 These contracts do not enable Gen2 native PCI publication. Active station PHY/link activation,
 association management TX/RX, peer/rate/key/Block-Ack and controlled-port
@@ -408,7 +408,7 @@ keep the phase closed and preserve the retained transport/DMA policy. These
 helpers never activate the link, allocate a station packet queue, install a
 peer/key or authorize transmit; active station and native PCI admission remain
 gated on the remaining power/SAR, peer/rate/key/BA, security and recovery work.
-Independent C fixtures compiled from actual Linux headers cover complete PHY
+Fixed source-cited Rust wire fixtures cover complete PHY
 and link/RLC payloads, both channel formats, both bands and each antenna mask.
 
 ### 3.8 Retained TX-disabled API77 AP peer
@@ -443,7 +443,7 @@ or removal stays in its in-progress phase, rejects retries, and prevents scan
 or PHY release. Any malformed, foreign or failed receipt makes the owner
 terminal while retaining its peer and transport/DMA teardown policy.
 
-Independent C output compiled from actual Linux `sta.h` checks the complete
+Fixed Rust vectors based on the documented `sta.h` contract check the complete
 ADD/REMOVE layouts and the disabled-transmit flags. Native RFH/TFH fixtures
 check status/command identity, fresh MCC denial, acknowledged peer reuse,
 invalid profile/BSSID/NVM/policy rejection and cancellation at MCC, ADD and
@@ -488,8 +488,8 @@ storage retained. A failed, malformed or foreign receipt makes the owner
 terminal without releasing uncertain queue/payload DMA. Unexpected outstanding
 packet ownership also prevents retirement rather than being silently freed.
 
-An independent C oracle extracts the operation/command/response definitions
-from Linux `fw/api/{datapath,txq}.h` and management TID from `iwl-trans.h`.
+Fixed Rust vectors record operation/command/response fields and management TID
+from the documented firmware wire contract; historical source citations remain.
 Native RFH/TFH tests compose acknowledged disabled-peer ADD, actual queue
 allocation and source-matched DMA fields, native API-v2 response-fenced queue REMOVE and peer
 REMOVE. They also cover cancellation at both queue boundaries, malformed and
@@ -592,8 +592,8 @@ returns to the management-queue stage. It sends no permissive reset and leaves
 firmware power restrictions intact; queue retirement remains fenced until this
 step. Registry name replacement alone does not revoke an already retained blob.
 
-`mvm_power_linux_oracle.py` compiles Linux's original packed power definitions;
-native RFH/TFH regressions exercise signed registry inputs, CC77 negotiation,
+Native Rust RFH/TFH regressions check the 44-byte packed power wire contract and
+exercise signed registry inputs, CC77 negotiation,
 SAR/link DMA bytes, fresh MCC, NVM/LAR flag differences, restrictive host overlap,
 policy tightening, source-capability revocation, receipt correlation, cancellation
 at each native wait and power-before-queue ordered retirement. Automatic Gen2

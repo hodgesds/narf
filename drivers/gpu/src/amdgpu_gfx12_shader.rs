@@ -1,5 +1,4 @@
 //! Bounded GC12.0.0/12.0.1 wave32 compute proof, on the retained VMID0 test pages.
-//! Shader bytes are independently assembled by tests/gfx12_shader/check.sh.
 //! PM4 logical SH offsets follow Mesa 26.0 ac_cmdbuf.c/si_compute.c;
 //! these are NOT the physical GC12 MMIO register offsets.
 use super::amdgpu_gfx12_queue::Error;

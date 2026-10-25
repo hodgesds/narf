@@ -348,7 +348,7 @@ pub(in crate::rtw89) fn fixture_with_seed(seed: u32) -> (Tssi, Model) {
     assert_eq!(result, Some(Ok(())));
     (owner, model)
 }
-fn smoke_rtw89_b_tssi_full_hwtx_matches_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_tssi_full_hwtx_matches_frozen_references() -> TestResult {
     for &(seed, erased, custom, count, hash, alignment) in CASES {
         let mut model = Model::new(seed);
         let mut owner = Tssi::default();
@@ -372,7 +372,7 @@ fn smoke_rtw89_b_tssi_full_hwtx_matches_original_linux_c() -> TestResult {
             || model.kind.is_some()
         {
             return TestResult::Fail(
-                "full two-path TSSI/PMAC write trace or signed measurement differs from original C",
+                "full two-path TSSI/PMAC write trace or signed measurement differs from the frozen reference",
             );
         }
     }
@@ -380,7 +380,7 @@ fn smoke_rtw89_b_tssi_full_hwtx_matches_original_linux_c() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_tssi_full_hwtx_matches_original_linux_c
+    smoke_rtw89_b_tssi_full_hwtx_matches_frozen_references
 );
 
 fn smoke_rtw89_b_tssi_tracking_bitmap_and_signed_thermal_bounds() -> TestResult {
@@ -418,7 +418,7 @@ kernel_test_in!(
     smoke_rtw89_b_tssi_tracking_bitmap_and_signed_thermal_bounds
 );
 
-fn smoke_rtw89_b_full_rx_ab_path_matches_original_common_source() -> TestResult {
+fn smoke_rtw89_b_full_rx_ab_path_matches_frozen_referencesommon_source() -> TestResult {
     for &(seed, count, hash) in RX_AB_CASES {
         let mut model = Model::new(seed);
         // SAFETY: inert exact B PHY0/channel1/20/RF_AB/rx_nss2 source fixture.
@@ -427,7 +427,7 @@ fn smoke_rtw89_b_full_rx_ab_path_matches_original_common_source() -> TestResult 
             || model.hash != hash
         {
             return TestResult::Fail(
-                "complete initial RXAB/gain/BTG/RF-mode/NSS path differs from original C",
+                "complete initial RXAB/gain/BTG/RF-mode/NSS path differs from the frozen reference",
             );
         }
     }
@@ -435,7 +435,7 @@ fn smoke_rtw89_b_full_rx_ab_path_matches_original_common_source() -> TestResult 
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_full_rx_ab_path_matches_original_common_source
+    smoke_rtw89_b_full_rx_ab_path_matches_frozen_referencesommon_source
 );
 
 fn smoke_rtw89_b_tssi_fail_cancel_revocation_and_ignored_controls_no_completion() -> TestResult {

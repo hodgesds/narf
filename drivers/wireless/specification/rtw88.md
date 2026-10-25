@@ -142,10 +142,11 @@ profile: reserved boundary460, H2C page500, firmware TX page508 and16/16/16/14
 priority-page allocation. LLT completion and empty configured H2C pointers are
 required. Its EDCA/SIFS/receive configuration uses evaluated8821C constants;
 the C22 cut-D PCI quirk is excluded. DMA/MAC TX/RX, packet producers and IRQs
-remain closed throughout. An original-Linux C oracle checks complete inactive
-register traces for two seeded images/cuts. Native owner tests sweep MAC access
-failures, stale hardware reports, LLT cancellation and exact firmware/owner
-retention; packed-factory and pinned raw-firmware-header oracles are independent.
+remain closed throughout. Native Rust tests compare complete inactive register
+traces with frozen reference cases for two seeded images/cuts. They also cover
+MAC access failures, stale hardware reports, LLT cancellation and exact
+firmware/owner retention. Packed-factory offsets and pinned raw-firmware-header
+metadata remain fixed inputs with source provenance.
 
 The C21 continuation then executes the original `rtw8821c_phy_set_param`
 prefix through its three retained channel-filter snapshots. Admission requires
@@ -171,10 +172,10 @@ beamforming setup, and retains its source TXSF2/TXSF6/TXFILTER snapshots for
 those later continuations. Successful parked readbacks alone earn
 `PhyTablesPrepared`; they do not prove hardware calibration.
 
-The independent generator compiles the actual Linux conditional parser,
-MAC/BB/AGC/RF callbacks, SIPI accessor, table loader and exact chip-function
-prefix for all56 cut/package/RFE profiles. Native traces and filter snapshots
-match those oracles; existing49 C22 callback profiles remain covered.
+Native Rust tests check stored table/callback digests and channel-filter
+snapshots for all56 C21 cut/package/RFE profiles and49 C22 cut/RFE profiles.
+The frozen reference data cites Linux `phy.c`, chip callbacks and per-chip table
+sources. No compiler/extraction pipeline participates in this validation.
 Composed regressions preserve the actual reserved-page backend and its
 published firmware DMA buffers through firmware/MAC/PHY success, access
 revocation and cancellation before or during RF table loading. Failed or
@@ -521,7 +522,7 @@ Remaining software ledger:
 | Inactive PCIe MAC/FIFO/LLT/internal H2C queue setup | Implemented in the same retained firmware owners with chip-specific FIFO/EDCA/SIFS and C22-only PCI quirk; packet DMA stays closed |
 | H2C packet ring and port0 command mailbox | Same retained native owner; bounded exact transport receipts and separate IQK completion |
 | Retained complete RTL8822CE factory map | Implemented from same probe EFUSE read; original Linux packed geometry checked |
-| Factory-selected inactive BB/AGC/RF tables | Same-owner C21 package/RFE/one-path SIPI and C22 two-path RFK-init/mixed-access ports; separate original-C oracles and composed failure/cancellation/DMA retention regressions |
+| Factory-selected inactive BB/AGC/RF tables | Same-owner C21 package/RFE/one-path SIPI and C22 two-path RFK-init/mixed-access ports; separate frozen reference fixtures and composed failure/cancellation/DMA retention regressions |
 | Current signed per-board gain/operating-envelope qualification | Implemented loader, exact identity/source ceilings, cap revocation and current-policy checks; real measured signed artifact is an external deployment gate |
 | Fixed awake ch1 radio/DACK/IQK/OTP/qualified power | Implemented for the explicit version2 CCK/control-response profile; real signed measured envelope remains a deployment gate |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
@@ -530,55 +531,45 @@ Remaining software ledger:
 | Device/frame/kernel IP integration | One shell before activation, same Arc lifecycle, bounded synchronous progress; Open/WPA2 real kernel DHCP and exact bidirectional IP pass composed model tests |
 | Reset/suspend/removal, retained-map reclamation and multi-device lifetime | Outside the one-shot awake profile; published mappings remain retained |
 
-Power-table rows were ported from each Linux chip's `trans_*` arrays.
-Their numeric expressions were checked with a C oracle compiled from those
-original arrays; shared-path tests cover all chips, warm/cold boot, cut-C
-filtering, polling retry/failure, unknown cuts, and absent hardware. Loader
-callbacks match a host C oracle compiled from the actual Linux loader
-functions (81 operations). Kernel smokes exercise parser bounds, complete
-section/reserved-page composition, every scripted access failure, stale
-completion, reuse ordering and terminal cancellation. A host fixture
-executes the actual native source with real capability epochs and inert
-PCI/MMIO/coherent mappings; it checks all ring descriptors before BME and
-sweeps allocation/PCI faults, failed readbacks, runtime faults and
-cancellation. A read-only installed NIC image audit covers exact section
-extents and page-body composition; none of these are silicon acceptance.
+Power-table rows are fixed Rust programming data ported from each Linux
+chip's `trans_*` arrays. Native Rust regressions cover all chips, warm/cold boot,
+cut-C filtering, bounded polling/retry/failure, unknown cuts and absent hardware.
+Frozen firmware reference traces cover81 loader operations. Tests also exercise
+header/section bounds, complete reserved-page composition, scripted I/O failures,
+stale completion, reuse ordering and terminal cancellation. Native capability
+regressions reject revoked authority before CPU/config/MMIO/allocation access.
+These are software checks, not silicon acceptance.
 
-An additional host oracle compiles the original `mac.c` FIFO/LLT/H2C setup
-and `rtw8822c.c` MAC function through an explicitly inactive bus adapter.
-Two independently seeded register images cover cut-A and cut-D traces,
-including preserved unrelated bits. Kernel smokes compare the actual Rust
-continuation with those traces and run real firmware-download-to-MAC ownership,
-every access failure, LLT cancellation and invalid H2C pointers. These checks
-establish register/ownership contracts; they do not replace the later composed
-radio/station gates or physical acceptance.
+MAC regressions compare Rust FIFO/LLT/H2C and chip-specific register behavior
+with frozen traces for cut-A/cut-D seeded images, preserving unrelated fields.
+They compose firmware-download and MAC ownership, sweep access failures, cancel
+LLT waits and reject invalid H2C pointers. PHY regressions retain56 C21 and49
+C22 profile digests and source filter snapshots, with same-owner stage faults,
+cancellation, replay refusal and invalid factory/path rejection. Table loading
+remains distinct from successful calibration or station readiness.
 
-The PHY table generator compiles Linux's original condition setup/check/parser
-for every supported cut/RFE PCIe profile and interns identical resulting tables.
-An independent callback oracle also executes the original BB/AGC/RF functions
-and direct/SIPI RF accessors over seeded registers. Regression fixtures compare
-all49 profiles with those access/delay digests, compose actual firmware and MAC
-owners into PHY loading, and cover stage errors, cancellation, replay refusal
-and incomplete factory/physical-path rejection. Table initialization is kept
-distinct from successful hardware calibration and station readiness.
+Frozen radio references cover fresh DACK, TRX/channel/trim and IQK-command
+writes/delays for zero/nonzero seeded register images and distinct RF paths.
+Rust models continue the actual retained firmware/MAC/PHY owners through current
+signed qualification into bounded calibration. They cover missing receipts,
+pending-command cancellation, restrictive live policy, actual cap revocation,
+distinct-path restoration and H2C wrap/foreign-head ownership. Fixed station
+mailbox vectors and control regressions cover readiness/consumption, close during
+a wait, retained cancelled commands and teardown after close.
 
-- Linux `drivers/net/wireless/realtek/rtw88/efuse.c` (read protocol and map).
-- Linux `rtw88/rtw8821c.{c,h}`, `rtw8822b.{c,h}`, `rtw8822c.{c,h}`
-  (geometry, PCIe MAC offsets, and chip-specific LDO controls).
-- Linux `rtw88/fw.c`, `mac.c`, and `pci.c` (remaining firmware lifecycle).
-- Linux `rtw88/pci.c::rtw_pci_io_mapping` (mandatory BAR2 register aperture).
-- Realtek RTL8822C public datasheet.
+The stored reference values are historical Linux-source inputs, not expected
+values calculated from the Rust implementation or an executable equivalence
+proof. RTW88 requires no Python, C compiler, temporary Rust compilation harness
+or external source checkout. The former pipelines were removed; source citations,
+recorded hashes, firmware metadata and the native Rust tests remain in
+`src/rtw88/REFERENCE_FIXTURES.md` and per-fixture provenance. Updates require
+source-contract review and must preserve independent expected values.
 
-The radio oracle compiles the original fresh DACK, TRX/channel/trim, H2C,
-reference/difference/RRSR and IGI/EDCCA source functions. Registered regressions
-compare those actual callbacks, compose the retained firmware owner through
-current signed qualification into bounded calibration, and cover missing
-receipts, pending-command cancellation, restrictive live policy, real cap
-revocation, distinct RF path backup and H2C wrap/foreign-head ownership.
-A separate original-C fixture checks station mailbox command fields; control
-regressions cover held readiness/consumption, close during a wait, retained
-cancelled commands and teardown after close. These are software evidence;
-latest combined gates and physical acceptance remain distinct obligations.
+Source contracts remain Linux `rtw88/efuse.c`, `mac.c`, `fw.c`, `pci.c`,
+`rtw8821c.{c,h}`, `rtw8822b.{c,h}`, `rtw8822c.{c,h}` and the per-chip tables.
+`pci.c::rtw_pci_io_mapping` identifies the mandatory BAR2 register aperture.
+The public Realtek RTL8822C datasheet remains supporting hardware documentation.
+
 Shell-future regressions additionally cover unpublished activation, cancelled
 activation before owner-mutex acquisition, public disconnect reservation before
 the mutex, nonblocking drain, cancellation release and terminal cleanup without

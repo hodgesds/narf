@@ -236,7 +236,7 @@ fn flatten(r: &Results) -> Vec<u8> {
     bytes.push(r.dpd_gain);
     bytes
 }
-fn smoke_rtw89_b_initial_rck_dack_rxdck_match_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_initial_rck_dack_rxdck_match_frozen_references() -> TestResult {
     for &(seed, high, second, count, hash, measurements) in CASES {
         let mut io = Model::new(seed, high, second);
         let mut rfk = Rfk::default();
@@ -249,7 +249,7 @@ fn smoke_rtw89_b_initial_rck_dack_rxdck_match_original_linux_c() -> TestResult {
             || rfk.results().is_none_or(|r| flatten(r) != measurements)
         {
             return TestResult::Fail(
-                "B RCK/DACK/RXDCK read/write/measurement stream differs from original C",
+                "B RCK/DACK/RXDCK read/write/measurement stream differs from the frozen reference",
             );
         }
     }
@@ -257,7 +257,7 @@ fn smoke_rtw89_b_initial_rck_dack_rxdck_match_original_linux_c() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_initial_rck_dack_rxdck_match_original_linux_c
+    smoke_rtw89_b_initial_rck_dack_rxdck_match_frozen_references
 );
 fn smoke_rtw89_b_basic_rfk_error_cancel_and_policy_never_publish_results() -> TestResult {
     let mut baseline = Model::new(0, false, false);
@@ -371,7 +371,7 @@ fn smoke_rtw89_b_channel_rxdck_uses_same_original_source_and_keeps_partial_owner
             || io.count != count
             || io.hash != hash
         {
-            return TestResult::Fail("fresh channel RXDCK differs from original C");
+            return TestResult::Fail("fresh channel RXDCK differs from the frozen reference");
         }
         for failed in 0..io.operations {
             let mut io = Model::new(seed, false, false);

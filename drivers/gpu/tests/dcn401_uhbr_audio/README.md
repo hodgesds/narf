@@ -1,25 +1,15 @@
-# UHBR LPCM reference checks
+# UHBR LPCM regression vectors
 
-`python3 check.py [linux-tree]` compiles the actual static bandwidth routines
-extracted from Linux `dc/dce/dce_audio.c` with Linux's `fixpt31_32.c`, using the
-existing DSC host header shims. It checks 1701 vectors. `--generate` prints a
-replacement vector file; kernel tests consume the checked-in file. Inputs are
-pixel clock in kHz, horizontal active/total, bpc, UHBR rate (10-Mbps units),
-lane count and channel count; output is the supported LPCM sample-rate mask.
+The retained 1701 vectors use pixel clock(kHz), horizontal active/total, bpc,
+UHBR rate(10-Mbps units), lane count and channel count; output is the supported
+LPCM sample-rate mask. The 4536 DSC cases additionally specify compressed
+bits-per-pixel in1/16, slice count and encoder minimum blank width.
 
-The harness supplies NARF's programmed `HBLANK_MIN_SYMBOL_WIDTH`, including
-pixel padding. It deliberately does not use the differently scaled field in
-Linux `populate_audio_dp_link_info`. This verifies `check_audio_bandwidth_dp`
-for that explicit hardware-width input, not all of Linux's audio policy.
-NARF uses stereo layout for mono and the eight-channel layout for 3..8 channels.
-The vectors cover Linux's defined 2/6/8-channel layouts, all UHBR rates/lane
-counts and RGB 8/10/12 bpc, including narrow blanking and rate-filter boundaries.
-`--dsc` checks `dsc_vectors.txt` (4536 cases): compressed streams as
-build_audio_output describes them (dsc_cfg bits per pixel in 1/16, slice
-count), with the encoder's minimum blank width as an explicit input.
-The same harness with `--mst` checks the separate legacy MST vectors in
-`../dcn401_mst_audio`; its default UHBR inputs remain unchanged.
-
-`registers.c` checks all four native APG/stream register offsets and masks
-against Linux DCN401 headers. Its compile command is in the file. These checks
-and the register/ownership models provide no physical playback evidence.
+These static fixtures originated from Linux `dc/dce/dce_audio.c` bandwidth
+arithmetic using the programmed `HBLANK_MIN_SYMBOL_WIDTH`, including pixel
+padding, rather than the differently scaled derived link-info field. Native
+Rust tests call the production bandwidth function. Mono uses stereo layout,
+and 3..8 channels use the eight-channel layout. Fixture agreement establishes
+an internal regression contract, not current Linux conformance or physical
+playback. The source extraction/compiler pipeline and register C shims are
+removed.

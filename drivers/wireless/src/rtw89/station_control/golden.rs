@@ -1,4 +1,5 @@
-// Compiled original Linux AX-v0 role/join/CAM/CCTL/EDCA and table writes.
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
+// Frozen Linux AX-v0 role/join/CAM/CCTL/EDCA and table-write references.
 const LINUX_PAUSE_REGISTER: u32 = 0x9eb0;
 const LINUX_AWAKE_REGISTERS: [(u32, u32); 2] = [(0x1e8, 0x80000000), (0xca0c, 0xe)];
 const LINUX_ROLE: [[u8; 4]; 2] = [[0, 32, 0, 0], [0, 36, 0, 0]];

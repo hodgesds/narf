@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux firmware scheduler SHA256 31339c577a21c3d238293a9c9690c2d34f6e8da0a7af1b4edd11465a5ea154a7
 pub(super) const CASES: &[(u8,u16,u32,u64)] = &[
 (0,0,16,0x41d428ddbf3e43db),

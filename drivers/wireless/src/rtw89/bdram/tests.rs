@@ -158,7 +158,7 @@ fn once<T>(future: impl Future<Output = T>) -> Option<T> {
     }
 }
 
-fn smoke_rtw89_bdram_linux_traces_and_every_access_failure() -> TestResult {
+fn smoke_rtw89_bdram_reference_traces_and_every_access_failure() -> TestResult {
     for case in CASES {
         let mut io = Model::new(case.chip, case.seed);
         let mut owner = Bdram::default();
@@ -201,7 +201,7 @@ fn smoke_rtw89_bdram_linux_traces_and_every_access_failure() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_bdram_linux_traces_and_every_access_failure
+    smoke_rtw89_bdram_reference_traces_and_every_access_failure
 );
 
 fn smoke_rtw89_bdram_idle_reset_deadlines_and_cancel_are_terminal() -> TestResult {

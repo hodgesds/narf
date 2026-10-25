@@ -20,7 +20,7 @@ fn hash(trace: &[(u8, u8, u16, u32)]) -> u64 {
             (8, 0) => 2,
             (1, 8) => 3,
             (0, 8) => 4,
-            _ => panic!("non-C21 PHY oracle operation"),
+            _ => panic!("non-C21 PHY reference operation"),
         };
         for byte in core::iter::once(kind)
             .chain(u32::from(reg).to_le_bytes())
@@ -60,7 +60,7 @@ fn mac_ready() -> Owner<Model> {
     owner.io.trace.clear();
     owner
 }
-fn smoke_rtw8821ce_phy_exact_linux_cut_package_rfe_callbacks_and_prefix() -> TestResult {
+fn smoke_rtw8821ce_phy_reference_cut_package_rfe_callbacks_and_prefix() -> TestResult {
     for (cut, packages) in LINUX_C21_HASHES.iter().enumerate() {
         for (package, rfes) in packages.iter().enumerate() {
             for (rfe_index, kinds) in rfes.iter().enumerate() {
@@ -71,7 +71,7 @@ fn smoke_rtw8821ce_phy_exact_linux_cut_package_rfe_callbacks_and_prefix() -> Tes
                         || hash(&io.trace) != *expected
                     {
                         return TestResult::Fail(
-                            "C21 table callbacks diverged from original Linux parser/accessors",
+                            "C21 table callbacks diverged from the frozen table/callback references",
                         );
                     }
                 }
@@ -79,7 +79,7 @@ fn smoke_rtw8821ce_phy_exact_linux_cut_package_rfe_callbacks_and_prefix() -> Tes
                 let actual = narf_scheduler::block_on(phy8821c::prepare(&mut io, info)).unwrap();
                 let expected = LINUX_C21_PREFIX[cut][package][rfe_index];
                 if hash(&io.trace) != expected.0 || actual.channel_filters != expected.1 {
-                    return TestResult::Fail("C21 pre/post table sequence or retained channel filters differ from original C");
+                    return TestResult::Fail("C21 pre/post table sequence or retained channel filters differ from the frozen reference");
                 }
             }
         }
@@ -88,7 +88,7 @@ fn smoke_rtw8821ce_phy_exact_linux_cut_package_rfe_callbacks_and_prefix() -> Tes
 }
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8821c",
-    smoke_rtw8821ce_phy_exact_linux_cut_package_rfe_callbacks_and_prefix
+    smoke_rtw8821ce_phy_reference_cut_package_rfe_callbacks_and_prefix
 );
 fn smoke_rtw8821ce_same_owner_phy_preserves_closed_mac_and_chip_type() -> TestResult {
     let mut owner = mac_ready();

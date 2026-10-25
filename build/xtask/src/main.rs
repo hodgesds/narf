@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod aarch64_initrd;
 mod affected;
 /// `verification/specification/spec.md` §8's statistics, split out because
 /// they are the only part of xtask with unit tests — a wrong t-distribution
@@ -40,7 +41,6 @@ mod cachyos_root;
 mod ci_clippy;
 mod composition;
 mod crate_release;
-mod gpu_reference;
 mod http3_smoke;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
@@ -49,6 +49,7 @@ mod passthrough;
 mod relocs;
 mod usb_image;
 mod wifi_firmware;
+mod wifi_fixture_tools;
 
 #[derive(Parser)]
 #[command(author, version, about = "NARF build orchestrator")]
@@ -71,8 +72,6 @@ struct RelocsArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Check native GPU reference harnesses against an explicit Linux commit.
-    GpuReference(gpu_reference::Args),
     /// Run the fast, hardware-independent unit-test suite on the host.
     ///
     /// This intentionally names an allowlist: crates that require the
@@ -342,6 +341,8 @@ enum Cmd {
     ImportFirmware(ImportFirmwareArgs),
     /// Inventory Wi-Fi firmware payloads and unresolved deployment prerequisites.
     WifiFirmware(wifi_firmware::Args),
+    /// Extract/check pinned structural Wi-Fi fixtures or encode explicit board facts in Rust.
+    WifiFixtures(wifi_fixture_tools::Args),
 }
 
 #[derive(Parser, Clone)]
@@ -1659,11 +1660,12 @@ impl Arch {
         profile: HwProfile,
         gpu_backend: GpuBackend,
         extra_bootargs: &str,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>> {
+        let kernel_path = kernel;
         let kernel = kernel.display().to_string();
         let gpu_backend = resolve_gpu_backend(self, display, gpu_backend);
         let display = qemu_display_arg(display, gpu_backend);
-        match self {
+        Ok(match self {
             Arch::X86_64 => {
                 // QEMU CPU model can be overridden to exercise the
                 // xAPIC fallback path (no x2APIC) and/or the
@@ -2249,7 +2251,14 @@ impl Arch {
                 .collect::<Vec<_>>()
                 .join(" ");
                 let initrd = TEST_INITRD.lock().ok().and_then(|g| g.clone());
-                let dtb = qemu_virt_dtb_path_with_cmdline(&append, initrd.as_deref());
+                let template = qemu_virt_dtb_path_with_cmdline(&append, initrd.as_deref());
+                let (dtb, initrd_addr) = if let Some(ird) = initrd.as_deref() {
+                    let (path, address) =
+                        aarch64_initrd::place(kernel_path, &template, ird, DTB_LOAD_ADDR)?;
+                    (path, Some(address))
+                } else {
+                    (template, None)
+                };
                 args.extend_from_slice(&[
                     "-device".into(),
                     format!(
@@ -2259,29 +2268,18 @@ impl Arch {
                     ),
                 ]);
 
-                // The initramfs goes in the same way the device tree does, at
-                // the address the tree itself declares. `-initrd` alone is not
-                // enough here: QEMU writes `/chosen` into the tree IT builds,
-                // and this guest reads a pre-built blob handed to it as opaque
-                // bytes, so the properties never reach it. Loading the blob at
-                // the address read back out of that tree makes the two agree
-                // by construction rather than by a hardcoded constant that
-                // could drift from QEMU's placement.
-                if let Some(ref ird) = initrd {
-                    match dtb_initrd_start(&dtb) {
-                        Some(addr) => args.extend_from_slice(&[
-                            "-device".into(),
-                            format!(
-                                "loader,file={},addr={:#x},force-raw=on",
-                                ird.display(),
-                                addr
-                            ),
-                        ]),
-                        None => println!(
-                            "xtask: device tree carries no linux,initrd-start; \
-                             initramfs not delivered"
+                // The Rust placement helper checks the real ELF's PT_LOAD
+                // memory extents, including BSS, then updates both chosen
+                // properties. The loader uses that exact validated address.
+                if let (Some(ird), Some(addr)) = (initrd.as_deref(), initrd_addr) {
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        format!(
+                            "loader,file={},addr={:#x},force-raw=on",
+                            ird.display(),
+                            addr
                         ),
-                    }
+                    ]);
                 }
 
                 // Passed as well, harmlessly: it is what a `-dtb`-style boot
@@ -2296,7 +2294,7 @@ impl Arch {
                 args.push(kernel);
                 args
             }
-        }
+        })
     }
 }
 
@@ -2309,69 +2307,6 @@ const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
 /// generation — the guest finds its initramfs through `/chosen`, so the DTB
 /// must declare where the blob lands before the args naming that blob exist.
 static TEST_INITRD: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-
-/// Read `/chosen/linux,initrd-start` out of a flattened device tree.
-///
-/// On aarch64 the guest is handed a pre-built DTB as opaque bytes, so QEMU
-/// never injects `/chosen` into the tree the kernel actually reads (the same
-/// reason `-append` had to be baked in — see
-/// `qemu_virt_dtb_path_with_cmdline`). The blob is generated WITH `-initrd`
-/// so QEMU writes the properties itself; this reads the address back so the
-/// initramfs can be loaded exactly where the tree says it is. Deriving the
-/// address rather than picking one keeps the two from disagreeing.
-fn dtb_initrd_start(path: &Path) -> Option<u64> {
-    let b = std::fs::read(path).ok()?;
-    let u32at = |o: usize| -> Option<u32> {
-        b.get(o..o + 4)
-            .map(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]]))
-    };
-    if u32at(0)? != 0xd00d_feed {
-        return None;
-    }
-    let off_struct = u32at(8)? as usize;
-    let off_strings = u32at(12)? as usize;
-    let size_struct = u32at(36)? as usize;
-    let st = b.get(off_struct..off_struct + size_struct)?;
-
-    let mut i = 0usize;
-    while i + 4 <= st.len() {
-        let tok = u32::from_be_bytes([st[i], st[i + 1], st[i + 2], st[i + 3]]);
-        i += 4;
-        match tok {
-            // FDT_BEGIN_NODE: NUL-terminated name, padded to 4.
-            1 => {
-                let end = st[i..].iter().position(|c| *c == 0)? + i;
-                i = (end + 4) & !3;
-            }
-            // FDT_PROP: len, name-offset, then value padded to 4.
-            3 => {
-                let len = u32::from_be_bytes([st[i], st[i + 1], st[i + 2], st[i + 3]]) as usize;
-                let noff =
-                    u32::from_be_bytes([st[i + 4], st[i + 5], st[i + 6], st[i + 7]]) as usize;
-                i += 8;
-                let name_start = off_strings + noff;
-                let name_end = b[name_start..].iter().position(|c| *c == 0)? + name_start;
-                if &b[name_start..name_end] == b"linux,initrd-start" {
-                    let v = st.get(i..i + len)?;
-                    return match len {
-                        4 => Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as u64),
-                        8 => Some(u64::from_be_bytes([
-                            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-                        ])),
-                        _ => None,
-                    };
-                }
-                i = (i + len + 3) & !3;
-            }
-            // FDT_END_NODE (2) / FDT_NOP (4) carry no payload; FDT_END (9)
-            // terminates.
-            2 | 4 => {}
-            9 => break,
-            _ => return None,
-        }
-    }
-    None
-}
 
 /// Path to a cached QEMU `virt` device tree, optionally carrying a kernel
 /// command line in `/chosen/bootargs`.
@@ -2455,9 +2390,10 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> Path
                 }
                 // Passing the real initramfs here is what makes QEMU write
                 // `/chosen/linux,initrd-{start,end}` into the dumped tree.
-                // The guest then finds the blob exactly where `dtb_initrd_start`
-                // reads it back and the generic loader puts it — one address,
-                // chosen by QEMU, agreed on by both sides.
+                // The guest reads the chosen start/end properties; the generic
+                // loader and native placement helper agree on one address,
+                // initially chosen by QEMU. The Rust placement helper later
+                // moves it above the real ELF memory extent when necessary.
                 if let Some(ird) = initrd {
                     v.push("-initrd".to_string());
                     v.push(ird.display().to_string());
@@ -4733,7 +4669,7 @@ fn qemu_boot_args(args: &BuildArgs, kernel: &Path) -> Result<Vec<String>> {
         args.hw_profile,
         args.gpu_backend,
         &composition_bootargs,
-    );
+    )?;
     if args.passthrough_devices.iter().any(passthrough::is_display) {
         // The passed-through GPU is the guest's only display adapter: no
         // QEMU VGA and no virtio-gpu for the kernel console or a compositor
@@ -11375,13 +11311,15 @@ mod kernel_test_feature_tests {
                 HwProfile::LegacyOnly,
                 HwProfile::Minimal,
             ] {
-                let args = arch.qemu_args(
-                    std::path::Path::new("kernel"),
-                    "none",
-                    profile,
-                    GpuBackend::Virtio2d,
-                    "",
-                );
+                let args = arch
+                    .qemu_args(
+                        std::path::Path::new("kernel"),
+                        "none",
+                        profile,
+                        GpuBackend::Virtio2d,
+                        "",
+                    )
+                    .unwrap();
                 let backends: Vec<_> = args
                     .windows(2)
                     .filter(|w| w[0] == "-audiodev")
@@ -11422,13 +11360,15 @@ mod kernel_test_feature_tests {
         use super::{Arch, GpuBackend, HwProfile};
 
         for profile in [HwProfile::Full, HwProfile::VirtioOnly] {
-            let args = Arch::X86_64.qemu_args(
-                std::path::Path::new("kernel"),
-                "gtk,gl=on",
-                profile,
-                GpuBackend::Virgl,
-                "",
-            );
+            let args = Arch::X86_64
+                .qemu_args(
+                    std::path::Path::new("kernel"),
+                    "gtk,gl=on",
+                    profile,
+                    GpuBackend::Virgl,
+                    "",
+                )
+                .unwrap();
             assert!(
                 args.windows(2).any(|pair| pair == ["-vga", "none"]),
                 "{profile:?} VirGL fixture must not expose QEMU's default Bochs VGA"
@@ -11436,50 +11376,58 @@ mod kernel_test_feature_tests {
         }
 
         for profile in [HwProfile::LegacyOnly, HwProfile::Minimal] {
-            let args = Arch::X86_64.qemu_args(
-                std::path::Path::new("kernel"),
-                "gtk,gl=on",
-                profile,
-                GpuBackend::Virgl,
-                "",
-            );
+            let args = Arch::X86_64
+                .qemu_args(
+                    std::path::Path::new("kernel"),
+                    "gtk,gl=on",
+                    profile,
+                    GpuBackend::Virgl,
+                    "",
+                )
+                .unwrap();
             assert!(
                 !args.windows(2).any(|pair| pair == ["-vga", "none"]),
                 "{profile:?} has no virtio GPU to own the display"
             );
         }
 
-        let graphical_2d = Arch::X86_64.qemu_args(
-            std::path::Path::new("kernel"),
-            "gtk",
-            HwProfile::VirtioOnly,
-            GpuBackend::Virtio2d,
-            "",
-        );
+        let graphical_2d = Arch::X86_64
+            .qemu_args(
+                std::path::Path::new("kernel"),
+                "gtk",
+                HwProfile::VirtioOnly,
+                GpuBackend::Virtio2d,
+                "",
+            )
+            .unwrap();
         assert!(
             graphical_2d.windows(2).any(|pair| pair == ["-vga", "none"]),
             "graphical virtio-only 2D fixtures must scan out virtio-gpu, not default VGA"
         );
 
-        let headless_2d = Arch::X86_64.qemu_args(
-            std::path::Path::new("kernel"),
-            "none",
-            HwProfile::VirtioOnly,
-            GpuBackend::Virtio2d,
-            "",
-        );
+        let headless_2d = Arch::X86_64
+            .qemu_args(
+                std::path::Path::new("kernel"),
+                "none",
+                HwProfile::VirtioOnly,
+                GpuBackend::Virtio2d,
+                "",
+            )
+            .unwrap();
         assert!(
             !headless_2d.windows(2).any(|pair| pair == ["-vga", "none"]),
             "headless 2D fixtures do not need to alter legacy display coverage"
         );
 
-        let full_2d = Arch::X86_64.qemu_args(
-            std::path::Path::new("kernel"),
-            "gtk",
-            HwProfile::Full,
-            GpuBackend::Virtio2d,
-            "",
-        );
+        let full_2d = Arch::X86_64
+            .qemu_args(
+                std::path::Path::new("kernel"),
+                "gtk",
+                HwProfile::Full,
+                GpuBackend::Virtio2d,
+                "",
+            )
+            .unwrap();
         assert!(
             !full_2d.windows(2).any(|pair| pair == ["-vga", "none"]),
             "full 2D fixtures retain their explicit legacy display coverage"
@@ -14375,7 +14323,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::HostTest => host_test_cmd(),
-        Cmd::GpuReference(args) => gpu_reference::run(&args, &workspace_root()?),
         Cmd::Passthrough(args) => passthrough_cmd(&args),
         Cmd::Relocs(args) => {
             let table = if args.patch {
@@ -14558,6 +14505,7 @@ fn main() -> Result<()> {
         Cmd::PackFirmware(args) => pack_firmware_cmd(&args),
         Cmd::ImportFirmware(args) => import_firmware_cmd(&args),
         Cmd::WifiFirmware(args) => wifi_firmware::run(args),
+        Cmd::WifiFixtures(args) => wifi_fixture_tools::run(args, &workspace_root()?),
         Cmd::Demo(mut args) => {
             if args.features.is_empty() {
                 args.features = "kernel-test,user-mode-testbin".into();

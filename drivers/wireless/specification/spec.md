@@ -37,7 +37,8 @@ supported; a recognized PCI/USB ID or a gated implementation is still open work.
 Readiness is assessed per actual chip/revision, firmware API and board profile.
 Inventory the reference driver's hardware/firmware capability gates, implement
 the reachable control and packet paths, and cover successful transitions plus
-failure/cancellation/ownership with source oracles and both-architecture tests.
+failure/cancellation/ownership with native Rust tests, reviewed fixed reference
+fixtures and both-architecture execution.
 Advertise only features backed by those paths. A feature may be inapplicable
 only with hardware/firmware evidence, not because the initial NARF profile
 omits it. Physical acceptance then supplies RF, interoperability and power
@@ -310,7 +311,7 @@ source band order, correlated PSE reads, then the scoped TX domain and exact
 scan request. The owner rechecks policy before probe admission and during the
 bounded wait, matches the exact scan sequence, and restores the passive NO_IR
 domain after success. Failure/cancellation remains retained for verified reset.
-The 1186-byte request and power-row ordering have original-Linux C oracles;
+The 1186-byte request and power-row ordering have fixed Rust reference fixtures;
 native regressions cover policy/revocation, malformed replies and cancellation.
 
 ### MT76 management TX backend

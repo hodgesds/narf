@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux RX functions/types SHA256 e22aacc0fff53c0b826a64f2ca09368e9b57a191d54a4fe7d24f7e9b73adfa88
 type RxdGolden = ([u32;3],[u32;7]);
 pub(super) const RXD: &[RxdGolden] = &[

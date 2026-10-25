@@ -12,7 +12,7 @@ fn digest(pairs: &[Pair]) -> u64 {
     }
     hash
 }
-fn smoke_rtw89_b_phy_pair_selection_matches_original_linux_c() -> TestResult {
+fn smoke_rtw89_b_phy_pair_selection_matches_frozen_references() -> TestResult {
     let tables = [BB, GAIN, RF_A, RF_B, NCTL];
     for &(index, rfe, cut, count, expected, rejected) in CASES {
         let result = program(tables[index], rfe, cut);
@@ -25,7 +25,7 @@ fn smoke_rtw89_b_phy_pair_selection_matches_original_linux_c() -> TestResult {
                 Ok(pairs) if pairs.len() == count as usize && digest(&pairs) == expected => {}
                 _ => {
                     return TestResult::Fail(
-                        "full selected B PHY pair stream differs from original Linux C",
+                        "full selected B PHY pair stream differs from the frozen reference",
                     )
                 }
             }
@@ -35,7 +35,7 @@ fn smoke_rtw89_b_phy_pair_selection_matches_original_linux_c() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_phy_pair_selection_matches_original_linux_c
+    smoke_rtw89_b_phy_pair_selection_matches_frozen_references
 );
 fn smoke_rtw89_phy_table_bad_grammar_is_rejected_before_io() -> TestResult {
     let a = Pair(0xf0010000, 0);

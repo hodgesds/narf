@@ -30,7 +30,7 @@ fn ready_radio() -> Result<Session<Model>, &'static str> {
     Ok(session)
 }
 fn originals() -> Result<(), &'static str> {
-    const ORIGINAL: &[u8; 4 * 1186] = include_bytes!("scan_oracle.bytes");
+    const ORIGINAL: &[u8; 4 * 1186] = include_bytes!("scan_reference.bytes");
     let channels = crate::mt7921::channel::channels(3);
     let fixtures = [
         scan::scan_request(1, &[1, 6, 36]),
@@ -60,12 +60,12 @@ fn originals() -> Result<(), &'static str> {
     }
     Ok(())
 }
-fn mcu_active_scan_whole_request_matches_original_linux() -> TestResult {
+fn mcu_active_scan_whole_request_matches_frozen_reference() -> TestResult {
     originals().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/scan",
-    mcu_active_scan_whole_request_matches_original_linux
+    mcu_active_scan_whole_request_matches_frozen_reference
 );
 
 fn native() -> Result<(), &'static str> {

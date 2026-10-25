@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Frozen reference data; source provenance is recorded in this file and rtw89/REFERENCE_FIXTURES.md.
 // Original Linux B firmware PHY capability SHA256 17301752a171a0ebc47ba6422bf69df6e848cd89cbbe4fc6e52b273c4efd68fa
 type Golden = (u8, [u32; 4], [u8; 5], u32, u64);
 pub(super) const CASES: &[Golden] = &[

@@ -19,7 +19,7 @@ fn flatten(gain: &Gain) -> Vec<i8> {
     }
     result
 }
-fn smoke_rtw89_b_gain_state_matches_original_linux_signed_callbacks() -> TestResult {
+fn smoke_rtw89_b_gain_state_matches_frozen_signed_references() -> TestResult {
     let gain = Gain::decode(super::super::radio_tables_b::GAIN, 1).unwrap();
     if flatten(&gain) != DEFAULT {
         return TestResult::Fail("real B gain table differs from original Linux state");
@@ -48,5 +48,5 @@ fn smoke_rtw89_b_gain_state_matches_original_linux_signed_callbacks() -> TestRes
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_gain_state_matches_original_linux_signed_callbacks
+    smoke_rtw89_b_gain_state_matches_frozen_signed_references
 );

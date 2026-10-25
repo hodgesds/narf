@@ -96,7 +96,7 @@ fn ready<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_fifo_linux_traces_and_failed_access_retention() -> TestResult {
+fn smoke_rtw89_fifo_reference_traces_and_failed_access_retention() -> TestResult {
     for c in CASES {
         let mut owner = Fifo::default();
         let mut io = Model::new(c.seed);
@@ -131,7 +131,7 @@ fn smoke_rtw89_fifo_linux_traces_and_failed_access_retention() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_fifo_linux_traces_and_failed_access_retention
+    smoke_rtw89_fifo_reference_traces_and_failed_access_retention
 );
 fn smoke_rtw89_fifo_ready_timeout_cancel_and_gone() -> TestResult {
     for c in CASES {

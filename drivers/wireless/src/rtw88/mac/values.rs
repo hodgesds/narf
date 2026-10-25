@@ -1,4 +1,5 @@
-// Evaluated from current Linux rtw88 headers and rtw8822c.c.
+// Frozen reference data; source provenance is recorded in this file and rtw88/REFERENCE_FIXTURES.md.
+// Frozen constants from Linux rtw88 headers and rtw8822c.c.
 pub const BITS_RRSR_RSC: u32 = 0x600000;
 pub const BITS_RXPSF_ERRTHR: u32 = 0x7;
 pub const BITS_RXPSF_PKTLENTHR: u32 = 0xe000;

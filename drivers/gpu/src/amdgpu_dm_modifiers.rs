@@ -17,9 +17,7 @@
 //! - `drm_framebuffer.c`: `framebuffer_check`; `drm_fourcc.c`: the
 //!   `drm_format_info` of the formats amdgpu_dm lists on DCN4.
 //!
-//! `drivers/gpu/tests/amd_modifiers/check.sh` compiles those Linux functions
-//! on the host and pins this module's answers (`vectors.txt`, replayed by
-//! the `drivers/gpu/drm` kernel tests). Nothing here touches hardware.
+//! Nothing here touches hardware.
 
 /// DRM_FORMAT_MOD_LINEAR.
 pub const LINEAR: u64 = 0;
@@ -624,8 +622,6 @@ mod tests {
         }
     }
 
-    /// The answer this module gives for one vectors.txt input line (see
-    /// tests/amd_modifiers/harness.c for the grammar).
     fn answer(input: &str) -> String {
         use core::fmt::Write;
         let mut f = input.split_whitespace();
@@ -715,8 +711,6 @@ mod tests {
         out
     }
 
-    /// Linux's amdgpu_dm / DRM answers for every vectors.txt line
-    /// (tests/amd_modifiers/check.sh builds them from Linux).
     fn amd_modifiers_match_linux_vectors() -> TestResult {
         let mut n = 0;
         for line in VECTORS

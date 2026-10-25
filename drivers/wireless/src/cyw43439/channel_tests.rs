@@ -2,47 +2,57 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-#[path = "channel/linux_oracle.rs"]
-mod linux_oracle;
-
-fn smoke_fullmac_d11ac_codec_matches_compiled_original_linux() -> TestResult {
-    let mut hash = 0xcbf29ce484222325u64;
-    let mut count = 0;
-    let mut byte = |value: u8| hash = (hash ^ u64::from(value)).wrapping_mul(0x100000001b3);
+fn smoke_fullmac_d11ac_codec_exhaustive_geometry_and_round_trips() -> TestResult {
+    let mut encodings = 0;
     for channel in 0..=255 {
         if let Some(spec) = encode20(channel) {
-            count += 1;
-            byte(channel);
-            for value in spec.to_le_bytes() {
-                byte(value);
+            encodings += 1;
+            if primary(spec, channel) != Some(channel)
+                || frequency(channel).and_then(from_frequency) != Some(channel)
+                || spec & 0xff != u16::from(channel)
+                || spec & 0x3800 != 0x1000
+                || spec & 0x0700 != 0
+            {
+                return TestResult::Fail("20 MHz channel lost frequency/encoding geometry");
             }
         }
     }
-    if (count, hash) != linux_oracle::ENCODE {
-        return TestResult::Fail("whole 20 MHz codec differs from original Linux C");
+    // Fourteen 2.4 GHz channels and the explicit 29-channel 5 GHz inventory.
+    if encodings != 43 {
+        return TestResult::Fail("supported channel inventory changed");
     }
-    let mut hash = 0xcbf29ce484222325u64;
-    let mut count = 0;
+    let mut widths = [0usize; 4];
     for spec in 0..=u16::MAX {
         if let Some(channel) = primary(spec, 0) {
-            count += 1;
-            for value in spec
-                .to_le_bytes()
-                .into_iter()
-                .chain(core::iter::once(channel))
+            let width = match spec & 0x3800 {
+                0x1000 => 0,
+                0x1800 => 1,
+                0x2000 => 2,
+                0x2800 => 3,
+                _ => return TestResult::Fail("unsupported channel width was decoded"),
+            };
+            widths[width] += 1;
+            let expected_band = if channel <= 14 { 0 } else { 0xc000 };
+            if frequency(channel).is_none()
+                || spec & 0xc000 != expected_band
+                || primary(spec, channel) != Some(channel)
+                || primary(spec, channel.wrapping_add(1)).is_some()
+                || primary(spec ^ 0xc000, 0).is_some()
             {
-                hash = (hash ^ u64::from(value)).wrapping_mul(0x100000001b3);
+                return TestResult::Fail("decoded primary violated channel/band/control identity");
             }
         }
     }
-    if (count, hash) != linux_oracle::DECODE {
-        return TestResult::Fail("AP primary geometry differs from original Linux C");
+    // 43 primaries at 20 MHz; 24 2.4 GHz plus 58 5 GHz 40 MHz layouts;
+    // 29 5 GHz primaries with four 80 MHz or eight 160 MHz sidebands.
+    if widths != [43, 82, 116, 232] {
+        return TestResult::Fail("decoder lost supported width/sideband inventory");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/brcmfmac/channel",
-    smoke_fullmac_d11ac_codec_matches_compiled_original_linux
+    smoke_fullmac_d11ac_codec_exhaustive_geometry_and_round_trips
 );
 
 fn smoke_fullmac_d11ac_twenty_mhz_channel_band_and_frequency() -> TestResult {

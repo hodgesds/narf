@@ -745,7 +745,7 @@ fn run_and_report(args: &BpfBenchArgs, build: &BuildArgs, accel: &str) -> Result
         build.hw_profile,
         build.gpu_backend,
         "",
-    ));
+    )?);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
     println!("xtask bpf-bench: launching {qemu} {}", kernel.display());

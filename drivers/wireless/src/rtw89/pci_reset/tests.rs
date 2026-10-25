@@ -470,7 +470,7 @@ kernel_test_in!(
     smoke_rtw89_b_flr_real_epoch_revocation_and_fence_binding_are_current
 );
 
-fn smoke_rtw89_b_flr_pending_and_quiet_timing_matches_extracted_linux_c() -> TestResult {
+fn smoke_rtw89_b_flr_pending_and_quiet_timing_matches_frozen_references() -> TestResult {
     for (scenario, expected) in PENDING_READ_TIMES.iter().enumerate() {
         let mut model = Model::new();
         model.pending_until = [0, 300, u64::MAX][scenario];
@@ -498,7 +498,7 @@ fn smoke_rtw89_b_flr_pending_and_quiet_timing_matches_extracted_linux_c() -> Tes
             })
         {
             return TestResult::Fail(
-                "pending read times or minimum FLR quiet time differs from extracted Linux C",
+                "pending read times or minimum FLR quiet time differs from the frozen reference",
             );
         }
     }
@@ -506,5 +506,5 @@ fn smoke_rtw89_b_flr_pending_and_quiet_timing_matches_extracted_linux_c() -> Tes
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_flr_pending_and_quiet_timing_matches_extracted_linux_c
+    smoke_rtw89_b_flr_pending_and_quiet_timing_matches_frozen_references
 );

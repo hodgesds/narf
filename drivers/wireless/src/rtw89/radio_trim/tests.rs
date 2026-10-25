@@ -134,7 +134,7 @@ fn ready<T>(f: impl Future<Output = T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
-fn smoke_rtw89_b_real_physical_trim_matches_original_linux_and_rejects_partial() -> TestResult {
+fn smoke_rtw89_b_real_physical_trim_matches_frozen_references_and_rejects_partial() -> TestResult {
     for &(flags, count, hash) in CASES {
         let mut io = Model::new();
         let mut owner = Trim::default();
@@ -144,7 +144,7 @@ fn smoke_rtw89_b_real_physical_trim_matches_original_linux_and_rejects_partial()
             || io.count != count
             || io.hash != hash
         {
-            return TestResult::Fail("B physical trims differ from original C");
+            return TestResult::Fail("B physical trims differ from the frozen reference");
         }
     }
     for variant in 0..15 {
@@ -176,5 +176,5 @@ fn smoke_rtw89_b_real_physical_trim_matches_original_linux_and_rejects_partial()
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_b_real_physical_trim_matches_original_linux_and_rejects_partial
+    smoke_rtw89_b_real_physical_trim_matches_frozen_references_and_rejects_partial
 );
