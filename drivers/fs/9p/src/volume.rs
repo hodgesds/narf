@@ -32,6 +32,9 @@ pub struct NinepVolume {
     /// The attached root's times, from the `Tstat` Linux's `v9fs_mount`
     /// issues to build the root inode.
     pub root_times: P9Times,
+    /// The attached root's length, from the same mount `Tstat`
+    /// (a directory's length is whatever the server reports).
+    pub root_length: u64,
 }
 
 impl NinepVolume {
@@ -90,9 +93,17 @@ impl NinepVolume {
         }
 
         // ── Tstat(root) ─────────────────────────────────────────
-        let probe =
-            NinepNode::new_root(transport.clone(), session.clone(), root_fid, root_qid, None);
-        let root_times = P9Times::from_stat(&probe.stat_fid(root_fid).await?);
+        let probe = NinepNode::new_root(
+            transport.clone(),
+            session.clone(),
+            root_fid,
+            root_qid,
+            None,
+            0,
+        );
+        let root_stat = probe.stat_fid(root_fid).await?;
+        let root_times = P9Times::from_stat(&root_stat);
+        let root_length = root_stat.length;
 
         Ok(Arc::new(Self {
             transport,
@@ -101,6 +112,7 @@ impl NinepVolume {
             root_qid,
             domain,
             root_times,
+            root_length,
         }))
     }
 }
@@ -121,6 +133,7 @@ impl FsInstance for NinepVolume {
             self.root_fid,
             self.root_qid,
             Some(self.root_times),
+            self.root_length,
         ))
     }
 }
