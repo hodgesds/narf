@@ -227,18 +227,64 @@ capability model, since the writer holds no Power cap.
 
 ### 3.4 Thermal
 
+Two layers, one registration path.
+
+**Generic registry** (`power/src/thermal.rs`): zones with warn/crit
+bands (millidegrees C), `ThermalEvent` publication on the
+`power.thermal` bus topic, and the active-cooling governor — the
+installed `CoolingPolicy` (default `StepPolicy`: Normal → 0,
+Warm → 128, Critical → 255) drives every registered `CoolingDevice`
+inline on a band crossing.
+
 ```rust
-pub struct ThermalZone { pub name: &'static str, pub trips: &'static [TripPoint] }
-pub struct TripPoint { pub temp_mc: i32, pub action: ThermalAction }
+pub fn init();   // create registry + install StepPolicy; safe to call
+                 // more than once — re-init clears the zone tables
+pub fn register_zone(cap: &Cap<Thermal, Grant>, name: &str,
+                     warn_milli: i32, crit_milli: i32)
+    -> Result<u32, ThermalError>;
+pub fn register_cooling_device(cap: &Cap<Thermal, Grant>,
+    dev: Arc<dyn CoolingDevice>) -> Result<(), ThermalError>;
+pub fn record_temp(zone: u32, milli_c: i32)
+    -> Result<ThermalState, ThermalError>;
+pub fn read_temp(zone: u32) -> Result<i32, ThermalError>;
+pub fn zone_count() -> usize;
+pub fn zones_snapshot() -> Vec<(String, i32, ThermalState)>;
+pub fn subscribe(reg: &Cap<TopicRegistry, Read>)
+    -> Result<Subscriber<ThermalEvent>, ThermalError>;
+pub fn install_active_cooling<P: CoolingPolicy>(
+    cap: &Cap<Thermal, Grant>, policy: P) -> Result<(), ThermalError>;
 
-pub enum ThermalAction { Notify, Throttle(u8 /* percent */), EmergencyShutdown }
-
-pub fn register_zone(z: ThermalZone);
-pub fn latest_reading(zone: &str) -> Millidegrees;
+pub trait CoolingDevice: Send + Sync + core::fmt::Debug {
+    fn name(&self) -> &'static str;
+    fn set_level(&self, level: u8);   // 0 = off, 255 = max
+}
 ```
 
-Throttle actions call into DVFS to cap the ceiling; emergency
-shutdown takes the panic path in `frame/` with a clear reason.
+**ACPI layer** (`power/src/acpi_thermal.rs`): the single ACPI
+thermal implementation. It owns zone modelling — `enumerate()`
+(ThermalZone nodes ∪ `PNP0C0F` devices, deduplicated), the full
+trip-point table (`_CRT`/`_HOT`/`_PSV`/`_AC0..=_AC9`/`_TC1`/`_TC2`)
+and `classify()` precedence (ACPI 6.5 §11.4). `drivers/platform`
+carries no zone model of its own (#910).
+
+The bridge between the layers is the only registration/sampling path:
+
+```rust
+// power::acpi_thermal — crit ← _CRT | _HOT | i32::MAX,
+// warn ← _PSV | _AC0 | crit/2; sensorless zones skipped;
+// registration failures logged, never swallowed.
+pub fn register_with_generic_registry(cap: &Cap<Thermal, Grant>) -> usize;
+pub fn sample_all() -> usize;  // evaluate _TMP, record_temp per bridged zone
+```
+
+**Composition order (load-bearing).** `thermal::init()` runs from
+power's `thermal-registry` initcall at **Stage::PostCore**, before
+the Stage::Subsys producers register into it (#907):
+`drivers/platform`'s `acpi-thermal` initcall calls the bridge and
+spawns the single 5 s poll task over `sample_all()`; its `acpi-fan`
+initcall registers `AcpiFan` cooling devices. Both producers log
+registration failures; the fan log prints "no PNP0C0B fans
+discovered" only when discovery genuinely found none.
 
 ### 3.5 Runtime PM for devices
 

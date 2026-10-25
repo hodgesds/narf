@@ -129,14 +129,337 @@ fn smoke_acpi_ec_address_is_stable() -> TestResult {
 }
 kernel_test_in!("drivers/platform/ec", smoke_acpi_ec_address_is_stable);
 
+// ── ACPI thermal fixtures ──────────────────────────────────────
+//
+// Hand-encoded AML (the encoder idiom of aml's own e2e tests),
+// appended to the boot namespace under unique names — no reset, so
+// the real namespace and sibling fixtures are untouched. The
+// fixture zone's `_TMP` reads a mutable Name (TMPV) the test
+// rewrites through a fixture SETT method; the fixture fan's
+// `_FSL`/`_ON`/`_OFF` Store their effect into Names the test reads
+// back. The whole sense → decide → actuate loop is therefore driven
+// and observed through the public AML surface, exactly as on real
+// firmware.
+
+/// PkgLength + NameString(`\SEG`) + body wrapper for Device /
+/// ThermalZone terms (ExtOpPrefix + ext op).
+fn fx_wrap(ext_op: u8, seg: &[u8; 4], inside: &[u8]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    // PkgLength counts the PkgLength field itself.
+    let rest = 1 + 4 + inside.len(); // NameString (root + seg) + inside
+    let value = if rest + 1 < 64 { rest + 1 } else { rest + 2 };
+    let mut v = Vec::new();
+    v.push(0x5B); // ExtOpPrefix
+    v.push(ext_op);
+    if value < 64 {
+        v.push(value as u8);
+    } else {
+        v.push(0x40 | (value as u8 & 0x0F));
+        v.push((value >> 4) as u8);
+    }
+    v.push(b'\\');
+    v.extend_from_slice(seg);
+    v.extend_from_slice(inside);
+    v
+}
+
+/// MethodOp with a single-byte PkgLength (all fixture methods are
+/// small enough).
+fn fx_method(seg: &[u8; 4], flags: u8, body: &[u8]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let value = 1 + 4 + 1 + body.len(); // PkgLength counts itself
+    let mut v = Vec::new();
+    v.push(0x14); // MethodOp
+    v.push(value as u8);
+    v.extend_from_slice(seg);
+    v.push(flags);
+    v.extend_from_slice(body);
+    v
+}
+
+/// Name(seg, WordPrefix value).
+fn fx_name_word(seg: &[u8; 4], value: u16) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut v = Vec::new();
+    v.push(0x08); // NameOp
+    v.extend_from_slice(seg);
+    v.push(0x0B); // WordPrefix
+    v.extend_from_slice(&value.to_le_bytes());
+    v
+}
+
+/// Name(seg, BytePrefix value).
+fn fx_name_byte(seg: &[u8; 4], value: u8) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut v = Vec::new();
+    v.push(0x08); // NameOp
+    v.extend_from_slice(seg);
+    v.push(0x0A); // BytePrefix
+    v.push(value);
+    v
+}
+
+/// Name(seg, 0) via ZeroOp.
+fn fx_name_zero(seg: &[u8; 4]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut v = Vec::new();
+    v.push(0x08); // NameOp
+    v.extend_from_slice(seg);
+    v.push(0x00); // ZeroOp
+    v
+}
+
+/// NameString `\A.B` (root + DualNamePrefix + two segs).
+fn fx_ref2(a: &[u8; 4], b: &[u8; 4]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut v = Vec::new();
+    v.push(b'\\');
+    v.push(0x2E); // DualNamePrefix
+    v.extend_from_slice(a);
+    v.extend_from_slice(b);
+    v
+}
+
+/// Method body `Return(\ZONE.TMPV)`.
+fn fx_tmp_body(zone: &[u8; 4]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut v = Vec::new();
+    v.push(0xA4); // ReturnOp
+    v.extend_from_slice(&fx_ref2(zone, b"TMPV"));
+    v
+}
+
+/// ThermalZone(TZ98) { TMPV=3132, _TMP, _CRT=3732, _PSV=3532 } —
+/// 3132 deciK = 40.05 C, _CRT 100.05 C, _PSV 80.05 C.
+fn fx_zone98() -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut inside = Vec::new();
+    inside.extend_from_slice(&fx_name_word(b"TMPV", 3132));
+    inside.extend_from_slice(&fx_method(b"_TMP", 0, &fx_tmp_body(b"TZ98")));
+    inside.extend_from_slice(&fx_name_word(b"_CRT", 3732));
+    inside.extend_from_slice(&fx_name_word(b"_PSV", 3532));
+    fx_wrap(0x85, b"TZ98", &inside)
+}
+
+/// ThermalZone(TZ99) { TMPV, _TMP, SETT, _CRT=3732, _AC0=3332 } —
+/// deliberately NO _PSV: the bridge maps warn ← _AC0 (60.05 C),
+/// the retired platform duplicate would have used _CRT − 10 C
+/// (90.05 C), so the Warm step at 70.05 C distinguishes them.
+/// Plus Device(FAN9) { _HID="PNP0C0B", FANL=0xFF, FONS=0, _FIF,
+/// _ON, _OFF, _FSL } with observable actuation state.
+fn fx_zone99_fan9() -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut zone = Vec::new();
+    zone.extend_from_slice(&fx_name_word(b"TMPV", 3132));
+    zone.extend_from_slice(&fx_method(b"_TMP", 0, &fx_tmp_body(b"TZ99")));
+    // Method(SETT, 1) { Store(Arg0, \TZ99.TMPV) }
+    let mut sett = Vec::new();
+    sett.push(0x70); // StoreOp
+    sett.push(0x68); // Arg0
+    sett.extend_from_slice(&fx_ref2(b"TZ99", b"TMPV"));
+    zone.extend_from_slice(&fx_method(b"SETT", 1, &sett));
+    zone.extend_from_slice(&fx_name_word(b"_CRT", 3732));
+    zone.extend_from_slice(&fx_name_word(b"_AC0", 3332));
+    let mut blob = fx_wrap(0x85, b"TZ99", &zone);
+
+    let mut fan = Vec::new();
+    // Name(_HID, "PNP0C0B")
+    fan.push(0x08);
+    fan.extend_from_slice(b"_HID");
+    fan.push(0x0D); // StringPrefix
+    fan.extend_from_slice(b"PNP0C0B");
+    fan.push(0x00);
+    fan.extend_from_slice(&fx_name_byte(b"FANL", 0xFF));
+    fan.extend_from_slice(&fx_name_zero(b"FONS"));
+    // Method(_FIF, 0) { Return(1) } — evaluates, so probe sees
+    // fine-grained control; AcpiFan's ladder is then 10 steps.
+    fan.extend_from_slice(&fx_method(b"_FIF", 0, &[0xA4, 0x01]));
+    // Method(_ON, 0) { Store(1, \FAN9.FONS) }
+    let mut on = Vec::new();
+    on.push(0x70);
+    on.push(0x01); // OneOp
+    on.extend_from_slice(&fx_ref2(b"FAN9", b"FONS"));
+    fan.extend_from_slice(&fx_method(b"_ON_", 0, &on));
+    // Method(_OFF, 0) { Store(0, \FAN9.FONS) }
+    let mut off = Vec::new();
+    off.push(0x70);
+    off.push(0x00); // ZeroOp
+    off.extend_from_slice(&fx_ref2(b"FAN9", b"FONS"));
+    fan.extend_from_slice(&fx_method(b"_OFF", 0, &off));
+    // Method(_FSL, 1) { Store(Arg0, \FAN9.FANL) }
+    let mut fsl = Vec::new();
+    fsl.push(0x70);
+    fsl.push(0x68); // Arg0
+    fsl.extend_from_slice(&fx_ref2(b"FAN9", b"FANL"));
+    fan.extend_from_slice(&fx_method(b"_FSL", 1, &fsl));
+    blob.extend_from_slice(&fx_wrap(0x82, b"FAN9", &fan));
+    blob
+}
+
+/// Production gets the thermal registry from power's Stage::PostCore
+/// `thermal-registry` initcall. A sibling power smoke ends with
+/// `thermal::__test_reset()`, so re-init here only if a reset landed
+/// first — the power crate's own test idiom.
+fn ensure_thermal_registry() {
+    if !narf_power::thermal::has_active_cooling() {
+        narf_power::thermal::init();
+    }
+}
+
+/// Read an Integer Name node back out of the namespace.
+fn fx_name_int(path: &str) -> Option<u64> {
+    match narf_aml::find_node(path).and_then(|n| n.value) {
+        Some(narf_aml::NameValue::Integer(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// (temp_milli, state) of a registered generic-registry zone.
+fn snap_zone(path: &str) -> Option<(i32, narf_power::thermal::ThermalState)> {
+    narf_power::thermal::zones_snapshot()
+        .into_iter()
+        .find(|(n, _, _)| n == path)
+        .map(|(_, t, s)| (t, s))
+}
+
 fn smoke_acpi_thermal_discovery() -> TestResult {
-    use narf_power::thermal::zone_count;
-    // `zone_count()` returns a `usize`, so it is always >= 0 — just
-    // confirm the call resolves (the discovery walk didn't panic).
-    let _ = zone_count();
+    // Zone-count assertion against a fixture namespace (#915): the
+    // previous body asserted nothing — `zone_count() >= 0` is true
+    // for a `usize` even with the registry never initialised, which
+    // is how the dead loop shipped unnoticed.
+    let blob = fx_zone98();
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("fixture ThermalZone parse failed");
+    }
+    // The ACPI layer must enumerate the fixture zone...
+    let zones = narf_power::acpi_thermal::enumerate();
+    let zone = match zones.iter().find(|z| z.path == "\\TZ98") {
+        Some(z) => z,
+        None => return TestResult::Fail("enumerate() missed the fixture zone"),
+    };
+    // ...with its trip points modelled (TZ98: _CRT 100.05 C,
+    // _PSV 80.05 C).
+    let trips = zone.trip_points();
+    if trips.critical_milli_c != Some(100_050) || trips.passive_milli_c != Some(80_050) {
+        return TestResult::Fail("fixture zone trip points modelled wrong");
+    }
+    // The bridge must land it in the generic registry, and the
+    // registry's zone count must grow by exactly the bridge's count.
+    ensure_thermal_registry();
+    let cap = narf_power::bootstrap_thermal_authority();
+    let before = narf_power::thermal::zone_count();
+    let n = narf_power::acpi_thermal::register_with_generic_registry(&cap);
+    if n == 0 {
+        return TestResult::Fail("bridge registered no zones (fixture zone should be new)");
+    }
+    if narf_power::thermal::zone_count() != before + n {
+        return TestResult::Fail("zone_count did not grow by the bridge's registered count");
+    }
+    if snap_zone("\\TZ98").is_none() {
+        return TestResult::Fail("fixture zone missing from the generic registry");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/platform/thermal", smoke_acpi_thermal_discovery);
+
+fn smoke_thermal_loop_end_to_end() -> TestResult {
+    use narf_power::thermal::ThermalState;
+
+    // (1) Composition: power's registry initcall is registered at a
+    // stage ordered before the Stage::Subsys producers. This is the
+    // #907 regression oracle — with the initcall absent (or moved
+    // to Subsys, where frame's registration order runs platform's
+    // producers first), registration in a real boot fails
+    // NotInitialised and the loop is dead.
+    let postcore = narf_init::registered_names(narf_init::Stage::PostCore);
+    if !postcore.contains(&"thermal-registry") {
+        return TestResult::Fail("thermal-registry initcall missing at Stage::PostCore");
+    }
+    let subsys = narf_init::registered_names(narf_init::Stage::Subsys);
+    if subsys.contains(&"thermal-registry") {
+        return TestResult::Fail("thermal-registry must not sit at Stage::Subsys");
+    }
+
+    ensure_thermal_registry();
+
+    // (2) Fixture namespace: TZ99 + FAN9 (see fx_zone99_fan9).
+    let blob = fx_zone99_fan9();
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("fixture zone/fan parse failed");
+    }
+
+    // (3) Producers, in boot order (platform registers acpi-thermal
+    // before acpi-fan). thermal::init also spawns the poll task; it
+    // samples the same fixture state, so it cannot disturb the
+    // assertions below — every actuation is a pure function of the
+    // current fixture temperature.
+    crate::thermal::init();
+    crate::fan::init();
+
+    // Prime one sample: temperature lands, state stays Normal, and
+    // the fan is untouched (no crossing → no actuation).
+    let _ = narf_power::acpi_thermal::sample_all();
+    match snap_zone("\\TZ99") {
+        Some((40_050, ThermalState::Normal)) => {}
+        _ => return TestResult::Fail("fixture zone not sampling as Normal at 40.05 C"),
+    }
+    if fx_name_int("\\FAN9.FONS") != Some(0) || fx_name_int("\\FAN9.FANL") != Some(0xFF) {
+        return TestResult::Fail("fan actuated before any crossing");
+    }
+
+    // (4) Warm crossing: SETT 3432 deciK = 70.05 C. With the
+    // bridge's warn ← _AC0 mapping (60.05 C) this is Warm; under the
+    // retired duplicate's _CRT − 10 C warn (90.05 C) it would stay
+    // Normal and the fan would never move — this step pins the
+    // unification (#910), not just the loop.
+    // StepPolicy Warm → level 128; AcpiFan maps that to _ON plus
+    // _FSL step ceil(128 * 10 / 255) = 6 on its 10-step ladder.
+    if narf_aml::eval::evaluate_method("\\TZ99.SETT", &[narf_aml::Value::Integer(3432)]).is_err() {
+        return TestResult::Fail("fixture SETT method failed");
+    }
+    let _ = narf_power::acpi_thermal::sample_all();
+    match snap_zone("\\TZ99") {
+        Some((70_050, ThermalState::Warm)) => {}
+        _ => return TestResult::Fail("70.05 C did not classify Warm (bridge warn mapping?)"),
+    }
+    if fx_name_int("\\FAN9.FONS") != Some(1) {
+        return TestResult::Fail("Warm crossing did not turn the fan on (_ON)");
+    }
+    if fx_name_int("\\FAN9.FANL") != Some(6) {
+        return TestResult::Fail("Warm crossing drove wrong _FSL step (want 6 for level 128)");
+    }
+
+    // (5) Critical crossing: 3832 deciK = 110.05 C ≥ _CRT.
+    // StepPolicy Critical → level 255 → _FSL step 10 (ladder max).
+    if narf_aml::eval::evaluate_method("\\TZ99.SETT", &[narf_aml::Value::Integer(3832)]).is_err() {
+        return TestResult::Fail("fixture SETT method failed");
+    }
+    let _ = narf_power::acpi_thermal::sample_all();
+    match snap_zone("\\TZ99") {
+        Some((110_050, ThermalState::Critical)) => {}
+        _ => return TestResult::Fail("110.05 C did not classify Critical"),
+    }
+    if fx_name_int("\\FAN9.FANL") != Some(10) {
+        return TestResult::Fail("Critical crossing drove wrong _FSL step (want 10 for level 255)");
+    }
+
+    // (6) Back to Normal: 3132 deciK = 40.05 C. Level 0 → _OFF.
+    // Leaves the fixture in the Normal band so the lingering poll
+    // task idles at level 0.
+    if narf_aml::eval::evaluate_method("\\TZ99.SETT", &[narf_aml::Value::Integer(3132)]).is_err() {
+        return TestResult::Fail("fixture SETT method failed");
+    }
+    let _ = narf_power::acpi_thermal::sample_all();
+    match snap_zone("\\TZ99") {
+        Some((40_050, ThermalState::Normal)) => {}
+        _ => return TestResult::Fail("return to 40.05 C did not classify Normal"),
+    }
+    if fx_name_int("\\FAN9.FONS") != Some(0) {
+        return TestResult::Fail("Normal crossing did not turn the fan off (_OFF)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/platform/thermal", smoke_thermal_loop_end_to_end);
 
 fn smoke_ec_sci_dispatch_notifies_subscribers() -> TestResult {
     use crate::ec;

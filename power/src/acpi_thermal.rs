@@ -373,6 +373,11 @@ pub fn enumerate() -> Vec<ThermalZone> {
 // register into that registry so fan / CPU-throttle / NVMe-temp
 // consumers see one cohesive zone list instead of two siloed views.
 //
+// This bridge is the SINGLE ACPI→generic registration/sampling path
+// (#910): `drivers/platform`'s thermal initcall calls
+// `register_with_generic_registry` and polls via `sample_all`; the
+// platform crate carries no zone model of its own.
+//
 // Mapping rules (the trip-point precedence at `classify()` decides):
 //   crit_milli  ← _CRT  (fall back to _HOT, else i32::MAX)
 //   warn_milli  ← _PSV  (fall back to _AC0, else crit_milli/2)
@@ -381,6 +386,7 @@ pub fn enumerate() -> Vec<ThermalZone> {
 
 use crate::thermal as generic;
 use alloc::vec::Vec as AVec;
+use core::fmt::Write;
 use narf_capabilities::{Cap, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -392,37 +398,58 @@ static BRIDGE: IrqSafeSpinLock<AVec<(String, u32)>> = IrqSafeSpinLock::new(AVec:
 /// `crate::thermal` registry, and remember the (path → id) mapping so
 /// `sample_all` can push live `_TMP` readings later.
 ///
-/// Returns the number of zones registered. Idempotent — call once at
-/// Stage::Late or whenever the namespace is stable; a second call
-/// after the bridge is populated re-walks but does NOT double-register
-/// existing paths.
+/// Returns the number of zones newly registered. Idempotent — call
+/// once at Stage::Subsys (from `drivers/platform`'s thermal initcall)
+/// or whenever the namespace is stable; a second call after the bridge
+/// is populated re-walks but does NOT double-register existing paths.
+///
+/// Registration failures are logged, not swallowed (#907): a zone that
+/// cannot register is exactly the dead-loop failure mode this bridge
+/// exists to eliminate, and it must be visible in the boot log.
 pub fn register_with_generic_registry(cap: &Cap<generic::Thermal, Grant>) -> usize {
-    let mut bridge = BRIDGE.lock();
-    let mut newly_registered = 0usize;
-    for zone in enumerate() {
-        if bridge.iter().any(|(p, _)| *p == zone.path) {
-            continue;
+    let mut failures: AVec<(String, generic::ThermalError)> = AVec::new();
+    let newly_registered = {
+        let mut bridge = BRIDGE.lock();
+        let mut newly_registered = 0usize;
+        for zone in enumerate() {
+            if bridge.iter().any(|(p, _)| *p == zone.path) {
+                continue;
+            }
+            // Skip sensorless zones — generic registry assumes a
+            // temperature can always be reported, and ACPI zones that
+            // exist purely to host trip-points without a `_TMP` aren't
+            // useful to cooling policy.
+            if zone.temperature_c_milli().is_err() {
+                continue;
+            }
+            let trips = zone.trip_points();
+            let crit_milli = trips
+                .critical_milli_c
+                .or(trips.hot_milli_c)
+                .unwrap_or(i32::MAX);
+            let warn_milli = trips
+                .passive_milli_c
+                .or(trips.active_milli_c[0])
+                .unwrap_or(crit_milli / 2);
+            match generic::register_zone(cap, &zone.path, warn_milli, crit_milli) {
+                Ok(id) => {
+                    bridge.push((zone.path.clone(), id));
+                    newly_registered += 1;
+                }
+                Err(e) => failures.push((zone.path.clone(), e)),
+            }
         }
-        // Skip sensorless zones — generic registry assumes a temperature
-        // can always be reported, and ACPI zones that exist purely to
-        // host trip-points without a `_TMP` aren't useful to cooling
-        // policy.
-        if zone.temperature_c_milli().is_err() {
-            continue;
-        }
-        let trips = zone.trip_points();
-        let crit_milli = trips
-            .critical_milli_c
-            .or(trips.hot_milli_c)
-            .unwrap_or(i32::MAX);
-        let warn_milli = trips
-            .passive_milli_c
-            .or(trips.active_milli_c[0])
-            .unwrap_or(crit_milli / 2);
-        if let Ok(id) = generic::register_zone(cap, &zone.path, warn_milli, crit_milli) {
-            bridge.push((zone.path.clone(), id));
-            newly_registered += 1;
-        }
+        newly_registered
+    };
+    // Log after dropping the bridge lock — console writes don't belong
+    // under an IRQ-safe spinlock.
+    for (path, e) in &failures {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  acpi-thermal: zone {} failed to register with the generic registry: {:?}",
+            path,
+            e
+        );
     }
     newly_registered
 }
