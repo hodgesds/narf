@@ -1948,15 +1948,24 @@ fn smoke_netdev_publication_two_families() -> TestResult {
     }
     // Route resolution: a /32 connected address on A (TEST-NET-3,
     // chosen narrow so no other test's routes are disturbed) makes
-    // for_dst resolve that exact destination through A.
+    // for_dst resolve that exact destination through A. The address
+    // must come back off A on EVERY exit path below: `add_addr` also
+    // feeds the stack's local-address table (and stamps A's primary),
+    // and 203.0.113.7 is the ABI suite's canonical non-local address —
+    // left assigned, `bind(203.0.113.7)` would succeed for the rest of
+    // the boot instead of returning EADDRNOTAVAIL, breaking the
+    // socket-errno smokes. `del_addr` reverses all of it: the ifaddr
+    // entry, the connected /32 route, and the primary stamp.
     narf_net::iface::add_addr(&a, [203, 0, 113, 7], 32);
-    let Some(dst) = narf_net::iface::for_dst([203, 0, 113, 7]) else {
-        return TestResult::Fail("for_dst found no iface for the published address");
+    let result = match narf_net::iface::for_dst([203, 0, 113, 7]) {
+        None => TestResult::Fail("for_dst found no iface for the published address"),
+        Some(dst) if dst.name != a => {
+            TestResult::Fail("for_dst resolved to a different iface than published")
+        }
+        Some(_) => TestResult::Pass,
     };
-    if dst.name != a {
-        return TestResult::Fail("for_dst resolved to a different iface than published");
-    }
-    TestResult::Pass
+    narf_net::iface::del_addr(&a, [203, 0, 113, 7], 32);
+    result
 }
 kernel_test_in!("drivers/net/core", smoke_netdev_publication_two_families);
 
