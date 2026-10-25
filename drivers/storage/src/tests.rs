@@ -323,7 +323,9 @@ fn smoke_ahci_device_address_is_stable() -> TestResult {
     // matters.
     use narf_block::BlockDeviceSync;
     let mut sector = [0u8; 512];
-    let _ = ahci::AhciBlockSync.read(0, 1, &mut sector);
+    if let Some(sync) = ahci::AhciBlockSync::from_probed() {
+        let _ = sync.read(0, 1, &mut sector);
+    }
     match ahci::dbg_device_addr() {
         Some(a) if a == before => TestResult::Pass,
         Some(_) => TestResult::Fail("HBA address changed across a read"),
@@ -2213,6 +2215,448 @@ kernel_test_in!(
     smoke_ahci_identify_refuses_a_running_port
 );
 
+/// DMA page a command-issuing call programmed into the model's
+/// port 0, recovered from PxCLB/PxCLBU, plus the command-table
+/// address from command-list entry 0. Lets a fixture inspect the
+/// exact FIS bytes the driver built (#841).
+fn model_cmd_addrs(m: &PortModel) -> (u64, u64) {
+    let clb = m.get(m_port(0, 0x00)) as u64 | ((m.get(m_port(0, 0x04)) as u64) << 32);
+    // SAFETY: `clb` is the coherent DMA page the driver allocated
+    // for this command; entry 0's command-table pointer sits at +8.
+    let tbl = unsafe {
+        core::ptr::read_volatile(narf_memory::PhysAddr::new(clb + 8).kernel_ptr::<u64>())
+    };
+    (clb, tbl)
+}
+
+/// Read `n` bytes out of a DMA page at physical address `phys`.
+fn model_dma_bytes(phys: u64, n: usize) -> alloc::vec::Vec<u8> {
+    // SAFETY: the caller guarantees `phys..phys+n` is the coherent
+    // DMA region the driver set up for the command under test.
+    unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(), n).to_vec()
+    }
+}
+
+/// #841: FLUSH CACHE / FLUSH CACHE EXT must reach the port as a
+/// real non-data H2D FIS with the right opcode — driven against
+/// the register model, inspecting the DMA page the driver built.
+fn smoke_ahci_flush_cache_issues_real_fis() -> TestResult {
+    use crate::ahci::flush_cache;
+    for (ext, opcode) in [(true, 0xEAu8), (false, 0xE7u8)] {
+        let mut m = PortModel::new(0b1);
+        m.ready = 0b1;
+        // SAFETY: a register model standing in for the HBA; the
+        // command page is a real coherent allocation the model
+        // never writes, and port 0 is present + ready.
+        let r = unsafe { flush_cache(&m, 1 << 31, 0, ext) };
+        if r.is_err() {
+            return TestResult::Fail("flush_cache failed on a healthy model port");
+        }
+        let (clb, tbl) = model_cmd_addrs(&m);
+        let hdr = model_dma_bytes(clb, 4);
+        // Command List entry 0: PRDT length 0 (non-data), CFL = 5.
+        if hdr[..4] != [5, 0, 0, 0] {
+            return TestResult::Fail("flush command header must be PRDT=0, CFL=5");
+        }
+        let fis = model_dma_bytes(tbl, 20);
+        if fis[0] != 0x27 || fis[1] != 0x80 {
+            return TestResult::Fail("flush FIS must be H2D Register with the C bit set");
+        }
+        if fis[2] != opcode {
+            return TestResult::Fail("flush FIS carries the wrong opcode");
+        }
+        if fis[7] != 0x40 {
+            return TestResult::Fail("flush FIS device byte must select LBA mode");
+        }
+        // The port is left stopped (the final port_idle ran).
+        if m.get(m_port(0, 0x18)) & 1 != 0 {
+            return TestResult::Fail("flush must leave the port idled");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_flush_cache_issues_real_fis
+);
+
+/// #841: DATA SET MANAGEMENT must stage the range buffer exactly
+/// as the ACS lays it out (48-bit LBA + 16-bit count per 8-byte
+/// entry) and issue opcode 0x06 with FEATURE = TRIM, the block
+/// count in the count registers, and a PRDT entry covering the
+/// staged blocks. Chunking past the per-command block limit must
+/// issue further commands.
+fn smoke_ahci_dsm_trim_issues_real_fis() -> TestResult {
+    use crate::ahci::dsm_trim;
+    let mut m = PortModel::new(0b1);
+    m.ready = 0b1;
+    let ranges: [(u64, u16); 2] = [(0x1000, 0x20), (0x5000, 0x10)];
+    // SAFETY: register model; see the flush fixture.
+    let r = unsafe { dsm_trim(&m, 1 << 31, 0, &ranges, 1) };
+    if r.is_err() {
+        return TestResult::Fail("dsm_trim failed on a healthy model port");
+    }
+    let (clb, tbl) = model_cmd_addrs(&m);
+    let hdr = model_dma_bytes(clb, 4);
+    // Command List entry 0: PRDT length 1, W bit set, CFL = 5.
+    if hdr[..4] != [0x45, 0, 1, 0] {
+        return TestResult::Fail("DSM command header must be PRDT=1, W=1, CFL=5");
+    }
+    let fis = model_dma_bytes(tbl, 20);
+    if fis[0] != 0x27 || fis[1] != 0x80 || fis[2] != 0x06 {
+        return TestResult::Fail("DSM FIS must be H2D Register, opcode 0x06");
+    }
+    if fis[3] != 0x01 {
+        return TestResult::Fail("DSM FEATURE byte must be 0x01 (TRIM)");
+    }
+    if fis[12] != 1 || fis[13] != 0 {
+        return TestResult::Fail("DSM sector count must be the staged block count (1)");
+    }
+    // PRDT entry 0 at cmd_tbl + 0x80: data pointer + byte count - 1.
+    let prdt = model_dma_bytes(tbl + 0x80, 16);
+    let data_phys = u64::from_le_bytes(prdt[0..8].try_into().unwrap());
+    if u32::from_le_bytes(prdt[12..16].try_into().unwrap()) != 511 {
+        return TestResult::Fail("DSM PRDT byte count must cover one 512-byte block");
+    }
+    let data = model_dma_bytes(data_phys, 512);
+    // Entry 0: LBA 0x1000 (48-bit LE) + count 0x20 (16-bit LE).
+    if data[0..8] != [0x00, 0x10, 0, 0, 0, 0, 0x20, 0] {
+        return TestResult::Fail("DSM range entry 0 encoding wrong");
+    }
+    // Entry 1: LBA 0x5000 + count 0x10.
+    if data[8..16] != [0x00, 0x50, 0, 0, 0, 0, 0x10, 0] {
+        return TestResult::Fail("DSM range entry 1 encoding wrong");
+    }
+    if data[16..].iter().any(|&b| b != 0) {
+        return TestResult::Fail("unused DSM range entries must be zero");
+    }
+
+    // Chunking: 65 ranges with a 1-block device limit = two
+    // commands; the second stages range 64 alone in its block.
+    let mut m = PortModel::new(0b1);
+    m.ready = 0b1;
+    let many: alloc::vec::Vec<(u64, u16)> = (0..65u64).map(|i| (i * 0x100, 1)).collect();
+    // SAFETY: register model; see above.
+    let r = unsafe { dsm_trim(&m, 1 << 31, 0, &many, 1) };
+    if r.is_err() {
+        return TestResult::Fail("chunked dsm_trim failed on a healthy model port");
+    }
+    let (_clb, tbl) = model_cmd_addrs(&m);
+    let prdt = model_dma_bytes(tbl + 0x80, 16);
+    let data_phys = u64::from_le_bytes(prdt[0..8].try_into().unwrap());
+    let data = model_dma_bytes(data_phys, 512);
+    // Range 64: LBA 64 * 0x100 = 0x4000, count 1.
+    if data[0..8] != [0x00, 0x40, 0, 0, 0, 0, 1, 0] {
+        return TestResult::Fail("the second DSM chunk must stage range 64");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_dsm_trim_issues_real_fis);
+
+/// #841: the IDENTIFY feature decoder + the DSM range encoder are
+/// the pure core of the flush/FUA/TRIM surface — pin their exact
+/// semantics, including the word-validity signatures.
+fn smoke_ahci_identify_features_and_dsm_encoding() -> TestResult {
+    use crate::ahci::{
+        encode_dsm_range_block, identify_ata_features, identify_firmware, identify_model_string,
+        identify_serial,
+    };
+    fn set_word(id: &mut [u8; 512], n: usize, v: u16) {
+        id[2 * n..2 * n + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn set_string(id: &mut [u8; 512], first_word: usize, text: &str) {
+        // ATA strings are byte-swapped per pair, space padded.
+        let mut bytes = alloc::vec![b' '; 40];
+        bytes[..text.len()].copy_from_slice(text.as_bytes());
+        for i in 0..text.len().div_ceil(2) {
+            id[(first_word + i) * 2] = bytes[i * 2 + 1];
+            id[(first_word + i) * 2 + 1] = bytes[i * 2];
+        }
+    }
+
+    let mut id = [0u8; 512];
+    set_word(&mut id, 82, (1 << 5) | (1 << 12)); // WC supported + FLUSH CACHE
+    set_word(&mut id, 83, 0x4000 | (1 << 10) | (1 << 13)); // valid + LBA48 + FLUSH EXT
+    set_word(&mut id, 84, 0x4000 | (1 << 10)); // valid + WRITE DMA FUA EXT
+    set_word(&mut id, 85, 1 << 5); // WC enabled
+    set_word(&mut id, 105, 8); // 8 blocks per DSM command
+    set_word(&mut id, 169, 1); // DSM/TRIM supported
+    set_string(&mut id, 10, "WD-WX21A012345");
+    set_string(&mut id, 23, "01.01A01");
+    set_string(&mut id, 27, "WDC WD10EZEX");
+    let f = identify_ata_features(&id);
+    if !f.lba48
+        || !f.write_cache_supported
+        || !f.write_cache_enabled
+        || !f.flush_cache
+        || !f.flush_cache_ext
+        || !f.write_fua_ext
+        || !f.trim
+        || f.dsm_max_blocks != 8
+    {
+        return TestResult::Fail("feature decode dropped a reported feature");
+    }
+    if identify_serial(&id) != "WD-WX21A012345"
+        || identify_firmware(&id) != "01.01A01"
+        || identify_model_string(&id) != "WDC WD10EZEX"
+    {
+        return TestResult::Fail("ATA string fields must decode byte-swapped + trimmed");
+    }
+
+    // An all-zero block reports nothing (and the DSM limit floors
+    // at 1), and feature bits behind an INVALID word 83 signature
+    // are not believed.
+    let zero = [0u8; 512];
+    let f = identify_ata_features(&zero);
+    if f.lba48 || f.write_cache_enabled || f.flush_cache || f.trim || f.dsm_max_blocks != 1 {
+        return TestResult::Fail("a zero IDENTIFY block must decode to no features");
+    }
+    let mut id = [0u8; 512];
+    set_word(&mut id, 83, (1 << 10) | (1 << 13)); // bits set, signature absent
+    let f = identify_ata_features(&id);
+    if f.lba48 || f.flush_cache_ext {
+        return TestResult::Fail("word 83 features require the validity signature");
+    }
+
+    // The range encoder: exact bytes, 64-entry cap, zero padding.
+    let mut block = [0xFFu8; 512];
+    let used = encode_dsm_range_block(&[(0x0102_0304_0506, 0x0708)], &mut block);
+    if used != 1 || block[0..8] != [0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x08, 0x07] {
+        return TestResult::Fail("DSM entry must be 48-bit LBA LE + 16-bit count LE");
+    }
+    if block[8..].iter().any(|&b| b != 0) {
+        return TestResult::Fail("DSM block tail must be zeroed");
+    }
+    let many: alloc::vec::Vec<(u64, u16)> = (0..65).map(|i| (i as u64, 1)).collect();
+    if encode_dsm_range_block(&many, &mut block) != 64 {
+        return TestResult::Fail("one DSM block holds at most 64 ranges");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_identify_features_and_dsm_encoding
+);
+
+/// Position-sensitive test pattern for the AHCI data-path smokes.
+fn audit_ahci_pattern(i: usize) -> u8 {
+    ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8
+}
+
+/// #930: a single block-surface call far past the historical
+/// 8-block cap — 256 blocks (128 KiB, one transfer-buffer chunk)
+/// plus a 9-block call — must round-trip byte-exact through
+/// `AhciBlockSync`. Uses the middle of the disk, away from the
+/// low LBAs other smokes scribble on.
+fn smoke_ahci_large_transfer_round_trip() -> TestResult {
+    use crate::ahci;
+    use narf_block::BlockDeviceSync;
+    let Some(sync) = ahci::AhciBlockSync::from_probed() else {
+        return TestResult::Skip("AHCI not probed / no disk");
+    };
+    let cap = sync.capacity();
+    if cap < 1024 {
+        return TestResult::Skip("disk too small for the large-transfer fixture");
+    }
+    let base = cap / 2;
+    // 256-block single call.
+    let mut wbuf = alloc::vec![0u8; 256 * 512];
+    for (i, b) in wbuf.iter_mut().enumerate() {
+        *b = audit_ahci_pattern(i);
+    }
+    if sync.write(base, 256, &wbuf).is_err() {
+        return TestResult::Fail("a single 256-block write must succeed (#930)");
+    }
+    let mut rbuf = alloc::vec![0u8; 256 * 512];
+    if sync.read(base, 256, &mut rbuf).is_err() {
+        return TestResult::Fail("a single 256-block read must succeed (#930)");
+    }
+    if rbuf != wbuf {
+        return TestResult::Fail("256-block round-trip data mismatch");
+    }
+    // 9 blocks: one past the historical cap, unaligned chunk edge.
+    let mut w9 = alloc::vec![0u8; 9 * 512];
+    for (i, b) in w9.iter_mut().enumerate() {
+        *b = audit_ahci_pattern(i + 7);
+    }
+    if sync.write(base + 256, 9, &w9).is_err() {
+        return TestResult::Fail("a single 9-block write must succeed (#930)");
+    }
+    let mut r9 = alloc::vec![0u8; 9 * 512];
+    if sync.read(base + 256, 9, &mut r9).is_err() || r9 != w9 {
+        return TestResult::Fail("9-block round-trip data mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_large_transfer_round_trip);
+
+/// #841: the block surface's durability contract on the real
+/// disk — flush succeeds, FUA writes round-trip (natively or via
+/// the write + flush emulation), the advertised capabilities
+/// match an independent IDENTIFY decode, and trim either works
+/// end-to-end or is honestly reported as unsupported (in which
+/// case calling it must fail, not silently succeed).
+fn smoke_ahci_flush_fua_trim_contract() -> TestResult {
+    use crate::ahci;
+    use narf_block::BlockDeviceSync;
+    let Some(sync) = ahci::AhciBlockSync::from_probed() else {
+        return TestResult::Skip("AHCI not probed / no disk");
+    };
+    let cap = sync.capacity();
+    if cap < 64 {
+        return TestResult::Skip("disk too small for the durability fixture");
+    }
+    // Cross-check the surface's claims against a fresh IDENTIFY.
+    let id = ahci::with_controller(|c| {
+        // SAFETY: with_controller holds the request gate; the
+        // block port is a published ATA disk port.
+        unsafe { c.identify_device(c.block_port) }
+    })
+    .and_then(|r| r.ok());
+    if let Some(id) = id {
+        let f = ahci::identify_ata_features(&id);
+        let caps = sync.capabilities();
+        if caps.volatile_cache != f.write_cache_enabled || caps.fua != f.write_fua_ext {
+            return TestResult::Fail("capabilities() must mirror the IDENTIFY feature words");
+        }
+        if sync.supports_trim() != f.trim {
+            return TestResult::Fail("supports_trim() must mirror IDENTIFY word 169");
+        }
+    }
+    if sync.flush().is_err() {
+        return TestResult::Fail("flush() must succeed on a healthy disk");
+    }
+    // Scratch area near the end of the disk.
+    let lba = cap - 16;
+    let mut wbuf = alloc::vec![0u8; 4 * 512];
+    for (i, b) in wbuf.iter_mut().enumerate() {
+        *b = audit_ahci_pattern(i + 3);
+    }
+    if sync.write_fua(lba, 4, &wbuf).is_err() {
+        return TestResult::Fail("write_fua must succeed (native or emulated)");
+    }
+    let mut rbuf = alloc::vec![0u8; 4 * 512];
+    if sync.read(lba, 4, &mut rbuf).is_err() || rbuf != wbuf {
+        return TestResult::Fail("write_fua round-trip data mismatch");
+    }
+    if sync.supports_trim() {
+        if sync.trim(lba, 4).is_err() {
+            return TestResult::Fail("trim must succeed on a trim-capable disk");
+        }
+        // The disk stays fully usable after a trim.
+        if sync.write(lba, 4, &wbuf).is_err() {
+            return TestResult::Fail("write after trim failed");
+        }
+        if sync.read(lba, 4, &mut rbuf).is_err() || rbuf != wbuf {
+            return TestResult::Fail("read after trim + rewrite mismatch");
+        }
+        if sync.trim(lba, 0).is_err() {
+            return TestResult::Fail("a zero-length trim is a no-op success");
+        }
+        if sync.trim(cap - 1, 4).is_ok() {
+            return TestResult::Fail("an out-of-range trim must fail");
+        }
+    } else if sync.trim(lba, 1).is_ok() {
+        return TestResult::Fail("trim on a trim-less disk must fail, not silently succeed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_flush_fua_trim_contract);
+
+/// #931: every published disk of every installed controller has
+/// a `sata<n>` registry entry whose capacity matches its
+/// IDENTIFY record, names are dense from `sata0`, and the
+/// controller registry agrees with the block registry.
+fn smoke_ahci_publishes_every_disk() -> TestResult {
+    use crate::ahci;
+    if !ahci::is_probed() {
+        return TestResult::Skip("AHCI not probed");
+    }
+    let ctrls = ahci::controllers();
+    if ctrls.len() != ahci::controller_count() {
+        return TestResult::Fail("controllers() and controller_count() disagree");
+    }
+    let mut total = 0usize;
+    for c in &ctrls {
+        for disk in c.disks() {
+            let name = alloc::format!("sata{total}");
+            let Some(dev) = narf_block::find_block_device(&name) else {
+                return TestResult::Fail("a published disk has no registry entry");
+            };
+            if dev.capacity() != disk.sectors || disk.sectors == 0 {
+                return TestResult::Fail("registry capacity must match the IDENTIFY record");
+            }
+            total += 1;
+        }
+    }
+    if total == 0 {
+        return TestResult::Skip("no AHCI disks published in this boot");
+    }
+    let extra = alloc::format!("sata{total}");
+    if narf_block::find_block_device(&extra).is_some() {
+        return TestResult::Fail("an unpublished sata name resolves in the registry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_publishes_every_disk);
+
+/// #932: the `ahci` device_pm entry suspends and resumes the real
+/// controller — I/O is refused while suspended (never served from
+/// a quiesced port) and the disk comes back byte-identical after
+/// resume revalidation. Skipped when the AHCI disk is the
+/// designated root: quiescing the running system's root is the
+/// real suspend path's business, not a smoke's.
+fn smoke_ahci_device_pm_round_trip() -> TestResult {
+    use crate::ahci;
+    use narf_block::BlockDeviceSync;
+    let Some(sync) = ahci::AhciBlockSync::from_probed() else {
+        return TestResult::Skip("AHCI not probed / no disk");
+    };
+    if let Some(root) = narf_block::disk_policy::designated_root() {
+        if root.starts_with("sata") {
+            return TestResult::Skip("AHCI disk is the designated root");
+        }
+    }
+    let entries = narf_power::device_pm::registered_devices();
+    let Some(entry) = entries.iter().find(|e| e.name == "ahci") else {
+        return TestResult::Fail("ahci must register with the device_pm fan-out (#932)");
+    };
+    if entry.ops.is_some() {
+        return TestResult::Fail("ahci must register fn-pointer PM handlers");
+    }
+    let cap = sync.capacity();
+    if cap < 64 {
+        return TestResult::Skip("disk too small for the PM fixture");
+    }
+    let lba = cap - 8;
+    let mut baseline = [0u8; 512];
+    if sync.read(lba, 1, &mut baseline).is_err() {
+        return TestResult::Fail("baseline read failed before suspend");
+    }
+    if (entry.suspend)().is_err() {
+        return TestResult::Fail("the ahci suspend handler must succeed on a healthy disk");
+    }
+    let mut byte = [0u8; 512];
+    if sync.read(lba, 1, &mut byte).is_ok() {
+        return TestResult::Fail("reads must be refused while the controller is suspended");
+    }
+    if sync.write(lba, 1, &baseline).is_ok() {
+        return TestResult::Fail("writes must be refused while the controller is suspended");
+    }
+    if (entry.resume)().is_err() {
+        return TestResult::Fail("the ahci resume handler must revalidate the disk");
+    }
+    if sync.capacity() != cap {
+        return TestResult::Fail("capacity must be unchanged after resume");
+    }
+    if sync.read(lba, 1, &mut byte).is_err() || byte != baseline {
+        return TestResult::Fail("the disk must serve identical data after resume");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_device_pm_round_trip);
+
 /// GHC.IE is the HBA's master interrupt gate and must stay clear until the
 /// ISR is installed and routed (it was set at the end of bring-up, before
 /// `probe` had any vector).
@@ -2304,7 +2748,10 @@ fn smoke_ahci_port_bring_up_classifies_qemu_disk() -> TestResult {
     if port != 0 {
         return TestResult::Fail("the QEMU disk sits on port 0");
     }
-    if cap == 0 || ahci::AhciBlockSync.capacity() != cap {
+    let sync_cap = ahci::AhciBlockSync::from_probed()
+        .map(|s| s.capacity())
+        .unwrap_or(0);
+    if cap == 0 || sync_cap != cap {
         return TestResult::Fail("IDENTIFY capacity must be cached and reported");
     }
     TestResult::Pass

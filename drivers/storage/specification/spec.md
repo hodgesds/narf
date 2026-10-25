@@ -64,9 +64,26 @@ All driver code is derived strictly from the references below.
   Each implemented port is deinitialised, given a FIS receive area, spun up,
   COMRESET (`sata_link_debounce`, `SATA_DEB_TIMING_NORMAL`) and waited on for
   BSY (10 s) before its signature is classified. `Ahci::{cap2, handoff,
-  block_port, capacity}`; `identify_n_sectors`; `sata0` reports the IDENTIFY
-  capacity and is partition-scanned (`sata0p<n>`). An HBA without CAP.S64A
-  refuses DMA buffers above 4 GiB. New `AhciError::AhciEnableFailed`.
+  block_port, capacity}`; `identify_n_sectors`. Every probed controller
+  installs in the controller registry (deduplicated by bus address) and
+  every ATA-disk port is IDENTIFYed and published as its own `sata<n>`
+  block device with a `DiskIdentity` (transport `ata`, PCI bus path,
+  model / serial / firmware) and a partition scan (`sata<n>p<m>`) (#931).
+  `AhciBlockSync` is per-disk (controller + port); its transfers chunk
+  at the per-controller 128 KiB DMA transfer buffer, so the block
+  surface takes any request size the registry contract allows (#930).
+  IDENTIFY features (`AtaFeatures` via `identify_ata_features`) drive
+  real FLUSH CACHE / FLUSH CACHE EXT, WRITE DMA FUA EXT (write + flush
+  emulation where unsupported), and DATA SET MANAGEMENT TRIM, with the
+  block adapter advertising Discard only for TRIM-capable disks (#841).
+  The driver registers `ahci` with the `power` device_pm fan-out:
+  suspend flushes + idles every published disk (failure aborts the
+  suspend), resume re-runs the HBA init sequence and revalidates each
+  disk's capacity + model before serving I/O again (#932). Only the
+  first installed HBA owns an IRQ (the ISR is a single-controller
+  design); later HBAs poll. An HBA without CAP.S64A gets its DMA
+  buffers below 4 GiB via the masked allocator. New
+  `AhciError::AhciEnableFailed`.
 - **SDHCI** (`sdhci`): full controller bring-up — software reset,
   power on at 3.3 V, supply 400 kHz init clock, run the SD
   identification sequence (CMD0 / CMD8 / ACMD41 / CMD2 / CMD3 / CMD7

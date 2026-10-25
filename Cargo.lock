@@ -2140,6 +2140,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -2163,6 +2164,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]

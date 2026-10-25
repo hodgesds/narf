@@ -64,64 +64,67 @@ use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTa
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 
-/// Persistent shared scratch for the per-LBA AHCI paths (audit
-/// #3: pre-fix every read/write/identify did
-/// `alloc_coherent(4096)` and dropped it at function end — under
-/// AMD-Vi the freed page could be reused while the controller
-/// still had a delayed DMA write in flight). Single global
-/// 4 KiB shared because all callers serialize on the per-port
-/// busy register; concurrent multi-port AHCI (rare) would still
-/// be correct under this lock but slower than per-port scratches.
-/// Layout matches the per-call buffers: cmd_list@0x000,
-/// fis_recv@0x400, cmd_tbl@0x500, data_buf@0x600 (offsets used
-/// by every path below).
-static AHCI_SCRATCH: narf_lib::sync::IrqSafeSpinLock<Option<DmaBuffer>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Size of the per-controller bulk-transfer DMA buffer (#930).
+/// The block path chunks requests at this size: 128 KiB = 256
+/// sectors per command, carried by a single PRDT entry (the PRDT
+/// byte-count field tops out at 4 MiB).
+pub const AHCI_XFER_BYTES: usize = 128 * 1024;
 
-fn with_ahci_scratch<R>(f: impl FnOnce(&DmaBuffer) -> R) -> Option<R> {
-    let mut g = AHCI_SCRATCH.lock();
-    if g.is_none() {
-        *g = alloc_coherent(4096, DomainId::DRIVER_0).ok();
-    }
-    g.as_ref().map(f)
+/// A DMA staging region for one transfer: the physical address of
+/// a coherent region and how many of its bytes the transfer may
+/// use. Either the scratch page's data area (small transfers) or
+/// the per-controller transfer buffer (bulk, #930).
+#[derive(Copy, Clone, Debug)]
+pub struct DmaStage {
+    pub phys: u64,
+    pub cap: usize,
 }
 
-/// Return the persistent scratch phys address, lazily allocating
-/// on first use. Returns 0 on alloc failure (caller checks).
-/// Thin wrapper around the locked accessor that gives back just
-/// the `phys` so the caller's existing buffer-access code (which
-/// works in raw u64 offsets) doesn't need to nest in a closure.
-/// SAFETY: callers serialise on per-port busy registers; the
-/// returned phys is stable for the controller's lifetime.
-fn ahci_scratch_phys() -> u64 {
-    let phys = with_ahci_scratch(|b| b.dma_addr().raw()).unwrap_or(0);
-    // An HBA without CAP.S64A drops the upper address dwords (Linux sets a
-    // 32-bit DMA mask for it), so a scratch above 4 GiB would send the
-    // device's DMA somewhere else entirely. Refuse instead.
-    if !AHCI_S64A.load(Ordering::Acquire) && phys.saturating_add(4096) > (1u64 << 32) {
-        return 0;
+/// Allocate (once) and return the physical address of one of a
+/// controller's persistent DMA buffers — its 4 KiB command scratch
+/// or its bulk-transfer buffer. Buffers are PER-CONTROLLER state
+/// (#931): two HBAs must never share command structures or a
+/// transfer buffer, so what used to be one global scratch (audit
+/// #3's fix for per-call alloc/free churn) is now a field of
+/// [`Ahci`]. Layout of the scratch page matches the per-call
+/// buffers: cmd_list@0x000, fis_recv@0x400, cmd_tbl@0x500,
+/// data_buf@0x600 (offsets used by every path below).
+///
+/// An HBA without CAP.S64A drops the upper address dwords (Linux
+/// sets a 32-bit DMA mask for it), so the buffer is allocated
+/// through `alloc_coherent_masked` with a 32-bit mask for such
+/// controllers. Returns 0 only on allocation failure (call sites
+/// treat it as a programming error via debug_assert, matching the
+/// pre-DmaBuffer behaviour).
+fn persistent_dma_phys(slot: &IrqSafeSpinLock<Option<DmaBuffer>>, cap: u32, bytes: usize) -> u64 {
+    let mut g = slot.lock();
+    if g.is_none() {
+        let mask = if cap & CAP_S64A != 0 {
+            u64::MAX
+        } else {
+            u32::MAX as u64
+        };
+        *g = narf_io::alloc_coherent_masked(bytes, DomainId::DRIVER_0, mask).ok();
     }
+    let phys = g.as_ref().map(|b| b.dma_addr().raw()).unwrap_or(0);
+    debug_assert!(phys != 0, "AHCI persistent DMA allocation failed");
     phys
 }
-
-/// CAP.S64A of the installed HBA (64-bit DMA addressing). Set by
-/// `Ahci::bring_up`; `true` until then so the QEMU model smokes that
-/// drive the scratch before any bring-up keep their behaviour.
-static AHCI_S64A: AtomicBool = AtomicBool::new(true);
 
 /// Byte offset of the data area inside the shared 4 KiB scratch
 /// (cmd_list@0x000, fis_recv@0x400, cmd_tbl@0x500, data@0x600).
 const SCRATCH_DATA_OFF: usize = 0x600;
 
-/// Payload bytes the scratch can hold past the command structures.
-///
-/// The scratch is ONE 4 KiB coherent page (`alloc_coherent` caps DMA
-/// allocations at a page), so a transfer is limited to
-/// `4096 - 0x600` = 2560 bytes = 5 sectors. The previous per-path
-/// checks allowed 8 sectors (4096 payload bytes), which let both the
-/// host-side zeroing and the device's PRDT DMA run up to 1536 bytes
-/// past the end of the page into whatever the allocator placed next —
-/// an out-of-bounds write reachable from any ≥6-sector registry read.
+/// Payload bytes the scratch's own data area can hold past the
+/// command structures: `4096 - 0x600` = 2560 bytes = 5 sectors.
+/// Transfers that stay inside the scratch page are capped here;
+/// the block path's bulk transfers point the PRDT at the separate
+/// per-controller transfer buffer instead (#930). The cap matters:
+/// the previous per-path checks allowed 8 sectors (4096 payload
+/// bytes) against this 2560-byte area, which let both the host-side
+/// zeroing and the device's PRDT DMA run up to 1536 bytes past the
+/// end of the page into whatever the allocator placed next — an
+/// out-of-bounds write reachable from any ≥6-sector registry read.
 const SCRATCH_DATA_MAX: usize = 4096 - SCRATCH_DATA_OFF;
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -293,6 +296,79 @@ pub struct PortInfo {
     pub kind: PortKind,
 }
 
+/// ATA feature set decoded from an IDENTIFY DEVICE block (#841).
+/// Pure function of the 512-byte block — see
+/// [`identify_ata_features`]. All fields describe what the DEVICE
+/// reports; whether the driver uses a feature is the driver's
+/// business (flush/write_fua/trim consult these).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AtaFeatures {
+    /// LBA48 addressing (IDENTIFY word 83 bit 10, with the word's
+    /// validity signature). Gates FLUSH CACHE EXT / WRITE DMA EXT.
+    pub lba48: bool,
+    /// A write cache is present (word 82 bit 5).
+    pub write_cache_supported: bool,
+    /// A write cache is currently ENABLED (word 85 bit 5): writes
+    /// may complete before reaching the medium.
+    pub write_cache_enabled: bool,
+    /// FLUSH CACHE (0xE7) supported (word 82 bit 12).
+    pub flush_cache: bool,
+    /// FLUSH CACHE EXT (0xEA) supported (word 83 bit 13).
+    pub flush_cache_ext: bool,
+    /// WRITE DMA FUA EXT (0x3D) supported (word 84 bit 10).
+    pub write_fua_ext: bool,
+    /// DATA SET MANAGEMENT (0x06) with the TRIM feature bit
+    /// supported (word 169 bit 0).
+    pub trim: bool,
+    /// Maximum 512-byte blocks per DATA SET MANAGEMENT command
+    /// (word 105). 1 when the word reads 0, per the ACS.
+    pub dsm_max_blocks: u16,
+}
+
+/// Decode the feature words of an IDENTIFY DEVICE block.
+/// Words 82–85 carry a validity signature in their top two bits
+/// (`01b` = valid); features behind an invalid word are reported
+/// as absent, matching libata's `ata_id_has_*` helpers.
+pub fn identify_ata_features(id: &[u8; 512]) -> AtaFeatures {
+    let word = |n: usize| -> u16 { u16::from_le_bytes([id[2 * n], id[2 * n + 1]]) };
+    let w82 = word(82);
+    let w83 = word(83);
+    let w84 = word(84);
+    let w85 = word(85);
+    let valid83 = w83 & 0xC000 == 0x4000;
+    let valid84 = w84 & 0xC000 == 0x4000;
+    let dsm_max = word(105);
+    AtaFeatures {
+        lba48: valid83 && w83 & (1 << 10) != 0,
+        write_cache_supported: w82 & (1 << 5) != 0,
+        write_cache_enabled: w82 & (1 << 5) != 0 && w85 & (1 << 5) != 0,
+        flush_cache: w82 & (1 << 12) != 0,
+        flush_cache_ext: valid83 && w83 & (1 << 13) != 0,
+        write_fua_ext: valid84 && w84 & (1 << 10) != 0,
+        trim: word(169) & 1 != 0,
+        dsm_max_blocks: if dsm_max == 0 { 1 } else { dsm_max },
+    }
+}
+
+/// One published ATA disk on a controller (#931): everything the
+/// block surface, the registry identity, and the suspend/resume
+/// revalidation need to know about the disk behind a port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiskInfo {
+    /// Port index on the owning controller.
+    pub port: u8,
+    /// User-addressable sectors from IDENTIFY DEVICE.
+    pub sectors: u64,
+    /// Feature set from the same IDENTIFY block.
+    pub features: AtaFeatures,
+    /// IDENTIFY model string (words 27–46), trimmed.
+    pub model: alloc::string::String,
+    /// IDENTIFY serial number (words 10–19), trimmed.
+    pub serial: alloc::string::String,
+    /// IDENTIFY firmware revision (words 23–26), trimmed.
+    pub firmware: alloc::string::String,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AhciError {
     BarMapFailed,
@@ -311,6 +387,10 @@ pub enum AhciError {
 /// allocated by `claim_port` (a follow-up).
 pub struct Ahci {
     mmio: MmioRegion,
+    /// Bus address this controller was probed at. The controller
+    /// registry deduplicates on it (#931): a repeat probe of the
+    /// same function is a no-op, a second HBA installs alongside.
+    pub addr: narf_bus::BusAddr,
     pub cap: u32,
     /// CAP2 (zero below AHCI 1.2).
     pub cap2: u32,
@@ -329,12 +409,37 @@ pub struct Ahci {
     /// (and the shared, never-issued command list they point at).
     /// Kept for the HBA's lifetime: a port may post a FIS late.
     _init_dma: Option<DmaBuffer>,
-    /// Serialises synchronous transfers (and the shared
-    /// `AHCI_SCRATCH` contents) across callers. Spun on WITHOUT
-    /// masking interrupts — see [`crate::req_gate::ReqGate`] for why
-    /// this replaces holding `CONTROLLER` across a 30-second-budget
-    /// CI/D2H poll.
+    /// Serialises synchronous transfers (and this controller's
+    /// scratch / transfer-buffer contents) across callers. Spun on
+    /// WITHOUT masking interrupts — see
+    /// [`crate::req_gate::ReqGate`] for why this replaces holding
+    /// the controller lock across a 30-second-budget CI/D2H poll.
     req_gate: AtomicBool,
+    /// This controller's persistent 4 KiB command scratch
+    /// (cmd_list@0x000, fis_recv@0x400, cmd_tbl@0x500,
+    /// data@0x600), allocated lazily by [`Self::scratch_phys`].
+    /// Per-controller since #931 — the pre-#931 single global
+    /// scratch would have two HBAs DMA into the same page.
+    scratch: IrqSafeSpinLock<Option<DmaBuffer>>,
+    /// This controller's persistent bulk-transfer buffer
+    /// ([`AHCI_XFER_BYTES`]) for the block path (#930), allocated
+    /// lazily by [`Self::xfer_phys`].
+    xfer: IrqSafeSpinLock<Option<DmaBuffer>>,
+    /// Disks published for this controller, one per ATA-disk port
+    /// (#931). Filled at probe from per-port IDENTIFY; the
+    /// suspend/resume path revalidates against it (#932).
+    disks: IrqSafeSpinLock<alloc::vec::Vec<DiskInfo>>,
+    /// True between the device_pm suspend handler quiescing this
+    /// controller and the resume handler revalidating it (#932).
+    /// The block surface refuses I/O with `DeviceRemoved` while set.
+    suspended: AtomicBool,
+    /// MSI vector the shared ISR serves for this controller, 0 when
+    /// this controller has none. Only the FIRST installed HBA gets
+    /// the vector: `ahci_isr` + the `AHCI_MMIO_BASE` /
+    /// `AHCI_IRQ_VECTOR` globals are a single-controller design;
+    /// later HBAs poll (their completion waits use the deadline
+    /// fallback) — see `probe`.
+    irq_vector: u8,
 }
 
 impl core::fmt::Debug for Ahci {
@@ -892,7 +997,6 @@ impl Ahci {
         let mmio = unsafe { map_bar(device, ABAR_BAR) }.map_err(|_| AhciError::BarMapFailed)?;
         let cfg = hba_global_init(&Abar(&mmio))?;
         let cap = cfg.cap;
-        AHCI_S64A.store(cap & CAP_S64A != 0, Ordering::Release);
 
         // FIS receive areas for the link bring-up. Without CAP.S64A the
         // HBA only sees the low address dword, so the area must sit
@@ -914,6 +1018,7 @@ impl Ahci {
 
         let mut dev = Self {
             mmio,
+            addr: device.addr,
             cap,
             cap2: cfg.cap2,
             vs: cfg.vs,
@@ -924,6 +1029,11 @@ impl Ahci {
             capacity: 0,
             _init_dma: None,
             req_gate: AtomicBool::new(false),
+            scratch: IrqSafeSpinLock::new(None),
+            xfer: IrqSafeSpinLock::new(None),
+            disks: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            suspended: AtomicBool::new(false),
+            irq_vector: 0,
         };
 
         // Seed every FIS area's D2H Register FIS status (RFIS + 0x40 + 2)
@@ -984,7 +1094,10 @@ impl Ahci {
         bit: u32,
     ) -> Result<(), AhciError> {
         let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
-        let vector = AHCI_IRQ_VECTOR.load(Ordering::Acquire);
+        // Per-controller vector (#931): only the first installed HBA
+        // owns the shared ISR; a later HBA must not await an IRQ
+        // that can only ever describe the first controller's ports.
+        let vector = self.irq_vector;
 
         if vector == 0 {
             // No IRQ wired — issue + sync-poll.
@@ -1178,6 +1291,69 @@ impl Ahci {
         // SAFETY: forwarded caller contract.
         unsafe { identify_device(&Abar(&self.mmio), self.cap, port_idx) }
     }
+
+    /// Physical address of this controller's persistent 4 KiB
+    /// command scratch, allocating it on first use.
+    fn scratch_phys(&self) -> u64 {
+        persistent_dma_phys(&self.scratch, self.cap, 4096)
+    }
+
+    /// Physical address of this controller's persistent
+    /// bulk-transfer buffer ([`AHCI_XFER_BYTES`]), allocating it on
+    /// first use. The block path's PRDT points here for transfers
+    /// larger than the scratch page's data area (#930).
+    fn xfer_phys(&self) -> u64 {
+        persistent_dma_phys(&self.xfer, self.cap, AHCI_XFER_BYTES)
+    }
+
+    /// Snapshot of the disks published for this controller (#931).
+    pub fn disks(&self) -> alloc::vec::Vec<DiskInfo> {
+        self.disks.lock().clone()
+    }
+
+    /// The published disk behind `port`, if that port carries one.
+    pub fn disk_on_port(&self, port: u8) -> Option<DiskInfo> {
+        self.disks.lock().iter().find(|d| d.port == port).cloned()
+    }
+
+    /// Replace the published-disk table (probe fills it before the
+    /// controller is installed; the resume path refreshes it after
+    /// revalidation, #932).
+    fn set_disks(&self, disks: alloc::vec::Vec<DiskInfo>) {
+        *self.disks.lock() = disks;
+    }
+
+    /// True while the device_pm suspend handler has this controller
+    /// quiesced (#932). The block surface refuses I/O in that state.
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(Ordering::Acquire)
+    }
+
+    /// Issue FLUSH CACHE (EXT when `ext`) on a port of this
+    /// controller (#841). See the free [`flush_cache`].
+    ///
+    /// # Safety
+    /// Caller owns the HBA + the named port exclusively (the block
+    /// surface holds the request gate); `port_idx < 32`.
+    pub unsafe fn flush_cache(&self, port_idx: u8, ext: bool) -> Result<(), AhciError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { flush_cache(&Abar(&self.mmio), self.cap, port_idx, ext) }
+    }
+
+    /// Issue DATA SET MANAGEMENT/TRIM for `ranges` on a port of
+    /// this controller (#841). See the free [`dsm_trim`].
+    ///
+    /// # Safety
+    /// Same contract as [`Self::flush_cache`].
+    pub unsafe fn dsm_trim(
+        &self,
+        port_idx: u8,
+        ranges: &[(u64, u16)],
+        max_blocks: u16,
+    ) -> Result<(), AhciError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { dsm_trim(&Abar(&self.mmio), self.cap, port_idx, ranges, max_blocks) }
+    }
 }
 
 /// [`Ahci::identify_device`] over any register block.
@@ -1359,9 +1535,270 @@ pub unsafe fn identify_device(
     Ok(out)
 }
 
+/// Encode one 512-byte DATA SET MANAGEMENT range block: up to 64
+/// ranges, each 8 bytes — 48-bit LBA little-endian followed by a
+/// 16-bit sector count little-endian (ACS, DATA SET MANAGEMENT
+/// parameter layout). Unused entries are zero. Returns how many
+/// of `ranges` were consumed. Pure — the byte-exact fixture for
+/// the TRIM path (#841).
+pub fn encode_dsm_range_block(ranges: &[(u64, u16)], out: &mut [u8; 512]) -> usize {
+    *out = [0u8; 512];
+    let n = ranges.len().min(64);
+    for (i, &(lba, count)) in ranges.iter().take(n).enumerate() {
+        let base = i * 8;
+        out[base..base + 6].copy_from_slice(&lba.to_le_bytes()[..6]);
+        out[base + 6..base + 8].copy_from_slice(&count.to_le_bytes());
+    }
+    n
+}
+
+/// Most 512-byte range blocks one DATA SET MANAGEMENT command
+/// stages in this driver (the range buffer is one allocation).
+pub const DSM_MAX_BLOCKS_PER_CMD: u16 = 256;
+
+/// Issue ATA `FLUSH CACHE` (0xE7) or `FLUSH CACHE EXT` (0xEA) on
+/// the given port (#841): a non-data command that returns only
+/// when the device's volatile write cache has reached the medium.
+/// Same per-call DMA page + forget-on-timeout discipline as
+/// [`identify_device`] — a flush that did not complete must
+/// surface as an error, never as success.
+///
+/// # Safety
+/// `regs` is the HBA the caller owns exclusively; `port_idx < 32`
+/// and the port's PortKind was Sata at probe.
+pub unsafe fn flush_cache(
+    regs: &impl AhciRegs,
+    cap: u32,
+    port_idx: u8,
+    ext: bool,
+) -> Result<(), AhciError> {
+    let off = port_off(port_idx);
+    port_idle(regs, port_idx)?;
+
+    // One 4 KiB DMA page: cmd_list@0x000, fis_recv@0x400,
+    // cmd_tbl@0x500. No data buffer — FLUSH CACHE is non-data
+    // (PRDT length 0).
+    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
+    if cap & CAP_S64A == 0 && scratch.dma_addr().raw() + 4096 > 1u64 << 32 {
+        return Err(AhciError::BarMapFailed);
+    }
+    const OFF_CMD_LIST: u64 = 0x000;
+    const OFF_FIS_RECV: u64 = 0x400;
+    const OFF_CMD_TBL: u64 = 0x500;
+    let cmd_list_dma = scratch.dma_addr_at(OFF_CMD_LIST);
+    let fis_recv_dma = scratch.dma_addr_at(OFF_FIS_RECV);
+    let cmd_tbl_dma = scratch.dma_addr_at(OFF_CMD_TBL);
+
+    // SAFETY: coherent DMA page, reached through the kernel direct map.
+    unsafe {
+        core::ptr::write_bytes(scratch.cpu_mut_ptr::<u8>(), 0, 0x600);
+        // Command List entry 0: CFL = 5, W = 0, PRDT length = 0.
+        core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u32>(OFF_CMD_LIST), 5);
+        core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u32>(OFF_CMD_LIST + 4), 0);
+        core::ptr::write_volatile(
+            scratch.cpu_mut_ptr_at::<u64>(OFF_CMD_LIST + 8),
+            cmd_tbl_dma.raw(),
+        );
+        // CFIS = H2D Register FIS: type 0x27, C bit, opcode
+        // FLUSH CACHE EXT (LBA48 devices) or FLUSH CACHE, device
+        // byte = LBA mode (0x40), as libata programs it.
+        core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL), 0x27);
+        core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 1), 0x80);
+        core::ptr::write_volatile(
+            scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 2),
+            if ext { 0xEA } else { 0xE7 },
+        );
+        core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 7), 0x40);
+    }
+
+    regs.write32(off, cmd_list_dma.raw() as u32);
+    regs.write32(off + 0x04, (cmd_list_dma.raw() >> 32) as u32);
+    regs.write32(off + 0x08, fis_recv_dma.raw() as u32);
+    regs.write32(off + 0x0C, (fis_recv_dma.raw() >> 32) as u32);
+    let serr = regs.read32(off + PORT_SERR);
+    regs.write32(off + PORT_SERR, serr);
+    regs.write32(off + PORT_IS, 0xFFFF_FFFF);
+    let cmd = regs.read32(off + PORT_CMD);
+    regs.write32(off + PORT_CMD, cmd | CMD_FRE);
+    let cmd = regs.read32(off + PORT_CMD);
+    regs.write32(off + PORT_CMD, cmd | CMD_ST);
+
+    compiler_fence(Ordering::SeqCst);
+    regs.write32(off + PORT_CI, 1);
+
+    // A flush drains the whole write cache; spinning media can
+    // take seconds. Same 30 s budget as the DMA paths.
+    let mut errored = false;
+    let done = narf_scheduler::responsive_spin_until(
+        || {
+            let ci = regs.read32(off + PORT_CI);
+            let tfd = regs.read32(off + PORT_TFD);
+            if tfd & 0x01 != 0 {
+                errored = true;
+                return true;
+            }
+            ci & 1 == 0
+        },
+        narf_time::Deadline::after_ms(30_000),
+    );
+    if errored || !done {
+        // The HBA may still own the command; never hand the page
+        // back while it can be a DMA target.
+        core::mem::forget(scratch);
+        return Err(AhciError::ResetTimeout);
+    }
+    if let Err(e) = port_idle(regs, port_idx) {
+        core::mem::forget(scratch);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Issue ATA `DATA SET MANAGEMENT` (0x06, FEATURE = 0x0001 TRIM)
+/// for `ranges` on the given port (#841), chunking the range list
+/// into commands of at most `max_blocks` 512-byte range blocks
+/// (the device's IDENTIFY word 105 limit) and at most
+/// [`DSM_MAX_BLOCKS_PER_CMD`] blocks per command. Each command
+/// returns only on completion; a failed chunk aborts the rest
+/// (earlier chunks are already trimmed — chunked TRIM is inherently
+/// partial, like Linux's per-request discard splitting).
+///
+/// # Safety
+/// `regs` is the HBA the caller owns exclusively; `port_idx < 32`
+/// and the port's PortKind was Sata at probe.
+pub unsafe fn dsm_trim(
+    regs: &impl AhciRegs,
+    cap: u32,
+    port_idx: u8,
+    ranges: &[(u64, u16)],
+    max_blocks: u16,
+) -> Result<(), AhciError> {
+    if ranges.is_empty() {
+        return Ok(());
+    }
+    let blocks_per_cmd = max_blocks.clamp(1, DSM_MAX_BLOCKS_PER_CMD) as usize;
+    let alloc_bytes = 0x600 + blocks_per_cmd * 512;
+    let off = port_off(port_idx);
+
+    let scratch =
+        alloc_coherent(alloc_bytes, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
+    if cap & CAP_S64A == 0 && scratch.dma_addr().raw() + alloc_bytes as u64 > 1u64 << 32 {
+        return Err(AhciError::BarMapFailed);
+    }
+    const OFF_CMD_LIST: u64 = 0x000;
+    const OFF_FIS_RECV: u64 = 0x400;
+    const OFF_CMD_TBL: u64 = 0x500;
+    const OFF_DATA: u64 = 0x600;
+    const OFF_PRDT: u64 = OFF_CMD_TBL + 0x80;
+    let cmd_list_dma = scratch.dma_addr_at(OFF_CMD_LIST);
+    let fis_recv_dma = scratch.dma_addr_at(OFF_FIS_RECV);
+    let cmd_tbl_dma = scratch.dma_addr_at(OFF_CMD_TBL);
+    let data_dma = scratch.dma_addr_at(OFF_DATA);
+
+    let mut idx = 0usize;
+    while idx < ranges.len() {
+        let take = (blocks_per_cmd * 64).min(ranges.len() - idx);
+        let n_blocks = take.div_ceil(64);
+        port_idle(regs, port_idx)?;
+
+        // Stage the range blocks for this chunk.
+        // SAFETY: coherent DMA page, reached through the kernel
+        // direct map; regions are disjoint and in bounds.
+        unsafe {
+            core::ptr::write_bytes(scratch.cpu_mut_ptr::<u8>(), 0, 0x600 + n_blocks * 512);
+            let mut block = [0u8; 512];
+            for b in 0..n_blocks {
+                let start = idx + b * 64;
+                let end = (start + 64).min(idx + take);
+                encode_dsm_range_block(&ranges[start..end], &mut block);
+                core::ptr::copy_nonoverlapping(
+                    block.as_ptr(),
+                    scratch.cpu_mut_ptr_at::<u8>(OFF_DATA + (b * 512) as u64),
+                    512,
+                );
+            }
+            // Command List entry 0: CFL = 5, W = 1 (host→device
+            // data), PRDT length = 1.
+            core::ptr::write_volatile(
+                scratch.cpu_mut_ptr_at::<u32>(OFF_CMD_LIST),
+                (1u32 << 16) | (1u32 << 6) | 5,
+            );
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u32>(OFF_CMD_LIST + 4), 0);
+            core::ptr::write_volatile(
+                scratch.cpu_mut_ptr_at::<u64>(OFF_CMD_LIST + 8),
+                cmd_tbl_dma.raw(),
+            );
+            // CFIS: type 0x27, C bit, opcode 0x06 (DATA SET
+            // MANAGEMENT), FEATURE = 0x0001 (TRIM) at +3, device =
+            // LBA mode at +7, 16-bit block count at +12/+13 (the
+            // EXT-style layout this driver's DMA commands use).
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL), 0x27);
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 1), 0x80);
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 2), 0x06);
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 3), 0x01);
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 7), 0x40);
+            core::ptr::write_volatile(
+                scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 12),
+                (n_blocks & 0xFF) as u8,
+            );
+            core::ptr::write_volatile(
+                scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 13),
+                ((n_blocks >> 8) & 0xFF) as u8,
+            );
+            // PRDT entry 0 → the staged range blocks.
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u64>(OFF_PRDT), data_dma.raw());
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u32>(OFF_PRDT + 8), 0);
+            core::ptr::write_volatile(
+                scratch.cpu_mut_ptr_at::<u32>(OFF_PRDT + 12),
+                (n_blocks * 512 - 1) as u32,
+            );
+        }
+
+        regs.write32(off, cmd_list_dma.raw() as u32);
+        regs.write32(off + 0x04, (cmd_list_dma.raw() >> 32) as u32);
+        regs.write32(off + 0x08, fis_recv_dma.raw() as u32);
+        regs.write32(off + 0x0C, (fis_recv_dma.raw() >> 32) as u32);
+        let serr = regs.read32(off + PORT_SERR);
+        regs.write32(off + PORT_SERR, serr);
+        regs.write32(off + PORT_IS, 0xFFFF_FFFF);
+        let cmd = regs.read32(off + PORT_CMD);
+        regs.write32(off + PORT_CMD, cmd | CMD_FRE);
+        let cmd = regs.read32(off + PORT_CMD);
+        regs.write32(off + PORT_CMD, cmd | CMD_ST);
+
+        compiler_fence(Ordering::SeqCst);
+        regs.write32(off + PORT_CI, 1);
+
+        let mut errored = false;
+        let done = narf_scheduler::responsive_spin_until(
+            || {
+                let ci = regs.read32(off + PORT_CI);
+                let tfd = regs.read32(off + PORT_TFD);
+                if tfd & 0x01 != 0 {
+                    errored = true;
+                    return true;
+                }
+                ci & 1 == 0
+            },
+            narf_time::Deadline::after_ms(30_000),
+        );
+        if errored || !done {
+            core::mem::forget(scratch);
+            return Err(AhciError::ResetTimeout);
+        }
+        if let Err(e) = port_idle(regs, port_idx) {
+            core::mem::forget(scratch);
+            return Err(e);
+        }
+        idx += take;
+    }
+    Ok(())
+}
+
 /// Issue ATA `WRITE DMA EXT` (opcode 0x35) for `n_sectors`
-/// 512-byte sectors starting at `lba`, sourcing from `data`. Same
-/// scratch-page shape as READ DMA EXT.
+/// 512-byte sectors starting at `lba`, sourcing from `data`,
+/// staged through the scratch page's data area (≤
+/// [`SCRATCH_DATA_MAX`] bytes).
 ///
 /// # Safety
 /// Same as `ahci_read_lba`.
@@ -1372,7 +1809,66 @@ pub unsafe fn ahci_write_lba(
     n_sectors: u16,
     data: &[u8],
 ) -> Result<(), AhciError> {
-    if n_sectors == 0 || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX {
+    // SAFETY: forwarded caller contract; the data area is the
+    // scratch page's own region past the command structures.
+    unsafe {
+        ahci_write_lba_xfer(
+            ahci,
+            port_idx,
+            lba,
+            n_sectors,
+            data,
+            DmaStage {
+                phys: ahci.scratch_phys() + SCRATCH_DATA_OFF as u64,
+                cap: SCRATCH_DATA_MAX,
+            },
+            false,
+        )
+    }
+}
+
+/// Issue ATA `WRITE DMA FUA EXT` (opcode 0x3D) (#841): like
+/// [`ahci_write_lba`], but the device must commit the data to the
+/// medium before reporting completion, bypassing its volatile
+/// write cache for these sectors. Only valid on devices whose
+/// IDENTIFY reports WRITE DMA FUA EXT (word 84 bit 10) — the
+/// caller (the block surface) checks.
+///
+/// # Safety
+/// Same as `ahci_read_lba`.
+pub unsafe fn ahci_write_lba_fua(
+    ahci: &Ahci,
+    port_idx: u8,
+    lba: u64,
+    n_sectors: u16,
+    data: &[u8],
+    stage: DmaStage,
+) -> Result<(), AhciError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { ahci_write_lba_xfer(ahci, port_idx, lba, n_sectors, data, stage, true) }
+}
+
+/// Shared WRITE DMA (FUA) EXT body. Command structures live in
+/// the controller's scratch page; the payload is staged in
+/// `stage` — the scratch page's data area for small transfers, the
+/// per-controller transfer buffer for bulk ones (#930). The PRDT
+/// carries a single entry, so `n_sectors * 512 <= stage.cap` and
+/// `stage.cap` must stay within the PRDT 4 MiB byte-count limit.
+///
+/// # Safety
+/// Same as `ahci_read_lba`; `stage` must name a coherent DMA
+/// region of at least `stage.cap` bytes owned by `ahci`.
+pub unsafe fn ahci_write_lba_xfer(
+    ahci: &Ahci,
+    port_idx: u8,
+    lba: u64,
+    n_sectors: u16,
+    data: &[u8],
+    stage: DmaStage,
+    fua: bool,
+) -> Result<(), AhciError> {
+    let data_buf = stage.phys;
+    if n_sectors == 0 || (n_sectors as usize) * 512 > stage.cap {
         return Err(AhciError::BarMapFailed);
     }
     if data.len() < (n_sectors as usize) * 512 {
@@ -1382,26 +1878,25 @@ pub unsafe fn ahci_write_lba(
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    // Persistent shared scratch (audit #3 — pre-fix this was
-    // alloc_coherent per call, dropped on return; freed page
-    // could be reused while AHCI still had a delayed DMA in
+    // Persistent per-controller scratch (audit #3 — pre-fix this
+    // was alloc_coherent per call, dropped on return; the freed
+    // page could be reused while AHCI still had a delayed DMA in
     // flight under AMD-Vi).
-    let base = ahci_scratch_phys();
+    let base = ahci.scratch_phys();
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
     let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
-    let data_buf = base + 0x600;
     // Zero the cmd-list / FIS / cmd-table prefix; copy caller payload
     // into the data buffer. Bulk `write_bytes` / `copy_nonoverlapping`
     // rather than per-byte volatile loops — the scratch is coherent
     // DMA memory, not MMIO, and the fence before the CI doorbell below
     // is what publishes these stores before the device can look.
     // SAFETY: coherent DMA reached through the kernel direct map; `data` is a kernel slice that
-    // cannot overlap the scratch page, and the caller-checked
-    // `n_sectors * 512 <= 4096` keeps the copy inside the data area.
+    // cannot overlap the staging region, and the entry check
+    // `n_sectors * 512 <= stage.cap` keeps the copy inside it.
     unsafe {
         core::ptr::write_bytes(
             narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
@@ -1432,7 +1927,8 @@ pub unsafe fn ahci_write_lba(
         );
     }
 
-    // CFIS = H2D for WRITE DMA EXT (0x35).
+    // CFIS = H2D for WRITE DMA EXT (0x35), or WRITE DMA FUA EXT
+    // (0x3D) when `fua` — identical FIS layout, FUA semantics.
     // SAFETY: coherent DMA reached through the kernel direct map.
     unsafe {
         core::ptr::write_volatile(
@@ -1445,7 +1941,7 @@ pub unsafe fn ahci_write_lba(
         );
         core::ptr::write_volatile(
             narf_memory::PhysAddr::new(cmd_tbl + 2).kernel_mut_ptr::<u8>(),
-            0x35,
+            if fua { 0x3D } else { 0x35 },
         );
         core::ptr::write_volatile(
             narf_memory::PhysAddr::new(cmd_tbl + 3).kernel_mut_ptr::<u8>(),
@@ -1556,11 +2052,10 @@ pub unsafe fn ahci_write_lba(
 
 /// Issue ATA `READ DMA EXT` (opcode 0x25) for `n_sectors` 512-byte
 /// sectors starting at `lba`, copying the result into `out`. `out`
-/// must be at least `n_sectors * 512` bytes.
-///
-/// Stage-4 cut: same per-call DMA scratch + single-PRDT-entry shape
-/// as identify_device. Caps `n_sectors * 512` at 4096 bytes (one
-/// page) — multi-page reads need a multi-PRDT chain.
+/// must be at least `n_sectors * 512` bytes. The transfer is staged
+/// through the scratch page's data area (≤ [`SCRATCH_DATA_MAX`]
+/// bytes); bulk callers use [`ahci_read_lba_xfer`] with the
+/// per-controller transfer buffer (#930).
 ///
 /// # Safety
 /// Same as `identify_device`.
@@ -1571,7 +2066,42 @@ pub unsafe fn ahci_read_lba(
     n_sectors: u16,
     out: &mut [u8],
 ) -> Result<(), AhciError> {
-    if n_sectors == 0 || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX {
+    // SAFETY: forwarded caller contract; the data area is the
+    // scratch page's own region past the command structures.
+    unsafe {
+        ahci_read_lba_xfer(
+            ahci,
+            port_idx,
+            lba,
+            n_sectors,
+            out,
+            DmaStage {
+                phys: ahci.scratch_phys() + SCRATCH_DATA_OFF as u64,
+                cap: SCRATCH_DATA_MAX,
+            },
+        )
+    }
+}
+
+/// Shared READ DMA EXT body. Command structures live in the
+/// controller's scratch page; the payload lands in `stage` before
+/// being copied to `out` — the scratch page's data area for small
+/// transfers, the per-controller transfer buffer for bulk ones
+/// (#930). Single PRDT entry, so `n_sectors * 512 <= stage.cap`.
+///
+/// # Safety
+/// Same as `identify_device`; `stage` must name a coherent DMA
+/// region of at least `stage.cap` bytes owned by `ahci`.
+pub unsafe fn ahci_read_lba_xfer(
+    ahci: &Ahci,
+    port_idx: u8,
+    lba: u64,
+    n_sectors: u16,
+    out: &mut [u8],
+    stage: DmaStage,
+) -> Result<(), AhciError> {
+    let data_buf = stage.phys;
+    if n_sectors == 0 || (n_sectors as usize) * 512 > stage.cap {
         return Err(AhciError::BarMapFailed);
     }
     if out.len() < (n_sectors as usize) * 512 {
@@ -1581,18 +2111,17 @@ pub unsafe fn ahci_read_lba(
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    // Persistent shared scratch (audit #3 — pre-fix this was
-    // alloc_coherent per call, dropped on return; freed page
-    // could be reused while AHCI still had a delayed DMA in
+    // Persistent per-controller scratch (audit #3 — pre-fix this
+    // was alloc_coherent per call, dropped on return; the freed
+    // page could be reused while AHCI still had a delayed DMA in
     // flight under AMD-Vi).
-    let base = ahci_scratch_phys();
+    let base = ahci.scratch_phys();
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
     let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
-    let data_buf = base + 0x600;
     // Bulk `write_bytes`, not a per-byte volatile loop: this ran one
     // `write_volatile` per byte, which the compiler cannot vectorise
     // or turn into a `memset`, so every read paid thousands of
@@ -1600,14 +2129,23 @@ pub unsafe fn ahci_read_lba(
     // Volatility buys nothing here — the scratch is coherent DMA
     // memory, not MMIO, and the fence before the CI doorbell below is
     // what publishes these zeroes before the device is notified.
-    // SAFETY: identity-mapped DMA; extent is 0x600 + n_sectors*512
-    // ≤ 0x600 + SCRATCH_DATA_MAX = 4096 (checked at entry), i.e.
-    // within the one-page scratch.
+    // The command prefix and the data staging region are zeroed
+    // separately: identical coverage when the staging region is the
+    // scratch's own data area, correct when it is the separate
+    // transfer buffer.
+    // SAFETY: identity-mapped DMA; the prefix extent is the
+    // scratch's first 0x600 bytes and the data extent is
+    // `n_sectors * 512 <= stage.cap` (checked at entry).
     unsafe {
         core::ptr::write_bytes(
             narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
             0,
-            0x600 + (n_sectors as usize) * 512,
+            0x600,
+        );
+        core::ptr::write_bytes(
+            narf_memory::PhysAddr::new(data_buf).kernel_mut_ptr::<u8>(),
+            0,
+            (n_sectors as usize) * 512,
         );
     }
 
@@ -1816,7 +2354,7 @@ pub async unsafe fn ahci_read_lba_async(
     // alloc_coherent per call, dropped on return; freed page
     // could be reused while AHCI still had a delayed DMA in
     // flight under AMD-Vi).
-    let base = ahci_scratch_phys();
+    let base = ahci.scratch_phys();
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
@@ -1994,7 +2532,7 @@ pub async unsafe fn ahci_write_lba_async(
     // alloc_coherent per call, dropped on return; freed page
     // could be reused while AHCI still had a delayed DMA in
     // flight under AMD-Vi).
-    let base = ahci_scratch_phys();
+    let base = ahci.scratch_phys();
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
@@ -2230,7 +2768,7 @@ unsafe fn ahci_lba_ncq(
     // alloc_coherent per call, dropped on return; freed page
     // could be reused while AHCI still had a delayed DMA in
     // flight under AMD-Vi).
-    let base = ahci_scratch_phys();
+    let base = ahci.scratch_phys();
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
@@ -2515,7 +3053,7 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
 
     // Use the persistent scratch at the same layout as identify_device
     // (cmd_list@0x000, fis_recv@0x400, cmd_tbl@0x500, data_buf@0x600).
-    let base = ahci_scratch_phys();
+    let base = ahci.scratch_phys();
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
@@ -2724,6 +3262,36 @@ pub fn identify_model(id: &[u8; 512]) -> [u8; 40] {
     out
 }
 
+/// Decode an ATA string field (byte-swapped per pair, space/NUL
+/// padded) into a trimmed `String`. Same encoding as
+/// [`identify_model`]; used for the registry's `DiskIdentity` (#931).
+fn ata_string(id: &[u8; 512], first_word: usize, words: usize) -> alloc::string::String {
+    let mut bytes = alloc::vec::Vec::with_capacity(words * 2);
+    for i in 0..words {
+        bytes.push(id[(first_word + i) * 2 + 1]);
+        bytes.push(id[(first_word + i) * 2]);
+    }
+    while matches!(bytes.last(), Some(b' ' | 0)) {
+        bytes.pop();
+    }
+    alloc::string::String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// IDENTIFY serial number (words 10–19), trimmed.
+pub fn identify_serial(id: &[u8; 512]) -> alloc::string::String {
+    ata_string(id, 10, 10)
+}
+
+/// IDENTIFY firmware revision (words 23–26), trimmed.
+pub fn identify_firmware(id: &[u8; 512]) -> alloc::string::String {
+    ata_string(id, 23, 4)
+}
+
+/// IDENTIFY model string (words 27–46), trimmed.
+pub fn identify_model_string(id: &[u8; 512]) -> alloc::string::String {
+    ata_string(id, 27, 20)
+}
+
 /// Extract the LBA-28 addressable sector count from an IDENTIFY
 /// DEVICE response (ATA-8 §7.16 word 60–61, byte offsets 120–123).
 /// Returns 0 if 28-bit LBA is not supported. A non-zero value here
@@ -2829,7 +3397,7 @@ pub unsafe fn atapi_send_cdb(
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    let base = ahci_scratch_phys();
+    let base = ahci.scratch_phys();
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
@@ -3000,7 +3568,7 @@ pub unsafe fn atapi_send_cdb(
 pub unsafe fn read_atapi_capacity(ahci: &Ahci, port_idx: u8) -> Result<(u32, u32), AhciError> {
     // Allocate the 8-byte response in the persistent scratch at
     // data_buf (offset 0x600, safe since scratch is 4 KiB).
-    let base = ahci_scratch_phys();
+    let base = ahci.scratch_phys();
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
@@ -3219,20 +3787,83 @@ pub unsafe fn handle_phyrdy_change(ahci: &Ahci, port_idx: u8) -> PortLinkState {
     PortLinkState::Connected { kind }
 }
 
-/// Sync block-device adapter for the registry. Routes reads /
-/// writes through `ahci_read_lba` / `ahci_write_lba` against the
-/// first SATA port (or port 0 as a fallback when probe-time
-/// PortKind classification missed the SIG window).
+/// Which FLUSH CACHE variant a disk takes, if any (#841): EXT on
+/// LBA48 devices that support it, plain FLUSH CACHE otherwise
+/// (libata `ata_do_flush`). `None` = the device reports no flush
+/// command at all.
+fn flush_ext_choice(f: &AtaFeatures) -> Option<bool> {
+    if f.flush_cache_ext && f.lba48 {
+        Some(true)
+    } else if f.flush_cache {
+        Some(false)
+    } else if f.flush_cache_ext {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Sync block-device adapter for the registry — ONE instance per
+/// published disk (#931), addressing its own controller + port.
+/// (Pre-#931 this was a unit struct that always routed to the
+/// first controller's first disk port; the `from_probed`
+/// constructor preserves that behaviour for compat callers.)
 #[derive(Debug)]
-pub struct AhciBlockSync;
+pub struct AhciBlockSync {
+    ahci: &'static Ahci,
+    port: u8,
+}
+
+/// Sectors per bulk-transfer chunk: the per-controller transfer
+/// buffer ([`AHCI_XFER_BYTES`]) holds exactly this many.
+const XFER_SECTORS: u16 = (AHCI_XFER_BYTES / 512) as u16;
+
+impl AhciBlockSync {
+    /// The block surface for the disk on `port` of `ahci`. The
+    /// port is expected to carry a published [`DiskInfo`]; the
+    /// surface reports `DeviceRemoved` if it does not.
+    pub fn new(ahci: &'static Ahci, port: u8) -> Self {
+        Self { ahci, port }
+    }
+
+    /// The first disk of the first probed controller — the
+    /// pre-#931 behaviour, kept for the smokes and compat callers
+    /// that address "the" SATA disk.
+    pub fn from_probed() -> Option<Self> {
+        let ahci = probed_ahci()?;
+        let disk = ahci.disks().into_iter().next()?;
+        Some(Self {
+            ahci,
+            port: disk.port,
+        })
+    }
+
+    /// This disk's probe-time record, if the port still carries one.
+    fn disk(&self) -> Option<DiskInfo> {
+        self.ahci.disk_on_port(self.port)
+    }
+
+    /// Shared entry discipline for every operation: the disk must
+    /// exist and the controller must not be PM-suspended (#932).
+    /// Checked again after the request gate is taken — suspend
+    /// sets its flag before acquiring the gate, so a transfer that
+    /// passed the first check either completes before the gate
+    /// changes hands or observes the flag here.
+    fn check_live(&self) -> Result<DiskInfo, narf_block::BlockIoError> {
+        if self.ahci.is_suspended() {
+            return Err(narf_block::BlockIoError::DeviceRemoved);
+        }
+        self.disk().ok_or(narf_block::BlockIoError::DeviceRemoved)
+    }
+}
 
 impl narf_block::BlockDeviceSync for AhciBlockSync {
     fn lba_size(&self) -> u32 {
         512
     }
     fn capacity(&self) -> u64 {
-        // Cached from IDENTIFY DEVICE at probe (0 = unknown).
-        probed_ahci().map(|a| a.capacity).unwrap_or(0)
+        // Per-disk IDENTIFY capacity cached at probe (0 = unknown).
+        self.disk().map(|d| d.sectors).unwrap_or(0)
     }
     fn read(
         &self,
@@ -3240,32 +3871,39 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
         n_blocks: u16,
         out: &mut [u8],
     ) -> Result<(), narf_block::BlockIoError> {
-        if (n_blocks as usize) * 512 > 4096 || out.len() < (n_blocks as usize) * 512 {
+        // #930: the pre-fix `n_blocks * 512 > 4096` rejection is
+        // gone — the only size contract left is the caller's own
+        // buffer. Transfers chunk at the transfer buffer's size.
+        if out.len() < (n_blocks as usize) * 512 {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        self.check_live()?;
         // Interrupts stay enabled for the whole transfer: hold the
-        // device's request gate, not the IRQ-masking CONTROLLER lock.
-        // See `probed_ahci` / `crate::req_gate::ReqGate`.
-        let ahci = probed_ahci().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        let _gate = ReqGate::acquire(&ahci.req_gate);
-        let port = ahci.block_port;
-        // Chunk to what the one-page scratch can hold past its command
-        // structures (SCRATCH_DATA_MAX); the registry contract allows
-        // up to 8 sectors per call.
-        let max_sectors = (SCRATCH_DATA_MAX / 512) as u16;
+        // device's request gate, not an IRQ-masking lock. See
+        // `crate::req_gate::ReqGate`.
+        let _gate = ReqGate::acquire(&self.ahci.req_gate);
+        self.check_live()?;
+        let stage = DmaStage {
+            phys: self.ahci.xfer_phys(),
+            cap: AHCI_XFER_BYTES,
+        };
         let mut done: u16 = 0;
         while done < n_blocks {
-            let want = max_sectors.min(n_blocks - done);
+            let want = XFER_SECTORS.min(n_blocks - done);
             let off = done as usize * 512;
-            // SAFETY: the request gate serialises transfers + scratch
-            // use.
+            // SAFETY: the request gate serialises transfers,
+            // scratch and transfer-buffer use on this controller.
             unsafe {
-                ahci_read_lba(
-                    ahci,
-                    port,
+                ahci_read_lba_xfer(
+                    self.ahci,
+                    self.port,
                     lba + done as u64,
                     want,
                     &mut out[off..off + want as usize * 512],
+                    stage,
                 )
             }
             .map_err(|_| narf_block::BlockIoError::DriverError)?;
@@ -3274,27 +3912,35 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
         Ok(())
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
-        if (n_blocks as usize) * 512 > 4096 || data.len() < (n_blocks as usize) * 512 {
+        if data.len() < (n_blocks as usize) * 512 {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        self.check_live()?;
         // Same reasoning (gate + chunking) as `read` above.
-        let ahci = probed_ahci().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        let _gate = ReqGate::acquire(&ahci.req_gate);
-        let port = ahci.block_port;
-        let max_sectors = (SCRATCH_DATA_MAX / 512) as u16;
+        let _gate = ReqGate::acquire(&self.ahci.req_gate);
+        self.check_live()?;
+        let stage = DmaStage {
+            phys: self.ahci.xfer_phys(),
+            cap: AHCI_XFER_BYTES,
+        };
         let mut done: u16 = 0;
         while done < n_blocks {
-            let want = max_sectors.min(n_blocks - done);
+            let want = XFER_SECTORS.min(n_blocks - done);
             let off = done as usize * 512;
-            // SAFETY: the request gate serialises transfers + scratch
-            // use.
+            // SAFETY: the request gate serialises transfers,
+            // scratch and transfer-buffer use on this controller.
             unsafe {
-                ahci_write_lba(
-                    ahci,
-                    port,
+                ahci_write_lba_xfer(
+                    self.ahci,
+                    self.port,
                     lba + done as u64,
                     want,
                     &data[off..off + want as usize * 512],
+                    stage,
+                    false,
                 )
             }
             .map_err(|_| narf_block::BlockIoError::DriverError)?;
@@ -3302,54 +3948,212 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
         }
         Ok(())
     }
+    fn flush(&self) -> Result<(), narf_block::BlockIoError> {
+        let disk = self.check_live()?;
+        // A device with no flush command has no flush to issue —
+        // `capabilities()` reports its cache state honestly, so Ok
+        // here cannot mislead a caller about the durability of a
+        // cache the device does not expose a drain for.
+        let Some(ext) = flush_ext_choice(&disk.features) else {
+            return Ok(());
+        };
+        let _gate = ReqGate::acquire(&self.ahci.req_gate);
+        self.check_live()?;
+        // SAFETY: the request gate serialises the port; the free
+        // function's contract is the same ownership.
+        unsafe { self.ahci.flush_cache(self.port, ext) }
+            .map_err(|_| narf_block::BlockIoError::DriverError)
+    }
+    fn capabilities(&self) -> narf_block::BlockCaps {
+        let features = self.disk().map(|d| d.features).unwrap_or_default();
+        narf_block::BlockCaps {
+            volatile_cache: features.write_cache_enabled,
+            fua: features.write_fua_ext,
+        }
+    }
+    fn write_fua(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        data: &[u8],
+    ) -> Result<(), narf_block::BlockIoError> {
+        let disk = self.check_live()?;
+        if !disk.features.write_fua_ext {
+            // Trait-default emulation, spelled out because this
+            // impl overrides the method: write, then a REAL flush
+            // (above) — sound precisely because flush is no longer
+            // a no-op (#841).
+            self.write(lba, n_blocks, data)?;
+            return self.flush();
+        }
+        if data.len() < (n_blocks as usize) * 512 {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        let _gate = ReqGate::acquire(&self.ahci.req_gate);
+        self.check_live()?;
+        let stage = DmaStage {
+            phys: self.ahci.xfer_phys(),
+            cap: AHCI_XFER_BYTES,
+        };
+        let mut done: u16 = 0;
+        while done < n_blocks {
+            let want = XFER_SECTORS.min(n_blocks - done);
+            let off = done as usize * 512;
+            // SAFETY: the request gate serialises transfers,
+            // scratch and transfer-buffer use on this controller.
+            unsafe {
+                ahci_write_lba_fua(
+                    self.ahci,
+                    self.port,
+                    lba + done as u64,
+                    want,
+                    &data[off..off + want as usize * 512],
+                    stage,
+                )
+            }
+            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+            done += want;
+        }
+        Ok(())
+    }
+    fn supports_trim(&self) -> bool {
+        self.disk().map(|d| d.features.trim).unwrap_or(false)
+    }
+    fn trim(&self, lba: u64, n_blocks: u64) -> Result<(), narf_block::BlockIoError> {
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        let disk = self.check_live()?;
+        if !disk.features.trim {
+            // Never silently succeed: the adapter only advertises
+            // Discard when this returns true, and a direct caller
+            // gets the same honesty (#841).
+            return Err(narf_block::BlockIoError::DriverError);
+        }
+        if lba
+            .checked_add(n_blocks)
+            .is_none_or(|end| end > disk.sectors)
+        {
+            return Err(narf_block::BlockIoError::OutOfRange);
+        }
+        let _gate = ReqGate::acquire(&self.ahci.req_gate);
+        self.check_live()?;
+        // Split into DSM range entries (16-bit sector counts).
+        let mut ranges = alloc::vec::Vec::new();
+        let mut at = lba;
+        let mut left = n_blocks;
+        while left > 0 {
+            let c = left.min(65_535);
+            ranges.push((at, c as u16));
+            at += c;
+            left -= c;
+        }
+        // SAFETY: the request gate serialises the port; the free
+        // function's contract is the same ownership.
+        unsafe {
+            self.ahci
+                .dsm_trim(self.port, &ranges, disk.features.dsm_max_blocks)
+        }
+        .map_err(|_| narf_block::BlockIoError::DriverError)
+    }
 }
 
 // ── Driver-match registration ────────────────────────────────────────
 
-/// Slot for the live HBA produced by `probe`. Held only long enough
-/// to read the installed device's address (`probed_ahci`) — NEVER
-/// across a device round-trip, which busy-polls CI-clear/D2H with a
+/// Registry of the live HBAs produced by `probe` (#931: every
+/// AHCI function installs, not just the first). Held only long
+/// enough to read an installed device's address — NEVER across a
+/// device round-trip, which busy-polls CI-clear/D2H with a
 /// 30-second budget. See [`crate::req_gate`] for the livelock this
 /// prevents.
-static CONTROLLER: IrqSafeSpinLock<Option<Ahci>> = IrqSafeSpinLock::new(None);
-
-/// The probed HBA, WITHOUT holding `CONTROLLER` for the caller's use
-/// of it.
 ///
-/// `CONTROLLER` is taken only long enough to read the address of the
+/// Each controller is individually boxed: growing the `Vec` never
+/// moves an installed `Ahci`, and entries are never removed, so
+/// the `&'static Ahci` escapes below stay valid for the rest of
+/// the boot. (The `Box` is the load-bearing part — clippy's
+/// `vec_box` suggestion of `Vec<Ahci>` would reintroduce the
+/// move-on-grow hazard.)
+#[allow(clippy::vec_box)]
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<alloc::boxed::Box<Ahci>>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// The first probed HBA, WITHOUT holding the registry lock for the
+/// caller's use of it.
+///
+/// The lock is taken only long enough to read the address of the
 /// installed device, then released, so a long transfer runs with
 /// interrupts enabled.
 ///
 /// # Why the reference stays valid
 ///
-/// The `Option` is written exactly once: [`probe`] returns early when
-/// an HBA is already installed, and nothing ever stores `None` back.
-/// The `Ahci` therefore is never moved, replaced or dropped after its
-/// single install, so a shared reference to it stays valid for the
-/// rest of the boot. `smoke_ahci_device_address_is_stable` pins that
-/// invariant, because it is the kind of assumption a later "support
-/// hot-unplug" change would silently invalidate. There is no `&mut`
-/// path into the slot at all — every `Ahci` method takes `&self`.
+/// An installed `Ahci` is never moved, replaced or dropped:
+/// [`probe`] deduplicates on the bus address, entries are appended
+/// only, and each lives in its own `Box`. A shared reference to an
+/// installed controller therefore stays valid for the rest of the
+/// boot. `smoke_ahci_device_address_is_stable` pins that
+/// invariant, because it is the kind of assumption a later
+/// "support hot-unplug" change would silently invalidate. There is
+/// no `&mut` path into an installed controller — every `Ahci`
+/// method takes `&self`.
 fn probed_ahci() -> Option<&'static Ahci> {
     let ptr: *const Ahci = {
-        let g = CONTROLLER.lock();
-        match g.as_ref() {
-            Some(d) => d as *const Ahci,
+        let g = CONTROLLERS.lock();
+        match g.first() {
+            Some(d) => &**d as *const Ahci,
             None => return None,
         }
     };
-    // SAFETY: install-once, never-moved, never-dropped — see above.
+    // SAFETY: append-only, individually boxed, never-dropped —
+    // see above.
     Some(unsafe { &*ptr })
 }
 
-/// The installed HBA's address, or `None` before probe. Test hook for
-/// the install-once invariant `probed_ahci` relies on.
+/// All installed controllers, in probe order (#931).
+pub fn controllers() -> alloc::vec::Vec<&'static Ahci> {
+    let g = CONTROLLERS.lock();
+    g.iter()
+        .map(|d| {
+            let ptr: *const Ahci = &**d;
+            // SAFETY: same append-only/boxed invariant as
+            // `probed_ahci`.
+            unsafe { &*ptr }
+        })
+        .collect()
+}
+
+/// How many AHCI controllers are installed.
+pub fn controller_count() -> usize {
+    CONTROLLERS.lock().len()
+}
+
+/// Whether a controller is already installed for `addr` — the
+/// probe deduplication check (#931).
+fn controller_installed(addr: narf_bus::BusAddr) -> bool {
+    CONTROLLERS.lock().iter().any(|c| c.addr == addr)
+}
+
+/// Append a fully-initialised controller to the registry and
+/// return its installed reference.
+fn install_controller(dev: Ahci) -> &'static Ahci {
+    let mut g = CONTROLLERS.lock();
+    g.push(alloc::boxed::Box::new(dev));
+    let ptr: *const Ahci = &**g.last().expect("just pushed");
+    // SAFETY: same append-only/boxed invariant as `probed_ahci`.
+    unsafe { &*ptr }
+}
+
+/// The first installed HBA's address, or `None` before probe.
+/// Test hook for the install-stability invariant `probed_ahci`
+/// relies on.
 #[doc(hidden)]
 pub fn dbg_device_addr() -> Option<usize> {
-    CONTROLLER
+    CONTROLLERS
         .lock()
-        .as_ref()
-        .map(|d| d as *const Ahci as usize)
+        .first()
+        .map(|d| &**d as *const Ahci as usize)
 }
 
 /// IDT vector our ISR is installed on, or 0 if no IRQ path was
@@ -3516,10 +4320,172 @@ fn try_setup_irq(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) {
     }
 }
 
+// ── Device power management (#932) ──────────────────────────────
+//
+// AHCI joins the `narf_power::device_pm` fan-out like NVMe (PR
+// #966): the handlers below run on the boot CPU with interrupts
+// gated and must not schedule. Every wait on this path is a polled
+// register wait (`responsive_spin_until`) and the request gate
+// spins without masking interrupts, so the context is safe. The
+// fan-out calls handlers in reverse registration order on suspend
+// and forward order on resume; AHCI registers once under the name
+// "ahci" (registration is idempotent on the name).
+
+/// Suspend every installed controller. A controller whose disks
+/// cannot be flushed + idled reports `Busy`, which aborts the
+/// system suspend — the machine stays awake rather than powering
+/// down over an unflushed write cache (PR #966's NVMe contract).
+fn ahci_suspend_all() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    let mut failed = false;
+    for ctrl in controllers() {
+        if ahci_suspend_controller(ctrl).is_err() {
+            failed = true;
+        }
+    }
+    if failed {
+        Err(narf_power::device_pm::DeviceSuspendError::Busy)
+    } else {
+        Ok(())
+    }
+}
+
+fn ahci_suspend_controller(ctrl: &Ahci) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    // Refuse new I/O first. The block surface checks this flag on
+    // entry, so a transfer already past its check holds the
+    // request gate we are about to take (and completes before we
+    // proceed); everything later fails fast with DeviceRemoved.
+    ctrl.suspended.store(true, Ordering::Release);
+    let _gate = ReqGate::acquire(&ctrl.req_gate);
+    let mut result = Ok(());
+    for disk in ctrl.disks() {
+        // Drain the volatile write cache BEFORE idling the port.
+        if let Some(ext) = flush_ext_choice(&disk.features) {
+            // SAFETY: the request gate is held; the port carries a
+            // published disk.
+            if unsafe { ctrl.flush_cache(disk.port, ext) }.is_err() {
+                result = Err(DeviceSuspendError::Busy);
+            }
+        }
+        // SAFETY: same ownership.
+        let _ = unsafe { ctrl.port_idle(disk.port) };
+    }
+    result
+}
+
+/// Resume every installed controller. A controller whose disks do
+/// not revalidate stays suspended (its block surface keeps
+/// refusing I/O) and reports `DriverError`.
+fn ahci_resume_all() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    let mut failed = false;
+    for ctrl in controllers() {
+        if ahci_resume_controller(ctrl).is_err() {
+            failed = true;
+        }
+    }
+    if failed {
+        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
+    } else {
+        Ok(())
+    }
+}
+
+fn ahci_resume_controller(ctrl: &Ahci) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let _gate = ReqGate::acquire(&ctrl.req_gate);
+    // Re-run the probe init sequence against the SAME mapped BAR
+    // and the SAME init DMA areas (the mapping and the areas
+    // survive suspend; only device state was lost). The BIOS
+    // handoff inside `hba_global_init` is a no-op here — ownership
+    // is already with the OS.
+    let init = ctrl
+        ._init_dma
+        .as_ref()
+        .map(|b| (b.dma_addr().raw(), b.dma_addr_at(INIT_FIS_BASE).raw()));
+    let cfg = hba_global_init(&Abar(&ctrl.mmio)).map_err(|_| DeviceSuspendError::DriverError)?;
+    let ports = bring_up_ports(
+        &Abar(&ctrl.mmio),
+        cfg.cap,
+        cfg.port_map,
+        init,
+        HBA_PORT_BRINGUP_BUDGET_MS,
+    );
+    hba_finish_init(&Abar(&ctrl.mmio));
+    if ctrl.irq_vector != 0 {
+        hba_enable_irq(&Abar(&ctrl.mmio));
+    }
+    // Revalidate every published disk before trusting it again:
+    // after resume the device behind a port must be the device
+    // that was there before — same class, same capacity, same
+    // model. Anything else means the medium changed under a
+    // suspended system; keep the controller suspended and fail
+    // rather than serve a stranger's disk under the old name.
+    // (`Ahci::ports` keeps the probe-time classification; the
+    // `disks` table is the live one the block surface reads.)
+    let mut fresh = alloc::vec::Vec::new();
+    for disk in ctrl.disks() {
+        let kind = ports.iter().find(|p| p.index == disk.port).map(|p| p.kind);
+        if kind != Some(PortKind::Sata) {
+            return Err(DeviceSuspendError::DriverError);
+        }
+        // SAFETY: the request gate is held; we own the HBA inside
+        // the PM handler and the port classified as an ATA disk.
+        let id = unsafe { ctrl.identify_device(disk.port) }
+            .map_err(|_| DeviceSuspendError::DriverError)?;
+        let sectors = identify_n_sectors(&id);
+        let model = identify_model_string(&id);
+        if sectors != disk.sectors || model != disk.model {
+            return Err(DeviceSuspendError::DriverError);
+        }
+        fresh.push(DiskInfo {
+            port: disk.port,
+            sectors,
+            features: identify_ata_features(&id),
+            model,
+            serial: identify_serial(&id),
+            firmware: identify_firmware(&id),
+        });
+    }
+    ctrl.set_disks(fresh);
+    ctrl.suspended.store(false, Ordering::Release);
+    Ok(())
+}
+
+/// Next `sata<n>` registry name. Names are never reused within a
+/// boot: hot-removed disks are out of scope, and reuse would alias
+/// a new disk onto a name a filesystem may still hold open.
+fn next_sata_name() -> &'static str {
+    static NEXT_SATA: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT_SATA.fetch_add(1, Ordering::Relaxed);
+    alloc::boxed::Box::leak(alloc::format!("sata{n}").into_boxed_str())
+}
+
+/// `0000:00:1f.2`-style bus path for a controller's
+/// `DiskIdentity` (empty for non-PCIe addresses).
+fn bus_path_of(addr: narf_bus::BusAddr) -> alloc::string::String {
+    match addr {
+        narf_bus::BusAddr::Pcie(a) => {
+            alloc::format!(
+                "{:04x}:{:02x}:{:02x}.{}",
+                a.segment,
+                a.bus,
+                a.device,
+                a.function
+            )
+        }
+        _ => alloc::string::String::new(),
+    }
+}
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    // #931: a repeat probe of an already-installed function is a
+    // no-op — re-running bring-up would reset a live controller,
+    // and the install-stability invariant forbids replacing it. A
+    // DIFFERENT function installs alongside the existing ones.
+    if controller_installed(device.addr) {
         return Ok(());
     }
+    let first = controller_count() == 0;
     // Enable MEM_SPACE + BUS_MASTER. We leave INTX_DISABLE clear so
     // that the legacy INTx fallback is reachable; if MSI / MSI-X
     // negotiation succeeds, the device's INTx pin is still inert
@@ -3533,72 +4499,125 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over the device's BAR.
-    let dev = match unsafe { Ahci::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { Ahci::bring_up(&device, &cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    // Stash MMIO base for the ISR before any IRQ can fire.
-    // The ISR dereferences this directly, so stash the mapped VA, not the
-    // BAR's physical address — `MmioRegion::virt` is the ioremap window for
-    // above-map BARs and equals the PA only for identity-mapped ones.
-    AHCI_MMIO_BASE.store(dev.mmio.virt as usize, Ordering::Release);
-    let mut dev = dev;
-    // Whether any port holds an ATA disk (`block_port` falls back to port
-    // 0 when none does).
-    let has_disk = dev
-        .ports
-        .iter()
-        .any(|p| p.index == dev.block_port && p.kind == PortKind::Sata);
-    // Cache the disk size for `AhciBlockSync::capacity` (Linux
-    // `ata_id_n_sectors`: LBA48 words 100..103 when the device reports
-    // 48-bit support, else LBA28 words 60..61). IDENTIFY only reads.
-    if has_disk {
-        // SAFETY: the HBA is not installed yet, so we own it; the port
-        // classified as an ATA disk.
-        if let Ok(id) = unsafe { dev.identify_device(dev.block_port) } {
-            dev.capacity = identify_n_sectors(&id);
+    // IDENTIFY every ATA-disk port (#931): each becomes a
+    // published disk with its own capacity, feature set and
+    // identity. A port whose IDENTIFY fails is not published —
+    // same reasoning as the pre-#931 no-disk case below: a phantom
+    // disk's every read would wait out command timeouts, and root
+    // designation (which reads every device's UUID) would stall
+    // on it. IDENTIFY only reads.
+    let mut disks = alloc::vec::Vec::new();
+    for p in dev.ports.iter().filter(|p| p.kind == PortKind::Sata) {
+        // SAFETY: the HBA is not installed yet, so we own it; the
+        // port classified as an ATA disk.
+        if let Ok(id) = unsafe { dev.identify_device(p.index) } {
+            disks.push(DiskInfo {
+                port: p.index,
+                sectors: identify_n_sectors(&id),
+                features: identify_ata_features(&id),
+                model: identify_model_string(&id),
+                serial: identify_serial(&id),
+                firmware: identify_firmware(&id),
+            });
         }
     }
-    // Negotiate IRQ delivery (MSI-X → MSI → INTx). Best-effort —
-    // failure leaves the driver in sync-poll mode.
-    try_setup_irq(&cap, &device);
-    // Only now may the HBA interrupt: the ISR is installed and the vector
-    // routed. Without a route GHC.IE stays clear and the driver polls.
-    if AHCI_IRQ_VECTOR.load(Ordering::Acquire) != 0 {
-        hba_enable_irq(&Abar(&dev.mmio));
+    // Compat first-disk fields (`capacity()`'s pre-#931 source and
+    // smokes read them): block_port falls back to port 0 when no
+    // port published a disk.
+    if let Some(first_disk) = disks.first() {
+        dev.block_port = first_disk.port;
+        dev.capacity = first_disk.sectors;
     }
-    *CONTROLLER.lock() = Some(dev);
-    // An HBA with no ATA disk behind it (QEMU q35's built-in ICH9 with no
-    // `-drive` on it, a laptop chipset SATA controller with empty ports)
-    // has nothing to read: registering `sata0` anyway put a phantom disk in
-    // the registry whose every read waited out the command timeouts on an
-    // empty port 0 — and root designation, which reads every device's
-    // UUID, stalled ~40 s on it. Linux's libata likewise creates no
-    // `ata_device` (so no `sd`) for a port whose link is down.
-    if !has_disk {
+    dev.set_disks(disks);
+    if first {
+        // The shared ISR (`ahci_isr` + the `AHCI_MMIO_BASE` /
+        // `AHCI_IRQ_VECTOR` globals) is a single-controller
+        // design, so only the FIRST installed HBA negotiates an
+        // IRQ. Later HBAs poll: their async completion waits take
+        // the `irq_vector == 0` deadline path (correct, just not
+        // interrupt-driven). Lifting this means per-controller ISR
+        // state — a follow-up, not silently half-done here.
+        //
+        // Stash the MMIO base for the ISR before any IRQ can fire.
+        // The ISR dereferences this directly, so stash the mapped
+        // VA, not the BAR's physical address — `MmioRegion::virt`
+        // is the ioremap window for above-map BARs and equals the
+        // PA only for identity-mapped ones.
+        AHCI_MMIO_BASE.store(dev.mmio.virt as usize, Ordering::Release);
+        // Negotiate IRQ delivery (MSI-X → MSI → INTx). Best-effort —
+        // failure leaves the driver in sync-poll mode.
+        try_setup_irq(&cap, &device);
+        dev.irq_vector = AHCI_IRQ_VECTOR.load(Ordering::Acquire);
+        // Only now may the HBA interrupt: the ISR is installed and
+        // the vector routed. Without a route GHC.IE stays clear
+        // and the driver polls.
+        if dev.irq_vector != 0 {
+            hba_enable_irq(&Abar(&dev.mmio));
+        }
+    }
+    let ctrl = install_controller(dev);
+    // #932: join the device_pm suspend/resume fan-out (idempotent
+    // on the name, so later HBAs re-register the same handlers).
+    narf_power::device_pm::register_device_pm("ahci", ahci_suspend_all, ahci_resume_all);
+    // An HBA with no ATA disk behind it (QEMU q35's built-in ICH9
+    // with no `-drive` on it, a laptop chipset SATA controller with
+    // empty ports) publishes nothing. Linux's libata likewise
+    // creates no `ata_device` (so no `sd`) for a port whose link
+    // is down.
+    let disks = ctrl.disks();
+    if disks.is_empty() {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "  ahci: no ATA disk on any port; not registering sata0"
+            "  ahci: no ATA disk on any port; not registering any sata disk"
         );
         return Ok(());
     }
-    // Register against the unified block-device registry.
-    let parent =
-        alloc::sync::Arc::new(AhciBlockSync) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>;
-    narf_block::register_block_device("sata0", parent.clone());
-    // Register `sata0p<n>` for each MBR / GPT partition, as the NVMe,
-    // virtio-blk and USB drivers do. Reads only; an unpartitioned disk
-    // just keeps the whole-disk `sata0`. Every partition goes through
-    // the registry's `PolicyGuard` like its parent.
-    let _ = narf_block::partition::scan_and_register_partitions(parent, "sata0");
-    narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("sata0"),
-        kind: narf_drivers::BoundKind::Block,
-        pci_vid: Some(device.id.vendor),
-        pci_did: Some(device.id.device),
-        domain: narf_drivers::BoundKind::Block.default_domain(),
-    });
+    // Publish every disk against the unified block-device
+    // registry, each with its hardware identity (#931), its
+    // partition scan, and its bound-driver record — as the NVMe,
+    // virtio-blk and USB drivers do per device.
+    let bus_path = bus_path_of(device.addr);
+    for disk in &disks {
+        let name = next_sata_name();
+        let surface = alloc::sync::Arc::new(AhciBlockSync::new(ctrl, disk.port))
+            as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>;
+        narf_block::register_block_device_with_identity(
+            name,
+            surface.clone(),
+            narf_block::DiskIdentity {
+                transport: "ata",
+                bus_path: bus_path.clone(),
+                controller: alloc::string::String::from(name),
+                model: disk.model.clone(),
+                serial: disk.serial.clone(),
+                firmware: disk.firmware.clone(),
+                vendor_id: device.id.vendor,
+                nsid: 0,
+                // NVMe-namespace identifiers; ATA has no
+                // equivalents in this identity shape.
+                eui64: None,
+                nguid: None,
+                uuid: None,
+            },
+        );
+        // Register `<name>p<n>` for each MBR / GPT partition.
+        // Reads only; an unpartitioned disk just keeps the
+        // whole-disk entry. Every partition goes through the
+        // registry's `PolicyGuard` like its parent.
+        let _ = narf_block::partition::scan_and_register_partitions(surface, name);
+        narf_drivers::record_bound(narf_drivers::BoundDriver {
+            name: alloc::string::String::from(name),
+            kind: narf_drivers::BoundKind::Block,
+            pci_vid: Some(device.id.vendor),
+            pci_did: Some(device.id.device),
+            domain: narf_drivers::BoundKind::Block.default_domain(),
+        });
+    }
     Ok(())
 }
 
@@ -3646,12 +4665,12 @@ fn name_for(did: u16) -> &'static str {
 }
 
 pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+    !CONTROLLERS.lock().is_empty()
 }
 
 /// Run `f` against the probed HBA, if any.
 ///
-/// Holds the device's request gate — not the `CONTROLLER` spinlock —
+/// Holds the device's request gate — not the registry spinlock —
 /// for the duration of `f`, so closures that do polled I/O
 /// (`identify_device`, `ahci_read_lba`, ...) wait out the transfer
 /// with interrupts enabled while still excluding every other user of

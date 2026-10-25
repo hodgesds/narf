@@ -17,7 +17,8 @@ builtin = [
     "dep:narf-block", "dep:narf-bus", "dep:narf-capabilities",
     "dep:narf-console", "dep:narf-drivers", "dep:narf-filesystem",
     "dep:narf-interrupts", "dep:narf-io", "dep:narf-kernel-test",
-    "dep:narf-lib", "dep:narf-memory", "dep:narf-scheduler", "dep:narf-time",
+    "dep:narf-lib", "dep:narf-memory", "dep:narf-power",
+    "dep:narf-scheduler", "dep:narf-time",
 ]
 module = []
 [dependencies]
@@ -36,6 +37,7 @@ narf-io           = { path = "../../../io", optional = true }
 narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
 narf-lib          = { path = "../../../lib", optional = true }
 narf-memory       = { path = "../../../memory", optional = true }
+narf-power        = { path = "../../../power", optional = true }
 narf-scheduler    = { path = "../../../scheduler", optional = true }
 narf-time         = { path = "../../../time", optional = true }
 [lints]
