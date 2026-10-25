@@ -13,6 +13,9 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+extern crate alloc;
+
+pub mod publish;
 pub mod rtl_phy;
 
 use narf_ipc::{Consumer, Producer};
@@ -26,6 +29,8 @@ pub enum NicModel {
     IntelE1000,
     /// Intel 82575-onwards Gigabit — "igb".
     IntelIgb,
+    /// Intel I225 / I226 2.5-GbE — "igc".
+    IntelIgc,
     /// Intel 82599 / X540 10-GbE — "ixgbe".
     IntelIxgbe,
     /// Intel X710 / XL710 / XXV710 — "i40e".
@@ -52,6 +57,7 @@ impl NicModel {
         match self {
             NicModel::IntelE1000 => (0x8086, 0x100E),
             NicModel::IntelIgb => (0x8086, 0x10C9),
+            NicModel::IntelIgc => (0x8086, 0x15F3),
             NicModel::IntelIxgbe => (0x8086, 0x10B6),
             NicModel::IntelI40e => (0x8086, 0x1572),
             NicModel::MellanoxMlx5 => (0x15B3, 0x1013),

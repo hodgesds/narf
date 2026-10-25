@@ -917,6 +917,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-crypto",
  "narf-drivers",
  "narf-efi",
  "narf-filesystem",
@@ -1636,6 +1637,7 @@ dependencies = [
 name = "narf-drivers-net-core"
 version = "0.0.0"
 dependencies = [
+ "narf-io",
  "narf-ipc",
  "narf-lib",
  "narf-net",

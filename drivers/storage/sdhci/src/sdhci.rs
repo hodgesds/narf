@@ -686,10 +686,13 @@ pub fn dbg_device_addr() -> Option<usize> {
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     use core::fmt::Write as _;
     // Class match catches all of class 0x08 (system peripheral).
-    // Filter to subclass 0x05 (SD host controller) here.
+    // Filter to subclass 0x05 (SD host controller) here. A
+    // non-SDHCI system peripheral is a decline, not a failure:
+    // this driver never engaged the device, so the dispatcher
+    // may fall through to another candidate (bus spec §9.3).
     let subclass = ((device.id.class >> 8) & 0xFF) as u8;
     if subclass != SDHCI_PCI_SUBCLASS {
-        return Err(narf_bus::ProbeError::BadDevice);
+        return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     if CONTROLLER.lock().is_some() {
         return Ok(());

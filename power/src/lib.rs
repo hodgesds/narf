@@ -43,6 +43,7 @@ pub mod orderly;
 pub mod psci;
 pub mod runtime_pm;
 pub mod runtime_pm_pci;
+pub mod service;
 pub mod suspend;
 pub mod syscall;
 pub mod sysfs_bridge;
@@ -294,6 +295,15 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Late, "power-button-orderly-poweroff", || {
         button::register_input_device();
         orderly::start_worker();
+        InitResult::Ok
+    });
+    // Power service worker: pumps the event → policy → action queue
+    // (lid close / sleep button → suspend request) from task context.
+    // The executor itself is installed by the platform composition
+    // (drivers/platform power-service glue); requests queued before
+    // an executor exists stay pending rather than being dropped.
+    narf_init::register(Stage::Late, "power-service", || {
+        service::start_worker();
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "acpi-ac-enum", || {

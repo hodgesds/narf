@@ -45,7 +45,15 @@ pub fn send(dev: u16, packet: &[u8]) -> bool {
 /// Drain the next HCI event from controller `dev`, encoded for the socket as
 /// `HCI_EVENT_PKT || code || plen || params`. `None` when no controller or no
 /// pending event.
+///
+/// Once the HCI pump is active for the controller it owns the
+/// transport's event stream, so events are read from the pump's
+/// fan-out queue; before that (and in pump-less fixtures) the
+/// transport is drained directly, as before.
 pub fn drain_event(dev: u16) -> Option<Vec<u8>> {
+    if crate::pump::is_attached(dev as usize) {
+        return crate::pump::take_socket_event(dev as usize);
+    }
     let controllers = controller::controllers();
     let controller = controllers.get(dev as usize)?;
     let event = controller.transport().recv_event().ok()??;

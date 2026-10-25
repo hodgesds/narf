@@ -643,7 +643,8 @@ impl Tg3Nic {
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
 
-        // Spawn pumps
+        // Spawn the device's only pump pair — probe spawns none, so the
+        // pair fed here is the pair whose halves occupy the ring slots.
         spawn_pumps(tg3.clone(), rx_prod, tx_cons);
 
         Arc::try_unwrap(tg3).map_err(|_| NicError::NoMemory)
@@ -801,6 +802,17 @@ impl Tg3Nic {
         let up = bmsr != 0xFFFF && (bmsr & MII_BMSR_LINK_UP) != 0;
         self.link_up = up;
         up
+    }
+
+    /// Live carrier read: the same BMSR sample
+    /// [`Self::refresh_link_state`] takes, without the `&mut` store.
+    /// The RX pump holds only an `Arc<Tg3Nic>`, so the publication
+    /// path (issue #791) samples through this.
+    pub fn live_link_up(&self) -> bool {
+        // SAFETY: identity-mapped MMIO; we own the device.
+        let bmsr = unsafe { Self::read_phy(&self.mmio, PHY_ADDR_INTERNAL, MII_REG_BMSR) }
+            .unwrap_or(0xFFFF);
+        bmsr != 0xFFFF && (bmsr & MII_BMSR_LINK_UP) != 0
     }
 
     /// Read BMCR via the MII bus. Mostly useful for diagnostics +
@@ -988,6 +1000,25 @@ impl Tg3Nic {
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Tg3Nic>>> = IrqSafeSpinLock::new(None);
 
+/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
+/// `dev_alloc_name`). Set once at probe; the device lives as long as
+/// the kernel, so the name is leaked into a `&'static str`.
+static TG3_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
+
+/// This NIC's interface name; empty until it has registered.
+pub fn tg3_ifname() -> &'static str {
+    TG3_IFNAME.get()
+}
+
+/// SendFn registered with `narf_net::iface` at probe time. Routes the
+/// kernel-side TCP stack's outbound frames through `Tg3Nic::transmit`.
+/// The Arc is cloned out rather than holding the IRQ-masking
+/// CONTROLLER lock across `transmit` (same reasoning as e1000).
+fn tg3_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+    ctrl.transmit(frame, &meta).map(|_| ()).map_err(|_| ())
+}
+
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -1005,9 +1036,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
-    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
-
     // SAFETY: this probe path owns `device`/`cap` exclusively — no other
     // driver has bound this function yet (guarded by the `CONTROLLER` check
     // above) — so we hold the device's BAR + cfg windows for the duration of
@@ -1017,18 +1045,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-
-    {
-        // SAFETY: `dev` was just created and has not been cloned or published
-        // yet, so this `Arc` is the unique owner and `Arc::as_ptr` yields a
-        // pointer to a live, exclusively-owned `Tg3Nic`. The `&mut` borrow is
-        // confined to this block and only touches the lock-guarded IPC-ring
-        // fields, so no aliasing `&`/`&mut` exists concurrently.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Tg3Nic) };
-        *d.rx_ipc_ring.lock() = Some(rx_cons);
-        *d.tx_ipc_ring.lock() = Some(tx_prod);
-    }
 
     *CONTROLLER.lock() = Some(dev.clone());
 
@@ -1040,6 +1056,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
+    // name + carrier metadata via the shared helper. The frame-ring
+    // registration below stays.
+    let name = crate::publish::publish_netdev(
+        dev.mac,
+        tg3_send_frame,
+        crate::publish::LinkSample::carrier_only(dev.live_link_up()),
+    );
+    TG3_IFNAME.set(name);
+
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
         Some(a) => a.derive().ok(),
@@ -1049,8 +1075,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         let _ = narf_net::registry().register(&auth, Tg3HwNic);
     }
 
-    // Spawn pumps
-    spawn_pumps(dev, rx_prod, tx_cons);
+    // No pump spawn here: `bring_up` spawned the device's single RX/TX
+    // pump pair, fed by the channel pair whose halves occupy the
+    // `rx_ipc_ring`/`tx_ipc_ring` slots (igc's discipline). A second
+    // pair spawned from probe would drain the same descriptor ring
+    // while its mirror sink's consumer is overwritten away — silently
+    // losing frames an attached ring consumer must see.
 
     Ok(())
 }
@@ -1072,13 +1102,40 @@ fn spawn_pumps(
 }
 
 async fn tg3_rx_pump(device: Arc<Tg3Nic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    // Carrier refresh (issue #791): the datapath is polled (LinkChg
+    // IRQ is a Stage-2 follow-up in this driver), so this pump is the
+    // family's link observer; a BMSR transition republishes the iface
+    // metadata instead of leaving it a probe-time photograph.
+    let mut last_up = device.live_link_up();
     loop {
+        let up = device.live_link_up();
+        if up != last_up {
+            last_up = up;
+            crate::publish::publish_link(
+                tg3_ifname(),
+                crate::publish::LinkSample::carrier_only(up),
+            );
+        }
         if let Some(pkt) = device.receive() {
             let dma_buf =
                 alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
-            let _ = rx_prod.send(frame).await;
+            // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
+            // shape via the shared helper: an attached ring consumer
+            // gets a pristine pre-dispatch copy; the original goes to
+            // the kernel stack in place. The mirror is non-blocking —
+            // a full/closed ring drops its copy, never the stack's
+            // packet.
+            let name = tg3_ifname();
+            crate::publish::dispatch_rx(
+                name,
+                &mut frame,
+                crate::publish::rx_mirror_attached(name),
+                |mirror| {
+                    let _ = rx_prod.try_send(mirror);
+                },
+            );
         }
         narf_scheduler::yield_now().await;
     }
@@ -1144,7 +1201,14 @@ pub struct Tg3HwNic;
 
 impl narf_net::Interface for Tg3HwNic {
     fn name(&self) -> &str {
-        "eth4"
+        // The dynamic `eth%d` name once published (issue #784); the
+        // old frame-ring name before probe gets that far.
+        let n = tg3_ifname();
+        if n.is_empty() {
+            "eth4"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -1162,6 +1226,11 @@ impl narf_net::Interface for Tg3HwNic {
             let mut r = RING.lock();
             if r.is_none() {
                 *r = c.rx_ipc_ring.lock().take();
+                if r.is_some() {
+                    // Ring consumer attached: enable the RX mirror
+                    // (e1000's `rx_mirror_enabled` moment).
+                    crate::publish::note_rx_mirror_attached(tg3_ifname());
+                }
             }
         });
         &RING
@@ -1181,7 +1250,12 @@ impl narf_net::Interface for Tg3HwNic {
 
 impl crate::HwNic for Tg3HwNic {
     fn name(&self) -> &'static str {
-        "eth4" // TODO: dynamic naming
+        let n = tg3_ifname();
+        if n.is_empty() {
+            "eth4"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -1208,6 +1282,11 @@ impl crate::HwNic for Tg3HwNic {
             let mut r = RING.lock();
             if r.is_none() {
                 *r = c.rx_ipc_ring.lock().take();
+                if r.is_some() {
+                    // Ring consumer attached: enable the RX mirror
+                    // (e1000's `rx_mirror_enabled` moment).
+                    crate::publish::note_rx_mirror_attached(tg3_ifname());
+                }
             }
         });
         &RING

@@ -1901,3 +1901,348 @@ kernel_test_in!(
     "drivers/net/rtl8127",
     smoke_rtl8127_phy_firmware_runs_after_firmware_scans
 );
+
+// ── netdev publication (issues #784 / #791) ────────────────────────
+//
+// Every wired family now probes through the shared helper in
+// `narf_drivers_net_core::publish`; these fixtures pin the helper's
+// contract at the mechanism level. Per-family probe fixtures would
+// need MMIO device models that don't exist in-tree for these
+// families, so the families' own wiring is covered by their existing
+// probe smokes plus this contract.
+
+fn fixture_send_a(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    Ok(())
+}
+
+fn fixture_send_b(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    Ok(())
+}
+
+fn smoke_netdev_publication_two_families() -> TestResult {
+    use crate::publish::{publish_netdev, LinkSample};
+    // Two distinct locally-administered MACs, as two families probing
+    // back to back would present. Assertions are relative to the
+    // returned names — other tests share the global iface table.
+    let mac_a = [0x02, 0x78, 0x40, 0x00, 0x00, 0x01];
+    let mac_b = [0x02, 0x78, 0x40, 0x00, 0x00, 0x02];
+    let a = publish_netdev(mac_a, fixture_send_a, LinkSample::DOWN);
+    let b = publish_netdev(mac_b, fixture_send_b, LinkSample::carrier_only(true));
+    if a == b {
+        return TestResult::Fail("publication allocated the same eth name twice");
+    }
+    if !a.starts_with("eth") || !b.starts_with("eth") {
+        return TestResult::Fail("publication did not allocate dynamic eth%d names");
+    }
+    let Some(ea) = narf_net::iface::lookup(&a) else {
+        return TestResult::Fail("published iface not found by lookup (a)");
+    };
+    if ea.mac != mac_a || ea.carrier {
+        return TestResult::Fail("published iface has wrong MAC or carrier (a)");
+    }
+    let Some(eb) = narf_net::iface::lookup(&b) else {
+        return TestResult::Fail("published iface not found by lookup (b)");
+    };
+    if eb.mac != mac_b || !eb.carrier {
+        return TestResult::Fail("published iface has wrong MAC or carrier (b)");
+    }
+    // Route resolution: a /32 connected address on A (TEST-NET-3,
+    // chosen narrow so no other test's routes are disturbed) makes
+    // for_dst resolve that exact destination through A. The address
+    // must come back off A on EVERY exit path below: `add_addr` also
+    // feeds the stack's local-address table (and stamps A's primary),
+    // and 203.0.113.7 is the ABI suite's canonical non-local address —
+    // left assigned, `bind(203.0.113.7)` would succeed for the rest of
+    // the boot instead of returning EADDRNOTAVAIL, breaking the
+    // socket-errno smokes. `del_addr` reverses all of it: the ifaddr
+    // entry, the connected /32 route, and the primary stamp.
+    narf_net::iface::add_addr(&a, [203, 0, 113, 7], 32);
+    let result = match narf_net::iface::for_dst([203, 0, 113, 7]) {
+        None => TestResult::Fail("for_dst found no iface for the published address"),
+        Some(dst) if dst.name != a => {
+            TestResult::Fail("for_dst resolved to a different iface than published")
+        }
+        Some(_) => TestResult::Pass,
+    };
+    narf_net::iface::del_addr(&a, [203, 0, 113, 7], 32);
+    result
+}
+kernel_test_in!("drivers/net/core", smoke_netdev_publication_two_families);
+
+fn smoke_netdev_carrier_transitions() -> TestResult {
+    use crate::publish::{publish_link, publish_netdev, LinkSample};
+    // The carrier contract the LSC / LinkChg / poll paths drive
+    // (issue #791): publish DOWN, flip up with a decoded rate, flip
+    // back down; the metadata and the change counter follow.
+    let name = publish_netdev(
+        [0x02, 0x78, 0x40, 0x00, 0x00, 0x03],
+        fixture_send_a,
+        LinkSample::DOWN,
+    );
+    let Some(down0) = narf_net::iface::lookup(&name) else {
+        return TestResult::Fail("carrier fixture iface missing after publish");
+    };
+    if down0.carrier || down0.speed_mbps.is_some() {
+        return TestResult::Fail("carrier fixture did not start DOWN");
+    }
+    if !publish_link(
+        &name,
+        LinkSample {
+            carrier: true,
+            speed_mbps: Some(1000),
+            duplex: Some(narf_net::iface::LinkDuplex::Full),
+        },
+    ) {
+        return TestResult::Fail("publish_link rejected the up transition");
+    }
+    let Some(up) = narf_net::iface::lookup(&name) else {
+        return TestResult::Fail("carrier fixture iface missing after up");
+    };
+    if !up.carrier || up.speed_mbps != Some(1000) || up.carrier_changes <= down0.carrier_changes {
+        return TestResult::Fail("up transition did not reach iface metadata");
+    }
+    if !publish_link(&name, LinkSample::DOWN) {
+        return TestResult::Fail("publish_link rejected the down transition");
+    }
+    let Some(down1) = narf_net::iface::lookup(&name) else {
+        return TestResult::Fail("carrier fixture iface missing after down");
+    };
+    if down1.carrier || down1.speed_mbps.is_some() || down1.carrier_changes <= up.carrier_changes {
+        return TestResult::Fail("down transition did not reach iface metadata");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/core", smoke_netdev_carrier_transitions);
+
+// ── RX dispatch mirror contract (issue #784) ──────────────────────
+//
+// `publish::dispatch_rx` is the fan-out every dual-published family's
+// pump runs. These statics back the counting/mutating RX handler the
+// fixture installs at the `iface` seam (the handler is a plain fn
+// pointer, so its observations live in statics).
+
+static FIXTURE_RX_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static FIXTURE_RX_FIRST_BYTE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Stand-in for the kernel stack's RX handler. Counts the delivery,
+/// records the first byte it was handed, then rewrites the first four
+/// bytes in place — the XDP shape `dispatch_rx` must defend the ring
+/// mirror against. Returning at all also stands in for a classifier
+/// "consumed" verdict: from the pump's side the frame is gone either
+/// way, so the mirror contract (below) is what is pinned, not the
+/// verdict plumbing inside the stack.
+fn fixture_rx_handler(_name: &str, frame: &mut [u8]) {
+    use core::sync::atomic::Ordering;
+    FIXTURE_RX_CALLS.fetch_add(1, Ordering::SeqCst);
+    if let Some(first) = frame.first() {
+        FIXTURE_RX_FIRST_BYTE.store(*first as usize, Ordering::SeqCst);
+    }
+    for b in frame.iter_mut().take(4) {
+        *b = 0xEE;
+    }
+}
+
+fn smoke_netdev_rx_dispatch_mirror_contract() -> TestResult {
+    use crate::publish::{
+        clear_rx_mirror_attached, dispatch_rx, note_rx_mirror_attached, publish_netdev,
+        rx_mirror_attached, LinkSample,
+    };
+    use core::sync::atomic::Ordering;
+
+    // A fresh published name has no ring consumer attached; noting
+    // the attach flips the gate — for that name only.
+    let name = publish_netdev(
+        [0x02, 0x78, 0x40, 0x00, 0x00, 0x04],
+        fixture_send_a,
+        LinkSample::DOWN,
+    );
+    if rx_mirror_attached(&name) {
+        return TestResult::Fail("fresh iface reported a ring consumer already attached");
+    }
+    // The note takes the family's leaked &'static name; this literal
+    // pins the registry round-trip without consuming the fixture's
+    // dynamic name (dispatch below takes its gate as a parameter,
+    // which is what the pumps feed from this same registry).
+    note_rx_mirror_attached("eth-fixture-mirror");
+    if !rx_mirror_attached("eth-fixture-mirror") || rx_mirror_attached("eth-fixture-never") {
+        return TestResult::Fail(
+            "mirror attach registry did not record the note for that name only",
+        );
+    }
+    // The detach-side clear (issue #789's obligation) forgets the
+    // note for that name only; clearing an unnoted name is a no-op.
+    clear_rx_mirror_attached("eth-fixture-mirror");
+    clear_rx_mirror_attached("eth-fixture-never");
+    if rx_mirror_attached("eth-fixture-mirror") {
+        return TestResult::Fail("mirror attach registry did not forget the cleared name");
+    }
+    note_rx_mirror_attached("eth-fixture-mirror");
+
+    narf_net::iface::install_rx_handler(fixture_rx_handler);
+    FIXTURE_RX_CALLS.store(0, Ordering::SeqCst);
+
+    // 64-byte pattern; first byte 0x10, distinct from the handler's
+    // 0xEE rewrite stamp.
+    let mut pattern = [0u8; 64];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = 0x10 + i as u8;
+    }
+    let build = |pattern: &[u8; 64]| -> Option<narf_net::Frame> {
+        let buf = narf_io::alloc_coherent(pattern.len(), narf_lib::id::DomainId::DRIVER_0).ok()?;
+        let mut frame = narf_net::Frame::new(buf, pattern.len() as u32);
+        frame.payload_mut().copy_from_slice(pattern);
+        Some(frame)
+    };
+
+    // Case 1 — no ring consumer attached: the stack handler is the
+    // only delivery, exactly once, on the original buffer (its
+    // in-place rewrite is visible afterwards); no mirror is made.
+    let Some(mut frame) = build(&pattern) else {
+        return TestResult::Fail("fixture frame allocation failed (case 1)");
+    };
+    let mut mirrored1: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    dispatch_rx(&name, &mut frame, false, |mirror| {
+        mirrored1.push(alloc::vec::Vec::from(mirror.payload()));
+    });
+    if FIXTURE_RX_CALLS.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail(
+            "unattached dispatch did not reach the stack handler exactly once",
+        );
+    }
+    if !mirrored1.is_empty() {
+        return TestResult::Fail("unattached dispatch mirrored to a ring with no consumer");
+    }
+    if frame.payload()[..4] != [0xEE; 4] {
+        return TestResult::Fail("stack handler's in-place rewrite missing on the original frame");
+    }
+
+    // Case 2 — ring consumer attached: the handler still sees the
+    // frame exactly once, the mirror sink is called exactly once,
+    // and the mirrored bytes are the PRISTINE pattern even though
+    // the handler rewrote its copy in place. The `RxHandler` seam
+    // returns `()`, so no stack verdict is exercised at this seam;
+    // the contract pinned is e1000's — the mirror is allocated and
+    // sunk before `deliver_rx` runs, so the ring observes raw
+    // hardware frames whatever the stack does with its own copy.
+    let Some(mut frame) = build(&pattern) else {
+        return TestResult::Fail("fixture frame allocation failed (case 2)");
+    };
+    let mut mirrored2: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    dispatch_rx(&name, &mut frame, true, |mirror| {
+        mirrored2.push(alloc::vec::Vec::from(mirror.payload()));
+    });
+    if FIXTURE_RX_CALLS.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("attached dispatch did not reach the stack handler exactly once");
+    }
+    if FIXTURE_RX_FIRST_BYTE.load(Ordering::SeqCst) != 0x10 {
+        return TestResult::Fail("stack handler was not handed the original first byte");
+    }
+    if mirrored2.len() != 1 {
+        return TestResult::Fail("attached dispatch did not mirror exactly once");
+    }
+    if mirrored2[0][..] != pattern[..] {
+        return TestResult::Fail("ring mirror does not hold the pristine pre-dispatch bytes");
+    }
+    if frame.payload()[..4] != [0xEE; 4] {
+        return TestResult::Fail("stack handler's rewrite missing on the original (case 2)");
+    }
+
+    // Case 3 — ring consumer attached but the device is UNPUBLISHED
+    // (empty name): the mirror gate is the attach signal alone,
+    // never the name — the i40e shape, whose pump observes attach
+    // from the taken consumer slot on a NIC that may have no
+    // published name at all. The mirror must still fire exactly
+    // once with pristine bytes, and the stack handler must NOT be
+    // reached (deliver_rx on an unpublished name is a no-op). This
+    // is the shape the pre-existing i40e queue-delivery smoke
+    // exercises end-to-end; an earlier build of `dispatch_rx`
+    // additionally required a non-empty name for the mirror and
+    // silently dropped this delivery entirely (CI kernel panic in
+    // `smoke_i40e_all_queues_deliver_and_rearm`).
+    let Some(mut frame) = build(&pattern) else {
+        return TestResult::Fail("fixture frame allocation failed (case 3)");
+    };
+    let mut mirrored3: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    dispatch_rx("", &mut frame, true, |mirror| {
+        mirrored3.push(alloc::vec::Vec::from(mirror.payload()));
+    });
+    if FIXTURE_RX_CALLS.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("unpublished-name dispatch reached the stack handler");
+    }
+    if mirrored3.len() != 1 {
+        return TestResult::Fail(
+            "attached dispatch with an empty name did not mirror exactly once",
+        );
+    }
+    if mirrored3[0][..] != pattern[..] {
+        return TestResult::Fail("empty-name ring mirror does not hold the pristine bytes");
+    }
+
+    // Restore the real stack handler for any later test in the boot.
+    narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/core", smoke_netdev_rx_dispatch_mirror_contract);
+
+// ── Single-pump construction invariant (issue #784) ───────────────
+//
+// The mirror contract above has a precondition no runtime fixture
+// in this tree can observe: exactly one RX pump drains a device's
+// descriptor ring, fed by the channel pair whose consumer the ring
+// consumer attaches to in `rx_ring()`. A second pump pair (the
+// pre-fix shape: `bring_up` spawned one pair, `probe` overwrote the
+// ring slots with another pair and spawned again) drains the same
+// ring but mirrors into the orphaned pair — the attached consumer
+// silently misses a scheduling-dependent subset of frames, and the
+// carrier observer runs twice. It cannot be caught at runtime
+// here: there is no MMIO device model for these families in-tree,
+// so `probe` never executes in a smoke, and the scheduler exposes
+// no per-driver task census a fixture could attribute pumps to.
+//
+// What can be pinned is the construction, for the representative
+// family (r8169; the other six formerly-double-spawning families —
+// ixgbe, rtl8125, rtl8126, tg3, atheros, forcedeth — share the
+// shape and are held to it by the same code discipline): the
+// driver source holds exactly one IPC channel pair creation and
+// exactly one `spawn_pumps` call, and the `probe` body creates
+// nothing and spawns nothing — the surviving pair is `bring_up`'s,
+// whose halves occupy the `rx_ipc_ring`/`tx_ipc_ring` slots.
+fn smoke_netdev_single_pump_construction_r8169() -> TestResult {
+    const SRC: &str = include_str!("../realtek/src/r8169.rs");
+
+    // One channel pair per device: one RX channel + one TX channel.
+    if SRC.matches("channel::<Frame").count() != 2 {
+        return TestResult::Fail(
+            "r8169 creates more (or fewer) than one IPC channel pair — duplicate-pump risk",
+        );
+    }
+    // One `spawn_pumps` definition + exactly one call site.
+    if SRC.matches("spawn_pumps(").count() != 2 {
+        return TestResult::Fail(
+            "r8169 has more (or fewer) than one spawn_pumps call site — duplicate-pump risk",
+        );
+    }
+    // The probe body — from `pub fn probe(` up to the `spawn_pumps`
+    // definition that follows it — must create no channels and
+    // spawn no pumps.
+    let Some(probe_start) = SRC.find("pub fn probe(") else {
+        return TestResult::Fail(
+            "r8169 probe not found — source layout changed, re-verify the single-pump invariant",
+        );
+    };
+    let Some(spawn_def) = SRC[probe_start..].find("\nfn spawn_pumps(") else {
+        return TestResult::Fail("r8169 spawn_pumps no longer follows probe — source layout changed, re-verify the single-pump invariant");
+    };
+    let probe_body = &SRC[probe_start..probe_start + spawn_def];
+    if probe_body.contains("channel::") || probe_body.contains("spawn_pumps(") {
+        return TestResult::Fail(
+            "r8169 probe creates channels or spawns pumps — a second pump pair would orphan the mirror sink",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/core",
+    smoke_netdev_single_pump_construction_r8169
+);

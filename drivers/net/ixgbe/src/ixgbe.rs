@@ -517,7 +517,8 @@ impl Ixgbe {
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
 
-        // Spawn pumps
+        // Spawn the device's only pump pair — probe spawns none, so the
+        // pair fed here is the pair whose halves occupy the ring slots.
         spawn_pumps(ixgbe.clone(), rx_prod, tx_cons);
 
         Ok(ixgbe)
@@ -810,7 +811,14 @@ impl Ixgbe {
 
 impl narf_net::Interface for Ixgbe {
     fn name(&self) -> &str {
-        name_for(self.did)
+        // The dynamic `eth%d` name once published (issue #784); the
+        // per-chip name before probe gets that far.
+        let n = ixgbe_ifname();
+        if n.is_empty() {
+            name_for(self.did)
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         self.mac
@@ -831,7 +839,12 @@ impl narf_net::Interface for Ixgbe {
 
 impl crate::HwNic for Ixgbe {
     fn name(&self) -> &'static str {
-        name_for(self.did)
+        let n = ixgbe_ifname();
+        if n.is_empty() {
+            name_for(self.did)
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         self.mac
@@ -870,7 +883,12 @@ pub struct IxgbeNic;
 
 impl narf_net::Interface for IxgbeNic {
     fn name(&self) -> &str {
-        with_controller(|c| name_for(c.did)).unwrap_or("ixgbe")
+        let n = ixgbe_ifname();
+        if n.is_empty() {
+            with_controller(|c| name_for(c.did)).unwrap_or("ixgbe")
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -888,6 +906,11 @@ impl narf_net::Interface for IxgbeNic {
             let mut r = RING.lock();
             if r.is_none() {
                 *r = c.rx_ipc_ring.lock().take();
+                if r.is_some() {
+                    // Ring consumer attached: enable the RX mirror
+                    // (e1000's `rx_mirror_enabled` moment).
+                    crate::publish::note_rx_mirror_attached(ixgbe_ifname());
+                }
             }
         });
         &RING
@@ -965,6 +988,33 @@ fn read_mac_from_rar(mmio: &MmioRegion) -> [u8; 6] {
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Ixgbe>>> = IrqSafeSpinLock::new(None);
 
+/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
+/// `dev_alloc_name`). Set once at probe; the device lives as long as
+/// the kernel, so the name is leaked into a `&'static str`.
+static IXGBE_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
+
+/// This NIC's interface name; empty until it has registered.
+pub fn ixgbe_ifname() -> &'static str {
+    IXGBE_IFNAME.get()
+}
+
+/// SendFn registered with `narf_net::iface` at probe time. Routes the
+/// kernel-side TCP stack's outbound frames through `Ixgbe::tx`. The
+/// Arc is cloned out rather than holding the IRQ-masking CONTROLLER
+/// lock across `tx` (same reasoning as e1000's send path).
+fn ixgbe_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+    ctrl.tx(frame, &meta).map_err(|_| ())
+}
+
+/// Decode a `LINKS` word into a publication sample. LINKS reports
+/// carrier in-band; its speed encoding is not decoded anywhere in the
+/// tree yet (PHY work, issue #790), so the sample is carrier-only
+/// rather than a guessed rate.
+fn ixgbe_link_sample(links: u32) -> crate::publish::LinkSample {
+    crate::publish::LinkSample::carrier_only(links & LINKS_UP != 0)
+}
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
@@ -978,9 +1028,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
-    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
-
     // SAFETY: `bring_up` requires exclusive ownership of the device's
     // BAR0 for init; we hold the bus `Cap<BusDeviceCap, Write>` and the
     // `CONTROLLER` guard above guarantees no other probe is racing this
@@ -990,17 +1037,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-
-    {
-        // SAFETY: `dev` was just created by `bring_up` and has not been
-        // published yet (it is stored into `CONTROLLER` only below), so
-        // this is the only `Arc` reference; no other thread can observe
-        // the `Ixgbe`, making this exclusive `&mut` to its interior sound.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Ixgbe) };
-        *d.rx_ipc_ring.lock() = Some(rx_cons);
-        *d.tx_ipc_ring.lock() = Some(tx_prod);
-    }
 
     *CONTROLLER.lock() = Some(dev.clone());
 
@@ -1012,6 +1048,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
+    // name + carrier metadata via the shared helper that generalises
+    // the e1000/igb pattern. The frame-ring registration below stays.
+    let name = crate::publish::publish_netdev(
+        dev.mac,
+        ixgbe_send_frame,
+        ixgbe_link_sample(dev.read_links()),
+    );
+    IXGBE_IFNAME.set(name);
+
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
         Some(a) => a.derive().ok(),
@@ -1021,8 +1067,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         let _ = narf_net::registry().register(&auth, IxgbeNic);
     }
 
-    // Spawn pumps
-    spawn_pumps(dev, rx_prod, tx_cons);
+    // No pump spawn here: `bring_up` spawned the device's single RX/TX
+    // pump pair, fed by the channel pair whose halves occupy the
+    // `rx_ipc_ring`/`tx_ipc_ring` slots (igc's discipline). A second
+    // pair spawned from probe would drain the same descriptor ring
+    // while its mirror sink's consumer is overwritten away — silently
+    // losing frames an attached ring consumer must see.
 
     Ok(())
 }
@@ -1047,10 +1097,38 @@ async fn ixgbe_rx_pump(device: Arc<Ixgbe>, mut rx_prod: Producer<Frame, RX_RING_
     // Zero-copy (P-F): take the device-filled DMA buffer straight out of the RX
     // descriptor as a Frame (refilling the slot), with no copy through a scratch
     // buffer + freshly-allocated frame.
+    //
+    // Carrier refresh (issue #791): the datapath is polled — MSI-X is
+    // enabled in bring-up but no production path consumes link
+    // interrupts — so this already-running pump is the family's link
+    // observer. It re-reads LINKS each pass and republishes only on a
+    // transition, so `iface` metadata tracks cable pull/replug instead
+    // of staying a probe-time photograph. Seeded from the probe-time
+    // sample so a steady link publishes nothing.
+    let mut last_sample = ixgbe_link_sample(device.read_links());
     loop {
+        let sample = ixgbe_link_sample(device.read_links());
+        if sample != last_sample {
+            last_sample = sample;
+            crate::publish::publish_link(ixgbe_ifname(), sample);
+        }
         match device.rx_recv_frame() {
-            Some(frame) => {
-                let _ = rx_prod.send(frame).await;
+            Some(mut frame) => {
+                // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
+                // shape via the shared helper: an attached ring
+                // consumer gets a pristine pre-dispatch copy; the
+                // original goes to the kernel stack in place. The
+                // mirror is non-blocking — a full/closed ring drops
+                // its copy, never the stack's packet.
+                let name = ixgbe_ifname();
+                crate::publish::dispatch_rx(
+                    name,
+                    &mut frame,
+                    crate::publish::rx_mirror_attached(name),
+                    |mirror| {
+                        let _ = rx_prod.try_send(mirror);
+                    },
+                );
             }
             None => narf_scheduler::yield_now().await,
         }

@@ -357,6 +357,57 @@ path for S1 and the expensive path only when needed, and makes the
 power-loss assumption explicit at the ABI rather than hiding in
 driver implementation.
 
+### 3.7 Power service (event → policy → action)
+
+```rust
+// service: the actor between platform power events and §3.3's core
+pub enum PowerAction { Suspend, PowerOff }
+pub enum ButtonAction { Ignore, Suspend, PowerOff }
+pub struct PowerPolicy {
+    pub suspend_on_lid_close: bool,          // default true
+    pub sleep_button: ButtonAction,          // default Suspend
+    pub power_button: ButtonAction,          // default Ignore (§3.6 owns the key)
+    pub warn_on_critical_battery: bool,      // default true
+}
+pub fn set_policy(cap: &Cap<Power, Grant>, p: PowerPolicy) -> Result<(), PowerError>;
+pub fn policy() -> PowerPolicy;
+
+pub trait ActionExecutor: Send + Sync { fn execute(&self, action: PowerAction); }
+pub fn install_action_executor(cap: &Cap<Power, Grant>, e: Arc<dyn ActionExecutor>) -> Result<(), PowerError>;
+pub fn install_warning_hook(cap: &Cap<Power, Grant>, h: Arc<dyn Fn() + Send + Sync>) -> Result<(), PowerError>;
+
+pub fn on_lid_changed(closed: bool);         // IRQ-safe intake
+pub fn on_ac_changed(state: AcAdapterState);
+pub fn on_power_button_press();
+pub fn on_sleep_button_press();
+pub fn request_action(action: PowerAction);  // policy-free direct request
+
+pub struct StateProviders { /* ac_adapter, lid, battery, cpu/gpu temp closures */ }
+pub fn register_state_providers(cap: &Cap<Power, Grant>, p: StateProviders) -> Result<(), PowerError>;
+pub fn snapshot() -> LaptopStateSnapshot;
+pub fn start_worker();                       // Stage::Late initcall
+```
+
+The service holds no `Cap`: configuration is cap-gated, execution is
+delegated to the installed `ActionExecutor`, whose owner holds the
+authority (the platform composition mints the suspend
+`Cap<Power, Invoke>` at its call site). Intake only records the
+request as a bit in an atomic mask and wakes the worker — duplicate
+requests coalesce, and no action ever runs in the notifying (IRQ /
+SCI subscriber) context. The worker (or any task-context caller of
+`pump_pending`) executes pending actions in Suspend → PowerOff
+order. With no executor installed, requests stay pending rather
+than being dropped; installing an executor wakes the worker.
+
+`snapshot()` fuses the registered `StateProviders` (closures that
+may evaluate AML — never invoked under the service lock), falls
+back to event-cached AC / lid state, drains the button-press
+counters into the snapshot exactly once, and edge-triggers the
+warning hook on a transition into `LaptopStateSnapshot::
+is_running_low_on_battery()` when policy enables it. The §3.3
+production-S3 arm/validated gates are unchanged: the service
+requests suspend, the core still decides.
+
 ## 4. Invariants & safety properties
 
 - Suspend never returns without either `WokeUp` or `Aborted`;

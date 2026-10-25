@@ -591,23 +591,33 @@ pub async fn try_bind_cdc_acm_already_addressed(
         bulk_out_dci,
         line_coding: coding,
     });
-    {
+    if should_announce_attach(slot_id) {
         use core::fmt::Write as _;
-        use core::sync::atomic::{AtomicU64, Ordering};
-        static ATTACHED: AtomicU64 = AtomicU64::new(0);
-        let bit = 1u64 << (slot_id as u32 & 63);
-        let prev = ATTACHED.fetch_or(bit, Ordering::AcqRel);
-        if prev & bit == 0 {
-            let _ = writeln!(
-                narf_console::Writer,
-                "  cdc-acm: serial attached on slot {} ({} bps)",
-                slot_id,
-                coding.baud_rate
-            );
-        }
+        let _ = writeln!(
+            narf_console::Writer,
+            "  cdc-acm: serial attached on slot {} ({} bps)",
+            slot_id,
+            coding.baud_rate
+        );
     }
     ACM_DEVICES.lock().push(dev);
     Ok(())
+}
+
+/// Detach the ACM device bound to `slot_id` (unplugged or torn
+/// down by the supervisor): drop the binding so `pump_all` stops
+/// polling the dead slot. Returns true when a binding was removed.
+pub fn detach_acm(slot_id: u8) -> bool {
+    let mut g = ACM_DEVICES.lock();
+    let before = g.len();
+    g.retain(|d| d.slot_id != slot_id);
+    g.len() != before
+}
+
+/// Drop every ACM binding. Called on a controller recovery epoch
+/// change.
+pub fn clear_acm() {
+    ACM_DEVICES.lock().clear();
 }
 
 /// Drain one report from each bound ACM device's bulk-IN endpoint
@@ -655,6 +665,17 @@ pub async fn send(xhci_dev: &Xhci, data: &[u8]) -> Result<usize, XhciError> {
 /// Number of bound ACM devices. Test + diagnostics helper.
 pub fn attached_count() -> usize {
     ACM_DEVICES.lock().len()
+}
+
+/// Whether binding `slot_id` should print the "serial attached"
+/// banner: yes iff no live binding for the slot exists yet.
+/// Membership in [`ACM_DEVICES`] is the latch — `detach_acm`
+/// removes the entry on unplug, so a replugged adapter on the same
+/// slot announces again. (This replaces a function-local `ATTACHED`
+/// bitmask in the bind path that was never cleared on detach and
+/// permanently suppressed the banner after the first bind.)
+fn should_announce_attach(slot_id: u8) -> bool {
+    !ACM_DEVICES.lock().iter().any(|d| d.slot_id == slot_id)
 }
 
 // ── SETUP-packet builders ────────────────────────────────────────
@@ -857,6 +878,43 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/cdc_acm", smoke_acm_descriptor_caps);
+
+    /// Detach/replug latch: the "serial attached" announce
+    /// predicate tracks ACM_DEVICES membership — latched while a
+    /// binding for the slot lives, re-armed once `detach_acm`
+    /// removes it, so a replugged adapter announces again.
+    fn smoke_acm_announce_latch_replug() -> TestResult {
+        const SLOT: u8 = 201; // no real enumeration reaches this slot in tests
+        let baseline = attached_count();
+        if !should_announce_attach(SLOT) {
+            return TestResult::Fail("announce should be armed with no binding");
+        }
+        ACM_DEVICES.lock().push(Arc::new(AcmDevice {
+            slot_id: SLOT,
+            data_iface: 1,
+            comm_iface: 0,
+            bulk_in_dci: 3,
+            bulk_out_dci: 2,
+            line_coding: LineCoding::N_115200_8N1,
+        }));
+        if attached_count() != baseline + 1 {
+            return TestResult::Fail("fabricated binding not registered");
+        }
+        if should_announce_attach(SLOT) {
+            return TestResult::Fail("announce should be latched while bound");
+        }
+        if !detach_acm(SLOT) {
+            return TestResult::Fail("detach_acm should report the removal");
+        }
+        if attached_count() != baseline {
+            return TestResult::Fail("binding should be gone after detach_acm");
+        }
+        if !should_announce_attach(SLOT) {
+            return TestResult::Fail("announce should re-arm after detach");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_acm", smoke_acm_announce_latch_replug);
 
     fn smoke_line_coding_round_trip() -> TestResult {
         let coding = LineCoding::N_115200_8N1;

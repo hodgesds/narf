@@ -219,6 +219,15 @@ pub fn unregister_generic_evdev(slot_id: u8) {
     }
 }
 
+/// Unregister every bound generic device. Called on a controller
+/// recovery epoch change.
+pub fn unregister_all_generic() {
+    let slots: alloc::vec::Vec<u8> = GENERIC_DEVICES.lock().iter().map(|d| d.slot_id).collect();
+    for slot in slots {
+        unregister_generic_evdev(slot);
+    }
+}
+
 // ── Pump ─────────────────────────────────────────────────────────────
 
 /// Drain reports from all Generic devices, dispatch events. Returns

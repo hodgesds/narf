@@ -268,6 +268,30 @@ static ISR_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Sync ISR: read ICR to acknowledge the device, then return. The
 /// dispatch layer bumps the per-vector fire-count and wakes any waiter.
+/// Link Status Change pending, set by the ISR when ICR reports LSC.
+/// The ISR does no lock or allocation work; the RX pump (task
+/// context) consumes the flag, re-samples STATUS via `Igb::link_up`,
+/// and republishes the iface link metadata — before this, carrier
+/// was a probe-time photograph because the ISR read ICR only to
+/// acknowledge it (issue #791).
+static LSC_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// The family's publication sample. i210/82576/i350 negotiate up to
+/// 1 GbE copper; report full duplex when the link is up (QEMU's igb
+/// model reports LU immediately). Shared by probe (initial state) and
+/// the RX pump's LSC drain (every transition).
+fn igb_link_sample(dev: &Igb) -> crate::publish::LinkSample {
+    if dev.link_up() {
+        crate::publish::LinkSample {
+            carrier: true,
+            speed_mbps: Some(1000),
+            duplex: Some(narf_net::iface::LinkDuplex::Full),
+        }
+    } else {
+        crate::publish::LinkSample::DOWN
+    }
+}
+
 fn igb_isr() {
     let base = ISR_MMIO_BASE.load(Ordering::Acquire);
     if base == 0 {
@@ -275,8 +299,12 @@ fn igb_isr() {
     }
     // SAFETY: `base` is the device's BAR0 virt, mapped at bring-up;
     // ICR (0x00c0) is inside the igb register window.
-    unsafe {
-        let _icr = narf_arch::mmio::read32(base + REG_ICR);
+    let icr = unsafe { narf_arch::mmio::read32(base + REG_ICR) };
+    // LSC is in the default IMS mask, so a link transition reaches
+    // this read; record it for the pump instead of discarding the
+    // cause word (issue #791).
+    if icr & IMS_LSC != 0 {
+        LSC_PENDING.store(true, Ordering::Release);
     }
 }
 
@@ -1307,7 +1335,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     let mac = dev.mac;
-    let link_up = dev.link_up();
+    let link_sample = igb_link_sample(&dev);
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
@@ -1327,14 +1355,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
     };
     narf_net::iface::set_driver_info(&name, "igb", None, bus_info);
-    // i210/82576/i350 negotiate up to 1 GbE copper; report full duplex
-    // when the link is up (QEMU's igb model reports LU immediately).
-    narf_net::iface::set_link_metadata(
-        &name,
-        link_up,
-        link_up.then_some(1000),
-        link_up.then_some(narf_net::iface::LinkDuplex::Full),
-    );
+    crate::publish::publish_link(&name, link_sample);
     narf_net::iface::set_offloads(
         &name,
         narf_net::OffloadCapabilities {
@@ -1463,6 +1484,13 @@ async fn igb_rx_pump(device: Arc<Igb>) {
     let poll_fallback_cycles = narf_time::ns_to_cycles(1_000_000);
 
     loop {
+        // Link Status Change drain (issue #791): the ISR flagged a
+        // transition; re-sample STATUS in task context and republish.
+        // The pump wakes on the same interrupt (LSC is in IMS_DEFAULT)
+        // or on the 10 ms fallback, so this adds no polling loop.
+        if LSC_PENDING.swap(false, Ordering::AcqRel) {
+            crate::publish::publish_link(igb_ifname(), igb_link_sample(&device));
+        }
         let irq_waiter = device.irq_vector.map(|vector| {
             narf_interrupts::wait_for_irq_until(
                 vector,

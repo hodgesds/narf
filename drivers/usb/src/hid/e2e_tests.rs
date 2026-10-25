@@ -1048,3 +1048,37 @@ kernel_test_in!(
     "drivers/usb/hid/e2e",
     smoke_e2e_touchpad_pointer_events_reach_router
 );
+
+// ── Smoke: production detach removes the boot-keyboard binding ───
+//
+// The disconnect lifecycle (attach::detach_slot) starts by dropping
+// class bindings. For boot keyboards that is hid::detach_boot_keyboard:
+// insert a binding the way the binder does, detach it by slot, and
+// verify the pump set no longer contains it and a second detach is
+// an honest no-op.
+
+fn smoke_e2e_detach_removes_boot_keyboard_binding() -> TestResult {
+    {
+        let mut g = super::KEYBOARDS.lock();
+        g.push(super::BootKeyboard {
+            slot_id: 7,
+            interrupt_in_ep: 3,
+            interface_num: 0,
+            last_report: super::KbdReport::default(),
+        });
+    }
+    if !super::detach_boot_keyboard(7) {
+        return TestResult::Fail("detach_boot_keyboard reported no binding for slot 7");
+    }
+    if super::KEYBOARDS.lock().iter().any(|k| k.slot_id == 7) {
+        return TestResult::Fail("boot-keyboard binding survived detach");
+    }
+    if super::detach_boot_keyboard(7) {
+        return TestResult::Fail("second detach_boot_keyboard reported a binding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/hid/e2e",
+    smoke_e2e_detach_removes_boot_keyboard_binding
+);

@@ -849,6 +849,8 @@ impl Rtl8126Nic {
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
 
+        // Spawn the device's only pump pair — probe spawns none, so the
+        // pair fed here is the pair whose halves occupy the ring slots.
         spawn_pumps(nic.clone(), rx_prod, tx_cons);
 
         Arc::try_unwrap(nic).map_err(|_| NicError::NoMemory)
@@ -1043,6 +1045,57 @@ impl Rtl8126Nic {
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtl8126Nic>>> = IrqSafeSpinLock::new(None);
 
+/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
+/// `dev_alloc_name`). Set once at probe; the device lives as long as
+/// the kernel, so the name is leaked into a `&'static str`.
+static RTL8126_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
+
+/// This NIC's interface name; empty until it has registered.
+pub fn rtl8126_ifname() -> &'static str {
+    RTL8126_IFNAME.get()
+}
+
+/// SendFn registered with `narf_net::iface` at probe time. Routes the
+/// kernel-side TCP stack's outbound frames through
+/// `Rtl8126Nic::transmit`. The Arc is cloned out rather than holding
+/// the IRQ-masking CONTROLLER lock across `transmit` (same reasoning
+/// as e1000's send path).
+fn rtl8126_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+    ctrl.transmit(frame).map_err(|_| ())
+}
+
+/// Decode a PHYStatus byte into a publication sample via the family's
+/// existing `PhyStatus::parse`. The ≥1G bit is in-band state (2.5G
+/// raises it too), so 1000 is the in-band lower bound unless the 5G
+/// bit is set; exact negotiated-rate decode is PHY work (#790).
+fn rtl8126_link_sample(status: u8) -> crate::publish::LinkSample {
+    let s = PhyStatus::parse(status);
+    if !s.link_up {
+        return crate::publish::LinkSample::DOWN;
+    }
+    let speed_mbps = if s.speed_5g {
+        Some(5000)
+    } else if s.speed_1000m_or_above {
+        Some(1000)
+    } else if s.speed_100m {
+        Some(100)
+    } else if s.speed_10m {
+        Some(10)
+    } else {
+        None
+    };
+    crate::publish::LinkSample {
+        carrier: true,
+        speed_mbps,
+        duplex: Some(if s.full_duplex {
+            narf_net::iface::LinkDuplex::Full
+        } else {
+            narf_net::iface::LinkDuplex::Half
+        }),
+    }
+}
+
 /// Probe entry — installed via `bus::register_pci_driver`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
@@ -1057,25 +1110,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
-    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
-
     // SAFETY: caller-authority over the device.
     let dev = match unsafe { Rtl8126Nic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-
-    {
-        // SAFETY: `dev` was just created here and has not been published
-        // (CONTROLLER is set below, no clones exist yet), so its Arc
-        // refcount is 1 and this is the only reference — forming a unique
-        // `&mut Rtl8126Nic` from the as_ptr pointer does not alias.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Rtl8126Nic) };
-        *d.rx_ipc_ring.lock() = Some(rx_cons);
-        *d.tx_ipc_ring.lock() = Some(tx_prod);
-    }
 
     *CONTROLLER.lock() = Some(dev.clone());
 
@@ -1087,6 +1126,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
+    // name + carrier metadata via the shared helper. The frame-ring
+    // registration below stays.
+    let mac = with_controller(|c| c.mac).unwrap_or([0; 6]);
+    let status = with_controller(|c| c.phy_status()).unwrap_or(0);
+    let name = crate::publish::publish_netdev(mac, rtl8126_send_frame, rtl8126_link_sample(status));
+    RTL8126_IFNAME.set(name);
+
     let auth = match narf_net::trusted_net_authority() {
         Some(a) => a.derive().ok(),
         None => None,
@@ -1095,7 +1142,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         let _ = narf_net::registry().register(&auth, Rtl8126NicIface);
     }
 
-    spawn_pumps(dev, rx_prod, tx_cons);
+    // No pump spawn here: `bring_up` spawned the device's single RX/TX
+    // pump pair, fed by the channel pair whose halves occupy the
+    // `rx_ipc_ring`/`tx_ipc_ring` slots (igc's discipline). A second
+    // pair spawned from probe would drain the same descriptor ring
+    // while its mirror sink's consumer is overwritten away — silently
+    // losing frames an attached ring consumer must see.
 
     Ok(())
 }
@@ -1116,13 +1168,40 @@ fn spawn_pumps(
 }
 
 async fn rtl8126_rx_pump(device: Arc<Rtl8126Nic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    // Carrier refresh (issue #791): the production datapath is polled
+    // (probe never enables MSI-X, so the LinkChg bit in the ISR has no
+    // consumer), which makes this pump the family's link observer.
+    // `phy_status()` is an `&self` MMIO read — unlike
+    // `refresh_link_state(&mut self)`, it is safe to call while pumps
+    // hold Arc clones. A transition republishes the iface metadata;
+    // the cached `Interface::link_up` snapshot is left as-is.
+    let mut last_sample = rtl8126_link_sample(device.phy_status());
     loop {
+        let sample = rtl8126_link_sample(device.phy_status());
+        if sample != last_sample {
+            last_sample = sample;
+            crate::publish::publish_link(rtl8126_ifname(), sample);
+        }
         if let Some(pkt) = device.receive() {
             let dma_buf =
                 alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
-            let _ = rx_prod.send(frame).await;
+            // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
+            // shape via the shared helper: an attached ring consumer
+            // gets a pristine pre-dispatch copy; the original goes to
+            // the kernel stack in place. The mirror is non-blocking —
+            // a full/closed ring drops its copy, never the stack's
+            // packet.
+            let name = rtl8126_ifname();
+            crate::publish::dispatch_rx(
+                name,
+                &mut frame,
+                crate::publish::rx_mirror_attached(name),
+                |mirror| {
+                    let _ = rx_prod.try_send(mirror);
+                },
+            );
         }
         narf_scheduler::yield_now().await;
     }
@@ -1172,7 +1251,14 @@ pub struct Rtl8126NicIface;
 
 impl narf_net::Interface for Rtl8126NicIface {
     fn name(&self) -> &str {
-        "rtl8126"
+        // The dynamic `eth%d` name once published (issue #784); the
+        // family name before probe gets that far.
+        let n = rtl8126_ifname();
+        if n.is_empty() {
+            "rtl8126"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -1190,6 +1276,11 @@ impl narf_net::Interface for Rtl8126NicIface {
             let mut r = RING.lock();
             if r.is_none() {
                 *r = c.rx_ipc_ring.lock().take();
+                if r.is_some() {
+                    // Ring consumer attached: enable the RX mirror
+                    // (e1000's `rx_mirror_enabled` moment).
+                    crate::publish::note_rx_mirror_attached(rtl8126_ifname());
+                }
             }
         });
         &RING
@@ -1209,7 +1300,12 @@ impl narf_net::Interface for Rtl8126NicIface {
 
 impl crate::HwNic for Rtl8126NicIface {
     fn name(&self) -> &'static str {
-        "rtl8126"
+        let n = rtl8126_ifname();
+        if n.is_empty() {
+            "rtl8126"
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])

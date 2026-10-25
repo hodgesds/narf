@@ -193,6 +193,34 @@ pub fn register_tty_usb(chip: ChipFamily) -> usize {
     idx
 }
 
+/// Unregister the ttyUSB port with the given index: remove it from
+/// the node table (so `lookup_tty_usb` / devfs enumeration stop
+/// resolving it) and withdraw its `/sys/class/tty/ttyUSB<N>`
+/// kobject. Returns `true` if a port was registered at that index.
+///
+/// This is the detach half of [`register_tty_usb`], called when a
+/// USB-serial adapter unplugs. The index is *not* returned to the
+/// allocator — indices are monotonic for the boot (the register
+/// side's existing design), so a replugged adapter publishes as a
+/// fresh `ttyUSB<N>` rather than resurrecting the old number. An
+/// already-open `TtyUsbFile` keeps its `Arc<SerialPort>` alive
+/// until close; only new lookups stop resolving.
+///
+/// Linux ref: `usb_serial_disconnect` → `tty_unregister_device` in
+/// `drivers/usb/serial/usb-serial.c`.
+pub fn unregister_tty_usb(index: usize) -> bool {
+    let removed = {
+        let mut nodes = TTY_USB_NODES.lock();
+        let before = nodes.len();
+        nodes.retain(|p| p.lock().index != index);
+        nodes.len() != before
+    };
+    // Registration created the kobject unconditionally, so withdraw
+    // it unconditionally too; remove_child is a no-op when absent.
+    unregister_sysfs(index);
+    removed
+}
+
 /// Retrieve the port state for ttyUSB<N>, if registered.
 pub fn get_port(index: usize) -> Option<Arc<IrqSafeSpinLock<SerialPort>>> {
     TTY_USB_NODES
@@ -249,6 +277,16 @@ fn register_sysfs(idx: usize, chip: ChipFamily) {
     // child kobject approach would match Linux more closely but is
     // not required to satisfy the test specification.
     kobject_add_attr(&kobj, "device/driver", move || format!("{}\n", driver_name));
+}
+
+/// Withdraw `/sys/class/tty/ttyUSB<N>/` (the kobject created by
+/// [`register_sysfs`]).
+fn unregister_sysfs(idx: usize) {
+    use narf_filesystem::sysfs::class_register;
+
+    let tty_class = class_register("tty");
+    let name = format!("ttyUSB{}", idx);
+    tty_class.remove_child(&name);
 }
 
 // ── devfs file node ───────────────────────────────────────────────────────
@@ -459,4 +497,49 @@ pub mod tests {
         }
     }
     kernel_test_in!("drivers/usb/serial/devfs_bridge", smoke_ttyusb_lookup);
+
+    /// Detach/replug: unregister removes the port from the node
+    /// table and withdraws the sysfs kobject; a second unregister
+    /// is a no-op; a replug republishes under a fresh index (the
+    /// allocator is monotonic).
+    fn smoke_ttyusb_unregister_detach_replug() -> TestResult {
+        narf_filesystem::sysfs::__reset_for_test();
+        __reset_for_test();
+        let idx = register_tty_usb(ChipFamily::Cp210x);
+        if lookup_tty_usb("ttyUSB0").is_none() {
+            return TestResult::Fail("ttyUSB0 should resolve after register");
+        }
+        if !unregister_tty_usb(idx) {
+            return TestResult::Fail("unregister should report a removal");
+        }
+        if port_count() != 0 || get_port(idx).is_some() {
+            return TestResult::Fail("port should be gone after unregister");
+        }
+        if lookup_tty_usb("ttyUSB0").is_some() {
+            return TestResult::Fail("ttyUSB0 should not resolve after unregister");
+        }
+        use narf_filesystem::sysfs::class_register;
+        if class_register("tty").get_child("ttyUSB0").is_some() {
+            return TestResult::Fail("sysfs kobject should be withdrawn after unregister");
+        }
+        if !enumerate_tty_usb().is_empty() {
+            return TestResult::Fail("enumeration should be empty after unregister");
+        }
+        if unregister_tty_usb(idx) {
+            return TestResult::Fail("second unregister should report no removal");
+        }
+        // Replug: fresh index, resolvable again.
+        let idx2 = register_tty_usb(ChipFamily::Cp210x);
+        if idx2 == idx {
+            return TestResult::Fail("replug should allocate a fresh index");
+        }
+        if lookup_tty_usb("ttyUSB1").is_none() {
+            return TestResult::Fail("ttyUSB1 should resolve after replug");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/serial/devfs_bridge",
+        smoke_ttyusb_unregister_detach_replug
+    );
 }

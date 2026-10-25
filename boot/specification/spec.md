@@ -65,6 +65,17 @@ most 32 bytes are kept. A zero tag-12 pointer is treated as absent.
 `loglevel=N` (clamped to 1..15) in command-line order and returns the final
 explicit threshold, or `None` when no verbosity token was supplied.
 
+**Cmdline store contract (per-arch `parse_raw`):** the bootloader-supplied
+command line is copied into a static 2048-byte buffer (`CMDLINE_CAP`,
+matching Linux's `COMMAND_LINE_SIZE`); the store keeps at most
+`CMDLINE_CAP - 1` bytes. On aarch64 the source is the FDT
+`/chosen/bootargs`, extracted by `narf-firmware-fdt` at the same 2048-byte
+cap (`BOOTARGS_CAP`). Truncation is never silent: the aarch64 store
+records it (`narf_boot::aarch64::cmdline_truncated()`) and prints a
+warning naming the sizes to the boot UART at store time (#960 — a
+256-byte cap previously dropped trailing tokens, including the test
+harness's `test_subsystem_exclude=`, without a trace).
+
 **Handoff validation checks (binding):**
 
 1. Every retained memory-map region is non-empty, its end address does

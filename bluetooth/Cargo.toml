@@ -24,6 +24,7 @@ narf-filesystem   = { path = "../filesystem" }
 narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
 narf-init         = { path = "../init" }
+narf-crypto       = { path = "../crypto" }
 narf-audio        = { path = "../audio" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 

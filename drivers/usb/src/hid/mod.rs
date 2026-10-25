@@ -838,6 +838,31 @@ pub static PUMP_ALL_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::A
 /// IRQ / endpoint-state issue).
 pub static REPORTS_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Detach the boot keyboard bound to `slot_id` — the device was
+/// unplugged, its hub went away, or the supervisor is tearing the
+/// binding down before slot reclaim. Boot keyboards feed the shared
+/// input ring and own no evdev node, so dropping the binding (which
+/// stops `pump_all` from polling the dead slot) is the whole
+/// detach. Returns true when a binding was removed.
+pub fn detach_boot_keyboard(slot_id: u8) -> bool {
+    let mut g = KEYBOARDS.lock();
+    let before = g.len();
+    g.retain(|k| k.slot_id != slot_id);
+    let removed = g.len() != before;
+    if removed {
+        ATTACHED_KEYBOARD_COUNT.store(g.len() as u32, core::sync::atomic::Ordering::Release);
+    }
+    removed
+}
+
+/// Drop every boot-keyboard binding. Called on a controller
+/// recovery epoch change, where every slot is dead by construction
+/// and no per-slot teardown applies.
+pub fn clear_boot_keyboards() {
+    KEYBOARDS.lock().clear();
+    ATTACHED_KEYBOARD_COUNT.store(0, core::sync::atomic::Ordering::Release);
+}
+
 #[doc(hidden)]
 pub fn __reset_keyboards_for_test() {
     KEYBOARDS.lock().clear();

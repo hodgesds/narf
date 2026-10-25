@@ -178,6 +178,18 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   the stable `hci<N>` ordinal.
 - `sysfs_bridge::register_hci_controller(index, info, connections)` publishes
   a ready controller under `/sys/class/bluetooth/hci<N>`.
+- `pump` — the HCI event/ACL driver task. `pump::notify_controller_ready(index)`
+  (called by both registration paths above) registers a per-controller
+  `PumpCore`; `pump::enable_spawning()` (Stage::Late `bluetooth-pump`
+  initcall) starts a stackful pump task per controller. `pump::pump_once(index)`
+  is the fixture-drivable step: events are dispatched (connection tracking,
+  LTK-request refusal, flow control) and fanned out to the raw-HCI socket
+  queue (`hci_sock::drain_event` reads it once a pump is active), ACL frames
+  are reassembled per connection and routed by CID — ATT to the
+  per-controller `GattServer`, SMP to a per-connection `smp::Responder`
+  driven by the production `pump::NarfSmpCrypto` (narf-crypto P-256 /
+  AES-CMAC / hardware RNG), signalling channels answered per §L2CAP.
+  `pump::stop_pump(index)` quiesces a controller's task ahead of detach.
 
 ## Scope
 
@@ -187,6 +199,12 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   Command Status decoders, transport trait + USB class triple, full
   bring-up state machine (Reset → Read Local Version → Read BD_ADDR
   → Read Buffer Size → Set Event Mask).
+- **HCI pump** (`pump`): supervised per-controller event/ACL pump task
+  composing the layers below into a running system — connection table,
+  ACL flow control, raw-socket event fan-out, per-connection L2CAP
+  dispatch (ATT → GATT server with default GAP/GATT/DIS/Battery
+  services, SMP → Just-Works responder, LE + BR/EDR signalling
+  answers). Production `SmpCrypto` via narf-crypto (`NarfSmpCrypto`).
 - **L2CAP** (`l2cap`): CID constants, B-frame codec, ACL fragment
   reassembler that handles the PB-flag rules from Vol 4 Part E §5.4.2,
   signalling-command codec + iterator, dynamic CID allocator.
@@ -266,7 +284,14 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   adopts its completed async bring-up through `register_ready_transport`.
 
 ### Out of scope (deliberate)
-- Non-QCA vendor firmware protocols and Bluetooth policy daemons.
+- Realtek / Broadcom USB vendor firmware protocols (Intel, MediaTek and
+  Qualcomm loaders live in `narf-drivers-usb::btusb`) and Bluetooth
+  policy daemons.
+- Bonding / LTK storage, SMP key distribution, pairing initiation from
+  the kernel (needs an application policy trigger), LE credit-based
+  channel servers, and SDP / RFCOMM channel servers — the pump refuses
+  or negative-replies these explicitly rather than leaving peers to
+  time out.
 - SCO/eSCO isochronous USB transport.
 
 ## Cap surface
