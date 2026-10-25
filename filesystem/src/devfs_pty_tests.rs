@@ -13,7 +13,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::devfs_misc::DevFull;
-use crate::devfs_pty::{open_ptmx, pts_lookup, DevPts, PtySlave, __reset_for_test};
+use crate::devfs_pty::{__reset_for_test, open_ptmx, pts_lookup, DevPts, PtySlave};
 use crate::{DirOps, FileOps, FsError};
 
 // ── Helper ────────────────────────────────────────────────────────────────────

@@ -2384,7 +2384,7 @@ kernel_test_in!("power/device_pm", smoke_device_pm_register_and_fanout_order);
 
 fn smoke_device_pm_one_failure_doesnt_abort_chain() -> TestResult {
     use crate::device_pm::{
-        register_device_pm, suspend_all_devices, DeviceSuspendError, __reset_for_test,
+        __reset_for_test, register_device_pm, suspend_all_devices, DeviceSuspendError,
     };
     __reset_for_test();
     PM_SEQ.store(0, TestOrdering::Release);
@@ -2466,7 +2466,7 @@ fn smoke_arm_s3_resume_refuses_without_armed_real_sleep() -> TestResult {
     // The arm_s3_resume orchestrator must NOT issue PM1 SLP_EN
     // unless REAL_SLEEP_ARMED is set — protects against bricking
     // the box during smoke runs.
-    use crate::suspend::{arm_s3_resume, SuspendError, __test_reset};
+    use crate::suspend::{__test_reset, arm_s3_resume, SuspendError};
     use crate::Power;
     use narf_capabilities::{Cap, Invoke};
     // Isolate from the boot's real devices: NVMe refuses system
@@ -2585,8 +2585,8 @@ kernel_test_in!("power/suspend", smoke_s3_wake_entry_phys_resolvable_via_cr3);
 
 fn smoke_device_pm_ops_round_trip() -> TestResult {
     use crate::device_pm::{
-        register_device_pm_ops, resume_all_devices, suspend_all_devices, DevicePmError,
-        DevicePmOps, __reset_for_test,
+        __reset_for_test, register_device_pm_ops, resume_all_devices, suspend_all_devices,
+        DevicePmError, DevicePmOps,
     };
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -2647,8 +2647,8 @@ fn smoke_pci_config_save_restore_round_trip_via_ops() -> TestResult {
     // verify the wrapper integrates with power's device_pm
     // registry. We model the cfg-space with an in-memory shadow.
     use crate::device_pm::{
-        register_device_pm_ops, resume_all_devices, suspend_all_devices, DevicePmError,
-        DevicePmOps, __reset_for_test,
+        __reset_for_test, register_device_pm_ops, resume_all_devices, suspend_all_devices,
+        DevicePmError, DevicePmOps,
     };
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -3094,7 +3094,7 @@ kernel_test_in!("power/watchdog", smoke_watchdog_write_any_byte_kicks);
 // Smoke 2: write 'V' then watchdog_release → active becomes false.
 // Linux ref: watchdog_dev.c:watchdog_release (lines 278–310) — magic close disarms.
 fn smoke_watchdog_magic_v_close_disarms() -> TestResult {
-    use crate::watchdog_bridge::{watchdog_release, DevWatchdog, __new_test_state};
+    use crate::watchdog_bridge::{__new_test_state, watchdog_release, DevWatchdog};
     use core::sync::atomic::Ordering;
     use narf_filesystem::FileOps;
 
@@ -3121,7 +3121,7 @@ kernel_test_in!("power/watchdog", smoke_watchdog_magic_v_close_disarms);
 // Smoke 3: write 'a' then close without 'V' → watchdog stays armed.
 // Linux ref: watchdog_dev.c:watchdog_release (lines 296–302) — no magic = no disarm.
 fn smoke_watchdog_close_without_v_keeps_active() -> TestResult {
-    use crate::watchdog_bridge::{watchdog_release, DevWatchdog, __new_test_state};
+    use crate::watchdog_bridge::{__new_test_state, watchdog_release, DevWatchdog};
     use core::sync::atomic::Ordering;
     use narf_filesystem::FileOps;
 

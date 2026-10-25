@@ -105,8 +105,8 @@ kernel_test_in!("observability", smoke_obs_crash_frame_captures_regs);
 
 fn smoke_obs_panic_snapshot_roundtrip() -> TestResult {
     use crate::{
-        install_panic_snapshot, take_snapshot, ObservabilityEvent, Recorder,
-        __test_clear_panic_ring, SNAPSHOT_CAPACITY,
+        __test_clear_panic_ring, install_panic_snapshot, take_snapshot, ObservabilityEvent,
+        Recorder, SNAPSHOT_CAPACITY,
     };
     use narf_capabilities::{Cap, Grant};
     use narf_tracing::FlightRing;
@@ -168,8 +168,8 @@ kernel_test_in!("observability", smoke_obs_panic_snapshot_roundtrip);
 
 fn smoke_obs_pmu_sample_into_ring() -> TestResult {
     use crate::{
-        install_panic_snapshot, sample_pmu, take_snapshot, ObsError, ObservabilityEvent, Pmu,
-        Recorder, __test_clear_panic_ring, SNAPSHOT_CAPACITY,
+        __test_clear_panic_ring, install_panic_snapshot, sample_pmu, take_snapshot, ObsError,
+        ObservabilityEvent, Pmu, Recorder, SNAPSHOT_CAPACITY,
     };
     use narf_capabilities::{Cap, Read};
     use narf_tracing::FlightRing;
@@ -228,8 +228,8 @@ kernel_test_in!("observability", smoke_obs_pmu_sample_into_ring);
 
 fn smoke_obs_core_dump_bundles_snapshot() -> TestResult {
     use crate::{
-        capture_core_dump, install_panic_snapshot, ArchRegs, ObservabilityEvent, Recorder,
-        __test_clear_panic_ring, SNAPSHOT_CAPACITY,
+        __test_clear_panic_ring, capture_core_dump, install_panic_snapshot, ArchRegs,
+        ObservabilityEvent, Recorder, SNAPSHOT_CAPACITY,
     };
     use narf_capabilities::{Cap, Grant};
     use narf_tracing::FlightRing;

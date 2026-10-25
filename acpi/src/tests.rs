@@ -2753,7 +2753,7 @@ kernel_test_in!("acpi/fan", smoke_acpi_fan_has_tachometer_handles_unknown);
 
 fn smoke_acpi_fan_registry_register_and_iterate() -> TestResult {
     use crate::fan::{
-        fan_count, register_fan, registered_fans, Fan, FanRuntimeError, FanStatus, __reset_for_test,
+        __reset_for_test, fan_count, register_fan, registered_fans, Fan, FanRuntimeError, FanStatus,
     };
     use alloc::sync::Arc;
     __reset_for_test();

@@ -24,8 +24,8 @@ mod smokes {
     use crate::kbd_backlight::dell_encode_kbd_level;
     use crate::leds::{led_device, register_led, unregister_led, LedDevice, SimpleLed, Trigger};
     use crate::{
-        backlight_device, backlight_devices, unregister_backlight, BacklightDevice, BacklightKind,
-        __reset_all_for_test,
+        __reset_all_for_test, backlight_device, backlight_devices, unregister_backlight,
+        BacklightDevice, BacklightKind,
     };
 
     // ── 1. BacklightDevice registry add / remove ───────────────────

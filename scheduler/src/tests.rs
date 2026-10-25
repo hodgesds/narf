@@ -2280,7 +2280,7 @@ kernel_test_in!("scheduler", smoke_scheduler_hotplug_error_variants_distinct);
 
 fn smoke_scheduler_cpu_take_offline_refuses_bsp() -> TestResult {
     use crate::affinity::CpuId;
-    use crate::cpu_lifecycle::{cpu_take_offline, HotPlugError, __test_reset_online_mask};
+    use crate::cpu_lifecycle::{__test_reset_online_mask, cpu_take_offline, HotPlugError};
     use narf_capabilities::{Cap, Invoke};
     __test_reset_online_mask();
     let cap: Cap<crate::cpu_lifecycle::CpuLifecycle, Invoke> = Cap::bootstrap();
@@ -2294,8 +2294,8 @@ kernel_test_in!("scheduler", smoke_scheduler_cpu_take_offline_refuses_bsp);
 fn smoke_scheduler_cpu_bring_up_take_offline_lifecycle() -> TestResult {
     use crate::affinity::CpuId;
     use crate::cpu_lifecycle::{
-        cpu_bring_up, cpu_online, cpu_take_offline, online_count, HotPlugError,
-        __test_reset_online_mask,
+        __test_reset_online_mask, cpu_bring_up, cpu_online, cpu_take_offline, online_count,
+        HotPlugError,
     };
     use narf_capabilities::{Cap, Invoke};
     __test_reset_online_mask();
@@ -2329,7 +2329,7 @@ kernel_test_in!(
 
 fn smoke_scheduler_cpu_bring_up_out_of_range() -> TestResult {
     use crate::affinity::CpuId;
-    use crate::cpu_lifecycle::{cpu_bring_up, HotPlugError, __test_reset_online_mask};
+    use crate::cpu_lifecycle::{__test_reset_online_mask, cpu_bring_up, HotPlugError};
     use narf_capabilities::{Cap, Invoke};
     __test_reset_online_mask();
     let cap: Cap<crate::cpu_lifecycle::CpuLifecycle, Invoke> = Cap::bootstrap();
@@ -2342,7 +2342,7 @@ kernel_test_in!("scheduler", smoke_scheduler_cpu_bring_up_out_of_range);
 
 fn smoke_scheduler_cpu_lifecycle_revoked_cap_rejected() -> TestResult {
     use crate::affinity::CpuId;
-    use crate::cpu_lifecycle::{cpu_bring_up, HotPlugError, __test_reset_online_mask};
+    use crate::cpu_lifecycle::{__test_reset_online_mask, cpu_bring_up, HotPlugError};
     use narf_capabilities::{Cap, Invoke};
     __test_reset_online_mask();
     let cap: Cap<crate::cpu_lifecycle::CpuLifecycle, Invoke> = Cap::bootstrap();

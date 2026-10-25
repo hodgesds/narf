@@ -4278,7 +4278,7 @@ kernel_test_in!("net/dhcp", smoke_dhcp_offer_decoder_fields);
 /// we can drive the full state machine without a real NIC by pre-loading
 /// the reply cache before calling `on_udp_in`.
 fn smoke_dhcp_state_machine_discover_to_ack() -> TestResult {
-    use crate::dhcp::{on_udp_in, DhcpLease, __reset_for_test};
+    use crate::dhcp::{__reset_for_test, on_udp_in, DhcpLease};
     use crate::pkt_dhcp::{
         append_end, append_message_type, append_option, DhcpHeader, DHCPACK, DHCPOFFER,
         OPT_LEASE_TIME, OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
@@ -4371,7 +4371,7 @@ kernel_test_in!("net/ipv4", smoke_ipv4_addr_helpers);
 
 /// Smoke 9: `bind_address` + `lookup_binding` round-trip.
 fn smoke_ipv4_bind_address_lookup_round_trip() -> TestResult {
-    use crate::ipv4::{bind_address, lookup_binding, Ipv4Addr, __reset_for_test};
+    use crate::ipv4::{__reset_for_test, bind_address, lookup_binding, Ipv4Addr};
 
     __reset_for_test();
 
@@ -5300,7 +5300,7 @@ fn nf_build_udp(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> alloc::ve
 
 fn smoke_nf_hook_register_dispatch() -> TestResult {
     use crate::netfilter::{
-        hooks, nf_dispatch, nf_register_hook, HookPoint, PktCtx, Verdict, __reset_all_for_test,
+        __reset_all_for_test, hooks, nf_dispatch, nf_register_hook, HookPoint, PktCtx, Verdict,
     };
     use core::sync::atomic::{AtomicU32, Ordering};
     __reset_all_for_test();
@@ -5332,7 +5332,7 @@ kernel_test_in!("net/netfilter", smoke_nf_hook_register_dispatch);
 
 fn smoke_nf_hook_chain_priority_ordering() -> TestResult {
     use crate::netfilter::{
-        nf_dispatch, nf_register_hook, HookPoint, PktCtx, Verdict, __reset_all_for_test,
+        __reset_all_for_test, nf_dispatch, nf_register_hook, HookPoint, PktCtx, Verdict,
     };
     use core::sync::atomic::{AtomicU32, Ordering};
     __reset_all_for_test();
@@ -5367,8 +5367,9 @@ kernel_test_in!("net/netfilter", smoke_nf_hook_chain_priority_ordering);
 
 fn smoke_ct_new_tcp_syn_creates_syn_sent() -> TestResult {
     use crate::netfilter::{
+        __reset_all_for_test,
         conntrack::{conntrack_hook, ct, TcpCtState},
-        HookPoint, PktCtx, Tuple, __reset_all_for_test,
+        HookPoint, PktCtx, Tuple,
     };
     __reset_all_for_test();
     let mut packet = nf_build_tcp([10, 0, 0, 5], [203, 0, 113, 7], 5555, 80, 0x02);
@@ -5406,8 +5407,9 @@ kernel_test_in!("net/netfilter", smoke_ct_new_tcp_syn_creates_syn_sent);
 
 fn smoke_ct_tcp_synack_advances_to_synrecv() -> TestResult {
     use crate::netfilter::{
+        __reset_all_for_test,
         conntrack::{conntrack_hook, ct, TcpCtState},
-        HookPoint, PktCtx, Tuple, __reset_all_for_test,
+        HookPoint, PktCtx, Tuple,
     };
     __reset_all_for_test();
     // 1) SYN: 10.0.0.5:5555 → 203.0.113.7:80
@@ -5441,8 +5443,9 @@ kernel_test_in!("net/netfilter", smoke_ct_tcp_synack_advances_to_synrecv);
 
 fn smoke_ct_udp_new_then_reply_established() -> TestResult {
     use crate::netfilter::{
+        __reset_all_for_test,
         conntrack::{conntrack_hook, ct, CtState},
-        HookPoint, PktCtx, Tuple, __reset_all_for_test,
+        HookPoint, PktCtx, Tuple,
     };
     __reset_all_for_test();
     let mut p1 = nf_build_udp([10, 0, 0, 5], [8, 8, 8, 8], 5555, 53);
@@ -5478,8 +5481,9 @@ kernel_test_in!("net/netfilter", smoke_ct_udp_new_then_reply_established);
 
 fn smoke_ct_expiry_evicts_idle_entry() -> TestResult {
     use crate::netfilter::{
+        __reset_all_for_test,
         conntrack::{ct, UDP_DEFAULT_EXPIRY_NS},
-        Tuple, __reset_all_for_test,
+        Tuple,
     };
     __reset_all_for_test();
     let t = Tuple {
@@ -5560,8 +5564,9 @@ kernel_test_in!("net/netfilter", smoke_ct_lru_evicts_oldest_at_capacity);
 
 fn smoke_nat_masquerade_rewrites_egress() -> TestResult {
     use crate::netfilter::{
+        __reset_all_for_test,
         nat::{nat, nat_masquerade_add, snat_postrouting},
-        HookPoint, PktCtx, Verdict, __reset_all_for_test,
+        HookPoint, PktCtx, Verdict,
     };
     __reset_all_for_test();
     nat_masquerade_add("eth0", [10, 0, 0, 0], 24, [203, 0, 113, 7]);
@@ -5594,8 +5599,9 @@ kernel_test_in!("net/netfilter", smoke_nat_masquerade_rewrites_egress);
 
 fn smoke_nat_reverse_restores_dst_on_reply() -> TestResult {
     use crate::netfilter::{
+        __reset_all_for_test,
         nat::{dnat_prerouting, nat_masquerade_add, snat_postrouting},
-        HookPoint, PktCtx, __reset_all_for_test,
+        HookPoint, PktCtx,
     };
     __reset_all_for_test();
     nat_masquerade_add("eth0", [10, 0, 0, 0], 24, [203, 0, 113, 7]);
@@ -5624,8 +5630,9 @@ kernel_test_in!("net/netfilter", smoke_nat_reverse_restores_dst_on_reply);
 
 fn smoke_nat_port_collision_reallocates() -> TestResult {
     use crate::netfilter::{
+        __reset_all_for_test,
         nat::{nat_masquerade_add, snat_postrouting},
-        HookPoint, PktCtx, __reset_all_for_test,
+        HookPoint, PktCtx,
     };
     __reset_all_for_test();
     nat_masquerade_add("eth0", [10, 0, 0, 0], 24, [203, 0, 113, 7]);
@@ -5650,9 +5657,10 @@ kernel_test_in!("net/netfilter", smoke_nat_port_collision_reallocates);
 
 fn smoke_filter_drop_rule_at_prerouting() -> TestResult {
     use crate::netfilter::{
+        __reset_all_for_test,
         filter::{filter_prerouting, nf_table_add},
         rules::Match,
-        HookPoint, PktCtx, Verdict, __reset_all_for_test,
+        HookPoint, PktCtx, Verdict,
     };
     __reset_all_for_test();
     let m = Match::from_src_ip([10, 0, 0, 99]);
@@ -5681,7 +5689,7 @@ kernel_test_in!("net/netfilter", smoke_filter_drop_rule_at_prerouting);
 
 fn smoke_filter_default_policy_accept() -> TestResult {
     use crate::netfilter::{
-        filter::filter_input, HookPoint, PktCtx, Verdict, __reset_all_for_test,
+        __reset_all_for_test, filter::filter_input, HookPoint, PktCtx, Verdict,
     };
     __reset_all_for_test();
     let mut packet = nf_build_tcp([10, 0, 0, 5], [203, 0, 113, 7], 1234, 80, 0x02);
@@ -5723,9 +5731,10 @@ kernel_test_in!("net/netfilter", smoke_icmp_ratelimit_drops_excess);
 
 fn smoke_nf_e2e_nat_round_trip_smoke() -> TestResult {
     use crate::netfilter::{
+        __reset_all_for_test,
         conntrack::{conntrack_hook, ct, TcpCtState},
         nat::{dnat_prerouting, nat_masquerade_add, snat_postrouting},
-        HookPoint, PktCtx, Tuple, __reset_all_for_test,
+        HookPoint, PktCtx, Tuple,
     };
     __reset_all_for_test();
     nat_masquerade_add("eth0", [10, 0, 0, 0], 24, [203, 0, 113, 7]);
@@ -6412,8 +6421,8 @@ fn bypass_build_eth_ipv4_tcp(dst_ip: [u8; 4], dst_port: u16) -> alloc::vec::Vec<
 fn smoke_route_lpm_specific_wins() -> TestResult {
     use crate::ifaddr::__reset_for_test as ifaddr_reset;
     use crate::ipv4::Ipv4Addr;
-    use crate::route::{route_add, Scope, __reset_for_test, TABLE_MAIN};
     use crate::route::{Ipv4Net, Route};
+    use crate::route::{__reset_for_test, route_add, Scope, TABLE_MAIN};
     use alloc::string::String;
 
     __reset_for_test();
@@ -6483,8 +6492,8 @@ kernel_test_in!("net/route", smoke_route_lpm_specific_wins);
 
 fn smoke_route_default_fallback() -> TestResult {
     use crate::ipv4::Ipv4Addr;
-    use crate::route::{route_add, route_lookup_raw, Scope, __reset_for_test, TABLE_MAIN};
     use crate::route::{Ipv4Net, Route};
+    use crate::route::{__reset_for_test, route_add, route_lookup_raw, Scope, TABLE_MAIN};
     use alloc::string::String;
 
     __reset_for_test();
@@ -6581,8 +6590,8 @@ kernel_test_in!("net/route", smoke_src_selection_direct_subnet);
 fn smoke_src_selection_via_gateway() -> TestResult {
     use crate::ifaddr::{__reset_for_test as ifaddr_reset, iface_add_addr};
     use crate::ipv4::Ipv4Addr;
-    use crate::route::{route_add, src_for, Scope, __reset_for_test, TABLE_MAIN};
     use crate::route::{Ipv4Net, Route};
+    use crate::route::{__reset_for_test, route_add, src_for, Scope, TABLE_MAIN};
     use alloc::string::String;
 
     __reset_for_test();
@@ -6621,7 +6630,7 @@ fn smoke_src_selection_via_gateway() -> TestResult {
 kernel_test_in!("net/route", smoke_src_selection_via_gateway);
 
 fn smoke_arp_cache_incomplete_to_reachable() -> TestResult {
-    use crate::arp_cache::{entry_state, insert, mark_incomplete, ArpState, __reset_for_test};
+    use crate::arp_cache::{__reset_for_test, entry_state, insert, mark_incomplete, ArpState};
 
     __reset_for_test();
     let ip = [10u8, 0, 0, 1];
@@ -6641,7 +6650,7 @@ fn smoke_arp_cache_incomplete_to_reachable() -> TestResult {
 kernel_test_in!("net/arp_cache", smoke_arp_cache_incomplete_to_reachable);
 
 fn smoke_arp_cache_reachable_to_stale() -> TestResult {
-    use crate::arp_cache::{__insert_with_expiry, entry_state, lookup, ArpState, __reset_for_test};
+    use crate::arp_cache::{__insert_with_expiry, __reset_for_test, entry_state, lookup, ArpState};
 
     __reset_for_test();
     let ip = [10u8, 0, 0, 2];

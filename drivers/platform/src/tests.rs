@@ -1616,7 +1616,7 @@ kernel_test_in!(
 
 /// IdeaPad performance mode 1=Balanced / 2=Performance round-trip.
 fn smoke_ideapad_perf_mode_round_trip() -> TestResult {
-    use crate::ideapad_laptop::{perf_mode, set_perf_mode, PerfMode, __test_reset};
+    use crate::ideapad_laptop::{__test_reset, perf_mode, set_perf_mode, PerfMode};
 
     __test_reset();
     if perf_mode() != PerfMode::Balanced {

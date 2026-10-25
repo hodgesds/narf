@@ -379,7 +379,7 @@ kernel_test_in!(
 fn smoke_devfs_block_disk_by_label_lookup() -> TestResult {
     use crate::{bootstrap_mount_authority, registry, DevFs, FileType};
     use narf_block::registry::{
-        PartitionMetadata, __restore_for_test, __snapshot_for_test, register_block_device_with_meta,
+        __restore_for_test, __snapshot_for_test, register_block_device_with_meta, PartitionMetadata,
     };
 
     let snap = __snapshot_for_test();
@@ -460,8 +460,8 @@ kernel_test_in!(
 fn smoke_devfs_block_disk_by_uuid_lookup() -> TestResult {
     use crate::{DevFs, FileType, FsInstance};
     use narf_block::registry::{
-        PartitionMetadata, __reset_for_test, __restore_for_test, __snapshot_for_test,
-        register_block_device_with_meta,
+        __reset_for_test, __restore_for_test, __snapshot_for_test, register_block_device_with_meta,
+        PartitionMetadata,
     };
 
     let snap = __snapshot_for_test();

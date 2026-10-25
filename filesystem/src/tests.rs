@@ -1961,7 +1961,7 @@ kernel_test_in!(
 );
 
 fn smoke_fs_root_mount_walker_yields_no_mountable_on_empty_registry() -> TestResult {
-    use crate::root_mount::{try_mount_root_with, RootMountError, __reset_for_test};
+    use crate::root_mount::{__reset_for_test, try_mount_root_with, RootMountError};
     use crate::MountPoint;
     use narf_capabilities::{Cap, Grant};
     __reset_for_test();
@@ -2124,7 +2124,7 @@ kernel_test_in!(
 );
 
 fn smoke_root_mount_selector_no_match_refuses() -> TestResult {
-    use crate::root_mount::{try_mount_root_with, RootMountError, __reset_for_test};
+    use crate::root_mount::{__reset_for_test, try_mount_root_with, RootMountError};
     use crate::root_selector::RootSelector;
     use crate::MountPoint;
     use narf_capabilities::{Cap, Grant};
@@ -3806,8 +3806,8 @@ kernel_test_in!("filesystem", smoke_fs_fuse_background_delivery_is_bounded);
 fn smoke_fs_fuse_request_context() -> TestResult {
     use crate::fuse::{pod_from_bytes, FuseInHeader, FuseOpcode};
     use crate::fuse_conn::{
-        install_request_context_provider, FuseConnection, FuseRequestContext,
-        __test_reset_request_context_provider,
+        __test_reset_request_context_provider, install_request_context_provider, FuseConnection,
+        FuseRequestContext,
     };
 
     fn context() -> FuseRequestContext {

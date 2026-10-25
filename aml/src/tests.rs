@@ -2332,7 +2332,7 @@ kernel_test_in!("aml/wmi", smoke_aml_wmi_decode_wdg_two_descriptors);
 fn smoke_aml_wmi_subscribe_event_fires() -> TestResult {
     // subscribe_event + dispatch_wmi_event with WmiGuid.
     use crate::wmi::{
-        dispatch_wmi_event, subscribe_event, WmiEvent, WmiEventHandler, WmiGuid, __reset_for_test,
+        __reset_for_test, dispatch_wmi_event, subscribe_event, WmiEvent, WmiEventHandler, WmiGuid,
         WDG_FLAG_EVENT,
     };
     use core::sync::atomic::{AtomicU64, Ordering};

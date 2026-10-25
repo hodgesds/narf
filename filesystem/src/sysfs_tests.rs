@@ -913,8 +913,8 @@ kernel_test_in!("filesystem", smoke_sysfs_block_add_events_are_canonical);
 // for the partition DEVTYPE on real GPT installs.
 fn smoke_sysfs_block_partition_uevent_marks_partition() -> TestResult {
     use narf_block::registry::{
-        PartitionMetadata, __reset_for_test, __restore_for_test, __snapshot_for_test,
-        register_block_device_with_meta,
+        __reset_for_test, __restore_for_test, __snapshot_for_test, register_block_device_with_meta,
+        PartitionMetadata,
     };
 
     crate::sysfs::__reset_for_test();

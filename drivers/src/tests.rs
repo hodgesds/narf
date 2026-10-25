@@ -533,8 +533,8 @@ kernel_test_in!("drivers", smoke_drivers_unbind_from_loaded);
 
 fn smoke_drivers_unbind_releases_idt_vector() -> TestResult {
     use crate::{
-        bootstrap_authority, registry, DomainPolicy, DriverManifest, NoopDriver, ReclaimToken,
-        __drain_vector_quarantine_for_test,
+        __drain_vector_quarantine_for_test, bootstrap_authority, registry, DomainPolicy,
+        DriverManifest, NoopDriver, ReclaimToken,
     };
 
     static MANIFEST: DriverManifest = DriverManifest {
