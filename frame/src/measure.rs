@@ -498,6 +498,7 @@ fn record_owned(
 
 // ── Smokes ─────────────────────────────────────────────────────────
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use async_trait::async_trait;
 use core::sync::atomic::AtomicU32;
