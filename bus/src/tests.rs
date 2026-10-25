@@ -2884,3 +2884,129 @@ fn smoke_pci_probe_all_sdhci_arbitration() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus", smoke_pci_probe_all_sdhci_arbitration);
+
+// ── Remove hooks + detach (bus spec §9.5) ────────────────────────
+//
+// probe_all records every binding it makes; `detach` drops the
+// record and invokes the bound driver's registered remove hook with
+// the bound device, and the default hot-plug dispatcher routes a
+// synthesized Detach event through the same path.
+
+/// Remove-hook invocations of the mirror driver below.
+static REMOVE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// (bus << 8) | device of the last device the hook was invoked for.
+static REMOVE_LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn arb_bind_probe(
+    _device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::driver_match::ProbeError> {
+    Ok(())
+}
+
+fn arb_remove_hook(
+    device: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::registry::BusDeviceCap, narf_capabilities::Write>,
+) {
+    use core::sync::atomic::Ordering;
+    if let crate::addr::BusAddr::Pcie(a) = device.addr {
+        REMOVE_LAST.store(((a.bus as u32) << 8) | a.device as u32, Ordering::SeqCst);
+    }
+    REMOVE_CALLS.fetch_add(1, Ordering::SeqCst);
+}
+
+fn smoke_pci_detach_runs_remove_hook() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    use crate::driver_match::{
+        __reset_for_test, bound_count, detach, probe_all, MatchKind, PciMatch,
+    };
+    use crate::registry::{bootstrap_registry_authority, install};
+
+    let _restore = RegistryRestore::capture();
+    __reset_for_test();
+    crate::hotplug::__clear_listeners();
+    REMOVE_CALLS.store(0, Ordering::SeqCst);
+    REMOVE_LAST.store(0, Ordering::SeqCst);
+
+    crate::driver_match::register(PciMatch {
+        name: "arb-remove",
+        kind: MatchKind::VendorDevice {
+            vendor: 0x1B36,
+            device: 0x0010,
+        },
+        probe: arb_bind_probe,
+    });
+    crate::driver_match::register_remove("arb-remove", arb_remove_hook);
+
+    let addr = crate::addr::PcieAddr::new(0, 0x7e, 0, 0);
+    install(alloc::vec![crate::BusDevice {
+        addr: crate::addr::BusAddr::Pcie(addr),
+        id: crate::DeviceId {
+            vendor: 0x1B36,
+            device: 0x0010,
+            class: 0x010802,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: crate::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    }]);
+
+    let authority = bootstrap_registry_authority();
+    match probe_all(&authority) {
+        Ok(1) => {}
+        Ok(_) => return TestResult::Fail("probe_all did not bind exactly the synthetic device"),
+        Err(_) => return TestResult::Fail("probe_all lost the bootstrap authority"),
+    }
+    if bound_count() != 1 {
+        return TestResult::Fail("probe_all did not record the binding");
+    }
+
+    // Direct detach: record dropped, hook ran once, with the device.
+    match detach(&authority, crate::addr::BusAddr::Pcie(addr)) {
+        Ok(true) => {}
+        Ok(false) => return TestResult::Fail("detach found no binding for a bound device"),
+        Err(_) => return TestResult::Fail("detach lost the bootstrap authority"),
+    }
+    if REMOVE_CALLS.load(Ordering::SeqCst) != 1 || REMOVE_LAST.load(Ordering::SeqCst) != 0x7e00 {
+        return TestResult::Fail("remove hook did not run once with the bound device");
+    }
+    if bound_count() != 0 {
+        return TestResult::Fail("detach left the binding recorded");
+    }
+
+    // Second detach is a no-op: no binding, no second hook call.
+    match detach(&authority, crate::addr::BusAddr::Pcie(addr)) {
+        Ok(false) => {}
+        Ok(true) => return TestResult::Fail("second detach claimed a binding"),
+        Err(_) => return TestResult::Fail("second detach lost the bootstrap authority"),
+    }
+    if REMOVE_CALLS.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("remove hook ran for an unbound device");
+    }
+
+    // Re-bind, then detach via the production event path: the
+    // default dispatcher routes a Detach event to the same hook.
+    match probe_all(&authority) {
+        Ok(1) => {}
+        _ => return TestResult::Fail("re-probe after detach did not re-bind"),
+    }
+    if crate::hotplug::install_default_dispatcher().is_err() {
+        return TestResult::Fail("install_default_dispatcher failed");
+    }
+    crate::hotplug::dispatch_event(crate::hotplug::HotplugEvent::Detach {
+        addr: crate::addr::BusAddr::Pcie(addr),
+    });
+    if REMOVE_CALLS.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("Detach event did not reach the remove hook");
+    }
+    if bound_count() != 0 {
+        return TestResult::Fail("Detach event left the binding recorded");
+    }
+    crate::hotplug::__clear_listeners();
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_pci_detach_runs_remove_hook);

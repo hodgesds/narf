@@ -134,10 +134,10 @@ pub fn __clear_listeners() {
 //
 //   * On `Attach`: re-runs probe_all_pci so any driver in the match
 //     table that claims the new device gets bound.
-//   * On `Detach`: clears the bound-driver record for that address
-//     (the driver's own `Driver::reset` hook is the cleaner exit;
-//     today's path is the BoundDriver list, not the lifecycle
-//     registry).
+//   * On `Detach`: routes the detach through
+//     `driver_match::detach`, which clears the binding record for
+//     that address and invokes the bound driver's registered remove
+//     hook (bus spec §9.5) so the driver tears the device down.
 //
 // Real PCIe hot-plug ISRs (Attention Button / Presence Detect
 // Changed at the bridge) wire into `dispatch_event` once the Stage-4
@@ -158,18 +158,17 @@ impl HotplugListener for DefaultDispatcher {
                 let auth = crate::registry::bootstrap_registry_authority();
                 let _ = crate::driver_match::probe_all(&auth);
             }
-            HotplugEvent::Detach { addr: _ } => {
-                // Reaping the bound-driver record on detach needs a
-                // bus-address-keyed lookup that `BoundDriver` doesn't
-                // carry today (it tracks vendor/device pairs but
-                // not the (bus, device, function) coordinate). When
-                // BoundDriver grows an `addr: Option<BusAddr>` field,
-                // the dispatcher walks it here and removes matches;
-                // for now the listener acknowledges the event and
-                // leaves cleanup to whatever subsystem owns the
-                // device's caps. Drivers that maintain their own
-                // bus-addr-keyed state subscribe via
-                // `register_listener` to learn detach immediately.
+            HotplugEvent::Detach { addr } => {
+                // Route the detach to the driver that bound the
+                // device: `driver_match::detach` drops the binding
+                // record `probe_all` made and invokes the driver's
+                // registered remove hook (bus spec §9.5) — NVMe's
+                // hook tears its controller down. The separate
+                // `narf_drivers::BoundDriver` inventory (vendor/device
+                // pairs, no bus coordinate) is still not reaped here;
+                // that cleanup belongs to the lifecycle framework.
+                let auth = crate::registry::bootstrap_registry_authority();
+                let _ = crate::driver_match::detach(&auth, addr);
             }
         }
     }

@@ -211,6 +211,12 @@ Hot-plug paths:
 - **virtio-mmio / platform-bus injection** — handled the same way
   for virtio transports presented after boot.
 
+As implemented today, hot-plug events flow as `HotplugEvent` via
+`hotplug::dispatch_event`; the default dispatcher re-runs
+`probe_all` on attach and routes detach to the bound driver's
+remove hook (§9.5). The bridge-ISR event sources above remain
+Stage-5 work; `dispatch_event` is the seam they will feed.
+
 ### 3.6 Loadable-driver PCI bridge
 
 Separately compiled modules cross the bus boundary through C-ABI callbacks
@@ -527,6 +533,27 @@ When a driver registers (statically at boot or dynamically at
 load), the dispatcher walks the existing device registry and
 attempts probing for any device that previously had no match.
 This is what lets a module load late and pick up its devices.
+
+### 9.5 Detach / remove hooks
+
+`probe_all` records every binding it commits — the device plus
+the name of the match that claimed it. A driver whose devices
+need real teardown registers a remove hook per match name
+(`register_remove(name, PciRemoveFn)`, a companion registry:
+`PciMatch` itself carries no remove field, so the ~90 in-tree
+match literals are untouched). `detach(authority, addr)` drops
+the binding record and, when the bound match name has a hook,
+invokes it with the bound device and a freshly minted
+`Cap<BusDeviceCap, Write>` (the same mint as probing). Detach is
+cap-gated on the registry authority and reports whether a
+binding existed; a hookless driver is simply unbound.
+
+The default hot-plug dispatcher's `Detach` arm routes here:
+`HotplugEvent::Detach { addr }` → `detach` under the bootstrap
+registry authority. Ordering invariant for future enumeration
+work: a device must be detached *before* its record leaves the
+registry — `detach` mints the hook's cap through the registry,
+so a device removed first would silently skip its teardown.
 
 ## 10. `Cap<BusDevice, _>` mint protocol
 

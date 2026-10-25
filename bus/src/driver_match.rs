@@ -27,6 +27,7 @@ use alloc::vec::Vec;
 use narf_capabilities::{Cap, CapError, CapOp, Grant, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
+use crate::addr::BusAddr;
 use crate::device::{BusDevice, BusKind};
 use crate::registry::{claim_device_cap, devices, BusDeviceCap, BusRegistryCap};
 
@@ -188,6 +189,100 @@ pub fn count() -> usize {
     REGISTRY.lock().len()
 }
 
+/// Driver remove signature — the detach counterpart of
+/// [`PciProbeFn`]. The driver receives the device it bound at probe
+/// time and a freshly-minted authority cap, and tears the device
+/// down (stop hardware, withdraw publications, release DMA). Removal
+/// is best-effort and cannot fail: the device may already be gone,
+/// which is precisely when this runs. Linux `pci_driver::remove`.
+pub type PciRemoveFn = fn(device: BusDevice, cap: Cap<BusDeviceCap, Write>);
+
+/// Remove hooks, keyed by the registering match's `name` (the same
+/// key `register` idempotency uses). A companion registry rather
+/// than a field on [`PciMatch`]: the match struct is constructed at
+/// ~90 in-tree sites, and a remove hook is the rare exception — only
+/// drivers with real teardown register one. A driver with several
+/// match entries (e.g. NVMe's per-SKU ids plus its class backstop)
+/// registers the same hook under each of its names.
+static REMOVE_FNS: IrqSafeSpinLock<Vec<(&'static str, PciRemoveFn)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Register (or replace) the remove hook for match `name`.
+pub fn register_remove(name: &'static str, remove: PciRemoveFn) {
+    let mut g = REMOVE_FNS.lock();
+    if let Some(pos) = g.iter().position(|e| e.0 == name) {
+        g[pos] = (name, remove);
+    } else {
+        g.push((name, remove));
+    }
+}
+
+/// One device a successful probe bound: the device as discovered
+/// plus the name of the match that claimed it. Recorded by
+/// `probe_all` so a later detach can route the remove hook to the
+/// driver that owns the device — the bound-driver record the
+/// hot-plug dispatcher clears on Detach (bus spec §9.5).
+struct BoundDevice {
+    device: BusDevice,
+    name: &'static str,
+}
+
+static BOUND: IrqSafeSpinLock<Vec<BoundDevice>> = IrqSafeSpinLock::new(Vec::new());
+
+fn record_binding(device: BusDevice, name: &'static str) {
+    let mut g = BOUND.lock();
+    if let Some(pos) = g.iter().position(|b| b.device.addr == device.addr) {
+        g[pos] = BoundDevice { device, name };
+    } else {
+        g.push(BoundDevice { device, name });
+    }
+}
+
+/// Number of devices currently recorded as bound — tests +
+/// diagnostics.
+pub fn bound_count() -> usize {
+    BOUND.lock().len()
+}
+
+/// Detach the device at `addr`: drop its binding record and, when
+/// the driver that bound it registered a remove hook, invoke the
+/// hook with a freshly minted `Cap<BusDeviceCap, Write>` (the same
+/// mint `probe_all` performs). Returns `true` when a binding was
+/// dropped. A device whose driver registered no hook is simply
+/// unbound — module-owned devices keep their own context teardown,
+/// and hookless drivers have nothing to release. When the registry
+/// no longer offers the device (its record is already gone), the
+/// binding is still dropped but the hook cannot be minted a cap and
+/// does not run; enumeration removes a device from the registry
+/// only after detaching it, so the production hot-plug path always
+/// mints.
+///
+/// Cap-gated on the registry authority, like `probe_all`: unbinding
+/// drivers from hardware is a registry-wide action.
+pub fn detach(authority: &Cap<BusRegistryCap, Grant>, addr: BusAddr) -> Result<bool, CapError> {
+    authority.check_live()?;
+    let bound = {
+        let mut g = BOUND.lock();
+        g.iter()
+            .position(|b| b.device.addr == addr)
+            .map(|pos| g.remove(pos))
+    };
+    let Some(bound) = bound else {
+        return Ok(false);
+    };
+    let remove = REMOVE_FNS
+        .lock()
+        .iter()
+        .find(|e| e.0 == bound.name)
+        .map(|e| e.1);
+    if let Some(remove) = remove {
+        if let Ok((_handle, cap)) = claim_device_cap(authority, addr) {
+            remove(bound.device, cap);
+        }
+    }
+    Ok(true)
+}
+
 /// Walk every device in the bus registry and bind a driver to it.
 ///
 /// For each device, the matching `PciMatch` entries form a
@@ -260,6 +355,7 @@ pub fn probe_all(
             }
             match result {
                 Ok(()) => {
+                    record_binding(*d, m.name);
                     bound += 1;
                     break;
                 }
@@ -1705,4 +1801,6 @@ pub fn __reset_for_test() {
     REGISTRY.lock().clear();
     MODULE_THUNKS.lock().clear();
     INTERNED_NAMES.lock().clear();
+    REMOVE_FNS.lock().clear();
+    BOUND.lock().clear();
 }

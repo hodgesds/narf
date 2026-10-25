@@ -733,3 +733,282 @@ kernel_test_in!(
     "drivers/nvme/multi",
     smoke_nvme_controller_teardown_and_reprobe_qemu
 );
+
+// ── Reset / recovery (audit #929) ──────────────────────────────────
+//
+// `Controller::reset_recover` + the dead-controller triggers in the
+// block entry points + the identity verdict, and the bus Detach
+// path into `remove_controller`.
+
+/// Build an IDENTIFY snapshot for verdict comparisons.
+fn verdict_id(sn: u8, fr: u8) -> super::IdentifyController {
+    super::IdentifyController {
+        vid: 0x144d,
+        ssvid: 0,
+        sn: [sn; 20],
+        mn: [b'M'; 40],
+        fr: [fr; 8],
+        mdts: 0,
+        ver: 0x0001_0400,
+        nn: 1,
+        rtd3e: 0,
+        vwc: 0,
+    }
+}
+
+fn verdict_ns(nsid: u32, eui: u8) -> NamespaceInfo {
+    NamespaceInfo {
+        nsid,
+        lba_bytes: 512,
+        nsze: 1_000_000,
+        usable: true,
+        ids: NsIds {
+            eui64: Some([eui; 8]),
+            nguid: None,
+            uuid: None,
+        },
+    }
+}
+
+/// The recovery identity verdict, as a pure model: firmware revision
+/// is not identity; serial/model changes are a different controller;
+/// any namespace-set change (membership, geometry, EUI64) is
+/// reported, not silently adopted.
+fn smoke_nvme_recovery_identity_verdicts() -> TestResult {
+    use super::{recovery_verdict, RecoveryVerdict};
+    let id = verdict_id(0x41, 0x31);
+    let ns = [verdict_ns(1, 0xE1)];
+    if recovery_verdict(&id, &ns, &id, &ns) != RecoveryVerdict::Unchanged {
+        return TestResult::Fail("identical snapshots judged changed");
+    }
+    // Firmware revision differs: still the same controller + set.
+    let newer_fw = verdict_id(0x41, 0x32);
+    if recovery_verdict(&id, &ns, &newer_fw, &ns) != RecoveryVerdict::Unchanged {
+        return TestResult::Fail("firmware revision treated as identity");
+    }
+    // Serial differs: a different controller answers at the function.
+    let swapped = verdict_id(0x42, 0x31);
+    if recovery_verdict(&id, &ns, &swapped, &ns) != RecoveryVerdict::ControllerChanged {
+        return TestResult::Fail("serial change not judged a controller change");
+    }
+    // Namespace added / removed / re-identified / resized.
+    let two = [verdict_ns(1, 0xE1), verdict_ns(2, 0xE2)];
+    if recovery_verdict(&id, &ns, &id, &two) != RecoveryVerdict::NamespacesChanged {
+        return TestResult::Fail("namespace addition not reported");
+    }
+    if recovery_verdict(&id, &two, &id, &ns) != RecoveryVerdict::NamespacesChanged {
+        return TestResult::Fail("namespace removal not reported");
+    }
+    let reidentified = [verdict_ns(1, 0xE9)];
+    if recovery_verdict(&id, &ns, &id, &reidentified) != RecoveryVerdict::NamespacesChanged {
+        return TestResult::Fail("namespace EUI64 change not reported");
+    }
+    let mut resized = verdict_ns(1, 0xE1);
+    resized.nsze += 1;
+    if recovery_verdict(&id, &ns, &id, &[resized]) != RecoveryVerdict::NamespacesChanged {
+        return TestResult::Fail("namespace geometry change not reported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/multi", smoke_nvme_recovery_identity_verdicts);
+
+/// QEMU, one controller: mark the installed controller dead — the
+/// exact state a command timeout leaves — then prove the next block
+/// read recovers it in place (reset, re-identify, I/O resumes, data
+/// intact) instead of refusing with ControllerDead forever. The
+/// flush entry point recovers the same way.
+fn smoke_nvme_recovery_after_forced_dead_qemu() -> TestResult {
+    if super::controller_count() < 1 {
+        return TestResult::Skip("needs an NVMe controller");
+    }
+    if let Err(e) = reinstall(0) {
+        return TestResult::Fail(e);
+    }
+    let Some(d) = narf_block::find_block_device("nvme0n1") else {
+        return TestResult::Fail("nvme0n1 not registered");
+    };
+    let n = SCRATCH_BLOCKS;
+    let len = n as usize * 512;
+    let mut saved = vec![0u8; len];
+    if d.read(SCRATCH_LBA, n, &mut saved).is_err() {
+        return TestResult::Fail("initial scratch read failed");
+    }
+    let p = pattern(0x5A);
+    if d.write(SCRATCH_LBA, n, &p).is_err() {
+        return TestResult::Fail("pattern write failed");
+    }
+    // Force the timeout's mark on the installed controller.
+    {
+        let mut g = super::controller_at(0);
+        let Some(g) = g.as_mut() else {
+            return TestResult::Fail("controller 0 not installed");
+        };
+        g.dead = true;
+    }
+    if super::with_controller_at(0, |c| c.is_dead()) != Some(true) {
+        return TestResult::Fail("dead mark did not land");
+    }
+    // This read must trigger recovery and return the pattern.
+    let mut back = vec![0u8; len];
+    if let Err(e) = d.read(SCRATCH_LBA, n, &mut back) {
+        use core::fmt::Write as _;
+        let _ = writeln!(narf_console::Writer, "nvme recovery: read: {e:?}");
+        return TestResult::Fail("read on a dead controller did not recover it");
+    }
+    if back != p {
+        return TestResult::Fail("data did not survive the in-place reset");
+    }
+    if super::with_controller_at(0, |c| c.is_dead()) != Some(false) {
+        return TestResult::Fail("controller still dead after recovery");
+    }
+    // The flush path recovers the same way.
+    {
+        let mut g = super::controller_at(0);
+        let Some(g) = g.as_mut() else {
+            return TestResult::Fail("controller 0 vanished");
+        };
+        g.dead = true;
+    }
+    if super::NvmeNamespaceBlock::new(0, 1).flush().is_err() {
+        return TestResult::Fail("flush on a dead controller did not recover it");
+    }
+    if super::with_controller_at(0, |c| c.is_dead()) != Some(false) {
+        return TestResult::Fail("controller still dead after flush recovery");
+    }
+    // Restore the scratch window.
+    if d.write(SCRATCH_LBA, n, &saved).is_err() {
+        return TestResult::Fail("restoring the scratch window failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/multi",
+    smoke_nvme_recovery_after_forced_dead_qemu
+);
+
+/// QEMU, second controller: a stack-local controller whose identity
+/// snapshot is poisoned (as if the function had been hot-swapped
+/// while wedged) must fail `reset_recover` with `IdentityChanged`,
+/// and the genuinely-present controller must be stopped again —
+/// never adopted under the old identity.
+fn smoke_nvme_recovery_identity_mismatch_qemu() -> TestResult {
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap};
+    if super::controller_count() < 2 {
+        return TestResult::Skip("needs two NVMe controllers");
+    }
+    if let Err(e) = reinstall(1) {
+        return TestResult::Fail(e);
+    }
+    let Some(Some(dev)) = super::with_controller_at(1, |c| c.bus_device()) else {
+        return TestResult::Fail("nvme1 has no bus device");
+    };
+    let authority = bootstrap_registry_authority();
+    let Ok((_h, cap)) = claim_device_cap(&authority, dev.addr) else {
+        return TestResult::Fail("claim_device_cap(nvme1) failed");
+    };
+    // Stack-local bring-up crosses the installed controller's queues
+    // (the harness pattern `reinstall` documents); it is reinstalled
+    // at the end.
+    let mut ctrl = super::Controller::from_device(dev);
+    if ctrl.bring_up(&cap).is_err() {
+        return TestResult::Fail("stack-local bring_up failed");
+    }
+    if ctrl.create_io_queue().is_err() {
+        ctrl.disable_after_failure(&cap);
+        return TestResult::Fail("stack-local create_io_queue failed");
+    }
+    // Poison the snapshot: reset_recover compares the re-identified
+    // (real) serial against this — a stand-in for a hot-swap.
+    match ctrl.identify.as_mut() {
+        Some(id) => id.sn[0] ^= 0xFF,
+        None => return TestResult::Fail("no identify snapshot to poison"),
+    }
+    ctrl.dead = true;
+    let verdict = ctrl.reset_recover(&cap);
+    // Restore shared state before judging the outcome.
+    let restored = reinstall(1);
+    match verdict {
+        Err(super::NvmeError::IdentityChanged) => {}
+        other => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "nvme recovery: expected IdentityChanged, got {other:?}"
+            );
+            return TestResult::Fail("identity mismatch not detected on recovery");
+        }
+    }
+    if !ctrl.is_dead() {
+        return TestResult::Fail("mismatched controller left live after recovery");
+    }
+    if let Err(e) = restored {
+        return TestResult::Fail(e);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/multi",
+    smoke_nvme_recovery_identity_mismatch_qemu
+);
+
+/// QEMU, second controller: a bus Detach event for nvme1's function,
+/// dispatched through the production default dispatcher, runs the
+/// registered remove hook and tears the controller down (block
+/// devices withdrawn, I/O refused, nvme0 untouched) — and a re-probe
+/// brings it back, mirroring the teardown smoke's restore.
+fn smoke_nvme_detach_event_removes_controller_qemu() -> TestResult {
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap};
+    if super::controller_count() < 2 {
+        return TestResult::Skip("needs two NVMe controllers");
+    }
+    if let Err(e) = reinstall(1) {
+        return TestResult::Fail(e);
+    }
+    let Some(Some(dev)) = super::with_controller_at(1, |c| c.bus_device()) else {
+        return TestResult::Fail("nvme1 has no bus device");
+    };
+    let narf_bus::BusAddr::Pcie(bdf) = dev.addr else {
+        return TestResult::Fail("nvme1 is not PCIe");
+    };
+    // The boot sequence installs the default dispatcher; installing
+    // again only stacks a duplicate listener, and detach is
+    // idempotent, so the outcome is the same either way.
+    let _ = narf_bus::hotplug::install_default_dispatcher();
+    narf_bus::dispatch_event(narf_bus::HotplugEvent::Detach { addr: dev.addr });
+    if super::instance_of(bdf).is_some() {
+        return TestResult::Fail("Detach event did not remove nvme1's slot");
+    }
+    if narf_block::find_block_device("nvme1n1").is_some() {
+        return TestResult::Fail("Detach event left nvme1n1 registered");
+    }
+    let mut sector = [0u8; 512];
+    let ns = super::NvmeNamespaceBlock::new(1, 1);
+    if ns.read(0, 1, &mut sector) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("I/O to a detached controller was not refused");
+    }
+    let Some(d0) = narf_block::find_block_device("nvme0n1") else {
+        return TestResult::Fail("detaching nvme1 unregistered nvme0n1");
+    };
+    if d0.read(0, 1, &mut sector).is_err() {
+        return TestResult::Fail("nvme0n1 I/O failed after detaching nvme1");
+    }
+    // Restore: re-probe the same function under the same instance.
+    let authority = bootstrap_registry_authority();
+    let Ok((_h, cap)) = claim_device_cap(&authority, dev.addr) else {
+        return TestResult::Fail("claim_device_cap(nvme1) failed after detach");
+    };
+    if super::probe(dev, cap).is_err() {
+        return TestResult::Fail("re-probe of nvme1 failed after detach");
+    }
+    if super::instance_of(bdf) != Some(1) {
+        return TestResult::Fail("re-probe changed nvme1's instance");
+    }
+    match narf_block::find_block_device("nvme1n1") {
+        Some(d) if d.read(0, 1, &mut sector).is_ok() => TestResult::Pass,
+        _ => TestResult::Fail("nvme1n1 not back after re-probe"),
+    }
+}
+kernel_test_in!(
+    "drivers/nvme/multi",
+    smoke_nvme_detach_event_removes_controller_qemu
+);
