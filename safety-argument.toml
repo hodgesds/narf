@@ -1817,3 +1817,13 @@ argument = "The execution-liveness pairing is preserved exactly. Each user TaskS
 ref = "security-model/specification/spec.md#L39"
 agent = "Muse Wonder"
 argument = "The GPU kernel-test split's only frame/ change is inside the #[cfg(feature = \"kernel-test\")] dispatch in frame/src/bare_main.rs: it additionally reads the test_subsystem_exclude= cmdline key and routes the test boot to the exclude-aware runners in narf-verification. The kernel-test feature is never compiled into production images; with the key absent the dispatch takes the previous run-all / run-subsystems paths unchanged. It adds no TCB member, capability, domain transition, mapping, or scheduling state — it only narrows which already-registered test functions execute inside a test boot, and the excluded GPU fixtures still run in the dedicated CI job gated by cargo xtask affected."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "Muse Wonder"
+argument = "The TPM registry keystone (#943) adds no TCB member and moves no trust boundary. The registry population happens in drivers/platform, outside the TCB set: on probe success the platform driver publishes the device it already probed as an Arc<dyn TpmDevice> through the pre-existing narf_tpm::registry::register API, keeping a second handle on the same Arc in its singleton. The only frame/ changes are a read-only dispatch-state predicate (measure::hardware_dispatch_active, an emptiness check over the pre-existing registry::list read path) and a boot-console summary that reports that predicate instead of asserting hardware anchoring unconditionally. Frame gains no MMIO surface, no capability, and no new dependency edge beyond the async-trait proc-macro already used by the tpm crate; it keeps consuming the TPM exclusively through the TpmDevice trait it already depended on."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "Muse Wonder"
+argument = "Hardware access is unchanged in kind and in reach. The TPM MMIO window is touched only by the platform driver's pre-existing probe/submit code, exactly as before this change; registration clones an Arc handle to that already-probed device and does not widen which code can reach the registers. Dispatch in frame::measure flows through the same registry::list().first() call that existed before (and previously always found an empty registry), so no new kernel-side data access is created: the change makes one pre-existing access path reachable under the same trait contract as every other TpmDevice call, and makes the boot log's claim about that path's state accurate. Registration is once-only on the probe's None-to-Some transition, so no second device can silently replace the dispatch target."

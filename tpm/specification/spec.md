@@ -56,6 +56,25 @@ pub enum TpmRight {
 pub type Cap<TpmDevice, R> = ...;
 ```
 
+### 3.3 Device Registry
+
+`registry` is the crate's composition point between transports and
+consumers:
+
+- `register(device: Arc<dyn TpmDevice>)` — called by the owning
+  transport exactly once, at probe success. The production transport
+  is the platform probe (`drivers/platform` TPM driver, Stage::Subsys
+  initcall); the registry itself never probes hardware.
+- `list() -> Vec<Arc<dyn TpmDevice>>` — snapshot of the registered
+  devices. `frame::measure` dispatches hardware PCR extends to the
+  first registered device. An empty registry means measured boot
+  records into its software shadow only, and boot reporting must say
+  so — no hardware anchoring may be claimed.
+- Registration is boot-lifetime: there is no production unregister.
+  `__reset_for_test` (doc-hidden) exists for kernel-test fixtures
+  only, so a fixture that registers a mock can restore the empty
+  state for later tests.
+
 ## 4. Operation: PCR Extension
 
 Extending a PCR is a foundational operation for Measured Boot.
