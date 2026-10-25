@@ -306,7 +306,7 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
                     .truncate_shrink(self.ino, &mut working, len)
                     .await
                 {
-                    *self.inode.lock() = Some(inode);
+                    self.inode.store(inode);
                     return Err(error);
                 }
                 inode = working;
