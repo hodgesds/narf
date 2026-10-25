@@ -344,13 +344,12 @@ bounds, response handling and cancellation ownership:
 | HDMI/DP audio DTO | `dce110_populate_audio_dto_parameters` / `dce_aud_wall_dto_setup`: HDMI's lowest active OTG drives DTO0; DP uses DPREFCLK/DTO1. HDMI audio now uses the 4:2:0-halved requested clock without deep-colour PLL scaling. |
 | PMFW watermarks and audio wake | DAL `0x5/0x6/0x8` carries the retained watermark address/table 1; `0x11` is optional audio PME. Watermark failure refuses dependent power-saving admission; it does not prove a display-clock failure. |
 
-`bash drivers/gpu/tests/navi22_clock/check.sh ~/git/linux` checks the wire
-constants and register fields against Linux's headers; the harness is also
-included by the revision-pinned `cargo xtask gpu-reference` gate. The kernel
-regressions cover every required display-floor rejection, frequencies outside
-board bounds before writes, stream counts, interrupted runtime operations and
-HDMI audio clock selection. Hardware acceptance of these requests, native
-modesetting and the KDE login remain unverified by this source audit.
+The Rust kernel regressions cover every required display-floor rejection,
+frequencies outside board bounds before writes, stream counts, interrupted
+runtime operations and HDMI audio clock selection. Linux source annotations
+retain the comparison's provenance; they are not an executable validation
+language. Hardware acceptance of these requests, native modesetting and the
+KDE login remain unverified by this source audit.
 
 The discrete GPU handoff also establishes the x86_64 TSC duration scale before
 firmware startup. Its Late initcall precedes the normal HPET/timer-IRQ setup;
