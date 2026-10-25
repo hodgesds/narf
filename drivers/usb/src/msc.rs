@@ -1238,6 +1238,7 @@ impl UsbMscBlockDevice {
                 last_lba: 0,
                 generation,
                 tag: IrqSafeSpinLock::new(1),
+                hub_port: dev.hub_port,
             },
         ))
     }
