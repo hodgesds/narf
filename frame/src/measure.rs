@@ -208,6 +208,20 @@ pub fn any_extend_observed() -> bool {
     EXTEND_OBSERVED.load(Ordering::Acquire)
 }
 
+/// Whether measured-boot extends dispatch to a hardware TPM.
+///
+/// `true` when at least one device is registered in
+/// `narf_tpm::registry` — the platform probe registers the device it
+/// probed at Stage::Subsys, before the Stage::Late measured-boot
+/// pass runs. When `false`, the `measure*` functions still record
+/// into the software log and shadow, but nothing reaches silicon;
+/// reporting surfaces (the boot console summary in `bare_main`) use
+/// this predicate so they never claim hardware anchoring that did
+/// not happen.
+pub fn hardware_dispatch_active() -> bool {
+    !narf_tpm::registry::list().is_empty()
+}
+
 /// Record a measurement in the software log and extend it into both
 /// the software shadow PCR and the hardware TPM (if one is present).
 ///
@@ -484,7 +498,11 @@ fn record_owned(
 
 // ── Smokes ─────────────────────────────────────────────────────────
 
+use alloc::sync::Arc;
+use async_trait::async_trait;
+use core::sync::atomic::AtomicU32;
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_tpm::{TpmDevice, TpmInfo};
 
 fn smoke_measure_sha256_known_vector() -> TestResult {
     // FIPS 180-4 vector: SHA-256("abc") =
@@ -634,3 +652,99 @@ fn smoke_measure_event_log_encoder_layout() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("frame/measure", smoke_measure_event_log_encoder_layout);
+
+/// Recording `TpmDevice` for the dispatch smoke: counts extends and
+/// keeps the last (PCR, digest) pair it was handed.
+struct RecordingTpm {
+    extends: AtomicU32,
+    last: IrqSafeSpinLock<Option<(u32, [u8; SHA256_DIGEST_SIZE])>>,
+}
+
+#[async_trait]
+impl TpmDevice for RecordingTpm {
+    fn get_info(&self) -> TpmInfo {
+        TpmInfo {
+            manufacturer: 0x4D4F434B, // "MOCK"
+            version: 1,
+            spec_level: 2,
+        }
+    }
+
+    async fn submit_raw(&self, _cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+        Ok(alloc::vec![0; 10])
+    }
+
+    async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError> {
+        Ok(alloc::vec![0xAA; bytes as usize])
+    }
+
+    async fn extend_pcr(&self, pcr: u32, digest: &[u8]) -> Result<(), TpmError> {
+        self.extends.fetch_add(1, Ordering::SeqCst);
+        let mut d = [0u8; SHA256_DIGEST_SIZE];
+        let n = digest.len().min(SHA256_DIGEST_SIZE);
+        d[..n].copy_from_slice(&digest[..n]);
+        *self.last.lock() = Some((pcr, d));
+        Ok(())
+    }
+
+    async fn read_pcr(&self, _pcr: u32) -> Result<Vec<u8>, TpmError> {
+        Ok(alloc::vec![0; SHA256_DIGEST_SIZE])
+    }
+}
+
+fn smoke_measure_dispatches_extend_to_registered_device() -> TestResult {
+    // The keystone seam (#943, covering #934's registry core): with
+    // a device in `narf_tpm::registry`, `measure` must dispatch the
+    // extend to it — until the platform probe learned to register,
+    // this branch could not execute anywhere, fixtures included.
+    // Hygiene: the registry and the measure state are globals, so
+    // reset on entry AND exit; a leaked mock would silently become
+    // the dispatch target for unrelated smokes later in the boot.
+    narf_tpm::registry::__reset_for_test();
+    __reset_for_test();
+    narf_scheduler::__reset_queues_for_test();
+
+    let mock = Arc::new(RecordingTpm {
+        extends: AtomicU32::new(0),
+        last: IrqSafeSpinLock::new(None),
+    });
+    narf_tpm::registry::register(mock.clone());
+    if !hardware_dispatch_active() {
+        narf_tpm::registry::__reset_for_test();
+        return TestResult::Fail("registered device invisible to dispatch check");
+    }
+
+    let payload: &'static [u8] = b"narf measured-boot dispatch smoke";
+    narf_scheduler::spawn(async move {
+        let _ = measure(4, "dispatch-smoke", payload).await;
+    });
+    narf_scheduler::run_until_empty();
+
+    let want_digest = sha256(payload);
+    let observed = *mock.last.lock();
+    let count = mock.extends.load(Ordering::SeqCst);
+    let shadow_ok =
+        pcr_shadow(4) == Some(pcr_extend_value(&[0u8; SHA256_DIGEST_SIZE], &want_digest));
+    let log_ok = get_log().len() == 1;
+    narf_tpm::registry::__reset_for_test();
+    __reset_for_test();
+
+    if count != 1 {
+        return TestResult::Fail("registered device did not receive exactly one extend");
+    }
+    match observed {
+        Some((pcr, digest)) if pcr == 4 && digest == want_digest => {}
+        _ => return TestResult::Fail("dispatched extend carried wrong PCR or digest"),
+    }
+    if !shadow_ok {
+        return TestResult::Fail("shadow PCR did not advance alongside hardware dispatch");
+    }
+    if !log_ok {
+        return TestResult::Fail("measurement log did not record the dispatched event");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/measure",
+    smoke_measure_dispatches_extend_to_registered_device
+);
