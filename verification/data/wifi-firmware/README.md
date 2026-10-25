@@ -1,46 +1,16 @@
-# Wi-Fi firmware metadata and provisioning inventory
+# Wi-Fi firmware provisioning inventory
 
-These fixtures retain independently extracted structural metadata from 36
-SHA256-pinned installed raw vendor files. They contain headers, TLV/section
-geometry, API/version facts and board names. Executable instructions, board
-calibration, cryptographic signatures and opaque payloads are omitted. A replay
-with zero-filled gaps is a parser input, never a loadable or qualified firmware
-image. Full-image authentication and hardware acceptance remain separate.
+Firmware parser tests live beside their drivers and construct small, explicit
+wire inputs in Rust. There are no extracted firmware metadata binaries or
+metadata extraction/regeneration commands. Intel, MediaTek, Qualcomm and
+Broadcom parser cases cover header fields, IE/TLV alignment, section extents,
+command-version negotiation, exact board identities and malformed inputs.
+The missing-metadata build script and Skip substitutes have been removed.
 
-All Intel, MediaTek, Qualcomm and Broadcom `*.metadata.bin` extracts are
-committed alongside their provenance and Rust fixture tables. The ten
-Qualcomm/Broadcom extracts previously omitted by the root `*.bin` ignore
-rule (issue #739) are included, so a clean checkout runs their parser replay
-tests without installed vendor firmware or regeneration. Each vendor directory
-allows only `*.metadata.bin` through that rule; raw firmware remains excluded.
-If Qualcomm or Broadcom extracts are removed locally, `narf-drivers-wireless`'s
-`build.rs` still warns and registers the affected tests as `Skip`.
-
-The native Rust host tool reads each vendor's explicit provenance pins and
-complete raw-source SHA256 hashes. It does not download originals, update pins,
-harvest reference source, invoke a C compiler or use production driver parsers to
-obtain their own expected results:
-
-```sh
-cargo xtask wifi-fixtures check
-cargo xtask wifi-fixtures check --vendor intel,mediatek --source /lib/firmware
-cargo xtask wifi-fixtures write --vendor qualcomm,broadcom --source /lib/firmware
-```
-
-`check` is read-only. `write` reproduces metadata, factual JSON and Rust data
-literals from those exact pinned originals. `extract` handles one explicit input
-with `--vendor`, `--key`, `--name`, `--input`, `--sha256` and a new `--output`
-directory. Neither structural extraction nor a matching hash grants firmware,
-board, calibration or radio authority.
-
-The kernel tests decode actual captured layouts and compare independently
-observed section extents, versions, API tables, firmware suits and board-name
-selection. MediaTek metadata slices intentionally fail whole-image preparation.
-The installed BCM43602 original has no RAM-size marker; its golden records that
-absence. No installed ath11k API2 container, exact CYW43439 set or qualified
-BCM43602 board NVRAM was available. Synthetic tests for unsupported/unavailable
-formats remain distinct from real-source evidence. Intel cc77 and bz-b0 images
-exercise parsers without enabling differently named QuZ/bz-a0 device profiles.
+These authored cases are parser/protocol tests, not evidence about installed
+vendor firmware. Existing reviewed Realtek reference literals remain Rust source
+with historical provenance. Device loading and physical acceptance require the
+actual externally provisioned, authenticated firmware and board assets.
 
 `profiles.json` inventories 45 currently named payload profiles across all 11
 driver families. It is a provisioning catalog, not a declaration that every

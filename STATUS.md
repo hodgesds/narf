@@ -73,8 +73,10 @@ comparison harnesses have been removed. Hardware tables and fixed source-cited
 fixtures remain reviewed data; Rust tests exercise actual production functions,
 wire contracts, boundaries and failure/ownership behavior. Historical source
 hashes do not assert current Linux/Mesa equivalence or physical acceptance.
-Essential Wi-Fi metadata extraction and board-manifest encoding use the native
-`cargo xtask wifi-fixtures` command, without reference-source compilation.
+Firmware parser cases are authored in Rust; extracted firmware metadata binaries,
+their regeneration commands and missing-file skip stubs are removed. Explicit
+deployment board-manifest encoding remains native Rust through
+`cargo xtask wifi-fixtures board-manifest`.
 
 All eleven in-tree families are covered by the current audit and dependency
 ledger in `drivers/wireless/specification/spec.md` and its family documents.

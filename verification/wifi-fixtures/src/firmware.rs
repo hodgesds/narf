@@ -1,8 +1,7 @@
-//! Structural firmware replays from independently captured metadata.
+//! Sparse test images assembled from reviewed Rust literals.
 //!
-//! These bytes deliberately omit vendor instructions and calibration data.
-//! A successful parser test proves layout handling, not executable firmware
-//! validity. Replays must never enter a firmware registry or hardware loader.
+//! No binary fixture files or host extraction are involved. These inputs test
+//! layout handling and must never enter a firmware registry or hardware loader.
 use alloc::vec::Vec;
 
 /// Match the firmware registry's current bounded source-image profile.
@@ -21,7 +20,7 @@ pub enum ReplayError {
 /// Reconstruct an explicitly synthetic image, preserving only the supplied
 /// metadata fragments. Every opaque gap is zeroed. Fragments must be nonempty,
 /// ordered and nonoverlapping, with all bounds checked before allocation.
-pub fn metadata_replay(
+pub fn sparse_image(
     image_len: usize,
     fragments: &[(usize, &[u8])],
 ) -> Result<Vec<u8>, ReplayError> {
@@ -55,19 +54,19 @@ pub fn metadata_replay(
     Ok(image)
 }
 
-fn firmware_metadata_replay_preserves_only_recorded_bytes() -> narf_kernel_test::TestResult {
+fn firmware_sparse_image_preserves_only_recorded_bytes() -> narf_kernel_test::TestResult {
     use narf_kernel_test::TestResult;
-    match metadata_replay(12, &[(0, &[1, 2]), (6, &[3, 4]), (11, &[5])]) {
+    match sparse_image(12, &[(0, &[1, 2]), (6, &[3, 4]), (11, &[5])]) {
         Ok(bytes) if bytes == [1, 2, 0, 0, 0, 0, 3, 4, 0, 0, 0, 5] => TestResult::Pass,
         _ => TestResult::Fail("metadata replay altered fragments or retained opaque bytes"),
     }
 }
 narf_kernel_test::kernel_test_in!(
     "verification/wifi-fixtures/firmware",
-    firmware_metadata_replay_preserves_only_recorded_bytes
+    firmware_sparse_image_preserves_only_recorded_bytes
 );
 
-fn firmware_metadata_replay_rejects_invalid_geometry() -> narf_kernel_test::TestResult {
+fn firmware_sparse_image_rejects_invalid_geometry() -> narf_kernel_test::TestResult {
     use narf_kernel_test::TestResult;
     for (len, fragments, expected) in [
         (0, &[(0, &[1][..])][..], ReplayError::Size),
@@ -83,7 +82,7 @@ fn firmware_metadata_replay_rejects_invalid_geometry() -> narf_kernel_test::Test
         ),
         (8, &[(4, &[1][..]), (0, &[2][..])][..], ReplayError::Overlap),
     ] {
-        if metadata_replay(len, fragments) != Err(expected) {
+        if sparse_image(len, fragments) != Err(expected) {
             return TestResult::Fail("invalid metadata replay geometry accepted");
         }
     }
@@ -91,5 +90,5 @@ fn firmware_metadata_replay_rejects_invalid_geometry() -> narf_kernel_test::Test
 }
 narf_kernel_test::kernel_test_in!(
     "verification/wifi-fixtures/firmware",
-    firmware_metadata_replay_rejects_invalid_geometry
+    firmware_sparse_image_rejects_invalid_geometry
 );

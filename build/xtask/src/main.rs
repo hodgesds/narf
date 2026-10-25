@@ -341,7 +341,7 @@ enum Cmd {
     ImportFirmware(ImportFirmwareArgs),
     /// Inventory Wi-Fi firmware payloads and unresolved deployment prerequisites.
     WifiFirmware(wifi_firmware::Args),
-    /// Extract/check pinned structural Wi-Fi fixtures or encode explicit board facts in Rust.
+    /// Encode explicit Wi-Fi deployment board facts in Rust.
     WifiFixtures(wifi_fixture_tools::Args),
 }
 
@@ -14505,7 +14505,7 @@ fn main() -> Result<()> {
         Cmd::PackFirmware(args) => pack_firmware_cmd(&args),
         Cmd::ImportFirmware(args) => import_firmware_cmd(&args),
         Cmd::WifiFirmware(args) => wifi_firmware::run(args),
-        Cmd::WifiFixtures(args) => wifi_fixture_tools::run(args, &workspace_root()?),
+        Cmd::WifiFixtures(args) => wifi_fixture_tools::run(args),
         Cmd::Demo(mut args) => {
             if args.features.is_empty() {
                 args.features = "kernel-test,user-mode-testbin".into();

@@ -30,7 +30,7 @@ fn smoke_rtl8188eu_raw_source_metadata_parser_golden() -> TestResult {
         return TestResult::Fail("RTL8188EU source identity/provenance changed");
     }
     let mut bytes =
-        match narf_wifi_fixtures::firmware::metadata_replay(source.length, source.fragments) {
+        match narf_wifi_fixtures::firmware::sparse_image(source.length, source.fragments) {
             Ok(bytes) => bytes,
             Err(_) => return TestResult::Fail("RTL8188EU metadata replay geometry"),
         };

@@ -42,28 +42,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
-#[cfg(all(any(test, feature = "kernel-test"), narf_wifi_goldens_broadcom))]
-#[path = "firmware_metadata_tests.rs"]
-mod metadata_tests;
-
-// Stub selected when the extracted Broadcom golden fixture is absent
-// from this checkout (see drivers/wireless/build.rs, issue #739): the
-// same test registers and reports Skip instead of the build failing on
-// `include_bytes!` of a missing `*.metadata.bin`.
-#[cfg(all(any(test, feature = "kernel-test"), not(narf_wifi_goldens_broadcom)))]
-mod metadata_tests {
-    use narf_kernel_test::{kernel_test_in, TestResult};
-
-    fn smoke_brcmfmac_installed_bcm43602_metadata_replay() -> TestResult {
-        TestResult::Skip(
-            "Broadcom wifi-firmware golden fixture absent from this checkout (issue #739)",
-        )
-    }
-    kernel_test_in!(
-        "drivers/wireless/brcmfmac",
-        smoke_brcmfmac_installed_bcm43602_metadata_replay
-    );
-}
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "firmware_parser_tests.rs"]
+mod parser_tests;
 
 // ── TRX firmware container ────────────────────────────────────────
 

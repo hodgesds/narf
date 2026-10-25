@@ -447,8 +447,9 @@ Fixed Rust vectors based on the documented `sta.h` contract check the complete
 ADD/REMOVE layouts and the disabled-transmit flags. Native RFH/TFH fixtures
 check status/command identity, fresh MCC denial, acknowledged peer reuse,
 invalid profile/BSSID/NVM/policy rejection and cancellation at MCC, ADD and
-REMOVE publication. A metadata-only replay of the SHA256-pinned real CC API77
-image drives the production version checks; opaque image bytes are never loaded.
+REMOVE publication. An authored Rust TLV input explicitly selects the peer,
+queue and power command versions for the API77 model and drives the production
+version checks. It makes no claim about a particular installed firmware image.
 This is a firmware table-ownership prerequisite, with the link inactive and
 transmit disabled. The subsequent management-queue owner is specified in §3.9.
 Active station PHY/link, management transmission, rate/key/BA/security,

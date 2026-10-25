@@ -457,38 +457,9 @@ pub(super) async fn prepare<T: Transport>(
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
 
-#[cfg(all(any(test, feature = "kernel-test"), narf_wifi_goldens_qualcomm))]
-#[path = "firmware_metadata_tests.rs"]
-mod metadata_tests;
-
-// Stub selected when the extracted Qualcomm golden fixtures are absent
-// from this checkout (see drivers/wireless/build.rs, issue #739): the
-// same tests register and report Skip instead of the build failing on
-// `include_bytes!` of a missing `*.metadata.bin`.
-#[cfg(all(any(test, feature = "kernel-test"), not(narf_wifi_goldens_qualcomm)))]
-mod metadata_tests {
-    use narf_kernel_test::{kernel_test_in, TestResult};
-
-    fn smoke_ath10k_installed_firmware_metadata_replays() -> TestResult {
-        TestResult::Skip(
-            "Qualcomm wifi-firmware golden fixtures absent from this checkout (issue #739)",
-        )
-    }
-    kernel_test_in!(
-        "drivers/wireless/ath10k",
-        smoke_ath10k_installed_firmware_metadata_replays
-    );
-
-    fn smoke_ath10k_installed_board_metadata_replays() -> TestResult {
-        TestResult::Skip(
-            "Qualcomm wifi-firmware golden fixtures absent from this checkout (issue #739)",
-        )
-    }
-    kernel_test_in!(
-        "drivers/wireless/ath10k",
-        smoke_ath10k_installed_board_metadata_replays
-    );
-}
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "firmware_parser_tests.rs"]
+mod parser_tests;
 
 #[cfg(feature = "kernel-test")]
 mod asset_authority_tests {
