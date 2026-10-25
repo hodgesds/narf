@@ -5280,8 +5280,9 @@ fn uvc_fixture_config_blob() -> Vec<u8> {
     cfg.extend_from_slice(&[9, 2, 0, 0, 2, 1, 0, 0x80, 50]);
     // Interface 0: VideoControl.
     cfg.extend_from_slice(&[9, 4, 0, 0, 0, 0x0E, 0x01, 0x00, 0]);
-    // VC_HEADER: bcdUVC 1.0, one streaming interface (1).
-    cfg.extend_from_slice(&[13, 0x24, 0x01, 0x00, 0x01, 13, 0, 0x40, 0x9C, 0x47, 1, 1]);
+    // VC_HEADER (13 bytes): bcdUVC 1.0, wTotalLength 13,
+    // dwClockFrequency (4 bytes), one streaming interface (1).
+    cfg.extend_from_slice(&[13, 0x24, 0x01, 0x00, 0x01, 13, 0, 0x40, 0x9C, 0x47, 0, 1, 1]);
     // Interface 1 alt 0: VideoStreaming, zero bandwidth.
     cfg.extend_from_slice(&[9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0]);
     // VS_INPUT_HEADER: 1 format, CS total 71, endpoint 0x81, terminal 1.
