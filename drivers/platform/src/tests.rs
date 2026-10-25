@@ -849,6 +849,204 @@ fn smoke_tpm_pcr_extend_request_bytes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/platform/tpm", smoke_tpm_pcr_extend_request_bytes);
+// ── TPM CRB probe core (#939) ───────────────────────────────────
+//
+// The probe sequence in `crate::tpm` runs against a `CrbRegs`
+// register window so it can be driven against a firmware-shaped
+// model of the control area. `FakeCrbRegs` is that model: a flat
+// register file plus two firmware behaviours (locality grant on
+// request; a floating bus reads back all-ones). Before #939 the
+// only TPM fixture was the no-TPM smoke above — no fixture
+// modelled a CRB control area at all, which is how the inverted
+// buffer contract shipped untested.
+
+struct FakeCrbRegs {
+    regs: core::cell::RefCell<alloc::vec::Vec<u32>>,
+    writes: core::cell::RefCell<alloc::vec::Vec<(u64, u32)>>,
+    grant_locality: core::cell::Cell<bool>,
+    floating: core::cell::Cell<bool>,
+}
+
+impl FakeCrbRegs {
+    fn new() -> Self {
+        Self {
+            regs: core::cell::RefCell::new(alloc::vec![0; 1024]),
+            writes: core::cell::RefCell::new(alloc::vec::Vec::new()),
+            grant_locality: core::cell::Cell::new(true),
+            floating: core::cell::Cell::new(false),
+        }
+    }
+    fn set32(&self, offset: u64, value: u32) {
+        self.regs.borrow_mut()[(offset / 4) as usize] = value;
+    }
+    fn get32(&self, offset: u64) -> u32 {
+        self.regs.borrow()[(offset / 4) as usize]
+    }
+}
+
+impl crate::tpm::CrbRegs for FakeCrbRegs {
+    fn rd32(&self, offset: u64) -> u32 {
+        if self.floating.get() {
+            return u32::MAX;
+        }
+        // Firmware behaviour: once the host requests locality via
+        // LOC_CTRL, LOC_STATE reads back locAssigned.
+        if offset == crate::tpm::REG_LOC_STATE
+            && self.grant_locality.get()
+            && self.get32(crate::tpm::REG_LOC_CTRL) & crate::tpm::LOC_CTRL_REQ_ACCESS != 0
+        {
+            return crate::tpm::LOC_STATE_LOC_ASSIGNED;
+        }
+        self.get32(offset)
+    }
+    fn wr32(&self, offset: u64, value: u32) {
+        self.writes.borrow_mut().push((offset, value));
+        self.set32(offset, value);
+    }
+}
+
+fn smoke_tpm_crb_probe_firmware_shaped_control_area() -> TestResult {
+    use crate::tpm;
+    let regs = FakeCrbRegs::new();
+    // Firmware-shaped CRB control area: INTF_ID advertises CRB
+    // (type 0, version 1) and — the normal, expected state — the
+    // CMD_*/RSP_* buffer registers are all ZERO, because they are
+    // host-programmed (PTP §6). The pre-#939 probe read them as
+    // firmware-published and returned NoCommandBuffer on exactly
+    // this shape, so CRB probe could never succeed on real fTPM
+    // hardware.
+    regs.set32(tpm::REG_INTERFACE_ID, 0x1);
+    match tpm::identify(&regs) {
+        Ok(tpm::TpmKind::Crb) => {}
+        _ => return TestResult::Fail("firmware-shaped CRB area not identified as CRB"),
+    }
+    let cmd_phys: u64 = 0x2000_0000;
+    let rsp_phys: u64 = 0x2000_1000;
+    if tpm::crb_acquire_and_program(
+        &regs,
+        cmd_phys,
+        4096,
+        rsp_phys,
+        4096,
+        narf_time::Deadline::after_ms(750),
+    )
+    .is_err()
+    {
+        return TestResult::Fail("CRB bring-up failed on a firmware-shaped control area");
+    }
+    // The host must have PROGRAMMED all six buffer registers with
+    // its own buffers — the exact inversion of the old contract.
+    if regs.get32(tpm::REG_CRB_CMD_SIZE) != 4096 {
+        return TestResult::Fail("CMD_SIZE was not programmed");
+    }
+    if regs.get32(tpm::REG_CRB_CMD_LO) != cmd_phys as u32 {
+        return TestResult::Fail("CMD_PA_LO was not programmed");
+    }
+    if regs.get32(tpm::REG_CRB_CMD_HI) != 0 {
+        return TestResult::Fail("CMD_PA_HI was not programmed");
+    }
+    if regs.get32(tpm::REG_CRB_RSP_SIZE) != 4096 {
+        return TestResult::Fail("RSP_SIZE was not programmed");
+    }
+    if regs.get32(tpm::REG_CRB_RSP_LO) != rsp_phys as u32 {
+        return TestResult::Fail("RSP_PA_LO was not programmed");
+    }
+    if regs.get32(tpm::REG_CRB_RSP_HI) != 0 {
+        return TestResult::Fail("RSP_PA_HI was not programmed");
+    }
+    // Locality was requested before any programming happened.
+    let writes = regs.writes.borrow();
+    match writes.first() {
+        Some(&(off, val)) if off == tpm::REG_LOC_CTRL && val == tpm::LOC_CTRL_REQ_ACCESS => {}
+        _ => return TestResult::Fail("first write was not the LOC_CTRL locality request"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-crb-firmware",
+    smoke_tpm_crb_probe_firmware_shaped_control_area
+);
+
+fn smoke_tpm_crb_probe_absent_window_fails_clean() -> TestResult {
+    use crate::tpm;
+    // Floating bus (absent device): every read is all-ones.
+    let floating = FakeCrbRegs::new();
+    floating.floating.set(true);
+    if tpm::identify(&floating) != Err(tpm::TpmError::NotPresent) {
+        return TestResult::Fail("floating window not reported NotPresent");
+    }
+    // Silent window: every read is zero.
+    let silent = FakeCrbRegs::new();
+    if tpm::identify(&silent) != Err(tpm::TpmError::NotPresent) {
+        return TestResult::Fail("silent window not reported NotPresent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-crb-absent",
+    smoke_tpm_crb_probe_absent_window_fails_clean
+);
+
+fn smoke_tpm_crb_probe_garbage_interface_fails_clean() -> TestResult {
+    use crate::tpm;
+    // Undefined interface type — the PTP defines 0x0 (CRB) and 0xF
+    // (TIS) only. The pre-#939 probe guessed CRB here.
+    let undef = FakeCrbRegs::new();
+    undef.set32(tpm::REG_INTERFACE_ID, 0x3);
+    if tpm::identify(&undef) != Err(tpm::TpmError::NotPresent) {
+        return TestResult::Fail("undefined interface type not rejected");
+    }
+    // A TIS claim with no DID_VID behind it is not a device.
+    let tis_no_vid = FakeCrbRegs::new();
+    tis_no_vid.set32(tpm::REG_INTERFACE_ID, 0xF);
+    if tpm::identify(&tis_no_vid) != Err(tpm::TpmError::NotPresent) {
+        return TestResult::Fail("TIS claim without DID_VID not rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-crb-garbage",
+    smoke_tpm_crb_probe_garbage_interface_fails_clean
+);
+
+fn smoke_tpm_tis_identification_still_works() -> TestResult {
+    use crate::tpm;
+    let regs = FakeCrbRegs::new();
+    regs.set32(tpm::REG_INTERFACE_ID, 0xF);
+    regs.set32(tpm::REG_TIS_DID_VID, 0x15D1_0001);
+    if tpm::identify(&regs) != Ok(tpm::TpmKind::Tis) {
+        return TestResult::Fail("TIS part with a sane DID_VID not identified");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-tis-identify",
+    smoke_tpm_tis_identification_still_works
+);
+
+fn smoke_tpm_crb_probe_locality_never_granted() -> TestResult {
+    use crate::tpm;
+    let regs = FakeCrbRegs::new();
+    regs.set32(tpm::REG_INTERFACE_ID, 0x1);
+    regs.grant_locality.set(false);
+    // Short deadline: this fixture pins the bounded-failure shape,
+    // not production's 750 ms TIMEOUT_A budget.
+    match tpm::crb_acquire_and_program(
+        &regs,
+        0x2000_0000,
+        4096,
+        0x2000_1000,
+        4096,
+        narf_time::Deadline::after_ms(1),
+    ) {
+        Err(tpm::TpmError::LocalityTimeout) => TestResult::Pass,
+        _ => TestResult::Fail("ungranted locality did not time out cleanly"),
+    }
+}
+kernel_test_in!(
+    "drivers/platform/tpm-crb-locality",
+    smoke_tpm_crb_probe_locality_never_granted
+);
 
 fn smoke_tpm_pcr_extend_response_validation() -> TestResult {
     use crate::tpm::validate_pcr_extend_response;
