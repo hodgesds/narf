@@ -112,6 +112,14 @@ and CI compiler-cache integration.
 - `cargo xtask test --arch=x86_64 --subsystem userspace` — run that subsystem
   and its `/`-delimited children, then perform the normal whole-kernel boot
   smoke. Comma-separated filters select the union of those subtrees.
+- `cargo xtask test --arch=x86_64 --exclude-subsystem drivers/gpu` — remove
+  that subsystem subtree from whatever the include filter (or the full
+  suite) selects; the two filters compose, and both thread onto the kernel
+  cmdline (`test_subsystem=` / `test_subsystem_exclude=`). CI's primary
+  kernel-test invocation always excludes `drivers/gpu`; that group runs in
+  the dedicated `kernel-test-gpu` job, gated by the affected plan's
+  `run_gpu_tests` output, so an intermittent GPU-fixture hang cannot stall
+  the primary suite.
 - `cargo xtask net-smoke --arch=x86_64` runs live host-to-guest TCP and UDP
   echoes plus a guest-originated DNS query over virtio-net. `cargo xtask
   e1000-module-net-smoke --arch=x86_64` runs the identical exchanges over an
@@ -142,7 +150,8 @@ and CI compiler-cache integration.
   shorten a filter only when it adds no unselected registration; a 1024-byte
   filter budget replaces the former arbitrary tag-count limit.
   `run_large_memory`, `run_xapic`, `run_virtio_mmio`, `run_user_mode`, and
-  `run_uefi` gate secondary configurations independently. Kernel lint and test
+  `run_uefi` gate secondary configurations independently; `run_gpu_tests`
+  gates the dedicated GPU kernel-test job. Kernel lint and test
   jobs retain both architectures. Shared compiler/configuration changes and
   explicit full runs lint all packages; ordinary crate edits lint direct
   owners even when their tests require a full run.

@@ -1131,6 +1131,15 @@ struct TestArgs {
     #[arg(long)]
     subsystem: Option<String>,
 
+    /// Exclude kernel tests under these subsystems. Comma-separated;
+    /// each is prefix-matched in-kernel, exactly like `--subsystem`,
+    /// and removes matches from whatever the include filter (or the
+    /// whole suite) would have run. CI's primary kernel-test step
+    /// passes `--exclude-subsystem drivers/gpu`: the GPU fixtures run
+    /// in their own job (see `.github/workflows/ci.yml`).
+    #[arg(long)]
+    exclude_subsystem: Option<String>,
+
     /// Run only the in-kernel test phase. Skip the production-init boot and
     /// host-side btrfs interoperability postflight that normally follow it.
     ///
@@ -14120,14 +14129,25 @@ fn main() -> Result<()> {
             let TestArgs {
                 build: mut args,
                 subsystem,
+                exclude_subsystem,
                 kernel_tests_only,
             } = test;
-            let prior_append = std::env::var_os("XTASK_QEMU_APPEND");
+            // Comma-separated subsystem filters (prefix-matched in-kernel)
+            // are threaded onto the cmdline: `test_subsystem=a,b,c`
+            // selects, `test_subsystem_exclude=a,b,c` removes matches from
+            // the selection (or from the whole suite). Each list is
+            // validated before it is trusted on a kernel cmdline.
+            let mut filter_parts: Vec<String> = Vec::new();
             if let Some(subsystem) = &subsystem {
-                // Comma-separated list of subsystem filters (prefix-matched
-                // in-kernel). Each part is validated; the whole list is
-                // threaded onto the cmdline as `test_subsystem=a,b,c`.
                 validate_test_subsystems(subsystem)?;
+                filter_parts.push(format!("test_subsystem={subsystem}"));
+            }
+            if let Some(exclude_subsystem) = &exclude_subsystem {
+                validate_test_subsystems(exclude_subsystem)?;
+                filter_parts.push(format!("test_subsystem_exclude={exclude_subsystem}"));
+            }
+            let prior_append = std::env::var_os("XTASK_QEMU_APPEND");
+            if !filter_parts.is_empty() {
                 let mut append = prior_append
                     .as_ref()
                     .map(|value| value.to_string_lossy().into_owned())
@@ -14135,8 +14155,7 @@ fn main() -> Result<()> {
                 if !append.is_empty() {
                     append.push(' ');
                 }
-                append.push_str("test_subsystem=");
-                append.push_str(subsystem);
+                append.push_str(&filter_parts.join(" "));
                 std::env::set_var("XTASK_QEMU_APPEND", append);
             }
             let result = (|| {

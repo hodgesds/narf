@@ -42,7 +42,8 @@ pub use info::{validate_memory_map, BootError, BootInfo, MemRegion, MemRegionKin
 /// `stop_at=<stage>`, `nosmp`, `root=<spec>`, `systemd_pid1`, `no_redis`,
 /// `hugepages_2m=N`, `hugepages_1g=N`, `mt_echo_threads=N`,
 /// `rcu_stall_panic`, plus feature-gated `trace_comm=`, `test_subsystem=`,
-/// `bpf_bench[_n]`, `bpf_fuzz_{n,seed,trace}`. Unknown tokens are ignored
+/// `test_subsystem_exclude=`, `bpf_bench[_n]`, `bpf_fuzz_{n,seed,trace}`.
+/// Unknown tokens are ignored
 /// and never abort boot; the full string is still exposed via
 /// `/proc/cmdline` for userspace (systemd's own `systemd.*` params).
 #[cfg(target_arch = "x86_64")]
