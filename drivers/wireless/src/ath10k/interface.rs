@@ -16,6 +16,7 @@ use narf_wireless::{
     WirelessNetIface,
 };
 type Error = wmi_runtime::Error;
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 enum Policy {
     Installed,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -50,6 +51,7 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     pub(super) radio: Arc<Mutex<Radio<T>>>,
     state: Mutex<State>,
     name: String,
+    generation: u64,
     mac: [u8; 6],
     policy: Policy,
     up: AtomicBool,
@@ -114,6 +116,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 pending: None,
             }),
             name: name.into(),
+            generation: NEXT_GENERATION
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_add(1)
+                })
+                .expect("ath10k interface generations exhausted"),
             mac,
             policy,
             up: AtomicBool::new(false),
@@ -171,6 +178,33 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             .ok_or(())?
             .try_send(frame)
             .map_err(|_| ())
+    }
+    pub(super) fn enqueue_generation(
+        &self,
+        generation: u64,
+        bytes: &[u8],
+        meta: narf_net::TxMeta,
+    ) -> Result<(), ()> {
+        if generation != self.generation {
+            return Err(());
+        }
+        self.enqueue(bytes, meta)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn generation_for_test(&self) -> u64 {
+        self.generation
+    }
+    pub(super) fn retire_host(&self) {
+        self.close();
+        if let Some(mut state) = self.state.try_lock() {
+            state.clear();
+        }
+        narf_wireless::registry::unregister(&self.name);
+        narf_net::registry().unregister(&self.name);
+        // Reserve while still registered: another family's wlan%d allocation
+        // must never take this name between unregister and reservation.
+        narf_net::iface::reserve_name(&self.name);
+        narf_net::iface::unregister(&self.name);
     }
     fn progress(&self) -> Vec<Vec<u8>> {
         let Some(mut radio) = self.radio.try_lock() else {
@@ -332,6 +366,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         if radio.prepared_peer().is_some() {
             return Err(WirelessError::Busy);
         }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
         let domain = self.policy.current().map_err(error)?;
         if request.active && implicit {
             frequencies.retain(|f| radio.active_frequency_allowed(&domain, *f));
@@ -437,6 +474,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         };
         let mut radio = self.radio.lock().await;
         self.state.lock().await.clear();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
         let domain = self.policy.current().map_err(error)?;
         radio
             .prepare_station(&domain, request.bssid, request.frequency_mhz as u16)
@@ -547,9 +587,21 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Interface for Device<T> {
 }
 type Native = Device<super::boot::PciBoot>;
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Native>>> = IrqSafeSpinLock::new(None);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE.lock().clone().ok_or(())?;
-    device.enqueue(bytes, meta)
+    device.enqueue_generation(generation, bytes, meta)
+}
+/// Remove only this physical generation. Its retired name remains reserved so
+/// late old-owner carrier updates cannot address a new driver's registration.
+pub(super) fn retire(radio: &Arc<Mutex<Radio<super::boot::PciBoot>>>) {
+    let mut active = ACTIVE.lock();
+    let Some(device) = active.as_ref().filter(|d| Arc::ptr_eq(&d.radio, radio)) else {
+        return;
+    };
+    let device = device.clone();
+    *active = None;
+    drop(active);
+    device.retire_host();
 }
 fn drain() -> bool {
     let device = ACTIVE.lock().clone();
@@ -593,49 +645,70 @@ fn check_admission() -> Result<Admission, Error> {
 fn publish_with_mac(
     radio: Arc<Mutex<Radio<super::boot::PciBoot>>>,
     mac: [u8; 6],
+    quarantine: &AtomicBool,
 ) -> Result<Arc<Native>, Error> {
     narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Unsupported)?;
     let mut active = ACTIVE.lock();
-    if active.is_some() {
+    admit_generation(quarantine, || {
+        if active.is_some() {
+            return Err(Error::Failed);
+        }
+        let name = narf_net::iface::reserve_name("wlan%d");
+        let device = Arc::new(Device::new(name, mac, radio));
+        narf_net::registry()
+            .register(&authority, Registered(device.clone()))
+            .map_err(|_| Error::Unsupported)?;
+        *active = Some(device.clone());
+        narf_net::iface::register_with_context(name, mac, device.generation, send);
+        narf_net::iface::set_link_state(name, false);
+        narf_net::iface::set_link_metadata(name, false, None, None);
+        narf_net::iface::install_rx_drain(drain);
+        narf_wireless::registry::register(device.clone());
+        let worker = device.clone();
+        narf_scheduler::spawn(async move {
+            loop {
+                if worker.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                worker.drain();
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            }
+        });
+        Ok(device)
+    })
+}
+/// Called under ACTIVE for the entire registration transaction, so retirement
+/// either prevents publication or observes its complete registered generation.
+pub(super) fn admit_generation<R>(
+    quarantine: &AtomicBool,
+    publish: impl FnOnce() -> Result<R, Error>,
+) -> Result<R, Error> {
+    if quarantine.load(Ordering::Acquire) {
         return Err(Error::Failed);
     }
-    let name = narf_net::iface::reserve_name("wlan%d");
-    let device = Arc::new(Device::new(name, mac, radio));
-    narf_net::registry()
-        .register(&authority, Registered(device.clone()))
-        .map_err(|_| Error::Unsupported)?;
-    *active = Some(device.clone());
-    drop(active);
-    narf_net::iface::register(name, mac, send);
-    narf_net::iface::set_link_state(name, false);
-    narf_net::iface::set_link_metadata(name, false, None, None);
-    narf_net::iface::install_rx_drain(drain);
-    narf_wireless::registry::register(device.clone());
-    let worker = device.clone();
-    narf_scheduler::spawn(async move {
-        loop {
-            worker.drain();
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
-        }
-    });
-    Ok(device)
+    publish()
 }
 pub(super) fn publish(
     radio: Arc<Mutex<Radio<super::boot::PciBoot>>>,
+    quarantine: Arc<AtomicBool>,
 ) -> Result<Arc<Native>, Error> {
     let r = radio.try_lock().ok_or(Error::Failed)?;
     let mac = r.station_publishable()?;
-    let result = publish_with_mac(radio.clone(), mac);
+    let result = publish_with_mac(radio.clone(), mac, &quarantine);
     drop(r);
     result
 }
 pub(super) async fn wait_publish(
     radio: Arc<Mutex<Radio<super::boot::PciBoot>>>,
+    quarantine: Arc<AtomicBool>,
 ) -> Result<Arc<Native>, Error> {
     loop {
+        if quarantine.load(Ordering::Acquire) {
+            return Err(Error::Failed);
+        }
         {
             let r = radio.lock().await;
             r.station_publishable()?;
@@ -647,7 +720,7 @@ pub(super) async fn wait_publish(
             Admission::Ready => {
                 let r = radio.lock().await;
                 let mac = r.station_publishable()?;
-                let result = publish_with_mac(radio.clone(), mac);
+                let result = publish_with_mac(radio.clone(), mac, &quarantine);
                 drop(r);
                 return result;
             }

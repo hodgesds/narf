@@ -202,6 +202,36 @@ another executor task. IRQ throughput and power management are separate profiles
   or rejoin claim. The registered Device closes host carrier and security
   before awaiting this firmware transaction. All six native WMI dialects are covered;
   only TLV advertises the extra synchronous delete service.
+- `pci::recover()` retires a retained boot/runtime/radio generation and schedules
+  the existing fresh-ROM boot path: chip-specific reset, new coherent CE rings,
+  BMI identity, current authenticated firmware/BDF and OTP calibration, then
+  HTC/WMI/HTT/scan setup and normal policy/network-capability interface admission.
+  It returns `RecoveryScheduled { attempt }` after scheduling, not readiness;
+  current controller stage/error metadata and eventual registration report the
+  result. Missing policy or deployment assets retain their normal staged waits.
+  No credentials, peer, keys, cached BSS or association are replayed. A successful
+  new generation can be scanned/joined through its newly registered interface.
+  `RecoveryError::Busy` means no retained session is available (including boot
+  in progress); Exhausted enforces three attempts per kernel boot. Transport
+  failures propagate without reopening the old generation.
+  Radio quarantine precedes its mutex wait and survives cancellation: all native
+  PCI radio APIs reject that session. Host carrier/registrations close first;
+  after acquiring Radio, packet security is failed and host retirement is
+  repeated under that lock to catch an older in-progress `wait_publish`.
+  Queued old interface control rechecks closure after acquiring the radio.
+  Each generation has a non-reused TX cookie; net-stack snapshots from a removed
+  interface cannot send into its replacement. Retired names are reserved before
+  unregister, preventing another driver's wlan-name allocation in that gap.
+  Every CE interrupt source is masked and every CE is halted before verified
+  PCI bus-master disable. A failed halt still attempts master disable but cannot
+  start a successor. The retired physical owner is terminal before hardware
+  access, and its late Drop performs no MMIO, BME or ASPM operation against a
+  successor. All old boot/firmware/WMI/management/HTT allocations remain pinned,
+  even after successful reset scheduling: no posted-DMA drain, reclamation or
+  RF-quiescence proof is claimed. The attempt limit bounds these retained DMA
+  generations. This is manual replacement/rejoin support, not automatic recovery,
+  stable-netdev reconnection, system suspend or reclaimed DMA. Physical reset,
+  ROM/firmware restart and repeated RF association still need hardware acceptance.
 - `pci::start_station_data(pmk)` starts the retained packet owner after native
   association, with `None` for Open or the caller's WPA2 PMK. It requires
   firmware `RAW_MODE_SUPPORT` (bit10), RAW RX selected during WMI INIT, and a

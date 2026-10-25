@@ -24,6 +24,8 @@ mod hif;
 pub(super) use hif::tests::CeFixture;
 #[path = "boot/htt_memory.rs"]
 mod htt_memory;
+#[path = "boot/recovery.rs"]
+mod recovery;
 #[path = "boot/wmi_memory.rs"]
 mod wmi_memory;
 
@@ -109,6 +111,21 @@ fn allocate(bytes: usize) -> Result<DmaBuffer, BmiError> {
         .map_err(|_| BmiError::NoMemory)
 }
 
+impl Resources<DmaBuffer> {
+    fn allocate(hardware: HwRev) -> Result<Self, BmiError> {
+        Ok(Self {
+            tx: Ring::new(allocate(16 * 8)?, hardware, 0, 16, Direction::Source)?,
+            rx: Ring::new(allocate(512 * 8)?, hardware, 1, 512, Direction::Destination)?,
+            diag_tx: Ring::new(allocate(2 * 8)?, hardware, 7, 2, Direction::Source)?,
+            diag_rx: Ring::new(allocate(2 * 8)?, hardware, 7, 2, Direction::Destination)?,
+            request: allocate(256)?,
+            response: allocate(2048)?,
+            diag: allocate(2048)?,
+            codeswap: None,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct PciBoot {
     mmio: Mmio,
@@ -123,6 +140,7 @@ pub(super) struct PciBoot {
     armed: bool,
     poisoned: bool,
     saved_aspm: Option<u16>,
+    retired: bool,
 }
 
 impl PciBoot {
@@ -138,16 +156,7 @@ impl PciBoot {
         if command & narf_bus::pci::cmd::BUS_MASTER != 0 {
             return Err(BmiError::Pci);
         }
-        let resources = Resources {
-            tx: Ring::new(allocate(16 * 8)?, hardware, 0, 16, Direction::Source)?,
-            rx: Ring::new(allocate(512 * 8)?, hardware, 1, 512, Direction::Destination)?,
-            diag_tx: Ring::new(allocate(2 * 8)?, hardware, 7, 2, Direction::Source)?,
-            diag_rx: Ring::new(allocate(2 * 8)?, hardware, 7, 2, Direction::Destination)?,
-            request: allocate(256)?,
-            response: allocate(2048)?,
-            diag: allocate(2048)?,
-            codeswap: None,
-        };
+        let resources = Resources::allocate(hardware)?;
         Ok(Self {
             mmio: Mmio {
                 cap,
@@ -164,6 +173,7 @@ impl PciBoot {
             armed: false,
             poisoned: false,
             saved_aspm: None,
+            retired: false,
         })
     }
 
@@ -285,6 +295,9 @@ impl PciBoot {
     }
 
     pub async fn power_up(&mut self, chip_revision: u32) -> Result<(), BmiError> {
+        if self.retired {
+            return Err(BmiError::BadResponse);
+        }
         if !self.mmio.authorized() {
             return Err(BmiError::Pci);
         }
@@ -600,6 +613,11 @@ impl<B: Memory> Resources<B> {
 
 impl Drop for PciBoot {
     fn drop(&mut self) {
+        if self.retired {
+            // A successor owns this function. Keep every old mapping pinned
+            // and never halt or reconfigure the new physical generation.
+            return;
+        }
         let mut stopped = true;
         if self.armed {
             for pipe in 0..self.registers.ce_count {

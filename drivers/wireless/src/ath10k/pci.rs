@@ -139,6 +139,7 @@ struct HttSession {
     profile: super::profile::Profile,
 }
 struct RadioSession {
+    quarantine: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
     radio:
         alloc::sync::Arc<narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>>,
     image: super::firmware::Image,
@@ -152,6 +153,110 @@ enum DriverSession {
     Radio(alloc::boxed::Box<RadioSession>),
 }
 static SESSION: narf_lib::mutex::Mutex<Option<DriverSession>> = narf_lib::mutex::Mutex::new(None);
+static RECOVERY_ATTEMPTS: IrqSafeSpinLock<u8> = IrqSafeSpinLock::new(0);
+
+fn live_radio(
+    session: &mut Option<DriverSession>,
+) -> Result<&mut RadioSession, super::wmi_runtime::Error> {
+    match session {
+        Some(DriverSession::Radio(owner))
+            if !owner.quarantine.load(core::sync::atomic::Ordering::Acquire) =>
+        {
+            Ok(owner)
+        }
+        _ => Err(super::wmi_runtime::Error::Failed),
+    }
+}
+
+pub(in crate::ath10k) async fn retire_radio<'a, T>(
+    radio: &'a alloc::sync::Arc<narf_lib::mutex::Mutex<super::wmi_runtime::Radio<T>>>,
+    quarantine: &core::sync::atomic::AtomicBool,
+    retire_host: impl Fn(),
+) -> narf_lib::mutex::MutexGuard<'a, super::wmi_runtime::Radio<T>>
+where
+    T: super::control::Hif + super::wmi_boot::HostMemory + super::htt_runtime::HttMemory,
+{
+    // Quarantine survives cancellation while a current controller owns Radio.
+    quarantine.store(true, core::sync::atomic::Ordering::Release);
+    retire_host();
+    let mut radio = radio.lock().await;
+    radio.fail_station_data();
+    // A previous wait_publish may have held Radio and published after our first
+    // lookup. This lookup under its lock fences that final old publication.
+    retire_host();
+    radio
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryError {
+    Busy,
+    Exhausted,
+    Transport(super::bmi::BmiError),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryScheduled {
+    pub attempt: u8,
+}
+
+/// Schedule fresh chip reset, authenticated ROM provisioning and a new runtime
+/// interface. Three attempts per boot bound permanently pinned old DMA.
+/// Success reports scheduling, not readiness, RF quiescence or DMA reclamation.
+pub async fn recover() -> Result<RecoveryScheduled, RecoveryError> {
+    let mut session = SESSION.lock().await;
+    let owner = session.as_mut().ok_or(RecoveryError::Busy)?;
+    let attempt = {
+        let mut attempts = RECOVERY_ATTEMPTS.lock();
+        if *attempts >= 3 {
+            return Err(RecoveryError::Exhausted);
+        }
+        *attempts += 1;
+        *attempts
+    };
+    let result = match owner {
+        DriverSession::Boot(owner) => owner.bmi.transport.retire_for_restart(),
+        DriverSession::Runtime(owner) => owner.htc.transport.retire_for_restart(),
+        DriverSession::Wmi(owner) => owner.wmi.htc.transport.retire_for_restart(),
+        DriverSession::Htt(owner) => owner.htt.wmi.htc.transport.retire_for_restart(),
+        DriverSession::Radio(owner) => {
+            let mut radio = retire_radio(&owner.radio, &owner.quarantine, || {
+                super::interface::retire(&owner.radio);
+            })
+            .await;
+            radio.htt.wmi.htc.transport.retire_for_restart()
+        }
+    };
+    let restart = result.map_err(RecoveryError::Transport)?;
+    // A retired transport's Drop performs no hardware access and preserves all
+    // old mappings. A late old firmware/CE write can only hit permanently pinned DMA.
+    *session = None;
+    let revision = {
+        let mut controller = CONTROLLER.lock();
+        let controller = controller.as_mut().ok_or(RecoveryError::Busy)?;
+        controller.target_info = None;
+        controller.boot_error = None;
+        controller.firmware_prepared = None;
+        controller.firmware_error = None;
+        controller.htc_ready = None;
+        controller.runtime_error = None;
+        controller.wmi_ready = None;
+        controller.wmi_error = None;
+        controller.htt_ready = None;
+        controller.htt_error = None;
+        controller.scan_ready = None;
+        controller.scan_error = None;
+        controller.station_prepared = None;
+        controller.station_error = None;
+        controller.chip_id_rev
+    };
+    narf_scheduler::spawn(boot_task(
+        restart.device,
+        restart.cap,
+        restart.mmio,
+        restart.hardware,
+        revision,
+    ));
+    Ok(RecoveryScheduled { attempt })
+}
 
 async fn activate_runtime(
     mut boot: BootSession,
@@ -262,6 +367,7 @@ async fn initialize_radio(
     let mut radio = super::wmi_runtime::Radio::new(htt.htt, dialect, htt.image.features);
     let result = radio.start_from_hardware().await;
     let owner = RadioSession {
+        quarantine: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
         radio: alloc::sync::Arc::new(narf_lib::mutex::Mutex::new(radio)),
         image: htt.image,
         profile: htt.profile,
@@ -277,9 +383,7 @@ pub async fn scan_passive(
     frequencies: &[u16],
 ) -> Result<super::wmi_runtime::ScanReport, super::wmi_runtime::Error> {
     let mut session = SESSION.lock().await;
-    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
-        return Err(super::wmi_runtime::Error::Failed);
-    };
+    let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     let result = radio.passive_scan(frequencies).await;
     if let Err(error) = &result {
@@ -313,9 +417,7 @@ pub async fn scan_active_with_ies(
     super::wmi_runtime::validate_probe_ies(extra_ies)?;
     let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
     let mut session = SESSION.lock().await;
-    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
-        return Err(Error::Failed);
-    };
+    let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     let plan = radio
         .prepare_active_scan(frequencies, ssids, &domain)?
@@ -345,9 +447,7 @@ pub async fn prepare_station(
     let domain = narf_wireless::reg::db::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
-    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
-        return Err(super::wmi_runtime::Error::Failed);
-    };
+    let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     let result = radio.prepare_station(&domain, bssid, frequency).await;
     if let Some(controller) = CONTROLLER.lock().as_mut() {
@@ -371,9 +471,7 @@ pub async fn exchange_initial_management(
     let domain = narf_wireless::reg::db::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
-    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
-        return Err(super::wmi_runtime::Error::Failed);
-    };
+    let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     let result = radio.exchange_initial_management(&domain, frame).await;
     if let Some(controller) = CONTROLLER.lock().as_mut() {
@@ -395,9 +493,7 @@ pub async fn associate_station(
     let domain = narf_wireless::reg::db::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
-    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
-        return Err(super::wmi_runtime::Error::Failed);
-    };
+    let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     let result = radio
         .associate_station(&domain, ssid, security, sme_ies)
@@ -417,9 +513,7 @@ pub async fn associate_station(
 pub async fn disconnect_station(
 ) -> Result<super::wmi_runtime::StationDisconnected, super::wmi_runtime::Error> {
     let mut session = SESSION.lock().await;
-    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
-        return Err(super::wmi_runtime::Error::Failed);
-    };
+    let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     let result = radio.disconnect_station().await;
     if let Some(controller) = CONTROLLER.lock().as_mut() {
@@ -439,9 +533,7 @@ pub async fn start_station_data(
     let domain = narf_wireless::reg::db::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
-    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
-        return Err(super::wmi_runtime::Error::Failed);
-    };
+    let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     radio.start_station_data(&domain, pmk).await
 }
@@ -452,9 +544,7 @@ pub async fn transmit_ethernet(bytes: &[u8]) -> Result<u16, super::wmi_runtime::
     let domain = narf_wireless::reg::db::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
-    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
-        return Err(super::wmi_runtime::Error::Failed);
-    };
+    let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     radio.transmit_ethernet(&domain, bytes).await
 }
@@ -466,9 +556,7 @@ pub async fn poll_ethernet(
     let domain = narf_wireless::reg::db::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
-    let Some(DriverSession::Radio(owner)) = session.as_mut() else {
-        return Err(super::wmi_runtime::Error::Failed);
-    };
+    let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     radio.poll_ethernet(&domain).await
 }
@@ -773,23 +861,34 @@ async fn boot_task(
                                             let _=writeln!(narf_console::Writer,"  ath10k: HTT {}.{} with retained packet DMA; station registration pending",ready.major,ready.minor);
                                             let (owner, result) = initialize_radio(owner).await;
                                             let radio = match (&owner, &result) {
-                                                (DriverSession::Radio(radio), Ok(_)) => {
-                                                    Some(radio.radio.clone())
-                                                }
+                                                (DriverSession::Radio(radio), Ok(_)) => Some((
+                                                    radio.radio.clone(),
+                                                    radio.quarantine.clone(),
+                                                )),
                                                 _ => None,
                                             };
+                                            // Publish stage facts before exposing the owner to
+                                            // recover(); an old task must not overwrite a new
+                                            // generation's cleared diagnostics after retirement.
+                                            if let Some(controller) = CONTROLLER.lock().as_mut() {
+                                                match &result {
+                                                    Ok(ready) => {
+                                                        controller.scan_ready = Some(*ready)
+                                                    }
+                                                    Err(error) => {
+                                                        controller.scan_error = Some(*error)
+                                                    }
+                                                }
+                                            }
                                             *SESSION.lock().await = Some(owner);
                                             match result {
                                                 Ok(ready) => {
-                                                    if let Some(controller) =
-                                                        CONTROLLER.lock().as_mut()
-                                                    {
-                                                        controller.scan_ready = Some(ready);
-                                                    }
                                                     let _=writeln!(narf_console::Writer,"  ath10k: retained passive scan vdev with {} receive-only channels; station closed",ready.channels);
-                                                    if let Some(radio) = radio {
-                                                        match super::interface::wait_publish(radio)
-                                                            .await
+                                                    if let Some((radio, quarantine)) = radio {
+                                                        match super::interface::wait_publish(
+                                                            radio, quarantine,
+                                                        )
+                                                        .await
                                                         {
                                                             Ok(_) => {
                                                                 let _ = writeln!(narf_console::Writer,"  ath10k: retained legacy RAW station interface registered, carrier closed");
@@ -801,20 +900,15 @@ async fn boot_task(
                                                     }
                                                 }
                                                 Err(error) => {
-                                                    if let Some(controller) =
-                                                        CONTROLLER.lock().as_mut()
-                                                    {
-                                                        controller.scan_error = Some(error);
-                                                    }
                                                     let _=writeln!(narf_console::Writer,"  ath10k: retained passive scan setup failed: {:?}",error);
                                                 }
                                             }
                                         }
                                         Err(error) => {
-                                            *SESSION.lock().await = Some(owner);
                                             if let Some(controller) = CONTROLLER.lock().as_mut() {
                                                 controller.htt_error = Some(error);
                                             }
+                                            *SESSION.lock().await = Some(owner);
                                             let _ = writeln!(
                                                 narf_console::Writer,
                                                 "  ath10k: retained HTT setup failed: {:?}",
@@ -824,10 +918,10 @@ async fn boot_task(
                                     }
                                 }
                                 Err(error) => {
-                                    *SESSION.lock().await = Some(owner);
                                     if let Some(controller) = CONTROLLER.lock().as_mut() {
                                         controller.wmi_error = Some(error);
                                     }
+                                    *SESSION.lock().await = Some(owner);
                                     let _ = writeln!(
                                         narf_console::Writer,
                                         "  ath10k: retained WMI initialization failed: {:?}",
@@ -837,10 +931,10 @@ async fn boot_task(
                             }
                         }
                         Err(error) => {
-                            *SESSION.lock().await = Some(owner);
                             if let Some(controller) = CONTROLLER.lock().as_mut() {
                                 controller.runtime_error = Some(error);
                             }
+                            *SESSION.lock().await = Some(owner);
                             let _ = writeln!(
                                 narf_console::Writer,
                                 "  ath10k: retained runtime activation failed: {:?}",

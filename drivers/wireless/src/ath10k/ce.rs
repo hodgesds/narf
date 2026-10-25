@@ -247,7 +247,7 @@ pub fn program_dst_ring<M: Ath10kMmio>(mmio: &mut M, cfg: &RingConfig) -> Result
 
 /// Halt a CE pipe so its rings can be re-pointed safely.
 /// `ce.c::ath10k_ce_halt_pipe`: write CE_CMD.HALT, then poll the
-/// halt-status register at offset 0x14 until bit 0 reads 1.
+/// CE_CMD register at offset 0x18 until HALT_STATUS (bit 3) reads 1.
 pub fn halt_pipe<M: Ath10kMmio>(mmio: &mut M, hw_rev: HwRev, pipe: u8) -> Result<(), CeError> {
     let base = hw_rev
         .registers()

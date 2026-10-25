@@ -8,9 +8,9 @@ use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
 type ModelDevice = Device<RadioModel>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE_TEST.lock().clone().ok_or(())?;
-    device.enqueue(bytes, meta)
+    device.enqueue_generation(generation, bytes, meta)
 }
 fn drain() -> bool {
     let device = ACTIVE_TEST.lock().clone();
@@ -58,7 +58,7 @@ impl Harness {
             HwRev::Qca988x
         };
         m.ce = Some(crate::ath10k::boot::CeFixture::new(hardware));
-        let name = narf_net::iface::register("wlan%d", OWN, send);
+        let name = String::from(narf_net::iface::reserve_name("wlan%d"));
         let policy = Arc::new(IrqSafeSpinLock::new(Some(station_tests::policy())));
         let current = policy.clone();
         let device = Arc::new(Device::for_test(
@@ -67,6 +67,7 @@ impl Harness {
             Arc::new(Mutex::new(radio)),
             move || current.lock().clone(),
         ));
+        narf_net::iface::register_with_context(&name, OWN, device.generation_for_test(), send);
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::set_link_state(&name, true); // operator IFF_UP
         narf_net::iface::set_link_metadata(&name, false, None, None);
@@ -190,6 +191,194 @@ impl Drop for Harness {
 fn composition(version: u32, dialect: Dialect, secured: bool) -> Result<(), &'static str> {
     composition_scan(version, dialect, secured, false)
 }
+
+fn smoke_ath10k_recovery_generation_rejects_stale_net_snapshot_and_old_device() -> TestResult {
+    for (version, dialect) in [(1, Dialect::Main), (4, Dialect::Tlv)] {
+        for secured in [false, true] {
+            let old = Harness::new(version, dialect, secured);
+            if let Err(error) = old.join() {
+                return TestResult::Fail(error);
+            }
+            let snapshot = narf_net::iface::lookup(&old.name).unwrap();
+            old.device.retire_host();
+            let new = Harness::new(version, dialect, secured);
+            if let Err(error) = new.join() {
+                return TestResult::Fail(error);
+            }
+            let (uplink, _) = packets();
+            let before = new.model(|model| model.sent.len());
+            if old.name == new.name
+                || old.device.generation_for_test() == new.device.generation_for_test()
+                || snapshot.xmit(&uplink).is_ok()
+                || old
+                    .device
+                    .enqueue(&uplink, narf_net::TxMeta::plain())
+                    .is_ok()
+                || new.model(|model| model.sent.len()) != before
+            {
+                return TestResult::Fail("old interface generation admitted TX into replacement");
+            }
+            // Repeated late old-owner closure must not flap the new carrier.
+            old.device.close_before_lock_for_test();
+            if !new.device.link_up()
+                || !narf_net::iface::lookup(&new.name).unwrap().carrier
+                || narf_net::iface::lookup(&new.name)
+                    .unwrap()
+                    .xmit(&uplink)
+                    .is_err()
+            {
+                return TestResult::Fail("retired owner closed replacement or rejected fresh TX");
+            }
+            new.device.drain();
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_recovery_generation_rejects_stale_net_snapshot_and_old_device
+);
+
+fn retire_model(radio: &Arc<Mutex<radio::Radio<RadioModel>>>) {
+    let mut active = ACTIVE_TEST.lock();
+    let Some(device) = active
+        .as_ref()
+        .filter(|device| Arc::ptr_eq(&device.radio, radio))
+        .cloned()
+    else {
+        return;
+    };
+    *active = None;
+    drop(active);
+    device.retire_host();
+}
+fn smoke_ath10k_recovery_cancelled_mutex_wait_keeps_host_generation_closed() -> TestResult {
+    let h = Harness::new(4, Dialect::Tlv, true);
+    if let Err(error) = h.join() {
+        return TestResult::Fail(error);
+    }
+    let radio = h.device.radio.clone();
+    let held = radio.try_lock().unwrap();
+    let before = held.htt.wmi.htc.transport.sent.len();
+    let quarantine = core::sync::atomic::AtomicBool::new(false);
+    if !drive(crate::ath10k::pci::retire_radio(
+        &radio,
+        &quarantine,
+        || retire_model(&radio),
+    ))
+    .is_pending()
+        || !quarantine.load(core::sync::atomic::Ordering::Acquire)
+        || h.device.link_up()
+        || narf_net::iface::lookup(&h.name).is_some()
+        || held.htt.wmi.htc.transport.sent.len() != before
+        || held
+            .htt
+            .wmi
+            .htc
+            .transport
+            .inner
+            .storage
+            .as_ref()
+            .unwrap()
+            .filled
+            != 1023
+        || held.htt.wmi.htc.transport.inner.inner.retained.is_none()
+    {
+        return TestResult::Fail("cancelled reset wait reopened host or touched/released live DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_recovery_cancelled_mutex_wait_keeps_host_generation_closed
+);
+
+fn smoke_ath10k_recovery_fences_publication_between_first_close_and_radio_lock() -> TestResult {
+    let h = Harness::new(4, Dialect::Tlv, false);
+    if let Err(error) = h.join() {
+        return TestResult::Fail(error);
+    }
+    let radio = h.device.radio.clone();
+    let held = radio.try_lock().unwrap();
+    *ACTIVE_TEST.lock() = None; // Old publication is still behind the Radio lock.
+    let quarantine = core::sync::atomic::AtomicBool::new(false);
+    {
+        let mut future = core::pin::pin!(crate::ath10k::pci::retire_radio(
+            &radio,
+            &quarantine,
+            || retire_model(&radio)
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        if !future.as_mut().poll(&mut cx).is_pending() {
+            return TestResult::Fail("reset did not wait for old publication owner");
+        }
+        *ACTIVE_TEST.lock() = Some(h.device.clone()); // Real old Device becomes visible.
+        drop(held);
+        if !matches!(drive(future.as_mut()), Poll::Ready(_)) {
+            return TestResult::Fail("reset did not acquire released old publication owner");
+        }
+    }
+    let (uplink, _) = packets();
+    if !quarantine.load(core::sync::atomic::Ordering::Acquire)
+        || ACTIVE_TEST.lock().is_some()
+        || h.device.link_up()
+        || narf_net::iface::lookup(&h.name).is_some()
+        || h.device.enqueue(&uplink, narf_net::TxMeta::plain()).is_ok()
+        || radio.try_lock().unwrap().station_link().is_some()
+    {
+        return TestResult::Fail("late old publication escaped second under-lock retirement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_recovery_fences_publication_between_first_close_and_radio_lock
+);
+fn smoke_ath10k_recovery_cancelled_missing_publication_cannot_publish_late() -> TestResult {
+    let h = Harness::new(4, Dialect::Tlv, false);
+    let radio = h.device.radio.clone();
+    let held = radio.try_lock().unwrap();
+    if held.station_publishable().is_err() {
+        return TestResult::Fail("late-publication fixture was not otherwise publishable");
+    }
+    *ACTIVE_TEST.lock() = None;
+    narf_net::iface::unregister(&h.name);
+    let quarantine = core::sync::atomic::AtomicBool::new(false);
+    if !drive(crate::ath10k::pci::retire_radio(
+        &radio,
+        &quarantine,
+        || retire_model(&radio),
+    ))
+    .is_pending()
+    {
+        return TestResult::Fail("late-publication cancellation fixture did not suspend");
+    }
+    // The actual production publication gate runs under ACTIVE, before any
+    // registration writes. The owner remains publishable while its mutex is
+    // held, so only the persistent retirement token may block this transaction.
+    let mut active = ACTIVE_TEST.lock();
+    let result = crate::ath10k::interface::admit_generation(&quarantine, || {
+        narf_net::iface::register_with_context(&h.name, OWN, h.device.generation_for_test(), send);
+        *active = Some(h.device.clone());
+        Ok(())
+    });
+    if result != Err(radio::Error::Failed)
+        || active.is_some()
+        || narf_net::iface::lookup(&h.name).is_some()
+        || held.station_publishable().is_err()
+        || held.htt.wmi.htc.transport.inner.inner.retained.is_none()
+    {
+        return TestResult::Fail(
+            "cancelled reset missed initial ACTIVE and allowed old publication",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_recovery_cancelled_missing_publication_cannot_publish_late
+);
+
 fn composition_scan(
     version: u32,
     dialect: Dialect,
