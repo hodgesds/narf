@@ -508,10 +508,15 @@ kernel_test_in!(
 );
 
 /// Invalidation by truncate: WILLNEED 32 pages, shrink the file to 8
-/// pages, re-extend it, then fault at page 20. The record is gone
-/// (truncate drops the file's batches), so the fault takes the window
-/// path: its window installs — clamped to the regrown size — and the
-/// truncated range serves zeros, never the pre-truncate bytes.
+/// pages, re-extend it, then fault at page 20 of a fresh mapping. The
+/// record is gone (truncate drops the file's batches wholesale), so
+/// the fault takes the window path: its window installs and reads
+/// exactly its own sectors, and the truncated range serves zeros,
+/// never the pre-truncate bytes. The fault runs on a fresh mapping
+/// because the in-tree truncate primitive revokes the tail VMA
+/// outright (the #678 semantics, shared with ext2): the original
+/// mapping's tail does not fault back in place even after the file
+/// regrows — which this test also pins.
 fn smoke_batch_restore_truncate_drops_record() -> TestResult {
     let bytes = content(0xB9, 32 * PAGE as usize);
     with_fat_file(&bytes, |fx| {
@@ -525,22 +530,31 @@ fn smoke_batch_restore_truncate_drops_record() -> TestResult {
         if ftruncate(fx.fd, 32 * PAGE) != Some(0) {
             return Err("re-extending ftruncate failed");
         }
-        // Window fallback, exactly as if no advise had ever happened:
-        // faulting page 20 installs its aligned window (16..32),
-        // reading each of its sectors once, and nothing before it.
+        // The truncate revoked the original mapping's tail outright,
+        // and re-extending the file does not remap it.
+        if mapped_frame(&fx.aspace, base + 20 * PAGE).is_some() {
+            return Err("re-extending the file remapped the truncated tail");
+        }
+        // Window fallback on a fresh mapping, exactly as if no advise
+        // had ever happened: faulting page 20 installs its aligned
+        // window (16..32), reading each of its sectors once, and
+        // nothing before it. (The truncate's generation bumps evicted
+        // the advise's cached folios past the shrink point, so the
+        // window fill really does reach the device.)
+        let base2 = map_shared(fx.fd, 32 * PAGE)?;
         let before = fx.data_blocks_read();
-        fault(&fx.aspace, base + 20 * PAGE)?;
+        fault(&fx.aspace, base2 + 20 * PAGE)?;
         if fx.data_blocks_read() != before + WINDOW_PAGES * PAGE_SECTORS {
             return Err("the post-truncate fault did not read exactly its window's sectors");
         }
         for index in 0..WINDOW_PAGES {
-            assert_unbacked(&fx.aspace, base, index)?;
+            assert_unbacked(&fx.aspace, base2, index)?;
         }
         for index in WINDOW_PAGES..32 {
-            assert_backed(&fx.aspace, base, index)?;
+            assert_backed(&fx.aspace, base2, index)?;
         }
         // The truncated range reads as zeros after re-extension.
-        let tail = mapped_bytes(&fx.aspace, base + 20 * PAGE, PAGE as usize)?;
+        let tail = mapped_bytes(&fx.aspace, base2 + 20 * PAGE, PAGE as usize)?;
         if tail.iter().any(|&b| b != 0) {
             return Err("the re-extended range resurrected pre-truncate bytes");
         }
