@@ -68,6 +68,13 @@ pub fn register_initcalls() {
         cdc_ncm::register_initcalls();
         InitResult::Ok
     });
+    // MSC binds through the attach cascade, not the class registry;
+    // this registration exists so the registry's unbind dispatch
+    // (detach path) can reach msc::detach_msc.
+    narf_init::register(Stage::Subsys, "usb-msc", || {
+        msc::register_initcalls();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "usb-xpad", || {
         xpad::register_initcalls();
         InitResult::Ok

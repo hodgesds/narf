@@ -406,6 +406,213 @@ fn smoke_msc_attach_via_xhci_qemu() -> TestResult {
 }
 kernel_test_in!("drivers/usb/msc", smoke_msc_attach_via_xhci_qemu);
 
+// ── MSC detach / replug publication ────────────────────────────────
+
+/// Minimal `BlockDeviceSync` standing in for a scanned partition
+/// child of a synthetic MSC disk (the real scanner cannot run
+/// against a fabricated device — it would issue BOT traffic).
+struct DummyPartition;
+impl narf_block::BlockDeviceSync for DummyPartition {
+    fn lba_size(&self) -> u32 {
+        512
+    }
+    fn capacity(&self) -> u64 {
+        1024
+    }
+    fn read(&self, _lba: u64, _n: u16, out: &mut [u8]) -> Result<(), narf_block::BlockIoError> {
+        out.fill(0);
+        Ok(())
+    }
+    fn write(&self, _lba: u64, _n: u16, _data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        Ok(())
+    }
+}
+
+/// The publication half of the USB detach lifecycle for MSC:
+/// bind publishes `usb-msc{idx}` (+ a partition child), the
+/// class-registry unbind dispatch tombstones the device and
+/// unregisters disk + partitions, and a replug on the same slot
+/// reuses the tombstoned index so the same name republishes.
+/// Runs without hardware via `msc::__insert_msc_for_test`.
+fn smoke_msc_detach_replug_publication() -> TestResult {
+    use crate::{class_registry, msc};
+    use alloc::sync::Arc;
+
+    msc::__reset_msc_for_test();
+    // Ensure the detach hook is in the class registry. A full boot
+    // registers it from the Stage::Subsys initcall; registering
+    // here too keeps the smoke independent of initcall order (a
+    // duplicate entry would only double-dispatch the detach, which
+    // is idempotent).
+    msc::register_initcalls();
+
+    // Slot 200: no real enumeration reaches it in the test kernel.
+    let idx = msc::__insert_msc_for_test(200);
+    let disk = alloc::format!("usb-msc{}", idx);
+    if msc::with_device(idx, |d| d.slot_id) != Some(200) {
+        return TestResult::Fail("synthetic MSC device not in registry");
+    }
+    if msc::attached_msc_count() != 1 {
+        return TestResult::Fail("attached count wrong after bind");
+    }
+    if narf_block::find_block_device(&disk).is_none() {
+        return TestResult::Fail("usb-msc disk not published after bind");
+    }
+    let child: &'static str =
+        alloc::boxed::Box::leak(alloc::format!("{}p1", disk).into_boxed_str());
+    narf_block::register_partition_device(
+        child,
+        &disk,
+        Arc::new(DummyPartition) as Arc<dyn narf_block::BlockDeviceSync>,
+        None,
+    );
+    if narf_block::find_block_device(child).is_none() {
+        return TestResult::Fail("partition child not published");
+    }
+
+    // Detach through the registry's unbind dispatch — the same
+    // entry the supervisor's detach path calls.
+    class_registry::dispatch_unbind(200);
+    if msc::with_device(idx, |d| d.slot_id).is_some() {
+        return TestResult::Fail("MSC entry not tombstoned after detach");
+    }
+    if msc::attached_msc_count() != 0 {
+        return TestResult::Fail("attached count nonzero after detach");
+    }
+    if narf_block::find_block_device(&disk).is_some() {
+        return TestResult::Fail("usb-msc disk still published after detach");
+    }
+    if narf_block::find_block_device(child).is_some() {
+        return TestResult::Fail("partition child still published after detach");
+    }
+    // Detach is idempotent, including for a never-bound slot.
+    msc::detach_msc(200);
+    msc::detach_msc(201);
+
+    // Replug: tombstone reuse republishes under the same name.
+    let idx2 = msc::__insert_msc_for_test(200);
+    if idx2 != idx {
+        return TestResult::Fail("replug did not reuse the tombstoned index");
+    }
+    if narf_block::find_block_device(&disk).is_none() {
+        return TestResult::Fail("usb-msc disk not republished after replug");
+    }
+    if msc::attached_msc_count() != 1 {
+        return TestResult::Fail("attached count wrong after replug");
+    }
+
+    // Clean up so later smokes see an empty MSC registry.
+    msc::detach_msc(200);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_detach_replug_publication);
+
+/// Finding A pin (queue 16 second-pass review): a held block
+/// adapter must never be silently retargeted at the next disk.
+/// Filesystems retain the `UsbMscBlockDevice` for the mount's
+/// whole life; the adapter re-resolves its target from
+/// `MSC_DEVICES[idx]` on every op, and `insert_device` reuses the
+/// first tombstone by design — so without a bind-identity check,
+/// unplug A / plug B serves A's mounted filesystem from B. The
+/// bind-generation gate is that check: stale adapters fail
+/// `DeviceRemoved`, including after the *same* disk rebinds (a
+/// rebind is a new bind with a new generation).
+fn smoke_msc_stale_adapter_generation_gate() -> TestResult {
+    use crate::msc::{self, UsbMscBlockDevice};
+    use narf_block::{BlockDeviceSync, BlockIoError};
+
+    msc::__reset_msc_for_test();
+
+    // Bind disk A (slot 202) and retain its adapter, the way a
+    // mounted filesystem retains it across detach/replug.
+    let idx = msc::__insert_msc_for_test(202);
+    let Some(stale) = UsbMscBlockDevice::from_index(idx) else {
+        return TestResult::Fail("adapter for freshly bound disk missing");
+    };
+    let mut buf = [0u8; 512];
+    let data = [0xA5u8; 512];
+
+    // Unplug A: the tombstone alone already fails the held adapter.
+    msc::detach_msc(202);
+    if stale.read(0, 1, &mut buf) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("held adapter read not DeviceRemoved while tombstoned");
+    }
+    if stale.write(0, 1, &data) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("held adapter write not DeviceRemoved while tombstoned");
+    }
+    if stale.flush() != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("held adapter flush not DeviceRemoved while tombstoned");
+    }
+    if stale.write_fua(0, 1, &data) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("held adapter FUA write not DeviceRemoved while tombstoned");
+    }
+
+    // Plug in a different disk B (slot 203): tombstone reuse lands
+    // it on the same index. The held adapter must NOT be served
+    // by B — this is the retargeting the generation gate exists
+    // to prevent.
+    let idx_b = msc::__insert_msc_for_test(203);
+    if idx_b != idx {
+        return TestResult::Fail("replug did not reuse the tombstoned index");
+    }
+    let Some(fresh) = UsbMscBlockDevice::from_index(idx) else {
+        return TestResult::Fail("adapter for replugged disk missing");
+    };
+    if stale.read(0, 1, &mut buf) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("stale adapter read silently served by replugged disk");
+    }
+    if stale.write(0, 1, &data) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("stale adapter write silently served by replugged disk");
+    }
+    if stale.flush() != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("stale adapter flush silently served by replugged disk");
+    }
+    if stale.write_fua(0, 1, &data) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("stale adapter FUA write silently served by replugged disk");
+    }
+
+    // B's own adapter is generation-current, so it must get PAST
+    // the identity gate. With a live controller (the harness's
+    // qemu-xhci) its ops fail in the transfer layer against the
+    // fabricated slot — DriverError, never DeviceRemoved. Without
+    // a controller the environment cannot distinguish the two, so
+    // this half is conditioned on one being present.
+    if crate::xhci::controller().is_some() {
+        if fresh.read(0, 1, &mut buf) != Err(BlockIoError::DriverError) {
+            return TestResult::Fail("fresh adapter read did not pass the generation gate");
+        }
+        if fresh.write(0, 1, &data) != Err(BlockIoError::DriverError) {
+            return TestResult::Fail("fresh adapter write did not pass the generation gate");
+        }
+        if fresh.flush() != Err(BlockIoError::DriverError) {
+            return TestResult::Fail("fresh adapter flush did not pass the generation gate");
+        }
+        if fresh.write_fua(0, 1, &data) != Err(BlockIoError::DriverError) {
+            return TestResult::Fail("fresh adapter FUA write did not pass the generation gate");
+        }
+    }
+
+    // Same disk out and back in (A returns on slot 202): a rebind
+    // is a new bind with a new generation, so NEITHER held adapter
+    // is resurrected — B's adapter is stale by generation too.
+    msc::detach_msc(203);
+    let idx_a2 = msc::__insert_msc_for_test(202);
+    if idx_a2 != idx {
+        return TestResult::Fail("same-disk replug did not reuse the tombstoned index");
+    }
+    if stale.read(0, 1, &mut buf) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("original adapter resurrected by same-disk rebind");
+    }
+    if fresh.read(0, 1, &mut buf) != Err(BlockIoError::DeviceRemoved) {
+        return TestResult::Fail("previous occupant's adapter not stale after rebind");
+    }
+
+    // Clean up so later smokes see an empty MSC registry.
+    msc::detach_msc(202);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_stale_adapter_generation_gate);
+
 // ── MSC BBB protocol codec unit tests ──────────────────────────────
 
 /// CBW encode round-trip: encode a READ(10) CBW and verify every
