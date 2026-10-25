@@ -11,8 +11,10 @@
 //! `fs/minix/{namei.c,bitmap.c,inode.c}`. The on-disk format is
 //! identical to mkfs.minix's V3 output (see `tests::build_minix3_image`).
 //!
-//! Per-node we hold the inode number and a copy of the decoded
-//! inode (cached at lookup time so `stat` is synchronous).
+//! Per-node we hold the inode number and a handle to the volume's
+//! shared inode cell for it (one cached decode per inode number,
+//! shared by every open, so `stat` is synchronous and a mutation
+//! through one open is visible to all the others).
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -21,7 +23,6 @@ use alloc::vec::Vec;
 
 use narf_block::BlockDevice;
 use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
-use narf_lib::sync::IrqSafeSpinLock;
 
 use super::dir::{clear_entry, find_entry, DirEntry as MxDirEntry};
 use super::inode::{mode, Inode};
@@ -31,11 +32,16 @@ use super::volume::MinixVolume;
 pub struct MinixNode<B: BlockDevice> {
     pub volume: Arc<MinixVolume<B>>,
     pub ino: u32,
-    /// Cached inode. `None` initially when the node was constructed
-    /// without a fresh decode (e.g. the volume root); the first
-    /// async op fills it. After that it's never invalidated — this
-    /// is a read-only driver.
-    inode: IrqSafeSpinLock<Option<Inode>>,
+    /// The volume's shared cell holding this inode's cached decode
+    /// (see `MinixVolume::inode_cell`). Every node minted for the
+    /// same inode reads and publishes through the one cell, so a
+    /// write or truncate through any open is what every other open
+    /// observes. (The per-node private copy this replaces was never
+    /// revalidated, so cross-open size changes were invisible —
+    /// #962.) The cell starts empty for a node constructed without
+    /// a fresh decode (e.g. the volume root); the first async op
+    /// fills it.
+    inode: Arc<crate::volume::InodeCell>,
     /// This inode's volume-anchored `MAP_SHARED` identity, resolved
     /// once from the volume's anchor table (see
     /// `MinixVolume::mmap_anchor`). Every node minted for the same
@@ -45,30 +51,38 @@ pub struct MinixNode<B: BlockDevice> {
 
 impl<B: BlockDevice + 'static> MinixNode<B> {
     pub fn new(volume: Arc<MinixVolume<B>>, ino: u32) -> Self {
+        let inode = volume.inode_cell(ino);
         Self {
             volume,
             ino,
-            inode: IrqSafeSpinLock::new(None),
+            inode,
             mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
 
-    pub fn new_with_inode(volume: Arc<MinixVolume<B>>, ino: u32, inode: Inode) -> Self {
+    pub fn new_with_inode(volume: Arc<MinixVolume<B>>, ino: u32, decoded: Inode) -> Self {
+        // The decode seeds the shared cell only if it is empty; a
+        // cell another open already filled holds the current state
+        // and wins over a decode made moments ago (see
+        // `InodeCell::seed`).
+        let inode = volume.inode_cell_seeded(ino, decoded);
         Self {
             volume,
             ino,
-            inode: IrqSafeSpinLock::new(Some(inode)),
+            inode,
             mmap_anchor: narf_lib::sync::OnceLock::new(),
         }
     }
 
-    /// Get a copy of the inode, lazily reading it if needed.
+    /// Get a copy of the inode, lazily reading it if needed. The
+    /// lazy fill publishes into the shared cell, so whichever open
+    /// reads first populates it for all of them.
     async fn ensure_inode(&self) -> Result<Inode, FsError> {
-        if let Some(i) = *self.inode.lock() {
+        if let Some(i) = self.inode.get() {
             return Ok(i);
         }
         let i = self.volume.read_inode(self.ino).await?;
-        *self.inode.lock() = Some(i);
+        self.inode.store(i);
         Ok(i)
     }
 
@@ -98,7 +112,7 @@ impl<B: BlockDevice + 'static> MinixNode<B> {
     /// node except a not-yet-read one carries its inode; an uncached node
     /// reports device only and the stat path falls back to `Stat`.
     fn attrs(&self) -> narf_filesystem::InodeAttrs {
-        let inode = *self.inode.lock();
+        let inode = self.inode.get();
         narf_filesystem::InodeAttrs {
             dev: self.volume.dev,
             atime_ns: inode.map_or(0, |i| i.atime_ns()),
@@ -179,7 +193,7 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
     /// every file on the volume, so `ls -l` showed one owner and a
     /// permission check against the real one could never succeed.
     fn owners(&self) -> (u32, u32) {
-        match *self.inode.lock() {
+        match self.inode.get() {
             Some(inode) => (u32::from(inode.uid), u32::from(inode.gid)),
             // Not read yet: the stat path reads the inode first, so this is
             // only reachable for a node nothing has looked at.
@@ -225,7 +239,7 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
             self.volume.bump_cache_generation(self.ino);
             let n = self.volume.write_file(&mut inode, offset, buf).await?;
             self.volume.write_inode(self.ino, &inode).await?;
-            *self.inode.lock() = Some(inode);
+            self.inode.store(inode);
             Ok(n)
         })
     }
@@ -233,7 +247,7 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
     fn stat(&self) -> Stat {
         // If we don't have a cached inode, return a placeholder.
         // The async stat returns the real value.
-        match *self.inode.lock() {
+        match self.inode.get() {
             Some(i) => self.stat_for(&i),
             None => Stat {
                 size: 0,
@@ -266,9 +280,9 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
                 // of faulting SIGBUS.
                 let mut published = inode;
                 published.size = len as u32;
-                *self.inode.lock() = Some(published);
+                self.inode.store(published);
                 if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
-                    *self.inode.lock() = Some(inode);
+                    self.inode.store(inode);
                     return Err(error);
                 }
             }
@@ -304,7 +318,7 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
                 inode.size = len as u32;
             }
             self.volume.write_inode(self.ino, &inode).await?;
-            *self.inode.lock() = Some(inode);
+            self.inode.store(inode);
             Ok(())
         })
     }
@@ -319,7 +333,7 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
     /// whose inode was never read, and any non-regular file, stays
     /// on the conservative `None` behaviour.
     fn mmap_cache_generation(&self) -> Option<u64> {
-        match *self.inode.lock() {
+        match self.inode.get() {
             Some(inode) if inode.is_reg() => Some(self.volume.cache_generation(self.ino)),
             _ => None,
         }
@@ -342,7 +356,7 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
 impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
     /// The directory's own on-disk mode, not the VFS's fixed 0755.
     fn dir_mode(&self) -> u16 {
-        match *self.inode.lock() {
+        match self.inode.get() {
             Some(inode) => inode.mode & 0o777,
             None => 0o755,
         }
@@ -350,7 +364,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
 
     /// As [`FileOps::owners`]: the on-disk ids.
     fn dir_owners(&self) -> (u32, u32) {
-        match *self.inode.lock() {
+        match self.inode.get() {
             Some(inode) => (u32::from(inode.uid), u32::from(inode.gid)),
             None => (0, 0),
         }
@@ -369,7 +383,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
     /// The directory's on-disk `i_mtime` (V1: `i_time`), whole seconds.
     /// Without it every MINIX directory stat'd as the epoch.
     fn dir_mtime_ns(&self) -> u64 {
-        self.inode.lock().map_or(0, |i| i.mtime_ns())
+        self.inode.get().map_or(0, |i| i.mtime_ns())
     }
 
     fn dcache_identity(&self) -> (usize, u64, u64) {
@@ -499,7 +513,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             self.append_dir_entry(&mut dir_inode, &mut bytes, new_ino as u16, name)
                 .await?;
             self.volume.write_inode(self.ino, &dir_inode).await?;
-            *self.inode.lock() = Some(dir_inode);
+            self.inode.store(dir_inode);
             Ok(Arc::new(MinixNode::new_with_inode(
                 self.volume.clone(),
                 new_ino,
@@ -551,7 +565,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
                 .await?;
             dir_inode.nlinks = dir_inode.nlinks.saturating_add(1);
             self.volume.write_inode(self.ino, &dir_inode).await?;
-            *self.inode.lock() = Some(dir_inode);
+            self.inode.store(dir_inode);
             Ok(Arc::new(MinixNode::new_with_inode(
                 self.volume.clone(),
                 new_ino,
@@ -593,7 +607,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             // Rewrite the directory body up to its original size.
             self.volume.write_file(&mut dir_inode, 0, &bytes).await?;
             self.volume.write_inode(self.ino, &dir_inode).await?;
-            *self.inode.lock() = Some(dir_inode);
+            self.inode.store(dir_inode);
             Ok(())
         })
     }
@@ -629,7 +643,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             self.volume.write_file(&mut dir_inode, 0, &bytes).await?;
             dir_inode.nlinks = dir_inode.nlinks.saturating_sub(1);
             self.volume.write_inode(self.ino, &dir_inode).await?;
-            *self.inode.lock() = Some(dir_inode);
+            self.inode.store(dir_inode);
             Ok(())
         })
     }
@@ -658,7 +672,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             self.append_dir_entry(&mut dir_inode, &mut bytes, new_ino as u16, name)
                 .await?;
             self.volume.write_inode(self.ino, &dir_inode).await?;
-            *self.inode.lock() = Some(dir_inode);
+            self.inode.store(dir_inode);
             Ok(Arc::new(MinixNode::new_with_inode(
                 self.volume.clone(),
                 new_ino,
@@ -702,7 +716,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             new_entry.encode(self.volume.sb.name_len, &mut bytes, old_off);
             self.volume.write_file(&mut dir_inode, 0, &bytes).await?;
             self.volume.write_inode(self.ino, &dir_inode).await?;
-            *self.inode.lock() = Some(dir_inode);
+            self.inode.store(dir_inode);
             Ok(())
         })
     }

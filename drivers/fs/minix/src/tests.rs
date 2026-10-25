@@ -1561,3 +1561,183 @@ fn smoke_minix_truncate_shrink_regrow_v1() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/minix", smoke_minix_truncate_shrink_regrow_v1);
+
+// ── Cross-open inode coherence (#962) ─────────────────────────────
+//
+// Every lookup mints a fresh `MinixNode`. Before the fix each node
+// held a private decode of the inode that was never revalidated, so
+// a size change through one open was invisible to every other open:
+// reads through the second node clamped to the stale size, `stat`
+// reported it, and a stale node could read (or write back) past a
+// shrink another open had performed. The nodes now share one inode
+// cell per (volume, ino) on the volume, so there is a single copy
+// to keep current. Each test below mints BOTH nodes before the
+// mutation — minting the second node afterwards would decode the
+// post-mutation inode from disk and mask the defect — and every
+// assertion keys on the second node's view.
+
+fn smoke_minix_cross_open_truncate_grow_visible() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image(&[b'x'; 100]);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let a = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup A failed"),
+    };
+    let b = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup B failed"),
+    };
+    // Grow through A only: 100 bytes → 3 zones (zone = block = 1024).
+    if poll_once(a.truncate(3072)).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("truncate grow through A failed");
+    }
+    // B's stat must report the grown size.
+    let stat = match poll_once(b.stat_async()) {
+        Some(Ok(s)) => s,
+        _ => return TestResult::Fail("stat through B failed"),
+    };
+    if stat.size != 3072 {
+        return TestResult::Fail("B's stat reports the pre-grow size");
+    }
+    // B must read the grown tail as zeros — a full zone at offset
+    // 2048, not the short read a stale size=100 snapshot produces.
+    let mut tail = [0xAAu8; 1024];
+    let n = match poll_once(b.read(2048, &mut tail)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read of grown tail through B failed"),
+    };
+    if n != 1024 || tail.iter().any(|&c| c != 0) {
+        return TestResult::Fail("B's read of the grown tail was short or non-zero");
+    }
+    // And the seeded prefix must still read through B, zero-filled
+    // up to the zone end.
+    let mut head = [0xAAu8; 128];
+    let n = match poll_once(b.read(0, &mut head)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read of head through B failed"),
+    };
+    if n != 128 || head[..100].iter().any(|&c| c != b'x') || head[100..].iter().any(|&c| c != 0) {
+        return TestResult::Fail("B's read of the seeded prefix is wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_cross_open_truncate_grow_visible
+);
+
+fn smoke_minix_cross_open_truncate_shrink_clamps() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image(&[b'y'; 600]);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let a = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup A failed"),
+    };
+    let b = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup B failed"),
+    };
+    // Shrink through A only: 600 → 100.
+    if poll_once(a.truncate(100)).and_then(|r| r.ok()).is_none() {
+        return TestResult::Fail("truncate shrink through A failed");
+    }
+    let stat = match poll_once(b.stat_async()) {
+        Some(Ok(s)) => s,
+        _ => return TestResult::Fail("stat through B failed"),
+    };
+    if stat.size != 100 {
+        return TestResult::Fail("B's stat reports the pre-shrink size");
+    }
+    // B's read must clamp at the new EOF: exactly 100 bytes, and a
+    // read starting at the new EOF returns 0 — a stale snapshot
+    // would serve the 500 bytes past it that are still on disk.
+    let mut buf = [0u8; 600];
+    let n = match poll_once(b.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read through B failed"),
+    };
+    if n != 100 || buf[..100].iter().any(|&c| c != b'y') {
+        return TestResult::Fail("B's read was not clamped at the shrunken EOF");
+    }
+    let mut past = [0u8; 16];
+    let n = match poll_once(b.read(100, &mut past)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("past-EOF read through B failed"),
+    };
+    if n != 0 {
+        return TestResult::Fail("B read past the shrunken EOF");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_cross_open_truncate_shrink_clamps
+);
+
+fn smoke_minix_cross_open_write_visible() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image(b"hello minix\n");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let a = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup A failed"),
+    };
+    let b = match poll_once(root.lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup B failed"),
+    };
+    // Extending write through A only: 12 → 21 bytes.
+    let ext = b" and more";
+    if poll_once(a.write(12, ext)).and_then(|r| r.ok()) != Some(ext.len()) {
+        return TestResult::Fail("extending write through A failed");
+    }
+    let stat = match poll_once(b.stat_async()) {
+        Some(Ok(s)) => s,
+        _ => return TestResult::Fail("stat through B failed"),
+    };
+    if stat.size != 21 {
+        return TestResult::Fail("B's stat reports the pre-write size");
+    }
+    let mut buf = [0u8; 32];
+    let n = match poll_once(b.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read through B failed"),
+    };
+    if n != 21 || &buf[..n] != b"hello minix\n and more" {
+        return TestResult::Fail("B did not read the bytes A wrote");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_cross_open_write_visible);

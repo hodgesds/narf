@@ -100,6 +100,17 @@ pub struct MinixVolume<B: BlockDevice> {
     /// distinguish file instances even if an anchor address is
     /// recycled).
     mmap_anchors: IrqSafeSpinLock<BTreeMap<u64, Weak<MmapAnchor>>>,
+    /// The one cached inode decode per inode number, shared by
+    /// every node of the inode (see [`InodeCell`]). Nodes are
+    /// minted per lookup, so the decode cannot live on the node:
+    /// two opens of one file are two objects, and a size change
+    /// through one must be visible to the other — a per-node copy
+    /// is never revalidated and goes stale the moment another
+    /// open writes or truncates (#962). Weak, like the anchors:
+    /// an inode no open references gives its cell up, and
+    /// `free_inode` drops the entry outright so a recycled inode
+    /// number mints a fresh cell for its new tenant.
+    inode_cells: IrqSafeSpinLock<BTreeMap<u64, Weak<InodeCell>>>,
 }
 
 /// Content-generation counters for one volume. Values are NOT
@@ -150,6 +161,60 @@ pub struct MmapAnchor {
     /// The inode number this anchor identifies. Carried for debug
     /// identity only; the anchor's address is the identity.
     _ino: u64,
+}
+
+/// One minix inode's cached decode, shared by every node of the
+/// inode. Where [`MmapAnchor`] shares *identity*, this shares the
+/// *metadata*: there is exactly one in-memory copy of the inode per
+/// inode number, so a mutation published through any open — or
+/// through `MinixVolume::write_inode` directly — is the copy every
+/// other open reads. Coherence by construction rather than by
+/// invalidation: no per-node snapshot exists that could go stale.
+///
+/// The lock is held only synchronously to copy the `Copy` inode in
+/// or out, never across an await — the same discipline the per-node
+/// cache this replaces used.
+#[derive(Debug)]
+pub struct InodeCell {
+    inode: IrqSafeSpinLock<Option<super::inode::Inode>>,
+}
+
+impl InodeCell {
+    fn new() -> Self {
+        Self {
+            inode: IrqSafeSpinLock::new(None),
+        }
+    }
+
+    fn seeded(inode: super::inode::Inode) -> Self {
+        Self {
+            inode: IrqSafeSpinLock::new(Some(inode)),
+        }
+    }
+
+    /// The cached decode, if any node (or `write_inode`) has
+    /// published one yet.
+    pub fn get(&self) -> Option<super::inode::Inode> {
+        *self.inode.lock()
+    }
+
+    /// Publish `inode` as the inode's current decode.
+    pub fn store(&self, inode: super::inode::Inode) {
+        *self.inode.lock() = Some(inode);
+    }
+
+    /// Fill the cell from a fresh decode, unless another node
+    /// already published one. Used when a node is minted carrying
+    /// a decode: the cell's existing contents, when present, are
+    /// at least as current (every mutation publishes through
+    /// `write_inode` before it completes), so the decode a lookup
+    /// just made is only a seed for an empty cell.
+    fn seed(&self, inode: super::inode::Inode) {
+        let mut slot = self.inode.lock();
+        if slot.is_none() {
+            *slot = Some(inode);
+        }
+    }
 }
 
 impl<B: BlockDevice + 'static> MinixVolume<B> {
@@ -209,6 +274,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             root_inode: IrqSafeSpinLock::new(None),
             cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
             mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
+            inode_cells: IrqSafeSpinLock::new(BTreeMap::new()),
         });
         let root = volume.read_inode(super::MINIX_ROOT_INO).await?;
         *volume.root_inode.lock() = Some(root);
@@ -261,6 +327,52 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         let anchor = Arc::new(MmapAnchor { _ino: key });
         anchors.insert(key, Arc::downgrade(&anchor));
         anchor
+    }
+
+    /// The live [`InodeCell`] for inode `ino`, created empty on
+    /// first use. Dead entries are pruned as the table grows (same
+    /// cadence as [`MinixVolume::mmap_anchor`]).
+    pub fn inode_cell(&self, ino: u32) -> Arc<InodeCell> {
+        let key = u64::from(ino);
+        let mut cells = self.inode_cells.lock();
+        if let Some(cell) = cells.get(&key).and_then(Weak::upgrade) {
+            return cell;
+        }
+        if cells.len() >= 256 && cells.len().is_power_of_two() {
+            cells.retain(|_, cell| cell.strong_count() != 0);
+        }
+        let cell = Arc::new(InodeCell::new());
+        cells.insert(key, Arc::downgrade(&cell));
+        cell
+    }
+
+    /// The live [`InodeCell`] for inode `ino`, seeded with `inode`
+    /// when the cell is newly created or still empty. A cell that
+    /// already holds a decode keeps it — see [`InodeCell::seed`].
+    pub fn inode_cell_seeded(&self, ino: u32, inode: super::inode::Inode) -> Arc<InodeCell> {
+        let key = u64::from(ino);
+        let mut cells = self.inode_cells.lock();
+        if let Some(cell) = cells.get(&key).and_then(Weak::upgrade) {
+            drop(cells);
+            cell.seed(inode);
+            return cell;
+        }
+        if cells.len() >= 256 && cells.len().is_power_of_two() {
+            cells.retain(|_, cell| cell.strong_count() != 0);
+        }
+        let cell = Arc::new(InodeCell::seeded(inode));
+        cells.insert(key, Arc::downgrade(&cell));
+        cell
+    }
+
+    /// The live [`InodeCell`] for inode `ino`, if one exists —
+    /// never creates one. For publishers (write_inode, free_inode)
+    /// that must not mint state for an inode nobody holds open.
+    fn live_inode_cell(&self, ino: u32) -> Option<Arc<InodeCell>> {
+        self.inode_cells
+            .lock()
+            .get(&u64::from(ino))
+            .and_then(Weak::upgrade)
     }
 
     /// Read one device sector (LBS bytes) into `dst`. `dst.len()`
@@ -597,6 +709,13 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         if ino == super::MINIX_ROOT_INO {
             *self.root_inode.lock() = Some(*inode);
         }
+        // Publish into the shared cell, so every open of this inode
+        // reads the decode just persisted — including writes that
+        // bypass the inode's own node (unlink/rmdir publish the
+        // victim's decremented link count through here).
+        if let Some(cell) = self.live_inode_cell(ino) {
+            cell.store(*inode);
+        }
         Ok(())
     }
 
@@ -684,7 +803,15 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
     pub async fn free_inode(&self, ino: u32) -> Result<(), FsError> {
         let imap_start = self.sb.imap_first_block();
         let n = self.sb.imap_blocks;
-        self.free_bitmap_bit(imap_start, n, ino).await
+        self.free_bitmap_bit(imap_start, n, ino).await?;
+        // The number is free now: drop its cell entry so the next
+        // tenant of the number mints a fresh cell instead of
+        // inheriting this file's decode. Nodes still holding the
+        // freed inode open keep their Arc to the old cell — their
+        // unlinked file keeps its last published state, exactly the
+        // snapshot semantics an open of a deleted file has today.
+        self.inode_cells.lock().remove(&u64::from(ino));
+        Ok(())
     }
 
     /// Allocate a fresh zone. Returns the absolute zone number.
