@@ -4734,3 +4734,25 @@ kernel_test_in!(
     "scheduler",
     smoke_sync_wake_affine_requires_an_empty_local_queue
 );
+
+fn smoke_scheduler_waker_identity_survives_clone() -> TestResult {
+    use alloc::sync::Arc;
+
+    let cell = crate::new_wake_cell(crate::TaskId::NONE, 0, false);
+    let original = crate::make_waker(cell.clone());
+    let cloned = original.clone();
+    let second = crate::make_waker(cell.clone());
+    for waker in [&original, &cloned, &second] {
+        if !crate::scheduler_wake_cell(waker).is_some_and(|owner| Arc::ptr_eq(&owner, &cell)) {
+            return TestResult::Fail("scheduler waker lost its vtable identity");
+        }
+    }
+    if crate::scheduler_wake_cell(core::task::Waker::noop()).is_some() {
+        return TestResult::Fail("foreign waker accepted as a scheduler WakeCell");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_waker_identity_survives_clone
+);

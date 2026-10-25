@@ -4255,7 +4255,10 @@ fn settle_donation(slot: &mut TaskSlot) {
 // future is free to stash its waker (as IRQ-driven drivers will want
 // to) and have it outlive the original `TaskSlot` view.
 
-const TASK_VTABLE: RawWakerVTable =
+// Waker identity is used before downcasting its data to WakeCell. A static
+// provides one address; const promotion may create different vtables at each
+// use and silently disable scheduler-owned wake and direct-transfer paths.
+static TASK_VTABLE: RawWakerVTable =
     RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
 
 unsafe fn clone_raw(data: *const ()) -> RawWaker {
