@@ -49,6 +49,47 @@ pub fn usb3_tunnels() -> Vec<TunnelInfo> {
         .collect()
 }
 
+/// Number of live tunnels across all domains, as published by
+/// `reconcile` and drained by teardown / [`forget_domain`]. Every
+/// entry is a DisplayPort or USB3 path the CM currently owns in the
+/// routers; this is the count the device-PM handler gates on.
+pub fn live_tunnel_count() -> usize {
+    DISPLAYS.lock().len()
+}
+
+/// Domains whose CM task exited with tunnel writes still
+/// unrolled-back. A poisoned config channel can prevent teardown
+/// from restoring the registers a tunnel programmed, so those paths
+/// may still exist in the routers even though the domain's published
+/// snapshots are gone. Recorded by `topology::run` on exit; read by
+/// the device-PM handler, which keeps refusing suspend while any
+/// domain is marked (see `pm.rs`).
+static ORPHANED_PATH_DOMAINS: IrqSafeSpinLock<Vec<u32>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Record whether `domain`'s CM exited leaving tunnel path writes
+/// unrolled-back. Called once per domain from `topology::run`'s exit
+/// path, after the teardown loop; `orphaned == false` clears the
+/// mark, so a CM that tears everything down cleanly never vetoes
+/// suspend after it stops.
+pub(crate) fn note_orphaned_paths(domain: u32, orphaned: bool) {
+    let mut domains = ORPHANED_PATH_DOMAINS.lock();
+    domains.retain(|d| *d != domain);
+    if orphaned {
+        domains.push(domain);
+    }
+}
+
+/// Domains whose routers may still carry CM-programmed paths with
+/// no live owner able to roll them back.
+pub fn orphaned_path_domains() -> Vec<u32> {
+    ORPHANED_PATH_DOMAINS.lock().clone()
+}
+
+#[doc(hidden)]
+pub fn __reset_orphaned_for_test() {
+    ORPHANED_PATH_DOMAINS.lock().clear();
+}
+
 #[derive(Clone, Debug)]
 struct Hop {
     route: u64,
@@ -180,6 +221,13 @@ impl Tunnel {
         let value = ctl.read(e.route, e.port, CfgSpace::Port, offset, 1).await?[0];
         self.change(ctl, e, CfgSpace::Port, offset, &[(value & !clear) | set])
             .await
+    }
+    /// True while this tunnel's journal still holds configuration
+    /// writes teardown has not rolled back — i.e. paths may still be
+    /// programmed in the routers. `topology::run` consults this on
+    /// exit to record orphaned paths for the device-PM handler.
+    pub(crate) fn has_unrolled_writes(&self) -> bool {
+        !self.writes.is_empty()
     }
     pub async fn teardown(&mut self, ctl: &mut impl Config, live: &Domain) -> Result<(), Error> {
         DISPLAYS.lock().retain(|d| {

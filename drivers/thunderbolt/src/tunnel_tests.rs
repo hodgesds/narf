@@ -23,6 +23,12 @@ impl Model {
     pub(crate) fn put(&mut self, route: u64, port: u8, space: CfgSpace, offset: u16, value: u32) {
         self.words.insert((route, port, space as u8, offset), value);
     }
+    /// Arm the one-shot failure of the next adapter-disable write
+    /// (the write teardown's rollback performs), modelling a
+    /// transport that dies mid-teardown.
+    pub(crate) fn set_fail_disable(&mut self) {
+        self.fail_disable = true;
+    }
 }
 impl Config for Model {
     async fn read(
@@ -116,7 +122,7 @@ impl Config for Model {
         Ok(())
     }
 }
-fn model() -> (Domain, Model) {
+pub(crate) fn model() -> (Domain, Model) {
     let mut ports = Vec::new();
     for (number, kind, cap) in [(1, 1, 0), (3, 0x200101, 32), (5, 0x0e0101, 32)] {
         ports.push(Port {
