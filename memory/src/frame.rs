@@ -2770,6 +2770,10 @@ pub mod cow {
         // Lifetime holds such as vmsplice do not write-protect the original
         // mapping. Fork must distinguish them from existing COW mappings.
         pins: AtomicU32,
+        // Physical provenance is independent of COW/pin ownership and survives
+        // reuse. Zero means unknown; registered RAM stores node + 1. This fits
+        // in the existing padding, keeping the 64-byte descriptor unchanged.
+        node_plus_one: AtomicU32,
     }
     const _: () = assert!(core::mem::size_of::<FlatCowSlot>() == 64);
     const _: () = assert!(core::mem::align_of::<FlatCowSlot>() == 64);
@@ -2784,14 +2788,30 @@ pub mod cow {
     static SPILL_PINS: [IrqSafeSpinLock<Option<PinMap>>; REFCOUNT_SHARDS] =
         [const { IrqSafeSpinLock::new(None) }; REFCOUNT_SHARDS];
 
-    fn flat_pins(key: u64) -> Option<&'static AtomicU32> {
+    #[inline]
+    fn flat_entry(key: u64) -> Option<&'static FlatCowSlot> {
         let ptr = FLAT.load(Ordering::Acquire);
         let index = (key >> super::PAGE_SHIFT) as usize;
         if ptr.is_null() || index >= FLAT_FRAMES.load(Ordering::Relaxed) {
             return None;
         }
         // SAFETY: the published PFN array is permanent and bounds-checked.
-        Some(&unsafe { &*ptr.add(index) }.pins)
+        Some(unsafe { &*ptr.add(index) })
+    }
+
+    fn flat_pins(key: u64) -> Option<&'static AtomicU32> {
+        flat_entry(key).map(|slot| &slot.pins)
+    }
+
+    /// Constant-time lookup for registered boot RAM. No ownership counter changes,
+    /// topology locks, or heap allocation occur on this path.
+    #[inline]
+    pub(super) fn cached_node_for_phys(key: u64) -> Option<usize> {
+        flat_entry(key)?
+            .node_plus_one
+            .load(Ordering::Relaxed)
+            .checked_sub(1)
+            .map(|node| node as usize)
     }
 
     /// Retain RAM independently of its mappings. The caller holds the mapping
@@ -2840,17 +2860,7 @@ pub mod cow {
 
     #[inline]
     fn flat_slot(key: u64) -> Option<&'static AtomicU64> {
-        let ptr = FLAT.load(Ordering::Acquire);
-        if ptr.is_null() {
-            return None;
-        }
-        let index = (key >> super::PAGE_SHIFT) as usize;
-        if index >= FLAT_FRAMES.load(Ordering::Relaxed) {
-            return None;
-        }
-        // SAFETY: `ptr` names the published, never-freed array of
-        // `FLAT_FRAMES` entries and `index` is bounds-checked above.
-        Some(&unsafe { &*ptr.add(index) }.state)
+        flat_entry(key).map(|slot| &slot.state)
     }
 
     /// Reserve a batch epoch. Epoch 0 is reserved for non-batch
@@ -2942,6 +2952,35 @@ pub mod cow {
         // frame-backed kernel memory; zero it before publication.
         unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0, bytes) };
         let base = ptr.as_ptr() as *mut FlatCowSlot;
+        // Only known boot RAM gets a cached node. PFN holes stay unknown so
+        // later hotplug cannot inherit a fabricated node-0 classification.
+        // Resolve before publication, while boot topology is authoritative;
+        // no user address space exists yet. A byte address within a frame has
+        // the same node as its page-aligned start.
+        // Rebalance publishes numa_aware only after boot node membership is
+        // fixed. An earlier initialization leaves nodes unknown, preserving
+        // authoritative lookup if topology is installed later. Hotplug RAM
+        // cannot overlap these boot ranges and keeps its existing fallback.
+        let boot_ranges = if super::ALLOC.numa_aware.load(Ordering::Acquire) {
+            super::BOOT_MEMORY_RANGES.lock().clone()
+        } else {
+            Vec::new()
+        };
+        for (start, len) in boot_ranges {
+            let first = (start.saturating_add(super::PAGE_SIZE - 1) >> super::PAGE_SHIFT) as usize;
+            let end = ((start.saturating_add(len) >> super::PAGE_SHIFT) as usize).min(frames);
+            for index in first..end {
+                // SAFETY: frame provides the topology hook; this is a known
+                // boot-RAM frame and the table is not yet published.
+                let node = unsafe { super::narf_phys_to_node((index as u64) << super::PAGE_SHIFT) };
+                if node < super::MAX_NUMA_NODES as u32 {
+                    // SAFETY: valloc owns `frames` initialized entries.
+                    unsafe { &*base.add(index) }
+                        .node_plus_one
+                        .store(node + 1, Ordering::Relaxed);
+                }
+            }
+        }
         for shard in &REFCOUNTS {
             let mut guard = shard.map.lock();
             if let Some(table) = guard.as_mut() {
@@ -3448,6 +3487,59 @@ pub mod cow {
     mod tests {
         use super::RefTable;
         use narf_kernel_test::{kernel_test_in, TestResult};
+
+        /// smaps and allocator return paths must not take the hotplug registry
+        /// lock for a registered frame. Compare with the firmware bridge, then
+        /// hold that registry while checking both whole-frame and byte lookups.
+        fn smoke_frame_node_metadata_bypasses_topology_locks() -> TestResult {
+            let Ok(frame) = super::super::alloc_frame() else {
+                return TestResult::Fail("no frame for NUMA metadata smoke");
+            };
+            let phys = frame.start_address().raw();
+            let cached = super::cached_node_for_phys(phys);
+            // SAFETY: the linked frame bridge is the uncached topology oracle.
+            let expected = unsafe { super::super::narf_phys_to_node(phys) } as usize;
+            let result = match cached {
+                None if super::FLAT
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    .is_null()
+                    || !super::super::ALLOC
+                        .numa_aware
+                        .load(core::sync::atomic::Ordering::Acquire) =>
+                {
+                    TestResult::Skip("boot node metadata is unavailable")
+                }
+                None => TestResult::Fail("allocated boot frame lacks NUMA provenance"),
+                Some(node) if node != expected => {
+                    TestResult::Fail("cached NUMA node differs from the topology bridge")
+                }
+                Some(node) => {
+                    if super::cached_node_for_phys(u64::MAX).is_some() {
+                        super::super::free_frame(frame);
+                        return TestResult::Fail("unknown PFN acquired fabricated provenance");
+                    }
+                    let _ranges = super::super::HOTPLUG_RANGES.lock();
+                    if [0, 1, super::super::PAGE_SIZE - 1]
+                        .into_iter()
+                        .all(|offset| {
+                            super::super::node_for_phys(phys + offset) == node
+                            // SAFETY: the allocated frame stays live.
+                            && unsafe { super::super::narf_phys_node(phys + offset) } == node
+                        })
+                    {
+                        TestResult::Pass
+                    } else {
+                        TestResult::Fail("frame-node lookup lost registered provenance")
+                    }
+                }
+            };
+            super::super::free_frame(frame);
+            result
+        }
+        kernel_test_in!(
+            "memory/numa",
+            smoke_frame_node_metadata_bypasses_topology_locks
+        );
 
         fn smoke_cow_refcount_hash_index_grows_through_tombstones() -> TestResult {
             let mut table = RefTable::new();
@@ -4028,6 +4120,9 @@ pub fn firmware_node_count() -> u32 {
 /// should use higher-level allocation and policy APIs.
 #[inline]
 pub(crate) unsafe fn narf_phys_node(addr: u64) -> usize {
+    if let Some(node) = cow::cached_node_for_phys(addr) {
+        return node;
+    }
     // SAFETY: narf-frame provides the topology hook in kernel binaries.
     unsafe { narf_phys_to_node(addr) as usize }.min(MAX_NUMA_NODES - 1)
 }
@@ -4084,6 +4179,9 @@ fn fallback_order(preferred: usize, out: &mut [usize; MAX_NUMA_NODES]) -> usize 
 
 #[inline]
 fn phys_to_node(addr: u64) -> usize {
+    if let Some(node) = cow::cached_node_for_phys(addr) {
+        return node;
+    }
     if let Some(node) = hotplug_node_for_phys(addr) {
         return node;
     }
