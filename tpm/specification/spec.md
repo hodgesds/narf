@@ -45,6 +45,9 @@ pub trait TpmDevice: Send + Sync {
     /// Lifecycle: submit TPM2_Startup (provided; see below).
     async fn startup(&self, startup_type: StartupType) -> Result<(), TpmError>;
 
+    /// Identity: query TPM2_GetCapability live (provided; §3.1).
+    async fn query_info(&self) -> Result<TpmInfo, TpmError>;
+
     /// High-level GetRandom.
     async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError>;
 }
@@ -66,6 +69,23 @@ trait folds both into the caller's goal state (`Clear` +
 Shutdown(STATE) → Startup(STATE) suspend/resume sequencing that
 consumes the `State` form is owned by the power-suspend program
 (#1003), not by this interface.
+
+**Identity (`query_info`, #941).** `get_info` is the synchronous
+cached read; `query_info` is the live query behind it. It is a
+provided method: it builds `TPM2_GetCapability(TPM_CAP_TPM_PROPERTIES,
+TPM_PT_FAMILY_INDICATOR, 64)` with the canonical codec, submits
+through `submit_raw`, and parses the TPML_TAGGED_TPM_PROPERTY page
+with the canonical parser (`ResponseParser::parse_get_capability_properties`;
+the PCRS sibling parses TPML_PCR_SELECTION). The mapping is:
+manufacturer ← `TPM_PT_MANUFACTURER` (required — its absence is a
+`BadResponse`), version ← `TPM_PT_FIRMWARE_VERSION_1`, spec_level ←
+`TPM_PT_REVISION` (both default 0 when unreported). The production
+probe calls `query_info` once after Startup and caches the result;
+on query failure the device still registers and `get_info` keeps
+its unqueried defaults — identity is diagnostic, not a liveness
+gate. Property tags live with the codec (`tpm2::TPM_PT_*`); note
+`TPM_PT_PERMANENT` is in the variable group (0x200), while 0x10E in
+the fixed group is `TPM_PT_HR_TRANSIENT_MIN`.
 
 ### 3.2 TPM Capabilities
 
@@ -153,10 +173,17 @@ contract:
   registered nodes are prototypes, each `open(2)` gets a fresh
   instance, and the devfs proxies forward the hook to the
   installed delegate. Sysfs attributes that need capability data
-  query per read through the transport; the command set they
-  depend on (GetCapability) is #941's — until it lands, the
-  platform transport's `get_info` stub stands and the affected
-  attributes report their failure defaults.
+  query per read through the transport. The command set they
+  depend on (GetCapability) landed with #941: the canonical codec
+  carries the builder and the property/PCR-selection parsers
+  (§3.1), the keystone model serves the capability, and the
+  attributes read live values against any device whose transport
+  implements the command — including the model, whose identity
+  (manufacturer "NARF", firmware 1.0, spec revision 159) the
+  publication fixture now asserts live. The platform transport's
+  `get_info` likewise answers from the probe-time `query_info`
+  (§3.1) instead of the pre-#941 stub values, which remain only as
+  the unqueried default.
 
 ## 4. Operation: PCR Extension
 
@@ -222,4 +249,8 @@ silent success.
 - Specific commands: `startup`, `shutdown`, `get_random`,
   `get_capability`, `pcr_read`.
 - `parse_get_random_response` for the 2-byte BE length + bytes form.
-- TPM_ST / TPM_CC / TPM_SU / TPM_ALG_ID / TPM_CAP / TPM_RC constants.
+- `ResponseParser::parse_get_capability_properties` /
+  `parse_get_capability_pcr_selections` (#941) for the
+  TPML_TAGGED_TPM_PROPERTY and TPML_PCR_SELECTION pages behind
+  `query_info` (§3.1).
+- TPM_ST / TPM_CC / TPM_SU / TPM_ALG_ID / TPM_CAP / TPM_PT / TPM_RC constants.

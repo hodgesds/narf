@@ -85,6 +85,37 @@ pub const TPM_CAP_TPM_PROPERTIES: u32 = 0x0000_0006;
 pub const TPM_CAP_PCR_PROPERTIES: u32 = 0x0000_0007;
 pub const TPM_CAP_ECC_CURVES: u32 = 0x0000_0008;
 
+// ── TPM_PT property tags (Part 2 §6.12–§6.15) ─────────────────────
+//
+// Property tags queried through TPM2_GetCapability with
+// TPM_CAP_TPM_PROPERTIES. The fixed group starts at PT_FIXED
+// (0x100) and describes the TPM itself; the variable group starts
+// at PT_VAR (0x200) and reports state that can change over the
+// TPM's life. TPM_PT_PERMANENT (variable group, first entry)
+// carries the TPMA_PERMANENT flags word (Part 2 §10.11: bit 0 =
+// ownerAuthSet, bit 1 = endorsementAuthSet, bit 2 =
+// lockoutAuthSet).
+//
+// Caution: 0x10E in the fixed group is TPM_PT_HR_TRANSIENT_MIN,
+// *not* PERMANENT — the sysfs bridge carried that wrong value
+// until this lane (#941) corrected it; see sysfs_bridge.rs.
+
+pub const TPM_PT_FAMILY_INDICATOR: u32 = 0x0000_0100;
+pub const TPM_PT_LEVEL: u32 = 0x0000_0101;
+pub const TPM_PT_REVISION: u32 = 0x0000_0102;
+pub const TPM_PT_MANUFACTURER: u32 = 0x0000_0105;
+pub const TPM_PT_VENDOR_STRING_1: u32 = 0x0000_0106;
+pub const TPM_PT_VENDOR_STRING_2: u32 = 0x0000_0107;
+pub const TPM_PT_VENDOR_STRING_3: u32 = 0x0000_0108;
+pub const TPM_PT_VENDOR_STRING_4: u32 = 0x0000_0109;
+pub const TPM_PT_VENDOR_TPM_TYPE: u32 = 0x0000_010A;
+pub const TPM_PT_FIRMWARE_VERSION_1: u32 = 0x0000_010B;
+pub const TPM_PT_FIRMWARE_VERSION_2: u32 = 0x0000_010C;
+pub const TPM_PT_INPUT_BUFFER: u32 = 0x0000_010D;
+pub const TPM_PT_HR_TRANSIENT_MIN: u32 = 0x0000_010E;
+pub const TPM_PT_PCR_COUNT: u32 = 0x0000_0112;
+pub const TPM_PT_PERMANENT: u32 = 0x0000_0200;
+
 // ── Common TPM_RC return codes (Part 2 §6.6) ──────────────────────
 
 pub const TPM_RC_SUCCESS: u32 = 0x0000_0000;

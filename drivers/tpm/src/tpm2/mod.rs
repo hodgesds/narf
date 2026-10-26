@@ -58,6 +58,16 @@ pub const TPM_CC_NV_DEFINE_SPACE: u32 = 0x0000_012A;
 pub const TPM_CC_NV_READ: u32 = 0x0000_014E;
 pub const TPM_CC_NV_WRITE: u32 = 0x0000_0137;
 pub const TPM_CC_NV_UNDEFINE_SPACE: u32 = 0x0000_0122;
+// Command-set completion (#941): hierarchy/session/object commands
+// the audit found absent everywhere (no builder, in Clear's case
+// not even a constant).
+pub const TPM_CC_CLEAR: u32 = 0x0000_0126;
+pub const TPM_CC_CLEAR_CONTROL: u32 = 0x0000_0127;
+pub const TPM_CC_CREATE_PRIMARY: u32 = 0x0000_0131;
+pub const TPM_CC_EVICT_CONTROL: u32 = 0x0000_0120;
+pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x0000_0165;
+pub const TPM_CC_START_AUTH_SESSION: u32 = 0x0000_0176;
+pub const TPM_CC_POLICY_PCR: u32 = 0x0000_019F;
 
 // ── TPM_SU values — Part 2 §6.9 ─────────────────────────────────────
 
@@ -71,6 +81,7 @@ pub const TPM_SU_STATE: u16 = 0x0001;
 pub const TPM_ALG_RSA: u16 = 0x0001;
 pub const TPM_ALG_SHA1: u16 = 0x0004;
 pub const TPM_ALG_AES: u16 = 0x0006;
+pub const TPM_ALG_KEYEDHASH: u16 = 0x0008;
 pub const TPM_ALG_SHA256: u16 = 0x000B;
 pub const TPM_ALG_SHA384: u16 = 0x000C;
 pub const TPM_ALG_SHA512: u16 = 0x000D;
@@ -112,6 +123,17 @@ pub const TPM_RH_OWNER: u32 = 0x4000_0001;
 pub const TPM_RH_PLATFORM: u32 = 0x4000_000C;
 /// Endorsement hierarchy handle.
 pub const TPM_RH_ENDORSEMENT: u32 = 0x4000_000B;
+/// Lockout authorization handle.
+pub const TPM_RH_LOCKOUT: u32 = 0x4000_000A;
+/// The null handle — "no handle" for optional StartAuthSession
+/// operands (tpmKey / bind).
+pub const TPM_RH_NULL: u32 = 0x4000_0007;
+
+// ── Session types (TPM_SE) — Part 2 §6.11 ────────────────────────────
+
+pub const TPM_SE_HMAC: u8 = 0x00;
+pub const TPM_SE_POLICY: u8 = 0x01;
+pub const TPM_SE_TRIAL: u8 = 0x03;
 
 // ── Codec errors ─────────────────────────────────────────────────────
 

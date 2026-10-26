@@ -100,6 +100,36 @@ pub trait TpmDevice: Send + Sync {
         }
     }
 
+    /// Query the TPM's identity live via TPM2_GetCapability
+    /// (TCG Part 3 §24.2) and return it as a [`TpmInfo`].
+    ///
+    /// Asks for the fixed TPM_PROPERTIES page starting at
+    /// TPM_PT_FAMILY_INDICATOR and maps: manufacturer ←
+    /// TPM_PT_MANUFACTURER (required — a response without it is a
+    /// `BadResponse`), version ← TPM_PT_FIRMWARE_VERSION_1 and
+    /// spec_level ← TPM_PT_REVISION (both default 0 when the TPM
+    /// does not report them). The frame is built with the canonical
+    /// codec and the response parsed with the canonical parser, so
+    /// every transport inherits the query unchanged; the production
+    /// probe calls this once after Startup and caches the result
+    /// behind `get_info` (#941).
+    async fn query_info(&self) -> Result<TpmInfo, TpmError> {
+        let req = crate::tpm2::get_capability(
+            crate::tpm2::TPM_CAP_TPM_PROPERTIES,
+            crate::tpm2::TPM_PT_FAMILY_INDICATOR,
+            64,
+        );
+        let resp = self.submit_raw(&req).await?;
+        let parser = crate::commands::ResponseParser::new(&resp)?;
+        let (_more, entries) = parser.parse_get_capability_properties()?;
+        let find = |tag: u32| entries.iter().find(|(t, _)| *t == tag).map(|(_, v)| *v);
+        Ok(TpmInfo {
+            manufacturer: find(crate::tpm2::TPM_PT_MANUFACTURER).ok_or(TpmError::BadResponse)?,
+            version: find(crate::tpm2::TPM_PT_FIRMWARE_VERSION_1).unwrap_or(0),
+            spec_level: find(crate::tpm2::TPM_PT_REVISION).unwrap_or(0),
+        })
+    }
+
     /// High-level GetRandom.
     async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError>;
 
@@ -438,6 +468,212 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("tpm/startup", smoke_tpm_startup_propagates_failure_rc);
+
+    // ── TPM2_GetCapability / query_info smokes (#941) ─────────────
+    //
+    // `GetCapProbeTpm` is spec-shaped silicon for the one command
+    // the trait's `query_info` submits: it answers a TPM_PROPERTIES
+    // query with a framed TPML_TAGGED_TPM_PROPERTY page in the
+    // model's identity (manufacturer "NARF", firmware 1.0, spec
+    // revision 159 — the same values the keystone platform model
+    // serves, so the trait parser and the model are pinned against
+    // one identity from both sides).
+
+    struct GetCapProbeTpm {
+        omit_manufacturer: bool,
+    }
+
+    #[async_trait]
+    impl TpmDevice for GetCapProbeTpm {
+        fn get_info(&self) -> TpmInfo {
+            TpmInfo {
+                manufacturer: 0,
+                version: 2,
+                spec_level: 159,
+            }
+        }
+
+        async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+            let header = crate::tpm2::Header::decode(cmd).map_err(|_| TpmError::BadResponse)?;
+            if header.code != crate::tpm2::TPM_CC_GET_CAPABILITY {
+                return Err(TpmError::BadResponse);
+            }
+            let mut body = alloc::vec::Vec::new();
+            body.push(0u8); // moreData = NO
+            body.extend_from_slice(&crate::tpm2::TPM_CAP_TPM_PROPERTIES.to_be_bytes());
+            let mut entries: alloc::vec::Vec<(u32, u32)> = alloc::vec![
+                (crate::tpm2::TPM_PT_FAMILY_INDICATOR, 0x322E_3000),
+                (crate::tpm2::TPM_PT_LEVEL, 0),
+                (crate::tpm2::TPM_PT_REVISION, 159),
+                (crate::tpm2::TPM_PT_MANUFACTURER, 0x4E41_5246),
+                (crate::tpm2::TPM_PT_FIRMWARE_VERSION_1, 0x0001_0000),
+            ];
+            if self.omit_manufacturer {
+                entries.retain(|(tag, _)| *tag != crate::tpm2::TPM_PT_MANUFACTURER);
+            }
+            body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for (tag, value) in &entries {
+                body.extend_from_slice(&tag.to_be_bytes());
+                body.extend_from_slice(&value.to_be_bytes());
+            }
+            let mut frame = alloc::vec::Vec::new();
+            frame.extend_from_slice(&crate::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+            frame.extend_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+            frame.extend_from_slice(&0u32.to_be_bytes()); // TPM_RC_SUCCESS
+            frame.extend_from_slice(&body);
+            Ok(frame)
+        }
+
+        async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError> {
+            Ok(alloc::vec![0u8; bytes as usize])
+        }
+
+        async fn extend_pcr(&self, _pcr: u32, _digest: &[u8]) -> Result<(), TpmError> {
+            Ok(())
+        }
+
+        async fn read_pcr(&self, _pcr: u32) -> Result<Vec<u8>, TpmError> {
+            Ok(alloc::vec![0u8; 32])
+        }
+    }
+
+    fn smoke_tpm_query_info_maps_properties() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let probe = Arc::new(GetCapProbeTpm {
+            omit_manufacturer: false,
+        });
+        let outcome = Arc::new(AtomicU32::new(0));
+        let p = probe.clone();
+        let o = outcome.clone();
+        narf_scheduler::spawn(async move {
+            match p.query_info().await {
+                Ok(info)
+                    if info.manufacturer == 0x4E41_5246
+                        && info.version == 0x0001_0000
+                        && info.spec_level == 159 =>
+                {
+                    o.store(1, Ordering::SeqCst)
+                }
+                _ => o.store(2, Ordering::SeqCst),
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if outcome.load(Ordering::SeqCst) != 1 {
+            return TestResult::Fail("query_info did not map the property page");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/getcapability", smoke_tpm_query_info_maps_properties);
+
+    fn smoke_tpm_query_info_requires_manufacturer() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let probe = Arc::new(GetCapProbeTpm {
+            omit_manufacturer: true,
+        });
+        let outcome = Arc::new(AtomicU32::new(0));
+        let p = probe.clone();
+        let o = outcome.clone();
+        narf_scheduler::spawn(async move {
+            match p.query_info().await {
+                Err(TpmError::BadResponse) => o.store(1, Ordering::SeqCst),
+                _ => o.store(2, Ordering::SeqCst),
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if outcome.load(Ordering::SeqCst) != 1 {
+            return TestResult::Fail("query_info must reject a page without a manufacturer");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "tpm/getcapability",
+        smoke_tpm_query_info_requires_manufacturer
+    );
+
+    fn smoke_tpm_getcapability_properties_parser() -> TestResult {
+        use crate::commands::ResponseParser;
+        // Hand-built page: moreData=YES, two properties.
+        let mut frame = alloc::vec::Vec::new();
+        frame.extend_from_slice(&crate::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes()); // size patched below
+        frame.extend_from_slice(&0u32.to_be_bytes()); // rc = success
+        frame.push(1u8); // moreData
+        frame.extend_from_slice(&crate::tpm2::TPM_CAP_TPM_PROPERTIES.to_be_bytes());
+        frame.extend_from_slice(&2u32.to_be_bytes());
+        frame.extend_from_slice(&crate::tpm2::TPM_PT_MANUFACTURER.to_be_bytes());
+        frame.extend_from_slice(&0x5354_4D20u32.to_be_bytes());
+        frame.extend_from_slice(&crate::tpm2::TPM_PT_PERMANENT.to_be_bytes());
+        frame.extend_from_slice(&0x0000_0005u32.to_be_bytes());
+        let size = frame.len() as u32;
+        frame[2..6].copy_from_slice(&size.to_be_bytes());
+        let parser = match ResponseParser::new(&frame) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("parser rejected a valid page"),
+        };
+        match parser.parse_get_capability_properties() {
+            Ok((true, entries))
+                if entries
+                    == alloc::vec![
+                        (crate::tpm2::TPM_PT_MANUFACTURER, 0x5354_4D20),
+                        (crate::tpm2::TPM_PT_PERMANENT, 0x0000_0005),
+                    ] => {}
+            _ => return TestResult::Fail("property page parsed incorrectly"),
+        }
+        // Truncated entry list must be a BadResponse, not a panic.
+        let short = &frame[..frame.len() - 4];
+        match ResponseParser::new(short).map(|p| p.parse_get_capability_properties()) {
+            Ok(Err(TpmError::BadResponse)) => {}
+            _ => return TestResult::Fail("truncated page must be rejected"),
+        }
+        // A PCRS page fed to the properties parser must be rejected.
+        let mut pcr_frame = frame.clone();
+        pcr_frame[11..15].copy_from_slice(&crate::tpm2::TPM_CAP_PCRS.to_be_bytes());
+        match ResponseParser::new(&pcr_frame).map(|p| p.parse_get_capability_properties()) {
+            Ok(Err(TpmError::BadResponse)) => TestResult::Pass,
+            _ => TestResult::Fail("capability echo mismatch must be rejected"),
+        }
+    }
+    kernel_test_in!(
+        "tpm/getcapability",
+        smoke_tpm_getcapability_properties_parser
+    );
+
+    fn smoke_tpm_getcapability_pcr_selections_parser() -> TestResult {
+        use crate::commands::ResponseParser;
+        let mut frame = alloc::vec::Vec::new();
+        frame.extend_from_slice(&crate::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.push(0u8); // moreData = NO
+        frame.extend_from_slice(&crate::tpm2::TPM_CAP_PCRS.to_be_bytes());
+        frame.extend_from_slice(&2u32.to_be_bytes());
+        frame.extend_from_slice(&crate::tpm2::TPM_ALG_SHA1.to_be_bytes());
+        frame.push(3u8);
+        frame.extend_from_slice(&[0xFF, 0x00, 0x00]);
+        frame.extend_from_slice(&crate::tpm2::TPM_ALG_SHA256.to_be_bytes());
+        frame.push(3u8);
+        frame.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+        let size = frame.len() as u32;
+        frame[2..6].copy_from_slice(&size.to_be_bytes());
+        let parser = match ResponseParser::new(&frame) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("parser rejected a valid PCRS page"),
+        };
+        match parser.parse_get_capability_pcr_selections() {
+            Ok((false, sels))
+                if sels.len() == 2
+                    && sels[0] == (crate::tpm2::TPM_ALG_SHA1, alloc::vec![0xFF, 0x00, 0x00])
+                    && sels[1] == (crate::tpm2::TPM_ALG_SHA256, alloc::vec![0xFF, 0xFF, 0xFF]) =>
+            {
+                TestResult::Pass
+            }
+            _ => TestResult::Fail("PCR selection page parsed incorrectly"),
+        }
+    }
+    kernel_test_in!(
+        "tpm/getcapability",
+        smoke_tpm_getcapability_pcr_selections_parser
+    );
 
     // ── TPM 2.0 codec smokes ──────────────────────────────────────
 

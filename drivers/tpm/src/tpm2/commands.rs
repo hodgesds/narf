@@ -24,6 +24,33 @@
 //! | `nv_read`             | 0x14E       | §31.13        |
 //! | `nv_write`            | 0x137       | §31.9         |
 //! | `nv_undefine_space`   | 0x122       | §31.5         |
+//! | `evict_control`       | 0x120       | §27.2         |
+//! | `clear`               | 0x126       | §24.4         |
+//! | `clear_control`       | 0x127       | §24.3         |
+//! | `create_primary`      | 0x131       | §12.2         |
+//! | `flush_context`       | 0x165       | §11.4         |
+//! | `start_auth_session`  | 0x176       | §11.1         |
+//! | `policy_pcr`          | 0x19F       | §19.7         |
+//!
+//! Structured response parsers (the pre-#941 layer had only
+//! GetRandom's): `parse_create_response`,
+//! `parse_create_primary_response`, `parse_load_response`,
+//! `parse_unseal_response`, `parse_nv_read_response`,
+//! `parse_get_capability_response` (+ `parse_tagged_properties` /
+//! `parse_pcr_selections` over its data),
+//! `parse_get_test_result_response`,
+//! `parse_start_auth_session_response`.
+//!
+//! The hierarchy/session/object commands and the parsers are the
+//! #941 command-set completion: the audit found Clear without even
+//! a command-code constant, CreatePrimary / EvictControl /
+//! StartAuthSession / PolicyPCR absent everywhere (sessions were
+//! password-only, so authPolicy-bound objects had no path), and
+//! the one Create template malformed — its inline "template"
+//! encoded the symmetric-alg field as TPM_ALG_SHA256 with stray
+//! extra parameter words and exponent 1. `create` now builds its
+//! inPublic from `objects::rsa2048_template`, the encoding the
+//! object layer already had right.
 //!
 //! ## Reference
 //!
@@ -33,11 +60,13 @@
 extern crate alloc;
 
 use super::{
-    begin_command, finalise, TPM_ALG_SHA256, TPM_CC_CREATE, TPM_CC_GET_CAPABILITY,
-    TPM_CC_GET_RANDOM, TPM_CC_GET_TEST_RESULT, TPM_CC_LOAD, TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_READ,
-    TPM_CC_NV_UNDEFINE_SPACE, TPM_CC_NV_WRITE, TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ,
-    TPM_CC_SELF_TEST, TPM_CC_SHUTDOWN, TPM_CC_STARTUP, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL,
-    TPM_RH_OWNER, TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
+    begin_command, finalise, TPM_ALG_NULL, TPM_ALG_SHA256, TPM_CC_CLEAR, TPM_CC_CLEAR_CONTROL,
+    TPM_CC_CREATE, TPM_CC_CREATE_PRIMARY, TPM_CC_EVICT_CONTROL, TPM_CC_FLUSH_CONTEXT,
+    TPM_CC_GET_CAPABILITY, TPM_CC_GET_RANDOM, TPM_CC_GET_TEST_RESULT, TPM_CC_LOAD,
+    TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_READ, TPM_CC_NV_UNDEFINE_SPACE, TPM_CC_NV_WRITE,
+    TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_PCR, TPM_CC_SELF_TEST, TPM_CC_SHUTDOWN,
+    TPM_CC_STARTUP, TPM_CC_START_AUTH_SESSION, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL, TPM_RH_OWNER,
+    TPM_RH_PLATFORM, TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
 };
 use alloc::vec::Vec;
 
@@ -194,14 +223,22 @@ pub fn pcr_extend_sha256(pcr: u32, digest: &[u8; 32]) -> Vec<u8> {
 
 // ── Create / Load / Unseal ─────────────────────────────────────────────
 
-/// Build a minimal `TPM2_Create` for an unrestricted decryption key
-/// under the owner hierarchy — Part 3 §12.1.
+/// Build `TPM2_Create` for an unrestricted RSA-2048 decryption
+/// key under the owner hierarchy — Part 3 §12.1.
 ///
-/// This is a skeleton; full creation requires caller-supplied
-/// `inSensitive` (auth, data) and `inPublic` (TPMT_PUBLIC).
-/// Here we send an empty sensitive and a stub RSA-2048 template so
-/// the wire length at least matches the spec's minimum command.
+/// `inSensitive` carries `auth_value` as the new object's auth and
+/// no sealed data. `inPublic` is `objects::rsa2048_template` with
+/// the standard child-key attributes (fixedTPM | stClear |
+/// fixedParent | sensitiveDataOrigin | userWithAuth | decrypt) —
+/// #941: the builder previously hand-encoded a malformed inline
+/// template (symmetric-alg field = TPM_ALG_SHA256, stray parameter
+/// words, exponent 1) that a real TPM rejects; the object layer's
+/// encoder is the single source for the template now.
 pub fn create_rsa2048_under_owner(auth_value: &[u8]) -> Vec<u8> {
+    use super::objects::{
+        OBJ_DECRYPT, OBJ_FIXED_PARENT, OBJ_FIXED_TPM, OBJ_SENSITIVE_DATA_ORIGIN, OBJ_ST_CLEAR,
+        OBJ_USER_WITH_AUTH,
+    };
     let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_CREATE);
     // parentHandle = TPM_RH_OWNER
     buf.extend_from_slice(&TPM_RH_OWNER.to_be_bytes());
@@ -219,25 +256,17 @@ pub fn create_rsa2048_under_owner(auth_value: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&(auth_value.len() as u16).to_be_bytes());
     buf.extend_from_slice(auth_value);
     buf.extend_from_slice(&0u16.to_be_bytes()); // data size = 0
-                                                // inPublic (TPM2B_PUBLIC): u16 size + TPMT_PUBLIC stub
-                                                // TPMT_PUBLIC: type(u16) + nameAlg(u16) + objectAttributes(u32) +
-                                                //   authPolicy(TPM2B: u16 + 0 bytes) + parameters + unique
-                                                // RSA-2048, RSAES, SHA256, restricted=0, decrypt=1
-    let pub_inner: &[u8] = &[
-        0x00, 0x01, // type = TPM_ALG_RSA
-        0x00, 0x0B, // nameAlg = SHA256
-        0x00, 0x02, 0x00, 0x00, // objectAttributes: decrypt only
-        0x00, 0x00, // authPolicy size = 0
-        0x00, 0x0B, // symmetric = TPM_ALG_AES (or NULL for key type)
-        0x00, 0x80, // keyBits = 128 (inner symmetric key bits)
-        0x00, 0x10, // mode = TPM_ALG_NULL
-        0x00, 0x10, // scheme = TPM_ALG_NULL
-        0x08, 0x00, // keyBits = 2048
-        0x00, 0x00, 0x00, 0x01, // exponent = 0 (65537 default)
-        0x00, 0x00, // unique (TPM2B size = 0 for new key)
-    ];
+                                                // inPublic (TPM2B_PUBLIC): u16 size + TPMT_PUBLIC
+    let pub_inner = super::objects::rsa2048_template(
+        OBJ_FIXED_TPM
+            | OBJ_ST_CLEAR
+            | OBJ_FIXED_PARENT
+            | OBJ_SENSITIVE_DATA_ORIGIN
+            | OBJ_USER_WITH_AUTH
+            | OBJ_DECRYPT,
+    );
     buf.extend_from_slice(&(pub_inner.len() as u16).to_be_bytes());
-    buf.extend_from_slice(pub_inner);
+    buf.extend_from_slice(&pub_inner);
     // outsideInfo (TPM2B_DATA): size = 0
     buf.extend_from_slice(&0u16.to_be_bytes());
     // creationPCR (TPML_PCR_SELECTION): count = 0
@@ -376,6 +405,189 @@ pub fn nv_undefine_space(nv_index: u32) -> Vec<u8> {
     buf
 }
 
+// ── Hierarchy / session / object lifecycle (#941) ─────────────────────
+
+/// Append the empty password-session authorization area used by
+/// every builder in this section: authorizationSize(4) = 9 +
+/// TPM_RS_PW(4) + nonceSize(2) = 0 + attributes(1) = 0 +
+/// hmacSize(2) = 0.
+fn push_password_session(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&9u32.to_be_bytes());
+    buf.extend_from_slice(&TPM_RS_PW.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.push(0u8);
+    buf.extend_from_slice(&0u16.to_be_bytes());
+}
+
+/// Build `TPM2_Clear()` — Part 3 §24.4.
+///
+/// Flushes transient objects and sessions, resets the PCRs, and
+/// clears the hierarchy auth values. The sole handle is
+/// `TPM_RH_PLATFORM`, authorized with the empty password session —
+/// this builder is the command the policy layer's
+/// `TpmRight::Clear` always named but no code could submit (#941:
+/// Clear had no builder and not even a command-code constant).
+pub fn clear() -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_CLEAR);
+    buf.extend_from_slice(&TPM_RH_PLATFORM.to_be_bytes());
+    push_password_session(&mut buf);
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_ClearControl(disableClear)` — Part 3 §24.3.
+///
+/// `disable_clear = true` blocks TPM2_Clear until the next
+/// Startup; platform handle, empty password session.
+pub fn clear_control(disable_clear: bool) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_CLEAR_CONTROL);
+    buf.extend_from_slice(&TPM_RH_PLATFORM.to_be_bytes());
+    push_password_session(&mut buf);
+    buf.push(u8::from(disable_clear)); // TPMI_YES_NO
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_CreatePrimary(inSensitive, inPublic, outsideInfo,
+/// creationPCR)` — Part 3 §12.2.
+///
+/// `primary_handle` is the hierarchy (TPM_RH_OWNER /
+/// TPM_RH_ENDORSEMENT / TPM_RH_PLATFORM), authorized with the
+/// empty password session carrying `auth_value` as the
+/// hierarchy's auth. `in_public_inner` is the raw TPMT_PUBLIC
+/// template (the TPM2B wrapper is added here) — use
+/// `objects::rsa2048_template` / `objects::ecc_template`, or the
+/// `create_primary_rsa_storage` shorthand. `outsideInfo` is empty
+/// and `creationPCR` selects nothing: creation data is not
+/// consumed by any caller yet.
+pub fn create_primary(primary_handle: u32, auth_value: &[u8], in_public_inner: &[u8]) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_CREATE_PRIMARY);
+    buf.extend_from_slice(&primary_handle.to_be_bytes());
+    push_password_session(&mut buf);
+    // inSensitive (TPM2B_SENSITIVE_CREATE)
+    let inner_size: u16 = 2 + auth_value.len() as u16 + 2;
+    buf.extend_from_slice(&inner_size.to_be_bytes());
+    buf.extend_from_slice(&(auth_value.len() as u16).to_be_bytes());
+    buf.extend_from_slice(auth_value);
+    buf.extend_from_slice(&0u16.to_be_bytes()); // data size = 0
+                                                // inPublic (TPM2B_PUBLIC)
+    buf.extend_from_slice(&(in_public_inner.len() as u16).to_be_bytes());
+    buf.extend_from_slice(in_public_inner);
+    // outsideInfo (TPM2B_DATA): size = 0
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    // creationPCR (TPML_PCR_SELECTION): count = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    finalise(&mut buf);
+    buf
+}
+
+/// Shorthand: `TPM2_CreatePrimary` for the RSA-2048 storage
+/// primary under the owner hierarchy (the SRK shape) with an
+/// empty hierarchy auth.
+pub fn create_primary_rsa_storage() -> Vec<u8> {
+    create_primary(
+        TPM_RH_OWNER,
+        &[],
+        &super::objects::rsa2048_template(super::objects::OBJ_ATTR_STORAGE),
+    )
+}
+
+/// Build `TPM2_EvictControl(authHandle, objectHandle,
+/// persistentHandle)` — Part 3 §27.2.
+///
+/// Makes a loaded object persistent (or, when `object_handle`
+/// names an existing persistent handle, evicts it). The auth
+/// handle — owner or platform — is authorized with the empty
+/// password session.
+pub fn evict_control(auth_handle: u32, object_handle: u32, persistent_handle: u32) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_EVICT_CONTROL);
+    buf.extend_from_slice(&auth_handle.to_be_bytes());
+    buf.extend_from_slice(&object_handle.to_be_bytes());
+    push_password_session(&mut buf);
+    buf.extend_from_slice(&persistent_handle.to_be_bytes());
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_FlushContext(flushHandle)` — Part 3 §11.4.
+///
+/// The command-layer builder: the resource-manager bridge
+/// previously kept a private copy of this frame in
+/// `devfs_bridge`; it delegates here now so the encoding exists
+/// exactly once. No sessions, no parameters.
+pub fn flush_context(handle: u32) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_NO_SESSIONS, TPM_CC_FLUSH_CONTEXT);
+    buf.extend_from_slice(&handle.to_be_bytes());
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_StartAuthSession(tpmKey, bind, nonceCaller,
+/// encryptedSalt, sessionType, symmetric, authHash)` — Part 3
+/// §11.1.
+///
+/// This is the session family's front door — #941: sessions were
+/// password-only before it, so objects bound to an `authPolicy`
+/// had no execution path at all. `tpm_key` / `bind` are
+/// `TPM_RH_NULL` for an unbound, unsalted session (the sealing
+/// shape). Only the `TPM_ALG_NULL` symmetric definition is
+/// encodable here (a TPMT_SYM_DEF is just its algorithm ID in
+/// that case); parameter-encryption sessions are follow-up work.
+pub fn start_auth_session(
+    tpm_key: u32,
+    bind: u32,
+    nonce_caller: &[u8],
+    encrypted_salt: &[u8],
+    session_type: u8,
+    auth_hash: u16,
+) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_NO_SESSIONS, TPM_CC_START_AUTH_SESSION);
+    buf.extend_from_slice(&tpm_key.to_be_bytes());
+    buf.extend_from_slice(&bind.to_be_bytes());
+    // nonceCaller (TPM2B_NONCE)
+    buf.extend_from_slice(&(nonce_caller.len() as u16).to_be_bytes());
+    buf.extend_from_slice(nonce_caller);
+    // encryptedSalt (TPM2B_ENCRYPTED_SECRET)
+    buf.extend_from_slice(&(encrypted_salt.len() as u16).to_be_bytes());
+    buf.extend_from_slice(encrypted_salt);
+    buf.push(session_type); // TPM_SE
+    buf.extend_from_slice(&TPM_ALG_NULL.to_be_bytes()); // symmetric
+    buf.extend_from_slice(&auth_hash.to_be_bytes()); // authHash
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_PolicyPCR(policySession, pcrDigest, pcrs)` —
+/// Part 3 §19.7.
+///
+/// Updates the session's policyDigest with the named PCRs'
+/// expected composite digest; an empty `pcr_digest` means "the
+/// PCRs' current values" (the TPM computes it). The authorization
+/// area is the policy session itself with `continueSession` set —
+/// a policy command is authorized by the session it extends.
+pub fn policy_pcr(session_handle: u32, pcr_digest: &[u8], selections: &[(u16, &[u8])]) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_POLICY_PCR);
+    buf.extend_from_slice(&session_handle.to_be_bytes());
+    // Authorization area: the policy session, continueSession.
+    buf.extend_from_slice(&9u32.to_be_bytes());
+    buf.extend_from_slice(&session_handle.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes()); // nonceSize
+    buf.push(0x01); // sessionAttributes = continueSession
+    buf.extend_from_slice(&0u16.to_be_bytes()); // hmacSize
+                                                // pcrDigest (TPM2B_DIGEST)
+    buf.extend_from_slice(&(pcr_digest.len() as u16).to_be_bytes());
+    buf.extend_from_slice(pcr_digest);
+    // TPML_PCR_SELECTION
+    buf.extend_from_slice(&(selections.len() as u32).to_be_bytes());
+    for (alg, mask) in selections {
+        buf.extend_from_slice(&alg.to_be_bytes());
+        buf.push(mask.len() as u8);
+        buf.extend_from_slice(mask);
+    }
+    finalise(&mut buf);
+    buf
+}
+
 // ── Response parsing ─────────────────────────────────────────────────
 
 /// Validate a raw TPM 2.0 response buffer. Returns the body slice
@@ -394,4 +606,226 @@ pub fn parse_response(raw: &[u8]) -> Result<&[u8], &'static str> {
         return Err("response size field invalid");
     }
     Ok(&raw[10..size])
+}
+
+// ── Structured response parsers (#941) ────────────────────────────────
+//
+// Before this section the layer could parse exactly one response
+// (GetRandom); Create/Load/Unseal/NV_Read responses were consumed
+// by nobody because nothing could read them. The parsers below
+// follow the Part 3 response layouts, including the sessions-tag
+// framing (parameterSize-delimited parameters, then the
+// authorization area, which these parsers validate by bounds and
+// otherwise ignore).
+
+/// Big-endian cursor over a response parameter area.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
+        if self.pos + n > self.buf.len() {
+            return Err("response parameter truncated");
+        }
+        let out = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(out)
+    }
+
+    fn u16(&mut self) -> Result<u16, &'static str> {
+        let b = self.take(2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, &'static str> {
+        let b = self.take(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Read a TPM2B (u16 size + bytes), returning the inner bytes.
+    fn tpm2b(&mut self) -> Result<&'a [u8], &'static str> {
+        let n = self.u16()? as usize;
+        self.take(n)
+    }
+}
+
+/// Split a response into `(handle, parameters)`: validates the
+/// header/RC via `parse_response`, then, for a sessions-tagged
+/// response, reads the response handle (when `has_handle`) and
+/// bounds the parameters by `parameterSize`. For a no-sessions
+/// response the whole body is the parameter area.
+fn response_params<'a>(
+    raw: &'a [u8],
+    has_handle: bool,
+) -> Result<(Option<u32>, &'a [u8]), &'static str> {
+    let body = parse_response(raw)?;
+    let tag = u16::from_be_bytes([raw[0], raw[1]]);
+    if tag == TPM_ST_NO_SESSIONS {
+        return Ok((None, body));
+    }
+    if tag != TPM_ST_SESSIONS {
+        return Err("response tag not a TPM_ST value");
+    }
+    let mut r = Reader::new(body);
+    let handle = if has_handle { Some(r.u32()?) } else { None };
+    let psize = r.u32()? as usize;
+    let params = r.take(psize)?;
+    Ok((handle, params))
+}
+
+/// The outputs of `TPM2_Create` / `TPM2_CreatePrimary` (Part 3
+/// §12.1/§12.2 share the parameter layout; CreatePrimary adds the
+/// object handle in the response handle area).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateOutputs {
+    /// TPM2B_PRIVATE — the encrypted sensitive area.
+    pub out_private: Vec<u8>,
+    /// TPM2B_PUBLIC inner bytes (TPMT_PUBLIC).
+    pub out_public: Vec<u8>,
+    /// TPM2B_CREATION_DATA inner bytes.
+    pub creation_data: Vec<u8>,
+    /// TPM2B_DIGEST — the creation hash.
+    pub creation_hash: Vec<u8>,
+    /// TPMT_TK_CREATION tag (TPM_ST_CREATION = 0x8021 on silicon).
+    pub ticket_tag: u16,
+    /// TPMT_TK_CREATION hierarchy.
+    pub ticket_hierarchy: u32,
+    /// TPMT_TK_CREATION digest (TPM2B inner bytes).
+    pub ticket_digest: Vec<u8>,
+}
+
+fn parse_create_params(params: &[u8]) -> Result<CreateOutputs, &'static str> {
+    let mut r = Reader::new(params);
+    let out_private = r.tpm2b()?.to_vec();
+    let out_public = r.tpm2b()?.to_vec();
+    let creation_data = r.tpm2b()?.to_vec();
+    let creation_hash = r.tpm2b()?.to_vec();
+    let ticket_tag = r.u16()?;
+    let ticket_hierarchy = r.u32()?;
+    let ticket_digest = r.tpm2b()?.to_vec();
+    Ok(CreateOutputs {
+        out_private,
+        out_public,
+        creation_data,
+        creation_hash,
+        ticket_tag,
+        ticket_hierarchy,
+        ticket_digest,
+    })
+}
+
+/// Parse a `TPM2_Create` response.
+pub fn parse_create_response(raw: &[u8]) -> Result<CreateOutputs, &'static str> {
+    let (_handle, params) = response_params(raw, false)?;
+    parse_create_params(params)
+}
+
+/// Parse a `TPM2_CreatePrimary` response: the created object's
+/// handle plus the shared creation outputs.
+pub fn parse_create_primary_response(raw: &[u8]) -> Result<(u32, CreateOutputs), &'static str> {
+    let (handle, params) = response_params(raw, true)?;
+    let handle = handle.ok_or("create_primary response missing its handle")?;
+    Ok((handle, parse_create_params(params)?))
+}
+
+/// Parse a `TPM2_Load` response: `(objectHandle, name)`.
+pub fn parse_load_response(raw: &[u8]) -> Result<(u32, Vec<u8>), &'static str> {
+    let (handle, params) = response_params(raw, true)?;
+    let handle = handle.ok_or("load response missing its handle")?;
+    let mut r = Reader::new(params);
+    let name = r.tpm2b()?.to_vec();
+    Ok((handle, name))
+}
+
+/// Parse a `TPM2_Unseal` response: the unsealed `outData` bytes.
+pub fn parse_unseal_response(raw: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let (_handle, params) = response_params(raw, false)?;
+    let mut r = Reader::new(params);
+    Ok(r.tpm2b()?.to_vec())
+}
+
+/// Parse a `TPM2_NV_Read` response: the data bytes.
+pub fn parse_nv_read_response(raw: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let (_handle, params) = response_params(raw, false)?;
+    let mut r = Reader::new(params);
+    Ok(r.tpm2b()?.to_vec())
+}
+
+/// Parse a `TPM2_GetTestResult` response: `(outData, testResult)`.
+pub fn parse_get_test_result_response(raw: &[u8]) -> Result<(Vec<u8>, u32), &'static str> {
+    let (_handle, params) = response_params(raw, false)?;
+    let mut r = Reader::new(params);
+    let out_data = r.tpm2b()?.to_vec();
+    let test_result = r.u32()?;
+    Ok((out_data, test_result))
+}
+
+/// Parse a `TPM2_StartAuthSession` response: `(sessionHandle,
+/// nonceTPM)`. The response is no-sessions framed: the handle
+/// sits where a command's first parameter would.
+pub fn parse_start_auth_session_response(raw: &[u8]) -> Result<(u32, Vec<u8>), &'static str> {
+    let body = parse_response(raw)?;
+    let mut r = Reader::new(body);
+    let handle = r.u32()?;
+    let nonce = r.tpm2b()?.to_vec();
+    Ok((handle, nonce))
+}
+
+/// A parsed `TPM2_GetCapability` response envelope; `data` is the
+/// capability-specific payload, decoded by
+/// `parse_tagged_properties` / `parse_pcr_selections` (or the
+/// canonical `narf_tpm` parsers — the framing is identical).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetCapabilityResponse {
+    pub more_data: bool,
+    pub capability: u32,
+    pub data: Vec<u8>,
+}
+
+/// Parse a `TPM2_GetCapability` response envelope (Part 3 §30.2).
+pub fn parse_get_capability_response(raw: &[u8]) -> Result<GetCapabilityResponse, &'static str> {
+    let body = parse_response(raw)?;
+    if body.len() < 5 {
+        return Err("get_capability response too short");
+    }
+    Ok(GetCapabilityResponse {
+        more_data: body[0] != 0,
+        capability: u32::from_be_bytes([body[1], body[2], body[3], body[4]]),
+        data: body[5..].to_vec(),
+    })
+}
+
+/// Decode a TPML_TAGGED_TPM_PROPERTY payload (the `data` of a
+/// TPM_CAP_TPM_PROPERTIES response) into `(tag, value)` pairs.
+pub fn parse_tagged_properties(data: &[u8]) -> Result<Vec<(u32, u32)>, &'static str> {
+    let mut r = Reader::new(data);
+    let count = r.u32()? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let tag = r.u32()?;
+        let value = r.u32()?;
+        out.push((tag, value));
+    }
+    Ok(out)
+}
+
+/// Decode a TPML_PCR_SELECTION payload (the `data` of a
+/// TPM_CAP_PCRS response) into `(algorithm, pcrSelect)` pairs.
+pub fn parse_pcr_selections(data: &[u8]) -> Result<Vec<(u16, Vec<u8>)>, &'static str> {
+    let mut r = Reader::new(data);
+    let count = r.u32()? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let alg = r.u16()?;
+        let size = r.take(1)?[0] as usize;
+        let mask = r.take(size)?.to_vec();
+        out.push((alg, mask));
+    }
+    Ok(out)
 }
