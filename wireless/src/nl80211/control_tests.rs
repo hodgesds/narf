@@ -16,6 +16,285 @@ struct InterfaceStub {
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
+#[path = "lifetime_tests.rs"]
+mod lifetime_tests;
+
+struct CacheNetdev(&'static str);
+impl Drop for CacheNetdev {
+    fn drop(&mut self) {
+        CACHE.lock().retain(|cache| cache.name != self.0);
+        station::unregister_wdev(self.0);
+        crate::registry::unregister(self.0);
+        narf_net::iface::unregister(self.0);
+    }
+}
+fn cache_netdev(name: &'static str) -> (CacheNetdev, Arc<dyn crate::WirelessNetIface>, u32) {
+    let iface: Arc<dyn crate::WirelessNetIface> = Arc::new(InterfaceStub {
+        name,
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+    });
+    narf_net::iface::register(name, iface.mac(), |_, _| Ok(()));
+    crate::registry::register(iface.clone());
+    let index = narf_net::netlink_route::ifindex_for_name(name).unwrap();
+    (CacheNetdev(name), iface, index)
+}
+fn replace_cache_netdev(iface: &dyn crate::WirelessNetIface) -> u32 {
+    narf_net::iface::unregister(iface.name());
+    narf_net::iface::register(iface.name(), iface.mac(), |_, _| Ok(()));
+    narf_net::netlink_route::ifindex_for_name(iface.name()).unwrap()
+}
+fn smoke_nl80211_reused_netdev_name_cannot_inherit_scan_facts() -> TestResult {
+    use core::future::Future;
+    let (_cleanup, iface, index) = cache_netdev("wifi-cache-gen");
+    let guard = begin_operation(iface.name(), 0, index).unwrap();
+    let admin = narf_net::kernel_admin(iface.name()).unwrap();
+    let mut scan = core::pin::pin!(execute(
+        iface.clone(),
+        admin,
+        0,
+        index,
+        Operation::Scan(crate::ScanRequest {
+            ssids: Vec::new(),
+            frequencies_mhz: alloc::vec![5180],
+            channels: Vec::new(),
+            active: false,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
+        })
+    ));
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    if scan.as_mut().poll(&mut cx).is_pending()
+        || cached_bss(iface.as_ref(), 0, index, [2, 1, 2, 3, 4, 5], 5180, b"test").is_err()
+    {
+        return TestResult::Fail("actual stub scan did not populate its own cache");
+    }
+    drop(guard);
+    let replacement = replace_cache_netdev(iface.as_ref());
+    if replacement == index
+        || cached_bss(
+            iface.as_ref(),
+            0,
+            replacement,
+            [2, 1, 2, 3, 4, 5],
+            5180,
+            b"test",
+        )
+        .is_ok()
+    {
+        return TestResult::Fail("new netdev identity inherited old radio scan facts");
+    }
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, 3, &replacement.to_ne_bytes());
+    if !matches!(handle(GET_SCAN,&attrs,true,RequestContext::default()),Ok(ref replies) if replies.is_empty())
+    {
+        return TestResult::Fail("scan dump exposed the old identity's BSS");
+    }
+    let _next = begin_operation(iface.name(), 0, replacement).unwrap();
+    if CACHE
+        .lock()
+        .iter()
+        .any(|c| c.name == iface.name() && (!c.results.is_empty() || c.ifindex != replacement))
+    {
+        return TestResult::Fail("new operation retained stale scan cache");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_reused_netdev_name_cannot_inherit_scan_facts
+);
+fn smoke_nl80211_cancelled_old_operation_cannot_release_new_busy_owner() -> TestResult {
+    let (_cleanup, iface, index) = cache_netdev("wifi-cache-op");
+    let old = begin_operation(iface.name(), 0, index).unwrap();
+    let replacement = replace_cache_netdev(iface.as_ref());
+    let new = begin_operation(iface.name(), 0, replacement).unwrap();
+    if !matches!(begin_operation(iface.name(), 0, index), Err(ENODEV)) {
+        return TestResult::Fail("stale admission replaced the new radio's busy owner");
+    }
+    drop(old);
+    if !matches!(begin_operation(iface.name(), 0, replacement), Err(EBUSY)) {
+        return TestResult::Fail("old operation drop released new radio's busy owner");
+    }
+    drop(new);
+    if begin_operation(iface.name(), 0, replacement).is_err() {
+        return TestResult::Fail("current operation failed to release its own busy owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_cancelled_old_operation_cannot_release_new_busy_owner
+);
+
+struct CacheWaitIface {
+    base: InterfaceStub,
+    scan_ready: core::sync::atomic::AtomicBool,
+    associate_ready: core::sync::atomic::AtomicBool,
+    associations: core::sync::atomic::AtomicUsize,
+    disconnects: core::sync::atomic::AtomicUsize,
+}
+impl Interface for CacheWaitIface {
+    fn name(&self) -> &str {
+        self.base.name()
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.base.mac()
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        false
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.base.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.base.tx
+    }
+}
+#[async_trait::async_trait]
+impl crate::WirelessNetIface for CacheWaitIface {
+    fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
+        crate::WirelessNetIface::get_wireless_info(&self.base)
+    }
+    async fn scan(
+        &self,
+        request: crate::ScanRequest,
+    ) -> Result<Vec<crate::BssInfo>, crate::WirelessError> {
+        core::future::poll_fn(|_| {
+            if self.scan_ready.load(core::sync::atomic::Ordering::Acquire) {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+        .await;
+        crate::WirelessNetIface::scan(&self.base, request).await
+    }
+    async fn associate(&self, _: crate::AssociateRequest) -> Result<(), crate::WirelessError> {
+        self.associations
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        core::future::poll_fn(|_| {
+            if self
+                .associate_ready
+                .load(core::sync::atomic::Ordering::Acquire)
+            {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+        .await;
+        Ok(())
+    }
+    async fn disassociate(&self) -> Result<(), crate::WirelessError> {
+        self.disconnects
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    async fn set_config(&self, _: crate::WirelessConfig) -> Result<(), crate::WirelessError> {
+        Err(crate::WirelessError::NotSupported)
+    }
+}
+fn smoke_nl80211_retired_async_connect_cannot_touch_replacement_or_publish() -> TestResult {
+    use core::{
+        future::Future,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::{Context, Waker},
+    };
+    let _sink = SinkRestore(narf_net::netlink_generic::install_event_sink(interop_sink));
+    for held_scan in [true, false] {
+        let name = if held_scan {
+            "wifi-wait-scan"
+        } else {
+            "wifi-wait-join"
+        };
+        let (_cleanup, _, index) = cache_netdev(name);
+        let iface = Arc::new(CacheWaitIface {
+            base: InterfaceStub {
+                name,
+                rx: IrqSafeSpinLock::new(None),
+                tx: IrqSafeSpinLock::new(None),
+            },
+            scan_ready: AtomicBool::new(!held_scan),
+            associate_ready: AtomicBool::new(false),
+            associations: AtomicUsize::new(0),
+            disconnects: AtomicUsize::new(0),
+        });
+        crate::registry::register(iface.clone());
+        let old = begin_operation(name, 0, index).unwrap();
+        let mut operation = core::pin::pin!(execute(
+            iface.clone(),
+            narf_net::kernel_admin(name).unwrap(),
+            0,
+            index,
+            Operation::Connect {
+                ssid: b"test".to_vec(),
+                bssid: Some([2, 1, 2, 3, 4, 5]),
+                frequency_mhz: Some(5180),
+                cred: Credential::Psk(Zeroizing::new([0x11; 32])),
+                ie: Vec::new(),
+                owner: None
+            }
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        INTEROP_EVENTS.lock().clear();
+        if operation.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("held scan/association completed without a receipt");
+        }
+        let replacement = replace_cache_netdev(iface.as_ref());
+        let new = begin_operation(name, 0, replacement).unwrap();
+        station::set_owner(name, 0, 99, Some([2, 9, 9, 9, 9, 9]));
+        let marker = crate::BssInfo {
+            bssid: [2, 9, 9, 9, 9, 9],
+            ssid: b"replacement".to_vec(),
+            frequency_mhz: 5180,
+            channel: 36,
+            rssi: -91,
+            security: crate::scan::BssSecurity::Open,
+        };
+        CACHE
+            .lock()
+            .iter_mut()
+            .find(|c| c.matches(name, 0, replacement))
+            .unwrap()
+            .results = alloc::vec![(marker.clone(), Vec::new())];
+        iface.scan_ready.store(true, Ordering::Release);
+        iface.associate_ready.store(true, Ordering::Release);
+        if operation.as_mut().poll(&mut cx).is_pending() {
+            return TestResult::Fail("retired native operation did not terminate");
+        }
+        drop(old);
+        if iface.associations.load(Ordering::Relaxed) != usize::from(!held_scan)
+            || iface.disconnects.load(Ordering::Relaxed) != usize::from(!held_scan)
+            || !INTEROP_EVENTS.lock().is_empty()
+            || station::check_owner(name, 99).is_err()
+            || station::check_owner(name, 77).is_ok()
+            || CACHE
+                .lock()
+                .iter()
+                .find(|c| c.matches(name, 0, replacement))
+                .is_none_or(|c| {
+                    !c.busy || c.results.len() != 1 || c.results[0].0.bssid != marker.bssid
+                })
+        {
+            return TestResult::Fail(
+                "retired CONNECT altered replacement owner/cache or published an old event",
+            );
+        }
+        drop(new);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_retired_async_connect_cannot_touch_replacement_or_publish
+);
 impl Interface for InterfaceStub {
     fn name(&self) -> &str {
         self.name
@@ -248,6 +527,7 @@ fn smoke_nl80211_authority_and_scan_completion() -> TestResult {
     });
     narf_net::iface::register(iface.name(), iface.mac(), |_, _| Ok(()));
     crate::registry::register(iface.clone());
+    let _cleanup = CacheNetdev("nlwifi-test");
     let index = narf_net::netlink_route::ifindex_for_name(iface.name()).unwrap();
     let mut attrs = Vec::new();
     push_attr(&mut attrs, 3, &index.to_ne_bytes());
@@ -273,23 +553,13 @@ fn smoke_nl80211_authority_and_scan_completion() -> TestResult {
     ) {
         return TestResult::Fail("cross-interface capability accepted");
     }
-    // Use the public synthetic-loopback authority for a standalone stub,
-    // without registering or changing the real loopback interface.
-    let iface: Arc<dyn crate::WirelessNetIface> = Arc::new(InterfaceStub {
-        name: "lo",
-        rx: IrqSafeSpinLock::new(None),
-        tx: IrqSafeSpinLock::new(None),
-    });
-    let admin = narf_net::initial_loopback_admin();
+    // Positive authority must bind an actual registered netdev lifetime;
+    // rtnetlink's synthetic loopback entry is not a wireless radio.
+    let admin = narf_net::kernel_admin(iface.name()).unwrap();
     if !authorized(&admin, iface.as_ref(), 0) || authorized(&admin, iface.as_ref(), 99) {
         return TestResult::Fail("namespace-bound admin validation");
     }
-    CACHE.lock().push(Cache {
-        name: iface.name().into(),
-        namespace: 0,
-        busy: true,
-        results: Vec::new(),
-    });
+    let guard = begin_operation(iface.name(), 0, index).unwrap();
     narf_scheduler::block_on_spin(execute(
         iface.clone(),
         admin.clone(),
@@ -310,7 +580,7 @@ fn smoke_nl80211_authority_and_scan_completion() -> TestResult {
     let cached = CACHE
         .lock()
         .iter()
-        .find(|c| c.name == "lo")
+        .find(|c| c.matches(iface.name(), 0, index))
         .unwrap()
         .results
         .clone();
@@ -322,7 +592,7 @@ fn smoke_nl80211_authority_and_scan_completion() -> TestResult {
     {
         return TestResult::Fail("native scan did not populate Linux dump");
     }
-    drop(OperationGuard(iface.name().into()));
+    drop(guard);
     if CACHE
         .lock()
         .iter()
@@ -714,6 +984,7 @@ fn smoke_nl80211_supplicant_interop() -> TestResult {
     CACHE.lock().retain(|c| c.name != INTEROP_NAME);
     CACHE.lock().push(Cache {
         name: INTEROP_NAME.into(),
+        ifindex,
         namespace: 0,
         busy: true,
         results: Vec::new(),
@@ -1219,6 +1490,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
     CACHE.lock().retain(|c| c.name != SME_NAME);
     CACHE.lock().push(Cache {
         name: SME_NAME.into(),
+        ifindex,
         namespace: 0,
         busy: false,
         results: alloc::vec![(
@@ -1835,6 +2107,7 @@ fn smoke_nl80211_connect_to_new_bss_roams() -> TestResult {
     CACHE.lock().retain(|c| c.name != ROAM_NAME);
     CACHE.lock().push(Cache {
         name: ROAM_NAME.into(),
+        ifindex,
         namespace: 0,
         busy: true,
         results: Vec::new(),
@@ -1991,6 +2264,7 @@ fn smoke_nl80211_passive_only_wiphy_scan_limit_and_connect_discovery() -> TestRe
     CACHE.lock().retain(|c| c.name != PASSIVE_NAME);
     CACHE.lock().push(Cache {
         name: PASSIVE_NAME.into(),
+        ifindex,
         namespace: 0,
         busy: true,
         results: Vec::new(),

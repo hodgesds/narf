@@ -69,6 +69,64 @@ headers and transport source under the repository's GPL-2.0 licensing.
 
 ## 3. Public Interface
 
+nl80211 scan caches and pending-operation guards bind the netdev's current
+ifindex and namespace as well as its name. Removing and recreating a same-named
+interface cannot inherit its predecessor's BSS facts, suppress fresh discovery,
+or let a late old operation release the replacement's busy guard. Scan dumps,
+station signal fallback and SME/CONNECT lookups respect that lifetime; native
+driver permissions and association receipts remain separately required.
+Stale operation admission fails before cache mutation. Asynchronous scan and
+CONNECT continuations recheck the captured identity before further dispatch,
+cache updates and events; retired completions cannot clear a replacement's
+connection owner or emit CONNECT/PORT_AUTHORIZED for an old index.
+Userspace-SME futures check that identity before each native poll and notification.
+Connection-owner grants and teardown claims also carry distinct monotonic
+tokens: reusing the same socket port ID on a live netdev cannot let an older
+queued release or held teardown act on the new grant. Owner/port mutations
+validate identity under the owner lock, and replacement or namespace movement
+resets peer, control-port and cached power-save state.
+
+`association::phy::{LocalHt, LocalVht, LocalPhy}` describes a native driver's
+implemented directional RX/TX limits. Checked HT20/HT40/VHT80 constructors
+encode only local equal-modulation HT MCS0..31, directional VHT MCS/NSS maps,
+GI and aggregation limits; optional LDPC/STBC/beamforming, extended NSS/BW and
+large A-MSDU remain absent. Local HT RX/TX include mandatory MCS0..7.
+`with_tx_selection` checks a nonempty subset of actual TX support for rate
+selection without changing capability IEs or granting transmit authority.
+These factual values are not capabilities and
+grant no channel, power, key, BA, controlled-port or publication authority.
+`ApElements::parse` validates an entire IE stream of at most2048 bytes with
+exact singleton HT Capabilities/Operation and VHT Capabilities/Operation pairs.
+`observe_with_phy` and `JoinPlan::prepare_with_phy` opt into this admission;
+the latter reparses the actual BSS and retains a private `Offer` bound to its
+addresses, primary channel and original mode/rate offer. Legacy entry points
+retain their existing membership-selector rejection.
+
+The opt-in path admits mandatory HT127/VHT126 membership selectors only with
+the corresponding complete compatible PHY, while preserving actual legacy
+basic rates for management frames. GLK/EPD/SAE-H2E/HE/EHT/UHR and unknown
+mandatory selectors remain unsupported. Optional unflagged values grant no
+membership. Present malformed or orphan PHY elements fail instead of becoming
+legacy fallback. Missing optional PHY can retain legacy operation. Generated
+local capability IEs are protocol-owned; caller HT/VHT capabilities and, on
+this path, HT/VHT Operation IEs are rejected before first transmission.
+
+`offered_phy()` and `negotiated_phy()` expose read-only directional HT/VHT
+facts, the selected width/center and complete occupied20MHz channel set.
+TX intersects local implementation with AP RX from both scan and response;
+local advertised RX limits and AP TX metadata remain independent. Strict
+HT Basic MCS and both-direction VHT Basic MCS/NSS checks apply, including
+the all-eight-NSS requirement of VHT basic map0. Selected HT requires a bound
+complete response pair. VHT width0 delegates to HT; contiguous80MHz validates
+all four canonical constituents and the matching HT40 primary pair. No
+160/80+80/revised nonzero second segment or extended NSS/BW admission exists.
+A response may narrow the original occupied set but cannot expand it. All
+address/status/AID/security/rate/membership/PHY checks precede one atomic
+rate/PHY/Associated transition; failure leaves old rates and no partial PHY
+result. Drivers must separately reconfigure native state on narrowing, program
+protection/EDCA/peer records, enforce current regulatory and measured power
+authority for every occupied channel, and complete key/port transactions.
+
 `wmm::{Parameters, Ac, Error, INFORMATION}` parses one WMM v1 Parameter
 element in a complete IE stream of at most4096 bytes. It validates exact
 OUI/type/subtype/version/length/reserved fields and four distinct ACIs, and

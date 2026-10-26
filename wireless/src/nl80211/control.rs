@@ -95,20 +95,67 @@ static ROC_COOKIE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 
 struct Cache {
     name: String,
+    ifindex: u32,
     namespace: u64,
     busy: bool,
     results: Vec<(crate::BssInfo, Vec<u8>)>,
 }
+impl Cache {
+    fn matches(&self, name: &str, namespace: u64, index: u32) -> bool {
+        self.name == name && self.namespace == namespace && self.ifindex == index
+    }
+}
 static CACHE: IrqSafeSpinLock<Vec<Cache>> = IrqSafeSpinLock::new(Vec::new());
 
 // Clearing on Drop also covers cancellation before the first poll.
-struct OperationGuard(String);
+struct OperationGuard(String, u32, u64);
 impl Drop for OperationGuard {
     fn drop(&mut self) {
-        if let Some(cache) = CACHE.lock().iter_mut().find(|c| c.name == self.0) {
+        if let Some(cache) = CACHE
+            .lock()
+            .iter_mut()
+            .find(|c| c.matches(&self.0, self.2, self.1))
+        {
             cache.busy = false;
         }
     }
+}
+
+/// Names can be reused after netdev removal. A new identity must not inherit
+/// scan facts or an in-flight operation from the previous radio at that name.
+fn begin_operation(name: &str, namespace: u64, index: u32) -> Result<OperationGuard, i32> {
+    let mut caches = CACHE.lock();
+    // Recheck after acquiring cache ownership. A caller resolved before
+    // removal cannot replace a newer owner's cache using its stale index.
+    // Net lookup returns an owned snapshot and never acquires CACHE.
+    if narf_net::iface::lookup_in(namespace, name).is_none_or(|link| link.ifindex != index) {
+        return Err(ENODEV);
+    }
+    if let Some(cache) = caches.iter_mut().find(|c| c.name == name) {
+        if cache.ifindex != index {
+            cache.ifindex = index;
+            cache.namespace = namespace;
+            cache.results.clear();
+            cache.busy = false;
+        }
+        if cache.busy {
+            return Err(EBUSY);
+        }
+        if cache.namespace != namespace {
+            cache.results.clear();
+            cache.namespace = namespace;
+        }
+        cache.busy = true;
+    } else {
+        caches.push(Cache {
+            name: name.into(),
+            ifindex: index,
+            namespace,
+            busy: true,
+            results: Vec::new(),
+        });
+    }
+    Ok(OperationGuard(name.into(), index, namespace))
 }
 
 enum Operation {
@@ -364,6 +411,17 @@ fn he_bss_color_config(raw: &[u8]) -> Result<crate::HeBssColorConfig, i32> {
 
 fn authorized(admin: &narf_net::AdminHandle, iface: &dyn crate::WirelessNetIface, ns: u64) -> bool {
     admin.authorize_interface(iface.name(), ns).is_ok()
+}
+fn current_link(iface: &dyn crate::WirelessNetIface, ns: u64, index: u32) -> bool {
+    narf_net::iface::lookup_in(ns, iface.name()).is_some_and(|link| link.ifindex == index)
+}
+fn authorized_link(
+    admin: &narf_net::AdminHandle,
+    iface: &dyn crate::WirelessNetIface,
+    ns: u64,
+    index: u32,
+) -> bool {
+    authorized(admin, iface, ns) && current_link(iface, ns, index)
 }
 
 /// The handle a mutating request acts with on `iface`, or -EPERM.
@@ -1013,7 +1071,7 @@ pub(super) fn handle(
         let cache = CACHE.lock();
         let results = cache
             .iter()
-            .find(|c| c.name == iface.name() && c.namespace == context.net_ns_id)
+            .find(|c| c.matches(iface.name(), context.net_ns_id, index))
             .map(|c| c.results.as_slice())
             .unwrap_or_default();
         return Ok(results
@@ -1034,28 +1092,7 @@ pub(super) fn handle(
         ConnectCaps::of(iface.as_ref()),
         context.portid,
     )?;
-    let name = String::from(iface.name());
-    {
-        let mut caches = CACHE.lock();
-        if let Some(cache) = caches.iter_mut().find(|c| c.name == name) {
-            if cache.busy {
-                return Err(EBUSY);
-            }
-            if cache.namespace != context.net_ns_id {
-                cache.results.clear();
-                cache.namespace = context.net_ns_id;
-            }
-            cache.busy = true;
-        } else {
-            caches.push(Cache {
-                name: name.clone(),
-                namespace: context.net_ns_id,
-                busy: true,
-                results: Vec::new(),
-            });
-        }
-    }
-    let guard = OperationGuard(name);
+    let guard = begin_operation(iface.name(), context.net_ns_id, index)?;
     let namespace = context.net_ns_id;
     match &operation {
         // nl80211_connect: `if (!err && SOCKET_OWNER) conn_owner_nlportid =
@@ -1064,13 +1101,13 @@ pub(super) fn handle(
             owner, cred, bssid, ..
         } => {
             if let Some(portid) = owner {
-                station::set_owner(iface.name(), namespace, *portid, *bssid);
+                station::set_owner_for_link(iface.name(), namespace, index, *portid, *bssid)?;
             }
             let over = matches!(cred, Credential::External(e) if e.control_port.over_nl80211);
-            station::set_control_port(iface.name(), namespace, over);
+            station::set_control_port_for_link(iface.name(), namespace, index, over)?;
         }
         // cfg80211_disconnect: the owner goes first.
-        Operation::Disconnect => station::clear_owner(iface.name()),
+        Operation::Disconnect => station::clear_owner_for_link(iface.name(), namespace, index)?,
         Operation::Scan(_) => {}
     }
     narf_scheduler::spawn(async move {
@@ -2155,7 +2192,7 @@ fn interface_handle(
                         CACHE
                             .lock()
                             .iter()
-                            .find(|c| c.name == iface.name() && c.namespace == context.net_ns_id)
+                            .find(|c| c.matches(iface.name(), context.net_ns_id, index))
                             .and_then(|c| c.results.iter().find(|(bss, _)| bss.bssid == peer))
                             .map(|(bss, _)| bss.rssi)
                     })
@@ -2330,7 +2367,7 @@ fn publish_mlme_frame_ie(
     frame: &[u8],
     req_ie: &[u8],
 ) {
-    if !super::in_namespace(iface, ns) {
+    if !current_link(iface, ns, index) {
         return;
     }
     let mut attrs = Vec::new();
@@ -2387,7 +2424,7 @@ fn publish_assoc_comeback(
     peer: [u8; 6],
     timeout_tu: u32,
 ) {
-    if !super::in_namespace(iface, ns) {
+    if !current_link(iface, ns, index) {
         return;
     }
     let mut attrs = Vec::new();
@@ -2433,11 +2470,42 @@ enum MlmeExec {
     },
 }
 
+/// Cancel before polling a retired native owner again. A check only after
+/// `.await` can suppress its event while still running an old continuation.
+async fn current_mlme<F: core::future::Future>(
+    iface: &dyn crate::WirelessNetIface,
+    ns: u64,
+    index: u32,
+    future: F,
+) -> Option<F::Output> {
+    let mut future = core::pin::pin!(future);
+    let result = core::future::poll_fn(|cx| {
+        if !current_link(iface, ns, index) {
+            return core::task::Poll::Ready(None);
+        }
+        future.as_mut().poll(cx).map(Some)
+    })
+    .await;
+    if current_link(iface, ns, index) {
+        result
+    } else {
+        None
+    }
+}
+
 async fn run_mlme(iface: Arc<dyn crate::WirelessNetIface>, ns: u64, index: u32, exec: MlmeExec) {
+    if !current_link(iface.as_ref(), ns, index) {
+        return;
+    }
     match exec {
         MlmeExec::Authenticate(request) => {
             let peer = request.peer;
-            match iface.mlme_authenticate(request).await {
+            let Some(result) =
+                current_mlme(iface.as_ref(), ns, index, iface.mlme_authenticate(request)).await
+            else {
+                return;
+            };
+            match result {
                 // cfg80211_rx_mlme_mgmt → nl80211_send_rx_auth.
                 Ok(frame) => publish_mlme_frame(iface.as_ref(), ns, index, AUTHENTICATE, &frame),
                 // cfg80211_auth_timeout.
@@ -2450,7 +2518,12 @@ async fn run_mlme(iface: Arc<dyn crate::WirelessNetIface>, ns: u64, index: u32, 
         MlmeExec::Associate(request) => {
             let peer = request.peer;
             let req_ie = request.ie.clone();
-            match iface.mlme_associate(request).await {
+            let Some(result) =
+                current_mlme(iface.as_ref(), ns, index, iface.mlme_associate(request)).await
+            else {
+                return;
+            };
+            match result {
                 // cfg80211_rx_assoc_resp: the frame (+ REQ_IE), then the
                 // connect result from its status code.
                 Ok(frame) => {
@@ -2462,8 +2535,10 @@ async fn run_mlme(iface: Arc<dyn crate::WirelessNetIface>, ns: u64, index: u32, 
                     if let Some(timeout_tu) = assoc_comeback_tu(&frame) {
                         publish_assoc_comeback(iface.as_ref(), ns, index, peer, timeout_tu);
                     } else {
-                        if status != 0 {
-                            station::clear_owner(iface.name());
+                        if status != 0
+                            && station::clear_owner_for_link(iface.name(), ns, index).is_err()
+                        {
+                            return;
                         }
                         publish_connect_result(
                             iface.as_ref(),
@@ -2487,14 +2562,28 @@ async fn run_mlme(iface: Arc<dyn crate::WirelessNetIface>, ns: u64, index: u32, 
             // A driver that reports its own disconnects emits the
             // DEAUTHENTICATE + DISCONNECT pair of its teardown
             // ([`station::notify_mlme_disconnect`]) itself.
-            if let Ok(frame) = iface.mlme_deauthenticate(peer, reason).await {
+            if let Some(Ok(frame)) = current_mlme(
+                iface.as_ref(),
+                ns,
+                index,
+                iface.mlme_deauthenticate(peer, reason),
+            )
+            .await
+            {
                 if !iface.reports_disconnect_events() {
                     publish_mlme_frame(iface.as_ref(), ns, index, DEAUTHENTICATE, &frame);
                 }
             }
         }
         MlmeExec::Disassociate { peer, reason } => {
-            if let Ok(frame) = iface.mlme_disassociate(peer, reason).await {
+            if let Some(Ok(frame)) = current_mlme(
+                iface.as_ref(),
+                ns,
+                index,
+                iface.mlme_disassociate(peer, reason),
+            )
+            .await
+            {
                 if !iface.reports_disconnect_events() {
                     publish_mlme_frame(iface.as_ref(), ns, index, DISASSOCIATE, &frame);
                 }
@@ -2502,8 +2591,13 @@ async fn run_mlme(iface: Arc<dyn crate::WirelessNetIface>, ns: u64, index: u32, 
         }
         MlmeExec::MgmtTx { cookie, request } => {
             let sent = request.frame.clone();
-            let acked = iface.mgmt_tx(cookie, request).await.unwrap_or(false);
-            if super::in_namespace(iface.as_ref(), ns) {
+            let Some(result) =
+                current_mlme(iface.as_ref(), ns, index, iface.mgmt_tx(cookie, request)).await
+            else {
+                return;
+            };
+            let acked = result.unwrap_or(false);
+            if current_link(iface.as_ref(), ns, index) {
                 let mut attrs = Vec::new();
                 push_attr(&mut attrs, 3, &index.to_ne_bytes());
                 push_attr(&mut attrs, 51, &sent);
@@ -2523,7 +2617,13 @@ async fn run_mlme(iface: Arc<dyn crate::WirelessNetIface>, ns: u64, index: u32, 
             }
         }
         MlmeExec::ExternalAuth { bssid, status } => {
-            let _ = iface.external_auth_status(bssid, status).await;
+            let _ = current_mlme(
+                iface.as_ref(),
+                ns,
+                index,
+                iface.external_auth_status(bssid, status),
+            )
+            .await;
         }
     }
 }
@@ -2637,14 +2737,18 @@ fn mlme_handle(
 fn cached_bss(
     iface: &dyn crate::WirelessNetIface,
     ns: u64,
+    index: u32,
     bssid: [u8; 6],
     frequency_mhz: u32,
     ssid: &[u8],
 ) -> Result<crate::BssInfo, i32> {
-    CACHE
-        .lock()
+    let caches = CACHE.lock();
+    if !current_link(iface, ns, index) {
+        return Err(ENOENT);
+    }
+    caches
         .iter()
-        .find(|c| c.name == iface.name() && c.namespace == ns)
+        .find(|c| c.name == iface.name() && c.ifindex == index && c.namespace == ns)
         .and_then(|c| {
             c.results.iter().find(|(b, _)| {
                 b.bssid == bssid && b.frequency_mhz == frequency_mhz && b.ssid == ssid
@@ -2720,7 +2824,7 @@ fn sme_command(
             if attr(attrs, 313).is_some() {
                 return Err(EINVAL); // no WIPHY_FLAG_SUPPORTS_MLO
             }
-            cached_bss(iface.as_ref(), ns, peer, frequency_mhz, ssid)?;
+            cached_bss(iface.as_ref(), ns, index, peer, frequency_mhz, ssid)?;
             // cfg80211_mlme_auth.
             if iface.connected_bssid() == Some(peer) {
                 return Err(EALREADY);
@@ -2777,7 +2881,7 @@ fn sme_command(
             if ssid.len() > 32 {
                 return Err(EINVAL);
             }
-            let bss = cached_bss(iface.as_ref(), ns, peer, freq, ssid)?;
+            let bss = cached_bss(iface.as_ref(), ns, index, peer, freq, ssid)?;
             // nl80211_crypto_settings.
             let port = control_port(attrs, iface.supports_external_supplicant())?;
             crypto_suites(attrs, station::cipher_suites(iface.as_ref()), 1)?;
@@ -2791,9 +2895,9 @@ fn sme_command(
                 return Err(EINVAL);
             }
             if attr(attrs, 204).is_some() {
-                station::set_owner(iface.name(), ns, context.portid, Some(peer));
+                station::set_owner_for_link(iface.name(), ns, index, context.portid, Some(peer))?;
             }
-            station::set_control_port(iface.name(), ns, port.over_nl80211);
+            station::set_control_port_for_link(iface.name(), ns, index, port.over_nl80211)?;
             let request = crate::MlmeAssocRequest {
                 peer,
                 ssid: ssid.to_vec(),
@@ -2827,7 +2931,7 @@ fn sme_command(
                 }
                 let target = station::with_wdev(iface.name(), ns, |w| w.disconnect_bssid);
                 if target == peer || connected == Some(peer) {
-                    station::clear_owner(iface.name());
+                    station::clear_owner_for_link(iface.name(), ns, index)?;
                 }
                 MlmeExec::Deauthenticate { peer, reason }
             } else {
@@ -2851,7 +2955,7 @@ fn publish_mlme_timeout(
     command: u8,
     peer: [u8; 6],
 ) {
-    if !super::in_namespace(iface, ns) {
+    if !current_link(iface, ns, index) {
         return;
     }
     let mut attrs = Vec::new();
@@ -2876,7 +2980,7 @@ fn publish_connect_result(
     req_ie: &[u8],
     resp_ie: &[u8],
 ) {
-    if !super::in_namespace(iface, ns) {
+    if !current_link(iface, ns, index) {
         return;
     }
     let mut attrs = Vec::new();
@@ -3554,7 +3658,7 @@ async fn execute(
 ) {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, 3, &index.to_ne_bytes());
-    let live = authorized(&admin, iface.as_ref(), ns);
+    let live = authorized_link(&admin, iface.as_ref(), ns, index);
     // The peer whose controlled port opened with this connect.
     let mut port_authorized = None;
     let (command, group) = match operation {
@@ -3566,7 +3670,7 @@ async fn execute(
             };
             if let Ok(mut results) = result {
                 results.truncate(256);
-                if authorized(&admin, iface.as_ref(), ns) {
+                if authorized_link(&admin, iface.as_ref(), ns, index) {
                     let results = results
                         .into_iter()
                         .map(|bss| {
@@ -3576,7 +3680,11 @@ async fn execute(
                             (bss, ies)
                         })
                         .collect();
-                    if let Some(cache) = CACHE.lock().iter_mut().find(|c| c.name == iface.name()) {
+                    if let Some(cache) = CACHE
+                        .lock()
+                        .iter_mut()
+                        .find(|c| c.matches(iface.name(), ns, index))
+                    {
                         cache.results = results;
                     }
                     (34, 18)
@@ -3604,9 +3712,7 @@ async fn execute(
                 }
                 selected = {
                     let cache = CACHE.lock();
-                    let results = cache
-                        .iter()
-                        .find(|c| c.name == iface.name() && c.namespace == ns);
+                    let results = cache.iter().find(|c| c.matches(iface.name(), ns, index));
                     results.and_then(|c| {
                         select_bss(
                             c.results.iter().map(|(b, _)| b),
@@ -3641,7 +3747,7 @@ async fn execute(
                         .await?;
                     results.truncate(256);
                     selected = select_bss(results.iter(), &ssid, bssid, frequency_mhz, akm);
-                    if !authorized(&admin, iface.as_ref(), ns) {
+                    if !authorized_link(&admin, iface.as_ref(), ns, index) {
                         return Err(crate::WirelessError::Denied);
                     }
                     let entries = results
@@ -3653,12 +3759,16 @@ async fn execute(
                             (bss, ies)
                         })
                         .collect();
-                    if let Some(cache) = CACHE.lock().iter_mut().find(|c| c.name == iface.name()) {
+                    if let Some(cache) = CACHE
+                        .lock()
+                        .iter_mut()
+                        .find(|c| c.matches(iface.name(), ns, index))
+                    {
                         cache.results = entries;
                     }
                 }
                 let bss = selected.as_ref().ok_or(crate::WirelessError::InvalidArgs)?;
-                if !authorized(&admin, iface.as_ref(), ns) {
+                if !authorized_link(&admin, iface.as_ref(), ns, index) {
                     return Err(crate::WirelessError::Denied);
                 }
                 let security = match &cred {
@@ -3689,7 +3799,7 @@ async fn execute(
                 }
             }
             .await;
-            let still_live = authorized(&admin, iface.as_ref(), ns);
+            let still_live = authorized_link(&admin, iface.as_ref(), ns, index);
             if result.is_ok() && !still_live {
                 let _ = iface.disassociate().await;
             }
@@ -3712,7 +3822,7 @@ async fn execute(
             push_attr(&mut attrs, 72, &status.to_ne_bytes());
             if status != 0 {
                 // __cfg80211_connect_result failure: owner cleared.
-                station::clear_owner(iface.name());
+                let _ = station::clear_owner_for_link(iface.name(), ns, index);
             }
             // A successful move to a new BSS is a ROAM event; a fresh
             // association is a CONNECT. Failures report as CONNECT(status!=0).
@@ -3736,9 +3846,9 @@ async fn execute(
     };
     // A namespace move during a firmware wait must not leak its new
     // interface state into the previous namespace's event listeners.
-    if super::in_namespace(iface.as_ref(), ns) {
+    if current_link(iface.as_ref(), ns, index) {
         publish_event(NL80211_FAMILY_ID, group, ns, GenlReply { command, attrs });
-        if let Some(peer) = port_authorized {
+        if let Some(peer) = port_authorized.filter(|_| current_link(iface.as_ref(), ns, index)) {
             publish_event(
                 NL80211_FAMILY_ID,
                 19,
@@ -3764,6 +3874,7 @@ pub async fn connect_for_test(
     if !authorized(&admin, iface.as_ref(), 0) {
         return Err(EPERM);
     }
+    let _guard = begin_operation(iface.name(), 0, index)?;
     execute(iface, admin, 0, index, operation).await;
     Ok(())
 }

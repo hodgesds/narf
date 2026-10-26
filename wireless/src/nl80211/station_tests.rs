@@ -44,6 +44,7 @@ struct ExtStub {
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     connected: AtomicBool,
+    disconnect_ready: AtomicBool,
     calls: IrqSafeSpinLock<Vec<Call>>,
 }
 
@@ -118,8 +119,16 @@ impl crate::WirelessNetIface for ExtStub {
         Ok(())
     }
     async fn disassociate(&self) -> Result<(), crate::WirelessError> {
-        self.connected.store(false, Ordering::SeqCst);
         self.calls.lock().push(Call::Disassociate);
+        core::future::poll_fn(|_| {
+            if self.disconnect_ready.load(Ordering::Acquire) {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+        .await;
+        self.connected.store(false, Ordering::SeqCst);
         Ok(())
     }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
@@ -229,16 +238,31 @@ impl Drop for Rig {
 fn rig() -> Result<Rig, &'static str> {
     super::super::register();
     crate::registry::unregister(NAME);
-    let stub = Arc::new(ExtStub {
-        rx: IrqSafeSpinLock::new(None),
-        tx: IrqSafeSpinLock::new(None),
-        connected: AtomicBool::new(false),
-        calls: IrqSafeSpinLock::new(Vec::new()),
-    });
+    let stub = ext_stub();
     narf_net::iface::register(NAME, MAC, |_, _| Ok(()));
     crate::registry::register(stub.clone());
     let ifindex = narf_net::netlink_route::ifindex_for_name(NAME).ok_or("ifindex")?;
     Ok(Rig { stub, ifindex })
+}
+
+fn ext_stub() -> Arc<ExtStub> {
+    Arc::new(ExtStub {
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+        connected: AtomicBool::new(false),
+        disconnect_ready: AtomicBool::new(true),
+        calls: IrqSafeSpinLock::new(Vec::new()),
+    })
+}
+
+fn replace_owner_netdev() -> (Arc<ExtStub>, u32) {
+    crate::registry::unregister(NAME);
+    narf_net::iface::unregister(NAME);
+    let stub = ext_stub();
+    narf_net::iface::register(NAME, MAC, |_, _| Ok(()));
+    crate::registry::register(stub.clone());
+    let index = narf_net::netlink_route::ifindex_for_name(NAME).unwrap();
+    (stub, index)
 }
 
 fn ctx(portid: u32) -> RequestContext<'static> {
@@ -1070,3 +1094,334 @@ fn smoke_nl80211_ext_connect_owner_release() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("wireless/nl80211", smoke_nl80211_ext_connect_owner_release);
+
+fn smoke_nl80211_owner_mutations_reject_retired_registration() -> TestResult {
+    let Ok(r) = rig() else {
+        return TestResult::Fail("rig");
+    };
+    station::set_owner_for_link(NAME, 0, r.ifindex, 41, Some(AP)).unwrap();
+    station::set_control_port_for_link(NAME, 0, r.ifindex, true).unwrap();
+    station::with_wdev(NAME, 0, |w| w.ps = Some(false));
+    let (_replacement, index) = replace_owner_netdev();
+    if index == r.ifindex
+        || station::conn_owner(NAME) != 0
+        || crate::nl80211::control_port_over_nl80211(NAME)
+        || crate::nl80211::rx_control_port(NAME, AP, 0x888e, &[1], true)
+        || station::with_wdev(NAME, 0, |w| {
+            w.ifindex != Some(index)
+                || w.ps.is_some()
+                || w.disconnect_bssid != [0; 6]
+                || w.control_port_over_nl80211
+        })
+    {
+        return TestResult::Fail("replacement inherited owner/port/peer/PS facts");
+    }
+    station::set_owner_for_link(NAME, 0, index, 93, Some(MAC)).unwrap();
+    station::set_control_port_for_link(NAME, 0, index, true).unwrap();
+    station::with_wdev(NAME, 0, |w| w.ps = Some(false));
+    if station::set_owner_for_link(NAME, 0, r.ifindex, 41, Some(AP)) != Err(ENODEV)
+        || station::set_control_port_for_link(NAME, 0, r.ifindex, false) != Err(ENODEV)
+        || station::clear_owner_for_link(NAME, 0, r.ifindex) != Err(ENODEV)
+        || station::set_owner_for_link(NAME, 99, index, 41, Some(AP)) != Err(ENODEV)
+        || station::conn_owner(NAME) != 93
+        || !crate::nl80211::control_port_over_nl80211(NAME)
+        || station::with_wdev(NAME, 0, |w| {
+            w.ifindex != Some(index) || w.disconnect_bssid != MAC || w.ps != Some(false)
+        })
+    {
+        return TestResult::Fail("stale set/port/clear mutated the replacement owner");
+    }
+    if station::clear_owner_for_link(NAME, 0, index).is_err()
+        || station::conn_owner(NAME) != 0
+        || crate::nl80211::control_port_over_nl80211(NAME)
+    {
+        return TestResult::Fail("current registration could not retire its owner/port");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_owner_mutations_reject_retired_registration
+);
+
+fn smoke_nl80211_owner_namespace_move_clears_old_peer_port_and_ps() -> TestResult {
+    let Ok(r) = rig() else {
+        return TestResult::Fail("rig");
+    };
+    station::set_owner_for_link(NAME, 0, r.ifindex, 41, Some(AP)).unwrap();
+    station::set_control_port_for_link(NAME, 0, r.ifindex, true).unwrap();
+    station::with_wdev(NAME, 0, |w| w.ps = Some(false));
+    if narf_net::kernel_admin(NAME)
+        .unwrap()
+        .move_to_net_ns(73)
+        .is_err()
+        || station::conn_owner(NAME) != 0
+        || station::with_wdev(NAME, 73, |w| {
+            w.namespace != 73
+                || w.ifindex != Some(r.ifindex)
+                || w.ps.is_some()
+                || w.disconnect_bssid != [0; 6]
+                || w.control_port_over_nl80211
+        })
+    {
+        return TestResult::Fail("namespace move inherited old wireless_dev facts");
+    }
+    station::set_owner_for_link(NAME, 73, r.ifindex, 93, Some(MAC)).unwrap();
+    station::set_control_port_for_link(NAME, 73, r.ifindex, true).unwrap();
+    // Infallible legacy helpers see detached empty state for an old namespace.
+    let stale_owner = station::with_wdev(NAME, 0, |w| {
+        let owner = w.conn_owner;
+        w.conn_owner = 41;
+        w.ps = Some(false);
+        owner
+    });
+    if stale_owner != 0
+        || station::clear_owner_for_link(NAME, 0, r.ifindex) != Err(ENODEV)
+        || station::set_owner_for_link(NAME, 0, r.ifindex, 41, Some(AP)) != Err(ENODEV)
+        || station::set_control_port_for_link(NAME, 0, r.ifindex, false) != Err(ENODEV)
+        || station::conn_owner(NAME) != 93
+        || !crate::nl80211::control_port_over_nl80211(NAME)
+        || station::with_wdev(NAME, 73, |w| w.ps.is_some() || w.disconnect_bssid != MAC)
+    {
+        return TestResult::Fail("old namespace helper changed the current owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_owner_namespace_move_clears_old_peer_port_and_ps
+);
+
+fn smoke_nl80211_queued_socket_release_cannot_disconnect_replacement() -> TestResult {
+    let Ok(r) = rig() else {
+        return TestResult::Fail("rig");
+    };
+    station::set_owner_for_link(NAME, 0, r.ifindex, 41, Some(AP)).unwrap();
+    station::set_control_port_for_link(NAME, 0, r.ifindex, true).unwrap();
+    narf_scheduler::__reset_queues_for_test();
+    narf_net::netlink_generic::notify_release(0, 41);
+    // Actual socket-release work is queued but has not polled its old Arc.
+    let (replacement, index) = replace_owner_netdev();
+    // Reusing the same numeric socket owner must not revive the old work.
+    station::set_owner_for_link(NAME, 0, index, 41, Some(MAC)).unwrap();
+    station::set_control_port_for_link(NAME, 0, index, true).unwrap();
+    narf_scheduler::run_until_empty();
+    if !r.stub.calls.lock().is_empty()
+        || !replacement.calls.lock().is_empty()
+        || station::conn_owner(NAME) != 41
+        || !crate::nl80211::control_port_over_nl80211(NAME)
+    {
+        return TestResult::Fail("late socket-release worker disconnected the replacement");
+    }
+    // The replacement's own release must still take the genuine teardown path.
+    narf_net::netlink_generic::notify_release(0, 41);
+    narf_scheduler::run_until_empty();
+    if replacement.calls.lock().as_slice() != [Call::Disassociate]
+        || !r.stub.calls.lock().is_empty()
+        || station::conn_owner(NAME) != 0
+        || crate::nl80211::control_port_over_nl80211(NAME)
+    {
+        return TestResult::Fail("current socket-release worker did not retire its own port");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_queued_socket_release_cannot_disconnect_replacement
+);
+
+fn smoke_nl80211_held_or_cancelled_owner_teardown_preserves_replacement() -> TestResult {
+    use core::{
+        future::Future,
+        task::{Context, Waker},
+    };
+    use narf_net::netlink_generic::install_event_sink;
+    let previous = install_event_sink(control_port_status_event);
+    let result = (|| -> Result<(), &'static str> {
+        for cancel in [false, true] {
+            let r = rig()?;
+            station::set_owner_for_link(NAME, 0, r.ifindex, 41, Some(AP)).unwrap();
+            station::set_control_port_for_link(NAME, 0, r.ifindex, true).unwrap();
+            r.stub.disconnect_ready.store(false, Ordering::Release);
+            let epoch = station::with_wdev(NAME, 0, |w| w.owner_epoch);
+            let mut work = Box::pin(station::autodisconnect(
+                r.stub.clone(),
+                0,
+                r.ifindex,
+                41,
+                epoch,
+            ));
+            let mut cx = Context::from_waker(Waker::noop());
+            CONTROL_PORT_STATUS_EVENTS.lock().clear();
+            if work.as_mut().poll(&mut cx).is_ready()
+                || station::conn_owner(NAME) != 0
+                || crate::nl80211::control_port_over_nl80211(NAME)
+            {
+                return Err("held owner teardown did not close the host port before waiting");
+            }
+            let (replacement, index) = replace_owner_netdev();
+            station::set_owner_for_link(NAME, 0, index, 93, Some(MAC)).unwrap();
+            station::set_control_port_for_link(NAME, 0, index, true).unwrap();
+            if !cancel {
+                r.stub.disconnect_ready.store(true, Ordering::Release);
+                if work.as_mut().poll(&mut cx).is_pending() {
+                    return Err("retired teardown ignored its actual completion");
+                }
+            }
+            drop(work);
+            if station::conn_owner(NAME) != 93
+                || !crate::nl80211::control_port_over_nl80211(NAME)
+                || !replacement.calls.lock().is_empty()
+                || r.stub.calls.lock().as_slice() != [Call::Disassociate]
+                || !CONTROL_PORT_STATUS_EVENTS.lock().is_empty()
+            {
+                return Err("late/cancelled teardown changed or published the replacement");
+            }
+        }
+        Ok(())
+    })();
+    let _ = install_event_sink(previous.unwrap_or(control_port_status_event));
+    result.map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_held_or_cancelled_owner_teardown_preserves_replacement
+);
+
+fn smoke_nl80211_queued_release_reused_portid_same_link_requires_grant_epoch() -> TestResult {
+    for peer in [AP, MAC] {
+        let Ok(r) = rig() else {
+            return TestResult::Fail("rig");
+        };
+        station::set_owner_for_link(NAME, 0, r.ifindex, 41, Some(AP)).unwrap();
+        station::set_control_port_for_link(NAME, 0, r.ifindex, true).unwrap();
+        r.stub.connected.store(true, Ordering::Release);
+        let old_epoch = station::with_wdev(NAME, 0, |w| w.owner_epoch);
+        narf_scheduler::__reset_queues_for_test();
+        narf_net::netlink_generic::notify_release(0, 41);
+        // A different socket may receive the same numeric portid, even for
+        // the identical peer on the identical netdev. It is a new grant.
+        station::set_owner_for_link(NAME, 0, r.ifindex, 41, Some(peer)).unwrap();
+        station::set_control_port_for_link(NAME, 0, r.ifindex, true).unwrap();
+        let new_epoch = station::with_wdev(NAME, 0, |w| w.owner_epoch);
+        narf_scheduler::run_until_empty();
+        if old_epoch == 0
+            || new_epoch <= old_epoch
+            || narf_net::iface::lookup(NAME).unwrap().ifindex != r.ifindex
+            || !r.stub.calls.lock().is_empty()
+            || !r.stub.connected.load(Ordering::Acquire)
+            || station::conn_owner(NAME) != 41
+            || !crate::nl80211::control_port_over_nl80211(NAME)
+            || station::with_wdev(NAME, 0, |w| {
+                w.disconnect_bssid != peer || w.owner_epoch != new_epoch
+            })
+        {
+            return TestResult::Fail("old release claimed a same-link reused-portid grant");
+        }
+        // Current grant release must still reach the driver and retire it.
+        narf_net::netlink_generic::notify_release(0, 41);
+        narf_scheduler::run_until_empty();
+        if r.stub.calls.lock().as_slice() != [Call::Disassociate]
+            || r.stub.connected.load(Ordering::Acquire)
+            || station::conn_owner(NAME) != 0
+            || crate::nl80211::control_port_over_nl80211(NAME)
+        {
+            return TestResult::Fail("grant epoch fencing disabled the current owner release");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_queued_release_reused_portid_same_link_requires_grant_epoch
+);
+
+fn smoke_nl80211_held_release_regrant_or_clear_cancels_before_native_poll() -> TestResult {
+    use core::{
+        future::Future,
+        task::{Context, Waker},
+    };
+    use narf_net::netlink_generic::install_event_sink;
+    let previous = install_event_sink(control_port_status_event);
+    let result = (|| -> Result<(), &'static str> {
+        // Both a new grant and explicit retirement invalidate a held claim.
+        for regrant in [false, true] {
+            let r = rig()?;
+            station::set_owner_for_link(NAME, 0, r.ifindex, 41, Some(AP)).unwrap();
+            station::set_control_port_for_link(NAME, 0, r.ifindex, true).unwrap();
+            r.stub.connected.store(true, Ordering::Release);
+            r.stub.disconnect_ready.store(false, Ordering::Release);
+            let grant = station::with_wdev(NAME, 0, |w| w.owner_epoch);
+            let mut work = Box::pin(station::autodisconnect(
+                r.stub.clone(),
+                0,
+                r.ifindex,
+                41,
+                grant,
+            ));
+            let mut cx = Context::from_waker(Waker::noop());
+            CONTROL_PORT_STATUS_EVENTS.lock().clear();
+            if work.as_mut().poll(&mut cx).is_ready()
+                || station::conn_owner(NAME) != 0
+                || crate::nl80211::control_port_over_nl80211(NAME)
+                || station::with_wdev(NAME, 0, |w| w.owner_epoch <= grant)
+            {
+                return Err("held teardown did not acquire a distinct closed-port claim");
+            }
+            if regrant {
+                station::set_owner_for_link(NAME, 0, r.ifindex, 41, Some(AP)).unwrap();
+                station::set_control_port_for_link(NAME, 0, r.ifindex, true).unwrap();
+            } else {
+                station::clear_owner_for_link(NAME, 0, r.ifindex).unwrap();
+            }
+            let current_epoch = station::with_wdev(NAME, 0, |w| w.owner_epoch);
+            r.stub.disconnect_ready.store(true, Ordering::Release);
+            if work.as_mut().poll(&mut cx).is_pending()
+                || !r.stub.connected.load(Ordering::Acquire)
+                || r.stub.calls.lock().as_slice() != [Call::Disassociate]
+                || station::conn_owner(NAME) != if regrant { 41 } else { 0 }
+                || crate::nl80211::control_port_over_nl80211(NAME) != regrant
+                || station::with_wdev(NAME, 0, |w| w.owner_epoch != current_epoch)
+                || !CONTROL_PORT_STATUS_EVENTS.lock().is_empty()
+            {
+                return Err(
+                    "retired claim polled native teardown or published after same-link renewal",
+                );
+            }
+            drop(work);
+            if regrant {
+                let mut current = Box::pin(station::autodisconnect(
+                    r.stub.clone(),
+                    0,
+                    r.ifindex,
+                    41,
+                    current_epoch,
+                ));
+                if current.as_mut().poll(&mut cx).is_pending()
+                    || r.stub.connected.load(Ordering::Acquire)
+                    || r.stub.calls.lock().as_slice() != [Call::Disassociate, Call::Disassociate]
+                    || station::conn_owner(NAME) != 0
+                    || crate::nl80211::control_port_over_nl80211(NAME)
+                    || CONTROL_PORT_STATUS_EVENTS.lock().len() != 1
+                {
+                    return Err("current same-link grant could not complete native teardown");
+                }
+                let events = CONTROL_PORT_STATUS_EVENTS.lock();
+                if events[0].0 != 0
+                    || events[0].1 != 19
+                    || events[0].2.get(16) != Some(&DISCONNECT)
+                    || find_attr(&events[0].2[20..], 3) != Some(&r.ifindex.to_ne_bytes()[..])
+                {
+                    return Err("current teardown emitted the wrong disconnect identity");
+                }
+            }
+        }
+        Ok(())
+    })();
+    let _ = install_event_sink(previous.unwrap_or(control_port_status_event));
+    result.map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_held_release_regrant_or_clear_cancels_before_native_poll
+);
