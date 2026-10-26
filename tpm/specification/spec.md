@@ -40,10 +40,30 @@ pub trait TpmDevice: Send + Sync {
     /// Submit a raw TPM2 command.
     async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError>;
 
+    /// Lifecycle: submit TPM2_Startup (provided; see below).
+    async fn startup(&self, startup_type: StartupType) -> Result<(), TpmError>;
+
     /// High-level GetRandom.
     async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError>;
 }
 ```
+
+**Lifecycle (`startup`).** A powered-on TPM rejects every command
+except `TPM2_Startup` with `TPM_RC_INITIALIZE` until one lands; the
+trait owns the lifecycle edge so no conversation — production or
+fixture — can begin without it. `startup` is a provided method:
+it builds the frame with the canonical codec and submits through
+`submit_raw`, so transports inherit it unchanged. `StartupType` is
+the `TPM_SU` operand (`Clear` / `State`, Part 2 §6.9). The response
+policy is Part 3 §9.3's: `TPM_RC_VALUE` from Startup means the
+startup type did not match the TPM's state — the device was
+already started, or a `State` startup found no saved state. The
+trait folds both into the caller's goal state (`Clear` +
+`TPM_RC_VALUE` ⇒ success; `State` + `TPM_RC_VALUE` ⇒ one retry as
+`Clear`); every other response code propagates. The
+Shutdown(STATE) → Startup(STATE) suspend/resume sequencing that
+consumes the `State` form is owned by the power-suspend program
+(#1003), not by this interface.
 
 ### 3.2 TPM Capabilities
 
@@ -68,8 +88,10 @@ pub type Cap<TpmDevice, R> = ...;
 consumers:
 
 - `register(device: Arc<dyn TpmDevice>)` — called by the owning
-  transport exactly once, at probe success. The production transport
-  is the platform probe (`drivers/platform` TPM driver, Stage::Subsys
+  transport exactly once, at probe success, after `TPM2_Startup`
+  (§3.1) has been submitted on the probed device: a registered
+  device is a *started* device. The production transport is the
+  platform probe (`drivers/platform` TPM driver, Stage::Subsys
   initcall); the registry itself never probes hardware.
 - `list() -> Vec<Arc<dyn TpmDevice>>` — snapshot of the registered
   devices. `frame::measure` dispatches hardware PCR extends to the
@@ -96,8 +118,14 @@ contract:
 - **Production transport — `drivers/platform`.** The CRB/TIS MMIO
   driver there is the only code that probes hardware, owns the
   probed-device singleton, and submits frames; on probe success it
-  registers the device into this crate's registry (the §3.3
-  registry contract) for `frame::measure` to dispatch through.
+  submits `TPM2_Startup(CLEAR)` (§3.1) and only then registers the
+  device into this crate's registry (the §3.3 registry contract)
+  for `frame::measure` to dispatch through — probe and Startup run
+  at Stage::Subsys, measured boot at Stage::Late, so the first
+  production extend always reaches a started TPM. A device that
+  probed but would not start is not registered (its every command
+  would fail with `TPM_RC_INITIALIZE`, and an unregistered device
+  keeps the no-hardware-anchoring report honest).
   Its probe/discovery semantics (PTP register map, host-programmed
   CRB buffers, TPM2-table discovery via `narf_acpi::tpm2_info()`)
   are #939's.

@@ -25,7 +25,7 @@ pub mod commands;
 pub mod tpm2;
 pub mod types;
 
-pub use types::{PcrSet, PolicyHash, TpmError};
+pub use types::{PcrSet, PolicyHash, StartupType, TpmError};
 
 /// A specialized capability for TPM operations.
 #[derive(Debug)]
@@ -57,6 +57,48 @@ pub trait TpmDevice: Send + Sync {
 
     /// Submits a raw TPM2 command.
     async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError>;
+
+    /// Submit `TPM2_Startup` (TCG Part 3 §9.3) — the lifecycle edge
+    /// every other command depends on. A powered-on TPM rejects all
+    /// commands except Startup with `TPM_RC_INITIALIZE` until one
+    /// lands, so the production probe submits this before the
+    /// device is registered (see the registry contract in
+    /// specification §3.3); conversations assembled by hand in
+    /// fixtures call it first for the same reason.
+    ///
+    /// Response policy (Part 3 §9.3, *Detailed Actions*): the TPM
+    /// answers `TPM_RC_VALUE` when `startupType` does not match its
+    /// internal state, which for Startup means one of two things —
+    /// the TPM was already started, or a `State` startup found no
+    /// saved state to restore. This method folds both into the
+    /// caller's goal state:
+    ///
+    /// - `Clear` + `TPM_RC_VALUE` ⇒ already started (e.g. by
+    ///   firmware during POST): success.
+    /// - `State` + `TPM_RC_VALUE` ⇒ retry once as `Clear`. Success
+    ///   means the TPM started fresh; a second `TPM_RC_VALUE` means
+    ///   it was already started: success either way.
+    ///
+    /// Any other response code propagates as `TpmError::Rc`. The
+    /// default implementation builds the frame with the canonical
+    /// codec and submits it through `submit_raw`, so every
+    /// transport inherits the policy unchanged.
+    async fn startup(&self, startup_type: StartupType) -> Result<(), TpmError> {
+        let mut attempt = startup_type;
+        loop {
+            let req = crate::tpm2::startup(attempt.su());
+            let resp = self.submit_raw(&req).await?;
+            match crate::commands::ResponseParser::new(&resp) {
+                Ok(_) if resp.len() == 10 => return Ok(()),
+                Ok(_) => return Err(TpmError::BadResponse),
+                Err(TpmError::Rc(types::TpmRc::Value)) => match attempt {
+                    StartupType::Clear => return Ok(()),
+                    StartupType::State => attempt = StartupType::Clear,
+                },
+                Err(e) => return Err(e),
+            }
+        }
+    }
 
     /// High-level GetRandom.
     async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError>;
@@ -231,6 +273,171 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("tpm", smoke_tpm_registry_register_list_and_reset);
+
+    // ── TPM2_Startup lifecycle policy smokes (#942) ───────────────
+    //
+    // `StartupProbeTpm` is spec-shaped silicon for the one command
+    // the trait's `startup` policy governs: it records the TPM_SU
+    // operand of every Startup frame submitted to it and answers
+    // per Part 3 §9.3 — success on a matching startup, TPM_RC_VALUE
+    // when already started or when a TPM_SU_STATE startup finds no
+    // saved state, TPM_RC_FAILURE in failure mode. The fixtures pin
+    // the trait's response policy against it: which frames are
+    // submitted, in which order, and which outcomes fold to Ok.
+    struct StartupProbeTpm {
+        started: AtomicU32,
+        state_saved: AtomicU32,
+        fail: AtomicU32,
+        submitted_sus: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u16>>,
+    }
+
+    impl StartupProbeTpm {
+        fn new(state_saved: bool, fail: bool) -> Self {
+            Self {
+                started: AtomicU32::new(0),
+                state_saved: AtomicU32::new(state_saved as u32),
+                fail: AtomicU32::new(fail as u32),
+                submitted_sus: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            }
+        }
+
+        fn response(rc: u32) -> Vec<u8> {
+            let mut frame = alloc::vec![0u8; 10];
+            frame[0..2].copy_from_slice(&crate::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+            frame[2..6].copy_from_slice(&10u32.to_be_bytes());
+            frame[6..10].copy_from_slice(&rc.to_be_bytes());
+            frame
+        }
+
+        fn submitted(&self) -> alloc::vec::Vec<u16> {
+            self.submitted_sus.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TpmDevice for StartupProbeTpm {
+        fn get_info(&self) -> TpmInfo {
+            TpmInfo {
+                manufacturer: 0x5354_4152,
+                version: 1,
+                spec_level: 2,
+            }
+        }
+
+        async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+            let header = crate::tpm2::Header::decode(cmd).map_err(|_| TpmError::BadResponse)?;
+            if header.code != crate::tpm2::TPM_CC_STARTUP || cmd.len() != 12 {
+                return Ok(Self::response(0));
+            }
+            let su = u16::from_be_bytes([cmd[10], cmd[11]]);
+            self.submitted_sus.lock().push(su);
+            if self.fail.load(Ordering::SeqCst) != 0 {
+                return Ok(Self::response(0x101)); // TPM_RC_FAILURE
+            }
+            if self.started.load(Ordering::SeqCst) != 0 {
+                return Ok(Self::response(0x184)); // TPM_RC_VALUE, parameter 1
+            }
+            if su == crate::tpm2::TPM_SU_STATE && self.state_saved.load(Ordering::SeqCst) == 0 {
+                return Ok(Self::response(0x184));
+            }
+            self.started.store(1, Ordering::SeqCst);
+            Ok(Self::response(0))
+        }
+
+        async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError> {
+            Ok(alloc::vec![0u8; bytes as usize])
+        }
+
+        async fn extend_pcr(&self, _pcr: u32, _digest: &[u8]) -> Result<(), TpmError> {
+            Ok(())
+        }
+
+        async fn read_pcr(&self, _pcr: u32) -> Result<Vec<u8>, TpmError> {
+            Ok(alloc::vec![0u8; 32])
+        }
+    }
+
+    fn smoke_tpm_startup_clear_then_already_started_is_ok() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let mock = Arc::new(StartupProbeTpm::new(false, false));
+        let results = Arc::new(AtomicU32::new(0));
+        let m = mock.clone();
+        let r = results.clone();
+        narf_scheduler::spawn(async move {
+            let mut bits = 0u32;
+            if m.startup(StartupType::Clear).await.is_ok() {
+                bits |= 1;
+            }
+            // The device is started now; a second Startup(CLEAR)
+            // draws TPM_RC_VALUE from real silicon, which the trait
+            // must fold into success — the production probe relies
+            // on this on every firmware-started laptop.
+            if m.startup(StartupType::Clear).await.is_ok() {
+                bits |= 2;
+            }
+            r.store(bits, Ordering::SeqCst);
+        });
+        narf_scheduler::run_until_empty();
+        if results.load(Ordering::SeqCst) != 3 {
+            return TestResult::Fail("startup(Clear) or already-started fold failed");
+        }
+        if mock.submitted() != alloc::vec![crate::tpm2::TPM_SU_CLEAR, crate::tpm2::TPM_SU_CLEAR] {
+            return TestResult::Fail("expected two TPM_SU_CLEAR submissions");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "tpm/startup",
+        smoke_tpm_startup_clear_then_already_started_is_ok
+    );
+
+    fn smoke_tpm_startup_state_falls_back_to_clear() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        // No saved state (power was lost, or the Shutdown was a
+        // CLEAR one): TPM_SU_STATE draws TPM_RC_VALUE and the trait
+        // must retry once as TPM_SU_CLEAR.
+        let mock = Arc::new(StartupProbeTpm::new(false, false));
+        let outcome = Arc::new(AtomicU32::new(0));
+        let m = mock.clone();
+        let o = outcome.clone();
+        narf_scheduler::spawn(async move {
+            if m.startup(StartupType::State).await.is_ok() {
+                o.store(1, Ordering::SeqCst);
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if outcome.load(Ordering::SeqCst) != 1 {
+            return TestResult::Fail("startup(State) fallback failed");
+        }
+        if mock.submitted() != alloc::vec![crate::tpm2::TPM_SU_STATE, crate::tpm2::TPM_SU_CLEAR] {
+            return TestResult::Fail("expected TPM_SU_STATE then TPM_SU_CLEAR");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/startup", smoke_tpm_startup_state_falls_back_to_clear);
+
+    fn smoke_tpm_startup_propagates_failure_rc() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let mock = Arc::new(StartupProbeTpm::new(false, true));
+        let outcome = Arc::new(AtomicU32::new(0));
+        let m = mock.clone();
+        let o = outcome.clone();
+        narf_scheduler::spawn(async move {
+            match m.startup(StartupType::Clear).await {
+                Err(TpmError::Rc(types::TpmRc::Failure)) => o.store(1, Ordering::SeqCst),
+                _ => o.store(2, Ordering::SeqCst),
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if outcome.load(Ordering::SeqCst) != 1 {
+            return TestResult::Fail("TPM_RC_FAILURE not propagated");
+        }
+        if mock.submitted() != alloc::vec![crate::tpm2::TPM_SU_CLEAR] {
+            return TestResult::Fail("failure RC must not be retried");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/startup", smoke_tpm_startup_propagates_failure_rc);
 
     // ── TPM 2.0 codec smokes ──────────────────────────────────────
 
