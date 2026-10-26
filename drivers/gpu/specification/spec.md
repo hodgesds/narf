@@ -44,6 +44,25 @@ infrastructure (Phase B).
 
 ## 3. Public interface
 
+### Vendor driver feature split
+
+The crate's vendor driver sets are cargo features: `amdgpu` and
+`intel`, both in `default`, so a default build compiles and
+registers exactly the driver set it did before the split. With a
+vendor feature off, none of that vendor's modules compile and none
+of its PCI drivers register: the Intel modules,
+`intel_gpu::register_pci_driver` and the `intel-gpu-pci` /
+`intel-gpu-dp-bridge` initcalls exist only under `intel`; the AMD
+module tree, `amdgpu-pci` and `amdgpu-usbc` only under `amdgpu`.
+The `smoke_gpu_vendor_feature_registration_census` kernel-test
+fixture pins the registered initcall names against the compiled
+feature set. The named-config registry in build/xtask
+(`configs.rs`) selects these features per build configuration:
+laptop/desktop-class configs enable `intel`; `minimal` and
+AMD-only configs do not. Neither vendor is offered as a loadable
+module: the module loader exists, but there is no GPU-class
+datapath ABI yet, so the feature gate is the selection mechanism.
+
 ### RX 6000 device queries, scheduling and memory pressure
 
 `amdgpu_rdna2::metadata::vram(table, module)` bounds atomfirmware

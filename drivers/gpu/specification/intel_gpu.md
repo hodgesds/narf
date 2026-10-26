@@ -1,8 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.5** (Stage 1 + Stage 2 codecs landed: PCI claim,
-> BAR0 GTTMMADR mapping, presence test, GMBUS / DPLL / pipe-and-
-> transcoder / DDI / GTT codecs).
+> Status: **v0.6** (Stage 1 + Stage 2 codecs landed; lane 1
+> #1010: canonical device table + census, panic-free probe with
+> owned contiguous scanout, Gen12 display gate).
 >
 > Clean-room driver for Intel integrated graphics from Tiger Lake
 > through Meteor Lake. **No GPL Linux `i915` / `xe` source
@@ -127,28 +127,53 @@ Stage-3 driver core consumes these codecs through the
 
 ## 5. PCI device ID table
 
-Tiger Lake / Alder Lake / Raptor Lake / Meteor Lake iGPU device
-IDs sourced from the public **`pci.ids`** database (Intel rows)
-and cross-referenced against Intel ARK. Discrete Arc parts share
-the same vendor and could be added later (Stage 5+).
+The canonical table lives in code as `intel_gpu::DEVICE_TABLE`;
+PCI registration and classification both derive from it, and the
+`smoke_device_table_census` fixture pins the code table to this
+section. IDs are sourced from the public **`pci.ids`** database
+(v2.2, Intel graphics rows). IDs that do not appear in pci.ids
+(9A59 / 9AC9 / 9AC0 / 46B2 / 46A2) are **not** listed — an
+earlier coverage pass named them in error.
 
-| Device ID | Codename / Marketing                          |
-| --------- | --------------------------------------------- |
-| 0x9A40 — 0x9A78 | TGL-U/H Xe iGPU (Gen12 Xe-LP)            |
-| 0x4626 / 0x4628 / 0x462A | ADL-P Xe iGPU                   |
-| 0x46A6 / 0x46A8 / 0x46AA | ADL-P "(Alder Lake P) GT2"      |
-| 0x46B0 / 0x46B1 / 0x46B3 | RPL-P Xe iGPU                   |
-| 0x4690 / 0x4692 / 0x4693 | ADL-S Xe iGPU                   |
-| 0xA780 / 0xA782 / 0xA788 | RPL-S Xe iGPU                   |
-| 0x7D40 / 0x7D45 / 0x7D55 / 0x7DD5 | MTL Xe-LPG iGPU         |
+| ASIC (`ChipInfo::asic`) | Device IDs |
+| ----------------------- | ---------- |
+| tigerlake (Gen12) | 9A40, 9A49, 9A60, 9A68, 9A70, 9A78 |
+| alderlake-p (Gen12) | 4626, 4628, 462A, 4636, 4638, 463A, 46A0, 46A1, 46A3, 46A6, 46A8, 46AA, 46B6, 46B8, 46BA |
+| raptorlake-p (Gen12) | 46B0, 46B1, 46B3, A720, A721, A7A0, A7A1, A7A8, A7A9, A7AA, A7AB, A7AC, A7AD |
+| alderlake-m (Gen12) | 46C0, 46C1, 46C3 |
+| alderlake-n (Gen12) | 46D0, 46D1, 46D2, 46D3, 46D4 |
+| alderlake-s (Gen12) | 4680, 4682, 4688, 468A, 468B, 4690, 4692, 4693 |
+| raptorlake-s (Gen12) | A780, A781, A782, A783, A788, A789, A78A, A78B |
+| meteorlake (Xe-LPG) | 7D40, 7D45, 7D55, 7D60, 7DD5 |
+| pantherlake (Xe3-LPG) | B080, B081, B082, B083, B084, B085, B086, B087, B08F, B090, B0A0, B0B0 |
+
+Note: pci.ids labels 46B0/46B1/46B3 as AlderLake-P silicon; the
+driver has always classified them `raptorlake-p` and the census
+pins that existing behaviour (re-classification is out of scope
+for lane 1).
 
 A single class-match backstop (`MatchKind::Class { class: 0x03,
 mask: 0xFF }`) catches every PCI VGA controller; the probe body
 filters on `vendor == 0x8086` so AMD / NVIDIA / virtio-gpu cards
-fall through to their own drivers.
+fall through to their own drivers. An Intel DID outside the
+table is announced on the console as an unsupported ASIC and the
+probe returns `NotForThisDriver` — it no longer collapses
+silently into the same `BadDevice` used for dead hardware.
+
+Display programming is gated to Gen12 (Tiger Lake / Alder Lake /
+Raptor Lake). Meteor Lake and Panther Lake rows identify and
+announce only; their display engines are tracked in #1016.
 
 ## 6. Out of scope
 
+- **Gen9 (Skylake / Kaby Lake / Coffee Lake) and Gen11 (Ice
+  Lake / Jasper Lake / Elkhart Lake)** — explicitly out of scope.
+  No device IDs are listed for them and none will be added to
+  this driver: the codec layer is Gen12-shaped (combo-PHY DPLL,
+  universal planes), so those generations would need a separate
+  display model, not more table rows.
+- Arrow Lake identification (7D41 / 7D51 / 7D67 / 7DD1 in
+  pci.ids) — not yet listed; tracked as a follow-on to lane 1.
 - Lunar Lake / Battlemage 3D — wait for PRM.
 - Discrete Arc (Alchemist / Battlemage) — could plug into the
   same code path but requires the higher Xe-HPG / Xe2-HPG PRM

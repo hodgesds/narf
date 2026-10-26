@@ -255,8 +255,71 @@ pub struct Framebuffer {
 /// drm_fb_release removes an open's framebuffers when it closes.
 #[derive(Clone, Debug)]
 pub struct FbBo {
+    /// The buffer itself. Only the amdgpu driver has GEM objects, so
+    /// the field exists only with it; a framebuffer's `bo` is `None`
+    /// in every other build, exactly as it is for a dumb or imported
+    /// buffer here.
+    #[cfg(feature = "amdgpu")]
     pub object: Arc<crate::amdgpu_gem::GemObject>,
     pub owner: u64,
+}
+
+/// The scanout pin a presented frame holds on its GEM buffer, as
+/// `amdgpu_dm_plane_helper_prepare_fb` took it. Only the amdgpu
+/// driver pins buffers, so without it the pin type is uninhabited:
+/// a frame's `bo` is `None` in every such build, exactly as it is
+/// for a dumb buffer here.
+#[cfg(feature = "amdgpu")]
+pub type ScanoutPin = Arc<crate::amdgpu_gem::ScanoutPin>;
+#[cfg(not(feature = "amdgpu"))]
+pub type ScanoutPin = Arc<core::convert::Infallible>;
+
+/// One plane's DRM framebuffer: a kernel-mapped dumb buffer, or (`bo`)
+/// an amdgpu GEM buffer pinned in VRAM for scanout; its pitch, size and
+/// fourcc, each plane's offset (a 4:2:0 framebuffer's chroma plane at
+/// `offsets[1]` with `chroma_pitch`) and its modifier. A pinned buffer is
+/// scanned out in place (`external`), as amdgpu_dm hands DC the
+/// framebuffer's address: no copy. Dumb buffers are such GEM buffers in
+/// VRAM once the card's client heap is up (amdgpu_mode_dumb_create:
+/// `drm_ioctl_bridge::amdgpu_dumb`). A dumb buffer of the card's own table
+/// (`phys`, made while no heap was up) lives in system memory, which
+/// display fetch on this dGPU never reads (amdgpu_display_supported_domains
+/// is VRAM alone), so the presenter copies it into the plane's staged VRAM
+/// back buffer, as amdgpu_bo_pin would migrate it: a linear RGB plane's
+/// source rectangle, a tiled or 4:2:0 one whole.
+///
+/// The type is the DRM present layer's currency — every card's
+/// presenter consumes it — so it lives in the DRM core; the AMD
+/// platform module re-exports it and keeps the DC-specific methods.
+#[derive(Clone, Debug)]
+pub struct PlaneFrame {
+    pub phys: u64,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub offsets: [u32; 2],
+    pub chroma_pitch: u32,
+    pub modifier: u64,
+    /// The pin amdgpu_dm_plane_helper_prepare_fb took on the framebuffer's
+    /// GEM buffer; it lasts until a flip latches past it.
+    pub bo: Option<ScanoutPin>,
+}
+impl PlaneFrame {
+    /// A linear single-plane framebuffer at `phys`.
+    pub const fn linear(phys: u64, pitch: u32, width: u32, height: u32, format: u32) -> Self {
+        Self {
+            phys,
+            pitch,
+            width,
+            height,
+            format,
+            offsets: [0; 2],
+            chroma_pitch: 0,
+            modifier: 0,
+            bo: None,
+        }
+    }
 }
 
 // ── Card ───────────────────────────────────────────────────────────────
@@ -900,6 +963,33 @@ impl NativePlane {
     }
 }
 
+/// DRM's connector "color format" values (drm_connector_color_format).
+/// AUTO preserves the HDMI helper policy: RGB, then declared 4:2:0.
+/// A vendor-neutral property value: it lives in the DRM core, and the
+/// AMD display code maps it onto its DC pixel encoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ColorFormat {
+    #[default]
+    Auto = 0,
+    Rgb = 1,
+    Ycbcr444 = 2,
+    Ycbcr422 = 3,
+    Ycbcr420 = 4,
+}
+impl ColorFormat {
+    pub const fn from_linux(value: u64) -> Option<Self> {
+        Some(match value {
+            0 => Self::Auto,
+            1 => Self::Rgb,
+            2 => Self::Ycbcr444,
+            3 => Self::Ycbcr422,
+            4 => Self::Ycbcr420,
+            _ => return None,
+        })
+    }
+}
+
 /// A connector whose modes and EDID come from a real sink, published by a
 /// native display driver. GETCONNECTOR reports these timings and this EDID
 /// instead of synthesizing them from `Connector::modes`.
@@ -929,7 +1019,7 @@ pub struct NativeOutput {
     pub max_bpc: Option<u8>,
     /// Standard HDMI connector "color format" (AUTO=0, RGB=1, YUV444=2,
     /// YUV422=3, YUV420=4). None on transports without this native path.
-    pub color_format: Option<crate::amdgpu_hdr::ColorFormat>,
+    pub color_format: Option<ColorFormat>,
 }
 
 /// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is
@@ -1619,7 +1709,7 @@ impl Card {
         pitch: u32,
         gem_handle: u32,
     ) -> Result<u32, CardError> {
-        let mut cmd = crate::amdgpu_dm_modifiers::FbCmd {
+        let mut cmd = crate::drm::fb_cmd::FbCmd {
             width,
             height,
             pixel_format: format,
@@ -1636,35 +1726,42 @@ impl Card {
     /// (`amdgpu_dm_modifiers::check_fb_cmd` / `check_amdgpu_fb`: format and
     /// modifier on a plane, one BO, tiling flags without modifiers, sizes);
     /// other cards take one plane, LINEAR only.
-    pub fn addfb2_cmd(
-        &mut self,
-        cmd: &crate::amdgpu_dm_modifiers::FbCmd,
-    ) -> Result<u32, CardError> {
-        use crate::amdgpu_dm_modifiers as m;
+    pub fn addfb2_cmd(&mut self, cmd: &crate::drm::fb_cmd::FbCmd) -> Result<u32, CardError> {
         let (width, height, gem_handle) = (cmd.width, cmd.height, cmd.handles[0]);
         let pitch = cmd.pitches[0];
         let (offsets, chroma_pitch, modifier) = if self.gfx12_modifiers {
-            let info = m::check_fb_cmd(cmd).map_err(|_| CardError::InvalidDimensions)?;
-            let object = self.gem.lookup(gem_handle).ok_or(CardError::BadGemHandle)?;
-            let bo_size = self
-                .dumb_backings
-                .iter()
-                .find(|b| b.gem_handle == gem_handle)
-                .map_or(object.size as u64, |b| b.byte_len as u64);
-            let (tiling, dcc) = self
-                .bo_tiling
-                .iter()
-                .find(|t| t.0 == gem_handle)
-                .map_or((0, false), |t| (t.1, t.2));
-            let formats = self.plane_formats.unwrap_or(&[]);
-            let modifier = m::check_amdgpu_fb(cmd, &info, formats, tiling, dcc, bo_size)
-                .map_err(|_| CardError::UnknownFormat)?;
-            let two = info.num_planes == 2;
-            (
-                [cmd.offsets[0], if two { cmd.offsets[1] } else { 0 }],
-                if two { cmd.pitches[1] } else { 0 },
-                modifier,
-            )
+            #[cfg(feature = "amdgpu")]
+            {
+                use crate::amdgpu_dm_modifiers as m;
+                let info = m::check_fb_cmd(cmd).map_err(|_| CardError::InvalidDimensions)?;
+                let object = self.gem.lookup(gem_handle).ok_or(CardError::BadGemHandle)?;
+                let bo_size = self
+                    .dumb_backings
+                    .iter()
+                    .find(|b| b.gem_handle == gem_handle)
+                    .map_or(object.size as u64, |b| b.byte_len as u64);
+                let (tiling, dcc) = self
+                    .bo_tiling
+                    .iter()
+                    .find(|t| t.0 == gem_handle)
+                    .map_or((0, false), |t| (t.1, t.2));
+                let formats = self.plane_formats.unwrap_or(&[]);
+                let modifier = m::check_amdgpu_fb(cmd, &info, formats, tiling, dcc, bo_size)
+                    .map_err(|_| CardError::UnknownFormat)?;
+                let two = info.num_planes == 2;
+                (
+                    [cmd.offsets[0], if two { cmd.offsets[1] } else { 0 }],
+                    if two { cmd.pitches[1] } else { 0 },
+                    modifier,
+                )
+            }
+            #[cfg(not(feature = "amdgpu"))]
+            {
+                // Only the amdgpu native KMS sets `gfx12_modifiers`
+                // (its cards are the ones with GFX12 modifier checks);
+                // without the driver the flag is never set.
+                return Err(CardError::UnknownFormat);
+            }
         } else {
             // DRM_MODE_FB_MODIFIERS with anything but LINEAR, or an unknown
             // flag, is refused (framebuffer_check / drm_mode_addfb2).
@@ -1758,9 +1855,10 @@ impl Card {
     /// AMDGPU_GEM_CREATE_GFX12_DCC (amdgpu_display_get_fb_info). The
     /// framebuffer holds the buffer until it is removed. Other cards have
     /// no amdgpu GEM handles (`BadGemHandle`).
+    #[cfg(feature = "amdgpu")]
     pub fn addfb2_bo(
         &mut self,
-        cmd: &crate::amdgpu_dm_modifiers::FbCmd,
+        cmd: &crate::drm::fb_cmd::FbCmd,
         object: Arc<crate::amdgpu_gem::GemObject>,
         owner: u64,
     ) -> Result<u32, CardError> {

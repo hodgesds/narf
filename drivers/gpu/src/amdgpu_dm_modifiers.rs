@@ -19,6 +19,11 @@
 //!
 //! Nothing here touches hardware.
 
+/// The ADDFB2 wire request itself is a vendor-neutral UAPI layout and
+/// lives in the DRM core; re-exported here so existing paths keep
+/// resolving.
+pub use crate::drm::fb_cmd::{FbCmd, FB_INTERLACED, FB_MODIFIERS};
+
 /// DRM_FORMAT_MOD_LINEAR.
 pub const LINEAR: u64 = 0;
 /// DRM_FORMAT_MOD_INVALID (fourcc_mod_code(NONE, DRM_FORMAT_RESERVED)).
@@ -324,48 +329,6 @@ pub const fn from_tiling_flags(tiling_flags: u64, gfx12_dcc: bool) -> u64 {
         | swizzle << TILE_SHIFT
         | (gfx12_dcc as u64) << DCC_SHIFT
         | max_comp_block << DCC_MAX_COMPRESSED_BLOCK_SHIFT
-}
-
-/// A DRM_IOCTL_MODE_ADDFB2 request (`struct drm_mode_fb_cmd2`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FbCmd {
-    pub width: u32,
-    pub height: u32,
-    pub pixel_format: u32,
-    pub flags: u32,
-    pub handles: [u32; 4],
-    pub pitches: [u32; 4],
-    pub offsets: [u32; 4],
-    pub modifier: [u64; 4],
-}
-/// DRM_MODE_FB_INTERLACED and DRM_MODE_FB_MODIFIERS.
-pub const FB_INTERLACED: u32 = 1;
-pub const FB_MODIFIERS: u32 = 2;
-impl FbCmd {
-    /// Decode `struct drm_mode_fb_cmd2` (104 bytes; a shorter legacy
-    /// struct leaves the modifiers zero).
-    pub fn parse(arg: &[u8]) -> Option<Self> {
-        let w = |at: usize| u32::from_le_bytes(arg[at..at + 4].try_into().unwrap());
-        if arg.len() < 68 {
-            return None;
-        }
-        let mut cmd = Self {
-            width: w(4),
-            height: w(8),
-            pixel_format: w(12),
-            flags: w(16),
-            ..Self::default()
-        };
-        for i in 0..4 {
-            cmd.handles[i] = w(20 + 4 * i);
-            cmd.pitches[i] = w(36 + 4 * i);
-            cmd.offsets[i] = w(52 + 4 * i);
-            if let Some(m) = arg.get(72 + 8 * i..80 + 8 * i) {
-                cmd.modifier[i] = u64::from_le_bytes(m.try_into().unwrap());
-            }
-        }
-        Some(cmd)
-    }
 }
 
 /// Why a framebuffer is refused: `framebuffer_check` and amdgpu's checks

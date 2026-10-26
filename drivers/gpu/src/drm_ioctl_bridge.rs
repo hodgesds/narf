@@ -37,6 +37,49 @@ use crate::drm_uapi::{
     DrmModeDestroyDumbUapi, DrmModeMapDumbUapi, DrmModePageFlipUapi, DrmVersionUapi,
 };
 
+// ── Native-KMS request types ─────────────────────────────────────
+//
+// The atomic / set-property paths collect the native display
+// requests a commit implies and issue them after dropping the card
+// lock. Only the amdgpu native KMS has displays to request anything
+// of, so without the driver the request types are uninhabited and
+// the collections are empty by construction.
+#[cfg(feature = "amdgpu")]
+type CrtcColorRequest = crate::amdgpu_native_kms::CrtcColorRequest;
+#[cfg(not(feature = "amdgpu"))]
+type CrtcColorRequest = core::convert::Infallible;
+#[cfg(feature = "amdgpu")]
+type ConnectorColorRequest = crate::amdgpu_native_kms::ConnectorColorRequest;
+#[cfg(not(feature = "amdgpu"))]
+type ConnectorColorRequest = core::convert::Infallible;
+/// The GEM buffer a legacy cursor request names (amdgpu only).
+#[cfg(feature = "amdgpu")]
+type CursorBo = Arc<crate::amdgpu_gem::GemObject>;
+#[cfg(not(feature = "amdgpu"))]
+type CursorBo = Arc<core::convert::Infallible>;
+/// A native hardware cursor's image (amdgpu only).
+#[cfg(feature = "amdgpu")]
+type CursorImage = crate::amdgpu_navi48_platform::CursorContent;
+#[cfg(not(feature = "amdgpu"))]
+type CursorImage = ();
+/// One display's planes in an atomic commit, as the native
+/// presenter consumes them (amdgpu only; the collection is empty
+/// by construction without the driver).
+#[cfg(feature = "amdgpu")]
+type NativePresentation = (
+    u32,
+    Option<crate::drm::card::PlaneFrame>,
+    [Option<crate::drm::card::PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+    Option<u64>,
+);
+#[cfg(not(feature = "amdgpu"))]
+type NativePresentation = (
+    u32,
+    Option<crate::drm::card::PlaneFrame>,
+    [Option<crate::drm::card::PlaneFrame>; 0],
+    Option<u64>,
+);
+
 // ── Copy helpers ──────────────────────────────────────────────────────
 //
 // These mirror `narf-userspace::handlers::{copy_from_user, copy_to_user}`
@@ -2222,6 +2265,7 @@ pub(crate) fn dispatch_card_for_file(
                 .filter_map(|p| p.crtc_id)
                 .collect();
             let result = handle_generic(&mode_state, cmd, arg, &ctx);
+            #[cfg(feature = "amdgpu")]
             if result.is_ok() && crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
                 for crtc_id in shown {
                     if let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) {
@@ -3601,7 +3645,7 @@ fn apply_crtc_color(
     card: &mut crate::drm::card::Card,
     crtc: u32,
     change: CrtcColorChange,
-) -> Option<(u8, crate::amdgpu_native_kms::CrtcColorRequest)> {
+) -> Option<(u8, CrtcColorRequest)> {
     let color = card.crtc_color.iter_mut().find(|c| c.crtc == crtc)?;
     let before = (color.ctm, color.gamma_lut);
     if let Some(id) = change.ctm {
@@ -3615,19 +3659,29 @@ fn apply_crtc_color(
     if (ctm, gamma_lut) == before {
         return None;
     }
-    let bytes = |id: u32| {
-        (id != 0)
-            .then(|| card.property_blob(id).map(<[u8]>::to_vec))
+    // The committed state above is generic DRM state; turning it
+    // into a native request is the amdgpu KMS's business alone.
+    #[cfg(feature = "amdgpu")]
+    {
+        let bytes = |id: u32| {
+            (id != 0)
+                .then(|| card.property_blob(id).map(<[u8]>::to_vec))
+                .flatten()
+        };
+        let request = crate::amdgpu_native_kms::CrtcColorRequest {
+            ctm: bytes(ctm),
+            gamma_lut: bytes(gamma_lut),
+        };
+        (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
+            .then(|| crate::amdgpu_native_kms::crtc_display(crtc))
             .flatten()
-    };
-    let request = crate::amdgpu_native_kms::CrtcColorRequest {
-        ctm: bytes(ctm),
-        gamma_lut: bytes(gamma_lut),
-    };
-    (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
-        .then(|| crate::amdgpu_native_kms::crtc_display(crtc))
-        .flatten()
-        .map(|display| (display, request))
+            .map(|display| (display, request))
+    }
+    #[cfg(not(feature = "amdgpu"))]
+    {
+        let _ = card_index;
+        None
+    }
 }
 
 fn native_output_on_crtc(
@@ -3649,6 +3703,7 @@ fn native_output_on_crtc(
 }
 
 /// SETCRTC uses the same complete HDMI preflight as atomic modesetting.
+#[cfg(feature = "amdgpu")]
 fn setcrtc_output_format_supported(
     card: &crate::drm::card::Card,
     display: u8,
@@ -3718,7 +3773,7 @@ fn setcrtc_output_format_supported(
 /// A connector's Colorspace / HDR_OUTPUT_METADATA values from one request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ConnectorColorChange {
-    color_format: Option<crate::amdgpu_hdr::ColorFormat>,
+    color_format: Option<crate::drm::card::ColorFormat>,
     colorspace: Option<u32>,
     hdr_output_metadata: Option<u32>,
 }
@@ -3740,9 +3795,8 @@ fn connector_color_property(
             if native.and_then(|n| n.color_format).is_none() {
                 return Err(FsError::InvalidData);
             }
-            change.color_format = Some(
-                crate::amdgpu_hdr::ColorFormat::from_linux(value).ok_or(FsError::InvalidData)?,
-            );
+            change.color_format =
+                Some(crate::drm::card::ColorFormat::from_linux(value).ok_or(FsError::InvalidData)?);
         }
         COLORSPACE_PROP_ID => {
             if native.and_then(|n| n.colorspace).is_none()
@@ -3802,9 +3856,12 @@ fn connector_color_check(
         // drm_connector_atomic_hdr_metadata_equal compares the bytes.
         if bytes(old) != bytes(new) {
             if let Some(data) = bytes(new) {
+                #[cfg(feature = "amdgpu")]
                 if !crate::amdgpu_native_kms::hdr_metadata_valid(data) {
                     return Err(FsError::InvalidData);
                 }
+                #[cfg(not(feature = "amdgpu"))]
+                let _ = data;
             }
             modeset |= old == 0 || new == 0;
         }
@@ -3814,9 +3871,15 @@ fn connector_color_check(
         .hdr_output_metadata
         .or(native.hdr_output_metadata)
         .is_some_and(|id| id != 0);
-    if native_card
-        && !crate::amdgpu_native_kms::connector_color_supported(connector, colorspace, hdr)
-    {
+    #[cfg(feature = "amdgpu")]
+    let color_supported =
+        crate::amdgpu_native_kms::connector_color_supported(connector, colorspace, hdr);
+    #[cfg(not(feature = "amdgpu"))]
+    let color_supported = {
+        let _ = (colorspace, hdr);
+        true
+    };
+    if native_card && !color_supported {
         return Err(FsError::InvalidData);
     }
     Ok(modeset)
@@ -3830,7 +3893,7 @@ fn apply_connector_color(
     card: &mut crate::drm::card::Card,
     connector: u32,
     change: ConnectorColorChange,
-) -> Option<crate::amdgpu_native_kms::ConnectorColorRequest> {
+) -> Option<ConnectorColorRequest> {
     let native = card.native.iter_mut().find(|n| n.connector == connector)?;
     let before = (
         native.colorspace,
@@ -3852,20 +3915,30 @@ fn apply_connector_color(
         native.color_format,
     );
     card.collect_blobs();
-    if after == before || crate::drm_registry::driver_name(card_index) != Some("amdgpu") {
-        return None;
+    // The committed state above is generic DRM state; turning it
+    // into a native request is the amdgpu KMS's business alone.
+    #[cfg(feature = "amdgpu")]
+    {
+        if after == before || crate::drm_registry::driver_name(card_index) != Some("amdgpu") {
+            return None;
+        }
+        let hdr = after
+            .1
+            .filter(|&id| id != 0)
+            .and_then(|id| card.property_blob(id))
+            .map(<[u8]>::to_vec);
+        Some(crate::amdgpu_native_kms::ConnectorColorRequest {
+            connector,
+            colorspace: after.0.unwrap_or(0),
+            color_format: after.2.unwrap_or_default(),
+            hdr_output_metadata: hdr,
+        })
     }
-    let hdr = after
-        .1
-        .filter(|&id| id != 0)
-        .and_then(|id| card.property_blob(id))
-        .map(<[u8]>::to_vec);
-    Some(crate::amdgpu_native_kms::ConnectorColorRequest {
-        connector,
-        colorspace: after.0.unwrap_or(0),
-        color_format: after.2.unwrap_or_default(),
-        hdr_output_metadata: hdr,
-    })
+    #[cfg(not(feature = "amdgpu"))]
+    {
+        let _ = (before, after, card_index);
+        None
+    }
 }
 
 /// A CRTC's "VRR_ENABLED" value, when the CRTC has the property.
@@ -3903,10 +3976,18 @@ fn apply_vrr_enabled(
     if let Some(slot) = card.vrr_enabled.iter_mut().find(|(id, _)| *id == crtc) {
         slot.1 = value;
     }
-    (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
-        .then(|| crate::amdgpu_native_kms::crtc_display(crtc))
-        .flatten()
-        .map(|display| (display, value))
+    #[cfg(feature = "amdgpu")]
+    {
+        (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
+            .then(|| crate::amdgpu_native_kms::crtc_display(crtc))
+            .flatten()
+            .map(|display| (display, value))
+    }
+    #[cfg(not(feature = "amdgpu"))]
+    {
+        let _ = card_index;
+        None
+    }
 }
 
 /// Validate a "max bpc" value for `connector`, as
@@ -3981,6 +4062,7 @@ fn apply_broadcast_rgb(
     if let Some(native) = card.native.iter_mut().find(|n| n.connector == connector) {
         native.broadcast_rgb = Some(value);
     }
+    #[cfg(feature = "amdgpu")]
     if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
         crate::amdgpu_native_kms::request_broadcast_rgb(value);
     }
@@ -3997,8 +4079,11 @@ fn set_property_object(
     obj_type: u32,
 ) -> Result<u32, FsError> {
     let plane = || {
-        crate::drm_native_planes::plane_state(card, obj_id).is_some()
-            || synth_planes(card).iter().any(|(id, _)| *id == obj_id)
+        #[cfg(feature = "amdgpu")]
+        let native = crate::drm_native_planes::plane_state(card, obj_id).is_some();
+        #[cfg(not(feature = "amdgpu"))]
+        let native = false;
+        native || synth_planes(card).iter().any(|(id, _)| *id == obj_id)
     };
     let found = [
         (DRM_MODE_OBJECT_CONNECTOR, card.connector(obj_id).is_ok()),
@@ -4071,9 +4156,10 @@ fn handle_set_property(
         card.crtc(obj_id).map_err(|_| FsError::NotFound)?;
         let mut color = CrtcColorChange::default();
         if crtc_color_property(&card, obj_id, prop_id, value, &mut color)? {
-            let request = apply_crtc_color(card_index, &mut card, obj_id, color);
+            let _request = apply_crtc_color(card_index, &mut card, obj_id, color);
             drop(card);
-            if let Some((display, request)) = request {
+            #[cfg(feature = "amdgpu")]
+            if let Some((display, request)) = _request {
                 crate::amdgpu_native_kms::request_crtc_color(display, request);
             }
             return Ok(0);
@@ -4082,9 +4168,10 @@ fn handle_set_property(
             return Err(FsError::InvalidData);
         }
         let value = vrr_enabled_value(&card, obj_id, value)?;
-        let request = apply_vrr_enabled(card_index, &mut card, obj_id, value);
+        let _request = apply_vrr_enabled(card_index, &mut card, obj_id, value);
         drop(card);
-        if let Some((display, enabled)) = request {
+        #[cfg(feature = "amdgpu")]
+        if let Some((display, enabled)) = _request {
             crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
         }
         return Ok(0);
@@ -4104,18 +4191,20 @@ fn handle_set_property(
         if connector_color_check(&card, native, obj_id, crtc, color)? {
             return Err(FsError::InvalidData);
         }
-        let request = apply_connector_color(card_index, &mut card, obj_id, color);
+        let _request = apply_connector_color(card_index, &mut card, obj_id, color);
         drop(card);
-        if let Some(request) = request {
+        #[cfg(feature = "amdgpu")]
+        if let Some(request) = _request {
             crate::amdgpu_native_kms::request_connector_color(request);
         }
         return Ok(0);
     }
     if prop_id == MAX_BPC_PROP_ID {
         let bpc = max_bpc_value(&card, obj_id, value)?;
-        let request = apply_max_bpc(card_index, &mut card, obj_id, bpc);
+        let _request = apply_max_bpc(card_index, &mut card, obj_id, bpc);
         drop(card);
-        if let Some((connector, bpc)) = request {
+        #[cfg(feature = "amdgpu")]
+        if let Some((connector, bpc)) = _request {
             crate::amdgpu_native_kms::request_connector_max_bpc(connector, bpc);
         }
         return Ok(0);
@@ -4252,11 +4341,12 @@ fn handle_gamma(
         ctm: Some(0),
         gamma_lut: Some(blob),
     };
-    let request = apply_crtc_color(card_index, &mut card, crtc_id, change);
+    let _request = apply_crtc_color(card_index, &mut card, crtc_id, change);
     // drm_property_blob_put: only the committed GAMMA_LUT holds it now.
     card.destroy_property_blob(blob);
     drop(card);
-    if let Some((display, request)) = request {
+    #[cfg(feature = "amdgpu")]
+    if let Some((display, request)) = _request {
         crate::amdgpu_native_kms::request_crtc_color(display, request);
     }
     Ok(0)
@@ -4284,11 +4374,14 @@ fn handle_getpropblob(
     // connector's EDID.
     let edid = {
         let card = mode_state.lock();
+        // A native plane's IN_FORMATS blob (amdgpu native card only).
+        #[cfg(feature = "amdgpu")]
+        let native_blob = crate::drm_native_planes::in_formats_blob(&card, blob_id);
+        #[cfg(not(feature = "amdgpu"))]
+        let native_blob: Option<Vec<u8>> = None;
         match card.property_blob(blob_id) {
             Some(data) => data.to_vec(),
-            None if crate::drm_native_planes::in_formats_blob(&card, blob_id).is_some() => {
-                crate::drm_native_planes::in_formats_blob(&card, blob_id).unwrap()
-            }
+            None if native_blob.is_some() => native_blob.unwrap(),
             None => {
                 let connector_id =
                     connector_id_from_edid_blob(blob_id).ok_or(FsError::InvalidData)?;
@@ -4336,8 +4429,17 @@ fn handle_obj_getproperties(
         let card = mode_state.lock();
         // A native card's plane (primary or overlay): the core plane
         // properties from its state, then amdgpu_dm's.
-        let native = (obj_type == DRM_MODE_OBJECT_PLANE)
-            .then(|| crate::drm_native_planes::plane_state(&card, obj_id))
+        let native: Option<crate::drm::atomic::PlaneState> = (obj_type == DRM_MODE_OBJECT_PLANE)
+            .then(|| {
+                #[cfg(feature = "amdgpu")]
+                {
+                    crate::drm_native_planes::plane_state(&card, obj_id)
+                }
+                #[cfg(not(feature = "amdgpu"))]
+                {
+                    None
+                }
+            })
             .flatten();
         if let Some(p) = native {
             let plane_type = card
@@ -4379,6 +4481,7 @@ fn handle_obj_getproperties(
                 u64::from(p.crtc_h),
                 (-1i64) as u64,
             ];
+            #[cfg(feature = "amdgpu")]
             if let Some((ids, vals)) = crate::drm_native_planes::object_properties(&card, obj_id) {
                 props.extend(ids);
                 values.extend(vals);
@@ -4847,8 +4950,8 @@ fn atomic_commit(
     // Native VRR changes, requested once the card lock is released.
     let mut vrr_requests: Vec<(u8, bool)> = Vec::new();
     // Native CRTC color and connector Colorspace/HDR changes, likewise.
-    let mut color_requests: Vec<(u8, crate::amdgpu_native_kms::CrtcColorRequest)> = Vec::new();
-    let mut connector_requests: Vec<crate::amdgpu_native_kms::ConnectorColorRequest> = Vec::new();
+    let mut color_requests: Vec<(u8, CrtcColorRequest)> = Vec::new();
+    let mut connector_requests: Vec<ConnectorColorRequest> = Vec::new();
     // Native cursor planes' hardware cursors, likewise.
     let mut cursor_requests: Vec<CursorRequest> = Vec::new();
     // Native connector "max bpc" changes, likewise.
@@ -4890,7 +4993,11 @@ fn atomic_commit(
             let object_values = &values[prop_index..end];
             prop_index = end;
 
-            if let Some(mut plane) = crate::drm_native_planes::plane_state(&card, object_id) {
+            #[cfg(feature = "amdgpu")]
+            let native_plane = crate::drm_native_planes::plane_state(&card, object_id);
+            #[cfg(not(feature = "amdgpu"))]
+            let native_plane: Option<crate::drm::atomic::PlaneState> = None;
+            if let Some(mut plane) = native_plane {
                 // A native card's plane, primary, overlay or cursor: its
                 // committed state plus amdgpu_dm's properties.
                 if let (Some(crtc_ids), Some(crtc_id)) = (event_crtc_ids.as_mut(), plane.crtc_id) {
@@ -4930,6 +5037,7 @@ fn atomic_commit(
                             }
                             plane.in_fence_fd = (fd >= 0).then_some(fd as i32);
                         }
+                        #[cfg(feature = "amdgpu")]
                         p if crate::drm_native_planes::set_property(
                             &card, &mut plane, p, value,
                         )? => {}
@@ -5055,6 +5163,7 @@ fn atomic_commit(
                                     // On the native card, a timing this
                                     // CRTC's connector offers: checked once
                                     // every connector routing is parsed.
+                                    #[cfg(feature = "amdgpu")]
                                     if crate::drm_registry::driver_name(card_index)
                                         == Some("amdgpu")
                                         && crate::amdgpu_native_kms::crtc_display(object_id)
@@ -5186,6 +5295,7 @@ fn atomic_commit(
         check_native_atomic(&card, &state)?;
         // amdgpu_dm's plane checks on a card with its native planes, and
         // each touched display's planes after this commit.
+        #[cfg(feature = "amdgpu")]
         let native_displays: Vec<crate::drm_native_planes::DisplayPlanes> =
             if card.native_planes.is_empty() {
                 Vec::new()
@@ -5202,6 +5312,7 @@ fn atomic_commit(
             };
         // A native MODE_ID is a timing of the connector the CRTC drives
         // after this commit: one routed to it here, else its current one.
+        #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
             for (crtc_id, wire) in &native_modes {
                 let connector = state
@@ -5283,6 +5394,9 @@ fn atomic_commit(
         // Retain the existing DP/MST-only modeset admission path. The
         // additional complete format search is needed when this request
         // changes an HDMI output or any of its planes.
+        // Only the amdgpu native card has native outputs whose
+        // color state can touch an HDMI format search.
+        #[cfg(feature = "amdgpu")]
         let hdmi_touched = card
             .native
             .iter()
@@ -5302,6 +5416,9 @@ fn atomic_commit(
                             .is_some_and(|current| current.connector == n.connector)
                     })
             });
+        #[cfg(not(feature = "amdgpu"))]
+        let hdmi_touched = false;
+        #[cfg(feature = "amdgpu")]
         if hdmi_touched && crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
             let mut outputs = Vec::new();
             let mut routes = Vec::new();
@@ -5425,6 +5542,7 @@ fn atomic_commit(
             // drm_atomic_helper_prepare_planes (amdgpu_dm's prepare_fb) for
             // every plane the commit shows, before any state changes: a pin
             // that fails fails the commit with its errno.
+            #[cfg(feature = "amdgpu")]
             let prepared = PreparedFbs::prepare(
                 &card,
                 state
@@ -5433,6 +5551,7 @@ fn atomic_commit(
                     .filter(|p| p.crtc_id.is_some())
                     .filter_map(|p| p.fb_id),
             )?;
+            #[cfg(feature = "amdgpu")]
             let cursors = crate::drm_native_planes::cursor_changes(&card, &state);
             if let Err(error) = state.core_commit(&mut card) {
                 let _ = writeln!(
@@ -5441,8 +5560,13 @@ fn atomic_commit(
                 );
                 return Err(FsError::InvalidData);
             }
+            #[cfg(feature = "amdgpu")]
             crate::drm_native_planes::commit(&mut card, &state);
-            cursor_requests = native_cursor_requests(card_index, &mut card, &cursors, &prepared);
+            #[cfg(feature = "amdgpu")]
+            {
+                cursor_requests =
+                    native_cursor_requests(card_index, &mut card, &cursors, &prepared);
+            }
             for &(connector, value) in &broadcast_rgb {
                 apply_broadcast_rgb(card_index, &mut card, connector, value);
             }
@@ -5469,6 +5593,7 @@ fn atomic_commit(
                 }
             }
             let amdgpu = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
+            #[cfg(feature = "amdgpu")]
             if amdgpu {
                 // Routing first: a mode is checked against the connector the
                 // CRTC drives. Any encoder may drive any native CRTC.
@@ -5565,7 +5690,10 @@ fn atomic_commit(
             let mut flip_tickets: Vec<(u32, u64)> = Vec::new();
             if let (Some(queue), Some(crtc_ids)) = (event_queue.as_mut(), event_crtc_ids) {
                 for crtc_id in crtc_ids {
+                    #[cfg(feature = "amdgpu")]
                     let display = crate::amdgpu_native_kms::crtc_display(crtc_id);
+                    #[cfg(not(feature = "amdgpu"))]
+                    let display: Option<u8> = None;
                     if let (true, Some(display)) = (hardware_crtcs.contains(&crtc_id), display) {
                         let ticket = crate::drm::card::flips(display).lock().reserve();
                         card.queue_hw_flip_event(queue, req.user_data, crtc_id, display, ticket)
@@ -5592,10 +5720,12 @@ fn atomic_commit(
             }
             // A display with native planes presents every plane this
             // commit updates together (`drm_native_planes`).
+            #[cfg(feature = "amdgpu")]
             let native_frame = |card: &crate::drm::card::Card, id: u32| {
                 native_plane_frame(card, state.planes.iter().find(|p| p.id == id)?, &prepared)
             };
-            let native_presentations: Vec<_> = native_displays
+            #[cfg(feature = "amdgpu")]
+            let native_presentations: Vec<NativePresentation> = native_displays
                 .iter()
                 .filter(|_| amdgpu)
                 .filter(|dp| dp.setup.overlay_count() > 0 || dp.setup.primary.is_some())
@@ -5615,6 +5745,8 @@ fn atomic_commit(
                     (dp.crtc_id, primary, overlays, ticket)
                 })
                 .collect();
+            #[cfg(not(feature = "amdgpu"))]
+            let native_presentations: Vec<NativePresentation> = Vec::new();
             // ... the others each plane on its own, as before.
             let presentations: Vec<_> = active_planes
                 .iter()
@@ -5642,16 +5774,20 @@ fn atomic_commit(
             Some((presentations, native_presentations))
         }
     };
+    #[cfg(feature = "amdgpu")]
     for (display, enabled) in vrr_requests {
         crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
     }
+    #[cfg(feature = "amdgpu")]
     for (display, request) in color_requests {
         crate::amdgpu_native_kms::request_crtc_color(display, request);
     }
+    #[cfg(feature = "amdgpu")]
     for request in connector_requests {
         crate::amdgpu_native_kms::request_connector_color(request);
     }
     send_cursor_requests(cursor_requests);
+    #[cfg(feature = "amdgpu")]
     for (connector, bpc) in max_bpc_requests {
         crate::amdgpu_native_kms::request_connector_max_bpc(connector, bpc);
     }
@@ -5673,9 +5809,12 @@ fn atomic_commit(
         Some((p, n)) => (Some(p), n),
         None => (None, Vec::new()),
     };
+    #[cfg(feature = "amdgpu")]
     for (crtc_id, primary, overlays, ticket) in native_presentation {
         present_native_planes(card_index, crtc_id, primary, overlays, ticket);
     }
+    #[cfg(not(feature = "amdgpu"))]
+    let _ = &native_presentation;
     for (crtc_id, resource, src_phys, (pitch, width, height, format), fb_id, flip_ticket) in
         presentation.into_iter().flatten()
     {
@@ -5685,9 +5824,7 @@ fn atomic_commit(
             present_frame(
                 card_index,
                 crtc_id,
-                crate::amdgpu_navi48_platform::PlaneFrame::linear(
-                    src_phys, pitch, width, height, format,
-                ),
+                crate::drm::card::PlaneFrame::linear(src_phys, pitch, width, height, format),
                 flip_ticket,
             );
         } else {
@@ -5794,6 +5931,28 @@ fn cursor_universal(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     ctx: &DrmFileCtx,
     req: LegacyCursor,
+    bo: Option<CursorBo>,
+    admission: Option<&scanout_kms::CommitAdmission<'_>>,
+) -> Result<u64, FsError> {
+    // Only a card with native cursor planes has any of this to do;
+    // those exist only on the amdgpu native card.
+    #[cfg(feature = "amdgpu")]
+    {
+        cursor_universal_native(card_index, mode_state, ctx, req, bo, admission)
+    }
+    #[cfg(not(feature = "amdgpu"))]
+    {
+        let _ = (card_index, mode_state, ctx, req, bo, admission);
+        Err(FsError::Unsupported)
+    }
+}
+
+#[cfg(feature = "amdgpu")]
+fn cursor_universal_native(
+    card_index: u32,
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    ctx: &DrmFileCtx,
+    req: LegacyCursor,
     bo: Option<Arc<crate::amdgpu_gem::GemObject>>,
     admission: Option<&scanout_kms::CommitAdmission<'_>>,
 ) -> Result<u64, FsError> {
@@ -5820,7 +5979,7 @@ fn cursor_universal(
         } else if req.handle == 0 {
             None
         } else {
-            let mut cmd = crate::amdgpu_dm_modifiers::FbCmd {
+            let mut cmd = crate::drm::fb_cmd::FbCmd {
                 width: req.size.0,
                 height: req.size.1,
                 pixel_format: crate::drm_native_planes::CURSOR_FORMATS[0],
@@ -5895,7 +6054,7 @@ fn cursor_universal(
 /// cursor task reads once its writes landed) and where.
 struct CursorRequest {
     crtc_id: u32,
-    image: Option<crate::amdgpu_navi48_platform::CursorContent>,
+    image: Option<CursorImage>,
     position: (i32, i32),
 }
 
@@ -5912,6 +6071,7 @@ fn cursor_plane_shown(
 /// A one-plane commit of a native cursor plane, as `__setplane_atomic`
 /// (legacy CURSOR, SETPLANE) runs it: the core and amdgpu_dm checks, then
 /// the commit. Returns the hardware cursor requests.
+#[cfg(feature = "amdgpu")]
 fn commit_cursor_plane(
     card_index: u32,
     card: &mut crate::drm::card::Card,
@@ -5951,6 +6111,7 @@ fn commit_cursor_plane(
 /// CRTC's image (read out of the framebuffer's BO) and position for the
 /// native display, after the legacy-wrapped framebuffers the planes let go
 /// of are removed. Only the native amdgpu card has a hardware cursor.
+#[cfg(feature = "amdgpu")]
 fn native_cursor_requests(
     card_index: u32,
     card: &mut crate::drm::card::Card,
@@ -5978,11 +6139,16 @@ fn native_cursor_requests(
 }
 
 fn send_cursor_requests(requests: Vec<CursorRequest>) {
+    // Only the native amdgpu card has hardware cursors to send to;
+    // the request list is empty without it.
+    #[cfg(feature = "amdgpu")]
     for r in requests {
         if let Some(display) = crate::amdgpu_native_kms::crtc_display(r.crtc_id) {
             crate::amdgpu_native_kms::request_display_cursor(display, r.image, r.position);
         }
     }
+    #[cfg(not(feature = "amdgpu"))]
+    let _ = requests;
 }
 
 /// Drop a kernel-held framebuffer (a legacy-wrapped cursor one), freeing
@@ -6025,9 +6191,16 @@ fn handle_create_dumb(
     // requires; other cards keep packed lines. (With its VRAM heap up, that
     // card's opens make VRAM buffers instead: `amdgpu_dumb`.)
     let pitch = if mode_state.lock().gfx12_modifiers {
-        match crate::amdgpu_gem::align_pitch(req.width, bpp_bytes) {
-            0 => return Err(FsError::InvalidData),
-            pitch => pitch,
+        #[cfg(feature = "amdgpu")]
+        {
+            match crate::amdgpu_gem::align_pitch(req.width, bpp_bytes) {
+                0 => return Err(FsError::InvalidData),
+                pitch => pitch,
+            }
+        }
+        #[cfg(not(feature = "amdgpu"))]
+        {
+            req.width * bpp_bytes
         }
     } else {
         req.width * bpp_bytes
@@ -6332,9 +6505,9 @@ fn handle_setcrtc_decoded(
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
-    let src_frame: crate::amdgpu_navi48_platform::PlaneFrame;
+    let src_frame: crate::drm::card::PlaneFrame;
     // A GEM framebuffer, pinned for scanout in place.
-    let gem_frame: Option<crate::amdgpu_navi48_platform::PlaneFrame>;
+    let gem_frame: Option<crate::drm::card::PlaneFrame>;
     {
         let mut card = mode_state.lock();
         if let Some(a) = admission {
@@ -6343,9 +6516,12 @@ fn handle_setcrtc_decoded(
         card.crtc(req.crtc_id).map_err(|_| FsError::NotFound)?;
 
         // The native display behind this CRTC, on the amdgpu card.
+        #[cfg(feature = "amdgpu")]
         let native_display = (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
             .then(|| crate::amdgpu_native_kms::crtc_display(req.crtc_id))
             .flatten();
+        #[cfg(not(feature = "amdgpu"))]
+        let native_display: Option<u8> = None;
         // The connector SETCRTC routes the native CRTC to: one at most (no
         // cloning); none keeps the current routing.
         let native_connector = if native_display.is_some() && req.count_connectors != 0 {
@@ -6384,6 +6560,7 @@ fn handle_setcrtc_decoded(
                 return Err(FsError::InvalidData);
             }
             // On the native card, a timing this CRTC's own display offers.
+            #[cfg(feature = "amdgpu")]
             if native_display.is_some_and(|d| {
                 !crate::amdgpu_native_kms::display_offers(d, native_connector, &wire)
             }) || (crate::drm_registry::driver_name(card_index) == Some("amdgpu")
@@ -6405,6 +6582,7 @@ fn handle_setcrtc_decoded(
             let mode = requested.or_else(|| card.crtc(req.crtc_id).ok().and_then(|c| c.mode));
             check_native_plane(&card, req.fb_id, mode, (req.x, req.y), None)?;
             // The native display must admit the plane's format at the mode.
+            #[cfg(feature = "amdgpu")]
             if let Some(d) = native_display {
                 let format = card
                     .framebuffer(req.fb_id)
@@ -6480,7 +6658,9 @@ fn handle_setcrtc_decoded(
         }
         // drm_atomic_helper_set_config: the primary shows the framebuffer
         // whole at the mode again; the overlays stay as committed.
+        #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::reset_primary(&mut card, req.crtc_id);
+        #[cfg(feature = "amdgpu")]
         if let Some(display) = native_display {
             let setup = crate::drm_native_planes::displays(&card)
                 .into_iter()
@@ -6491,6 +6671,7 @@ fn handle_setcrtc_decoded(
         // The native display follows the CRTC's on/off state, and another
         // offered timing is a native modeset the display monitor runs (the
         // current one leaves it as it is).
+        #[cfg(feature = "amdgpu")]
         if let Some(display) = native_display {
             if let Some(id) = native_connector {
                 crate::amdgpu_native_kms::request_display_route(display, Some(id));
@@ -6548,7 +6729,7 @@ fn handle_setcrtc_decoded(
         present_frame(
             card_index,
             req.crtc_id,
-            crate::amdgpu_navi48_platform::PlaneFrame {
+            crate::drm::card::PlaneFrame {
                 phys: src,
                 ..src_frame
             },
@@ -6611,9 +6792,9 @@ fn handle_page_flip_decoded(
     let virgl_resource: Option<Arc<VirtGpuResource>>;
     let src_w: u32;
     let src_h: u32;
-    let src_frame: crate::amdgpu_navi48_platform::PlaneFrame;
+    let src_frame: crate::drm::card::PlaneFrame;
     // A GEM framebuffer, pinned for scanout in place.
-    let gem_frame: Option<crate::amdgpu_navi48_platform::PlaneFrame>;
+    let gem_frame: Option<crate::drm::card::PlaneFrame>;
     let mut flip_ticket = None;
     {
         let mut card = mode_state.lock();
@@ -6643,7 +6824,11 @@ fn handle_page_flip_decoded(
         // A placed native primary keeps its placement: the new framebuffer
         // must hold its source rectangle (drm_atomic_helper_page_flip
         // changes the framebuffer alone).
-        match crate::drm_native_planes::flip_fits(&card, req.crtc_id, req.fb_id) {
+        #[cfg(feature = "amdgpu")]
+        let fits = crate::drm_native_planes::flip_fits(&card, req.crtc_id, req.fb_id);
+        #[cfg(not(feature = "amdgpu"))]
+        let fits: Option<bool> = None;
+        match fits {
             Some(true) => {}
             Some(false) => return Err(FsError::NoSpace),
             None => check_native_plane(&card, req.fb_id, mode, (x, y), None)?,
@@ -6693,6 +6878,7 @@ fn handle_page_flip_decoded(
         // A framebuffer of another tiling changes the primary's surface
         // (DC's full update): the display relights with it, as for an
         // atomic commit.
+        #[cfg(feature = "amdgpu")]
         if let Some(display) =
             crate::amdgpu_native_kms::crtc_display(req.crtc_id).filter(|_| card.gfx12_modifiers)
         {
@@ -6705,11 +6891,14 @@ fn handle_page_flip_decoded(
         }
 
         if let Some(queue) = event_queue.as_mut() {
+            #[cfg(feature = "amdgpu")]
             let hardware = (virgl_resource.is_none()
                 && (src_phys.is_some() || gem_frame.is_some())
                 && hardware_flips(card_index, req.crtc_id))
             .then(|| crate::amdgpu_native_kms::crtc_display(req.crtc_id))
             .flatten();
+            #[cfg(not(feature = "amdgpu"))]
+            let hardware: Option<u8> = None;
             if let Some(display) = hardware {
                 // The event waits for the hardware flip of this frame.
                 let ticket = crate::drm::card::flips(display).lock().reserve();
@@ -6747,7 +6936,7 @@ fn handle_page_flip_decoded(
         present_frame(
             card_index,
             req.crtc_id,
-            crate::amdgpu_navi48_platform::PlaneFrame {
+            crate::drm::card::PlaneFrame {
                 phys: src,
                 ..src_frame
             },
@@ -6801,9 +6990,18 @@ fn present_virgl_frame(resource: &VirtGpuResource, width: u32, height: u32) -> R
 /// Whether `card_index` presents dumb-buffer frames through a hardware flip,
 /// so their flip-complete events wait for that flip (see `drm::card::FlipLog`).
 fn hardware_flips(card_index: u32, crtc_id: u32) -> bool {
-    crate::drm_registry::driver_name(card_index) == Some("amdgpu")
-        && crate::amdgpu_native_kms::crtc_display(crtc_id)
-            .is_some_and(crate::amdgpu_native_kms::native_present_ready)
+    // Only the amdgpu native card flips in hardware.
+    #[cfg(feature = "amdgpu")]
+    {
+        crate::drm_registry::driver_name(card_index) == Some("amdgpu")
+            && crate::amdgpu_native_kms::crtc_display(crtc_id)
+                .is_some_and(crate::amdgpu_native_kms::native_present_ready)
+    }
+    #[cfg(not(feature = "amdgpu"))]
+    {
+        let _ = (card_index, crtc_id);
+        false
+    }
 }
 
 /// DRM_IOCTL_MODE_SETPLANE — `struct drm_mode_set_plane` (48 bytes):
@@ -6830,6 +7028,27 @@ fn handle_setplane(
 }
 
 fn handle_setplane_decoded(
+    card_index: u32,
+    mode_state: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    bytes: &[u8],
+    admission: Option<&scanout_kms::CommitAdmission<'_>>,
+    validate_only: bool,
+) -> Result<u64, FsError> {
+    // SETPLANE's atomic path serves native planes only; those exist
+    // only on the amdgpu native card.
+    #[cfg(feature = "amdgpu")]
+    {
+        handle_setplane_decoded_native(card_index, mode_state, bytes, admission, validate_only)
+    }
+    #[cfg(not(feature = "amdgpu"))]
+    {
+        let _ = (card_index, mode_state, bytes, admission, validate_only);
+        Err(FsError::Unsupported)
+    }
+}
+
+#[cfg(feature = "amdgpu")]
+fn handle_setplane_decoded_native(
     card_index: u32,
     mode_state: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     bytes: &[u8],
@@ -6971,35 +7190,41 @@ fn handle_setplane_decoded(
 /// unpins them (cleanup_fb of the failed commit). A dumb framebuffer
 /// needs no pin.
 #[derive(Default)]
-pub(crate) struct PreparedFbs(Vec<(u32, Arc<crate::amdgpu_gem::ScanoutPin>)>);
+pub(crate) struct PreparedFbs(Vec<(u32, crate::drm::card::ScanoutPin)>);
 impl PreparedFbs {
     pub(crate) fn prepare(
         card: &crate::drm::card::Card,
         fb_ids: impl IntoIterator<Item = u32>,
     ) -> Result<Self, FsError> {
-        let mut pins: Vec<(u32, Arc<crate::amdgpu_gem::ScanoutPin>)> = Vec::new();
+        let mut pins: Vec<(u32, crate::drm::card::ScanoutPin)> = Vec::new();
         for id in fb_ids {
             if pins.iter().any(|(f, _)| *f == id) {
                 continue;
             }
-            let Some(bo) = card.framebuffer(id).ok().and_then(|fb| fb.bo.as_ref()) else {
-                continue;
-            };
-            match bo.object.pin_scanout() {
-                Ok(pin) => pins.push((id, Arc::new(pin))),
-                Err(e) => {
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "  drm: fb {id} not pinned for scanout: {e:?}"
-                    );
-                    return Err(e);
+            // Only an amdgpu GEM framebuffer pins; a dumb one needs none.
+            #[cfg(feature = "amdgpu")]
+            {
+                let Some(bo) = card.framebuffer(id).ok().and_then(|fb| fb.bo.as_ref()) else {
+                    continue;
+                };
+                match bo.object.pin_scanout() {
+                    Ok(pin) => pins.push((id, Arc::new(pin))),
+                    Err(e) => {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "  drm: fb {id} not pinned for scanout: {e:?}"
+                        );
+                        return Err(e);
+                    }
                 }
             }
+            #[cfg(not(feature = "amdgpu"))]
+            let _ = (card, id);
         }
         Ok(Self(pins))
     }
     /// The pin prepare took on framebuffer `fb_id`'s GEM buffer.
-    pub(crate) fn pin(&self, fb_id: u32) -> Option<Arc<crate::amdgpu_gem::ScanoutPin>> {
+    pub(crate) fn pin(&self, fb_id: u32) -> Option<crate::drm::card::ScanoutPin> {
         self.0
             .iter()
             .find(|(f, _)| *f == fb_id)
@@ -7014,7 +7239,7 @@ fn native_plane_frame(
     card: &crate::drm::card::Card,
     plane: &crate::drm::atomic::PlaneState,
     prepared: &PreparedFbs,
-) -> Option<crate::amdgpu_navi48_platform::PlaneFrame> {
+) -> Option<crate::drm::card::PlaneFrame> {
     prepared_frame(card, card.framebuffer(plane.fb_id?).ok()?, prepared)
 }
 
@@ -7025,9 +7250,9 @@ fn prepared_frame(
     card: &crate::drm::card::Card,
     fb: &crate::drm::card::Framebuffer,
     prepared: &PreparedFbs,
-) -> Option<crate::amdgpu_navi48_platform::PlaneFrame> {
+) -> Option<crate::drm::card::PlaneFrame> {
     if fb.bo.is_some() {
-        return Some(crate::amdgpu_navi48_platform::PlaneFrame {
+        return Some(crate::drm::card::PlaneFrame {
             bo: Some(prepared.pin(fb.id)?),
             ..fb_frame(fb, 0)
         });
@@ -7042,17 +7267,14 @@ fn prepared_frame(
 pub(crate) fn scanout_frame(
     card: &crate::drm::card::Card,
     fb: &crate::drm::card::Framebuffer,
-) -> Option<crate::amdgpu_navi48_platform::PlaneFrame> {
+) -> Option<crate::drm::card::PlaneFrame> {
     let prepared = PreparedFbs::prepare(card, [fb.id]).ok()?;
     prepared_frame(card, fb, &prepared)
 }
 
 /// Framebuffer `fb` (backed at `phys`) as the presenter copies it.
-fn fb_frame(
-    fb: &crate::drm::card::Framebuffer,
-    phys: u64,
-) -> crate::amdgpu_navi48_platform::PlaneFrame {
-    crate::amdgpu_navi48_platform::PlaneFrame {
+fn fb_frame(fb: &crate::drm::card::Framebuffer, phys: u64) -> crate::drm::card::PlaneFrame {
+    crate::drm::card::PlaneFrame {
         phys,
         pitch: fb.pitch,
         width: fb.width,
@@ -7068,12 +7290,12 @@ fn fb_frame(
 /// A display with native planes presents an atomic commit's planes
 /// together through its back buffers; when it cannot, the primary takes
 /// `present_frame`'s fallback.
+#[cfg(feature = "amdgpu")]
 fn present_native_planes(
     card_index: u32,
     crtc_id: u32,
-    primary: Option<crate::amdgpu_navi48_platform::PlaneFrame>,
-    overlays: [Option<crate::amdgpu_navi48_platform::PlaneFrame>;
-        crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+    primary: Option<crate::drm::card::PlaneFrame>,
+    overlays: [Option<crate::drm::card::PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
     ticket: Option<u64>,
 ) {
     let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) else {
@@ -7104,7 +7326,7 @@ fn present_native_planes(
 fn present_frame(
     card_index: u32,
     crtc_id: u32,
-    f: crate::amdgpu_navi48_platform::PlaneFrame,
+    f: crate::drm::card::PlaneFrame,
     flip_ticket: Option<u64>,
 ) {
     let (src_phys, src_pitch, src_w, src_h, src_format) =
@@ -7112,6 +7334,7 @@ fn present_frame(
     let driver = crate::drm_registry::driver_name(card_index);
     // A native amdgpu display presents tear-free through its back buffer
     // and a VUPDATE-latched flip instead of copying onto the visible front.
+    #[cfg(feature = "amdgpu")]
     if driver == Some("amdgpu") {
         if let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) {
             // A refused frame completes its ticket at once. A tiled or 4:2:0
@@ -7426,6 +7649,7 @@ pub fn get_client(
 /// `amdgpu_device_initialize` dereferences `drmGetVersion`'s result, so the
 /// render node must answer even without a display owner. `None` for any
 /// other ioctl or a card with KMS state (the card's own table answers).
+#[cfg(feature = "amdgpu")]
 pub fn without_kms(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
     if crate::drm_registry::driver_name(card_index) != Some("amdgpu")
         || crate::drm_registry::mode_state(card_index).is_some()
@@ -7451,6 +7675,7 @@ pub fn without_kms(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, 
 
 /// `DRM_IOCTL_GET_CAP` for amdgpu: the generic table, plus
 /// `DRM_CAP_SYNCOBJ_TIMELINE` = 1 (amdgpu has `DRIVER_SYNCOBJ_TIMELINE`).
+#[cfg(feature = "amdgpu")]
 pub fn amdgpu_cap_value(cap: u64) -> u64 {
     // amdgpu: DRIVER_SYNCOBJ_TIMELINE, and format modifiers are supported
     // (!fb_modifiers_not_supported); only LINEAR scans out natively.
@@ -7466,6 +7691,7 @@ pub fn amdgpu_cap_value(cap: u64) -> u64 {
 /// `DRM_IOCTL_GET_CAP(SYNCOBJ_TIMELINE)` on an amdgpu open (with or without
 /// KMS state); `None` for any other ioctl or capability, which the card's
 /// generic table answers identically for amdgpu.
+#[cfg(feature = "amdgpu")]
 pub fn amdgpu_get_cap(cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
     if (cmd >> 8) & 0xff != u32::from(b'd') || drm_uapi::ioc_nr(cmd) != 0x0c {
         return None;
@@ -7492,6 +7718,7 @@ pub fn amdgpu_get_cap(cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
 /// (convert_tiling_flags_to_modifier_gfx12), GET returns them with no
 /// metadata blob. `None` for another ioctl or a handle that is not a dumb
 /// BO of a native amdgpu card (the per-open amdgpu GEM table answers it).
+#[cfg(feature = "amdgpu")]
 pub fn amdgpu_dumb_metadata(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
     let nr = drm_uapi::ioc_nr(cmd);
     if (cmd >> 8) & 0xff != u32::from(b'd')
@@ -7544,6 +7771,7 @@ pub fn amdgpu_dumb_metadata(card_index: u32, cmd: u32, arg: usize) -> Option<Res
 /// file's own handle table, then `Card::addfb2_bo`. `None` for another
 /// ioctl, another card, or a handle that is not one of the open's amdgpu
 /// GEM buffers (the card's ADDFB2 then answers it as before).
+#[cfg(feature = "amdgpu")]
 pub fn amdgpu_addfb2_bo(
     card_index: u32,
     open_id: u64,
@@ -7563,7 +7791,7 @@ pub fn amdgpu_addfb2_bo(
         Ok(b) => b,
         Err(e) => return Some(Err(e)),
     };
-    let fb = crate::amdgpu_dm_modifiers::FbCmd::parse(&b)?;
+    let fb = crate::drm::fb_cmd::FbCmd::parse(&b)?;
     if !gem.owns(fb.handles[0]) {
         return None;
     }
@@ -7586,11 +7814,13 @@ pub fn amdgpu_addfb2_bo(
 /// client VRAM heap is up. Other cards, and the Navi48 card without a heap
 /// (before bring-up, while suspended or recovering), keep the card's
 /// system-memory dumb buffers.
+#[cfg(feature = "amdgpu")]
 fn amdgpu_vram_dumb(card_index: u32) -> bool {
     crate::drm_registry::mode_state(card_index).is_some_and(|m| m.lock().gfx12_modifiers)
         && crate::amdgpu_gem::vram_heap_usage(card_index).is_some()
 }
 
+#[cfg(feature = "amdgpu")]
 fn amdgpu_dumb_live(card_index: u32) -> Result<(), FsError> {
     let native =
         crate::drm_registry::mode_state(card_index).is_some_and(|mode| mode.lock().gfx12_modifiers);
@@ -7603,6 +7833,7 @@ fn amdgpu_dumb_live(card_index: u32) -> Result<(), FsError> {
 /// CREATE_DUMB's `struct drm_mode_create_dumb` at `arg`, filled in with the
 /// `(handle, pitch, size)` of `made` on success. `NoSpace` is ENOMEM, as
 /// amdgpu_mode_dumb_create returns it.
+#[cfg(feature = "amdgpu")]
 fn finish_amdgpu_dumb(
     arg: usize,
     req: DrmModeCreateDumbUapi,
@@ -7644,6 +7875,7 @@ fn read_create_dumb(arg: usize) -> Result<DrmModeCreateDumbUapi, FsError> {
 ///
 /// `None` for another ioctl, another card, or a handle the open's table
 /// does not hold: the card's dumb-buffer table answers those as before.
+#[cfg(feature = "amdgpu")]
 pub fn amdgpu_dumb(
     card_index: u32,
     cmd: u32,
@@ -7695,6 +7927,7 @@ pub fn amdgpu_dumb(
 /// CREATE_DUMB from a user open of the Navi48 card, which may sleep: when
 /// visible VRAM is full, TTM's eviction (`amdgpu_gem::create_dumb_async`)
 /// before ENOMEM. `None` where [`amdgpu_dumb`] answers `None`.
+#[cfg(feature = "amdgpu")]
 pub async fn amdgpu_create_dumb_async(
     card_index: u32,
     cmd: u32,
@@ -7719,6 +7952,7 @@ pub async fn amdgpu_create_dumb_async(
 
 #[path = "amdgpu_scanout_kms.rs"]
 mod scanout_kms;
+#[cfg(feature = "amdgpu")]
 pub(crate) use scanout_kms::dispatch as amdgpu_kms_async;
 
 /// DRM_IOCTL_MODE_CURSOR{,2} with DRM_MODE_CURSOR_BO on the Navi48 card
@@ -7726,6 +7960,7 @@ pub(crate) use scanout_kms::dispatch as amdgpu_kms_async;
 /// CREATE_DUMB, say): drm_mode_cursor_universal wraps the buffer itself
 /// (drm_internal_framebuffer_create's lookup in the file's table), as
 /// `Card::addfb2_bo`. `None` for another ioctl, card or handle.
+#[cfg(feature = "amdgpu")]
 pub fn amdgpu_cursor_bo(
     card_index: u32,
     open_id: u64,
@@ -7777,6 +8012,7 @@ pub fn amdgpu_cursor_bo(
 /// `struct drm_version` for the amdgpu driver: `amdgpu`, `20150101`,
 /// `AMD GPU`, `KMS_DRIVER_*` — 3.64.0 on a Navi 22 whose submission path is
 /// wired, the base 3.0.0 otherwise.
+#[cfg(feature = "amdgpu")]
 fn amdgpu_version(card_index: u32, arg: usize) -> Result<u64, FsError> {
     // SAFETY: `arg` is the ioctl struct pointer; drm_version is 64 bytes.
     let mut b = unsafe { copy_in(arg, 64)? };

@@ -1322,8 +1322,9 @@ pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
         format: PixelFormat::Xrgb8888,
     };
 
-    let _ = modeset.modeset(&fb, None);
-    // Even if modeset fails (e.g. EDID not available), we can fall back
-    // to generic mode, but let's return what modeset gave us.
+    // Single modeset run. Before lane 1 (#1010) this called
+    // `modeset()` twice — discarding the first result and running
+    // the full DPLL + link-training sequence a second time on
+    // hardware that had just been programmed.
     modeset.modeset(&fb, None).ok()
 }

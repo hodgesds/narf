@@ -14172,3 +14172,33 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     smoke_rdna2_chip_identity_and_startup_gate
 );
+
+/// Vendor feature census: the PCI-driver initcalls this crate
+/// registers must match the compiled-in vendor feature set exactly.
+/// `register_initcalls` runs at boot before the test runner, so the
+/// registry still holds every name it published. With a vendor
+/// feature off, none of that vendor's initcalls may appear (and its
+/// modules do not compile at all — the build itself proves that
+/// half); with it on, they must all be there.
+fn smoke_gpu_vendor_feature_registration_census() -> TestResult {
+    let subsys = narf_init::registered_names(narf_init::Stage::Subsys);
+    let late = narf_init::registered_names(narf_init::Stage::Late);
+    let intel = cfg!(feature = "intel");
+    let amdgpu = cfg!(feature = "amdgpu");
+    if subsys.contains(&"intel-gpu-pci") != intel {
+        return TestResult::Fail("intel-gpu-pci registration does not match the intel feature");
+    }
+    if late.contains(&"intel-gpu-dp-bridge") != intel {
+        return TestResult::Fail(
+            "intel-gpu-dp-bridge registration does not match the intel feature",
+        );
+    }
+    if subsys.contains(&"amdgpu-pci") != amdgpu {
+        return TestResult::Fail("amdgpu-pci registration does not match the amdgpu feature");
+    }
+    if late.contains(&"amdgpu-usbc") != amdgpu {
+        return TestResult::Fail("amdgpu-usbc registration does not match the amdgpu feature");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_gpu_vendor_feature_registration_census);

@@ -39,6 +39,16 @@ narf-interrupts      = { path = "../../interrupts" }
 narf-drivers-backlight = { path = "../backlight" }
 
 [features]
+# Each GPU vendor's driver set is a selectable feature. `default`
+# enables them all, so the built kernel compiles the same driver
+# set it did before the split. Drop one (e.g.
+# `--no-default-features --features intel`) to build a kernel
+# without that vendor's drivers: none of its modules compile and
+# none of its PCI drivers register. The named-config registry
+# (build/xtask configs) selects these per build configuration.
+default = ["amdgpu", "intel"]
+amdgpu = []
+intel = []
 # Tests cover the DRM sysfs class bridge, so the
 # kernel-test build must compile those paths.
 kernel-test = []
