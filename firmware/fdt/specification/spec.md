@@ -98,6 +98,14 @@ impl<'a> Iterator for PropIter<'a> {
     type Item = (&'a str, &'a [u8]);
 }
 
+/// Read a `u32` property of the root node (`/`). The walkers
+/// never report the root, but the root carries tree-wide
+/// declarations — `interrupt-parent` above all, the default
+/// interrupt parent every node inherits (DTSpec §2.4). `None`
+/// on a malformed blob, a non-root first node, or an absent /
+/// short property.
+pub fn root_prop_u32(blob: &[u8], name: &str) -> Option<u32>;
+
 /// Convenience helpers atop `walk_nodes`:
 
 /// Capacity of the owned buffer `chosen_bootargs` returns. Matches
@@ -154,7 +162,7 @@ pub fn for_each_interrupt<F>(
 | `smoke_fdt_reserved_memory_static_ranges` | `/reserved-memory` static range + flags |
 | `smoke_fdt_interrupts_extended_multiple_domains` | mixed interrupt domains decoded |
 | `smoke_fdt_chosen_stdout_reg_forms` | `stdout-path` resolves via alias+`:params` and full-path forms; absent `/chosen` yields `None` |
-| `smoke_fdt_real_qemu_virt_*` (9 smokes) | parser pinned against a real QEMU `virt` DTB fixture (`tests/fixtures/qemu-virt.dtb`, #1048) |
+| `smoke_fdt_real_qemu_virt_*` (10 smokes) | parser pinned against a real QEMU `virt` DTB fixture (`tests/fixtures/qemu-virt.dtb`, #1048); the root-props smoke pins `root_prop_u32` against the blob's `interrupt-parent` + root cells |
 
 ## 6. Out of scope (v0.1)
 

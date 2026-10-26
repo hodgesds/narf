@@ -460,6 +460,37 @@ fn skip_props(blob: &[u8], mut cur: usize, end: usize) -> usize {
     cur
 }
 
+/// Read a `u32` property of the root node (`/`).
+///
+/// The walkers never report the root itself, but the root carries
+/// enumeration-relevant declarations — most importantly
+/// `interrupt-parent`, the tree-wide default interrupt parent that
+/// every node inherits unless it or an ancestor overrides it
+/// (Devicetree Specification §2.4). Returns `None` when the blob is
+/// malformed, the structure block does not open with the root node,
+/// or the property is absent / shorter than 4 bytes.
+pub fn root_prop_u32(blob: &[u8], name: &str) -> Option<u32> {
+    let hdr = parse_header(blob)?;
+    let struct_start = hdr.off_dt_struct as usize;
+    let strings_start = hdr.off_dt_strings as usize;
+    let strings_end = strings_start.checked_add(hdr.size_dt_strings as usize)?;
+    if strings_end > blob.len() {
+        return None;
+    }
+    // The structure block opens with the root's BEGIN_NODE token.
+    // The root's name is the empty string — one NUL byte padded to
+    // the 4-byte token grid — so its properties begin 8 bytes in.
+    if be_u32(blob, struct_start)? != FDT_BEGIN_NODE || blob.get(struct_start + 4) != Some(&0) {
+        return None;
+    }
+    let props = PropIter {
+        blob,
+        cur: struct_start + 8,
+        strings: &blob[strings_start..strings_end],
+    };
+    prop_u32(props, name)
+}
+
 // ───────────────────────────────────────────────────────────────────
 // Convenience helpers
 // ───────────────────────────────────────────────────────────────────

@@ -792,6 +792,25 @@ fn smoke_fdt_real_qemu_virt_chosen() -> TestResult {
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_chosen);
 
+fn smoke_fdt_real_qemu_virt_root_props() -> TestResult {
+    // The root carries the tree-wide interrupt parent (the GIC's
+    // phandle, 0x8005) and the 2/2 root cells every child inherits.
+    if fdt::root_prop_u32(QEMU_VIRT_DTB, "interrupt-parent") != Some(0x8005) {
+        return TestResult::Fail("root interrupt-parent is not the GIC phandle");
+    }
+    if fdt::root_prop_u32(QEMU_VIRT_DTB, "#address-cells") != Some(2) {
+        return TestResult::Fail("root #address-cells != 2");
+    }
+    if fdt::root_prop_u32(QEMU_VIRT_DTB, "#size-cells") != Some(2) {
+        return TestResult::Fail("root #size-cells != 2");
+    }
+    if fdt::root_prop_u32(QEMU_VIRT_DTB, "no-such-property").is_some() {
+        return TestResult::Fail("absent root property decoded as present");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_root_props);
+
 fn smoke_fdt_chosen_stdout_reg_forms() -> TestResult {
     // Root cells 1/1 so the fixture UARTs' `reg` decodes as
     // (addr, size) u32 pairs.
