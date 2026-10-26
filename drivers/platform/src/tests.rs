@@ -2345,7 +2345,28 @@ fn composition_park_step_latch() {
     narf_power::s2idle::note_wake_event(narf_power::s2idle::WakeSource::TestInjected);
 }
 
+/// Registered wrapper for the composition smoke. The body's
+/// isolation reset clears the `device_pm` registry — but that
+/// registry is probe-owned global state (every driver registers at
+/// probe, e.g. AHCI's #932 entry), not composition state, and later
+/// smokes in the same boot read it. Snapshot it before the body
+/// runs and hand it back afterwards, whatever the body returns.
 fn smoke_power_state_freeze_end_to_end() -> TestResult {
+    let saved = narf_power::device_pm::registered_devices();
+    let result = smoke_power_state_freeze_end_to_end_body();
+    narf_power::device_pm::__reset_for_test();
+    for entry in &saved {
+        match &entry.ops {
+            Some(ops) => narf_power::device_pm::register_device_pm_ops(&entry.name, ops.clone()),
+            None => {
+                narf_power::device_pm::register_device_pm(&entry.name, entry.suspend, entry.resume)
+            }
+        }
+    }
+    result
+}
+
+fn smoke_power_state_freeze_end_to_end_body() -> TestResult {
     use narf_power::service;
 
     if !narf_power::s2idle::s2idle_supported() {
@@ -2353,7 +2374,10 @@ fn smoke_power_state_freeze_end_to_end() -> TestResult {
     }
 
     // Reset every surface the composition touches, so the fixture
-    // measures the composition and not boot residue.
+    // measures the composition and not boot residue. The
+    // `device_pm` clear is the exception that proves the rule: the
+    // registry belongs to the drivers' probes, so the wrapper
+    // above snapshots it first and restores it on the way out.
     service::__reset_for_test();
     narf_power::suspend::__test_reset();
     narf_power::s2idle::__test_reset();
