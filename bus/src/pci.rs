@@ -383,6 +383,7 @@ fn pcie_cfg_phys(device: &BusDevice) -> Result<PhysAddr, PciError> {
     match device.kind {
         BusKind::Pcie { cfg_phys, .. } => Ok(cfg_phys),
         BusKind::VirtioMmio { .. } => Err(PciError::NotPcie),
+        BusKind::Platform(_) => Err(PciError::NotPcie),
     }
 }
 
@@ -641,5 +642,6 @@ pub fn requester_id(device: &BusDevice) -> Option<u16> {
             Some(((addr.bus as u16) << 8) | ((addr.device as u16) << 3) | (addr.function as u16))
         }
         BusKind::VirtioMmio { .. } => None,
+        BusKind::Platform(_) => None,
     }
 }

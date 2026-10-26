@@ -70,7 +70,10 @@ pub use bar::{
     allocate_pci_mmio, assign_unprogrammed_bars, init_mmio_pool, map_bar, map_bar_control,
     read_bar, AssignError, Bar, BarError, BarKind, MmioRegion, NUM_BARS,
 };
-pub use device::{BusDevice, BusKind, DeviceId};
+pub use device::{
+    BusDevice, BusKind, DeviceId, DtIrq, PlatformDevice, RegWindow, PLATFORM_COMPATIBLE_CAP,
+    PLATFORM_MAX_IRQS, PLATFORM_MAX_REGS,
+};
 pub use driver_match::{
     bound_count as bound_pci_devices, detach as detach_pci_device, module_bar_map, module_dma_addr,
     module_dma_alloc, module_dma_free, module_dma_read, module_dma_wait8, module_dma_write,

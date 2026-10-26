@@ -468,6 +468,7 @@ pub fn enable_msix(
     let cfg_phys = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(MsixError::NotPcie),
+        BusKind::Platform(_) => return Err(MsixError::NotPcie),
     };
 
     // SAFETY: caller-checked cap; pci_cap::find_cap walks the

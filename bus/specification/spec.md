@@ -98,6 +98,32 @@ pub struct DeviceInfo {
 }
 ```
 
+As implemented, the registry descriptor is
+`BusDevice { addr: BusAddr, id: DeviceId, kind: BusKind }` with
+`BusKind::{Pcie, VirtioMmio, Platform}`. `Platform(PlatformDevice)`
+is the devicetree record (DT enumeration, §3.2 / §5):
+
+- `compatible`: the node's `compatible` list inline, most-specific
+  string first, capacity `PLATFORM_COMPATIBLE_CAP` (128) bytes,
+  truncated at a string boundary — the strings matching prefers are
+  the ones kept. A string's position in the list is the DT match
+  specificity measure (§9.2).
+- `regs`: up to `PLATFORM_MAX_REGS` (4) decoded `reg` windows,
+  translated through ancestor `ranges` at enumeration. Window 0's
+  base is the device's `BusAddr::Mmio` key; `DeviceId` is all-zero.
+- `irqs`: up to `PLATFORM_MAX_IRQS` (4) interrupts resolved at
+  enumeration to architectural INTIDs against the interrupt
+  parent's binding. Only the GIC 3-cell form is resolved today;
+  a device under another controller keeps `irq_parent` (the
+  parent's phandle) but carries no resolved entries.
+- `phandle` / `irq_parent`: the node's own phandle and its
+  interrupt parent's, for the framework layer. Further phandle
+  references (`clocks` / `resets` / `regulators`) are *not* decoded
+  at enumeration — their cell widths are properties of the target
+  controller, so the framework layer resolves them at probe time,
+  re-locating the node by (first compatible string, first `reg`
+  base) via `narf_firmware_fdt::for_each_compatible`.
+
 ### 3.2 Enumeration API
 
 ```rust

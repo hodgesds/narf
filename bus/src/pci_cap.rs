@@ -94,6 +94,7 @@ pub unsafe fn iter(device: &BusDevice) -> Result<CapIter, CapError> {
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(CapError::NotPcie),
+        BusKind::Platform(_) => return Err(CapError::NotPcie),
     };
     // SAFETY: cfg-space is identity-mapped MMIO; offset 0x06 is in
     // every type-0 / type-1 header.

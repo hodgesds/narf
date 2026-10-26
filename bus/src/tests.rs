@@ -58,6 +58,94 @@ fn smoke_bus_enumerates_pcie() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bus", smoke_bus_enumerates_pcie);
 
+fn smoke_bus_platform_device_record() -> TestResult {
+    // The devicetree device record: compatible-list specificity,
+    // reg/irq windows, and boundary-truncation of an over-long
+    // compatible list. Pure record semantics — no hardware.
+    use crate::{BusAddr, BusDevice, BusKind, DeviceId, DtIrq, PlatformDevice, RegWindow};
+    use narf_memory::PhysAddr;
+
+    let mut rec = PlatformDevice::new();
+    rec.set_compatible(b"arm,pl011\0arm,primecell\0");
+    if rec.compatible_position("arm,pl011") != Some(0) {
+        return TestResult::Fail("most-specific compatible not at position 0");
+    }
+    if rec.compatible_position("arm,primecell") != Some(1) {
+        return TestResult::Fail("fallback compatible not at position 1");
+    }
+    if rec.compatible_position("arm,pl022").is_some() {
+        return TestResult::Fail("absent compatible reported present");
+    }
+    if rec.first_compatible() != "arm,pl011" {
+        return TestResult::Fail("first_compatible mismatch");
+    }
+    if !rec.push_reg(RegWindow {
+        base: PhysAddr::new(0x0900_0000),
+        len: 0x1000,
+    }) {
+        return TestResult::Fail("first reg window rejected");
+    }
+    if !rec.push_irq(DtIrq {
+        intid: 33,
+        flags: 4,
+    }) {
+        return TestResult::Fail("first irq rejected");
+    }
+    if rec.reg_windows().len() != 1 || rec.irq_list().len() != 1 {
+        return TestResult::Fail("window counts wrong after push");
+    }
+    rec.irq_parent = 0x8005;
+    rec.phandle = 7;
+
+    // Over-long compatible list: whole strings only, in order, and
+    // the copy stops at the first string that does not fit.
+    let mut long = alloc::vec::Vec::new();
+    for i in 0..10 {
+        long.extend_from_slice(b"vendor,device-");
+        long.push(b'0' + i);
+        long.push(0);
+    }
+    let mut rec2 = PlatformDevice::new();
+    rec2.set_compatible(&long);
+    if rec2.compatible_bytes().len() > crate::PLATFORM_COMPATIBLE_CAP {
+        return TestResult::Fail("compatible copy exceeded capacity");
+    }
+    if rec2.compatible_bytes().last() != Some(&0) {
+        return TestResult::Fail("truncated compatible not NUL-terminated at a boundary");
+    }
+    if rec2.compatible_position("vendor,device-0") != Some(0) {
+        return TestResult::Fail("truncated list lost its head");
+    }
+    if rec2.compatible_position("vendor,device-9").is_some() {
+        return TestResult::Fail("truncated list claims its tail");
+    }
+
+    // The record rides through the registry keyed on window 0.
+    let _restore_registry = RegistryRestore::capture();
+    let dev = BusDevice {
+        addr: BusAddr::Mmio(PhysAddr::new(0x0900_0000)),
+        id: DeviceId {
+            vendor: 0,
+            device: 0,
+            class: 0,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Platform(rec),
+    };
+    crate::registry::install(alloc::vec![dev]);
+    let found = crate::devices();
+    if found.len() != 1 {
+        return TestResult::Fail("platform device did not round-trip the registry");
+    }
+    match &found[0].kind {
+        BusKind::Platform(p) if p.compatible_contains("arm,pl011") && p.irq_parent == 0x8005 => {}
+        _ => return TestResult::Fail("registry returned a mangled platform record"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_platform_device_record);
+
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_pcie_dtb_aarch64() -> TestResult {
     // The boot-time `bus::init` discovers the `pcie@10000000` node
