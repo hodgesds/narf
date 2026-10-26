@@ -264,7 +264,11 @@ pub fn begin_path_mutation(
   named dentry (or every child when `names` is empty); unrelated hash chains
   survive. The guard holds no lock and may cross `.await`; per-chain active
   writer counts and generations close the no-existing-dentry race and make
-  overlapping readers retry. Reference walk publishes merged file/directory
+  overlapping readers retry. Its allocation-free bucket bitmap is sized from
+  the full dentry-cache bucket count, including whole-directory invalidation;
+  duplicate names count each affected chain once per guard. Independent guards
+  on the same chain retain separate active-writer counts until each completes.
+  Reference walk publishes merged file/directory
   positive dentries and negative dentries only when its pre/post chain token
   validates.
   Local initramfs, memfs, ext2, btrfs, FAT, MINIX, exFAT, UDF, SquashFS, and
