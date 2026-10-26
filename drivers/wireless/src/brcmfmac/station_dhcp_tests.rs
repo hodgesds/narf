@@ -16,6 +16,8 @@ use narf_wifi_fixtures::udp_ipv4;
 
 #[path = "channel_station_tests.rs"]
 mod channel_station_tests;
+#[path = "ht_tests.rs"]
+mod ht_tests;
 #[path = "mfp_tests.rs"]
 mod mfp_tests;
 #[path = "power_save_tests.rs"]
@@ -41,6 +43,7 @@ fn ready<F: Future>(future: F) -> Result<F::Output, &'static str> {
     }
     Err("PCIe firmware conversation did not complete")
 }
+type NativeFeatures = (Option<(bool, bool, u8)>, Option<(u32, u8)>);
 struct Harness {
     device: Arc<ModelDevice>,
     bus: Handle,
@@ -89,6 +92,25 @@ impl Harness {
         database: Option<Arc<narf_wireless::reg::db::Database>>,
         mfp: Option<(bool, bool, u8)>,
     ) -> Result<Self, &'static str> {
+        Self::new_features(
+            version,
+            secured,
+            keys_first,
+            selected,
+            channel,
+            database,
+            (mfp, None),
+        )
+    }
+    fn new_features(
+        version: u32,
+        secured: bool,
+        keys_first: bool,
+        selected: bool,
+        channel: u8,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        features: NativeFeatures,
+    ) -> Result<Self, &'static str> {
         let (adapter, bus) = if selected {
             let (selection, assets) = crate::brcmfmac::provision::tests::selected_fixture(
                 crate::brcmfmac::provision::Family::Pcie43602,
@@ -100,8 +122,11 @@ impl Harness {
         .map_err(|_| "CR4/common-ring native ownership")?;
         bus.keys_first(keys_first);
         bus.channel(channel);
-        if let Some((supported, required, fault)) = mfp {
+        if let Some((supported, required, fault)) = features.0 {
             bus.mfp_profile(supported, required, fault);
+        }
+        if let Some((chains, fault)) = features.1 {
+            bus.phy_profile(chains, fault);
         }
         let mut domain = firmware::domain();
         if channel > 14 {
@@ -141,6 +166,7 @@ impl Harness {
             .collect();
         let supplicant = station.supplicant;
         let mfp_supported = station.supports_management_protection();
+        let ht_capabilities = station.ht_capabilities();
         let (rx, consumer) = narf_ipc::channel();
         let (producer, tx) = narf_ipc::channel();
         let name = narf_net::iface::register("wlan%d", OWN, send);
@@ -156,6 +182,7 @@ impl Harness {
             channels,
             supplicant,
             mfp_supported,
+            ht_capabilities,
             up: AtomicBool::new(false),
             power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
@@ -320,14 +347,25 @@ fn composition_mfp(
     channel: u8,
     mfp: bool,
 ) -> Result<(), &'static str> {
-    let harness = Harness::new_profile(
+    composition_phy(version, secured, keys_first, selected, channel, mfp, None)
+}
+fn composition_phy(
+    version: u32,
+    secured: bool,
+    keys_first: bool,
+    selected: bool,
+    channel: u8,
+    mfp: bool,
+    phy: Option<(u32, u8)>,
+) -> Result<(), &'static str> {
+    let harness = Harness::new_features(
         version,
         secured,
         keys_first,
         selected,
         channel,
         None,
-        mfp.then_some((true, true, 0)),
+        (mfp.then_some((true, true, 0)), phy),
     )?;
     let (uplink, downlink) = packets();
     if !harness.closed(&uplink)
@@ -342,6 +380,17 @@ fn composition_mfp(
         return Err("PCIe preauthorization RX escaped controlled port");
     }
     harness.associate(secured)?;
+    if harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .ht_connection()
+        != phy.is_some()
+    {
+        return Err("PCIe PHY proof did not match the completed conversation");
+    }
     if harness
         .device
         .state

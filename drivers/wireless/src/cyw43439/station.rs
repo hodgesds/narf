@@ -32,6 +32,8 @@ pub struct Station<R: Fullmac> {
     pub supplicant: bool,
     mfp_supported: bool,
     mfp_verified: bool,
+    phy: Option<phy::Capabilities>,
+    ht_verified: bool,
     power_save: bool,
     operation: bool,
 }
@@ -115,6 +117,7 @@ impl<R: Fullmac> Station<R> {
                 }
             }
         }
+        let phy = phy::probe(&mut runtime).await?;
         set_int(&mut runtime, ioctl::WLC_SET_PM, 0).await?;
         set_int(&mut runtime, 20, 1).await?; // Infrastructure station.
         set_int(&mut runtime, 22, 0).await?; // Open-system 802.11 authentication.
@@ -184,6 +187,8 @@ impl<R: Fullmac> Station<R> {
             supplicant,
             mfp_supported,
             mfp_verified: false,
+            phy,
+            ht_verified: false,
             power_save: false,
             operation: false,
         })
@@ -203,6 +208,14 @@ impl<R: Fullmac> Station<R> {
     /// wiphy metadata, not a completed protected association or key grant.
     pub fn supports_management_protection(&self) -> bool {
         self.mfp_supported && self.supplicant
+    }
+    /// Actual queried and20MHz-constrained firmware HT capabilities.
+    pub fn ht_capabilities(&self) -> Option<[u8; 26]> {
+        self.phy.map(phy::Capabilities::body)
+    }
+    /// Completed native HT association facts for the currently admitted peer.
+    pub fn ht_connection(&self) -> bool {
+        self.ht_verified && self.bssid.is_some() && self.connection.is_some()
     }
 
     /// Linux brcmf_cfg80211_set_power_mgmt: PM_FAST / PM_OFF followed by
@@ -469,7 +482,13 @@ impl<R: Fullmac> Station<R> {
         let protection =
             mfp::Profile::negotiate(&bss.ies, &request.ie, secure, self.mfp_supported)?;
         validate_association_ies(&request.ie, secure, protection.required())?;
+        let ht = self
+            .phy
+            .map(|phy| phy.prepare(&bss.ies, bss.info.channel as u8))
+            .transpose()?
+            .flatten();
         self.mfp_verified = false;
+        self.ht_verified = false;
         self.tx_var(grant, "qtxpower", &(u32::from(power) * 4).to_le_bytes())
             .await?;
         self.runtime.poll()?;
@@ -569,6 +588,14 @@ impl<R: Fullmac> Station<R> {
                 // current FIFO/ring idle sample before opening the host port.
                 while self.runtime.pop_data().is_some() {}
                 if associated && keys && consumed == 0 {
+                    if let Some(profile) = ht.filter(|_| !self.ht_verified) {
+                        self.verify_phy(grant, request.bssid, bss.info.channel as u8, profile)
+                            .await?;
+                        self.ht_verified = true;
+                        // Native queries can consume later peer loss/data.
+                        // Re-observe a current FIFO/ring idle sample first.
+                        continue;
+                    }
                     if protection.required() && !self.mfp_verified {
                         self.verify_management_protection(grant, request.bssid, protection)
                             .await?;
@@ -599,6 +626,7 @@ impl<R: Fullmac> Station<R> {
         .await;
         if result.is_err() {
             self.mfp_verified = false;
+            self.ht_verified = false;
             self.bssid = None;
             self.connection = None;
             self.runtime.set_link(None);
@@ -630,6 +658,7 @@ impl<R: Fullmac> Station<R> {
         let grant = self.connection.take();
         let peer = self.bssid.take();
         self.mfp_verified = false;
+        self.ht_verified = false;
         self.runtime.set_link(None);
         if let Some(grant) = grant {
             self.tx_command(grant, 52, &[]).await?;
@@ -705,6 +734,8 @@ pub use policy::{GlobalPolicy, PolicySource};
 
 #[path = "station_mfp.rs"]
 mod mfp;
+#[path = "station_phy.rs"]
+mod phy;
 
 const MAX_REPLY: usize = 1502;
 
@@ -803,7 +834,7 @@ fn channel_ceiling(
         }
         if rule.freq_start_mhz >= rule.freq_end_mhz
             || rule.max_bandwidth_mhz < 20
-            || transmit && rule.flags.intersects(RegFlags::DFS | RegFlags::NO_IR)
+            || transmit && rule.flags.bits() & !RegFlags::NO_P2P.bits() != 0
         {
             return None;
         }

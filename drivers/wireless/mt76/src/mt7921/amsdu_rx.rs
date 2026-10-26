@@ -95,7 +95,8 @@ impl Receiver {
         }
         let ht = ht.ok_or(Error::UnsupportedFirmware)?;
         let operation = operation.ok_or(Error::UnsupportedFirmware)?;
-        // The narrow receive prerequisite is one stream, HT20, long GI.
+        // The narrow receive prerequisite is one stream, HT20. Guard
+        // interval selection does not change the native MSDU layout.
         // Do not infer higher NSS or accept an AP mandatory basic MCS above7.
         if ht[3] == 0 || operation[7..].iter().any(|&byte| byte != 0) {
             return Err(Error::UnsupportedFirmware);

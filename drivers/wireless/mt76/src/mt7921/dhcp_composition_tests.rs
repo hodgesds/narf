@@ -334,6 +334,9 @@ fn composition(wpa2: bool, aggregate_rx: bool, wmm: bool) -> TestResult {
     composition_ht20(wpa2, aggregate_rx, wmm, false)
 }
 fn composition_ht20(wpa2: bool, aggregate_rx: bool, wmm: bool, ht20: bool) -> TestResult {
+    composition_ht(wpa2, aggregate_rx, wmm, ht20, false)
+}
+fn composition_ht(wpa2: bool, aggregate_rx: bool, wmm: bool, ht20: bool, ht40: bool) -> TestResult {
     let mut model = Model::new();
     if wmm {
         model.wmm_reply = Some(super::wmm_tests::PARAMETERS.to_vec());
@@ -379,7 +382,7 @@ fn composition_ht20(wpa2: bool, aggregate_rx: bool, wmm: bool, ht20: bool) -> Te
         received: Vec::new(),
     });
 
-    let result = composition_body(&name, wpa2, aggregate_rx, wmm, ht20);
+    let result = composition_body(&name, wpa2, aggregate_rx, wmm, ht20, ht40);
 
     // Teardown in reverse order: session first (no drain/send can
     // fire against a half-removed interface), then carrier, then
@@ -406,6 +409,7 @@ fn composition_body(
     aggregate_rx: bool,
     wmm: bool,
     ht20: bool,
+    ht40: bool,
 ) -> TestResult {
     // ── Before association: no carrier, and the controlled port
     // keeps DHCP off the air entirely (audit §4.3.1 S1: "no DHCP
@@ -442,7 +446,12 @@ fn composition_body(
             } else {
                 crate::mt7921::association::Security::Open
             };
-            run(session.associate_station(&bss, SSID, security, test_permission_for(CHANNEL), &[]))
+            let permission = if ht40 {
+                super::ht40_tests::permission40(CHANNEL, CHANNEL + 4)
+            } else {
+                test_permission_for(CHANNEL)
+            };
+            run(session.associate_station(&bss, SSID, security, permission, &[]))
                 .ok()
                 .map(|aid| (bss, aid))
         });
@@ -455,6 +464,15 @@ fn composition_body(
         || session.backend.access_point.as_ref().map(FakeAp::phase) != Some(ApPhase::Authorized)
         || session.wmm.is_some() != wmm
         || session.ht20_profile.is_some() != ht20
+        || session
+            .ht20_profile
+            .and_then(|profile| profile.negotiated_secondary())
+            .is_some()
+            != ht40
+        || ht20
+            && session
+                .ht20_profile
+                .is_none_or(|profile| !profile.short_gi())
     {
         put_session(session);
         return TestResult::Fail("associated state/aid mismatch");
@@ -637,6 +655,21 @@ fn mt76_wpa2_negotiated_ht20_amsdu_dhcp_and_ip() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/ht20",
     mt76_wpa2_negotiated_ht20_amsdu_dhcp_and_ip
+);
+
+fn mt76_open_ht40_sgi_amsdu_dhcp_and_ip() -> TestResult {
+    composition_ht(false, true, true, true, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/ht40",
+    mt76_open_ht40_sgi_amsdu_dhcp_and_ip
+);
+fn mt76_wpa2_ht40_sgi_amsdu_dhcp_and_ip() -> TestResult {
+    composition_ht(true, true, true, true, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/ht40",
+    mt76_wpa2_ht40_sgi_amsdu_dhcp_and_ip
 );
 kernel_test_in!(
     "drivers/wireless/mt7921/wmm",

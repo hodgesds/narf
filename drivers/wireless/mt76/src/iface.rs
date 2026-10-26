@@ -339,7 +339,11 @@ impl WirelessNetIface for Mt76Iface {
         };
         (self.radio.capabilities.phy.ht && self.radio.capabilities.phy.bands & band != 0).then_some(
             narf_wireless::iface::PhyCapabilities {
-                ht: crate::mt7921::ht20::capability(),
+                ht: if (1..=3).contains(&self.radio.capabilities.phy.max_bandwidth) {
+                    crate::mt7921::ht20::capability40()
+                } else {
+                    crate::mt7921::ht20::capability()
+                },
                 vht: None,
             },
         )
@@ -964,7 +968,7 @@ mod tests {
             || !info.hw_caps.ht_supported
             || iface
                 .phy_capabilities(2400)
-                .is_none_or(|caps| caps.ht[..4] != [0, 0, 28, 255] || caps.vht.is_some())
+                .is_none_or(|caps| caps.ht[..4] != [98, 0, 28, 255] || caps.vht.is_some())
             || iface.phy_capabilities(6000).is_some()
             || info.hw_caps.vht_supported
             || info.hw_caps.he_supported

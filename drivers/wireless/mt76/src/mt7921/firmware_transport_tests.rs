@@ -17,6 +17,8 @@ mod amsdu_rx_tests;
 
 #[path = "ht20_tests.rs"]
 mod ht20_tests;
+#[path = "ht40_tests.rs"]
+mod ht40_tests;
 #[path = "wmm_tests.rs"]
 mod wmm_tests;
 

@@ -137,9 +137,14 @@ impl JoinPlan {
         &mut self,
         info: super::firmware_transport::RadioInfo,
         bss: &ScanBss,
+        permission: TxPermission,
     ) -> Result<(), super::firmware_transport::Error> {
         if self.wmm.is_none() || !info.capabilities.phy.ht {
-            return Ok(());
+            return if permission.secondary_channel().is_some() {
+                Err(super::firmware_transport::Error::UnsupportedFirmware)
+            } else {
+                Ok(())
+            };
         }
         let mut ies = bss.information_elements.as_slice();
         let mut offered = false;
@@ -149,7 +154,18 @@ impl JoinPlan {
             ies = &ies[end..];
         }
         if offered {
-            self.ht20 = Some(super::ht20::Profile::prepare(info, bss)?);
+            if permission.secondary_channel().is_some()
+                && !(super::cmd::CH_BW_40..=super::cmd::CH_BW_160)
+                    .contains(&info.capabilities.phy.max_bandwidth)
+            {
+                return Err(super::firmware_transport::Error::UnsupportedFirmware);
+            }
+            self.ht20 = Some(
+                super::ht20::Profile::prepare(info, bss)?
+                    .with_secondary(permission.secondary_channel())?,
+            );
+        } else if permission.secondary_channel().is_some() {
+            return Err(super::firmware_transport::Error::UnsupportedFirmware);
         }
         Ok(())
     }
@@ -168,9 +184,9 @@ impl JoinPlan {
         }
         self.wmm_association.clear();
         self.wmm_association.extend_from_slice(request);
-        if self.ht20.is_some() {
+        if let Some(profile) = self.ht20 {
             self.wmm_association
-                .extend_from_slice(&super::ht20::Profile::request_ie());
+                .extend_from_slice(&profile.request_ie());
         }
         self.wmm_association.extend_from_slice(&wmm::INFORMATION);
         Ok(Some(&self.wmm_association))
@@ -190,8 +206,10 @@ impl JoinPlan {
                 }
             }
         }
-        if self.ht20.is_some() {
-            match super::ht20::Profile::parse(&bytes[30..], self.channel) {
+        if let Some(offered) = self.ht20 {
+            match super::ht20::Profile::parse(&bytes[30..], self.channel)
+                .and_then(|p| p.with_secondary(offered.negotiated_secondary()))
+            {
                 Ok(profile) => self.ht20 = Some(profile),
                 Err(_) => {
                     self.cancel();
@@ -403,28 +421,81 @@ pub(crate) struct TxPermission {
     pub country: [u8; 2],
     pub power_dbm: i8,
     channel: u8,
+    secondary: Option<u8>,
 }
 
 impl TxPermission {
     pub fn from_domain(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> Option<Self> {
+        Self::occupied(domain, channel, None)
+    }
+    pub(crate) fn from_domain40(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        channel: u8,
+        secondary: u8,
+    ) -> Option<Self> {
+        let band = super::channel::band(channel)?;
+        if super::channel::band(secondary)? != band || channel.abs_diff(secondary) != 4 {
+            return None;
+        }
+        if band == super::channel::Band::Ghz5
+            && !super::channel::CHANNELS_5GHZ
+                .chunks_exact(2)
+                .any(|pair| pair.contains(&channel) && pair.contains(&secondary))
+        {
+            return None;
+        }
+        Self::occupied(domain, channel, Some(secondary))
+    }
+    pub(crate) fn from_ap(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        info: super::firmware_transport::RadioInfo,
+        bss: &ScanBss,
+    ) -> Option<Self> {
+        if (super::cmd::CH_BW_40..=super::cmd::CH_BW_160)
+            .contains(&info.capabilities.phy.max_bandwidth)
+            && matches!(
+                wmm::Parameters::parse(&bss.information_elements),
+                Ok(Some(_))
+            )
+        {
+            if let Some(permission) = super::ht20::Profile::prepare(info, bss)
+                .ok()
+                .and_then(|p| p.secondary(bss.channel))
+                .and_then(|secondary| Self::from_domain40(domain, bss.channel, secondary))
+            {
+                return Some(permission);
+            }
+        }
+        Self::from_domain(domain, bss.channel)
+    }
+    fn occupied(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        channel: u8,
+        secondary: Option<u8>,
+    ) -> Option<Self> {
         use narf_wireless::reg::RegFlags;
         if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return None;
         }
-        let center = super::channel::frequency(channel)?;
+        let primary = super::channel::frequency(channel)?;
+        let center = secondary.map_or(Some(primary), |ch| {
+            Some((primary + super::channel::frequency(ch)?) / 2)
+        })?;
+        let width = if secondary.is_some() { 40 } else { 20 };
+        let half = width / 2;
         let overlaps = |rule: &&narf_wireless::reg::RegRule| {
-            rule.freq_start_mhz < center + 10 && center - 10 < rule.freq_end_mhz
+            rule.freq_start_mhz < center + half && center - half < rule.freq_end_mhz
         };
         // A permissive wide rule cannot erase a restrictive overlapping rule.
         if domain.rules.iter().filter(overlaps).any(|rule| {
-            rule.flags.intersects(RegFlags::DFS | RegFlags::NO_IR) || rule.max_bandwidth_mhz < 20
+            rule.flags.bits() & !RegFlags::NO_P2P.bits() != 0 || rule.max_bandwidth_mhz < width
         }) {
             return None;
         }
         if !domain.rules.iter().any(|rule| {
-            rule.freq_start_mhz <= center - 10
-                && center + 10 <= rule.freq_end_mhz
-                && rule.max_bandwidth_mhz >= 20
+            rule.freq_start_mhz <= center - half
+                && center + half <= rule.freq_end_mhz
+                && rule.max_bandwidth_mhz >= width
         }) {
             return None;
         }
@@ -443,6 +514,7 @@ impl TxPermission {
             country: domain.country_code,
             power_dbm,
             channel,
+            secondary,
         })
     }
 
@@ -451,7 +523,7 @@ impl TxPermission {
     }
 
     pub(crate) fn current(self, domain: &narf_wireless::reg::RegulatoryDomain) -> bool {
-        Self::from_domain(domain, self.channel)
+        Self::occupied(domain, self.channel, self.secondary)
             .is_some_and(|now| now.country == self.country && now.power_dbm >= self.power_dbm)
     }
 
@@ -460,16 +532,42 @@ impl TxPermission {
         // Linux mt76_connac_tx_power_limit_tlv (44 bytes), followed by one
         // channel + 161 signed half-dBm rate limits. Firmware's calibration
         // and CLC limits still constrain this additional host ceiling.
-        let mut bytes = vec![0; 44 + 162];
+        let count = if self.secondary.is_some() { 2 } else { 1 };
+        let mut bytes = vec![0; 44 + 162 * count];
         bytes[4..7].copy_from_slice(&[
-            1,
+            count as u8,
             super::channel::band(channel).map_or(0, |band| band.scan_tag()),
             1,
         ]); // n_chan, band, last_msg
         bytes[8..10].copy_from_slice(&self.country);
         bytes[44] = channel;
         bytes[45..].fill(self.power_dbm.saturating_mul(2) as u8);
+        if let Some(secondary) = self.secondary {
+            bytes[44 + 162] = secondary;
+        }
         bytes
+    }
+    pub(crate) fn secondary_channel(self) -> Option<u8> {
+        self.secondary
+    }
+    pub(crate) fn channels(self) -> Vec<u8> {
+        let mut channels = vec![self.channel];
+        if let Some(secondary) = self.secondary {
+            channels.push(secondary);
+        }
+        channels
+    }
+    pub(crate) fn center_channel(self) -> u8 {
+        self.secondary.map_or(self.channel, |secondary| {
+            ((u16::from(self.channel) + u16::from(secondary)) / 2) as u8
+        })
+    }
+    pub(crate) fn native_width(self) -> u8 {
+        if self.secondary.is_some() {
+            super::cmd::CH_BW_40
+        } else {
+            super::cmd::CH_BW_20
+        }
     }
 }
 

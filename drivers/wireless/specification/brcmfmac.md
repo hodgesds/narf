@@ -272,6 +272,24 @@ Raw CONNECT attributes additionally exercise the real shared parser/execution
 path through shared5/6 native MFP/association verification and port publication;
 missing native MFP capability is rejected without a device command.
 
+### Firmware-qualified HT20/SGI admission
+
+The common Station now uses actual native `nmode`/`rxchain` and the two
+previously pinned/read-back20MHz `bw_cap` values to expose source HT capability
+bodies on the real2.4/5GHz bands. It never guesses a chain or enables a wider
+bandwidth/6GHz/VHT profile from an alias. AP HT/WMM/basic-MCS admission and
+current BSSID/chanspec/actual association request+response IE verification
+precede the port, followed by another real completion-ring idle drain. Firmware
+owns BA/reorder and Ethernet deaggregation. Required PMF composes with the PHY
+verification; cancellation keeps the native control/DMA owner terminal.
+See `cyw43439.md` §3 for the exact shared profile and remaining feature inventory.
+
+Three `drivers/wireless/brcmfmac/ht20` smokes exercise source capability literals,
+both shared5/6 versions, both bands, actual three-chain HT RX masks, and
+Open/WPA2/required-PMF DHCP/exact bidirectional IP. They reject invalid chains,
+wider/current-peer/HT/MCS/WMM receipts and preserve posted DMA through cancelled
+verification. This does not establish physical firmware/PHY interoperability.
+
 The exact BCM43602 `Fullmac::BAND_5GHZ` profile admits firmware-reported valid
 channels from Linux's 2.4/5 GHz tables, intersected with the retained host-policy
 snapshot. It first sets and reads back `bw_cap=20 MHz` on both firmware bands

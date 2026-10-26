@@ -7,15 +7,22 @@ use alloc::{vec, vec::Vec};
 pub(crate) struct Profile {
     capability: [u8; 26],
     operation: [u8; 22],
+    secondary: Option<u8>,
 }
 
-/// One RX/TX stream, HT20, long GI, no LDPC/STBC/greenfield, 3839-byte
+/// One RX/TX stream, HT20 with optional short GI, no LDPC/STBC/greenfield, 3839-byte
 /// A-MSDU. No BA session is offered/created by a capability element.
 pub(crate) fn capability() -> [u8; 26] {
     let mut bytes = [0; 26];
+    bytes[0] = 1 << 5; // IEEE80211_HT_CAP_SGI_20, actual CONNAC2 HT radio.
     bytes[2] = 7 << 2; // Smallest A-MPDU factor; maximum 16-us MPDU density.
     bytes[3] = 0xff; // RX MCS0..7, actual HT-capable CONNAC2 first stream.
     bytes[15] = 1; // TX MCS set defined, equal to RX; one stream.
+    bytes
+}
+pub(crate) fn capability40() -> [u8; 26] {
+    let mut bytes = capability();
+    bytes[0] |= 2 | 64;
     bytes
 }
 
@@ -71,6 +78,7 @@ impl Profile {
         Ok(Self {
             capability,
             operation,
+            secondary: None,
         })
     }
     pub(crate) fn transmit_mcs(self) -> u8 {
@@ -80,16 +88,51 @@ impl Profile {
         self.capability[2] & 31
     }
     pub(crate) fn peer_capability(self) -> u16 {
-        // Only the peer's SMPS constraint survives the local capability
-        // intersection. Unsupported width/GI/LDPC/STBC/TX-AMSDU stay disabled.
-        u16::from_le_bytes(self.capability[..2].try_into().unwrap()) & 12
+        // CONNAC2 consumes SGI20 in STA_REC_HT; the WTBL_RAW short-GI
+        // programming in Linux is explicitly CONNAC1-only. No SGI40 or
+        // wider-width bit survives this local HT20 capability intersection.
+        let cap = u16::from_le_bytes(self.capability[..2].try_into().unwrap());
+        (cap & (12 | 32))
+            | if self.secondary.is_some() {
+                2 | (u16::from(self.short_gi()) << 6)
+            } else {
+                0
+            }
     }
     pub(crate) fn dynamic_smps(self) -> bool {
-        self.peer_capability() >> 2 == 1
+        self.peer_capability() & 12 == 4
     }
-    pub(crate) fn request_ie() -> Vec<u8> {
+    pub(crate) fn short_gi(self) -> bool {
+        self.capability[0] & if self.secondary.is_some() { 64 } else { 32 } != 0
+    }
+    pub(crate) fn secondary(self, channel: u8) -> Option<u8> {
+        if self.capability[0] & 2 == 0 || self.capability[1] & 64 != 0 || self.operation[1] & 4 == 0
+        {
+            return None;
+        }
+        match self.operation[1] & 3 {
+            1 => channel.checked_add(4),
+            3 => channel.checked_sub(4),
+            _ => None,
+        }
+    }
+    pub(crate) fn with_secondary(mut self, secondary: Option<u8>) -> Result<Self, Error> {
+        if secondary.is_some() && self.secondary(self.operation[0]) != secondary {
+            return Err(Error::UnsupportedFirmware);
+        }
+        self.secondary = secondary;
+        Ok(self)
+    }
+    pub(crate) fn negotiated_secondary(self) -> Option<u8> {
+        self.secondary
+    }
+    pub(crate) fn request_ie(self) -> Vec<u8> {
         let mut bytes = vec![45, 26];
-        bytes.extend_from_slice(&capability());
+        bytes.extend_from_slice(&if self.secondary.is_some() {
+            capability40()
+        } else {
+            capability()
+        });
         bytes
     }
     pub(crate) fn received_ies(self) -> Vec<u8> {
@@ -99,7 +142,7 @@ impl Profile {
         bytes.extend_from_slice(&self.operation);
         bytes
     }
-    pub(crate) fn rlm(channel: u8, receive_chains: u8) -> Vec<u8> {
+    pub(crate) fn rlm(self, channel: u8, receive_chains: u8) -> Vec<u8> {
         let mut bytes = vec![0; 20];
         bytes[4..8].copy_from_slice(&[2, 0, 16, 0]); // UNI_BSS_INFO_RLM.
         bytes[8] = channel;
@@ -108,6 +151,12 @@ impl Profile {
         bytes[13] = receive_chains;
         bytes[14] = 1; // Source RLM.short_st, not an HT short-GI capability.
         bytes[17] = u8::from(channel > 14);
+        if let Some(secondary) = self.secondary {
+            bytes[9] = ((u16::from(channel) + u16::from(secondary)) / 2) as u8;
+            bytes[11] = 1; // CMD_CBW_40MHZ.
+            bytes[15] = 4; // Source HT40 allowed.
+            bytes[16] = if secondary > channel { 1 } else { 3 }; // SCA/SCB.
+        }
         bytes
     }
 }

@@ -24,6 +24,8 @@ use narf_wifi_fixtures::{udp_ipv4, DhcpServer, NetworkPlan};
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
 
+#[path = "ht_tests.rs"]
+mod ht_tests;
 #[path = "mfp_tests.rs"]
 mod mfp_tests;
 
@@ -179,9 +181,20 @@ impl Harness {
         database: Option<Arc<narf_wireless::reg::db::Database>>,
         mfp: Option<(bool, bool, u8)>,
     ) -> Result<Self, &'static str> {
+        Self::new_features(secured, database, mfp, None)
+    }
+    fn new_features(
+        secured: bool,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        mfp: Option<(bool, bool, u8)>,
+        phy: Option<(u32, u8)>,
+    ) -> Result<Self, &'static str> {
         let bus = Bus::new(secured);
         if let Some((supported, required, fault)) = mfp {
             bus.firmware.lock().mfp_profile(supported, required, fault);
+        }
+        if let Some((chains, fault)) = phy {
+            bus.firmware.lock().phy_profile(chains, fault);
         }
         let station = if let Some(database) = database {
             ready(Station::initialize_live(
@@ -203,6 +216,7 @@ impl Harness {
         let channels = station.channels.iter().map(|&ch| u32::from(ch)).collect();
         let supplicant = station.supplicant;
         let mfp_supported = station.supports_management_protection();
+        let ht_capabilities = station.ht_capabilities();
         let (rx, rx_consumer) = narf_ipc::channel();
         let (tx_producer, tx) = narf_ipc::channel();
         let name = narf_net::iface::register("wlan%d", OWN, send);
@@ -218,6 +232,7 @@ impl Harness {
             channels,
             supplicant,
             mfp_supported,
+            ht_capabilities,
             up: AtomicBool::new(false),
             power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
@@ -307,7 +322,10 @@ fn composition(secured: bool) -> Result<(), &'static str> {
     composition_mfp(secured, false)
 }
 fn composition_mfp(secured: bool, mfp: bool) -> Result<(), &'static str> {
-    let harness = Harness::new_config(secured, None, mfp.then_some((true, true, 0)))?;
+    composition_phy(secured, mfp, None)
+}
+fn composition_phy(secured: bool, mfp: bool, phy: Option<(u32, u8)>) -> Result<(), &'static str> {
+    let harness = Harness::new_features(secured, None, mfp.then_some((true, true, 0)), phy)?;
     let plan = network_plan();
     let uplink = udp_ipv4(
         AP,
@@ -328,6 +346,17 @@ fn composition_mfp(secured: bool, mfp: bool) -> Result<(), &'static str> {
         return Err("CYW admitted data or carrier before association");
     }
     harness.scan_and_associate(secured)?;
+    if harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .ht_connection()
+        != phy.is_some()
+    {
+        return Err("CYW native PHY verification did not match the completed conversation");
+    }
     if harness
         .device
         .state

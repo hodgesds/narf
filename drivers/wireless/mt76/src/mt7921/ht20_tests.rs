@@ -4,7 +4,7 @@ use crate::mt7921::association::Security;
 
 pub(super) fn elements(channel: u8) -> Vec<u8> {
     let mut ht = [0; 26];
-    ht[0] = 0x77; // AP: LDPC/40/SGI/greenfield and dynamic SMPS, intersected away.
+    ht[0] = 0x77; // AP: SGI20/dynamic SMPS retained; LDPC/40/greenfield intersected away.
     ht[2] = 30; // AP RX factor2/density7, not an active BA agreement.
     ht[3] = 0xff;
     ht[4] = 0xff; // AP has two streams; local retained profile offers one.
@@ -19,7 +19,7 @@ pub(super) fn elements(channel: u8) -> Vec<u8> {
     bytes
 }
 
-fn prepared(channel: u8, secured: bool) -> (Session<Model>, ScanBss) {
+pub(super) fn prepared(channel: u8, secured: bool) -> (Session<Model>, ScanBss) {
     let (mut session, mut bss) = super::wmm_tests::prepared(true, secured);
     session.backend.station_channel = channel;
     session.backend.ht_reply = Some(elements(channel));
@@ -77,6 +77,7 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
                     && frame.get(10..16) == Some(super::amsdu_rx_tests::OWN.as_slice())
             });
             let mut expected = [0; 26];
+            expected[0] = 32;
             expected[2] = 28;
             expected[3] = 255;
             expected[15] = 1;
@@ -86,7 +87,7 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
                     .any(|ie| ie[..2] == [45, 26] && ie[2..] == expected)
             }) {
                 return TestResult::Fail(
-                    "HT20 request advertised width/GI/LDPC/NSS beyond the owner",
+                    "HT20 request advertised unsupported width/LDPC/NSS or lost SGI20",
                 );
             }
             let peer = frames.iter().find(|(_, frame)| {
@@ -105,7 +106,7 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
                 || peer[118..124] != [72, 0, 1, 1, 5, 0]
                 || peer[168..180] != [2, 0, 12, 0, 1, 0, 2, 7, 0, 0, 0, 0]
                 || peer[180..188] != [13, 0, 8, 0, 1, 0, 0, 0]
-                || peer[188..196] != [9, 0, 8, 0, 4, 0, 0, 0]
+                || peer[188..196] != [9, 0, 8, 0, 36, 0, 0, 0]
             {
                 return TestResult::Fail(
                     "HT/PHY/RA/WTBL/SMPS native fields or stream intersection",
@@ -150,6 +151,53 @@ fn mt76_ht20_native_peer_rlm_rates_and_bound_association() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/ht20",
     mt76_ht20_native_peer_rlm_rates_and_bound_association
+);
+
+fn mt76_ht20_sgi_intersects_bound_response_without_changing_width_or_smps() -> TestResult {
+    for channel in [6, 36] {
+        for scan_sgi in [false, true] {
+            for response_sgi in [false, true] {
+                let (mut session, mut bss) = prepared(channel, true);
+                let mut offset = 0;
+                while offset < bss.information_elements.len() {
+                    if bss.information_elements[offset] == 45 {
+                        bss.information_elements[offset + 2] &= !32;
+                        bss.information_elements[offset + 2] |= u8::from(scan_sgi) << 5;
+                    }
+                    offset += 2 + usize::from(bss.information_elements[offset + 1]);
+                }
+                let reply = session.backend.ht_reply.as_mut().unwrap();
+                reply[2] &= !32;
+                reply[2] |= u8::from(response_sgi) << 5;
+                if join(&mut session, &bss, true) != Ok(42)
+                    || session
+                        .ht20_profile
+                        .is_none_or(|p| p.short_gi() != response_sgi)
+                {
+                    return TestResult::Fail(
+                        "SGI20 used a stale scan capability instead of the bound AP response",
+                    );
+                }
+                let peer = session.backend.frames.iter().find(|(_, p)| {
+                    p.len() >= 196 && p[34..36] == [3, 0] && p[43] == 7 && p[65] == 1
+                });
+                if peer.is_none_or(|(_, p)| {
+                    p[188..196] != [9, 0, 8, 0, if response_sgi { 36 } else { 4 }, 0, 0, 0]
+                        || p[180..188] != [13, 0, 8, 0, 1, 0, 0, 0]
+                        || p[122] != 5
+                }) {
+                    return TestResult::Fail(
+                        "SGI20 lost dynamic SMPS or invented CONNAC1 raw WTBL fields",
+                    );
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/ht20",
+    mt76_ht20_sgi_intersects_bound_response_without_changing_width_or_smps
 );
 
 fn mt76_ht20_amsdu_receive_and_unsolicited_ampdu_never_consume_pn() -> TestResult {

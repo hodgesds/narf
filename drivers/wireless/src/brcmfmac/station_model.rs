@@ -50,6 +50,7 @@ pub(super) struct Firmware {
     mfp_mode: u32,
     mfp_fault: u8,
     mfp_missing: bool,
+    phy_profile: Option<(u32, u8)>,
     hold_tx: bool,
     wpa_ie: Option<Vec<u8>>,
     wpa_auth: Option<u32>,
@@ -91,6 +92,7 @@ impl Firmware {
             mfp_mode: 0,
             mfp_fault: 0,
             mfp_missing: false,
+            phy_profile: None,
             hold_tx: false,
             wpa_ie: None,
             wpa_auth: None,
@@ -148,6 +150,28 @@ impl Firmware {
             self.deletes += 1;
         }
     }
+    fn request_ies(&self) -> Vec<u8> {
+        let mut ies = self.wpa_ie.clone().unwrap_or_default();
+        if let Some((chains, fault)) = self.phy_profile {
+            if fault != 3 {
+                ies.extend_from_slice(&crate::cyw43439::phy_fixture::request(chains));
+            }
+            if fault == 8 {
+                let index = ies.len() - 37 + 5;
+                ies[index] ^= 1;
+            }
+        }
+        ies
+    }
+    fn response_ies(&self) -> Vec<u8> {
+        self.phy_profile.map_or(Vec::new(), |(chains, fault)| {
+            if fault == 4 {
+                vec![0, 0]
+            } else {
+                crate::cyw43439::phy_fixture::response(self.channel, chains)
+            }
+        })
+    }
     pub(super) fn command(&mut self, command: u32, input: &[u8], maximum: u16) -> Vec<u8> {
         if self
             .policy_clear
@@ -162,7 +186,7 @@ impl Firmware {
         match command {
             1 => 2u32.to_le_bytes().to_vec(),
             23 => {
-                if self.mfp_fault == 3 {
+                if self.mfp_fault == 3 || self.phy_profile.is_some_and(|p| p.1 == 6) {
                     vec![2, 9, 8, 7, 6, 5]
                 } else {
                     AP.to_vec()
@@ -183,6 +207,19 @@ impl Firmware {
                 let mut out = vec![0; usize::from(maximum)];
                 if input.starts_with(b"cur_etheraddr\0") {
                     out[..6].copy_from_slice(&OWN);
+                } else if input.starts_with(b"nmode\0") {
+                    out[..4].copy_from_slice(&u32::from(self.phy_profile.is_some()).to_le_bytes());
+                } else if input.starts_with(b"rxchain\0") {
+                    out[..4].copy_from_slice(&self.phy_profile.map_or(0, |p| p.0).to_le_bytes());
+                } else if input.starts_with(b"chanspec\0") {
+                    let channel = if self.phy_profile.is_some_and(|p| p.1 == 2) {
+                        0x1808u32
+                    } else if self.channel <= 14 {
+                        0x1000 | u32::from(self.channel)
+                    } else {
+                        0xd000 | u32::from(self.channel)
+                    };
+                    out[..4].copy_from_slice(&channel.to_le_bytes());
                 } else if input.starts_with(b"mfp\0") {
                     let mode = if self.mfp_fault == 1 && self.mfp_mode == 2 {
                         0
@@ -192,17 +229,34 @@ impl Firmware {
                     out[..4].copy_from_slice(&mode.to_le_bytes());
                 } else if input.starts_with(b"assoc_info\0") {
                     out[..4].copy_from_slice(
-                        &(if self.mfp_fault == 4 { 1503 } else { 28u32 }).to_le_bytes(),
+                        &(if self.mfp_fault == 4 {
+                            1503
+                        } else if self.phy_profile.is_some() {
+                            self.request_ies().len() as u32
+                        } else {
+                            28u32
+                        })
+                        .to_le_bytes(),
                     );
+                    out[4..8].copy_from_slice(&(self.response_ies().len() as u32).to_le_bytes());
                 } else if input.starts_with(b"assoc_req_ies\0") {
-                    out[..28].copy_from_slice(&pmf_ie());
+                    let ies = if self.phy_profile.is_some() {
+                        self.request_ies()
+                    } else {
+                        pmf_ie()
+                    };
+                    out[..ies.len()].copy_from_slice(&ies);
                     if self.mfp_fault == 2 {
                         out[20] = 0;
                     }
+                } else if input.starts_with(b"assoc_resp_ies\0") {
+                    let ies = self.response_ies();
+                    out[..ies.len()].copy_from_slice(&ies);
                 } else if input.starts_with(b"bw_cap\0") {
                     let band = u32::from_le_bytes(input[7..11].try_into().unwrap());
                     assert!(matches!(band, 1 | 2));
-                    let cap = if self.bandwidth_stuck {
+                    let cap = if self.bandwidth_stuck || self.phy_profile.is_some_and(|p| p.1 == 1)
+                    {
                         7
                     } else {
                         self.bandwidth[(band - 1) as usize]
@@ -225,7 +279,13 @@ impl Firmware {
                     69,
                     8,
                     0,
-                    &scan_result(id, self.secured, self.channel, self.pmf_required),
+                    &scan_result(
+                        id,
+                        self.secured,
+                        self.channel,
+                        self.pmf_required,
+                        self.phy_profile,
+                    ),
                 );
                 self.event(69, 0, 0, &[]);
                 Vec::new()
@@ -315,7 +375,10 @@ impl Firmware {
         }
     }
     pub(super) fn hold_mfp_reply(&self, command: u32, input: &[u8]) -> bool {
-        self.mfp_fault == 5 && command == 262 && input.starts_with(b"assoc_req_ies\0")
+        command == 262
+            && (self.mfp_fault == 5 && input.starts_with(b"assoc_req_ies\0")
+                || self.phy_profile.is_some_and(|p| p.1 == 5)
+                    && input.starts_with(b"assoc_resp_ies\0"))
     }
     fn event(&mut self, kind: u32, status: u32, flags: u16, data: &[u8]) {
         let mut bytes = vec![0; 72 + data.len()];
@@ -424,7 +487,7 @@ fn pmf_ie() -> Vec<u8> {
         172, 6,
     ]
 }
-fn scan_result(id: u16, secured: bool, channel: u8, mfp: bool) -> Vec<u8> {
+fn scan_result(id: u16, secured: bool, channel: u8, mfp: bool, phy: Option<(u32, u8)>) -> Vec<u8> {
     let mut ies = vec![0, 4, b't', b'e', b's', b't'];
     if secured {
         if mfp {
@@ -434,6 +497,10 @@ fn scan_result(id: u16, secured: bool, channel: u8, mfp: bool) -> Vec<u8> {
                 48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
             ]);
         }
+    }
+    if let Some((chains, fault)) = phy {
+        let extra = crate::cyw43439::phy_fixture::response(channel, chains);
+        ies.extend_from_slice(if fault == 9 { &extra[..52] } else { &extra });
     }
     let mut out = vec![0; 12 + 128 + ies.len()];
     let len = out.len();
@@ -475,6 +542,9 @@ impl Handle {
             f.pmf_required = required;
             f.mfp_fault = fault;
         });
+    }
+    pub(crate) fn phy_profile(&self, chains: u32, fault: u8) {
+        self.change(|f| f.phy_profile = Some((chains, fault)));
     }
     pub(crate) fn channel(&self, channel: u8) {
         self.change(|f| f.channel = channel);

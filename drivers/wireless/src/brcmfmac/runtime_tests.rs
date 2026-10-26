@@ -248,6 +248,7 @@ fn firmware_step(state: &mut State) {
                             bytes
                         }
                         262 if input.starts_with(b"sup_wpa\0") => vec![0; usize::from(output_len)],
+                        262 if input.starts_with(b"nmode\0") => vec![0; usize::from(output_len)],
                         262 if input.starts_with(b"mfp\0") => vec![0; usize::from(output_len)],
                         262 if input.starts_with(b"bw_cap\0") => {
                             let mut bytes = vec![0; usize::from(output_len)];

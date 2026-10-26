@@ -33,6 +33,8 @@ pub(in crate::cyw43439) struct Bus {
     mfp_mode: u32,
     mfp_fault: u8,
     mfp_held: bool,
+    phy_profile: Option<(u32, u8)>,
+    bandwidth: u32,
 }
 impl Bus {
     pub(in crate::cyw43439) fn new() -> Self {
@@ -59,6 +61,8 @@ impl Bus {
             mfp_mode: 0,
             mfp_fault: 0,
             mfp_held: false,
+            phy_profile: None,
+            bandwidth: 1,
         }
     }
     pub(in crate::cyw43439) fn set_secured(&mut self, secured: bool) {
@@ -71,6 +75,32 @@ impl Bus {
         if fault != 5 {
             self.mfp_held = false;
         }
+    }
+    pub(in crate::cyw43439) fn phy_profile(&mut self, chains: u32, fault: u8) {
+        self.phy_profile = Some((chains, fault));
+        self.mfp_held = false;
+    }
+    fn request_ies(&self) -> Vec<u8> {
+        let mut ies = self.wpa_ie.clone().unwrap_or_default();
+        if let Some((chains, fault)) = self.phy_profile {
+            if fault != 3 {
+                ies.extend_from_slice(&super::super::phy_fixture::request(chains));
+            }
+            if fault == 8 {
+                let index = ies.len() - 37 + 5;
+                ies[index] ^= 1;
+            }
+        }
+        ies
+    }
+    fn response_ies(&self) -> Vec<u8> {
+        self.phy_profile.map_or(Vec::new(), |(chains, fault)| {
+            if fault == 4 {
+                vec![0, 0]
+            } else {
+                super::super::phy_fixture::response(6, chains)
+            }
+        })
     }
     pub(in crate::cyw43439) fn mfp_commands(&self) -> Vec<(u32, Vec<u8>)> {
         self.tx
@@ -239,11 +269,13 @@ impl PacketTransport for Bus {
         let mut response = Vec::new();
         match request.cmd {
             1 => response.extend_from_slice(&2u32.to_le_bytes()),
-            23 => response.extend_from_slice(if self.mfp_fault == 3 {
-                &[2, 9, 8, 7, 6, 5]
-            } else {
-                &AP
-            }),
+            23 => response.extend_from_slice(
+                if self.mfp_fault == 3 || self.phy_profile.is_some_and(|p| p.1 == 6) {
+                    &[2, 9, 8, 7, 6, 5]
+                } else {
+                    &AP
+                },
+            ),
             217 => {
                 response.extend_from_slice(&(self.valid_channels.len() as u32).to_le_bytes());
                 for channel in &self.valid_channels {
@@ -253,6 +285,29 @@ impl PacketTransport for Bus {
             262 => {
                 if body.starts_with(b"cur_etheraddr\0") {
                     response.extend_from_slice(&OWN);
+                } else if body.starts_with(b"nmode\0") {
+                    response
+                        .extend_from_slice(&u32::from(self.phy_profile.is_some()).to_le_bytes());
+                } else if body.starts_with(b"rxchain\0") {
+                    response.extend_from_slice(&self.phy_profile.map_or(0, |p| p.0).to_le_bytes());
+                } else if body.starts_with(b"bw_cap\0") {
+                    response.extend_from_slice(
+                        &(if self.phy_profile.is_some_and(|p| p.1 == 1) {
+                            3
+                        } else {
+                            self.bandwidth
+                        })
+                        .to_le_bytes(),
+                    );
+                } else if body.starts_with(b"chanspec\0") {
+                    response.extend_from_slice(
+                        &(if self.phy_profile.is_some_and(|p| p.1 == 2) {
+                            0x1808u32
+                        } else {
+                            0x1006
+                        })
+                        .to_le_bytes(),
+                    );
                 } else if body.starts_with(b"mfp\0") {
                     response.extend_from_slice(
                         &(if self.mfp_fault == 1 && self.mfp_mode == 2 {
@@ -264,15 +319,31 @@ impl PacketTransport for Bus {
                     );
                 } else if body.starts_with(b"assoc_info\0") {
                     response.extend_from_slice(
-                        &(if self.mfp_fault == 4 { 1503 } else { 28u32 }).to_le_bytes(),
+                        &(if self.mfp_fault == 4 {
+                            1503
+                        } else if self.phy_profile.is_some() {
+                            self.request_ies().len() as u32
+                        } else {
+                            28u32
+                        })
+                        .to_le_bytes(),
                     );
-                    response.extend_from_slice(&0u32.to_le_bytes());
+                    response.extend_from_slice(&(self.response_ies().len() as u32).to_le_bytes());
                 } else if body.starts_with(b"assoc_req_ies\0") {
-                    response.extend_from_slice(&pmf_ie());
+                    response.extend_from_slice(&if self.phy_profile.is_some() {
+                        self.request_ies()
+                    } else {
+                        pmf_ie()
+                    });
                     if self.mfp_fault == 2 {
                         response[20] = 0;
                     }
                     if self.mfp_fault == 5 {
+                        self.mfp_held = true;
+                    }
+                } else if body.starts_with(b"assoc_resp_ies\0") {
+                    response.extend_from_slice(&self.response_ies());
+                    if self.phy_profile.is_some_and(|p| p.1 == 5) {
                         self.mfp_held = true;
                     }
                 } else {
@@ -291,12 +362,15 @@ impl PacketTransport for Bus {
                     69,
                     8,
                     0,
-                    &scan_result_profile(id, self.secured, self.pmf_required),
+                    &scan_result_profile(id, self.secured, self.pmf_required, self.phy_profile),
                     maximum,
                 );
                 self.event(69, 0, 0, &[], maximum);
             }
             263 if body.starts_with(b"wpaie\0") => self.wpa_ie = Some(body[6..].to_vec()),
+            263 if body.starts_with(b"bw_cap\0") => {
+                self.bandwidth = u32::from_le_bytes(body[11..15].try_into().unwrap())
+            }
             263 if body.starts_with(b"mfp\0") => {
                 self.mfp_mode = u32::from_le_bytes(body[4..8].try_into().unwrap())
             }
@@ -447,7 +521,7 @@ fn ready<F: Future>(future: F) -> Option<F::Output> {
     }
 }
 fn scan_result(id: u16, secured: bool) -> Vec<u8> {
-    scan_result_profile(id, secured, false)
+    scan_result_profile(id, secured, false, None)
 }
 fn pmf_ie() -> Vec<u8> {
     vec![
@@ -455,7 +529,7 @@ fn pmf_ie() -> Vec<u8> {
         172, 6,
     ]
 }
-fn scan_result_profile(id: u16, secured: bool, mfp: bool) -> Vec<u8> {
+fn scan_result_profile(id: u16, secured: bool, mfp: bool, phy: Option<(u32, u8)>) -> Vec<u8> {
     let mut ies = vec![0, 4, b't', b'e', b's', b't'];
     if secured {
         if mfp {
@@ -465,6 +539,10 @@ fn scan_result_profile(id: u16, secured: bool, mfp: bool) -> Vec<u8> {
             ies.extend_from_slice(&[48, rsn.len() as u8]);
             ies.extend_from_slice(&rsn);
         }
+    }
+    if let Some((chains, fault)) = phy {
+        let extra = super::super::phy_fixture::response(6, chains);
+        ies.extend_from_slice(if fault == 9 { &extra[..52] } else { &extra });
     }
     let mut out = vec![0; 12 + 128 + ies.len()];
     let size = out.len();

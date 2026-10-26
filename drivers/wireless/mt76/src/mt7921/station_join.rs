@@ -485,7 +485,9 @@ impl<B: Backend> Session<B> {
                     && header[16..22] == peer
                     && (header[4..10] == own || header[4..10] == [0xff; 6])
                     && frame.get(36..).is_some_and(|ies| {
-                        crate::mt7921::ht20::Profile::parse(ies, channel) != Ok(profile)
+                        crate::mt7921::ht20::Profile::parse(ies, channel)
+                            .and_then(|p| p.with_secondary(profile.negotiated_secondary()))
+                            != Ok(profile)
                     })
                 {
                     self.peer_lost = true;
@@ -760,7 +762,7 @@ impl<B: Backend> Session<B> {
             _ => Error::Bounds,
         })?;
         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
-        plan.offer_ht20(info, bss)?;
+        plan.offer_ht20(info, bss, permission)?;
         self.backend.check_tx_permission(permission)?;
 
         self.management_rate = plan.management_rate();
@@ -782,12 +784,19 @@ impl<B: Backend> Session<B> {
             self.stage(Stage::ChannelSwitch);
             self.check_station_tx()?;
             // 1. Authorize transmission on the target channel in channel domain (NO_IR = 0):
-            let mut domain = vec![0u8; 12 + 8];
+            let channels = permission.channels();
+            let mut domain = vec![0u8; 12 + 8 * channels.len()];
             domain[..2].copy_from_slice(&permission.country);
             domain[4..7].fill(1); // 20 MHz
-            domain[7 + usize::from(band.scan_tag())] = 1; // n_2ch / n_5ch.
-            domain[12..14].copy_from_slice(&(u16::from(bss.channel)).to_le_bytes());
-            domain[16..20].copy_from_slice(&0u32.to_le_bytes()); // NO_IR=0 (transmission authorized)
+            if permission.secondary_channel().is_some() {
+                domain[3 + usize::from(band.scan_tag())] = 0;
+            } // Native BW20/40 enum.
+            domain[7 + usize::from(band.scan_tag())] = channels.len() as u8;
+            for (index, channel) in channels.into_iter().enumerate() {
+                domain[12 + index * 8..14 + index * 8]
+                    .copy_from_slice(&u16::from(channel).to_le_bytes());
+                // Flags zero only after complete occupied-channel admission.
+            }
             self.notify(
                 Command::Ce {
                     id: 0x0f,
@@ -814,8 +823,8 @@ impl<B: Backend> Session<B> {
             let mut switch = [0u8; cmd::CHANNEL_SWITCH_SIZE];
             cmd::encode_channel_switch(
                 bss.channel,
-                bss.channel,
-                cmd::CH_BW_20,
+                permission.center_channel(),
+                permission.native_width(),
                 1, // The retained legacy profile transmits on one chain.
                 (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
                 band.switch_tag(),
@@ -920,10 +929,10 @@ impl<B: Backend> Session<B> {
             .map_err(|_| Error::Bounds)?;
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
-            if plan.ht20().is_some() {
+            if let Some(profile) = plan.ht20() {
                 self.exchange_station(
                     Command::Unified { id: 2 },
-                    &crate::mt7921::ht20::Profile::rlm(
+                    &profile.rlm(
                         bss.channel,
                         (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
                     ),

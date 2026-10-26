@@ -849,9 +849,12 @@ impl Transport {
         extra_ies: &[u8],
     ) -> Result<u16, Error> {
         let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
-        let permission =
-            crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
-                .ok_or(Error::Authority)?;
+        let info = match self.session.state {
+            State::RadioReady(info) | State::ScanReady(info) => info,
+            _ => return Err(Error::Busy),
+        };
+        let permission = crate::mt7921::association::TxPermission::from_ap(&domain, info, bss)
+            .ok_or(Error::Authority)?;
         self.session
             .associate_station(bss, ssid, security, permission, extra_ies)
             .await
