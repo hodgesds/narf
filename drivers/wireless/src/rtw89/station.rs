@@ -26,6 +26,17 @@ use zeroize::Zeroizing;
 pub(super) unsafe trait Io: Send {
     fn station_allowed(&mut self) -> Result<(), power::Error>;
     fn station_own(&mut self) -> Result<[u8; 6], power::Error>;
+    fn station_wmm_allowed(&mut self) -> Result<bool, power::Error> {
+        Ok(false)
+    }
+    async fn station_configure_wmm(
+        &mut self,
+        _: narf_wireless::wmm::Parameters,
+        _: bool,
+        _: &Admission,
+    ) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
     async fn station_prepare_initial(
         &mut self,
         own: [u8; 6],
@@ -166,6 +177,7 @@ pub(super) struct State {
     initial_nonce: Option<[u8; 32]>,
     sequence: u16,
     established: bool,
+    wmm: Option<narf_wireless::wmm::Parameters>,
     deadline: u64,
     last_peer: u64,
     last_now: u64,
@@ -202,6 +214,7 @@ impl State {
             initial_nonce: None,
             sequence: 1,
             established: false,
+            wmm: None,
             deadline: 0,
             last_peer: 0,
             last_now: 0,
@@ -262,6 +275,7 @@ impl State {
         Ok(())
     }
     pub(super) fn stop(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        self.wmm = None;
         self.admission.close();
         self.established = false;
         self.phase = Phase::Stopped;
@@ -291,6 +305,7 @@ impl State {
         };
         self.admission.close();
         self.established = false;
+        self.wmm = None;
         if let Some(security) = &mut self.security {
             security.fail();
         }
@@ -394,6 +409,22 @@ impl State {
             return false;
         };
         let bytes = frame.bytes();
+        if let Some(p) = self.wmm {
+            if association::observe(frame, 1, self.own, None)
+                .ok()
+                .is_some_and(|candidate| {
+                    candidate.bss.bssid == peer.bss.bssid
+                        && narf_wireless::wmm::Parameters::parse(
+                            &candidate.bss.information_elements,
+                        )
+                        .ok()
+                        .flatten()
+                            != Some(p)
+                })
+            {
+                return true;
+            }
+        }
         bytes.len() >= 26
             && matches!(bytes[0], 0xa0 | 0xc0)
             && bytes[1] & 0xc7 == 0
@@ -484,13 +515,16 @@ impl State {
             };
             match self.phase {
                 Phase::Authentication => {
-                    if let Some(association) = self
+                    if let Some(mut association) = self
                         .plan
                         .as_mut()
                         .ok_or(Error::State)?
                         .authentication_response(frame.bytes())?
                         .map(|bytes| bytes.to_vec())
                     {
+                        if self.wmm.is_some() {
+                            association.extend_from_slice(&narf_wireless::wmm::INFORMATION);
+                        }
                         self.phase = Phase::Association;
                         self.transmit(io, association, Kind::Association)?;
                     }
@@ -506,6 +540,15 @@ impl State {
                         let response_cap =
                             u16::from_le_bytes([frame.bytes()[24], frame.bytes()[25]]);
                         let short = peer.bss.capability & response_cap & 0x400 != 0;
+                        if self.wmm.is_some() {
+                            let p = narf_wireless::wmm::Parameters::parse(
+                                frame.bytes().get(30..).ok_or(Error::Profile)?,
+                            )
+                            .map_err(|_| Error::Profile)?
+                            .ok_or(Error::Profile)?;
+                            super::station_control::wmm_admit(p, short)?;
+                            self.wmm = Some(p);
+                        }
                         self.peer_commit = Some((aid, short));
                         self.last_peer = now;
                         // Firmware peer commit is an awaited continuation in associate().
@@ -660,6 +703,16 @@ impl State {
             admission: self.admission.clone(),
             armed: true,
         };
+        let offered = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
+            .map_err(|_| Error::Profile)?;
+        self.wmm = if io.station_wmm_allowed()? {
+            offered
+        } else {
+            None
+        };
+        if let Some(p) = self.wmm {
+            super::station_control::wmm_admit(p, candidate.bss.capability & 0x400 != 0)?;
+        }
         io.station_prepare_peer(bssid, &self.admission).await?;
         self.peer = Some(candidate);
         self.deadline = self.now()?.saturating_add(5000);
@@ -674,6 +727,9 @@ impl State {
             if let Some((aid, short)) = self.peer_commit {
                 io.station_commit_peer(bssid, aid, short, &self.admission)
                     .await?;
+                if let Some(p) = self.wmm {
+                    io.station_configure_wmm(p, short, &self.admission).await?;
+                }
                 self.admission.run(|| {
                     self.peer_commit = None;
                     self.phase = Phase::FourWay;
@@ -717,17 +773,24 @@ impl State {
         }
         let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
         let native = if let Some(security) = &mut self.security {
-            security.transmit_ethernet(frame)?
+            if self.wmm.is_some() {
+                security.transmit_ethernet_qos(frame, 0)?
+            } else {
+                security.transmit_ethernet(frame)?
+            }
         } else {
             if !admitted(frame, self.own) {
                 return Err(Error::Profile);
             }
-            let mut bytes = vec![8, 1, 0, 0];
+            let mut bytes = vec![if self.wmm.is_some() { 0x88 } else { 8 }, 1, 0, 0];
             bytes.extend_from_slice(&peer);
             bytes.extend_from_slice(&self.own);
             bytes.extend_from_slice(&frame[..6]);
             bytes.extend_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
+            if self.wmm.is_some() {
+                bytes.extend_from_slice(&[0, 0]);
+            }
             bytes.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             bytes.extend_from_slice(&frame[12..]);
             bytes
@@ -746,25 +809,37 @@ pub(super) fn admitted(frame: &[u8], own: [u8; 6]) -> bool {
         )
 }
 fn ethernet(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
-    if !(32..=1532).contains(&frame.len())
-        || frame[0] != 8
+    if !(32..=1534).contains(&frame.len())
+        || !matches!(frame[0], 8 | 0x88)
         || frame[1] & 0xc7 != 2
         || frame[22] & 15 != 0
         || frame[10..16] != peer
         || (frame[4..10] != own && frame[4] & 1 == 0)
         || frame[16] & 1 != 0
         || frame[16..22] == [0; 6]
-        || frame[24..30] != [0xaa, 0xaa, 3, 0, 0, 0]
     {
         return None;
     }
-    let proto = u16::from_be_bytes([frame[30], frame[31]]);
+    let offset = if frame[0] == 0x88 {
+        let qos = frame.get(24..26)?;
+        if qos[0] & 0xf0 != 0 || qos[1] != 0 {
+            return None;
+        }
+        26
+    } else {
+        24
+    };
+    let snap = frame.get(offset..offset + 8)?;
+    if snap[..6] != [0xaa, 0xaa, 3, 0, 0, 0] || frame.len() + 6 - offset > 1514 {
+        return None;
+    }
+    let proto = u16::from_be_bytes([snap[6], snap[7]]);
     if proto < 0x600 || matches!(proto, 0x888e | 0x80f3 | 0x8137) {
         return None;
     }
     let mut bytes = Vec::with_capacity(frame.len() - 18);
     bytes.extend_from_slice(&frame[4..10]);
     bytes.extend_from_slice(&frame[16..22]);
-    bytes.extend_from_slice(&frame[30..]);
+    bytes.extend_from_slice(&frame[offset + 6..]);
     Some(bytes)
 }

@@ -65,6 +65,7 @@ pub mod security_runtime;
 pub mod service_runtime;
 pub mod station_runtime;
 pub mod usb;
+mod wmm_runtime;
 
 pub use regs::{ChipFamily, RTL8XXXU_VENDOR};
 

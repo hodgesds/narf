@@ -375,6 +375,89 @@ impl Interface for Model {
         Ok(())
     }
 }
+fn smoke_rtw8852b_wmm_edca_actual_ack_current_authority_and_cancel_peer_gate() -> TestResult {
+    const WMM: [u8; 26] = [
+        221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x81, 0, 0x62, 0x32, 47, 0, 3, 0xa4, 0, 0, 0x42, 0x43, 94,
+        0, 0x27, 0xa4, 0, 0,
+    ];
+    let parameters = narf_wireless::wmm::Parameters::parse(&WMM)
+        .unwrap()
+        .unwrap();
+    for case in 0..4 {
+        let mut controller = Controller::new(&factory(false)).unwrap();
+        let admission = Admission::new();
+        let mut model = Model::new();
+        narf_scheduler::block_on(controller.initialize(&mut model, &admission)).unwrap();
+        let peer =
+            narf_scheduler::block_on(controller.prepare_peer(&mut model, AP, &admission)).unwrap();
+        narf_scheduler::block_on(controller.commit_peer(&mut model, AP, 42, false, &admission))
+            .unwrap();
+        let mut frame = vec![0; 26];
+        frame[..2].copy_from_slice(&[0x88, 1]);
+        frame[4..10].copy_from_slice(&AP);
+        frame[10..16].copy_from_slice(&OWN);
+        if peer.admits(&frame) {
+            return TestResult::Fail("B peer admitted QoS before all EDCA acknowledgements");
+        }
+        let before = model.packets.len();
+        if case == 1 {
+            model.reply = Reply::Failure;
+        } else if case == 2 {
+            model.qualification.revoke();
+        } else if case == 3 {
+            model.wait = true;
+        }
+        if case == 3 {
+            let mut operation =
+                Box::pin(controller.configure_wmm(&mut model, parameters, false, &admission));
+            if operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return TestResult::Fail("B WMM command wait did not suspend");
+            }
+            drop(operation);
+        } else {
+            let result = narf_scheduler::block_on(
+                controller.configure_wmm(&mut model, parameters, false, &admission),
+            );
+            if result.is_ok() != (case == 0) {
+                return TestResult::Fail("B WMM ignored firmware ACK or current signed authority");
+            }
+        }
+        if case == 0 {
+            let expected = [0xa546u32, 0xa496, 0x005e4332, 0x002f3232];
+            if model.packets.len() != before + 4 || !peer.admits(&frame) {
+                return TestResult::Fail("B WMM native receipt did not seal QoS peer");
+            }
+            for (i, packet) in model.packets[before..].iter().enumerate() {
+                if packet[8..12] != ((i as u32) << 5).to_le_bytes()
+                    || packet[12..16] != expected[i].to_le_bytes()
+                    || packet[16..20] != [0; 4]
+                {
+                    return TestResult::Fail("B WMM source EDCA H2C literal fields");
+                }
+            }
+            frame[24] = 3;
+            if peer.admits(&frame) {
+                return TestResult::Fail("B WMM peer broadened BE/TID0 authority");
+            }
+        } else if peer.current().is_ok()
+            || !admission.closed()
+            || controller.phase() != Phase::Failed
+            || case >= 2 && model.packets.len() != before
+        {
+            return TestResult::Fail("B partial/cancelled/revoked WMM revived exact peer owner");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/wmm",
+    smoke_rtw8852b_wmm_edca_actual_ack_current_authority_and_cancel_peer_gate
+);
+
 fn smoke_rtw8852b_station_controls_match_linux_and_keep_packet_engines_closed() -> TestResult {
     let factory = factory(false);
     let mut control = Controller::new(&factory).unwrap();

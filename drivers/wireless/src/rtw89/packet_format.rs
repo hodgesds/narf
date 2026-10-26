@@ -61,6 +61,12 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
         // One non-QoS three-address station. Optional modes are not admitted.
         0x00 | 0xb0 | 0xa0 | 0xc0 if frame[1] & (3 | 64) == 0 => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
+        0x88 if frame[1] & 3 == 1
+            && unicast(&frame[4..10])
+            && frame.get(24..26) == Some(&[0, 0]) =>
+        {
+            Ok(Queue::Data)
+        }
         _ => Err(Error::Frame),
     }
 }

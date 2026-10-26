@@ -19,6 +19,7 @@ pub(in crate::rtw89) struct QualificationRequest {
     version: u8,
     mac: [u8; 6],
     digest: [u8; 32],
+    wmm_digest: Option<[u8; 32]>,
 }
 impl QualificationRequest {
     pub(in crate::rtw89) fn version(&self) -> u8 {
@@ -29,6 +30,9 @@ impl QualificationRequest {
     }
     pub(in crate::rtw89) fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+    pub(in crate::rtw89) fn wmm_digest(&self) -> Option<[u8; 32]> {
+        self.wmm_digest
     }
     pub(in crate::rtw89) fn name(&self) -> alloc::string::String {
         let m = self.mac;
@@ -85,9 +89,34 @@ impl Native {
                 version: if full { 2 } else { 1 },
                 mac: identity.mac(),
                 digest,
+                wmm_digest: if full {
+                    let power =
+                        radio_power::Plan::from_assets(assets, identity.calibration().rfe_type)
+                            .map_err(denied)?;
+                    Some(
+                        radio_policy::Board::new(
+                            factory,
+                            self.device.id,
+                            assets,
+                            &power,
+                            self.firmware_phycap().ok_or(power::Error::Unsupported)?,
+                        )
+                        .map_err(denied)?
+                        .wmm()
+                        .identity(),
+                    )
+                } else {
+                    None
+                },
             })
         })
         .map_err(denied)?
+    }
+    pub(in crate::rtw89) fn station_wmm_allowed(&self) -> Result<bool, power::Error> {
+        self.full_radio_scope()
+            .ok_or(power::Error::Unsupported)?
+            .wmm_allowed()
+            .map_err(denied)
     }
     fn operating_current(&self) -> Result<(), power::Error> {
         self.phy_profile_current()?;

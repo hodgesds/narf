@@ -754,7 +754,7 @@ impl<I: Io> Owner<I> {
             policy,
         };
         let result = narf_time::timeout(
-            narf_time::Deadline::after_ms(8000),
+            narf_time::Deadline::after_ms(12000),
             super::radio8821c::prepare(&mut checked, factory, mac, phy, &envelope),
         )
         .await

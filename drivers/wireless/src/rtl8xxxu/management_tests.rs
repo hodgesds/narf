@@ -226,6 +226,38 @@ fn smoke_rtl8188eu_management_rejections_and_original_rsna_binding() -> TestResu
     if p.receive(&mpdu(deauth)) != Err(Error::PeerLeft(3)) || p.phase() != Phase::Failed {
         return TestResult::Fail("AP teardown did not revoke association");
     }
+    // The common response parser accepts the AID first. A subsequent native
+    // WMM rejection must retire that intermediate association for direct
+    // callers too, independently of Station's outer failure guard.
+    const WMM: [u8; 26] = [
+        221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42, 0x43, 94, 0,
+        0x62, 0x32, 47, 0,
+    ];
+    for fault in 0..3 {
+        let mut advertised = beacon(false);
+        advertised.bytes.extend_from_slice(&WMM);
+        let candidate = Candidate::from_receive(&advertised, 1, LOCAL).unwrap();
+        let mut p = Join::prepare(candidate, LOCAL, b"narf", SecurityMode::Open).unwrap();
+        p.begin().unwrap();
+        p.receive(&auth(0)).unwrap();
+        let mut response = assoc(false);
+        if fault != 0 {
+            let mut parameters = WMM;
+            if fault == 1 {
+                parameters[7] = 2; // Unsupported version.
+            } else {
+                parameters[10] |= 16; // BE requires admission control.
+            }
+            response.bytes.extend_from_slice(&parameters);
+        }
+        if p.receive(&response) != Err(Error::Profile)
+            || p.phase() != Phase::Failed
+            || p.wmm().is_some()
+            || p.receive(&assoc(false)) != Ok(None)
+        {
+            return TestResult::Fail("WMM rejection retained an intermediate Join association");
+        }
+    }
     TestResult::Pass
 }
 kernel_test_in!(

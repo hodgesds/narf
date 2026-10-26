@@ -16,6 +16,10 @@ use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIf
 const OWN: [u8; 6] = [2, 4, 6, 8, 10, 12];
 const AP: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const SSID: &[u8] = b"narf-8852b";
+const WMM: [u8; 26] = [
+    221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x81, 0, 0x62, 0x32, 47, 0, 3, 0xa4, 0, 0, 0x42, 0x43, 94, 0,
+    0x27, 0xa4, 0, 0,
+];
 const PMK: [u8; 32] = [0x55; 32];
 const ANONCE: [u8; 32] = [0xaa; 32];
 struct Env {
@@ -79,6 +83,8 @@ pub(super) struct Peer {
     pub(super) uplink: Vec<Vec<u8>>,
     pub(super) hold_m4: bool,
     pub(super) hold_data: bool,
+    wmm: Option<Vec<u8>>,
+    qos: bool,
 }
 impl Peer {
     pub(super) fn new(protected: bool) -> Self {
@@ -108,14 +114,24 @@ impl Peer {
             uplink: Vec::new(),
             hold_m4: false,
             hold_data: false,
+            wmm: None,
+            qos: false,
         }
     }
     pub(super) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
-        let mut frame = vec![8, if self.ap.protected() { 0x42 } else { 2 }, 0, 0];
+        let mut frame = vec![
+            if self.qos { 0x88 } else { 8 },
+            if self.ap.protected() { 0x42 } else { 2 },
+            0,
+            0,
+        ];
         frame.extend_from_slice(&ethernet[..6]);
         frame.extend_from_slice(&AP);
         frame.extend_from_slice(&ethernet[6..12]);
         frame.extend_from_slice(&[0, 0]);
+        if self.qos {
+            frame.extend_from_slice(&[0, 0]);
+        }
         let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0];
         body.extend_from_slice(&ethernet[12..]);
         if self.ap.protected() {
@@ -139,11 +155,21 @@ impl Peer {
             return Err("native AP peer identity");
         }
         if self.ap.phase() != ApPhase::Authorized || matches!(frame[0], 0 | 0xb0) {
+            if frame[0] == 0 {
+                self.qos = self.wmm.is_some() && frame.ends_with(&narf_wireless::wmm::INFORMATION);
+            }
             let before = self.ap.phase();
-            let replies = self
+            let mut replies = self
                 .ap
                 .receive(frame)
                 .map_err(|_| "shared AP rejected real native MLME/EAPOL")?;
+            for reply in &mut replies {
+                if reply.first() == Some(&0x10) {
+                    if let Some(p) = &self.wmm {
+                        reply.extend_from_slice(p);
+                    }
+                }
+            }
             if before == ApPhase::Message2 {
                 let key =
                     KeyFrame::decode(frame.get(36..).ok_or("M2 extent")?, 16).ok_or("M2 key")?;
@@ -159,10 +185,21 @@ impl Peer {
             }
             return Ok((replies, before == ApPhase::Message4 && self.hold_m4));
         }
-        if frame[0] != 8 || frame[1] & 3 != 1 || (frame[1] & 0x40 != 0) != self.ap.protected() {
+        if frame[0] != if self.qos { 0x88 } else { 8 }
+            || frame[1] & 3 != 1
+            || (frame[1] & 0x40 != 0) != self.ap.protected()
+        {
             return Err("native AP data protection/direction");
         }
-        let mut body = frame[24..].to_vec();
+        let header = if self.qos {
+            if frame.get(24..26) != Some(&[0, 0]) {
+                return Err("AP BE/TID0 QoS control");
+            }
+            26
+        } else {
+            24
+        };
+        let mut body = frame[header..].to_vec();
         if self.ap.protected() {
             let key: &[u8; 16] = self
                 .ptk
@@ -174,7 +211,7 @@ impl Peer {
                 .map_err(|_| "AP uplink TK extent")?;
             body = narf_wireless::ccmp::unprotect(
                 &Ccm,
-                &frame[..24],
+                &frame[..header],
                 key,
                 0,
                 false,
@@ -206,6 +243,7 @@ struct DriverModel {
     clock: Arc<AtomicU64>,
     stopped: bool,
     packet_error: Option<crate::rtw89::packet_core::Error>,
+    wmm: bool,
 }
 impl DriverModel {
     fn new() -> Self {
@@ -218,6 +256,7 @@ impl DriverModel {
             clock: Arc::new(AtomicU64::new(0)),
             stopped: false,
             packet_error: None,
+            wmm: false,
         }
     }
     fn packet<T>(
@@ -257,6 +296,24 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     fn station_own(&mut self) -> Result<[u8; 6], crate::rtw89::power::Error> {
         self.station_allowed()?;
         Ok(self.controller.own())
+    }
+    fn station_wmm_allowed(&mut self) -> Result<bool, crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        Ok(self.wmm)
+    }
+    async fn station_configure_wmm(
+        &mut self,
+        p: narf_wireless::wmm::Parameters,
+        short: bool,
+        admission: &crate::rtw89::station_control::Admission,
+    ) -> Result<(), crate::rtw89::power::Error> {
+        self.station_allowed()?;
+        if !self.wmm {
+            return Err(crate::rtw89::power::Error::Unsupported);
+        }
+        self.controller
+            .configure_wmm(&mut self.control, p, short, admission)
+            .await
     }
     async fn station_prepare_initial(
         &mut self,
@@ -376,8 +433,12 @@ struct Harness {
 }
 impl Harness {
     fn new(protected: bool) -> Self {
+        Self::profile(protected, false)
+    }
+    fn profile(protected: bool, wmm: bool) -> Self {
         assert!(ACTIVE_TEST.lock().is_none());
         let mut io = DriverModel::new();
+        io.wmm = wmm;
         // The AP sees current DMA at publication; these independent device
         // actions then advance the real modeled RP and emit parsed RPQ.
         io.packets.consume = true;
@@ -387,6 +448,9 @@ impl Harness {
             entropy: AtomicBool::new(true),
         });
         let peer = Arc::new(IrqSafeSpinLock::new(Peer::new(protected)));
+        if wmm {
+            peer.lock().wmm = Some(WMM.to_vec());
+        }
         let plan = peer.lock().plan;
         let actor = peer.clone();
         io.packets.reaction = Some(Arc::new(move |bytes| {
@@ -407,7 +471,10 @@ impl Harness {
         device.admit_for_test();
         complete(device.activate()).unwrap();
         {
-            let beacon = peer.lock().ap.beacon();
+            let mut beacon = peer.lock().ap.beacon();
+            if wmm {
+                beacon.extend_from_slice(&WMM);
+            }
             let mut retained = lifecycle.retained.try_lock().unwrap();
             retained
                 .as_mut()
@@ -494,6 +561,112 @@ impl Drop for Harness {
         narf_net::iface::unregister(self.device.name());
     }
 }
+fn smoke_rtw8852b_wmm_source_peer_commands_native_qos_ccmp_and_ip() -> TestResult {
+    for protected in [false, true] {
+        let h = Harness::profile(protected, true);
+        if h.join().is_err() {
+            return TestResult::Fail("B WMM actual controller/packet association failed");
+        }
+        let commands = h.model(|io| io.control.packets().to_vec());
+        let tail: Vec<_> = commands
+            .iter()
+            .filter(|p| {
+                p.len() == 20 && p[8..12] == [0, 0, 0, 0] && p[12..16] == [0x46, 0xa5, 0, 0]
+            })
+            .collect();
+        if tail.len() != 1 || !h.peer.lock().qos {
+            return TestResult::Fail("B WMM firmware EDCA literal or bound AP negotiation missing");
+        }
+        let ethernet = udp_ipv4(
+            AP,
+            OWN,
+            h.plan.lease_ip,
+            h.plan.server_ip,
+            45000,
+            45001,
+            b"B WMM exact uplink",
+        );
+        if narf_net::iface::send_on(h.device.name(), &ethernet).is_err() {
+            return TestResult::Fail("B QoS publish refused");
+        }
+        h.pump();
+        if h.peer.lock().uplink.last() != Some(&ethernet) {
+            return TestResult::Fail("B QoS raw26/TID0 TXWD or CCMP failed");
+        }
+        let reply = udp_ipv4(
+            OWN,
+            AP,
+            h.plan.server_ip,
+            h.plan.lease_ip,
+            45001,
+            45000,
+            b"B WMM exact reply",
+        );
+        let frame = match h.peer.lock().downlink(&reply) {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("B WMM AP fixture"),
+        };
+        h.model(|io| io.packets.inject(&frame)).unwrap();
+        h.pump();
+        if h.received() != vec![reply] {
+            return TestResult::Fail("B WMM native RX/per-TID CCMP data changed");
+        }
+        h.model(|io| io.packets.authority.revoke());
+        h.pump();
+        if !h.closed() {
+            return TestResult::Fail("B WMM retained carrier after actual PCI epoch loss");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/wmm",
+    smoke_rtw8852b_wmm_source_peer_commands_native_qos_ccmp_and_ip
+);
+fn smoke_rtw8852b_wmm_response_rejection_and_pending_m4_cancellation_close_owner() -> TestResult {
+    for cancel in [false, true] {
+        let h = Harness::profile(true, true);
+        h.scan();
+        if cancel {
+            h.peer.lock().hold_m4 = true;
+        } else {
+            h.peer.lock().wmm.as_mut().unwrap()[14] |= 16;
+        }
+        let controls = h.model(|io| io.packets.controls.clone());
+        let mut operation = Box::pin(h.device.associate(h.request()));
+        let mut cx = Context::from_waker(Waker::noop());
+        if cancel {
+            let mut held = false;
+            for _ in 0..10000 {
+                if operation.as_mut().poll(&mut cx).is_ready() {
+                    return TestResult::Fail("B WMM held M4 completed");
+                }
+                if controls.held.load(Ordering::Acquire) {
+                    held = true;
+                    break;
+                }
+            }
+            if !held {
+                return TestResult::Fail("B WMM fixture never retained M4 DMA");
+            }
+            drop(operation);
+        } else {
+            let result = complete(operation);
+            if result.is_ok() {
+                return TestResult::Fail("B invalid response BE admission promoted QoS");
+            }
+        }
+        h.pump();
+        if !h.closed() {
+            return TestResult::Fail("B cancelled/invalid WMM retained established metadata");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/wmm",
+    smoke_rtw8852b_wmm_response_rejection_and_pending_m4_cancellation_close_owner
+);
 fn composition(protected: bool) -> TestResult {
     let h = Harness::new(protected);
     if !h.closed() || narf_net::dhcp::acquire(h.device.name(), 100).is_ok() {

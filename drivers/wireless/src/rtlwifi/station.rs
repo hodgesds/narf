@@ -148,6 +148,7 @@ pub(super) struct State {
     last_now: u64,
     last_peer: u64,
     capability: u16,
+    wmm: Option<narf_wireless::wmm::Parameters>,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -171,6 +172,7 @@ impl State {
             last_now: 0,
             last_peer: 0,
             capability: 0,
+            wmm: None,
         }
     }
     fn fail(&mut self) {
@@ -180,6 +182,7 @@ impl State {
         self.incoming.clear();
         self.received.clear();
         self.pmk = None;
+        self.wmm = None;
         if let Some(plan) = &mut self.plan {
             plan.cancel();
         }
@@ -201,7 +204,7 @@ impl Drop for Attempt {
 }
 fn ethernet(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
     if frame.len() < 32
-        || frame[0] != 8
+        || !matches!(frame[0], 8 | 0x88)
         || frame[1] & 0xc7 != 2
         || frame[22] & 15 != 0
         || frame[10..16] != peer
@@ -211,28 +214,49 @@ fn ethernet(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
     {
         return None;
     }
-    let protocol = u16::from_be_bytes([frame[30], frame[31]]);
-    if frame[24..30] != [0xaa, 0xaa, 3, 0, 0, 0]
+    let offset = if frame[0] == 0x88 {
+        let qos = frame.get(24..26)?;
+        if qos[0] & 0xf0 != 0 || qos[1] != 0 {
+            return None;
+        }
+        26
+    } else {
+        24
+    };
+    let snap = frame.get(offset..offset + 8)?;
+    let protocol = u16::from_be_bytes([snap[6], snap[7]]);
+    if snap[..6] != [0xaa, 0xaa, 3, 0, 0, 0]
         || protocol < 0x600
         || matches!(protocol, 0x888e | 0x80f3 | 0x8137)
-        || frame.len() + 6 - 24 > 1514
+        || frame.len() + 6 - offset > 1514
     {
         return None;
     }
     let mut bytes = frame[4..10].to_vec();
     bytes.extend_from_slice(&frame[16..22]);
-    bytes.extend_from_slice(&frame[30..]);
+    bytes.extend_from_slice(&frame[offset + 6..]);
     Some(bytes)
 }
 fn eapol(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> bool {
-    frame.len() >= 32
-        && frame[0] == 8
+    let offset = if frame.first() == Some(&0x88) {
+        if frame
+            .get(24..26)
+            .is_none_or(|q| q[0] & 0xf0 != 0 || q[1] != 0)
+        {
+            return false;
+        }
+        26
+    } else {
+        24
+    };
+    frame.len() >= offset + 8
+        && matches!(frame[0], 8 | 0x88)
         && frame[1] & 0x87 == 2
         && frame[4..10] == own
         && frame[10..16] == peer
         && frame[16..22] == peer
         && frame[22] & 15 == 0
-        && frame[24..32] == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]
+        && frame[offset..offset + 8] == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]
 }
 impl<I: Io, M: Memory> Prepared<I, M> {
     pub(crate) fn station_calibration_present(&self) -> bool {
@@ -441,6 +465,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         plan.append_sme_ies(ies).map_err(Error::Management)?;
         let (rates, basic) = plan.legacy_rates();
         let capability = candidate.bss.capability;
+        let wmm = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
+            .map_err(|_| Error::Profile)?;
+        if let Some(p) = wmm {
+            super::super::wmm::admit(p, capability & 0x400 != 0)?;
+        }
         if rates & 1 == 0 || basic & 1 == 0 || basic & !0x15f != 0 {
             return Err(Error::Profile);
         }
@@ -449,6 +478,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.station.plan = Some(plan);
         self.station.pmk = pmk;
         self.station.capability = capability;
+        self.station.wmm = wmm;
         let mut attempt = Attempt {
             failed: self.station.failed.clone(),
             armed: true,
@@ -484,6 +514,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         basic,
                         self.station.capability,
                     )?;
+                    if let Some(p) = self.station.wmm {
+                        let calibration =
+                            self.station.calibration.as_ref().ok_or(Error::Profile)?;
+                        calibration.with_current(|| {
+                            super::super::wmm::program(
+                                &self.io,
+                                p,
+                                self.station.capability & 0x400 != 0,
+                            )
+                        })?;
+                        self.check_station_policy(environment)?;
+                        self.packet.qos = true;
+                    }
                     self.complete_station_peer_admitted(
                         bssid,
                         self.station.aid.ok_or(Error::State)?,
@@ -656,6 +699,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     if candidate.bss.ssid != old.bss.ssid
                         || candidate.rsne != old.rsne
                         || candidate.rsnxe != old.rsnxe
+                        || self.station.native_associated
+                            && self.station.wmm.is_some()
+                            && narf_wireless::wmm::Parameters::parse(
+                                &candidate.bss.information_elements,
+                            )
+                            .ok()
+                            .flatten()
+                                != self.station.wmm
                     {
                         return Err(Error::Profile);
                     }
@@ -681,7 +732,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 Phase::Authentication | Phase::Association
             ) && matches!(bytes[0], 0xb0 | 0x10);
             let key = eapol(bytes, own, peer.ok_or(Error::State)?);
-            let data = self.station.phase == Phase::Open && bytes[0] == 8;
+            let data = self.station.phase == Phase::Open
+                && (bytes[0] == 8 || self.station.wmm.is_some() && bytes[0] == 0x88);
             if management || key && self.station.phase != Phase::Passive || data {
                 if self.station.incoming.len() == 64 {
                     return Err(Error::Allocation);
@@ -704,7 +756,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         .authentication_response(bytes)
                         .map_err(Error::Management)?
                     {
-                        let assoc = assoc.to_vec();
+                        let mut assoc = assoc.to_vec();
+                        if self.station.wmm.is_some() {
+                            assoc.extend_from_slice(&narf_wireless::wmm::INFORMATION);
+                        }
                         self.queue_station(assoc, Kind::Association, now, true, environment)?;
                         self.station.phase = Phase::Association;
                         self.station.deadline = now.saturating_add(5000);
@@ -720,6 +775,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         .map_err(Error::Management)?
                     {
                         let capability = u16::from_le_bytes([bytes[24], bytes[25]]);
+                        if self.station.wmm.is_some() {
+                            let p = narf_wireless::wmm::Parameters::parse(
+                                bytes.get(30..).ok_or(Error::Profile)?,
+                            )
+                            .map_err(|_| Error::Profile)?
+                            .ok_or(Error::Profile)?;
+                            super::super::wmm::admit(
+                                p,
+                                self.station.capability & capability & 0x400 != 0,
+                            )?;
+                            self.station.wmm = Some(p);
+                        }
                         self.station.capability &= capability;
                         self.station.aid = Some(aid);
                         self.station.phase = Phase::Configuring;
@@ -790,7 +857,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let own = self.local().ok_or(Error::State)?;
             let peer = self.station_peer().ok_or(Error::State)?;
             let frame = if let Some(security) = &mut self.station.security {
-                security.transmit_ethernet(bytes).map_err(Error::Security)?
+                if self.station.wmm.is_some() {
+                    security.transmit_ethernet_qos(bytes, 0)
+                } else {
+                    security.transmit_ethernet(bytes)
+                }
+                .map_err(Error::Security)?
             } else {
                 if !(14..=1514).contains(&bytes.len())
                     || bytes[6..12] != own
@@ -802,12 +874,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 if protocol < 0x600 || matches!(protocol, 0x888e | 0x80f3 | 0x8137) {
                     return Err(Error::Profile);
                 }
-                let mut frame = vec![8, 1, 0, 0];
+                let mut frame = vec![if self.station.wmm.is_some() { 0x88 } else { 8 }, 1, 0, 0];
                 frame.extend_from_slice(&peer);
                 frame.extend_from_slice(&own);
                 frame.extend_from_slice(&bytes[..6]);
                 frame.extend_from_slice(&(self.station.sequence << 4).to_le_bytes());
                 self.station.sequence = (self.station.sequence + 1) & 4095;
+                if self.station.wmm.is_some() {
+                    frame.extend_from_slice(&[0, 0]);
+                }
                 frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
                 frame.extend_from_slice(&bytes[12..]);
                 frame

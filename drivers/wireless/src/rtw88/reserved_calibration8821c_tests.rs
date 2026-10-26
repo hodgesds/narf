@@ -49,6 +49,8 @@ fn fixture(rfe: u8, swing: u8) -> Result<Fixture, &'static str> {
         m.bytes[0x2820..0x2824].fill(0);
         m.bytes[0x1bf0..0x1bf4].fill(0);
         m.rf_written = false;
+        m.thermal_triggered = false;
+        m.thermal_conversions = 0;
     }
     let request = narf_scheduler::block_on(lifecycle.calibration_request8821c(&factory))
         .map_err(|_| "C21 calibration request failed")?;
@@ -490,4 +492,113 @@ fn smoke_rtw8821ce_iqk_pending_revocation_policy_thermal_and_cancel_retain_owner
 kernel_test_in!(
     "drivers/wireless/rtw88/rtl8821c",
     smoke_rtw8821ce_iqk_pending_revocation_policy_thermal_and_cancel_retain_owner
+);
+
+fn smoke_rtw8821ce_fresh_meter_conversions_bound_both_sides_of_actual_iqk() -> TestResult {
+    for samples in [[25, 26], [31, 26], [25, 31]] {
+        let f = match fixture(2, 6) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        {
+            let mut m = f.port.0.lock();
+            // The stale pre-conversion register lies outside the envelope.
+            // Only the independent two-second device conversion changes it.
+            m.bytes[0x2908..0x290c].copy_from_slice(&(5u32 << 10).to_le_bytes());
+            m.thermal_values = Some(samples);
+        }
+        let result = narf_scheduler::block_on(f.lifecycle.prepare_calibration8821c_with(
+            &f.factory,
+            source(envelope(&f.request), Cap::bootstrap()),
+            || Ok(domain()),
+        ));
+        if samples == [25, 26] {
+            if result.is_err()
+                || result
+                    .as_ref()
+                    .is_ok_and(|i| (i.thermal_before, i.thermal_after) != (25, 26))
+                || f.port.0.lock().thermal_conversions != 2
+                || f.lifecycle.status().stage != Stage::Calibration8821cPrepared
+            {
+                return TestResult::Fail(
+                    "fresh C21 conversion did not precede both thermal samples",
+                );
+            }
+        } else if result != Err(Error::Calibration8821c(QualificationError::Thermal))
+            || f.lifecycle.status().stage != Stage::Failed
+            || f.port.0.lock().thermal_conversions != if samples[0] == 31 { 1 } else { 2 }
+            || narf_scheduler::block_on(f.lifecycle.calibration_info8821c()).is_some()
+        {
+            return TestResult::Fail(
+                "C21 fresh out-of-envelope conversion admitted calibration receipt",
+            );
+        }
+        drop(f.lifecycle);
+        if f.drops.load(Ordering::SeqCst) != 0 {
+            return TestResult::Fail("C21 fresh thermal result freed actual published mappings");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_fresh_meter_conversions_bound_both_sides_of_actual_iqk
+);
+
+fn smoke_rtw8821ce_thermal_conversion_pending_cancel_and_authority_loss_are_terminal() -> TestResult
+{
+    for outcome in 0..3 {
+        let f = match fixture(4, 3) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let cap = Cap::<FirmwareBlob, Read>::bootstrap();
+        let policy = Arc::new(IrqSafeSpinLock::new(domain()));
+        f.port.0.lock().hold_delay = Some(2_000_000);
+        let mut operation = Box::pin(f.lifecycle.prepare_calibration8821c_with(
+            &f.factory,
+            source(envelope(&f.request), cap),
+            || Ok(policy.lock().clone()),
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        if operation.as_mut().poll(&mut cx) != Poll::Pending {
+            return TestResult::Fail("C21 conversion did not retain pending real wait");
+        }
+        let before = f.port.0.lock().calls;
+        if outcome == 0 {
+            drop(operation);
+        } else {
+            if outcome == 1 {
+                cap.revoke();
+            } else {
+                policy.lock().rules[0].flags = RegFlags::NO_IR;
+            }
+            f.port.0.lock().hold_delay = None;
+            let expected = Error::Calibration8821c(if outcome == 1 {
+                QualificationError::Authority
+            } else {
+                QualificationError::Policy
+            });
+            if operation.as_mut().poll(&mut cx) != Poll::Ready(Err(expected)) {
+                return TestResult::Fail(
+                    "C21 resumed conversion ignored current signed/regulatory authority",
+                );
+            }
+            drop(operation);
+        }
+        if f.lifecycle.status().stage != Stage::Failed
+            || f.port.0.lock().calls != before
+            || !f.port.0.lock().commands.is_empty()
+            || f.drops.load(Ordering::SeqCst) != 0
+        {
+            return TestResult::Fail(
+                "cancelled/revoked C21 conversion published calibration commands or lost owner",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/rtl8821c",
+    smoke_rtw8821ce_thermal_conversion_pending_cancel_and_authority_loss_are_terminal
 );

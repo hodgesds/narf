@@ -103,6 +103,7 @@ struct LinkState {
     hold_m4: bool,
     quiet: bool,
     ptk: Option<Ptk>,
+    wmm: Option<Vec<u8>>,
 }
 #[derive(Clone)]
 struct Link {
@@ -193,18 +194,29 @@ impl Io for Link {
                     // This AP's beacon offers only basic1Mbps. A response
                     // cannot make unoffered2/5.5/11Mbps mandatory.
                     b.extend_from_slice(&[1, 1, 0x82]);
+                    if let Some(parameters) = &m.wmm {
+                        b.extend_from_slice(parameters);
+                    }
                     m.queue.push_back(b);
                     if self.protected {
                         m.queue.push_back(native(self.own, &ap_key(0x8a, 1, None)));
                     }
                 }
-                8 => {
+                8 | 0x88 => {
+                    let header = if f[0] == 0x88 {
+                        if f.get(24..26) != Some(&[0, 0]) {
+                            return Err(UsbError::Stall);
+                        }
+                        26
+                    } else {
+                        24
+                    };
                     let body = if f[1] & 0x40 != 0 {
                         let mut w = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
-                        let mut b = f[24..].to_vec();
+                        let mut b = f[header..].to_vec();
                         narf_wireless::ccmp::unprotect(
                             &Ccm,
-                            &f[..24],
+                            &f[..header],
                             m.ptk.as_ref().unwrap().tk.as_slice().try_into().unwrap(),
                             0,
                             false,
@@ -213,7 +225,7 @@ impl Io for Link {
                         )
                         .unwrap()
                     } else {
-                        f[24..].to_vec()
+                        f[header..].to_vec()
                     };
                     if body.get(..8) == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]) {
                         let k = KeyFrame::decode(&body[12..], 16).unwrap();
@@ -234,8 +246,11 @@ impl Io for Link {
                             m4 = true;
                         }
                     } else {
-                        let mut reply = mgmt(8, self.own);
+                        let mut reply = mgmt(f[0], self.own);
                         reply[1] = if self.protected { 0x42 } else { 2 };
+                        if f[0] == 0x88 {
+                            reply.extend_from_slice(&[0, 0]);
+                        }
                         if self.protected {
                             let mut plain = body;
                             let wire = narf_wireless::ccmp::protect(
@@ -342,6 +357,177 @@ fn prepared(protected: bool) -> (Fake, Link, Station<Fake, Link>) {
     .unwrap();
     (control, link, station)
 }
+const WMM: [u8; 26] = [
+    221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x81, 0, 0x62, 0x32, 47, 0, 3, 0xa4, 0, 0, 0x42, 0x43, 94, 0,
+    0x27, 0xa4, 0, 0,
+];
+type WmmFixture = (
+    Fake,
+    Link,
+    Station<Fake, Link>,
+    narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    Arc<IrqSafeSpinLock<narf_wireless::reg::RegulatoryDomain>>,
+);
+fn wmm_prepared(protected: bool) -> WmmFixture {
+    let (control, link, mut rx, permission) = raw(protected);
+    let cap = narf_capabilities::Cap::bootstrap();
+    let domain = Arc::new(IrqSafeSpinLock::new(super::domain(17)));
+    rx.install_wmm_model(super::super::super::wmm_runtime::Proof::model(
+        super::native_calibration(permission.factory),
+        permission,
+        cap,
+        domain.clone(),
+    ));
+    link.state.lock().wmm = Some(WMM.to_vec());
+    let mut b = beacon(protected);
+    b.bytes.extend_from_slice(&WMM);
+    let candidate = Candidate::from_receive(&b, 1, link.own).unwrap();
+    let station = Station::new(
+        rx,
+        candidate,
+        b"narf",
+        if protected {
+            SecurityMode::Wpa2Psk
+        } else {
+            SecurityMode::Open
+        },
+        protected.then(|| Zeroizing::new(PMK)),
+        permission,
+    )
+    .unwrap();
+    (control, link, station, cap, domain)
+}
+fn smoke_rtl8188eu_wmm_real_ep0_bulk_edca_qos_and_current_authority() -> TestResult {
+    for protected in [false, true] {
+        let (control, link, mut s, cap, _) = wmm_prepared(protected);
+        if narf_scheduler::block_on(s.begin(0)).is_err() {
+            return TestResult::Fail("EU WMM native begin");
+        }
+        for now in 1..20 {
+            if narf_scheduler::block_on(s.step(now, SN)).is_err() {
+                return TestResult::Fail("EU WMM native association/RSNA");
+            }
+            if s.controlled_port_open() {
+                break;
+            }
+        }
+        let regs = control.0.lock().regs.clone();
+        if !s.controlled_port_open()
+            || [0x508, 0x50c, 0x504, 0x500]
+                .map(|r| u32::from_le_bytes(regs[r..r + 4].try_into().unwrap()))
+                != [0xa546, 0xa496, 0x005e4332, 0x002f3232]
+            || !link
+                .state
+                .lock()
+                .sent
+                .iter()
+                .any(|f| f.get(32) == Some(&0) && f.ends_with(&narf_wireless::wmm::INFORMATION))
+        {
+            return TestResult::Fail("EU WMM literal EDCA or driver-owned association IE");
+        }
+        let mut eth = AP.to_vec();
+        eth.extend_from_slice(&link.own);
+        eth.extend_from_slice(&[8, 0, 0x45, 0, 0, 20]);
+        if s.send_ethernet(&eth, 20).is_err() {
+            return TestResult::Fail("EU QoS/TID0 publication");
+        }
+        for now in 21..25 {
+            if s.poll_network(now, SN).is_err() {
+                return TestResult::Fail("EU QoS native roundtrip");
+            }
+        }
+        let mut expected = link.own.to_vec();
+        expected.extend_from_slice(&AP);
+        expected.extend_from_slice(&eth[12..]);
+        let sent = link.state.lock().sent.last().unwrap().clone();
+        if s.pop_received() != Some(expected)
+            || sent[32] != 0x88
+            || sent[56..58] != [0, 0]
+            || u32::from_le_bytes(sent[16..20].try_into().unwrap()) & 64 == 0
+        {
+            return TestResult::Fail("EU QoS header/TXD/CCMP normalization");
+        }
+        let before = link.state.lock().sent.len();
+        cap.revoke();
+        if s.send_ethernet(&eth, 26).is_ok()
+            || s.controlled_port_open()
+            || link.state.lock().sent.len() != before
+        {
+            return TestResult::Fail("EU WMM reused revoked actual signed qualification");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/wmm",
+    smoke_rtl8188eu_wmm_real_ep0_bulk_edca_qos_and_current_authority
+);
+fn smoke_rtl8188eu_wmm_response_rejection_and_pending_ep0_cancellation_retain_owner() -> TestResult
+{
+    for case in 0..4 {
+        let (control, link, mut s, cap, domain) = wmm_prepared(false);
+        if case == 0 {
+            link.state.lock().wmm = None;
+        } else if case == 1 {
+            link.state.lock().wmm.as_mut().unwrap()[14] |= 16;
+        } else {
+            control.0.lock().pending_write = Some(0x508);
+        }
+        if narf_scheduler::block_on(s.begin(0)).is_err() {
+            return TestResult::Fail("EU WMM failure fixture begin");
+        }
+        let mut failure = false;
+        for now in 1..12 {
+            let mut operation = Box::pin(s.step(now, SN));
+            let mut cx = Context::from_waker(Waker::noop());
+            match operation.as_mut().poll(&mut cx) {
+                Poll::Ready(Err(_)) => {
+                    failure = true;
+                    drop(operation);
+                    break;
+                }
+                Poll::Ready(Ok(())) => {}
+                Poll::Pending => {
+                    if case < 2 {
+                        return TestResult::Fail("EU malformed WMM entered EP0 configuration");
+                    }
+                    let before = control.0.lock().ops.len();
+                    if case == 2 {
+                        drop(operation);
+                    } else {
+                        domain.lock().rules[0].flags = narf_wireless::reg::RegFlags::NO_IR;
+                        cap.revoke();
+                        if operation.as_mut().poll(&mut cx).is_pending() {
+                            return TestResult::Fail("EU pending EP0 ignored revoked source");
+                        }
+                        drop(operation);
+                    }
+                    if control.0.lock().ops.len() != before {
+                        return TestResult::Fail(
+                            "EU revoked/cancelled WMM published further EP0 operations",
+                        );
+                    }
+                    failure = true;
+                    break;
+                }
+            }
+        }
+        if !failure
+            || s.controlled_port_open()
+            || s.phase() != Phase::Failed
+            || link.state.lock().rx.is_none()
+        {
+            return TestResult::Fail(
+                "EU failed/cancelled WMM lost exact posted USB owner or opened port",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/wmm",
+    smoke_rtl8188eu_wmm_response_rejection_and_pending_ep0_cancellation_retain_owner
+);
 fn smoke_rtl8188eu_real_station_auth_assoc_fw_rsna_and_packet_roundtrip() -> TestResult {
     for protected in [false, true] {
         let (control, link, mut s) = prepared(protected);

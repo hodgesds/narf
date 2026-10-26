@@ -78,6 +78,9 @@ struct Model {
     iqk_reads: usize,
     hold_delay: Option<u64>,
     ignore_rf: bool,
+    thermal_values: Option<[u8; 2]>,
+    thermal_conversions: usize,
+    thermal_triggered: bool,
     ring: Arc<IrqSafeSpinLock<BlockState>>,
     frame: Arc<IrqSafeSpinLock<BlockState>>,
 }
@@ -198,6 +201,9 @@ unsafe impl Registers for Port {
                 if address == 8 && value & 0xfffff == 0 {
                     model.iqk_armed = false;
                 }
+                if address == 0x42 && value & 0x30000 == 0x30000 {
+                    model.thermal_triggered = true;
+                }
             }
             if model.revoke_on_rf {
                 model.fail = Some(model.calls);
@@ -216,6 +222,20 @@ unsafe impl Registers for Port {
             }
         })
         .await;
+        if us == 2_000_000 {
+            let mut model = self.0.lock();
+            if model.thermal_triggered {
+                if let Some(samples) = model.thermal_values {
+                    let temperature = samples[model.thermal_conversions.min(1)];
+                    let previous = word(&model.bytes, 0x2908);
+                    model.bytes[0x2908..0x290c].copy_from_slice(
+                        &((previous & !0xfc00) | u32::from(temperature) << 10).to_le_bytes(),
+                    );
+                }
+                model.thermal_conversions += 1;
+                model.thermal_triggered = false;
+            }
+        }
     }
     async fn lte_backup(&mut self) -> Result<u32, Error> {
         self.access()?;
@@ -372,6 +392,9 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         iqk_reads: 0,
         hold_delay: None,
         ignore_rf: false,
+        thermal_values: None,
+        thermal_conversions: 0,
+        thermal_triggered: false,
         ring: ring.clone(),
         frame: frame.clone(),
     })));

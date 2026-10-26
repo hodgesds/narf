@@ -83,6 +83,7 @@ pub struct Owner<I: Io> {
     endpoints: Endpoints,
     channel: u8,
     failed: bool,
+    pub(super) qos: bool,
     receive: Option<I::Receipt>,
     transmit: Option<Transmit<I::Receipt>>,
     scratch: Vec<u8>,
@@ -114,6 +115,7 @@ impl<I: Io> Owner<I> {
             endpoints,
             channel,
             failed: false,
+            qos: false,
             receive: None,
             transmit: None,
             scratch: alloc::vec![0;MAX_TRANSFER],
@@ -189,6 +191,9 @@ impl<I: Io> Owner<I> {
     }
     pub fn submit(&mut self, kind: Kind, frame: &[u8]) -> Result<(), Error> {
         self.check()?;
+        if kind == Kind::Data && frame.first() == Some(&0x88) && !self.qos {
+            return Err(Error::Packet(packet_codec::Error::Header));
+        }
         if self.receive.is_none() {
             return Err(Error::NotStarted);
         }

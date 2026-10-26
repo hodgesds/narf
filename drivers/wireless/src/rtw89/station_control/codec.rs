@@ -134,3 +134,36 @@ pub(super) fn edca(ac: u8, short: bool) -> [u8; 12] {
     );
     bytes
 }
+pub(super) fn wmm_edca(p: narf_wireless::wmm::Parameters, short: bool) -> Option<[[u8; 12]; 4]> {
+    if p.ac[0].admission_control
+        || p.ac.iter().any(|a| {
+            a.ecw_min == 0
+                || a.ecw_min > 15
+                || a.ecw_max > 15
+                || a.ecw_min > a.ecw_max
+                || a.aifsn < 2
+                || a.aifsn > 15
+        })
+    {
+        return None;
+    }
+    let mut commands = [[0; 12]; 4];
+    for (i, a) in p.ac.iter().enumerate() {
+        let aifs = u32::from(if i == 0 { a.aifsn.max(3) } else { a.aifsn })
+            * if short { 9 } else { 20 }
+            + 10;
+        if aifs > 255 {
+            return None;
+        }
+        word(&mut commands[i], 0, (i as u32) << 5);
+        word(
+            &mut commands[i],
+            1,
+            u32::from(if i == 0 { 0 } else { a.txop }) << 16
+                | u32::from(if i == 0 { a.ecw_max.max(10) } else { a.ecw_max }) << 12
+                | u32::from(if i == 0 { a.ecw_min.max(5) } else { a.ecw_min }) << 8
+                | aifs,
+        );
+    }
+    Some(commands)
+}

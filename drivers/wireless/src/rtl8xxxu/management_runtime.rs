@@ -174,6 +174,7 @@ pub struct Join {
     candidate: Candidate,
     local: [u8; 6],
     next_sequence: u16,
+    wmm: Option<narf_wireless::wmm::Parameters>,
 }
 impl Join {
     pub fn prepare(
@@ -184,15 +185,25 @@ impl Join {
     ) -> Result<Self, Error> {
         let plan =
             JoinPlan::prepare(&candidate.bss, local, ssid, security).map_err(Error::Protocol)?;
+        let wmm = narf_wireless::wmm::Parameters::parse(candidate.information_elements())
+            .map_err(|_| Error::Profile)?;
+        if let Some(p) = wmm {
+            super::wmm_runtime::words(p, candidate.capability() & 0x400 != 0)
+                .map_err(|_| Error::Profile)?;
+        }
         Ok(Self {
             plan,
             candidate,
             local,
             next_sequence: 0,
+            wmm,
         })
     }
     pub fn phase(&self) -> Phase {
         self.plan.phase()
+    }
+    pub(super) fn wmm(&self) -> Option<narf_wireless::wmm::Parameters> {
+        self.wmm
     }
     pub fn candidate(&self) -> &Candidate {
         &self.candidate
@@ -217,6 +228,7 @@ impl Join {
         self.plan.append_sme_ies(bytes).map_err(Error::Protocol)
     }
     pub fn cancel(&mut self) {
+        self.wmm = None;
         self.plan.cancel();
     }
     /// Unrelated native traffic is ignored. A malformed matching management
@@ -256,17 +268,46 @@ impl Join {
                     .map_err(Error::Protocol)?
                 {
                     Some(frame) => {
-                        let frame = frame.to_vec();
+                        let mut frame = frame.to_vec();
+                        if self.wmm.is_some() {
+                            frame.extend_from_slice(&narf_wireless::wmm::INFORMATION);
+                        }
                         Ok(Some(Action::Transmit(self.sequence(frame))))
                     }
                     None => Ok(None),
                 }
             }
-            (Phase::AwaitAssociation, 0x10) => self
-                .plan
-                .association_response(bytes)
-                .map(|aid| aid.map(|aid| Action::Associated { aid }))
-                .map_err(Error::Protocol),
+            (Phase::AwaitAssociation, 0x10) => {
+                let aid = self
+                    .plan
+                    .association_response(bytes)
+                    .map_err(Error::Protocol)?;
+                if aid.is_some() && self.wmm.is_some() {
+                    let profile = (|| {
+                        let p = narf_wireless::wmm::Parameters::parse(
+                            bytes.get(30..).ok_or(Error::Frame)?,
+                        )
+                        .map_err(|_| Error::Profile)?
+                        .ok_or(Error::Profile)?;
+                        let capability = u16::from_le_bytes([bytes[24], bytes[25]])
+                            & self.candidate.capability();
+                        super::wmm_runtime::words(p, capability & 0x400 != 0)
+                            .map_err(|_| Error::Profile)?;
+                        Ok(p)
+                    })();
+                    match profile {
+                        Ok(p) => self.wmm = Some(p),
+                        Err(error) => {
+                            // The common response receipt precedes native
+                            // WMM admission. Revoke that intermediate state
+                            // before returning an error to any Join caller.
+                            self.cancel();
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(aid.map(|aid| Action::Associated { aid }))
+            }
             _ => Ok(None),
         }
     }

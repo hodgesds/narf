@@ -785,7 +785,9 @@ BSSID match, MACID/port and checked AID. Every security-entry valid bit remains
 zero. Global TX encryption/hardware decryption and MIC/ICV appending are
 explicitly disabled and read back for original host CCMP MPDUs. The fixed
 legacy profile uses source TX-A CCTL path selection, CCK1/20MHz and disabled
-data/RTS fallback, with no WMM/HT claims. Source EDCA commands use non-QoS
+data/RTS fallback. The original flags3 qualification has no WMM/HT claims;
+the optional separately qualified WMM profile below retains the same PHY.
+Initial source EDCA commands use non-QoS
 TXOP0, CWmin31/CWmax1023 and AIFSN2; actual negotiated long/short slot yields
 50/28us AIFS. `profile_fingerprint()` binds these exact CCTL/EDCA/software-crypto
 choices for the independent ordinary RF/automatic-response grant. CCTL TX-A
@@ -826,8 +828,11 @@ and authority loss before command publication. They supply no physical RF grant.
 AX PCI body/WP/address-info records for an initial non-QoS, three-address native
 profile. Only 8852B additionally admits already encrypted host CCMP To-DS data
 with complete IV/ciphertext/MIC extents, reserved/ExtIV/PN validation and hardware
-encryption/IV insertion disabled. Protected management, QoS, fragmentation and
-optional headers remain rejected. It rejects unsupported BE, wrong QSEL/channel
+encryption/IV insertion disabled. The optional B WMM profile additionally admits
+checked26-byte BE/TID0 QoS headers, with source header length13 halfwords and
+CCMP extents shifted accordingly. Current native peer admission remains mandatory;
+formatting alone grants no RF/QoS authority. Protected management, other TIDs,
+fragmentation and optional headers remain rejected. It rejects unsupported BE, wrong QSEL/channel
 and address extents outside the 36-bit 8852B/8852C device mask or 40-bit other AX
 baseline. Descriptor encoding capacity does not grant DMA address authority.
 Baseline uses a 24-byte body and eight-byte
@@ -896,6 +901,41 @@ cache maintenance and order publication before the doorbell. They have no
 station/firmware producer or RPQ pump caller yet. The registered Ethernet
 `pci::send_frame` rejects before allocation or MMIO until those owners and
 Ethernet-to-native encapsulation exist.
+
+### Separately qualified RTL8852B WMM BE/TID0
+
+N52B v2 profile byte57 may additionally be7 instead of3. Flags3 retains its
+original full-radio digest and legacy station behavior. Flags7 requires a
+distinct derived digest binding that full board/firmware/PHY/power identity and
+the versioned WMM negotiation, source H2C EDCA, conservative BE policy and
+26-byte TID0 TXWD recipe. Merely changing the flag on an old signed record
+fails identity. The retained qualification request logs the alternate WMM
+identity beside the same `radio-v2` asset name; only actual measured signed
+evidence covering this operating program can enable it. Calibration-only or
+legacy qualification cannot authorize QoS.
+
+When both the actual current qualification and scan AP permit WMM, the driver
+adds its own Information IE. The already peer/status/AID/rate-bound response
+must supply valid WMM parameters. Source MAC H2C class9/function15 programs
+four canonical BE/BK/VI/VO EDCA values with actual identity/sequence-matched
+DONE_ACK. All rows are checked before publication, including representable AIFS;
+BE uses AIFSN>=3, ECWmin>=5, ECWmax>=10 and TXOP0. The source10us SIFS and
+negotiated9/20us slot remain exact. Only after all four receipts does the
+retained native peer token admit QoS DATA/TID0 on BE0. That token is invalidated
+before failed/cancelled setup or teardown; an unrelated or late receipt cannot
+promote it. Actual device and signed qualification invocations still enclose
+native commands/descriptors/doorbells. Live flags7 policy checks require the
+installed domain and cannot reload a cleared installation.
+
+Raw26-byte headers precede host CCMP; native TXWD uses13 halfwords and complete
+shifted IV/ciphertext/MIC validation. Open/WPA2 RX retains source channel and
+per-key/TID replay checks. Valid bound AP parameter changes close the station;
+dynamic EDCA, HT/BA, U-APSD, TSPEC, priority scheduling and other TIDs remain
+unsupported. Four native Rust smokes exercise distinct signed recipes/current
+cap revocation, literal source H2C/peer gates, failing/held ACK and cancellation,
+actual native packet owners through Open/WPA2 and exact bidirectional data,
+malformed response and held M4. Real measured flags7 assets and physical WMM/RF
+acceptance remain external gates; broader lifecycle recovery remains open.
 
 ## 4. Invariants
 

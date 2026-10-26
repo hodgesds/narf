@@ -248,9 +248,23 @@ impl Model {
         let body_dma = u64::from(word(60))
             | u64::from((u16::from_le_bytes(header[58..60].try_into().unwrap()) & 0x3fc0) >> 6)
                 << 32;
+        if packet_len < 24 {
+            return Err(Error::Packet);
+        }
+        let body = self.bytes(body_dma, packet_len)?;
+        // Decode independently from the descriptor: the raw QoS data header
+        // contributes its two actual control bytes to ieee80211_hdrlen/2.
+        let header_words = if body[0] & 0xfc == 0x88 {
+            if kind != format::Queue::Data || body.get(24..26) != Some(&[0, 0]) {
+                return Err(Error::Packet);
+            }
+            13
+        } else {
+            12
+        };
         let expected0 = 1 << 22
             | u32::from(kind.channel()) << 16
-            | 12 << 11
+            | header_words << 11
             | 1 << 7
             | if kind == format::Queue::Management {
                 5
@@ -280,7 +294,6 @@ impl Model {
         {
             return Err(Error::Packet);
         }
-        let body = self.bytes(body_dma, packet_len)?;
         let submission = Submission {
             sequence: sequence & 0x7fff,
             channel: kind.channel(),

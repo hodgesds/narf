@@ -50,6 +50,37 @@ fn artifact(factory: &Factory) -> Vec<u8> {
 pub(crate) fn calibration(factory: &Factory) -> Calibration {
     Calibration::from_verified(&artifact(factory), Some([0x44; 32]), factory).unwrap()
 }
+fn smoke_rtl8188ee_retained_signed_calibration_epoch_encloses_native_wmm_operation() -> TestResult {
+    let mut calibration = calibration(&factory());
+    let cap = Cap::<FirmwareBlob, Read>::bootstrap();
+    calibration.authority = Some(cap);
+    let calls = core::cell::Cell::new(0);
+    if calibration.permission(&domain(17), 1).is_err()
+        || calibration.with_current(|| {
+            calls.set(calls.get() + 1);
+            Ok(7)
+        }) != Ok(7)
+    {
+        return TestResult::Fail(
+            "EE exact retained calibration rejected current native publication",
+        );
+    }
+    cap.revoke();
+    if calibration.permission(&domain(17), 1) != Err(Error::Authority)
+        || calibration.with_current(|| {
+            calls.set(calls.get() + 1);
+            Ok(8)
+        }) != Err(super::super::prepare::Error::Power(Error::Authority))
+        || calls.get() != 1
+    {
+        return TestResult::Fail("EE revoked signed record reached actual WMM native operation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/wmm",
+    smoke_rtl8188ee_retained_signed_calibration_epoch_encloses_native_wmm_operation
+);
 pub(crate) fn domain(power: i8) -> narf_wireless::reg::RegulatoryDomain {
     use narf_wireless::reg::*;
     RegulatoryDomain {

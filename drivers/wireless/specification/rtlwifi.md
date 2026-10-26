@@ -239,7 +239,8 @@ the one-shot current-capability BME transition and CR/PCIe DMA opening. Device
 IRQs stay masked. The retained station service below drives this bounded
 polling transport; transport readiness alone leaves carrier down.
 
-Management and non-QoS legacy data use distinct retained rings. Linux queue
+Management and legacy data use distinct retained rings. Negotiated WMM adds
+only BE/TID0 QoS data to the same retained BE ring. Linux queue
 IDs MGNT6/BE1 supply doorbell bits64/2; allocation-vector indices1/4 never
 substitute those IDs. One pending native payload is retained before OWN
 publication, along with its exact queue, slot, serial, length and address.
@@ -301,7 +302,7 @@ shared `station_security::Security`, exact pending TX ID/bytes, monotonic
 deadlines and key history beside the native DMA/mailbox owner. Actual Open
 authentication and association responses must complete MLME; software flags
 never substitute for peer frames. Negotiated rates and peer capabilities set
-real RRSR/INIRTS, preamble, slot/SIFS and non-QoS DCF BE registers. CAM is reset
+real RRSR/INIRTS, preamble, slot/SIFS and initial non-QoS DCF BE registers. CAM is reset
 and software crypto remains selected. Current signed domain/board permission
 and physical radio switch are checked before progress/submission; a changed
 permission is terminal for the already configured channel.
@@ -359,6 +360,43 @@ invokes administrative open/stop hooks while retained driver state is locked.
 Explicit registration, operator up/down and autoconnect remain administrative
 events. Disconnect/failure clears carrier and peer identity while preserving an
 operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
+
+### Negotiated RTL8188EE WMM BE/TID0
+
+The retained EE station automatically offers its own WMM Information IE when
+the scanned AP has one valid shared `narf_wireless::wmm` Parameter element.
+The common management plan must first bind the actual association response;
+that response must then contain valid WMM parameters. Missing, duplicate,
+malformed or BE admission-controlled parameters fail the attempt before QoS
+admission. An AP cannot upgrade a legacy request through an unsolicited IE.
+No HT, BA, U-APSD, TSPEC or priority classification is enabled.
+
+Source `rtl_get_hal_edca_param` programs BE/BK/VI/VO at0x508/50c/504/500 with
+TXOP in32us units, ECW exponents and SIFS10 plus AIFSN times the actual negotiated
+9/20us slot. All rows are checked before writes, including the8-bit AIFS bound;
+every write is read back. BE uses AIFSN>=3, ECWmin>=5, ECWmax>=10 and TXOP0;
+only BE/TID0 can be submitted. Source ACM queue bits are cleared for the
+unselected/admission-free host profile. The signed NEPC gain/response envelope
+still constrains the same1T legacy PHY/rates; WMM changes no gain, channel,
+antenna, response-rate or RF calibration authority. Calibration now retains
+the exact authenticated source cap, rechecks it when deriving permission and
+encloses the actual EDCA operation in that current invocation.
+The native live environment consumes only the currently installed policy;
+signed-policy bootstrap belongs to explicit preparation. Clearing that
+installation closes TX and the station. Explicit reinstall cannot revive
+an attempt that already observed the absence.
+
+Only successful response binding and native EDCA readbacks admit the packet
+owner's QoS bit. TXD4.QOS and a26-byte MPDU header carry TID0 on BE; software
+CCMP authenticates that header before publication. EAPOL keeps its existing
+driver-owned non-QoS TX path; RX admits checked ordinary QoS headers and shared
+per-key/TID replay. Changed bound AP WMM parameters close the station until a
+fresh lifecycle. Four native Rust smokes cover literal EDCA/TXD fields, real
+Open/WPA2 DMA and exact bidirectional data, malformed/downgraded responses,
+ignored register writes, actual signed/device epoch loss, isolated installed-policy
+clear/reinstall, retained mappings and cancelled M4. Physical WMM/RF acceptance
+remains unrecorded; other ACs,
+dynamic EDCA, HT, power management and reset/rejoin remain separate work.
 
 ## 4. Invariants
 

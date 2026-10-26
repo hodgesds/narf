@@ -52,6 +52,42 @@ fn domain() -> narf_wireless::reg::RegulatoryDomain {
         }],
     }
 }
+fn smoke_rtw8852b_wmm_measured_recipe_is_distinct_from_legacy_full_radio() -> TestResult {
+    let base = board();
+    let cap = authority();
+    let legacy = image(base);
+    let mut old = Qualification::from_verified(&legacy, Some([3; 32]), base, cap).unwrap();
+    old.model_domain = Some(domain());
+    if old.wmm_allowed() != Ok(false) {
+        return TestResult::Fail("legacy full-radio qualification silently granted WMM");
+    }
+    let mut bytes = legacy;
+    bytes[57] = 7;
+    if Qualification::from_verified(&bytes, Some([3; 32]), base, cap).is_ok() {
+        return TestResult::Fail("old digest reused by new WMM emission recipe");
+    }
+    bytes[16..48].copy_from_slice(&base.wmm().identity());
+    let mut qualified = match Qualification::from_verified(&bytes, Some([3; 32]), base, cap) {
+        Ok(q) => q,
+        Err(_) => return TestResult::Fail("exact signed WMM recipe rejected"),
+    };
+    qualified.model_domain = Some(domain());
+    if !qualified.matches(base)
+        || qualified.wmm_allowed() != Ok(true)
+        || base.wmm().identity() == base.identity()
+    {
+        return TestResult::Fail("WMM recipe/current measured authority not bound");
+    }
+    cap.revoke();
+    if qualified.wmm_allowed() != Err(Error::Authority) {
+        return TestResult::Fail("WMM accepted revoked actual qualification cap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/wmm",
+    smoke_rtw8852b_wmm_measured_recipe_is_distinct_from_legacy_full_radio
+);
 fn smoke_rtw89_b_full_radio_artifact_cannot_reuse_basic_and_is_revocable() -> TestResult {
     let board = board();
     let bytes = image(board);

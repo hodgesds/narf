@@ -222,20 +222,27 @@ XTAL toggle and RX DFIR operations run through C21 SIPI with bounded async
 delays and stable readbacks. All supported CCK/OFDM/HT1S/VHT1S TXAGC words
 are programmed to minimum coded index0 solely for the calibration setup;
 this is neither a measured power curve nor permission for ordinary packets.
-Actual RF thermal bits are checked before, during and after IQK against the
-signed interval. General H2C boundary48 and PHYDM firmware RF_1T1R=4 with
+Fresh RF thermal conversions now bracket IQK. The source C21 power-tracking
+trigger writes RF42[17:16]=3; the next watchdog pass reads RF42[15:10]. The
+native continuation preserves that two-second conversion interval before both
+initial and final meter reads, without inventing a conversion-done bit or
+substituting the factory thermal byte. During IQK polling the actual meter
+register remains checked against the same signed interval. Recipe revision2
+binds these trigger/wait operations into the N21Q identity; an earlier signed
+identity cannot authorize the changed calibration program. The asset format
+and filename remain v1 because their wire schema is unchanged. General H2C boundary48 and PHYDM firmware RF_1T1R=4 with
 TX-A/RX-A fields precede C21 IQK clear=0/segment=0. Transport retirement alone
 does not complete IQK: a pre-existing RF08=0xabcde is rejected; a fresh actual
 RF08 marker is required within300 polls20ms apart, then cleared and read back.
 IQK fail bits0..7 or reload bit16 at0x1bf0 reject this fresh-result profile.
-The complete attempt has an eight-second outer bound. Published command DMA
+The complete attempt has a twelve-second outer bound. Published command DMA
 stays retained on error/cancellation. Success drains commands, parks BME and
 MAC/ordinary producers/IRQs again and earns only `Calibration8821cPrepared`.
 `rtl8821c_calibration_info()` reports this historical receipt, not continuing
 RF authority. C21's Linux calibration callback is firmware IQK; no C22 DACK,
 protected trim cells or C22 RF access method is substituted.
 
-Four native Rust regressions compose real retained reserved-page firmware DMA,
+Six native Rust regressions compose real retained reserved-page firmware DMA,
 MAC and PHY through this continuation. They check literal command bytes, all
 four supported RFE branches/swing bins, actual modeled RF receipts and failure/
 reload/thermal/transport errors, missing/malformed/unsigned/foreign assets,

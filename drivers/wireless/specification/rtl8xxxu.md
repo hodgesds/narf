@@ -285,6 +285,41 @@ Explicit registration, operator up/down and autoconnect remain administrative
 events. Disconnect/failure clears carrier and peer identity while preserving an
 operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
+### Negotiated RTL8188EU WMM BE/TID0
+
+A valid AP WMM Parameter element selects an optional legacy QoS station.
+The driver appends its own Information IE requesting no U-APSD and requires
+valid parameters in the actual peer-bound association response before native
+EDCA/connected media admission. Missing, duplicate, malformed or BE-ACM
+parameters are terminal; unsolicited response WMM cannot upgrade a legacy
+request. All four rows must have supported ECW/AIFSN geometry and fit the
+hardware8-bit AIFS field before any EDCA write.
+
+Linux `rtl8xxxu_conf_tx` plus `rtl8xxxu_set_aifs` supply BE/BK/VI/VO registers
+0x508/50c/504/500, ECW/TXOP fields and SIFS10 plus AIFSN times9/20us slot.
+Every EP0 write has an exact readback. The only selected queue is conservative
+BE (AIFSN>=3, ECWmin>=5, ECWmax>=10, TXOP0); source ACM queue bits are cleared.
+Only then may the retained bulk owner admit a QoS DATA header with TID0 and
+TXDESC32_QOS. Other priorities, HT/BA, U-APSD, TSPEC and QoS Null stay closed.
+Open frames and host CCMP use the26-byte header; CCMP protection occurs before
+USB staging, and the shared key owner retains per-key/TID replay state.
+
+The same signed N8PC legacy1T gain/response envelope qualifies unchanged PHY
+rates, gain, channel, antenna and autonomous response power. Before a WMM attempt
+the exact signed calibration cap is retained and compared against its existing
+permission under authenticated policy. Each future poll during start, EDCA and
+association invokes that cap and rechecks the current installed country/power
+permission; active work never bootstraps a cleared policy. Packet publication
+and completion also require this retained proof. Missing/changed/revoked proof
+is terminal and cannot publish QoS, reuse pending USB storage or revive carrier.
+Bound AP parameter changes require a fresh lifecycle.
+
+Two native Rust smokes compose actual EP0/bulk owners through Open/WPA2,
+literal EDCA/TXD values, exact QoS/CCMP data, actual cap loss, malformed response,
+held EP0 cancellation and revocation before repoll. Controller-proven reset,
+safe rejoin, additional AC/channel/rate profiles and physical USB/RF acceptance
+remain separate gates.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX

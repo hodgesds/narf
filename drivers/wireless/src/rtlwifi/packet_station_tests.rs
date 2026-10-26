@@ -13,6 +13,7 @@ pub(super) struct Env {
     now: AtomicU64,
     power: AtomicI8,
     entropy: AtomicBool,
+    policy: Option<Arc<narf_wireless::reg::db::Database>>,
 }
 impl Env {
     fn new() -> Self {
@@ -20,6 +21,7 @@ impl Env {
             now: AtomicU64::new(0),
             power: AtomicI8::new(17),
             entropy: AtomicBool::new(true),
+            policy: None,
         }
     }
 }
@@ -31,6 +33,9 @@ impl Environment for Env {
         self.entropy.load(Ordering::Acquire).then_some([0x33; 32])
     }
     fn domain(&self) -> Result<narf_wireless::reg::RegulatoryDomain, StationError> {
+        if let Some(policy) = &self.policy {
+            return super::super::super::super::interface::installed_domain(policy.snapshot());
+        }
         Ok(power::domain(self.power.load(Ordering::Acquire)))
     }
     async fn pause(&self) {
@@ -82,6 +87,7 @@ pub(super) struct Peer {
     uplink: Vec<Vec<u8>>,
     hold_m4: bool,
     hold_data: bool,
+    wmm: Option<Vec<u8>>,
 }
 impl Peer {
     fn new(protected: bool) -> Self {
@@ -111,14 +117,23 @@ impl Peer {
             uplink: Vec::new(),
             hold_m4: false,
             hold_data: false,
+            wmm: None,
         }
     }
     fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
-        let mut frame = vec![8, if self.ap.protected() { 0x42 } else { 2 }, 0, 0];
+        let mut frame = vec![
+            if self.wmm.is_some() { 0x88 } else { 8 },
+            if self.ap.protected() { 0x42 } else { 2 },
+            0,
+            0,
+        ];
         frame.extend_from_slice(&ethernet[..6]);
         frame.extend_from_slice(&PEER);
         frame.extend_from_slice(&ethernet[6..12]);
         frame.extend_from_slice(&[0, 0]);
+        if self.wmm.is_some() {
+            frame.extend_from_slice(&[0, 0]);
+        }
         let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0];
         body.extend_from_slice(&ethernet[12..]);
         if self.ap.protected() {
@@ -143,10 +158,17 @@ impl Peer {
         }
         if self.ap.phase() != ApPhase::Authorized || matches!(frame[0], 0 | 0xb0) {
             let before = self.ap.phase();
-            let replies = self
+            let mut replies = self
                 .ap
                 .receive(frame)
                 .map_err(|_| "shared AP rejected real native MLME/EAPOL")?;
+            for reply in &mut replies {
+                if reply.first() == Some(&0x10) {
+                    if let Some(parameters) = &self.wmm {
+                        reply.extend_from_slice(parameters);
+                    }
+                }
+            }
             if before == ApPhase::Message2 {
                 let key =
                     KeyFrame::decode(frame.get(36..).ok_or("M2 extent")?, 16).ok_or("M2 key")?;
@@ -162,10 +184,21 @@ impl Peer {
             }
             return Ok((replies, before == ApPhase::Message4 && self.hold_m4));
         }
-        if frame[0] != 8 || frame[1] & 3 != 1 || (frame[1] & 0x40 != 0) != self.ap.protected() {
+        if frame[0] != if self.wmm.is_some() { 0x88 } else { 8 }
+            || frame[1] & 3 != 1
+            || (frame[1] & 0x40 != 0) != self.ap.protected()
+        {
             return Err("native AP data protection/direction");
         }
-        let mut body = frame[24..].to_vec();
+        let header = if self.wmm.is_some() {
+            if frame.get(24..26) != Some(&[0, 0]) {
+                return Err("AP BE/TID0 QoS control");
+            }
+            26
+        } else {
+            24
+        };
+        let mut body = frame[header..].to_vec();
         if self.ap.protected() {
             let key: &[u8; 16] = self
                 .ptk
@@ -177,7 +210,7 @@ impl Peer {
                 .map_err(|_| "AP uplink TK extent")?;
             body = narf_wireless::ccmp::unprotect(
                 &Ccm,
-                &frame[..24],
+                &frame[..header],
                 key,
                 0,
                 false,
@@ -218,6 +251,17 @@ fn started(
     Arc<IrqSafeSpinLock<Peer>>,
     Env,
 ) {
+    started_profile(protected, None)
+}
+fn started_profile(
+    protected: bool,
+    parameters: Option<Vec<u8>>,
+) -> (
+    Prepared<PacketPort, Block>,
+    PacketPort,
+    Arc<IrqSafeSpinLock<Peer>>,
+    Env,
+) {
     let (mut owner, port) = control_owner();
     let env = Env::new();
     owner
@@ -225,13 +269,204 @@ fn started(
         .unwrap();
     complete(owner.start_station_service(&env)).unwrap();
     let peer = Arc::new(IrqSafeSpinLock::new(Peer::new(protected)));
+    peer.lock().wmm = parameters.clone();
     port.model.lock().peer = Some(peer.clone());
-    let beacon = { peer.lock().ap.beacon() };
+    let mut beacon = { peer.lock().ap.beacon() };
+    if let Some(parameters) = parameters {
+        beacon.extend_from_slice(&parameters);
+    }
     port.emit(&beacon).unwrap();
     owner.progress_station(&env).unwrap();
     assert_eq!(owner.station_candidates(env.now_ms()).len(), 1);
     (owner, port, peer, env)
 }
+const WMM: [u8; 26] = [
+    221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x81, 0, 0x62, 0x32, 47, 0, 3, 0xa4, 0, 0, 0x42, 0x43, 94, 0,
+    0x27, 0xa4, 0, 0,
+];
+fn smoke_rtl8188ee_wmm_real_dma_edca_and_open_wpa2_qos_data() -> TestResult {
+    for protected in [false, true] {
+        let (mut owner, port, peer, mut env) = started_profile(protected, Some(WMM.to_vec()));
+        let policy = Arc::new(narf_wireless::reg::db::Database::new());
+        policy.install(power::domain(17));
+        env.policy = Some(policy.clone());
+        if complete(owner.connect_station(
+            PEER,
+            SSID,
+            if protected {
+                SecurityMode::Wpa2Psk
+            } else {
+                SecurityMode::Open
+            },
+            protected.then(|| Zeroizing::new(PMK)),
+            &[],
+            &env,
+        ))
+        .is_err()
+        {
+            return TestResult::Fail("EE WMM response/native association failed");
+        }
+        if [0x508, 0x50c, 0x504, 0x500].map(|r| port.radio.word(r))
+            != [0xa546, 0xa496, 0x005e4332, 0x002f3232]
+            || !port
+                .model
+                .lock()
+                .observed
+                .iter()
+                .any(|f| f.first() == Some(&0) && f.ends_with(&narf_wireless::wmm::INFORMATION))
+        {
+            return TestResult::Fail(
+                "EE actual EDCA fields or driver-owned WMM IE differ from literals",
+            );
+        }
+        let plan = peer.lock().plan;
+        let ethernet = udp_ipv4(
+            PEER,
+            plan.station,
+            plan.lease_ip,
+            plan.server_ip,
+            45000,
+            45001,
+            b"EE WMM exact QoS",
+        );
+        // WPA2 M2/M4 also use BE and have already advanced this native ring.
+        // Inspect the slot consumed by the next actual DATA publication.
+        let slot = port.model.lock().slots[4];
+        if owner.send_station_ethernet(&ethernet, &env).is_err() {
+            return TestResult::Fail("EE native QoS publication failed");
+        }
+        if owner.progress_station(&env).is_err() {
+            return TestResult::Fail("EE native QoS DMA receipt failed");
+        }
+        if peer.lock().uplink.last() != Some(&ethernet) {
+            return TestResult::Fail("EE actual QoS/TID0 AP bytes or CCMP data changed");
+        }
+        if u32::from_le_bytes(port.descriptor(4, slot)[16..20].try_into().unwrap()) & 64 == 0 {
+            return TestResult::Fail("EE published DATA descriptor omitted QOS bit");
+        }
+        let reply = udp_ipv4(
+            plan.station,
+            PEER,
+            plan.server_ip,
+            plan.lease_ip,
+            45001,
+            45000,
+            b"EE WMM exact reply",
+        );
+        let frame = match peer.lock().downlink(&reply) {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("EE QoS AP fixture"),
+        };
+        if port.emit(&frame).is_err() || owner.progress_station(&env) != Ok(vec![reply]) {
+            return TestResult::Fail("EE QoS RX/CCMP normalization failed");
+        }
+        // Completed MLME/data payloads have already retired legitimately.
+        // Track the exact remaining ring/RX/reserved mappings across failure.
+        let retained = port.live_regions();
+        if protected {
+            policy.clear();
+        } else {
+            port.model.lock().live = false;
+        }
+        if owner.send_station_ethernet(&ethernet, &env).is_ok() || owner.station_peer().is_some() {
+            return TestResult::Fail("EE QoS survived current policy/PCI authority loss");
+        }
+        policy.install(power::domain(17));
+        if owner.send_station_ethernet(&ethernet, &env).is_ok() || owner.station_peer().is_some() {
+            return TestResult::Fail("EE explicit policy reinstall revived a terminal WMM station");
+        }
+        drop(owner);
+        if retained
+            .iter()
+            .any(|region| !region.live.load(Ordering::Acquire))
+        {
+            return TestResult::Fail("EE WMM authority failure freed published DMA");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/wmm",
+    smoke_rtl8188ee_wmm_real_dma_edca_and_open_wpa2_qos_data
+);
+fn smoke_rtl8188ee_wmm_malformed_response_and_native_readback_are_terminal() -> TestResult {
+    for case in 0..4 {
+        let (mut owner, port, peer, env) = started_profile(false, Some(WMM.to_vec()));
+        let retained = port.live_regions();
+        match case {
+            0 => peer.lock().wmm = None,
+            1 => peer.lock().wmm.as_mut().unwrap()[7] = 2,
+            2 => peer.lock().wmm.as_mut().unwrap()[14] |= 16,
+            _ => port.radio.ignore(0x508),
+        }
+        if complete(owner.connect_station(PEER, SSID, SecurityMode::Open, None, &[], &env)).is_ok()
+            || owner.station_peer().is_some()
+            || owner.station_phase() != Logical::Failed
+            || complete(owner.connect_station(PEER, SSID, SecurityMode::Open, None, &[], &env))
+                .is_ok()
+        {
+            return TestResult::Fail("EE invalid WMM/readback admitted or replayed native station");
+        }
+        drop(owner);
+        if retained
+            .iter()
+            .any(|region| !region.live.load(Ordering::Acquire))
+        {
+            return TestResult::Fail("EE partial WMM released published DMA");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/wmm",
+    smoke_rtl8188ee_wmm_malformed_response_and_native_readback_are_terminal
+);
+fn smoke_rtl8188ee_wmm_m4_cancellation_keeps_port_closed_and_exact_owner() -> TestResult {
+    let (mut owner, port, peer, env) = started_profile(true, Some(WMM.to_vec()));
+    peer.lock().hold_m4 = true;
+    let mut operation = Box::pin(owner.connect_station(
+        PEER,
+        SSID,
+        SecurityMode::Wpa2Psk,
+        Some(Zeroizing::new(PMK)),
+        &[],
+        &env,
+    ));
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut held = false;
+    for _ in 0..1000 {
+        if operation.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("EE WMM M4 did not retain pending delivery");
+        }
+        if port.model.lock().held.is_some() {
+            held = true;
+            break;
+        }
+    }
+    // Include the actual held M4 payload as well as the posted native rings,
+    // RX buffers and reserved beacon, excluding earlier terminal payloads.
+    let retained = port.live_regions();
+    drop(operation);
+    if !held
+        || owner.station_peer().is_some()
+        || owner.station_transmit_ready()
+        || owner.progress_station(&env).is_ok()
+    {
+        return TestResult::Fail("EE cancelled WMM M4 reopened controlled port");
+    }
+    drop(owner);
+    if retained
+        .iter()
+        .any(|region| !region.live.load(Ordering::Acquire))
+    {
+        return TestResult::Fail("EE cancelled WMM discarded real native mappings");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/wmm",
+    smoke_rtl8188ee_wmm_m4_cancellation_keeps_port_closed_and_exact_owner
+);
 fn connected(
     protected: bool,
 ) -> (

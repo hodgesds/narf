@@ -39,7 +39,8 @@ const DFIR: [(u16, u32, u32); 4] = [
     (0x8f0, 1 << 31, 0),
 ];
 pub(super) fn bind_recipe(hash: &mut narf_crypto::sha256::Sha256) {
-    hash.update(b"US non-SRRC; C21 RF-A SIPI c90 direct-read2800; source switch/calibration v1");
+    hash.update(b"US non-SRRC; C21 RF-A SIPI c90 direct-read2800; source switch/calibration v2");
+    hash.update(b"RF42 mask30000 trigger3; 2000000us source watchdog conversion before/after IQK");
     for (reg, mask, value) in BB_2G.into_iter().chain(DFIR) {
         hash.update(&reg.to_le_bytes());
         hash.update(&mask.to_le_bytes());
@@ -103,6 +104,17 @@ fn temperature(io: &mut impl Io, envelope: &Envelope) -> Result<u8, Error> {
         .temperature(value)
         .map_err(Error::Calibration8821c)?;
     Ok(value)
+}
+/// rtw8821c_pwr_track triggers RF42[17:16]=3 on one watchdog pass and
+/// consumes RF42[15:10] on the following pass (main.h:2-second interval).
+/// There is no documented conversion-done bit: preserve that source wait,
+/// then read the actual meter. A cached pre-trigger value is no fresh sample.
+async fn convert_temperature(io: &mut impl Io, envelope: &Envelope) -> Result<u8, Error> {
+    let old = rf_read(io, 0x42)?;
+    io.write32(0xc90, (0x42 << 20) | (old & !0x30000) | 0x30000)?;
+    io.delay_us(13).await;
+    io.delay_us(2_000_000).await;
+    temperature(io, envelope)
 }
 async fn channel(
     io: &mut impl Io,
@@ -183,7 +195,7 @@ pub(super) async fn prepare(
     if cfg & (1 << 27) != 0 || (cfg >> 12) & 15 != u32::from(phy.cut) {
         return Err(Error::Unsupported);
     }
-    let thermal_before = temperature(io, envelope)?;
+    let thermal_before = convert_temperature(io, envelope).await?;
     let swing = channel(io, factory, phy).await?;
     // A stale marker cannot establish this attempt's completion. Source C21
     // clear=0 is retained; do not clear a stale done receipt to make it fresh.
@@ -215,7 +227,7 @@ pub(super) async fn prepare(
     if status & 0x100ff != 0 {
         return Err(Error::Prerequisite);
     }
-    let thermal_after = temperature(io, envelope)?;
+    let thermal_after = convert_temperature(io, envelope).await?;
     verify_channel(io, swing, matches!(phy.rfe, 2 | 4))?;
     io.park_radio()?;
     io.finish_calibration8821c()?;

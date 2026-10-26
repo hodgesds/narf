@@ -83,7 +83,7 @@ impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
 }
 impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     pub fn new(
-        radio: Receiver<C, B>,
+        mut radio: Receiver<C, B>,
         candidate: Candidate,
         ssid: &[u8],
         mode: SecurityMode,
@@ -99,6 +99,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         }
         let own = radio.local().ok_or(Error::State)?;
         let plan = Join::prepare(candidate, own, ssid, mode).map_err(Error::Management)?;
+        if plan.wmm().is_some() {
+            radio.qualify_wmm(permission).map_err(Error::Radio)?;
+        }
         Ok(Self {
             radio,
             plan,
@@ -155,6 +158,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         self.received.clear();
     }
     fn fail(&mut self) {
+        self.plan.cancel();
         self.failed.store(true, Ordering::Release);
         self.phase = Phase::Failed;
         self.radio.fail_terminal();
@@ -168,7 +172,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         }
         self.phase = Phase::Starting;
         let mut attempt = self.attempt();
-        let result = async {
+        let proof = self.radio.wmm_proof();
+        let operation = async {
             match self.radio.phase() {
                 receive_runtime::Phase::Prepared | receive_runtime::Phase::Stopped => {
                     self.radio.start().await.map_err(Error::Radio)?
@@ -200,8 +205,12 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             self.last_now = now_ms;
             self.last_peer = now_ms;
             Ok(())
-        }
-        .await;
+        };
+        let result = if let Some(proof) = proof {
+            proof.fence(operation, Error::Radio).await
+        } else {
+            operation.await
+        };
         attempt.armed = false;
         if result.is_err() {
             self.fail();
@@ -225,7 +234,13 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             return Err(Error::State);
         }
         let mut attempt = self.attempt();
-        let result = self.step_inner(now_ms, &mut fresh_snonce).await;
+        let proof = self.radio.wmm_proof();
+        let operation = self.step_inner(now_ms, &mut fresh_snonce);
+        let result = if let Some(proof) = proof {
+            proof.fence(operation, Error::Radio).await
+        } else {
+            operation.await
+        };
         attempt.armed = false;
         if result.is_err() {
             self.fail();
@@ -255,6 +270,20 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 if beacon.bssid() == self.plan.candidate().bssid()
                     && beacon.ssid() == self.plan.candidate().ssid()
                 {
+                    if matches!(
+                        self.plan.phase(),
+                        management_runtime::Phase::Associated { .. }
+                    ) {
+                        if let Some(p) = self.plan.wmm() {
+                            if narf_wireless::wmm::Parameters::parse(beacon.information_elements())
+                                .ok()
+                                .flatten()
+                                != Some(p)
+                            {
+                                return Err(Error::PeerLost);
+                            }
+                        }
+                    }
                     self.last_peer = now;
                 }
                 continue;
@@ -273,6 +302,12 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                         return Ok(());
                     }
                     Action::Associated { aid } => {
+                        if let Some(p) = self.plan.wmm() {
+                            self.radio
+                                .configure_wmm(p, self.plan.candidate().capability() & 0x400 != 0)
+                                .await
+                                .map_err(Error::Radio)?;
+                        }
                         self.radio
                             .association(aid, true)
                             .await
@@ -313,6 +348,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         Ok(())
     }
     fn progress(&mut self, now: u64) -> Result<bool, Error> {
+        self.radio.current_wmm().map_err(Error::Radio)?;
         if now < self.last_now {
             return Err(Error::State);
         }
@@ -428,6 +464,15 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                 if beacon.bssid() == self.plan.candidate().bssid()
                     && beacon.ssid() == self.plan.candidate().ssid()
                 {
+                    if let Some(p) = self.plan.wmm() {
+                        if narf_wireless::wmm::Parameters::parse(beacon.information_elements())
+                            .ok()
+                            .flatten()
+                            != Some(p)
+                        {
+                            return Err(Error::PeerLost);
+                        }
+                    }
                     self.last_peer = now;
                 }
                 continue;
@@ -520,11 +565,19 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     /// Backpressure precedes encryption/PN consumption. EAPOL is never admitted
     /// from an Ethernet client; only shared-Supplicant replies own that path.
     pub fn send_ethernet(&mut self, frame: &[u8], now: u64) -> Result<(), Error> {
+        if let Err(error) = self.radio.current_wmm() {
+            self.fail();
+            return Err(Error::Radio(error));
+        }
         if !self.controlled_port_open() || self.pending.is_some() {
             return Err(Error::State);
         }
         let native = if let Some(security) = &mut self.security {
-            match security.transmit_ethernet(frame) {
+            match if self.plan.wmm().is_some() {
+                security.transmit_ethernet_qos(frame, 0)
+            } else {
+                security.transmit_ethernet(frame)
+            } {
                 Ok(frame) => frame,
                 Err(error) => {
                     if !security.port_open() {
@@ -542,12 +595,15 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             if proto < 0x600 || matches!(proto, 0x888e | 0x80f3 | 0x8137) {
                 return Err(Error::Profile);
             }
-            let mut h = vec![8, 1, 0, 0];
+            let mut h = vec![if self.plan.wmm().is_some() { 0x88 } else { 8 }, 1, 0, 0];
             h.extend_from_slice(&self.plan.candidate().bssid());
             h.extend_from_slice(&own);
             h.extend_from_slice(&frame[..6]);
             h.extend_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
+            if self.plan.wmm().is_some() {
+                h.extend_from_slice(&[0, 0]);
+            }
             h.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             h.extend_from_slice(&frame[12..]);
             h
@@ -572,7 +628,10 @@ fn ethernet(frame: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let offset = if frame[0] == 0x88 {
-        if frame.get(24)? & 0x80 != 0 {
+        if frame
+            .get(24..26)
+            .is_none_or(|q| q[0] & 0xf0 != 0 || q[1] != 0)
+        {
             return None;
         }
         26

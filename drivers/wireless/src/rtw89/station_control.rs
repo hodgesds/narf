@@ -104,6 +104,7 @@ pub(super) struct Peer {
     peer: [u8; 6],
     valid: Arc<AtomicBool>,
     admission: Admission,
+    qos: Arc<AtomicBool>,
 }
 impl Peer {
     pub(super) fn own(&self) -> [u8; 6] {
@@ -128,8 +129,11 @@ impl Peer {
             && frame.len() >= 24
             && frame[4..10] == self.peer
             && frame[10..16] == self.own
+            && (frame[0] != 0x88
+                || self.qos.load(Ordering::Acquire) && frame.get(24..26) == Some(&[0, 0]))
     }
     fn invalidate(&self) {
+        self.qos.store(false, Ordering::Release);
         self.valid.store(false, Ordering::Release);
     }
 }
@@ -268,6 +272,7 @@ impl Controller {
             peer: bssid,
             valid: Arc::new(AtomicBool::new(false)),
             admission: admission.clone(),
+            qos: Arc::new(AtomicBool::new(false)),
         };
         self.peer = Some(peer.clone());
         let mut attempt = Attempt {
@@ -334,6 +339,42 @@ impl Controller {
             port(io, true)
         })?;
         admission.run(|| {
+            self.phase = Phase::Associated;
+            Ok(())
+        })?;
+        attempt.armed = false;
+        Ok(())
+    }
+    pub(super) async fn configure_wmm(
+        &mut self,
+        io: &mut impl Interface,
+        p: narf_wireless::wmm::Parameters,
+        short: bool,
+        admission: &Admission,
+    ) -> Result<(), Error> {
+        let rows = codec::wmm_edca(p, short).ok_or(Error::Unsupported)?;
+        if self.phase() != Phase::Associated
+            || self.admission.as_ref().is_none_or(|a| !a.same(admission))
+        {
+            return Err(Error::Terminal);
+        }
+        let peer = self.peer.clone().ok_or(Error::Terminal)?;
+        peer.current()?;
+        if peer.qos.load(Ordering::Acquire) {
+            return Err(Error::Unsupported);
+        }
+        self.phase = Phase::Failed;
+        let mut attempt = Attempt {
+            admission: admission.clone(),
+            peer: Some(peer.clone()),
+            armed: true,
+        };
+        for row in rows {
+            command(io, 9, 15, &row, true, Some(admission)).await?;
+        }
+        admission.run(|| {
+            peer.current()?;
+            peer.qos.store(true, Ordering::Release);
             self.phase = Phase::Associated;
             Ok(())
         })?;
@@ -516,6 +557,17 @@ pub(super) fn profile_fingerprint() -> [u8; 32] {
     hash.update(&codec::edca(0, true));
     hash.update(b"SEC_ENG_CTRL[4:0]=0 SEC_MPDU_PROC[1:0]=0 no security CAM keys");
     hash.finalize()
+}
+pub(super) fn wmm_fingerprint() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"B WMM v1 AP response-bound; BE/TID0 CCK1 raw26 halfwords13; noHT/BA/UAPSD/TSPEC; source H2C MAC9 class15 fourAC ACK; BE ECWmin>=5 max>=10 AIFSN>=3 TXOP0 SIFS10 long20/short9; noAP ACM BE; bounded AIFS8bit");
+    hash.update(&narf_wireless::wmm::INFORMATION);
+    hash.finalize()
+}
+pub(super) fn wmm_admit(p: narf_wireless::wmm::Parameters, short: bool) -> Result<(), Error> {
+    codec::wmm_edca(p, short)
+        .map(|_| ())
+        .ok_or(Error::Unsupported)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
