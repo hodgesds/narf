@@ -58,8 +58,12 @@ fn response_rates(ies: &[u8], channel: u8) -> Result<(u8, u8), &'static str> {
     if !supported || !basic || rates.basic & !rates.supported != 0 {
         return Err("MVM active link requires an observed supported/basic rate intersection");
     }
-    let mut cck = (rates.basic & 15) as u8;
-    let mut ofdm = (rates.basic >> 4) as u8;
+    Ok(completed_response_rates(rates.basic))
+}
+
+pub(super) fn completed_response_rates(basic: u16) -> (u8, u8) {
+    let mut cck = (basic & 15) as u8;
+    let mut ofdm = (basic >> 4) as u8;
     let lowest_cck = if cck == 0 { 100 } else { cck.trailing_zeros() };
     let lowest_ofdm = if ofdm == 0 {
         100
@@ -76,7 +80,7 @@ fn response_rates(ies: &[u8], channel: u8) -> Result<(u8, u8), &'static str> {
             ofdm |= 1 << index;
         }
     }
-    Ok((cck, ofdm))
+    (cck, ofdm)
 }
 
 fn command(local: [u8; 6], active: Option<ActiveLinkStatus>) -> [u8; 208] {
@@ -284,6 +288,7 @@ impl Owner {
         match result {
             Ok(reply) if reply.payload.is_empty() => {
                 self.power.prepared.as_mut().unwrap().active_link = None;
+                self.power.prepared.as_mut().unwrap().mlme = super::assoc::Context::default();
                 self.phase = Phase::TransmitPowerPrepared;
                 Ok(())
             }

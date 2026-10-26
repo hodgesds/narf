@@ -19,7 +19,7 @@ pub struct AuthenticationStatus {
     pub status: u16,
 }
 
-fn disable_tx(disable: bool) -> [u8; 48] {
+pub(super) fn disable_tx(disable: bool) -> [u8; 48] {
     let mut body = [0; 48];
     body[0] = 1; // STA_MODE_MODIFY; station0, MAC0/LMAC0
     put32(&mut body, 20, if disable { 1 << 4 } else { 0 });
@@ -28,7 +28,7 @@ fn disable_tx(disable: bool) -> [u8; 48] {
 }
 
 impl Owner {
-    fn authentication_rate(&self, ies: &[u8], channel: u8) -> Result<u32, &'static str> {
+    pub(super) fn authentication_rate(&self, ies: &[u8], channel: u8) -> Result<u32, &'static str> {
         // Linux ops.c requires all four rates-v2 indicators to agree. The
         // retained producer implements the pre-AX210 v9 TX parameters and
         // unaggregated response v6/7/8; no guessed absent-version fallback.
@@ -63,7 +63,7 @@ impl Owner {
         .await
     }
 
-    async fn authenticate_open_using(
+    pub(super) async fn authenticate_open_using(
         &mut self,
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<AuthenticationStatus, &'static str> {
@@ -93,7 +93,9 @@ impl Owner {
             .authenticate_open_inner(local, link.bssid, link.channel, queue, rate, &mut policy)
             .await;
         match result {
-            Ok(status) => {
+            Ok((status, response)) => {
+                self.power.prepared.as_mut().unwrap().mlme.authenticated = (status.status == 0)
+                    .then_some(super::assoc::Authenticated { status, response });
                 self.phase = Phase::LinkActive;
                 Ok(status)
             }
@@ -113,7 +115,7 @@ impl Owner {
         queue: u16,
         rate: u32,
         policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
-    ) -> Result<AuthenticationStatus, &'static str> {
+    ) -> Result<(AuthenticationStatus, alloc::vec::Vec<u8>), &'static str> {
         if let Some((version, request)) = self.mcc_request()? {
             let reply = self
                 .qualified_link_command(1, 0xc8, &request, policy)
@@ -131,23 +133,10 @@ impl Owner {
         }
         self.check_link_power(&policy()?)?;
         let frame = frame_api::management(0xb0, local, bssid, 0, &[0, 0, 1, 0, 0, 0]);
-        {
-            let power = self
-                .power
-                .prepared
-                .as_ref()
-                .ok_or("missing authentication qualification")?;
-            let mut tx = pin!(self.hardware.transmit(queue, &frame, 24, Some(rate)));
-            poll_fn(|cx| {
-                if let Err(error) = policy().and_then(|domain| power.check_applied(&domain)) {
-                    return Poll::Ready(Err(error));
-                }
-                tx.as_mut().poll(cx)
-            })
+        self.qualified_management_transmit(queue, &frame, rate, policy)
             .await?;
-        }
         self.check_link_power(&policy()?)?;
-        let status = self
+        let (status, response) = self
             .authentication_response(local, bssid, channel, policy)
             .await?;
         // Closing needs no continuing transmit authority. A terminal receipt
@@ -165,11 +154,36 @@ impl Owner {
         // Source/policy can be revoked during the closing command. Do not
         // publish protocol success under authority which is no longer current.
         self.check_link_power(&policy()?)?;
-        Ok(AuthenticationStatus {
-            bssid,
-            channel,
-            status,
+        Ok((
+            AuthenticationStatus {
+                bssid,
+                channel,
+                status,
+            },
+            response,
+        ))
+    }
+
+    pub(super) async fn qualified_management_transmit(
+        &mut self,
+        queue: u16,
+        frame: &[u8],
+        rate: u32,
+        policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        let power = self
+            .power
+            .prepared
+            .as_ref()
+            .ok_or("missing management qualification")?;
+        let mut tx = pin!(self.hardware.transmit(queue, frame, 24, Some(rate)));
+        poll_fn(|cx| {
+            if let Err(error) = policy().and_then(|domain| power.check_applied(&domain)) {
+                return Poll::Ready(Err(error));
+            }
+            tx.as_mut().poll(cx)
         })
+        .await
     }
 
     async fn authentication_response(
@@ -178,7 +192,7 @@ impl Owner {
         bssid: [u8; 6],
         channel: u8,
         policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
-    ) -> Result<u16, &'static str> {
+    ) -> Result<(u16, alloc::vec::Vec<u8>), &'static str> {
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
             self.check_link_power(&policy()?)?;
@@ -211,7 +225,11 @@ impl Owner {
                     continue;
                 }
                 let body = mpdu.body(24, 0).unwrap();
-                return Ok(u16::from_le_bytes([body[4], body[5]]));
+                // Retain the actual checked authentication response for the
+                // association plan; never synthesize an authentication ACK.
+                let mut response = f[..24].to_vec();
+                response.extend_from_slice(body);
+                return Ok((u16::from_le_bytes([body[4], body[5]]), response));
             }
             if deadline.expired() {
                 return Err("MVM AP authentication response timed out");
@@ -223,4 +241,4 @@ impl Owner {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mvm_auth_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -46,6 +46,52 @@ fn fixture() -> Result<Fixture, &'static str> {
     runtime::model::versions(&mut fixture.owner.as_mut().unwrap().hardware, &versions);
     Ok(fixture)
 }
+pub(in crate::iwlwifi::mvm_boot) fn authenticated_fixture(
+    protected: bool,
+) -> Result<Fixture, &'static str> {
+    let mut f = fixture()?;
+    if protected {
+        let beacon = &mut f.owner.as_mut().unwrap().beacons[0];
+        beacon.capabilities |= 16;
+        beacon.privacy = true;
+        beacon.information_elements.extend_from_slice(&[
+            48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
+        ]);
+    }
+    {
+        let mut op = pin!(f
+            .owner
+            .as_mut()
+            .unwrap()
+            .authenticate_open_using(|| Ok(policy())));
+        if !poll(op.as_mut()).is_pending() {
+            return Err("association prerequisite peer enable");
+        }
+        f.firmware.inject(0x18, 0, 6, &[1, 0, 0, 0]);
+        if !poll(op.as_mut()).is_pending() {
+            return Err("association prerequisite native auth TX");
+        }
+        f.firmware.tx_complete(23, 0x46);
+        f.firmware.inject(0xc1, 0, 0x8000, &auth_rx(0));
+        if !poll(op.as_mut()).is_pending() {
+            return Err("association prerequisite native auth disable");
+        }
+        f.firmware.inject(0x18, 0, 7, &[1, 0, 0, 0]);
+        if !matches!(
+            poll(op.as_mut()),
+            Poll::Ready(Ok(AuthenticationStatus { status: 0, .. }))
+        ) {
+            return Err("association prerequisite actual authentication");
+        }
+    }
+    for _ in 0..3 {
+        f.trace
+            .take()
+            .ok_or("association prerequisite native DMA trace")?;
+    }
+    Ok(f)
+}
+
 fn modify(
     trace: &runtime::model::TxTrace,
     sequence: u16,

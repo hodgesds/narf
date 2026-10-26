@@ -22,6 +22,9 @@ pub enum Phase {
     ActivatingLink,
     LinkActive,
     Authenticating,
+    Associating,
+    Associated,
+    ClearingAssociation,
     DeactivatingLink,
     RemovingManagementQueue,
     RemovingPeer,
@@ -206,3 +209,8 @@ pub type ActiveLinkStatus = link::ActiveLinkStatus;
 #[path = "mvm_auth.rs"]
 mod auth;
 pub type AuthenticationStatus = auth::AuthenticationStatus;
+
+#[path = "mvm_assoc.rs"]
+mod assoc;
+pub type AssociationStatus = assoc::AssociationStatus;
+pub type AssociationSecurity = narf_wireless::association::SecurityMode;

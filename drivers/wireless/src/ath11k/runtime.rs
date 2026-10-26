@@ -2811,7 +2811,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     ///
     /// Pending association and CSA requests count as their requested
     /// context. This conservatively closes a sibling-vdev race; failure
-    /// paths restore the old context, and stop/recovery clear it.
+    /// paths restore the old context, and terminal stop clears it. Physical
+    /// reconstruction retains these logical reservations until each vdev is
+    /// replayed or closed; firmware losing its context does not free a live
+    /// netdev's claim for another virtual interface to steal.
     pub fn reserve_operating_channel(&self, vdev_id: u32, frequency_mhz: u32) -> Option<u32> {
         if (vdev_id as usize) >= WCN6855_MAX_VDEVS || frequency_mhz == 0 {
             return None;
@@ -3241,7 +3244,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         // pdev has received their current antenna generation yet.
         self.antenna_programmed_generation
             .store(0, Ordering::Release);
-        *self.operating_channels.lock() = [0; WCN6855_MAX_VDEVS];
+        // Associated STA/AP contexts are replayed while retaining carrier.
+        // Keep their logical reservations throughout reset and cancellation;
+        // the owning netdev clears its own slot if replay/teardown fails.
         self.bss_surveys.lock().clear();
         *self.mbssid_beacons.lock() = core::array::from_fn(|_| None);
         *self.mbssid_transmitters.lock() = [None; WCN6855_MAX_VDEVS];

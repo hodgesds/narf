@@ -18,7 +18,10 @@ impl Owner {
     pub fn prepared_management_queue(&self) -> Option<u16> {
         if !matches!(
             self.phase,
-            Phase::ManagementQueuePrepared | Phase::TransmitPowerPrepared | Phase::LinkActive
+            Phase::ManagementQueuePrepared
+                | Phase::TransmitPowerPrepared
+                | Phase::LinkActive
+                | Phase::Associated
         ) || self.hardware.is_failed()
         {
             return None;

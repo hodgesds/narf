@@ -51,6 +51,7 @@ pub(super) struct Prepared {
     channel: u8,
     applied: Option<i16>,
     pub(super) active_link: Option<super::link::ActiveLinkStatus>,
+    pub(super) mlme: super::assoc::Context,
 }
 
 impl Prepared {
@@ -130,6 +131,7 @@ fn parse(
         channel,
         applied: None,
         active_link: None,
+        mlme: super::assoc::Context::default(),
     })
 }
 
@@ -228,8 +230,10 @@ impl Owner {
     }
 
     pub fn prepared_transmit_power(&self) -> Option<PowerStatus> {
-        if !matches!(self.phase, Phase::TransmitPowerPrepared | Phase::LinkActive)
-            || self.hardware.is_failed()
+        if !matches!(
+            self.phase,
+            Phase::TransmitPowerPrepared | Phase::LinkActive | Phase::Associated
+        ) || self.hardware.is_failed()
         {
             return None;
         }

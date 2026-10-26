@@ -1668,6 +1668,14 @@ restart; detail 1, 3 caps).
    `qmi_firmware_ready(DpHooks)` over the same transport (new CE / HTC /
    WMI / DP; the TX queues and pending statuses carried over), the new
    `Rt` back in the slot.
+   The shared channel-reservation table is logical netdev ownership, not a
+   mirror of firmware memory: it stays reserved throughout physical reset,
+   replay and cancellation. Losing the firmware's channel contexts cannot
+   let a third distinct channel take a live STA/AP vdev's slot. A terminal
+   link loss, failed vdev replay or completed interface stop clears only that
+   vdev's reservation; transport failure/cancellation does not imply RF
+   quiescence or reclaim any DMA. Retaining reservations also covers the
+   cold transport reconstruction used by system resume.
 3. `post_reconfigure_recovery` / `ieee80211_restart_hw`: a new mac layer
    from the new capabilities (`Mac::config()` kept); if the interface was
    open, the open path again (`ath11k_mac_op_start` + `add_interface`). An
@@ -1682,6 +1690,12 @@ restart; detail 1, 3 caps).
    (`fail_cont_count` = 0, queues woken, `diag::note_wifi_recovered`) then
    follows. Only a pre-key in-kernel handshake lacks retained key state and
    performs the existing directed scan + `associate` retry.
+   Three native CE/HTC/WMI regressions keep a real WPA2 station and a sibling
+   legacy5GHz AP across reset, check both actual replayed channel contexts and
+   the two-channel admission limit, fail the sibling's native VDEV_START, and
+   cancel its replay after an actual native command publication. The RAM
+   target assigns distinct peer IDs to different vdevs. Late credits cannot
+   release the cancelled vdev's claim or reopen its stopped native queues.
 4. A failure latches its step, parks what the firmware was given and
    marks the device dead: control operations fail with `HardwareError`,
    `lock` callers park forever, the runtime loop ends.
@@ -1778,7 +1792,7 @@ card (QEMU emulates none) is exercised once, after phase 8.
 | 4 | Copy Engines + HTC + WMI: service ready, init, ready; MAC from firmware (**done, offline**: HAL SRNG core, CE pipes, shadow v2 list, HTC/WMI codecs, `core.rs` bring-up to WMI READY + SET_HW_MODE DBS; DP hooks no-op) | `core.c`, `hal.c`, `ce.c`, `htc.c`, `wmi.c` |
 | 5 | DP rings (TCL, REO, WBM, RXDMA refill) on the HAL: descriptor layouts, ring runtime, HTT ring setup / filters / version / peer map, per-peer REO TID queues + REO command ring, wired into bring-up (`DpHooks`, DP ext IRQs, NAPI service, shadow / monitor timers) (**done, offline**) | `hal*.c`, `dp.c`, `dp_tx.c` (HTT), `dp_rx.c` (rx_tid), `pcic.c` (ext IRQ) |
 | 6 | Control: pdev/vdev, regulatory, scan → `BssInfo` list, over the runtime ports (**done, offline**) | `mac.c`, `wmi.c`, `reg.c` |
-| 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant over the DP rings, key install + PN config (**done, offline** for Open + WPA2-PSK/CCMP; SAE open) | `mac.c`, `wmi.c`, `dp_rx.c` |
+| 7 | Connect: peer, auth/assoc via mgmt TX, EAPOL via `narf-wireless` supplicant over the DP rings, key install + PN config (**implemented, offline** for Open, WPA2-PSK/CCMP and SAE; real firmware/userspace acceptance remains) | `mac.c`, `wmi.c`, `dp_rx.c` |
 | 8 | Data path: TX (Ethernet → native-wifi 802.11 → TCL → WBM completion), RX (REO dst → Ethernet II → stack / RX ring); `wlan%d` registered with `narf_net` + `narf_wireless` (**done, offline**; first hardware run pending) | `mac80211/tx.c`, `dp_tx.c`, `dp_rx.c` |
 | 9 | Power: PS, WoW M3 suspend/resume or no-WoW cold HIF/MHI cycle, and firmware crash recovery (**implemented, validation deferred**: MHI RDDM / SYS_ERR + QMI late events → reset / restart, power cycle, reconfigure; WoW ACK/wakeup and normal cfg80211 disconnect/reconfigure policy) | `core.c`, `mac.c`, `mhi.c`, `qmi.c`, `wow.c` |
 
@@ -1795,6 +1809,32 @@ SAE, registry), `narf-net` (frame rings).
 Stage 5 "Silicon" — real-HW Wi-Fi on the bring-up laptops.
 
 ## 8. Open questions
+
+### Per-profile software inventory
+
+This inventory is based on local Linux `ath11k/{core,hw,pci,mac,wmi,dp_rx}.c`,
+`hal_{rx,desc}.h` and the actual NARF profile dispatch. A capability absent from
+SERVICE_READY/EXT, the current band's regulatory/MAC/PHY capability or a Linux
+hardware parameter is inapplicable to that running profile; absence is never
+permission to emulate or advertise it. These rows are software scope, separate
+from physical RF, board, firmware and userspace interoperability acceptance.
+
+| Profile | Implemented reachable software | Remaining or inapplicable scope |
+|---|---|---|
+| WCN6855 HW2.0/HW2.1 | Native dynamic-window PCI/MHI/QMI/CE/HTC/WMI/DP; advertised-band legacy/HT/VHT/HE station/AP/P2P, security/keys/PMF, four-vdev/two-channel ownership, scan/ROC, recovery and PS/WoW/cold suspend; firmware power readback and retained recovery channel reservations | Native composed hardware fixtures remain x86-only; real aarch64 startup/PCI/IRQ/board discovery has no equivalent composed configuration. Per-dialog TWT control, non-contiguous RATEMASK firmware programming, DT board-variant discovery and spectral/radar detector diagnostics are not complete exposed software paths. Their absence is not a blanket assertion that firmware cannot support them. |
+| QCA6390 HW2.0 | Independent IPQ8074 RX descriptor/DP profile and core dispatch, shared supported MAC/runtime capabilities, native normal/error/coalescing/fragment ownership and composed station/recovery path | The same explicit optional/control and architecture gaps above apply only when target services advertise them. Six-GHz/HE160/80+80/extended security are admitted only from actual band, peer and firmware capabilities, not inferred from WCN6855. |
+| QCN9074 | PCI identity/configuration definitions only; rejected with BME disabled before MMIO/MSI/firmware activation | Missing native static BAR windows, QCN9074 HAL register/operation tables, non-shadow rings, independent core/per-pdev/HTT peer-map-v2 configuration, QCN RX/REO/DP runtime and composed ownership tests. This is missing software for a recognized profile. WCN6855/QCA6390 tests cannot establish it. |
+| Other Linux ath11k SoC/AHB profiles | No native NARF admission | IPQ8074/IPQ6018/IPQ5018/WCN6750 platform IRQ, reset, reserved-memory/board and HAL profiles require their own bus/firmware lifetime contracts. Their helper constants/layouts do not provide an admitted runtime. |
+
+802.11be/MLO/EHT is not an ath11k Wi-Fi6/6E contract; it belongs to newer
+hardware/driver families. Firmware-owned HT/HE BA, OFDMA/TWT behavior is distinct
+from a NARF user control API. The existing firmware requester engine does not
+claim a separate host TWT-dialog manager. Native fragmentation-threshold TX is
+inapplicable to the Linux ath11k firmware contract, which cannot transmit
+More-Fragments frames; it remains explicitly unsupported. SAR/board values and
+RF acceptance must come from real platform inputs, never this inventory.
+
+### Existing acceptance questions
 
 - Per-family software completion: QCA6390 now has Linux
   `rx_desc.h::hal_rx_desc_ipq8074`, native HAL accessors and DP parameters,

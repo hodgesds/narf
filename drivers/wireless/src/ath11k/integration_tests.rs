@@ -76,6 +76,8 @@ macro_rules! ensure {
 
 #[path = "power_stats_tests.rs"]
 mod power_stats_tests;
+#[path = "recovery_channel_tests.rs"]
+mod recovery_channel_tests;
 
 fn check(f: impl FnOnce() -> R) -> TestResult {
     match f() {
@@ -449,6 +451,7 @@ struct Dev {
     revision: HwRev,
     chip: Arc<Chip>,
     st: RefCell<DevState>,
+    pause_wait: core::sync::atomic::AtomicBool,
 }
 // SAFETY: as `Chip` — single-task kernel test, no concurrent access.
 unsafe impl Send for Dev {}
@@ -459,6 +462,7 @@ impl Dev {
     fn new(chip: Arc<Chip>, script: Script, cfg: FwCfg, revision: HwRev) -> Arc<Dev> {
         let credit_size = script.credit_size as u32;
         Arc::new(Dev {
+            pause_wait: core::sync::atomic::AtomicBool::new(false),
             revision,
             chip,
             st: RefCell::new(DevState {
@@ -537,14 +541,14 @@ impl Dev {
                     let mac: [u8; 6] = b[8..14].try_into().unwrap();
                     if st.world.cfg().peer_map {
                         let m = le(&[
-                            0x03 | (vdev & 0xff) << 8 | (AP_PEER_ID as u32) << 16,
+                            0x03 | (vdev & 0xff) << 8 | (u32::from(AP_PEER_ID) + vdev * 16) << 16,
                             u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]),
                             u16::from_le_bytes([mac[4], mac[5]]) as u32,
                         ]);
                         st.fw
                             .out
                             .push_back((CTRL_DL, htc::target_frame(HTT_EID, &m, &[])));
-                        st.peers.push((vdev, mac, AP_PEER_ID));
+                        st.peers.push((vdev, mac, AP_PEER_ID + vdev as u16 * 16));
                     }
                 }
                 wmi::WMI_PEER_DELETE_CMDID => {
@@ -820,9 +824,20 @@ impl CeIrq for DevIrq {
         self.0.chip().take_pending()
     }
     fn wait(&self, ms: u32) -> impl Future<Output = ()> + Send {
-        NOW.fetch_add(ms.max(1) as u64, Ordering::Relaxed);
-        self.0.step();
-        core::future::ready(())
+        let dev = self.0.clone();
+        async move {
+            core::future::poll_fn(|cx| {
+                if dev.pause_wait.load(Ordering::Acquire) {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
+            NOW.fetch_add(ms.max(1) as u64, Ordering::Relaxed);
+            dev.step();
+        }
     }
 }
 

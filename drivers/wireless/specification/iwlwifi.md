@@ -747,9 +747,88 @@ Six native Rust smokes compose the acknowledged power/link prerequisites with
 real peer enable, packet DMA, native TX receipt, AP RX and re-disable. They cover
 AP rejection, independent literal wire/rate expectations, each cancellation and
 authority boundary, failed receipts, profile rejection and malformed/foreign
-RX. No automatic Gen2 station admission is enabled. Association, authenticated
-station state, adaptive data rates, keys/BA/controlled-port security, recovery,
-PM and native PCI publication still require their complete owner chains.
+RX. The actual checked response, with firmware padding/trailer removed, remains
+with the same power/link owner for §3.14; no synthetic authentication receipt
+can seed an association plan. No automatic Gen2 station admission is enabled.
+
+### 3.14 Retained Gen2 legacy association and local close
+
+`Owner::associate_legacy(ssid, AssociationSecurity::{Open,Wpa2Psk}).await`
+requires the same current qualified `LinkActive` context, exact idle
+station0/TID15 queue, original BSS and a successful retained authentication
+response. The shared native `association::JoinPlan` validates the observed
+SSID, offered legacy rates and Open or PSK/CCMP policy; it consumes the actual
+completed authentication response before building an Association Request.
+Required PMF/SAE, HT/VHT/WMM and unsupported required rate profiles cannot enter
+this legacy path. No PMK, temporal key or controlled-port state is stored here.
+
+Before the first native wait the owner consumes the prior authentication and
+retains the plan in `Associating`. It refreshes MCC when applicable, rechecks
+the current signed qualification/host ceiling/firmware channel permission and
+discards old RX. A receipt-confirmed peer-enable permits only the private
+Association Request producer. The actual TX must complete before a checked
+RX48 Association Response from the same AP/local RA/channel can be accepted.
+The complete response IE set, status, ESS/privacy capabilities and AID1…2007
+with both high AID bits must validate. Supported rates are intersected with the
+actual offer; every original/new basic rate must remain in that intersection.
+The plan retains the response-bound AID/rates before further firmware waits.
+
+The producer is first disabled again using its real four-byte ADD_STA-success
+receipt. A separately qualified ADD_STA v12 MODIFY then applies the AP's AID
+with TX-disable preserved. Linux's legacy MVM command does not synthesize
+CLASS_AUTH/CLASS_ASSOC flags. LINK_CONFIG updates only response rates,
+short-preamble/slot, ERP protection and beacon timing for the existing active
+PHY, using original beacon interval/DTIM and the response-bound capabilities.
+Mandatory control-response completion follows the same source rules as §3.12.
+MAC_CONFIG v1/52 then sets its associated client bit/AID and group filter,
+without enabling HE/EHT or a data producer. Command-ID headers remain0;
+ADD_STA requires its native status and LINK/MAC require exact empty correlated
+receipts. Source capability/host policy are checked at every qualified poll,
+firmware/host predicates between stages and before final publication.
+
+`AssociationStatus { bssid, channel, aid, supported_rates, basic_rates,
+protected, short_preamble, short_slot, erp_protection }` is receipt metadata only
+in `Associated`; `protected` records the selected RSN suite, not installed keys.
+Neither Open nor WPA2 association opens carrier or a data controlled port.
+`clear_association().await` is an acknowledged local firmware close: MAC
+association off, disabled peer AID reset, original active-link rates/protection
+and inactive-association timing restored. It requires no continuing TX grant,
+does not claim an over-air deauthentication, and returns `LinkActive` only after
+all exact receipts. Then the existing deactivation/power/queue/peer/PHY close
+chain applies. Association cancellation/failure retains its plan, response
+metadata and uncertain native command/packet DMA; a cancelled local close
+cannot reopen or bypass that chain. No timeout or host failure proves RF
+quiescence.
+
+Seven native RFH/TFH smokes compose actual auth, Open/WPA2 Association Requests,
+TX responses, AP replies, peer/AID/link/MAC updates and local close. Literal
+wire expectations, required preflight proof, each wait's cancellation/current
+authority, bound AID/rate/status/header failures, native control failures and
+closing after qualification revocation exercise the composed owner. Automatic
+PCI station publication remains gated until real Gen2 data queues, normal
+legacy EDCA/rate control, keys/RSNA/BA, connection monitoring, over-air teardown,
+owned recovery and PM are complete. Association metadata is not that admission.
+
+### 3.15 Per-profile remaining software inventory
+
+This inventory follows local Linux `cfg/{22000,ax210,bz,sc}.c`, `mvm/{ops,sta,
+link,mld-mac,tx,mac80211}.c` and `fw/api/{mac-cfg,sta,tx,rs}.h`. Actual NVM,
+firmware command tables/services and band-qualified regulatory authority bound
+each feature; a Linux chip name or helper structure does not grant a capability.
+
+| Profile | Implemented reachable software | Remaining software gates |
+|---|---|---|
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles | Context-v1 boot, native RFH/TFH, NVM/runtime defaults, passive scan, inactive/active PHY/link, AP peer/management queue, measured signed v5 SAR/power, actual open authentication and Open/PSK-CCMP legacy association/local close | Gen2 native data queue/rate/EDCA owner; real pairwise/group key and RSNA integration; BA/reorder; protected management; connection loss/air teardown; recovery and runtime/system PM; retained native PCI station publication. HT/VHT/HE, wider channels, AP/P2P, WoW/offloads and multiple RX/RSS are not implemented by the new legacy owner even where hardware supports them. |
+| AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile. The generic Gen3 command-ID-header/version assumption still needs a native Linux ABI audit; payload versions alone cannot select header versions. Sc conversation tests do not establish a different family's ABI or hardware. |
+| Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile | The same explicit Gen3 native command-ID audit; HE/EHT/6GHz and MLO,160/320MHz, AP/P2P, advanced offloads, platform power/runtime/system PM remain separate implementations and must not be inferred from single-link Sc fixtures. |
+| Other advertised PCI/firmware combinations | Identification/firmware selection where defined | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
+
+MLO/EHT/320MHz is hardware-inapplicable to Wi-Fi6/6E AX2xx devices, while
+Wi-Fi7 Bz/Sc support is missing software in this station profile. Six-GHz is
+hardware-inapplicable to AX200/AX201; supported 6E/7 parts still require real
+band-qualified HE/security/power admission. Platform SAR/antenna measurements,
+firmware/board identity and silicon/RF acceptance are external inputs; they
+cannot be filled by software defaults or counted as completed code.
 
 ## 4. References
 
