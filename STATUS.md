@@ -223,6 +223,19 @@ Scoped production/kernel-test Clippy, workspace formatting and release/debug
 builds pass on both architectures. The wave adds 39 passing x86_64 smokes and
 36 on aarch64; three native ath11k recovery cases are x86_64-specific.
 
+The following wave adds retained native Gen2 Open data ownership with DCF/TLC,
+TID0 DMA and receipt-fenced teardown, while automatic PCI/netdev/WPA2 keys remain
+gated. MT76 gains bounded recipient BA/reordering and ordered key retirement;
+native rekey tests also corrected KEY_V2 tag17/install0/remove1 ABI fields.
+Ath10k gains response-bound WMM/QoS and policy checks across native station and
+RSNA waits. RTL8821CE reaches native Open/WPA2 kernel DHCP/IP through its original
+reserved-DMA owner and distinct signed full-static thermal/power qualification.
+Real measured deployment assets and RF acceptance are still required.
+The wave adds 39 passing smokes per architecture: combined Wi-Fi/shared-fixture
+suites pass 1926/0 fail/9 skip on x86_64 and 1456/0 fail/3 skip on aarch64.
+Production boots/btrfs postflights, scoped production/kernel-test Clippy,
+workspace formatting and release/debug builds pass on both architectures.
+
 The [per-chip inventory](drivers/wireless/research/chip-inventory.md) audits all
 102 registered bus identities. Tokei measures 316,060 Rust code lines including
 tests/tables in the specified scopes, compared with 1,177,080 C/header lines in
