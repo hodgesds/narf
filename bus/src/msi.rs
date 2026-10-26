@@ -77,6 +77,10 @@ pub struct MsiConfig {
     mme_log2: u8,
     /// Cfg-space window for the device.
     cfg_phys: PhysAddr,
+    /// Snapshot of the function the cap was discovered on. Kept so
+    /// `program_msi` can apply the VMD remap interposition
+    /// (issue #933 item 4) without a second device parameter.
+    device: BusDevice,
 }
 
 impl MsiConfig {
@@ -135,6 +139,7 @@ pub fn enable_msi(
         mmc_log2: mmc,
         mme_log2,
         cfg_phys,
+        device: *device,
     })
 }
 
@@ -154,7 +159,25 @@ pub unsafe fn program_msi(
     target_apic_id: u32,
     base_irq: u8,
 ) -> Result<u64, MsiError> {
-    let (addr, data) = msi_message(target_apic_id, base_irq);
+    // VMD remap interposition (issue #933 item 4): a child behind a
+    // VMD bridge is programmed with the bridge-entry message, not a
+    // message of its own. Legacy MSI has a single address/data pair,
+    // so all of the device's vectors collapse onto the one assigned
+    // bridge entry — the remap ignores the message data, which is
+    // the only per-vector signal MSI has.
+    let (addr, data) = if let Some(domain) = crate::vmd_domain::domain_for_device(&cfg.device) {
+        let entry = crate::vmd_irq::assign_child_vector(
+            domain.segment,
+            cfg.device.id.class,
+            cfg.device.addr,
+            0,
+            base_irq,
+        )
+        .ok_or(MsiError::Unsupported)?;
+        crate::vmd_irq::remap_message(entry)
+    } else {
+        msi_message(target_apic_id, base_irq)
+    };
 
     let addr_lo = addr as u32;
     let addr_hi = (addr >> 32) as u32;

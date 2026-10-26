@@ -807,6 +807,333 @@ fn smoke_vmd_not_present_on_qemu_tcg() -> TestResult {
 }
 kernel_test_in!("drivers/storage/vmd", smoke_vmd_not_present_on_qemu_tcg);
 
+// ── VMD domain end-to-end fixture (issue #933 items 3 + 4) ────────
+//
+// A fake VMD bridge in RAM: a bridge config window (MSI-X cap whose
+// table lives in MEMBAR2, VMCONFIG preset with remapping DISABLED),
+// a 1 MiB CFGBAR window containing one NVMe function, and MEMBAR1 /
+// MEMBAR2 register RAM. `Vmd::assemble_domain` runs the production
+// assembly (enumerate, bridge MSI-X setup, VMCONFIG, domain
+// registration), a mirror NVMe driver binds the child through
+// probe_all and runs the child-side conversation (map BAR0, assign
+// BAR2, program MSI-X vector 0), and the fixture fires the bridge
+// vector to prove the demux reaches the child's handler.
+//
+// The one seam: BAR *decode*. RAM cannot emulate the sizing dance
+// (a RAM cell reads back the all-ones probe verbatim, so every fake
+// BAR reports the minimum size), so the fixture hands
+// `assemble_domain` the decoded MEMBAR windows directly — the same
+// values `bring_up` computes from `read_bar` on real hardware.
+
+/// Page-aligned RAM window standing in for a hardware aperture.
+struct VmdFakeWindow {
+    _backing: alloc::vec::Vec<u8>,
+    ptr: *mut u8,
+    phys: u64,
+    len: usize,
+}
+
+impl VmdFakeWindow {
+    fn new(len: usize) -> Self {
+        let mut backing = alloc::vec![0u8; len + 4096];
+        let base = backing.as_mut_ptr() as usize;
+        let aligned = (base + 4095) & !4095;
+        let ptr = aligned as *mut u8;
+        let phys = narf_memory::PhysAddr::from_kernel_ptr(ptr as *const u8).raw();
+        Self {
+            _backing: backing,
+            ptr,
+            phys,
+            len,
+        }
+    }
+
+    fn write32(&self, off: usize, v: u32) {
+        debug_assert!(off + 4 <= self.len);
+        // SAFETY: `off` is inside the owned window per the assert.
+        unsafe {
+            core::ptr::write_volatile(self.ptr.add(off) as *mut u32, v);
+        }
+    }
+
+    fn read32(&self, off: usize) -> u32 {
+        debug_assert!(off + 4 <= self.len);
+        // SAFETY: `off` is inside the owned window per the assert.
+        unsafe { core::ptr::read_volatile(self.ptr.add(off) as *const u32) }
+    }
+}
+
+static VMD_E2E_PROBE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VMD_E2E_BAR0_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static VMD_E2E_IRQ_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VMD_E2E_DV: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn vmd_e2e_count_handler(_cookie: u64) -> narf_interrupts::dispatch::IrqStatus {
+    use core::sync::atomic::Ordering;
+    VMD_E2E_IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
+    narf_interrupts::dispatch::IrqStatus::Handled
+}
+
+/// Mirror NVMe child probe: the child-side conversation a real
+/// driver runs against a VMD child, with results parked in statics
+/// for the fixture body to assert.
+fn vmd_e2e_child_probe(
+    device: narf_bus::BusDevice,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    use core::sync::atomic::Ordering;
+    VMD_E2E_PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: the probe owns the child exclusively (bus contract).
+    match unsafe { narf_bus::map_bar(&device, 0) } {
+        Ok(region) => VMD_E2E_BAR0_PHYS.store(region.phys.raw(), Ordering::SeqCst),
+        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
+    }
+    // SAFETY: same ownership.
+    match unsafe { narf_bus::assign_unprogrammed_bars(&device) } {
+        Ok(n) if n >= 1 => {}
+        _ => return Err(narf_bus::ProbeError::BadDevice),
+    }
+    let mut table = match narf_bus::enable_msix(&cap, &device) {
+        Ok(t) => t,
+        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
+    };
+    let dv = VMD_E2E_DV.load(Ordering::SeqCst) as u8;
+    // SAFETY: same ownership; vector 0 came from enable_msix's table.
+    if unsafe { table.program_vector(0, 0, dv) }.is_err() {
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
+    Ok(())
+}
+
+fn smoke_vmd_domain_end_to_end() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    use crate::vmd;
+    use narf_bus::{
+        BarKind, BusAddr, BusDevice, BusKind, DeviceId, MembarWindow, MmioRegion, PcieAddr,
+    };
+    use narf_memory::PhysAddr;
+
+    let saved_registry = narf_bus::devices();
+    narf_bus::driver_match::__reset_for_test();
+    narf_bus::vmd_domain::__reset_for_test();
+    narf_bus::vmd_irq::__reset_for_test();
+    vmd::__reset_for_test();
+    VMD_E2E_PROBE_CALLS.store(0, Ordering::SeqCst);
+    VMD_E2E_BAR0_PHYS.store(0, Ordering::SeqCst);
+    VMD_E2E_IRQ_COUNT.store(0, Ordering::SeqCst);
+
+    // ── Fake hardware ──────────────────────────────────────────────
+    let bridge_cfg = VmdFakeWindow::new(0x1000);
+    let cfgbar = VmdFakeWindow::new(0x10_0000);
+    let regs = VmdFakeWindow::new(0x8000); // MEMBAR1: child registers
+    let membar2 = VmdFakeWindow::new(0x4000); // MEMBAR2: bridge MSI-X table
+
+    // Bridge config: Tiger Lake VMD, cap list -> MSI-X (4 entries,
+    // table in BAR4), VMCONFIG with remap-disable SET + BIOS-owned
+    // bits that must survive.
+    bridge_cfg.write32(0x00, 0x9A0B_8086);
+    bridge_cfg.write32(0x04, 0x0010_0000);
+    bridge_cfg.write32(0x08, 0x0104_0000);
+    bridge_cfg.write32(0x10, (cfgbar.phys as u32 & 0xFFFF_FFF0) | 0x4);
+    bridge_cfg.write32(0x14, (cfgbar.phys >> 32) as u32);
+    bridge_cfg.write32(0x18, (regs.phys as u32 & 0xFFFF_FFF0) | 0x4);
+    bridge_cfg.write32(0x1C, (regs.phys >> 32) as u32);
+    bridge_cfg.write32(0x20, (membar2.phys as u32 & 0xFFFF_FFF0) | 0x4);
+    bridge_cfg.write32(0x24, (membar2.phys >> 32) as u32);
+    bridge_cfg.write32(0x34, 0x80);
+    bridge_cfg.write32(0x44, 0xDEAD_0002); // VMCONFIG: MSI_RMP_DIS set
+    bridge_cfg.write32(0x80, (3 << 16) | 0x11); // MSI-X cap, size 4
+    bridge_cfg.write32(0x84, 4); // table: BIR 4, offset 0
+    bridge_cfg.write32(0x88, 4 | 0x800); // PBA: BIR 4, offset 0x800
+
+    // Child function at CFGBAR bus 0, dev 0: NVMe, BAR0 = the
+    // register window inside MEMBAR1, BAR2 unprogrammed, MSI-X
+    // (2 entries) table in BAR0.
+    cfgbar.write32(0x00, 0xA808_144D);
+    cfgbar.write32(0x04, 0x0010_0000);
+    cfgbar.write32(0x08, 0x0108_0200);
+    cfgbar.write32(0x10, (regs.phys as u32 & 0xFFFF_FFF0) | 0x4);
+    cfgbar.write32(0x14, (regs.phys >> 32) as u32);
+    cfgbar.write32(0x18, 0);
+    cfgbar.write32(0x34, 0x80);
+    cfgbar.write32(0x80, (1 << 16) | 0x11); // MSI-X cap, size 2
+    cfgbar.write32(0x84, 0);
+    cfgbar.write32(0x88, 0x800);
+
+    let bridge_addr = PcieAddr::new(0, 0, 0x0E, 0);
+    let bridge = BusDevice {
+        addr: BusAddr::Pcie(bridge_addr),
+        id: DeviceId {
+            vendor: vmd::INTEL_VENDOR,
+            device: 0x9A0B,
+            class: 0x010400,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Pcie {
+            addr: bridge_addr,
+            cfg_phys: PhysAddr::new(bridge_cfg.phys),
+        },
+    };
+
+    // SAFETY: fixture-owned RAM window, mapped as the bridge's ECAM
+    // segment so cap-gated config accesses resolve.
+    if !unsafe { narf_bus::ecam::map_segment(PhysAddr::new(bridge_cfg.phys), 0x1000) } {
+        return TestResult::Fail("could not map the fake bridge cfg segment");
+    }
+    narf_bus::registry::install(alloc::vec![bridge]);
+    let authority = narf_bus::bootstrap_registry_authority();
+    let (_handle, cap) = match narf_bus::claim_device_cap(&authority, bridge.addr) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("claim on the fake bridge failed"),
+    };
+
+    // The child driver's host vector, allocated up front so the
+    // mirror probe can program it.
+    let dv = match narf_interrupts::vector::alloc() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("host vector allocation failed"),
+    };
+    VMD_E2E_DV.store(dv as u64, Ordering::SeqCst);
+    narf_interrupts::dispatch::install_handler_named(dv, "vmd-e2e", 7, vmd_e2e_count_handler);
+
+    narf_bus::driver_match::register(narf_bus::PciMatch {
+        name: "vmd-e2e-nvme",
+        kind: narf_bus::MatchKind::ClassFull {
+            class: 0x01,
+            subclass: 0x08,
+            prog_if: 0x02,
+        },
+        probe: vmd_e2e_child_probe,
+    });
+
+    // ── Production assembly ────────────────────────────────────────
+    let region = MmioRegion {
+        phys: PhysAddr::new(cfgbar.phys),
+        virt: cfgbar.ptr as u64,
+        len: 0x10_0000,
+        kind: BarKind::Mmio64 {
+            prefetchable: false,
+        },
+    };
+    // SAFETY: the fixture owns the fake bridge + windows; the seam
+    // is only that the MEMBAR windows arrive pre-decoded (see the
+    // fixture header comment).
+    let vmd_inst = match unsafe {
+        vmd::Vmd::assemble_domain(
+            &bridge,
+            &cap,
+            region,
+            Some(MembarWindow::new(regs.phys, 0x8000, 0)),
+            Some(MembarWindow::new(membar2.phys, 0x4000, 0x2000)),
+        )
+    } {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("assemble_domain failed on the fake bridge"),
+    };
+    let seg = vmd_inst.segment;
+    if seg != vmd::VMD_SEGMENT_BASE || vmd_inst.child_count() != 1 || vmd_inst.msix_entries != 4 {
+        return TestResult::Fail("assembly produced the wrong domain shape");
+    }
+    // VMCONFIG: remap-disable cleared, every BIOS-owned bit intact.
+    if bridge_cfg.read32(0x44) != 0xDEAD_0000 {
+        return TestResult::Fail("VMCONFIG was not switched to remapping, or lost BIOS bits");
+    }
+    // Bridge MSI-X table in MEMBAR2 RAM: four entries pointing at
+    // the LAPIC base with distinct host vectors, all unmasked.
+    let mut seen = [0u32; 4];
+    for i in 0..4usize {
+        let base = i * 16;
+        if membar2.read32(base) != 0xFEE0_0000 || membar2.read32(base + 12) != 0 {
+            return TestResult::Fail("bridge MSI-X entry is not a native LAPIC message");
+        }
+        let data = membar2.read32(base + 8);
+        if !(48..=240).contains(&data) || seen[..i].contains(&data) {
+            return TestResult::Fail("bridge MSI-X entries do not hold distinct host vectors");
+        }
+        seen[i] = data;
+    }
+    // Domain registered with the client shape (first_vec = 1).
+    match narf_bus::vmd_domain_info(seg) {
+        Some(info) => {
+            if info.msix_entries != 4
+                || info.first_vec != 1
+                || info.membar1.map(|w| w.base) != Some(regs.phys)
+                || info.membar2.map(|w| w.reserve_head) != Some(0x2000)
+            {
+                return TestResult::Fail("registered domain info does not match the fake hardware");
+            }
+        }
+        None => return TestResult::Fail("domain was not registered"),
+    }
+
+    // ── Child binding + conversation ───────────────────────────────
+    vmd_inst.install_children();
+    let child_addr = BusAddr::Pcie(PcieAddr::new(seg, 0, 0, 0));
+    if !narf_bus::devices().iter().any(|d| d.addr == child_addr) {
+        return TestResult::Fail("child was not installed into the registry");
+    }
+    match narf_bus::driver_match::probe_all(&authority) {
+        Ok(1) => {}
+        _ => return TestResult::Fail("probe_all did not bind exactly the child"),
+    }
+    if VMD_E2E_PROBE_CALLS.load(Ordering::SeqCst) != 1
+        || VMD_E2E_BAR0_PHYS.load(Ordering::SeqCst) != regs.phys
+    {
+        return TestResult::Fail("child probe did not map BAR0 inside MEMBAR1");
+    }
+    // BAR2 was assigned from MEMBAR1, routed around BAR0's range.
+    if cfgbar.read32(0x18) != (regs.phys as u32 + 0x1000) {
+        return TestResult::Fail("child BAR2 was not assigned from MEMBAR1 past BAR0");
+    }
+    // Child MSI-X entry 0 holds the remap message for bridge
+    // entry 2 (NVMe policy: least loaded at/above first_vec + 1).
+    if regs.read32(0) != 0xFEE0_2000 || regs.read32(8) != 0 {
+        return TestResult::Fail("child MSI-X entry does not hold the remap message");
+    }
+    if narf_bus::vmd_entry_for_child(seg, child_addr, 0) != Some(2) {
+        return TestResult::Fail("child vector was not assigned bridge entry 2");
+    }
+
+    // ── Demux: fire the bridge vector, reach the child handler ────
+    let bv = match narf_bus::vmd_bridge_vector(seg, 2) {
+        Some(v) => v,
+        None => return TestResult::Fail("no bridge vector for entry 2"),
+    };
+    if bv as u32 != seen[2] {
+        return TestResult::Fail("bridge vector disagrees with the programmed table entry");
+    }
+    narf_interrupts::dispatch::on_irq(bv);
+    if VMD_E2E_IRQ_COUNT.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("demux did not dispatch the bridge interrupt to the child");
+    }
+
+    // ── Detach: mappings die with the binding ──────────────────────
+    match narf_bus::detach_pci_device(&authority, child_addr) {
+        Ok(true) => {}
+        _ => return TestResult::Fail("detach of the child failed"),
+    }
+    if narf_bus::vmd_entry_for_child(seg, child_addr, 0).is_some() {
+        return TestResult::Fail("detach left the child's remap mapping live");
+    }
+    narf_interrupts::dispatch::on_irq(bv);
+    if VMD_E2E_IRQ_COUNT.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("demux dispatched to a detached child");
+    }
+
+    // ── Cleanup ────────────────────────────────────────────────────
+    narf_interrupts::dispatch::clear_handler(dv);
+    let _ = narf_interrupts::vector::free(dv);
+    narf_bus::unregister_vmd_domain(seg);
+    narf_bus::unregister_vmd_irq_domain(seg);
+    narf_bus::registry::install(saved_registry);
+    narf_bus::driver_match::__reset_for_test();
+    vmd::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/vmd", smoke_vmd_domain_end_to_end);
+
 // ── SD response/CSD/CID decoder smokes ─────────────────────────────
 
 fn smoke_sd_r1_status_error_mask() -> TestResult {

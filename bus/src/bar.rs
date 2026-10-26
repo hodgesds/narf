@@ -214,6 +214,7 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
 pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarError> {
     // SAFETY: forwarded.
     let bar = unsafe { read_bar(device, idx)? };
+    check_vmd_aperture(device, &bar)?;
     let attrs = match bar.kind {
         BarKind::Mmio32 { prefetchable: true } | BarKind::Mmio64 { prefetchable: true } => {
             MmioAttrs::WriteCombining
@@ -237,8 +238,32 @@ pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarErro
 pub unsafe fn map_bar_control(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarError> {
     // SAFETY: forwarded device/config-space ownership.
     let bar = unsafe { read_bar(device, idx)? };
+    check_vmd_aperture(device, &bar)?;
     // SAFETY: this decoded BAR belongs to the caller's device.
     unsafe { map_decoded_bar(bar, MmioAttrs::Device) }
+}
+
+/// VMD aperture gate (issue #933 item 3): a child behind a VMD
+/// bridge may only decode inside the bridge's MEMBAR windows. A
+/// decoded BAR pointing anywhere else — e.g. a stale host-domain
+/// address firmware left behind in a non-VMD configuration — is
+/// refused as `Unimplemented` rather than mapped, because on the
+/// real bus it would never route through the bridge. Devices not
+/// on a registered VMD segment pass unconditionally.
+fn check_vmd_aperture(device: &BusDevice, bar: &Bar) -> Result<(), BarError> {
+    if bar.phys.raw() == 0 {
+        // Unprogrammed — `map_decoded_bar` refuses it below.
+        return Ok(());
+    }
+    if let Some(domain) = crate::vmd_domain::domain_for_device(device) {
+        if crate::vmd_domain::membar_window_of(domain.segment, bar.phys.raw(), bar.size).is_none() {
+            return Err(BarError::Unimplemented);
+        }
+        // A BAR in use is a range later allocations must route
+        // around (issue #933 item 3).
+        crate::vmd_domain::note_occupied(domain.segment, bar.phys.raw(), bar.size);
+    }
+    Ok(())
 }
 
 /// Install one typed mapping for a decoded, exclusively owned device BAR.
@@ -485,11 +510,20 @@ pub enum AssignError {
 /// Skipped silently when the pool wasn't initialised (typical on
 /// x86_64 where seabios already programmed BARs).
 ///
+/// VMD children (issue #933 item 3) are the exception to both rules
+/// above: their assignments come from the owning bridge's MEMBAR
+/// aperture (see [`crate::vmd_domain`]), never the host pool —
+/// a host-pool address would not route through the bridge — and a
+/// BAR holding an address *outside* the aperture counts as
+/// unprogrammed and is reassigned, since it cannot decode behind
+/// the bridge either.
+///
 /// # Safety
 /// `device` must be PCIe with cfg space writable; caller owns
 /// the device exclusively for the duration of the call.
 pub unsafe fn assign_unprogrammed_bars(device: &BusDevice) -> Result<u32, AssignError> {
-    if MMIO_POOL_BASE.load(Ordering::Acquire) == 0 {
+    let domain = crate::vmd_domain::domain_for_device(device);
+    if domain.is_none() && MMIO_POOL_BASE.load(Ordering::Acquire) == 0 {
         return Ok(0); // Pool not initialised — assume firmware did it.
     }
     let cfg_phys = match device.kind {
@@ -508,7 +542,20 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice) -> Result<u32, Assign
             } // unimplemented slot
         };
         // Already programmed? Skip. (firmware path or earlier pass.)
-        if bar.phys.raw() != 0 {
+        // For a VMD child, "programmed" additionally requires the
+        // address to decode inside the bridge's MEMBAR aperture.
+        let programmed = bar.phys.raw() != 0
+            && match &domain {
+                Some(d) => crate::vmd_domain::membar_window_of(d.segment, bar.phys.raw(), bar.size)
+                    .is_some(),
+                None => true,
+            };
+        if programmed {
+            // A programmed VMD-child BAR already owns its range;
+            // note it so aperture allocations route around it.
+            if let Some(d) = &domain {
+                crate::vmd_domain::note_occupied(d.segment, bar.phys.raw(), bar.size);
+            }
             idx += if matches!(bar.kind, BarKind::Mmio64 { .. }) {
                 2
             } else {
@@ -516,10 +563,18 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice) -> Result<u32, Assign
             };
             continue;
         }
+        // Allocation source: the bridge aperture for VMD children,
+        // the host pool for everyone else.
+        let alloc = |size: u64| -> Option<u64> {
+            match &domain {
+                Some(d) => crate::vmd_domain::allocate_domain_mmio(d.segment, size, size),
+                None => allocate_pci_mmio(size, size),
+            }
+        };
         match bar.kind {
             BarKind::Mmio32 { prefetchable: _ } => {
                 // Allocate + write low half.
-                let base = match allocate_pci_mmio(bar.size, bar.size) {
+                let base = match alloc(bar.size) {
                     Some(p) => p,
                     None => return Err(AssignError::PoolExhausted),
                 };
@@ -539,7 +594,7 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice) -> Result<u32, Assign
                 idx += 1;
             }
             BarKind::Mmio64 { prefetchable: _ } => {
-                let base = match allocate_pci_mmio(bar.size, bar.size) {
+                let base = match alloc(bar.size) {
                     Some(p) => p,
                     None => return Err(AssignError::PoolExhausted),
                 };

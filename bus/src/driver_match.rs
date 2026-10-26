@@ -270,6 +270,11 @@ pub fn detach(authority: &Cap<BusRegistryCap, Grant>, addr: BusAddr) -> Result<b
     let Some(bound) = bound else {
         return Ok(false);
     };
+    // A detached VMD child's remap mappings die with the binding
+    // (issue #933 item 4, spec §9.7): the bridge demux must never
+    // dispatch to a vector whose driver is gone. No-op for devices
+    // that were never remapped.
+    crate::vmd_irq::release_device(addr);
     let remove = REMOVE_FNS
         .lock()
         .iter()

@@ -3374,3 +3374,564 @@ fn smoke_pci_appended_child_binds_and_detaches() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus", smoke_pci_appended_child_binds_and_detaches);
+
+// ---------------------------------------------------------------------------
+// VMD domain fixtures (issue #933 items 3 + 4): MEMBAR aperture
+// assignment / containment, and MSI remap + demux. The fixtures
+// simulate the hardware conversation against RAM-backed fake config
+// windows — production code (`assign_unprogrammed_bars`, `map_bar`,
+// `enable_msix` / `program_vector`, `program_msi`, the demux) runs
+// unmodified; the only unrealism is BAR *size* decode, because a RAM
+// cell reads back the sizing-dance probe value verbatim and every
+// fake BAR therefore reports the minimum 16-byte size. Addresses,
+// containment, entry policy, message composition and dispatch are
+// all asserted exactly.
+
+/// Page-aligned RAM window standing in for a hardware aperture.
+struct FakeWindow {
+    _backing: alloc::vec::Vec<u8>,
+    ptr: *mut u8,
+    phys: u64,
+    len: usize,
+}
+
+impl FakeWindow {
+    fn new(len: usize) -> Self {
+        let mut backing = alloc::vec![0u8; len + 4096];
+        let base = backing.as_mut_ptr() as usize;
+        let aligned = (base + 4095) & !4095;
+        let ptr = aligned as *mut u8;
+        let phys = narf_memory::PhysAddr::from_kernel_ptr(ptr as *const u8).raw();
+        Self {
+            _backing: backing,
+            ptr,
+            phys,
+            len,
+        }
+    }
+
+    fn write32(&self, off: usize, v: u32) {
+        debug_assert!(off + 4 <= self.len);
+        // SAFETY: `off` is inside the owned window per the assert.
+        unsafe {
+            core::ptr::write_volatile(self.ptr.add(off) as *mut u32, v);
+        }
+    }
+
+    fn read32(&self, off: usize) -> u32 {
+        debug_assert!(off + 4 <= self.len);
+        // SAFETY: `off` is inside the owned window per the assert.
+        unsafe { core::ptr::read_volatile(self.ptr.add(off) as *const u32) }
+    }
+
+    fn write16(&self, off: usize, v: u16) {
+        debug_assert!(off + 2 <= self.len);
+        // SAFETY: `off` is inside the owned window per the assert.
+        unsafe {
+            core::ptr::write_volatile(self.ptr.add(off) as *mut u16, v);
+        }
+    }
+
+    fn read16(&self, off: usize) -> u16 {
+        debug_assert!(off + 2 <= self.len);
+        // SAFETY: `off` is inside the owned window per the assert.
+        unsafe { core::ptr::read_volatile(self.ptr.add(off) as *const u16) }
+    }
+}
+
+/// A synthetic PCIe function whose config window is `cfg_phys`.
+fn fake_pcie(
+    segment: u16,
+    device: u8,
+    vendor: u16,
+    device_id: u16,
+    class: u32,
+    cfg_phys: u64,
+) -> crate::BusDevice {
+    let addr = crate::addr::PcieAddr::new(segment, 0, device, 0);
+    crate::BusDevice {
+        addr: crate::addr::BusAddr::Pcie(addr),
+        id: crate::DeviceId {
+            vendor,
+            device: device_id,
+            class,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: crate::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(cfg_phys),
+        },
+    }
+}
+
+/// Lay down an MSI-X capability (at 0x80, single-entry cap list)
+/// with `entries` table slots in BAR0 at offset 0.
+fn fake_msix_cap(cfg: &FakeWindow, entries: u16) {
+    // Status (0x06): Capabilities List bit. Command stays 0.
+    cfg.write32(0x04, 0x0010_0000);
+    // Capabilities Pointer (0x34).
+    cfg.write32(0x34, 0x80);
+    // Cap header + Message Control (table size - 1 in bits 10..0).
+    cfg.write32(0x80, ((entries as u32 - 1) << 16) | 0x11);
+    // Table: BIR 0, offset 0. PBA: BIR 0, offset 0x800.
+    cfg.write32(0x84, 0);
+    cfg.write32(0x88, 0x800);
+}
+
+fn smoke_vmd_domain_membar_assignment() -> TestResult {
+    use crate::bar::{assign_unprogrammed_bars, map_bar, pool_snapshot, BarError};
+    use crate::vmd_domain::{
+        __reset_for_test as reset_domains, membar_window_of, register_domain, MembarWindow,
+        VmdDomainInfo,
+    };
+
+    let _restore = RegistryRestore::capture();
+    reset_domains();
+    crate::vmd_irq::__reset_for_test();
+
+    const SEG: u16 = 0x8000;
+    const MB1: u64 = 0x3000_0000;
+    const MB2: u64 = 0x3100_0000;
+
+    let cfg = FakeWindow::new(0x1000);
+    // SAFETY: the window is owned by this fixture for its lifetime.
+    if !unsafe { crate::ecam::map_segment(narf_memory::PhysAddr::new(cfg.phys), 0x1000) } {
+        return TestResult::Fail("could not map fake ECAM segment");
+    }
+    // BAR0: 64-bit MMIO, unprogrammed (type bits 0b100 only).
+    cfg.write32(0x10, 0x4);
+    cfg.write32(0x14, 0);
+    // BAR2: 32-bit MMIO, unprogrammed.
+    cfg.write32(0x18, 0);
+    // BAR4: 32-bit MMIO programmed OUTSIDE the aperture — a stale
+    // host-domain address that must be reassigned, not trusted.
+    cfg.write32(0x20, 0xDEAD_0000);
+
+    let child = fake_pcie(SEG, 0, 0x144d, 0xa808, 0x010802, cfg.phys);
+    let bridge = fake_pcie(0, 28, 0x8086, 0x9A0B, 0x010400, 0);
+    if register_domain(VmdDomainInfo {
+        segment: SEG,
+        bridge: bridge.addr,
+        membar1: Some(MembarWindow::new(MB1, 0x2000, 0)),
+        membar2: Some(MembarWindow::new(MB2, 0x1_0000, 0x2000)),
+        msix_entries: 0,
+        first_vec: 0,
+    })
+    .is_err()
+    {
+        return TestResult::Fail("register_domain rejected a fresh segment");
+    }
+
+    let pool_before = pool_snapshot();
+    // SAFETY: the fixture owns the child's cfg window exclusively.
+    let assigned = match unsafe { assign_unprogrammed_bars(&child) } {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("assign_unprogrammed_bars failed for a VMD child"),
+    };
+    if assigned != 3 {
+        return TestResult::Fail("expected all three child BARs assigned from the aperture");
+    }
+    // BAR0 -> MEMBAR1 base (first allocation), BAR2 -> MEMBAR1
+    // +0x1000 (page-granular cursor), BAR4 -> MEMBAR2 + reserve
+    // (MEMBAR1 full by then; the stale host address was discarded).
+    if cfg.read32(0x10) != (MB1 as u32 | 0x4) || cfg.read32(0x14) != 0 {
+        return TestResult::Fail("BAR0 was not assigned MEMBAR1's base");
+    }
+    if cfg.read32(0x18) != (MB1 as u32 + 0x1000) {
+        return TestResult::Fail("BAR2 was not assigned inside MEMBAR1");
+    }
+    if cfg.read32(0x20) != (MB2 as u32 + 0x2000) {
+        return TestResult::Fail("BAR4 was not reassigned into MEMBAR2 past its reserved head");
+    }
+    if membar_window_of(SEG, MB1, 16) != Some(1)
+        || membar_window_of(SEG, MB2 + 0x2000, 16) != Some(2)
+        || membar_window_of(SEG, 0xDEAD_0000, 16).is_some()
+    {
+        return TestResult::Fail("membar_window_of misclassified an address");
+    }
+    // The host MMIO pool must be untouched by VMD-child assignment.
+    if pool_snapshot() != pool_before {
+        return TestResult::Fail("VMD child assignment consumed the host MMIO pool");
+    }
+
+    // map_bar containment: an in-aperture BAR maps; an
+    // out-of-aperture BAR is refused.
+    // SAFETY: fixture-owned cfg window.
+    match unsafe { map_bar(&child, 0) } {
+        Ok(region) => {
+            if region.phys.raw() != MB1 {
+                return TestResult::Fail("map_bar returned the wrong aperture address");
+            }
+        }
+        Err(_) => return TestResult::Fail("map_bar refused an in-aperture BAR"),
+    }
+    let cfg2 = FakeWindow::new(0x1000);
+    // SAFETY: fixture-owned window.
+    if !unsafe { crate::ecam::map_segment(narf_memory::PhysAddr::new(cfg2.phys), 0x1000) } {
+        return TestResult::Fail("could not map second fake ECAM segment");
+    }
+    cfg2.write32(0x10, 0xDEAD_0000);
+    let outsider = fake_pcie(SEG, 1, 0x144d, 0xa808, 0x010802, cfg2.phys);
+    // SAFETY: fixture-owned cfg window.
+    match unsafe { map_bar(&outsider, 0) } {
+        Err(BarError::Unimplemented) => {}
+        Err(_) => return TestResult::Fail("map_bar refused an outside BAR with the wrong error"),
+        Ok(_) => return TestResult::Fail("map_bar mapped a BAR outside the MEMBAR aperture"),
+    }
+
+    reset_domains();
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_vmd_domain_membar_assignment);
+
+/// Child-vector dispatch counts for the remap fixtures, indexed by
+/// the cookie the fixture installs its handlers with.
+static VMD_FIXTURE_COUNTS: [core::sync::atomic::AtomicU32; 4] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+
+fn vmd_count_handler(cookie: u64) -> narf_interrupts::dispatch::IrqStatus {
+    use core::sync::atomic::Ordering;
+    VMD_FIXTURE_COUNTS[(cookie as usize) & 3].fetch_add(1, Ordering::SeqCst);
+    narf_interrupts::dispatch::IrqStatus::Handled
+}
+
+fn vmd_fixture_count(i: usize) -> u32 {
+    use core::sync::atomic::Ordering;
+    VMD_FIXTURE_COUNTS[i].load(Ordering::SeqCst)
+}
+
+fn smoke_vmd_remap_message_shape() -> TestResult {
+    // The composition itself, asserted without any registry state:
+    // bridge entry index in the destination field, zero data.
+    let (addr, data) = crate::vmd_irq::remap_message(5);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if addr != 0xFEE0_5000 || data != 0 {
+            return TestResult::Fail("x86 remap message must be base | (entry << 12), data 0");
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if data != 5 || addr != narf_interrupts::aarch64::its::doorbell_pa() {
+            return TestResult::Fail(
+                "aarch64 remap message must be the ITS doorbell + entry EventID",
+            );
+        }
+    }
+    let words = crate::vmd_irq::remap_entry_words(5);
+    if words != [addr as u32, (addr >> 32) as u32, data, 0] {
+        return TestResult::Fail("remap entry words do not match the composed message");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_vmd_remap_message_shape);
+
+fn smoke_vmd_irq_remap_msix_and_demux() -> TestResult {
+    use crate::driver_match::{
+        __reset_for_test as reset_matches, detach, probe_all, MatchKind, PciMatch,
+    };
+    use crate::registry::{bootstrap_registry_authority, install};
+    use crate::vmd_domain::{
+        __reset_for_test as reset_domains, register_domain, MembarWindow, VmdDomainInfo,
+    };
+    use crate::vmd_irq::{bridge_vector, entry_for_child, register_bridge_domain};
+    use narf_interrupts::{dispatch, vector};
+
+    let _restore = RegistryRestore::capture();
+    reset_matches();
+    reset_domains();
+    crate::vmd_irq::__reset_for_test();
+    for c in &VMD_FIXTURE_COUNTS {
+        c.store(0, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    const SEG: u16 = 0x8000;
+
+    // --- Child 1: NVMe class, MSI-X table in BAR0 (RAM). ---
+    let table1 = FakeWindow::new(0x1000);
+    let cfg1 = FakeWindow::new(0x1000);
+    // SAFETY: fixture-owned windows.
+    if !unsafe { crate::ecam::map_segment(narf_memory::PhysAddr::new(cfg1.phys), 0x1000) } {
+        return TestResult::Fail("could not map child cfg segment");
+    }
+    cfg1.write32(0x00, 0xA808_144D);
+    cfg1.write32(0x08, 0x0108_0200);
+    cfg1.write32(0x10, (table1.phys as u32 & 0xFFFF_FFF0) | 0x4);
+    cfg1.write32(0x14, (table1.phys >> 32) as u32);
+    fake_msix_cap(&cfg1, 4);
+    let child1 = fake_pcie(SEG, 0, 0x144d, 0xa808, 0x010802, cfg1.phys);
+
+    // --- Child 2: network class, same shape, device 1. ---
+    let table2 = FakeWindow::new(0x1000);
+    let cfg2 = FakeWindow::new(0x1000);
+    // SAFETY: fixture-owned windows.
+    if !unsafe { crate::ecam::map_segment(narf_memory::PhysAddr::new(cfg2.phys), 0x1000) } {
+        return TestResult::Fail("could not map second child cfg segment");
+    }
+    cfg2.write32(0x00, 0x10D3_8086);
+    cfg2.write32(0x08, 0x0200_0000);
+    cfg2.write32(0x10, (table2.phys as u32 & 0xFFFF_FFF0) | 0x4);
+    cfg2.write32(0x14, (table2.phys >> 32) as u32);
+    fake_msix_cap(&cfg2, 2);
+    let child2 = fake_pcie(SEG, 1, 0x8086, 0x10d3, 0x020000, cfg2.phys);
+
+    // Domain: MEMBAR1 must contain both table BARs for
+    // map_bar_control's aperture gate. The windows are heap RAM, so
+    // register one window per table via two domains is impossible —
+    // use a single window spanning from table1's page; the tables
+    // are separate allocations, so instead register MEMBAR1 over
+    // table1 and MEMBAR2 over table2 (containment is per-window).
+    let bridge = fake_pcie(0, 28, 0x8086, 0x9A0B, 0x010400, 0);
+    if register_domain(VmdDomainInfo {
+        segment: SEG,
+        bridge: bridge.addr,
+        membar1: Some(MembarWindow::new(table1.phys, 0x1000, 0)),
+        membar2: Some(MembarWindow::new(table2.phys, 0x1000, 0)),
+        msix_entries: 4,
+        first_vec: 1,
+    })
+    .is_err()
+    {
+        return TestResult::Fail("register_domain failed");
+    }
+
+    // Bridge IRQ domain: four entries, first_vec = 1.
+    let mut bridge_vecs = [0u8; 4];
+    for v in &mut bridge_vecs {
+        match vector::alloc() {
+            Ok(x) => *v = x,
+            Err(_) => return TestResult::Fail("host vector allocation failed"),
+        }
+    }
+    if register_bridge_domain(SEG, 1, &bridge_vecs).is_err() {
+        return TestResult::Fail("register_bridge_domain failed");
+    }
+
+    install(alloc::vec![child1, child2]);
+    let authority = bootstrap_registry_authority();
+    let (_h1, cap1) = match crate::claim_device_cap(&authority, child1.addr) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("claim on child1 failed"),
+    };
+    let (_h2, cap2) = match crate::claim_device_cap(&authority, child2.addr) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("claim on child2 failed"),
+    };
+    let mut t1 = match crate::enable_msix(&cap1, &child1) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("enable_msix on the fake child failed"),
+    };
+    let mut t2 = match crate::enable_msix(&cap2, &child2) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("enable_msix on the second fake child failed"),
+    };
+
+    // Child driver vectors + counting handlers.
+    let mut dvs = [0u8; 3];
+    for (i, v) in dvs.iter_mut().enumerate() {
+        match vector::alloc() {
+            Ok(x) => *v = x,
+            Err(_) => return TestResult::Fail("driver vector allocation failed"),
+        }
+        dispatch::install_handler_named(*v, "vmd-fixture", i as u64, vmd_count_handler);
+    }
+
+    // NVMe policy: idx0 -> entry 2, idx1 -> entry 3 (least loaded
+    // at/above first_vec+1), idx2 -> entry 2 (tie broken low).
+    // SAFETY: fixture owns both children's tables exclusively.
+    for (idx, dv) in dvs.iter().enumerate() {
+        if unsafe { t1.program_vector(idx as u16, 0, *dv) }.is_err() {
+            return TestResult::Fail("program_vector on the VMD child failed");
+        }
+    }
+    if entry_for_child(SEG, child1.addr, 0) != Some(2)
+        || entry_for_child(SEG, child1.addr, 1) != Some(3)
+        || entry_for_child(SEG, child1.addr, 2) != Some(2)
+    {
+        return TestResult::Fail("NVMe entry policy (least-loaded >= first_vec+1) not applied");
+    }
+    // The table RAM holds the remap message, not a native message.
+    let (exp_addr, exp_data) = crate::vmd_irq::remap_message(2);
+    if table1.read32(0) != exp_addr as u32
+        || table1.read32(4) != (exp_addr >> 32) as u32
+        || table1.read32(8) != exp_data
+        || table1.read32(12) != 0
+    {
+        return TestResult::Fail("child MSI-X entry does not hold the remap message");
+    }
+    // Idempotent reprogramming keeps the same entry.
+    // SAFETY: fixture-owned table.
+    if unsafe { t1.program_vector(0, 0, dvs[0]) }.is_err()
+        || entry_for_child(SEG, child1.addr, 0) != Some(2)
+    {
+        return TestResult::Fail("reprogramming a child vector moved its bridge entry");
+    }
+    // Non-storage class shares first_vec.
+    // SAFETY: fixture-owned table.
+    if unsafe { t2.program_vector(0, 0, dvs[0]) }.is_err() {
+        return TestResult::Fail("program_vector on the network-class child failed");
+    }
+    if entry_for_child(SEG, child2.addr, 0) != Some(1) {
+        return TestResult::Fail("non-storage child was not assigned the shared first_vec entry");
+    }
+
+    // Demux: firing bridge entry 2 dispatches child vectors 0 and 2
+    // (child1 idx0 + idx2); entry 3 dispatches idx1; entry 1
+    // dispatches child2's vector (also handler cookie 0 -> count[0]
+    // grows by one more).
+    let bv2 = bridge_vector(SEG, 2).unwrap_or(0xFF);
+    let bv3 = bridge_vector(SEG, 3).unwrap_or(0xFF);
+    let bv1 = bridge_vector(SEG, 1).unwrap_or(0xFF);
+    if bv2 == 0xFF || bv3 == 0xFF || bv1 == 0xFF {
+        return TestResult::Fail("bridge_vector lookup failed");
+    }
+    dispatch::on_irq(bv2);
+    if vmd_fixture_count(0) != 1 || vmd_fixture_count(1) != 0 || vmd_fixture_count(2) != 1 {
+        return TestResult::Fail("demux on entry 2 dispatched the wrong child vectors");
+    }
+    dispatch::on_irq(bv3);
+    dispatch::on_irq(bv1);
+    if vmd_fixture_count(0) != 2 || vmd_fixture_count(1) != 1 || vmd_fixture_count(2) != 1 {
+        return TestResult::Fail("demux on entries 3/1 dispatched the wrong child vectors");
+    }
+
+    // Detach composition: bind child1 through probe_all, detach
+    // it, and its mappings must be gone (demux no longer reaches
+    // its vectors) while child2's stay live.
+    crate::driver_match::register(PciMatch {
+        name: "vmd-fixture-nvme",
+        kind: MatchKind::ClassFull {
+            class: 0x01,
+            subclass: 0x08,
+            prog_if: 0x02,
+        },
+        probe: |_d, _c| Ok(()),
+    });
+    match probe_all(&authority) {
+        Ok(1) => {}
+        _ => return TestResult::Fail("probe_all did not bind exactly the NVMe child"),
+    }
+    match detach(&authority, child1.addr) {
+        Ok(true) => {}
+        _ => return TestResult::Fail("detach of the bound child failed"),
+    }
+    if entry_for_child(SEG, child1.addr, 0).is_some()
+        || entry_for_child(SEG, child1.addr, 2).is_some()
+        || entry_for_child(SEG, child2.addr, 0) != Some(1)
+    {
+        return TestResult::Fail("detach did not release exactly the detached child's mappings");
+    }
+    dispatch::on_irq(bv2);
+    if vmd_fixture_count(0) != 2 || vmd_fixture_count(2) != 1 {
+        return TestResult::Fail("demux dispatched to a detached child's vectors");
+    }
+
+    // Cleanup: handlers + vectors + registries back to baseline.
+    for v in dvs {
+        dispatch::clear_handler(v);
+        let _ = vector::free(v);
+    }
+    crate::vmd_irq::__reset_for_test();
+    reset_domains();
+    reset_matches();
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_vmd_irq_remap_msix_and_demux);
+
+fn smoke_vmd_irq_remap_legacy_msi() -> TestResult {
+    use crate::registry::{bootstrap_registry_authority, install};
+    use crate::vmd_domain::{
+        __reset_for_test as reset_domains, register_domain, MembarWindow, VmdDomainInfo,
+    };
+    use crate::vmd_irq::{entry_for_child, register_bridge_domain};
+    use narf_interrupts::vector;
+
+    let _restore = RegistryRestore::capture();
+    reset_domains();
+    crate::vmd_irq::__reset_for_test();
+
+    const SEG: u16 = 0x8001;
+    let cfg = FakeWindow::new(0x1000);
+    // SAFETY: fixture-owned window.
+    if !unsafe { crate::ecam::map_segment(narf_memory::PhysAddr::new(cfg.phys), 0x1000) } {
+        return TestResult::Fail("could not map legacy-MSI child cfg segment");
+    }
+    cfg.write32(0x00, 0x10D3_8086);
+    cfg.write32(0x04, 0x0010_0000); // status: cap list present
+    cfg.write32(0x08, 0x0200_0000); // network class
+    cfg.write32(0x34, 0x80); // cap pointer
+                             // MSI cap at 0x80: ID 0x05, next 0, Message Control with the
+                             // 64-bit-capable bit set and MMC = 0 (one vector).
+    cfg.write32(0x80, (0x0080u32 << 16) | 0x05);
+    let child = fake_pcie(SEG, 3, 0x8086, 0x10d3, 0x020000, cfg.phys);
+    let bridge = fake_pcie(0, 28, 0x8086, 0x9A0B, 0x010400, 0);
+    if register_domain(VmdDomainInfo {
+        segment: SEG,
+        bridge: bridge.addr,
+        membar1: Some(MembarWindow::new(0x3200_0000, 0x1_0000, 0)),
+        membar2: None,
+        msix_entries: 2,
+        first_vec: 1,
+    })
+    .is_err()
+    {
+        return TestResult::Fail("register_domain failed");
+    }
+    let mut bridge_vecs = [0u8; 2];
+    for v in &mut bridge_vecs {
+        match vector::alloc() {
+            Ok(x) => *v = x,
+            Err(_) => return TestResult::Fail("host vector allocation failed"),
+        }
+    }
+    if register_bridge_domain(SEG, 1, &bridge_vecs).is_err() {
+        return TestResult::Fail("register_bridge_domain failed");
+    }
+
+    install(alloc::vec![child]);
+    let authority = bootstrap_registry_authority();
+    let (_h, cap) = match crate::claim_device_cap(&authority, child.addr) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("claim on the legacy-MSI child failed"),
+    };
+    let mut msi = match crate::msi::enable_msi(&cap, &child, 1) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("enable_msi on the fake child failed"),
+    };
+    let dv = match vector::alloc() {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("driver vector allocation failed"),
+    };
+    // SAFETY: fixture owns the child's cfg window exclusively.
+    let addr = match unsafe { crate::msi::program_msi(&mut msi, 0, dv) } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("program_msi on the VMD child failed"),
+    };
+    // Non-storage class -> shared first_vec entry (1).
+    if entry_for_child(SEG, child.addr, 0) != Some(1) {
+        return TestResult::Fail("legacy MSI child was not assigned the first_vec bridge entry");
+    }
+    let (exp_addr, exp_data) = crate::vmd_irq::remap_message(1);
+    if addr != exp_addr {
+        return TestResult::Fail("program_msi returned the native address, not the remap address");
+    }
+    // The cap in RAM holds the remap pair: addr at +4/+8, data
+    // (u16) at +0xC for a 64-bit cap.
+    if cfg.read32(0x84) != exp_addr as u32
+        || cfg.read32(0x88) != (exp_addr >> 32) as u32
+        || cfg.read16(0x8C) != exp_data as u16
+    {
+        return TestResult::Fail("legacy MSI cap does not hold the remap message");
+    }
+
+    let _ = vector::free(dv);
+    crate::vmd_irq::__reset_for_test();
+    reset_domains();
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_vmd_irq_remap_legacy_msi);
