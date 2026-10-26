@@ -53,9 +53,15 @@
 //! - GetRandom bytes come from a fixed-seed xorshift PRNG:
 //!   determinism is a fixture requirement, and fixtures assert
 //!   framing/length only, never entropy.
-//! - GetCapability is not implemented (`TPM_RC_COMMAND_CODE`);
-//!   the command-set lane (#941) grows the model as its builders
-//!   land. Production `get_info` is a stub that never submits it.
+//! - GetCapability (#941) serves the capabilities the command
+//!   core actually implements — TPM_PROPERTIES (the model's
+//!   identity: manufacturer "NARF", vendor string "NARF fixture
+//!   TPM", firmware 1.0, spec revision 159, TPMA_PERMANENT = 0 —
+//!   no hierarchy auth is set), PCRS (the SHA-256 bank), ALGS
+//!   (SHA-256 only), COMMANDS (the six implemented command
+//!   codes), HANDLES (always empty: the model holds no loaded
+//!   objects). Any other capability is answered `TPM_RC_VALUE`,
+//!   as a TPM without it would.
 //! - `CTRL_STS.error` is never set for ordinary command RCs (it
 //!   signals a fatal device state on silicon, not a rejection).
 
@@ -428,6 +434,7 @@ impl FakeTpmDevice {
             }
             x if x == narf_tpm::tpm2::TPM_CC_PCR_EXTEND => self.exec_pcr_extend(tag, cmd),
             x if x == narf_tpm::tpm2::TPM_CC_PCR_READ => self.exec_pcr_read(cmd),
+            x if x == narf_tpm::tpm2::TPM_CC_GET_CAPABILITY => self.exec_get_capability(tag, cmd),
             x if x == narf_tpm::tpm2::TPM_CC_GET_RANDOM => {
                 if cmd.len() != 12 {
                     return err(RC_SIZE);
@@ -613,6 +620,133 @@ impl FakeTpmDevice {
         drop(st);
         let mut out = alloc::vec![0u8; 10 + body.len()];
         out[0..2].copy_from_slice(&narf_tpm::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+        out[2..6].copy_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+        out[10..].copy_from_slice(&body);
+        out
+    }
+
+    /// The model's TPM_PT property table (Part 2 §6.12–§6.15),
+    /// ascending by tag: the fixed group first, then
+    /// TPM_PT_PERMANENT from the variable group. The identity is
+    /// deliberately legible in fixtures — vendor string pieces
+    /// concatenate to "NARF fixture TPM" through the sysfs
+    /// `description` attribute.
+    fn model_properties() -> &'static [(u32, u32)] {
+        use narf_tpm::tpm2::*;
+        &[
+            (TPM_PT_FAMILY_INDICATOR, 0x322E_3000), // "2.0\0"
+            (TPM_PT_LEVEL, 0),
+            (TPM_PT_REVISION, 159),
+            (TPM_PT_MANUFACTURER, 0x4E41_5246),    // "NARF"
+            (TPM_PT_VENDOR_STRING_1, 0x4E41_5246), // "NARF"
+            (TPM_PT_VENDOR_STRING_2, 0x2066_6978), // " fix"
+            (TPM_PT_VENDOR_STRING_3, 0x7475_7265), // "ture"
+            (TPM_PT_VENDOR_STRING_4, 0x2054_504D), // " TPM"
+            (TPM_PT_VENDOR_TPM_TYPE, 0),
+            (TPM_PT_FIRMWARE_VERSION_1, 0x0001_0000),
+            (TPM_PT_FIRMWARE_VERSION_2, 0),
+            (TPM_PT_INPUT_BUFFER, 1024),
+            (TPM_PT_HR_TRANSIENT_MIN, 3),
+            (TPM_PT_PCR_COUNT, 24),
+            // TPMA_PERMANENT = 0: no hierarchy auth value is set,
+            // dictionary-attack lockout is not engaged.
+            (TPM_PT_PERMANENT, 0),
+        ]
+    }
+
+    /// TPM2_GetCapability (Part 3 §30): no handles, no sessions;
+    /// parameters are capability(4) + property(4) +
+    /// propertyCount(4). The response mirrors the request tag and
+    /// carries moreData(1) + capability(4) + capabilityData.
+    fn exec_get_capability(&self, tag: u16, cmd: &[u8]) -> Vec<u8> {
+        let err = |rc: u32| -> Vec<u8> {
+            let mut out = alloc::vec![0u8; 10];
+            out[0..2].copy_from_slice(&narf_tpm::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+            out[2..6].copy_from_slice(&10u32.to_be_bytes());
+            out[6..10].copy_from_slice(&rc.to_be_bytes());
+            out
+        };
+        if cmd.len() != 22 {
+            return err(RC_SIZE);
+        }
+        let capability = u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]);
+        let property = u32::from_be_bytes([cmd[14], cmd[15], cmd[16], cmd[17]]);
+        let count = u32::from_be_bytes([cmd[18], cmd[19], cmd[20], cmd[21]]) as usize;
+
+        let mut data = Vec::new();
+        let more_data: u8 = match capability {
+            x if x == narf_tpm::tpm2::TPM_CAP_TPM_PROPERTIES => {
+                // TPML_TAGGED_TPM_PROPERTY, paged by tag: entries
+                // at or after `property`, ascending, at most
+                // `count` of them; moreData reports whether the
+                // table continues past the page.
+                let table = Self::model_properties();
+                let eligible: Vec<&(u32, u32)> =
+                    table.iter().filter(|(t, _)| *t >= property).collect();
+                let page = &eligible[..eligible.len().min(count)];
+                data.extend_from_slice(&(page.len() as u32).to_be_bytes());
+                for (t, v) in page {
+                    data.extend_from_slice(&t.to_be_bytes());
+                    data.extend_from_slice(&v.to_be_bytes());
+                }
+                u8::from(eligible.len() > page.len())
+            }
+            x if x == narf_tpm::tpm2::TPM_CAP_PCRS => {
+                // TPML_PCR_SELECTION: the one implemented bank,
+                // all 24 PCRs allocated.
+                data.extend_from_slice(&1u32.to_be_bytes());
+                data.extend_from_slice(&narf_tpm::tpm2::TPM_ALG_SHA256.to_be_bytes());
+                data.push(3u8);
+                data.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+                0
+            }
+            x if x == narf_tpm::tpm2::TPM_CAP_ALGS => {
+                // TPML_ALG_PROPERTY: SHA-256, TPMA_ALGORITHM.hash
+                // (bit 2) — the only algorithm the command core
+                // implements.
+                data.extend_from_slice(&1u32.to_be_bytes());
+                data.extend_from_slice(&narf_tpm::tpm2::TPM_ALG_SHA256.to_be_bytes());
+                data.extend_from_slice(&0x0000_0004u32.to_be_bytes());
+                0
+            }
+            x if x == narf_tpm::tpm2::TPM_CAP_COMMANDS => {
+                // TPML_CCA: one attribute word per 32 command
+                // codes, indexed from TPM_CC_FIRST (0x11F). Four
+                // words cover every code the core implements.
+                const MODEL_COMMANDS: [u32; 6] = [
+                    narf_tpm::tpm2::TPM_CC_STARTUP,
+                    narf_tpm::tpm2::TPM_CC_SHUTDOWN,
+                    narf_tpm::tpm2::TPM_CC_GET_CAPABILITY,
+                    narf_tpm::tpm2::TPM_CC_GET_RANDOM,
+                    narf_tpm::tpm2::TPM_CC_PCR_READ,
+                    narf_tpm::tpm2::TPM_CC_PCR_EXTEND,
+                ];
+                let mut words = [0u32; 4];
+                for cc in MODEL_COMMANDS {
+                    let idx = (cc - 0x0000_011F) as usize;
+                    words[idx / 32] |= 1 << (idx % 32);
+                }
+                data.extend_from_slice(&(words.len() as u32).to_be_bytes());
+                for w in words {
+                    data.extend_from_slice(&w.to_be_bytes());
+                }
+                0
+            }
+            x if x == narf_tpm::tpm2::TPM_CAP_HANDLES => {
+                // TPML_HANDLE: the model holds no loaded,
+                // persistent, or session handles.
+                data.extend_from_slice(&0u32.to_be_bytes());
+                0
+            }
+            _ => return err(RC_VALUE),
+        };
+
+        let mut body = Vec::new();
+        body.push(more_data);
+        body.extend_from_slice(&capability.to_be_bytes());
+        body.extend_from_slice(&data);
+        let mut out = alloc::vec![0u8; 10 + body.len()];
+        out[0..2].copy_from_slice(&tag.to_be_bytes());
         out[2..6].copy_from_slice(&((10 + body.len()) as u32).to_be_bytes());
         out[10..].copy_from_slice(&body);
         out
@@ -1189,7 +1323,10 @@ fn map_transport_err(e: tpm::TpmError) -> HighLevelTpmError {
 #[async_trait]
 impl TpmDevice for ModelDevice {
     fn get_info(&self) -> TpmInfo {
-        // Mirrors the production transport's (stub) values.
+        // Mirrors the production transport's unqueried defaults
+        // (#941): the adapter does not run the probe-time
+        // `query_info` — fixtures that need the live identity call
+        // `query_info` on the adapter explicitly.
         TpmInfo {
             manufacturer: 0,
             version: 2,
@@ -1604,6 +1741,227 @@ kernel_test_in!(
 
 // ── Userspace publication (#940): devfs + sysfs over the model ────
 
+/// #941: TPM2_GetCapability against the model — the command the
+/// keystone deliberately left unimplemented until the command-set
+/// lane grew it. The conversation runs over the CRB register
+/// front end through the production submit seam: the trait's
+/// `query_info` maps the model's property page, and the raw
+/// capability pages (PCRS / ALGS / COMMANDS / HANDLES, paging,
+/// unknown-capability rejection) are checked against the
+/// canonical parsers and the model's documented identity.
+fn smoke_tpm_getcapability_conversation() -> TestResult {
+    use narf_tpm::commands::ResponseParser;
+    use narf_tpm::types::TpmRc;
+
+    let mut dev = FakeTpmDevice::crb();
+    let mut cmd_mem = alloc::vec![0u8; 4096];
+    let mut rsp_mem = alloc::vec![0u8; 4096];
+    let cmd_ptr = cmd_mem.as_mut_ptr();
+    let rsp_ptr = rsp_mem.as_mut_ptr();
+    dev.attach_buffers(cmd_ptr, 4096, rsp_ptr, 4096);
+    let dev = Arc::new(dev);
+    if tpm::crb_acquire_and_program(
+        dev.as_ref(),
+        cmd_ptr as u64,
+        4096,
+        rsp_ptr as u64,
+        4096,
+        narf_time::Deadline::after_ms(750),
+    )
+    .is_err()
+    {
+        return TestResult::Fail("CRB bring-up failed against the model");
+    }
+    let adapter: Arc<dyn TpmDevice> = Arc::new(ModelDevice {
+        dev: dev.clone(),
+        cmd_ptr,
+        rsp_ptr,
+        tis: false,
+    });
+    let submit = |req: &[u8]| submit_crb_sync(dev.as_ref(), cmd_ptr, rsp_ptr, req);
+
+    // (1) Before Startup the model rejects GetCapability with
+    // TPM_RC_INITIALIZE, like every other command.
+    let req = narf_tpm::tpm2::get_capability(
+        narf_tpm::tpm2::TPM_CAP_TPM_PROPERTIES,
+        narf_tpm::tpm2::TPM_PT_FAMILY_INDICATOR,
+        64,
+    );
+    let resp = match submit(&req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("pre-startup GetCapability submit failed at transport"),
+    };
+    match ResponseParser::new(&resp) {
+        Err(HighLevelTpmError::Rc(TpmRc::Initialize)) => {}
+        _ => return TestResult::Fail("pre-startup GetCapability not rejected with INITIALIZE"),
+    }
+
+    if narf_scheduler::block_on_spin(adapter.startup(narf_tpm::StartupType::Clear)).is_err() {
+        return TestResult::Fail("Startup(CLEAR) failed against the model");
+    }
+
+    // (2) The trait's query_info maps the model's property page.
+    match narf_scheduler::block_on_spin(adapter.query_info()) {
+        Ok(info)
+            if info.manufacturer == 0x4E41_5246
+                && info.version == 0x0001_0000
+                && info.spec_level == 159 => {}
+        _ => return TestResult::Fail("query_info did not map the model's identity"),
+    }
+
+    // (3) PCRS: the one implemented bank, all 24 PCRs, parsed by
+    // the canonical selection parser.
+    let req = narf_tpm::tpm2::get_capability(narf_tpm::tpm2::TPM_CAP_PCRS, 0, 1);
+    let resp = match submit(&req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("GetCapability(PCRS) submit failed at transport"),
+    };
+    let parser = match ResponseParser::new(&resp) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("GetCapability(PCRS) response not a success frame"),
+    };
+    match parser.parse_get_capability_pcr_selections() {
+        Ok((false, sels))
+            if sels.len() == 1
+                && sels[0].0 == narf_tpm::tpm2::TPM_ALG_SHA256
+                && sels[0].1 == alloc::vec![0xFF, 0xFF, 0xFF] => {}
+        _ => return TestResult::Fail("PCRS page != one SHA-256 bank with all PCRs"),
+    }
+
+    // (4) ALGS: SHA-256 only, TPMA_ALGORITHM.hash set. (No
+    // canonical parser for this page yet — raw body walk.)
+    let req = narf_tpm::tpm2::get_capability(narf_tpm::tpm2::TPM_CAP_ALGS, 0, 1);
+    let resp = match submit(&req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("GetCapability(ALGS) submit failed at transport"),
+    };
+    let body = match ResponseParser::new(&resp) {
+        Ok(p) => p.body().to_vec(),
+        Err(_) => return TestResult::Fail("GetCapability(ALGS) response not a success frame"),
+    };
+    // moreData(1) + cap(4) + count(4) + alg(2) + properties(4)
+    if body.len() != 15
+        || body[0] != 0
+        || u32::from_be_bytes([body[5], body[6], body[7], body[8]]) != 1
+        || u16::from_be_bytes([body[9], body[10]]) != narf_tpm::tpm2::TPM_ALG_SHA256
+        || u32::from_be_bytes([body[11], body[12], body[13], body[14]]) != 0x0000_0004
+    {
+        return TestResult::Fail("ALGS page != SHA-256 with the hash attribute");
+    }
+
+    // (5) COMMANDS: the TPML_CCA bitmap names exactly the six
+    // commands the model's core implements.
+    let req = narf_tpm::tpm2::get_capability(narf_tpm::tpm2::TPM_CAP_COMMANDS, 0, 0);
+    let resp = match submit(&req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("GetCapability(COMMANDS) submit failed at transport"),
+    };
+    let body = match ResponseParser::new(&resp) {
+        Ok(p) => p.body().to_vec(),
+        Err(_) => return TestResult::Fail("GetCapability(COMMANDS) response not a success frame"),
+    };
+    if body.len() < 9 {
+        return TestResult::Fail("COMMANDS page truncated");
+    }
+    let words = u32::from_be_bytes([body[5], body[6], body[7], body[8]]) as usize;
+    if body.len() != 9 + words * 4 {
+        return TestResult::Fail("COMMANDS page length disagrees with its word count");
+    }
+    let has = |cc: u32| -> bool {
+        let idx = (cc - 0x0000_011F) as usize;
+        let word = u32::from_be_bytes([
+            body[9 + (idx / 32) * 4],
+            body[10 + (idx / 32) * 4],
+            body[11 + (idx / 32) * 4],
+            body[12 + (idx / 32) * 4],
+        ]);
+        word & (1 << (idx % 32)) != 0
+    };
+    for cc in [
+        narf_tpm::tpm2::TPM_CC_STARTUP,
+        narf_tpm::tpm2::TPM_CC_SHUTDOWN,
+        narf_tpm::tpm2::TPM_CC_GET_CAPABILITY,
+        narf_tpm::tpm2::TPM_CC_GET_RANDOM,
+        narf_tpm::tpm2::TPM_CC_PCR_READ,
+        narf_tpm::tpm2::TPM_CC_PCR_EXTEND,
+    ] {
+        if !has(cc) {
+            return TestResult::Fail("COMMANDS bitmap missing an implemented command");
+        }
+    }
+    if has(0x0000_0153) {
+        // TPM_CC_Create — the model does not implement it.
+        return TestResult::Fail("COMMANDS bitmap claims TPM_CC_Create");
+    }
+
+    // (6) HANDLES: the model holds none.
+    let req = narf_tpm::tpm2::get_capability(narf_tpm::tpm2::TPM_CAP_HANDLES, 0, 0);
+    let resp = match submit(&req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("GetCapability(HANDLES) submit failed at transport"),
+    };
+    let body = match ResponseParser::new(&resp) {
+        Ok(p) => p.body().to_vec(),
+        Err(_) => return TestResult::Fail("GetCapability(HANDLES) response not a success frame"),
+    };
+    if body.len() != 9 || u32::from_be_bytes([body[5], body[6], body[7], body[8]]) != 0 {
+        return TestResult::Fail("HANDLES page not empty");
+    }
+
+    // (7) Property paging: a two-entry page from the first tag
+    // reports moreData; continuing from the next tag drains the
+    // table (ending at TPM_PT_PERMANENT in the variable group).
+    let req = narf_tpm::tpm2::get_capability(
+        narf_tpm::tpm2::TPM_CAP_TPM_PROPERTIES,
+        narf_tpm::tpm2::TPM_PT_FAMILY_INDICATOR,
+        2,
+    );
+    let resp = match submit(&req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("GetCapability paging submit failed at transport"),
+    };
+    let parser = match ResponseParser::new(&resp) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("GetCapability paging response not a success frame"),
+    };
+    let next_tag = match parser.parse_get_capability_properties() {
+        Ok((true, entries)) if entries.len() == 2 => entries[1].0 + 1,
+        _ => return TestResult::Fail("first property page != 2 entries with moreData"),
+    };
+    let req = narf_tpm::tpm2::get_capability(narf_tpm::tpm2::TPM_CAP_TPM_PROPERTIES, next_tag, 64);
+    let resp = match submit(&req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("GetCapability page-2 submit failed at transport"),
+    };
+    let parser = match ResponseParser::new(&resp) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("GetCapability page-2 response not a success frame"),
+    };
+    match parser.parse_get_capability_properties() {
+        Ok((false, entries))
+            if entries.last().map(|(t, _)| *t) == Some(narf_tpm::tpm2::TPM_PT_PERMANENT) => {}
+        _ => return TestResult::Fail("second property page does not drain at TPM_PT_PERMANENT"),
+    }
+
+    // (8) An unknown capability is TPM_RC_VALUE, not a framed lie.
+    let req = narf_tpm::tpm2::get_capability(0xFFFF_FFFF, 0, 1);
+    let resp = match submit(&req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("GetCapability(unknown) submit failed at transport"),
+    };
+    match ResponseParser::new(&resp) {
+        Err(HighLevelTpmError::Rc(TpmRc::Value)) => {}
+        _ => return TestResult::Fail("unknown capability not rejected with TPM_RC_VALUE"),
+    }
+
+    let _ = (cmd_mem, rsp_mem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-getcapability",
+    smoke_tpm_getcapability_conversation
+);
+
 /// Fixture-cleanup transport: installed into the sysfs bridge on
 /// fixture exit so the class attributes the publication registered
 /// stop pointing at this fixture's model device (whose command
@@ -1801,12 +2159,30 @@ fn smoke_tpm_userspace_publication_conversation() -> TestResult {
         if !pcrs.contains("PCR-04:") || !pcrs.contains(&want_hex) {
             return Err("pcrs does not show the /dev/tpm0 extend on PCR 4");
         }
-        // `owned`: the model does not implement GetCapability
-        // (#941 grows it), so the attribute reports its failure
-        // default. The bit semantics are pinned separately by the
-        // drivers/tpm fixture against a crafted response.
+        // `owned` is live since #941: the model serves
+        // TPM_PT_PERMANENT = 0 (no hierarchy auth is set), so the
+        // attribute reads a real property value. (Before #941 the
+        // model did not implement GetCapability and this assertion
+        // pinned the bridge's failure default instead; the bit
+        // semantics over nonzero values are pinned separately by
+        // the drivers/tpm fixture against a crafted response.)
         if tpm0.attr_show("owned").as_deref() != Some("0\n") {
-            return Err("owned != '0\\n' against the model (GetCapability unimplemented)");
+            return Err("owned != '0\\n' against the model");
+        }
+        // The remaining GetCapability-backed attributes read the
+        // model's identity live through the published surface:
+        // manufacturer "NARF", vendor string "NARF fixture TPM",
+        // spec revision 159 → "1.59".
+        if tpm0.attr_show("manufacturer").as_deref() != Some("NARF\n") {
+            return Err("manufacturer does not read the model's identity");
+        }
+        if tpm0.attr_show("description").as_deref() != Some("NARF fixture TPM\n") {
+            return Err("description does not concatenate the model's vendor strings");
+        }
+        match tpm0.attr_show("caps") {
+            Some(caps)
+                if caps.contains("manufacturer: NARF") && caps.contains("revision: 1.59") => {}
+            _ => return Err("caps does not report the model's identity"),
         }
         Ok(())
     };

@@ -4,7 +4,7 @@
 //! `FakeTpmTransport` that maintains virtual PCR banks, a small NV
 //! index store, and a sealed-object store bound to PCR policies.
 //!
-//! ## Smokes covered (13 total)
+//! ## Smokes covered (17 total)
 //!
 //! 1.  `TPM2_Startup(CLEAR)` → SUCCESS
 //! 2.  `TPM2_GetCapability(MANUFACTURER)` → 4-char "FAKE"
@@ -19,6 +19,12 @@
 //! 11. Re-extend PCR-7 → Unseal fails (TPM_RC_POLICY_FAIL)
 //! 12. FlushContext on DevTpmRm0 drop
 //! 13. DevTpm0 (raw) does not auto-flush on drop
+//! 14. (#941) Session lifecycle via the production builders:
+//!     StartAuthSession → PolicyPCR → FlushContext → PolicyPCR fails
+//! 15. (#941) TPM2_Clear resets PCRs and flushes created objects
+//! 16. (#941) CreatePrimary (storage template) + EvictControl
+//!     make-persistent / evict / unknown-handle rejection
+//! 17. (#941) GetCapability through the production parser
 //!
 //! ## Linux references
 //!
@@ -44,8 +50,10 @@ mod smokes {
     use narf_lib::sync::IrqSafeSpinLock;
 
     use crate::tpm2::{
-        TPM_CC_GET_CAPABILITY, TPM_CC_GET_RANDOM, TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_READ,
-        TPM_CC_NV_WRITE, TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_STARTUP, TPM_RC_SUCCESS,
+        TPM_CC_CLEAR, TPM_CC_CLEAR_CONTROL, TPM_CC_CREATE_PRIMARY, TPM_CC_EVICT_CONTROL,
+        TPM_CC_FLUSH_CONTEXT, TPM_CC_GET_CAPABILITY, TPM_CC_GET_RANDOM, TPM_CC_NV_DEFINE_SPACE,
+        TPM_CC_NV_READ, TPM_CC_NV_WRITE, TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_PCR,
+        TPM_CC_STARTUP, TPM_RC_SUCCESS,
     };
 
     // ─────────────────────────────────────────────────────────────────────
@@ -167,13 +175,16 @@ mod smokes {
     /// Session handle allocated by StartAuthSession.
     const FAKE_SESSION_HANDLE: u32 = 0x0200_0001;
 
-    // Additional command codes not exported by the tpm2 module as pub consts.
+    // Additional command codes kept local to the fake.
+    // (#941 note: this block previously defined TPM_CC_POLICY_PCR
+    // as 0x0000_017F — the wrong code; Part 2 §6.5.2 assigns
+    // PolicyPCR 0x0000_019F. The block was self-consistent, so the
+    // session smokes passed against a code silicon would not
+    // dispatch; the constants now come from the tpm2 module.)
     const TPM_CC_START_AUTH_SESSION: u32 = 0x0000_0176;
-    const TPM_CC_POLICY_PCR: u32 = 0x0000_017F;
     const TPM_CC_CREATE: u32 = 0x0000_0153;
     const TPM_CC_LOAD: u32 = 0x0000_0157;
     const TPM_CC_UNSEAL: u32 = 0x0000_015E;
-    const TPM_CC_FLUSH_CONTEXT: u32 = 0x0000_0165;
 
     struct SealedObject {
         /// Original (non-transient) object handle.
@@ -199,6 +210,10 @@ mod smokes {
         nv: Vec<(u32, Vec<u8>)>,
         /// Sealed objects keyed by original handle.
         sealed: Vec<SealedObject>,
+        /// Handles allocated by CreatePrimary (#941).
+        primaries: Vec<u32>,
+        /// Persistent mappings: (persistent_handle, object_handle).
+        persistent: Vec<(u32, u32)>,
         /// Active auth sessions.
         sessions: Vec<AuthSession>,
         /// Next original object handle to allocate.
@@ -211,6 +226,8 @@ mod smokes {
                 pcrs: [[0u8; 32]; 24],
                 nv: Vec::new(),
                 sealed: Vec::new(),
+                primaries: Vec::new(),
+                persistent: Vec::new(),
                 sessions: Vec::new(),
                 next_handle: 0x8000_0100, // distinct from transient range base
             }
@@ -625,6 +642,110 @@ mod smokes {
                     r[12..12 + secret.len()].copy_from_slice(&secret);
                     patch_size(&mut r);
                     Ok(r)
+                }
+
+                // ── TPM2_Clear (#941) ─────────────────────────────────────
+                //
+                // Flushes volatile state: PCRs reset, created objects
+                // and sessions dropped, persistent mappings removed.
+                // NV indices survive (Clear does not undefine them).
+                x if x == TPM_CC_CLEAR => {
+                    st.pcrs = [[0u8; 32]; 24];
+                    st.sealed.clear();
+                    st.primaries.clear();
+                    st.persistent.clear();
+                    st.sessions.clear();
+                    Ok(success_resp())
+                }
+
+                // ── TPM2_ClearControl (#941) ──────────────────────────────
+                x if x == TPM_CC_CLEAR_CONTROL => Ok(success_resp()),
+
+                // ── TPM2_CreatePrimary (#941) ─────────────────────────────
+                //
+                // Allocates a primary handle and answers with a
+                // spec-framed sessions response whose outPublic echoes
+                // the request's inPublic template (the fake derives no
+                // key material — the creation outputs are empty blobs).
+                x if x == TPM_CC_CREATE_PRIMARY => {
+                    // header(10) + primaryHandle(4) + authSize(4) + auth(9)
+                    if cmd.len() < 27 + 4 {
+                        return Err(());
+                    }
+                    let primary_handle = u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]);
+                    let auth_size =
+                        u32::from_be_bytes([cmd[14], cmd[15], cmd[16], cmd[17]]) as usize;
+                    let params = 18 + auth_size;
+                    if cmd.len() < params + 2 {
+                        return Err(());
+                    }
+                    // inSensitive TPM2B, then inPublic TPM2B.
+                    let sens_size = u16::from_be_bytes([cmd[params], cmd[params + 1]]) as usize;
+                    let pub_off = params + 2 + sens_size;
+                    if cmd.len() < pub_off + 2 {
+                        return Err(());
+                    }
+                    let pub_size = u16::from_be_bytes([cmd[pub_off], cmd[pub_off + 1]]) as usize;
+                    if cmd.len() < pub_off + 2 + pub_size {
+                        return Err(());
+                    }
+                    let in_public = cmd[pub_off + 2..pub_off + 2 + pub_size].to_vec();
+
+                    let handle = st.next_handle;
+                    st.next_handle += 1;
+                    st.primaries.push(handle);
+
+                    // Parameters: outPrivate(2+0) + outPublic(echo) +
+                    // creationData(2+0) + creationHash(2+0) +
+                    // ticket: TPM_ST_CREATION(2) + hierarchy(4) + digest(2+0).
+                    let mut body: Vec<u8> = Vec::new();
+                    body.extend_from_slice(&0u16.to_be_bytes()); // outPrivate
+                    body.extend_from_slice(&(in_public.len() as u16).to_be_bytes());
+                    body.extend_from_slice(&in_public);
+                    body.extend_from_slice(&0u16.to_be_bytes()); // creationData
+                    body.extend_from_slice(&0u16.to_be_bytes()); // creationHash
+                    body.extend_from_slice(&0x8021u16.to_be_bytes()); // TPM_ST_CREATION
+                    body.extend_from_slice(&primary_handle.to_be_bytes());
+                    body.extend_from_slice(&0u16.to_be_bytes()); // ticket digest
+
+                    let mut r: Vec<u8> = Vec::new();
+                    r.extend_from_slice(&[0x80u8, 0x02, 0, 0, 0, 0, 0, 0, 0, 0]); // SESSIONS header
+                    r.extend_from_slice(&handle.to_be_bytes());
+                    r.extend_from_slice(&(body.len() as u32).to_be_bytes()); // parameterSize
+                    r.extend_from_slice(&body);
+                    // Authorization area: nonce(2+0) + attrs(1) + hmac(2+0).
+                    r.extend_from_slice(&[0u8; 5]);
+                    patch_size(&mut r);
+                    Ok(r)
+                }
+
+                // ── TPM2_EvictControl (#941) ──────────────────────────────
+                //
+                // objectHandle naming an existing persistent handle
+                // evicts it; naming a known object (created, loaded,
+                // or primary) makes it persistent; anything else is
+                // TPM_RC_HANDLE.
+                x if x == TPM_CC_EVICT_CONTROL => {
+                    // header(10) + authHandle(4) + objectHandle(4) +
+                    // authSize(4) + auth(9) + persistentHandle(4)
+                    if cmd.len() < 35 {
+                        return Err(());
+                    }
+                    let object_handle = u32::from_be_bytes([cmd[14], cmd[15], cmd[16], cmd[17]]);
+                    let persistent_handle =
+                        u32::from_be_bytes([cmd[31], cmd[32], cmd[33], cmd[34]]);
+                    if let Some(pos) = st.persistent.iter().position(|(p, _)| *p == object_handle) {
+                        st.persistent.remove(pos);
+                        return Ok(success_resp());
+                    }
+                    let orig = object_handle & !0x8000_0000;
+                    let known = st.sealed.iter().any(|o| o.handle == orig)
+                        || st.primaries.contains(&object_handle);
+                    if !known {
+                        return Ok(failure_resp(0x018B)); // TPM_RC_HANDLE
+                    }
+                    st.persistent.push((persistent_handle, object_handle));
+                    Ok(success_resp())
                 }
 
                 // ── TPM2_FlushContext ─────────────────────────────────────
@@ -1392,4 +1513,195 @@ mod smokes {
         TestResult::Pass
     }
     kernel_test_in!("drivers/tpm/e2e", e2e_smoke_tpm0_no_auto_flush);
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Smoke 14 (#941): session lifecycle through the production
+    // builders + parsers — StartAuthSession → PolicyPCR → FlushContext
+    // ═════════════════════════════════════════════════════════════════════
+
+    fn e2e_smoke_session_lifecycle_production_builders() -> TestResult {
+        use crate::tpm2::commands as cmds;
+        let t = Arc::new(FakeTpmTransport::new());
+
+        let start = cmds::start_auth_session(
+            crate::tpm2::TPM_RH_NULL,
+            crate::tpm2::TPM_RH_NULL,
+            &[],
+            &[],
+            crate::tpm2::TPM_SE_POLICY,
+            crate::tpm2::TPM_ALG_SHA256,
+        );
+        let resp = t.submit(&start).unwrap_or_default();
+        let (session, _nonce) = match cmds::parse_start_auth_session_response(&resp) {
+            Ok(v) => v,
+            Err(_) => return TestResult::Fail("StartAuthSession response did not parse"),
+        };
+        if session != FAKE_SESSION_HANDLE {
+            return TestResult::Fail("session handle != the fake's allocated handle");
+        }
+
+        // PolicyPCR against PCR 7 with the production builder
+        // (command code 0x19F — see the const note at the fake).
+        let mut mask = [0u8; 3];
+        mask[0] = 1 << 7;
+        let policy = cmds::policy_pcr(session, &[], &[(crate::tpm2::TPM_ALG_SHA256, &mask)]);
+        let resp = t.submit(&policy).unwrap_or_default();
+        if rc(&resp) != TPM_RC_SUCCESS {
+            return TestResult::Fail("PolicyPCR with a live session failed");
+        }
+
+        // FlushContext through the production builder ends it.
+        let resp = t.submit(&cmds::flush_context(session)).unwrap_or_default();
+        if rc(&resp) != TPM_RC_SUCCESS {
+            return TestResult::Fail("FlushContext failed");
+        }
+        let resp = t.submit(&policy).unwrap_or_default();
+        if rc(&resp) == TPM_RC_SUCCESS {
+            return TestResult::Fail("PolicyPCR succeeded against a flushed session");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/tpm/e2e",
+        e2e_smoke_session_lifecycle_production_builders
+    );
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Smoke 15 (#941): TPM2_Clear resets PCRs and flushes objects
+    // ═════════════════════════════════════════════════════════════════════
+
+    fn e2e_smoke_clear_resets_state() -> TestResult {
+        use crate::tpm2::commands as cmds;
+        let t = Arc::new(FakeTpmTransport::new());
+
+        let d = [0x55u8; 32];
+        if t.submit(&crate::tpm2::commands::pcr_extend_sha256(7, &d))
+            .is_err()
+        {
+            return TestResult::Fail("PCR_Extend failed");
+        }
+        let secret = b"clear-semantics-fixture-secret!";
+        let create_resp = t
+            .submit(&create_sealed_cmd(secret, &[0u8; 32]))
+            .unwrap_or_default();
+        let private_blob = match parse_create_private(&create_resp) {
+            Some(b) => b,
+            None => return TestResult::Fail("could not parse Create response"),
+        };
+
+        let resp = t.submit(&cmds::clear()).unwrap_or_default();
+        if rc(&resp) != TPM_RC_SUCCESS {
+            return TestResult::Fail("TPM2_Clear returned non-SUCCESS");
+        }
+
+        // PCR 7 is back to zero…
+        let resp = t
+            .submit(&crate::tpm2::commands::pcr_read_single(7))
+            .unwrap_or_default();
+        match parse_pcr_digest(&resp) {
+            Some(dg) if dg == [0u8; 32] => {}
+            _ => return TestResult::Fail("PCR-7 not zero after Clear"),
+        }
+        // …and the object created before Clear no longer loads.
+        let load_resp = t
+            .submit(&load_sealed_cmd(crate::tpm2::TPM_RH_OWNER, &private_blob))
+            .unwrap_or_default();
+        if rc(&load_resp) == TPM_RC_SUCCESS {
+            return TestResult::Fail("object created before Clear still loads");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/e2e", e2e_smoke_clear_resets_state);
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Smoke 16 (#941): CreatePrimary + EvictControl, production surface
+    // ═════════════════════════════════════════════════════════════════════
+
+    fn e2e_smoke_create_primary_and_evict() -> TestResult {
+        use crate::tpm2::commands as cmds;
+        let t = Arc::new(FakeTpmTransport::new());
+
+        let resp = t
+            .submit(&cmds::create_primary_rsa_storage())
+            .unwrap_or_default();
+        let (handle, outputs) = match cmds::parse_create_primary_response(&resp) {
+            Ok(v) => v,
+            Err(_) => return TestResult::Fail("CreatePrimary response did not parse"),
+        };
+        if !(0x8000_0000..0xC000_0000).contains(&handle) {
+            return TestResult::Fail("primary handle outside the transient range");
+        }
+        // outPublic echoes the storage template the builder sent.
+        let want_public =
+            crate::tpm2::objects::rsa2048_template(crate::tpm2::objects::OBJ_ATTR_STORAGE);
+        if outputs.out_public != want_public {
+            return TestResult::Fail("CreatePrimary outPublic != the storage template");
+        }
+        if outputs.ticket_tag != 0x8021 {
+            return TestResult::Fail("creation ticket tag != TPM_ST_CREATION");
+        }
+
+        // Make it persistent, then evict it by its persistent
+        // handle; a bogus object handle is TPM_RC_HANDLE.
+        let resp = t
+            .submit(&cmds::evict_control(
+                crate::tpm2::TPM_RH_OWNER,
+                handle,
+                0x8100_0000,
+            ))
+            .unwrap_or_default();
+        if rc(&resp) != TPM_RC_SUCCESS {
+            return TestResult::Fail("EvictControl(make persistent) failed");
+        }
+        let resp = t
+            .submit(&cmds::evict_control(
+                crate::tpm2::TPM_RH_OWNER,
+                0x8100_0000,
+                0x8100_0000,
+            ))
+            .unwrap_or_default();
+        if rc(&resp) != TPM_RC_SUCCESS {
+            return TestResult::Fail("EvictControl(evict) failed");
+        }
+        let resp = t
+            .submit(&cmds::evict_control(
+                crate::tpm2::TPM_RH_OWNER,
+                0x8000_7777,
+                0x8100_0001,
+            ))
+            .unwrap_or_default();
+        if rc(&resp) == TPM_RC_SUCCESS {
+            return TestResult::Fail("EvictControl accepted an unknown object handle");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/e2e", e2e_smoke_create_primary_and_evict);
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Smoke 17 (#941): GetCapability through the production parser
+    // ═════════════════════════════════════════════════════════════════════
+
+    fn e2e_smoke_get_capability_production_parser() -> TestResult {
+        use crate::tpm2::commands as cmds;
+        let t = Arc::new(FakeTpmTransport::new());
+        let cmd = cmds::get_capability(crate::tpm2::TPM_CAP_TPM_PROPERTIES, 0x0000_0105, 1);
+        let resp = t.submit(&cmd).unwrap_or_default();
+        let parsed = match cmds::parse_get_capability_response(&resp) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("GetCapability response did not parse"),
+        };
+        if parsed.more_data || parsed.capability != crate::tpm2::TPM_CAP_TPM_PROPERTIES {
+            return TestResult::Fail("GetCapability envelope wrong");
+        }
+        match cmds::parse_tagged_properties(&parsed.data) {
+            Ok(entries) if entries.len() == 1 && entries[0] == (0x0000_0105, FAKE_MANUFACTURER) => {
+            }
+            _ => return TestResult::Fail("tagged properties != the fake's manufacturer"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/tpm/e2e",
+        e2e_smoke_get_capability_production_parser
+    );
 }

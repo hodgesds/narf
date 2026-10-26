@@ -38,7 +38,15 @@
 //! | `PT_VENDOR_STRING_2`    | `0x107`     | Vendor description part 2     |
 //! | `PT_VENDOR_STRING_3`    | `0x108`     | Vendor description part 3     |
 //! | `PT_VENDOR_STRING_4`    | `0x109`     | Vendor description part 4     |
-//! | `PT_PERMANENT`          | `0x10E`     | `TPMA_PERMANENT` flags        |
+//! | `PT_PERMANENT`          | `0x200`     | `TPMA_PERMANENT` flags        |
+//!
+//! Note (corrected in #941): `PT_PERMANENT` lives in the *variable*
+//! property group (Part 2 §6.12: PT_VAR = 0x200), not the fixed
+//! group. This bridge previously carried `0x10E` — which is
+//! `PT_HR_TRANSIENT_MIN` — so `owned` would have read the transient
+//! slot count's low bit on real silicon once GetCapability went
+//! live. The canonical tag set now lives in `narf_tpm::tpm2`
+//! (`TPM_PT_*`); the locals below are kept in step with it.
 
 extern crate alloc;
 
@@ -67,11 +75,13 @@ const PT_MANUFACTURER: u32 = 0x0000_0105;
 const PT_VENDOR_STRING_1: u32 = 0x0000_0106;
 /// `TPM_PT_VENDOR_STRING_4` — vendor description part 4.
 const PT_VENDOR_STRING_4: u32 = 0x0000_0109;
-/// `TPM_PT_PERMANENT` — TPMA_PERMANENT flags. Bit 0 = ownerAuthSet
+/// `TPM_PT_PERMANENT` — TPMA_PERMANENT flags, in the variable
+/// property group (Part 2 §6.12). Bit 0 = ownerAuthSet
 /// (Part 2 §10.11: `ownerAuthSet` is the first field of
 /// TPMA_PERMANENT; bit 1 is `endorsementAuthSet`, bit 2 is
-/// `lockoutAuthSet`).
-const PT_PERMANENT: u32 = 0x0000_010E;
+/// `lockoutAuthSet`). Corrected from 0x10E (PT_HR_TRANSIENT_MIN)
+/// in #941.
+const PT_PERMANENT: u32 = 0x0000_0200;
 
 // ── Response parsing helpers ──────────────────────────────────────────
 

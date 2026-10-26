@@ -319,7 +319,22 @@ pub struct Tpm {
     cmd_buf: Option<narf_io::DmaBuffer>,
     /// Host-owned CRB response buffer (CRB kind only).
     rsp_buf: Option<narf_io::DmaBuffer>,
+    /// Device identity, cached at probe time by `query_info`
+    /// (#941). Holds the unqueried defaults until `try_init_default`
+    /// replaces them with the TPM's own GetCapability answer; a
+    /// failed query leaves the defaults in place (identity is
+    /// diagnostic, not a liveness gate — see `set_info`).
+    info: IrqSafeSpinLock<TpmInfo>,
 }
+
+/// The identity `get_info` reports before the probe-time
+/// GetCapability query lands (#941): the values the pre-#941 stub
+/// returned, kept as the honest "not yet queried" default.
+const UNQUERIED_INFO: TpmInfo = TpmInfo {
+    manufacturer: 0,
+    version: 2,
+    spec_level: 159,
+};
 
 impl Tpm {
     /// Probe the TPM whose control area / locality window is at
@@ -357,6 +372,7 @@ impl Tpm {
                 regs_va: mapped.va(),
                 cmd_buf: None,
                 rsp_buf: None,
+                info: IrqSafeSpinLock::new(UNQUERIED_INFO),
             }),
             TpmKind::Crb => {
                 // Host-owned buffers, programmed into the chip by
@@ -383,6 +399,7 @@ impl Tpm {
                     regs_va: mapped.va(),
                     cmd_buf: Some(cmd_buf),
                     rsp_buf: Some(rsp_buf),
+                    info: IrqSafeSpinLock::new(UNQUERIED_INFO),
                 })
             }
         }
@@ -638,14 +655,22 @@ impl Tpm {
     }
 }
 
+impl Tpm {
+    /// Cache the identity `query_info` read from the device
+    /// (#941). Called by `try_init_default` on the probe success
+    /// path, before the device is registered, so `get_info`
+    /// answers with the TPM's own values from first visibility.
+    pub fn set_info(&self, info: TpmInfo) {
+        *self.info.lock() = info;
+    }
+}
+
 #[async_trait]
 impl TpmDevice for Tpm {
     fn get_info(&self) -> TpmInfo {
-        TpmInfo {
-            manufacturer: 0, // Should be read from hardware
-            version: 2,
-            spec_level: 159,
-        }
+        // The probe-time GetCapability answer (#941), or the
+        // unqueried defaults if the query failed at probe.
+        *self.info.lock()
     }
 
     async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, HighLevelTpmError> {
@@ -814,6 +839,24 @@ pub fn try_init_default() {
         // one the fixture seams use to drive these submit paths.
         match narf_scheduler::block_on_spin(dev.startup(narf_tpm::StartupType::Clear)) {
             Ok(()) => {
+                // Identity (#941): read the TPM's own
+                // manufacturer / firmware / spec revision via
+                // TPM2_GetCapability while the device is still
+                // unpublished, so `get_info` answers with real
+                // values from first visibility. A failed query is
+                // not fatal — the device works without its
+                // identity — so log it and keep the unqueried
+                // defaults rather than withholding a started TPM.
+                match narf_scheduler::block_on_spin(dev.query_info()) {
+                    Ok(info) => dev.set_info(info),
+                    Err(e) => {
+                        use core::fmt::Write as _;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "  tpm: TPM2_GetCapability failed ({e:?}); device info defaults retained"
+                        );
+                    }
+                }
                 narf_tpm::registry::register(dev.clone());
                 // Userspace publication (#940): the devfs/sysfs
                 // bridges, composed onto the same started device

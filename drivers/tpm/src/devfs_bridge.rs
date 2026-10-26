@@ -118,14 +118,12 @@ fn is_transient(handle: u32) -> bool {
 
 // ── Build TPM2_FlushContext command ───────────────────────────────────
 
-/// Build `TPM2_FlushContext(flushHandle)` — Part 3 §28.4.
-/// Command code 0x0165.
+/// Build `TPM2_FlushContext(flushHandle)` — Part 3 §11.4.
+/// Delegates to the command layer's builder (#941): this bridge
+/// previously kept a private copy of the frame; the encoding now
+/// exists exactly once, in `tpm2::commands`.
 fn flush_context_cmd(handle: u32) -> Vec<u8> {
-    use crate::tpm2::{begin_command, finalise, TPM_ST_NO_SESSIONS};
-    let mut buf = begin_command(TPM_ST_NO_SESSIONS, 0x0000_0165);
-    buf.extend_from_slice(&handle.to_be_bytes());
-    finalise(&mut buf);
-    buf
+    crate::tpm2::commands::flush_context(handle)
 }
 
 // ── Per-device state ─────────────────────────────────────────────────

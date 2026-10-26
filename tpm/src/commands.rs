@@ -167,6 +167,77 @@ impl<'a> ResponseParser<'a> {
         Ok(body[body.len() - 32..].to_vec())
     }
 
+    /// Parse a TPM2_GetCapability response for TPM_CAP_TPM_PROPERTIES.
+    ///
+    /// Returns `(more_data, entries)` — `more_data` set means the TPM
+    /// holds further properties past the last returned tag and the
+    /// caller may page by re-querying from tag+1. Each entry is a
+    /// `(TPM_PT tag, value)` pair in ascending tag order. The echoed
+    /// capability must be TPM_CAP_TPM_PROPERTIES; anything else is a
+    /// `BadResponse` (use `parse_get_capability_pcr_selections` for
+    /// TPM_CAP_PCRS instead).
+    pub fn parse_get_capability_properties(&self) -> Result<(bool, Vec<(u32, u32)>), TpmError> {
+        let body = self.body();
+        // moreData(1) + capability(4) + count(4) + count × (tag(4) + value(4))
+        if body.len() < 9 {
+            return Err(TpmError::BadResponse);
+        }
+        let more_data = body[0] != 0;
+        let capability = u32::from_be_bytes([body[1], body[2], body[3], body[4]]);
+        if capability != crate::tpm2::TPM_CAP_TPM_PROPERTIES {
+            return Err(TpmError::BadResponse);
+        }
+        let count = u32::from_be_bytes([body[5], body[6], body[7], body[8]]) as usize;
+        if body.len() < 9 + count * 8 {
+            return Err(TpmError::BadResponse);
+        }
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 9 + i * 8;
+            let tag = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+            let value =
+                u32::from_be_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
+            entries.push((tag, value));
+        }
+        Ok((more_data, entries))
+    }
+
+    /// Parse a TPM2_GetCapability response for TPM_CAP_PCRS.
+    ///
+    /// Returns `(more_data, selections)` where each selection is a
+    /// `(TPM_ALG_ID, pcrSelect bytes)` pair (TPML_PCR_SELECTION).
+    pub fn parse_get_capability_pcr_selections(
+        &self,
+    ) -> Result<(bool, Vec<(u16, Vec<u8>)>), TpmError> {
+        let body = self.body();
+        // moreData(1) + capability(4) + count(4) + count × TPMS_PCR_SELECTION
+        if body.len() < 9 {
+            return Err(TpmError::BadResponse);
+        }
+        let more_data = body[0] != 0;
+        let capability = u32::from_be_bytes([body[1], body[2], body[3], body[4]]);
+        if capability != crate::tpm2::TPM_CAP_PCRS {
+            return Err(TpmError::BadResponse);
+        }
+        let count = u32::from_be_bytes([body[5], body[6], body[7], body[8]]) as usize;
+        let mut selections = Vec::with_capacity(count);
+        let mut off = 9usize;
+        for _ in 0..count {
+            // algorithm(2) + sizeofSelect(1) + pcrSelect[sizeofSelect]
+            if body.len() < off + 3 {
+                return Err(TpmError::BadResponse);
+            }
+            let alg = u16::from_be_bytes([body[off], body[off + 1]]);
+            let size = body[off + 2] as usize;
+            if body.len() < off + 3 + size {
+                return Err(TpmError::BadResponse);
+            }
+            selections.push((alg, body[off + 3..off + 3 + size].to_vec()));
+            off += 3 + size;
+        }
+        Ok((more_data, selections))
+    }
+
     /// Parse TPM2_GetRandom response.
     pub fn parse_get_random(&self) -> Result<Vec<u8>, TpmError> {
         let body = self.body();
