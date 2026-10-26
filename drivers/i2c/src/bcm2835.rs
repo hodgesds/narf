@@ -62,6 +62,7 @@ const C_READ: u32 = 1 << 0;
 // S register bits.
 const S_CLKT: u32 = 1 << 9;
 const S_ERR: u32 = 1 << 8;
+#[allow(dead_code)] // S.RXF (RX FIFO full): part of the decoded S-register table; the drain loop polls RXD instead.
 const S_RXF: u32 = 1 << 7;
 const S_TXE: u32 = 1 << 6;
 const S_RXD: u32 = 1 << 5;
@@ -231,7 +232,7 @@ impl<I: BscIo> Bcm2835I2c<I> {
             core::hint::spin_loop();
         }
         // DONE: the final read bytes may still sit in the FIFO.
-        if let Some(rbuf) = read.as_deref_mut() {
+        if let Some(rbuf) = read {
             while rpos < rlen && io.read(REG_S) & S_RXD != 0 {
                 rbuf[rpos] = io.read(REG_FIFO) as u8;
                 rpos += 1;
