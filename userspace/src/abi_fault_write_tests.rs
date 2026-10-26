@@ -396,3 +396,49 @@ kernel_test_in!(
     "syscall_abi/fault_write/minix",
     smoke_minix_fault_then_write
 );
+
+/// Mount a 9p volume over the in-process loopback server, seeded
+/// with one file, `narf.txt`. The file's qid version is primed past
+/// 0 with a same-byte rewrite before the scenario opens it: a
+/// version-0 file reports no cache generation and stays out of the
+/// retained cache by design (#720), and the cacheable path is what
+/// this scenario exercises.
+fn ninep_volume() -> Result<Arc<narf_drivers_fs_9p::volume::NinepVolume>, &'static str> {
+    let seed = content(3 * PAGE as usize - 100);
+    let transport = narf_drivers_fs_9p::loopback::LoopbackTransport::new(&[("narf.txt", &seed)]);
+    let t: Arc<dyn narf_drivers_fs_9p::session::Transport> = transport;
+    let volume = crate::handlers::poll_io_to_completion(
+        narf_drivers_fs_9p::volume::NinepVolume::mount(t, narf_lib::id::DomainId::DRIVER_0),
+    )
+    .and_then(|r| r.ok())
+    .ok_or("mounting the loopback 9p volume failed")?;
+    let primer = crate::handlers::poll_io_to_completion(volume.root().lookup_async("narf.txt"))
+        .and_then(|r| r.ok())
+        .ok_or("priming lookup of narf.txt failed")?;
+    let n = crate::handlers::poll_io_to_completion(primer.write(0, &seed[..1]))
+        .and_then(|r| r.ok())
+        .ok_or("priming write failed")?;
+    if n != 1 {
+        return Err("priming write was short");
+    }
+    crate::handlers::poll_io_to_completion(primer.stat_async())
+        .and_then(|r| r.ok())
+        .ok_or("priming stat refresh failed")?;
+    Ok(volume)
+}
+
+fn ninep_open(
+    volume: &Arc<narf_drivers_fs_9p::volume::NinepVolume>,
+) -> Result<Arc<dyn FileOps>, &'static str> {
+    crate::handlers::poll_io_to_completion(volume.root().lookup_async("narf.txt"))
+        .and_then(|r| r.ok())
+        .ok_or("lookup of narf.txt failed")
+}
+
+/// The #724 sequence on 9p (#742): a client write bumps the server
+/// qid version, which moves the node's cache generation; the fold
+/// keeps the retained frame current across the two opens.
+fn smoke_9p_fault_then_write() -> TestResult {
+    with_two_opens(ninep_volume, ninep_open, scenario_fault_then_write)
+}
+kernel_test_in!("syscall_abi/fault_write/9p", smoke_9p_fault_then_write);
