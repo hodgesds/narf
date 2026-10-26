@@ -15,24 +15,92 @@
 //! }
 //! ```
 //!
-//! The pool is seeded once at boot from hardware entropy (`RDSEED` →
-//! `RDRAND` → TSC-fallback on x86_64; `RNDRRS` → `RNDR` → TSC-fallback
-//! on aarch64).  Reseeding occurs automatically after every
-//! `RESEED_THRESHOLD` bytes; on each reseed another 32 bytes of hardware
-//! entropy are mixed in via XOR into the key material.
+//! The pool is seeded from hardware entropy through `narf-crypto`'s
+//! entropy surface — the tree has exactly one entropy truth, and it is
+//! not probed privately here (issue #1026). Reseeding occurs
+//! automatically after every `RESEED_THRESHOLD` bytes; on each reseed
+//! another 32 bytes of hardware entropy are mixed in via XOR into the
+//! key material.
+//!
+//! # Seed discipline — the floor (issue #1026)
+//!
+//! This module used to gather its own entropy: RDSEED → RDRAND →
+//! cycle-counter TSC on x86_64, RNDRRS → RNDR → TSC on aarch64. The
+//! cycle-counter tail was a silent security downgrade: on a machine
+//! (or VM) without the RNG instructions, every userspace key — SSH/TLS
+//! keys, tokens, nonces — drew from a predictable source, with one
+//! warning log line as the only signal. The TSC gather is **deleted**;
+//! no path in this module can seed the pool from a timing counter.
+//!
+//! A seed is now drawn by a two-class ladder over `narf-crypto`:
+//!
+//! 1. **Seed-grade** — `narf_crypto::try_fill_key_material`: RDSEED on
+//!    x86_64, RNDR/RNDRRS on aarch64, every released byte covered by
+//!    the SP 800-90B health tests of issue #996, fail-closed. This is
+//!    the only class that can seed the pool when a seed-grade source
+//!    is present: if the key-material surface refuses (source starved
+//!    or health-latched off), the pool refuses too. The weaker adapter
+//!    is never consulted as a route around the health latch — on
+//!    aarch64 it draws the very same instructions.
+//! 2. **Conditioned** (x86_64 only) — when no seed-grade source exists
+//!    but RDRAND does, the pool seeds through the protocol adapter
+//!    `narf_crypto::try_fill_random_bytes`. RDRAND is a conditioned
+//!    DRBG output, not an entropy source (crypto specification §6),
+//!    and the crypto specification's own protocol adapter trusts it
+//!    for protocol secrets (§3.2); the pool accepts it as a degraded
+//!    class rather than bricking userspace randomness on RDRAND-only
+//!    hardware. The class is never silent: it is recorded in
+//!    [`seed_class`], announced on the kernel log when installed, and
+//!    printed by the boot console line.
+//!
+//! When neither class is available the pool **stays unseeded** and
+//! every cryptographic fill refuses (see "Blocking semantics"). A
+//! failed *reseed* is different: the pool keeps serving from its
+//! existing, properly seeded key — output never degrades — and the
+//! failure is counted (see `PoolState::reseed_failures`) and retried
+//! after a further slice of output.
 //!
 //! # Blocking semantics
 //!
-//! A `CSPRNG_SEEDED` atomic flag is set to `true` after the initial
-//! hardware-entropy seed.  `/dev/random` and `/dev/urandom` are
-//! **identical** post-5.18 Linux semantics: both deliver CSPRNG bytes;
-//! neither blocks once the pool is seeded.  Reads before seeding
-//! complete immediately (the seeding is synchronous during `init_csprng`).
+//! [`try_fill`] is the cryptographic fill. While the pool is unseeded
+//! it returns `Err(CsprngError::EntropyUnavailable)`, and the ABI
+//! consumers translate that to Linux's not-ready signal:
+//!
+//! - `getrandom(2)` returns `-EAGAIN`. Linux would park a blocking
+//!   call until the CRNG initialises and `-EAGAIN` only a
+//!   `GRND_NONBLOCK` one; NARF syscall handlers have no readiness
+//!   source to park on, so both take `-EAGAIN` (the same failure mode
+//!   the compat read paths use). `GRND_INSECURE` waives blocking, not
+//!   provenance: it is served from the seeded pool like any other
+//!   request and takes the same `-EAGAIN` while unseeded — there is
+//!   no partial-entropy pool state to honour it with. On any machine
+//!   with a hardware RNG the pool seeds at `Stage::Subsys` init, long
+//!   before userspace runs, so the refusal window is "hardware with
+//!   no RNG source", not "early boot".
+//! - `/dev/random` and `/dev/urandom` reads fail with
+//!   `FsError::WouldBlock` (`EAGAIN`), and `RNDGETENTCNT` plus
+//!   `/proc/sys/kernel/random/entropy_avail` report the real pool
+//!   state via [`entropy_avail_bits`] — 0 while unseeded — so
+//!   userspace can observe readiness instead of guessing.
+//!
+//! `/dev/random` and `/dev/urandom` are **identical** post-5.18 Linux
+//! semantics: both deliver CSPRNG bytes; neither blocks once the pool
+//! is seeded.
+//!
+//! The legacy infallible [`fill`] remains for in-kernel,
+//! non-cryptographic consumers whose contract cannot fail (the net
+//! stack's IP-ID hook is installed as a bare `fn(&mut [u8])`). On
+//! refusal it leaves the caller's buffer **unchanged** — visibly
+//! absent output rather than silently predictable output. It must
+//! never serve a cryptographic consumer; they all use [`try_fill`].
 //!
 //! # Thread safety
 //!
-//! The global pool is protected by an `IrqSafeSpinLock`.  Each `fill`
-//! call locks, generates bytes, and unlocks.  This is safe from IRQ
+//! The global pool is protected by an `IrqSafeSpinLock`. Each `fill`
+//! call locks, generates bytes, and unlocks. Entropy draws (which may
+//! spin in the RDSEED bounded-retry loop, and run the 90B startup
+//! test on first use) are performed with the pool lock **dropped**,
+//! exactly as the previous gather path did. This is safe from IRQ
 //! context because ChaCha20 is pure computation.
 //!
 //! # Linux refs
@@ -44,7 +112,7 @@
 //!
 //! GPL-2.0-or-later — NARF is GPL-2.0-or-later as of 2026-05-20.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -54,6 +122,13 @@ use narf_lib::sync::IrqSafeSpinLock;
 // NARF uses 1 MiB — conservative for an embedded/microkernel context where
 // boot sessions are short and hardware entropy is abundant.
 const RESEED_THRESHOLD: usize = 1024 * 1024; // 1 MiB
+
+/// After a failed reseed the pool keeps serving from its current key
+/// and does not retry until this much further output has been drawn —
+/// a starved or latched source must not turn every fill into a
+/// bounded-retry spin, but a transient failure must not brick
+/// reseeding for the rest of the boot either.
+const RESEED_RETRY_SLICE: usize = RESEED_THRESHOLD / 8;
 
 // ── ChaCha20 constants ───────────────────────────────────────────────────────
 
@@ -191,11 +266,13 @@ impl CsprngInner {
 
 // ── ChaCha20 block function ──────────────────────────────────────────────────
 //
-// Cleanroom implementation from RFC 8439.  This is intentionally a private
-// copy rather than a re-export from narf-crypto to avoid a circular crate
-// dependency between narf-filesystem and narf-crypto.  The algorithm is
-// identical to narf_crypto::chacha20::chacha20_block, verified by the same
-// RFC 8439 test vectors in Wave 31.
+// Cleanroom implementation from RFC 8439. This remains a private copy
+// rather than a re-export from narf-crypto: the pool is a persistent
+// key + monotonic-counter stream with XOR-mix reseeding — a different
+// state model from narf-crypto's fresh-seed-per-fill streams — and
+// coupling the pool's state semantics to that API would blur both.
+// The algorithm is identical to narf_crypto::chacha20::chacha20_block,
+// verified by the same RFC 8439 test vectors in Wave 31.
 //
 // Reference: https://datatracker.ietf.org/doc/html/rfc8439#section-2.3
 
@@ -213,15 +290,6 @@ fn qr(a: &mut u32, b: &mut u32, c: &mut u32, d: &mut u32) {
     *c = c.wrapping_add(*d);
     *b ^= *c;
     *b = b.rotate_left(7);
-}
-
-/// Test-only: return the pool to its factory state — all-zero state, seeded
-/// flag clear. Lets a case exercise the first-reader path regardless of what
-/// else in the shared kernel image already seeded it.
-#[doc(hidden)]
-pub fn __test_unseed() {
-    *POOL.lock() = CsprngInner::uninit();
-    CSPRNG_SEEDED.store(false, Ordering::Release);
 }
 
 fn chacha20_block(state: &[u32; 16], out: &mut [u8; 64]) {
@@ -284,195 +352,503 @@ fn chacha20_block(state: &[u32; 16], out: &mut [u8; 64]) {
     }
 }
 
+// ── Seed classes and the draw discipline ─────────────────────────────────────
+
+/// The class of entropy the pool was seeded from.
+///
+/// The class is part of the pool's observable state ([`seed_class`]):
+/// degradation is a fact userspace tooling and operators can query,
+/// never a silent property of the bytes served.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SeedClass {
+    /// Seeded from the seed-grade architectural source through
+    /// `narf_crypto::try_fill_key_material` — RDSEED on x86_64,
+    /// RNDR/RNDRRS on aarch64 — under the SP 800-90B health discipline
+    /// of issue #996. The only class permitted to seed key generation
+    /// anywhere in the tree.
+    SeedGrade,
+    /// x86_64 only: no seed-grade source exists, so the pool seeded
+    /// from RDRAND through the protocol adapter
+    /// `narf_crypto::try_fill_random_bytes`. RDRAND output is
+    /// conditioned (crypto specification §6), not raw entropy; the
+    /// class exists so RDRAND-only hardware still gets a real CSPRNG
+    /// instead of a predictable one, and it is announced — kernel log
+    /// at install, boot console line, and this queryable state — every
+    /// time. A `SeedGrade` pool can never become `Conditioned`, and a
+    /// `Conditioned` pool never claims to be `SeedGrade`.
+    Conditioned,
+}
+
+/// The pool could not produce bytes: it is unseeded and no seed could
+/// be drawn (no hardware source, or the source starved, or the 90B
+/// health tests latched it off). ABI consumers map this to `EAGAIN`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CsprngError {
+    /// No seed-grade or conditioned hardware entropy is available.
+    EntropyUnavailable,
+}
+
+/// Whether the seed-grade architectural source is present on this CPU:
+/// RDSEED on x86_64, the FEAT_RNG instructions (RNDR/RNDRRS) on
+/// aarch64. Probed from the same `narf-arch` feature surface the
+/// crypto crate's key-material path consults — presence only; the
+/// seed-grade *trust* decision (startup test, continuous health
+/// tests, latching) lives in `narf-crypto` and is not duplicated here.
+fn seed_grade_present() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: CPUID is legal at CPL=0 for any leaf, and unsupported
+        // leaves return zeros rather than faulting (the arch cpuid
+        // contract); this probe runs in kernel context only.
+        unsafe { narf_arch::x86_64::cpuid::Features::probe() }.rdseed
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        narf_arch::aarch64::rndr::supported()
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+/// Whether the conditioned architectural source is present. Only
+/// x86_64 has one distinct from its seed-grade source: RDRAND. On
+/// aarch64 the protocol adapter draws RNDR/RNDRRS themselves, so
+/// there is no separate conditioned class to fall back to.
+fn conditioned_present() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: as for `seed_grade_present` — CPUID at CPL=0, kernel
+        // context only.
+        unsafe { narf_arch::x86_64::cpuid::Features::probe() }.rdrand
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Draw one 32-byte seed under the class discipline.
+///
+/// - `current == Some(class)`: a reseed. The draw uses the SAME class
+///   the pool was seeded with — reseeds preserve class and can never
+///   downgrade (a seed-grade pool whose RDSEED latched off refuses
+///   the reseed rather than quietly continuing on RDRAND).
+/// - `current == None`: an initial seed. Seed-grade wins whenever it
+///   is present, and its refusal is terminal: when a seed-grade
+///   source exists but `try_fill_key_material` refuses (starved or
+///   health-latched), the conditioned draw is NOT consulted — on
+///   aarch64 it would draw the same latched instructions without the
+///   health tests, and on x86_64 routing around a latched-off RDSEED
+///   with RDRAND would defeat the latch. Only when no seed-grade
+///   source exists at all may the conditioned draw seed the pool.
+fn obtain_seed(
+    seed_grade_present: bool,
+    conditioned_present: bool,
+    current: Option<SeedClass>,
+    key_material: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
+    conditioned: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
+) -> Result<([u8; 32], SeedClass), CsprngError> {
+    let mut seed = [0u8; 32];
+    let class = match current {
+        Some(SeedClass::SeedGrade) => {
+            key_material(&mut seed).map_err(|_| CsprngError::EntropyUnavailable)?;
+            SeedClass::SeedGrade
+        }
+        Some(SeedClass::Conditioned) => {
+            conditioned(&mut seed).map_err(|_| CsprngError::EntropyUnavailable)?;
+            SeedClass::Conditioned
+        }
+        None => {
+            if seed_grade_present {
+                key_material(&mut seed).map_err(|_| CsprngError::EntropyUnavailable)?;
+                SeedClass::SeedGrade
+            } else if conditioned_present {
+                conditioned(&mut seed).map_err(|_| CsprngError::EntropyUnavailable)?;
+                SeedClass::Conditioned
+            } else {
+                return Err(CsprngError::EntropyUnavailable);
+            }
+        }
+    };
+    Ok((seed, class))
+}
+
+/// Best-effort wipe of a local seed buffer once it has been installed
+/// into the pool (volatile writes so the compiler cannot elide them).
+fn wipe(seed: &mut [u8; 32]) {
+    for byte in seed.iter_mut() {
+        // SAFETY: `byte` points into the caller's live `[u8; 32]`
+        // array; a volatile byte write to it is valid and cannot
+        // race (the array is stack-local to the seed path).
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+// ── Pool state ───────────────────────────────────────────────────────────────
+
+/// The userspace CSPRNG pool: the ChaCha20 stream plus the seed-class
+/// bookkeeping the floor discipline needs.
+struct PoolState {
+    inner: CsprngInner,
+    /// Class of the installed seed; `None` while the pool has never
+    /// been seeded this boot.
+    class: Option<SeedClass>,
+    /// Reseed draws that failed since the last successful (re)seed.
+    /// Non-zero means "serving from an older key than the reseed
+    /// schedule wants" — counted, never silent (the first failure is
+    /// also kernel-logged).
+    reseed_failures: u32,
+    /// `inner.bytes_since_reseed` value at which a failed reseed may
+    /// be retried.
+    reseed_blocked_until: usize,
+}
+
+impl PoolState {
+    const fn uninit() -> Self {
+        Self {
+            inner: CsprngInner::uninit(),
+            class: None,
+            reseed_failures: 0,
+            reseed_blocked_until: 0,
+        }
+    }
+
+    /// A reseed is due when the byte threshold is reached and a
+    /// previously failed attempt's retry slice has elapsed.
+    fn reseed_due(&self) -> bool {
+        self.inner.needs_reseed() && self.inner.bytes_since_reseed >= self.reseed_blocked_until
+    }
+
+    /// Install a freshly drawn seed (initial seed or reseed mix).
+    fn install(&mut self, seed: &[u8; 32], class: SeedClass) {
+        self.inner.seed(seed);
+        self.class = Some(class);
+        self.reseed_failures = 0;
+        self.reseed_blocked_until = 0;
+    }
+
+    /// Record a failed reseed draw against a live pool: the pool
+    /// keeps serving from its existing key, and the next attempt is
+    /// deferred by one retry slice.
+    fn note_reseed_failure(&mut self) {
+        self.reseed_failures = self.reseed_failures.saturating_add(1);
+        self.reseed_blocked_until = self
+            .inner
+            .bytes_since_reseed
+            .saturating_add(RESEED_RETRY_SLICE);
+    }
+}
+
+/// Seed (or reseed) a pool from scripted draws — the deterministic
+/// seam the source-selection fixtures drive. Returns the pool's class
+/// after the attempt. A failed draw against an already-seeded pool is
+/// NOT an error: the pool keeps its class and its key, the failure is
+/// counted, and `Ok(class)` reports that the pool remains serviceable.
+/// A failed draw against an unseeded pool is `Err`.
+fn seed_pool(
+    state: &mut PoolState,
+    seed_grade_present: bool,
+    conditioned_present: bool,
+    key_material: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
+    conditioned: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
+) -> Result<SeedClass, CsprngError> {
+    match obtain_seed(
+        seed_grade_present,
+        conditioned_present,
+        state.class,
+        key_material,
+        conditioned,
+    ) {
+        Ok((mut seed, class)) => {
+            state.install(&seed, class);
+            wipe(&mut seed);
+            Ok(class)
+        }
+        Err(e) => match state.class {
+            Some(class) => {
+                state.note_reseed_failure();
+                Ok(class)
+            }
+            None => Err(e),
+        },
+    }
+}
+
+/// Fill `buf` from a pool, seeding/reseeding from scripted draws as
+/// needed. Mirrors the global [`try_fill`] discipline exactly.
+fn fill_pool(
+    state: &mut PoolState,
+    seed_grade_present: bool,
+    conditioned_present: bool,
+    key_material: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
+    conditioned: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
+    buf: &mut [u8],
+) -> Result<(), CsprngError> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    if state.class.is_none() || state.reseed_due() {
+        seed_pool(
+            state,
+            seed_grade_present,
+            conditioned_present,
+            key_material,
+            conditioned,
+        )?;
+    }
+    state.inner.fill(buf);
+    Ok(())
+}
+
 // ── Global pool ──────────────────────────────────────────────────────────────
 
-static POOL: IrqSafeSpinLock<CsprngInner> = IrqSafeSpinLock::new(CsprngInner::uninit());
+static POOL: IrqSafeSpinLock<PoolState> = IrqSafeSpinLock::new(PoolState::uninit());
 
-/// Set to `true` once the pool has been seeded from hardware entropy.
+/// `true` after the pool's first seed; part of filesystem's public
+/// contract (kernel-test assertions read it directly). The pool never
+/// un-seeds: once set, the flag stays set for the boot.
 pub static CSPRNG_SEEDED: AtomicBool = AtomicBool::new(false);
 
-// ── Public API ───────────────────────────────────────────────────────────────
+/// Encoding of the pool's [`SeedClass`] for lock-free readers:
+/// 0 = unseeded, 1 = seed-grade, 2 = conditioned.
+static SEED_CLASS_CODE: AtomicU8 = AtomicU8::new(0);
 
-/// Seed the global CSPRNG from hardware entropy.
-///
-/// Must be called once during kernel init (before any `/dev/random` read).
-/// Safe to call multiple times — subsequent calls reseed the pool.
-///
-/// On x86_64: attempts RDSEED, falls back to RDRAND, then TSC.
-/// On aarch64: attempts RNDRRS, falls back to RNDR, then TSC.
-/// On other arches: TSC-based fallback (weak; logs a warning).
-pub fn init_csprng() {
-    let entropy = gather_entropy();
-    POOL.lock().seed(&entropy);
-    CSPRNG_SEEDED.store(true, Ordering::Release);
-}
+/// One-shot guard for the unseeded-refusal kernel-log line: the
+/// refusal is logged once per boot (plus once after each successful
+/// seed that a later latch could follow), not once per failed fill.
+static REFUSAL_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Fill `buf` with CSPRNG bytes.
-///
-/// Thread-safe; safe from IRQ context.  If the pool needs a reseed
-/// (bytes_since_reseed ≥ 1 MiB), pulls new hardware entropy and mixes
-/// it in before returning output.
-///
-/// Seeds on demand if the pool has never been seeded, so a caller can
-/// never be served the unseeded keystream. That is not belt-and-braces:
-/// `CsprngInner::uninit()` is an ALL-ZERO key and nonce, so an unseeded
-/// pool emits ChaCha20 under a key every reader can compute — the same
-/// bytes on every boot of every machine — and `needs_reseed()` would not
-/// correct it until 1 MiB had been drawn. `init_csprng` had no caller
-/// outside tests, so that is exactly what `/dev/random` and
-/// `/dev/urandom` served. The seeded flag existed but nothing consulted
-/// it; checking it here is what makes the guarantee hold regardless of
-/// whether boot remembered to call `init_csprng`.
-pub fn fill(buf: &mut [u8]) {
-    if !CSPRNG_SEEDED.load(Ordering::Acquire) {
-        // gather_entropy() may take the RDSEED retry loop, so it must run
-        // with the pool lock DROPPED, exactly as the reseed path below does.
-        let entropy = gather_entropy();
-        let mut pool = POOL.lock();
-        // Re-check under the lock: a racing caller may have seeded while we
-        // were gathering. Seeding twice is harmless (`seed` mixes rather than
-        // replaces after the first), but the flag store should be monotonic.
-        pool.seed(&entropy);
-        CSPRNG_SEEDED.store(true, Ordering::Release);
-        drop(pool);
-    }
-    // Trigger reseed if needed, then fill.
-    let mut pool = POOL.lock();
-    if pool.needs_reseed() {
-        // Drop the lock while gathering entropy so IRQs aren't held off
-        // for the RDSEED retry loop.  Re-acquire for the seed() call.
-        drop(pool);
-        let entropy = gather_entropy();
-        POOL.lock().seed(&entropy);
-        pool = POOL.lock();
-    }
-    pool.fill(buf);
-}
+/// One-shot guard for the reseed-failure kernel-log line.
+static RESEED_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Gather 32 bytes of hardware entropy using the platform's best available
-/// source.  Returns the bytes and the source used (for diagnostic purposes).
-pub fn gather_entropy() -> [u8; 32] {
-    let mut buf = [0u8; 32];
-    gather_entropy_into(&mut buf);
-    buf
-}
+// ── Entropy source tracking ──────────────────────────────────────────────────
 
-/// Hardware entropy source used on the last `gather_entropy` call.
-///
-/// Used by diagnostic smokes to verify the probe path.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// Which hardware entropy instruction the pool's seed class draws
+/// from — retained for boot diagnostics and kernel tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntropySource {
     /// x86_64 RDSEED instruction.
     Rdseed,
-    /// x86_64 RDRAND instruction (CSPRNG output from CPU's pool).
+    /// x86_64 RDRAND instruction.
     Rdrand,
-    /// aarch64 RNDRRS instruction (reseed-quality entropy).
+    /// aarch64 FEAT_RNG RNDRRS instruction.
     Rndrrs,
-    /// aarch64 RNDR instruction.
+    /// aarch64 FEAT_RNG RNDR instruction.
     Rndr,
-    /// TSC + diversity constant (weak fallback).
-    TscFallback,
 }
 
-/// Last entropy source used.  Written by `gather_entropy_into`; readable
-/// from smokes via `last_entropy_source()`.
-static LAST_SOURCE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(255);
+/// Atomic encoding of the last entropy source used (255 = none yet).
+static LAST_SOURCE: AtomicU8 = AtomicU8::new(255);
 
-/// Return the `EntropySource` used by the most recent `gather_entropy` call.
-/// Returns `None` if `gather_entropy` has never been called.
-pub fn last_entropy_source() -> Option<EntropySource> {
-    match LAST_SOURCE.load(Ordering::Relaxed) {
-        0 => Some(EntropySource::Rdseed),
-        1 => Some(EntropySource::Rdrand),
-        2 => Some(EntropySource::Rndrrs),
-        3 => Some(EntropySource::Rndr),
-        4 => Some(EntropySource::TscFallback),
-        _ => None,
+/// The instruction a seed class draws on this architecture. The
+/// crypto surface deliberately does not say WHICH of RNDR/RNDRRS a
+/// draw used, so the seed-grade class records `Rndrrs` on aarch64 —
+/// the reseeding variant #996 prefers — as representative.
+fn source_of(class: SeedClass) -> EntropySource {
+    match class {
+        SeedClass::SeedGrade => {
+            if cfg!(target_arch = "x86_64") {
+                EntropySource::Rdseed
+            } else {
+                EntropySource::Rndrrs
+            }
+        }
+        SeedClass::Conditioned => EntropySource::Rdrand,
     }
 }
 
-fn record_source(s: EntropySource) {
-    let v = match s {
+fn record_source(src: EntropySource) {
+    let val: u8 = match src {
         EntropySource::Rdseed => 0,
         EntropySource::Rdrand => 1,
         EntropySource::Rndrrs => 2,
         EntropySource::Rndr => 3,
-        EntropySource::TscFallback => 4,
     };
-    LAST_SOURCE.store(v, Ordering::Relaxed);
+    LAST_SOURCE.store(val, Ordering::Release);
 }
 
-#[cfg(target_arch = "x86_64")]
-fn gather_entropy_into(buf: &mut [u8; 32]) {
-    use narf_arch::x86_64::hwrng::{fill_key_32, HwRngSource};
-    let src = fill_key_32(buf);
-    record_source(match src {
-        HwRngSource::Rdseed => EntropySource::Rdseed,
-        HwRngSource::Rdrand => EntropySource::Rdrand,
-        HwRngSource::TscFallback => EntropySource::TscFallback,
-    });
+/// The entropy source the pool's seed came from, or `None` if the
+/// pool has not been seeded yet this boot.
+pub fn last_entropy_source() -> Option<EntropySource> {
+    match LAST_SOURCE.load(Ordering::Acquire) {
+        0 => Some(EntropySource::Rdseed),
+        1 => Some(EntropySource::Rdrand),
+        2 => Some(EntropySource::Rndrrs),
+        3 => Some(EntropySource::Rndr),
+        _ => None,
+    }
 }
 
-#[cfg(target_arch = "aarch64")]
-fn gather_entropy_into(buf: &mut [u8; 32]) {
-    use narf_arch::aarch64::rndr;
-    // Try RNDRRS first (reseed-grade), then RNDR.
-    if rndr::supported() {
-        let mut ok = true;
-        for i in 0..4usize {
-            match rndr::try_rndrrs() {
-                Some(v) => buf[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes()),
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/// Whether the pool has been seeded this boot.
+pub fn is_seeded() -> bool {
+    CSPRNG_SEEDED.load(Ordering::Acquire)
+}
+
+/// The class of the pool's seed, or `None` while unseeded. This is
+/// the userspace-observable distinction the #1026 floor requires:
+/// degraded service is a queryable fact, not a silent property.
+pub fn seed_class() -> Option<SeedClass> {
+    match SEED_CLASS_CODE.load(Ordering::Acquire) {
+        1 => Some(SeedClass::SeedGrade),
+        2 => Some(SeedClass::Conditioned),
+        _ => None,
+    }
+}
+
+/// Bits of entropy userspace readiness queries report
+/// (`RNDGETENTCNT`, `/proc/sys/kernel/random/entropy_avail`): the
+/// full 4096-bit pool size once seeded, 0 while unseeded — the real
+/// pool state, replacing the constants those interfaces used to
+/// fabricate.
+pub fn entropy_avail_bits() -> u32 {
+    if is_seeded() {
+        4096
+    } else {
+        0
+    }
+}
+
+fn log_refusal_once() {
+    if !REFUSAL_LOGGED.swap(true, Ordering::AcqRel) {
+        narf_console::klog::record(
+            "csprng: no usable hardware entropy source - pool NOT seeded; \
+             getrandom(2) and /dev/random reads will fail EAGAIN (#1026)",
+        );
+    }
+}
+
+fn log_reseed_failure_once() {
+    if !RESEED_FAILURE_LOGGED.swap(true, Ordering::AcqRel) {
+        narf_console::klog::record(
+            "csprng: entropy reseed draw failed - continuing on the existing \
+             pool key (#1026)",
+        );
+    }
+}
+
+/// Publish a successfully installed seed class to the lock-free
+/// observers, announcing a first-time conditioned (degraded) seed on
+/// the kernel log.
+fn publish_class(class: SeedClass) {
+    let code = match class {
+        SeedClass::SeedGrade => 1,
+        SeedClass::Conditioned => 2,
+    };
+    let previous = SEED_CLASS_CODE.swap(code, Ordering::AcqRel);
+    CSPRNG_SEEDED.store(true, Ordering::Release);
+    record_source(source_of(class));
+    if class == SeedClass::Conditioned && previous == 0 {
+        narf_console::klog::record(
+            "csprng: WARNING - no seed-grade entropy source; pool seeded from \
+             RDRAND conditioned output (DEGRADED class, #1026)",
+        );
+    }
+}
+
+/// One seed attempt against the global pool, drawing through
+/// `narf-crypto` with the pool lock dropped (the draw may spin in the
+/// RDSEED bounded-retry loop and runs the 90B startup test on first
+/// use). Mirrors [`seed_pool`]'s discipline: `Err` only when the pool
+/// is unseeded and unseedable.
+fn global_seed_attempt() -> Result<SeedClass, CsprngError> {
+    let current = POOL.lock().class;
+    let mut key_material = |buf: &mut [u8; 32]| narf_crypto::try_fill_key_material(buf);
+    let mut conditioned = |buf: &mut [u8; 32]| narf_crypto::try_fill_random_bytes(buf);
+    match obtain_seed(
+        seed_grade_present(),
+        conditioned_present(),
+        current,
+        &mut key_material,
+        &mut conditioned,
+    ) {
+        Ok((mut seed, class)) => {
+            POOL.lock().install(&seed, class);
+            wipe(&mut seed);
+            publish_class(class);
+            Ok(class)
+        }
+        Err(e) => {
+            let mut pool = POOL.lock();
+            match pool.class {
+                Some(class) => {
+                    pool.note_reseed_failure();
+                    drop(pool);
+                    log_reseed_failure_once();
+                    Ok(class)
+                }
                 None => {
-                    ok = false;
-                    break;
+                    drop(pool);
+                    log_refusal_once();
+                    Err(e)
                 }
             }
         }
-        if ok {
-            record_source(EntropySource::Rndrrs);
-            return;
-        }
-        // Retry with RNDR.
-        let mut ok2 = true;
-        for i in 0..4usize {
-            match rndr::try_rndr() {
-                Some(v) => buf[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes()),
-                None => {
-                    ok2 = false;
-                    break;
-                }
-            }
-        }
-        if ok2 {
-            record_source(EntropySource::Rndr);
-            return;
-        }
-    }
-    tsc_fallback_into(buf);
-    record_source(EntropySource::TscFallback);
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn gather_entropy_into(buf: &mut [u8; 32]) {
-    tsc_fallback_into(buf);
-    record_source(EntropySource::TscFallback);
-}
-
-/// Cross-arch TSC/cycle-counter fallback.
-// Used on x86_64 (RDSEED/RDRAND path calls this as last resort), on aarch64
-// (RNDR path), and on all other arches.  The `dead_code` warning fires on
-// x86_64 because the #[cfg] branches mean the cfg=aarch64 definition is
-// never reached in an x86_64 build — suppress it.
-#[allow(dead_code)]
-fn tsc_fallback_into(buf: &mut [u8; 32]) {
-    let t0 = narf_time::now_cycles();
-    let t1 = narf_time::now_cycles().wrapping_add(0xDEAD_BEEF_CAFE_1234);
-    const WEYL: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut s = t0 ^ t1;
-    for i in 0..4usize {
-        s = s.wrapping_add(WEYL);
-        s = s.wrapping_mul(0x6C62_272E_07BB_0142);
-        s ^= s >> 30;
-        buf[i * 8..(i + 1) * 8].copy_from_slice(&s.to_le_bytes());
     }
 }
+
+/// Attempt to (re-)seed the pool, called once per boot from
+/// `frame`'s Stage::Subsys initcall and again by kernel tests.
+///
+/// The outcome is observable via [`seed_class`] /
+/// [`last_entropy_source`] and is announced by the seed path itself
+/// (kernel log + the boot console line): on entropy-less hardware the
+/// pool stays unseeded and fills refuse with `EAGAIN` semantics
+/// rather than serving predictable bytes.
+pub fn init_csprng() {
+    let _ = global_seed_attempt();
+}
+
+/// Seed the pool (synchronously) if it is not already seeded, then
+/// fill `buf` with CSPRNG bytes.
+///
+/// This is the ONLY fill cryptographic consumers may use:
+/// `getrandom(2)`, `/dev/random`, `/dev/urandom`, and the ELF
+/// `AT_RANDOM` aux vector. Returns
+/// `Err(CsprngError::EntropyUnavailable)` — writing nothing — while
+/// the pool is unseeded. See the module docs for the seed-class
+/// discipline and the per-ABI refusal mapping.
+pub fn try_fill(buf: &mut [u8]) -> Result<(), CsprngError> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    if !is_seeded() || POOL.lock().reseed_due() {
+        global_seed_attempt()?;
+    }
+    POOL.lock().inner.fill(buf);
+    Ok(())
+}
+
+/// Fill `buf` with CSPRNG bytes, for in-kernel **non-cryptographic**
+/// consumers whose contract cannot fail — today the net stack's IP-ID
+/// random hook, installed as a bare `fn(&mut [u8])`.
+///
+/// If the pool is unseeded and cannot be seeded, `buf` is left
+/// **unchanged** (the refusal itself is kernel-logged once by the
+/// seed path). Callers that need bytes with any provenance guarantee
+/// must use [`try_fill`] and handle its refusal.
+pub fn fill(buf: &mut [u8]) {
+    let _ = try_fill(buf);
+}
+
+/// Reset the pool to the un-seeded state — test support only, used by
+/// the kernel-test end-to-end smokes to exercise the seed-on-demand
+/// and refusal paths from a known state.
+#[doc(hidden)]
+pub fn __test_unseed() {
+    *POOL.lock() = PoolState::uninit();
+    CSPRNG_SEEDED.store(false, Ordering::Release);
+    SEED_CLASS_CODE.store(0, Ordering::Release);
+    LAST_SOURCE.store(255, Ordering::Release);
+    REFUSAL_LOGGED.store(false, Ordering::Release);
+    RESEED_FAILURE_LOGGED.store(false, Ordering::Release);
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[path = "csprng_tests.rs"]
+mod tests;

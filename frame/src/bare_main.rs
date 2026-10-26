@@ -3304,17 +3304,38 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             }
 
             // Seed the ChaCha20 CSPRNG that backs /dev/random, /dev/urandom
-            // and getrandom(2). `csprng::fill` seeds on demand so nothing can
-            // be served the unseeded keystream, but doing it here pins WHEN it
-            // happens: once, early, off the first reader's latency, and before
-            // anything that draws entropy runs. `devfs`'s doc has always said
-            // "the pool is always seeded synchronously during kernel init" —
-            // until now nothing outside the tests called `init_csprng`, so an
-            // all-zero key and nonce is what a real boot actually used.
+            // and getrandom(2). `csprng::try_fill` seeds on demand so nothing
+            // can be served the unseeded keystream, but doing it here pins
+            // WHEN it happens: once, early, off the first reader's latency,
+            // and before anything that draws entropy runs. Since #1026 the
+            // seed can REFUSE — hardware with no RNG source leaves the pool
+            // unseeded and its consumers take EAGAIN — so the console line
+            // reports the pool's actual state and seed class rather than
+            // claiming a seed that may not have happened.
             narf_init::register(narf_init::Stage::Subsys, "csprng-seed", || {
                 narf_filesystem::csprng::init_csprng();
-                let src = narf_filesystem::csprng::last_entropy_source();
-                let _ = writeln!(console::Writer, "  csprng: seeded (source: {:?})", src);
+                match narf_filesystem::csprng::seed_class() {
+                    Some(narf_filesystem::csprng::SeedClass::SeedGrade) => {
+                        let src = narf_filesystem::csprng::last_entropy_source();
+                        let _ = writeln!(
+                            console::Writer,
+                            "  csprng: seeded (seed-grade, source: {:?})",
+                            src
+                        );
+                    }
+                    Some(narf_filesystem::csprng::SeedClass::Conditioned) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  csprng: seeded DEGRADED (RDRAND conditioned output; no seed-grade source)"
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  csprng: NOT SEEDED (no hardware entropy source; getrandom and /dev/random will fail EAGAIN)"
+                        );
+                    }
+                }
                 narf_init::InitResult::Ok
             });
 

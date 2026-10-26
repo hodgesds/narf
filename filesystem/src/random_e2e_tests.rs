@@ -3,10 +3,19 @@
 //! ## CSPRNG implementation
 //!
 //! NARF's `/dev/random` and `/dev/urandom` are backed by a ChaCha20-based
-//! CSPRNG (`filesystem/src/csprng.rs`) seeded from hardware entropy:
+//! CSPRNG (`filesystem/src/csprng.rs`) seeded from hardware entropy
+//! through `narf-crypto`'s fail-closed surface (#996):
 //!
-//! - x86_64: RDSEED (preferred) → RDRAND (fallback) → TSC (last resort)
-//! - aarch64: RNDRRS (preferred) → RNDR (fallback) → TSC (last resort)
+//! - Seed-grade source present (RDSEED on x86_64, RNDR/RNDRRS on
+//!   aarch64): the pool seeds from `try_fill_key_material` under the
+//!   SP 800-90B health discipline.
+//! - x86_64 with RDRAND but no RDSEED: the pool seeds at the labelled
+//!   Conditioned class via the protocol adapter.
+//! - No hardware source: the pool never seeds and every cryptographic
+//!   consumer refuses with EAGAIN semantics (#1026). There is no
+//!   cycle-counter rung — the old TSC fallback is deleted. The
+//!   deterministic source-selection matrix lives in
+//!   `filesystem/src/csprng_tests.rs`.
 //!
 //! Both `/dev/random` and `/dev/urandom` use the same pool.  Post-Linux-5.18
 //! semantics: neither blocks once seeded; both deliver identical CSPRNG bytes.
@@ -605,13 +614,15 @@ fn smoke_rand_concurrent_readers() -> TestResult {
 kernel_test_in!("filesystem/random_e2e", smoke_rand_concurrent_readers);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Smoke 16 — Hardware-entropy probe: entropy source is detected
+// Smoke 16 — Hardware-entropy probe: the recorded source matches the pool
 //
-// After init_csprng(), `csprng::last_entropy_source()` must return Some(...)
-// with the source that was used.  On x86_64 with RDSEED/RDRAND (Zen2+,
-// Phoenix), it must be `Rdseed` or `Rdrand`.  On QEMU TCG without HW RNG
-// the source will be `TscFallback`.  We accept any non-None result since the
-// test must pass on all supported targets including QEMU.
+// After init_csprng(), the pool's observable state must be consistent:
+// on a machine with a hardware entropy source the pool is seeded at a
+// recorded class with a recorded source; on entropy-less hardware the
+// pool is unseeded, records NO source, and reports one only after a
+// seed actually happened (#1026 — the pre-floor version of this smoke
+// accepted a `TscFallback` source here, i.e. it pinned the silent
+// degradation this issue removes).
 //
 // x86_64 RDSEED presence is confirmed by CPUID leaf 7 EBX[18] (see
 // narf_arch::x86_64::cpuid::Features::rdseed).
@@ -622,13 +633,14 @@ kernel_test_in!("filesystem/random_e2e", smoke_rand_concurrent_readers);
 
 fn smoke_rand_hardware_entropy_probe() -> TestResult {
     crate::csprng::init_csprng();
-    match crate::csprng::last_entropy_source() {
-        Some(src) => {
-            // Log which source was used (visible in test output).
-            let _ = src; // No console in no_std test context; source is in LAST_SOURCE.
-            TestResult::Pass
-        }
-        None => TestResult::Fail("last_entropy_source() returned None after init_csprng()"),
+    match (
+        crate::csprng::seed_class(),
+        crate::csprng::last_entropy_source(),
+    ) {
+        (Some(_), Some(_)) => TestResult::Pass,
+        (None, None) => TestResult::Pass,
+        (Some(_), None) => TestResult::Fail("seeded pool records no entropy source"),
+        (None, Some(_)) => TestResult::Fail("unseeded pool records an entropy source"),
     }
 }
 kernel_test_in!("filesystem/random_e2e", smoke_rand_hardware_entropy_probe);
@@ -652,11 +664,15 @@ fn smoke_rand_lcg_dead_code_removed() -> TestResult {
     // If csprng::CSPRNG_SEEDED exists and is accessible, the CSPRNG path
     // is live and the LCG has been replaced.  The absence of RANDOM_STATE
     // and next_random_u32 symbols is proven by compilation succeeding.
+    // Since #1026 the flag must agree with the pool's seed class: set
+    // exactly when a seed class is installed, clear on entropy-less
+    // hardware (where the pre-floor pool would have claimed a TSC seed).
     crate::csprng::init_csprng();
-    if crate::csprng::CSPRNG_SEEDED.load(core::sync::atomic::Ordering::Acquire) {
+    let flagged = crate::csprng::CSPRNG_SEEDED.load(core::sync::atomic::Ordering::Acquire);
+    if flagged == crate::csprng::seed_class().is_some() {
         TestResult::Pass
     } else {
-        TestResult::Fail("CSPRNG_SEEDED false — CSPRNG path may not be active")
+        TestResult::Fail("CSPRNG_SEEDED disagrees with the pool's seed class")
     }
 }
 kernel_test_in!("filesystem/random_e2e", smoke_rand_lcg_dead_code_removed);
@@ -685,19 +701,42 @@ fn smoke_rand_pool_is_seeded_before_any_read() -> TestResult {
     // did). The subject here is the first reader, so the test has to
     // manufacture that situation rather than hope for it.
     crate::csprng::__test_unseed();
-    let mut buf = [0u8; 64];
+    // Non-zero sentinel: distinguishes "the pool wrote zeros" (the
+    // original bug) from "the pool wrote nothing" (the #1026 refusal
+    // on entropy-less hardware, where `fill` leaves the buffer
+    // untouched by design).
+    let mut buf = [0xCDu8; 64];
     crate::csprng::fill(&mut buf);
-    // `uninit()` zeroes the ENTIRE state, including the ChaCha20 constants
-    // that `seed()` installs — so the block function run over it returns
-    // literally all zeros, not merely a computable keystream. A reader that
-    // arrives first must never see this.
-    if buf.iter().all(|&x| x == 0) {
-        return TestResult::Fail("csprng served all zeros from the UNSEEDED pool");
+    match crate::csprng::seed_class() {
+        Some(_) => {
+            // A source exists: the fill must have seeded on demand and
+            // served real output — never the uninit all-zeros block.
+            if buf.iter().all(|&x| x == 0) {
+                return TestResult::Fail("csprng served all zeros from the UNSEEDED pool");
+            }
+            if buf == [0xCDu8; 64] {
+                return TestResult::Fail("csprng claims a seed class but wrote nothing");
+            }
+            if !crate::csprng::CSPRNG_SEEDED.load(core::sync::atomic::Ordering::Acquire) {
+                return TestResult::Fail(
+                    "csprng filled a buffer without ever marking itself seeded",
+                );
+            }
+            TestResult::Pass
+        }
+        None => {
+            // No hardware source: refusal is the floor working. The
+            // buffer must be untouched and the fallible fill must
+            // agree that there is nothing to serve.
+            if buf != [0xCDu8; 64] {
+                return TestResult::Fail("unseeded pool wrote into a reader's buffer");
+            }
+            if crate::csprng::try_fill(&mut [0u8; 8]).is_ok() {
+                return TestResult::Fail("try_fill served bytes from an unseeded pool");
+            }
+            TestResult::Pass
+        }
     }
-    if !crate::csprng::CSPRNG_SEEDED.load(core::sync::atomic::Ordering::Acquire) {
-        return TestResult::Fail("csprng filled a buffer without ever marking itself seeded");
-    }
-    TestResult::Pass
 }
 kernel_test_in!(
     "filesystem/random_e2e",
@@ -706,13 +745,20 @@ kernel_test_in!(
 
 /// Two draws must differ. A fixed keystream from an unseeded pool would also
 /// fail the case above; this additionally catches a pool that seeds but does
-/// not advance its counter.
+/// not advance its counter. On entropy-less hardware the #1026 floor makes
+/// both draws refuse instead — the pin there is that neither writes.
 fn smoke_rand_successive_draws_differ() -> TestResult {
     crate::csprng::__test_unseed();
-    let mut a = [0u8; 64];
-    let mut b = [0u8; 64];
+    let mut a = [0xCDu8; 64];
+    let mut b = [0xCDu8; 64];
     crate::csprng::fill(&mut a);
     crate::csprng::fill(&mut b);
+    if crate::csprng::seed_class().is_none() {
+        if a != [0xCDu8; 64] || b != [0xCDu8; 64] {
+            return TestResult::Fail("unseeded pool wrote into a draw buffer");
+        }
+        return TestResult::Pass;
+    }
     if a == b {
         return TestResult::Fail("two csprng draws returned identical bytes");
     }
@@ -742,6 +788,16 @@ fn smoke_rand_urandom_never_returns_all_zeros() -> TestResult {
     let mut buf = vec![0u8; 96];
     match poll_once(file.read(0, &mut buf)) {
         Some(Ok(96)) => {}
+        // Entropy-less hardware (#1026): the read must refuse with
+        // WouldBlock while the pool is unseeded — that IS the floor
+        // working, and it is the only acceptable non-Ok outcome.
+        Some(Err(crate::FsError::WouldBlock)) => {
+            return if crate::csprng::seed_class().is_none() {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("/dev/urandom refused a read despite a seeded pool")
+            };
+        }
         _ => return TestResult::Fail("/dev/urandom read(96) did not return 96 bytes"),
     }
     if buf.iter().all(|&b| b == 0) {
@@ -772,6 +828,15 @@ fn smoke_rand_random_never_returns_all_zeros() -> TestResult {
     let mut buf = vec![0u8; 96];
     match poll_once(file.read(0, &mut buf)) {
         Some(Ok(96)) => {}
+        // Entropy-less hardware (#1026): WouldBlock while unseeded is
+        // the floor working — see the urandom case above.
+        Some(Err(crate::FsError::WouldBlock)) => {
+            return if crate::csprng::seed_class().is_none() {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("/dev/random refused a read despite a seeded pool")
+            };
+        }
         _ => return TestResult::Fail("/dev/random read(96) did not return 96 bytes"),
     }
     if buf.iter().all(|&b| b == 0) {
