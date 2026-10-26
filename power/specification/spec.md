@@ -265,7 +265,11 @@ thermal implementation. It owns zone modelling — `enumerate()`
 (ThermalZone nodes ∪ `PNP0C0F` devices, deduplicated), the full
 trip-point table (`_CRT`/`_HOT`/`_PSV`/`_AC0..=_AC9`/`_TC1`/`_TC2`)
 and `classify()` precedence (ACPI 6.5 §11.4). `drivers/platform`
-carries no zone model of its own (#910).
+carries no zone model of its own (#910). Temperature and trip-point
+objects are evaluated as ACPI objects in either firmware shape — a
+Method returning deciKelvin or a Name holding it (the common DSDT
+shape for `_CRT`/`_PSV`/`_ACx`); a methods-only read silently
+produces an empty trip table (#986).
 
 The bridge between the layers is the only registration/sampling path:
 
