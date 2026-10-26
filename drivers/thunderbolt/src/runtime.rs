@@ -27,14 +27,11 @@ pub(crate) fn start() -> narf_init::InitResult {
         );
         return narf_init::InitResult::NotPresent;
     };
-    // Native tunnel suspend/replay is not implemented yet. Keep system sleep
-    // from powering down an NHI with live paths or DMA rings. This registration
-    // persists after a transport fault because router paths may still exist.
-    narf_power::device_pm::register_device_pm(
-        "usb4-native-cm",
-        || Err(narf_power::device_pm::DeviceSuspendError::Busy),
-        || Ok(()),
-    );
+    // Join the device-PM fan-out with the state-checked handlers in
+    // `pm.rs`: system sleep is refused only while tunnels are live
+    // or a fault left path writes unrolled-back — an idle or stopped
+    // CM never vetoes suspend (#1028).
+    super::pm::register();
     for (domain, pending) in pending.into_iter().enumerate() {
         narf_scheduler::spawn(async move {
             let Pending { device, cap, nhi } = pending;

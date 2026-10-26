@@ -32,6 +32,8 @@ mod firmware;
 #[cfg(feature = "builtin")]
 pub mod nhi;
 #[cfg(feature = "builtin")]
+mod pm;
+#[cfg(feature = "builtin")]
 mod ring;
 #[cfg(feature = "builtin")]
 mod runtime;

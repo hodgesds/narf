@@ -298,6 +298,12 @@ pub(crate) async fn run(id: u32, controls: u32, ctl: &mut Control) -> Result<(),
     for tunnel in tunnels.iter_mut().rev() {
         let _ = tunnel.teardown(ctl, &current).await;
     }
+    // A teardown that could not roll its journal back (e.g. a
+    // poisoned channel) leaves paths possibly programmed in the
+    // routers with no owner; record that so the device-PM handler
+    // keeps refusing suspend for this domain. A clean exit clears
+    // any earlier mark.
+    super::tunnel::note_orphaned_paths(id, tunnels.iter().any(|t| t.has_unrolled_writes()));
     DOMAINS.lock().retain(|d| d.id != id);
     super::tunnel::forget_domain(id);
     result

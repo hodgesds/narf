@@ -23,6 +23,10 @@ number of NHI functions does not determine the number of physical USB-C ports.
   with domain, protocol and input/output `(route, port)` endpoints. A DP
   `dprx_done` flag is reported separately from tunnel creation. Neither is
   proof that the GPU has trained an external monitor or enabled scanout.
+- `tunnel::live_tunnel_count()` reports the published live-tunnel count
+  across domains, and `tunnel::orphaned_path_domains()` the domains whose
+  CM exited with tunnel writes unrolled-back. Together they are the
+  state the CM's device-PM handler gates system suspend on (§4).
 - `register_initcalls()` registers PCI discovery at Device and starts one
   task per controller at Late. MSI-X wakes the task, with bounded timed
   polling when MSI-X is unavailable. No config transaction holds a spinlock
@@ -53,10 +57,15 @@ Hop pending is read from DWORD 1 and must clear before credits are released.
 USB3 bandwidth ownership uses the CMR/HCA handshake in both directions.
 Protocol adapters retain vendor-defined ingress credit/flow-control fields.
 
-The CM does not request PCIe or XDomain control. System suspend is refused
-while a native CM has been started: tunnel suspend/replay remains unsupported.
-Transport failure clears public snapshots and attempts owned-path teardown;
-a poisoned channel can prevent that teardown, so the suspend refusal remains.
+The CM does not request PCIe or XDomain control. The native CM joins the
+device-PM fan-out with a state-checked handler: system suspend is refused
+(`Busy`) only while tunnels are live, or while a domain's CM has exited
+with tunnel writes unrolled-back. With no live paths the handler reports
+ready — an idle, stopped, or cleanly-exited CM never vetoes suspend.
+Tunnel suspend/replay remains unsupported, so live tunnels still block
+sleep. Transport failure clears public snapshots and attempts owned-path
+teardown; a poisoned channel can prevent that teardown, and the orphaned
+domain's refusal persists until a CM for it tears the paths down.
 
 ## 5. Architecture notes
 
@@ -79,6 +88,7 @@ it does not emulate an AMD USB4 dock or prove physical monitor output.
 ## 8. Open work
 
 Hardware validation; full DP bandwidth allocation and multiple DP tunnels;
-firmware tunnel adoption; native suspend/resume and controller reset recovery;
+firmware tunnel adoption; tunnel suspend/replay (live tunnels still veto
+system suspend); controller reset recovery after resume;
 legacy Thunderbolt/ICM, PCIe/XDomain tunnels, link bonding and retimer policy.
 AMD source encoder setup, firmware loading and link training belong to GPU.
