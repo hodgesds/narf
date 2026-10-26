@@ -1277,6 +1277,16 @@ pub fn kfree(ptr: NonNull<u8>, size: usize, domain: DomainId);
 pub fn slab::stats() -> SlabStats;
 pub fn slab::magazine_stats() -> MagazineStats;
 
+/// Ordinary slab frames use per-frame central chains and intrusive partial /
+/// empty frame lists. Frame descriptors keep their 64-byte footprint: slab
+/// bookkeeping occupies existing padding independently of COW and pin atomics.
+/// Reclaim selects a fully central frame in O(1), verifies that page's complete
+/// object set within the bounded node budget, and unregisters it under the
+/// class lock before returning it to buddy outside that lock. Pre-descriptor
+/// and out-of-range frames retain the legacy bounded FIFO implementation.
+/// Central inventory publication is serialized with insertion/removal by the
+/// class lock; statistics remain advisory while a magazine operation is live.
+
 // Task-context domain state. Its architecture representation is private so
 // scheduler policies cannot manufacture or directly switch rights state.
 pub struct DomainSavedState {
@@ -1679,7 +1689,18 @@ x86_64 is rejected at runtime.
   The slab converts free blocks to page estimates per size class, visits the
   4 KiB class first while dividing pressure fairly across the remaining
   classes, and reclaims only a frame whose complete block set is present on the
-  central list. Each central list is an intrusive FIFO with a persistent
+  central pool. Frames with permanent PFN descriptors have a separate central
+  object chain and exact central-object count in that descriptor. Nonempty
+  partial frames and fully central frames belong to disjoint intrusive frame
+  lists; refill consumes partial frames first, and reclaim selects from the
+  fully central list without searching unrelated objects. Magazine-cached and
+  allocated objects are excluded from the central count. Before detachment,
+  a bounded page-local walk verifies canaries, offsets, distinct objects and
+  complete coverage; the record is cleared before releasing the class lock.
+  This bookkeeping does not touch COW counts, pin counts or NUMA provenance,
+  and the permanent descriptor remains exactly 64 bytes. Frames allocated
+  before descriptor publication, or outside its range, retain an intrusive
+  FIFO with a persistent
   allocation-free frame candidate and finite snapshot cursor. A class-lock
   acquisition examines at most 2,048 nodes; concurrent allocations consume
   from that finite snapshot and new frees append after it, so producers cannot

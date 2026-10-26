@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-6"
-prompt_hash = "1cd0f8ece50097a2470e1cd1a5dd01fab92cfe3cac933d3c147e60dceb94341a"
+prompt_hash = "314b16fc791cb3dcd8500ef84e6b9d616ea8874b0df007da72426c6ef52d19b9"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1941,6 +1941,14 @@ ref = "security-model/specification/spec.md#L42"
 argument = "Shared identity buffers contain procfs bytes and loader provenance only; they confer no capabilities or mapped-file ownership. Existing PID/TID namespace translation and procfs access checks remain at their original callers. The OOM name-copy and timer diagnostic paths borrow through nonblocking directory and identity guards without cloning a Task or identity owner, so they neither wait on an interrupted writer nor cause final owner reclamation in IRQ context."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+agent = "OpenAI Codex GPT-6"
+argument = "Slab frame lists remain inside the memory allocator. Their records occupy the existing 48 bytes of padding in each permanent 64-byte PFN descriptor; COW ownership, pin counts and boot NUMA provenance retain their independent fields and transitions. No domain, mapping, capability or TCB boundary changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+agent = "OpenAI Codex GPT-6"
+argument = "A fresh buddy frame is registered before publishing any objects. All frame-chain, count and intrusive-list accesses hold its owning size-class lock; a descriptor changes class only after detachment has cleared it and the frame has returned to exclusive buddy ownership. Magazine-cached and live objects do not contribute to central counts. Reclaim selects only a fully central frame and checks its entire bounded chain for free canaries, in-frame aligned offsets, distinct slots and complete coverage before clearing metadata under the lock. Buddy release remains outside the class lock. Early and out-of-range frames preserve the bounded legacy queue. Central inventory additions now occur before unlocking, matching removal serialization and preventing transient unsigned underflow. Tests cover a large partial pool against the legacy negative control, exact reclaim budgets, cached-object exclusion, partial-frame preference and descriptor reuse across classes without COW count changes."
 ref = "security-model/specification/spec.md#L42"
 agent = "Muse Wonder"
 argument = "Key-material entropy in narf-crypto now fails closed (issue #996, power-suspend lane P0). The new surface (has_hw_entropy / try_fill_key_material / key_material_rng) draws only from the seed-grade architectural source — RDSEED on x86_64 (CPUID leaf 7 EBX:18), RNDR/RNDRRS on aarch64 (ID_AA64ISAR0_EL1.RNDR) — probed on every draw, never assumed. RDRAND is excluded because the crypto spec classes it as conditioned output rather than an entropy source, and the cycle-counter placeholder behind per_task_rng is unreachable from this surface; per_task_rng itself has no live consumers outside the crate and is now prohibited for key material in crypto spec §3.2. Every released byte passes SP 800-90B health discipline: a 1024-byte startup test drawn and discarded before the first release, plus continuous Repetition Count (cutoff 33) and Adaptive Proportion (512-byte windows, cutoff 326) tests over the raw byte stream, parameterised at an assumed min-entropy of 1 bit/byte with alpha = 2^-32. A health failure latches the source off for the rest of the boot; absence, starvation, and health failure all surface as the typed CryptoError::EntropyUnavailable with caller output and partial seeds zeroized, so no caller can receive silently degraded key material and the suspend service's refusal gate (has_hw_entropy) stands on observed source health, not on feature bits alone. The protocol adapter (try_per_task_rng / try_fill_random_bytes) and the legacy placeholder keep their exact prior behaviour. No new capability, mapping, or domain authority is introduced: the monitor is one spin-locked test state plus a phase latch inside narf-crypto, touched only on key-material draws. Deterministic tests drive the source seam with absent, stuck, biased, and healthy streams, pinning refusal without latching on starvation, startup rejection of degenerate sources, startup-exactly-once word accounting, continuous-failure zeroization and latching, and a native contract that holds whether or not the harness CPU exposes the instructions."

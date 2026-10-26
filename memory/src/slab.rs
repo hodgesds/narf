@@ -15,16 +15,15 @@
 //!
 //! # Shape
 //!
-//! Single-CPU today; the per-CPU magazine layer slots on top once
-//! SMP brings up application processors. The shape:
-//!
 //!   * Nine power-of-2 size classes from 16 B to 4 KiB.
-//!   * Each class owns a singly-linked free list of blocks the same
-//!     size as the class. Pop on `alloc`, push on `dealloc`.
-//!   * When a class's free list is empty, the slab grabs a fresh
-//!     page frame from `alloc_frame` and slabs it into N blocks of
-//!     class size, pushing all N onto the list before popping the
-//!     first.
+//!   * Per-CPU magazines batch transfers through each class's central
+//!     lock; local allocation and deallocation need no central lock.
+//!   * Central objects form per-frame chains. Permanent PFN metadata
+//!     links partial and fully free frames into separate lists, so
+//!     reclaim selects a complete frame without scanning other pages.
+//!     Early and out-of-range frames retain a bounded FIFO fallback.
+//!   * An empty central pool grows from a fresh buddy frame, carving
+//!     objects into the local magazine and central pool.
 //!   * Allocations larger than the largest class fall through to
 //!     `alloc_frame` directly (one or more contiguous frames).
 //!     `dealloc` symmetrically returns those frames.
@@ -33,20 +32,8 @@
 //! the standard `GlobalAlloc` contract. No header is stored ahead
 //! of each block.
 //!
-//! **What's missing for SMP** (Stage-5+):
-//!   * Per-CPU magazines. Each CPU has a small array of free blocks
-//!     per size class; alloc pops local, dealloc pushes local. Magazine
-//!     overflow / underflow batch-flushes to / pulls from the
-//!     central slab here. That removes all CAS / lock contention
-//!     from the fast path.
-//!   * `get_cpu()` primitive (`RDPID` / `MPIDR_EL1`).
-//!   * Cross-CPU dealloc routing (the freeing CPU's magazine isn't
-//!     necessarily the allocating CPU's — solved with a per-CPU
-//!     "remote free queue").
-//!
 //! The trait surface here is intentionally minimal — `alloc(layout)`
-//! and `dealloc(ptr, layout)` — so the SMP layer can wrap the
-//! central slab with a magazine pair without changing call sites.
+//! and `dealloc(ptr, layout)` — independent of the central representation.
 
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
@@ -60,6 +47,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::buddy::MAX_ORDER;
 use crate::frame::{alloc_frame, alloc_pages_on, free_pages, PhysFrame};
 use crate::PAGE_SIZE;
+
+mod central;
+pub(crate) use central::FrameState;
 
 /// Local `usize` view of `PAGE_SIZE` (which the rest of the crate
 /// exposes as `u64` because it doubles as a physical-address
@@ -253,6 +243,10 @@ unsafe fn double_free_confirmed(
     }
     if may_lock_central {
         let g = class.head.lock();
+        // SAFETY: this class lock protects the bounded per-frame chain.
+        if unsafe { g.frames.contains(blk) } {
+            return true;
+        }
         let mut cur = g.head;
         let mut steps = 0usize;
         while let Some(b) = cur {
@@ -621,6 +615,7 @@ struct CentralList {
     tail: Option<NonNull<FreeBlock>>,
     len: usize,
     scan: ReclaimScan,
+    frames: central::FrameLists,
 }
 
 /// Persistent, allocation-free cursor for one bounded empty-frame search.
@@ -680,6 +675,32 @@ impl CentralList {
             tail: None,
             len: 0,
             scan: ReclaimScan::new(),
+            frames: central::FrameLists::new(),
+        }
+    }
+
+    /// # Safety
+    /// Caller holds the class lock protecting both central representations.
+    unsafe fn front(&self) -> Option<NonNull<FreeBlock>> {
+        // SAFETY: all tracked lists belong to this locked class.
+        unsafe { self.frames.front() }.or(self.head)
+    }
+
+    /// # Safety
+    /// Caller holds the class lock; every queued node is a valid free block.
+    unsafe fn pop_front(&mut self) -> Option<NonNull<FreeBlock>> {
+        // SAFETY: both representations are exclusively protected by this lock.
+        unsafe { self.frames.pop().or_else(|| self.pop_legacy()) }
+    }
+
+    /// # Safety
+    /// Caller owns the free block and holds its class lock.
+    unsafe fn push_back(&mut self, node: NonNull<FreeBlock>) {
+        // SAFETY: the frame record selects the tracked path only after grow
+        // initialized it; pre-publication and out-of-range frames stay legacy.
+        if !unsafe { self.frames.push(node) } {
+            // SAFETY: this still-exclusively-owned block has no tracked record.
+            unsafe { self.push_legacy(node) };
         }
     }
 
@@ -688,7 +709,7 @@ impl CentralList {
     ///
     /// # Safety
     /// Every queued node is a valid free block owned by this list.
-    unsafe fn pop_front(&mut self) -> Option<NonNull<FreeBlock>> {
+    unsafe fn pop_legacy(&mut self) -> Option<NonNull<FreeBlock>> {
         let mut node = self.head?;
         // SAFETY: `node` is the live queue head under the class lock.
         let next = unsafe { node.as_ref().next };
@@ -709,7 +730,7 @@ impl CentralList {
     ///
     /// # Safety
     /// `node` is exclusively owned by the caller and is a valid free block.
-    unsafe fn push_back(&mut self, mut node: NonNull<FreeBlock>) {
+    unsafe fn push_legacy(&mut self, mut node: NonNull<FreeBlock>) {
         // SAFETY: `node` is not reachable from any free structure yet.
         unsafe { node.as_mut().next = None };
         match self.tail {
@@ -748,6 +769,82 @@ impl CentralList {
         }
         self.tail = Some(tail);
         self.len += count;
+    }
+    /// Detach complete pages without holding a buddy/cgroup lock.
+    /// # Safety
+    /// The owning class lock is held. Caller consumes each output exactly once.
+    unsafe fn detach_pages(&mut self, c: usize, frames: &mut [usize], node_budget: usize) -> usize {
+        let n_blocks = PAGE_SIZE_USIZE / class_size(c);
+        // Tracked frames require no search through unrelated objects. Validate
+        // their own chains within the same total per-acquisition node budget.
+        // SAFETY: the class lock owns every tracked frame; caller consumes output.
+        let (mut detached_pages, mut examined) =
+            unsafe { self.frames.detach(c, frames, node_budget) };
+
+        while detached_pages < frames.len() && examined < node_budget {
+            if self.scan.active && self.scan.pending_count == n_blocks {
+                // A frame has exactly `n_blocks` slab objects.  Holding that many
+                // distinct central-free nodes from one frame proves no object in
+                // the frame is allocated or cached in a magazine.
+                frames[detached_pages] = self.scan.frame_base;
+                detached_pages += 1;
+                self.scan.clear();
+                continue;
+            }
+
+            if self.scan.active && self.scan.remaining == 0 {
+                // One finite queue snapshot contained only part of this frame.
+                // Put the candidate back at the tail in O(1); later frees can then
+                // join it and a future pass can prove the frame complete.
+                let head = self.scan.pending_head;
+                let tail = self.scan.pending_tail;
+                let count = self.scan.pending_count;
+                self.scan.clear();
+                // SAFETY: the scan exclusively owns this linked chain.
+                unsafe { self.append_chain(head, tail, count) };
+                continue;
+            }
+
+            if !self.scan.active {
+                // SAFETY: class lock gives exclusive ownership of the queue head.
+                let Some(node) = (unsafe { self.pop_legacy() }) else {
+                    break;
+                };
+                // SAFETY: the node is a central-free block; validate before using
+                // any of its linkage or page identity.
+                unsafe { canary_check_free(node, c) };
+                self.scan.active = true;
+                self.scan.frame_base = (node.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1);
+                self.scan.remaining = self.len;
+                // SAFETY: `pop_front` gave the scan exclusive ownership.
+                unsafe { self.scan.push_pending(node) };
+                examined += 1;
+                continue;
+            }
+
+            // SAFETY: `remaining > 0` describes nodes at the queue head that
+            // existed when this snapshot began.  Allocations decrement it when
+            // they consume such a node, so a node is present here unless they
+            // exhausted the snapshot immediately before this lock acquisition.
+            let Some(node) = (unsafe { self.pop_legacy() }) else {
+                self.scan.remaining = 0;
+                continue;
+            };
+            // SAFETY: `node` was just detached from the valid central queue.
+            unsafe { canary_check_free(node, c) };
+            let frame_base = (node.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1);
+            if frame_base == self.scan.frame_base {
+                // SAFETY: the scan now exclusively owns `node`.
+                unsafe { self.scan.push_pending(node) };
+            } else {
+                // SAFETY: rotate the non-matching free node behind the finite
+                // snapshot.  This is O(1) because the central list stores a tail.
+                unsafe { self.push_legacy(node) };
+            }
+            examined += 1;
+        }
+
+        detached_pages
     }
 }
 
@@ -1144,7 +1241,8 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
             // slipped invariant (a stale `top`) must flush/return, never
             // index off the end of the fixed 16-slot stack.
             while taken < take && mag.top < MAG_SIZE {
-                match g.head {
+                // SAFETY: the class lock covers tracked and legacy lists.
+                match unsafe { g.front() } {
                     Some(head) => {
                         // Verify the block wasn't scribbled while free
                         // BEFORE trusting its `next` link — a clobbered
@@ -1221,21 +1319,26 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
             // blocks skipped because the magazine was already full)
             // goes onto the central free list.
             let mut g = class.head.lock();
+            // Register after buddy allocation and before publishing any nodes.
+            // No magazine borrow spans allocator callbacks.
+            g.frames.register(base as usize, c);
             for i in to_mag..(n_blocks - 1) {
                 let blk = base.add(i * block_size) as *mut FreeBlock;
                 canary_set_fresh(NonNull::new_unchecked(blk));
                 // SAFETY: this is a freshly carved, exclusively owned block.
                 g.push_back(NonNull::new_unchecked(blk));
             }
+            // Publish inventory while the same lock still excludes a refill.
+            // Publishing after unlock allowed a concurrent fetch_sub to wrap.
+            class
+                .central_free
+                .fetch_add(n_blocks - 1 - to_mag, Ordering::Relaxed);
+            class.grown.fetch_add(n_blocks, Ordering::Relaxed);
             drop(g);
         }
         class.magazines[cpu]
             .available
             .store(mag.top, Ordering::Relaxed);
-        class
-            .central_free
-            .fetch_add(n_blocks - 1 - to_mag, Ordering::Relaxed);
-        class.grown.fetch_add(n_blocks, Ordering::Relaxed);
         // First growth of any class arms the slab shrinker so reclaim can later
         // return these frames under pressure (allocation-free, once).
         ensure_slab_shrinker_registered();
@@ -1304,6 +1407,8 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
             // SAFETY: Valid memory or trusted environment
             unsafe { g.push_back(blk) };
         }
+        // Refill/reclaim cannot consume these blocks before their count exists.
+        let central_free = class.central_free.fetch_add(flush, Ordering::Relaxed) + flush;
         drop(g);
         // Compact: shift the surviving half down to slots 0..flush.
         for i in 0..(MAG_SIZE - flush) {
@@ -1315,7 +1420,6 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         class.magazines[cpu]
             .available
             .store(mag.top, Ordering::Relaxed);
-        let central_free = class.central_free.fetch_add(flush, Ordering::Relaxed) + flush;
         // Proactive watermark: if this class has parked more than
         // SLAB_RETAIN_FRAMES_HIGH frames of free blocks, flag the executor to
         // shed empties back to the buddy at its next maintenance tick. Only a
@@ -1786,71 +1890,10 @@ unsafe fn detach_class_frames(c: usize, max_pages: usize, frames: &mut [usize]) 
         return 0;
     }
     let mut g = class.head.lock();
-    let mut detached_pages = 0usize;
-    let mut examined = 0usize;
-
-    while detached_pages < limit && examined < SLAB_RECLAIM_SCAN_BLOCKS {
-        if g.scan.active && g.scan.pending_count == n_blocks {
-            // A frame has exactly `n_blocks` slab objects.  Holding that many
-            // distinct central-free nodes from one frame proves no object in
-            // the frame is allocated or cached in a magazine.
-            frames[detached_pages] = g.scan.frame_base;
-            detached_pages += 1;
-            g.scan.clear();
-            continue;
-        }
-
-        if g.scan.active && g.scan.remaining == 0 {
-            // One finite queue snapshot contained only part of this frame.
-            // Put the candidate back at the tail in O(1); later frees can then
-            // join it and a future pass can prove the frame complete.
-            let head = g.scan.pending_head;
-            let tail = g.scan.pending_tail;
-            let count = g.scan.pending_count;
-            g.scan.clear();
-            // SAFETY: the scan exclusively owns this linked chain.
-            unsafe { g.append_chain(head, tail, count) };
-            continue;
-        }
-
-        if !g.scan.active {
-            // SAFETY: class lock gives exclusive ownership of the queue head.
-            let Some(node) = (unsafe { g.pop_front() }) else {
-                break;
-            };
-            // SAFETY: the node is a central-free block; validate before using
-            // any of its linkage or page identity.
-            unsafe { canary_check_free(node, c) };
-            g.scan.active = true;
-            g.scan.frame_base = (node.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1);
-            g.scan.remaining = g.len;
-            // SAFETY: `pop_front` gave the scan exclusive ownership.
-            unsafe { g.scan.push_pending(node) };
-            examined += 1;
-            continue;
-        }
-
-        // SAFETY: `remaining > 0` describes nodes at the queue head that
-        // existed when this snapshot began.  Allocations decrement it when
-        // they consume such a node, so a node is present here unless they
-        // exhausted the snapshot immediately before this lock acquisition.
-        let Some(node) = (unsafe { g.pop_front() }) else {
-            g.scan.remaining = 0;
-            continue;
-        };
-        // SAFETY: `node` was just detached from the valid central queue.
-        unsafe { canary_check_free(node, c) };
-        let frame_base = (node.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1);
-        if frame_base == g.scan.frame_base {
-            // SAFETY: the scan now exclusively owns `node`.
-            unsafe { g.scan.push_pending(node) };
-        } else {
-            // SAFETY: rotate the non-matching free node behind the finite
-            // snapshot.  This is O(1) because the central list stores a tail.
-            unsafe { g.push_back(node) };
-        }
-        examined += 1;
-    }
+    // SAFETY: class lock owns both central representations and the caller
+    // returns the detached frames after this function releases that lock.
+    let detached_pages =
+        unsafe { g.detach_pages(c, &mut frames[..limit], SLAB_RECLAIM_SCAN_BLOCKS) };
 
     class
         .central_free
@@ -2649,6 +2692,9 @@ fn smoke_slab_shrinker_detaches_before_free() -> narf_kernel_test::TestResult {
     // SAFETY: `current`'s chain is a valid class-`c` free-block chain,
     // exclusively owned here; appending preserves each block once.
     unsafe { parked.append_chain(current.head, current.tail, current.len) };
+    // SAFETY: scenario frames were freshly grown while the old central lists
+    // were parked. Their frame memberships are disjoint and the class is quiet.
+    unsafe { parked.frames.append(&mut current.frames) };
     {
         let mut guard = CLASSES[c].head.lock();
         *guard = parked;
