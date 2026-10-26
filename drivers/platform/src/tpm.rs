@@ -148,6 +148,7 @@ pub(crate) const REG_TIS_DID_VID: u64 = 0xF00;
 const TIS_ACCESS_REQUEST_USE: u8 = 1 << 1;
 const TIS_ACCESS_ACTIVE: u8 = 1 << 5;
 const TIS_STS_VALID: u8 = 1 << 7;
+const TIS_STS_CMD_READY: u8 = 1 << 6;
 const TIS_STS_DATA_AVAIL: u8 = 1 << 4;
 const TIS_STS_GO: u8 = 1 << 5;
 const TIS_STS_EXPECT: u8 = 1 << 3;
@@ -560,11 +561,11 @@ pub(crate) async fn submit_crb_over<R: CrbRegs>(
 }
 
 /// The TIS submit sequence (TIS v1.21) over an abstract register
-/// window: request locality 0, push the command into DATA_FIFO
-/// under EXPECT flow control, issue STS.GO, then drain the
-/// response FIFO while DATA_AVAIL asserts. Factored out of
-/// `Tpm::submit_tis` for the same fixture seam as
-/// [`submit_crb_over`] (#946).
+/// window: request locality 0, assert STS.commandReady and observe
+/// it set, push the command into DATA_FIFO under EXPECT flow
+/// control, issue STS.GO, then drain the response FIFO while
+/// DATA_AVAIL asserts. Factored out of `Tpm::submit_tis` for the
+/// same fixture seam as [`submit_crb_over`] (#946).
 pub(crate) async fn submit_tis_over<R: CrbRegs>(regs: &R, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
     // 1. Request locality 0.
     regs.wr8(REG_TIS_ACCESS, TIS_ACCESS_REQUEST_USE);
@@ -574,7 +575,27 @@ pub(crate) async fn submit_tis_over<R: CrbRegs>(regs: &R, cmd: &[u8]) -> Result<
         narf_time::Deadline::after_ms(750),
     )
     .await;
-    // 2. Write command into the FIFO.
+    // 2. Assert commandReady (TIS §5.6). A powered-on TPM presents
+    //    commandReady set, but the device clears it when it takes a
+    //    command at GO; from the second command on, the host must
+    //    re-assert it and observe it set before the FIFO writes, or
+    //    the device drops the bytes and the command cannot complete
+    //    (Linux `tpm_tis_ready`, called at the head of every send;
+    //    the `drivers/tpm` reference flow documents the same step).
+    //    The neighbouring polls ignore their timeouts, but this one
+    //    cannot: proceeding without commandReady is exactly the
+    //    byte-drop failure, so surface the typed timeout instead
+    //    (#942).
+    regs.wr8(REG_TIS_STS, TIS_STS_CMD_READY);
+    let ready = poll_yielding_until(
+        || regs.rd8(REG_TIS_STS) & TIS_STS_CMD_READY != 0,
+        narf_time::Deadline::after_ms(750),
+    )
+    .await;
+    if !ready {
+        return Err(TpmError::BusyTimeout);
+    }
+    // 3. Write command into the FIFO.
     for b in cmd {
         // Wait for STS.EXPECT before each byte. 750 ms
         // TIMEOUT_A — typical sub-microsecond on real TPMs.
@@ -585,9 +606,9 @@ pub(crate) async fn submit_tis_over<R: CrbRegs>(regs: &R, cmd: &[u8]) -> Result<
         .await;
         regs.wr8(REG_TIS_DATA_FIFO, *b);
     }
-    // 3. Issue STS.GO.
+    // 4. Issue STS.GO.
     regs.wr8(REG_TIS_STS, TIS_STS_GO);
-    // 4. Wait for STS.DATA_AVAIL. 5 s wall-clock budget —
+    // 5. Wait for STS.DATA_AVAIL. 5 s wall-clock budget —
     // TIMEOUT_C / TIMEOUT_D worst cases (RSA keygen etc.).
     let done = poll_yielding_until(
         || {
@@ -600,7 +621,7 @@ pub(crate) async fn submit_tis_over<R: CrbRegs>(regs: &R, cmd: &[u8]) -> Result<
     if !done {
         return Err(TpmError::BusyTimeout);
     }
-    // 5. Drain FIFO until DATA_AVAIL clears.
+    // 6. Drain FIFO until DATA_AVAIL clears.
     let mut out: Vec<u8> = Vec::new();
     for _ in 0..0x4000u32 {
         let s = regs.rd8(REG_TIS_STS);
@@ -768,13 +789,14 @@ pub(crate) fn discovered_base() -> Option<u64> {
 /// without a TPM. (`pub(crate)` so the discovery-composition
 /// fixture can drive the same decision the initcall drives, #946.)
 ///
-/// On a successful probe the device is published through two handles
-/// on the SAME `Arc<Tpm>`: this crate's singleton (backing
-/// `with_tpm` / `is_present` / `kind`) and `narf_tpm::registry` —
-/// the dispatch target `frame::measure` consults for hardware PCR
-/// extends. Registration happens exactly once, on the None→Some
-/// transition guarded by the early return above, so a repeated
-/// initcall can never double-register the device.
+/// On a successful probe the device is started (TPM2_Startup,
+/// #942) and then published through two handles on the SAME
+/// `Arc<Tpm>`: this crate's singleton (backing `with_tpm` /
+/// `is_present` / `kind`) and `narf_tpm::registry` — the dispatch
+/// target `frame::measure` consults for hardware PCR extends.
+/// Publication happens exactly once, on the None→Some transition
+/// guarded by the early return above, so a repeated initcall can
+/// never double-register the device.
 pub fn try_init_default() {
     if !cfg!(target_arch = "x86_64") {
         return;
@@ -788,8 +810,45 @@ pub fn try_init_default() {
     // locality-0 window, and `probe` maps it before touching it.
     if let Ok(dev) = unsafe { Tpm::probe(base) } {
         let dev = Arc::new(dev);
-        narf_tpm::registry::register(dev.clone());
-        *TPM.lock() = Some(dev);
+        // Lifecycle (#942): a powered-on TPM rejects every command
+        // with TPM_RC_INITIALIZE until TPM2_Startup, and this is
+        // the only production path that can submit it — measured
+        // boot reaches the device through the registry at
+        // Stage::Late and previously worked on the target laptops
+        // only because firmware had started the TPM during POST.
+        // Start the device here, before either handle is published,
+        // so the registry contract ("a registered device is a
+        // started device", narf-tpm spec §3.3) holds on firmware
+        // paths that leave the TPM unstarted too. CLEAR is the
+        // power-on form; a firmware-started TPM answers
+        // TPM_RC_VALUE, which `TpmDevice::startup` folds into
+        // success.
+        //
+        // The Stage::Subsys initcall runs synchronously on the BSP,
+        // not inside an executor poll, no IrqSafeSpinLock is held
+        // here (the TPM singleton guard above was dropped with its
+        // statement), and the submit paths are self-waking register
+        // polls — `block_on_spin` is the correct bridge, the same
+        // one the fixture seams use to drive these submit paths.
+        match narf_scheduler::block_on_spin(dev.startup(narf_tpm::StartupType::Clear)) {
+            Ok(()) => {
+                narf_tpm::registry::register(dev.clone());
+                *TPM.lock() = Some(dev);
+            }
+            Err(e) => {
+                // Probed but would not start: every command would
+                // fail with TPM_RC_INITIALIZE, so publishing the
+                // device would let measured boot claim a hardware
+                // anchor that cannot extend. Publish neither handle
+                // — `hardware_dispatch_active()` stays honest — and
+                // say so on the console.
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  tpm: TPM2_Startup failed ({e:?}); device not registered"
+                );
+            }
+        }
     }
 }
 

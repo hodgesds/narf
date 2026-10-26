@@ -1163,6 +1163,11 @@ struct ModelDevice {
     dev: Arc<FakeTpmDevice>,
     cmd_ptr: *mut u8,
     rsp_ptr: *mut u8,
+    /// Which production submit seam `submit_raw` drives: `false`
+    /// for CRB (the buffer pointers are live), `true` for TIS (the
+    /// pointers are unused — TIS moves bytes through the FIFO
+    /// registers, not host buffers).
+    tis: bool,
 }
 
 // SAFETY: `FakeTpmDevice` is Send + Sync; the buffer pointers
@@ -1194,6 +1199,11 @@ impl TpmDevice for ModelDevice {
     }
 
     async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, HighLevelTpmError> {
+        if self.tis {
+            return tpm::submit_tis_over(self.dev.as_ref(), cmd)
+                .await
+                .map_err(map_transport_err);
+        }
         tpm::submit_crb_over(
             self.dev.as_ref(),
             self.cmd_ptr,
@@ -1380,6 +1390,7 @@ fn smoke_tpm_discovery_to_registry_conversation() -> TestResult {
         dev: dev.clone(),
         cmd_ptr,
         rsp_ptr,
+        tis: false,
     });
     narf_tpm::registry::register(adapter.clone());
     if narf_tpm::registry::list().len() != 1 {
@@ -1431,4 +1442,163 @@ fn smoke_tpm_discovery_to_registry_conversation() -> TestResult {
 kernel_test_in!(
     "drivers/platform/tpm-discovery",
     smoke_tpm_discovery_to_registry_conversation
+);
+
+// ── Lifecycle lane (#942): commandReady + probe→Startup→extend ────
+
+fn smoke_tpm_tis_multi_command_conversation() -> TestResult {
+    use narf_tpm::types::TpmRc;
+
+    let dev = Arc::new(FakeTpmDevice::tis());
+    if tpm::identify(dev.as_ref()) != Ok(tpm::TpmKind::Tis) {
+        return TestResult::Fail("model register block not identified as TIS");
+    }
+    // The multi-command TIS conversation the keystone deferred,
+    // run through the trait over the production TIS submit path.
+    // Commands after the first are the acceptance test for the
+    // commandReady assertion in `submit_tis_over`: the model
+    // enforces the spec discipline (clears commandReady at GO,
+    // drops FIFO bytes written outside the ready state), so a
+    // missing re-assertion surfaces as dropped bytes and a stuck
+    // command — TPM_RC_SIZE from executing an empty FIFO —
+    // exactly as on spec-shaped silicon.
+    let adapter: Arc<dyn TpmDevice> = Arc::new(ModelDevice {
+        dev: dev.clone(),
+        cmd_ptr: core::ptr::null_mut(),
+        rsp_ptr: core::ptr::null_mut(),
+        tis: true,
+    });
+    let digest1: [u8; 32] = [0x11; 32];
+    let digest2: [u8; 32] = [0x22; 32];
+    let stages = Arc::new(IrqSafeSpinLock::new([false; 6]));
+    let stages_in = stages.clone();
+    narf_scheduler::__reset_queues_for_test();
+    narf_scheduler::spawn(async move {
+        let mut s = [false; 6];
+        // 1. Pre-Startup extend is rejected TPM_RC_INITIALIZE.
+        s[0] = matches!(
+            adapter.extend_pcr(4, &digest1).await,
+            Err(HighLevelTpmError::Rc(TpmRc::Initialize))
+        );
+        // 2. The trait's lifecycle call starts the device.
+        s[1] = adapter.startup(narf_tpm::StartupType::Clear).await.is_ok();
+        // 3. A second Startup(CLEAR) — the call the production
+        //    probe submits on a firmware-started machine — is
+        //    folded to success by the already-started policy.
+        s[2] = adapter.startup(narf_tpm::StartupType::Clear).await.is_ok();
+        // 4. The extend lands; the device chain advances.
+        s[3] = adapter.extend_pcr(4, &digest1).await.is_ok();
+        // 5. Read-back matches the chain so far.
+        let after1 = pcr_extend_value(&[0u8; 32], &digest1);
+        s[4] = matches!(adapter.read_pcr(4).await, Ok(v) if v == after1.to_vec());
+        // 6. A further extend composes the chain across the whole
+        //    conversation (seven submits in total).
+        s[5] = adapter.extend_pcr(4, &digest2).await.is_ok();
+        *stages_in.lock() = s;
+    });
+    narf_scheduler::run_until_empty();
+    let stages = *stages.lock();
+    if stages != [true; 6] {
+        return TestResult::Fail("multi-command TIS stage failed (see stage order in source)");
+    }
+    let after1 = pcr_extend_value(&[0u8; 32], &digest1);
+    if dev.pcr(4) != pcr_extend_value(&after1, &digest2) {
+        return TestResult::Fail("device PCR 4 chain does not match the conversation");
+    }
+    // The discipline held for every command: no FIFO byte was
+    // dropped anywhere in the conversation.
+    if dev.dropped_fifo_bytes() != 0 {
+        return TestResult::Fail("device dropped FIFO bytes — commandReady discipline missing");
+    }
+    if !dev.is_started() {
+        return TestResult::Fail("device not started after the conversation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-tis-multi",
+    smoke_tpm_tis_multi_command_conversation
+);
+
+fn smoke_tpm_probe_startup_extend_conversation() -> TestResult {
+    use narf_tpm::types::TpmRc;
+
+    // The boot-path lifecycle conversation: the composition
+    // `try_init_default` performs on real silicon — device,
+    // registry publication, registry dispatch — with the
+    // lifecycle edge this lane adds: the registered handle is
+    // started through the trait's `startup`, the call the
+    // production probe now makes between probe and registration,
+    // before the first extend is dispatched. The keystone's
+    // discovery fixture covers the same composition with Startup
+    // submitted as a hand-built raw frame; this one pins the
+    // trait surface production actually uses.
+    let mut dev = FakeTpmDevice::crb();
+    let mut cmd_mem = alloc::vec![0u8; 4096];
+    let mut rsp_mem = alloc::vec![0u8; 4096];
+    let cmd_ptr = cmd_mem.as_mut_ptr();
+    let rsp_ptr = rsp_mem.as_mut_ptr();
+    dev.attach_buffers(cmd_ptr, 4096, rsp_ptr, 4096);
+    let dev = Arc::new(dev);
+    if tpm::crb_acquire_and_program(
+        dev.as_ref(),
+        cmd_ptr as u64,
+        4096,
+        rsp_ptr as u64,
+        4096,
+        narf_time::Deadline::after_ms(750),
+    )
+    .is_err()
+    {
+        return TestResult::Fail("CRB bring-up failed against the model");
+    }
+    narf_tpm::registry::__reset_for_test();
+    let adapter: Arc<dyn TpmDevice> = Arc::new(ModelDevice {
+        dev: dev.clone(),
+        cmd_ptr,
+        rsp_ptr,
+        tis: false,
+    });
+    narf_tpm::registry::register(adapter);
+    let digest: [u8; 32] = [0x5A; 32];
+    let stages = Arc::new(IrqSafeSpinLock::new([false; 4]));
+    let stages_in = stages.clone();
+    narf_scheduler::__reset_queues_for_test();
+    narf_scheduler::spawn(async move {
+        let mut s = [false; 4];
+        if let Some(handle) = narf_tpm::registry::list().first().cloned() {
+            // 1. Before Startup, the registry dispatch is
+            //    rejected exactly as `frame::measure` observes it.
+            s[0] = matches!(
+                handle.extend_pcr(4, &digest).await,
+                Err(HighLevelTpmError::Rc(TpmRc::Initialize))
+            );
+            // 2. The lifecycle call.
+            s[1] = handle.startup(narf_tpm::StartupType::Clear).await.is_ok();
+            // 3. The extend now lands.
+            s[2] = handle.extend_pcr(4, &digest).await.is_ok();
+            // 4. Read-back through the registry handle matches the
+            //    device-side chain.
+            let want = pcr_extend_value(&[0u8; 32], &digest);
+            s[3] = matches!(handle.read_pcr(4).await, Ok(v) if v == want.to_vec());
+        }
+        *stages_in.lock() = s;
+    });
+    narf_scheduler::run_until_empty();
+    let stages = *stages.lock();
+    let started = dev.is_started();
+    let pcr_ok = dev.pcr(4) == pcr_extend_value(&[0u8; 32], &digest);
+    narf_tpm::registry::__reset_for_test();
+    let _ = (cmd_mem, rsp_mem);
+    if stages != [true; 4] {
+        return TestResult::Fail("probe/startup/extend stage failed (see stage order in source)");
+    }
+    if !started || !pcr_ok {
+        return TestResult::Fail("device state does not reflect the conversation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-startup",
+    smoke_tpm_probe_startup_extend_conversation
 );

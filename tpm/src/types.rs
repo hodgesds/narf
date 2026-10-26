@@ -128,3 +128,32 @@ impl PcrSet {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PolicyHash(pub [u8; 32]);
+
+/// The `TPM_SU` operand of `TPM2_Startup` (TCG Part 2 §6.9, Part 3
+/// §9.3) — which lifecycle edge [`crate::TpmDevice::startup`] drives
+/// the device across.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StartupType {
+    /// `TPM_SU_CLEAR` — a full start: PCRs reset, no saved state
+    /// consulted. The only form valid after a power loss, and the
+    /// power-on form the production probe submits.
+    Clear,
+    /// `TPM_SU_STATE` — resume the state a matching
+    /// `TPM2_Shutdown(TPM_SU_STATE)` saved; valid only when the TPM
+    /// was shut down in that mode with no intervening power loss.
+    /// The suspend/resume sequencing that pairs the Shutdown and
+    /// this Startup is owned by the power-suspend program (#1003);
+    /// the type exists here so that lane consumes the same
+    /// lifecycle surface instead of growing a second one.
+    State,
+}
+
+impl StartupType {
+    /// The wire value (`TPM_SU`) of this startup type.
+    pub fn su(self) -> u16 {
+        match self {
+            StartupType::Clear => crate::tpm2::TPM_SU_CLEAR,
+            StartupType::State => crate::tpm2::TPM_SU_STATE,
+        }
+    }
+}
