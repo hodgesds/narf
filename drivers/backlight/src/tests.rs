@@ -20,7 +20,6 @@ mod smokes {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use crate::acpi_video::{__reset_for_test as av_reset, __test_install};
-    use crate::amdgpu_bl::{build_set_level_writes, AmdgpuBacklightDevice, MockAmdgpuBlExecutor};
     use crate::brightness_keys::{handle_notify, NOTIFY_BRIGHTNESS_DOWN, NOTIFY_BRIGHTNESS_UP};
     use crate::kbd_backlight::dell_encode_kbd_level;
     use crate::leds::{led_device, register_led, unregister_led, LedDevice, SimpleLed, Trigger};
@@ -116,80 +115,13 @@ mod smokes {
     }
     kernel_test_in!("drivers/backlight", smoke_acpi_video_bcm_snap);
 
-    // ── 4. AMDGPU backlight PWM level write (stub interface) ───────
-
-    fn smoke_amdgpu_bl_pwm_level_write() -> TestResult {
-        __reset_all_for_test();
-
-        let exec = Arc::new(MockAmdgpuBlExecutor::new(0x8000));
-        let dev = Arc::new(AmdgpuBacklightDevice::new(
-            "amdgpu_bl0",
-            exec.clone(),
-            0x8000,
-        ));
-
-        // Initial state from constructor.
-        if dev.current_brightness() != 0x8000 {
-            return TestResult::Fail("initial brightness wrong");
-        }
-        // set_brightness must call the executor.
-        dev.set_brightness(0xC000);
-        if exec.level.load(Ordering::Acquire) != 0xC000 {
-            return TestResult::Fail("executor level not updated");
-        }
-        if exec.set_count.load(Ordering::Acquire) != 1 {
-            return TestResult::Fail("set_count not 1");
-        }
-        if dev.current_brightness() != 0xC000 {
-            return TestResult::Fail("cached brightness not updated");
-        }
-        // Clamp above max.
-        dev.set_brightness(0xFFFF + 1);
-        if exec.level.load(Ordering::Acquire) != 0xFFFF {
-            return TestResult::Fail("clamp above max failed");
-        }
-
-        __reset_all_for_test();
-        TestResult::Pass
-    }
-    kernel_test_in!("drivers/backlight", smoke_amdgpu_bl_pwm_level_write);
-
-    // ── 5. AMDGPU build_set_level_writes sequence ─────────────────
-
-    fn smoke_amdgpu_build_set_level_writes() -> TestResult {
-        let base: u32 = 0x0001_0000;
-        let level: u16 = 0xBEEF;
-        let writes = build_set_level_writes(base, level);
-        if writes.len() != 3 {
-            return TestResult::Fail("expected 3 writes: lock, level, unlock");
-        }
-        // First write: lock assert.
-        let (lock_addr, lock_val) = writes[0];
-        if lock_addr != base + 0x4B70 {
-            return TestResult::Fail("lock addr wrong");
-        }
-        if lock_val != 1 << 31 {
-            return TestResult::Fail("lock value wrong");
-        }
-        // Second write: user level.
-        let (level_addr, level_val) = writes[1];
-        if level_addr != base + 0x4B64 {
-            return TestResult::Fail("level addr wrong");
-        }
-        if level_val != level as u32 {
-            return TestResult::Fail("level value wrong");
-        }
-        // Third write: lock release.
-        let (unlock_addr, unlock_val) = writes[2];
-        if unlock_addr != base + 0x4B70 {
-            return TestResult::Fail("unlock addr wrong");
-        }
-        if unlock_val != 0 {
-            return TestResult::Fail("unlock value != 0");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!("drivers/backlight", smoke_amdgpu_build_set_level_writes);
+    // ── 4/5 retired with the amdgpu_bl bridge (#951) ──────────────
+    // The bridge module and its two smokes were deleted: one smoke
+    // asserted the pre-fix BL_PWM write sequence verbatim (lock
+    // `1 << 31` at base+0x4B70, USER_LEVEL at base+0x4B64) — a
+    // fixture pinning the bug. The production AMD owner is
+    // `AmdgpuPanelBacklight` in drivers/gpu, covered by that crate's
+    // contract smoke and the arbitration fixtures below.
 
     // ── 6. LED class registry ─────────────────────────────────────
 
@@ -787,4 +719,45 @@ mod smokes {
         TestResult::Pass
     }
     kernel_test_in!("drivers/backlight", smoke_arbitration_keys_step_owner_only);
+
+    // ── 22. Composition: initcalls registered in a composed boot ──
+
+    fn smoke_backlight_composition_registers_initcalls() -> TestResult {
+        // #947: the frame composition root must call this crate's
+        // register_initcalls(), so a composed boot carries the
+        // backlight Stage::Device initcalls. Before the fix the list
+        // contained no backlight entries at all and none of the
+        // subsystem ever ran in production.
+        let names = narf_init::registered_names(narf_init::Stage::Device);
+        for want in [
+            "backlight/acpi-video",
+            "backlight/intel",
+            "backlight/leds",
+            "backlight/kbd",
+            "backlight/brightness-keys",
+            "backlight/sysfs",
+        ] {
+            if !names.iter().any(|n| *n == want) {
+                return TestResult::Fail("backlight initcall missing from composed boot");
+            }
+        }
+        // The sysfs initcall's body guarantees the class directory
+        // exists even on a panel-less machine. Run it, then verify
+        // through the non-creating child lookup so the assertion
+        // cannot create the class itself.
+        populate_backlight_class();
+        let root = narf_filesystem::sysfs::sysfs_root();
+        let class_dir = match root.get_child("class") {
+            Some(c) => c,
+            None => return TestResult::Fail("/sys/class missing"),
+        };
+        if class_dir.get_child("backlight").is_none() {
+            return TestResult::Fail("/sys/class/backlight missing after populate");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_backlight_composition_registers_initcalls
+    );
 }
