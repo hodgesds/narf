@@ -34,6 +34,9 @@ pub(in crate::cyw43439) struct Bus {
     mfp_fault: u8,
     mfp_held: bool,
     phy_profile: Option<(u32, u8)>,
+    wide: Option<super::super::phy_fixture::Wide>,
+    current_chanspec: u16,
+    wide_started: bool,
     bandwidth: u32,
 }
 impl Bus {
@@ -62,6 +65,9 @@ impl Bus {
             mfp_fault: 0,
             mfp_held: false,
             phy_profile: None,
+            wide: None,
+            current_chanspec: 0x1006,
+            wide_started: false,
             bandwidth: 1,
         }
     }
@@ -80,11 +86,25 @@ impl Bus {
         self.phy_profile = Some((chains, fault));
         self.mfp_held = false;
     }
+    pub(in crate::cyw43439) fn wide_profile(&mut self, wide: super::super::phy_fixture::Wide) {
+        self.bandwidth = wide.caps[0];
+        self.valid_channels = vec![1, 2, 6, 10, 11];
+        self.wide = Some(wide);
+    }
+    pub(in crate::cyw43439) fn release_wide(&mut self) {
+        if let Some(wide) = &mut self.wide {
+            wide.fault = super::super::phy_fixture::WideFault::None;
+        }
+        self.mfp_held = false;
+    }
     fn request_ies(&self) -> Vec<u8> {
         let mut ies = self.wpa_ie.clone().unwrap_or_default();
         if let Some((chains, fault)) = self.phy_profile {
             if fault != 3 {
-                ies.extend_from_slice(&super::super::phy_fixture::request(chains));
+                ies.extend_from_slice(&self.wide.as_ref().map_or_else(
+                    || super::super::phy_fixture::request(chains),
+                    |wide| wide.request(chains, self.bandwidth == 3),
+                ));
             }
             if fault == 8 {
                 let index = ies.len() - 37 + 5;
@@ -98,7 +118,10 @@ impl Bus {
             if fault == 4 {
                 vec![0, 0]
             } else {
-                super::super::phy_fixture::response(6, chains)
+                self.wide.as_ref().map_or_else(
+                    || super::super::phy_fixture::response(6, chains),
+                    |wide| wide.response(6, chains),
+                )
             }
         })
     }
@@ -112,9 +135,11 @@ impl Bus {
                 let size = usize::from(HwHeader::decode(bytes).unwrap().length);
                 let command = BcdcHeader::decode(&bytes[12..]).unwrap().cmd;
                 let body = &bytes[28..size];
-                (matches!(command, 23 | 134)
+                (matches!(command, 23 | 26 | 134)
                     || body.starts_with(b"mfp\0")
                     || body.starts_with(b"assoc_")
+                    || body.starts_with(b"bw_cap\0")
+                    || body.starts_with(b"chanspec")
                     || body.starts_with(b"wpaie\0"))
                 .then(|| (command, body.to_vec()))
             })
@@ -290,21 +315,53 @@ impl PacketTransport for Bus {
                         .extend_from_slice(&u32::from(self.phy_profile.is_some()).to_le_bytes());
                 } else if body.starts_with(b"rxchain\0") {
                     response.extend_from_slice(&self.phy_profile.map_or(0, |p| p.0).to_le_bytes());
+                } else if body.starts_with(b"per_chan_info\0") {
+                    let ch = u32::from_le_bytes(body[14..18].try_into().unwrap());
+                    assert_eq!(ch & !255, 0x1000);
+                    let wide = self.wide.as_ref().expect("wide channel query profile");
+                    assert!(matches!(ch & 255, 6) || ch & 255 == u32::from(wide.secondary));
+                    let flags = 3u32
+                        | if ch & 255 == u32::from(wide.secondary)
+                            && wide.fault == super::super::phy_fixture::WideFault::ChannelRestricted
+                        {
+                            32
+                        } else {
+                            0
+                        };
+                    response.extend_from_slice(&flags.to_le_bytes());
                 } else if body.starts_with(b"bw_cap\0") {
                     response.extend_from_slice(
                         &(if self.phy_profile.is_some_and(|p| p.1 == 1) {
                             3
+                        } else if self.wide_started
+                            && self.bandwidth == 3
+                            && self.wide.as_ref().is_some_and(|w| {
+                                w.fault == super::super::phy_fixture::WideFault::CapReadback
+                            })
+                        {
+                            1
                         } else {
                             self.bandwidth
                         })
                         .to_le_bytes(),
                     );
+                } else if body.starts_with(b"chanspecs\0") {
+                    response.extend_from_slice(
+                        &self
+                            .wide
+                            .as_ref()
+                            .map_or_else(|| vec![0; 4], |wide| wide.list()),
+                    );
                 } else if body.starts_with(b"chanspec\0") {
                     response.extend_from_slice(
                         &(if self.phy_profile.is_some_and(|p| p.1 == 2) {
                             0x1808u32
-                        } else {
+                        } else if self.wide.as_ref().is_some_and(|w| {
+                            w.fault == super::super::phy_fixture::WideFault::CurrentWidth
+                        }) {
                             0x1006
+                        } else {
+                            u32::from(self.current_chanspec)
                         })
                         .to_le_bytes(),
                     );
@@ -343,7 +400,11 @@ impl PacketTransport for Bus {
                     }
                 } else if body.starts_with(b"assoc_resp_ies\0") {
                     response.extend_from_slice(&self.response_ies());
-                    if self.phy_profile.is_some_and(|p| p.1 == 5) {
+                    if self.phy_profile.is_some_and(|p| p.1 == 5)
+                        || self.wide.as_ref().is_some_and(|w| {
+                            w.fault == super::super::phy_fixture::WideFault::HoldResponse
+                        })
+                    {
                         self.mfp_held = true;
                     }
                 } else {
@@ -362,14 +423,29 @@ impl PacketTransport for Bus {
                     69,
                     8,
                     0,
-                    &scan_result_profile(id, self.secured, self.pmf_required, self.phy_profile),
+                    &scan_result_profile(
+                        id,
+                        self.secured,
+                        self.pmf_required,
+                        self.phy_profile,
+                        self.wide.as_ref(),
+                    ),
                     maximum,
                 );
                 self.event(69, 0, 0, &[], maximum);
             }
             263 if body.starts_with(b"wpaie\0") => self.wpa_ie = Some(body[6..].to_vec()),
             263 if body.starts_with(b"bw_cap\0") => {
-                self.bandwidth = u32::from_le_bytes(body[11..15].try_into().unwrap())
+                self.bandwidth = u32::from_le_bytes(body[11..15].try_into().unwrap());
+                self.wide_started |= self.bandwidth == 3;
+                if self.bandwidth == 3
+                    && self
+                        .wide
+                        .as_ref()
+                        .is_some_and(|w| w.fault == super::super::phy_fixture::WideFault::HoldCap)
+                {
+                    self.mfp_held = true;
+                }
             }
             263 if body.starts_with(b"mfp\0") => {
                 self.mfp_mode = u32::from_le_bytes(body[4..8].try_into().unwrap())
@@ -377,6 +453,18 @@ impl PacketTransport for Bus {
             263 if body.starts_with(b"roam_off\0") => self.roam_off = body[9..] == [1, 0, 0, 0],
             268 => self.secured = true,
             26 if self.join_events => {
+                let expected = if self.bandwidth == 3 {
+                    self.wide
+                        .as_ref()
+                        .ok_or(TransportError::BadFraming)?
+                        .operating
+                } else {
+                    0x1006
+                };
+                if body.get(48..50) != Some(expected.to_le_bytes().as_slice()) {
+                    return Err(TransportError::BadFraming);
+                }
+                self.current_chanspec = expected;
                 let protected_ie = pmf_ie();
                 let expected: &[u8] = if self.pmf_required {
                     &protected_ie
@@ -521,7 +609,7 @@ fn ready<F: Future>(future: F) -> Option<F::Output> {
     }
 }
 fn scan_result(id: u16, secured: bool) -> Vec<u8> {
-    scan_result_profile(id, secured, false, None)
+    scan_result_profile(id, secured, false, None, None)
 }
 fn pmf_ie() -> Vec<u8> {
     vec![
@@ -529,7 +617,13 @@ fn pmf_ie() -> Vec<u8> {
         172, 6,
     ]
 }
-fn scan_result_profile(id: u16, secured: bool, mfp: bool, phy: Option<(u32, u8)>) -> Vec<u8> {
+fn scan_result_profile(
+    id: u16,
+    secured: bool,
+    mfp: bool,
+    phy: Option<(u32, u8)>,
+    wide: Option<&super::super::phy_fixture::Wide>,
+) -> Vec<u8> {
     let mut ies = vec![0, 4, b't', b'e', b's', b't'];
     if secured {
         if mfp {
@@ -541,7 +635,10 @@ fn scan_result_profile(id: u16, secured: bool, mfp: bool, phy: Option<(u32, u8)>
         }
     }
     if let Some((chains, fault)) = phy {
-        let extra = super::super::phy_fixture::response(6, chains);
+        let extra = wide.map_or_else(
+            || super::super::phy_fixture::response(6, chains),
+            |w| w.beacon(6, chains),
+        );
         ies.extend_from_slice(if fault == 9 { &extra[..52] } else { &extra });
     }
     let mut out = vec![0; 12 + 128 + ies.len()];

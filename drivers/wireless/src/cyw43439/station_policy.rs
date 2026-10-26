@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Live host-policy observation, separate from firmware/RF quiescence.
-use super::{channel_ceiling, channel_power, Fullmac, Station};
+use super::{channel, channel_ceiling, occupied_power, Fullmac, Station};
 use crate::cyw43439::runtime::Error;
 use alloc::{sync::Arc, vec::Vec};
 use core::{
@@ -29,9 +29,14 @@ impl PolicySource for GlobalPolicy {
 
 #[derive(Clone, Copy)]
 pub(super) struct TxGrant {
-    channel: u8,
+    channel: channel::Operating,
     power: u8,
     country: [u8; 2],
+}
+impl TxGrant {
+    pub(super) fn width(self) -> u32 {
+        self.channel.width()
+    }
 }
 
 impl<R: Fullmac> Station<R> {
@@ -95,6 +100,16 @@ impl<R: Fullmac> Station<R> {
     }
 
     pub(super) fn grant(&mut self, channel: u8, power: u8) -> Result<TxGrant, Error> {
+        self.grant_occupied(
+            channel::Operating::twenty(channel).ok_or(Error::Unsupported)?,
+            power,
+        )
+    }
+    pub(super) fn grant_occupied(
+        &mut self,
+        channel: channel::Operating,
+        power: u8,
+    ) -> Result<TxGrant, Error> {
         self.refresh_policy()?;
         let grant = TxGrant {
             channel,
@@ -109,7 +124,7 @@ impl<R: Fullmac> Station<R> {
         self.refresh_policy()?;
         if grants.iter().any(|g| {
             g.country != self.domain.country_code
-                || channel_power(&self.domain, g.channel).is_none_or(|limit| limit < g.power)
+                || occupied_power(&self.domain, g.channel).is_none_or(|limit| limit < g.power)
         }) {
             return Err(self.deny_policy());
         }
@@ -297,7 +312,7 @@ impl Fence<'_> {
                 .all(|&ch| channel_ceiling(&now, ch, false).is_some())
             && self.grants.iter().all(|grant| {
                 grant.country == now.country_code
-                    && channel_power(&now, grant.channel).is_some_and(|power| power >= grant.power)
+                    && occupied_power(&now, grant.channel).is_some_and(|power| power >= grant.power)
             })
     }
     async fn command<R: Fullmac>(

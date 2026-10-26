@@ -1,29 +1,81 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Firmware-owned HT20 admission. Linux brcmfmac/cfg80211.c
+//! Firmware-owned HT20/40 admission. Linux brcmfmac/cfg80211.c
 //! brcmf_setup_wiphybands, brcmf_update_ht_cap and brcmf_get_assoc_ies.
 use super::{channel, get_var, policy::TxGrant, set_var, Error, Fullmac, Station, MAX_REPLY};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Capabilities {
     ht: [u8; 26],
+    wide: [bool; 2],
+    chanspecs: alloc::vec::Vec<u16>,
 }
 impl Capabilities {
-    pub(super) fn body(self) -> [u8; 26] {
-        self.ht
+    pub(super) fn body(&self, five: bool) -> [u8; 26] {
+        let mut ht = self.ht;
+        if self.wide[usize::from(five)] {
+            ht[0] |= 2 | 64; // SUP_WIDTH_20_40 and SGI40 from actual bw_cap.
+        }
+        ht
     }
-    pub(super) fn prepare(self, ies: &[u8], channel: u8) -> Result<Option<Self>, Error> {
+    pub(super) fn prepare(
+        &self,
+        ies: &[u8],
+        channel: u8,
+        valid: &[u8],
+    ) -> Result<Option<Profile>, Error> {
         let Elements { ht, operation } = elements(ies)?;
         if ht.is_none() && operation.is_none() {
             return Ok(None);
         }
-        self.ap(ies, channel)?;
-        Ok(Some(self))
+        let mut profile = Profile {
+            ht: self.ht,
+            channel: channel::Operating::twenty(channel).ok_or(Error::Unsupported)?,
+        };
+        profile.ap(ies)?;
+        let ht = ht.ok_or(Error::Unsupported)?;
+        let operation = operation.ok_or(Error::Unsupported)?;
+        if self.wide[usize::from(channel > 14)]
+            && ht[0] & 2 != 0
+            && ht[1] & 0x40 == 0
+            && operation[1] & 4 != 0
+        {
+            let secondary = match operation[1] & 3 {
+                1 => channel.checked_add(4),
+                3 => channel.checked_sub(4),
+                _ => None,
+            };
+            if let Some(occupied) = secondary
+                .filter(|ch| valid.contains(ch))
+                .and_then(|ch| channel::Operating::forty(channel, ch))
+            {
+                if self.chanspecs.contains(&occupied.chanspec()) {
+                    profile.channel = occupied;
+                    profile.ht = self.body(channel > 14);
+                }
+            }
+        }
+        Ok(Some(profile))
     }
-    fn ap(self, ies: &[u8], channel: u8) -> Result<(), Error> {
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Profile {
+    ht: [u8; 26],
+    pub(super) channel: channel::Operating,
+}
+impl Profile {
+    pub(super) fn narrow(mut self) -> Self {
+        self.ht[0] &= !(2 | 64);
+        self.channel = channel::Operating::twenty(self.channel.primary).expect("validated primary");
+        self
+    }
+    fn ap(self, ies: &[u8]) -> Result<(), Error> {
         let Elements { ht, operation } = elements(ies)?;
         let ht = ht.ok_or(Error::Unsupported)?;
         let operation = operation.ok_or(Error::Unsupported)?;
-        if operation[0] != channel
+        if operation[0] != self.channel.primary
+            || operation[1] & 3 == 2
+            || operation[1] & 0xf0 != 0
             || ht[3] == 0
             || ht[2] & 0xe0 != 0
             || ht[0] & 12 == 8
@@ -38,12 +90,23 @@ impl Capabilities {
         {
             return Err(Error::Unsupported);
         }
+        if let Some(secondary) = self.channel.secondary {
+            let offset = if secondary > self.channel.primary {
+                1
+            } else {
+                3
+            };
+            if ht[0] & 2 == 0 || ht[1] & 0x40 != 0 || operation[1] & 7 != (4 | offset) {
+                return Err(Error::Unsupported);
+            }
+        }
         Ok(())
     }
     fn request(self, ies: &[u8]) -> Result<(), Error> {
         let Elements { ht, operation } = elements(ies)?;
         let ht = ht.ok_or(Error::Unsupported)?;
-        // The source profile is bounded to HT20, SGI20 and actual RX chains.
+        // The source profile is bounded to its configured width, short GI
+        // and actual RX chains.
         // Firmware may select SMPS; it cannot advertise unqualified wider PHY.
         if operation.is_some()
             || ht[0] & !12 != self.ht[0]
@@ -100,18 +163,10 @@ pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabili
             Err(error) => Err(error),
         }
     }
-    let Some(mode) = optional(runtime, "nmode").await? else {
-        return Ok(None);
-    };
-    if mode == 0 {
-        return Ok(None);
-    }
-    if !R::BAND_5GHZ {
-        let mut cap = [0; 8];
-        cap[..4].copy_from_slice(&2u32.to_le_bytes());
-        cap[4..].copy_from_slice(&1u32.to_le_bytes());
-        set_var(runtime, "bw_cap", &cap).await?;
-    }
+    let mode = optional(runtime, "nmode").await?.unwrap_or(0);
+    let mut available = [0u32; 2];
+    // Discover before narrowing; a configured20MHz cap is not the original
+    // firmware capability. Linux brcmf_get_bwcap queries each explicit band.
     for band in if R::BAND_5GHZ {
         &[2u32, 1][..]
     } else {
@@ -119,12 +174,77 @@ pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabili
     } {
         let mut query = b"bw_cap\0".to_vec();
         query.extend_from_slice(&band.to_le_bytes());
+        if mode == 0 && !R::BAND_5GHZ {
+            break;
+        }
         let reply = runtime
             .command(super::Direction::Get, 262, &query, 4)
             .await?;
-        if reply.as_slice() != 1u32.to_le_bytes() {
+        if reply.len() != 4 {
+            return Err(Error::Malformed);
+        }
+        let value = u32::from_le_bytes(reply.try_into().unwrap());
+        if value & 1 == 0 || value & !15 != 0 {
             return Err(Error::Unsupported);
         }
+        available[usize::from(*band == 1)] = value;
+    }
+    let mut chanspecs = alloc::vec::Vec::new();
+    if mode != 0 && available.iter().any(|cap| cap & 2 != 0) {
+        // brcmf_chanspec_list is count:u32 followed by chanspec:u32 rows.
+        // The native response, not an HT/chip alias, qualifies exact40MHz
+        // primary/secondary pairs. Unsupported queries retain20MHz.
+        // Source BRCMF_DCMD_MEDLEN1536, hence at most383 u32 entries.
+        match get_var(runtime, "chanspecs", 1536).await {
+            Ok(reply) => {
+                let count = super::le32(&reply, 0)? as usize;
+                let end = count
+                    .checked_mul(4)
+                    .and_then(|n| n.checked_add(4))
+                    .ok_or(Error::Malformed)?;
+                if count > 383 || end > reply.len() || reply[end..].iter().any(|b| *b != 0) {
+                    return Err(Error::Malformed);
+                }
+                for row in reply[4..end].chunks_exact(4) {
+                    let value = u32::from_le_bytes(row.try_into().unwrap());
+                    let value = u16::try_from(value).map_err(|_| Error::Malformed)?;
+                    if let Some(occupied) = channel::Operating::decode40(value) {
+                        if (occupied.primary <= 14 || R::BAND_5GHZ) && !chanspecs.contains(&value) {
+                            chanspecs.push(value);
+                        }
+                    }
+                }
+            }
+            Err(Error::Firmware(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    // WLC_UP and scans remain constrained20MHz. A later fully authorized
+    // association sets/readbacks the selected width under its occupied grant.
+    for band in if R::BAND_5GHZ {
+        &[2u32, 1][..]
+    } else if mode != 0 {
+        &[2u32][..]
+    } else {
+        &[][..]
+    } {
+        let mut cap = [0; 8];
+        cap[..4].copy_from_slice(&band.to_le_bytes());
+        cap[4..].copy_from_slice(&1u32.to_le_bytes());
+        set_var(runtime, "bw_cap", &cap).await?;
+        let mut query = b"bw_cap\0".to_vec();
+        query.extend_from_slice(&band.to_le_bytes());
+        if runtime
+            .command(super::Direction::Get, 262, &query, 4)
+            .await?
+            .as_slice()
+            != 1u32.to_le_bytes()
+        {
+            return Err(Error::Unsupported);
+        }
+    }
+    if mode == 0 {
+        return Ok(None);
     }
     let Some(chains) = optional(runtime, "rxchain").await? else {
         return Ok(None);
@@ -140,7 +260,15 @@ pub(super) async fn probe<R: Fullmac>(runtime: &mut R) -> Result<Option<Capabili
     ht[2] = 31; // Source64K A-MPDU factor,16us density; firmware owns BA/RX.
     ht[3..3 + chains.count_ones() as usize].fill(255);
     ht[15] = 1; // TX MCS defined/equal RX, as brcmf_update_ht_cap.
-    Ok(Some(Capabilities { ht }))
+    let wide = [false, true].map(|five| {
+        available[usize::from(five)] & 2 != 0
+            && chanspecs.iter().any(|value| (*value & 0xc000 != 0) == five)
+    });
+    Ok(Some(Capabilities {
+        ht,
+        wide,
+        chanspecs,
+    }))
 }
 
 impl<R: Fullmac> Station<R> {
@@ -149,15 +277,13 @@ impl<R: Fullmac> Station<R> {
         grant: TxGrant,
         peer: [u8; 6],
         channel: u8,
-        profile: Capabilities,
+        profile: Profile,
     ) -> Result<(), Error> {
         if self.tx_get(grant, 23, &[], 6).await?.as_slice() != peer {
             return Err(Error::Malformed);
         }
         let actual = self.tx_query(grant, "chanspec", 4).await?;
-        if actual.as_slice()
-            != u32::from(channel::encode20(channel).ok_or(Error::Unsupported)?).to_le_bytes()
-        {
+        if actual.as_slice() != u32::from(profile.channel.chanspec()).to_le_bytes() {
             return Err(Error::Unsupported);
         }
         let info = self.tx_query(grant, "assoc_info", 8).await?;
@@ -178,6 +304,49 @@ impl<R: Fullmac> Station<R> {
         if response_ies.len() != response {
             return Err(Error::Malformed);
         }
-        profile.ap(&response_ies, channel)
+        if profile.channel.primary != channel {
+            return Err(Error::Malformed);
+        }
+        profile.ap(&response_ies)
+    }
+
+    pub(super) async fn configure_width(
+        &mut self,
+        grant: TxGrant,
+        occupied: channel::Operating,
+    ) -> Result<(), Error> {
+        if let Some(secondary) = occupied.secondary {
+            // cfg80211::brcmf_construct_chaninfo queries per_chan_info on
+            // each20MHz constituent. Index0 uses the plain iovar (fwil.c).
+            // Never discard a firmware-only passive/radar/invalid restriction.
+            for channel in [occupied.primary, secondary] {
+                let mut query = b"per_chan_info\0".to_vec();
+                query.extend_from_slice(
+                    &u32::from(channel::encode20(channel).ok_or(Error::Unsupported)?).to_le_bytes(),
+                );
+                let reply = self.tx_get(grant, 262, &query, 4).await?;
+                let flags = super::le32(&reply, 0)?;
+                let expected = 3 | if channel > 14 { 4 } else { 0 }; // VALID_HW, VALID_SW, BAND_5G.
+                if reply.len() != 4 || flags != expected {
+                    return Err(Error::Unsupported);
+                }
+            }
+        }
+        let band = if occupied.primary <= 14 { 2u32 } else { 1u32 };
+        let width = if occupied.secondary.is_some() {
+            3u32
+        } else {
+            1u32
+        };
+        let mut cap = [0; 8];
+        cap[..4].copy_from_slice(&band.to_le_bytes());
+        cap[4..].copy_from_slice(&width.to_le_bytes());
+        self.tx_var(grant, "bw_cap", &cap).await?;
+        let mut query = b"bw_cap\0".to_vec();
+        query.extend_from_slice(&band.to_le_bytes());
+        if self.tx_get(grant, 262, &query, 4).await?.as_slice() != width.to_le_bytes() {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
     }
 }

@@ -96,27 +96,6 @@ impl<R: Fullmac> Station<R> {
         country[8..10].copy_from_slice(&domain.country_code);
         set_var(&mut runtime, "country", &country).await?;
         runtime.configure_bus().await?;
-        if R::BAND_5GHZ {
-            // A 20 MHz join chanspec alone is not a firmware bandwidth cap.
-            // Bound both actual BCM43602 bands before WLC_UP, and require
-            // readback; a wider automatic firmware policy cannot satisfy
-            // this retained 20 MHz host-policy profile.
-            for band in [2u32, 1u32] {
-                // WLC_BAND_2G, WLC_BAND_5G.
-                let mut cap = [0; 8];
-                cap[..4].copy_from_slice(&band.to_le_bytes());
-                cap[4..].copy_from_slice(&1u32.to_le_bytes()); // WLC_BW_CAP_20MHZ.
-                set_var(&mut runtime, "bw_cap", &cap).await?;
-                let mut query = b"bw_cap\0".to_vec();
-                query.extend_from_slice(&band.to_le_bytes());
-                let reply = runtime
-                    .command(Direction::Get, ioctl::WLC_GET_VAR, &query, 4)
-                    .await?;
-                if reply.as_slice() != 1u32.to_le_bytes() {
-                    return Err(Error::Unsupported);
-                }
-            }
-        }
         let phy = phy::probe(&mut runtime).await?;
         set_int(&mut runtime, ioctl::WLC_SET_PM, 0).await?;
         set_int(&mut runtime, 20, 1).await?; // Infrastructure station.
@@ -209,13 +188,24 @@ impl<R: Fullmac> Station<R> {
     pub fn supports_management_protection(&self) -> bool {
         self.mfp_supported && self.supplicant
     }
-    /// Actual queried and20MHz-constrained firmware HT capabilities.
-    pub fn ht_capabilities(&self) -> Option<[u8; 26]> {
-        self.phy.map(phy::Capabilities::body)
+    /// Actual queried HT capabilities by2GHz/5GHz band. Width40 also requires
+    /// exact firmware chanspec inventory; it grants no operating permission.
+    pub fn ht_capabilities(&self) -> [Option<[u8; 26]>; 2] {
+        [false, true].map(|five| {
+            self.phy
+                .as_ref()
+                .filter(|_| !five || R::BAND_5GHZ)
+                .map(|phy| phy.body(five))
+        })
     }
     /// Completed native HT association facts for the currently admitted peer.
     pub fn ht_connection(&self) -> bool {
         self.ht_verified && self.bssid.is_some() && self.connection.is_some()
+    }
+    /// Last native-verified occupied width of this connected peer. Metadata
+    /// grants no TX authority; the current policy fence still guards service.
+    pub fn channel_width_mhz(&self) -> Option<u32> {
+        self.bssid.and(self.connection).map(policy::TxGrant::width)
     }
 
     /// Linux brcmf_cfg80211_set_power_mgmt: PM_FAST / PM_OFF followed by
@@ -456,9 +446,6 @@ impl<R: Fullmac> Station<R> {
             .ok_or(Error::Malformed)?
             .clone();
         self.refresh_policy()?;
-        let power =
-            channel_power(&self.domain, bss.info.channel as u8).ok_or(Error::Unsupported)?;
-        let grant = self.grant(bss.info.channel as u8, power)?;
         let secure = match &request.security {
             SecurityConfig::Open
                 if matches!(bss.info.security, narf_wireless::scan::BssSecurity::Open) =>
@@ -482,11 +469,24 @@ impl<R: Fullmac> Station<R> {
         let protection =
             mfp::Profile::negotiate(&bss.ies, &request.ie, secure, self.mfp_supported)?;
         validate_association_ies(&request.ie, secure, protection.required())?;
-        let ht = self
+        let mut ht = self
             .phy
-            .map(|phy| phy.prepare(&bss.ies, bss.info.channel as u8))
+            .as_ref()
+            .map(|phy| phy.prepare(&bss.ies, bss.info.channel as u8, &self.channels))
             .transpose()?
             .flatten();
+        if ht.is_some_and(|profile| {
+            profile.channel.secondary.is_some()
+                && occupied_power(&self.domain, profile.channel).is_none()
+        }) {
+            ht = ht.map(phy::Profile::narrow);
+        }
+        let occupied = ht.map_or_else(
+            || channel::Operating::twenty(bss.info.channel as u8).ok_or(Error::Unsupported),
+            |profile| Ok(profile.channel),
+        )?;
+        let power = occupied_power(&self.domain, occupied).ok_or(Error::Unsupported)?;
+        let grant = self.grant_occupied(occupied, power)?;
         self.mfp_verified = false;
         self.ht_verified = false;
         self.tx_var(grant, "qtxpower", &(u32::from(power) * 4).to_le_bytes())
@@ -494,6 +494,9 @@ impl<R: Fullmac> Station<R> {
         self.runtime.poll()?;
         while self.runtime.pop_event().is_some() {}
         let result = async {
+            if self.phy.is_some() || R::BAND_5GHZ {
+                self.configure_width(grant, occupied).await?;
+            }
             self.tx_int(grant, 22, 0).await?;
             // Linux configures (and clears for Open) the association RSNE
             // before joining. Pin the firmware offload to this driver's
@@ -538,11 +541,7 @@ impl<R: Fullmac> Station<R> {
             join[4..4 + request.ssid.len()].copy_from_slice(&request.ssid);
             join[36..42].copy_from_slice(&request.bssid);
             join[44..48].copy_from_slice(&1u32.to_le_bytes());
-            join[48..50].copy_from_slice(
-                &channel::encode20(bss.info.channel as u8)
-                    .ok_or(Error::Unsupported)?
-                    .to_le_bytes(),
-            );
+            join[48..50].copy_from_slice(&occupied.chanspec().to_le_bytes());
             self.tx_command(grant, 26, &join).await?;
             let deadline = narf_time::Deadline::after_ms(15000);
             let (mut associated, mut keys) = (false, !secure);
@@ -815,17 +814,28 @@ fn le32(bytes: &[u8], index: usize) -> Result<u32, Error> {
     ))
 }
 fn channel_power(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> Option<u8> {
-    u8::try_from(channel_ceiling(domain, channel, true)?).ok()
+    occupied_power(domain, channel::Operating::twenty(channel)?)
+}
+fn occupied_power(
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: channel::Operating,
+) -> Option<u8> {
+    u8::try_from(occupied_ceiling(domain, channel, true)?).ok()
 }
 fn channel_ceiling(
     domain: &narf_wireless::reg::RegulatoryDomain,
     channel: u8,
     transmit: bool,
 ) -> Option<i8> {
+    occupied_ceiling(domain, channel::Operating::twenty(channel)?, transmit)
+}
+fn occupied_ceiling(
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: channel::Operating,
+    transmit: bool,
+) -> Option<i8> {
     use narf_wireless::reg::RegFlags;
-    let frequency = channel::frequency(channel)?;
-    let low = frequency - 10;
-    let high = frequency + 10;
+    let (low, high) = channel.span();
     let mut covered = false;
     let mut ceiling: Option<i8> = None;
     for rule in &domain.rules {
@@ -833,7 +843,7 @@ fn channel_ceiling(
             continue;
         }
         if rule.freq_start_mhz >= rule.freq_end_mhz
-            || rule.max_bandwidth_mhz < 20
+            || rule.max_bandwidth_mhz < channel.width()
             || transmit && rule.flags.bits() & !RegFlags::NO_P2P.bits() != 0
         {
             return None;

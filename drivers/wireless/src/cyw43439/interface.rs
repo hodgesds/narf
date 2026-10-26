@@ -90,7 +90,7 @@ pub struct Device<R: Fullmac> {
     channels: Vec<u32>,
     supplicant: bool,
     mfp_supported: bool,
-    ht_capabilities: Option<[u8; 26]>,
+    ht_capabilities: [Option<[u8; 26]>; 2],
     up: AtomicBool,
     // Requested PS policy: 0=awake, 1=PM_FAST, 2=terminal failure. The
     // retained worker serializes firmware commands with scan/join/packets.
@@ -382,7 +382,7 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
             return None;
         }
         Some(narf_wireless::iface::PhyCapabilities {
-            ht: self.ht_capabilities?,
+            ht: self.ht_capabilities[usize::from(band == 5000)]?,
             vht: None,
         })
     }
@@ -460,7 +460,7 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
             bands,
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: self.ht_capabilities.is_some(),
+                ht_supported: self.ht_capabilities.iter().any(Option::is_some),
                 vht_supported: false,
                 he_supported: false,
                 eht_supported: false,

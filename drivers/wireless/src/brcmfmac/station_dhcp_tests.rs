@@ -16,6 +16,8 @@ use narf_wifi_fixtures::udp_ipv4;
 
 #[path = "channel_station_tests.rs"]
 mod channel_station_tests;
+#[path = "ht40_tests.rs"]
+mod ht40_tests;
 #[path = "ht_tests.rs"]
 mod ht_tests;
 #[path = "mfp_tests.rs"]
@@ -44,6 +46,11 @@ fn ready<F: Future>(future: F) -> Result<F::Output, &'static str> {
     Err("PCIe firmware conversation did not complete")
 }
 type NativeFeatures = (Option<(bool, bool, u8)>, Option<(u32, u8)>);
+struct Configuration {
+    mfp: Option<(bool, bool, u8)>,
+    phy: Option<(u32, u8)>,
+    wide: Option<crate::cyw43439::phy_fixture::Wide>,
+}
 struct Harness {
     device: Arc<ModelDevice>,
     bus: Handle,
@@ -111,6 +118,51 @@ impl Harness {
         database: Option<Arc<narf_wireless::reg::db::Database>>,
         features: NativeFeatures,
     ) -> Result<Self, &'static str> {
+        Self::new_details(
+            version,
+            secured,
+            keys_first,
+            selected,
+            channel,
+            database,
+            Configuration {
+                mfp: features.0,
+                phy: features.1,
+                wide: None,
+            },
+        )
+    }
+    fn new_wide(
+        version: u32,
+        secured: bool,
+        channel: u8,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        mfp: bool,
+        wide: crate::cyw43439::phy_fixture::Wide,
+    ) -> Result<Self, &'static str> {
+        Self::new_details(
+            version,
+            secured,
+            secured,
+            false,
+            channel,
+            database,
+            Configuration {
+                mfp: mfp.then_some((true, true, 0)),
+                phy: Some((7, 0)),
+                wide: Some(wide),
+            },
+        )
+    }
+    fn new_details(
+        version: u32,
+        secured: bool,
+        keys_first: bool,
+        selected: bool,
+        channel: u8,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        features: Configuration,
+    ) -> Result<Self, &'static str> {
         let (adapter, bus) = if selected {
             let (selection, assets) = crate::brcmfmac::provision::tests::selected_fixture(
                 crate::brcmfmac::provision::Family::Pcie43602,
@@ -122,13 +174,18 @@ impl Harness {
         .map_err(|_| "CR4/common-ring native ownership")?;
         bus.keys_first(keys_first);
         bus.channel(channel);
-        if let Some((supported, required, fault)) = features.0 {
+        if let Some((supported, required, fault)) = features.mfp {
             bus.mfp_profile(supported, required, fault);
         }
-        if let Some((chains, fault)) = features.1 {
+        if let Some((chains, fault)) = features.phy {
             bus.phy_profile(chains, fault);
         }
         let mut domain = firmware::domain();
+        let wide = features.wide.is_some();
+        if let Some(profile) = features.wide {
+            bus.wide_profile(profile);
+            domain.rules[0].max_bandwidth_mhz = 40;
+        }
         if channel > 14 {
             use narf_wireless::reg::{RegFlags, RegRule};
             for (start, end, flags) in [
@@ -139,7 +196,7 @@ impl Harness {
                 domain.rules.push(RegRule {
                     freq_start_mhz: start,
                     freq_end_mhz: end,
-                    max_bandwidth_mhz: 20,
+                    max_bandwidth_mhz: if wide { 40 } else { 20 },
                     max_power_dbm: 17,
                     flags,
                 });
@@ -156,7 +213,11 @@ impl Harness {
         } else {
             &[1, 6, 11]
         };
-        if station.mac != OWN || station.channels != expected || !station.supplicant {
+        if station.mac != OWN
+            || !wide && station.channels != expected
+            || !station.channels.contains(&channel)
+            || !station.supplicant
+        {
             return Err("PCIe firmware identity/channel/key capabilities");
         }
         let channels = station
@@ -367,6 +428,14 @@ fn composition_phy(
         None,
         (mfp.then_some((true, true, 0)), phy),
     )?;
+    composition_native(harness, secured, mfp, phy.is_some())
+}
+fn composition_native(
+    harness: Harness,
+    secured: bool,
+    mfp: bool,
+    ht: bool,
+) -> Result<(), &'static str> {
     let (uplink, downlink) = packets();
     if !harness.closed(&uplink)
         || narf_net::dhcp::acquire(&harness.name, 0).is_ok()
@@ -387,7 +456,7 @@ fn composition_phy(
         .unwrap()
         .station
         .ht_connection()
-        != phy.is_some()
+        != ht
     {
         return Err("PCIe PHY proof did not match the completed conversation");
     }
