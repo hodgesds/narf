@@ -1122,7 +1122,12 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             prologue[..3].copy_from_slice(&start);
             prologue[3..].copy_from_slice(&store);
             if let Err(e) = ring_emit(&ctx.ring_mem, &mut ctx.ring, &prologue) {
-                drop(ctx);
+                // End the mutable borrow of `self` held through
+                // `ctx` so `self.alloc` is usable on this error
+                // path. `ctx` is a reference, so nothing is (or
+                // could be) dropped — consuming the binding is
+                // what ends the borrow.
+                let _ = ctx;
                 self.alloc.free(batch.backing);
                 return Err(e);
             }
@@ -1408,9 +1413,7 @@ static RCS_STATE: narf_lib::sync::IrqSafeSpinLock<Option<(ProductionEngine, Opti
 
 fn attach_default() -> Result<(), SubmitError> {
     let engine = crate::intel_gpu::with_controller(|gpu| {
-        if gpu.chip_info().generation.region_generation().is_none() {
-            return None;
-        }
+        gpu.chip_info().generation.region_generation()?;
         let arena = GgttArena::new(gpu.gtt_mmadr);
         RcsEngine::new(BarWindow { bar: gpu.gtt_mmadr }, arena).ok()
     })
@@ -1877,11 +1880,23 @@ pub mod tests {
             return TestResult::Fail("group 1 header");
         }
         // PDP pairs name descending PDPs and carry zero values.
+        // Each PDP spans two pairs — UDW then LDW — so successive
+        // PDPs sit 4 dwords apart: PDP3 at CTX_PDP3_UDW, PDP2 at
+        // +4, PDP1 at +8, PDP0 at +12.
         if r[CTX_PDP3_UDW] != ring_pdp_udw(3) as u32 || r[CTX_PDP3_UDW + 1] != 0 {
             return TestResult::Fail("PDP3 pair");
         }
-        if r[CTX_PDP3_UDW + 8] != ring_pdp_udw(2) as u32 {
+        if r[CTX_PDP3_UDW + 2] != ring_pdp_ldw(3) as u32 || r[CTX_PDP3_UDW + 3] != 0 {
+            return TestResult::Fail("PDP3 LDW pair");
+        }
+        if r[CTX_PDP3_UDW + 4] != ring_pdp_udw(2) as u32 {
             return TestResult::Fail("PDP2 pair position");
+        }
+        if r[CTX_PDP3_UDW + 8] != ring_pdp_udw(1) as u32 {
+            return TestResult::Fail("PDP1 pair position");
+        }
+        if r[CTX_PDP3_UDW + 12] != ring_pdp_udw(0) as u32 {
+            return TestResult::Fail("PDP0 pair position");
         }
         if r[CTX_LRI_HEADER_2] != 0x1100_0001 || r[CTX_R_PWR_CLK_STATE] != R_PWR_CLK_STATE as u32 {
             return TestResult::Fail("group 2 (RCS power clock state)");
