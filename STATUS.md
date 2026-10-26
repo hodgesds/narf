@@ -176,10 +176,29 @@ All old firmware/CE/WMI/HTT mappings remain pinned, with three attempts per boot
 bounding retained generations. Automatic/stable-interface recovery, DMA
 reclamation, broader PHY features and physical reset/RF acceptance remain open.
 
-The combined selected Wi-Fi/shared-fixture QEMU gates pass 1790 / 0 fail / 9 skip
-on x86_64 and 1327 / 0 fail / 3 skip on aarch64, with clean production boots
-and btrfs postflights. Scoped cross-architecture Clippy and changed-package
+The next parallel wave advances all eleven families: Intel Gen2 native Open
+authentication with acknowledged peer re-disable; ath11k physical PDEV power
+readback with reset/query fencing; MT76 response-bound HT20 MCS0–7 long-GI and
+bounded A-MSDU receive admission; AR9285 directed/wildcard active discovery;
+and ath10k six-dialect native station power-save intent before carrier.
+CYW43439/BCM43602 add firmware-owned WPA2 AP-required PMF with native capability,
+peer and association-RSNE readback, public cipher exposure and explicitly gated
+nl80211 PMK CONNECT admission. RTL8188EE, RTL8188EU and qualified RTL8852B
+add native response-bound WMM BE/TID0 QoS; the shared formatter constructs the
+QoS header before CCMP and preserves the installed key's TX packet-number
+sequence. RTL8821CE IQK now uses fresh hardware thermal conversions and a new
+signed recipe identity. Narrow PHY/security contracts and retained terminal
+ownership remain explicit in each family spec. Hardware acceptance and the
+remaining software ledger are still open.
+
+The combined selected Wi-Fi/shared-fixture QEMU gates pass 1848 / 0 fail / 9 skip
+on x86_64 and 1381 / 0 fail / 3 skip on aarch64, with clean production boots
+and btrfs postflights. Scoped production/kernel-test Clippy and workspace
 formatting pass; default release and debug kernels build on both architectures.
+This continuation adds 58 passing smokes on x86_64 and 54 on aarch64; four
+native ath11k physical-transport integration cases are x86_64-specific. Native
+PMF tests include real nl80211 parsing/dispatch through both FullMAC transports,
+with unsupported capability and additional-security requests rejected before I/O.
 Native Rust tests cover the queue and v5 power ABIs, active scan requests/power
 ordering, bounded A-MSDU conversion and C21 factory/MAC/PHY behavior using fixed
 reference data and explicit ownership invariants. D11AC coverage uses exhaustive
