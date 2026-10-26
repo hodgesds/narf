@@ -4116,7 +4116,11 @@ fn withdraw_controller_publications(instance: u32) {
 /// recovered returns `Ok` immediately.
 ///
 /// On a namespace-set change the controller's publications are
-/// withdrawn and re-registered from the fresh scan. On
+/// withdrawn and re-registered from the fresh scan; the cap minted
+/// for the reset is handed to that re-registration, so the device-PM
+/// entry re-published for the controller carries the device's real
+/// claimed cap (the PM callbacks receive none — see
+/// [`register_controller`]). On
 /// [`NvmeError::IdentityChanged`] the function hosts a different
 /// device than the one that wedged: the slot is marked removed
 /// (before the gate is released, so no racing caller can adopt the
@@ -4128,8 +4132,9 @@ fn recover_slot(instance: u32) -> Result<(), NvmeError> {
     let slot = slot_of(instance).ok_or(NvmeError::NotReady)?;
     let name = ns::controller_name(instance);
     // The reset proper, under the gate; the outcome is acted on
-    // after the guard drops (see the gate note above).
-    let (device, outcome) = {
+    // after the guard drops (see the gate note above). The minted
+    // cap travels with the outcome: re-publication needs it.
+    let (device, outcome, cap) = {
         let mut ctrl = acquire(slot);
         if !ctrl.is_dead() {
             return Ok(());
@@ -4146,13 +4151,13 @@ fn recover_slot(instance: u32) -> Result<(), NvmeError> {
         if matches!(outcome, Err(NvmeError::IdentityChanged)) {
             slot.removed.store(true, Ordering::Release);
         }
-        (device, outcome)
+        (device, outcome, cap)
     };
     match outcome {
         Ok(report) => {
             if report.namespaces_changed {
                 withdraw_controller_publications(instance);
-                register_controller(instance, device);
+                register_controller(instance, device, cap);
                 let _ = writeln!(
                     narf_console::Writer,
                     "nvme: {name}: recovered; namespace set changed, re-published"
