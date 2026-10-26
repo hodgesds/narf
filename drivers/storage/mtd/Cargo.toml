@@ -1,0 +1,28 @@
+# MTD (memory technology device) core for raw flash — device
+# record, registry, fixed-partitions handling. Leaf crate in the
+# storage family: flash controller bindings (CFI NOR, SPI-NOR)
+# live here or depend on this, never on the facade (no cycle),
+# mirroring narf-drivers-storage-core.
+[package]
+name         = "narf-drivers-storage-mtd"
+description  = "MTD core: raw-flash device trait, registry, and DT fixed-partitions support."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_storage_mtd"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib         = { path = "../../../lib" }
+narf-bus         = { path = "../../../bus" }
+narf-kernel-test = { path = "../../../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true
