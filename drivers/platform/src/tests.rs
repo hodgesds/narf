@@ -2332,3 +2332,116 @@ fn smoke_intel_vsec_feature_ids() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/platform/intel_vsec", smoke_intel_vsec_feature_ids);
+
+// ── Power-service composition (#868) ───────────────────────────────
+
+/// Park-step hook for the composition smoke: model a wake source
+/// firing while the CPU is parked. Latching on the first step
+/// means the park loop observes the event before its first real
+/// halt — the harness arms no periodic clockevent on this path,
+/// so a real halt could sleep past the idle-kill (the hazard
+/// `s2idle`'s bounded test entry documents).
+fn composition_park_step_latch() {
+    narf_power::s2idle::note_wake_event(narf_power::s2idle::WakeSource::TestInjected);
+}
+
+fn smoke_power_state_freeze_end_to_end() -> TestResult {
+    use narf_power::service;
+
+    if !narf_power::s2idle::s2idle_supported() {
+        return TestResult::Skip("s2idle not offered on this platform");
+    }
+
+    // Reset every surface the composition touches, so the fixture
+    // measures the composition and not boot residue.
+    service::__reset_for_test();
+    narf_power::suspend::__test_reset();
+    narf_power::s2idle::__test_reset();
+    narf_power::device_pm::__reset_for_test();
+    narf_power::sleep_request::__test_reset_sleep_request_hook();
+
+    // Fail-closed first: with no consumer installed, a store of a
+    // supported state must be refused ENODEV — never silently
+    // dropped (the posture #877's review pinned).
+    narf_power::sysfs_bridge::populate_power_state();
+    let root = narf_filesystem::sysfs::get_root();
+    let kobj = match root.get_child("power") {
+        Some(k) => k,
+        None => return TestResult::Fail("/sys/power kobject missing after populate"),
+    };
+    match kobj.attr_store("state", b"freeze\n") {
+        Some(Err(narf_filesystem::FsError::NoDevice)) => {}
+        _ => return TestResult::Fail("unwired freeze store was not refused with NoDevice"),
+    }
+
+    // The real composition root: platform executor + sleep-request
+    // hook + providers + event subscriptions.
+    crate::power_service::init();
+    if !narf_power::sleep_request::sleep_request_hook_installed() {
+        return TestResult::Fail("composition did not install the sleep-request hook");
+    }
+
+    // Arm the park and model the wake source.
+    narf_power::s2idle::__test_arm_s2idle();
+    narf_power::s2idle::__test_set_park_step_hook(Some(composition_park_step_latch));
+
+    // The userspace write — `echo freeze > /sys/power/state` at
+    // the sysfs model layer (the VFS write → store dispatch above
+    // it is covered by the filesystem sysfs e2e tests).
+    match kobj.attr_store("state", b"freeze\n") {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("freeze store refused with the composition installed"),
+    }
+    // The write only queues: the Freeze action pending (bit 2),
+    // one freeze request counted, nothing executed in the writer's
+    // context.
+    if service::pending_actions() != 4 {
+        return TestResult::Fail("freeze store did not queue the Freeze action");
+    }
+    if service::stats().freeze_requests != 1 {
+        return TestResult::Fail("service did not count the freeze request");
+    }
+
+    // Execute from task context: the platform executor mints the
+    // Power cap and runs `suspend_to_idle` — park, wake, resume.
+    if service::pump_pending() != 1 {
+        return TestResult::Fail("pump did not execute the queued freeze");
+    }
+    let s = narf_power::s2idle::stats();
+    if s.parks != 1 || s.wakes != 1 || s.last_exit != narf_power::s2idle::ParkExit::WakeEvent {
+        return TestResult::Fail("freeze did not park and wake exactly once");
+    }
+    if narf_power::suspend::current_phase() != narf_power::SuspendPhase::Idle {
+        return TestResult::Fail("phase did not return to Idle after the freeze cycle");
+    }
+
+    // The hook's other half: `mem` queues Suspend — never Freeze —
+    // and the platform executor runs the S3 core. Unarmed here, so
+    // the core walks the phases and declines; the queue/executor
+    // contract is what is pinned. Skipped where S3 does not parse.
+    if narf_power::suspend::s3_supported() {
+        match kobj.attr_store("state", b"mem\n") {
+            Some(Ok(())) => {}
+            _ => return TestResult::Fail("mem store refused with the composition installed"),
+        }
+        if service::pending_actions() != 1 {
+            return TestResult::Fail("mem store did not queue the Suspend action");
+        }
+        if service::pump_pending() != 1 {
+            return TestResult::Fail("pump did not execute the queued suspend");
+        }
+        if narf_power::suspend::current_phase() != narf_power::SuspendPhase::Idle {
+            return TestResult::Fail("phase did not return to Idle after the mem cycle");
+        }
+    }
+
+    // Clean up the test seams. The composition itself stays
+    // installed — that is the production state.
+    narf_power::s2idle::__test_set_park_step_hook(None);
+    narf_power::s2idle::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/power-service",
+    smoke_power_state_freeze_end_to_end
+);
