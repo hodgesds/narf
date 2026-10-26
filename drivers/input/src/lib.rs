@@ -25,6 +25,7 @@ pub mod i2c_hid_touch;
 pub mod i8042;
 #[cfg(target_arch = "x86_64")]
 pub mod i8042_mouse;
+pub mod intel_ish;
 #[cfg(target_arch = "x86_64")]
 pub mod psmouse;
 pub mod rmi4_core;
@@ -73,6 +74,11 @@ pub fn register_initcalls() {
 
     wacom::register_usb_driver();
     goodix::register_initcalls();
+
+    // Intel ISH sensor-hub transport — registers its PCI
+    // matches; the IDs only exist on Intel x86 SoCs, so this is a
+    // no-op on other platforms in practice.
+    intel_ish::register_initcalls();
 
     #[cfg(target_arch = "x86_64")]
     register_i8042_initcalls();
