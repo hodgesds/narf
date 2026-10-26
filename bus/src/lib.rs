@@ -17,9 +17,9 @@
 //!   we fall back to the QEMU `q35` ECAM default (`0xb000_0000`, 256
 //!   buses × 4 KiB / function). Real MCFG parsing lands with boot/
 //!   ACPI work.
-//! - Full FDT property walk on aarch64 — we scan the flattened-devicetree
-//!   structure for the minimum set of nodes (`virtio_mmio@...`) needed to
-//!   produce the registry; a generic property getter is out of scope.
+//! - ACPI-based platform enumeration on aarch64 SystemReady — the
+//!   devicetree path (`crate::dt`, on `narf-firmware-fdt`) is the
+//!   enumeration story there today.
 //!
 //! The registry is populated once by `init` and is read-only thereafter.
 //! Wave 2 will swap the backing store for an RCU-protected list so
@@ -39,6 +39,7 @@ pub mod bar;
 pub mod cxl;
 pub mod device;
 pub mod driver_match;
+pub mod dt;
 pub mod ecam;
 pub mod hotplug;
 pub mod msi;

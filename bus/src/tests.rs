@@ -283,6 +283,176 @@ fn smoke_bus_dt_match_binds_platform() -> TestResult {
 }
 kernel_test_in!("bus", smoke_bus_dt_match_binds_platform);
 
+// ── Devicetree enumeration ─────────────────────────────────────
+
+/// The real QEMU `virt` DTB fixture (copy of the firmware-fdt
+/// crate's fixture; provenance in tests/fixtures/README.md).
+const QEMU_VIRT_DTB: &[u8] = include_bytes!("../tests/fixtures/qemu-virt.dtb");
+
+fn smoke_bus_dt_decode_fixture_census() -> TestResult {
+    // The decoder's census over the real QEMU virt blob, derived
+    // from the blob itself (see the fixture README): 32 virtio-mmio
+    // slots + 8 platform-shaped nodes (fw-cfg, PL061, PCIe bridge,
+    // PL031, PL011, GIC, ITS, CFI flash). The /cpus subtree, and
+    // compatible-but-regless nodes (PSCI, timer, fixed clock), must
+    // NOT appear.
+    use crate::dt::decode_devices;
+    let devs = decode_devices(QEMU_VIRT_DTB);
+    if devs.len() != 40 {
+        return TestResult::Fail("DT decode census is not 40 devices");
+    }
+    let find = |needle: &str| devs.iter().find(|d| d.compatible_contains(needle));
+
+    let Some(pl011) = find("arm,pl011") else {
+        return TestResult::Fail("PL011 not decoded from DT");
+    };
+    if pl011.regs != [(0x0900_0000, 0x1000)] {
+        return TestResult::Fail("PL011 reg window mismatch");
+    }
+    if pl011.irqs != [(33, 4)] {
+        return TestResult::Fail("PL011 IRQ not resolved to SPI 1 (INTID 33)");
+    }
+    if pl011.irq_parent != 0x8005 {
+        return TestResult::Fail("PL011 did not inherit the root interrupt-parent (GIC)");
+    }
+    // The registry record built from the decode keys on window 0
+    // and carries the resolved IRQ.
+    let bus_dev = pl011.to_bus_device();
+    if bus_dev.addr != crate::BusAddr::Mmio(narf_memory::PhysAddr::new(0x0900_0000)) {
+        return TestResult::Fail("PL011 bus device not keyed on its reg base");
+    }
+    match &bus_dev.kind {
+        crate::BusKind::Platform(p)
+            if p.reg_windows().len() == 1
+                && p.irq_list()
+                    == [crate::DtIrq {
+                        intid: 33,
+                        flags: 4,
+                    }] => {}
+        _ => return TestResult::Fail("PL011 platform record mangled"),
+    }
+
+    let Some(gic) = find("arm,gic-v3") else {
+        return TestResult::Fail("GIC not decoded from DT");
+    };
+    if gic.phandle != 0x8005 || gic.regs.len() != 2 || gic.regs[0] != (0x0800_0000, 0x1_0000) {
+        return TestResult::Fail("GIC record mismatch (phandle / GICD window)");
+    }
+    let Some(flash) = find("cfi-flash") else {
+        return TestResult::Fail("CFI flash not decoded from DT");
+    };
+    if flash.regs != [(0, 0x400_0000), (0x400_0000, 0x400_0000)] {
+        return TestResult::Fail("flash bank windows mismatch");
+    }
+    let Some(bridge) = find("pci-host-ecam-generic") else {
+        return TestResult::Fail("PCIe host bridge not decoded from DT");
+    };
+    if bridge.regs != [(0x4010_0000_0000, 0x1000_0000)] {
+        return TestResult::Fail("host bridge ECAM window mismatch");
+    }
+    let Some(pl061) = find("arm,pl061") else {
+        return TestResult::Fail("PL061 not decoded from DT");
+    };
+    if pl061.phandle != 0x8007 || pl061.irqs != [(39, 4)] {
+        return TestResult::Fail("PL061 record mismatch (phandle / IRQ)");
+    }
+
+    // The virtio fleet: 32 slots, ascending, each with its SPI
+    // resolved (slot i -> SPI 16+i -> INTID 48+i).
+    let fleet: alloc::vec::Vec<_> = devs
+        .iter()
+        .filter(|d| d.compatible_contains("virtio,mmio"))
+        .collect();
+    if fleet.len() != 32 {
+        return TestResult::Fail("virtio-mmio fleet is not 32 slots");
+    }
+    for (i, slot) in fleet.iter().enumerate() {
+        let base = 0x0a00_0000u64 + (i as u64) * 0x200;
+        if slot.regs != [(base, 0x200)] || slot.irqs != [(48 + (i as u32), 1)] {
+            return TestResult::Fail("virtio-mmio slot decode mismatch");
+        }
+    }
+
+    // Exclusions: CPUs (SMP input, not devices) and regless nodes.
+    for absent in [
+        "arm,cortex-a72",
+        "arm,psci-1.0",
+        "arm,armv8-timer",
+        "fixed-clock",
+    ] {
+        if find(absent).is_some() {
+            return TestResult::Fail("a node that is not a bus device was decoded as one");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_dt_decode_fixture_census);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_bus_dt_enumeration_live() -> TestResult {
+    // Boot-path enumeration over the live DTB (xtask places QEMU
+    // virt's blob at 0x4F00_0000, the same pointer other bus
+    // smokes use): the registry gains platform records decoded
+    // from the tree — PL011 with its GIC-resolved IRQ above all —
+    // while virtio slots stay VirtioMmio-kind.
+    use crate::{devices, BusKind};
+    use narf_memory::PhysAddr;
+    let _restore_registry = RegistryRestore::capture();
+    // SAFETY: xtask loads the DTB at this identity-mapped address.
+    let _ = unsafe { crate::init(Some(PhysAddr::new(0x4F00_0000))) };
+    let devs = devices();
+
+    let pl011 = devs
+        .iter()
+        .find(|d| matches!(&d.kind, BusKind::Platform(p) if p.compatible_contains("arm,pl011")));
+    let Some(pl011) = pl011 else {
+        return TestResult::Fail("no PL011 platform device in the live registry");
+    };
+    match &pl011.kind {
+        BusKind::Platform(p) => {
+            if p.reg_windows()
+                != [crate::RegWindow {
+                    base: PhysAddr::new(0x0900_0000),
+                    len: 0x1000,
+                }]
+            {
+                return TestResult::Fail("live PL011 reg window mismatch");
+            }
+            if p.irq_list()
+                != [crate::DtIrq {
+                    intid: 33,
+                    flags: 4,
+                }]
+            {
+                return TestResult::Fail("live PL011 IRQ not resolved to INTID 33");
+            }
+        }
+        _ => unreachable!(),
+    }
+    if !devs
+        .iter()
+        .any(|d| matches!(&d.kind, BusKind::Platform(p) if p.compatible_contains("arm,gic-v3")))
+    {
+        return TestResult::Fail("no GIC platform device in the live registry");
+    }
+    if !devs
+        .iter()
+        .any(|d| matches!(&d.kind, BusKind::Platform(p) if p.compatible_contains("cfi-flash")))
+    {
+        return TestResult::Fail("no CFI flash platform device in the live registry");
+    }
+    // No platform record may carry the virtio-mmio identity —
+    // those nodes enumerate through the probe as VirtioMmio.
+    if devs
+        .iter()
+        .any(|d| matches!(&d.kind, BusKind::Platform(p) if p.compatible_contains("virtio,mmio")))
+    {
+        return TestResult::Fail("a virtio-mmio node was emitted as a platform device");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("bus", smoke_bus_dt_enumeration_live);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_pcie_dtb_aarch64() -> TestResult {

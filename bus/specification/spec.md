@@ -148,6 +148,29 @@ pub unsafe fn discover_pmu_ppi(dtb: PhysAddr) -> Option<u32>;
 three-cell PPI interrupt specifier and returns its architectural INTID. It has
 no platform-default fallback because the PMU interrupt is implementation-defined.
 
+Devicetree enumeration (`bus::dt`, aarch64) runs on
+`narf_firmware_fdt` — the tree's only FDT walker:
+
+```rust
+/// Pure decode of a DTB into device-shaped records: nodes with
+/// `status` absent-or-okay, a `compatible`, and a translatable
+/// `reg`, excluding the `/cpus` subtree. `reg` windows are
+/// translated through ancestor `ranges`; interrupts are resolved
+/// to architectural INTIDs against the (inherited) interrupt
+/// parent when it carries a GIC binding.
+pub fn decode_devices(blob: &[u8]) -> Vec<DtDevice>;
+```
+
+`enumerate_dt` (crate-internal, aarch64) turns the decode into
+registry devices: `Platform` records as decoded, virtio-mmio
+slots probed for a populated device-id (emitted as `VirtioMmio`,
+never `Platform`), and the `pci-host-ecam-generic` bridge's ECAM
+walked via the shared PCIe enumerator when its window falls in
+the low 4 GiB (the legacy guard — a highmem ECAM is described in
+the tree but not walked). With no DTB, or a blob that yields
+nothing, aarch64 enumeration falls back to the QEMU `virt`
+virtio-mmio slot scan.
+
 Appends made after enumeration (hot-plug arrivals, bridge-enumerated
 children) are visible to `devices()` immediately. The match-table
 dispatcher's binding walk (§9) additionally observes appends made
@@ -460,11 +483,15 @@ ignores message data — MSI's only per-vector signal.
   the isolation claim is void.
 
 ### aarch64
-- PCIe: ECAM base from devicetree `reg` property or ACPI MCFG on
-  SystemReady platforms.
+- PCIe: ECAM base from the devicetree `pci-host-ecam-generic`
+  node's `reg` property (low-4-GiB windows only today) or ACPI
+  MCFG on SystemReady platforms.
 - MSI via GICv3 ITS; `msi-parent` devicetree node points to the ITS.
-- Platform-bus devices enumerated from devicetree's `/soc` subtree,
-  with `compatible` strings keyed against the driver registry.
+- Platform devices enumerated from the whole devicetree (minus
+  `/cpus`) in one `narf_firmware_fdt` walk: `compatible` strings
+  keyed against the DT match table (§9), `reg` windows decoded
+  through parent `ranges`, interrupts resolved through the
+  inherited interrupt parent to GIC INTIDs at enumeration time.
 
 ## 6. Dependencies
 
