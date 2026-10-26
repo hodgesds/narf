@@ -34,6 +34,9 @@ pub(super) struct RadioIo {
     pub(super) packets: crate::rtw88::packet_core::tests::Model,
     core: Option<crate::rtw88::packet_core::Core>,
     gate: Option<crate::rtw88::power_policy::Gate>,
+    extension: Option<Arc<crate::rtw88::station_profile::Grant>>,
+    pub(super) edca_writes: Arc<AtomicUsize>,
+    pub(super) before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) clock: Arc<AtomicU64>,
     pub(super) policy: Arc<narf_lib::sync::IrqSafeSpinLock<narf_wireless::reg::RegulatoryDomain>>,
     pub(super) mailbox_ready_hold: Arc<AtomicBool>,
@@ -66,6 +69,9 @@ impl RadioIo {
             packets: crate::rtw88::packet_core::tests::Model::new(),
             core: None,
             gate: None,
+            extension: None,
+            edca_writes: Arc::new(AtomicUsize::new(0)),
+            before_publication: None,
             clock: Arc::new(AtomicU64::new(0)),
             policy: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
                 super::power_policy_tests::domain(),
@@ -98,6 +104,27 @@ impl RadioIo {
         self.base.regs[0x670..0x674].fill(0);
         self.base.regs[0x3d9..0x3db].fill(0);
         self.base.regs[0x1d70..0x1d74].copy_from_slice(&0x30303030u32.to_le_bytes());
+    }
+    pub(super) fn extension_request(
+        &self,
+    ) -> Result<crate::rtw88::station_profile::Request, Error> {
+        self.gate
+            .as_ref()
+            .and_then(crate::rtw88::power_policy::Gate::extension_request)
+            .ok_or(Error::State)
+    }
+    pub(super) fn qualify_extension(
+        &mut self,
+        source: crate::rtw88::station_profile::Source,
+    ) -> Result<(), Error> {
+        self.extension = Some(source.load(self.gate.as_ref().ok_or(Error::State)?.clone())?);
+        Ok(())
+    }
+    pub(super) fn register(&self, r: usize) -> u32 {
+        self.word(r)
+    }
+    pub(super) fn lose_write(&mut self, r: u16) {
+        self.lost = Some(r);
     }
     fn packet_with<T>(
         &mut self,
@@ -185,6 +212,9 @@ unsafe impl Io for RadioIo {
         self.base.write16(r, v)
     }
     fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
+        if self.finished && matches!(r, 0x500 | 0x504 | 0x508 | 0x50c) {
+            self.edca_writes.fetch_add(1, Ordering::AcqRel);
+        }
         if self.finished && !self.packets.live {
             return Err(Error::Access);
         }
@@ -267,6 +297,50 @@ unsafe impl Io for RadioIo {
             .map(|gate| gate.own())
             .ok_or(Error::State)
     }
+    fn station_extension(
+        &mut self,
+    ) -> Result<Option<Arc<crate::rtw88::station_profile::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(self.extension.clone())
+    }
+    fn station_bind_extension(
+        &mut self,
+        grant: Arc<crate::rtw88::station_profile::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        let gate = self
+            .gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .with_extension(grant)?;
+        let current = gate.clone();
+        let policy = self.policy.clone();
+        self.packets.authority = Some(Arc::new(move || {
+            current.current_with_policy_for_test(&policy.lock()).is_ok()
+        }));
+        self.gate = Some(gate);
+        Ok(())
+    }
+    fn packet_profile(&mut self, p: crate::rtw88::packet_format::DataProfile) -> Result<(), Error> {
+        self.station_allowed()?;
+        if self.gate.as_ref().is_none_or(|g| !g.allows_profile(p)) {
+            return Err(Error::Unsupported);
+        }
+        self.core
+            .as_mut()
+            .ok_or(Error::State)?
+            .configure_data(p)
+            .map_err(|_| Error::State)
+    }
+    fn station_profile_readback(&mut self) -> Result<(), Error> {
+        self.station_allowed()?;
+        let gains = self
+            .gate
+            .as_ref()
+            .and_then(crate::rtw88::power_policy::Gate::cck_gains)
+            .ok_or(Error::State)?;
+        crate::rtw88::wmm::readback(|r| self.read32(r), gains)
+    }
     fn station_allowed(&mut self) -> Result<(), Error> {
         if !self.finished || !self.packets.live || !self.packets.allowed {
             return Err(Error::Access);
@@ -276,6 +350,14 @@ unsafe impl Io for RadioIo {
             .ok_or(Error::State)?
             .current_with_policy_for_test(&self.policy.lock())
             .map_err(Error::Power)
+    }
+    fn station_publication(&mut self) -> Result<crate::rtw88::publication::Publication, Error> {
+        self.station_allowed()?;
+        Ok(crate::rtw88::publication::Publication::model(
+            self.gate.as_ref().ok_or(Error::State)?.clone(),
+            Some(self.policy.clone()),
+        )
+        .before_invoke(self.before_publication.clone()))
     }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
         if !self.packets.live {
@@ -361,7 +443,16 @@ unsafe impl Io for RadioIo {
         self.packet_with(|core, port| core.poll(port))
     }
     fn packet_stop(&mut self) -> Result<(), crate::rtw88::packet_core::Error> {
-        self.packet_with(|core, port| core.stop(port))
+        self.packet_with(|core, port| {
+            // Match the actual PCI-only safe shutdown after RF source loss.
+            let authority = port.authority.take();
+            let allowed = port.allowed;
+            port.allowed = true;
+            let result = core.stop(port);
+            port.authority = authority;
+            port.allowed = allowed;
+            result
+        })
     }
     async fn delay_us(&mut self, us: u64) {
         self.base.delay_us(us).await;

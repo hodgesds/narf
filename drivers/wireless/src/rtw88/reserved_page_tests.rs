@@ -457,6 +457,14 @@ unsafe impl Registers for Port {
             .current()
             .map_err(Error::Power)
     }
+    fn station_publication(&mut self) -> Result<crate::rtw88::publication::Publication, Error> {
+        self.station_allowed()?;
+        let m = self.0.lock();
+        Ok(crate::rtw88::publication::Publication::model(
+            m.station_gate.as_ref().ok_or(Error::State)?.clone(),
+            None,
+        ))
+    }
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
         self.station_allowed()?;
         Ok(self

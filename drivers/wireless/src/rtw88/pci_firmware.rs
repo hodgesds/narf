@@ -777,9 +777,62 @@ unsafe impl Registers for Native {
         })
         .map_err(|_| Error::Access)?
     }
+    fn station_publication(&mut self) -> Result<super::publication::Publication, Error> {
+        self.station_allowed()?;
+        if self.state != State::Packets {
+            return Err(Error::State);
+        }
+        Ok(super::publication::Publication::native(
+            self.packet_gate.as_ref().ok_or(Error::State)?.clone(),
+            self.device,
+            self.cap,
+        ))
+    }
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
         self.station_allowed()?;
         Ok(self.packet_gate.as_ref().ok_or(Error::State)?.own())
+    }
+    fn station_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::station_profile::Grant>>, Error> {
+        self.station_allowed()?;
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+        if gate.did() != 0xc822 {
+            return Ok(None);
+        }
+        // Optional qualification lookup is pure. Missing/malformed assets
+        // preserve the original fully qualified legacy connection profile.
+        Ok(super::station_profile::Source::Registered
+            .load(gate.clone())
+            .ok())
+    }
+    fn station_bind_extension(
+        &mut self,
+        grant: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        self.packet_gate = Some(
+            self.packet_gate
+                .as_ref()
+                .ok_or(Error::State)?
+                .with_extension(grant)?,
+        );
+        Ok(())
+    }
+    fn packet_profile(&mut self, profile: super::packet_format::DataProfile) -> Result<(), Error> {
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?.clone();
+        if !gate.allows_profile(profile) {
+            return Err(Error::Unsupported);
+        }
+        gate.invoke(|| self.configure_packet_profile(profile))
+    }
+    fn station_profile_readback(&mut self) -> Result<(), Error> {
+        let gains = self
+            .packet_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::cck_gains)
+            .ok_or(Error::Unsupported)?;
+        super::wmm::readback(|r| self.read32(r), gains)
     }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
         if !matches!(self.state, State::Calibrated | State::Packets) || self.mailbox_pending {

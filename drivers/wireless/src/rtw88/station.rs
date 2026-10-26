@@ -111,6 +111,10 @@ pub(super) struct State {
     phase: Phase,
     admission: Admission,
     prepared: bool,
+    extension: Option<Arc<super::station_profile::Grant>>,
+    wmm_requested: bool,
+    wmm: Option<narf_wireless::wmm::Parameters>,
+    data_profile: super::packet_format::DataProfile,
     peer_commit: Option<(u16, bool)>,
     cache: Vec<Entry>,
     peer: Option<ObservedBss>,
@@ -147,6 +151,10 @@ impl State {
             phase: Phase::Prepared,
             admission,
             prepared: false,
+            extension: None,
+            wmm_requested: false,
+            wmm: None,
+            data_profile: super::packet_format::DataProfile::LEGACY,
             peer_commit: None,
             cache: Vec::new(),
             peer: None,
@@ -219,6 +227,9 @@ impl State {
         self.incoming.clear();
         self.received.clear();
         self.peer_commit = None;
+        self.wmm = None;
+        self.wmm_requested = false;
+        self.data_profile = super::packet_format::DataProfile::LEGACY;
         if self.prepared {
             io.packet_stop()?;
         }
@@ -408,11 +419,12 @@ impl State {
         // Inspect all queued peer loss before committing an exact M4 receipt.
         if idle {
             if let Some(receipt) = self.delivered_reply.take() {
+                let publication = io.station_publication()?;
                 let security = self.security.as_mut().ok_or(Error::State)?;
                 if security.pending_frame() != Some(receipt.bytes.as_slice()) {
                     return Err(Error::State);
                 }
-                security.reply_delivered(receipt.bytes.len())?;
+                publication.invoke(|| Ok(security.reply_delivered(receipt.bytes.len())))??;
             }
         }
         for _ in 0..64 {
@@ -431,13 +443,16 @@ impl State {
             };
             match self.phase {
                 Phase::Authentication => {
-                    if let Some(association) = self
+                    if let Some(mut association) = self
                         .plan
                         .as_mut()
                         .ok_or(Error::State)?
                         .authentication_response(frame.bytes())?
                         .map(|bytes| bytes.to_vec())
                     {
+                        if self.wmm_requested {
+                            association.extend_from_slice(&narf_wireless::wmm::INFORMATION);
+                        }
                         self.phase = Phase::Association;
                         self.transmit(io, association, Kind::Association)?;
                     }
@@ -453,12 +468,41 @@ impl State {
                         let response_cap =
                             u16::from_le_bytes([frame.bytes()[24], frame.bytes()[25]]);
                         let short = peer.bss.capability & response_cap & 0x400 != 0;
+                        if let Some(grant) = &self.extension {
+                            let (rates, basic) =
+                                self.plan.as_ref().ok_or(Error::State)?.legacy_rates();
+                            let rates = rates & grant.rates();
+                            if rates & 1 == 0 || basic & !rates != 0 {
+                                return Err(Error::Profile);
+                            }
+                            if self.wmm_requested {
+                                let p = narf_wireless::wmm::Parameters::parse(&frame.bytes()[30..])
+                                    .map_err(|_| Error::Profile)?
+                                    .ok_or(Error::Profile)?;
+                                super::wmm::words(p, short)?;
+                                self.wmm = Some(p);
+                            }
+                            self.data_profile = super::packet_format::DataProfile {
+                                rates,
+                                qos: self.wmm.is_some(),
+                            };
+                        }
                         self.peer_commit = Some((aid, short));
                         self.last_peer = now;
                         // Firmware peer commit is an awaited continuation in associate().
                     }
                 }
                 Phase::FourWay | Phase::Open => {
+                    if self.extension.is_some()
+                        && (frame.rate >= 12 || self.data_profile.rates & (1 << frame.rate) == 0)
+                    {
+                        continue;
+                    }
+                    if frame.bytes().first() == Some(&0x88)
+                        && (!self.data_profile.qos || frame.bytes().get(24..26) != Some(&[0, 0]))
+                    {
+                        continue;
+                    }
                     if let Some(security) = &mut self.security {
                         let handshake_active = security.handshake_active();
                         let environment = &self.environment;
@@ -467,10 +511,11 @@ impl State {
                             initial.take().or_else(|| environment.nonce())
                         })? {
                             station_security::Rx::Data(bytes) => {
-                                if let Some(bytes) = ethernet(
+                                if let Some(bytes) = ethernet_profile(
                                     &bytes,
                                     self.own,
                                     self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
+                                    self.data_profile.qos,
                                 ) {
                                     self.last_peer = now;
                                     if self.received.len() == 64 {
@@ -486,10 +531,11 @@ impl State {
                             }
                             station_security::Rx::Ignored => {}
                         }
-                    } else if let Some(bytes) = ethernet(
+                    } else if let Some(bytes) = ethernet_profile(
                         frame.bytes(),
                         self.own,
                         self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
+                        self.data_profile.qos,
                     ) {
                         self.last_peer = now;
                         if self.received.len() == 64 {
@@ -518,9 +564,13 @@ impl State {
             && self.phase == Phase::FourWay
             && self.security.as_ref().is_none_or(Security::port_open)
         {
-            self.established = true;
-            self.phase = Phase::Open;
-            self.last_peer = now;
+            io.station_publication()?.invoke(|| {
+                self.admission.check()?;
+                self.established = true;
+                self.phase = Phase::Open;
+                self.last_peer = now;
+                Ok(())
+            })?;
         }
         if self.phase != Phase::Passive {
             let expired = if self.established {
@@ -538,7 +588,12 @@ impl State {
             }
         }
         if idle && self.established && self.security.as_ref().is_none_or(Security::port_open) {
-            Ok(self.received.drain(..).collect())
+            io.station_publication()?
+                .invoke(|| {
+                    self.admission.check()?;
+                    Ok(self.received.drain(..).collect())
+                })
+                .map_err(Error::Native)
         } else {
             Ok(Vec::new())
         }
@@ -607,6 +662,25 @@ impl State {
             admission: self.admission.clone(),
             armed: true,
         };
+        // Missing/unqualified extension preserves the original CCK1 profile.
+        // C21 cannot supply this C22-only sealed grant through its native Io.
+        if let Some(grant) = io.station_extension()? {
+            if candidate.basic_rates & !grant.rates() == 0 {
+                let p = if grant.wmm() {
+                    narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
+                        .map_err(|_| Error::Profile)?
+                } else {
+                    None
+                };
+                if let Some(p) = p {
+                    super::wmm::words(p, candidate.bss.capability & 0x400 != 0)?;
+                }
+                self.wmm_requested = p.is_some();
+                self.admission
+                    .run(|| io.station_bind_extension(grant.clone()))?;
+                self.extension = Some(grant);
+            }
+        }
         station_control::prepare_peer(io, bssid, &self.admission).await?;
         self.peer = Some(candidate);
         self.deadline = self.now()?.saturating_add(5000);
@@ -620,6 +694,10 @@ impl State {
             self.poll(io)?;
             if let Some((aid, short)) = self.peer_commit {
                 station_control::commit_peer(io, bssid, aid, short, &self.admission).await?;
+                if self.extension.is_some() {
+                    super::wmm::commit(io, self.data_profile, self.wmm, short, &self.admission)
+                        .await?;
+                }
                 self.admission.run(|| {
                     self.peer_commit = None;
                     self.phase = Phase::FourWay;
@@ -663,17 +741,24 @@ impl State {
         }
         let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
         let native = if let Some(security) = &mut self.security {
-            security.transmit_ethernet(frame)?
+            if self.data_profile.qos {
+                security.transmit_ethernet_qos(frame, 0)?
+            } else {
+                security.transmit_ethernet(frame)?
+            }
         } else {
             if !admitted(frame, self.own) {
                 return Err(Error::Profile);
             }
-            let mut bytes = vec![8, 1, 0, 0];
+            let mut bytes = vec![if self.data_profile.qos { 0x88 } else { 8 }, 1, 0, 0];
             bytes.extend_from_slice(&peer);
             bytes.extend_from_slice(&self.own);
             bytes.extend_from_slice(&frame[..6]);
             bytes.extend_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
+            if self.data_profile.qos {
+                bytes.extend_from_slice(&[0, 0]);
+            }
             bytes.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             bytes.extend_from_slice(&frame[12..]);
             bytes
@@ -692,25 +777,33 @@ pub(super) fn admitted(frame: &[u8], own: [u8; 6]) -> bool {
         )
 }
 fn ethernet(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
-    if !(32..=1532).contains(&frame.len())
-        || frame[0] != 8
+    ethernet_profile(frame, own, peer, false)
+}
+fn ethernet_profile(frame: &[u8], own: [u8; 6], peer: [u8; 6], qos: bool) -> Option<Vec<u8>> {
+    let header = if frame.first() == Some(&0x88) && qos && frame.get(24..26) == Some(&[0, 0]) {
+        26
+    } else {
+        24
+    };
+    if !(header + 8..=header + 1508).contains(&frame.len())
+        || frame[0] != if header == 26 { 0x88 } else { 8 }
         || frame[1] & 0xc7 != 2
         || frame[22] & 15 != 0
         || frame[10..16] != peer
         || (frame[4..10] != own && frame[4] & 1 == 0)
         || frame[16] & 1 != 0
         || frame[16..22] == [0; 6]
-        || frame[24..30] != [0xaa, 0xaa, 3, 0, 0, 0]
+        || frame[header..header + 6] != [0xaa, 0xaa, 3, 0, 0, 0]
     {
         return None;
     }
-    let proto = u16::from_be_bytes([frame[30], frame[31]]);
+    let proto = u16::from_be_bytes([frame[header + 6], frame[header + 7]]);
     if proto < 0x600 || matches!(proto, 0x888e | 0x80f3 | 0x8137) {
         return None;
     }
     let mut bytes = Vec::with_capacity(frame.len() - 18);
     bytes.extend_from_slice(&frame[4..10]);
     bytes.extend_from_slice(&frame[16..22]);
-    bytes.extend_from_slice(&frame[30..]);
+    bytes.extend_from_slice(&frame[header + 6..]);
     Some(bytes)
 }

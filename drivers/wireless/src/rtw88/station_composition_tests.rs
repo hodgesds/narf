@@ -14,6 +14,8 @@ use narf_net::{Interface, TxMeta};
 use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
 use narf_wireless::eapol::{KeyFrame, KeyMgmt, Ptk};
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIface};
+#[path = "wmm_station_tests.rs"]
+mod wmm_tests;
 const OWN: [u8; 6] = [2, 4, 6, 8, 10, 12];
 const AP: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const SSID: &[u8] = b"narf-8822ce";
@@ -71,6 +73,11 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
     }
 }
 pub(in crate::rtw88) struct Peer {
+    pub(super) wmm: Option<Vec<u8>>,
+    pub(super) qos: bool,
+    pub(super) association: Option<Vec<u8>>,
+    pub(super) response_rates: Option<Vec<u8>>,
+    pub(super) response_wmm: Option<Option<Vec<u8>>>,
     pub(in crate::rtw88) ap: FakeAp,
     pub(in crate::rtw88) plan: NetworkPlan,
     pub(super) server: DhcpServer,
@@ -100,6 +107,11 @@ impl Peer {
         .with_basic_1mbps()
         .unwrap();
         Self {
+            wmm: None,
+            qos: false,
+            association: None,
+            response_rates: None,
+            response_wmm: None,
             ap,
             plan,
             server: DhcpServer::new(plan),
@@ -112,11 +124,19 @@ impl Peer {
         }
     }
     pub(in crate::rtw88) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
-        let mut frame = vec![8, if self.ap.protected() { 0x42 } else { 2 }, 0, 0];
+        let mut frame = vec![
+            if self.qos { 0x88 } else { 8 },
+            if self.ap.protected() { 0x42 } else { 2 },
+            0,
+            0,
+        ];
         frame.extend_from_slice(&ethernet[..6]);
         frame.extend_from_slice(&AP);
         frame.extend_from_slice(&ethernet[6..12]);
         frame.extend_from_slice(&[0, 0]);
+        if self.qos {
+            frame.extend_from_slice(&[0, 0]);
+        }
         let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0];
         body.extend_from_slice(&ethernet[12..]);
         if self.ap.protected() {
@@ -144,10 +164,54 @@ impl Peer {
         }
         if self.ap.phase() != ApPhase::Authorized || matches!(frame[0], 0 | 0xb0) {
             let before = self.ap.phase();
-            let replies = self
+            if frame[0] == 0 {
+                let count = frame
+                    .get(28..)
+                    .ok_or("native association IE extent")?
+                    .windows(9)
+                    .filter(|w| *w == narf_wireless::wmm::INFORMATION)
+                    .count();
+                if count > 1 || count == 1 && self.wmm.is_none() {
+                    return Err("unexpected native station WMM Information IE");
+                }
+                self.qos = count == 1;
+                self.association = Some(frame.to_vec());
+            }
+            let mut replies = self
                 .ap
                 .receive(frame)
                 .map_err(|_| "shared AP rejected real native MLME/EAPOL")?;
+            for response in &mut replies {
+                if response.first() == Some(&0x10) {
+                    if let Some(rates) = &self.response_rates {
+                        let mut native = response[..30].to_vec();
+                        let mut ies = &response[30..];
+                        while !ies.is_empty() {
+                            let end = 2 + usize::from(*ies.get(1).ok_or("AP response extent")?);
+                            let ie = ies.get(..end).ok_or("AP response IE extent")?;
+                            if !matches!(ie[0], 1 | 50) {
+                                native.extend_from_slice(ie);
+                            }
+                            ies = &ies[end..];
+                        }
+                        let split = rates.len().min(8);
+                        native.extend_from_slice(&[1, split as u8]);
+                        native.extend_from_slice(&rates[..split]);
+                        if rates.len() > split {
+                            native.extend_from_slice(&[50, (rates.len() - split) as u8]);
+                            native.extend_from_slice(&rates[split..]);
+                        }
+                        *response = native;
+                    }
+                    if let Some(wmm) = self
+                        .response_wmm
+                        .as_ref()
+                        .map_or(self.wmm.as_ref(), |p| p.as_ref())
+                    {
+                        response.extend_from_slice(wmm);
+                    }
+                }
+            }
             if before == ApPhase::Message2 {
                 let key =
                     KeyFrame::decode(frame.get(36..).ok_or("M2 extent")?, 16).ok_or("M2 key")?;
@@ -163,10 +227,16 @@ impl Peer {
             }
             return Ok((replies, before == ApPhase::Message4 && self.hold_m4));
         }
-        if frame[0] != 8 || frame[1] & 3 != 1 || (frame[1] & 0x40 != 0) != self.ap.protected() {
+        let header = if self.qos { 26 } else { 24 };
+        if frame.len() < header
+            || frame[0] != if self.qos { 0x88 } else { 8 }
+            || self.qos && frame[24..26] != [0, 0]
+            || frame[1] & 3 != 1
+            || (frame[1] & 0x40 != 0) != self.ap.protected()
+        {
             return Err("native AP data protection/direction");
         }
-        let mut body = frame[24..].to_vec();
+        let mut body = frame[header..].to_vec();
         if self.ap.protected() {
             let key: &[u8; 16] = self
                 .ptk
@@ -178,7 +248,7 @@ impl Peer {
                 .map_err(|_| "AP uplink TK extent")?;
             body = narf_wireless::ccmp::unprotect(
                 &Ccm,
-                &frame[..24],
+                &frame[..header],
                 key,
                 0,
                 false,

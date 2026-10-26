@@ -129,9 +129,19 @@ impl<I: Io + 'static> Device<I> {
         self.lifecycle
             .start_station(self.environment.clone(), self.admission.clone())
             .await?;
+        let authority = self
+            .lifecycle
+            .retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .station_publication()?;
         self.admission.run(|| {
-            self.admitted.store(true, Ordering::Release);
-            Ok(())
+            authority.invoke(|| {
+                self.admitted.store(true, Ordering::Release);
+                Ok(())
+            })
         })?;
         attempt.armed = false;
         Ok(())
@@ -155,6 +165,21 @@ impl<I: Io + 'static> Device<I> {
         if was && !up {
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
+    }
+    fn publish_link(
+        &self,
+        owner: &mut super::firmware_transport::Owner<I>,
+    ) -> Result<super::publication::Publication, Error> {
+        let peer = owner.station_peer();
+        let port = owner.station_ready();
+        let authority = owner.station_publication()?;
+        self.admission.run(|| {
+            authority.invoke(|| {
+                self.link(peer, port);
+                Ok(())
+            })
+        })?;
+        Ok(authority)
     }
     fn control_ready(&self) -> Result<(), WirelessError> {
         if self.closed() {
@@ -197,15 +222,22 @@ impl<I: Io + 'static> Device<I> {
             // Re-sample the retained PCI/calibration/policy authority at
             // queue publication, after allocation and the initial check.
             // Native DMA publication independently checks again.
-            owner
-                .station_check()
+            let authority = owner
+                .station_publication()
                 .map_err(|_| super::firmware_transport::Error::Access)?;
-            self.tx
-                .lock()
-                .as_mut()
-                .ok_or(super::firmware_transport::Error::State)?
-                .try_send(frame)
-                .map_err(|_| super::firmware_transport::Error::State)
+            // Outer failure is current authority/PCI loss. Keep the inner
+            // ring-full result retryable without confusing the two classes.
+            authority
+                .invoke(|| {
+                    let mut slot = self.tx.lock();
+                    Ok(match slot.as_mut() {
+                        Some(ring) => ring
+                            .try_send(frame)
+                            .map_err(|_| super::firmware_transport::Error::State),
+                        None => Err(super::firmware_transport::Error::State),
+                    })
+                })
+                .map_err(|_| super::firmware_transport::Error::Access)?
         });
         if result == Err(super::firmware_transport::Error::Access) {
             self.close();
@@ -215,7 +247,7 @@ impl<I: Io + 'static> Device<I> {
         }
         result.map_err(|_| ())
     }
-    fn progress(&self) -> Vec<Vec<u8>> {
+    fn progress(&self) -> Vec<(Vec<u8>, super::publication::Publication)> {
         let Some(mut storage) = self.lifecycle.retained.try_lock() else {
             return Vec::new();
         };
@@ -236,16 +268,16 @@ impl<I: Io + 'static> Device<I> {
         if !self.admitted.load(Ordering::Acquire) {
             return Vec::new();
         }
-        let result = (|| -> Result<Vec<Vec<u8>>, Error> {
+        let result = (|| -> Result<Vec<(Vec<u8>, super::publication::Publication)>, Error> {
             let frames = owner.station_poll()?;
-            self.link(owner.station_peer(), owner.station_ready());
+            self.publish_link(owner)?;
             if self.closed() {
                 rings.clear();
                 return Ok(Vec::new());
             }
             if owner.station_peer().is_none() {
                 rings.clear();
-                return Ok(frames);
+                return Ok(Vec::new());
             }
             if rings.pending.is_none() {
                 for _ in 0..16 {
@@ -268,7 +300,7 @@ impl<I: Io + 'static> Device<I> {
                     }
                 }
             }
-            self.link(owner.station_peer(), owner.station_ready());
+            let authority = self.publish_link(owner)?;
             self.admission.run(|| {
                 for bytes in &frames {
                     if let Ok(memory) =
@@ -276,12 +308,18 @@ impl<I: Io + 'static> Device<I> {
                     {
                         let mut frame = Frame::new(memory, bytes.len() as u32);
                         frame.payload_mut().copy_from_slice(bytes);
-                        let _ = rings.rx.try_send(frame);
+                        authority.invoke(|| {
+                            let _ = rings.rx.try_send(frame);
+                            Ok(())
+                        })?;
                     }
                 }
                 Ok(())
             })?;
-            Ok(frames)
+            Ok(frames
+                .into_iter()
+                .map(|frame| (frame, authority.clone()))
+                .collect())
         })();
         match result {
             Ok(frames) => {
@@ -307,11 +345,24 @@ impl<I: Io + 'static> Device<I> {
         let progressed = !frames.is_empty();
         // All retained-owner/ring/admission guards have dropped before the
         // stack can synchronously answer ARP/ND through this enqueue callback.
-        for mut frame in frames {
+        for (mut frame, authority) in frames {
             if self.closed() {
                 break;
             }
-            narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+            if authority
+                .invoke(|| {
+                    if self.closed() {
+                        return Err(super::firmware_transport::Error::State);
+                    }
+                    narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+                    Ok(())
+                })
+                .is_err()
+            {
+                self.close();
+                let _ = self.progress();
+                break;
+            }
         }
         progressed
     }
@@ -482,7 +533,13 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             self.link(None, false);
             return Err(WirelessError::HardwareError);
         }
-        self.link(owner.station_peer(), owner.station_ready());
+        if self.publish_link(owner).is_err() {
+            self.close();
+            if !self.admission.teardown_pending() {
+                let _ = owner.station_stop();
+            }
+            return Err(WirelessError::HardwareError);
+        }
         result.map_err(error)
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {

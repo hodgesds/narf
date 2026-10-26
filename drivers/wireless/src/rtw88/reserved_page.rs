@@ -91,7 +91,27 @@ pub(super) unsafe trait Registers: Send {
     fn station_allowed(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn station_publication(&mut self) -> Result<super::publication::Publication, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::station_profile::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_extension(
+        &mut self,
+        _: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn packet_profile(&mut self, _: super::packet_format::DataProfile) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_profile_readback(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
@@ -274,6 +294,26 @@ impl<R: Registers, M: Memory> Backend<R, M> {
 // before publication, poisons before mutation and reopens only on a fresh
 // page completion; R's unsafe contract governs all other native queue state.
 unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
+    fn station_publication(&mut self) -> Result<super::publication::Publication, Error> {
+        self.io.station_publication()
+    }
+    fn station_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::station_profile::Grant>>, Error> {
+        self.io.station_extension()
+    }
+    fn station_bind_extension(
+        &mut self,
+        grant: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<(), Error> {
+        self.io.station_bind_extension(grant)
+    }
+    fn packet_profile(&mut self, profile: super::packet_format::DataProfile) -> Result<(), Error> {
+        self.io.packet_profile(profile)
+    }
+    fn station_profile_readback(&mut self) -> Result<(), Error> {
+        self.io.station_profile_readback()
+    }
     fn claim_pristine(&mut self) -> Result<(), Error> {
         if self.state != PageState::Unclaimed {
             return Err(Error::Prerequisite);

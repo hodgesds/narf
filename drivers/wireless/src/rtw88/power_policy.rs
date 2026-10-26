@@ -143,6 +143,67 @@ pub struct Permission {
 #[derive(Clone)]
 pub struct Gate {
     scope: Scope,
+    extension: Option<alloc::sync::Arc<super::station_profile::Grant>>,
+}
+/// A C22 calibration source without extension dispatch. N22L retains this
+/// narrower type, so invoking its base cannot recursively invoke N22L again.
+#[derive(Clone)]
+pub(super) struct CalibratedBase {
+    calibration: alloc::sync::Arc<Calibration>,
+    permission: Permission,
+    own: [u8; 6],
+}
+impl CalibratedBase {
+    pub(super) fn request(&self) -> super::station_profile::Request {
+        super::station_profile::request(
+            self.permission.identity,
+            self.calibration.digest,
+            self.permission.gains,
+            self.own,
+        )
+    }
+    pub(super) fn current(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), Error> {
+        self.calibration.validate(self.permission, domain)
+    }
+    pub(super) fn eirp(&self) -> i16 {
+        self.permission.eirp
+    }
+    pub(super) fn invoke<T>(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
+    ) -> Result<T, super::firmware_transport::Error> {
+        struct Invoke<'a, F> {
+            base: &'a CalibratedBase,
+            domain: &'a narf_wireless::reg::RegulatoryDomain,
+            operation: F,
+        }
+        impl<T, F: FnOnce() -> Result<T, super::firmware_transport::Error>>
+            CapOp<FirmwareBlob, Read> for Invoke<'_, F>
+        {
+            type Output = Result<T, super::firmware_transport::Error>;
+            fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((|| {
+                    self.base
+                        .current(self.domain)
+                        .map_err(super::firmware_transport::Error::Power)?;
+                    (self.operation)()
+                })())
+            }
+        }
+        self.calibration
+            .authority
+            .0
+            .invoke(Invoke {
+                base: self,
+                domain,
+                operation,
+            })
+            .map_err(|_| super::firmware_transport::Error::Power(Error::Authority))?
+    }
 }
 #[derive(Clone)]
 enum Scope {
@@ -154,12 +215,30 @@ enum Scope {
     C21(alloc::sync::Arc<super::station_power8821c::Grant>),
 }
 impl Gate {
+    pub(super) fn calibrated_base(&self) -> Option<CalibratedBase> {
+        if self.extension.is_some() {
+            return None;
+        }
+        match &self.scope {
+            Scope::C22 {
+                calibration,
+                permission,
+                own,
+            } => Some(CalibratedBase {
+                calibration: calibration.clone(),
+                permission: *permission,
+                own: *own,
+            }),
+            Scope::C21(_) => None,
+        }
+    }
     pub(super) fn new(
         calibration: alloc::sync::Arc<Calibration>,
         permission: Permission,
         own: [u8; 6],
     ) -> Self {
         Self {
+            extension: None,
             scope: Scope::C22 {
                 calibration,
                 permission,
@@ -170,6 +249,7 @@ impl Gate {
     pub(super) fn c21(grant: alloc::sync::Arc<super::station_power8821c::Grant>) -> Self {
         Self {
             scope: Scope::C21(grant),
+            extension: None,
         }
     }
     pub(super) fn did(&self) -> u16 {
@@ -185,6 +265,9 @@ impl Gate {
         }
     }
     pub(super) fn current(&self) -> Result<(), Error> {
+        if let Some(g) = &self.extension {
+            return g.check().map_err(|_| Error::Authority);
+        }
         match &self.scope {
             Scope::C22 {
                 calibration,
@@ -206,11 +289,91 @@ impl Gate {
         &self,
         operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
+        if let Some(g) = &self.extension {
+            return g.invoke(operation);
+        }
+        self.invoke_inner(None, operation)
+    }
+    pub(super) fn current_in(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), Error> {
+        match &self.scope {
+            Scope::C22 {
+                calibration,
+                permission,
+                ..
+            } => calibration.validate(*permission, domain),
+            Scope::C21(_) => self.current(),
+        }
+    }
+    pub(super) fn extension_request(&self) -> Option<super::station_profile::Request> {
+        match &self.scope {
+            Scope::C22 {
+                calibration,
+                permission,
+                own,
+            } => Some(super::station_profile::request(
+                permission.identity,
+                calibration.digest,
+                permission.gains,
+                *own,
+            )),
+            Scope::C21(_) => None,
+        }
+    }
+    pub(super) fn eirp(&self) -> Option<i16> {
+        match &self.scope {
+            Scope::C22 { permission, .. } => Some(permission.eirp),
+            Scope::C21(_) => None,
+        }
+    }
+    pub(super) fn cck_gains(&self) -> Option<[u8; 2]> {
+        match &self.scope {
+            Scope::C22 { permission, .. } => Some(permission.gains),
+            Scope::C21(_) => None,
+        }
+    }
+    pub(super) fn allows_profile(&self, p: super::packet_format::DataProfile) -> bool {
+        p.valid()
+            && match &self.extension {
+                Some(g) => p.rates & !g.rates() == 0 && (!p.qos || g.wmm()),
+                None => p == super::packet_format::DataProfile::LEGACY,
+            }
+    }
+    pub(super) fn with_extension(
+        &self,
+        g: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<Self, super::firmware_transport::Error> {
+        if self.did() != 0xc822 || self.extension.is_some() || !g.matches(self) {
+            return Err(super::firmware_transport::Error::State);
+        }
+        g.check()?;
+        let mut gate = self.clone();
+        gate.extension = Some(g);
+        Ok(gate)
+    }
+    pub(super) fn invoke_with_domain<T>(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
+    ) -> Result<T, super::firmware_transport::Error> {
+        if let Some(g) = &self.extension {
+            return g.invoke(operation);
+        }
+        self.invoke_inner(Some(domain), operation)
+    }
+    fn invoke_inner<T>(
+        &self,
+        domain: Option<&narf_wireless::reg::RegulatoryDomain>,
+        operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
+    ) -> Result<T, super::firmware_transport::Error> {
         match &self.scope {
             Scope::C21(grant) => grant.invoke(operation),
             Scope::C22 { calibration, .. } => {
                 struct Invoke<'a, F> {
                     gate: &'a Gate,
+                    domain: Option<&'a narf_wireless::reg::RegulatoryDomain>,
                     operation: F,
                 }
                 impl<T, F: FnOnce() -> Result<T, super::firmware_transport::Error>>
@@ -222,9 +385,11 @@ impl Gate {
                         _: &Cap<FirmwareBlob, Read>,
                     ) -> Result<Self::Output, CapError> {
                         Ok((|| {
-                            self.gate
-                                .current()
-                                .map_err(super::firmware_transport::Error::Power)?;
+                            match self.domain {
+                                Some(d) => self.gate.current_in(d),
+                                None => self.gate.current(),
+                            }
+                            .map_err(super::firmware_transport::Error::Power)?;
                             (self.operation)()
                         })())
                     }
@@ -234,6 +399,7 @@ impl Gate {
                     .0
                     .invoke(Invoke {
                         gate: self,
+                        domain,
                         operation,
                     })
                     .map_err(|_| super::firmware_transport::Error::Power(Error::Authority))?
@@ -245,6 +411,9 @@ impl Gate {
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
+        if let Some(g) = &self.extension {
+            return g.check().map_err(|_| Error::Authority);
+        }
         match &self.scope {
             Scope::C22 {
                 calibration,

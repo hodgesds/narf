@@ -143,6 +143,17 @@ fn smoke_rtw8821ce_native_station_radio_retry_receipts_and_retained_reserved_dma
         || m.ring.lock().bytes[..16] != [0; 16]
         || m.frame.lock().bytes[..DESC] != [0; DESC]
         || m.station_gate.as_ref().is_none_or(|g| g.did() != 0xc821)
+        || m.station_gate.as_ref().is_some_and(|g| {
+            g.extension_request().is_some()
+                || g.allows_profile(crate::rtw88::packet_format::DataProfile {
+                    rates: 0xfff,
+                    qos: false,
+                })
+                || g.allows_profile(crate::rtw88::packet_format::DataProfile {
+                    rates: 1,
+                    qos: true,
+                })
+        })
         || m.command_ring.pending()
     {
         return TestResult::Fail(

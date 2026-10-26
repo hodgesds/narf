@@ -92,6 +92,16 @@ impl<I: Io> Lifecycle<I> {
     pub(super) fn device_id(&self) -> u16 {
         self.did
     }
+    pub(super) async fn legacy_wmm_request(
+        &self,
+    ) -> Result<super::station_profile::Request, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(Error::State)?
+            .legacy_wmm_request()
+    }
     pub(super) async fn initialize_registered(
         &self,
         allocate: impl FnOnce() -> Result<I, Error> + Send,

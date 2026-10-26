@@ -72,7 +72,7 @@ impl Admission {
         })
     }
 }
-async fn send(
+pub(super) async fn send(
     io: &mut impl Io,
     words: [u8; 8],
     admission: Option<&Admission>,

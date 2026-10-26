@@ -51,6 +51,13 @@ fn write(memory: &DmaBuffer, offset: usize, data: &[u8]) -> Result<(), packet::E
     Ok(())
 }
 impl Native {
+    pub(in crate::rtw88) fn configure_packet_profile(
+        &mut self,
+        profile: format::DataProfile,
+    ) -> Result<(), crate::rtw88::firmware_transport::Error> {
+        self.with_packet(|core, _| core.configure_data(profile))
+            .map_err(|_| crate::rtw88::firmware_transport::Error::State)
+    }
     fn packet_memory<T>(
         &mut self,
         operation: impl FnOnce(&Self) -> Result<T, packet::Error>,

@@ -58,11 +58,16 @@ pub(in crate::rtw88) struct Model {
     pub(in crate::rtw88) reaction: Option<Arc<Reaction>>,
     pub(in crate::rtw88) authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub(in crate::rtw88) after_descriptor: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(in crate::rtw88) after_idle: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(in crate::rtw88) last_descriptor: Option<[u8; 48]>,
     submission: Option<Submission>,
     held: Option<Submission>,
     pub(in crate::rtw88) controls: Arc<Controls>,
 }
 impl Model {
+    pub(in crate::rtw88) fn payload_identity(&self) -> Option<(usize, u64)> {
+        Some((self.payload_cpu?, self.payload_dma?))
+    }
     pub(in crate::rtw88) fn new() -> Self {
         Self {
             indices: [0; 3],
@@ -82,6 +87,8 @@ impl Model {
             reaction: None,
             authority: None,
             after_descriptor: None,
+            after_idle: None,
+            last_descriptor: None,
             submission: None,
             held: None,
             controls: Arc::new(Controls::default()),
@@ -207,7 +214,15 @@ unsafe impl Port for Model {
     fn index(&mut self, reg: u16) -> Result<u32, Error> {
         self.guard()?;
         self.asynchronous_device_progress();
-        Ok(self.indices[Self::slot(reg)?])
+        let value = self.indices[Self::slot(reg)?];
+        // Device-side hook after the exact final RX-idle register read was
+        // authorized and observed, before its consumer publishes host state.
+        if reg == 0x3b4 && value & 0xfff == (value >> 16) & 0xfff {
+            if let Some(callback) = self.after_idle.clone() {
+                callback();
+            }
+        }
+        Ok(value)
     }
     fn publish(&mut self, reg: u16, host: u16) -> Result<(), Error> {
         self.guard()?;
@@ -268,6 +283,7 @@ unsafe impl Port for Model {
         // mapping. Observe actual requested CCX identity, never synthesize one
         // from the host station's pending state.
         let descriptor = unsafe { core::slice::from_raw_parts(pointer, format::TX_DESC) };
+        self.last_descriptor = Some(descriptor.try_into().map_err(|_| Error::Packet)?);
         let status = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
         let sequence = descriptor[24] & 0xfc;
         self.submission = Some(Submission {

@@ -56,6 +56,18 @@ pub struct Rtw88Device {
 static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
 
 impl Rtw88Device {
+    /// Metadata for a separately measured C22 legacy12/WMM station recipe.
+    /// Neither this request nor N22Cv2 alone grants the optional profile.
+    pub async fn rtl8822c_legacy_wmm_request(
+        &self,
+    ) -> Result<super::C22LegacyWmmRequest, super::FirmwareError> {
+        self.firmware
+            .as_ref()
+            .ok_or(super::FirmwareError::Unsupported)?
+            .lifecycle()
+            .legacy_wmm_request()
+            .await
+    }
     /// Exact awake/native station program for external board qualification.
     /// This request and the parked N21P receipt grant no RF authority.
     pub async fn rtl8821c_station_request(

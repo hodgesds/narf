@@ -257,7 +257,27 @@ pub(super) unsafe trait Io: Send {
     fn station_allowed(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn station_publication(&mut self) -> Result<super::publication::Publication, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::station_profile::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_extension(
+        &mut self,
+        _: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn packet_profile(&mut self, _: super::packet_format::DataProfile) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_profile_readback(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
@@ -330,6 +350,7 @@ pub(super) struct Owner<I: Io> {
     image_digest: Option<[u8; 32]>,
     power: Option<alloc::sync::Arc<super::power_policy::Calibration>>,
     radio: Option<super::radio::Info>,
+    radio_gate: Option<super::power_policy::Gate>,
     station: Option<super::station::State>,
 }
 impl<I: Io> core::fmt::Debug for Owner<I> {
@@ -360,6 +381,7 @@ impl<I: Io> Owner<I> {
             image_digest: None,
             power: None,
             radio: None,
+            radio_gate: None,
             station: None,
         }
     }
@@ -409,6 +431,14 @@ impl<I: Io> Owner<I> {
         }
         self.io
             .station_allowed()
+            .map_err(super::station::Error::Native)
+    }
+    pub(super) fn station_publication(
+        &mut self,
+    ) -> Result<super::publication::Publication, super::station::Error> {
+        self.station_check()?;
+        self.io
+            .station_publication()
             .map_err(super::station::Error::Native)
     }
     pub(super) fn station_phase(&self) -> Option<super::station::Phase> {
@@ -697,6 +727,7 @@ impl<I: Io> Owner<I> {
             permission,
             policy,
         };
+        self.radio_gate = Some(gate.clone());
         let info = super::radio::prepare(&mut io, factory, mac, phy, gain, gate).await?;
         self.radio = Some(info);
         self.phase = Phase::Calibrated;
@@ -712,6 +743,15 @@ impl<I: Io> Owner<I> {
         )
         .then_some(self.calibration8821c)
         .flatten()
+    }
+    pub(super) fn legacy_wmm_request(&self) -> Result<super::station_profile::Request, Error> {
+        if !matches!(self.phase, Phase::Calibrated | Phase::Station) {
+            return Err(Error::State);
+        }
+        self.radio_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::extension_request)
+            .ok_or(Error::Unsupported)
     }
     pub(super) fn operating_info8821c(&self) -> Option<super::operating8821c::Info> {
         matches!(
