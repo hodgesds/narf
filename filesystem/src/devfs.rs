@@ -654,6 +654,18 @@ pub fn install_tty_usb_hooks(
     });
 }
 
+pub fn install_ccid_hooks(
+    lookup: providers::DeviceLookup,
+    enumerate: providers::DeviceEnumeration,
+) {
+    register_provider(DeviceProvider {
+        name: "ccid",
+        lookup,
+        lookup_dir: |_| None,
+        enumerate,
+    });
+}
+
 pub fn install_video_hooks(
     lookup: providers::DeviceLookup,
     enumerate: providers::DeviceEnumeration,

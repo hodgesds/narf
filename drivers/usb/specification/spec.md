@@ -365,6 +365,22 @@ also consult upstream Linux GPL sources.
   `register_tty_usb`: it removes the port from the ttyUSB node table and
   withdraws the `/sys/class/tty/ttyUSB<N>` kobject. Indices are not
   recycled; a replugged adapter republishes under a fresh index.
+- `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
+  (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
+  initcall; node index = `CCID_READERS` index, assigned at bind). The
+  node is clone-on-open: `write` submits one raw APDU via
+  `CcidReader::send_apdu` and queues the response for `read` (one
+  command in flight per fd; a second `write` with an unread response
+  fails Busy). Card power and status are async ioctls via `ioctl_user`
+  (NARF-local, type 'C': POWER_ON queues the ATR as the next read,
+  POWER_OFF, SLOT_STATUS returns present/powered/changed bits,
+  SET_SLOT selects the fd's slot). Slot presence is tracked from
+  `RDR_to_PC_NotifySlotChange` reports consumed by the
+  `usb-ccid-supervisor` Stage::Late pump on the Interrupt-IN endpoint;
+  readers without an interrupt endpoint are polled via
+  `CcidReader::get_slot_status`. The bridge depends on the narrow
+  `CcidTransport` seam (production: the bound reader over xHCI);
+  fixtures drive the published surface against a modelled card.
 
 ## Scope
 

@@ -42,11 +42,13 @@
 //! - Extended APDU reassembly beyond the single-block XfrBlock path.
 //! - T=15 / global-interface parameter negotiation, PPS — default-good.
 
+pub mod devfs_bridge;
 pub mod t0;
 pub mod t1;
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -92,6 +94,13 @@ pub const PC_TO_RDR_XFR_BLOCK: u8 = 0x6F;
 pub const RDR_TO_PC_DATA_BLOCK: u8 = 0x80;
 /// RDR_to_PC_SlotStatus — slot status response (§6.2.2).
 pub const RDR_TO_PC_SLOT_STATUS: u8 = 0x81;
+
+/// RDR_to_PC_NotifySlotChange — slot-change report (§6.2.4). Not a
+/// bulk message: it arrives on the Interrupt-IN endpoint as
+/// `[0x50, bmSlotStatus...]` with no 10-byte CCID header. Each
+/// bmSlotStatus byte covers four slots, two bits per slot
+/// (bit 2n = ICC present, bit 2n+1 = state changed).
+pub const RDR_TO_PC_NOTIFY_SLOT_CHANGE: u8 = 0x50;
 
 /// CCID message header length (§6.1 Table 6-2): bMessageType(1) +
 /// dwLength(4) + bSlot(1) + bSeq(1) + abRFU[3] = 10 bytes.
@@ -267,6 +276,76 @@ pub struct Atr {
     pub bytes: Vec<u8>,
 }
 
+/// Decoded slot status from `PC_to_RDR_GetSlotStatus` (§6.1.3 /
+/// `RDR_to_PC_SlotStatus` §6.2.2).
+///
+/// `icc_status` is the bmICCStatus field (bStatus bits [1:0],
+/// §6.2.6 Table 6-10): 0 = ICC present and active (powered),
+/// 1 = ICC present but inactive, 2 = ICC not present, 3 = reserved.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SlotStatus {
+    /// bmICCStatus — see the type-level doc for the encoding.
+    pub icc_status: u8,
+    /// Raw bError byte (§6.2.6); meaningful only when the command
+    /// status bits report failure.
+    pub error: u8,
+    /// bClockStatus (§6.2.2): 0 = clock running, 1–3 = clock stopped
+    /// (low / high / unknown state).
+    pub clock_status: u8,
+}
+
+impl SlotStatus {
+    /// True when a card is physically present (active or inactive).
+    pub fn present(&self) -> bool {
+        self.icc_status != 2
+    }
+
+    /// True when the card is present and powered.
+    pub fn powered(&self) -> bool {
+        self.icc_status == 0
+    }
+}
+
+/// One slot's state decoded from a `RDR_to_PC_NotifySlotChange`
+/// report (§6.2.4): bmSlotStatus carries two bits per slot —
+/// bit 2n = ICC present after the change, bit 2n+1 = the state
+/// changed since the previous report.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SlotChange {
+    /// Slot index within the reader.
+    pub slot: u8,
+    /// ICC present after the change.
+    pub present: bool,
+    /// The device flagged this slot's state as changed.
+    pub changed: bool,
+}
+
+/// Decode a NotifySlotChange interrupt-IN payload into per-slot
+/// states. `buf` is `[0x50, bmSlotStatus...]`; each status byte
+/// covers four slots. Only slots that are present or flagged
+/// changed are returned (an absent, unchanged slot carries no
+/// information). Returns `None` if the type byte doesn't match.
+pub fn decode_notify_slot_change(buf: &[u8]) -> Option<Vec<SlotChange>> {
+    if buf.first() != Some(&RDR_TO_PC_NOTIFY_SLOT_CHANGE) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (i, &status) in buf[1..].iter().enumerate() {
+        for j in 0..4u8 {
+            let present = (status >> (2 * j)) & 1 != 0;
+            let changed = (status >> (2 * j + 1)) & 1 != 0;
+            if changed || present {
+                out.push(SlotChange {
+                    slot: (4 * i) as u8 + j,
+                    present,
+                    changed,
+                });
+            }
+        }
+    }
+    Some(out)
+}
+
 /// A bound CCID smart-card reader.
 #[derive(Debug)]
 pub struct CcidReader {
@@ -422,10 +501,102 @@ impl CcidReader {
         if msg_type != RDR_TO_PC_SLOT_STATUS {
             return Err(CcidError::BadResponse);
         }
-        if b_status & 0x03 != STATUS_SUCCESS {
+        // Success is bmCommandStatus (bits [7:6]): after a power-off
+        // the ICC status is 1 (present, inactive) or 2 (absent) —
+        // never 0 — so the previous `b_status & 0x03` check reported
+        // every successful power-off of a present card as an error.
+        if (b_status >> 6) & 0x03 != STATUS_SUCCESS {
             return Err(CcidError::CommandError(b_error));
         }
         Ok(())
+    }
+
+    /// Query slot `slot`'s status without ICC interaction.
+    ///
+    /// Sends `PC_to_RDR_GetSlotStatus` (§6.1.3) and decodes the
+    /// `RDR_to_PC_SlotStatus` (§6.2.2) response: bStatus at +7
+    /// (bmICCStatus in bits [1:0]), bError at +8, bClockStatus
+    /// at +9.
+    pub async fn get_slot_status(
+        &self,
+        xhci_dev: &Xhci,
+        slot: u8,
+    ) -> Result<SlotStatus, CcidError> {
+        let seq = self.next_seq(slot);
+        let hdr = Self::build_header(PC_TO_RDR_GET_SLOT_STATUS, 0, slot, seq);
+        xhci_dev
+            .bulk_out(self.slot_id, self.bulk_out_dci(), &hdr)
+            .await
+            .map_err(|_| CcidError::Transfer)?;
+
+        let mut resp = [0u8; CCID_HDR_LEN];
+        let n = xhci_dev
+            .bulk_in(self.slot_id, self.bulk_in_dci(), &mut resp)
+            .await
+            .map_err(|_| CcidError::Transfer)?;
+        if n < CCID_HDR_LEN {
+            return Err(CcidError::BadResponse);
+        }
+        let (msg_type, _pl, _rs, _rseq, b_status, b_error) = Self::decode_response_header(&resp)?;
+        if msg_type != RDR_TO_PC_SLOT_STATUS {
+            return Err(CcidError::BadResponse);
+        }
+        // The success check is on bmCommandStatus (bStatus bits
+        // [7:6], §6.2.6) — NOT bmICCStatus: an absent card is a
+        // successful query reporting icc_status 2, not an error.
+        if (b_status >> 6) & 0x03 != STATUS_SUCCESS {
+            return Err(CcidError::CommandError(b_error));
+        }
+        Ok(SlotStatus {
+            icc_status: b_status & 0x03,
+            error: b_error,
+            clock_status: resp[9],
+        })
+    }
+
+    /// DCI (Device Context Index) for the Interrupt-IN endpoint.
+    /// §4.8.1: DCI = (ep_num × 2) + 1 for IN. `None` on readers
+    /// that omit the endpoint.
+    fn intr_in_dci(&self) -> Option<u8> {
+        self.intr_in_ep.map(|ep| (ep.ep_addr & 0x0F) * 2 + 1)
+    }
+
+    /// Stage a transfer on the Interrupt-IN endpoint so the device
+    /// can deliver a `RDR_to_PC_NotifySlotChange` report (§6.2.4).
+    /// The transfer length matches the endpoint's max packet, the
+    /// same length `poll_slot_change` drains with (the xHCI layer
+    /// re-arms with the poll buffer's length after each report).
+    pub fn arm_slot_change(&self, xhci_dev: &Xhci) -> Result<(), CcidError> {
+        let dci = self.intr_in_dci().ok_or(CcidError::EndpointsMissing)?;
+        let len = self
+            .intr_in_ep
+            .map(|ep| ep.max_packet as u32)
+            .unwrap_or(8)
+            .max(2);
+        xhci_dev
+            .arm_interrupt_in(self.slot_id, dci, len)
+            .map_err(|_| CcidError::Transfer)?;
+        Ok(())
+    }
+
+    /// Non-blocking drain of a pending NotifySlotChange report.
+    /// Returns `Ok(Some(n))` with `n` report bytes in `out` (the
+    /// xHCI layer stages a fresh TRB for the next report),
+    /// `Ok(None)` when no report is pending. Arm the endpoint
+    /// with `arm_slot_change` once before the first poll.
+    ///
+    /// `out` must be exactly the endpoint max-packet length the
+    /// endpoint was armed with — the xHCI layer re-arms with
+    /// `out.len()` after each drain.
+    pub fn poll_slot_change(
+        &self,
+        xhci_dev: &Xhci,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, CcidError> {
+        let dci = self.intr_in_dci().ok_or(CcidError::EndpointsMissing)?;
+        xhci_dev
+            .poll_interrupt_in(self.slot_id, dci, out)
+            .map_err(|_| CcidError::Transfer)
     }
 
     /// Send raw payload bytes via `PC_to_RDR_XfrBlock` (§6.1.4) and
@@ -628,7 +799,12 @@ impl CcidReader {
 
 /// Global registry of bound CCID readers. Append-only — a userland
 /// PC/SC daemon attaches by index or slot_id when it loads.
-pub static CCID_READERS: IrqSafeSpinLock<Vec<CcidReader>> = IrqSafeSpinLock::new(Vec::new());
+/// Global registry of attached CCID readers.
+///
+/// Readers are `Arc`s so consumers (the `/dev/ccid<N>` bridge)
+/// can clone a handle under a short lock and run async transfers
+/// without holding the registry lock across an `.await`.
+pub static CCID_READERS: IrqSafeSpinLock<Vec<Arc<CcidReader>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Return the number of CCID readers currently registered.
 pub fn attached_count() -> usize {
@@ -852,7 +1028,7 @@ pub async fn try_bind_ccid_already_addressed(
         );
     }
 
-    let reader = CcidReader {
+    let reader = Arc::new(CcidReader {
         slot_id,
         num_slots: desc.max_slot_index.saturating_add(1),
         descriptor: desc,
@@ -860,16 +1036,103 @@ pub async fn try_bind_ccid_already_addressed(
         bulk_out_ep: eps.bulk_out,
         intr_in_ep: eps.intr_in,
         seq: IrqSafeSpinLock::new([0u8; 16]),
+    });
+    let idx = {
+        let mut g = CCID_READERS.lock();
+        let idx = g.len();
+        g.push(reader);
+        idx
     };
-    let mut g = CCID_READERS.lock();
-    let idx = g.len();
-    g.push(reader);
+    // Publish /dev/ccid<idx> — the userspace surface attach.rs
+    // documents for the PC/SC daemon.
+    devfs_bridge::register_reader(idx);
     Ok(idx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── NotifySlotChange decode (§6.2.4) ────────────────────────────
+
+    #[test]
+    fn notify_slot_change_decodes_insert_and_remove() {
+        // Slot 0 removed (changed=1, present=0 → 0b10), slot 1
+        // inserted (changed=1, present=1 → 0b1100): byte = 0x0E.
+        let out = decode_notify_slot_change(&[RDR_TO_PC_NOTIFY_SLOT_CHANGE, 0x0E]).unwrap();
+        assert_eq!(
+            out,
+            alloc::vec![
+                SlotChange {
+                    slot: 0,
+                    present: false,
+                    changed: true
+                },
+                SlotChange {
+                    slot: 1,
+                    present: true,
+                    changed: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn notify_slot_change_decodes_multi_byte_and_steady_state() {
+        // Byte 0 slot 0 present, unchanged (0b01); byte 1 covers
+        // slots 4..8 with slot 5 present+changed (bits [3:2] = 0b11).
+        let out = decode_notify_slot_change(&[RDR_TO_PC_NOTIFY_SLOT_CHANGE, 0x01, 0x0C]).unwrap();
+        assert_eq!(
+            out,
+            alloc::vec![
+                SlotChange {
+                    slot: 0,
+                    present: true,
+                    changed: false
+                },
+                SlotChange {
+                    slot: 5,
+                    present: true,
+                    changed: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn notify_slot_change_rejects_wrong_type() {
+        assert!(decode_notify_slot_change(&[RDR_TO_PC_DATA_BLOCK, 0xFF]).is_none());
+        assert!(decode_notify_slot_change(&[]).is_none());
+        // Quiet report (no slot present, none changed) decodes empty.
+        assert_eq!(
+            decode_notify_slot_change(&[RDR_TO_PC_NOTIFY_SLOT_CHANGE, 0x00])
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn slot_status_present_powered_semantics() {
+        let active = SlotStatus {
+            icc_status: 0,
+            error: 0,
+            clock_status: 0,
+        };
+        assert!(active.present() && active.powered());
+        let inactive = SlotStatus {
+            icc_status: 1,
+            error: 0,
+            clock_status: 1,
+        };
+        assert!(inactive.present() && !inactive.powered());
+        let absent = SlotStatus {
+            icc_status: 2,
+            error: 0,
+            clock_status: 0,
+        };
+        assert!(!absent.present() && !absent.powered());
+    }
 
     // ── Smoke 1: CCID descriptor decode — T=0 + T=1 bits ─────────────
 

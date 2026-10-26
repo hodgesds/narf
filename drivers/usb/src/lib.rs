@@ -55,6 +55,15 @@ pub fn register_initcalls() {
         );
         InitResult::Ok
     });
+    // Install devfs hooks so /dev/ccid<N> nodes resolve for every
+    // reader the CCID class driver binds.
+    narf_init::register(Stage::Subsys, "usb-ccid-devfs", || {
+        narf_filesystem::devfs::install_ccid_hooks(
+            ccid::devfs_bridge::lookup_ccid,
+            ccid::devfs_bridge::enumerate_ccid,
+        );
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "usb-uac", || {
         uac::register_initcalls();
         InitResult::Ok
@@ -137,6 +146,17 @@ pub fn register_initcalls() {
             return InitResult::NotPresent;
         }
         spawn_supervisor_task();
+        InitResult::Ok
+    });
+    // CCID slot-change pump: services the readers' Interrupt-IN
+    // endpoints (NotifySlotChange) so card insert/remove reaches
+    // the /dev/ccid<N> presence state. Same NotPresent rule as the
+    // HID supervisor when no xHCI controller is bound.
+    narf_init::register(Stage::Late, "usb-ccid-supervisor", || {
+        if !xhci::is_probed() {
+            return InitResult::NotPresent;
+        }
+        ccid::devfs_bridge::spawn_slot_change_pump();
         InitResult::Ok
     });
     // Stage::Subsys banner for the HID vendor quirk tables (Apple /
