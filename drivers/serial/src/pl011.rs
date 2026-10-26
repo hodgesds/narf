@@ -1,24 +1,249 @@
-//! ARM PrimeCell UART (PL011) Driver.
+//! ARM PrimeCell UART (PL011) driver — devicetree-bound.
 //!
-//! Provides serial console and TTY support for the standard UART
-//! block found on most ARM SoCs, including the Raspberry Pi.
+//! The first DT-native device driver in the tree (DT programme
+//! step 4, issue #1048): the driver registers a `DtMatch` for
+//! `arm,pl011`, and `probe_all` hands it the enumerated
+//! `BusKind::Platform` record — reg window and GIC-resolved IRQ
+//! come from the device tree, not from a hardcoded constant. The
+//! probe maps the window, programs the UART, and publishes the
+//! port in the serial registry as `ttyAMA0`.
 //!
-//! References: `linux/drivers/tty/serial/amba-pl011.c`
+//! The early console (`narf_console`) drives the same UART from
+//! boot; the two coexist the way Linux's console and `amba-pl011`
+//! do — the console owns the device until the driver binds, and
+//! both program the same 115200 8N1 line format here, so the
+//! takeover re-init below is a register-identical reprogram on
+//! QEMU `virt`.
+//!
+//! Clock: divisors are computed for a 24 MHz UARTCLK. On QEMU
+//! `virt` that is the fixed `/apb-pclk` the node's `clocks`
+//! property references; resolving the referenced clock (and its
+//! rate) from the tree is the clock framework's work (issue
+//! #1052), at which point the constant becomes a lookup.
+//!
+//! IRQ: the record's INTID is published in the registry entry.
+//! RX is polled (as the console backend is); IRQ-driven RX into
+//! the TTY layer is a follow-on, not part of the binding proof.
+//!
+//! References: ARM PrimeCell UART (PL011) Technical Reference
+//! Manual (DDI 0183); `linux/drivers/tty/serial/amba-pl011.c`.
 
 extern crate alloc;
 
 use core::fmt::Write;
+use narf_bus::{BusDevice, BusKind, DtMatch, ProbeError};
+use narf_capabilities::{Cap, Write as CapWrite};
 use narf_console::Writer;
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::ioremap::{ioremap, IoMapping, MmioAttrs};
+use narf_memory::PhysAddr;
 
-/// Register the PL011 platform driver.
-pub fn register_initcalls() {
-    use narf_init::{InitResult, Stage};
-    narf_init::register(Stage::Subsys, "pl011", || {
-        let _ = writeln!(
-            Writer,
-            "  serial: ARM PrimeCell PL011 UART driver registered"
-        );
-        // Placeholder: parse DeviceTree for `arm,pl011` compatible strings.
-        InitResult::Ok
+use crate::registry;
+
+// PL011 register offsets (DDI 0183 §3.2).
+const DR: u64 = 0x000;
+const FR: u64 = 0x018;
+const IBRD: u64 = 0x024;
+const FBRD: u64 = 0x028;
+const LCR_H: u64 = 0x02C;
+const CR: u64 = 0x030;
+const ICR: u64 = 0x044;
+
+const FR_TXFF: u32 = 1 << 5;
+const FR_RXFE: u32 = 1 << 4;
+
+const CR_UARTEN: u32 = 1 << 0;
+const CR_LBE: u32 = 1 << 7;
+const CR_TXE: u32 = 1 << 8;
+const CR_RXE: u32 = 1 << 9;
+
+const LCR_H_FEN: u32 = 1 << 4;
+const LCR_H_WLEN_8: u32 = 0b11 << 5;
+
+/// UARTCLK the divisors are computed against (see module docs).
+const UARTCLK_HZ: u32 = 24_000_000;
+/// Line format this driver programs: 115200 8N1.
+pub const DEFAULT_BAUD: u32 = 115_200;
+
+/// A bound PL011 port: the mapped register block plus the
+/// DT-described identity (physical base, resolved IRQ).
+#[derive(Debug)]
+pub struct Pl011 {
+    mapping: IoMapping,
+    base: PhysAddr,
+    irq: Option<u32>,
+}
+
+impl Pl011 {
+    /// Map the register window described by the device record.
+    ///
+    /// # Safety
+    /// `base`/`len` must name this device's real MMIO window (the
+    /// enumerator took them from the machine's device tree) and
+    /// the caller must hold the device exclusively — `probe_all`'s
+    /// cap-mint is that exclusivity.
+    unsafe fn new(base: PhysAddr, len: u64, irq: Option<u32>) -> Result<Self, ProbeError> {
+        // SAFETY: caller-asserted device window (see above).
+        let mapping = unsafe { ioremap(base.raw(), len, MmioAttrs::Device) }
+            .map_err(|_| ProbeError::Other("pl011: ioremap of the DT reg window failed"))?;
+        Ok(Self { mapping, base, irq })
+    }
+
+    fn read(&self, off: u64) -> u32 {
+        // SAFETY: `off` is a PL011 register offset inside the
+        // mapped window (all call sites use the constants above).
+        unsafe {
+            (self.mapping.va() as *const u32)
+                .byte_add(off as usize)
+                .read_volatile()
+        }
+    }
+
+    fn write(&self, off: u64, val: u32) {
+        // SAFETY: same window contract as `read`.
+        unsafe {
+            (self.mapping.va() as *mut u32)
+                .byte_add(off as usize)
+                .write_volatile(val)
+        }
+    }
+
+    /// Program the UART to `baud` 8N1 with FIFOs on: disable,
+    /// clear stale interrupt status, divisors, line control,
+    /// enable. Runs the full sequence even when the console has
+    /// already programmed the same format (identical values on
+    /// QEMU `virt`), so the driver owns the programming path on
+    /// boards whose firmware never touched the UART.
+    pub fn init(&mut self, baud: u32) {
+        let denom = 16 * baud;
+        let ibrd = UARTCLK_HZ / denom;
+        let rem = UARTCLK_HZ % denom;
+        // Fractional divisor, rounded to the nearest 1/64.
+        let fbrd = (rem * 64 + denom / 2) / denom;
+        self.write(CR, 0);
+        self.write(ICR, 0x7FF);
+        self.write(IBRD, ibrd);
+        self.write(FBRD, fbrd);
+        self.write(LCR_H, LCR_H_FEN | LCR_H_WLEN_8);
+        self.write(CR, CR_UARTEN | CR_TXE | CR_RXE);
+    }
+
+    /// Blocking single-byte TX (polled on the TX FIFO flag, the
+    /// console backend's pattern).
+    pub fn write_byte(&self, byte: u8) {
+        while self.read(FR) & FR_TXFF != 0 {
+            core::hint::spin_loop();
+        }
+        self.write(DR, byte as u32);
+    }
+
+    /// Non-blocking single-byte RX; `None` when the RX FIFO is
+    /// empty.
+    pub fn try_read_byte(&self) -> Option<u8> {
+        if self.read(FR) & FR_RXFE != 0 {
+            return None;
+        }
+        Some(self.read(DR) as u8)
+    }
+
+    /// Hardware loopback round-trip (CR.LBE): the TX path drives
+    /// the RX path internally and the external TXD line stays
+    /// disconnected, so the pattern never reaches the console
+    /// wire. Proves the mapped window is the live device — the
+    /// step-4 binding proof the boot smoke asserts.
+    pub fn loopback_selftest(&mut self) -> bool {
+        while self.try_read_byte().is_some() {} // drain stale RX
+        let cr = self.read(CR);
+        self.write(CR, cr | CR_LBE);
+        const PATTERN: [u8; 3] = [0xA5, 0x3C, 0x55];
+        for &b in &PATTERN {
+            self.write_byte(b);
+        }
+        let mut ok = true;
+        for &want in &PATTERN {
+            let mut got = None;
+            for _ in 0..100_000 {
+                if let Some(b) = self.try_read_byte() {
+                    got = Some(b);
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            if got != Some(want) {
+                ok = false;
+                break;
+            }
+        }
+        self.write(CR, cr & !CR_LBE);
+        while self.try_read_byte().is_some() {} // drain any residue
+        ok
+    }
+}
+
+/// The bound port, stashed at probe (the `probe_all` pattern —
+/// drivers keep their controller in a static).
+static BOUND: IrqSafeSpinLock<Option<Pl011>> = IrqSafeSpinLock::new(None);
+
+/// `(physical base, resolved IRQ)` of the bound port, if a PL011
+/// has been bound. Test/diagnostic surface.
+pub fn bound_port() -> Option<(u64, Option<u32>)> {
+    BOUND.lock().as_ref().map(|p| (p.base.raw(), p.irq))
+}
+
+/// Run the loopback self-test on the bound port; `None` when no
+/// PL011 is bound.
+pub fn selftest_loopback() -> Option<bool> {
+    BOUND.lock().as_mut().map(|p| p.loopback_selftest())
+}
+
+fn probe_pl011(
+    device: BusDevice,
+    _cap: Cap<narf_bus::BusDeviceCap, CapWrite>,
+) -> Result<(), ProbeError> {
+    let BusKind::Platform(rec) = device.kind else {
+        return Err(ProbeError::NotForThisDriver);
+    };
+    let Some(win) = rec.reg_windows().first() else {
+        return Err(ProbeError::BadDevice);
+    };
+    let irq = rec.irq_list().first().map(|i| i.intid);
+    // SAFETY: the record's window is this machine's DT-described
+    // PL011 window and `probe_all` minted us the device cap.
+    let mut uart = unsafe { Pl011::new(win.base, win.len, irq)? };
+    uart.init(DEFAULT_BAUD);
+    registry::register(registry::UartInfo {
+        io_base: 0,
+        mmio_base: win.base.raw(),
+        irq: irq.and_then(|i| u16::try_from(i).ok()),
+        name: "ttyAMA0",
+        baud: DEFAULT_BAUD,
     });
+    let _ = writeln!(
+        Writer,
+        "  serial: pl011 bound from DT at {:#x} (irq {:?}), published as ttyAMA0",
+        win.base.raw(),
+        irq
+    );
+    *BOUND.lock() = Some(uart);
+    Ok(())
+}
+
+/// Register the PL011 DT driver: a `DtMatch` for `arm,pl011`,
+/// registered when the serial crate's Stage::Subsys initcall runs
+/// so Stage::Device's `probe_all` can bind against it.
+///
+/// (The pre-step-4 body nested a second `narf_init::register` for
+/// a banner closure; `run_stage` snapshots a stage's calls before
+/// running them, so that registration could never execute — dead
+/// code, removed rather than preserved.)
+pub fn register_initcalls() {
+    narf_bus::register_dt_driver(DtMatch {
+        name: "pl011",
+        compatible: "arm,pl011",
+        probe: probe_pl011,
+    });
+    let _ = writeln!(
+        Writer,
+        "  serial: ARM PrimeCell PL011 UART driver registered (DT match arm,pl011)"
+    );
 }

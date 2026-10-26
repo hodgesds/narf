@@ -443,7 +443,8 @@ pub fn register_legacy_uarts() {
         );
         registry::register(registry::UartInfo {
             io_base: base,
-            irq: Some(irq),
+            mmio_base: 0,
+            irq: Some(u16::from(irq)),
             name,
             baud: 115_200,
         });
