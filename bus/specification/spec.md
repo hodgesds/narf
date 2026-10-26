@@ -176,6 +176,48 @@ children) are visible to `devices()` immediately. The match-table
 dispatcher's binding walk (§9) additionally observes appends made
 *during* the walk itself — see §9.5.
 
+Probe-time tree access (DT programme step 5): enumeration retains
+the discovered blob, and bindings re-locate their node in it —
+matched by the same identity the record carries (first
+compatible string + first translated `reg` base) — to decode
+node-local data the fixed-size record cannot hold:
+
+```rust
+/// The boot DTB retained at enumeration (aarch64); `None` on
+/// x86_64 and DTB-less boots.
+pub fn dtb_blob() -> Option<&'static [u8]>;
+
+/// Decode the child subtree of the node identified by
+/// (`parent_compatible`, `parent_first_reg_base`). Child `reg`
+/// values are decoded with the parent node's cells and left
+/// untranslated — they live in the parent's local address space
+/// (partition offsets, chip-selects). Children ride recursively.
+pub fn children_of(
+    blob: &[u8],
+    parent_compatible: &str,
+    parent_first_reg_base: u64,
+) -> Vec<DtChild>;
+
+/// Read one property of the identified node itself (a `clocks`
+/// phandle list, a `clock-frequency` override).
+pub fn node_prop(
+    blob: &[u8],
+    parent_compatible: &str,
+    parent_first_reg_base: u64,
+    name: &str,
+) -> Option<Vec<u8>>;
+
+/// Resolve a clock phandle to the target node's
+/// `clock-frequency` when the target is a fixed-clock style
+/// provider. The #1052 clock framework generalises provider
+/// resolution; consumers name their fallback explicitly.
+pub fn clock_frequency_of_phandle(blob: &[u8], phandle: u32) -> Option<u32>;
+```
+
+This is the mechanism the §3.1 framework resolution (clocks /
+resets / regulators, and likewise `fixed-partitions` tables and
+bus child devices) is specified to use at probe time.
+
 ### 3.3 Device capability
 
 ```rust

@@ -28,9 +28,11 @@
 //! translatable `reg` window. The `/cpus` subtree is excluded:
 //! CPU nodes are SMP bring-up's input, not bus devices.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use narf_firmware_fdt as fdt;
+use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
 use crate::addr::BusAddr;
@@ -323,6 +325,320 @@ pub fn decode_devices(blob: &[u8]) -> Vec<DtDevice> {
         });
     });
     out
+}
+
+// ── Probe-time tree access ─────────────────────────────────────
+//
+// Enumeration (step 3) flattens device-shaped nodes into records
+// and deliberately carries nothing that points back into the blob.
+// Some bindings nevertheless need node-local data the record
+// cannot hold: a flash node's `fixed-partitions` children, an SPI
+// controller's child devices, a clock phandle's target. Per bus
+// spec §3.1 the framework layer resolves those at probe time by
+// re-locating the node in the retained blob — the two helpers
+// below are that mechanism.
+
+/// The boot DTB slice retained at enumeration (aarch64). The blob
+/// lives in memory the boot handoff reserved, and `discover`
+/// returns a `'static` slice over it, so retaining it costs one
+/// pointer. `None` on x86_64 and on DTB-less boots.
+static DTB_BLOB: IrqSafeSpinLock<Option<&'static [u8]>> = IrqSafeSpinLock::new(None);
+
+/// The retained boot DTB, if enumeration ran on one. Probe fns use
+/// it with [`children_of`] to re-locate their node (matched by
+/// first compatible string + first translated `reg` base — the
+/// identity the enumerated record carries).
+pub fn dtb_blob() -> Option<&'static [u8]> {
+    *DTB_BLOB.lock()
+}
+
+/// Retain the discovered blob for probe-time access. Called once
+/// by the aarch64 enumerator; a later call replaces the slice.
+pub(crate) fn retain_dtb_blob(blob: &'static [u8]) {
+    *DTB_BLOB.lock() = Some(blob);
+}
+
+/// One child node of a devicetree device node, decoded raw: the
+/// child's properties are carried verbatim (drivers decode the
+/// ones their binding defines — `label` / `reg` for partitions,
+/// `reg` / `spi-max-frequency` for SPI children), and `reg` is the
+/// child's first `reg` entry decoded with the *parent* node's
+/// cells, **untranslated** — a child's `reg` lives in the parent's
+/// local address space (a partition offset, a chip-select), not in
+/// CPU space. Grandchildren ride along recursively in `children`.
+#[derive(Clone, Debug)]
+pub struct DtChild {
+    /// Node name, e.g. `partition@0` or `flash@0`.
+    pub name: String,
+    /// Raw `compatible` value (NUL-separated); empty when absent.
+    pub compatible: Vec<u8>,
+    /// First `reg` entry as `(address, size)` in the parent node's
+    /// local space; `None` when the child declares no `reg`.
+    pub reg: Option<(u64, u64)>,
+    /// Every property of the child, name → raw value.
+    pub props: Vec<(String, Vec<u8>)>,
+    /// The child's own children, recursively.
+    pub children: Vec<DtChild>,
+}
+
+impl DtChild {
+    /// `true` iff the child's `compatible` list contains `needle`.
+    pub fn compatible_contains(&self, needle: &str) -> bool {
+        fdt::compatible_matches(&self.compatible, needle)
+    }
+
+    /// Raw value of property `name`, if present.
+    pub fn prop(&self, name: &str) -> Option<&[u8]> {
+        self.props
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// Property `name` as a big-endian u32 (first cell).
+    pub fn prop_u32(&self, name: &str) -> Option<u32> {
+        let v = self.prop(name)?;
+        if v.len() < 4 {
+            return None;
+        }
+        Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+    }
+
+    /// Property `name` as a NUL-terminated string.
+    pub fn prop_str(&self, name: &str) -> Option<&str> {
+        let v = self.prop(name)?;
+        let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
+        core::str::from_utf8(&v[..end]).ok()
+    }
+
+    /// `true` iff the boolean property `name` is present
+    /// (`read-only`, `lock`, …).
+    pub fn prop_present(&self, name: &str) -> bool {
+        self.prop(name).is_some()
+    }
+}
+
+/// Push the ancestor frame for the node being visited and return
+/// its first `reg` window's base translated through ancestor
+/// `ranges` (`None` when it has no decodable first window or a
+/// `ranges` hop fails). Shared by the probe-time lookups below;
+/// the frame discipline mirrors `decode_devices`'.
+fn visit_node(
+    ancestors: &mut Vec<AncestorFrame>,
+    path: &fdt::Path,
+    props: fdt::PropIter,
+    parent_cells: fdt::Cells,
+) -> Option<u64> {
+    let depth = path.depth() as usize;
+    ancestors.truncate(depth);
+    if ancestors.len() < depth {
+        return None; // unreachable on a well-formed walk; stay total
+    }
+    let own_cells = fdt::Cells {
+        address: fdt::prop_u32(props, "#address-cells").unwrap_or(2),
+        size: fdt::prop_u32(props, "#size-cells").unwrap_or(1),
+    };
+    let ranges = match raw_prop(props, "ranges") {
+        Some(v) if !v.is_empty() => Some(v.to_vec()),
+        _ => None,
+    };
+    ancestors.push(AncestorFrame {
+        ranges,
+        own_cells,
+        parent_cells,
+        irq_parent: 0,
+    });
+    let reg_raw = raw_prop(props, "reg")?;
+    if parent_cells.entry_bytes() == 0 || reg_raw.len() < parent_cells.entry_bytes() {
+        return None;
+    }
+    let (raw_addr, _) = parent_cells.read_one_reg(reg_raw, 0)?;
+    let mut addr = raw_addr;
+    for k in (1..depth).rev() {
+        if let Some(ranges) = &ancestors[k].ranges {
+            addr = translate_ranges(ranges, &ancestors[k], addr)?;
+        }
+    }
+    Some(addr)
+}
+
+/// The ancestor stack's seed frame (the root), shared by the
+/// probe-time lookups.
+fn seed_ancestors() -> Vec<AncestorFrame> {
+    alloc::vec![AncestorFrame {
+        ranges: None,
+        own_cells: fdt::Cells::DEFAULT,
+        parent_cells: fdt::Cells::DEFAULT,
+        irq_parent: 0,
+    }]
+}
+
+/// Decode the child subtree of the node identified by
+/// (`parent_compatible`, `parent_first_reg_base`) — the identity
+/// an enumerated [`PlatformDevice`] record carries (its first
+/// compatible string and its first `reg` window's base, translated
+/// through ancestor `ranges` exactly as [`decode_devices`]
+/// translates it; spec §3.1). The first matching node wins; a
+/// parent whose `status` is not absent-or-`okay` never matches
+/// (the enumeration rule). Children whose own status is not
+/// absent-or-`okay` are skipped with their subtrees. Returns an
+/// empty Vec when no node matches.
+pub fn children_of(
+    blob: &[u8],
+    parent_compatible: &str,
+    parent_first_reg_base: u64,
+) -> Vec<DtChild> {
+    let mut ancestors = seed_ancestors();
+    let mut match_depth: Option<usize> = None;
+    let mut skip_depth: Option<usize> = None;
+    let mut done = false;
+    // (depth, node) for every node in the matched subtree below
+    // the parent itself, in walk (preorder) order.
+    let mut flat: Vec<(usize, DtChild)> = Vec::new();
+
+    fdt::walk_with_cells(blob, |path, props, parent_cells| {
+        if done {
+            return;
+        }
+        let depth = path.depth() as usize;
+        if depth == 0 {
+            return;
+        }
+        let translated_base = visit_node(&mut ancestors, path, props, parent_cells);
+
+        if let Some(md) = match_depth {
+            if depth <= md {
+                done = true; // the matched subtree is finished
+                return;
+            }
+            // Inside the matched subtree. A node whose status is
+            // not okay is skipped with everything below it.
+            if let Some(sd) = skip_depth {
+                if depth > sd {
+                    return;
+                }
+                skip_depth = None;
+            }
+            if fdt::node_status(props) != fdt::Status::Okay {
+                skip_depth = Some(depth);
+                return;
+            }
+            let reg = raw_prop(props, "reg").and_then(|raw| {
+                if raw.is_empty() {
+                    None
+                } else {
+                    parent_cells.read_one_reg(raw, 0)
+                }
+            });
+            flat.push((
+                depth,
+                DtChild {
+                    name: path.last_segment().into(),
+                    compatible: raw_prop(props, "compatible")
+                        .map(|v| v.to_vec())
+                        .unwrap_or_default(),
+                    reg,
+                    props: props
+                        .into_iter()
+                        .map(|(n, v)| (n.into(), v.to_vec()))
+                        .collect(),
+                    children: Vec::new(),
+                },
+            ));
+            return;
+        }
+
+        // Not yet matched: test this node for parenthood. The
+        // identity is the enumeration identity (spec §3.1): the
+        // node's FIRST compatible string plus its first reg
+        // window translated through ancestor ranges.
+        if fdt::node_status(props) != fdt::Status::Okay {
+            return;
+        }
+        let Some(compatible) = raw_prop(props, "compatible") else {
+            return;
+        };
+        let first_len = compatible
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(compatible.len());
+        if &compatible[..first_len] != parent_compatible.as_bytes() {
+            return;
+        }
+        if translated_base == Some(parent_first_reg_base) {
+            match_depth = Some(depth);
+        }
+    });
+
+    let Some(md) = match_depth else {
+        return Vec::new();
+    };
+    let mut pos = 0usize;
+    assemble_children(&flat, &mut pos, md + 1)
+}
+
+/// Fold a preorder (depth, node) listing of one subtree into the
+/// recursive [`DtChild`] shape.
+fn assemble_children(flat: &[(usize, DtChild)], pos: &mut usize, depth: usize) -> Vec<DtChild> {
+    let mut out = Vec::new();
+    while *pos < flat.len() && flat[*pos].0 == depth {
+        let mut node = flat[*pos].1.clone();
+        *pos += 1;
+        node.children = assemble_children(flat, pos, depth + 1);
+        out.push(node);
+    }
+    out
+}
+
+/// Read one property of the node identified by (`parent_compatible`,
+/// `parent_first_reg_base`) — the same identity [`children_of`]
+/// matches. This is how a binding reads its own node's
+/// node-local data the record cannot hold (a `clocks` phandle
+/// list, a `clock-frequency` override).
+pub fn node_prop(
+    blob: &[u8],
+    parent_compatible: &str,
+    parent_first_reg_base: u64,
+    name: &str,
+) -> Option<Vec<u8>> {
+    let mut ancestors = seed_ancestors();
+    let mut found: Option<Vec<u8>> = None;
+    fdt::walk_with_cells(blob, |path, props, parent_cells| {
+        if found.is_some() || path.depth() == 0 {
+            return;
+        }
+        let translated_base = visit_node(&mut ancestors, path, props, parent_cells);
+        if translated_base != Some(parent_first_reg_base)
+            || fdt::node_status(props) != fdt::Status::Okay
+        {
+            return;
+        }
+        let Some(compatible) = raw_prop(props, "compatible") else {
+            return;
+        };
+        let first_len = compatible
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(compatible.len());
+        if &compatible[..first_len] == parent_compatible.as_bytes() {
+            found = raw_prop(props, name).map(|v| v.to_vec());
+        }
+    });
+    found
+}
+
+/// Resolve a clock phandle to a fixed frequency: the target
+/// node's `clock-frequency`, when the target is a fixed-clock
+/// style provider that carries one. The clock framework (#1052)
+/// generalises provider resolution; until it lands this is the
+/// probe-time constant a binding consumes (bus spec §3.1), and
+/// each consumer names its fallback explicitly.
+pub fn clock_frequency_of_phandle(blob: &[u8], phandle: u32) -> Option<u32> {
+    let mut hz = None;
+    fdt::for_phandle(blob, phandle, |_path, props, _cells| {
+        hz = fdt::prop_u32(props, "clock-frequency");
+    });
+    hz
 }
 
 // ── Hardware-facing enumeration (aarch64) ───────────────────────

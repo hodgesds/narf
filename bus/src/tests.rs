@@ -4332,3 +4332,277 @@ fn smoke_vmd_irq_remap_legacy_msi() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus", smoke_vmd_irq_remap_legacy_msi);
+
+// ── Probe-time child decode (DT programme step 5 prerequisite) ──
+
+use alloc::vec::Vec;
+
+/// One node of a synthetic test tree.
+struct TSpec<'a> {
+    name: &'a str,
+    props: &'a [(&'a str, &'a [u8])],
+    kids: &'a [TSpec<'a>],
+}
+
+fn be_cells(vals: &[u32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in vals {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+fn be_str(s: &str) -> Vec<u8> {
+    let mut out = s.as_bytes().to_vec();
+    out.push(0);
+    out
+}
+
+fn intern_test_string(strings: &mut Vec<u8>, name: &str) -> u32 {
+    let target = name.as_bytes();
+    let mut i = 0;
+    while i + target.len() < strings.len() {
+        if &strings[i..i + target.len()] == target && strings[i + target.len()] == 0 {
+            return i as u32;
+        }
+        i += 1;
+    }
+    let off = strings.len() as u32;
+    strings.extend_from_slice(target);
+    strings.push(0);
+    off
+}
+
+fn emit_test_prop(s: &mut Vec<u8>, strings: &mut Vec<u8>, name: &str, val: &[u8]) {
+    let off = intern_test_string(strings, name);
+    s.extend_from_slice(&narf_firmware_fdt::FDT_PROP.to_be_bytes());
+    s.extend_from_slice(&(val.len() as u32).to_be_bytes());
+    s.extend_from_slice(&off.to_be_bytes());
+    s.extend_from_slice(val);
+    while s.len() % 4 != 0 {
+        s.push(0);
+    }
+}
+
+fn emit_test_node(s: &mut Vec<u8>, strings: &mut Vec<u8>, node: &TSpec) {
+    s.extend_from_slice(&narf_firmware_fdt::FDT_BEGIN_NODE.to_be_bytes());
+    s.extend_from_slice(node.name.as_bytes());
+    s.push(0);
+    while s.len() % 4 != 0 {
+        s.push(0);
+    }
+    for (name, val) in node.props {
+        emit_test_prop(s, strings, name, val);
+    }
+    for kid in node.kids {
+        emit_test_node(s, strings, kid);
+    }
+    s.extend_from_slice(&narf_firmware_fdt::FDT_END_NODE.to_be_bytes());
+}
+
+/// Build a minimal v17 DTB (root props + the given root children)
+/// — the same layout discipline as the firmware-fdt crate's test
+/// builder, with nesting.
+fn build_test_dtb(root_props: &[(&str, &[u8])], kids: &[TSpec]) -> Vec<u8> {
+    let mut strings: Vec<u8> = Vec::new();
+    let mut s: Vec<u8> = Vec::new();
+    s.extend_from_slice(&narf_firmware_fdt::FDT_BEGIN_NODE.to_be_bytes());
+    s.extend_from_slice(&[0, 0, 0, 0]); // root name: empty + pad
+    for (name, val) in root_props {
+        emit_test_prop(&mut s, &mut strings, name, val);
+    }
+    for kid in kids {
+        emit_test_node(&mut s, &mut strings, kid);
+    }
+    s.extend_from_slice(&narf_firmware_fdt::FDT_END_NODE.to_be_bytes());
+    s.extend_from_slice(&narf_firmware_fdt::FDT_END.to_be_bytes());
+
+    let off_rsvmap = 40u32;
+    let off_struct = off_rsvmap + 16;
+    let off_strings = off_struct + s.len() as u32;
+    let totalsize = off_strings + strings.len() as u32;
+    let mut out: Vec<u8> = Vec::with_capacity(totalsize as usize);
+    out.extend_from_slice(&narf_firmware_fdt::FDT_MAGIC.to_be_bytes());
+    out.extend_from_slice(&totalsize.to_be_bytes());
+    out.extend_from_slice(&off_struct.to_be_bytes());
+    out.extend_from_slice(&off_strings.to_be_bytes());
+    out.extend_from_slice(&off_rsvmap.to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&16u32.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&(strings.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    out.extend_from_slice(&[0u8; 16]); // reserve-map terminator
+    out.extend_from_slice(&s);
+    out.extend_from_slice(&strings);
+    out
+}
+
+fn smoke_bus_dt_children_real_fixture() -> TestResult {
+    // children_of over the real QEMU virt blob: the GIC's ITS
+    // child is the one real child subtree on virt; the flash and
+    // PL011 nodes are childless; a wrong base matches nothing.
+    use crate::dt::children_of;
+    let its = children_of(QEMU_VIRT_DTB, "arm,gic-v3", 0x0800_0000);
+    if its.len() != 1 || its[0].name != "its@8080000" {
+        return TestResult::Fail("GIC child decode did not yield exactly the ITS node");
+    }
+    if !its[0].compatible_contains("arm,gic-v3-its") {
+        return TestResult::Fail("ITS child compatible mismatch");
+    }
+    if its[0].reg != Some((0x0808_0000, 0x2_0000)) {
+        return TestResult::Fail("ITS child reg not decoded with the GIC node's cells");
+    }
+    if !children_of(QEMU_VIRT_DTB, "cfi-flash", 0).is_empty() {
+        return TestResult::Fail("virt flash unexpectedly has children");
+    }
+    if !children_of(QEMU_VIRT_DTB, "arm,pl011", 0x0900_0000).is_empty() {
+        return TestResult::Fail("PL011 unexpectedly has children");
+    }
+    if !children_of(QEMU_VIRT_DTB, "cfi-flash", 0x400_0000).is_empty() {
+        return TestResult::Fail("children_of matched on the flash's second bank base");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_dt_children_real_fixture);
+
+fn smoke_bus_dt_children_synthetic() -> TestResult {
+    // A flash node with fixed-partitions grandchildren and an SPI
+    // controller with a NOR child: the two child shapes step 5/6
+    // bindings consume. Partition/child regs decode with the
+    // PARENT node's cells in the parent's local space.
+    use crate::dt::children_of;
+    let root_cells_a = be_cells(&[2]);
+    let root_cells_s = be_cells(&[1]);
+    let one = be_cells(&[1]);
+    let zero = be_cells(&[0]);
+    let flash_reg = be_cells(&[0, 0, 0x400_0000]);
+    let part0_reg = be_cells(&[0, 0x10_0000]);
+    let part1_reg = be_cells(&[0x10_0000, 0x3f0_0000]);
+    let spi_reg = be_cells(&[0, 0x8_0000, 0x1000]);
+    let nor_reg = be_cells(&[0]);
+    let nor_freq = be_cells(&[20_000_000]);
+    let spi_clocks = be_cells(&[42]);
+    let clk_phandle = be_cells(&[42]);
+    let clk_freq = be_cells(&[24_000_000]);
+    let empty: &[u8] = &[];
+    let blob = build_test_dtb(
+        &[
+            ("#address-cells", &root_cells_a),
+            ("#size-cells", &root_cells_s),
+        ],
+        &[
+            TSpec {
+                name: "flash@0",
+                props: &[
+                    ("compatible", &be_str("cfi-flash")),
+                    ("reg", &flash_reg),
+                    ("#address-cells", &one),
+                    ("#size-cells", &one),
+                ],
+                kids: &[TSpec {
+                    name: "partitions",
+                    props: &[
+                        ("compatible", &be_str("fixed-partitions")),
+                        ("#address-cells", &one),
+                        ("#size-cells", &one),
+                    ],
+                    kids: &[
+                        TSpec {
+                            name: "partition@0",
+                            props: &[
+                                ("label", &be_str("boot")),
+                                ("reg", &part0_reg),
+                                ("read-only", empty),
+                            ],
+                            kids: &[],
+                        },
+                        TSpec {
+                            name: "partition@100000",
+                            props: &[("label", &be_str("rootfs")), ("reg", &part1_reg)],
+                            kids: &[],
+                        },
+                    ],
+                }],
+            },
+            TSpec {
+                name: "spi@80000",
+                props: &[
+                    ("compatible", &be_str("arm,pl022")),
+                    ("reg", &spi_reg),
+                    ("clocks", &spi_clocks),
+                    ("#address-cells", &one),
+                    ("#size-cells", &zero),
+                ],
+                kids: &[TSpec {
+                    name: "flash@0",
+                    props: &[
+                        ("compatible", &be_str("jedec,spi-nor")),
+                        ("reg", &nor_reg),
+                        ("spi-max-frequency", &nor_freq),
+                    ],
+                    kids: &[],
+                }],
+            },
+            TSpec {
+                name: "apb-clock",
+                props: &[
+                    ("compatible", &be_str("fixed-clock")),
+                    ("phandle", &clk_phandle),
+                    ("clock-frequency", &clk_freq),
+                ],
+                kids: &[],
+            },
+        ],
+    );
+
+    let flash_kids = children_of(&blob, "cfi-flash", 0);
+    if flash_kids.len() != 1 || flash_kids[0].name != "partitions" {
+        return TestResult::Fail("flash children are not the partitions node");
+    }
+    let parts = &flash_kids[0].children;
+    if parts.len() != 2 {
+        return TestResult::Fail("fixed-partitions grandchildren not decoded");
+    }
+    if parts[0].prop_str("label") != Some("boot")
+        || parts[0].reg != Some((0, 0x10_0000))
+        || !parts[0].prop_present("read-only")
+    {
+        return TestResult::Fail("partition@0 decode mismatch (label/reg/read-only)");
+    }
+    if parts[1].prop_str("label") != Some("rootfs")
+        || parts[1].reg != Some((0x10_0000, 0x3f0_0000))
+        || parts[1].prop_present("read-only")
+    {
+        return TestResult::Fail("partition@100000 decode mismatch");
+    }
+
+    let spi_kids = children_of(&blob, "arm,pl022", 0x8_0000);
+    if spi_kids.len() != 1 || spi_kids[0].name != "flash@0" {
+        return TestResult::Fail("SPI children are not the NOR node");
+    }
+    if !spi_kids[0].compatible_contains("jedec,spi-nor")
+        || spi_kids[0].reg != Some((0, 0))
+        || spi_kids[0].prop_u32("spi-max-frequency") != Some(20_000_000)
+    {
+        return TestResult::Fail("NOR child decode mismatch (compatible/cs/max-frequency)");
+    }
+
+    // Probe-time node access: the SPI node's own `clocks` phandle
+    // reads back, a missing property is None, and the fixed-clock
+    // phandle resolves to its frequency.
+    use crate::dt::{clock_frequency_of_phandle, node_prop};
+    if node_prop(&blob, "arm,pl022", 0x8_0000, "clocks").as_deref() != Some(&spi_clocks[..]) {
+        return TestResult::Fail("node_prop did not return the SPI node's clocks phandle");
+    }
+    if node_prop(&blob, "arm,pl022", 0x8_0000, "no-such-prop").is_some() {
+        return TestResult::Fail("node_prop invented a missing property");
+    }
+    if clock_frequency_of_phandle(&blob, 42) != Some(24_000_000)
+        || clock_frequency_of_phandle(&blob, 99).is_some()
+    {
+        return TestResult::Fail("fixed-clock phandle resolution mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_dt_children_synthetic);

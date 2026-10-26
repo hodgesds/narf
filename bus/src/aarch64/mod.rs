@@ -36,6 +36,10 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
         if let Some(blob) = unsafe {
             narf_firmware_fdt::discover(dtb_phys.raw() as usize, crate::dt::MAX_DTB_BYTES)
         } {
+            // Retain the blob for probe-time node re-location
+            // (bus::dt::children_of — flash partitions, bus
+            // children, clock phandles).
+            crate::dt::retain_dtb_blob(blob);
             // SAFETY: the blob describes this machine (the boot
             // handoff supplied it); enumerate_dt's probes run
             // under that contract.
