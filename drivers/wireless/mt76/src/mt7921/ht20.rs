@@ -27,6 +27,32 @@ pub(crate) fn capability40() -> [u8; 26] {
 }
 
 impl Profile {
+    pub(crate) fn from_shared(
+        n: &narf_wireless::association::phy::HtNegotiation,
+        width: u8,
+    ) -> Self {
+        let mut capability = [0; 26];
+        let cap = (n.peer_capability() & 12)
+            | (u16::from(n.tx_sgi20()) << 5)
+            | if width != 0 {
+                2 | (u16::from(n.tx_sgi40()) << 6)
+            } else {
+                0
+            };
+        capability[..2].copy_from_slice(&cap.to_le_bytes());
+        capability[2] = n.peer_ampdu_factor() | (n.peer_mpdu_density() << 2);
+        capability[3..13].copy_from_slice(&n.tx_mcs());
+        capability[15] = n.peer_tx_params();
+        Self {
+            capability,
+            operation: n.operation().body(),
+            secondary: if width != 0 {
+                n.operation().secondary()
+            } else {
+                None
+            },
+        }
+    }
     pub(crate) fn prepare(info: RadioInfo, bss: &ScanBss) -> Result<Self, Error> {
         if !info.capabilities.phy.ht
             || info.capabilities.phy.spatial_streams == 0

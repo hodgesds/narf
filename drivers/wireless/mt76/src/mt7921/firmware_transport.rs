@@ -831,6 +831,8 @@ struct Session<B: Backend> {
     wmm: Option<crate::mt7921::association::wmm::Parameters>,
     ht20_rx: Option<amsdu::Receiver>,
     ht20_profile: Option<crate::mt7921::ht20::Profile>,
+    vht_profile: Option<crate::mt7921::vht::Profile>,
+    ap_phy: Option<narf_wireless::association::phy::ApElements>,
     control_pending: VecDeque<Vec<u8>>,
     rx_ba: ba::Owner,
     received_msdu: VecDeque<Vec<u8>>,
@@ -857,6 +859,8 @@ impl<B: Backend> Session<B> {
             wmm: None,
             ht20_rx: None,
             ht20_profile: None,
+            vht_profile: None,
+            ap_phy: None,
             control_pending: VecDeque::new(),
             rx_ba: ba::Owner::default(),
             received_msdu: VecDeque::new(),
@@ -1072,6 +1076,9 @@ impl<B: Backend> Session<B> {
         self.security = None;
         self.station_permission = None;
         self.ht20_rx = None;
+        self.ht20_profile = None;
+        self.vht_profile = None;
+        self.ap_phy = None;
         self.received_msdu.clear();
         self.stage(Stage::Shutdown);
         let result = async {

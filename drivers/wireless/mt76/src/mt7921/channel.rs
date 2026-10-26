@@ -66,3 +66,16 @@ pub(crate) fn channels(bands: u8) -> Vec<u8> {
     }
     channels
 }
+
+/// Contiguous 5-GHz80-MHz centers and four20-MHz constituents. Keep the
+/// UNII discontinuity between144/149 explicit; array adjacency is not RF
+/// geometry. cfg80211_chandef_valid/primary and IEEE VHT operation channel.
+pub(crate) fn block80(primary: u8, center: u8) -> Option<[u8; 4]> {
+    if ![42, 58, 106, 122, 138, 155, 171].contains(&center) {
+        return None;
+    }
+    let first = center.checked_sub(6)?;
+    let channels = [first, first + 4, first + 8, first + 12];
+    (channels.contains(&primary) && channels.iter().all(|ch| band(*ch) == Some(Band::Ghz5)))
+        .then_some(channels)
+}

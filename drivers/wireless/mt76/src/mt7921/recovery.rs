@@ -96,6 +96,8 @@ impl<B: Backend> Session<B> {
         self.station_permission = None;
         self.ht20_rx = None;
         self.ht20_profile = None;
+        self.vht_profile = None;
+        self.ap_phy = None;
         self.control_pending.clear();
         self.received_msdu.clear();
         self.station_bss = None;

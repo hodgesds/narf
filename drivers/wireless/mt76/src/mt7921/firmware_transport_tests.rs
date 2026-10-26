@@ -25,6 +25,8 @@ mod rx_ba_tests;
 mod tx_ba_tests;
 #[path = "tx_pipeline_station_tests.rs"]
 mod tx_pipeline_station_tests;
+#[path = "vht_tests.rs"]
+mod vht_tests;
 #[path = "wmm_tests.rs"]
 mod wmm_tests;
 
@@ -184,6 +186,7 @@ struct Model {
     data_qos: Vec<bool>,
     wmm_reply: Option<Vec<u8>>,
     ht_reply: Option<Vec<u8>>,
+    vht_reply: Option<Vec<u8>>,
     stall_edca: bool,
     edca_progress_fault: u8,
     deny_tx_after: Option<usize>,
@@ -246,6 +249,7 @@ impl Model {
             data_qos: Vec::new(),
             wmm_reply: None,
             ht_reply: None,
+            vht_reply: None,
             stall_edca: false,
             edca_progress_fault: 0,
             deny_tx_after: None,
@@ -383,7 +387,19 @@ impl Backend for Model {
                     result[0] = frame[34];
                     if frame[34..36] == [3, 0]
                         && self.ba_error_tag.is_some_and(|tag| {
-                            frame.get(56..58) == Some(tag.to_le_bytes().as_slice())
+                            let mut rest = &frame[56..];
+                            while let Some(header) = rest.get(..4) {
+                                let length =
+                                    usize::from(u16::from_le_bytes([header[2], header[3]]));
+                                if length < 4 || length > rest.len() {
+                                    return false;
+                                }
+                                if header[..2] == tag.to_le_bytes() {
+                                    return true;
+                                }
+                                rest = &rest[length..];
+                            }
+                            false
                         })
                     {
                         result[4..8].copy_from_slice(&1u32.to_le_bytes());
@@ -678,6 +694,9 @@ impl Backend for Model {
                     if let Some(ht) = &self.ht_reply {
                         reply.extend_from_slice(ht);
                     }
+                    if let Some(vht) = &self.vht_reply {
+                        reply.extend_from_slice(vht);
+                    }
                 }
                 let mut packet = vec![0u8; 32 + reply.len()];
                 let len = packet.len();
@@ -687,6 +706,10 @@ impl Backend for Model {
                 packet[12..16]
                     .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
                 packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+                if self.vht_reply.is_some() {
+                    packet[24..28].copy_from_slice(&((1u32 << 24) | 11).to_le_bytes());
+                    // actual basic6Mbps OFDM metadata.
+                }
                 packet[32..].copy_from_slice(&reply);
                 self.packets.push_back(packet);
             }
@@ -758,6 +781,9 @@ impl Backend for Model {
                         m3_packet[12..16]
                             .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
                         m3_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+                        if self.vht_reply.is_some() {
+                            m3_packet[24..28].copy_from_slice(&((1u32 << 24) | 11).to_le_bytes());
+                        }
                         m3_packet[32..].copy_from_slice(&m3_frame);
                         self.packets.push_back(m3_packet);
                     }
