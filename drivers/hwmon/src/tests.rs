@@ -581,7 +581,7 @@ impl crate::HwmonDevice for FakeControlDevice {
 
 /// Fetch `hwmon0` from a freshly populated class with exactly one
 /// device registered. Returns `None` (fixture failure) when absent.
-fn hwmon0_kobj() -> Option<narf_filesystem::sysfs::Kobject> {
+fn hwmon0_kobj() -> Option<alloc::sync::Arc<narf_filesystem::sysfs::Kobject>> {
     narf_filesystem::sysfs::sysfs_root()
         .get_child("class")
         .and_then(|c| c.get_child("hwmon"))

@@ -1481,6 +1481,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power",
 ]
 
 [[package]]
