@@ -49,6 +49,18 @@ pub const TPM_CC_PCR_READ: u32 = 0x0000_017E;
 pub const TPM_CC_PCR_EXTEND: u32 = 0x0000_0182;
 pub const TPM_CC_PCR_RESET: u32 = 0x0000_013D;
 pub const TPM_CC_READ_CLOCK: u32 = 0x0000_0181;
+// Attestation + object commands (#945): Quote is the command the
+// attestation surface submits; ReadPublic / CreatePrimary /
+// EvictControl / FlushContext are the AK provisioning set the
+// platform composition drives (builders for the latter three live
+// in the `drivers/tpm` extension surface, per §3.4 — the codes are
+// named here so the device model's command core and the canonical
+// codec agree on one spelling).
+pub const TPM_CC_EVICT_CONTROL: u32 = 0x0000_0120;
+pub const TPM_CC_CREATE_PRIMARY: u32 = 0x0000_0131;
+pub const TPM_CC_QUOTE: u32 = 0x0000_0158;
+pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x0000_0165;
+pub const TPM_CC_READ_PUBLIC: u32 = 0x0000_0169;
 
 // ── TPM_SU values (Part 2 §6.9) — operand to TPM2_Startup ─────────
 
@@ -68,10 +80,23 @@ pub const TPM_ALG_SHA384: u16 = 0x000C;
 pub const TPM_ALG_SHA512: u16 = 0x000D;
 pub const TPM_ALG_NULL: u16 = 0x0010;
 pub const TPM_ALG_SM3_256: u16 = 0x0012;
+pub const TPM_ALG_RSASSA: u16 = 0x0014;
+pub const TPM_ALG_RSAPSS: u16 = 0x0016;
+pub const TPM_ALG_ECDSA: u16 = 0x0018;
 pub const TPM_ALG_ECC: u16 = 0x0023;
 pub const TPM_ALG_SHA3_256: u16 = 0x0027;
 pub const TPM_ALG_SHA3_384: u16 = 0x0028;
 pub const TPM_ALG_SHA3_512: u16 = 0x0029;
+
+// ── Attestation constants (Part 2 §6.3 / §10.12) ──────────────────
+
+/// `TPM_GENERATED` — the magic that opens every TPMS_ATTEST
+/// (0xFF 'T' 'C' 'G'): proof the structure came out of a TPM.
+pub const TPM_GENERATED_VALUE: u32 = 0xFF54_4347;
+/// `TPM_ST_ATTEST_QUOTE` — the TPMS_ATTEST type for TPM2_Quote.
+pub const TPM_ST_ATTEST_QUOTE: u16 = 0x8018;
+/// `TPM_ECC_NIST_P256` — the attestation key's curve.
+pub const TPM_ECC_NIST_P256: u16 = 0x0003;
 
 // ── TPM_CAP values (Part 2 §6.10) ─────────────────────────────────
 
