@@ -157,6 +157,25 @@ pub fn set_fan_level(fan_idx: u8, level: u8) -> bool {
     r.eax != SMM_ERR_NOSUPPORT
 }
 
+/// Map a trait-level PWM duty (0–255) to a Dell SMM fan tier
+/// (0=auto, 1=low, 2=high, 3=max), rounding to the nearest tier.
+///
+/// The [`crate::HwmonDevice::set_fan`] contract is a 0–255 duty on
+/// every driver; the SMM firmware only takes the four discrete
+/// tiers, so the scaling lives here at the hardware boundary. The
+/// representative tier duties (0, 85, 170, 255) map back onto their
+/// own tiers exactly (see [`tier_to_duty`]).
+pub fn duty_to_tier(duty: u8) -> u8 {
+    ((duty as u16 * 3 + 127) / 255) as u8
+}
+
+/// Map a Dell SMM fan tier back to its representative PWM duty
+/// (0, 85, 170, 255) — the exact inverse of [`duty_to_tier`] on the
+/// four tier values, so a read-back reports the duty the tier means.
+pub fn tier_to_duty(tier: u32) -> u8 {
+    (tier.min(3) * 85) as u8
+}
+
 // ── Label constants ───────────────────────────────────────────────────
 
 pub const TEMP_LABELS: &[&str] = &["cpu", "gpu", "hdd", "ambient"];
@@ -248,10 +267,45 @@ impl crate::HwmonDevice for DellSmm {
         if idx >= self.num_fans {
             return false;
         }
+        // `level` is the trait's 0–255 duty; the SMM takes tiers.
         #[cfg(target_arch = "x86_64")]
-        return set_fan_level(idx, level);
+        return set_fan_level(idx, duty_to_tier(level));
         #[cfg(not(target_arch = "x86_64"))]
         false
+    }
+
+    fn read_pwm(&self, label: &str) -> Option<u8> {
+        let idx = FAN_LABELS.iter().position(|&l| l == label)? as u8;
+        if idx >= self.num_fans {
+            return None;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // The firmware reports the current tier; report it as the
+            // duty that tier represents.
+            let tier = read_fan_status(idx)?;
+            Some(tier_to_duty(tier))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        None
+    }
+
+    fn supports_fan_control(&self, label: &str) -> bool {
+        let idx = match FAN_LABELS.iter().position(|&l| l == label) {
+            Some(i) => i as u8,
+            None => return false,
+        };
+        if idx >= self.num_fans {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            true
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
     }
 
     fn list_labels(&self) -> Vec<&str> {

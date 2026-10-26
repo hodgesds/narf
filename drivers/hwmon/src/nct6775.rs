@@ -574,6 +574,20 @@ pub const VOLT_LABELS: &[&str] = &["in0", "in1", "in2", "in3", "in4", "in5", "in
 /// PWM fan control labels.
 pub const PWM_LABELS: &[&str] = &["pwm1", "pwm2", "pwm3", "pwm4", "pwm5"];
 
+/// Resolve a fan channel label to its PWM channel index.
+///
+/// Both the tachometer label (`"fan<n>"` — the [`crate::HwmonDevice`]
+/// trait's convention) and the chip's native PWM label (`"pwm<n>"`)
+/// name the same channel: `FAN_LABELS[i]` and `PWM_LABELS[i]` are
+/// wired to the same physical fan, whose duty register is
+/// `NCT6775_REG_PWM[i]`.
+pub fn pwm_channel(label: &str) -> Option<usize> {
+    if let Some(i) = FAN_LABELS.iter().position(|&l| l == label) {
+        return Some(i);
+    }
+    PWM_LABELS.iter().position(|&l| l == label)
+}
+
 /// A bound NCT6775-family device.
 #[derive(Debug)]
 pub struct Nct6775 {
@@ -690,7 +704,7 @@ impl crate::HwmonDevice for Nct6775 {
     }
 
     fn set_fan(&self, label: &str, level: u8) -> bool {
-        let idx = match PWM_LABELS.iter().position(|&l| l == label) {
+        let idx = match pwm_channel(label) {
             Some(i) => i,
             None => return false,
         };
@@ -711,6 +725,45 @@ impl crate::HwmonDevice for Nct6775 {
         #[cfg(not(target_arch = "x86_64"))]
         {
             let _ = level;
+            false
+        }
+    }
+
+    fn read_pwm(&self, label: &str) -> Option<u8> {
+        let idx = pwm_channel(label)?;
+        if idx >= self.chip.num_fans() as usize || idx >= NCT6775_REG_PWM.len() {
+            return None;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.hwm_base == 0 {
+                return None;
+            }
+            // Read the live duty back out of the fan's PWM register.
+            // nct6775-core.c NCT6775_REG_PWM.
+            // SAFETY: validated nonzero hwm_base; CPL-0 EC window I/O.
+            Some(unsafe { ec_read(self.hwm_base, NCT6775_REG_PWM[idx]) })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            None
+        }
+    }
+
+    fn supports_fan_control(&self, label: &str) -> bool {
+        let idx = match pwm_channel(label) {
+            Some(i) => i,
+            None => return false,
+        };
+        if idx >= self.chip.num_fans() as usize || idx >= NCT6775_REG_PWM.len() {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.hwm_base != 0
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
             false
         }
     }

@@ -8,13 +8,36 @@
 //! - `name`             — chip name, e.g. `"k10temp\n"`
 //! - `temp<i>_input`   — temperature in millidegrees C
 //! - `temp<i>_label`   — human label, e.g. `"Tdie\n"`
-//! - `temp<i>_max`     — high threshold (if provided)
-//! - `temp<i>_crit`    — critical threshold (if provided)
+//! - `temp<i>_max`     — high threshold (only when the device reports one)
+//! - `temp<i>_crit`    — critical threshold (only when the device reports one)
 //! - `fan<i>_input`    — tachometer reading in RPM
 //! - `fan<i>_label`    — fan label
+//! - `pwm<i>`          — writable fan duty 0–255 (only for channels the
+//!   device can actually control; paired with `fan<i>`)
 //! - `in<i>_input`     — voltage input in millivolts
 //! - `in<i>_label`     — voltage label
 //! - `update_interval` — milliseconds between hardware reads (stub 1000)
+//!
+//! ## Thresholds
+//!
+//! `temp<i>_max` / `temp<i>_crit` are published only when
+//! [`HwmonDevice::temp_limits`] reports a real hardware limit for the
+//! label (a Tjmax MSR, a programmed limit register) — never a
+//! bridge-invented constant (#909). The show re-reads the limit live,
+//! so a failed limit read renders empty under the same rule as a
+//! failed sensor read below.
+//!
+//! ## Fan control
+//!
+//! For each fan channel the device marks controllable
+//! ([`HwmonDevice::supports_fan_control`]), `pwm<i>` is a writable
+//! attribute: reading it returns the current duty from
+//! [`HwmonDevice::read_pwm`] (empty when unreadable), and writing a
+//! decimal duty in 0–255 drives [`HwmonDevice::set_fan`] — the
+//! userspace production caller for fan control. Channels without a
+//! real driver behind them get no `pwm<i>` attribute at all, so a
+//! published control is never a dead end. The in-kernel caller is
+//! the thermal governor (see `crate::cooling`).
 //!
 //! ## Failed reads
 //!
@@ -58,7 +81,10 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
+use narf_filesystem::sysfs::{
+    class_device_register, class_register, kobject_add_attr, kobject_add_writable_attr,
+};
+use narf_filesystem::FsError;
 
 use crate::HwmonDevice;
 
@@ -177,6 +203,12 @@ fn populate_one_device(
             }
             LabelKind::Fan => {
                 add_fan_attrs(&kobj, dev.clone(), label, fan_idx);
+                // pwm<n> pairs with fan<n> (Linux hwmon convention)
+                // and exists only where the device can really drive
+                // the channel.
+                if dev.supports_fan_control(label) {
+                    add_pwm_attr(&kobj, dev.clone(), label, fan_idx);
+                }
                 fan_idx += 1;
             }
             LabelKind::Voltage => {
@@ -222,20 +254,82 @@ fn add_temp_attrs(
         kobject_add_attr(kobj, attr_name, move || format!("{}\n", label_owned));
     }
 
-    // temp<n>_max — not configurable in this first cut; expose the
-    // generic TJ_MAX convention of 100 °C = 100_000 mC.
-    // Linux: hwmon_temp_max (drivers/hwmon/hwmon.c:186).
-    {
+    // temp<n>_max / temp<n>_crit — published only when the device
+    // reports a real hardware limit for this label (#909); there is
+    // no generic TJ_MAX constant to fall back on. Existence is probed
+    // once here; the show re-reads the limit live and renders empty
+    // if it has become unreadable (the failed-read rule above).
+    // Linux: hwmon_temp_max (drivers/hwmon/hwmon.c:186),
+    //        hwmon_temp_crit (drivers/hwmon/hwmon.c:194).
+    let (max_mc, crit_mc) = dev.temp_limits(label_owned);
+    if max_mc.is_some() {
         let attr_name = intern(format!("temp{}_max", n));
-        kobject_add_attr(kobj, attr_name, || "100000\n".into());
+        let dev2 = dev.clone();
+        kobject_add_attr(kobj, attr_name, move || {
+            match dev2.temp_limits(label_owned).0 {
+                Some(mc) => format!("{}\n", mc),
+                None => String::new(),
+            }
+        });
     }
-
-    // temp<n>_crit — 105 °C default (AMD/Intel thermal throttle point).
-    // Linux: hwmon_temp_crit (drivers/hwmon/hwmon.c:194).
-    {
+    if crit_mc.is_some() {
         let attr_name = intern(format!("temp{}_crit", n));
-        kobject_add_attr(kobj, attr_name, || "105000\n".into());
+        let dev2 = dev.clone();
+        kobject_add_attr(kobj, attr_name, move || {
+            match dev2.temp_limits(label_owned).1 {
+                Some(mc) => format!("{}\n", mc),
+                None => String::new(),
+            }
+        });
     }
+}
+
+/// Add the writable `pwm<n>` attribute paired with fan channel `n`.
+///
+/// Only called for channels the device marks controllable
+/// ([`HwmonDevice::supports_fan_control`]), so the attribute always
+/// has a real driver behind it. Show reads the live duty back via
+/// [`HwmonDevice::read_pwm`] (empty when unreadable, per the
+/// failed-read rule); store parses a decimal duty in 0–255 and
+/// drives it through [`HwmonDevice::set_fan`].
+///
+/// Store errors: malformed or out-of-range input is
+/// `FsError::InvalidData` (Linux `pwm_store` returns `-EINVAL`); a
+/// driver refusal is `FsError::NoDevice`.
+///
+/// Linux ref: `hwmon_pwm_show` / `hwmon_pwm_store`
+/// (drivers/hwmon/hwmon.c:282).
+fn add_pwm_attr(
+    kobj: &narf_filesystem::sysfs::Kobject,
+    dev: Arc<dyn HwmonDevice + Send + Sync>,
+    label: &str,
+    n: u32,
+) {
+    let label_owned: &'static str = intern(String::from(label));
+    let attr_name = intern(format!("pwm{}", n));
+    let dev_show = dev.clone();
+    kobject_add_writable_attr(
+        kobj,
+        attr_name,
+        move || match dev_show.read_pwm(label_owned) {
+            Some(duty) => format!("{}\n", duty),
+            None => String::new(),
+        },
+        move |buf| {
+            let s = core::str::from_utf8(buf)
+                .map_err(|_| FsError::InvalidData)?
+                .trim();
+            let v: u32 = s.parse().map_err(|_| FsError::InvalidData)?;
+            if v > 255 {
+                return Err(FsError::InvalidData);
+            }
+            if dev.set_fan(label_owned, v as u8) {
+                Ok(())
+            } else {
+                Err(FsError::NoDevice)
+            }
+        },
+    );
 }
 
 /// Add `fan<n>_input` and `fan<n>_label` to `kobj`.

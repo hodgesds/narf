@@ -22,6 +22,7 @@ narf-filesystem   = { path = "../../filesystem" }
 narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-firmware-smbios = { path = "../../firmware/smbios" }
+narf-power        = { path = "../../power" }
 narf-aml          = { path = "../../aml" }
 narf-drivers-platform = { path = "../platform" }
 

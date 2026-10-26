@@ -24,6 +24,7 @@
 extern crate alloc;
 
 pub mod applesmc;
+pub mod cooling;
 pub mod coretemp;
 pub mod dell_smm;
 pub mod it87;
@@ -56,7 +57,44 @@ pub trait HwmonDevice: core::fmt::Debug {
 
     /// Set a fan PWM output level (0–255). Returns `false` if the label
     /// is not a controllable fan or the chip does not support fan control.
+    ///
+    /// `label` is a fan channel label from [`HwmonDevice::list_labels`]
+    /// (e.g. `"fan1"`); `level` is a PWM duty in 0–255. Drivers whose
+    /// hardware takes discrete levels instead of a duty (Dell SMM fan
+    /// tiers) scale the duty internally — the 0–255 contract holds at
+    /// this surface regardless of the hardware's native units.
     fn set_fan(&self, label: &str, level: u8) -> bool;
+
+    /// The device's real high (`max`) and critical (`crit`) temperature
+    /// limits for `label`, in millidegrees Celsius, as the hardware
+    /// itself reports them — a Tjmax MSR, a programmed limit register,
+    /// and so on. Either component is `None` when the hardware exposes
+    /// no such limit for the label.
+    ///
+    /// The sysfs bridge publishes `temp<n>_max` / `temp<n>_crit` only
+    /// for components that return `Some` (#909): thresholds are never
+    /// invented constants. The default reports no limits.
+    fn temp_limits(&self, _label: &str) -> (Option<i32>, Option<i32>) {
+        (None, None)
+    }
+
+    /// Read back the current PWM duty (0–255) of a fan channel, by the
+    /// same label [`HwmonDevice::set_fan`] takes. Returns `None` if the
+    /// channel is not controllable or the read fails. Default: `None`.
+    fn read_pwm(&self, _label: &str) -> Option<u8> {
+        None
+    }
+
+    /// Whether the fan channel named by `label` (a label from
+    /// [`HwmonDevice::list_labels`], e.g. `"fan1"`) can be driven via
+    /// [`HwmonDevice::set_fan`]. The sysfs bridge publishes a writable
+    /// `pwm<n>` attribute — and the thermal composition registers a
+    /// cooling device — only for channels that return `true`, so a
+    /// published control always has a real driver behind it.
+    /// Default: `false`.
+    fn supports_fan_control(&self, _label: &str) -> bool {
+        false
+    }
 
     /// List all sensor labels exposed by this device. The returned slice
     /// references static strings owned by the driver; no allocation.
@@ -100,6 +138,14 @@ pub fn register_initcalls() {
     // Stage::Late: sysfs bridge runs after all Stage::Subsys driver probes.
     narf_init::register(Stage::Late, "hwmon-sysfs-bridge", || {
         sysfs_bridge::populate_hwmon_class();
+        InitResult::Ok
+    });
+    // Stage::Late: hand every controllable hwmon fan to the thermal
+    // governor as a cooling device (see `cooling`). Runs after the
+    // bridge registration above; the thermal registry itself is
+    // initialised at Stage::PostCore, so it is live by now.
+    narf_init::register(Stage::Late, "hwmon-cooling", || {
+        cooling::register_hwmon_cooling_devices();
         InitResult::Ok
     });
 }

@@ -478,6 +478,43 @@ impl crate::HwmonDevice for It87Hwmon {
         }
     }
 
+    fn read_pwm(&self, label: &str) -> Option<u8> {
+        let idx = FAN_LABELS.iter().position(|&l| l == label)?;
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.ec_base == 0
+                || idx >= IT87_REG_PWM.len()
+                || idx >= self.chip.num_fans() as usize
+            {
+                return None;
+            }
+            // Read the live duty back out of IT87_REG_PWM[nr] (it87.c:252).
+            // SAFETY: ec_base validated at probe; reg from the static PWM map.
+            Some(unsafe { ec_read(self.ec_base, IT87_REG_PWM[idx]) })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = idx;
+            None
+        }
+    }
+
+    fn supports_fan_control(&self, label: &str) -> bool {
+        let idx = match FAN_LABELS.iter().position(|&l| l == label) {
+            Some(i) => i,
+            None => return false,
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.ec_base != 0 && idx < IT87_REG_PWM.len() && idx < self.chip.num_fans() as usize
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = idx;
+            false
+        }
+    }
+
     fn list_labels(&self) -> Vec<&str> {
         let mut v: Vec<&str> = Vec::new();
         for &l in TEMP_LABELS.iter().take(self.chip.num_temps() as usize) {
