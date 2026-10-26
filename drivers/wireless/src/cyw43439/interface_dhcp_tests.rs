@@ -24,6 +24,9 @@ use narf_wifi_fixtures::{udp_ipv4, DhcpServer, NetworkPlan};
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
 
+#[path = "mfp_tests.rs"]
+mod mfp_tests;
+
 const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
 
@@ -169,7 +172,17 @@ impl Harness {
         secured: bool,
         database: Option<Arc<narf_wireless::reg::db::Database>>,
     ) -> Result<Self, &'static str> {
+        Self::new_config(secured, database, None)
+    }
+    fn new_config(
+        secured: bool,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        mfp: Option<(bool, bool, u8)>,
+    ) -> Result<Self, &'static str> {
         let bus = Bus::new(secured);
+        if let Some((supported, required, fault)) = mfp {
+            bus.firmware.lock().mfp_profile(supported, required, fault);
+        }
         let station = if let Some(database) = database {
             ready(Station::initialize_live(
                 Runtime::new(bus.clone()),
@@ -189,6 +202,7 @@ impl Harness {
         }
         let channels = station.channels.iter().map(|&ch| u32::from(ch)).collect();
         let supplicant = station.supplicant;
+        let mfp_supported = station.supports_management_protection();
         let (rx, rx_consumer) = narf_ipc::channel();
         let (tx_producer, tx) = narf_ipc::channel();
         let name = narf_net::iface::register("wlan%d", OWN, send);
@@ -203,6 +217,7 @@ impl Harness {
             mac: OWN,
             channels,
             supplicant,
+            mfp_supported,
             up: AtomicBool::new(false),
             power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
@@ -289,7 +304,10 @@ impl Drop for Harness {
 }
 
 fn composition(secured: bool) -> Result<(), &'static str> {
-    let harness = Harness::new(secured)?;
+    composition_mfp(secured, false)
+}
+fn composition_mfp(secured: bool, mfp: bool) -> Result<(), &'static str> {
+    let harness = Harness::new_config(secured, None, mfp.then_some((true, true, 0)))?;
     let plan = network_plan();
     let uplink = udp_ipv4(
         AP,
@@ -310,6 +328,17 @@ fn composition(secured: bool) -> Result<(), &'static str> {
         return Err("CYW admitted data or carrier before association");
     }
     harness.scan_and_associate(secured)?;
+    if harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .management_protection()
+        != mfp
+    {
+        return Err("CYW firmware management-protection receipt missing/unrequested");
+    }
     // Exercise ordinary station power save through the same native data
     // owner before the real DHCP/IP conversation, for Open and WPA2.
     harness

@@ -3,7 +3,7 @@
 //! ecd997b0189a mlme.c::_ieee80211_sta_wmm_params and mt7921_mcu_set_tx.
 use super::Error;
 
-pub(crate) const INFORMATION: [u8; 9] = [221, 7, 0, 0x50, 0xf2, 2, 0, 1, 0];
+pub(crate) use narf_wireless::wmm::INFORMATION;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Ac {
@@ -23,66 +23,25 @@ pub(crate) struct Parameters {
 impl Parameters {
     /// Inspect the complete IE stream; an Information IE alone offers no
     /// contention parameters and cannot authorize this QoS station profile.
-    pub(crate) fn parse(mut ies: &[u8]) -> Result<Option<Self>, Error> {
-        let mut found = false;
-        let mut result = None;
-        while !ies.is_empty() {
-            let head = ies.get(..2).ok_or(Error::InvalidBss)?;
-            let end = 2 + usize::from(head[1]);
-            let body = ies.get(2..end).ok_or(Error::InvalidBss)?;
-            if head[0] == 221 && body.starts_with(&[0, 0x50, 0xf2, 2]) {
-                if found {
-                    return Err(Error::Protocol);
-                }
-                found = true;
-                if body.get(5) != Some(&1) {
-                    return Err(Error::Protocol);
-                }
-                match body.get(4) {
-                    Some(0) if body.len() == 7 => {}
-                    Some(1) if body.len() == 24 && body[6] & 0x70 == 0 && body[7] == 0 => {
-                        let empty = Ac {
-                            cw_min: 0,
-                            cw_max: 0,
-                            txop: 0,
-                            aifs: 0,
-                        };
-                        let mut ac = [empty; 4];
-                        let mut seen = 0u8;
-                        for record in body[8..].chunks_exact(4) {
-                            let index = usize::from((record[0] >> 5) & 3);
-                            let min = record[1] & 15;
-                            let max = record[1] >> 4;
-                            if record[0] & 0x80 != 0
-                                || record[0] & 15 < 2
-                                || seen & (1 << index) != 0
-                                || min == 0
-                                || min > max
-                                // No TSPEC/admission-control owner exists. Only
-                                // BE/TID 0 is selected by this station profile.
-                                || index == 0 && record[0] & 0x10 != 0
-                            {
-                                return Err(Error::Protocol);
-                            }
-                            seen |= 1 << index;
-                            ac[index] = Ac {
-                                cw_min: ((1u32 << min) - 1) as u16,
-                                cw_max: ((1u32 << max) - 1) as u16,
-                                txop: u16::from_le_bytes([record[2], record[3]]),
-                                aifs: u16::from(record[0] & 15),
-                            };
-                        }
-                        if seen != 15 {
-                            return Err(Error::Protocol);
-                        }
-                        result = Some(Self { ac });
-                    }
-                    _ => return Err(Error::Protocol),
-                }
-            }
-            ies = &ies[end..];
+    pub(crate) fn parse(ies: &[u8]) -> Result<Option<Self>, Error> {
+        let Some(parameters) =
+            narf_wireless::wmm::Parameters::parse(ies).map_err(|_| Error::Protocol)?
+        else {
+            return Ok(None);
+        };
+        // Native mt7921 policy is intentionally stricter than wire parsing:
+        // no zero contention window and no TSPEC/admission-controlled BE.
+        if parameters.ac.iter().any(|ac| ac.cw_min() == 0) || parameters.ac[0].admission_control {
+            return Err(Error::Protocol);
         }
-        Ok(result)
+        Ok(Some(Self {
+            ac: parameters.ac.map(|ac| Ac {
+                cw_min: ac.cw_min(),
+                cw_max: ac.cw_max(),
+                txop: ac.txop,
+                aifs: u16::from(ac.aifsn),
+            }),
+        }))
     }
 
     /// Native CE SET_EDCA_PARMS (0x1d), one BSS and WMM set zero.

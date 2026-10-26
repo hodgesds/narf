@@ -16,6 +16,8 @@ use narf_wifi_fixtures::udp_ipv4;
 
 #[path = "channel_station_tests.rs"]
 mod channel_station_tests;
+#[path = "mfp_tests.rs"]
+mod mfp_tests;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
 
@@ -74,6 +76,19 @@ impl Harness {
         channel: u8,
         database: Option<Arc<narf_wireless::reg::db::Database>>,
     ) -> Result<Self, &'static str> {
+        Self::new_profile(
+            version, secured, keys_first, selected, channel, database, None,
+        )
+    }
+    fn new_profile(
+        version: u32,
+        secured: bool,
+        keys_first: bool,
+        selected: bool,
+        channel: u8,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        mfp: Option<(bool, bool, u8)>,
+    ) -> Result<Self, &'static str> {
         let (adapter, bus) = if selected {
             let (selection, assets) = crate::brcmfmac::provision::tests::selected_fixture(
                 crate::brcmfmac::provision::Family::Pcie43602,
@@ -85,6 +100,9 @@ impl Harness {
         .map_err(|_| "CR4/common-ring native ownership")?;
         bus.keys_first(keys_first);
         bus.channel(channel);
+        if let Some((supported, required, fault)) = mfp {
+            bus.mfp_profile(supported, required, fault);
+        }
         let mut domain = firmware::domain();
         if channel > 14 {
             use narf_wireless::reg::{RegFlags, RegRule};
@@ -122,6 +140,7 @@ impl Harness {
             .map(|&channel| u32::from(channel))
             .collect();
         let supplicant = station.supplicant;
+        let mfp_supported = station.supports_management_protection();
         let (rx, consumer) = narf_ipc::channel();
         let (producer, tx) = narf_ipc::channel();
         let name = narf_net::iface::register("wlan%d", OWN, send);
@@ -136,6 +155,7 @@ impl Harness {
             mac: OWN,
             channels,
             supplicant,
+            mfp_supported,
             up: AtomicBool::new(false),
             power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
@@ -290,7 +310,25 @@ fn composition_channel(
     selected: bool,
     channel: u8,
 ) -> Result<(), &'static str> {
-    let harness = Harness::new_channel(version, secured, keys_first, selected, channel)?;
+    composition_mfp(version, secured, keys_first, selected, channel, false)
+}
+fn composition_mfp(
+    version: u32,
+    secured: bool,
+    keys_first: bool,
+    selected: bool,
+    channel: u8,
+    mfp: bool,
+) -> Result<(), &'static str> {
+    let harness = Harness::new_profile(
+        version,
+        secured,
+        keys_first,
+        selected,
+        channel,
+        None,
+        mfp.then_some((true, true, 0)),
+    )?;
     let (uplink, downlink) = packets();
     if !harness.closed(&uplink)
         || narf_net::dhcp::acquire(&harness.name, 0).is_ok()
@@ -304,6 +342,17 @@ fn composition_channel(
         return Err("PCIe preauthorization RX escaped controlled port");
     }
     harness.associate(secured)?;
+    if harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .management_protection()
+        != mfp
+    {
+        return Err("PCIe firmware PMF offload verification missing/unrequested");
+    }
     harness
         .device
         .set_power_save(true)

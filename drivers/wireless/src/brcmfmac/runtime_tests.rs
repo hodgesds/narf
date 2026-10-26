@@ -248,6 +248,7 @@ fn firmware_step(state: &mut State) {
                             bytes
                         }
                         262 if input.starts_with(b"sup_wpa\0") => vec![0; usize::from(output_len)],
+                        262 if input.starts_with(b"mfp\0") => vec![0; usize::from(output_len)],
                         262 if input.starts_with(b"bw_cap\0") => {
                             let mut bytes = vec![0; usize::from(output_len)];
                             bytes[..4].copy_from_slice(&1u32.to_le_bytes());
@@ -256,6 +257,17 @@ fn firmware_step(state: &mut State) {
                         _ => Vec::new(),
                     }
                 };
+                if firmware
+                    .station
+                    .as_ref()
+                    .is_some_and(|station| station.hold_mfp_reply(command, &input))
+                {
+                    // Consume the real control descriptor but withhold its
+                    // correlated receipt. Cancellation must retain its DMA.
+                    firmware.control_read = (firmware.control_read + 1) % depth;
+                    put(state, H2DR, &firmware.control_read.to_le_bytes());
+                    continue;
+                }
                 let (response_id, response_dma) = firmware.responses.pop_front().unwrap();
                 let status = firmware
                     .station

@@ -27,7 +27,7 @@ pub(super) fn management(
     }
     let fc = u16::from_le_bytes([frame[0], frame[1]]);
     let is_data = (fc & 0x0f == 0x08) && ((fc >> 4) & 15 == 0);
-    let is_mgmt = (fc & 0x0f == 0x00) && matches!((fc >> 4) & 15, 0 | 2 | 4 | 10 | 11 | 12);
+    let is_mgmt = (fc & 0x0f == 0x00) && matches!((fc >> 4) & 15, 0 | 2 | 4 | 10 | 11 | 12 | 13);
     if (!is_data && !is_mgmt) || token == 0 || token >= TOKEN_LIMIT || wcid >= 20 {
         return Err(Error::Bounds);
     }
@@ -100,7 +100,7 @@ pub(super) fn ethernet_qos(
         (frame.len() as u32 + 32) | (u32::from(qos) << 25),
         (1 << 31) | (u32::from(is_eth_802_3) << 15) | u32::from(wcid),
         (2 << 4) | if qos { 8 } else { 0 }, // DATA / QoS DATA; AP receiver is unicast.
-        (15 << 11) | (u32::from(protected) << 1), // Only an installed PTK authorizes encryption.
+        (1 << 28) | (15 << 11) | (u32::from(protected) << 1), // BA_DISABLE; installed PTK only.
         0,
         0,
         0,

@@ -45,6 +45,11 @@ pub(super) struct Firmware {
     power_save_error: u32,
     policy_clear: Option<(u32, alloc::sync::Arc<narf_wireless::reg::db::Database>)>,
     last_power_save_error: bool,
+    mfp_supported: bool,
+    pmf_required: bool,
+    mfp_mode: u32,
+    mfp_fault: u8,
+    mfp_missing: bool,
     hold_tx: bool,
     wpa_ie: Option<Vec<u8>>,
     wpa_auth: Option<u32>,
@@ -81,6 +86,11 @@ impl Firmware {
             power_save_error: 0,
             policy_clear: None,
             last_power_save_error: false,
+            mfp_supported: false,
+            pmf_required: false,
+            mfp_mode: 0,
+            mfp_fault: 0,
+            mfp_missing: false,
             hold_tx: false,
             wpa_ie: None,
             wpa_auth: None,
@@ -148,8 +158,16 @@ impl Firmware {
         }
         self.last_power_save_error = command == self.power_save_error
             && (command == 86 || input.starts_with(b"pm2_sleep_ret\0"));
+        self.mfp_missing = command == 262 && input.starts_with(b"mfp\0") && !self.mfp_supported;
         match command {
             1 => 2u32.to_le_bytes().to_vec(),
+            23 => {
+                if self.mfp_fault == 3 {
+                    vec![2, 9, 8, 7, 6, 5]
+                } else {
+                    AP.to_vec()
+                }
+            }
             217 => {
                 let channels: &[u32] = if self.channel > 14 {
                     &[6, 36, 52, 149, 165, 255]
@@ -165,6 +183,22 @@ impl Firmware {
                 let mut out = vec![0; usize::from(maximum)];
                 if input.starts_with(b"cur_etheraddr\0") {
                     out[..6].copy_from_slice(&OWN);
+                } else if input.starts_with(b"mfp\0") {
+                    let mode = if self.mfp_fault == 1 && self.mfp_mode == 2 {
+                        0
+                    } else {
+                        self.mfp_mode
+                    };
+                    out[..4].copy_from_slice(&mode.to_le_bytes());
+                } else if input.starts_with(b"assoc_info\0") {
+                    out[..4].copy_from_slice(
+                        &(if self.mfp_fault == 4 { 1503 } else { 28u32 }).to_le_bytes(),
+                    );
+                } else if input.starts_with(b"assoc_req_ies\0") {
+                    out[..28].copy_from_slice(&pmf_ie());
+                    if self.mfp_fault == 2 {
+                        out[20] = 0;
+                    }
                 } else if input.starts_with(b"bw_cap\0") {
                     let band = u32::from_le_bytes(input[7..11].try_into().unwrap());
                     assert!(matches!(band, 1 | 2));
@@ -187,12 +221,21 @@ impl Firmware {
             }
             263 if input.starts_with(b"escan\0") => {
                 let id = u16::from_le_bytes(input[12..14].try_into().unwrap());
-                self.event(69, 8, 0, &scan_result(id, self.secured, self.channel));
+                self.event(
+                    69,
+                    8,
+                    0,
+                    &scan_result(id, self.secured, self.channel, self.pmf_required),
+                );
                 self.event(69, 0, 0, &[]);
                 Vec::new()
             }
             263 if input.starts_with(b"wpaie\0") => {
                 self.wpa_ie = Some(input[6..].to_vec());
+                Vec::new()
+            }
+            263 if input.starts_with(b"mfp\0") => {
+                self.mfp_mode = u32::from_le_bytes(input[4..8].try_into().unwrap());
                 Vec::new()
             }
             263 if input.starts_with(b"wpa_auth\0") => {
@@ -227,7 +270,10 @@ impl Firmware {
                     0xd000u16
                 } | u16::from(self.channel);
                 assert_eq!(&input[48..50], &chanspec.to_le_bytes());
-                let expected: &[u8] = if self.secured {
+                let protected_ie = pmf_ie();
+                let expected: &[u8] = if self.pmf_required {
+                    &protected_ie
+                } else if self.secured {
                     &[
                         48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
                     ]
@@ -235,6 +281,7 @@ impl Firmware {
                     &[]
                 };
                 assert_eq!(self.wpa_ie.as_deref(), Some(expected));
+                assert!(!self.pmf_required || self.mfp_supported && self.mfp_mode == 2);
                 assert!(self.roam_off && (!self.secured || self.psk));
                 assert_eq!(self.wpa_auth, Some(if self.secured { 128 } else { 0 }));
                 assert_eq!(self.cipher, Some(if self.secured { 4 } else { 0 }));
@@ -259,11 +306,16 @@ impl Firmware {
         }
     }
     pub(super) fn status(&self, command: u32) -> i16 {
-        if command == 52 && self.fail_disconnect || self.last_power_save_error {
+        if self.mfp_missing {
+            -23
+        } else if command == 52 && self.fail_disconnect || self.last_power_save_error {
             5
         } else {
             0
         }
+    }
+    pub(super) fn hold_mfp_reply(&self, command: u32, input: &[u8]) -> bool {
+        self.mfp_fault == 5 && command == 262 && input.starts_with(b"assoc_req_ies\0")
     }
     fn event(&mut self, kind: u32, status: u32, flags: u16, data: &[u8]) {
         let mut bytes = vec![0; 72 + data.len()];
@@ -366,12 +418,22 @@ impl Firmware {
         }
     }
 }
-fn scan_result(id: u16, secured: bool, channel: u8) -> Vec<u8> {
+fn pmf_ie() -> Vec<u8> {
+    vec![
+        48, 26, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 192, 0, 0, 0, 0, 15,
+        172, 6,
+    ]
+}
+fn scan_result(id: u16, secured: bool, channel: u8, mfp: bool) -> Vec<u8> {
     let mut ies = vec![0, 4, b't', b'e', b's', b't'];
     if secured {
-        ies.extend_from_slice(&[
-            48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
-        ]);
+        if mfp {
+            ies.extend_from_slice(&pmf_ie());
+        } else {
+            ies.extend_from_slice(&[
+                48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
+            ]);
+        }
     }
     let mut out = vec![0; 12 + 128 + ies.len()];
     let len = out.len();
@@ -406,6 +468,13 @@ impl Handle {
     }
     pub(crate) fn keys_first(&self, value: bool) {
         self.change(|f| f.keys_first = value);
+    }
+    pub(crate) fn mfp_profile(&self, supported: bool, required: bool, fault: u8) {
+        self.change(|f| {
+            f.mfp_supported = supported;
+            f.pmf_required = required;
+            f.mfp_fault = fault;
+        });
     }
     pub(crate) fn channel(&self, channel: u8) {
         self.change(|f| f.channel = channel);

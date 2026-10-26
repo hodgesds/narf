@@ -28,6 +28,11 @@ pub(in crate::cyw43439) struct Bus {
     power_save_held: bool,
     valid_channels: Vec<u32>,
     policy_clear: Option<(u32, alloc::sync::Arc<narf_wireless::reg::db::Database>)>,
+    mfp_supported: bool,
+    pmf_required: bool,
+    mfp_mode: u32,
+    mfp_fault: u8,
+    mfp_held: bool,
 }
 impl Bus {
     pub(in crate::cyw43439) fn new() -> Self {
@@ -49,10 +54,47 @@ impl Bus {
             power_save_held: false,
             valid_channels: vec![1, 6],
             policy_clear: None,
+            mfp_supported: false,
+            pmf_required: false,
+            mfp_mode: 0,
+            mfp_fault: 0,
+            mfp_held: false,
         }
     }
     pub(in crate::cyw43439) fn set_secured(&mut self, secured: bool) {
         self.secured = secured;
+    }
+    pub(in crate::cyw43439) fn mfp_profile(&mut self, supported: bool, required: bool, fault: u8) {
+        self.mfp_supported = supported;
+        self.pmf_required = required;
+        self.mfp_fault = fault;
+        if fault != 5 {
+            self.mfp_held = false;
+        }
+    }
+    pub(in crate::cyw43439) fn mfp_commands(&self) -> Vec<(u32, Vec<u8>)> {
+        self.tx
+            .iter()
+            .filter_map(|bytes| {
+                if bytes[5] & 15 != 0 {
+                    return None;
+                }
+                let size = usize::from(HwHeader::decode(bytes).unwrap().length);
+                let command = BcdcHeader::decode(&bytes[12..]).unwrap().cmd;
+                let body = &bytes[28..size];
+                (matches!(command, 23 | 134)
+                    || body.starts_with(b"mfp\0")
+                    || body.starts_with(b"assoc_")
+                    || body.starts_with(b"wpaie\0"))
+                .then(|| (command, body.to_vec()))
+            })
+            .collect()
+    }
+    pub(in crate::cyw43439) fn control_count(&self) -> usize {
+        self.tx
+            .iter()
+            .filter(|packet| packet.get(5).is_some_and(|channel| channel & 15 == 0))
+            .count()
     }
     pub(in crate::cyw43439) fn queue(&mut self, channel: u8, maximum: u8, payload: &[u8]) {
         self.rx
@@ -161,6 +203,9 @@ impl Transport for Bus {
 }
 impl PacketTransport for Bus {
     fn receive_packet(&mut self, bytes: &mut [u8]) -> Result<usize, TransportError> {
+        if self.mfp_held {
+            return Ok(0);
+        }
         if self.power_save_held {
             return Ok(0);
         }
@@ -194,6 +239,11 @@ impl PacketTransport for Bus {
         let mut response = Vec::new();
         match request.cmd {
             1 => response.extend_from_slice(&2u32.to_le_bytes()),
+            23 => response.extend_from_slice(if self.mfp_fault == 3 {
+                &[2, 9, 8, 7, 6, 5]
+            } else {
+                &AP
+            }),
             217 => {
                 response.extend_from_slice(&(self.valid_channels.len() as u32).to_le_bytes());
                 for channel in &self.valid_channels {
@@ -203,6 +253,28 @@ impl PacketTransport for Bus {
             262 => {
                 if body.starts_with(b"cur_etheraddr\0") {
                     response.extend_from_slice(&OWN);
+                } else if body.starts_with(b"mfp\0") {
+                    response.extend_from_slice(
+                        &(if self.mfp_fault == 1 && self.mfp_mode == 2 {
+                            0
+                        } else {
+                            self.mfp_mode
+                        })
+                        .to_le_bytes(),
+                    );
+                } else if body.starts_with(b"assoc_info\0") {
+                    response.extend_from_slice(
+                        &(if self.mfp_fault == 4 { 1503 } else { 28u32 }).to_le_bytes(),
+                    );
+                    response.extend_from_slice(&0u32.to_le_bytes());
+                } else if body.starts_with(b"assoc_req_ies\0") {
+                    response.extend_from_slice(&pmf_ie());
+                    if self.mfp_fault == 2 {
+                        response[20] = 0;
+                    }
+                    if self.mfp_fault == 5 {
+                        self.mfp_held = true;
+                    }
                 } else {
                     response.extend_from_slice(&0u32.to_le_bytes());
                 }
@@ -215,14 +287,26 @@ impl PacketTransport for Bus {
                 old[..4].copy_from_slice(&12u32.to_le_bytes());
                 old[8..10].copy_from_slice(&id.wrapping_sub(1).to_le_bytes());
                 self.event(69, 0, 0, &old, maximum);
-                self.event(69, 8, 0, &scan_result(id, self.secured), maximum);
+                self.event(
+                    69,
+                    8,
+                    0,
+                    &scan_result_profile(id, self.secured, self.pmf_required),
+                    maximum,
+                );
                 self.event(69, 0, 0, &[], maximum);
             }
             263 if body.starts_with(b"wpaie\0") => self.wpa_ie = Some(body[6..].to_vec()),
+            263 if body.starts_with(b"mfp\0") => {
+                self.mfp_mode = u32::from_le_bytes(body[4..8].try_into().unwrap())
+            }
             263 if body.starts_with(b"roam_off\0") => self.roam_off = body[9..] == [1, 0, 0, 0],
             268 => self.secured = true,
             26 if self.join_events => {
-                let expected: &[u8] = if self.secured {
+                let protected_ie = pmf_ie();
+                let expected: &[u8] = if self.pmf_required {
+                    &protected_ie
+                } else if self.secured {
                     &[
                         48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
                     ]
@@ -230,6 +314,9 @@ impl PacketTransport for Bus {
                     &[]
                 };
                 if self.wpa_ie.as_deref() != Some(expected) || !self.roam_off {
+                    return Err(TransportError::NotReady);
+                }
+                if self.pmf_required && (!self.mfp_supported || self.mfp_mode != 2) {
                     return Err(TransportError::NotReady);
                 }
                 self.event(16, 0, 1, &[], maximum);
@@ -262,6 +349,10 @@ impl PacketTransport for Bus {
         {
             header.flags |= bcdc_flag::ERROR;
             header.status = 1;
+        }
+        if request.cmd == 262 && body.starts_with(b"mfp\0") && !self.mfp_supported {
+            header.flags |= bcdc_flag::ERROR;
+            header.status = (-23i32) as u32;
         }
         let mut control = header.encode().to_vec();
         control.extend_from_slice(&response);
@@ -356,11 +447,24 @@ fn ready<F: Future>(future: F) -> Option<F::Output> {
     }
 }
 fn scan_result(id: u16, secured: bool) -> Vec<u8> {
+    scan_result_profile(id, secured, false)
+}
+fn pmf_ie() -> Vec<u8> {
+    vec![
+        48, 26, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 192, 0, 0, 0, 0, 15,
+        172, 6,
+    ]
+}
+fn scan_result_profile(id: u16, secured: bool, mfp: bool) -> Vec<u8> {
     let mut ies = vec![0, 4, b't', b'e', b's', b't'];
     if secured {
-        let rsn = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
-        ies.extend_from_slice(&[48, rsn.len() as u8]);
-        ies.extend_from_slice(&rsn);
+        if mfp {
+            ies.extend_from_slice(&pmf_ie());
+        } else {
+            let rsn = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
+            ies.extend_from_slice(&[48, rsn.len() as u8]);
+            ies.extend_from_slice(&rsn);
+        }
     }
     let mut out = vec![0; 12 + 128 + ies.len()];
     let size = out.len();
@@ -546,7 +650,7 @@ fn smoke_cyw_station_rejects_inconsistent_association_ies() -> TestResult {
         (vec![48, 20, 1], true, Error::Malformed),
         (vec![127], true, Error::Malformed),
     ] {
-        if validate_association_ies(&ies, secure) != Err(expected) {
+        if validate_association_ies(&ies, secure, false) != Err(expected) {
             return TestResult::Fail(
                 "association IE policy admitted malformed or unsupported security",
             );

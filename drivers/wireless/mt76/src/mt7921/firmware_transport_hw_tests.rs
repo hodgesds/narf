@@ -499,7 +499,7 @@ fn mt76_wmm_native_qos_descriptor_publication_and_two_phase_retirement() -> Test
         // Literal Linux CONNAC2 fields: BE LMAC queue 1, EtherType/802.3,
         // TID 0, QoS DATA subtype in TXD2/TXD7, normal retry, PTK bit only.
         if bytes[..12] != [50, 0, 0, 2, 1, 128, 0, 128, 40, 0, 0, 0]
-            || bytes[12..16] != [if protected { 2 } else { 0 }, 120, 0, 0]
+            || bytes[12..16] != [if protected { 2 } else { 0 }, 120, 0, 16]
             || bytes[16..28] != [0; 12]
             || bytes[28..36] != [0, 0, 40, 0, 1, 128, 0, 0]
             || bytes[44..46] != [18, 128]

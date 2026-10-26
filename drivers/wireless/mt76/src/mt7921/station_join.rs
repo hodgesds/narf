@@ -293,10 +293,11 @@ impl<B: Backend> Session<B> {
         !self.peer_lost
             && matches!(self.state, State::Associated { .. })
             && self.data_pending.is_none()
-            && self
-                .security
-                .as_ref()
-                .is_some_and(|security| !security.pending.is_empty())
+            && (!self.control_pending.is_empty()
+                || self
+                    .security
+                    .as_ref()
+                    .is_some_and(|security| !security.pending.is_empty()))
     }
     async fn install_group_key(&mut self, gtk: &Gtk) -> Result<(), Error> {
         if gtk.rsc[6..] != [0, 0] {
@@ -313,6 +314,7 @@ impl<B: Backend> Session<B> {
     /// The supplicant only reports a key when it differs from the installed
     /// one, so retransmissions cannot reset packet-number replay windows.
     pub(super) async fn service_keys(&mut self) -> Result<(), Error> {
+        self.service_control().await?;
         let associated = self.state;
         let State::Associated { info, peer, .. } = associated else {
             return Ok(());
@@ -378,6 +380,8 @@ impl<B: Backend> Session<B> {
         if let Err(error) = result {
             self.wmm = None;
             self.station_permission = None;
+            self.ht20_rx = None;
+            self.ht20_profile = None;
             self.state = State::Failed {
                 stage: Stage::EapolHandshake,
                 error,
@@ -423,6 +427,18 @@ impl<B: Backend> Session<B> {
                 self.clear_aggregate_receive();
                 continue;
             }
+            if self
+                .ht20_rx
+                .as_ref()
+                .is_some_and(|receiver| receiver.active)
+                && native.ampdu
+                && native.frame.first().is_some_and(|fc| fc & 0x0c == 8)
+            {
+                // No BA agreement or reorder owner exists. Hardware-split
+                // A-MPDU packets cannot be delivered as ordinary HT MPDUs.
+                self.clear_aggregate_receive();
+                continue;
+            }
             if native.amsdu != 0 {
                 if let Some(frame) = self.receive_aggregate(&native, own, peer, channel) {
                     return Ok(Some(frame));
@@ -436,6 +452,47 @@ impl<B: Backend> Session<B> {
             let Some(header) = frame.get(..24) else {
                 continue;
             };
+            if self.ht20_profile.is_some()
+                && native.ccmp.is_none()
+                && frame.len() == 33
+                && header[0] == 0xd0
+                && header[1] & 0xc7 == 0
+                && header[22] & 15 == 0
+                && header[4..10] == own
+                && header[10..16] == peer
+                && header[16..22] == peer
+                && frame[24..26] == [3, 0]
+            // Block Ack / ADDBA Request.
+            {
+                if self.control_pending.len() < 4 {
+                    let mut response = vec![0; 33];
+                    response[0] = 0xd0;
+                    response[4..10].copy_from_slice(&peer);
+                    response[10..16].copy_from_slice(&own);
+                    response[16..22].copy_from_slice(&peer);
+                    response[24..29].copy_from_slice(&[3, 1, frame[26], 37, 0]);
+                    // Echo TID/immediate-policy only; no AMSDU permission,
+                    // buffer allocation, timeout or successful BA receipt.
+                    response[29] = frame[27] & 0x3e;
+                    self.control_pending.push_back(response);
+                }
+                continue;
+            }
+            if let Some(profile) = self.ht20_profile {
+                if matches!(header[0], 0x80 | 0x50)
+                    && header[1] & 0xc7 == 0
+                    && header[10..16] == peer
+                    && header[16..22] == peer
+                    && (header[4..10] == own || header[4..10] == [0xff; 6])
+                    && frame.get(36..).is_some_and(|ies| {
+                        crate::mt7921::ht20::Profile::parse(ies, channel) != Ok(profile)
+                    })
+                {
+                    self.peer_lost = true;
+                    self.clear_aggregate_receive();
+                    return Err(Error::DeviceGone);
+                }
+            }
             if let Some(parameters) = self.wmm {
                 if native.ccmp.is_none()
                     && matches!(header[0], 0x80 | 0x50)
@@ -703,13 +760,15 @@ impl<B: Backend> Session<B> {
             _ => Error::Bounds,
         })?;
         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
+        plan.offer_ht20(info, bss)?;
         self.backend.check_tx_permission(permission)?;
 
         self.management_rate = plan.management_rate();
-        // The currently admitted MLME/peer remains legacy. A prepared HT
-        // receiver is not an HT association receipt and cannot survive into
-        // this legacy station's packet admission.
+        // Discard idle receive preparation. Any HT activation below must be
+        // rebuilt from the bound AP response and completed native receipts.
         self.ht20_rx = None;
+        self.ht20_profile = None;
+        self.control_pending.clear();
         self.received_msdu.clear();
         self.boot_started = Some(self.backend.now_ns());
         self.security = None;
@@ -832,6 +891,11 @@ impl<B: Backend> Session<B> {
                 .await?;
 
             self.management_rate = plan.management_rate();
+            if let Some(profile) = plan.ht20() {
+                let mut response_bss = bss.clone();
+                response_bss.information_elements = profile.received_ies();
+                self.ht20_rx = Some(super::amsdu::Receiver::prepare(info, &response_bss)?);
+            }
             if let Some(parameters) = plan.wmm() {
                 self.check_station_tx()?;
                 // Native SET_EDCA_PARMS has no firmware reply. The following
@@ -848,11 +912,24 @@ impl<B: Backend> Session<B> {
                 self.confirm_command_progress().await?;
                 self.check_station_tx()?;
             }
-            let bss_record =
-                crate::mt7921::association::bss_record_qos(bss, true, plan.wmm().is_some())
-                    .map_err(|_| Error::Bounds)?;
+            let bss_record = crate::mt7921::association::bss_record_ht20(
+                bss,
+                plan.wmm().is_some(),
+                plan.ht20().is_some(),
+            )
+            .map_err(|_| Error::Bounds)?;
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
+            if plan.ht20().is_some() {
+                self.exchange_station(
+                    Command::Unified { id: 2 },
+                    &crate::mt7921::ht20::Profile::rlm(
+                        bss.channel,
+                        (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                    ),
+                )
+                .await?;
+            }
             let peer_record = plan.peer_record(aid, true).map_err(|_| Error::Bounds)?;
             self.exchange_station(Command::Unified { id: 3 }, &peer_record)
                 .await?;
@@ -949,6 +1026,10 @@ impl<B: Backend> Session<B> {
                 self.peer_lost = false;
                 self.station_bss = Some(bss.clone());
                 self.wmm = plan.wmm();
+                self.ht20_profile = plan.ht20();
+                if let Some(receiver) = &mut self.ht20_rx {
+                    receiver.active = true;
+                }
                 self.state = State::Associated {
                     info,
                     peer: bss.bssid,
@@ -961,6 +1042,8 @@ impl<B: Backend> Session<B> {
                 self.security = None;
                 self.wmm = None;
                 self.station_permission = None;
+                self.ht20_rx = None;
+                self.ht20_profile = None;
                 plan.cancel();
                 let stage = match self.state {
                     State::Running(stage) | State::Failed { stage, .. } => stage,
@@ -986,6 +1069,8 @@ impl<B: Backend> Session<B> {
         // reusable station permission in the retained running owner.
         let closing_permission = self.station_permission.take();
         self.ht20_rx = None;
+        self.ht20_profile = None;
+        self.control_pending.clear();
         self.received_msdu.clear();
         let peer_lost = self.peer_lost;
         self.stage(Stage::StaRecord);
@@ -1069,6 +1154,9 @@ impl<B: Backend> Session<B> {
             self.station_permission = None;
             self.wmm = None;
             self.security = None;
+            self.ht20_rx = None;
+            self.ht20_profile = None;
+            self.control_pending.clear();
             self.clear_aggregate_receive();
             let stage = match self.state {
                 State::Running(stage) | State::Failed { stage, .. } => stage,
@@ -1077,6 +1165,47 @@ impl<B: Backend> Session<B> {
             self.state = State::Failed { stage, error };
         }
         result
+    }
+
+    /// Refuse ADDBA explicitly through the same retained, bounded management
+    /// completion owner. No BA session/TLV/queue or reorder context is made.
+    async fn service_control(&mut self) -> Result<(), Error> {
+        if self.control_pending.is_empty() || self.data_pending.is_some() {
+            return Ok(());
+        }
+        let associated = self.state;
+        if !matches!(associated, State::Associated { .. }) || self.peer_lost {
+            return Ok(());
+        }
+        self.stage(Stage::StaRecord);
+        self.boot_started = Some(self.backend.now_ns());
+        let result = async {
+            for _ in 0..4 {
+                let Some(frame) = self.control_pending.pop_front() else {
+                    break;
+                };
+                self.send_management(&frame, 1).await?;
+            }
+            self.check_station_tx()
+        }
+        .await;
+        self.boot_started = None;
+        if let Err(error) = result {
+            self.security = None;
+            self.wmm = None;
+            self.station_permission = None;
+            self.ht20_profile = None;
+            self.ht20_rx = None;
+            self.control_pending.clear();
+            self.received_msdu.clear();
+            self.state = State::Failed {
+                stage: Stage::StaRecord,
+                error,
+            };
+            return Err(error);
+        }
+        self.state = associated;
+        Ok(())
     }
 
     /// Every association/key/port publication earns fresh authority after

@@ -43,6 +43,7 @@ pub(super) struct NativeRx<'a> {
     pub ccmp: Option<CcmpRx>,
     pub channel: u8,
     pub amsdu: u8,
+    pub ampdu: bool,
 }
 
 pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
@@ -101,6 +102,7 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
         frame: packet.get(offset..)?,
         channel,
         amsdu: (r4 & 3) as u8,
+        ampdu: r2 & (1 << 30) == 0, // MT_RXD2_NORMAL_NON_AMPDU.
         ccmp: if cipher == 4 {
             Some(CcmpRx {
                 pn: pn?,

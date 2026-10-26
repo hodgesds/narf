@@ -15,6 +15,8 @@ mod active_scan_tests;
 #[path = "amsdu_rx_tests.rs"]
 mod amsdu_rx_tests;
 
+#[path = "ht20_tests.rs"]
+mod ht20_tests;
 #[path = "wmm_tests.rs"]
 mod wmm_tests;
 
@@ -162,6 +164,7 @@ struct Model {
     data_protection: Vec<bool>,
     data_qos: Vec<bool>,
     wmm_reply: Option<Vec<u8>>,
+    ht_reply: Option<Vec<u8>>,
     stall_edca: bool,
     edca_progress_fault: u8,
     deny_tx_after: Option<usize>,
@@ -212,6 +215,7 @@ impl Model {
             data_protection: Vec::new(),
             data_qos: Vec::new(),
             wmm_reply: None,
+            ht_reply: None,
             stall_edca: false,
             edca_progress_fault: 0,
             deny_tx_after: None,
@@ -529,12 +533,34 @@ impl Backend for Model {
                 return Ok(());
             }
         }
+        if frame.first() == Some(&0xd0) {
+            if let Some(ap) = &self.access_point {
+                let beacon = ap.beacon();
+                if ap.phase() != narf_wifi_fixtures::ApPhase::Authorized
+                    || frame.len() != 33
+                    || frame[1..4] != [0; 3]
+                    || frame[4..10] != beacon[10..16]
+                    || frame[10..16] != [2, 0x11, 0x22, 0x33, 0x44, 0x55]
+                    || frame[16..22] != beacon[10..16]
+                    || frame[24..26] != [3, 1]
+                    || frame[27..29] != [37, 0]
+                    || frame[29] & !0x3e != 0
+                    || frame[30..33] != [0; 3]
+                {
+                    return Err(Error::Bounds);
+                }
+                return Ok(()); // Native adapter consumes a refusal, never creates BA state.
+            }
+        }
         if let Some(ap) = &mut self.access_point {
             let replies = ap.receive(frame).map_err(|_| Error::Bounds)?;
             for mut reply in replies {
                 if reply.first() == Some(&0x10) {
                     if let Some(parameters) = &self.wmm_reply {
                         reply.extend_from_slice(parameters);
+                    }
+                    if let Some(ht) = &self.ht_reply {
+                        reply.extend_from_slice(ht);
                     }
                 }
                 let mut packet = vec![0u8; 32 + reply.len()];
@@ -1914,6 +1940,7 @@ fn native_data_packet(qos: bool) -> Vec<u8> {
     frame[16..22].copy_from_slice(&[2, 6, 7, 8, 9, 10]);
     frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00, 1, 2, 3]);
     let mut packet = vec![0u8; 24];
+    packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
     packet[..4].copy_from_slice(&((2u32 << 27) | (24 + frame.len()) as u32).to_le_bytes());
     packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
     packet.extend_from_slice(&frame);
@@ -2027,6 +2054,7 @@ kernel_test_in!(
 
 fn descriptor(frame: &[u8]) -> Vec<u8> {
     let mut packet = vec![0; 24];
+    packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes()); // One MPDU, no BA aggregate.
     packet[..4].copy_from_slice(&((2u32 << 27) | (24 + frame.len()) as u32).to_le_bytes());
     packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
     packet.extend_from_slice(frame);
@@ -2165,6 +2193,7 @@ fn ccmp_packet(pn: u64, key: u8, multicast: bool) -> Vec<u8> {
         frame[4..10].fill(0xff);
     }
     let mut packet = vec![0; 40];
+    packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
     packet[..4].copy_from_slice(&((2u32 << 27) | (40 + frame.len()) as u32).to_le_bytes());
     packet[4..8]
         .copy_from_slice(&((4u32 << 16) | (1 << 11) | (u32::from(key) << 21)).to_le_bytes());

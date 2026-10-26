@@ -90,6 +90,8 @@ impl<B: Backend> Session<B> {
         self.wmm = None;
         self.station_permission = None;
         self.ht20_rx = None;
+        self.ht20_profile = None;
+        self.control_pending.clear();
         self.received_msdu.clear();
         self.station_bss = None;
         self.data_pending = None;

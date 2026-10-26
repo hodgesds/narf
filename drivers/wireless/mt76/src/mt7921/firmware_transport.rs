@@ -806,6 +806,8 @@ struct Session<B: Backend> {
     station_permission: Option<crate::mt7921::association::TxPermission>,
     wmm: Option<crate::mt7921::association::wmm::Parameters>,
     ht20_rx: Option<amsdu::Receiver>,
+    ht20_profile: Option<crate::mt7921::ht20::Profile>,
+    control_pending: VecDeque<Vec<u8>>,
     received_msdu: VecDeque<Vec<u8>>,
 }
 impl<B: Backend> Session<B> {
@@ -827,6 +829,8 @@ impl<B: Backend> Session<B> {
             station_permission: None,
             wmm: None,
             ht20_rx: None,
+            ht20_profile: None,
+            control_pending: VecDeque::new(),
             received_msdu: VecDeque::new(),
         }
     }

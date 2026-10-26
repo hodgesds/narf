@@ -22,7 +22,7 @@ pub(super) const PARAMETERS: [u8; 26] = [
     0, 0x27, 0xa4, 0, 0,
 ];
 
-fn prepared(wmm: bool, wpa2: bool) -> (Session<Model>, ScanBss) {
+pub(super) fn prepared(wmm: bool, wpa2: bool) -> (Session<Model>, ScanBss) {
     let mut model = Model::new();
     let ap = if wpa2 {
         FakeAp::wpa2(NETWORK, b"narf", 6, 42, [0x55; 32], [0xaa; 32])

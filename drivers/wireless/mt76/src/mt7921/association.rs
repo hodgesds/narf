@@ -65,6 +65,7 @@ pub struct JoinPlan {
     security: SecurityMode,
     wmm: Option<wmm::Parameters>,
     wmm_association: Vec<u8>,
+    ht20: Option<super::ht20::Profile>,
 }
 impl core::ops::Deref for JoinPlan {
     type Target = ManagementPlan;
@@ -126,10 +127,34 @@ impl JoinPlan {
             security: mode,
             wmm,
             wmm_association: Vec::new(),
+            ht20: None,
         })
     }
     pub(crate) fn management_rate(&self) -> LegacyRate {
         LegacyRate::lowest(self.common.legacy_rates().1)
+    }
+    pub(crate) fn offer_ht20(
+        &mut self,
+        info: super::firmware_transport::RadioInfo,
+        bss: &ScanBss,
+    ) -> Result<(), super::firmware_transport::Error> {
+        if self.wmm.is_none() || !info.capabilities.phy.ht {
+            return Ok(());
+        }
+        let mut ies = bss.information_elements.as_slice();
+        let mut offered = false;
+        while !ies.is_empty() {
+            let end = 2 + usize::from(ies[1]); // common/WMM preparation validated extents
+            offered |= matches!(ies[0], 45 | 61);
+            ies = &ies[end..];
+        }
+        if offered {
+            self.ht20 = Some(super::ht20::Profile::prepare(info, bss)?);
+        }
+        Ok(())
+    }
+    pub(crate) fn ht20(&self) -> Option<super::ht20::Profile> {
+        self.ht20
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
         self.common.start_authentication()
@@ -143,6 +168,10 @@ impl JoinPlan {
         }
         self.wmm_association.clear();
         self.wmm_association.extend_from_slice(request);
+        if self.ht20.is_some() {
+            self.wmm_association
+                .extend_from_slice(&super::ht20::Profile::request_ie());
+        }
         self.wmm_association.extend_from_slice(&wmm::INFORMATION);
         Ok(Some(&self.wmm_association))
     }
@@ -161,10 +190,20 @@ impl JoinPlan {
                 }
             }
         }
+        if self.ht20.is_some() {
+            match super::ht20::Profile::parse(&bytes[30..], self.channel) {
+                Ok(profile) => self.ht20 = Some(profile),
+                Err(_) => {
+                    self.cancel();
+                    return Err(Error::Protocol);
+                }
+            }
+        }
         Ok(Some(aid))
     }
     pub fn cancel(&mut self) {
         self.wmm = None;
+        self.ht20 = None;
         self.wmm_association.clear();
         self.common.cancel();
     }
@@ -229,6 +268,23 @@ impl JoinPlan {
         out[trans + 6] = 1; // to-DS, no RX translation
         let length = (out.len() - wtbl) as u16;
         out[wtbl + 2..wtbl + 4].copy_from_slice(&length.to_le_bytes());
+        if let Some(profile) = self.ht20.filter(|_| associated) {
+            out[phy + 6] |= 1 << 4; // PHY_TYPE_BIT_HT, without VHT/HE.
+            out[phy + 7] = profile.ampdu();
+            out[ra + 6] = profile.transmit_mcs();
+            let ht = tlv(&mut out, 2, 12); // nested WTBL_HT.
+            out[ht + 4] = 1;
+            out[ht + 6] = profile.ampdu() & 3;
+            out[ht + 7] = profile.ampdu() >> 2;
+            let smps = tlv(&mut out, 13, 8); // nested WTBL_SMPS.
+            out[smps + 4] = u8::from(profile.dynamic_smps());
+            out[wtbl + 6] = 5;
+            let length = (out.len() - wtbl) as u16;
+            out[wtbl + 2..wtbl + 4].copy_from_slice(&length.to_le_bytes());
+            let ht = tlv(&mut out, 9, 8); // top-level STA_REC_HT.
+            out[ht + 4..ht + 6].copy_from_slice(&profile.peer_capability().to_le_bytes());
+            out[2] += 1;
+        }
         Ok(out)
     }
 
@@ -331,6 +387,13 @@ pub(crate) fn bss_record_qos(bss: &ScanBss, connected: bool, qos: bool) -> Resul
     let mut out = bss_record(bss, connected)?;
     let qbss = tlv(&mut out, 15, 8);
     out[qbss + 4] = u8::from(connected && qos);
+    Ok(out)
+}
+pub(crate) fn bss_record_ht20(bss: &ScanBss, qos: bool, ht: bool) -> Result<Vec<u8>, Error> {
+    let mut out = bss_record_qos(bss, true, qos)?;
+    if ht {
+        out[29] |= if bss.channel > 14 { 1 << 4 } else { 1 << 3 };
+    }
     Ok(out)
 }
 

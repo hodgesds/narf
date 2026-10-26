@@ -42,9 +42,9 @@ struct Pending {
 pub(super) struct Receiver {
     info: Ht20ReceiveInfo,
     own: [u8; 6],
-    // Remains false until the complete HT/WMM peer/MLME owner is wired.
-    // Test models may exercise this post-admission seam; Transport has no
-    // activation API and the public station remains legacy-only.
+    // Preparation remains inactive; only the complete bound HT/WMM/peer/
+    // security receipt path activates it. Older tests may also exercise the
+    // explicit model-only post-admission seam.
     pub(super) active: bool,
     pending: Option<Pending>,
 }

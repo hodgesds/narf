@@ -30,6 +30,8 @@ pub struct Station<R: Fullmac> {
     pub cache: Vec<Bss>,
     scan_id: u16,
     pub supplicant: bool,
+    mfp_supported: bool,
+    mfp_verified: bool,
     power_save: bool,
     operation: bool,
 }
@@ -134,6 +136,14 @@ impl<R: Fullmac> Station<R> {
             Err(Error::Firmware(code)) if code as i32 == -23 => false,
             Err(error) => return Err(error),
         };
+        // Linux feature.c probes this exact native iovar; host RSN flags
+        // alone do not establish firmware management-protection support.
+        let mfp_supported = match get_var(&mut runtime, "mfp", 4).await {
+            Ok(bytes) if bytes.len() == 4 && le32(&bytes, 0)? <= 2 => true,
+            Ok(_) => return Err(Error::Malformed),
+            Err(Error::Firmware(_)) => false,
+            Err(error) => return Err(error),
+        };
         policy::check_initial(&mut runtime, &policy, &domain)?;
         policy::enable(&mut runtime, &policy, &domain).await?;
         policy::check_initial(&mut runtime, &policy, &domain)?;
@@ -172,6 +182,8 @@ impl<R: Fullmac> Station<R> {
             cache: Vec::new(),
             scan_id: 0,
             supplicant,
+            mfp_supported,
+            mfp_verified: false,
             power_save: false,
             operation: false,
         })
@@ -180,6 +192,17 @@ impl<R: Fullmac> Station<R> {
     /// Last firmware-acknowledged ordinary station power-save policy.
     pub fn power_save(&self) -> bool {
         self.power_save
+    }
+
+    /// Completed firmware-offloaded PMF negotiation/key receipt metadata.
+    /// This grants no independent packet or management-frame authority.
+    pub fn management_protection(&self) -> bool {
+        self.mfp_verified && self.bssid.is_some() && self.connection.is_some()
+    }
+    /// Actual retained firmware MFP and four-way-offload capability. This is
+    /// wiphy metadata, not a completed protected association or key grant.
+    pub fn supports_management_protection(&self) -> bool {
+        self.mfp_supported && self.supplicant
     }
 
     /// Linux brcmf_cfg80211_set_power_mgmt: PM_FAST / PM_OFF followed by
@@ -436,7 +459,6 @@ impl<R: Fullmac> Station<R> {
                 if rsn.group_cipher != ccmp
                     || !rsn.pairwise_ciphers.contains(&ccmp)
                     || !rsn.akms.contains(&Suite::standard(AKM_PSK))
-                    || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0
                 {
                     return Err(Error::Unsupported);
                 }
@@ -444,7 +466,10 @@ impl<R: Fullmac> Station<R> {
             }
             _ => return Err(Error::Unsupported),
         };
-        validate_association_ies(&request.ie, secure)?;
+        let protection =
+            mfp::Profile::negotiate(&bss.ies, &request.ie, secure, self.mfp_supported)?;
+        validate_association_ies(&request.ie, secure, protection.required())?;
+        self.mfp_verified = false;
         self.tx_var(grant, "qtxpower", &(u32::from(power) * 4).to_le_bytes())
             .await?;
         self.runtime.poll()?;
@@ -453,10 +478,10 @@ impl<R: Fullmac> Station<R> {
             self.tx_int(grant, 22, 0).await?;
             // Linux configures (and clears for Open) the association RSNE
             // before joining. Pin the firmware offload to this driver's
-            // single PSK/CCMP, no-PMF profile even on a mixed-mode AP.
+            // single negotiated PSK/CCMP profile even on a mixed-mode AP.
             let mut wpa_ie = Vec::new();
             if secure {
-                let body = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
+                let body = protection.rsn().encode_body();
                 wpa_ie.extend_from_slice(&[48, body.len() as u8]);
                 wpa_ie.extend_from_slice(&body);
             }
@@ -468,6 +493,16 @@ impl<R: Fullmac> Station<R> {
             )
             .await?;
             self.tx_int(grant, 134, if secure { 4 } else { 0 }).await?;
+            if self.mfp_supported {
+                // WSEC can overwrite MFP state: Linux cfg80211.c places
+                // this after cipher configuration, including NONE on Open.
+                self.tx_var(grant, "mfp", &protection.mode().to_le_bytes())
+                    .await?;
+                let applied = self.tx_query(grant, "mfp", 4).await?;
+                if applied.as_slice() != protection.mode().to_le_bytes() {
+                    return Err(Error::Unsupported);
+                }
+            }
             if self.supplicant {
                 self.tx_var(grant, "sup_wpa", &u32::from(secure).to_le_bytes())
                     .await?;
@@ -534,6 +569,14 @@ impl<R: Fullmac> Station<R> {
                 // current FIFO/ring idle sample before opening the host port.
                 while self.runtime.pop_data().is_some() {}
                 if associated && keys && consumed == 0 {
+                    if protection.required() && !self.mfp_verified {
+                        self.verify_management_protection(grant, request.bssid, protection)
+                            .await?;
+                        self.mfp_verified = true;
+                        // Queries can drain new events/data. Require another
+                        // genuine idle fence before publishing the host port.
+                        continue;
+                    }
                     self.check_grants(core::slice::from_ref(&grant))?;
                     self.connection = Some(grant);
                     self.runtime.set_link(Some(request.bssid));
@@ -555,6 +598,7 @@ impl<R: Fullmac> Station<R> {
         }
         .await;
         if result.is_err() {
+            self.mfp_verified = false;
             self.bssid = None;
             self.connection = None;
             self.runtime.set_link(None);
@@ -585,6 +629,7 @@ impl<R: Fullmac> Station<R> {
         self.check_connection_policy()?;
         let grant = self.connection.take();
         let peer = self.bssid.take();
+        self.mfp_verified = false;
         self.runtime.set_link(None);
         if let Some(grant) = grant {
             self.tx_command(grant, 52, &[]).await?;
@@ -658,13 +703,16 @@ impl<R: Fullmac> Station<R> {
 mod policy;
 pub use policy::{GlobalPolicy, PolicySource};
 
+#[path = "station_mfp.rs"]
+mod mfp;
+
 const MAX_REPLY: usize = 1502;
 
 /// The firmware offload builds its own association elements. Match the
 /// nl80211 PSK-offload contract: validate the requested RSNE, consume a
 /// bounded well-formed IE list, and leave firmware-generated capabilities
 /// and RSNXE to the firmware. External-key profiles remain unsupported.
-fn validate_association_ies(mut ies: &[u8], secure: bool) -> Result<(), Error> {
+fn validate_association_ies(mut ies: &[u8], secure: bool, mfp: bool) -> Result<(), Error> {
     use narf_wireless::rsn::*;
     if ies.len() > 2048 {
         return Err(Error::Malformed);
@@ -683,8 +731,11 @@ fn validate_association_ies(mut ies: &[u8], secure: bool) -> Result<(), Error> {
             if rsn.group_cipher != ccmp
                 || rsn.pairwise_ciphers != [ccmp]
                 || rsn.akms != [Suite::standard(AKM_PSK)]
-                || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0
+                || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0 && !mfp
                 || !rsn.pmkids.is_empty()
+                || rsn
+                    .group_management_cipher
+                    .is_some_and(|cipher| cipher != Suite::standard(CIPHER_BIP_CMAC_128))
             {
                 return Err(Error::Unsupported);
             }

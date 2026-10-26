@@ -239,6 +239,39 @@ operator-UP interface; a later physical carrier sample cannot undo operator DOWN
 
 ### Dual-band 20 MHz station profile
 
+The common station also admits firmware-owned required PMF with WPA2-PSK/CCMP
+when native `mfp` capability probing succeeds. The driver validates AP/SME
+MFPC/MFPR and BIP-CMAC-128, emits a canonical required-PMF RSNE, configures/readbacks
+`mfp=2` after WSEC, and still requires correlated SET_SSID/FWSUP_COMPLETED.
+Before opening the port it queries actual firmware MFP mode, current BSSID and
+bounded `assoc_info`/`assoc_req_ies`; the transmitted RSNE must match the required
+profile, followed by another actual event/data idle fence. Every native GET/SET
+retains current policy checks across polls and receipts. Missing capability,
+unsupported management cipher, malformed/downgraded receipt, wrong peer, absent
+policy or cancellation cannot open the port or revive a failed owner. Legacy
+Open/WPA2 remains reachable when MFP is unsupported. This does not enable SAE.
+The common Device advertises AES-CMAC/BIP only from actual MFP plus supplicant
+capability, so userspace can select required-PMF APs without inventing support.
+It separately exposes default-closed `supports_wpa2_mfp_offload()` from those
+native probes. Shared nl80211 PMK CONNECT requires it plus `USE_MFP=1` and a
+strict MFPC|MFPR PSK/CCMP RSNE with explicit/default BIP-CMAC-128. Unsupported
+caller security promises such as OCV are rejected before native join writes;
+OPTIONAL remains unsupported.
+
+IGTK installation, BIP replay/integrity and protected robust-management/SA Query
+processing remain inside the firmware offload. The host manufactures no IGTK,
+key receipt or protected-event flag. Its protected-peer metadata requires the
+verified firmware configuration, actual association request and completed key
+event; link/deauth events remain the firmware's management-authentication
+decisions. Physical PMF acceptance remains external. See `cyw43439.md` §3 for
+the complete shared contract. Five native msgbuf smokes under
+`drivers/wireless/brcmfmac/pmf` cover both shared5/6 and both firmware key-event
+orders through DHCP/exact IP, native mode/cipher ordering, capability/receipt/
+peer denials, teardown and cancelled verification with all posted DMA retained.
+Raw CONNECT attributes additionally exercise the real shared parser/execution
+path through shared5/6 native MFP/association verification and port publication;
+missing native MFP capability is rejected without a device command.
+
 The exact BCM43602 `Fullmac::BAND_5GHZ` profile admits firmware-reported valid
 channels from Linux's 2.4/5 GHz tables, intersected with the retained host-policy
 snapshot. It first sets and reads back `bw_cap=20 MHz` on both firmware bands

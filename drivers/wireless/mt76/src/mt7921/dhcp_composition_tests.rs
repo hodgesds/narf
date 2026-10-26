@@ -254,6 +254,7 @@ impl Harness {
             let pn = self.next_pn;
             self.next_pn += 1;
             let mut packet = vec![0u8; 40];
+            packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
             let len = 40 + frame.len();
             packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
             packet[4..8].copy_from_slice(&((4u32 << 16) | (1 << 11)).to_le_bytes());
@@ -263,6 +264,7 @@ impl Harness {
             packet
         } else {
             let mut packet = vec![0u8; 24];
+            packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
             let len = 24 + frame.len();
             packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
             packet[12..16].copy_from_slice(&(u32::from(CHANNEL) << 8).to_le_bytes());
@@ -313,6 +315,9 @@ fn push_beacon(session: &mut Session<Model>) {
     if let Some(parameters) = &session.backend.wmm_reply {
         frame.extend_from_slice(parameters);
     }
+    if let Some(ht) = &session.backend.ht_reply {
+        frame.extend_from_slice(ht);
+    }
     let mut packet = vec![0u8; 32 + frame.len()];
     let len = packet.len();
     packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
@@ -326,9 +331,15 @@ fn push_beacon(session: &mut Session<Model>) {
 // ── The composition ────────────────────────────────────────────────
 
 fn composition(wpa2: bool, aggregate_rx: bool, wmm: bool) -> TestResult {
+    composition_ht20(wpa2, aggregate_rx, wmm, false)
+}
+fn composition_ht20(wpa2: bool, aggregate_rx: bool, wmm: bool, ht20: bool) -> TestResult {
     let mut model = Model::new();
     if wmm {
         model.wmm_reply = Some(super::wmm_tests::PARAMETERS.to_vec());
+    }
+    if ht20 {
+        model.ht_reply = Some(super::ht20_tests::elements(6));
     }
     model.station_channel = CHANNEL;
     model.access_point = Some(
@@ -368,7 +379,7 @@ fn composition(wpa2: bool, aggregate_rx: bool, wmm: bool) -> TestResult {
         received: Vec::new(),
     });
 
-    let result = composition_body(&name, wpa2, aggregate_rx, wmm);
+    let result = composition_body(&name, wpa2, aggregate_rx, wmm, ht20);
 
     // Teardown in reverse order: session first (no drain/send can
     // fire against a half-removed interface), then carrier, then
@@ -389,7 +400,13 @@ fn composition(wpa2: bool, aggregate_rx: bool, wmm: bool) -> TestResult {
     }
 }
 
-fn composition_body(name: &str, wpa2: bool, aggregate_rx: bool, wmm: bool) -> TestResult {
+fn composition_body(
+    name: &str,
+    wpa2: bool,
+    aggregate_rx: bool,
+    wmm: bool,
+    ht20: bool,
+) -> TestResult {
     // ── Before association: no carrier, and the controlled port
     // keeps DHCP off the air entirely (audit §4.3.1 S1: "no DHCP
     // before PORT_SECURE" — here, before association completes).
@@ -437,11 +454,12 @@ fn composition_body(name: &str, wpa2: bool, aggregate_rx: bool, wmm: bool) -> Te
         || !matches!(session.state, State::Associated { .. })
         || session.backend.access_point.as_ref().map(FakeAp::phase) != Some(ApPhase::Authorized)
         || session.wmm.is_some() != wmm
+        || session.ht20_profile.is_some() != ht20
     {
         put_session(session);
         return TestResult::Fail("associated state/aid mismatch");
     }
-    if aggregate_rx {
+    if aggregate_rx && !ht20 {
         super::amsdu_rx_tests::activate_receive(&mut session);
     }
     put_session(session);
@@ -605,6 +623,21 @@ kernel_test_in!(
 fn mt76_wpa2_wmm_qos_dhcp_lease_composition() -> TestResult {
     composition(true, false, true)
 }
+
+fn mt76_open_negotiated_ht20_amsdu_dhcp_and_ip() -> TestResult {
+    composition_ht20(false, true, true, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/ht20",
+    mt76_open_negotiated_ht20_amsdu_dhcp_and_ip
+);
+fn mt76_wpa2_negotiated_ht20_amsdu_dhcp_and_ip() -> TestResult {
+    composition_ht20(true, true, true, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/ht20",
+    mt76_wpa2_negotiated_ht20_amsdu_dhcp_and_ip
+);
 kernel_test_in!(
     "drivers/wireless/mt7921/wmm",
     mt76_wpa2_wmm_qos_dhcp_lease_composition
