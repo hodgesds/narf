@@ -34,12 +34,24 @@
 //!
 //! `_TC1` and `_TC2` (passive cooling coefficients) are unit-free
 //! integers and are returned raw.
+//!
+//! # Object shapes: Name vs Method
+//!
+//! ACPI evaluates these as *objects*, and firmware declares them in
+//! both shapes: `_TMP` is almost always a Method, but the trip points
+//! (`_CRT`/`_PSV`/`_ACx`) are usually **Name objects** holding the
+//! deciKelvin integer (`Name (_CRT, 0x0E94)`). `evaluate_method`
+//! rejects non-Method nodes, so every read in this module goes
+//! through `evaluate_object_int`, which falls back to the Name's
+//! parser-decoded value — the same idiom `crate::suspend` uses for
+//! `\_S3_`. Reading trip points as methods only silently yields an
+//! empty trip table on the dominant firmware shape (#986).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use narf_aml::eval::evaluate_method;
-use narf_aml::{find_all_devices_by_hid, for_each_node_of_kind, NodeKind};
+use narf_aml::{find_all_devices_by_hid, find_node, for_each_node_of_kind, NodeKind};
 
 /// One ACPI Thermal Zone. Cheap to clone (just the path).
 ///
@@ -138,6 +150,24 @@ pub enum ActiveTrip {
     Critical,
 }
 
+/// Evaluate an ACPI object that yields an integer, in either of the
+/// two shapes firmware uses: a Method returning one, or a Name
+/// holding one. `evaluate_method` alone returns `MethodNotFound` for
+/// Name objects — and trip points are Names in most DSDTs — so on
+/// any method-evaluation failure we fall back to the value the AML
+/// parser decoded for the Name node. The fallback can only succeed
+/// for Name nodes: the parser stores `value: None` for Methods, so a
+/// Method that exists but fails to evaluate still yields `None`.
+fn evaluate_object_int(path: &str) -> Option<u64> {
+    if let Ok(v) = evaluate_method(path, &[]) {
+        return Some(v.as_integer());
+    }
+    match find_node(path).and_then(|n| n.value) {
+        Some(narf_aml::NameValue::Integer(v)) => Some(v),
+        _ => None,
+    }
+}
+
 impl ThermalZone {
     /// Evaluate `<path>._TMP` and return the current temperature in
     /// millidegrees Celsius. ACPI returns tenths of Kelvin; we
@@ -145,8 +175,7 @@ impl ThermalZone {
     pub fn temperature_c_milli(&self) -> Result<i32, ThermalError> {
         let mut method = self.path.clone();
         method.push_str("._TMP");
-        let v = evaluate_method(&method, &[]).map_err(|_| ThermalError::MethodMissing)?;
-        let dk = v.as_integer();
+        let dk = evaluate_object_int(&method).ok_or(ThermalError::MethodMissing)?;
         // ACPI uses 0xFFFF_FFFF as the sensor-offline sentinel; some
         // firmware reports 0 (absolute zero) when the sensor isn't
         // wired up. Both are nonsense values.
@@ -184,15 +213,14 @@ impl ThermalZone {
         }
     }
 
-    /// Helper: read a method that returns deciKelvin, convert to
-    /// milli-C. `None` if the method is missing or returned a value
-    /// that doesn't make sense as a temperature.
+    /// Helper: read a trip-point object (Method or Name) that yields
+    /// deciKelvin, convert to milli-C. `None` if the object is
+    /// missing or its value doesn't make sense as a temperature.
     fn read_dk_milli(&self, leaf: &str) -> Option<i32> {
         let mut method = self.path.clone();
         method.push('.');
         method.push_str(leaf);
-        let v = evaluate_method(&method, &[]).ok()?;
-        let dk = v.as_integer();
+        let dk = evaluate_object_int(&method)?;
         // Same sentinel-rejection as `_TMP`. A 0 deciK trip point is
         // nonsense (would mean "throttle below absolute zero").
         if dk == 0 || dk == 0xFFFF_FFFF {
@@ -262,13 +290,13 @@ impl ThermalZone {
         PassiveCoolingList { processors }
     }
 
-    /// Helper: read a method that returns a plain integer.
+    /// Helper: read an object (Method or Name) that yields a plain
+    /// integer.
     fn read_int(&self, leaf: &str) -> Option<u64> {
         let mut method = self.path.clone();
         method.push('.');
         method.push_str(leaf);
-        let v = evaluate_method(&method, &[]).ok()?;
-        let i = v.as_integer();
+        let i = evaluate_object_int(&method)?;
         if i == 0xFFFF_FFFF {
             None
         } else {
@@ -509,6 +537,58 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("power/acpi_thermal", smoke_acpi_thermal_decik_round_trip);
+
+    /// #986: trip points declared as Name objects — the dominant
+    /// real-DSDT shape (`Name (_CRT, 3732)`) — must model. Before
+    /// `evaluate_object_int`, `trip_points()` read them through
+    /// `evaluate_method` only, which rejects Name nodes, so the
+    /// whole table came back `None` and the bridge registered the
+    /// zone with crit = i32::MAX, warn = crit/2 — a loop that could
+    /// never classify Warm or Critical on real firmware.
+    fn smoke_acpi_thermal_name_object_trip_points() -> TestResult {
+        // ThermalZone(TZ97) { Name(_CRT, 3732), Name(_PSV, 3532) },
+        // hand-encoded after the platform fixtures' encoder idiom
+        // (drivers/platform/src/tests.rs): ExtOpPrefix +
+        // ThermalZoneOp, PkgLength (which counts its own byte),
+        // \TZ97, two Name(Word) terms.
+        fn name_word(seg: &[u8; 4], value: u16) -> alloc::vec::Vec<u8> {
+            let mut v = alloc::vec::Vec::new();
+            v.push(0x08); // NameOp
+            v.extend_from_slice(seg);
+            v.push(0x0B); // WordPrefix
+            v.extend_from_slice(&value.to_le_bytes());
+            v
+        }
+        let mut inside = alloc::vec::Vec::new();
+        inside.extend_from_slice(&name_word(b"_CRT", 3732));
+        inside.extend_from_slice(&name_word(b"_PSV", 3532));
+        let mut blob = alloc::vec![
+            0x5B,                         // ExtOpPrefix
+            0x85,                         // ThermalZoneOp
+            (1 + 5 + inside.len()) as u8, // PkgLength counts itself
+            b'\\',
+        ];
+        blob.extend_from_slice(b"TZ97");
+        blob.extend_from_slice(&inside);
+        if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+            return TestResult::Fail("fixture ThermalZone parse failed");
+        }
+        let zone = ThermalZone {
+            path: alloc::string::String::from("\\TZ97"),
+        };
+        let trips = zone.trip_points();
+        if trips.critical_milli_c != Some(100_050) {
+            return TestResult::Fail("Name(_CRT, 3732) must model as 100_050 milli-C");
+        }
+        if trips.passive_milli_c != Some(80_050) {
+            return TestResult::Fail("Name(_PSV, 3532) must model as 80_050 milli-C");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "power/acpi_thermal",
+        smoke_acpi_thermal_name_object_trip_points
+    );
 
     fn smoke_acpi_thermal_classify_precedence_critical_wins() -> TestResult {
         // Trips: _CRT=100 C, _HOT=95 C, _PSV=85 C, _AC0=75 C, _AC1=65 C.
