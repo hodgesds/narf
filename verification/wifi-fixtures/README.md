@@ -7,10 +7,12 @@ ordinary 802.11/EAPOL and Ethernet; each adapter retains its own firmware wire
 format, rings, completions, regulatory policy and controlled port. See
 [verification §3](../specification/spec.md#3-test-taxonomy) for the contract.
 
-`FakeAp` handles one legacy 2.4-GHz Open or WPA2-PSK/CCMP association, including
+`FakeAp` handles one legacy 2.4-GHz or non-DFS 5-GHz Open or WPA2-PSK/CCMP association, including
 M2/M4 MIC and replay validation. `with_basic_1mbps()` selects the checked CCK
 rate profile required by RTL8188EU before authentication; other adapters keep
-the default OFDM profile. `DhcpServer` handles one station's initial
+the default OFDM profile. `with_legacy_rates()` selects up to twelve unique
+legacy rates with at least one basic rate, splitting Supported/Extended Rates
+at eight entries; 5 GHz rejects CCK. `DhcpServer` handles one station's initial
 lease, correlated by its Ethernet/BOOTP identity, transaction, requested
 address and server. It rejects malformed checksums, lengths and duplicate
 control options. Renewal, roaming, WPA3, 6 GHz and physical RF are outside
