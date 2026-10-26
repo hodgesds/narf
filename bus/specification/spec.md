@@ -40,6 +40,17 @@
 
 ## 3. Public interface
 
+`read_bar` sizes BARs with Command I/O and Memory Space decoding disabled,
+using 16-bit Command accesses so adjacent RW1C Status bits are untouched.
+Bus Master and other Command bits are preserved. A 64-bit pair remains
+undecoded until both words are restored. High-half/invalid indices are
+rejected before mutation; normal errors restore the original Command.
+Disable and restoration writes are read back. `BarError::ConfigFailed`
+reports a failed configuration transaction; a failed BAR restoration leaves
+decoding disabled so no probe address is exposed. The exclusive cfg/BAR
+ownership contract requires all BAR users, including IRQ handlers, to be
+quiesced for sizing. `map_bar` and `map_bar_control` share this contract.
+
 `map_bar` maps prefetchable MMIO windows with write-combining attributes:
 PAT WC on x86_64, MAIR Normal-NC on aarch64. Register BARs remain Device.
 These attributes match user mappings of native GPU framebuffer windows.
