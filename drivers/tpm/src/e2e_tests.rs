@@ -695,11 +695,15 @@ mod smokes {
                     st.next_handle += 1;
                     st.primaries.push(handle);
 
-                    // Parameters: outPrivate(2+0) + outPublic(echo) +
+                    // Parameters (Part 3 §12.2): outPublic(echo) +
                     // creationData(2+0) + creationHash(2+0) +
-                    // ticket: TPM_ST_CREATION(2) + hierarchy(4) + digest(2+0).
+                    // ticket: TPM_ST_CREATION(2) + hierarchy(4) +
+                    // digest(2+0) + name. There is no outPrivate in
+                    // a CreatePrimary response — the pre-#945 fake
+                    // emitted one to match the old shared parser;
+                    // both now follow §12.2. The name is the real
+                    // Part 1 §16 name of the echoed public area.
                     let mut body: Vec<u8> = Vec::new();
-                    body.extend_from_slice(&0u16.to_be_bytes()); // outPrivate
                     body.extend_from_slice(&(in_public.len() as u16).to_be_bytes());
                     body.extend_from_slice(&in_public);
                     body.extend_from_slice(&0u16.to_be_bytes()); // creationData
@@ -707,6 +711,11 @@ mod smokes {
                     body.extend_from_slice(&0x8021u16.to_be_bytes()); // TPM_ST_CREATION
                     body.extend_from_slice(&primary_handle.to_be_bytes());
                     body.extend_from_slice(&0u16.to_be_bytes()); // ticket digest
+                    let mut name: Vec<u8> = Vec::new();
+                    name.extend_from_slice(&0x000Bu16.to_be_bytes()); // nameAlg = SHA256
+                    name.extend_from_slice(&sha256(&in_public));
+                    body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                    body.extend_from_slice(&name);
 
                     let mut r: Vec<u8> = Vec::new();
                     r.extend_from_slice(&[0x80u8, 0x02, 0, 0, 0, 0, 0, 0, 0, 0]); // SESSIONS header
@@ -1639,6 +1648,14 @@ mod smokes {
         }
         if outputs.ticket_tag != 0x8021 {
             return TestResult::Fail("creation ticket tag != TPM_ST_CREATION");
+        }
+        // The name is the Part 1 §16 name of the outPublic
+        // (§12.2's final parameter — absent from the pre-#945
+        // shared-parser shape entirely).
+        let mut want_name = alloc::vec![0x00, 0x0B];
+        want_name.extend_from_slice(&sha256(&want_public));
+        if outputs.name != want_name {
+            return TestResult::Fail("CreatePrimary name != nameAlg || H(outPublic)");
         }
 
         // Make it persistent, then evict it by its persistent

@@ -22,6 +22,15 @@
 //! TPM2-table parsing is NOT here anymore: `narf_acpi` owns it
 //! (see `probe.rs`).
 //!
+//! Attestation (#945) composes across all three owners rather
+//! than living here: `narf-tpm` carries Quote + the TPMS_ATTEST
+//! verifier, this crate carries the AK template + ReadPublic
+//! builders the provisioning composition submits and the
+//! `binary_bios_measurements` sysfs node (served from
+//! `narf_tpm::attest`'s measurement hooks, not the transport),
+//! and `drivers/platform` carries the provisioning + guarded
+//! quote composition itself.
+//!
 //! Covers two host-interface flavours:
 //!
 //! - **CRB** (`crb.rs`) — Command/Response Buffer; the interface used
@@ -45,7 +54,10 @@
 //! ## Deferred
 //!
 //! - TPM 1.2 compatibility
-//! - EK / AK provisioning
+//! - EK certification / credential activation (MakeCredential /
+//!   ActivateCredential): AK *provisioning* landed with #945; the
+//!   EK-certificate chain that lets a remote party trust the AK
+//!   belongs to a fleet-enrollment lane, not this surface
 //! - TSS2 userspace daemon protocol
 //! - DRTM (Dynamic Root of Trust Measurement)
 //! - Interrupt-driven (polling-only today)

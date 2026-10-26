@@ -68,6 +68,12 @@ pub const TPM_CC_EVICT_CONTROL: u32 = 0x0000_0120;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x0000_0165;
 pub const TPM_CC_START_AUTH_SESSION: u32 = 0x0000_0176;
 pub const TPM_CC_POLICY_PCR: u32 = 0x0000_019F;
+// Attestation (#945): Quote is built by the canonical codec in
+// narf-tpm (it is a `TpmDevice` operation there); the code is named
+// here for this layer's capability surface. ReadPublic is the AK
+// provisioning probe composed in drivers/platform.
+pub const TPM_CC_QUOTE: u32 = 0x0000_0158;
+pub const TPM_CC_READ_PUBLIC: u32 = 0x0000_0169;
 
 // ── TPM_SU values — Part 2 §6.9 ─────────────────────────────────────
 
@@ -86,6 +92,8 @@ pub const TPM_ALG_SHA256: u16 = 0x000B;
 pub const TPM_ALG_SHA384: u16 = 0x000C;
 pub const TPM_ALG_SHA512: u16 = 0x000D;
 pub const TPM_ALG_NULL: u16 = 0x0010;
+pub const TPM_ALG_RSASSA: u16 = 0x0014;
+pub const TPM_ALG_ECDSA: u16 = 0x0018;
 pub const TPM_ALG_ECC: u16 = 0x0023;
 
 // ── ECC curve IDs (TPM_ECC_CURVE) — Part 2 §6.4 ─────────────────────

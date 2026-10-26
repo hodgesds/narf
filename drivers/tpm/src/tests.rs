@@ -482,11 +482,45 @@ mod smokes {
                     && o.ticket_digest == alloc::vec![0xDD; 2] => {}
             _ => return TestResult::Fail("Create response parsed incorrectly"),
         }
-        // CreatePrimary: same params behind a handle.
-        let frame = sessions_frame(Some(0x8000_0100), &params);
+        // CreatePrimary: §12.2 layout — outPublic / creationData /
+        // creationHash / ticket / name behind a handle; no
+        // outPrivate (the #945 correction: this case previously
+        // reused Create's parameter bytes, pinning the wrong
+        // layout in both the parser and the e2e fake).
+        let mut cp_params = alloc::vec::Vec::new();
+        cp_params.extend_from_slice(&tpm2b(&[0xBB; 6]));
+        cp_params.extend_from_slice(&tpm2b(&[]));
+        cp_params.extend_from_slice(&tpm2b(&[0xCC; 4]));
+        cp_params.extend_from_slice(&0x8021u16.to_be_bytes());
+        cp_params.extend_from_slice(&0x4000_000Bu32.to_be_bytes());
+        cp_params.extend_from_slice(&tpm2b(&[0xDD; 2]));
+        cp_params.extend_from_slice(&tpm2b(&[0xEE; 34]));
+        let frame = sessions_frame(Some(0x8000_0100), &cp_params);
         match cmds::parse_create_primary_response(&frame) {
-            Ok((0x8000_0100, o)) if o.out_public == alloc::vec![0xBB; 6] => {}
+            Ok((0x8000_0100, o))
+                if o.out_public == alloc::vec![0xBB; 6]
+                    && o.creation_hash == alloc::vec![0xCC; 4]
+                    && o.ticket_tag == 0x8021
+                    && o.ticket_hierarchy == 0x4000_000B
+                    && o.name == alloc::vec![0xEE; 34] => {}
             _ => return TestResult::Fail("CreatePrimary response parsed incorrectly"),
+        }
+        // ReadPublic: NO_SESSIONS frame, three TPM2B parameters.
+        let mut rp = alloc::vec::Vec::new();
+        rp.extend_from_slice(&0x8001u16.to_be_bytes());
+        rp.extend_from_slice(&0u32.to_be_bytes());
+        rp.extend_from_slice(&0u32.to_be_bytes());
+        rp.extend_from_slice(&tpm2b(&[0xBB; 6]));
+        rp.extend_from_slice(&tpm2b(&[0xEE; 34]));
+        rp.extend_from_slice(&tpm2b(&[0xEF; 34]));
+        let n = rp.len() as u32;
+        rp[2..6].copy_from_slice(&n.to_be_bytes());
+        match cmds::parse_read_public_response(&rp) {
+            Ok(o)
+                if o.out_public == alloc::vec![0xBB; 6]
+                    && o.name == alloc::vec![0xEE; 34]
+                    && o.qualified_name == alloc::vec![0xEF; 34] => {}
+            _ => return TestResult::Fail("ReadPublic response parsed incorrectly"),
         }
         // Load: handle + name TPM2B.
         let frame = sessions_frame(Some(0x8000_0200), &tpm2b(&[1, 2, 3]));
