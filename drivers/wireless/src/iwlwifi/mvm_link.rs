@@ -27,8 +27,12 @@ pub(super) mod tests;
 /// Complete control-response rates exactly as iwl_mvm_ack_rates does: map
 /// supported/basic legacy rates first, then include the lower mandatory PHY
 /// responses. The latter are local mandatory rates, not invented AP IEs.
+#[cfg(any(test, feature = "kernel-test"))]
 fn response_rates(ies: &[u8], channel: u8) -> Result<(u8, u8), &'static str> {
-    let rates = Rates::parse(ies, channel)?;
+    response_rates_for(ies, channel, 0)
+}
+fn response_rates_for(ies: &[u8], channel: u8, mode: u8) -> Result<(u8, u8), &'static str> {
+    let rates = Rates::parse_for_phy(ies, channel, mode)?;
     let mut cursor = ies;
     let (mut supported, mut extended, mut basic) = (false, false, false);
     while !cursor.is_empty() {
@@ -181,8 +185,11 @@ impl Owner {
             .iter()
             .find(|beacon| beacon.bssid == bssid && beacon.channel == channel)
             .ok_or("missing original MVM link BSS")?;
-        let (cck_response_rates, ofdm_response_rates) =
-            response_rates(&beacon.information_elements, channel)?;
+        let (cck_response_rates, ofdm_response_rates) = response_rates_for(
+            &beacon.information_elements,
+            channel,
+            u8::from(self.power.phy.offered.is_some()),
+        )?;
         let active = ActiveLinkStatus {
             bssid,
             channel,

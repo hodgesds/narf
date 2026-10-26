@@ -4,12 +4,24 @@ use crate::firmware_asset::Asset;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::AtomicBool;
 use narf_wireless::{
-    association::{Bss, JoinPlan, SecurityMode},
+    association::{Bss, SecurityMode},
     reg::RegulatoryDomain,
 };
 use zeroize::Zeroizing;
 
 impl Owner {
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::iwlwifi) fn model_expire_receive_aggregate(&mut self) {
+        let now = narf_time::now_cycles().wrapping_add(narf_time::wall::ns_to_cycles(200_000_000));
+        if let Some(d) = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.data.as_mut())
+        {
+            d.aggregate.pop(now);
+        }
+    }
     pub(in crate::iwlwifi) fn station_wpa2_supported(&self) -> bool {
         self.security_api().is_ok()
     }
@@ -119,7 +131,19 @@ impl Owner {
             .fence()
     }
     pub(in crate::iwlwifi) fn station_needs_security(&self) -> bool {
-        self.security.needs_service()
+        self.security.needs_service() || !self.power.phy.actions.is_empty()
+    }
+    pub(in crate::iwlwifi) fn station_defer_packet(&mut self, frame: Vec<u8>) {
+        self.power
+            .prepared
+            .as_mut()
+            .unwrap()
+            .mlme
+            .data
+            .as_mut()
+            .unwrap()
+            .aggregate
+            .defer_validated(frame);
     }
     pub(in crate::iwlwifi) async fn station_scan(
         &mut self,
@@ -146,7 +170,31 @@ impl Owner {
         nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
         policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
-        self.service_security_using(nonce, policy).await
+        let mut policy = policy;
+        self.service_phy_actions(&mut policy).await?;
+        if let Some(frame) = self.receive_data_inner(&mut policy)? {
+            match frame {
+                super::LegacyReceive::Ethernet(frame) => self
+                    .power
+                    .prepared
+                    .as_mut()
+                    .unwrap()
+                    .mlme
+                    .data
+                    .as_mut()
+                    .unwrap()
+                    .aggregate
+                    .defer_validated(frame),
+                super::LegacyReceive::Eapol(_) => {
+                    return self.data_failed("MVM control lost native RSNA owner")
+                }
+            }
+        }
+        if self.security.needs_service() {
+            self.service_security_using(nonce, &mut policy).await
+        } else {
+            Ok(())
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -185,11 +233,7 @@ impl Owner {
             beacon_interval: beacon.interval,
             information_elements: beacon.information_elements.clone(),
         };
-        let mut plan =
-            JoinPlan::prepare(&bss, self.mac.ok_or("MVM station MAC absent")?, ssid, mode)
-                .map_err(|_| "unsupported MVM native station offer")?;
-        plan.append_sme_ies(elements)
-            .map_err(|_| "unsupported MVM native SME elements")?;
+        self.station_plan(&bss, ssid, mode, elements, self.power.phy.offered.is_some())?;
         // Decode and bind the exact signed input BEFORE the first PHY/queue
         // publication. No missing/malformed board asset consumes a lifecycle.
         let probe = Asset {
@@ -198,7 +242,14 @@ impl Owner {
             signer: source.signer,
             digest: source.digest,
         };
-        super::power::parse(probe, binding, self.mac.unwrap(), channel)?.host_ceiling(&policy()?)?;
+        super::power::parse_for(
+            probe,
+            binding,
+            self.mac.unwrap(),
+            channel,
+            self.power.phy.emission(),
+        )?
+        .host_ceiling(&policy()?)?;
         self.prepare_channel_in_domain(channel, &policy()?).await?;
         self.prepare_peer_in_domain(bssid, &policy()?).await?;
         self.prepare_management_queue().await?;

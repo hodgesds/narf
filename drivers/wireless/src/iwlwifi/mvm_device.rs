@@ -47,7 +47,7 @@ impl Environment {
             }),
             nonce: Arc::new(super::security::fresh_nonce),
             power: Arc::new(|owner| {
-                let request = owner.transmit_power_request()?;
+                let request = owner.station_power_request()?;
                 let authority = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive().ok())
                     .ok_or("MVM power loader authority unavailable")?;
@@ -99,6 +99,7 @@ pub(super) struct Device {
     mac: [u8; 6],
     channels: Vec<u8>,
     wpa2: bool,
+    ht20: bool,
     irq: Option<u8>,
     publication: AtomicBool,
     terminal: AtomicBool,
@@ -135,6 +136,18 @@ impl Device {
                 .transmit_power_request()
         })
     }
+    pub(super) async fn ht20_power_request(
+        &self,
+    ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+        let mut state = self.state.lock().await;
+        self.source.invoke(|| {
+            let owner = state.owner.as_mut().ok_or("MVM native owner absent")?;
+            if !owner.supports_native_ht20() {
+                return Err("MVM native HT20 contract unavailable");
+            }
+            owner.transmit_power_request_for(super::mvm_boot::PowerEmission::Ht20)
+        })
+    }
     pub(super) async fn initialize(
         hardware: Hardware,
         firmware: Asset,
@@ -165,6 +178,7 @@ impl Device {
         let channels = nvm.channels.clone();
         let irq = owner.station_irq();
         let wpa2 = owner.station_wpa2_supported();
+        let ht20 = owner.supports_native_ht20();
         let stopping = Arc::new(AtomicBool::new(false));
         owner.bind_station_stop(stopping.clone());
         Ok(Arc::new_cyclic(|me| Self {
@@ -182,6 +196,7 @@ impl Device {
             mac,
             channels,
             wpa2,
+            ht20,
             irq,
             publication: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
@@ -454,6 +469,13 @@ impl Device {
                 }) {
                     return Err("MVM scan observation expired");
                 }
+                owner.select_station_offer(
+                    request.bssid,
+                    &request.ssid,
+                    request.channel,
+                    &request.elements,
+                    request.pmk.is_some(),
+                )?;
                 let (source, binding) = (self.environment.power)(owner)?;
                 owner
                     .station_join(
@@ -545,6 +567,9 @@ impl Device {
                 }
             }
             if owner.station_needs_security() {
+                for frame in output.into_iter().rev() {
+                    owner.station_defer_packet(frame);
+                }
                 let _publication = self.admission.lock();
                 self.retire_port_locked();
                 return Ok((Vec::new(), true, false));
@@ -806,6 +831,14 @@ impl WirelessNetIface for Device {
     fn reports_disconnect_events(&self) -> bool {
         true
     }
+    fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+        (self.ht20 && matches!(band_mhz, 2400 | 5000)).then(|| {
+            narf_wireless::iface::PhyCapabilities {
+                ht: narf_wireless::association::phy::LocalHt::siso20(true, true).capability_body(),
+                vht: None,
+            }
+        })
+    }
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
         use narf_wireless::iface::*;
         WirelessIfaceInfo {
@@ -826,7 +859,7 @@ impl WirelessNetIface for Device {
                 .collect(),
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: false,
+                ht_supported: self.ht20,
                 vht_supported: false,
                 he_supported: false,
                 eht_supported: false,

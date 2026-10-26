@@ -391,6 +391,23 @@ pub async fn gen2_transmit_power_request() -> Result<super::Gen2TransmitPowerReq
         .ok_or("native Intel binding is not Gen2")?;
     device.power_request().await
 }
+/// Metadata for the distinct legacy-management + WMM/HT20/SISO emitting
+/// program. The returned binding and filename do not supply measured limits.
+pub async fn gen2_ht20_transmit_power_request(
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.ht20_power_request().await
+}
 
 #[cfg(feature = "kernel-test")]
 #[path = "bootstrap_tests.rs"]

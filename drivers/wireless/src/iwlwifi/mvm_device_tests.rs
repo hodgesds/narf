@@ -80,6 +80,9 @@ fn envelope(frame: &[u8]) -> Vec<u8> {
     let mut b = vec![0; 48];
     b[..2].copy_from_slice(&(frame.len() as u16).to_le_bytes());
     b[12] = 3;
+    // No BA agreement exists in this native fixture. API4 encodes an
+    // unaggregated packet with INVALID_BAID0x7f, including initial M1.
+    b[16..20].copy_from_slice(&0x7f000000u32.to_le_bytes());
     b[32] = 40;
     b[34] = 1;
     b.extend_from_slice(frame);
@@ -105,7 +108,29 @@ fn ap(protected: bool) -> Result<FakeAp, &'static str> {
     .with_basic_1mbps()
     .map_err(|_| "MVM interface AP rate")
 }
+fn ht_ies() -> Vec<u8> {
+    let mut ht = [0; 26];
+    ht[0] = 0x2c;
+    ht[2] = 19;
+    ht[3] = 0xff;
+    ht[15] = 1;
+    let mut op = [0; 22];
+    op[0] = 1;
+    op[6] = 1;
+    let mut out = vec![45, 26];
+    out.extend_from_slice(&ht);
+    out.extend_from_slice(&[61, 22]);
+    out.extend_from_slice(&op);
+    out.extend_from_slice(&[
+        221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42, 0x43, 94, 0,
+        0x62, 0x32, 47, 0,
+    ]);
+    out
+}
 struct Actor {
+    ht: bool,
+    rx_rate: u32,
+    tlc_version: u8,
     stopped: bool,
     firmware: model::Firmware,
     trace: model::TxTrace,
@@ -121,6 +146,10 @@ struct Actor {
     held: Option<(u8, u8, u16, Vec<u8>)>,
     closing: bool,
     scan_clock: Option<(Arc<AtomicU64>, u64)>,
+    hold_phy: Option<u8>,
+    fail_phy: Option<u8>,
+    beacon_ies: Option<Vec<u8>>,
+    response_ies: Option<Vec<u8>>,
 }
 // SAFETY: fixture-only device-side pointers refer to the retained Owner's
 // posted coherent buffers. CURRENT retains both endpoints; every device-side
@@ -133,7 +162,22 @@ impl Actor {
     fn inject(&mut self, command: u8, group: u8, sequence: u16, body: &[u8]) {
         self.firmware.inject(command, group, sequence, body)
     }
-    fn reply(&mut self, command: u8, group: u8, sequence: u16, body: Vec<u8>) {
+    fn reply(&mut self, command: u8, group: u8, sequence: u16, mut body: Vec<u8>) {
+        let stage = self.commands.last().and_then(|(g, c, b)| match (*g, *c) {
+            (1, 0x18) if b[17] == 6 => Some(1),
+            (3, 9) if b[24] == 8 && b[56] == 3 => Some(2),
+            (5, 15) if b[5] == 1 => Some(3),
+            _ => None,
+        });
+        if stage.is_some() && self.fail_phy == stage {
+            body = vec![0];
+            self.fail_phy = None;
+        }
+        if stage.is_some() && self.hold_phy == stage {
+            self.held = Some((command, group, sequence, body));
+            self.hold_phy = None;
+            return;
+        }
         if self.hold_close && self.closing && command == 0x18 && group == 0 {
             self.held = Some((command, group, sequence, body));
             self.hold_close = false;
@@ -150,11 +194,21 @@ impl Actor {
     }
     fn downlink(&mut self, ethernet: &[u8]) -> Result<(), &'static str> {
         self.ap_pn += 1;
-        let packet = if self.protected {
-            self.security.encrypted_rx(ethernet, self.ap_pn, false)?
+        let mut packet = if self.protected {
+            self.security
+                .encrypted_rx_profile(ethernet, self.ap_pn, false, self.ht.then_some(0))?
         } else {
-            envelope(&from_ap(ethernet, self.ap_pn as u16))
+            let mut frame = from_ap(ethernet, self.ap_pn as u16);
+            if self.ht {
+                frame[0] = 0x88;
+                frame.splice(24..24, [0, 0]);
+            }
+            envelope(&frame)
         };
+        if self.ht {
+            packet[16..20].copy_from_slice(&0x7f000000u32.to_le_bytes());
+            packet[28..32].copy_from_slice(&self.rx_rate.to_le_bytes());
+        }
         self.inject(0xc1, 0, 0x8000, &packet);
         Ok(())
     }
@@ -209,7 +263,11 @@ impl Actor {
                     if b != [0; 4] {
                         return Err("MVM configure NVM body");
                     }
-                    nvm()
+                    let mut nvm = nvm();
+                    if self.ht {
+                        nvm[8] = 4;
+                    }
+                    nvm
                 }
                 (1, 0x98) => {
                     if b != 3u32.to_le_bytes() {
@@ -275,7 +333,10 @@ impl Actor {
                     if b.len() != 1940 {
                         return Err("MVM native scan request extent");
                     }
-                    let beacon = self.security.ap.beacon();
+                    let mut beacon = self.security.ap.beacon();
+                    if self.ht {
+                        beacon.extend_from_slice(self.beacon_ies.as_ref().unwrap_or(&ht_ies()));
+                    }
                     self.inject(0xc1, 0, 0x8000, &envelope(&beacon));
                     if let Some((clock, elapsed)) = self.scan_clock.take() {
                         clock.fetch_add(elapsed, Ordering::AcqRel);
@@ -336,7 +397,10 @@ impl Actor {
                     vec![]
                 }
                 (5, 15) => {
-                    if b.len() != 28 || b[6] != 1 || b[10..12] != [1, 0] {
+                    if b.len() != if self.tlc_version == 2 { 24 } else { 28 }
+                        || b[6] != 1
+                        || b[10..12] != [1, 0]
+                    {
                         return Err("MVM native response-bound TLC profile");
                     }
                     vec![]
@@ -363,13 +427,23 @@ impl Actor {
                 .receive(frame)
                 .map_err(|_| "independent AP rejected actual native MLME")?;
             self.firmware.tx_complete(23, p.pointer);
-            for reply in replies {
+            for mut reply in replies {
                 if reply.first() == Some(&8) {
                     self.security.m1 = reply;
                 } else {
+                    if self.ht && reply.first() == Some(&0x10) {
+                        reply.extend_from_slice(self.response_ies.as_ref().unwrap_or(&ht_ies()));
+                    }
                     self.inject(0xc1, 0, 0x8000, &envelope(&reply));
                 }
             }
+            return Ok(());
+        }
+        if self.ht && p.queue == 23 && frame[0] == 0xd0 {
+            if frame.get(24..) != Some(&[3, 1, 9, 37, 0, 2, 0, 0, 0]) {
+                return Err("native ADDBA decline bytes");
+            }
+            self.firmware.tx_complete(23, p.pointer);
             return Ok(());
         }
         if self.protected {
@@ -388,17 +462,25 @@ impl Actor {
                 }
             }
         } else {
+            let mut frame = frame.to_vec();
+            let header = if self.ht { 26 } else { 24 };
+            if self.ht {
+                if frame.get(26..28) != Some(&[0, 0]) || frame.get(24..26) != Some(&[0, 0]) {
+                    return Err("Open QoS padding/TID");
+                }
+                frame.drain(26..28);
+            }
             if p.queue != 24
-                || frame[0..2] != [8, 1]
+                || frame[0..2] != [if self.ht { 0x88 } else { 8 }, 1]
                 || frame[4..10] != AP
                 || frame[10..16] != OWN
-                || frame.get(24..30) != Some(&[0xaa, 0xaa, 3, 0, 0, 0])
+                || frame.get(header..header + 6) != Some(&[0xaa, 0xaa, 3, 0, 0, 0])
             {
                 return Err("MVM actual Open Ethernet header");
             }
             let mut ethernet = frame[16..22].to_vec();
             ethernet.extend_from_slice(&OWN);
-            ethernet.extend_from_slice(&frame[30..]);
+            ethernet.extend_from_slice(&frame[header + 6..]);
             self.security.data.push(ethernet.clone());
             self.firmware.tx_complete(24, p.pointer);
             if let Some(reply) = self.server.receive(&ethernet) {
@@ -458,10 +540,36 @@ fn run<T>(future: impl Future<Output = T>) -> Result<T, &'static str> {
 }
 impl Harness {
     fn new(protected: bool) -> Result<Self, &'static str> {
+        Self::profile(protected, false)
+    }
+    fn profile(protected: bool, ht: bool) -> Result<Self, &'static str> {
+        Self::qualified_profile(protected, ht, if ht { 2 } else { 1 })
+    }
+    fn qualified_profile(protected: bool, ht: bool, emission: u8) -> Result<Self, &'static str> {
+        Self::version_profile(protected, ht, emission, 3)
+    }
+    fn version_profile(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+    ) -> Result<Self, &'static str> {
         if CURRENT.lock().is_some() {
             return Err("MVM interface fixture already owned");
         }
-        let executable = asset("narf-test/mvm-interface/executable", &image(), true)?;
+        let mut image = image();
+        let parsed = super::super::parse_ucode(&image).unwrap();
+        let mut versions = parsed.api.commands.to_vec();
+        for entry in versions.chunks_exact_mut(4) {
+            if entry[0] == 15 && entry[1] == 5 {
+                entry[2] = tlc_version;
+            }
+        }
+        tlv(&mut image, 48, &versions);
+        if ht {
+            tlv(&mut image, 30, &[1, 0, 0, 0, 0, 8, 0, 0]);
+        }
+        let executable = asset("narf-test/mvm-interface/executable", &image, true)?;
         let parsed = super::super::parse_ucode(&executable.bytes).unwrap();
         let (mut hardware, firmware, trace) = model::station_model_for_format(CompletionFormat::Qu);
         model::versions(&mut hardware, parsed.api.commands);
@@ -469,6 +577,9 @@ impl Harness {
         let mut security = super::super::mvm_boot::SecurityModel::new(3)?;
         security.ap = ap(protected)?;
         let mut actor = Actor {
+            ht,
+            rx_rate: if ht { 0x00100207 } else { 0 },
+            tlc_version,
             stopped: false,
             firmware,
             trace,
@@ -484,6 +595,10 @@ impl Harness {
             held: None,
             closing: false,
             scan_clock: None,
+            hold_phy: None,
+            fail_phy: None,
+            beacon_ies: None,
+            response_ies: None,
         };
         {
             let mut configure = Box::pin(owner.model_configure());
@@ -502,7 +617,9 @@ impl Harness {
             }
         }
         let source = owner.station_source(executable.cap, true);
-        let signed = asset("narf-test/mvm-interface/power", &power(), true)?;
+        let mut limits = power();
+        limits[46] = emission;
+        let signed = asset("narf-test/mvm-interface/power", &limits, true)?;
         let cap = signed.cap;
         let digest = signed.digest;
         let signer = signed.signer;
@@ -662,7 +779,10 @@ fn check(test: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
     test().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
 fn conversation(protected: bool) -> Result<(), &'static str> {
-    let h = Harness::new(protected)?;
+    conversation_profile(protected, false)
+}
+fn conversation_profile(protected: bool, ht: bool) -> Result<(), &'static str> {
+    let h = Harness::profile(protected, ht)?;
     h.join()?;
     let lease = narf_net::dhcp::dhcp_acquire(h.device.name(), 0)
         .map_err(|_| "MVM actual kernel DORA failed")?;
@@ -1236,3 +1356,5 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/interface",
     smoke_mvm_interface_retired_publication_token_cannot_follow_new_station
 );
+#[path = "mvm_ht_tests.rs"]
+mod ht_tests;

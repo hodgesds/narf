@@ -201,10 +201,15 @@ mod peer;
 #[path = "mvm_queue.rs"]
 mod queue;
 
+#[path = "mvm_amsdu.rs"]
+mod amsdu;
+#[path = "mvm_phy.rs"]
+mod phy;
 #[path = "mvm_power.rs"]
 mod power;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
+pub(super) use power::Emission as PowerEmission;
 
 #[path = "mvm_link.rs"]
 mod link;

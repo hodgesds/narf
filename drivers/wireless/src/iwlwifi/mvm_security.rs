@@ -268,6 +268,7 @@ impl Owner {
             .as_mut()
             .unwrap()
             .port_open = false;
+        self.clear_data_aggregate();
         self.phase = Phase::SecuringData;
         let result = self.security_loop(&mut nonce, &mut policy).await;
         self.finish_security(result)
@@ -519,6 +520,7 @@ impl Owner {
         &mut self,
         policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
+        self.clear_data_aggregate();
         let reply = self
             .qualified_link_command(1, 0x18, &super::auth::disable_tx(true), policy)
             .await?;

@@ -45,6 +45,7 @@ pub(super) struct Prepared {
     pub(super) sequence: u16,
     pub(super) replay: frame_api::Replay,
     pub(super) last_peer: u64,
+    pub(super) aggregate: super::amsdu::Receiver,
 }
 
 fn edca(local: [u8; 6], use_11b: bool) -> [u8; 208] {
@@ -160,6 +161,10 @@ impl Owner {
             .ok_or("MVM data owner is not terminal/ready")?;
         self.check_link_power(policy)?;
         let prepared = self.power.prepared.as_ref().unwrap();
+        if self.power.phy.negotiated.is_some() && prepared.emission != super::power::Emission::Ht20
+        {
+            return Err("MVM active PHY differs from qualified emitting program");
+        }
         let data = prepared.mlme.data.as_ref().unwrap();
         if prepared.mlme.prepared != Some(data.status)
             || !self.hardware.idle_tx_binding(status.queue, STATION, TID)
@@ -205,7 +210,17 @@ impl Owner {
             .ok_or("MVM data BSS missing")?;
         // This also validates the exact Gen2 TX-v9/RX-v4/rates-v2 contract.
         self.authentication_rate(&beacon.information_elements, association.channel)?;
-        let beacon_rates = Rates::parse(&beacon.information_elements, association.channel)?;
+        let phy = self.power.phy.negotiated;
+        if phy.is_some()
+            && self.power.prepared.as_ref().unwrap().emission != super::power::Emission::Ht20
+        {
+            return Err("MVM new emitting profile lacks its distinct signed qualification");
+        }
+        let beacon_rates = Rates::parse_for_phy(
+            &beacon.information_elements,
+            association.channel,
+            u8::from(phy.is_some_and(|p| p.ht)),
+        )?;
         let allowed = if association.channel == 14 {
             15
         } else if association.channel <= 13 {
@@ -222,12 +237,23 @@ impl Owner {
         }
         let chains = self.nvm.as_ref().unwrap().tx_chains;
         let chains = (chains & chains.wrapping_neg()) as u8;
-        let payload = tlc(
-            self.hardware.version(5, 15).ok_or("MVM TLC API absent")?.0,
-            association.supported_rates,
-            chains,
-        )?;
-        let edca = edca(local, beacon_rates.supported & 0xff0 == 0);
+        let payload = if let Some(p) = phy {
+            p.tlc(
+                self.hardware.version(5, 15).ok_or("MVM TLC API absent")?.0,
+                association.supported_rates,
+                chains,
+            )?
+        } else {
+            tlc(
+                self.hardware.version(5, 15).ok_or("MVM TLC API absent")?.0,
+                association.supported_rates,
+                chains,
+            )?
+        };
+        let edca = phy.map_or_else(
+            || edca(local, beacon_rates.supported & 0xff0 == 0),
+            |p| p.edca(local),
+        );
         self.check_link_power(&policy()?)?;
         // Reserve before any MCC/control/queue publication. A dropped future
         // retains this phase and every uncertain DMA allocation in Hardware.
@@ -238,6 +264,7 @@ impl Owner {
             sequence: 0,
             replay: frame_api::Replay::default(),
             last_peer: narf_time::now_cycles(),
+            aggregate: super::amsdu::Receiver::default(),
         });
         self.phase = Phase::PreparingData;
         let result = self.prepare_data_inner(&edca, &payload, &mut policy).await;
@@ -340,6 +367,8 @@ impl Owner {
     }
 
     pub(super) fn data_failed<T>(&mut self, error: &'static str) -> Result<T, &'static str> {
+        self.clear_data_aggregate();
+        self.power.phy.actions.clear();
         if let Some(data) = self
             .power
             .prepared
@@ -387,13 +416,25 @@ impl Owner {
             .data
             .as_mut()
             .unwrap();
-        let frame = frame_api::transmit(
-            self.mac.unwrap(),
-            status.bssid,
-            data.sequence,
-            ethernet,
-            status.protected,
-        )
+        let qos = self.power.phy.negotiated.is_some();
+        let frame = if qos {
+            frame_api::transmit_qos(
+                self.mac.unwrap(),
+                status.bssid,
+                data.sequence,
+                ethernet,
+                status.protected,
+                0,
+            )
+        } else {
+            frame_api::transmit(
+                self.mac.unwrap(),
+                status.bssid,
+                data.sequence,
+                ethernet,
+                status.protected,
+            )
+        }
         .ok_or("invalid MVM legacy Ethernet frame")?;
         data.sequence = data.sequence.wrapping_add(1) & 0xfff;
         self.phase = Phase::TransmittingData;
@@ -401,7 +442,12 @@ impl Owner {
             self.fresh_data_policy(&mut policy).await?;
             {
                 let power = self.power.prepared.as_ref().unwrap();
-                let mut tx = pin!(self.hardware.transmit(status.queue, &frame, 24, None));
+                let mut tx = pin!(self.hardware.transmit(
+                    status.queue,
+                    &frame,
+                    if qos { 26 } else { 24 },
+                    None
+                ));
                 poll_fn(|cx| {
                     if let Err(error) = policy().and_then(|p| power.check_applied(&p)) {
                         return Poll::Ready(Err(error));
@@ -459,6 +505,22 @@ impl Owner {
             self.data_ready(&domain)?
         };
         let local = self.mac.unwrap();
+        let phy = self.power.phy.negotiated;
+        if !status.protected || self.security.ready() && self.phase == Phase::DataPrepared {
+            let data = self
+                .power
+                .prepared
+                .as_mut()
+                .unwrap()
+                .mlme
+                .data
+                .as_mut()
+                .unwrap();
+            if let Some(frame) = data.aggregate.pop(narf_time::now_cycles()) {
+                data.last_peer = narf_time::now_cycles();
+                return Ok(Some(LegacyReceive::Ethernet(frame)));
+            }
+        }
         self.hardware.poll()?;
         while let Some(index) = self
             .hardware
@@ -469,10 +531,16 @@ impl Owner {
             self.check_link_power(&policy()?)?;
             let packet = self.hardware.notifications.remove(index).unwrap();
             let Some(mpdu) = scan_api::mpdu_gen2(&packet.payload) else {
+                self.cancel_data_partial();
                 continue;
             };
             let f = mpdu.frame;
             if mpdu.channel != status.channel || f.len() < 24 || f[10..16] != status.bssid {
+                self.clear_data_aggregate();
+                continue;
+            }
+            if self.receive_phy_action(&mpdu, local, status.bssid) {
+                self.clear_data_aggregate();
                 continue;
             }
             if ap_disconnected(&mpdu, local, status) {
@@ -494,6 +562,13 @@ impl Owner {
                             && (beacon.capability_info & 16 != 0) == status.protected
                     })
             {
+                if phy.is_some_and(|p| {
+                    mpdu.body(24, 0)
+                        .and_then(|b| b.get(12..))
+                        .is_none_or(|ies| !p.matches_beacon(ies))
+                }) {
+                    return Err("MVM current AP changed retained WMM/HT profile");
+                }
                 self.power
                     .prepared
                     .as_mut()
@@ -505,20 +580,27 @@ impl Owner {
                     .last_peer = narf_time::now_cycles();
                 continue;
             }
-            // Only original non-QoS FromDS frames in this negotiated legacy
-            // profile. Reject HT-control, fragments, unauthenticated crypto,
-            // firmware duplicates and A-MSDUs before a generic frame parser.
-            if f[0] != 8
+            // Original FromDS frames only; QoS and native deaggregation need
+            // the retained response-bound profile. Reject unsupported header,
+            // PHY, reorder and crypto shapes before any replay publication.
+            let qos = f[0] == 0x88;
+            let header = if qos { 26 } else { 24 };
+            if !matches!(f[0], 8 | 0x88)
+                || qos && phy.is_none()
                 || f[1] & 0x87 != 2
                 || f[22] & 15 != 0
                 || mpdu.status & (1 << 22) != 0
-                || mpdu.amsdu
-                || mpdu.amsdu_index != 0
-                || !legacy_rx_rate(&packet.payload, status)
+                || qos && f.get(24..26).is_none_or(|q| q[0] & 0x7f > 7 || q[1] != 0)
+                || mpdu.amsdu && !phy.is_some_and(|p| p.ht)
+                || phy.is_some() && mpdu.reorder & 0x7f000000 != 0x7f000000
+                || !mpdu.amsdu && mpdu.amsdu_index != 0
+                || !(legacy_rx_rate(&packet.payload, status)
+                    || phy.is_some_and(|p| p.rx_rate(&packet.payload)))
                 || mpdu
-                    .body(24, if f[1] & 0x40 != 0 { 8 } else { 0 })
+                    .body(header, if f[1] & 0x40 != 0 { 8 } else { 0 })
                     .is_none_or(|b| !(8..=1508).contains(&b.len()))
             {
+                self.clear_data_aggregate();
                 continue;
             }
             let encrypted = f[1] & 0x40 != 0;
@@ -530,9 +612,11 @@ impl Owner {
                     || !self.security.has_pairwise()
                     || mpdu.status & (0x1f000000 | 0xf4c) != 0xa4c
                 {
+                    self.clear_data_aggregate();
                     continue;
                 }
             } else if mpdu.status & 0xf40 != 0 {
+                self.clear_data_aggregate();
                 continue;
             }
             let data = self
@@ -544,12 +628,13 @@ impl Owner {
                 .data
                 .as_mut()
                 .unwrap();
-            let Some(ethernet) = frame_api::receive(
+            let Some(ethernet) = data.aggregate.observe(
                 &mpdu,
                 local,
                 status.bssid,
                 status.protected,
                 &mut data.replay,
+                narf_time::now_cycles(),
             ) else {
                 continue;
             };
@@ -622,6 +707,8 @@ impl Owner {
             .unwrap();
         let queue = data.queue.ok_or("MVM data close queue missing")?;
         data.port_open = false;
+        data.aggregate.clear();
+        self.power.phy.actions.clear();
         self.phase = Phase::ClosingData;
         let result = async {
             let reply = self
@@ -645,6 +732,26 @@ impl Owner {
                 Ok(())
             }
             Err(error) => self.data_failed(error),
+        }
+    }
+    pub(super) fn clear_data_aggregate(&mut self) {
+        if let Some(data) = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.data.as_mut())
+        {
+            data.aggregate.clear();
+        }
+    }
+    pub(super) fn cancel_data_partial(&mut self) {
+        if let Some(data) = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.data.as_mut())
+        {
+            data.aggregate.cancel_pending();
         }
     }
 }

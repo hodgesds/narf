@@ -16,7 +16,8 @@ radios. Implements `narf_net::Interface` and
 
 The current Gen3 runtime includes AX210/Bz/Sc transport initialization and
 an MLD station profile. Exact CC/Qu/QuZ API77 Gen2 bindings now continue
-through native deferred provisioning and a legacy20 Open/WPA2 station netdev.
+through native deferred provisioning and an Open/WPA2 station netdev, with
+legacy20 or the separately qualified WMM/HT20/SISO profile in §3.18.
 Software tests do not establish hardware acceptance for either path.
 
 **Does NOT own (any stage):** mac80211-equivalent stack,
@@ -78,7 +79,8 @@ additional RX queues and RSS remain disabled for this single-queue profile.
 
 The supported software profile is a single station with Open/WPA2-PSK or
 WPA3-SAE security, 2.4/5 GHz, and legacy/HT/VHT operation up to 80 MHz.
-Gen2's separate §3.17 profile supports legacy20 Open/WPA2 station operation.
+Gen2's separate §§3.17–3.18 profiles support legacy20 and WMM/HT20/SISO
+Open/WPA2 station operation with distinct emitting-program qualifications.
 AP mode, 6 GHz/HE/EHT and system suspend/resume still require separate
 software implementations. They are not hardware-only
 acceptance gates and are not enabled by this profile's station tests.
@@ -990,7 +992,7 @@ native crypto/PN/group-floor denial; source-defined omitted/UNKNOWN version
 fallbacks; old-material rejection; AP close during
 the epoch; and key/queue closing ownership. These are software conversation
 tests, not hardware acceptance. Native interface publication is §3.17.
-PMF/WPA3, BA/reorder, WMM/HT/VHT/HE, wider channels, over-air teardown,
+PMF/WPA3, BA/reorder, VHT/HE, wider channels, over-air teardown,
 recovery and runtime/system PM remain separate work.
 
 ### 3.17 Native Gen2 provisioning, interface and retained worker
@@ -1024,8 +1026,9 @@ configured owner's exact MAC/PCI/MAC-RF/firmware/SMBIOS binding and expected
 signed-input filename. It supplies metadata for external measurement, never
 board limits or transmit permission. Missing SMBIOS facts fail closed.
 
-The published `WirelessNetIface` is one non-QoS legacy20 station on NVM
-2.4/5-GHz channels, with no HT/VHT/HE/EHT, additional vdev or SAE/PMF claim.
+The default published station profile is non-QoS legacy20 on NVM
+2.4/5-GHz channels. §3.18 adds a separately qualified WMM/HT20/SISO profile;
+VHT/HE/EHT, additional vdev and SAE/PMF remain unsupported.
 WPA2 handshake offload is advertised only for the actual key-v2/v3 and
 RX-sync-v1 contract, including its source-defined defaults. Passive scans
 accept exact canonical frequencies/legacy selectors, reject contradictory
@@ -1108,7 +1111,109 @@ The existing boot-resource test also covers literal new/legacy API selection.
 These Rust tests establish software contracts, not silicon/firmware/RF
 acceptance or the existence of a measured board qualification.
 
-### 3.18 Per-profile remaining software inventory
+### 3.18 Qualified native WMM and HT20/SISO
+
+The same retained `mvm_device` worker can select an optional BE/TID0 WMM
+profile and HT20/SISO/MCS0–7 with optional SGI20. The actual native NVM4 SKU
+must enable11n and usable TX/RX chains; firmware must advertise TLC_OFFLOAD43,
+TLC command2/3/4, ADD_STA12/response2 and SCD_QUEUE_CONFIG3/response2, and the
+same consistent TX-v9/TX-response6–8/RX4/TLC-update3 rates-v2 contract. These
+facts come from the retained executable/native response. A PCI name or Gen3
+encoder cannot enable this path. Missing optional PHY retains legacy admission
+only when its actual rate/membership requirements permit it. HT40, NSS2,
+VHT/HE, LDPC/STBC and TX aggregation remain absent.
+
+`JoinPlan::prepare_with_phy` consumes the exact original BSS and the local
+`LocalHt::siso20(true,true)` implementation profile. It owns the HT capability
+IE, strict directional AP offer/response intersection, mandatory HT selector,
+basic MCS and primary/operation checks. Caller HT/WMM/operation IEs remain
+rejected. The driver appends only its own WMM Info with no U-APSD. The actual
+bound response must confirm WMM parameters and selected HT Capabilities plus
+Operation; invalid/missing/broader facts never reach native peer/port commit.
+AP RX support narrows native TX MCS/SGI, while native RX remains bounded by
+the locally advertised SISO/MCS0–7/SGI20 facts. A WMM-only AP uses QoS at
+legacy rates, without TGN/HT flags. BE ACM, malformed/duplicate ACI records
+and TXOP*32 overflow are rejected before PHY/queue publication. The first
+producer deliberately sends ordinary Ethernet only as BE/TID0; it does not
+claim DSCP classification, other AC/TID queues or TSPEC admission.
+
+The emitting measurement is separate from §3.11's static legacy20 profile.
+`gen2_ht20_transmit_power_request().await` returns metadata for
+`iwlwifi/mvm-api77-ht20-siso-wmm-power-v2-<MAC>.bin`; it grants no limits or RF
+permission. Its SHA-256 binding uses domain
+`NARF Intel MVM API77 qualified static HT20 SISO MCS0-7 SGI20 WMM-BE power v2`
+plus the same actual PCI/MAC/RF, NVM antenna, firmware, MAC and unambiguous
+SMBIOS facts. Signed NIPW retains the64-byte wire format/version1, but byte46
+is emitting-program tag2 rather than legacy tag1. The external qualification
+must cover the legacy management/EAPOL program and the entire additional
+HT20/SISO/MCS0–7/SGI20/WMM-BE program over all supported bands, platform
+postures and states, with measured SAR/gain/conducted ceilings. A legacy tag1
+asset cannot satisfy tag2, even with the same MAC/binding supplied. Selection
+of WMM (including WMM-only legacy QoS) requires tag2; an absent input leaves
+the native owner Configured/retryable and does not silently emit the new
+program using legacy measurements. No measured values are supplied by this code.
+
+After actual Association Response, native ADD_STA48 receives the response AID,
+20MHz/SISO and AP density/AMPDU-factor/SMPS flags under exact masks. U-APSD
+ACs remain zero and every aggregation TID remains disabled. LINK_CONFIG208
+programs QoS flags UPDATE_EDCA and, only for HT,TGN; AP CW/AIFS/checked
+microsecond TXOP in BK/BE/VI/VO order with native FIFO masks2/4/8/16. ERP and
+HT protection follow the source operation. Native TLC24/28 version2/3/4 sets
+HT mode1, width20, one qualified chain, response-intersected NSS1 MCS and
+version-specific SGI20; NSS2, wider rates, LDPC/STBC and TX A-MSDU stay zero.
+Native peer, LINK and TLC receipts precede the data queue/controlled-port
+publication. Existing command header0, qualified-power/source/current-policy
+checks at each wait and cancellation/DMA retention remain required.
+
+QoS data uses the actual station0/TID0 queue,26-byte MAC header,2-byte
+transport pad and TX-v9 offload geometry. Firmware owns CCMP IV/MIC/PN and
+actual TX receipts. Native RX accepts only the selected local MCS/NSS/width/GI
+bound, valid normal-QoS headers/TIDs0–7, current source station/key/MIC/decrypted
+metadata and unnegotiated-BA sentinel. Ordinary and EAPOL traffic retain the
+same real RSNA/key-epoch owner, per-key/TID PN floors and authenticated GTK RSC.
+The independent native firmware model authenticates actual26-byte CCMP AAD
+and nonce priority; it cannot substitute an authorized/decrypted caller flag.
+
+The local HT capability implies3839-byte receive A-MSDU support. The API4
+receiver therefore stages firmware-deaggregated subframes, a cloned replay
+state and reconstructed aggregate extent until the native last marker. It
+requires initial index0, contiguous bounded indices, exact peer/TID/sequence/
+key/PN identity, no HTC or negotiated BA, valid source/destination and bounded
+Ethernet geometry. No packet or replay floor is published for an incomplete,
+foreign, timed-out, oversized or malformed suffix. Inner EAPOL/preauth/tunnel
+control and invalid EtherTypes are excluded, including through up to two VLAN
+tags. Completion commits the one aggregate's replay state and then releases
+the checked batch. A100ms partial deadline, key transition/RX marker, local
+close and terminal failure discard private partial state. There is no claim
+that arbitrary index1 suffixes can establish completeness. Native index/size/
+RF acceptance remains physical testing work.
+
+BA remains unnegotiated. A genuine bound ADDBA request earns a bounded actual
+status37 decline on the native management queue under driver-retained Work;
+late receipt/cancellation cannot open an aggregate producer. Valid Ethernet
+already received behind that action is privately retained and later delivered
+under fresh publication grants. Rekey flushes old private batches before the
+new key epoch. A changed bound AP WMM/HT beacon profile closes admission;
+there is no asynchronous EDCA/PHY reconfiguration shortcut. All final IPC/
+stack publication continues to require current firmware/PCI/signed-power and
+station-generation authority after owner/ring locks drop.
+
+Seventeen new native smokes cover Open/WPA2 worker DHCP/IP, literal EDCA/peer/
+TLC2/3/4, distinct qualification denial, each new native wait's failure,
+cancellation and source/policy loss, directional rates/GI and TID replay,
+real whole-aggregate CCM plus staged deaggregation/no-PN/prefix leakage,
+malformed/control/oversize/timeout/close/key-epoch boundaries, mandatory HT
+selector/caller rejection, response binding, WMM-only legacy fallback, bound
+beacon changes and ADDBA decline preserving following native IP. These tests
+exercise software contracts; they do not establish a measured board envelope,
+real firmware/RF acceptance or throughput.
+
+Primary layouts/selection follow Linux `iwl-nvm-utils.c::iwl_init_ht_hw_capab`,
+`iwl-nvm-parse.c::iwl_get_nvm`, `mvm/{sta,rs-fw,mac-ctxt,link,tx,rxmq}.c` and
+`fw/api/{nvm-reg,sta,rs,mac,mac-cfg,tx,rx}.h`. The Gen3 `ht_vht::apply_*`
+payload encoders are deliberately not used for native MVM peer/TLC commands.
+
+### 3.19 Per-profile remaining software inventory
 
 This inventory follows local Linux `cfg/{22000,ax210,bz,sc}.c`, `mvm/{ops,sta,
 link,mld-mac,tx,mac80211}.c` and `fw/api/{mac-cfg,sta,tx,rs}.h`. Actual NVM,
@@ -1117,7 +1222,7 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 legacy20 MLME, signed v5 SAR/power, DCF/TLC, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement | Active probes; BA/reorder; PMF/WPA3; over-air deauthentication; broader retired-key/reconnect history; recovery and runtime/system PM. HT/VHT/HE, WMM, wider channels, AP/P2P, WoW/offloads and multiple RX/RSS are not implemented by this legacy owner even where hardware supports them. Exact command contracts, measured board inputs and physical acceptance remain required. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement | Active probes; BA/reorder; other QoS ACs/TIDs and TX A-MSDU; HT40/NSS2/VHT/HE; PMF/WPA3; over-air deauthentication; broader retired-key/reconnect history; recovery and runtime/system PM. Wider channels, AP/P2P, WoW/offloads and multiple RX/RSS remain unimplemented even where hardware supports them. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile. The generic Gen3 command-ID-header/version assumption still needs a native Linux ABI audit; payload versions alone cannot select header versions. Sc conversation tests do not establish a different family's ABI or hardware. |
 | Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile | The same explicit Gen3 native command-ID audit; HE/EHT/6GHz and MLO,160/320MHz, AP/P2P, advanced offloads, platform power/runtime/system PM remain separate implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |

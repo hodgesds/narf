@@ -137,10 +137,13 @@ impl Owner {
             beacon_interval: beacon.interval,
             information_elements: beacon.information_elements.clone(),
         };
-        let mut plan = JoinPlan::prepare(&bss, local, ssid, security)
-            .map_err(|_| "unsupported legacy association offer")?;
-        plan.append_sme_ies(elements)
-            .map_err(|_| "unsupported MVM SME elements")?;
+        let mut plan = self.station_plan(
+            &bss,
+            ssid,
+            security,
+            elements,
+            self.power.phy.offered.is_some(),
+        )?;
         let authenticated = self
             .power
             .prepared
@@ -162,6 +165,12 @@ impl Owner {
             .map_err(|_| "retained authentication invalid")?
             .ok_or("retained authentication foreign")?
             .to_vec();
+        if self.power.phy.offered.is_some() {
+            if frame.len() + narf_wireless::wmm::INFORMATION.len() > 4096 {
+                return Err("MVM WMM request extent exceeded");
+            }
+            frame.extend_from_slice(&narf_wireless::wmm::INFORMATION);
+        }
         frame[22..24].copy_from_slice(&16u16.to_le_bytes()); // next management sequence1
         let rate = self.authentication_rate(&bss.information_elements, bss.channel)?;
         self.check_link_power(&policy()?)?;
@@ -227,15 +236,26 @@ impl Owner {
             return Err("association peer disable failed");
         }
         self.check_link_power(&policy()?)?;
-        let reply = self
-            .qualified_link_command(1, 0x18, &peer(status.aid), policy)
-            .await?;
+        let peer = self
+            .power
+            .phy
+            .negotiated
+            .map_or_else(|| peer(status.aid), |p| p.peer(status.aid));
+        let reply = self.qualified_link_command(1, 0x18, &peer, policy).await?;
         if reply.len() != 4 || u32::from_le_bytes(reply[..4].try_into().unwrap()) & 255 != 1 {
             return Err("associated peer/AID update failed");
         }
         self.check_link_power(&policy()?)?;
+        let mut link = link(local, status, interval, dtim);
+        if let Some(p) = self.power.phy.negotiated {
+            put32(
+                &mut link,
+                52,
+                u32::from(status.erp_protection) | p.protection,
+            );
+        }
         for (group, id, body) in [
-            (3, 9, link(local, status, interval, dtim).to_vec()),
+            (3, 9, link.to_vec()),
             (3, 8, mac(local, Some(status.aid)).to_vec()),
         ] {
             if !self
@@ -300,6 +320,7 @@ impl Owner {
                     .map_err(|_| "AP association rejection/invalid response")?
                 {
                     let (supported_rates, basic_rates) = plan.legacy_rates();
+                    self.power.phy.confirm(plan, &body[6..])?;
                     let capability = u16::from_le_bytes([body[0], body[1]]);
                     let beacon = self
                         .beacons

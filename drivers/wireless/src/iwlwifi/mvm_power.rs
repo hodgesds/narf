@@ -16,6 +16,16 @@ use narf_wireless::reg::RegulatoryDomain;
 const RECORD_LEN: usize = 64;
 const REDUCE_TX_POWER: u8 = 0x9f;
 
+/// Distinct externally qualified emission programs. Profile2 includes the
+/// legacy management/EAPOL program and HT20/SISO/MCS0..7/SGI20 with WMM BE.
+/// A profile1 measurement never authorizes that additional emission set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::iwlwifi) enum Emission {
+    #[default]
+    Legacy = 1,
+    Ht20 = 2,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PowerRequest {
     pub name: String,
@@ -33,6 +43,7 @@ pub(super) struct Context {
     reduced_v5: bool,
     pub(super) nvm_permissions: Option<Vec<u32>>,
     pub(super) prepared: Option<Prepared>,
+    pub(super) phy: super::phy::Context,
 }
 impl Context {
     pub(super) fn new(api: &FirmwareApi<'_>) -> Self {
@@ -40,11 +51,13 @@ impl Context {
             reduced_v5: api.api_changes[1] & (1 << 13) != 0,
             nvm_permissions: None,
             prepared: None,
+            phy: super::phy::Context::default(),
         }
     }
 }
 
 pub(super) struct Prepared {
+    pub(super) emission: Emission,
     source: Asset,
     sar: [[u8; 5]; 2],
     maximum: i16,
@@ -86,11 +99,15 @@ impl Prepared {
     }
 }
 
-fn request(binding: [u8; 32], mac: [u8; 6]) -> PowerRequest {
+fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest {
+    let program = match emission {
+        Emission::Legacy => "mvm-api77-power-v1",
+        Emission::Ht20 => "mvm-api77-ht20-siso-wmm-power-v2",
+    };
     PowerRequest {
         name: format!(
-            "iwlwifi/mvm-api77-power-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            "iwlwifi/{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            program, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         ),
         binding,
     }
@@ -102,6 +119,15 @@ pub(super) fn parse(
     mac: [u8; 6],
     channel: u8,
 ) -> Result<Prepared, &'static str> {
+    parse_for(source, binding, mac, channel, Emission::Legacy)
+}
+pub(super) fn parse_for(
+    source: Asset,
+    binding: [u8; 32],
+    mac: [u8; 6],
+    channel: u8,
+    emission: Emission,
+) -> Result<Prepared, &'static str> {
     let bytes = &source.bytes;
     if !source.current() || source.signer.is_none() {
         return Err("MVM platform power qualification is unsigned or revoked");
@@ -111,7 +137,7 @@ pub(super) fn parse(
         || bytes[4..8] != [1, 0, RECORD_LEN as u8, 0]
         || bytes[8..40] != binding
         || bytes[40..46] != mac
-        || bytes[46..48] != [1, 0]
+        || bytes[46..48] != [emission as u8, 0]
         || bytes[62..64] != [0; 2]
     {
         return Err("MVM platform power qualification format or identity mismatch");
@@ -126,6 +152,7 @@ pub(super) fn parse(
         bytes[53..58].try_into().unwrap(),
     ];
     Ok(Prepared {
+        emission,
         source,
         sar,
         maximum,
@@ -280,6 +307,12 @@ impl Owner {
     /// Exact physical/firmware/platform binding requested from the image
     /// builder. Identification grants no calibration or transmit authority.
     pub fn transmit_power_request(&mut self) -> Result<PowerRequest, &'static str> {
+        self.transmit_power_request_for(Emission::Legacy)
+    }
+    pub(in crate::iwlwifi) fn transmit_power_request_for(
+        &mut self,
+        emission: Emission,
+    ) -> Result<PowerRequest, &'static str> {
         let mac = self.mac.ok_or("MVM power identity is not initialized")?;
         let nvm = self
             .nvm
@@ -295,7 +328,12 @@ impl Owner {
         let mut image = narf_crypto::sha256::Sha256::new();
         image.update(&self.firmware);
         let mut hash = narf_crypto::sha256::Sha256::new();
-        hash.update(b"NARF Intel MVM API77 qualified static legacy20 power v1");
+        hash.update(match emission {
+            Emission::Legacy => &b"NARF Intel MVM API77 qualified static legacy20 power v1"[..],
+            Emission::Ht20 => {
+                &b"NARF Intel MVM API77 qualified static HT20 SISO MCS0-7 SGI20 WMM-BE power v2"[..]
+            }
+        });
         hash.update(&facts);
         hash.update(&mac);
         hash.update(&nvm.tx_chains.to_le_bytes());
@@ -303,7 +341,7 @@ impl Owner {
         hash.update(profile.prefix.as_bytes());
         hash.update(&image.finalize());
         hash.update(&platform_digest()?);
-        Ok(request(hash.finalize(), mac))
+        Ok(request(hash.finalize(), mac, emission))
     }
 
     pub fn prepared_transmit_power(&self) -> Option<PowerStatus> {
@@ -369,12 +407,22 @@ impl Owner {
         if !nvm.channels.contains(&channel) || self.power.nvm_permissions.is_none() {
             return Err("MVM power channel lacks actual retained NVM permission");
         }
-        let prepared = parse(
-            source,
-            binding,
-            self.mac.ok_or("MVM power MAC unavailable")?,
-            channel,
-        )?;
+        let prepared = if self.power.phy.emission() == Emission::Legacy {
+            parse(
+                source,
+                binding,
+                self.mac.ok_or("MVM power MAC unavailable")?,
+                channel,
+            )?
+        } else {
+            parse_for(
+                source,
+                binding,
+                self.mac.ok_or("MVM power MAC unavailable")?,
+                channel,
+                self.power.phy.emission(),
+            )?
+        };
         let domain = policy()?;
         if !domain.country_code.iter().all(u8::is_ascii_uppercase)
             || super::super::connection::host_channel_power(&domain, channel, true).is_none()
@@ -479,6 +527,7 @@ impl Owner {
             return Err("MVM owner has no completed inactive transmit-power preparation");
         }
         self.power.prepared = None;
+        self.power.phy = super::phy::Context::default();
         self.phase = Phase::ManagementQueuePrepared;
         Ok(())
     }
