@@ -67,9 +67,9 @@ remain separate profiles.
   owner for 1–16 explicit SSID entries, each 0–32 arbitrary bytes; an empty
   entry requests wildcard probes. The registered interface advertises
   `max_scan_ssids() == 16` and normalizes an active request without entries to
-  one wildcard. The initial active profile is legacy20 on configured channels
-  1–11, within SERVICE_READY ranges and the existing strict factory-world
-  ceiling. An authenticated current host domain must cover every complete
+  one wildcard. The active profile is legacy20 on configured channels
+  1–11 and the non-DFS 5-GHz centres listed below, within SERVICE_READY ranges
+  and factory/host ceilings. An authenticated current host domain must cover every complete
   channel interval. Any overlapping DFS, NO_IR, unproven indoor-only rule,
   narrow bandwidth or negative
   power ceiling denies probes. Implicit lists select only eligible channels;
@@ -80,7 +80,8 @@ remain separate profiles.
   All six MAIN/10.1/10.2/10.2.4/10.4/TLV layouts encode real SSID arrays,
   CCK/OFDM probe rates and DFS bypass. TLV's inverted probe-request-filter bit
   is handled explicitly. Before START, ordered commands retain factory RD/CTL,
-  apply the minimum selected-channel ceiling to the 2-GHz PDEV limit, and
+  apply each band's minimum selected-channel ceiling to its native 2-GHz or
+  5-GHz PDEV limit before any mixed-band probe, and
   program each active channel's max/reg/max-TX power in half-dBm. Factory
   calibration remains enforced by firmware. Matching terminal completion is
   followed by restoration of the complete receive-only channel list before a
@@ -130,10 +131,17 @@ remain separate profiles.
 - `pci::prepare_station(bssid, frequency_mhz)` prepares one native station
   context selected from the last successful passive or active scan cache. It requires
   the installed authenticated host regulatory policy; initial geometry is
-  legacy 20 MHz on channels 1–11 within firmware hardware limits. The strict
-  initial factory-world 20 dBm ceiling and every overlapping host power,
-  bandwidth and DFS restriction constrain it. Negative power, DFS, 5/6 GHz
-  and beacon-hint-dependent channels stay closed in this profile.
+  legacy 20 MHz on channels 1–11 or 5-GHz centres 5180/5200/5220/5240 and
+  5745/5765/5785/5805/5825 MHz within firmware hardware limits. 5 GHz requires
+  an actual fixed-country factory identity matching the authenticated host
+  country; a world factory identity is never promoted by host policy. Host
+  occupied-channel power is additionally bounded by 20 dBm on 2 GHz and
+  30 dBm on 5 GHz, while immutable factory pair/CTL and firmware calibration
+  remain active. These bounds are ceilings, not measured board transmit power.
+  Every overlapping host power/bandwidth/DFS restriction applies; 5-GHz
+  indoor-only restrictions without authority, negative power, DFS, 6 GHz and
+  beacon-hint-dependent channels stay closed. Native station/channel/peer
+  records use 11A for 5 GHz and reject CCK there; 2 GHz retains 11G/11B.
   It programs immutable factory pair/CTL and additional half-dBm power limits,
   waits for a successful correlated VDEV_START_RESPONSE, creates the BSS
   peer and waits for native HTT peer-map confirmation. `PeerPrepared` reports
@@ -274,7 +282,8 @@ remain separate profiles.
   images and invalid/unsigned regulatory policy fail immediately without waiting.
   `RadioSession` retains an `Arc<Mutex<Radio<PciBoot>>>` with the selected image
   and board profile; native PCI APIs and the Device share this single owner.
-  The Device exposes passive/active scan and Open/WPA2-PSK/CCMP on channels1–11,
+  The Device exposes passive/active scan and Open/WPA2-PSK/CCMP on configured
+  channels1–11 and the admitted fixed-country non-DFS 5-GHz centres above,
   legacy20 only. Unsupported scan options, PHY modes, external EAPOL and
   checksum/TSO/VLAN requests are rejected, including direct frame-ring clients.
   Native control and each bounded packet-progress pass sample the current
@@ -599,7 +608,8 @@ variants, concurrent terminal HTT completion and dropped/failed ownership.
 
 The retained validation profile is calibrated BMI boot with a signed board
 file, firmware advertising RAW_MODE_SUPPORT, non-PFC HTT, legacy20 station on
-host-permitted channels1–11, passive/active scan, Open or WPA2-PSK/CCMP, DHCP and
+host-permitted channels1–11 or the matching fixed-country non-DFS 5-GHz profile,
+passive/active scan, Open or WPA2-PSK/CCMP, DHCP and
 bidirectional IP. Peer/vdev retirement is terminal; firmware and DMA allocations
 remain owned until full-device reset. Interrupts remain masked and the bounded
 polling path is the initial packet service. No country, real calibration data,

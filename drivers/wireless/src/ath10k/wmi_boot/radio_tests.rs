@@ -42,6 +42,7 @@ struct RadioModel {
     active: Option<active_scan_tests::Fixture>,
     ps: Option<power_save_tests::Fixture>,
     ps_default_off: bool,
+    frequency: u16,
 }
 // SAFETY: This private firmware fixture owns its complete graph of CE-model
 // Rc/RefCell buffers; no reference-counted alias escapes the model. Moving the
@@ -108,7 +109,7 @@ fn scan_event(model: &mut RadioModel, kind: u32, scan: u16, request: u16) {
     for v in [
         kind,
         model.reason,
-        2412,
+        u32::from(model.frequency),
         u32::from(request),
         u32::from(scan),
         0,
@@ -177,7 +178,15 @@ fn management_frame(model: &mut RadioModel, frame: Vec<u8>) {
             24
         }
     ];
-    u32at(&mut head, 0, 1);
+    u32at(
+        &mut head,
+        0,
+        if model.frequency < 3000 {
+            u32::from((model.frequency - 2407) / 5)
+        } else {
+            u32::from((model.frequency - 5000) / 5)
+        },
+    );
     u32at(&mut head, 4, 31);
     u32at(&mut head, 16 + extra, frame.len() as u32);
     let mut body = Vec::new();
@@ -330,8 +339,14 @@ impl Hif for RadioModel {
             _ => SCAN_10X,
         }
         .to_vec();
+        if self.phase == 1 && self.frequency > 3000 && !self.default_channels {
+            let at = if dialect == Dialect::Tlv { 48 } else { 32 };
+            u32at(&mut expected, at, u32::from(self.frequency));
+            u32at(&mut expected, at + 4, u32::from(self.frequency));
+        }
         if self.phase == 1 && self.active.is_some() {
-            expected = active_scan_tests::receive_channels(dialect);
+            expected =
+                active_scan_tests::receive_on(dialect, &self.active.as_ref().unwrap().receive);
         }
         if self.phase >= 2 {
             if self.data.as_ref().is_some_and(|d| d.automatic) {
@@ -343,6 +358,10 @@ impl Hif for RadioModel {
                     (4, 60)
                 };
                 let at = base + common;
+                // The one-channel passive request carries the actual AP
+                // frequency rather than a generated production scan plan.
+                let f = at + if dialect == Dialect::Tlv { 4 } else { 8 };
+                u32at(&mut expected, f, u32::from(self.frequency));
                 if dialect == Dialect::Tlv {
                     u32at(&mut expected, base + 64, 1);
                     u32at(&mut expected, at, (16 << 16) | 4);
@@ -425,6 +444,15 @@ fn radio_boot_options(
     features: u64,
     major: u8,
 ) -> radio::Radio<RadioModel> {
+    radio_boot_country(version, dialect, features, major, 0x64)
+}
+fn radio_boot_country(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    major: u8,
+    factory: u32,
+) -> radio::Radio<RadioModel> {
     let hardware = if dialect == Dialect::Tlv {
         HwRev::Qca6174
     } else if dialect == Dialect::TenFour {
@@ -441,6 +469,7 @@ fn radio_boot_options(
     };
     let c = htt::Config::new(hardware, version, htt_version, 0).unwrap();
     let mut inner = HttModel::new(dialect, c, hardware);
+    inner.inner.factory = factory;
     let raw = features & (1 << 10) != 0;
     inner.raw = raw;
     if raw {
@@ -478,6 +507,7 @@ fn radio_boot_options(
         active: None,
         ps: None,
         ps_default_off: false,
+        frequency: 2412,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));

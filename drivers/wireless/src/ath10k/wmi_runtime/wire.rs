@@ -157,7 +157,7 @@ impl Wire {
         for permission in permissions {
             // 11G, with no PASSIVE/IBSS/HT/VHT promotion. Power is half-dBm
             // in max/reg/max_tx fields (wmi_channel), not whole dBm.
-            put(&mut out, at + 12, 1);
+            put(&mut out, at + 12, u32::from(permission.frequency < 3000));
             out[at + 17] = permission.half_dbm;
             out[at + 18] = permission.half_dbm;
             out[at + 21] = permission.half_dbm;

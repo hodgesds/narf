@@ -22,7 +22,8 @@ impl StationFixture {
 pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
     let fixture = m.station.as_ref().unwrap();
     let phase = fixture.phase;
-    let expected = match (phase, m.inner.inner.dialect) {
+    let dialect = m.inner.inner.dialect;
+    let mut expected = match (phase, dialect) {
         (0, Dialect::Main) => RD_MAIN,
         (0, Dialect::Tlv) => RD_TLV,
         (0, Dialect::TenFour) => RD_104,
@@ -42,8 +43,35 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
         (3, Dialect::TenOne) => PEER_10X,
         (3, _) => PEER_102,
         _ => return Err(BmiError::BadResponse),
-    };
-    if bytes[8..] != *expected {
+    }
+    .to_vec();
+    if m.frequency > 3000 {
+        // Independent source facts for the fixed US factory5GHz profile.
+        // Retain the full reviewed packet and replace only authored fields.
+        let at = if dialect == Dialect::Tlv { 12 } else { 4 };
+        match phase {
+            0 => {
+                for (i, value) in [0x3a, 0x3a, 0x3a, 0x10, 0x10].into_iter().enumerate() {
+                    u32at(&mut expected, at + i * 4, value);
+                }
+            }
+            1 => {
+                u32at(&mut expected, at, 4);
+                u32at(&mut expected, at + 4, 54);
+            }
+            2 => {
+                let chan = if dialect == Dialect::Tlv { 84 } else { 4 };
+                u32at(&mut expected, chan, u32::from(m.frequency));
+                u32at(&mut expected, chan + 4, u32::from(m.frequency));
+                u32at(&mut expected, chan + 12, 0);
+                for offset in [17, 18, 21] {
+                    expected[chan + offset] = 54;
+                }
+            }
+            _ => {}
+        }
+    }
+    if bytes[8..] != expected {
         return Err(BmiError::BadResponse);
     }
     m.sent.push(bytes.to_vec());

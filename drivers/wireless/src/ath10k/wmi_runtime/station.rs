@@ -127,13 +127,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .map_err(plan_error)?
             .ok_or(Error::Malformed)?;
         let capability = u16::from_le_bytes([response[24], response[25]]);
-        let command = mlme::peer(
-            self.wire.dialect,
-            peer.bssid,
+        let associated = StationAssociated {
+            bssid: peer.bssid,
+            frequency: peer.frequency,
             aid,
+            protected: security.is_wpa2(),
+        };
+        let command = mlme::peer_on(
+            self.wire.dialect,
+            associated,
             capability,
             plan.legacy_rates().0,
-            security.is_wpa2(),
         )?;
         let up = mlme::up(self.wire.dialect, peer.bssid, aid)?;
         // Existing failed state precedes both publications and stays retained
@@ -161,12 +165,6 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             match event {
                 htt::Event::Idle => {
-                    let associated = StationAssociated {
-                        bssid: peer.bssid,
-                        frequency: peer.frequency,
-                        aid,
-                        protected: security.is_wpa2(),
-                    };
                     self.peer.as_mut().ok_or(Error::Failed)?.associated = Some(associated);
                     self.failed = false;
                     return Ok(associated);

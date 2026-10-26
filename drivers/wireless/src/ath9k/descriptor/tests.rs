@@ -3,6 +3,62 @@ use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 include!("golden.rs");
 const LOCAL: [u8; 6] = [2, 1, 2, 3, 4, 5];
+fn smoke_ar9285_native_four_series_literals_and_bound_feedback() -> TestResult {
+    let series = Series {
+        rates: [11, 10, 9, 8],
+        tries: [4, 2, 2, 2],
+        basic: 0,
+    };
+    let mut words = match transmit_series(&frame(80, false), LOCAL, 0x12345000, series) {
+        Ok(words) => words,
+        Err(_) => return TestResult::Fail("native MRR encode"),
+    };
+    // Literal ar9002 ctl2/ctl3, four durations, ctl7 and fallback powers.
+    if words[4] != 0x22248000
+        || words[5] != 0x090d080c
+        || words[6] != 0x00340034
+        || words[7] != 0x00440038
+        || words[9] != 0x01b21084
+        || words[11..14] != [0x3f000000; 3]
+    {
+        return TestResult::Fail("native four-series rate/tries/duration/chain/power literals");
+    }
+    words[15] = 1;
+    for (slot, rate) in [11, 10, 9, 8].into_iter().enumerate() {
+        words[TX_DONE] = 1 | ((slot as u32) << 21);
+        if transmit_status(&words, false) != Ok(TxStatus::Delivered)
+            || transmit_feedback(&words)
+                != Ok(Feedback {
+                    rate,
+                    retried: slot != 0,
+                    radio: true,
+                })
+        {
+            return TestResult::Fail("FinalTxIdx misclassified or actual rate lost");
+        }
+    }
+    words[15] = 1 | 0x100;
+    words[TX_DONE] = 1;
+    if !transmit_feedback(&words).unwrap().retried {
+        return TestResult::Fail("native DATA retry count ignored");
+    }
+    words[15] = 4;
+    if transmit_feedback(&words).unwrap().radio {
+        return TestResult::Fail("FIFO underrun treated as RF evidence");
+    }
+    let mut invalid = series;
+    invalid.tries[1] = 0;
+    if transmit_series(&frame(80, false), LOCAL, 0x1000, invalid) != Err(Error::Profile)
+        || transmit_series(&frame(80, true), LOCAL, 0x1000, series) != Err(Error::Profile)
+    {
+        return TestResult::Fail("sparse or broadcast retry chain admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/rates",
+    smoke_ar9285_native_four_series_literals_and_bound_feedback
+);
 fn frame(length: usize, group: bool) -> Vec<u8> {
     let mut bytes = vec![0x59; length];
     bytes[..2].copy_from_slice(&[8, 1]);
@@ -95,10 +151,14 @@ fn check_exact_done_and_native_failure_receipts() -> Result<(), &'static str> {
     {
         return Err("ACK expectation not bound to receiver address");
     }
-    for error in [1 << 17, 1 << 21, 2 << 21, 3 << 21] {
+    words[TX_DONE] = 1 | (1 << 17);
+    if transmit_status(&words, true) != Ok(TxStatus::Failed) {
+        return Err("TXOP failure admitted");
+    }
+    for error in [1 << 21, 2 << 21, 3 << 21] {
         words[TX_DONE] = 1 | error;
-        if transmit_status(&words, true) != Ok(TxStatus::Failed) {
-            return Err("TXOP/fallback admitted");
+        if transmit_status(&words, true) != Err(Error::Status) {
+            return Err("unprogrammed fallback series admitted");
         }
     }
     words[TX_DONE] = u32::MAX;

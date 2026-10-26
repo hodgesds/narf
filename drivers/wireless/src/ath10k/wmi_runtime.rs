@@ -95,6 +95,9 @@ pub(super) struct Radio<T> {
     power_save: Option<bool>,
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    pub(in crate::ath10k) fn configured_channels(&self) -> &[u16] {
+        &self.channels
+    }
     pub fn information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
         self.scan_cache
             .iter()

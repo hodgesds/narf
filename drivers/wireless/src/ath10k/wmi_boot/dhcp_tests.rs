@@ -6,6 +6,19 @@ use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
+fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
+    let mut domain = station_tests::policy();
+    for (low, high) in [(5150, 5350), (5725, 5850)] {
+        domain.rules.push(narf_wireless::reg::RegRule {
+            freq_start_mhz: low,
+            freq_end_mhz: high,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 27,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        });
+    }
+    domain
+}
 type ModelDevice = Device<RadioModel>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
 fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
@@ -22,32 +35,56 @@ struct Harness {
     name: String,
     secured: bool,
     active_scan: bool,
+    frequency: u16,
 }
 impl Harness {
     fn new(version: u32, dialect: Dialect, secured: bool) -> Self {
         Self::new_scan(version, dialect, secured, false)
     }
     fn new_scan(version: u32, dialect: Dialect, secured: bool, active_scan: bool) -> Self {
-        let mut radio = radio_boot_features(
+        Self::new_on(version, dialect, secured, active_scan, 2412, 0x64)
+    }
+    fn new_on(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+    ) -> Self {
+        let mut radio = radio_boot_country(
             version,
             dialect,
             (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
+            3,
+            factory,
         );
+        radio.htt.wmi.htc.transport.frequency = frequency;
         if active_scan {
-            let mut fixture = super::super::active_scan_tests::Fixture::directed(1);
+            let mut fixture = if frequency < 3000 {
+                super::super::active_scan_tests::Fixture::directed(1)
+            } else {
+                super::super::active_scan_tests::Fixture::band_pair(1, frequency)
+            };
             fixture.extra_ies = super::super::active_scan_tests::PROBE_IES.to_vec();
             radio.htt.wmi.htc.transport.active = Some(fixture);
         }
-        assert!(matches!(
-            drive(radio.start(if active_scan {
-                &[2412, 2437, 5180]
-            } else {
-                &[2412, 5180]
-            })),
-            Poll::Ready(Ok(_))
-        ));
+        let pair = [2412, frequency.max(5180)];
+        let configured: &[u16] = if active_scan && frequency < 3000 {
+            &[2412, 2437, 5180]
+        } else {
+            &pair
+        };
+        assert!(matches!(drive(radio.start(configured)), Poll::Ready(Ok(_))));
         let m = &mut radio.htt.wmi.htc.transport;
-        let mut fixture = Fixture::new(secured);
+        let mut fixture = Fixture::on_channel(
+            secured,
+            if frequency < 3000 {
+                ((frequency - 2407) / 5) as u8
+            } else {
+                ((frequency - 5000) / 5) as u8
+            },
+        );
         fixture.automatic = true;
         m.data = Some(fixture);
         let hardware = if dialect == Dialect::Tlv {
@@ -59,7 +96,11 @@ impl Harness {
         };
         m.ce = Some(crate::ath10k::boot::CeFixture::new(hardware));
         let name = String::from(narf_net::iface::reserve_name("wlan%d"));
-        let policy = Arc::new(IrqSafeSpinLock::new(Some(station_tests::policy())));
+        let policy = Arc::new(IrqSafeSpinLock::new(Some(if frequency < 3000 {
+            station_tests::policy()
+        } else {
+            five_ghz_policy()
+        })));
         let current = policy.clone();
         let device = Arc::new(Device::for_test(
             &name,
@@ -79,14 +120,19 @@ impl Harness {
             name,
             secured,
             active_scan,
+            frequency,
         }
     }
     fn request(&self) -> AssociateRequest {
         AssociateRequest {
             bssid: AP,
             ssid: b"narf".to_vec(),
-            frequency_mhz: 2412,
-            channel: 1,
+            frequency_mhz: u32::from(self.frequency),
+            channel: u32::from(if self.frequency < 3000 {
+                (self.frequency - 2407) / 5
+            } else {
+                (self.frequency - 5000) / 5
+            }),
             security: if self.secured {
                 SecurityConfig::Wpa2 { psk: PMK }
             } else {
@@ -98,15 +144,23 @@ impl Harness {
     fn scan(&self) -> Result<(), &'static str> {
         let Poll::Ready(Ok(bss)) = drive(self.device.scan(ScanRequest {
             ssids: vec![b"narf".to_vec()],
-            frequencies_mhz: if self.active_scan {
+            frequencies_mhz: if self.active_scan && self.frequency > 3000 {
+                vec![2412, u32::from(self.frequency)]
+            } else if self.active_scan {
                 vec![2412, 2437]
             } else {
-                vec![2412]
+                vec![u32::from(self.frequency)]
             },
-            channels: if self.active_scan {
+            channels: if self.active_scan && self.frequency > 3000 {
+                vec![1, u32::from((self.frequency - 5000) / 5)]
+            } else if self.active_scan {
                 vec![1, 6]
             } else {
-                vec![1]
+                vec![u32::from(if self.frequency < 3000 {
+                    (self.frequency - 2407) / 5
+                } else {
+                    (self.frequency - 5000) / 5
+                })]
             },
             active: self.active_scan,
             random_mac: None,
@@ -121,7 +175,11 @@ impl Harness {
         })) else {
             return Err("retained Device native scan failed");
         };
-        if bss.len() != 1 || bss[0].bssid != AP || bss[0].frequency_mhz != 2412 {
+        if bss.len() != 1
+            || bss[0].bssid != AP
+            || bss[0].frequency_mhz != u32::from(self.frequency)
+            || bss[0].channel != self.request().channel
+        {
             return Err("retained Device scan identity");
         }
         Ok(())
@@ -162,6 +220,15 @@ impl Harness {
         !self.device.link_up()
             && narf_net::iface::lookup(&self.name).is_some_and(|i| {
                 !i.carrier && i.link_up && i.carrier_up_count == 1 && i.carrier_down_count == 1
+            })
+    }
+    fn never_opened(&self) -> bool {
+        // A denied/cancelled first association must not publish even a
+        // transient carrier. `closed` instead verifies retirement of an
+        // established carrier, which necessarily has one up/down pair.
+        !self.device.link_up()
+            && narf_net::iface::lookup(&self.name).is_some_and(|i| {
+                !i.carrier && i.link_up && i.carrier_up_count == 0 && i.carrier_down_count == 0
             })
     }
     fn received(&self, expected: &[u8]) -> bool {
@@ -396,6 +463,166 @@ fn smoke_ath10k_power_save_native_six_dialects_open_wpa2_dhcp_ip() -> TestResult
     }
     TestResult::Pass
 }
+const BAND_DIALECTS: [(u32, Dialect); 6] = [
+    (1, Dialect::Main),
+    (2, Dialect::TenOne),
+    (3, Dialect::TenTwo),
+    (4, Dialect::Tlv),
+    (5, Dialect::TenTwoFour),
+    (6, Dialect::TenFour),
+];
+fn smoke_ath10k_fixed_country_5ghz_native_open_wpa2_dhcp_ip() -> TestResult {
+    for (version, dialect) in BAND_DIALECTS {
+        for frequency in [5180, 5825] {
+            for secured in [false, true] {
+                if let Err(error) =
+                    composition_on(version, dialect, secured, false, true, frequency)
+                {
+                    return TestResult::Fail(error);
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/5ghz",
+    smoke_ath10k_fixed_country_5ghz_native_open_wpa2_dhcp_ip
+);
+fn smoke_ath10k_mixed_band_active_scan_native_limits_and_join() -> TestResult {
+    for (version, dialect) in BAND_DIALECTS {
+        for frequency in [5180, 5825] {
+            for secured in [false, true] {
+                if let Err(error) =
+                    composition_on(version, dialect, secured, true, false, frequency)
+                {
+                    return TestResult::Fail(error);
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/5ghz",
+    smoke_ath10k_mixed_band_active_scan_native_limits_and_join
+);
+fn smoke_ath10k_5ghz_factory_world_and_country_mismatch_never_emit() -> TestResult {
+    for factory in [0x64, 0x8114, 0xffff] {
+        let h = Harness::new_on(4, Dialect::Tlv, true, false, 5180, factory);
+        if let Err(error) = h.scan() {
+            return TestResult::Fail(error);
+        }
+        let before = h.model(|m| m.sent.len());
+        if !matches!(
+            drive(h.device.associate_for_test(h.request(), [0x73; 32])),
+            Poll::Ready(Err(_))
+        ) || !h.never_opened()
+            || h.model(|m| m.sent.len()) != before
+        {
+            return TestResult::Fail("world/country-mismatched factory5GHz acquired native TX");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/5ghz",
+    smoke_ath10k_5ghz_factory_world_and_country_mismatch_never_emit
+);
+fn smoke_ath10k_5ghz_policy_overlap_and_live_restriction_are_terminal() -> TestResult {
+    use narf_wireless::reg::RegFlags;
+    for case in 0..8 {
+        let h = Harness::new_on(4, Dialect::Tlv, false, false, 5180, 0x8348);
+        if let Err(error) = h.scan() {
+            return TestResult::Fail(error);
+        }
+        let before = h.model(|m| m.sent.len());
+        {
+            let mut p = h.policy.lock();
+            let domain = p.as_mut().unwrap();
+            match case {
+                0 => domain.rules[1].flags = RegFlags::NO_IR,
+                1 => domain.rules[1].flags = RegFlags::DFS,
+                2 => domain.rules[1].flags = RegFlags::INDOOR_ONLY,
+                3 => domain.rules[1].max_bandwidth_mhz = 10,
+                4 => domain.rules[1].max_power_dbm = -1,
+                5 => domain.rules[1].freq_start_mhz = 5175,
+                6 => domain.country_code = *b"DE",
+                _ => domain.rules.push(narf_wireless::reg::RegRule {
+                    freq_start_mhz: 5181,
+                    freq_end_mhz: 5184,
+                    max_bandwidth_mhz: 20,
+                    max_power_dbm: 30,
+                    flags: RegFlags::NO_IR,
+                }),
+            }
+        }
+        if !matches!(
+            drive(h.device.associate_for_test(h.request(), [0x73; 32])),
+            Poll::Ready(Err(_))
+        ) || !h.never_opened()
+            || h.model(|m| m.sent.len()) != before
+        {
+            return TestResult::Fail("5GHz restrictive overlapping rule was ignored");
+        }
+    }
+    for clear in [false, true] {
+        let h = Harness::new_on(4, Dialect::Tlv, true, false, 5180, 0x8348);
+        if let Err(error) = h.join() {
+            return TestResult::Fail(error);
+        }
+        if clear {
+            *h.policy.lock() = None;
+        } else {
+            h.policy.lock().as_mut().unwrap().rules[1].max_power_dbm = 26;
+        }
+        let before = h.model(|m| m.sent.len());
+        h.pump();
+        *h.policy.lock() = Some(five_ghz_policy());
+        if !h.closed()
+            || h.model(|m| m.sent.len()) != before
+            || h.device.request_power_save(false) != Err(-19)
+        {
+            return TestResult::Fail("5GHz live restriction or reinstallation reopened host");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/5ghz",
+    smoke_ath10k_5ghz_policy_overlap_and_live_restriction_are_terminal
+);
+fn smoke_ath10k_5ghz_each_native_prepare_cancel_retains_dma() -> TestResult {
+    for phase in 0..4 {
+        let h = Harness::new_on(4, Dialect::Tlv, true, false, 5180, 0x8348);
+        if let Err(error) = h.scan() {
+            return TestResult::Fail(error);
+        }
+        h.model(|m| {
+            let mut station = StationFixture::new();
+            station.stall = Some(phase);
+            m.station = Some(station);
+        });
+        if !drive(h.device.associate_for_test(h.request(), [0x73; 32])).is_pending() {
+            return TestResult::Fail(
+                "5GHz native prepare failed/completed instead of held publication",
+            );
+        }
+        if !h.never_opened() {
+            return TestResult::Fail("5GHz cancelled prepare reopened carrier");
+        }
+        if !h.model(|m| {
+            m.inner.inner.retained.is_some() && m.inner.storage.as_ref().unwrap().filled == 1023
+        }) {
+            return TestResult::Fail("5GHz cancelled native prepare reopened/freed DMA");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/5ghz",
+    smoke_ath10k_5ghz_each_native_prepare_cancel_retains_dma
+);
 kernel_test_in!(
     "drivers/wireless/ath10k/power-save",
     smoke_ath10k_power_save_native_six_dialects_open_wpa2_dhcp_ip
@@ -610,7 +837,24 @@ fn composition_options(
     active_scan: bool,
     power_save: bool,
 ) -> Result<(), &'static str> {
-    let h = Harness::new_scan(version, dialect, secured, active_scan);
+    composition_on(version, dialect, secured, active_scan, power_save, 2412)
+}
+fn composition_on(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    active_scan: bool,
+    power_save: bool,
+    frequency: u16,
+) -> Result<(), &'static str> {
+    let h = Harness::new_on(
+        version,
+        dialect,
+        secured,
+        active_scan,
+        frequency,
+        if frequency < 3000 { 0x64 } else { 0x8348 },
+    );
     if power_save {
         h.model(|model| {
             model.ps = Some(super::super::power_save_tests::Fixture::new(dialect, true))

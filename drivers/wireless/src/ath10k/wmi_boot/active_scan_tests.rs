@@ -29,6 +29,9 @@ pub(super) struct Fixture {
     started: bool,
     stopped: bool,
     started_signal: Arc<AtomicBool>,
+    pub(super) frequencies: [u16; 2],
+    pub(super) receive: Vec<u16>,
+    pub(super) fixed_country: bool,
 }
 impl Fixture {
     pub(super) fn new(sequence: u16) -> Self {
@@ -46,11 +49,22 @@ impl Fixture {
             started: false,
             stopped: false,
             started_signal: Arc::new(AtomicBool::new(false)),
+            frequencies: [2412, 2437],
+            receive: vec![2412, 2437, 5180],
+            fixed_country: false,
         }
     }
     pub(super) fn directed(sequence: u16) -> Self {
         let mut fixture = Self::new(sequence);
         fixture.ssids.pop();
+        fixture
+    }
+    pub(super) fn band_pair(sequence: u16, frequency: u16) -> Self {
+        let mut fixture = Self::directed(sequence);
+        fixture.frequencies = [2412, frequency];
+        fixture.receive = vec![2412, frequency];
+        fixture.limits = [34, 54];
+        fixture.fixed_country = true;
         fixture
     }
 }
@@ -73,7 +87,7 @@ const DIALECTS: [(u32, Dialect); 6] = [
 fn packet_word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
-fn channels(dialect: Dialect, limits: [u8; 2]) -> Vec<u8> {
+fn channels(dialect: Dialect, limits: [u8; 2], frequencies: [u16; 2]) -> Vec<u8> {
     let mut out = match dialect {
         Dialect::Main => CHANNELS_MAIN,
         Dialect::Tlv => CHANNELS_TLV,
@@ -85,10 +99,10 @@ fn channels(dialect: Dialect, limits: [u8; 2]) -> Vec<u8> {
     } else {
         (8, 24)
     };
-    for (frequency, half_dbm) in [(2412, limits[0]), (2437, limits[1])] {
-        u32at(&mut out, at, frequency);
-        u32at(&mut out, at + 4, frequency);
-        u32at(&mut out, at + 12, 1);
+    for (frequency, half_dbm) in [(frequencies[0], limits[0]), (frequencies[1], limits[1])] {
+        u32at(&mut out, at, u32::from(frequency));
+        u32at(&mut out, at + 4, u32::from(frequency));
+        u32at(&mut out, at + 12, u32::from(frequency < 3000));
         out[at + 17] = half_dbm;
         out[at + 18] = half_dbm;
         out[at + 21] = half_dbm;
@@ -96,7 +110,13 @@ fn channels(dialect: Dialect, limits: [u8; 2]) -> Vec<u8> {
     }
     out
 }
-fn scan(dialect: Dialect, sequence: u16, ssids: &[Vec<u8>], ies: &[u8]) -> Vec<u8> {
+fn scan(
+    dialect: Dialect,
+    sequence: u16,
+    ssids: &[Vec<u8>],
+    ies: &[u8],
+    frequencies: [u16; 2],
+) -> Vec<u8> {
     let mut out = match dialect {
         Dialect::Main => SCAN_MAIN,
         Dialect::Tlv => SCAN_TLV,
@@ -116,7 +136,8 @@ fn scan(dialect: Dialect, sequence: u16, ssids: &[Vec<u8>], ies: &[u8]) -> Vec<u
         if dialect == Dialect::Tlv { 0x5c } else { 0x7c },
     );
     let channels = base + common + if dialect == Dialect::Tlv { 4 } else { 8 };
-    u32at(&mut out, channels + 4, 2437);
+    u32at(&mut out, channels, u32::from(frequencies[0]));
+    u32at(&mut out, channels + 4, u32::from(frequencies[1]));
     let mut names = Vec::new();
     if dialect == Dialect::Tlv {
         u32at(&mut out, base + 72, ssids.len() as u32);
@@ -183,24 +204,29 @@ fn restore(dialect: Dialect) -> &'static [u8] {
         _ => CHANNELS_10X,
     }
 }
-pub(super) fn receive_channels(dialect: Dialect) -> Vec<u8> {
+pub(super) fn receive_on(dialect: Dialect, frequencies: &[u16]) -> Vec<u8> {
     let mut out = restore(dialect).to_vec();
     let (base, stride) = if dialect == Dialect::Tlv {
         (20, 28)
     } else {
         (8, 24)
     };
-    let last = out[out.len() - stride..].to_vec();
-    out.extend_from_slice(&last);
-    if dialect == Dialect::Tlv {
-        u32at(&mut out, 8, 3);
-        u32at(&mut out, 12, (18 << 16) | 84);
-    } else {
-        u32at(&mut out, 4, 3);
+    let prefix = if dialect == Dialect::Tlv { 16 } else { base };
+    let first = out[prefix..prefix + stride].to_vec();
+    out.truncate(prefix);
+    for frequency in frequencies {
+        out.extend_from_slice(&first);
+        let at = out.len() - stride + usize::from(dialect == Dialect::Tlv) * 4;
+        u32at(&mut out, at, u32::from(*frequency));
+        u32at(&mut out, at + 4, u32::from(*frequency));
+        u32at(&mut out, at + 12, 0x80 | u32::from(*frequency < 3000));
     }
-    u32at(&mut out, base + stride, 2437);
-    u32at(&mut out, base + stride + 4, 2437);
-    u32at(&mut out, base + stride + 12, 0x81);
+    if dialect == Dialect::Tlv {
+        u32at(&mut out, 8, frequencies.len() as u32);
+        u32at(&mut out, 12, (18 << 16) | (28 * frequencies.len()) as u32);
+    } else {
+        u32at(&mut out, 4, frequencies.len() as u32);
+    }
     out
 }
 fn credit(m: &mut RadioModel, bytes: &[u8]) {
@@ -230,18 +256,21 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
     let dialect = m.inner.inner.dialect;
     let fixture = m.active.as_mut().unwrap();
     let step = fixture.step;
+    let mixed = (fixture.frequencies[0] < 3000) != (fixture.frequencies[1] < 3000);
+    let scan_step = if mixed { 4 } else { 3 };
     let stopping = bytes[8..] == stop(dialect, fixture.sequence);
-    let starting = step == 3 && !stopping && !fixture.stopped;
+    let starting = step == scan_step && !stopping && !fixture.stopped;
     let expected = if stopping {
         fixture.stopped = true;
         fixture.done = false;
         stop(dialect, fixture.sequence)
-    } else if fixture.stopped || step == 4 {
+    } else if fixture.stopped || step == scan_step + 1 {
         fixture.done = true;
-        receive_channels(dialect)
+        receive_on(dialect, &fixture.receive)
     } else {
         fixture.step += 1;
-        match step {
+        let logical = if mixed && step >= 3 { step - 1 } else { step };
+        let mut expected = match logical {
             0 => match dialect {
                 Dialect::Main => RD_MAIN,
                 Dialect::TenOne => RD_10X,
@@ -260,10 +289,32 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
                 }
                 .to_vec();
                 let at = power.len() - 4;
-                u32at(&mut power, at, u32::from(fixture.global));
+                u32at(
+                    &mut power,
+                    at,
+                    u32::from(if fixture.fixed_country {
+                        fixture.limits[0]
+                    } else {
+                        fixture.global
+                    }),
+                );
                 power
             }
-            2 => channels(dialect, fixture.limits),
+            2 if mixed && step == 2 => {
+                let mut power = match dialect {
+                    Dialect::Main => POWER_MAIN,
+                    Dialect::Tlv => POWER_TLV,
+                    Dialect::TenFour => POWER_104,
+                    Dialect::TenOne => POWER_10X,
+                    _ => POWER_102,
+                }
+                .to_vec();
+                let at = power.len() - 8;
+                u32at(&mut power, at, 4);
+                u32at(&mut power, at + 4, u32::from(fixture.limits[1]));
+                power
+            }
+            2 => channels(dialect, fixture.limits, fixture.frequencies),
             3 => {
                 fixture.started = true;
                 fixture.started_signal.store(true, Ordering::Release);
@@ -272,10 +323,18 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
                     fixture.sequence,
                     &fixture.ssids,
                     &fixture.extra_ies,
+                    fixture.frequencies,
                 )
             }
             _ => return Err(BmiError::BadResponse),
+        };
+        if logical == 0 && fixture.fixed_country {
+            let at = if dialect == Dialect::Tlv { 12 } else { 4 };
+            for (i, value) in [0x3a, 0x3a, 0x3a, 0x10, 0x10].into_iter().enumerate() {
+                u32at(&mut expected, at + i * 4, value);
+            }
         }
+        expected
     };
     if bytes[8..] != expected {
         return Err(BmiError::BadResponse);

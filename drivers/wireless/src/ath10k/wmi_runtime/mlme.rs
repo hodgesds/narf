@@ -13,6 +13,7 @@ pub struct Associated {
     pub protected: bool,
 }
 
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn peer(
     dialect: Dialect,
     bssid: [u8; 6],
@@ -21,6 +22,30 @@ pub(super) fn peer(
     rates: u16,
     protected: bool,
 ) -> Result<Vec<u8>, Error> {
+    peer_on(
+        dialect,
+        Associated {
+            bssid,
+            aid,
+            frequency: 2412,
+            protected,
+        },
+        capabilities,
+        rates,
+    )
+}
+pub(super) fn peer_on(
+    dialect: Dialect,
+    associated: Associated,
+    capabilities: u16,
+    rates: u16,
+) -> Result<Vec<u8>, Error> {
+    let Associated {
+        bssid,
+        aid,
+        frequency,
+        protected,
+    } = associated;
     if bssid == [0; 6]
         || bssid[0] & 1 != 0
         || !(1..=2007).contains(&aid)
@@ -28,6 +53,8 @@ pub(super) fn peer(
         || rates & !0xfff != 0
         || capabilities & 3 != 1
         || (capabilities & 16 != 0) != protected
+        || !crate::ath10k::regulatory::Permission::profile_frequency(frequency)
+        || frequency > 3000 && rates & 15 != 0
     {
         return Err(Error::Malformed);
     }
@@ -59,7 +86,13 @@ pub(super) fn peer(
     wire::put(&mut out, at + 20, 1 | if protected { 4 } else { 0 });
     wire::put(&mut out, at + 24, u32::from(capabilities));
     wire::put(&mut out, at + 28, 1); // Linux STA listen-interval workaround.
-    let mode = if rates & !15 != 0 { 1 } else { 2 }; // 11G / 11B
+    let mode = if frequency > 3000 {
+        0
+    } else if rates & !15 != 0 {
+        1
+    } else {
+        2
+    }; // 11A/G/B
     if tlv {
         wire::put(&mut out, at + 48, 1); // one spatial stream, no HT/VHT
         wire::put(&mut out, at + 56, mode);

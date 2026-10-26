@@ -108,16 +108,22 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         for &frequency in channels {
             permissions.push(permission(caps, domain, frequency)?);
         }
-        let mut global = *permissions.first().ok_or(Error::Unsupported)?;
-        global.half_dbm = permissions
-            .iter()
-            .map(|p| p.half_dbm)
-            .min()
-            .ok_or(Error::Unsupported)?;
+        let global = *permissions.first().ok_or(Error::Unsupported)?;
         let mut setup = Vec::new();
-        setup.try_reserve_exact(3).map_err(|_| Error::NoMemory)?;
+        setup.try_reserve_exact(4).map_err(|_| Error::NoMemory)?;
         setup.push(self.wire.domain(global)?);
-        setup.push(self.wire.power(global)?);
+        // Both native per-band limits precede a mixed-band active request.
+        // A low-power2GHz channel cannot accidentally program only2G while
+        // probes on5GHz inherit an unrelated firmware default.
+        for two_ghz in [true, false] {
+            if let Some(permission) = permissions
+                .iter()
+                .filter(|p| (p.frequency < 3000) == two_ghz)
+                .min_by_key(|p| p.half_dbm)
+            {
+                setup.push(self.wire.power(*permission)?);
+            }
+        }
         setup.push(self.wire.active_channels(&permissions)?);
         let restore = self.wire.channels(&self.channels)?;
         let mut names = Vec::new();

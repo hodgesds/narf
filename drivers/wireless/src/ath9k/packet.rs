@@ -199,6 +199,7 @@ pub(super) struct Delivery {
     pub id: u64,
     pub delivered: bool,
     pub bytes: Vec<u8>,
+    pub feedback: super::rates::Feedback,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ReceiveStep {
@@ -356,6 +357,26 @@ impl<P: Port> Packet<P> {
         Ok(())
     }
     pub(super) fn submit(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
+        let local = self.local;
+        self.submit_inner(frame, |address| {
+            descriptor::transmit(frame, local, address, rate)
+        })
+    }
+    pub(super) fn submit_rates(
+        &mut self,
+        frame: &[u8],
+        series: super::rates::Series,
+    ) -> Result<u64, Error> {
+        let local = self.local;
+        self.submit_inner(frame, |address| {
+            descriptor::transmit_series(frame, local, address, series)
+        })
+    }
+    fn submit_inner(
+        &mut self,
+        frame: &[u8],
+        encode: impl FnOnce(u64) -> Result<[u32; WORDS], descriptor::Error>,
+    ) -> Result<u64, Error> {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
@@ -364,13 +385,8 @@ impl<P: Port> Packet<P> {
         }
         let slot = self.next_tx;
         let storage = self.storage.as_ref().ok_or(Error::State)?;
-        let words = descriptor::transmit(
-            frame,
-            self.local,
-            u64::from(storage.tx_bytes[slot].address()),
-            rate,
-        )
-        .map_err(|_| Error::Packet)?;
+        let words =
+            encode(u64::from(storage.tx_bytes[slot].address())).map_err(|_| Error::Packet)?;
         self.phase = Phase::Failed;
         self.port.transmit_allowed()?;
         if self.port.read(QTXE)? & 1 != 0 || self.port.read(QSTS)? & 3 != 0 {
@@ -456,6 +472,7 @@ impl<P: Port> Packet<P> {
                 id: pending.id,
                 delivered: result == TxStatus::Delivered,
                 bytes: storage.tx_bytes[pending.slot].bytes(pending.length)?,
+                feedback: descriptor::transmit_feedback(&words).map_err(|_| Error::Descriptor)?,
             }))
         })?;
         if delivery.is_some() {

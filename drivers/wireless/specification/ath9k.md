@@ -74,12 +74,25 @@ AR9285-specific writes follow a checked silicon revision.
   PCI capability invocation. Unsupported per-domain IOMMU mappings are refused.
 - The retained `station::Radio` and its `interface::Device` implement the
   public wireless/netdev paths without replacing the packet owner. The initial
-  profile is channel1/2412MHz, 20MHz, legacy basic1Mbps, Open or
+  profile is channel1/2412MHz, 20MHz, negotiated legacy CCK/OFDM, Open or
   WPA2-PSK/CCMP with host MLME/RSNA/crypto. Entropy failure rejects authentication.
   Original observed RSN/RSNX bodies reach shared security admission. Carrier,
   controlled-port state and exact native terminal TX receipts precede kernel
   DHCP and Ethernet/IP delivery. The exact transmitted M4 bytes must match
   the retained reply before key/port commit.
+- Legacy DATA rates cover the actual association-response intersection from
+  1 to 54 Mbps. Management/EAPOL use the lowest negotiated basic bitrate;
+  probe requests retain their driver-owned 1 Mbps discovery rate. Bitmap
+  order is never substituted for bitrate order (OFDM6/9 lie below CCK11).
+  Unicast DATA programs up to four distinct descending native retry series,
+  per-series packet durations, single-chain selectors and factory-limited
+  power fields. Only exact terminal descriptor/queue-idle receipts train the
+  retained adaptive controller. A native fallback selects the actual final
+  rate, failure lowers it and eight clean native DATA receipts probe the next
+  supported bitrate. FIFO/filter/descriptor/TXOP conditions supply no RF-rate
+  evidence. Invalid/unprogrammed FinalTxIdx or modified descriptors close the
+  owner; pending/RX/security receipts cannot train it. This provides no HT,
+  aggregation or performance measurement claim.
 - The facade advertises four active-scan SSIDs and no caller probe IEs.
   Directed binary SSIDs and wildcard discovery use actual broadcast Probe
   Requests through the same calibrated descriptor/DMA owner. Empty active
@@ -244,7 +257,7 @@ device, authenticated deployment policy and measured RF/calibration acceptance.
 No RF or AP interoperability has been demonstrated by the model tests.
 
 Broader live channels/retuning, factory profiles, periodic calibration,
-interrupt-driven operation, aggregation/rate control and power transitions
+interrupt-driven operation, HT/aggregation and power transitions
 require separate continuations. Reset/rejoin, removal and DMA reclamation need
 an independently proved generation/reset owner; the initial profile retains
 storage and requires a fresh lifecycle after terminal closure.

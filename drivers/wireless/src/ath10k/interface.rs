@@ -7,7 +7,7 @@ use super::{
     wmi_boot::HostMemory,
     wmi_runtime::{self, Radio},
 };
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
@@ -54,6 +54,7 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     generation: u64,
     ps_supported: bool,
     ps_request: AtomicU8,
+    frequencies: Vec<u16>,
     mac: [u8; 6],
     policy: Policy,
     up: AtomicBool,
@@ -100,8 +101,16 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         mac: [u8; 6],
         radio: Arc<Mutex<Radio<T>>>,
         ps_supported: bool,
+        frequencies: Vec<u16>,
     ) -> Self {
-        Self::with_policy(name, mac, radio, Policy::Installed, ps_supported)
+        Self::with_policy(
+            name,
+            mac,
+            radio,
+            Policy::Installed,
+            ps_supported,
+            frequencies,
+        )
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn for_test(
@@ -113,12 +122,17 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         let ps_supported = radio
             .try_lock()
             .is_some_and(|radio| radio.power_save_supported());
+        let frequencies = radio
+            .try_lock()
+            .map(|radio| radio.configured_channels().to_vec())
+            .unwrap_or_default();
         Self::with_policy(
             name,
             mac,
             radio,
             Policy::Model(Arc::new(current)),
             ps_supported,
+            frequencies,
         )
     }
     fn with_policy(
@@ -127,6 +141,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         radio: Arc<Mutex<Radio<T>>>,
         policy: Policy,
         ps_supported: bool,
+        frequencies: Vec<u16>,
     ) -> Self {
         let (rx, consumer) = narf_ipc::channel();
         let (producer, tx) = narf_ipc::channel();
@@ -139,6 +154,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             }),
             name: name.into(),
             ps_supported,
+            frequencies,
             // Submit the advertised awake default before first carrier.
             ps_request: AtomicU8::new(u8::from(ps_supported)),
             generation: NEXT_GENERATION
@@ -416,11 +432,6 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 .map_err(|_| error(Error::NoMemory))?;
             request.ssids.push(Vec::new());
         }
-        if request.frequencies_mhz.is_empty()
-            && request.channels.iter().any(|ch| !(1..=11).contains(ch))
-        {
-            return Err(WirelessError::NotSupported);
-        }
         let implicit = request.frequencies_mhz.is_empty() && request.channels.is_empty();
         let mut frequencies = if !request.frequencies_mhz.is_empty() {
             request
@@ -432,15 +443,22 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             request
                 .channels
                 .iter()
-                .map(|ch| u16::try_from(2407 + ch * 5).map_err(|_| WirelessError::InvalidArgs))
+                .map(|ch| {
+                    u8::try_from(*ch)
+                        .ok()
+                        .and_then(narf_wireless::association::channel::frequency)
+                        .and_then(|f| u16::try_from(f).ok())
+                        .ok_or(WirelessError::InvalidArgs)
+                })
                 .collect::<Result<Vec<_>, _>>()?
         } else {
-            (2412..=2462).step_by(5).collect()
+            self.frequencies.clone()
         };
         if frequencies.is_empty()
-            || frequencies
-                .iter()
-                .any(|f| !(2412..=2462).contains(f) || (f - 2412) % 5 != 0)
+            || frequencies.iter().any(|f| {
+                !super::regulatory::Permission::profile_frequency(*f)
+                    || !self.frequencies.contains(f)
+            })
         {
             return Err(WirelessError::NotSupported);
         }
@@ -452,8 +470,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             return Err(WirelessError::HardwareError);
         }
         let domain = self.policy.current().map_err(error)?;
-        if request.active && implicit {
-            frequencies.retain(|f| radio.active_frequency_allowed(&domain, *f));
+        if implicit {
+            frequencies.retain(|f| {
+                receive_permission(&domain, &[*f]).is_ok()
+                    && (!request.active || radio.active_frequency_allowed(&domain, *f))
+            });
         }
         receive_permission(&domain, &frequencies).map_err(error)?;
         let active = if request.active {
@@ -495,7 +516,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 BssInfo {
                     bssid: b.bssid,
                     ssid: b.ssid,
-                    channel: u32::from((b.frequency - 2407) / 5),
+                    channel: narf_wireless::association::channel::from_frequency(u32::from(
+                        b.frequency,
+                    ))
+                    .map(u32::from)
+                    .unwrap_or(0),
                     frequency_mhz: u32::from(b.frequency),
                     rssi: i8::MIN,
                     security: if secured {
@@ -537,8 +562,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         if self.up.load(Ordering::Acquire) {
             return Err(WirelessError::Busy);
         }
-        if !(1..=11).contains(&request.channel)
-            || request.frequency_mhz != 2407 + request.channel * 5
+        if u16::try_from(request.frequency_mhz).ok().is_none_or(|f| {
+            !super::regulatory::Permission::profile_frequency(f) || !self.frequencies.contains(&f)
+        }) || narf_wireless::association::channel::from_frequency(request.frequency_mhz)
+            .map(u32::from)
+            != Some(request.channel)
         {
             return Err(WirelessError::NotSupported);
         }
@@ -744,6 +772,7 @@ fn publish_with_mac(
     mac: [u8; 6],
     quarantine: &AtomicBool,
     ps_supported: bool,
+    frequencies: Vec<u16>,
 ) -> Result<Arc<Native>, Error> {
     narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
     let authority = narf_net::trusted_net_authority()
@@ -755,7 +784,7 @@ fn publish_with_mac(
             return Err(Error::Failed);
         }
         let name = narf_net::iface::reserve_name("wlan%d");
-        let device = Arc::new(Device::new(name, mac, radio, ps_supported));
+        let device = Arc::new(Device::new(name, mac, radio, ps_supported, frequencies));
         narf_net::registry()
             .register(&authority, Registered(device.clone()))
             .map_err(|_| Error::Unsupported)?;
@@ -796,7 +825,17 @@ pub(super) fn publish(
 ) -> Result<Arc<Native>, Error> {
     let r = radio.try_lock().ok_or(Error::Failed)?;
     let mac = r.station_publishable()?;
-    let result = publish_with_mac(radio.clone(), mac, &quarantine, r.power_save_supported());
+    let result = publish_with_mac(
+        radio.clone(),
+        mac,
+        &quarantine,
+        r.power_save_supported(),
+        r.configured_channels()
+            .iter()
+            .copied()
+            .filter(|f| super::regulatory::Permission::profile_frequency(*f))
+            .collect(),
+    );
     drop(r);
     result
 }
@@ -819,8 +858,17 @@ pub(super) async fn wait_publish(
             Admission::Ready => {
                 let r = radio.lock().await;
                 let mac = r.station_publishable()?;
-                let result =
-                    publish_with_mac(radio.clone(), mac, &quarantine, r.power_save_supported());
+                let result = publish_with_mac(
+                    radio.clone(),
+                    mac,
+                    &quarantine,
+                    r.power_save_supported(),
+                    r.configured_channels()
+                        .iter()
+                        .copied()
+                        .filter(|f| super::regulatory::Permission::profile_frequency(*f))
+                        .collect(),
+                );
                 drop(r);
                 return result;
             }
@@ -866,10 +914,28 @@ impl WirelessNetIface for Native {
         WirelessIfaceInfo {
             base_name: self.name.clone(),
             base_mac: self.mac,
-            bands: vec![WirelessBand {
-                freq_mhz: 2400,
-                channels: (1..=11).collect(),
-            }],
+            bands: [2400, 5000]
+                .into_iter()
+                .filter_map(|band| {
+                    let channels: Vec<u32> = self
+                        .frequencies
+                        .iter()
+                        .copied()
+                        .filter(|f| {
+                            super::regulatory::Permission::profile_frequency(*f)
+                                && (*f < 3000) == (band == 2400)
+                        })
+                        .filter_map(|f| {
+                            narf_wireless::association::channel::from_frequency(u32::from(f))
+                                .map(u32::from)
+                        })
+                        .collect();
+                    (!channels.is_empty()).then_some(WirelessBand {
+                        freq_mhz: band,
+                        channels,
+                    })
+                })
+                .collect(),
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
                 ht_supported: false,

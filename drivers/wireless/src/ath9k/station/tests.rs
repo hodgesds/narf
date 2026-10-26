@@ -77,7 +77,7 @@ pub(in crate::ath9k) struct Peer {
     pub(in crate::ath9k) hold_data: bool,
 }
 impl Peer {
-    pub(in crate::ath9k) fn new(protected: bool) -> Self {
+    pub(in crate::ath9k) fn new_rates(protected: bool, rates: Option<&[u8]>) -> Self {
         let plan = NetworkPlan {
             station: OWN,
             bssid: AP,
@@ -91,9 +91,12 @@ impl Peer {
         } else {
             FakeAp::open(plan, SSID, 1, 42)
         }
-        .unwrap()
-        .with_basic_1mbps()
         .unwrap();
+        let ap = if let Some(rates) = rates {
+            ap.with_legacy_rates(rates).unwrap()
+        } else {
+            ap.with_basic_1mbps().unwrap()
+        };
         Self {
             ap,
             plan,
@@ -234,8 +237,14 @@ pub(in crate::ath9k) struct Fixture {
     pub plan: NetworkPlan,
 }
 pub(in crate::ath9k) fn fixture(protected: bool) -> Result<Fixture, &'static str> {
+    fixture_rates(protected, None)
+}
+pub(in crate::ath9k) fn fixture_rates(
+    protected: bool,
+    rates: Option<&[u8]>,
+) -> Result<Fixture, &'static str> {
     let model = Model::new();
-    let peer = Arc::new(IrqSafeSpinLock::new(Peer::new(protected)));
+    let peer = Arc::new(IrqSafeSpinLock::new(Peer::new_rates(protected, rates)));
     let plan = peer.lock().plan;
     let reacting = peer.clone();
     *model.reaction.borrow_mut() = Some(Arc::new(move |bytes| {
@@ -322,6 +331,77 @@ fn conversation() -> Result<(), &'static str> {
     }
     Ok(())
 }
+
+fn smoke_ar9285_native_rate_feedback_binds_exact_dma_and_peer_subset() -> TestResult {
+    const RATES: &[u8] = &[0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    for protected in [false, true] {
+        let mut f = fixture_rates(protected, Some(RATES)).unwrap();
+        if complete(
+            f.radio
+                .associate(AP, SSID, protected.then(|| Zeroizing::new(PMK)), &[]),
+        )
+        .is_err()
+        {
+            return TestResult::Fail("rich-rate native association");
+        }
+        let ethernet = udp_ipv4(
+            AP,
+            f.plan.station,
+            f.plan.lease_ip,
+            f.plan.server_ip,
+            4001,
+            4002,
+            b"native MRR receipt",
+        );
+        f.peer.lock().hold_data = true;
+        if f.radio.send(&ethernet).is_err() {
+            return TestResult::Fail("native rich-rate DATA send");
+        }
+        let descriptor = f.model.tx.get().unwrap();
+        if f.model.word(descriptor + 16) != Ok(0x22248000)
+            || f.model.word(descriptor + 20) != Ok(0x090d080c)
+            || f.peer.lock().uplink.last() != Some(&ethernet)
+        {
+            return TestResult::Fail(
+                "actual DMA retry chain or independently decrypted peer payload",
+            );
+        }
+        let before = f.radio.rates.unwrap().series();
+        if f.radio.poll().is_err() || f.radio.rates.unwrap().series() != before {
+            return TestResult::Fail("pending native DATA trained rate policy");
+        }
+        f.model.complete(true).unwrap();
+        f.model.put(descriptor + 92, 1 | (2 << 21)).unwrap();
+        if f.radio.poll().is_err() || f.radio.rates.unwrap().series().rates[0] != 9 {
+            return TestResult::Fail("actual native terminal fallback was ignored");
+        }
+        f.peer.lock().hold_data = false;
+        for _ in 0..8 {
+            if f.radio.send(&ethernet).is_err() || f.radio.poll().is_err() {
+                return TestResult::Fail("real native clean DATA receipts");
+            }
+        }
+        if f.radio.rates.unwrap().series().rates[0] != 10 {
+            return TestResult::Fail("native clean receipts did not recover bitrate");
+        }
+        f.peer.lock().hold_data = true;
+        if f.radio.send(&ethernet).is_err() {
+            return TestResult::Fail("held rate publication");
+        }
+        let descriptor = f.model.tx.get().unwrap();
+        f.model.complete(true).unwrap();
+        // Disabled/foreign rate series cannot free/reopen the packet owner.
+        f.model.put(descriptor + 16, 0x00048000).unwrap();
+        if f.radio.poll().is_ok() || f.radio.phase() != Phase::Failed || f.radio.peer().is_some() {
+            return TestResult::Fail("changed native retry descriptor revived station");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/rates",
+    smoke_ar9285_native_rate_feedback_binds_exact_dma_and_peer_subset
+);
 
 fn smoke_ar9285_active_probes_exact_native_dma_and_probe_cache_open_wpa2() -> TestResult {
     for protected in [false, true] {

@@ -70,10 +70,13 @@ impl core::fmt::Debug for Fixture {
 }
 impl Fixture {
     fn new(secured: bool) -> Self {
+        Self::on_channel(secured, 1)
+    }
+    fn on_channel(secured: bool, channel: u8) -> Self {
         let ap = if secured {
-            FakeAp::wpa2(network(), b"narf", 1, 7, PMK, ANONCE)
+            FakeAp::wpa2(network(), b"narf", channel, 7, PMK, ANONCE)
         } else {
-            FakeAp::open(network(), b"narf", 1, 7)
+            FakeAp::open(network(), b"narf", channel, 7)
         }
         .unwrap();
         Self {
@@ -283,7 +286,11 @@ pub(super) fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
         }
         let count = at + if dialect == Dialect::Tlv { 68 } else { 48 };
         let rates = count + if dialect == Dialect::Tlv { 12 } else { 4 };
-        if word(count) != 3 || command[rates..rates + 3] != [12, 24, 48] {
+        let phy = at + if dialect == Dialect::Tlv { 56 } else { 328 };
+        if word(count) != 3
+            || command[rates..rates + 3] != [12, 24, 48]
+            || word(phy) != u32::from(m.frequency < 3000)
+        {
             return Err(BmiError::BadResponse);
         }
     } else if phase == 3 {

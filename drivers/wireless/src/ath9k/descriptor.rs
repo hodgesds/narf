@@ -16,6 +16,7 @@
  */
 //! AR9285 non-EDMA, single-buffer legacy descriptors (Linux ar9002_mac.c).
 //! Words are host-order values; the retained DMA owner publishes little endian.
+use super::rates::{Feedback, Series};
 use alloc::vec::Vec;
 
 pub(super) const WORDS: usize = 24;
@@ -54,6 +55,16 @@ pub(super) fn transmit(
     address: u64,
     rate: usize,
 ) -> Result<[u32; WORDS], Error> {
+    let series =
+        Series::single(rate, frame.get(4).is_some_and(|b| b & 1 != 0)).ok_or(Error::Profile)?;
+    transmit_series(frame, local, address, series)
+}
+pub(super) fn transmit_series(
+    frame: &[u8],
+    local: [u8; 6],
+    address: u64,
+    series: Series,
+) -> Result<[u32; WORDS], Error> {
     if !(24..=MAX_MPDU).contains(&frame.len()) {
         return Err(Error::Length);
     }
@@ -72,9 +83,14 @@ pub(super) fn transmit(
     if !admitted {
         return Err(Error::Profile);
     }
-    encode(frame.len(), address, rate, frame[4] & 1 != 0)
+    encode_series(frame.len(), address, series, frame[4] & 1 != 0)
 }
-fn encode(length: usize, address: u64, rate: usize, group: bool) -> Result<[u32; WORDS], Error> {
+fn encode_series(
+    length: usize,
+    address: u64,
+    series: Series,
+    group: bool,
+) -> Result<[u32; WORDS], Error> {
     if !(24..=MAX_MPDU).contains(&length) {
         return Err(Error::Length);
     }
@@ -86,13 +102,10 @@ fn encode(length: usize, address: u64, rate: usize, group: bool) -> Result<[u32;
     {
         return Err(Error::Address);
     }
-    let &(bitrate, code) = RATES.get(rate).ok_or(Error::Profile)?;
+    if !series.valid(group) {
+        return Err(Error::Profile);
+    }
     let packet_length = (length + 4) as u32; // hardware adds the FCS.
-    let duration = if rate < 4 {
-        10 + 192 + (packet_length * 8 * 1000) / (u32::from(bitrate) * 100)
-    } else {
-        16 + 20 + (22 + packet_length * 8).div_ceil(u32::from(bitrate) * 100 * 4 / 1000) * 4
-    };
     let mut words = [0; WORDS];
     words[1] = address as u32;
     // AR_ClrDestMask and MAX_RATE_POWER with TPC disabled: actual factory/
@@ -101,10 +114,31 @@ fn encode(length: usize, address: u64, rate: usize, group: bool) -> Result<[u32;
     words[3] = length as u32 | if group { 1 << 24 } else { 0 };
     // Linux enables native duration/L-SIG update for every supported frame;
     // the excluded PS-Poll profile is the sole upstream exception.
-    words[4] = (if group { 1 } else { 4 } << 16) | 0x8000;
-    words[5] = u32::from(code);
-    words[6] = duration;
-    words[9] = 4 | (u32::from(RATES[0].1) << 20); // single chain, RTS reference1M.
+    words[4] = 0x8000;
+    words[9] = u32::from(RATES[usize::from(series.basic)].1) << 20;
+    for slot in 0..4 {
+        let tries = series.tries[slot];
+        if tries == 0 {
+            break;
+        }
+        let rate = usize::from(series.rates[slot]);
+        let (bitrate, code) = RATES[rate];
+        let duration = if rate < 4 {
+            10 + 192 + (packet_length * 8 * 1000) / (u32::from(bitrate) * 100)
+        } else {
+            16 + 20 + (22 + packet_length * 8).div_ceil(u32::from(bitrate) * 100 * 4 / 1000) * 4
+        };
+        if duration > 0x7fff {
+            return Err(Error::Profile);
+        }
+        words[4] |= u32::from(tries) << (16 + slot * 4);
+        words[5] |= u32::from(code) << (slot * 8);
+        words[6 + slot / 2] |= duration << ((slot % 2) * 16);
+        words[9] |= 1 << (2 + slot * 5); // One calibrated chain for every series.
+        if slot != 0 {
+            words[10 + slot] = 63 << 24;
+        }
+    }
     Ok(words)
 }
 
@@ -140,10 +174,29 @@ pub(super) fn transmit_status(words: &[u32; WORDS], group: bool) -> Result<TxSta
         return Ok(TxStatus::Pending);
     }
     let status = words[15];
-    if done & ((1 << 17) | (3 << 21)) != 0 || status & 0xf000e != 0 || (!group && status & 1 == 0) {
+    transmit_feedback(words)?;
+    if done & (1 << 17) != 0 || status & 0xf000e != 0 || (!group && status & 1 == 0) {
         return Ok(TxStatus::Failed);
     }
     Ok(TxStatus::Delivered)
+}
+/// FinalTxIdx names a programmed rate series, not a hardware error. A foreign
+/// or disabled series is malformed and cannot retire this native owner.
+pub(super) fn transmit_feedback(words: &[u32; WORDS]) -> Result<Feedback, Error> {
+    let index = ((words[TX_DONE] >> 21) & 3) as usize;
+    if words[4] >> (16 + index * 4) & 15 == 0 {
+        return Err(Error::Status);
+    }
+    let code = (words[5] >> (index * 8)) as u8;
+    let rate = RATES
+        .iter()
+        .position(|&(_, codeword)| codeword == code)
+        .ok_or(Error::Status)?;
+    Ok(Feedback {
+        rate: rate as u8,
+        retried: index != 0 || words[15] & 0xff0 != 0,
+        radio: words[15] & 0xf000c == 0 && words[TX_DONE] & (1 << 17) == 0,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
