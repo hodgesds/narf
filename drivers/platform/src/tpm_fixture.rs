@@ -1601,3 +1601,225 @@ kernel_test_in!(
     "drivers/platform/tpm-startup",
     smoke_tpm_probe_startup_extend_conversation
 );
+
+// ── Userspace publication (#940): devfs + sysfs over the model ────
+
+/// Fixture-cleanup transport: installed into the sysfs bridge on
+/// fixture exit so the class attributes the publication registered
+/// stop pointing at this fixture's model device (whose command
+/// buffers are fixture-owned memory). Mirrors the hygiene the
+/// `drivers/tpm` sysfs fixtures apply with their mock transports.
+struct DeadTransport;
+
+impl narf_drivers_tpm::devfs_bridge::TpmTransport for DeadTransport {
+    fn submit(&self, _cmd: &[u8]) -> Result<Vec<u8>, ()> {
+        Err(())
+    }
+}
+
+fn smoke_tpm_userspace_publication_conversation() -> TestResult {
+    use narf_filesystem::{DirOps, FileOps, FsInstance};
+
+    // Hygiene in AND out: the registry, the bridge transport slot
+    // and the devfs delegates are globals. The sysfs class is
+    // boot-lifetime by design (production registers it once and
+    // never removes it); on exit the fixture re-points its
+    // attributes at `DeadTransport`, the same end-state the
+    // `drivers/tpm` sysfs fixtures leave behind.
+    let teardown = || {
+        narf_drivers_tpm::devfs_bridge::unregister_dev_nodes();
+        narf_drivers_tpm::devfs_bridge::unregister_transport();
+        narf_drivers_tpm::sysfs_bridge::register_sysfs_tpm0(
+            Arc::new(DeadTransport) as Arc<dyn narf_drivers_tpm::devfs_bridge::TpmTransport>
+        );
+        narf_tpm::registry::__reset_for_test();
+    };
+    teardown();
+
+    // The composition `try_init_default` performs on real silicon,
+    // over the model: bring the device up, start it, register it,
+    // publish it. The production struct cannot be constructed over
+    // a register model (`Tpm::probe` owns an ioremap'd window), so
+    // the `ModelDevice` adapter stands in for that ownership glue —
+    // the same substitution the #946/#942 fixtures make; everything
+    // below the adapter is production code, including the
+    // publication function itself.
+    let mut dev = FakeTpmDevice::crb();
+    let mut cmd_mem = alloc::vec![0u8; 4096];
+    let mut rsp_mem = alloc::vec![0u8; 4096];
+    let cmd_ptr = cmd_mem.as_mut_ptr();
+    let rsp_ptr = rsp_mem.as_mut_ptr();
+    dev.attach_buffers(cmd_ptr, 4096, rsp_ptr, 4096);
+    let dev = Arc::new(dev);
+
+    let run = || -> Result<(), &'static str> {
+        if tpm::crb_acquire_and_program(
+            dev.as_ref(),
+            cmd_ptr as u64,
+            4096,
+            rsp_ptr as u64,
+            4096,
+            narf_time::Deadline::after_ms(750),
+        )
+        .is_err()
+        {
+            return Err("CRB bring-up failed against the model");
+        }
+        let adapter: Arc<dyn TpmDevice> = Arc::new(ModelDevice {
+            dev: dev.clone(),
+            cmd_ptr,
+            rsp_ptr,
+            tis: false,
+        });
+        // The production order: Startup, registry, publication.
+        // `block_on_spin` from the fixture body is the same bridge
+        // the Stage::Subsys initcall uses (not an executor poll;
+        // the submit futures are self-waking register polls).
+        if narf_scheduler::block_on_spin(adapter.startup(narf_tpm::StartupType::Clear)).is_err() {
+            return Err("Startup(CLEAR) failed against the model");
+        }
+        narf_tpm::registry::register(adapter.clone());
+        if narf_tpm::registry::list().len() != 1 {
+            return Err("registered device not visible in the registry");
+        }
+
+        // Before publication the devfs nodes do not exist (the
+        // entries' visibility is the delegate slot).
+        let dev_root = narf_filesystem::devfs::DevFs::new().root();
+        if dev_root.lookup("tpm0").is_some() || dev_root.lookup("tpmrm0").is_some() {
+            return Err("TPM devfs nodes visible before publication");
+        }
+
+        tpm::publish_userspace_surface(adapter.clone());
+
+        let node = dev_root
+            .lookup("tpm0")
+            .ok_or("/dev/tpm0 missing after publication")?;
+        if dev_root.lookup("tpmrm0").is_none() {
+            return Err("/dev/tpmrm0 missing after publication");
+        }
+
+        // Open both nodes the way `sys_open` does: the looked-up
+        // node is the prototype; the fd is its per-open clone.
+        let open = |node: &Arc<dyn FileOps>| -> Result<Arc<dyn FileOps>, &'static str> {
+            match node.open_instance_checked(false) {
+                Ok(Some(instance)) => Ok(instance),
+                Ok(None) => Ok(node.clone()),
+                Err(_) => Err("open_instance_checked errored on the TPM node"),
+            }
+        };
+        let fd_a = open(&node)?;
+        let fd_b = open(&node)?;
+        if Arc::ptr_eq(&fd_a, &fd_b) {
+            return Err("two opens of /dev/tpm0 share one instance (per-fd state broken)");
+        }
+
+        // Command round-trip through the published node:
+        // TPM2_GetRandom(8) against the model, via the production
+        // transport (registry device → register-level submit).
+        let cmd = narf_tpm::tpm2::get_random(8);
+        match narf_scheduler::block_on(fd_a.write(0, &cmd)) {
+            Ok(n) if n == cmd.len() => {}
+            _ => return Err("GetRandom write through /dev/tpm0 failed"),
+        }
+        let mut resp = [0u8; 64];
+        let n = match narf_scheduler::block_on(fd_a.read(0, &mut resp)) {
+            Ok(n) => n,
+            Err(_) => return Err("GetRandom read through /dev/tpm0 failed"),
+        };
+        if n != 20 || resp[6..10] != [0, 0, 0, 0] || resp[10..12] != [0, 8] {
+            return Err("GetRandom response through /dev/tpm0 malformed");
+        }
+        // The second fd has no pending response of its own: its
+        // read is EOF, not fd A's response.
+        let mut other = [0u8; 64];
+        match narf_scheduler::block_on(fd_b.read(0, &mut other)) {
+            Ok(0) => {}
+            _ => return Err("second /dev/tpm0 fd observed the first fd's response"),
+        }
+
+        // A PCR extend through the published node lands on the
+        // device (production frame builder, production transport).
+        let digest: [u8; 32] = [0x77; 32];
+        let ext = tpm::build_pcr_extend_request(4, &digest);
+        match narf_scheduler::block_on(fd_a.write(0, &ext)) {
+            Ok(n) if n == ext.len() => {}
+            _ => return Err("PCR_Extend write through /dev/tpm0 failed"),
+        }
+        let mut rsp = [0u8; 16];
+        match narf_scheduler::block_on(fd_a.read(0, &mut rsp)) {
+            Ok(10) if rsp[6..10] == [0, 0, 0, 0] => {}
+            _ => return Err("PCR_Extend response through /dev/tpm0 malformed"),
+        }
+        let want_pcr = pcr_extend_value(&[0u8; 32], &digest);
+        if dev.pcr(4) != want_pcr {
+            return Err("device PCR 4 does not reflect the /dev/tpm0 extend");
+        }
+
+        // The RM node is live too: a GetRandom round-trip through
+        // its own per-open instance.
+        let rm_node = dev_root
+            .lookup("tpmrm0")
+            .ok_or("/dev/tpmrm0 vanished after publication")?;
+        let fd_rm = open(&rm_node)?;
+        match narf_scheduler::block_on(fd_rm.write(0, &cmd)) {
+            Ok(n) if n == cmd.len() => {}
+            _ => return Err("GetRandom write through /dev/tpmrm0 failed"),
+        }
+        let mut rm_resp = [0u8; 64];
+        match narf_scheduler::block_on(fd_rm.read(0, &mut rm_resp)) {
+            Ok(20) if rm_resp[6..10] == [0, 0, 0, 0] => {}
+            _ => return Err("GetRandom response through /dev/tpmrm0 malformed"),
+        }
+
+        // The sysfs surface: navigate the published class tree
+        // (not the registration API — presence is the assertion).
+        let sysfs = narf_filesystem::sysfs::sysfs_root();
+        let tpm0 = sysfs
+            .get_child("class")
+            .and_then(|c| c.get_child("tpm"))
+            .and_then(|c| c.get_child("tpm0"))
+            .ok_or("/sys/class/tpm/tpm0 missing after publication")?;
+        if tpm0.attr_show("tpm_version_major").as_deref() != Some("2\n") {
+            return Err("tpm_version_major != '2\\n' on the published class");
+        }
+        // `pcrs` reads back the extend through the published
+        // surface: PCR 4's SHA-256 bank shows the chain value, in
+        // the bridge's uppercase space-separated format. (The
+        // SHA-1 bank is not implemented by the model, so its field
+        // is the bridge's "??" — not asserted.)
+        let pcrs = tpm0
+            .attr_show("pcrs")
+            .ok_or("pcrs attribute missing on the published class")?;
+        let mut want_hex = alloc::string::String::new();
+        for (i, b) in want_pcr.iter().enumerate() {
+            if i > 0 {
+                want_hex.push(' ');
+            }
+            want_hex.push_str(&alloc::format!("{b:02X}"));
+        }
+        if !pcrs.contains("PCR-04:") || !pcrs.contains(&want_hex) {
+            return Err("pcrs does not show the /dev/tpm0 extend on PCR 4");
+        }
+        // `owned`: the model does not implement GetCapability
+        // (#941 grows it), so the attribute reports its failure
+        // default. The bit semantics are pinned separately by the
+        // drivers/tpm fixture against a crafted response.
+        if tpm0.attr_show("owned").as_deref() != Some("0\n") {
+            return Err("owned != '0\\n' against the model (GetCapability unimplemented)");
+        }
+        Ok(())
+    };
+
+    let result = run();
+    teardown();
+    let _ = (cmd_mem, rsp_mem);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+kernel_test_in!(
+    "drivers/platform/tpm-publication",
+    smoke_tpm_userspace_publication_conversation
+);

@@ -17,10 +17,12 @@
 **Does NOT own:**
 - Raw MMIO drivers (e.g., TIS/CRB) — these live in `drivers/platform/tpm`.
 - Crypto primitives (HMAC, SHA-256) — consumed from `crypto/`.
-- The extended command set (Create/Load/Unseal, NV, object models) and
-  the `/dev/tpm*` + `/sys/class/tpm` bridges — staged, fixture-tested,
-  and not production in `drivers/tpm` (see §3.4); they compose onto
-  this crate's trait/registry when their lanes (#940/#941/#944) land.
+- The extended command set (Create/Load/Unseal, NV, object models) —
+  staged, fixture-tested, and not production in `drivers/tpm` (see
+  §3.4); it composes onto this crate's trait/registry when its
+  lanes (#941/#944) land. The `/dev/tpm*` + `/sys/class/tpm`
+  bridges, also in `drivers/tpm`, ARE production-composed onto the
+  trait/registry since #940 (see §3.4).
 - TPM2 ACPI table parsing — owned by `acpi/` (`tpm2_info()` /
   `parse_tpm2`); no TPM crate carries a second parser.
 
@@ -129,12 +131,32 @@ contract:
   Its probe/discovery semantics (PTP register map, host-programmed
   CRB buffers, TPM2-table discovery via `narf_acpi::tpm2_info()`)
   are #939's.
-- **`drivers/tpm` is not a stack.** It is a staged extension
-  surface (extended command set, devfs/sysfs bridges, register
-  models) with zero production dependents. It must not grow a
-  second `TpmDevice` trait, registry, transport, TPM2-table
-  parser, or PCR_Extend encoding; its follow-on lanes compose its
+- **`drivers/tpm` is not a stack.** It is an extension surface
+  (extended command set, devfs/sysfs bridges, register models). It
+  must not grow a second `TpmDevice` trait, registry, transport,
+  TPM2-table parser, or PCR_Extend encoding; its lanes compose its
   modules onto the two owners above.
+- **Userspace publication (#940).** On the same success path that
+  registers the device (probe → `TPM2_Startup` → registry), the
+  platform probe installs a synchronous `TpmTransport` over the
+  registered device into `drivers/tpm`'s bridges and registers
+  their surfaces: `/dev/tpm0` + `/dev/tpmrm0` (via
+  `filesystem::register_tpm`) and `/sys/class/tpm/tpm0`. The
+  transport is the bridges' only production implementation; it
+  bridges sync→async with `block_on_spin` over `submit_raw` (the
+  submit futures are self-waking register polls). The bridges keep
+  no registry of their own — devfs writes and sysfs attribute reads
+  alike submit through the installed transport, i.e. through the
+  §3.3 registry device. Per-fd state (response slot; the RM node's
+  transient-handle set, flushed with `TPM2_FlushContext` at close)
+  rides the VFS clone-on-open hook (`FileOps::open_instance`): the
+  registered nodes are prototypes, each `open(2)` gets a fresh
+  instance, and the devfs proxies forward the hook to the
+  installed delegate. Sysfs attributes that need capability data
+  query per read through the transport; the command set they
+  depend on (GetCapability) is #941's — until it lands, the
+  platform transport's `get_info` stub stands and the affected
+  attributes report their failure defaults.
 
 ## 4. Operation: PCR Extension
 

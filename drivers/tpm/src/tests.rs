@@ -1115,4 +1115,202 @@ mod smokes {
         TestResult::Pass
     }
     kernel_test_in!("drivers/tpm/sysfs", smoke_sysfs_manufacturer_ascii);
+
+    /// GetCapability transport for the `owned` fixture: answers
+    /// `TPM_PT_PERMANENT` with a value the fixture controls, so
+    /// each TPMA_PERMANENT bit can be exercised in isolation.
+    static PERMANENT_VALUE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    struct PermanentTransport;
+    impl crate::devfs_bridge::TpmTransport for PermanentTransport {
+        fn submit(&self, cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
+            if cmd.len() < 10 {
+                return Err(());
+            }
+            let cc = u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]);
+            if cc != crate::tpm2::TPM_CC_GET_CAPABILITY {
+                return Err(());
+            }
+            // Response layout (mirrors MfrTransport's): header(10) +
+            // moreData(1) + capability(4) + count(4) + tag(4) +
+            // value(4); read_property extracts tag at body[9..13]
+            // and value at body[13..17].
+            let total = 10 + 1 + 4 + 4 + 4 + 4;
+            let mut r = alloc::vec![0u8; total];
+            r[0] = 0x80;
+            r[1] = 0x01;
+            r[2..6].copy_from_slice(&(total as u32).to_be_bytes());
+            // capability = TPM_CAP_TPM_PROPERTIES (6)
+            r[14] = 6;
+            // count = 1
+            r[18] = 1;
+            // property tag = PT_PERMANENT (0x0000_010E)
+            r[21] = 0x01;
+            r[22] = 0x0E;
+            // value = the fixture-controlled TPMA_PERMANENT
+            let v = PERMANENT_VALUE.load(core::sync::atomic::Ordering::SeqCst);
+            r[23..27].copy_from_slice(&v.to_be_bytes());
+            Ok(r)
+        }
+    }
+
+    fn smoke_sysfs_owned_reflects_owner_auth_bit() -> TestResult {
+        use crate::devfs_bridge::TpmTransport;
+        use alloc::sync::Arc;
+        use core::sync::atomic::Ordering;
+
+        let t = Arc::new(PermanentTransport) as Arc<dyn TpmTransport>;
+        crate::sysfs_bridge::register_sysfs_tpm0(t);
+
+        let class_tpm = narf_filesystem::class_register("tpm");
+        let tpm0 = narf_filesystem::class_device_register(class_tpm, "tpm0");
+
+        // TPMA_PERMANENT (Part 2 §10.11): ownerAuthSet is bit 0,
+        // endorsementAuthSet bit 1, lockoutAuthSet bit 2. `owned`
+        // must track bit 0 only. The pre-#940 code tested bit 1
+        // under a comment claiming bit 2, so it reported the
+        // endorsement hierarchy's auth state — the 0b010 case is
+        // the one that catches it.
+        let cases: [(u32, &str); 5] = [
+            (0b000, "0\n"),
+            (0b001, "1\n"),
+            (0b010, "0\n"),
+            (0b100, "0\n"),
+            (0b111, "1\n"),
+        ];
+        for (value, want) in cases {
+            PERMANENT_VALUE.store(value, Ordering::SeqCst);
+            match tpm0.attr_show("owned") {
+                Some(s) if s == want => {}
+                _ => {
+                    return TestResult::Fail(
+                        "owned does not reflect TPMA_PERMANENT bit 0 (ownerAuthSet)",
+                    );
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/tpm/sysfs",
+        smoke_sysfs_owned_reflects_owner_auth_bit
+    );
+
+    // ── Per-open state fixtures (#940) ─────────────────────────────
+    //
+    // The registered nodes are prototypes; `sys_open` clones them
+    // per fd through `FileOps::open_instance`. These fixtures pin
+    // the two contracts that follow: response state is per-fd, and
+    // the RM node's FlushContext-on-close fires at the owning fd's
+    // close only.
+
+    fn smoke_tpm0_open_instance_state_isolation() -> TestResult {
+        use crate::devfs_bridge::{DevTpm0, TpmTransport};
+        use alloc::sync::Arc;
+        use narf_filesystem::FileOps;
+
+        crate::devfs_bridge::register_transport(Arc::new(GetRandomMock) as Arc<dyn TpmTransport>);
+
+        let proto = DevTpm0::new();
+        let (fd_a, fd_b) = match (proto.open_instance(), proto.open_instance()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                crate::devfs_bridge::unregister_transport();
+                return TestResult::Fail("DevTpm0::open_instance returned None");
+            }
+        };
+        if Arc::ptr_eq(&fd_a, &fd_b) {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("open_instance returned the same instance twice");
+        }
+
+        // GetRandom command, as in smoke_tpm0_write_read_roundtrip.
+        let mut cmd = alloc::vec![0u8; 12];
+        cmd[0] = 0x80;
+        cmd[1] = 0x01; // tag TPM_ST_NO_SESSIONS
+        cmd[5] = 12; // size
+        cmd[8] = 0x01;
+        cmd[9] = 0x7B; // CC GetRandom
+        cmd[11] = 8; // bytesRequested = 8
+
+        let n = poll_once_sync(fd_a.write(0, &cmd)).and_then(|r| r.ok());
+        if n != Some(12) {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("write on fd A did not return 12");
+        }
+        // fd B must not observe fd A's pending response: with no
+        // response of its own, its read is EOF (0), exactly as a
+        // fresh Linux tpm fd behaves before any write.
+        let mut buf_b = [0u8; 32];
+        let nb = poll_once_sync(fd_b.read(0, &mut buf_b)).and_then(|r| r.ok());
+        if nb != Some(0) {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("fd B observed fd A's pending response");
+        }
+        // fd A reads its own response back.
+        let mut buf_a = [0u8; 32];
+        let na = poll_once_sync(fd_a.read(0, &mut buf_a)).and_then(|r| r.ok());
+        crate::devfs_bridge::unregister_transport();
+        if na != Some(20) {
+            return TestResult::Fail("fd A did not read its 20-byte response");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/tpm/devfs",
+        smoke_tpm0_open_instance_state_isolation
+    );
+
+    fn smoke_tpmrm0_open_instance_flushes_only_own_handles() -> TestResult {
+        use crate::devfs_bridge::{DevTpmRm0, TpmTransport};
+        use alloc::sync::Arc;
+        use narf_filesystem::FileOps;
+
+        FLUSH_CALLS.lock().clear();
+        crate::devfs_bridge::register_transport(
+            Arc::new(TrackingTransport) as Arc<dyn TpmTransport>
+        );
+
+        let proto = DevTpmRm0::new();
+        let (fd_a, fd_b) = match (proto.open_instance(), proto.open_instance()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                crate::devfs_bridge::unregister_transport();
+                return TestResult::Fail("DevTpmRm0::open_instance returned None");
+            }
+        };
+
+        // TPM2_Load on fd A — TrackingTransport answers with
+        // transient handle 0x8000_0001 (as in
+        // smoke_tpmrm0_flush_on_drop), which fd A now tracks.
+        let mut cmd = alloc::vec![0u8; 10];
+        cmd[0] = 0x80;
+        cmd[1] = 0x01;
+        cmd[5] = 10;
+        cmd[8] = 0x01;
+        cmd[9] = 0x57; // CC = TPM_CC_LOAD
+        let _ = poll_once_sync(fd_a.write(0, &cmd));
+
+        // Closing fd B (which allocated nothing) must not flush
+        // fd A's handle — under the pre-#940 shared-node model the
+        // single instance's Drop was the only flush point, so this
+        // distinction did not exist.
+        drop(fd_b);
+        if FLUSH_CALLS.lock().contains(&0x8000_0001) {
+            crate::devfs_bridge::unregister_transport();
+            return TestResult::Fail("closing fd B flushed fd A's transient handle");
+        }
+        // Closing fd A flushes exactly its own handle.
+        drop(fd_a);
+        let calls = FLUSH_CALLS.lock().clone();
+        crate::devfs_bridge::unregister_transport();
+        if !calls.contains(&0x8000_0001) {
+            return TestResult::Fail("closing fd A did not flush its transient handle");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/tpm/devfs",
+        smoke_tpmrm0_open_instance_flushes_only_own_handles
+    );
 }

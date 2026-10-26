@@ -772,9 +772,13 @@ pub(crate) fn discovered_base() -> Option<u64> {
 /// `Arc<Tpm>`: this crate's singleton (backing `with_tpm` /
 /// `is_present` / `kind`) and `narf_tpm::registry` — the dispatch
 /// target `frame::measure` consults for hardware PCR extends.
-/// Publication happens exactly once, on the None→Some transition
-/// guarded by the early return above, so a repeated initcall can
-/// never double-register the device.
+/// The same success path also composes the userspace surface
+/// (#940): [`publish_userspace_surface`] installs a transport over
+/// the registered device into the `drivers/tpm` bridges, which
+/// instantiate `/dev/tpm0`, `/dev/tpmrm0` and
+/// `/sys/class/tpm/tpm0`. Publication happens exactly once, on the
+/// None→Some transition guarded by the early return above, so a
+/// repeated initcall can never double-register the device.
 pub fn try_init_default() {
     if !cfg!(target_arch = "x86_64") {
         return;
@@ -811,6 +815,10 @@ pub fn try_init_default() {
         match narf_scheduler::block_on_spin(dev.startup(narf_tpm::StartupType::Clear)) {
             Ok(()) => {
                 narf_tpm::registry::register(dev.clone());
+                // Userspace publication (#940): the devfs/sysfs
+                // bridges, composed onto the same started device
+                // the registry now dispatches through.
+                publish_userspace_surface(dev.clone());
                 *TPM.lock() = Some(dev);
             }
             Err(e) => {
@@ -828,6 +836,55 @@ pub fn try_init_default() {
             }
         }
     }
+}
+
+// ── Userspace publication (#940) ─────────────────────────────────────
+
+/// Production `TpmTransport` for the `drivers/tpm` bridges: submits
+/// through a registered `narf_tpm::TpmDevice`.
+///
+/// The bridge trait is synchronous (the devfs nodes submit inside
+/// `FileOps::write`, mirroring Linux's tpm-dev write path) while
+/// `TpmDevice::submit_raw` is async. The bridge point is
+/// `block_on_spin`: the device's submit futures are self-waking
+/// register polls (they never pend on an external waker — the same
+/// property the Startup call in `try_init_default` relies on), and
+/// the write path runs in syscall context, never inside an executor
+/// poll. No lock is held across the call: `devfs_bridge` clones the
+/// transport `Arc` out of its slot before invoking `submit`, the
+/// response slot the node holds is its own per-fd lock taken only
+/// after `submit` returns, and the registry device here is the
+/// concrete `Tpm` (or a fixture adapter), whose submit path takes
+/// no `IrqSafeSpinLock` across its polls.
+struct RegistryTransport {
+    dev: Arc<dyn narf_tpm::TpmDevice>,
+}
+
+impl narf_drivers_tpm::devfs_bridge::TpmTransport for RegistryTransport {
+    fn submit(&self, cmd: &[u8]) -> Result<Vec<u8>, ()> {
+        narf_scheduler::block_on_spin(self.dev.submit_raw(cmd)).map_err(|_| ())
+    }
+}
+
+/// Publish the userspace TPM surface for a registered device:
+/// `/dev/tpm0`, `/dev/tpmrm0` and `/sys/class/tpm/tpm0`, backed by
+/// `dev` through the `drivers/tpm` bridges (#940).
+///
+/// Called exactly once per device, from `try_init_default`'s
+/// success path — after TPM2_Startup and registry registration, so
+/// the surface only ever exposes a started device (narf-tpm spec
+/// §3.3). The bridges keep no second registry: the devfs nodes
+/// submit through the transport slot this installs, and the sysfs
+/// attributes query the same transport per read. The devfs nodes
+/// are per-fd from here on — `sys_open` clones them through
+/// `FileOps::open_instance`, so response state and the RM node's
+/// transient-handle flush live and die with each fd.
+pub fn publish_userspace_surface(dev: Arc<dyn narf_tpm::TpmDevice>) {
+    let transport: Arc<dyn narf_drivers_tpm::devfs_bridge::TpmTransport> =
+        Arc::new(RegistryTransport { dev });
+    narf_drivers_tpm::devfs_bridge::register_transport(transport.clone());
+    narf_drivers_tpm::devfs_bridge::register_dev_nodes();
+    narf_drivers_tpm::sysfs_bridge::register_sysfs_tpm0(transport);
 }
 
 pub fn is_present() -> bool {
