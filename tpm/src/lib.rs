@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 use narf_capabilities::{CapKind, CapType};
 
+pub mod attest;
 pub mod commands;
 pub mod tpm2;
 pub mod types;
@@ -128,6 +129,46 @@ pub trait TpmDevice: Send + Sync {
             version: find(crate::tpm2::TPM_PT_FIRMWARE_VERSION_1).unwrap_or(0),
             spec_level: find(crate::tpm2::TPM_PT_REVISION).unwrap_or(0),
         })
+    }
+
+    /// Attestation: submit `TPM2_Quote` (Part 3 §18) over the
+    /// selected PCRs, signed by the attestation key at
+    /// `sign_handle`, with `qualifying_data` (the verifier's
+    /// nonce) bound into the attestation as `extraData`.
+    ///
+    /// Provided, like `startup` / `query_info`: the frame is built
+    /// with the canonical codec (`CommandBuilder::quote` —
+    /// TPM_ST_SESSIONS + TPM_RS_PW empty-auth session, so the AK
+    /// must carry an empty auth value) and the response is parsed
+    /// structurally (`ResponseParser::parse_quote_response`), so
+    /// every transport inherits the operation unchanged. The
+    /// result carries the raw attestation bytes, their parsed
+    /// form, and the signature; [`crate::attest::verify_quote`]
+    /// checks all three the way a remote party would.
+    ///
+    /// This is the raw device operation and carries no policy:
+    /// the refusal to quote an untouched PCR set (the
+    /// EXTEND_OBSERVED guard, #945) lives in the quote
+    /// *composition* in `drivers/platform`, which is also where
+    /// the AK is provisioned — the trait deliberately knows
+    /// neither the guard (`frame::measure` owns it) nor the AK's
+    /// persistent handle.
+    async fn quote(
+        &self,
+        sign_handle: u32,
+        qualifying_data: &[u8],
+        scheme: (u16, u16),
+        selections: &[(u16, &[u8])],
+    ) -> Result<crate::attest::QuoteResponse, TpmError> {
+        let req = crate::commands::CommandBuilder::quote(
+            sign_handle,
+            qualifying_data,
+            scheme,
+            selections,
+        );
+        let resp = self.submit_raw(&req).await?;
+        let parser = crate::commands::ResponseParser::new(&resp)?;
+        parser.parse_quote_response()
     }
 
     /// High-level GetRandom.
@@ -798,6 +839,407 @@ mod tests {
         }
     }
     kernel_test_in!("tpm/pcr-read", smoke_tpm_pcr_read_parser_rejects_truncation);
+
+    // ── Attestation (#945) ────────────────────────────────────────
+    //
+    // The Quote codec, the TPMS_ATTEST / TPMT_SIGNATURE structures,
+    // and the remote-party verifier. The device-side conversation
+    // (a model that actually provisions an AK and signs) is the
+    // platform fixture's; here the structures are pinned against
+    // hand-built spec bytes and the verifier's check order against
+    // a synthetic AK whose public point is the NIST P-256 KAT key
+    // from `narf-crypto`'s ECDSA tests.
+
+    /// NIST P-256 KAT key (Linux testmgr vector, via narf-crypto):
+    /// X || Y of the public point.
+    const KAT_POINT: [u8; 64] = [
+        0xf1, 0xea, 0xc4, 0x53, 0xf3, 0xb9, 0x0e, 0x9f, 0x7e, 0xad, 0xe3, 0xea, 0xd7, 0x0e, 0x0f,
+        0xd6, 0x98, 0x9a, 0xca, 0x92, 0x4d, 0x0a, 0x80, 0xdb, 0x2d, 0x45, 0xc7, 0xec, 0x4b, 0x97,
+        0x00, 0x2f, 0xe9, 0x42, 0x6c, 0x29, 0xdc, 0x55, 0x0e, 0x0b, 0x53, 0x12, 0x9b, 0x2b, 0xad,
+        0x2c, 0xe9, 0x80, 0xe6, 0xc5, 0x43, 0xc2, 0x1d, 0x5e, 0xbb, 0x65, 0x21, 0x50, 0xb6, 0x37,
+        0xb0, 0x03, 0x8e, 0xb8,
+    ];
+
+    /// A marshaled TPMT_PUBLIC for an ECC P-256 AK over `point`:
+    /// restricted signing attributes, ECDSA/SHA-256 scheme — the
+    /// shape `objects::ecc_ak_template` (drivers/tpm) encodes, with
+    /// the template's empty unique replaced by the point.
+    fn synthetic_ak_public(point: &[u8; 64]) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::new();
+        v.extend_from_slice(&crate::tpm2::TPM_ALG_ECC.to_be_bytes());
+        v.extend_from_slice(&crate::tpm2::TPM_ALG_SHA256.to_be_bytes());
+        // fixedTPM | stClear | fixedParent | sensitiveDataOrigin |
+        // userWithAuth | restricted | sign
+        v.extend_from_slice(&0x0003_0076u32.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes()); // authPolicy
+        v.extend_from_slice(&crate::tpm2::TPM_ALG_NULL.to_be_bytes()); // symmetric
+        v.extend_from_slice(&crate::tpm2::TPM_ALG_ECDSA.to_be_bytes()); // scheme
+        v.extend_from_slice(&crate::tpm2::TPM_ALG_SHA256.to_be_bytes());
+        v.extend_from_slice(&crate::tpm2::TPM_ECC_NIST_P256.to_be_bytes());
+        v.extend_from_slice(&crate::tpm2::TPM_ALG_NULL.to_be_bytes()); // kdf
+        v.extend_from_slice(&32u16.to_be_bytes());
+        v.extend_from_slice(&point[..32]);
+        v.extend_from_slice(&32u16.to_be_bytes());
+        v.extend_from_slice(&point[32..]);
+        v
+    }
+
+    fn sha256_of(data: &[u8]) -> [u8; 32] {
+        let mut h = narf_crypto::sha256::Sha256::new();
+        h.update(data);
+        h.finalize()
+    }
+
+    /// A hand-built TPMS_ATTEST for a quote of PCR 4 = `pcr4`,
+    /// signed (nominally) by the AK whose qualified name is
+    /// `qname`, answering the nonce `nonce`.
+    fn synthetic_attest(qname: &[u8], nonce: &[u8], pcr4: &[u8; 32]) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::new();
+        v.extend_from_slice(&crate::tpm2::TPM_GENERATED_VALUE.to_be_bytes());
+        v.extend_from_slice(&crate::tpm2::TPM_ST_ATTEST_QUOTE.to_be_bytes());
+        v.extend_from_slice(&(qname.len() as u16).to_be_bytes());
+        v.extend_from_slice(qname);
+        v.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
+        v.extend_from_slice(nonce);
+        v.extend_from_slice(&123_456u64.to_be_bytes()); // clock
+        v.extend_from_slice(&3u32.to_be_bytes()); // resetCount
+        v.extend_from_slice(&1u32.to_be_bytes()); // restartCount
+        v.push(1u8); // safe
+        v.extend_from_slice(&0x0001_0000_0000_0000u64.to_be_bytes()); // firmwareVersion
+        v.extend_from_slice(&1u32.to_be_bytes()); // pcrSelect count
+        v.extend_from_slice(&crate::tpm2::TPM_ALG_SHA256.to_be_bytes());
+        v.push(3u8);
+        v.extend_from_slice(&[0x10, 0x00, 0x00]); // PCR 4
+        let digest = sha256_of(pcr4);
+        v.extend_from_slice(&(digest.len() as u16).to_be_bytes());
+        v.extend_from_slice(&digest);
+        v
+    }
+
+    fn synthetic_signature() -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::new();
+        v.extend_from_slice(&crate::tpm2::TPM_ALG_ECDSA.to_be_bytes());
+        v.extend_from_slice(&crate::tpm2::TPM_ALG_SHA256.to_be_bytes());
+        v.extend_from_slice(&32u16.to_be_bytes());
+        v.extend_from_slice(&[0x11u8; 32]); // r — not a valid signature
+        v.extend_from_slice(&32u16.to_be_bytes());
+        v.extend_from_slice(&[0x22u8; 32]); // s
+        v
+    }
+
+    fn smoke_tpm_quote_builder_layout() -> TestResult {
+        use crate::commands::CommandBuilder;
+        let nonce = b"verifier-nonce";
+        let mask: [u8; 3] = [0x10, 0x00, 0x00];
+        let cmd = CommandBuilder::quote(
+            0x8101_0002,
+            nonce,
+            (crate::tpm2::TPM_ALG_ECDSA, crate::tpm2::TPM_ALG_SHA256),
+            &[(crate::tpm2::TPM_ALG_SHA256, &mask)],
+        );
+        // header(10) + handle(4) + authSize(4) + auth(9) +
+        // qualifyingData TPM2B(2 + 14) + scheme(4) + TPML(4 + 2 + 1 + 3)
+        if cmd.len() != 57 {
+            return TestResult::Fail("quote command length drifted from 57");
+        }
+        if u16::from_be_bytes([cmd[0], cmd[1]]) != crate::commands::TPM_ST_SESSIONS {
+            return TestResult::Fail("quote must be sessions-tagged");
+        }
+        if u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]) != crate::tpm2::TPM_CC_QUOTE {
+            return TestResult::Fail("cc != TPM_CC_QUOTE");
+        }
+        if u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != 0x8101_0002 {
+            return TestResult::Fail("signHandle not first");
+        }
+        if u32::from_be_bytes([cmd[14], cmd[15], cmd[16], cmd[17]]) != 9 {
+            return TestResult::Fail("authSize != 9");
+        }
+        if u32::from_be_bytes([cmd[18], cmd[19], cmd[20], cmd[21]]) != 0x4000_0009 {
+            return TestResult::Fail("session != TPM_RS_PW");
+        }
+        // qualifyingData at 27: TPM2B size then the nonce bytes.
+        if u16::from_be_bytes([cmd[27], cmd[28]]) != nonce.len() as u16
+            || &cmd[29..29 + nonce.len()] != nonce.as_slice()
+        {
+            return TestResult::Fail("qualifyingData misplaced");
+        }
+        // inScheme at 43: ECDSA + SHA256.
+        let off = 29 + nonce.len();
+        if u16::from_be_bytes([cmd[off], cmd[off + 1]]) != crate::tpm2::TPM_ALG_ECDSA
+            || u16::from_be_bytes([cmd[off + 2], cmd[off + 3]]) != crate::tpm2::TPM_ALG_SHA256
+        {
+            return TestResult::Fail("inScheme != ECDSA/SHA256");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/attest", smoke_tpm_quote_builder_layout);
+
+    fn smoke_tpm_attest_structures_and_verifier_checks() -> TestResult {
+        use crate::attest::{self, AttestError};
+        let public = synthetic_ak_public(&KAT_POINT);
+        // Name helpers, cross-checked against an inline Part 1 §16
+        // computation (not the helpers themselves).
+        let name = match attest::object_name(&public) {
+            Some(n) => n,
+            None => return TestResult::Fail("object_name rejected a SHA-256 AK public"),
+        };
+        let mut want_name = alloc::vec![0x00, 0x0B];
+        want_name.extend_from_slice(&sha256_of(&public));
+        if name != want_name {
+            return TestResult::Fail("object_name != nameAlg || H(publicArea)");
+        }
+        let qname = match attest::primary_qualified_name(0x4000_000B, &name) {
+            Some(q) => q,
+            None => return TestResult::Fail("primary_qualified_name rejected a SHA-256 name"),
+        };
+        let mut qn_input = alloc::vec::Vec::new();
+        qn_input.extend_from_slice(&0x4000_000Bu32.to_be_bytes());
+        qn_input.extend_from_slice(&name);
+        let mut want_qname = alloc::vec![0x00, 0x0B];
+        want_qname.extend_from_slice(&sha256_of(&qn_input));
+        if qname != want_qname {
+            return TestResult::Fail("qualified name != nameAlg || H(hierarchy || name)");
+        }
+
+        let nonce = b"attest-nonce-945";
+        let pcr4 = [0x42u8; 32];
+        let attest_bytes = synthetic_attest(&qname, nonce, &pcr4);
+        let info = match attest::AttestInfo::parse(&attest_bytes) {
+            Ok(i) => i,
+            Err(_) => return TestResult::Fail("hand-built TPMS_ATTEST did not parse"),
+        };
+        if info.magic != crate::tpm2::TPM_GENERATED_VALUE
+            || info.attest_type != crate::tpm2::TPM_ST_ATTEST_QUOTE
+            || info.qualified_signer != qname
+            || info.extra_data != nonce.as_slice()
+            || info.clock_info.reset_count != 3
+            || info.firmware_version != 0x0001_0000_0000_0000
+        {
+            return TestResult::Fail("TPMS_ATTEST fields parsed incorrectly");
+        }
+        let quote = match &info.quote {
+            Some(q) => q,
+            None => return TestResult::Fail("quote union not parsed"),
+        };
+        if quote.pcr_digest != sha256_of(&pcr4).as_slice()
+            || quote.pcr_select
+                != alloc::vec![(crate::tpm2::TPM_ALG_SHA256, alloc::vec![0x10, 0, 0])]
+        {
+            return TestResult::Fail("TPMS_QUOTE_INFO parsed incorrectly");
+        }
+        // Truncation and trailing bytes are structural failures.
+        if attest::AttestInfo::parse(&attest_bytes[..attest_bytes.len() - 1]).is_ok() {
+            return TestResult::Fail("truncated TPMS_ATTEST accepted");
+        }
+        let signature = match attest::Signature::parse(&synthetic_signature()) {
+            Ok(s) => s,
+            Err(_) => return TestResult::Fail("hand-built TPMT_SIGNATURE did not parse"),
+        };
+        let mut trailing = synthetic_signature();
+        trailing.push(0);
+        if attest::Signature::parse(&trailing).is_ok() {
+            return TestResult::Fail("TPMT_SIGNATURE with trailing byte accepted");
+        }
+
+        // The verifier's check order: each case breaks exactly one
+        // link, and the (structurally valid, digest-correct) base
+        // case must reach the signature check and fail there — the
+        // synthetic (r, s) is not a signature by the KAT key.
+        let pcrs = [(4u32, pcr4)];
+        match attest::verify_quote(&attest_bytes, &signature, &public, &qname, nonce, &pcrs) {
+            Err(AttestError::BadSignature) => {}
+            other => {
+                return TestResult::Fail(match other {
+                    Ok(_) => "invalid signature verified",
+                    Err(e) => match e {
+                        AttestError::BadStructure => "base case: BadStructure",
+                        AttestError::BadMagic => "base case: BadMagic",
+                        AttestError::NotAQuote => "base case: NotAQuote",
+                        AttestError::ExtraDataMismatch => "base case: ExtraDataMismatch",
+                        AttestError::SignerMismatch => "base case: SignerMismatch",
+                        AttestError::PcrDigestMismatch => "base case: PcrDigestMismatch",
+                        AttestError::Unsupported => "base case: Unsupported",
+                        AttestError::BadSignature => unreachable!(),
+                    },
+                })
+            }
+        }
+        match attest::verify_quote(
+            &attest_bytes,
+            &signature,
+            &public,
+            &qname,
+            b"a-different-nonce",
+            &pcrs,
+        ) {
+            Err(AttestError::ExtraDataMismatch) => {}
+            _ => return TestResult::Fail("wrong nonce not ExtraDataMismatch"),
+        }
+        let mut wrong_qname = qname.clone();
+        wrong_qname[33] ^= 0x01;
+        match attest::verify_quote(
+            &attest_bytes,
+            &signature,
+            &public,
+            &wrong_qname,
+            nonce,
+            &pcrs,
+        ) {
+            Err(AttestError::SignerMismatch) => {}
+            _ => return TestResult::Fail("wrong signer not SignerMismatch"),
+        }
+        match attest::verify_quote(
+            &attest_bytes,
+            &signature,
+            &public,
+            &qname,
+            nonce,
+            &[(4u32, [0x43u8; 32])],
+        ) {
+            Err(AttestError::PcrDigestMismatch) => {}
+            _ => return TestResult::Fail("tampered PCR value not PcrDigestMismatch"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "tpm/attest",
+        smoke_tpm_attest_structures_and_verifier_checks
+    );
+
+    fn stub_event_log() -> alloc::vec::Vec<u8> {
+        alloc::vec![0xDE, 0xAD, 0xBE, 0xEF]
+    }
+    fn stub_extends_observed() -> bool {
+        true
+    }
+
+    fn smoke_tpm_measurement_hooks_fail_closed() -> TestResult {
+        use crate::attest;
+        attest::__reset_measurement_hooks_for_test();
+        if attest::extends_observed() {
+            return TestResult::Fail("uninstalled hooks must report no extends (fail closed)");
+        }
+        if !attest::event_log_bytes().is_empty() {
+            return TestResult::Fail("uninstalled hooks must serve an empty log");
+        }
+        attest::install_measurement_hooks(attest::MeasurementHooks {
+            event_log: stub_event_log,
+            extends_observed: stub_extends_observed,
+        });
+        if !attest::extends_observed() {
+            return TestResult::Fail("installed hook's extend flag not consulted");
+        }
+        if attest::event_log_bytes() != alloc::vec![0xDE, 0xAD, 0xBE, 0xEF] {
+            return TestResult::Fail("installed hook's log bytes not served");
+        }
+        attest::__reset_measurement_hooks_for_test();
+        if attest::extends_observed() {
+            return TestResult::Fail("reset did not restore the fail-closed state");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/attest", smoke_tpm_measurement_hooks_fail_closed);
+
+    /// Spec-shaped silicon for the trait's `quote`: answers the
+    /// canned Quote response and records the submitted frame.
+    struct QuoteProbeTpm {
+        submitted: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>,
+        attest_bytes: alloc::vec::Vec<u8>,
+    }
+
+    #[async_trait]
+    impl TpmDevice for QuoteProbeTpm {
+        fn get_info(&self) -> TpmInfo {
+            TpmInfo {
+                manufacturer: 0x5155_4F54,
+                version: 1,
+                spec_level: 159,
+            }
+        }
+
+        async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+            *self.submitted.lock() = cmd.to_vec();
+            let mut params = alloc::vec::Vec::new();
+            params.extend_from_slice(&(self.attest_bytes.len() as u16).to_be_bytes());
+            params.extend_from_slice(&self.attest_bytes);
+            params.extend_from_slice(&synthetic_signature());
+            let mut frame = alloc::vec::Vec::new();
+            frame.extend_from_slice(&crate::commands::TPM_ST_SESSIONS.to_be_bytes());
+            frame.extend_from_slice(&0u32.to_be_bytes()); // size, patched below
+            frame.extend_from_slice(&0u32.to_be_bytes()); // rc = success
+            frame.extend_from_slice(&(params.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&params);
+            frame.extend_from_slice(&[0u8; 5]); // password-session auth area
+            let size = frame.len() as u32;
+            frame[2..6].copy_from_slice(&size.to_be_bytes());
+            Ok(frame)
+        }
+
+        async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError> {
+            Ok(alloc::vec![0u8; bytes as usize])
+        }
+
+        async fn extend_pcr(&self, _pcr: u32, _digest: &[u8]) -> Result<(), TpmError> {
+            Ok(())
+        }
+
+        async fn read_pcr(&self, _pcr: u32) -> Result<Vec<u8>, TpmError> {
+            Ok(alloc::vec![0u8; 32])
+        }
+    }
+
+    fn smoke_tpm_trait_quote_conversation() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let public = synthetic_ak_public(&KAT_POINT);
+        let qname = match attest::object_name(&public)
+            .and_then(|n| attest::primary_qualified_name(0x4000_000B, &n))
+        {
+            Some(q) => q,
+            None => return TestResult::Fail("AK qualified-name computation failed"),
+        };
+        let nonce = b"trait-quote-nonce";
+        let attest_bytes = synthetic_attest(&qname, nonce, &[0x42u8; 32]);
+        let probe = Arc::new(QuoteProbeTpm {
+            submitted: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            attest_bytes,
+        });
+        let outcome = Arc::new(AtomicU32::new(0));
+        let p = probe.clone();
+        let o = outcome.clone();
+        narf_scheduler::spawn(async move {
+            let mask: [u8; 3] = [0x10, 0x00, 0x00];
+            match p
+                .quote(
+                    0x8101_0002,
+                    nonce,
+                    (crate::tpm2::TPM_ALG_ECDSA, crate::tpm2::TPM_ALG_SHA256),
+                    &[(crate::tpm2::TPM_ALG_SHA256, &mask)],
+                )
+                .await
+            {
+                Ok(resp)
+                    if resp.info.extra_data == nonce.as_slice()
+                        && matches!(resp.signature, attest::Signature::Ecdsa { .. }) =>
+                {
+                    o.store(1, Ordering::SeqCst)
+                }
+                _ => o.store(2, Ordering::SeqCst),
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if outcome.load(Ordering::SeqCst) != 1 {
+            return TestResult::Fail("trait quote did not round-trip the canned response");
+        }
+        let submitted = probe.submitted.lock().clone();
+        if submitted.len() < 10
+            || u32::from_be_bytes([submitted[6], submitted[7], submitted[8], submitted[9]])
+                != crate::tpm2::TPM_CC_QUOTE
+        {
+            return TestResult::Fail("trait quote submitted a non-Quote frame");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/attest", smoke_tpm_trait_quote_conversation);
 
     // ── TPM 2.0 codec smokes ──────────────────────────────────────
 
