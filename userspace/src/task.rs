@@ -79,6 +79,9 @@ pub struct Task {
     /// Explicit launch grant; inherited by fork/clone, never minted by a
     /// Linux uid/capability bit. Released with this task's final reference.
     pub(crate) network_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
+    /// Retained identity binding; current-task procfs access and clone snapshot
+    /// inheritance do not consult the bootstrap directory or copy image bytes.
+    pub(crate) proc_identity: Arc<crate::proc_identity::Identity>,
     /// Current job-control stop signal, or zero while not stopped.
     ///
     /// Linux keeps this state in `signal_struct`; keeping it on the refcounted
@@ -186,6 +189,7 @@ impl Task {
             process_group_pid: AtomicU64::new(pid),
             state: AtomicU32::new(TASK_RUNNING),
             network_admin: IrqSafeSpinLock::new(None),
+            proc_identity: crate::proc_identity::owner(tid),
             job_stop_signal: AtomicU32::new(0),
             exit_code: AtomicI32::new(0),
             user_cpu_ns: AtomicU64::new(0),
@@ -1364,6 +1368,7 @@ pub fn release_task(tid: u64) -> Option<Arc<Task>> {
     // lock; siblings retain their own owners and may keep using their limits.
     // Never hold TASKS while taking the lifecycle index lock or dropping it.
     crate::handlers::rlimit_retire_key(tid);
+    crate::proc_identity::retire(tid, &owner.proc_identity);
     removed
 }
 

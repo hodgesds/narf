@@ -14839,17 +14839,8 @@ fn release_task_tables(tid: u64) {
         m.remove(&(PKEY_NO_MM | tid));
     }
 
-    // /proc mirrors.
-    if let Some(m) = PROC_ARGV.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = PROC_COMM.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = PROC_EXE.lock().as_mut() {
-        m.remove(&tid);
-    }
-    task_map_remove(&PROC_IMAGE_MAPPINGS, tid);
+    // Task-owned /proc snapshots; release shared bytes after the owner lock.
+    crate::proc_identity::clear(tid);
     if let Some(m) = TASK_START_NS.lock().as_mut() {
         m.remove(&tid);
     }
@@ -14867,12 +14858,6 @@ fn release_task_tables(tid: u64) {
             }
         }
         crate::fd::locks::drop_waiter_owner(tid);
-    }
-    if let Some(m) = PROC_ENVIRON.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = PROC_AUXV.lock().as_mut() {
-        m.remove(&tid);
     }
     if let Some(m) = PROC_OOM_ADJ.lock().as_mut() {
         m.remove(&tid);
@@ -15240,17 +15225,11 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
     );
     r |= has(futex_has_task_waiter(tid), 1 << 5);
     r |= has(
-        PROC_ARGV
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.contains_key(&tid)),
+        crate::proc_identity::read(tid, |state| state.argv.is_some()).unwrap_or(false),
         1 << 6,
     );
     r |= has(
-        PROC_COMM
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.contains_key(&tid)),
+        crate::proc_identity::read(tid, |state| state.comm.is_some()).unwrap_or(false),
         1 << 7,
     );
     r |= has(

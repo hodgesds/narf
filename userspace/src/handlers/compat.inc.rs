@@ -3116,11 +3116,15 @@ pub(crate) fn proc_exe_magic_target(task: u64, path: &str) -> Option<alloc::stri
         "self" | "thread-self" => task,
         pid => proc_pid_to_tid(accept_pid_from(task, pid.parse::<u64>().ok()?)?),
     };
-    let g = PROC_EXE.lock();
-    let map = g.as_ref()?;
-    map.get(&owner)
-        .or_else(|| map.get(&proc_pid_to_tid(task_to_pid_raw(owner)?)))
-        .cloned()
+    crate::proc_identity::read(owner, |state| state.exe.clone())
+        .flatten()
+        .or_else(|| {
+            crate::proc_identity::read(proc_pid_to_tid(task_to_pid_raw(owner)?), |state| {
+                state.exe.clone()
+            })
+            .flatten()
+        })
+        .map(|exe| exe.as_ref().clone())
 }
 
 /// Parse `/proc/self/fd/<N>` or `/proc/<pid>/fd/<N>` → the fd number `N`.
@@ -7223,96 +7227,31 @@ pub fn default_signal_action(signum: u32) -> DefaultAction {
     }
 }
 
-// ── /proc/[pid]/{cmdline,comm} backing tables ───────────────────
+// ── /proc/[pid] identity and image snapshots ──────────────────
 //
 // Both are populated at task-creation time (boot init, sys_execve)
 // and queried by the proc_task_info hook below. The comm name is
 // also writable through prctl(PR_SET_NAME).
 
-static PROC_ARGV: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
-
-static PROC_COMM: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, alloc::string::String>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 // /proc/[pid]/exe target: the absolute path of the last successfully
 // exec'd image (for a `#!` script, the interpreter — Linux points the
 // exe link at whatever binary is actually mapped). Recorded by
-// sys_execve next to the argv/comm publish; a fork child has no entry
-// until it execs (the procfs hook then renders an empty target).
-static PROC_EXE: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, alloc::string::String>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+// sys_execve next to the argv/comm publish; fork and clone retain the
+// parent's immutable snapshot until the child replaces it.
 
 /// File-backed image ranges published by a successful exec. The address-space
-/// region table owns permissions and lifetime; this small side table preserves
+/// region table owns permissions and lifetime; this immutable snapshot preserves
 /// the loader's file identity and page offset for `/proc/<pid>/maps`.
 ///
 /// `AddressSpace` deliberately does not retain VFS paths, so keeping this
 /// exec-scoped metadata here avoids making the generic VM depend on VFS names.
 /// Dynamic mappings created by a later mmap still have unknown backing until
 /// that syscall gains equivalent provenance.
-#[derive(Clone, Debug)]
-struct ProcImageMapping {
-    start: u64,
-    end: u64,
-    file_offset: u64,
-    device: u64,
-    inode: u64,
-    pathname: alloc::string::String,
-}
+use crate::proc_identity::ImageMapping as ProcImageMapping;
 
-static PROC_IMAGE_MAPPINGS: TaskMapTable<alloc::vec::Vec<ProcImageMapping>> =
-    [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
-
-/// Best-effort clone for `/proc/<pid>/maps` image provenance.
-///
-/// This table is diagnostic metadata, but an ordinary `Vec::clone` is
-/// infallible: if userspace has driven the machine into OOM, cloning even a
-/// handful of mappings invokes the kernel's allocation-error handler and
-/// panics the whole machine. Keep every allocation in this snapshot fallible;
-/// callers degrade to missing file labels when there is no kernel-heap room.
-fn try_clone_proc_image_mappings(
-    mappings: &[ProcImageMapping],
-) -> Option<alloc::vec::Vec<ProcImageMapping>> {
-    let mut cloned = alloc::vec::Vec::new();
-    cloned.try_reserve_exact(mappings.len()).ok()?;
-    for mapping in mappings {
-        let mut pathname = alloc::string::String::new();
-        pathname.try_reserve_exact(mapping.pathname.len()).ok()?;
-        pathname.push_str(&mapping.pathname);
-        cloned.push(ProcImageMapping {
-            start: mapping.start,
-            end: mapping.end,
-            file_offset: mapping.file_offset,
-            device: mapping.device,
-            inode: mapping.inode,
-            pathname,
-        });
-    }
-    Some(cloned)
-}
-
-fn proc_image_mappings_snapshot(task: u64) -> alloc::vec::Vec<ProcImageMapping> {
-    let g = PROC_IMAGE_MAPPINGS[task_map_shard(task)].map.lock();
-    g.as_ref()
-        .and_then(|m| m.get(&task))
-        .and_then(|mappings| try_clone_proc_image_mappings(mappings))
-        .unwrap_or_default()
-}
-
-fn proc_image_mappings_fork(parent: u64, child: u64) {
-    let inherited = {
-        let g = PROC_IMAGE_MAPPINGS[task_map_shard(parent)].map.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&parent))
-            .and_then(|mappings| try_clone_proc_image_mappings(mappings))
-    };
-    if let Some(mappings) = inherited {
-        task_map_set(&PROC_IMAGE_MAPPINGS, child, mappings);
-    }
+fn proc_image_mappings_snapshot(task: u64) -> Option<Arc<alloc::vec::Vec<ProcImageMapping>>> {
+    crate::proc_identity::read(task, |state| state.mappings.clone()).flatten()
 }
 
 fn proc_absolute_path(task: u64, path: &str) -> alloc::string::String {
@@ -7338,7 +7277,7 @@ fn set_proc_image_mappings(
     if image_mappings.try_reserve(mappings.len()).is_err() {
         // `/proc/maps` provenance is diagnostic metadata. A failure to retain
         // it must not turn an otherwise successful exec into a kernel panic.
-        task_map_remove(&PROC_IMAGE_MAPPINGS, task);
+        drop(crate::proc_identity::update(task, |state| state.mappings.take()));
         return;
     }
     for mapping in mappings {
@@ -7361,7 +7300,11 @@ fn set_proc_image_mappings(
                 .unwrap_or_else(|| main_program_path.clone()),
         });
     }
-    task_map_set(&PROC_IMAGE_MAPPINGS, task, image_mappings);
+    // Retain one immutable snapshot. Fork/clone only clone this reference.
+    let snapshot = Arc::try_new(image_mappings).ok();
+    drop(crate::proc_identity::update(task, |state| {
+        core::mem::replace(&mut state.mappings, snapshot)
+    }));
 }
 
 /// Kernel-test seam for `/proc/maps` loader-provenance coverage.
@@ -7377,7 +7320,7 @@ pub fn __test_set_proc_image_mappings(
 /// Kernel-test cleanup for `/proc/maps` loader-provenance coverage.
 #[doc(hidden)]
 pub fn __test_clear_proc_image_mappings(task: u64) {
-    task_map_remove(&PROC_IMAGE_MAPPINGS, task);
+    drop(crate::proc_identity::update(task, |state| state.mappings.take()));
 }
 
 fn proc_image_mapping_for_range(
@@ -7404,58 +7347,22 @@ fn proc_image_mapping_for_range(
 }
 
 pub(crate) fn proc_identity_fork(parent_task: u64, child_task: u64) {
-    let inherited_comm = {
-        let g = PROC_COMM.lock();
-        g.as_ref().and_then(|m| m.get(&parent_task).cloned())
-    };
-    if let Some(comm) = inherited_comm {
-        PROC_COMM
-            .lock()
-            .get_or_insert_with(alloc::collections::BTreeMap::new)
-            .insert(child_task, comm);
-    }
-    let inherited_exe = {
-        let g = PROC_EXE.lock();
-        g.as_ref().and_then(|m| m.get(&parent_task).cloned())
-    };
-    if let Some(exe) = inherited_exe {
-        PROC_EXE
-            .lock()
-            .get_or_insert_with(alloc::collections::BTreeMap::new)
-            .insert(child_task, exe);
-    }
-    proc_image_mappings_fork(parent_task, child_task);
-    // argv, environ and the auxiliary vector live in the mm on Linux
-    // (`mm->arg_start..env_end`, `mm->saved_auxv`), which `dup_mm` copies: a
-    // forked child that has not exec'd reports its parent's
-    // /proc/self/{cmdline,environ,auxv}. Chromium's zygote-forked renderers
-    // never exec, and crashpad reads their auxv for AT_PHDR / AT_BASE.
-    for table in [&PROC_ARGV, &PROC_ENVIRON, &PROC_AUXV] {
-        let inherited = table.lock().as_ref().and_then(|m| m.get(&parent_task).cloned());
-        if let Some(bytes) = inherited {
-            table
-                .lock()
-                .get_or_insert_with(alloc::collections::BTreeMap::new)
-                .insert(child_task, bytes);
-        }
-    }
+    crate::proc_identity::inherit(parent_task, child_task);
 }
 
 /// Record the exec'd binary path for `/proc/[pid]/exe`. A relative
 /// exec path is resolved against the caller's cwd so the link is
 /// always absolute (Linux renders a resolved path here, never `./x`).
 pub fn set_proc_exe(pid: u64, path: &str) {
-    let abs = proc_absolute_path(pid, path);
-    let mut g = PROC_EXE.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(pid, abs);
+    let exe = Arc::new(proc_absolute_path(pid, path));
+    drop(crate::proc_identity::update(pid, |state| state.exe.replace(exe)));
 }
 
 /// `/proc/[pid]/exe` hook — None until the task has exec'd.
 pub fn proc_exe_path(pid: u64) -> Option<alloc::string::String> {
-    let tid = proc_pid_to_tid(pid);
-    let g = PROC_EXE.lock();
-    g.as_ref().and_then(|m| m.get(&tid).cloned())
+    crate::proc_identity::read(proc_pid_to_tid(pid), |state| state.exe.clone())
+        .flatten()
+        .map(|exe| exe.as_ref().clone())
 }
 
 /// `/proc/[pid]/cwd` hook — `cwd_of` defaults to `/` for a task that
@@ -7522,40 +7429,30 @@ pub fn set_proc_argv(pid: u64, argv: &[&str]) {
         packed.extend_from_slice(s.as_bytes());
         packed.push(0);
     }
-    let mut g = PROC_ARGV.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(pid, packed);
+    set_proc_argv_packed(pid, packed);
 }
 
 /// Pre-packed variant — the caller already owns the NUL-separated bytes.
 pub fn set_proc_argv_packed(pid: u64, packed: alloc::vec::Vec<u8>) {
-    let mut g = PROC_ARGV.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(pid, packed);
+    let packed = Arc::new(packed);
+    drop(crate::proc_identity::update(pid, |state| state.argv.replace(packed)));
 }
 
-/// Set the per-task comm name. Truncated to 15 bytes per Linux's
-/// PR_SET_NAME (TASK_COMM_LEN = 16 including NUL).
+/// Set the per-task comm name, preserving the existing 15-character limit.
 pub fn set_proc_comm(pid: u64, name: &str) {
-    let trimmed: alloc::string::String = name.chars().take(15).collect();
-    // Counts-only syscall tracing snapshots the selected task ids here, while
-    // names are being published, so its hot path never takes PROC_COMM's
-    // lock to re-match a comm string for every syscall.
+    let comm = crate::proc_identity::Comm::new(name);
     #[cfg(feature = "syscall-trace")]
-    crate::syscall::syscall_trace_note_comm(pid, &trimmed);
-    let mut g = PROC_COMM.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(pid, trimmed);
+    crate::syscall::syscall_trace_note_comm(pid, comm.as_str());
+    crate::proc_identity::update(pid, |state| state.comm = Some(comm));
 }
 
 /// Read-only accessor for the NUL-separated argv pack recorded
 /// against `pid`. Used by `/proc/[pid]/cmdline` and by the execve
 /// smoke tests to verify the post-load argv publish step.
 pub fn proc_argv_of(pid: u64) -> alloc::vec::Vec<u8> {
-    let tid = proc_pid_to_tid(pid);
-    let g = PROC_ARGV.lock();
-    g.as_ref()
-        .and_then(|m| m.get(&tid).cloned())
+    crate::proc_identity::read(proc_pid_to_tid(pid), |state| state.argv.clone())
+        .flatten()
+        .map(|bytes| bytes.as_ref().clone())
         .unwrap_or_default()
 }
 
@@ -7698,40 +7595,47 @@ pub fn proc_set_thread_comm(tid: u64, name: &str) -> Result<(), narf_filesystem:
 /// translating to a user-visible PID and must not feed a TaskId through
 /// `proc_pid_to_tid` a second time.
 pub fn proc_comm_of_task(tid: u64) -> Option<alloc::string::String> {
-    let g = PROC_COMM.lock();
-    g.as_ref().and_then(|m| m.get(&tid).cloned())
+    crate::proc_identity::read(tid, |state| state.comm)
+        .flatten()
+        .map(|comm| alloc::string::String::from(comm.as_str()))
 }
 
 /// Copy a task's comm into `buf` without allocating (the OOM report runs when
-/// the heap may be exhausted). Returns the copied length; 0 if unknown.
+/// the heap may be exhausted). Returns the copied length; 0 if unknown or
+/// contended. Neither the identity owner nor a Task reference is cloned.
 pub fn proc_comm_of_task_into(tid: u64, buf: &mut [u8; 16]) -> usize {
-    let g = PROC_COMM.lock();
-    let Some(comm) = g.as_ref().and_then(|m| m.get(&tid)) else {
-        return 0;
-    };
-    let n = comm.len().min(buf.len());
-    buf[..n].copy_from_slice(&comm.as_bytes()[..n]);
-    n
+    crate::proc_identity::try_read(tid, |state| state.comm)
+        .flatten()
+        .map_or(0, |comm| {
+            let bytes = comm.as_str().as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            n
+        })
 }
 
 /// `proc_comm_of_task` for callers running in the timer trap, which can
-/// interrupt a CPU already holding `PROC_COMM` — blocking there deadlocks
+/// interrupt a CPU already holding an identity lock — blocking there deadlocks
 /// the machine the caller is trying to observe. Returns `None` on
 /// contention; a missing name in a diagnostic line is the right trade.
 #[cfg(feature = "unix-latency-trace")]
 pub fn proc_comm_of_task_try(tid: u64) -> Option<alloc::string::String> {
-    let g = PROC_COMM.try_lock()?;
-    g.as_ref().and_then(|m| m.get(&tid).cloned())
+    crate::proc_identity::try_read(tid, |state| {
+        state.comm.map(|comm| alloc::string::String::from(comm.as_str()))
+    })
+    .flatten()
 }
 
-/// Timer-trap-safe argv lookup, keyed by TID (both `PROC_ARGV` and
-/// `PROC_COMM` are tid-keyed despite their `pid` parameter names — see
+/// Timer-trap-safe argv lookup, keyed by TID (identity records are
+/// tid-keyed despite their public accessors' `pid` parameter names — see
 /// `proc_argv_of`, which resolves pid→tid before indexing). Returns the
 /// NUL-separated pack; `None` on lock contention.
 #[cfg(feature = "unix-latency-trace")]
 pub fn proc_argv_of_task_try(tid: u64) -> Option<alloc::vec::Vec<u8>> {
-    let g = PROC_ARGV.try_lock()?;
-    g.as_ref().and_then(|m| m.get(&tid).cloned())
+    crate::proc_identity::try_read(tid, |state| {
+        state.argv.as_ref().map(|bytes| bytes.as_ref().clone())
+    })
+    .flatten()
 }
 
 /// Match a `comm` string against comma-separated `trace_comm=` selectors. A
@@ -7753,11 +7657,12 @@ pub fn comm_matches_selectors(comm: &str, prefixes: &str) -> bool {
 /// syscall, so cloning the short comm string (and taking a second configuration
 /// lock) would itself perturb the workload being traced.
 pub fn proc_comm_of_task_matches(tid: u64, prefixes: &str) -> bool {
-    let g = PROC_COMM.lock();
-    let Some(comm) = g.as_ref().and_then(|m| m.get(&tid)) else {
-        return false;
-    };
-    comm_matches_selectors(comm, prefixes)
+    crate::proc_identity::read(tid, |state| {
+        state
+            .comm
+            .is_some_and(|comm| comm_matches_selectors(comm.as_str(), prefixes))
+    })
+    .unwrap_or(false)
 }
 
 // ── /proc/[pid]/comm writable hook ─────────────────────────────
@@ -7765,7 +7670,7 @@ pub fn proc_comm_of_task_matches(tid: u64, prefixes: &str) -> bool {
 /// Update comm from a procfs write. Linux ref: `comm_write` in
 /// `fs/proc/base.c`. Truncates to 15 chars; returns `Ok(())`.
 pub fn proc_set_comm(pid: u64, name: &str) -> Result<(), narf_filesystem::FsError> {
-    // PROC_COMM is TaskId-keyed (see proc_comm_of); write under the TaskId so a
+    // Identity is TaskId-keyed (see proc_comm_of); write under the TaskId so a
     // subsequent /proc/<pid>/comm read matches.
     set_proc_comm(proc_pid_to_tid(pid), name);
     Ok(())
@@ -8033,7 +7938,7 @@ pub fn proc_task_info(
         .map(|as_arc| as_arc.stack_top())
         .filter(|&t| t != 0)
         .unwrap_or(crate::process::DEFAULT_USER_STACK_TOP);
-    // Comm name — from the PROC_COMM table (written at exec time
+    // Comm name — from the task identity (written at exec time
     // or via prctl(PR_SET_NAME)). Falls back to a "task-N"
     // default when no name has been set.
     let comm = proc_comm_of(pid).unwrap_or_else(|| {
@@ -8057,7 +7962,7 @@ pub fn proc_task_info(
     let image_mappings = if query == TaskInfoQuery::Vmas {
         proc_image_mappings_snapshot(tid)
     } else {
-        alloc::vec::Vec::new()
+        None
     };
     let stack_bytes = as_arc
         .as_ref()
@@ -8132,7 +8037,11 @@ pub fn proc_task_info(
                         )
                     });
                 let (file_offset, device, inode, pathname) = owned.unwrap_or_else(|| {
-                    proc_image_mapping_for_range(&image_mappings, base, end)
+                    proc_image_mapping_for_range(
+                        image_mappings.as_deref().map_or(&[], |m| m.as_slice()),
+                        base,
+                        end,
+                    )
                         .map(|(file_offset, device, inode, pathname)| {
                             (file_offset, device, inode, Some(pathname))
                         })
@@ -8400,20 +8309,18 @@ pub fn nice_of(pid: u64) -> i32 {
 /// Return the environ block for `pid` (NUL-separated key=value bytes).
 /// Returns empty Vec when no environ has been recorded.
 pub fn proc_environ_of(pid: u64) -> alloc::vec::Vec<u8> {
-    let tid = proc_pid_to_tid(pid);
-    let g = PROC_ENVIRON.lock();
-    g.as_ref()
-        .and_then(|m| m.get(&tid).cloned())
+    crate::proc_identity::read(proc_pid_to_tid(pid), |state| state.environ.clone())
+        .flatten()
+        .map(|bytes| bytes.as_ref().clone())
         .unwrap_or_default()
 }
 
 /// Return the packed ELF auxv bytes for `pid`.  Each entry is two
 /// little-endian u64s (key, value).  AT_NULL (0, 0) terminates.
 pub fn proc_auxv_of(pid: u64) -> alloc::vec::Vec<u8> {
-    let tid = proc_pid_to_tid(pid);
-    let g = PROC_AUXV.lock();
-    g.as_ref()
-        .and_then(|m| m.get(&tid).cloned())
+    crate::proc_identity::read(proc_pid_to_tid(pid), |state| state.auxv.clone())
+        .flatten()
+        .map(|bytes| bytes.as_ref().clone())
         .unwrap_or_else(|| alloc::vec![0u8; 16])
 }
 
@@ -8425,9 +8332,8 @@ pub fn set_proc_environ(task: u64, envp: &[&str]) {
         packed.extend_from_slice(s.as_bytes());
         packed.push(0);
     }
-    let mut g = PROC_ENVIRON.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(task, packed);
+    let packed = Arc::new(packed);
+    drop(crate::proc_identity::update(task, |state| state.environ.replace(packed)));
 }
 
 /// Record packed auxv (key, value) pairs for a scheduler task at execve time.
@@ -8441,9 +8347,8 @@ pub fn set_proc_auxv_pairs(task: u64, aux: &[(u64, u64)]) {
     }
     packed.extend_from_slice(&0u64.to_le_bytes());
     packed.extend_from_slice(&0u64.to_le_bytes());
-    let mut g = PROC_AUXV.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(task, packed);
+    let packed = Arc::new(packed);
+    drop(crate::proc_identity::update(task, |state| state.auxv.replace(packed)));
 }
 
 /// Return the backing description for fd `n` of `pid`.  Shaped like
@@ -8591,15 +8496,6 @@ fn strip_chroot_prefix(task: u64, path: &str) -> alloc::string::String {
     }
     alloc::string::String::from(path)
 }
-
-// Per-task environ and auxv byte stores.
-static PROC_ENVIRON: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
-
-static PROC_AUXV: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Set the pending bit for `signum` on `task`. Used by Wave-73
 /// POSIX timer expiries to queue a signal without going through

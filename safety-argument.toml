@@ -1912,3 +1912,11 @@ argument = "RCU's fallible constructors allocate the same header/value layout as
 ref = "security-model/specification/spec.md#L42"
 agent = "OpenAI Codex GPT-6"
 argument = "Dentry mutation tracking uses the existing fixed-capacity Bitmap sized from DENTRY_BUCKET_COUNT instead of a single u64 that covered only 64 of 2048 chains. Every affected chain is announced before unhashing and backing mutation, advances its generation before its active count is released, and is counted once per guard even for duplicate names. Whole-directory mutation includes every chain. Independent guards retain independent counts, so the first completion cannot admit readers across a second writer. No new allocation, unsafe operation, lock, filesystem callback, capability, or mapping authority is introduced. The existing per-chain atomics, dentry sequences, RCU lifetimes, reference-walk fallback, permission checks, and mount selection remain authoritative. Deterministic tests reject late negative-cache publication and old lookup tokens for high buckets, cover whole-directory invalidation, and check balanced duplicate/overlapping writers."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Pthread procfs identity optimization is confined to userspace task metadata. Task retains the same Arc-backed identity used by early loader publication; fork/clone copy a fixed-size snapshot of immutable buffers, each replacement is serialized by that task's identity lock, and old buffers drop after unlocking. Exit clears image references before reap retires the matching directory owner. No TCB code, page-table ownership, domain transition, scheduling policy, or executable authority is changed."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Shared identity buffers contain procfs bytes and loader provenance only; they confer no capabilities or mapped-file ownership. Existing PID/TID namespace translation and procfs access checks remain at their original callers. The OOM name-copy and timer diagnostic paths borrow through nonblocking directory and identity guards without cloning a Task or identity owner, so they neither wait on an interrupted writer nor cause final owner reclamation in IRQ context."
