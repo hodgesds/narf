@@ -60,10 +60,19 @@ struct Fixture {
     hole_fault_zero: bool,
 }
 
+/// A fixture's keep-alive anchor: state the installed ops only borrow,
+/// which must therefore outlive the scenario. btrfs nodes hold their
+/// mount view (`BtrfsVolume`) by `Weak` — a node whose view has been
+/// dropped answers every I/O op with `NotFound` — so the btrfs fixture
+/// returns its view here and `with_file` keeps it bound until `body`
+/// has run. memfs and FAT nodes own their backing (a FAT node holds
+/// its volume by `Arc`) and return `None`.
+type KeepAlive = Option<alloc::boxed::Box<dyn core::any::Any>>;
+
 /// Give the harness task an address space, install `ops` as an fd opened
 /// read-write, and run `body` against them.
 fn with_file(
-    make_ops: impl FnOnce() -> Result<Arc<dyn FileOps>, &'static str>,
+    make_ops: impl FnOnce() -> Result<(Arc<dyn FileOps>, KeepAlive), &'static str>,
     hole_fault_zero: bool,
     body: impl FnOnce(&Fixture) -> Result<(), &'static str>,
 ) -> TestResult {
@@ -77,7 +86,9 @@ fn with_file(
         *TRUNC_AS.lock() = Some(Arc::clone(&aspace));
         crate::handlers::install_address_space_lookup(lookup_trunc_as);
         let result = (|| {
-            let ops = make_ops()?;
+            // `_keep_alive` must stay bound until `body` has run: it is
+            // dropped at the end of this closure, after the scenario.
+            let (ops, _keep_alive) = make_ops()?;
             let fd = crate::fd::install(
                 FAKE_TASK,
                 crate::fd::FdEntry {
@@ -147,11 +158,28 @@ fn mapped_frame(aspace: &AddressSpace, va: u64) -> Option<u64> {
     (phys != 0).then_some(phys)
 }
 
-/// Fault `va` in the way a user access would.
-fn fault(aspace: &AddressSpace, va: u64) -> Result<(), &'static str> {
+/// Fault `va` in the way a user access would. `step` names the
+/// scenario step in the failure message: two steps fault the same
+/// `va`, so a bare va cannot tell them apart.
+fn fault(aspace: &AddressSpace, va: u64, step: &'static str) -> Result<(), &'static str> {
     // SAFETY: `aspace` is a live user root and paging is enabled.
-    unsafe { aspace.demand_alloc_page(VirtAddr::new(va)) }
-        .map_err(|_| "a fault inside the file's EOF was refused")?;
+    unsafe { aspace.demand_alloc_page(VirtAddr::new(va)) }.map_err(|e| {
+        // Surface the error variant (#863 discriminator): the fixed
+        // string this used to return discarded it, and the variant is
+        // the one observation that names the production site when an
+        // in-EOF fault is refused. The `&'static str` error type
+        // leaves a leaked format as the only carrier; the path runs at
+        // most once before the scenario aborts, so the leak is bounded.
+        &*alloc::boxed::Box::leak(
+            alloc::format!(
+                "a fault inside the file's EOF was refused (step: {}, va {:#x}): {:?}",
+                step,
+                va,
+                e
+            )
+            .into_boxed_str(),
+        )
+    })?;
     if mapped_frame(aspace, va).is_none() {
         return Err("the fault left the page unbacked");
     }
@@ -186,7 +214,7 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
     let bytes = content(3 * PAGE as usize - 100);
     let base = map_shared(fx.fd, 3 * PAGE)?;
     for page in 0..3 {
-        fault(&fx.aspace, base + page * PAGE)?;
+        fault(&fx.aspace, base + page * PAGE, "seed fault-in")?;
     }
     if mapped_bytes(&fx.aspace, base, 32)? != bytes[..32] {
         return Err("the mapping does not show the file's first bytes");
@@ -239,7 +267,7 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
         // A filesystem whose fault path materialises holes serves the
         // truncated range as zeros through the original mapping, never
         // as the pre-truncate bytes.
-        fault(&fx.aspace, base + 2 * PAGE)?;
+        fault(&fx.aspace, base + 2 * PAGE, "post-regrow hole fault")?;
         let regrown = mapped_bytes(&fx.aspace, base + 2 * PAGE, PAGE as usize)?;
         if regrown.iter().any(|&b| b != 0) {
             return Err("re-extending the file resurrected stale bytes in the truncated range");
@@ -266,7 +294,7 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
         Some(n) if n == PAGE as i64 => {}
         _ => return Err("rewrite of the truncated range failed or was short"),
     }
-    fault(&fx.aspace, base + 2 * PAGE)?;
+    fault(&fx.aspace, base + 2 * PAGE, "post-pwrite re-fault")?;
     if mapped_bytes(&fx.aspace, base + 2 * PAGE, PAGE as usize)? != new_bytes {
         return Err("the rewritten range does not serve the new bytes");
     }
@@ -291,7 +319,7 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
         return Err("the second truncate destroyed the tail VMA");
     }
     if fx.hole_fault_zero {
-        fault(&fx.aspace, base + 2 * PAGE)?;
+        fault(&fx.aspace, base + 2 * PAGE, "second-regrow hole fault")?;
         let regrown = mapped_bytes(&fx.aspace, base + 2 * PAGE, PAGE as usize)?;
         if regrown.iter().any(|&b| b != 0) {
             return Err("the second regrow resurrected bytes the second shrink discarded");
@@ -320,7 +348,7 @@ fn run_scenario(fx: &Fixture) -> Result<(), &'static str> {
     if fixed != base + 2 * PAGE {
         return Err("MAP_FIXED did not land on the zapped window");
     }
-    fault(&fx.aspace, fixed)?;
+    fault(&fx.aspace, fixed, "MAP_FIXED fault-in")?;
     if mapped_bytes(&fx.aspace, fixed, PAGE as usize)? != fixed_bytes {
         return Err("the MAP_FIXED replacement does not serve the file's current bytes");
     }
@@ -345,7 +373,7 @@ fn smoke_truncate_unmap_memfs() -> TestResult {
             if written != bytes.len() {
                 return Err("tmpfs seed write was short");
             }
-            Ok(file)
+            Ok((file, None))
         },
         true,
         run_scenario,
@@ -425,7 +453,7 @@ fn smoke_truncate_unmap_fat() -> TestResult {
                 crate::handlers::poll_io_to_completion(volume.root().lookup_async("NARF.TXT"))
                     .and_then(|r| r.ok())
                     .ok_or("lookup of NARF.TXT failed")?;
-            Ok(file)
+            Ok((file, None))
         },
         false,
         run_scenario,
@@ -527,7 +555,7 @@ fn smoke_truncate_unmap_minix() -> TestResult {
             let file = crate::handlers::poll_io_to_completion(volume.root().lookup_async("hi.txt"))
                 .and_then(|r| r.ok())
                 .ok_or("lookup of hi.txt failed")?;
-            Ok(file)
+            Ok((file, None))
         },
         // minix `read_file` zero-fills unmapped zones, so in-size
         // holes fault in as zero pages — the flag is the honest
@@ -544,4 +572,37 @@ fn smoke_truncate_unmap_minix() -> TestResult {
 kernel_test_in!(
     "syscall_abi/truncate_unmap/minix",
     smoke_truncate_unmap_minix
+);
+
+fn smoke_truncate_unmap_btrfs() -> TestResult {
+    with_file(
+        || {
+            let volume = crate::abi_fault_write_tests::btrfs_volume_with_file(&content(
+                3 * PAGE as usize - 100,
+            ))?;
+            let file =
+                crate::handlers::poll_io_to_completion(volume.root().lookup_async("narf.txt"))
+                    .and_then(|r| r.ok())
+                    .ok_or("lookup of narf.txt failed")?;
+            // The looked-up node holds the volume by `Weak` only, so
+            // the view itself is the keep-alive anchor: were it dropped
+            // with this closure, the scenario's first fault would meet
+            // a node whose every read answers `NotFound` (surfacing as
+            // a refused in-EOF fault, `Bus`) — the #863 seed fault-in
+            // failure. The sibling btrfs fixtures bind the volume
+            // across their scenario for the same reason.
+            Ok((
+                file,
+                Some(alloc::boxed::Box::new(volume) as alloc::boxed::Box<dyn core::any::Any>),
+            ))
+        },
+        // btrfs holes (dropped extents, never-allocated ranges) read
+        // back as zeros, so a regrown range faults in as zero pages.
+        true,
+        run_scenario,
+    )
+}
+kernel_test_in!(
+    "syscall_abi/truncate_unmap/btrfs",
+    smoke_truncate_unmap_btrfs
 );
