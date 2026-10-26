@@ -900,6 +900,23 @@ pub fn try_init_default() {
                 // bridges, composed onto the same started device
                 // the registry now dispatches through.
                 publish_userspace_surface(dev.clone());
+                // Attestation (#945): provision the AK now, while
+                // the boot is already paying TPM latencies, so the
+                // first quote request does not. Log-only on
+                // failure — attestation is additive surface; a TPM
+                // that cannot provision still registers, publishes,
+                // and anchors measured boot. On a firmware-started
+                // TPM whose AK a previous boot persisted, this is
+                // one ReadPublic round-trip.
+                if let Err(e) =
+                    narf_scheduler::block_on_spin(crate::tpm_attestation::ensure_ak(&*dev))
+                {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  tpm: AK provisioning failed ({e:?}); attestation unavailable"
+                    );
+                }
                 *TPM.lock() = Some(dev);
             }
             Err(e) => {
