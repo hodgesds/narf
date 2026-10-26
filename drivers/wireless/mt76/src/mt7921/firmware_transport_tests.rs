@@ -21,6 +21,12 @@ mod ht20_tests;
 mod ht40_tests;
 #[path = "rx_ba_tests.rs"]
 mod rx_ba_tests;
+#[path = "tx_ba_tests.rs"]
+mod tx_ba_tests;
+#[path = "tx_pipeline_station_tests.rs"]
+mod tx_pipeline_station_tests;
+#[path = "vht_tests.rs"]
+mod vht_tests;
 #[path = "wmm_tests.rs"]
 mod wmm_tests;
 
@@ -155,6 +161,13 @@ struct Model {
     ticks: Cell<u64>,
     management_stall_after: Option<usize>,
     ba_error_tag: Option<u16>,
+    tx_ba_offer: Option<(u16, u16)>,
+    tx_ba_status: u16,
+    tx_ba_fault: u8,
+    tx_ba_native: bool,
+    tx_ba_late_rx: VecDeque<Vec<u8>>,
+    data_aggregation: Vec<bool>,
+    data_ba_disabled: Vec<bool>,
     entropy_fail: bool,
     entropy_calls: usize,
     live: bool,
@@ -164,6 +177,8 @@ struct Model {
     replies: VecDeque<Vec<u8>>,
     loaded: bool,
     tx_stall: bool,
+    completion_budget: Option<usize>,
+    completion_status: u8,
     tx_stall_after: Option<usize>,
     management_resume: Option<u64>,
     management_rates: Vec<u16>,
@@ -171,6 +186,7 @@ struct Model {
     data_qos: Vec<bool>,
     wmm_reply: Option<Vec<u8>>,
     ht_reply: Option<Vec<u8>>,
+    vht_reply: Option<Vec<u8>>,
     stall_edca: bool,
     edca_progress_fault: u8,
     deny_tx_after: Option<usize>,
@@ -205,6 +221,13 @@ impl Model {
             ticks: Cell::new(0),
             management_stall_after: None,
             ba_error_tag: None,
+            tx_ba_offer: None,
+            tx_ba_status: 0,
+            tx_ba_fault: 0,
+            tx_ba_native: false,
+            tx_ba_late_rx: VecDeque::new(),
+            data_aggregation: Vec::new(),
+            data_ba_disabled: Vec::new(),
             entropy_fail: false,
             entropy_calls: 0,
             live: true,
@@ -217,6 +240,8 @@ impl Model {
             replies: VecDeque::new(),
             loaded: false,
             tx_stall: false,
+            completion_budget: None,
+            completion_status: 0,
             tx_stall_after: None,
             management_resume: None,
             management_rates: Vec::new(),
@@ -224,6 +249,7 @@ impl Model {
             data_qos: Vec::new(),
             wmm_reply: None,
             ht_reply: None,
+            vht_reply: None,
             stall_edca: false,
             edca_progress_fault: 0,
             deny_tx_after: None,
@@ -361,10 +387,33 @@ impl Backend for Model {
                     result[0] = frame[34];
                     if frame[34..36] == [3, 0]
                         && self.ba_error_tag.is_some_and(|tag| {
-                            frame.get(56..58) == Some(tag.to_le_bytes().as_slice())
+                            let mut rest = &frame[56..];
+                            while let Some(header) = rest.get(..4) {
+                                let length =
+                                    usize::from(u16::from_le_bytes([header[2], header[3]]));
+                                if length < 4 || length > rest.len() {
+                                    return false;
+                                }
+                                if header[..2] == tag.to_le_bytes() {
+                                    return true;
+                                }
+                                rest = &rest[length..];
+                            }
+                            false
                         })
                     {
                         result[4..8].copy_from_slice(&1u32.to_le_bytes());
+                    }
+                    if frame[34..36] == [3, 0]
+                        && frame
+                            .get(56..64)
+                            .is_some_and(|b| b[..6] == [6, 0, 12, 0, 0, 1])
+                        && result[4..] == [0; 4]
+                    {
+                        self.tx_ba_native = frame[63] == 1;
+                        if self.tx_ba_native {
+                            self.packets.append(&mut self.tx_ba_late_rx);
+                        }
                     }
                     reply = runtime_event(1, frame[39], 0, &result);
                 } else if cmd == 3 {
@@ -561,13 +610,48 @@ impl Backend for Model {
                     return Err(Error::Bounds);
                 }
                 if frame.len() == 30 {
+                    let parameters = u16::from_le_bytes([frame[26], frame[27]]);
                     if frame[24..26] != [3, 2]
-                        || frame[26] != 0
-                        || frame[27] & 15 != 0
-                        || frame[27] >> 4 >= 8
+                        || parameters & 0x7ff != 0
+                        || parameters >> 12 >= 8
+                        || parameters & 0x800 != 0 && parameters >> 12 != 0
                         || frame[28..30] != [39, 0]
                     {
                         return Err(Error::Bounds);
+                    }
+                } else if frame[24..26] == [3, 0] {
+                    if frame[26] == 0 || frame[27..33] != [2, 16, 0, 0, 0, 0] {
+                        return Err(Error::Bounds);
+                    }
+                    if let Some((window, timeout)) = self.tx_ba_offer {
+                        let mut reply = vec![0; 33];
+                        reply[0] = 0xd0;
+                        reply[4..10].copy_from_slice(&frame[10..16]);
+                        reply[10..16].copy_from_slice(&frame[4..10]);
+                        reply[16..22].copy_from_slice(&frame[16..22]);
+                        reply[24..27].copy_from_slice(&[3, 1, frame[26]]);
+                        reply[27..29].copy_from_slice(&self.tx_ba_status.to_le_bytes());
+                        reply[29..31].copy_from_slice(&(2 | window << 6).to_le_bytes());
+                        reply[31..33].copy_from_slice(&timeout.to_le_bytes());
+                        match self.tx_ba_fault {
+                            1 => reply[26] = reply[26].wrapping_add(1),
+                            2 => reply[29] |= 4,
+                            3 => reply[29] |= 1,
+                            4 => reply[29] &= !2,
+                            5 => reply[4] ^= 2,
+                            _ => {}
+                        }
+                        let mut native = descriptor(&reply);
+                        native[4] = 1;
+                        native[12..16]
+                            .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
+                        if self.tx_ba_fault == 6 {
+                            native[12..16].copy_from_slice(&(11u32 << 8).to_le_bytes());
+                        }
+                        if self.tx_ba_fault == 7 {
+                            native[8..12].copy_from_slice(&0u32.to_le_bytes());
+                        }
+                        self.packets.push_back(native);
                     }
                 } else if frame[24..26] != [3, 1] {
                     return Err(Error::Bounds);
@@ -610,6 +694,9 @@ impl Backend for Model {
                     if let Some(ht) = &self.ht_reply {
                         reply.extend_from_slice(ht);
                     }
+                    if let Some(vht) = &self.vht_reply {
+                        reply.extend_from_slice(vht);
+                    }
                 }
                 let mut packet = vec![0u8; 32 + reply.len()];
                 let len = packet.len();
@@ -619,6 +706,10 @@ impl Backend for Model {
                 packet[12..16]
                     .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
                 packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+                if self.vht_reply.is_some() {
+                    packet[24..28].copy_from_slice(&((1u32 << 24) | 11).to_le_bytes());
+                    // actual basic6Mbps OFDM metadata.
+                }
                 packet[32..].copy_from_slice(&reply);
                 self.packets.push_back(packet);
             }
@@ -690,6 +781,9 @@ impl Backend for Model {
                         m3_packet[12..16]
                             .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
                         m3_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
+                        if self.vht_reply.is_some() {
+                            m3_packet[24..28].copy_from_slice(&((1u32 << 24) | 11).to_le_bytes());
+                        }
                         m3_packet[32..].copy_from_slice(&m3_frame);
                         self.packets.push_back(m3_packet);
                     }
@@ -705,10 +799,27 @@ impl Backend for Model {
         }) {
             return Err(Error::Bounds);
         }
+        let header = crate::mt7921::packet_tx::ethernet_qos(frame, 0x1000, 1, 1, protected, qos)?;
         self.frames.push((false, frame.to_vec()));
         self.data_protection.push(protected);
         self.data_qos.push(qos);
+        self.data_aggregation.push(false);
+        self.data_ba_disabled.push(header[15] & 0x10 != 0);
         Ok(())
+    }
+    fn submit_data_aggregated(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
+        if !self.tx_ba_native {
+            return Err(Error::Bounds);
+        }
+        self.submit_data(frame, protected, true)?;
+        let header = crate::mt7921::packet_tx::ethernet_aggregated(frame, 0x1000, 1, protected)?;
+        *self.data_aggregation.last_mut().unwrap() = true;
+        *self.data_ba_disabled.last_mut().unwrap() = header[15] & 0x10 != 0;
+        Ok(())
+    }
+    fn receive_idle(&self) -> Result<bool, Error> {
+        self.check()?;
+        Ok(self.packets.is_empty())
     }
     fn management_complete(
         &mut self,
@@ -727,9 +838,15 @@ impl Backend for Model {
         {
             return Ok(None);
         }
+        if let Some(budget) = &mut self.completion_budget {
+            if *budget == 0 {
+                return Ok(None);
+            }
+            *budget -= 1;
+        }
         Ok(Some(crate::mt7921::packet_tx::Completion {
             token: 1,
-            status: 0,
+            status: self.completion_status,
         }))
     }
 }
@@ -2581,7 +2698,7 @@ fn mt76_reset_recovers_cancelled_dma_then_requires_fresh_station() -> TestResult
         || !matches!(session.state, State::RadioReady(_))
         || session.security.is_some()
         || session.station_bss.is_some()
-        || session.data_pending.is_some()
+        || !session.data_pending.is_empty()
         || !session.events.is_empty()
         || !session.backend.packets.is_empty()
         || !session.backend.owner.published

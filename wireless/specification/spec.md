@@ -69,6 +69,64 @@ headers and transport source under the repository's GPL-2.0 licensing.
 
 ## 3. Public Interface
 
+nl80211 scan caches and pending-operation guards bind the netdev's current
+ifindex and namespace as well as its name. Removing and recreating a same-named
+interface cannot inherit its predecessor's BSS facts, suppress fresh discovery,
+or let a late old operation release the replacement's busy guard. Scan dumps,
+station signal fallback and SME/CONNECT lookups respect that lifetime; native
+driver permissions and association receipts remain separately required.
+Stale operation admission fails before cache mutation. Asynchronous scan and
+CONNECT continuations recheck the captured identity before further dispatch,
+cache updates and events; retired completions cannot clear a replacement's
+connection owner or emit CONNECT/PORT_AUTHORIZED for an old index.
+Userspace-SME futures check that identity before each native poll and notification.
+Connection-owner grants and teardown claims also carry distinct monotonic
+tokens: reusing the same socket port ID on a live netdev cannot let an older
+queued release or held teardown act on the new grant. Owner/port mutations
+validate identity under the owner lock, and replacement or namespace movement
+resets peer, control-port and cached power-save state.
+
+`association::phy::{LocalHt, LocalVht, LocalPhy}` describes a native driver's
+implemented directional RX/TX limits. Checked HT20/HT40/VHT80 constructors
+encode only local equal-modulation HT MCS0..31, directional VHT MCS/NSS maps,
+GI and aggregation limits; optional LDPC/STBC/beamforming, extended NSS/BW and
+large A-MSDU remain absent. Local HT RX/TX include mandatory MCS0..7.
+`with_tx_selection` checks a nonempty subset of actual TX support for rate
+selection without changing capability IEs or granting transmit authority.
+These factual values are not capabilities and
+grant no channel, power, key, BA, controlled-port or publication authority.
+`ApElements::parse` validates an entire IE stream of at most2048 bytes with
+exact singleton HT Capabilities/Operation and VHT Capabilities/Operation pairs.
+`observe_with_phy` and `JoinPlan::prepare_with_phy` opt into this admission;
+the latter reparses the actual BSS and retains a private `Offer` bound to its
+addresses, primary channel and original mode/rate offer. Legacy entry points
+retain their existing membership-selector rejection.
+
+The opt-in path admits mandatory HT127/VHT126 membership selectors only with
+the corresponding complete compatible PHY, while preserving actual legacy
+basic rates for management frames. GLK/EPD/SAE-H2E/HE/EHT/UHR and unknown
+mandatory selectors remain unsupported. Optional unflagged values grant no
+membership. Present malformed or orphan PHY elements fail instead of becoming
+legacy fallback. Missing optional PHY can retain legacy operation. Generated
+local capability IEs are protocol-owned; caller HT/VHT capabilities and, on
+this path, HT/VHT Operation IEs are rejected before first transmission.
+
+`offered_phy()` and `negotiated_phy()` expose read-only directional HT/VHT
+facts, the selected width/center and complete occupied20MHz channel set.
+TX intersects local implementation with AP RX from both scan and response;
+local advertised RX limits and AP TX metadata remain independent. Strict
+HT Basic MCS and both-direction VHT Basic MCS/NSS checks apply, including
+the all-eight-NSS requirement of VHT basic map0. Selected HT requires a bound
+complete response pair. VHT width0 delegates to HT; contiguous80MHz validates
+all four canonical constituents and the matching HT40 primary pair. No
+160/80+80/revised nonzero second segment or extended NSS/BW admission exists.
+A response may narrow the original occupied set but cannot expand it. All
+address/status/AID/security/rate/membership/PHY checks precede one atomic
+rate/PHY/Associated transition; failure leaves old rates and no partial PHY
+result. Drivers must separately reconfigure native state on narrowing, program
+protection/EDCA/peer records, enforce current regulatory and measured power
+authority for every occupied channel, and complete key/port transactions.
+
 `wmm::{Parameters, Ac, Error, INFORMATION}` parses one WMM v1 Parameter
 element in a complete IE stream of at most4096 bytes. It validates exact
 OUI/type/subtype/version/length/reserved fields and four distinct ACIs, and
@@ -882,6 +940,70 @@ group keys are receive-only. Full header, fragment, A-MSDU and CCMP extents
 are checked before crypto; identical-key reinstall preserves counters, and
 authentication failure changes neither replay state nor ciphertext.
 
+`amsdu::{decode, MAX_BYTES, MAX_SUBFRAMES}` supplies bounded station-side
+plaintext A-MSDU decoding into complete Ethernet-II frames. The caller binds
+the local station and outer native receiver before parsing; this helper grants
+no PHY, association, crypto or controlled-port authority. The default HT limit
+is3839 bytes, with work bounded by3839/22 minimum-size subframes. Every subframe
+has an exact14-byte DA/SA/length header,8..1508-byte RFC1042 body and complete
+inter-subframe alignment. IEEE padding bytes are opaque; a last subframe has
+no trailing padding. A malformed later subframe returns no partial result.
+Unicast outer RA binds inner unicast DA to the local station while permitting
+multicast DA as Linux's station check_da rule does. Multicast outer RA binds
+every inner DA to that exact receiver. Each SA must be nonlocal unicast.
+RFC1042 first-subframe DA ambiguity (aggregation-bit injection), malformed SNAP,
+length protocols, legacy AARP/IPX tunnel exceptions, EAPOL/preauthentication and
+VLAN-encapsulated control ports are rejected. Ordinary Ethernet-II VLAN data
+is retained with at most two customer/provider tags.
+
+`Key::unprotect_amsdu(header, wire)` is a distinct opt-in software CCMP receive
+operation. It requires an original protected26-byte FromDS QoS DATA header
+with A-MSDU-present, no fragments/Address4/HT-control/EOSP/alternate ACK policy,
+and the key's retained native station/peer/role/KeyID. It authenticates the
+entire aggregate using the original IEEE CCMP header/TID/nonce into scratch,
+validates and allocates every subframe, then commits exactly one existing
+key/TID replay update. All failures preserve caller ciphertext and replay
+state. Aggregates and standalone QoS MPDUs share the same sixteen replay
+trackers, key epochs and GTK RSC floors. Ordinary CCMP masks A-MSDU-present
+in AAD; the parser's RFC1042 DA check supplies the Linux aggregation-injection
+mitigation without changing interoperable AAD. No SPP A-MSDU support is claimed.
+The original `protect`/`unprotect` continue rejecting A-MSDU headers; TX
+aggregation, hardware-deaggregated RX, BA/reordering and larger VHT limits are
+separate native ownership contracts.
+
+`reorder::Reorder<T>` supplies a bounded opaque native-MPDU sequence owner,
+independent of crypto, radio, policy and controlled-port authority. Construction
+requires window1..64 and a positive hole timeout. Its slots are heap allocated;
+no generic64-item stack array is formed. Offloaded RX BA has no notification
+SSN, so the first native-admitted frame initializes the12-bit head, matching
+mac80211's auto_seq behavior. A separately validated native BAR may establish
+or advance the head through `advance(sequence, now_ns)`. The driver retains
+peer/TID/session/generation proof and supplies current monotonic nanoseconds.
+
+`push(sequence, now_ns, item)` returns ordered original items across contiguous
+sequence numbers and drives hole expiry. Duplicate, old and exactly-half-range
+ambiguous input drops only that incoming item, without replacing queued bytes
+or refreshing their age. Future out-of-window input releases older buffered
+ownership in sequence order and advances through holes to retain at most the
+negotiated window. Independent slot indexing handles non-power-of-two windows
+across4095→0. `expire(now_ns)` advances expired holes during idle progress;
+an older buffered arrival cannot be held indefinitely by newer nearer frames.
+`advance` releases buffered items before its validated BAR head and contiguous
+items afterward; old/half-range BARs cannot move backward. Output allocation
+uses try_reserve before any state mutation; all three operations return typed
+Window/Timeout/Sequence/Allocation errors as applicable.
+
+`clear` discards every buffered item, retains allocation and resets auto-sequence;
+`retire` consumes the owner. Drop never implicitly delivers data. `head`,
+`window` and `buffered` are diagnostic facts, not capabilities. Drivers must
+buffer original MPDUs here before CCMP/PN processing, authenticate only released
+items, and enforce current key/port/policy before publication. Native HTT BA,
+PPDU ownership, BAR input, key/reply epoch flushing, peer unmap and terminal
+teardown remain driver responsibilities. Nine native Rust smokes cover all
+window sizes, original-item order, holes/duplicates/late arrivals, half-range
+ambiguity, wrap with window3, bounded future advance, BAR, oldest timeout and
+clear/retire/drop ownership.
+
 `station_security::{Security, RawFrame, Rx}` composes the shared WPA2-PSK
 supplicant with those keys. Drivers supply already-negotiated station/AP RSNEs
 and original descriptor-validated native MPDUs. `RawFrame::unmodified()` must
@@ -912,6 +1034,22 @@ invalid TIDs do not consume sequence/PN state. Each caller must independently
 prove AP WMM negotiation, native EDCA/descriptor/peer admission and applicable
 policy. This shared cryptographic formatter grants no HT, aggregation, U-APSD,
 role or radio capability.
+
+`Security::receive_amsdu(&impl RawFrame)` composes that aggregate key operation
+with the existing currently-open controlled port and installed pairwise/group
+slots. It returns `Option<Vec<Vec<u8>>>` of complete Ethernet-II subframes and
+preserves the existing `Rx` enum and ordinary receive path. Closed, failed or
+pending-reply owners return State before key/replay work; invalid raw/native
+headers, MICs, key identities, replay or subframe geometry return None without
+altering a live owner. An aggregate cannot deliver EAPOL to the supplicant,
+install a key, commit an M4 reply or revive a port. The driver must independently
+prove negotiated HT, original native PHY/peer/channel/TID/CRC admission and
+current policy before calling and again before publishing returned frames.
+Open station owners may call the plaintext parser only after their own native
+association/controlled-port checks. Sixteen native Rust smokes cover exact
+Ethernet, all TIDs, PTK/GTK0/GTK2 and RSC, malformed later subframes, MIC/RA/TA/
+TID/header denial, aggregation-bit injection, atomic PN, default size/work
+bounds, closed/pending ports and real retained pairwise/group rekeys.
 
 `Security::handshake_active()` reports a retained reply awaiting terminal
 delivery or the supplicant waiting for M3 after M2 delivery. It is false after

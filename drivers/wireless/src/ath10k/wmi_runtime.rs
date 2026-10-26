@@ -17,6 +17,7 @@ pub use management::{
 mod active_scan;
 pub(in crate::ath10k) use active_scan::checked as checked_policy;
 mod data;
+mod ht;
 mod mlme;
 mod power_save;
 mod wmm;

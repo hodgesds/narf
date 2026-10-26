@@ -9,6 +9,7 @@ pub(super) const TX_BD: usize = 16;
 pub(super) const RX_DESC: usize = 24;
 pub(super) const RX_BD: usize = 8;
 pub(super) const MAX_MPDU: usize = 2304;
+pub(super) const MAX_HT_RX: usize = 26 + 16 + narf_wireless::amsdu::MAX_BYTES;
 pub(super) const RX_BYTES: usize = 11454 + RX_DESC;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,16 +53,25 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
 pub(super) struct DataProfile {
     pub rates: u16,
     pub qos: bool,
+    pub mcs: u8,
+    pub sgi: bool,
 }
 impl DataProfile {
     pub(super) const LEGACY: Self = Self {
         rates: 1,
         qos: false,
+        mcs: 0,
+        sgi: false,
     };
     pub(super) fn valid(self) -> bool {
-        self.rates != 0 && self.rates & !0xfff == 0
+        self.rates != 0
+            && self.rates & !0xfff == 0
+            && (self.mcs == 0 && !self.sgi || self.mcs != 0 && self.qos)
     }
     pub(super) fn rate_id(self) -> u8 {
+        if self.mcs != 0 {
+            return if self.rates & 15 == 0 { 5 } else { 3 };
+        }
         if self.rates & 0xff0 == 0 {
             8
         } else if self.rates & 15 == 0 {
@@ -71,6 +81,9 @@ impl DataProfile {
         }
     }
     pub(super) fn rate(self) -> u8 {
+        if self.mcs != 0 {
+            return 12 + (7 - self.mcs.leading_zeros() as u8);
+        }
         const KBPS: [u32; 12] = [
             1000, 2000, 5500, 11000, 6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000,
         ];
@@ -82,8 +95,14 @@ impl DataProfile {
     }
     pub(super) fn response_mask(self) -> u32 {
         let rate = self.rate();
-        let mut order = if rate >= 4 { rate - 4 } else { rate };
-        if order == 0 {
+        let mut order = if rate >= 12 {
+            rate - 12
+        } else if rate >= 4 {
+            rate - 4
+        } else {
+            rate
+        };
+        if rate >= 12 || order == 0 {
             order += 1;
         }
         ((1u32 << (u32::from(order) + 4)) - 1) & 0x15f
@@ -106,6 +125,14 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
         // Management stays legacy. The separate qualified branch below may
         // admit only BE/TID0 QoS, without aggregation or fragmentation.
         0x00 | 0xb0 | 0xa0 | 0xc0 if frame[1] & (3 | 64) == 0 => Ok(Queue::Management),
+        0xd0 if profile.mcs != 0
+            && frame.len() == 33
+            && frame[1] == 0
+            && frame[24..26] == [3, 1]
+            && frame[27..29] == [37, 0] =>
+        {
+            Ok(Queue::Management)
+        }
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
         0x88 if profile.qos
             && frame.len() >= 26
@@ -177,6 +204,9 @@ pub(super) fn transmit_profile(
         },
     );
     put(&mut bytes, 24, u32::from(report.unwrap_or(0)));
+    if ordinary && profile.mcs != 0 {
+        put(&mut bytes, 20, u32::from(profile.sgi) << 4);
+    }
     let sequence = u16::from_le_bytes([frame[22], frame[23]]) >> 4;
     put(&mut bytes, 36, u32::from(sequence) << 12);
     Ok((bytes, queue))
@@ -211,6 +241,18 @@ pub(super) struct Receive {
     pub(super) rate: u8,
 }
 pub(super) fn receive(descriptor: &[u8; RX_DESC]) -> Result<Receive, Error> {
+    receive_profile(descriptor, false)
+}
+/// Call only after successful descriptor admission. Linux rx.c places the
+/// single status record before driver-info bytes, after native shift bytes.
+pub(super) fn phy_status(descriptor: &[u8; RX_DESC]) -> Option<Range<usize>> {
+    if word(descriptor, 0) & (1 << 26) == 0 || word(descriptor, 8) & (1 << 28) != 0 {
+        return None;
+    }
+    let start = RX_DESC + ((word(descriptor, 0) >> 24) & 3) as usize;
+    Some(start..start + 32)
+}
+pub(super) fn receive_profile(descriptor: &[u8; RX_DESC], ht: bool) -> Result<Receive, Error> {
     let first = word(descriptor, 0);
     let length = (first & 0x3fff) as usize;
     let info = ((first >> 16) & 15) as usize;
@@ -232,8 +274,8 @@ pub(super) fn receive(descriptor: &[u8; RX_DESC]) -> Result<Receive, Error> {
     } else {
         let encryption = (first >> 20) & 7;
         let software = first & (1 << 27) != 0;
-        if !(28..=MAX_MPDU + 4).contains(&length)
-            || rate >= 12
+        if !(28..=if ht { MAX_HT_RX + 4 } else { MAX_MPDU + 4 }).contains(&length)
+            || rate >= if ht { 20 } else { 12 }
             || word(descriptor, 16) & 0x30 != 0
             || encryption != 0 && !(encryption == 4 && software)
         {

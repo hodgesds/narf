@@ -60,10 +60,7 @@ impl core::fmt::Debug for Owner {
 impl Owner {
     pub fn new(mut hardware: Hardware, firmware: &[u8]) -> Result<Self, &'static str> {
         let parsed = super::parse_ucode(firmware).map_err(|_| "invalid MVM firmware image")?;
-        if parsed.header.version != 77
-            || parsed.fw_version.is_some_and(|v| v.0 != 77)
-            || !hardware.matches_firmware(&parsed)
-        {
+        if super::gen2_profile::firmware_api(&parsed) != 77 || !hardware.matches_firmware(&parsed) {
             return Err("MVM boot image/API differs from retained transport");
         }
         // Do not discover ABI incompatibility only after publishing DMA.
@@ -204,10 +201,15 @@ mod peer;
 #[path = "mvm_queue.rs"]
 mod queue;
 
+#[path = "mvm_amsdu.rs"]
+mod amsdu;
+#[path = "mvm_phy.rs"]
+mod phy;
 #[path = "mvm_power.rs"]
 mod power;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
+pub(super) use power::Emission as PowerEmission;
 
 #[path = "mvm_link.rs"]
 mod link;
@@ -229,3 +231,11 @@ pub type LegacyReceive = data::LegacyReceive;
 
 #[path = "mvm_security.rs"]
 mod rsna;
+pub(super) type PowerFence = power::Fence;
+pub(super) fn passive_channel(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> bool {
+    scan::passive_permitted(domain, channel)
+}
+#[path = "mvm_station.rs"]
+mod station;
+#[cfg(any(test, feature = "kernel-test"))]
+pub(super) use rsna::tests::Device as SecurityModel;

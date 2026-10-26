@@ -1,4 +1,6 @@
 use super::*;
+#[path = "station_security_amsdu_tests.rs"]
+mod amsdu_tests;
 use crate::eapol::{self, KeyFrame, KeyMgmt, Ptk};
 use narf_kernel_test::{kernel_test_in, TestResult};
 const OWN: [u8; 6] = [2, 0, 0, 0, 0, 1];

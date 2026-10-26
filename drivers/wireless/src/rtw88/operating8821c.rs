@@ -79,6 +79,7 @@ pub(super) struct Envelope {
     ceiling: i16,
     peaks: [i16; 14],
     thermal: [u8; 2],
+    ht_limit: Option<u8>,
 }
 fn factory_limits(factory: &Factory8821c) -> Result<[u8; 2], QError> {
     // Original C21 BTG RFE2/4 substitutes pathB's 2G record for physical RF-A.
@@ -123,7 +124,7 @@ impl Source {
                 })())
             }
         }
-        match self {
+        let result = match self {
             Self::Registered => {
                 let loader = narf_firmware::trusted_loader_authority()
                     .and_then(|cap| cap.derive::<Read>().ok())
@@ -141,10 +142,28 @@ impl Source {
             Self::Verified { bytes, signer, cap } => {
                 Envelope::decode(&bytes, signer, cap, request, calibration, limits)
             }
-        }
+        };
+        result.map(|mut e| {
+            let path = u8::from(matches!(factory.rfe(), 2 | 4));
+            e.ht_limit = factory
+                .power_path(path)
+                .and_then(|p| super::ht::factory_limit(p, 1, 63));
+            e
+        })
     }
 }
 impl Envelope {
+    pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
+        Some(super::ht::Facts {
+            hardware: self.calibration.hardware(),
+            maximum: self.ht_limit?,
+            legacy: self.indices,
+            cck: [0; 2],
+        })
+    }
+    pub(super) fn indices(&self) -> [u8; 12] {
+        self.indices
+    }
     pub(super) fn temperature(&self, value: u8) -> Result<(), Error> {
         self.calibration.temperature(value).map_err(denied)?;
         if (self.thermal[0]..=self.thermal[1]).contains(&value) {
@@ -209,6 +228,7 @@ impl Envelope {
             ceiling,
             peaks,
             thermal,
+            ht_limit: None,
         })
     }
     pub(super) fn matches(&self, request: &Request) -> bool {

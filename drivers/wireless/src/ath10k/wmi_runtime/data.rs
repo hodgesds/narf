@@ -4,6 +4,10 @@
 use super::*;
 use crate::ath10k::regulatory::Permission;
 use narf_wireless::station_security::{RawFrame, Rx, Security};
+const RECEIVED_FRAMES: usize = 256;
+const INCOMING_FRAMES: usize = 1024;
+#[path = "rx_ba.rs"]
+mod rx_ba;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Link {
@@ -13,6 +17,21 @@ pub struct Link {
 }
 #[derive(Debug)]
 struct Native(Vec<u8>);
+#[derive(Clone, Copy)]
+struct Addresses {
+    own: [u8; 6],
+    bssid: [u8; 6],
+}
+#[derive(Debug)]
+struct Incoming {
+    frame: Native,
+    peer: u16,
+    data_admitted: bool,
+}
+enum NativeEvent {
+    Data(Native),
+    Bar { tid: u8, sequence: u16 },
+}
 impl RawFrame for Native {
     fn bytes(&self) -> &[u8] {
         &self.0
@@ -32,7 +51,10 @@ struct Pending {
 pub(super) struct State {
     security: Option<Security>,
     pending: Option<Pending>,
-    incoming: VecDeque<Native>,
+    incoming: VecDeque<Incoming>,
+    rx_ba: rx_ba::Owner,
+    #[cfg(any(test, feature = "kernel-test"))]
+    receive_time: Option<u64>,
     received: VecDeque<Vec<u8>>,
     sequence: u16,
     qos: bool,
@@ -45,6 +67,7 @@ impl State {
         self.failed = true;
         self.incoming.clear();
         self.received.clear();
+        self.rx_ba.clear();
         if let Some(security) = &mut self.security {
             security.fail();
         }
@@ -52,8 +75,79 @@ impl State {
         // Do not release or pretend to complete the outstanding native ID.
     }
     fn open(&self) -> bool {
-        !self.failed && self.authorized
+        !self.failed && self.authorized && self.security.as_ref().is_none_or(Security::port_open)
     }
+    fn now(&self) -> u64 {
+        #[cfg(any(test, feature = "kernel-test"))]
+        if let Some(now) = self.receive_time {
+            return now;
+        }
+        narf_time::wall::monotonic_ns()
+    }
+    fn queue_ready(&mut self, frames: Vec<Incoming>) -> Result<(), Error> {
+        if self.incoming.len().saturating_add(frames.len()) > INCOMING_FRAMES {
+            return Err(Error::Exhausted);
+        }
+        self.incoming
+            .try_reserve(frames.len())
+            .map_err(|_| Error::NoMemory)?;
+        self.incoming.extend(frames);
+        Ok(())
+    }
+    fn receive_native(
+        &mut self,
+        frame: htt::rx::Msdu,
+        status: u8,
+        peer: u16,
+        tid: u8,
+        addresses: Addresses,
+        now: u64,
+    ) -> Result<(), Error> {
+        let data_admitted = self.open();
+        match raw_frame(frame, status, peer, tid, addresses, &mut self.rx_ba, now)? {
+            Some(NativeEvent::Data(frame)) => {
+                if !data_admitted && !plaintext_eapol(&frame, addresses) {
+                    // Even a valid original FIRST was not admitted in this
+                    // controlled-port epoch. Its PHY context cannot authorize
+                    // a later MIDDLE/LAST after a delayed reply receipt.
+                    self.rx_ba.discard_ppdu();
+                    return Ok(());
+                }
+                let ready = self.rx_ba.push(
+                    Incoming {
+                        frame,
+                        peer,
+                        data_admitted,
+                    },
+                    now,
+                )?;
+                self.queue_ready(ready)?;
+            }
+            Some(NativeEvent::Bar { tid, sequence }) => {
+                let ready = self.rx_ba.bar(peer, tid, sequence, now)?;
+                self.queue_ready(ready)?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+}
+fn plaintext_eapol(frame: &Native, addresses: Addresses) -> bool {
+    let b = &frame.0;
+    let at = if b[0] == 0x88 { 26 } else { 24 };
+    if b[1] & 0x40 != 0
+        || b[4..10] != addresses.own
+        || b[16..22] != addresses.bssid
+        || b[0] == 0x88 && b[24] & 0x80 != 0
+        || b.get(at..at + 8) != Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
+    {
+        return false;
+    }
+    let pdu = &b[at + 8..];
+    pdu.len() >= 4
+        && (1..=3).contains(&pdu[0])
+        && pdu[1] == 3
+        && usize::from(u16::from_be_bytes([pdu[2], pdu[3]])) + 4 == pdu.len()
 }
 fn security_error(_: narf_wireless::station_security::Error) -> Error {
     Error::Malformed
@@ -116,6 +210,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             data.last_peer = narf_time::Deadline::after_ms(0);
         }
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::ath10k) fn receive_time_for_test(&mut self, now: u64) {
+        if let Some(data) = &mut self.data {
+            data.receive_time = Some(now);
+        }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::ath10k) fn receive_ba_for_test(
+        &self,
+        tid: u8,
+    ) -> Option<(u16, u8, usize, Option<u16>)> {
+        self.data.as_ref()?.rx_ba.state(tid)
+    }
     pub fn data_supported(&self) -> bool {
         self.htt.data_profile()
     }
@@ -134,6 +241,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             data.fail();
         }
     }
+    /// Host closure retires receive ownership without failing a still-owned
+    /// native TX operation or preventing the subsequent DOWN/DELETE sequence.
+    pub(in crate::ath10k) fn retire_station_receive(&mut self) {
+        if let Some(data) = &mut self.data {
+            data.incoming.clear();
+            data.received.clear();
+            data.rx_ba.clear();
+        }
+    }
     pub fn station_link(&self) -> Option<Link> {
         if !self.data.as_ref()?.open() {
             return None;
@@ -144,6 +260,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             frequency: associated.frequency,
             protected: associated.protected,
         })
+    }
+    pub(in crate::ath10k) fn data_permission(&self) -> Option<Permission> {
+        self.station_link()?;
+        Some(self.peer.as_ref()?.permission)
     }
     pub(in crate::ath10k) fn check_data_policy(
         &self,
@@ -228,6 +348,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // only exact descriptor-bound, unprotected unicast EAPOL for the new
         // supplicant. Association-era IP can never become authorized later.
         let peer = self.peer.as_ref().ok_or(Error::Failed)?;
+        let mut rx_ba = rx_ba::Owner::new(peer.ht)?;
+        let addresses = Addresses {
+            own,
+            bssid: associated.bssid,
+        };
         for event in core::mem::take(&mut self.pending) {
             let frames = match event {
                 htt::Event::Rx(batch) if security.is_some() && peer.owns(batch.peer) => batch
@@ -254,18 +379,24 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             };
             for (status, id, tid, frame) in frames {
-                if let Some(frame) = raw_frame(frame, status, id, tid, own, associated.bssid)? {
-                    let bytes = &frame.0;
-                    let at = if bytes[0] == 0x88 { 26 } else { 24 };
-                    if bytes[1] & 0x40 == 0
-                        && bytes[4..10] == own
-                        && bytes[16..22] == associated.bssid
-                        && bytes.get(at..at + 8) == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
-                    {
+                if let Some(NativeEvent::Data(frame)) = raw_frame(
+                    frame,
+                    status,
+                    id,
+                    tid,
+                    addresses,
+                    &mut rx_ba,
+                    narf_time::wall::monotonic_ns(),
+                )? {
+                    if plaintext_eapol(&frame, addresses) {
                         if incoming.len() == 64 {
                             return Err(Error::Exhausted);
                         }
-                        incoming.push_back(frame);
+                        incoming.push_back(Incoming {
+                            frame,
+                            peer: id,
+                            data_admitted: false,
+                        });
                     }
                 }
             }
@@ -275,6 +406,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             security,
             pending: None,
             incoming,
+            rx_ba,
+            #[cfg(any(test, feature = "kernel-test"))]
+            receive_time: None,
             received: VecDeque::new(),
             sequence: 2,
             qos: self.peer.as_ref().ok_or(Error::Failed)?.wmm.is_some(),
@@ -431,13 +565,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             }
             if idle {
-                let frames = self
-                    .data
-                    .as_mut()
-                    .ok_or(Error::Failed)?
-                    .received
-                    .drain(..)
-                    .collect();
+                let data = self.data.as_mut().ok_or(Error::Failed)?;
+                if !data.open() {
+                    data.received.clear();
+                }
+                let frames = data.received.drain(..).collect();
                 self.failed = false;
                 return Ok(frames);
             }
@@ -493,6 +625,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 .await?;
             if idle {
                 let data = self.data.as_mut().ok_or(Error::Failed)?;
+                if !data.open() {
+                    data.received.clear();
+                }
                 let frames = data.received.drain(..).collect();
                 self.failed = false;
                 return Ok(frames);
@@ -519,10 +654,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate()?;
         Ok(idle)
     }
-    fn data_check(&self) -> Result<(), Error> {
+    fn data_check(&mut self) -> Result<(), Error> {
         if self.peer.as_ref().and_then(|p| p.associated).is_none()
             || self.peer.as_ref().and_then(station::Peer::mapped).is_none()
         {
+            if let Some(data) = &mut self.data {
+                data.fail();
+            }
             return Err(Error::Failed);
         }
         if self
@@ -531,9 +669,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .and_then(|d| d.pending.as_ref())
             .is_some_and(|p| p.deadline.expired())
         {
+            if let Some(data) = &mut self.data {
+                data.fail();
+            }
             return Err(Error::Timeout);
         }
         if self.data.as_ref().is_some_and(|d| d.last_peer.expired()) {
+            if let Some(data) = &mut self.data {
+                data.fail();
+            }
             return Err(Error::Timeout);
         }
         Ok(())
@@ -543,7 +687,30 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         event: htt::Event,
         nonce: &mut impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<(bool, Option<Vec<u8>>), Error> {
+        let result = self.data_event_inner(event, nonce);
+        if result.is_err() {
+            if let Some(data) = &mut self.data {
+                data.fail();
+            }
+        }
+        result
+    }
+    fn data_event_inner(
+        &mut self,
+        event: htt::Event,
+        nonce: &mut impl FnMut() -> Option<[u8; 32]>,
+    ) -> Result<(bool, Option<Vec<u8>>), Error> {
         let idle = matches!(event, htt::Event::Idle);
+        if self
+            .peer
+            .as_ref()
+            .is_none_or(|peer| peer.associated.is_none() || peer.mapped().is_none())
+        {
+            if let Some(data) = &mut self.data {
+                data.fail();
+            }
+            return Err(Error::Failed);
+        }
         let peer = self.peer.as_ref().ok_or(Error::Failed)?;
         if peer.associated.is_none() || peer.mapped().is_none() {
             return Err(Error::Failed);
@@ -551,19 +718,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let own = self.ready.ok_or(Error::Failed)?.mac;
         let bssid = peer.bssid;
         let data = self.data.as_mut().ok_or(Error::Failed)?;
+        let addresses = Addresses { own, bssid };
+        let now = data.now();
+        data.rx_ba.retain(|id| peer.owns(id));
+        let expired = data.rx_ba.expire(now)?;
+        data.queue_ready(expired)?;
         match event {
             htt::Event::Rx(batch) => {
                 if peer.owns(batch.peer) {
                     for (status, frame) in batch.frames {
-                        if let Some(frame) =
-                            raw_frame(frame, status, batch.peer, batch.tid, own, bssid)?
-                        {
-                            if data.incoming.len() == 64 {
-                                return Err(Error::Exhausted);
-                            }
-                            data.incoming.push_back(frame);
-                        }
+                        data.receive_native(frame, status, batch.peer, batch.tid, addresses, now)?;
                     }
+                } else {
+                    data.rx_ba.discard_ppdu();
                 }
             }
             htt::Event::InOrder(indication, frames) => {
@@ -573,15 +740,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     && peer.owns(indication.peer)
                 {
                     for frame in frames {
-                        if let Some(frame) =
-                            raw_frame(frame, 1, indication.peer, indication.tid, own, bssid)?
-                        {
-                            if data.incoming.len() == 64 {
-                                return Err(Error::Exhausted);
-                            }
-                            data.incoming.push_back(frame);
-                        }
+                        data.receive_native(
+                            frame,
+                            1,
+                            indication.peer,
+                            indication.tid,
+                            addresses,
+                            now,
+                        )?;
                     }
+                } else {
+                    data.rx_ba.discard_ppdu();
                 }
             }
             htt::Event::Wmi(bytes)
@@ -589,6 +758,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             {
                 let management = self.wire.management(&bytes[4..], self.features)?;
                 let f = &management.frame;
+                if management.status & !0x40 == 0
+                    && wire::channel_to_frequency(management.channel)
+                        == Some(peer.permission.frequency)
+                    && peer.ht.is_some()
+                {
+                    if let Some((tid, sequence)) = bar(f, addresses) {
+                        let ready = data.rx_ba.station_bar(tid, sequence, now)?;
+                        data.queue_ready(ready)?;
+                    }
+                }
                 if let Some(beacon) = super::beacon(&management, &[peer.permission.frequency])? {
                     if beacon.bssid == bssid
                         && self
@@ -614,12 +793,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
             }
             htt::Event::Message(bytes) if !matches!(bytes.first(), Some(3 | 4)) => {
-                // BA, fragment and PFC events require separate ownership. This
-                // profile never advertises HT/VHT or accepts a PFC image.
-                if matches!(
-                    bytes.first(),
-                    Some(2 | 5 | 6 | 0xb | 0xc | 0xd | 0x16 | 0x17 | 0x18)
-                ) {
+                let ba = data.rx_ba.note(&bytes, |id| peer.owns(id))?;
+                // Fragment/PFC and their additional ownership remain separate.
+                if !ba && matches!(bytes.first(), Some(0xb | 0xc | 0xd | 0x16 | 0x17 | 0x18)) {
                     return Err(Error::Unsupported);
                 }
             }
@@ -632,6 +808,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     return Err(Error::Firmware(u32::from(receipt.status)));
                 }
                 if pending.reply {
+                    // Native reply completion is a receive-admission epoch
+                    // boundary. Firmware BA agreements persist across rekey,
+                    // but no retained PPDU PHY proof crosses this boundary.
+                    data.rx_ba.discard_ppdu();
                     data.security
                         .as_mut()
                         .ok_or(Error::Failed)?
@@ -650,9 +830,44 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 .and_then(Security::pending_frame)
                 .is_none()
         {
-            let Some(frame) = data.incoming.pop_front() else {
+            let Some(incoming) = data.incoming.pop_front() else {
                 break;
             };
+            if !peer.owns(incoming.peer) {
+                continue;
+            }
+            let frame = incoming.frame;
+            if !incoming.data_admitted && !plaintext_eapol(&frame, addresses) {
+                continue;
+            }
+            if !data.open() && !plaintext_eapol(&frame, addresses) {
+                continue;
+            }
+            if frame.0[0] == 0x88 && frame.0[24] & 0x80 != 0 {
+                // Native peer/PHY/TID admission precedes this path. Authenticate
+                // the original aggregate once; splitting before MIC/replay
+                // validation would assign authority to unauthenticated bytes.
+                let frames = if let Some(security) = &mut data.security {
+                    security.receive_amsdu(&frame).map_err(security_error)?
+                } else if frame.0[1] & 0x40 == 0 {
+                    narf_wireless::amsdu::decode(
+                        &frame.0[26..],
+                        own,
+                        frame.0[4..10].try_into().unwrap(),
+                    )
+                    .ok()
+                } else {
+                    None
+                };
+                if let Some(frames) = frames {
+                    if data.received.len().saturating_add(frames.len()) > RECEIVED_FRAMES {
+                        return Err(Error::Exhausted);
+                    }
+                    data.last_peer = narf_time::Deadline::after_ms(5000);
+                    data.received.extend(frames);
+                }
+                continue;
+            }
             let normalized = if let Some(security) = &mut data.security {
                 match security
                     .receive_with_nonce(&frame, &mut *nonce)
@@ -664,6 +879,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         Some(frame)
                     }
                     Rx::ReplyReady => {
+                        // A reply fences a new receive admission/key epoch.
+                        // Never allow a late native TX receipt to authorize
+                        // data observed while the earlier port was closed.
+                        data.received.clear();
+                        data.rx_ba.flush();
+                        data.incoming
+                            .retain(|incoming| plaintext_eapol(&incoming.frame, addresses));
                         data.last_peer = narf_time::Deadline::after_ms(5000);
                         break;
                     }
@@ -673,7 +895,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             };
             if let Some(frame) = normalized.and_then(|f| ethernet(&f, own, bssid)) {
                 data.last_peer = narf_time::Deadline::after_ms(5000);
-                if data.received.len() == 64 {
+                if data.received.len() == RECEIVED_FRAMES {
                     return Err(Error::Exhausted);
                 }
                 data.received.push_back(frame);
@@ -700,10 +922,27 @@ fn raw_frame(
     status: u8,
     peer: u16,
     tid: u8,
-    own: [u8; 6],
-    bssid: [u8; 6],
-) -> Result<Option<Native>, Error> {
-    if msdu.offload.is_some() || !matches!(status, 1 | 6 | 10) {
+    addresses: Addresses,
+    ba: &mut rx_ba::Owner,
+    now: u64,
+) -> Result<Option<NativeEvent>, Error> {
+    let result = raw_frame_inner(&mut msdu, status, peer, tid, addresses, ba, now);
+    if !matches!(&result, Ok(Some(_))) {
+        // No malformed header/foreign indication may seed or bridge a PPDU.
+        ba.discard_ppdu();
+    }
+    result
+}
+fn raw_frame_inner(
+    msdu: &mut htt::rx::Msdu,
+    status: u8,
+    peer: u16,
+    tid: u8,
+    Addresses { own, bssid }: Addresses,
+    ba: &mut rx_ba::Owner,
+    now: u64,
+) -> Result<Option<NativeEvent>, Error> {
+    if msdu.offload.is_some() || !matches!(status, 1 | 6 | 10) || msdu.descriptor.len() < 116 {
         return Ok(None);
     }
     let descriptor = &msdu.descriptor;
@@ -713,7 +952,6 @@ fn raw_frame(
         | (1 << 4)
         | (1 << 7)
         | (1 << 8)
-        | (1 << 9)
         | (1 << 13)
         | (1 << 16)
         | (1 << 17)
@@ -723,15 +961,12 @@ fn raw_frame(
     let start = word(12);
     if attention & (1 << 31) == 0
         || attention & errors != 0
-        || attention & 3 != 3
         || word(28) & 0x300 != 0
         || word(56) & 0xc000 != 0xc000
-        || word(104) >> 24 != 4
         || (word(24) & 0x3fff) as usize != msdu.payload.len()
         || start & 0x7ff != u32::from(peer)
-        || start & 0x1800 != 0x800
         || word(20) >> 28 != u32::from(if tid == 16 { 0 } else { tid })
-        || !(28..=4096).contains(&msdu.payload.len())
+        || !(24..=4096).contains(&msdu.payload.len())
     {
         return Ok(None);
     }
@@ -748,9 +983,29 @@ fn raw_frame(
     }
     msdu.payload.truncate(msdu.payload.len() - 4); // native RAW carries FCS
     let frame = &msdu.payload;
+    if let Some((bar_tid, sequence)) = bar(frame, Addresses { own, bssid }) {
+        // BAR is a non-QoS control MPDU, with neither DS bit set. Firmware
+        // descriptor TID is the non-QoS sentinel, not BAR control's TID.
+        if status == 1
+            && tid == 16
+            && start & 0x1800 == 0
+            && attention & (1 << 9) != 0
+            && attention & 3 == 3
+            && ba.ht()
+            && ba.phy(peer, tid, descriptor, false, frame.len() + 4, now)
+        {
+            return Ok(Some(NativeEvent::Bar {
+                tid: bar_tid,
+                sequence,
+            }));
+        }
+        return Ok(None);
+    }
     if frame.len() < 24
         || !matches!(frame[0], 8 | 0x88)
         || frame[1] & 0x87 != 2
+        || start & 0x1800 != 0x800
+        || attention & (1 << 9) != 0
         || u32::from(u16::from_le_bytes([frame[22], frame[23]]) >> 4) != (start >> 16) & 0xfff
         || frame[22] & 15 != 0
         || frame[10..16] != bssid
@@ -761,9 +1016,12 @@ fn raw_frame(
         return Ok(None);
     }
     let qos = frame[0] == 0x88;
-    if qos && (frame.len() < 26 || frame[24] & 0x80 != 0 || frame[24] & 15 != tid)
+    if qos && (frame.len() < 26 || frame[24] & 15 != tid || frame[24] & 0x80 != 0 && !ba.ht())
         || !qos && tid != 16
     {
+        return Ok(None);
+    }
+    if qos && frame[24] & 0x80 != 0 && (frame[24] & 0xf0 != 0x80 || frame[25] != 0) {
         return Ok(None);
     }
     if status == 6 {
@@ -772,5 +1030,35 @@ fn raw_frame(
             return Ok(None);
         }
     }
-    Ok(Some(Native(msdu.payload)))
+    if !ba.phy(
+        peer,
+        tid,
+        descriptor,
+        qos && frame[4] & 1 == 0,
+        frame.len() + 4,
+        now,
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(NativeEvent::Data(Native(core::mem::take(
+        &mut msdu.payload,
+    )))))
+}
+
+/// IEEE compressed, single-TID BAR. RA/TA bind the control to the current
+/// association; only an existing native peer/TID BA owner may advance it.
+fn bar(frame: &[u8], addresses: Addresses) -> Option<(u8, u16)> {
+    if frame.len() != 20
+        || frame[..2] != [0x84, 0]
+        || frame[4..10] != addresses.own
+        || frame[10..16] != addresses.bssid
+    {
+        return None;
+    }
+    let control = u16::from_le_bytes([frame[16], frame[17]]);
+    let sequence = u16::from_le_bytes([frame[18], frame[19]]);
+    if control & 0x0fff != 4 || sequence & 15 != 0 {
+        return None;
+    }
+    Some(((control >> 12) as u8, sequence >> 4))
 }

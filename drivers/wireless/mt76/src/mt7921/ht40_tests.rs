@@ -142,9 +142,9 @@ fn mt76_ht40_native_domain_channel_rlm_peer_and_response_geometry() -> TestResul
             let switch = frames
                 .iter()
                 .find(|(_, f)| f.len() >= 76 && f[36] == 0xed && f[41] == 8);
-            if switch.is_none_or(|(_, f)| f[64..69] != [primary, center, 1, 1, 3] || f[74] != band)
+            if switch.is_none_or(|(_, f)| f[64..69] != [primary, center, 1, 1, 2] || f[74] != band)
             {
-                return TestResult::Fail("native40MHz switch width/center/actual RX mask");
+                return TestResult::Fail("native40MHz switch width/center/actual RX count");
             }
             let rlm = frames
                 .iter()

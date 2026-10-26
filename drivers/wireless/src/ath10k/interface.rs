@@ -37,6 +37,31 @@ struct State {
     tx: narf_ipc::Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
 }
+struct ReceiveBatch {
+    permission: super::regulatory::Permission,
+    frames: Vec<Vec<u8>>,
+}
+#[cfg(any(test, feature = "kernel-test"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReceivePoint {
+    AfterFrameAllocation,
+    BeforeCallbackAdmission,
+}
+#[cfg(any(test, feature = "kernel-test"))]
+type ReceiveHook = Arc<dyn Fn(ReceivePoint) + Send + Sync>;
+#[derive(Clone, Copy)]
+pub(super) struct RadioFeatures {
+    power_save: bool,
+    ht: Option<[u8; 26]>,
+}
+impl RadioFeatures {
+    fn observed<T: Hif + HostMemory + HttMemory>(radio: &Radio<T>) -> Self {
+        Self {
+            power_save: radio.power_save_supported(),
+            ht: radio.ht_capabilities(),
+        }
+    }
+}
 impl State {
     fn clear(&mut self) {
         self.pending = None;
@@ -53,6 +78,7 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     name: String,
     generation: u64,
     ps_supported: bool,
+    ht_capabilities: Option<[u8; 26]>,
     ps_request: AtomicU8,
     frequencies: Vec<u16>,
     mac: [u8; 6],
@@ -62,6 +88,8 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     publication: IrqSafeSpinLock<()>,
     #[cfg(any(test, feature = "kernel-test"))]
     close_on_progress: AtomicBool,
+    #[cfg(any(test, feature = "kernel-test"))]
+    receive_hook: IrqSafeSpinLock<Option<ReceiveHook>>,
     bssid: AtomicU64,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
@@ -100,17 +128,10 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         name: &str,
         mac: [u8; 6],
         radio: Arc<Mutex<Radio<T>>>,
-        ps_supported: bool,
+        features: RadioFeatures,
         frequencies: Vec<u16>,
     ) -> Self {
-        Self::with_policy(
-            name,
-            mac,
-            radio,
-            Policy::Installed,
-            ps_supported,
-            frequencies,
-        )
+        Self::with_policy(name, mac, radio, Policy::Installed, features, frequencies)
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn for_test(
@@ -119,9 +140,13 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         radio: Arc<Mutex<Radio<T>>>,
         current: impl Fn() -> Option<narf_wireless::reg::RegulatoryDomain> + Send + Sync + 'static,
     ) -> Self {
-        let ps_supported = radio
+        let features = radio
             .try_lock()
-            .is_some_and(|radio| radio.power_save_supported());
+            .map(|radio| RadioFeatures::observed(&radio))
+            .unwrap_or(RadioFeatures {
+                power_save: false,
+                ht: None,
+            });
         let frequencies = radio
             .try_lock()
             .map(|radio| radio.configured_channels().to_vec())
@@ -131,7 +156,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             mac,
             radio,
             Policy::Model(Arc::new(current)),
-            ps_supported,
+            features,
             frequencies,
         )
     }
@@ -140,7 +165,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         mac: [u8; 6],
         radio: Arc<Mutex<Radio<T>>>,
         policy: Policy,
-        ps_supported: bool,
+        features: RadioFeatures,
         frequencies: Vec<u16>,
     ) -> Self {
         let (rx, consumer) = narf_ipc::channel();
@@ -153,10 +178,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 pending: None,
             }),
             name: name.into(),
-            ps_supported,
+            ps_supported: features.power_save,
+            ht_capabilities: features.ht,
             frequencies,
             // Submit the advertised awake default before first carrier.
-            ps_request: AtomicU8::new(u8::from(ps_supported)),
+            ps_request: AtomicU8::new(u8::from(features.power_save)),
             generation: NEXT_GENERATION
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     value.checked_add(1)
@@ -169,6 +195,8 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             publication: IrqSafeSpinLock::new(()),
             #[cfg(any(test, feature = "kernel-test"))]
             close_on_progress: AtomicBool::new(false),
+            #[cfg(any(test, feature = "kernel-test"))]
+            receive_hook: IrqSafeSpinLock::new(None),
             bssid: AtomicU64::new(0),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
@@ -304,19 +332,16 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         attempt.armed = false;
         Ok(())
     }
-    fn progress(&self) -> Vec<Vec<u8>> {
-        let Some(mut radio) = self.radio.try_lock() else {
-            return Vec::new();
-        };
-        let Some(mut state) = self.state.try_lock() else {
-            return Vec::new();
-        };
+    fn progress(&self) -> Option<ReceiveBatch> {
+        let mut radio = self.radio.try_lock()?;
+        let mut state = self.state.try_lock()?;
         if self.closed.load(Ordering::Acquire) {
             // Host closure precedes the control path's async mutex acquire.
             // A worker here must not poison an otherwise healthy radio before
             // that path can send native DOWN/DELETE/STOP.
+            radio.retire_station_receive();
             state.clear();
-            return Vec::new();
+            return None;
         }
         #[cfg(any(test, feature = "kernel-test"))]
         if self.close_on_progress.swap(false, Ordering::AcqRel) {
@@ -327,11 +352,12 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             // EAPOL generated by RX progress. No await or stack callback is here.
             let _publication = self.publication.lock();
             if self.closed.load(Ordering::Acquire) {
+                radio.retire_station_receive();
                 state.clear();
-                return Vec::new();
+                return None;
             }
             if !radio.has_station_data() {
-                return Vec::new();
+                return None;
             }
             (|| {
                 // Sampling under the publication gate precedes consuming any
@@ -339,6 +365,17 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 // DMA. A changed ceiling must match the programmed channel.
                 let domain = self.policy.current()?;
                 let frames = radio.poll_ethernet_now(&domain)?;
+                // A later event in this drain may have started a rekey after
+                // earlier data was decoded. Neither those buffered frames nor
+                // host TX can bypass the port's final current state.
+                let domain = self.policy.current()?;
+                radio.check_data_policy(&domain)?;
+                let Some(permission) = radio.data_permission() else {
+                    // An established authenticated rekey temporarily closes
+                    // DATA, not the still-associated physical carrier. Initial
+                    // authorization is published only by associate's receipt.
+                    return Ok(None);
+                };
                 self.publish_link(radio.station_link().map(|link| link.bssid));
                 if state.pending.is_none() {
                     for _ in 0..16 {
@@ -368,37 +405,64 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                     {
                         let mut frame = Frame::new(memory, bytes.len() as u32);
                         frame.payload_mut().copy_from_slice(bytes);
+                        #[cfg(any(test, feature = "kernel-test"))]
+                        self.receive_point_for_test(ReceivePoint::AfterFrameAllocation);
+                        radio.check_data_policy(&self.policy.current()?)?;
+                        if radio.data_permission() != Some(permission) {
+                            return Ok(None);
+                        }
                         let _ = state.rx.try_send(frame);
                     }
                 }
-                Ok(frames)
+                Ok(Some(ReceiveBatch { permission, frames }))
             })()
         };
         match result {
-            Ok(frames) => {
+            Ok(batch) => {
                 if self.closed.load(Ordering::Acquire) {
-                    Vec::new()
+                    None
                 } else {
-                    frames
+                    batch
                 }
             }
             Err(_) => {
                 radio.fail_station_data();
                 state.clear();
                 self.close();
-                Vec::new()
+                None
             }
         }
     }
     pub(super) fn drain(&self) -> bool {
-        let frames = self.progress();
+        let Some(batch) = self.progress() else {
+            return false;
+        };
         if self.closed.load(Ordering::Acquire) {
             return false;
         }
-        let progressed = !frames.is_empty();
-        for mut frame in frames {
-            if self.closed.load(Ordering::Acquire) {
-                break;
+        let progressed = !batch.frames.is_empty();
+        for mut frame in batch.frames {
+            // Release the native owner before calling the network stack: an
+            // ARP/ND reply may re-enter this same interface synchronously.
+            #[cfg(any(test, feature = "kernel-test"))]
+            self.receive_point_for_test(ReceivePoint::BeforeCallbackAdmission);
+            let admission: Result<bool, Error> = (|| {
+                if self.closed.load(Ordering::Acquire) {
+                    return Ok(false);
+                }
+                let Some(radio) = self.radio.try_lock() else {
+                    return Ok(false);
+                };
+                radio.check_data_policy(&self.policy.current()?)?;
+                Ok(radio.data_permission() == Some(batch.permission))
+            })();
+            match admission {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(_) => {
+                    self.close();
+                    break;
+                }
             }
             narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
         }
@@ -660,6 +724,26 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         self.close_on_progress.store(true, Ordering::Release);
     }
     #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn set_receive_hook_for_test(
+        &self,
+        hook: impl Fn(ReceivePoint) + Send + Sync + 'static,
+    ) {
+        *self.receive_hook.lock() = Some(Arc::new(hook));
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    fn receive_point_for_test(&self, point: ReceivePoint) {
+        let hook = { self.receive_hook.lock().clone() };
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn callback_locks_available_for_test(&self) -> bool {
+        self.radio.try_lock().is_some()
+            && self.state.try_lock().is_some()
+            && self.publication.try_lock().is_some()
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn stale_link_after_close_for_test(&self, peer: [u8; 6]) {
         self.close();
         self.link(Some(peer));
@@ -789,7 +873,7 @@ fn publish_with_mac(
     radio: Arc<Mutex<Radio<super::boot::PciBoot>>>,
     mac: [u8; 6],
     quarantine: &AtomicBool,
-    ps_supported: bool,
+    features: RadioFeatures,
     frequencies: Vec<u16>,
 ) -> Result<Arc<Native>, Error> {
     narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
@@ -802,7 +886,7 @@ fn publish_with_mac(
             return Err(Error::Failed);
         }
         let name = narf_net::iface::reserve_name("wlan%d");
-        let device = Arc::new(Device::new(name, mac, radio, ps_supported, frequencies));
+        let device = Arc::new(Device::new(name, mac, radio, features, frequencies));
         narf_net::registry()
             .register(&authority, Registered(device.clone()))
             .map_err(|_| Error::Unsupported)?;
@@ -847,7 +931,7 @@ pub(super) fn publish(
         radio.clone(),
         mac,
         &quarantine,
-        r.power_save_supported(),
+        RadioFeatures::observed(&r),
         r.configured_channels()
             .iter()
             .copied()
@@ -880,7 +964,7 @@ pub(super) async fn wait_publish(
                     radio.clone(),
                     mac,
                     &quarantine,
-                    r.power_save_supported(),
+                    RadioFeatures::observed(&r),
                     r.configured_channels()
                         .iter()
                         .copied()
@@ -896,6 +980,19 @@ pub(super) async fn wait_publish(
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for Native {
+    fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+        if !self
+            .frequencies
+            .iter()
+            .any(|frequency| band == 2400 && *frequency < 3000 || band == 5000 && *frequency > 3000)
+        {
+            return None;
+        }
+        Some(narf_wireless::iface::PhyCapabilities {
+            ht: self.ht_capabilities?,
+            vht: None,
+        })
+    }
     fn power_save_default(&self) -> Option<bool> {
         self.ps_supported.then_some(false)
     }
@@ -956,7 +1053,7 @@ impl WirelessNetIface for Native {
                 .collect(),
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: false,
+                ht_supported: self.ht_capabilities.is_some(),
                 vht_supported: false,
                 he_supported: false,
                 eht_supported: false,

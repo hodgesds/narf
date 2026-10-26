@@ -6,6 +6,8 @@ use crate::rsn::{self, RsnIe, Suite};
 use alloc::{vec, vec::Vec};
 #[path = "association/channel.rs"]
 pub mod channel;
+#[path = "association/phy.rs"]
+pub mod phy;
 
 /// One validated beacon/probe response, retaining original IEs for the SME.
 #[derive(Clone, Debug)]
@@ -73,6 +75,9 @@ pub struct JoinPlan {
     auth: Vec<u8>,
     assoc: Vec<u8>,
     phase: Phase,
+    phy_enabled: bool,
+    offered_phy: Option<phy::Offer>,
+    negotiated_phy: Option<phy::Negotiated>,
 }
 
 #[derive(Default)]
@@ -81,6 +86,8 @@ struct RateElements {
     extended: bool,
     rates: u16,
     basic: u16,
+    phy: bool,
+    selectors: u8,
 }
 impl RateElements {
     fn observe(&mut self, id: u8, body: &[u8]) -> Result<(), Error> {
@@ -100,6 +107,8 @@ impl RateElements {
                 if rate & 128 != 0 {
                     self.basic |= 1 << index;
                 }
+            } else if self.phy && matches!(*rate, 0xff | 0xfe) {
+                self.selectors |= if *rate == 0xff { 1 } else { 2 };
             } else if rate & 128 != 0 {
                 // This legacy profile has no HT/VHT/HE membership-selector
                 // negotiation. Unknown optional rates do not become offers.
@@ -135,6 +144,26 @@ pub fn observe(
     own: [u8; 6],
     signal_dbm: Option<i8>,
 ) -> Result<ObservedBss, Error> {
+    observe_inner(frame, channel, own, signal_dbm, None)
+}
+/// Opt into factual HT/VHT admission from the actual retained raw BSS.
+/// The local profile does not confer channel, transmit or association rights.
+pub fn observe_with_phy(
+    frame: &impl crate::station_security::RawFrame,
+    channel: u8,
+    own: [u8; 6],
+    signal_dbm: Option<i8>,
+    local: &phy::LocalPhy,
+) -> Result<ObservedBss, Error> {
+    observe_inner(frame, channel, own, signal_dbm, Some(local))
+}
+fn observe_inner(
+    frame: &impl crate::station_security::RawFrame,
+    channel: u8,
+    own: [u8; 6],
+    signal_dbm: Option<i8>,
+    local: Option<&phy::LocalPhy>,
+) -> Result<ObservedBss, Error> {
     let bytes = frame.bytes();
     if !frame.unmodified()
         || channel::band(channel).is_none()
@@ -158,7 +187,10 @@ pub fn observe(
     }
     let (mut ssid, mut ap_rsne, mut ap_rsnxe) = (None, None, None);
     let mut ds_seen = false;
-    let mut rates = RateElements::default();
+    let mut rates = RateElements {
+        phy: local.is_some(),
+        ..Default::default()
+    };
     ies(&bytes[36..], |id, body| {
         match id {
             0 => {
@@ -192,6 +224,9 @@ pub fn observe(
     })?;
     if !rates.supported || rates.rates == 0 || rates.basic == 0 {
         return Err(Error::UnsupportedRates);
+    }
+    if let Some(local) = local {
+        phy::Offer::prepare(*local, &bytes[36..], channel, rates.selectors)?;
     }
     Ok(ObservedBss {
         bss: Bss {
@@ -271,6 +306,15 @@ impl JoinPlan {
             return Err(Error::InvalidBss);
         }
         validate_sme_ies(bytes, self.security.is_wpa2())?;
+        if self.phy_enabled {
+            ies(bytes, |id, _| {
+                if matches!(id, 61 | 192) {
+                    Err(Error::UnsupportedRates)
+                } else {
+                    Ok(())
+                }
+            })?;
+        }
         ies(bytes, |id, body| {
             if id != 48 {
                 self.assoc.extend_from_slice(&[id, body.len() as u8]);
@@ -285,6 +329,32 @@ impl JoinPlan {
         ssid: &[u8],
         security: SecurityMode,
     ) -> Result<Self, Error> {
+        Self::prepare_inner(bss, own, ssid, security, None)
+    }
+    /// Prepare using an implementation profile derived by the native owner.
+    /// AP facts are reparsed and bound here, never accepted as an external grant.
+    pub fn prepare_with_phy(
+        bss: &Bss,
+        own: [u8; 6],
+        ssid: &[u8],
+        security: SecurityMode,
+        local: phy::LocalPhy,
+    ) -> Result<Self, Error> {
+        Self::prepare_inner(bss, own, ssid, security, Some(local))
+    }
+    pub fn offered_phy(&self) -> Option<&phy::Offer> {
+        self.offered_phy.as_ref()
+    }
+    pub fn negotiated_phy(&self) -> Option<&phy::Negotiated> {
+        self.negotiated_phy.as_ref()
+    }
+    fn prepare_inner(
+        bss: &Bss,
+        own: [u8; 6],
+        ssid: &[u8],
+        security: SecurityMode,
+        local: Option<phy::LocalPhy>,
+    ) -> Result<Self, Error> {
         if !unicast(own)
             || !unicast(bss.bssid)
             || own == bss.bssid
@@ -297,7 +367,10 @@ impl JoinPlan {
         {
             return Err(Error::InvalidBss);
         }
-        let mut rate_elements = RateElements::default();
+        let mut rate_elements = RateElements {
+            phy: local.is_some(),
+            ..Default::default()
+        };
         let mut rsn = None;
         let mut wpa = false;
         let mut seen_ssid = false;
@@ -334,6 +407,15 @@ impl JoinPlan {
         if !seen_ssid || !rate_elements.supported || rates == 0 || basic == 0 {
             return Err(Error::UnsupportedRates);
         }
+        let offered_phy = match local {
+            Some(local) => phy::Offer::prepare(
+                local,
+                &bss.information_elements,
+                bss.channel,
+                rate_elements.selectors,
+            )?,
+            None => None,
+        };
         let negotiated = match security {
             SecurityMode::Open => {
                 if bss.capability & 0x10 != 0 || rsn.is_some() || wpa {
@@ -391,6 +473,9 @@ impl JoinPlan {
             assoc.extend_from_slice(&[48, rsn.len() as u8]);
             assoc.extend_from_slice(&rsn);
         }
+        if let Some(offer) = offered_phy.as_ref() {
+            offer.append_capabilities(&mut assoc);
+        }
         Ok(Self {
             own,
             peer: bss.bssid,
@@ -405,6 +490,9 @@ impl JoinPlan {
             auth,
             assoc,
             phase: Phase::Prepared,
+            phy_enabled: local.is_some(),
+            offered_phy,
+            negotiated_phy: None,
         })
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
@@ -475,7 +563,10 @@ impl JoinPlan {
             self.phase = Phase::Failed;
             return Err(Error::Protocol);
         }
-        let mut response = RateElements::default();
+        let mut response = RateElements {
+            phy: self.offered_phy.is_some(),
+            ..Default::default()
+        };
         if let Err(error) = ies(&bytes[30..], |id, body| response.observe(id, body)) {
             self.phase = Phase::Failed;
             return Err(if error == Error::InvalidBss {
@@ -490,14 +581,48 @@ impl JoinPlan {
             self.phase = Phase::Failed;
             return Err(Error::UnsupportedRates);
         }
+        let negotiated_phy = if self.phy_enabled {
+            // Validate every relevant element before committing any AID/rate/PHY.
+            let result = (|| {
+                phy::ApElements::parse(&bytes[30..])?;
+                let mut rsn_seen = false;
+                ies(&bytes[30..], |id, body| {
+                    if id == 48 {
+                        if rsn_seen
+                            || !self.security.is_wpa2()
+                            || RsnIe::decode_body(body) != Some(RsnIe::wpa2_psk_ccmp())
+                        {
+                            return Err(Error::UnsupportedSecurity);
+                        }
+                        rsn_seen = true;
+                    }
+                    Ok(())
+                })?;
+                self.offered_phy
+                    .as_ref()
+                    .map(|offer| offer.response(&bytes[30..], response.selectors))
+                    .transpose()
+            })();
+            match result {
+                Ok(value) => value,
+                Err(error) => {
+                    self.phase = Phase::Failed;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         // Commit only after all frame, IE and rate checks have passed.
         self.rates = rates;
         self.basic = basic;
+        self.negotiated_phy = negotiated_phy;
         self.phase = Phase::Associated { aid };
         Ok(Some(aid))
     }
     pub fn cancel(&mut self) {
         self.phase = Phase::Failed;
+        self.negotiated_phy = None;
     }
 
     /// Before association: the validated request offer. After association:

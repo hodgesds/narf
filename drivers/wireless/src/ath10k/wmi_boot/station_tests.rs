@@ -71,6 +71,14 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
             _ => {}
         }
     }
+    if phase == 2 && m.data.as_ref().is_some_and(|data| data.ht_expected) {
+        let channel = if dialect == Dialect::Tlv { 84 } else { 4 };
+        u32at(
+            &mut expected,
+            channel + 12,
+            if m.frequency < 3000 { 0x805 } else { 0x804 },
+        );
+    }
     if bytes[8..] != expected {
         return Err(BmiError::BadResponse);
     }

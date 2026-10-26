@@ -1236,7 +1236,7 @@ kernel_test_in!(
 fn smoke_mt7921_channel_switch_default_5g() -> TestResult {
     let body = super::cmd::build_default_channel_switch_vec();
     if body.len() != 76
-        || body[..12] != [36, 36, 0, 2, 3, 0, 0, 0, 0, 0, 1, 0]
+        || body[..12] != [36, 36, 0, 2, 2, 0, 0, 0, 0, 0, 1, 0]
         || body[12..].iter().any(|byte| *byte != 0)
     {
         return TestResult::Fail("channel request differs from Linux packed MT7921 ABI");
@@ -1246,6 +1246,43 @@ fn smoke_mt7921_channel_switch_default_5g() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921",
     smoke_mt7921_channel_switch_default_5g
+);
+
+fn smoke_mt7921_channel_switch_antenna_masks_encode_rx_counts() -> TestResult {
+    // Linux mt7921/mcu.c::mt7921_mcu_set_chan_info converts the RX mask
+    // to hweight8 only for CHANNEL_SWITCH. Literal A/B/AB cases distinguish
+    // a stream count from either the raw mask or the selected TX count.
+    for (mask, expected) in [
+        (1, [36, 42, 2, 1, 1, 0, 0, 0, 0, 0, 1, 0]),
+        (2, [36, 42, 2, 1, 1, 0, 0, 0, 0, 0, 1, 0]),
+        (3, [36, 42, 2, 1, 2, 0, 0, 0, 0, 0, 1, 0]),
+    ] {
+        let mut body = [0xa5; 76];
+        if super::cmd::encode_channel_switch(36, 42, 2, 1, mask, 1, &mut body).is_none()
+            || body[..12] != expected
+            || body[12..] != [0; 64]
+        {
+            return TestResult::Fail("CHANNEL_SWITCH lost literal singleton/pair RX stream count");
+        }
+    }
+    for mask in [0, 4, 7, 255] {
+        let mut body = [0xa5; 76];
+        if super::cmd::encode_channel_switch(36, 42, 2, 1, mask, 1, &mut body).is_some()
+            || body != [0xa5; 76]
+        {
+            return TestResult::Fail("invalid CHANNEL_SWITCH RX mask wrote a native request");
+        }
+    }
+    let config = super::bringup::BringUpConfig::default();
+    let body = super::bringup::build_channel_switch_body(&config);
+    if body[..12] != [36, 36, 0, 2, 2, 0, 0, 0, 0, 0, 1, 0] {
+        return TestResult::Fail("bringup channel request did not use RX count ABI");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_channel_switch_antenna_masks_encode_rx_counts
 );
 
 // ── Stage-11: association MGMT frames ────────────────────────────

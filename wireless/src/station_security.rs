@@ -218,6 +218,44 @@ impl Security {
     pub fn receive(&mut self, mpdu: &impl RawFrame, fresh_snonce: [u8; 32]) -> Result<Rx, Error> {
         self.receive_with_nonce(mpdu, || Some(fresh_snonce))
     }
+    /// Receive one original protected QoS A-MSDU after the driver proves its
+    /// actual native HT/peer/channel/descriptor profile. The established
+    /// controlled port and current installed PTK/GTK are required before
+    /// any crypto or replay state can change. Malformed input is ignored;
+    /// complete authenticated subframes are returned as Ethernet-II frames.
+    /// A-MSDU cannot supply EAPOL or drive the retained supplicant/rekey.
+    pub fn receive_amsdu(&mut self, mpdu: &impl RawFrame) -> Result<Option<Vec<Vec<u8>>>, Error> {
+        if !self.port_open() {
+            return Err(Error::State);
+        }
+        let bytes = mpdu.bytes();
+        if !mpdu.unmodified()
+            || !(26 + 16 + 22..=26 + 16 + crate::amsdu::MAX_BYTES).contains(&bytes.len())
+        {
+            return Ok(None);
+        }
+        let header = &bytes[..26];
+        if packet_key::aggregate_header(header).is_err()
+            || header[10..16] != self.peer
+            || !unicast(header[16..22].try_into().unwrap())
+            || header[4..10] != self.own && header[4] & 1 == 0
+        {
+            return Ok(None);
+        }
+        let wire = &bytes[26..];
+        let id = usize::from(wire[3] >> 6);
+        let slot = if header[4] & 1 != 0 {
+            self.group[id].as_mut()
+        } else if id == 0 {
+            self.pair.as_mut()
+        } else {
+            None
+        };
+        let Some(slot) = slot else {
+            return Ok(None);
+        };
+        Ok(slot.key.unprotect_amsdu(header, wire).ok())
+    }
     pub fn receive_with_nonce(
         &mut self,
         mpdu: &impl RawFrame,

@@ -532,7 +532,7 @@ fn preflight() -> Result<(), &'static str> {
         }
         Err(_) => return Err("unexpected registry unsigned qualification failure"),
     }
-    let requested = request(BINDING, [2, 3, 4, 5, 6, 7]);
+    let requested = request(BINDING, [2, 3, 4, 5, 6, 7], Emission::Legacy);
     if requested.name != "iwlwifi/mvm-api77-power-v1-020304050607.bin"
         || requested.binding != BINDING
     {

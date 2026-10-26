@@ -6,13 +6,25 @@ use super::{
     radio,
 };
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 #[derive(Clone)]
 pub(super) struct Admission {
     closed: Arc<AtomicBool>,
     teardown: Arc<AtomicBool>,
     publication: Arc<IrqSafeSpinLock<()>>,
+    receive_epoch: Arc<AtomicU64>,
+}
+#[derive(Clone)]
+pub(super) struct ReceiveEpoch {
+    epoch: Arc<AtomicU64>,
+    value: u64,
+    closed: Arc<AtomicBool>,
+}
+impl ReceiveEpoch {
+    pub(super) fn current(&self) -> bool {
+        !self.closed.load(Ordering::Acquire) && self.epoch.load(Ordering::Acquire) == self.value
+    }
 }
 /// Own the terminal disconnect across an awaited lifecycle lock/control path.
 /// Cancellation clears only the reservation: publication stays closed, so a
@@ -32,10 +44,34 @@ impl Admission {
             closed: Arc::new(AtomicBool::new(false)),
             teardown: Arc::new(AtomicBool::new(false)),
             publication: Arc::new(IrqSafeSpinLock::new(())),
+            receive_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
     pub(super) fn closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+    pub(super) fn epoch(&self) -> ReceiveEpoch {
+        ReceiveEpoch {
+            epoch: self.receive_epoch.clone(),
+            value: self.receive_epoch.load(Ordering::Acquire),
+            closed: self.closed.clone(),
+        }
+    }
+    pub(super) fn receive_generation(&self) -> u64 {
+        self.receive_epoch.load(Ordering::Acquire)
+    }
+    /// Only native key/reply/close transitions retire receive admission.
+    /// Ordinary TX credit and completion never change this generation.
+    pub(super) fn retire_receive(&self) -> Result<(), Error> {
+        if self
+            .receive_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |e| e.checked_add(1))
+            .is_err()
+        {
+            self.closed.store(true, Ordering::Release);
+            return Err(Error::State);
+        }
+        Ok(())
     }
     pub(super) fn check(&self) -> Result<(), Error> {
         if self.closed() {
@@ -52,6 +88,7 @@ impl Admission {
     pub(super) fn close(&self) {
         let _publication = self.publication.lock();
         self.closed.store(true, Ordering::Release);
+        let _ = self.retire_receive();
     }
     pub(super) fn teardown_pending(&self) -> bool {
         self.teardown.load(Ordering::Acquire)
@@ -67,6 +104,7 @@ impl Admission {
         // must also see this prior reservation and preserve native cleanup.
         self.teardown.store(true, Ordering::Release);
         self.closed.store(true, Ordering::Release);
+        let _ = self.retire_receive();
         Ok(Disconnect {
             admission: self.clone(),
         })

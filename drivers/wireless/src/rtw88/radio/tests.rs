@@ -35,6 +35,7 @@ pub(super) struct RadioIo {
     core: Option<crate::rtw88::packet_core::Core>,
     gate: Option<crate::rtw88::power_policy::Gate>,
     extension: Option<Arc<crate::rtw88::station_profile::Grant>>,
+    ht: Option<Arc<crate::rtw88::ht::Grant>>,
     pub(super) edca_writes: Arc<AtomicUsize>,
     pub(super) before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) clock: Arc<AtomicU64>,
@@ -70,6 +71,7 @@ impl RadioIo {
             core: None,
             gate: None,
             extension: None,
+            ht: None,
             edca_writes: Arc::new(AtomicUsize::new(0)),
             before_publication: None,
             clock: Arc::new(AtomicU64::new(0)),
@@ -123,6 +125,13 @@ impl RadioIo {
     pub(super) fn register(&self, r: usize) -> u32 {
         self.word(r)
     }
+    pub(super) fn qualify_ht(&mut self, s: crate::rtw88::ht::Source) -> Result<(), Error> {
+        self.ht = Some(s.load(self.extension.as_ref().ok_or(Error::State)?.clone())?);
+        Ok(())
+    }
+    pub(super) fn ht_request(&self) -> Result<crate::rtw88::ht::Request, Error> {
+        crate::rtw88::ht::request(self.extension.as_ref().ok_or(Error::State)?)
+    }
     pub(super) fn lose_write(&mut self, r: u16) {
         self.lost = Some(r);
     }
@@ -147,6 +156,24 @@ impl RadioIo {
 // SAFETY: isolated same-owner register/receipt model. It never accesses a
 // physical device; every firmware/MAC stage uses the actual retained owner.
 unsafe impl Io for RadioIo {
+    fn station_ht_facts(&self) -> Option<crate::rtw88::ht::Facts> {
+        self.gate.as_ref()?.ht_facts()
+    }
+    fn station_ht_extension(
+        &mut self,
+        _: Arc<crate::rtw88::station_profile::Grant>,
+    ) -> Result<Option<Arc<crate::rtw88::ht::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(self.ht.clone())
+    }
+    fn station_bind_ht(&mut self, g: Arc<crate::rtw88::ht::Grant>) -> Result<(), Error> {
+        self.station_allowed()?;
+        let gate = self.gate.as_ref().ok_or(Error::State)?.with_ht(g)?;
+        let current = gate.clone();
+        self.packets.authority = Some(Arc::new(move || current.current().is_ok()));
+        self.gate = Some(gate);
+        Ok(())
+    }
     fn claim_pristine(&mut self) -> Result<(), Error> {
         self.base.claim_pristine()
     }
@@ -334,6 +361,13 @@ unsafe impl Io for RadioIo {
     }
     fn station_profile_readback(&mut self) -> Result<(), Error> {
         self.station_allowed()?;
+        if let Some(g) = self
+            .gate
+            .as_ref()
+            .and_then(crate::rtw88::power_policy::Gate::ht_grant)
+        {
+            return g.readback(|r| self.read32(r));
+        }
         let gains = self
             .gate
             .as_ref()

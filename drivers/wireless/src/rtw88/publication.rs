@@ -9,6 +9,7 @@ use narf_capabilities::{Cap, Write};
 pub(super) struct Publication {
     gate: Gate,
     native: Option<(BusDevice, Cap<BusDeviceCap, Write>)>,
+    receive_epoch: Option<super::station_control::ReceiveEpoch>,
     #[cfg(any(test, feature = "kernel-test"))]
     before: Option<alloc::sync::Arc<dyn Fn() + Send + Sync>>,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -21,6 +22,7 @@ impl Publication {
         Self {
             gate,
             native: Some((device, cap)),
+            receive_epoch: None,
             #[cfg(any(test, feature = "kernel-test"))]
             before: None,
             #[cfg(any(test, feature = "kernel-test"))]
@@ -37,6 +39,7 @@ impl Publication {
         Self {
             gate,
             native: None,
+            receive_epoch: None,
             before: None,
             model: policy,
         }
@@ -53,6 +56,15 @@ impl Publication {
         &self,
         operation: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
+        if !self.current() {
+            return Err(Error::State);
+        }
+        let operation = || {
+            if !self.current() {
+                return Err(Error::State);
+            }
+            operation()
+        };
         #[cfg(any(test, feature = "kernel-test"))]
         if let Some(hook) = &self.before {
             hook();
@@ -83,5 +95,14 @@ impl Publication {
             })
             .map_err(|_| Error::Access)?
         })
+    }
+    pub(super) fn with_epoch(mut self, epoch: super::station_control::ReceiveEpoch) -> Self {
+        self.receive_epoch = Some(epoch);
+        self
+    }
+    pub(super) fn current(&self) -> bool {
+        self.receive_epoch
+            .as_ref()
+            .is_none_or(super::station_control::ReceiveEpoch::current)
     }
 }

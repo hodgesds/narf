@@ -65,6 +65,10 @@ pub(super) struct Fixture {
     pn: u64,
     replay: narf_wireless::ccmp::ReplayWindow,
     hold_m4: bool,
+    m4_before_receipt: Option<Vec<u8>>,
+    m4_descriptor: Option<(u8, u8, u32, u32)>,
+    m4_ba_window: Option<u8>,
+    deferred_receipt: Option<(u16, u8)>,
     hold_data: bool,
     stall_ce: bool,
     status: u8,
@@ -74,6 +78,18 @@ pub(super) struct Fixture {
     next_tid: Option<u8>,
     wmm_offer: Option<Vec<u8>>,
     wmm_response: Option<Vec<u8>>,
+    ht_offer: Option<Vec<u8>>,
+    pub(super) ht_expected: bool,
+    ht_response: Option<Vec<u8>>,
+    ht_mcs: u8,
+    ht_sgi: bool,
+    ht_request_sgi: bool,
+    ht_ampdu: u8,
+    ht_capabilities: u16,
+    rx_phy: Option<(u8, u32, u32)>,
+    // Authored native descriptors per actual DMA frame, including invalid
+    // stale middle PHY words that the host must never reinterpret.
+    rx_descriptors: VecDeque<(u8, u8, u32, u32)>,
     wmm_words: [u32; 24],
     wmm_sent: usize,
     wmm_hold: bool,
@@ -104,6 +120,16 @@ impl Fixture {
             control_phase: 0,
             wmm_offer: None,
             wmm_response: None,
+            ht_offer: None,
+            ht_expected: false,
+            ht_response: None,
+            ht_mcs: 0xff,
+            ht_sgi: true,
+            ht_request_sgi: true,
+            ht_ampdu: 0x1b,
+            ht_capabilities: 0x002c,
+            rx_phy: None,
+            rx_descriptors: VecDeque::new(),
             wmm_words: WMM_WORDS,
             wmm_sent: 0,
             wmm_hold: false,
@@ -120,6 +146,10 @@ impl Fixture {
             pn: 1,
             replay: narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 },
             hold_m4: false,
+            m4_before_receipt: None,
+            m4_descriptor: None,
+            m4_ba_window: None,
+            deferred_receipt: None,
             hold_data: false,
             stall_ce: false,
             status: 0,
@@ -133,6 +163,9 @@ impl Fixture {
         let mut frame = self.ap.beacon();
         if let Some(wmm) = &self.wmm_offer {
             frame.extend_from_slice(wmm);
+        }
+        if let Some(ht) = &self.ht_offer {
+            frame.extend_from_slice(ht);
         }
         frame
     }
@@ -340,6 +373,28 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
                 return Err(BmiError::BadResponse);
             }
         }
+        if phase == 1 && m.data.as_ref().unwrap().ht_expected {
+            // The host owns this exact HT20/1SS IE; no production encoder
+            // supplies the device model's expectation.
+            let mut expected = vec![
+                45,
+                26,
+                if m.data.as_ref().unwrap().ht_request_sgi {
+                    0x2c
+                } else {
+                    0x0c
+                },
+                0,
+                24,
+                0xff,
+            ];
+            expected.extend_from_slice(&[0; 11]);
+            expected.push(1);
+            expected.extend_from_slice(&[0; 10]);
+            if !frame.windows(expected.len()).any(|ie| ie == expected) {
+                return Err(BmiError::BadResponse);
+            }
+        }
         m.native_management.push(frame.clone());
         replies = m
             .data
@@ -351,6 +406,9 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
         if phase == 1 {
             if let Some(parameters) = &m.data.as_ref().unwrap().wmm_response {
                 replies[0].extend_from_slice(parameters);
+            }
+            if let Some(ht) = &m.data.as_ref().unwrap().ht_response {
+                replies[0].extend_from_slice(ht);
             }
         }
         if dialect == Dialect::Tlv {
@@ -367,6 +425,15 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             Dialect::TenFour => (0x9026, 360),
             Dialect::Tlv => (0x6005, 116),
         };
+        let f = m.data.as_ref().unwrap();
+        let ht = f.ht_expected;
+        let ht_rates: Vec<u8> = (0..8).filter(|n| f.ht_mcs & (1 << n) != 0).collect();
+        let size = size
+            + if ht && dialect == Dialect::Tlv {
+                ht_rates.len().next_multiple_of(4)
+            } else {
+                0
+            };
         let at = if dialect == Dialect::Tlv { 8 } else { 4 };
         let secured = m.data.as_ref().unwrap().ap.protected();
         if word(0) != expected
@@ -374,7 +441,10 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             || command[at..at + 6] != AP
             || word(at + 12) != 1
             || word(at + 16) != 7
-            || word(at + 20) != ((if secured { 5 } else { 1 }) | if qos { 2 } else { 0 })
+            || word(at + 20)
+                != ((if secured { 5 } else { 1 })
+                    | if qos { 2 } else { 0 }
+                    | if ht { 0x1000 } else { 0 })
             || word(at + 24) != (if secured { 0x11 } else { 1 })
         {
             return Err(BmiError::BadResponse);
@@ -384,9 +454,36 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
         let phy = at + if dialect == Dialect::Tlv { 56 } else { 328 };
         if word(count) != 3
             || command[rates..rates + 3] != [12, 24, 48]
-            || word(phy) != u32::from(m.frequency < 3000)
+            || word(phy)
+                != if ht {
+                    if m.frequency < 3000 {
+                        5
+                    } else {
+                        4
+                    }
+                } else {
+                    u32::from(m.frequency < 3000)
+                }
         {
             return Err(BmiError::BadResponse);
+        }
+        if ht {
+            let ht_count = at + if dialect == Dialect::Tlv { 72 } else { 184 };
+            let ht_at = if dialect == Dialect::Tlv {
+                at + 88
+            } else {
+                at + 188
+            };
+            let density = [0, 1, 1, 1, 2, 4, 8, 16][usize::from((f.ht_ampdu >> 2) & 7)];
+            if word(at + 32) != u32::from(f.ht_capabilities)
+                || word(at + 36) != (1 << (13 + (f.ht_ampdu & 3))) - 1
+                || word(at + 40) != density
+                || word(at + 44) != if f.ht_sgi { 12 } else { 8 }
+                || word(ht_count) != ht_rates.len() as u32
+                || command.get(ht_at..ht_at + ht_rates.len()) != Some(&ht_rates)
+            {
+                return Err(BmiError::BadResponse);
+            }
         }
     } else if phase == 3 {
         let expected = match dialect {
@@ -508,7 +605,23 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
         return Err(BmiError::BadResponse);
     }
     let m4 = fixture.react(frame)?;
-    if m4 && fixture.hold_m4
+    if m4 && fixture.m4_before_receipt.is_some() {
+        fixture
+            .queue
+            .push_front(fixture.m4_before_receipt.take().unwrap());
+        if let Some(descriptor) = fixture.m4_descriptor.take() {
+            fixture.rx_descriptors.push_front(descriptor);
+        }
+        fixture.deferred_receipt = Some((id, fixture.status));
+        if let Some(window) = fixture.m4_ba_window.take() {
+            // Actual firmware HTT ADDBA arrives while M4 awaits its native
+            // terminal receipt, before the following original RAW DMA frame.
+            m.inner
+                .inner
+                .rx
+                .push_back((m.inner.receive_pipe, header(1, &[5, window, 0x80, 0x70])));
+        }
+    } else if m4 && fixture.hold_m4
         || fixture.ap.phase() == ApPhase::Authorized && !m4 && fixture.hold_data
     {
         fixture.held.push_back(id);
@@ -526,6 +639,9 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         return Ok(());
     }
     let Some(mut frame) = fixture.queue.pop_front() else {
+        if let Some((id, status)) = fixture.deferred_receipt.take() {
+            complete(m, id, status);
+        }
         return Ok(());
     };
     let peer = fixture.next_peer.take().unwrap_or(1800);
@@ -534,14 +650,21 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         .take()
         .unwrap_or(if frame[0] == 0x88 { 0 } else { 16 });
     let protected = frame[1] & 0x40 != 0;
-    let sequence = u16::from_le_bytes([frame[22], frame[23]]) >> 4;
+    let control = frame[0] == 0x84;
+    let sequence = if control {
+        0
+    } else {
+        u16::from_le_bytes([frame[22], frame[23]]) >> 4
+    };
+    let per_frame = fixture.rx_descriptors.pop_front();
     frame.extend_from_slice(&[0; 4]);
     let mut descriptor = [0u8; 300];
     u32at(
         &mut descriptor,
         4,
         (1 << 31)
-            | 3
+            | u32::from(per_frame.map_or(3, |d| d.0))
+            | if control { 1 << 9 } else { 0 }
             | if protected { 1 << 29 } else { 0 }
             | core::mem::take(&mut fixture.next_attention),
     );
@@ -549,7 +672,7 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         &mut descriptor,
         12,
         u32::from(peer)
-            | (1 << 11)
+            | if control { 0 } else { 1 << 11 }
             | (u32::from(sequence) << 16)
             | if protected { 6 << 28 } else { 7 << 28 },
     );
@@ -566,6 +689,11 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
     );
     u32at(&mut descriptor, 56, 0xc000);
     u32at(&mut descriptor, 104, 0x0400000b); // legacy OFDM6
+    if let Some((preamble, sig, guard)) = per_frame.map(|d| (d.1, d.2, d.3)).or(fixture.rx_phy) {
+        u32at(&mut descriptor, 104, u32::from(preamble) << 24);
+        u32at(&mut descriptor, 108, sig);
+        u32at(&mut descriptor, 112, guard);
+    }
     let storage = m.inner.storage.as_mut().ok_or(BmiError::BadResponse)?;
     let index = *storage.order.front().ok_or(BmiError::BadResponse)?;
     let buffer = storage.buffers[index]

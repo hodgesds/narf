@@ -447,6 +447,7 @@ fn smoke_nl80211_wpa_supplicant_wpa2_psk_end_to_end() -> TestResult {
     CACHE.lock().retain(|c| c.name != E2E_NAME);
     CACHE.lock().push(Cache {
         name: E2E_NAME.into(),
+        ifindex,
         namespace: 0,
         busy: true,
         results: Vec::new(),

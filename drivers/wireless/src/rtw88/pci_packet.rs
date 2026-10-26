@@ -147,6 +147,13 @@ impl Native {
 // qualification. CPU and register accesses invoke its actual current cap;
 // original rings and every published payload stay retained on every exit.
 unsafe impl Port for Native {
+    fn receive_chip(&self) -> Result<crate::rtw88::packet_phy::Chip, packet::Error> {
+        match self.device.id.device {
+            0xc821 => Ok(crate::rtw88::packet_phy::Chip::C21),
+            0xc822 => Ok(crate::rtw88::packet_phy::Chip::C22),
+            _ => Err(packet::Error::Packet),
+        }
+    }
     fn transmit_allowed(&mut self) -> Result<(), packet::Error> {
         self.check_packet_permission().map_err(access_error)
     }
