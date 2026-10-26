@@ -156,12 +156,25 @@ const PL011_FR_TXFF: u32 = 1 << 5;
 /// boot forever to deliver a warning — dropping the tail of the
 /// warning beats never booting.
 fn uart_putc(byte: u8) {
-    let fr = (PL011_QEMU_VIRT as *const u32).wrapping_byte_add(0x18);
-    let dr = (PL011_QEMU_VIRT as *mut u32).wrapping_byte_add(0x00);
+    // Reach the UART through the high-VA device window
+    // (`KERNEL_PHYS_OFFSET | phys`) — the same alias `parse_raw`
+    // publishes as `BootInfo::uart_virt` and the console uses after
+    // `remap_to_virtual`. The raw physical address is mapped only
+    // while the boot stub's identity TTBR0 is installed; once
+    // TTBR0 is swapped for a task's private root, a raw-phys access
+    // takes a level-0 translation fault and kills the guest (#990:
+    // the truncation warning fired from a kernel-test smoke, long
+    // after the swap). The window is installed by boot.S in TTBR1
+    // before `parse_raw` runs — `parse_raw` itself relies on
+    // `kernel_ptr` for the DTB in the same flow — so this route is
+    // valid at store time on the boot path and in every later
+    // context that can call `store_cmdline`.
+    let uart = PhysAddr::new(PL011_QEMU_VIRT);
+    let fr = uart.kernel_ptr::<u32>().wrapping_byte_add(0x18);
+    let dr = uart.kernel_mut_ptr::<u32>().wrapping_byte_add(0x00);
     for _ in 0..100_000 {
-        // SAFETY: identity-mapped UART base — the same access the
-        // console crate's early PL011 backend performs before
-        // `parse_raw` runs; FR is a read-only status register.
+        // SAFETY: direct-mapped Device window (see above); FR is a
+        // read-only status register.
         if unsafe { fr.read_volatile() } & PL011_FR_TXFF == 0 {
             break;
         }

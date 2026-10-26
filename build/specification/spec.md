@@ -133,6 +133,24 @@ and CI compiler-cache integration.
   the dedicated `kernel-test-gpu` job, gated by the affected plan's
   `run_gpu_tests` output, so an intermittent GPU-fixture hang cannot stall
   the primary suite.
+- `cargo xtask test --arch=x86_64 --split` — run the kernel-test phase as
+  one QEMU boot per subsystem group instead of a single boot. The guest
+  harness runs tests as direct synchronous calls, so a hung test never
+  returns control and no in-guest watchdog can preempt it; in one boot a
+  single hang burns the phase's whole 2400 s cap and every later test's
+  result is lost. Each split boot is capped by
+  `XTASK_QEMU_GROUP_TIMEOUT_SECS` (default 900, ≈2.25× the slowest
+  group's measured guest time — the btrfs subtree at ≈400 s on x86_64
+  TCG). Groups are the `--subsystem` entries when one is given, else a
+  fixed partition of the suite whose final group is the exact complement
+  of the others, so coverage is unchanged; caller excludes apply to every
+  group. A boot killed at the cap, or one that dies without a summary,
+  is accounted from the tests that completed plus exactly one failure
+  for the in-flight test, whose reason names the timeout — a timeout is
+  a failure, never a skip. xtask aggregates the groups into the same
+  `── summary: P pass, F fail, S skip ──` and `── failing tests ──`
+  lines the guest prints, and the phase-2 boot-smoke and postflight run
+  once, afterwards, as in the single-boot form.
 - `cargo xtask net-smoke --arch=x86_64` runs live host-to-guest TCP and UDP
   echoes plus a guest-originated DNS query over virtio-net. `cargo xtask
   e1000-module-net-smoke --arch=x86_64` runs the identical exchanges over an
