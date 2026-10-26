@@ -2774,7 +2774,14 @@ pub mod cow {
         // reuse. Zero means unknown; registered RAM stores node + 1. This fits
         // in the existing padding, keeping the 64-byte descriptor unchanged.
         node_plus_one: AtomicU32,
+        // Independent slab bookkeeping. Zeroed before publication, protected
+        // exclusively by the owning slab size-class lock, never by COW locks.
+        slab: core::cell::UnsafeCell<crate::slab::FrameState>,
     }
+    // SAFETY: ownership/pins/provenance use their original atomics. Only slab
+    // accesses `slab`, under the frame's owning class lock; an allocated frame
+    // cannot change classes until every object is central and it is detached.
+    unsafe impl Sync for FlatCowSlot {}
     const _: () = assert!(core::mem::size_of::<FlatCowSlot>() == 64);
     const _: () = assert!(core::mem::align_of::<FlatCowSlot>() == 64);
 
@@ -2801,6 +2808,15 @@ pub mod cow {
 
     fn flat_pins(key: u64) -> Option<&'static AtomicU32> {
         flat_entry(key).map(|slot| &slot.pins)
+    }
+
+    /// Permanent metadata only; callers require their slab class lock before
+    /// dereferencing the interior-mutability cell. Early/out-of-range frames
+    /// return None and keep the legacy slab central path.
+    pub(crate) fn slab_frame_state(
+        phys: PhysAddr,
+    ) -> Option<&'static core::cell::UnsafeCell<crate::slab::FrameState>> {
+        flat_entry(phys.raw()).map(|slot| &slot.slab)
     }
 
     /// Constant-time lookup for registered boot RAM. No ownership counter changes,
