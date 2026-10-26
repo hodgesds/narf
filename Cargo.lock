@@ -2015,7 +2015,10 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-crypto",
  "narf-drivers",
+ "narf-drivers-tpm",
+ "narf-filesystem",
  "narf-firmware-smbios",
  "narf-init",
  "narf-input",
@@ -2343,6 +2346,7 @@ dependencies = [
  "narf-filesystem",
  "narf-kernel-test",
  "narf-lib",
+ "narf-tpm",
 ]
 
 [[package]]
