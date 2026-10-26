@@ -486,6 +486,10 @@ fn smoke_nvme_suspend_drains_in_flight_io() -> TestResult {
     // `acquire` guard), so no other reference into the cell can exist
     // — the same argument `ControllerGuard::deref` makes.
     let untouched = {
+        // SAFETY: this fixture holds `req_gate` (the forgotten
+        // `acquire` guard above), so no other reference into the
+        // cell can exist — the argument in the note above this
+        // block.
         let c = unsafe { &*slot.ctrl.get() };
         c.is_ready() && !c.is_suspended()
     };
