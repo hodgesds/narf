@@ -255,6 +255,14 @@ impl fmt::Debug for PlatformDevice {
 /// full BAR layout asks the registry for its `BusDeviceHandle` and
 /// pulls it out there (Wave 2 cap work).
 #[derive(Copy, Clone)]
+// `Platform(PlatformDevice)` is far larger than the other variants:
+// the record is deliberately a fixed-size, allocation-free value
+// (128-byte `compatible` buffer, 4 `reg` windows, 4 IRQs inline),
+// and `BusKind`/`BusDevice` are `Copy` by design — the registry
+// stores and hands out values. Boxing the variant would strip
+// `Copy` from both types and change the registry surface every
+// consumer copies and matches on, to satisfy a size heuristic.
+#[allow(clippy::large_enum_variant)]
 pub enum BusKind {
     /// PCIe function. ECAM window base lets drivers build their own
     /// cfg-space accessor after `claim()` — the bus crate holds the
