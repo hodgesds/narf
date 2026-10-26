@@ -457,9 +457,12 @@ address-space metadata snapshot, reports lazy pages as nonresident and
 hardware-huge pages as resident base-page equivalents, and returns `ENOMEM`
 for any hole without quadratically cloning a VMA's complete backing list once
 per queried page.
-`msync(2)` validates its complete rounded mapping, rejects unknown flags and
-the mutually exclusive `MS_ASYNC|MS_SYNC` combination, then flushes retained
-shared-file pages. `madvise(2)` accepts unimplemented performance-only hints
+`msync(2)` validates its complete rounded VMA coverage without allocating a
+residency bitmap or consulting page tables. It rejects unknown flags and the
+mutually exclusive `MS_ASYNC|MS_SYNC` combination. Only `MS_SYNC` initiates
+shared-file writeback; `MS_ASYNC`, zero flags, and `MS_INVALIDATE` alone do
+not. Invalidation still reports `EBUSY` for locked mappings before reporting
+holes as `ENOMEM`. `madvise(2)` accepts unimplemented performance-only hints
 as no-ops, but unknown advice and semantic state controls such as DONTFORK or
 WIPEONFORK fail with `EINVAL` until their observable behavior exists.
 
@@ -528,6 +531,23 @@ so a closed descriptor returns `EBADF` even for an unknown command; an unknown
 command on a live non-`O_PATH` descriptor returns `EINVAL`. An `O_PATH`
 description accepts only Linux's path-safe command whitelist; other commands
 return `EBADF`. `F_GETFL` reads status from the shared open-file description.
+Ordinary single-fd resolution uses a lazily initialized RCU directory of
+direct-indexed descriptor slots, including for tables shared by `CLONE_FILES`.
+Writers retain the per-table lock and publish slot replacement before releasing
+the previous file/description. A reader upgrades weak file and description
+references, revalidates both the directory and slot identity, and leaves its
+RCU read section before I/O or parking; the returned references own their
+lifetimes. Retired metadata contains only weak references, so grace periods
+do not postpone last-description close effects. Directory growth follows the
+table's geometric capacity; all RCU metadata allocations are fallible and
+allocation failure falls back to locked lookup. Close clears a slot without
+allocating, and metadata allocation runs outside read sections.
+IRQ table access permanently selects that locked fallback without invoking
+RCU. Whole-table replacement also invalidates the read view. `FdTable::get_mut`
+returns an `FdEntryMut` guard which publishes changed slot metadata on drop.
+The last shared-table owner performs descriptor cleanup even if it is a
+temporary lookup owner surviving the last task's detach; cleanup never creates
+a replacement task table.
 `F_SETFD` retains only `FD_CLOEXEC`, silently ignores all other argument bits,
 and `F_GETFD` reports only that retained bit.
 `F_SETOWN`, `F_SETOWN_EX`, and `F_SETSIG` likewise update shared

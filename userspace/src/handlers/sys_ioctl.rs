@@ -1200,11 +1200,11 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             }
         };
         let replaced = fd::with_table(task, |t| {
-            let Some(entry) = t.get_mut(fd) else {
+            let Some(mut entry) = t.get_mut(fd) else {
                 return false;
             };
             entry.ops = cloned;
-            let _ = entry;
+            drop(entry);
             t.set_offset(fd, 0);
             true
         })

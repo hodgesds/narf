@@ -365,3 +365,41 @@ kernel_test_in!(
     "syscall_abi/filemap/msync",
     smoke_abi_filemap_msync_writes_mapped_store_to_disk
 );
+
+/// Linux's MS_ASYNC does not initiate writeback. The raw device must retain
+/// the original bytes until an explicit MS_SYNC commits the mapped store.
+fn smoke_abi_filemap_msync_without_sync_does_not_writeback() -> TestResult {
+    const MS_SYNC: u64 = 4;
+    let original = content(6000);
+    with_fixture(&original, |fx| {
+        let a = map_shared(fx.fd_data, 2 * PAGE)?;
+        let pa = fault(&fx.aspace, a + PAGE)?;
+        store(unsafe_add(pa, 8), b"durable");
+        let block = u64::from(testing::FILE_FIRST_BLOCK) + 4;
+        for flags in [1, 0, 2, 3] {
+            if call(Syscall::Msync.raw(), a2(a, 2 * PAGE, flags)) != Some(0) {
+                return Err("msync without MS_SYNC failed on a mapped range");
+            }
+            let mut disk = [0u8; testing::BLOCK_SIZE];
+            match crate::handlers::poll_io_to_completion(fx.volume.read_block(block, &mut disk)) {
+                Some(Ok(())) => {}
+                _ => return Err("reading the raw block before MS_SYNC failed"),
+            }
+            if disk[8..15] != original[PAGE as usize + 8..PAGE as usize + 15] {
+                return Err("msync without MS_SYNC initiated writeback");
+            }
+        }
+        if call(Syscall::Msync.raw(), a2(a, 2 * PAGE, MS_SYNC)) != Some(0) {
+            return Err("explicit MS_SYNC failed after advisory calls");
+        }
+        let mut disk = [0u8; testing::BLOCK_SIZE];
+        match crate::handlers::poll_io_to_completion(fx.volume.read_block(block, &mut disk)) {
+            Some(Ok(())) if &disk[8..15] == b"durable" => Ok(()),
+            _ => Err("MS_SYNC did not commit the pending mapped store"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/filemap/msync",
+    smoke_abi_filemap_msync_without_sync_does_not_writeback
+);

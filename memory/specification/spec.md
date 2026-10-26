@@ -194,6 +194,10 @@ pub fn kernel_ram_range_mapped(start: PhysAddr, len: u64) -> bool;
 pub fn online_node_mask() -> u64;
 pub fn online_node_count() -> usize;
 pub fn hotplug_node_for_phys(addr: PhysAddr) -> Option<usize>;
+/// Boot RAM uses immutable node provenance in the existing PFN descriptor
+/// after boot NUMA rebalance. Unknown PFNs, hotplug RAM, and callers before
+/// descriptor publication retain the authoritative topology lookup.
+pub fn node_for_phys(addr: u64) -> usize;
 /// Post-commit observer invoked with no allocator/hotplug lock held.
 pub fn install_memory_hotplug_hook(hook: fn());
 pub const MEMORY_BLOCK_SIZE: u64;
@@ -1388,6 +1392,13 @@ x86_64 is rejected at runtime.
   unpublished suffix, including restoration of the implicit sole-owner
   representation. The granular per-region reservation path remains available
   to inject failures at each publication boundary.
+  The same descriptor stores a boot-RAM NUMA node in existing padding, with
+  zero reserved for unknown provenance. Initialization resolves only known RAM
+  after boot rebalance and before release-publishing the permanent descriptor
+  array; common lookup is one bounds check and an atomic word load. Node words
+  survive frame reuse and COW test resets. No runtime writer changes boot node
+  membership. PFN holes remain unknown, so hotplug never inherits a cached
+  node-zero guess; unknown and early queries keep the authoritative fallback.
   The shared-owner transaction is released after regular child publication and
   before private huge-page allocation or copying. Multi-page materialization
   and parent permission rewriting snapshot COW counts by shard while holding

@@ -5238,10 +5238,16 @@ fn import_rw_iovecs(iov_ptr: u64, iovcnt: usize) -> Result<alloc::vec::Vec<Impor
 }
 
 fn copy_fd_endpoint(task: u64, fd_num: u32) -> Option<CopyFdEndpoint> {
-    fd::with_table(task, |table| {
-        copy_fd_endpoint_from_table(table, fd_num)
+    let file = fd::lookup(task, fd_num)?;
+    let status_flags = file.description.status_flags();
+    if status_flags & crate::fd::O_PATH != 0 {
+        return None;
+    }
+    Some(CopyFdEndpoint {
+        ops: file.ops,
+        description: file.description,
+        status_flags,
     })
-    .flatten()
 }
 
 fn copy_fd_endpoint_from_table(
