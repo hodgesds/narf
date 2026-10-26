@@ -24,6 +24,7 @@
 extern crate alloc;
 
 pub mod amd_fch;
+pub mod bcm2835;
 pub mod dw;
 pub mod dw_speed;
 pub mod gsb;
@@ -100,6 +101,10 @@ pub trait I2cBus: Send + Sync + core::fmt::Debug {
 /// dispatcher.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // DT match-table registration (DT programme step 5): a plain
+    // bus-registry call at composition time, NOT an initcall —
+    // the desktop `all` census gains no initcalls.
+    bcm2835::register_dt_drivers();
     narf_init::register(Stage::Device, "amd-fch-i2c", || {
         let n = amd_fch::probe_all();
         if n == 0 {
