@@ -225,6 +225,17 @@ the write therefore returns once the request is queued rather than blocking
 until resume as Linux's does — a deliberate divergence required by the
 capability model, since the writer holds no Power cap.
 
+As built: the hook is installed by the platform power-service
+composition (`drivers/platform`, Stage::Late, alongside the action
+executor), and the wake latch's production callers are the
+platform EC SCI funnel (`PlatformEvent` → the matching
+`WakeSource`, latched before the event fans out to subscribers),
+the button drivers (power / sleep press), and the lid driver
+(open only — a close requests suspend through the service, it is
+not a wake source). With no composition installed the store keeps
+its fail-closed shape: a supported state's write is refused
+`ENODEV`, never silently dropped.
+
 ### 3.4 Thermal
 
 Two layers, one registration path.
@@ -469,7 +480,7 @@ driver implementation.
 
 ```rust
 // service: the actor between platform power events and §3.3's core
-pub enum PowerAction { Suspend, PowerOff }
+pub enum PowerAction { Suspend, Freeze, PowerOff }
 pub enum ButtonAction { Ignore, Suspend, PowerOff }
 pub struct PowerPolicy {
     pub suspend_on_lid_close: bool,          // default true
@@ -503,9 +514,22 @@ authority (the platform composition mints the suspend
 request as a bit in an atomic mask and wakes the worker — duplicate
 requests coalesce, and no action ever runs in the notifying (IRQ /
 SCI subscriber) context. The worker (or any task-context caller of
-`pump_pending`) executes pending actions in Suspend → PowerOff
-order. With no executor installed, requests stay pending rather
-than being dropped; installing an executor wakes the worker.
+`pump_pending`) executes pending actions in Suspend → Freeze →
+PowerOff order — the sleeps run first, and a power-off queued
+alongside them is served on the next pump, after resume. With no
+executor installed, requests stay pending rather than being
+dropped; installing an executor wakes the worker.
+
+Userspace sleep requests (§3.3) enter through the same queue: the
+platform composition root (`drivers/platform` power-service
+wiring, Stage::Late) installs the `sleep_request` hook, which maps
+`SleepState::Freeze` → `PowerAction::Freeze` and
+`SleepState::Mem` → `PowerAction::Suspend` via `request_action`.
+The executor's `Freeze` arm mints a `Cap<Power, Invoke>` and calls
+`s2idle::suspend_to_idle`, parallel to the `Suspend` arm's
+`s3_enter` — the two sleep states are distinct actions because
+they run distinct cores, and neither may silently stand in for
+the other.
 
 `snapshot()` fuses the registered `StateProviders` (closures that
 may evaluate AML — never invoked under the service lock), falls

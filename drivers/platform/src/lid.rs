@@ -124,6 +124,13 @@ pub fn subscribe<F: Fn(LidEvent) + Send + Sync + 'static>(cb: F) {
 }
 
 fn notify(event: LidEvent) {
+    // Opening the lid is the wake event — latch it for a parked
+    // s2idle CPU before fanning out. A close is deliberately not
+    // latched: it is the event that *requests* suspend (via the
+    // power service's lid policy), not a reason to end a park.
+    if let LidEvent::Opened = event {
+        narf_power::s2idle::note_wake_event(narf_power::s2idle::WakeSource::Lid);
+    }
     let subs = SUBSCRIBERS.lock();
     for s in subs.iter() {
         s(event);

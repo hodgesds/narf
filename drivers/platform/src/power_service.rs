@@ -14,7 +14,13 @@
 //! - action executor → `PowerAction::Suspend` runs the suspend core
 //!   with a freshly minted `Cap<Power, Invoke>` (this composition
 //!   site is the authority owner; the service itself holds no cap),
-//!   `PowerAction::PowerOff` defers to the orderly power-off worker.
+//!   `PowerAction::Freeze` runs `s2idle::suspend_to_idle` under the
+//!   same authority, and `PowerAction::PowerOff` defers to the
+//!   orderly power-off worker.
+//! - the `sleep_request` hook → userspace `/sys/power/state` stores
+//!   land in the service's action queue (`freeze` → `Freeze`,
+//!   `mem` → `Suspend`). Until this install runs, stores are refused
+//!   with ENODEV by design (see `narf_power::sleep_request`).
 //!
 //! Providers re-walk the namespace and re-evaluate methods on every
 //! snapshot, exactly like the platform drivers' own reads; snapshots
@@ -31,6 +37,7 @@ use narf_aml::eval::evaluate_method;
 use narf_aml::{find_all_devices_by_hid, Value};
 use narf_capabilities::{Cap, Invoke};
 use narf_power::service::{self, PowerAction, StateProviders};
+use narf_power::sleep_request::{SleepRequestError, SleepState};
 
 use crate::lid::LidEvent;
 
@@ -60,6 +67,25 @@ impl service::ActionExecutor for PlatformExecutor {
                     }
                 }
             }
+            PowerAction::Freeze => {
+                // The s2idle twin of the S3 arm above: same minted
+                // authority, different core. The s2idle production
+                // gate inside `suspend_to_idle` decides whether the
+                // request actually parks the machine; unarmed or
+                // unsupported, the refusal is the log line.
+                let cap: Cap<narf_power::Power, Invoke> = Cap::bootstrap();
+                match narf_power::s2idle::suspend_to_idle(&cap) {
+                    Ok(()) => {
+                        let _ = writeln!(narf_console::Writer, "  power-service: resumed");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "  power-service: freeze request not carried out: {e:?}"
+                        );
+                    }
+                }
+            }
             PowerAction::PowerOff => {
                 narf_power::orderly::orderly_poweroff(
                     narf_power::orderly::OrderlyReason::PowerService,
@@ -68,6 +94,24 @@ impl service::ActionExecutor for PlatformExecutor {
             }
         }
     }
+}
+
+/// The composition's `sleep_request` consumer: forward a parsed
+/// userspace sleep request into the service's action queue. It only
+/// queues — execution (and the `Cap<Power, Invoke>` it needs) is
+/// the executor's, from the worker's task context — because the
+/// sysfs writer whose context this runs in holds no Power
+/// capability (see `narf_power::sleep_request` module docs).
+/// Requests are never refused here: the cores' own gates (the S3
+/// production gate, the s2idle arm/support gate) decide at
+/// execution time whether a queued request actually sleeps the
+/// machine, exactly as for event-driven requests.
+fn forward_sleep_request(state: SleepState) -> Result<(), SleepRequestError> {
+    service::request_action(match state {
+        SleepState::Freeze => PowerAction::Freeze,
+        SleepState::Mem => PowerAction::Suspend,
+    });
+    Ok(())
 }
 
 /// Evaluate `<path>` and return its package elements, if any.
@@ -148,6 +192,12 @@ fn providers() -> StateProviders {
 pub fn init() {
     let cap = narf_power::bootstrap_power_authority();
     let _ = service::install_action_executor(&cap, Arc::new(PlatformExecutor));
+    // Userspace trigger composition: with the executor in place,
+    // install the sleep-request hook so `/sys/power/state` stores
+    // reach the service. Installing it here (and only here) is
+    // what keeps the store's fail-closed shape honest — no
+    // composition, no consumer, ENODEV.
+    narf_power::sleep_request::set_sleep_request_hook(forward_sleep_request);
     let _ = service::install_warning_hook(
         &cap,
         Arc::new(|| {

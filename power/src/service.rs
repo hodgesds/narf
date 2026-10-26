@@ -65,6 +65,13 @@ use crate::{Power, PowerError};
 pub enum PowerAction {
     /// Enter system sleep via the suspend core ([`crate::suspend`]).
     Suspend,
+    /// Enter suspend-to-idle via [`crate::s2idle::suspend_to_idle`].
+    /// The action a userspace `freeze` request (see
+    /// [`crate::sleep_request`]) maps to: S3 and s2idle are
+    /// different sleep states with different cores, so they are
+    /// different actions — `Suspend` must never silently run the
+    /// idle path or vice versa.
+    Freeze,
     /// Orderly power-off (filesystem sync, then device shutdown).
     PowerOff,
 }
@@ -74,13 +81,19 @@ impl PowerAction {
         match self {
             PowerAction::Suspend => 1 << 0,
             PowerAction::PowerOff => 1 << 1,
+            PowerAction::Freeze => 1 << 2,
         }
     }
 
-    /// Deterministic execution order when both are pending: suspend
-    /// first (a power-off request that lands during suspend wins on
-    /// the next pump, after resume).
-    const ORDER: [PowerAction; 2] = [PowerAction::Suspend, PowerAction::PowerOff];
+    /// Deterministic execution order when several are pending:
+    /// sleeps first (S3, then s2idle), power-off last — a power-off
+    /// request that lands during a sleep wins on the next pump,
+    /// after resume.
+    const ORDER: [PowerAction; 3] = [
+        PowerAction::Suspend,
+        PowerAction::Freeze,
+        PowerAction::PowerOff,
+    ];
 }
 
 /// What a button press requests. The power button defaults to
@@ -201,6 +214,7 @@ pub struct ServiceStats {
     pub power_presses: u64,
     pub sleep_presses: u64,
     pub suspend_requests: u64,
+    pub freeze_requests: u64,
     pub poweroff_requests: u64,
     pub actions_executed: u64,
     pub warnings_fired: u64,
@@ -254,6 +268,7 @@ static STATE: IrqSafeSpinLock<ServiceState> = IrqSafeSpinLock::new(ServiceState 
         power_presses: 0,
         sleep_presses: 0,
         suspend_requests: 0,
+        freeze_requests: 0,
         poweroff_requests: 0,
         actions_executed: 0,
         warnings_fired: 0,
@@ -417,6 +432,7 @@ pub fn request_action(action: PowerAction) {
         let mut state = STATE.lock();
         match action {
             PowerAction::Suspend => state.stats.suspend_requests += 1,
+            PowerAction::Freeze => state.stats.freeze_requests += 1,
             PowerAction::PowerOff => state.stats.poweroff_requests += 1,
         }
     }

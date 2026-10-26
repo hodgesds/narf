@@ -3640,6 +3640,74 @@ fn smoke_power_service_buttons_policy() -> TestResult {
 }
 kernel_test_in!("power/service", smoke_power_service_buttons_policy);
 
+fn smoke_power_service_freeze_action() -> TestResult {
+    use crate::bootstrap_power_authority;
+    use crate::service::{self, PowerAction};
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    #[derive(Debug)]
+    struct Recorder(IrqSafeSpinLock<Vec<PowerAction>>);
+    impl service::ActionExecutor for Recorder {
+        fn execute(&self, action: PowerAction) {
+            self.0.lock().push(action);
+        }
+    }
+
+    service::__reset_for_test();
+    let cap = bootstrap_power_authority();
+    let recorder = Arc::new(Recorder(IrqSafeSpinLock::new(Vec::new())));
+    if service::install_action_executor(&cap, recorder.clone()).is_err() {
+        return TestResult::Fail("install_action_executor rejected the bootstrap cap");
+    }
+
+    // Freeze is its own action with its own pending bit (bit 2) —
+    // it must not alias onto Suspend: the two sleep states run
+    // different cores in the executor.
+    service::request_action(PowerAction::Freeze);
+    if service::pending_actions() != 4 {
+        return TestResult::Fail("freeze request did not set the Freeze pending bit");
+    }
+    if service::stats().freeze_requests != 1 || service::stats().suspend_requests != 0 {
+        return TestResult::Fail("freeze request was not counted as a freeze");
+    }
+    if service::pump_pending() != 1 {
+        return TestResult::Fail("pump did not execute the queued freeze");
+    }
+    {
+        let got = recorder.0.lock();
+        if got.as_slice() != [PowerAction::Freeze] {
+            return TestResult::Fail("executor did not receive exactly [Freeze]");
+        }
+    }
+
+    // Execution order across a mixed queue: Suspend, then Freeze,
+    // then PowerOff (a power-off queued alongside sleeps is served
+    // after them).
+    recorder.0.lock().clear();
+    service::request_action(PowerAction::PowerOff);
+    service::request_action(PowerAction::Freeze);
+    service::request_action(PowerAction::Suspend);
+    if service::pump_pending() != 3 {
+        return TestResult::Fail("pump did not execute all three queued actions");
+    }
+    {
+        let got = recorder.0.lock();
+        if got.as_slice()
+            != [
+                PowerAction::Suspend,
+                PowerAction::Freeze,
+                PowerAction::PowerOff,
+            ]
+        {
+            return TestResult::Fail("executor order was not Suspend, Freeze, PowerOff");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/service", smoke_power_service_freeze_action);
+
 fn smoke_power_service_snapshot_fusion_and_drain() -> TestResult {
     use crate::bootstrap_power_authority;
     use crate::service::{self, StateProviders};
