@@ -12865,12 +12865,8 @@ fn current_socket(fd: u32) -> Option<alloc::sync::Arc<crate::socket::SocketFile>
 /// syscalls must distinguish those as `EBADF` and `ENOTSOCK` respectively.
 fn current_socket_result(fd: u32) -> Result<alloc::sync::Arc<crate::socket::SocketFile>, i64> {
     let task = current_task_id();
-    let ops = fd::with_table(task, |table| {
-        table.get(fd).map(|entry| entry.ops.clone())
-    })
-        .flatten()
-        .ok_or(EBADF)?;
-    socket_from_file_ops(ops).ok_or(ENOTSOCK)
+    let file = fd::lookup(task, fd).ok_or(EBADF)?;
+    socket_from_file_ops(file.ops).ok_or(ENOTSOCK)
 }
 
 /// Install the kernel-held admin authority returned by a successful stack

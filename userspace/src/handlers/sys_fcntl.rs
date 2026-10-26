@@ -326,6 +326,14 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let arg = args.arg2;
     let task = current_task_id();
 
+    if cmd == F_GETFD {
+        ctx.set_return(match fd::lookup(task, fd) {
+            Some(file) => SyscallReturn::ok((file.flags & crate::fd::FD_CLOEXEC) as u64),
+            None => errno_ret(EBADF),
+        });
+        return;
+    }
+
     // Linux's hot F_GETFL path is `fdget_raw(fd)` followed by a load of
     // `file::f_flags`. Keep the same shape here: resolve the descriptor once,
     // read its shared-description flags, and inspect socket/mqueue state
@@ -335,17 +343,15 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     // stdio FileOps Arc on every call, making unrelated workers contend on one
     // reference-count cache line.
     if cmd == F_GETFL {
-        let snapshot = fd::with_table(task, |table| {
-            let entry = table.get(fd)?;
-            let flags = table.status_flags(fd)? as u64;
-            let socket_nonblock = entry
+        let snapshot = fd::lookup(task, fd).map(|file| {
+            let flags = file.description.status_flags() as u64;
+            let socket_nonblock = file
                 .ops
                 .as_any()
                 .and_then(|ops| ops.downcast_ref::<crate::socket::SocketFile>())
                 .map(|socket| socket.is_nonblock());
-            Some((flags, socket_nonblock, entry.ops.mq_queue_id()))
-        })
-        .flatten();
+            (flags, socket_nonblock, file.ops.mq_queue_id())
+        });
 
         let Some((mut flags, socket_nonblock, mqueue_id)) = snapshot else {
             ctx.set_return(errno_ret(EBADF));

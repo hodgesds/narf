@@ -517,7 +517,7 @@ fn smoke_abi_socket_accept4_uses_shared_nonblock_state() -> TestResult {
             return Err("F_SETFL(O_NONBLOCK) failed");
         }
         let cleared = fd::with_table(FAKE_TASK, |table| {
-            table.get_mut(srv as u32).map(|entry| {
+            table.get_mut(srv as u32).map(|mut entry| {
                 entry.status_flags &= !(O_NONBLOCK as u32);
             })
         })

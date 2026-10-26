@@ -22,6 +22,10 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
+mod read_index;
+pub(crate) use read_index::ResolvedFd;
+use read_index::{ReadIndex, SharedTable};
+
 /// Per-task fd table entry.
 #[derive(Clone)]
 pub struct FdEntry {
@@ -40,6 +44,44 @@ pub struct FdEntry {
     /// runtime users must call `FdTable::status_flags`, because aliases may
     /// change the shared value without updating every slot's debug mirror.
     pub status_flags: u32,
+}
+
+/// Mutable descriptor borrow that publishes changed slot metadata on release.
+/// The owning table guard keeps the entry and description stable throughout.
+pub struct FdEntryMut<'a> {
+    fd: u32,
+    entry: &'a mut FdEntry,
+    description: &'a Description,
+    view: Option<&'a ReadIndex>,
+}
+
+impl core::fmt::Debug for FdEntryMut<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FdEntryMut")
+            .field("fd", &self.fd)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::ops::Deref for FdEntryMut<'_> {
+    type Target = FdEntry;
+    fn deref(&self) -> &FdEntry {
+        self.entry
+    }
+}
+
+impl core::ops::DerefMut for FdEntryMut<'_> {
+    fn deref_mut(&mut self) -> &mut FdEntry {
+        self.entry
+    }
+}
+
+impl Drop for FdEntryMut<'_> {
+    fn drop(&mut self) {
+        if let Some(view) = self.view {
+            view.publish_slot(self.fd, Some(self.entry), Some(self.description));
+        }
+    }
 }
 
 /// State owned by a Linux open-file description (`struct file`), rather than
@@ -376,6 +418,9 @@ pub struct FdTable {
     /// [`with_table`] on every access, so a `setrlimit` takes effect on the
     /// next fd-creating call without the table having to be notified.
     nofile_limit: u64,
+    /// Shared owners install a lazy RCU lookup view. Standalone tables retain
+    /// their allocation-free const constructor and need no read-side index.
+    read_view: Option<Arc<ReadIndex>>,
 }
 
 /// Why a descriptor could not be allocated.
@@ -405,6 +450,7 @@ impl FdTable {
             // boot path seeds stdio into tables that have no task behind
             // them yet, and a limit of zero there would fail every one.
             nofile_limit: u64::MAX,
+            read_view: None,
         }
     }
 
@@ -533,12 +579,23 @@ impl FdTable {
             self.slots.push(None);
             self.descriptions.push(None);
         }
-        self.slots[i] = Some(entry);
-        self.descriptions[i] = Some(description);
+        let old_entry = self.slots[i].replace(entry);
+        let old_description = self.descriptions[i].replace(description);
         self.reserved.remove(&fd);
         if i == self.next_fd {
             self.next_fd = self.next_fd.saturating_add(1);
             self.advance_next_fd();
+        }
+        self.publish_fd(fd);
+        // Replacing an open fd is atomic to a lookup. Withdraw the old view
+        // before releasing its last description, so a reader can revalidate.
+        drop(old_entry);
+        drop(old_description);
+    }
+
+    fn publish_fd(&self, fd: u32) {
+        if let Some(view) = self.read_view.as_ref() {
+            view.publish(self, fd);
         }
     }
 
@@ -772,8 +829,10 @@ impl FdTable {
         match self.slots.get_mut(i) {
             Some(slot @ Some(_)) => {
                 let entry = slot.take();
-                self.descriptions[i] = None;
+                let description = self.descriptions[i].take();
                 self.next_fd = self.next_fd.min(i);
+                self.publish_fd(fd);
+                drop(description);
                 entry
             }
             _ => None,
@@ -807,20 +866,15 @@ impl FdTable {
         if hi < lo {
             return closed;
         }
-        let mut lowest_closed = None;
-        for (relative, slot) in self.slots[lo..=hi].iter_mut().enumerate() {
-            if let Some(entry) = slot {
+        for i in lo..=hi {
+            if self.slots[i].is_some() {
                 if cloexec {
-                    entry.flags |= FD_CLOEXEC;
-                } else if let Some(entry) = slot.take() {
+                    self.slots[i].as_mut().unwrap().flags |= FD_CLOEXEC;
+                    self.publish_fd(i as u32);
+                } else if let Some(entry) = self.take(i as u32) {
                     closed.push(entry.ops);
-                    self.descriptions[lo + relative] = None;
-                    lowest_closed.get_or_insert(lo + relative);
                 }
             }
-        }
-        if let Some(fd) = lowest_closed {
-            self.next_fd = self.next_fd.min(fd);
         }
         closed
     }
@@ -831,21 +885,15 @@ impl FdTable {
     /// holder) after [`release_closed`] has run.
     pub fn close_cloexec_slots(&mut self) -> Vec<Arc<dyn FileOps>> {
         let mut closed = Vec::new();
-        let mut lowest_closed = None;
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            if slot
+        for i in 0..self.slots.len() {
+            if self.slots[i]
                 .as_ref()
                 .is_some_and(|entry| entry.flags & FD_CLOEXEC != 0)
             {
-                if let Some(entry) = slot.take() {
+                if let Some(entry) = self.take(i as u32) {
                     closed.push(entry.ops);
                 }
-                self.descriptions[i] = None;
-                lowest_closed.get_or_insert(i);
             }
-        }
-        if let Some(fd) = lowest_closed {
-            self.next_fd = self.next_fd.min(fd);
         }
         closed
     }
@@ -856,8 +904,14 @@ impl FdTable {
     }
 
     /// Mutable borrow — used by Read/Write to advance the offset.
-    pub fn get_mut(&mut self, fd: u32) -> Option<&mut FdEntry> {
-        self.slots.get_mut(fd as usize).and_then(Option::as_mut)
+    pub fn get_mut(&mut self, fd: u32) -> Option<FdEntryMut<'_>> {
+        let i = fd as usize;
+        Some(FdEntryMut {
+            fd,
+            entry: self.slots.get_mut(i)?.as_mut()?,
+            description: self.descriptions.get(i)?.as_ref()?,
+            view: self.read_view.as_deref(),
+        })
     }
 
     /// The OFD-lock owner identity behind `fd` — the description, not the
@@ -937,7 +991,7 @@ impl Default for FdTable {
 /// map (Arc lookup/insert/remove); fd operations run under the per-table inner
 /// lock, so distinct processes don't serialise and a long `poll_blocking` read
 /// holds only its own table's lock, not the whole shard.
-type Tables = BTreeMap<u64, Arc<IrqSafeSpinLock<FdTable>>>;
+type Tables = BTreeMap<u64, Arc<SharedTable>>;
 
 /// A fresh fd table pre-populated with the three stdio slots routed to the
 /// kernel console (stdin reads EOF until a real backing lands).
@@ -1022,11 +1076,24 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
     let arc = {
         let mut map = TABLES[table_shard(task_id)].tables.lock();
         map.entry(task_id)
-            .or_insert_with(|| Arc::new(IrqSafeSpinLock::new(fresh_table())))
+            .or_insert_with(|| Arc::new(SharedTable::new(fresh_table(), task_id)))
             .clone()
     };
     let mut table = arc.lock();
     Some(op(&mut table))
+}
+
+/// Resolve one descriptor through the shared table's RCU view. The returned
+/// file and description are owned references; no read guard escapes this call.
+pub(crate) fn lookup(task_id: u64, fd: u32) -> Option<ResolvedFd> {
+    let table = {
+        let mut map = TABLES[table_shard(task_id)].tables.lock();
+        Arc::clone(
+            map.entry(task_id)
+                .or_insert_with(|| Arc::new(SharedTable::new(fresh_table(), task_id))),
+        )
+    };
+    read_index::lookup(&table, fd)
 }
 
 /// [`with_table`] for an operation that may ALLOCATE a descriptor.
@@ -1871,7 +1938,9 @@ pub fn fork(parent: u64, child: u64) -> usize {
         .lock()
         .get(&parent)
         .cloned();
-    let (parent_slots, parent_descriptions, parent_max_fds) = match parent_arc {
+    // Keep the source owner pinned through child publication. If the parent
+    // detaches concurrently, final-close cleanup must see the inherited fds.
+    let (parent_slots, parent_descriptions, parent_max_fds) = match parent_arc.as_ref() {
         Some(a) => {
             let table = a.lock();
             (
@@ -1891,10 +1960,11 @@ pub fn fork(parent: u64, child: u64) -> usize {
     // inherited. Recompute instead of copying the parent's cursor, which may
     // have advanced past slots that are immediately free in the child.
     child_table.advance_next_fd();
-    TABLES[table_shard(child)]
+    let displaced = TABLES[table_shard(child)]
         .tables
         .lock()
-        .insert(child, Arc::new(IrqSafeSpinLock::new(child_table)));
+        .insert(child, Arc::new(SharedTable::new(child_table, child)));
+    drop(displaced);
     copied
 }
 
@@ -1930,7 +2000,8 @@ pub(crate) fn release_closed(task: u64, closed: impl IntoIterator<Item = Arc<dyn
         if !sock.has_registration() {
             continue;
         }
-        let has_duplicate = with_table(task, |table| table.contains_ops(&ops)).unwrap_or(false);
+        let own = TABLES[table_shard(task)].tables.lock().get(&task).cloned();
+        let has_duplicate = own.is_some_and(|table| table.lock().contains_ops(&ops));
         // `contains_ops` only sees THIS process's descriptors. A fork gives
         // every child its own table holding the same file description, so
         // each of them looks like the last owner. Release the binding only
@@ -1967,8 +2038,7 @@ pub fn ops_held_by_other_task(
     for shard in TABLES.iter() {
         // Clone the shard's table Arcs out from under its lock, so the
         // per-table locks below are never taken while a shard lock is held.
-        let tables: Vec<Arc<IrqSafeSpinLock<FdTable>>> =
-            shard.tables.lock().values().cloned().collect();
+        let tables: Vec<Arc<SharedTable>> = shard.tables.lock().values().cloned().collect();
         for table in tables {
             if let Some(own) = own.as_ref() {
                 if Arc::ptr_eq(&table, own) {
@@ -1999,11 +2069,12 @@ pub fn share(parent: u64, child: u64) -> usize {
     let arc = {
         let mut map = TABLES[table_shard(parent)].tables.lock();
         map.entry(parent)
-            .or_insert_with(|| Arc::new(IrqSafeSpinLock::new(fresh_table())))
+            .or_insert_with(|| Arc::new(SharedTable::new(fresh_table(), parent)))
             .clone()
     };
     let n = arc.lock().slots.iter().filter(|s| s.is_some()).count();
-    TABLES[table_shard(child)].tables.lock().insert(child, arc);
+    let displaced = TABLES[table_shard(child)].tables.lock().insert(child, arc);
+    drop(displaced);
     n
 }
 
@@ -2058,32 +2129,9 @@ pub fn detach(task_id: u64) {
     let table = TABLES[table_shard(task_id)].tables.lock().remove(&task_id);
     // `exit_files` → `put_files_struct`: the last thread sharing the table
     // closes every descriptor in it, exactly like close(2) would.
-    if let Some(table) = table {
-        if let Ok(table) = Arc::try_unwrap(table) {
-            // Consume the unique table directly instead of collecting its
-            // entries into a temporary Vec. Exit is a memory-release path and
-            // must keep making progress when the heap is exhausted; the old
-            // collect could panic on even a 128-byte allocation during a fork
-            // storm, before any of these descriptor references were dropped.
-            let FdTable {
-                slots,
-                descriptions,
-                reserved,
-                ..
-            } = table.into_inner();
-            // Preserve the old ordering: dropping the table released open-file
-            // descriptions and reservations before socket registrations were
-            // examined by `release_closed`.
-            drop(descriptions);
-            drop(reserved);
-            release_closed(
-                task_id,
-                slots
-                    .into_iter()
-                    .filter_map(|slot| slot.map(|entry| entry.ops)),
-            );
-        }
-    }
+    // SharedTable's destructor closes the entries even when a concurrent
+    // lookup owns the final temporary reference after this registry removal.
+    drop(table);
     // Drop any advisory POSIX locks the task held so its peers can
     // make progress on shared inodes — and wake their F_SETLKW waiters
     // NOW. This is the FIRST of the two exit-path release_owner calls
@@ -2102,7 +2150,8 @@ pub fn detach(task_id: u64) {
 #[doc(hidden)]
 pub fn __test_reset() {
     for shard in TABLES.iter() {
-        shard.tables.lock().clear();
+        let removed = core::mem::take(&mut *shard.tables.lock());
+        drop(removed);
     }
 }
 

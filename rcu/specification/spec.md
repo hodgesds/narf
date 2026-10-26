@@ -61,9 +61,14 @@ pub struct Owned<T>;                       // exclusively-owned allocation
 pub struct Shared<'g, T>;                  // tied to a ReadGuard's lifetime
 
 pub struct Atomic<T>;                       // epoch-collected pointer cell
+impl<T> Owned<T> {
+    pub fn try_new(value: T) -> Result<Self, alloc::alloc::AllocError>;
+}
 impl<T> Atomic<T> {
+    pub fn try_new(value: T) -> Result<Self, alloc::alloc::AllocError>;
     pub fn load<'g>(&self, g: &'g ReadGuard) -> Shared<'g, T>;
     pub fn store(&self, owned: Owned<T>, g: &ReadGuard);
+    pub fn clear(&self, g: &ReadGuard);      // empty publication, no allocation
     pub fn compare_and_set<'g>(
         &self, expected: Shared<'_, T>, new: Owned<T>, g: &'g ReadGuard,
     ) -> Result<Shared<'g, T>, (Owned<T>, Shared<'g, T>)>;
@@ -78,6 +83,13 @@ pub fn stalled_cpu_mask(now_ns: u64, threshold_ns: u64) -> u64;
 `'g` ties `Shared<'g, T>` to the guard; the borrow checker forbids
 keeping it past `drop(g)`. UAF is a compile error for well-typed
 consumers.
+
+`try_new` returns allocation failure instead of invoking the allocation-error
+handler; its consumed value is dropped on failure. `clear` atomically publishes
+an empty cell and retires its previous node through the same grace-period
+protocol as `store`. Clearing an already-empty cell is a no-op, and neither
+clearing nor retiring allocates. This permits close/exit paths to withdraw
+lookup metadata even when no new node can be allocated.
 
 `stalled_cpu_mask` is an allocation-free watchdog snapshot. Bit `N` is set
 when active CPU `N` has not reported a QSBR quiescent boundary within the

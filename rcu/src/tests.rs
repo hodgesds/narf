@@ -37,6 +37,54 @@ fn smoke_rcu_qsbr_pin_unpin() -> TestResult {
 }
 kernel_test_in!("rcu", smoke_rcu_qsbr_pin_unpin);
 
+fn smoke_rcu_clear_preserves_pinned_value() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    struct Canary(Arc<AtomicUsize>);
+    impl Drop for Canary {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let Ok(cell) = crate::Atomic::try_new(Canary(Arc::clone(&drops))) else {
+        return TestResult::Fail("could not allocate RCU clear fixture");
+    };
+    {
+        let guard = crate::pin();
+        let old = cell.load(&guard);
+        cell.clear(&guard);
+        cell.clear(&guard);
+        crate::report_quiescent();
+        if cell.load(&guard).as_ref().is_some()
+            || old.as_ref().is_none()
+            || drops.load(Ordering::Relaxed) != 0
+        {
+            return TestResult::Fail("clear reclaimed a pinned node or failed to publish empty");
+        }
+    }
+    crate::sync();
+    if drops.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("clear did not reclaim exactly once after the grace period");
+    }
+    let Ok(replacement) = crate::Owned::try_new(Canary(Arc::clone(&drops))) else {
+        return TestResult::Fail("could not allocate RCU replacement fixture");
+    };
+    {
+        let guard = crate::pin();
+        cell.store(replacement, &guard);
+        if cell.load(&guard).as_ref().is_none() {
+            return TestResult::Fail("cleared cell could not be republished");
+        }
+    }
+    drop(cell);
+    if drops.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("republished RCU value did not drop exactly once");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_clear_preserves_pinned_value);
+
 fn smoke_rcu_qsbr_reclaims() -> TestResult {
     // Deferred-drop round-trip: publish a value, swap it, sync, confirm
     // the displaced allocation's Drop ran.

@@ -1764,7 +1764,7 @@ impl Drop for EpollInstance {
 
 /// Clone `epfd`'s `Arc<dyn FileOps>` out of `task`'s fd table.
 fn epoll_ops(task: u64, epfd: u32) -> Option<Arc<dyn FileOps>> {
-    fd::with_table(task, |t| t.get(epfd).map(|e| e.ops.clone())).flatten()
+    fd::lookup(task, epfd).map(|file| file.ops)
 }
 
 /// Passive post-registration readiness probe for the epoll park handshake.

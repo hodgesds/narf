@@ -171,7 +171,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     // with no flags: the TCP errno (ECONNRESET, ETIMEDOUT, ...) is reported
     // as is, and a blocking read honours SO_RCVTIMEO (`sock_rcvtimeo`). The
     // generic FileOps path could do neither.
-    if let Ok(sock) = current_socket_result(fd_num) {
+    if let Some(sock) = socket_from_file_ops(endpoint.ops.clone()) {
         if let Some(tcb) = sock.kernel_tcb_id() {
             let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
             let nonblock = endpoint.nonblocking() || sock.is_nonblock();

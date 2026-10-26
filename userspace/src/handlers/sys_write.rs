@@ -51,8 +51,8 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     // `*_sendmsg` without flags: it returns only once the whole buffer is
     // queued.
     if !endpoint.nonblocking() {
-        if let Ok(sock) = current_socket_result(fd_num) {
-            if !socket_listener_nonblock(task, fd_num, sock.as_ref()) {
+        if let Some(sock) = socket_from_file_ops(endpoint.ops.clone()) {
+            if !sock.is_nonblock() {
                 let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
                 if sock.domain == crate::socket::AF_UNIX
                     && sock.kind == crate::socket::SOCK_STREAM

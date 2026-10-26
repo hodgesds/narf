@@ -40,6 +40,7 @@
 //! (§3.5) is the explicit exception; its guard is a different type.
 
 #![no_std]
+#![feature(allocator_api)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
@@ -167,6 +168,21 @@ impl<T: Send + 'static> Owned<T> {
         }
     }
 
+    /// Allocate a node without invoking the allocation-error handler.
+    pub fn try_new(value: T) -> Result<Self, alloc::alloc::AllocError> {
+        let node = Box::try_new(DeferNode {
+            hdr: DeferHdr {
+                next: core::ptr::null_mut(),
+                epoch: 0,
+                dropper: Some(drop_node::<T>),
+            },
+            value,
+        })?;
+        Ok(Self {
+            ptr: Box::into_raw(node),
+        })
+    }
+
     /// Raw node pointer — `Atomic<T>::store` consumes this.
     fn into_raw(self) -> *mut DeferNode<T> {
         let p = self.ptr;
@@ -270,6 +286,13 @@ impl<T: Send + 'static> Atomic<T> {
         }
     }
 
+    /// Construct with a value, returning allocation failure to the caller.
+    pub fn try_new(value: T) -> Result<Self, alloc::alloc::AllocError> {
+        Ok(Self {
+            ptr: AtomicPtr::new(Owned::try_new(value)?.into_raw()),
+        })
+    }
+
     /// Load the current pointer tied to a read guard's lifetime.
     /// Acquire ordering — ensures the pointed-to fields are visible.
     pub fn load<'g>(&self, _g: &'g ReadGuard) -> Shared<'g, T> {
@@ -290,6 +313,12 @@ impl<T: Send + 'static> Atomic<T> {
         // Infallible: the displaced node's retirement header was allocated
         // with it, so handing it to the reclamation list cannot fail and
         // cannot allocate.
+        retire_node::<T>(old_ptr);
+    }
+
+    /// Publish an empty cell and retire its previous node without allocating.
+    pub fn clear(&self, _g: &ReadGuard) {
+        let old_ptr = self.ptr.swap(core::ptr::null_mut(), Ordering::AcqRel);
         retire_node::<T>(old_ptr);
     }
 
