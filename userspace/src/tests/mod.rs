@@ -96,6 +96,7 @@ mod mem_uaccess;
 mod misc;
 mod module_load;
 mod namespaces;
+mod poll_silent;
 mod process;
 mod signals;
 mod sockets;

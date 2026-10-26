@@ -25,6 +25,15 @@ applications above NARF.
 
 ## 3. Public interface
 
+Blocking poll/ppoll and select/pselect distinguish providers with a durable
+readiness arm or broadcast notification from silent legacy providers (such
+as serial ttys). A set containing a silent provider sleeps to a recheck no
+later than 10 ms, clamped by any earlier provider deadline or application
+timeout. This is a scheduler wake deadline only: the application's absolute
+timeout survives syscall re-execution unchanged. Fully notifying sets keep
+their event-driven wait, including infinite waits without periodic retries.
+An empty or negative-only set waits only for its timeout or a signal.
+
 Device ioctl dispatch passes an `IoctlContext` with guarded process-memory
 copies, the open description's O_NONBLOCK state, retained descriptor lookup
 and the caller's thread-group ID to FileOps. The syscall layer also owns the
