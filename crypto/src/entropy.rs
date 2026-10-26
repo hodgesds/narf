@@ -376,7 +376,7 @@ fn key_seed_with(
         seed.zeroize();
         return Err(error);
     }
-    if !seed_words(seed, || next_word()) {
+    if !seed_words(seed, next_word) {
         return Err(CryptoError::EntropyUnavailable);
     }
     if let Err(error) = health.observe(seed) {
