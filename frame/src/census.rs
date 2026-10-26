@@ -21,10 +21,18 @@
 //! baseline for this arch, minus the names owned by any driver group
 //! the build's config left out (frame's `drivers-net` /
 //! `drivers-storage` features gate those groups' registrations).
-//! Habitat: the standard `cargo xtask test` invocation — optional
-//! one-off features the test path never enables (e.g. the net
-//! facade's `qemu-static-ipv4`, enabled only by QEMU run paths) are
-//! not part of the baseline.
+//! Habitat: the CI kernel-test invocation —
+//! `cargo xtask test --features cgroup-all,container` (xtask itself
+//! adds `kernel-test` + `module-allow-unsigned`), per
+//! `.github/workflows/ci.yml`. The baseline is defined w.r.t. that
+//! feature set: registrations gated on features it enables (e.g.
+//! `narf-filesystem`'s `cgroup` / `cgroup-psi`, reached via frame's
+//! `cgroup-all`) ARE part of the baseline, while optional one-off
+//! features the test path never enables (e.g. the net facade's
+//! `qemu-static-ipv4`, enabled only by QEMU run paths) are not.
+//! A capture made without the CI feature set records a different,
+//! smaller composition — see the correction note at the baseline
+//! table below.
 
 use alloc::vec::Vec;
 use core::fmt::Write as _;
@@ -59,6 +67,20 @@ pub fn capture() {
 // with `census_dump=1` on the kernel cmdline and
 // `XTASK_QEMU_SERIAL_LOG` keeping the guest stream, 2026-10-26.
 // x86_64: two independent boots produced byte-identical censuses.
+//
+// CORRECTION (2026-10-26, CI run 40372856800): the original capture
+// omitted the CI kernel-test feature set (`--features
+// cgroup-all,container`), so feature-gated registrations were
+// missing from the table: the fs stage recorded 4 names where the
+// CI-habitat build composes 6 — `narf-filesystem`'s `cgroupfs-mount`
+// (`#[cfg(feature = "cgroup")]`) and `proc-pressure`
+// (`#[cfg(feature = "cgroup-psi")]`) follow `procfs-mount`. Both
+// registrations and their feature forwarding predate this lane and
+// exist identically on pre-change main under the CI invocation;
+// the composition did not drift, the capture habitat did. The fs
+// entries below are corrected to the CI-habitat recording, and any
+// future regeneration must pass the CI feature set (see the module
+// header). Every other stage matched CI exactly as recorded.
 // The recording is reality, not an ideal: on x86_64 the `arch` stage
 // is empty and `ipmi`, `itco_wdt`, and `usb-r8152` each register
 // twice at Subsys (pre-existing duplicate registrations; the census
@@ -236,7 +258,9 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "devfs-mount",
         "devshm-mount",
         "procfs-mount",
-    ], // fs: 4
+        "cgroupfs-mount",
+        "proc-pressure",
+    ], // fs: 6
     &[
         "amd-fch-gpio",
         "intel-pch-gpio",
