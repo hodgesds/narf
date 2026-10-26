@@ -38,6 +38,17 @@ and CI compiler-cache integration.
   selected by signed module entries augment the build-time module trust store.
 - `cargo xtask build-module --manifest-path PATH --package NAME ...` builds an
   out-of-tree module without adding it to the repository workspace.
+- Commands with common kernel build arguments also accept
+  `--config NAME`, naming a build configuration from the closed
+  registry in `build/xtask/src/configs.rs`: `all` (frame's default
+  feature set — every driver group; the configuration production
+  and release builds use) or `minimal` (`--no-default-features`
+  plus the always-on core features; the net and storage driver
+  groups are neither compiled into the kernel nor registered).
+  `--config` unions with `--features`; unknown names are rejected.
+  Configs select `narf-frame` driver-group features only — the
+  per-driver facade features remain an internal detail of the
+  net/storage facades.
 
 - `NARF_FIRMWARE_TRUSTED_KEYS=/absolute/path/keys.txt` embeds firmware
   verification public keys (one 64-digit hex Ed25519 key per line).
