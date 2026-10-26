@@ -3168,7 +3168,15 @@ mod tests {
     /// by the fault path's false path, so a slot naming it would let a
     /// later msync write back through an unheld frame.
     fn smoke_mapped_file_zap_cancels_straddling_fill() -> TestResult {
-        const VB: u64 = 0x0000_0080_6000_0000;
+        // The base must sit in the AS-private part of the PML4[1]
+        // subtree: PDPT[0] (virt 0x80_0000_0000..0x80_4000_0000).
+        // PDPT[1..512] of every user root is a verbatim copy of the
+        // kernel's high-MMIO identity map — 1 GiB huge leaves — so a
+        // base under PDPT[1] (the old 0x80_6000_0000) can never take
+        // a 4 KiB demand leaf: `map_4kb_demand` refuses with
+        // EncounteredHugePage and the fault fails NotImplemented
+        // before any zap behaviour is exercised.
+        const VB: u64 = 0x0000_0080_2000_0000;
         // SAFETY: kernel tests run with paging enabled; the new root is
         // owned by this fixture, as in the syscall-ABI fixtures.
         let aspace = match unsafe { narf_memory::AddressSpace::new_for_user() } {
