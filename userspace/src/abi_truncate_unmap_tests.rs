@@ -555,7 +555,7 @@ fn smoke_truncate_unmap_minix() -> TestResult {
             let file = crate::handlers::poll_io_to_completion(volume.root().lookup_async("hi.txt"))
                 .and_then(|r| r.ok())
                 .ok_or("lookup of hi.txt failed")?;
-            Ok(file)
+            Ok((file, None))
         },
         // minix `read_file` zero-fills unmapped zones, so in-size
         // holes fault in as zero pages — the flag is the honest
