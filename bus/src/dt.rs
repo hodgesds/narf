@@ -39,7 +39,11 @@ use crate::addr::BusAddr;
 use crate::device::{BusDevice, BusKind, DeviceId, DtIrq, PlatformDevice, RegWindow};
 
 /// Upper bound on the DTB size the enumerator will map — the same
-/// bound `boot/` applies (`MAX_DTB_SIZE`).
+/// bound `boot/` applies (`MAX_DTB_SIZE`). Consumed only by the
+/// aarch64 enumerator (the sole target that maps a DTB at
+/// enumeration), hence the cfg gate — other targets have no
+/// caller and would trip `dead_code`.
+#[cfg(target_arch = "aarch64")]
 pub(crate) const MAX_DTB_BYTES: usize = 2 * 1024 * 1024;
 
 /// Platform devices have no PCI identity.
@@ -354,6 +358,9 @@ pub fn dtb_blob() -> Option<&'static [u8]> {
 
 /// Retain the discovered blob for probe-time access. Called once
 /// by the aarch64 enumerator; a later call replaces the slice.
+/// The aarch64 enumerator is the only caller (no other target
+/// receives a DTB handoff), hence the cfg gate.
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn retain_dtb_blob(blob: &'static [u8]) {
     *DTB_BLOB.lock() = Some(blob);
 }
