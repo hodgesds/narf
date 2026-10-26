@@ -346,6 +346,40 @@ const NVME_MAX_IO_QUEUE_PAIRS: u16 = 8;
 /// found any namespace (I/O is then refused as `NamespaceUnusable`).
 const DEFAULT_NSID: u32 = 1;
 
+/// Pre-suspend identity of one controller, captured by
+/// [`Controller::suspend_pm`] and consumed by [`Controller::resume_pm`].
+///
+/// Resume rebuilds the controller from scratch (the suspend teardown
+/// destroys every queue), so the only thing tying the rebuilt controller
+/// to the block devices registered at probe is this snapshot: if the
+/// re-identified controller is not the one that was suspended — a disk
+/// swapped while the machine slept — resume refuses rather than serving
+/// a different disk under the old registrations.
+#[derive(Clone, Debug)]
+struct SuspendSnapshot {
+    /// Identify Controller as read at suspend time.
+    identify: IdentifyController,
+    /// The registered namespace set as scanned at suspend time.
+    namespaces: Vec<ns::NamespaceInfo>,
+}
+
+/// Whether a re-identified controller is the one a [`SuspendSnapshot`]
+/// was taken from: drive identity (serial + model), namespace count and
+/// the full registered-namespace set (NSID, size, LBA format,
+/// EUI64/NGUID/UUID) must all be equal. The firmware revision is
+/// deliberately NOT compared — it is the one identity field a
+/// legitimate firmware update changes, and it names no data.
+fn suspend_identity_matches(
+    snap: &SuspendSnapshot,
+    id: &IdentifyController,
+    namespaces: &[ns::NamespaceInfo],
+) -> bool {
+    id.sn == snap.identify.sn
+        && id.mn == snap.identify.mn
+        && id.nn == snap.identify.nn
+        && namespaces == snap.namespaces
+}
+
 /// NVMe controller handle.
 ///
 /// Three states:
@@ -432,6 +466,18 @@ pub struct Controller {
     /// targets, so later I/O is refused with
     /// [`NvmeError::ControllerDead`].
     dead: bool,
+    /// Set by [`Controller::suspend_pm`] once the controller has been
+    /// quiesced (Flush + CC.SHN) and torn down for system suspend, and
+    /// cleared by [`Controller::resume_pm`] after a full re-init and
+    /// identity re-check. I/O is refused throughout the suspended
+    /// window (`suspend_pm`'s teardown also leaves `dead` set); the
+    /// flag exists so resume can tell a resumable teardown from a
+    /// controller that merely died.
+    suspended: bool,
+    /// Identity captured at suspend, re-validated at resume (see
+    /// [`SuspendSnapshot`]). `Some` exactly while `suspended` is set
+    /// by this driver (a failed resume keeps it for the retry).
+    suspend_snapshot: Option<SuspendSnapshot>,
     /// DMA pages a failed bring-up command handed the controller (an
     /// Identify target, an I/O CQ/SQ named by a failed Create). They are
     /// released only by [`Controller::disable_after_failure`], and only
@@ -685,6 +731,8 @@ impl Controller {
             ns_usable: false,
             prp_list: None,
             dead: false,
+            suspended: false,
+            suspend_snapshot: None,
             in_flight_dma: Vec::new(),
             namespaces: Vec::new(),
             primary_nsid: DEFAULT_NSID,
@@ -798,6 +846,86 @@ impl Controller {
         Some(report)
     }
 
+    /// System-suspend quiesce + teardown (Linux `nvme_suspend` →
+    /// `nvme_dev_disable(dev, shutdown = true)`): snapshot the identity
+    /// [`Self::resume_pm`] must re-validate, Flush + CC.SHN via
+    /// [`Self::shutdown`], then stop the controller and release its
+    /// queues via [`Self::disable_after_failure`]. The caller holds the
+    /// slot's request gate (the drain), so no command is in flight.
+    ///
+    /// On success the controller is disabled with `suspended` set and
+    /// I/O refused (`dead`) until `resume_pm`. Failure leaves the
+    /// controller stopped but NOT marked suspended: `resume_pm` is then
+    /// a no-op and the disk stays down rather than half-rebuilt (a
+    /// controller that cannot be confirmed stopped may still own DMA —
+    /// its pages were leaked, never freed; see
+    /// `disable_after_failure`). The one exception is
+    /// [`shutdown::ShutdownOutcome::Gone`]: the function vanished
+    /// mid-quiesce, nothing remains to stop, and the teardown is still
+    /// recorded so a resume attempt re-runs bring-up and fails honestly
+    /// there instead of pretending the disk came back.
+    pub fn suspend_pm(
+        &mut self,
+        cap: &Cap<BusDeviceCap, Write>,
+    ) -> Result<shutdown::ShutdownOutcome, NvmeError> {
+        if self.suspended {
+            return Ok(shutdown::ShutdownOutcome::Complete);
+        }
+        if !self.is_ready() {
+            return Err(NvmeError::NotReady);
+        }
+        let snapshot = SuspendSnapshot {
+            identify: self.identify.ok_or(NvmeError::NotReady)?,
+            namespaces: self.namespaces.clone(),
+        };
+        let report = self.shutdown().ok_or(NvmeError::NotReady)?;
+        let stopped = self.disable_after_failure(cap);
+        if !stopped && report.shutdown != shutdown::ShutdownOutcome::Gone {
+            return Err(NvmeError::ControllerDead);
+        }
+        self.suspended = true;
+        self.suspend_snapshot = Some(snapshot);
+        Ok(report.shutdown)
+    }
+
+    /// System-resume re-init (Linux `nvme_resume` → `nvme_reset_ctrl`):
+    /// the full probe sequence — [`Self::bring_up`] (reset, admin
+    /// queue, IDENTIFY, namespace scan) + [`Self::create_io_queue`] —
+    /// against the controller [`Self::suspend_pm`] tore down, then an
+    /// identity re-check against the suspend snapshot.
+    ///
+    /// A no-op when the controller is not suspended: the suspend
+    /// orchestrator resumes every device on rollback, including ones
+    /// whose suspend never ran or failed before marking. A failed
+    /// bring-up or queue create leaves the controller stopped and
+    /// still marked suspended, so a later resume retries the re-init.
+    /// An identity mismatch is permanent — a different disk woke up
+    /// under this instance's registrations — so the controller is torn
+    /// back down, unmarked, and the error propagates: the disk stays
+    /// down (remove + re-probe is the way back; that lifecycle trigger
+    /// is #929's work) rather than serving the wrong device.
+    pub fn resume_pm(&mut self, cap: &Cap<BusDeviceCap, Write>) -> Result<(), NvmeError> {
+        if !self.suspended {
+            return Ok(());
+        }
+        let snapshot = self.suspend_snapshot.clone().ok_or(NvmeError::NotReady)?;
+        self.bring_up(cap)?;
+        if let Err(e) = self.create_io_queue() {
+            self.disable_after_failure(cap);
+            return Err(e);
+        }
+        let id = self.identify.ok_or(NvmeError::NotReady)?;
+        if !suspend_identity_matches(&snapshot, &id, &self.namespaces) {
+            self.disable_after_failure(cap);
+            self.suspended = false;
+            self.suspend_snapshot = None;
+            return Err(NvmeError::ControllerDead);
+        }
+        self.suspended = false;
+        self.suspend_snapshot = None;
+        Ok(())
+    }
+
     /// Largest data transfer one I/O command may carry, in bytes.
     pub fn max_transfer_bytes(&self) -> u32 {
         self.max_transfer
@@ -807,6 +935,12 @@ impl Controller {
     /// [`NvmeError::ControllerDead`].
     pub fn is_dead(&self) -> bool {
         self.dead
+    }
+
+    /// `true` between a successful [`Controller::suspend_pm`] and the
+    /// matching [`Controller::resume_pm`].
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
     }
 
     /// Constructor taking the real `BusDevice`. The kernel-test smoke
@@ -1184,6 +1318,14 @@ impl Controller {
         &mut self,
         cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<RecoveryReport, NvmeError> {
+        if self.suspended {
+            // Recovery loses to suspend: this controller was put
+            // down by `suspend_pm`, and only `resume_pm` may bring
+            // it back. (`recover_slot` refuses earlier still; this
+            // guard keeps the invariant at the layer that owns the
+            // state, for any future caller.)
+            return Err(NvmeError::NotReady);
+        }
         let before_id = self.identify.ok_or(NvmeError::NotReady)?;
         let before_ns = self.namespaces.clone();
         if !self.disable_after_failure(cap) {
@@ -3299,12 +3441,16 @@ struct InstalledController {
     /// first use. Its contents are serialised by `req_gate`; this lock
     /// only covers the lazy init.
     scratch: IrqSafeSpinLock<Option<&'static DmaBuffer>>,
-    /// BAR0 and the CC.SHN wait budget, copied out at install so the final
-    /// shutdown can still send CC.SHN — a register write that touches no
-    /// queue state — when an in-flight command never releases `req_gate`
-    /// (Linux `nvme_dev_disable` disables the controller after its freeze
-    /// timeout whatever is still outstanding). `None` before bring-up.
-    shutdown_regs: Option<(MmioRegion, u64)>,
+    /// BAR0 and the CC.SHN wait budget, copied out of the live controller
+    /// so the final shutdown can still send CC.SHN — a register write
+    /// that touches no queue state — when an in-flight command never
+    /// releases `req_gate` (Linux `nvme_dev_disable` disables the
+    /// controller after its freeze timeout whatever is still
+    /// outstanding). `None` before bring-up. Behind a lock because
+    /// resume's re-init replaces the BAR mapping and must refresh the
+    /// pair (`resume_slot`); install and the final shutdown are the
+    /// only other accessor / reader.
+    shutdown_regs: IrqSafeSpinLock<Option<(MmioRegion, u64)>>,
     ctrl: UnsafeCell<Controller>,
 }
 
@@ -3333,24 +3479,32 @@ fn controller_bdf(ctrl: &Controller) -> Option<narf_bus::PcieAddr> {
     }
 }
 
+/// The `(BAR0, CC.SHN wait budget)` pair the final shutdown's forced
+/// path needs, copied out of the live controller. Recomputed whenever a
+/// bring-up replaces the controller's BAR mapping: at install
+/// ([`leak_slot`]) and after a PM resume ([`resume_slot`]).
+fn shutdown_regs_of(ctrl: &Controller) -> Option<(MmioRegion, u64)> {
+    ctrl.bar0_region.map(|bar| {
+        (
+            bar,
+            shutdown::shutdown_timeout_ms(ctrl.identify.map(|i| i.rtd3e).unwrap_or(0)),
+        )
+    })
+}
+
 fn leak_slot(
     instance: u32,
     bdf: Option<narf_bus::PcieAddr>,
     ctrl: Controller,
 ) -> &'static InstalledController {
-    let shutdown_regs = ctrl.bar0_region.map(|bar| {
-        (
-            bar,
-            shutdown::shutdown_timeout_ms(ctrl.identify.map(|i| i.rtd3e).unwrap_or(0)),
-        )
-    });
+    let shutdown_regs = shutdown_regs_of(&ctrl);
     alloc::boxed::Box::leak(alloc::boxed::Box::new(InstalledController {
         req_gate: AtomicBool::new(false),
         instance,
         bdf,
         removed: AtomicBool::new(false),
         scratch: IrqSafeSpinLock::new(None),
-        shutdown_regs,
+        shutdown_regs: IrqSafeSpinLock::new(shutdown_regs),
         ctrl: UnsafeCell::new(ctrl),
     }))
 }
@@ -3860,14 +4014,14 @@ pub fn probe(
             log_level: LogLevel::Info,
         });
     }
-    register_controller(instance, device);
+    register_controller(instance, device, cap);
     Ok(())
 }
 
 /// Publish controller `instance`: block devices (namespaces + partitions,
 /// each behind the registry's `narf.disks` guard), the bound-driver record,
 /// device PM, and the `/dev/nvme<C>` controller node.
-fn register_controller(instance: u32, device: narf_bus::BusDevice) {
+fn register_controller(instance: u32, device: narf_bus::BusDevice, cap: Cap<BusDeviceCap, Write>) {
     let bus_path = match device.addr {
         narf_bus::BusAddr::Pcie(a) => ns::bdf_string(a),
         _ => alloc::string::String::new(),
@@ -3901,11 +4055,13 @@ fn register_controller(instance: u32, device: narf_bus::BusDevice) {
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Block.default_domain(),
     });
-    // Device PM: system suspend is refused (see `NvmePm::suspend`), which
-    // makes the suspend orchestrator abort before anything powers down.
+    // Device PM: suspend quiesces + tears the controller down and
+    // resume re-initialises it (see `NvmePm`), so NVMe-rooted machines
+    // can complete system suspend. The PM entry carries the probe cap:
+    // the callbacks receive none.
     narf_power::device_pm::register_device_pm_ops(
         &ctrl_name,
-        alloc::sync::Arc::new(NvmePm { instance }),
+        alloc::sync::Arc::new(NvmePm { instance, cap }),
     );
     // `/dev/nvme<C>`: admin passthrough (smartctl / nvme-cli) for this
     // controller. devfs gates it on every one of its namespaces being
@@ -3958,6 +4114,11 @@ fn withdraw_controller_publications(instance: u32) {
 /// [`Controller::reset_recover`], minting the device cap from the
 /// bus bootstrap authority the way `probe_all` does.
 ///
+/// A suspended controller is refused ([`NvmeError::NotReady`]),
+/// never recovered: its `dead` is the suspend teardown's state, and
+/// only resume may bring it back (see [`suspend_slot`] /
+/// [`resume_slot`]).
+///
 /// Gate discipline: the reset runs under the slot's request gate,
 /// acquired here — callers (the block entry points) drop their
 /// guard before calling, because re-publication
@@ -3968,7 +4129,11 @@ fn withdraw_controller_publications(instance: u32) {
 /// recovered returns `Ok` immediately.
 ///
 /// On a namespace-set change the controller's publications are
-/// withdrawn and re-registered from the fresh scan. On
+/// withdrawn and re-registered from the fresh scan; the cap minted
+/// for the reset is handed to that re-registration, so the device-PM
+/// entry re-published for the controller carries the device's real
+/// claimed cap (the PM callbacks receive none — see
+/// [`register_controller`]). On
 /// [`NvmeError::IdentityChanged`] the function hosts a different
 /// device than the one that wedged: the slot is marked removed
 /// (before the gate is released, so no racing caller can adopt the
@@ -3980,9 +4145,21 @@ fn recover_slot(instance: u32) -> Result<(), NvmeError> {
     let slot = slot_of(instance).ok_or(NvmeError::NotReady)?;
     let name = ns::controller_name(instance);
     // The reset proper, under the gate; the outcome is acted on
-    // after the guard drops (see the gate note above).
-    let (device, outcome) = {
+    // after the guard drops (see the gate note above). The minted
+    // cap travels with the outcome: re-publication needs it.
+    let (device, outcome, cap) = {
         let mut ctrl = acquire(slot);
+        if ctrl.is_suspended() {
+            // Suspend wins over recovery: a suspended controller is
+            // `dead` because the PM teardown put it down, not because
+            // a command wedged it, and resurrecting it here would
+            // serve I/O the suspend window exists to refuse.
+            // Recovery of a suspended controller is deferred to
+            // resume (`resume_slot` re-inits it); refuse the caller
+            // instead. Checked before the not-dead early return so
+            // the refusal holds whatever state the teardown left.
+            return Err(NvmeError::NotReady);
+        }
         if !ctrl.is_dead() {
             return Ok(());
         }
@@ -3998,13 +4175,13 @@ fn recover_slot(instance: u32) -> Result<(), NvmeError> {
         if matches!(outcome, Err(NvmeError::IdentityChanged)) {
             slot.removed.store(true, Ordering::Release);
         }
-        (device, outcome)
+        (device, outcome, cap)
     };
     match outcome {
         Ok(report) => {
             if report.namespaces_changed {
                 withdraw_controller_publications(instance);
-                register_controller(instance, device);
+                register_controller(instance, device, cap);
                 let _ = writeln!(
                     narf_console::Writer,
                     "nvme: {name}: recovered; namespace set changed, re-published"
@@ -4081,7 +4258,7 @@ fn shutdown_slot(
             None => SlotShutdown::NotReady,
         };
     }
-    let Some((bar, timeout_ms)) = slot.shutdown_regs else {
+    let Some((bar, timeout_ms)) = *slot.shutdown_regs.lock() else {
         return SlotShutdown::NotReady;
     };
     let _ = writeln!(
@@ -4189,37 +4366,227 @@ pub fn shutdown_all_controllers() {
     }
 }
 
+/// What one controller's PM suspend did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotSuspend {
+    /// Drained, flushed, CC.SHN'd and torn down; [`resume_slot`]
+    /// rebuilds the controller on resume.
+    Suspended(shutdown::ShutdownOutcome),
+    /// Already suspended: a repeated suspend is a no-op.
+    AlreadySuspended,
+    /// The request gate never freed within the drain budget; the
+    /// controller was not touched.
+    Busy,
+    /// Never brought up: nothing to suspend.
+    NotReady,
+    /// The quiesce/teardown failed partway; the controller is left
+    /// stopped, not suspended, and stays down until remove + re-probe.
+    Failed,
+}
+
+/// What one controller's PM resume did.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SlotResume {
+    /// Re-initialised and identity re-validated; I/O flows again.
+    Resumed,
+    /// Was not suspended: a rollback resume is a no-op.
+    NotSuspended,
+    /// The request gate never freed within the drain budget.
+    Busy,
+    /// Re-init or the identity re-check failed; the controller stays
+    /// down (a later resume retries after a transient bring-up
+    /// failure; an identity mismatch is permanent).
+    Failed,
+}
+
+/// PM suspend of one controller: wait up to `drain_ms` for its request
+/// gate (in-flight commands to finish) via `wait(cond, ms)`, then
+/// [`Controller::suspend_pm`] — Flush + CC.SHN quiesce and queue
+/// teardown. Unlike the final shutdown there is no forced path: a
+/// controller that never drains reports [`SlotSuspend::Busy`] and the
+/// suspend orchestrator aborts the system suspend (its documented
+/// `Busy` contract) rather than powering down under live DMA. `wait`
+/// is [`pm_drain_wait`] in production and a model in tests.
+fn suspend_slot(
+    slot: &'static InstalledController,
+    cap: &Cap<BusDeviceCap, Write>,
+    drain_ms: u64,
+    wait: &mut dyn FnMut(&mut dyn FnMut() -> bool, u64) -> bool,
+) -> SlotSuspend {
+    let got = drain_ms > 0
+        && wait(
+            &mut || {
+                slot.req_gate
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            },
+            drain_ms,
+        );
+    if !got {
+        return SlotSuspend::Busy;
+    }
+    let mut ctrl = ControllerGuard { slot };
+    if ctrl.suspended {
+        return SlotSuspend::AlreadySuspended;
+    }
+    if !ctrl.is_ready() {
+        return SlotSuspend::NotReady;
+    }
+    match ctrl.suspend_pm(cap) {
+        Ok(outcome) => SlotSuspend::Suspended(outcome),
+        Err(_) => SlotSuspend::Failed,
+    }
+}
+
+/// PM resume of one controller: take the request gate (bounded by
+/// `drain_ms` via `wait`, as in [`suspend_slot`]), then
+/// [`Controller::resume_pm`] — full re-init + identity re-check. On
+/// success the slot's copied-out shutdown registers are refreshed:
+/// the re-init replaced the controller's BAR mapping, and the final
+/// shutdown's forced path must not write CC.SHN through the stale one.
+fn resume_slot(
+    slot: &'static InstalledController,
+    cap: &Cap<BusDeviceCap, Write>,
+    drain_ms: u64,
+    wait: &mut dyn FnMut(&mut dyn FnMut() -> bool, u64) -> bool,
+) -> SlotResume {
+    let got = drain_ms > 0
+        && wait(
+            &mut || {
+                slot.req_gate
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            },
+            drain_ms,
+        );
+    if !got {
+        return SlotResume::Busy;
+    }
+    let mut ctrl = ControllerGuard { slot };
+    if !ctrl.suspended {
+        return SlotResume::NotSuspended;
+    }
+    match ctrl.resume_pm(cap) {
+        Ok(()) => {
+            *slot.shutdown_regs.lock() = shutdown_regs_of(&ctrl);
+            SlotResume::Resumed
+        }
+        Err(_) => SlotResume::Failed,
+    }
+}
+
+/// The PM drain wait: [`drain_wait`] without the cooperative yield —
+/// device-PM handlers run on the boot CPU with interrupts gated and
+/// must not schedule (see `narf_power::device_pm`). Spins in 100 ms
+/// slices via the responsive spin (the sleep pumps keep running) and
+/// logs every 5 s so a long drain is visible.
+fn pm_drain_wait(name: &str) -> impl FnMut(&mut dyn FnMut() -> bool, u64) -> bool + '_ {
+    move |cond, budget_ms| {
+        use core::fmt::Write as _;
+        let start = narf_time::wall::monotonic_ns();
+        let mut next_log_ms = 5_000;
+        loop {
+            if narf_scheduler::responsive_spin_until(&mut *cond, narf_time::Deadline::after_ms(100))
+            {
+                return true;
+            }
+            let waited_ms = narf_time::wall::monotonic_ns().saturating_sub(start) / 1_000_000;
+            if waited_ms >= budget_ms {
+                return false;
+            }
+            if waited_ms >= next_log_ms {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "nvme: {name}: PM waiting for in-flight I/O ({waited_ms} ms of {budget_ms} ms)"
+                );
+                next_log_ms += 5_000;
+            }
+        }
+    }
+}
+
 /// Per-controller suspend/resume (`DevicePmOps`).
+///
+/// Suspend is Linux `nvme_suspend` (`nvme_dev_disable(shutdown =
+/// true)`): drain the request gate, Flush every namespace, CC.SHN,
+/// queues torn down. Resume is Linux `nvme_resume`: a full controller
+/// reset that rebuilds the admin and I/O queues and revalidates the
+/// controller's identity before I/O flows again.
 #[derive(Debug)]
 struct NvmePm {
     instance: u32,
+    /// The probe-time device authority, carried here because the
+    /// `DevicePmOps` callbacks receive no cap: the teardown and the
+    /// re-init write PCI config space (BUS_MASTER) and manage MSI-X
+    /// through it (the amdgpu driver's stored-authority pattern).
+    cap: Cap<BusDeviceCap, Write>,
 }
 
 impl narf_power::device_pm::DevicePmOps for NvmePm {
-    /// Refused: system suspend is not supported for NVMe yet, so the
-    /// suspend orchestrator aborts and resumes every device it already
-    /// suspended.
-    ///
-    /// Linux `nvme_suspend` (simple suspend) is `nvme_dev_disable(shutdown =
-    /// true)` — flush, CC.SHN, queues torn down — and `nvme_resume` is a full
-    /// controller reset that rebuilds the admin and I/O queues. Clearing
-    /// CC.EN alone (what this did) discards the controller's queue state
-    /// without a Flush or a shutdown notification, and re-setting it leaves
-    /// the host's queue indices pointing past what the controller now
-    /// expects; the first command after resume would be lost. Until the
-    /// re-init path exists, refusing is the only correct answer.
     fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
         use core::fmt::Write as _;
-        let _ = writeln!(
-            narf_console::Writer,
-            "nvme: {}: system suspend refused (NVMe suspend/resume not supported yet)",
-            ns::controller_name(self.instance)
-        );
-        Err(narf_power::device_pm::DeviceSuspendError::NotImplemented)
+        use narf_power::device_pm::DeviceSuspendError as PmErr;
+        let name = ns::controller_name(self.instance);
+        // Not installed (or removed): nothing to quiesce. The PM entry
+        // outlives removal because the registry has no unregister.
+        let Some(slot) = slot_of(self.instance) else {
+            return Ok(());
+        };
+        // Bind the wait closure to a local rather than creating it
+        // inline in the `match` scrutinee: a temporary there lives in
+        // the block's tail expression and drops *after* the block's
+        // locals, but its type may access the `name` borrow on drop
+        // (E0597). Declared after `name`, the local drops first.
+        let mut wait = pm_drain_wait(&name);
+        match suspend_slot(slot, &self.cap, SHUTDOWN_DRAIN_TIMEOUT_MS, &mut wait) {
+            SlotSuspend::Suspended(shutdown::ShutdownOutcome::Complete)
+            | SlotSuspend::Suspended(shutdown::ShutdownOutcome::NotEnabled)
+            | SlotSuspend::AlreadySuspended
+            | SlotSuspend::NotReady => Ok(()),
+            SlotSuspend::Suspended(shutdown::ShutdownOutcome::Gone) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "nvme: {name}: controller vanished during suspend; nothing left to power down"
+                );
+                Ok(())
+            }
+            SlotSuspend::Suspended(shutdown::ShutdownOutcome::TimedOut) => {
+                // `DeviceSuspendError::DriverError` is documented for
+                // exactly this: the controller didn't acknowledge the
+                // shutdown notification. The queues are still torn
+                // down, so the orchestrator's rollback resume rebuilds
+                // the controller.
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "nvme: {name}: CC.SHN not acknowledged within the RTD3E budget; torn down anyway, reporting DriverError"
+                );
+                Err(PmErr::DriverError)
+            }
+            SlotSuspend::Busy => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "nvme: {name}: suspend refused: in-flight I/O did not drain"
+                );
+                Err(PmErr::Busy)
+            }
+            SlotSuspend::Failed => Err(PmErr::DriverError),
+        }
     }
-    /// Nothing to undo: [`Self::suspend`] never touches the controller.
+
     fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
-        Ok(())
+        use narf_power::device_pm::DeviceSuspendError as PmErr;
+        let name = ns::controller_name(self.instance);
+        let Some(slot) = slot_of(self.instance) else {
+            return Ok(());
+        };
+        // See `suspend`: the wait closure must be a local declared
+        // after `name`, not a block-tail temporary (E0597).
+        let mut wait = pm_drain_wait(&name);
+        match resume_slot(slot, &self.cap, SHUTDOWN_DRAIN_TIMEOUT_MS, &mut wait) {
+            SlotResume::Resumed | SlotResume::NotSuspended => Ok(()),
+            SlotResume::Busy => Err(PmErr::Busy),
+            SlotResume::Failed => Err(PmErr::DriverError),
+        }
     }
 }
 

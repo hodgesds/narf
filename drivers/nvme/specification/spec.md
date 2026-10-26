@@ -116,9 +116,17 @@ multipath / fabrics (defer).
   request gate, then flushes + sends CC.SHN; a controller that never drains
   still gets CC.SHN written straight to the register (`SlotShutdown::Forced`,
   logged as an error). Never waits from interrupt context.
-- **System suspend is refused** (`DevicePmOps::suspend` →
-  `DeviceSuspendError::NotImplemented`, so the orchestrator aborts) until a
-  flush + CC.SHN suspend and a full queue re-init on resume exist.
+- **System suspend / resume** (`DevicePmOps`, #926). `suspend` drains the
+  request gate (30 s budget; `DeviceSuspendError::Busy` if it never frees —
+  no forced quiesce, unlike final shutdown), then `Controller::suspend_pm`:
+  Flush every namespace + CC.SHN (the shutdown path), queue teardown and
+  CC.EN clear (Linux `nvme_suspend` = `nvme_dev_disable(shutdown = true)`).
+  `resume` (`Controller::resume_pm`) is a full re-init — `bring_up` +
+  `create_io_queue` (Linux `nvme_resume` = controller reset) — followed by
+  an identity re-check against the pre-suspend snapshot (Identify
+  serial/model/NN + the registered namespace set; the firmware revision is
+  not compared). A mismatch leaves the controller torn down and fails the
+  resume rather than serving a different disk under the old registrations.
 - `/dev/nvme<C>`: one controller node per instance
   (`narf_filesystem::devfs::register_nvme_controller(instance, node,
   namespaces)`); `NVME_IOCTL_IO_CMD` / `NVME_IOCTL_IO64_CMD` are refused
