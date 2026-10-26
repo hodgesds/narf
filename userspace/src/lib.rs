@@ -78,6 +78,7 @@ pub mod poll;
 pub mod posix_timer;
 pub mod process;
 pub mod ptrace;
+mod rlimit;
 pub mod seccomp;
 pub mod select;
 pub mod socket;

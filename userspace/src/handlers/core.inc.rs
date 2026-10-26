@@ -12148,6 +12148,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         None => crate::user_task::prepare_user_process_initial(proc, child_spec),
     };
     let child_tid = pending_child.task_id();
+    // Copy before publishing the child's PID, so a cross-task prlimit cannot
+    // update default limits only to have inheritance overwrite that update.
+    // CLONE_THREAD already shares its constructor-selected process object.
+    rlimit_fork(parent_pid, child_tid.raw());
     #[cfg(feature = "container")]
     pid_plan.install(child_tid.raw());
     proc_identity_fork(parent_pid, child_tid.raw());
@@ -12223,7 +12227,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // Rlimits are process/TGID state (shared by CLONE_THREAD, copied by a real
     // process clone); capabilities remain per-thread credentials and copy in
     // both cases.
-    rlimit_fork(parent_pid, child_tid.raw());
     cap_fork(parent_pid, child_tid.raw());
     // Linux copy_io(): CLONE_IO shares the caller's existing io_context;
     // otherwise a present context is copied. This includes ioprio state.
@@ -14676,22 +14679,7 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                     }
                     crate::pid_ns::clear_ns(tid);
                 }
-                // Serialize rlimit-row removal with prlimit64's retained-task
-                // revalidation. Both paths take RLIMIT_TABLE before TASKS:
-                // prlimit either completes its transaction first, or observes
-                // that reap already removed the registry entry. No permanent
-                // TaskId tombstone is needed (TaskIds are never reused).
-                {
-                    let mut rlimits = RLIMIT_TABLE.lock();
-                    if let Some(state) = rlimits.as_mut() {
-                        if state.rows.remove(&tid).is_some() {
-                            RLIMIT_CUSTOM_ROWS
-                                .fetch_sub(1, core::sync::atomic::Ordering::Release);
-                            publish_rlimit_change();
-                        }
-                    }
-                    crate::task::release_task(tid);
-                }
+                crate::task::release_task(tid);
                 // Reap-time pid↔tid unbinding. PIDs are recycled after the
                 // cyclic allocator wraps, so a surviving PID_TO_TASK row would
                 // point the pid's NEXT owner-lookup at this dead tid —
@@ -14711,7 +14699,6 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                         m.remove(&tid);
                     }
                     tgid_member_remove(tid, child_pid);
-                    publish_rlimit_change();
                 }
             }
         }
@@ -15424,7 +15411,7 @@ static LINUX_TID_TO_TASK: [PidTaskMapShard; PID_TASK_SHARDS] =
     [const { PidTaskMapShard::new() }; PID_TASK_SHARDS];
 /// Serializes the cold registration/removal paths with whole-registry
 /// snapshots. Point lookups intentionally bypass it and take one shard only.
-static PID_TASK_MUTATION: narf_lib::sync::IrqSafeSpinLock<()> =
+pub(crate) static PID_TASK_MUTATION: narf_lib::sync::IrqSafeSpinLock<()> =
     narf_lib::sync::IrqSafeSpinLock::new(());
 
 /// Reverse index of [`TASK_TO_PID`]: visible pid (tgid) → the set of member
@@ -15485,7 +15472,7 @@ fn set_task_pid_locked(task: u64, tgid: u64) {
             tgid_member_remove(task, o);
         }
         tgid_member_add(task, tgid);
-        publish_rlimit_change();
+        rlimit_refresh_task_binding_locked(task);
     }
 }
 
@@ -15550,7 +15537,7 @@ pub fn __test_forget_task_pid(task: u64) {
         .and_then(|m| m.remove(&task));
     if let Some(tgid) = old {
         tgid_member_remove(task, tgid);
-        publish_rlimit_change();
+        rlimit_refresh_task_binding_locked(task);
     }
 }
 
@@ -15603,6 +15590,7 @@ fn pid_task_snapshot() -> alloc::vec::Vec<(u64, u64)> {
 
 
 pub fn pid_task_map_init() {
+    let _mutation = PID_TASK_MUTATION.lock();
     for shard in PID_TO_TASK.iter() {
         *shard.map.lock() = Some(BTreeMap::new());
     }
@@ -15616,10 +15604,11 @@ pub fn pid_task_map_init() {
         *shard.map.lock() = Some(BTreeMap::new());
     }
     *TGID_MEMBERS.lock() = Some(BTreeMap::new());
-    publish_rlimit_change();
+    rlimit_refresh_bindings_locked();
 }
 
 pub fn pid_task_map_reset() {
+    let _mutation = PID_TASK_MUTATION.lock();
     for shard in PID_TO_TASK.iter() {
         *shard.map.lock() = None;
     }
@@ -15633,7 +15622,7 @@ pub fn pid_task_map_reset() {
         *shard.map.lock() = None;
     }
     *TGID_MEMBERS.lock() = None;
-    publish_rlimit_change();
+    rlimit_refresh_bindings_locked();
 }
 
 /// Register a (ProcessId → TaskId) mapping. Called by `sys_fork` and
@@ -15641,6 +15630,11 @@ pub fn pid_task_map_reset() {
 /// Records both directions simultaneously so all translations are O(1).
 pub fn register_pid_task_mapping(pid_raw: u64, task_raw: u64) {
     let _mutation = PID_TASK_MUTATION.lock();
+    // Capture the incoming leader's owner before changing its group. A real
+    // exec/de-thread preserves its shared process limits; a replacement leader
+    // from another process retains that process's existing keyed object.
+    let preferred = crate::task::task_get(task_raw).map(|task| task.rlimit_owner());
+    let limits = rlimit_registry_owner(task_raw, preferred);
     set_task_pid_locked(task_raw, pid_raw);
     // Self-initialize: the map may be `None` if `wait_init` hasn't run
     // yet (early boot, or the kernel-test harness which boots straight
@@ -15651,7 +15645,10 @@ pub fn register_pid_task_mapping(pid_raw: u64, task_raw: u64) {
         .lock()
         .get_or_insert_with(BTreeMap::new)
         .insert(pid_raw, task_raw);
-    publish_rlimit_change();
+    for_each_group_member(pid_raw, |member| {
+        rlimit_bind_task_locked(member, limits.clone());
+        true
+    });
 }
 
 pub fn register_task_to_pid(task_raw: u64, pid_raw: u64) {
@@ -15800,7 +15797,6 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
         m.remove(&tid);
     }
     tgid_member_remove(tid, pid);
-    publish_rlimit_change();
 }
 
 /// Linux `signal->live`: per-thread-group (per-`pid`) count of live
@@ -17701,7 +17697,7 @@ fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, vals: [u3
 //   RLIMIT_NOFILE  = (1024 cur, 4096 max)
 //   RLIMIT_AS      = INFINITY
 
-const RLIMIT_COUNT: usize = 16;
+const RLIMIT_COUNT: usize = crate::rlimit::COUNT;
 
 /// `RLIMIT_NOFILE` — the resource index the descriptor-allocation bound comes
 /// from. Named because it is consulted from several syscalls that each used a
@@ -17710,12 +17706,7 @@ const RLIMIT_NOFILE_RESOURCE: usize = 7;
 
 /// Wire-shape pair: rlim_cur followed by rlim_max. Matches the
 /// glibc layout the libc shim already exposes.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-struct RLimitPair {
-    cur: u64,
-    max: u64,
-}
+type RLimitPair = crate::rlimit::Limit;
 
 const RLIM_INFINITY: u64 = !0;
 
@@ -17770,13 +17761,7 @@ fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
 struct RlimitState {
     /// Rows are keyed by the monotonic thread-group leader TaskId. ProcessIds
     /// are recycled and therefore cannot safely own lifetime-bearing state.
-    rows: BTreeMap<u64, [RLimitPair; RLIMIT_COUNT]>,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct RlimitReadCache {
-    generation: u64,
-    limits: [RLimitPair; RLIMIT_COUNT],
+    rows: BTreeMap<u64, alloc::sync::Arc<crate::rlimit::ProcessLimits>>,
 }
 
 impl RlimitState {
@@ -17789,39 +17774,16 @@ impl RlimitState {
 
 static RLIMIT_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<RlimitState>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
-static RLIMIT_CUSTOM_ROWS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-static RLIMIT_GENERATION: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(1);
-
-/// Called after a limits-row or process-identity mutation, under its owning
-/// mutation lock. A reader may use an older snapshot only if its acquire
-/// generation load precedes this publication, just as a locked read may finish
-/// before a concurrent writer. Cache fills read matching generation before key
-/// resolution and with their complete row.
-fn publish_rlimit_change() {
-    RLIMIT_GENERATION
-        .fetch_update(
-            core::sync::atomic::Ordering::Release,
-            core::sync::atomic::Ordering::Relaxed,
-            |generation| generation.checked_add(1),
-        )
-        .expect("rlimit cache generation exhausted");
-}
 
 pub fn rlimit_init() {
-    let mut table = RLIMIT_TABLE.lock();
-    *table = Some(RlimitState::new());
-    RLIMIT_CUSTOM_ROWS.store(0, core::sync::atomic::Ordering::Release);
-    publish_rlimit_change();
+    let _mutation = PID_TASK_MUTATION.lock();
+    *RLIMIT_TABLE.lock() = Some(RlimitState::new());
+    rlimit_refresh_bindings_locked();
 }
 
 #[doc(hidden)]
 pub fn __test_rlimit_reset() {
-    let mut table = RLIMIT_TABLE.lock();
-    *table = Some(RlimitState::new());
-    RLIMIT_CUSTOM_ROWS.store(0, core::sync::atomic::Ordering::Release);
-    publish_rlimit_change();
+    rlimit_init();
 }
 
 /// Test-only count of every lifetime-bearing record in the rlimit store.
@@ -17833,6 +17795,37 @@ pub fn __test_rlimit_storage_len() -> usize {
         .map_or(0, |state| state.rows.len())
 }
 
+/// Prove that enforcement does not consult either transaction lock. The
+/// seeded non-default value also rules out accidentally returning defaults.
+#[doc(hidden)]
+pub fn __test_rlimit_read_once_under_locks(task: u64, resource: usize) -> Option<(u64, u64)> {
+    let _identity = PID_TASK_MUTATION.lock();
+    if !crate::task::with_task_local(task, |owner| owner.__test_rlimits_use_initial())? {
+        return None;
+    }
+    let limits = rlimit_owner(task);
+    limits.transaction(|_| {
+        let _index = RLIMIT_TABLE.lock();
+        read_rlimit(task, resource).map(|limit| (limit.cur, limit.max))
+    })
+}
+
+#[doc(hidden)]
+pub fn __test_rlimit_read_once(task: u64, resource: usize) -> Option<(u64, u64)> {
+    read_rlimit(task, resource).map(|limit| (limit.cur, limit.max))
+}
+
+#[doc(hidden)]
+pub fn __test_rlimit_retained_update_is_gone(owner: &alloc::sync::Arc<crate::task::Task>) -> bool {
+    update_rlimit_atomic(
+        owner.tid,
+        Some(owner),
+        RLIMIT_NOFILE_RESOURCE,
+        Some(RLimitPair { cur: 64, max: 200 }),
+        true,
+    ) == Err(ESRCH)
+}
+
 /// Resolve any thread in a group to the leader's never-reused TaskId.
 fn process_state_key(task: u64) -> u64 {
     task_to_pid_raw(task)
@@ -17840,50 +17833,98 @@ fn process_state_key(task: u64) -> u64 {
         .unwrap_or(task)
 }
 
+/// Only creation, identity rebinding, and reap use this index. Neither hot
+/// limit checks nor updates to a registered task take its global lock.
+fn rlimit_registry_owner(
+    key: u64,
+    preferred: Option<alloc::sync::Arc<crate::rlimit::ProcessLimits>>,
+) -> alloc::sync::Arc<crate::rlimit::ProcessLimits> {
+    RLIMIT_TABLE
+        .lock()
+        .get_or_insert_with(RlimitState::new)
+        .rows
+        .entry(key)
+        .or_insert_with(|| {
+            preferred.unwrap_or_else(|| {
+                alloc::sync::Arc::new(crate::rlimit::ProcessLimits::new(default_rlimits()))
+            })
+        })
+        .clone()
+}
+
+pub(crate) fn rlimit_for_new_task(
+    task: u64,
+    pid: u64,
+) -> alloc::sync::Arc<crate::rlimit::ProcessLimits> {
+    let _mutation = PID_TASK_MUTATION.lock();
+    let key = pid_to_task_raw(pid).unwrap_or(task);
+    rlimit_registry_owner(key, None)
+}
+
+fn rlimit_owner(task: u64) -> alloc::sync::Arc<crate::rlimit::ProcessLimits> {
+    crate::task::with_task_local(task, |owner| owner.rlimit_owner())
+        .or_else(|| {
+            let key = process_state_key(task);
+            RLIMIT_TABLE
+                .lock()
+                .as_ref()
+                .and_then(|state| state.rows.get(&key).cloned())
+        })
+        // A stale /proc snapshot or a synthetic unregistered task must not
+        // create a permanent lifetime-index entry merely by reading defaults.
+        .unwrap_or_else(|| {
+            alloc::sync::Arc::new(crate::rlimit::ProcessLimits::new(default_rlimits()))
+        })
+}
+
+/// Caller holds PID_TASK_MUTATION. No registry lock is held while taking the
+/// task's binding gate and then its old process's transaction lock.
+fn rlimit_bind_task_locked(task: u64, limits: alloc::sync::Arc<crate::rlimit::ProcessLimits>) {
+    if let Some(owner) = crate::task::task_get(task) {
+        owner.rebind_rlimits(limits);
+    }
+}
+
+fn rlimit_refresh_task_binding_locked(task: u64) {
+    let limits = rlimit_registry_owner(process_state_key(task), None);
+    rlimit_bind_task_locked(task, limits);
+}
+
+fn rlimit_refresh_bindings_locked() {
+    for task in crate::task::task_ids() {
+        rlimit_refresh_task_binding_locked(task);
+    }
+}
+
+/// Task::release_task freezes the current limits binding before unregistration
+/// and calls here with its binding gate still held. Prepared-child
+/// cancellation and non-leader thread retirement use that same release path.
+pub(crate) fn rlimit_retire_key(task: u64) {
+    if let Some(state) = RLIMIT_TABLE.lock().as_mut() {
+        state.rows.remove(&task);
+    }
+}
+
+/// Internal enforcement reads individual atomic words, like Linux task_rlimit.
+/// Syscalls requiring a coherent soft/hard pair use the process transaction.
+#[inline]
 fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
     if resource >= RLIMIT_COUNT {
         return None;
     }
-    // Rows are sparse: an absent process has exactly `default_rlimits()`.
-    // Most tasks never call setrlimit, so avoid task→pid→leader translation
-    // and the global table lock while no custom row exists anywhere.
-    if RLIMIT_CUSTOM_ROWS.load(core::sync::atomic::Ordering::Acquire) == 0 {
-        return Some(default_rlimits()[resource]);
+    if let Some(limit) = crate::task::with_task_local(task, |owner| {
+        owner.read_rlimit_once(resource)
+    }) {
+        return limit;
     }
-    let generation = RLIMIT_GENERATION.load(core::sync::atomic::Ordering::Acquire);
-    let cached = crate::task::with_task_local(task, |owner| {
-        let cached = owner.rlimit_read_cache.lock();
-        cached
-            .as_ref()
-            .filter(|snapshot| snapshot.generation == generation)
-            .map(|snapshot| snapshot.limits[resource])
-    })
-    .flatten();
-    if let Some(limit) = cached {
-        return Some(limit);
-    }
+    // Early boot and synthetic tests can name a task without an Arc<Task>.
+    // Keep that cold compatibility path separate from registered hot reads.
     let key = process_state_key(task);
-    let (row, snapshot_generation) = {
-        let g = RLIMIT_TABLE.lock();
-        let state = g.as_ref()?;
-        (
-            state.rows.get(&key).copied().unwrap_or_else(default_rlimits),
-            RLIMIT_GENERATION.load(core::sync::atomic::Ordering::Relaxed),
-        )
-    };
-    // Identity updates need not take RLIMIT_TABLE. If the epoch changed after
-    // resolving the key, return the ordinary locked read without caching it.
-    // A concurrent newer fill may otherwise be overwritten by an older one;
-    // its stale generation forces another miss rather than a stale cache hit.
-    if generation == snapshot_generation {
-        crate::task::with_task_local(task, |owner| {
-            *owner.rlimit_read_cache.lock() = Some(RlimitReadCache {
-                generation,
-                limits: row,
-            });
-        });
-    }
-    Some(row[resource])
+    let limits = RLIMIT_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|state| state.rows.get(&key).cloned());
+    limits.map_or(Some(default_rlimits()[resource]), |limits| limits.read_once(resource))
 }
 
 const RLIMIT_NICE: usize = 13;
@@ -18027,9 +18068,8 @@ const SIGXCPU: u32 = 24;
 /// Sampled from the timer tick's return-to-user hook, which is where Linux
 /// samples process CPU timers too.
 fn rlimit_cpu_tick(task: u64) {
-    // Fast path first: `read_rlimit` answers from one atomic load while no
-    // process has set any custom limit, so a kernel where nobody uses
-    // RLIMIT_CPU pays almost nothing per tick.
+    // Fast path first: registered tasks read their own process's atomic words
+    // without the global index or process transaction lock.
     let Some(limits) = read_rlimit(task, RLIMIT_CPU) else {
         return;
     };
@@ -18274,7 +18314,7 @@ fn can_do_mlock(authority: MlockAuthority) -> bool {
 }
 
 /// Atomically snapshot and optionally replace one process-shared rlimit.
-/// Validation against the previous hard limit occurs under the same table
+/// Validation against the previous hard limit occurs under the same process
 /// lock as publication, matching Linux's group-leader task lock and preventing
 /// two CLONE_THREAD callers from raising a hard limit through stale snapshots.
 fn update_rlimit_atomic(
@@ -18287,57 +18327,47 @@ fn update_rlimit_atomic(
     if resource >= RLIMIT_COUNT {
         return Err(EINVAL);
     }
-    let key = process_state_key(task);
-    let mut g = RLIMIT_TABLE.lock();
-    let state = g.as_mut().ok_or(EINVAL)?;
-    if let Some(owner) = owner {
-        // Revalidate while holding RLIMIT_TABLE. Reap takes this lock before
-        // removing the task-registry entry, so it cannot slip between this
-        // check and the row transaction. This replaces the old unbounded set
-        // of every TaskId ever reaped without allowing a retained Arc<Task>
-        // from a raced prlimit64 to recreate the dead process's row.
-        let registered = crate::task::task_get(task).ok_or(ESRCH)?;
-        if !alloc::sync::Arc::ptr_eq(owner, &registered) {
-            return Err(ESRCH);
+    let task_owner = owner.cloned().or_else(|| crate::task::task_get_local(task));
+    let transact = |locked: &crate::rlimit::LockedLimits<'_>| {
+        if let Some(owner) = task_owner.as_ref() {
+            // The task binding and process are locked in that order. Reap
+            // takes both before unregistration, so this identity stays stable.
+            let Some(registered) = crate::task::task_get(task) else {
+                return Err(ESRCH);
+            };
+            if !alloc::sync::Arc::ptr_eq(owner, &registered) {
+                return Err(ESRCH);
+            }
         }
+        let prior = locked.read(resource).expect("validated resource");
+        if let Some(value) = new_value {
+            if value.cur > value.max {
+                return Err(EINVAL);
+            }
+            // Linux's fs.nr_open ceiling has no CAP_SYS_RESOURCE bypass.
+            if resource == RLIMIT_NOFILE_RESOURCE
+                && value.max > narf_filesystem::procfs::sys_fs::nr_open()
+            {
+                return Err(EPERM);
+            }
+            // Authority is resolved before taking the process lock, so
+            // credentials and namespaces never nest inside its transaction.
+            if value.max > prior.max && !may_raise_hard {
+                return Err(EPERM);
+            }
+            locked.write(resource, value);
+        }
+        Ok(prior)
+    };
+    if let Some(owner) = task_owner.as_ref() {
+        // Borrowing under the task's binding gate avoids refcount/destructor
+        // work for RLIMIT_CPU updates from the timer-return IRQ path.
+        owner.rlimit_transaction(transact)
+    } else {
+        // Cold synthetic/early-boot callers have no Task owner. Real retained
+        // targets always take the branch above, including after reap.
+        rlimit_registry_owner(process_state_key(task), None).transaction(transact)
     }
-    let prior = state
-        .rows
-        .get(&key)
-        .copied()
-        .unwrap_or_else(default_rlimits)[resource];
-    if let Some(value) = new_value {
-        if value.cur > value.max {
-            return Err(EINVAL);
-        }
-        // `fs.nr_open` is the ceiling on RLIMIT_NOFILE's hard limit, and
-        // `do_prlimit` refuses above it with EPERM for everyone — there is no
-        // CAP_SYS_RESOURCE bypass on this one, so the check sits ahead of the
-        // hard-raise authority test. The knob had a public accessor in
-        // `narf-filesystem` and no caller, so it bounded nothing.
-        if resource == RLIMIT_NOFILE_RESOURCE
-            && value.max > narf_filesystem::procfs::sys_fs::nr_open()
-        {
-            return Err(EPERM);
-        }
-        if value.max > prior.max && !may_raise_hard {
-            // `do_prlimit`: raising the hard ceiling requires CAP_SYS_RESOURCE
-            // in the target task's user namespace. The caller's authority is
-            // resolved before taking RLIMIT_TABLE and passed into this
-            // transaction, keeping the table independent of the credential and
-            // namespace lock order. pam_limits (and any Limit* that raises a
-            // hard limit) relies on root holding this.
-            return Err(EPERM);
-        }
-        let new_row = !state.rows.contains_key(&key);
-        let row = state.rows.entry(key).or_insert_with(default_rlimits);
-        row[resource] = value;
-        if new_row {
-            RLIMIT_CUSTOM_ROWS.fetch_add(1, core::sync::atomic::Ordering::Release);
-        }
-        publish_rlimit_change();
-    }
-    Ok(prior)
 }
 
 fn prlimit_target_task(caller: u64, pid: u64) -> Option<PrlimitTarget> {
@@ -18359,8 +18389,8 @@ fn prlimit_target_task(caller: u64, pid: u64) -> Option<PrlimitTarget> {
 
 /// Whether `caller` holds CAP_SYS_RESOURCE over `target`'s user namespace.
 /// This is the authority Linux uses both for cross-task `prlimit64` and for
-/// raising a hard limit. Resolve it outside [`RLIMIT_TABLE`] transactions so
-/// the rlimit lock never nests credential or namespace locks.
+/// raising a hard limit. Resolve it before the per-process transaction so
+/// that lock never nests credential or namespace locks.
 fn prlimit_resource_capable(caller: u64, target: u64) -> bool {
     #[cfg(feature = "container")]
     {
@@ -18394,28 +18424,15 @@ fn prlimit_permission(caller: u64, target: u64) -> bool {
 }
 
 fn rlimit_fork(parent: u64, child: u64) {
-    let parent_key = process_state_key(parent);
-    let child_key = process_state_key(child);
-    // Absence means the complete default table.  The exact row count lets
-    // the overwhelmingly common default-only fork avoid contending on the
-    // global IRQ-safe table lock.  Writers publish the count before they
-    // return; a fork overlapping the first writer may linearize before that
-    // update, while a completed update is observed by this acquire load.
-    if parent_key == child_key
-        || RLIMIT_CUSTOM_ROWS.load(core::sync::atomic::Ordering::Acquire) == 0
-    {
+    let parent = rlimit_owner(parent);
+    let child = rlimit_owner(child);
+    if alloc::sync::Arc::ptr_eq(&parent, &child) {
         return;
     }
-    let mut g = RLIMIT_TABLE.lock();
-    let state = g.get_or_insert_with(RlimitState::new);
-    // Absence means the complete default table, so default-only parents need
-    // no child row. Preserve only an actually materialised custom snapshot.
-    if let Some(inherited) = state.rows.get(&parent_key).copied() {
-        if state.rows.insert(child_key, inherited).is_none() {
-            RLIMIT_CUSTOM_ROWS.fetch_add(1, core::sync::atomic::Ordering::Release);
-        }
-        publish_rlimit_change();
-    }
+    // The child has not been published by PID yet. Snapshot the complete
+    // parent under its lock, then initialize the independent child object.
+    let inherited = parent.snapshot();
+    child.transaction(|locked| locked.replace(inherited));
 }
 
 // ── prctl — per-task settings switchboard ──────────────────────────

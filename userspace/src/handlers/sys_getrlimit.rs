@@ -6,10 +6,10 @@ pub(crate) fn sys_getrlimit(ctx: &mut dyn TrapContext) {
     let resource = args.arg0 as usize;
     let out_ptr = args.arg1;
     let task = current_task_id();
-    let pair = match read_rlimit(task, resource) {
-        Some(p) => p,
-        None => {
-            ctx.set_return(errno_ret(EINVAL));
+    let pair = match update_rlimit_atomic(task, None, resource, None, false) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };

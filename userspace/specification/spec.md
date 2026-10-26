@@ -399,14 +399,27 @@ returns the unchanged break. Rlimits are shared by CLONE_THREAD tasks, copied
 by process fork/clone, and retired only when the process is reaped. Device/PFN
 mappings, vDSO/vvar, kernel control rings, guards, and hardware huge mappings
 are lock-exempt; inaccessible PROT_NONE reservations are not populated.
-`setrlimit` validation and replacement are one process-table transaction.
-Repeated rlimit reads may use a task-owned immutable snapshot after an acquire
-check of the store generation. Limits updates, inheritance, reap, and process
-identity mutations advance that generation. Cache fills pair the complete
-locked row with a stable generation across key resolution; a racing identity
-change leaves the ordinary read uncached. TaskId reuse cannot revive a cached
-row, and no cache lock is held while resolving identity or taking the store
-lock. Thread sharing, fork copying, and authority checks remain store-owned.
+Each process owns a refcounted limits object shared by its threads. Internal
+enforcement checks use individual `AtomicU64` relaxed loads, the Rust analogue
+of Linux `READ_ONCE`; they do not promise a coherent soft/hard pair. Ordinary
+current-task reads follow the task's immutable initial owner with no global
+lookup, lock, refcount change, or generation retry. Rare identity rebinding
+publishes a replacement under a per-task IRQ-safe binding gate before setting
+a monotone release flag. Acquire readers of that replacement borrow it under
+the gate, including in timer IRQ context, without RCU or an Arc drop. The
+original owner remains pinned by the task's lifetime.
+`getrlimit`, `setrlimit`, `prlimit64`, and `/proc` snapshots use the process's
+own transaction lock for coherent values and hard-limit validation. The global
+index serves only construction, identity rebinding, and retirement. Fork copies
+under the parent's lock before publishing the child PID; CLONE_THREAD shares
+the existing object. Rebind and every task-unregistration path take the same
+binding gate as retained-target revalidation, so reap or cancellation cannot
+revive a retired row. Unregistration needs no shared process lock: siblings
+retain their own owners. TaskId keys remain non-reusable and permission checks
+retain their existing credential and namespace rules.
+Updates borrow the owner while holding the binding gate and then the process
+lock. Rebinding and task unregistration also take the identity-mutation lock
+first, serializing them with a writer that has already resolved its task.
 `prlimit64` copies a proposed limit before PID/permission validation, returns
 `ESRCH` for a nonexistent target, and requires the caller's real uid+gid to
 match all representable target real/effective/saved IDs unless the target is

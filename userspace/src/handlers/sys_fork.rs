@@ -320,12 +320,14 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
         None => crate::user_task::prepare_user_process_initial(proc, child_spec),
     };
     let child_tid = pending_child.task_id();
+    // Initialize inherited limits before any PID lookup can expose the child
+    // to a remote prlimit update. The child is not runnable yet.
+    rlimit_fork(parent_pid, child_tid.raw());
     #[cfg(feature = "container")]
     pid_plan.install(child_tid.raw());
     // Record the explicit ProcessId ↔ TaskId binding.  Must happen
     // before any code that crosses the ID-space boundary.
     register_pid_task_mapping(child_pid.raw(), child_tid.raw());
-    rlimit_fork(parent_pid, child_tid.raw());
     cap_fork(parent_pid, child_tid.raw());
     // comm, exe, image mappings, argv, environ and auxv: the same identity
     // the clone path inherits. A fork(2) child (musl issues SYS_fork) used to
