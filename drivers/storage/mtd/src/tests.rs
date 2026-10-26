@@ -200,3 +200,286 @@ fn smoke_mtd_registry_dedupes_by_name() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("storage-mtd", smoke_mtd_registry_dedupes_by_name);
+
+// ── CFI model + binding smokes (step 6b) ────────────────────────
+//
+// A modelled CFI chip behind the driver's CfiIo seam: a query
+// table (1 MiB device, one erase region of 64 KiB blocks), the
+// Intel and AMD command state machines, and honest busy polling
+// (status bit 7 / DQ7) — the production command sequences in
+// cfi.rs execute against it unchanged.
+
+use crate::cfi::{CfiFlash, CfiIo};
+
+const MODEL_WORDS: usize = 0x8_0000; // 1 MiB as x16 words
+const MODEL_BLOCK_WORDS: u64 = 0x8000; // 64 KiB
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CfiMode {
+    Read,
+    Query,
+    IntelProg(u64),
+    IntelEraseArm(u64),
+    IntelBusy {
+        cd: u32,
+        erase: Option<(u64, u64)>,
+    },
+    AmdU1,
+    AmdCmd {
+        erase_setup: bool,
+    },
+    AmdEraseU1,
+    AmdEraseU2,
+    AmdProg,
+    AmdBusy {
+        addr: u64,
+        data: u16,
+        cd: u32,
+        erase: Option<(u64, u64)>,
+    },
+}
+
+#[derive(Debug)]
+struct ModelState {
+    cells: alloc::vec::Vec<u16>,
+    cmdset: u16,
+    mode: CfiMode,
+}
+
+#[derive(Debug)]
+struct ModelCfi {
+    state: IrqSafeSpinLock<ModelState>,
+}
+
+impl ModelCfi {
+    fn new(cmdset: u16) -> Self {
+        Self {
+            state: IrqSafeSpinLock::new(ModelState {
+                cells: alloc::vec![0xFFFF; MODEL_WORDS],
+                cmdset,
+                mode: CfiMode::Read,
+            }),
+        }
+    }
+
+    fn query_word(st: &ModelState, word: u64) -> u16 {
+        match word {
+            0x10 => 0x51, // 'Q'
+            0x11 => 0x52, // 'R'
+            0x12 => 0x59, // 'Y'
+            0x13 => st.cmdset,
+            0x27 => 20, // 2^20 = 1 MiB
+            0x2C => 0,  // one erase region (count - 1)
+            0x2D => 15, // 16 blocks - 1
+            0x2E => 0,
+            0x2F => 0x00, // block size units LE16 = 256 -> 64 KiB
+            0x30 => 0x01,
+            _ => 0,
+        }
+    }
+
+    fn block_range(word: u64) -> (u64, u64) {
+        let start = word - word % MODEL_BLOCK_WORDS;
+        (start, start + MODEL_BLOCK_WORDS)
+    }
+}
+
+impl CfiIo for ModelCfi {
+    fn read16(&self, off: u64) -> u16 {
+        let mut st = self.state.lock();
+        let word = off / 2;
+        match st.mode {
+            CfiMode::Query => Self::query_word(&st, word),
+            CfiMode::IntelBusy { cd, erase } => {
+                if cd > 0 {
+                    st.mode = CfiMode::IntelBusy { cd: cd - 1, erase };
+                    0x0000 // status: not ready
+                } else {
+                    if let Some((lo, hi)) = erase {
+                        for w in lo..hi {
+                            st.cells[w as usize] = 0xFFFF;
+                        }
+                        st.mode = CfiMode::IntelBusy { cd: 0, erase: None };
+                    }
+                    0x0080 // status: ready
+                }
+            }
+            CfiMode::AmdBusy {
+                addr,
+                data,
+                cd,
+                erase,
+            } => {
+                if word == addr {
+                    if cd > 0 {
+                        st.mode = CfiMode::AmdBusy {
+                            addr,
+                            data,
+                            cd: cd - 1,
+                            erase,
+                        };
+                        data ^ 0x0080 // DQ7 inverted while busy
+                    } else {
+                        if let Some((lo, hi)) = erase {
+                            for w in lo..hi {
+                                st.cells[w as usize] = 0xFFFF;
+                            }
+                        }
+                        st.cells[addr as usize]
+                    }
+                } else {
+                    st.cells[word as usize]
+                }
+            }
+            _ => st.cells[word as usize],
+        }
+    }
+
+    fn write16(&self, off: u64, val: u16) {
+        let mut st = self.state.lock();
+        let word = off / 2;
+        match st.mode {
+            CfiMode::Query => {
+                st.mode = CfiMode::Read; // any write exits query
+            }
+            CfiMode::IntelProg(addr) => {
+                if word == addr {
+                    st.cells[addr as usize] &= val;
+                    st.mode = CfiMode::IntelBusy { cd: 2, erase: None };
+                }
+            }
+            CfiMode::IntelEraseArm(addr) => {
+                if word == addr && val == 0x00D0 {
+                    st.mode = CfiMode::IntelBusy {
+                        cd: 3,
+                        erase: Some(Self::block_range(addr)),
+                    };
+                }
+            }
+            CfiMode::IntelBusy { .. } => {
+                if val == 0x00FF || val == 0x00F0 {
+                    st.mode = CfiMode::Read;
+                }
+                // 0x70 (read status) / 0x50 (clear) keep the mode.
+            }
+            CfiMode::AmdU1 => {
+                if word == 0x2AA && val == 0x0055 {
+                    st.mode = CfiMode::AmdCmd { erase_setup: false };
+                } else {
+                    st.mode = CfiMode::Read;
+                }
+            }
+            CfiMode::AmdCmd { erase_setup } => {
+                if !erase_setup && word == 0x555 && val == 0x00A0 {
+                    st.mode = CfiMode::AmdProg;
+                } else if !erase_setup && word == 0x555 && val == 0x0080 {
+                    st.mode = CfiMode::AmdEraseU1;
+                } else if erase_setup && val == 0x0030 {
+                    st.mode = CfiMode::AmdBusy {
+                        addr: word,
+                        data: 0xFFFF,
+                        cd: 2,
+                        erase: Some(Self::block_range(word)),
+                    };
+                } else {
+                    st.mode = CfiMode::Read;
+                }
+            }
+            CfiMode::AmdEraseU1 => {
+                if word == 0x555 && val == 0x00AA {
+                    st.mode = CfiMode::AmdEraseU2;
+                } else {
+                    st.mode = CfiMode::Read;
+                }
+            }
+            CfiMode::AmdEraseU2 => {
+                if word == 0x2AA && val == 0x0055 {
+                    st.mode = CfiMode::AmdCmd { erase_setup: true };
+                } else {
+                    st.mode = CfiMode::Read;
+                }
+            }
+            CfiMode::AmdProg => {
+                // The write after the A0 command is the data word
+                // at its own address.
+                st.cells[word as usize] &= val;
+                st.mode = CfiMode::AmdBusy {
+                    addr: word,
+                    data: val,
+                    cd: 2,
+                    erase: None,
+                };
+            }
+            CfiMode::AmdBusy { .. } => {
+                if val == 0x00FF || val == 0x00F0 {
+                    st.mode = CfiMode::Read;
+                }
+            }
+            CfiMode::Read => match (st.cmdset, val) {
+                (_, 0x0098) if word == 0x55 => st.mode = CfiMode::Query,
+                (1, 0x0040) => st.mode = CfiMode::IntelProg(word),
+                (1, 0x0020) => st.mode = CfiMode::IntelEraseArm(word),
+                (1, 0x0070) | (1, 0x0050) | (1, 0x00FF) => {}
+                (2, 0x00AA) if word == 0x555 => st.mode = CfiMode::AmdU1,
+                _ => {}
+            },
+        }
+    }
+}
+
+fn cfi_round_trip(cmdset: u16) -> TestResult {
+    let model = ModelCfi::new(cmdset);
+    let flash = match CfiFlash::identify("model".into(), model, 0x10_0000) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("CFI identify failed against the modelled chip"),
+    };
+    if flash.size() != 0x10_0000 || flash.erase_size() != 0x1_0000 || flash.cmdset() != cmdset {
+        return TestResult::Fail("CFI geometry decode mismatch (size/erase/cmdset)");
+    }
+    // Program + read back, including an unaligned tail byte.
+    if flash.write(0, &[0xDE, 0xAD, 0xBE, 0xEF]).is_err() {
+        return TestResult::Fail("CFI program failed");
+    }
+    if flash.write(5, &[0x42]).is_err() {
+        return TestResult::Fail("CFI unaligned program failed");
+    }
+    let mut buf = [0u8; 6];
+    if flash.read(0, &mut buf).is_err() || buf != [0xDE, 0xAD, 0xBE, 0xEF, 0xFF, 0x42] {
+        return TestResult::Fail("CFI read-back mismatch (incl. neighbour preservation)");
+    }
+    // Program-only-clears: writing all-ones changes nothing.
+    if flash.write(0, &[0xFF, 0xFF]).is_err() {
+        return TestResult::Fail("CFI no-op program failed");
+    }
+    if flash.read(0, &mut buf[..2]).is_err() || buf[..2] != [0xDE, 0xAD] {
+        return TestResult::Fail("CFI program set a bit without erase");
+    }
+    // Erase restores all-ones in the block; block 1 untouched.
+    if flash.write(0x1_0000, &[0x11]).is_err() {
+        return TestResult::Fail("CFI block-1 program failed");
+    }
+    if flash.erase(0, 0x1_0000).is_err() {
+        return TestResult::Fail("CFI erase failed");
+    }
+    if flash.read(0, &mut buf[..2]).is_err() || buf[..2] != [0xFF, 0xFF] {
+        return TestResult::Fail("CFI erase did not restore the block");
+    }
+    if flash.read(0x1_0000, &mut buf[..1]).is_err() || buf[0] != 0x11 {
+        return TestResult::Fail("CFI erase clobbered the neighbouring block");
+    }
+    // Unaligned erase is BadGeometry.
+    if flash.erase(0x100, 0x1_0000) != Err(MtdError::BadGeometry) {
+        return TestResult::Fail("CFI unaligned erase not refused");
+    }
+    TestResult::Pass
+}
+
+fn smoke_cfi_intel_round_trip() -> TestResult {
+    cfi_round_trip(1)
+}
+kernel_test_in!("storage-mtd", smoke_cfi_intel_round_trip);
+
+fn smoke_cfi_amd_round_trip() -> TestResult {
+    cfi_round_trip(2)
+}
+kernel_test_in!("storage-mtd", smoke_cfi_amd_round_trip);

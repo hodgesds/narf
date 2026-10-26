@@ -22,6 +22,10 @@
 
 extern crate alloc;
 
+pub mod cfi;
+
+pub use cfi::register_dt_drivers;
+
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -257,3 +261,7 @@ pub fn attach_partitions(
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+
+/// aarch64-only smokes (the live CFI binding smoke).
+#[cfg(all(target_arch = "aarch64", any(test, feature = "kernel-test")))]
+mod tests_aarch64;

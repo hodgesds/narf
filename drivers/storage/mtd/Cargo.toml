@@ -19,6 +19,8 @@ path = "src/lib.rs"
 [dependencies]
 narf-lib         = { path = "../../../lib" }
 narf-bus         = { path = "../../../bus" }
+narf-memory      = { path = "../../../memory" }
+narf-capabilities = { path = "../../../capabilities" }
 narf-kernel-test = { path = "../../../verification/kernel-test" }
 
 [features]
