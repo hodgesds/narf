@@ -18,7 +18,8 @@
 extern crate alloc;
 
 use super::{
-    TPM_ALG_ECC, TPM_ALG_NULL, TPM_ALG_RSA, TPM_ALG_SHA256, TPM_ECC_NIST_P256, TPM_ECC_NIST_P384,
+    TPM_ALG_ECC, TPM_ALG_ECDSA, TPM_ALG_NULL, TPM_ALG_RSA, TPM_ALG_SHA256, TPM_ECC_NIST_P256,
+    TPM_ECC_NIST_P384,
 };
 use alloc::vec::Vec;
 
@@ -56,6 +57,22 @@ pub const OBJ_ATTR_SEAL: u32 = OBJ_FIXED_TPM
     | OBJ_FIXED_PARENT
     | OBJ_SENSITIVE_DATA_ORIGIN
     | OBJ_USER_WITH_AUTH;
+
+/// Attribute set for an attestation key (AK) per the TCG EK
+/// Credential Profile's AK template: a restricted signing primary
+/// (fixedTPM | stClear | fixedParent | sensitiveDataOrigin |
+/// userWithAuth | restricted | sign). The profile's Policy A form
+/// uses adminWithPolicy with a PolicySecret(Endorsement)
+/// authPolicy instead of userWithAuth; the tree's session story is
+/// password-first (TPM_RS_PW), so the provisioning composition
+/// uses this form, and the profile form is the fleet variant.
+pub const OBJ_ATTR_AK: u32 = OBJ_FIXED_TPM
+    | OBJ_ST_CLEAR
+    | OBJ_FIXED_PARENT
+    | OBJ_SENSITIVE_DATA_ORIGIN
+    | OBJ_USER_WITH_AUTH
+    | OBJ_RESTRICTED
+    | OBJ_SIGN;
 
 // ── Key type selector ─────────────────────────────────────────────────
 
@@ -206,6 +223,21 @@ pub fn rsa2048_template(attributes: u32) -> Vec<u8> {
 /// given curve. `curve` should be `TPM_ECC_NIST_P256` or
 /// `TPM_ECC_NIST_P384`.
 pub fn ecc_template(curve: u16, attributes: u32) -> Vec<u8> {
+    ecc_template_with_scheme(curve, attributes, TPM_ALG_NULL, TPM_ALG_NULL)
+}
+
+/// Encode a `TPMT_PUBLIC` template for an ECC key with an explicit
+/// signing scheme (`TPMT_ECC_SCHEME`): a signing scheme encodes as
+/// algorithm + hash (4 bytes), unlike `TPM_ALG_NULL`'s lone word.
+/// A key whose template names a scheme may sign only with it —
+/// restricted signing keys (the AK) must name one, since Quote's
+/// `inScheme` has to agree with the key's scheme or be NULL.
+pub fn ecc_template_with_scheme(
+    curve: u16,
+    attributes: u32,
+    scheme_alg: u16,
+    scheme_hash: u16,
+) -> Vec<u8> {
     let mut v = Vec::with_capacity(32);
     v.extend_from_slice(&TPM_ALG_ECC.to_be_bytes()); // type
     v.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes()); // nameAlg
@@ -213,11 +245,29 @@ pub fn ecc_template(curve: u16, attributes: u32) -> Vec<u8> {
     v.extend_from_slice(&0u16.to_be_bytes()); // authPolicy size = 0
                                               // TPMS_ECC_PARMS: symmetric + scheme + curveID + kdf
     v.extend_from_slice(&TPM_ALG_NULL.to_be_bytes()); // symmetric = NULL
-    v.extend_from_slice(&TPM_ALG_NULL.to_be_bytes()); // scheme = NULL
+    v.extend_from_slice(&scheme_alg.to_be_bytes()); // scheme
+    if scheme_alg != TPM_ALG_NULL {
+        v.extend_from_slice(&scheme_hash.to_be_bytes()); // scheme hash
+    }
     v.extend_from_slice(&curve.to_be_bytes()); // curveID
     v.extend_from_slice(&TPM_ALG_NULL.to_be_bytes()); // kdf = NULL
                                                       // unique (TPMS_ECC_POINT): x(TPM2B) + y(TPM2B), both size=0
     v.extend_from_slice(&0u16.to_be_bytes()); // x size = 0
     v.extend_from_slice(&0u16.to_be_bytes()); // y size = 0
     v
+}
+
+/// The attestation-key template (#945): ECC P-256, SHA-256
+/// nameAlg, [`OBJ_ATTR_AK`], ECDSA/SHA-256 scheme — the TCG EK
+/// Credential Profile AK template in its userWithAuth form (see
+/// [`OBJ_ATTR_AK`]). Provisioning submits it to
+/// `TPM2_CreatePrimary` in the endorsement hierarchy; the TPM
+/// fills `unique` with the derived primary's point.
+pub fn ecc_ak_template() -> Vec<u8> {
+    ecc_template_with_scheme(
+        TPM_ECC_NIST_P256,
+        OBJ_ATTR_AK,
+        TPM_ALG_ECDSA,
+        TPM_ALG_SHA256,
+    )
 }

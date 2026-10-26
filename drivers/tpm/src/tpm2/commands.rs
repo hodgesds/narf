@@ -31,6 +31,7 @@
 //! | `flush_context`       | 0x165       | §11.4         |
 //! | `start_auth_session`  | 0x176       | §11.1         |
 //! | `policy_pcr`          | 0x19F       | §19.7         |
+//! | `read_public`         | 0x169       | §23           |
 //!
 //! Structured response parsers (the pre-#941 layer had only
 //! GetRandom's): `parse_create_response`,
@@ -39,7 +40,19 @@
 //! `parse_get_capability_response` (+ `parse_tagged_properties` /
 //! `parse_pcr_selections` over its data),
 //! `parse_get_test_result_response`,
-//! `parse_start_auth_session_response`.
+//! `parse_start_auth_session_response`,
+//! `parse_read_public_response`.
+//!
+//! Correction (#945): `parse_create_primary_response` previously
+//! shared `parse_create_response`'s parameter walk, but the two
+//! commands' response layouts differ (Part 3 §12.1 vs §12.2):
+//! Create carries `outPrivate` and no name; CreatePrimary carries
+//! no `outPrivate` and ends with the object's `name`. The shared
+//! walk round-tripped only because this crate's e2e fake emitted
+//! the same wrong shape; both now follow §12.2, and the
+//! attestation composition (which consumes the AK's name +
+//! outPublic) is the first caller that would have met the
+//! discrepancy on silicon.
 //!
 //! The hierarchy/session/object commands and the parsers are the
 //! #941 command-set completion: the audit found Clear without even
@@ -64,9 +77,9 @@ use super::{
     TPM_CC_CREATE, TPM_CC_CREATE_PRIMARY, TPM_CC_EVICT_CONTROL, TPM_CC_FLUSH_CONTEXT,
     TPM_CC_GET_CAPABILITY, TPM_CC_GET_RANDOM, TPM_CC_GET_TEST_RESULT, TPM_CC_LOAD,
     TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_READ, TPM_CC_NV_UNDEFINE_SPACE, TPM_CC_NV_WRITE,
-    TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_PCR, TPM_CC_SELF_TEST, TPM_CC_SHUTDOWN,
-    TPM_CC_STARTUP, TPM_CC_START_AUTH_SESSION, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL, TPM_RH_OWNER,
-    TPM_RH_PLATFORM, TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
+    TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_PCR, TPM_CC_READ_PUBLIC, TPM_CC_SELF_TEST,
+    TPM_CC_SHUTDOWN, TPM_CC_STARTUP, TPM_CC_START_AUTH_SESSION, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL,
+    TPM_RH_OWNER, TPM_RH_PLATFORM, TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
 };
 use alloc::vec::Vec;
 
@@ -509,6 +522,21 @@ pub fn evict_control(auth_handle: u32, object_handle: u32, persistent_handle: u3
     buf
 }
 
+/// Build `TPM2_ReadPublic(objectHandle)` — Part 3 §23.
+///
+/// No sessions, no authorization: reading an object's public
+/// area, name, and qualified name is unauthenticated (the values
+/// are public by construction). This is the AK existence probe
+/// and public-area source for the attestation composition (#945):
+/// a persistent AK answers here; an absent handle answers
+/// `TPM_RC_HANDLE`.
+pub fn read_public(object_handle: u32) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_NO_SESSIONS, TPM_CC_READ_PUBLIC);
+    buf.extend_from_slice(&object_handle.to_be_bytes());
+    finalise(&mut buf);
+    buf
+}
+
 /// Build `TPM2_FlushContext(flushHandle)` — Part 3 §11.4.
 ///
 /// The command-layer builder: the resource-manager bridge
@@ -723,12 +751,87 @@ pub fn parse_create_response(raw: &[u8]) -> Result<CreateOutputs, &'static str> 
     parse_create_params(params)
 }
 
+/// The outputs of `TPM2_CreatePrimary` (Part 3 §12.2). Unlike
+/// Create (§12.1) there is no `outPrivate` — a primary's sensitive
+/// area is re-derived from the hierarchy seed on every load, never
+/// exported — and the parameter list ends with the object's
+/// `name`, which the attestation composition needs to check the
+/// provisioned AK is the key it derived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatePrimaryOutputs {
+    /// TPM2B_PUBLIC inner bytes (TPMT_PUBLIC).
+    pub out_public: Vec<u8>,
+    /// TPM2B_CREATION_DATA inner bytes.
+    pub creation_data: Vec<u8>,
+    /// TPM2B_DIGEST — the creation hash.
+    pub creation_hash: Vec<u8>,
+    /// TPMT_TK_CREATION tag (TPM_ST_CREATION = 0x8021 on silicon).
+    pub ticket_tag: u16,
+    /// TPMT_TK_CREATION hierarchy.
+    pub ticket_hierarchy: u32,
+    /// TPMT_TK_CREATION digest (TPM2B inner bytes).
+    pub ticket_digest: Vec<u8>,
+    /// TPM2B_NAME — the created primary's name.
+    pub name: Vec<u8>,
+}
+
 /// Parse a `TPM2_CreatePrimary` response: the created object's
-/// handle plus the shared creation outputs.
-pub fn parse_create_primary_response(raw: &[u8]) -> Result<(u32, CreateOutputs), &'static str> {
+/// handle plus its outputs (Part 3 §12.2 parameter layout — see
+/// the module doc's #945 correction note).
+pub fn parse_create_primary_response(
+    raw: &[u8],
+) -> Result<(u32, CreatePrimaryOutputs), &'static str> {
     let (handle, params) = response_params(raw, true)?;
     let handle = handle.ok_or("create_primary response missing its handle")?;
-    Ok((handle, parse_create_params(params)?))
+    let mut r = Reader::new(params);
+    let out_public = r.tpm2b()?.to_vec();
+    let creation_data = r.tpm2b()?.to_vec();
+    let creation_hash = r.tpm2b()?.to_vec();
+    let ticket_tag = r.u16()?;
+    let ticket_hierarchy = r.u32()?;
+    let ticket_digest = r.tpm2b()?.to_vec();
+    let name = r.tpm2b()?.to_vec();
+    Ok((
+        handle,
+        CreatePrimaryOutputs {
+            out_public,
+            creation_data,
+            creation_hash,
+            ticket_tag,
+            ticket_hierarchy,
+            ticket_digest,
+            name,
+        },
+    ))
+}
+
+/// The outputs of `TPM2_ReadPublic` (Part 3 §23): the object's
+/// public area and both name forms. The qualified name is what a
+/// quote's `qualifiedSigner` carries and what a verifier pins at
+/// enrollment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadPublicOutputs {
+    /// TPM2B_PUBLIC inner bytes (TPMT_PUBLIC).
+    pub out_public: Vec<u8>,
+    /// TPM2B_NAME — the object's name.
+    pub name: Vec<u8>,
+    /// TPM2B_NAME — the object's qualified name.
+    pub qualified_name: Vec<u8>,
+}
+
+/// Parse a `TPM2_ReadPublic` response (no sessions: the whole
+/// body is the parameter area).
+pub fn parse_read_public_response(raw: &[u8]) -> Result<ReadPublicOutputs, &'static str> {
+    let (_handle, params) = response_params(raw, false)?;
+    let mut r = Reader::new(params);
+    let out_public = r.tpm2b()?.to_vec();
+    let name = r.tpm2b()?.to_vec();
+    let qualified_name = r.tpm2b()?.to_vec();
+    Ok(ReadPublicOutputs {
+        out_public,
+        name,
+        qualified_name,
+    })
 }
 
 /// Parse a `TPM2_Load` response: `(objectHandle, name)`.

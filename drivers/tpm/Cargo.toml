@@ -16,6 +16,11 @@ narf-lib          = { path = "../../lib" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-filesystem   = { path = "../../filesystem" }
 narf-block        = { path = "../../block" }
+# The canonical protocol crate: the sysfs bridge serves the TCG
+# event log through narf-tpm's attestation hooks (#945). Depending
+# on the canonical crate is the composition direction (#934) — the
+# bridges remain consumers of it, never a second stack.
+narf-tpm          = { path = "../../tpm" }
 
 [features]
 kernel-test = []
