@@ -10,6 +10,7 @@ pub(super) struct Peer {
     ids: [u64; 32],
     exchange_stage: u8,
     pub(super) associated: Option<StationAssociated>,
+    pub(super) wmm: Option<narf_wireless::wmm::Parameters>,
 }
 impl Peer {
     pub(super) fn owns(&self, id: u16) -> bool {
@@ -56,6 +57,7 @@ impl Peer {
                     // A later MAP for this address cannot restore the prior
                     // AP negotiation after its last firmware owner vanished.
                     self.associated = None;
+                    self.wmm = None;
                 }
                 Ok(matched)
             }
@@ -68,6 +70,36 @@ impl Peer {
 mod disconnect;
 pub use disconnect::Disconnected;
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    async fn send_station_command(
+        &mut self,
+        command: &[u8],
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        checked_policy(
+            async {
+                self.htt
+                    .wmi
+                    .htc
+                    .send_wmi(command)
+                    .await
+                    .map_err(htt::Error::from)?;
+                Ok(())
+            },
+            validate,
+        )
+        .await
+    }
+    pub(in crate::ath10k) fn station_permission(
+        &self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        frequency: u16,
+    ) -> Result<Permission, Error> {
+        Permission::from_domain(
+            self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?,
+            domain,
+            frequency,
+        )
+    }
     pub fn associated_station(&self) -> Option<StationAssociated> {
         if self.failed {
             return None;
@@ -86,6 +118,18 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         security: narf_wireless::association::SecurityMode,
         sme_ies: &[u8],
     ) -> Result<StationAssociated, Error> {
+        self.associate_station_checked(domain, ssid, security, sme_ies, &|| Ok(()))
+            .await
+    }
+    pub(in crate::ath10k) async fn associate_station_checked(
+        &mut self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        ssid: &[u8],
+        security: narf_wireless::association::SecurityMode,
+        sme_ies: &[u8],
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<StationAssociated, Error> {
+        validate()?;
         use narf_wireless::association::{channel, Bss, JoinPlan};
         let peer = self.prepared_peer().ok_or(Error::Failed)?;
         if self.peer.as_ref().ok_or(Error::Failed)?.exchange_stage != 0 {
@@ -107,26 +151,42 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             information_elements: wire::owned(&cached.information_elements)?,
         };
         let own = self.ready.ok_or(Error::Failed)?.mac;
+        let offered_wmm = wmm::offer(&bss.information_elements, sme_ies)?;
         let mut plan = JoinPlan::prepare(&bss, own, ssid, security).map_err(plan_error)?;
         plan.append_sme_ies(sme_ies).map_err(plan_error)?;
         let auth = wire::owned(plan.start_authentication().map_err(plan_error)?)?;
-        let response = self.exchange_initial_management(domain, &auth).await?;
+        let response =
+            checked_policy(self.exchange_initial_management(domain, &auth), validate).await?;
         // A matching but semantically invalid response is terminal even if
         // the lower transport accepted its address/channel/status envelope.
         self.failed = true;
-        let assoc = wire::owned(
+        let mut assoc = wire::owned(
             plan.authentication_response(&response)
                 .map_err(plan_error)?
                 .ok_or(Error::Malformed)?,
         )?;
+        if offered_wmm.is_some() {
+            // The generic SME append deliberately forbids caller-supplied
+            // WMM. This Information IE belongs to this native queue owner.
+            let information = wmm::information();
+            if assoc.len().saturating_add(information.len()) > 4096 {
+                return Err(Error::Unsupported);
+            }
+            assoc
+                .try_reserve_exact(information.len())
+                .map_err(|_| Error::NoMemory)?;
+            assoc.extend_from_slice(information);
+        }
         self.failed = false;
-        let response = self.exchange_initial_management(domain, &assoc).await?;
+        let response =
+            checked_policy(self.exchange_initial_management(domain, &assoc), validate).await?;
         self.failed = true;
         let aid = plan
             .association_response(&response)
             .map_err(plan_error)?
             .ok_or(Error::Malformed)?;
         let capability = u16::from_le_bytes([response[24], response[25]]);
+        let wmm = wmm::response(offered_wmm, &response[30..])?;
         let associated = StationAssociated {
             bssid: peer.bssid,
             frequency: peer.frequency,
@@ -138,17 +198,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             associated,
             capability,
             plan.legacy_rates().0,
+            wmm.is_some(),
         )?;
         let up = mlme::up(self.wire.dialect, peer.bssid, aid)?;
+        let contention = wmm
+            .map(|p| wmm::command(self.wire.dialect, p))
+            .transpose()?;
         // Existing failed state precedes both publications and stays retained
         // if any command's waiter is dropped. CE receipt is no firmware ACK.
-        for command in [&command, &up] {
-            self.htt
-                .wmi
-                .htc
-                .send_wmi(command)
-                .await
-                .map_err(htt::Error::from)?;
+        for command in contention.iter().chain([&command, &up]) {
+            self.send_station_command(command, validate).await?;
         }
         // Consume maps/unmaps/completions already received with the command
         // receipts before reporting the configured peer; never revive a lost
@@ -159,13 +218,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            let event = self.station_progress().await?;
+            let event = checked_policy(self.station_progress(), validate).await?;
             if self.peer.as_ref().and_then(Peer::mapped).is_none() {
                 return Err(Error::Failed);
             }
             match event {
                 htt::Event::Idle => {
                     self.peer.as_mut().ok_or(Error::Failed)?.associated = Some(associated);
+                    self.peer.as_mut().ok_or(Error::Failed)?.wmm = wmm;
                     self.failed = false;
                     return Ok(associated);
                 }
@@ -196,6 +256,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         bssid: [u8; 6],
         frequency: u16,
     ) -> Result<PeerPrepared, Error> {
+        self.prepare_station_checked(domain, bssid, frequency, &|| Ok(()))
+            .await
+    }
+    pub(in crate::ath10k) async fn prepare_station_checked(
+        &mut self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        bssid: [u8; 6],
+        frequency: u16,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<PeerPrepared, Error> {
+        validate()?;
         if self.failed || self.ready.is_none() || self.peer.is_some() {
             return Err(Error::Failed);
         }
@@ -237,17 +308,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             ids: [0; 32],
             exchange_stage: 0,
             associated: None,
+            wmm: None,
         });
         // Even an unsent/ambiguous START cannot be retried under this owner.
         // The nested native mission transport retains all published DMA.
         self.failed = true;
         for command in [&rd, &power, &start] {
-            self.htt
-                .wmi
-                .htc
-                .send_wmi(command)
-                .await
-                .map_err(htt::Error::from)?;
+            self.send_station_command(command, validate).await?;
         }
         let deadline = narf_time::Deadline::after_ms(5_000);
         let mut started = false;
@@ -257,7 +324,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            let event = self.htt.poll().await?;
+            let event = checked_policy(async { Ok(self.htt.poll().await?) }, validate).await?;
             match event {
                 htt::Event::Wmi(bytes)
                     if wire::word(&bytes, 0)? & 0xffffff == self.wire.start_response_id() =>
@@ -275,12 +342,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if !started {
             return Err(Error::Timeout);
         }
-        self.htt
-            .wmi
-            .htc
-            .send_wmi(&create)
-            .await
-            .map_err(htt::Error::from)?;
+        self.send_station_command(&create, validate).await?;
         let deadline = narf_time::Deadline::after_ms(5_000);
         for _ in 0..65_536 {
             // Continuous ready events must not monopolize the retained owner.
@@ -288,7 +350,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            let event = self.station_progress().await?;
+            let event = checked_policy(self.station_progress(), validate).await?;
             match event {
                 htt::Event::Idle => {
                     if let Some(id) = self.peer.as_ref().and_then(Peer::mapped) {

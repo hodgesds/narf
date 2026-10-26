@@ -306,7 +306,7 @@ impl Hif for RadioModel {
                 self.station = Some(StationFixture::new());
             }
             if self.station.as_ref().is_some_and(|s| s.phase >= 4) {
-                return data_tests::control(self, bytes);
+                return data_tests::control(self, bytes).await;
             }
         }
         if self.mlme.is_some() {

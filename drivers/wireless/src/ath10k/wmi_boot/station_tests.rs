@@ -448,9 +448,21 @@ fn smoke_ath10k_station_policy_power_and_overlapping_restrictions() -> TestResul
     if !Permission::from_domain(caps, &domain, 2412).is_ok_and(|p| p.half_dbm == 18) {
         return TestResult::Fail("overlapping lower power was ignored");
     }
-    domain.rules[1].flags = narf_wireless::reg::RegFlags::DFS;
-    if Permission::from_domain(caps, &domain, 2412).is_ok() {
-        return TestResult::Fail("overlapping permissive rule erased DFS restriction");
+    use narf_wireless::reg::RegFlags;
+    for flags in [
+        RegFlags::DFS,
+        RegFlags::NO_IR,
+        RegFlags::INDOOR_ONLY,
+        RegFlags::from_bits_retain(1 << 31),
+    ] {
+        domain.rules[1].flags = flags;
+        if Permission::from_domain(caps, &domain, 2412).is_ok() {
+            return TestResult::Fail("overlapping permissive rule erased a TX restriction");
+        }
+    }
+    domain.rules[1].flags = RegFlags::NO_P2P;
+    if !Permission::from_domain(caps, &domain, 2412).is_ok_and(|p| p.half_dbm == 18) {
+        return TestResult::Fail("P2P-only restriction incorrectly denied bounded station TX");
     }
     domain = policy();
     domain.rules[0].max_power_dbm = -1;

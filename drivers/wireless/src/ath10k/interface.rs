@@ -588,20 +588,38 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             return Err(WirelessError::HardwareError);
         }
         let domain = self.policy.current().map_err(error)?;
-        radio
-            .prepare_station(&domain, request.bssid, request.frequency_mhz as u16)
-            .await
+        let permission = radio
+            .station_permission(&domain, request.frequency_mhz as u16)
             .map_err(error)?;
-        let domain = self.policy.current().map_err(error)?;
-        radio
-            .associate_station(&domain, &request.ssid, mode, &request.ie)
-            .await
-            .map_err(error)?;
-        let domain = self.policy.current().map_err(error)?;
-        let link = radio
-            .start_data_with_nonce(&domain, pmk.as_deref(), nonce)
-            .await
-            .map_err(error)?;
+        let validate = || {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Error::Failed);
+            }
+            permission.check(&self.policy.current()?)
+        };
+        wmi_runtime::checked_policy(
+            radio.prepare_station_checked(
+                &domain,
+                request.bssid,
+                request.frequency_mhz as u16,
+                &validate,
+            ),
+            &validate,
+        )
+        .await
+        .map_err(error)?;
+        wmi_runtime::checked_policy(
+            radio.associate_station_checked(&domain, &request.ssid, mode, &request.ie, &validate),
+            &validate,
+        )
+        .await
+        .map_err(error)?;
+        let link = wmi_runtime::checked_policy(
+            radio.start_data_with_nonce_checked(&domain, pmk.as_deref(), nonce, &validate),
+            &validate,
+        )
+        .await
+        .map_err(error)?;
         let domain = self.policy.current().map_err(error)?;
         radio.check_data_policy(&domain).map_err(error)?;
         let ps_request = self.ps_request.load(Ordering::Acquire);

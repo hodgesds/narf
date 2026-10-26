@@ -15,9 +15,11 @@ pub use management::{
     Completion as ManagementCompletion, Receipt as ManagementReceipt, Token as ManagementToken,
 };
 mod active_scan;
+pub(in crate::ath10k) use active_scan::checked as checked_policy;
 mod data;
 mod mlme;
 mod power_save;
+mod wmm;
 pub use data::Link as StationLink;
 pub use mlme::Associated as StationAssociated;
 pub use station::Disconnected as StationDisconnected;

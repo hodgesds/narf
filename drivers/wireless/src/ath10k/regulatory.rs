@@ -43,7 +43,6 @@ impl Permission {
         domain: &narf_wireless::reg::RegulatoryDomain,
         frequency: u16,
     ) -> Result<Self, Error> {
-        use narf_wireless::reg::RegFlags;
         // Linux's strict initial custom world domain admits 1..11 to
         // initiate radiation; channels requiring beacon-hint/DFS state
         // are not promoted by this first station profile.
@@ -62,6 +61,18 @@ impl Permission {
             return Err(Error::Unsupported);
         }
         let factory = Factory::from_eeprom(caps.eeprom_domain).map_err(|_| Error::Unsupported)?;
+        Self::from_factory(factory, domain, frequency)
+    }
+    fn from_factory(
+        factory: Factory,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        frequency: u16,
+    ) -> Result<Self, Error> {
+        let two_ghz = frequency < 3000;
+        use narf_wireless::reg::RegFlags;
+        if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+            return Err(Error::Unsupported);
+        }
         // World 5GHz is NO_IR in Linux ath/regd.c. No beacon-hint or DFS
         // qualification is invented. The wider profile requires a resolved
         // fixed-country factory identity matching the authenticated host DB;
@@ -82,8 +93,10 @@ impl Permission {
             // permissive rule cannot erase DFS, narrow bandwidth or power.
             if r.freq_start_mhz >= r.freq_end_mhz
                 || r.max_bandwidth_mhz < 20
-                || r.flags.intersects(RegFlags::DFS | RegFlags::NO_IR)
-                || !two_ghz && r.flags.contains(RegFlags::INDOOR_ONLY)
+                // This STA profile has no DFS/indoor qualification. NO_P2P
+                // does not restrict STA; unknown future restrictions are not
+                // silently promoted by a second permissive overlapping row.
+                || r.flags.bits() & !RegFlags::NO_P2P.bits() != 0
             {
                 return Err(Error::Unsupported);
             }
@@ -106,5 +119,13 @@ impl Permission {
             frequency,
             half_dbm,
         })
+    }
+    /// Recheck the chosen immutable factory/frequency receipt against the
+    /// current host policy without querying or inventing hardware facts.
+    pub fn check(self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
+        if Self::from_factory(self.factory, domain, self.frequency)? != self {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
     }
 }

@@ -35,6 +35,7 @@ pub(super) struct State {
     incoming: VecDeque<Native>,
     received: VecDeque<Vec<u8>>,
     sequence: u16,
+    qos: bool,
     failed: bool,
     authorized: bool,
     last_peer: narf_time::Deadline,
@@ -179,8 +180,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         domain: &narf_wireless::reg::RegulatoryDomain,
         pmk: Option<&[u8; 32]>,
-        mut nonce: impl FnMut() -> Option<[u8; 32]>,
+        nonce: impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<Link, Error> {
+        self.start_data_with_nonce_checked(domain, pmk, nonce, &|| Ok(()))
+            .await
+    }
+    pub(in crate::ath10k) async fn start_data_with_nonce_checked(
+        &mut self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        pmk: Option<&[u8; 32]>,
+        mut nonce: impl FnMut() -> Option<[u8; 32]>,
+        validate: &impl Fn() -> Result<(), Error>,
+    ) -> Result<Link, Error> {
+        validate()?;
         let associated = self.associated_station().ok_or(Error::Failed)?;
         if self.data.is_some() || !self.htt.data_profile() {
             return Err(Error::Unsupported);
@@ -265,6 +277,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             incoming,
             received: VecDeque::new(),
             sequence: 2,
+            qos: self.peer.as_ref().ok_or(Error::Failed)?.wmm.is_some(),
             failed: false,
             authorized: !associated.protected,
             last_peer: narf_time::Deadline::after_ms(5000),
@@ -275,7 +288,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            let idle = self.data_step(&mut nonce).await?;
+            let idle = self.data_step(&mut nonce, validate).await?;
             if idle && self.data.as_ref().is_some_and(State::open) {
                 self.failed = false;
                 return self.station_link().ok_or(Error::Failed);
@@ -310,7 +323,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Htt(htt::Error::Busy));
         }
         let frame = if let Some(security) = &mut data.security {
-            security.transmit_ethernet(bytes).map_err(security_error)?
+            if data.qos {
+                security.transmit_ethernet_qos(bytes, 0)
+            } else {
+                security.transmit_ethernet(bytes)
+            }
+            .map_err(security_error)?
         } else {
             if !(14..=1514).contains(&bytes.len())
                 || bytes[6..12] != own
@@ -323,12 +341,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             {
                 return Err(Error::Unsupported);
             }
-            let mut frame = alloc::vec![8, 1, 0, 0];
+            let mut frame = alloc::vec![if data.qos { 0x88 } else { 8 }, 1, 0, 0];
             frame.extend_from_slice(&link.bssid);
             frame.extend_from_slice(&own);
             frame.extend_from_slice(&bytes[..6]);
             frame.extend_from_slice(&(data.sequence << 4).to_le_bytes());
             data.sequence = (data.sequence + 1) & 4095;
+            if data.qos {
+                frame.extend_from_slice(&[0, 0]);
+            }
             frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             frame.extend_from_slice(&bytes[12..]);
             frame
@@ -352,7 +373,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             htt::tx::Parameters {
                 kind: htt::tx::Kind::Raw,
                 vdev: 0,
-                tid: 16,
+                tid: if frame[0] == 0x88 { 0 } else { 16 },
                 hardware_crypto: false,
             },
             &frame,
@@ -433,7 +454,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 htt::tx::Parameters {
                     kind: htt::tx::Kind::Raw,
                     vdev: 0,
-                    tid: 16,
+                    tid: if frame[0] == 0x88 { 0 } else { 16 },
                     hardware_crypto: false,
                 },
                 frame,
@@ -460,12 +481,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.failed = true;
         for _ in 0..256 {
             let idle = self
-                .data_step(&mut || {
-                    let mut nonce = [0; 32];
-                    narf_crypto::try_fill_random_bytes(&mut nonce)
-                        .ok()
-                        .map(|()| nonce)
-                })
+                .data_step(
+                    &mut || {
+                        let mut nonce = [0; 32];
+                        narf_crypto::try_fill_random_bytes(&mut nonce)
+                            .ok()
+                            .map(|()| nonce)
+                    },
+                    &|| Ok(()),
+                )
                 .await?;
             if idle {
                 let data = self.data.as_mut().ok_or(Error::Failed)?;
@@ -480,16 +504,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     async fn data_step(
         &mut self,
         nonce: &mut impl FnMut() -> Option<[u8; 32]>,
+        validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<bool, Error> {
+        validate()?;
         self.data_check()?;
         let event = match self.pending.pop_front() {
             Some(e) => e,
-            None => self.station_progress().await?,
+            None => checked_policy(self.station_progress(), validate).await?,
         };
         let (idle, reply) = self.data_event(event, nonce)?;
         if let Some(reply) = reply {
-            self.send_data(&reply, true).await?;
+            checked_policy(self.send_data(&reply, true), validate).await?;
         }
+        validate()?;
         Ok(idle)
     }
     fn data_check(&self) -> Result<(), Error> {

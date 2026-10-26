@@ -115,6 +115,28 @@ remain separate profiles.
   These opaque probe elements grant no PHY, association, security or regulatory
   authority. Current channel/power checks, terminal correlation/restoration,
   failure/cancellation and retained-DMA rules are identical to `scan_active`.
+- The single-vdev RAW station can negotiate WMM from an actual AP Parameter IE.
+  It appends its own Information IE with U-APSD disabled; caller-supplied WMM
+  cannot duplicate or replace that negotiation. The bound successful association
+  response supplies the final contention values. Missing, duplicate, malformed
+  or BE-admission-controlled response parameters fail before peer/data admission.
+  Native per-dialect PDEV WMM records program BE/BK/VI/VO contention, converting
+  IEEE TXOP32-us units to native microseconds; PEER_ASSOC carries the real QoS
+  flag only after those transport receipts. This one-radio profile has no
+  per-vdev concurrency and makes no firmware ACK claim for these commands.
+  Ordinary Ethernet uses QoS BE/TID0 through actual RAW HTT metadata and the
+  shared host CCMP formatter; EAPOL/key replies remain legacy non-QoS. RX binds
+  QoS TID to the native descriptor before replay/PN commitment. A-MSDU, BA/TX
+  aggregation, TSPEC, U-APSD and non-BE transmit classification remain separate
+  features. APs without WMM retain the legacy packet/command profile.
+- The registered Device binds native preparation, authentication/association,
+  WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
+  receipt. It samples current policy before and after each nested wait and
+  before each new command or EAPOL publication. Observed clear, changed country/power,
+  DFS, NO_IR, unqualified indoor-only or unknown restrictions terminate admission
+  on either band; NO_P2P alone does not restrict STA. Cancellation or a late
+  successful receipt cannot reopen the host, commit a failed M4 or release
+  uncertain DMA. Passive receive keeps its distinct non-transmit permission.
 - The older public `wmi` MAIN-dialect codec now uses Linux's group IDs
   starting at index 1, with distinct scan/debug events and correct
   `VDEV_SET_PARAM` (0x5008), RTS, fragmentation, beacon and DTIM parameter

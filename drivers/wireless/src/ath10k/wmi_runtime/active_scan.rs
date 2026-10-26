@@ -10,17 +10,7 @@ fn permission(
     domain: &RegulatoryDomain,
     frequency: u16,
 ) -> Result<Permission, Error> {
-    let permission = Permission::from_domain(caps, domain, frequency)?;
-    // No trusted indoor-location input exists in this station profile.
-    let center = u32::from(frequency);
-    if domain.rules.iter().any(|r| {
-        r.freq_start_mhz < center + 10
-            && center - 10 < r.freq_end_mhz
-            && r.flags.contains(narf_wireless::reg::RegFlags::INDOOR_ONLY)
-    }) {
-        return Err(Error::Unsupported);
-    }
-    Ok(permission)
+    Permission::from_domain(caps, domain, frequency)
 }
 
 pub(in crate::ath10k) struct Plan {
@@ -54,7 +44,7 @@ impl Plan {
 
 // A credit wait can yield inside send_wmi. Recheck policy on every poll,
 // including Ready, rather than checking only before constructing the future.
-pub(super) async fn checked<O>(
+pub(in crate::ath10k) async fn checked<O>(
     future: impl Future<Output = Result<O, Error>>,
     validate: &impl Fn() -> Result<(), Error>,
 ) -> Result<O, Error> {

@@ -6,6 +6,8 @@ use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
+#[path = "wmm_conversation_tests.rs"]
+mod wmm_conversation_tests;
 fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
     let mut domain = station_tests::policy();
     for (low, high) in [(5150, 5350), (5725, 5850)] {
@@ -847,6 +849,25 @@ fn composition_on(
     power_save: bool,
     frequency: u16,
 ) -> Result<(), &'static str> {
+    composition_profile(
+        version,
+        dialect,
+        secured,
+        active_scan,
+        power_save,
+        frequency,
+        false,
+    )
+}
+fn composition_profile(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    active_scan: bool,
+    power_save: bool,
+    frequency: u16,
+    qos: bool,
+) -> Result<(), &'static str> {
     let h = Harness::new_on(
         version,
         dialect,
@@ -855,6 +876,13 @@ fn composition_on(
         frequency,
         if frequency < 3000 { 0x64 } else { 0x8348 },
     );
+    if qos {
+        h.model(|model| {
+            let f = model.data.as_mut().unwrap();
+            f.wmm_offer = Some(WMM_PARAMETERS.to_vec());
+            f.wmm_response = Some(WMM_PARAMETERS.to_vec());
+        });
+    }
     if power_save {
         h.model(|model| {
             model.ps = Some(super::super::power_save_tests::Fixture::new(dialect, true))
@@ -925,6 +953,14 @@ fn composition_on(
     h.pump();
     if !h.model(|m| m.data.as_ref().unwrap().uplink.contains(&uplink)) {
         return Err("native HTT/AP IP uplink changed");
+    }
+    if qos
+        && !h.model(|m| {
+            let f = m.data.as_ref().unwrap();
+            f.wmm_sent == 1 && f.qos_frames >= 3
+        })
+    {
+        return Err("native response-bound WMM or QoS DHCP/DATA did not execute");
     }
     let before = narf_net::iface::lookup(&h.name).unwrap().stats.rx_packets;
     h.model(|m| {

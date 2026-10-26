@@ -32,6 +32,7 @@ pub(super) fn peer(
         },
         capabilities,
         rates,
+        false,
     )
 }
 pub(super) fn peer_on(
@@ -39,6 +40,7 @@ pub(super) fn peer_on(
     associated: Associated,
     capabilities: u16,
     rates: u16,
+    qos: bool,
 ) -> Result<Vec<u8>, Error> {
     let Associated {
         bssid,
@@ -83,7 +85,11 @@ pub(super) fn peer_on(
     wire::put(&mut out, at + 12, 1); // new association, vdev0
     wire::put(&mut out, at + 16, u32::from(aid));
     // AUTH is Linux's association flag, independent of controlled-port state.
-    wire::put(&mut out, at + 20, 1 | if protected { 4 } else { 0 });
+    wire::put(
+        &mut out,
+        at + 20,
+        1 | if protected { 4 } else { 0 } | if qos { 2 } else { 0 },
+    );
     wire::put(&mut out, at + 24, u32::from(capabilities));
     wire::put(&mut out, at + 28, 1); // Linux STA listen-interval workaround.
     let mode = if frequency > 3000 {
