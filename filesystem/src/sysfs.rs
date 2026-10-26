@@ -1743,7 +1743,31 @@ pub(crate) fn evdev_caps_uevent(caps: &narf_input::evdev::DeviceCaps) -> alloc::
     // "no input devices". Classification mirrors input_id's coarse rules:
     // a relative pointer is a mouse, an absolute device a touchscreen,
     // otherwise a key-only device is a keyboard.
+    // PROP= — the INPUT_PROP_* bitmap, same shape as the other
+    // capability lines (Linux `input_add_uevent_bm_var`).
+    s.push_str(&format!("PROP={}\n", fmt_cap_bitmap(&caps.propbit.words)));
     s.push_str("ID_INPUT=1\n");
+    // Property-driven classification first: the props are the
+    // authoritative statement of what the device IS. A BUTTONPAD
+    // device is a touchpad even though it also carries BTN_LEFT +
+    // ABS axes (the heuristic below would call it a mouse or a
+    // touchscreen); a DIRECT device with a tool key is a tablet, and
+    // with BTN_TOUCH a touchscreen.
+    {
+        use narf_input::evdev::{key, prop};
+        if caps.has_prop(prop::BUTTONPAD) {
+            s.push_str("ID_INPUT_TOUCHPAD=1\n");
+            return s;
+        }
+        if caps.has_prop(prop::DIRECT) && caps.keybit.get(key::BTN_TOOL_PEN) {
+            s.push_str("ID_INPUT_TABLET=1\n");
+            return s;
+        }
+        if caps.has_prop(prop::DIRECT) && caps.keybit.get(key::BTN_TOUCH) {
+            s.push_str("ID_INPUT_TOUCHSCREEN=1\n");
+            return s;
+        }
+    }
     // BTN_LEFT (0x110) present ⇒ the device carries mouse buttons.
     let has_mouse_btn = caps.keybit.get(0x110);
     if has_rel {
@@ -1836,9 +1860,44 @@ pub fn populate_input_class() {
         let n = id.0.saturating_sub(1);
         let minor = 64 + n;
 
+        // The device's registered identity (name/phys/id) — sysfs and
+        // the parent uevent report the transport's real values, not a
+        // per-index synthetic name.
+        let caps = narf_input::evdev::ROUTER.caps(id);
+        let dev_name = caps
+            .as_ref()
+            .map(|c| c.name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("narf-input{}", n));
+        let dev_phys = caps.as_ref().map(|c| c.phys.clone()).unwrap_or_default();
+        let dev_uniq = caps.as_ref().map(|c| c.uniq.clone()).unwrap_or_default();
+        let dev_id = caps
+            .as_ref()
+            .map(|c| c.id)
+            .unwrap_or(narf_input::evdev::InputId::new(
+                narf_input::evdev::bus::VIRTUAL,
+                0,
+                0,
+                0,
+            ));
+
         // ── Parent input device: /sys/devices/platform/narf-input/inputN ──
         let inputn = Kobject::new_child(narf_input.clone(), format!("input{}", n));
-        kobject_add_attr(&inputn, "name", move || format!("narf-input{}\n", n));
+        {
+            let attr_name = dev_name.clone();
+            kobject_add_attr(&inputn, "name", move || format!("{}\n", attr_name));
+        }
+        {
+            let attr_phys = dev_phys.clone();
+            kobject_add_attr(&inputn, "phys", move || format!("{}\n", attr_phys));
+        }
+        {
+            let attr_uniq = dev_uniq.clone();
+            kobject_add_attr(&inputn, "uniq", move || format!("{}\n", attr_uniq));
+        }
+        // (The id quartet rides the uevent PRODUCT= line below; the
+        // sysfs `id/` subdirectory shape is a follow-up, not faked
+        // here with slash-named attrs the VFS cannot walk.)
         // A `uevent` file is what sd_device_new_from_syspath uses to accept a
         // directory as a device (so the parent walk resolves it). Writable, like
         // the child eventN below: `udevadm trigger --action=add` walks /sys and
@@ -1851,7 +1910,16 @@ pub fn populate_input_class() {
         // drivers/base/core.c:2453); mirror that. Weak ref avoids a closure↔kobject
         // refcount cycle.
         {
-            let pu = format!("PRODUCT=0/0/0/0\nNAME=\"narf-input{}\"\n", n);
+            let pu = format!(
+                "PRODUCT={:x}/{:x}/{:x}/{:x}\nNAME=\"{}\"\nPHYS=\"{}\"\nUNIQ=\"{}\"\n",
+                dev_id.bustype,
+                dev_id.vendor,
+                dev_id.product,
+                dev_id.version,
+                dev_name,
+                dev_phys,
+                dev_uniq
+            );
             let weak = alloc::sync::Arc::downgrade(&inputn);
             kobject_add_writable_attr(
                 &inputn,
@@ -1883,8 +1951,17 @@ pub fn populate_input_class() {
             .map(|c| evdev_caps_uevent(&c))
             .unwrap_or_default();
         let uevent = format!(
-            "MAJOR=13\nMINOR={}\nDEVNAME=input/event{}\n{}",
-            minor, n, caps_lines
+            "MAJOR=13\nMINOR={}\nDEVNAME=input/event{}\nPRODUCT={:x}/{:x}/{:x}/{:x}\nNAME=\"{}\"\nPHYS=\"{}\"\nUNIQ=\"{}\"\n{}",
+            minor,
+            n,
+            dev_id.bustype,
+            dev_id.vendor,
+            dev_id.product,
+            dev_id.version,
+            dev_name,
+            dev_phys,
+            dev_uniq,
+            caps_lines
         );
         // Writable so `udevadm trigger` (which writes "add"/"change" to the
         // uevent file) makes the kernel broadcast a netlink uevent. Weak ref

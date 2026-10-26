@@ -46,6 +46,28 @@ All code is derived strictly from the references below.
 ### Landed
 - `KeyEvent` / `PointerEvent` / `ScrollEvent` types + `EventRing`
   with the `narf-capabilities`-gated subscriber handle.
+- `evdev` per-device publication surface: `Router::register_device`
+  takes a `DeviceCaps` carrying the device's userspace-visible
+  identity — `name`, `phys`, `uniq`, `InputId` (`bustype` / `vendor`
+  / `product` / `version`, Linux `struct input_id`) — plus an
+  `INPUT_PROP_*` property bitmap (`propbit`), alongside the existing
+  key/rel/abs capability bitmaps and per-axis `AxisInfo` ranges.
+  Producers fill the identity from their discovering transport;
+  `DeviceCaps::default()` keeps the historical synthetic identity
+  (`narf-input`, `BUS_VIRTUAL`, ids 0) for producers not yet plumbed.
+  The filesystem layer answers `EVIOCGID` / `EVIOCGNAME` /
+  `EVIOCGPHYS` / `EVIOCGUNIQ` / `EVIOCGPROP` from these fields and
+  synthesises `/dev/input/by-id` / `/dev/input/by-path` aliases and
+  the sysfs `name` / `phys` / `uniq` + `PRODUCT=` uevent fields from
+  them.
+- `evdev::MtEvdevState`: transport-neutral multi-touch emitter
+  implementing Linux slot protocol B. The producer resolves wire
+  contact ids to MT slots; the emitter owns the wire rules —
+  per-slot `ABS_MT_SLOT` / `ABS_MT_TRACKING_ID` (`-1` on release) /
+  `ABS_MT_POSITION_X/Y` / `ABS_MT_PRESSURE`, single-touch
+  `ABS_X`/`ABS_Y` + `BTN_TOUCH` compatibility following the primary
+  slot, integrated-button edges, and exactly one `SYN_REPORT` per
+  non-empty frame.
 - `goodix`: clean-room GT911 codec. I²C address constants,
   status-byte decoder (buffer-ready / large-detect / have-key /
   4-bit touch count), TouchPoint parser (track-id + LE 16-bit

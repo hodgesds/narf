@@ -23,6 +23,7 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -98,6 +99,12 @@ pub mod rel {
 /// `EV_KEY` button codes for mouse buttons.
 /// Ref: `include/uapi/linux/input-event-codes.h`.
 pub mod key {
+    pub const BTN_TOUCH: u16 = 0x14a;
+    pub const BTN_TOOL_PEN: u16 = 0x140;
+    pub const BTN_TOOL_RUBBER: u16 = 0x141;
+    pub const BTN_TOOL_FINGER: u16 = 0x145;
+    pub const BTN_STYLUS: u16 = 0x14b;
+    pub const BTN_STYLUS2: u16 = 0x14c;
     pub const BTN_LEFT: u16 = 0x110;
     pub const BTN_RIGHT: u16 = 0x111;
     pub const BTN_MIDDLE: u16 = 0x112;
@@ -353,8 +360,76 @@ impl CapBitmap {
 /// Per-type capability bitmaps for a device.
 /// Mirrors `input_dev->keybit`, `->relbit`, `->absbit` in Linux
 /// `include/linux/input.h`.
-#[derive(Clone, Debug, Default)]
+/// Linux `input_id::bustype` values used by NARF producers.
+/// Ref: `include/uapi/linux/input.h`.
+pub mod bus {
+    pub const PCI: u16 = 0x01;
+    pub const USB: u16 = 0x03;
+    pub const VIRTUAL: u16 = 0x06;
+    pub const I8042: u16 = 0x11;
+    pub const I2C: u16 = 0x18;
+}
+
+/// Linux `INPUT_PROP_*` device-property codes.
+/// Ref: `include/uapi/linux/input.h`.
+pub mod prop {
+    /// The device is a pointing device (relative or absolute pointer).
+    pub const POINTER: u16 = 0x00;
+    /// Direct input device (touchscreen / pen digitiser): positions map
+    /// directly onto the surface rather than through a pointer cursor.
+    pub const DIRECT: u16 = 0x01;
+    /// Clickpad-style touchpad with an integrated primary button.
+    pub const BUTTONPAD: u16 = 0x02;
+    /// Semi-multitouch device (reports a bounding box, not contacts).
+    pub const SEMI_MT: u16 = 0x03;
+    /// The device is an external pad attached to a tablet.
+    pub const EXTERNAL: u16 = 0x04;
+    /// The touchpad has buttons along its top edge.
+    pub const TOPBUTTONPAD: u16 = 0x05;
+}
+
+/// Stable hardware identity for one evdev device — the in-kernel form of
+/// Linux `struct input_id`. Producers fill this from the transport that
+/// discovered the device (HID descriptor IDs over I2C, virtio-input
+/// config, the i8042 port, uinput setup) instead of every device
+/// collapsing onto one synthetic virtual identity.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct InputId {
+    pub bustype: u16,
+    pub vendor: u16,
+    pub product: u16,
+    pub version: u16,
+}
+
+impl InputId {
+    pub const fn new(bustype: u16, vendor: u16, product: u16, version: u16) -> Self {
+        Self {
+            bustype,
+            vendor,
+            product,
+            version,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct DeviceCaps {
+    /// Human-readable device name (`EVIOCGNAME`, sysfs `name`,
+    /// `/proc/bus/input/devices` `N:` line).
+    pub name: String,
+    /// Physical topology string (`EVIOCGPHYS`, sysfs `phys`): where the
+    /// device hangs in the machine, e.g. `i2c-ELAN0001/input0`.
+    pub phys: String,
+    /// Unique per-instance string (`EVIOCGUNIQ`) when the transport
+    /// exposes one; empty when it does not.
+    pub uniq: String,
+    /// Bus / vendor / product / version identity (`EVIOCGID`).
+    pub id: InputId,
+    /// `INPUT_PROP_*` property bitmap (`EVIOCGPROP`). libinput and
+    /// udev's input classifier key touchpad-vs-touchscreen decisions
+    /// off these bits, so they are part of the device contract, not
+    /// decoration.
+    pub propbit: CapBitmap,
     /// Supported `EV_KEY` codes.
     pub keybit: CapBitmap,
     /// Supported `EV_REL` axis codes.
@@ -367,6 +442,26 @@ pub struct DeviceCaps {
     pub abs_info: Vec<(u16, crate::AxisInfo)>,
     /// Bitmask of supported event types (bit = `EventType as u16`).
     pub evbit: u32,
+}
+
+impl Default for DeviceCaps {
+    /// The historical synthetic identity: producers that have not been
+    /// plumbed with a transport identity still publish as a virtual
+    /// `narf-input` device rather than an anonymous empty name.
+    fn default() -> Self {
+        Self {
+            name: String::from("narf-input"),
+            phys: String::new(),
+            uniq: String::new(),
+            id: InputId::new(bus::VIRTUAL, 0, 0, 0),
+            propbit: CapBitmap::new(),
+            keybit: CapBitmap::new(),
+            relbit: CapBitmap::new(),
+            absbit: CapBitmap::new(),
+            abs_info: Vec::new(),
+            evbit: 0,
+        }
+    }
 }
 
 impl DeviceCaps {
@@ -427,6 +522,27 @@ impl DeviceCaps {
             EventType::Syn => true, // every device supports EV_SYN
             _ => false,
         }
+    }
+
+    /// Replace the synthetic default identity with the identity the
+    /// producing transport discovered. Builder-style so existing
+    /// `let mut caps = DeviceCaps::new(); caps.add_*()` call sites can
+    /// attach identity in one statement.
+    pub fn set_identity(&mut self, name: &str, phys: &str, uniq: &str, id: InputId) {
+        self.name = String::from(name);
+        self.phys = String::from(phys);
+        self.uniq = String::from(uniq);
+        self.id = id;
+    }
+
+    /// Declare an `INPUT_PROP_*` property (see [`prop`]).
+    pub fn add_prop(&mut self, p: u16) {
+        self.propbit.set(p);
+    }
+
+    /// Return `true` if the `INPUT_PROP_*` property `p` is declared.
+    pub fn has_prop(&self, p: u16) -> bool {
+        self.propbit.get(p)
     }
 }
 
@@ -1108,6 +1224,195 @@ pub fn dispatch_pointer_to_node(node: &DeviceNode, dx: i32, dy: i32, btn_changes
         });
     }
     node.dispatch(EvdevEvent::syn_report(now));
+}
+
+// ── Multi-touch (slot protocol B) frame dispatch ────────────────────────────
+
+/// One contact's state in a multi-touch frame, already resolved to an
+/// MT slot by the producing driver (which owns the wire contact-id →
+/// slot mapping for its transport).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MtContactUpdate {
+    /// MT slot index (`ABS_MT_SLOT` value), `<` the device's slot count.
+    pub slot: usize,
+    /// `true` while the contact is down in this frame.
+    pub active: bool,
+    /// Wire contact identifier, reported as `ABS_MT_TRACKING_ID` while
+    /// the contact is active. Ignored on release (the protocol reports
+    /// `-1` for a released slot regardless of the id).
+    pub tracking_id: i32,
+    pub x: i32,
+    pub y: i32,
+    /// Contact pressure when the device reports it (`ABS_MT_PRESSURE`).
+    pub pressure: Option<i32>,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct MtSlotState {
+    tracking_id: Option<i32>,
+    x: i32,
+    y: i32,
+    pressure: Option<i32>,
+}
+
+/// Stateful slot-protocol-B emitter shared by every multi-touch
+/// producer (I2C-HID PTP / touchscreen today, USB HID when that lane
+/// adopts it). The producer owns contact-id → slot allocation; this
+/// state owns the evdev wire rules:
+///
+/// * per changed slot: `ABS_MT_SLOT`, `ABS_MT_TRACKING_ID` (the id on
+///   down, `-1` on release), `ABS_MT_POSITION_X/Y`, optional
+///   `ABS_MT_PRESSURE` — unchanged values are not re-sent;
+/// * single-touch compatibility: `ABS_X`/`ABS_Y` follow the
+///   lowest-numbered live slot and `BTN_TOUCH` tracks "any contact
+///   down", exactly the shape libinput's touchpad/touchscreen paths
+///   consume;
+/// * the device's integrated buttons ride as `BTN_LEFT`/`BTN_RIGHT`
+///   edge transitions (PTP clickpads);
+/// * exactly one `SYN_REPORT` terminates a frame that emitted
+///   anything; a no-change frame emits nothing.
+///
+/// Ref: Linux `Documentation/input/multi-touch-protocol.txt` (type B).
+#[derive(Clone, Debug)]
+pub struct MtEvdevState {
+    slots: Vec<MtSlotState>,
+    btn_touch: bool,
+    btn_left: bool,
+    btn_right: bool,
+}
+
+impl MtEvdevState {
+    /// State for a device with `max_slots` MT slots. `0` is clamped to
+    /// 1 so a malformed profile cannot produce a permanently-dead node.
+    pub fn new(max_slots: usize) -> Self {
+        Self {
+            slots: alloc::vec![MtSlotState::default(); max_slots.max(1)],
+            btn_touch: false,
+            btn_left: false,
+            btn_right: false,
+        }
+    }
+
+    /// Number of live contacts after the frames dispatched so far.
+    pub fn active_contacts(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.tracking_id.is_some())
+            .count()
+    }
+
+    /// Dispatch one decoded frame. `button_primary` / `button_secondary`
+    /// are the device's integrated button states for this frame (PTP
+    /// clickpad buttons; `false` for pure touchscreens). Returns the
+    /// number of non-SYN events emitted.
+    pub fn dispatch_frame(
+        &mut self,
+        node: &DeviceNode,
+        updates: &[MtContactUpdate],
+        button_primary: bool,
+        button_secondary: bool,
+    ) -> usize {
+        // Monotonic NANOSECONDS — see the note in
+        // `dispatch_pointer_to_node`.
+        let now = narf_time::monotonic_ns();
+        let mut emitted = 0usize;
+        let mut push = |type_: EventType, code: u16, value: i32| {
+            node.dispatch(EvdevEvent {
+                time: now,
+                type_,
+                code,
+                value,
+            });
+            emitted += 1;
+        };
+
+        let primary_before = self.primary_position();
+        for u in updates {
+            if u.slot >= self.slots.len() {
+                continue;
+            }
+            let slot = &mut self.slots[u.slot];
+            if u.active {
+                let is_new = slot.tracking_id != Some(u.tracking_id);
+                let moved = is_new || slot.x != u.x || slot.y != u.y;
+                let pressure_changed = is_new || slot.pressure != u.pressure;
+                if !is_new && !moved && !pressure_changed {
+                    continue;
+                }
+                push(EventType::Abs, abs::ABS_MT_SLOT, u.slot as i32);
+                if is_new {
+                    push(EventType::Abs, abs::ABS_MT_TRACKING_ID, u.tracking_id);
+                }
+                if moved {
+                    push(EventType::Abs, abs::ABS_MT_POSITION_X, u.x);
+                    push(EventType::Abs, abs::ABS_MT_POSITION_Y, u.y);
+                }
+                if pressure_changed {
+                    if let Some(p) = u.pressure {
+                        push(EventType::Abs, abs::ABS_MT_PRESSURE, p);
+                    }
+                }
+                *slot = MtSlotState {
+                    tracking_id: Some(u.tracking_id),
+                    x: u.x,
+                    y: u.y,
+                    pressure: u.pressure,
+                };
+            } else if slot.tracking_id.is_some() {
+                push(EventType::Abs, abs::ABS_MT_SLOT, u.slot as i32);
+                push(EventType::Abs, abs::ABS_MT_TRACKING_ID, -1);
+                *slot = MtSlotState::default();
+            }
+        }
+
+        // Single-touch compatibility axes follow the primary (lowest
+        // live slot). A primary hand-off (release of slot 0 while slot
+        // 1 stays down) re-reports the new primary's position.
+        let primary_after = self.primary_position();
+        if primary_after != primary_before {
+            if let Some((x, y)) = primary_after {
+                push(EventType::Abs, abs::ABS_X, x);
+                push(EventType::Abs, abs::ABS_Y, y);
+            }
+        }
+        let any_active = primary_after.is_some();
+        if any_active != self.btn_touch {
+            self.btn_touch = any_active;
+            push(
+                EventType::Key,
+                key::BTN_TOUCH,
+                if any_active { 1 } else { 0 },
+            );
+        }
+        if button_primary != self.btn_left {
+            self.btn_left = button_primary;
+            push(
+                EventType::Key,
+                key::BTN_LEFT,
+                if button_primary { 1 } else { 0 },
+            );
+        }
+        if button_secondary != self.btn_right {
+            self.btn_right = button_secondary;
+            push(
+                EventType::Key,
+                key::BTN_RIGHT,
+                if button_secondary { 1 } else { 0 },
+            );
+        }
+
+        if emitted > 0 {
+            node.dispatch(EvdevEvent::syn_report(now));
+        }
+        emitted
+    }
+
+    fn primary_position(&self) -> Option<(i32, i32)> {
+        self.slots
+            .iter()
+            .find(|s| s.tracking_id.is_some())
+            .map(|s| (s.x, s.y))
+    }
 }
 
 /// Dispatch an absolute-pointer frame — absolute `ABS_X`/`ABS_Y` position

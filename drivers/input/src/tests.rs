@@ -1252,6 +1252,112 @@ mod i2c_hid_bind_smokes {
         smoke_ptp_pointer_no_active_contact_resets_origin
     );
 
+    // Publication: a two-contact PTP report must reach the evdev node
+    // as slot-protocol-B — the second contact is exactly what the
+    // first-contact relative-pointer path above drops (issue #764).
+    fn smoke_ptp_reports_reach_evdev_node() -> TestResult {
+        use crate::i2c_hid_touch::{
+            __new_ptp_state_for_test, __pump_ptp_to_evdev_for_test, build_ptp_caps,
+        };
+        use narf_input::abs;
+        use narf_input::evdev::{bus, key, prop, DeviceCaps, EventType, InputId, ROUTER};
+
+        let blob = narf_hid::ptp::__ptp_descriptor_blob();
+        let parsed = match narf_hid::parse(blob) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("parse(PTP_DESCRIPTOR) failed"),
+        };
+        let profile = match narf_hid::ptp::detect(&parsed) {
+            Some(p) => p,
+            None => return TestResult::Fail("PTP detect rejected the descriptor"),
+        };
+
+        let mut identity = DeviceCaps::new();
+        identity.set_identity(
+            "ELAN09BD I2C-HID Touchpad",
+            "i2c-ELAN0001/input0",
+            "",
+            InputId::new(bus::I2C, 0x04F3, 0x3045, 0x0001),
+        );
+        let caps = build_ptp_caps(&profile, &identity);
+        if !caps.has_prop(prop::BUTTONPAD) || !caps.has_prop(prop::POINTER) {
+            return TestResult::Fail("PTP caps must carry POINTER+BUTTONPAD props");
+        }
+        if caps.abs_info(abs::ABS_MT_POSITION_X).map(|i| i.max) != Some(0x7FFF) {
+            return TestResult::Fail("PTP MT X range must come from the profile");
+        }
+        let (id, node) = ROUTER.register_device(caps);
+        let reader = ROUTER.open_reader(id).expect("reader");
+        let mut state = __new_ptp_state_for_test(profile.contacts_max);
+
+        let contact = |cid: u8, tip: bool, x: i32, y: i32| DecodedContact {
+            tip_switch: tip,
+            contact_id: cid,
+            x,
+            y,
+            pressure: None,
+            in_range: tip,
+            confidence: true,
+        };
+        let down = DecodedReport {
+            contacts: alloc::vec![contact(7, true, 100, 200), contact(9, true, 300, 400)],
+            contact_count: 2,
+            scan_time: 0,
+            button1: true,
+        };
+        let n = __pump_ptp_to_evdev_for_test(&profile, &mut state, &node, &down);
+        if n == 0 {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("PTP down frame emitted no evdev events");
+        }
+        let mut events = alloc::vec::Vec::new();
+        while let Some(ev) = reader.poll_event() {
+            events.push(ev);
+        }
+        let has = |type_: EventType, code: u16, value: i32| {
+            events
+                .iter()
+                .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+        };
+        let ok = has(EventType::Abs, abs::ABS_MT_TRACKING_ID, 9)
+            && has(EventType::Abs, abs::ABS_MT_POSITION_X, 300)
+            && has(EventType::Abs, abs::ABS_X, 100)
+            && has(EventType::Key, key::BTN_TOUCH, 1)
+            && has(EventType::Key, key::BTN_LEFT, 1)
+            && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 1;
+        if !ok {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("PTP evdev frame missing second contact / click / SYN");
+        }
+
+        // Release both contacts + the clickpad button in one frame.
+        let up = DecodedReport {
+            contacts: alloc::vec![contact(7, false, 100, 200), contact(9, false, 300, 400)],
+            contact_count: 2,
+            scan_time: 0,
+            button1: false,
+        };
+        let _ = __pump_ptp_to_evdev_for_test(&profile, &mut state, &node, &up);
+        let mut events = alloc::vec::Vec::new();
+        while let Some(ev) = reader.poll_event() {
+            events.push(ev);
+        }
+        let has = |type_: EventType, code: u16, value: i32| {
+            events
+                .iter()
+                .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+        };
+        let ok = has(EventType::Abs, abs::ABS_MT_TRACKING_ID, -1)
+            && has(EventType::Key, key::BTN_TOUCH, 0)
+            && has(EventType::Key, key::BTN_LEFT, 0);
+        ROUTER.unregister_device(id);
+        if !ok {
+            return TestResult::Fail("PTP release frame missing tracking -1 / releases");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/i2c-hid", smoke_ptp_reports_reach_evdev_node);
+
     // End-to-end test of the SET_FEATURE(Device Mode = MULTI_TOUCH)
     // wiring added to the bind layer. Parses a real PTP report
     // descriptor, builds a PtpProfile from it, hands it to
@@ -1753,6 +1859,161 @@ mod i2c_hid_touch_smokes {
         TestResult::Pass
     }
     kernel_test_in!("drivers/input/i2c-hid", smoke_pen_leave_range_releases_tool);
+
+    // Publication: touchscreen contacts must reach the evdev node as
+    // MT frames with the device's identity (issue #764), not only the
+    // global ring.
+    fn smoke_touchscreen_reports_reach_evdev_node() -> TestResult {
+        use crate::i2c_hid_touch::{__pump_report_to_evdev_for_test, build_touchscreen_caps};
+        use narf_input::abs;
+        use narf_input::evdev::{bus, key, prop, DeviceCaps, EventType, InputId, ROUTER};
+
+        let profile = make_profile();
+        let mut identity = DeviceCaps::new();
+        identity.set_identity(
+            "GDIX I2C-HID Touchscreen",
+            "i2c-GDIX0001/input0",
+            "",
+            InputId::new(bus::I2C, 0x27C6, 0x0117, 0x0001),
+        );
+        let caps = build_touchscreen_caps(&profile, &identity);
+        if !caps.has_prop(prop::DIRECT) || caps.has_prop(prop::BUTTONPAD) {
+            return TestResult::Fail("touchscreen caps must be DIRECT, not BUTTONPAD");
+        }
+        let (id, node) = ROUTER.register_device(caps);
+        if ROUTER.caps(id).expect("caps").name != "GDIX I2C-HID Touchscreen" {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("touchscreen node lost its identity");
+        }
+        let reader = ROUTER.open_reader(id).expect("reader");
+        let mut state = __new_state_for_test();
+        let _ = __pump_report_to_evdev_for_test(
+            &profile,
+            &mut state,
+            &__build_decoded_for_test(&[(3, true, 0x0100, 0x0200), (7, true, 0x6000, 0x6000)]),
+            &node,
+        );
+        let mut events = alloc::vec::Vec::new();
+        while let Some(ev) = reader.poll_event() {
+            events.push(ev);
+        }
+        let has = |type_: EventType, code: u16, value: i32| {
+            events
+                .iter()
+                .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+        };
+        let ok = has(EventType::Abs, abs::ABS_MT_TRACKING_ID, 7)
+            && has(EventType::Abs, abs::ABS_MT_POSITION_X, 0x6000)
+            && has(EventType::Key, key::BTN_TOUCH, 1)
+            && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 1;
+        ROUTER.unregister_device(id);
+        if !ok {
+            return TestResult::Fail("touchscreen evdev frame missing second contact");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_touchscreen_reports_reach_evdev_node
+    );
+
+    // Publication: pen reports must reach the evdev node with tablet
+    // semantics (BTN_TOOL_PEN + BTN_TOUCH + ABS_PRESSURE), not the
+    // global ring's BTN_STYLUS-for-tip mapping.
+    fn smoke_pen_reports_reach_evdev_node() -> TestResult {
+        use crate::i2c_hid_touch::{
+            __build_pen_for_test, __new_pen_state_for_test, __pump_pen_to_evdev_for_test,
+            build_pen_caps,
+        };
+        use narf_hid::pen::{PenFields, PenProfile, UsagePick};
+        use narf_input::abs;
+        use narf_input::evdev::{bus, key, prop, DeviceCaps, EventType, InputId, ROUTER};
+
+        // Pen profile manufactured from a parsed descriptor field so
+        // the caps constructor sees real logical ranges.
+        let blob = narf_hid::touchscreen::__touchscreen_descriptor_blob();
+        let parsed = narf_hid::parse(blob).expect("parse");
+        let base = parsed.fields[0].clone();
+        let pick = |min: i32, max: i32| {
+            let mut f = base.clone();
+            f.logical_min = min;
+            f.logical_max = max;
+            UsagePick { field: f, index: 0 }
+        };
+        let profile = PenProfile {
+            input_report_id: 1,
+            fields: PenFields {
+                tip_switch: pick(0, 1),
+                in_range: Some(pick(0, 1)),
+                eraser: Some(pick(0, 1)),
+                invert: None,
+                barrel_switch: Some(pick(0, 1)),
+                secondary_barrel_switch: None,
+                x: pick(0, 0x7FFF),
+                y: pick(0, 0x7FFF),
+                tip_pressure: Some(pick(0, 1023)),
+                x_tilt: None,
+                y_tilt: None,
+                twist: None,
+            },
+        };
+        let mut identity = DeviceCaps::new();
+        identity.set_identity(
+            "WCOM I2C-HID Pen",
+            "i2c-WCOM0001/input0",
+            "",
+            InputId::new(bus::I2C, 0x056A, 0x0001, 0x0001),
+        );
+        let caps = build_pen_caps(&profile, &identity);
+        if !caps.has_prop(prop::DIRECT)
+            || caps.abs_info(abs::ABS_PRESSURE).map(|i| i.max) != Some(1023)
+        {
+            return TestResult::Fail("pen caps must be DIRECT with the pressure range");
+        }
+        let (id, node) = ROUTER.register_device(caps);
+        let reader = ROUTER.open_reader(id).expect("reader");
+        let mut state = __new_pen_state_for_test();
+
+        // Tip down with pressure + barrel held.
+        let pen = __build_pen_for_test(true, true, false, true, 100, 200, Some(512));
+        let _ = __pump_pen_to_evdev_for_test(&mut state, &pen, &node);
+        let mut events = alloc::vec::Vec::new();
+        while let Some(ev) = reader.poll_event() {
+            events.push(ev);
+        }
+        let has = |type_: EventType, code: u16, value: i32| {
+            events
+                .iter()
+                .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+        };
+        let ok = has(EventType::Key, key::BTN_TOOL_PEN, 1)
+            && has(EventType::Key, key::BTN_TOUCH, 1)
+            && has(EventType::Key, key::BTN_STYLUS, 1)
+            && has(EventType::Abs, abs::ABS_X, 100)
+            && has(EventType::Abs, abs::ABS_PRESSURE, 512);
+        if !ok {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("pen evdev frame missing tool/touch/stylus/pressure");
+        }
+
+        // Leave range: the tool must be released exactly once.
+        let out = __build_pen_for_test(false, false, false, false, 0, 0, None);
+        let _ = __pump_pen_to_evdev_for_test(&mut state, &out, &node);
+        let mut events = alloc::vec::Vec::new();
+        while let Some(ev) = reader.poll_event() {
+            events.push(ev);
+        }
+        let releases = events
+            .iter()
+            .filter(|e| e.type_ == EventType::Key && e.code == key::BTN_TOOL_PEN && e.value == 0)
+            .count();
+        ROUTER.unregister_device(id);
+        if releases != 1 {
+            return TestResult::Fail("pen leave-range must release the tool once");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/i2c-hid", smoke_pen_reports_reach_evdev_node);
 
     // ── End-to-end FakeI2cHid bind ───────────────────────────────
     //
