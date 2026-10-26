@@ -21,6 +21,7 @@ pub enum Phase {
     TransmitPowerPrepared,
     ActivatingLink,
     LinkActive,
+    Authenticating,
     DeactivatingLink,
     RemovingManagementQueue,
     RemovingPeer,
@@ -201,3 +202,7 @@ pub type PowerStatus = power::PowerStatus;
 #[path = "mvm_link.rs"]
 mod link;
 pub type ActiveLinkStatus = link::ActiveLinkStatus;
+
+#[path = "mvm_auth.rs"]
+mod auth;
+pub type AuthenticationStatus = auth::AuthenticationStatus;

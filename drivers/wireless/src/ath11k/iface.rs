@@ -1321,6 +1321,13 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                     error.report("asynchronous BSS channel survey");
                 }
             }
+            if self.shared.take_tx_power_request() {
+                if let Some(pdev_id) = m.tx_power_query_pdev() {
+                    // Read-only telemetry: a send failure leaves the normal
+                    // bss_conf fallback available to the synchronous caller.
+                    let _ = self.shared.refresh_tx_power(pdev_id).await;
+                }
+            }
             let loss = m.poll().await;
             let gtk_rekey = m.take_gtk_rekey_notify();
             let cqm_pktloss = m.take_cqm_pktloss();
@@ -3426,7 +3433,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
     }
 
     fn tx_power_dbm(&self) -> Option<i32> {
-        self.mac.try_lock()?.tx_power_dbm()
+        self.shared.request_tx_power();
+        self.shared
+            .firmware_tx_power_dbm()
+            .or_else(|| self.mac.try_lock()?.tx_power_dbm())
     }
 
     fn survey_info(&self) -> Vec<SurveyInfo> {

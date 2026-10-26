@@ -22,7 +22,7 @@ pub struct ActiveLinkStatus {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mvm_link_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 /// Complete control-response rates exactly as iwl_mvm_ack_rates does: map
 /// supported/basic legacy rates first, then include the lower mandatory PHY
@@ -119,7 +119,7 @@ impl Owner {
         Ok(())
     }
 
-    fn check_link_power(&self, policy: &RegulatoryDomain) -> Result<(), &'static str> {
+    pub(super) fn check_link_power(&self, policy: &RegulatoryDomain) -> Result<(), &'static str> {
         let power = self
             .power
             .prepared
@@ -234,7 +234,7 @@ impl Owner {
         Ok(())
     }
 
-    async fn qualified_link_command(
+    pub(super) async fn qualified_link_command(
         &mut self,
         group: u8,
         id: u8,

@@ -90,7 +90,10 @@ fn awake_wire(trace: &runtime::model::TxTrace, sequence: u16) -> Result<(), &'st
     }
     Ok(())
 }
-fn activate(fixture: &mut Fixture, lar: bool) -> Result<u16, &'static str> {
+pub(in crate::iwlwifi::mvm_boot) fn activate(
+    fixture: &mut Fixture,
+    lar: bool,
+) -> Result<u16, &'static str> {
     let owner = fixture.owner.as_mut().unwrap();
     let mut operation = pin!(owner.activate_link_using(|| Ok(policy())));
     let mut sequence = 4;

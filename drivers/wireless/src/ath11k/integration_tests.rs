@@ -74,6 +74,9 @@ macro_rules! ensure {
     };
 }
 
+#[path = "power_stats_tests.rs"]
+mod power_stats_tests;
+
 fn check(f: impl FnOnce() -> R) -> TestResult {
     match f() {
         Ok(()) => TestResult::Pass,

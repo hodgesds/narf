@@ -2683,6 +2683,16 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         self.vif.as_ref().and_then(|vif| vif.txpower)
     }
 
+    /// `ath11k_mac_get_fw_stats`: query only a started, on-channel receiver.
+    /// Firmware provides no valid channel power during DFS CAC.
+    pub fn tx_power_query_pdev(&self) -> Option<u32> {
+        (self.started
+            && self.scan.state == ScanState::Idle
+            && self.pending.dfs_cac.is_none()
+            && self.vif.as_ref().is_some_and(|v| v.chanctx.is_some()))
+        .then_some(self.caps.pdev_id)
+    }
+
     /// `WMI_TLV_SERVICE_GTK_OFFLOAD`: the firmware can run the Group Key
     /// Handshake while a later low-power/WoW lifecycle leaves it armed.
     pub fn supports_gtk_rekey_offload(&self) -> bool {

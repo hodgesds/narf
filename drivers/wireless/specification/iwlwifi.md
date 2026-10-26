@@ -376,10 +376,10 @@ policy fixtures use the same private admission path without global mutation.
 Native Rust tests verify fixed MAC/link/SF/power/MCC and versioned-channel
 wire vectors alongside receipt, policy and ownership invariants.
 
-These contracts do not enable Gen2 native PCI publication. Active station PHY/link activation,
-association management TX/RX, peer/rate/key/Block-Ack and controlled-port
-integration, authenticated platform power/SAR, owned recovery and PM remain
-software dependencies before a Gen2 netdev can be exposed.
+These contracts do not enable Gen2 native PCI publication. The retained power,
+active-link and bounded authentication continuations are specified in §§3.11–3.13.
+Association, peer/rate/key/Block-Ack and controlled-port integration, owned
+recovery and PM remain software dependencies before a Gen2 netdev can be exposed.
 
 ### 3.7 Retained inactive API77 PHY context
 
@@ -452,9 +452,9 @@ queue and power command versions for the API77 model and drives the production
 version checks. It makes no claim about a particular installed firmware image.
 This is a firmware table-ownership prerequisite, with the link inactive and
 transmit disabled. The subsequent management-queue owner is specified in §3.9.
-Active station PHY/link, management transmission, rate/key/BA/security,
-authenticated platform power/SAR, recovery and native Gen2 publication remain
-software work.
+Later qualified power, active-link and authentication stages are specified in
+§§3.11–3.13. Association, rate/key/BA/security, recovery and native Gen2
+publication remain software work.
 
 ### 3.9 Retained API77 management queue
 
@@ -495,9 +495,9 @@ Native RFH/TFH tests compose acknowledged disabled-peer ADD, actual queue
 allocation and source-matched DMA fields, native API-v2 response-fenced queue REMOVE and peer
 REMOVE. They also cover cancellation at both queue boundaries, malformed and
 foreign receipts, wrong queue/failure/reserved response fields, station/TID/idle
-rejection and actual CC77 metadata selection.
+rejection and authored API77 payload-version selection.
 These are software ownership results; active station admission, externally
-qualified platform power/SAR (§3.11), packet management exchanges,
+qualified platform power/SAR (§3.11), management beyond bounded authentication (§3.13),
 rate/key/BA/security, recovery and native Gen2 PCI publication remain gates.
 
 ### 3.10 Host NO_IR policy
@@ -601,8 +601,8 @@ SAR/link DMA bytes, fresh MCC, NVM/LAR flag differences, restrictive host overla
 policy tightening, source-capability revocation, receipt correlation, cancellation
 at each native wait and power-before-queue ordered retirement. Automatic Gen2
 station TX remains disabled. The retained active-link transition is specified
-in §3.12; TX-enabled peer transitions, management packet
-exchange and rate/key/BA/security, recovery, PM and native PCI station publication
+in §3.12 and the exclusive authentication TX window in §3.13. Association,
+rate/key/BA/security, recovery, PM and native PCI station publication
 remain unimplemented gates. No physical SAR, RF compliance or hardware readiness
 claim follows from these software checks.
 
@@ -668,7 +668,8 @@ failures make the owner terminal without releasing uncertain resources.
 cck_response_rates, ofdm_response_rates }` only after those receipts while the
 source capability remains current. This is firmware-receipt metadata, not
 carrier, association, a controlled port or continuing TX authority. There is no
-management/data submission surface and the peer remains TX-disabled. Host
+general management/data submission surface and the peer remains TX-disabled
+except during the explicitly retained authentication operation in §3.13. Host
 policy changes after publication require fresh admission before a future active
 operation; neither a cached status nor BSS entry can supply that authority.
 
@@ -691,9 +692,64 @@ fresh firmware permissions, source revocation, each cancelled native wait,
 malformed/foreign receipts, final-publication tightening and closing after
 revocation. These tests use explicit isolated policy/qualification fixtures;
 they cannot authorize real hardware. No reset, DMA reclamation or autonomous RF
-quiescence follows from host failure. TX-enabled peer setup, actual management
-exchange, complete Gen2 TX/completion/MLME ownership, rate/key/BA/security,
+quiescence follows from host failure. Association and subsequent management,
+complete Gen2 data/completion/MLME ownership, rate/key/BA/security,
 recovery/PM and native PCI station publication remain separate gates.
+
+### 3.13 Retained API77 open-system authentication exchange
+
+`Owner::authenticate_open().await -> Result<AuthenticationStatus, _>` requires
+the acknowledged `LinkActive` owner, current signed NIPW power qualification,
+the exact idle station0/TID15 native queue and the original observed AP/rates.
+It returns `AuthenticationStatus { bssid, channel, status }`, preserving the
+AP's real status code (including rejection). This is protocol metadata: it
+does not publish association, carrier, a security state or a packet capability.
+
+The implemented firmware profile is explicit: TX command9, long-group TX
+notification6–8, RX-MPDU notification4 and TLC-update notification3. These are
+Linux `mvm/ops.c`'s mutually consistent rates-v2 indicators, with pre-AX210
+`iwl_tx_cmd_v9`'s20-byte parameters and48-byte single-frame TX response. Missing,
+inconsistent or newer unsupported layouts fail before any peer mutation. The
+rate comes from the lowest observed AP basic bitrate and one actual NVM TX
+antenna; legacy rates-v2 and v3 share these modulation/index/antenna bits. No
+PLCP/rates-v1 assumption or inferred adaptive-rate configuration is used.
+
+Before its first wait, the owner reserves `Authenticating`. It requeries MCC
+when applicable, rechecks current host NO_IR/DFS/overlap/power and firmware
+VALID/ACTIVE/20MHz/no-radar permission, and discards pre-attempt RX. It then
+sends ADD_STA v12 MODIFY with only `STA_FLG_DISABLE_TX` masked and cleared,
+requiring the native four-byte ADD_STA-success receipt. All association,
+class/auth, aggregation, key and other station flags remain unchanged.
+
+Only this private producer can use the resulting TX window. It posts one
+30-byte unprotected Authentication Request (open-system algorithm0,
+transaction1) through the retained TFH queue, using explicit firmware command
+rate and encryption-disable flags. It waits for an actual valid single-frame
+TX receipt and then for a CRC/overrun-checked RX48 Authentication Response with
+matching channel, local RA, AP TA/BSSID, algorithm0 and transaction2. Foreign,
+fragmented, protected, unsupported +HTC/Order, A-MSDU and structurally invalid responses cannot complete
+the exchange. The TX and AP-response waits are each bounded at two seconds.
+Source capability and host power authority are sampled before each native
+enable/TX/receive poll, and complete firmware/host predicates at each stage.
+
+Before returning either AP success or rejection, the owner sends ADD_STA MODIFY
+with TX-disable set again, requires its exact success receipt and the same idle
+queue, and rechecks current authority before restoring `LinkActive`. Closing
+does not require continuing TX permission; revoked authority still prevents
+publication after its receipt. `deactivate_link` and all resource retirement
+remain unavailable throughout the exchange.
+
+Cancellation retains `Authenticating`, the exact peer/link/power/queue and any
+pending command or packet DMA. Late receipts cannot replay, reopen, deactivate
+or release that owner. A malformed receipt, failed TX, response timeout or
+authority loss makes the owner terminal; this does not prove RF quiescence.
+Six native Rust smokes compose the acknowledged power/link prerequisites with
+real peer enable, packet DMA, native TX receipt, AP RX and re-disable. They cover
+AP rejection, independent literal wire/rate expectations, each cancellation and
+authority boundary, failed receipts, profile rejection and malformed/foreign
+RX. No automatic Gen2 station admission is enabled. Association, authenticated
+station state, adaptive data rates, keys/BA/controlled-port security, recovery,
+PM and native PCI publication still require their complete owner chains.
 
 ## 4. References
 

@@ -1063,6 +1063,7 @@ pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     /// A WMI event for vdev 1 must not be consumed and discarded by a task
     /// currently waiting on vdev 0.
     events: Vec<VecDeque<Vec<u8>>>,
+    tx_power_stats: Arc<IrqSafeSpinLock<super::fw_stats::State>>,
 }
 
 /// A synchronous port call, applied at the next locked step.
@@ -1167,6 +1168,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             crash_flush: false,
             reset: ResetState::default(),
             events,
+            tx_power_stats: Arc::new(IrqSafeSpinLock::new(super::fw_stats::State::default())),
         }
     }
 
@@ -1766,6 +1768,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     /// with the firmware's peer. Nothing is freed that the hardware may
     /// still use: rings and buffers wait for the restart.
     pub fn pre_reconfigure_recovery(&mut self) {
+        self.tx_power_stats.lock().invalidate();
         self.crash_flush = true;
         self.core.hif.ce.crash_flush = true;
         self.dp.crash_flush = true;
@@ -2337,6 +2340,14 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     fn route_wmi_events(&mut self) {
         while let Some(event) = self.core.take_event() {
             let frame = event.frame;
+            if let Ok((super::wmi_ids::WMI_UPDATE_STATS_EVENTID, payload)) =
+                wmi::split_event(&frame)
+            {
+                if let Ok(receipt) = super::fw_stats::decode(payload) {
+                    self.tx_power_stats.lock().receive(receipt, self.now_ms());
+                }
+                continue;
+            }
             let target = match wmi::decode_event(&frame) {
                 Ok(wmi::WmiEvent::VdevStartResp(event)) => Some(event.vdev_id),
                 Ok(wmi::WmiEvent::VdevStopped(vdev_id)) => Some(vdev_id),
@@ -2546,6 +2557,8 @@ pub struct Shared<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     bss_surveys: IrqSafeSpinLock<Vec<BssSurvey>>,
     /// Coalesced `GET_SURVEY` refresh demand from synchronous netlink dumps.
     bss_survey_requested: AtomicBool,
+    tx_power_requested: AtomicBool,
+    tx_power_stats: Arc<IrqSafeSpinLock<super::fw_stats::State>>,
     /// Desired pdev chain masks selected through `NL80211_CMD_SET_WIPHY`.
     /// They outlive WMI restart so every freshly-created MAC derives the
     /// same HT/VHT/HE NSS policy before it adds a vdev.
@@ -2599,6 +2612,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         let clock = rt.core.hif.clock;
         let max_msg_len = rt.core.wmi_ep.map_or(0, |e| e.max_msg_len);
         let wmi_send_ms = rt.core.cfg.wmi_send_ms;
+        let tx_power_stats = rt.tx_power_stats.clone();
         Arc::new(Shared {
             rt: Mutex::new(Some(rt)),
             irq,
@@ -2621,6 +2635,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             bios_sar_table: IrqSafeSpinLock::new(None),
             bss_surveys: IrqSafeSpinLock::new(Vec::new()),
             bss_survey_requested: AtomicBool::new(false),
+            tx_power_requested: AtomicBool::new(false),
+            tx_power_stats,
             antenna_config: IrqSafeSpinLock::new(None),
             antenna_programmed_generation: AtomicU32::new(0),
             rts_config: IrqSafeSpinLock::new((RTS_THRESHOLD_OFF, 0)),
@@ -2812,6 +2828,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             }
         }
         if count <= 2 {
+            if old != frequency_mhz {
+                self.tx_power_stats.lock().invalidate();
+            }
             Some(old)
         } else {
             channels[vdev_id as usize] = old;
@@ -2823,7 +2842,11 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// mutex serializes transitions from that vdev.
     pub fn restore_operating_channel(&self, vdev_id: u32, frequency_mhz: u32) {
         if (vdev_id as usize) < WCN6855_MAX_VDEVS {
-            self.operating_channels.lock()[vdev_id as usize] = frequency_mhz;
+            let mut channels = self.operating_channels.lock();
+            if channels[vdev_id as usize] != frequency_mhz {
+                channels[vdev_id as usize] = frequency_mhz;
+                self.tx_power_stats.lock().invalidate();
+            }
         }
     }
 
@@ -2838,6 +2861,84 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// owns the WMI send and event dispatch.
     pub fn request_bss_survey(&self) {
         self.bss_survey_requested.store(true, Ordering::Release);
+    }
+
+    /// Coalesce synchronous GET_INTERFACE demand across all sibling vdevs.
+    pub fn request_tx_power(&self) {
+        self.tx_power_requested.store(true, Ordering::Release);
+    }
+
+    pub fn take_tx_power_request(&self) -> bool {
+        self.tx_power_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Latest complete physical-pdev measurement, valid for one second.
+    /// The caller retains its normal vdev fallback when no sample is current.
+    pub fn firmware_tx_power_dbm(&self) -> Option<i32> {
+        if self.is_dead() {
+            return None;
+        }
+        self.tx_power_stats.lock().cached(self.now_ms())
+    }
+
+    /// Serialize the untagged PDEV statistics transaction in the physical
+    /// runtime. Send/credit waits service CE/HTC/DP with the lock released.
+    /// A dropped future leaves its reservation, even before publication;
+    /// only a genuine response or a completed reset can permit replacement.
+    pub async fn refresh_tx_power(&self, pdev_id: u32) -> Result<(), i32> {
+        // The ordered MAC worker supplies the live on-channel predicate.
+        // The interface-combination reservation cache is not firmware's
+        // channel state and may be empty while an associated MAC is replayed.
+        if self.is_dead() {
+            return Ok(());
+        }
+        let Some(token) = self.tx_power_stats.lock().begin(pdev_id, self.now_ms()) else {
+            return Ok(());
+        };
+        let command = super::fw_stats::request(pdev_id);
+        let deadline = self.now_ms().saturating_add(self.wmi_send_ms);
+        loop {
+            let error = {
+                let mut rt = self.lock().await;
+                // Physical reset may have replaced the untagged transaction
+                // while this old worker awaited the lock/credits. It must
+                // never post into, mark or roll back the successor's owner.
+                if !self.tx_power_stats.lock().owns(token) {
+                    return Err(ESHUTDOWN);
+                }
+                rt.service();
+                rt.route_wmi_events();
+                if rt.crash_flush || rt.wowlan_suspended {
+                    ESHUTDOWN
+                } else if rt
+                    .vdevs
+                    .iter()
+                    .any(|v| v.txq.stop_reasons(0) & (1 << txq::reason::DFS_CAC) != 0)
+                {
+                    super::mac::errno::EBUSY
+                } else {
+                    match rt.core.wmi_cmd_try_send(&command) {
+                        Ok(()) => {
+                            self.tx_power_stats.lock().published(token, self.now_ms());
+                            return Ok(());
+                        }
+                        Err(error) => error,
+                    }
+                }
+            };
+            let retry = {
+                let rt = self.lock().await;
+                !rt.crash_flush && rt.core.wmi_send_retryable(error)
+            };
+            let now = self.now_ms();
+            if !retry || now >= deadline {
+                self.tx_power_stats.lock().send_failed(token);
+                return Err(error);
+            }
+            self.irq
+                .wait(((deadline - now) as u32).min(self.slice_ms))
+                .await;
+        }
     }
 
     /// Claim a pending survey request for one runtime worker.
@@ -2924,6 +3025,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// its ordered vdev worker; this copy is intentionally retained across a
     /// reset because firmware loses all pdev policy state there.
     pub fn set_bios_sar_table(&self, table: [u8; wmi::BIOS_SAR_TABLE_LEN]) {
+        self.tx_power_stats.lock().invalidate();
         *self.bios_sar_table.lock() = Some(table);
     }
 
@@ -3133,6 +3235,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         self.scan_owner.store(0, Ordering::Release);
         self.scan_cancel.store(0, Ordering::Release);
         self.bss_survey_requested.store(false, Ordering::Release);
+        self.tx_power_requested.store(false, Ordering::Release);
+        self.tx_power_stats.lock().invalidate();
         // Desired controls survive a firmware reset, but no newly rebuilt
         // pdev has received their current antenna generation yet.
         self.antenna_programmed_generation
@@ -3221,6 +3325,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             }
         };
         let mut rt = Rt::new(core, dp);
+        // A completed physical transport reset terminates old untagged
+        // statistics transactions; reuse the physical cache identity.
+        self.tx_power_stats.lock().reset();
+        rt.tx_power_stats = self.tx_power_stats.clone();
         // mac80211's queues (still stopped for the driver) and the
         // statuses not yet reported survive the restart.  Keep that state
         // per vdev so a restart cannot deliver vdev 1's requested-TX

@@ -791,12 +791,46 @@ single compatible VHT, HE or HT MCS becomes `WMI_PEER_PARAM_FIXED_RATE`; an
 unrestricted/multi-rate policy clears that override. The policy is retained
 by `Ath11kNetdev` across `Mac::new` during reset and is installed before
 future STA/AP peer association, matching `ath11k_vif::bitrate_mask`.
-`Ath11kNetdev::tx_power_dbm` is the read-only `get_txpower` fallback: its
-try-lock snapshot returns the active vdev's retained `bss_conf.txpower`
-equivalent, which `GET_INTERFACE` publishes as the signed-mBm
-`NL80211_ATTR_WIPHY_TX_POWER_LEVEL`. It deliberately does not issue a
-firmware stats request from the netlink read path; if no vdev has established
-a channel, the attribute is absent, as an unavailable driver measurement.
+`Ath11kNetdev::tx_power_dbm` returns the latest complete physical-pdev firmware
+power sample, falling back to the active vdev's retained `bss_conf.txpower`
+equivalent when no sample is current. `GET_INTERFACE` publishes that dBm value
+as signed mBm in `NL80211_ATTR_WIPHY_TX_POWER_LEVEL`. Its synchronous read
+coalesces a refresh for the ordered runtime worker; it never waits for WMI in
+the netlink syscall. `Mac::tx_power_query_pdev` requires a started vdev with a
+channel, idle scan and no DFS CAC; the physical runtime additionally checks
+sibling CAC before sending. With no channel and no fallback, the attribute is
+absent.
+
+`Shared::refresh_tx_power(pdev_id)` owns one physical untagged statistics
+transaction across all vdevs, after the ordered caller validates its actual MAC
+channel context; the interface-combination reservation cache is not used as
+firmware channel proof during reconstruction. It posts `WMI_REQUEST_STATS_CMDID` with
+`WMI_REQUEST_PDEV_STAT`, vdev0, zero peer and the exact pdev, using the real
+CE/HTC/WMI credit/command path. It accepts only a checked `WMI_UPDATE_STATS`
+header44 with precisely one pdev, no other announced records, and one ordered
+228-byte ARRAY_BYTE record (base7/TX35/RX15 dwords). Duplicate/missing/truncated
+TLVs, malformed inventories, unsolicited responses and a foreign pdev cannot
+publish a sample or retire the request. `chan_tx_pwr` is base dword6, divided
+by two as Linux's integral-dBm readback; it is firmware's reported minimum
+after target/CTL/regulatory/PSD constraints, never a new host TX grant.
+
+Samples remain current for one second. Channel reservations/rollback/release,
+new BIOS SAR state and firmware-crash/reconstruction invalidate the cache.
+An invalidation retains an outstanding request but prevents its old response
+from entering the next channel's cache. Firmware supplies no request nonce:
+cancelled or expired transactions are not reused until their genuine terminal
+receipt or a completed physical transport reset. A cancelled pre-publication
+lock waiter therefore conservatively needs reset. A known native send failure
+permits retry only when no command was published. A monotonic transaction token
+is checked under the runtime lock before every native send; an old lock/credit
+waiter cannot post into, publish or roll back a successor after physical reset.
+This cache owns no DMA and
+does not reclaim transport allocations. Two portable native wire/state smokes
+and four real CE/HTC/WMI integration smokes cover literal geometry, malformed
+events, WCN6855/QCA6390 readback, fallback, coalescing, cancelled lock ownership,
+native send failure, late receipts, cache invalidation and an actual native
+firmware reset with an unscheduled old waiter and fresh successor. Composed integration
+fixtures remain x86-only; portable wire/state tests run on both architectures.
 Before a management frame enters WMI, ath11k mirrors
 `ath11k_mac_mgmt_action_frame_fill_elem_data`: for Radio Measurement Link
 Measurement Request it fills the current and regulatory/hardware-maximum
