@@ -208,6 +208,26 @@ pub fn any_extend_observed() -> bool {
     EXTEND_OBSERVED.load(Ordering::Acquire)
 }
 
+/// Install the measurement hooks the TPM attestation surface
+/// (`narf_tpm::attest`) consults: this module's TCG event-log
+/// encoder (served to userspace as the sysfs
+/// `binary_bios_measurements` node) and [`any_extend_observed`]
+/// (the flag the quote composition refuses on when no extend has
+/// been recorded this boot).
+///
+/// Called once from the measured-boot initcall in `bare_main`,
+/// before that pass's own extends run. The hooks are plain
+/// function pointers to the two pure readers above — installing
+/// them changes no measurement semantics; it only publishes, to
+/// the crates that cannot name `frame` (the dependency runs the
+/// other way), state this module already maintains.
+pub fn install_attestation_hooks() {
+    narf_tpm::attest::install_measurement_hooks(narf_tpm::attest::MeasurementHooks {
+        event_log: tcg_event_log_encode,
+        extends_observed: any_extend_observed,
+    });
+}
+
 /// Whether measured-boot extends dispatch to a hardware TPM.
 ///
 /// `true` when at least one device is registered in
@@ -590,6 +610,47 @@ fn smoke_measure_tcg_event_log_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("frame/measure", smoke_measure_tcg_event_log_round_trip);
+
+fn smoke_measure_attestation_hooks_publish_state() -> TestResult {
+    __reset_for_test();
+    narf_tpm::attest::__reset_measurement_hooks_for_test();
+    install_attestation_hooks();
+    // Before any extend: the guard hook reports the untouched
+    // state (the quote composition refuses on exactly this), and
+    // the log hook serves the encoder's (empty) output.
+    if narf_tpm::attest::extends_observed() {
+        return TestResult::Fail("extends observed before any extend");
+    }
+    if narf_tpm::attest::event_log_bytes() != tcg_event_log_encode() {
+        return TestResult::Fail("event log hook != tcg_event_log_encode (empty)");
+    }
+    let d = [0xCDu8; 32];
+    record_owned(
+        7,
+        EV_IPL,
+        alloc::string::ToString::to_string("hook-event"),
+        &d,
+        7,
+    );
+    if narf_tpm::attest::event_log_bytes() != tcg_event_log_encode()
+        || narf_tpm::attest::event_log_bytes().is_empty()
+    {
+        return TestResult::Fail("event log hook does not serve the recorded log");
+    }
+    if extend_shadow(4, &d).is_none() {
+        return TestResult::Fail("extend_shadow(4) rejected");
+    }
+    if !narf_tpm::attest::extends_observed() {
+        return TestResult::Fail("extend not observed through the installed hook");
+    }
+    narf_tpm::attest::__reset_measurement_hooks_for_test();
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/measure",
+    smoke_measure_attestation_hooks_publish_state
+);
 
 fn smoke_measure_initramfs_event_records_pcr_6() -> TestResult {
     __reset_for_test();

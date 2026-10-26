@@ -3354,6 +3354,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // Stage::Late initcalls: FB console + virtio-gpu splash.
             narf_init::register(narf_init::Stage::Late, "measured-boot", || {
                 narf_scheduler::spawn(async move {
+                    // Attestation hooks (#945): publish the
+                    // measurement log + extend-observed flag to
+                    // `narf_tpm::attest` before this pass's own
+                    // extends run, so the quote composition and
+                    // the sysfs event-log node consult live state.
+                    measure::install_attestation_hooks();
                     let _ = writeln!(
                         console::Writer,
                         "  measured-boot: starting hardware attestation..."
