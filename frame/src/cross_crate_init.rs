@@ -411,6 +411,7 @@ fn install_net_stack() {
     // forever, adding ~one-round (~230 µs) of latency to every request on
     // the OTHER NIC. PARK ~1 ms on the wheel after an empty drain so the
     // executor can halt; tight-poll only while frames are flowing.
+    #[cfg(feature = "drivers-net")]
     narf_scheduler::spawn_stackful(async {
         let idle_park_cycles = narf_time::ns_to_cycles(1_000_000);
         loop {
