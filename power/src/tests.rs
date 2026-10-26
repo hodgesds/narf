@@ -3359,11 +3359,13 @@ fn smoke_power_shutdown_syncs_before_device_hooks() -> TestResult {
     if synced != ["other-device", "nvme-flush+shn"] {
         return TestResult::Fail("an already-synced transition must still run every hook");
     }
-    // The production sync step is installed (userspace wait_init) in a
-    // kernel that has the syscall layer, which every kernel-test image does.
-    if saved_sync.is_none() {
-        return TestResult::Fail("no pre-shutdown sync installed: reboot would skip the fs sync");
-    }
+    // The production sync step's install wiring is asserted by the
+    // userspace suite (`smoke_userspace_wait_init_installs_pre_shutdown_sync`):
+    // the installer is userspace's boot init, which lives above this crate
+    // and — in a kernel-test boot — runs only when a userspace test
+    // establishes it, so this smoke's verdict must not depend on which
+    // other suites shared the boot. The swaps above restored whatever was
+    // installed (production hook or none) verbatim.
     TestResult::Pass
 }
 kernel_test_in!(
