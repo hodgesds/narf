@@ -3795,9 +3795,8 @@ fn connector_color_property(
             if native.and_then(|n| n.color_format).is_none() {
                 return Err(FsError::InvalidData);
             }
-            change.color_format = Some(
-                crate::drm::card::ColorFormat::from_linux(value).ok_or(FsError::InvalidData)?,
-            );
+            change.color_format =
+                Some(crate::drm::card::ColorFormat::from_linux(value).ok_or(FsError::InvalidData)?);
         }
         COLORSPACE_PROP_ID => {
             if native.and_then(|n| n.colorspace).is_none()
@@ -4430,8 +4429,7 @@ fn handle_obj_getproperties(
         let card = mode_state.lock();
         // A native card's plane (primary or overlay): the core plane
         // properties from its state, then amdgpu_dm's.
-        let native: Option<crate::drm::atomic::PlaneState> = (obj_type
-            == DRM_MODE_OBJECT_PLANE)
+        let native: Option<crate::drm::atomic::PlaneState> = (obj_type == DRM_MODE_OBJECT_PLANE)
             .then(|| {
                 #[cfg(feature = "amdgpu")]
                 {
@@ -5566,7 +5564,8 @@ fn atomic_commit(
             crate::drm_native_planes::commit(&mut card, &state);
             #[cfg(feature = "amdgpu")]
             {
-                cursor_requests = native_cursor_requests(card_index, &mut card, &cursors, &prepared);
+                cursor_requests =
+                    native_cursor_requests(card_index, &mut card, &cursors, &prepared);
             }
             for &(connector, value) in &broadcast_rgb {
                 apply_broadcast_rgb(card_index, &mut card, connector, value);
@@ -5825,9 +5824,7 @@ fn atomic_commit(
             present_frame(
                 card_index,
                 crtc_id,
-                crate::drm::card::PlaneFrame::linear(
-                    src_phys, pitch, width, height, format,
-                ),
+                crate::drm::card::PlaneFrame::linear(src_phys, pitch, width, height, format),
                 flip_ticket,
             );
         } else {
@@ -7276,10 +7273,7 @@ pub(crate) fn scanout_frame(
 }
 
 /// Framebuffer `fb` (backed at `phys`) as the presenter copies it.
-fn fb_frame(
-    fb: &crate::drm::card::Framebuffer,
-    phys: u64,
-) -> crate::drm::card::PlaneFrame {
+fn fb_frame(fb: &crate::drm::card::Framebuffer, phys: u64) -> crate::drm::card::PlaneFrame {
     crate::drm::card::PlaneFrame {
         phys,
         pitch: fb.pitch,
@@ -7301,8 +7295,7 @@ fn present_native_planes(
     card_index: u32,
     crtc_id: u32,
     primary: Option<crate::drm::card::PlaneFrame>,
-    overlays: [Option<crate::drm::card::PlaneFrame>;
-        crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+    overlays: [Option<crate::drm::card::PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
     ticket: Option<u64>,
 ) {
     let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) else {

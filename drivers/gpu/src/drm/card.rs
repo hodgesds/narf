@@ -1726,10 +1726,7 @@ impl Card {
     /// (`amdgpu_dm_modifiers::check_fb_cmd` / `check_amdgpu_fb`: format and
     /// modifier on a plane, one BO, tiling flags without modifiers, sizes);
     /// other cards take one plane, LINEAR only.
-    pub fn addfb2_cmd(
-        &mut self,
-        cmd: &crate::drm::fb_cmd::FbCmd,
-    ) -> Result<u32, CardError> {
+    pub fn addfb2_cmd(&mut self, cmd: &crate::drm::fb_cmd::FbCmd) -> Result<u32, CardError> {
         let (width, height, gem_handle) = (cmd.width, cmd.height, cmd.handles[0]);
         let pitch = cmd.pitches[0];
         let (offsets, chroma_pitch, modifier) = if self.gfx12_modifiers {
@@ -1739,18 +1736,18 @@ impl Card {
                 let info = m::check_fb_cmd(cmd).map_err(|_| CardError::InvalidDimensions)?;
                 let object = self.gem.lookup(gem_handle).ok_or(CardError::BadGemHandle)?;
                 let bo_size = self
-                .dumb_backings
-                .iter()
-                .find(|b| b.gem_handle == gem_handle)
-                .map_or(object.size as u64, |b| b.byte_len as u64);
+                    .dumb_backings
+                    .iter()
+                    .find(|b| b.gem_handle == gem_handle)
+                    .map_or(object.size as u64, |b| b.byte_len as u64);
                 let (tiling, dcc) = self
-                .bo_tiling
-                .iter()
-                .find(|t| t.0 == gem_handle)
-                .map_or((0, false), |t| (t.1, t.2));
+                    .bo_tiling
+                    .iter()
+                    .find(|t| t.0 == gem_handle)
+                    .map_or((0, false), |t| (t.1, t.2));
                 let formats = self.plane_formats.unwrap_or(&[]);
                 let modifier = m::check_amdgpu_fb(cmd, &info, formats, tiling, dcc, bo_size)
-                .map_err(|_| CardError::UnknownFormat)?;
+                    .map_err(|_| CardError::UnknownFormat)?;
                 let two = info.num_planes == 2;
                 (
                     [cmd.offsets[0], if two { cmd.offsets[1] } else { 0 }],

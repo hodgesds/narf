@@ -14201,7 +14201,4 @@ fn smoke_gpu_vendor_feature_registration_census() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/gpu",
-    smoke_gpu_vendor_feature_registration_census
-);
+kernel_test_in!("drivers/gpu", smoke_gpu_vendor_feature_registration_census);

@@ -262,7 +262,10 @@ impl Request {
             #[cfg(feature = "amdgpu")]
             fbs.push((id, fb.bo.as_ref().map(|bo| bo.object.clone())));
             #[cfg(not(feature = "amdgpu"))]
-            fbs.push((id, { let _ = fb; None }));
+            fbs.push((id, {
+                let _ = fb;
+                None
+            }));
         }
         let cursor = match self {
             Self::Cursor(_, bo) => bo.clone(),

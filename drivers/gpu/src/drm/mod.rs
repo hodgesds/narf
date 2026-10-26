@@ -28,8 +28,8 @@
 
 pub mod atomic;
 pub mod card;
-pub mod fb_cmd;
 pub mod edid_gen;
+pub mod fb_cmd;
 pub mod gem;
 pub mod ioctl;
 pub mod prime;
