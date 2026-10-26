@@ -2,7 +2,8 @@
 
 > Status: **v0.6** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
-> owned contiguous scanout, Gen12 display gate).
+> owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
+> command submission landed — see §8).
 >
 > Clean-room driver for Intel integrated graphics from Tiger Lake
 > through Meteor Lake. **No GPL Linux `i915` / `xe` source
@@ -53,9 +54,9 @@ The volume layout is stable across Gen12 (TGL / ADL / RPL):
 
 | Vol | Title                                | Used by               |
 | --- | ------------------------------------ | --------------------- |
-| 2a  | Command Reference: Instructions      | (3D — out of scope)   |
-| 2c  | Command Reference: Engines           | (3D — out of scope)   |
-| 5   | Memory Views                         | `intel_gpu_gtt`       |
+| 2a  | Command Reference: Instructions      | `intel_gpu_rcs` (MI command codecs) |
+| 2c  | Command Reference: Engines           | `intel_gpu_rcs` (execlists / LRC model) |
+| 5   | Memory Views                         | `intel_gpu_gtt`, `intel_gpu_rcs` |
 | 11  | Display Engine Registers             | `intel_gpu_pll`       |
 | 12  | Display DDIs / Plane Programming     | `intel_gpu_ddi`, `intel_gpu_gmbus` |
 | 14  | Display Engine                       | `intel_gpu_pipes`     |
@@ -120,10 +121,13 @@ Stage-3 driver core consumes these codecs through the
 - PPGTT page-table walks per the PRM memory model.
 - Single-rectangle scanout from a CPU-mapped buffer.
 
-### Stage 5+ (future) — 3D / compute (TGL only)
-- Command streamer (RCS0) ring submission.
-- Limited 3D pipeline using the public PRM. Out of scope for
-  v1; the kernel-resident driver only needs a display surface.
+### Stage 5+ (partially landed) — 3D / compute (TGL only)
+- Command streamer (RCS0) ring submission — **landed** as the
+  execlists path in `intel_gpu_rcs` (§8). GGTT addressing only.
+- Remaining: PPGTT per-context page tables, media engines,
+  full 3D pipeline state. Out of scope for v1; the
+  kernel-resident driver only needs a display surface plus
+  batch submission.
 
 ## 5. PCI device ID table
 
@@ -223,3 +227,59 @@ DDI A / eDP, single pipe):
   protocol the AMD display pipeline uses, and the DRM card
   carries real KMS mode state (CRTC 1, encoder 2 TMDS,
   connector 3 eDP) instead of the identity stub.
+
+## 8. Command submission (Stage 5 — `intel_gpu_rcs`)
+
+The RCS0 execlists engine for Gen12. Compiled only under the
+gpu crate's `intel` feature. Public interface:
+
+- `RcsEngine::new(mmio, alloc)` — allocate the engine status
+  page, program `RING_HWS_PGA`, adopt the hardware CSB write
+  pointer. Generic over `MmioWindow` + `GpuAllocator` so the
+  protocol is fixture-drivable without a BAR; production uses
+  `BarWindow` + `GgttArena`.
+- `create_context() -> ContextId` / `destroy_context(id)` —
+  a context owns a 48-page LRC image (register-state template
+  on page 1), a 128 KiB ring, and a 1-page HWSP. Handles pack
+  slot + generation; a stale handle is `UnknownContext`, never
+  an alias. Destroy refuses (`ContextBusy`) while the context
+  is loaded or has work queued/in flight.
+- `write_batch(dwords) -> BatchBuf` — GGTT batch allocation;
+  the batch must end with `MI_BATCH_BUFFER_END`.
+- `submit(ctx, batch) -> request id` — appends
+  `MI_BATCH_BUFFER_START` (GGTT) + an `MI_STORE_DWORD_IMM`
+  breadcrumb (per-context seqno) to the ring, advances the
+  image tail, and pumps the execlist ports. The context must
+  be idle: this driver never patches an image the hardware
+  may be restoring or saving, so re-submitting to a loaded
+  context is `ContextBusy` (queued-but-unloaded contexts
+  accept further submits and are covered together).
+- `poll_completions() -> Vec<CompletedRequest>` — drains the
+  Gen12 CSB from the engine status page (promote / preempt /
+  complete), retires requests, frees batch allocations, and
+  pumps the next ports. `wait_seqno` is the bounded-poll
+  wrapper. Production glue: `submit_dwords` /
+  `poll_default_completions` attach lazily to the probed
+  controller on a default context.
+
+Invariants:
+
+- ELSP writes are always full pairs in hardware order
+  (port 1 high/low, port 0 high/low, posting read); a zero
+  descriptor marks an empty port.
+- Contexts address via GGTT only: descriptor mode
+  Legacy-64B, PDP image fields zero, batch ASI = GGTT. PPGTT
+  is a separate lane and is not absorbed here.
+- A context's requests retire strictly in submission order;
+  a preempted context's covered requests return to the queue
+  front and are resubmitted, never retired early.
+- Every allocation (image / ring / HWSP / batch / status
+  page) is arena-accounted; destroy and retirement return
+  the arena to its prior balance.
+
+Flagged for first-silicon verification (single named
+constants in `intel_gpu_rcs`): `CSB_ENTRIES` = 8 (Gen11+
+CSB depth), `RCS_IMAGE_PAGES` = 48 (allocation bound above
+the hardware image size), and the descriptor Legacy-64B
+mode choice.
+
