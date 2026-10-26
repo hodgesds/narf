@@ -288,6 +288,13 @@ pub unsafe fn init() -> Result<(), InitError> {
 
     // Register the PS/2 mouse as an evdev device.
     let mut caps = DeviceCaps::new();
+    caps.set_identity(
+        "PS/2 Generic Mouse",
+        "isa0060/serio1/input0",
+        "",
+        narf_input::evdev::InputId::new(narf_input::evdev::bus::I8042, 0x0002, 0x0001, 0),
+    );
+    caps.add_prop(narf_input::evdev::prop::POINTER);
     caps.add_rel(rel::REL_X);
     caps.add_rel(rel::REL_Y);
     caps.add_key(key::BTN_LEFT);

@@ -43,6 +43,7 @@ mod firmware_assets;
 mod firmware_parser_tests;
 pub mod firmware_transport;
 pub mod fwdl;
+pub(crate) mod ht20;
 pub mod mac;
 pub mod mcu;
 mod packet_tx;

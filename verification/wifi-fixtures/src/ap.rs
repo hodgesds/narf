@@ -24,7 +24,7 @@ pub enum ApError {
     Mic,
 }
 
-/// A deterministic legacy 2.4-GHz Open/WPA2-PSK/CCMP access point.
+/// A deterministic legacy Open/WPA2-PSK/CCMP access point.
 ///
 /// Fixed PMK/nonces belong only to fixtures. The AP checks M2 and M4 MICs and
 /// replay counters; it does not invoke the station MLME or supplicant. Device
@@ -39,6 +39,7 @@ pub struct FakeAp {
     ptk: Option<Ptk>,
     phase: ApPhase,
     basic_1mbps: bool,
+    rates: Option<Vec<u8>>,
 }
 
 impl core::fmt::Debug for FakeAp {
@@ -91,6 +92,7 @@ impl FakeAp {
         if ssid.is_empty()
             || ssid.len() > 32
             || !(1..=11).contains(&channel)
+                && !matches!(channel, 36 | 40 | 44 | 48 | 149 | 153 | 157 | 161 | 165)
             || !(1..=2007).contains(&aid)
             || plan.station == plan.bssid
             || [plan.station, plan.bssid]
@@ -109,6 +111,7 @@ impl FakeAp {
             ptk: None,
             phase: ApPhase::Authentication,
             basic_1mbps: false,
+            rates: None,
         })
     }
 
@@ -116,18 +119,59 @@ impl FakeAp {
     /// authentication. Default constructors retain their OFDM6/12/24 profile.
     /// This configures only the fake peer; it grants no driver/radio authority.
     pub fn with_basic_1mbps(mut self) -> Result<Self, ApError> {
-        if self.phase != ApPhase::Authentication || self.ptk.is_some() {
+        if self.phase != ApPhase::Authentication || self.ptk.is_some() || self.channel > 14 {
             return Err(ApError::Phase);
         }
         self.basic_1mbps = true;
+        self.rates = None;
         Ok(self)
     }
 
-    fn basic_rates(&self) -> &'static [u8] {
-        if self.basic_1mbps {
+    /// Configure literal IEEE Supported Rates (the high bit marks basic
+    /// rates). Only actual legacy CCK/OFDM values, unique entries and a basic
+    /// subset are admitted. Five-GHz fixtures cannot offer CCK. This configures
+    /// the independent AP and grants no station/device/regulatory authority.
+    pub fn with_legacy_rates(mut self, rates: &[u8]) -> Result<Self, ApError> {
+        if self.phase != ApPhase::Authentication || self.ptk.is_some() {
+            return Err(ApError::Phase);
+        }
+        let mut seen = 0u16;
+        let ieee = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+        if rates.is_empty() || rates.len() > 12 || !rates.iter().any(|r| r & 128 != 0) {
+            return Err(ApError::Configuration);
+        }
+        for rate in rates {
+            let index = ieee
+                .iter()
+                .position(|r| *r == rate & 127)
+                .ok_or(ApError::Configuration)?;
+            if seen & (1 << index) != 0 || self.channel > 14 && index < 4 {
+                return Err(ApError::Configuration);
+            }
+            seen |= 1 << index;
+        }
+        self.rates = Some(rates.to_vec());
+        Ok(self)
+    }
+
+    fn basic_rates(&self) -> &[u8] {
+        if let Some(rates) = &self.rates {
+            rates
+        } else if self.basic_1mbps {
             &[0x82]
         } else {
             &[0x8c, 0x98, 0xb0]
+        }
+    }
+
+    fn append_rates(&self, out: &mut Vec<u8>) {
+        let rates = self.basic_rates();
+        let first = rates.len().min(8);
+        out.extend_from_slice(&[1, first as u8]);
+        out.extend_from_slice(&rates[..first]);
+        if first != rates.len() {
+            out.extend_from_slice(&[50, (rates.len() - first) as u8]);
+            out.extend_from_slice(&rates[first..]);
         }
     }
 
@@ -181,8 +225,7 @@ impl FakeAp {
                 response.extend_from_slice(&self.capabilities().to_le_bytes());
                 response.extend_from_slice(&0u16.to_le_bytes());
                 response.extend_from_slice(&(self.aid | 0xc000).to_le_bytes());
-                response.extend_from_slice(&[1, self.basic_rates().len() as u8]);
-                response.extend_from_slice(self.basic_rates());
+                self.append_rates(&mut response);
                 if self.protected() {
                     let mut m1 = KeyFrame::empty(16);
                     m1.key_information = eapol::KI_KEY_TYPE_PAIRWISE
@@ -236,8 +279,7 @@ impl FakeAp {
     fn ies(&self) -> Vec<u8> {
         let mut out = vec![0, self.ssid.len() as u8];
         out.extend_from_slice(&self.ssid);
-        out.extend_from_slice(&[1, self.basic_rates().len() as u8]);
-        out.extend_from_slice(self.basic_rates());
+        self.append_rates(&mut out);
         out.extend_from_slice(&[3, 1, self.channel]);
         if self.protected() {
             out.extend_from_slice(&self.rsn_ie());

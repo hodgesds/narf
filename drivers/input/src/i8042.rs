@@ -381,6 +381,12 @@ pub unsafe fn init() -> Result<(), InitError> {
 
     // Register the i8042 keyboard as an evdev device.
     let mut caps = DeviceCaps::new();
+    caps.set_identity(
+        "AT Translated Set 2 keyboard",
+        "isa0060/serio0/input0",
+        "",
+        narf_input::evdev::InputId::new(narf_input::evdev::bus::I8042, 0x0001, 0x0001, 0),
+    );
     // Full scancode-set-1 range (codes 1..=127) + extended set.
     for c in 1u16..=127 {
         caps.add_key(c);

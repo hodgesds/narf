@@ -6,6 +6,18 @@ const OWN: [u8; 6] = [2, 3, 4, 5, 6, 7];
 const AP: [u8; 6] = [2, 8, 9, 10, 11, 12];
 const PMK: [u8; 32] = [0x55; 32];
 const ANONCE: [u8; 32] = [0xaa; 32];
+// IEEE WMM Parameter IE: BE/BK/VI/VO, no U-APSD/ACM. Native expected
+// TXOP values below are independently authored in microseconds (Linux
+// mac.c::ath10k_conf_tx multiplies the IEEE32-us value by32).
+const WMM_PARAMETERS: [u8; 26] = [
+    221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42, 0x43, 94, 0,
+    0x62, 0x32, 47, 0,
+];
+const WMM_WORDS: [u32; 24] = [
+    15, 1023, 3, 0, 0, 0, 15, 1023, 7, 0, 0, 0, 7, 15, 2, 3008, 0, 0, 3, 7, 2, 1504, 0, 0,
+];
+type TestPolicy =
+    alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<Option<narf_wireless::reg::RegulatoryDomain>>>;
 fn network() -> NetworkPlan {
     NetworkPlan {
         station: OWN,
@@ -60,6 +72,14 @@ pub(super) struct Fixture {
     next_attention: u32,
     next_peer: Option<u16>,
     next_tid: Option<u8>,
+    wmm_offer: Option<Vec<u8>>,
+    wmm_response: Option<Vec<u8>>,
+    wmm_words: [u32; 24],
+    wmm_sent: usize,
+    wmm_hold: bool,
+    wmm_fail: bool,
+    wmm_policy: Option<TestPolicy>,
+    qos_frames: usize,
 }
 impl core::fmt::Debug for Fixture {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -70,15 +90,26 @@ impl core::fmt::Debug for Fixture {
 }
 impl Fixture {
     fn new(secured: bool) -> Self {
+        Self::on_channel(secured, 1)
+    }
+    fn on_channel(secured: bool, channel: u8) -> Self {
         let ap = if secured {
-            FakeAp::wpa2(network(), b"narf", 1, 7, PMK, ANONCE)
+            FakeAp::wpa2(network(), b"narf", channel, 7, PMK, ANONCE)
         } else {
-            FakeAp::open(network(), b"narf", 1, 7)
+            FakeAp::open(network(), b"narf", channel, 7)
         }
         .unwrap();
         Self {
             automatic: false,
             control_phase: 0,
+            wmm_offer: None,
+            wmm_response: None,
+            wmm_words: WMM_WORDS,
+            wmm_sent: 0,
+            wmm_hold: false,
+            wmm_fail: false,
+            wmm_policy: None,
+            qos_frames: 0,
             group_replies: 0,
             server: DhcpServer::new(network()),
             ap,
@@ -99,7 +130,14 @@ impl Fixture {
         }
     }
     pub(super) fn beacon(&self) -> Vec<u8> {
-        self.ap.beacon()
+        let mut frame = self.ap.beacon();
+        if let Some(wmm) = &self.wmm_offer {
+            frame.extend_from_slice(wmm);
+        }
+        frame
+    }
+    fn qos(&self) -> bool {
+        self.wmm_offer.is_some() && self.wmm_response.is_some()
     }
     fn react(&mut self, frame: &[u8]) -> Result<bool, BmiError> {
         if self.ap.phase() != ApPhase::Authorized {
@@ -122,13 +160,18 @@ impl Fixture {
             return Ok(phase == ApPhase::Message4);
         }
         if frame.len() < 32
-            || frame[..2] != [8, if self.ap.protected() { 0x41 } else { 1 }]
+            || !matches!(frame[0], 8 | 0x88)
+            || frame[1] != if self.ap.protected() { 0x41 } else { 1 }
             || frame[4..10] != AP
             || frame[10..16] != OWN
         {
             return Err(BmiError::BadResponse);
         }
-        let mut body = frame[24..].to_vec();
+        let header = if frame[0] == 0x88 { 26 } else { 24 };
+        if header == 26 && frame.get(24..26) != Some(&[0, 0]) {
+            return Err(BmiError::BadResponse);
+        }
+        let mut body = frame.get(header..).ok_or(BmiError::BadResponse)?.to_vec();
         if self.ap.protected() {
             let tk: &[u8; 16] = self
                 .ptk
@@ -140,7 +183,7 @@ impl Fixture {
                 .unwrap();
             body = narf_wireless::ccmp::unprotect(
                 &Ccm,
-                &frame[..24],
+                &frame[..header],
                 tk,
                 0,
                 false,
@@ -174,6 +217,10 @@ impl Fixture {
             return Ok(false);
         }
         let mut ethernet = frame[16..22].to_vec();
+        if (frame[0] == 0x88) != self.qos() {
+            return Err(BmiError::BadResponse);
+        }
+        self.qos_frames += usize::from(frame[0] == 0x88);
         ethernet.extend_from_slice(&frame[10..16]);
         ethernet.extend_from_slice(&body[6..]);
         self.uplink.push(ethernet.clone());
@@ -184,11 +231,20 @@ impl Fixture {
         Ok(false)
     }
     fn downlink(&mut self, ethernet: &[u8]) -> Vec<u8> {
-        let mut frame = vec![8, if self.ap.protected() { 0x42 } else { 2 }, 0, 0];
+        let qos = self.qos() && ethernet[12..14] != [0x88, 0x8e];
+        let mut frame = vec![
+            if qos { 0x88 } else { 8 },
+            if self.ap.protected() { 0x42 } else { 2 },
+            0,
+            0,
+        ];
         frame.extend_from_slice(&ethernet[..6]);
         frame.extend_from_slice(&AP);
         frame.extend_from_slice(&ethernet[6..12]);
         frame.extend_from_slice(&[0, 0]);
+        if qos {
+            frame.extend_from_slice(&[0, 0]);
+        }
         let mut body = vec![0xaa, 0xaa, 3, 0, 0, 0];
         body.extend_from_slice(&ethernet[12..]);
         if self.ap.protected() {
@@ -229,13 +285,39 @@ impl Fixture {
         self.downlink(&ethernet)
     }
 }
-pub(super) fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
     let dialect = m.inner.inner.dialect;
     let command = &bytes[8..];
     let word = |at: usize| u32::from_le_bytes(command[at..at + 4].try_into().unwrap());
-    let phase = m.data.as_ref().unwrap().control_phase;
+    let native_phase = m.data.as_ref().unwrap().control_phase;
+    let qos = m.data.as_ref().unwrap().qos();
+    let is_wmm = qos && native_phase == 2;
+    let phase = native_phase - u8::from(qos && native_phase > 2);
     let mut replies = Vec::new();
-    if phase < 2 {
+    if is_wmm {
+        let expected_id: u32 = match dialect {
+            Dialect::Main | Dialect::Tlv => 0x4006,
+            Dialect::TenOne | Dialect::TenTwo | Dialect::TenTwoFour => 0x9009,
+            Dialect::TenFour => 0x900b,
+        };
+        let f = m.data.as_mut().unwrap();
+        let mut expected = expected_id.to_le_bytes().to_vec();
+        if dialect == Dialect::Tlv {
+            expected.extend_from_slice(&[8, 0, 83, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        for ac in f.wmm_words.chunks_exact(6) {
+            if dialect == Dialect::Tlv {
+                expected.extend_from_slice(&[24, 0, 84, 0]);
+            }
+            for word in ac {
+                expected.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        if command != expected {
+            return Err(BmiError::BadResponse);
+        }
+        f.wmm_sent += 1;
+    } else if phase < 2 {
         let expected = match dialect {
             Dialect::Main => 0x7006,
             Dialect::TenOne => 0x9028,
@@ -247,6 +329,17 @@ pub(super) fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
             return Err(BmiError::BadResponse);
         }
         let frame = mlme_tests::native_frame(m, command)?;
+        if phase == 1 && m.data.as_ref().unwrap().wmm_offer.is_some() {
+            let expected = [221, 7, 0, 0x50, 0xf2, 2, 0, 1, 0];
+            if frame
+                .windows(expected.len())
+                .filter(|w| *w == expected)
+                .count()
+                != 1
+            {
+                return Err(BmiError::BadResponse);
+            }
+        }
         m.native_management.push(frame.clone());
         replies = m
             .data
@@ -255,6 +348,11 @@ pub(super) fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
             .ap
             .receive(&frame)
             .map_err(|_| BmiError::BadResponse)?;
+        if phase == 1 {
+            if let Some(parameters) = &m.data.as_ref().unwrap().wmm_response {
+                replies[0].extend_from_slice(parameters);
+            }
+        }
         if dialect == Dialect::Tlv {
             let mut terminal = vec![16, 0, 0xa7, 1];
             terminal.extend_from_slice(&word(12).to_le_bytes());
@@ -276,14 +374,18 @@ pub(super) fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
             || command[at..at + 6] != AP
             || word(at + 12) != 1
             || word(at + 16) != 7
-            || word(at + 20) != (if secured { 5 } else { 1 })
+            || word(at + 20) != ((if secured { 5 } else { 1 }) | if qos { 2 } else { 0 })
             || word(at + 24) != (if secured { 0x11 } else { 1 })
         {
             return Err(BmiError::BadResponse);
         }
         let count = at + if dialect == Dialect::Tlv { 68 } else { 48 };
         let rates = count + if dialect == Dialect::Tlv { 12 } else { 4 };
-        if word(count) != 3 || command[rates..rates + 3] != [12, 24, 48] {
+        let phy = at + if dialect == Dialect::Tlv { 56 } else { 328 };
+        if word(count) != 3
+            || command[rates..rates + 3] != [12, 24, 48]
+            || word(phy) != u32::from(m.frequency < 3000)
+        {
             return Err(BmiError::BadResponse);
         }
     } else if phase == 3 {
@@ -307,6 +409,21 @@ pub(super) fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> 
     }
     m.data.as_mut().unwrap().control_phase += 1;
     m.sent.push(bytes.to_vec());
+    if is_wmm {
+        if let Some(policy) = &m.data.as_ref().unwrap().wmm_policy {
+            // Actual native WMM command receipt coincides with an external
+            // policy update. PEER_ASSOC/UP must revalidate even when every
+            // nested future can otherwise complete in one outer poll.
+            policy.lock().as_mut().unwrap().rules[0].flags =
+                narf_wireless::reg::RegFlags::INDOOR_ONLY;
+        }
+    }
+    if is_wmm && m.data.as_ref().unwrap().wmm_fail {
+        return Err(BmiError::BadResponse);
+    }
+    if is_wmm && m.data.as_ref().unwrap().wmm_hold {
+        core::future::pending::<()>().await;
+    }
     m.inner.inner.rx.push_back((
         2,
         vec![
@@ -360,7 +477,7 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
         || bytes[5] != m.inner.sequence
         || bytes[2..4] != (bytes.len() as u16 - 8).to_le_bytes()
         || body.len() < 16
-        || body[..4] != [1, 5, 0, 0x0c]
+        || body[..2] != [1, 5]
         || body[12..16] != [0xff, 0xff, 0, 0]
     {
         return Err(BmiError::BadResponse);
@@ -386,6 +503,10 @@ pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
         }
     }
     let fixture = m.data.as_mut().unwrap();
+    let expected_tid = if frame[0] == 0x88 { 0 } else { 16 };
+    if body[2..4] != (0x800u16 | (expected_tid << 6)).to_le_bytes() {
+        return Err(BmiError::BadResponse);
+    }
     let m4 = fixture.react(frame)?;
     if m4 && fixture.hold_m4
         || fixture.ap.phase() == ApPhase::Authorized && !m4 && fixture.hold_data
@@ -408,7 +529,10 @@ pub(super) fn poll(m: &mut RadioModel) -> Result<(), BmiError> {
         return Ok(());
     };
     let peer = fixture.next_peer.take().unwrap_or(1800);
-    let tid = fixture.next_tid.take().unwrap_or(16);
+    let tid = fixture
+        .next_tid
+        .take()
+        .unwrap_or(if frame[0] == 0x88 { 0 } else { 16 });
     let protected = frame[1] & 0x40 != 0;
     let sequence = u16::from_le_bytes([frame[22], frame[23]]) >> 4;
     frame.extend_from_slice(&[0; 4]);

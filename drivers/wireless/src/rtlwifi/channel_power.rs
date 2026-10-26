@@ -4,8 +4,8 @@
 //! per-board signed upper envelopes qualify every final conducted gain.
 use super::{efuse::Factory, radio};
 use alloc::{format, vec::Vec};
-use narf_capabilities::Read;
-use narf_firmware::FirmwareError;
+use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
+use narf_firmware::{FirmwareBlob, FirmwareError};
 const HEADER: usize = 96;
 const ROW: usize = 260;
 const UNKNOWN: i16 = i16::MAX;
@@ -36,6 +36,7 @@ pub struct Calibration {
     antenna: i16,
     qualified: i16,
     curves: Vec<Curve>,
+    authority: Option<Cap<FirmwareBlob, Read>>,
 }
 impl core::fmt::Debug for Calibration {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -80,6 +81,36 @@ fn signed(bytes: &[u8], at: usize) -> i16 {
     i16::from_le_bytes(bytes[at..at + 2].try_into().unwrap())
 }
 impl Calibration {
+    fn current(&self) -> Result<(), Error> {
+        if let Some(cap) = &self.authority {
+            return cap.invoke(NoopOp).map_err(|_| Error::Authority);
+        }
+        #[cfg(any(test, feature = "kernel-test"))]
+        return Ok(()); // Inert verified-metadata fixtures cannot reach PCI.
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        Err(Error::Authority)
+    }
+    pub(super) fn with_current<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, super::prepare::Error>,
+    ) -> Result<T, super::prepare::Error> {
+        struct Invoke<F>(F);
+        impl<T, F: FnOnce() -> Result<T, super::prepare::Error>> CapOp<FirmwareBlob, Read> for Invoke<F> {
+            type Output = Result<T, super::prepare::Error>;
+            fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((self.0)())
+            }
+        }
+        if let Some(cap) = &self.authority {
+            return cap
+                .invoke(Invoke(operation))
+                .map_err(|_| super::prepare::Error::Power(Error::Authority))?;
+        }
+        #[cfg(any(test, feature = "kernel-test"))]
+        return operation();
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        Err(super::prepare::Error::Power(Error::Authority))
+    }
     pub fn load_registered(factory: &Factory) -> Result<Self, Error> {
         let name = format!(
             "rtlwifi/rtl8188ee-cal-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
@@ -95,7 +126,9 @@ impl Calibration {
             .ok_or(Error::Authority)?;
         let asset = crate::firmware_asset::load(&authority, &name, HEADER + 11 * ROW, true)
             .map_err(Error::Firmware)?;
-        Self::from_verified(&asset.bytes, asset.signer, factory)
+        let mut calibration = Self::from_verified(&asset.bytes, asset.signer, factory)?;
+        calibration.authority = Some(asset.cap);
+        Ok(calibration)
     }
     fn from_verified(
         bytes: &[u8],
@@ -166,6 +199,7 @@ impl Calibration {
             antenna,
             qualified,
             curves,
+            authority: None,
         })
     }
     pub fn permission(
@@ -173,6 +207,7 @@ impl Calibration {
         domain: &narf_wireless::reg::RegulatoryDomain,
         channel: u8,
     ) -> Result<Permission, Error> {
+        self.current()?;
         if !(1..=11).contains(&channel) || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err(Error::Policy);
         }

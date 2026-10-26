@@ -19,6 +19,9 @@ enum State {
     Parked,
     MacPrepared,
     PhyTablesPrepared,
+    Calibrating8821c,
+    Calibration8821cPrepared,
+    Operating8821cPrepared,
     Commands,
     Calibrated,
     Packets,
@@ -237,6 +240,9 @@ impl Native {
                 | State::Active
                 | State::MacPrepared
                 | State::PhyTablesPrepared
+                | State::Calibrating8821c
+                | State::Calibration8821cPrepared
+                | State::Operating8821cPrepared
                 | State::Commands
                 | State::Calibrated
                 | State::Packets
@@ -244,15 +250,22 @@ impl Native {
             return Err(Error::State);
         }
         let active = matches!(self.state, State::Active | State::Commands | State::Packets);
-        let result = crate::rtw88::pci_park::invoke(&self.cap, || {
-            self.command(active)?;
-            if usize::from(reg) % width != 0 || u64::from(reg) + width as u64 > self.mmio.len {
-                return Err(Error::Access);
-            }
-            Ok(operation(self.mmio))
-        })
-        .map_err(|_| Error::Access)
-        .and_then(|value| value);
+        let gate = self.packet_gate.clone();
+        let access = || {
+            crate::rtw88::pci_park::invoke(&self.cap, || {
+                self.command(active)?;
+                if usize::from(reg) % width != 0 || u64::from(reg) + width as u64 > self.mmio.len {
+                    return Err(Error::Access);
+                }
+                Ok(operation(self.mmio))
+            })
+            .map_err(|_| Error::Access)
+            .and_then(|value| value)
+        };
+        let result = match gate {
+            Some(gate) => gate.invoke(access),
+            None => access(),
+        };
         if result.is_err() {
             self.state = State::Terminal;
         }
@@ -518,8 +531,89 @@ unsafe impl Registers for Native {
         self.state = State::PhyTablesPrepared;
         Ok(())
     }
+    fn begin_calibration8821c(&mut self) -> Result<(), Error> {
+        if self.device.id.device != 0xc821 || self.state != State::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        if self.mmio.len < 0x2c00 {
+            return Err(Error::Unsupported);
+        }
+        self.state = State::Calibrating8821c;
+        if self.read8(0x100)? & 0xcf != 0
+            || self.read8(0x522)? != 255
+            || self.read8(0x303)? & 0xf7 != 0xf7
+        {
+            self.state = State::Terminal;
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
+    }
+    fn finish_calibration8821c(&mut self) -> Result<(), Error> {
+        if self.device.id.device != 0xc821
+            || self.state != State::Configuring
+            || self.command_ring.pending()
+        {
+            return Err(Error::State);
+        }
+        self.finish_mac()?;
+        self.state = State::Calibration8821cPrepared;
+        Ok(())
+    }
+    fn begin_operating8821c(&mut self) -> Result<(), Error> {
+        if self.device.id.device != 0xc821
+            || self.state != State::Calibration8821cPrepared
+            || self.command_ring.pending()
+        {
+            return Err(Error::State);
+        }
+        self.state = State::Configuring;
+        if self.read8(0x100)? & 0xcf != 0
+            || self.read8(0x522)? != 255
+            || self.read8(0x303)? & 0xf7 != 0xf7
+        {
+            self.state = State::Terminal;
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
+    }
+    fn finish_operating8821c(&mut self) -> Result<(), Error> {
+        if self.device.id.device != 0xc821 || self.state != State::Configuring {
+            return Err(Error::State);
+        }
+        self.finish_mac()?;
+        self.state = State::Operating8821cPrepared;
+        Ok(())
+    }
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        if self.device.id.device != 0xc821
+            || self.state != State::Operating8821cPrepared
+            || self.command_ring.pending()
+        {
+            return Err(Error::State);
+        }
+        self.state = State::Configuring;
+        self.finish_mac()?; // actual closed CR/TXPAUSE/IRQ and parked PCI receipts
+        self.state = State::Configuring;
+        Ok(())
+    }
+    fn finish_station8821c(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
+        if self.device.id.device != 0xc821
+            || self.state != State::Configuring
+            || gate.did() != 0xc821
+        {
+            return Err(Error::State);
+        }
+        gate.current().map_err(Error::Power)?;
+        self.finish_mac()?;
+        self.packet_gate = Some(gate);
+        self.state = State::Calibrated;
+        Ok(())
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
-        if self.state != State::PhyTablesPrepared || self.command_buffer.is_some() {
+        if !(self.state == State::PhyTablesPrepared
+            || self.device.id.device == 0xc821 && self.state == State::Calibrating8821c)
+            || self.command_buffer.is_some()
+        {
             return Err(Error::State);
         }
         let result = (|| {
@@ -655,7 +749,10 @@ unsafe impl Registers for Native {
         result
     }
     fn finish_radio(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
-        if self.state != State::Configuring {
+        if self.device.id.device != 0xc822
+            || gate.did() != 0xc822
+            || self.state != State::Configuring
+        {
             return Err(Error::State);
         }
         let result = (|| {
@@ -680,9 +777,62 @@ unsafe impl Registers for Native {
         })
         .map_err(|_| Error::Access)?
     }
+    fn station_publication(&mut self) -> Result<super::publication::Publication, Error> {
+        self.station_allowed()?;
+        if self.state != State::Packets {
+            return Err(Error::State);
+        }
+        Ok(super::publication::Publication::native(
+            self.packet_gate.as_ref().ok_or(Error::State)?.clone(),
+            self.device,
+            self.cap,
+        ))
+    }
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
         self.station_allowed()?;
         Ok(self.packet_gate.as_ref().ok_or(Error::State)?.own())
+    }
+    fn station_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::station_profile::Grant>>, Error> {
+        self.station_allowed()?;
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
+        if gate.did() != 0xc822 {
+            return Ok(None);
+        }
+        // Optional qualification lookup is pure. Missing/malformed assets
+        // preserve the original fully qualified legacy connection profile.
+        Ok(super::station_profile::Source::Registered
+            .load(gate.clone())
+            .ok())
+    }
+    fn station_bind_extension(
+        &mut self,
+        grant: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        self.packet_gate = Some(
+            self.packet_gate
+                .as_ref()
+                .ok_or(Error::State)?
+                .with_extension(grant)?,
+        );
+        Ok(())
+    }
+    fn packet_profile(&mut self, profile: super::packet_format::DataProfile) -> Result<(), Error> {
+        let gate = self.packet_gate.as_ref().ok_or(Error::State)?.clone();
+        if !gate.allows_profile(profile) {
+            return Err(Error::Unsupported);
+        }
+        gate.invoke(|| self.configure_packet_profile(profile))
+    }
+    fn station_profile_readback(&mut self) -> Result<(), Error> {
+        let gains = self
+            .packet_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::cck_gains)
+            .ok_or(Error::Unsupported)?;
+        super::wmm::readback(|r| self.read32(r), gains)
     }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
         if !matches!(self.state, State::Calibrated | State::Packets) || self.mailbox_pending {

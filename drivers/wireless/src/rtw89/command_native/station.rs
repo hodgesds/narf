@@ -128,6 +128,17 @@ impl Native {
     ) -> Result<u64, packet::Error> {
         self.packet_operation(|core, port| core.submit(port, bytes, report))
     }
+    pub(in crate::rtw89) fn submit_packet_rate(
+        &mut self,
+        bytes: &[u8],
+        report: bool,
+        rate: u8,
+    ) -> Result<u64, packet::Error> {
+        if rate != 0 && !self.station_wmm_allowed()? {
+            return Err(packet::Error::Access);
+        }
+        self.packet_operation(|core, port| core.submit_rate(port, bytes, report, rate))
+    }
     pub(in crate::rtw89) fn poll_packets(&mut self) -> Result<packet::Step, packet::Error> {
         self.packet_operation(|core, port| core.poll(port))
     }

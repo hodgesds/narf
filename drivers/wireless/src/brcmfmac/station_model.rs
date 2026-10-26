@@ -45,6 +45,15 @@ pub(super) struct Firmware {
     power_save_error: u32,
     policy_clear: Option<(u32, alloc::sync::Arc<narf_wireless::reg::db::Database>)>,
     last_power_save_error: bool,
+    mfp_supported: bool,
+    pmf_required: bool,
+    mfp_mode: u32,
+    mfp_fault: u8,
+    mfp_missing: bool,
+    phy_profile: Option<(u32, u8)>,
+    wide: Option<crate::cyw43439::phy_fixture::Wide>,
+    current_chanspec: u16,
+    wide_started: bool,
     hold_tx: bool,
     wpa_ie: Option<Vec<u8>>,
     wpa_auth: Option<u32>,
@@ -81,6 +90,15 @@ impl Firmware {
             power_save_error: 0,
             policy_clear: None,
             last_power_save_error: false,
+            mfp_supported: false,
+            pmf_required: false,
+            mfp_mode: 0,
+            mfp_fault: 0,
+            mfp_missing: false,
+            phy_profile: None,
+            wide: None,
+            current_chanspec: 0x1006,
+            wide_started: false,
             hold_tx: false,
             wpa_ie: None,
             wpa_auth: None,
@@ -138,6 +156,36 @@ impl Firmware {
             self.deletes += 1;
         }
     }
+    fn request_ies(&self) -> Vec<u8> {
+        let mut ies = self.wpa_ie.clone().unwrap_or_default();
+        if let Some((chains, fault)) = self.phy_profile {
+            if fault != 3 {
+                ies.extend_from_slice(&self.wide.as_ref().map_or_else(
+                    || crate::cyw43439::phy_fixture::request(chains),
+                    |wide| {
+                        wide.request(chains, self.bandwidth[usize::from(self.channel <= 14)] == 3)
+                    },
+                ));
+            }
+            if fault == 8 {
+                let index = ies.len() - 37 + 5;
+                ies[index] ^= 1;
+            }
+        }
+        ies
+    }
+    fn response_ies(&self) -> Vec<u8> {
+        self.phy_profile.map_or(Vec::new(), |(chains, fault)| {
+            if fault == 4 {
+                vec![0, 0]
+            } else {
+                self.wide.as_ref().map_or_else(
+                    || crate::cyw43439::phy_fixture::response(self.channel, chains),
+                    |wide| wide.response(self.channel, chains),
+                )
+            }
+        })
+    }
     pub(super) fn command(&mut self, command: u32, input: &[u8], maximum: u16) -> Vec<u8> {
         if self
             .policy_clear
@@ -148,10 +196,22 @@ impl Firmware {
         }
         self.last_power_save_error = command == self.power_save_error
             && (command == 86 || input.starts_with(b"pm2_sleep_ret\0"));
+        self.mfp_missing = command == 262 && input.starts_with(b"mfp\0") && !self.mfp_supported;
         match command {
             1 => 2u32.to_le_bytes().to_vec(),
+            23 => {
+                if self.mfp_fault == 3 || self.phy_profile.is_some_and(|p| p.1 == 6) {
+                    vec![2, 9, 8, 7, 6, 5]
+                } else {
+                    AP.to_vec()
+                }
+            }
             217 => {
-                let channels: &[u32] = if self.channel > 14 {
+                let channels: &[u32] = if self.wide.is_some() && self.channel > 14 {
+                    &[6, 10, 36, 40, 52, 149, 153, 165, 255]
+                } else if self.wide.is_some() {
+                    &[1, 2, 6, 10, 11]
+                } else if self.channel > 14 {
                     &[6, 36, 52, 149, 165, 255]
                 } else {
                     &[1, 6, 11]
@@ -165,11 +225,95 @@ impl Firmware {
                 let mut out = vec![0; usize::from(maximum)];
                 if input.starts_with(b"cur_etheraddr\0") {
                     out[..6].copy_from_slice(&OWN);
+                } else if input.starts_with(b"nmode\0") {
+                    out[..4].copy_from_slice(&u32::from(self.phy_profile.is_some()).to_le_bytes());
+                } else if input.starts_with(b"rxchain\0") {
+                    out[..4].copy_from_slice(&self.phy_profile.map_or(0, |p| p.0).to_le_bytes());
+                } else if input.starts_with(b"chanspecs\0") {
+                    let list = self
+                        .wide
+                        .as_ref()
+                        .map_or_else(|| vec![0; 4], |wide| wide.list());
+                    out[..list.len()].copy_from_slice(&list);
+                } else if input.starts_with(b"chanspec\0") {
+                    let channel = if self.phy_profile.is_some_and(|p| p.1 == 2) {
+                        0x1808u32
+                    } else if self.wide.is_some()
+                        && !self.wide.as_ref().is_some_and(|w| {
+                            w.fault == crate::cyw43439::phy_fixture::WideFault::CurrentWidth
+                        })
+                    {
+                        u32::from(self.current_chanspec)
+                    } else if self.channel <= 14 {
+                        0x1000 | u32::from(self.channel)
+                    } else {
+                        0xd000 | u32::from(self.channel)
+                    };
+                    out[..4].copy_from_slice(&channel.to_le_bytes());
+                } else if input.starts_with(b"mfp\0") {
+                    let mode = if self.mfp_fault == 1 && self.mfp_mode == 2 {
+                        0
+                    } else {
+                        self.mfp_mode
+                    };
+                    out[..4].copy_from_slice(&mode.to_le_bytes());
+                } else if input.starts_with(b"assoc_info\0") {
+                    out[..4].copy_from_slice(
+                        &(if self.mfp_fault == 4 {
+                            1503
+                        } else if self.phy_profile.is_some() {
+                            self.request_ies().len() as u32
+                        } else {
+                            28u32
+                        })
+                        .to_le_bytes(),
+                    );
+                    out[4..8].copy_from_slice(&(self.response_ies().len() as u32).to_le_bytes());
+                } else if input.starts_with(b"assoc_req_ies\0") {
+                    let ies = if self.phy_profile.is_some() {
+                        self.request_ies()
+                    } else {
+                        pmf_ie()
+                    };
+                    out[..ies.len()].copy_from_slice(&ies);
+                    if self.mfp_fault == 2 {
+                        out[20] = 0;
+                    }
+                } else if input.starts_with(b"assoc_resp_ies\0") {
+                    let ies = self.response_ies();
+                    out[..ies.len()].copy_from_slice(&ies);
+                } else if input.starts_with(b"per_chan_info\0") {
+                    let ch = u32::from_le_bytes(input[14..18].try_into().unwrap());
+                    let wide = self.wide.as_ref().expect("wide channel query profile");
+                    assert!(
+                        ch & 255 == u32::from(self.channel)
+                            || ch & 255 == u32::from(wide.secondary)
+                    );
+                    assert_eq!(ch & !255, if self.channel <= 14 { 0x1000 } else { 0xd000 });
+                    let flags = 3u32
+                        | if self.channel > 14 { 4 } else { 0 }
+                        | if ch & 255 == u32::from(wide.secondary)
+                            && wide.fault
+                                == crate::cyw43439::phy_fixture::WideFault::ChannelRestricted
+                        {
+                            32
+                        } else {
+                            0
+                        };
+                    out[..4].copy_from_slice(&flags.to_le_bytes());
                 } else if input.starts_with(b"bw_cap\0") {
                     let band = u32::from_le_bytes(input[7..11].try_into().unwrap());
                     assert!(matches!(band, 1 | 2));
-                    let cap = if self.bandwidth_stuck {
+                    let cap = if self.bandwidth_stuck || self.phy_profile.is_some_and(|p| p.1 == 1)
+                    {
                         7
+                    } else if self.wide_started
+                        && self.bandwidth[(band - 1) as usize] == 3
+                        && self.wide.as_ref().is_some_and(|w| {
+                            w.fault == crate::cyw43439::phy_fixture::WideFault::CapReadback
+                        })
+                    {
+                        1
                     } else {
                         self.bandwidth[(band - 1) as usize]
                     };
@@ -183,16 +327,33 @@ impl Firmware {
                 assert!(matches!(band, 1 | 2));
                 self.bandwidth[(band - 1) as usize] =
                     u32::from_le_bytes(input[11..15].try_into().unwrap());
+                self.wide_started |= self.bandwidth[(band - 1) as usize] == 3;
                 Vec::new()
             }
             263 if input.starts_with(b"escan\0") => {
                 let id = u16::from_le_bytes(input[12..14].try_into().unwrap());
-                self.event(69, 8, 0, &scan_result(id, self.secured, self.channel));
+                self.event(
+                    69,
+                    8,
+                    0,
+                    &scan_result(
+                        id,
+                        self.secured,
+                        self.channel,
+                        self.pmf_required,
+                        self.phy_profile,
+                        self.wide.as_ref(),
+                    ),
+                );
                 self.event(69, 0, 0, &[]);
                 Vec::new()
             }
             263 if input.starts_with(b"wpaie\0") => {
                 self.wpa_ie = Some(input[6..].to_vec());
+                Vec::new()
+            }
+            263 if input.starts_with(b"mfp\0") => {
+                self.mfp_mode = u32::from_le_bytes(input[4..8].try_into().unwrap());
                 Vec::new()
             }
             263 if input.starts_with(b"wpa_auth\0") => {
@@ -226,8 +387,17 @@ impl Firmware {
                 } else {
                     0xd000u16
                 } | u16::from(self.channel);
+                let chanspec = if self.bandwidth[usize::from(self.channel <= 14)] == 3 {
+                    self.wide.as_ref().expect("wide native profile").operating
+                } else {
+                    chanspec
+                };
                 assert_eq!(&input[48..50], &chanspec.to_le_bytes());
-                let expected: &[u8] = if self.secured {
+                self.current_chanspec = chanspec;
+                let protected_ie = pmf_ie();
+                let expected: &[u8] = if self.pmf_required {
+                    &protected_ie
+                } else if self.secured {
                     &[
                         48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
                     ]
@@ -235,6 +405,7 @@ impl Firmware {
                     &[]
                 };
                 assert_eq!(self.wpa_ie.as_deref(), Some(expected));
+                assert!(!self.pmf_required || self.mfp_supported && self.mfp_mode == 2);
                 assert!(self.roam_off && (!self.secured || self.psk));
                 assert_eq!(self.wpa_auth, Some(if self.secured { 128 } else { 0 }));
                 assert_eq!(self.cipher, Some(if self.secured { 4 } else { 0 }));
@@ -259,11 +430,29 @@ impl Firmware {
         }
     }
     pub(super) fn status(&self, command: u32) -> i16 {
-        if command == 52 && self.fail_disconnect || self.last_power_save_error {
+        if self.mfp_missing {
+            -23
+        } else if command == 52 && self.fail_disconnect || self.last_power_save_error {
             5
         } else {
             0
         }
+    }
+    pub(super) fn hold_mfp_reply(&self, command: u32, input: &[u8]) -> bool {
+        (command == 263
+            && input.starts_with(b"bw_cap\0")
+            && input[11..15] == [3, 0, 0, 0]
+            && self
+                .wide
+                .as_ref()
+                .is_some_and(|w| w.fault == crate::cyw43439::phy_fixture::WideFault::HoldCap))
+            || command == 262
+                && (self.mfp_fault == 5 && input.starts_with(b"assoc_req_ies\0")
+                    || self.phy_profile.is_some_and(|p| p.1 == 5)
+                        && input.starts_with(b"assoc_resp_ies\0")
+                    || self.wide.as_ref().is_some_and(|w| {
+                        w.fault == crate::cyw43439::phy_fixture::WideFault::HoldResponse
+                    }) && input.starts_with(b"assoc_resp_ies\0"))
     }
     fn event(&mut self, kind: u32, status: u32, flags: u16, data: &[u8]) {
         let mut bytes = vec![0; 72 + data.len()];
@@ -366,12 +555,36 @@ impl Firmware {
         }
     }
 }
-fn scan_result(id: u16, secured: bool, channel: u8) -> Vec<u8> {
+fn pmf_ie() -> Vec<u8> {
+    vec![
+        48, 26, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 192, 0, 0, 0, 0, 15,
+        172, 6,
+    ]
+}
+fn scan_result(
+    id: u16,
+    secured: bool,
+    channel: u8,
+    mfp: bool,
+    phy: Option<(u32, u8)>,
+    wide: Option<&crate::cyw43439::phy_fixture::Wide>,
+) -> Vec<u8> {
     let mut ies = vec![0, 4, b't', b'e', b's', b't'];
     if secured {
-        ies.extend_from_slice(&[
-            48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
-        ]);
+        if mfp {
+            ies.extend_from_slice(&pmf_ie());
+        } else {
+            ies.extend_from_slice(&[
+                48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
+            ]);
+        }
+    }
+    if let Some((chains, fault)) = phy {
+        let extra = wide.map_or_else(
+            || crate::cyw43439::phy_fixture::response(channel, chains),
+            |w| w.beacon(channel, chains),
+        );
+        ies.extend_from_slice(if fault == 9 { &extra[..52] } else { &extra });
     }
     let mut out = vec![0; 12 + 128 + ies.len()];
     let len = out.len();
@@ -406,6 +619,29 @@ impl Handle {
     }
     pub(crate) fn keys_first(&self, value: bool) {
         self.change(|f| f.keys_first = value);
+    }
+    pub(crate) fn mfp_profile(&self, supported: bool, required: bool, fault: u8) {
+        self.change(|f| {
+            f.mfp_supported = supported;
+            f.pmf_required = required;
+            f.mfp_fault = fault;
+        });
+    }
+    pub(crate) fn phy_profile(&self, chains: u32, fault: u8) {
+        self.change(|f| f.phy_profile = Some((chains, fault)));
+    }
+    pub(crate) fn wide_profile(&self, wide: crate::cyw43439::phy_fixture::Wide) {
+        self.change(|f| {
+            f.bandwidth = [wide.caps[1], wide.caps[0]];
+            f.wide = Some(wide);
+        });
+    }
+    pub(crate) fn release_wide(&self) {
+        self.change(|f| {
+            if let Some(wide) = &mut f.wide {
+                wide.fault = crate::cyw43439::phy_fixture::WideFault::None;
+            }
+        });
     }
     pub(crate) fn channel(&self, channel: u8) {
         self.change(|f| f.channel = channel);

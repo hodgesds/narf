@@ -1,0 +1,686 @@
+//! Recipient BA over the actual native command/control/data/CCMP owner.
+use super::*;
+use crate::mt7921::association::Security;
+const OWN: [u8; 6] = super::amsdu_rx_tests::OWN;
+const AP: [u8; 6] = super::amsdu_rx_tests::AP;
+
+fn wrap(frame: &[u8], channel: u8) -> Vec<u8> {
+    let mut packet = descriptor(frame);
+    packet[4] = 1;
+    packet[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
+    packet
+}
+pub(super) fn request_packet(tid: u8, ssn: u16, window: u16, timeout: u16, channel: u8) -> Vec<u8> {
+    let mut frame = vec![0; 33];
+    frame[0] = 0xd0;
+    frame[4..10].copy_from_slice(&OWN);
+    frame[10..16].copy_from_slice(&AP);
+    frame[16..22].copy_from_slice(&AP);
+    frame[24..27].copy_from_slice(&[3, 0, 9]);
+    frame[27..29].copy_from_slice(&(3 | u16::from(tid) << 2 | window << 6).to_le_bytes());
+    frame[29..31].copy_from_slice(&timeout.to_le_bytes());
+    frame[31..33].copy_from_slice(&(ssn << 4).to_le_bytes());
+    wrap(&frame, channel)
+}
+fn bar(tid: u8, ssn: u16) -> Vec<u8> {
+    let mut frame = vec![0; 20];
+    frame[0] = 0x84;
+    frame[4..10].copy_from_slice(&OWN);
+    frame[10..16].copy_from_slice(&AP);
+    frame[16..18].copy_from_slice(&(4 | u16::from(tid) << 12).to_le_bytes());
+    frame[18..20].copy_from_slice(&(ssn << 4).to_le_bytes());
+    wrap(&frame, 6)
+}
+fn delba(tid: u8) -> Vec<u8> {
+    let mut frame = vec![0; 30];
+    frame[0] = 0xd0;
+    frame[4..10].copy_from_slice(&OWN);
+    frame[10..16].copy_from_slice(&AP);
+    frame[16..22].copy_from_slice(&AP);
+    frame[24..26].copy_from_slice(&[3, 2]);
+    frame[26..28].copy_from_slice(&(0x0800 | u16::from(tid) << 12).to_le_bytes());
+    frame[28..30].copy_from_slice(&39u16.to_le_bytes());
+    wrap(&frame, 6)
+}
+fn data(tid: u8, sequence: u16, pn: Option<u64>, value: u8) -> Vec<u8> {
+    let ethernet = super::amsdu_rx_tests::ethernet(value, 3);
+    let mut frame = vec![0; 26];
+    frame[..2].copy_from_slice(&[0x88, if pn.is_some() { 0x42 } else { 2 }]);
+    frame[4..10].copy_from_slice(&OWN);
+    frame[10..16].copy_from_slice(&AP);
+    frame[16..22].copy_from_slice(&AP);
+    frame[22..24].copy_from_slice(&(sequence << 4).to_le_bytes());
+    frame[24] = tid;
+    frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
+    frame.extend_from_slice(&ethernet[12..]);
+    let prefix = if pn.is_some() { 40 } else { 24 };
+    let mut packet = vec![0; prefix];
+    packet[..4].copy_from_slice(&((2u32 << 27) | (prefix + frame.len()) as u32).to_le_bytes());
+    let r1: u32 = 1 | if pn.is_some() {
+        (4 << 16) | (1 << 11)
+    } else {
+        0
+    };
+    packet[4..8].copy_from_slice(&r1.to_le_bytes());
+    packet[8..12].copy_from_slice(&(u32::from(tid) << 16).to_le_bytes()); // AMPDU; native TID.
+    packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    if let Some(pn) = pn {
+        packet[24..30].copy_from_slice(&pn.to_le_bytes()[..6]);
+    }
+    packet.extend_from_slice(&frame);
+    packet
+}
+fn joined(channel: u8, wide: bool, secured: bool) -> Result<Session<Model>, &'static str> {
+    let (mut session, bss) = super::ht20_tests::prepared(channel, secured);
+    let permission = if wide {
+        super::ht40_tests::permission40(channel, channel + 4)
+    } else {
+        test_permission_for(channel)
+    };
+    let security = if secured {
+        Security::Wpa2Psk { psk: [0x55; 32] }
+    } else {
+        Security::Open
+    };
+    run(session.associate_station(&bss, b"narf", security, permission, &[]))
+        .map_err(|_| "recipient BA genuine HT station")?;
+    Ok(session)
+}
+fn establish(
+    session: &mut Session<Model>,
+    tid: u8,
+    ssn: u16,
+    timeout: u16,
+) -> Result<(), &'static str> {
+    let State::Associated { channel, .. } = session.state else {
+        return Err("BA needs current association");
+    };
+    session
+        .backend
+        .packets
+        .push_back(request_packet(tid, ssn, 64, timeout, channel));
+    if session.receive_ethernet() != Ok(None)
+        || !session.keys_pending()
+        || session.rx_ba.active(tid)
+    {
+        return Err("ADDBA request published premature RX agreement");
+    }
+    run(session.service_keys()).map_err(|_| "native BA setup receipts/response")?;
+    if !session.rx_ba.active(tid) {
+        return Err("terminal BA response did not activate recipient");
+    }
+    Ok(())
+}
+fn expected(value: u8) -> Option<Vec<u8>> {
+    Some(super::amsdu_rx_tests::ethernet(value, 3))
+}
+fn consume(session: &mut Session<Model>, message: &'static str) -> Result<(), &'static str> {
+    if session.receive_ethernet() == Ok(None) {
+        Ok(())
+    } else {
+        Err(message)
+    }
+}
+
+fn wire() -> Result<(), &'static str> {
+    for channel in [6, 36] {
+        for wide in [false, true] {
+            for secured in [false, true] {
+                let mut session = joined(channel, wide, secured)?;
+                let start = session.backend.frames.len();
+                establish(&mut session, 3, 4094, 0)?;
+                let frames = &session.backend.frames[start..];
+                // Literal native ABI, not an expected value made by the new encoder.
+                let wtbl = [
+                    0, 1, 1, 0, 1, 0, 0, 0, 13, 0, 40, 0, 1, 2, 1, 0, 0, 0, 0, 0, 8, 0, 28, 0, 3,
+                    2, 0, 0, 0, 0, 0, 0, 32, 0, 2, 1, 2, 3, 4, 5, 3, 0, 1, 0, 0, 0, 0, 0,
+                ];
+                let station = [
+                    0, 1, 1, 0, 1, 0, 0, 0, 6, 0, 12, 0, 3, 2, 0, 8, 254, 15, 32, 0,
+                ];
+                if frames.len() != 3
+                    || frames[0].1.get(48..) != Some(wtbl.as_slice())
+                    || frames[1].1.get(48..) != Some(station.as_slice())
+                    || frames[2].1.get(24..) != Some(&[3, 1, 9, 0, 0, 14, 8, 0, 0][..])
+                {
+                    return Err("WTBL recipient/reset/window -> STA BA -> no-nested-AMSDU response native wire/order");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn mt76_rx_ba_native_recipient_receipts_response_and_ht20_ht40_profiles() -> TestResult {
+    wire().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_native_recipient_receipts_response_and_ht20_ht40_profiles
+);
+
+fn reorder() -> Result<(), &'static str> {
+    for secured in [false, true] {
+        let mut session = joined(6, false, secured)?;
+        establish(&mut session, 3, 4094, 0)?;
+        let pn = |n| secured.then_some(n);
+        for (seq, counter, value) in [(4095, 11, 11), (0, 12, 12)] {
+            session
+                .backend
+                .packets
+                .push_back(data(3, seq, pn(counter), value));
+        }
+        if session.receive_ethernet() != Ok(None) {
+            return Err("out-of-order BA committed/delivered before head");
+        }
+        session.backend.packets.push_back(data(3, 4094, pn(10), 10));
+        for value in [10, 11, 12] {
+            if session.receive_ethernet() != Ok(expected(value)) {
+                return Err("12-bit wrap reorder or post-reorder PN order failed");
+            }
+        }
+        let mut wrong_wcid = data(3, 1, pn(13), 90);
+        wrong_wcid[4] = 2;
+        let mut wrong_tid = data(3, 1, pn(13), 91);
+        wrong_tid[10] = 4;
+        let mut bad_integrity = data(3, 1, pn(13), 92);
+        bad_integrity[7] |= 2;
+        for packet in [
+            data(3, 4095, pn(11), 94),
+            data(3, 4093, pn(99), 95),
+            wrong_wcid,
+            wrong_tid,
+            bad_integrity,
+        ] {
+            session.backend.packets.push_back(packet);
+        }
+        for marker in [3, 1] {
+            let mut nested = super::amsdu_rx_tests::packet(
+                &super::amsdu_rx_tests::ethernet(93, 3),
+                secured,
+                13,
+                marker,
+                1,
+            );
+            nested[4] |= 1;
+            nested[8..12].copy_from_slice(&(3u32 << 16).to_le_bytes());
+            nested[if secured { 64 } else { 48 }] |= 3;
+            session.backend.packets.push_back(nested);
+        }
+        if session.receive_ethernet() != Ok(None) {
+            return Err("replay/old SN/native identity/nested aggregate crossed BA owner");
+        }
+        session.backend.packets.push_back(data(3, 1, pn(13), 13));
+        if session.receive_ethernet() != Ok(expected(13)) {
+            return Err("rejected BA packet consumed sequence or pairwise PN");
+        }
+        // A non-A-MPDU A-MSDU on the same TID remains supported, but its
+        // single PN must wait behind the earlier MPDU's sequence number.
+        for marker in [3, 1] {
+            let mut aggregate = super::amsdu_rx_tests::packet(
+                &super::amsdu_rx_tests::ethernet(15, 3),
+                secured,
+                15,
+                marker,
+                3,
+            );
+            aggregate[4] |= 1;
+            aggregate[8..12].copy_from_slice(&((1u32 << 30) | (3 << 16)).to_le_bytes());
+            aggregate[if secured { 64 } else { 48 }] |= 3;
+            session.backend.packets.push_back(aggregate);
+        }
+        consume(
+            &mut session,
+            "A-MSDU bypassed its BA TID's sequence/PN owner",
+        )?;
+        session.backend.packets.push_back(data(3, 2, pn(14), 14));
+        for value in [14, 15, 15] {
+            if session.receive_ethernet() != Ok(expected(value)) {
+                return Err("ordered BA plus ordinary A-MSDU changed atomic PN delivery");
+            }
+        }
+    }
+    Ok(())
+}
+fn mt76_rx_ba_wrap_reorder_peer_tid_integrity_and_replay_are_composed() -> TestResult {
+    reorder().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_wrap_reorder_peer_tid_integrity_and_replay_are_composed
+);
+
+fn bars_and_timeout() -> Result<(), &'static str> {
+    let mut session = joined(6, true, true)?;
+    establish(&mut session, 5, 100, 0)?;
+    for (seq, pn) in [(102, 12), (104, 14)] {
+        session
+            .backend
+            .packets
+            .push_back(data(5, seq, Some(pn), pn as u8));
+    }
+    if session.receive_ethernet() != Ok(None) {
+        return Err("BA gap did not hold MPDUs");
+    }
+    let mut foreign = bar(5, 102);
+    foreign[34] ^= 4;
+    session.backend.packets.push_back(foreign);
+    if session.receive_ethernet() != Ok(None) {
+        return Err("foreign BAR released a current peer window");
+    }
+    session.backend.packets.push_back(bar(5, 102));
+    if session.receive_ethernet() != Ok(expected(12)) {
+        return Err("compressed BAR did not release in sequence");
+    }
+    session
+        .backend
+        .ticks
+        .set(session.backend.ticks.get() + 41_000_000);
+    if session.receive_ethernet() != Ok(expected(14)) {
+        return Err("source VI reorder-hole timer stranded a frame");
+    }
+    session
+        .backend
+        .packets
+        .push_back(data(5, 103, Some(13), 13));
+    if session.receive_ethernet() != Ok(None) {
+        return Err("timeout released PN/SN was replayable");
+    }
+    session
+        .backend
+        .packets
+        .push_back(data(5, 200, Some(30), 30));
+    if session.receive_ethernet() != Ok(None) {
+        return Err("far-window jump delivered across a new gap");
+    }
+    session.backend.packets.push_back(bar(5, 201));
+    if session.receive_ethernet() != Ok(expected(30)) {
+        return Err("bounded far-window advance/BAR lost packet");
+    }
+    let mut wrapped = joined(6, false, true)?;
+    establish(&mut wrapped, 5, 4000, 0)?;
+    wrapped.backend.packets.push_back(data(5, 31, Some(1), 1));
+    if wrapped.receive_ethernet() != Ok(None) {
+        return Err("wrapped far-window jump bypassed its gap");
+    }
+    wrapped.backend.packets.push_back(bar(5, 32));
+    if wrapped.receive_ethernet() != Ok(expected(1)) {
+        return Err("12-bit far-window subtraction did not wrap safely");
+    }
+    Ok(())
+}
+fn mt76_rx_ba_compressed_bar_hole_timeout_and_far_window_advance() -> TestResult {
+    bars_and_timeout().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_compressed_bar_hole_timeout_and_far_window_advance
+);
+
+fn duplicates_and_declines() -> Result<(), &'static str> {
+    let mut session = joined(6, false, false)?;
+    establish(&mut session, 0, 7, 0)?;
+    session.backend.packets.push_back(data(0, 8, None, 8));
+    if session.receive_ethernet() != Ok(None) {
+        return Err("duplicate agreement gap fixture");
+    }
+    let before = session.backend.frames.len();
+    session
+        .backend
+        .packets
+        .push_back(request_packet(0, 7, 64, 0, 6));
+    if session.receive_ethernet() != Ok(None) {
+        return Err("repeat ADDBA unexpectedly delivered data");
+    }
+    run(session.service_keys()).map_err(|_| "repeat ADDBA response")?;
+    if session.backend.frames.len() != before + 1 {
+        return Err("repeat ADDBA reset native sequence/PN records");
+    }
+    for _ in 0..8 {
+        session
+            .backend
+            .packets
+            .push_back(request_packet(0, 7, 64, 0, 6));
+    }
+    consume(&mut session, "repeat BA flood unexpectedly delivered data")?;
+    if !session.control_pending.is_empty() {
+        return Err("response backpressure changed a duplicate accepted agreement into a decline");
+    }
+    let before = session.backend.frames.len();
+    run(session.service_keys()).map_err(|_| "bounded repeated BA response flood")?;
+    if session.backend.frames.len() != before + 4 {
+        return Err("repeated BA response queue escaped its bound");
+    }
+    session.backend.packets.push_back(data(0, 7, None, 7));
+    for n in [7, 8] {
+        if session.receive_ethernet() != Ok(expected(n)) {
+            return Err("repeat ADDBA destroyed the original reorder window");
+        }
+    }
+    for case in 0..4 {
+        let mut packet = request_packet(if case == 0 { 8 } else { 0 }, 10, 64, 0, 6);
+        if case == 1 {
+            packet[24 + 27] &= !2;
+        } // delayed BA
+        if case == 2 {
+            packet[24 + 31] |= 1;
+        } // fragmented SSN
+          // case3 is an incompatible active-TID renegotiation.
+        session.backend.packets.push_back(packet);
+    }
+    if session.receive_ethernet() != Ok(None) || session.control_pending.len() != 4 {
+        return Err("unsupported ADDBA was unbounded or admitted");
+    }
+    run(session.service_keys()).map_err(|_| "bounded unsupported BA responses")?;
+    if !session.rx_ba.active(0) || session.rx_ba.active(8) {
+        return Err("declines replaced a live TID or fabricated unsupported TID");
+    }
+    Ok(())
+}
+fn mt76_rx_ba_duplicate_admission_preserves_window_and_unsupported_requests_decline() -> TestResult
+{
+    duplicates_and_declines().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_duplicate_admission_preserves_window_and_unsupported_requests_decline
+);
+
+fn retirement() -> Result<(), &'static str> {
+    for timeout in [false, true] {
+        let mut session = joined(6, false, true)?;
+        establish(&mut session, 0, 1, if timeout { 20 } else { 0 })?;
+        session.backend.packets.push_back(data(0, 2, Some(2), 2));
+        if session.receive_ethernet() != Ok(None) {
+            return Err("retirement pending data fixture");
+        }
+        if timeout {
+            session
+                .backend
+                .ticks
+                .set(session.backend.ticks.get() + 21_000_000);
+        } else {
+            session.backend.packets.push_back(delba(0));
+        }
+        if session.receive_ethernet() != Ok(None)
+            || session.rx_ba.active(0)
+            || !session.keys_pending()
+        {
+            return Err("DELBA/inactivity did not close host RX before native waits");
+        }
+        let before = session.backend.frames.len();
+        run(session.service_keys()).map_err(|_| "native BA stop receipts")?;
+        let f = &session.backend.frames[before..];
+        if f.len() != if timeout { 3 } else { 2 }
+            || f[0].1.get(80..82) != Some(&[0, 0][..])
+            || f[1].1.get(63) != Some(&0)
+            || !session.rx_ba.records().is_empty()
+        {
+            return Err("BA native disable/reset/recipient DELBA order");
+        }
+        session.backend.packets.push_back(data(0, 1, Some(1), 1));
+        if session.receive_ethernet() != Ok(None) {
+            return Err("retired BA accepted unsolicited A-MPDU");
+        }
+    }
+    Ok(())
+}
+fn mt76_rx_ba_delba_and_inactivity_retire_both_native_records() -> TestResult {
+    retirement().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_delba_and_inactivity_retire_both_native_records
+);
+
+fn rekey() -> Result<(), &'static str> {
+    let mut session = joined(6, true, true)?;
+    establish(&mut session, 0, 1, 0)?;
+    session.backend.packets.push_back(data(0, 2, Some(99), 99));
+    if session.receive_ethernet() != Ok(None) {
+        return Err("old-key buffered BA packet fixture");
+    }
+    // The native adapter owns the authentic EAPOL rekey conversation; the
+    // shared legacy FakeAp does not generate rekeys in its Authorized phase.
+    session.backend.access_point = None;
+    session.backend.psk = [0x55; 32];
+    session.backend.own_mac = OWN;
+    session.backend.ap_mac = AP;
+    session.backend.anonce = [0x55; 32];
+    let mut m1 = narf_wireless::eapol::KeyFrame::empty(16);
+    m1.key_information = 2 | (1 << 3) | (1 << 7);
+    m1.key_length = 16;
+    m1.replay_counter = 7;
+    m1.key_nonce = [0x55; 32];
+    session
+        .backend
+        .packets
+        .push_back(descriptor(&ap_eapol_frame(OWN, AP, &m1.into_eapol())));
+    if session.receive_ethernet() != Ok(None) || !session.keys_pending() {
+        return Err("BA rekey EAPOL capture");
+    }
+    let before = session.backend.frames.len();
+    run(session.service_keys()).map_err(|_| "BA retirement before rekey M2")?;
+    if session.rx_ba.owns(0) {
+        return Err("old key's BA owner crossed rekey M2");
+    }
+    if session.receive_ethernet() != Ok(None) || !session.keys_pending() {
+        return Err("native authenticated rekey M3 capture");
+    }
+    run(session.service_keys()).map_err(|_| "native rekey key receipts")?;
+    let frames = &session.backend.frames[before..];
+    let wtbl_disabled = frames
+        .iter()
+        .position(|(_, f)| {
+            f.len() == 96
+                && f[34..36] == [3, 0]
+                && f[49] == 1
+                && f[56..60] == [13, 0, 40, 0]
+                && f[68..72] == [8, 0, 28, 0]
+                && f[80..82] == [0, 0]
+        })
+        .ok_or("WTBL BA disable before rekey missing")?;
+    let disabled = frames
+        .iter()
+        .position(|(_, f)| f.len() == 68 && f[56..60] == [6, 0, 12, 0] && f[63] == 0)
+        .ok_or("BA disable before rekey missing")?;
+    let key = frames
+        .iter()
+        .position(|(_, f)| {
+            f.len() == 100
+                && f[34..36] == [3, 0]
+                && f[48..68]
+                    == [
+                        0, 1, 1, 0, 1, 0, 0, 0, 17, 0, 44, 0, 0, 1, 0, 0, 6, 36, 0, 16,
+                    ]
+        })
+        .ok_or("native PTK publication missing")?;
+    if wtbl_disabled >= disabled || disabled >= key {
+        return Err("new PTK preceded terminal receive BA retirement");
+    }
+    // M3 repeats the installed GTK (id1, 0x77); a PTK rekey must not
+    // reinstall that group key and reset its packet-number replay window.
+    if frames.iter().any(|(_, f)| {
+        f.len() == 100
+            && f[34..36] == [3, 0]
+            && f[49] == 19
+            && f[56..64] == [17, 0, 44, 0, 0, 1, 0, 0]
+    }) {
+        return Err("unchanged GTK was reinstalled during PTK rekey");
+    }
+    establish(&mut session, 0, 50, 0)?;
+    session.backend.packets.push_back(data(0, 51, Some(2), 2));
+    session.backend.packets.push_back(data(0, 50, Some(1), 1));
+    for n in [1, 2] {
+        if session.receive_ethernet() != Ok(expected(n)) {
+            return Err("new key epoch inherited old buffered PN/window");
+        }
+    }
+    session
+        .backend
+        .ticks
+        .set(session.backend.ticks.get() + 101_000_000);
+    if session.receive_ethernet() != Ok(None) {
+        return Err("old key packet survived into replacement BA window");
+    }
+    run(session.recover(OWN)).map_err(|_| "verified BA reset")?;
+    if !session.rx_ba.records().is_empty() || !matches!(session.state, State::RadioReady(_)) {
+        return Err("verified reset retained old BA records");
+    }
+    Ok(())
+}
+fn mt76_rx_ba_rekey_receipts_fence_old_windows_before_ptk_and_reset() -> TestResult {
+    rekey().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_rekey_receipts_fence_old_windows_before_ptk_and_reset
+);
+
+fn failure() -> Result<(), &'static str> {
+    for tag in [13, 6] {
+        let mut session = joined(6, false, false)?;
+        session.backend.ba_error_tag = Some(tag);
+        session
+            .backend
+            .packets
+            .push_back(request_packet(0, 1, 64, 0, 6));
+        consume(&mut session, "BA error fixture")?;
+        let before = session.backend.frames.len();
+        if run(session.service_keys()).is_ok()
+            || session.rx_ba.active(0)
+            || !matches!(session.state, State::Failed { .. })
+            || !session.backend.owner.published
+            || session.backend.frames[before..]
+                .iter()
+                .any(|(_, f)| f.first() == Some(&0xd0))
+        {
+            return Err("rejected native BA receipt activated/replied or released DMA");
+        }
+    }
+    for publication in 0..=3 {
+        let mut session = joined(6, false, false)?;
+        session
+            .backend
+            .packets
+            .push_back(request_packet(0, 1, 64, 0, 6));
+        consume(&mut session, "BA policy fixture")?;
+        session.backend.deny_tx_after = Some(session.backend.frames.len() + publication);
+        if run(session.service_keys()) != Err(Error::Authority)
+            || session.rx_ba.active(0)
+            || !matches!(session.state, State::Failed { .. })
+            || !session.backend.owner.published
+        {
+            return Err("native BA publication/response reused current-policy denial");
+        }
+    }
+    Ok(())
+}
+fn mt76_rx_ba_rejected_receipts_and_each_current_policy_boundary_fail_closed() -> TestResult {
+    failure().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_rejected_receipts_and_each_current_policy_boundary_fail_closed
+);
+
+fn cancelled() -> Result<(), &'static str> {
+    for boundary in 1..=3 {
+        let mut session = joined(6, false, false)?;
+        session
+            .backend
+            .packets
+            .push_back(request_packet(0, 1, 64, 0, 6));
+        consume(&mut session, "BA cancel fixture")?;
+        let before = session.backend.frames.len();
+        if boundary < 3 {
+            session.backend.tx_stall_after = Some(before + boundary);
+        } else {
+            session.backend.management_stall_after = Some(before + 3);
+        }
+        {
+            let mut future = pin!(session.service_keys());
+            if future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return Err("BA native receipt/response did not suspend for cancellation");
+            }
+        }
+        if session.rx_ba.active(0)
+            || !session.rx_ba.owns(0)
+            || !matches!(session.state, State::Running(_))
+            || session.receive_ethernet() != Err(Error::Busy)
+            || !session.backend.owner.published
+        {
+            return Err(
+                "cancelled setup restored a producer or lost uncertain native BA/DMA ownership",
+            );
+        }
+    }
+    let mut session = joined(6, false, true)?;
+    establish(&mut session, 0, 1, 0)?;
+    session.backend.packets.push_back(data(0, 2, Some(2), 2));
+    consume(&mut session, "BA teardown cancel packet")?;
+    session.backend.tx_stall_after = Some(session.backend.frames.len() + 1);
+    {
+        let mut future = pin!(session.disassociate_station());
+        if future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+        {
+            return Err("BA teardown did not suspend at disable receipt");
+        }
+    }
+    if session.rx_ba.active(0)
+        || !session.rx_ba.owns(0)
+        || session.station_permission.is_some()
+        || session.security.is_some()
+        || session.receive_ethernet() != Err(Error::Busy)
+        || !session.backend.owner.published
+    {
+        return Err("cancelled BA teardown retained host authorization or freed live mappings");
+    }
+    let mut rekey = joined(6, true, true)?;
+    establish(&mut rekey, 0, 1, 0)?;
+    rekey.backend.packets.push_back(data(0, 2, Some(99), 99));
+    consume(&mut rekey, "BA key cancellation packet fixture")?;
+    let mut m1 = narf_wireless::eapol::KeyFrame::empty(16);
+    m1.key_information = 2 | (1 << 3) | (1 << 7);
+    m1.key_length = 16;
+    m1.replay_counter = 7;
+    m1.key_nonce = [0x55; 32];
+    rekey
+        .backend
+        .packets
+        .push_back(descriptor(&ap_eapol_frame(OWN, AP, &m1.into_eapol())));
+    consume(&mut rekey, "BA key cancellation EAPOL fixture")?;
+    rekey.backend.tx_stall_after = Some(rekey.backend.frames.len() + 1);
+    {
+        let mut future = pin!(rekey.service_keys());
+        if future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+        {
+            return Err("BA key retirement did not suspend at native receipt");
+        }
+    }
+    if rekey.rx_ba.active(0)
+        || !rekey.rx_ba.owns(0)
+        || rekey.security.is_some()
+        || rekey.receive_ethernet() != Err(Error::Busy)
+        || !rekey.backend.owner.published
+    {
+        return Err("cancelled key transition revived queued BA/PN ownership or freed DMA");
+    }
+    Ok(())
+}
+fn mt76_rx_ba_setup_response_and_teardown_cancel_retain_native_ownership() -> TestResult {
+    cancelled().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_rx_ba_setup_response_and_teardown_cancel_retain_native_ownership
+);

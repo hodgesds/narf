@@ -519,14 +519,21 @@ fn crypto_suites(attrs: &[(u16, &[u8])], suites: &[u32], cipher_limit: usize) ->
 /// The information elements wpa_supplicant puts in a WPA2-PSK CONNECT's
 /// NL80211_ATTR_IE: the RSN element it will advertise plus extended
 /// capabilities, RSNXE and vendor elements. The offloading driver builds
-/// its own RSN element (CCMP, PSK, no MFP), so a requested RSN element must
-/// describe exactly that suite; other elements are accepted but not
-/// forwarded. A second RSN element, or an MFP-required one, is refused.
-fn psk_association_ies(ie: &[u8]) -> Result<(), i32> {
+/// its own RSN element (CCMP, PSK, optionally required PMF), so the requested
+/// RSN element must describe that admitted suite. Required PMF needs an
+/// explicit complete RSNE; it is never inferred from a cipher advertisement.
+fn psk_association_ies(ie: &[u8], required_mfp: bool) -> Result<(), i32> {
+    if ie.len() > 2048 {
+        return Err(EINVAL);
+    }
     let ies = elements(ie)?;
     let mut rsn = ies.iter().filter(|(id, _)| *id == 48);
     let Some((_, body)) = rsn.next() else {
-        return Ok(());
+        return if required_mfp {
+            Err(EOPNOTSUPP)
+        } else {
+            Ok(())
+        };
     };
     if rsn.next().is_some() {
         return Err(EOPNOTSUPP);
@@ -536,7 +543,21 @@ fn psk_association_ies(ie: &[u8]) -> Result<(), i32> {
     if rsn.group_cipher != ccmp
         || rsn.pairwise_ciphers != [ccmp]
         || rsn.akms != [crate::rsn::Suite::standard(crate::rsn::AKM_PSK)]
-        || rsn.rsn_capabilities & crate::rsn::RSN_CAP_MFP_REQUIRED != 0
+        || !required_mfp && rsn.rsn_capabilities & crate::rsn::RSN_CAP_MFP_REQUIRED != 0
+    {
+        return Err(EOPNOTSUPP);
+    }
+    // Exactly one pairwise/AKM above leaves a twenty-byte fixed prefix.
+    // A default BIP suite may omit the PMKID-count/suite tail, or include
+    // its zero count alone. No partial or trailing RSN fields are valid.
+    let mfp_bits = crate::rsn::RSN_CAP_MFP_REQUIRED | crate::rsn::RSN_CAP_MFP_CAPABLE;
+    if required_mfp
+        && (!matches!(body.len(), 20 | 22 | 26)
+            || rsn.rsn_capabilities != mfp_bits
+            || !rsn.pmkids.is_empty()
+            || rsn.group_management_cipher.is_some_and(|cipher| {
+                cipher != crate::rsn::Suite::standard(crate::rsn::CIPHER_BIP_CMAC_128)
+            }))
     {
         return Err(EOPNOTSUPP);
     }
@@ -618,24 +639,28 @@ fn scan_random_mac(
 #[derive(Clone, Copy, Default)]
 struct ConnectCaps {
     psk_offload: bool,
+    psk_mfp_offload: bool,
     sae_offload: bool,
     external: bool,
     cipher_suites: &'static [u32],
     scan_random_mac: bool,
     connected: bool,
     max_scan_ssids: u8,
+    max_scan_ie_len: u16,
 }
 
 impl ConnectCaps {
     fn of(iface: &dyn crate::WirelessNetIface) -> Self {
         ConnectCaps {
             psk_offload: iface.supports_handshake_offload(),
+            psk_mfp_offload: iface.supports_wpa2_mfp_offload(),
             sae_offload: iface.supports_sae_offload(),
             external: iface.supports_external_supplicant(),
             cipher_suites: iface.cipher_suites(),
             scan_random_mac: iface.supports_scan_random_mac(),
             connected: iface.connected_bssid().is_some(),
             max_scan_ssids: iface.max_scan_ssids(),
+            max_scan_ie_len: iface.max_scan_ie_len(),
         }
     }
 }
@@ -652,12 +677,14 @@ fn parse_operation(
         attrs,
         ConnectCaps {
             psk_offload,
+            psk_mfp_offload: false,
             sae_offload,
             external: false,
             cipher_suites: &[],
             scan_random_mac: false,
             connected: false,
             max_scan_ssids: 16,
+            max_scan_ie_len: 512,
         },
         0,
     )
@@ -685,8 +712,7 @@ fn parse_operation_caps(
     }
     match command {
         SCAN => {
-            // ath11k_mac_register: WLAN_SCAN_PARAMS_MAX_IE_LEN.
-            if attr(attrs, 42).is_some_and(|ie| ie.len() > 512) {
+            if attr(attrs, 42).is_some_and(|ie| ie.len() > usize::from(caps.max_scan_ie_len)) {
                 return Err(EINVAL);
             }
             let flags = u32_attr(attrs, 158)?.unwrap_or(0);
@@ -812,19 +838,18 @@ fn parse_operation_caps(
                 }
                 Credential::Sae(Zeroizing::new(password.to_vec()))
             } else if let Some(pmk) = attr(attrs, 254) {
-                // WPA2-PSK offload: OPEN auth, no MFP, AKM PSK (00-0F-AC:2), CCMP.
+                // WPA2-PSK offload: OPEN auth, AKM PSK and CCMP. Required
+                // PMF needs the driver's complete firmware-offload contract.
                 if !psk_offload
                     || auth != 0
-                    || mfp != 0
+                    || mfp == 1 && !caps.psk_mfp_offload
                     || !ccmp
                     || u32_attr(attrs, 75)? != Some(2)
                     || u32_attr(attrs, 76)? != Some(0x000fac02)
                 {
                     return Err(EOPNOTSUPP);
                 }
-                if let Some(ie) = attr(attrs, 42) {
-                    psk_association_ies(ie)?;
-                }
+                psk_association_ies(attr(attrs, 42).unwrap_or(&[]), mfp == 1)?;
                 Credential::Psk(Zeroizing::new(pmk.try_into().map_err(|_| EINVAL)?))
             } else if caps.external
                 && (attr(attrs, 70).is_some()
@@ -3722,6 +3747,25 @@ async fn execute(
             );
         }
     }
+}
+
+/// Native-driver fixture seam through the production CONNECT parser and
+/// execution path. Association outcome is still reported by the driver's
+/// port state/events; this result reports only parsing and dispatch admission.
+#[cfg(any(test, feature = "kernel-test"))]
+pub async fn connect_for_test(
+    iface: Arc<dyn crate::WirelessNetIface>,
+    raw_attrs: &[u8],
+) -> Result<(), i32> {
+    let attrs = attributes(raw_attrs)?;
+    let operation = parse_operation_caps(CONNECT, &attrs, ConnectCaps::of(iface.as_ref()), 0)?;
+    let admin = narf_net::kernel_admin(iface.name()).ok_or(EPERM)?;
+    let index = narf_net::netlink_route::ifindex_for_name(iface.name()).ok_or(ENODEV)?;
+    if !authorized(&admin, iface.as_ref(), 0) {
+        return Err(EPERM);
+    }
+    execute(iface, admin, 0, index, operation).await;
+    Ok(())
 }
 
 /// The wiphy index nl80211 reports for `iface` (its registry position).

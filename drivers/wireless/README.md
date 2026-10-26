@@ -35,3 +35,4 @@ radio is just another 802.11 interface. The crate is `no_std`. Secret
 material uses `zeroize`.
 
 - Spec: [`specification/spec.md`](./specification/spec.md)
+- Per-chip status and measured source footprint: [`research/chip-inventory.md`](./research/chip-inventory.md)

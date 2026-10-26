@@ -1288,6 +1288,14 @@ impl Hardware {
         Ok(())
     }
 
+    /// An unused prerequisite queue must still belong to the exact peer/TID.
+    pub(super) fn idle_tx_binding(&self, id: u16, station: u8, tid: u8) -> bool {
+        !self.failed
+            && self.resources.data.iter().any(|queue| {
+                queue.id() == Some(id) && queue.belongs_to(station, tid) && queue.is_idle()
+            })
+    }
+
     /// The caller owns the async device mutex, so no other submission or
     /// completion waiter can consume this queue's newly available credit.
     /// Polling here drains DMA even while the background RX task is excluded.
@@ -1375,14 +1383,37 @@ impl Hardware {
         command: u8,
         payload: &[u8],
     ) -> Result<Packet, &'static str> {
+        // Retained CC/Qu MVM callers pass bare opcodes/WIDE_IDs. Their
+        // command-ID version is0 even when the payload layout is v3/v5/v12.
+        // fw/api/cmdhdr.h extracts wire version only from ID bits16..23;
+        // pcie/gen1_2/tx-gen2.c copies those bits into hdr_wide.version.
+        // Preserve the existing Gen3 contract here; explicitly versioned IDs
+        // use command_with_header_version instead of the payload lookup.
+        let version = if self.format == rx_rfh::CompletionFormat::Qu {
+            0
+        } else {
+            self.version(group, command)
+                .map(|v| v.0)
+                .filter(|v| *v != 99)
+                .unwrap_or(0)
+        };
+        self.command_with_header_version(group, command, payload, version)
+            .await
+    }
+
+    /// The wire header's version comes from command-ID bits16..23, not the
+    /// firmware's payload-layout lookup (Linux fw/api/cmdhdr.h and
+    /// pcie/gen1_2/tx-gen2.c). Retained MVM link control uses WIDE_ID, version0.
+    pub(super) async fn command_with_header_version(
+        &mut self,
+        group: u8,
+        command: u8,
+        payload: &[u8],
+        version: u8,
+    ) -> Result<Packet, &'static str> {
         if self.failed {
             return Err("Wi-Fi transport failed");
         }
-        let version = self
-            .version(group, command)
-            .map(|v| v.0)
-            .filter(|v| *v != 99)
-            .unwrap_or(0);
         let sequence =
             self.resources
                 .commands

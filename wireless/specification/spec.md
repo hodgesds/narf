@@ -69,6 +69,18 @@ headers and transport source under the repository's GPL-2.0 licensing.
 
 ## 3. Public Interface
 
+`wmm::{Parameters, Ac, Error, INFORMATION}` parses one WMM v1 Parameter
+element in a complete IE stream of at most4096 bytes. It validates exact
+OUI/type/subtype/version/length/reserved fields and four distinct ACIs, and
+returns canonical BE/BK/VI/VO rows (AIFSN, ECW exponents, TXOP in32us units,
+ACM), the AP parameter-set count and U-APSD bit. `Ac::cw_min/cw_max` expand
+the checked four-bit exponents. Information-only or absent WMM returns None;
+duplicates including Information+Parameter reject. ECW0 and ACM remain wire
+facts, not an admission decision. Drivers bind the actual association response,
+select hardware queues, enforce BE/TSPEC/regulatory/power policy and retain
+native ownership themselves. The fixed station Information IE requests no
+U-APSD or service period. This parser grants no association, radio or TX authority.
+
 `association::{Bss, JoinPlan, SecurityMode, Phase}` supplies the shared
 legacy SoftMAC management plan extracted from MT76. It validates bounded AP
 IEs, SSID, supported/basic rates and Open or WPA2-PSK/CCMP negotiation, builds
@@ -137,8 +149,8 @@ chooses a directed active scan only when the limit is nonzero; otherwise it
 requests passive discovery without SSID entries and applies the requested SSID,
 BSSID, frequency and security filters to the observed results. This does not
 downgrade explicit active scans or grant probe-transmit authority. Intel exposes
-20 entries; ath11k and the shared CYW/BCM FullMAC facade expose 16. The initial
-MT76, ath10k, AR9285 and Realtek profiles retain passive-only discovery.
+20 entries; ath10k, ath11k and the shared CYW/BCM FullMAC facade expose 16.
+MT76 and AR9285 expose four; the initial Realtek profiles advertise zero.
 
 `WirelessNetIface::phy_capabilities(band_mhz) -> Option<PhyCapabilities>`
 returns band-specific IEEE HT (26-byte) and optional VHT (12-byte) capability
@@ -430,7 +442,7 @@ vdev are down; unsupported or active-vdev changes are -EOPNOTSUPP / -EBUSY.
 for both `GET_WIPHY`'s `NL80211_ATTR_CIPHER_SUITES` and CONNECT / NEW_KEY
 validation. Its default external-supplicant profile remains CCMP-128 plus
 BIP-CMAC-128; a hardware driver overrides it only after its firmware key
-install, data descriptor, and host MFP paths implement the advertised suite.
+install, data descriptor, and host or firmware MFP owner implement the advertised suite.
 The ath11k WCN6855 profile supplies Linux's nine-suite set: TKIP, CCMP-128/
 256, GCMP-128/256, BIP-CMAC-128/256, and BIP-GMAC-128/256.
 `4ADDR` follows the selected wiphy's managed-station capability: an enabled
@@ -453,8 +465,18 @@ wiphy cipher suites (-EINVAL). CONNECT accepts up to five pairwise selectors,
 while direct ASSOCIATE accepts one, as `nl80211_crypto_settings` does.
 `CONTROL_PORT_OVER_NL80211` needs
 `SOCKET_OWNER` (-EINVAL), then the ext feature (-EOPNOTSUPP). For the PMK
-path the RSN element in `NL80211_ATTR_IE` must describe CCMP/PSK without
-MFP-required; every element is carried in `AssociateRequest::ie`, and an
+path the RSN element in `NL80211_ATTR_IE` must describe CCMP/PSK. Required
+PMF additionally needs the explicit default-false
+`WirelessNetIface::supports_wpa2_mfp_offload() -> bool` and `USE_MFP=1`;
+cipher advertisement alone cannot grant this association capability. The
+required profile demands one RSNE with exactly MFPC|MFPR, no additional
+caller security promises such as OCV, no PMKIDs, and BIP-CMAC-128 (explicit
+or the IEEE default when omitted). Its fixed PSK/CCMP body accepts only
+20/22/26-byte extents, with no partial/trailing fields, and the complete IE
+stream is bounded at 2048 bytes. Missing capability, missing/contradictory
+RSNE or unsupported suite remains closed; OPTIONAL remains unsupported.
+Other offload drivers preserve their no-required-PMF default. Every element
+is carried in `AssociateRequest::ie`, and an
 offloading driver replaces RSNE / RSNXE with its own and forwards the rest
 (`ieee80211_mgd_assoc`). A successful offloaded
 WPA2-PSK / SAE connect emits `CONNECT` (with `WIPHY`, `MAC`, `STATUS_CODE`)
@@ -463,6 +485,14 @@ waits for under `WPA_DRIVER_FLAGS_4WAY_HANDSHAKE_PSK`. `GET_SCAN` marks the
 associated BSS with `NL80211_BSS_STATUS_ASSOCIATED`; `GET_STATION` reports the
 AP (do needs `MAC`, -ENOENT for another peer) with the signal of its last scan
 record only.
+
+One native CONNECT admission smoke covers these capability/attribute/RSNE
+boundaries, including literal explicit/default BIP and unsupported-cipher-only
+profiles. The CYW43439 and BCM43602 native transport tests pass raw CONNECT
+attributes through the production parser and execution path into their real
+FullMAC Station, checking native MFP/association receipts and controlled-port
+state. A test-only entry point supplies the fixture's registered, currently
+valid admin capability; it does not change production authority or dispatch.
 
 **Two driver modes.** A handshake-offloading driver (iwlwifi, mt7921)
 advertises `4WAY_HANDSHAKE_STA_PSK` (and `SAE_OFFLOAD`): wpa_supplicant derives
@@ -691,6 +721,14 @@ reuse. This ordinary firmware station power save does not suspend the host bus
 or provide system suspend/WoW. Native SDPCM and PCIe-msgbuf models cover the
 commands, failures and Open/WPA2 DHCP/IP traffic with power save enabled.
 
+Ath10k RAW/non-PFC images without `NO_PS` also expose an awake default. Their
+retained worker submits the six-dialect native station-PS parameters and mode,
+with the awake default or explicit prejoin intent applied before carrier. Its applied diagnostic
+records submission rather than a firmware sleep acknowledgement. Desired intent
+coalesces without losing a newer request. Current policy and host closure fence
+each command poll; failure/cancellation closes admission and retains DMA. Actual
+DTIM, energy behavior and host-bus/system suspend remain separate acceptance.
+
 `SET_CQM` accepts the station/P2P-client RSSI form: a binary native-endian
 signed threshold array plus its required native-endian u32 hysteresis. Values
 must be non-positive and strictly increasing. A zero/empty array disables it;
@@ -712,10 +750,15 @@ zero-length `_MANDATORY` flag. The request retains both; ath11k applies a
 nonzero duration to every active/passive WMI dwell field and bounds its scan
 timeout with Linux's per-channel event-overhead calculation.
 
-`TRIGGER_SCAN` additionally accepts up to 512 bytes of `NL80211_ATTR_IE`,
-matching `WLAN_SCAN_PARAMS_MAX_IE_LEN`. On an active ath11k scan these are
+`WirelessNetIface::max_scan_ie_len()` supplies the native-endian u16
+`NL80211_ATTR_MAX_SCAN_IE_LEN` and the parser's pre-dispatch byte limit.
+Its compatibility default is 512; ath10k overrides it with its firmware's
+256-byte budget. Longer `NL80211_ATTR_IE` input returns -EINVAL before driver
+dispatch. On an active ath11k scan the accepted bytes are
 appended after the host's standard Probe Request rates/capabilities and sent
-as WMI's extra-IE array; longer input is -EINVAL.
+as WMI's extra-IE array. Ath10k validates complete probe elements, rejects
+firmware-owned SSID/rate elements and passive extra-IE requests, and copies
+accepted bytes into its retained six-dialect active-scan plan before I/O.
 
 `WirelessNetIface::nl80211_feature_flags()` returns only defined physical
 `NL80211_FEATURE_*` bits; the generic wiphy response combines them with its
@@ -859,6 +902,16 @@ admission, and key/nonce material is zeroized on drop. `transmit_ethernet`
 accepts local Ethernet data only while authorized and consumes its PN before
 transport publication. Each driver's stop/cancellation/DMA ownership remains
 that driver's responsibility.
+
+`Security::transmit_ethernet_qos(ethernet, tid)` preserves those same controlled
+port, Ethernet/EAPOL and key-lifetime checks while accepting TID0–15. It builds
+the full 26-byte QoS header before packet-key CCMP protection, so both the TID
+AAD and nonce priority authenticate the actual transmitted header. QoS and
+legacy frames consume the same installed key's monotonically increasing TX PN;
+invalid TIDs do not consume sequence/PN state. Each caller must independently
+prove AP WMM negotiation, native EDCA/descriptor/peer admission and applicable
+policy. This shared cryptographic formatter grants no HT, aggregation, U-APSD,
+role or radio capability.
 
 `Security::handshake_active()` reports a retained reply awaiting terminal
 delivery or the supplicant waiting for M3 after M2 delivery. It is false after

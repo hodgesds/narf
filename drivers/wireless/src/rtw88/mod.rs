@@ -39,6 +39,7 @@
 
 extern crate alloc;
 
+mod calibration8821c;
 mod command;
 mod dack;
 pub mod efuse;
@@ -49,6 +50,7 @@ pub mod fw;
 mod hardware;
 pub(super) mod interface;
 mod mac;
+mod operating8821c;
 pub(super) mod packet_core;
 pub(super) mod packet_format;
 mod pci_firmware;
@@ -57,17 +59,28 @@ mod phy;
 mod phy8821c;
 mod power_policy;
 mod probe_guard;
+mod publication;
 mod radio;
+mod radio8821c;
 mod reserved_page;
 mod sibling;
 mod station;
 pub(super) mod station_control;
+mod station_power8821c;
+mod station_profile;
+mod wmm;
+pub use calibration8821c::{Error as C21CalibrationError, Request as C21CalibrationRequest};
 pub use firmware_lifecycle::{Stage as FirmwareStage, Status as FirmwareStatus};
 pub use firmware_transport::{Error as FirmwareError, Info as FirmwareInfo};
 pub use mac::Info as MacInfo;
+pub use operating8821c::{Info as C21OperatingPowerInfo, Request as C21OperatingPowerRequest};
 pub use phy::Info as PhyTablesInfo;
 pub use power_policy::{Error as PowerError, Permission as PowerPermission};
 pub use radio::Info as RadioInfo;
+pub use radio8821c::Info as C21CalibrationInfo;
+pub use radio8821c::StationInfo as C21StationRadioInfo;
+pub use station_power8821c::Request as C21StationRequest;
+pub use station_profile::Request as C22LegacyWmmRequest;
 pub mod pci;
 pub(crate) mod pci_park;
 

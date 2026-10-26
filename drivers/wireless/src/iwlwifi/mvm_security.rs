@@ -1,0 +1,726 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+//! API77 native RSNA/key owner. Linux mvm/{sta,rxmq,mac80211}.c and
+//! fw/api/{sta,rx,tx}.h. Crypto verification never substitutes for firmware
+//! key, RX-epoch or positive EAPOL TX receipts.
+use super::super::{
+    boot_context::{put16, put32},
+    frame_api, security,
+};
+use super::{data::LegacyDataStatus, Owner, Phase};
+use alloc::{collections::VecDeque, vec::Vec};
+use narf_wireless::{
+    eapol::{KeyFrame, KI_KEY_MIC, KI_KEY_TYPE_PAIRWISE},
+    reg::RegulatoryDomain,
+};
+use zeroize::Zeroizing;
+
+const KEY: u8 = 0x17;
+const HISTORY: usize = 32;
+
+struct NativeKey {
+    material: Zeroizing<[u8; 16]>,
+    id: u8,
+    group: bool,
+    slot: u8,
+    rsc: u64,
+    api: u8,
+}
+
+struct Pending {
+    reply: Vec<u8>,
+    change: Option<security::KeyUpdate>,
+    frame: Vec<u8>,
+    install: Vec<Option<NativeKey>>,
+    changed: Vec<usize>,
+}
+
+struct Exchange {
+    session: security::Session,
+    keys: [Option<NativeKey>; 5],
+    incoming: VecDeque<(Vec<u8>, bool)>,
+    pending: Option<Pending>,
+    waiting: bool,
+    complete: bool,
+    key_api: u8,
+}
+
+#[derive(Default)]
+pub(super) struct Context {
+    active: Option<Exchange>,
+    // Retired key material must never reset a PN during this native owner
+    // lifetime, even after association/data teardown and recreation.
+    history: Vec<[u8; 32]>,
+    cookie: u32,
+    mic_keys: bool,
+}
+impl Context {
+    pub(super) fn new(api: &super::super::firmware_api::FirmwareApi<'_>) -> Self {
+        Self {
+            mic_keys: api.api_changes[0] & (1 << 29) != 0,
+            ..Self::default()
+        }
+    }
+    pub(super) fn ready(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|s| s.complete && !s.waiting && s.pending.is_none() && s.keys[0].is_some())
+    }
+    pub(super) fn started(&self) -> bool {
+        self.active.is_some()
+    }
+    pub(super) fn has_pairwise(&self) -> bool {
+        self.active.as_ref().is_some_and(|s| s.keys[0].is_some())
+    }
+    pub(super) fn receive(
+        &mut self,
+        ethernet: Vec<u8>,
+        encrypted: bool,
+    ) -> Result<(), &'static str> {
+        let active = self.active.as_mut().ok_or("MVM RSNA owner missing")?;
+        if active.incoming.len() == 8 {
+            return Err("MVM EAPOL input overflow");
+        }
+        active.incoming.push_back((ethernet, encrypted));
+        Ok(())
+    }
+}
+
+fn key_command(key: &NativeKey, remove: bool) -> Zeroizing<[u8; 76]> {
+    let mut bytes = Zeroizing::new([0; 76]);
+    bytes[1] = key.slot;
+    let flags = 8
+        | u16::from(key.id) << 8
+        | if key.group { 1 << 14 } else { 0 }
+        | if remove { 1 << 11 } else { 2 };
+    put16(&mut bytes[..], 2, flags);
+    if !remove {
+        bytes[4..20].copy_from_slice(key.material.as_ref());
+        // Match sta.c's memcpy from ieee80211_key_seq.ccmp.pn (six
+        // most-significant-first bytes). v2 leaves a hole at2/3; v3
+        // keeps the six bytes contiguous. TX sequence below is LE64.
+        let pn = key.rsc.to_be_bytes();
+        bytes[36..38].copy_from_slice(&pn[2..4]);
+        let tail = if key.api == 2 { 40 } else { 38 };
+        bytes[tail..tail + 4].copy_from_slice(&pn[4..]);
+        // Native TX PN starts0 only for authenticated new material. Firmware
+        // owns increments and IV/MIC insertion; retries never re-add this key.
+    }
+    bytes
+}
+
+fn success(bytes: &[u8]) -> Result<(), &'static str> {
+    if bytes.len() != 4 || u32::from_le_bytes(bytes.try_into().unwrap()) != 1 {
+        return Err("MVM native key/peer status rejected");
+    }
+    Ok(())
+}
+
+impl Owner {
+    pub(super) fn security_status(&self) -> Result<LegacyDataStatus, &'static str> {
+        let data = self
+            .power
+            .prepared
+            .as_ref()
+            .and_then(|p| p.mlme.data.as_ref())
+            .ok_or("MVM RSNA data context missing")?;
+        if !data.status.protected
+            || !self
+                .hardware
+                .idle_tx_binding(data.queue.ok_or("MVM RSNA queue absent")?, 0, 0)
+        {
+            return Err("MVM RSNA requires an idle protected data binding");
+        }
+        Ok(LegacyDataStatus {
+            bssid: data.status.bssid,
+            channel: data.status.channel,
+            queue: data.queue.unwrap(),
+            supported_rates: data.status.supported_rates,
+            protected: true,
+        })
+    }
+    fn security_api(&self) -> Result<u8, &'static str> {
+        // sta.c uses API_TKIP_MIC_KEYS to select the76-byte command and
+        // iwl_fw_lookup_cmd_ver(..., new_api ? 2 : 1). Missing/UNKNOWN
+        // table records therefore meanv2 here, not an absent command.
+        let version = match self.hardware.version(1, KEY).map(|v| v.0) {
+            None | Some(99) => 2,
+            Some(version) => version,
+        };
+        // mac80211.c sends the fixed RX sync-v1 structure without a
+        // version lookup. Respect an explicit incompatible table record,
+        // but do not invent a requirement that unversioned IDs be listed.
+        if !self.security.mic_keys
+            || !matches!(version, 2 | 3)
+            || self
+                .hardware
+                .version(5, 2)
+                .is_some_and(|v| !matches!(v.0, 1 | 99))
+            || self
+                .hardware
+                .version(5, 0xff)
+                .is_some_and(|v| !matches!(v.1, 1 | 99))
+        {
+            return Err("unsupported MVM key-v2/v3/RX-sync-v1 contract");
+        }
+        Ok(version)
+    }
+
+    pub async fn secure_legacy_wpa2(&mut self, pmk: [u8; 32]) -> Result<(), &'static str> {
+        self.secure_using(pmk, security::fresh_nonce, || {
+            narf_wireless::reg::db::get_domain().ok_or("MVM WPA2 policy unavailable")
+        })
+        .await
+    }
+    async fn secure_using(
+        &mut self,
+        pmk: [u8; 32],
+        mut nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
+        mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        let pmk = Zeroizing::new(pmk);
+        if self.phase != Phase::DataPrepared || self.security.started() {
+            return Err("MVM WPA2 already started or data owner not ready");
+        }
+        let status = self.security_status()?;
+        let key_api = self.security_api()?;
+        if let Err(error) = policy().and_then(|domain| self.check_link_power(&domain)) {
+            return self.data_failed(error);
+        }
+        let own = self.mac.ok_or("MVM WPA2 MAC missing")?;
+        let rsn = self
+            .beacons
+            .iter()
+            .find(|b| b.bssid == status.bssid && b.channel == status.channel)
+            .and_then(|b| {
+                let mut ies = b.information_elements.as_slice();
+                while ies.len() >= 2 {
+                    let end = 2 + usize::from(ies[1]);
+                    let bytes = ies.get(2..end)?;
+                    if ies[0] == 48 {
+                        return Some(bytes.to_vec());
+                    }
+                    ies = &ies[end..];
+                }
+                None
+            })
+            .ok_or("MVM actual WPA2 RSN offer absent")?;
+        let snonce = Zeroizing::new(nonce()?);
+        self.security.active = Some(Exchange {
+            session: security::Session::new(
+                security::Akm::Wpa2Psk,
+                *pmk,
+                status.bssid,
+                own,
+                *snonce,
+                rsn,
+            ),
+            keys: core::array::from_fn(|_| None),
+            incoming: VecDeque::new(),
+            pending: None,
+            waiting: true,
+            complete: false,
+            key_api,
+        });
+        self.phase = Phase::SecuringData;
+        let result = async {
+            self.fresh_data_policy(&mut policy).await?;
+            let reply = self
+                .qualified_link_command(1, 0x18, &super::auth::disable_tx(false), &mut policy)
+                .await?;
+            success(&reply)?;
+            self.security_loop(&mut nonce, &mut policy).await
+        }
+        .await;
+        self.finish_security(result)
+    }
+
+    /// Drive captured native EAPOL rekeys/retransmissions with the same PMK,
+    /// key slots, replay and current qualification owner. No caller RX bytes.
+    pub async fn service_legacy_wpa2(&mut self) -> Result<(), &'static str> {
+        self.service_security_using(security::fresh_nonce, || {
+            narf_wireless::reg::db::get_domain().ok_or("MVM WPA2 policy unavailable")
+        })
+        .await
+    }
+    async fn service_security_using(
+        &mut self,
+        mut nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
+        mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        if self.phase != Phase::DataPrepared || !self.security.started() {
+            return Err("MVM RSNA service owner absent");
+        }
+        if let Err(e) = policy().and_then(|domain| self.check_link_power(&domain)) {
+            return self.data_failed(e);
+        }
+        if self.security.active.as_ref().unwrap().incoming.is_empty() {
+            return Ok(());
+        }
+        self.power
+            .prepared
+            .as_mut()
+            .unwrap()
+            .mlme
+            .data
+            .as_mut()
+            .unwrap()
+            .port_open = false;
+        self.phase = Phase::SecuringData;
+        let result = self.security_loop(&mut nonce, &mut policy).await;
+        self.finish_security(result)
+    }
+
+    fn finish_security(&mut self, result: Result<(), &'static str>) -> Result<(), &'static str> {
+        match result {
+            Ok(()) => {
+                self.power
+                    .prepared
+                    .as_mut()
+                    .unwrap()
+                    .mlme
+                    .data
+                    .as_mut()
+                    .unwrap()
+                    .port_open = true;
+                self.phase = Phase::DataPrepared;
+                Ok(())
+            }
+            Err(e) => self.data_failed(e),
+        }
+    }
+
+    async fn security_loop(
+        &mut self,
+        nonce: &mut impl FnMut() -> Result<[u8; 32], &'static str>,
+        policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        let deadline = narf_time::Deadline::after_ms(6000);
+        for _ in 0..4096 {
+            self.check_link_power(&policy()?)?;
+            let activity = self.hardware.activity();
+            // Shared native receive checks bind the current AP/channel,
+            // rates, CRC/crypto metadata and every packet's current grant.
+            self.receive_data_inner(policy)?;
+            let next = self.security.active.as_mut().unwrap().incoming.pop_front();
+            if let Some((ethernet, encrypted)) = next {
+                let pdu = ethernet.get(14..).ok_or("short native EAPOL")?;
+                let key = KeyFrame::decode(pdu.get(4..).ok_or("short EAPOL key")?, 16)
+                    .ok_or("malformed EAPOL key")?;
+                let challenge = key.key_information & (KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC)
+                    == KI_KEY_TYPE_PAIRWISE;
+                let active = self.security.active.as_mut().unwrap();
+                if active.complete
+                    && !encrypted
+                    && !challenge
+                    && key.key_information & KI_KEY_TYPE_PAIRWISE == 0
+                {
+                    return Err("unprotected group rekey");
+                }
+                let response = active.session.process_with_nonce(pdu, &mut *nonce)?;
+                if challenge {
+                    active.waiting = true;
+                }
+                let own = self.mac.unwrap();
+                let status = self.security_status()?;
+                let old_key = self.security.active.as_ref().unwrap().keys[0].is_some();
+                let data = self
+                    .power
+                    .prepared
+                    .as_mut()
+                    .unwrap()
+                    .mlme
+                    .data
+                    .as_mut()
+                    .unwrap();
+                let mut bytes = frame_api::transmit(
+                    own,
+                    status.bssid,
+                    data.sequence,
+                    &ethernet_reply(own, status.bssid, &response.bytes),
+                    old_key,
+                )
+                .ok_or("MVM EAPOL reply geometry")?;
+                data.sequence = data.sequence.wrapping_add(1) & 4095;
+                // EAPOL uses the management/non-QoS queue, never an ordinary
+                // Ethernet producer. The native old PTK protects rekey replies.
+                bytes[16..22].copy_from_slice(&status.bssid);
+                let install = self.key_changes(response.keys.as_ref())?;
+                self.security.active.as_mut().unwrap().pending = Some(Pending {
+                    reply: response.bytes,
+                    change: response.keys,
+                    frame: bytes,
+                    install,
+                    changed: Vec::new(),
+                });
+                self.deliver_security_reply(policy).await?;
+            }
+            self.check_link_power(&policy()?)?;
+            if deadline.expired() {
+                return Err("MVM native RSNA deadline");
+            }
+            if self.security.ready() && self.security.active.as_ref().unwrap().incoming.is_empty() {
+                // Native control/TX waits can have collected a later AP
+                // close or EAPOL challenge. Drain those before port commit.
+                self.receive_data_inner(policy)?;
+                if self.security.active.as_ref().unwrap().incoming.is_empty() {
+                    self.check_link_power(&policy()?)?;
+                    return Ok(());
+                }
+            }
+            if self.security.active.as_ref().unwrap().incoming.is_empty()
+                && !self
+                    .hardware
+                    .notifications
+                    .iter()
+                    .any(|p| p.header.group_id == 0 && p.header.cmd == 0xc1)
+            {
+                activity.await;
+            }
+        }
+        Err("MVM native RSNA receive budget")
+    }
+
+    async fn deliver_security_reply(
+        &mut self,
+        policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        self.fresh_data_policy(policy).await?;
+        let queue = self
+            .management_queue
+            .ok_or("MVM EAPOL management owner absent")?
+            .id
+            .ok_or("MVM EAPOL management queue absent")?;
+        if !self.hardware.idle_tx_binding(queue, 0, 15) {
+            return Err("MVM EAPOL management queue not terminal");
+        }
+        let status = self.security_status()?;
+        let rate = super::super::rates::Rates {
+            supported: status.supported_rates,
+            basic: self
+                .power
+                .prepared
+                .as_ref()
+                .unwrap()
+                .mlme
+                .data
+                .as_ref()
+                .unwrap()
+                .status
+                .basic_rates,
+        }
+        .management_rate(
+            self.nvm.as_ref().unwrap().tx_chains
+                & self.nvm.as_ref().unwrap().tx_chains.wrapping_neg(),
+        );
+        let frame = self
+            .security
+            .active
+            .as_ref()
+            .unwrap()
+            .pending
+            .as_ref()
+            .unwrap()
+            .frame
+            .clone();
+        let reply = &self
+            .security
+            .active
+            .as_ref()
+            .unwrap()
+            .pending
+            .as_ref()
+            .unwrap()
+            .reply;
+        if frame.get(32..) != Some(reply.as_slice()) {
+            return Err("MVM retained EAPOL reply changed before native publication");
+        }
+        self.qualified_management_transmit(queue, &frame, rate, policy)
+            .await?;
+        if !self.hardware.idle_tx_binding(queue, 0, 15) {
+            return Err("MVM EAPOL completion not terminal");
+        }
+        if self
+            .security
+            .active
+            .as_ref()
+            .unwrap()
+            .pending
+            .as_ref()
+            .unwrap()
+            .change
+            .is_some()
+        {
+            self.apply_security_keys(policy).await?;
+            let active = self.security.active.as_mut().unwrap();
+            active.waiting = false;
+            active.complete = true;
+        }
+        self.security.active.as_mut().unwrap().pending = None;
+        Ok(())
+    }
+
+    fn key_changes(
+        &self,
+        change: Option<&security::KeyUpdate>,
+    ) -> Result<Vec<Option<NativeKey>>, &'static str> {
+        let Some(change) = change else {
+            return Ok(Vec::new());
+        };
+        if change.igtk.is_some() || change.group_id > 3 || change.group_rx_pn >> 48 != 0 {
+            return Err("unsupported MVM key update");
+        }
+        let mut keys = Vec::new();
+        let api = self.security.active.as_ref().unwrap().key_api;
+        if let Some(material) = change.pairwise {
+            keys.push(NativeKey {
+                material: Zeroizing::new(material),
+                id: 0,
+                group: false,
+                slot: 0,
+                rsc: 0,
+                api,
+            });
+        }
+        keys.push(NativeKey {
+            material: Zeroizing::new(change.group),
+            id: change.group_id,
+            group: true,
+            slot: change.group_id + 1,
+            rsc: change.group_rx_pn,
+            api,
+        });
+        let mut install = Vec::new();
+        for key in keys {
+            let index = usize::from(key.slot);
+            if let Some(old) = self.security.active.as_ref().unwrap().keys[index].as_ref() {
+                if old.material.as_ref() == key.material.as_ref() {
+                    continue;
+                }
+            }
+            let digest = key_digest(key.material.as_ref());
+            if self.security.history.contains(&digest)
+                || self.security.history.len() + install.len() >= HISTORY
+                || install
+                    .iter()
+                    .flatten()
+                    .any(|k: &NativeKey| key_digest(k.material.as_ref()) == digest)
+            {
+                return Err("MVM retired key reuse/history exhausted");
+            }
+            install.push(Some(key));
+        }
+        Ok(install)
+    }
+
+    async fn apply_security_keys(
+        &mut self,
+        policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        let reply = self
+            .qualified_link_command(1, 0x18, &super::auth::disable_tx(true), policy)
+            .await?;
+        success(&reply)?;
+        let count = self
+            .security
+            .active
+            .as_ref()
+            .unwrap()
+            .pending
+            .as_ref()
+            .unwrap()
+            .install
+            .len();
+        for entry in 0..count {
+            let key = self
+                .security
+                .active
+                .as_ref()
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .install[entry]
+                .as_ref()
+                .unwrap();
+            let index = usize::from(key.slot);
+            let body = key_command(key, false);
+            if let Some(old) = self.security.active.as_ref().unwrap().keys[index].as_ref() {
+                let remove = key_command(old, true);
+                let reply = self
+                    .qualified_link_command(1, KEY, &remove[..], policy)
+                    .await?;
+                success(&reply)?;
+                self.security.active.as_mut().unwrap().keys[index] = None;
+            }
+            let reply = self
+                .qualified_link_command(1, KEY, &body[..], policy)
+                .await?;
+            success(&reply)?;
+            let key = self
+                .security
+                .active
+                .as_mut()
+                .unwrap()
+                .pending
+                .as_mut()
+                .unwrap()
+                .install[entry]
+                .take()
+                .unwrap();
+            self.security
+                .history
+                .push(key_digest(key.material.as_ref()));
+            self.security.active.as_mut().unwrap().keys[index] = Some(key);
+            self.security
+                .active
+                .as_mut()
+                .unwrap()
+                .pending
+                .as_mut()
+                .unwrap()
+                .changed
+                .push(index);
+        }
+        self.sync_security_rx(Some(policy)).await?;
+        let active = self.security.active.as_ref().unwrap();
+        let pending = active.pending.as_ref().unwrap();
+        let data = self
+            .power
+            .prepared
+            .as_mut()
+            .unwrap()
+            .mlme
+            .data
+            .as_mut()
+            .unwrap();
+        for &index in &pending.changed {
+            let key = active.keys[index].as_ref().unwrap();
+            if key.group {
+                data.replay.group[usize::from(key.id)].fill(key.rsc);
+                data.replay.group_valid[usize::from(key.id)] = true;
+            } else {
+                data.replay.reset_pairwise();
+            }
+        }
+        let change = pending.change.as_ref().unwrap();
+        for pn in &mut data.replay.group[usize::from(change.group_id)] {
+            *pn = (*pn).max(change.group_rx_pn);
+        }
+        let reply = self
+            .qualified_link_command(1, 0x18, &super::auth::disable_tx(false), policy)
+            .await?;
+        success(&reply)?;
+        self.check_link_power(&policy()?)
+    }
+
+    pub(super) async fn remove_security_keys(&mut self) -> Result<(), &'static str> {
+        if self.security.active.is_none() {
+            return Ok(());
+        }
+        for index in 0..5 {
+            if let Some(key) = self.security.active.as_ref().unwrap().keys[index].as_ref() {
+                let body = key_command(key, true);
+                let reply = self
+                    .hardware
+                    .command_with_header_version(1, KEY, &body[..], 0)
+                    .await?;
+                success(&reply.payload)?;
+                self.security.active.as_mut().unwrap().keys[index] = None;
+            }
+        }
+        self.sync_security_rx(None::<&mut fn() -> Result<RegulatoryDomain, &'static str>>)
+            .await?;
+        self.security.active = None;
+        Ok(())
+    }
+
+    async fn sync_security_rx(
+        &mut self,
+        mut policy: Option<&mut impl FnMut() -> Result<RegulatoryDomain, &'static str>>,
+    ) -> Result<(), &'static str> {
+        let bound = if policy.is_some() {
+            Some((
+                self.mac.ok_or("MVM RX epoch MAC absent")?,
+                self.security_status()?,
+            ))
+        } else {
+            None
+        };
+        self.security.cookie = self
+            .security
+            .cookie
+            .checked_add(1)
+            .ok_or("MVM RX key epoch exhausted")?;
+        let cookie = self.security.cookie;
+        let mut body = [0; 20];
+        put32(&mut body, 4, 1);
+        put32(&mut body, 8, 8);
+        put16(&mut body, 14, 1);
+        put32(&mut body, 16, cookie);
+        let reply = if let Some(p) = policy.as_deref_mut() {
+            self.qualified_link_command(5, 2, &body, p).await?
+        } else {
+            self.hardware
+                .command_with_header_version(5, 2, &body, 0)
+                .await?
+                .payload
+        };
+        if !reply.is_empty() {
+            return Err("MVM RX key fence command receipt malformed");
+        }
+        let deadline = narf_time::Deadline::after_ms(2000);
+        loop {
+            if let Some(p) = policy.as_deref_mut() {
+                self.check_link_power(&p()?)?;
+            }
+            let activity = self.hardware.activity();
+            self.hardware.poll()?;
+            while let Some(packet) = self.hardware.notifications.pop_front() {
+                if bound.is_some()
+                    && packet.header.group_id == 0
+                    && packet.header.cmd == 0xc1
+                    && super::super::scan_api::mpdu_gen2(&packet.payload).is_some_and(|mpdu| {
+                        let (mac, status) = bound.unwrap();
+                        super::data::ap_disconnected(&mpdu, mac, status)
+                    })
+                {
+                    return Err("MVM AP disconnected during native RX key epoch");
+                }
+                if packet.header.group_id == 5 && packet.header.cmd == 0xff {
+                    let bytes = packet.payload;
+                    if bytes.len() != 12 || bytes[..8] != [8, 0, 0, 0, 0, 0, 1, 0] {
+                        return Err("MVM RX key epoch marker malformed");
+                    }
+                    if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) == cookie {
+                        return Ok(());
+                    }
+                }
+                // Every earlier packet belongs to the retired RX epoch. The
+                // single owned RX queue's matching marker orders that prefix.
+            }
+            if deadline.expired() {
+                return Err("MVM RX key epoch marker timeout");
+            }
+            activity.await;
+        }
+    }
+}
+
+fn ethernet_reply(own: [u8; 6], peer: [u8; 6], pdu: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&peer);
+    out.extend_from_slice(&own);
+    out.extend_from_slice(&[0x88, 0x8e]);
+    out.extend_from_slice(pdu);
+    out
+}
+
+fn key_digest(key: &[u8]) -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(key);
+    hash.finalize()
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "mvm_security_tests.rs"]
+mod tests;

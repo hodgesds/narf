@@ -785,7 +785,9 @@ BSSID match, MACID/port and checked AID. Every security-entry valid bit remains
 zero. Global TX encryption/hardware decryption and MIC/ICV appending are
 explicitly disabled and read back for original host CCMP MPDUs. The fixed
 legacy profile uses source TX-A CCTL path selection, CCK1/20MHz and disabled
-data/RTS fallback, with no WMM/HT claims. Source EDCA commands use non-QoS
+data/RTS fallback. The original flags3 qualification has no WMM/HT claims;
+the optional separately qualified WMM profile below retains the same PHY.
+Initial source EDCA commands use non-QoS
 TXOP0, CWmin31/CWmax1023 and AIFSN2; actual negotiated long/short slot yields
 50/28us AIFS. `profile_fingerprint()` binds these exact CCTL/EDCA/software-crypto
 choices for the independent ordinary RF/automatic-response grant. CCTL TX-A
@@ -826,8 +828,11 @@ and authority loss before command publication. They supply no physical RF grant.
 AX PCI body/WP/address-info records for an initial non-QoS, three-address native
 profile. Only 8852B additionally admits already encrypted host CCMP To-DS data
 with complete IV/ciphertext/MIC extents, reserved/ExtIV/PN validation and hardware
-encryption/IV insertion disabled. Protected management, QoS, fragmentation and
-optional headers remain rejected. It rejects unsupported BE, wrong QSEL/channel
+encryption/IV insertion disabled. The optional B WMM profile additionally admits
+checked26-byte BE/TID0 QoS headers, with source header length13 halfwords and
+CCMP extents shifted accordingly. Current native peer admission remains mandatory;
+formatting alone grants no RF/QoS authority. Protected management, other TIDs,
+fragmentation and optional headers remain rejected. It rejects unsupported BE, wrong QSEL/channel
 and address extents outside the 36-bit 8852B/8852C device mask or 40-bit other AX
 baseline. Descriptor encoding capacity does not grant DMA address authority.
 Baseline uses a 24-byte body and eight-byte
@@ -897,6 +902,62 @@ station/firmware producer or RPQ pump caller yet. The registered Ethernet
 `pci::send_frame` rejects before allocation or MMIO until those owners and
 Ethernet-to-native encapsulation exist.
 
+### Separately qualified RTL8852B WMM BE/TID0
+
+N52B v2 profile byte57 may additionally be7 instead of3. Flags3 retains its
+original full-radio digest and legacy station behavior. Flags7 requires a
+distinct derived digest binding that full board/firmware/PHY/power identity and
+the versioned WMM negotiation, source H2C EDCA, conservative BE policy and
+26-byte TID0 TXWD recipe. Merely changing the flag on an old signed record
+fails identity. The retained qualification request logs the alternate WMM
+identity beside the same `radio-v2` asset name; only actual measured signed
+evidence covering this operating program can enable it. Calibration-only or
+legacy qualification cannot authorize QoS.
+
+When both the actual current qualification and scan AP permit WMM, the driver
+adds its own Information IE. The already peer/status/AID/rate-bound response
+must supply valid WMM parameters. Source MAC H2C class9/function15 programs
+four canonical BE/BK/VI/VO EDCA values with actual identity/sequence-matched
+DONE_ACK. All rows are checked before publication, including representable AIFS;
+BE uses AIFSN>=3, ECWmin>=5, ECWmax>=10 and TXOP0. The source10us SIFS and
+negotiated9/20us slot remain exact. Only after all four receipts does the
+retained native peer token admit QoS DATA/TID0 on BE0. That token is invalidated
+before failed/cancelled setup or teardown; an unrelated or late receipt cannot
+promote it. Actual device and signed qualification invocations still enclose
+native commands/descriptors/doorbells. Live flags7 policy checks require the
+installed domain and cannot reload a cleared installation.
+
+Raw26-byte headers precede host CCMP; native TXWD uses13 halfwords and complete
+shifted IV/ciphertext/MIC validation. Open/WPA2 RX retains source channel and
+per-key/TID replay checks. Valid bound AP parameter changes close the station;
+dynamic EDCA, HT/BA, U-APSD, TSPEC, priority scheduling and other TIDs remain
+unsupported. Four native Rust smokes exercise distinct signed recipes/current
+cap revocation, literal source H2C/peer gates, failing/held ACK and cancellation,
+actual native packet owners through Open/WPA2 and exact bidirectional data,
+malformed response and held M4. Real measured flags7 assets and physical WMM/RF
+acceptance remain external gates; broader lifecycle recovery remains open.
+
+### Negotiated legacy DATA rates under WMM recipe revision2
+
+The flags7 derived WMM identity now binds recipe revision2, the exact native
+TXWD_INFO0 DATA_RATE[24:16] field, USE_RATE/DISDATAFB and response-bound
+selection order54,48,36,24,18,12,11,9,6,5.5,2,1Mbps. Earlier flags7 measured
+records cannot authorize this changed emitter program. A genuine new record
+must bound all newly reachable DATA rates and the complete unchanged radio/
+automatic-response program. Flags3 remains fixed CCK1; packet formatting or
+an AP rate offer cannot promote that qualification.
+
+Only ordinary DATA after actual WMM/peer admission selects the fastest rate
+from the common plan's actual association response/request intersection.
+Management/EAPOL remain CCK1 and the initial AP still needs that basic rate.
+The actual Native rechecks the current flags7 qualifier before nonzero-rate
+publication, then the same retained packet owner formats TXWD and waits for
+both TXBD consumption and matching RPQ release. One composed native smoke
+checks all12 literal TXWD rates, Open/WPA2 data/CCMP, AP response narrowing,
+current PCI loss and unchanged flags3 behavior. HT/HE, adaptive fallback/MRR
+and full WMM AC/TIDs remain software work with additional source and signed
+qualification dependencies.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before
@@ -946,6 +1007,17 @@ or physical hardware acceptance.
 | Initial B scan, MLME, WPA2 and Ethernet | Source controller plus shared host MLME/RSNA/CCMP, exact M4/RX-idle admission, kernel DHCP/IP, rekey and terminal disconnect/cancellation are implemented; physical acceptance remains |
 | BE EFUSE/block format and BE transport | Missing |
 | Broader lifecycle | Initial independent reset and terminal ownership implemented; removal, suspend, automatic reset/rejoin and multiple live functions remain outside this first profile |
+
+The per-chip source `rtw_chip_info` inventories are broader than this station:
+8851B declares1TX/1RX and2.4/5GHz;8852A/B declare2TX/2RX and2.4/5GHz;
+8852C declares2TX/2RX and2.4/5/6GHz;8922A declares2TX/2RX and2.4/5/6GHz
+with its distinct BE generation. B still needs source-bound HT/HE and widths,
+full QoS AC/TIDs, BA/aggregation/reorder, broader channel/scan policy, tracking,
+runtime sleep/WoW and safe reset/rejoin. A/C/51 need complete chip-specific
+firmware/security, BB/RF/power/packet/station composition;8922A additionally
+needs BE EFUSE/container/descriptor/transport and EHT operation. Source band
+masks make6GHz inapplicable to A/B/51, not to C/8922A. These are remaining
+software dependencies, not implementation-complete hardware capability claims.
 
 References: Linux `rtw89/efuse.c`, `rtw8852a.h`, `rtw8852b_common.h`,
 `rtw8852c.h`, `rtw8851b.h`, `core.c::rtw89_core_get_ch_dma`,

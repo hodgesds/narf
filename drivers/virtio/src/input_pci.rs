@@ -111,6 +111,8 @@ const MAX_MT_SLOTS: usize = 10;
 
 // virtio-input device-config selector codes (VirtIO 1.2 §5.8.4).
 const CFG_ID_NAME: u8 = 0x01;
+const CFG_ID_SERIAL: u8 = 0x02;
+const CFG_ID_DEVIDS: u8 = 0x03;
 const CFG_EV_BITS: u8 = 0x11;
 const CFG_ABS_INFO: u8 = 0x12;
 
@@ -201,10 +203,27 @@ unsafe fn read_cfg(
     take
 }
 
-/// Read the device name + per-axis bounds + LED bitmap. Returns
-/// the (name, axis_info[], led_bits) triple. Best-effort — missing
-/// selectors leave fields empty / `None` / `0`. Called once at
-/// probe.
+/// Parse a `CFG_ID_DEVIDS` payload into an evdev [`InputId`].
+///
+/// The wire struct is four little-endian u16s — bustype, vendor,
+/// product, version — so a full read is 8 bytes and every field sits
+/// at its own offset. A short or absent selector (a device that
+/// simply does not publish ids) falls back to the synthetic
+/// identity: BUS_VIRTUAL with zeroed ids.
+///
+/// [`InputId`]: narf_input::evdev::InputId
+fn parse_devids(bytes: &[u8]) -> narf_input::evdev::InputId {
+    if bytes.len() < 8 {
+        return narf_input::evdev::InputId::new(narf_input::evdev::bus::VIRTUAL, 0, 0, 0);
+    }
+    let le16 = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+    narf_input::evdev::InputId::new(le16(0), le16(2), le16(4), le16(6))
+}
+
+/// Read the device name + serial + ids + per-axis bounds + LED
+/// bitmap. Returns (name, serial, ids, axis_info[], led_bits).
+/// Best-effort — missing selectors leave fields empty / `None` /
+/// `0`. Called once at probe.
 ///
 /// # Safety
 /// `region` must be a live virtio-input device-cfg mapping.
@@ -212,6 +231,8 @@ unsafe fn read_device_metadata(
     region: &crate::pci::VirtioRegion,
 ) -> (
     alloc::string::String,
+    alloc::string::String,
+    narf_input::evdev::InputId,
     [Option<narf_input::AxisInfo>; ABS_BOUNDS_LEN],
     u8,
 ) {
@@ -225,6 +246,26 @@ unsafe fn read_device_metadata(
         .position(|&b| b == 0)
         .unwrap_or(trimmed.len());
     let name = alloc::string::String::from_utf8_lossy(&trimmed[..stop]).into_owned();
+
+    // Serial (evdev `uniq`): same string shape as the name.
+    let mut serial_buf = [0u8; 128];
+    // SAFETY: caller-asserted mapped region.
+    let n = unsafe { read_cfg(region, CFG_ID_SERIAL, 0, &mut serial_buf) };
+    let trimmed = &serial_buf[..n];
+    let stop = trimmed
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(trimmed.len());
+    let serial = alloc::string::String::from_utf8_lossy(&trimmed[..stop]).into_owned();
+
+    // Device ids: `struct virtio_input_devids { le16 bustype; le16
+    // vendor; le16 product; le16 version; }` (VirtIO §5.8,
+    // virtio_input.h) — the bustype is the device's own, not a
+    // hardcoded BUS_VIRTUAL.
+    let mut id_buf = [0u8; 8];
+    // SAFETY: caller-asserted mapped region.
+    let got = unsafe { read_cfg(region, CFG_ID_DEVIDS, 0, &mut id_buf) };
+    let devids = parse_devids(&id_buf[..got]);
 
     // EV_BITS for EV_ABS tells us which axes have abs-info to read.
     let mut ev_abs_bits = [0u8; 128];
@@ -258,7 +299,7 @@ unsafe fn read_device_metadata(
     let nled = unsafe { read_cfg(region, CFG_EV_BITS, EV_LED as u8, &mut led_buf) };
     let led_bits = if nled == 0 { 0u8 } else { led_buf[0] };
 
-    (name, axis_info, led_bits)
+    (name, serial, devids, axis_info, led_bits)
 }
 
 /// Classify a virtio-input device from its advertised EV bits and
@@ -290,6 +331,7 @@ enum EvdevKind {
 unsafe fn register_evdev_node(
     region: &crate::pci::VirtioRegion,
     axis_info: &[Option<narf_input::AxisInfo>; ABS_BOUNDS_LEN],
+    identity: &DeviceCaps,
 ) -> (Option<alloc::sync::Arc<DeviceNode>>, EvdevKind) {
     let bit = |buf: &[u8], n: usize, code: usize| {
         let byte = code / 8;
@@ -309,7 +351,7 @@ unsafe fn register_evdev_node(
 
     // A real relative mouse: EV_REL deltas + buttons.
     if has_rel {
-        let mut caps = DeviceCaps::new();
+        let mut caps = identity.clone();
         caps.add_rel(REL_X);
         caps.add_rel(REL_Y);
         caps.add_key(BTN_LEFT);
@@ -341,7 +383,7 @@ unsafe fn register_evdev_node(
             .get(abs::ABS_Y as usize)
             .and_then(|a| *a)
             .unwrap_or(default_range);
-        let mut caps = DeviceCaps::new();
+        let mut caps = identity.clone();
         caps.add_abs_info(abs::ABS_X, x_info);
         caps.add_abs_info(abs::ABS_Y, y_info);
         caps.add_key(BTN_LEFT);
@@ -358,7 +400,7 @@ unsafe fn register_evdev_node(
     // KEY_ESC = 1, KEY_A = 30 (input-event-codes.h). Either present ⇒ kbd.
     let is_kbd = bit(&key_bits, nkey, 1) || bit(&key_bits, nkey, 30);
     if is_kbd {
-        let mut caps = DeviceCaps::new();
+        let mut caps = identity.clone();
         for code in 0..nkey * 8 {
             if bit(&key_bits, nkey, code) {
                 caps.add_key(code as u16);
@@ -398,6 +440,7 @@ fn abs_to_px(v: i32, info: Option<narf_input::AxisInfo>, span: i64) -> i32 {
 }
 
 mod abs_px_tests;
+mod devids_tests;
 
 #[derive(Debug)]
 struct Queues {
@@ -707,19 +750,54 @@ impl VirtioInputPci {
         } else {
             None
         };
-        let (name, axis_info, led_bits) = match device_cfg.as_ref() {
+        let (name, serial, devids, axis_info, led_bits) = match device_cfg.as_ref() {
             // SAFETY: device-cfg region was just mapped; read_cfg
             // bounds-checks every offset.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             Some(r) => unsafe { read_device_metadata(r) },
-            None => (alloc::string::String::new(), [None; ABS_BOUNDS_LEN], 0u8),
+            None => (
+                alloc::string::String::new(),
+                alloc::string::String::new(),
+                narf_input::evdev::InputId::new(narf_input::evdev::bus::VIRTUAL, 0, 0, 0),
+                [None; ABS_BOUNDS_LEN],
+                0u8,
+            ),
+        };
+
+        // evdev identity for the node registered below: the device's
+        // own name/serial/ids from virtio config, phys from its bus
+        // address. A blank name falls back to the class name so the
+        // node never publishes an empty EVIOCGNAME.
+        let identity = {
+            let mut caps = DeviceCaps::new();
+            let phys = match device.addr {
+                narf_bus::BusAddr::Pcie(a) => alloc::format!(
+                    "pci-{:04x}:{:02x}:{:02x}.{}/input0",
+                    a.segment,
+                    a.bus,
+                    a.device,
+                    a.function
+                ),
+                narf_bus::BusAddr::Mmio(p) => alloc::format!("virtio-mmio-{:#x}/input0", p.raw()),
+            };
+            caps.set_identity(
+                if name.is_empty() {
+                    "Virtio Input"
+                } else {
+                    &name
+                },
+                &phys,
+                &serial,
+                devids,
+            );
+            caps
         };
 
         // Expose the device on /dev/input/event* so a userspace
         // compositor (weston via libinput) can read it.
         let (evdev_node, evdev_kind) = match device_cfg.as_ref() {
             // SAFETY: device-cfg region was just mapped above.
-            Some(r) => unsafe { register_evdev_node(r, &axis_info) },
+            Some(r) => unsafe { register_evdev_node(r, &axis_info, &identity) },
             None => (None, EvdevKind::Pointer),
         };
 

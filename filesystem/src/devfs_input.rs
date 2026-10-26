@@ -233,6 +233,82 @@ unsafe fn copy_to_user_bytes(uptr: usize, src: &[u8]) -> Result<usize, FsError> 
     Ok(src.len())
 }
 
+/// Copy `dst.len()` bytes from the user buffer at `uptr` — the mirror
+/// of [`copy_to_user_bytes`], used by the uinput setup ioctls.
+///
+/// # Safety
+/// `uptr` must be a valid user-space pointer with at least `dst.len()`
+/// readable bytes, or null (rejected).
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_from_user_bytes(uptr: usize, dst: &mut [u8]) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: caller guarantees `uptr` is a valid readable user pointer
+    // of at least `dst.len()` bytes; `with_user_access` opens the SMAP
+    // window and the byte copy stays within that range.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::copy_nonoverlapping(uptr as *const u8, dst.as_mut_ptr(), dst.len());
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn copy_from_user_bytes(uptr: usize, dst: &mut [u8]) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: caller guarantees `uptr` is a valid readable user pointer
+    // of at least `dst.len()` bytes (no SMAP outside x86_64).
+    unsafe {
+        core::ptr::copy_nonoverlapping(uptr as *const u8, dst.as_mut_ptr(), dst.len());
+    }
+    Ok(())
+}
+
+/// Read a NUL-terminated user string of at most `max` bytes (the
+/// `UI_SET_PHYS` argument shape). Stops at the first NUL; a string
+/// with no NUL in `max` bytes is truncated, matching how the kernel
+/// bounds `strncpy_from_user` for this ioctl.
+fn read_user_c_string(uptr: usize, max: usize) -> Result<String, FsError> {
+    let mut out = Vec::new();
+    for i in 0..max {
+        let mut byte = [0u8; 1];
+        // SAFETY: `uptr + i` walks the caller's string one byte at a
+        // time and stops at its NUL; the caller (the ioctl layer) has
+        // validated `uptr` as a user pointer for this request.
+        unsafe { copy_from_user_bytes(uptr + i, &mut byte)? };
+        if byte[0] == 0 {
+            break;
+        }
+        out.push(byte[0]);
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Apply a `struct uinput_setup` image (92 bytes: `input_id` +
+/// `name[80]` + `ff_effects_max`) to `caps`. Pure over the byte image
+/// so kernel tests can pin the wire layout without a user pointer.
+fn apply_uinput_setup(caps: &mut DeviceCaps, setup: &[u8]) -> Result<(), FsError> {
+    if setup.len() < 92 {
+        return Err(FsError::InvalidData);
+    }
+    let le16 = |off: usize| u16::from_le_bytes([setup[off], setup[off + 1]]);
+    let name_bytes = &setup[8..88];
+    let stop = name_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(name_bytes.len());
+    let name = String::from_utf8_lossy(&name_bytes[..stop]).into_owned();
+    // Direct field assignment (not `set_identity`): a uinput setup
+    // carries no phys/uniq, so those keep whatever UI_SET_PHYS set.
+    caps.name = name;
+    caps.id = narf_input::evdev::InputId::new(le16(0), le16(2), le16(4), le16(6));
+    Ok(())
+}
+
 // ── EVIOC* ioctl decoding ─────────────────────────────────────────────────────
 
 /// Linux `_IOC` field accessors.  An ioctl `cmd` packs
@@ -263,10 +339,6 @@ const EVIOC_TYPE: u32 = b'E' as u32;
 /// Ref: `include/uapi/linux/input.h:53`.
 const EV_VERSION: i32 = 0x01_0001;
 
-/// `BUS_VIRTUAL` bustype for the synthesised `input_id`.
-/// Ref: `include/uapi/linux/input.h:259`.
-const BUS_VIRTUAL: u16 = 0x06;
-
 /// Fixed `nr` values for the non-parametric evdev ioctls.
 const EVIOC_NR_GVERSION: u32 = 0x01; // EVIOCGVERSION
 const EVIOC_NR_GID: u32 = 0x02; // EVIOCGID
@@ -285,8 +357,17 @@ const EVIOC_NR_GRAB: u32 = 0x90; // EVIOCGRAB
 const EVIOC_NR_REVOKE: u32 = 0x91; // EVIOCREVOKE
 const EVIOC_NR_SCLOCKID: u32 = 0xa0; // EVIOCSCLOCKID — set the event clock
 
-/// Synthetic device name reported by `EVIOCGNAME`.
-const DEVICE_NAME: &[u8] = b"narf-input";
+/// Render an identity string the way the string `EVIOCG*` ioctls do:
+/// bytes plus a trailing NUL, truncated by the caller to the user's
+/// requested length. An empty stored string falls back so a device
+/// never reports an empty name.
+fn identity_bytes(value: &str, fallback: &str) -> Vec<u8> {
+    let text = if value.is_empty() { fallback } else { value };
+    let mut bytes = Vec::with_capacity(text.len() + 1);
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.push(0);
+    bytes
+}
 
 // ── InputEventFile ────────────────────────────────────────────────────────────
 
@@ -621,10 +702,15 @@ impl FileOps for InputEventFile {
                 Ok(n as u64)
             }
             EVIOC_NR_GID => {
-                // EVIOCGID → struct input_id { bustype, vendor, product, version }.
+                // EVIOCGID → struct input_id { bustype, vendor, product,
+                // version } — the identity the producing transport
+                // registered, not a synthetic all-virtual id.
+                let caps = ROUTER.caps(self.device_id).ok_or(FsError::NotFound)?;
                 let mut id = [0u8; 8];
-                id[0..2].copy_from_slice(&BUS_VIRTUAL.to_le_bytes());
-                // vendor/product/version left zero (synthetic device).
+                id[0..2].copy_from_slice(&caps.id.bustype.to_le_bytes());
+                id[2..4].copy_from_slice(&caps.id.vendor.to_le_bytes());
+                id[4..6].copy_from_slice(&caps.id.product.to_le_bytes());
+                id[6..8].copy_from_slice(&caps.id.version.to_le_bytes());
                 // SAFETY: `arg` is the user `struct input_id *`.
                 let n = unsafe { copy_to_user_bytes(arg, &id)? };
                 Ok(n as u64)
@@ -632,12 +718,37 @@ impl FileOps for InputEventFile {
             EVIOC_NR_GNAME => {
                 // EVIOCGNAME(len) → NUL-terminated device name, truncated
                 // to the requested length.  Returns the byte count copied.
-                let mut name = Vec::with_capacity(DEVICE_NAME.len() + 1);
-                name.extend_from_slice(DEVICE_NAME);
-                name.push(0);
+                let caps = ROUTER.caps(self.device_id).ok_or(FsError::NotFound)?;
+                let name = identity_bytes(&caps.name, "narf-input");
                 let take = name.len().min(size.max(1));
                 // SAFETY: `arg` is the user name buffer of `size` bytes.
                 let n = unsafe { copy_to_user_bytes(arg, &name[..take])? };
+                Ok(n as u64)
+            }
+            EVIOC_NR_GPHYS | EVIOC_NR_GUNIQ => {
+                // EVIOCGPHYS / EVIOCGUNIQ(len) → the device's topology /
+                // unique strings, same wire shape as EVIOCGNAME.
+                let caps = ROUTER.caps(self.device_id).ok_or(FsError::NotFound)?;
+                let value = if nr == EVIOC_NR_GPHYS {
+                    &caps.phys
+                } else {
+                    &caps.uniq
+                };
+                let bytes = identity_bytes(value, "");
+                let take = bytes.len().min(size.max(1));
+                // SAFETY: `arg` is the user string buffer of `size` bytes.
+                let n = unsafe { copy_to_user_bytes(arg, &bytes[..take])? };
+                Ok(n as u64)
+            }
+            EVIOC_NR_GPROP => {
+                // EVIOCGPROP(len) → the INPUT_PROP_* bitmap. libinput
+                // reads BUTTONPAD/DIRECT from here to classify the
+                // device; an all-zero answer misclassifies touchpads.
+                let caps = ROUTER.caps(self.device_id).ok_or(FsError::NotFound)?;
+                let src = caps.propbit.as_bytes();
+                let take = src.len().min(size);
+                // SAFETY: `arg` is the user bitmap buffer of `size` bytes.
+                let n = unsafe { copy_to_user_bytes(arg, &src[..take])? };
                 Ok(n as u64)
             }
             EVIOC_NR_GRAB => {
@@ -667,15 +778,16 @@ impl FileOps for InputEventFile {
                 // Our event timestamps are already monotonic; accept + no-op.
                 Ok(0)
             }
-            EVIOC_NR_GPROP | EVIOC_NR_GMTSLOTS | EVIOC_NR_GKEY | EVIOC_NR_GLED | EVIOC_NR_GSND
-            | EVIOC_NR_GSW | EVIOC_NR_GPHYS | EVIOC_NR_GUNIQ => {
-                // Property bitmap, multitouch-slot state, current key/LED/sound/
-                // switch state, and the phys/uniq strings. We synthesise none of
-                // these, but libevdev (libinput's backend) issues them at device
-                // init and treats a FAILURE — notably EVIOCGPROP — as fatal,
-                // rejecting the device. Report an all-zero buffer of the
-                // requested length: no properties set, no keys/LEDs/switches
-                // active, empty strings. Linux ref: `libevdev_set_fd`.
+            EVIOC_NR_GMTSLOTS | EVIOC_NR_GKEY | EVIOC_NR_GLED | EVIOC_NR_GSND | EVIOC_NR_GSW => {
+                // Multitouch-slot state and current key/LED/sound/switch
+                // state. We synthesise none of these, but libevdev
+                // (libinput's backend) issues them at device init and
+                // treats a FAILURE as fatal, rejecting the device.
+                // Report an all-zero buffer of the requested length: no
+                // keys/LEDs/switches active. (Properties and the
+                // phys/uniq strings are real now — see the GPROP /
+                // GPHYS / GUNIQ arms above.) Linux ref:
+                // `libevdev_set_fd`.
                 let zeros = alloc::vec![0u8; size];
                 // SAFETY: `arg` is the user buffer of `size` bytes, validated
                 // by the syscall layer before dispatch.
@@ -761,6 +873,7 @@ const UI_SET_RELBIT: u32 = 102; // _IOW('U', 102, int)
 const UI_SET_ABSBIT: u32 = 103; // _IOW('U', 103, int)
 const UI_SET_MSCBIT: u32 = 104; // _IOW('U', 104, int)
 const UI_SET_PHYS: u32 = 108; // _IOW('U', 108, char*)
+const UI_SET_PROPBIT: u32 = 110; // _IOW('U', 110, int)
 
 /// Mutable state behind the control file's lock.
 struct UinputInner {
@@ -961,10 +1074,30 @@ impl FileOps for UinputControlFile {
                 g.caps.add_abs(arg as u16);
                 Ok(0)
             }
-            UI_SET_MSCBIT | UI_SET_PHYS | UI_DEV_SETUP => {
-                // Accept; we don't model misc bits, phys strings, or the
-                // uinput_setup name/id struct (the synthetic device name is
-                // reported by InputEventFile's EVIOCGNAME handler).
+            UI_SET_PROPBIT => {
+                // arg IS the INPUT_PROP_* code (passed by value).
+                g.caps.add_prop(arg as u16);
+                Ok(0)
+            }
+            UI_SET_PHYS => {
+                // arg is a `char *` to the device's phys string.
+                let phys = read_user_c_string(arg, 128)?;
+                g.caps.phys = phys;
+                Ok(0)
+            }
+            UI_DEV_SETUP => {
+                // arg is a `struct uinput_setup *`: input_id + name[80]
+                // + ff_effects_max. The name/id land on the created
+                // device's identity instead of being discarded.
+                let mut setup = [0u8; 92];
+                // SAFETY: `arg` is the user `struct uinput_setup *`
+                // validated by the syscall layer before dispatch.
+                unsafe { copy_from_user_bytes(arg, &mut setup)? };
+                apply_uinput_setup(&mut g.caps, &setup)?;
+                Ok(0)
+            }
+            UI_SET_MSCBIT => {
+                // Accept; misc bits aren't modelled in DeviceCaps.
                 Ok(0)
             }
             // uinput is lenient about unknown setup-style requests.
@@ -987,6 +1120,152 @@ impl FileOps for UinputControlFile {
 #[derive(Debug)]
 pub struct DevInputDir;
 
+/// Which alias namespace a `/dev/input/by-*` directory serves.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum InputAliasKind {
+    ById,
+    ByPath,
+}
+
+/// Sanitize one alias component the way udev does: anything outside
+/// `[A-Za-z0-9._-]` becomes `_`.
+fn sanitize_alias(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    while out.starts_with('_') {
+        out.remove(0);
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("narf-input");
+    }
+    out
+}
+
+/// The class suffix udev-style alias names carry (`-event-touchpad`,
+/// `-event-kbd`, …), derived from the device's properties/caps.
+fn alias_class_suffix(caps: &narf_input::evdev::DeviceCaps) -> &'static str {
+    use narf_input::evdev::{key, prop};
+    if caps.has_prop(prop::BUTTONPAD) {
+        "-event-touchpad"
+    } else if caps.has_prop(prop::DIRECT) && caps.keybit.get(key::BTN_TOOL_PEN) {
+        "-event-tablet"
+    } else if caps.has_prop(prop::DIRECT) && caps.keybit.get(key::BTN_TOUCH) {
+        "-event-touchscreen"
+    } else if caps.evbit & (1 << (narf_input::evdev::EventType::Rel as u16)) != 0
+        || caps.keybit.get(key::BTN_LEFT)
+    {
+        "-event-mouse"
+    } else if caps.evbit & (1 << (narf_input::evdev::EventType::Key as u16)) != 0 {
+        "-event-kbd"
+    } else {
+        "-event"
+    }
+}
+
+/// The alias name for one registered device in one namespace, or
+/// `None` when the namespace cannot name it (by-path needs a phys).
+fn input_alias_name(kind: InputAliasKind, caps: &narf_input::evdev::DeviceCaps) -> Option<String> {
+    match kind {
+        InputAliasKind::ById => {
+            let bus_name = match caps.id.bustype {
+                narf_input::evdev::bus::USB => "usb",
+                narf_input::evdev::bus::I2C => "i2c",
+                narf_input::evdev::bus::I8042 => "serio",
+                narf_input::evdev::bus::PCI => "pci",
+                _ => "virtual",
+            };
+            let mut name = alloc::format!("{}-", bus_name);
+            if caps.id.vendor != 0 || caps.id.product != 0 {
+                name.push_str(&alloc::format!(
+                    "{:04x}-{:04x}-",
+                    caps.id.vendor,
+                    caps.id.product
+                ));
+            }
+            name.push_str(&sanitize_alias(&caps.name));
+            if !caps.uniq.is_empty() {
+                name.push('-');
+                name.push_str(&sanitize_alias(&caps.uniq));
+            }
+            name.push_str(alias_class_suffix(caps));
+            Some(name)
+        }
+        InputAliasKind::ByPath => {
+            if caps.phys.is_empty() {
+                return None;
+            }
+            let mut name = sanitize_alias(&caps.phys);
+            name.push_str(alias_class_suffix(caps));
+            Some(name)
+        }
+    }
+}
+
+/// One `/dev/input/by-id` or `/dev/input/by-path` directory. Entries
+/// are symlinks to `../eventN`, regenerated from the live router on
+/// every lookup/enumeration so replug + removal stay consistent.
+#[derive(Debug)]
+struct DevInputAliasDir {
+    kind: InputAliasKind,
+}
+
+impl DevInputAliasDir {
+    fn entries(&self) -> Vec<(String, DeviceId)> {
+        narf_input::evdev::snapshot_devices()
+            .iter()
+            .filter_map(|snap| input_alias_name(self.kind, &snap.caps).map(|name| (name, snap.id)))
+            .collect()
+    }
+}
+
+impl DirOps for DevInputAliasDir {
+    fn ino(&self) -> u64 {
+        match self.kind {
+            InputAliasKind::ById => 21,
+            InputAliasKind::ByPath => 22,
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        let (_, id) = self.entries().into_iter().find(|(n, _)| n == name)?;
+        let event_n = id.0.saturating_sub(1);
+        Some(crate::devfs::symlink_file(
+            name,
+            alloc::format!("../event{}", event_n),
+        ))
+    }
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+        Box::new(core::iter::empty())
+    }
+
+    fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
+        self.entries()
+            .into_iter()
+            .skip(cursor)
+            .take(max)
+            .map(|(name, _)| (name, FileType::Symlink))
+            .collect()
+    }
+
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, Vec<(String, FileType)>> {
+        Box::pin(async move { Ok(self.enumerate(cursor, max)) })
+    }
+}
+
 impl DirOps for DevInputDir {
     fn ino(&self) -> u64 {
         20
@@ -1001,12 +1280,24 @@ impl DirOps for DevInputDir {
         Some(Arc::new(file) as Arc<dyn FileOps>)
     }
 
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        match name {
+            "by-id" => Some(Arc::new(DevInputAliasDir {
+                kind: InputAliasKind::ById,
+            })),
+            "by-path" => Some(Arc::new(DevInputAliasDir {
+                kind: InputAliasKind::ByPath,
+            })),
+            _ => None,
+        }
+    }
+
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move { self.lookup(name).ok_or(FsError::NotFound) })
     }
 
-    fn lookup_dir_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
-        Box::pin(async move { Err(FsError::NotFound) })
+    fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move { self.lookup_dir(name).ok_or(FsError::NotFound) })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -1016,15 +1307,15 @@ impl DirOps for DevInputDir {
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
-        let ids = ROUTER.device_ids();
-        ids.iter()
-            .skip(cursor)
-            .take(max)
-            .map(|id| {
-                let n = id.0.saturating_sub(1);
-                (alloc::format!("event{}", n), FileType::Special)
-            })
-            .collect()
+        let mut entries: Vec<(String, FileType)> = alloc::vec![
+            (String::from("by-id"), FileType::Dir),
+            (String::from("by-path"), FileType::Dir),
+        ];
+        for id in ROUTER.device_ids() {
+            let n = id.0.saturating_sub(1);
+            entries.push((alloc::format!("event{}", n), FileType::Special));
+        }
+        entries.into_iter().skip(cursor).take(max).collect()
     }
 
     fn enumerate_async<'a>(
@@ -1066,6 +1357,99 @@ fn smoke_evdev_eviocrevoke_errno() -> narf_kernel_test::TestResult {
     TestResult::Pass
 }
 narf_kernel_test::kernel_test_in!("filesystem/devfs_input", smoke_evdev_eviocrevoke_errno);
+
+// ── Identity publication (issues #764/#769) ───────────────────────────────────
+// A registered device with a real transport identity must surface
+// by-id / by-path aliases that resolve to its event node, and a
+// uinput setup image must land its name/id on the caps.
+fn smoke_evdev_identity_aliases_and_uinput_setup() -> narf_kernel_test::TestResult {
+    use narf_input::evdev::{bus, prop, DeviceCaps, InputId, ROUTER};
+    use narf_kernel_test::TestResult;
+
+    let mut caps = DeviceCaps::new();
+    caps.set_identity(
+        "ELAN09BD I2C-HID Touchpad",
+        "i2c-ELAN0001/input0",
+        "",
+        InputId::new(bus::I2C, 0x04F3, 0x3045, 0x0001),
+    );
+    caps.add_prop(prop::POINTER);
+    caps.add_prop(prop::BUTTONPAD);
+    caps.add_key(narf_input::evdev::key::BTN_TOUCH);
+    let (id, _node) = ROUTER.register_device(caps);
+
+    let dir = DevInputDir;
+    let names: Vec<String> = dir.enumerate(0, 64).into_iter().map(|(n, _)| n).collect();
+    if !names.iter().any(|n| n == "by-id") || !names.iter().any(|n| n == "by-path") {
+        ROUTER.unregister_device(id);
+        return TestResult::Fail("/dev/input must enumerate by-id and by-path");
+    }
+
+    let by_id = match dir.lookup_dir("by-id") {
+        Some(d) => d,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("by-id directory missing");
+        }
+    };
+    let aliases: Vec<String> = by_id.enumerate(0, 64).into_iter().map(|(n, _)| n).collect();
+    let alias = match aliases
+        .iter()
+        .find(|n| n.contains("04f3-3045") && n.ends_with("-event-touchpad"))
+    {
+        Some(a) => a.clone(),
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("by-id touchpad alias missing");
+        }
+    };
+    match by_id.lookup(&alias) {
+        Some(f) if f.stat().mode.file_type == FileType::Symlink => {}
+        _ => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("by-id alias must resolve to a symlink");
+        }
+    }
+
+    let by_path = match dir.lookup_dir("by-path") {
+        Some(d) => d,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("by-path directory missing");
+        }
+    };
+    if !by_path
+        .enumerate(0, 64)
+        .iter()
+        .any(|(n, _)| n.starts_with("i2c-ELAN0001_input0") && n.ends_with("-event-touchpad"))
+    {
+        ROUTER.unregister_device(id);
+        return TestResult::Fail("by-path touchpad alias missing");
+    }
+    ROUTER.unregister_device(id);
+
+    // uinput_setup wire image: input_id{0x1234,0x5678,0x9abc,0x0001} +
+    // name "Test Virtual Pad" + ff_effects_max.
+    let mut setup = [0u8; 92];
+    setup[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
+    setup[2..4].copy_from_slice(&0x5678u16.to_le_bytes());
+    setup[4..6].copy_from_slice(&0x9abcu16.to_le_bytes());
+    setup[6..8].copy_from_slice(&0x0001u16.to_le_bytes());
+    setup[8..8 + 16].copy_from_slice(b"Test Virtual Pad");
+    let mut ucaps = DeviceCaps::new();
+    if apply_uinput_setup(&mut ucaps, &setup).is_err() {
+        return TestResult::Fail("uinput setup image rejected");
+    }
+    if ucaps.name != "Test Virtual Pad" || ucaps.id != InputId::new(0x1234, 0x5678, 0x9abc, 0x0001)
+    {
+        return TestResult::Fail("uinput setup name/id did not land on caps");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_evdev_identity_aliases_and_uinput_setup
+);
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

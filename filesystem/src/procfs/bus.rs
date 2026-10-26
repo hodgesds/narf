@@ -362,11 +362,15 @@ impl ProcFile for InputDevicesFile {
             let id_num = snap.id.0;
             let caps = &snap.caps;
 
-            let _ = writeln!(out, "I: Bus=0000 Vendor=0000 Product=0000 Version=0000");
-            let _ = writeln!(out, "N: Name=\"input{id_num}\"");
-            let _ = writeln!(out, "P: Phys=");
+            let _ = writeln!(
+                out,
+                "I: Bus={:04x} Vendor={:04x} Product={:04x} Version={:04x}",
+                caps.id.bustype, caps.id.vendor, caps.id.product, caps.id.version
+            );
+            let _ = writeln!(out, "N: Name=\"{}\"", caps.name);
+            let _ = writeln!(out, "P: Phys={}", caps.phys);
             let _ = writeln!(out, "S: Sysfs=/devices/virtual/input/input{id_num}");
-            let _ = writeln!(out, "U: Uniq=");
+            let _ = writeln!(out, "U: Uniq={}", caps.uniq);
 
             // H: always include evdev eventN; also kbd when EV_KEY is set.
             let ev_key_bit = 1u32 << (evdev::EventType::Key as u16);
@@ -376,7 +380,7 @@ impl ProcFile for InputDevicesFile {
                 let _ = writeln!(out, "H: Handlers=event{id_num}");
             }
 
-            let _ = writeln!(out, "B: PROP=0");
+            let _ = writeln!(out, "B: PROP={}", render_bitmap(&caps.propbit.words));
             let _ = writeln!(out, "B: EV={:x}", caps.evbit);
             let _ = writeln!(out, "B: KEY={}", render_bitmap(&caps.keybit.words));
             let _ = writeln!(out, "B: REL={}", render_bitmap(&caps.relbit.words));

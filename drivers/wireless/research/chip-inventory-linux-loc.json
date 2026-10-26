@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "measured_on_utc": "2026-10-26",
+  "tool": "tokei 15.0.0",
+  "reference": "/usr/src/linux, Makefile version 7.3.0-rc4; no Git metadata",
+  "languages": [
+    "C",
+    "C Header"
+  ],
+  "excluded": "*.mod.c generated files",
+  "scope_note": "whole listed driver directories, including unmatched chips, tables and tests; mac80211 and cfg80211 included, public include/net headers and ath/brcmutil shared code excluded",
+  "totals": {
+    "driverTotal": 1061776,
+    "sharedTotal": 115304,
+    "total": 1177080
+  },
+  "groups": [
+    {
+      "family": "iwlwifi",
+      "files": 285,
+      "code": 127123,
+      "c_code": 104181,
+      "h_code": 22942,
+      "comments": 32012,
+      "blanks": 26826
+    },
+    {
+      "family": "ath10k",
+      "files": 62,
+      "code": 65633,
+      "c_code": 49332,
+      "h_code": 16301,
+      "comments": 6989,
+      "blanks": 12797
+    },
+    {
+      "family": "brcmfmac+cyw",
+      "files": 67,
+      "code": 30575,
+      "c_code": 27491,
+      "h_code": 3084,
+      "comments": 4126,
+      "blanks": 5799
+    },
+    {
+      "family": "ath9k",
+      "files": 110,
+      "code": 70626,
+      "c_code": 43573,
+      "h_code": 27053,
+      "comments": 6708,
+      "blanks": 10679
+    },
+    {
+      "family": "mt76",
+      "files": 217,
+      "code": 98103,
+      "c_code": 79544,
+      "h_code": 18559,
+      "comments": 3234,
+      "blanks": 21707
+    },
+    {
+      "family": "rtlwifi",
+      "files": 270,
+      "code": 145325,
+      "c_code": 115289,
+      "h_code": 30036,
+      "comments": 7705,
+      "blanks": 19965
+    },
+    {
+      "family": "rtl8xxxu",
+      "files": 11,
+      "code": 19055,
+      "c_code": 16039,
+      "h_code": 3016,
+      "comments": 1794,
+      "blanks": 3549
+    },
+    {
+      "family": "mac80211",
+      "files": 92,
+      "code": 69630,
+      "c_code": 61389,
+      "h_code": 8241,
+      "comments": 9665,
+      "blanks": 15218
+    },
+    {
+      "family": "cfg80211",
+      "files": 40,
+      "code": 45674,
+      "c_code": 39372,
+      "h_code": 6302,
+      "comments": 3521,
+      "blanks": 8687
+    },
+    {
+      "family": "rtw88",
+      "files": 96,
+      "code": 152005,
+      "c_code": 144901,
+      "h_code": 7104,
+      "comments": 1755,
+      "blanks": 8770
+    },
+    {
+      "family": "rtw89",
+      "files": 105,
+      "code": 287431,
+      "c_code": 255792,
+      "h_code": 31639,
+      "comments": 1852,
+      "blanks": 23530
+    },
+    {
+      "family": "ath11k",
+      "files": 69,
+      "code": 65089,
+      "c_code": 49857,
+      "h_code": 15232,
+      "comments": 5815,
+      "blanks": 12046
+    },
+    {
+      "family": "brcm-shared",
+      "files": 7,
+      "code": 811,
+      "c_code": 0,
+      "h_code": 811,
+      "comments": 181,
+      "blanks": 174
+    }
+  ]
+}

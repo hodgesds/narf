@@ -4,10 +4,10 @@
 //! Linux `rtw88/pci.c::rtw_pci_io_mapping` (`bar_id = 2`). BAR2 is
 //! the register aperture; firmware bytes cannot be copied into it as SRAM.
 //!
-//! RTL8822CE publishes one named station shell before its retained firmware,
+//! RTL8821CE/RTL8822CE publish one named station shell before retained firmware,
 //! MAC/PHY, signed power qualification, radio and packet continuation. Bounded
-//! polling drives its awake channel1 profile with interrupts masked. RTL8821CE
-//! retains its own firmware/inactive-MAC/PHY-table owner; sibling interfaces keep carrier down.
+//! polling drives the qualified awake channel1 profile with interrupts masked.
+//! Each chip retains its own factory/PHY/RF/power owner; C22B stays diagnostic.
 
 #![allow(dead_code)]
 
@@ -40,7 +40,7 @@ pub struct Rtw88Device {
     pub(crate) bus_addr: narf_bus::BusAddr,
     pub registers: MmioRegion,
     pub mac: [u8; MAC_ADDR_LEN],
-    /// PCI device id selecting the retained C822 station or diagnostic sibling.
+    /// PCI device id selecting the retained C21/C22 station or diagnostic C22B.
     pub device_id: u16,
     /// The exact post-power native owner, shared by controller and interface.
     pub(super) firmware: Option<Arc<super::firmware_native::Firmware>>,
@@ -56,6 +56,35 @@ pub struct Rtw88Device {
 static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
 
 impl Rtw88Device {
+    /// Metadata for a separately measured C22 legacy12/WMM station recipe.
+    /// Neither this request nor N22Cv2 alone grants the optional profile.
+    pub async fn rtl8822c_legacy_wmm_request(
+        &self,
+    ) -> Result<super::C22LegacyWmmRequest, super::FirmwareError> {
+        self.firmware
+            .as_ref()
+            .ok_or(super::FirmwareError::Unsupported)?
+            .lifecycle()
+            .legacy_wmm_request()
+            .await
+    }
+    /// Exact awake/native station program for external board qualification.
+    /// This request and the parked N21P receipt grant no RF authority.
+    pub async fn rtl8821c_station_request(
+        &self,
+    ) -> Result<super::C21StationRequest, super::FirmwareError> {
+        self.sibling
+            .as_ref()
+            .ok_or(super::FirmwareError::Unsupported)?
+            .station_request()
+            .await
+    }
+    pub async fn rtl8821c_station_radio_info(&self) -> Option<super::C21StationRadioInfo> {
+        match &self.sibling {
+            Some(owner) => owner.station_radio_info().await,
+            None => None,
+        }
+    }
     /// Firmware loading is independent of station/radio readiness.
     pub fn firmware_status(&self) -> Option<super::FirmwareStatus> {
         self.firmware
@@ -67,6 +96,42 @@ impl Rtw88Device {
     /// Factory country/power fields grant no regulatory or transmit authority.
     pub fn rtl8821c_factory(&self) -> Option<&efuse::Factory8821c> {
         self.sibling.as_ref().map(|owner| owner.factory())
+    }
+    /// Exact retained calibration-program metadata for external measurement/signing.
+    /// This request is not an RF/operating-power authorization.
+    pub async fn rtl8821c_calibration_request(
+        &self,
+    ) -> Result<super::C21CalibrationRequest, super::FirmwareError> {
+        self.sibling
+            .as_ref()
+            .ok_or(super::FirmwareError::Unsupported)?
+            .calibration_request()
+            .await
+    }
+    /// Historical IQK receipt; it does not grant packet/automatic-response power.
+    pub async fn rtl8821c_calibration_info(&self) -> Option<super::C21CalibrationInfo> {
+        match &self.sibling {
+            Some(owner) => owner.calibration_info().await,
+            None => None,
+        }
+    }
+    /// Exact post-IQK parked operating-power program to measure and sign.
+    /// This request grants no packet, response or station authority.
+    pub async fn rtl8821c_operating_power_request(
+        &self,
+    ) -> Result<super::C21OperatingPowerRequest, super::FirmwareError> {
+        self.sibling
+            .as_ref()
+            .ok_or(super::FirmwareError::Unsupported)?
+            .operating_request()
+            .await
+    }
+    /// Historical parked TXAGC/readback receipt; MAC TX/RX remain closed.
+    pub async fn rtl8821c_operating_power_info(&self) -> Option<super::C21OperatingPowerInfo> {
+        match &self.sibling {
+            Some(owner) => owner.operating_info().await,
+            None => None,
+        }
     }
 }
 
@@ -300,6 +365,8 @@ fn probe_exclusive(
                                 fw.status().stage,
                                 super::firmware_lifecycle::Stage::Detected
                                     | super::firmware_lifecycle::Stage::PhyTablesPrepared
+                                    | super::firmware_lifecycle::Stage::Calibration8821cPrepared
+                                    | super::firmware_lifecycle::Stage::Operating8821cPrepared
                             )
                         }) && dev.interface.as_ref().is_some_and(|iface| !iface.closed())
                     })
@@ -326,7 +393,11 @@ fn probe_exclusive(
                 || {
                     with_controller(|dev| {
                         dev.sibling.as_ref().is_some_and(|owner| {
-                            owner.status().stage == super::firmware_lifecycle::Stage::Detected
+                            matches!(
+                                owner.status().stage,
+                                super::firmware_lifecycle::Stage::Detected
+                                    | super::firmware_lifecycle::Stage::PhyTablesPrepared
+                            )
                         })
                     })
                     .unwrap_or(false)
@@ -337,7 +408,7 @@ fn probe_exclusive(
             .await
             {
                 narf_console::klog!(
-                    "rtw88-8821ce retained firmware/MAC provisioning: {:?}\n",
+                    "rtw88-8821ce retained calibration provisioning: {:?}\n",
                     error
                 );
             }
@@ -448,16 +519,20 @@ pub unsafe fn bring_up(
         Arc::new(unsafe { super::sibling::Sibling::new(*device, *cap, registers, factory) })
     });
 
-    let interface = firmware.as_ref().map(|firmware| {
+    let station_lifecycle = firmware
+        .as_ref()
+        .map(|firmware| firmware.lifecycle())
+        .or_else(|| sibling.as_ref().map(|owner| owner.lifecycle()));
+    let interface = station_lifecycle.map(|lifecycle| {
         let name = narf_net::iface::reserve_name("wlan%d");
         Arc::new(super::interface::Device::new(
             name,
             mac,
-            firmware.lifecycle(),
+            lifecycle,
             Arc::new(super::station::NativeEnvironment),
         ))
     });
-    // Sibling chips remain diagnostic only; C822's rings live in its one shell.
+    // Each qualified C21/C22 packet runtime lives in its exact retained shell.
     let (rx_ring, tx_ring) = if interface.is_none() {
         let (_, rx) = channel::<Frame, RX_RING_N>();
         let (tx, _) = channel::<Frame, TX_RING_N>();
@@ -627,7 +702,26 @@ pub async fn provision() -> Result<(), super::FirmwareError> {
             .and_then(|dev| dev.sibling.clone())
     };
     if let Some(owner) = sibling {
-        return owner.provision().await;
+        let _admission = PROVISIONING.lock().await;
+        let interface = CONTROLLER
+            .lock()
+            .as_ref()
+            .and_then(|dev| dev.interface.clone())
+            .ok_or(super::FirmwareError::State)?;
+        if interface.closed() {
+            return Err(super::FirmwareError::Cancelled);
+        }
+        owner.provision().await?;
+        if interface.closed() {
+            return Err(super::FirmwareError::Cancelled);
+        }
+        if owner.status().stage == super::firmware_lifecycle::Stage::Radio8821cPrepared {
+            interface
+                .activate()
+                .await
+                .map_err(|_| super::FirmwareError::Prerequisite)?;
+        }
+        return Ok(());
     }
     provision_with(&PROVISIONING, || {
         let controller = CONTROLLER.lock();

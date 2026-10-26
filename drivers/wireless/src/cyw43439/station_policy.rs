@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Live host-policy observation, separate from firmware/RF quiescence.
-use super::{channel_ceiling, channel_power, Fullmac, Station};
+use super::{channel, channel_ceiling, occupied_power, Fullmac, Station};
 use crate::cyw43439::runtime::Error;
 use alloc::{sync::Arc, vec::Vec};
 use core::{
@@ -29,9 +29,14 @@ impl PolicySource for GlobalPolicy {
 
 #[derive(Clone, Copy)]
 pub(super) struct TxGrant {
-    channel: u8,
+    channel: channel::Operating,
     power: u8,
     country: [u8; 2],
+}
+impl TxGrant {
+    pub(super) fn width(self) -> u32 {
+        self.channel.width()
+    }
 }
 
 impl<R: Fullmac> Station<R> {
@@ -95,6 +100,16 @@ impl<R: Fullmac> Station<R> {
     }
 
     pub(super) fn grant(&mut self, channel: u8, power: u8) -> Result<TxGrant, Error> {
+        self.grant_occupied(
+            channel::Operating::twenty(channel).ok_or(Error::Unsupported)?,
+            power,
+        )
+    }
+    pub(super) fn grant_occupied(
+        &mut self,
+        channel: channel::Operating,
+        power: u8,
+    ) -> Result<TxGrant, Error> {
         self.refresh_policy()?;
         let grant = TxGrant {
             channel,
@@ -109,7 +124,7 @@ impl<R: Fullmac> Station<R> {
         self.refresh_policy()?;
         if grants.iter().any(|g| {
             g.country != self.domain.country_code
-                || channel_power(&self.domain, g.channel).is_none_or(|limit| limit < g.power)
+                || occupied_power(&self.domain, g.channel).is_none_or(|limit| limit < g.power)
         }) {
             return Err(self.deny_policy());
         }
@@ -188,6 +203,45 @@ impl<R: Fullmac> Station<R> {
         self.checked_command(core::slice::from_ref(&grant), &[], command, bytes)
             .await
     }
+    pub(super) async fn tx_query(
+        &mut self,
+        grant: TxGrant,
+        name: &str,
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let mut bytes = name.as_bytes().to_vec();
+        bytes.push(0);
+        self.tx_get(grant, 262, &bytes, maximum).await
+    }
+    pub(super) async fn tx_get(
+        &mut self,
+        grant: TxGrant,
+        command: u32,
+        bytes: &[u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        self.check_grants(core::slice::from_ref(&grant))?;
+        let result = Fence {
+            source: &self.policy,
+            domain: &self.domain,
+            grants: core::slice::from_ref(&grant),
+            channels: &[],
+            initial: false,
+        }
+        .exchange(
+            &mut self.runtime,
+            super::Direction::Get,
+            command,
+            bytes,
+            maximum,
+        )
+        .await;
+        if matches!(result, Err(Error::Authority)) {
+            return Err(self.deny_policy());
+        }
+        self.check_grants(core::slice::from_ref(&grant))?;
+        result
+    }
     pub(super) async fn tx_int(
         &mut self,
         grant: TxGrant,
@@ -258,7 +312,7 @@ impl Fence<'_> {
                 .all(|&ch| channel_ceiling(&now, ch, false).is_some())
             && self.grants.iter().all(|grant| {
                 grant.country == now.country_code
-                    && channel_power(&now, grant.channel).is_some_and(|power| power >= grant.power)
+                    && occupied_power(&now, grant.channel).is_some_and(|power| power >= grant.power)
             })
     }
     async fn command<R: Fullmac>(
@@ -267,12 +321,24 @@ impl Fence<'_> {
         command: u32,
         bytes: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        let mut future = core::pin::pin!(runtime.command(
+        self.exchange(
+            runtime,
             super::Direction::Set,
             command,
             bytes,
-            super::MAX_REPLY
-        ));
+            super::MAX_REPLY,
+        )
+        .await
+    }
+    async fn exchange<R: Fullmac>(
+        &self,
+        runtime: &mut R,
+        direction: super::Direction,
+        command: u32,
+        bytes: &[u8],
+        maximum: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let mut future = core::pin::pin!(runtime.command(direction, command, bytes, maximum));
         poll_fn(|cx| {
             if !self.permits() {
                 return Poll::Ready(Err(Error::Authority));

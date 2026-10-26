@@ -17,6 +17,7 @@
 //! folds. These smokes drive the real syscall surface throughout.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use narf_block::ram::RamBlockDevice;
 use narf_filesystem::{FileOps, FsInstance};
@@ -275,4 +276,123 @@ fn smoke_memfs_fault_then_write() -> TestResult {
 kernel_test_in!(
     "syscall_abi/fault_write/memfs",
     smoke_memfs_fault_then_write
+);
+
+/// Byte-built MINIX V3 image holding one file, `hi.txt`, whose content
+/// is `data` spread over direct zones plus a single-indirect zone —
+/// the multi-zone extension of `drivers/fs/minix`'s own
+/// `build_minix3_image` (block size 1024, V3 magic 0x4D5A, 60-byte
+/// names). Layout: block 0 boot, 1 superblock, 2 inode bitmap,
+/// 3 zone bitmap, 4 inode table, 5 root directory zone, 6.. file
+/// zones (7 direct, then an indirect zone, then the rest).
+pub(crate) fn minix3_image(data: &[u8]) -> alloc::vec::Vec<u8> {
+    use alloc::vec;
+    const BS: usize = 1024;
+    const NBLOCKS: usize = 32;
+    let mut img = vec![0u8; BS * NBLOCKS];
+    let sb = &mut img[BS..BS * 2];
+    sb[0..2].copy_from_slice(&32u16.to_le_bytes()); // ninodes
+    sb[4..6].copy_from_slice(&1u16.to_le_bytes()); // imap_blocks
+    sb[6..8].copy_from_slice(&1u16.to_le_bytes()); // zmap_blocks
+    sb[8..10].copy_from_slice(&5u16.to_le_bytes()); // first_data_zone
+    sb[10..12].copy_from_slice(&0u16.to_le_bytes()); // log_zone_size
+    sb[12..16].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes()); // max_size
+    sb[16..18].copy_from_slice(&0x4D5Au16.to_le_bytes()); // V3 magic
+    sb[20..24].copy_from_slice(&(NBLOCKS as u32).to_le_bytes()); // s_zones
+    sb[24..26].copy_from_slice(&1024u16.to_le_bytes()); // s_block_size
+                                                        // Inode bitmap: inodes 1 (root) and 2 (file) used.
+    img[BS * 2] = 0b0000_0111;
+
+    // Zone assignment for the file body: direct zones 6..13, then (if
+    // needed) indirect zone 13 listing zones 14...
+    let zones_needed = (data.len() as u32).div_ceil(BS as u32).max(1);
+    let direct = zones_needed.min(7);
+    let indirect: Vec<u32> = (0..zones_needed.saturating_sub(7))
+        .map(|i| 14 + i)
+        .collect();
+    let mut file_zones: Vec<u32> = (0..direct).map(|i| 6 + i).collect();
+    file_zones.extend_from_slice(&indirect);
+    // Zone bitmap: bit i <-> zone 5 + i; mark the root zone and every
+    // file/indirect zone used so the allocator never hands them out.
+    let mut top_zone = 6 + direct;
+    if !indirect.is_empty() {
+        top_zone = 14 + (indirect.len() as u32) - 1;
+    }
+    for z in 5..=top_zone {
+        let bit = (z - 5) as usize;
+        img[BS * 3 + bit / 8] |= 1 << (bit % 8);
+    }
+
+    // Inode table (block 4). Inode 1: root directory.
+    let it = BS * 4;
+    let i1 = &mut img[it..it + 64];
+    i1[0..2].copy_from_slice(&(0o40000u16 | 0o755).to_le_bytes()); // IFDIR|0755
+    i1[2..4].copy_from_slice(&2u16.to_le_bytes()); // nlinks
+    i1[8..12].copy_from_slice(&186u32.to_le_bytes()); // size: 3 entries x 62
+    i1[24..28].copy_from_slice(&5u32.to_le_bytes()); // zone[0]
+                                                     // Inode 2: the file.
+    let i2 = &mut img[it + 64..it + 128];
+    i2[0..2].copy_from_slice(&(0o100000u16 | 0o644).to_le_bytes()); // IFREG|0644
+    i2[2..4].copy_from_slice(&1u16.to_le_bytes()); // nlinks
+    i2[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    for (slot, zone) in file_zones.iter().take(7).enumerate() {
+        i2[24 + slot * 4..28 + slot * 4].copy_from_slice(&zone.to_le_bytes());
+    }
+    if !indirect.is_empty() {
+        // zone[7] = the indirect zone (13).
+        i2[24 + 7 * 4..28 + 7 * 4].copy_from_slice(&13u32.to_le_bytes());
+        for (i, zone) in indirect.iter().enumerate() {
+            img[BS * 13 + i * 4..BS * 13 + i * 4 + 4].copy_from_slice(&zone.to_le_bytes());
+        }
+    }
+    // Root directory (zone 5): ".", "..", "hi.txt" at 62-byte stride.
+    let dr = BS * 5;
+    img[dr..dr + 2].copy_from_slice(&1u16.to_le_bytes());
+    img[dr + 2] = b'.';
+    img[dr + 62..dr + 64].copy_from_slice(&1u16.to_le_bytes());
+    img[dr + 64] = b'.';
+    img[dr + 65] = b'.';
+    img[dr + 124..dr + 126].copy_from_slice(&2u16.to_le_bytes());
+    img[dr + 126..dr + 132].copy_from_slice(b"hi.txt");
+    // File body, one 1024-byte chunk per zone.
+    for (i, zone) in file_zones.iter().enumerate() {
+        let lo = i * BS;
+        let hi = ((i + 1) * BS).min(data.len());
+        if lo < data.len() {
+            img[*zone as usize * BS..*zone as usize * BS + (hi - lo)]
+                .copy_from_slice(&data[lo..hi]);
+        }
+    }
+    img
+}
+
+fn minix_volume(
+) -> Result<Arc<narf_drivers_fs_minix::volume::MinixVolume<RamBlockDevice>>, &'static str> {
+    let image = minix3_image(&content(3 * PAGE as usize - 100));
+    let device = RamBlockDevice::from_image(512, image);
+    crate::handlers::poll_io_to_completion(narf_drivers_fs_minix::volume::MinixVolume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    ))
+    .and_then(|r| r.ok())
+    .ok_or("mounting the test MINIX image failed")
+}
+
+fn minix_open(
+    volume: &Arc<narf_drivers_fs_minix::volume::MinixVolume<RamBlockDevice>>,
+) -> Result<Arc<dyn FileOps>, &'static str> {
+    crate::handlers::poll_io_to_completion(volume.root().lookup_async("hi.txt"))
+        .and_then(|r| r.ok())
+        .ok_or("lookup of hi.txt failed")
+}
+
+/// The #724 sequence on MINIX (#742): minix write bumps the volume
+/// generation before the bytes move and the identity is the per-inode
+/// volume anchor, so the fold lands on the canonical frame.
+fn smoke_minix_fault_then_write() -> TestResult {
+    with_two_opens(minix_volume, minix_open, scenario_fault_then_write)
+}
+kernel_test_in!(
+    "syscall_abi/fault_write/minix",
+    smoke_minix_fault_then_write
 );

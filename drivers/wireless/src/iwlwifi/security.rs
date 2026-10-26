@@ -519,7 +519,7 @@ impl Session {
 
     // The old PTK remains active while the unauthenticated M1 is pending.
     // Commit only after a valid M3 MIC/RSN/wrapped-key check using fresh SNonce.
-    fn process_with_nonce(
+    pub(super) fn process_with_nonce(
         &mut self,
         pdu: &[u8],
         nonce: impl FnOnce() -> Result<[u8; 32], &'static str>,

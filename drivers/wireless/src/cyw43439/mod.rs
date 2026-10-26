@@ -233,3 +233,5 @@ pub mod tests {
         smoke_cyw43439_sdpcm_region_cmd_encode
     );
 }
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod phy_fixture;

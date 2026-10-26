@@ -2,6 +2,9 @@
 
 mod control;
 
+#[cfg(any(test, feature = "kernel-test"))]
+pub use control::connect_for_test;
+
 pub use control::station::{
     control_port_over_nl80211, notify_control_port_tx_status, notify_gtk_rekey,
     notify_michael_mic_failure, notify_mlme_disconnect, notify_mlme_frame, rx_control_port,
@@ -674,8 +677,13 @@ fn wiphy_attrs(
         43,
         &[iface.map_or(0, |iface| iface.max_scan_ssids())],
     );
-    // ath11k_mac_register: WLAN_SCAN_PARAMS_MAX_IE_LEN.
-    push_attr(&mut attrs, 56, &512u16.to_ne_bytes());
+    push_attr(
+        &mut attrs,
+        56,
+        &iface
+            .map_or(512, |iface| iface.max_scan_ie_len())
+            .to_ne_bytes(),
+    );
     if let Some(max) = iface
         .map(|iface| iface.max_remain_on_channel_duration_ms())
         .filter(|max| *max != 0)

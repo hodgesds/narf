@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Linux WMI station preparation; every supported dialect has a native oracle.
+//! Native Rust WMI station preparation for each supported firmware dialect.
 use super::*;
 use crate::ath10k::regulatory::Permission;
 impl Wire {
@@ -51,7 +51,12 @@ impl Wire {
         } else {
             4
         };
-        put(&mut out, at, 3); // Linux native PDEV_PARAM_TXPOWER_LIMIT2G in all six dialects.
+        // Linux native PDEV_PARAM_TXPOWER_LIMIT2G/5G across all six dialects.
+        put(
+            &mut out,
+            at,
+            if permission.frequency < 3000 { 3 } else { 4 },
+        );
         put(&mut out, at + 4, u32::from(permission.half_dbm));
         Ok(out)
     }
@@ -79,7 +84,7 @@ impl Wire {
         // Legacy 11G, no IBSS/HT/VHT flags, no AP SSID/rate/power or NOA.
         put(&mut out, chan, u32::from(permission.frequency));
         put(&mut out, chan + 4, u32::from(permission.frequency));
-        put(&mut out, chan + 12, 1);
+        put(&mut out, chan + 12, u32::from(permission.frequency < 3000));
         out[chan + 17] = permission.half_dbm;
         out[chan + 18] = permission.half_dbm;
         out[chan + 21] = permission.half_dbm;

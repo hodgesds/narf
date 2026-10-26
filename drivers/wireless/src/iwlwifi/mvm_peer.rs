@@ -37,7 +37,12 @@ impl Owner {
     pub fn prepared_ap_peer(&self) -> Option<([u8; 6], u8)> {
         if !matches!(
             self.phase,
-            Phase::PeerPrepared | Phase::ManagementQueuePrepared | Phase::TransmitPowerPrepared
+            Phase::PeerPrepared
+                | Phase::ManagementQueuePrepared
+                | Phase::TransmitPowerPrepared
+                | Phase::LinkActive
+                | Phase::Associated
+                | Phase::DataPrepared
         ) || self.hardware.is_failed()
         {
             return None;

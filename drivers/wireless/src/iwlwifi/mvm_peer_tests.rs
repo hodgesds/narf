@@ -64,6 +64,7 @@ impl Fixture {
                 channel,
                 peer: None,
                 management_queue: None,
+                security: super::super::rsna::Context::default(),
                 power: super::super::power::Context::new(&FirmwareApi::default()),
             }),
             firmware,

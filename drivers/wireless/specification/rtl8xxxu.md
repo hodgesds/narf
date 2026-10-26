@@ -285,6 +285,56 @@ Explicit registration, operator up/down and autoconnect remain administrative
 events. Disconnect/failure clears carrier and peer identity while preserving an
 operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
+### Negotiated RTL8188EU WMM BE/TID0
+
+A valid AP WMM Parameter element selects an optional legacy QoS station.
+The driver appends its own Information IE requesting no U-APSD and requires
+valid parameters in the actual peer-bound association response before native
+EDCA/connected media admission. Missing, duplicate, malformed or BE-ACM
+parameters are terminal; unsolicited response WMM cannot upgrade a legacy
+request. All four rows must have supported ECW/AIFSN geometry and fit the
+hardware8-bit AIFS field before any EDCA write.
+
+Linux `rtl8xxxu_conf_tx` plus `rtl8xxxu_set_aifs` supply BE/BK/VI/VO registers
+0x508/50c/504/500, ECW/TXOP fields and SIFS10 plus AIFSN times9/20us slot.
+Every EP0 write has an exact readback. The only selected queue is conservative
+BE (AIFSN>=3, ECWmin>=5, ECWmax>=10, TXOP0); source ACM queue bits are cleared.
+Only then may the retained bulk owner admit a QoS DATA header with TID0 and
+TXDESC32_QOS. Other priorities, HT/BA, U-APSD, TSPEC and QoS Null stay closed.
+Open frames and host CCMP use the26-byte header; CCMP protection occurs before
+USB staging, and the shared key owner retains per-key/TID replay state.
+
+The same signed N8PC legacy1T gain/response envelope qualifies unchanged PHY
+rates, gain, channel, antenna and autonomous response power. Before a WMM attempt
+the exact signed calibration cap is retained and compared against its existing
+permission under authenticated policy. Each future poll during start, EDCA and
+association invokes that cap and rechecks the current installed country/power
+permission; active work never bootstraps a cleared policy. Packet publication
+and completion also require this retained proof. Missing/changed/revoked proof
+is terminal and cannot publish QoS, reuse pending USB storage or revive carrier.
+Bound AP parameter changes require a fresh lifecycle.
+
+Two native Rust smokes compose actual EP0/bulk owners through Open/WPA2,
+literal EDCA/TXD values, exact QoS/CCMP data, actual cap loss, malformed response,
+held EP0 cancellation and revocation before repoll. Controller-proven reset,
+safe rejoin, additional AC/channel/rate profiles and physical USB/RF acceptance
+remain separate gates.
+
+### Measured legacy-rate selection on the WMM station path
+
+The current signed WMM owner now selects the fastest ordinary DATA rate from
+the actual bound association response/request intersection, ordered
+54,48,36,24,18,12,11,9,6,5.5,2,1Mbps. Source TXDESC32 DATA_RATE low6 bits
+are programmed before the descriptor checksum; USE_DRIVER_RATE and disabled
+fallback keep the chosen rate explicit. Management and EAPOL remain CCK1,
+and the unchanged legacy station path remains fixed CCK1. This extension uses
+only N8PC's existing explicit whole-board CCK/all4 and OFDM/all8 measured
+envelopes; it does not qualify HT or change autonomous response gains/rates.
+The retained current source/policy fence still encloses admission and native
+USB publication. One composed native smoke exercises all12 literal rates,
+response narrowing, Open/WPA2 native data/CCMP, exact checksum and source
+revocation with no extra publication and retained posted RX ownership.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -335,11 +385,22 @@ channels/rates, reset/rejoin and PM still need software implementation.
 | Production passive scan/MLME service and policy-admitted management TX | Implemented narrow channel1/basic1Mbps profile, signed board/deployment admission required |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
-| Broader channel/rate profiles and coexistence | Missing; initial profile is channel1/basic1Mbps only |
+| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX; management/basic1Mbps and channel1 remain required. Retune, broader bands/HT/adaptation and coexistence remain missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
 | Disconnect/peer-loss callbacks and normal bulk stop | Implemented; one association per firmware claim |
 | EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Missing; software prerequisites |
+
+Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
+`8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
+BT/S0S1. EU therefore still needs HT20/40, aggregation/BA/reorder, full WMM
+AC/TID routing, adaptive rates, broader active/passive scanning, runtime PM and
+reset/rejoin. 8192EU/8723BU first need their own retained power/firmware/radio/
+packet/station compositions, including2-chain or coexistence dependencies.
+The repository's matched8821CU/8822BU profiles need the actual upstream
+`rtw88/rtw8821cu.c`/`rtw8822bu.c` USB transport and C21/C22B radio semantics;
+EU descriptor/register helpers cannot establish those VHT runtimes. No
+unsupported initial profile is marked hardware-inapplicable here.
 
 Linux references: `rtl8xxxu/8188e.c` power/reset, IQK and fops;
 `rtl8xxxu/core.c` firmware, post-table init, HSSI, LC and IQ matrix functions;

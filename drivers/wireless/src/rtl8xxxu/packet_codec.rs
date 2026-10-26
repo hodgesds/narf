@@ -125,6 +125,12 @@ pub fn receive(bytes: &[u8]) -> Result<Vec<Record>, Error> {
 /// admission policy must require a 2.4GHz/20MHz AP supporting the 1Mbps rate.
 /// USB completion only acknowledges host delivery, not an on-air radio ACK.
 pub fn transmit(frame: &[u8], kind: Kind) -> Result<Vec<u8>, Error> {
+    transmit_rate(frame, kind, 0)
+}
+pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8>, Error> {
+    if rate > 11 || kind == Kind::Management && rate != 0 {
+        return Err(Error::Header);
+    }
     if frame.len() < 24 || frame.len() > MAX_TRANSFER - TX_DESC {
         return Err(Error::Length);
     }
@@ -141,7 +147,13 @@ pub fn transmit(frame: &[u8], kind: Kind) -> Result<Vec<u8>, Error> {
         {
             return Err(Error::Header)
         }
-        Kind::Data if frame[0] != 0x08 || frame[1] & 3 != 1 => return Err(Error::Header),
+        Kind::Data
+            if !matches!(frame[0], 0x08 | 0x88)
+                || frame[1] & 3 != 1
+                || frame[0] == 0x88 && frame.get(24..26) != Some(&[0, 0]) =>
+        {
+            return Err(Error::Header)
+        }
         _ => (),
     }
     let mut out = alloc::vec![0;TX_DESC+frame.len()];
@@ -159,12 +171,13 @@ pub fn transmit(frame: &[u8], kind: Kind) -> Result<Vec<u8>, Error> {
     out[12..16].copy_from_slice(
         &(u32::from(u16::from_le_bytes([frame[22], frame[23]]) >> 4) << 16).to_le_bytes(),
     );
-    out[16..20].copy_from_slice(&(1u32 << 8).to_le_bytes()); // USE_DRIVER_RATE
+    out[16..20]
+        .copy_from_slice(&((1u32 << 8) | if frame[0] == 0x88 { 1 << 6 } else { 0 }).to_le_bytes()); // USE_DRIVER_RATE/QOS
     out[20..24].copy_from_slice(
         &(if management {
             6u32 << 18 | 1 << 17
         } else {
-            0x0001ff00
+            0x0001ff00 | u32::from(rate)
         })
         .to_le_bytes(),
     );

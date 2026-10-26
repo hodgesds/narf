@@ -52,6 +52,7 @@ impl Fixture {
                 nvm: Some(nvm()),
                 peer: None,
                 management_queue: None,
+                security: super::super::rsna::Context::default(),
                 power: super::super::power::Context::new(&FirmwareApi::default()),
                 beacons: vec![],
                 scan: super::super::scan::ScanContext::new(&api),

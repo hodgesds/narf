@@ -69,6 +69,13 @@ checking Ethernet/IPv4/UDP framing and control options. `NetworkPlan` defines
 the expected address, mask, gateway, DNS and duration; `udp_ipv4` builds test
 data. `FakeAp::with_basic_1mbps()` selects a checked CCK basic-rate profile
 before authentication for RTL8188EU; the default OFDM profile is unchanged.
+`FakeAp::with_legacy_rates(&[u8])` selects unique literal IEEE CCK/OFDM rates
+with basic flags before authentication. Beacons and association responses use
+the standard eight-entry Supported Rates plus Extended Supported Rates split.
+Non-DFS 5 GHz fixture channels36/40/44/48/149/153/157/161/165 use OFDM;
+CCK profiles on those channels, malformed/duplicate rates, absent basic rates
+and post-authentication profile replacement are refused. These fixture profiles
+grant no device, calibration or regulatory authority.
 The kit has no device, driver-registration or carrier authority.
 Driver adapters retain native RX/TX framing, completions and controlled-port
 admission. MT76 and ath11k compose production station/security paths through a

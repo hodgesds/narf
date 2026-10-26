@@ -6,7 +6,7 @@ use super::*;
 use alloc::{boxed::Box, sync::Arc, vec};
 use core::{
     future::Future,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -18,6 +18,7 @@ include!("radio/station_golden.rs");
 struct Region {
     address: u64,
     bytes: Arc<IrqSafeSpinLock<Vec<u8>>>,
+    live: Arc<AtomicBool>,
 }
 struct Block {
     region: Region,
@@ -25,6 +26,7 @@ struct Block {
 }
 impl Drop for Block {
     fn drop(&mut self) {
+        self.region.live.store(false, Ordering::Release);
         self.drops.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -154,12 +156,22 @@ impl PacketPort {
         let region = Region {
             address,
             bytes: Arc::new(IrqSafeSpinLock::new(vec![0; bytes])),
+            live: Arc::new(AtomicBool::new(true)),
         };
         model.regions.push(region.clone());
         Block {
             region,
             drops: self.drops.clone(),
         }
+    }
+    fn live_regions(&self) -> Vec<Region> {
+        self.model
+            .lock()
+            .regions
+            .iter()
+            .filter(|region| region.live.load(Ordering::Acquire))
+            .cloned()
+            .collect()
     }
     fn region(&self, address: u64) -> Region {
         self.model

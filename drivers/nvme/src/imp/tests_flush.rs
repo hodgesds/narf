@@ -356,30 +356,268 @@ kernel_test_in!(
     smoke_nvme_shutdown_forces_shn_when_never_drained
 );
 
-/// System suspend is refused (it used to clear CC.EN with no Flush and no
-/// CC.SHN, and resume left the queues stale); the controller keeps working.
-fn smoke_nvme_suspend_is_refused() -> TestResult {
-    use narf_power::device_pm::{DevicePmOps, DeviceSuspendError};
+/// An `NvmePm` for nvme1 carrying a freshly claimed device cap — the
+/// shape `probe` registers at boot (instance + the function's
+/// `BusDeviceCap`), rebuilt here because the boot registration lives in
+/// the device-PM registry, not in a handle the smokes can reach.
+fn nvme1_pm() -> Option<super::NvmePm> {
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap};
+    let dev = super::with_controller_at(1, |c| c.bus_device())??;
+    let authority = bootstrap_registry_authority();
+    let (_h, cap) = claim_device_cap(&authority, dev.addr).ok()?;
+    Some(super::NvmePm { instance: 1, cap })
+}
+
+/// System suspend/resume round-trip on QEMU's nvme1 (#926, replacing
+/// `smoke_nvme_suspend_is_refused`): suspend quiesces and tears the
+/// controller down — I/O is refused while it is down, not served by
+/// stale queues — resume re-initialises it, and the first command
+/// afterwards lands: the block written and flushed before suspend
+/// reads back intact on the rebuilt queues, and the datapath (write +
+/// Flush) is fully alive again. A rollback resume is a no-op, and a
+/// second full cycle works.
+fn smoke_nvme_suspend_resume_qemu() -> TestResult {
+    use narf_power::device_pm::DevicePmOps;
     if super::controller_count() < 2 {
         return TestResult::Skip("needs the kernel-test NVMe controllers");
     }
-    let pm = super::NvmePm { instance: 1 };
-    if pm.suspend() != Err(DeviceSuspendError::NotImplemented) {
-        return TestResult::Fail("NVMe suspend must be refused");
-    }
-    if pm.resume().is_err() {
-        return TestResult::Fail("resume after a refused suspend must be a no-op");
-    }
+    let Some(pm) = nvme1_pm() else {
+        return TestResult::Fail("could not claim nvme1's device cap");
+    };
     let Some(dev) = narf_block::find_block_device("nvme1n1") else {
         return TestResult::Fail("nvme1n1 not registered");
     };
+    // Seed a known block and flush it durable before suspending.
+    let lba = 60u64;
+    let mut saved = [0u8; 512];
+    if dev.read(lba, 1, &mut saved).is_err() {
+        return TestResult::Fail("pre-suspend read failed");
+    }
     let mut block = [0u8; 512];
-    if dev.read(0, 1, &mut block).is_err() {
-        return TestResult::Fail("controller stopped working after a refused suspend");
+    for (i, b) in block.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0xA5;
+    }
+    if dev.write(lba, 1, &block).is_err() || dev.flush().is_err() {
+        return TestResult::Fail("pre-suspend write/flush failed");
+    }
+    if pm.suspend().is_err() {
+        return TestResult::Fail("NVMe suspend failed on a healthy controller");
+    }
+    // While suspended: the state is marked, and I/O is refused.
+    let marked = super::with_controller_at(1, |c| c.is_suspended() && c.is_dead());
+    let mut probe = [0u8; 512];
+    let refused = dev.read(lba, 1, &mut probe).is_err();
+    let resume = pm.resume();
+    if marked != Some(true) {
+        let _ = dev.write(lba, 1, &saved);
+        return TestResult::Fail("controller not marked suspended after suspend");
+    }
+    if !refused {
+        let _ = dev.write(lba, 1, &saved);
+        return TestResult::Fail("a suspended controller served I/O");
+    }
+    if resume.is_err() {
+        return TestResult::Fail("NVMe resume failed");
+    }
+    // The first post-resume command lands: the pre-suspend block reads
+    // back intact on the rebuilt queues.
+    let mut back = [0u8; 512];
+    let landed = dev.read(lba, 1, &mut back).is_ok() && back == block;
+    // And the datapath is fully alive again: write + flush + read back.
+    for (i, b) in block.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0x3C;
+    }
+    let alive = dev.write(lba, 1, &block).is_ok()
+        && dev.flush().is_ok()
+        && dev.read(lba, 1, &mut back).is_ok()
+        && back == block;
+    let _ = dev.write(lba, 1, &saved);
+    if !landed {
+        return TestResult::Fail("first post-resume read did not return the pre-suspend block");
+    }
+    if !alive {
+        return TestResult::Fail("datapath did not come back after resume");
+    }
+    // A rollback resume (not suspended) is a no-op success, and
+    // suspend is not a one-shot: a second full cycle works.
+    if pm.resume().is_err() {
+        return TestResult::Fail("resume while not suspended must be a no-op");
+    }
+    if pm.suspend().is_err() || pm.resume().is_err() {
+        return TestResult::Fail("second suspend/resume cycle failed");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvme/flush", smoke_nvme_suspend_is_refused);
+kernel_test_in!("drivers/nvme/flush", smoke_nvme_suspend_resume_qemu);
+
+/// Suspend drains the in-flight command before quiescing: with nvme1's
+/// request gate held (a command mid-flight), a wait that never sees
+/// the gate free reports Busy and touches nothing; a wait that sees it
+/// released after a few polls suspends normally (Flush + CC.SHN), and
+/// resume rebuilds the controller.
+fn smoke_nvme_suspend_drains_in_flight_io() -> TestResult {
+    if super::controller_count() < 2 {
+        return TestResult::Skip("needs the kernel-test NVMe controllers");
+    }
+    let Some(pm) = nvme1_pm() else {
+        return TestResult::Fail("could not claim nvme1's device cap");
+    };
+    let Some(slot) = super::slot_of(1) else {
+        return TestResult::Fail("nvme1 slot missing");
+    };
+    let vwc = super::with_controller_at(1, |c| c.has_volatile_write_cache()).unwrap_or(false);
+    let flushes_before = super::with_controller_at(1, |c| c.flushes_completed()).unwrap_or(0);
+    // "In flight": hold the gate the way an I/O path does.
+    core::mem::forget(super::acquire(slot));
+    // A wait that never observes the gate free: Busy, nothing touched.
+    let busy = super::suspend_slot(slot, &pm.cap, 50, &mut |cond, ms| (0..ms).any(|_| cond()));
+    if busy != super::SlotSuspend::Busy {
+        slot.req_gate
+            .store(false, core::sync::atomic::Ordering::Release);
+        return TestResult::Fail("a never-drained suspend must report Busy");
+    }
+    // Inspect the controller directly, NOT through
+    // `with_controller_at`: that helper acquires the gate by spinning
+    // on it, and this fixture is itself the gate holder (the forgotten
+    // `acquire` above) — the helper would spin forever on a hold this
+    // fixture only releases in its failure arms or in the second
+    // suspend's model wait, wedging the run.
+    // SAFETY: `req_gate` is held by this fixture (the forgotten
+    // `acquire` guard), so no other reference into the cell can exist
+    // — the same argument `ControllerGuard::deref` makes.
+    let untouched = {
+        // SAFETY: this fixture holds `req_gate` (the forgotten
+        // `acquire` guard above), so no other reference into the
+        // cell can exist — the argument in the note above this
+        // block.
+        let c = unsafe { &*slot.ctrl.get() };
+        c.is_ready() && !c.is_suspended()
+    };
+    if !untouched {
+        slot.req_gate
+            .store(false, core::sync::atomic::Ordering::Release);
+        return TestResult::Fail("a Busy suspend touched the controller");
+    }
+    // A wait whose holder releases after a few polls: suspend proceeds.
+    let mut polls = 0u32;
+    let outcome = super::suspend_slot(
+        slot,
+        &pm.cap,
+        super::SHUTDOWN_DRAIN_TIMEOUT_MS,
+        &mut |cond, _budget| {
+            loop {
+                if cond() {
+                    return true;
+                }
+                polls += 1;
+                // The command completes after a few polls.
+                if polls == 3 {
+                    slot.req_gate
+                        .store(false, core::sync::atomic::Ordering::Release);
+                }
+                if polls > 100 {
+                    return false;
+                }
+            }
+        },
+    );
+    let result = match &outcome {
+        super::SlotSuspend::Suspended(ShutdownOutcome::Complete) => {
+            let flushes_after =
+                super::with_controller_at(1, |c| c.flushes_completed()).unwrap_or(0);
+            if polls < 3 {
+                TestResult::Fail("suspend did not wait for the gate holder")
+            } else if vwc && flushes_after <= flushes_before {
+                TestResult::Fail("drained suspend did not flush")
+            } else {
+                TestResult::Pass
+            }
+        }
+        _ => TestResult::Fail("drained suspend must quiesce with Flush + CC.SHN"),
+    };
+    // Whatever the outcome the slot is suspended now: resume it and
+    // require the controller back before any later smoke runs.
+    let resumed = super::resume_slot(
+        slot,
+        &pm.cap,
+        super::SHUTDOWN_DRAIN_TIMEOUT_MS,
+        &mut |cond, ms| (0..ms).any(|_| cond()),
+    );
+    if resumed != super::SlotResume::Resumed {
+        return TestResult::Fail("resume after drained suspend failed");
+    }
+    result
+}
+kernel_test_in!("drivers/nvme/flush", smoke_nvme_suspend_drains_in_flight_io);
+
+/// The resume identity re-check, model side: the rebuilt controller
+/// must be the one that was suspended. A serial, model or
+/// namespace-count change — or any change to the registered namespace
+/// set — fails the match; a firmware-revision change alone does not
+/// (it names no data).
+fn smoke_nvme_suspend_identity_match() -> TestResult {
+    let mut sn = [b' '; 20];
+    sn[..12].copy_from_slice(b"SN1234567890");
+    let mut mn = [b' '; 40];
+    mn[..7].copy_from_slice(b"Model X");
+    let mut fr = [b' '; 8];
+    fr[..3].copy_from_slice(b"1.0");
+    let id = super::IdentifyController {
+        vid: 0x15B7,
+        ssvid: 0,
+        sn,
+        mn,
+        fr,
+        mdts: 0,
+        ver: 0x0001_0400,
+        nn: 1,
+        rtd3e: 0,
+        vwc: 1,
+    };
+    let ns = super::ns::NamespaceInfo {
+        nsid: 1,
+        lba_bytes: 512,
+        nsze: 1_000_000,
+        usable: true,
+        ids: super::ns::NsIds {
+            eui64: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+            nguid: None,
+            uuid: None,
+        },
+    };
+    let snap = super::SuspendSnapshot {
+        identify: id,
+        namespaces: alloc::vec![ns],
+    };
+    if !super::suspend_identity_matches(&snap, &id, &[ns]) {
+        return TestResult::Fail("the identical controller must match its snapshot");
+    }
+    let mut other = id;
+    other.sn[0] = b'X';
+    if super::suspend_identity_matches(&snap, &other, &[ns]) {
+        return TestResult::Fail("a serial change must fail the identity check");
+    }
+    let mut other = id;
+    other.nn = 2;
+    if super::suspend_identity_matches(&snap, &other, &[ns]) {
+        return TestResult::Fail("a namespace-count change must fail the identity check");
+    }
+    let mut resized = ns;
+    resized.nsze += 1;
+    if super::suspend_identity_matches(&snap, &id, &[resized]) {
+        return TestResult::Fail("a namespace size change must fail the identity check");
+    }
+    if super::suspend_identity_matches(&snap, &id, &[]) {
+        return TestResult::Fail("a shrunk namespace set must fail the identity check");
+    }
+    let mut updated = id;
+    updated.fr[0] = b'2';
+    if !super::suspend_identity_matches(&snap, &updated, &[ns]) {
+        return TestResult::Fail("a firmware-revision change alone must still match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/flush", smoke_nvme_suspend_identity_match);
 
 /// `NVME_IOCTL_IO_CMD` / `NVME_IOCTL_IO64_CMD` are refused (EOPNOTSUPP at
 /// the syscall layer) without reading the command or touching the

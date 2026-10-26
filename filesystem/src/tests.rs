@@ -2945,7 +2945,7 @@ fn smoke_uinput_loopback() -> TestResult {
     use crate::devfs_input::{UinputControlFile, LINUX_INPUT_EVENT_SIZE};
     use crate::FileOps;
     use narf_input::evdev::key::KEY_A;
-    use narf_input::evdev::{EventType, ROUTER};
+    use narf_input::evdev::{bus, EventType, InputId, ROUTER};
 
     // _IOC(dir, 'U', nr, size) — uinput type byte is 'U' = 0x55.
     fn ioc(dir: u32, nr: u32, size: u32) -> u32 {
@@ -2980,8 +2980,24 @@ fn smoke_uinput_loopback() -> TestResult {
     {
         return TestResult::Fail("UI_SET_KEYBIT failed");
     }
-    // UI_DEV_SETUP: accepted no-op (we pass a null arg; handler must not deref).
-    if ctrl.ioctl(ioc(WRITE, UI_DEV_SETUP, 92), 0).is_err() {
+    // UI_DEV_SETUP: pass a real `struct uinput_setup` image (input_id +
+    // name[80] + ff_effects_max). The handler copies the image from the
+    // user pointer and lands name/id on the created device's caps, so a
+    // null arg is rejected (as on Linux, where copy_from_user(NULL)
+    // faults). A kernel stack buffer address is a valid source pointer
+    // in kernel-test context — the copy_from_user mirror of the EVIOCG*
+    // smokes' destination buffers.
+    let mut setup = [0u8; 92];
+    setup[0..2].copy_from_slice(&bus::VIRTUAL.to_le_bytes());
+    setup[2..4].copy_from_slice(&0x1234u16.to_le_bytes());
+    setup[4..6].copy_from_slice(&0x5678u16.to_le_bytes());
+    setup[6..8].copy_from_slice(&0x0001u16.to_le_bytes());
+    setup[8..8 + 17].copy_from_slice(b"narf-uinput-smoke");
+    // ff_effects_max (bytes 88..92) stays 0.
+    if ctrl
+        .ioctl(ioc(WRITE, UI_DEV_SETUP, 92), setup.as_ptr() as usize)
+        .is_err()
+    {
         return TestResult::Fail("UI_DEV_SETUP failed");
     }
     // Create the virtual device.
@@ -2995,6 +3011,17 @@ fn smoke_uinput_loopback() -> TestResult {
         Some(id) => *id,
         None => return TestResult::Fail("UI_DEV_CREATE did not register a new device"),
     };
+
+    // The setup identity must have landed on the created device's caps.
+    match ROUTER.caps(new_id) {
+        Some(caps)
+            if caps.name == "narf-uinput-smoke"
+                && caps.id == InputId::new(bus::VIRTUAL, 0x1234, 0x5678, 0x0001) => {}
+        _ => {
+            ctrl.ioctl(ioc(NONE, UI_DEV_DESTROY, 0), 0).ok();
+            return TestResult::Fail("UI_DEV_SETUP identity did not land on created device");
+        }
+    }
 
     // Open a reader on the freshly-created device (the eventN node).
     let reader = match ROUTER.open_reader(new_id) {

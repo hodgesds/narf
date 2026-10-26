@@ -34,6 +34,74 @@ pub(super) fn encode20(channel: u8) -> Option<u16> {
     Some(if channel <= 14 { 0x1000 } else { 0xd000 } | u16::from(channel))
 }
 
+/// One retained occupied channel. A40MHz geometry is usable only when the
+/// firmware's native chanspec inventory also contains this exact encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Operating {
+    pub(super) primary: u8,
+    pub(super) secondary: Option<u8>,
+}
+impl Operating {
+    pub(super) fn twenty(primary: u8) -> Option<Self> {
+        encode20(primary)?;
+        Some(Self {
+            primary,
+            secondary: None,
+        })
+    }
+    pub(super) fn forty(primary: u8, secondary: u8) -> Option<Self> {
+        let a = frequency(primary)?;
+        let b = frequency(secondary)?;
+        if primary == 14
+            || secondary == 14
+            || a.abs_diff(b) != 20
+            || (primary <= 14) != (secondary <= 14)
+        {
+            return None;
+        }
+        Some(Self {
+            primary,
+            secondary: Some(secondary),
+        })
+    }
+    pub(super) fn width(self) -> u32 {
+        if self.secondary.is_some() {
+            40
+        } else {
+            20
+        }
+    }
+    pub(super) fn chanspec(self) -> u16 {
+        if let Some(secondary) = self.secondary {
+            let center = (u16::from(self.primary) + u16::from(secondary)) / 2;
+            let side = if self.primary > secondary { 0x100 } else { 0 };
+            (if self.primary <= 14 { 0x1800 } else { 0xd800 }) | side | center
+        } else {
+            encode20(self.primary).expect("validated operating channel")
+        }
+    }
+    pub(super) fn span(self) -> (u32, u32) {
+        let a = frequency(self.primary).expect("validated primary channel");
+        let b = self
+            .secondary
+            .map_or(a, |ch| frequency(ch).expect("validated secondary channel"));
+        (a.min(b) - 10, a.max(b) + 10)
+    }
+    pub(super) fn decode40(chanspec: u16) -> Option<Self> {
+        if chanspec & 0x3800 != 0x1800 {
+            return None;
+        }
+        let primary = primary(chanspec, 0)?;
+        let secondary = if chanspec & 0x700 == 0 {
+            primary.checked_add(4)?
+        } else {
+            primary.checked_sub(4)?
+        };
+        let value = Self::forty(primary, secondary)?;
+        (value.chanspec() == chanspec).then_some(value)
+    }
+}
+
 /// Decode the advertised primary channel, including a wider AP's center and
 /// sideband. Never reinterpret a center channel as its primary. A supplied
 /// BSS-info ctl_ch must agree with the independently decoded chanspec.

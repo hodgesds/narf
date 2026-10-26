@@ -29,6 +29,7 @@ pub(super) struct State<M: Memory> {
     pending: Option<Pending<M>>,
     mailbox: super::super::station_control::Mailbox,
     reserved: Option<M>,
+    pub(super) qos: bool,
 }
 impl<M: Memory> State<M> {
     pub(super) fn new() -> Self {
@@ -40,6 +41,7 @@ impl<M: Memory> State<M> {
             pending: None,
             mailbox: super::super::station_control::Mailbox::default(),
             reserved: None,
+            qos: false,
         }
     }
     pub(super) fn retain(&mut self) {
@@ -94,7 +96,7 @@ impl narf_wireless::station_security::RawFrame for Mpdu {
 const OWN: u32 = 1 << 31;
 const MAX_MPDU: usize = 2304;
 
-fn queue(frame: &[u8], local: [u8; 6]) -> Result<(usize, u16, u8), Error> {
+fn queue(frame: &[u8], local: [u8; 6], qos: bool) -> Result<(usize, u16, u8), Error> {
     if !(24..=MAX_MPDU).contains(&frame.len()) || frame[10..16] != local || frame[22] & 15 != 0 {
         return Err(Error::Packet);
     }
@@ -107,7 +109,9 @@ fn queue(frame: &[u8], local: [u8; 6]) -> Result<(usize, u16, u8), Error> {
             // MGMT vector1, Linux MGNT_QUEUE6, QSLT_MGNT0x12.
             Ok((1, 1 << 6, 0x12))
         }
-        2 if fc & 0x03f0 == 0x0100 => {
+        2 if fc & 0x03f0 == 0x0100
+            || qos && fc & 0x03f0 == 0x0180 && frame.get(24..26) == Some(&[0, 0]) =>
+        {
             // BE vector4, Linux BE_QUEUE1, firmware priority/TID0.
             Ok((4, 1 << 1, 0))
         }
@@ -388,7 +392,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if rate > 11 {
             return Err(Error::Packet);
         }
-        let (queue, poll, selector) = queue(frame, self.packet.local.ok_or(Error::State)?)?;
+        let (queue, poll, selector) = queue(
+            frame,
+            self.packet.local.ok_or(Error::State)?,
+            self.packet.qos,
+        )?;
         let id = self.packet.serial.checked_add(1).ok_or(Error::State)?;
         let mut buffer = self.io.allocate_packet(frame.len())?;
         let address = extent(&buffer, frame.len(), 4)?;
@@ -418,6 +426,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         prefix[1] = u32::from(selector) << 8; // MACID0, rateID0, security0.
         prefix[3] = u32::from(u16::from_le_bytes([frame[22], frame[23]]) >> 4) << 16;
         prefix[4] = (1 << 8) | (1 << 10); // forced legacy rate, no fallback.
+        if frame[0] == 0x88 {
+            prefix[4] |= 1 << 6;
+        } // EE TXD.QOS; host SSN retained.
         prefix[5] = u32::from(rate) | (0x1f << 8) | (15 << 13);
         prefix[7] = frame.len() as u32;
         prefix[8] = address;

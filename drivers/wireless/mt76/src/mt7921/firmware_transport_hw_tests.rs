@@ -475,6 +475,68 @@ fn mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order() ->
     }
     TestResult::Pass
 }
+
+fn mt76_wmm_native_qos_descriptor_publication_and_two_phase_retirement() -> TestResult {
+    for protected in [false, true] {
+        let (mut words, mut hw) = match rig() {
+            Ok(rig) => rig,
+            Err(_) => return TestResult::Fail("QoS native fixture allocation"),
+        };
+        hw.owner.published = true;
+        let mut frame = vec![0; 18];
+        frame[..6].fill(0xff);
+        frame[6..12].copy_from_slice(&[2, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        frame[12..14].copy_from_slice(&[8, 0]);
+        if hw.submit_data(&frame, protected, true).is_err()
+            || words[(TX_DATA + 8) as usize / 4] != 1
+        {
+            return TestResult::Fail("QoS descriptor did not reach hardware doorbell");
+        }
+        let ring = &hw.owner.storage.as_ref().unwrap().data;
+        // SAFETY: fixture owns the stable coherent allocation, with at least
+        // HEADER + frame.len bytes; hardware is modeled by owned memory.
+        let bytes = unsafe { core::slice::from_raw_parts(ring.buffers[0].cpu_ptr::<u8>(), 82) };
+        // Literal Linux CONNAC2 fields: BE LMAC queue 1, EtherType/802.3,
+        // TID 0, QoS DATA subtype in TXD2/TXD7, normal retry, PTK bit only.
+        if bytes[..12] != [50, 0, 0, 2, 1, 128, 0, 128, 40, 0, 0, 0]
+            || bytes[12..16] != [if protected { 2 } else { 0 }, 120, 0, 16]
+            || bytes[16..28] != [0; 12]
+            || bytes[28..36] != [0, 0, 40, 0, 1, 128, 0, 0]
+            || bytes[44..46] != [18, 128]
+            || bytes[64..] != frame
+            || ring.word(0, 1) != (64 << 16) | LAST
+            || hw.submit_data(&frame, protected, true) != Err(Error::Busy)
+        {
+            return TestResult::Fail("native QoS queue/TID/subtype/security/TXP geometry");
+        }
+        // A firmware release alone cannot release the Ethernet allocation.
+        inject_rx(&mut words, &hw, 0, &release_event(1, 0, true));
+        if hw.receive() != Ok(None) || hw.management_complete() != Ok(None) {
+            return TestResult::Fail("QoS firmware-only completion freed payload");
+        }
+        hw.owner
+            .storage
+            .as_ref()
+            .unwrap()
+            .data
+            .set_word(0, 1, (64 << 16) | LAST | DONE);
+        words[(TX_DATA + 12) as usize / 4] = 1;
+        if hw.management_complete()
+            != Ok(Some(packet_tx::Completion {
+                token: 1,
+                status: 0,
+            }))
+        {
+            return TestResult::Fail("QoS native terminal completion retained token");
+        }
+        hw.owner.published = false; // fixture proved both modeled owners retired
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/wmm",
+    mt76_wmm_native_qos_descriptor_publication_and_two_phase_retirement
+);
 kernel_test_in!(
     "drivers/wireless/mt7921/tx",
     mcu_management_buffer_waits_for_dma_and_firmware_release_in_either_order

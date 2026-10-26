@@ -4,8 +4,9 @@
 > The live PCI task obtains BMI identity, selects trusted firmware/BDF,
 > runs OTP calibration and downloads the image. It retains runtime CE DMA
 > before BMI_DONE, negotiates HTC endpoints, handles firmware host-memory
-> requests and completes WMI INIT/READY. Retained HTT RX/TX and a passive
-> scan vdev follow. Raw-capable non-PFC images can publish a retained legacy
+> requests and completes WMI INIT/READY. Retained HTT RX/TX and a receive-only
+> scan vdev follow, with policy-authorized directed/wildcard active discovery.
+> Raw-capable non-PFC images can publish a retained legacy
 > station interface with Open/WPA2, bounded native packet progress and terminal
 > disconnect. Hardware-validation readiness is scoped to this exact profile.
 
@@ -23,7 +24,8 @@ windows. Boot uses coherent DMA32 storage and keeps the target awake.
 Boot messages are serialized and polled asynchronously. The initial native
 packet service polls with CE interrupts masked; synchronous network drains
 and the periodic worker drive the same bounded state without waiting on
-another executor task. IRQ throughput and power management are separate profiles.
+another executor task. IRQ throughput and host-bus/system power transitions
+remain separate profiles.
 
 ## 3. Public interface
 
@@ -61,6 +63,80 @@ another executor task. IRQ throughput and power management are separate profiles
   firmware requestor/scan/vdev identities and never reuses a 12-bit scan ID
   within an owner lifetime. A failed/malformed terminal, timeout or dropped
   post-publication future closes that owner until full reset, retaining DMA.
+- `pci::scan_active(frequencies_mhz, ssids)` uses the same retained physical
+  owner for 1–16 explicit SSID entries, each 0–32 arbitrary bytes; an empty
+  entry requests wildcard probes. The registered interface advertises
+  `max_scan_ssids() == 16` and normalizes an active request without entries to
+  one wildcard. The active profile is legacy20 on configured channels
+  1–11 and the non-DFS 5-GHz centres listed below, within SERVICE_READY ranges
+  and factory/host ceilings. An authenticated current host domain must cover every complete
+  channel interval. Any overlapping DFS, NO_IR, unproven indoor-only rule,
+  narrow bandwidth or negative
+  power ceiling denies probes. Implicit lists select only eligible channels;
+  explicit denied channels and invalid SSID/geometry/options fail before I/O.
+  Random-MAC, dwell and colocated-6-GHz requests remain unsupported.
+  The interface returns Busy for scans with a prepared/associated peer, without
+  closing that live station or publishing scan commands.
+  All six MAIN/10.1/10.2/10.2.4/10.4/TLV layouts encode real SSID arrays,
+  CCK/OFDM probe rates and DFS bypass. TLV's inverted probe-request-filter bit
+  is handled explicitly. Before START, ordered commands retain factory RD/CTL,
+  apply each band's minimum selected-channel ceiling to its native 2-GHz or
+  5-GHz PDEV limit before any mixed-band probe, and
+  program each active channel's max/reg/max-TX power in half-dBm. Factory
+  calibration remains enforced by firmware. Matching terminal completion is
+  followed by restoration of the complete receive-only channel list before a
+  new scan cache is published; normal passive discovery can continue afterward.
+  Host country, channel geometry and power are checked on every command-future
+  poll (including credit waits), receive iteration and final restoration. A
+  host close/disconnect signal aborts the scan on its next poll, before returning
+  results or releasing the radio lock to teardown. A
+  lower ceiling or observed policy loss/restriction closes the owner; looser
+  same-country policy cannot increase the already selected power. On errors,
+  STOP_ONE for the reserved scan ID and receive-only restoration are attempted
+  when the control channel permits. Cancellation at any publication, timeout,
+  malformed/failed terminal or policy failure retains DMA and requires full
+  owned reset. Command submission is not firmware-idle or RF-quiescence proof.
+  This follows the shared cached-domain contract; it does not independently
+  observe revocation of a cached regulatory firmware capability.
+- `pci::scan_active_with_ies(frequencies_mhz, ssids, extra_ies)` and active
+  `Device::scan(ScanRequest)` carry up to 256 bytes of caller-supplied probe
+  information elements on all six dialects. The facade reports
+  `max_scan_ie_len() == 256` to nl80211 for both discovery and its pre-dispatch
+  bound. Complete element boundaries,
+  vendor OUI and extension-ID presence are checked before transport access;
+  firmware-generated SSID/Supported Rates/Extended Rates elements cannot be
+  duplicated. Malformed native-interface input returns InvalidArgs; oversized
+  or firmware-owned elements and passive requests with extra IEs return
+  NotSupported. Rejected input reserves no scan ID, changes no firmware state
+  and leaves the owner retryable. Prepared plans own the immutable byte copy
+  before scan publication. Legacy WMI appends IE tag4 with raw length and zero
+  padding to a four-byte boundary; TLV sets the fixed raw `ie_len` and padded ARRAY_BYTE
+  length separately. Empty-IE requests preserve the existing packets.
+  These opaque probe elements grant no PHY, association, security or regulatory
+  authority. Current channel/power checks, terminal correlation/restoration,
+  failure/cancellation and retained-DMA rules are identical to `scan_active`.
+- The single-vdev RAW station can negotiate WMM from an actual AP Parameter IE.
+  It appends its own Information IE with U-APSD disabled; caller-supplied WMM
+  cannot duplicate or replace that negotiation. The bound successful association
+  response supplies the final contention values. Missing, duplicate, malformed
+  or BE-admission-controlled response parameters fail before peer/data admission.
+  Native per-dialect PDEV WMM records program BE/BK/VI/VO contention, converting
+  IEEE TXOP32-us units to native microseconds; PEER_ASSOC carries the real QoS
+  flag only after those transport receipts. This one-radio profile has no
+  per-vdev concurrency and makes no firmware ACK claim for these commands.
+  Ordinary Ethernet uses QoS BE/TID0 through actual RAW HTT metadata and the
+  shared host CCMP formatter; EAPOL/key replies remain legacy non-QoS. RX binds
+  QoS TID to the native descriptor before replay/PN commitment. A-MSDU, BA/TX
+  aggregation, TSPEC, U-APSD and non-BE transmit classification remain separate
+  features. APs without WMM retain the legacy packet/command profile.
+- The registered Device binds native preparation, authentication/association,
+  WMM/peer/up commands and initial RSNA data to a chosen factory/frequency/power
+  receipt. It samples current policy before and after each nested wait and
+  before each new command or EAPOL publication. Observed clear, changed country/power,
+  DFS, NO_IR, unqualified indoor-only or unknown restrictions terminate admission
+  on either band; NO_P2P alone does not restrict STA. Cancellation or a late
+  successful receipt cannot reopen the host, commit a failed M4 or release
+  uncertain DMA. Passive receive keeps its distinct non-transmit permission.
 - The older public `wmi` MAIN-dialect codec now uses Linux's group IDs
   starting at index 1, with distinct scan/debug events and correct
   `VDEV_SET_PARAM` (0x5008), RTS, fragmentation, beacon and DTIM parameter
@@ -75,12 +151,19 @@ another executor task. IRQ throughput and power management are separate profiles
   oversized identifiers return `FactoryError::Unsupported`. Internal station
   permission construction maps that error to its existing unsupported error.
 - `pci::prepare_station(bssid, frequency_mhz)` prepares one native station
-  context selected from the last successful passive-scan cache. It requires
+  context selected from the last successful passive or active scan cache. It requires
   the installed authenticated host regulatory policy; initial geometry is
-  legacy 20 MHz on channels 1–11 within firmware hardware limits. The strict
-  initial factory-world 20 dBm ceiling and every overlapping host power,
-  bandwidth and DFS restriction constrain it. Negative power, DFS, 5/6 GHz
-  and beacon-hint-dependent channels stay closed in this profile.
+  legacy 20 MHz on channels 1–11 or 5-GHz centres 5180/5200/5220/5240 and
+  5745/5765/5785/5805/5825 MHz within firmware hardware limits. 5 GHz requires
+  an actual fixed-country factory identity matching the authenticated host
+  country; a world factory identity is never promoted by host policy. Host
+  occupied-channel power is additionally bounded by 20 dBm on 2 GHz and
+  30 dBm on 5 GHz, while immutable factory pair/CTL and firmware calibration
+  remain active. These bounds are ceilings, not measured board transmit power.
+  Every overlapping host power/bandwidth/DFS restriction applies; 5-GHz
+  indoor-only restrictions without authority, negative power, DFS, 6 GHz and
+  beacon-hint-dependent channels stay closed. Native station/channel/peer
+  records use 11A for 5 GHz and reject CCK there; 2 GHz retains 11G/11B.
   It programs immutable factory pair/CTL and additional half-dBm power limits,
   waits for a successful correlated VDEV_START_RESPONSE, creates the BSS
   peer and waits for native HTT peer-map confirmation. `PeerPrepared` reports
@@ -150,6 +233,36 @@ another executor task. IRQ throughput and power management are separate profiles
   or rejoin claim. The registered Device closes host carrier and security
   before awaiting this firmware transaction. All six native WMI dialects are covered;
   only TLV advertises the extra synchronous delete service.
+- `pci::recover()` retires a retained boot/runtime/radio generation and schedules
+  the existing fresh-ROM boot path: chip-specific reset, new coherent CE rings,
+  BMI identity, current authenticated firmware/BDF and OTP calibration, then
+  HTC/WMI/HTT/scan setup and normal policy/network-capability interface admission.
+  It returns `RecoveryScheduled { attempt }` after scheduling, not readiness;
+  current controller stage/error metadata and eventual registration report the
+  result. Missing policy or deployment assets retain their normal staged waits.
+  No credentials, peer, keys, cached BSS or association are replayed. A successful
+  new generation can be scanned/joined through its newly registered interface.
+  `RecoveryError::Busy` means no retained session is available (including boot
+  in progress); Exhausted enforces three attempts per kernel boot. Transport
+  failures propagate without reopening the old generation.
+  Radio quarantine precedes its mutex wait and survives cancellation: all native
+  PCI radio APIs reject that session. Host carrier/registrations close first;
+  after acquiring Radio, packet security is failed and host retirement is
+  repeated under that lock to catch an older in-progress `wait_publish`.
+  Queued old interface control rechecks closure after acquiring the radio.
+  Each generation has a non-reused TX cookie; net-stack snapshots from a removed
+  interface cannot send into its replacement. Retired names are reserved before
+  unregister, preventing another driver's wlan-name allocation in that gap.
+  Every CE interrupt source is masked and every CE is halted before verified
+  PCI bus-master disable. A failed halt still attempts master disable but cannot
+  start a successor. The retired physical owner is terminal before hardware
+  access, and its late Drop performs no MMIO, BME or ASPM operation against a
+  successor. All old boot/firmware/WMI/management/HTT allocations remain pinned,
+  even after successful reset scheduling: no posted-DMA drain, reclamation or
+  RF-quiescence proof is claimed. The attempt limit bounds these retained DMA
+  generations. This is manual replacement/rejoin support, not automatic recovery,
+  stable-netdev reconnection, system suspend or reclaimed DMA. Physical reset,
+  ROM/firmware restart and repeated RF association still need hardware acceptance.
 - `pci::start_station_data(pmk)` starts the retained packet owner after native
   association, with `None` for Open or the caller's WPA2 PMK. It requires
   firmware `RAW_MODE_SUPPORT` (bit10), RAW RX selected during WMI INIT, and a
@@ -191,7 +304,8 @@ another executor task. IRQ throughput and power management are separate profiles
   images and invalid/unsigned regulatory policy fail immediately without waiting.
   `RadioSession` retains an `Arc<Mutex<Radio<PciBoot>>>` with the selected image
   and board profile; native PCI APIs and the Device share this single owner.
-  The Device exposes passive scan and Open/WPA2-PSK/CCMP on channels1–11,
+  The Device exposes passive/active scan and Open/WPA2-PSK/CCMP on configured
+  channels1–11 and the admitted fixed-country non-DFS 5-GHz centres above,
   legacy20 only. Unsupported scan options, PHY modes, external EAPOL and
   checksum/TSO/VLAN requests are rejected, including direct frame-ring clients.
   Native control and each bounded packet-progress pass sample the current
@@ -207,6 +321,22 @@ another executor task. IRQ throughput and power management are separate profiles
   Carrier starts closed and opens only after actual authorization. Disconnect,
   cancelled control operations, peer loss, malformed state and native progress
   failure close carrier permanently; another join requires a future reset owner.
+- RAW/non-PFC images without firmware `NO_PS` expose an awake station
+  power-save default and `WirelessNetIface::set_power_save`. The synchronous
+  setter records desired intent; the retained async worker submits native
+  station-PS controls only after association. Enabling programs RX wake,
+  TX wake, PSPOLL, disabled U-APSD and 100 ms inactivity before PS mode;
+  disabling submits mode off. MAIN, 10.1, 10.2, 10.2.4, 10.4 and TLV use
+  their own native command identities and TLV layouts. The initial awake
+  default or an explicit prejoin preference is submitted before carrier.
+  Completion records command
+  submission, without claiming a firmware sleep acknowledgement or RF/power
+  measurement. A newer requested preference survives an older in-flight
+  submission. Current channel/power and host closure are checked on every
+  native command-future poll, including a coalesced no-op request. Failure
+  or cancellation closes station admission and retains uncertain DMA;
+  reinstalling policy or late receipts cannot reopen it. This profile
+  enables neither U-APSD nor host-bus/system suspend or wake offload.
 - Physical packet HIF supplies bounded source-ready, begin-send and poll-now
   operations. Each source pipe retains its bounce occupancy/deadline before
   publication. An occupied source is rejected before any buffer copy; its CE
@@ -500,7 +630,8 @@ variants, concurrent terminal HTT completion and dropped/failed ownership.
 
 The retained validation profile is calibrated BMI boot with a signed board
 file, firmware advertising RAW_MODE_SUPPORT, non-PFC HTT, legacy20 station on
-host-permitted channels1–11, passive scan, Open or WPA2-PSK/CCMP, DHCP and
+host-permitted channels1–11 or the matching fixed-country non-DFS 5-GHz profile,
+passive/active scan, Open or WPA2-PSK/CCMP, DHCP and
 bidirectional IP. Peer/vdev retirement is terminal; firmware and DMA allocations
 remain owned until full-device reset. Interrupts remain masked and the bounded
 polling path is the initial packet service. No country, real calibration data,
@@ -514,6 +645,11 @@ cover all six WMI dialects with Open/WPA2, exact lease/IP bytes, occupied CE4
 bounce preservation while RX proceeds, separate CE/HTT retirement, held-M4
 cancellation, connection-loss expiry and failed terminal disconnect. These are
 software evidence; they do not attest a physical board or firmware image.
+Native station-PS cases exercise all six dialects with Open/WPA2 DHCP/IP,
+literal command layouts, each publication's cancellation/policy/failure fence,
+concurrent closure and preference replacement. `NO_PS` images reject requests
+before I/O. These checks establish submitted control intent; physical DTIM,
+buffering, wake latency and energy behavior remain hardware acceptance work.
 
 Physical acceptance still must validate exact PCI/BMI identity, trusted firmware
 and board calibration, ROM/OTP/PLL/code-swap, native CE/HTC/WMI/HTT progress,
@@ -523,6 +659,7 @@ An image lacking RAW support, or requiring PFC, remains a diagnostic scan owner
 and must not be counted as a usable station under this profile.
 
 Broader bands/widths, HT/VHT/BA aggregation, PFC fetch/queue ownership, alternate
-calibration sources, interrupt throughput, active/richer scanning, recoverable
-reset/rejoin and firmware power management remain explicit later profiles. They
+calibration sources, interrupt throughput, associated/off-channel scanning,
+automatic/stable-interface recovery and host-bus/system power management remain
+explicit later profiles. They
 are not prerequisites for validating the bounded station profile above.

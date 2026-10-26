@@ -75,6 +75,7 @@ impl Environment for NativeEnvironment {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
+    Probe,
     Authentication,
     Association,
     Security,
@@ -124,6 +125,7 @@ pub(super) struct Radio<P: Port, E: Environment> {
     deadline: u64,
     last_peer: u64,
     last_now: u64,
+    rates: Option<super::rates::Control>,
 }
 impl<P: Port, E: Environment> core::fmt::Debug for Radio<P, E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -157,6 +159,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
             deadline: 0,
             last_peer: 0,
             last_now: 0,
+            rates: None,
         }
     }
     pub(super) fn closed(&self) -> Arc<AtomicBool> {
@@ -229,6 +232,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
         Ok(now)
     }
     pub(super) fn candidates(&self) -> Vec<ObservedBss> {
+        if self.closed.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         let now = self.environment.now_ms();
         self.cache
             .iter()
@@ -254,7 +260,17 @@ impl<P: Port, E: Environment> Radio<P, E> {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
-        let id = self.packet.submit(&bytes, 0)?;
+        let id = if kind == Kind::Data {
+            let control = self.rates.ok_or(Error::State)?;
+            self.packet.submit_rates(&bytes, control.series())?
+        } else {
+            let rate = if kind == Kind::Probe {
+                0
+            } else {
+                self.rates.ok_or(Error::State)?.basic()
+            };
+            self.packet.submit(&bytes, rate)?
+        };
         self.pending = Some(Pending { id, bytes, kind });
         Ok(())
     }
@@ -266,9 +282,6 @@ impl<P: Port, E: Environment> Radio<P, E> {
         let Ok(candidate) = association::observe(frame, 1, self.own, signal) else {
             return;
         };
-        if candidate.basic_rates & 1 == 0 {
-            return;
-        }
         if self
             .peer
             .as_ref()
@@ -324,6 +337,15 @@ impl<P: Port, E: Environment> Radio<P, E> {
             return Err(Error::State);
         }
         if !delivery.delivered && !matches!(pending.kind, Kind::Data) {
+            return Err(Error::State);
+        }
+        if pending.kind == Kind::Data
+            && !self
+                .rates
+                .as_mut()
+                .ok_or(Error::State)?
+                .complete(delivery.delivered, delivery.feedback)
+        {
             return Err(Error::State);
         }
         if pending.kind == Kind::Security {
@@ -419,6 +441,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         let response_cap =
                             u16::from_le_bytes([frame.bytes()[24], frame.bytes()[25]]);
                         let short = peer.bss.capability & response_cap & 0x400 != 0;
+                        let (rates, basic) = self.plan.as_ref().ok_or(Error::State)?.legacy_rates();
+                        self.rates =
+                            Some(super::rates::Control::new(rates, basic).ok_or(Error::Profile)?);
                         self.packet
                             .set_peer(Some((peer.bss.bssid, aid)), if short { 9 } else { 20 })?;
                         self.last_peer = now;
@@ -526,6 +551,78 @@ impl<P: Port, E: Environment> Radio<P, E> {
             self.environment.pause().await;
         }
     }
+    /// Actual broadcast probes use the same calibrated/policy/RF-silent
+    /// packet owner and terminal descriptor receipts as every management TX.
+    pub(super) async fn active_scan_for(
+        &mut self,
+        dwell_ms: u64,
+        ssids: &[Vec<u8>],
+    ) -> Result<Vec<ObservedBss>, Error> {
+        if !(1..=1024).contains(&dwell_ms)
+            || ssids.len() > 4
+            || ssids.iter().any(|ssid| ssid.len() > 32)
+        {
+            return Err(Error::Profile);
+        }
+        if self.phase() != Phase::Passive || self.pending.is_some() {
+            return Err(Error::Busy);
+        }
+        let mut attempt = Attempt {
+            closed: self.closed.clone(),
+            publication: self.publication.clone(),
+            armed: true,
+        };
+        self.cache.clear();
+        let until = self.now()?.saturating_add(dwell_ms);
+        let wildcard = Vec::new();
+        let names = if ssids.is_empty() {
+            core::slice::from_ref(&wildcard)
+        } else {
+            ssids
+        };
+        for name in names {
+            if self.now()? >= until {
+                return Err(Error::Timeout);
+            }
+            let mut probe = vec![0x40, 0, 0, 0];
+            probe.extend_from_slice(&[255; 6]);
+            probe.extend_from_slice(&self.own);
+            probe.extend_from_slice(&[255; 6]);
+            probe.extend_from_slice(&[0, 0, 0, name.len() as u8]);
+            probe.extend_from_slice(name);
+            // Driver-owned legacy CCK/OFDM rates, no HT/VHT/WMM promotion.
+            probe.extend_from_slice(&[
+                1, 4, 0x82, 0x84, 0x8b, 0x96, 50, 8, 12, 18, 24, 36, 48, 72, 96, 108, 3, 1, 1,
+            ]);
+            {
+                let publication = self.publication.clone();
+                let _publication = publication.lock();
+                self.transmit(probe, Kind::Probe)?;
+            }
+            loop {
+                self.poll()?;
+                if self.now()? > until {
+                    return Err(Error::Timeout);
+                }
+                if self.pending.is_none() {
+                    break;
+                }
+                if self.now()? >= until {
+                    return Err(Error::Timeout);
+                }
+                self.environment.pause().await;
+            }
+        }
+        loop {
+            self.poll()?;
+            if self.now()? >= until {
+                let result = self.candidates();
+                attempt.armed = false;
+                return Ok(result);
+            }
+            self.environment.pause().await;
+        }
+    }
     pub(super) async fn associate(
         &mut self,
         bssid: [u8; 6],
@@ -541,7 +638,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
             .into_iter()
             .find(|c| c.bss.bssid == bssid)
             .ok_or(Error::Profile)?;
-        if candidate.bss.channel != 1 || candidate.basic_rates & 1 == 0 {
+        if candidate.bss.channel != 1 {
             return Err(Error::Profile);
         }
         let mode = if pmk.is_some() {
@@ -551,6 +648,8 @@ impl<P: Port, E: Environment> Radio<P, E> {
         };
         let mut plan = JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?;
         plan.append_sme_ies(ies)?;
+        let (rates, basic) = plan.legacy_rates();
+        let rates = super::rates::Control::new(rates, basic).ok_or(Error::Profile)?;
         if let Some(pmk) = pmk {
             let nonce = self.environment.nonce().ok_or(Error::Entropy)?;
             let station_rsne = plan.rsn_body().ok_or(Error::Profile)?;
@@ -571,6 +670,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
             armed: true,
         };
         self.peer = Some(candidate);
+        self.rates = Some(rates);
         self.deadline = self.now()?.saturating_add(5000);
         self.last_peer = self.last_now;
         let auth = plan.start_authentication()?.to_vec();

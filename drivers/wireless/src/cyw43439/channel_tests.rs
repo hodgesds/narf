@@ -2,6 +2,66 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_fullmac_occupied_ht40_literal_spans_and_exact_chanspec_roundtrips() -> TestResult {
+    // IEEE20MHz constituent spacing and Linux D11AC center/sideband values.
+    for (primary, secondary, spec, low, high) in [
+        (6, 10, 0x1808, 2427, 2467),
+        (6, 2, 0x1904, 2407, 2447),
+        (36, 40, 0xd826, 5170, 5210),
+        (40, 36, 0xd926, 5170, 5210),
+        //149+153 center151 (0x97), lower-primary sideband0.
+        (149, 153, 0xd897, 5735, 5775),
+    ] {
+        let Some(value) = Operating::forty(primary, secondary) else {
+            return TestResult::Fail("literal40MHz occupied geometry rejected");
+        };
+        if value.chanspec() != spec
+            || value.width() != 40
+            || value.span() != (low, high)
+            || Operating::decode40(spec) != Some(value)
+        {
+            return TestResult::Fail(
+                "40MHz primary/secondary lost literal native encoding or full occupied span",
+            );
+        }
+    }
+    if Operating::decode40(0xd896).is_some() {
+        return TestResult::Fail("center150 aliased unsupported primary148 into149/153");
+    }
+    for (primary, secondary) in [
+        (0, 4),
+        (14, 10),
+        (10, 14),
+        (6, 11),
+        (13, 36),
+        (36, 44),
+        (165, 169),
+    ] {
+        if Operating::forty(primary, secondary).is_some() {
+            return TestResult::Fail("unsupported40MHz constituent geometry admitted");
+        }
+    }
+    for spec in 0..=u16::MAX {
+        if let Some(value) = Operating::decode40(spec) {
+            let (low, high) = value.span();
+            if value.chanspec() != spec
+                || high - low != 40
+                || primary(spec, 0) != Some(value.primary)
+                || value.secondary.is_none_or(|ch| frequency(ch).is_none())
+            {
+                return TestResult::Fail(
+                    "occupied40MHz decoder violated bounded roundtrip/span/constituent invariants",
+                );
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/channel",
+    smoke_fullmac_occupied_ht40_literal_spans_and_exact_chanspec_roundtrips
+);
+
 fn smoke_fullmac_d11ac_codec_exhaustive_geometry_and_round_trips() -> TestResult {
     let mut encodings = 0;
     for channel in 0..=255 {

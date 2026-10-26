@@ -51,6 +51,24 @@ pub(super) unsafe trait Registers: Send {
     fn finish_phy(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn begin_calibration8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_calibration8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn begin_operating8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_operating8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_station8821c(&mut self, _: super::power_policy::Gate) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
@@ -73,7 +91,27 @@ pub(super) unsafe trait Registers: Send {
     fn station_allowed(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn station_publication(&mut self) -> Result<super::publication::Publication, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::station_profile::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_extension(
+        &mut self,
+        _: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn packet_profile(&mut self, _: super::packet_format::DataProfile) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_profile_readback(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
@@ -112,6 +150,9 @@ pub(super) unsafe trait Registers: Send {
 enum PageState {
     Unclaimed,
     Idle,
+    /// Successful firmware-to-MAC transfer: beacon ownership is complete,
+    /// but it must never be republished as another firmware page.
+    Continued,
     Terminal,
 }
 pub(super) struct Backend<R: Registers, M: Memory> {
@@ -253,6 +294,26 @@ impl<R: Registers, M: Memory> Backend<R, M> {
 // before publication, poisons before mutation and reopens only on a fresh
 // page completion; R's unsafe contract governs all other native queue state.
 unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
+    fn station_publication(&mut self) -> Result<super::publication::Publication, Error> {
+        self.io.station_publication()
+    }
+    fn station_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::station_profile::Grant>>, Error> {
+        self.io.station_extension()
+    }
+    fn station_bind_extension(
+        &mut self,
+        grant: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<(), Error> {
+        self.io.station_bind_extension(grant)
+    }
+    fn packet_profile(&mut self, profile: super::packet_format::DataProfile) -> Result<(), Error> {
+        self.io.packet_profile(profile)
+    }
+    fn station_profile_readback(&mut self) -> Result<(), Error> {
+        self.io.station_profile_readback()
+    }
     fn claim_pristine(&mut self) -> Result<(), Error> {
         if self.state != PageState::Unclaimed {
             return Err(Error::Prerequisite);
@@ -303,7 +364,9 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
         // Firmware pages may never overwrite the parked beacon owner during
         // a later MAC/packet continuation, including cancellation.
         self.state = PageState::Terminal;
-        self.io.begin_mac()
+        self.io.begin_mac()?;
+        self.state = PageState::Continued;
+        Ok(())
     }
     fn finish_mac(&mut self) -> Result<(), Error> {
         self.io.finish_mac()
@@ -314,6 +377,46 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn finish_phy(&mut self) -> Result<(), Error> {
         self.io.finish_phy()
     }
+    fn begin_calibration8821c(&mut self) -> Result<(), Error> {
+        self.io.begin_calibration8821c()
+    }
+    fn finish_calibration8821c(&mut self) -> Result<(), Error> {
+        self.io.finish_calibration8821c()
+    }
+    fn begin_operating8821c(&mut self) -> Result<(), Error> {
+        self.io.begin_operating8821c()
+    }
+    fn finish_operating8821c(&mut self) -> Result<(), Error> {
+        self.io.finish_operating8821c()
+    }
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        self.io.begin_station8821c()
+    }
+    fn finish_station8821c(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
+        if self.state != PageState::Continued || !self.completed || gate.did() != 0xc821 {
+            return Err(Error::State);
+        }
+        self.state = PageState::Terminal;
+        // C21 arrived parked after IQK/power. There is no active command-DMA
+        // ownership to park again; disarm only under actual parked authority.
+        let ring = self.ring.as_mut().ok_or(Error::State)?;
+        let frame = self.frame.as_mut().ok_or(Error::State)?;
+        self.io.parked_cpu(|| {
+            ring.write(0, &[0; 16])?;
+            ring.sync();
+            frame.write(0, &[0; DESC])?;
+            frame.sync();
+            Ok(())
+        })?;
+        let work = self.io.read8(0x383)?;
+        self.io.write8(0x383, work & !0x10)?;
+        let beacon = self.io.read8(0x550)?;
+        self.io.write8(0x550, beacon & !8)?;
+        if self.io.read8(0x383)? & 0x10 != 0 || self.io.read8(0x550)? & 8 != 0 {
+            return Err(Error::Prerequisite);
+        }
+        self.io.finish_station8821c(gate)
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
         self.io.begin_commands()
     }
@@ -323,10 +426,19 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     fn poll_h2c(&mut self) -> Result<bool, Error> {
         self.io.poll_h2c()
     }
+    fn park_radio(&mut self) -> Result<(), Error> {
+        // The calibration-only continuation retains the completed beacon
+        // mappings unchanged and never admits ordinary packet producers.
+        self.io.park_radio()
+    }
     fn finish_radio(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
-        if self.state != PageState::Idle || !self.completed {
+        if self.state != PageState::Continued || !self.completed {
             return Err(Error::State);
         }
+        // Poison before parking/disarming: any ambiguous native failure must
+        // not reopen this one-shot transfer. Continued is never a generic
+        // exception for a failed/uncertain firmware descriptor.
+        self.state = PageState::Terminal;
         self.io.park_radio()?;
         // Only after the exact successful BCN_VALID receipt and native BMEoff
         // parking may the original completed beacon descriptor be disarmed.
