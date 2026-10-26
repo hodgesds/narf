@@ -79,6 +79,7 @@ pub(super) enum Source {
     },
 }
 pub(super) struct Grant {
+    digest: [u8; 32],
     request: Request,
     base: power_policy::ExtensionBase,
     cap: Cap<FirmwareBlob, Read>,
@@ -181,6 +182,11 @@ impl Grant {
             return Err(denied(power_policy::Error::Format));
         }
         Ok(Self {
+            digest: {
+                let mut h = narf_crypto::sha256::Sha256::new();
+                h.update(raw);
+                h.finalize()
+            },
             request,
             base,
             cap,
@@ -195,6 +201,28 @@ impl Grant {
     }
     pub(super) fn rates(&self) -> u16 {
         self.rates
+    }
+    pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
+        self.base.ht_facts()
+    }
+    pub(super) fn own(&self) -> [u8; 6] {
+        self.request.mac
+    }
+    pub(super) fn temperature(&self, value: u8) -> Result<(), Error> {
+        match &self.base {
+            power_policy::ExtensionBase::C21(b) => b.temperature(value),
+            power_policy::ExtensionBase::C22(_) => Ok(()),
+        }
+    }
+    pub(super) fn ht_identity(&self) -> ([u8; 32], [u8; 32]) {
+        (self.request.identity, self.digest)
+    }
+    pub(super) fn ht_limit(&self, domain: &RegulatoryDomain) -> Result<i16, Error> {
+        self.policy(domain)?;
+        Ok(self.base.current(domain)?.min(self.ceiling))
+    }
+    pub(super) fn current_domain(&self) -> Result<RegulatoryDomain, Error> {
+        self.domain()
     }
     pub(super) fn did(&self) -> u16 {
         self.base.did()

@@ -26,6 +26,7 @@ pub(super) struct Board {
     identity: [u8; 32],
     mac: [u8; 6],
     maximum: [u8; 2],
+    ht: Option<super::ht::Facts>,
 }
 impl Board {
     pub(super) fn identity(&self) -> [u8; 32] {
@@ -77,6 +78,20 @@ impl Board {
             identity: hash.finalize(),
             mac: factory.mac(),
             maximum,
+            ht: factory
+                .power_path(0)
+                .and_then(|a| super::ht::factory_limit(a, 2, 127))
+                .zip(
+                    factory
+                        .power_path(1)
+                        .and_then(|b| super::ht::factory_limit(b, 2, 127)),
+                )
+                .map(|(a, b)| super::ht::Facts {
+                    hardware,
+                    maximum: a.min(b),
+                    legacy: [0; 12],
+                    cck: [0; 2],
+                }),
         })
     }
 }
@@ -144,6 +159,7 @@ pub struct Permission {
 pub struct Gate {
     scope: Scope,
     extension: Option<alloc::sync::Arc<super::station_profile::Grant>>,
+    ht: Option<alloc::sync::Arc<super::ht::Grant>>,
 }
 /// A C22 calibration source without extension dispatch. N22L retains this
 /// narrower type, so invoking its base cannot recursively invoke N22L again.
@@ -213,6 +229,15 @@ pub(super) enum ExtensionBase {
     C21(alloc::sync::Arc<super::station_power8821c::Grant>),
 }
 impl ExtensionBase {
+    pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
+        match self {
+            Self::C21(b) => b.ht_facts(),
+            Self::C22(b) => b.calibration.board.ht.map(|mut f| {
+                f.cck = b.permission.gains;
+                f
+            }),
+        }
+    }
     pub(super) fn did(&self) -> u16 {
         match self {
             Self::C22(_) => 0xc822,
@@ -303,6 +328,7 @@ impl Gate {
     ) -> Self {
         Self {
             extension: None,
+            ht: None,
             scope: Scope::C22 {
                 calibration,
                 permission,
@@ -314,6 +340,7 @@ impl Gate {
         Self {
             scope: Scope::C21(grant),
             extension: None,
+            ht: None,
         }
     }
     pub(super) fn did(&self) -> u16 {
@@ -329,6 +356,9 @@ impl Gate {
         }
     }
     pub(super) fn current(&self) -> Result<(), Error> {
+        if let Some(g) = &self.ht {
+            return g.check().map_err(|_| Error::Authority);
+        }
         if let Some(g) = &self.extension {
             return g.check().map_err(|_| Error::Authority);
         }
@@ -353,6 +383,9 @@ impl Gate {
         &self,
         operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
+        if let Some(g) = &self.ht {
+            return g.invoke(operation);
+        }
         if let Some(g) = &self.extension {
             return g.invoke(operation);
         }
@@ -399,6 +432,12 @@ impl Gate {
         }
     }
     pub(super) fn allows_profile(&self, p: super::packet_format::DataProfile) -> bool {
+        if let Some(g) = &self.ht {
+            return g.allows(p);
+        }
+        if p.mcs != 0 || p.sgi {
+            return false;
+        }
         p.valid()
             && match &self.extension {
                 Some(g) => p.rates & !g.rates() == 0 && (!p.qos || g.wmm()),
@@ -417,6 +456,37 @@ impl Gate {
         gate.extension = Some(g);
         Ok(gate)
     }
+    pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
+        match &self.scope {
+            Scope::C21(b) => b.ht_facts(),
+            Scope::C22 {
+                calibration,
+                permission,
+                ..
+            } => calibration.board.ht.map(|mut f| {
+                f.cck = permission.gains;
+                f
+            }),
+        }
+    }
+    pub(super) fn ht_base(&self) -> Option<alloc::sync::Arc<super::station_profile::Grant>> {
+        self.extension.clone().filter(|_| self.ht.is_none())
+    }
+    pub(super) fn ht_grant(&self) -> Option<alloc::sync::Arc<super::ht::Grant>> {
+        self.ht.clone()
+    }
+    pub(super) fn with_ht(
+        &self,
+        g: alloc::sync::Arc<super::ht::Grant>,
+    ) -> Result<Self, super::firmware_transport::Error> {
+        if self.ht.is_some() || self.extension.as_ref().is_none_or(|b| !g.matches(b)) {
+            return Err(super::firmware_transport::Error::State);
+        }
+        g.check()?;
+        let mut gate = self.clone();
+        gate.ht = Some(g);
+        Ok(gate)
+    }
     pub(super) fn c21_indices(&self) -> Option<[u8; 12]> {
         match &self.scope {
             Scope::C21(g) => Some(g.indices()),
@@ -428,6 +498,9 @@ impl Gate {
         domain: &narf_wireless::reg::RegulatoryDomain,
         operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
+        if let Some(g) = &self.ht {
+            return g.invoke(operation);
+        }
         if let Some(g) = &self.extension {
             return g.invoke(operation);
         }
@@ -481,6 +554,9 @@ impl Gate {
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
+        if let Some(g) = &self.ht {
+            return g.check().map_err(|_| Error::Authority);
+        }
         if let Some(g) = &self.extension {
             return g.check().map_err(|_| Error::Authority);
         }

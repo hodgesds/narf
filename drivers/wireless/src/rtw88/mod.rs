@@ -48,11 +48,15 @@ mod firmware_native;
 mod firmware_transport;
 pub mod fw;
 mod hardware;
+mod ht;
+#[cfg(feature = "kernel-test")]
+mod ht_tests;
 pub(super) mod interface;
 mod mac;
 mod operating8821c;
 pub(super) mod packet_core;
 pub(super) mod packet_format;
+mod packet_phy;
 mod pci_firmware;
 mod phy;
 #[path = "phy/rtl8821c.rs"]
@@ -72,6 +76,7 @@ mod wmm;
 pub use calibration8821c::{Error as C21CalibrationError, Request as C21CalibrationRequest};
 pub use firmware_lifecycle::{Stage as FirmwareStage, Status as FirmwareStatus};
 pub use firmware_transport::{Error as FirmwareError, Info as FirmwareInfo};
+pub use ht::Request as Ht20Request;
 pub use mac::Info as MacInfo;
 pub use operating8821c::{Info as C21OperatingPowerInfo, Request as C21OperatingPowerRequest};
 pub use phy::Info as PhyTablesInfo;

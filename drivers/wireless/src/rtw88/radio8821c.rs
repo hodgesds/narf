@@ -27,13 +27,26 @@ const TXAGC: [u16; 8] = [
 /// rtw8821c_set_tx_power_index_by_rate packs four source rate indices per
 /// word at RF-A1d00. C22's reference/difference registers are unrelated.
 pub(super) fn operating_readback(
+    read: impl FnMut(u16) -> Result<u32, Error>,
+    indices: [u8; 12],
+) -> Result<(), Error> {
+    operating_readback_ht(read, indices, [0; 8])
+}
+pub(super) fn operating_readback_ht(
     mut read: impl FnMut(u16) -> Result<u32, Error>,
     indices: [u8; 12],
+    mcs: [u8; 8],
 ) -> Result<(), Error> {
     for (slot, reg) in TXAGC.into_iter().enumerate() {
         let expected = if slot < 3 {
             u32::from_le_bytes(
                 indices[slot * 4..slot * 4 + 4]
+                    .try_into()
+                    .map_err(|_| Error::State)?,
+            )
+        } else if slot < 5 {
+            u32::from_le_bytes(
+                mcs[(slot - 3) * 4..(slot - 3) * 4 + 4]
                     .try_into()
                     .map_err(|_| Error::State)?,
             )

@@ -29,6 +29,7 @@ pub(in crate::rtw88) struct Controls {
     pub(in crate::rtw88) release: AtomicBool,
     pub(in crate::rtw88) corrupt_receipt: AtomicBool,
     pub(in crate::rtw88) incoming: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
+    pub(in crate::rtw88) incoming_profiles: IrqSafeSpinLock<VecDeque<(Vec<u8>, u8, u8)>>,
 }
 impl Default for Controls {
     fn default() -> Self {
@@ -37,10 +38,12 @@ impl Default for Controls {
             release: AtomicBool::new(false),
             corrupt_receipt: AtomicBool::new(false),
             incoming: IrqSafeSpinLock::new(VecDeque::new()),
+            incoming_profiles: IrqSafeSpinLock::new(VecDeque::new()),
         }
     }
 }
 pub(in crate::rtw88) struct Model {
+    pub(in crate::rtw88) receive_chip: crate::rtw88::packet_phy::Chip,
     indices: [u32; 3],
     pub(in crate::rtw88) now: u64,
     pub(in crate::rtw88) live: bool,
@@ -70,6 +73,7 @@ impl Model {
     }
     pub(in crate::rtw88) fn new() -> Self {
         Self {
+            receive_chip: crate::rtw88::packet_phy::Chip::C22,
             indices: [0; 3],
             now: 0,
             live: true,
@@ -130,6 +134,36 @@ impl Model {
         let next = (((self.indices[2] >> 16) & 0xfff) + 1) % 512;
         self.indices[2] = self.indices[2] & 0xfff | next << 16;
     }
+    pub(in crate::rtw88) fn receive_rate(&mut self, body: &[u8], rate: u8, bw: u8) {
+        self.receive(body, false, false);
+        let packet = self.rx.back_mut().unwrap();
+        packet.bytes[12] = rate;
+        packet.bytes[16] = bw << 4;
+    }
+    /// Authored native descriptor/status bytes. No production status encoder
+    /// is used to create expectations for the parser under test.
+    pub(in crate::rtw88) fn receive_status(
+        &mut self,
+        body: &[u8],
+        status: &[u8],
+        info: u8,
+        present: bool,
+        shift: u8,
+    ) {
+        self.receive_rate(body, 19, 0);
+        let packet = self.rx.back_mut().unwrap();
+        let first = (body.len() + 4) as u32
+            | u32::from(info) << 16
+            | u32::from(present) << 26
+            | u32::from(shift) << 24;
+        packet.bytes[..4].copy_from_slice(&first.to_le_bytes());
+        let mut raw = packet.bytes[..24].to_vec();
+        raw.resize(24 + usize::from(shift), 0xe5);
+        raw.extend_from_slice(status);
+        raw.extend_from_slice(body);
+        raw.extend_from_slice(&[0; 4]);
+        packet.bytes = raw;
+    }
     pub(in crate::rtw88) fn report(&mut self, sequence: u8, success: bool) {
         let mut body = [0; 12];
         body[0] = 255;
@@ -169,6 +203,13 @@ impl Model {
         })
     }
     fn asynchronous_device_progress(&mut self) {
+        loop {
+            let next = self.controls.incoming_profiles.lock().pop_front();
+            let Some((bytes, rate, bw)) = next else {
+                break;
+            };
+            self.receive_rate(&bytes, rate, bw);
+        }
         if self.controls.corrupt_receipt.swap(false, Ordering::AcqRel) {
             self.mutate_payload();
         }
@@ -185,6 +226,9 @@ impl Model {
 // SAFETY: inert single-threaded model owns unique real coherent allocations;
 // simulated bus addresses only match complete owned maps, never become CPU pointers.
 unsafe impl Port for Model {
+    fn receive_chip(&self) -> Result<crate::rtw88::packet_phy::Chip, Error> {
+        Ok(self.receive_chip)
+    }
     fn transmit_allowed(&mut self) -> Result<(), Error> {
         self.guard()?;
         if self.allowed && self.authority.as_ref().is_none_or(|check| check()) {

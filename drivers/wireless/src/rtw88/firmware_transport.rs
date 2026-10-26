@@ -280,6 +280,21 @@ pub(super) unsafe trait Io: Send {
     fn station_profile_readback(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn station_ht_facts(&self) -> Option<super::ht::Facts> {
+        None
+    }
+    fn station_ht_extension(
+        &mut self,
+        _: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<Option<alloc::sync::Arc<super::ht::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_ht(&mut self, _: alloc::sync::Arc<super::ht::Grant>) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
+        Err(Error::Unsupported)
+    }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
         Err(Error::Unsupported)
     }
@@ -409,6 +424,11 @@ impl<I: Io> Owner<I> {
     pub(super) fn station_local(&self) -> Option<[u8; 6]> {
         self.station.as_ref().map(super::station::State::local)
     }
+    pub(super) fn station_ht_capability(&self) -> Option<[u8; 26]> {
+        self.io
+            .station_ht_facts()
+            .and_then(super::ht::Facts::capability)
+    }
     pub(super) fn station_peer(&self) -> Option<[u8; 6]> {
         self.station.as_ref().and_then(super::station::State::peer)
     }
@@ -416,6 +436,11 @@ impl<I: Io> Owner<I> {
         self.station
             .as_ref()
             .is_some_and(super::station::State::ready)
+    }
+    pub(super) fn station_receive_open(&self) -> bool {
+        self.station
+            .as_ref()
+            .is_some_and(super::station::State::receive_open)
     }
     pub(super) fn station_check(&mut self) -> Result<(), super::station::Error> {
         let station = self.station.as_ref().ok_or(super::station::Error::State)?;
@@ -437,8 +462,15 @@ impl<I: Io> Owner<I> {
         &mut self,
     ) -> Result<super::publication::Publication, super::station::Error> {
         self.station_check()?;
+        let epoch = self
+            .station
+            .as_ref()
+            .ok_or(super::station::Error::State)?
+            .admission()
+            .epoch();
         self.io
             .station_publication()
+            .map(|p| p.with_epoch(epoch))
             .map_err(super::station::Error::Native)
     }
     pub(super) fn station_phase(&self) -> Option<super::station::Phase> {
@@ -765,6 +797,9 @@ impl<I: Io> Owner<I> {
             .as_ref()
             .and_then(super::power_policy::Gate::extension_request)
             .ok_or(Error::Unsupported)
+    }
+    pub(super) fn ht20_request(&mut self) -> Result<super::ht::Request, Error> {
+        self.io.station_ht_request()
     }
     pub(super) fn operating_info8821c(&self) -> Option<super::operating8821c::Info> {
         matches!(

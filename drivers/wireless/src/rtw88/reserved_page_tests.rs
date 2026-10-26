@@ -86,6 +86,7 @@ struct Model {
     awake_stuck: bool,
     station_gate: Option<crate::rtw88::power_policy::Gate>,
     extension: Option<Arc<crate::rtw88::station_profile::Grant>>,
+    ht: Option<Arc<crate::rtw88::ht::Grant>>,
     before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     edca_writes: usize,
     packet_model: crate::rtw88::packet_core::tests::Model,
@@ -100,6 +101,21 @@ struct Model {
 #[derive(Clone)]
 struct Port(Arc<IrqSafeSpinLock<Model>>);
 impl Port {
+    fn qualify_ht(&self, s: crate::rtw88::ht::Source) -> Result<(), Error> {
+        let b = self
+            .0
+            .lock()
+            .extension
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let g = s.load(b)?;
+        self.0.lock().ht = Some(g);
+        Ok(())
+    }
+    fn ht_request(&self) -> Result<crate::rtw88::ht::Request, Error> {
+        crate::rtw88::ht::request(self.0.lock().extension.as_ref().ok_or(Error::State)?)
+    }
     fn qualify_extension(
         &self,
         source: crate::rtw88::station_profile::Source,
@@ -147,6 +163,31 @@ impl Port {
 // SAFETY: no physical PCI/DMA. The simulator holds all synthetic device
 // mappings, observes OWN before claiming, and only reads published storage.
 unsafe impl Registers for Port {
+    fn station_ht_facts(&self) -> Option<crate::rtw88::ht::Facts> {
+        self.0.lock().station_gate.as_ref()?.ht_facts()
+    }
+    fn station_ht_extension(
+        &mut self,
+        _: Arc<crate::rtw88::station_profile::Grant>,
+    ) -> Result<Option<Arc<crate::rtw88::ht::Grant>>, Error> {
+        self.station_allowed()?;
+        Ok(self.0.lock().ht.clone())
+    }
+    fn station_bind_ht(&mut self, g: Arc<crate::rtw88::ht::Grant>) -> Result<(), Error> {
+        self.station_allowed()?;
+        let gate = self
+            .0
+            .lock()
+            .station_gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .with_ht(g)?;
+        let current = gate.clone();
+        let mut m = self.0.lock();
+        m.packet_model.authority = Some(Arc::new(move || current.current().is_ok()));
+        m.station_gate = Some(gate);
+        Ok(())
+    }
     fn claim_firmware_dma(&mut self, base: u32) -> Result<(), Error> {
         self.access()?;
         let model = self.0.lock();
@@ -525,6 +566,15 @@ unsafe impl Registers for Port {
     }
     fn station_profile_readback(&mut self) -> Result<(), Error> {
         self.station_allowed()?;
+        let ht = self
+            .0
+            .lock()
+            .station_gate
+            .as_ref()
+            .and_then(crate::rtw88::power_policy::Gate::ht_grant);
+        if let Some(g) = ht {
+            return g.readback(|r| self.read32(r));
+        }
         let indices = self
             .0
             .lock()
@@ -587,6 +637,7 @@ unsafe impl Registers for Port {
             return Err(PacketError::State);
         }
         m.packet_model.authority = Some(Arc::new(move || gate.current().is_ok()));
+        m.packet_model.receive_chip = crate::rtw88::packet_phy::Chip::C21;
         m.packet_core = Some(Core::prepare(&mut m.packet_model, own, id)?);
         Ok(())
     }
@@ -687,6 +738,7 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         awake_stuck: false,
         station_gate: None,
         extension: None,
+        ht: None,
         before_publication: None,
         edca_writes: 0,
         packet_model: crate::rtw88::packet_core::tests::Model::new(),

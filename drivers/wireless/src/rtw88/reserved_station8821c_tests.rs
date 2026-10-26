@@ -151,10 +151,14 @@ fn smoke_rtw8821ce_native_station_radio_retry_receipts_and_retained_reserved_dma
                 || g.allows_profile(crate::rtw88::packet_format::DataProfile {
                     rates: 0xfff,
                     qos: false,
+                    mcs: 0,
+                    sgi: false,
                 })
                 || g.allows_profile(crate::rtw88::packet_format::DataProfile {
                     rates: 1,
                     qos: true,
+                    mcs: 0,
+                    sgi: false,
                 })
         })
         || m.command_ring.pending()

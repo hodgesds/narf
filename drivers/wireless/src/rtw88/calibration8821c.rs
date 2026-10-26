@@ -33,6 +33,7 @@ pub(super) struct Board {
     identity: [u8; 32],
     mac: [u8; 6],
     thermal: u8,
+    hardware: Features,
 }
 impl Board {
     pub(super) fn new(
@@ -80,6 +81,7 @@ impl Board {
             identity: hash.finalize(),
             mac: factory.mac(),
             thermal: factory.thermal(),
+            hardware,
         })
     }
     pub(super) fn request(self) -> Request {
@@ -159,6 +161,9 @@ fn signed(raw: &[u8], at: usize) -> i16 {
     i16::from_le_bytes([raw[at], raw[at + 1]])
 }
 impl Envelope {
+    pub(super) fn hardware(&self) -> Features {
+        self.board.hardware
+    }
     fn decode(
         raw: &[u8],
         signer: Option<[u8; 32]>,

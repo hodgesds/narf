@@ -1,6 +1,8 @@
 //! Actual retained C21 reserved-page/IQK/TXAGC/awake owner through separately
 //! qualified legacy12/QoS. All measured numbers here belong to inert fixtures.
 use super::*;
+#[path = "ht8821c_tests.rs"]
+mod ht_tests;
 use crate::rtw88::station_profile::{Request, Source};
 use core::sync::atomic::AtomicBool;
 const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];

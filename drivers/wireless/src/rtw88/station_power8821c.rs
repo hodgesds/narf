@@ -116,6 +116,9 @@ impl Source {
     }
 }
 impl Grant {
+    pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
+        self.power.ht_facts()
+    }
     fn decode(
         raw: &[u8],
         signer: Option<[u8; 32]>,

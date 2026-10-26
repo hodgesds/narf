@@ -1,6 +1,8 @@
 //! C22 retained firmware/radio/packet/Device with distinct synthetic N22L
 //! measurement records and an independent native AP/CCMP/DHCP actor.
 use super::*;
+#[path = "ht8822c_tests.rs"]
+mod ht_tests;
 use crate::rtw88::{
     packet_format::{self, DataProfile},
     station_profile::{Request, Source},
@@ -169,6 +171,8 @@ fn smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units() -> Te
             let profile = DataProfile {
                 rates: 1 | (1 << index),
                 qos: true,
+                mcs: 0,
+                sgi: false,
             };
             let mut frame = vec![0x88, 1, 0, 0];
             frame.extend_from_slice(&AP);
@@ -200,6 +204,8 @@ fn smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units() -> Te
         if (DataProfile {
             rates: (1 << 3) | (1 << 4) | (1 << 5),
             qos: false,
+            mcs: 0,
+            sgi: false,
         })
         .rate()
             != 3

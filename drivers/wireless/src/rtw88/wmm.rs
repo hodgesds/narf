@@ -85,18 +85,18 @@ pub(super) async fn commit(
             narf_scheduler::yield_now().await;
         }
     }
-    let rates = profile.rates.to_le_bytes();
+    let rates = (u32::from(profile.rates) | (u32::from(profile.mcs) << 12)).to_le_bytes();
     super::station_control::send(
         io,
         [
             0x40,
             0,
-            profile.rate_id() | (1 << 5),
+            profile.rate_id() | (1 << 5) | (u8::from(profile.sgi) << 7),
             0x40,
             rates[0],
             rates[1],
-            0,
-            0,
+            rates[2],
+            rates[3],
         ],
         Some(admission),
     )
