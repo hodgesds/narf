@@ -608,7 +608,12 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             h.extend_from_slice(&frame[12..]);
             h
         };
-        if let Err(error) = self.radio.submit_native_data(&native) {
+        let rate = if self.plan.wmm().is_some() {
+            self.plan.data_rate().map_err(Error::Management)?
+        } else {
+            0
+        };
+        if let Err(error) = self.radio.submit_native_data_rate(&native, rate) {
             self.fail();
             return Err(Error::Radio(error));
         }

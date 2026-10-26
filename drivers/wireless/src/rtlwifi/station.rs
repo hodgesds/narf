@@ -131,7 +131,7 @@ struct Pending {
 pub(super) struct State {
     phase: Phase,
     failed: Arc<AtomicBool>,
-    calibration: Option<super::super::channel_power::Calibration>,
+    calibration: Option<Arc<super::super::channel_power::Calibration>>,
     cache: Vec<Entry>,
     candidate: Option<Candidate>,
     plan: Option<JoinPlan>,
@@ -287,7 +287,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         {
             return Err(Error::Profile);
         }
-        self.station.calibration = Some(calibration);
+        self.station.calibration = Some(Arc::new(calibration));
         Ok(())
     }
     pub(crate) fn station_peer(&self) -> Option<[u8; 6]> {
@@ -416,14 +416,41 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             bytes[22..24].copy_from_slice(&(self.station.sequence << 4).to_le_bytes());
             self.station.sequence = (self.station.sequence + 1) & 4095;
         }
-        let id = if let Some(admission) = environment.admission() {
-            admission.publish(Error::State, || {
-                self.check_station_policy(environment)?;
-                self.submit(&bytes, 0).map_err(Error::Radio)
-            })?
+        let rate = if matches!(kind, Kind::Data) {
+            let rates = self
+                .station
+                .plan
+                .as_ref()
+                .ok_or(Error::State)?
+                .legacy_rates()
+                .0;
+            [11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]
+                .into_iter()
+                .find(|rate| rates & (1 << rate) != 0)
+                .ok_or(Error::Profile)?
         } else {
-            self.check_station_policy(environment)?;
-            self.submit(&bytes, 0)?
+            0
+        };
+        let calibration = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::Profile)?
+            .clone();
+        let mut publish = || {
+            calibration
+                .with_current(|| {
+                    self.check_station_policy(environment).map_err(|_| {
+                        RadioError::Power(super::super::channel_power::Error::Policy)
+                    })?;
+                    self.submit(&bytes, rate)
+                })
+                .map_err(Error::Radio)
+        };
+        let id = if let Some(admission) = environment.admission() {
+            admission.publish(Error::State, publish)?
+        } else {
+            publish()?
         };
         self.station.pending = Some(Pending {
             id,

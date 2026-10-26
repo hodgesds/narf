@@ -205,6 +205,16 @@ impl Join {
     pub(super) fn wmm(&self) -> Option<narf_wireless::wmm::Parameters> {
         self.wmm
     }
+    pub(super) fn data_rate(&self) -> Result<u8, Error> {
+        if !matches!(self.phase(), Phase::Associated { .. }) {
+            return Err(Error::Profile);
+        }
+        let rates = self.plan.legacy_rates().0;
+        [11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]
+            .into_iter()
+            .find(|rate| rates & (1 << rate) != 0)
+            .ok_or(Error::Profile)
+    }
     pub fn candidate(&self) -> &Candidate {
         &self.candidate
     }

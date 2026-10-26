@@ -473,7 +473,13 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         self.fail();
     }
     pub(super) fn submit_native_data(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.submit_native_data_rate(frame, 0)
+    }
+    pub(super) fn submit_native_data_rate(&mut self, frame: &[u8], rate: u8) -> Result<(), Error> {
         self.current_wmm()?;
+        if rate != 0 && self.wmm.is_none() {
+            return Err(Error::State);
+        }
         if self.phase() != Phase::Active
             || frame.len() < 24
             || frame[10..16] != self.local().ok_or(Error::State)?
@@ -481,7 +487,16 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         {
             return Err(Error::State);
         }
-        let result = self.packets.submit(super::packet_codec::Kind::Data, frame);
+        let proof = self.wmm.clone();
+        let mut submit = || {
+            self.packets
+                .submit_rate(super::packet_codec::Kind::Data, frame, rate)
+        };
+        let result = if let Some(proof) = proof {
+            proof.invoke(submit)?
+        } else {
+            submit()
+        };
         if self.packets.is_failed() {
             self.fail();
         }

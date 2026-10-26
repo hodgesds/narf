@@ -14,6 +14,8 @@ pub(super) struct Env {
     power: AtomicI8,
     entropy: AtomicBool,
     policy: Option<Arc<narf_wireless::reg::db::Database>>,
+    qualification:
+        Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
 }
 impl Env {
     fn new() -> Self {
@@ -22,6 +24,7 @@ impl Env {
             power: AtomicI8::new(17),
             entropy: AtomicBool::new(true),
             policy: None,
+            qualification: None,
         }
     }
 }
@@ -262,13 +265,36 @@ fn started_profile(
     Arc<IrqSafeSpinLock<Peer>>,
     Env,
 ) {
+    started_rates(protected, parameters, None)
+}
+fn started_rates(
+    protected: bool,
+    parameters: Option<Vec<u8>>,
+    rates: Option<&[u8]>,
+) -> (
+    Prepared<PacketPort, Block>,
+    PacketPort,
+    Arc<IrqSafeSpinLock<Peer>>,
+    Env,
+) {
     let (mut owner, port) = control_owner();
-    let env = Env::new();
+    let mut env = Env::new();
+    let calibration = if rates.is_some() {
+        let cap = narf_capabilities::Cap::bootstrap();
+        env.qualification = Some(cap);
+        power::calibration_with_cap(&power::factory(), cap)
+    } else {
+        power::calibration(&power::factory())
+    };
     owner
-        .stage_station_calibration(power::calibration(&power::factory()), &power::domain(17))
+        .stage_station_calibration(calibration, &power::domain(17))
         .unwrap();
     complete(owner.start_station_service(&env)).unwrap();
-    let peer = Arc::new(IrqSafeSpinLock::new(Peer::new(protected)));
+    let mut peer = Peer::new(protected);
+    if let Some(rates) = rates {
+        peer.ap = peer.ap.with_legacy_rates(rates).unwrap();
+    }
+    let peer = Arc::new(IrqSafeSpinLock::new(peer));
     peer.lock().wmm = parameters.clone();
     port.model.lock().peer = Some(peer.clone());
     let mut beacon = { peer.lock().ap.beacon() };
@@ -284,6 +310,94 @@ const WMM: [u8; 26] = [
     221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x81, 0, 0x62, 0x32, 47, 0, 3, 0xa4, 0, 0, 0x42, 0x43, 94, 0,
     0x27, 0xa4, 0, 0,
 ];
+const LEGACY_RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+fn smoke_rtl8188ee_negotiated_legacy_data_rate_uses_native_descriptor_and_ccmp() -> TestResult {
+    for protected in [false, true] {
+        let cases = LEGACY_RATES
+            .iter()
+            .enumerate()
+            .map(|(index, &code)| {
+                (
+                    if index == 0 {
+                        vec![code]
+                    } else {
+                        vec![0x82, code]
+                    },
+                    index as u32,
+                )
+            })
+            .chain(core::iter::once((LEGACY_RATES.to_vec(), 11)));
+        for (response, expected) in cases {
+            let (mut owner, port, peer, env) =
+                started_rates(protected, Some(WMM.to_vec()), Some(&LEGACY_RATES));
+            // The immutable scan offered all12; the actual response may narrow it.
+            {
+                let mut p = peer.lock();
+                let ap = core::mem::replace(&mut p.ap, Peer::new(protected).ap);
+                p.ap = ap.with_legacy_rates(&response).unwrap();
+            }
+            if complete(owner.connect_station(
+                PEER,
+                SSID,
+                if protected {
+                    SecurityMode::Wpa2Psk
+                } else {
+                    SecurityMode::Open
+                },
+                protected.then(|| Zeroizing::new(PMK)),
+                &[],
+                &env,
+            ))
+            .is_err()
+            {
+                return TestResult::Fail("EE negotiated legacy native association");
+            }
+            let plan = peer.lock().plan;
+            let ethernet = udp_ipv4(
+                PEER,
+                plan.station,
+                plan.lease_ip,
+                plan.server_ip,
+                44000,
+                44001,
+                b"EE all12 legacy DATA",
+            );
+            let slot = port.model.lock().slots[4];
+            if owner.send_station_ethernet(&ethernet, &env).is_err()
+                || owner.progress_station(&env).is_err()
+                || peer.lock().uplink.last() != Some(&ethernet)
+            {
+                return TestResult::Fail("EE actual richer-rate native data/CCMP");
+            }
+            let descriptor = port.descriptor(4, slot);
+            if word(&descriptor, 20) & 63 != expected
+                || word(&descriptor, 16) & ((1 << 8) | (1 << 10)) != ((1 << 8) | (1 << 10))
+            {
+                return TestResult::Fail("EE response intersection or native forced rate differs");
+            }
+            let retained = port.live_regions();
+            if protected {
+                env.qualification.unwrap().revoke();
+            } else {
+                port.model.lock().live = false;
+            }
+            if owner.send_station_ethernet(&ethernet, &env).is_ok()
+                || owner.station_peer().is_some()
+            {
+                return TestResult::Fail("EE richer rates survived signed/PCI authority loss");
+            }
+            drop(owner);
+            if retained.iter().any(|r| !r.live.load(Ordering::Acquire)) {
+                return TestResult::Fail("EE richer-rate terminal owner freed native mappings");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rates",
+    smoke_rtl8188ee_negotiated_legacy_data_rate_uses_native_descriptor_and_ccmp
+);
 fn smoke_rtl8188ee_wmm_real_dma_edca_and_open_wpa2_qos_data() -> TestResult {
     for protected in [false, true] {
         let (mut owner, port, peer, mut env) = started_profile(protected, Some(WMM.to_vec()));
@@ -422,7 +536,7 @@ kernel_test_in!(
     smoke_rtl8188ee_wmm_malformed_response_and_native_readback_are_terminal
 );
 fn smoke_rtl8188ee_wmm_m4_cancellation_keeps_port_closed_and_exact_owner() -> TestResult {
-    let (mut owner, port, peer, env) = started_profile(true, Some(WMM.to_vec()));
+    let (mut owner, port, peer, env) = started_rates(true, Some(WMM.to_vec()), Some(&LEGACY_RATES));
     peer.lock().hold_m4 = true;
     let mut operation = Box::pin(owner.connect_station(
         PEER,

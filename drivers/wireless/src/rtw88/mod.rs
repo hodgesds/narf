@@ -50,6 +50,7 @@ pub mod fw;
 mod hardware;
 pub(super) mod interface;
 mod mac;
+mod operating8821c;
 pub(super) mod packet_core;
 pub(super) mod packet_format;
 mod pci_firmware;
@@ -68,6 +69,7 @@ pub use calibration8821c::{Error as C21CalibrationError, Request as C21Calibrati
 pub use firmware_lifecycle::{Stage as FirmwareStage, Status as FirmwareStatus};
 pub use firmware_transport::{Error as FirmwareError, Info as FirmwareInfo};
 pub use mac::Info as MacInfo;
+pub use operating8821c::{Info as C21OperatingPowerInfo, Request as C21OperatingPowerRequest};
 pub use phy::Info as PhyTablesInfo;
 pub use power_policy::{Error as PowerError, Permission as PowerPermission};
 pub use radio::Info as RadioInfo;

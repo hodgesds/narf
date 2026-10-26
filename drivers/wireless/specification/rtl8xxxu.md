@@ -320,6 +320,21 @@ held EP0 cancellation and revocation before repoll. Controller-proven reset,
 safe rejoin, additional AC/channel/rate profiles and physical USB/RF acceptance
 remain separate gates.
 
+### Measured legacy-rate selection on the WMM station path
+
+The current signed WMM owner now selects the fastest ordinary DATA rate from
+the actual bound association response/request intersection, ordered
+54,48,36,24,18,12,11,9,6,5.5,2,1Mbps. Source TXDESC32 DATA_RATE low6 bits
+are programmed before the descriptor checksum; USE_DRIVER_RATE and disabled
+fallback keep the chosen rate explicit. Management and EAPOL remain CCK1,
+and the unchanged legacy station path remains fixed CCK1. This extension uses
+only N8PC's existing explicit whole-board CCK/all4 and OFDM/all8 measured
+envelopes; it does not qualify HT or change autonomous response gains/rates.
+The retained current source/policy fence still encloses admission and native
+USB publication. One composed native smoke exercises all12 literal rates,
+response narrowing, Open/WPA2 native data/CCMP, exact checksum and source
+revocation with no extra publication and retained posted RX ownership.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -370,11 +385,22 @@ channels/rates, reset/rejoin and PM still need software implementation.
 | Production passive scan/MLME service and policy-admitted management TX | Implemented narrow channel1/basic1Mbps profile, signed board/deployment admission required |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
-| Broader channel/rate profiles and coexistence | Missing; initial profile is channel1/basic1Mbps only |
+| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX; management/basic1Mbps and channel1 remain required. Retune, broader bands/HT/adaptation and coexistence remain missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
 | Disconnect/peer-loss callbacks and normal bulk stop | Implemented; one association per firmware claim |
 | EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Missing; software prerequisites |
+
+Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
+`8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
+BT/S0S1. EU therefore still needs HT20/40, aggregation/BA/reorder, full WMM
+AC/TID routing, adaptive rates, broader active/passive scanning, runtime PM and
+reset/rejoin. 8192EU/8723BU first need their own retained power/firmware/radio/
+packet/station compositions, including2-chain or coexistence dependencies.
+The repository's matched8821CU/8822BU profiles need the actual upstream
+`rtw88/rtw8821cu.c`/`rtw8822bu.c` USB transport and C21/C22B radio semantics;
+EU descriptor/register helpers cannot establish those VHT runtimes. No
+unsupported initial profile is marked hardware-inapplicable here.
 
 Linux references: `rtl8xxxu/8188e.c` power/reset, IQK and fops;
 `rtl8xxxu/core.c` firmware, post-table init, HSSI, LC and IQ matrix functions;

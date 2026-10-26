@@ -63,6 +63,18 @@ pub(super) unsafe trait Io: Send {
     fn packet_start(&mut self) -> Result<(), packet::Error>;
     fn packet_ready(&self) -> bool;
     fn packet_submit(&mut self, bytes: &[u8], report: bool) -> Result<u64, packet::Error>;
+    fn packet_submit_rate(
+        &mut self,
+        bytes: &[u8],
+        report: bool,
+        rate: u8,
+    ) -> Result<u64, packet::Error> {
+        if rate == 0 {
+            self.packet_submit(bytes, report)
+        } else {
+            Err(packet::Error::Packet)
+        }
+    }
     fn packet_poll(&mut self) -> Result<packet::Step, packet::Error>;
     fn packet_stop(&mut self) -> Result<(), packet::Error>;
 }
@@ -358,7 +370,16 @@ impl State {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
-        let id = io.packet_submit(&bytes, kind != Kind::Data)?;
+        let rate = if kind == Kind::Data && self.wmm.is_some() {
+            let rates = self.plan.as_ref().ok_or(Error::State)?.legacy_rates().0;
+            [11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]
+                .into_iter()
+                .find(|rate| rates & (1 << rate) != 0)
+                .ok_or(Error::Profile)?
+        } else {
+            0
+        };
+        let id = io.packet_submit_rate(&bytes, kind != Kind::Data, rate)?;
         self.pending = Some(Pending { id, bytes, kind });
         Ok(())
     }

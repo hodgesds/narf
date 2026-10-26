@@ -67,7 +67,7 @@ impl Board {
     }
     pub(super) fn wmm(mut self) -> Self {
         let mut hash = narf_crypto::sha256::Sha256::new();
-        hash.update(b"NARF RTL8852B WMM BE/TID0 legacy1 optional operating recipe v1");
+        hash.update(b"NARF RTL8852B WMM BE/TID0 legacy12 optional operating recipe v2");
         hash.update(&self.identity);
         hash.update(&super::station_control::wmm_fingerprint());
         self.identity = hash.finalize();

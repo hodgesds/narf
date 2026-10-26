@@ -190,6 +190,9 @@ impl<I: Io> Owner<I> {
         Ok(Some(records))
     }
     pub fn submit(&mut self, kind: Kind, frame: &[u8]) -> Result<(), Error> {
+        self.submit_rate(kind, frame, 0)
+    }
+    pub(super) fn submit_rate(&mut self, kind: Kind, frame: &[u8], rate: u8) -> Result<(), Error> {
         self.check()?;
         if kind == Kind::Data && frame.first() == Some(&0x88) && !self.qos {
             return Err(Error::Packet(packet_codec::Error::Header));
@@ -200,7 +203,7 @@ impl<I: Io> Owner<I> {
         if self.transmit.is_some() {
             return Err(Error::Busy);
         }
-        let packet = packet_codec::transmit(frame, kind).map_err(Error::Packet)?;
+        let packet = packet_codec::transmit_rate(frame, kind, rate).map_err(Error::Packet)?;
         let index = match kind {
             Kind::Management => 0,
             Kind::Data => usize::from(self.endpoints.output_count - 1),

@@ -33,6 +33,7 @@ pub enum Phase {
     MacPrepared,
     PhyTablesPrepared,
     Calibration8821cPrepared,
+    Operating8821cPrepared,
     Calibrated,
     Station,
     Failed,
@@ -223,6 +224,12 @@ pub(super) unsafe trait Io: Send {
     fn finish_calibration8821c(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn begin_operating8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_operating8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
@@ -309,6 +316,8 @@ pub(super) struct Owner<I: Io> {
     phy8821c: Option<super::phy8821c::Info>,
     calibration8821c: Option<super::radio8821c::Info>,
     envelope8821c: Option<alloc::sync::Arc<super::calibration8821c::Envelope>>,
+    operating8821c: Option<super::operating8821c::Info>,
+    operating_envelope8821c: Option<alloc::sync::Arc<super::operating8821c::Envelope>>,
     image_digest: Option<[u8; 32]>,
     power: Option<alloc::sync::Arc<super::power_policy::Calibration>>,
     radio: Option<super::radio::Info>,
@@ -335,6 +344,8 @@ impl<I: Io> Owner<I> {
             phy8821c: None,
             calibration8821c: None,
             envelope8821c: None,
+            operating8821c: None,
+            operating_envelope8821c: None,
             image_digest: None,
             power: None,
             radio: None,
@@ -673,9 +684,78 @@ impl<I: Io> Owner<I> {
         Ok(info)
     }
     pub(super) fn calibration_info8821c(&self) -> Option<super::radio8821c::Info> {
-        (self.phase == Phase::Calibration8821cPrepared)
-            .then_some(self.calibration8821c)
+        matches!(
+            self.phase,
+            Phase::Calibration8821cPrepared | Phase::Operating8821cPrepared
+        )
+        .then_some(self.calibration8821c)
+        .flatten()
+    }
+    pub(super) fn operating_info8821c(&self) -> Option<super::operating8821c::Info> {
+        (self.phase == Phase::Operating8821cPrepared)
+            .then_some(self.operating8821c)
             .flatten()
+    }
+    pub(super) fn operating_request8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::operating8821c::Request, Error> {
+        if self.did != 0xc821
+            || !matches!(
+                self.phase,
+                Phase::Calibration8821cPrepared | Phase::Operating8821cPrepared
+            )
+        {
+            return Err(Error::State);
+        }
+        Ok(super::operating8821c::request(
+            self.calibration_board8821c(factory)?.request(),
+            self.calibration8821c.ok_or(Error::State)?,
+        ))
+    }
+    pub(super) fn preflight_operating8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+        source: super::operating8821c::Source,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<alloc::sync::Arc<super::operating8821c::Envelope>, Error> {
+        if self.phase != Phase::Calibration8821cPrepared {
+            return Err(Error::State);
+        }
+        let envelope = source.load(
+            self.operating_request8821c(factory)?,
+            factory,
+            self.envelope8821c.as_ref().ok_or(Error::State)?.clone(),
+        )?;
+        envelope.invoke(&|| Ok(domain.clone()), || Ok(()))?;
+        Ok(alloc::sync::Arc::new(envelope))
+    }
+    pub(super) async fn prepare_operating8821c<F>(
+        &mut self,
+        factory: &super::efuse::Factory8821c,
+        envelope: alloc::sync::Arc<super::operating8821c::Envelope>,
+        policy: F,
+    ) -> Result<super::operating8821c::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        if self.phase != Phase::Calibration8821cPrepared
+            || !envelope.matches(&self.operating_request8821c(factory)?)
+        {
+            return Err(Error::State);
+        }
+        envelope.invoke(&policy, || Ok(()))?;
+        self.phase = Phase::Failed;
+        self.operating_envelope8821c = Some(envelope.clone());
+        let info = narf_time::timeout(
+            narf_time::Deadline::after_ms(3000),
+            envelope.prepare(&mut self.io, policy),
+        )
+        .await
+        .map_err(|_| Error::Deadline)??;
+        self.operating8821c = Some(info);
+        self.phase = Phase::Operating8821cPrepared;
+        Ok(info)
     }
     pub(super) fn calibration_request8821c(
         &self,
@@ -686,7 +766,9 @@ impl<I: Io> Owner<I> {
         }
         if !matches!(
             self.phase,
-            Phase::PhyTablesPrepared | Phase::Calibration8821cPrepared
+            Phase::PhyTablesPrepared
+                | Phase::Calibration8821cPrepared
+                | Phase::Operating8821cPrepared
         ) {
             return Err(Error::State);
         }

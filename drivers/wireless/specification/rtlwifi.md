@@ -398,6 +398,25 @@ clear/reinstall, retained mappings and cancelled M4. Physical WMM/RF acceptance
 remains unrecorded; other ACs,
 dynamic EDCA, HT, power management and reset/rejoin remain separate work.
 
+### Response-bound legacy data rates
+
+Ordinary DATA selects the fastest physically ordered rate in the actual
+association response/request intersection:54,48,36,24,18,12,11,9,6,5.5,2,1Mbps.
+IEEE bit order is not throughput order: CCK11Mbps outranks OFDM9/6Mbps. The
+retained EE submit path programs actual TXD5 rate0..11 with USE_RATE and
+DISDATAFB; management, association and EAPOL retain CCK1. Basic1Mbps remains
+required for those transmissions. Signed NEPC class envelopes already cover
+all four CCK and all eight OFDM rates; each selected rate keeps its checked
+factory/PG gain and current power/source admission. No MCS, rate fallback,
+retry adaptation or additional response rate is inferred.
+The exact retained signed calibration invocation encloses allocation,
+descriptor/body publication and doorbell, with fresh host policy inside it.
+
+One composed native smoke exercises every literal descriptor rate in Open
+and WPA2, AP response narrowing, the all12-rate offer, actual QoS/CCMP bytes,
+current signed/PCI loss and retained mappings. The existing actual held-M4
+cancellation test now negotiates this richer offer before terminal closure.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -433,6 +452,19 @@ implemented, awaiting combined gates. Physical board qualification remains.
 | Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; new Device/composition regressions await combined gates. Other matched chips remain missing |
 | Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures implemented; combined gates and actual board testing remain |
 | Multi-radio, removal, suspend/reset/recovery | Missing |
+
+Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
+
+| Chip | Source hardware scope | Remaining native software |
+|---|---|---|
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |HT20/40, BA/reorder/aggregation, all WMM AC/TIDs, adaptive rates, broader scan/channels, runtime tracking/PM and reset/rejoin |
+| RTL8192CE/EE |2.4GHz2T2R HT |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle |
+| RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
+| RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |
+| RTL8821AE |Dual-band VHT, source `RTL_SPEC_SUPPORT_VHT` |Exact retained firmware/MAC/PHY/RF/power/station chain, VHT/QoS and lifecycle |
+
+The source2.4GHz bandset rules out5GHz work on EE/CE/8192EE/8723;
+initial-profile restrictions do not rule out their HT/QoS hardware features.
 
 References: Linux `rtlwifi/efuse.c`, per-chip `sw.c`/`reg.h`,
 `rtl8192d/hw_common.c` dual-MAC selection, and per-chip firmware/HW code.

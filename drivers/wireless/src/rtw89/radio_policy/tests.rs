@@ -66,6 +66,24 @@ fn smoke_rtw8852b_wmm_measured_recipe_is_distinct_from_legacy_full_radio() -> Te
     if Qualification::from_verified(&bytes, Some([3; 32]), base, cap).is_ok() {
         return TestResult::Fail("old digest reused by new WMM emission recipe");
     }
+    // Frozen previous BE/TID0 CCK1 recipe: those measured bytes cannot admit
+    // the new source DATA_RATE program, even though wire flags remain7.
+    let mut old_recipe = narf_crypto::sha256::Sha256::new();
+    old_recipe.update(b"B WMM v1 AP response-bound; BE/TID0 CCK1 raw26 halfwords13; noHT/BA/UAPSD/TSPEC; source H2C MAC9 class15 fourAC ACK; BE ECWmin>=5 max>=10 AIFSN>=3 TXOP0 SIFS10 long20/short9; noAP ACM BE; bounded AIFS8bit");
+    old_recipe.update(&[221, 7, 0, 0x50, 0xf2, 2, 0, 1, 0]);
+    let mut old_identity = narf_crypto::sha256::Sha256::new();
+    old_identity.update(b"NARF RTL8852B WMM BE/TID0 legacy1 optional operating recipe v1");
+    old_identity.update(&base.identity());
+    old_identity.update(&old_recipe.finalize());
+    bytes[16..48].copy_from_slice(&old_identity.finalize());
+    if !matches!(
+        Qualification::from_verified(&bytes, Some([3; 32]), base, cap),
+        Err(Error::Identity)
+    ) {
+        return TestResult::Fail(
+            "previous CCK1 WMM qualification admitted richer legacy DATA rates",
+        );
+    }
     bytes[16..48].copy_from_slice(&base.wmm().identity());
     let mut qualified = match Qualification::from_verified(&bytes, Some([3; 32]), base, cap) {
         Ok(q) => q,

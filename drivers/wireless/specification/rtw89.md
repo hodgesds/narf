@@ -937,6 +937,27 @@ actual native packet owners through Open/WPA2 and exact bidirectional data,
 malformed response and held M4. Real measured flags7 assets and physical WMM/RF
 acceptance remain external gates; broader lifecycle recovery remains open.
 
+### Negotiated legacy DATA rates under WMM recipe revision2
+
+The flags7 derived WMM identity now binds recipe revision2, the exact native
+TXWD_INFO0 DATA_RATE[24:16] field, USE_RATE/DISDATAFB and response-bound
+selection order54,48,36,24,18,12,11,9,6,5.5,2,1Mbps. Earlier flags7 measured
+records cannot authorize this changed emitter program. A genuine new record
+must bound all newly reachable DATA rates and the complete unchanged radio/
+automatic-response program. Flags3 remains fixed CCK1; packet formatting or
+an AP rate offer cannot promote that qualification.
+
+Only ordinary DATA after actual WMM/peer admission selects the fastest rate
+from the common plan's actual association response/request intersection.
+Management/EAPOL remain CCK1 and the initial AP still needs that basic rate.
+The actual Native rechecks the current flags7 qualifier before nonzero-rate
+publication, then the same retained packet owner formats TXWD and waits for
+both TXBD consumption and matching RPQ release. One composed native smoke
+checks all12 literal TXWD rates, Open/WPA2 data/CCMP, AP response narrowing,
+current PCI loss and unchanged flags3 behavior. HT/HE, adaptive fallback/MRR
+and full WMM AC/TIDs remain software work with additional source and signed
+qualification dependencies.
+
 ## 4. Invariants
 
 Physical reads write the address and wait for the hardware ready flag before
@@ -986,6 +1007,17 @@ or physical hardware acceptance.
 | Initial B scan, MLME, WPA2 and Ethernet | Source controller plus shared host MLME/RSNA/CCMP, exact M4/RX-idle admission, kernel DHCP/IP, rekey and terminal disconnect/cancellation are implemented; physical acceptance remains |
 | BE EFUSE/block format and BE transport | Missing |
 | Broader lifecycle | Initial independent reset and terminal ownership implemented; removal, suspend, automatic reset/rejoin and multiple live functions remain outside this first profile |
+
+The per-chip source `rtw_chip_info` inventories are broader than this station:
+8851B declares1TX/1RX and2.4/5GHz;8852A/B declare2TX/2RX and2.4/5GHz;
+8852C declares2TX/2RX and2.4/5/6GHz;8922A declares2TX/2RX and2.4/5/6GHz
+with its distinct BE generation. B still needs source-bound HT/HE and widths,
+full QoS AC/TIDs, BA/aggregation/reorder, broader channel/scan policy, tracking,
+runtime sleep/WoW and safe reset/rejoin. A/C/51 need complete chip-specific
+firmware/security, BB/RF/power/packet/station composition;8922A additionally
+needs BE EFUSE/container/descriptor/transport and EHT operation. Source band
+masks make6GHz inapplicable to A/B/51, not to C/8922A. These are remaining
+software dependencies, not implementation-complete hardware capability claims.
 
 References: Linux `rtw89/efuse.c`, `rtw8852a.h`, `rtw8852b_common.h`,
 `rtw8852c.h`, `rtw8851b.h`, `core.c::rtw89_core_get_ch_dma`,

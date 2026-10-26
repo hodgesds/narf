@@ -189,6 +189,15 @@ unsafe impl Io for Startup {
     fn packet_submit(&mut self, bytes: &[u8], report: bool) -> Result<u64, packet::Error> {
         self.station_native()?.submit_packet(bytes, report)
     }
+    fn packet_submit_rate(
+        &mut self,
+        bytes: &[u8],
+        report: bool,
+        rate: u8,
+    ) -> Result<u64, packet::Error> {
+        self.station_native()?
+            .submit_packet_rate(bytes, report, rate)
+    }
     fn packet_poll(&mut self) -> Result<packet::Step, packet::Error> {
         self.station_native()?.poll_packets()
     }

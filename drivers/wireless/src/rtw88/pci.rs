@@ -86,6 +86,24 @@ impl Rtw88Device {
             None => None,
         }
     }
+    /// Exact post-IQK parked operating-power program to measure and sign.
+    /// This request grants no packet, response or station authority.
+    pub async fn rtl8821c_operating_power_request(
+        &self,
+    ) -> Result<super::C21OperatingPowerRequest, super::FirmwareError> {
+        self.sibling
+            .as_ref()
+            .ok_or(super::FirmwareError::Unsupported)?
+            .operating_request()
+            .await
+    }
+    /// Historical parked TXAGC/readback receipt; MAC TX/RX remain closed.
+    pub async fn rtl8821c_operating_power_info(&self) -> Option<super::C21OperatingPowerInfo> {
+        match &self.sibling {
+            Some(owner) => owner.operating_info().await,
+            None => None,
+        }
+    }
 }
 
 impl Interface for Rtw88Device {

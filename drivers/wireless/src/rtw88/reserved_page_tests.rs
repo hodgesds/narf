@@ -78,6 +78,7 @@ struct Model {
     iqk_reads: usize,
     hold_delay: Option<u64>,
     ignore_rf: bool,
+    ignore_write: Option<u16>,
     thermal_values: Option<[u8; 2]>,
     thermal_conversions: usize,
     thermal_triggered: bool,
@@ -190,6 +191,9 @@ unsafe impl Registers for Port {
     fn write32(&mut self, reg: u16, value: u32) -> Result<(), Error> {
         self.access()?;
         let mut model = self.0.lock();
+        if model.ignore_write == Some(reg) {
+            return Ok(());
+        }
         let at = usize::from(reg);
         model.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
         if reg == 0xc90 {
@@ -350,6 +354,24 @@ unsafe impl Registers for Port {
         model.continuation = 8;
         Ok(())
     }
+    fn begin_operating8821c(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut m = self.0.lock();
+        if m.continuation != 8 || m.bytes[0x100] & 0xcf != 0 || m.bytes[0x522] != 255 {
+            return Err(Error::Prerequisite);
+        }
+        m.continuation = 9;
+        Ok(())
+    }
+    fn finish_operating8821c(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut m = self.0.lock();
+        if m.continuation != 9 || m.bytes[0x100] & 0xcf != 0 || m.bytes[0x522] != 255 {
+            return Err(Error::Prerequisite);
+        }
+        m.continuation = 10;
+        Ok(())
+    }
 }
 fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
     let drops = Arc::new(AtomicUsize::new(0));
@@ -392,6 +414,7 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         iqk_reads: 0,
         hold_delay: None,
         ignore_rf: false,
+        ignore_write: None,
         thermal_values: None,
         thermal_conversions: 0,
         thermal_triggered: false,

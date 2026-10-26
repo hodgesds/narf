@@ -104,6 +104,7 @@ struct LinkState {
     quiet: bool,
     ptk: Option<Ptk>,
     wmm: Option<Vec<u8>>,
+    rates: Option<Vec<u8>>,
 }
 #[derive(Clone)]
 struct Link {
@@ -194,6 +195,10 @@ impl Io for Link {
                     // This AP's beacon offers only basic1Mbps. A response
                     // cannot make unoffered2/5.5/11Mbps mandatory.
                     b.extend_from_slice(&[1, 1, 0x82]);
+                    if let Some(rates) = &m.rates {
+                        b.extend_from_slice(&[50, rates.len() as u8]);
+                        b.extend_from_slice(rates);
+                    }
                     if let Some(parameters) = &m.wmm {
                         b.extend_from_slice(parameters);
                     }
@@ -369,6 +374,9 @@ type WmmFixture = (
     Arc<IrqSafeSpinLock<narf_wireless::reg::RegulatoryDomain>>,
 );
 fn wmm_prepared(protected: bool) -> WmmFixture {
+    wmm_rates(protected, None)
+}
+fn wmm_rates(protected: bool, rates: Option<&[u8]>) -> WmmFixture {
     let (control, link, mut rx, permission) = raw(protected);
     let cap = narf_capabilities::Cap::bootstrap();
     let domain = Arc::new(IrqSafeSpinLock::new(super::domain(17)));
@@ -380,6 +388,11 @@ fn wmm_prepared(protected: bool) -> WmmFixture {
     ));
     link.state.lock().wmm = Some(WMM.to_vec());
     let mut b = beacon(protected);
+    if let Some(rates) = rates {
+        link.state.lock().rates = Some(rates.to_vec());
+        b.bytes.extend_from_slice(&[50, rates.len() as u8]);
+        b.bytes.extend_from_slice(rates);
+    }
     b.bytes.extend_from_slice(&WMM);
     let candidate = Candidate::from_receive(&b, 1, link.own).unwrap();
     let station = Station::new(
@@ -397,6 +410,68 @@ fn wmm_prepared(protected: bool) -> WmmFixture {
     .unwrap();
     (control, link, station, cap, domain)
 }
+fn smoke_rtl8188eu_negotiated_legacy_rate_native_usb_and_current_power() -> TestResult {
+    const RATES: [u8; 11] = [4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    for protected in [false, true] {
+        for code in 0..=12 {
+            let response = if code == 12 {
+                Some(RATES.to_vec())
+            } else if code == 0 {
+                None
+            } else {
+                Some(vec![RATES[code - 1]])
+            };
+            let expected = if code == 12 { 11 } else { code as u8 };
+            let (_, link, mut s, cap, _) = wmm_rates(protected, Some(&RATES));
+            link.state.lock().rates = response;
+            if narf_scheduler::block_on(s.begin(0)).is_err() {
+                return TestResult::Fail("EU richer rates native start");
+            }
+            for now in 1..20 {
+                if narf_scheduler::block_on(s.step(now, SN)).is_err() {
+                    return TestResult::Fail("EU richer rate response/RSNA");
+                }
+                if s.controlled_port_open() {
+                    break;
+                }
+            }
+            let mut eth = AP.to_vec();
+            eth.extend_from_slice(&link.own);
+            eth.extend_from_slice(&[8, 0, 0x45, 0, 0, 20]);
+            if s.send_ethernet(&eth, 20).is_err() {
+                return TestResult::Fail("EU richer-rate native USB publication");
+            }
+            let packet = link.state.lock().sent.last().unwrap().clone();
+            if packet[20] & 63 != expected
+                || packet[..32]
+                    .chunks_exact(2)
+                    .fold(0u16, |a, b| a ^ u16::from_le_bytes([b[0], b[1]]))
+                    != 0
+            {
+                return TestResult::Fail("EU actual response intersection/TX rate/checksum");
+            }
+            if s.poll_network(21, SN).is_err() {
+                return TestResult::Fail("EU richer-rate terminal delivery");
+            }
+            let count = link.state.lock().sent.len();
+            cap.revoke();
+            if s.send_ethernet(&eth, 22).is_ok()
+                || s.controlled_port_open()
+                || link.state.lock().sent.len() != count
+                || link.state.lock().rx.is_none()
+            {
+                return TestResult::Fail(
+                    "EU richer-rate source loss published or released posted RX",
+                );
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/rates",
+    smoke_rtl8188eu_negotiated_legacy_rate_native_usb_and_current_power
+);
 fn smoke_rtl8188eu_wmm_real_ep0_bulk_edca_qos_and_current_authority() -> TestResult {
     for protected in [false, true] {
         let (control, link, mut s, cap, _) = wmm_prepared(protected);

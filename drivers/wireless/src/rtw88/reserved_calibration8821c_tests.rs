@@ -35,6 +35,15 @@ fn fixture(rfe: u8, swing: u8) -> Result<Fixture, &'static str> {
     narf_scheduler::block_on(lifecycle.prepare_mac())
         .map_err(|_| "C21 calibration fixture inactive MAC failed")?;
     let mut raw = [255; 512];
+    // Independent synthetic factory bases for the post-IQK power stage.
+    for path in 0..4 {
+        let at = 0x10 + path * 42;
+        raw[at..at + 11].fill(30);
+        raw[at + 11] = 0;
+    }
+    if matches!(rfe, 2 | 4) {
+        raw[0x10..0x1b].fill(4);
+    }
     raw[0xd0..0xd6].copy_from_slice(&[2, 4, 6, 8, 10, 12]);
     raw[0xb9] = 0x33;
     raw[0xba] = 25;
@@ -62,6 +71,8 @@ fn fixture(rfe: u8, swing: u8) -> Result<Fixture, &'static str> {
         request,
     })
 }
+#[path = "reserved_operating8821c_tests.rs"]
+mod operating_tests;
 fn envelope(request: &Request) -> Vec<u8> {
     let mut bytes = vec![0; 128];
     bytes[..4].copy_from_slice(b"N21Q");

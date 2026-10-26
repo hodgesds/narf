@@ -125,6 +125,12 @@ pub fn receive(bytes: &[u8]) -> Result<Vec<Record>, Error> {
 /// admission policy must require a 2.4GHz/20MHz AP supporting the 1Mbps rate.
 /// USB completion only acknowledges host delivery, not an on-air radio ACK.
 pub fn transmit(frame: &[u8], kind: Kind) -> Result<Vec<u8>, Error> {
+    transmit_rate(frame, kind, 0)
+}
+pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8>, Error> {
+    if rate > 11 || kind == Kind::Management && rate != 0 {
+        return Err(Error::Header);
+    }
     if frame.len() < 24 || frame.len() > MAX_TRANSFER - TX_DESC {
         return Err(Error::Length);
     }
@@ -171,7 +177,7 @@ pub fn transmit(frame: &[u8], kind: Kind) -> Result<Vec<u8>, Error> {
         &(if management {
             6u32 << 18 | 1 << 17
         } else {
-            0x0001ff00
+            0x0001ff00 | u32::from(rate)
         })
         .to_le_bytes(),
     );

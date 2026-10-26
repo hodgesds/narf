@@ -15,6 +15,8 @@ pub enum Stage {
     PhyTablesPrepared,
     PreparingCalibration8821c,
     Calibration8821cPrepared,
+    PreparingOperating8821c,
+    Operating8821cPrepared,
     Calibrating,
     Calibrated,
     StationPreparation,
@@ -55,6 +57,7 @@ impl<I: Io> Drop for Attempt<'_, I> {
                 | Stage::MacPrepared
                 | Stage::PhyTablesPrepared
                 | Stage::Calibration8821cPrepared
+                | Stage::Operating8821cPrepared
                 | Stage::Calibrated
                 | Stage::StationReady
                 | Stage::Failed
@@ -263,6 +266,68 @@ impl<I: Io> Lifecycle<I> {
         let mut status = self.status.lock();
         match result {
             Ok(_) => status.stage = Stage::PhyTablesPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn operating_request8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::operating8821c::Request, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(Error::State)?
+            .operating_request8821c(factory)
+    }
+    pub(super) async fn operating_info8821c(&self) -> Option<super::operating8821c::Info> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .and_then(Owner::operating_info8821c)
+    }
+    pub(super) async fn prepare_operating8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::operating8821c::Info, Error> {
+        self.prepare_operating8821c_with(factory, super::operating8821c::Source::Registered, || {
+            narf_wireless::reg::db::get_domain().ok_or(Error::Calibration8821c(
+                super::calibration8821c::Error::Policy,
+            ))
+        })
+        .await
+    }
+    pub(super) async fn prepare_operating8821c_with<F>(
+        &self,
+        factory: &super::efuse::Factory8821c,
+        source: super::operating8821c::Source,
+        policy: F,
+    ) -> Result<super::operating8821c::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::Calibration8821cPrepared {
+            return Err(Error::State);
+        }
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        let envelope = owner.preflight_operating8821c(factory, source, &policy()?)?;
+        self.status.lock().stage = Stage::PreparingOperating8821c;
+        let _attempt = Attempt(self);
+        let result = owner
+            .prepare_operating8821c(factory, envelope, policy)
+            .await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Operating8821cPrepared,
             Err(error) => {
                 *status = Status {
                     stage: Stage::Failed,

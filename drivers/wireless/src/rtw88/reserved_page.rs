@@ -57,6 +57,12 @@ pub(super) unsafe trait Registers: Send {
     fn finish_calibration8821c(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn begin_operating8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_operating8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
@@ -330,6 +336,12 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn finish_calibration8821c(&mut self) -> Result<(), Error> {
         self.io.finish_calibration8821c()
+    }
+    fn begin_operating8821c(&mut self) -> Result<(), Error> {
+        self.io.begin_operating8821c()
+    }
+    fn finish_operating8821c(&mut self) -> Result<(), Error> {
+        self.io.finish_operating8821c()
     }
     fn begin_commands(&mut self) -> Result<(), Error> {
         self.io.begin_commands()

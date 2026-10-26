@@ -386,6 +386,17 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
     ) -> Result<u64, crate::rtw89::packet_core::Error> {
         self.packet(|c, p| c.submit(p, bytes, report))
     }
+    fn packet_submit_rate(
+        &mut self,
+        bytes: &[u8],
+        report: bool,
+        rate: u8,
+    ) -> Result<u64, crate::rtw89::packet_core::Error> {
+        if rate != 0 && !self.wmm {
+            return Err(crate::rtw89::packet_core::Error::Access);
+        }
+        self.packet(|c, p| c.submit_rate(p, bytes, report, rate))
+    }
     fn packet_poll(
         &mut self,
     ) -> Result<crate::rtw89::packet_core::Step, crate::rtw89::packet_core::Error> {
@@ -436,6 +447,9 @@ impl Harness {
         Self::profile(protected, false)
     }
     fn profile(protected: bool, wmm: bool) -> Self {
+        Self::rates_profile(protected, wmm, None)
+    }
+    fn rates_profile(protected: bool, wmm: bool, rates: Option<&[u8]>) -> Self {
         assert!(ACTIVE_TEST.lock().is_none());
         let mut io = DriverModel::new();
         io.wmm = wmm;
@@ -447,7 +461,11 @@ impl Harness {
             clock: io.clock.clone(),
             entropy: AtomicBool::new(true),
         });
-        let peer = Arc::new(IrqSafeSpinLock::new(Peer::new(protected)));
+        let mut peer = Peer::new(protected);
+        if let Some(rates) = rates {
+            peer.ap = peer.ap.with_legacy_rates(rates).unwrap();
+        }
+        let peer = Arc::new(IrqSafeSpinLock::new(peer));
         if wmm {
             peer.lock().wmm = Some(WMM.to_vec());
         }
@@ -555,6 +573,86 @@ impl Harness {
         result
     }
 }
+fn smoke_rtw8852b_negotiated_legacy_rate_actual_txwd_ccmp_and_source_gate() -> TestResult {
+    const RATES: [u8; 12] = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    for protected in [false, true] {
+        let cases = RATES
+            .iter()
+            .enumerate()
+            .map(|(index, &code)| {
+                (
+                    if index == 0 {
+                        vec![code]
+                    } else {
+                        vec![0x82, code]
+                    },
+                    index as u16,
+                )
+            })
+            .chain(core::iter::once((RATES.to_vec(), 11)));
+        for (response, expected) in cases {
+            let h = Harness::rates_profile(protected, true, Some(&RATES));
+            {
+                let mut p = h.peer.lock();
+                let ap = core::mem::replace(&mut p.ap, Peer::new(protected).ap);
+                p.ap = ap.with_legacy_rates(&response).unwrap();
+            }
+            if h.join().is_err() {
+                return TestResult::Fail("B richer rate source-controller association");
+            }
+            let ethernet = udp_ipv4(
+                AP,
+                OWN,
+                h.plan.lease_ip,
+                h.plan.server_ip,
+                44002,
+                44003,
+                b"B12 legacy native TXWD",
+            );
+            if narf_net::iface::send_on(h.device.name(), &ethernet).is_err() {
+                return TestResult::Fail("B richer-rate publication");
+            }
+            h.pump();
+            if h.peer.lock().uplink.last() != Some(&ethernet)
+                || h.model(|io| io.packets.last.map(|s| s.legacy_rate)) != Some(expected)
+            {
+                return TestResult::Fail("B native TXWD rate or response-bound data/CCMP differs");
+            }
+            h.model(|io| io.packets.authority.revoke());
+            h.pump();
+            if !h.closed() {
+                return TestResult::Fail("B richer-rate owner survived PCI epoch loss");
+            }
+        }
+    }
+    // An unchanged legacy qualification continues to choose CCK1 even if the
+    // AP offers all rates; formatting/native DMA alone cannot opt it in.
+    let h = Harness::rates_profile(false, false, Some(&RATES));
+    if h.join().is_err() {
+        return TestResult::Fail("B legacy qualification rate regression");
+    }
+    let ethernet = udp_ipv4(
+        AP,
+        OWN,
+        h.plan.lease_ip,
+        h.plan.server_ip,
+        44002,
+        44003,
+        b"B legacy scope",
+    );
+    if narf_net::iface::send_on(h.device.name(), &ethernet).is_err() {
+        return TestResult::Fail("B legacy fixed rate send");
+    }
+    h.pump();
+    if h.model(|io| io.packets.last.map(|s| s.legacy_rate)) != Some(0) {
+        return TestResult::Fail("B legacy qualification promoted richer rates");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/rates",
+    smoke_rtw8852b_negotiated_legacy_rate_actual_txwd_ccmp_and_source_gate
+);
 impl Drop for Harness {
     fn drop(&mut self) {
         *ACTIVE_TEST.lock() = None;

@@ -21,6 +21,7 @@ enum State {
     PhyTablesPrepared,
     Calibrating8821c,
     Calibration8821cPrepared,
+    Operating8821cPrepared,
     Commands,
     Calibrated,
     Packets,
@@ -241,6 +242,7 @@ impl Native {
                 | State::PhyTablesPrepared
                 | State::Calibrating8821c
                 | State::Calibration8821cPrepared
+                | State::Operating8821cPrepared
                 | State::Commands
                 | State::Calibrated
                 | State::Packets
@@ -548,6 +550,31 @@ unsafe impl Registers for Native {
         }
         self.finish_mac()?;
         self.state = State::Calibration8821cPrepared;
+        Ok(())
+    }
+    fn begin_operating8821c(&mut self) -> Result<(), Error> {
+        if self.device.id.device != 0xc821
+            || self.state != State::Calibration8821cPrepared
+            || self.command_ring.pending()
+        {
+            return Err(Error::State);
+        }
+        self.state = State::Configuring;
+        if self.read8(0x100)? & 0xcf != 0
+            || self.read8(0x522)? != 255
+            || self.read8(0x303)? & 0xf7 != 0xf7
+        {
+            self.state = State::Terminal;
+            return Err(Error::Prerequisite);
+        }
+        Ok(())
+    }
+    fn finish_operating8821c(&mut self) -> Result<(), Error> {
+        if self.device.id.device != 0xc821 || self.state != State::Configuring {
+            return Err(Error::State);
+        }
+        self.finish_mac()?;
+        self.state = State::Operating8821cPrepared;
         Ok(())
     }
     fn begin_commands(&mut self) -> Result<(), Error> {

@@ -51,6 +51,12 @@ impl Sibling {
     pub(super) async fn calibration_info(&self) -> Option<super::radio8821c::Info> {
         self.lifecycle.calibration_info8821c().await
     }
+    pub(super) async fn operating_request(&self) -> Result<super::operating8821c::Request, Error> {
+        self.lifecycle.operating_request8821c(&self.factory).await
+    }
+    pub(super) async fn operating_info(&self) -> Option<super::operating8821c::Info> {
+        self.lifecycle.operating_info8821c().await
+    }
     pub(super) async fn provision(&self) -> Result<(), Error> {
         let _admission = self.admission.lock().await;
         loop {
@@ -75,7 +81,10 @@ impl Sibling {
                         .prepare_calibration8821c(&self.factory)
                         .await?;
                 }
-                Stage::Calibration8821cPrepared => return Ok(()),
+                Stage::Calibration8821cPrepared => {
+                    self.lifecycle.prepare_operating8821c(&self.factory).await?;
+                }
+                Stage::Operating8821cPrepared => return Ok(()),
                 _ => return Err(Error::State),
             }
         }

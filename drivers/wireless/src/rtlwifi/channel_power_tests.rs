@@ -50,6 +50,11 @@ fn artifact(factory: &Factory) -> Vec<u8> {
 pub(crate) fn calibration(factory: &Factory) -> Calibration {
     Calibration::from_verified(&artifact(factory), Some([0x44; 32]), factory).unwrap()
 }
+pub(crate) fn calibration_with_cap(factory: &Factory, cap: Cap<FirmwareBlob, Read>) -> Calibration {
+    let mut calibration = calibration(factory);
+    calibration.authority = Some(cap);
+    calibration
+}
 fn smoke_rtl8188ee_retained_signed_calibration_epoch_encloses_native_wmm_operation() -> TestResult {
     let mut calibration = calibration(&factory());
     let cap = Cap::<FirmwareBlob, Read>::bootstrap();

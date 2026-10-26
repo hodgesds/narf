@@ -560,7 +560,9 @@ pub(super) fn profile_fingerprint() -> [u8; 32] {
 }
 pub(super) fn wmm_fingerprint() -> [u8; 32] {
     let mut hash = narf_crypto::sha256::Sha256::new();
-    hash.update(b"B WMM v1 AP response-bound; BE/TID0 CCK1 raw26 halfwords13; noHT/BA/UAPSD/TSPEC; source H2C MAC9 class15 fourAC ACK; BE ECWmin>=5 max>=10 AIFSN>=3 TXOP0 SIFS10 long20/short9; noAP ACM BE; bounded AIFS8bit");
+    hash.update(b"B WMM v2 AP response-bound; BE/TID0 negotiated legacy DATA raw26 halfwords13; noHT/BA/UAPSD/TSPEC; source H2C MAC9 class15 fourAC ACK; BE ECWmin>=5 max>=10 AIFSN>=3 TXOP0 SIFS10 long20/short9; noAP ACM BE; bounded AIFS8bit");
+    hash.update(b"TXWD_INFO0 DATA_RATE[24:16] USE_RATE DISDATAFB; common response rate intersection; management/EAPOL CCK1");
+    hash.update(&[11, 10, 9, 8, 7, 6, 3, 5, 4, 2, 1, 0]);
     hash.update(&narf_wireless::wmm::INFORMATION);
     hash.finalize()
 }
