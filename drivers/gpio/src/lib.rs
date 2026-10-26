@@ -24,6 +24,7 @@ extern crate alloc;
 
 pub mod amd_fch;
 pub mod intel_pch;
+pub mod pl061;
 pub mod registry;
 
 use alloc::vec::Vec;
@@ -125,6 +126,10 @@ pub trait GpioController: Send + Sync + core::fmt::Debug {
 /// enough to let i2c-hid-bind resolve `GpioInt::resource_source`.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // DT match-table registration (DT programme step 5): a plain
+    // bus-registry call at composition time, NOT an initcall —
+    // the desktop `all` census gains no initcalls.
+    pl061::register_dt_drivers();
     narf_init::register(Stage::Device, "amd-fch-gpio", || {
         let n = amd_fch::probe_all();
         if n == 0 {
@@ -156,3 +161,8 @@ pub fn registered_controller_count() -> u32 {
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+
+/// aarch64-only smokes (DT-bound device smokes live here; the
+/// crate's `tests` module is arch-neutral synthetic-MMIO work).
+#[cfg(all(target_arch = "aarch64", any(test, feature = "kernel-test")))]
+mod tests_aarch64;

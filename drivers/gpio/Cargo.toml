@@ -21,6 +21,8 @@ narf-init         = { path = "../../init" }
 narf-console      = { path = "../../console" }
 narf-interrupts   = { path = "../../interrupts" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-bus          = { path = "../../bus" }
+narf-capabilities = { path = "../../capabilities" }
 
 [features]
 kernel-test = []

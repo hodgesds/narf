@@ -776,3 +776,118 @@ kernel_test_in!(
     "drivers-gpio",
     smoke_intel_pch_registers_into_shared_registry
 );
+
+// ── PL061 (DT programme step 5) ─────────────────────────────────
+
+use crate::pl061::Pl061;
+
+/// Allocate a 4 KiB zeroed register file for a synthetic PL061.
+fn make_pl061_mmio() -> (PhysAddr, &'static mut [u32; 1024]) {
+    let buf: Box<[u32; 1024]> = Box::new([0u32; 1024]);
+    let raw = Box::leak(buf);
+    (PhysAddr::new(raw.as_ptr() as u64), raw)
+}
+
+static PL061_FIRE_COUNT: AtomicU32 = AtomicU32::new(0);
+static PL061_LAST_PIN: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn pl061_counting_handler(pin: u16) {
+    PL061_FIRE_COUNT.fetch_add(1, Ordering::SeqCst);
+    PL061_LAST_PIN.store(pin as u32, Ordering::SeqCst);
+}
+
+fn smoke_pl061_direction_and_masked_data() -> TestResult {
+    let (phys, regs) = make_pl061_mmio();
+    // SAFETY: leaked 4 KiB RAM window outlives the controller.
+    let ctrl = unsafe { Pl061::__new_for_test("pl061-test", phys, 0x1000) };
+    // Reset state: every pin is an input; set_pin refuses.
+    if ctrl.set_pin(3, true) != Err(GpioError::WrongDirection) {
+        return TestResult::Fail("PL061 set_pin on an input pin did not refuse");
+    }
+    if ctrl.set_direction(3, true).is_err() || ctrl.direction(3) != Ok(true) {
+        return TestResult::Fail("PL061 set_direction did not program GPIODIR");
+    }
+    if regs[0x400 / 4] & (1 << 3) == 0 {
+        return TestResult::Fail("GPIODIR bit 3 not set in the register file");
+    }
+    // Masked data write: only pin 3's cell (offset (1<<3)<<2)
+    // changes, and only its bit.
+    if ctrl.set_pin(3, true).is_err() {
+        return TestResult::Fail("PL061 set_pin on an output pin failed");
+    }
+    if regs[(0x20) / 4] != 1 << 3 {
+        return TestResult::Fail("PL061 masked DATA write landed wrong");
+    }
+    if ctrl.read_pin(3) != Ok(true) || ctrl.read_pin(2) != Ok(false) {
+        return TestResult::Fail("PL061 masked DATA read mismatch");
+    }
+    if ctrl.set_pin(3, false).is_err() || ctrl.read_pin(3) != Ok(false) {
+        return TestResult::Fail("PL061 masked DATA clear mismatch");
+    }
+    if ctrl.read_pin(8) != Err(GpioError::InvalidPin) {
+        return TestResult::Fail("PL061 accepted pin 8 (only 8 pins)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-gpio", smoke_pl061_direction_and_masked_data);
+
+fn smoke_pl061_irq_programming_and_dispatch() -> TestResult {
+    let (phys, regs) = make_pl061_mmio();
+    // SAFETY: leaked 4 KiB RAM window outlives the controller.
+    let ctrl = unsafe { Pl061::__new_for_test("pl061-irq-test", phys, 0x1000) };
+    PL061_FIRE_COUNT.store(0, Ordering::SeqCst);
+    // Rising-edge on pin 5: IS=0 (edge), IBE=0, IEV=1, IE=1.
+    let cfg = GpioIrqConfig {
+        level_triggered: false,
+        polarity: 0,
+    };
+    if ctrl
+        .register_irq(5, GpioPull::None, cfg, pl061_counting_handler)
+        .is_err()
+    {
+        return TestResult::Fail("PL061 register_irq (rising edge) failed");
+    }
+    let (is, ibe, iev, ie) = (
+        regs[0x404 / 4],
+        regs[0x408 / 4],
+        regs[0x40C / 4],
+        regs[0x410 / 4],
+    );
+    if is & (1 << 5) != 0 || ibe & (1 << 5) != 0 || iev & (1 << 5) == 0 || ie & (1 << 5) == 0 {
+        return TestResult::Fail("PL061 rising-edge programming mismatch (IS/IBE/IEV/IE)");
+    }
+    // A different handler on the same pin is refused.
+    fn other_handler(_pin: u16) {}
+    if ctrl.register_irq(5, GpioPull::None, cfg, other_handler) != Err(GpioError::AlreadyRegistered)
+    {
+        return TestResult::Fail("PL061 double-register with a new handler not refused");
+    }
+    // Level + ActiveBoth is the one inexpressible configuration.
+    let both_level = GpioIrqConfig {
+        level_triggered: true,
+        polarity: 2,
+    };
+    if ctrl.register_irq(6, GpioPull::None, both_level, pl061_counting_handler)
+        != Err(GpioError::BadHardware)
+    {
+        return TestResult::Fail("PL061 level+both-edges not refused");
+    }
+    // Dispatch: MIS poked as the hardware would raise it; the
+    // handler fires once with the right pin and IC records the
+    // clear.
+    regs[0x418 / 4] = 1 << 5;
+    if ctrl.dispatch_pending() != 1
+        || PL061_FIRE_COUNT.load(Ordering::SeqCst) != 1
+        || PL061_LAST_PIN.load(Ordering::SeqCst) != 5
+        || regs[0x41C / 4] != 1 << 5
+    {
+        return TestResult::Fail("PL061 dispatch did not fire/clear exactly pin 5");
+    }
+    // Unregister masks the pin again.
+    ctrl.unregister_irq(5);
+    if regs[0x410 / 4] & (1 << 5) != 0 {
+        return TestResult::Fail("PL061 unregister_irq did not mask the pin");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-gpio", smoke_pl061_irq_programming_and_dispatch);
