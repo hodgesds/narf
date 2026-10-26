@@ -134,6 +134,34 @@ impl Peer {
         &mut self,
         frame: &[u8],
     ) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+        if frame.first() == Some(&0x40) {
+            let length = usize::from(*frame.get(25).ok_or("probe extent")?);
+            let name = frame.get(26..26 + length).ok_or("probe SSID")?;
+            if frame[1] != 0
+                || frame[4..10] != [255; 6]
+                || frame[10..16] != self.plan.station
+                || frame[16..22] != [255; 6]
+                || frame[22] & 15 != 0
+                || frame[24] != 0
+                || length > 32
+                || frame.get(26 + length..)
+                    != Some(
+                        &[
+                            1, 4, 0x82, 0x84, 0x8b, 0x96, 50, 8, 12, 18, 24, 36, 48, 72, 96, 108,
+                            3, 1, 1,
+                        ][..],
+                    )
+            {
+                return Err("native probe identity/rates/channel");
+            }
+            if name.is_empty() || name == SSID {
+                let mut reply = self.ap.beacon();
+                reply[0] = 0x50;
+                reply[4..10].copy_from_slice(&self.plan.station);
+                return Ok((vec![reply], false));
+            }
+            return Ok((Vec::new(), false));
+        }
         if frame.len() < 24 || frame[4..10] != AP || frame[10..16] != self.plan.station {
             return Err("native AP peer identity");
         }
@@ -294,6 +322,175 @@ fn conversation() -> Result<(), &'static str> {
     }
     Ok(())
 }
+
+fn smoke_ar9285_active_probes_exact_native_dma_and_probe_cache_open_wpa2() -> TestResult {
+    for protected in [false, true] {
+        let mut f = fixture(protected).unwrap();
+        let names = vec![SSID.to_vec(), Vec::new()];
+        let result = complete(f.radio.active_scan_for(20, &names));
+        if !matches!(result, Ok(ref bss) if bss.len() == 1 && bss[0].bss.information_elements[0] == 0)
+            || f.radio.peer().is_some()
+            || f.radio.ready()
+        {
+            return TestResult::Fail("active probe cache granted a peer or lost bounded BSS");
+        }
+        let sent = f.model.transmitted.borrow();
+        if sent.len() != 2 {
+            return TestResult::Fail("active names were not two exact native probes");
+        }
+        let mut expected = vec![0x40, 0, 0, 0];
+        expected.extend_from_slice(&[255; 6]);
+        expected.extend_from_slice(&OWN);
+        expected.extend_from_slice(&[255; 6]);
+        expected.extend_from_slice(&[0x10, 0, 0, SSID.len() as u8]);
+        expected.extend_from_slice(SSID);
+        expected.extend_from_slice(&[
+            1, 4, 0x82, 0x84, 0x8b, 0x96, 50, 8, 12, 18, 24, 36, 48, 72, 96, 108, 3, 1, 1,
+        ]);
+        if sent[0] != expected || sent[1][22..26] != [0x20, 0, 0, 0] {
+            return TestResult::Fail(
+                "active probe DMA changed identity, sequence, name or rate IEs",
+            );
+        }
+        drop(sent);
+        if complete(
+            f.radio
+                .associate(AP, SSID, protected.then(|| Zeroizing::new(PMK)), &[]),
+        )
+        .is_err()
+            || !f.radio.ready()
+            || f.peer.lock().ap.phase() != ApPhase::Authorized
+        {
+            return TestResult::Fail("active cache did not enter native Open/WPA2 association");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/active-scan",
+    smoke_ar9285_active_probes_exact_native_dma_and_probe_cache_open_wpa2
+);
+
+fn smoke_ar9285_active_probe_ssid_bounds_preflight_preserves_owner() -> TestResult {
+    let mut f = fixture(false).unwrap();
+    let before = f.model.count.get();
+    for names in [vec![vec![0; 33]], vec![Vec::new(); 5]] {
+        if !matches!(
+            complete(f.radio.active_scan_for(20, &names)),
+            Err(Error::Profile)
+        ) {
+            return TestResult::Fail("active SSID bound was not checked before publication");
+        }
+    }
+    if f.model.count.get() != before
+        || f.radio.phase() != Phase::Passive
+        || f.radio.candidates().len() != 1
+    {
+        return TestResult::Fail("denied active preflight changed native owner or cache");
+    }
+    let names = vec![vec![0x80; 32], SSID.to_vec(), Vec::new(), vec![0; 32]];
+    if !matches!(complete(f.radio.active_scan_for(20, &names)), Ok(ref bss) if bss.len() == 1)
+        || f.model.transmitted.borrow().len() != 4
+    {
+        return TestResult::Fail(
+            "four directed/wildcard binary probes failed native SSID encoding",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/active-scan",
+    smoke_ar9285_active_probe_ssid_bounds_preflight_preserves_owner
+);
+
+fn smoke_ar9285_active_probe_cancel_and_late_receipt_never_reopen() -> TestResult {
+    let mut f = fixture(false).unwrap();
+    let peer = f.peer.clone();
+    *f.model.reaction.borrow_mut() = Some(Arc::new(move |frame| {
+        let (replies, _) = peer
+            .lock()
+            .react(frame)
+            .map_err(|_| packet::Error::Packet)?;
+        Ok((replies, true))
+    }));
+    let names = vec![SSID.to_vec()];
+    {
+        let mut scan = core::pin::pin!(f.radio.active_scan_for(20, &names));
+        let mut cx = Context::from_waker(Waker::noop());
+        if !scan.as_mut().poll(&mut cx).is_pending() {
+            return TestResult::Fail(
+                "active native cancellation never retained a pending descriptor",
+            );
+        }
+    }
+    let regions = f.model.regions.borrow().len();
+    if f.model.tx.get().is_none()
+        || f.radio.phase() != Phase::Failed
+        || !f.radio.candidates().is_empty()
+    {
+        return TestResult::Fail("cancelled active probe exposed BSS or lost pending native owner");
+    }
+    f.model.complete(true).unwrap();
+    if f.radio.poll().is_ok()
+        || f.radio.peer().is_some()
+        || f.model.regions.borrow().len() != regions
+        || complete(f.radio.scan_for(1)).is_ok()
+    {
+        return TestResult::Fail("late broadcast completion reopened cancelled scan or freed DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/active-scan",
+    smoke_ar9285_active_probe_cancel_and_late_receipt_never_reopen
+);
+
+fn smoke_ar9285_active_probe_live_policy_loss_and_failed_receipt_are_terminal() -> TestResult {
+    for policy_loss in [false, true] {
+        let mut f = fixture(false).unwrap();
+        let peer = f.peer.clone();
+        *f.model.reaction.borrow_mut() = Some(Arc::new(move |frame| {
+            let (replies, _) = peer
+                .lock()
+                .react(frame)
+                .map_err(|_| packet::Error::Packet)?;
+            Ok((replies, true))
+        }));
+        let names = vec![SSID.to_vec()];
+        let result = {
+            let mut scan = core::pin::pin!(f.radio.active_scan_for(20, &names));
+            let mut cx = Context::from_waker(Waker::noop());
+            if !scan.as_mut().poll(&mut cx).is_pending() {
+                return TestResult::Fail("probe failure fixture never suspended");
+            }
+            if policy_loss {
+                f.model.allowed.set(false);
+            } else {
+                let descriptor = f.model.tx.get().unwrap();
+                f.model.complete(false).unwrap();
+                // A broadcast has no ACK: FrameOK=0 alone is legitimate.
+                // Inject native FIFO underrun to supply an actual failed TX.
+                f.model.put(descriptor + 60, 1 << 16).unwrap();
+            }
+            complete(scan.as_mut())
+        };
+        f.model.allowed.set(true);
+        if result.is_ok()
+            || f.radio.phase() != Phase::Failed
+            || !f.radio.candidates().is_empty()
+            || complete(f.radio.scan_for(1)).is_ok()
+        {
+            return TestResult::Fail(
+                "active policy/TX failure was ignored or later reopened owner",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/active-scan",
+    smoke_ar9285_active_probe_live_policy_loss_and_failed_receipt_are_terminal
+);
 fn held_m4() -> Result<(), &'static str> {
     let mut f = fixture(true)?;
     f.peer.lock().hold_m4 = true;

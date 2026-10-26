@@ -379,13 +379,251 @@ kernel_test_in!(
     smoke_ath10k_recovery_cancelled_missing_publication_cannot_publish_late
 );
 
+fn smoke_ath10k_power_save_native_six_dialects_open_wpa2_dhcp_ip() -> TestResult {
+    for (version, dialect) in [
+        (1, Dialect::Main),
+        (2, Dialect::TenOne),
+        (3, Dialect::TenTwo),
+        (4, Dialect::Tlv),
+        (5, Dialect::TenTwoFour),
+        (6, Dialect::TenFour),
+    ] {
+        for secured in [false, true] {
+            if let Err(error) = composition_options(version, dialect, secured, false, true) {
+                return TestResult::Fail(error);
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_native_six_dialects_open_wpa2_dhcp_ip
+);
+
+fn smoke_ath10k_power_save_each_cancelled_publication_closes_and_retains_dma() -> TestResult {
+    for step in 0..6 {
+        let h = Harness::new(4, Dialect::Tlv, true);
+        if let Err(error) = h.join() {
+            return TestResult::Fail(error);
+        }
+        let hold = Arc::new(core::sync::atomic::AtomicBool::new(true));
+        h.model(|model| {
+            let mut ps = super::super::power_save_tests::Fixture::new(Dialect::Tlv, true);
+            ps.hold = Some((step, hold.clone()));
+            model.ps = Some(ps);
+        });
+        h.device.request_power_save(true).unwrap();
+        if !drive(h.device.apply_power_save()).is_pending()
+            || !h.closed()
+            || h.device.request_power_save(false) != Err(-19)
+            || !h.model(|model| {
+                model.inner.storage.as_ref().unwrap().filled == 1023
+                    && model.inner.inner.retained.is_some()
+            })
+        {
+            return TestResult::Fail(
+                "cancelled PS control reopened host or released uncertain DMA",
+            );
+        }
+        let before = h.model(|model| model.sent.len());
+        hold.store(false, core::sync::atomic::Ordering::Release);
+        h.pump();
+        if !h.closed() || h.model(|model| model.sent.len()) != before {
+            return TestResult::Fail("late PS send reopened cancelled owner");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_each_cancelled_publication_closes_and_retains_dma
+);
+
+fn smoke_ath10k_power_save_policy_clear_and_native_failure_are_terminal() -> TestResult {
+    for failure in [false, true] {
+        for step in 0..6 {
+            let h = Harness::new(4, Dialect::Tlv, false);
+            if let Err(error) = h.join() {
+                return TestResult::Fail(error);
+            }
+            h.model(|model| {
+                let mut ps = super::super::power_save_tests::Fixture::new(Dialect::Tlv, true);
+                if failure {
+                    ps.fail = Some(step);
+                } else {
+                    ps.change = Some((step, h.policy.clone()));
+                }
+                model.ps = Some(ps);
+            });
+            h.device.request_power_save(true).unwrap();
+            if !matches!(drive(h.device.apply_power_save()), Poll::Ready(Err(_))) || !h.closed() {
+                return TestResult::Fail("PS ignored policy loss or failed native publication");
+            }
+            *h.policy.lock() = Some(station_tests::policy());
+            if h.device.request_power_save(false) != Err(-19)
+                || !h.model(|model| {
+                    model.inner.inner.retained.is_some()
+                        && model.inner.storage.as_ref().unwrap().filled == 1023
+                })
+            {
+                return TestResult::Fail("restored policy reopened failed PS grant or freed DMA");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_policy_clear_and_native_failure_are_terminal
+);
+
+fn smoke_ath10k_power_save_latest_preference_survives_inflight_completion() -> TestResult {
+    let h = Harness::new(4, Dialect::Tlv, false);
+    if let Err(error) = h.join() {
+        return TestResult::Fail(error);
+    }
+    let hold = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    h.model(|model| {
+        let mut ps = super::super::power_save_tests::Fixture::new(Dialect::Tlv, true);
+        ps.queue(Dialect::Tlv, false);
+        ps.hold = Some((5, hold.clone()));
+        model.ps = Some(ps);
+    });
+    h.device.request_power_save(true).unwrap();
+    {
+        let mut applying = core::pin::pin!(h.device.apply_power_save());
+        if !drive(applying.as_mut()).is_pending() {
+            return TestResult::Fail("PS coalescing fixture did not wait");
+        }
+        h.device.request_power_save(false).unwrap();
+        hold.store(false, core::sync::atomic::Ordering::Release);
+        if !matches!(drive(applying.as_mut()), Poll::Ready(Ok(()))) {
+            return TestResult::Fail("PS enable did not finish native receipt");
+        }
+    }
+    if !matches!(drive(h.device.apply_power_save()), Poll::Ready(Ok(())))
+        || !h.model(|model| {
+            model
+                .ps
+                .as_ref()
+                .is_some_and(|ps| ps.mode == Some(false) && ps.expected.is_empty() && ps.seen == 7)
+        })
+        || !h.device.link_up()
+    {
+        return TestResult::Fail("old PS completion overwrote newer disable preference");
+    }
+    let before = h.model(|model| model.sent.len());
+    if !matches!(drive(h.device.apply_power_save()), Poll::Ready(Ok(())))
+        || h.model(|model| model.sent.len()) != before
+    {
+        return TestResult::Fail("coalesced PS preference replayed a command");
+    }
+    *h.policy.lock() = None;
+    if !matches!(drive(h.device.apply_power_save()), Poll::Ready(Err(_))) || !h.closed() {
+        return TestResult::Fail("coalesced PS no-op bypassed current policy closure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_latest_preference_survives_inflight_completion
+);
+
+fn smoke_ath10k_power_save_no_ps_firmware_rejects_before_publication() -> TestResult {
+    let mut radio = radio_boot_features(4, Dialect::Tlv, (1 << 10) | (1 << 17));
+    if !matches!(drive(radio.start(&[2412, 5180])), Poll::Ready(Ok(_)))
+        || radio.power_save_supported()
+    {
+        return TestResult::Fail("NO_PS firmware capability was misclassified");
+    }
+    let before = radio.htt.wmi.htc.transport.sent.len();
+    let owner = Arc::new(Mutex::new(radio));
+    let device = Device::for_test("narf-test-no-ps", OWN, owner.clone(), || {
+        Some(station_tests::policy())
+    });
+    if device.request_power_save(true) != Err(-95)
+        || device.request_power_save(false) != Err(-95)
+        || owner.try_lock().unwrap().htt.wmi.htc.transport.sent.len() != before
+    {
+        return TestResult::Fail(
+            "NO_PS setter changed native state or advertised unsupported control",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_no_ps_firmware_rejects_before_publication
+);
+
+fn smoke_ath10k_power_save_host_close_during_send_cannot_reopen() -> TestResult {
+    let h = Harness::new(4, Dialect::Tlv, false);
+    if let Err(error) = h.join() {
+        return TestResult::Fail(error);
+    }
+    let hold = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    h.model(|model| {
+        let mut ps = super::super::power_save_tests::Fixture::new(Dialect::Tlv, true);
+        ps.hold = Some((5, hold.clone()));
+        model.ps = Some(ps);
+    });
+    h.device.request_power_save(true).unwrap();
+    {
+        let mut applying = core::pin::pin!(h.device.apply_power_save());
+        if !drive(applying.as_mut()).is_pending() {
+            return TestResult::Fail("close/PS fixture never held native send");
+        }
+        h.device.close_before_lock_for_test();
+        hold.store(false, core::sync::atomic::Ordering::Release);
+        if !matches!(drive(applying.as_mut()), Poll::Ready(Err(_))) {
+            return TestResult::Fail("PS ignored concurrent host close");
+        }
+    }
+    if !h.closed()
+        || !h.model(|model| {
+            model.inner.storage.as_ref().unwrap().filled == 1023
+                && model.inner.inner.retained.is_some()
+        })
+    {
+        return TestResult::Fail("late PS completion reopened carrier or released firmware DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_host_close_during_send_cannot_reopen
+);
+
 fn composition_scan(
     version: u32,
     dialect: Dialect,
     secured: bool,
     active_scan: bool,
 ) -> Result<(), &'static str> {
+    composition_options(version, dialect, secured, active_scan, false)
+}
+fn composition_options(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    active_scan: bool,
+    power_save: bool,
+) -> Result<(), &'static str> {
     let h = Harness::new_scan(version, dialect, secured, active_scan);
+    if power_save {
+        h.model(|model| {
+            model.ps = Some(super::super::power_save_tests::Fixture::new(dialect, true))
+        });
+        h.device
+            .request_power_save(true)
+            .map_err(|_| "PS preference rejected")?;
+        if !matches!(drive(h.device.apply_power_save()), Poll::Ready(Ok(())))
+            || h.model(|model| model.ps.as_ref().unwrap().seen) != 0
+        {
+            return Err("PS preference emitted before association");
+        }
+    }
     let (uplink, downlink) = packets();
     if narf_net::dhcp::acquire(&h.name, 0).is_ok()
         || h.device.enqueue(&uplink, narf_net::TxMeta::plain()).is_ok()
@@ -393,6 +631,19 @@ fn composition_scan(
         return Err("DHCP/data escaped preauthorization carrier");
     }
     h.join()?;
+    if !power_save && !h.model(|model| model.ps_default_off) {
+        return Err("awake default was not submitted before carrier");
+    }
+    if power_save
+        && !h.model(|model| {
+            model
+                .ps
+                .as_ref()
+                .is_some_and(|ps| ps.seen == 6 && ps.expected.is_empty() && ps.mode == Some(true))
+        })
+    {
+        return Err("power-save initialization did not precede carrier");
+    }
     if active_scan {
         let sent = h.model(|m| m.sent.len());
         let request = ScanRequest {

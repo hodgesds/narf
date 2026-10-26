@@ -8,7 +8,7 @@ use super::{
     wmi_runtime::{self, Radio},
 };
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
@@ -52,6 +52,8 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     state: Mutex<State>,
     name: String,
     generation: u64,
+    ps_supported: bool,
+    ps_request: AtomicU8,
     mac: [u8; 6],
     policy: Policy,
     up: AtomicBool,
@@ -93,8 +95,13 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> HostClose for Device<T> {
     }
 }
 impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
-    pub(super) fn new(name: &str, mac: [u8; 6], radio: Arc<Mutex<Radio<T>>>) -> Self {
-        Self::with_policy(name, mac, radio, Policy::Installed)
+    pub(super) fn new(
+        name: &str,
+        mac: [u8; 6],
+        radio: Arc<Mutex<Radio<T>>>,
+        ps_supported: bool,
+    ) -> Self {
+        Self::with_policy(name, mac, radio, Policy::Installed, ps_supported)
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn for_test(
@@ -103,9 +110,24 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         radio: Arc<Mutex<Radio<T>>>,
         current: impl Fn() -> Option<narf_wireless::reg::RegulatoryDomain> + Send + Sync + 'static,
     ) -> Self {
-        Self::with_policy(name, mac, radio, Policy::Model(Arc::new(current)))
+        let ps_supported = radio
+            .try_lock()
+            .is_some_and(|radio| radio.power_save_supported());
+        Self::with_policy(
+            name,
+            mac,
+            radio,
+            Policy::Model(Arc::new(current)),
+            ps_supported,
+        )
     }
-    fn with_policy(name: &str, mac: [u8; 6], radio: Arc<Mutex<Radio<T>>>, policy: Policy) -> Self {
+    fn with_policy(
+        name: &str,
+        mac: [u8; 6],
+        radio: Arc<Mutex<Radio<T>>>,
+        policy: Policy,
+        ps_supported: bool,
+    ) -> Self {
         let (rx, consumer) = narf_ipc::channel();
         let (producer, tx) = narf_ipc::channel();
         Self {
@@ -116,6 +138,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 pending: None,
             }),
             name: name.into(),
+            ps_supported,
+            // Submit the advertised awake default before first carrier.
+            ps_request: AtomicU8::new(u8::from(ps_supported)),
             generation: NEXT_GENERATION
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     value.checked_add(1)
@@ -205,6 +230,63 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         // must never take this name between unregister and reservation.
         narf_net::iface::reserve_name(&self.name);
         narf_net::iface::unregister(&self.name);
+    }
+    pub(super) fn request_power_save(&self, enabled: bool) -> Result<(), i32> {
+        if !self.ps_supported {
+            return Err(-95);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(-19);
+        }
+        self.ps_request
+            .store(if enabled { 2 } else { 1 }, Ordering::Release);
+        Ok(())
+    }
+    pub(super) async fn apply_power_save(&self) -> Result<(), WirelessError> {
+        let request = self.ps_request.load(Ordering::Acquire);
+        if request == 0 {
+            return Ok(());
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        let Some(mut radio) = self.radio.try_lock() else {
+            return Ok(());
+        };
+        let enabled = request == 2;
+        if radio.station_link().is_none() {
+            return Ok(());
+        }
+        let mut attempt = Attempt {
+            device: self,
+            armed: true,
+        };
+        if let Err(cause) = self
+            .policy
+            .current()
+            .and_then(|domain| radio.check_data_policy(&domain))
+        {
+            radio.fail_station_data();
+            return Err(error(cause));
+        }
+        if radio.submitted_power_save() == Some(enabled) {
+            attempt.armed = false;
+            return Ok(());
+        }
+        let result = radio
+            .set_station_power_save(enabled, || {
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Error::Failed);
+                }
+                self.policy.current()
+            })
+            .await;
+        if let Err(cause) = result {
+            radio.fail_station_data();
+            return Err(error(cause));
+        }
+        attempt.armed = false;
+        Ok(())
     }
     fn progress(&self) -> Vec<Vec<u8>> {
         let Some(mut radio) = self.radio.try_lock() else {
@@ -494,6 +576,21 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             .map_err(error)?;
         let domain = self.policy.current().map_err(error)?;
         radio.check_data_policy(&domain).map_err(error)?;
+        let ps_request = self.ps_request.load(Ordering::Acquire);
+        if ps_request != 0 {
+            let result = radio
+                .set_station_power_save(ps_request == 2, || {
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(Error::Failed);
+                    }
+                    self.policy.current()
+                })
+                .await;
+            if let Err(cause) = result {
+                radio.fail_station_data();
+                return Err(error(cause));
+            }
+        }
         if self.closed.load(Ordering::Acquire) {
             radio.fail_station_data();
             return Err(WirelessError::HardwareError);
@@ -646,6 +743,7 @@ fn publish_with_mac(
     radio: Arc<Mutex<Radio<super::boot::PciBoot>>>,
     mac: [u8; 6],
     quarantine: &AtomicBool,
+    ps_supported: bool,
 ) -> Result<Arc<Native>, Error> {
     narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
     let authority = narf_net::trusted_net_authority()
@@ -657,7 +755,7 @@ fn publish_with_mac(
             return Err(Error::Failed);
         }
         let name = narf_net::iface::reserve_name("wlan%d");
-        let device = Arc::new(Device::new(name, mac, radio));
+        let device = Arc::new(Device::new(name, mac, radio, ps_supported));
         narf_net::registry()
             .register(&authority, Registered(device.clone()))
             .map_err(|_| Error::Unsupported)?;
@@ -674,6 +772,7 @@ fn publish_with_mac(
                     break;
                 }
                 worker.drain();
+                let _ = worker.apply_power_save().await;
                 narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
             }
         });
@@ -697,7 +796,7 @@ pub(super) fn publish(
 ) -> Result<Arc<Native>, Error> {
     let r = radio.try_lock().ok_or(Error::Failed)?;
     let mac = r.station_publishable()?;
-    let result = publish_with_mac(radio.clone(), mac, &quarantine);
+    let result = publish_with_mac(radio.clone(), mac, &quarantine, r.power_save_supported());
     drop(r);
     result
 }
@@ -720,7 +819,8 @@ pub(super) async fn wait_publish(
             Admission::Ready => {
                 let r = radio.lock().await;
                 let mac = r.station_publishable()?;
-                let result = publish_with_mac(radio.clone(), mac, &quarantine);
+                let result =
+                    publish_with_mac(radio.clone(), mac, &quarantine, r.power_save_supported());
                 drop(r);
                 return result;
             }
@@ -730,6 +830,12 @@ pub(super) async fn wait_publish(
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for Native {
+    fn power_save_default(&self) -> Option<bool> {
+        self.ps_supported.then_some(false)
+    }
+    fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
+        self.request_power_save(enabled)
+    }
     fn max_scan_ssids(&self) -> u8 {
         wmi_runtime::MAX_SCAN_SSIDS as u8
     }

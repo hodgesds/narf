@@ -40,6 +40,8 @@ struct RadioModel {
     ce: Option<crate::ath10k::boot::CeFixture>,
     data: Option<data_tests::Fixture>,
     active: Option<active_scan_tests::Fixture>,
+    ps: Option<power_save_tests::Fixture>,
+    ps_default_off: bool,
 }
 // SAFETY: This private firmware fixture owns its complete graph of CE-model
 // Rc/RefCell buffers; no reference-counted alias escapes the model. Moving the
@@ -277,6 +279,9 @@ impl Hif for RadioModel {
             return Err(BmiError::BadResponse);
         }
         self.sequence = self.sequence.wrapping_add(1);
+        if power_save_tests::handles(self.inner.inner.dialect, &bytes[8..]) {
+            return power_save_tests::send(self, bytes).await;
+        }
         if self.phase >= 2
             && self.active.as_ref().is_some_and(|active| {
                 active_scan_tests::handles(active, self.inner.inner.dialect, &bytes[8..])
@@ -471,6 +476,8 @@ fn radio_boot_options(
         ce: None,
         data: None,
         active: None,
+        ps: None,
+        ps_default_off: false,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));
@@ -738,3 +745,5 @@ mod data_tests;
 
 #[path = "active_scan_tests.rs"]
 mod active_scan_tests;
+#[path = "power_save_tests.rs"]
+mod power_save_tests;

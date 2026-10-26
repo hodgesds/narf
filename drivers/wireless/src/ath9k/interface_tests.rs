@@ -71,11 +71,14 @@ impl Harness {
         }
     }
     fn scan(&self) {
+        self.scan_mode(false);
+    }
+    fn scan_mode(&self, active: bool) {
         let result = tests::complete(self.device.scan(ScanRequest {
             ssids: vec![SSID.to_vec()],
             frequencies_mhz: vec![2412],
             channels: vec![1],
-            active: false,
+            active,
             random_mac: None,
             colocated_6ghz: false,
             duration_tu: Some(1),
@@ -88,7 +91,10 @@ impl Harness {
         assert_eq!(result[0].ssid, SSID);
     }
     fn join(&self) {
-        self.scan();
+        self.join_mode(false);
+    }
+    fn join_mode(&self, active: bool) {
+        self.scan_mode(active);
         tests::complete(self.device.associate(self.request())).unwrap();
         assert!(self.device.link_up());
         assert_eq!(self.device.connected_bssid(), Some(AP));
@@ -133,11 +139,38 @@ impl Drop for Harness {
     }
 }
 fn composition(protected: bool) -> TestResult {
+    composition_mode(protected, false)
+}
+fn composition_mode(protected: bool, active: bool) -> TestResult {
     let h = Harness::new(protected);
     if !h.closed() || narf_net::dhcp::acquire(h.device.name(), 100).is_ok() {
         return TestResult::Fail("AR9285 DHCP passed before real native association");
     }
-    h.join();
+    h.join_mode(active);
+    if active {
+        let sent = h.model.transmitted.borrow().len();
+        let request = ScanRequest {
+            ssids: vec![SSID.to_vec()],
+            frequencies_mhz: vec![2412],
+            channels: vec![1],
+            active: true,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: Some(20),
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
+        };
+        if !matches!(
+            tests::complete(h.device.scan(request)),
+            Err(WirelessError::Busy)
+        ) || h.model.transmitted.borrow().len() != sent
+            || !h.device.link_up()
+        {
+            return TestResult::Fail(
+                "associated AR9285 active scan changed carrier or native owner",
+            );
+        }
+    }
     let lease = match narf_net::dhcp::dhcp_acquire(h.device.name(), 0) {
         Ok(lease) => lease,
         Err(_) => return TestResult::Fail("AR9285 actual kernel DHCP failed"),
@@ -500,6 +533,19 @@ fn smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons() -> TestR
 kernel_test_in!(
     "drivers/wireless/ath9k/device",
     smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons
+);
+
+fn smoke_ar9285_active_probe_native_open_wpa2_dhcp_and_bidirectional_ip() -> TestResult {
+    for protected in [false, true] {
+        if let TestResult::Fail(error) = composition_mode(protected, true) {
+            return TestResult::Fail(error);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/active-scan",
+    smoke_ar9285_active_probe_native_open_wpa2_dhcp_and_bidirectional_ip
 );
 
 fn smoke_ar9285_drive_scheduled_retries_policy_and_stops_on_terminal_error() -> TestResult {

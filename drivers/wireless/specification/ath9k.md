@@ -74,12 +74,23 @@ AR9285-specific writes follow a checked silicon revision.
   PCI capability invocation. Unsupported per-domain IOMMU mappings are refused.
 - The retained `station::Radio` and its `interface::Device` implement the
   public wireless/netdev paths without replacing the packet owner. The initial
-  profile is passive channel1/2412MHz, 20MHz, legacy basic1Mbps, Open or
+  profile is channel1/2412MHz, 20MHz, legacy basic1Mbps, Open or
   WPA2-PSK/CCMP with host MLME/RSNA/crypto. Entropy failure rejects authentication.
   Original observed RSN/RSNX bodies reach shared security admission. Carrier,
   controlled-port state and exact native terminal TX receipts precede kernel
   DHCP and Ethernet/IP delivery. The exact transmitted M4 bytes must match
   the retained reply before key/port commit.
+- The facade advertises four active-scan SSIDs and no caller probe IEs.
+  Directed binary SSIDs and wildcard discovery use actual broadcast Probe
+  Requests through the same calibrated descriptor/DMA owner. Empty active
+  input becomes one wildcard; SSIDs are bounded to 32 bytes before I/O.
+  Driver-owned CCK/OFDM rate and channel1 elements precede publication. Each
+  probe waits for its exact native terminal TX completion within the total
+  bounded dwell; broadcast completion does not claim an over-air ACK.
+  Current signed policy, PCI authority and RF-silent input constrain every
+  publication. Discovery is limited to the unassociated initial channel;
+  scans while associated return Busy without changing carrier. Failure or
+  cancellation hides the partial cache, closes the owner and retains DMA.
 - Synchronous bounded packet progression services polled RX/TX with hardware
   IRQs masked. Every transmit rechecks current signed policy and factory
   RF-silent GPIO state; metadata and packet publication share terminal closure.
@@ -215,6 +226,10 @@ Device conversations run Open/WPA2 through the real kernel DHCP client and exact
 bidirectional IP, including held/modified/cancelled M4, entropy/peer deadlines,
 policy restriction and concurrent disconnect/publication. Fixture assets cannot
 authorize real hardware.
+Active-discovery cases consume actual DMA Probe Requests, supply matching native
+Probe Responses, and continue through Open/WPA2 DHCP/IP. Directed/wildcard and
+binary/maximal SSIDs, preflight rejection, held/failed completion, policy loss,
+cancellation and associated-scan rejection have native regression coverage.
 
 Adjacent `REFERENCE.md` files document fixed-vector coverage and update rules.
 Review fixture values independently against the documented contract. These

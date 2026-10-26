@@ -24,7 +24,8 @@ windows. Boot uses coherent DMA32 storage and keeps the target awake.
 Boot messages are serialized and polled asynchronously. The initial native
 packet service polls with CE interrupts masked; synchronous network drains
 and the periodic worker drive the same bounded state without waiting on
-another executor task. IRQ throughput and power management are separate profiles.
+another executor task. IRQ throughput and host-bus/system power transitions
+remain separate profiles.
 
 ## 3. Public interface
 
@@ -273,7 +274,7 @@ another executor task. IRQ throughput and power management are separate profiles
   images and invalid/unsigned regulatory policy fail immediately without waiting.
   `RadioSession` retains an `Arc<Mutex<Radio<PciBoot>>>` with the selected image
   and board profile; native PCI APIs and the Device share this single owner.
-  The Device exposes passive scan and Open/WPA2-PSK/CCMP on channels1–11,
+  The Device exposes passive/active scan and Open/WPA2-PSK/CCMP on channels1–11,
   legacy20 only. Unsupported scan options, PHY modes, external EAPOL and
   checksum/TSO/VLAN requests are rejected, including direct frame-ring clients.
   Native control and each bounded packet-progress pass sample the current
@@ -289,6 +290,22 @@ another executor task. IRQ throughput and power management are separate profiles
   Carrier starts closed and opens only after actual authorization. Disconnect,
   cancelled control operations, peer loss, malformed state and native progress
   failure close carrier permanently; another join requires a future reset owner.
+- RAW/non-PFC images without firmware `NO_PS` expose an awake station
+  power-save default and `WirelessNetIface::set_power_save`. The synchronous
+  setter records desired intent; the retained async worker submits native
+  station-PS controls only after association. Enabling programs RX wake,
+  TX wake, PSPOLL, disabled U-APSD and 100 ms inactivity before PS mode;
+  disabling submits mode off. MAIN, 10.1, 10.2, 10.2.4, 10.4 and TLV use
+  their own native command identities and TLV layouts. The initial awake
+  default or an explicit prejoin preference is submitted before carrier.
+  Completion records command
+  submission, without claiming a firmware sleep acknowledgement or RF/power
+  measurement. A newer requested preference survives an older in-flight
+  submission. Current channel/power and host closure are checked on every
+  native command-future poll, including a coalesced no-op request. Failure
+  or cancellation closes station admission and retains uncertain DMA;
+  reinstalling policy or late receipts cannot reopen it. This profile
+  enables neither U-APSD nor host-bus/system suspend or wake offload.
 - Physical packet HIF supplies bounded source-ready, begin-send and poll-now
   operations. Each source pipe retains its bounce occupancy/deadline before
   publication. An occupied source is rejected before any buffer copy; its CE
@@ -582,7 +599,7 @@ variants, concurrent terminal HTT completion and dropped/failed ownership.
 
 The retained validation profile is calibrated BMI boot with a signed board
 file, firmware advertising RAW_MODE_SUPPORT, non-PFC HTT, legacy20 station on
-host-permitted channels1–11, passive scan, Open or WPA2-PSK/CCMP, DHCP and
+host-permitted channels1–11, passive/active scan, Open or WPA2-PSK/CCMP, DHCP and
 bidirectional IP. Peer/vdev retirement is terminal; firmware and DMA allocations
 remain owned until full-device reset. Interrupts remain masked and the bounded
 polling path is the initial packet service. No country, real calibration data,
@@ -596,6 +613,11 @@ cover all six WMI dialects with Open/WPA2, exact lease/IP bytes, occupied CE4
 bounce preservation while RX proceeds, separate CE/HTT retirement, held-M4
 cancellation, connection-loss expiry and failed terminal disconnect. These are
 software evidence; they do not attest a physical board or firmware image.
+Native station-PS cases exercise all six dialects with Open/WPA2 DHCP/IP,
+literal command layouts, each publication's cancellation/policy/failure fence,
+concurrent closure and preference replacement. `NO_PS` images reject requests
+before I/O. These checks establish submitted control intent; physical DTIM,
+buffering, wake latency and energy behavior remain hardware acceptance work.
 
 Physical acceptance still must validate exact PCI/BMI identity, trusted firmware
 and board calibration, ROM/OTP/PLL/code-swap, native CE/HTC/WMI/HTT progress,
@@ -605,6 +627,7 @@ An image lacking RAW support, or requiring PFC, remains a diagnostic scan owner
 and must not be counted as a usable station under this profile.
 
 Broader bands/widths, HT/VHT/BA aggregation, PFC fetch/queue ownership, alternate
-calibration sources, interrupt throughput, active/richer scanning, recoverable
-reset/rejoin and firmware power management remain explicit later profiles. They
+calibration sources, interrupt throughput, associated/off-channel scanning,
+automatic/stable-interface recovery and host-bus/system power management remain
+explicit later profiles. They
 are not prerequisites for validating the bounded station profile above.

@@ -75,6 +75,7 @@ impl Environment for NativeEnvironment {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
+    Probe,
     Authentication,
     Association,
     Security,
@@ -229,6 +230,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
         Ok(now)
     }
     pub(super) fn candidates(&self) -> Vec<ObservedBss> {
+        if self.closed.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         let now = self.environment.now_ms();
         self.cache
             .iter()
@@ -522,6 +526,78 @@ impl<P: Port, E: Environment> Radio<P, E> {
             self.poll()?;
             if self.now()? >= until {
                 return Ok(self.candidates());
+            }
+            self.environment.pause().await;
+        }
+    }
+    /// Actual broadcast probes use the same calibrated/policy/RF-silent
+    /// packet owner and terminal descriptor receipts as every management TX.
+    pub(super) async fn active_scan_for(
+        &mut self,
+        dwell_ms: u64,
+        ssids: &[Vec<u8>],
+    ) -> Result<Vec<ObservedBss>, Error> {
+        if !(1..=1024).contains(&dwell_ms)
+            || ssids.len() > 4
+            || ssids.iter().any(|ssid| ssid.len() > 32)
+        {
+            return Err(Error::Profile);
+        }
+        if self.phase() != Phase::Passive || self.pending.is_some() {
+            return Err(Error::Busy);
+        }
+        let mut attempt = Attempt {
+            closed: self.closed.clone(),
+            publication: self.publication.clone(),
+            armed: true,
+        };
+        self.cache.clear();
+        let until = self.now()?.saturating_add(dwell_ms);
+        let wildcard = Vec::new();
+        let names = if ssids.is_empty() {
+            core::slice::from_ref(&wildcard)
+        } else {
+            ssids
+        };
+        for name in names {
+            if self.now()? >= until {
+                return Err(Error::Timeout);
+            }
+            let mut probe = vec![0x40, 0, 0, 0];
+            probe.extend_from_slice(&[255; 6]);
+            probe.extend_from_slice(&self.own);
+            probe.extend_from_slice(&[255; 6]);
+            probe.extend_from_slice(&[0, 0, 0, name.len() as u8]);
+            probe.extend_from_slice(name);
+            // Driver-owned legacy CCK/OFDM rates, no HT/VHT/WMM promotion.
+            probe.extend_from_slice(&[
+                1, 4, 0x82, 0x84, 0x8b, 0x96, 50, 8, 12, 18, 24, 36, 48, 72, 96, 108, 3, 1, 1,
+            ]);
+            {
+                let publication = self.publication.clone();
+                let _publication = publication.lock();
+                self.transmit(probe, Kind::Probe)?;
+            }
+            loop {
+                self.poll()?;
+                if self.now()? > until {
+                    return Err(Error::Timeout);
+                }
+                if self.pending.is_none() {
+                    break;
+                }
+                if self.now()? >= until {
+                    return Err(Error::Timeout);
+                }
+                self.environment.pause().await;
+            }
+        }
+        loop {
+            self.poll()?;
+            if self.now()? >= until {
+                let result = self.candidates();
+                attempt.armed = false;
+                return Ok(result);
             }
             self.environment.pause().await;
         }

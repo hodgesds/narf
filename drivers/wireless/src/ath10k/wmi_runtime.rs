@@ -17,6 +17,7 @@ pub use management::{
 mod active_scan;
 mod data;
 mod mlme;
+mod power_save;
 pub use data::Link as StationLink;
 pub use mlme::Associated as StationAssociated;
 pub use station::Disconnected as StationDisconnected;
@@ -91,6 +92,7 @@ pub(super) struct Radio<T> {
     sequence: u16,
     pending: VecDeque<htt::Event>,
     failed: bool,
+    power_save: Option<bool>,
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub fn information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
@@ -113,6 +115,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             sequence: 0,
             pending: VecDeque::new(),
             failed: false,
+            power_save: None,
         }
     }
     /// No country policy is inferred here: these are receive-only IEEE

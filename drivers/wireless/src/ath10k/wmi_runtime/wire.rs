@@ -18,6 +18,46 @@ pub(super) struct Wire {
     pub management_event: u32,
 }
 impl Wire {
+    fn ps_ids(self) -> (u32, u32) {
+        // Linux wmi.h MAIN/10X/10.2/10.4 and wmi-tlv.h command enums.
+        match self.dialect {
+            Dialect::Main | Dialect::Tlv => (0x9001, 0x9002),
+            Dialect::TenOne => (0x902f, 0x9030),
+            Dialect::TenTwo | Dialect::TenTwoFour => (0x9030, 0x9031),
+            Dialect::TenFour => (0x9039, 0x903a),
+        }
+    }
+    pub fn station_ps_mode(self, enabled: bool) -> Result<Vec<u8>, Error> {
+        let tlv = self.dialect == Dialect::Tlv;
+        let mut out = packet(self.ps_ids().0, if tlv { 12 } else { 8 })?;
+        let at = if tlv {
+            header(&mut out, 108, 8);
+            8
+        } else {
+            4
+        };
+        put(&mut out, at + 4, u32::from(enabled));
+        Ok(out)
+    }
+    pub fn station_ps_parameter(self, parameter: u32, value: u32) -> Result<Vec<u8>, Error> {
+        if !matches!(
+            (parameter, value),
+            (0, 0) | (1, 1) | (2, 0) | (4, 0) | (3, 1..=1000)
+        ) {
+            return Err(Error::Unsupported);
+        }
+        let tlv = self.dialect == Dialect::Tlv;
+        let mut out = packet(self.ps_ids().1, if tlv { 16 } else { 12 })?;
+        let at = if tlv {
+            header(&mut out, 109, 12);
+            8
+        } else {
+            4
+        };
+        put(&mut out, at + 4, parameter);
+        put(&mut out, at + 8, value);
+        Ok(out)
+    }
     pub fn new(dialect: Dialect) -> Self {
         let (scan, stop_scan, channels, create, scan_event, management_event) = match dialect {
             Dialect::Main | Dialect::Tlv => (0x3001, 0x3002, 0x3003, 0x5001, 0x3001, 0x7001),

@@ -276,6 +276,12 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Interface for Device<P,
 }
 #[async_trait::async_trait]
 impl<P: Port + Send + 'static, E: Environment + 'static> WirelessNetIface for Device<P, E> {
+    fn max_scan_ssids(&self) -> u8 {
+        4
+    }
+    fn max_scan_ie_len(&self) -> u16 {
+        0
+    }
     fn supports_handshake_offload(&self) -> bool {
         true
     }
@@ -319,12 +325,22 @@ impl<P: Port + Send + 'static, E: Environment + 'static> WirelessNetIface for De
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let dwell = scan_dwell(&request)?;
         let mut radio = self.radio.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        if !matches!(radio.phase(), Phase::Prepared | Phase::Passive) {
+            return Err(WirelessError::Busy);
+        }
         self.start(&mut radio).map_err(wireless)?;
         let mut attempt = Attempt {
             device: self,
             armed: true,
         };
-        let result = radio.scan_for(dwell).await;
+        let result = if request.active {
+            radio.active_scan_for(dwell, &request.ssids).await
+        } else {
+            radio.scan_for(dwell).await
+        };
         attempt.armed = false;
         if result.is_err() {
             self.close();
@@ -402,8 +418,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static> WirelessNetIface for De
     }
 }
 fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
-    if request.active
-        || request.random_mac.is_some()
+    if request.random_mac.is_some()
         || request.colocated_6ghz
         || !request.extra_ies.is_empty()
         || request
@@ -412,7 +427,7 @@ fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
             .any(|frequency| *frequency != 2412)
         || request.frequencies_mhz.is_empty()
             && request.channels.iter().any(|channel| *channel != 1)
-        || request.ssids.len() > 32
+        || request.ssids.len() > if request.active { 4 } else { 32 }
         || request.ssids.iter().any(|ssid| ssid.len() > 32)
     {
         return Err(WirelessError::NotSupported);
