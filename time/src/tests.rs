@@ -173,6 +173,71 @@ kernel_test_in!(
     smoke_cached_calibration_installs_wall_scales
 );
 
+fn smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters() -> TestResult {
+    use core::cell::Cell;
+    let sample = |start: u64, end: u64, cycles: u64| {
+        let hpet_reads = Cell::new(0);
+        let tsc_reads = Cell::new(0);
+        crate::hpet::measure_tsc(
+            100_000_000,
+            200,
+            || {
+                let n = hpet_reads.get();
+                hpet_reads.set(n + 1);
+                if n == 0 {
+                    start
+                } else {
+                    end
+                }
+            },
+            || {
+                let n = tsc_reads.get();
+                tsc_reads.set(n + 1);
+                if n == 0 {
+                    100
+                } else {
+                    100 + cycles
+                }
+            },
+        )
+    };
+    if sample(1000, 1200, 10_000) != Some(5_000_000_000)
+        || sample(u64::MAX - 100, 99, 10_000) != Some(5_000_000_000)
+        || sample(1000, 1200, 0).is_some()
+        || sample(1000, 1200, u64::MAX / 2).is_some()
+    {
+        return TestResult::Fail("HPET/TSC ratio, wrap, zero or overflow handling");
+    }
+    let tsc_reads = Cell::new(0);
+    let stalled = crate::hpet::measure_tsc(
+        100_000_000,
+        200,
+        || 123,
+        || {
+            let n = tsc_reads.get();
+            tsc_reads.set(n + 1);
+            if n == 0 {
+                0
+            } else {
+                6_500_000_001
+            }
+        },
+    );
+    if stalled.is_some() || tsc_reads.get() != 2 {
+        return TestResult::Fail("stalled HPET calibration ignored its TSC safety bound");
+    }
+    for (frequency, window) in [(0, 200), (100_000_000, 0)] {
+        if crate::hpet::measure_tsc(frequency, window, || 0, || 0).is_some() {
+            return TestResult::Fail("invalid HPET sample parameters accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "time/calibration",
+    smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters
+);
+
 // ── RTC backstops (CMOS / PL031 / Qualcomm PMIC) ──────────────────
 
 fn smoke_rtc_cmos_bcd_to_bin_and_back() -> TestResult {

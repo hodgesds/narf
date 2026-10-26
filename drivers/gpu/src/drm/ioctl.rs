@@ -11,7 +11,8 @@
 //! | `DRM_IOCTL_MODE_GETPLANE_RES` | `0xB5`           | list planes (stub)           |
 //! | `DRM_IOCTL_MODE_GETCONNECTOR` | `0xA7`           | connector + mode list        |
 //! | `DRM_IOCTL_MODE_ADDFB2`  | `0xB8`                  | register framebuffer         |
-//! | `DRM_IOCTL_MODE_RMFB`    | `0xA8`                  | remove framebuffer           |
+//! | `DRM_IOCTL_MODE_ADDFB`   | `0xAE`                  | legacy framebuffer creation  |
+//! | `DRM_IOCTL_MODE_RMFB`    | `0xAF`                  | remove framebuffer           |
 //!
 //! Wire-format structs match the ABI in `include/uapi/drm/drm.h` and
 //! `include/uapi/drm/drm_mode.h` (Linux).  All fields are little-endian
@@ -55,7 +56,8 @@ pub enum IoctlCmd {
     ModeSetGamma = 0xA5,
     ModeGetEncoder = 0xA6,
     ModeGetConnector = 0xA7,
-    ModeRmFb = 0xA8,
+    ModeAddFb = 0xAE,
+    ModeRmFb = 0xAF,
     ModePageFlip = 0xB0,
     ModeCreateDumb = 0xB2,
     ModeMapDumb = 0xB3,
@@ -107,7 +109,8 @@ impl IoctlCmd {
             0xA5 => IoctlCmd::ModeSetGamma,
             0xA6 => IoctlCmd::ModeGetEncoder,
             0xA7 => IoctlCmd::ModeGetConnector,
-            0xA8 => IoctlCmd::ModeRmFb,
+            0xAE => IoctlCmd::ModeAddFb,
+            0xAF => IoctlCmd::ModeRmFb,
             0xB9 => IoctlCmd::ModeObjGetProperties,
             0xAA => IoctlCmd::ModeGetProperty,
             0xAB => IoctlCmd::ModeConnectorSetProperty,
@@ -352,6 +355,7 @@ pub enum DrmIoctlResult {
     GetCap(DrmGetCap),
     GetResources(DrmModeCardRes),
     GetConnector(DrmModeGetConnector, alloc::vec::Vec<DrmModeModeInfo>),
+    /// Framebuffer id from either ADDFB or ADDFB2 (first u32 in both ABIs).
     AddFb2(u32),
     RmFb,
     GetPlaneRes {
@@ -399,6 +403,10 @@ pub fn dispatch(
         IoctlCmd::GetCap => handle_get_cap(arg),
         IoctlCmd::ModeGetResources => handle_getresources(card),
         IoctlCmd::ModeGetConnector => handle_getconnector(card, arg),
+        IoctlCmd::ModeAddFb => {
+            let cmd = legacy_fb_cmd(arg)?;
+            Ok(DrmIoctlResult::AddFb2(card.addfb2_cmd(&cmd)?))
+        }
         IoctlCmd::ModeAddFb2 => handle_addfb2(card, arg),
         IoctlCmd::ModeRmFb => handle_rmfb(card, arg),
         IoctlCmd::ModeGetPlaneRes => handle_getplane_res(card),
@@ -540,9 +548,12 @@ fn handle_getconnector(card: &Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoc
         .connector(connector_id)
         .map_err(|_| DrmIoctlError::UnknownConnector)?;
 
-    // A native driver's real sink timings replace the synthesized ones.
+    // Native timings are authoritative. Distinct timings may share a size
+    // and rounded refresh, so Connector::modes can be deduplicated while
+    // this exact list is longer. Synthesizing in that case advertises modes
+    // accepts_mode/display_offers must then reject at SETCRTC.
     let modes: alloc::vec::Vec<DrmModeModeInfo> = match card.native_output(connector_id) {
-        Some(n) if n.timings.len() == conn.modes.len() => n.timings.clone(),
+        Some(n) => n.timings.clone(),
         _ => conn.modes.iter().map(mode_to_wire).collect(),
     };
 
@@ -561,6 +572,41 @@ fn handle_getconnector(card: &Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoc
         ..Default::default()
     };
     Ok(DrmIoctlResult::GetConnector(info, modes))
+}
+
+/// Linux drm_mode_addfb converts the 28-byte drm_mode_fb_cmd into fb_cmd2
+/// before running the same framebuffer/BO checks. Depth is not a fourcc.
+pub(crate) fn legacy_fb_cmd(
+    arg: &[u8],
+) -> Result<crate::drm::fb_cmd::FbCmd, DrmIoctlError> {
+    if arg.len() < crate::drm_uapi::SZ_DRM_MODE_FB_CMD as usize {
+        return Err(DrmIoctlError::BadSize);
+    }
+    let w = |at| u32::from_le_bytes(arg[at..at + 4].try_into().unwrap());
+    // drm_mode_legacy_fb_format in drivers/gpu/drm/drm_fourcc.c. Formats
+    // unsupported by this card are still refused by addfb2_cmd/addfb2_bo.
+    let fourcc = match (w(16), w(20)) {
+        (1, 1) => *b"C1  ",
+        (2, 2) => *b"C2  ",
+        (4, 4) => *b"C4  ",
+        (8, 8) => *b"C8  ",
+        (16, 15) => *b"XR15",
+        (16, 16) => *b"RG16",
+        (24, 24) => *b"RG24",
+        (32, 24) => *b"XR24",
+        (32, 30) => *b"XR30",
+        (32, 32) => *b"AR24",
+        _ => return Err(CardError::UnknownFormat.into()),
+    };
+    let mut cmd = crate::drm::fb_cmd::FbCmd {
+        width: w(4),
+        height: w(8),
+        pixel_format: u32::from_le_bytes(fourcc),
+        ..Default::default()
+    };
+    cmd.pitches[0] = w(12);
+    cmd.handles[0] = w(24);
+    Ok(cmd)
 }
 
 fn handle_addfb2(card: &mut Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {

@@ -288,8 +288,9 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         // are blocked but plain (non-master, authenticated) clients
         // can still enumerate.
         0xA0 | 0xA7 | 0xB5 => Some(IoctlFlags::auth_only()),
-        // SETCRTC / ADDFB2 / RMFB — DRM_MASTER (display authority).
-        0xA2 | 0xB8 | 0xA8 => Some(IoctlFlags::master_only()),
+        // SETCRTC / ADDFB / ADDFB2 / RMFB — retain NARF's existing
+        // DRM_MASTER display-authority policy for framebuffer operations.
+        0xA2 | 0xAE | 0xAF | 0xB8 => Some(IoctlFlags::master_only()),
         // PAGE_FLIP and SETPLANE — DRM_MASTER.
         0xB0 | 0xB7 => Some(IoctlFlags::master_only()),
         // ATOMIC commit — DRM_MASTER.

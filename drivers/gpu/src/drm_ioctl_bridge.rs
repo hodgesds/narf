@@ -7614,9 +7614,9 @@ fn handle_generic(
             // SAFETY: `arg` is the validated user drm_get_cap pointer (16 bytes).
             unsafe { copy_out(arg, &out)? };
         }
-        // fb_id is the first __u32 of struct drm_mode_fb_cmd2.
+        // fb_id is the first __u32 of both drm_mode_fb_cmd and fb_cmd2.
         crate::drm::ioctl::DrmIoctlResult::AddFb2(fb_id) if arg != 0 => {
-            // SAFETY: `arg` is the validated user drm_mode_fb_cmd2 pointer.
+            // SAFETY: `arg` is the validated user framebuffer request pointer.
             unsafe { copy_out(arg, &fb_id.to_le_bytes())? };
         }
         _ => {}
@@ -7786,7 +7786,7 @@ pub fn amdgpu_dumb_metadata(card_index: u32, cmd: u32, arg: usize) -> Option<Res
     }
 }
 
-/// `DRM_IOCTL_MODE_ADDFB2` on the native amdgpu card naming an amdgpu GEM
+/// `DRM_IOCTL_MODE_ADDFB` / `ADDFB2` on the native amdgpu card naming an amdgpu GEM
 /// handle of the calling open (`gem`, owner `open_id`):
 /// amdgpu_display_user_framebuffer_create's drm_gem_object_lookup in the
 /// file's own handle table, then `Card::addfb2_bo`. `None` for another
@@ -7800,19 +7800,38 @@ pub fn amdgpu_addfb2_bo(
     arg: usize,
     gem: &crate::amdgpu_gem::GemState,
 ) -> Option<Result<u64, FsError>> {
-    if cmd != drm_uapi::DRM_IOCTL_MODE_ADDFB2 || arg == 0 {
+    let legacy = cmd == drm_uapi::DRM_IOCTL_MODE_ADDFB;
+    if (!legacy && cmd != drm_uapi::DRM_IOCTL_MODE_ADDFB2) || arg == 0 {
         return None;
     }
     let mode_state = crate::drm_registry::mode_state(card_index)?;
     if !mode_state.lock().gfx12_modifiers {
         return None;
     }
-    // SAFETY: `arg` is the ioctl pointer; drm_mode_fb_cmd2 is 104 bytes.
-    let b = match unsafe { copy_in(arg, 104) } {
+    let size = if legacy {
+        drm_uapi::SZ_DRM_MODE_FB_CMD
+    } else {
+        drm_uapi::SZ_DRM_MODE_FB_CMD2
+    };
+    // SAFETY: `arg` is the ioctl pointer; the selected Linux request size is
+    // 28 (fb_cmd) or 104 (fb_cmd2), checked by copy_in.
+    let b = match unsafe { copy_in(arg, size as usize) } {
         Ok(b) => b,
         Err(e) => return Some(Err(e)),
     };
-    let fb = crate::drm::fb_cmd::FbCmd::parse(&b)?;
+    let fb = if legacy {
+        // This helper is reached only from the primary node. Match the
+        // generic legacy handler's display-authority gate before allocating.
+        if !mode_state.lock().is_master(open_id) {
+            return Some(Err(FsError::PermissionDenied));
+        }
+        match crate::drm::ioctl::legacy_fb_cmd(&b) {
+            Ok(fb) => fb,
+            Err(e) => return Some(Err(map_err(e))),
+        }
+    } else {
+        crate::drm::fb_cmd::FbCmd::parse(&b)?
+    };
     if !gem.owns(fb.handles[0]) {
         return None;
     }

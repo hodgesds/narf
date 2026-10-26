@@ -6480,7 +6480,12 @@ fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
         Err(_) => return TestResult::Fail("fb lookup by id failed"),
     }
     let rmfb_arg = fb_id.to_le_bytes();
-    match dispatch(&mut card, 0xA8, &rmfb_arg, &ctx) {
+    match dispatch(
+        &mut card,
+        crate::drm_uapi::DRM_IOCTL_MODE_RMFB,
+        &rmfb_arg,
+        &ctx,
+    ) {
         Ok(DrmIoctlResult::RmFb) => {}
         Ok(_) => return TestResult::Fail("RMFB wrong type"),
         Err(_) => return TestResult::Fail("RMFB failed"),

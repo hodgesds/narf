@@ -928,32 +928,74 @@ pub fn __reset_for_test() {
 /// enough to keep boot snappy.
 #[cfg(target_arch = "x86_64")]
 pub fn calibrate_tsc_via_hpet(calibration_window_hpet_ticks: u64) -> Option<u64> {
-    let hpet_hz = frequency_hz();
-    if hpet_hz == 0 || calibration_window_hpet_ticks == 0 {
-        return None;
-    }
     let g = HPET.lock();
     let dev = g.as_ref()?;
-    // SAFETY: HPET singleton is alive for the lock scope; the
-    // window read is volatile + naturally aligned.
-    // SAFETY: Valid memory or trusted environment
-    let hpet_t0 = unsafe { dev.read_counter() };
-    let tsc_t0 = narf_arch::x86_64::tsc::rdtsc();
-    let hpet_deadline = hpet_t0.wrapping_add(calibration_window_hpet_ticks);
-    // Tight loop on HPET — RDTSC + an MMIO read per iteration is
-    // fine for a one-shot boot-time calibration.
-    loop {
-        // SAFETY: same as above.
-        let now = unsafe { dev.read_counter() };
-        if now.wrapping_sub(hpet_t0) >= calibration_window_hpet_ticks || now == hpet_deadline {
+    measure_tsc(
+        dev.caps.frequency_hz(),
+        calibration_window_hpet_ticks,
+        // SAFETY: the singleton mapping remains alive under the guard.
+        || unsafe { dev.read_counter() },
+        narf_arch::x86_64::tsc::rdtsc,
+    )
+}
+
+/// Measure TSC Hz before the HPET singleton and IRQ timers are installed.
+/// Enables the main counter without changing comparators or publishing a
+/// singleton/base override. The later timer owner can initialize normally.
+/// Only a 64-bit counter is supported on this early path.
+///
+/// # Safety
+/// `base` is a permanent, uncached, mapped HPET register window of at least
+/// 1 KiB. Caller has exclusive boot-time access before timer installation.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn calibrate_tsc_at(base: u64) -> Option<u64> {
+    // SAFETY: caller supplies the exclusively owned live register window.
+    let dev = unsafe { Hpet::probe(base) }.ok()?;
+    if !dev.caps.counter_64bit {
+        return None;
+    }
+    // SAFETY: boot owns the main counter; no comparator configuration changes.
+    unsafe { dev.enable() };
+    let hz = dev.caps.frequency_hz();
+    measure_tsc(
+        hz,
+        (hz / 10).max(1),
+        // SAFETY: same retained mapping and exclusive boot access.
+        || unsafe { dev.read_counter() },
+        narf_arch::x86_64::tsc::rdtsc,
+    )
+}
+
+/// Shared sampler, including a read bound for an inert counter. These are
+/// early calibration reads, before an IRQ-based deadline can be established.
+pub(crate) fn measure_tsc(
+    hpet_hz: u64,
+    window: u64,
+    mut hpet: impl FnMut() -> u64,
+    mut tsc: impl FnMut() -> u64,
+) -> Option<u64> {
+    if hpet_hz == 0 || window == 0 {
+        return None;
+    }
+    let hpet_t0 = hpet();
+    let tsc_t0 = tsc();
+    let mut end = None;
+    for _ in 0..10_000_000 {
+        let now = hpet();
+        if now.wrapping_sub(hpet_t0) >= window {
+            end = Some(now);
             break;
+        }
+        // No calibrated wall clock exists here. At every frequency this
+        // subsystem admits (<= 6.5 GHz), this permits at least one second
+        // for the usual 100 ms sample, while an inert HPET still terminates.
+        if tsc().wrapping_sub(tsc_t0) > 6_500_000_000 {
+            return None;
         }
         core::hint::spin_loop();
     }
-    // SAFETY: same.
-    let hpet_t1 = unsafe { dev.read_counter() };
-    let tsc_t1 = narf_arch::x86_64::tsc::rdtsc();
-    drop(g);
+    let hpet_t1 = end?;
+    let tsc_t1 = tsc();
     let d_hpet = hpet_t1.wrapping_sub(hpet_t0);
     let d_tsc = tsc_t1.wrapping_sub(tsc_t0);
     if d_hpet == 0 {
@@ -965,7 +1007,7 @@ pub fn calibrate_tsc_via_hpet(calibration_window_hpet_ticks: u64) -> Option<u64>
     // to a `__udivti3` call in compiler-builtins that thin LTO failed
     // to relocate correctly — non-canonical RIP, #GP. Plain u64
     // arithmetic produces the same result inline.
-    let prod = d_tsc.saturating_mul(hpet_hz);
+    let prod = d_tsc.checked_mul(hpet_hz)?;
     let hz = prod / d_hpet;
     if hz == 0 {
         None

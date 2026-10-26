@@ -63,6 +63,38 @@ AMD-only configs do not. Neither vendor is offered as a loadable
 module: the module loader exists, but there is no GPU-class
 datapath ABI yet, so the feature gate is the selection mechanism.
 
+### Legacy framebuffers and native mode timing
+
+`DRM_IOCTL_MODE_ADDFB` uses Linux's 28-byte `drm_mode_fb_cmd` request
+(`0xc01c64ae`). It converts the legacy bpp/depth pair to a DRM fourcc and
+supplies one handle/pitch, zero offsets and no modifiers to the existing
+ADDFB2 validation/lifetime path. Unsupported formats, invalid dimensions,
+short pitches and short dumb buffers remain rejected. Native AMD per-open
+GEM framebuffers use the same conversion and retain their owner/BO checks.
+Only the first u32, `fb_id`, is copied back on success. Legacy creation
+retains NARF's existing DRM-master framebuffer policy and rejects render
+nodes. `RMFB` dispatches Linux request number `0xaf` (`0xc00464af`);
+`0xa8` is ATTACHMODE and must never remove a framebuffer.
+
+For a connector with `NativeOutput`, GETCONNECTOR reports the exact
+driver-admitted `timings` and their count, including distinct timings that
+share a resolution and rounded integer refresh rate. `Connector::modes` may
+deduplicate those simplified geometries; a differing list length must not
+replace native timings with synthesized ones. A native output with an empty
+timing list reports zero modes. Synthetic modes remain the fallback only
+for connectors without native sink data. The two-pass user-copy protocol
+uses the exact list count and writes modes only when the supplied capacity
+is sufficient. SETCRTC and atomic admission retain their exact timing checks.
+
+The discrete boot preflight establishes wall-time conversions before any
+firmware wait. When CPU frequency probes are unavailable and the HPET
+singleton is not installed, it measures the platform HPET counter through
+an uncached mapping without publishing a base override or programming IRQ
+comparators. Failure still rejects bring-up as `Clock`. Navi22's ROM-register
+fallback admits SMUIO 11.0.6 (captured RX 6750 XT) at discovered base index
+zero with ROM_INDEX/ROM_DATA dword offsets 0xe5/0xe6. SMUIO11's older
+callback and SMUIO14.0.2 retain 0xe4/0xe5; unrelated revisions remain rejected.
+
 ### RX 6000 device queries, scheduling and memory pressure
 
 `amdgpu_rdna2::metadata::vram(table, module)` bounds atomfirmware
@@ -78,8 +110,11 @@ Unavailable or ambiguous partner discovery leaves the fields zero.
 Navi21/22/23/24. `Published::memory_khz` reports boot MCLK while UCLK DPM is
 disabled, or GetMin/MaxDpmFreq(PPCLK_UCLK) when enabled. Publication refreshes
 after boot/recovery and power-policy changes, clearing unavailable values.
-The cold-boot owner retains the immutable boot clock independently of its
-reduced GPU layout snapshot, which intentionally omits the VBIOS.
+The cold-boot owner retains the immutable boot clock and a fallibly copied,
+validated board VBIOS. Both trained and untrained constructors preserve the
+image bytes and source in their reduced GPU snapshot so reset/post can run
+ASIC_Init. Recovery's fresh snapshot preserves it again after the original
+controller is released. Live driver state remains with the controller.
 
 Real device `READ_MMR_REG` ioctls on both primary and render nodes acquire a
 GFXOFF reference before awaiting the platform owner. The whole register range
@@ -9728,6 +9763,10 @@ and primary-plane binding; the boot resource is never exposed as a GEM object.
   carrying that card's vendor/device IDs and `DRIVER` identity. This mapping
   is required for libdrm/Mesa device discovery when multiple QEMU displays
   (virtio-gpu plus a Bochs fallback) are present.
+  The canonical minors are real children of that function's `drm/`
+  directory, so udev's parent walk reaches PCI for Xorg GPU selection.
+  Class/devnum symlinks name those canonical minors; the former
+  `/sys/devices/platform/narf-drm/*` paths remain compatibility aliases.
 - Once that sysfs projection is complete, the PCI parent, primary node, and
   render node emit ordered ADD uevents inside the bounded boot replay window.
   This is the interface by which udev applies the `master-of-seat` tag and

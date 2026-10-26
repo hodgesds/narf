@@ -77,6 +77,97 @@ fn admitted(_: &Port, _: &[u8]) -> Option<Vec<Timing>> {
     Some(vec![hd(), xga()])
 }
 
+/// Distinct DCN30 timings can round to the same Mode (size and integer Hz).
+/// GETCONNECTOR must still offer the exact timings accepted by SETCRTC,
+/// rather than replacing the whole list with synthesized timings.
+fn navi22_kms_duplicate_geometry_keeps_exact_connector_timings() -> TestResult {
+    use crate::drm::ioctl::{dispatch, DrmIoctlResult};
+    use crate::drm::render_node::DrmFileCtx;
+    let mut card = Card::new("amdgpu", "DCN30 timing fixture", (3, 60, 0));
+    let preferred = Timing {
+        pixel_clock_khz: 533_250,
+        h_active: 3840,
+        h_total: 4000,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 2160,
+        v_total: 2222,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    let alternate = Timing {
+        pixel_clock_khz: 594_000,
+        h_total: 4400,
+        h_front_porch: 176,
+        h_sync_width: 88,
+        v_total: 2250,
+        v_front_porch: 8,
+        v_sync_width: 10,
+        ..preferred
+    };
+    let offered = [preferred, alternate];
+    let edid = [1; 128];
+    let crtcs = [Some(crate::amdgpu_navi48_kms::Sink {
+        edid: &edid,
+        timing: &preferred,
+        offered: &offered,
+    })];
+    let connectors = [crate::amdgpu_navi48_kms::RoutedConnector {
+        index: 3,
+        kind: ConnectorType::HdmiA,
+        edid: Some(&edid),
+        offered: &offered,
+        crtc: Some(0),
+        possible_crtcs: 1,
+    }];
+    apply_card(&mut card, &crtcs, &connectors);
+    if card.connectors[0].modes.len() != 1 || card.native[0].timings.len() != 2 {
+        return TestResult::Fail("fixture does not reproduce rounded-mode deduplication");
+    }
+    let id = card.connectors[0].id;
+    let mut request = [0u8; 80];
+    request[48..52].copy_from_slice(&id.to_le_bytes());
+    let Ok(DrmIoctlResult::GetConnector(info, modes)) = dispatch(
+        &mut card,
+        0xc050_64a7,
+        &request,
+        &DrmFileCtx::primary_master(),
+    ) else {
+        return TestResult::Fail("GETCONNECTOR of the DCN30 fixture failed");
+    };
+    if info.count_modes != 2 || modes.len() != 2 {
+        return TestResult::Fail("GETCONNECTOR lost exact timings sharing rounded geometry");
+    }
+    for (wire, timing) in modes.iter().zip(offered) {
+        let expected = crate::amdgpu_navi48_kms::timing_wire(&timing);
+        if wire.clock != expected.clock
+            || wire.hdisplay != expected.hdisplay
+            || wire.hsync_start != expected.hsync_start
+            || wire.hsync_end != expected.hsync_end
+            || wire.htotal != expected.htotal
+            || wire.vdisplay != expected.vdisplay
+            || wire.vsync_start != expected.vsync_start
+            || wire.vsync_end != expected.vsync_end
+            || wire.vtotal != expected.vtotal
+            || wire.flags != expected.flags
+            || !card.accepts_mode(wire)
+        {
+            return TestResult::Fail("GETCONNECTOR offered a synthesized or rejected timing");
+        }
+    }
+    let synthesized = crate::drm::ioctl::mode_to_wire(&card.connectors[0].modes[0]);
+    if card.accepts_mode(&synthesized) {
+        return TestResult::Fail("fixture unexpectedly accepts the old synthesized timing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm/native_modes",
+    navi22_kms_duplicate_geometry_keeps_exact_connector_timings
+);
+
 fn navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers() -> TestResult {
     let mut card = Card::new("amdgpu", "DCN30 publication fixture", (3, 60, 0));
     let edid = [1; 128];

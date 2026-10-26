@@ -999,7 +999,9 @@ pub struct NativeOutput {
     pub connector: u32,
     /// The sink's base EDID block, reported verbatim; None when unplugged.
     pub edid: Option<[u8; 128]>,
-    /// Exact timings, parallel to the connector's `modes`.
+    /// Exact driver-admitted timings, authoritative for GETCONNECTOR.
+    /// Several may share a size and rounded refresh represented by only
+    /// one entry in the connector's simplified `modes` list.
     pub timings: Vec<crate::drm::ioctl::DrmModeModeInfo>,
     /// The connector's "Broadcast RGB" value (0 Automatic, 1 Full,
     /// 2 Limited 16:235), when it has the property.

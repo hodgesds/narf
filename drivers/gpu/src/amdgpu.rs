@@ -2094,7 +2094,31 @@ pub(crate) const fn mm_dword(rel_bytes: u32) -> u32 {
 pub(crate) fn boot_clock_ready() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        let (hz, source) = narf_time::calibrate_clocks_with_source();
+        let (mut hz, mut source) = narf_time::calibrate_clocks_with_source();
+        if hz == 0 && !narf_time::hpet::is_present() {
+            // KVM can mask CPUID frequency leaves and AMD P-state MSRs.
+            // This handoff precedes frame's HPET/IRQ timer setup. Borrow
+            // only the counter for calibration; do not publish a virtual
+            // base as the physical address frame must map later.
+            let phys = narf_time::hpet::base_phys_for_ioremap();
+            // SAFETY: exclusive boot-time clock setup; this is the same
+            // platform HPET window used by frame's later timer installation.
+            if let Ok(mapping) = unsafe {
+                narf_memory::ioremap::ioremap(phys, 0x1000, narf_memory::ioremap::MmioAttrs::Device)
+            } {
+                // SAFETY: permanent device mapping, before IRQ timer setup;
+                // no other CPU or HPET owner accesses the counter here.
+                if let Some(measured) = unsafe { narf_time::hpet::calibrate_tsc_at(mapping.virt) }
+                    .filter(|hz| (1_000_000_000..=6_500_000_000).contains(hz))
+                {
+                    narf_arch::x86_64::tsc::set_hz_via_hpet(measured);
+                    // Installs both wall-time conversion directions from
+                    // the measured cache, before any firmware delay.
+                    hz = narf_time::calibrate_clocks_with_source().0;
+                    source = narf_time::CalibrationSource::HpetXcheck;
+                }
+            }
+        }
         if hz == 0 {
             return false;
         }

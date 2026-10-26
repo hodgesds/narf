@@ -966,8 +966,8 @@ pub struct ColdBoot {
     // to overflow the 64 KiB aarch64 boot stack, even when recovery refused.
     sequence: Box<Sequence<Hardware>>,
 }
-/// Copy only the immutable layout consumed by firmware owners. VBIOS,
-/// userspace topology and live driver state remain with the controller.
+/// Copy the immutable layout and validated board BIOS consumed by firmware
+/// and reset owners. Userspace topology and live state stay with the controller.
 fn snapshot(gpu: &AmdGpu) -> Result<AmdGpu, Error> {
     let mut blocks = alloc::vec::Vec::new();
     blocks
@@ -982,7 +982,12 @@ fn snapshot(gpu: &AmdGpu) -> Result<AmdGpu, Error> {
         ip_blocks: blocks,
         // Immutable discovery maxima, needed to bound the topology sample.
         gc_info: gpu.gc_info,
-        vbios: None,
+        vbios: gpu
+            .vbios
+            .as_ref()
+            .map(|bios| bios.try_clone())
+            .transpose()
+            .map_err(|_| Error::Allocation)?,
         mode: None,
         fw_loaded: false,
     })
