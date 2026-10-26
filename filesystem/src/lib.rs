@@ -58,6 +58,8 @@
 
 #![no_std]
 #![feature(allocator_api)]
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)] // narf_lib::bitmap::Bitmap's fixed-capacity storage
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 

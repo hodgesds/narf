@@ -20,6 +20,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use narf_lib::bitmap::Bitmap;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_rcu::{Atomic as RcuAtomic, Owned as RcuOwned, ReadGuard};
 
@@ -177,7 +178,9 @@ static MUTATION_GENERATIONS: [AtomicU64; DENTRY_BUCKET_COUNT] =
 /// the change is fully visible. It holds no lock and may cross `.await`.
 #[must_use = "an RCU path mutation must stay guarded until publication completes"]
 pub struct PathMutationGuard {
-    buckets: u64,
+    // Keep coverage coupled to the cache's size. A machine-word mask silently
+    // omitted high chains when the cache grew beyond 64 buckets.
+    buckets: Bitmap<DENTRY_BUCKET_COUNT>,
 }
 
 impl core::fmt::Debug for PathMutationGuard {
@@ -205,14 +208,6 @@ fn hash(directory: (usize, u64, u64), name: &str) -> usize {
     value as usize % DENTRY_BUCKET_COUNT
 }
 
-fn for_each_bucket(mut buckets: u64, mut f: impl FnMut(usize)) {
-    while buckets != 0 {
-        let bucket = buckets.trailing_zeros() as usize;
-        buckets &= buckets - 1;
-        f(bucket);
-    }
-}
-
 /// Begin changing `names` in an RCU-walkable directory.
 ///
 /// Every alias of each affected dentry is unhashed before the backing
@@ -220,20 +215,24 @@ fn for_each_bucket(mut buckets: u64, mut f: impl FnMut(usize)) {
 /// directory. Unrelated hash chains remain available to RCU readers.
 pub fn begin_path_mutation(parent: &dyn DirOps, names: &[&str]) -> PathMutationGuard {
     let parent_key = directory_key(parent);
-    let mut buckets = 0u64;
-    if names.is_empty() {
-        buckets = u64::MAX;
+    let mut buckets = if names.is_empty() {
+        Bitmap::new_full()
     } else {
+        Bitmap::new()
+    };
+    if !names.is_empty() {
         for name in names {
-            buckets |= 1u64 << hash(parent_key, name);
+            buckets.set(hash(parent_key, name));
         }
     }
 
-    for_each_bucket(buckets, |bucket| {
+    for bucket in buckets.iter_set() {
         ACTIVE_MUTATIONS[bucket].fetch_add(1, Ordering::AcqRel);
-    });
+    }
     if names.is_empty() {
-        for_each_bucket(buckets, |bucket| invalidate_bucket(parent, None, bucket));
+        for bucket in buckets.iter_set() {
+            invalidate_bucket(parent, None, bucket);
+        }
     } else {
         for name in names {
             invalidate_bucket(parent, Some(name), hash(parent_key, name));
@@ -244,14 +243,11 @@ pub fn begin_path_mutation(parent: &dyn DirOps, names: &[&str]) -> PathMutationG
 
 impl Drop for PathMutationGuard {
     fn drop(&mut self) {
-        if self.buckets == 0 {
-            return;
-        }
-        for_each_bucket(self.buckets, |bucket| {
+        for bucket in self.buckets.iter_set() {
             MUTATION_GENERATIONS[bucket].fetch_add(1, Ordering::Release);
             ACTIVE_MUTATIONS[bucket].fetch_sub(1, Ordering::Release);
-        });
-        self.buckets = 0;
+        }
+        self.buckets = Bitmap::new();
     }
 }
 
@@ -694,4 +690,108 @@ pub(crate) fn map_fast_file(result: FastFile) -> Option<Result<Arc<dyn FileOps>,
         FastFile::Negative => Some(Err(FsError::NotFound)),
         FastFile::Retry => None,
     }
+}
+
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn high_bucket_name(parent: &dyn DirOps) -> String {
+        (0..4096)
+            .map(|n| alloc::format!("mutation-high-{n}"))
+            .find(|name| hash(directory_key(parent), name) >= u64::BITS as usize)
+            .expect("test name must exercise a bucket beyond one bitmap word")
+    }
+
+    fn smoke_dcache_mutation_rejects_late_negative_in_high_bucket() -> TestResult {
+        let fs = crate::MemFs::new("dcache-high-negative");
+        let dir = crate::FsInstance::root(&fs);
+        let root = Dentry::root(Arc::clone(&dir));
+        let name = high_bucket_name(dir.as_ref());
+        // A filesystem lookup observed absence before the creator started.
+        // Its negative publication must be rejected both during the write
+        // and after it completes, even though no dentry existed to unhash.
+        let token = lookup_token(&root, &name).unwrap();
+        let mutation = begin_path_mutation(dir.as_ref(), &[&name]);
+        let guarded = lookup_token(&root, &name).is_none() && !token_valid(&root, token);
+        cache_negative(&root, &name, token);
+        drop(mutation);
+        cache_negative(&root, &name, token);
+        if !guarded || token_valid(&root, token) {
+            return TestResult::Fail(
+                "high hash bucket escaped mutation lifetime/generation checks",
+            );
+        }
+        if map_fast_file(resolve_file(Arc::clone(&root), &name)).is_some() {
+            return TestResult::Fail("a stale negative was published across directory creation");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "filesystem/dcache",
+        smoke_dcache_mutation_rejects_late_negative_in_high_bucket
+    );
+
+    fn smoke_dcache_mutation_all_names_invalidates_high_bucket() -> TestResult {
+        let fs = crate::MemFs::new("dcache-all-names");
+        let dir = crate::FsInstance::root(&fs);
+        let root = Dentry::root(Arc::clone(&dir));
+        let name = high_bucket_name(dir.as_ref());
+        let token = lookup_token(&root, &name).unwrap();
+        cache_negative(&root, &name, token);
+        if !matches!(
+            map_fast_file(resolve_file(Arc::clone(&root), &name)),
+            Some(Err(FsError::NotFound))
+        ) {
+            return TestResult::Fail("negative dentry fixture did not warm");
+        }
+        let mutation = begin_path_mutation(dir.as_ref(), &[]);
+        let guarded = lookup_token(&root, &name).is_none();
+        let unhashed = map_fast_file(resolve_file(Arc::clone(&root), &name)).is_none();
+        drop(mutation);
+        if !guarded
+            || !unhashed
+            || token_valid(&root, token)
+            || map_fast_file(resolve_file(Arc::clone(&root), &name)).is_some()
+        {
+            return TestResult::Fail("whole-directory mutation omitted a high hash bucket");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "filesystem/dcache",
+        smoke_dcache_mutation_all_names_invalidates_high_bucket
+    );
+
+    fn smoke_dcache_mutation_duplicate_names_and_overlapping_writers() -> TestResult {
+        let fs = crate::MemFs::new("dcache-overlap");
+        let dir = crate::FsInstance::root(&fs);
+        let root = Dentry::root(Arc::clone(&dir));
+        let name = high_bucket_name(dir.as_ref());
+        let bucket = hash(directory_key(dir.as_ref()), &name);
+        let before = ACTIVE_MUTATIONS[bucket].load(Ordering::Acquire);
+        let outer = begin_path_mutation(dir.as_ref(), &[&name, &name]);
+        let outer_count = ACTIVE_MUTATIONS[bucket].load(Ordering::Acquire) == before + 1;
+        let inner = begin_path_mutation(dir.as_ref(), &[&name]);
+        let inner_count = ACTIVE_MUTATIONS[bucket].load(Ordering::Acquire) == before + 2;
+        drop(inner);
+        let still_guarded = lookup_token(&root, &name).is_none()
+            && ACTIVE_MUTATIONS[bucket].load(Ordering::Acquire) == before + 1;
+        drop(outer);
+        if !outer_count
+            || !inner_count
+            || !still_guarded
+            || ACTIVE_MUTATIONS[bucket].load(Ordering::Acquire) != before
+            || lookup_token(&root, &name).is_none()
+        {
+            return TestResult::Fail(
+                "duplicate names or overlapping writers unbalanced mutation counts",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "filesystem/dcache",
+        smoke_dcache_mutation_duplicate_names_and_overlapping_writers
+    );
 }
