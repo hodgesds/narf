@@ -143,6 +143,15 @@ audit at the #996 landing) and is prohibited for key material by this
 interface: key generation through it, or mixing its output into key
 material, is a spec violation.
 
+One consumer of this section lives outside the crate: the userspace
+CSPRNG pool (`filesystem::csprng`, backing `getrandom(2)`, `/dev/random`,
+`/dev/urandom` and `AT_RANDOM`) seeds and reseeds exclusively through
+this surface — the key-material surface above when a seed-grade source
+is present, and, on x86_64 machines with RDRAND but no RDSEED, the
+protocol adapter as a labelled Conditioned seed class (issue #1026;
+the floor contract is specified in `filesystem` §3.0d). The tree has
+one entropy truth: no consumer probes the RNG instructions privately.
+
 ```rust
 pub struct Rng;                                           // typed handle
 pub fn rng_open(cap: &Cap<Rng, Read>) -> Rng;

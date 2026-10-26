@@ -241,9 +241,14 @@ impl FileOps for DevNull {
 ///
 /// Post-Linux-5.18 semantics: both files are identical — both deliver
 /// bytes from the same ChaCha20 CSPRNG seeded from hardware entropy
-/// (RDSEED → RDRAND → TSC-fallback on x86_64).  Neither blocks once the
-/// pool is seeded; the pool is always seeded synchronously during kernel
-/// init via `csprng::init_csprng()`.
+/// through `narf-crypto` (see `csprng`'s module docs for the seed
+/// classes; issue #1026). Neither blocks once the pool is seeded, and
+/// the pool seeds synchronously during kernel init via
+/// `csprng::init_csprng()` on any machine with a hardware RNG source.
+///
+/// On entropy-less hardware the pool never seeds, and reads fail with
+/// `FsError::WouldBlock` (`EAGAIN`) instead of serving predictable
+/// bytes — Linux's not-ready signal for an unseeded pool.
 ///
 /// Write = discard (matching `/dev/null` semantics for the write path).
 /// A write-to-stir-the-pool extension is deferred (Linux ref:
@@ -254,9 +259,13 @@ struct DevRandom;
 
 impl FileOps for DevRandom {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let len = buf.len();
-        crate::csprng::fill(buf);
-        Box::pin(async move { Ok(len) })
+        // Refusal (pool unseeded, #1026) maps to WouldBlock/EAGAIN —
+        // see the struct doc. try_fill writes nothing on refusal.
+        let result = match crate::csprng::try_fill(buf) {
+            Ok(()) => Ok(buf.len()),
+            Err(crate::csprng::CsprngError::EntropyUnavailable) => Err(FsError::WouldBlock),
+        };
+        Box::pin(async move { result })
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
@@ -264,12 +273,16 @@ impl FileOps for DevRandom {
         Box::pin(async move { Ok(len) })
     }
 
-    /// RNG-pool management ioctls. NARF's CSPRNG is always seeded (see
-    /// the struct doc), so there is no entropy pool to fill or drain:
-    /// the count ioctls report a full pool and the mutating ioctls are
-    /// accepted no-ops. `systemd-random-seed` credits saved seed bytes
-    /// via `RNDADDENTROPY` on shutdown/boot; answering 0 (instead of the
-    /// default `ENOTTY`) lets that unit complete cleanly.
+    /// RNG-pool management ioctls. The pool state reported here is
+    /// real (#1026): `RNDGETENTCNT` returns the csprng pool's
+    /// `entropy_avail_bits()` — a full 4096-bit pool once seeded, 0
+    /// while unseeded — so callers that gate on an entropy threshold
+    /// see the same truth reads and getrandom(2) enforce. There is
+    /// still no entropy pool to fill or drain from userspace, so the
+    /// mutating ioctls are accepted no-ops. `systemd-random-seed`
+    /// credits saved seed bytes via `RNDADDENTROPY` on shutdown/boot;
+    /// answering 0 (instead of the default `ENOTTY`) lets that unit
+    /// complete cleanly.
     ///
     /// Linux ref: `drivers/char/random.c::random_ioctl`.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
@@ -283,13 +296,17 @@ impl FileOps for DevRandom {
             return Err(FsError::Unsupported);
         }
         match nr {
-            // RNDGETENTCNT — bits of entropy available. Report a full
-            // pool (4096 bits, Linux's `POOL_BITS`) so callers that gate
-            // on a threshold proceed.
+            // RNDGETENTCNT — bits of entropy available, from the
+            // pool's real state (4096 once seeded, 0 while unseeded).
             0x00 => {
                 // SAFETY: `arg` is the caller's `int*`; write_user_i32
                 // range-checks and SMAP-brackets the store.
-                unsafe { crate::devfs_pty::write_user_i32(arg, 4096)? };
+                unsafe {
+                    crate::devfs_pty::write_user_i32(
+                        arg,
+                        crate::csprng::entropy_avail_bits() as i32,
+                    )?
+                };
                 Ok(0)
             }
             // RNDADDTOENTCNT (0x01), RNDADDENTROPY (0x03),

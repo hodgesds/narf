@@ -25,6 +25,7 @@ narf-time         = { path = "../time" }
 narf-input        = { path = "../input" }
 narf-bus          = { path = "../bus" }
 narf-console      = { path = "../console" }
+narf-crypto       = { path = "../crypto" }
 narf-interrupts   = { path = "../interrupts" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-efi          = { path = "../efi" }

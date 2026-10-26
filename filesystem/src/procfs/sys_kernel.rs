@@ -11,11 +11,11 @@
 //!
 //! ## `/proc/sys/kernel/random/*`
 //!
-//! `entropy_avail` reports a fixed stub (NARF has no entropy pool yet).
-//! `uuid` generates a fresh RFC-4122 v4-shaped UUID per read, seeded
-//! from `monotonic_ns()` + a static counter. This is NOT
-//! cryptographically random; a real CSPRNG lands with the entropy
-//! driver.
+//! `entropy_avail` reports the real state of the `csprng` pool
+//! (`entropy_avail_bits()`: 4096 once seeded, 0 while unseeded —
+//! issue #1026). `uuid` generates a fresh RFC-4122 v4-shaped UUID per
+//! read, seeded from `monotonic_ns()` + a static counter. This is NOT
+//! cryptographically random.
 //! `boot_id` is generated once at first read and then fixed for the
 //! session — matching Linux semantics.
 
@@ -618,11 +618,13 @@ fn write_core_pattern(v: &str) -> Result<(), FsError> {
 
 // ── kernel/random/* ─────────────────────────────────────────────
 
-// entropy_avail: report a fixed stub. NARF has no entropy pool yet;
-// returning a modest non-zero value (256 bits) keeps userspace from
-// spinning on a "not yet ready" check.
+// entropy_avail: the csprng pool's real state (#1026) — 4096 bits
+// once seeded, 0 while unseeded, matching what getrandom(2) and
+// /dev/random reads enforce. Userspace readiness checks (e.g. a
+// "not yet ready" spin) now observe the truth on entropy-less
+// hardware instead of a fabricated non-zero stub.
 fn read_entropy_avail() -> String {
-    String::from("256\n")
+    format!("{}\n", crate::csprng::entropy_avail_bits())
 }
 
 fn read_random_uuid() -> String {
