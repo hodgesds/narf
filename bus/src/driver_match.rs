@@ -221,7 +221,7 @@ pub fn register_remove(name: &'static str, remove: PciRemoveFn) {
 /// plus the name of the match that claimed it. Recorded by
 /// `probe_all` so a later detach can route the remove hook to the
 /// driver that owns the device — the bound-driver record the
-/// hot-plug dispatcher clears on Detach (bus spec §9.5).
+/// hot-plug dispatcher clears on Detach (bus spec §9.6).
 struct BoundDevice {
     device: BusDevice,
     name: &'static str,
@@ -302,15 +302,35 @@ pub fn detach(authority: &Cap<BusRegistryCap, Grant>, addr: BusAddr) -> Result<b
 /// A device with no matching driver is silently skipped —
 /// drivers can be loaded later, and a re-run of `probe_all`
 /// will pick it up.
+///
+/// The walk is live with respect to the device registry: a
+/// probe may append devices while the walk is running — bridge
+/// drivers do this, notably Intel VMD enumerating the functions
+/// behind the bridge (issue #933). Devices appended by an
+/// earlier probe in the same call are attempted, in registry
+/// order, before the call returns (bus spec §9.5). Every
+/// device is attempted at most once per call: the registry is
+/// append-only during a walk (probes append via
+/// `append_devices`; `install` is an enumeration / test-setup
+/// operation), so the walked prefix never reorders.
 pub fn probe_all(
     authority: &Cap<BusRegistryCap, Grant>,
 ) -> Result<u32, narf_capabilities::CapError> {
     authority.check_live()?;
     let drivers = registered();
-    let devs = devices();
+    let mut devs = devices();
     let mut bound = 0u32;
 
-    for d in &devs {
+    // Index-based walk over a refreshable snapshot (bus spec
+    // §9.5): when the walk catches up with the snapshot it
+    // re-reads the registry once, so devices a bridge probe
+    // appended mid-walk (Intel VMD children, issue #933) are
+    // attempted by this same call instead of waiting for a
+    // hot-plug re-run that, at boot, never comes.
+    let mut idx = 0usize;
+    while idx < devs.len() {
+        let d = &devs[idx];
+        idx += 1;
         // Candidate matches in arbitration order. `sort_by_key`
         // is stable, so equal-specificity candidates keep their
         // registration order — the pre-existing tie behaviour.
@@ -366,6 +386,21 @@ pub fn probe_all(
                     log_probe_failure(m, d, e);
                     break;
                 }
+            }
+        }
+
+        if idx == devs.len() {
+            // Caught up with the snapshot: pick up anything the
+            // probes above appended before declaring the walk
+            // done. The registry is append-only during a walk,
+            // so a longer snapshot extends the tail in registry
+            // order and the walked prefix is never re-attempted;
+            // a same-length one ends the walk, and a shorter one
+            // (not reachable today) defensively keeps the
+            // snapshot already in hand.
+            let fresh = devices();
+            if fresh.len() > devs.len() {
+                devs = fresh;
             }
         }
     }

@@ -111,6 +111,11 @@ pub unsafe fn discover_pmu_ppi(dtb: PhysAddr) -> Option<u32>;
 three-cell PPI interrupt specifier and returns its architectural INTID. It has
 no platform-default fallback because the PMU interrupt is implementation-defined.
 
+Appends made after enumeration (hot-plug arrivals, bridge-enumerated
+children) are visible to `devices()` immediately. The match-table
+dispatcher's binding walk (§9) additionally observes appends made
+*during* the walk itself — see §9.5.
+
 ### 3.3 Device capability
 
 ```rust
@@ -214,7 +219,7 @@ Hot-plug paths:
 As implemented today, hot-plug events flow as `HotplugEvent` via
 `hotplug::dispatch_event`; the default dispatcher re-runs
 `probe_all` on attach and routes detach to the bound driver's
-remove hook (§9.5). The bridge-ISR event sources above remain
+remove hook (§9.6). The bridge-ISR event sources above remain
 Stage-5 work; `dispatch_event` is the seam they will feed.
 
 ### 3.6 Loadable-driver PCI bridge
@@ -534,16 +539,41 @@ load), the dispatcher walks the existing device registry and
 attempts probing for any device that previously had no match.
 This is what lets a module load late and pick up its devices.
 
-### 9.5 Detach / remove hooks
+### 9.5 Devices appended during the walk
+
+A probe may append devices to the registry while `probe_all` is
+walking it — bridge drivers do this: the Intel VMD probe
+enumerates the functions behind the bridge and appends them
+under a synthetic segment (issue #933). The walk therefore
+iterates by index over a refreshable snapshot: when the walk
+catches up with the snapshot it re-reads the registry and
+continues over the appended tail, so devices appended by an
+earlier probe in the same call are attempted, in registry
+order, exactly once each, before the call returns.
+
+The registry is append-only during a walk — probes append
+through `append_devices`; `install` remains an enumeration /
+test-setup operation — so the already-walked prefix never
+reorders and no device is attempted twice by one call. This
+preserves the staged-initcall boot ordering (a bridge
+registered at `Stage::Device` has its children bound by the
+same walk that binds the bridge) and the hot-plug dispatcher's
+semantics (§3.5): an Attach that appends a bridge sees the
+bridge's children bound by the same re-run, not by a later
+event.
+
+### 9.6 Detach / remove hooks
 
 `probe_all` records every binding it commits — the device plus
-the name of the match that claimed it. A driver whose devices
-need real teardown registers a remove hook per match name
-(`register_remove(name, PciRemoveFn)`, a companion registry:
-`PciMatch` itself carries no remove field, so the ~90 in-tree
-match literals are untouched). `detach(authority, addr)` drops
-the binding record and, when the bound match name has a hook,
-invokes it with the bound device and a freshly minted
+the name of the match that claimed it, including bindings for
+devices appended during the walk (§9.5), which are recorded by
+the same commit path and are detachable the same way. A driver
+whose devices need real teardown registers a remove hook per
+match name (`register_remove(name, PciRemoveFn)`, a companion
+registry: `PciMatch` itself carries no remove field, so the ~90
+in-tree match literals are untouched). `detach(authority, addr)`
+drops the binding record and, when the bound match name has a
+hook, invokes it with the bound device and a freshly minted
 `Cap<BusDeviceCap, Write>` (the same mint as probing). Detach is
 cap-gated on the registry authority and reports whether a
 binding existed; a hookless driver is simply unbound.
