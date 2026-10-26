@@ -769,6 +769,52 @@ kernel_test_in!(
     smoke_minix_mmap_cache_generation_tracks_mutations
 );
 
+/// The final-unlink half of the minix generation contract (#742):
+/// when the last link to a file is unlinked, its zones are released
+/// under any node still holding it open, so the generation must move
+/// for that held node — otherwise pages it retained would keep
+/// validating against an inode whose number (and zones) a later
+/// create can recycle.
+fn smoke_minix_mmap_cache_generation_moves_on_final_unlink() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image_writable();
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.create("doomed.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create doomed.txt failed"),
+    };
+    if poll_once(file.write(0, b"data")).and_then(|r| r.ok()) != Some(4) {
+        return TestResult::Fail("seed write failed");
+    }
+    let g0 = match file.mmap_cache_generation() {
+        Some(g) => g,
+        None => return TestResult::Fail("regular file reports no cache generation"),
+    };
+    if !matches!(poll_once(root.unlink("doomed.txt")), Some(Ok(()))) {
+        return TestResult::Fail("unlink failed");
+    }
+    match file.mmap_cache_generation() {
+        Some(g) if g != g0 => {}
+        Some(_) => return TestResult::Fail("final unlink did not move the generation"),
+        None => return TestResult::Fail("generation vanished after final unlink"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_mmap_cache_generation_moves_on_final_unlink
+);
+
 /// The shared page cache keys retained pages by
 /// `mmap_backing_identity`, so the identity must belong to the
 /// inode, not to the node an open minted (issue #679): two opens of
