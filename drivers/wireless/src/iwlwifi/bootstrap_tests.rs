@@ -197,6 +197,102 @@ fn discovery(owner: &Owner, words: &mut [u32]) {
     .unwrap();
 }
 
+fn smoke_iwlwifi_mvm_native_discovery_selects_one_exact_api77_image() -> TestResult {
+    for (did, rev, rf, name) in [
+        (0x2723, 0x340, 0, "iwlwifi/iwlwifi-cc-a0-77.ucode"),
+        (
+            0x02f0,
+            0x331,
+            0x105000,
+            "iwlwifi/iwlwifi-Qu-b0-jf-b0-77.ucode",
+        ),
+        (
+            0x02f0,
+            0x332,
+            0x10c000,
+            "iwlwifi/iwlwifi-Qu-c0-hr-b0-77.ucode",
+        ),
+        (
+            0x43f0,
+            0x351,
+            0x108000,
+            "iwlwifi/iwlwifi-QuZ-a0-jf-b0-77.ucode",
+        ),
+        (
+            0xa0f0,
+            0x35f,
+            0x10a000,
+            "iwlwifi/iwlwifi-QuZ-a0-hr-b0-77.ucode",
+        ),
+    ] {
+        let mut startup = owner();
+        startup.device.id.device = did;
+        startup.chip = super::super::chip_config_for_pci_id(0x8086, did).unwrap();
+        startup.parked();
+        let mut registers = [0; 0xa0 / 4];
+        registers[0x28 / 4] = rev;
+        registers[0x9c / 4] = rf;
+        discovery(&startup, &mut registers);
+        let selected = ready(async {
+            let mut state = startup.state.lock().await;
+            startup.candidates(&mut state)
+        })
+        .unwrap();
+        if !matches!(selected,Ok((names,None)) if names==[name])
+            || startup.phase() != ProvisionState::Parked
+            || registers[0x28 / 4] != rev
+            || registers[0x9c / 4] != rf
+        {
+            return TestResult::Fail("MVM discovery widened exact MAC/RF/API or consumed startup");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/interface",
+    smoke_iwlwifi_mvm_native_discovery_selects_one_exact_api77_image
+);
+
+fn smoke_iwlwifi_mvm_unknown_changed_revoked_identity_never_selects_fallback() -> TestResult {
+    for fault in 0..4 {
+        let mut startup = owner();
+        startup.device.id.device = 0xa0f0;
+        startup.chip = super::super::chip_config_for_pci_id(0x8086, 0xa0f0).unwrap();
+        startup.parked();
+        let mut registers = [0; 0xa0 / 4];
+        registers[0x28 / 4] = 0x351;
+        registers[0x9c / 4] = 0x10c000;
+        discovery(&startup, &mut registers);
+        match fault {
+            0 => registers[0x28 / 4] = 0x480,
+            1 => registers[0x9c / 4] = 0x112000,
+            2 => startup.cap.revoke(),
+            _ => ready(async {
+                startup.state.lock().await.discovery.as_mut().unwrap().len = 0x9c;
+            })
+            .unwrap(),
+        };
+        let selected = ready(async {
+            let mut state = startup.state.lock().await;
+            startup.candidates(&mut state)
+        })
+        .unwrap();
+        if selected.is_ok()
+            || startup.phase() != ProvisionState::Parked
+            || ready(async { startup.state.lock().await.interface.is_some() }).unwrap()
+        {
+            return TestResult::Fail(
+                "MVM incompatible identity borrowed static ladder or native station",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/interface",
+    smoke_iwlwifi_mvm_unknown_changed_revoked_identity_never_selects_fallback
+);
+
 fn smoke_iwlwifi_sc_native_identity_selects_exact_staged_rf_with_other_images_present() -> TestResult
 {
     let owner = owner();

@@ -15,6 +15,15 @@ pub struct Profile {
     pub ltr_delay_us: u32,
 }
 pub const API: u32 = 77;
+/// Linux iwl-drv.c: API_NEW_VERSION selects the full header word; older
+/// firmware uses IWL_UCODE_API's bits8..15. FW_VERSION is display metadata.
+pub fn firmware_api(parsed: &super::ParsedUcode<'_>) -> u32 {
+    if parsed.api.api_changes[0] & (1 << 20) != 0 {
+        parsed.header.version
+    } else {
+        (parsed.header.version >> 8) & 255
+    }
+}
 pub fn select(did: u16, hw_rev: u32, hw_rf: u32) -> Result<Profile, Error> {
     if hw_rev == u32::MAX || hw_rf == u32::MAX {
         return Err(Error::Gone);

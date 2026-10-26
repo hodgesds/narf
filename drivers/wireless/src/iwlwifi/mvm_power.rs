@@ -9,7 +9,8 @@ use super::super::{
 };
 use super::{Owner, Phase};
 use crate::firmware_asset::Asset;
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 use narf_wireless::reg::RegulatoryDomain;
 
 const RECORD_LEN: usize = 64;
@@ -52,10 +53,11 @@ pub(super) struct Prepared {
     applied: Option<i16>,
     pub(super) active_link: Option<super::link::ActiveLinkStatus>,
     pub(super) mlme: super::assoc::Context,
+    pub(super) stop: Option<Arc<AtomicBool>>,
 }
 
 impl Prepared {
-    fn host_ceiling(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
+    pub(super) fn host_ceiling(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
         if !self.source.current() || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err("MVM platform power authority or host policy is no longer valid");
         }
@@ -94,7 +96,7 @@ fn request(binding: [u8; 32], mac: [u8; 6]) -> PowerRequest {
     }
 }
 
-fn parse(
+pub(super) fn parse(
     source: Asset,
     binding: [u8; 32],
     mac: [u8; 6],
@@ -132,7 +134,82 @@ fn parse(
         applied: None,
         active_link: None,
         mlme: super::assoc::Context::default(),
+        stop: None,
     })
+}
+
+/// Current-operation publication contract copied only from an acknowledged
+/// native power owner. It retains the actual signed source, not a ready bit.
+#[derive(Clone)]
+pub(in crate::iwlwifi) struct Fence {
+    cap: narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    maximum: i16,
+    gain: i16,
+    channel: u8,
+    applied: i16,
+    stop: Option<Arc<AtomicBool>>,
+}
+impl Fence {
+    pub(in crate::iwlwifi) fn invoke<T>(
+        &self,
+        domain: &RegulatoryDomain,
+        operation: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        use narf_capabilities::{Cap, CapError, CapOp, Read};
+        struct Live<'a, F> {
+            fence: &'a Fence,
+            domain: &'a RegulatoryDomain,
+            operation: F,
+        }
+        impl<T, F: FnOnce() -> Result<T, &'static str>> CapOp<narf_firmware::FirmwareBlob, Read>
+            for Live<'_, F>
+        {
+            type Output = Result<T, &'static str>;
+            fn execute(
+                self,
+                _: &Cap<narf_firmware::FirmwareBlob, Read>,
+            ) -> Result<Self::Output, CapError> {
+                Ok((|| {
+                    let f = self.fence;
+                    if f.stop.as_ref().is_some_and(|s| s.load(Ordering::Acquire))
+                        || !self.domain.country_code.iter().all(u8::is_ascii_uppercase)
+                    {
+                        return Err("MVM current station publication is closed");
+                    }
+                    let power =
+                        super::super::connection::host_channel_power(self.domain, f.channel, true)
+                            .ok_or("MVM current publication channel prohibited")?;
+                    let ceiling = (i16::from(power) * 8)
+                        .checked_sub(f.gain)
+                        .ok_or("MVM current publication power overflow")?
+                        .min(f.maximum);
+                    if ceiling < f.applied {
+                        return Err("MVM current publication ceiling tightened");
+                    }
+                    (self.operation)()
+                })())
+            }
+        }
+        self.cap
+            .invoke(Live {
+                fence: self,
+                domain,
+                operation,
+            })
+            .map_err(|_| "MVM publication power source revoked")?
+    }
+}
+impl Prepared {
+    pub(super) fn fence(&self) -> Result<Fence, &'static str> {
+        Ok(Fence {
+            cap: self.source.cap,
+            maximum: self.maximum,
+            gain: self.gain,
+            channel: self.channel,
+            applied: self.applied.ok_or("MVM power not acknowledged")?,
+            stop: self.stop.clone(),
+        })
+    }
 }
 
 /// Fixed legacy v5 prefix, not the Gen3 v10/v11 structure. Linux computes
@@ -268,7 +345,7 @@ impl Owner {
         .await
     }
 
-    async fn prepare_power_using(
+    pub(super) async fn prepare_power_using(
         &mut self,
         source: Asset,
         binding: [u8; 32],

@@ -119,7 +119,7 @@ struct Receipt {
     body: Vec<u8>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Kind {
+pub(in crate::iwlwifi) enum Kind {
     Enable,
     Message2,
     Message4,
@@ -133,12 +133,12 @@ enum Kind {
     RemoveQueue,
     Data,
 }
-struct Device {
-    ap: FakeAp,
-    m1: Vec<u8>,
+pub(in crate::iwlwifi) struct Device {
+    pub(in crate::iwlwifi) ap: FakeAp,
+    pub(in crate::iwlwifi) m1: Vec<u8>,
     ptk: Option<Ptk>,
     keys: [Option<[u8; 16]>; 5],
-    events: Vec<Kind>,
+    pub(in crate::iwlwifi) events: Vec<Kind>,
     held: Vec<Receipt>,
     enabled: bool,
     api: u8,
@@ -147,7 +147,7 @@ struct Device {
     pair_adds: usize,
     group_adds: usize,
     sync: u32,
-    data: Vec<Vec<u8>>,
+    pub(in crate::iwlwifi) data: Vec<Vec<u8>>,
     gtk: [u8; 16],
     rsc: u64,
     rekey: Option<Rekey>,
@@ -202,7 +202,15 @@ fn ap_ethernet(pdu: &[u8]) -> Vec<u8> {
     bytes
 }
 impl Device {
-    fn new(api: u8) -> Result<Self, &'static str> {
+    pub(in crate::iwlwifi) fn release(&mut self, fw: &mut runtime::model::Firmware) {
+        for receipt in core::mem::take(&mut self.held) {
+            Self::inject(fw, receipt);
+        }
+    }
+    pub(in crate::iwlwifi) fn holding(&self) -> bool {
+        !self.held.is_empty()
+    }
+    pub(in crate::iwlwifi) fn new(api: u8) -> Result<Self, &'static str> {
         let plan = NetworkPlan {
             station: OWN,
             bssid: AP,
@@ -263,7 +271,7 @@ impl Device {
             &receipt.body,
         );
     }
-    fn react(
+    pub(in crate::iwlwifi) fn react(
         &mut self,
         p: runtime::model::Published,
         fw: &mut runtime::model::Firmware,
@@ -633,7 +641,12 @@ impl Device {
             Ok(false)
         }
     }
-    fn encrypted_rx(&self, ethernet: &[u8], pn: u64, group: bool) -> Result<Vec<u8>, &'static str> {
+    pub(in crate::iwlwifi) fn encrypted_rx(
+        &self,
+        ethernet: &[u8],
+        pn: u64,
+        group: bool,
+    ) -> Result<Vec<u8>, &'static str> {
         let mut frame = data_from_ap(ethernet, 12);
         frame[1] |= 0x40;
         let expected: &[u8; 16] = if group {
@@ -673,7 +686,7 @@ impl Device {
         Ok(envelope(&frame, 0xa4f))
     }
 
-    fn challenge(
+    pub(in crate::iwlwifi) fn challenge(
         &mut self,
         fw: &mut runtime::model::Firmware,
         anonce: Option<[u8; 32]>,

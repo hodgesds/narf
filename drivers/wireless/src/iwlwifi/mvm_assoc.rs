@@ -98,6 +98,16 @@ impl Owner {
         &mut self,
         ssid: &[u8],
         security: SecurityMode,
+        policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<AssociationStatus, &'static str> {
+        self.associate_elements_using(ssid, security, &[], policy)
+            .await
+    }
+    pub(super) async fn associate_elements_using(
+        &mut self,
+        ssid: &[u8],
+        security: SecurityMode,
+        elements: &[u8],
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<AssociationStatus, &'static str> {
         let active = self
@@ -129,6 +139,8 @@ impl Owner {
         };
         let mut plan = JoinPlan::prepare(&bss, local, ssid, security)
             .map_err(|_| "unsupported legacy association offer")?;
+        plan.append_sme_ies(elements)
+            .map_err(|_| "unsupported MVM SME elements")?;
         let authenticated = self
             .power
             .prepared

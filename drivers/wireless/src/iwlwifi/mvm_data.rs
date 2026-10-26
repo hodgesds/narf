@@ -44,6 +44,7 @@ pub(super) struct Prepared {
     pub(super) port_open: bool,
     pub(super) sequence: u16,
     pub(super) replay: frame_api::Replay,
+    pub(super) last_peer: u64,
 }
 
 fn edca(local: [u8; 6], use_11b: bool) -> [u8; 208] {
@@ -176,7 +177,7 @@ impl Owner {
         .await
     }
 
-    async fn prepare_data_using(
+    pub(super) async fn prepare_data_using(
         &mut self,
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<LegacyDataStatus, &'static str> {
@@ -236,6 +237,7 @@ impl Owner {
             port_open: false,
             sequence: 0,
             replay: frame_api::Replay::default(),
+            last_peer: narf_time::now_cycles(),
         });
         self.phase = Phase::PreparingData;
         let result = self.prepare_data_inner(&edca, &payload, &mut policy).await;
@@ -476,6 +478,33 @@ impl Owner {
             if ap_disconnected(&mpdu, local, status) {
                 return Err("MVM current AP disconnected legacy station");
             }
+            if f[0] == 0x80
+                && f[1] & 0xc7 == 0
+                && f[4..10] == [255; 6]
+                && f[16..22] == status.bssid
+                && f[22] & 15 == 0
+                && !mpdu.amsdu
+                && mpdu
+                    .body(24, 0)
+                    .and_then(|body| super::super::mlme::parse_beacon_to_bss(status.bssid, body))
+                    .is_some_and(|beacon| {
+                        self.beacons
+                            .iter()
+                            .any(|b| b.bssid == status.bssid && b.ssid == beacon.ssid)
+                            && (beacon.capability_info & 16 != 0) == status.protected
+                    })
+            {
+                self.power
+                    .prepared
+                    .as_mut()
+                    .unwrap()
+                    .mlme
+                    .data
+                    .as_mut()
+                    .unwrap()
+                    .last_peer = narf_time::now_cycles();
+                continue;
+            }
             // Only original non-QoS FromDS frames in this negotiated legacy
             // profile. Reject HT-control, fragments, unauthenticated crypto,
             // firmware duplicates and A-MSDUs before a generic frame parser.
@@ -544,12 +573,30 @@ impl Owner {
                     continue;
                 }
                 if self.security.started() {
+                    self.power
+                        .prepared
+                        .as_mut()
+                        .unwrap()
+                        .mlme
+                        .data
+                        .as_mut()
+                        .unwrap()
+                        .last_peer = narf_time::now_cycles();
                     self.security.receive(ethernet, encrypted)?;
                     return Ok(None);
                 }
                 return Ok(Some(LegacyReceive::Eapol(ethernet)));
             }
             if !status.protected || self.security.ready() && self.phase == Phase::DataPrepared {
+                self.power
+                    .prepared
+                    .as_mut()
+                    .unwrap()
+                    .mlme
+                    .data
+                    .as_mut()
+                    .unwrap()
+                    .last_peer = narf_time::now_cycles();
                 return Ok(Some(LegacyReceive::Ethernet(ethernet)));
             }
         }

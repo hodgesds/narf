@@ -145,7 +145,7 @@ impl Owner {
         .await
     }
 
-    async fn activate_link_using(
+    pub(super) async fn activate_link_using(
         &mut self,
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
