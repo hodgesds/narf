@@ -83,7 +83,11 @@ and CI compiler-cache integration.
   active host IOMMU groups, every requested endpoint bound to `vfio-pci`,
   complete IOMMU-group assignment, and BAR sizes compatible with NARF's mapped
   physical windows. It never unbinds or rebinds host hardware. PCI passthrough
-  is currently x86_64-only.
+  is currently x86_64-only. A passed-through display removes the explicit
+  Bochs and VirtIO display devices as well as the default VGA adapter.
+  The `max` and KVM `host` CPU models default to `phys-bits=40` so q35's
+  64-bit PCI BAR placements stay below NARF's 1 TiB mapping ceiling;
+  explicit physical-address-width overrides are retained.
 - `cargo xtask run --arch=x86_64 --gpu-backend=virgl --display=gtk,gl=on`
   — opt into QEMU's OpenGL-backed virtio-gpu device. The default remains
   `--gpu-backend=auto`: graphical runs prefer VirGL when QEMU advertises the
