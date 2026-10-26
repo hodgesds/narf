@@ -446,6 +446,24 @@ impl Tpm {
     }
 }
 
+/// A `*mut u8` buffer pointer that may cross an `.await` inside
+/// [`submit_crb_over`].
+///
+/// Raw pointers are `!Send`, which would poison the submit
+/// future for the `#[async_trait]` `TpmDevice` surface (its
+/// futures must be `Send`). The pointee is a caller-owned
+/// command/response buffer under `submit_crb_over`'s safety
+/// contract — exclusively owned for the call's duration and
+/// backed by coherent DMA memory (production) or fixture-owned
+/// memory (kernel tests); neither is tied to a particular
+/// thread, so moving an in-flight submit between executor
+/// threads is sound.
+struct SendBufPtr(*mut u8);
+
+// SAFETY: see the type doc — the pointee buffer is exclusively
+// owned for the call's duration and is not thread-affine.
+unsafe impl Send for SendBufPtr {}
+
 /// The CRB submit sequence (PTP §6.5) over an abstract register
 /// window: set CMD_READY, copy the command into the host-owned
 /// command buffer, kick CTRL_START.GO, poll for completion
@@ -468,6 +486,10 @@ pub(crate) async fn submit_crb_over<R: CrbRegs>(
     rsp_buf_len: usize,
     cmd: &[u8],
 ) -> Result<Vec<u8>, TpmError> {
+    // Wrap the raw buffer pointers so this future stays `Send`
+    // across the poll awaits below (see `SendBufPtr`).
+    let cmd_buf = SendBufPtr(cmd_buf);
+    let rsp_buf = SendBufPtr(rsp_buf);
     if cmd.is_empty() || cmd.len() > cmd_buf_len {
         return Err(TpmError::BadResponse);
     }
@@ -488,7 +510,7 @@ pub(crate) async fn submit_crb_over<R: CrbRegs>(
     // above.
     unsafe {
         for (i, b) in cmd.iter().enumerate() {
-            core::ptr::write_volatile(cmd_buf.add(i), *b);
+            core::ptr::write_volatile(cmd_buf.0.add(i), *b);
         }
     }
     // 3. Kick CRB_CTRL_START.GO.
@@ -520,7 +542,7 @@ pub(crate) async fn submit_crb_over<R: CrbRegs>(
     // 10-byte response header).
     unsafe {
         for (i, byte) in header.iter_mut().enumerate() {
-            *byte = core::ptr::read_volatile(rsp_buf.add(i));
+            *byte = core::ptr::read_volatile(rsp_buf.0.add(i));
         }
     }
     let resp_size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
@@ -532,7 +554,7 @@ pub(crate) async fn submit_crb_over<R: CrbRegs>(
         // SAFETY: `resp_size <= rsp_buf_len` was checked above,
         // so every `i` addresses a byte inside the response
         // buffer.
-        *byte = unsafe { core::ptr::read_volatile(rsp_buf.add(i)) };
+        *byte = unsafe { core::ptr::read_volatile(rsp_buf.0.add(i)) };
     }
     Ok(out)
 }
