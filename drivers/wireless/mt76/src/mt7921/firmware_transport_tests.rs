@@ -19,6 +19,8 @@ mod amsdu_rx_tests;
 mod ht20_tests;
 #[path = "ht40_tests.rs"]
 mod ht40_tests;
+#[path = "rx_ba_tests.rs"]
+mod rx_ba_tests;
 #[path = "wmm_tests.rs"]
 mod wmm_tests;
 
@@ -151,6 +153,8 @@ fn event(cmd: u8, seq: u8, status: u8) -> Vec<u8> {
 #[derive(Debug)]
 struct Model {
     ticks: Cell<u64>,
+    management_stall_after: Option<usize>,
+    ba_error_tag: Option<u16>,
     entropy_fail: bool,
     entropy_calls: usize,
     live: bool,
@@ -199,6 +203,8 @@ impl Model {
         let resources = Arc::new(AtomicUsize::new(1));
         Self {
             ticks: Cell::new(0),
+            management_stall_after: None,
+            ba_error_tag: None,
             entropy_fail: false,
             entropy_calls: 0,
             live: true,
@@ -353,6 +359,13 @@ impl Backend for Model {
                 if frame[43] == 7 {
                     let mut result = [0u8; 8];
                     result[0] = frame[34];
+                    if frame[34..36] == [3, 0]
+                        && self.ba_error_tag.is_some_and(|tag| {
+                            frame.get(56..58) == Some(tag.to_le_bytes().as_slice())
+                        })
+                    {
+                        result[4..8].copy_from_slice(&1u32.to_le_bytes());
+                    }
                     reply = runtime_event(1, frame[39], 0, &result);
                 } else if cmd == 3 {
                     let mut done = [0u8; 8];
@@ -539,19 +552,52 @@ impl Backend for Model {
             if let Some(ap) = &self.access_point {
                 let beacon = ap.beacon();
                 if ap.phase() != narf_wifi_fixtures::ApPhase::Authorized
-                    || frame.len() != 33
+                    || !matches!(frame.len(), 30 | 33)
                     || frame[1..4] != [0; 3]
                     || frame[4..10] != beacon[10..16]
                     || frame[10..16] != [2, 0x11, 0x22, 0x33, 0x44, 0x55]
                     || frame[16..22] != beacon[10..16]
-                    || frame[24..26] != [3, 1]
-                    || frame[27..29] != [37, 0]
-                    || frame[29] & !0x3e != 0
-                    || frame[30..33] != [0; 3]
                 {
                     return Err(Error::Bounds);
                 }
-                return Ok(()); // Native adapter consumes a refusal, never creates BA state.
+                if frame.len() == 30 {
+                    if frame[24..26] != [3, 2]
+                        || frame[26] != 0
+                        || frame[27] & 15 != 0
+                        || frame[27] >> 4 >= 8
+                        || frame[28..30] != [39, 0]
+                    {
+                        return Err(Error::Bounds);
+                    }
+                } else if frame[24..26] != [3, 1] {
+                    return Err(Error::Bounds);
+                } else if frame[27..29] == [37, 0] {
+                    if frame[29] & !0x3e != 0 || frame[30..33] != [0; 3] {
+                        return Err(Error::Bounds);
+                    }
+                } else if frame[27..29] == [0; 2] {
+                    let parameters = u16::from_le_bytes([frame[29], frame[30]]);
+                    let window = parameters >> 6;
+                    let tid = ((parameters >> 2) & 15) as u8;
+                    if parameters & 3 != 2
+                        || tid >= 8
+                        || !(1..=32).contains(&window)
+                        || !window.is_power_of_two()
+                        || !self.frames.iter().any(|(_, f)| {
+                            f.len() == 68
+                                && f[34..36] == [3, 0]
+                                && f[56..60] == [6, 0, 12, 0]
+                                && f[60] == tid
+                                && f[63] == 1 << tid
+                                && f[66..68] == window.to_le_bytes()
+                        })
+                    {
+                        return Err(Error::Bounds);
+                    }
+                } else {
+                    return Err(Error::Bounds);
+                }
+                return Ok(()); // Bound firmware adapter, not a new AP/port authority.
             }
         }
         if let Some(ap) = &mut self.access_point {
@@ -569,6 +615,7 @@ impl Backend for Model {
                 let len = packet.len();
                 packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
                 packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+                packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
                 packet[12..16]
                     .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
                 packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
@@ -639,6 +686,7 @@ impl Backend for Model {
                         let len = m3_packet.len();
                         m3_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
                         m3_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+                        m3_packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
                         m3_packet[12..16]
                             .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
                         m3_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
@@ -666,6 +714,12 @@ impl Backend for Model {
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error> {
         self.check()?;
+        if self
+            .management_stall_after
+            .is_some_and(|after| self.frames.len() >= after)
+        {
+            return Ok(None);
+        }
         if self.tx_stall
             && self
                 .management_resume
@@ -1781,12 +1835,11 @@ fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult 
             && f[34..36] == [3, 0]
             && f[43] == 7
             && f.len() >= 48 + 44
-            && f[48..]
-                .windows(4)
-                .any(|w| u16::from_le_bytes([w[0], w[1]]) == 0x12)
+            && f[49] == 1
+            && f[f.len() - 44..f.len() - 32] == [17, 0, 44, 0, 0, 1, 0, 0, 6, 36, 0, 16]
     });
     if secure_sta_rec.is_none() {
-        return TestResult::Fail("secure STA_REC with key tag 0x12 not emitted");
+        return TestResult::Fail("secure STA_REC with native KEY_V2 tag 17 not emitted");
     }
 
     let ethernet = [

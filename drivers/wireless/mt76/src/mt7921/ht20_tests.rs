@@ -351,8 +351,10 @@ fn addba() -> Vec<u8> {
     frame[4..10].copy_from_slice(&super::amsdu_rx_tests::OWN);
     frame[10..16].copy_from_slice(&super::amsdu_rx_tests::AP);
     frame[16..22].copy_from_slice(&super::amsdu_rx_tests::AP);
-    frame[24..].copy_from_slice(&[3, 0, 9, 0x0f, 0x10, 0, 0, 0, 0]);
-    descriptor(&frame)
+    frame[24..].copy_from_slice(&[3, 0, 9, 0x0d, 0x10, 0, 0, 0, 0]); // Unsupported delayed BA.
+    let mut packet = descriptor(&frame);
+    packet[4] = 1; // Real native AP WCID, distinct from frame-address binding.
+    packet
 }
 
 fn mt76_ht20_addba_is_bound_bounded_and_explicitly_declined_without_ba_state() -> TestResult {
@@ -386,7 +388,7 @@ fn mt76_ht20_addba_is_bound_bounded_and_explicitly_declined_without_ba_state() -
         );
     }
     for (_, frame) in &session.backend.frames[before..] {
-        if frame.len() != 33 || frame[0] != 0xd0 || frame[24..] != [3, 1, 9, 37, 0, 14, 0, 0, 0] {
+        if frame.len() != 33 || frame[0] != 0xd0 || frame[24..] != [3, 1, 9, 37, 0, 12, 0, 0, 0] {
             return TestResult::Fail(
                 "ADDBA response enabled BA/AMSDU or changed dialog/TID/status",
             );

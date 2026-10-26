@@ -85,7 +85,7 @@ fn mt76_join_plan_encodes_rates_and_exact_wpa2_rsn() -> TestResult {
     let sec_rec = plan.secure_peer_record(42, &key).unwrap();
     if sec_rec.len() != 164
         || sec_rec[..8] != [0, 1, 6, 0, 1, 0, 0, 0]
-        || sec_rec[120..128] != [18, 0, 44, 0, 1, 1, 0, 0]
+        || sec_rec[120..128] != [17, 0, 44, 0, 0, 1, 0, 0]
         || sec_rec[128..132] != [6, 36, 0, 16]
         || sec_rec[132..148] != key
         || sec_rec[16] != 2
@@ -257,12 +257,28 @@ fn mt76_group_wtbl_and_key_request_match_linux_null_station() -> TestResult {
     if record.len() != 52
         || record[..20]
             != [
-                0, 19, 1, 0, 1, 14, 0, 0, 18, 0, 44, 0, 1, 1, 0, 0, 6, 36, 2, 16,
+                0, 19, 1, 0, 1, 14, 0, 0, 17, 0, 44, 0, 0, 1, 0, 0, 6, 36, 2, 16,
             ]
         || record[20..36] != [0x77; 16]
         || record[36..] != [0; 16]
     {
         return TestResult::Fail("group key MCU request geometry/index/MUAR");
+    }
+    // mt7921/main.c::mt7921_set_key selects Unified STA_REC_UPDATE;
+    // mt76_connac_mcu_sta_key_tlv uses KEY_V2 (17), never MURU (18),
+    // and copies enum set_key_cmd: SET_KEY=0, DISABLE_KEY=1.
+    let pairwise = key_record(1, 0, Some(&[0x66; 16])).unwrap();
+    if pairwise.len() != 52
+        || pairwise[..20]
+            != [
+                0, 1, 1, 0, 1, 0, 0, 0, 17, 0, 44, 0, 0, 1, 0, 0, 6, 36, 0, 16,
+            ]
+        || pairwise[20..36] != [0x66; 16]
+        || pairwise[36..] != [0; 16]
+        || key_record(1, 0, None).unwrap() != [0, 1, 1, 0, 1, 0, 0, 0, 17, 0, 8, 0, 1, 0, 0, 0]
+        || key_record(19, 0, None).unwrap() != [0, 19, 1, 0, 1, 14, 0, 0, 17, 0, 8, 0, 1, 0, 0, 0]
+    {
+        return TestResult::Fail("pairwise install or PTK/GTK removal uses wrong native key TLV");
     }
     if key_record(1, 1, Some(&[0; 16])).is_ok()
         || key_record(19, 4, Some(&[0; 16])).is_ok()

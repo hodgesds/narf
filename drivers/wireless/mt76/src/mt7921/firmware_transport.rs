@@ -13,6 +13,10 @@ mod scan;
 pub use scan::{rx_frame, ScanBss, ScanReport};
 #[path = "amsdu_rx.rs"]
 mod amsdu;
+#[path = "rx_ba.rs"]
+mod ba;
+#[path = "rx_ba_station.rs"]
+mod ba_station;
 #[path = "station_join.rs"]
 mod join;
 pub use amsdu::Ht20ReceiveInfo;
@@ -808,6 +812,7 @@ struct Session<B: Backend> {
     ht20_rx: Option<amsdu::Receiver>,
     ht20_profile: Option<crate::mt7921::ht20::Profile>,
     control_pending: VecDeque<Vec<u8>>,
+    rx_ba: ba::Owner,
     received_msdu: VecDeque<Vec<u8>>,
 }
 impl<B: Backend> Session<B> {
@@ -831,6 +836,7 @@ impl<B: Backend> Session<B> {
             ht20_rx: None,
             ht20_profile: None,
             control_pending: VecDeque::new(),
+            rx_ba: ba::Owner::default(),
             received_msdu: VecDeque::new(),
         }
     }
@@ -1039,6 +1045,11 @@ impl<B: Backend> Session<B> {
             return Ok(());
         }
         self.boot_started = None;
+        self.rx_ba.fence();
+        self.security = None;
+        self.station_permission = None;
+        self.ht20_rx = None;
+        self.received_msdu.clear();
         self.stage(Stage::Shutdown);
         let result = async {
             self.backend.check()?;

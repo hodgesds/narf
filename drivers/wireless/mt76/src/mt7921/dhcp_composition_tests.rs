@@ -96,6 +96,8 @@ struct Harness {
     /// Model-only activation of the completed receive prerequisite after
     /// legacy MLME authorizes the station; this is not HT association evidence.
     aggregate_rx: bool,
+    ba_rx: bool,
+    next_sequence: u16,
     server: DhcpServer,
     received: Vec<Vec<u8>>,
 }
@@ -250,21 +252,27 @@ impl Harness {
         frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
         frame.extend_from_slice(&eth[12..14]); // EtherType via SNAP
         frame.extend_from_slice(&eth[14..]);
+        if self.ba_rx {
+            frame[22..24].copy_from_slice(&(self.next_sequence << 4).to_le_bytes());
+            self.next_sequence = (self.next_sequence + 1) & 4095;
+        }
         if self.protected_link {
             let pn = self.next_pn;
             self.next_pn += 1;
             let mut packet = vec![0u8; 40];
-            packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
+            packet[8..12].copy_from_slice(&(if self.ba_rx { 0 } else { 1u32 << 30 }).to_le_bytes());
             let len = 40 + frame.len();
             packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
-            packet[4..8].copy_from_slice(&((4u32 << 16) | (1 << 11)).to_le_bytes());
+            packet[4..8]
+                .copy_from_slice(&((4u32 << 16) | (1 << 11) | u32::from(self.ba_rx)).to_le_bytes());
             packet[12..16].copy_from_slice(&(u32::from(CHANNEL) << 8).to_le_bytes());
             packet[24..30].copy_from_slice(&pn.to_le_bytes()[..6]);
             packet.extend_from_slice(&frame);
             packet
         } else {
             let mut packet = vec![0u8; 24];
-            packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
+            packet[8..12].copy_from_slice(&(if self.ba_rx { 0 } else { 1u32 << 30 }).to_le_bytes());
+            packet[4] = u8::from(self.ba_rx);
             let len = 24 + frame.len();
             packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
             packet[12..16].copy_from_slice(&(u32::from(CHANNEL) << 8).to_le_bytes());
@@ -337,6 +345,16 @@ fn composition_ht20(wpa2: bool, aggregate_rx: bool, wmm: bool, ht20: bool) -> Te
     composition_ht(wpa2, aggregate_rx, wmm, ht20, false)
 }
 fn composition_ht(wpa2: bool, aggregate_rx: bool, wmm: bool, ht20: bool, ht40: bool) -> TestResult {
+    composition_profile(wpa2, aggregate_rx, wmm, ht20, ht40, false)
+}
+fn composition_profile(
+    wpa2: bool,
+    aggregate_rx: bool,
+    wmm: bool,
+    ht20: bool,
+    ht40: bool,
+    ba_rx: bool,
+) -> TestResult {
     let mut model = Model::new();
     if wmm {
         model.wmm_reply = Some(super::wmm_tests::PARAMETERS.to_vec());
@@ -378,11 +396,13 @@ fn composition_ht(wpa2: bool, aggregate_rx: bool, wmm: bool, ht20: bool, ht40: b
         next_pn: 1,
         protected_link: wpa2,
         aggregate_rx,
+        ba_rx,
+        next_sequence: 0,
         server: DhcpServer::new(NETWORK),
         received: Vec::new(),
     });
 
-    let result = composition_body(&name, wpa2, aggregate_rx, wmm, ht20, ht40);
+    let result = composition_body(&name, wpa2, aggregate_rx, wmm, ht20, ht40, ba_rx);
 
     // Teardown in reverse order: session first (no drain/send can
     // fire against a half-removed interface), then carrier, then
@@ -410,6 +430,7 @@ fn composition_body(
     wmm: bool,
     ht20: bool,
     ht40: bool,
+    ba_rx: bool,
 ) -> TestResult {
     // ── Before association: no carrier, and the controlled port
     // keeps DHCP off the air entirely (audit §4.3.1 S1: "no DHCP
@@ -479,6 +500,19 @@ fn composition_body(
     }
     if aggregate_rx && !ht20 {
         super::amsdu_rx_tests::activate_receive(&mut session);
+    }
+    if ba_rx {
+        session
+            .backend
+            .packets
+            .push_back(super::rx_ba_tests::request_packet(0, 0, 64, 0, CHANNEL));
+        if session.receive_ethernet() != Ok(None)
+            || run(session.service_keys()).is_err()
+            || !session.rx_ba.active(0)
+        {
+            put_session(session);
+            return TestResult::Fail("composed DHCP BA native negotiation/response failed");
+        }
     }
     put_session(session);
 
@@ -667,6 +701,20 @@ kernel_test_in!(
 fn mt76_wpa2_ht40_sgi_amsdu_dhcp_and_ip() -> TestResult {
     composition_ht(true, true, true, true, true)
 }
+fn mt76_open_ht20_recipient_ba_dhcp_and_exact_ip() -> TestResult {
+    composition_profile(false, false, true, true, false, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_open_ht20_recipient_ba_dhcp_and_exact_ip
+);
+fn mt76_wpa2_ht40_recipient_ba_dhcp_and_exact_ip() -> TestResult {
+    composition_profile(true, false, true, true, true, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx_ba",
+    mt76_wpa2_ht40_recipient_ba_dhcp_and_exact_ip
+);
 kernel_test_in!(
     "drivers/wireless/mt7921/ht40",
     mt76_wpa2_ht40_sgi_amsdu_dhcp_and_ip

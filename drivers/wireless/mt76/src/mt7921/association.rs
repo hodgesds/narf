@@ -76,6 +76,10 @@ impl core::ops::Deref for JoinPlan {
 fn unicast(address: [u8; 6]) -> bool {
     address != [0; 6] && address[0] & 1 == 0
 }
+// mt76_connac_mcu.h enum STA_REC_KEY_V2; mt7921 set_key uses this
+// common key TLV with MCU_UNI_CMD(STA_REC_UPDATE). Tag 18 is STA_REC_MURU.
+const STA_REC_KEY_V2: u16 = 17;
+
 fn tlv(bytes: &mut Vec<u8>, id: u16, len: usize) -> usize {
     let offset = bytes.len();
     bytes.resize(offset + len, 0);
@@ -316,8 +320,8 @@ impl JoinPlan {
         out[16] = 2; // STA_REC_BASIC.CONN_STATE_PORT_SECURE
         out[64] = 2; // STA_REC_STATE.CONN_STATE_PORT_SECURE
         out[2] += 1; // 6 TLVs
-        let sec = tlv(&mut out, 0x12, 44);
-        out[sec + 4] = 1; // cmd = SET_KEY
+        let sec = tlv(&mut out, STA_REC_KEY_V2, 44);
+        out[sec + 4] = 0; // enum set_key_cmd::SET_KEY, copied verbatim by Linux.
         out[sec + 5] = 1; // n_cipher = 1
         out[sec + 8] = 6; // cipher_id = MCU_CIPHER_AES_CCMP (6)
         out[sec + 9] = 36; // cipher_len
@@ -366,9 +370,11 @@ pub fn key_record(wcid: u8, key_id: u8, key: Option<&[u8]>) -> Result<Vec<u8>, E
     out[2] = 1;
     out[4] = 1;
     out[5] = if wcid == 19 { 0xe } else { 0 };
-    let sec = tlv(&mut out, 0x12, if key.is_some() { 44 } else { 8 });
+    let sec = tlv(&mut out, STA_REC_KEY_V2, if key.is_some() { 44 } else { 8 });
+    // mt76_connac_mcu_sta_key_tlv copies enum set_key_cmd directly:
+    // SET_KEY = 0, DISABLE_KEY = 1 (not an add/remove boolean).
+    out[sec + 4] = u8::from(key.is_none());
     if let Some(key) = key {
-        out[sec + 4] = 1;
         out[sec + 5] = 1;
         out[sec + 8..sec + 12].copy_from_slice(&[6, 36, key_id, 16]);
         out[sec + 12..sec + 28].copy_from_slice(key);

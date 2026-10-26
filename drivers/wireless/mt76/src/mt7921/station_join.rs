@@ -251,7 +251,7 @@ impl<B: Backend> Session<B> {
         Ok(info)
     }
 
-    fn clear_aggregate_receive(&mut self) {
+    pub(super) fn clear_aggregate_receive(&mut self) {
         if let Some(receiver) = &mut self.ht20_rx {
             receiver.clear();
         }
@@ -275,11 +275,31 @@ impl<B: Backend> Session<B> {
             return None;
         };
         let tid = usize::from(*qos & 15);
+        if self.rx_ba.owns(tid as u8)
+            && (!self.rx_ba.active(tid as u8) || native.wcid != 1 || usize::from(native.tid) != tid)
+        {
+            receiver.clear();
+            return None;
+        }
         let floor = self
             .security
             .as_ref()
             .map(|security| security.pairwise[tid]);
         let complete = receiver.observe(native, floor, self.backend.now_ns())?;
+        if self.rx_ba.active(tid as u8) {
+            let sequence = u16::from_le_bytes([native.frame[22], native.frame[23]]) >> 4;
+            self.rx_ba.insert(
+                tid as u8,
+                super::ba::Packet::new(
+                    sequence,
+                    complete.replay.map(|r| r.pn),
+                    complete.frames,
+                    None,
+                ),
+                self.backend.now_ns(),
+            );
+            return self.receive_ba_ready();
+        }
         // Only a complete, checked MPDU can consume its PN, and only once
         // for all hardware-deaggregated MSDUs sharing that PN.
         if let Some(replay) = complete.replay {
@@ -289,11 +309,43 @@ impl<B: Backend> Session<B> {
         self.received_msdu.pop_front()
     }
 
+    fn receive_ba_ready(&mut self) -> Option<Vec<u8>> {
+        // Replay validation follows sequence reordering, as mt76_rx_complete
+        // calls mt76_check_ccmp_pn only after mt76_rx_aggr_reorder.
+        for _ in 0..32 {
+            let Some((tid, mut packet)) = self.rx_ba.pop() else {
+                break;
+            };
+            match (self.security.as_mut(), packet.pn) {
+                (Some(security), Some(pn)) if pn > security.pairwise[usize::from(tid)] => {
+                    security.pairwise[usize::from(tid)] = pn
+                }
+                (None, None) => {}
+                (Some(_), None) if packet.eapol.is_some() => {}
+                _ => continue,
+            }
+            if let Some(pdu) = packet.eapol.take() {
+                if let Some(security) = &mut self.security {
+                    if security.pending.len() < 16 {
+                        security.pending.push_back((pdu, packet.pn.is_some()));
+                    }
+                }
+                continue;
+            }
+            self.received_msdu = packet.frames;
+            if let Some(frame) = self.received_msdu.pop_front() {
+                return Some(frame);
+            }
+        }
+        None
+    }
+
     pub(super) fn keys_pending(&self) -> bool {
         !self.peer_lost
             && matches!(self.state, State::Associated { .. })
             && self.data_pending.is_none()
             && (!self.control_pending.is_empty()
+                || self.rx_ba.pending(self.backend.now_ns())
                 || self
                     .security
                     .as_ref()
@@ -338,6 +390,7 @@ impl<B: Backend> Session<B> {
         };
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
+            self.retire_receive_ba(peer).await?;
             for _ in 0..4 {
                 let Some((pdu, protected)) = security.pending.pop_front() else {
                     break;
@@ -382,6 +435,7 @@ impl<B: Backend> Session<B> {
             self.station_permission = None;
             self.ht20_rx = None;
             self.ht20_profile = None;
+            self.rx_ba.fence();
             self.state = State::Failed {
                 stage: Stage::EapolHandshake,
                 error,
@@ -398,6 +452,7 @@ impl<B: Backend> Session<B> {
     /// returned as a raw Ethernet frame. The budget also bounds malformed bursts.
     pub(super) fn receive_ethernet(&mut self) -> Result<Option<Vec<u8>>, Error> {
         if self.peer_lost {
+            self.rx_ba.fence();
             self.clear_aggregate_receive();
             return Err(Error::DeviceGone);
         }
@@ -411,7 +466,13 @@ impl<B: Backend> Session<B> {
             _ => return Err(Error::Busy),
         };
         self.backend.check()?;
+        if self.rx_ba.tick(self.backend.now_ns()) {
+            self.clear_aggregate_receive();
+        }
         if let Some(frame) = self.received_msdu.pop_front() {
+            return Ok(Some(frame));
+        }
+        if let Some(frame) = self.receive_ba_ready() {
             return Ok(Some(frame));
         }
         for _ in 0..16 {
@@ -427,15 +488,8 @@ impl<B: Backend> Session<B> {
                 self.clear_aggregate_receive();
                 continue;
             }
-            if self
-                .ht20_rx
-                .as_ref()
-                .is_some_and(|receiver| receiver.active)
-                && native.ampdu
-                && native.frame.first().is_some_and(|fc| fc & 0x0c == 8)
-            {
-                // No BA agreement or reorder owner exists. Hardware-split
-                // A-MPDU packets cannot be delivered as ordinary HT MPDUs.
+            if native.ampdu && native.amsdu != 0 {
+                // Recipient BA explicitly leaves nested A-MSDU unnegotiated.
                 self.clear_aggregate_receive();
                 continue;
             }
@@ -449,35 +503,15 @@ impl<B: Backend> Session<B> {
                 receiver.clear();
             }
             let frame = native.frame;
-            let Some(header) = frame.get(..24) else {
-                continue;
-            };
-            if self.ht20_profile.is_some()
-                && native.ccmp.is_none()
-                && frame.len() == 33
-                && header[0] == 0xd0
-                && header[1] & 0xc7 == 0
-                && header[22] & 15 == 0
-                && header[4..10] == own
-                && header[10..16] == peer
-                && header[16..22] == peer
-                && frame[24..26] == [3, 0]
-            // Block Ack / ADDBA Request.
-            {
-                if self.control_pending.len() < 4 {
-                    let mut response = vec![0; 33];
-                    response[0] = 0xd0;
-                    response[4..10].copy_from_slice(&peer);
-                    response[10..16].copy_from_slice(&own);
-                    response[16..22].copy_from_slice(&peer);
-                    response[24..29].copy_from_slice(&[3, 1, frame[26], 37, 0]);
-                    // Echo TID/immediate-policy only; no AMSDU permission,
-                    // buffer allocation, timeout or successful BA receipt.
-                    response[29] = frame[27] & 0x3e;
-                    self.control_pending.push_back(response);
+            if self.receive_ba_control(&native, own, peer) {
+                if let Some(frame) = self.receive_ba_ready() {
+                    return Ok(Some(frame));
                 }
                 continue;
             }
+            let Some(header) = frame.get(..24) else {
+                continue;
+            };
             if let Some(profile) = self.ht20_profile {
                 if matches!(header[0], 0x80 | 0x50)
                     && header[1] & 0xc7 == 0
@@ -491,6 +525,7 @@ impl<B: Backend> Session<B> {
                     })
                 {
                     self.peer_lost = true;
+                    self.rx_ba.fence();
                     self.clear_aggregate_receive();
                     return Err(Error::DeviceGone);
                 }
@@ -512,6 +547,7 @@ impl<B: Backend> Session<B> {
                     // owner exists yet. A changed/missing/malformed bound AP
                     // parameter set closes the port until a fresh join.
                     self.peer_lost = true;
+                    self.rx_ba.fence();
                     self.clear_aggregate_receive();
                     return Err(Error::DeviceGone);
                 }
@@ -526,6 +562,7 @@ impl<B: Backend> Session<B> {
                 && frame.get(24..26).is_some_and(|reason| reason != [0, 0])
             {
                 self.peer_lost = true;
+                self.rx_ba.fence();
                 self.clear_aggregate_receive();
                 return Err(Error::DeviceGone);
             }
@@ -534,6 +571,19 @@ impl<B: Backend> Session<B> {
                 || header[16..22] == [0; 6]
                 || header[16] & 1 != 0
                 || header[4] & 1 != 0 && header[16..22] == own
+            {
+                continue;
+            }
+            let qos = (header[0] == 0x88).then(|| frame.get(24..26)).flatten();
+            let tid = qos.map(|qos| qos[0] & 15);
+            let reordered = tid.is_some_and(|tid| self.rx_ba.active(tid));
+            if (native.ampdu || tid.is_some_and(|tid| self.rx_ba.owns(tid)))
+                && (!reordered
+                    || native.wcid != 1
+                    || tid != Some(native.tid)
+                    || header[4..10] != own
+                    || header[22] & 15 != 0
+                    || qos.is_none_or(|q| q[1] != 0 || !matches!(q[0] & 0xe0, 0 | 0x60)))
             {
                 continue;
             }
@@ -584,6 +634,34 @@ impl<B: Backend> Session<B> {
             if let Some(ethernet) = to_ethernet(frame) {
                 let eapol = ethernet[12..14] == [0x88, 0x8e];
                 if self.security.is_some() && !protected && !eapol {
+                    continue;
+                }
+                if reordered {
+                    let pdu = if eapol {
+                        if ethernet[..6] != own || ethernet[6..12] != peer {
+                            continue;
+                        }
+                        let Some(pdu) = extract_eapol(frame) else {
+                            continue;
+                        };
+                        Some(pdu.to_vec())
+                    } else {
+                        None
+                    };
+                    let frames = if eapol {
+                        VecDeque::new()
+                    } else {
+                        VecDeque::from([ethernet])
+                    };
+                    let sequence = u16::from_le_bytes([header[22], header[23]]) >> 4;
+                    self.rx_ba.insert(
+                        tid.unwrap(),
+                        super::ba::Packet::new(sequence, replay.map(|r| r.1), frames, pdu),
+                        self.backend.now_ns(),
+                    );
+                    if let Some(frame) = self.receive_ba_ready() {
+                        return Ok(Some(frame));
+                    }
                     continue;
                 }
                 if let Some(security) = self.security.as_mut() {
@@ -764,6 +842,9 @@ impl<B: Backend> Session<B> {
         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
         plan.offer_ht20(info, bss, permission)?;
         self.backend.check_tx_permission(permission)?;
+        if !self.rx_ba.begin_connection() {
+            return Err(Error::Busy);
+        }
 
         self.management_rate = plan.management_rate();
         // Discard idle receive preparation. Any HT activation below must be
@@ -1077,6 +1158,7 @@ impl<B: Backend> Session<B> {
         // authorize only the closing deauth; a dropped waiter cannot leave a
         // reusable station permission in the retained running owner.
         let closing_permission = self.station_permission.take();
+        self.rx_ba.fence();
         self.ht20_rx = None;
         self.ht20_profile = None;
         self.control_pending.clear();
@@ -1089,6 +1171,7 @@ impl<B: Backend> Session<B> {
                     .await?;
                 self.data_pending = None;
             }
+            self.retire_receive_ba(peer).await?;
             if !peer_lost {
                 let mut deauth = vec![0u8; 26];
                 deauth[0] = 0xc0;
@@ -1154,7 +1237,7 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    fn check_station_tx(&mut self) -> Result<(), Error> {
+    pub(super) fn check_station_tx(&mut self) -> Result<(), Error> {
         let result = self
             .station_permission
             .ok_or(Error::Authority)
@@ -1165,6 +1248,7 @@ impl<B: Backend> Session<B> {
             self.security = None;
             self.ht20_rx = None;
             self.ht20_profile = None;
+            self.rx_ba.fence();
             self.control_pending.clear();
             self.clear_aggregate_receive();
             let stage = match self.state {
@@ -1176,19 +1260,25 @@ impl<B: Backend> Session<B> {
         result
     }
 
-    /// Refuse ADDBA explicitly through the same retained, bounded management
-    /// completion owner. No BA session/TLV/queue or reorder context is made.
+    /// Advance recipient BA and declined requests under the retained control
+    /// owner. Dropping this future cannot restore an associated producer.
     async fn service_control(&mut self) -> Result<(), Error> {
-        if self.control_pending.is_empty() || self.data_pending.is_some() {
+        if self.control_pending.is_empty() && !self.rx_ba.pending(self.backend.now_ns())
+            || self.data_pending.is_some()
+        {
             return Ok(());
         }
         let associated = self.state;
-        if !matches!(associated, State::Associated { .. }) || self.peer_lost {
+        let State::Associated { info, peer, .. } = associated else {
+            return Ok(());
+        };
+        if self.peer_lost {
             return Ok(());
         }
         self.stage(Stage::StaRecord);
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
+            self.service_receive_ba(info.capabilities.mac, peer).await?;
             for _ in 0..4 {
                 let Some(frame) = self.control_pending.pop_front() else {
                     break;
@@ -1205,6 +1295,7 @@ impl<B: Backend> Session<B> {
             self.station_permission = None;
             self.ht20_profile = None;
             self.ht20_rx = None;
+            self.rx_ba.fence();
             self.control_pending.clear();
             self.received_msdu.clear();
             self.state = State::Failed {
@@ -1219,7 +1310,11 @@ impl<B: Backend> Session<B> {
 
     /// Every association/key/port publication earns fresh authority after
     /// the preceding wait. Cleanup deliberately uses plain exchange instead.
-    async fn exchange_station(&mut self, command: Command, body: &[u8]) -> Result<Vec<u8>, Error> {
+    pub(super) async fn exchange_station(
+        &mut self,
+        command: Command,
+        body: &[u8],
+    ) -> Result<Vec<u8>, Error> {
         self.check_station_tx()?;
         let reply = self.exchange(command, body).await?;
         self.check_station_tx()?;
