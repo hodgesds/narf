@@ -1318,6 +1318,14 @@ impl Controller {
         &mut self,
         cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<RecoveryReport, NvmeError> {
+        if self.suspended {
+            // Recovery loses to suspend: this controller was put
+            // down by `suspend_pm`, and only `resume_pm` may bring
+            // it back. (`recover_slot` refuses earlier still; this
+            // guard keeps the invariant at the layer that owns the
+            // state, for any future caller.)
+            return Err(NvmeError::NotReady);
+        }
         let before_id = self.identify.ok_or(NvmeError::NotReady)?;
         let before_ns = self.namespaces.clone();
         if !self.disable_after_failure(cap) {
@@ -4106,6 +4114,11 @@ fn withdraw_controller_publications(instance: u32) {
 /// [`Controller::reset_recover`], minting the device cap from the
 /// bus bootstrap authority the way `probe_all` does.
 ///
+/// A suspended controller is refused ([`NvmeError::NotReady`]),
+/// never recovered: its `dead` is the suspend teardown's state, and
+/// only resume may bring it back (see [`suspend_slot`] /
+/// [`resume_slot`]).
+///
 /// Gate discipline: the reset runs under the slot's request gate,
 /// acquired here — callers (the block entry points) drop their
 /// guard before calling, because re-publication
@@ -4136,6 +4149,17 @@ fn recover_slot(instance: u32) -> Result<(), NvmeError> {
     // cap travels with the outcome: re-publication needs it.
     let (device, outcome, cap) = {
         let mut ctrl = acquire(slot);
+        if ctrl.is_suspended() {
+            // Suspend wins over recovery: a suspended controller is
+            // `dead` because the PM teardown put it down, not because
+            // a command wedged it, and resurrecting it here would
+            // serve I/O the suspend window exists to refuse.
+            // Recovery of a suspended controller is deferred to
+            // resume (`resume_slot` re-inits it); refuse the caller
+            // instead. Checked before the not-dead early return so
+            // the refusal holds whatever state the teardown left.
+            return Err(NvmeError::NotReady);
+        }
         if !ctrl.is_dead() {
             return Ok(());
         }
