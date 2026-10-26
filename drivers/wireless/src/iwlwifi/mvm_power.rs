@@ -232,7 +232,10 @@ impl Owner {
     pub fn prepared_transmit_power(&self) -> Option<PowerStatus> {
         if !matches!(
             self.phase,
-            Phase::TransmitPowerPrepared | Phase::LinkActive | Phase::Associated
+            Phase::TransmitPowerPrepared
+                | Phase::LinkActive
+                | Phase::Associated
+                | Phase::DataPrepared
         ) || self.hardware.is_failed()
         {
             return None;

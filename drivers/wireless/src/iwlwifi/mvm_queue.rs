@@ -22,6 +22,7 @@ impl Owner {
                 | Phase::TransmitPowerPrepared
                 | Phase::LinkActive
                 | Phase::Associated
+                | Phase::DataPrepared
         ) || self.hardware.is_failed()
         {
             return None;

@@ -117,7 +117,7 @@ impl DataQueue {
             return Err("invalid TX allocation response");
         }
         let id = u16::from_le_bytes(response[..2].try_into().unwrap());
-        if id == 0 || id >= 512 || response[2..4] != [0; 2] {
+        if id == 0 || id >= 512 || response[2..4] != [0; 2] || response[6..8] != [0; 2] {
             return Err("TX queue allocation rejected");
         }
         let pointer = u16::from_le_bytes(response[4..6].try_into().unwrap());

@@ -24,6 +24,10 @@ pub enum Phase {
     Authenticating,
     Associating,
     Associated,
+    PreparingData,
+    DataPrepared,
+    TransmittingData,
+    ClosingData,
     ClearingAssociation,
     DeactivatingLink,
     RemovingManagementQueue,
@@ -214,3 +218,8 @@ pub type AuthenticationStatus = auth::AuthenticationStatus;
 mod assoc;
 pub type AssociationStatus = assoc::AssociationStatus;
 pub type AssociationSecurity = narf_wireless::association::SecurityMode;
+
+#[path = "mvm_data.rs"]
+mod data;
+pub type LegacyDataStatus = data::LegacyDataStatus;
+pub type LegacyReceive = data::LegacyReceive;

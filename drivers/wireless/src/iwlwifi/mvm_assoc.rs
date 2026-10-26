@@ -20,7 +20,8 @@ pub(super) struct Authenticated {
 pub(super) struct Context {
     pub authenticated: Option<Authenticated>,
     plan: Option<JoinPlan>,
-    prepared: Option<AssociationStatus>,
+    pub(super) prepared: Option<AssociationStatus>,
+    pub(super) data: Option<super::data::Prepared>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AssociationStatus {
@@ -73,7 +74,9 @@ fn link(local: [u8; 6], status: AssociationStatus, interval: u16, dtim: u8) -> [
 }
 impl Owner {
     pub fn associated_station(&self) -> Option<AssociationStatus> {
-        if self.phase != Phase::Associated || self.hardware.is_failed() {
+        if !matches!(self.phase, Phase::Associated | Phase::DataPrepared)
+            || self.hardware.is_failed()
+        {
             return None;
         }
         let power = self.power.prepared.as_ref()?;
@@ -91,7 +94,7 @@ impl Owner {
         })
         .await
     }
-    async fn associate_legacy_using(
+    pub(super) async fn associate_legacy_using(
         &mut self,
         ssid: &[u8],
         security: SecurityMode,
