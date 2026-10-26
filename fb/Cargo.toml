@@ -16,7 +16,7 @@ narf-lib          = { path = "../lib" }
 narf-graphics     = { path = "../graphics" }
 narf-graphics-driver = { path = "../drivers/graphics" }
 narf-drivers-virtio  = { path = "../drivers/virtio" }
-narf-drivers-gpu     = { path = "../drivers/gpu" }
+narf-drivers-gpu     = { path = "../drivers/gpu", default-features = false }
 narf-capabilities = { path = "../capabilities" }
 narf-init         = { path = "../init" }
 narf-ipc          = { path = "../ipc" }
@@ -39,6 +39,12 @@ narf-arch         = { path = "../arch" }
 narf-boot         = { path = "../boot" }
 
 [features]
+default = ["amdgpu", "intel"]
+# Per-vendor forwarding to narf-drivers-gpu, mirroring its split:
+# without `amdgpu` the AMD scanout backend and handoff are not
+# compiled; without `intel` the Intel scanout backend is not.
+amdgpu = ["narf-drivers-gpu/amdgpu"]
+intel = ["narf-drivers-gpu/intel"]
 # Marker the frame-level `kernel-test` feature switches on so this
 # crate can skip work that would interfere with the test harness
 # (live status-panel repaint while a test installs a test scanout).

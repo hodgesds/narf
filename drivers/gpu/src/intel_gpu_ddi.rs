@@ -173,8 +173,22 @@ pub const HBR3_BUF_TRANS: [DpBufTrans; 4] = [
 pub fn dp_buf_trans_table(link_bw_set: u8) -> Option<&'static [DpBufTrans; 4]> {
     // `link_bw_set` is the DPCD value (0x06 = RBR, 0x0A = HBR,
     // 0x14 = HBR2, 0x1E = HBR3). Source: VESA DP 1.4a §2.9.3.2.
+    //
+    // RBR and HBR resolve to the HBR2 table: the analog swing
+    // coefficients in a DDI_BUF_TRANS table are indexed by the
+    // voltage-swing / pre-emphasis *level* link training
+    // negotiates over DPCD, not by link rate, and the Gen12
+    // combo-PHY DP translation is a single table per VccIO
+    // (TGL PRM Vol. 12 publishes per-protocol PORT_TX tables for
+    // the TC PHYs, whose level rows for "DP up to HBR" and
+    // "DP HBR2" share the same swing levels). Before lane 1
+    // RBR/HBR returned `None` and — like HBR2/HBR3 — had no
+    // writer at all; lane 1 adds the writer in the modeset and
+    // this resolution for the fallback rates. If a board file
+    // later publishes distinct RBR/HBR coefficients, they
+    // replace this fallback in exactly this one place.
     match link_bw_set {
-        0x14 => Some(&HBR2_BUF_TRANS),
+        0x06 | 0x0A | 0x14 => Some(&HBR2_BUF_TRANS),
         0x1E => Some(&HBR3_BUF_TRANS),
         _ => None,
     }
@@ -231,6 +245,9 @@ pub mod tests {
         }
         if dp_buf_trans_table(0x1E).is_none() {
             return TestResult::Fail("HBR3 not resolved");
+        }
+        if dp_buf_trans_table(0x06).is_none() || dp_buf_trans_table(0x0A).is_none() {
+            return TestResult::Fail("RBR/HBR must resolve (lane 1 fallback table)");
         }
         if dp_buf_trans_table(0xFF).is_some() {
             return TestResult::Fail("unknown rate must be None");

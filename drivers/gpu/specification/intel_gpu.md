@@ -182,3 +182,44 @@ announce only; their display engines are tracked in #1016.
   platform.
 - HDCP / content-protection registers — out of scope for the
   KMS-grade driver.
+
+## 7. Lane 1 (#1010) — display correctness core + publication
+
+Landed on top of the Stage-3 modeset orchestrator (Gen12,
+DDI A / eDP, single pipe):
+
+- **Routing** — `TRANS_DDI_FUNC_CTL` (transcoder → DDI bind,
+  DP-SST, 8 bpc, port width) and `DPCLKA_CFGCR0` (DPLL0 → DDI,
+  two-write select-then-enable at the Gen12 address 0x164280)
+  are programmed by the modeset. Neither was written before.
+- **DP M/N** — `PIPE_DATA_M1/N1` + `PIPE_LINK_M1/N1` computed
+  per TGL PRM Vol. 12 §"Transcoder MN Values" (uncompressed
+  SST, N = 2^23, M rounded up; LINK_N written last as the
+  hardware update trigger).
+- **CDCLK floor** — CDCLK is raised (never lowered) to the
+  smallest ladder frequency satisfying the PRM rule
+  `pixel rate <= 2 * CDCLK` (CD2X divider 1, pipe A).
+- **Watermarks / DBUF allocation** — the PRM's "Display Buffer
+  Allocation and Watermark Programming Prior to OS Boot" basic
+  programming: 160 DBUF blocks to Pipe A's primary plane,
+  level-0 watermark 160 blocks / 2 lines, higher levels off.
+  The full latency-based algorithm (pcode mailbox latencies)
+  and DBUF_CTL power-request sequencing remain follow-on work.
+- **DDI_BUF_TRANS** — the modeset loads the swing table for
+  the training start rate before link training and reloads if
+  training settles elsewhere. RBR/HBR resolve to the HBR2 table
+  (see `intel_gpu_ddi` for the rationale).
+- **PLL table corrected** — DPLL_CFGCR0/1 field layouts and the
+  four DP coefficient rows now match TGL PRM Vol. 12's
+  "DisplayPort Mode PLL Values" for the 19.2/38.4 MHz reference
+  family (DCO 8100 MHz for all rates; P/K per rate). The 24 MHz
+  family shares the dividers with int 0x151 / frac 0x4000;
+  DSSM reference-frequency selection is not yet implemented.
+- **PLANE_CTL format pinned** — source-format discriminants
+  corrected to the ICL+ 5-bit field values (XRGB_8888 =
+  0b01000); fixture-pinned against PRM Vol. 14.
+- **Publication** — a probed Gen12 scanout is published to the
+  framebuffer console through the same ACTIVE + observer
+  protocol the AMD display pipeline uses, and the DRM card
+  carries real KMS mode state (CRTC 1, encoder 2 TMDS,
+  connector 3 eDP) instead of the identity stub.

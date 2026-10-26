@@ -29,8 +29,34 @@
 
 // ── DPLL register block (TGL PRM Vol. 11 §"DPLL Registers") ──────
 
-/// `DPCLKA_CFGCR0` — DDI ↔ DPLL routing latch.
-pub const DPCLKA_CFGCR0: u64 = 0x0000_6C200;
+/// `DPCLKA_CFGCR0` — DDI ↔ DPLL routing latch. Gen12 address
+/// (ICL+): 0x164280. The pre-lane-1 value 0x6C200 was the
+/// pre-ICL LCPLL-block address and addressed the wrong block on
+/// every Gen12 part.
+pub const DPCLKA_CFGCR0: u64 = 0x0000_164280;
+
+/// `DPCLKA_CFGCR0` clock-off bit for combo PHY `phy` (0 = DDI A):
+/// bits 10, 11, 24, 4, 5 for phys 0..4 (ICL encoding). Lane 1
+/// programs DDI A only; the helper covers the combo PHYs A..C.
+pub const fn dpclka_clk_off(phy: u32) -> u32 {
+    match phy {
+        0 => 1 << 10,
+        1 => 1 << 11,
+        2 => 1 << 24,
+        _ => 0,
+    }
+}
+
+/// `DPCLKA_CFGCR0` clock-select field for combo PHY `phy`: a
+/// 2-bit DPLL index at shift `phy * 2` (phys 0..3).
+pub const fn dpclka_clk_sel(dpll_idx: u32, phy: u32) -> u32 {
+    (dpll_idx & 0x3) << (phy * 2)
+}
+
+/// Mask of the clock-select field for combo PHY `phy`.
+pub const fn dpclka_clk_sel_mask(phy: u32) -> u32 {
+    0x3 << (phy * 2)
+}
 
 /// Per-DPLL config register 0 base. Each DPLL is at +0x8 from
 /// the previous (LO at +0x00, HI at +0x04).
@@ -46,41 +72,46 @@ pub const fn dpll_cfgcr1(cfgcr0: u64) -> u64 {
 
 // ── DPLL_CFGCR0 fields (TGL PRM Vol. 11 §"DPLL_CFGCR0") ─────────
 
-/// DCO integer field bits[14:0].
+/// DCO integer field bits[9:0] (TGL PRM Vol. 11; the pre-lane-1
+/// codec claimed bits[14:0], which overlaps the fraction field).
 pub const fn cfgcr0_dco_integer(int: u16) -> u32 {
-    (int as u32) & 0x7FFF
+    (int as u32) & 0x3FF
 }
 
-/// DCO fraction field bits[24:15] — 10-bit fractional component.
+/// DCO fraction field bits[24:10] — 15-bit fractional component
+/// in units of 1/2^15. The pre-lane-1 codec used 10 bits at
+/// [24:15], which truncated the PRM fractions (0x7000 & 0x3FF
+/// = 0) — every published row silently lost its fraction.
 pub const fn cfgcr0_dco_fraction(frac: u16) -> u32 {
-    ((frac as u32) & 0x3FF) << 15
+    ((frac as u32) & 0x7FFF) << 10
 }
 
 // ── DPLL_CFGCR1 fields (TGL PRM Vol. 11 §"DPLL_CFGCR1") ─────────
 
-/// Q-divider value bits[7:0].
+/// Q-divider ratio field bits[17:10]. Ratio value 0 encodes a
+/// ratio of 1 (the PRM DP rows all use Q = 1).
 pub const fn cfgcr1_qdiv_ratio(q: u8) -> u32 {
-    q as u32
+    (q as u32) << 10
 }
-/// Q-divider mode (1 → divide-by-2; 0 → bypass) bit[8].
-pub const CFGCR1_QDIV_MODE_DIV2: u32 = 1 << 8;
+/// Q-divider mode bit[9] (1 → divide-by-2; 0 → ratio field rules).
+pub const CFGCR1_QDIV_MODE_DIV2: u32 = 1 << 9;
 
-/// K-divider field bits[10:9]. Documented values:
-pub const CFGCR1_KDIV_1: u32 = 0b01 << 9;
-pub const CFGCR1_KDIV_2: u32 = 0b10 << 9;
-pub const CFGCR1_KDIV_3: u32 = 0b00 << 9;
+/// K-divider field bits[8:6]. Documented values:
+pub const CFGCR1_KDIV_1: u32 = 0b001 << 6;
+pub const CFGCR1_KDIV_2: u32 = 0b010 << 6;
+pub const CFGCR1_KDIV_3: u32 = 0b100 << 6;
 
-/// P-divider field bits[15:13].
-pub const CFGCR1_PDIV_2: u32 = 0b001 << 13;
-pub const CFGCR1_PDIV_3: u32 = 0b010 << 13;
-pub const CFGCR1_PDIV_5: u32 = 0b100 << 13;
-pub const CFGCR1_PDIV_7: u32 = 0b110 << 13;
+/// P-divider field bits[5:2].
+pub const CFGCR1_PDIV_2: u32 = 0b0001 << 2;
+pub const CFGCR1_PDIV_3: u32 = 0b0010 << 2;
+pub const CFGCR1_PDIV_5: u32 = 0b0100 << 2;
+pub const CFGCR1_PDIV_7: u32 = 0b1000 << 2;
 
-/// Central frequency selector bits[1:0]. PRM Vol. 11 §"Central
-/// Frequency".
-pub const CFGCR1_CFREQ_9_6_GHZ: u32 = 0b00;
-pub const CFGCR1_CFREQ_9_0_GHZ: u32 = 0b01;
-pub const CFGCR1_CFREQ_8_4_GHZ: u32 = 0b10;
+/// Central frequency selector bits[1:0]. The field value 3
+/// selects the 8400 MHz central frequency used with an 8100 MHz
+/// DCO (TGL PRM Vol. 11). The pre-lane-1 codec encoded 8.4 GHz
+/// as 0b10, which selects a different (reserved on TGL) band.
+pub const CFGCR1_CFREQ_8_4_GHZ: u32 = 0b11;
 
 // ── Documented DP / HDMI link rates ──────────────────────────────
 //
@@ -149,31 +180,48 @@ pub struct DpllCoeffs {
     pub cfgcr1: u32,
 }
 
+// Canonical rows: TGL PRM Vol. 12, "DisplayPort Mode PLL Values"
+// for the 19.2/38.4 MHz reference family. Both reference families
+// share DCO = 8100 MHz (24 MHz ref: int 0x151, frac 0x4000;
+// 19.2/38.4 MHz ref: int 0x1A5, frac 0x7000 — 421.875 x 19.2 =
+// 8100). The P/K/Q dividers are identical across families:
+//   RBR  (1.62 Gbps): P/5, K/2, Q=1 -> 8100/10 = 810 MHz out
+//   HBR  (2.7  Gbps): P/3, K/2, Q=1 -> 8100/6  = 1350
+//   HBR2 (5.4  Gbps): P/3, K/1, Q=1 -> 8100/3  = 2700
+//   HBR3 (8.1  Gbps): P/2, K/1, Q=1 -> 8100/2  = 4050
+// PLL output = 5x symbol rate = bit rate / 2, so output x 2 is
+// the bit rate. Before lane 1 the HBR2 and HBR3 rows were
+// byte-identical (both P/2 K/1) and every fraction was 0 — HBR,
+// HBR2 and RBR were all programmed with wrong dividers.
+// Reference-clock family selection via the DSSM register is not
+// yet implemented; the rows below are the 19.2/38.4 family the
+// pre-existing DCO integer already presumed.
+
 /// Combo-PHY coefficients for HBR2 (5.4 Gbps).
 pub const COMBO_HBR2: DpllCoeffs = DpllCoeffs {
     dco_integer: 0x01A5,
-    dco_fraction: 0x0000,
-    cfgcr1: CFGCR1_KDIV_1 | CFGCR1_PDIV_2 | CFGCR1_CFREQ_8_4_GHZ,
+    dco_fraction: 0x7000,
+    cfgcr1: CFGCR1_KDIV_1 | CFGCR1_PDIV_3 | CFGCR1_CFREQ_8_4_GHZ,
 };
 
 /// Combo-PHY coefficients for HBR (2.7 Gbps).
 pub const COMBO_HBR: DpllCoeffs = DpllCoeffs {
     dco_integer: 0x01A5,
-    dco_fraction: 0x0000,
-    cfgcr1: CFGCR1_KDIV_2 | CFGCR1_PDIV_2 | CFGCR1_CFREQ_8_4_GHZ,
+    dco_fraction: 0x7000,
+    cfgcr1: CFGCR1_KDIV_2 | CFGCR1_PDIV_3 | CFGCR1_CFREQ_8_4_GHZ,
 };
 
 /// Combo-PHY coefficients for RBR (1.62 Gbps).
 pub const COMBO_RBR: DpllCoeffs = DpllCoeffs {
-    dco_integer: 0x00C2,
-    dco_fraction: 0x0000,
-    cfgcr1: CFGCR1_KDIV_2 | CFGCR1_PDIV_2 | CFGCR1_CFREQ_9_6_GHZ,
+    dco_integer: 0x01A5,
+    dco_fraction: 0x7000,
+    cfgcr1: CFGCR1_KDIV_2 | CFGCR1_PDIV_5 | CFGCR1_CFREQ_8_4_GHZ,
 };
 
 /// Combo-PHY coefficients for HBR3 (8.1 Gbps).
 pub const COMBO_HBR3: DpllCoeffs = DpllCoeffs {
     dco_integer: 0x01A5,
-    dco_fraction: 0x0000,
+    dco_fraction: 0x7000,
     cfgcr1: CFGCR1_KDIV_1 | CFGCR1_PDIV_2 | CFGCR1_CFREQ_8_4_GHZ,
 };
 
@@ -236,10 +284,54 @@ pub mod tests {
 
     fn smoke_cfgcr0_encoding() -> TestResult {
         let v = encode_cfgcr0(&COMBO_HBR2);
-        if v & 0x7FFF != COMBO_HBR2.dco_integer as u32 {
-            return TestResult::Fail("DCO integer not in low 15 bits");
+        if v & 0x3FF != COMBO_HBR2.dco_integer as u32 {
+            return TestResult::Fail("DCO integer not in low 10 bits");
+        }
+        if (v >> 10) & 0x7FFF != COMBO_HBR2.dco_fraction as u32 {
+            return TestResult::Fail("DCO fraction not at bits[24:10]");
         }
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_pll", smoke_cfgcr0_encoding);
+
+    /// Pin the PRM Vol. 12 DP PLL table: the four rates must have
+    /// distinct divider encodings, share DCO 8100 MHz for the
+    /// 19.2/38.4 MHz reference family, and compose a CFGCR1 whose
+    /// Q ratio field is 0 (Q = 1) as the PRM requires when
+    /// K != 2 — and also when K == 2.
+    fn smoke_combo_coeffs_match_prm_table() -> TestResult {
+        let rows = [COMBO_RBR, COMBO_HBR, COMBO_HBR2, COMBO_HBR3];
+        for r in rows {
+            if r.dco_integer != 0x1A5 || r.dco_fraction != 0x7000 {
+                return TestResult::Fail("DCO must be 8100 MHz (0x1A5 + 0x7000/2^15)");
+            }
+            if cfgcr1_qdiv_ratio(0) != 0 || (r.cfgcr1 >> 10) & 0xFF != 0 {
+                return TestResult::Fail("Q divider ratio field must encode Q=1");
+            }
+        }
+        if COMBO_HBR2.cfgcr1 == COMBO_HBR3.cfgcr1 {
+            return TestResult::Fail("HBR2 and HBR3 divider rows must differ");
+        }
+        // P/K fields: RBR P5|K2, HBR P3|K2, HBR2 P3|K1, HBR3 P2|K1.
+        if COMBO_RBR.cfgcr1 & (CFGCR1_PDIV_5 | CFGCR1_KDIV_2) != CFGCR1_PDIV_5 | CFGCR1_KDIV_2 {
+            return TestResult::Fail("RBR must be P/5 K/2");
+        }
+        if COMBO_HBR.cfgcr1 & (CFGCR1_PDIV_3 | CFGCR1_KDIV_2) != CFGCR1_PDIV_3 | CFGCR1_KDIV_2 {
+            return TestResult::Fail("HBR must be P/3 K/2");
+        }
+        if COMBO_HBR2.cfgcr1 & (CFGCR1_PDIV_3 | CFGCR1_KDIV_1) != CFGCR1_PDIV_3 | CFGCR1_KDIV_1 {
+            return TestResult::Fail("HBR2 must be P/3 K/1");
+        }
+        if COMBO_HBR3.cfgcr1 & (CFGCR1_PDIV_2 | CFGCR1_KDIV_1) != CFGCR1_PDIV_2 | CFGCR1_KDIV_1 {
+            return TestResult::Fail("HBR3 must be P/2 K/1");
+        }
+        if DPCLKA_CFGCR0 != 0x164280 {
+            return TestResult::Fail("DPCLKA_CFGCR0 must be the Gen12 address 0x164280");
+        }
+        if dpclka_clk_sel(0, 0) != 0 || dpclka_clk_off(0) != 1 << 10 {
+            return TestResult::Fail("DDI A must select DPLL0 with clock on");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_pll", smoke_combo_coeffs_match_prm_table);
 }

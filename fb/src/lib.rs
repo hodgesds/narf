@@ -47,7 +47,21 @@ pub use client::{allocate_singleton_ring, FbClient};
 pub use cmd_ring::{DrawCmd, DrawRing, RING_DEPTH, TAG_BLIT, TAG_FILL, TAG_FLUSH};
 pub use drain_task::{drain_once, stats as drain_stats, DrainTask};
 
+#[cfg(feature = "amdgpu")]
 mod amdgpu_boot;
+
+/// Whether the amdgpu boot handoff has paused fb drawing. Without
+/// the amdgpu feature there is no handoff to pause for.
+fn amdgpu_boot_paused() -> bool {
+    #[cfg(feature = "amdgpu")]
+    {
+        amdgpu_boot::paused()
+    }
+    #[cfg(not(feature = "amdgpu"))]
+    {
+        false
+    }
+}
 pub use registry::{
     connect as registry_connect, disconnect as registry_disconnect,
     disconnect_all_for_pid as registry_disconnect_all_for_pid, ConnectError,
@@ -298,8 +312,10 @@ impl FbScanout for VirtioGpuScanout {
 // ── amdgpu backend ──────────────────────────────────────────────────
 
 #[derive(Debug)]
+#[cfg(feature = "amdgpu")]
 struct AmdgpuScanout;
 
+#[cfg(feature = "amdgpu")]
 impl FbScanout for AmdgpuScanout {
     fn width(&self) -> u32 {
         narf_drivers_gpu::amdgpu::with_controller(|d| {
@@ -348,8 +364,10 @@ impl FbScanout for AmdgpuScanout {
 // ── intel-gpu backend ───────────────────────────────────────────────
 
 #[derive(Debug)]
+#[cfg(feature = "intel")]
 struct IntelGpuScanout;
 
+#[cfg(feature = "intel")]
 impl FbScanout for IntelGpuScanout {
     fn width(&self) -> u32 {
         narf_drivers_gpu::intel_gpu::with_controller(|d| {
@@ -400,7 +418,9 @@ impl FbScanout for IntelGpuScanout {
 
 static BOCHS: BochsScanout = BochsScanout;
 static VIRTIO_GPU: VirtioGpuScanout = VirtioGpuScanout;
+#[cfg(feature = "amdgpu")]
 static AMDGPU: AmdgpuScanout = AmdgpuScanout;
+#[cfg(feature = "intel")]
 static INTEL_GPU: IntelGpuScanout = IntelGpuScanout;
 static GENERIC: GenericScanout = GenericScanout;
 
@@ -426,6 +446,7 @@ static BOOT_GENERIC: narf_lib::sync::IrqSafeSpinLock<
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
+    #[cfg(feature = "amdgpu")]
     narf_drivers_gpu::amdgpu_platform::record_boot_framebuffer(fb);
     {
         let mut boot = BOOT_GENERIC.lock();
@@ -451,10 +472,19 @@ pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
 /// Returns whether a scanout was adopted. The boot framebuffer recorded for the
 /// display handoff is left alone, so a later teardown can still find it.
 pub fn adopt_external_scanout() -> bool {
-    let Some(fb) = narf_drivers_gpu::amdgpu_dcn_display::active_scanout() else {
-        return false;
-    };
-    adopt(fb)
+    // The pull entry samples the AMD publication; Intel adoption
+    // arrives through the scanout observer instead.
+    #[cfg(feature = "amdgpu")]
+    {
+        let Some(fb) = narf_drivers_gpu::amdgpu_dcn_display::active_scanout() else {
+            return false;
+        };
+        adopt(fb)
+    }
+    #[cfg(not(feature = "amdgpu"))]
+    {
+        false
+    }
 }
 /// Kernel mappings made for adopted scanouts, as (phys, len, va). Never
 /// unmapped. CPU views lease their publication epoch; withdrawal waits for
@@ -508,9 +538,16 @@ fn adopt(fb: narf_graphics_driver::generic::GenericFb) -> bool {
         // A pull adoption may have raced withdrawal while mapping the range.
         // Publication changes ACTIVE before invoking its observer, so a stale
         // pull either fails here or precedes that observer's replacement.
-        let current = narf_drivers_gpu::amdgpu_dcn_display::active_scanout();
+        #[cfg(feature = "amdgpu")]
+        let amd = narf_drivers_gpu::amdgpu_dcn_display::active_scanout();
+        #[cfg(not(feature = "amdgpu"))]
+        let amd: Option<narf_graphics_driver::generic::GenericFb> = None;
+        #[cfg(feature = "intel")]
+        let intel = narf_drivers_gpu::intel_gpu::active_scanout_generic();
+        #[cfg(not(feature = "intel"))]
+        let intel: Option<narf_graphics_driver::generic::GenericFb> = None;
         let boot = *BOOT_GENERIC.lock();
-        if ![current, boot].into_iter().flatten().any(|f| {
+        if ![amd, intel, boot].into_iter().flatten().any(|f| {
             (f.addr, f.width, f.height, f.pitch, f.bpp)
                 == (fb.addr, fb.width, fb.height, fb.pitch, fb.bpp)
         }) {
@@ -542,16 +579,32 @@ fn clear_generic() {
 }
 /// The console draws to exactly the scanout a driver published.
 pub(crate) fn adopted_external_scanout() -> bool {
-    narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_some_and(|published| {
-        GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire) == published.addr
-    })
+    let phys = GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire);
+    #[cfg(feature = "amdgpu")]
+    let amd = narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_some_and(|p| phys == p.addr);
+    #[cfg(not(feature = "amdgpu"))]
+    let amd = false;
+    #[cfg(feature = "intel")]
+    let intel =
+        narf_drivers_gpu::intel_gpu::active_scanout_generic().is_some_and(|p| phys == p.addr);
+    #[cfg(not(feature = "intel"))]
+    let intel = false;
+    amd || intel
 }
 /// The adopted external scanout as a DRM blit target, through its kernel
 /// mapping. Only a driver-published scanout that the console actually adopted
 /// qualifies: the boot framebuffer keeps its existing fbdev-only behaviour,
 /// and nothing here is exposed to a userspace mmap.
 fn external_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
-    let published = narf_drivers_gpu::amdgpu_dcn_display::active_scanout()?;
+    #[cfg(feature = "amdgpu")]
+    let amd = narf_drivers_gpu::amdgpu_dcn_display::active_scanout();
+    #[cfg(not(feature = "amdgpu"))]
+    let amd: Option<narf_graphics_driver::generic::GenericFb> = None;
+    #[cfg(feature = "intel")]
+    let intel = narf_drivers_gpu::intel_gpu::active_scanout_generic();
+    #[cfg(not(feature = "intel"))]
+    let intel: Option<narf_graphics_driver::generic::GenericFb> = None;
+    let published = amd.or_else(|| intel)?;
     // Compare with this publication, not a second ACTIVE sample that could
     // already name the next front. The caller leases GENERIC_FB under the
     // replacement gate, so its mapping cannot change during this query.
@@ -642,6 +695,7 @@ impl FbScanout for GenericScanout {
     fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {
         // An adopted Navi48 scanout is written through the BAR and HDP; its
         // owner publishes the flush. Boot/GOP and DCN314 scanouts have none.
+        #[cfg(feature = "amdgpu")]
         narf_drivers_gpu::amdgpu_dcn_display::flush_active_scanout();
     }
     unsafe fn framebuffer(&self) -> Framebuffer {
@@ -673,7 +727,7 @@ impl FbScanout for GenericScanout {
 /// (no other path mutates the slot), the resulting `&'static`
 /// stays valid until clear_test_scanout runs.
 pub fn select_active() -> Option<&'static dyn FbScanout> {
-    if amdgpu_boot::paused() {
+    if amdgpu_boot_paused() {
         return None;
     }
     {
@@ -707,6 +761,7 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
     if GENERIC_FB.lock().is_some() {
         return Some(&GENERIC);
     }
+    #[cfg(feature = "amdgpu")]
     if narf_drivers_gpu::amdgpu::is_probed() {
         let mode_ok = narf_drivers_gpu::amdgpu::with_controller(|d| d.current_mode().is_some())
             .unwrap_or(false);
@@ -728,6 +783,7 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
             return Some(&VIRTIO_GPU);
         }
     }
+    #[cfg(feature = "intel")]
     if narf_drivers_gpu::intel_gpu::is_probed() {
         let mode_ok = narf_drivers_gpu::intel_gpu::with_controller(|d| d.current_mode().is_some())
             .unwrap_or(false);
@@ -884,7 +940,7 @@ impl FbWriter {
 
     /// Validate cap is still live; returns `Err` if revoked.
     fn check_live(&self) -> Result<(), FbWriteError> {
-        if amdgpu_boot::paused() {
+        if amdgpu_boot_paused() {
             return Err(FbWriteError::NoActiveScanout);
         }
         self.cap
@@ -1069,7 +1125,7 @@ impl PumpWriterCell {
 /// Reads the boot-cached writer and runs one drain pass; cheap
 /// on empty rings.
 fn fb_drain_pump() {
-    if amdgpu_boot::paused() {
+    if amdgpu_boot_paused() {
         return;
     }
     // SAFETY: PUMP_WRITER is initialised once at boot before any
@@ -1113,7 +1169,7 @@ fn init_pump_writer(writer: FbWriter) {
 /// active. Used by the cursor sleep-pump tick to avoid minting a
 /// fresh `Cap::bootstrap()` per call.
 pub(crate) fn pump_writer_ref() -> Option<&'static FbWriter> {
-    if amdgpu_boot::paused() {
+    if amdgpu_boot_paused() {
         return None;
     }
     // SAFETY: PUMP_WRITER is initialised once at boot; subsequent
@@ -1164,6 +1220,7 @@ pub fn register_initcalls() {
     // Register the actual handoff during Subsys so it follows the firmware
     // scans, console installation and other statically registered Late calls.
     // It still runs before executor polling and all userspace framebuffer maps.
+    #[cfg(feature = "amdgpu")]
     narf_init::register(Stage::Subsys, "fb-amdgpu-handoff-register", || {
         narf_init::register_with_budget(
             Stage::Late,
@@ -1209,7 +1266,11 @@ pub fn register_initcalls() {
     // DRM fbdev hook below: a function pointer installed once during Stage::Late,
     // so the dependency on the GPU driver stays one-way.
     narf_init::register(Stage::Late, "fb-external-scanout", || {
+        #[cfg(feature = "amdgpu")]
         narf_drivers_gpu::amdgpu_dcn_display::register_scanout_observer(external_scanout_changed);
+        // Same observer follows the Intel lane-1 publication.
+        #[cfg(feature = "intel")]
+        narf_drivers_gpu::intel_gpu::register_scanout_observer(external_scanout_changed);
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "drm-fb-hook", || {

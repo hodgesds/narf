@@ -318,6 +318,18 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // Stage 1 wires the actual MMIO writes here.
         self.program_dpll(&mode)?;
 
+        // Step 4b (lane 1, #1010): raise CDCLK to the floor this
+        // pixel clock needs — PRM: "Pipe maximum pixel rate =
+        // 2 * CDCLK frequency" with CD2X divider 1. Only raises;
+        // a faster firmware CDCLK is left alone.
+        self.program_cdclk_floor(&mode);
+
+        // Step 4c (lane 1): route DPLL0 to this DDI in
+        // DPCLKA_CFGCR0 — select the PLL and turn the DDI clock
+        // on in separate writes, per the PRM sequence. This
+        // register was never written before lane 1.
+        self.program_dpclka_routing();
+
         // Step 5: enable per-pipe power well (PG2 for Pipe A).
         // Stage-2: real PG2 sequencing via HSW_PWR_WELL_CTL2,
         // mirroring i915's `hsw_set_power_well`.
@@ -331,6 +343,22 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // For native-resolution modeset, source == destination.
         self.program_pipe(&mode);
 
+        // Step 7b (lane 1): DP data/link M/N for the stream
+        // (24 bpp, uncompressed SST, 4 lanes). LINK_N is written
+        // last — it triggers the hardware update of all four.
+        self.program_mn(&mode);
+
+        // Step 7c (lane 1): bind the transcoder to the DDI port
+        // (TRANS_DDI_FUNC_CTL, DP-SST, 8 bpc, 4 lanes). Never
+        // written before lane 1 — routing was firmware leftover.
+        self.program_trans_ddi_func_ctl();
+
+        // Step 7d (lane 1): single-pipe watermarks + DBUF
+        // allocation (PRM pre-OS-boot basic programming) before
+        // the plane is armed; the PLANE_SURF write in step 8
+        // latches them.
+        self.program_watermarks();
+
         // Step 8: program primary plane — framebuffer pointer,
         // stride, format.
         self.program_plane(primary_fb, &mode);
@@ -339,7 +367,16 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // For Stage 1 we expect AUX is available (the panel is
         // alive enough to ACK DPCD reads). Failure surfaces as
         // ModesetError::LinkTrainingCr/Eq; the panel stays dark.
-        self.train_dp_link()?;
+        //
+        // Lane 1: load the DDI_BUF_TRANS swing table for the
+        // rate training starts at (HBR2) before training — the
+        // source PHY needs its coefficients while training runs.
+        // If training settles on a different rate, reload.
+        self.load_buf_trans(LinkRate::DpHbr2);
+        let trained = self.train_dp_link()?;
+        if trained != LinkRate::DpHbr2 {
+            self.load_buf_trans(trained);
+        }
 
         // Step 10: enable DDI buffer — physical output drivers on.
         self.enable_ddi_buffer();
@@ -667,7 +704,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     ///
     /// Reference: Linux drivers/gpu/drm/i915/display/
     /// intel_dp_link_training.c (`intel_dp_link_training`).
-    fn train_dp_link(&mut self) -> Result<(), ModesetError> {
+    fn train_dp_link(&mut self) -> Result<LinkRate, ModesetError> {
         use crate::dp_link_training::{train_link, LinkError, LinkRate as TrainRate};
         let mut aux = IntelAux::new(self.mmio, self.ddi);
         // Stage-2 starts at HBR2/4-lane and falls back via
@@ -677,12 +714,137 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         let initial_rate = TrainRate::Hbr2;
         let lanes = 4;
         match train_link(&mut aux, initial_rate, lanes, |_us| core::hint::spin_loop()) {
-            Ok(_trained) => Ok(()),
+            Ok(trained) => Ok(match trained.rate {
+                TrainRate::Rbr => LinkRate::DpRbr,
+                TrainRate::Hbr => LinkRate::DpHbr,
+                TrainRate::Hbr2 => LinkRate::DpHbr2,
+                TrainRate::Hbr3 => LinkRate::DpHbr3,
+            }),
             Err(LinkError::CrFailed(_)) => Err(ModesetError::LinkTrainingCr),
             Err(LinkError::EqFailed(_)) => Err(ModesetError::LinkTrainingEq),
             Err(LinkError::Aborted) => Err(ModesetError::LinkTrainingCr),
             Err(LinkError::AuxFailure(e)) => Err(ModesetError::AuxFailure(e)),
         }
+    }
+
+    // ── Lane-1 display correctness core ─────────────────────
+
+    /// Load the DDI_BUF_TRANS voltage-swing table for `rate`
+    /// into this DDI's translation registers (two dwords per
+    /// entry at DDI base + 0x10 + n*8). Before lane 1 the tables
+    /// in `intel_gpu_ddi` had zero writers tree-wide.
+    fn load_buf_trans(&mut self, rate: LinkRate) {
+        use crate::intel_gpu_ddi::{dp_buf_trans_table, DDI_BUF_TRANS_BASE_OFFSET};
+        let bw = match rate.dpcd_link_bw_set() {
+            Some(b) => b,
+            None => return,
+        };
+        let table = match dp_buf_trans_table(bw) {
+            Some(t) => t,
+            None => return,
+        };
+        for (i, entry) in table.iter().enumerate() {
+            let off = self.ddi.base() + DDI_BUF_TRANS_BASE_OFFSET + (i as u64) * 8;
+            self.mmio.write32(off, entry.lo);
+            self.mmio.write32(off + 4, entry.hi);
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Program DPCLKA_CFGCR0 routing: DPLL0 → this DDI, clock
+    /// on, in the PRM's two writes (select with the clock off,
+    /// then clear the off bit).
+    fn program_dpclka_routing(&mut self) {
+        use crate::intel_gpu_pll::{
+            dpclka_clk_off, dpclka_clk_sel, dpclka_clk_sel_mask, DPCLKA_CFGCR0,
+        };
+        let phy = self.ddi as u32;
+        let cur = self.mmio.read32(DPCLKA_CFGCR0);
+        let selected = (cur & !dpclka_clk_sel_mask(phy) & !dpclka_clk_off(phy))
+            | dpclka_clk_sel(0, phy)
+            | dpclka_clk_off(phy);
+        self.mmio.write32(DPCLKA_CFGCR0, selected);
+        compiler_fence(Ordering::SeqCst);
+        self.mmio.write32(DPCLKA_CFGCR0, selected & !dpclka_clk_off(phy));
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Raise CDCLK to the floor for `mode`'s pixel clock.
+    fn program_cdclk_floor(&mut self, mode: &Mode) {
+        let cur = self.mmio.read32(CDCLK_CTL);
+        let cur_khz = cdclk_decode_khz(cur);
+        let floor_khz = mode.pixel_clock_khz.div_ceil(2);
+        if floor_khz <= cur_khz {
+            return;
+        }
+        let (freq_khz, sel, decimal) = match cdclk_for_pixel_clock(mode.pixel_clock_khz) {
+            Some(v) => v,
+            None => return, // beyond the ladder; leave firmware CDCLK
+        };
+        let _ = freq_khz;
+        let val = (sel << CDCLK_FREQ_SEL_SHIFT)
+            | CDCLK_SSA_PRECHARGE
+            | (decimal & CDCLK_FREQ_DECIMAL_MASK);
+        self.mmio.write32(CDCLK_CTL, val);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Program the DP data/link M/N registers for Transcoder A.
+    fn program_mn(&mut self, mode: &Mode) {
+        use crate::intel_gpu_pipes::{
+            dp_mn, Transcoder, PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET,
+            PIPE_LINK_N1_OFFSET,
+        };
+        let rate = link_rate_for_pixel_clock(mode.pixel_clock_khz);
+        let ls_khz = rate.megabits_per_sec() * 100;
+        let (dm, dn, lm, ln) = dp_mn(mode.pixel_clock_khz, ls_khz, 4, 3);
+        let base = Transcoder::A.base();
+        self.mmio.write32(base + PIPE_DATA_M1_OFFSET, dm);
+        self.mmio.write32(base + PIPE_DATA_N1_OFFSET, dn);
+        self.mmio.write32(base + PIPE_LINK_M1_OFFSET, lm);
+        // LINK_N last: it triggers the hardware update.
+        self.mmio.write32(base + PIPE_LINK_N1_OFFSET, ln);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Bind Transcoder A to this DDI (DP-SST, 8 bpc, 4 lanes).
+    fn program_trans_ddi_func_ctl(&mut self) {
+        use crate::intel_gpu_pipes::{
+            build_trans_ddi_func_ctl, Transcoder, TRANS_DDI_FUNC_CTL_OFFSET, TRANS_DDI_MODE_DP_SST,
+        };
+        let val = build_trans_ddi_func_ctl(self.ddi as u8, TRANS_DDI_MODE_DP_SST, 4);
+        self.mmio
+            .write32(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Single-pipe watermarks + DBUF allocation, using the
+    /// PRM's "Display Buffer Allocation and Watermark
+    /// Programming Prior to OS Boot" basic programming (TGL PRM
+    /// Vol. 12): 160 DBUF blocks for Pipe A's primary plane
+    /// (PLANE_BUF_CFG = END 159 / START 0), level-0 watermark
+    /// 160 blocks / 2 lines (0x800080A0), all higher levels,
+    /// SAGV and transition watermarks disabled. The PRM scopes
+    /// this programming to any resolution, linear surfaces,
+    /// <=32 bpp, one universal plane per pipe — exactly this
+    /// driver's shape. The full latency-based watermark
+    /// algorithm needs pcode-mailbox memory latencies and is
+    /// follow-on work; the DBUF_CTL power-request sequencing
+    /// likewise remains (its register detail is not in Vol. 12;
+    /// firmware leaves DBUF_S1 enabled, which this allocation
+    /// sub-divides).
+    fn program_watermarks(&mut self) {
+        let wm_base = Pipe::A.base() + PLANE_WM_BASE_OFFSET;
+        self.mmio.write32(wm_base, PLANE_WM0_PREBOOT);
+        for level in 1..6u64 {
+            self.mmio.write32(wm_base + level * 4, 0);
+        }
+        self.mmio.write32(wm_base + PLANE_WM_SAGV_OFFSET, 0);
+        self.mmio.write32(wm_base + PLANE_WM_SAGV_TRANS_OFFSET, 0);
+        self.mmio.write32(wm_base + PLANE_WM_TRANS_OFFSET, 0);
+        self.mmio
+            .write32(Pipe::A.base() + PLANE_BUF_CFG_OFFSET, PLANE_BUF_CFG_PREBOOT_A);
+        compiler_fence(Ordering::SeqCst);
     }
 
     // ── DDI buffer enable ────────────────────────────────────
@@ -787,6 +949,57 @@ fn mode_to_display_timing(mode: &Mode) -> crate::intel_gpu_pipes::DisplayTiming 
         vtotal: mode.v_total,
     }
 }
+
+// ── CDCLK (TGL PRM Vol. 12 §"Clocks"; CDCLK_CTL at 0x46000) ────
+
+const CDCLK_CTL: u64 = 0x4_6000;
+const CDCLK_FREQ_SEL_SHIFT: u32 = 26;
+const CDCLK_FREQ_DECIMAL_MASK: u32 = 0x7FF;
+const CDCLK_SSA_PRECHARGE: u32 = 1 << 16;
+
+/// CDCLK ladder for the 19.2/38.4 MHz reference family:
+/// (frequency kHz, FREQ_SEL value). FREQ_SEL bands: 0 =
+/// 450/432 MHz, 1 = 540, 2 = 337.5/307.2, 3 = 675/617.28. The
+/// band for each ladder rung is the voltage level that rung
+/// requires; the decimal field carries the exact frequency as
+/// (kHz - 1000) / 500.
+const CDCLK_LADDER: &[(u32, u32)] = &[(337_500, 2), (432_000, 0), (540_000, 1), (675_000, 3)];
+
+/// Smallest ladder CDCLK that satisfies the PRM floor
+/// `pixel_clock <= 2 * CDCLK` for `pixel_clock_khz`, as
+/// (freq_khz, freq_sel, decimal_field). `None` past the ladder.
+fn cdclk_for_pixel_clock(pixel_clock_khz: u32) -> Option<(u32, u32, u32)> {
+    let floor_khz = pixel_clock_khz.div_ceil(2);
+    for (freq, sel) in CDCLK_LADDER {
+        if *freq >= floor_khz {
+            let decimal = (freq - 1000 + 250) / 500;
+            return Some((*freq, *sel, decimal));
+        }
+    }
+    None
+}
+
+/// Decode the current CDCLK frequency (kHz) from CDCLK_CTL's
+/// decimal field: freq = decimal * 500 + 1000 (Hz-scaled x1000).
+fn cdclk_decode_khz(ctl: u32) -> u32 {
+    (ctl & CDCLK_FREQ_DECIMAL_MASK) * 500 + 1000
+}
+
+// ── Watermark / DBUF allocation registers (plane 1, pipe A) ────
+// Absolute bases: PLANE_WM_1_A_0 = 0x70240, PLANE_WM_SAGV_1_A =
+// 0x70258, PLANE_WM_SAGV_TRANS_1_A = 0x7025C, PLANE_WM_TRANS_1_A
+// = 0x70268, PLANE_BUF_CFG_1_A = 0x7027C — expressed here as
+// offsets from Pipe::A.base() (0x70000).
+
+const PLANE_WM_BASE_OFFSET: u64 = 0x0240;
+const PLANE_WM_SAGV_OFFSET: u64 = 0x0018;
+const PLANE_WM_SAGV_TRANS_OFFSET: u64 = 0x001C;
+const PLANE_WM_TRANS_OFFSET: u64 = 0x0028;
+const PLANE_BUF_CFG_OFFSET: u64 = 0x027C;
+/// PRM pre-OS-boot level-0 watermark: enable | 2 lines | 160 blocks.
+const PLANE_WM0_PREBOOT: u32 = 0x8000_80A0;
+/// PRM pre-OS-boot DBUF allocation for Pipe A: END 159, START 0.
+const PLANE_BUF_CFG_PREBOOT_A: u32 = 0x009F_0000;
 
 /// Poll an MMIO register's `mask` bits until they assert (when
 /// `want_set` is `true`) or deassert (when `false`). Returns
@@ -1209,6 +1422,163 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_enable_ddi_buffer_writes_lane_and_enable
+    );
+
+    fn smoke_cdclk_floor_ladder() -> TestResult {
+        // 65 MHz pixel clock: floor 32.5 MHz -> lowest rung.
+        match super::cdclk_for_pixel_clock(65_000) {
+            Some((337_500, 2, 673)) => {}
+            _ => return TestResult::Fail("65 MHz must pick 337.5 MHz CDCLK (sel 2, decimal 673)"),
+        }
+        // 1 GHz pixel clock: floor 500 MHz -> 540 MHz rung.
+        match super::cdclk_for_pixel_clock(1_000_000) {
+            Some((540_000, 1, 1078)) => {}
+            _ => return TestResult::Fail("1 GHz must pick 540 MHz CDCLK (sel 1, decimal 1078)"),
+        }
+        if super::cdclk_for_pixel_clock(1_400_000).is_some() {
+            return TestResult::Fail("beyond-ladder pixel clock must be None");
+        }
+        if super::cdclk_decode_khz(673) != 337_500 {
+            return TestResult::Fail("CDCLK decimal decode round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_modeset", smoke_cdclk_floor_ladder);
+
+    fn smoke_program_mn_writes_link_n_last() -> TestResult {
+        use crate::intel_gpu_pipes::Transcoder;
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.program_mn(&Mode::VESA_1024X768_60);
+        let base = Transcoder::A.base();
+        for off in [0x30u64, 0x34, 0x40, 0x44] {
+            if mmio.writes_to(base + off).is_empty() {
+                return TestResult::Fail("M/N register not written");
+            }
+        }
+        // LINK_N (base+0x44) must be the last of the four writes.
+        let log = mmio.writes.borrow();
+        let mut last_mn_idx = 0usize;
+        let mut link_n_idx = 0usize;
+        for (i, (o, _)) in log.iter().enumerate() {
+            if *o >= base + 0x30 && *o <= base + 0x44 {
+                last_mn_idx = i;
+            }
+            if *o == base + 0x44 {
+                link_n_idx = i;
+            }
+        }
+        if link_n_idx != last_mn_idx {
+            return TestResult::Fail("LINK_N must be written last");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_program_mn_writes_link_n_last
+    );
+
+    fn smoke_program_routing_and_watermarks() -> TestResult {
+        use crate::intel_gpu_pipes::{Pipe as PipeIdx, Transcoder, TRANS_DDI_FUNC_CTL_OFFSET};
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.program_trans_ddi_func_ctl();
+        let want = (1u32 << 31) | (1 << 27) | (2 << 24) | (3 << 1);
+        let writes = mmio.writes_to(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET);
+        if writes != alloc::vec![want] {
+            return TestResult::Fail("TRANS_DDI_FUNC_CTL value wrong");
+        }
+        ms.program_watermarks();
+        let wm_base = PipeIdx::A.base() + super::PLANE_WM_BASE_OFFSET;
+        if mmio.writes_to(wm_base) != alloc::vec![super::PLANE_WM0_PREBOOT] {
+            return TestResult::Fail("PLANE_WM level 0 must be the PRM pre-boot value");
+        }
+        if mmio.writes_to(wm_base + 4) != alloc::vec![0] {
+            return TestResult::Fail("PLANE_WM level 1 must be disabled");
+        }
+        if mmio.writes_to(PipeIdx::A.base() + super::PLANE_BUF_CFG_OFFSET)
+            != alloc::vec![super::PLANE_BUF_CFG_PREBOOT_A]
+        {
+            return TestResult::Fail("PLANE_BUF_CFG must be the PRM pre-boot allocation");
+        }
+        // DPCLKA routing: two writes, first with clock-off set
+        // (select phase), second with it clear (clock on).
+        let mut ms2 = Modeset::new(&mmio, Ddi::A);
+        ms2.program_dpclka_routing();
+        let dpclka = mmio.writes_to(crate::intel_gpu_pll::DPCLKA_CFGCR0);
+        if dpclka.len() != 2 {
+            return TestResult::Fail("DPCLKA routing must be two writes");
+        }
+        if dpclka[0] & (1 << 10) == 0 || dpclka[1] & (1 << 10) != 0 {
+            return TestResult::Fail("DPCLKA clock-off sequencing wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_program_routing_and_watermarks
+    );
+
+    fn smoke_load_buf_trans_writes_table() -> TestResult {
+        use crate::intel_gpu_ddi::{DDI_BUF_TRANS_BASE_OFFSET, HBR2_BUF_TRANS};
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.load_buf_trans(crate::intel_gpu_pll::LinkRate::DpHbr2);
+        for (i, e) in HBR2_BUF_TRANS.iter().enumerate() {
+            let off = Ddi::A.base() + DDI_BUF_TRANS_BASE_OFFSET + (i as u64) * 8;
+            if mmio.writes_to(off) != alloc::vec![e.lo] || mmio.writes_to(off + 4) != alloc::vec![e.hi] {
+                return TestResult::Fail("BUF_TRANS entry not written");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_load_buf_trans_writes_table
+    );
+
+    fn smoke_modeset_power_well_timeout() -> TestResult {
+        // No state bits ever assert: PG1 grant times out.
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        let fb = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 1024 * 4,
+            format: PixelFormat::Xrgb8888,
+        };
+        match ms.modeset(&fb, Some(&Mode::VESA_1024X768_60)) {
+            Err(ModesetError::PowerWellTimeout) => TestResult::Pass,
+            _ => TestResult::Fail("missing PG1 grant must surface as PowerWellTimeout"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_modeset_power_well_timeout
+    );
+
+    fn smoke_modeset_pll_lock_timeout() -> TestResult {
+        // Power wells grant; the PLL powers but never locks.
+        let mut mmio = FakeMmio::new();
+        mmio.set_read(
+            super::PWR_WELL_CTL2,
+            super::pwr_well_state(0) | super::pwr_well_state(1),
+        );
+        mmio.state_offset = super::DPLL0_ENABLE;
+        mmio.state_value = super::PLL_POWER_STATE;
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        let fb = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 1024 * 4,
+            format: PixelFormat::Xrgb8888,
+        };
+        match ms.modeset(&fb, Some(&Mode::VESA_1024X768_60)) {
+            Err(ModesetError::PllLockTimeout) => TestResult::Pass,
+            _ => TestResult::Fail("missing PLL lock must surface as PllLockTimeout"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_modeset_pll_lock_timeout
     );
 
     fn smoke_disable_pipeline_writes_disables_in_order() -> TestResult {

@@ -344,8 +344,150 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
     }
 }
 
-// Tests live in `crate::tests` and follow the `kernel_test_in!`
-// macro convention so they run on the actual kernel test harness
-// rather than `cargo test`. Smokes for the AUX transport (wire
-// packing + control-register composition with a mock MmioWindow)
-// live there.
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod tests {
+    //! AUX transport smokes (lane 1, #1010). Before this lane the
+    //! module header claimed these lived in `crate::tests`; they
+    //! did not exist anywhere. The mock below records writes and
+    //! serves scripted reads keyed by offset.
+
+    extern crate alloc;
+
+    use super::*;
+    use crate::dp_aux::{AuxCommand, AuxRequest, AuxStatus};
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    #[derive(Debug, Default)]
+    pub struct MockMmio {
+        pub writes: RefCell<Vec<(u64, u32)>>,
+        pub reads: RefCell<Vec<(u64, u32)>>,
+    }
+
+    impl MockMmio {
+        pub fn set_read(&self, off: u64, val: u32) {
+            self.reads.borrow_mut().push((off, val));
+        }
+        pub fn writes_to(&self, off: u64) -> Vec<u32> {
+            self.writes
+                .borrow()
+                .iter()
+                .filter(|(o, _)| *o == off)
+                .map(|(_, v)| *v)
+                .collect()
+        }
+    }
+
+    impl MmioWindow for MockMmio {
+        fn read32(&self, off: u64) -> u32 {
+            let mut v = 0u32;
+            for (o, val) in self.reads.borrow().iter() {
+                if *o == off {
+                    v = *val;
+                }
+            }
+            v
+        }
+        fn write32(&self, off: u64, val: u32) {
+            self.writes.borrow_mut().push((off, val));
+        }
+    }
+
+    fn ctl_off() -> u64 {
+        Ddi::A.base() + DDI_AUX_CTL_OFFSET
+    }
+
+    fn smoke_aux_wire_packing_is_big_endian() -> TestResult {
+        let mmio = MockMmio::default();
+        let aux = IntelAux::new(&mmio, Ddi::A);
+        aux.write_data(&[0x10, 0x00, 0xAB, 0xCD, 0x42]);
+        let d0 = mmio.writes_to(Ddi::A.base() + DDI_AUX_DATA_OFFSET);
+        let d1 = mmio.writes_to(Ddi::A.base() + DDI_AUX_DATA_OFFSET + 4);
+        if d0 != alloc::vec![0x1000_ABCD] {
+            return TestResult::Fail("first wire dword must pack bytes big-endian");
+        }
+        if d1 != alloc::vec![0x4200_0000] {
+            return TestResult::Fail("fifth byte must start DATA[1] in the high byte");
+        }
+        // Round-trip through read_data.
+        let mmio2 = MockMmio::default();
+        mmio2.set_read(Ddi::A.base() + DDI_AUX_DATA_OFFSET, 0x1000_ABCD);
+        mmio2.set_read(Ddi::A.base() + DDI_AUX_DATA_OFFSET + 4, 0x4200_0000);
+        let aux2 = IntelAux::new(&mmio2, Ddi::A);
+        let mut buf = [0u8; 5];
+        if aux2.read_data(5, &mut buf) != 5 || buf != [0x10, 0x00, 0xAB, 0xCD, 0x42] {
+            return TestResult::Fail("AUX data read-back round-trip failed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_aux", smoke_aux_wire_packing_is_big_endian);
+
+    fn smoke_aux_ctl_composition_and_success() -> TestResult {
+        let mmio = MockMmio::default();
+        // Reply: DONE set, SEND_BUSY clear, MSGSIZE = 1 (status byte only).
+        mmio.set_read(ctl_off(), AUX_CTL_DONE | (1 << AUX_CTL_MSGSIZE_SHIFT));
+        mmio.set_read(Ddi::A.base() + DDI_AUX_DATA_OFFSET, 0);
+        let mut aux = IntelAux::new(&mmio, Ddi::A);
+        let req = AuxRequest {
+            cmd: AuxCommand::NativeWrite,
+            address: 0x100,
+            data: &[0x55],
+        };
+        let mut reply = [0u8; 17];
+        match aux.transact(&req, &mut reply) {
+            Ok(resp) if resp.status == AuxStatus::Ack => {}
+            _ => return TestResult::Fail("native write with ACK status must succeed"),
+        }
+        // Exactly one SEND write, carrying SEND_BUSY + the wire
+        // length (4-byte header + 1 payload byte = 5) in MSGSIZE.
+        let sends: Vec<u32> = mmio
+            .writes_to(ctl_off())
+            .into_iter()
+            .filter(|w| w & AUX_CTL_SEND_BUSY != 0)
+            .collect();
+        if sends.len() != 1 {
+            return TestResult::Fail("expected exactly one SEND_BUSY write");
+        }
+        if (sends[0] & AUX_CTL_MSGSIZE_MASK) >> AUX_CTL_MSGSIZE_SHIFT != 5 {
+            return TestResult::Fail("MSGSIZE must carry the wire length");
+        }
+        if sends[0] & AUX_CTL_TIMEOUT_1600US != AUX_CTL_TIMEOUT_1600US {
+            return TestResult::Fail("CTL must select the 1600us timeout");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_aux", smoke_aux_ctl_composition_and_success);
+
+    fn smoke_aux_timeout_retries_exactly_three_times() -> TestResult {
+        let mmio = MockMmio::default();
+        // Every completion read reports TIMEOUT_ERROR (SEND_BUSY clear).
+        mmio.set_read(ctl_off(), AUX_CTL_DONE | AUX_CTL_TIMEOUT_ERROR);
+        let mut aux = IntelAux::new(&mmio, Ddi::A);
+        // For reads, `data` is a length placeholder: the frame
+        // carries the requested byte count, not contents.
+        let req = AuxRequest {
+            cmd: AuxCommand::NativeRead,
+            address: 0x000,
+            data: &[0u8; 1],
+        };
+        let mut reply = [0u8; 17];
+        match aux.transact(&req, &mut reply) {
+            Err(AuxError::ShortReply) => {}
+            _ => return TestResult::Fail("timeout error must surface as ShortReply"),
+        }
+        let sends = mmio
+            .writes_to(ctl_off())
+            .into_iter()
+            .filter(|w| w & AUX_CTL_SEND_BUSY != 0)
+            .count();
+        if sends != 3 {
+            return TestResult::Fail("HW retry budget must be exactly 3 attempts");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_aux",
+        smoke_aux_timeout_retries_exactly_three_times
+    );
+}

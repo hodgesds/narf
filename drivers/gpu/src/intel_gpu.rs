@@ -219,465 +219,90 @@ pub struct DeviceEntry {
 /// (v2.2) Intel graphics rows.
 pub const DEVICE_TABLE: &[DeviceEntry] = &[
     // Tiger Lake (Gen12 Xe-LP).
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A40",
-        did: TGL_9A40,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A49",
-        did: TGL_U_GT2_9A49,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A60",
-        did: TGL_H_GT1_9A60,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A68",
-        did: TGL_H_GT2_9A68,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A70",
-        did: TGL_H_GT2_9A70,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-tgl-9A78",
-        did: TGL_GT2_9A78,
-        generation: Generation::TigerLake,
-        asic: "tigerlake",
-    },
+    DeviceEntry { name: "intel-gpu-tgl-9A40", did: TGL_9A40, generation: Generation::TigerLake, asic: "tigerlake" },
+    DeviceEntry { name: "intel-gpu-tgl-9A49", did: TGL_U_GT2_9A49, generation: Generation::TigerLake, asic: "tigerlake" },
+    DeviceEntry { name: "intel-gpu-tgl-9A60", did: TGL_H_GT1_9A60, generation: Generation::TigerLake, asic: "tigerlake" },
+    DeviceEntry { name: "intel-gpu-tgl-9A68", did: TGL_H_GT2_9A68, generation: Generation::TigerLake, asic: "tigerlake" },
+    DeviceEntry { name: "intel-gpu-tgl-9A70", did: TGL_H_GT2_9A70, generation: Generation::TigerLake, asic: "tigerlake" },
+    DeviceEntry { name: "intel-gpu-tgl-9A78", did: TGL_GT2_9A78, generation: Generation::TigerLake, asic: "tigerlake" },
     // Alder Lake-P.
-    DeviceEntry {
-        name: "intel-gpu-adl-4626",
-        did: ADL_P_4626,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4628",
-        did: ADL_P_4628,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-462A",
-        did: ADL_P_462A,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4636",
-        did: ADL_P_4636,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4638",
-        did: ADL_P_4638,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-463A",
-        did: ADL_P_463A,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A0",
-        did: ADL_P_46A0,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A1",
-        did: ADL_P_46A1,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A3",
-        did: ADL_P_46A3,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A6",
-        did: ADL_P_46A6,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46A8",
-        did: ADL_P_46A8,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46AA",
-        did: ADL_P_46AA,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46B6",
-        did: ADL_P_46B6,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46B8",
-        did: ADL_P_46B8,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46BA",
-        did: ADL_P_46BA,
-        generation: Generation::AlderLake,
-        asic: "alderlake-p",
-    },
+    DeviceEntry { name: "intel-gpu-adl-4626", did: ADL_P_4626, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-4628", did: ADL_P_4628, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-462A", did: ADL_P_462A, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-4636", did: ADL_P_4636, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-4638", did: ADL_P_4638, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-463A", did: ADL_P_463A, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-46A0", did: ADL_P_46A0, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-46A1", did: ADL_P_46A1, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-46A3", did: ADL_P_46A3, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-46A6", did: ADL_P_46A6, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-46A8", did: ADL_P_46A8, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-46AA", did: ADL_P_46AA, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-46B6", did: ADL_P_46B6, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-46B8", did: ADL_P_46B8, generation: Generation::AlderLake, asic: "alderlake-p" },
+    DeviceEntry { name: "intel-gpu-adl-46BA", did: ADL_P_46BA, generation: Generation::AlderLake, asic: "alderlake-p" },
     // Raptor Lake-P (IDs the tree has always classified here).
-    DeviceEntry {
-        name: "intel-gpu-rpl-46B0",
-        did: RPL_P_46B0,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-46B1",
-        did: RPL_P_46B1,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-46B3",
-        did: RPL_P_46B3,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
+    DeviceEntry { name: "intel-gpu-rpl-46B0", did: RPL_P_46B0, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-46B1", did: RPL_P_46B1, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-46B3", did: RPL_P_46B3, generation: Generation::AlderLake, asic: "raptorlake-p" },
     // Alder Lake-M.
-    DeviceEntry {
-        name: "intel-gpu-adl-46C0",
-        did: ADL_M_46C0,
-        generation: Generation::AlderLake,
-        asic: "alderlake-m",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46C1",
-        did: ADL_M_46C1,
-        generation: Generation::AlderLake,
-        asic: "alderlake-m",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46C3",
-        did: ADL_M_46C3,
-        generation: Generation::AlderLake,
-        asic: "alderlake-m",
-    },
+    DeviceEntry { name: "intel-gpu-adl-46C0", did: ADL_M_46C0, generation: Generation::AlderLake, asic: "alderlake-m" },
+    DeviceEntry { name: "intel-gpu-adl-46C1", did: ADL_M_46C1, generation: Generation::AlderLake, asic: "alderlake-m" },
+    DeviceEntry { name: "intel-gpu-adl-46C3", did: ADL_M_46C3, generation: Generation::AlderLake, asic: "alderlake-m" },
     // Alder Lake-N.
-    DeviceEntry {
-        name: "intel-gpu-adl-46D0",
-        did: ADL_N_46D0,
-        generation: Generation::AlderLake,
-        asic: "alderlake-n",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46D1",
-        did: ADL_N_46D1,
-        generation: Generation::AlderLake,
-        asic: "alderlake-n",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46D2",
-        did: ADL_N_46D2,
-        generation: Generation::AlderLake,
-        asic: "alderlake-n",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46D3",
-        did: ADL_N_46D3,
-        generation: Generation::AlderLake,
-        asic: "alderlake-n",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-46D4",
-        did: ADL_N_46D4,
-        generation: Generation::AlderLake,
-        asic: "alderlake-n",
-    },
+    DeviceEntry { name: "intel-gpu-adl-46D0", did: ADL_N_46D0, generation: Generation::AlderLake, asic: "alderlake-n" },
+    DeviceEntry { name: "intel-gpu-adl-46D1", did: ADL_N_46D1, generation: Generation::AlderLake, asic: "alderlake-n" },
+    DeviceEntry { name: "intel-gpu-adl-46D2", did: ADL_N_46D2, generation: Generation::AlderLake, asic: "alderlake-n" },
+    DeviceEntry { name: "intel-gpu-adl-46D3", did: ADL_N_46D3, generation: Generation::AlderLake, asic: "alderlake-n" },
+    DeviceEntry { name: "intel-gpu-adl-46D4", did: ADL_N_46D4, generation: Generation::AlderLake, asic: "alderlake-n" },
     // Alder Lake-S.
-    DeviceEntry {
-        name: "intel-gpu-adl-4680",
-        did: ADL_S_4680,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4682",
-        did: ADL_S_4682,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4688",
-        did: ADL_S_4688,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-468A",
-        did: ADL_S_468A,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-468B",
-        did: ADL_S_468B,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4690",
-        did: ADL_S_4690,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4692",
-        did: ADL_S_4692,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-adl-4693",
-        did: ADL_S_4693,
-        generation: Generation::AlderLake,
-        asic: "alderlake-s",
-    },
+    DeviceEntry { name: "intel-gpu-adl-4680", did: ADL_S_4680, generation: Generation::AlderLake, asic: "alderlake-s" },
+    DeviceEntry { name: "intel-gpu-adl-4682", did: ADL_S_4682, generation: Generation::AlderLake, asic: "alderlake-s" },
+    DeviceEntry { name: "intel-gpu-adl-4688", did: ADL_S_4688, generation: Generation::AlderLake, asic: "alderlake-s" },
+    DeviceEntry { name: "intel-gpu-adl-468A", did: ADL_S_468A, generation: Generation::AlderLake, asic: "alderlake-s" },
+    DeviceEntry { name: "intel-gpu-adl-468B", did: ADL_S_468B, generation: Generation::AlderLake, asic: "alderlake-s" },
+    DeviceEntry { name: "intel-gpu-adl-4690", did: ADL_S_4690, generation: Generation::AlderLake, asic: "alderlake-s" },
+    DeviceEntry { name: "intel-gpu-adl-4692", did: ADL_S_4692, generation: Generation::AlderLake, asic: "alderlake-s" },
+    DeviceEntry { name: "intel-gpu-adl-4693", did: ADL_S_4693, generation: Generation::AlderLake, asic: "alderlake-s" },
     // Raptor Lake-S.
-    DeviceEntry {
-        name: "intel-gpu-rpl-A780",
-        did: RPL_S_A780,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A781",
-        did: RPL_S_A781,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A782",
-        did: RPL_S_A782,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A783",
-        did: RPL_S_A783,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A788",
-        did: RPL_S_A788,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A789",
-        did: RPL_S_A789,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A78A",
-        did: RPL_S_A78A,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A78B",
-        did: RPL_S_A78B,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-s",
-    },
+    DeviceEntry { name: "intel-gpu-rpl-A780", did: RPL_S_A780, generation: Generation::AlderLake, asic: "raptorlake-s" },
+    DeviceEntry { name: "intel-gpu-rpl-A781", did: RPL_S_A781, generation: Generation::AlderLake, asic: "raptorlake-s" },
+    DeviceEntry { name: "intel-gpu-rpl-A782", did: RPL_S_A782, generation: Generation::AlderLake, asic: "raptorlake-s" },
+    DeviceEntry { name: "intel-gpu-rpl-A783", did: RPL_S_A783, generation: Generation::AlderLake, asic: "raptorlake-s" },
+    DeviceEntry { name: "intel-gpu-rpl-A788", did: RPL_S_A788, generation: Generation::AlderLake, asic: "raptorlake-s" },
+    DeviceEntry { name: "intel-gpu-rpl-A789", did: RPL_S_A789, generation: Generation::AlderLake, asic: "raptorlake-s" },
+    DeviceEntry { name: "intel-gpu-rpl-A78A", did: RPL_S_A78A, generation: Generation::AlderLake, asic: "raptorlake-s" },
+    DeviceEntry { name: "intel-gpu-rpl-A78B", did: RPL_S_A78B, generation: Generation::AlderLake, asic: "raptorlake-s" },
     // Raptor Lake-P / -U.
-    DeviceEntry {
-        name: "intel-gpu-rpl-A720",
-        did: RPL_P_A720,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A721",
-        did: RPL_P_A721,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7A0",
-        did: RPL_P_A7A0,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7A1",
-        did: RPL_P_A7A1,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7A8",
-        did: RPL_P_A7A8,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7A9",
-        did: RPL_P_A7A9,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7AA",
-        did: RPL_P_A7AA,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7AB",
-        did: RPL_P_A7AB,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7AC",
-        did: RPL_P_A7AC,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
-    DeviceEntry {
-        name: "intel-gpu-rpl-A7AD",
-        did: RPL_P_A7AD,
-        generation: Generation::AlderLake,
-        asic: "raptorlake-p",
-    },
+    DeviceEntry { name: "intel-gpu-rpl-A720", did: RPL_P_A720, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-A721", did: RPL_P_A721, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-A7A0", did: RPL_P_A7A0, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-A7A1", did: RPL_P_A7A1, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-A7A8", did: RPL_P_A7A8, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-A7A9", did: RPL_P_A7A9, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-A7AA", did: RPL_P_A7AA, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-A7AB", did: RPL_P_A7AB, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-A7AC", did: RPL_P_A7AC, generation: Generation::AlderLake, asic: "raptorlake-p" },
+    DeviceEntry { name: "intel-gpu-rpl-A7AD", did: RPL_P_A7AD, generation: Generation::AlderLake, asic: "raptorlake-p" },
     // Meteor Lake (Xe-LPG) — identify + announce only in this lane.
-    DeviceEntry {
-        name: "intel-gpu-mtl-7D40",
-        did: MTL_7D40,
-        generation: Generation::MeteorLake,
-        asic: "meteorlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-mtl-7D45",
-        did: MTL_7D45,
-        generation: Generation::MeteorLake,
-        asic: "meteorlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-mtl-7D55",
-        did: MTL_7D55,
-        generation: Generation::MeteorLake,
-        asic: "meteorlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-mtl-7D60",
-        did: MTL_7D60,
-        generation: Generation::MeteorLake,
-        asic: "meteorlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-mtl-7DD5",
-        did: MTL_7DD5,
-        generation: Generation::MeteorLake,
-        asic: "meteorlake",
-    },
+    DeviceEntry { name: "intel-gpu-mtl-7D40", did: MTL_7D40, generation: Generation::MeteorLake, asic: "meteorlake" },
+    DeviceEntry { name: "intel-gpu-mtl-7D45", did: MTL_7D45, generation: Generation::MeteorLake, asic: "meteorlake" },
+    DeviceEntry { name: "intel-gpu-mtl-7D55", did: MTL_7D55, generation: Generation::MeteorLake, asic: "meteorlake" },
+    DeviceEntry { name: "intel-gpu-mtl-7D60", did: MTL_7D60, generation: Generation::MeteorLake, asic: "meteorlake" },
+    DeviceEntry { name: "intel-gpu-mtl-7DD5", did: MTL_7DD5, generation: Generation::MeteorLake, asic: "meteorlake" },
     // Panther Lake (Xe3-LPG) — identify + announce only in this lane.
-    DeviceEntry {
-        name: "intel-gpu-ptl-B080",
-        did: PTL_B080,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B081",
-        did: PTL_B081,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B082",
-        did: PTL_B082,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B083",
-        did: PTL_B083,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B084",
-        did: PTL_B084,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B085",
-        did: PTL_B085,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B086",
-        did: PTL_B086,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B087",
-        did: PTL_B087,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B08F",
-        did: PTL_B08F,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B090",
-        did: PTL_B090,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B0A0",
-        did: PTL_B0A0,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
-    DeviceEntry {
-        name: "intel-gpu-ptl-B0B0",
-        did: PTL_B0B0,
-        generation: Generation::PantherLake,
-        asic: "pantherlake",
-    },
+    DeviceEntry { name: "intel-gpu-ptl-B080", did: PTL_B080, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B081", did: PTL_B081, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B082", did: PTL_B082, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B083", did: PTL_B083, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B084", did: PTL_B084, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B085", did: PTL_B085, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B086", did: PTL_B086, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B087", did: PTL_B087, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B08F", did: PTL_B08F, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B090", did: PTL_B090, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B0A0", did: PTL_B0A0, generation: Generation::PantherLake, asic: "pantherlake" },
+    DeviceEntry { name: "intel-gpu-ptl-B0B0", did: PTL_B0B0, generation: Generation::PantherLake, asic: "pantherlake" },
 ];
 
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
@@ -890,9 +515,7 @@ fn log_probe(msg: &str, device: &BusDevice) {
     let _ = writeln!(
         narf_console::Writer,
         "intel-gpu: {} (PCI {:04x}:{:04x})",
-        msg,
-        device.id.vendor,
-        device.id.device,
+        msg, device.id.vendor, device.id.device,
     );
 }
 
@@ -917,10 +540,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Err(IntelGpuError::UnknownAsic) => {
             // Announced, not silent: an Intel DID outside the
             // table is a coverage gap, not broken silicon.
-            log_probe(
-                "unsupported Intel ASIC — device id not in the driver table",
-                &device,
-            );
+            log_probe("unsupported Intel ASIC — device id not in the driver table", &device);
             return Err(narf_bus::ProbeError::NotForThisDriver);
         }
         Err(e) => {
@@ -928,9 +548,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             let _ = writeln!(
                 narf_console::Writer,
                 "intel-gpu: bring-up failed: {:?} (PCI {:04x}:{:04x})",
-                e,
-                device.id.vendor,
-                device.id.device,
+                e, device.id.vendor, device.id.device,
             );
             return Err(narf_bus::ProbeError::BadDevice);
         }
@@ -1053,11 +671,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
     }
 
+    let scanout_mode = dev.current_mode();
     *CONTROLLER.lock() = Some(dev);
 
-    // Register with drm_registry (identity card; the KMS mode
-    // state is attached by the lane-1 publication step when a
-    // scanout exists).
+    // Register with drm_registry. With a live scanout the card
+    // carries real KMS mode state (CRTC 1 + mode, encoder 2,
+    // eDP connector 3 — the virtio/bochs pattern in lib.rs) and
+    // the scanout is published to the framebuffer console;
+    // without one (MTL/PTL gate, allocation failure) the card
+    // stays identity-only, as before lane 1.
     let drm_count = crate::drm_registry::count() as u32;
     let card_name = alloc::format!("card{}", drm_count);
     let intel_card = crate::drm_devfs_bridge::IntelGpuCard::new(
@@ -1067,7 +689,58 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         device.id.subsystem_vendor,
         device.id.subsystem_id,
     );
-    crate::drm_registry::register_drm_card(alloc::sync::Arc::new(intel_card));
+    match scanout_mode {
+        Some(mode) => {
+            use crate::drm::card::{
+                Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
+            };
+            let kms_mode = crate::Mode {
+                width: mode.width,
+                height: mode.height,
+                refresh_hz: 60,
+                bpp: 32,
+            };
+            let mut kms = Card::new("intel-gpu", "NARF Intel iGPU driver", (1, 0, 0));
+            kms.crtcs.push(Crtc {
+                id: 1,
+                mode: Some(kms_mode),
+                enabled: true,
+                primary_fb: None,
+                x: 0,
+                y: 0,
+            });
+            kms.encoders.push(Encoder {
+                id: 2,
+                // i915 reports DP encoders as TMDS to userspace.
+                encoder_type: EncoderType::Tmds,
+                possible_crtcs: 0x1,
+                possible_clones: 0,
+                crtc_id: Some(1),
+            });
+            kms.connectors.push(Connector {
+                id: 3,
+                connector_type: ConnectorType::Edp,
+                connector_type_id: 1,
+                status: ConnectorStatus::Connected,
+                encoder_id: Some(2),
+                modes: alloc::vec![kms_mode],
+            });
+            crate::drm_registry::register_drm_card_with_state(
+                alloc::sync::Arc::new(intel_card),
+                kms,
+            );
+            publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
+                mode.phys_base,
+                mode.width,
+                mode.height,
+                mode.stride_bytes,
+                32,
+            )));
+        }
+        None => {
+            crate::drm_registry::register_drm_card(alloc::sync::Arc::new(intel_card));
+        }
+    }
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("intel-gpu"),
@@ -1105,6 +778,50 @@ pub fn register_pci_driver() {
     });
 }
 
+// ── Framebuffer-console publication (lane 1, #1010 item 4) ──────
+//
+// Mirrors the AMD publication protocol in `amdgpu_dcn_display`:
+// an ACTIVE slot plus a single observer fn pointer, so the fb
+// crate (which depends on this crate, not the reverse) can
+// follow the Intel scanout exactly the way it follows AMD's.
+// Publishing records ACTIVE first; an observer installed late
+// is told the current value immediately, so install order
+// between probe (Stage::Device) and the fb initcall
+// (Stage::Late) does not matter.
+
+/// Told when the active Intel scanout appears or goes away.
+pub type ScanoutObserver = fn(Option<narf_graphics_driver::generic::GenericFb>);
+static ACTIVE_GENERIC: IrqSafeSpinLock<Option<narf_graphics_driver::generic::GenericFb>> =
+    IrqSafeSpinLock::new(None);
+static SCANOUT_OBSERVER: IrqSafeSpinLock<Option<ScanoutObserver>> = IrqSafeSpinLock::new(None);
+
+/// The Intel scanout currently published to the fb console.
+pub fn active_scanout_generic() -> Option<narf_graphics_driver::generic::GenericFb> {
+    *ACTIVE_GENERIC.lock()
+}
+
+/// Install the fb-console observer. Called once during
+/// Stage::Late; a scanout that already exists is replayed
+/// immediately so the edge cannot be missed.
+pub fn register_scanout_observer(observer: ScanoutObserver) {
+    *SCANOUT_OBSERVER.lock() = Some(observer);
+    let current = *ACTIVE_GENERIC.lock();
+    if current.is_some() {
+        observer(current);
+    }
+}
+
+/// Publish (or withdraw) the Intel scanout. Locks are released
+/// before the observer runs, so an observer that reads
+/// `active_scanout_generic` cannot deadlock against this.
+fn publish_scanout(scanout: Option<narf_graphics_driver::generic::GenericFb>) {
+    *ACTIVE_GENERIC.lock() = scanout;
+    let observer = *SCANOUT_OBSERVER.lock();
+    if let Some(observer) = observer {
+        observer(scanout);
+    }
+}
+
 pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
@@ -1126,81 +843,33 @@ pub mod tests {
     fn smoke_device_table_census() -> TestResult {
         // (did, asic) — transcribed from drivers/gpu/specification/intel_gpu.md §5.
         const EXPECTED: &[(u16, &str)] = &[
-            (0x9A40, "tigerlake"),
-            (0x9A49, "tigerlake"),
-            (0x9A60, "tigerlake"),
-            (0x9A68, "tigerlake"),
-            (0x9A70, "tigerlake"),
-            (0x9A78, "tigerlake"),
-            (0x4626, "alderlake-p"),
-            (0x4628, "alderlake-p"),
-            (0x462A, "alderlake-p"),
-            (0x4636, "alderlake-p"),
-            (0x4638, "alderlake-p"),
-            (0x463A, "alderlake-p"),
-            (0x46A0, "alderlake-p"),
-            (0x46A1, "alderlake-p"),
-            (0x46A3, "alderlake-p"),
-            (0x46A6, "alderlake-p"),
-            (0x46A8, "alderlake-p"),
-            (0x46AA, "alderlake-p"),
-            (0x46B6, "alderlake-p"),
-            (0x46B8, "alderlake-p"),
-            (0x46BA, "alderlake-p"),
-            (0x46B0, "raptorlake-p"),
-            (0x46B1, "raptorlake-p"),
-            (0x46B3, "raptorlake-p"),
-            (0x46C0, "alderlake-m"),
-            (0x46C1, "alderlake-m"),
-            (0x46C3, "alderlake-m"),
-            (0x46D0, "alderlake-n"),
-            (0x46D1, "alderlake-n"),
-            (0x46D2, "alderlake-n"),
-            (0x46D3, "alderlake-n"),
-            (0x46D4, "alderlake-n"),
-            (0x4680, "alderlake-s"),
-            (0x4682, "alderlake-s"),
-            (0x4688, "alderlake-s"),
-            (0x468A, "alderlake-s"),
-            (0x468B, "alderlake-s"),
-            (0x4690, "alderlake-s"),
-            (0x4692, "alderlake-s"),
-            (0x4693, "alderlake-s"),
-            (0xA780, "raptorlake-s"),
-            (0xA781, "raptorlake-s"),
-            (0xA782, "raptorlake-s"),
-            (0xA783, "raptorlake-s"),
-            (0xA788, "raptorlake-s"),
-            (0xA789, "raptorlake-s"),
-            (0xA78A, "raptorlake-s"),
-            (0xA78B, "raptorlake-s"),
-            (0xA720, "raptorlake-p"),
-            (0xA721, "raptorlake-p"),
-            (0xA7A0, "raptorlake-p"),
-            (0xA7A1, "raptorlake-p"),
-            (0xA7A8, "raptorlake-p"),
-            (0xA7A9, "raptorlake-p"),
-            (0xA7AA, "raptorlake-p"),
-            (0xA7AB, "raptorlake-p"),
-            (0xA7AC, "raptorlake-p"),
+            (0x9A40, "tigerlake"), (0x9A49, "tigerlake"), (0x9A60, "tigerlake"),
+            (0x9A68, "tigerlake"), (0x9A70, "tigerlake"), (0x9A78, "tigerlake"),
+            (0x4626, "alderlake-p"), (0x4628, "alderlake-p"), (0x462A, "alderlake-p"),
+            (0x4636, "alderlake-p"), (0x4638, "alderlake-p"), (0x463A, "alderlake-p"),
+            (0x46A0, "alderlake-p"), (0x46A1, "alderlake-p"), (0x46A3, "alderlake-p"),
+            (0x46A6, "alderlake-p"), (0x46A8, "alderlake-p"), (0x46AA, "alderlake-p"),
+            (0x46B6, "alderlake-p"), (0x46B8, "alderlake-p"), (0x46BA, "alderlake-p"),
+            (0x46B0, "raptorlake-p"), (0x46B1, "raptorlake-p"), (0x46B3, "raptorlake-p"),
+            (0x46C0, "alderlake-m"), (0x46C1, "alderlake-m"), (0x46C3, "alderlake-m"),
+            (0x46D0, "alderlake-n"), (0x46D1, "alderlake-n"), (0x46D2, "alderlake-n"),
+            (0x46D3, "alderlake-n"), (0x46D4, "alderlake-n"),
+            (0x4680, "alderlake-s"), (0x4682, "alderlake-s"), (0x4688, "alderlake-s"),
+            (0x468A, "alderlake-s"), (0x468B, "alderlake-s"), (0x4690, "alderlake-s"),
+            (0x4692, "alderlake-s"), (0x4693, "alderlake-s"),
+            (0xA780, "raptorlake-s"), (0xA781, "raptorlake-s"), (0xA782, "raptorlake-s"),
+            (0xA783, "raptorlake-s"), (0xA788, "raptorlake-s"), (0xA789, "raptorlake-s"),
+            (0xA78A, "raptorlake-s"), (0xA78B, "raptorlake-s"),
+            (0xA720, "raptorlake-p"), (0xA721, "raptorlake-p"), (0xA7A0, "raptorlake-p"),
+            (0xA7A1, "raptorlake-p"), (0xA7A8, "raptorlake-p"), (0xA7A9, "raptorlake-p"),
+            (0xA7AA, "raptorlake-p"), (0xA7AB, "raptorlake-p"), (0xA7AC, "raptorlake-p"),
             (0xA7AD, "raptorlake-p"),
-            (0x7D40, "meteorlake"),
-            (0x7D45, "meteorlake"),
-            (0x7D55, "meteorlake"),
-            (0x7D60, "meteorlake"),
-            (0x7DD5, "meteorlake"),
-            (0xB080, "pantherlake"),
-            (0xB081, "pantherlake"),
-            (0xB082, "pantherlake"),
-            (0xB083, "pantherlake"),
-            (0xB084, "pantherlake"),
-            (0xB085, "pantherlake"),
-            (0xB086, "pantherlake"),
-            (0xB087, "pantherlake"),
-            (0xB08F, "pantherlake"),
-            (0xB090, "pantherlake"),
-            (0xB0A0, "pantherlake"),
-            (0xB0B0, "pantherlake"),
+            (0x7D40, "meteorlake"), (0x7D45, "meteorlake"), (0x7D55, "meteorlake"),
+            (0x7D60, "meteorlake"), (0x7DD5, "meteorlake"),
+            (0xB080, "pantherlake"), (0xB081, "pantherlake"), (0xB082, "pantherlake"),
+            (0xB083, "pantherlake"), (0xB084, "pantherlake"), (0xB085, "pantherlake"),
+            (0xB086, "pantherlake"), (0xB087, "pantherlake"), (0xB08F, "pantherlake"),
+            (0xB090, "pantherlake"), (0xB0A0, "pantherlake"), (0xB0B0, "pantherlake"),
         ];
         if DEVICE_TABLE.len() != EXPECTED.len() {
             return TestResult::Fail("device table size drifted from the spec §5 census");
@@ -1262,20 +931,13 @@ pub mod tests {
             return TestResult::Fail("scanout size must use the padded stride");
         }
         match crate::intel_gpu_pipes::build_primary_plane(
-            1366,
-            768,
-            1366 * 4,
-            0x10_0000,
-            crate::intel_gpu_pipes::PixelFormat::Argb8888,
+            1366, 768, 1366 * 4, 0x10_0000, crate::intel_gpu_pipes::PixelFormat::Argb8888,
         ) {
             Err(crate::intel_gpu_pipes::PipeError::BadStride) => {}
             _ => return TestResult::Fail("unpadded 1366 stride must be rejected"),
         }
         if crate::intel_gpu_pipes::build_primary_plane(
-            1366,
-            768,
-            padded_stride_bytes(1366),
-            0x10_0000,
+            1366, 768, padded_stride_bytes(1366), 0x10_0000,
             crate::intel_gpu_pipes::PixelFormat::Argb8888,
         )
         .is_err()
@@ -1287,12 +949,10 @@ pub mod tests {
     kernel_test_in!("drivers/gpu/intel_gpu", smoke_probe_stride_1366_regression);
 
     fn smoke_display_gate_is_gen12_only() -> TestResult {
-        if !Generation::TigerLake.display_supported() || !Generation::AlderLake.display_supported()
-        {
+        if !Generation::TigerLake.display_supported() || !Generation::AlderLake.display_supported() {
             return TestResult::Fail("Gen12 generations must allow display programming");
         }
-        if Generation::MeteorLake.display_supported() || Generation::PantherLake.display_supported()
-        {
+        if Generation::MeteorLake.display_supported() || Generation::PantherLake.display_supported() {
             return TestResult::Fail("MTL/PTL must skip display programming in this lane");
         }
         TestResult::Pass
