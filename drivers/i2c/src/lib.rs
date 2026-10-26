@@ -24,11 +24,15 @@
 extern crate alloc;
 
 pub mod amd_fch;
+pub mod dw;
 pub mod gsb;
 pub mod i801;
 pub mod lpss;
 pub mod piix4;
 pub mod registry;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod dw_model;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;

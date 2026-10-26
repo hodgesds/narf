@@ -52,6 +52,7 @@ use narf_aml::resource::ResourceItem;
 use narf_lib::mutex::Mutex as AsyncMutex;
 use narf_memory::PhysAddr;
 
+use crate::dw::{DwRegs, MmioDwRegs};
 use crate::{I2cBus, I2cError, I2cOp};
 
 // ── ACPI HIDs we recognise ─────────────────────────────────────────
@@ -147,10 +148,16 @@ const TRANSFER_TIMEOUT_POLLS: u32 = 100_000;
 /// One AMD FCH I2C controller. The MMIO region + IRQ vector are
 /// owned by this struct for the lifetime of the registry entry; the
 /// internal mutex serialises concurrent `transfer()` callers.
-pub struct AmdFchI2c {
+///
+/// Generic over the register backend `R` (the `DwRegs` seam in
+/// `crate::dw`): production uses `MmioDwRegs`; fixtures plug the
+/// behavioural DW model so the transfer state machine can run
+/// end-to-end without silicon (#1029).
+pub struct AmdFchI2c<R = MmioDwRegs> {
     name: String,
     mmio_base: PhysAddr,
     mmio_len: u64,
+    regs: R,
     /// `Some(v)` means an IDT vector + handler is installed and the
     /// transfer state machine awaits on `wait_for_irq(v)`. `None`
     /// means we couldn't allocate a vector or route the GSI; the
@@ -175,7 +182,7 @@ pub struct AmdFchI2c {
     last_target: AtomicU8,
 }
 
-impl core::fmt::Debug for AmdFchI2c {
+impl<R> core::fmt::Debug for AmdFchI2c<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AmdFchI2c")
             .field("name", &self.name)
@@ -187,15 +194,40 @@ impl core::fmt::Debug for AmdFchI2c {
     }
 }
 
-impl AmdFchI2c {
+impl AmdFchI2c<MmioDwRegs> {
     /// Construct a controller against an already-decoded MMIO region
     /// + IRQ vector. Used both by `probe_all` (real discovery) and by
     ///   the smoke tests (synthetic backing buffer instead of MMIO).
     pub fn new(name: String, mmio_base: PhysAddr, mmio_len: u64, irq_vector: Option<u8>) -> Self {
+        Self::with_regs(
+            name,
+            mmio_base,
+            mmio_len,
+            irq_vector,
+            MmioDwRegs::new(mmio_base),
+        )
+    }
+}
+
+impl<R: DwRegs> AmdFchI2c<R> {
+    /// Construct a controller over a caller-supplied register
+    /// backend. This is the fixture seam (#1029): production goes
+    /// through [`AmdFchI2c::new`], which builds the `MmioDwRegs`
+    /// backend; smokes pass the behavioural DW model instead.
+    /// `mmio_base` is retained for diagnostics + bounds assertions;
+    /// all register traffic goes through `regs`.
+    pub fn with_regs(
+        name: String,
+        mmio_base: PhysAddr,
+        mmio_len: u64,
+        irq_vector: Option<u8>,
+        regs: R,
+    ) -> Self {
         Self {
             name,
             mmio_base,
             mmio_len,
+            regs,
             irq_vector,
             bus: AsyncMutex::new(()),
             enabled: AtomicBool::new(false),
@@ -207,16 +239,16 @@ impl AmdFchI2c {
     unsafe fn read32(&self, off: u64) -> u32 {
         debug_assert!(off + 4 <= self.mmio_len);
         // SAFETY: caller holds bus lock or this is a single-thread
-        // probe path; offset bounds-checked above.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { narf_arch::mmio::read32(self.mmio_base.raw() + off) }
+        // probe path; offset bounds-checked above, and the backend
+        // upholds the DwRegs contract for the window.
+        unsafe { self.regs.read32(off) }
     }
 
     #[inline]
     unsafe fn write32(&self, off: u64, val: u32) {
         debug_assert!(off + 4 <= self.mmio_len);
         // SAFETY: same.
-        unsafe { narf_arch::mmio::write32(self.mmio_base.raw() + off, val) }
+        unsafe { self.regs.write32(off, val) }
     }
 
     /// Read IC_COMP_TYPE and confirm we're talking to a DW I2C IP.
@@ -332,7 +364,7 @@ impl AmdFchI2c {
 }
 
 #[async_trait]
-impl I2cBus for AmdFchI2c {
+impl<R: DwRegs> I2cBus for AmdFchI2c<R> {
     async fn transfer(&self, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
         if !self.enabled.load(Ordering::Acquire) {
             return Err(I2cError::BadHardware);
