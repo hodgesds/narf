@@ -49,6 +49,9 @@ extern crate alloc;
 
 pub mod amd_fch;
 pub mod cadence;
+/// Devicetree bindings (PL022 + Cadence) and the DT child-device
+/// registry — DT programme step 5.
+pub mod dt;
 pub mod intel_lpss;
 /// Intel PCH SPI *flash* controller — the BIOS-flash hardware
 /// sequencer at `00:1f.5`, distinct from the LPSS SSP masters above.
@@ -237,6 +240,10 @@ pub mod registry {
 /// the other.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // DT match-table registration (DT programme step 5): a plain
+    // bus-registry call at composition time, NOT an initcall —
+    // the desktop `all` census gains no initcalls.
+    dt::register_dt_drivers();
     narf_init::register(Stage::Device, "amd-fch-spi", || {
         let n = amd_fch::probe_all();
         if n == 0 {

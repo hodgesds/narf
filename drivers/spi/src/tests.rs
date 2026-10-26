@@ -514,3 +514,267 @@ kernel_test_in!(
     "drivers/spi/intel_spi_flash",
     smoke_intel_spi_flash_protected_range_decode
 );
+
+// ── DT bindings (DT programme step 5) ────────────────────────────
+
+use crate::cadence::{divisor_for as cdns_divisor_for, CadenceSpi};
+use crate::pl022::{divisor_for as pl022_divisor_for, Pl022Spi};
+
+fn fake_mapping(phys: PhysAddr) -> narf_memory::ioremap::IoMapping {
+    narf_memory::ioremap::IoMapping {
+        phys: phys.raw(),
+        virt: phys.raw(),
+        len: SYNTHETIC_MMIO_BYTES as u64,
+        offset: 0,
+    }
+}
+
+fn smoke_pl022_divisor_math() -> TestResult {
+    // Exact division: 24 MHz SSPCLK -> 1 MHz is CPSDVSR 2, SCR 11
+    // (2 x 12 = 24).
+    if pl022_divisor_for(24_000_000, 1_000_000) != Some((2, 11)) {
+        return TestResult::Fail("PL022 divisor for 24 MHz -> 1 MHz is not (2, 11)");
+    }
+    // Fastest possible: SSPCLK/2.
+    if pl022_divisor_for(24_000_000, 12_000_000) != Some((2, 0)) {
+        return TestResult::Fail("PL022 divisor for max rate is not (2, 0)");
+    }
+    // Above max, below min (24 MHz / (254*256) = 369 Hz), zero.
+    if pl022_divisor_for(24_000_000, 12_000_001).is_some()
+        || pl022_divisor_for(24_000_000, 300).is_some()
+        || pl022_divisor_for(0, 1_000).is_some()
+        || pl022_divisor_for(24_000_000, 0).is_some()
+    {
+        return TestResult::Fail("PL022 divisor accepted an out-of-range request");
+    }
+    // Inexact: the result must be the highest SCK <= target.
+    let Some((cps, scr)) = pl022_divisor_for(24_000_000, 7_000_000) else {
+        return TestResult::Fail("PL022 divisor found nothing for 7 MHz");
+    };
+    let actual = 24_000_000 / (cps as u32 * (1 + scr as u32));
+    if actual > 7_000_000 || actual < 6_000_000 {
+        return TestResult::Fail("PL022 divisor is not the closest rate at or below target");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-spi", smoke_pl022_divisor_math);
+
+fn smoke_pl022_set_freq_and_mode_program_registers() -> TestResult {
+    let (phys, _len) = make_mmio();
+    // SAFETY: leaked RAM window outlives the controller.
+    let spi =
+        unsafe { Pl022Spi::new_mapped("pl022-test".to_string(), fake_mapping(phys), 24_000_000) };
+    if spi.set_freq(1_000_000).is_err() {
+        return TestResult::Fail("PL022 set_freq refused an in-range rate");
+    }
+    // SAFETY: the leaked window is ours; register offsets are the
+    // PL022 map.
+    let (cpsr, cr0) = unsafe {
+        (
+            core::ptr::read_volatile((phys.raw() + 0x10) as *const u32),
+            core::ptr::read_volatile((phys.raw()) as *const u32),
+        )
+    };
+    if cpsr != 2 || (cr0 >> 8) & 0xFF != 11 {
+        return TestResult::Fail("PL022 set_freq did not program CPSR/SCR (2, 11)");
+    }
+    if spi.set_freq(99_000_000) != Err(SpiError::FrequencyOutOfRange) {
+        return TestResult::Fail("PL022 set_freq accepted an out-of-range rate");
+    }
+    if spi.set_mode(SpiMode::Mode3).is_err() {
+        return TestResult::Fail("PL022 set_mode(Mode3) failed");
+    }
+    // SAFETY: same window.
+    let cr0 = unsafe { core::ptr::read_volatile((phys.raw()) as *const u32) };
+    if cr0 & (1 << 6) == 0 || cr0 & (1 << 7) == 0 {
+        return TestResult::Fail("PL022 Mode3 did not set SPO+SPH in CR0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers-spi",
+    smoke_pl022_set_freq_and_mode_program_registers
+);
+
+fn smoke_cadence_divisor_and_set_freq() -> TestResult {
+    if cdns_divisor_for(100_000_000, 10_000_000) != Some(2)
+        || cdns_divisor_for(100_000_000, 25_000_000) != Some(0)
+        || cdns_divisor_for(100_000_000, 24_000_000) != Some(1)
+        || cdns_divisor_for(100_000_000, 300_000).is_some()
+        || cdns_divisor_for(100_000_000, 26_000_000).is_some()
+    {
+        return TestResult::Fail("Cadence divisor selection mismatch");
+    }
+    let (phys, _len) = make_mmio();
+    // SAFETY: leaked RAM window outlives the controller.
+    let spi =
+        unsafe { CadenceSpi::new_mapped("cdns-test".to_string(), fake_mapping(phys), 100_000_000) };
+    if spi.set_freq(10_000_000).is_err() {
+        return TestResult::Fail("Cadence set_freq refused an in-range rate");
+    }
+    // SAFETY: the leaked window is ours; CR is offset 0.
+    let cr = unsafe { core::ptr::read_volatile((phys.raw()) as *const u32) };
+    if (cr >> 3) & 0x7 != 2 {
+        return TestResult::Fail("Cadence set_freq did not program the baud field (want 2)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-spi", smoke_cadence_divisor_and_set_freq);
+
+// ── Synthetic DTB for the child-publication smoke ───────────────
+
+struct TSpec<'a> {
+    name: &'a str,
+    props: &'a [(&'a str, &'a [u8])],
+    kids: &'a [TSpec<'a>],
+}
+
+fn be_cells(vals: &[u32]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::new();
+    for v in vals {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+fn be_str(s: &str) -> alloc::vec::Vec<u8> {
+    let mut out = s.as_bytes().to_vec();
+    out.push(0);
+    out
+}
+
+fn intern_test_string(strings: &mut alloc::vec::Vec<u8>, name: &str) -> u32 {
+    let target = name.as_bytes();
+    let mut i = 0;
+    while i + target.len() < strings.len() {
+        if &strings[i..i + target.len()] == target && strings[i + target.len()] == 0 {
+            return i as u32;
+        }
+        i += 1;
+    }
+    let off = strings.len() as u32;
+    strings.extend_from_slice(target);
+    strings.push(0);
+    off
+}
+
+fn emit_test_prop(
+    s: &mut alloc::vec::Vec<u8>,
+    strings: &mut alloc::vec::Vec<u8>,
+    name: &str,
+    val: &[u8],
+) {
+    let off = intern_test_string(strings, name);
+    s.extend_from_slice(&narf_firmware_fdt::FDT_PROP.to_be_bytes());
+    s.extend_from_slice(&(val.len() as u32).to_be_bytes());
+    s.extend_from_slice(&off.to_be_bytes());
+    s.extend_from_slice(val);
+    while s.len() % 4 != 0 {
+        s.push(0);
+    }
+}
+
+fn emit_test_node(s: &mut alloc::vec::Vec<u8>, strings: &mut alloc::vec::Vec<u8>, node: &TSpec) {
+    s.extend_from_slice(&narf_firmware_fdt::FDT_BEGIN_NODE.to_be_bytes());
+    s.extend_from_slice(node.name.as_bytes());
+    s.push(0);
+    while s.len() % 4 != 0 {
+        s.push(0);
+    }
+    for (name, val) in node.props {
+        emit_test_prop(s, strings, name, val);
+    }
+    for kid in node.kids {
+        emit_test_node(s, strings, kid);
+    }
+    s.extend_from_slice(&narf_firmware_fdt::FDT_END_NODE.to_be_bytes());
+}
+
+fn build_test_dtb(root_props: &[(&str, &[u8])], kids: &[TSpec]) -> alloc::vec::Vec<u8> {
+    let mut strings: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut s: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    s.extend_from_slice(&narf_firmware_fdt::FDT_BEGIN_NODE.to_be_bytes());
+    s.extend_from_slice(&[0, 0, 0, 0]);
+    for (name, val) in root_props {
+        emit_test_prop(&mut s, &mut strings, name, val);
+    }
+    for kid in kids {
+        emit_test_node(&mut s, &mut strings, kid);
+    }
+    s.extend_from_slice(&narf_firmware_fdt::FDT_END_NODE.to_be_bytes());
+    s.extend_from_slice(&narf_firmware_fdt::FDT_END.to_be_bytes());
+    let off_rsvmap = 40u32;
+    let off_struct = off_rsvmap + 16;
+    let off_strings = off_struct + s.len() as u32;
+    let totalsize = off_strings + strings.len() as u32;
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(totalsize as usize);
+    out.extend_from_slice(&narf_firmware_fdt::FDT_MAGIC.to_be_bytes());
+    out.extend_from_slice(&totalsize.to_be_bytes());
+    out.extend_from_slice(&off_struct.to_be_bytes());
+    out.extend_from_slice(&off_strings.to_be_bytes());
+    out.extend_from_slice(&off_rsvmap.to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&16u32.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&(strings.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    out.extend_from_slice(&[0u8; 16]);
+    out.extend_from_slice(&s);
+    out.extend_from_slice(&strings);
+    out
+}
+
+fn smoke_spi_dt_children_publish() -> TestResult {
+    crate::dt::__reset_children_for_test();
+    let root_a = be_cells(&[2]);
+    let root_s = be_cells(&[1]);
+    let one = be_cells(&[1]);
+    let zero = be_cells(&[0]);
+    let spi_reg = be_cells(&[0, 0x8_0000, 0x1000]);
+    let nor_reg = be_cells(&[0]);
+    let nor_freq = be_cells(&[20_000_000]);
+    let blob = build_test_dtb(
+        &[("#address-cells", &root_a), ("#size-cells", &root_s)],
+        &[TSpec {
+            name: "spi@80000",
+            props: &[
+                ("compatible", &be_str("arm,pl022")),
+                ("reg", &spi_reg),
+                ("#address-cells", &one),
+                ("#size-cells", &zero),
+            ],
+            kids: &[
+                TSpec {
+                    name: "flash@0",
+                    props: &[
+                        ("compatible", &be_str("jedec,spi-nor")),
+                        ("reg", &nor_reg),
+                        ("spi-max-frequency", &nor_freq),
+                    ],
+                    kids: &[],
+                },
+                TSpec {
+                    name: "regless@1",
+                    props: &[("compatible", &be_str("example,regless"))],
+                    kids: &[],
+                },
+            ],
+        }],
+    );
+    let n = crate::dt::publish_children_from(&blob, "arm,pl022", 0x8_0000, "pl022@0x80000");
+    if n != 1 {
+        return TestResult::Fail("SPI child publication did not publish exactly the NOR child");
+    }
+    let kids = crate::dt::published_children();
+    if kids.len() != 1
+        || kids[0].controller != "pl022@0x80000"
+        || kids[0].cs != 0
+        || kids[0].max_hz != 20_000_000
+        || !narf_firmware_fdt::compatible_matches(&kids[0].compatible, "jedec,spi-nor")
+    {
+        return TestResult::Fail("published SPI child record mismatch");
+    }
+    crate::dt::__reset_children_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers-spi", smoke_spi_dt_children_publish);
