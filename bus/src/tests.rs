@@ -146,6 +146,144 @@ fn smoke_bus_platform_device_record() -> TestResult {
 }
 kernel_test_in!("bus", smoke_bus_platform_device_record);
 
+// ── Devicetree match table ─────────────────────────────────────
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+static DT_SPECIFIC_CALLS: AtomicU32 = AtomicU32::new(0);
+static DT_GENERIC_CALLS: AtomicU32 = AtomicU32::new(0);
+static DT_DECLINING_CALLS: AtomicU32 = AtomicU32::new(0);
+static DT_FALLBACK_CALLS: AtomicU32 = AtomicU32::new(0);
+
+fn dt_probe_specific(
+    _dev: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::ProbeError> {
+    DT_SPECIFIC_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+fn dt_probe_generic(
+    _dev: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::ProbeError> {
+    DT_GENERIC_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+fn dt_probe_declining(
+    _dev: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::ProbeError> {
+    DT_DECLINING_CALLS.fetch_add(1, Ordering::SeqCst);
+    Err(crate::ProbeError::NotForThisDriver)
+}
+
+fn dt_probe_fallback(
+    _dev: crate::BusDevice,
+    _cap: narf_capabilities::Cap<crate::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), crate::ProbeError> {
+    DT_FALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+fn smoke_bus_dt_match_binds_platform() -> TestResult {
+    // probe_all over platform devices: the candidate order is the
+    // matched string's position in the device's compatible list
+    // (most-specific first), NOT registration order; a
+    // NotForThisDriver decline falls through to the next candidate;
+    // bindings are recorded like PCI bindings. The compatible
+    // strings are fictional, so the registered test entries can
+    // never match a real device in a later smoke.
+    use crate::driver_match::{bound_count, probe_all, register_dt, DtMatch};
+    use crate::{BusAddr, BusDevice, BusKind, DeviceId, PlatformDevice, RegWindow};
+    use narf_memory::PhysAddr;
+
+    DT_SPECIFIC_CALLS.store(0, Ordering::SeqCst);
+    DT_GENERIC_CALLS.store(0, Ordering::SeqCst);
+    DT_DECLINING_CALLS.store(0, Ordering::SeqCst);
+    DT_FALLBACK_CALLS.store(0, Ordering::SeqCst);
+
+    // Generic registered FIRST — it must still lose to the
+    // more-specific string on device 1.
+    register_dt(DtMatch {
+        name: "dt-test-generic",
+        compatible: "narf,test-generic",
+        probe: dt_probe_generic,
+    });
+    register_dt(DtMatch {
+        name: "dt-test-specific",
+        compatible: "narf,test-device",
+        probe: dt_probe_specific,
+    });
+    register_dt(DtMatch {
+        name: "dt-test-declining",
+        compatible: "narf,test-device2",
+        probe: dt_probe_declining,
+    });
+    register_dt(DtMatch {
+        name: "dt-test-fallback",
+        compatible: "narf,test-fallback",
+        probe: dt_probe_fallback,
+    });
+
+    let mk = |base: u64, compat: &[u8]| {
+        let mut rec = PlatformDevice::new();
+        rec.set_compatible(compat);
+        let _ = rec.push_reg(RegWindow {
+            base: PhysAddr::new(base),
+            len: 0x1000,
+        });
+        BusDevice {
+            addr: BusAddr::Mmio(PhysAddr::new(base)),
+            id: DeviceId {
+                vendor: 0,
+                device: 0,
+                class: 0,
+                subsystem_vendor: 0,
+                subsystem_id: 0,
+            },
+            kind: BusKind::Platform(rec),
+        }
+    };
+    let _restore_registry = RegistryRestore::capture();
+    crate::registry::install(alloc::vec![
+        mk(0x0bad_1000, b"narf,test-device\0narf,test-generic\0"),
+        mk(0x0bad_2000, b"narf,test-device2\0narf,test-fallback\0"),
+    ]);
+
+    let authority = crate::bootstrap_registry_authority();
+    let bound_before = bound_count();
+    match probe_all(&authority) {
+        Ok(2) => {}
+        Ok(n) => {
+            return TestResult::Fail(match n {
+                0 => "probe_all bound no platform devices",
+                1 => "probe_all bound only one platform device",
+                _ => "probe_all bound an unexpected number of devices",
+            })
+        }
+        Err(_) => return TestResult::Fail("probe_all returned a cap error"),
+    }
+    if DT_SPECIFIC_CALLS.load(Ordering::SeqCst) != 1 {
+        return TestResult::Fail("most-specific DT match was not attempted first / not bound");
+    }
+    if DT_GENERIC_CALLS.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("generic DT match attempted after the specific one bound");
+    }
+    if DT_DECLINING_CALLS.load(Ordering::SeqCst) != 1
+        || DT_FALLBACK_CALLS.load(Ordering::SeqCst) != 1
+    {
+        return TestResult::Fail("NotForThisDriver decline did not fall through to the fallback");
+    }
+    if bound_count() != bound_before + 2 {
+        return TestResult::Fail("platform bindings were not recorded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_bus_dt_match_binds_platform);
+
+
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_pcie_dtb_aarch64() -> TestResult {
     // The boot-time `bus::init` discovers the `pcie@10000000` node

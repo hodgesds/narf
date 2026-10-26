@@ -591,6 +591,17 @@ pub enum MatchEntry {
 }
 ```
 
+As implemented, the dispatcher carries two tables in
+`driver_match` — `PciMatch` (PCIe kinds above) and `DtMatch`
+(`{ name, compatible, probe }`) — feeding one shared walk:
+candidate selection is per-kind, everything after it (cap mint,
+§9.3 outcomes, §9.5 appended-device handling, §9.6 binding
+records + remove hooks keyed by match name) is common. A
+`DtMatch` probe receives the `BusKind::Platform` device with the
+same `Cap<BusDeviceCap, Write>` mint as a PCI probe.
+Virtio-MMIO devices have no table entries; they keep their own
+discovery shape.
+
 ### 9.2 Specificity ordering
 
 When multiple registrations could match a given device:
@@ -610,6 +621,12 @@ is linear in the number of entries matching the device's bus
 type. With hundreds of drivers this is still microseconds; the
 table can be promoted to a hash on (vendor, device) if it
 becomes hot.
+
+For devicetree matches, specificity is a property of the
+*device*: the matched string's position in the device's
+`compatible` list (position 0, the most-specific string, wins),
+with registration order as the tie-break — rules 2–3 above do
+not apply across the DT table today.
 
 ### 9.3 Probe outcomes
 

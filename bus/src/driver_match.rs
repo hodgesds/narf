@@ -189,6 +189,73 @@ pub fn count() -> usize {
     REGISTRY.lock().len()
 }
 
+// ── Devicetree match table ──────────────────────────────────────
+//
+// The DT analogue of the PCI table above (bus spec §9.1
+// `DtCompat`): a platform driver registers the `compatible` string
+// it binds, and `probe_all` attempts a platform device's
+// candidates most-specific-first. Specificity is a property of the
+// *device*, not the entry: a string's position in the device's
+// `compatible` list (position 0 = most specific — the list is
+// ordered most-specific-first by devicetree convention), with
+// registration order breaking ties. Probes share the PCI
+// signature and the §9 walk: same cap mint, same binding record,
+// same detach path (remove hooks key off the match name in both
+// tables).
+
+/// Devicetree probe signature — identical to [`PciProbeFn`]; the
+/// probed device's `kind` is `BusKind::Platform`, whose record
+/// carries the reg windows + resolved IRQs.
+pub type DtProbeFn = PciProbeFn;
+
+/// One entry in the devicetree match registry.
+#[derive(Copy, Clone)]
+pub struct DtMatch {
+    /// Human-readable driver name. Used in diagnostics + as a
+    /// duplicate-registration key (with `compatible`).
+    pub name: &'static str,
+    /// The `compatible` string this driver binds.
+    pub compatible: &'static str,
+    /// Probe fn invoked when a discovered platform device's
+    /// `compatible` list contains `compatible`.
+    pub probe: DtProbeFn,
+}
+
+impl core::fmt::Debug for DtMatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DtMatch")
+            .field("name", &self.name)
+            .field("compatible", &self.compatible)
+            .finish_non_exhaustive()
+    }
+}
+
+static DT_REGISTRY: IrqSafeSpinLock<Vec<DtMatch>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Register a devicetree driver with the match table. Idempotent
+/// on `(name, compatible)` — same contract as [`register`].
+pub fn register_dt(m: DtMatch) {
+    let mut g = DT_REGISTRY.lock();
+    if let Some(pos) = g
+        .iter()
+        .position(|e| e.name == m.name && e.compatible == m.compatible)
+    {
+        g[pos] = m;
+    } else {
+        g.push(m);
+    }
+}
+
+/// Snapshot of currently-registered devicetree drivers.
+pub fn registered_dt() -> Vec<DtMatch> {
+    DT_REGISTRY.lock().clone()
+}
+
+/// Number of registered devicetree drivers — tests + diagnostics.
+pub fn dt_count() -> usize {
+    DT_REGISTRY.lock().len()
+}
+
 /// Driver remove signature — the detach counterpart of
 /// [`PciProbeFn`]. The driver receives the device it bound at probe
 /// time and a freshly-minted authority cap, and tears the device
@@ -323,6 +390,7 @@ pub fn probe_all(
 ) -> Result<u32, narf_capabilities::CapError> {
     authority.check_live()?;
     let drivers = registered();
+    let dt_drivers = registered_dt();
     let mut devs = devices();
     let mut bound = 0u32;
 
@@ -336,11 +404,46 @@ pub fn probe_all(
     while idx < devs.len() {
         let d = &devs[idx];
         idx += 1;
-        // Candidate matches in arbitration order. `sort_by_key`
-        // is stable, so equal-specificity candidates keep their
-        // registration order — the pre-existing tie behaviour.
-        let mut candidates: Vec<&PciMatch> = drivers.iter().filter(|m| m.kind.matches(d)).collect();
-        candidates.sort_by_key(|m| core::cmp::Reverse(m.kind.specificity()));
+        // Candidate matches in arbitration order, normalised
+        // across the two match tables so the mint / probe /
+        // record walk below is shared (§9.3, §9.5, §9.6 apply to
+        // both). PCI: `MatchKind` specificity, highest first.
+        // Platform: the matched string's position in the device's
+        // `compatible` list, most-specific (lowest) first.
+        // `sort_by_key` is stable, so equal-rank candidates keep
+        // their registration order — the pre-existing tie
+        // behaviour. Virtio-MMIO devices use their own discovery
+        // shape and never have candidates.
+        struct Candidate {
+            name: &'static str,
+            probe: PciProbeFn,
+        }
+        let candidates: Vec<Candidate> = match &d.kind {
+            BusKind::Pcie { .. } => {
+                let mut v: Vec<&PciMatch> = drivers.iter().filter(|m| m.kind.matches(d)).collect();
+                v.sort_by_key(|m| core::cmp::Reverse(m.kind.specificity()));
+                v.iter()
+                    .map(|m| Candidate {
+                        name: m.name,
+                        probe: m.probe,
+                    })
+                    .collect()
+            }
+            BusKind::Platform(rec) => {
+                let mut v: Vec<(usize, &DtMatch)> = dt_drivers
+                    .iter()
+                    .filter_map(|m| rec.compatible_position(m.compatible).map(|pos| (pos, m)))
+                    .collect();
+                v.sort_by_key(|(pos, _)| *pos);
+                v.iter()
+                    .map(|(_, m)| Candidate {
+                        name: m.name,
+                        probe: m.probe,
+                    })
+                    .collect()
+            }
+            BusKind::VirtioMmio { .. } => Vec::new(),
+        };
 
         for m in candidates {
             // Mint the per-device cap. We're inside a TCB-trusted
@@ -388,7 +491,7 @@ pub fn probe_all(
                 // list and attempt the next-most-specific match.
                 Err(ProbeError::NotForThisDriver) => continue,
                 Err(e) => {
-                    log_probe_failure(m, d, e);
+                    log_probe_failure(m.name, d, e);
                     break;
                 }
             }
@@ -492,7 +595,7 @@ impl<'a> core::fmt::Write for TruncatingWriter<'a> {
 /// failure on the floor (the kernel-test harness can call into the
 /// per-driver static state to verify success). Wave-3b can route
 /// this through `tracing/` once the trace probe IDs land.
-fn log_probe_failure(_m: &PciMatch, _d: &BusDevice, _e: ProbeError) {}
+fn log_probe_failure(_name: &str, _d: &BusDevice, _e: ProbeError) {}
 
 // ── Loadable-module PCI drivers ──────────────────────────────────
 //
