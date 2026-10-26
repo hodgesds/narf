@@ -633,6 +633,76 @@ pub(crate) fn frequency_period(current: u64, frequency: u64, elapsed_ns: u64) ->
         .max(1)
 }
 
+/// Whether the rate implied by one drained frequency-mode sample pair is
+/// consistent with the counter's architectural tick rate.
+///
+/// The pair credits `loaded_period` counter ticks — the period whose
+/// counting produced the sample — against `elapsed_ns` of monotonic time
+/// between this sample's capture and the previous one. When the counter
+/// and the monotonic clock agree, the implied rate
+/// `loaded_period * 1e9 / elapsed_ns` equals the counter's true tick rate
+/// up to capture jitter. A pair implying a rate below
+/// `reference_hz / 4` — the same 4x bound `frequency_period` applies to
+/// a single correction — is distorted: the two clocks advanced at
+/// unrelated rates (under TCG the cycle counter is instruction-paced
+/// while the monotonic clock is virtual-time-paced), so the pair
+/// carries no trustworthy evidence that the counter runs slowly.
+///
+/// A zero `reference_hz` (timer uncalibrated) cannot convict a pair and
+/// is reported consistent, preserving the un-gated behaviour; a zero
+/// `loaded_period` means no period was recorded for the sample, so the
+/// pair carries no evidence at all and is reported inconsistent.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn frequency_elapsed_consistent(
+    loaded_period: u64,
+    elapsed_ns: u64,
+    reference_hz: u64,
+) -> bool {
+    if reference_hz == 0 {
+        return true;
+    }
+    if loaded_period == 0 {
+        return false;
+    }
+    // implied >= reference / 4  <=>  loaded * 4e9 >= reference * elapsed
+    (loaded_period as u128) * 4_000_000_000u128
+        >= (reference_hz as u128) * (elapsed_ns.max(1) as u128)
+}
+
+/// Next period for an aarch64 cycle-counter frequency event (#987).
+///
+/// Identical to `frequency_period` floored at `minimum_period` whenever
+/// the clocks agree: consistent pairs — including a legitimate shrink
+/// back toward the architectural anchor `reference_hz / frequency`
+/// after a growth step — and all growth steps pass through unchanged.
+/// A *shrink* demanded by an inconsistent pair is refused and the
+/// current period is held instead. Under TCG the monotonic elapsed can
+/// overstate the counter's advance by orders of magnitude, and
+/// ratcheting down on it walked the period to `minimum_period` within
+/// a few samples, where servicing one overflow (PPI + handler + EOI)
+/// costs more counter ticks than the period itself, so the overflow
+/// re-pends before the interrupted thread runs — an interrupt
+/// livelock. Because the cycle counter's architectural rate is fixed,
+/// a consistent pair can never demand a period materially below the
+/// open-time anchor, so holding on inconsistent pairs loses no real
+/// adaptation signal.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn frequency_next_period(
+    current: u64,
+    loaded_period: u64,
+    frequency: u64,
+    elapsed_ns: u64,
+    reference_hz: u64,
+    minimum_period: u64,
+) -> u64 {
+    let next = frequency_period(current, frequency, elapsed_ns).max(minimum_period);
+    if next >= current || frequency_elapsed_consistent(loaded_period, elapsed_ns, reference_hz) {
+        next
+    } else {
+        current.max(minimum_period)
+    }
+}
+
 struct PendingSample {
     state: AtomicU8,
     task: AtomicU64,
@@ -1970,7 +2040,7 @@ impl PerfEventFile {
         false
     }
 
-    fn adjust_frequency_period(&self, now: u64) {
+    fn adjust_frequency_period(&self, now: u64, _loaded_period: u64) {
         if self.sample_frequency == 0 {
             return;
         }
@@ -1985,7 +2055,25 @@ impl PerfEventFile {
         // or a delayed drain cannot collapse the period into an IRQ storm.
         let next = frequency_period(current, self.sample_frequency, elapsed);
         #[cfg(target_arch = "aarch64")]
-        let next = next.max(narf_arch::aarch64::pmu::minimum_sample_period());
+        let next = if matches!(self.pmu_event, Some(AarchPmuEvent::Cycle)) {
+            // #987: the cycle counter ticks at the architectural counter
+            // clock — the same rate the open path anchors the initial
+            // period on — so gate cycle-event shrinks on the sample
+            // pair's consistency with that clock (frequency_next_period).
+            // Programmable events count non-cycle events and have no
+            // architectural rate to check against; they keep the
+            // floor-only rule below.
+            frequency_next_period(
+                current,
+                _loaded_period,
+                self.sample_frequency,
+                elapsed,
+                narf_arch::aarch64::timer::frequency_hz(),
+                narf_arch::aarch64::pmu::minimum_sample_period(),
+            )
+        } else {
+            next.max(narf_arch::aarch64::pmu::minimum_sample_period())
+        };
         self.sample_period.store(next, Ordering::Release);
         #[cfg(target_arch = "x86_64")]
         {
@@ -2835,7 +2923,7 @@ fn drain_irq_samples_active() {
                             &[],
                         );
                         deliver_sigtrap(&event, task);
-                        event.adjust_frequency_period(now);
+                        event.adjust_frequency_period(now, period);
                         notify |= event.consume_refresh();
                     }
                 }
