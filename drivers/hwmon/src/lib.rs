@@ -116,11 +116,11 @@ pub fn register_initcalls() {
         it87::register_isa_driver();
         InitResult::Ok
     });
-    narf_init::register(Stage::Subsys, "hwmon-coretemp", || {
-        #[cfg(target_arch = "x86_64")]
-        coretemp::register_msr_driver();
-        InitResult::Ok
-    });
+    narf_init::register(
+        Stage::Subsys,
+        "hwmon-coretemp",
+        coretemp::register_msr_driver,
+    );
     narf_init::register(Stage::Subsys, "hwmon-applesmc", || {
         #[cfg(target_arch = "x86_64")]
         applesmc::register_smc_driver();
