@@ -562,11 +562,12 @@ mod tests {
         let mut inside = alloc::vec::Vec::new();
         inside.extend_from_slice(&name_word(b"_CRT", 3732));
         inside.extend_from_slice(&name_word(b"_PSV", 3532));
-        let mut blob = alloc::vec::Vec::new();
-        blob.push(0x5B); // ExtOpPrefix
-        blob.push(0x85); // ThermalZoneOp
-        blob.push((1 + 5 + inside.len()) as u8); // PkgLength counts itself
-        blob.push(b'\\');
+        let mut blob = alloc::vec![
+            0x5B,                         // ExtOpPrefix
+            0x85,                         // ThermalZoneOp
+            (1 + 5 + inside.len()) as u8, // PkgLength counts itself
+            b'\\',
+        ];
         blob.extend_from_slice(b"TZ97");
         blob.extend_from_slice(&inside);
         if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
