@@ -44,6 +44,12 @@ only with hardware/firmware evidence, not because the initial NARF profile
 omits it. Physical acceptance then supplies RF, interoperability and power
 measurements; source/model results cannot supply those measurements.
 
+The [per-chip inventory](../research/chip-inventory.md) records all 102 registered
+bus identities, actual revision/firmware gates, native-path gaps and measured
+source counts. It distinguishes aliases, catalog-only entries and rejected
+devices; these counts are not a completion fraction. Its initial numeric
+remaining-LOC forecasts were withdrawn after identifying overlapping work.
+
 The following is the open implementation ledger, not a claim of exhaustive
 hardware capability enumeration. Family specifications retain the detailed
 profile and dependency contracts; every broader profile needs its own complete
@@ -52,13 +58,13 @@ feature inventory before it can be called ready.
 | Family | Required software beyond the initial station milestone |
 |---|---|
 | iwlwifi | Gen2/MVM association/security/data admission after retained native authentication; remaining Gen3 command profiles; 6 GHz/HE/EHT, additional roles, RX/RSS and system PM |
-| ath11k | QCN9074 static windows/HAL/DP and firmware profile; STA recovery channel-reservation restoration; complete per-chip optional-feature inventory, remaining platform/BW-scaling paths and architecture coverage |
-| mt76 | Associated/off-channel and richer scans, 6 GHz/HT40/SGI/VHT/HE, BA/TX aggregation, PMF/WPA3, fragmentation, QoS beyond BE/TID0 and U-APSD/TSPEC, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
+| ath11k | QCN9074 static windows/HAL/DP and firmware profile; complete per-chip optional-feature inventory, remaining platform/BW-scaling paths and architecture coverage |
+| mt76 | Associated/off-channel and richer scans, 6 GHz/VHT/HE, BA/TX aggregation, PMF/WPA3, fragmentation, QoS beyond BE/TID0 and U-APSD/TSPEC, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
 | ath10k | Wider bands/widths, HT/VHT/aggregation, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, automatic/stable-interface recovery, DMA reclamation and host-bus/system PM |
-| ath9k | Other chip/EEPROM/descriptor variants, channel retune, periodic calibration, rate control/aggregation, IRQs, reset/rejoin, removal and PM |
+| ath9k | Other chip/EEPROM/descriptor variants, channel retune, periodic calibration, HT/BA/aggregation and richer rates, IRQs, reset/rejoin, removal and PM |
 | rtlwifi | Other matched chips; wider channel/rate profiles, IRQ/C2H expansion, multiple radios, reset/recovery, removal and suspend |
 | rtl8xxxu | Other matched USB chips, wider channels/rates, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
-| rtw88 | RTL8821CE operating-power/radio/station admission after qualified calibration-only IQK; RTL8822BE station path; broader channels/rates/roles/security, reset/suspend/removal, multiple devices and retained-map reclamation |
+| rtw88 | RTL8821CE operating radio/station admission after qualified parked power preparation; RTL8822BE station path; broader channels/rates/roles/security, reset/suspend/removal, multiple devices and retained-map reclamation |
 | rtw89 | Other AX/BE profiles and BE transport/EFUSE, wider PHY/channel/rate/role/security profiles, periodic RF tracking, IRQs, reset/rejoin/removal/suspend and multiple functions |
 | brcmfmac | Other chip/CPU/RAM/OTP/shared-ring profiles, wider PHY/bandwidth, WPA3/AP and other supported roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
 | cyw43439 | Platform clocks/pins/regulators/reset and gSPI host, wider PHY/role/security coverage, reset/reload, system PM and host-bus power transitions |
@@ -102,6 +108,21 @@ The combined Wi-Fi/shared-fixture QEMU gates pass 1848/0 fail/9 skip on x86_64
 and 1381/0 fail/3 skip on aarch64, including clean production boot and btrfs
 postflights. Production/kernel-test scoped Clippy, workspace formatting and
 release/debug builds pass on both architectures. These remain software checks.
+
+The following wave adds native Gen2 legacy association without claiming automatic
+PCI security/data startup; ath11k preserves channel reservations through sibling
+recovery. MT76 negotiates HT40/SGI and FullMAC confirms HT20/SGI from native
+readbacks and actual association records. AR9285 has response-bound legacy
+rates, four native retry series and adaptive DATA feedback; ath10k adds
+fixed-country non-DFS 5-GHz legacy station/active scanning on all six dialects.
+RTL8188EE/EU and qualified RTL8852B use response-bound legacy DATA rates, while
+RTL8821CE has a distinct post-IQK parked operating-power owner without station
+transmit admission. These remain partial feature profiles with hardware
+acceptance outstanding.
+The combined Wi-Fi/shared-fixture suites pass 1887/0 fail/9 skip on x86_64
+and 1417/0 fail/3 skip on aarch64, including clean production boots and btrfs
+postflights. Scoped production/kernel-test Clippy, workspace formatting and
+release/debug builds pass on both architectures.
 
 The public nl80211 scan limit follows each facade's `max_scan_ssids`: Intel
 admits 20 active SSID entries, ath10k, ath11k and common FullMAC admit 16, MT76

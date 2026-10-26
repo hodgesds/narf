@@ -210,6 +210,26 @@ now contains 45 profiles across all eleven families, including the actual
 These are software/source/asset checks and do not establish physical acceptance
 or full hardware-feature completion.
 
+The subsequent continuation adds native Gen2 legacy association, ath11k sibling
+channel-reservation recovery, MT76 HT40/SGI and actual FullMAC HT20/SGI readbacks.
+AR9285 now has negotiated legacy rates, native four-series retries and adaptive
+terminal DATA feedback; ath10k admits fixed-country non-DFS 5-GHz legacy station
+and mixed-band active scanning across all six dialects. RTL8188EE/EU and
+qualified RTL8852B gain response-bound legacy DATA rates; RTL8821CE gains parked
+post-IQK operating-power preparation, with no station transmit grant.
+The combined Wi-Fi/shared-fixture suites pass 1887/0 fail/9 skip on x86_64 and
+1417/0 fail/3 skip on aarch64 with clean production boots and btrfs postflights.
+Scoped production/kernel-test Clippy, workspace formatting and release/debug
+builds pass on both architectures. The wave adds 39 passing x86_64 smokes and
+36 on aarch64; three native ath11k recovery cases are x86_64-specific.
+
+The [per-chip inventory](drivers/wireless/research/chip-inventory.md) audits all
+102 registered bus identities. Tokei measures 316,060 Rust code lines including
+tests/tables in the specified scopes, compared with 1,177,080 C/header lines in
+broader local Linux driver and mac80211/cfg80211 directories. These are footprint
+counts, not completion percentages. Initial remaining-LOC forecasts were
+withdrawn after review found overlapping work; a delivery date remains uncalibrated.
+
 The preceding station power-save continuation added ordinary firmware station power save to the
 common CYW43439/BCM43602 owner. PM_FAST/PM_OFF and the default sleep-retention
 commands are serialized with station control; partial failure or cancellation
