@@ -9,6 +9,7 @@ extern crate alloc;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[cfg(feature = "amdgpu")]
 fn smoke_fb_picker_skips_unprobed_amdgpu() -> TestResult {
     // The amdgpu backend joins the picker ahead of bochs +
     // virtio-gpu; without a probed amdgpu controller the picker
@@ -24,6 +25,7 @@ fn smoke_fb_picker_skips_unprobed_amdgpu() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("fb", smoke_fb_picker_skips_unprobed_amdgpu);
 
 fn smoke_fb_console_writes_glyphs() -> TestResult {
@@ -1371,6 +1373,7 @@ kernel_test_in!(
 /// Without a driver-published external scanout, the DRM blit target stays
 /// exactly what fbdev exposes: the boot framebuffer gains no new route.
 fn smoke_fb_drm_external_geometry_requires_published_scanout() -> TestResult {
+    #[cfg(feature = "amdgpu")]
     if narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_some() {
         return TestResult::Skip("an external scanout is live");
     }
@@ -1393,9 +1396,11 @@ fn smoke_fb_hardware_cursor_arrow_and_gating() -> TestResult {
     if set == 0 || set + clear != image.len() {
         return TestResult::Fail("arrow is not opaque white over transparent");
     }
-    if narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_none()
-        && crate::cursor::hardware_cursor(Some((10, 10)))
-    {
+    #[cfg(feature = "amdgpu")]
+    let no_scanout = narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_none();
+    #[cfg(not(feature = "amdgpu"))]
+    let no_scanout = true;
+    if no_scanout && crate::cursor::hardware_cursor(Some((10, 10))) {
         return TestResult::Fail("hardware cursor without an adopted scanout");
     }
     TestResult::Pass

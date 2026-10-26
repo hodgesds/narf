@@ -189,6 +189,72 @@ pub const TRANS_DDI_MODE_HDMI: u32 = 0b000 << TRANS_DDI_FUNC_CTL_MODE_SHIFT;
 pub const TRANS_DDI_MODE_DVI: u32 = 0b001 << TRANS_DDI_FUNC_CTL_MODE_SHIFT;
 pub const TRANS_DDI_MODE_DP_SST: u32 = 0b010 << TRANS_DDI_FUNC_CTL_MODE_SHIFT;
 pub const TRANS_DDI_MODE_DP_MST: u32 = 0b011 << TRANS_DDI_FUNC_CTL_MODE_SHIFT;
+/// `TRANS_DDI_FUNC_CTL` BPC field bits[22:20]; 8 bpc = 0.
+pub const TRANS_DDI_BPC_8: u32 = 0 << 20;
+/// `TRANS_DDI_FUNC_CTL` port-width field bits[3:1], encoded as
+/// `lanes - 1`.
+pub const fn trans_ddi_port_width(lanes: u8) -> u32 {
+    ((lanes.saturating_sub(1)) as u32) << 1
+}
+
+/// Build the `TRANS_DDI_FUNC_CTL` value binding a transcoder to
+/// DDI port `ddi_index` (0 = DDI A) in DP-SST mode at 8 bpc.
+/// The TGL port-select field bits[30:27] encodes `index + 1`
+/// (0 = no port selected). Before lane 1 no code wrote this
+/// register at all — routing was whatever firmware left behind.
+pub const fn build_trans_ddi_func_ctl(ddi_index: u8, mode: u32, lanes: u8) -> u32 {
+    TRANS_DDI_FUNC_CTL_ENABLE
+        | (((ddi_index as u32) + 1) << TRANS_DDI_FUNC_CTL_DDI_SHIFT)
+        | mode
+        | TRANS_DDI_BPC_8
+        | trans_ddi_port_width(lanes)
+}
+
+// ── DP M/N registers (TGL PRM Vol. 12 §"Transcoder MN Values") ──
+//
+// One instance per transcoder, in the timing region:
+// DATA_M1 +0x30, DATA_N1 +0x34, LINK_M1 +0x40, LINK_N1 +0x44.
+// The M/N fields are 24 bits; LINK_N is written last because it
+// triggers the hardware update of all four registers.
+
+/// `PIPE_DATA_M1` offset relative to the transcoder timing base.
+pub const PIPE_DATA_M1_OFFSET: u64 = 0x0030;
+/// `PIPE_DATA_N1` offset relative to the transcoder timing base.
+pub const PIPE_DATA_N1_OFFSET: u64 = 0x0034;
+/// `PIPE_LINK_M1` offset relative to the transcoder timing base.
+pub const PIPE_LINK_M1_OFFSET: u64 = 0x0040;
+/// `PIPE_LINK_N1` offset relative to the transcoder timing base.
+pub const PIPE_LINK_N1_OFFSET: u64 = 0x0044;
+/// Fixed N used for both data and link M/N on this driver
+/// (2^23, the maximum the DP M/N encoding recommends).
+pub const DP_MN_N: u32 = 0x80_0000;
+
+/// Compute DP data + link M/N for an uncompressed, non-FEC SST
+/// stream (TGL PRM Vol. 12 §"Transcoder MN Values"):
+///   Data M/N = (strm_clk * bytes_per_pixel) / (ls_clk * lanes)
+///   Link M/N = strm_clk / ls_clk
+/// with M rounded up per the PRM recommendation. `strm_clk` is
+/// the pixel clock; `ls_clk` is the link symbol clock
+/// (bit rate / 10). Returns (data_m, data_n, link_m, link_n).
+pub const fn dp_mn(
+    pixel_clock_khz: u32,
+    link_symbol_khz: u32,
+    lanes: u32,
+    bytes_per_pixel: u32,
+) -> (u32, u32, u32, u32) {
+    let n = DP_MN_N as u64;
+    let data_num = pixel_clock_khz as u64 * bytes_per_pixel as u64 * n;
+    let data_den = link_symbol_khz as u64 * lanes as u64;
+    let data_m = data_num.div_ceil(data_den);
+    let link_num = pixel_clock_khz as u64 * n;
+    let link_m = link_num.div_ceil(link_symbol_khz as u64);
+    (
+        (data_m & 0xFF_FFFF) as u32,
+        DP_MN_N,
+        (link_m & 0xFF_FFFF) as u32,
+        DP_MN_N,
+    )
+}
 
 // ── Plane registers (SKL+ universal plane) ───────────────────────
 //
@@ -225,20 +291,28 @@ pub const PLANE_CTL_ENABLE: u32 = 1 << 31;
 
 /// Pixel-format encoding in `PLANE_CTL[27:23]`.
 /// Source: TGL PRM Vol. 14 §"PLANE_CTL — Source Pixel Format".
+///
+/// Lane 1 (#1010) resolved a disagreement between this module
+/// and `intel_gpu_modeset`'s documentation in favour of the
+/// modeset doc: on ICL+ (Gen12) the field is 5 bits at [27:23]
+/// and XRGB_8888 is 0b01000. The pre-lane-1 discriminants here
+/// were the pre-ICL values shifted one bit low, so every plane
+/// programmed through this codec carried half the correct
+/// format value (Argb8888 encoded 0b00100, the 2101010 slot).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PixelFormat {
     /// 8-bit indexed.
-    Indexed8 = 0b01100,
+    Indexed8 = 0b11000,
     /// 8:8:8:8 ARGB / XRGB. The "X" form (PIPE only sees opaque
     /// 32-bpp scanout) is selected by the alpha disable bit.
-    Argb8888 = 0b00100,
+    Argb8888 = 0b01000,
     /// 5:6:5 RGB.
-    Rgb565 = 0b01110,
+    Rgb565 = 0b11100,
     /// 10:10:10:2 ARGB / XRGB (HDR scanout).
-    Rgb2101010 = 0b00010,
+    Rgb2101010 = 0b00100,
     /// FP16 RGBA (HDR composite path).
-    Fp16Rgba = 0b10010,
+    Fp16Rgba = 0b01100,
 }
 
 impl PixelFormat {
@@ -571,6 +645,54 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_pipes", smoke_primary_plane_program);
+
+    fn smoke_plane_ctl_format_encoding_matches_prm() -> TestResult {
+        // PRM Vol. 14 / ICL+ universal plane: XRGB_8888 = 0b01000
+        // in PLANE_CTL[27:23] -> 0x0400_0000 in the register.
+        if PixelFormat::Argb8888.encode_for_plane_ctl() != 0x0400_0000 {
+            return TestResult::Fail("Argb8888 format bits must be 0b01000 << 23");
+        }
+        let p = match build_primary_plane(64, 64, 256, 0x1000, PixelFormat::Argb8888) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("clean plane rejected"),
+        };
+        if p.plane_ctl & 0x0F80_0000 != 0x0400_0000 {
+            return TestResult::Fail("plane_ctl format field wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_pipes",
+        smoke_plane_ctl_format_encoding_matches_prm
+    );
+
+    fn smoke_trans_ddi_func_ctl_and_mn() -> TestResult {
+        // DDI A, DP SST, 4 lanes: enable | (0+1)<<27 | 2<<24 | 3<<1.
+        let v = build_trans_ddi_func_ctl(0, TRANS_DDI_MODE_DP_SST, 4);
+        if v != (1 << 31) | (1 << 27) | (2 << 24) | (3 << 1) {
+            return TestResult::Fail("TRANS_DDI_FUNC_CTL encoding wrong");
+        }
+        // 148.5 MHz pixel clock over HBR (270 MHz symbol), 4 lanes, 3 Bpp.
+        let (dm, dn, lm, ln) = dp_mn(148_500, 270_000, 4, 3);
+        if dn != DP_MN_N || ln != DP_MN_N {
+            return TestResult::Fail("M/N denominators must be 2^23");
+        }
+        // data ratio 0.4125 -> M = ceil(0.4125 * 2^23) = 3460301 or 3460302
+        // (exact: 0.4125 * 2^23 = 3460300.8 -> ceil 3460301).
+        if dm != 3_460_301 {
+            return TestResult::Fail("data M wrong");
+        }
+        // link ratio 0.55 -> M = ceil(0.55 * 2^23) = 4613735
+        // (exact: 148500 * 2^23 / 270000 = 4613734.4 -> ceil 4613735).
+        if lm != 4_613_735 {
+            return TestResult::Fail("link M wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_pipes",
+        smoke_trans_ddi_func_ctl_and_mn
+    );
 
     fn smoke_primary_plane_rejects_bad_stride() -> TestResult {
         match build_primary_plane(1920, 1080, 1921, 0x1000, PixelFormat::Argb8888) {
