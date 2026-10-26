@@ -122,6 +122,13 @@ pub fn copy_memory_ranges(blob: &[u8], out: &mut [Reservation]) -> usize;
 /// at, copied into the caller's buffer (NUL-terminated).
 pub fn chosen_stdout_path(blob: &[u8], out: &mut [u8]) -> usize;
 
+/// Resolve `chosen.stdout-path` to the `(base, size)` of the node
+/// it names. Handles a full path, an `/aliases` label, and either
+/// form carrying `:params` output parameters (stripped, not
+/// interpreted). `None` when the property is absent, the target
+/// node is missing, or it has no decodable first `reg` entry.
+pub fn chosen_stdout_reg(blob: &[u8]) -> Option<(u64, u64)>;
+
 /// Decode `interrupts-extended`, or legacy `interrupts` when no
 /// extended property exists. Extended entries may target different
 /// interrupt-controller phandles and therefore different cell widths.
@@ -146,6 +153,8 @@ pub fn for_each_interrupt<F>(
 | `smoke_fdt_reservations`           | reserve-map decoded                |
 | `smoke_fdt_reserved_memory_static_ranges` | `/reserved-memory` static range + flags |
 | `smoke_fdt_interrupts_extended_multiple_domains` | mixed interrupt domains decoded |
+| `smoke_fdt_chosen_stdout_reg_forms` | `stdout-path` resolves via alias+`:params` and full-path forms; absent `/chosen` yields `None` |
+| `smoke_fdt_real_qemu_virt_*` (9 smokes) | parser pinned against a real QEMU `virt` DTB fixture (`tests/fixtures/qemu-virt.dtb`, #1048) |
 
 ## 6. Out of scope (v0.1)
 

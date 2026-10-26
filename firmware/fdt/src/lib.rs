@@ -774,6 +774,64 @@ pub fn chosen_stdout_path(blob: &[u8], out: &mut [u8]) -> usize {
     n
 }
 
+/// Resolve `/chosen/stdout-path` to the `(base, size)` of the node
+/// it names — the early-console MMIO window the firmware points at.
+///
+/// All three forms firmware emits are handled: a full path
+/// (`"/pl011@9000000"`), an alias label (`"serial0"`, resolved
+/// through `/aliases`), and either form carrying output parameters
+/// after a `:` (`"serial0:115200n8"` — the parameters are not
+/// interpreted, only stripped). Returns `None` when the property
+/// is absent or empty, the target node does not exist, or it
+/// carries no decodable first `reg` entry.
+pub fn chosen_stdout_reg(blob: &[u8]) -> Option<(u64, u64)> {
+    let mut path_buf = [0u8; MAX_PATH_BYTES];
+    let n = chosen_stdout_path(blob, &mut path_buf);
+    if n == 0 {
+        return None;
+    }
+    let raw = core::str::from_utf8(&path_buf[..n]).ok()?;
+    let target = raw.split(':').next().unwrap_or("");
+    if target.is_empty() {
+        return None;
+    }
+    let mut alias_buf = [0u8; MAX_PATH_BYTES];
+    let resolved: &str = if target.starts_with('/') {
+        target
+    } else {
+        let m = alias_path(blob, target, &mut alias_buf);
+        if m == 0 {
+            return None;
+        }
+        core::str::from_utf8(&alias_buf[..m]).ok()?
+    };
+    let depth = resolved.split('/').filter(|s| !s.is_empty()).count();
+    if depth == 0 || depth > MAX_PATH_DEPTH {
+        return None;
+    }
+    let mut found = None;
+    walk_with_cells(blob, |path, props, parent_cells| {
+        if found.is_some() || path.depth() as usize != depth {
+            return;
+        }
+        let matches = resolved
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .enumerate()
+            .all(|(i, seg)| path.segment(i) == Some(seg));
+        if !matches {
+            return;
+        }
+        for (name, value) in props {
+            if name == "reg" {
+                found = parent_cells.read_one_reg(value, 0);
+                return;
+            }
+        }
+    });
+    found
+}
+
 // ───────────────────────────────────────────────────────────────────
 // `status` filter
 // ───────────────────────────────────────────────────────────────────

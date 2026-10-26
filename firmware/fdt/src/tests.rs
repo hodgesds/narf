@@ -784,9 +784,57 @@ fn smoke_fdt_real_qemu_virt_chosen() -> TestResult {
     if fdt::alias_path(QEMU_VIRT_DTB, "serial0", &mut alias) != 0 {
         return TestResult::Fail("unexpected alias");
     }
+    // stdout-path resolves to the PL011's reg window.
+    if fdt::chosen_stdout_reg(QEMU_VIRT_DTB) != Some((0x0900_0000, 0x1000)) {
+        return TestResult::Fail("stdout-path did not resolve to the PL011 reg");
+    }
     TestResult::Pass
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_real_qemu_virt_chosen);
+
+fn smoke_fdt_chosen_stdout_reg_forms() -> TestResult {
+    // Root cells 1/1 so the fixture UARTs' `reg` decodes as
+    // (addr, size) u32 pairs.
+    let root_props: &[(&str, &[u8])] = &[
+        ("#address-cells", &[0, 0, 0, 1]),
+        ("#size-cells", &[0, 0, 0, 1]),
+    ];
+    // Alias label + ":params" suffix form.
+    let alias_form = &[
+        ("aliases", &[("serial0", b"/uart@1000\0" as &[u8])][..]),
+        (
+            "chosen",
+            &[("stdout-path", b"serial0:115200n8\0" as &[u8])][..],
+        ),
+        (
+            "uart@1000",
+            &[("reg", &[0u8, 0, 0x10, 0x00, 0, 0, 0x01, 0x00] as &[u8])][..],
+        ),
+    ];
+    let blob = build_blob(0, &[], root_props, alias_form);
+    if fdt::chosen_stdout_reg(&blob) != Some((0x1000, 0x100)) {
+        return TestResult::Fail("alias+params stdout-path did not resolve");
+    }
+    // Bare full-path form.
+    let path_form = &[
+        ("chosen", &[("stdout-path", b"/uart@2000\0" as &[u8])][..]),
+        (
+            "uart@2000",
+            &[("reg", &[0u8, 0, 0x20, 0x00, 0, 0, 0x00, 0x80] as &[u8])][..],
+        ),
+    ];
+    let blob = build_blob(0, &[], root_props, path_form);
+    if fdt::chosen_stdout_reg(&blob) != Some((0x2000, 0x80)) {
+        return TestResult::Fail("full-path stdout-path did not resolve");
+    }
+    // No /chosen at all.
+    let blob = build_blob(0, &[], root_props, &[]);
+    if fdt::chosen_stdout_reg(&blob).is_some() {
+        return TestResult::Fail("stdout reg without /chosen");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_chosen_stdout_reg_forms);
 
 fn smoke_fdt_real_qemu_virt_pl011() -> TestResult {
     let mut hits = 0usize;

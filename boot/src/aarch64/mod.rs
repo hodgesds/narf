@@ -260,6 +260,18 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         None => None,
     };
 
+    // Early-console selection: `/chosen/stdout-path` names the
+    // UART the firmware booted with; resolve it to that node's
+    // `reg` base. Fall back to the QEMU `virt` PL011 base when
+    // there is no blob, no stdout-path, or no decodable `reg` —
+    // on QEMU `virt` the resolved value IS the fallback constant,
+    // so the tested platform's console is unchanged; boards whose
+    // console UART sits elsewhere get the described one.
+    let uart_base = dtb
+        .and_then(narf_firmware_fdt::chosen_stdout_reg)
+        .map(|(base, _size)| base)
+        .unwrap_or(PL011_QEMU_VIRT);
+
     let initramfs = dtb
         .and_then(narf_firmware_fdt::chosen_initrd_range)
         .map(|r| MemRegion {
@@ -364,14 +376,14 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     Ok(BootInfo {
         memory_map: regions,
         cmdline,
-        uart_phys: PhysAddr::new(PL011_QEMU_VIRT),
+        uart_phys: PhysAddr::new(uart_base),
         // High-VA alias: TTBR1's hi_L1[0] (installed by boot.S)
         // maps PA 0x00000000-0x40000000 → VA 0xFFFFFF80_00000000
         // -0xFFFFFF80_40000000 as Device memory. After the boot
         // identity TTBR0 is swapped for a user task's private
         // root, the kernel keeps reaching the UART through this
         // high-VA window.
-        uart_virt: VirtAddr::new(0xFFFF_FF80_0000_0000 | PL011_QEMU_VIRT),
+        uart_virt: VirtAddr::new(0xFFFF_FF80_0000_0000 | uart_base),
         dtb_phys,
         acpi_rsdp_phys: None,
         initramfs,
@@ -456,163 +468,6 @@ fn normalize_memory_map(
         }
     }
     Ok(())
-}
-
-/// FDT structure-block tokens (Devicetree Specification §5.4.1).
-#[allow(dead_code)]
-const FDT_BEGIN_NODE: u32 = 0x0000_0001;
-#[allow(dead_code)]
-const FDT_END_NODE: u32 = 0x0000_0002;
-#[allow(dead_code)]
-const FDT_PROP: u32 = 0x0000_0003;
-#[allow(dead_code)]
-const FDT_NOP: u32 = 0x0000_0004;
-#[allow(dead_code)]
-const FDT_END: u32 = 0x0000_0009;
-
-/// Find the `/chosen` node in the DTB at `dtb_phys`, read
-/// `linux,initrd-start` and `linux,initrd-end`, return the
-/// covered phys range. Properties are u32 OR u64 — the FDT spec
-/// allows either; we accept both.
-///
-/// # Safety
-/// `dtb_phys` must point at a 4-byte-aligned valid Devicetree
-/// blob whose `totalsize` covers the structure + strings blocks.
-#[allow(dead_code)]
-unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
-    // Read header fields (all big-endian u32).
-    let read_be32 = |off: u64| -> u32 {
-        // SAFETY: per this fn's contract `dtb_phys` is a 4-byte-aligned,
-        // identity-mapped Normal-memory DTB; `off` indexes within its
-        // `totalsize`, so the u32 read is in-bounds and aligned.
-        // SAFETY: Valid memory or trusted environment
-        unsafe { core::ptr::read_volatile((dtb_phys + off) as *const u32) }.to_be()
-    };
-    if read_be32(0) != 0xd00d_feed {
-        return None;
-    }
-    let off_dt_struct = read_be32(8) as u64;
-    let off_dt_strings = read_be32(12) as u64;
-    let size_dt_struct = read_be32(36) as u64;
-
-    let strings_base = dtb_phys + off_dt_strings;
-    let mut p = dtb_phys + off_dt_struct;
-    let end = p + size_dt_struct;
-
-    // Track whether we're inside `/chosen`. The DTB always starts
-    // with a single root node (`""`); we walk the immediate
-    // children looking for "chosen".
-    let mut depth = 0i32;
-    let mut in_chosen = false;
-    let mut chosen_depth = -1i32;
-    let mut start: Option<u64> = None;
-    let mut end_addr: Option<u64> = None;
-
-    while p + 4 <= end {
-        // SAFETY: identity-mapped DTB; bounds-checked above.
-        let tok = unsafe { core::ptr::read_volatile(p as *const u32) }.to_be();
-        p += 4;
-        match tok {
-            FDT_BEGIN_NODE => {
-                depth += 1;
-                // Name: NUL-terminated, 4-byte aligned.
-                let name_start = p;
-                let mut len = 0;
-                while p < end {
-                    // SAFETY: bounds-checked.
-                    let b = unsafe { core::ptr::read_volatile(p as *const u8) };
-                    p += 1;
-                    if b == 0 {
-                        break;
-                    }
-                    len += 1;
-                }
-                // Round up to 4-byte boundary.
-                let consumed = p - name_start;
-                let pad = (4 - (consumed & 3)) & 3;
-                p += pad;
-                // SAFETY: name spans `len` bytes from name_start.
-                let name = unsafe { core::slice::from_raw_parts(name_start as *const u8, len) };
-                if depth == 2 && name.starts_with(b"chosen") {
-                    in_chosen = true;
-                    chosen_depth = depth;
-                }
-            }
-            FDT_END_NODE => {
-                if depth == chosen_depth {
-                    in_chosen = false;
-                    chosen_depth = -1;
-                }
-                depth -= 1;
-            }
-            FDT_PROP => {
-                if p + 8 > end {
-                    return None;
-                }
-                let plen = read_be32(p - dtb_phys) as u64;
-                let nameoff = read_be32(p - dtb_phys + 4) as u64;
-                p += 8;
-                if p + plen > end {
-                    return None;
-                }
-                if in_chosen {
-                    // Read property name from strings block.
-                    let mut nlen = 0;
-                    while nlen < 64 {
-                        // SAFETY: strings block is bounded by
-                        // size_dt_strings; cap at 64 for safety.
-                        // SAFETY: Valid memory or trusted environment
-                        let b = unsafe {
-                            core::ptr::read_volatile((strings_base + nameoff + nlen) as *const u8)
-                        };
-                        if b == 0 {
-                            break;
-                        }
-                        nlen += 1;
-                    }
-                    // SAFETY: name spans nlen bytes.
-                    let name = unsafe {
-                        core::slice::from_raw_parts(
-                            (strings_base + nameoff) as *const u8,
-                            nlen as usize,
-                        )
-                    };
-                    let val = if plen == 4 {
-                        Some(read_be32(p - dtb_phys) as u64)
-                    } else if plen == 8 {
-                        let hi = read_be32(p - dtb_phys) as u64;
-                        let lo = read_be32(p - dtb_phys + 4) as u64;
-                        Some((hi << 32) | lo)
-                    } else {
-                        None
-                    };
-                    if let Some(v) = val {
-                        if name == b"linux,initrd-start" {
-                            start = Some(v);
-                        } else if name == b"linux,initrd-end" {
-                            end_addr = Some(v);
-                        }
-                    }
-                }
-                p += plen;
-                // 4-byte align.
-                let pad = (4 - (plen & 3)) & 3;
-                p += pad;
-            }
-            FDT_NOP => {}
-            FDT_END => break,
-            _ => return None, // Bad token; bail out.
-        }
-    }
-
-    match (start, end_addr) {
-        (Some(s), Some(e)) if e > s => Some(MemRegion {
-            start: PhysAddr::new(s),
-            len: e - s,
-            kind: MemRegionKind::Reserved,
-        }),
-        _ => None,
-    }
 }
 
 /// Search low RAM for the FDT magic (`0xd00dfeed` big-endian). QEMU
