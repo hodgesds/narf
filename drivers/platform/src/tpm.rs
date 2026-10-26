@@ -140,9 +140,9 @@ const CTRL_START_GO: u32 = 1 << 0;
 
 // TIS register layout (TIS v1.21 §5.6), offsets relative to the same
 // window base.
-const REG_TIS_ACCESS: u64 = 0x00;
-const REG_TIS_STS: u64 = 0x18;
-const REG_TIS_DATA_FIFO: u64 = 0x24;
+pub(crate) const REG_TIS_ACCESS: u64 = 0x00;
+pub(crate) const REG_TIS_STS: u64 = 0x18;
+pub(crate) const REG_TIS_DATA_FIFO: u64 = 0x24;
 pub(crate) const REG_TIS_DID_VID: u64 = 0xF00;
 
 const TIS_ACCESS_REQUEST_USE: u8 = 1 << 1;
@@ -198,18 +198,23 @@ async fn poll_yielding_until<F: FnMut() -> bool>(
 
 // ── CRB register window + probe core ────────────────────────────────
 //
-// The probe sequence is written against a minimal register-window
-// trait so kernel-test fixtures can drive it against a
-// firmware-shaped model of the control area — the same split
-// `drivers/tpm/src/crb.rs` uses with its `CrbMmio` trait. The
-// production implementation is [`MmioCrbRegs`] over an ioremap'd
-// window.
+// The probe sequence and both submit paths are written against a
+// minimal register-window trait so kernel-test fixtures can drive
+// them against a register-level model of the device (see
+// `crate::tpm_fixture`) — the same split `drivers/tpm/src/crb.rs`
+// uses with its `CrbMmio` trait. The production implementation is
+// [`MmioCrbRegs`] over an ioremap'd window.
 
-/// A 32-bit register window over a TPM control area; offsets are
-/// relative to the control-area base.
+/// A register window over a TPM control area; offsets are
+/// relative to the control-area base. The 32-bit accessors serve
+/// the CRB control area and the probe core; the 8-bit accessors
+/// serve the TIS register block (ACCESS / STS / DATA_FIFO are
+/// byte-wide in TIS v1.21 §5.6).
 pub(crate) trait CrbRegs {
     fn rd32(&self, offset: u64) -> u32;
     fn wr32(&self, offset: u64, value: u32);
+    fn rd8(&self, offset: u64) -> u8;
+    fn wr8(&self, offset: u64, value: u8);
 }
 
 /// Production [`CrbRegs`]: volatile MMIO over an ioremap'd window.
@@ -217,26 +222,23 @@ struct MmioCrbRegs {
     va: u64,
 }
 
-impl MmioCrbRegs {
-    fn rd8(&self, offset: u64) -> u8 {
-        // SAFETY: `va` is the device window mapped at probe; `offset`
-        // is a register offset inside the 4 KiB locality window.
-        unsafe { core::ptr::read_volatile((self.va + offset) as *const u8) }
-    }
-    fn wr8(&self, offset: u64, value: u8) {
-        // SAFETY: as `rd8`.
-        unsafe { core::ptr::write_volatile((self.va + offset) as *mut u8, value) }
-    }
-}
-
 impl CrbRegs for MmioCrbRegs {
     fn rd32(&self, offset: u64) -> u32 {
-        // SAFETY: as `rd8`.
+        // SAFETY: `va` is the device window mapped at probe; `offset`
+        // is a register offset inside the 4 KiB locality window.
         unsafe { core::ptr::read_volatile((self.va + offset) as *const u32) }
     }
     fn wr32(&self, offset: u64, value: u32) {
-        // SAFETY: as `rd8`.
+        // SAFETY: as `rd32`.
         unsafe { core::ptr::write_volatile((self.va + offset) as *mut u32, value) }
+    }
+    fn rd8(&self, offset: u64) -> u8 {
+        // SAFETY: as `rd32`.
+        unsafe { core::ptr::read_volatile((self.va + offset) as *const u8) }
+    }
+    fn wr8(&self, offset: u64, value: u8) {
+        // SAFETY: as `rd32`.
+        unsafe { core::ptr::write_volatile((self.va + offset) as *mut u8, value) }
     }
 }
 
@@ -428,129 +430,171 @@ impl Tpm {
             // happen through `probe`; fail rather than guess.
             return Err(TpmError::BadResponse);
         };
-        if cmd.is_empty() || cmd.len() > cmd_buf.len() {
-            return Err(TpmError::BadResponse);
-        }
-        let regs = self.regs();
-        // 1. Set CMD_READY.
-        regs.wr32(REG_CRB_CTRL_REQ, CTRL_REQ_CMD_READY);
-        // Wait until idle clears (TPM is in command-ready state).
-        // 750 ms TIMEOUT_A. Timeout ignored, mirroring prior
-        // behaviour — the GO write below will fail loudly if the
-        // TPM never left idle.
-        let _ = poll_yielding_until(
-            || regs.rd32(REG_CRB_CTRL_STS) & CTRL_STS_TPM_IDLE == 0,
-            narf_time::Deadline::after_ms(750),
+        submit_crb_over(
+            &self.regs(),
+            cmd_buf.cpu_mut_ptr::<u8>(),
+            cmd_buf.len(),
+            rsp_buf.cpu_mut_ptr::<u8>(),
+            rsp_buf.len(),
+            cmd,
         )
-        .await;
-        // 2. Write command into the host-owned command buffer.
-        // SAFETY: `cmd_buf` is a coherent DMA buffer of
-        // `cmd_buf.len()` bytes owned by this device; `cmd.len()`
-        // was bounded by it above.
-        unsafe {
-            let dst = cmd_buf.cpu_mut_ptr::<u8>();
-            for (i, b) in cmd.iter().enumerate() {
-                core::ptr::write_volatile(dst.add(i), *b);
-            }
-        }
-        // 3. Kick CRB_CTRL_START.GO.
-        regs.wr32(REG_CRB_CTRL_START, CTRL_START_GO);
-        // 4. Poll for start bit to self-clear (cmd complete).
-        // 5 s wall-clock budget — TIMEOUT_C / TIMEOUT_D worst
-        // cases (e.g. RSA keygen). Yields to the executor between
-        // MMIO reads so peer tasks make progress during the wait.
-        let done = poll_yielding_until(
-            || regs.rd32(REG_CRB_CTRL_START) & CTRL_START_GO == 0,
-            narf_time::Deadline::after_ms(5_000),
-        )
-        .await;
-        if !done {
-            // Cancel the wedged command before reporting, mirroring
-            // `drivers/tpm/src/crb.rs::run_command`.
-            regs.wr32(REG_CRB_CTRL_CANCEL, 1);
-            return Err(TpmError::BusyTimeout);
-        }
-        if regs.rd32(REG_CRB_CTRL_STS) & CTRL_STS_ERROR != 0 {
-            return Err(TpmError::BadResponse);
-        }
-        // 5. Read response from the host-owned response buffer. The
-        //    size lives in bytes [2..6] of the response header
-        //    (TPM2 §5.6 paragraphSize).
-        let mut header = [0u8; 10];
-        // SAFETY: `rsp_buf` is a coherent DMA buffer owned by this
-        // device, at least 10 bytes by construction (4096).
-        unsafe {
-            let src = rsp_buf.cpu_ptr::<u8>();
-            for (i, byte) in header.iter_mut().enumerate() {
-                *byte = core::ptr::read_volatile(src.add(i));
-            }
-        }
-        let resp_size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
-        if resp_size < 10 || resp_size as usize > rsp_buf.len() {
-            return Err(TpmError::BadResponse);
-        }
-        let mut out = alloc::vec![0u8; resp_size as usize];
-        for (i, byte) in out.iter_mut().enumerate() {
-            // SAFETY: `resp_size <= rsp_buf.len()` was checked
-            // above, so every `i` addresses a byte inside the
-            // host-owned response buffer.
-            *byte = unsafe { core::ptr::read_volatile(rsp_buf.cpu_ptr::<u8>().add(i)) };
-        }
-        Ok(out)
+        .await
     }
 
     async fn submit_tis(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
-        let regs = self.regs();
-        // 1. Request locality 0.
-        regs.wr8(REG_TIS_ACCESS, TIS_ACCESS_REQUEST_USE);
-        // 750 ms TIMEOUT_A — locality acknowledgement.
+        submit_tis_over(&self.regs(), cmd).await
+    }
+}
+
+/// The CRB submit sequence (PTP §6.5) over an abstract register
+/// window: set CMD_READY, copy the command into the host-owned
+/// command buffer, kick CTRL_START.GO, poll for completion
+/// (CANCEL on timeout), then read the response out of the
+/// host-owned response buffer. Factored out of `Tpm::submit_crb`
+/// so kernel-test fixtures can drive the identical sequence
+/// against a register-level device model (#946); the method is a
+/// thin wrapper passing the device's probe-time DMA buffers.
+///
+/// # Safety
+/// `cmd_buf` / `rsp_buf` must each point at `*_len` bytes of
+/// memory the caller owns exclusively for the call's duration
+/// and that the device side may read/write (production passes
+/// its coherent DMA buffers).
+pub(crate) async fn submit_crb_over<R: CrbRegs>(
+    regs: &R,
+    cmd_buf: *mut u8,
+    cmd_buf_len: usize,
+    rsp_buf: *mut u8,
+    rsp_buf_len: usize,
+    cmd: &[u8],
+) -> Result<Vec<u8>, TpmError> {
+    if cmd.is_empty() || cmd.len() > cmd_buf_len {
+        return Err(TpmError::BadResponse);
+    }
+    // 1. Set CMD_READY.
+    regs.wr32(REG_CRB_CTRL_REQ, CTRL_REQ_CMD_READY);
+    // Wait until idle clears (TPM is in command-ready state).
+    // 750 ms TIMEOUT_A. Timeout ignored, mirroring prior
+    // behaviour — the GO write below will fail loudly if the
+    // TPM never left idle.
+    let _ = poll_yielding_until(
+        || regs.rd32(REG_CRB_CTRL_STS) & CTRL_STS_TPM_IDLE == 0,
+        narf_time::Deadline::after_ms(750),
+    )
+    .await;
+    // 2. Write command into the host-owned command buffer.
+    // SAFETY: the caller contract guarantees `cmd_buf` is valid
+    // for `cmd_buf_len` bytes; `cmd.len()` was bounded by it
+    // above.
+    unsafe {
+        for (i, b) in cmd.iter().enumerate() {
+            core::ptr::write_volatile(cmd_buf.add(i), *b);
+        }
+    }
+    // 3. Kick CRB_CTRL_START.GO.
+    regs.wr32(REG_CRB_CTRL_START, CTRL_START_GO);
+    // 4. Poll for start bit to self-clear (cmd complete).
+    // 5 s wall-clock budget — TIMEOUT_C / TIMEOUT_D worst
+    // cases (e.g. RSA keygen). Yields to the executor between
+    // MMIO reads so peer tasks make progress during the wait.
+    let done = poll_yielding_until(
+        || regs.rd32(REG_CRB_CTRL_START) & CTRL_START_GO == 0,
+        narf_time::Deadline::after_ms(5_000),
+    )
+    .await;
+    if !done {
+        // Cancel the wedged command before reporting, mirroring
+        // `drivers/tpm/src/crb.rs::run_command`.
+        regs.wr32(REG_CRB_CTRL_CANCEL, 1);
+        return Err(TpmError::BusyTimeout);
+    }
+    if regs.rd32(REG_CRB_CTRL_STS) & CTRL_STS_ERROR != 0 {
+        return Err(TpmError::BadResponse);
+    }
+    // 5. Read response from the host-owned response buffer. The
+    //    size lives in bytes [2..6] of the response header
+    //    (TPM2 §5.6 paragraphSize).
+    let mut header = [0u8; 10];
+    // SAFETY: the caller contract guarantees `rsp_buf` is valid
+    // for `rsp_buf_len` bytes (4096 in production — at least the
+    // 10-byte response header).
+    unsafe {
+        for (i, byte) in header.iter_mut().enumerate() {
+            *byte = core::ptr::read_volatile(rsp_buf.add(i));
+        }
+    }
+    let resp_size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
+    if resp_size < 10 || resp_size as usize > rsp_buf_len {
+        return Err(TpmError::BadResponse);
+    }
+    let mut out = alloc::vec![0u8; resp_size as usize];
+    for (i, byte) in out.iter_mut().enumerate() {
+        // SAFETY: `resp_size <= rsp_buf_len` was checked above,
+        // so every `i` addresses a byte inside the response
+        // buffer.
+        *byte = unsafe { core::ptr::read_volatile(rsp_buf.add(i)) };
+    }
+    Ok(out)
+}
+
+/// The TIS submit sequence (TIS v1.21) over an abstract register
+/// window: request locality 0, push the command into DATA_FIFO
+/// under EXPECT flow control, issue STS.GO, then drain the
+/// response FIFO while DATA_AVAIL asserts. Factored out of
+/// `Tpm::submit_tis` for the same fixture seam as
+/// [`submit_crb_over`] (#946).
+pub(crate) async fn submit_tis_over<R: CrbRegs>(regs: &R, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+    // 1. Request locality 0.
+    regs.wr8(REG_TIS_ACCESS, TIS_ACCESS_REQUEST_USE);
+    // 750 ms TIMEOUT_A — locality acknowledgement.
+    let _ = poll_yielding_until(
+        || regs.rd8(REG_TIS_ACCESS) & TIS_ACCESS_ACTIVE != 0,
+        narf_time::Deadline::after_ms(750),
+    )
+    .await;
+    // 2. Write command into the FIFO.
+    for b in cmd {
+        // Wait for STS.EXPECT before each byte. 750 ms
+        // TIMEOUT_A — typical sub-microsecond on real TPMs.
         let _ = poll_yielding_until(
-            || regs.rd8(REG_TIS_ACCESS) & TIS_ACCESS_ACTIVE != 0,
+            || regs.rd8(REG_TIS_STS) & TIS_STS_EXPECT != 0,
             narf_time::Deadline::after_ms(750),
         )
         .await;
-        // 2. Write command into the FIFO.
-        for b in cmd {
-            // Wait for STS.EXPECT before each byte. 750 ms
-            // TIMEOUT_A — typical sub-microsecond on real TPMs.
-            let _ = poll_yielding_until(
-                || regs.rd8(REG_TIS_STS) & TIS_STS_EXPECT != 0,
-                narf_time::Deadline::after_ms(750),
-            )
-            .await;
-            regs.wr8(REG_TIS_DATA_FIFO, *b);
-        }
-        // 3. Issue STS.GO.
-        regs.wr8(REG_TIS_STS, TIS_STS_GO);
-        // 4. Wait for STS.DATA_AVAIL. 5 s wall-clock budget —
-        // TIMEOUT_C / TIMEOUT_D worst cases (RSA keygen etc.).
-        let done = poll_yielding_until(
-            || {
-                let s = regs.rd8(REG_TIS_STS);
-                s & (TIS_STS_VALID | TIS_STS_DATA_AVAIL) == (TIS_STS_VALID | TIS_STS_DATA_AVAIL)
-            },
-            narf_time::Deadline::after_ms(5_000),
-        )
-        .await;
-        if !done {
-            return Err(TpmError::BusyTimeout);
-        }
-        // 5. Drain FIFO until DATA_AVAIL clears.
-        let mut out: Vec<u8> = Vec::new();
-        for _ in 0..0x4000u32 {
-            let s = regs.rd8(REG_TIS_STS);
-            if s & TIS_STS_DATA_AVAIL == 0 {
-                break;
-            }
-            let b = regs.rd8(REG_TIS_DATA_FIFO);
-            out.push(b);
-            if out.len() > 0x1000 {
-                return Err(TpmError::BadResponse);
-            }
-        }
-        Ok(out)
+        regs.wr8(REG_TIS_DATA_FIFO, *b);
     }
+    // 3. Issue STS.GO.
+    regs.wr8(REG_TIS_STS, TIS_STS_GO);
+    // 4. Wait for STS.DATA_AVAIL. 5 s wall-clock budget —
+    // TIMEOUT_C / TIMEOUT_D worst cases (RSA keygen etc.).
+    let done = poll_yielding_until(
+        || {
+            let s = regs.rd8(REG_TIS_STS);
+            s & (TIS_STS_VALID | TIS_STS_DATA_AVAIL) == (TIS_STS_VALID | TIS_STS_DATA_AVAIL)
+        },
+        narf_time::Deadline::after_ms(5_000),
+    )
+    .await;
+    if !done {
+        return Err(TpmError::BusyTimeout);
+    }
+    // 5. Drain FIFO until DATA_AVAIL clears.
+    let mut out: Vec<u8> = Vec::new();
+    for _ in 0..0x4000u32 {
+        let s = regs.rd8(REG_TIS_STS);
+        if s & TIS_STS_DATA_AVAIL == 0 {
+            break;
+        }
+        let b = regs.rd8(REG_TIS_DATA_FIFO);
+        out.push(b);
+        if out.len() > 0x1000 {
+            return Err(TpmError::BadResponse);
+        }
+    }
+    Ok(out)
+}
 
+impl Tpm {
     /// `TPM2_GetRandom(bytes_requested)` — convenience wrapper.
     /// Returns up to `bytes` bytes of random data. The TPM may
     /// return fewer than requested.
@@ -674,7 +718,7 @@ static TPM: IrqSafeSpinLock<Option<Arc<Tpm>>> = IrqSafeSpinLock::new(None);
 /// no boot caller, so this initcall drives it from the RSDP the
 /// boot-time SRAT parse cached (the parse is idempotent; a failure
 /// just leaves the fixed-window fallback in place).
-fn discovered_base() -> Option<u64> {
+pub(crate) fn discovered_base() -> Option<u64> {
     if narf_acpi::tpm2_info().is_none() {
         if let Some(rsdp) = narf_acpi::cached_rsdp() {
             // SAFETY: `rsdp` comes from narf_acpi's own boot-parse
@@ -699,7 +743,8 @@ fn discovered_base() -> Option<u64> {
 /// Best-effort initialisation: probe the TPM2-table control area
 /// when firmware published one, else the fixed locality-0 window.
 /// Used from the Stage::Subsys initcall — silently no-ops on hosts
-/// without a TPM.
+/// without a TPM. (`pub(crate)` so the discovery-composition
+/// fixture can drive the same decision the initcall drives, #946.)
 ///
 /// On a successful probe the device is published through two handles
 /// on the SAME `Arc<Tpm>`: this crate's singleton (backing

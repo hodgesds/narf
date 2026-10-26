@@ -118,6 +118,7 @@ pub mod surface_acpi;
 pub mod system76_acpi;
 
 mod tests;
+mod tpm_fixture;
 
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {

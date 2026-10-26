@@ -903,6 +903,24 @@ impl crate::tpm::CrbRegs for FakeCrbRegs {
         self.writes.borrow_mut().push((offset, value));
         self.set32(offset, value);
     }
+    fn rd8(&self, offset: u64) -> u8 {
+        // Byte lanes of the 32-bit register file, little-endian —
+        // present so the fake satisfies the full `CrbRegs`
+        // surface; the probe-core fixtures don't exercise the
+        // TIS byte path (the register-level device model in
+        // `crate::tpm_fixture` does).
+        let word = self.rd32(offset & !3);
+        (word >> ((offset & 3) * 8)) as u8
+    }
+    fn wr8(&self, offset: u64, value: u8) {
+        let aligned = offset & !3;
+        let shift = (offset & 3) * 8;
+        let word = self.get32(aligned);
+        self.set32(
+            aligned,
+            (word & !(0xFF << shift)) | ((value as u32) << shift),
+        );
+    }
 }
 
 fn smoke_tpm_crb_probe_firmware_shaped_control_area() -> TestResult {

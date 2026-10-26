@@ -501,7 +501,7 @@ fn record_owned(
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use async_trait::async_trait;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_tpm::{TpmDevice, TpmInfo};
 
@@ -749,3 +749,168 @@ kernel_test_in!(
     "frame/measure",
     smoke_measure_dispatches_extend_to_registered_device
 );
+
+/// Stateful `TpmDevice` for the reconciliation smoke: a real PCR
+/// bank (the production extend formula applied per extend), not
+/// a recording mock — so the fixture can compare *device PCR
+/// state* against the software shadow, the reconciliation the
+/// audit noted the production design needs (#946).
+struct StatefulTpm {
+    bank: IrqSafeSpinLock<[[u8; SHA256_DIGEST_SIZE]; PCR_COUNT]>,
+    extends: AtomicU32,
+    fail_extends: AtomicBool,
+}
+
+impl StatefulTpm {
+    fn new() -> Self {
+        Self {
+            bank: IrqSafeSpinLock::new([[0; SHA256_DIGEST_SIZE]; PCR_COUNT]),
+            extends: AtomicU32::new(0),
+            fail_extends: AtomicBool::new(false),
+        }
+    }
+
+    fn bank_snapshot(&self, pcr: u32) -> [u8; SHA256_DIGEST_SIZE] {
+        self.bank.lock()[pcr as usize]
+    }
+}
+
+#[async_trait]
+impl TpmDevice for StatefulTpm {
+    fn get_info(&self) -> TpmInfo {
+        TpmInfo {
+            manufacturer: 0x53544154, // "STAT"
+            version: 1,
+            spec_level: 2,
+        }
+    }
+
+    async fn submit_raw(&self, _cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+        // `measure` never submits raw frames; the register-level
+        // command conversation is covered at the platform seam
+        // (drivers/platform/src/tpm_fixture.rs). Fail honestly
+        // rather than fabricate a success response.
+        Err(TpmError::BadResponse)
+    }
+
+    async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError> {
+        Ok(alloc::vec![0x5A; bytes as usize])
+    }
+
+    async fn extend_pcr(&self, pcr: u32, digest: &[u8]) -> Result<(), TpmError> {
+        if self.fail_extends.load(Ordering::SeqCst) {
+            return Err(TpmError::HardwareError);
+        }
+        let mut d = [0u8; SHA256_DIGEST_SIZE];
+        let n = digest.len().min(SHA256_DIGEST_SIZE);
+        d[..n].copy_from_slice(&digest[..n]);
+        let mut bank = self.bank.lock();
+        bank[pcr as usize] = pcr_extend_value(&bank[pcr as usize], &d);
+        self.extends.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn read_pcr(&self, pcr: u32) -> Result<Vec<u8>, TpmError> {
+        Ok(self.bank_snapshot(pcr).to_vec())
+    }
+}
+
+fn smoke_measure_hardware_pcr_state_matches_shadow() -> TestResult {
+    // #946: with a *stateful* device registered, a sequence of
+    // production measurements must leave the device's PCR state
+    // identical to the software shadow for every measured PCR —
+    // the end-to-end property measured boot exists to provide,
+    // previously unexecutable anywhere (the dispatch smoke's
+    // recording mock has no PCR state to reconcile).
+    // Hygiene: registry + measure state are globals; reset on
+    // entry and exit (see the dispatch smoke).
+    narf_tpm::registry::__reset_for_test();
+    __reset_for_test();
+    narf_scheduler::__reset_queues_for_test();
+
+    let dev = Arc::new(StatefulTpm::new());
+    narf_tpm::registry::register(dev.clone());
+    let errs = Arc::new(AtomicU32::new(0));
+    let errs_in = errs.clone();
+    narf_scheduler::spawn(async move {
+        let bump = |r: Result<(), TpmError>| {
+            if r.is_err() {
+                errs_in.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        bump(measure(4, "boot-info", b"stage5 boot info payload").await);
+        bump(measure(4, "boot-info-2", b"second measurement, same PCR").await);
+        bump(measure(5, "cmdline", b"root=/dev/nvme0n1p2 quiet").await);
+        let blob_digest = sha256(b"firmware blob bytes");
+        bump(measure_precomputed(9, EV_IPL, String::from("fw-blob"), &blob_digest, 19).await);
+    });
+    narf_scheduler::run_until_empty();
+
+    let mut ok = errs.load(Ordering::SeqCst) == 0 && dev.extends.load(Ordering::SeqCst) == 4;
+    for pcr in [4u32, 5, 9] {
+        if dev.bank_snapshot(pcr) != pcr_shadow(pcr).unwrap_or([0u8; SHA256_DIGEST_SIZE]) {
+            ok = false;
+        }
+    }
+    // An unmeasured PCR stays at the reset value on both sides.
+    if dev.bank_snapshot(0) != [0u8; SHA256_DIGEST_SIZE]
+        || pcr_shadow(0) != Some([0u8; SHA256_DIGEST_SIZE])
+    {
+        ok = false;
+    }
+    let log_ok = get_log().len() == 4;
+    narf_tpm::registry::__reset_for_test();
+    __reset_for_test();
+    if !ok {
+        return TestResult::Fail("device PCR state diverged from the shadow");
+    }
+    if !log_ok {
+        return TestResult::Fail("measurement log did not record all four events");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/measure",
+    smoke_measure_hardware_pcr_state_matches_shadow
+);
+
+fn smoke_measure_hardware_failure_propagates() -> TestResult {
+    // The hardware branch of `measure_with_type` propagates
+    // device errors with `?` (measure.rs) — pin that a failing
+    // device makes the measurement fail, and that the documented
+    // shadow-first order still leaves the shadow advanced (the
+    // forensic property the code comment promises) while the
+    // device bank is untouched.
+    narf_tpm::registry::__reset_for_test();
+    __reset_for_test();
+    narf_scheduler::__reset_queues_for_test();
+
+    let dev = Arc::new(StatefulTpm::new());
+    dev.fail_extends.store(true, Ordering::SeqCst);
+    narf_tpm::registry::register(dev.clone());
+    let outcome = Arc::new(IrqSafeSpinLock::new(None::<bool>));
+    let outcome_in = outcome.clone();
+    narf_scheduler::spawn(async move {
+        let r = measure(6, "initramfs", b"initramfs bytes").await;
+        *outcome_in.lock() = Some(r.is_err());
+    });
+    narf_scheduler::run_until_empty();
+
+    let propagated = *outcome.lock() == Some(true);
+    let want_shadow = pcr_extend_value(&[0u8; SHA256_DIGEST_SIZE], &sha256(b"initramfs bytes"));
+    let shadow_ok = pcr_shadow(6) == Some(want_shadow);
+    let bank_ok = dev.bank_snapshot(6) == [0u8; SHA256_DIGEST_SIZE];
+    narf_tpm::registry::__reset_for_test();
+    __reset_for_test();
+    if !propagated {
+        return TestResult::Fail("device extend failure did not propagate out of measure");
+    }
+    if !shadow_ok {
+        return TestResult::Fail("shadow did not advance ahead of the failing device");
+    }
+    if !bank_ok {
+        return TestResult::Fail("failing device mutated its PCR bank");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("frame/measure", smoke_measure_hardware_failure_propagates);
