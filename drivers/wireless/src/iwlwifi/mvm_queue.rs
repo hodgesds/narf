@@ -10,7 +10,7 @@ const MANAGEMENT_TID: u8 = 15;
 
 #[derive(Clone, Copy)]
 pub(super) struct ManagementQueue {
-    id: Option<u16>,
+    pub(super) id: Option<u16>,
 }
 
 impl Owner {

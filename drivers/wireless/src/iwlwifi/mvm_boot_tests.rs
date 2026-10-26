@@ -32,6 +32,7 @@ impl Fixture {
                 nvm: None,
                 peer: None,
                 management_queue: None,
+                security: super::rsna::Context::default(),
                 power: super::power::Context::new(
                     &super::super::firmware_api::FirmwareApi::default(),
                 ),

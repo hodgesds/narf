@@ -33,17 +33,17 @@ pub struct LegacyDataStatus {
 #[derive(Debug, Eq, PartialEq)]
 pub enum LegacyReceive {
     Ethernet(Vec<u8>),
-    /// A bounded, original plaintext EAPOL packet for the future native
-    /// RSNA owner. It is never delivered to the ordinary Ethernet port.
+    /// A bounded, original plaintext EAPOL packet observed before the native
+    /// RSNA owner starts. It is never delivered to the ordinary Ethernet port.
     Eapol(Vec<u8>),
 }
 
 pub(super) struct Prepared {
-    status: AssociationStatus,
-    queue: Option<u16>,
-    port_open: bool,
-    sequence: u16,
-    replay: frame_api::Replay,
+    pub(super) status: AssociationStatus,
+    pub(super) queue: Option<u16>,
+    pub(super) port_open: bool,
+    pub(super) sequence: u16,
+    pub(super) replay: frame_api::Replay,
 }
 
 fn edca(local: [u8; 6], use_11b: bool) -> [u8; 208] {
@@ -96,6 +96,24 @@ fn legacy_rx_rate(payload: &[u8], status: LegacyDataStatus) -> bool {
     rate & (0xf0 | (7 << 11)) == 0 && status.supported_rates & (1 << bit) != 0
 }
 
+pub(super) fn ap_disconnected(
+    mpdu: &scan_api::Mpdu<'_>,
+    local: [u8; 6],
+    status: LegacyDataStatus,
+) -> bool {
+    let f = mpdu.frame;
+    mpdu.channel == status.channel
+        && f.len() >= 24
+        && matches!(f[0], 0xa0 | 0xc0)
+        && f[1] & 0xc7 == 0
+        && f[4..10] == local
+        && f[10..16] == status.bssid
+        && f[16..22] == status.bssid
+        && f[22] & 15 == 0
+        && !mpdu.amsdu
+        && mpdu.body(24, 0).is_some_and(|b| b.len() == 2)
+}
+
 impl Owner {
     pub fn prepared_legacy_data(&self) -> Option<LegacyDataStatus> {
         if self.phase != Phase::DataPrepared || self.prepared_transmit_power().is_none() {
@@ -119,7 +137,7 @@ impl Owner {
         })
     }
 
-    fn data_port_using(
+    pub(super) fn data_port_using(
         &mut self,
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> bool {
@@ -127,7 +145,7 @@ impl Owner {
             return false;
         }
         match policy().and_then(|p| self.data_ready(&p)) {
-            Ok(status) => !status.protected,
+            Ok(status) => !status.protected || self.security.ready(),
             Err(error) => {
                 let _ = self.data_failed::<()>(error);
                 false
@@ -231,7 +249,7 @@ impl Owner {
         }
     }
 
-    async fn fresh_data_policy(
+    pub(super) async fn fresh_data_policy(
         &mut self,
         policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
@@ -319,7 +337,7 @@ impl Owner {
         Ok(())
     }
 
-    fn data_failed<T>(&mut self, error: &'static str) -> Result<T, &'static str> {
+    pub(super) fn data_failed<T>(&mut self, error: &'static str) -> Result<T, &'static str> {
         if let Some(data) = self
             .power
             .prepared
@@ -340,7 +358,7 @@ impl Owner {
         .await
     }
 
-    async fn transmit_data_using(
+    pub(super) async fn transmit_data_using(
         &mut self,
         ethernet: &[u8],
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
@@ -350,7 +368,7 @@ impl Owner {
             Err(error) if self.phase == Phase::DataPrepared => return self.data_failed(error),
             Err(error) => return Err(error),
         };
-        if status.protected {
+        if status.protected && !self.security.ready() {
             return Err("MVM secured controlled port requires real RSNA and keys");
         }
         // EAPOL belongs to an authenticated security owner, never an ordinary
@@ -372,7 +390,7 @@ impl Owner {
             status.bssid,
             data.sequence,
             ethernet,
-            false,
+            status.protected,
         )
         .ok_or("invalid MVM legacy Ethernet frame")?;
         data.sequence = data.sequence.wrapping_add(1) & 0xfff;
@@ -407,14 +425,14 @@ impl Owner {
     }
 
     /// One bounded synchronous native receive drain. No IP packet escapes a
-    /// protected port; EAPOL is explicitly distinguished for its future owner.
+    /// protected port; an active RSNA owner captures EAPOL privately.
     pub fn poll_legacy_receive(&mut self) -> Result<Option<LegacyReceive>, &'static str> {
         self.receive_data_using(|| {
             narf_wireless::reg::db::get_domain().ok_or("MVM data policy unavailable")
         })
     }
 
-    fn receive_data_using(
+    pub(super) fn receive_data_using(
         &mut self,
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<Option<LegacyReceive>, &'static str> {
@@ -427,11 +445,17 @@ impl Owner {
         }
     }
 
-    fn receive_data_inner(
+    pub(super) fn receive_data_inner(
         &mut self,
         policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<Option<LegacyReceive>, &'static str> {
-        let status = self.data_ready(&policy()?)?;
+        let domain = policy()?;
+        let status = if self.phase == Phase::SecuringData {
+            self.check_link_power(&domain)?;
+            self.security_status()?
+        } else {
+            self.data_ready(&domain)?
+        };
         let local = self.mac.unwrap();
         self.hardware.poll()?;
         while let Some(index) = self
@@ -449,30 +473,37 @@ impl Owner {
             if mpdu.channel != status.channel || f.len() < 24 || f[10..16] != status.bssid {
                 continue;
             }
-            if matches!(f[0], 0xa0 | 0xc0)
-                && f[1] & 0xc7 == 0
-                && f[4..10] == local
-                && f[16..22] == status.bssid
-                && f[22] & 15 == 0
-                && !mpdu.amsdu
-                && mpdu.body(24, 0).is_some_and(|b| b.len() == 2)
-            {
+            if ap_disconnected(&mpdu, local, status) {
                 return Err("MVM current AP disconnected legacy station");
             }
             // Only original non-QoS FromDS frames in this negotiated legacy
-            // profile. Reject HT-control, fragments, crypto/decrypted data,
+            // profile. Reject HT-control, fragments, unauthenticated crypto,
             // firmware duplicates and A-MSDUs before a generic frame parser.
             if f[0] != 8
-                || f[1] & 0xc7 != 2
+                || f[1] & 0x87 != 2
                 || f[22] & 15 != 0
-                || mpdu.status & (0x700 | (1 << 22)) != 0
+                || mpdu.status & (1 << 22) != 0
                 || mpdu.amsdu
                 || mpdu.amsdu_index != 0
                 || !legacy_rx_rate(&packet.payload, status)
                 || mpdu
-                    .body(24, 0)
+                    .body(24, if f[1] & 0x40 != 0 { 8 } else { 0 })
                     .is_none_or(|b| !(8..=1508).contains(&b.len()))
             {
+                continue;
+            }
+            let encrypted = f[1] & 0x40 != 0;
+            if encrypted {
+                // Native API4 must name station0 and report source/key-found,
+                // CCM, MIC-OK and DECRYPTED. The IV remains in the MPDU;
+                // firmware MIC stripping is described by its envelope.
+                if !status.protected
+                    || !self.security.has_pairwise()
+                    || mpdu.status & (0x1f000000 | 0xf4c) != 0xa4c
+                {
+                    continue;
+                }
+            } else if mpdu.status & 0xf40 != 0 {
                 continue;
             }
             let data = self
@@ -512,9 +543,13 @@ impl Owner {
                 {
                     continue;
                 }
+                if self.security.started() {
+                    self.security.receive(ethernet, encrypted)?;
+                    return Ok(None);
+                }
                 return Ok(Some(LegacyReceive::Eapol(ethernet)));
             }
-            if !status.protected {
+            if !status.protected || self.security.ready() && self.phase == Phase::DataPrepared {
                 return Ok(Some(LegacyReceive::Ethernet(ethernet)));
             }
         }
@@ -551,6 +586,7 @@ impl Owner {
             {
                 return Err("MVM data close peer disable failed");
             }
+            self.remove_security_keys().await?;
             self.hardware.discard_key_transition_rx()?;
             self.hardware.remove_idle_tx(queue, STATION, TID).await
         }
@@ -568,4 +604,4 @@ impl Owner {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mvm_data_tests.rs"]
-mod tests;
+pub(super) mod tests;

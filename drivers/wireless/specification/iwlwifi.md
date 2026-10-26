@@ -283,8 +283,10 @@ without publishing an interface or worker.
 A separate Gen2 owner implements the context-v1 transport for exact AX200
 2723 and AX201 02f0/43f0/a0f0 MAC/RF profiles. It selects Linux's CC/Qu/QuZ
 firmware prefix from discovered identity and requires API77 and the negotiated
-ALIVE6/NVM4 command profile. Native automatic admission remains closed: MVM
-active station PHY/link activation, rate/key/Block-Ack and recovery lifecycle still need
+ALIVE6/NVM4 command profile. The retained legacy station continuations in
+§3.11–3.16 now cover qualified active-link, MLME, rates, native WPA2 keys and
+encrypted packets. Native automatic admission remains closed: retained PCI
+publication/workers, beacon-loss/air teardown and recovery still need
 integration before a Gen2 interface can be published. The passive-scan owner
 creates its own idle MAC context but does not authorize station data.
 
@@ -406,8 +408,8 @@ before sending PHY REMOVE. Only the final correlated receipt reopens scan or
 channel preparation. Failure and cancellation at every publication boundary
 keep the phase closed and preserve the retained transport/DMA policy. These
 helpers never activate the link, allocate a station packet queue, install a
-peer/key or authorize transmit; active station and native PCI admission remain
-gated on the remaining power/SAR, peer/rate/key/BA, security and recovery work.
+peer/key or authorize transmit. Qualified station continuation is separate in
+§3.11–3.16; BA, recovery and native PCI admission remain subsequent work.
 Fixed source-cited Rust wire fixtures cover complete PHY
 and link/RLC payloads, both channel formats, both bands and each antenna mask.
 
@@ -496,9 +498,10 @@ allocation and source-matched DMA fields, native API-v2 response-fenced queue RE
 REMOVE. They also cover cancellation at both queue boundaries, malformed and
 foreign receipts, wrong queue/failure/reserved response fields, station/TID/idle
 rejection and authored API77 payload-version selection.
-These are software ownership results; active station admission, externally
-qualified platform power/SAR (§3.11), management beyond bounded authentication (§3.13),
-rate/key/BA/security, recovery and native Gen2 PCI publication remain gates.
+These are software ownership results. Active continuation requires the
+externally qualified platform power/SAR source (§3.11) and the actual later
+MLME/data/key receipts (§3.12–3.16); BA, recovery and native Gen2 PCI
+publication remain separate gates.
 
 ### 3.10 Host NO_IR policy
 
@@ -847,7 +850,8 @@ temporal key or synthetic key/handshake receipt.
 for the terminal prepared owner and a still-current qualification.
 `legacy_data_port_open(&mut self)` additionally resamples the current policy
 and firmware channel predicate. Observed source/policy loss closes the owner
-permanently; reinstalling policy cannot reopen it. Only Open returns true.
+permanently; reinstalling policy cannot reopen it. Open returns true at this
+stage; a protected association additionally requires the native §3.16 owner.
 `transmit_legacy_ethernet().await` binds the original local source/BSSID,
 complete Ethernet-II shape and retained sequence, excludes ordinary-caller
 EAPOL, refreshes MCC when required, and submits native TX-v9 with firmware TLC
@@ -861,19 +865,21 @@ reclamation. A timeout never proves device quiescence.
 `poll_legacy_receive()` performs one bounded native poll/drain and returns
 `Option<LegacyReceive::{Ethernet,Eapol}>`. It admits only current-channel,
 AP-bound FromDS non-QoS frames with valid CRC/overrun status, supported legacy
-rates-v2 modulation/rate and20MHz width. It rejects fragments, protected or
-firmware-decrypted data, HT-control, A-MSDUs and firmware/retry duplicates.
+rates-v2 modulation/rate and20MHz width. It rejects fragments, unsupported
+crypto metadata, HT-control, A-MSDUs and firmware/retry duplicates.
 The native descriptor's padding and CRC trailer are excluded from Ethernet.
 The controlled port never forwards WPA2 plaintext IP; a current AP/local-RA
 plaintext EAPOL frame is distinguished only after its outer802.1X version and
-length bounds validate. This is input for a future RSNA owner, not a MIC check,
-key installation, authenticated EAPOL reply or authorized data port. Open does
-not forward EAPOL to IP. A bound AP deauthentication/disassociation closes host
+length bounds validate. Before RSNA starts this is observation metadata, not a
+MIC check or caller-supplied key authority. Once the native RSNA owner starts,
+EAPOL is captured privately for §3.16. Open does not forward EAPOL to IP. A
+bound AP deauthentication/disassociation closes host
 admission and retains native resources without claiming an over-air response.
 Current policy/source checks precede receive work and every packet publication.
 
 `release_legacy_data().await` closes host admission before its first wait,
-acknowledges peer TX-disable, discards transition RX and validates idle
+acknowledges peer TX-disable, retires every installed native key and its RX
+epoch when RSNA is present, discards transition RX and validates idle
 station0/TID0 ownership before native queue REMOVE. Only its exact eight-byte
 matching receipt releases that queue and returns `Associated`. It preserves
 the management queue, AP, PHY, association and signed power owner. This closing
@@ -889,11 +895,104 @@ other cases cover each wait's cancellation/current policy/source, fresh MCC,
 malformed/foreign command/packet/close receipts, DMA retention, WPA2/EAPOL port
 isolation, receive geometry/padding/retry/AP-close, rejected caller packets and
 terminal policy reinstallation. These software tests do not publish a Gen2
-netdev or establish RF/firmware acceptance. Native RSNA/keys/PMF, BA/reorder,
+netdev or establish RF/firmware acceptance. Native PMF, BA/reorder,
 beacon-loss monitoring, over-air teardown/recovery, automatic PCI/netdev
 publication and runtime/system PM remain explicit subsequent work.
 
-### 3.16 Per-profile remaining software inventory
+### 3.16 Retained Gen2 WPA2-PSK/CCMP native key and RX epoch owner
+
+`Owner::secure_legacy_wpa2(pmk).await` continues a protected `DataPrepared`
+legacy association with an idle normal-data binding and the original observed
+PSK/CCMP RSN offer. It requires API change29 (`TKIP_MIC_KEYS`), exact
+ADD_STA_KEY payloadv2/v3, RX-queue-sync commandv1 and notificationv1. Linux
+`iwl_mvm_send_sta_key` defaults missing/UNKNOWN key-table entries to v2 when
+API29 is present; fixed sync-v1 IDs need not be enumerated in that table.
+Explicit incompatible layouts and unavailable nonce entropy fail before native publication. An
+observed source/host-policy loss is terminal. There is no caller completion,
+crypto-status or authorization boolean. The guarded entropy source supplies a
+fresh SNonce; shared Rust `security::Session` authenticates the original EAPOL
+PDU, replay, MIC, wrapped GTK KDE and original AP RSN. This path remains
+legacy20, non-QoS, single station and WPA2-Personal without PMF.
+
+The owner reserves `SecuringData` and its zeroizing PMK/session/key state before
+the first native wait. It enables the peer only for its private EAPOL producer,
+using the retained station0/TID15 queue, response-bound basic rate and native
+TX-v9. Ordinary callers still cannot transmit EAPOL or use the closed data
+port. M2 and M4 require actual positive queue/SSN TX receipts. The exact
+retained authenticated reply is bound to the native frame before submission;
+no key installation or port commit precedes the terminal M4 receipt. Rekey
+replies are hardware-encrypted with the old installed PTK until that receipt.
+
+Key changes acknowledge peer TX-disable, remove an occupied slot with its
+native receipt, then add authenticated new material. `ADD_STA_KEY` uses bare
+ID0x17/header0 and the76-byte v2/v3 structure from Linux `fw/api/sta.h` and
+`mvm/sta.c::{iwl_mvm_send_sta_key,__iwl_mvm_remove_sta_key}`. Station0 owns
+PTK slot0 and GTK slots1..4 (key IDs0..3). Flags retain WEP-key-map plus CCM,
+key ID and multicast; REMOVE uses NOT_VALID/NO_ENC with all key/sequence
+fields zero. Each receipt must be exactly four bytes with full status1.
+The authenticated GTK RSC is48-bit; Linux's six most-significant-first
+`ieee80211_key_seq.ccmp.pn` bytes use the v2 hole at2/3 or v3 contiguous
+layout. Fresh key material starts firmware TX PN0; firmware owns IV/MIC
+insertion and increments. This never resets an existing key's PN.
+
+After key receipts, the real single RX0 queue is synchronized with
+`TRIGGER_RX_QUEUES_NOTIF_CMD` group5/ID2/header0:20 bytes, flags0, mask1,
+count8 and internal type0/sync1/monotonic cookie. An exact empty command
+receipt and the matching12-byte group5/ID0xff notification are both required.
+Malformed markers fail; foreign cookies cannot commit an epoch. Pre-marker
+data is discarded before replay reset, while a bound AP disconnect remains
+terminal. Only this actual RX ordering marker permits the new PTK replay
+epoch or new GTK floor to commit. A final native peer-enable receipt and
+current signed platform source, host policy and firmware channel checks
+precede the protected data port. Linux primary references are
+`mvm/mac80211.c::iwl_mvm_sync_rx_queues_internal`,
+`mvm/rxmq.c::iwl_mvm_rx_queue_notif`, `mvm/sta.h` and `fw/api/rx.h`.
+The exact empty command-ACK profile still needs physical API77 acceptance.
+
+`poll_legacy_receive()` captures bounded native EAPOL privately once RSNA
+starts; `service_legacy_wpa2().await` drives captured retransmissions/rekeys
+with the same owner and credential. Its input is actual native receive,
+not caller-provided EAPOL. Duplicate authenticated M3 replies reuse the exact
+cached M4 and never re-add keys or reset replay. Pairwise rekey uses a fresh
+SNonce and keeps the old native PTK until the new M4 receipt. Unchanged GTKs
+retain their PN and take the maximum authenticated RSC. Old key IDs remain
+owned until replacement or close. Retired-material fingerprints survive data
+and association recreation; reusing retired material or exhausting32 retained
+fingerprints fails closed instead of resetting a PN.
+
+`legacy_data_port_open()` now also admits a terminal protected RSNA owner.
+`transmit_legacy_ethernet()` submits protected native plaintext DMA for
+firmware CCMP under the installed PTK, still requiring exact native TX
+completion and current qualification. Receive requires real API4 CRC/overrun,
+station0 source-found/key-valid, CCM/MIC-OK/decrypted status, original AP and
+channel, the retained CCMP IV, and monotonic per-key non-QoS PN. Native
+descriptor padding/trailers are excluded. Invalid metadata never advances PN;
+plaintext IP, unknown group keys and replay remain denied. Ethernet is
+published only after the port's final commit. Firmware crypto metadata grants
+no authority without the retained native key receipts and current source.
+
+Cancellation retains the exact phase, EAPOL reply, pending/new/old keys,
+cookie, commands and queue/packet DMA; late receipts cannot reopen it. Failed
+or ambiguous transactions require transport retirement/reset, not a retry.
+`release_legacy_data()` closes admission before its first wait and executes
+peer-disable → each installed native key REMOVE → actual RX epoch marker →
+idle data-queue REMOVE. Closing is permitted after source/policy revocation;
+only exact receipts retire resources. No timeout proves RF quiescence.
+
+Fifteen new native smokes use the actual TFH/RFH publication path, an
+independent authenticator with real MIC/AES key-wrap and device-key CCM
+encryption/decryption. They cover both key layouts; M4/key/fence/port ordering;
+encrypted bidirectional Ethernet; duplicate, group and pairwise rekeys;
+nonzero RSC; every native wait's cancellation/current authority/failure;
+malformed and foreign markers; RX-prefix retirement; exact full status;
+native crypto/PN/group-floor denial; source-defined omitted/UNKNOWN version
+fallbacks; old-material rejection; AP close during
+the epoch; and key/queue closing ownership. These are software conversation
+tests, not hardware acceptance. Automatic Gen2 PCI/netdev/SME publication,
+PMF/WPA3, BA/reorder, WMM/HT/VHT/HE, wider channels, beacon-loss/air teardown,
+recovery and runtime/system PM remain separate work.
+
+### 3.17 Per-profile remaining software inventory
 
 This inventory follows local Linux `cfg/{22000,ax210,bz,sc}.c`, `mvm/{ops,sta,
 link,mld-mac,tx,mac80211}.c` and `fw/api/{mac-cfg,sta,tx,rs}.h`. Actual NVM,
@@ -902,7 +1001,7 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles | Context-v1 boot, native RFH/TFH, NVM/runtime defaults, passive scan, inactive/active PHY/link, AP peer/management queue, measured signed v5 SAR/power, actual open authentication and Open/PSK-CCMP legacy association/local close; retained normal-data queue/DCF/TLC and Open packet TX/RX, closed WPA2 port with bounded EAPOL receive | Real pairwise/group key and RSNA integration; BA/reorder; protected management; beacon loss/air teardown; recovery and runtime/system PM; retained native PCI station publication. HT/VHT/HE, wider channels, AP/P2P, WoW/offloads and multiple RX/RSS are not implemented by the new legacy owner even where hardware supports them. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles | Context-v1 boot, native RFH/TFH, NVM/runtime defaults, passive scan, inactive/active PHY/link, AP peer/management queue, measured signed v5 SAR/power, actual open authentication and Open/PSK-CCMP legacy association/local close; retained normal-data queue/DCF/TLC, Open TX/RX and native WPA2 M4/key/epoch/rekey controlled-port/encrypted TX/RX continuation | BA/reorder; protected management/WPA3; beacon loss/air teardown; recovery and runtime/system PM; retained native PCI station publication. HT/VHT/HE, WMM, wider channels, AP/P2P, WoW/offloads and multiple RX/RSS are not implemented by the new legacy owner even where hardware supports them. Exact firmware key/RX-sync contracts and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile. The generic Gen3 command-ID-header/version assumption still needs a native Linux ABI audit; payload versions alone cannot select header versions. Sc conversation tests do not establish a different family's ABI or hardware. |
 | Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile | The same explicit Gen3 native command-ID audit; HE/EHT/6GHz and MLO,160/320MHz, AP/P2P, advanced offloads, platform power/runtime/system PM remain separate implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |

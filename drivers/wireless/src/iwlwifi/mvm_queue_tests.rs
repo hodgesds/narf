@@ -2,7 +2,7 @@ use super::super::super::{
     connection::Beacon, firmware_api::FirmwareApi, gen2_profile, runtime, rx_rfh, station_api::Nvm,
 };
 use super::*;
-use alloc::vec;
+use alloc::{boxed::Box, vec};
 use core::{
     future::Future,
     pin::{pin, Pin},
@@ -18,10 +18,15 @@ const VERSIONS: &[u8] = &[
 ];
 
 pub(in crate::iwlwifi::mvm_boot) struct Fixture {
-    pub(in crate::iwlwifi::mvm_boot) owner: Option<Owner>,
+    // This fixture is returned through power/link/auth/association setup.
+    // Keep the native owner at one stable heap address: by-value copies at
+    // each helper otherwise exceed the64KiB aarch64 boot/test stack before
+    // reaching the first WPA2 transaction. DMA ownership is unchanged.
+    pub(in crate::iwlwifi::mvm_boot) owner: Option<Box<Owner>>,
     pub(in crate::iwlwifi::mvm_boot) firmware: runtime::model::Firmware,
     pub(in crate::iwlwifi::mvm_boot) trace: runtime::model::TxTrace,
 }
+const _: () = assert!(core::mem::size_of::<Fixture>() <= 256);
 impl Fixture {
     pub(in crate::iwlwifi::mvm_boot) fn new() -> Self {
         let (mut hardware, firmware, trace) =
@@ -40,7 +45,7 @@ impl Fixture {
         bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
         bytes[28] = 1;
         Self {
-            owner: Some(Owner {
+            owner: Some(Box::new(Owner {
                 hardware,
                 firmware: vec![],
                 profile: gen2_profile::select(0xa0f0, 0x351, 0x10c000).unwrap(),
@@ -63,7 +68,8 @@ impl Fixture {
                 peer: None,
                 management_queue: None,
                 power: super::super::power::Context::new(&api),
-            }),
+                security: super::super::rsna::Context::default(),
+            })),
             firmware,
             trace,
         }

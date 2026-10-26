@@ -27,6 +27,7 @@ pub enum Phase {
     PreparingData,
     DataPrepared,
     TransmittingData,
+    SecuringData,
     ClosingData,
     ClearingAssociation,
     DeactivatingLink,
@@ -47,6 +48,7 @@ pub struct Owner {
     peer: Option<peer::ApPeer>,
     management_queue: Option<queue::ManagementQueue>,
     power: power::Context,
+    security: rsna::Context,
 }
 impl core::fmt::Debug for Owner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -99,6 +101,7 @@ impl Owner {
             peer: None,
             management_queue: None,
             power: power::Context::new(&parsed.api),
+            security: rsna::Context::new(&parsed.api),
         })
     }
     pub fn phase(&self) -> Phase {
@@ -223,3 +226,6 @@ pub type AssociationSecurity = narf_wireless::association::SecurityMode;
 mod data;
 pub type LegacyDataStatus = data::LegacyDataStatus;
 pub type LegacyReceive = data::LegacyReceive;
+
+#[path = "mvm_security.rs"]
+mod rsna;

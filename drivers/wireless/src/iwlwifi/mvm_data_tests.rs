@@ -19,7 +19,7 @@ use narf_wireless::{
 const AP: [u8; 6] = [2, 4, 6, 8, 10, 12];
 const DATA_QUEUE: u16 = 24;
 const POINTER: u16 = 0x91;
-fn policy() -> RegulatoryDomain {
+pub(in crate::iwlwifi::mvm_boot) fn policy() -> RegulatoryDomain {
     RegulatoryDomain {
         country_code: *b"US",
         rules: vec![RegRule {
@@ -43,7 +43,11 @@ fn poll<T>(future: Pin<&mut impl Future<Output = T>>) -> Poll<T> {
 fn check(test: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
     test().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
-fn associated(protected: bool, version: u8, mixed_rates: bool) -> Result<Fixture, &'static str> {
+pub(in crate::iwlwifi::mvm_boot) fn associated(
+    protected: bool,
+    version: u8,
+    mixed_rates: bool,
+) -> Result<Fixture, &'static str> {
     let mut f = authenticated_fixture(protected)?;
     let owner = f.owner.as_mut().unwrap();
     if mixed_rates {
@@ -142,7 +146,10 @@ fn until<T>(
     }
     Ok(())
 }
-fn prepare(f: &mut Fixture, protected: bool) -> Result<(), &'static str> {
+pub(in crate::iwlwifi::mvm_boot) fn prepare(
+    f: &mut Fixture,
+    protected: bool,
+) -> Result<(), &'static str> {
     let mut op = pin!(f
         .owner
         .as_mut()

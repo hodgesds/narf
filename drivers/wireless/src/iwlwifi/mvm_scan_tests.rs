@@ -37,6 +37,7 @@ impl Fixture {
                 nvm: Some(station_api::Nvm::parse(4, &nvm).unwrap()),
                 peer: None,
                 management_queue: None,
+                security: super::super::rsna::Context::default(),
                 power: super::super::power::Context::new(
                     &super::super::super::firmware_api::FirmwareApi::default(),
                 ),
