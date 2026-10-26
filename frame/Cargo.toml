@@ -30,14 +30,14 @@ narf-io            = { path = "../io" }
 narf-block         = { path = "../block" }
 narf-drivers-nvme    = { path = "../drivers/nvme" }
 narf-drivers-virtio  = { path = "../drivers/virtio" }
-narf-drivers-net     = { path = "../drivers/net" }
+narf-drivers-net     = { path = "../drivers/net", default-features = false, optional = true }
 narf-net             = { path = "../net" }
 narf-drivers-wireless = { path = "../drivers/wireless" }
 narf-drivers-i3c      = { path = "../drivers/i3c" }
 narf-drivers-i2c      = { path = "../drivers/i2c" }
 narf-drivers-gpio     = { path = "../drivers/gpio" }
 narf-drivers         = { path = "../drivers" }
-narf-drivers-storage = { path = "../drivers/storage" }
+narf-drivers-storage = { path = "../drivers/storage", default-features = false, optional = true }
 narf-drivers-usb     = { path = "../drivers/usb" }
 narf-drivers-video   = { path = "../drivers/video" }
 narf-drivers-media = { path = "../drivers/media" }
@@ -235,7 +235,49 @@ cgroup-all = [
 # user tasks run there (sharing the BSP's TSS/IST corrupts memory — that was
 # a long-lived heisenbug). `--no-default-features` pins user tasks to the
 # BSP; the per-CPU AP setup stays on either way.
-default = ["user-task-smp"]
+default = ["user-task-smp", "drivers-net", "drivers-storage"]
+
+# Driver-group selection (configurable drivers, design §5.2). The
+# net/storage facades expose per-driver features whose own `default`
+# is "all"; frame takes both facades with default features OFF and
+# forwards each group's FULL per-driver set through these features,
+# so builds select drivers at group granularity: frame's `default`
+# includes both groups (a plain build composes exactly the driver
+# set it did before this wiring), and xtask's named subset configs
+# (`--config minimal`, build/xtask/src/configs.rs) build with
+# `--no-default-features` and leave the groups out. Selection and
+# registration are the same switch: bare_main calls the facades'
+# `register_initcalls()` only under the matching feature, so a group
+# that is not selected is never registered (the composition census
+# fixture in frame/src/census.rs pins the equivalence).
+drivers-net = [
+    "dep:narf-drivers-net",
+    "narf-drivers-net/atheros",
+    "narf-drivers-net/bnxt",
+    "narf-drivers-net/cxgb4",
+    "narf-drivers-net/e1000",
+    "narf-drivers-net/enic",
+    "narf-drivers-net/forcedeth",
+    "narf-drivers-net/i40e",
+    "narf-drivers-net/igb",
+    "narf-drivers-net/igc",
+    "narf-drivers-net/ixgbe",
+    "narf-drivers-net/mlx5",
+    "narf-drivers-net/realtek",
+    "narf-drivers-net/rtl8139",
+    "narf-drivers-net/tg3",
+    "narf-drivers-net/vmxnet3",
+]
+drivers-storage = [
+    "dep:narf-drivers-storage",
+    "narf-drivers-storage/ahci",
+    "narf-drivers-storage/megaraid",
+    "narf-drivers-storage/mpt3sas",
+    "narf-drivers-storage/rtsx",
+    "narf-drivers-storage/sdhci",
+    "narf-drivers-storage/smartpqi",
+    "narf-drivers-storage/vmd",
+]
 
 # User-task SMP: let USER tasks migrate onto application processors.
 # ON by default. Provides the per-AP user-mode machinery (per-CPU
