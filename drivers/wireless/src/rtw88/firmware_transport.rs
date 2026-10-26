@@ -745,8 +745,21 @@ impl<I: Io> Owner<I> {
         .flatten()
     }
     pub(super) fn legacy_wmm_request(&self) -> Result<super::station_profile::Request, Error> {
-        if !matches!(self.phase, Phase::Calibrated | Phase::Station) {
+        if !matches!(
+            self.phase,
+            Phase::Calibrated | Phase::Radio8821cPrepared | Phase::Station
+        ) {
             return Err(Error::State);
+        }
+        if self.did == 0xc821 {
+            return super::power_policy::Gate::c21(
+                self.station_grant8821c
+                    .as_ref()
+                    .ok_or(Error::State)?
+                    .clone(),
+            )
+            .extension_request()
+            .ok_or(Error::Unsupported);
         }
         self.radio_gate
             .as_ref()

@@ -73,11 +73,11 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
     }
 }
 pub(in crate::rtw88) struct Peer {
-    pub(super) wmm: Option<Vec<u8>>,
-    pub(super) qos: bool,
-    pub(super) association: Option<Vec<u8>>,
-    pub(super) response_rates: Option<Vec<u8>>,
-    pub(super) response_wmm: Option<Option<Vec<u8>>>,
+    pub(in crate::rtw88) wmm: Option<Vec<u8>>,
+    pub(in crate::rtw88) qos: bool,
+    pub(in crate::rtw88) association: Option<Vec<u8>>,
+    pub(in crate::rtw88) response_rates: Option<Vec<u8>>,
+    pub(in crate::rtw88) response_wmm: Option<Option<Vec<u8>>>,
     pub(in crate::rtw88) ap: FakeAp,
     pub(in crate::rtw88) plan: NetworkPlan,
     pub(super) server: DhcpServer,

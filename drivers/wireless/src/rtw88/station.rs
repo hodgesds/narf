@@ -663,7 +663,7 @@ impl State {
             armed: true,
         };
         // Missing/unqualified extension preserves the original CCK1 profile.
-        // C21 cannot supply this C22-only sealed grant through its native Io.
+        // Each chip can supply only its own exact-board sealed extension.
         if let Some(grant) = io.station_extension()? {
             if candidate.basic_rates & !grant.rates() == 0 {
                 let p = if grant.wmm() {

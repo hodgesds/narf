@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Optional C22 legacy-rate/WMM recipe qualification. No measured asset is
-//! supplied. The original N22Cv2 calibration alone never authorizes this path.
+//! Optional chip-specific C21/C22 legacy-rate/WMM qualification. No measured
+//! asset is supplied; the base N21S/N22Cv2 alone never authorizes this path.
 use super::{
     firmware_transport::Error,
     power_policy::{self, Gate},
@@ -44,6 +44,30 @@ pub(super) fn request(
         ),
     }
 }
+pub(super) fn request_c21(
+    station: [u8; 32],
+    qualification: [u8; 32],
+    indices: [u8; 12],
+    mac: [u8; 6],
+) -> Request {
+    let mut h = narf_crypto::sha256::Sha256::new();
+    h.update(b"NARF RTL8821CE ch1/20 RF-A static legacy12 DATA and response-bound WMM BE/TID0 v1");
+    h.update(&station);
+    h.update(&qualification);
+    h.update(&indices);
+    h.update(b"exact retained N21Q IQK/N21P TXAGC12/N21S awake qualification; measured full thermal0..63; no C22 reference/difference power ABI; 1d00/04/08 actual indices, unused HT/VHT0; RF18c01 RF08clear IQKfail0");
+    h.update(b"actual bound legacy12 intersection; rateID B8/BG6/G7; H2C40 init1 PTdisabled mask12; fixed highest IEEE kbps data USE_RATE DISDATAFB; mgmt/EAPOL1M");
+    h.update(b"WMM1 strict singleton Param; no UAPSD ACM BE; AP-response parameters; source EDCA 500/504/508/50c; SIFS10 slot9/20; BE AIFSN>=3 CWmin>=31 CWmax>=1023 TXOP0; no HT AMPDU BA");
+    h.update(b"source phy_get_rrsr_mask(selected_rate)&15f=1f/5f/15f; TXDESC48 TXBD16 RXDESC24 RXBD8; BE3a8; raw QoS26 TID0 before software CCMP; mgmt/EAPOL24; current Q/P/S/L signed sources and policy at every publication");
+    Request {
+        identity: h.finalize(),
+        mac,
+        filename: format!(
+            "rtw88/rtw8821ce-legacy-wmm-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        ),
+    }
+}
 pub(super) enum Source {
     Registered,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -56,7 +80,7 @@ pub(super) enum Source {
 }
 pub(super) struct Grant {
     request: Request,
-    base: power_policy::CalibratedBase,
+    base: power_policy::ExtensionBase,
     cap: Cap<FirmwareBlob, Read>,
     antenna: i16,
     ceiling: i16,
@@ -68,10 +92,10 @@ pub(super) struct Grant {
 }
 impl Source {
     pub(super) fn load(self, base: Gate) -> Result<Arc<Grant>, Error> {
-        let base = base.calibrated_base().ok_or(Error::Unsupported)?;
+        let base = base.extension_base().ok_or(Error::Unsupported)?;
         let request = base.request();
         struct Decode {
-            base: power_policy::CalibratedBase,
+            base: power_policy::ExtensionBase,
             request: Request,
         }
         impl CapOp<FirmwareBlob, Read> for Decode {
@@ -115,16 +139,22 @@ impl Grant {
         signer: Option<[u8; 32]>,
         cap: Cap<FirmwareBlob, Read>,
         request: Request,
-        base: power_policy::CalibratedBase,
+        base: power_policy::ExtensionBase,
     ) -> Result<Self, Error> {
         cap.invoke(NoopOp)
             .map_err(|_| denied(power_policy::Error::Authority))?;
         signer.ok_or(denied(power_policy::Error::Unsigned))?;
         if raw.len() != 128
-            || &raw[..4] != b"N22L"
+            || &raw[..4]
+                != if base.did() == 0xc821 {
+                    b"N21L"
+                } else {
+                    b"N22L"
+                }
             || raw[4..8] != [1, 0, 128, 0]
             || raw[8..12] != 128u32.to_le_bytes()
-            || raw[12..16] != [0xec, 0x10, 0x22, 0xc8]
+            || raw[12..14] != [0xec, 0x10]
+            || raw[14..16] != base.did().to_le_bytes()
             || raw[54..56] != [1, 20]
             || raw[90] & !1 != 0
             || raw[91..] != [0; 37]
@@ -166,6 +196,9 @@ impl Grant {
     pub(super) fn rates(&self) -> u16 {
         self.rates
     }
+    pub(super) fn did(&self) -> u16 {
+        self.base.did()
+    }
     pub(super) fn wmm(&self) -> bool {
         self.wmm
     }
@@ -183,8 +216,7 @@ impl Grant {
         narf_wireless::reg::db::get_domain().ok_or(denied(power_policy::Error::Policy))
     }
     fn policy(&self, domain: &RegulatoryDomain) -> Result<(), Error> {
-        self.base.current(domain).map_err(denied)?;
-        let limit = self.base.eirp().min(self.ceiling);
+        let limit = self.base.current(domain)?.min(self.ceiling);
         if self.peaks.iter().enumerate().any(|(i, &p)| {
             (i < 2 || self.rates & (1 << (i - 2)) != 0)
                 && i32::from(p) + i32::from(self.antenna) > i32::from(limit)

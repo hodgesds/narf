@@ -1,6 +1,6 @@
 # rtw88 — Specification
 
-> Status: **v1.1** (RTL8821CE retained firmware/MAC/PHY, separately signed IQK/parked-power/awake-station continuations; RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
+> Status: **v1.2** (RTL8821CE retained firmware/MAC/PHY, separately signed IQK/parked-power/awake-station and legacy12/WMM continuations; RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
 > signed operating-power qualification, native packets and channel1 station
 > integration; composed software gates and physical acceptance remain distinct).
 >
@@ -18,9 +18,9 @@ loader, MAC/FIFO/PHY, H2C, calibrated radio/board-power continuations and a
 single awake channel1 legacy20 station for RTL8821CE/RTL8822CE. Each retained station
 supports Open and WPA2-PSK with host RSNA/CCMP; its ordinary host TX rate is
 fixed at1Mbps by default and requires an AP advertising that basic rate.
-RTL8822CE can separately qualify response-bound legacy12 DATA rates and
-non-HT WMM BE/TID0; management and EAPOL remain at1Mbps. C21's N21S authority
-does not admit that C22 extension.
+RTL8821CE/RTL8822CE can separately qualify response-bound legacy12 DATA rates
+and non-HT WMM BE/TID0; management and EAPOL remain at1Mbps. N21S alone does
+not admit the C21 extension, and neither chip can reuse the other's assets.
 The probe decodes physical EFUSE programming
 records to obtain the correct PCIe MAC.
 
@@ -621,11 +621,12 @@ After attachment, both signed source invocations and the current installed
 host policy enclose actual register/CPU-DMA/doorbell/BME publications. Source
 or observed policy loss then closes that owner permanently; reinstalling
 policy cannot restore it. No live operation implicitly bootstraps policy.
-N22L retains a distinct C22 `CalibratedBase` containing only the original
-calibration source/permission. Its base-only invocation encloses the N22L
-invocation directly; it never routes through the extension-aware packet gate.
-An already extended gate and every C21 gate refuse base extraction. This keeps
-both current source checks while making native generic dispatch acyclic.
+The extension retains a statically base-only `ExtensionBase`: C22's
+`CalibratedBase` contains the original calibration source/permission; the C21
+arm retains its actual N21S source. Neither arm routes through an
+extension-aware packet gate, and an already extended gate refuses extraction.
+C21 still refuses extraction as a C22 `CalibratedBase`. Current source
+enclosures therefore remain chip-specific and generic dispatch stays acyclic.
 
 Shared `wireless::wmm` parses the original complete AP offer and the bound
 successful association response. Only a valid offered Parameter IE and a
@@ -777,7 +778,7 @@ ACTIVE/media/RA/default-port commands and `main.c`/`mac80211.c` MAC/BSSID/AID/
 conservative DCF semantics are reused. C21 RF, EFUSE and qualification remain
 distinct. The qualified shell then uses shared MLME/RSNA/host CCMP and exposes
 Open/WPA2, passive ch1/20, CCK1 ordinary TX and receive-only legacy rates;
-no QoS, aggregation or HT/VHT admission is inferred.
+no QoS, aggregation or HT/VHT admission is inferred by N21S alone.
 
 Seven new native Rust smokes compose the actual reserved-DMA firmware/MAC/PHY/
 IQK/N21P owner through radio and packet/station. They cover literal CAM/wake/
@@ -789,6 +790,64 @@ revocation. These are inert software models. Physical
 RF acceptance, real signed measured assets and qualification over the full
 permitted awake operating/temperature envelope remain external gates; dynamic
 power tracking and thermal compensation are not claimed.
+
+### RTL8821CE separately qualified legacy12 DATA and WMM BE/TID0
+
+`rtl8821c_legacy_wmm_request()` returns `C21LegacyWmmRequest` after genuine
+same-owner N21S radio preparation. Its MAC-bound
+`rtw88/rtw8821ce-legacy-wmm-v1-<mac>.bin` name and SHA256 identify a distinct
+C21 program: the exact retained N21S recipe and signed-record digest, all12
+actual N21P TXAGC indices, RF-A channel/IQK state, source EDCA/RA/RRSR, native
+legacy12 fixed DATA selection and raw QoS26/host CCMP. This metadata grants no
+RF authority and cannot request a C22 qualification.
+
+The signed128-byte **N21L** record uses the N22L field layout documented above,
+with magic `N21L`, DID0xc821 and this exact C21 identity. Its enabled-rate
+bitmap (including1Mbps), independently measured12 DATA peaks, complete-program
+transient and automatic-response peaks, antenna gain, ceiling and optional
+WMM flag apply to the complete static awake raw thermal range0..63. A narrow
+initial sample cannot replace that full measured envelope. No actual measured
+asset is supplied. The original N21Q/N21P/N21S sources stay mandatory/current;
+every actual radio/control/packet/host publication nests their invocations with
+the new N21L capability. All peaks plus antenna gain fit the new signed ceiling,
+current N21S ceiling,20dBm profile and every overlapping host-policy minimum.
+Missing, foreign-chip, malformed, unsigned, revoked or denied N21L preserves
+the original N21S CCK1 legacy profile before any changed hardware operation.
+Once attached, observed source/policy loss is terminal, including after native
+RX/CCX read and before final carrier/frame publication; reinstall cannot reopen.
+
+C21's own `rtw8821c_set_tx_power_index_by_rate` packs the measured indices in
+RF-A `0x1d00/0x1d04/0x1d08`; the five unused HT/VHT words remain zero. This
+continuation reads all eight actual words, RF18 ch1/20, RF08 cleared after IQK,
+zero failed/reload status and disabled hardware crypto before/after extended
+control programming. It never reads or substitutes C22's `0x18a0/0x41a0`
+reference gains or `0x3a00` relative-difference power format. Source C21 chip
+info independently declares matching48/16/24/8 PCI descriptors and
+`old_datarate_fb_limit=false`; its RA and EDCA port0 ABI matches the reviewed
+common path. No new RF/calibration completion or thermal sample is inferred.
+
+Only a strict offered WMM Parameter IE, N21L WMM permission and the actual
+bound association response admit BE/TID0. The same response's common measured
+legacy rates drive RA/rate-ID and the highest IEEE bit rate for ordinary DATA.
+Source EDCA readbacks, conservative BE limits and the source response mask
+precede native profile admission. Management/EAPOL remain legacy24/CCK1; QoS26
+is formed before host CCMP, unsupported TIDs/A-MSDUs/AMPDUs and HT/VHT remain
+closed. A qualified non-WMM peer retains legacy headers; an unqualified WMM
+peer keeps the prior CCK1 connection. Original firmware/beacon/command and
+packet DMA owners remain retained without reset, replay or ring replacement.
+
+Eight new native Rust smokes compose the actual C21 reserved-DMA firmware,
+inactive MAC/PHY, IQK, parked-power, awake and station owner through this path.
+They check exact-chip asset refusal/retry and legacy fallback, Open/WPA2 real
+kernel DHCP and bidirectional IP, actual source TXAGC/EDCA/RA/RRSR/descriptors,
+response narrowing and non-WMM headers, bad QoS/MIC/replay, partial EDCA
+cancellation and all four signed-source/policy losses, missing/duplicate/ACM
+responses or native register/RF/IQK loss, held/modified/late M4 and actual
+descriptor/final-RX publication revocation. Firmware bounce bytes and native
+packet allocation identity stay unchanged; ambiguous exits retain DMA.
+These are inert software models, not physical RF acceptance. Real full-envelope
+signed assets, HT/VHT widths/aggregation, other bands/channels, full AC/TID,
+dynamic tracking/coexistence, recovery and PM remain explicit gates/work.
 
 ## 4. Invariants
 
@@ -871,7 +930,7 @@ Remaining software ledger:
 | C21 awake radio/packet/port0/station | Exact N21S identity/current triple signed-source authority and live policy, C21 gain/channel/thermal and real wake/CAM receipts, parked same-owner beacon disarm and native Open/WPA2 DHCP/IP composition implemented; measured assets/physical acceptance remain external |
 | Current signed per-board gain/operating-envelope qualification | Implemented loader, exact identity/source ceilings, cap revocation and current-policy checks; real measured signed artifact is an external deployment gate |
 | Fixed awake ch1 radio/DACK/IQK/OTP/qualified power | Implemented for the explicit version2 CCK/control-response profile; real signed measured envelope remains a deployment gate |
-| C22 legacy12 DATA/WMM BE-TID0 | Separate N22L identity/current signed measurement and host-policy gates; bound response rates/parameters, source EDCA/RA/RRSR, native fixed legacy DATA descriptors, raw QoS/CCMP and Open/WPA2 DHCP/IP composition implemented. C21 remains legacy-only; full AC/TID scheduling remains work |
+| C21/C22 legacy12 DATA/WMM BE-TID0 | Separate N21L/N22L exact-chip identities/current signed measurements and host-policy gates; bound response rates/parameters, source EDCA/RA/RRSR, each chip's actual gain readbacks, native fixed legacy DATA, raw QoS/CCMP and Open/WPA2 DHCP/IP composition implemented. Base N21S/N22Cv2 alone retain CCK1; full AC/TID scheduling remains work |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
 | Passive scan, authentication/association, WPA2 controlled port | Retained channel1 shared MLME/RSNA/CCMP through actual native DMA and CCX, including held/altered/cancelled M4 and queued peer-loss closure |
 | Native management/data TX, RX, completion and ring ownership | Implemented original rings, source descriptors, exact DMA plus CCX security receipt and current-authority publication |

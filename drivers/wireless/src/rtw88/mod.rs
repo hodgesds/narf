@@ -81,6 +81,7 @@ pub use radio8821c::Info as C21CalibrationInfo;
 pub use radio8821c::StationInfo as C21StationRadioInfo;
 pub use station_power8821c::Request as C21StationRequest;
 pub use station_profile::Request as C22LegacyWmmRequest;
+pub use station_profile::Request as C21LegacyWmmRequest;
 pub mod pci;
 pub(crate) mod pci_park;
 

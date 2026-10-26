@@ -797,7 +797,7 @@ unsafe impl Registers for Native {
     ) -> Result<Option<alloc::sync::Arc<super::station_profile::Grant>>, Error> {
         self.station_allowed()?;
         let gate = self.packet_gate.as_ref().ok_or(Error::State)?;
-        if gate.did() != 0xc822 {
+        if gate.extension_request().is_none() {
             return Ok(None);
         }
         // Optional qualification lookup is pure. Missing/malformed assets
@@ -827,6 +827,13 @@ unsafe impl Registers for Native {
         gate.invoke(|| self.configure_packet_profile(profile))
     }
     fn station_profile_readback(&mut self) -> Result<(), Error> {
+        if let Some(indices) = self
+            .packet_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::c21_indices)
+        {
+            return super::radio8821c::operating_readback(|r| self.read32(r), indices);
+        }
         let gains = self
             .packet_gate
             .as_ref()

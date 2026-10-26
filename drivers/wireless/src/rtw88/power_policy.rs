@@ -205,6 +205,53 @@ impl CalibratedBase {
             .map_err(|_| super::firmware_transport::Error::Power(Error::Authority))?
     }
 }
+/// Extension bases never contain an extension-aware Gate. Both arms dispatch
+/// directly into their chip's retained qualification, keeping invocation
+/// statically acyclic and preventing C22 gain/measurement substitution.
+pub(super) enum ExtensionBase {
+    C22(CalibratedBase),
+    C21(alloc::sync::Arc<super::station_power8821c::Grant>),
+}
+impl ExtensionBase {
+    pub(super) fn did(&self) -> u16 {
+        match self {
+            Self::C22(_) => 0xc822,
+            Self::C21(_) => 0xc821,
+        }
+    }
+    pub(super) fn request(&self) -> super::station_profile::Request {
+        match self {
+            Self::C22(b) => b.request(),
+            Self::C21(b) => b.extension_request(),
+        }
+    }
+    pub(super) fn current(
+        &self,
+        d: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<i16, super::firmware_transport::Error> {
+        match self {
+            Self::C22(b) => {
+                b.current(d)
+                    .map_err(super::firmware_transport::Error::Power)?;
+                Ok(b.eirp())
+            }
+            Self::C21(b) => {
+                b.check()?;
+                b.extension_limit(d)
+            }
+        }
+    }
+    pub(super) fn invoke<T>(
+        &self,
+        d: &narf_wireless::reg::RegulatoryDomain,
+        op: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
+    ) -> Result<T, super::firmware_transport::Error> {
+        match self {
+            Self::C22(b) => b.invoke(d, op),
+            Self::C21(b) => b.invoke(op),
+        }
+    }
+}
 #[derive(Clone)]
 enum Scope {
     C22 {
@@ -215,6 +262,23 @@ enum Scope {
     C21(alloc::sync::Arc<super::station_power8821c::Grant>),
 }
 impl Gate {
+    pub(super) fn extension_base(&self) -> Option<ExtensionBase> {
+        if self.extension.is_some() {
+            return None;
+        }
+        match &self.scope {
+            Scope::C22 {
+                calibration,
+                permission,
+                own,
+            } => Some(ExtensionBase::C22(CalibratedBase {
+                calibration: calibration.clone(),
+                permission: *permission,
+                own: *own,
+            })),
+            Scope::C21(b) => Some(ExtensionBase::C21(b.clone())),
+        }
+    }
     pub(super) fn calibrated_base(&self) -> Option<CalibratedBase> {
         if self.extension.is_some() {
             return None;
@@ -319,7 +383,7 @@ impl Gate {
                 permission.gains,
                 *own,
             )),
-            Scope::C21(_) => None,
+            Scope::C21(g) => Some(g.extension_request()),
         }
     }
     pub(super) fn eirp(&self) -> Option<i16> {
@@ -345,13 +409,19 @@ impl Gate {
         &self,
         g: alloc::sync::Arc<super::station_profile::Grant>,
     ) -> Result<Self, super::firmware_transport::Error> {
-        if self.did() != 0xc822 || self.extension.is_some() || !g.matches(self) {
+        if self.did() != g.did() || self.extension.is_some() || !g.matches(self) {
             return Err(super::firmware_transport::Error::State);
         }
         g.check()?;
         let mut gate = self.clone();
         gate.extension = Some(g);
         Ok(gate)
+    }
+    pub(super) fn c21_indices(&self) -> Option<[u8; 12]> {
+        match &self.scope {
+            Scope::C21(g) => Some(g.indices()),
+            Scope::C22 { .. } => None,
+        }
     }
     pub(super) fn invoke_with_domain<T>(
         &self,

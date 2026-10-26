@@ -14,6 +14,8 @@ use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIf
 const OWN: [u8; 6] = [2, 4, 6, 8, 10, 12];
 const AP: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const SSID: &[u8] = b"narf-8822ce"; // shared independent AP actor, not a chip identity
+#[path = "wmm8821c_tests.rs"]
+mod wmm_tests;
 
 type OperatingFixture = (Fixture, Cap<FirmwareBlob, Read>, Cap<FirmwareBlob, Read>);
 fn operating() -> Result<OperatingFixture, &'static str> {
@@ -144,7 +146,8 @@ fn smoke_rtw8821ce_native_station_radio_retry_receipts_and_retained_reserved_dma
         || m.frame.lock().bytes[..DESC] != [0; DESC]
         || m.station_gate.as_ref().is_none_or(|g| g.did() != 0xc821)
         || m.station_gate.as_ref().is_some_and(|g| {
-            g.extension_request().is_some()
+            g.extension_request().is_none()
+                || g.calibrated_base().is_some()
                 || g.allows_profile(crate::rtw88::packet_format::DataProfile {
                     rates: 0xfff,
                     qos: false,
