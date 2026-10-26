@@ -2,29 +2,46 @@
 //!
 //! ## /dev/tpm0 — raw TPM access
 //!
-//! Serialises each open fd with a per-node mutex: write submits a TPM 2.0
+//! Serialises each open fd with a per-fd mutex: write submits a TPM 2.0
 //! command via the installed transport and stores the pending response;
 //! read returns that response. `poll_readiness` returns `POLL_IN` when a
 //! response is pending, `POLL_OUT` always. Only one command can be in
-//! flight at a time (write fails with `FsError::Busy` if a response is
-//! still unread). This matches Linux `tpm-dev-common.c:tpm_common_write`
-//! (line 175) which rejects a second write while `response_length != 0`.
+//! flight at a time per fd (write fails with `FsError::Busy` if a
+//! response is still unread). This matches Linux
+//! `tpm-dev-common.c:tpm_common_write` (line 175) which rejects a
+//! second write while `response_length != 0`.
 //!
 //! ## /dev/tpmrm0 — resource-manager pass-through
 //!
 //! Same write/read/poll semantics as `/dev/tpm0` for v1. Additionally
 //! tracks allocated transient handles (TPM object handles in the range
 //! `0x8000_0000..0xBFFF_FFFF`) observed in `TPM2_Load` responses, and
-//! issues `TPM2_FlushContext` for each handle on drop. This prevents
-//! transient-handle leaks when multiple tasks open the RM device
-//! concurrently. A full RM (session virtualisation, handle remapping) is
-//! deferred.
+//! issues `TPM2_FlushContext` for each handle when the fd closes. This
+//! prevents transient-handle leaks when multiple tasks open the RM
+//! device concurrently. A full RM (session virtualisation, handle
+//! remapping) is deferred.
+//!
+//! ## Per-open state (#940)
+//!
+//! The registered nodes are prototypes: both implement
+//! `FileOps::open_instance`, which `sys_open` calls (after permission
+//! checks) to allocate a fresh node per fd. The response slot — and,
+//! for the RM node, the transient-handle set its `Drop` flushes — is
+//! therefore per-fd, matching Linux's `tpm_dev` per-file buffer model:
+//! closing one fd can neither consume another fd's pending response
+//! nor flush another fd's handles. The transport is the one shared
+//! resource, reached through the global slot below, so per-open
+//! instances need no wiring of their own.
 //!
 //! ## Transport injection
 //!
-//! Hardware bring-up wires a `TpmTransport` implementation via
-//! `register_transport()`. Until a transport is installed, both device
-//! nodes return `FsError::Io(BlockError::IOError)` on write.
+//! Production wiring is `drivers/platform`'s TPM probe: on its
+//! success path (probe → TPM2_Startup → registry registration) it
+//! installs a `TpmTransport` over the registered device via
+//! `register_transport()`, then calls `register_dev_nodes()` and
+//! `sysfs_bridge::register_sysfs_tpm0` (#940). Until a transport is
+//! installed, both device nodes return
+//! `FsError::Io(BlockError::IOError)` on write.
 //!
 //! ## Linux references
 //!
@@ -66,8 +83,9 @@ pub trait TpmTransport: Send + Sync {
 
 static TPM_TRANSPORT: IrqSafeSpinLock<Option<Arc<dyn TpmTransport>>> = IrqSafeSpinLock::new(None);
 
-/// Register (or replace) the TPM transport.  Called by the CRB/TIS
-/// probe layer after the hardware is confirmed alive.
+/// Register (or replace) the TPM transport. Production caller: the
+/// platform probe's publication step (#940), after the device has
+/// been probed, started (TPM2_Startup), and registered.
 pub fn register_transport(t: Arc<dyn TpmTransport>) {
     *TPM_TRANSPORT.lock() = Some(t);
 }
@@ -159,6 +177,15 @@ impl FileOps for DevTpm0 {
     /// The devfs inode of this device's `/dev` node.
     fn ino(&self) -> u64 {
         narf_filesystem::devfs::char_device_inode(self.rdev())
+    }
+
+    /// Per-open state (#940): the registered node is a prototype;
+    /// each successful `open(2)` gets a fresh instance with its own
+    /// response slot, so one fd's pending response is invisible to
+    /// (and unconsumable by) every other fd. The transport is the
+    /// global slot, shared by all instances.
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        Some(Arc::new(DevTpm0::new()))
     }
 
     /// Submit a TPM 2.0 command and store the response.
@@ -362,6 +389,17 @@ impl FileOps for DevTpmRm0 {
         narf_filesystem::devfs::char_device_inode(self.rdev())
     }
 
+    /// Per-open state (#940): each successful `open(2)` gets a
+    /// fresh instance, so the transient-handle set lives exactly as
+    /// long as the fd that allocated the handles — this instance's
+    /// `Drop` (the `TPM2_FlushContext` sweep) fires at that fd's
+    /// close, not when some other fd closes or the node is torn
+    /// down. This is the per-fd contract Linux's `tpm_common_release`
+    /// implements.
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        Some(Arc::new(DevTpmRm0::new()))
+    }
+
     /// Submit a command; track transient handle allocations in responses.
     ///
     /// After a successful `TPM2_Load`, the response objectHandle is
@@ -480,4 +518,12 @@ pub fn register_dev_nodes() {
         Arc::new(DevTpm0::new()) as Arc<dyn narf_filesystem::FileOps>,
         Arc::new(DevTpmRm0::new()) as Arc<dyn narf_filesystem::FileOps>,
     );
+}
+
+/// Uninstall the `/dev/tpm0` and `/dev/tpmrm0` delegates, restoring
+/// the no-TPM devfs state. Production registration is boot-lifetime
+/// (there is no production unregister, mirroring the registry's);
+/// this exists for kernel-test fixture hygiene.
+pub fn unregister_dev_nodes() {
+    narf_filesystem::unregister_tpm();
 }

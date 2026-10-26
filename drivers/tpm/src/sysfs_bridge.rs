@@ -67,7 +67,10 @@ const PT_MANUFACTURER: u32 = 0x0000_0105;
 const PT_VENDOR_STRING_1: u32 = 0x0000_0106;
 /// `TPM_PT_VENDOR_STRING_4` — vendor description part 4.
 const PT_VENDOR_STRING_4: u32 = 0x0000_0109;
-/// `TPM_PT_PERMANENT` — TPMA_PERMANENT flags. Bit 2 = ownerAuthSet.
+/// `TPM_PT_PERMANENT` — TPMA_PERMANENT flags. Bit 0 = ownerAuthSet
+/// (Part 2 §10.11: `ownerAuthSet` is the first field of
+/// TPMA_PERMANENT; bit 1 is `endorsementAuthSet`, bit 2 is
+/// `lockoutAuthSet`).
 const PT_PERMANENT: u32 = 0x0000_010E;
 
 // ── Response parsing helpers ──────────────────────────────────────────
@@ -223,15 +226,20 @@ fn show_active() -> String {
 
 /// Build the `owned` attribute show-closure for the given transport.
 ///
-/// Queries `TPM_PT_PERMANENT` and tests bit 2 (`ownerAuthSet`).
+/// Queries `TPM_PT_PERMANENT` and tests bit 0 (`ownerAuthSet`).
 /// Returns `"0\n"` or `"1\n"`.
 /// Linux ref: `owned_show` (tpm-sysfs.c:161) — for TPM 2.0 uses
 /// `TPM2_GetCapability(PT_PERMANENT)`.
 fn make_owned_show(transport: Arc<dyn TpmTransport>) -> impl Fn() -> String + Send + Sync {
     move || {
         let val = read_property(transport.as_ref(), PT_PERMANENT).unwrap_or(0);
-        // Bit 2 of TPMA_PERMANENT = ownerAuthSet.
-        let owned = (val >> 1) & 1;
+        // Bit 0 of TPMA_PERMANENT = ownerAuthSet (Part 2 §10.11 —
+        // the first field of the struct; bit 1 is
+        // endorsementAuthSet, bit 2 is lockoutAuthSet). This
+        // previously tested bit 1 under a comment claiming bit 2:
+        // both were wrong, so `owned` reported the endorsement
+        // hierarchy's auth state (#940).
+        let owned = val & 1;
         format!("{}\n", owned)
     }
 }
