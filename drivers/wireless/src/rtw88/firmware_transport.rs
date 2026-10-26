@@ -34,6 +34,7 @@ pub enum Phase {
     PhyTablesPrepared,
     Calibration8821cPrepared,
     Operating8821cPrepared,
+    Radio8821cPrepared,
     Calibrated,
     Station,
     Failed,
@@ -230,6 +231,12 @@ pub(super) unsafe trait Io: Send {
     fn finish_operating8821c(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_station8821c(&mut self, _: super::power_policy::Gate) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
@@ -318,6 +325,8 @@ pub(super) struct Owner<I: Io> {
     envelope8821c: Option<alloc::sync::Arc<super::calibration8821c::Envelope>>,
     operating8821c: Option<super::operating8821c::Info>,
     operating_envelope8821c: Option<alloc::sync::Arc<super::operating8821c::Envelope>>,
+    station_grant8821c: Option<alloc::sync::Arc<super::station_power8821c::Grant>>,
+    station_radio8821c: Option<super::radio8821c::StationInfo>,
     image_digest: Option<[u8; 32]>,
     power: Option<alloc::sync::Arc<super::power_policy::Calibration>>,
     radio: Option<super::radio::Info>,
@@ -346,6 +355,8 @@ impl<I: Io> Owner<I> {
             envelope8821c: None,
             operating8821c: None,
             operating_envelope8821c: None,
+            station_grant8821c: None,
+            station_radio8821c: None,
             image_digest: None,
             power: None,
             radio: None,
@@ -360,7 +371,9 @@ impl<I: Io> Owner<I> {
         environment: alloc::sync::Arc<dyn super::station::Environment>,
         admission: super::station_control::Admission,
     ) -> Result<super::station_control::Admission, super::station::Error> {
-        if self.phase != Phase::Calibrated || self.station.is_some() {
+        if !matches!(self.phase, Phase::Calibrated | Phase::Radio8821cPrepared)
+            || self.station.is_some()
+        {
             return Err(super::station::Error::State);
         }
         let own = self.io.station_own()?;
@@ -471,6 +484,8 @@ impl<I: Io> Owner<I> {
             Phase::MacPrepared
                 | Phase::PhyTablesPrepared
                 | Phase::Calibration8821cPrepared
+                | Phase::Operating8821cPrepared
+                | Phase::Radio8821cPrepared
                 | Phase::Calibrated
                 | Phase::Station
         )
@@ -483,6 +498,8 @@ impl<I: Io> Owner<I> {
             Phase::MacPrepared
                 | Phase::PhyTablesPrepared
                 | Phase::Calibration8821cPrepared
+                | Phase::Operating8821cPrepared
+                | Phase::Radio8821cPrepared
                 | Phase::Calibrated
                 | Phase::Station
         ) {
@@ -523,6 +540,8 @@ impl<I: Io> Owner<I> {
             | Phase::MacPrepared
             | Phase::PhyTablesPrepared
             | Phase::Calibration8821cPrepared
+            | Phase::Operating8821cPrepared
+            | Phase::Radio8821cPrepared
             | Phase::Calibrated
             | Phase::Station => self.image_digest,
             _ => None,
@@ -686,15 +705,21 @@ impl<I: Io> Owner<I> {
     pub(super) fn calibration_info8821c(&self) -> Option<super::radio8821c::Info> {
         matches!(
             self.phase,
-            Phase::Calibration8821cPrepared | Phase::Operating8821cPrepared
+            Phase::Calibration8821cPrepared
+                | Phase::Operating8821cPrepared
+                | Phase::Radio8821cPrepared
+                | Phase::Station
         )
         .then_some(self.calibration8821c)
         .flatten()
     }
     pub(super) fn operating_info8821c(&self) -> Option<super::operating8821c::Info> {
-        (self.phase == Phase::Operating8821cPrepared)
-            .then_some(self.operating8821c)
-            .flatten()
+        matches!(
+            self.phase,
+            Phase::Operating8821cPrepared | Phase::Radio8821cPrepared | Phase::Station
+        )
+        .then_some(self.operating8821c)
+        .flatten()
     }
     pub(super) fn operating_request8821c(
         &self,
@@ -703,7 +728,10 @@ impl<I: Io> Owner<I> {
         if self.did != 0xc821
             || !matches!(
                 self.phase,
-                Phase::Calibration8821cPrepared | Phase::Operating8821cPrepared
+                Phase::Calibration8821cPrepared
+                    | Phase::Operating8821cPrepared
+                    | Phase::Radio8821cPrepared
+                    | Phase::Station
             )
         {
             return Err(Error::State);
@@ -757,6 +785,84 @@ impl<I: Io> Owner<I> {
         self.phase = Phase::Operating8821cPrepared;
         Ok(info)
     }
+    pub(super) fn station_request8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::station_power8821c::Request, Error> {
+        if self.did != 0xc821
+            || !matches!(
+                self.phase,
+                Phase::Operating8821cPrepared | Phase::Radio8821cPrepared | Phase::Station
+            )
+        {
+            return Err(Error::State);
+        }
+        // Retained power identity already binds the immutable factory/cut/RFE,
+        // original firmware, IQK recipe and all exact operating gain indices.
+        if !self
+            .envelope8821c
+            .as_ref()
+            .ok_or(Error::State)?
+            .matches(self.calibration_board8821c(factory)?)
+        {
+            return Err(Error::State);
+        }
+        Ok(super::station_power8821c::request(
+            self.operating8821c.ok_or(Error::State)?,
+            factory.mac(),
+        ))
+    }
+    pub(super) fn station_radio_info8821c(&self) -> Option<super::radio8821c::StationInfo> {
+        matches!(self.phase, Phase::Radio8821cPrepared | Phase::Station)
+            .then_some(self.station_radio8821c)
+            .flatten()
+    }
+    pub(super) fn preflight_station8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+        source: super::station_power8821c::Source,
+    ) -> Result<alloc::sync::Arc<super::station_power8821c::Grant>, Error> {
+        if self.phase != Phase::Operating8821cPrepared {
+            return Err(Error::State);
+        }
+        source.load(
+            self.station_request8821c(factory)?,
+            self.operating_envelope8821c
+                .as_ref()
+                .ok_or(Error::State)?
+                .clone(),
+        )
+    }
+    pub(super) async fn prepare_station8821c(
+        &mut self,
+        factory: &super::efuse::Factory8821c,
+        grant: alloc::sync::Arc<super::station_power8821c::Grant>,
+    ) -> Result<super::radio8821c::StationInfo, Error> {
+        if self.phase != Phase::Operating8821cPrepared
+            || !grant.matches(&self.station_request8821c(factory)?)
+        {
+            return Err(Error::State);
+        }
+        grant.check()?;
+        self.phase = Phase::Failed;
+        self.station_grant8821c = Some(grant.clone());
+        let result = narf_time::timeout(
+            narf_time::Deadline::after_ms(4000),
+            super::radio8821c::prepare_station(
+                &mut self.io,
+                factory,
+                self.phy8821c.ok_or(Error::State)?,
+                self.calibration8821c.ok_or(Error::State)?,
+                self.operating8821c.ok_or(Error::State)?,
+                grant,
+            ),
+        )
+        .await
+        .map_err(|_| Error::Deadline)??;
+        self.station_radio8821c = Some(result);
+        self.phase = Phase::Radio8821cPrepared;
+        Ok(result)
+    }
     pub(super) fn calibration_request8821c(
         &self,
         factory: &super::efuse::Factory8821c,
@@ -769,6 +875,8 @@ impl<I: Io> Owner<I> {
             Phase::PhyTablesPrepared
                 | Phase::Calibration8821cPrepared
                 | Phase::Operating8821cPrepared
+                | Phase::Radio8821cPrepared
+                | Phase::Station
         ) {
             return Err(Error::State);
         }
@@ -1093,7 +1201,7 @@ mod power_policy_tests;
 mod radio_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "station_composition_tests.rs"]
-mod station_composition_tests;
+pub(super) mod station_composition_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "firmware_transport_tests.rs"]
 mod tests;

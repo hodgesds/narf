@@ -142,9 +142,16 @@ pub struct Permission {
 /// continuation can supply one to the native packet owner.
 #[derive(Clone)]
 pub struct Gate {
-    calibration: alloc::sync::Arc<Calibration>,
-    permission: Permission,
-    own: [u8; 6],
+    scope: Scope,
+}
+#[derive(Clone)]
+enum Scope {
+    C22 {
+        calibration: alloc::sync::Arc<Calibration>,
+        permission: Permission,
+        own: [u8; 6],
+    },
+    C21(alloc::sync::Arc<super::station_power8821c::Grant>),
 }
 impl Gate {
     pub(super) fn new(
@@ -153,24 +160,99 @@ impl Gate {
         own: [u8; 6],
     ) -> Self {
         Self {
-            calibration,
-            permission,
-            own,
+            scope: Scope::C22 {
+                calibration,
+                permission,
+                own,
+            },
+        }
+    }
+    pub(super) fn c21(grant: alloc::sync::Arc<super::station_power8821c::Grant>) -> Self {
+        Self {
+            scope: Scope::C21(grant),
+        }
+    }
+    pub(super) fn did(&self) -> u16 {
+        match &self.scope {
+            Scope::C22 { .. } => 0xc822,
+            Scope::C21(_) => 0xc821,
         }
     }
     pub(super) fn own(&self) -> [u8; 6] {
-        self.own
+        match &self.scope {
+            Scope::C22 { own, .. } => *own,
+            Scope::C21(grant) => grant.own(),
+        }
     }
     pub(super) fn current(&self) -> Result<(), Error> {
-        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Policy)?;
-        self.calibration.validate(self.permission, &domain)
+        match &self.scope {
+            Scope::C22 {
+                calibration,
+                permission,
+                ..
+            } => {
+                let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Policy)?;
+                calibration.validate(*permission, &domain)
+            }
+            Scope::C21(grant) => grant.check().map_err(|e| match e {
+                super::firmware_transport::Error::Calibration8821c(
+                    super::calibration8821c::Error::Authority,
+                ) => Error::Authority,
+                _ => Error::Policy,
+            }),
+        }
+    }
+    pub(super) fn invoke<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
+    ) -> Result<T, super::firmware_transport::Error> {
+        match &self.scope {
+            Scope::C21(grant) => grant.invoke(operation),
+            Scope::C22 { calibration, .. } => {
+                struct Invoke<'a, F> {
+                    gate: &'a Gate,
+                    operation: F,
+                }
+                impl<T, F: FnOnce() -> Result<T, super::firmware_transport::Error>>
+                    CapOp<FirmwareBlob, Read> for Invoke<'_, F>
+                {
+                    type Output = Result<T, super::firmware_transport::Error>;
+                    fn execute(
+                        self,
+                        _: &Cap<FirmwareBlob, Read>,
+                    ) -> Result<Self::Output, CapError> {
+                        Ok((|| {
+                            self.gate
+                                .current()
+                                .map_err(super::firmware_transport::Error::Power)?;
+                            (self.operation)()
+                        })())
+                    }
+                }
+                calibration
+                    .authority
+                    .0
+                    .invoke(Invoke {
+                        gate: self,
+                        operation,
+                    })
+                    .map_err(|_| super::firmware_transport::Error::Power(Error::Authority))?
+            }
+        }
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn current_with_policy_for_test(
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
-        self.calibration.validate(self.permission, domain)
+        match &self.scope {
+            Scope::C22 {
+                calibration,
+                permission,
+                ..
+            } => calibration.validate(*permission, domain),
+            Scope::C21(_) => self.current(),
+        }
     }
 }
 impl Permission {

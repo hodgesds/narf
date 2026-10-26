@@ -70,19 +70,19 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
             .map_err(|_| narf_wireless::ccmp::CcmpError::AuthFailed)
     }
 }
-pub(super) struct Peer {
-    pub(super) ap: FakeAp,
-    pub(super) plan: NetworkPlan,
+pub(in crate::rtw88) struct Peer {
+    pub(in crate::rtw88) ap: FakeAp,
+    pub(in crate::rtw88) plan: NetworkPlan,
     pub(super) server: DhcpServer,
     pub(super) ptk: Option<Ptk>,
     pub(super) replay: narf_wireless::ccmp::ReplayWindow,
     pub(super) pn: u64,
-    pub(super) uplink: Vec<Vec<u8>>,
-    pub(super) hold_m4: bool,
+    pub(in crate::rtw88) uplink: Vec<Vec<u8>>,
+    pub(in crate::rtw88) hold_m4: bool,
     pub(super) hold_data: bool,
 }
 impl Peer {
-    pub(super) fn new(protected: bool) -> Self {
+    pub(in crate::rtw88) fn new(protected: bool) -> Self {
         let plan = NetworkPlan {
             station: OWN,
             bssid: AP,
@@ -111,7 +111,7 @@ impl Peer {
             hold_data: false,
         }
     }
-    pub(super) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
+    pub(in crate::rtw88) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
         let mut frame = vec![8, if self.ap.protected() { 0x42 } else { 2 }, 0, 0];
         frame.extend_from_slice(&ethernet[..6]);
         frame.extend_from_slice(&AP);
@@ -135,7 +135,10 @@ impl Peer {
         frame.extend_from_slice(&body);
         Ok(frame)
     }
-    pub(super) fn react(&mut self, frame: &[u8]) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+    pub(in crate::rtw88) fn react(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
         if frame.len() < 24 || frame[4..10] != AP || frame[10..16] != self.plan.station {
             return Err("native AP peer identity");
         }

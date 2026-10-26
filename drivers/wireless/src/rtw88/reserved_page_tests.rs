@@ -3,7 +3,7 @@ use super::*;
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
     future::Future,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -82,6 +82,15 @@ struct Model {
     thermal_values: Option<[u8; 2]>,
     thermal_conversions: usize,
     thermal_triggered: bool,
+    cam_stuck: bool,
+    awake_stuck: bool,
+    station_gate: Option<crate::rtw88::power_policy::Gate>,
+    packet_model: crate::rtw88::packet_core::tests::Model,
+    packet_core: Option<crate::rtw88::packet_core::Core>,
+    clock: Arc<AtomicU64>,
+    mailboxes: Vec<[u8; 8]>,
+    mailbox_pending: bool,
+    mailbox_hold: bool,
     ring: Arc<IrqSafeSpinLock<BlockState>>,
     frame: Arc<IrqSafeSpinLock<BlockState>>,
 }
@@ -97,6 +106,23 @@ impl Port {
         } else {
             Ok(())
         }
+    }
+    fn packet_with<T>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut crate::rtw88::packet_core::Core,
+            &mut crate::rtw88::packet_core::tests::Model,
+        ) -> Result<T, crate::rtw88::packet_core::Error>,
+    ) -> Result<T, crate::rtw88::packet_core::Error> {
+        let mut m = self.0.lock();
+        m.packet_model.now = m.clock.load(Ordering::Acquire).saturating_mul(1000);
+        let mut core = m
+            .packet_core
+            .take()
+            .ok_or(crate::rtw88::packet_core::Error::State)?;
+        let result = operation(&mut core, &mut m.packet_model);
+        m.packet_core = Some(core);
+        result
     }
 }
 #[async_trait::async_trait]
@@ -143,6 +169,9 @@ unsafe impl Registers for Port {
         if reg == 0x208 {
             value &= !1;
         }
+        if reg == 0x670 && !model.cam_stuck {
+            value &= !(1 << 31);
+        }
         if reg == 0x80 && model.ready && value & 1 << 14 != 0 {
             value |= 1 << 15;
         }
@@ -152,6 +181,9 @@ unsafe impl Registers for Port {
         self.access()?;
         let mut model = self.0.lock();
         model.bytes[usize::from(reg)] = value;
+        if reg == 0x3d9 && model.continuation == 11 && !model.awake_stuck {
+            model.bytes[0x3da] ^= 0x80;
+        }
         // H2C initialization is an 8-bit REG_H2C_INFO write in mac.c.
         // Its bit2 receipt exposes both empty pointers at the configured head.
         if reg == 0x254 && value & 4 != 0 {
@@ -226,6 +258,10 @@ unsafe impl Registers for Port {
             }
         })
         .await;
+        self.0
+            .lock()
+            .clock
+            .fetch_add(us.div_ceil(1000), Ordering::AcqRel);
         if us == 2_000_000 {
             let mut model = self.0.lock();
             if model.thermal_triggered {
@@ -341,6 +377,10 @@ unsafe impl Registers for Port {
         if model.continuation != 6 || model.command_ring.pending() {
             return Err(Error::State);
         }
+        // Native::park first closes the source DMA configuration bits before
+        // CR/BME parking. Preserve that real prerequisite in the retained
+        // register model; a later readback must not have to fabricate it.
+        model.bytes[0x303] |= 0xf7;
         model.bytes[0x100] = 0;
         model.continuation = 7;
         Ok(())
@@ -371,6 +411,154 @@ unsafe impl Registers for Port {
         }
         m.continuation = 10;
         Ok(())
+    }
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let mut m = self.0.lock();
+        if m.continuation != 10 || m.bytes[0x100] & 0xcf != 0 || m.bytes[0x522] != 255 {
+            return Err(Error::Prerequisite);
+        }
+        m.continuation = 11;
+        Ok(())
+    }
+    fn finish_station8821c(&mut self, gate: crate::rtw88::power_policy::Gate) -> Result<(), Error> {
+        self.access()?;
+        gate.current().map_err(Error::Power)?;
+        let mut m = self.0.lock();
+        if m.continuation != 11
+            || gate.did() != 0xc821
+            || m.bytes[0x100] & 0xcf != 0
+            || m.bytes[0x522] != 255
+            || m.ring.lock().bytes[..16] != [0; 16]
+            || m.frame.lock().bytes[..DESC] != [0; DESC]
+        {
+            return Err(Error::Prerequisite);
+        }
+        m.station_gate = Some(gate);
+        m.continuation = 12;
+        Ok(())
+    }
+    fn parked_cpu<T>(&mut self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        self.access()?;
+        if self.0.lock().continuation != 11 {
+            return Err(Error::State);
+        }
+        operation()
+    }
+    fn station_allowed(&mut self) -> Result<(), Error> {
+        self.access()?;
+        let m = self.0.lock();
+        if m.continuation != 12 || !m.packet_model.live || !m.packet_model.allowed {
+            return Err(Error::Access);
+        }
+        m.station_gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .current()
+            .map_err(Error::Power)
+    }
+    fn station_own(&mut self) -> Result<[u8; 6], Error> {
+        self.station_allowed()?;
+        Ok(self
+            .0
+            .lock()
+            .station_gate
+            .as_ref()
+            .ok_or(Error::State)?
+            .own())
+    }
+    fn mailbox_ready(&mut self) -> Result<bool, Error> {
+        self.access()?;
+        let m = self.0.lock();
+        Ok(!m.mailbox_pending)
+    }
+    fn mailbox_submit(&mut self, words: [u8; 8]) -> Result<(), Error> {
+        self.access()?;
+        let mut m = self.0.lock();
+        if m.mailbox_pending {
+            return Err(Error::State);
+        }
+        m.mailboxes.push(words);
+        m.mailbox_pending = true;
+        Ok(())
+    }
+    fn mailbox_consumed(&mut self) -> Result<bool, Error> {
+        self.access()?;
+        let mut m = self.0.lock();
+        if !m.mailbox_pending {
+            return Err(Error::State);
+        }
+        if m.mailbox_hold {
+            return Ok(false);
+        }
+        m.mailbox_pending = false;
+        Ok(true)
+    }
+    fn mailbox_pending(&self) -> bool {
+        self.0.lock().mailbox_pending
+    }
+    fn packet_prepare(
+        &mut self,
+        own: [u8; 6],
+        id: u8,
+    ) -> Result<(), crate::rtw88::packet_core::Error> {
+        use crate::rtw88::packet_core::{Core, Error as PacketError};
+        self.station_allowed().map_err(|_| PacketError::Access)?;
+        let mut m = self.0.lock();
+        let gate = m.station_gate.as_ref().ok_or(PacketError::State)?.clone();
+        if gate.own() != own || m.packet_core.is_some() {
+            return Err(PacketError::State);
+        }
+        m.packet_model.authority = Some(Arc::new(move || gate.current().is_ok()));
+        m.packet_core = Some(Core::prepare(&mut m.packet_model, own, id)?);
+        Ok(())
+    }
+    fn packet_start(&mut self) -> Result<(), crate::rtw88::packet_core::Error> {
+        self.packet_with(|core, port| core.start(port))?;
+        let mut m = self.0.lock();
+        m.bytes[0x100] = 255;
+        m.bytes[0x522] = 0;
+        Ok(())
+    }
+    fn packet_ready(&self) -> bool {
+        let m = self.0.lock();
+        m.packet_model.active
+            && m.packet_core
+                .as_ref()
+                .is_some_and(crate::rtw88::packet_core::Core::ready)
+    }
+    fn packet_submit(
+        &mut self,
+        frame: &[u8],
+        report: bool,
+    ) -> Result<u64, crate::rtw88::packet_core::Error> {
+        self.station_allowed()
+            .map_err(|_| crate::rtw88::packet_core::Error::Access)?;
+        self.packet_with(|core, port| core.submit(port, frame, report))
+    }
+    fn packet_poll(
+        &mut self,
+    ) -> Result<crate::rtw88::packet_core::Step, crate::rtw88::packet_core::Error> {
+        self.station_allowed()
+            .map_err(|_| crate::rtw88::packet_core::Error::Access)?;
+        self.packet_with(|core, port| core.poll(port))
+    }
+    fn packet_stop(&mut self) -> Result<(), crate::rtw88::packet_core::Error> {
+        // Native stop encloses only PCI authority: closing RF/DMA must remain
+        // possible after a measured-source or regulatory revocation.
+        let result = self.packet_with(|core, port| {
+            let authority = port.authority.take();
+            let allowed = port.allowed;
+            port.allowed = true;
+            let result = core.stop(port);
+            port.authority = authority;
+            port.allowed = allowed;
+            result
+        });
+        let mut m = self.0.lock();
+        m.bytes[0x100] &= !0xcf;
+        m.bytes[0x522] = 255;
+        result
     }
 }
 fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
@@ -418,6 +606,15 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         thermal_values: None,
         thermal_conversions: 0,
         thermal_triggered: false,
+        cam_stuck: false,
+        awake_stuck: false,
+        station_gate: None,
+        packet_model: crate::rtw88::packet_core::tests::Model::new(),
+        packet_core: None,
+        clock: Arc::new(AtomicU64::new(0)),
+        mailboxes: Vec::new(),
+        mailbox_pending: false,
+        mailbox_hold: false,
         ring: ring.clone(),
         frame: frame.clone(),
     })));

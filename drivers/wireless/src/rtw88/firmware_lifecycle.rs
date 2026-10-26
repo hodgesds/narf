@@ -17,6 +17,8 @@ pub enum Stage {
     Calibration8821cPrepared,
     PreparingOperating8821c,
     Operating8821cPrepared,
+    PreparingRadio8821c,
+    Radio8821cPrepared,
     Calibrating,
     Calibrated,
     StationPreparation,
@@ -58,6 +60,7 @@ impl<I: Io> Drop for Attempt<'_, I> {
                 | Stage::PhyTablesPrepared
                 | Stage::Calibration8821cPrepared
                 | Stage::Operating8821cPrepared
+                | Stage::Radio8821cPrepared
                 | Stage::Calibrated
                 | Stage::StationReady
                 | Stage::Failed
@@ -85,6 +88,9 @@ impl<I: Io> Lifecycle<I> {
     }
     pub(super) fn status(&self) -> Status {
         *self.status.lock()
+    }
+    pub(super) fn device_id(&self) -> u16 {
+        self.did
     }
     pub(super) async fn initialize_registered(
         &self,
@@ -123,7 +129,10 @@ impl<I: Io> Lifecycle<I> {
         admission.check()?;
         let mut retained = self.retained.lock().await;
         admission.check()?;
-        if self.status().stage != Stage::Calibrated {
+        if !matches!(
+            self.status().stage,
+            Stage::Calibrated | Stage::Radio8821cPrepared
+        ) {
             return Err(super::station::Error::State);
         }
         self.status.lock().stage = Stage::StationPreparation;
@@ -328,6 +337,53 @@ impl<I: Io> Lifecycle<I> {
         let mut status = self.status.lock();
         match result {
             Ok(_) => status.stage = Stage::Operating8821cPrepared,
+            Err(error) => {
+                *status = Status {
+                    stage: Stage::Failed,
+                    info: None,
+                    error: Some(error),
+                }
+            }
+        }
+        result
+    }
+    pub(super) async fn station_request8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::station_power8821c::Request, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(Error::State)?
+            .station_request8821c(factory)
+    }
+    pub(super) async fn station_radio_info8821c(&self) -> Option<super::radio8821c::StationInfo> {
+        self.retained
+            .lock()
+            .await
+            .as_ref()
+            .and_then(Owner::station_radio_info8821c)
+    }
+    pub(super) async fn prepare_station8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+        source: super::station_power8821c::Source,
+    ) -> Result<super::radio8821c::StationInfo, Error> {
+        let mut retained = self.retained.lock().await;
+        if self.status().stage != Stage::Operating8821cPrepared {
+            return Err(Error::State);
+        }
+        let owner = retained.as_mut().ok_or(Error::State)?;
+        // Missing, mismatched, revoked or policy-denied qualification is
+        // retryable before the first register write or ownership transition.
+        let grant = owner.preflight_station8821c(factory, source)?;
+        self.status.lock().stage = Stage::PreparingRadio8821c;
+        let _attempt = Attempt(self);
+        let result = owner.prepare_station8821c(factory, grant).await;
+        let mut status = self.status.lock();
+        match result {
+            Ok(_) => status.stage = Stage::Radio8821cPrepared,
             Err(error) => {
                 *status = Status {
                     stage: Stage::Failed,

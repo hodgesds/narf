@@ -63,6 +63,12 @@ pub(super) unsafe trait Registers: Send {
     fn finish_operating8821c(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_station8821c(&mut self, _: super::power_policy::Gate) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
@@ -342,6 +348,34 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn finish_operating8821c(&mut self) -> Result<(), Error> {
         self.io.finish_operating8821c()
+    }
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        self.io.begin_station8821c()
+    }
+    fn finish_station8821c(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
+        if self.state != PageState::Continued || !self.completed || gate.did() != 0xc821 {
+            return Err(Error::State);
+        }
+        self.state = PageState::Terminal;
+        // C21 arrived parked after IQK/power. There is no active command-DMA
+        // ownership to park again; disarm only under actual parked authority.
+        let ring = self.ring.as_mut().ok_or(Error::State)?;
+        let frame = self.frame.as_mut().ok_or(Error::State)?;
+        self.io.parked_cpu(|| {
+            ring.write(0, &[0; 16])?;
+            ring.sync();
+            frame.write(0, &[0; DESC])?;
+            frame.sync();
+            Ok(())
+        })?;
+        let work = self.io.read8(0x383)?;
+        self.io.write8(0x383, work & !0x10)?;
+        let beacon = self.io.read8(0x550)?;
+        self.io.write8(0x550, beacon & !8)?;
+        if self.io.read8(0x383)? & 0x10 != 0 || self.io.read8(0x550)? & 8 != 0 {
+            return Err(Error::Prerequisite);
+        }
+        self.io.finish_station8821c(gate)
     }
     fn begin_commands(&mut self) -> Result<(), Error> {
         self.io.begin_commands()

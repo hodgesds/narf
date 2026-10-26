@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Retained RTL8822CE channel1 host station state. The exact firmware Owner
+//! Retained RTL8821CE/RTL8822CE channel1 host station state. The exact firmware Owner
 //! keeps its native backend; this state never owns or reconstructs hardware.
 use super::{
     firmware_transport::{self, Io},
@@ -129,7 +129,7 @@ pub(super) struct State {
 }
 impl core::fmt::Debug for State {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Rtw8822ceStation")
+        f.debug_struct("Rtw88Station")
             .field("phase", &self.phase)
             .field("established", &self.established)
             .finish_non_exhaustive()

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One registered RTL8822CE shell and retained owner for control and packet
+//! One registered RTL8821CE/RTL8822CE shell and retained owner for control and packet
 //! progress. Synchronous stack drains never wait for another executor task.
 use super::{
     firmware_lifecycle::Lifecycle,
@@ -51,7 +51,7 @@ pub(super) struct Device<I: Io> {
 }
 impl<I: Io> core::fmt::Debug for Device<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Rtw8822ceDevice")
+        f.debug_struct("Rtw88Device")
             .field("name", &self.name)
             .field("admitted", &self.admitted)
             .field("up", &self.up)
@@ -565,6 +565,11 @@ fn drain() -> bool {
     device.is_some_and(|d| d.drain())
 }
 pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
+    let driver = match device.lifecycle.device_id() {
+        0xc821 => "rtw8821ce",
+        0xc822 => "rtw8822ce",
+        _ => return Err(Error::State),
+    };
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Profile)?;
@@ -575,7 +580,7 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
         .register(&authority, Registered(device.clone()))
         .map_err(|_| Error::Profile)?;
     narf_net::iface::register(&device.name, device.local, send);
-    narf_net::iface::set_driver_info(&device.name, "rtw8822ce", None, String::new());
+    narf_net::iface::set_driver_info(&device.name, driver, None, String::new());
     narf_net::iface::set_offloads(&device.name, narf_net::OffloadCapabilities::default());
     device.link(None, false);
     *ACTIVE.lock() = Some(device.clone());

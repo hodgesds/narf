@@ -1,6 +1,6 @@
 # rtw88 — Specification
 
-> Status: **v0.9** (RTL8821CE retained firmware/inactive MAC/PHY and measured calibration-only IQK continuation; RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
+> Status: **v1.0** (RTL8821CE retained firmware/MAC/PHY, separately signed IQK/parked-power/awake-station continuations; RTL8822CE retained firmware, MAC/PHY, bounded radio calibration,
 > signed operating-power qualification, native packets and channel1 station
 > integration; composed software gates and physical acceptance remain distinct).
 >
@@ -12,9 +12,10 @@
 
 **Owns:** PCI matching, baseline power-on, and factory identity for
 RTL8821CE / RTL8822BE / RTL8822CE, plus the retained RTL8821CE firmware/inactive
-MAC/PHY-table owner with a separately qualified calibration-only continuation and RTL8822CE native firmware
+MAC/PHY-table owner with separately qualified IQK, parked-power and native
+awake station continuations, and RTL8822CE native firmware
 loader, MAC/FIFO/PHY, H2C, calibrated radio/board-power continuations and a
-single awake channel1 legacy20 station for RTL8822CE. The retained station
+single awake channel1 legacy20 station for RTL8821CE/RTL8822CE. Each retained station
 supports Open and WPA2-PSK with host RSNA/CCMP; its ordinary host TX rate is
 fixed at 1 Mbps and requires an AP advertising that basic rate.
 The probe decodes physical EFUSE programming
@@ -89,18 +90,21 @@ Nineteen separate source-defined protected OTP cells retain the actual thermal,
 sparse-map decoding; protected cells can never be interpreted as map records.
 The same current PCI invocation covers the original map and trim capture.
 
-For RTL8822CE, `bring_up` creates one named, unpublished station shell sharing
+For RTL8821CE/RTL8822CE, `bring_up` creates one named, unpublished station shell sharing
 the exact `Arc<Lifecycle>` retained by the firmware owner. Probe acquires frame
 registry authority and registers the shell in the frame, kernel IP and wireless
 registries before spawning the firmware worker or activating packet DMA. The
 controller view delegates control, carrier and frame rings to this same shell.
 Carrier stays down until actual peer association and security admission.
-RTL8821CE/RTL8822BE remain diagnostic interfaces with wireless controls and
-packet TX unsupported.
+The driver name follows the actual retained chip. RTL8822BE remains diagnostic,
+with wireless controls and packet TX unsupported. A C21 shell stays inactive
+until its complete separately qualified chain succeeds.
 `Rtw88Device::firmware_status()` returns its
 `FirmwareStatus { stage, info, error }`; `FirmwareStage` is `Detected`,
 `Allocating`, `Loading`, `Ready`, `PreparingMac`, `MacPrepared`,
-`PreparingPhy`, `PhyTablesPrepared`, `Calibrating`, `Calibrated`,
+`PreparingPhy`, `PhyTablesPrepared`, `PreparingCalibration8821c`,
+`Calibration8821cPrepared`, `PreparingOperating8821c`, `Operating8821cPrepared`,
+`PreparingRadio8821c`, `Radio8821cPrepared`, `Calibrating`, `Calibrated`,
 `StationPreparation`, `StationReady`, or `Failed`. `Ready` identifies firmware
 completion and parked host DMA, independently of station/radio readiness.
 `StationReady` identifies completed packet preparation, not an associated peer
@@ -109,24 +113,26 @@ or authorized controlled port. RTL8822BE has no native firmware owner. The safe
 `FwError::Unsupported` before registry or MMIO access for every device:
 raw MMIO alone cannot prove exclusive DMA/ring/reset ownership.
 
-### RTL8821CE retained firmware, PHY and calibration-only continuation
+### RTL8821CE retained firmware, PHY and qualified calibration continuation
 
 Probe captures `efuse::Factory8821c` from the same single512-byte logical-map
 read that establishes its factory MAC. The distinct type retains raw4×42-byte
 power records, thermal/crystal/board/BT/channel/country fields and the original
 RFE byte. Its decoded RFE mask/package bit follows `rtw8821c_read_efuse`; erased
-values are never replaced, and RFE-specific power-path substitution is left to
-the future calibrated radio owner. `Rtw88Device::rtl8821c_factory()` borrows this exact
+values are never replaced. The later parked-power owner applies the exact
+source RFE-specific power-path selection. `Rtw88Device::rtl8821c_factory()` borrows this exact
 retained identity. No protected C22 trim cells or C22 factory offsets are used.
 
-The diagnostic interface retains a separate native lifecycle before any
+The station shell retains a separate native lifecycle before any
 firmware work. `firmware_status()` reports its stages just as for C22.
 `pci::provision()` serializes explicit calls with probe's bounded background
-worker and advances `Detected → Ready → MacPrepared → PhyTablesPrepared → Calibration8821cPrepared`; missing/revoked/malformed
+worker and advances `Detected → Ready → MacPrepared → PhyTablesPrepared → Calibration8821cPrepared → Operating8821cPrepared → Radio8821cPrepared → StationReady`; missing/revoked/malformed
 firmware remains at the pure retryable `Detected` checkpoint without allocating
 DMA. Missing or invalid calibration assets/current policy remain retryable at
 `PhyTablesPrepared`, without register access or DMA allocation. A repeated
-`Calibration8821cPrepared` request is a no-op. Once native allocation or a
+`Operating8821cPrepared` or `Radio8821cPrepared` checkpoint continues only with
+the next required genuine asset/current policy; a `StationReady` request is a
+no-op. Once native allocation or a
 hardware attempt starts, failure/cancellation is terminal and retains the exact
 inner owner and every published mapping; no cold-power/firmware reconstruction
 occurs. Existing IRQ-safe static locks never cross an await.
@@ -249,13 +255,14 @@ reload/thermal/transport errors, missing/malformed/unsigned/foreign assets,
 NO_IR/overlap policy, suspended cancellation/revocation and exact retained DMA.
 These are register/transport model checks; no physical IQK acceptance is recorded.
 
-C21-specific dynamic PHY/power tracking/beamforming/coexistence, additional
-source-required trim/thermal behavior, packet geometry, native control and station/data
-integration are still required. The calibration-only asset cannot authorize
-operating RF or station admission.
+C21-specific dynamic PHY/power tracking/beamforming/coexistence and additional
+source-required thermal behavior remain broader work. The calibration-only
+asset cannot authorize operating RF or station admission; the separate full
+awake grant and retained native chain below are mandatory.
 C21 PHY state has a distinct type and never populates the C22 PHY/power/radio
-fields; C22 calibration/station admission therefore stays closed. No C21
-scan/TX/HT/VHT/security capability is advertised. Physical firmware/board
+fields; C22 calibration callbacks remain inaccessible to C21. The completed
+C21 native profile exposes passive channel1 scan and legacy Open/WPA2 station;
+HT/VHT, QoS and additional bands are not advertised. Physical firmware/board
 acceptance remains unrecorded.
 
 ### RTL8822CE retained station provisioning
@@ -557,10 +564,96 @@ policy loss, ignored writes and transport failure retain firmware/command DMA.
 Success earns `Operating8821cPrepared` and historical
 `rtl8821c_operating_power_info()`, with BME, MAC TX/RX, producers and IRQs still
 closed. Sibling provisioning continues to this stage when the exact asset is
-available. This is parked power preparation; native C21 packet/peer/awake
-activation and station admission remain unfinished. Three composed native Rust
+available. This is parked power preparation; the independent full awake grant
+below is required before native packet/peer activation. Three composed native Rust
 smokes cover exact words, BTG factory substitution, retry, per-rate/response/
 thermal limits, partial I/O, cancellation and both source/device revocation.
+
+### RTL8821CE full awake radio and retained native station
+
+`rtl8821c_station_request()` is available after the same owner's N21P success.
+It returns the exact recipe identity, MAC and
+`rtw88/rtw8821ce-station-v1-<12 lowercase MAC hex digits>.bin` filename.
+The SHA256 identity binds the immutable N21P program, all12 selected gain
+indices, C21 channel/RFE/swing retention, fresh thermal conversion, literal
+CAM/wake/response programming, native PCI formats/rings and bounded port0
+station recipe. It changes the response mask from parked `0x15f` to the
+initial station's `0x1f`; old IQK/parked records never authorize that sequence.
+
+The separate signed128-byte little-endian **N21S** record is:
+
+| Offset | Meaning |
+|---|---|
+|0..4|`N21S`|
+|4..8|version1, header length128 (u16 each)|
+|8..12|total length128 (u32)|
+|12..16|VID0x10ec, DID0xc821 (u16 each)|
+|16..48|exact awake-station recipe SHA256|
+|48..54|exact unicast factory MAC|
+|54..56|channel1, width20MHz|
+|56..60|signed antenna gain, qualified EIRP ceiling (i16 quarter-dB units)|
+|60..66|signed measured ordinary-packet, automatic-response and complete awake-program transient conducted peaks (i16 quarter-dBm each)|
+|66..68|raw thermal minimum0/maximum63; full static awake envelope is mandatory|
+|68..70|trusted profile country `US`|
+|70..128|zero reserved bytes|
+
+The source must have a verified signer and current blob authority. The actual
+N21Q, N21P and N21S capability invocations nest around every native radio
+operation, packet-memory access, MMIO publication and PCI BME enabling. The
+current installed host domain must cover the entire2402..2422MHz span with
+at least20MHz, no restrictions except NO_P2P and countryUS. All intersecting
+rules contribute their minimum power ceiling; all three measured peaks plus
+antenna gain must fit that ceiling, signed ceiling and the initial20dBm board
+profile. Live checks read current policy without implicitly reinstalling it.
+N21Q/N21P limits and current source authority remain mandatory too. Missing,
+foreign, unsigned, revoked or policy-denied N21S leaves the parked checkpoint
+retryable without register writes. No real measurement asset is supplied.
+This initial awake profile has no continuous conversion watchdog, so N21S
+must qualify every possible six-bit meter value0..63. A narrow N21S thermal
+interval is rejected even when the initial reading lies within it. Thus a
+one-time sample cannot authorize an indefinitely awake narrow-temperature
+program. The earlier N21Q/N21P intervals still constrain the actual preparation
+samples; N21S must independently bound all subsequent static-gain awake RF.
+
+The C21-specific continuation checks its retained RF18 channel, RFE/swing,
+original12 TXAGC values and zeroed unused HT/VHT words, RF08 cleared after
+genuine IQK and zero failed/reload status. It triggers a fresh RF42 conversion
+and preserves the source two-second wait, checks the actual meter against all
+three signed intervals, invalidates all32 source CAM slots with bounded busy
+receipts, disables hardware encryption/decryption and retains native raw RX.
+The source RPWM3d9/CPWM3da handshake requires a fresh device toggle. There is
+no C22 DACK/trim/RF callback substitution or inferred RF-mode receipt. This
+entire attempt has a four-second deadline. Failure/cancellation after its
+first access is terminal and retains the exact owner and published mappings.
+
+The original completed beacon descriptor is disarmed through the retained
+reserved-page owner only under actual parked PCI authority; C21 is already
+parked after IQK/N21P, so it does not reuse C22's active-command parking
+transition. Success earns `Radio8821cPrepared` and historical
+`rtl8821c_station_radio_info()`. This copyable receipt itself grants no TX.
+Only its sealed exact-chip grant can admit the common PCI packet backend.
+
+Original `rtw8821c.c`/`rtw8822c.c` chip-info and `pci.c` share48-byte TXDESC,
+16-byte TXBD,24-byte RXDESC and8-byte RXBD formats; C21's checksum callback
+belongs to USB, not this PCI path. The same retained seven TX rings and512 RX
+buffers continue into the MGMT128/BE256 packet owner, using consumed indices
+plus actual CCX for security/management delivery. Common `fw.c` port0
+ACTIVE/media/RA/default-port commands and `main.c`/`mac80211.c` MAC/BSSID/AID/
+conservative DCF semantics are reused. C21 RF, EFUSE and qualification remain
+distinct. The qualified shell then uses shared MLME/RSNA/host CCMP and exposes
+Open/WPA2, passive ch1/20, CCK1 ordinary TX and receive-only legacy rates;
+no QoS, aggregation or HT/VHT admission is inferred.
+
+Seven new native Rust smokes compose the actual reserved-DMA firmware/MAC/PHY/
+IQK/N21P owner through radio and packet/station. They cover literal CAM/wake/
+gain/mailbox/DCF receipts, retry without writes, receipt failures, pending
+thermal cancellation and all three source/policy losses, real descriptor
+Open/WPA2 kernel DHCP and exact bidirectional IP, and held M4 cancellation/
+late receipt/terminal reinstall and actual descriptor-to-doorbell source/policy
+revocation. These are inert software models. Physical
+RF acceptance, real signed measured assets and qualification over the full
+permitted awake operating/temperature envelope remain external gates; dynamic
+power tracking and thermal compensation are not claimed.
 
 ## 4. Invariants
 
@@ -606,11 +699,11 @@ station-security and packet-key owners supply bounded MLME, RSNA and CCMP;
   IDDMA, MAC/PHY/radio, signed operating power, H2C/mailbox, ordinary packet
   rings and the channel1 Open/WPA2 station shell are implemented. Composed
   software gates and physical acceptance are tracked separately.
-- **Retained RTL8821CE prerequisite**: exact firmware, inactive MAC,
-  chip-specific one-path PHY tables and signed measured calibration-only
-  ch1/20 firmware IQK continuation are implemented; operating radio,
-  qualified power and native station admission remain gated.
-- **Additional profiles**: RTL8821CE/RTL8822BE native station support, broader
+- **Retained RTL8821CE software profile**: exact firmware, inactive MAC,
+  chip-specific one-path PHY tables, separate N21Q IQK/N21P parked-power/N21S
+  awake-radio grants and native ch1/20 Open/WPA2 station are implemented.
+  Real measured signed assets and physical acceptance remain gates.
+- **Additional profiles**: RTL8822BE native station support, broader
   PHY/rates/channels, power management and recovery remain outside this gate.
 
 ## 8. Open questions and references
@@ -637,8 +730,9 @@ Remaining software ledger:
 | H2C packet ring and port0 command mailbox | Same retained native owner; bounded exact transport receipts and separate IQK completion |
 | Retained complete RTL8822CE factory map | Implemented from same probe EFUSE read; original Linux packed geometry checked |
 | Factory-selected inactive BB/AGC/RF tables | Same-owner C21 package/RFE/one-path SIPI and C22 two-path RFK-init/mixed-access ports; separate frozen reference fixtures and composed failure/cancellation/DMA retention regressions |
-| C21 measured calibration-only ch1/20 IQK | Exact N21Q identity/current signed authority/policy, source channel/RFE/swing and one-path H2C, fresh RF08/status/thermal receipt, retained command DMA and parked success; real measured envelope is external, operating/station gate stays closed |
-| C21 parked operating-power program | Same-owner post-IQK N21P exact-board/source-recipe qualification, source RFE-selected factory ceilings, explicit measured12-rate indices/peaks and response envelope, fresh thermal/TXAGC/RRSR readbacks implemented. Real measurement asset and native awake/packet/peer/station chain remain gates |
+| C21 measured calibration-only ch1/20 IQK | Exact N21Q identity/current signed authority/policy, source channel/RFE/swing and one-path H2C, fresh RF08/status/thermal receipt, retained command DMA and parked success; the real measured envelope is external and cannot authorize operating RF |
+| C21 parked operating-power program | Same-owner post-IQK N21P exact-board/source-recipe qualification, source RFE-selected factory ceilings, explicit measured12-rate indices/peaks and response envelope, fresh thermal/TXAGC/RRSR readbacks implemented; distinct N21S required for awake packets |
+| C21 awake radio/packet/port0/station | Exact N21S identity/current triple signed-source authority and live policy, C21 gain/channel/thermal and real wake/CAM receipts, parked same-owner beacon disarm and native Open/WPA2 DHCP/IP composition implemented; measured assets/physical acceptance remain external |
 | Current signed per-board gain/operating-envelope qualification | Implemented loader, exact identity/source ceilings, cap revocation and current-policy checks; real measured signed artifact is an external deployment gate |
 | Fixed awake ch1 radio/DACK/IQK/OTP/qualified power | Implemented for the explicit version2 CCK/control-response profile; real signed measured envelope remains a deployment gate |
 | Port0 peer/AID/media/RA/default-port control | Implemented bounded source mailbox, long-slot initial MLME, same-owner station integration and close/cancel behavior |
@@ -651,10 +745,9 @@ Per-chip hardware backlog follows original `rtw8821c.c`, `rtw8822b.c` and
 `rtw8822c.c` chip-info/ops. C21 is1SS and C22B/C22C are2SS; all declare2.4/5GHz,
 HT and VHT. Those capabilities remain software work, including HT/VHT widths,
 aggregation/reordering/BA, WMM AC/TID scheduling, noninitial channels/active scan,
-RF tracking, coexistence, sleep/WoW and controller-proven reset/rejoin. C21 still
-needs its actual packet/control chain; C22B additionally needs retained firmware,
-MAC/PHY/RF/power and packet composition. C22C currently supplies the one complete
-legacy station chain. None of these initial-profile exclusions are hardware
+RF tracking, coexistence, sleep/WoW and controller-proven reset/rejoin. C22B needs
+retained firmware, MAC/PHY/RF/power and packet composition. C21/C22C supply
+separate qualified legacy station chains. None of these initial-profile exclusions are hardware
 inapplicability claims; no6GHz/HE/EHT capability is declared by these chip-info
 records.
 

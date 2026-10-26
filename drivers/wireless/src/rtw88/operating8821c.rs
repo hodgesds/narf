@@ -145,6 +145,14 @@ impl Source {
     }
 }
 impl Envelope {
+    pub(super) fn temperature(&self, value: u8) -> Result<(), Error> {
+        self.calibration.temperature(value).map_err(denied)?;
+        if (self.thermal[0]..=self.thermal[1]).contains(&value) {
+            Ok(())
+        } else {
+            Err(denied(QError::Thermal))
+        }
+    }
     fn decode(
         raw: &[u8],
         signer: Option<[u8; 32]>,

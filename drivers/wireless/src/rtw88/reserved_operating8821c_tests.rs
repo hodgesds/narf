@@ -1,6 +1,8 @@
 //! Actual retained reserved-DMA firmware/MAC/PHY/IQK/parked power composition.
 use super::*;
 use crate::rtw88::operating8821c::{Request as PowerRequest, Source as PowerSource};
+#[path = "reserved_station8821c_tests.rs"]
+mod station_tests;
 fn calibrated() -> Result<(Fixture, Cap<FirmwareBlob, Read>), &'static str> {
     let f = fixture(2, 3)?;
     let cap = Cap::bootstrap();

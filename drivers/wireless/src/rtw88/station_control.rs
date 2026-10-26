@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Retained RTL8822CE port0 and four-box command mailbox, Linux rtw88.
+//! Retained RTL8821CE/RTL8822CE port0 and four-box mailbox, Linux rtw88.
 //! A consumed mailbox is transport evidence, never an applied-command ACK.
 use super::{
     firmware_transport::{Error, Io},

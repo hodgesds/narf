@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One retained RTL8822CE packet slot; native rings stay in their original
+//! One retained RTL8821CE/RTL8822CE packet slot; native rings stay in their original
 //! firmware backend. No reset, descriptor-owner reconstruction or IRQ service.
 use super::packet_format::{self as format, Queue};
 use alloc::vec::Vec;

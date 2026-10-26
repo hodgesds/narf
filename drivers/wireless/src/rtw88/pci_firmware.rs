@@ -250,15 +250,22 @@ impl Native {
             return Err(Error::State);
         }
         let active = matches!(self.state, State::Active | State::Commands | State::Packets);
-        let result = crate::rtw88::pci_park::invoke(&self.cap, || {
-            self.command(active)?;
-            if usize::from(reg) % width != 0 || u64::from(reg) + width as u64 > self.mmio.len {
-                return Err(Error::Access);
-            }
-            Ok(operation(self.mmio))
-        })
-        .map_err(|_| Error::Access)
-        .and_then(|value| value);
+        let gate = self.packet_gate.clone();
+        let access = || {
+            crate::rtw88::pci_park::invoke(&self.cap, || {
+                self.command(active)?;
+                if usize::from(reg) % width != 0 || u64::from(reg) + width as u64 > self.mmio.len {
+                    return Err(Error::Access);
+                }
+                Ok(operation(self.mmio))
+            })
+            .map_err(|_| Error::Access)
+            .and_then(|value| value)
+        };
+        let result = match gate {
+            Some(gate) => gate.invoke(access),
+            None => access(),
+        };
         if result.is_err() {
             self.state = State::Terminal;
         }
@@ -577,6 +584,31 @@ unsafe impl Registers for Native {
         self.state = State::Operating8821cPrepared;
         Ok(())
     }
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        if self.device.id.device != 0xc821
+            || self.state != State::Operating8821cPrepared
+            || self.command_ring.pending()
+        {
+            return Err(Error::State);
+        }
+        self.state = State::Configuring;
+        self.finish_mac()?; // actual closed CR/TXPAUSE/IRQ and parked PCI receipts
+        self.state = State::Configuring;
+        Ok(())
+    }
+    fn finish_station8821c(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
+        if self.device.id.device != 0xc821
+            || self.state != State::Configuring
+            || gate.did() != 0xc821
+        {
+            return Err(Error::State);
+        }
+        gate.current().map_err(Error::Power)?;
+        self.finish_mac()?;
+        self.packet_gate = Some(gate);
+        self.state = State::Calibrated;
+        Ok(())
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
         if !(self.state == State::PhyTablesPrepared
             || self.device.id.device == 0xc821 && self.state == State::Calibrating8821c)
@@ -717,7 +749,10 @@ unsafe impl Registers for Native {
         result
     }
     fn finish_radio(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
-        if self.state != State::Configuring {
+        if self.device.id.device != 0xc822
+            || gate.did() != 0xc822
+            || self.state != State::Configuring
+        {
             return Err(Error::State);
         }
         let result = (|| {

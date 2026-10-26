@@ -65,6 +65,7 @@ mod reserved_page;
 mod sibling;
 mod station;
 pub(super) mod station_control;
+mod station_power8821c;
 pub use calibration8821c::{Error as C21CalibrationError, Request as C21CalibrationRequest};
 pub use firmware_lifecycle::{Stage as FirmwareStage, Status as FirmwareStatus};
 pub use firmware_transport::{Error as FirmwareError, Info as FirmwareInfo};
@@ -74,6 +75,8 @@ pub use phy::Info as PhyTablesInfo;
 pub use power_policy::{Error as PowerError, Permission as PowerPermission};
 pub use radio::Info as RadioInfo;
 pub use radio8821c::Info as C21CalibrationInfo;
+pub use radio8821c::StationInfo as C21StationRadioInfo;
+pub use station_power8821c::Request as C21StationRequest;
 pub mod pci;
 pub(crate) mod pci_park;
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! C21 calibration-only ch1/20 continuation: Linux rtw8821c.c/fw.c/mac.c.
-//! Firmware IQK is authorized by a measured envelope; this grants no packets.
+//! C21 ch1/20 IQK and separately qualified awake radio continuations.
+//! Linux rtw8821c.c/fw.c/mac.c/ps.c; the IQK envelope alone grants no packets.
 use super::{
     calibration8821c::Envelope,
     efuse::Factory8821c,
@@ -165,6 +165,15 @@ async fn channel(
     Ok(swing)
 }
 fn verify_channel(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
+    verify_geometry(io, swing, btg)?;
+    for reg in TXAGC {
+        if read(io, reg)? != 0 {
+            return Err(Error::Prerequisite);
+        }
+    }
+    Ok(())
+}
+fn verify_geometry(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
     if rf_read(io, 0x18)? & 0x70fff != 0xc01
         || read(io, 0xc1c)? >> 21 != u32::from(swing)
         || read(io, 0x8ac)? & (!0xffcffc00 | 0x10010000) != 0x10010000
@@ -176,12 +185,134 @@ fn verify_channel(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> 
     {
         return Err(Error::Prerequisite);
     }
-    for reg in TXAGC {
-        if read(io, reg)? != 0 {
+    Ok(())
+}
+
+/// Historical native preparation receipts; packet admission also requires the
+/// retained current N21Q/N21P/N21S grants, not this copyable diagnostic value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StationInfo {
+    pub channel: u8,
+    pub bandwidth_mhz: u8,
+    pub thermal: u8,
+    pub response_rates: u16,
+    pub identity: [u8; 32],
+}
+pub(super) async fn prepare_station(
+    io: &mut impl Io,
+    factory: &Factory8821c,
+    phy: phy8821c::Info,
+    iqk: Info,
+    power: super::operating8821c::Info,
+    grant: alloc::sync::Arc<super::station_power8821c::Grant>,
+) -> Result<StationInfo, Error> {
+    let mut io = StationChecked { io, grant: &grant };
+    io.begin_station8821c()?;
+    // C21's exact channel/RFE setup is retained from its completed IQK. Do
+    // not replay the channel helper here: it deliberately zeros all TXAGC.
+    verify_geometry(&mut io, iqk.swing, matches!(phy.rfe, 2 | 4))?;
+    if read(&mut io, 0xf0)? >> 12 & 15 != u32::from(phy.cut)
+        || rf_read(&mut io, 8)? != 0
+        || read(&mut io, 0x1bf0)? & 0x100ff != 0
+        || factory.mac() != grant.own()
+    {
+        return Err(Error::Prerequisite);
+    }
+    let old = rf_read(&mut io, 0x42)?;
+    io.write32(0xc90, (0x42 << 20) | (old & !0x30000) | 0x30000)?;
+    io.delay_us(13).await;
+    io.delay_us(2_000_000).await;
+    let thermal = ((rf_read(&mut io, 0x42)? >> 10) & 63) as u8;
+    grant.temperature(thermal)?;
+    for (slot, reg) in TXAGC.into_iter().enumerate() {
+        let expected = if slot < 3 {
+            u32::from_le_bytes(
+                power.indices[slot * 4..slot * 4 + 4]
+                    .try_into()
+                    .map_err(|_| Error::State)?,
+            )
+        } else {
+            0
+        };
+        if read(&mut io, reg)? != expected {
             return Err(Error::Prerequisite);
         }
     }
-    Ok(())
+    // Source rtw8821c band switch also admits OFDM response rates. This
+    // initial station uses CCK1 data/management and the same conservative
+    // response mask as the existing source rtw88 legacy station profile.
+    io.write32(0x440, 0x1f)?;
+    super::radio::software_crypto(&mut io).await?;
+    super::radio::awake(&mut io).await?;
+    verify_geometry(&mut io, iqk.swing, matches!(phy.rfe, 2 | 4))?;
+    if read(&mut io, 0x440)? != 0x1f
+        || io.read8(0x303)? & 0xf7 != 0xf7
+        || [0xb0, 0xb8, 0x10b8]
+            .into_iter()
+            .any(|r| io.read32(r).ok() != Some(0))
+    {
+        return Err(Error::Prerequisite);
+    }
+    grant.temperature(((rf_read(&mut io, 0x42)? >> 10) & 63) as u8)?;
+    io.finish_station8821c(super::power_policy::Gate::c21(grant.clone()))?;
+    Ok(StationInfo {
+        channel: 1,
+        bandwidth_mhz: 20,
+        thermal,
+        response_rates: 0x1f,
+        identity: grant.identity(),
+    })
+}
+struct StationChecked<'a, I> {
+    io: &'a mut I,
+    grant: &'a super::station_power8821c::Grant,
+}
+#[async_trait::async_trait]
+// SAFETY: the retained backend owns every published buffer, and every native
+// register operation executes inside all three current signed source invokes.
+unsafe impl<I: Io> Io for StationChecked<'_, I> {
+    fn claim_pristine(&mut self) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    fn read8(&mut self, r: u16) -> Result<u8, Error> {
+        self.grant.invoke(|| self.io.read8(r))
+    }
+    fn read16(&mut self, r: u16) -> Result<u16, Error> {
+        self.grant.invoke(|| self.io.read16(r))
+    }
+    fn read32(&mut self, r: u16) -> Result<u32, Error> {
+        self.grant.invoke(|| self.io.read32(r))
+    }
+    fn write8(&mut self, r: u16, v: u8) -> Result<(), Error> {
+        self.grant.invoke(|| self.io.write8(r, v))
+    }
+    fn write16(&mut self, r: u16, v: u16) -> Result<(), Error> {
+        self.grant.invoke(|| self.io.write16(r, v))
+    }
+    fn write32(&mut self, r: u16, v: u32) -> Result<(), Error> {
+        self.grant.invoke(|| self.io.write32(r, v))
+    }
+    async fn reserved_page(&mut self, _: &[u8]) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    async fn lte_backup(&mut self) -> Result<u32, Error> {
+        Err(Error::State)
+    }
+    async fn lte_restore(&mut self, _: u32) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    async fn finish_dma(&mut self) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        self.grant.invoke(|| self.io.begin_station8821c())
+    }
+    fn finish_station8821c(&mut self, gate: super::power_policy::Gate) -> Result<(), Error> {
+        self.grant.invoke(|| self.io.finish_station8821c(gate))
+    }
+    async fn delay_us(&mut self, us: u64) {
+        self.io.delay_us(us).await
+    }
 }
 pub(super) async fn prepare(
     io: &mut impl Io,
