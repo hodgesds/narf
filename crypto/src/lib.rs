@@ -48,7 +48,10 @@ pub mod cmac_aes256;
 pub mod curve25519;
 pub mod ed25519;
 mod entropy;
-pub use entropy::{try_fill_random_bytes, try_per_task_rng};
+pub use entropy::{
+    has_hw_entropy, key_material_rng, try_fill_key_material, try_fill_random_bytes,
+    try_per_task_rng,
+};
 pub mod hdcp;
 pub mod hkdf;
 pub mod michael_mic;
@@ -192,7 +195,9 @@ pub enum CryptoError {
     /// dependency stubbed out). Should never fire in a well-configured
     /// build.
     BackendUnavailable,
-    /// No suitable architectural RNG, or bounded entropy retries exhausted.
+    /// No suitable architectural RNG, bounded entropy retries exhausted,
+    /// or the entropy source failed its SP 800-90B health tests and
+    /// latched off (key-material surface; see `entropy`).
     EntropyUnavailable,
 }
 
@@ -494,15 +499,21 @@ pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
 // Legacy Stage-3 compatibility helpers use observable cycle counters. They
 // remain predictable and must not supply protocol secrets or nonces. New
 // protocol callers use try_per_task_rng / try_fill_random_bytes, which require
-// fresh architectural RNG output and propagate failure. The full system pool,
-// per-task lifecycle and SP 800-90B health service remain separate work.
+// fresh architectural RNG output and propagate failure. Key material —
+// SMS/SMK-class secrets and any long-term key generation — must instead use
+// try_fill_key_material / key_material_rng, which draw only from the
+// seed-grade architectural source behind SP 800-90B health tests and refuse
+// (EntropyUnavailable) when no healthy source exists; this section's output
+// must never seed, reseed, or be mixed into key material. The full system
+// pool and per-task handle lifecycle remain separate work.
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 
 /// Construct the predictable Stage-3 compatibility stream from cycle counts.
 /// This helper is unsuitable for cryptographic secrets.
-/// Protocol secrets and nonces must use [`try_per_task_rng`] instead.
+/// Protocol secrets and nonces must use [`try_per_task_rng`] instead;
+/// key material must use [`try_fill_key_material`] / [`key_material_rng`].
 pub fn per_task_rng() -> ChaCha20Rng {
     // Mix cycles into a 32-byte seed by stretching across the buffer.
     // Two independent reads + a constant tag keep the seed at least
