@@ -7,10 +7,28 @@
 //! - `/sys/class/leds/*` — LED devices (keyboard backlight, power LED,
 //!   caps-lock LED, etc.).
 //! - ACPI `_BCL` / `_BCM` / `_BQC` video backlight.
-//! - AMD GPU PWM bridge (delegates into `drivers/gpu/amdgpu_backlight`).
-//! - Intel backlight scaffold (deferred full implementation).
+//! - Intel BXT PWM backlight (registered from the Intel GPU probe).
 //! - Keyboard backlight via vendor WMI.
 //! - Brightness key handling (ACPI Notify 0x86/0x87).
+//!
+//! The AMD panel owner lives in `drivers/gpu`
+//! (`AmdgpuPanelBacklight`, over `Amdgpu::set_backlight`) and
+//! registers into this crate's registry from the amdgpu PCI probe;
+//! there is deliberately no AMD bridge module here — the previous
+//! bridge encoded a pre-fix `BL_PWM` register scheme and was
+//! retired (#951).
+//!
+//! ## Composition and publication
+//!
+//! The frame composition root (`frame/src/bare_main.rs`) calls
+//! [`register_initcalls`] (#947), so this crate's Stage::Device
+//! initcalls run in production boots. Sysfs publication is
+//! *dynamic*: [`register_backlight`] / [`unregister_backlight`]
+//! reconcile `/sys/class/backlight` with the elected owner after
+//! every registry change (#952), so a device registered from a PCI
+//! probe — after all Stage::Device initcalls have run — is
+//! published immediately, a preempted owner is unpublished, and a
+//! promoted candidate is published in its place.
 //!
 //! ## Architecture
 //!
@@ -50,7 +68,6 @@
 extern crate alloc;
 
 pub mod acpi_video;
-pub mod amdgpu_bl;
 pub mod brightness_keys;
 pub mod intel_bl;
 pub mod kbd_backlight;
@@ -201,23 +218,39 @@ fn elect_owner(cands: &[Arc<dyn BacklightDevice>]) -> Option<Arc<dyn BacklightDe
 /// registrations still elect exactly one owner.
 pub fn register_backlight(dev: Arc<dyn BacklightDevice>) -> Ownership {
     let name: String = dev.name().to_owned();
-    let mut g = BACKLIGHT_DEVS.lock();
-    if let Some(slot) = g.iter_mut().find(|d| d.name() == name) {
-        *slot = dev;
-    } else {
-        g.push(dev);
+    let (standing, replaced) = {
+        let mut g = BACKLIGHT_DEVS.lock();
+        let replaced = if let Some(slot) = g.iter_mut().find(|d| d.name() == name) {
+            *slot = dev;
+            true
+        } else {
+            g.push(dev);
+            false
+        };
+        let standing = match elect_owner(&g) {
+            Some(owner) if owner.name() == name => Ownership::Owner,
+            _ => Ownership::Deferred,
+        };
+        (standing, replaced)
+    };
+    // Publication follows the election dynamically (#952). The
+    // sysfs attribute closures capture the device `Arc`, so a
+    // same-name replacement must rebuild its directory rather than
+    // leave sysfs driving the superseded device object.
+    if replaced {
+        sysfs_bridge::unpublish(&name);
     }
-    match elect_owner(&g) {
-        Some(owner) if owner.name() == name => Ownership::Owner,
-        _ => Ownership::Deferred,
-    }
+    sysfs_bridge::sync_publication();
+    standing
 }
 
 /// Unregister a backlight device by name. If the removed device was
 /// the panel owner, the highest-priority remaining candidate is
-/// promoted automatically (see [`panel_owner`]).
+/// promoted automatically (see [`panel_owner`]) and the sysfs
+/// publication is reconciled to match.
 pub fn unregister_backlight(name: &str) {
     BACKLIGHT_DEVS.lock().retain(|d| d.name() != name);
+    sysfs_bridge::sync_publication();
 }
 
 /// The panel's current owner, if any candidate is registered.
@@ -251,20 +284,24 @@ pub fn backlight_device(name: &str) -> Option<Arc<dyn BacklightDevice>> {
 #[doc(hidden)]
 pub fn __reset_all_for_test() {
     BACKLIGHT_DEVS.lock().clear();
+    sysfs_bridge::sync_publication();
     leds::__reset_for_test();
 }
 
 // ── initcalls ─────────────────────────────────────────────────────
 
 /// Register all Stage::Device initcalls for the backlight subsystem.
+///
+/// Called from the frame composition root
+/// (`frame/src/bare_main.rs`) — before #947 nothing called this and
+/// none of these initcalls ever ran in a production boot. There is
+/// no AMD initcall: the AMD panel owner registers from the amdgpu
+/// PCI probe, and dynamic publication (see [`register_backlight`])
+/// means no initcall ordering against the probe is required.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Device, "backlight/acpi-video", || {
         acpi_video::init();
-        InitResult::Ok
-    });
-    narf_init::register(Stage::Device, "backlight/amdgpu", || {
-        amdgpu_bl::init();
         InitResult::Ok
     });
     narf_init::register(Stage::Device, "backlight/intel", || {

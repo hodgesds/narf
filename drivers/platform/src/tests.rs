@@ -981,66 +981,12 @@ kernel_test_in!(
     smoke_buttons_inject_dispatches_to_subscribers
 );
 
-fn smoke_backlight_snap_chooses_nearest_ladder_step() -> TestResult {
-    use crate::backlight::{__test_install_panel, __test_reset};
-
-    __test_reset();
-    let panel = __test_install_panel("\\TEST.LCD", alloc::vec![0, 25, 50, 75, 100]);
-    if panel.snap(0) != 0 {
-        return TestResult::Fail("snap(0) != 0");
-    }
-    // `snap` chooses the nearest ladder step by absolute distance.
-    // For levels [0, 25, 50, 75, 100]:
-    //   snap(12) → 0  (12 ≤ 12.5 midpoint)
-    //   snap(13) → 25 (distance 12 < 13)
-    //   snap(63) → 75 (distance 12 < 13)
-    if panel.snap(12) != 0 {
-        return TestResult::Fail("snap(12) should round down to 0");
-    }
-    if panel.snap(13) != 25 {
-        return TestResult::Fail("snap(13) should round up to 25 (nearest)");
-    }
-    if panel.snap(63) != 75 {
-        return TestResult::Fail("snap(63) should round up to 75");
-    }
-    if panel.snap(101) != 100 {
-        return TestResult::Fail("snap above max should clamp to max");
-    }
-    if panel.max() != 100 {
-        return TestResult::Fail("max() did not return ladder top");
-    }
-    __test_reset();
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/platform/backlight",
-    smoke_backlight_snap_chooses_nearest_ladder_step
-);
-
-fn smoke_backlight_cap_revocation_blocks_set_percent() -> TestResult {
-    use crate::backlight::{
-        __test_install_panel, __test_reset, bootstrap_backlight_authority, set_percent,
-        BacklightError,
-    };
-
-    __test_reset();
-    // Without any panels the percentage path returns Ok but does
-    // nothing; we want to focus on cap revocation here so install
-    // a synthetic panel.
-    let _ = __test_install_panel("\\TEST.LCD", alloc::vec![0, 100]);
-    let cap = bootstrap_backlight_authority();
-    cap.revoke();
-    match set_percent(&cap, 50) {
-        Err(BacklightError::AuthorityRevoked) => {}
-        _ => return TestResult::Fail("revoked cap was accepted by set_percent"),
-    }
-    __test_reset();
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/platform/backlight",
-    smoke_backlight_cap_revocation_blocks_set_percent
-);
+// ── Platform backlight smokes retired (#949) ──────────────────────
+// The platform crate's parallel `_BCL`/`_BCM`/`_BQC` registry
+// (BacklightPanel + cap-gated set_percent) was deleted; the single
+// ACPI brightness owner is narf_drivers_backlight::acpi_video,
+// whose ladder snap is covered by that crate's
+// smoke_acpi_video_bcm_snap.
 
 // ── Battery (AML-driven) ───────────────────────────────────────────
 

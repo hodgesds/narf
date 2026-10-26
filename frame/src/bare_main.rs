@@ -3232,6 +3232,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_platform::register_initcalls();
             narf_drivers_hwmon::register_initcalls();
             narf_drivers_watchdog::register_initcalls();
+            // Backlight subsystem: panel registry + single-owner
+            // arbitration + /sys/class/backlight. Until #947 nothing
+            // called this, so the crate's Stage::Device initcalls
+            // never ran in a production boot and the class did not
+            // exist. Sysfs publication is dynamic (register /
+            // unregister hooks in narf-drivers-backlight), so this
+            // needs no ordering against probe_all_pci: devices the
+            // GPU probes register afterwards publish themselves.
+            narf_drivers_backlight::register_initcalls();
             narf_drivers_serial::register_initcalls();
             narf_drivers_spi::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the
