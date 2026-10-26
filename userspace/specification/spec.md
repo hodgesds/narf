@@ -457,9 +457,12 @@ address-space metadata snapshot, reports lazy pages as nonresident and
 hardware-huge pages as resident base-page equivalents, and returns `ENOMEM`
 for any hole without quadratically cloning a VMA's complete backing list once
 per queried page.
-`msync(2)` validates its complete rounded mapping, rejects unknown flags and
-the mutually exclusive `MS_ASYNC|MS_SYNC` combination, then flushes retained
-shared-file pages. `madvise(2)` accepts unimplemented performance-only hints
+`msync(2)` validates its complete rounded VMA coverage without allocating a
+residency bitmap or consulting page tables. It rejects unknown flags and the
+mutually exclusive `MS_ASYNC|MS_SYNC` combination. Only `MS_SYNC` initiates
+shared-file writeback; `MS_ASYNC`, zero flags, and `MS_INVALIDATE` alone do
+not. Invalidation still reports `EBUSY` for locked mappings before reporting
+holes as `ENOMEM`. `madvise(2)` accepts unimplemented performance-only hints
 as no-ops, but unknown advice and semantic state controls such as DONTFORK or
 WIPEONFORK fail with `EINVAL` until their observable behavior exists.
 

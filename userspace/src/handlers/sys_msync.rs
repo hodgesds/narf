@@ -1,9 +1,8 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `msync(addr, len, flags)` — validate the range and commit fallback
-/// file-backed MAP_SHARED pages. Anonymous and device mappings need no
-/// writeback here.
+/// `msync(addr, len, flags)` — validate VMA coverage and, for MS_SYNC,
+/// commit fallback file-backed MAP_SHARED pages. MS_ASYNC does not start I/O.
 ///
 /// `mm/msync.c::SYSCALL_DEFINE3(msync)` fixes both the codes and their order:
 ///
@@ -76,26 +75,34 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
     // and MS_INVALIDATE's whole contract is that it may discard clean pages —
     // a caller told ENOMEM would widen its range and try again, while EBUSY
     // says the discard can never be honoured here.
+    let Some(as_ref) = current_address_space() else {
+        ctx.set_return(errno_ret(ENOMEM));
+        return;
+    };
     if flags & MS_INVALIDATE != 0 {
-        let locked = current_address_space().is_some_and(|as_ref| {
-            as_ref
-                .perms_intersecting(VirtAddr::new(addr), len)
-                .iter()
-                .any(|p| p.contains(narf_memory::RegionPerms::LOCKED))
-        });
+        let locked = as_ref
+            .perms_intersecting(VirtAddr::new(addr), len)
+            .iter()
+            .any(|p| p.contains(narf_memory::RegionPerms::LOCKED));
         if locked {
             ctx.set_return(errno_ret(EBUSY));
             return;
         }
     }
-    let mapped = current_address_space()
-        .is_some_and(|as_ref| as_ref.residency_range(VirtAddr::new(addr), len).is_ok());
-    if mapped {
-        match crate::mapped_file::flush_current_range(addr, len) {
-            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(()) => ctx.set_return(errno_ret(EIO)),
-        }
-    } else {
+    // msync validates VMAs, including lazy and PROT_NONE mappings. It does
+    // not need mincore's per-page bitmap or a hardware page-table walk.
+    if !as_ref.range_fully_mapped(VirtAddr::new(addr), len) {
         ctx.set_return(errno_ret(ENOMEM));
+        return;
+    }
+    // Linux mm/msync.c starts writeback only for MS_SYNC. MS_ASYNC, flags=0,
+    // and MS_INVALIDATE alone still validate coverage but do not initiate I/O.
+    if flags & MS_SYNC == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    match crate::mapped_file::flush_current_range(addr, len) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(()) => ctx.set_return(errno_ret(EIO)),
     }
 }
