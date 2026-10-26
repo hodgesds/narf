@@ -30,6 +30,9 @@ impl core::fmt::Debug for StationSecurity {
 }
 
 impl StationSecurity {
+    pub(super) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
     pub(super) fn new(
         bss: &ScanBss,
         plan: &JoinPlan,
@@ -343,9 +346,10 @@ impl<B: Backend> Session<B> {
     pub(super) fn keys_pending(&self) -> bool {
         !self.peer_lost
             && matches!(self.state, State::Associated { .. })
-            && self.data_pending.is_none()
+            && self.data_pending.is_empty()
             && (!self.control_pending.is_empty()
                 || self.rx_ba.pending(self.backend.now_ns())
+                || self.tx_ba.pending(self.backend.now_ns())
                 || self
                     .security
                     .as_ref()
@@ -371,7 +375,7 @@ impl<B: Backend> Session<B> {
         let State::Associated { info, peer, .. } = associated else {
             return Ok(());
         };
-        if self.data_pending.is_some() {
+        if !self.data_pending.is_empty() {
             return Ok(());
         }
         if self
@@ -390,6 +394,7 @@ impl<B: Backend> Session<B> {
         };
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
+            self.retire_transmit_ba(true).await?;
             self.retire_receive_ba(peer).await?;
             for _ in 0..4 {
                 let Some((pdu, protected)) = security.pending.pop_front() else {
@@ -436,6 +441,7 @@ impl<B: Backend> Session<B> {
             self.ht20_rx = None;
             self.ht20_profile = None;
             self.rx_ba.fence();
+            self.tx_ba.fence();
             self.state = State::Failed {
                 stage: Stage::EapolHandshake,
                 error,
@@ -453,6 +459,7 @@ impl<B: Backend> Session<B> {
     pub(super) fn receive_ethernet(&mut self) -> Result<Option<Vec<u8>>, Error> {
         if self.peer_lost {
             self.rx_ba.fence();
+            self.tx_ba.fence();
             self.clear_aggregate_receive();
             return Err(Error::DeviceGone);
         }
@@ -526,6 +533,7 @@ impl<B: Backend> Session<B> {
                 {
                     self.peer_lost = true;
                     self.rx_ba.fence();
+                    self.tx_ba.fence();
                     self.clear_aggregate_receive();
                     return Err(Error::DeviceGone);
                 }
@@ -548,6 +556,7 @@ impl<B: Backend> Session<B> {
                     // parameter set closes the port until a fresh join.
                     self.peer_lost = true;
                     self.rx_ba.fence();
+                    self.tx_ba.fence();
                     self.clear_aggregate_receive();
                     return Err(Error::DeviceGone);
                 }
@@ -563,6 +572,7 @@ impl<B: Backend> Session<B> {
             {
                 self.peer_lost = true;
                 self.rx_ba.fence();
+                self.tx_ba.fence();
                 self.clear_aggregate_receive();
                 return Err(Error::DeviceGone);
             }
@@ -723,21 +733,64 @@ impl<B: Backend> Session<B> {
         &mut self,
         frame: &[u8],
     ) -> Result<packet_tx::Completion, Error> {
+        if !self.data_pending.is_empty() {
+            return Err(Error::Busy);
+        }
         self.start_ethernet(frame)?;
-        self.wait(TIMEOUT_MS, |backend| backend.management_complete())
-            .await
-            .and_then(|completion| {
-                self.data_pending = None;
+        let result = self
+            .wait(TIMEOUT_MS, |backend| backend.management_complete())
+            .await;
+        match result {
+            Ok(completion) => {
+                self.data_pending.pop_front();
                 if completion.status == 0 {
                     Ok(completion)
                 } else {
-                    Err(Error::Rejected(completion.status))
+                    Err(self.fail_data(Error::Rejected(completion.status)))
                 }
-            })
+            }
+            Err(error) => Err(self.fail_data(error)),
+        }
     }
 
-    /// Publish at most one frame; completion is advanced by the common
-    /// bounded step, including from synchronous network waiters.
+    pub(super) fn fail_data(&mut self, error: Error) -> Error {
+        self.security = None;
+        self.station_permission = None;
+        self.wmm = None;
+        self.ht20_rx = None;
+        self.ht20_profile = None;
+        self.rx_ba.fence();
+        self.tx_ba.fence();
+        self.clear_aggregate_receive();
+        self.state = State::Failed {
+            stage: Stage::StaRecord,
+            error,
+        };
+        error
+    }
+
+    fn data_capacity(&self) -> usize {
+        if self.tx_ba.active() {
+            return self.tx_ba.capacity();
+        }
+        if self.ht20_profile.is_some() && self.wmm.is_some() {
+            packet_tx::PIPELINE
+        } else {
+            1
+        }
+    }
+    pub(super) fn data_controls_pending(&self) -> bool {
+        !self.control_pending.is_empty()
+            || self.rx_ba.pending(self.backend.now_ns())
+            || self.tx_ba.pending(self.backend.now_ns())
+            || self
+                .security
+                .as_ref()
+                .is_some_and(|s| !s.pending.is_empty())
+    }
+
+    /// Publish one frame into this profile's bounded native ownership queue;
+    /// synchronous network waiters advance the same completion proofs.
     pub(super) fn start_ethernet(&mut self, frame: &[u8]) -> Result<(), Error> {
         if self.peer_lost {
             return Err(Error::DeviceGone);
@@ -752,38 +805,58 @@ impl<B: Backend> Session<B> {
         {
             return Err(Error::Bounds);
         }
-        if self.data_pending.is_some() {
+        if self.data_pending.len() >= self.data_capacity() || self.data_controls_pending() {
             return Err(Error::Busy);
         }
         self.check_station_tx()?;
-        self.backend
-            .submit_data(frame, self.security.is_some(), self.wmm.is_some())?;
-        self.data_pending = Some(self.backend.now_ns());
+        let result = if self.tx_ba.active() {
+            self.backend
+                .submit_data_aggregated(frame, self.security.is_some())
+        } else if self.data_capacity() > 1 {
+            self.backend
+                .submit_data_pipelined(frame, self.security.is_some(), true)
+        } else {
+            self.backend
+                .submit_data(frame, self.security.is_some(), self.wmm.is_some())
+        };
+        match result {
+            Ok(()) => {}
+            Err(Error::Busy) => return Err(Error::Busy),
+            Err(error) => return Err(self.fail_data(error)),
+        }
+        self.data_pending.push_back(self.backend.now_ns());
+        if self.wmm.is_some() {
+            self.tid0_used = true;
+        }
+        self.tx_ba.touch(self.backend.now_ns());
         Ok(())
     }
 
     pub(super) fn poll_data_tx(&mut self) -> Result<bool, Error> {
-        let Some(started) = self.data_pending else {
-            return Ok(true);
-        };
-        self.backend.check()?;
-        if let Some(completion) = self.backend.management_complete()? {
-            self.data_pending = None;
-            if completion.status != 0 {
-                return Err(Error::Rejected(completion.status));
-            }
-            return Ok(true);
-        }
-        if self.backend.now_ns().saturating_sub(started) >= TIMEOUT_MS * 1_000_000 {
-            let error = Error::Timeout;
-            self.security = None;
-            self.state = State::Failed {
-                stage: Stage::StaRecord,
-                error,
+        for _ in 0..packet_tx::PIPELINE {
+            let Some(&started) = self.data_pending.front() else {
+                return Ok(!self.data_controls_pending());
             };
-            return Err(error);
+            if let Err(error) = self.backend.check() {
+                return Err(self.fail_data(error));
+            }
+            let completion = match self.backend.management_complete() {
+                Ok(value) => value,
+                Err(error) => return Err(self.fail_data(error)),
+            };
+            if let Some(completion) = completion {
+                self.data_pending.pop_front();
+                if completion.status != 0 {
+                    return Err(self.fail_data(Error::Rejected(completion.status)));
+                }
+                continue;
+            }
+            if self.backend.now_ns().saturating_sub(started) >= TIMEOUT_MS * 1_000_000 {
+                return Err(self.fail_data(Error::Timeout));
+            }
+            break;
         }
-        Ok(false)
+        Ok(self.data_pending.len() < self.data_capacity() && !self.data_controls_pending())
     }
 
     pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
@@ -842,9 +915,10 @@ impl<B: Backend> Session<B> {
         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
         plan.offer_ht20(info, bss, permission)?;
         self.backend.check_tx_permission(permission)?;
-        if !self.rx_ba.begin_connection() {
+        if !self.rx_ba.begin_connection() || !self.tx_ba.begin_connection() {
             return Err(Error::Busy);
         }
+        self.tid0_used = false;
 
         self.management_rate = plan.management_rate();
         // Discard idle receive preparation. Any HT activation below must be
@@ -1159,6 +1233,7 @@ impl<B: Backend> Session<B> {
         // reusable station permission in the retained running owner.
         let closing_permission = self.station_permission.take();
         self.rx_ba.fence();
+        self.tx_ba.fence();
         self.ht20_rx = None;
         self.ht20_profile = None;
         self.control_pending.clear();
@@ -1166,11 +1241,12 @@ impl<B: Backend> Session<B> {
         let peer_lost = self.peer_lost;
         self.stage(Stage::StaRecord);
         let result = async {
-            if self.data_pending.is_some() {
+            while !self.data_pending.is_empty() {
                 self.wait(TIMEOUT_MS, |backend| backend.management_complete())
                     .await?;
-                self.data_pending = None;
+                self.data_pending.pop_front();
             }
+            self.retire_transmit_ba(false).await?;
             self.retire_receive_ba(peer).await?;
             if !peer_lost {
                 let mut deauth = vec![0u8; 26];
@@ -1249,6 +1325,7 @@ impl<B: Backend> Session<B> {
             self.ht20_rx = None;
             self.ht20_profile = None;
             self.rx_ba.fence();
+            self.tx_ba.fence();
             self.control_pending.clear();
             self.clear_aggregate_receive();
             let stage = match self.state {
@@ -1263,8 +1340,10 @@ impl<B: Backend> Session<B> {
     /// Advance recipient BA and declined requests under the retained control
     /// owner. Dropping this future cannot restore an associated producer.
     async fn service_control(&mut self) -> Result<(), Error> {
-        if self.control_pending.is_empty() && !self.rx_ba.pending(self.backend.now_ns())
-            || self.data_pending.is_some()
+        if self.control_pending.is_empty()
+            && !self.rx_ba.pending(self.backend.now_ns())
+            && !self.tx_ba.pending(self.backend.now_ns())
+            || !self.data_pending.is_empty()
         {
             return Ok(());
         }
@@ -1278,6 +1357,7 @@ impl<B: Backend> Session<B> {
         self.stage(Stage::StaRecord);
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
+            self.service_transmit_ba().await?;
             self.service_receive_ba(info.capabilities.mac, peer).await?;
             for _ in 0..4 {
                 let Some(frame) = self.control_pending.pop_front() else {
@@ -1296,6 +1376,7 @@ impl<B: Backend> Session<B> {
             self.ht20_profile = None;
             self.ht20_rx = None;
             self.rx_ba.fence();
+            self.tx_ba.fence();
             self.control_pending.clear();
             self.received_msdu.clear();
             self.state = State::Failed {

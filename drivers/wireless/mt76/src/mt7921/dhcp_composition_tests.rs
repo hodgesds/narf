@@ -345,7 +345,7 @@ fn composition_ht20(wpa2: bool, aggregate_rx: bool, wmm: bool, ht20: bool) -> Te
     composition_ht(wpa2, aggregate_rx, wmm, ht20, false)
 }
 fn composition_ht(wpa2: bool, aggregate_rx: bool, wmm: bool, ht20: bool, ht40: bool) -> TestResult {
-    composition_profile(wpa2, aggregate_rx, wmm, ht20, ht40, false)
+    composition_profile(wpa2, aggregate_rx, wmm, ht20, ht40, false, false)
 }
 fn composition_profile(
     wpa2: bool,
@@ -354,6 +354,7 @@ fn composition_profile(
     ht20: bool,
     ht40: bool,
     ba_rx: bool,
+    ba_tx: bool,
 ) -> TestResult {
     let mut model = Model::new();
     if wmm {
@@ -363,6 +364,9 @@ fn composition_profile(
         model.ht_reply = Some(super::ht20_tests::elements(6));
     }
     model.station_channel = CHANNEL;
+    if ba_tx {
+        model.tx_ba_offer = Some((64, 0));
+    }
     model.access_point = Some(
         if wpa2 {
             FakeAp::wpa2(NETWORK, SSID, CHANNEL, 42, PSK, ANONCE)
@@ -402,7 +406,7 @@ fn composition_profile(
         received: Vec::new(),
     });
 
-    let result = composition_body(&name, wpa2, aggregate_rx, wmm, ht20, ht40, ba_rx);
+    let result = composition_body(&name, wpa2, aggregate_rx, wmm, ht20, ht40, (ba_rx, ba_tx));
 
     // Teardown in reverse order: session first (no drain/send can
     // fire against a half-removed interface), then carrier, then
@@ -430,8 +434,9 @@ fn composition_body(
     wmm: bool,
     ht20: bool,
     ht40: bool,
-    ba_rx: bool,
+    ba: (bool, bool),
 ) -> TestResult {
+    let (ba_rx, ba_tx) = ba;
     // ── Before association: no carrier, and the controlled port
     // keeps DHCP off the air entirely (audit §4.3.1 S1: "no DHCP
     // before PORT_SECURE" — here, before association completes).
@@ -514,6 +519,17 @@ fn composition_body(
             return TestResult::Fail("composed DHCP BA native negotiation/response failed");
         }
     }
+    // The real Transport attempts this before carrier for every fresh HT/WMM
+    // peer. Authored legacy APs consume the genuine request but make no offer;
+    // their completed timeout/DELBA fallback must keep DHCP reachable.
+    if run(session.negotiate_transmit_ba()) != Ok(ba_tx)
+        || session.tx_ba.active() != ba_tx
+        || session.tx_ba.published() != ba_tx
+        || session.tx_ba.remote() != ba_tx
+    {
+        put_session(session);
+        return TestResult::Fail("composed DHCP originator transaction did not complete");
+    }
     put_session(session);
 
     // ── Carrier up, exactly where `Mt76Iface::associate` raises it:
@@ -554,6 +570,19 @@ fn composition_body(
             || session.backend.data_qos.iter().any(|qos| *qos != wmm)
         {
             return TestResult::Fail("DHCP link used unnegotiated QoS metadata");
+        }
+        if session.backend.data_aggregation.len() != session.backend.data_protection.len()
+            || session.backend.data_ba_disabled.len() != session.backend.data_protection.len()
+            || session.backend.data_ba_disabled.contains(&ba_tx)
+            || session
+                .backend
+                .data_aggregation
+                .iter()
+                .any(|aggregated| *aggregated != ba_tx)
+        {
+            return TestResult::Fail(
+                "DHCP native aggregate eligibility differed from completed originator owner",
+            );
         }
         let dhcp_frames = captured_data(session)
             .into_iter()
@@ -635,6 +664,21 @@ fn rx_packets(name: &str) -> u64 {
 fn mt76_wifi_open_association_dhcp_lease_composition() -> TestResult {
     composition(false, false, false)
 }
+
+fn mt76_tx_ba_open_ht20_negotiation_dhcp_and_exact_bidirectional_ip() -> TestResult {
+    composition_profile(false, false, true, true, false, false, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx_ba",
+    mt76_tx_ba_open_ht20_negotiation_dhcp_and_exact_bidirectional_ip
+);
+fn mt76_tx_ba_wpa2_ht40_both_roles_dhcp_and_exact_bidirectional_ip() -> TestResult {
+    composition_profile(true, false, true, true, true, true, true)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx_ba",
+    mt76_tx_ba_wpa2_ht40_both_roles_dhcp_and_exact_bidirectional_ip
+);
 kernel_test_in!(
     "drivers/wireless/mt7921/dhcp",
     mt76_wifi_open_association_dhcp_lease_composition
@@ -702,14 +746,14 @@ fn mt76_wpa2_ht40_sgi_amsdu_dhcp_and_ip() -> TestResult {
     composition_ht(true, true, true, true, true)
 }
 fn mt76_open_ht20_recipient_ba_dhcp_and_exact_ip() -> TestResult {
-    composition_profile(false, false, true, true, false, true)
+    composition_profile(false, false, true, true, false, true, false)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/rx_ba",
     mt76_open_ht20_recipient_ba_dhcp_and_exact_ip
 );
 fn mt76_wpa2_ht40_recipient_ba_dhcp_and_exact_ip() -> TestResult {
-    composition_profile(true, false, true, true, true, true)
+    composition_profile(true, false, true, true, true, true, false)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/rx_ba",

@@ -26,7 +26,7 @@ fn dma_barrier() {
     fence(Ordering::SeqCst);
 }
 
-const DEPTH: usize = 16;
+const DEPTH: usize = packet_tx::RING_SLOTS;
 const GLOBAL: u32 = 0xd4208;
 const BUSY: u32 = 0xa;
 const ENABLE: u32 = 5;
@@ -133,6 +133,7 @@ struct Storage {
     fwdl: Ring,
     rx: [Ring; 3],
     data: Ring,
+    data_dma: usize,
     tokens: packet_tx::Tokens,
     pending_events: VecDeque<Vec<u8>>,
     pending_data: VecDeque<Vec<u8>>,
@@ -161,6 +162,7 @@ impl Storage {
             }
         }
         self.tokens = packet_tx::Tokens::new();
+        self.data_dma = 0;
         self.pending_events.clear();
         self.pending_data.clear();
         dma_barrier();
@@ -304,9 +306,10 @@ impl Hardware {
             );
         }
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
-        storage.tokens.begin(token)?;
+        storage.tokens.begin_at(token, slot)?;
         let ring = &mut storage.data;
         ring.pending = true; // conservative on any later doorbell failure
+        ring.index = (slot + 1) % DEPTH;
         ring.set_word(slot, 0, address as u32);
         ring.set_word(slot, 2, 0);
         ring.set_word(slot, 3, (address >> 32) as u32 & 15);
@@ -316,22 +319,53 @@ impl Hardware {
         self.write(TX_DATA + 8, ((slot + 1) % DEPTH) as u32)
     }
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
+        self.submit_data_mode(frame, protected, qos, false)
+    }
+    fn submit_data_mode(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+        pipelined: bool,
+    ) -> Result<(), Error> {
+        self.submit_data_profile(frame, protected, qos, pipelined, false)
+    }
+    fn submit_data_profile(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+        pipelined: bool,
+        aggregated: bool,
+    ) -> Result<(), Error> {
+        if aggregated && (!qos || !pipelined) {
+            return Err(Error::Bounds);
+        }
+        if pipelined && !qos {
+            return Err(Error::Bounds);
+        }
         self.check()?;
         if !self.owner.published {
             return Err(Error::Busy);
         }
         let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
-        let token = storage.tokens.available()?;
+        let token = if pipelined {
+            storage.tokens.available_pipelined()?
+        } else {
+            storage.tokens.available()?
+        };
         let ring = &storage.data;
         let slot = ring.index;
-        if ring.pending || ring.word(slot, 1) & DONE == 0 {
+        if storage.tokens.owns_slot(slot) || ring.word(slot, 1) & DONE == 0 {
             return Err(Error::Busy);
         }
         let address = ring.buffers[slot].dma_addr().raw();
         let payload = address
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
-        let header = if qos {
+        let header = if aggregated {
+            packet_tx::ethernet_aggregated(frame, payload, token, protected)?
+        } else if qos {
             packet_tx::ethernet_qos(frame, payload, token, 1, protected, true)?
         } else {
             packet_tx::ethernet(frame, payload, token, 1, protected)?
@@ -351,9 +385,10 @@ impl Hardware {
             );
         }
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
-        storage.tokens.begin(token)?;
+        storage.tokens.begin_at(token, slot)?;
         let ring = &mut storage.data;
         ring.pending = true; // conservative on any later doorbell failure
+        ring.index = (slot + 1) % DEPTH;
         ring.set_word(slot, 0, address as u32);
         ring.set_word(slot, 2, 0);
         ring.set_word(slot, 3, (address >> 32) as u32 & 15);
@@ -368,17 +403,33 @@ impl Hardware {
         if !ring.pending {
             return Err(Error::Ring);
         }
-        let next = (ring.index + 1) % DEPTH;
+        let read = self.owner.storage.as_ref().ok_or(Error::Busy)?.data_dma;
         let didx = self.read(TX_DATA + 12)? as usize;
-        if didx >= DEPTH || didx != ring.index && didx != next {
+        dma_barrier();
+        let submitted = (ring.index + DEPTH - read) % DEPTH;
+        let advanced = if didx < DEPTH {
+            (didx + DEPTH - read) % DEPTH
+        } else {
+            DEPTH
+        };
+        if advanced > submitted {
             return Err(Error::Ring);
         }
-        let done = didx == next && ring.word(ring.index, 1) & DONE != 0;
+        for offset in 0..advanced {
+            let slot = (read + offset) % DEPTH;
+            if !self.owner.storage.as_ref().unwrap().tokens.owns_slot(slot) {
+                return Err(Error::Ring);
+            }
+            if ring.word(slot, 1) & DONE == 0 {
+                return Ok(None);
+            }
+        }
         dma_barrier();
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
-        if done {
-            storage.tokens.dma_done()?;
+        for offset in 0..advanced {
+            storage.tokens.dma_done_at((read + offset) % DEPTH)?;
         }
+        storage.data_dma = didx;
         let mut result = storage.tokens.finish();
         if result.is_none() {
             // Poll reports without consuming queued/fresh MCU replies.
@@ -388,8 +439,7 @@ impl Hardware {
         }
         if result.is_some() {
             let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
-            storage.data.pending = false;
-            storage.data.index = next;
+            storage.data.pending = !storage.tokens.is_empty();
         }
         Ok(result)
     }
@@ -709,6 +759,30 @@ impl Backend for Hardware {
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
         self.submit_data(frame, protected, qos)
     }
+    fn submit_data_pipelined(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+    ) -> Result<(), Error> {
+        if !qos {
+            return Err(Error::Bounds);
+        }
+        self.submit_data_mode(frame, protected, qos, true)
+    }
+    fn submit_data_aggregated(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
+        self.submit_data_profile(frame, protected, true, true, true)
+    }
+    fn receive_idle(&self) -> Result<bool, Error> {
+        self.check()?;
+        let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
+        dma_barrier();
+        Ok(storage.pending_data.is_empty()
+            && storage
+                .rx
+                .iter()
+                .all(|ring| ring.word(ring.index, 1) & DONE == 0))
+    }
     fn management_complete(
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error> {
@@ -765,6 +839,7 @@ impl Transport {
                 wm: Ring::allocate(TX_WM, false)?,
                 fwdl: Ring::allocate(TX_FWDL, false)?,
                 data: Ring::allocate(TX_DATA, false)?,
+                data_dma: 0,
                 tokens: packet_tx::Tokens::new(),
                 pending_events: VecDeque::new(),
                 pending_data: VecDeque::new(),
@@ -855,9 +930,24 @@ impl Transport {
         };
         let permission = crate::mt7921::association::TxPermission::from_ap(&domain, info, bss)
             .ok_or(Error::Authority)?;
-        self.session
+        let aid = self
+            .session
             .associate_station(bss, ssid, security, permission, extra_ies)
-            .await
+            .await?;
+        self.session.service_keys().await?;
+        self.session.negotiate_transmit_ba().await?;
+        self.session.service_keys().await?;
+        Ok(aid)
+    }
+    /// Negotiate only before this native peer's first QoS Ethernet MPDU.
+    /// Metadata alone does not grant current transmit permission.
+    pub async fn negotiate_transmit_ba(&mut self) -> Result<bool, Error> {
+        self.session.negotiate_transmit_ba().await
+    }
+    pub fn transmit_ba_active(&self) -> bool {
+        matches!(self.session.state, State::Associated { .. })
+            && !self.session.peer_lost
+            && self.session.tx_ba.active()
     }
     /// Send deauthentication and tear down peer station record.
     pub async fn disassociate_station(&mut self) -> Result<(), Error> {

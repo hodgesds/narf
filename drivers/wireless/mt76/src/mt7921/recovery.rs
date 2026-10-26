@@ -25,6 +25,7 @@ impl<B: Backend> Session<B> {
         }
         self.boot_started = None;
         self.rx_ba.fence();
+        self.tx_ba.fence();
         self.stage(Stage::RecoveryPark);
         let result = self.recover_inner(expected_mac).await;
         if let Err(error) = result {
@@ -88,6 +89,8 @@ impl<B: Backend> Session<B> {
         self.stage(Stage::RecoveryRearm);
         self.backend.recycle()?;
         self.rx_ba.reset_after_quiescence();
+        self.tx_ba.reset_after_quiescence();
+        self.tid0_used = false;
         self.security = None;
         self.wmm = None;
         self.station_permission = None;
@@ -96,7 +99,7 @@ impl<B: Backend> Session<B> {
         self.control_pending.clear();
         self.received_msdu.clear();
         self.station_bss = None;
-        self.data_pending = None;
+        self.data_pending.clear();
         self.peer_lost = false;
         self.events.clear();
         self.transferred = 0;

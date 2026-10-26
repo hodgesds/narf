@@ -1,6 +1,6 @@
 //! Retained CONNAC2 firmware transport, adapted from local Linux ecd997b0189a:
 //! mt76_connac_mcu.{c,h}, mt7921/{pci,pci_mcu,mcu}.c and mt792x_dma.c.
-//! Retains ROM/WM startup, legacy station control, and serialized packet ownership.
+//! Retains ROM/WM startup, station control, and bounded native packet ownership.
 use super::fwdl;
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{future::poll_fn, ops::Range, task::Poll};
@@ -19,6 +19,10 @@ mod ba;
 mod ba_station;
 #[path = "station_join.rs"]
 mod join;
+#[path = "tx_ba.rs"]
+mod tx_ba;
+#[path = "tx_ba_station.rs"]
+mod tx_ba_station;
 pub use amsdu::Ht20ReceiveInfo;
 pub use join::to_ethernet;
 #[path = "recovery.rs"]
@@ -753,6 +757,9 @@ trait Backend {
     fn tx_complete(&mut self, scatter: bool) -> Result<bool, Error>;
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error>;
     fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error>;
+    /// A current native RX-ring/FIFO idle observation, including host-queued
+    /// normal/forwarded frames. An empty decoded-frame result is insufficient.
+    fn receive_idle(&self) -> Result<bool, Error>;
     fn release(&mut self) -> Result<(), Error>;
     fn park_bus_master(&mut self) -> Result<(), Error>;
     fn request_link_own(&mut self) -> Result<(), Error>;
@@ -776,6 +783,17 @@ trait Backend {
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error>;
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error>;
+    fn submit_data_pipelined(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+    ) -> Result<(), Error> {
+        self.submit_data(frame, protected, qos)
+    }
+    fn submit_data_aggregated(&mut self, _frame: &[u8], _protected: bool) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
 }
 
 /// Active station checks consume only the currently installed snapshot.
@@ -804,7 +822,9 @@ struct Session<B: Backend> {
     scan_seq: u8,
     security: Option<join::StationSecurity>,
     management_rate: crate::mt7921::association::LegacyRate,
-    data_pending: Option<u64>,
+    data_pending: VecDeque<u64>,
+    tid0_used: bool,
+    tx_ba: tx_ba::Owner,
     peer_lost: bool,
     station_bss: Option<ScanBss>,
     station_permission: Option<crate::mt7921::association::TxPermission>,
@@ -828,7 +848,9 @@ impl<B: Backend> Session<B> {
             scan_seq: 0,
             security: None,
             management_rate: crate::mt7921::association::LegacyRate::ONE_MBPS,
-            data_pending: None,
+            data_pending: VecDeque::with_capacity(crate::mt7921::packet_tx::PIPELINE),
+            tid0_used: false,
+            tx_ba: tx_ba::Owner::default(),
             peer_lost: false,
             station_bss: None,
             station_permission: None,
@@ -1046,6 +1068,7 @@ impl<B: Backend> Session<B> {
         }
         self.boot_started = None;
         self.rx_ba.fence();
+        self.tx_ba.fence();
         self.security = None;
         self.station_permission = None;
         self.ht20_rx = None;
