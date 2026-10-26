@@ -181,6 +181,18 @@ impl crate::HwmonDevice for Coretemp {
         false
     }
 
+    fn temp_limits(&self, label: &str) -> (Option<i32>, Option<i32>) {
+        // Tjmax, decoded from MSR_TEMPERATURE_TARGET at probe, is the
+        // junction critical limit by definition — Linux coretemp
+        // publishes it as temp_crit and exposes no separate temp_max.
+        match label {
+            "Tpackage" | "Core0" | "Core1" | "Core2" | "Core3" => {
+                (None, Some((self.tjmax_c as i32) * 1000))
+            }
+            _ => (None, None),
+        }
+    }
+
     fn list_labels(&self) -> Vec<&str> {
         LABELS.to_vec()
     }

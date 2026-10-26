@@ -236,6 +236,24 @@ fn smoke_nct6775_fan_tach_layout() -> TestResult {
 }
 kernel_test_in!("drivers/hwmon/nct6775", smoke_nct6775_fan_tach_layout);
 
+/// PWM channel resolution: the trait's fan labels and the chip's
+/// native pwm labels name the same channels; sensor labels don't
+/// resolve.
+fn smoke_nct6775_pwm_channel_labels() -> TestResult {
+    use crate::nct6775::pwm_channel;
+    if pwm_channel("fan1") != Some(0) || pwm_channel("pwm1") != Some(0) {
+        return TestResult::Fail("fan1/pwm1 should both resolve to PWM channel 0");
+    }
+    if pwm_channel("fan5") != Some(4) || pwm_channel("pwm5") != Some(4) {
+        return TestResult::Fail("fan5/pwm5 should both resolve to PWM channel 4");
+    }
+    if pwm_channel("temp1").is_some() || pwm_channel("in0").is_some() {
+        return TestResult::Fail("sensor labels must not resolve to a PWM channel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/nct6775", smoke_nct6775_pwm_channel_labels);
+
 /// num_fans / num_temps counts for a few variants.
 fn smoke_nct6775_chip_caps() -> TestResult {
     use crate::nct6775::NctChip;
@@ -480,6 +498,291 @@ fn smoke_bridge_failed_reads_empty_genuine_zero_renders() -> TestResult {
 kernel_test_in!(
     "drivers/hwmon/bridge",
     smoke_bridge_failed_reads_empty_genuine_zero_renders
+);
+
+/// Fake device with real hardware limits and one controllable fan
+/// channel. `set_fan` records the duty it was driven with;
+/// `read_pwm` reports it back — the shape a real PWM chip (nct6775,
+/// it87) presents to the bridge.
+#[derive(Debug)]
+struct FakeControlDevice {
+    duty: core::sync::atomic::AtomicU8,
+    set_fan_called: core::sync::atomic::AtomicBool,
+}
+
+impl FakeControlDevice {
+    fn new() -> Self {
+        Self {
+            duty: core::sync::atomic::AtomicU8::new(0),
+            set_fan_called: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl crate::HwmonDevice for FakeControlDevice {
+    fn name(&self) -> &str {
+        "fakecontrol"
+    }
+
+    fn read_temp(&self, label: &str) -> Option<i32> {
+        if label == "Tdie" {
+            Some(42_000)
+        } else {
+            None
+        }
+    }
+
+    fn read_fan(&self, label: &str) -> Option<u32> {
+        if label == "fan1" {
+            Some(1200)
+        } else {
+            None
+        }
+    }
+
+    fn read_voltage(&self, _label: &str) -> Option<i32> {
+        None
+    }
+
+    fn set_fan(&self, label: &str, level: u8) -> bool {
+        use core::sync::atomic::Ordering;
+        if label != "fan1" {
+            return false;
+        }
+        self.duty.store(level, Ordering::SeqCst);
+        self.set_fan_called.store(true, Ordering::SeqCst);
+        true
+    }
+
+    fn temp_limits(&self, label: &str) -> (Option<i32>, Option<i32>) {
+        if label == "Tdie" {
+            (Some(85_000), Some(95_000))
+        } else {
+            (None, None)
+        }
+    }
+
+    fn read_pwm(&self, label: &str) -> Option<u8> {
+        if label == "fan1" {
+            Some(self.duty.load(core::sync::atomic::Ordering::SeqCst))
+        } else {
+            None
+        }
+    }
+
+    fn supports_fan_control(&self, label: &str) -> bool {
+        label == "fan1"
+    }
+
+    fn list_labels(&self) -> alloc::vec::Vec<&str> {
+        alloc::vec!["Tdie", "fan1"]
+    }
+}
+
+/// Fetch `hwmon0` from a freshly populated class with exactly one
+/// device registered. Returns `None` (fixture failure) when absent.
+fn hwmon0_kobj() -> Option<narf_filesystem::sysfs::Kobject> {
+    narf_filesystem::sysfs::sysfs_root()
+        .get_child("class")
+        .and_then(|c| c.get_child("hwmon"))
+        .and_then(|h| h.get_child("hwmon0"))
+}
+
+/// #909: `temp1_max` / `temp1_crit` render the DEVICE's limits
+/// (85 °C / 95 °C here) — before the fix the bridge rendered its own
+/// hardcoded 100000 / 105000 constants for every chip.
+fn smoke_bridge_thresholds_come_from_device() -> TestResult {
+    use alloc::sync::Arc;
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    crate::registry::register_device(Arc::new(FakeControlDevice::new()));
+    crate::sysfs_bridge::populate_hwmon_class();
+    let kobj = match hwmon0_kobj() {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 not found"),
+    };
+    match kobj.attr_show("temp1_max") {
+        Some(s) if s == "85000\n" => {}
+        Some(_) => return TestResult::Fail("temp1_max did not render the device limit 85000"),
+        None => return TestResult::Fail("temp1_max missing though the device reports a limit"),
+    }
+    match kobj.attr_show("temp1_crit") {
+        Some(s) if s == "95000\n" => {}
+        Some(_) => return TestResult::Fail("temp1_crit did not render the device limit 95000"),
+        None => return TestResult::Fail("temp1_crit missing though the device reports a limit"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/hwmon/bridge",
+    smoke_bridge_thresholds_come_from_device
+);
+
+/// #909: a device that reports no limits gets NO threshold
+/// attributes (never the old fabricated constants), and a fan
+/// channel without control support gets NO `pwm1` attribute — a
+/// published control is never a dead end.
+fn smoke_bridge_no_limits_no_threshold_attrs_no_pwm() -> TestResult {
+    use alloc::sync::Arc;
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    crate::registry::register_device(Arc::new(FakeFailDevice));
+    crate::sysfs_bridge::populate_hwmon_class();
+    let kobj = match hwmon0_kobj() {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 not found"),
+    };
+    if kobj.attr_show("temp1_max").is_some() {
+        return TestResult::Fail("temp1_max published for a device with no hardware limit");
+    }
+    if kobj.attr_show("temp1_crit").is_some() {
+        return TestResult::Fail("temp1_crit published for a device with no hardware limit");
+    }
+    if kobj.attr_show("pwm1").is_some() || kobj.attr_is_writable("pwm1") {
+        return TestResult::Fail("pwm1 published for a fan channel with no control support");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/hwmon/bridge",
+    smoke_bridge_no_limits_no_threshold_attrs_no_pwm
+);
+
+/// #909: coretemp's `temp1_crit` is the device's Tjmax (95 °C for
+/// this fixture device — a value the old hardcoded bridge could
+/// never produce in the crit slot), and coretemp gets no `temp1_max`
+/// because the hardware exposes no separate high limit.
+fn smoke_bridge_coretemp_crit_is_device_tjmax() -> TestResult {
+    use crate::coretemp::Coretemp;
+    use alloc::sync::Arc;
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    crate::registry::register_device(Arc::new(Coretemp::new(95, 0)));
+    crate::sysfs_bridge::populate_hwmon_class();
+    let kobj = match hwmon0_kobj() {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 not found"),
+    };
+    match kobj.attr_show("temp1_crit") {
+        Some(s) if s == "95000\n" => {}
+        Some(_) => return TestResult::Fail("temp1_crit did not render the device Tjmax 95000"),
+        None => return TestResult::Fail("temp1_crit missing for coretemp"),
+    }
+    if kobj.attr_show("temp1_max").is_some() {
+        return TestResult::Fail("temp1_max published though coretemp has no max limit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/hwmon/bridge",
+    smoke_bridge_coretemp_crit_is_device_tjmax
+);
+
+/// #909: the `pwm1` store is the userspace production caller of
+/// `set_fan` — a valid write lands in the driver with the exact
+/// duty, the show reads the duty back, and malformed / out-of-range
+/// writes are rejected without touching the driver.
+fn smoke_bridge_pwm_store_drives_set_fan() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::Ordering;
+    narf_filesystem::sysfs::__reset_for_test();
+    crate::registry::__reset_devices_for_test();
+    let dev = Arc::new(FakeControlDevice::new());
+    crate::registry::register_device(dev.clone());
+    crate::sysfs_bridge::populate_hwmon_class();
+    let kobj = match hwmon0_kobj() {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 not found"),
+    };
+    if !kobj.attr_is_writable("pwm1") {
+        return TestResult::Fail("pwm1 not writable for a controllable fan channel");
+    }
+    match kobj.attr_show("pwm1") {
+        Some(s) if s == "0\n" => {}
+        Some(_) => return TestResult::Fail("pwm1 did not show the initial duty 0"),
+        None => return TestResult::Fail("pwm1 attr missing"),
+    }
+    match kobj.attr_store("pwm1", b"200\n") {
+        Some(Ok(())) => {}
+        Some(Err(_)) => return TestResult::Fail("pwm1 store of 200 was rejected"),
+        None => return TestResult::Fail("pwm1 has no store callback"),
+    }
+    if !dev.set_fan_called.load(Ordering::SeqCst) || dev.duty.load(Ordering::SeqCst) != 200 {
+        return TestResult::Fail("pwm1 store did not drive set_fan with duty 200");
+    }
+    match kobj.attr_show("pwm1") {
+        Some(s) if s == "200\n" => {}
+        Some(_) => return TestResult::Fail("pwm1 did not read back duty 200"),
+        None => return TestResult::Fail("pwm1 attr missing after store"),
+    }
+    for bad in [
+        &b"256"[..],
+        &b"1000"[..],
+        &b"fast"[..],
+        &b""[..],
+        &b"-1"[..],
+    ] {
+        match kobj.attr_store("pwm1", bad) {
+            Some(Err(_)) => {}
+            Some(Ok(())) => return TestResult::Fail("pwm1 store accepted invalid input"),
+            None => return TestResult::Fail("pwm1 has no store callback"),
+        }
+    }
+    if dev.duty.load(Ordering::SeqCst) != 200 {
+        return TestResult::Fail("a rejected pwm1 store changed the driven duty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/hwmon/bridge",
+    smoke_bridge_pwm_store_drives_set_fan
+);
+
+// ── Thermal composition (#909) ──────────────────────────────────────
+
+/// The cooling adapter forwards the governor's level to `set_fan`
+/// unchanged — the adapter is the in-kernel production caller that
+/// connects the thermal loop to the hwmon drivers.
+fn smoke_cooling_adapter_drives_set_fan() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::Ordering;
+    use narf_power::thermal::CoolingDevice as _;
+    let dev = Arc::new(FakeControlDevice::new());
+    let cooling = crate::cooling::HwmonCoolingDevice::new(dev.clone(), "fan1");
+    cooling.set_level(77);
+    if !dev.set_fan_called.load(Ordering::SeqCst) || dev.duty.load(Ordering::SeqCst) != 77 {
+        return TestResult::Fail("cooling adapter did not drive set_fan with level 77");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/hwmon/cooling",
+    smoke_cooling_adapter_drives_set_fan
+);
+
+/// End to end: a controllable device in the hwmon registry is picked
+/// up by `register_hwmon_cooling_devices`, and the thermal
+/// governor's `set_cooling_level` reaches its `set_fan`.
+fn smoke_cooling_registration_reaches_governor() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::Ordering;
+    narf_power::thermal::init();
+    crate::registry::__reset_devices_for_test();
+    let dev = Arc::new(FakeControlDevice::new());
+    crate::registry::register_device(dev.clone());
+    crate::cooling::register_hwmon_cooling_devices();
+    match narf_power::thermal::set_cooling_level(55) {
+        Ok(()) => {}
+        Err(_) => return TestResult::Fail("set_cooling_level failed after registration"),
+    }
+    if dev.duty.load(Ordering::SeqCst) != 55 {
+        return TestResult::Fail("governor level 55 did not reach the device's set_fan");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/hwmon/cooling",
+    smoke_cooling_registration_reaches_governor
 );
 
 /// `temp1_label` returns the label string with a newline.
@@ -730,6 +1033,11 @@ mod dell_smm_tests {
     use crate::HwmonDevice;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    /// Last `SMM_SET_FAN` argument the mock received
+    /// (`fan_idx | level << 8`); `u32::MAX` until the first call.
+    static LAST_SET_FAN_ARG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(u32::MAX);
+
     fn mock_smm_call(cmd: u32, arg: u32) -> crate::dell_smm::SmmResult {
         use crate::dell_smm::*;
         match cmd {
@@ -770,6 +1078,7 @@ mod dell_smm_tests {
                 }
             }
             SMM_SET_FAN => {
+                LAST_SET_FAN_ARG.store(arg, core::sync::atomic::Ordering::SeqCst);
                 let fan_idx = arg & 0xFF;
                 let level = (arg >> 8) & 0xFF;
                 if fan_idx < 2 && level <= 3 {
@@ -818,20 +1127,90 @@ mod dell_smm_tests {
             return TestResult::Fail("Expected fan2 RPM to be 2400");
         }
 
-        // Verify setting fan levels
-        if !dev.set_fan("fan1", 2) {
+        // Verify fan writes: `set_fan` takes the trait's 0–255 duty
+        // and the driver scales it to an SMM tier at the boundary —
+        // duty 255 reaches the firmware as tier 3 (max) for fan 0,
+        // duty 85 as tier 1 (low) for fan 1.
+        use core::sync::atomic::Ordering;
+        LAST_SET_FAN_ARG.store(u32::MAX, Ordering::SeqCst);
+        if !dev.set_fan("fan1", 255) {
             *SMM_MOCK.lock() = None;
-            return TestResult::Fail("Expected set_fan to succeed");
+            return TestResult::Fail("Expected set_fan(fan1, 255) to succeed");
         }
-        if dev.set_fan("fan1", 5) {
+        if LAST_SET_FAN_ARG.load(Ordering::SeqCst) != (3 << 8) {
             *SMM_MOCK.lock() = None;
-            return TestResult::Fail("Expected setting invalid level to fail");
+            return TestResult::Fail("Duty 255 should reach SMM as tier 3 for fan 0");
+        }
+        if !dev.set_fan("fan2", 85) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected set_fan(fan2, 85) to succeed");
+        }
+        if LAST_SET_FAN_ARG.load(Ordering::SeqCst) != (1 | (1 << 8)) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Duty 85 should reach SMM as tier 1 for fan 1");
+        }
+        // The raw firmware boundary still rejects out-of-range tiers.
+        if crate::dell_smm::set_fan_level(0, 5) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected SMM to reject tier 5");
+        }
+        // Unknown fan labels are refused at the trait surface.
+        if dev.set_fan("fan9", 100) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected set_fan on an unknown label to fail");
+        }
+
+        // read_pwm reports the firmware's current tier as its duty:
+        // the mock's fan status is tier 2 for fan1 (duty 170) and
+        // tier 1 for fan2 (duty 85).
+        if dev.read_pwm("fan1") != Some(170) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected fan1 read_pwm to be 170 (tier 2)");
+        }
+        if dev.read_pwm("fan2") != Some(85) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected fan2 read_pwm to be 85 (tier 1)");
+        }
+        if !dev.supports_fan_control("fan1") || dev.supports_fan_control("fan3") {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("supports_fan_control disagrees with the fan labels");
         }
 
         *SMM_MOCK.lock() = None;
         TestResult::Pass
     }
     kernel_test_in!("drivers/hwmon/dell_smm", smoke_dell_smm_operations);
+
+    /// Duty↔tier scaling: the four tier duties map to their own
+    /// tiers, the scale is monotonic across the duty range, and the
+    /// round trip tier → duty → tier is exact.
+    fn smoke_dell_smm_duty_tier_scaling() -> TestResult {
+        use crate::dell_smm::{duty_to_tier, tier_to_duty};
+        if duty_to_tier(0) != 0
+            || duty_to_tier(85) != 1
+            || duty_to_tier(170) != 2
+            || duty_to_tier(255) != 3
+        {
+            return TestResult::Fail("tier duties should map to their own tiers");
+        }
+        if duty_to_tier(128) != 2 || duty_to_tier(42) != 0 || duty_to_tier(43) != 1 {
+            return TestResult::Fail("duty_to_tier rounding wrong at band edges");
+        }
+        if tier_to_duty(0) != 0
+            || tier_to_duty(1) != 85
+            || tier_to_duty(2) != 170
+            || tier_to_duty(3) != 255
+        {
+            return TestResult::Fail("tier_to_duty values wrong");
+        }
+        for tier in 0..=3u32 {
+            if duty_to_tier(tier_to_duty(tier)) != tier as u8 {
+                return TestResult::Fail("duty↔tier round trip not exact");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/hwmon/dell_smm", smoke_dell_smm_duty_tier_scaling);
 
     fn set_mock_system_manufacturer(mfr: &[u8]) {
         let fixed_len: u8 = 25;

@@ -199,6 +199,19 @@ impl crate::HwmonDevice for Jc42 {
         false
     }
 
+    fn temp_limits(&self, _label: &str) -> (Option<i32>, Option<i32>) {
+        // The JC42.4 upper and critical limit registers hold real
+        // programmed thresholds in the same 13-bit format as the
+        // temperature register, decoded by the same `temp_from_reg`.
+        // Linux jc42.c publishes them as temp1_max / temp1_crit.
+        // A failed register read yields `None` for that component —
+        // the bridge then omits the attribute rather than inventing
+        // a threshold.
+        let max = read_reg(self.addr, JC42_REG_TEMP_UPPER).map(temp_from_reg);
+        let crit = read_reg(self.addr, JC42_REG_TEMP_CRITICAL).map(temp_from_reg);
+        (max, crit)
+    }
+
     fn list_labels(&self) -> Vec<&str> {
         vec!["temp1"]
     }
