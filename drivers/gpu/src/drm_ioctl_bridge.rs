@@ -4540,6 +4540,7 @@ fn handle_obj_getproperties(
                     (-1i64) as u64,
                 ],
             );
+            #[cfg(feature = "amdgpu")]
             if crate::amdgpu_native_kms::linear_gem_card(&card) {
                 // GBM must choose LINEAR explicitly for the DCN30 copy
                 // presenter rather than infer an AMD tiled layout.

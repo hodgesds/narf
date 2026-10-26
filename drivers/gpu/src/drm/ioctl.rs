@@ -576,9 +576,7 @@ fn handle_getconnector(card: &Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoc
 
 /// Linux drm_mode_addfb converts the 28-byte drm_mode_fb_cmd into fb_cmd2
 /// before running the same framebuffer/BO checks. Depth is not a fourcc.
-pub(crate) fn legacy_fb_cmd(
-    arg: &[u8],
-) -> Result<crate::drm::fb_cmd::FbCmd, DrmIoctlError> {
+pub(crate) fn legacy_fb_cmd(arg: &[u8]) -> Result<crate::drm::fb_cmd::FbCmd, DrmIoctlError> {
     if arg.len() < crate::drm_uapi::SZ_DRM_MODE_FB_CMD as usize {
         return Err(DrmIoctlError::BadSize);
     }
