@@ -20,6 +20,7 @@ builtin = [
     "dep:narf-lib", "dep:narf-memory", "dep:narf-scheduler", "dep:narf-time",
 ]
 module = []
+kernel-test = []
 [dependencies]
 narf-driver-macros = { path = "../../../driver-macros" }
 narf-drivers-storage-core = { path = "../core", optional = true }

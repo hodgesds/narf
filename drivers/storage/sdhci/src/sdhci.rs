@@ -220,11 +220,6 @@ impl Sdhci {
     ) -> Result<Self, SdhciError> {
         // SAFETY: caller-asserted.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| SdhciError::BarMapFailed)?;
-        let me = Sdhci {
-            mmio,
-            card: IrqSafeSpinLock::new(None),
-            req_gate: AtomicBool::new(false),
-        };
 
         // AMD FCH SDHCI quirk: on Renoir / Phoenix / older FCH parts
         // (1022:7906 / 1022:1611 / 1022:1612 / 1022:14CC / 1022:14E7
@@ -254,6 +249,29 @@ impl Sdhci {
                 );
             }
         }
+
+        // SAFETY: caller-asserted exclusive ownership of BAR0
+        // carries to the shared tail.
+        unsafe { Self::bring_up_mmio(mmio) }
+    }
+
+    /// Bring up over a caller-supplied MMIO window: software
+    /// reset, supply 400 kHz init clock, set 3.3V, run the SD
+    /// identification sequence. This is the shared tail of the
+    /// PCI path ([`Sdhci::bring_up`]) and the DT/MMIO binding
+    /// (DT programme step 6) — everything from the reset onward
+    /// is window-shaped, not bus-shaped. Returns the populated
+    /// `SdCard` inside the controller.
+    ///
+    /// # Safety
+    /// Caller owns the window exclusively for the duration of
+    /// init and keeps it mapped for the controller's lifetime.
+    pub unsafe fn bring_up_mmio(mmio: MmioRegion) -> Result<Self, SdhciError> {
+        let me = Sdhci {
+            mmio,
+            card: IrqSafeSpinLock::new(None),
+            req_gate: AtomicBool::new(false),
+        };
 
         // 1. Software reset — Reset All (§3.6).
         // SAFETY: identity-mapped MMIO.
@@ -723,7 +741,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
     };
     *CONTROLLER.lock() = Some(dev);
+    publish_probed(Some((device.id.vendor, device.id.device)));
+    Ok(())
+}
 
+/// Publish the installed controller: register its card as the
+/// `sdhci0` block device and record the binding. Shared by the
+/// PCI probe and the DT probe (DT programme step 6) so both
+/// paths produce the same consumer story.
+fn publish_probed(vid_did: Option<(u16, u16)>) {
     if let Some(card) = CONTROLLER.lock().as_ref().unwrap().card.lock().as_ref() {
         if card.capacity_blocks > 0 {
             let block_dev = alloc::sync::Arc::new(SdhciBlockDevice {
@@ -737,11 +763,88 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("sd0"),
         kind: narf_drivers::BoundKind::Block,
-        pci_vid: Some(device.id.vendor),
-        pci_did: Some(device.id.device),
+        pci_vid: vid_did.map(|(v, _)| v),
+        pci_did: vid_did.map(|(_, d)| d),
         domain: narf_drivers::BoundKind::Block.default_domain(),
     });
+}
+
+/// The DT probe's ioremap, kept alive for the controller's
+/// lifetime (the PCI path's BAR mapping rides in the bus layer;
+/// the DT window's mapping is this binding's own).
+static DT_MAPPING: IrqSafeSpinLock<Option<narf_memory::ioremap::IoMapping>> =
+    IrqSafeSpinLock::new(None);
+
+/// DT probe (`xlnx,zynqmp-8.9a`, the ZynqMP Arasan SDHCI — an
+/// SDHCI-standard register interface described by devicetree
+/// instead of PCI config space): ioremap the window and run
+/// the same bring-up + publication as the PCI path. DT
+/// machines describe the rail and clocks in the tree; the
+/// shared bring-up's fixed 3.3 V power step assumes the rail is
+/// already at a card-supporting voltage, which is exactly the
+/// assumption the PCI path makes — a board that must switch
+/// voltages needs the regulator framework (#1053), named here
+/// rather than papered over.
+pub fn probe_dt(
+    device: BusDevice,
+    _cap: Cap<BusDeviceCap, Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    use core::fmt::Write as _;
+    use narf_memory::ioremap::{ioremap, MmioAttrs};
+    let narf_bus::BusKind::Platform(rec) = device.kind else {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    };
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
+    let win = rec
+        .reg_windows()
+        .first()
+        .ok_or(narf_bus::ProbeError::BadDevice)?;
+    // SAFETY: the window is the device's DT reg window; ioremap
+    // maps it device-nongathering for the binding's lifetime
+    // (retained in DT_MAPPING).
+    let mapping = unsafe { ioremap(win.base.raw(), win.len.max(0x1000), MmioAttrs::Device) }
+        .map_err(|_| {
+            narf_bus::ProbeError::Other("sdhci-dt: ioremap of the DT reg window failed")
+        })?;
+    let mmio = MmioRegion {
+        phys: win.base,
+        virt: mapping.va(),
+        len: win.len,
+        kind: if win.base.raw() >> 32 != 0 {
+            narf_bus::BarKind::Mmio64 {
+                prefetchable: false,
+            }
+        } else {
+            narf_bus::BarKind::Mmio32 {
+                prefetchable: false,
+            }
+        },
+    };
+    // SAFETY: the ioremap'd window is exclusively ours.
+    let dev = match unsafe { Sdhci::bring_up_mmio(mmio) } {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = writeln!(narf_console::Writer, "  sdhci: DT bring_up failed: {:?}", e,);
+            return Err(narf_bus::ProbeError::BadDevice);
+        }
+    };
+    *DT_MAPPING.lock() = Some(mapping);
+    *CONTROLLER.lock() = Some(dev);
+    publish_probed(None);
     Ok(())
+}
+
+/// Register the SDHCI DT match entry (`xlnx,zynqmp-8.9a`).
+/// Called from `do_register` beside the PCI registration —
+/// composition-time, census-neutral (bus registry state).
+pub fn register_dt_driver() {
+    narf_bus::register_dt_driver(narf_bus::DtMatch {
+        name: "sdhci-dt",
+        compatible: "xlnx,zynqmp-8.9a",
+        probe: probe_dt,
+    });
 }
 
 struct SdhciBlockDevice {

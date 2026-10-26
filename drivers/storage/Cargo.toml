@@ -46,7 +46,7 @@ narf-kernel-test  = { path = "../../verification/kernel-test" }
 default = ["ahci", "megaraid", "mpt3sas", "mtd", "rtsx", "sdhci", "smartpqi", "vmd"]
 # Declared so frame's `narf-drivers-storage/kernel-test` dep resolves; the only
 # source-level consumer is rtsx's block_bridge, so propagate there.
-kernel-test = ["narf-drivers-storage-rtsx?/kernel-test"]
+kernel-test = ["narf-drivers-storage-rtsx?/kernel-test", "narf-drivers-storage-sdhci?/kernel-test"]
 ahci = ["dep:narf-drivers-storage-ahci"]
 megaraid = ["dep:narf-drivers-storage-megaraid"]
 mpt3sas = ["dep:narf-drivers-storage-mpt3sas"]
