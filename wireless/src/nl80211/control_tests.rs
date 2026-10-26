@@ -6,6 +6,8 @@ use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 
 #[path = "permission_tests.rs"]
 mod permission;
+#[path = "pmf_tests.rs"]
+mod pmf;
 #[path = "supplicant_e2e_tests.rs"]
 mod supplicant_e2e;
 

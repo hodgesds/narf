@@ -22,6 +22,7 @@ pub mod rsn;
 pub mod sae;
 pub mod scan;
 pub mod station_security;
+pub mod wmm;
 
 pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
 pub use scan::{BssInfo, ScanRandomMac, ScanRequest, ScanResult};
@@ -487,6 +488,13 @@ pub trait WirelessNetIface: Interface {
 
     /// The driver performs WPA2-PSK key exchange from a supplied PMK.
     fn supports_handshake_offload(&self) -> bool {
+        false
+    }
+
+    /// The WPA2-PSK firmware offload also verifies required management-frame
+    /// protection before opening its controlled port. Cipher advertisement
+    /// alone does not establish this complete association contract.
+    fn supports_wpa2_mfp_offload(&self) -> bool {
         false
     }
 

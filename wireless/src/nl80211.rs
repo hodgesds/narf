@@ -2,6 +2,9 @@
 
 mod control;
 
+#[cfg(any(test, feature = "kernel-test"))]
+pub use control::connect_for_test;
+
 pub use control::station::{
     control_port_over_nl80211, notify_control_port_tx_status, notify_gtk_rekey,
     notify_michael_mic_failure, notify_mlme_disconnect, notify_mlme_frame, rx_control_port,

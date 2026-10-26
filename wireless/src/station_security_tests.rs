@@ -423,6 +423,90 @@ kernel_test_in!(
     "wireless/station_security",
     smoke_station_retired_temporal_key_cannot_restart_packet_numbers
 );
+fn smoke_station_qos_tx_authenticates_tid_header_and_shared_packet_numbers() -> TestResult {
+    let p = ptk(AN, SN);
+    let mut eth = vec![2, 0, 0, 0, 0, 3];
+    eth.extend_from_slice(&OWN);
+    eth.extend_from_slice(&[8, 0, 0x45, 0x80, 0, 0xff]);
+    let mut expected = vec![0xaa, 0xaa, 3, 0, 0, 0];
+    expected.extend_from_slice(&eth[12..]);
+    let mut s = established();
+    for tid in 0u8..16 {
+        let frame = s.transmit_ethernet_qos(&eth, tid).unwrap();
+        if frame[..2] != [0x88, 0x41]
+            || frame[4..10] != AP
+            || frame[10..16] != OWN
+            || frame[16..22] != eth[..6]
+            || frame[24..26] != [tid, 0]
+            || frame[26] != tid + 1
+        {
+            return TestResult::Fail("QoS TX header, identity or shared PN mismatch");
+        }
+        let mut replay = crate::ccmp::ReplayWindow { last_seen_pn: 0 };
+        let mut forged_header = frame[..26].to_vec();
+        forged_header[24] ^= 1;
+        let mut forged_body = frame[26..].to_vec();
+        if crate::ccmp::unprotect(
+            &Ccm,
+            &forged_header,
+            p.tk.as_slice().try_into().unwrap(),
+            tid ^ 1,
+            false,
+            &mut replay,
+            &mut forged_body,
+        )
+        .is_ok()
+            || replay.last_seen_pn != 0
+        {
+            return TestResult::Fail("rewritten QoS TID authenticated or advanced replay");
+        }
+        let mut body = frame[26..].to_vec();
+        if !matches!(crate::ccmp::unprotect(&Ccm, &frame[..26], p.tk.as_slice().try_into().unwrap(),
+            tid, false, &mut replay, &mut body), Ok(ref bytes) if *bytes == expected)
+        {
+            return TestResult::Fail("native QoS TID/CCMP nonce could not authenticate");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/station_security",
+    smoke_station_qos_tx_authenticates_tid_header_and_shared_packet_numbers
+);
+
+fn smoke_station_qos_tx_invalid_tid_and_ring_eapol_do_not_consume_key_state() -> TestResult {
+    let mut s = established();
+    let mut eth = vec![2, 0, 0, 0, 0, 3];
+    eth.extend_from_slice(&OWN);
+    eth.extend_from_slice(&[8, 0, 0x45]);
+    for tid in [16, 255] {
+        if s.transmit_ethernet_qos(&eth, tid) != Err(Error::Profile) {
+            return TestResult::Fail("invalid TID reached packet encryption");
+        }
+    }
+    eth[12..14].copy_from_slice(&[0x88, 0x8e]);
+    if s.transmit_ethernet_qos(&eth, 0) != Err(Error::Profile) {
+        return TestResult::Fail("ring EAPOL escaped QoS controlled-port admission");
+    }
+    eth[12..14].copy_from_slice(&[8, 0]);
+    if s.transmit_ethernet(&eth).unwrap()[24] != 1
+        || s.transmit_ethernet_qos(&eth, 15).unwrap()[26] != 2
+    {
+        return TestResult::Fail("rejected QoS input consumed or split packet-key PN");
+    }
+    s.fail();
+    if s.transmit_ethernet_qos(&eth, 0) != Err(Error::State)
+        || security().transmit_ethernet_qos(&eth, 0) != Err(Error::State)
+    {
+        return TestResult::Fail("QoS data escaped failed or preauthorization owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/station_security",
+    smoke_station_qos_tx_invalid_tid_and_ring_eapol_do_not_consume_key_state
+);
+
 fn smoke_station_rsna_retry_does_not_reset_installed_key_state() -> TestResult {
     let mut s = established();
     let p = ptk(AN, SN);
@@ -445,6 +529,10 @@ fn smoke_station_rsna_retry_does_not_reset_installed_key_state() -> TestResult {
     let second = s.transmit_ethernet(&eth).unwrap();
     if second[24] != 3 || s.history.len() != 2 {
         return TestResult::Fail("retry reinstalled TK or reset TX PN");
+    }
+    let qos = s.transmit_ethernet_qos(&eth, 0).unwrap();
+    if qos[26] != 4 || qos[24..26] != [0, 0] {
+        return TestResult::Fail("QoS after M3 retry restarted the shared key PN");
     }
     TestResult::Pass
 }

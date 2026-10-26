@@ -958,6 +958,7 @@ fn smoke_nl80211_ext_connect_owner_release() -> TestResult {
     };
     let caps = ConnectCaps {
         psk_offload: false,
+        psk_mfp_offload: false,
         sae_offload: false,
         external: true,
         // nl80211_crypto_settings checks the ciphers against the wiphy's
