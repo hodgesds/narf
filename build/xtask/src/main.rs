@@ -15,7 +15,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1149,6 +1149,25 @@ struct TestArgs {
     /// postflight. Local and primary CI runs retain the safer default.
     #[arg(long, default_value_t = false)]
     kernel_tests_only: bool,
+
+    /// Run the kernel-test phase as one QEMU boot per subsystem group
+    /// instead of a single boot for the whole selection, each boot capped
+    /// by `XTASK_QEMU_GROUP_TIMEOUT_SECS` (default 900; see
+    /// `kernel_test_group_timeout_secs`).
+    ///
+    /// The in-kernel harness runs tests as direct synchronous calls, so a
+    /// hung test never returns control and no in-guest watchdog can preempt
+    /// it: in one boot, a single hang burns the phase's whole 2400 s cap
+    /// and every later test's result is lost with it. Split mode contains
+    /// the hang to its group — the boot is killed at the group cap, the
+    /// in-flight test is reported as a named timeout failure, and the
+    /// remaining groups still run and report. Groups are subsystem
+    /// prefixes (the affected list, when `--subsystem` is given; a fixed
+    /// partition of the suite otherwise), selected with the guest's
+    /// existing prefix filters, so coverage is unchanged. The phase-2
+    /// boot-smoke and postflight still run once, afterwards.
+    #[arg(long, default_value_t = false)]
+    split: bool,
 }
 
 /// Args for the hidden `xtask net-peer` (see `net_robust::net_peer_main`).
@@ -5114,14 +5133,32 @@ fn serial_tee_enabled() -> bool {
     std::env::var("XTASK_QEMU_SERIAL_TEE").is_ok_and(|value| value == "1")
 }
 
-/// Boot the kernel under QEMU. When `gate_exit` is set (the `test`
-/// subcommand's kernel-test phase), the QEMU exit status is checked
-/// against the all-pass status: the kernel-test runner calls
-/// `exit_kernel(0)` only when every smoke passed and `exit_kernel(1)`
-/// when any failed, so a failing suite (or a panic/hang) makes the
-/// command fail. Manual `Cmd::Run` passes `false` and never gates — the
-/// user drives it interactively and an arbitrary exit code is expected.
-fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
+/// How one QEMU boot ended, as consumed by [`run_cmd_inner`] (the
+/// single-boot verdict path) and by the split-phase driver
+/// ([`run_kernel_test_phase_split`], which interprets each group's boot
+/// itself so one bad boot cannot take the whole phase down with it).
+enum BootOutcome {
+    /// QEMU exited on its own. Whether the guest reported all-pass is
+    /// the caller's call: it needs the exit status AND the guest's own
+    /// `── summary` line, and the two callers weigh them differently.
+    Exited { status: ExitStatus, serial: Vec<u8> },
+    /// The host killed QEMU: the phase deadline passed, the idle-kill
+    /// fired, or a panicked kernel did not exit within the grace period.
+    /// `reason` is the same text the single-boot path bails with.
+    Killed {
+        reason: String,
+        cpu_state: String,
+        serial: Vec<u8>,
+        elapsed_secs: u64,
+    },
+}
+
+/// Boot the kernel under QEMU and report how the boot ended, without
+/// judging the result. `timeout_secs` is the host deadline for this one
+/// boot (the whole-phase cap for a single boot; the per-group cap for a
+/// split-mode group boot). When `gate_exit` is set, the idle-kill is
+/// armed; the panic grace applies either way.
+fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<BootOutcome> {
     let root = workspace_root()?;
     let out_dir = cargo_build(args, &root)?;
 
@@ -5277,7 +5314,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         })
     });
 
-    let secs = kernel_test_timeout_secs();
+    let secs = timeout_secs;
     let idle_secs = kernel_test_idle_secs();
     // A panicked kernel may halt without QEMU exiting; allow the dump to
     // drain, then stop waiting.
@@ -5320,13 +5357,12 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             let serial = serial_reader
                 .and_then(|reader| reader.join().ok())
                 .unwrap_or_default();
-            emit_serial_tail(&serial);
-            bail!(
-                "xtask: {qemu} {reason} after {}s; QEMU process CPU at kill: {cpu_state}; \
-                 last serial line: {}",
-                started.elapsed().as_secs(),
-                last_serial_line(&serial)
-            );
+            return Ok(BootOutcome::Killed {
+                reason,
+                cpu_state,
+                serial,
+                elapsed_secs: started.elapsed().as_secs(),
+            });
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -5340,18 +5376,39 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         "xtask: {qemu} exited with {status} after {}s (cap {secs}s)",
         started.elapsed().as_secs()
     );
+    Ok(BootOutcome::Exited { status, serial })
+}
+
+/// Boot the kernel under QEMU. When `gate_exit` is set (the `test`
+/// subcommand's kernel-test phase), the QEMU exit status is checked
+/// against the all-pass status: the kernel-test runner calls
+/// `exit_kernel(0)` only when every smoke passed and `exit_kernel(1)`
+/// when any failed, so a failing suite (or a panic/hang) makes the
+/// command fail. Manual `Cmd::Run` passes `false` and never gates — the
+/// user drives it interactively and an arbitrary exit code is expected.
+fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
+    let (status, serial) = match run_boot(args, gate_exit, kernel_test_timeout_secs())? {
+        BootOutcome::Exited { status, serial } => (status, serial),
+        BootOutcome::Killed {
+            reason,
+            cpu_state,
+            serial,
+            elapsed_secs,
+        } => {
+            let qemu = args.arch.qemu_bin();
+            emit_serial_tail(&serial);
+            bail!(
+                "xtask: {qemu} {reason} after {elapsed_secs}s; QEMU process CPU at kill: {cpu_state}; \
+                 last serial line: {}",
+                last_serial_line(&serial)
+            );
+        }
+    };
 
     if gate_exit {
-        // All-pass status mirrors boot-smoke's clean-exit encoding:
-        //  * x86_64 isa-debug-exit encodes `(code << 1) | 1`, so the
-        //    runner's exit_kernel(0) → QEMU status 1 (a failed suite
-        //    exits 1 → status 3).
-        //  * aarch64 shuts down via PSCI/semihosting and QEMU exits with
-        //    the kernel code directly: 0 on all-pass (1 on failure).
-        let expected = match args.arch {
-            Arch::X86_64 => Some(1),
-            Arch::Aarch64 => Some(0),
-        };
+        // All-pass status mirrors boot-smoke's clean-exit encoding
+        // (see `expected_all_pass_status`).
+        let expected = expected_all_pass_status(args.arch);
         if status.code() != expected {
             emit_serial_tail(&serial);
             bail!(
@@ -5473,6 +5530,190 @@ mod kernel_test_summary_tests {
     }
 }
 
+#[cfg(test)]
+mod kernel_test_split_tests {
+    use super::{
+        dedupe_subsystem_prefixes, full_suite_groups, group_selects, interpret_boot,
+        parse_partial_boot_results, split_filter_list, Arch, BootOutcome, GroupVerdict,
+    };
+
+    #[test]
+    fn full_suite_groups_partition_the_registry() {
+        let groups = full_suite_groups(&[]);
+        let samples = [
+            "drivers/fs/btrfs",
+            "drivers/fs/btrfs/race",
+            "drivers/fs/ext2",
+            "drivers/gpu",
+            "drivers/wireless/ath11k",
+            "drivers/nvme",
+            "drivers/usb",
+            "filesystem/page_cache",
+            "filesystem",
+            "syscall_abi",
+            "syscall_abi/socket",
+            "userspace/mount",
+            "bpf/fuzz",
+            "net/tcp",
+            "narf-net",
+            "memory",
+            "boot/aarch64",
+            "verification",
+            "some/future/subsystem",
+        ];
+        for sample in samples {
+            let hits: Vec<&str> = groups
+                .iter()
+                .filter(|g| group_selects(g, sample))
+                .map(|g| g.label.as_str())
+                .collect();
+            assert_eq!(hits.len(), 1, "{sample} selected by {hits:?}");
+        }
+    }
+
+    #[test]
+    fn full_suite_groups_land_known_subsystems_in_their_groups() {
+        let groups = full_suite_groups(&[]);
+        let label_of = |sub: &str| {
+            groups
+                .iter()
+                .find(|g| group_selects(g, sub))
+                .map(|g| g.label.as_str())
+                .unwrap_or("<none>")
+        };
+        assert_eq!(label_of("drivers/fs/btrfs"), "btrfs");
+        assert_eq!(label_of("drivers/fs/ext2"), "filesystem");
+        assert_eq!(label_of("drivers/gpu"), "drivers-rest");
+        assert_eq!(label_of("drivers/wireless/ath11k"), "drivers-wireless");
+        assert_eq!(label_of("memory"), "core");
+        assert_eq!(label_of("some/future/subsystem"), "core");
+    }
+
+    #[test]
+    fn caller_excludes_apply_to_every_group() {
+        let groups = full_suite_groups(&["drivers/gpu".to_string()]);
+        for group in &groups {
+            assert!(!group_selects(group, "drivers/gpu"), "{}", group.label);
+        }
+    }
+
+    #[test]
+    fn dedupe_drops_covered_entries() {
+        let input: Vec<String> = ["drivers", "drivers/gpu", "net", "net"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            dedupe_subsystem_prefixes(&input),
+            vec!["drivers".to_string(), "net".to_string()]
+        );
+        let child_first: Vec<String> = ["net/tcp", "net"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            dedupe_subsystem_prefixes(&child_first),
+            vec!["net".to_string()]
+        );
+    }
+
+    #[test]
+    fn partial_parse_filtered_stream_recovers_the_in_flight_test() {
+        let serial = "\
+── kernel_test (filtered: 1) ──
+  [run] bpf / smoke_bpf_ok
+  [ OK ] bpf / smoke_bpf_ok
+  [run] bpf / smoke_bpf_hangs
+";
+        let partial = parse_partial_boot_results(serial);
+        assert_eq!(partial.passed, 1);
+        assert_eq!(partial.failed, 0);
+        assert_eq!(
+            partial.in_flight,
+            Some(("bpf".to_string(), "smoke_bpf_hangs".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_parse_unfiltered_stream_uses_group_headers() {
+        let serial = "\
+── bpf ─
+  [run] smoke_bpf_ok
+  [ OK ] smoke_bpf_ok
+  [run] smoke_bpf_bad
+  [FAIL] smoke_bpf_bad: map lookup failed
+  [run] smoke_bpf_next
+  [skip] smoke_bpf_next: no hardware
+── memory ─
+  [run] smoke_mem_hangs
+";
+        let partial = parse_partial_boot_results(serial);
+        assert_eq!(partial.passed, 1);
+        assert_eq!(partial.failed, 1);
+        assert_eq!(partial.skipped, 1);
+        assert_eq!(
+            partial.failing,
+            vec![(
+                "bpf".to_string(),
+                "smoke_bpf_bad".to_string(),
+                "map lookup failed".to_string()
+            )]
+        );
+        assert_eq!(
+            partial.in_flight,
+            Some(("memory".to_string(), "smoke_mem_hangs".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_parse_completed_stream_has_no_in_flight_test() {
+        let serial = "\
+── kernel_test (filtered: 1) ──
+  [run] net / smoke_net_ok
+  [ OK ] net / smoke_net_ok
+── summary: 1 pass, 0 fail, 0 skip ──
+";
+        let partial = parse_partial_boot_results(serial);
+        assert_eq!(partial.passed, 1);
+        assert_eq!(partial.in_flight, None);
+    }
+
+    #[test]
+    fn killed_boot_charges_the_in_flight_test_as_a_timeout_failure() {
+        let serial = "\
+── kernel_test (filtered: 1) ──
+  [run] bpf / smoke_bpf_ok
+  [ OK ] bpf / smoke_bpf_ok
+  [run] bpf / smoke_bpf_hangs
+";
+        let outcome = interpret_boot(
+            "bpf",
+            BootOutcome::Killed {
+                reason: "timed out waiting for QEMU to exit".to_string(),
+                cpu_state: "busy".to_string(),
+                serial: serial.as_bytes().to_vec(),
+                elapsed_secs: 900,
+            },
+            Arch::X86_64,
+            900,
+            900,
+        );
+        assert_eq!(outcome.verdict, GroupVerdict::TimedOut);
+        assert_eq!(outcome.passed, 1);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.failing.len(), 1);
+        assert_eq!(outcome.failing[0].0, "bpf");
+        assert_eq!(outcome.failing[0].1, "smoke_bpf_hangs");
+        assert!(outcome.failing[0].2.contains("timeout after 900s"));
+    }
+
+    #[test]
+    fn split_filter_list_trims_and_drops_empties() {
+        assert_eq!(
+            split_filter_list(Some(" drivers/gpu, net ,, ")),
+            vec!["drivers/gpu".to_string(), "net".to_string()]
+        );
+        assert!(split_filter_list(None).is_empty());
+    }
+}
+
 /// Boot the kernel under QEMU *without* the `kernel-test` feature
 /// (i.e. the real init flow), capture stdout line-by-line, and check
 /// for panic markers + known success markers. This catches regressions
@@ -5541,6 +5782,610 @@ fn kernel_test_timeout_secs() -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(2400)
+}
+
+/// Per-group wall-clock cap for one kernel-test boot in `--split` mode
+/// (`XTASK_QEMU_GROUP_TIMEOUT_SECS`).
+///
+/// Derivation (CI run 40249683627 on main dafea30f3, x86_64 TCG — the
+/// slower arch for CPU-bound groups): the whole 11,255-test primary
+/// suite's guest time is ≈820 s of summed per-test durations, and the
+/// group partition below concentrates almost all of it in one group —
+/// the btrfs subtree measures ≈400 s (its slowest single test,
+/// `smoke_btrfs_root_rw_metadata_reserve`, is 307 s on x86_64 / 97 s on
+/// aarch64). Every other group measures ≤ ≈125 s. 900 s is ≈2.25× the
+/// slowest group's measured time: headroom for TCG variance and host
+/// load, while a hang in any group costs at most 900 s instead of the
+/// whole phase's 2400 s — and the other groups still run and report.
+/// A healthy split run totals ≈880 s of guest time plus nine short
+/// boots, well inside the kernel-test job's 60-minute limit.
+fn kernel_test_group_timeout_secs() -> u64 {
+    std::env::var("XTASK_QEMU_GROUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(900)
+}
+
+/// The QEMU exit status of an all-pass kernel-test boot: x86_64
+/// `isa-debug-exit` encodes `(code << 1) | 1`, so the runner's
+/// `exit_kernel(0)` surfaces as status 1 (a failed suite exits 1 →
+/// status 3); aarch64 shuts down via PSCI/semihosting and QEMU exits
+/// with the kernel code directly (0 on all-pass).
+fn expected_all_pass_status(arch: Arch) -> Option<i32> {
+    match arch {
+        Arch::X86_64 => Some(1),
+        Arch::Aarch64 => Some(0),
+    }
+}
+
+/// One split-mode group's guest selection: the `test_subsystem=` /
+/// `test_subsystem_exclude=` cmdline filters for its boot. An empty
+/// `include` selects the whole suite (the guest's unfiltered run).
+struct GroupSpec {
+    label: String,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+/// The fixed partition of the full suite for `--split` runs without a
+/// `--subsystem` filter, ordered slowest-first so the long groups start
+/// early and a late hang leaves the least work unreported. Includes are
+/// disjoint and the last group (`core`) is the exact complement of the
+/// others — the guest's include-minus-exclude prefix filters partition
+/// the registry exactly — so every registered subsystem runs in exactly
+/// one group, including subsystems added after this table. Measured
+/// group costs (x86_64 TCG, run 40249683627): btrfs ≈400 s, userspace
+/// ≈125 s, syscall_abi ≈70 s, bpf ≈60 s, net ≈55 s, drivers/wireless
+/// ≈35 s, filesystem + drivers/fs remainder ≈30 s, drivers-rest ≈20 s,
+/// core ≈60 s.
+const FULL_SUITE_GROUPS: &[(&str, &[&str], &[&str])] = &[
+    ("btrfs", &["drivers/fs/btrfs"], &[]),
+    ("userspace", &["userspace"], &[]),
+    ("syscall-abi", &["syscall_abi"], &[]),
+    ("bpf", &["bpf"], &[]),
+    ("net", &["net", "narf-net"], &[]),
+    (
+        "filesystem",
+        &["filesystem", "drivers/fs"],
+        &["drivers/fs/btrfs"],
+    ),
+    ("drivers-wireless", &["drivers/wireless"], &[]),
+    (
+        "drivers-rest",
+        &["drivers"],
+        &["drivers/fs", "drivers/wireless"],
+    ),
+    (
+        "core",
+        &[],
+        &[
+            "drivers",
+            "syscall_abi",
+            "userspace",
+            "bpf",
+            "net",
+            "narf-net",
+            "filesystem",
+        ],
+    ),
+];
+
+/// Build the full-suite group list, appending the caller's own
+/// `--exclude-subsystem` entries to every group (CI's primary split run
+/// excludes `drivers/gpu` this way; the dedicated GPU job is unchanged).
+fn full_suite_groups(caller_exclude: &[String]) -> Vec<GroupSpec> {
+    FULL_SUITE_GROUPS
+        .iter()
+        .map(|(label, include, exclude)| {
+            let mut exclude: Vec<String> = exclude.iter().map(|s| (*s).to_string()).collect();
+            for extra in caller_exclude {
+                if !exclude.contains(extra) {
+                    exclude.push(extra.clone());
+                }
+            }
+            GroupSpec {
+                label: (*label).to_string(),
+                include: include.iter().map(|s| (*s).to_string()).collect(),
+                exclude,
+            }
+        })
+        .collect()
+}
+
+/// Host mirror of the guest's `subsystem_selected`
+/// (`verification/src/lib.rs`): `want` selects `have` when they are
+/// equal or `have` is in `want`'s `/`-delimited subtree.
+fn subsystem_prefix_selected(have: &str, want: &str) -> bool {
+    have == want
+        || (have.len() > want.len()
+            && have.as_bytes()[want.len()] == b'/'
+            && have.starts_with(want))
+}
+
+/// Whether `group`'s filters select `subsystem`, under the guest's
+/// semantics: selected by any include entry (or by the empty include,
+/// which selects everything), and not excluded by any exclude entry.
+/// Test-only: it exists so the unit tests can prove the full-suite
+/// table partitions the registry exactly; group boots themselves are
+/// selected by the guest from the same filters.
+#[cfg(test)]
+fn group_selects(group: &GroupSpec, subsystem: &str) -> bool {
+    (group.include.is_empty()
+        || group
+            .include
+            .iter()
+            .any(|w| subsystem_prefix_selected(subsystem, w)))
+        && !group
+            .exclude
+            .iter()
+            .any(|w| subsystem_prefix_selected(subsystem, w))
+}
+
+/// Split a validated comma-separated filter value into its entries.
+fn split_filter_list(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Drop filter entries already covered by another entry's subtree (and
+/// exact duplicates): affected-mode groups boot once per entry, and a
+/// parent entry's boot already runs its children's tests.
+fn dedupe_subsystem_prefixes(list: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in list {
+        if out
+            .iter()
+            .any(|kept| subsystem_prefix_selected(entry, kept))
+        {
+            continue;
+        }
+        out.retain(|kept| !subsystem_prefix_selected(kept, entry));
+        out.push(entry.clone());
+    }
+    out
+}
+
+/// Test results recovered from a kernel-test boot that never printed
+/// its `── summary` line (host kill, guest crash, fatal exception):
+/// the tests that did complete, plus the one left in flight. Counts
+/// from a partial parse are real printed results, not estimates — the
+/// in-flight test is reported separately by the caller as one failure.
+#[derive(Default)]
+struct PartialBootResults {
+    passed: u64,
+    failed: u64,
+    skipped: u64,
+    failing: Vec<(String, String, String)>,
+    in_flight: Option<(String, String)>,
+}
+
+/// Parse the guest's per-test stream (`verification/src/lib.rs`) from a
+/// boot that died before its summary. Handles both live formats: the
+/// filtered run's `  [run] {subsystem} / {name}` (completions carry the
+/// subsystem too) and the unfiltered run's bare `  [run] {name}` under
+/// `── {subsystem} ─` headers (completions are bare, so the subsystem
+/// comes from the header / the in-flight entry).
+fn parse_partial_boot_results(text: &str) -> PartialBootResults {
+    let mut out = PartialBootResults::default();
+    let mut current_sub = String::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if let Some(mid) = line
+            .strip_prefix("── ")
+            .and_then(|rest| rest.strip_suffix(" ─"))
+        {
+            // Subsystem group header. Other `── … ─` banners (the
+            // filtered-run banner, the failing-tests header) contain
+            // spaces or parentheses; subsystem paths never do.
+            if !mid.is_empty() && !mid.contains(' ') && !mid.contains('(') {
+                current_sub = mid.to_string();
+            }
+            continue;
+        }
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("[run] ") {
+            out.in_flight = Some(split_run_target(rest, &current_sub));
+        } else if t.starts_with("[ OK ] ") {
+            out.passed += 1;
+            out.in_flight = None;
+        } else if let Some(rest) = t.strip_prefix("[FAIL] ") {
+            out.failed += 1;
+            out.failing
+                .push(parse_fail_line(rest, &current_sub, out.in_flight.as_ref()));
+            out.in_flight = None;
+        } else if t.starts_with("[skip] ") {
+            out.skipped += 1;
+            out.in_flight = None;
+        }
+    }
+    out
+}
+
+/// Split a `[run]` target into (subsystem, name): the filtered format
+/// is `{subsystem} / {name}`; the unfiltered format is a bare name
+/// under the current `── {subsystem} ─` header.
+fn split_run_target(rest: &str, current_sub: &str) -> (String, String) {
+    match rest.split_once(" / ") {
+        Some((sub, name)) => (sub.to_string(), name.to_string()),
+        None => (
+            if current_sub.is_empty() {
+                "(unknown)".to_string()
+            } else {
+                current_sub.to_string()
+            },
+            rest.to_string(),
+        ),
+    }
+}
+
+/// Parse one `[FAIL]` payload (`{name}: {why}` or
+/// `{subsystem} / {name}: {why}`) into (subsystem, name, why). When the
+/// failed test is the one in flight, its identity wins: the unfiltered
+/// format's bare FAIL line carries no subsystem of its own.
+fn parse_fail_line(
+    rest: &str,
+    current_sub: &str,
+    in_flight: Option<&(String, String)>,
+) -> (String, String, String) {
+    if let Some((sub, name)) = in_flight {
+        if let Some(pos) = rest.find(&format!("{name}: ")) {
+            return (
+                sub.clone(),
+                name.clone(),
+                rest[pos + name.len() + 2..].to_string(),
+            );
+        }
+    }
+    let (sub, tail) = match rest.split_once(" / ") {
+        Some((sub, tail)) => (sub.to_string(), tail),
+        None => (
+            if current_sub.is_empty() {
+                "(unknown)".to_string()
+            } else {
+                current_sub.to_string()
+            },
+            rest,
+        ),
+    };
+    match tail.split_once(": ") {
+        Some((name, why)) => (sub, name.to_string(), why.to_string()),
+        None => (sub, tail.to_string(), String::new()),
+    }
+}
+
+/// The guest's own `── failing tests ──` list, printed by the
+/// unfiltered run after its summary; `(subsystem, name, why)` per line.
+/// Filtered runs do not print one (their `[FAIL]` lines are the
+/// record), so this is empty for them.
+fn parse_failing_list(text: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let mut in_list = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if line.starts_with("── failing tests ──") {
+            in_list = true;
+            continue;
+        }
+        if !in_list {
+            continue;
+        }
+        let t = line.trim();
+        match t.split_once(" / ") {
+            Some((sub, tail)) => match tail.split_once(": ") {
+                Some((name, why)) => out.push((sub.to_string(), name.to_string(), why.to_string())),
+                None => break,
+            },
+            None => break,
+        }
+    }
+    out
+}
+
+/// How one split-mode group boot turned out.
+#[derive(Debug, PartialEq, Eq)]
+enum GroupVerdict {
+    Passed,
+    Failed,
+    /// QEMU exited on its own but the guest never printed a summary
+    /// (crash / fatal exception mid-suite).
+    Died,
+    /// The host killed the boot at the per-group cap.
+    TimedOut,
+}
+
+/// One group's aggregated result, in the guest's own accounting.
+struct GroupOutcome {
+    label: String,
+    verdict: GroupVerdict,
+    passed: u64,
+    failed: u64,
+    skipped: u64,
+    failing: Vec<(String, String, String)>,
+    elapsed_secs: u64,
+    serial: Vec<u8>,
+}
+
+/// Turn one group's raw boot outcome into counts and a verdict. A boot
+/// that produced a guest summary is judged by it (plus the exit-status
+/// check the single-boot gate applies). A boot without one — killed at
+/// the cap, or dead on its own — is accounted from the tests that did
+/// complete, and the test left in flight (or the boot itself, when no
+/// test was in flight) counts as exactly one failure with a `why` that
+/// names the containment event: a timeout is a failure, never a skip,
+/// and the phase continues with the next group either way.
+fn interpret_boot(
+    label: &str,
+    outcome: BootOutcome,
+    arch: Arch,
+    group_cap: u64,
+    elapsed_secs: u64,
+) -> GroupOutcome {
+    let base = GroupOutcome {
+        label: label.to_string(),
+        verdict: GroupVerdict::Failed,
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        failing: Vec::new(),
+        elapsed_secs,
+        serial: Vec::new(),
+    };
+    match outcome {
+        BootOutcome::Exited { status, serial } => {
+            let text = String::from_utf8_lossy(&serial);
+            match kernel_test_summary(&text) {
+                Some(summary) => {
+                    let failing = parse_failing_list(&text);
+                    let mut out = GroupOutcome {
+                        passed: summary.pass,
+                        failed: summary.fail,
+                        skipped: summary.skip,
+                        failing,
+                        serial,
+                        ..base
+                    };
+                    if summary.fail == 0 && status.code() == expected_all_pass_status(arch) {
+                        out.verdict = GroupVerdict::Passed;
+                    } else if summary.fail == 0 {
+                        // The guest claims all-pass but QEMU's exit
+                        // status disagrees — the same mismatch the
+                        // single-boot gate bails on. Host-attributed:
+                        // one synthetic failure so the counts stay
+                        // honest.
+                        out.failed += 1;
+                        out.failing.push((
+                            "(boot)".to_string(),
+                            label.to_string(),
+                            format!(
+                                "QEMU exited with {status} (all-pass is {:?} on this arch) \
+                                 but the guest summary reported no failures",
+                                expected_all_pass_status(arch)
+                            ),
+                        ));
+                    }
+                    out
+                }
+                None => {
+                    let partial = parse_partial_boot_results(&text);
+                    let mut out = GroupOutcome {
+                        passed: partial.passed,
+                        failed: partial.failed,
+                        skipped: partial.skipped,
+                        failing: partial.failing,
+                        verdict: GroupVerdict::Died,
+                        serial,
+                        ..base
+                    };
+                    out.failed += 1;
+                    match partial.in_flight {
+                        Some((sub, name)) => out.failing.push((
+                            sub,
+                            name,
+                            format!(
+                                "guest exited ({status}) mid-test — no result reported; \
+                                 the rest of this group did not run"
+                            ),
+                        )),
+                        None => out.failing.push((
+                            "(boot)".to_string(),
+                            label.to_string(),
+                            format!(
+                                "guest exited ({status}) without printing a summary — \
+                                 no result for this group"
+                            ),
+                        )),
+                    }
+                    out
+                }
+            }
+        }
+        BootOutcome::Killed {
+            reason,
+            cpu_state,
+            serial,
+            ..
+        } => {
+            let text = String::from_utf8_lossy(&serial);
+            let partial = parse_partial_boot_results(&text);
+            let timed_out = reason.starts_with("timed out");
+            let why = if timed_out {
+                format!(
+                    "timeout after {group_cap}s — host per-group cap \
+                     (XTASK_QEMU_GROUP_TIMEOUT_SECS); the test never reported a result \
+                     and its group boot was killed (QEMU CPU at kill: {cpu_state})"
+                )
+            } else {
+                format!(
+                    "host killed the boot ({reason}; QEMU CPU at kill: {cpu_state}); \
+                     the test never reported a result"
+                )
+            };
+            let mut out = GroupOutcome {
+                passed: partial.passed,
+                failed: partial.failed,
+                skipped: partial.skipped,
+                failing: partial.failing,
+                verdict: if timed_out {
+                    GroupVerdict::TimedOut
+                } else {
+                    GroupVerdict::Failed
+                },
+                serial,
+                ..base
+            };
+            out.failed += 1;
+            match partial.in_flight {
+                Some((sub, name)) => out.failing.push((sub, name, why)),
+                None => out
+                    .failing
+                    .push(("(boot)".to_string(), label.to_string(), why)),
+            }
+            out
+        }
+    }
+}
+
+/// Phase 1 of `cargo xtask test --split`: boot the kernel once per
+/// group, each boot capped at [`kernel_test_group_timeout_secs`], and
+/// aggregate the per-group results into the same
+/// `── summary: P pass, F fail, S skip ──` + `── failing tests ──`
+/// contract the guest's own unfiltered run prints, so CI tooling and
+/// humans read split and single-boot runs identically. A group that
+/// hangs, dies, or fails costs its own boot only; the remaining groups
+/// still run. Bails when any group did not pass, like the single-boot
+/// gate.
+fn run_kernel_test_phase_split(
+    smoke_args: &BuildArgs,
+    subsystem: Option<&str>,
+    exclude_subsystem: Option<&str>,
+) -> Result<()> {
+    let caller_exclude = split_filter_list(exclude_subsystem);
+    let groups: Vec<GroupSpec> = match subsystem {
+        Some(raw) => dedupe_subsystem_prefixes(&split_filter_list(Some(raw)))
+            .into_iter()
+            .map(|entry| GroupSpec {
+                label: entry.clone(),
+                include: vec![entry],
+                exclude: caller_exclude.clone(),
+            })
+            .collect(),
+        None => full_suite_groups(&caller_exclude),
+    };
+    let cap = kernel_test_group_timeout_secs();
+    // The caller's own XTASK_QEMU_APPEND (usually unset) is the base
+    // every group boot starts from; group filters are appended per
+    // boot and the base is restored after each one.
+    let base_append = std::env::var("XTASK_QEMU_APPEND").ok();
+    println!(
+        "xtask: kernel-test phase (split): {} group(s), per-group cap {cap}s",
+        groups.len()
+    );
+    let mut outcomes: Vec<GroupOutcome> = Vec::new();
+    for (idx, group) in groups.iter().enumerate() {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(base) = base_append.as_deref().filter(|s| !s.trim().is_empty()) {
+            parts.push(base.to_string());
+        }
+        if !group.include.is_empty() {
+            parts.push(format!("test_subsystem={}", group.include.join(",")));
+        }
+        if !group.exclude.is_empty() {
+            parts.push(format!(
+                "test_subsystem_exclude={}",
+                group.exclude.join(",")
+            ));
+        }
+        if parts.is_empty() {
+            std::env::remove_var("XTASK_QEMU_APPEND");
+        } else {
+            std::env::set_var("XTASK_QEMU_APPEND", parts.join(" "));
+        }
+        println!(
+            "xtask: kernel-test group {}/{} ({}) — booting",
+            idx + 1,
+            groups.len(),
+            group.label
+        );
+        let started = std::time::Instant::now();
+        let boot = run_boot(smoke_args, true, cap);
+        let elapsed = started.elapsed().as_secs();
+        match base_append.as_deref() {
+            Some(value) => std::env::set_var("XTASK_QEMU_APPEND", value),
+            None => std::env::remove_var("XTASK_QEMU_APPEND"),
+        }
+        // A spawn-level error (QEMU missing, image missing) aborts the
+        // phase like the single-boot path; a guest that merely hung or
+        // died is an outcome, not an error.
+        let outcome = interpret_boot(&group.label, boot?, smoke_args.arch, cap, elapsed);
+        let text = String::from_utf8_lossy(&outcome.serial);
+        for line in text.lines() {
+            if line.contains("NETBENCH_RESULT ") || line.contains("NETBENCH_JSON ") {
+                println!("{line}");
+            }
+        }
+        println!(
+            "── group {}/{} ({}): {} pass, {} fail, {} skip in {}s ──",
+            idx + 1,
+            groups.len(),
+            outcome.label,
+            outcome.passed,
+            outcome.failed,
+            outcome.skipped,
+            outcome.elapsed_secs
+        );
+        if outcome.verdict == GroupVerdict::Passed && outcome.passed == 0 {
+            println!(
+                "xtask test: warning: kernel-test group {} reported zero passing \
+                 tests — check the group filter",
+                outcome.label
+            );
+        }
+        if outcome.verdict != GroupVerdict::Passed {
+            emit_serial_tail(&outcome.serial);
+        }
+        outcomes.push(outcome);
+    }
+
+    let (mut total_pass, mut total_fail, mut total_skip) = (0u64, 0u64, 0u64);
+    let mut failing_all: Vec<&(String, String, String)> = Vec::new();
+    for outcome in &outcomes {
+        total_pass += outcome.passed;
+        total_fail += outcome.failed;
+        total_skip += outcome.skipped;
+        failing_all.extend(outcome.failing.iter());
+    }
+    println!("── summary: {total_pass} pass, {total_fail} fail, {total_skip} skip ──");
+    if !failing_all.is_empty() {
+        println!("── failing tests ──");
+        for (sub, name, why) in failing_all.iter().take(32) {
+            println!(" {sub} / {name}: {why}");
+        }
+        if failing_all.len() > 32 {
+            println!(" ... and {} more", failing_all.len() - 32);
+        }
+    }
+    let bad: Vec<&GroupOutcome> = outcomes
+        .iter()
+        .filter(|o| o.verdict != GroupVerdict::Passed)
+        .collect();
+    if !bad.is_empty() {
+        let names: Vec<String> = bad
+            .iter()
+            .map(|o| format!("{} ({:?})", o.label, o.verdict))
+            .collect();
+        bail!(
+            "xtask test: kernel-test phase (split) failed — {} of {} group(s) did not \
+             pass: {}. See the per-group lines and the `── failing tests ──` list above.",
+            bad.len(),
+            outcomes.len(),
+            names.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// How long to let a boot-smoke run take before calling it a hang.
@@ -14375,6 +15220,7 @@ fn main() -> Result<()> {
                 subsystem,
                 exclude_subsystem,
                 kernel_tests_only,
+                split,
             } = test;
             // Comma-separated subsystem filters (prefix-matched in-kernel)
             // are threaded onto the cmdline: `test_subsystem=a,b,c`
@@ -14391,7 +15237,11 @@ fn main() -> Result<()> {
                 filter_parts.push(format!("test_subsystem_exclude={exclude_subsystem}"));
             }
             let prior_append = std::env::var_os("XTASK_QEMU_APPEND");
-            if !filter_parts.is_empty() {
+            // Split mode applies the filters itself, per group boot, on
+            // top of the untouched prior append (see
+            // `run_kernel_test_phase_split`); pre-applying them here
+            // would hand every group the caller's whole selection.
+            if !filter_parts.is_empty() && !split {
                 let mut append = prior_append
                     .as_ref()
                     .map(|value| value.to_string_lossy().into_owned())
@@ -14413,7 +15263,17 @@ fn main() -> Result<()> {
                 ensure_feature(&mut smoke_args.features, "module-allow-unsigned");
                 // Gate on the kernel-test runner's exit status: a failing
                 // smoke makes the runner exit_kernel(1), which this fails on.
-                run_cmd_inner(&smoke_args, true)?;
+                // Split mode boots once per subsystem group instead, so a
+                // hang or crash costs one group's boot, not the phase.
+                if split {
+                    run_kernel_test_phase_split(
+                        &smoke_args,
+                        subsystem.as_deref(),
+                        exclude_subsystem.as_deref(),
+                    )?;
+                } else {
+                    run_cmd_inner(&smoke_args, true)?;
+                }
                 // Phase 2 rebuilds the NVMe fixture from pristine, so keep the
                 // image the kernel tests themselves wrote (the shared-instance
                 // subvolume writers) for the postflight to check too.
