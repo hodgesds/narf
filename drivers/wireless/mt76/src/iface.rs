@@ -324,12 +324,29 @@ impl WirelessNetIface for Mt76Iface {
             bands: self.bands(),
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: false,
+                ht_supported: self.radio.capabilities.phy.ht,
                 vht_supported: false,
                 he_supported: false,
                 eht_supported: false,
             },
         }
+    }
+    fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+        let band = match band_mhz {
+            2400 => 1,
+            5000 => 2,
+            _ => return None,
+        };
+        (self.radio.capabilities.phy.ht && self.radio.capabilities.phy.bands & band != 0).then_some(
+            narf_wireless::iface::PhyCapabilities {
+                ht: if (1..=3).contains(&self.radio.capabilities.phy.max_bandwidth) {
+                    crate::mt7921::ht20::capability40()
+                } else {
+                    crate::mt7921::ht20::capability()
+                },
+                vht: None,
+            },
+        )
     }
     fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
         self.scan_cache
@@ -948,7 +965,11 @@ mod tests {
             || info.base_name != "wlan7"
             || info.bands.len() != 2
             || info.bands[0].channels != (1..=11).collect::<Vec<_>>()
-            || info.hw_caps.ht_supported
+            || !info.hw_caps.ht_supported
+            || iface
+                .phy_capabilities(2400)
+                .is_none_or(|caps| caps.ht[..4] != [98, 0, 28, 255] || caps.vht.is_some())
+            || iface.phy_capabilities(6000).is_some()
             || info.hw_caps.vht_supported
             || info.hw_caps.he_supported
             || info.hw_caps.eht_supported

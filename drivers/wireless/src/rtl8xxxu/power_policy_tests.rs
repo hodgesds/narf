@@ -223,6 +223,11 @@ kernel_test_in!(
 );
 
 fn native_permission(factory: Factory) -> Permission {
+    native_calibration(factory)
+        .permission(&domain(17), 1)
+        .unwrap()
+}
+fn native_calibration(factory: Factory) -> Calibration {
     let mut bytes = fixture();
     bytes[12..41].copy_from_slice(&factory_bytes(factory, 0x0bda, 0x8179));
     // Omit the unrelated parser test's below-factory/above-qualified points.
@@ -237,8 +242,6 @@ fn native_permission(factory: Factory) -> Permission {
         0x0bda,
         0x8179,
     )
-    .unwrap()
-    .permission(&domain(17), 1)
     .unwrap()
 }
 fn smoke_rtl8188eu_measured_gains_verified_before_mac_tx() -> TestResult {

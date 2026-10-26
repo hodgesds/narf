@@ -4,7 +4,7 @@ use core::{
     cell::Cell,
     future::Future,
     pin::pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::{Context, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -14,6 +14,15 @@ mod active_scan_tests;
 
 #[path = "amsdu_rx_tests.rs"]
 mod amsdu_rx_tests;
+
+#[path = "ht20_tests.rs"]
+mod ht20_tests;
+#[path = "ht40_tests.rs"]
+mod ht40_tests;
+#[path = "rx_ba_tests.rs"]
+mod rx_ba_tests;
+#[path = "wmm_tests.rs"]
+mod wmm_tests;
 
 fn mt76_late_preflight_retry_and_owned_start_survive_cancelled_waiter() -> TestResult {
     let allocations = Cell::new(0);
@@ -144,6 +153,8 @@ fn event(cmd: u8, seq: u8, status: u8) -> Vec<u8> {
 #[derive(Debug)]
 struct Model {
     ticks: Cell<u64>,
+    management_stall_after: Option<usize>,
+    ba_error_tag: Option<u16>,
     entropy_fail: bool,
     entropy_calls: usize,
     live: bool,
@@ -157,6 +168,13 @@ struct Model {
     management_resume: Option<u64>,
     management_rates: Vec<u16>,
     data_protection: Vec<bool>,
+    data_qos: Vec<bool>,
+    wmm_reply: Option<Vec<u8>>,
+    ht_reply: Option<Vec<u8>>,
+    stall_edca: bool,
+    edca_progress_fault: u8,
+    deny_tx_after: Option<usize>,
+    tx_policy: Option<Arc<CurrentPolicy>>,
     station_channel: u8,
     rx_stall: bool,
     idle_stall: bool,
@@ -185,6 +203,8 @@ impl Model {
         let resources = Arc::new(AtomicUsize::new(1));
         Self {
             ticks: Cell::new(0),
+            management_stall_after: None,
+            ba_error_tag: None,
             entropy_fail: false,
             entropy_calls: 0,
             live: true,
@@ -201,6 +221,13 @@ impl Model {
             management_resume: None,
             management_rates: Vec::new(),
             data_protection: Vec::new(),
+            data_qos: Vec::new(),
+            wmm_reply: None,
+            ht_reply: None,
+            stall_edca: false,
+            edca_progress_fault: 0,
+            deny_tx_after: None,
+            tx_policy: None,
             station_channel: 6,
             rx_stall: false,
             idle_stall: false,
@@ -228,6 +255,16 @@ impl Model {
 }
 #[derive(Debug)]
 struct Lease(Arc<AtomicUsize>);
+
+struct CurrentPolicy {
+    database: narf_wireless::reg::db::Database,
+    hold_bss_ack: AtomicBool,
+}
+impl core::fmt::Debug for CurrentPolicy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CurrentPolicy")
+    }
+}
 impl Drop for Lease {
     fn drop(&mut self) {
         self.0.store(0, Ordering::SeqCst);
@@ -254,6 +291,23 @@ impl Backend for Model {
             Ok(())
         } else {
             Err(Error::Authority)
+        }
+    }
+    fn check_tx_permission(
+        &self,
+        permission: crate::mt7921::association::TxPermission,
+    ) -> Result<(), Error> {
+        self.check()?;
+        if let Some(policy) = &self.tx_policy {
+            current_station_permission(permission, policy.database.snapshot())?;
+        }
+        if self
+            .deny_tx_after
+            .is_some_and(|limit| self.frames.len() >= limit)
+        {
+            Err(Error::Authority)
+        } else {
+            Ok(())
         }
     }
     fn quiesce(&mut self) -> Result<(), Error> {
@@ -305,6 +359,13 @@ impl Backend for Model {
                 if frame[43] == 7 {
                     let mut result = [0u8; 8];
                     result[0] = frame[34];
+                    if frame[34..36] == [3, 0]
+                        && self.ba_error_tag.is_some_and(|tag| {
+                            frame.get(56..58) == Some(tag.to_le_bytes().as_slice())
+                        })
+                    {
+                        result[4..8].copy_from_slice(&1u32.to_le_bytes());
+                    }
                     reply = runtime_event(1, frame[39], 0, &result);
                 } else if cmd == 3 {
                     let mut done = [0u8; 8];
@@ -351,6 +412,7 @@ impl Backend for Model {
                     || cmd == 0x0f
                     || cmd == 0x5d
                     || cmd == 0x1b
+                    || cmd == 0x1d
                     || cmd == 3 && self.scan_stall)
                 {
                     self.replies.push_back(reply);
@@ -362,6 +424,12 @@ impl Backend for Model {
             .is_some_and(|limit| self.frames.len() >= limit)
         {
             self.tx_stall = true;
+        }
+        if self.stall_edca && frame.get(36) == Some(&0x1d) {
+            self.tx_stall = true;
+        }
+        if self.edca_progress_fault != 0 && frame.get(36) == Some(&0x1d) {
+            self.reg_reply_fault = self.edca_progress_fault;
         }
         if self.revoke_on_submit {
             self.live = false;
@@ -377,7 +445,13 @@ impl Backend for Model {
         }
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        if self.rx_stall {
+        let held = self.tx_policy.as_ref().is_some_and(|policy| {
+            policy.hold_bss_ack.load(Ordering::SeqCst)
+                && self.frames.last().is_some_and(|(_, frame)| {
+                    frame.len() == 92 && frame[34..36] == [2, 0] && frame[43] == 7 && frame[88] == 1
+                })
+        });
+        if self.rx_stall || held {
             Ok(None)
         } else {
             Ok(self.replies.pop_front())
@@ -453,13 +527,95 @@ impl Backend for Model {
         self.check()?;
         self.management_rates.push(rate.hardware());
         self.frames.push((false, frame.to_vec()));
+        if frame.first() == Some(&0xc0) {
+            if let Some(ap) = &self.access_point {
+                // The shared AP speaks auth/association/EAPOL through its
+                // Authorized phase, not disconnect. This native adapter
+                // validates the exact closing frame and retires that fixture
+                // peer; it adds no production RX or cleanup acceptance.
+                let beacon = ap.beacon();
+                if ap.phase() != narf_wifi_fixtures::ApPhase::Authorized
+                    || frame.len() != 26
+                    || frame[1..4] != [0; 3]
+                    || frame[4..10] != beacon[10..16]
+                    || frame[10..16] != [2, 0x11, 0x22, 0x33, 0x44, 0x55]
+                    || frame[16..22] != beacon[10..16]
+                    || frame[22..26] != [0, 0, 3, 0]
+                {
+                    return Err(Error::Bounds);
+                }
+                self.access_point = None;
+                return Ok(());
+            }
+        }
+        if frame.first() == Some(&0xd0) {
+            if let Some(ap) = &self.access_point {
+                let beacon = ap.beacon();
+                if ap.phase() != narf_wifi_fixtures::ApPhase::Authorized
+                    || !matches!(frame.len(), 30 | 33)
+                    || frame[1..4] != [0; 3]
+                    || frame[4..10] != beacon[10..16]
+                    || frame[10..16] != [2, 0x11, 0x22, 0x33, 0x44, 0x55]
+                    || frame[16..22] != beacon[10..16]
+                {
+                    return Err(Error::Bounds);
+                }
+                if frame.len() == 30 {
+                    if frame[24..26] != [3, 2]
+                        || frame[26] != 0
+                        || frame[27] & 15 != 0
+                        || frame[27] >> 4 >= 8
+                        || frame[28..30] != [39, 0]
+                    {
+                        return Err(Error::Bounds);
+                    }
+                } else if frame[24..26] != [3, 1] {
+                    return Err(Error::Bounds);
+                } else if frame[27..29] == [37, 0] {
+                    if frame[29] & !0x3e != 0 || frame[30..33] != [0; 3] {
+                        return Err(Error::Bounds);
+                    }
+                } else if frame[27..29] == [0; 2] {
+                    let parameters = u16::from_le_bytes([frame[29], frame[30]]);
+                    let window = parameters >> 6;
+                    let tid = ((parameters >> 2) & 15) as u8;
+                    if parameters & 3 != 2
+                        || tid >= 8
+                        || !(1..=32).contains(&window)
+                        || !window.is_power_of_two()
+                        || !self.frames.iter().any(|(_, f)| {
+                            f.len() == 68
+                                && f[34..36] == [3, 0]
+                                && f[56..60] == [6, 0, 12, 0]
+                                && f[60] == tid
+                                && f[63] == 1 << tid
+                                && f[66..68] == window.to_le_bytes()
+                        })
+                    {
+                        return Err(Error::Bounds);
+                    }
+                } else {
+                    return Err(Error::Bounds);
+                }
+                return Ok(()); // Bound firmware adapter, not a new AP/port authority.
+            }
+        }
         if let Some(ap) = &mut self.access_point {
             let replies = ap.receive(frame).map_err(|_| Error::Bounds)?;
-            for reply in replies {
+            for mut reply in replies {
+                if reply.first() == Some(&0x10) {
+                    if let Some(parameters) = &self.wmm_reply {
+                        reply.extend_from_slice(parameters);
+                    }
+                    if let Some(ht) = &self.ht_reply {
+                        reply.extend_from_slice(ht);
+                    }
+                }
                 let mut packet = vec![0u8; 32 + reply.len()];
                 let len = packet.len();
                 packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
                 packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+                packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
                 packet[12..16]
                     .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
                 packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
@@ -530,6 +686,7 @@ impl Backend for Model {
                         let len = m3_packet.len();
                         m3_packet[..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
                         m3_packet[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+                        m3_packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
                         m3_packet[12..16]
                             .copy_from_slice(&(u32::from(self.station_channel) << 8).to_le_bytes());
                         m3_packet[28..32].copy_from_slice(&0x00007864u32.to_le_bytes());
@@ -541,7 +698,7 @@ impl Backend for Model {
         }
         Ok(())
     }
-    fn submit_data(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
+    fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
         self.check()?;
         if self.access_point.as_ref().is_some_and(|ap| {
             ap.phase() != narf_wifi_fixtures::ApPhase::Authorized || ap.protected() != protected
@@ -550,12 +707,19 @@ impl Backend for Model {
         }
         self.frames.push((false, frame.to_vec()));
         self.data_protection.push(protected);
+        self.data_qos.push(qos);
         Ok(())
     }
     fn management_complete(
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error> {
         self.check()?;
+        if self
+            .management_stall_after
+            .is_some_and(|after| self.frames.len() >= after)
+        {
+            return Ok(None);
+        }
         if self.tx_stall
             && self
                 .management_resume
@@ -1671,12 +1835,11 @@ fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult 
             && f[34..36] == [3, 0]
             && f[43] == 7
             && f.len() >= 48 + 44
-            && f[48..]
-                .windows(4)
-                .any(|w| u16::from_le_bytes([w[0], w[1]]) == 0x12)
+            && f[49] == 1
+            && f[f.len() - 44..f.len() - 32] == [17, 0, 44, 0, 0, 1, 0, 0, 6, 36, 0, 16]
     });
     if secure_sta_rec.is_none() {
-        return TestResult::Fail("secure STA_REC with key tag 0x12 not emitted");
+        return TestResult::Fail("secure STA_REC with native KEY_V2 tag 17 not emitted");
     }
 
     let ethernet = [
@@ -1754,6 +1917,7 @@ fn mcu_ethernet_tx_rx_frame_transport() -> TestResult {
     let State::RadioReady(info) = session.state else {
         return TestResult::Fail("radio state");
     };
+    session.station_permission = Some(test_permission());
     session.state = State::Associated {
         info,
         peer: [2, 1, 2, 3, 4, 5],
@@ -1831,6 +1995,7 @@ fn native_data_packet(qos: bool) -> Vec<u8> {
     frame[16..22].copy_from_slice(&[2, 6, 7, 8, 9, 10]);
     frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00, 1, 2, 3]);
     let mut packet = vec![0u8; 24];
+    packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
     packet[..4].copy_from_slice(&((2u32 << 27) | (24 + frame.len()) as u32).to_le_bytes());
     packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
     packet.extend_from_slice(&frame);
@@ -1944,6 +2109,7 @@ kernel_test_in!(
 
 fn descriptor(frame: &[u8]) -> Vec<u8> {
     let mut packet = vec![0; 24];
+    packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes()); // One MPDU, no BA aggregate.
     packet[..4].copy_from_slice(&((2u32 << 27) | (24 + frame.len()) as u32).to_le_bytes());
     packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
     packet.extend_from_slice(frame);
@@ -2063,6 +2229,7 @@ fn secure_model() -> Session<Model> {
         })
         .unwrap();
     session.security = Some(security);
+    session.station_permission = Some(test_permission());
     session.state = State::Associated {
         info,
         peer: bss.bssid,
@@ -2081,6 +2248,7 @@ fn ccmp_packet(pn: u64, key: u8, multicast: bool) -> Vec<u8> {
         frame[4..10].fill(0xff);
     }
     let mut packet = vec![0; 40];
+    packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
     packet[..4].copy_from_slice(&((2u32 << 27) | (40 + frame.len()) as u32).to_le_bytes());
     packet[4..8]
         .copy_from_slice(&((4u32 << 16) | (1 << 11) | (u32::from(key) << 21)).to_le_bytes());

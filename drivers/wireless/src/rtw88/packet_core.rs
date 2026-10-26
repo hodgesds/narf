@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One retained RTL8822CE packet slot; native rings stay in their original
+//! One retained RTL8821CE/RTL8822CE packet slot; native rings stay in their original
 //! firmware backend. No reset, descriptor-owner reconstruction or IRQ service.
 use super::packet_format::{self as format, Queue};
 use alloc::vec::Vec;
@@ -73,6 +73,7 @@ pub(super) struct Receipt {
 #[derive(Debug)]
 pub(super) struct Frame {
     bytes: Vec<u8>,
+    pub(super) rate: u8,
 }
 impl narf_wireless::station_security::RawFrame for Frame {
     fn bytes(&self) -> &[u8] {
@@ -95,6 +96,7 @@ pub(super) struct Core {
     frame: Option<DmaBuffer>,
     own: [u8; 6],
     mac_id: u8,
+    data_profile: format::DataProfile,
     tx_host: [u16; 2],
     tx_device: [u16; 2],
     rx: u16,
@@ -189,6 +191,7 @@ impl Core {
             frame: Some(frame),
             own,
             mac_id,
+            data_profile: format::DataProfile::LEGACY,
             tx_host: [0; 2],
             tx_device: [0; 2],
             rx: 0,
@@ -212,6 +215,13 @@ impl Core {
     }
     pub(super) fn ready(&self) -> bool {
         self.phase == Phase::Running && self.pending.is_none()
+    }
+    pub(super) fn configure_data(&mut self, profile: format::DataProfile) -> Result<(), Error> {
+        if !self.ready() || !profile.valid() {
+            return Err(Error::State);
+        }
+        self.data_profile = profile;
+        Ok(())
     }
     pub(super) fn submit(
         &mut self,
@@ -240,7 +250,8 @@ impl Core {
             self.reports = 0;
         }
         let sequence = radio_report.then_some(self.reports << 2);
-        let (descriptor, queue) = format::transmit(frame, self.own, self.mac_id, sequence)?;
+        let (descriptor, queue) =
+            format::transmit_profile(frame, self.own, self.mac_id, sequence, self.data_profile)?;
         let memory = self.frame.as_ref().ok_or(Error::State)?;
         let bd = format::buffer_descriptor(memory.dma_addr().raw(), frame.len())?;
         let id = self.next_id;
@@ -323,7 +334,10 @@ impl Core {
                     step.c2h = Some(body);
                 } else {
                     body.truncate(body.len() - 4);
-                    step.frame = Some(Frame { bytes: body });
+                    step.frame = Some(Frame {
+                        bytes: body,
+                        rate: metadata.rate,
+                    });
                 }
             }
         } else {

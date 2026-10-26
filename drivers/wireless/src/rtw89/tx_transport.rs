@@ -326,6 +326,7 @@ pub fn prepare_header(
             | 0x00c0
             | 0x00d0
             | 0x0008
+            | 0x0088
     ) || fc & (0x8000 | 0x0400) != 0
         || fc & 0x0300 == 0x0300
         || frame[22] & 0xf != 0
@@ -335,15 +336,23 @@ pub fn prepare_header(
     if fc & 0x000c == 0 && fc & 0x0300 != 0 {
         return Err(Error::BadFrame);
     }
+    let header_length = if fc & 0xfc == 0x88 {
+        if chip != ChipId::Rtl8852B || frame.get(24..26) != Some(&[0, 0]) {
+            return Err(Error::BadFrame);
+        }
+        26
+    } else {
+        24
+    };
     if fc & 0x4000 != 0
         && (chip != ChipId::Rtl8852B
-            || fc & 0x00fc != 8
+            || !matches!(fc & 0x00fc,8|0x88)
             || fc & 0x0300 != 0x0100
             //24 native header +8 CCMP IV +>=8 ciphertext +8 MIC.
-            || frame.len() < 48
-            || frame[26] != 0
-            || frame[27] & 0x3f != 0x20
-            || [frame[24], frame[25], frame[28], frame[29], frame[30], frame[31]] == [0; 6])
+            || frame.len() < header_length+24
+            || frame[header_length+2] != 0
+            || frame[header_length+3] & 0x3f != 0x20
+            || [frame[header_length], frame[header_length+1], frame[header_length+4], frame[header_length+5], frame[header_length+6], frame[header_length+7]] == [0; 6])
     {
         return Err(Error::BadFrame);
     }
@@ -372,7 +381,7 @@ pub fn prepare_header(
     let mut word = u32::from_le_bytes(header[..4].try_into().unwrap());
     word &= !(1 << 22); // No optional WD_INFO block is present.
     word |= 1 << 7; // PCI WD page, Linux rtw89_core_tx_update_descinfo.
-    word |= ((24u32 / 2) << 11) & 0xf800; // Native non-QoS header length in halfwords.
+    word |= (((header_length as u32) / 2) << 11) & 0xf800; // Source ieee80211_hdrlen/2.
     header[..4].copy_from_slice(&word.to_le_bytes());
     // Only the v1 body carries ADDR_INFO_NUM. Baseline uses the
     // count in its PCI address-info option and leaves BODY1 reserved.

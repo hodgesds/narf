@@ -22,6 +22,7 @@ pub mod rsn;
 pub mod sae;
 pub mod scan;
 pub mod station_security;
+pub mod wmm;
 
 pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
 pub use scan::{BssInfo, ScanRandomMac, ScanRequest, ScanResult};
@@ -415,6 +416,13 @@ pub trait WirelessNetIface: Interface {
         0
     }
 
+    /// Caller probe-IE byte budget advertised as MAX_SCAN_IE_LEN and enforced
+    /// before scan dispatch. The default preserves the existing 512-byte ABI;
+    /// drivers with smaller firmware buffers override it.
+    fn max_scan_ie_len(&self) -> u16 {
+        512
+    }
+
     /// Whether an unassociated `NL80211_CMD_TRIGGER_SCAN` may use a random
     /// source address (`NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR`).  The default
     /// is deliberately conservative: a request carrying RANDOM_ADDR is
@@ -480,6 +488,13 @@ pub trait WirelessNetIface: Interface {
 
     /// The driver performs WPA2-PSK key exchange from a supplied PMK.
     fn supports_handshake_offload(&self) -> bool {
+        false
+    }
+
+    /// The WPA2-PSK firmware offload also verifies required management-frame
+    /// protection before opening its controlled port. Cipher advertisement
+    /// alone does not establish this complete association contract.
+    fn supports_wpa2_mfp_offload(&self) -> bool {
         false
     }
 

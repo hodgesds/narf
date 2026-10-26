@@ -39,8 +39,9 @@ pub struct ScanRequest {
     /// requests.
     pub duration_mandatory: bool,
     /// Caller-supplied `NL80211_ATTR_IE` bytes for the Probe Request. The
-    /// generic control layer limits this to ath11k's 512-byte raw IE budget;
-    /// the MAC appends it to its mac80211-style capability elements.
+    /// generic control layer enforces the driver's `max_scan_ie_len()` budget
+    /// (512 bytes by default, 256 for ath10k). Each driver validates and adds
+    /// accepted elements to its Probe Request representation.
     pub extra_ies: Vec<u8>,
 }
 

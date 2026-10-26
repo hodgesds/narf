@@ -10,7 +10,7 @@ const MANAGEMENT_TID: u8 = 15;
 
 #[derive(Clone, Copy)]
 pub(super) struct ManagementQueue {
-    id: Option<u16>,
+    pub(super) id: Option<u16>,
 }
 
 impl Owner {
@@ -18,7 +18,11 @@ impl Owner {
     pub fn prepared_management_queue(&self) -> Option<u16> {
         if !matches!(
             self.phase,
-            Phase::ManagementQueuePrepared | Phase::TransmitPowerPrepared
+            Phase::ManagementQueuePrepared
+                | Phase::TransmitPowerPrepared
+                | Phase::LinkActive
+                | Phase::Associated
+                | Phase::DataPrepared
         ) || self.hardware.is_failed()
         {
             return None;

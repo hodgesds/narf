@@ -31,24 +31,55 @@ pub(super) struct Permission {
     pub half_dbm: u8,
 }
 impl Permission {
+    pub fn profile_frequency(frequency: u16) -> bool {
+        (2412..=2462).contains(&frequency) && (frequency - 2412) % 5 == 0
+            || matches!(
+                frequency,
+                5180 | 5200 | 5220 | 5240 | 5745 | 5765 | 5785 | 5805 | 5825
+            )
+    }
     pub fn from_domain(
         caps: &super::wmi_boot::Capabilities,
         domain: &narf_wireless::reg::RegulatoryDomain,
         frequency: u16,
     ) -> Result<Self, Error> {
-        use narf_wireless::reg::RegFlags;
         // Linux's strict initial custom world domain admits 1..11 to
         // initiate radiation; channels requiring beacon-hint/DFS state
         // are not promoted by this first station profile.
-        if !(2412..=2462).contains(&frequency)
-            || (frequency - 2412) % 5 != 0
+        if !Self::profile_frequency(frequency)
             || !domain.country_code.iter().all(u8::is_ascii_uppercase)
-            || u32::from(frequency) < caps.low_2ghz
-            || u32::from(frequency) > caps.high_2ghz
         {
             return Err(Error::Unsupported);
         }
+        let two_ghz = frequency < 3000;
+        let (low_band, high_band) = if two_ghz {
+            (caps.low_2ghz, caps.high_2ghz)
+        } else {
+            (caps.low_5ghz, caps.high_5ghz)
+        };
+        if !(low_band..=high_band).contains(&u32::from(frequency)) {
+            return Err(Error::Unsupported);
+        }
         let factory = Factory::from_eeprom(caps.eeprom_domain).map_err(|_| Error::Unsupported)?;
+        Self::from_factory(factory, domain, frequency)
+    }
+    fn from_factory(
+        factory: Factory,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        frequency: u16,
+    ) -> Result<Self, Error> {
+        let two_ghz = frequency < 3000;
+        use narf_wireless::reg::RegFlags;
+        if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+            return Err(Error::Unsupported);
+        }
+        // World 5GHz is NO_IR in Linux ath/regd.c. No beacon-hint or DFS
+        // qualification is invented. The wider profile requires a resolved
+        // fixed-country factory identity matching the authenticated host DB;
+        // immutable factory pair/CTL and target calibration remain active.
+        if !two_ghz && (factory.country == 0 || factory.alpha2 != domain.country_code) {
+            return Err(Error::Unsupported);
+        }
         let center = u32::from(frequency);
         let low = center - 10;
         let high = center + 10;
@@ -62,7 +93,10 @@ impl Permission {
             // permissive rule cannot erase DFS, narrow bandwidth or power.
             if r.freq_start_mhz >= r.freq_end_mhz
                 || r.max_bandwidth_mhz < 20
-                || r.flags.intersects(RegFlags::DFS | RegFlags::NO_IR)
+                // This STA profile has no DFS/indoor qualification. NO_P2P
+                // does not restrict STA; unknown future restrictions are not
+                // silently promoted by a second permissive overlapping row.
+                || r.flags.bits() & !RegFlags::NO_P2P.bits() != 0
             {
                 return Err(Error::Unsupported);
             }
@@ -78,12 +112,20 @@ impl Permission {
         if ceiling < 0 {
             return Err(Error::Unsupported);
         }
-        let half_dbm = ceiling.min(20) as u8 * 2;
+        let half_dbm = ceiling.min(if two_ghz { 20 } else { 30 }) as u8 * 2;
         Ok(Self {
             factory,
             country: domain.country_code,
             frequency,
             half_dbm,
         })
+    }
+    /// Recheck the chosen immutable factory/frequency receipt against the
+    /// current host policy without querying or inventing hardware facts.
+    pub fn check(self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
+        if Self::from_factory(self.factory, domain, self.frequency)? != self {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
     }
 }

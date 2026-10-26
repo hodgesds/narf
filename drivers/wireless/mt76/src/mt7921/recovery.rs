@@ -24,6 +24,7 @@ impl<B: Backend> Session<B> {
             return Err(Error::Busy);
         }
         self.boot_started = None;
+        self.rx_ba.fence();
         self.stage(Stage::RecoveryPark);
         let result = self.recover_inner(expected_mac).await;
         if let Err(error) = result {
@@ -86,8 +87,13 @@ impl<B: Backend> Session<B> {
         self.backend.release()?;
         self.stage(Stage::RecoveryRearm);
         self.backend.recycle()?;
+        self.rx_ba.reset_after_quiescence();
         self.security = None;
+        self.wmm = None;
+        self.station_permission = None;
         self.ht20_rx = None;
+        self.ht20_profile = None;
+        self.control_pending.clear();
         self.received_msdu.clear();
         self.station_bss = None;
         self.data_pending = None;

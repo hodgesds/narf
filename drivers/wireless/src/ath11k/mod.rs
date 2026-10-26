@@ -53,6 +53,7 @@ pub mod dp_frag;
 pub mod dp_peer;
 pub mod dp_ring;
 pub mod fw;
+mod fw_stats;
 pub mod hal;
 pub mod htc;
 pub mod htt;

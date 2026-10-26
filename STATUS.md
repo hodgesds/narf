@@ -133,10 +133,72 @@ an in-flight signed bootstrap. This does not automatically follow revocation of
 a cached policy firmware capability, retract in-flight RF or prove autonomous
 firmware radio quiescence; uncertain DMA remains retained.
 
-The combined selected Wi-Fi/shared-fixture QEMU gates pass 1736 / 0 fail / 9 skip
-on x86_64 and 1273 / 0 fail / 3 skip on aarch64, with clean production boots
-and btrfs postflights. Scoped cross-architecture Clippy and changed-package
+Ath10k now supports directed and wildcard active discovery through its retained
+HTC/WMI/HTT owner on all six firmware dialects. The initial channel1–11 legacy20
+profile advertises sixteen SSIDs and requires current host policy plus the
+existing factory CTL/power bounds. Ordered domain, minimum band-power and
+per-channel half-dBm limits precede probes; every command/receive poll rechecks
+policy, and matching completion restores the entire receive-only channel list
+before publishing results. Rust packet and native CE models cover probe replies,
+SSID bounds, cancellation, policy restriction, failed terminals and active-cache
+Open/WPA2 DHCP/IP/teardown. Associated/off-channel scanning, broader PHY/bands,
+reset/rejoin and physical acceptance remain open.
+
+The ath10k scan continuation adds caller probe information elements to the same
+six-dialect owner. Its 256-byte firmware budget now reaches nl80211 discovery
+and pre-dispatch validation through a per-driver limit; complete element checks
+and immutable plan ownership precede I/O. Authored Rust packets check raw versus
+padded lengths, binary/maximal content and all six dialects, while native CE
+Open/WPA2 DHCP/IP conversations include extra probe elements. Invalid input stays
+retryable; cancellation or policy loss after publication retains DMA and closes
+the owner. This does not expand the initial PHY/channel profile.
+
+The parallel driver continuation now adds Intel API77 active-link/deactivation
+with source-matched response rates and fresh power/MCC receipts, while retaining
+the TX-disabled peer and management/data gates. Gen2 Qu prerequisites now use
+native header0 independently of their negotiated payload versions; Gen3 is
+unchanged. MT76 negotiates driver-owned WMM
+Information/Parameter IEs, programs native BSS/peer/WTBL QoS and CE EDCA, and
+carries BE/TID0 QoS through actual Open/WPA2 DHCP/IP. HT/aggregation stays gated.
+Live policy clear/restriction fails old MT76 scan/station grants across command
+waits rather than reloading policy into them.
+RTL8821CE advances from inactive PHY tables through an exact-board signed
+calibration-only envelope, channel1/20 setup and real firmware IQK receipts;
+operating power/radio/station still need their separate grants. RTL8822CE's
+actual reserved backend now completes radio preparation through an explicit
+Continued lifecycle state, including failure/cancellation coverage.
+
+Ath10k manual recovery parks all CEs and verifies BME disable before scheduling
+fresh chip reset, authenticated ROM provisioning and a new runtime/interface.
+Retirement tokens, unique TX cookies and reserved old names fence cancelled
+control and late publication; old physical Drop cannot touch its successor.
+All old firmware/CE/WMI/HTT mappings remain pinned, with three attempts per boot
+bounding retained generations. Automatic/stable-interface recovery, DMA
+reclamation, broader PHY features and physical reset/RF acceptance remain open.
+
+The next parallel wave advances all eleven families: Intel Gen2 native Open
+authentication with acknowledged peer re-disable; ath11k physical PDEV power
+readback with reset/query fencing; MT76 response-bound HT20 MCS0–7 long-GI and
+bounded A-MSDU receive admission; AR9285 directed/wildcard active discovery;
+and ath10k six-dialect native station power-save intent before carrier.
+CYW43439/BCM43602 add firmware-owned WPA2 AP-required PMF with native capability,
+peer and association-RSNE readback, public cipher exposure and explicitly gated
+nl80211 PMK CONNECT admission. RTL8188EE, RTL8188EU and qualified RTL8852B
+add native response-bound WMM BE/TID0 QoS; the shared formatter constructs the
+QoS header before CCMP and preserves the installed key's TX packet-number
+sequence. RTL8821CE IQK now uses fresh hardware thermal conversions and a new
+signed recipe identity. Narrow PHY/security contracts and retained terminal
+ownership remain explicit in each family spec. Hardware acceptance and the
+remaining software ledger are still open.
+
+The combined selected Wi-Fi/shared-fixture QEMU gates pass 1848 / 0 fail / 9 skip
+on x86_64 and 1381 / 0 fail / 3 skip on aarch64, with clean production boots
+and btrfs postflights. Scoped production/kernel-test Clippy and workspace
 formatting pass; default release and debug kernels build on both architectures.
+This continuation adds 58 passing smokes on x86_64 and 54 on aarch64; four
+native ath11k physical-transport integration cases are x86_64-specific. Native
+PMF tests include real nl80211 parsing/dispatch through both FullMAC transports,
+with unsupported capability and additional-security requests rejected before I/O.
 Native Rust tests cover the queue and v5 power ABIs, active scan requests/power
 ordering, bounded A-MSDU conversion and C21 factory/MAC/PHY behavior using fixed
 reference data and explicit ownership invariants. D11AC coverage uses exhaustive
@@ -147,6 +209,56 @@ now contains 45 profiles across all eleven families, including the actual
 139472-byte RTL8821CE image; 15 required fixed payload entries remain absent.
 These are software/source/asset checks and do not establish physical acceptance
 or full hardware-feature completion.
+
+The subsequent continuation adds native Gen2 legacy association, ath11k sibling
+channel-reservation recovery, MT76 HT40/SGI and actual FullMAC HT20/SGI readbacks.
+AR9285 now has negotiated legacy rates, native four-series retries and adaptive
+terminal DATA feedback; ath10k admits fixed-country non-DFS 5-GHz legacy station
+and mixed-band active scanning across all six dialects. RTL8188EE/EU and
+qualified RTL8852B gain response-bound legacy DATA rates; RTL8821CE gains parked
+post-IQK operating-power preparation, with no station transmit grant.
+The combined Wi-Fi/shared-fixture suites pass 1887/0 fail/9 skip on x86_64 and
+1417/0 fail/3 skip on aarch64 with clean production boots and btrfs postflights.
+Scoped production/kernel-test Clippy, workspace formatting and release/debug
+builds pass on both architectures. The wave adds 39 passing x86_64 smokes and
+36 on aarch64; three native ath11k recovery cases are x86_64-specific.
+
+The following wave adds retained native Gen2 Open data ownership with DCF/TLC,
+TID0 DMA and receipt-fenced teardown, while automatic PCI/netdev/WPA2 keys remain
+gated. MT76 gains bounded recipient BA/reordering and ordered key retirement;
+native rekey tests also corrected KEY_V2 tag17/install0/remove1 ABI fields.
+Ath10k gains response-bound WMM/QoS and policy checks across native station and
+RSNA waits. RTL8821CE reaches native Open/WPA2 kernel DHCP/IP through its original
+reserved-DMA owner and distinct signed full-static thermal/power qualification.
+Real measured deployment assets and RF acceptance are still required.
+The wave adds 39 passing smokes per architecture: combined Wi-Fi/shared-fixture
+suites pass 1926/0 fail/9 skip on x86_64 and 1456/0 fail/3 skip on aarch64.
+Production boots/btrfs postflights, scoped production/kernel-test Clippy,
+workspace formatting and release/debug builds pass on both architectures.
+
+The next continuation adds native Gen2 WPA2 keys, authenticated EAPOL/M4
+receipts, RX-epoch fencing, encrypted data and rekeys with key-before-queue
+retirement. Automatic Gen2 PCI/netdev publication remains gated. FullMAC
+HT40/SGI40 now requires actual firmware capability/inventory, negotiated AP
+facts and current power authority for both occupied channels, with 20 MHz fallback.
+RTL8822CE gains distinct signed N22L WMM/legacy-DATA-rate qualification and
+current source/PCI checks around final carrier and host-frame publication;
+RTL8821CE keeps its separate legacy grant. Shared native Intel test owners now
+live on the heap to bound nested aarch64 fixture construction. These advances
+remain software evidence; genuine assets, firmware/RF acceptance and the
+all-family feature backlog remain required.
+
+This wave adds 39 passing smokes per architecture: combined Wi-Fi/shared-fixture
+suites pass 1965/0 fail/9 skip on x86_64 and 1495/0 fail/3 skip on aarch64.
+Production boots/btrfs postflights, scoped production/kernel-test Clippy,
+workspace formatting and release/debug builds pass on both architectures.
+
+The [per-chip inventory](drivers/wireless/research/chip-inventory.md) audits all
+102 registered bus identities. Tokei measures 316,060 Rust code lines including
+tests/tables in the specified scopes, compared with 1,177,080 C/header lines in
+broader local Linux driver and mac80211/cfg80211 directories. These are footprint
+counts, not completion percentages. Initial remaining-LOC forecasts were
+withdrawn after review found overlapping work; a delivery date remains uncalibrated.
 
 The preceding station power-save continuation added ordinary firmware station power save to the
 common CYW43439/BCM43602 owner. PM_FAST/PM_OFF and the default sleep-retention

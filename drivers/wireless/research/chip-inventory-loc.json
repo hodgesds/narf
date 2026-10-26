@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-10-26T02:12:31Z",
+  "branch": "codex/ath10k-active-scan",
+  "head": "e8fe43e7b",
+  "includes_uncommitted_changes": true,
+  "tool": "tokei 15.0.0",
+  "command_template": "tokei --streaming json --types Rust <paths...>",
+  "unit": "Rust language code lines; includes tests, fixtures, tables and unreachable code; embedded Markdown excluded",
+  "excluded_scope": "bus, SDIO/USB hosts, net, crypto, DMA/IOMMU, platform and build code outside the listed paths; firmware binaries excluded",
+  "totals": {
+    "files": 755,
+    "code": 316060,
+    "comments": 11727,
+    "blanks": 11922
+  },
+  "scopes": [
+    {
+      "family": "iwlwifi",
+      "files": 70,
+      "code": 25673,
+      "comments": 1374,
+      "blanks": 1437,
+      "paths": [
+        "drivers/wireless/src/iwlwifi"
+      ]
+    },
+    {
+      "family": "ath11k",
+      "files": 61,
+      "code": 78324,
+      "comments": 3468,
+      "blanks": 4498,
+      "paths": [
+        "drivers/wireless/src/ath11k"
+      ]
+    },
+    {
+      "family": "mt76",
+      "files": 39,
+      "code": 17382,
+      "comments": 766,
+      "blanks": 828,
+      "paths": [
+        "drivers/wireless/mt76/src"
+      ]
+    },
+    {
+      "family": "rtw88",
+      "files": 72,
+      "code": 38442,
+      "comments": 498,
+      "blanks": 245,
+      "paths": [
+        "drivers/wireless/src/rtw88"
+      ]
+    },
+    {
+      "family": "rtw89",
+      "files": 202,
+      "code": 50970,
+      "comments": 1449,
+      "blanks": 682,
+      "paths": [
+        "drivers/wireless/src/rtw89"
+      ]
+    },
+    {
+      "family": "rtlwifi",
+      "files": 51,
+      "code": 14509,
+      "comments": 655,
+      "blanks": 656,
+      "paths": [
+        "drivers/wireless/src/rtlwifi"
+      ]
+    },
+    {
+      "family": "rtl8xxxu",
+      "files": 41,
+      "code": 15499,
+      "comments": 588,
+      "blanks": 838,
+      "paths": [
+        "drivers/wireless/src/rtl8xxxu"
+      ]
+    },
+    {
+      "family": "ath10k",
+      "files": 71,
+      "code": 22584,
+      "comments": 620,
+      "blanks": 539,
+      "paths": [
+        "drivers/wireless/src/ath10k"
+      ]
+    },
+    {
+      "family": "ath9k",
+      "files": 35,
+      "code": 10053,
+      "comments": 268,
+      "blanks": 114,
+      "paths": [
+        "drivers/wireless/src/ath9k",
+        "drivers/wireless/src/ath9k.rs"
+      ]
+    },
+    {
+      "family": "brcmfmac",
+      "files": 31,
+      "code": 11219,
+      "comments": 592,
+      "blanks": 476,
+      "paths": [
+        "drivers/wireless/src/brcmfmac"
+      ]
+    },
+    {
+      "family": "cyw43439",
+      "files": 33,
+      "code": 8850,
+      "comments": 316,
+      "blanks": 426,
+      "paths": [
+        "drivers/wireless/src/cyw43439"
+      ]
+    },
+    {
+      "family": "shared",
+      "files": 49,
+      "code": 22555,
+      "comments": 1133,
+      "blanks": 1183,
+      "paths": [
+        "wireless/src",
+        "drivers/wireless/src/qualcomm_regulatory.rs",
+        "drivers/wireless/src/qualcomm_regulatory",
+        "drivers/wireless/src/qualcomm_pci.rs",
+        "drivers/wireless/src/firmware_asset.rs",
+        "drivers/wireless/src/lib.rs",
+        "verification/wifi-fixtures/src"
+      ]
+    }
+  ],
+  "per_file_counts": "chip-inventory-loc-files.csv"
+}

@@ -18,6 +18,7 @@ mod mac;
 mod packet;
 mod packet_native;
 mod phy;
+mod rates;
 mod station;
 pub use calibration::{Report as RadioCalibration, State as RadioState};
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};

@@ -83,7 +83,7 @@ fn smart_fifo() -> [u8; 92] {
     b
 }
 
-fn awake_mac_power() -> [u8; 40] {
+pub(super) fn awake_mac_power() -> [u8; 40] {
     let mut b = [0; 40];
     put16(&mut b, 6, 25); // required keep-alive even with PM disabled
     b
@@ -282,7 +282,7 @@ impl Owner {
         self.scan.ready = true;
         Ok(())
     }
-    pub(super) async fn refresh_mcc(&mut self) -> Result<(), &'static str> {
+    pub(super) fn mcc_request(&self) -> Result<Option<(u8, [u8; 28])>, &'static str> {
         // The firmware can change its current profile after a successful
         // scan (e.g. CHUB/MCC updates). Requery every operation; an earlier
         // successful scan never turns its channel map into lasting policy.
@@ -299,8 +299,18 @@ impl Owner {
                 3
             };
             let query = mcc_query(self.scan.multi_mcc);
+            return Ok(Some((version, query)));
+        }
+        Ok(None)
+    }
+    pub(super) fn accept_mcc(&mut self, version: u8, payload: &[u8]) -> Result<(), &'static str> {
+        self.scan.permissions = Some(mcc_permissions(version, payload)?);
+        Ok(())
+    }
+    pub(super) async fn refresh_mcc(&mut self) -> Result<(), &'static str> {
+        if let Some((version, query)) = self.mcc_request()? {
             let reply = self.hardware.command(1, 0xc8, &query).await?;
-            self.scan.permissions = Some(mcc_permissions(version, &reply.payload)?);
+            self.accept_mcc(version, &reply.payload)?;
         }
         Ok(())
     }

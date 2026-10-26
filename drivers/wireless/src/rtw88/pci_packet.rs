@@ -51,6 +51,13 @@ fn write(memory: &DmaBuffer, offset: usize, data: &[u8]) -> Result<(), packet::E
     Ok(())
 }
 impl Native {
+    pub(in crate::rtw88) fn configure_packet_profile(
+        &mut self,
+        profile: format::DataProfile,
+    ) -> Result<(), crate::rtw88::firmware_transport::Error> {
+        self.with_packet(|core, _| core.configure_data(profile))
+            .map_err(|_| crate::rtw88::firmware_transport::Error::State)
+    }
     fn packet_memory<T>(
         &mut self,
         operation: impl FnOnce(&Self) -> Result<T, packet::Error>,
@@ -58,13 +65,16 @@ impl Native {
         if !matches!(self.state, State::Calibrated | State::Packets) {
             return Err(packet::Error::State);
         }
-        let result = crate::rtw88::pci_park::invoke(&self.cap, || {
-            self.command(self.state == State::Packets)
-                .map_err(access_error)?;
-            operation(self)
-        })
-        .map_err(|_| packet::Error::Access)
-        .and_then(|value| value);
+        let gate = self.packet_gate.clone().ok_or(packet::Error::Access)?;
+        let result = gate
+            .invoke(|| {
+                crate::rtw88::pci_park::invoke(&self.cap, || {
+                    self.command(self.state == State::Packets)?;
+                    operation(self).map_err(|_| crate::rtw88::firmware_transport::Error::Access)
+                })
+                .map_err(|_| crate::rtw88::firmware_transport::Error::Access)?
+            })
+            .map_err(access_error);
         if result.is_err() {
             self.state = State::Terminal;
         }
@@ -304,14 +314,17 @@ unsafe impl Port for Native {
             return Err(packet::Error::Access);
         }
         self.check_packet_permission().map_err(access_error)?;
-        crate::rtw88::pci_park::invoke(&self.cap, || {
-            self.command(false)?;
-            barrier();
-            narf_bus::pci::set_command(&self.cap, &self.device, BUS_MASTER)
-                .map_err(|_| crate::rtw88::firmware_transport::Error::Access)?;
-            self.command(true)
+        let gate = self.packet_gate.clone().ok_or(packet::Error::State)?;
+        gate.invoke(|| {
+            crate::rtw88::pci_park::invoke(&self.cap, || {
+                self.command(false)?;
+                barrier();
+                narf_bus::pci::set_command(&self.cap, &self.device, BUS_MASTER)
+                    .map_err(|_| crate::rtw88::firmware_transport::Error::Access)?;
+                self.command(true)
+            })
+            .map_err(|_| crate::rtw88::firmware_transport::Error::Access)?
         })
-        .map_err(|_| packet::Error::Access)?
         .map_err(access_error)?;
         self.state = State::Packets;
         Ok(())

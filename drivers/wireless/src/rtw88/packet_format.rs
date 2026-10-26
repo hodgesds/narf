@@ -46,6 +46,53 @@ fn unicast(address: &[u8]) -> bool {
     address.len() == 6 && address != [0; 6] && address[0] & 1 == 0
 }
 pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
+    classify_profile(frame, own, DataProfile::LEGACY)
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DataProfile {
+    pub rates: u16,
+    pub qos: bool,
+}
+impl DataProfile {
+    pub(super) const LEGACY: Self = Self {
+        rates: 1,
+        qos: false,
+    };
+    pub(super) fn valid(self) -> bool {
+        self.rates != 0 && self.rates & !0xfff == 0
+    }
+    pub(super) fn rate_id(self) -> u8 {
+        if self.rates & 0xff0 == 0 {
+            8
+        } else if self.rates & 15 == 0 {
+            7
+        } else {
+            6
+        }
+    }
+    pub(super) fn rate(self) -> u8 {
+        const KBPS: [u32; 12] = [
+            1000, 2000, 5500, 11000, 6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000,
+        ];
+        KBPS.iter()
+            .enumerate()
+            .filter(|(i, _)| self.rates & (1 << i) != 0)
+            .max_by_key(|(_, r)| **r)
+            .map_or(0, |(i, _)| i as u8)
+    }
+    pub(super) fn response_mask(self) -> u32 {
+        let rate = self.rate();
+        let mut order = if rate >= 4 { rate - 4 } else { rate };
+        if order == 0 {
+            order += 1;
+        }
+        ((1u32 << (u32::from(order) + 4)) - 1) & 0x15f
+    }
+}
+fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<Queue, Error> {
+    if !profile.valid() {
+        return Err(Error::Metadata);
+    }
     if !(24..=MAX_MPDU).contains(&frame.len())
         || !unicast(&own)
         || frame[10..16] != own
@@ -56,10 +103,18 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
         return Err(Error::Frame);
     }
     match frame[0] {
-        // Initial STA profile: association, authentication and terminal peer
-        // teardown. No QoS, aggregation, fragmentation or four-address frame.
+        // Management stays legacy. The separate qualified branch below may
+        // admit only BE/TID0 QoS, without aggregation or fragmentation.
         0x00 | 0xb0 | 0xa0 | 0xc0 if frame[1] & (3 | 64) == 0 => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
+        0x88 if profile.qos
+            && frame.len() >= 26
+            && frame[24..26] == [0, 0]
+            && frame[1] & 3 == 1
+            && unicast(&frame[4..10]) =>
+        {
+            Ok(Queue::Data)
+        }
         _ => Err(Error::Frame),
     }
 }
@@ -71,7 +126,16 @@ pub(super) fn transmit(
     mac_id: u8,
     report: Option<u8>,
 ) -> Result<([u8; TX_DESC], Queue), Error> {
-    let queue = classify(frame, own)?;
+    transmit_profile(frame, own, mac_id, report, DataProfile::LEGACY)
+}
+pub(super) fn transmit_profile(
+    frame: &[u8],
+    own: [u8; 6],
+    mac_id: u8,
+    report: Option<u8>,
+    profile: DataProfile,
+) -> Result<([u8; TX_DESC], Queue), Error> {
+    let queue = classify_profile(frame, own, profile)?;
     if mac_id > 127 || report.is_some_and(|sequence| sequence & 3 != 0) {
         return Err(Error::Metadata);
     }
@@ -89,10 +153,29 @@ pub(super) fn transmit(
         Queue::Management => 18,
         Queue::Data => 0,
     };
-    // RTW_RATEID_B_20M, software crypto, fixed CCK1, source no-fallback mode.
-    put(&mut bytes, 4, u32::from(mac_id) | qsel << 8 | 8 << 16);
+    let ordinary = queue == Queue::Data && report.is_none();
+    if frame[0] == 0x88 && !ordinary {
+        return Err(Error::Frame);
+    }
+    let rate_id = if ordinary { profile.rate_id() } else { 8 };
+    // Source fixed-rate/no-fallback; management/EAPOL remain CCK1. QoS comes
+    // from the actual26-byte frame, with TID0 selecting the same BE queue.
+    put(
+        &mut bytes,
+        4,
+        u32::from(mac_id) | qsel << 8 | u32::from(rate_id) << 16,
+    );
     put(&mut bytes, 8, u32::from(report.is_some()) << 19);
     put(&mut bytes, 12, 1 << 8 | 1 << 10);
+    put(
+        &mut bytes,
+        16,
+        if ordinary {
+            u32::from(profile.rate())
+        } else {
+            0
+        },
+    );
     put(&mut bytes, 24, u32::from(report.unwrap_or(0)));
     let sequence = u16::from_le_bytes([frame[22], frame[23]]) >> 4;
     put(&mut bytes, 36, u32::from(sequence) << 12);

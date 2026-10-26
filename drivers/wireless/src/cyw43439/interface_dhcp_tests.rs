@@ -24,6 +24,13 @@ use narf_wifi_fixtures::{udp_ipv4, DhcpServer, NetworkPlan};
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
 
+#[path = "ht40_tests.rs"]
+mod ht40_tests;
+#[path = "ht_tests.rs"]
+mod ht_tests;
+#[path = "mfp_tests.rs"]
+mod mfp_tests;
+
 const OWN: [u8; 6] = [2, 6, 7, 8, 9, 10];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
 
@@ -169,7 +176,56 @@ impl Harness {
         secured: bool,
         database: Option<Arc<narf_wireless::reg::db::Database>>,
     ) -> Result<Self, &'static str> {
+        Self::new_config(secured, database, None)
+    }
+    fn new_config(
+        secured: bool,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        mfp: Option<(bool, bool, u8)>,
+    ) -> Result<Self, &'static str> {
+        Self::new_features(secured, database, mfp, None)
+    }
+    fn new_features(
+        secured: bool,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        mfp: Option<(bool, bool, u8)>,
+        phy: Option<(u32, u8)>,
+    ) -> Result<Self, &'static str> {
+        Self::new_details(secured, database, mfp, phy, None)
+    }
+    fn new_wide(
+        secured: bool,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        mfp: bool,
+        wide: crate::cyw43439::phy_fixture::Wide,
+    ) -> Result<Self, &'static str> {
+        Self::new_details(
+            secured,
+            database,
+            mfp.then_some((true, true, 0)),
+            Some((1, 0)),
+            Some(wide),
+        )
+    }
+    fn new_details(
+        secured: bool,
+        database: Option<Arc<narf_wireless::reg::db::Database>>,
+        mfp: Option<(bool, bool, u8)>,
+        phy: Option<(u32, u8)>,
+        wide: Option<crate::cyw43439::phy_fixture::Wide>,
+    ) -> Result<Self, &'static str> {
         let bus = Bus::new(secured);
+        if let Some((supported, required, fault)) = mfp {
+            bus.firmware.lock().mfp_profile(supported, required, fault);
+        }
+        if let Some((chains, fault)) = phy {
+            bus.firmware.lock().phy_profile(chains, fault);
+        }
+        let mut domain = firmware::domain();
+        if let Some(wide) = wide {
+            bus.firmware.lock().wide_profile(wide);
+            domain.rules[0].max_bandwidth_mhz = 40;
+        }
         let station = if let Some(database) = database {
             ready(Station::initialize_live(
                 Runtime::new(bus.clone()),
@@ -177,11 +233,7 @@ impl Harness {
                 database,
             ))?
         } else {
-            ready(Station::initialize(
-                Runtime::new(bus.clone()),
-                &[1],
-                firmware::domain(),
-            ))?
+            ready(Station::initialize(Runtime::new(bus.clone()), &[1], domain))?
         }
         .map_err(|_| "CYW composition firmware initialization")?;
         if station.mac != OWN {
@@ -189,6 +241,8 @@ impl Harness {
         }
         let channels = station.channels.iter().map(|&ch| u32::from(ch)).collect();
         let supplicant = station.supplicant;
+        let mfp_supported = station.supports_management_protection();
+        let ht_capabilities = station.ht_capabilities();
         let (rx, rx_consumer) = narf_ipc::channel();
         let (tx_producer, tx) = narf_ipc::channel();
         let name = narf_net::iface::register("wlan%d", OWN, send);
@@ -203,6 +257,8 @@ impl Harness {
             mac: OWN,
             channels,
             supplicant,
+            mfp_supported,
+            ht_capabilities,
             up: AtomicBool::new(false),
             power_save: AtomicU8::new(0),
             bssid: AtomicU64::new(0),
@@ -219,6 +275,25 @@ impl Harness {
     }
 
     fn scan_and_associate(&self, secured: bool) -> Result<(), &'static str> {
+        self.scan()?;
+        ready(self.device.associate(Self::request(secured)))?
+            .map_err(|_| "CYW composition association")?;
+        if !self.device.link_up()
+            || self.device.connected_bssid() != Some(AP)
+            || narf_net::iface::lookup(&self.name)
+                .is_none_or(|iface| !iface.link_up || !iface.carrier)
+        {
+            return Err("CYW composition did not authorize the connected port");
+        }
+        narf_net::iface::set_link_state(&self.name, false);
+        self.device.drain();
+        if narf_net::iface::lookup(&self.name).is_none_or(|iface| iface.link_up || !iface.carrier) {
+            return Err("CYW physical carrier overwrote operator DOWN");
+        }
+        narf_net::iface::set_link_state(&self.name, true);
+        Ok(())
+    }
+    fn scan(&self) -> Result<(), &'static str> {
         let bss = ready(self.device.scan(ScanRequest {
             ssids: vec![b"test".to_vec()],
             frequencies_mhz: vec![2437],
@@ -234,7 +309,10 @@ impl Harness {
         if bss.len() != 1 || bss[0].bssid != AP || bss[0].frequency_mhz != 2437 {
             return Err("CYW composition scan did not identify the AP");
         }
-        ready(self.device.associate(AssociateRequest {
+        Ok(())
+    }
+    fn request(secured: bool) -> AssociateRequest {
+        AssociateRequest {
             bssid: AP,
             ssid: b"test".to_vec(),
             frequency_mhz: 2437,
@@ -245,22 +323,7 @@ impl Harness {
                 narf_wireless::SecurityConfig::Open
             },
             ie: Vec::new(),
-        }))?
-        .map_err(|_| "CYW composition association")?;
-        if !self.device.link_up()
-            || self.device.connected_bssid() != Some(AP)
-            || narf_net::iface::lookup(&self.name)
-                .is_none_or(|iface| !iface.link_up || !iface.carrier)
-        {
-            return Err("CYW composition did not authorize the connected port");
         }
-        narf_net::iface::set_link_state(&self.name, false);
-        self.device.drain();
-        if narf_net::iface::lookup(&self.name).is_none_or(|iface| iface.link_up || !iface.carrier) {
-            return Err("CYW physical carrier overwrote operator DOWN");
-        }
-        narf_net::iface::set_link_state(&self.name, true);
-        Ok(())
     }
 
     fn received(&self, expected: &[u8]) -> bool {
@@ -289,7 +352,21 @@ impl Drop for Harness {
 }
 
 fn composition(secured: bool) -> Result<(), &'static str> {
-    let harness = Harness::new(secured)?;
+    composition_mfp(secured, false)
+}
+fn composition_mfp(secured: bool, mfp: bool) -> Result<(), &'static str> {
+    composition_phy(secured, mfp, None)
+}
+fn composition_phy(secured: bool, mfp: bool, phy: Option<(u32, u8)>) -> Result<(), &'static str> {
+    let harness = Harness::new_features(secured, None, mfp.then_some((true, true, 0)), phy)?;
+    composition_native(harness, secured, mfp, phy.is_some())
+}
+fn composition_native(
+    harness: Harness,
+    secured: bool,
+    mfp: bool,
+    ht: bool,
+) -> Result<(), &'static str> {
     let plan = network_plan();
     let uplink = udp_ipv4(
         AP,
@@ -310,6 +387,28 @@ fn composition(secured: bool) -> Result<(), &'static str> {
         return Err("CYW admitted data or carrier before association");
     }
     harness.scan_and_associate(secured)?;
+    if harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .ht_connection()
+        != ht
+    {
+        return Err("CYW native PHY verification did not match the completed conversation");
+    }
+    if harness
+        .device
+        .state
+        .try_lock()
+        .unwrap()
+        .station
+        .management_protection()
+        != mfp
+    {
+        return Err("CYW firmware management-protection receipt missing/unrequested");
+    }
     // Exercise ordinary station power save through the same native data
     // owner before the real DHCP/IP conversation, for Open and WPA2.
     harness

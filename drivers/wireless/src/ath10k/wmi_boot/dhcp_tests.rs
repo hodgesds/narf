@@ -5,12 +5,27 @@ use crate::ath10k::interface::Device;
 use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
-use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig};
+use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
+#[path = "wmm_conversation_tests.rs"]
+mod wmm_conversation_tests;
+fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
+    let mut domain = station_tests::policy();
+    for (low, high) in [(5150, 5350), (5725, 5850)] {
+        domain.rules.push(narf_wireless::reg::RegRule {
+            freq_start_mhz: low,
+            freq_end_mhz: high,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 27,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        });
+    }
+    domain
+}
 type ModelDevice = Device<RadioModel>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE_TEST.lock().clone().ok_or(())?;
-    device.enqueue(bytes, meta)
+    device.enqueue_generation(generation, bytes, meta)
 }
 fn drain() -> bool {
     let device = ACTIVE_TEST.lock().clone();
@@ -21,20 +36,57 @@ struct Harness {
     policy: Arc<IrqSafeSpinLock<Option<narf_wireless::reg::RegulatoryDomain>>>,
     name: String,
     secured: bool,
+    active_scan: bool,
+    frequency: u16,
 }
 impl Harness {
     fn new(version: u32, dialect: Dialect, secured: bool) -> Self {
-        let mut radio = radio_boot_features(
+        Self::new_scan(version, dialect, secured, false)
+    }
+    fn new_scan(version: u32, dialect: Dialect, secured: bool, active_scan: bool) -> Self {
+        Self::new_on(version, dialect, secured, active_scan, 2412, 0x64)
+    }
+    fn new_on(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+    ) -> Self {
+        let mut radio = radio_boot_country(
             version,
             dialect,
             (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
+            3,
+            factory,
         );
-        assert!(matches!(
-            drive(radio.start(&[2412, 5180])),
-            Poll::Ready(Ok(_))
-        ));
+        radio.htt.wmi.htc.transport.frequency = frequency;
+        if active_scan {
+            let mut fixture = if frequency < 3000 {
+                super::super::active_scan_tests::Fixture::directed(1)
+            } else {
+                super::super::active_scan_tests::Fixture::band_pair(1, frequency)
+            };
+            fixture.extra_ies = super::super::active_scan_tests::PROBE_IES.to_vec();
+            radio.htt.wmi.htc.transport.active = Some(fixture);
+        }
+        let pair = [2412, frequency.max(5180)];
+        let configured: &[u16] = if active_scan && frequency < 3000 {
+            &[2412, 2437, 5180]
+        } else {
+            &pair
+        };
+        assert!(matches!(drive(radio.start(configured)), Poll::Ready(Ok(_))));
         let m = &mut radio.htt.wmi.htc.transport;
-        let mut fixture = Fixture::new(secured);
+        let mut fixture = Fixture::on_channel(
+            secured,
+            if frequency < 3000 {
+                ((frequency - 2407) / 5) as u8
+            } else {
+                ((frequency - 5000) / 5) as u8
+            },
+        );
         fixture.automatic = true;
         m.data = Some(fixture);
         let hardware = if dialect == Dialect::Tlv {
@@ -45,8 +97,12 @@ impl Harness {
             HwRev::Qca988x
         };
         m.ce = Some(crate::ath10k::boot::CeFixture::new(hardware));
-        let name = narf_net::iface::register("wlan%d", OWN, send);
-        let policy = Arc::new(IrqSafeSpinLock::new(Some(station_tests::policy())));
+        let name = String::from(narf_net::iface::reserve_name("wlan%d"));
+        let policy = Arc::new(IrqSafeSpinLock::new(Some(if frequency < 3000 {
+            station_tests::policy()
+        } else {
+            five_ghz_policy()
+        })));
         let current = policy.clone();
         let device = Arc::new(Device::for_test(
             &name,
@@ -54,6 +110,7 @@ impl Harness {
             Arc::new(Mutex::new(radio)),
             move || current.lock().clone(),
         ));
+        narf_net::iface::register_with_context(&name, OWN, device.generation_for_test(), send);
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::set_link_state(&name, true); // operator IFF_UP
         narf_net::iface::set_link_metadata(&name, false, None, None);
@@ -64,14 +121,20 @@ impl Harness {
             policy,
             name,
             secured,
+            active_scan,
+            frequency,
         }
     }
     fn request(&self) -> AssociateRequest {
         AssociateRequest {
             bssid: AP,
             ssid: b"narf".to_vec(),
-            frequency_mhz: 2412,
-            channel: 1,
+            frequency_mhz: u32::from(self.frequency),
+            channel: u32::from(if self.frequency < 3000 {
+                (self.frequency - 2407) / 5
+            } else {
+                (self.frequency - 5000) / 5
+            }),
             security: if self.secured {
                 SecurityConfig::Wpa2 { psk: PMK }
             } else {
@@ -83,18 +146,42 @@ impl Harness {
     fn scan(&self) -> Result<(), &'static str> {
         let Poll::Ready(Ok(bss)) = drive(self.device.scan(ScanRequest {
             ssids: vec![b"narf".to_vec()],
-            frequencies_mhz: vec![2412],
-            channels: vec![1],
-            active: false,
+            frequencies_mhz: if self.active_scan && self.frequency > 3000 {
+                vec![2412, u32::from(self.frequency)]
+            } else if self.active_scan {
+                vec![2412, 2437]
+            } else {
+                vec![u32::from(self.frequency)]
+            },
+            channels: if self.active_scan && self.frequency > 3000 {
+                vec![1, u32::from((self.frequency - 5000) / 5)]
+            } else if self.active_scan {
+                vec![1, 6]
+            } else {
+                vec![u32::from(if self.frequency < 3000 {
+                    (self.frequency - 2407) / 5
+                } else {
+                    (self.frequency - 5000) / 5
+                })]
+            },
+            active: self.active_scan,
             random_mac: None,
             colocated_6ghz: false,
             duration_tu: None,
             duration_mandatory: false,
-            extra_ies: Vec::new(),
+            extra_ies: if self.active_scan {
+                super::super::active_scan_tests::PROBE_IES.to_vec()
+            } else {
+                Vec::new()
+            },
         })) else {
             return Err("retained Device native scan failed");
         };
-        if bss.len() != 1 || bss[0].bssid != AP || bss[0].frequency_mhz != 2412 {
+        if bss.len() != 1
+            || bss[0].bssid != AP
+            || bss[0].frequency_mhz != u32::from(self.frequency)
+            || bss[0].channel != self.request().channel
+        {
             return Err("retained Device scan identity");
         }
         Ok(())
@@ -137,6 +224,15 @@ impl Harness {
                 !i.carrier && i.link_up && i.carrier_up_count == 1 && i.carrier_down_count == 1
             })
     }
+    fn never_opened(&self) -> bool {
+        // A denied/cancelled first association must not publish even a
+        // transient carrier. `closed` instead verifies retirement of an
+        // established carrier, which necessarily has one up/down pair.
+        !self.device.link_up()
+            && narf_net::iface::lookup(&self.name).is_some_and(|i| {
+                !i.carrier && i.link_up && i.carrier_up_count == 0 && i.carrier_down_count == 0
+            })
+    }
     fn received(&self, expected: &[u8]) -> bool {
         let mut rx = self.device.rx_ring().lock();
         let Some(rx) = rx.as_mut() else {
@@ -162,7 +258,644 @@ impl Drop for Harness {
     }
 }
 fn composition(version: u32, dialect: Dialect, secured: bool) -> Result<(), &'static str> {
-    let h = Harness::new(version, dialect, secured);
+    composition_scan(version, dialect, secured, false)
+}
+
+fn smoke_ath10k_recovery_generation_rejects_stale_net_snapshot_and_old_device() -> TestResult {
+    for (version, dialect) in [(1, Dialect::Main), (4, Dialect::Tlv)] {
+        for secured in [false, true] {
+            let old = Harness::new(version, dialect, secured);
+            if let Err(error) = old.join() {
+                return TestResult::Fail(error);
+            }
+            let snapshot = narf_net::iface::lookup(&old.name).unwrap();
+            old.device.retire_host();
+            let new = Harness::new(version, dialect, secured);
+            if let Err(error) = new.join() {
+                return TestResult::Fail(error);
+            }
+            let (uplink, _) = packets();
+            let before = new.model(|model| model.sent.len());
+            if old.name == new.name
+                || old.device.generation_for_test() == new.device.generation_for_test()
+                || snapshot.xmit(&uplink).is_ok()
+                || old
+                    .device
+                    .enqueue(&uplink, narf_net::TxMeta::plain())
+                    .is_ok()
+                || new.model(|model| model.sent.len()) != before
+            {
+                return TestResult::Fail("old interface generation admitted TX into replacement");
+            }
+            // Repeated late old-owner closure must not flap the new carrier.
+            old.device.close_before_lock_for_test();
+            if !new.device.link_up()
+                || !narf_net::iface::lookup(&new.name).unwrap().carrier
+                || narf_net::iface::lookup(&new.name)
+                    .unwrap()
+                    .xmit(&uplink)
+                    .is_err()
+            {
+                return TestResult::Fail("retired owner closed replacement or rejected fresh TX");
+            }
+            new.device.drain();
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_recovery_generation_rejects_stale_net_snapshot_and_old_device
+);
+
+fn retire_model(radio: &Arc<Mutex<radio::Radio<RadioModel>>>) {
+    let mut active = ACTIVE_TEST.lock();
+    let Some(device) = active
+        .as_ref()
+        .filter(|device| Arc::ptr_eq(&device.radio, radio))
+        .cloned()
+    else {
+        return;
+    };
+    *active = None;
+    drop(active);
+    device.retire_host();
+}
+fn smoke_ath10k_recovery_cancelled_mutex_wait_keeps_host_generation_closed() -> TestResult {
+    let h = Harness::new(4, Dialect::Tlv, true);
+    if let Err(error) = h.join() {
+        return TestResult::Fail(error);
+    }
+    let radio = h.device.radio.clone();
+    let held = radio.try_lock().unwrap();
+    let before = held.htt.wmi.htc.transport.sent.len();
+    let quarantine = core::sync::atomic::AtomicBool::new(false);
+    if !drive(crate::ath10k::pci::retire_radio(
+        &radio,
+        &quarantine,
+        || retire_model(&radio),
+    ))
+    .is_pending()
+        || !quarantine.load(core::sync::atomic::Ordering::Acquire)
+        || h.device.link_up()
+        || narf_net::iface::lookup(&h.name).is_some()
+        || held.htt.wmi.htc.transport.sent.len() != before
+        || held
+            .htt
+            .wmi
+            .htc
+            .transport
+            .inner
+            .storage
+            .as_ref()
+            .unwrap()
+            .filled
+            != 1023
+        || held.htt.wmi.htc.transport.inner.inner.retained.is_none()
+    {
+        return TestResult::Fail("cancelled reset wait reopened host or touched/released live DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_recovery_cancelled_mutex_wait_keeps_host_generation_closed
+);
+
+fn smoke_ath10k_recovery_fences_publication_between_first_close_and_radio_lock() -> TestResult {
+    let h = Harness::new(4, Dialect::Tlv, false);
+    if let Err(error) = h.join() {
+        return TestResult::Fail(error);
+    }
+    let radio = h.device.radio.clone();
+    let held = radio.try_lock().unwrap();
+    *ACTIVE_TEST.lock() = None; // Old publication is still behind the Radio lock.
+    let quarantine = core::sync::atomic::AtomicBool::new(false);
+    {
+        let mut future = core::pin::pin!(crate::ath10k::pci::retire_radio(
+            &radio,
+            &quarantine,
+            || retire_model(&radio)
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        if !future.as_mut().poll(&mut cx).is_pending() {
+            return TestResult::Fail("reset did not wait for old publication owner");
+        }
+        *ACTIVE_TEST.lock() = Some(h.device.clone()); // Real old Device becomes visible.
+        drop(held);
+        if !matches!(drive(future.as_mut()), Poll::Ready(_)) {
+            return TestResult::Fail("reset did not acquire released old publication owner");
+        }
+    }
+    let (uplink, _) = packets();
+    if !quarantine.load(core::sync::atomic::Ordering::Acquire)
+        || ACTIVE_TEST.lock().is_some()
+        || h.device.link_up()
+        || narf_net::iface::lookup(&h.name).is_some()
+        || h.device.enqueue(&uplink, narf_net::TxMeta::plain()).is_ok()
+        || radio.try_lock().unwrap().station_link().is_some()
+    {
+        return TestResult::Fail("late old publication escaped second under-lock retirement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_recovery_fences_publication_between_first_close_and_radio_lock
+);
+fn smoke_ath10k_recovery_cancelled_missing_publication_cannot_publish_late() -> TestResult {
+    let h = Harness::new(4, Dialect::Tlv, false);
+    let radio = h.device.radio.clone();
+    let held = radio.try_lock().unwrap();
+    if held.station_publishable().is_err() {
+        return TestResult::Fail("late-publication fixture was not otherwise publishable");
+    }
+    *ACTIVE_TEST.lock() = None;
+    narf_net::iface::unregister(&h.name);
+    let quarantine = core::sync::atomic::AtomicBool::new(false);
+    if !drive(crate::ath10k::pci::retire_radio(
+        &radio,
+        &quarantine,
+        || retire_model(&radio),
+    ))
+    .is_pending()
+    {
+        return TestResult::Fail("late-publication cancellation fixture did not suspend");
+    }
+    // The actual production publication gate runs under ACTIVE, before any
+    // registration writes. The owner remains publishable while its mutex is
+    // held, so only the persistent retirement token may block this transaction.
+    let mut active = ACTIVE_TEST.lock();
+    let result = crate::ath10k::interface::admit_generation(&quarantine, || {
+        narf_net::iface::register_with_context(&h.name, OWN, h.device.generation_for_test(), send);
+        *active = Some(h.device.clone());
+        Ok(())
+    });
+    if result != Err(radio::Error::Failed)
+        || active.is_some()
+        || narf_net::iface::lookup(&h.name).is_some()
+        || held.station_publishable().is_err()
+        || held.htt.wmi.htc.transport.inner.inner.retained.is_none()
+    {
+        return TestResult::Fail(
+            "cancelled reset missed initial ACTIVE and allowed old publication",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/recovery",
+    smoke_ath10k_recovery_cancelled_missing_publication_cannot_publish_late
+);
+
+fn smoke_ath10k_power_save_native_six_dialects_open_wpa2_dhcp_ip() -> TestResult {
+    for (version, dialect) in [
+        (1, Dialect::Main),
+        (2, Dialect::TenOne),
+        (3, Dialect::TenTwo),
+        (4, Dialect::Tlv),
+        (5, Dialect::TenTwoFour),
+        (6, Dialect::TenFour),
+    ] {
+        for secured in [false, true] {
+            if let Err(error) = composition_options(version, dialect, secured, false, true) {
+                return TestResult::Fail(error);
+            }
+        }
+    }
+    TestResult::Pass
+}
+const BAND_DIALECTS: [(u32, Dialect); 6] = [
+    (1, Dialect::Main),
+    (2, Dialect::TenOne),
+    (3, Dialect::TenTwo),
+    (4, Dialect::Tlv),
+    (5, Dialect::TenTwoFour),
+    (6, Dialect::TenFour),
+];
+fn smoke_ath10k_fixed_country_5ghz_native_open_wpa2_dhcp_ip() -> TestResult {
+    for (version, dialect) in BAND_DIALECTS {
+        for frequency in [5180, 5825] {
+            for secured in [false, true] {
+                if let Err(error) =
+                    composition_on(version, dialect, secured, false, true, frequency)
+                {
+                    return TestResult::Fail(error);
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/5ghz",
+    smoke_ath10k_fixed_country_5ghz_native_open_wpa2_dhcp_ip
+);
+fn smoke_ath10k_mixed_band_active_scan_native_limits_and_join() -> TestResult {
+    for (version, dialect) in BAND_DIALECTS {
+        for frequency in [5180, 5825] {
+            for secured in [false, true] {
+                if let Err(error) =
+                    composition_on(version, dialect, secured, true, false, frequency)
+                {
+                    return TestResult::Fail(error);
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/5ghz",
+    smoke_ath10k_mixed_band_active_scan_native_limits_and_join
+);
+fn smoke_ath10k_5ghz_factory_world_and_country_mismatch_never_emit() -> TestResult {
+    for factory in [0x64, 0x8114, 0xffff] {
+        let h = Harness::new_on(4, Dialect::Tlv, true, false, 5180, factory);
+        if let Err(error) = h.scan() {
+            return TestResult::Fail(error);
+        }
+        let before = h.model(|m| m.sent.len());
+        if !matches!(
+            drive(h.device.associate_for_test(h.request(), [0x73; 32])),
+            Poll::Ready(Err(_))
+        ) || !h.never_opened()
+            || h.model(|m| m.sent.len()) != before
+        {
+            return TestResult::Fail("world/country-mismatched factory5GHz acquired native TX");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/5ghz",
+    smoke_ath10k_5ghz_factory_world_and_country_mismatch_never_emit
+);
+fn smoke_ath10k_5ghz_policy_overlap_and_live_restriction_are_terminal() -> TestResult {
+    use narf_wireless::reg::RegFlags;
+    for case in 0..8 {
+        let h = Harness::new_on(4, Dialect::Tlv, false, false, 5180, 0x8348);
+        if let Err(error) = h.scan() {
+            return TestResult::Fail(error);
+        }
+        let before = h.model(|m| m.sent.len());
+        {
+            let mut p = h.policy.lock();
+            let domain = p.as_mut().unwrap();
+            match case {
+                0 => domain.rules[1].flags = RegFlags::NO_IR,
+                1 => domain.rules[1].flags = RegFlags::DFS,
+                2 => domain.rules[1].flags = RegFlags::INDOOR_ONLY,
+                3 => domain.rules[1].max_bandwidth_mhz = 10,
+                4 => domain.rules[1].max_power_dbm = -1,
+                5 => domain.rules[1].freq_start_mhz = 5175,
+                6 => domain.country_code = *b"DE",
+                _ => domain.rules.push(narf_wireless::reg::RegRule {
+                    freq_start_mhz: 5181,
+                    freq_end_mhz: 5184,
+                    max_bandwidth_mhz: 20,
+                    max_power_dbm: 30,
+                    flags: RegFlags::NO_IR,
+                }),
+            }
+        }
+        if !matches!(
+            drive(h.device.associate_for_test(h.request(), [0x73; 32])),
+            Poll::Ready(Err(_))
+        ) || !h.never_opened()
+            || h.model(|m| m.sent.len()) != before
+        {
+            return TestResult::Fail("5GHz restrictive overlapping rule was ignored");
+        }
+    }
+    for clear in [false, true] {
+        let h = Harness::new_on(4, Dialect::Tlv, true, false, 5180, 0x8348);
+        if let Err(error) = h.join() {
+            return TestResult::Fail(error);
+        }
+        if clear {
+            *h.policy.lock() = None;
+        } else {
+            h.policy.lock().as_mut().unwrap().rules[1].max_power_dbm = 26;
+        }
+        let before = h.model(|m| m.sent.len());
+        h.pump();
+        *h.policy.lock() = Some(five_ghz_policy());
+        if !h.closed()
+            || h.model(|m| m.sent.len()) != before
+            || h.device.request_power_save(false) != Err(-19)
+        {
+            return TestResult::Fail("5GHz live restriction or reinstallation reopened host");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/5ghz",
+    smoke_ath10k_5ghz_policy_overlap_and_live_restriction_are_terminal
+);
+fn smoke_ath10k_5ghz_each_native_prepare_cancel_retains_dma() -> TestResult {
+    for phase in 0..4 {
+        let h = Harness::new_on(4, Dialect::Tlv, true, false, 5180, 0x8348);
+        if let Err(error) = h.scan() {
+            return TestResult::Fail(error);
+        }
+        h.model(|m| {
+            let mut station = StationFixture::new();
+            station.stall = Some(phase);
+            m.station = Some(station);
+        });
+        if !drive(h.device.associate_for_test(h.request(), [0x73; 32])).is_pending() {
+            return TestResult::Fail(
+                "5GHz native prepare failed/completed instead of held publication",
+            );
+        }
+        if !h.never_opened() {
+            return TestResult::Fail("5GHz cancelled prepare reopened carrier");
+        }
+        if !h.model(|m| {
+            m.inner.inner.retained.is_some() && m.inner.storage.as_ref().unwrap().filled == 1023
+        }) {
+            return TestResult::Fail("5GHz cancelled native prepare reopened/freed DMA");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/5ghz",
+    smoke_ath10k_5ghz_each_native_prepare_cancel_retains_dma
+);
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_native_six_dialects_open_wpa2_dhcp_ip
+);
+
+fn smoke_ath10k_power_save_each_cancelled_publication_closes_and_retains_dma() -> TestResult {
+    for step in 0..6 {
+        let h = Harness::new(4, Dialect::Tlv, true);
+        if let Err(error) = h.join() {
+            return TestResult::Fail(error);
+        }
+        let hold = Arc::new(core::sync::atomic::AtomicBool::new(true));
+        h.model(|model| {
+            let mut ps = super::super::power_save_tests::Fixture::new(Dialect::Tlv, true);
+            ps.hold = Some((step, hold.clone()));
+            model.ps = Some(ps);
+        });
+        h.device.request_power_save(true).unwrap();
+        if !drive(h.device.apply_power_save()).is_pending()
+            || !h.closed()
+            || h.device.request_power_save(false) != Err(-19)
+            || !h.model(|model| {
+                model.inner.storage.as_ref().unwrap().filled == 1023
+                    && model.inner.inner.retained.is_some()
+            })
+        {
+            return TestResult::Fail(
+                "cancelled PS control reopened host or released uncertain DMA",
+            );
+        }
+        let before = h.model(|model| model.sent.len());
+        hold.store(false, core::sync::atomic::Ordering::Release);
+        h.pump();
+        if !h.closed() || h.model(|model| model.sent.len()) != before {
+            return TestResult::Fail("late PS send reopened cancelled owner");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_each_cancelled_publication_closes_and_retains_dma
+);
+
+fn smoke_ath10k_power_save_policy_clear_and_native_failure_are_terminal() -> TestResult {
+    for failure in [false, true] {
+        for step in 0..6 {
+            let h = Harness::new(4, Dialect::Tlv, false);
+            if let Err(error) = h.join() {
+                return TestResult::Fail(error);
+            }
+            h.model(|model| {
+                let mut ps = super::super::power_save_tests::Fixture::new(Dialect::Tlv, true);
+                if failure {
+                    ps.fail = Some(step);
+                } else {
+                    ps.change = Some((step, h.policy.clone()));
+                }
+                model.ps = Some(ps);
+            });
+            h.device.request_power_save(true).unwrap();
+            if !matches!(drive(h.device.apply_power_save()), Poll::Ready(Err(_))) || !h.closed() {
+                return TestResult::Fail("PS ignored policy loss or failed native publication");
+            }
+            *h.policy.lock() = Some(station_tests::policy());
+            if h.device.request_power_save(false) != Err(-19)
+                || !h.model(|model| {
+                    model.inner.inner.retained.is_some()
+                        && model.inner.storage.as_ref().unwrap().filled == 1023
+                })
+            {
+                return TestResult::Fail("restored policy reopened failed PS grant or freed DMA");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_policy_clear_and_native_failure_are_terminal
+);
+
+fn smoke_ath10k_power_save_latest_preference_survives_inflight_completion() -> TestResult {
+    let h = Harness::new(4, Dialect::Tlv, false);
+    if let Err(error) = h.join() {
+        return TestResult::Fail(error);
+    }
+    let hold = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    h.model(|model| {
+        let mut ps = super::super::power_save_tests::Fixture::new(Dialect::Tlv, true);
+        ps.queue(Dialect::Tlv, false);
+        ps.hold = Some((5, hold.clone()));
+        model.ps = Some(ps);
+    });
+    h.device.request_power_save(true).unwrap();
+    {
+        let mut applying = core::pin::pin!(h.device.apply_power_save());
+        if !drive(applying.as_mut()).is_pending() {
+            return TestResult::Fail("PS coalescing fixture did not wait");
+        }
+        h.device.request_power_save(false).unwrap();
+        hold.store(false, core::sync::atomic::Ordering::Release);
+        if !matches!(drive(applying.as_mut()), Poll::Ready(Ok(()))) {
+            return TestResult::Fail("PS enable did not finish native receipt");
+        }
+    }
+    if !matches!(drive(h.device.apply_power_save()), Poll::Ready(Ok(())))
+        || !h.model(|model| {
+            model
+                .ps
+                .as_ref()
+                .is_some_and(|ps| ps.mode == Some(false) && ps.expected.is_empty() && ps.seen == 7)
+        })
+        || !h.device.link_up()
+    {
+        return TestResult::Fail("old PS completion overwrote newer disable preference");
+    }
+    let before = h.model(|model| model.sent.len());
+    if !matches!(drive(h.device.apply_power_save()), Poll::Ready(Ok(())))
+        || h.model(|model| model.sent.len()) != before
+    {
+        return TestResult::Fail("coalesced PS preference replayed a command");
+    }
+    *h.policy.lock() = None;
+    if !matches!(drive(h.device.apply_power_save()), Poll::Ready(Err(_))) || !h.closed() {
+        return TestResult::Fail("coalesced PS no-op bypassed current policy closure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_latest_preference_survives_inflight_completion
+);
+
+fn smoke_ath10k_power_save_no_ps_firmware_rejects_before_publication() -> TestResult {
+    let mut radio = radio_boot_features(4, Dialect::Tlv, (1 << 10) | (1 << 17));
+    if !matches!(drive(radio.start(&[2412, 5180])), Poll::Ready(Ok(_)))
+        || radio.power_save_supported()
+    {
+        return TestResult::Fail("NO_PS firmware capability was misclassified");
+    }
+    let before = radio.htt.wmi.htc.transport.sent.len();
+    let owner = Arc::new(Mutex::new(radio));
+    let device = Device::for_test("narf-test-no-ps", OWN, owner.clone(), || {
+        Some(station_tests::policy())
+    });
+    if device.request_power_save(true) != Err(-95)
+        || device.request_power_save(false) != Err(-95)
+        || owner.try_lock().unwrap().htt.wmi.htc.transport.sent.len() != before
+    {
+        return TestResult::Fail(
+            "NO_PS setter changed native state or advertised unsupported control",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_no_ps_firmware_rejects_before_publication
+);
+
+fn smoke_ath10k_power_save_host_close_during_send_cannot_reopen() -> TestResult {
+    let h = Harness::new(4, Dialect::Tlv, false);
+    if let Err(error) = h.join() {
+        return TestResult::Fail(error);
+    }
+    let hold = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    h.model(|model| {
+        let mut ps = super::super::power_save_tests::Fixture::new(Dialect::Tlv, true);
+        ps.hold = Some((5, hold.clone()));
+        model.ps = Some(ps);
+    });
+    h.device.request_power_save(true).unwrap();
+    {
+        let mut applying = core::pin::pin!(h.device.apply_power_save());
+        if !drive(applying.as_mut()).is_pending() {
+            return TestResult::Fail("close/PS fixture never held native send");
+        }
+        h.device.close_before_lock_for_test();
+        hold.store(false, core::sync::atomic::Ordering::Release);
+        if !matches!(drive(applying.as_mut()), Poll::Ready(Err(_))) {
+            return TestResult::Fail("PS ignored concurrent host close");
+        }
+    }
+    if !h.closed()
+        || !h.model(|model| {
+            model.inner.storage.as_ref().unwrap().filled == 1023
+                && model.inner.inner.retained.is_some()
+        })
+    {
+        return TestResult::Fail("late PS completion reopened carrier or released firmware DMA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/power-save",
+    smoke_ath10k_power_save_host_close_during_send_cannot_reopen
+);
+
+fn composition_scan(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    active_scan: bool,
+) -> Result<(), &'static str> {
+    composition_options(version, dialect, secured, active_scan, false)
+}
+fn composition_options(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    active_scan: bool,
+    power_save: bool,
+) -> Result<(), &'static str> {
+    composition_on(version, dialect, secured, active_scan, power_save, 2412)
+}
+fn composition_on(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    active_scan: bool,
+    power_save: bool,
+    frequency: u16,
+) -> Result<(), &'static str> {
+    composition_profile(
+        version,
+        dialect,
+        secured,
+        active_scan,
+        power_save,
+        frequency,
+        false,
+    )
+}
+fn composition_profile(
+    version: u32,
+    dialect: Dialect,
+    secured: bool,
+    active_scan: bool,
+    power_save: bool,
+    frequency: u16,
+    qos: bool,
+) -> Result<(), &'static str> {
+    let h = Harness::new_on(
+        version,
+        dialect,
+        secured,
+        active_scan,
+        frequency,
+        if frequency < 3000 { 0x64 } else { 0x8348 },
+    );
+    if qos {
+        h.model(|model| {
+            let f = model.data.as_mut().unwrap();
+            f.wmm_offer = Some(WMM_PARAMETERS.to_vec());
+            f.wmm_response = Some(WMM_PARAMETERS.to_vec());
+        });
+    }
+    if power_save {
+        h.model(|model| {
+            model.ps = Some(super::super::power_save_tests::Fixture::new(dialect, true))
+        });
+        h.device
+            .request_power_save(true)
+            .map_err(|_| "PS preference rejected")?;
+        if !matches!(drive(h.device.apply_power_save()), Poll::Ready(Ok(())))
+            || h.model(|model| model.ps.as_ref().unwrap().seen) != 0
+        {
+            return Err("PS preference emitted before association");
+        }
+    }
     let (uplink, downlink) = packets();
     if narf_net::dhcp::acquire(&h.name, 0).is_ok()
         || h.device.enqueue(&uplink, narf_net::TxMeta::plain()).is_ok()
@@ -170,6 +903,41 @@ fn composition(version: u32, dialect: Dialect, secured: bool) -> Result<(), &'st
         return Err("DHCP/data escaped preauthorization carrier");
     }
     h.join()?;
+    if !power_save && !h.model(|model| model.ps_default_off) {
+        return Err("awake default was not submitted before carrier");
+    }
+    if power_save
+        && !h.model(|model| {
+            model
+                .ps
+                .as_ref()
+                .is_some_and(|ps| ps.seen == 6 && ps.expected.is_empty() && ps.mode == Some(true))
+        })
+    {
+        return Err("power-save initialization did not precede carrier");
+    }
+    if active_scan {
+        let sent = h.model(|m| m.sent.len());
+        let request = ScanRequest {
+            ssids: vec![b"narf".to_vec()],
+            frequencies_mhz: vec![2412],
+            channels: vec![1],
+            active: true,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: None,
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
+        };
+        if !matches!(
+            drive(h.device.scan(request)),
+            Poll::Ready(Err(WirelessError::Busy))
+        ) || !h.device.link_up()
+            || h.model(|m| m.sent.len()) != sent
+        {
+            return Err("associated active scan failed to preserve exclusive peer and carrier");
+        }
+    }
     let lease = narf_net::dhcp::dhcp_acquire(&h.name, 0)
         .map_err(|_| "actual kernel DHCP through CE/HTT failed")?;
     if !network().matches_lease(&lease)
@@ -185,6 +953,14 @@ fn composition(version: u32, dialect: Dialect, secured: bool) -> Result<(), &'st
     h.pump();
     if !h.model(|m| m.data.as_ref().unwrap().uplink.contains(&uplink)) {
         return Err("native HTT/AP IP uplink changed");
+    }
+    if qos
+        && !h.model(|m| {
+            let f = m.data.as_ref().unwrap();
+            f.wmm_sent == 1 && f.qos_frames >= 3
+        })
+    {
+        return Err("native response-bound WMM or QoS DHCP/DATA did not execute");
     }
     let before = narf_net::iface::lookup(&h.name).unwrap().stats.rx_packets;
     h.model(|m| {
@@ -238,6 +1014,27 @@ fn smoke_ath10k_native_device_open_wpa2_dhcp_and_bidirectional_ip() -> TestResul
 kernel_test_in!(
     "drivers/wireless/ath10k/station",
     smoke_ath10k_native_device_open_wpa2_dhcp_and_bidirectional_ip
+);
+fn smoke_ath10k_active_probe_cache_native_open_wpa2_dhcp_ip_and_teardown() -> TestResult {
+    for (version, dialect) in [
+        (1, Dialect::Main),
+        (2, Dialect::TenOne),
+        (3, Dialect::TenTwo),
+        (4, Dialect::Tlv),
+        (5, Dialect::TenTwoFour),
+        (6, Dialect::TenFour),
+    ] {
+        for secured in [false, true] {
+            if let Err(error) = composition_scan(version, dialect, secured, true) {
+                return TestResult::Fail(error);
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/active-scan",
+    smoke_ath10k_active_probe_cache_native_open_wpa2_dhcp_ip_and_teardown
 );
 fn occupancy(htt_first: bool) -> Result<(), &'static str> {
     let h = Harness::new(4, Dialect::Tlv, true);
@@ -633,15 +1430,14 @@ kernel_test_in!(
     smoke_ath10k_current_policy_restriction_fences_native_station_publication
 );
 
-fn smoke_ath10k_station_publish_admission_stages_missing_regulatory_only_for_raw_radio() -> TestResult {
+fn smoke_ath10k_station_publish_admission_stages_missing_regulatory_only_for_raw_radio(
+) -> TestResult {
     use crate::ath10k::interface::{classify_domain_admission, Admission};
     use narf_firmware::FirmwareError;
     use narf_wireless::reg::policy::Error as RegPolicyError;
 
-    if classify_domain_admission(
-        Err(RegPolicyError::Firmware(FirmwareError::NotFound)),
-        true,
-    ) != Ok(Admission::PendingAssets)
+    if classify_domain_admission(Err(RegPolicyError::Firmware(FirmwareError::NotFound)), true)
+        != Ok(Admission::PendingAssets)
         || classify_domain_admission(Err(RegPolicyError::Authority), false)
             != Ok(Admission::PendingAssets)
         || classify_domain_admission(Err(RegPolicyError::Authority), true)
@@ -650,10 +1446,11 @@ fn smoke_ath10k_station_publish_admission_stages_missing_regulatory_only_for_raw
             != Err(crate::ath10k::wmi_runtime::Error::Unsupported)
         || classify_domain_admission(Err(RegPolicyError::Format("bad")), true)
             != Err(crate::ath10k::wmi_runtime::Error::Unsupported)
-        || classify_domain_admission(Ok(station_tests::policy()), true)
-            != Ok(Admission::Ready)
+        || classify_domain_admission(Ok(station_tests::policy()), true) != Ok(Admission::Ready)
     {
-        return TestResult::Fail("ath10k regulatory staging classification mishandled error states");
+        return TestResult::Fail(
+            "ath10k regulatory staging classification mishandled error states",
+        );
     }
 
     let mut non_raw = radio_boot_features(4, Dialect::Tlv, 1 << 2);

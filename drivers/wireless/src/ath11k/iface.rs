@@ -1321,6 +1321,13 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                     error.report("asynchronous BSS channel survey");
                 }
             }
+            if self.shared.take_tx_power_request() {
+                if let Some(pdev_id) = m.tx_power_query_pdev() {
+                    // Read-only telemetry: a send failure leaves the normal
+                    // bss_conf fallback available to the synchronous caller.
+                    let _ = self.shared.refresh_tx_power(pdev_id).await;
+                }
+            }
             let loss = m.poll().await;
             let gtk_rekey = m.take_gtk_rekey_notify();
             let cqm_pktloss = m.take_cqm_pktloss();
@@ -1962,7 +1969,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
     /// station is rebuilt in place, including its firmware keys, while an
     /// incomplete in-kernel handshake uses its established reconnect path.
     /// `true` when the device came back.
-    async fn recover_one(&self, notice: FwNotice, complete_reconfig: bool) -> bool {
+    pub(super) async fn recover_one(&self, notice: FwNotice, complete_reconfig: bool) -> bool {
         use core::fmt::Write as _;
         self.stats.recoveries.fetch_add(1, Ordering::Relaxed);
         let _ = writeln!(
@@ -2150,7 +2157,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
     /// reconstruction has completed. The caller has reset the shared pdev
     /// start refcount, so each previously-open vif reclaims it through
     /// [`Self::do_open`] without replaying pdev setup for siblings.
-    async fn rebuild_after_radio_recovery(
+    pub(super) async fn rebuild_after_radio_recovery(
         &self,
         mut caps: DeviceCaps,
         reg_info: Option<Box<super::wmi::RegInfo>>,
@@ -3426,7 +3433,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
     }
 
     fn tx_power_dbm(&self) -> Option<i32> {
-        self.mac.try_lock()?.tx_power_dbm()
+        self.shared.request_tx_power();
+        self.shared
+            .firmware_tx_power_dbm()
+            .or_else(|| self.mac.try_lock()?.tx_power_dbm())
     }
 
     fn survey_info(&self) -> Vec<SurveyInfo> {

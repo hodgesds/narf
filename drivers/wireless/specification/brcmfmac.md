@@ -239,6 +239,73 @@ operator-UP interface; a later physical carrier sample cannot undo operator DOWN
 
 ### Dual-band 20 MHz station profile
 
+The common station also admits firmware-owned required PMF with WPA2-PSK/CCMP
+when native `mfp` capability probing succeeds. The driver validates AP/SME
+MFPC/MFPR and BIP-CMAC-128, emits a canonical required-PMF RSNE, configures/readbacks
+`mfp=2` after WSEC, and still requires correlated SET_SSID/FWSUP_COMPLETED.
+Before opening the port it queries actual firmware MFP mode, current BSSID and
+bounded `assoc_info`/`assoc_req_ies`; the transmitted RSNE must match the required
+profile, followed by another actual event/data idle fence. Every native GET/SET
+retains current policy checks across polls and receipts. Missing capability,
+unsupported management cipher, malformed/downgraded receipt, wrong peer, absent
+policy or cancellation cannot open the port or revive a failed owner. Legacy
+Open/WPA2 remains reachable when MFP is unsupported. This does not enable SAE.
+The common Device advertises AES-CMAC/BIP only from actual MFP plus supplicant
+capability, so userspace can select required-PMF APs without inventing support.
+It separately exposes default-closed `supports_wpa2_mfp_offload()` from those
+native probes. Shared nl80211 PMK CONNECT requires it plus `USE_MFP=1` and a
+strict MFPC|MFPR PSK/CCMP RSNE with explicit/default BIP-CMAC-128. Unsupported
+caller security promises such as OCV are rejected before native join writes;
+OPTIONAL remains unsupported.
+
+IGTK installation, BIP replay/integrity and protected robust-management/SA Query
+processing remain inside the firmware offload. The host manufactures no IGTK,
+key receipt or protected-event flag. Its protected-peer metadata requires the
+verified firmware configuration, actual association request and completed key
+event; link/deauth events remain the firmware's management-authentication
+decisions. Physical PMF acceptance remains external. See `cyw43439.md` §3 for
+the complete shared contract. Five native msgbuf smokes under
+`drivers/wireless/brcmfmac/pmf` cover both shared5/6 and both firmware key-event
+orders through DHCP/exact IP, native mode/cipher ordering, capability/receipt/
+peer denials, teardown and cancelled verification with all posted DMA retained.
+Raw CONNECT attributes additionally exercise the real shared parser/execution
+path through shared5/6 native MFP/association verification and port publication;
+missing native MFP capability is rejected without a device command.
+
+### Firmware-qualified HT20/HT40 and short GI admission
+
+The common Station now uses actual native `nmode`/`rxchain` and the two
+native per-band `bw_cap` plus exact `chanspecs` inventory before constraining
+the firmware to20MHz for `WLC_UP`. Source HT capability bodies remain distinct
+on the real2.4/5GHz bands; HT40/SGI40 require native width and inventory support,
+and no chain/bandwidth/6GHz/VHT profile is guessed from an alias. AP HT/WMM/basic-MCS admission and
+current BSSID/chanspec/actual association request+response IE verification
+precede the port, followed by another real completion-ring idle drain. Firmware
+owns BA/reorder and Ethernet deaggregation. Required PMF composes with the PHY
+verification; cancellation keeps the native control/DMA owner terminal.
+See `cyw43439.md` §3 for the exact shared profile and remaining feature inventory.
+For HT40 the complete occupied span supplies a retained power/policy grant,
+and both constituent channels must return valid native `per_chan_info` without
+unsupported restrictions. Power precedes the selected band's `bw_cap=3`
+set/readback and exact40MHz join chanspec. Current BSSID/chanspec and actual
+request/response HT width/secondary/MCS/WMM receipts precede port publication.
+Pre-join20MHz fallback preserves constrained HT20 when native/AP/policy facts
+do not qualify40; post-submission width or peer mismatches terminate the owner.
+Control futures and queued data recheck the full occupied grant, including
+secondary-only restriction/power changes and source clear. No host flag alone
+authorizes wider firmware operation or short GI negotiation.
+
+Three `drivers/wireless/brcmfmac/ht20` smokes exercise source capability literals,
+both shared5/6 versions, both bands, actual three-chain HT RX masks, and
+Open/WPA2/required-PMF DHCP/exact bidirectional IP. They reject invalid chains,
+wider/current-peer/HT/MCS/WMM receipts and preserve posted DMA through cancelled
+verification. This does not establish physical firmware/PHY interoperability.
+Five `drivers/wireless/brcmfmac/ht40` native smokes add shared5/6, both bands,
+exact cap/chanspec/association ordering, Open/WPA2/required-PMF DHCP/exact IP,
+capability/inventory/policy fallback and secondary-power reduction, native
+restriction/width/request/response denials, current secondary revocation across
+data and held native waits, and cancellation with posted DMA retained.
+
 The exact BCM43602 `Fullmac::BAND_5GHZ` profile admits firmware-reported valid
 channels from Linux's 2.4/5 GHz tables, intersected with the retained host-policy
 snapshot. It first sets and reads back `bw_cap=20 MHz` on both firmware bands
@@ -247,7 +314,7 @@ failed or wider readback prevents interface/station publication. CYW43439's
 SDIO profile leaves this capability false and never gains 5 GHz from an
 unexpected valid-channel reply.
 
-Scan and join use the correct D11AC band bits and 20 MHz channel encodings.
+Scan uses20MHz D11AC encodings; join uses its fully qualified20/40MHz encoding.
 Wider AP BSS records decode their primary from center/sideband and require any
 reported ctl_ch to agree; 6 GHz/4.9 GHz numeric aliases, malformed widths and
 band mismatches fail. The facade splits genuine allowed channels into separate
@@ -329,7 +396,7 @@ step; Open/WPA2 DHCP/IP conversations run while PS is enabled. This implements
 firmware station PS only; host-bus PM, suspend/WoW and reset replay remain open.
 
 Additional software outside that retained profile remains: nonzero descriptor
-prefixes/shared 7, other CPU/RAM/chip/OTP selectors, wider operating widths/PHY, native802.11
+prefixes/shared 7, other CPU/RAM/chip/OTP selectors, PHY beyond qualified HT40, native802.11
 RX/metadata, larger flow budgets, host-supplicant fallback, WPA3/AP, replayed
 recovery/system PM, confirmed stop/IOMMU quiescence and DMA reclamation, and IRQ delivery.
 These do not expand the initial polling/retained-failure acceptance claim.

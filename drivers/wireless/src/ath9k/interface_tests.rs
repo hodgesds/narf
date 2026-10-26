@@ -30,6 +30,9 @@ struct Harness {
 }
 impl Harness {
     fn new(protected: bool) -> Self {
+        Self::new_rates(protected, None)
+    }
+    fn new_rates(protected: bool, rates: Option<&[u8]>) -> Self {
         assert!(ACTIVE_TEST.lock().is_none());
         let tests::Fixture {
             radio,
@@ -37,7 +40,7 @@ impl Harness {
             peer,
             env,
             plan,
-        } = tests::fixture(protected).unwrap();
+        } = tests::fixture_rates(protected, rates).unwrap();
         let radio: Arc<Mutex<TestRadio>> = Arc::new(Mutex::new(radio));
         let name = narf_net::iface::reserve_name("ar9-native%d");
         let device = Arc::new(Device::new(name, radio).unwrap());
@@ -71,11 +74,14 @@ impl Harness {
         }
     }
     fn scan(&self) {
+        self.scan_mode(false);
+    }
+    fn scan_mode(&self, active: bool) {
         let result = tests::complete(self.device.scan(ScanRequest {
             ssids: vec![SSID.to_vec()],
             frequencies_mhz: vec![2412],
             channels: vec![1],
-            active: false,
+            active,
             random_mac: None,
             colocated_6ghz: false,
             duration_tu: Some(1),
@@ -88,7 +94,10 @@ impl Harness {
         assert_eq!(result[0].ssid, SSID);
     }
     fn join(&self) {
-        self.scan();
+        self.join_mode(false);
+    }
+    fn join_mode(&self, active: bool) {
+        self.scan_mode(active);
         tests::complete(self.device.associate(self.request())).unwrap();
         assert!(self.device.link_up());
         assert_eq!(self.device.connected_bssid(), Some(AP));
@@ -133,11 +142,61 @@ impl Drop for Harness {
     }
 }
 fn composition(protected: bool) -> TestResult {
-    let h = Harness::new(protected);
+    composition_mode(protected, false)
+}
+fn smoke_ar9285_legacy_rate_profiles_native_open_wpa2_kernel_dhcp_ip() -> TestResult {
+    for profile in [
+        &[0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108][..],
+        &[0x8c, 24, 48, 108][..],
+        &[0x82, 4, 11, 22][..],
+    ] {
+        for protected in [false, true] {
+            if let failure @ TestResult::Fail(_) =
+                composition_rates(protected, false, Some(profile))
+            {
+                return failure;
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/rates",
+    smoke_ar9285_legacy_rate_profiles_native_open_wpa2_kernel_dhcp_ip
+);
+fn composition_mode(protected: bool, active: bool) -> TestResult {
+    composition_rates(protected, active, None)
+}
+fn composition_rates(protected: bool, active: bool, rates: Option<&[u8]>) -> TestResult {
+    let h = Harness::new_rates(protected, rates);
     if !h.closed() || narf_net::dhcp::acquire(h.device.name(), 100).is_ok() {
         return TestResult::Fail("AR9285 DHCP passed before real native association");
     }
-    h.join();
+    h.join_mode(active);
+    if active {
+        let sent = h.model.transmitted.borrow().len();
+        let request = ScanRequest {
+            ssids: vec![SSID.to_vec()],
+            frequencies_mhz: vec![2412],
+            channels: vec![1],
+            active: true,
+            random_mac: None,
+            colocated_6ghz: false,
+            duration_tu: Some(20),
+            duration_mandatory: false,
+            extra_ies: Vec::new(),
+        };
+        if !matches!(
+            tests::complete(h.device.scan(request)),
+            Err(WirelessError::Busy)
+        ) || h.model.transmitted.borrow().len() != sent
+            || !h.device.link_up()
+        {
+            return TestResult::Fail(
+                "associated AR9285 active scan changed carrier or native owner",
+            );
+        }
+    }
     let lease = match narf_net::dhcp::dhcp_acquire(h.device.name(), 0) {
         Ok(lease) => lease,
         Err(_) => return TestResult::Fail("AR9285 actual kernel DHCP failed"),
@@ -500,6 +559,19 @@ fn smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons() -> TestR
 kernel_test_in!(
     "drivers/wireless/ath9k/device",
     smoke_ar9285_native_rekey_missing_m3_expires_despite_fresh_beacons
+);
+
+fn smoke_ar9285_active_probe_native_open_wpa2_dhcp_and_bidirectional_ip() -> TestResult {
+    for protected in [false, true] {
+        if let TestResult::Fail(error) = composition_mode(protected, true) {
+            return TestResult::Fail(error);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/active-scan",
+    smoke_ar9285_active_probe_native_open_wpa2_dhcp_and_bidirectional_ip
 );
 
 fn smoke_ar9285_drive_scheduled_retries_policy_and_stops_on_terminal_error() -> TestResult {

@@ -19,6 +19,18 @@ pub enum Phase {
     ManagementQueuePrepared,
     PreparingTransmitPower,
     TransmitPowerPrepared,
+    ActivatingLink,
+    LinkActive,
+    Authenticating,
+    Associating,
+    Associated,
+    PreparingData,
+    DataPrepared,
+    TransmittingData,
+    SecuringData,
+    ClosingData,
+    ClearingAssociation,
+    DeactivatingLink,
     RemovingManagementQueue,
     RemovingPeer,
     Failed,
@@ -36,6 +48,7 @@ pub struct Owner {
     peer: Option<peer::ApPeer>,
     management_queue: Option<queue::ManagementQueue>,
     power: power::Context,
+    security: rsna::Context,
 }
 impl core::fmt::Debug for Owner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -88,6 +101,7 @@ impl Owner {
             peer: None,
             management_queue: None,
             power: power::Context::new(&parsed.api),
+            security: rsna::Context::new(&parsed.api),
         })
     }
     pub fn phase(&self) -> Phase {
@@ -194,3 +208,24 @@ mod queue;
 mod power;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
+
+#[path = "mvm_link.rs"]
+mod link;
+pub type ActiveLinkStatus = link::ActiveLinkStatus;
+
+#[path = "mvm_auth.rs"]
+mod auth;
+pub type AuthenticationStatus = auth::AuthenticationStatus;
+
+#[path = "mvm_assoc.rs"]
+mod assoc;
+pub type AssociationStatus = assoc::AssociationStatus;
+pub type AssociationSecurity = narf_wireless::association::SecurityMode;
+
+#[path = "mvm_data.rs"]
+mod data;
+pub type LegacyDataStatus = data::LegacyDataStatus;
+pub type LegacyReceive = data::LegacyReceive;
+
+#[path = "mvm_security.rs"]
+mod rsna;

@@ -89,6 +89,8 @@ pub struct Device<R: Fullmac> {
     mac: [u8; 6],
     channels: Vec<u32>,
     supplicant: bool,
+    mfp_supported: bool,
+    ht_capabilities: [Option<[u8; 26]>; 2],
     up: AtomicBool,
     // Requested PS policy: 0=awake, 1=PM_FAST, 2=terminal failure. The
     // retained worker serializes firmware commands with scan/join/packets.
@@ -163,6 +165,8 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         mac: station.mac,
         channels: station.channels.iter().map(|&ch| u32::from(ch)).collect(),
         supplicant: station.supplicant,
+        mfp_supported: station.supports_management_protection(),
+        ht_capabilities: station.ht_capabilities(),
         state: Mutex::new(State {
             station,
             rx: rx_producer,
@@ -369,6 +373,31 @@ impl<R: Fullmac + 'static> Interface for Device<R> {
 }
 #[async_trait::async_trait]
 impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
+    fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+        if !self
+            .channels
+            .iter()
+            .any(|channel| band == 2400 && *channel <= 14 || band == 5000 && *channel > 14)
+        {
+            return None;
+        }
+        Some(narf_wireless::iface::PhyCapabilities {
+            ht: self.ht_capabilities[usize::from(band == 5000)]?,
+            vht: None,
+        })
+    }
+    fn cipher_suites(&self) -> &'static [u32] {
+        if self.mfp_supported {
+            &[
+                narf_wireless::CIPHER_SUITE_CCMP,
+                narf_wireless::CIPHER_SUITE_AES_CMAC,
+            ]
+        } else if self.supplicant {
+            &[narf_wireless::CIPHER_SUITE_CCMP]
+        } else {
+            &[]
+        }
+    }
     fn power_save_default(&self) -> Option<bool> {
         Some(false)
     }
@@ -391,6 +420,9 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
 
     fn supports_handshake_offload(&self) -> bool {
         self.supplicant
+    }
+    fn supports_wpa2_mfp_offload(&self) -> bool {
+        self.mfp_supported
     }
     fn reports_disconnect_events(&self) -> bool {
         true
@@ -428,7 +460,7 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
             bands,
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: false,
+                ht_supported: self.ht_capabilities.iter().any(Option::is_some),
                 vht_supported: false,
                 he_supported: false,
                 eht_supported: false,

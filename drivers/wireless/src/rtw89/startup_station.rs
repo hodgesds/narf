@@ -48,6 +48,30 @@ unsafe impl Io for Startup {
         self.station_allowed()?;
         Ok(self.identity.ok_or(power::Error::Terminal)?.mac())
     }
+    fn station_wmm_allowed(&mut self) -> Result<bool, power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_wmm_allowed()
+    }
+    async fn station_configure_wmm(
+        &mut self,
+        p: narf_wireless::wmm::Parameters,
+        short: bool,
+        admission: &control::Admission,
+    ) -> Result<(), power::Error> {
+        if !self.station_wmm_allowed()? {
+            return Err(power::Error::Unsupported);
+        }
+        let native = self
+            .firmware
+            .as_mut()
+            .ok_or(power::Error::Terminal)?
+            .transport_mut();
+        self.station_controller
+            .as_mut()
+            .ok_or(power::Error::Terminal)?
+            .configure_wmm(&mut native.station_access(), p, short, admission)
+            .await
+    }
     async fn station_prepare_initial(
         &mut self,
         own: [u8; 6],
@@ -164,6 +188,15 @@ unsafe impl Io for Startup {
     }
     fn packet_submit(&mut self, bytes: &[u8], report: bool) -> Result<u64, packet::Error> {
         self.station_native()?.submit_packet(bytes, report)
+    }
+    fn packet_submit_rate(
+        &mut self,
+        bytes: &[u8],
+        report: bool,
+        rate: u8,
+    ) -> Result<u64, packet::Error> {
+        self.station_native()?
+            .submit_packet_rate(bytes, report, rate)
     }
     fn packet_poll(&mut self) -> Result<packet::Step, packet::Error> {
         self.station_native()?.poll_packets()

@@ -634,6 +634,15 @@ pub(super) struct NativeEnvironment {
     admission: Arc<station::Admission>,
     firmware: Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>>,
 }
+/// Live station work consumes only the current installation. The explicit
+/// native preparation boundary owns signed-policy bootstrap.
+pub(super) fn installed_domain(
+    snapshot: Option<Arc<narf_wireless::reg::RegulatoryDomain>>,
+) -> Result<narf_wireless::reg::RegulatoryDomain, Error> {
+    snapshot
+        .map(|domain| domain.as_ref().clone())
+        .ok_or(Error::Profile)
+}
 impl NativeEnvironment {
     pub(super) fn new(
         firmware: Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>>,
@@ -658,7 +667,7 @@ impl Environment for NativeEnvironment {
             .map(|()| bytes)
     }
     fn domain(&self) -> Result<narf_wireless::reg::RegulatoryDomain, Error> {
-        narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Profile)
+        installed_domain(narf_wireless::reg::db::snapshot())
     }
     async fn pause(&self) {
         narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;

@@ -14,11 +14,17 @@ mod wire;
 pub use management::{
     Completion as ManagementCompletion, Receipt as ManagementReceipt, Token as ManagementToken,
 };
+mod active_scan;
+pub(in crate::ath10k) use active_scan::checked as checked_policy;
 mod data;
 mod mlme;
+mod power_save;
+mod wmm;
 pub use data::Link as StationLink;
 pub use mlme::Associated as StationAssociated;
 pub use station::Disconnected as StationDisconnected;
+pub(in crate::ath10k) use wire::validate_probe_ies;
+pub(crate) use wire::{MAX_SCAN_IE_LEN, MAX_SCAN_SSIDS};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Htt(htt::Error),
@@ -88,8 +94,12 @@ pub(super) struct Radio<T> {
     sequence: u16,
     pending: VecDeque<htt::Event>,
     failed: bool,
+    power_save: Option<bool>,
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    pub(in crate::ath10k) fn configured_channels(&self) -> &[u16] {
+        &self.channels
+    }
     pub fn information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
         self.scan_cache
             .iter()
@@ -110,6 +120,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             sequence: 0,
             pending: VecDeque::new(),
             failed: false,
+            power_save: None,
         }
     }
     /// No country policy is inferred here: these are receive-only IEEE
@@ -175,6 +186,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// Scan IDs never wrap within this firmware owner's lifetime. A timeout,
     /// failed scan or dropped future leaves the owner closed until reset.
     pub async fn passive_scan(&mut self, channels: &[u16]) -> Result<ScanReport, Error> {
+        self.scan_run(channels, (&[], &[]), &[], None, || Ok(()))
+            .await
+    }
+    async fn scan_run(
+        &mut self,
+        channels: &[u16],
+        probes: (&[Vec<u8>], &[u8]),
+        setup: &[Vec<u8>],
+        restore: Option<&[u8]>,
+        validate: impl Fn() -> Result<(), Error>,
+    ) -> Result<ScanReport, Error> {
         if self.failed || self.ready.is_none() || self.peer.is_some() {
             return Err(Error::Failed);
         }
@@ -187,7 +209,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .checked_add(1)
             .filter(|n| *n <= 4095)
             .ok_or(Error::Exhausted)?;
-        let command = self.wire.scan(sequence, channels)?;
+        let (ssids, extra_ies) = probes;
+        let command = if ssids.is_empty() {
+            self.wire.scan(sequence, channels)?
+        } else {
+            self.wire
+                .active_scan(sequence, channels, ssids, extra_ies)?
+        };
         let mut report = ScanReport {
             bss: Vec::new(),
             received: 0,
@@ -200,18 +228,38 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .map_err(|_| Error::NoMemory)?;
         self.sequence = sequence;
         self.failed = true;
-        self.htt
-            .wmi
-            .htc
-            .send_wmi(&command)
-            .await
-            .map_err(htt::Error::from)?;
+        for packet in setup
+            .iter()
+            .map(Vec::as_slice)
+            .chain(core::iter::once(command.as_slice()))
+        {
+            active_scan::checked(
+                async {
+                    self.htt
+                        .wmi
+                        .htc
+                        .send_wmi(packet)
+                        .await
+                        .map_err(htt::Error::from)
+                        .map_err(Error::from)
+                },
+                &validate,
+            )
+            .await?;
+        }
         let deadline = narf_time::Deadline::after_ms(25_000);
         for _ in 0..65_536 {
+            narf_scheduler::yield_now().await;
+            validate()?;
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            match self.htt.poll().await? {
+            match active_scan::checked(
+                async { self.htt.poll().await.map_err(Error::from) },
+                &validate,
+            )
+            .await?
+            {
                 htt::Event::Wmi(bytes) => {
                     let id = wire::word(&bytes, 0)? & 0xffffff;
                     if id == self.wire.scan_event {
@@ -225,6 +273,22 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         }
                         match event.kind {
                             2 if event.reason == 0 => {
+                                if let Some(packet) = restore {
+                                    active_scan::checked(
+                                        async {
+                                            self.htt
+                                                .wmi
+                                                .htc
+                                                .send_wmi(packet)
+                                                .await
+                                                .map_err(htt::Error::from)
+                                                .map_err(Error::from)
+                                        },
+                                        &validate,
+                                    )
+                                    .await?;
+                                }
+                                validate()?;
                                 let mut cache = Vec::new();
                                 cache
                                     .try_reserve_exact(report.bss.len())

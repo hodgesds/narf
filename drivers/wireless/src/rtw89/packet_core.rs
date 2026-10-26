@@ -272,6 +272,15 @@ impl Core {
         bytes: &[u8],
         radio_report: bool,
     ) -> Result<u64, Error> {
+        self.submit_rate(port, bytes, radio_report, 0)
+    }
+    pub(super) fn submit_rate(
+        &mut self,
+        port: &mut impl Port,
+        bytes: &[u8],
+        radio_report: bool,
+        rate: u8,
+    ) -> Result<u64, Error> {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
@@ -301,14 +310,26 @@ impl Core {
             }
             let packet = ring.queue.reserved_mut(ticket)?;
             let preparation = (|| {
-                let (header, actual) = format::transmit(
-                    bytes,
-                    self.own,
-                    self.mac_id,
-                    ticket.sequence,
-                    packet.body.dma_addr().raw(),
-                    radio_report,
-                )?;
+                let (header, actual) = if rate == 0 {
+                    format::transmit(
+                        bytes,
+                        self.own,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                    )
+                } else {
+                    format::transmit_rate(
+                        bytes,
+                        self.own,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                        rate,
+                    )
+                }?;
                 if actual != kind {
                     return Err(Error::Packet);
                 }

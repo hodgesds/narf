@@ -1,0 +1,147 @@
+# Realtek per-chip inventory and remaining work
+
+> Initial remaining-LOC and engineer-day forecasts were withdrawn on 2026-10-26:
+> they used uncalibrated allowances and overlapping shared/backend/chip work.
+> The chip/path audit and measured LOC remain useful; packages describe scope.
+
+Audit date: 2026-10-25. Repository HEAD at inspection: `e8fe43e7b` on the existing branch. Linux comparison tree reports **7.3.0-rc4** in `/usr/src/linux/Makefile` and has no Git metadata, so this is an inspected local snapshot, not a pinned upstream commit or a claim about the latest release. Four owned driver trees remain frozen. This document is planning evidence, not a completion percentage, hardware qualification or a validated delivery date.
+
+## Measurement and interpretation
+
+Measured with installed **tokei15.0.0**, using `tokei -t Rust --compact drivers/wireless/src/<family>`. JSON evidence is `/tmp/narf-realtek-tokei.json` (`tokei -o json` over all four trees). These are CURRENT WORKTREE counts, including tests, frozen reference vectors, hardware programming tables, diagnostics and unreachable helpers. They must not be interpreted as production-path support or compared to upstream whole-driver LOC as a completion fraction.
+
+| Tree | Rust files | Rust code lines | Rust comments | Rust blank lines |
+|---|---:|---:|---:|---:|
+|rtw88|72|38,442|498|245|
+|rtw89|202|50,970|1,449|682|
+|rtlwifi|51|14,509|655|656|
+|rtl8xxxu|41|15,499|588|838|
+|Sum of Rust rows|366|119,420|3,190|2,421|
+
+Tokei's `Total` row also incorporates embedded documentation languages; e.g. rtl8xxxu reports15,507 there. The table deliberately uses its Rust-language row. Root owns the centralized metric and tracked/untracked classification. No Cargo/QEMU or compiler-wrapper validation was run for this audit.
+
+**Committed runtime baseline:** four conditional station chains: RTL8822CE, RTL8852BE (including actual B85B alternate ID), RTL8188EE, RTL8188EU. Each is a narrow, continuously awake, polled, single-association station implementation with model composition tests. Real operation additionally needs the exact signed firmware, installed regulatory policy and genuine signed board power qualification. None has recorded physical acceptance in this work. RTL8821CE additionally has retained firmware/inactive MAC/PHY and measured-envelope-gated IQK, but no station. Helpers and firmware-file parsers on other chips do not constitute a reachable firmware/radio/station chain.
+
+**Current unvalidated work, excluded from committed support below:** C21 post-IQK parked operating-power preparation (`Operating8821cPrepared`, N21P record); EE actual response-bound12-rate DATA; EU12-rate DATA on the signed WMM path; B12-rate DATA under a changed WMM recipe identity. Six new smokes plus extensions are written, not yet accepted by coordinated combined gates. Management/EAPOL remain1Mbps. This work does not add HT, additional AC/TIDs, bands, recovery or PM.
+
+Feature shorthand: `S0` means no active RF/packet service; implemented band/width/NSS/rates/BA/QoS/security/roles are all **none**. `S1` means conditional channel1/2.4GHz,20MHz, one host TX stream, fixed CCK1 DATA, no HT/VHT/HE/EHT, no BA/aggregation, Open or WPA2-PSK/host CCMP, STA only. `S1W` adds negotiated WMM BE/TID0, actual response binding/EDCA/CCMP, without other ACs or U-APSD/TSPEC. All station chains have explicit disconnect/failure and retain uncertain DMA, but **no safe reset/rejoin/removal reclaim, runtime power save/suspend/WoW, IRQ-driven sustained service or multi-radio lifetime**. These are real missing software, not hardware exclusions. RTL8822CE is S1; EE/EU are S1W; B has legacy S1 or separately qualified S1W.
+
+NARF paths below are relative to `/data/narf`; Linux paths are relative to `/usr/src/linux/drivers/net/wireless/realtek`. Function and field names identify evidence without assuming current upstream line numbers.
+
+## Every registered PCI chip/profile
+
+All PCI IDs below use vendor10ec. Hardware columns describe local Linux declarations, not what NARF currently exposes. Revision/RFE/firmware qualifiers are in the following profile table.
+
+|Chip/profile|Actually registered IDs|Reachable committed NARF stage and feature scope|Linux hardware scope / concrete remaining packages|NARF and Linux evidence|
+|---|---|---|---|---|
+|RTL8821CE / C21|c821|S0: source cold power/factory, exact signed section firmware, inactive MAC/FIFO/PHY and actual firmware IQK under N21Q, parked afterwards. WIP N21P parked gain/response preparation remains S0.|1SS2.4/5GHz HT/VHT. Needs actual C21 ordinary PCI TX/RX descriptors/rings/receipts, awake MAC/peer/H2C and station composition first; then HT/VHT widths/rates, WMM all ACs, BA/aggregation, bands/scan, tracking/coexistence/PM/recovery. R88+C21+G packages.|N:`rtw88/pci.rs:bring_up`, `sibling.rs:provision`, `firmware_lifecycle.rs:prepare_calibration8821c`, `phy/rtl8821c.rs:Info::from_factory`; L:`rtw88/rtw8821c.c:rtw8821c_hw_spec`, `rtw8821c_read_efuse`, `rtw8821c_set_tx_power_index`; `rtw88/pci.c`.|
+|RTL8822CE / C22C|c822|S1. Native complete retained firmware/MAC/PHY/radio/power, peer control, passive channel1 scan, MLME, RSNA/CCMP, real native packet receipts and kernel DHCP/IP composition. No WMM negotiation.|2SS2.4/5GHz HT/VHT; NARF factory profile requires both physical RF paths but ordinary host DATA remains1 stream/CCK1. Needs expanded measured profiles/rates/paths, full QoS/HT/VHT/BA, bands/scans, tracking/coexistence, recovery/PM. R88+C22C+G.|N:`rtw88/firmware_native.rs`, `radio.rs:prepare`, `power_policy.rs`, `station.rs`, `pci_packet.rs`; L:`rtw88/rtw8822c.c:rtw8822c_hw_spec`, `rtw8822c_phy_set_channel`, `rtw8822c_phy_calibration`, `main.c:rtw_register_hw`.|
+|RTL8822BE / C22B|b822|S0: parked diagnostic power/factory MAC only. Native section-loader filename/parse rejects this DID; C22C radio cannot authorize it.|2SS2.4/5GHz HT/VHT. Needs exact firmware transport/image semantics, factory/radio tables/RFK/power, MAC/packet/peer/station chain, then broad features. R88+C22B+G.|N:`rtw88/pci.rs:bring_up`, `firmware_transport.rs:filename/parse`; L:`rtw88/rtw8822b.c:rtw8822b_hw_spec`, `rtw8822be.c`, `pci.c`.|
+|RTL8852AE|8852,a85a|S0: legacy parked BAR2/power/EFUSE identity diagnostic. Shared AX cold/secure/download/command primitives exist but automatic probe does not compose a station on A.|2SS2.4/5GHz20/40/80 HT/VHT/HE. Needs A retained cold→WCPU→MAC/RX→BB/RF/channel/power/peer/data chain, current security policy, broader shared features. R89+A+G.|N:`rtw89/pci.rs:probe/bring_up_registers`, `prepared.rs:load`, `secure.rs`, `cold.rs`; L:`rtw89/rtw8852ae.c:rtw89_8852ae_id_table`, `rtw8852a.c:rtw8852a_chip_info`, `rtw8852a_rfk.c`.|
+|RTL8852BE|b852|S1 or S1W under distinct signed full-radio flags3/7 record. Actual reset/cold/factory/firmware/CMAC/RX/BB/RFK/power/peer/native TXBD+RPQ/host-security chain is composed. WIP richer DATA requires new flags7 digest.|2SS2.4/5GHz20/40/80 HT/VHT/HE. Host ordinary profile remains1TX/legacy20. Needs HT/VHT/HE/2SS/widths, BA/reordering, all AC/TIDs, scanning/bands, runtime tracking/coex/PM/recovery; genuine measured assets gate every expanded emitter. R89+B+G.|N:`rtw89/bootstrap.rs:probe`, `startup.rs`, `command_native/radio.rs:preflight_full_radio`, `station_control.rs`, `packet_core.rs`; L:`rtw89/rtw8852be.c`, `rtw8852b.c:rtw8852b_chip_info`, `rtw8852b_rfk.c`, `core.c`.|
+|RTL8852BE alternate|b85b|Same B chain and gates as b852, not another completed driver.|Same underlying B chip/info. Board-specific calibration, PCI subsystem quirks and real hardware still must be checked independently; common package counted once.|N:`rtw89/mod.rs:RTL_DEV_8852BE_ALT`, `pci.rs:probe`; L:`rtw89/rtw8852be.c:rtw89_8852be_id_table` binds SAME driver_info. **Not RTL8852BT**: BT is b520 and is not registered.|
+|RTL8852CE|c852|S0 diagnostic identity. AX-C header/DDV/PCI/command primitives are present but not a reachable C radio/station chain.|2SS2.4/5/6GHz20/40/80/160 HT/VHT/HE. Needs exact C BB/RFK/6GHz/power/channel/profile/runtime composition, then broad features. R89+C+G; 6GHz regulatory/security interfaces are shared dependencies.|N:`rtw89/pci.rs:probe`, `mac.rs:ChipId`, `prepared.rs`, `command_native.rs`; L:`rtw89/rtw8852ce.c`, `rtw8852c.c:rtw8852c_chip_info`, `rtw8852c_rfk.c`.|
+|RTL8851BE|b851|S0 diagnostic identity. Shared AX1SS/ECV/cut/security prerequisites exist, no native station composition.|1SS2.4/5GHz20/40/80 HT/VHT/HE. Needs exact51 firmware/BB/RFK/power/channel/packet/station chain, single-path/antenna/coex semantics and broad features. R89+51+G.|N:`rtw89/pci.rs`, `factory.rs:Factory::read`, `power.rs:power_on`, `prepared.rs`; L:`rtw89/rtw8851be.c`, `rtw8851b.c:rtw8851b_chip_info`, `rtw8851b_rfk.c`.|
+|RTL8922AE base|8922|Registered, **probe rejects before EFUSE**: S0, not even an accepted factory owner. Firmware selector returns no filenames for BE.|2SS2.4/5/6GHz20/40/80/160 EHT/HE; source support_link_num2. Needs BE EFUSE/fuse/security/container/PCI/CMAC/descriptor/RX firmware paths plus chip RFK/power/MLME, EHT/MLO and broader features. R89+BE+G.|N:`rtw89/pci.rs:bring_up_registers`, `prepared.rs:filenames`, `mac.rs:ChipGeneration`; L:`rtw89/rtw8922ae.c:rtw89_8922ae_info`, `rtw8922a.c:rtw8922a_chip_info`, `mac_be.c`, `efuse.c`.|
+|RTL8922AE-VS|892b|Same current explicit BE rejection. NARF currently aliases base ChipId; no VS variant selection.|Same physical family but upstream distinct variant must be implemented and qualified, not silently treated as a board alias. Add VS delta after BE package.|N:`rtw89/mac.rs:ChipId::from_pci_did`; L:`rtw89/rtw8922ae.c:rtw89_8922ae_vs_info` selects `rtw8922ae_vs_variant`, unlike8922 base.|
+|RTL8188EE|8179|S1W. Native signed paged firmware/LLT/rings/radio/IQK/LCK/NEPC gains/peer/packets/RSNA/CCMP/DHCP. WIP12-rate ordinary DATA and source-invoked publication are unvalidated.|1T1R2.4GHz HT; no5GHz in source bandset. Needs HT20/40/BA/aggregation, full AC/TID, adaptive rates, broader channel/scan, gain/antenna tracking, IRQ/recovery/PM and extra roles. RTL+EE+G.|N:`rtlwifi/pci.rs:bring_up`, `firmware_transport.rs`, `prepare_native.rs`, `station.rs`, `interface.rs`; L:`rtlwifi/rtl8188ee/{sw,hw,phy,rf,trx}.c`, `base.c:_rtl_init_mac80211`.|
+|RTL8192CE2T2R (plus actual RF1T2R revision)|8178|S0 diagnostic power/EFUSE only; chip native firmware loader is EE-only. Source RF configuration must be read; DID alone does not prove2TX.|2.4GHz HT; source `hw.c:_rtl92ce_read_chip_version` selects1T1R/1T2R/2T2R from hardware version. Needs retained CE firmware/MAC/rings/radio/calibration/power/station, then shared HT/QoS/lifecycle. RTL+92CE+G; revision delta below.|N:`rtlwifi/regs.rs:ALL_DEV_IDS`, `pci.rs:bring_up`, `firmware_transport.rs:parse`; L:`rtlwifi/rtl8192ce/sw.c:rtl92ce_pci_ids/rtl92c_init_sw_vars`, `hw.c:_rtl92ce_read_chip_version`.|
+|RTL8188CE/88C1T sibling currently named8192CE_ALT|8176|S0 diagnostic only. Current NARF label groups this with8192CE; do not plan it as a second complete2T driver.|Source88C/92C RF-type/cut-dependent profile; commonly1T1R, detect actual RF type. Same CE backend, distinct antenna/RF chain/table/cut delta. RTL+92CE+88CE+G.|N:`rtlwifi/regs.rs:RTL_DEV_8192CE_ALT`, `pci.rs:name_for`; same Linux CE evidence, including firmware UMC selection.|
+|RTL8192DE dual-MAC function0|8193, PCI fn0|S0 diagnostic exact per-function EFUSE MAC. No retained runtime firmware/DMA/radio chain.|Dual-band HT2SS; source dual-MAC/single/dual-PHY modes need actual detection. Exact cross-function power/reset/radio/IRQ ownership is additional to shared RTL package. RTL+92DE+G.|N:`rtlwifi/pci.rs:bring_up`, `efuse.rs:read_factory`; L:`rtlwifi/rtl8192de/{sw,hw,phy}.c`, `rtl8192d/hw_common.c` dual-MAC power/EFUSE paths.|
+|RTL8192DE dual-MAC function1|8193, PCI fn1|S0 diagnostic MAC1 selection only. No second radio runtime or coexistence arbitration.|Same shared92DE package; second-function lifetime and concurrency must be composed and tested, not counted as another full backend.|Same NARF/L sources as fn0.|
+|RTL8192EE|818b|S0 diagnostic only. EE-named generic helpers in tree are not this chip's active linked-descriptor runtime.|2T2R2.4GHz HT. Needs actual92EE TXBD/rings/firmware/MAC/PHY/RFK/power/station, not8188EE descriptor substitution. RTL+92EE+G.|N:`rtlwifi/pci.rs:bring_up`, `prepare.rs:TX_BASES` explicit8188EE ownership; L:`rtlwifi/rtl8192ee/{sw,hw,phy,trx}.c`.|
+|RTL8723AE A/default vs UMC-B firmware|8723|S0 diagnostic only; no authenticated loader or radio/station chain.|1SS2.4GHz HT+BT. Needs chip-specific retained chain plus source antenna/BT coexistence and A/B firmware/cut policy. RTL+23AE+G.|N:`rtlwifi/pci.rs`, `fw.rs:FW_8723AE` (currently unused runtime and inaccurate filename); L:`rtlwifi/rtl8723ae/sw.c:rtl8723e_init_sw_vars`, `hw.c`, `phy.c`.|
+|RTL8723BE|b723|S0 diagnostic only; no retained chain.|1SS2.4GHz HT+BT. Needs correct versioned firmware, exact chip RFK, antenna/BT coexistence and native packet/station/lifecycle. RTL+23BE+G.|N:`rtlwifi/pci.rs`, `fw.rs:FW_8723BE`; L:`rtlwifi/rtl8723be/sw.c:rtl8723be_init_sw_vars`, `hw.c`, `phy.c`, `trx.c`.|
+|RTL8821AE|8821|S0 diagnostic only.8812AE (8812) is NOT registered here.|1SS dual-band VHT/HT. Needs correct versioned/wow firmware policy, exact VHT descriptors/RF/calibration/power, full native station then broad roles/PHY/lifecycle. RTL+21AE+G.|N:`rtlwifi/regs.rs`, `pci.rs`, `fw.rs`; L:`rtlwifi/rtl8821ae/sw.c:rtl8821ae_init_sw_vars`, `phy.c`, `trx.c`.|
+
+### Revision and firmware profile gates (do not equate parser support with runtime)
+
+|Profile|Actual accepted selection / missing behavior|Evidence|
+|---|---|---|
+|rtw88 C21|Power/PHY cut0..6 only; package bit retained; PHY RFE0/2/4/6 only, hardware one-path/one-stream or firmware IGNORE. Other RFEs/cuts remain denied software profiles. Exact `rtw88/rtw8821c_fw.bin`; N21Q calibration-only; N21P WIP after actual IQK.|N:`rtw88/power.rs:enable`, `phy/rtl8821c.rs:Info::from_factory`, `firmware_transport.rs:filename/parse`; L:`rtw88/rtw8821c.c:rtw8821c_read_efuse` has broader BTG RFE handling.|
+|rtw88 C22C|Cut0..6,RFE0..6; both physical RF paths required; antenna1 narrowing not implemented. Exact `rtw88/rtw8822c_fw.bin`; signed per-board `rtw8822ce-cal-v2-*`; WoW image is not loaded.|N:`rtw88/phy.rs:Info::from_factory`, `firmware_transport.rs`; L:`rtw88/rtw8822c.c` firmware/wow names and hardware ops.|
+|rtw88 C22B|Name `rtw88/rtw8822b_fw.bin` exists upstream but no accepted NARF runtime filename/profile. No inferred compatibility from equal vendor header families.|N:`rtw88/firmware_transport.rs:filename/parse`; L:`rtw88/rtw8822b.c:rtw8822b_hw_spec`.|
+|rtw89 AX selected formats|A tries `rtw8852a_fw-1.bin`, then unversioned; B/C try suffix2,1,unversioned;51 tries1,unversioned. B/51 prefer NORMAL_CE, fallback NORMAL; A/C NORMAL. MFW nearest non-manufacturing cut<=physical cut; AX header v0/v1 accepted. All image/section/security extents checked. This selection is composed in native B; on A/C/51 it is a prerequisite, not runtime.|N:`rtw89/prepared.rs:filenames/load/prepare`, `fwdl.rs:select_image/parse_auto`; L:`rtw89/fw.c` image/container/download policy.|
+|rtw89 B hardware secure profiles|Actual erased fuse pair means nonsecure; recognized programmed legacy/MSSC secure fuses require actual matching signature and current host blacklist. Secure v0 length960 override and v1 formatted/indexed pools handled. Unknown/newer-policy/signature cases fail. B/C upstream blacklist0 available; secure A/51 require authenticated external blacklist. Cut/ECV/RFE identity must be actual; no assertion that all cuts/RFEs have a measured board record.|N:`rtw89/secure.rs:Fuses::decode/Blacklist::upstream`, `rtw89/download_plan.rs:DownloadPlan`, `factory.rs:Factory::read`, `radio_policy.rs`.|
+|rtw89 B operating records|N52Bv2 flags3 legacy station vs flags7 WMM recipe; genuine measured calibration/packet/autonomous peaks bound full board/firmware/tables. WIP recipe2 rejects old flags7 identity; flags3 remains CCK1. BT b520 is not matched.|N:`rtw89/radio_policy.rs:Board::wmm/Qualification`, `station_control.rs:wmm_fingerprint`, `mod.rs`.|
+|rtw89 BE/VS|Generic expected basename is not actual loader support: `prepared::filenames(Rtl8922A)` is empty. Local Linux8922 uses firmware format max4 and distinct VS variant; NARF only AX header0/1. Need actual BE container/fuse/variant paths.|N:`rtw89/prepared.rs`, `fwdl.rs`, `pci.rs`; L:`rtw89/rtw8922a.c:RTW8922A_FW_FORMAT_MAX`, `rtw8922ae.c`.|
+|rtlwifi CE/88C foundry/cuts|Source chooses `rtlwifi/rtl8192cfwU.bin` for UMC-A non92C, `rtl8192cfwU_B.bin` for UMC-B, else `rtl8192cfw.bin`. No NARF cut/loader chain exists beyond diagnostic helpers. Treat verified foundry/cut/RF-type coverage as a profile delta, not three full backend rewrites.|L:`rtlwifi/rtl8192ce/sw.c:rtl92c_init_sw_vars`, `hw.c:_rtl92ce_read_chip_version`; N:`rtlwifi/fw.rs` has only one generic name and no live CE caller.|
+|rtlwifi AE/BE/21AE firmware|8723AE source uses `rtl8723fw.bin` or `_B.bin`, not NARF unused `rtl8723aefw.bin`.8723BE prefers `_36.bin` with unversioned fallback.8821AE prefers `rtl8821aefw_29.bin`, alternative unversioned and separate `_wowlan.bin`;8812AE firmware is not a matched chip.8192DE/EE names are `rtl8192defw.bin`/`rtl8192eefw.bin`;8188EE live name is `rtl8188efw.bin`.|L: respective `sw.c:*init_sw_vars`, MODULE_FIRMWARE and `.alt_fw_name`; N:`rtlwifi/fw.rs`, `firmware_transport.rs:parse_image/initialize_registered` (8188EE only).|
+|rtl8xxxu EU revisions|Native factory reads actual cut; test silicon and I-cut8 reject. Firmware signature must be8188E and family EU; no claim every other cut/board has been physically tested. Exact `rtlwifi/rtl8188eufw.bin`, N8PCv1 whole CCK/OFDM envelope. Others may have filename strings but live initialization rejects nonEU.|N:`rtl8xxxu/device_init.rs:factory`, `firmware_transport.rs:parse_image/initialize`, `regs.rs:firmware_name`; L:`rtl8xxxu/8188e.c` identify/firmware ops.|
+
+## Every registered USB identity, grouped only when it truly shares silicon
+
+There are20 registered VID:PID pairs.18 map to a non-Unknown NARF family, but only8 map to the actually implemented EU station owner. Two additional pairs are registered and then rejected. Two of the18 are mapped to the wrong upstream silicon. Board calibration never transfers between aliases merely because a firmware name matches.
+
+|Actual chip / profile|Registered VID:PID identities|Current NARF stage and implemented feature scope|Missing software and evidence|
+|---|---|---|---|
+|RTL8188EU native/ETV and confirmed rebrands|0bda:8179,0bda:0179;7392:b811;2357:010c,2357:0111;0b05:18f0;07b8:8179;2001:3311|S1W conditional native control/bulk owner, exact EU firmware/factory/FIFO/MAC/BB/RF/LC/IQK/N8PC channel1, shared MLME/RSNA/CCMP/DHCP. WIP richer WMM DATA unvalidated.|USB+EU+G: HT20/40 and width/rate/gain qualification, BA/reorder/aggregation, full AC/TID/endpoint routing, broader scan/retune, recovery/removal/PM. N:`rtl8xxxu/mod.rs:rtl8xxxu_probe`, `regs.rs:from_usb_id`, `firmware_transport.rs`, `station_runtime.rs`; L:`rtl8xxxu/core.c:dev_table`, `8188e.c`.|
+|RTL8188EU Rosewill alias|0bda:ffef|Registered but `ChipFamily::from_usb_id` returns Unknown; probe returns UnsupportedVariant. S0, not ninth working EU identity.|Alias correction and exact per-board qualification; no new chip backend needed. N:`rtl8xxxu/regs.rs:REALTEK_USB_IDS/from_usb_id`, `mod.rs:rtl8xxxu_probe`; L:`rtl8xxxu/core.c:dev_table` binds8188eu_fops.|
+|RTL8192EU native + confirmed rebrands|0bda:818b;2357:0108,2357:0109;2001:3319|S0: recognized, stores device and owner, but only EU spawns initialization. Firmware `rtlwifi/rtl8192eufw.bin` is a name, not a native loader.|USB+92EU+G: exact1/2TX2RX identification, firmware/tables/RFK/power/FIFO/packet/station chain then HT/QoS/lifecycle. N:`rtl8xxxu/mod.rs:rtl8xxxu_probe`, `firmware_transport.rs`; L:`rtl8xxxu/core.c:dev_table`, `8192e.c` identify/radio/fops.|
+|RTL8192FU incorrectly labelled8192EU|7392:b722;2357:0135|S0 detection under WRONG NARF family. Safe currently because nonEU initialization is not started; cannot reuse8192EU power/firmware/tables later.|New92FU chip package and corrected mapping first. L:`rtl8xxxu/core.c:dev_table` binds both to8192fu_fops, `8192f.c:rtl8192fu_fops`; N:`rtl8xxxu/regs.rs:REBRANDED_IDS`.|
+|RTL8723BU|0bda:b720;7392:a611|S0 recognized detection, no native runtime. Name `rtlwifi/rtl8723bufw.bin` only.|USB+23BU+G: one-path exact firmware/RFK/S0S1/BT coexistence/calibrated native station then HT/QoS/lifecycle. L:`rtl8xxxu/8723b.c`, `core.c:dev_table`; N:`rtl8xxxu/mod.rs`, `regs.rs`.|
+|RTL8710BU / RTL8188GU|0bda:b711|Registered but mapped Unknown, probe rejects. It is neither an EU alias nor an implemented Unknown fallback.|New8710B profile/factory/firmware/control/radio/packets/station; USB+10BU+G. L:`rtl8xxxu/core.c:dev_table`, `8710b.c:rtl8710bu_fops`; N:`rtl8xxxu/regs.rs` enum lacks this family.|
+|RTL8821CU / C21 USB|0bda:c811|S0 recognized detection. Current string `rtlwifi/rtl8821cufw.bin` is not evidence for the upstream rtw88 USB firmware/transport.|USB88+C21 shared core+CU bus delta+G. Needs actual rtw88 USB firmware/reserved-page, register, RX/TX aggregation/descriptor/endpoint lifetimes and chip radio/peer/station composition. L:`rtw88/rtw8821cu.c:rtw_8821cu_id_table`, `usb.c`, `rtw8821c.c` uses `rtw88/rtw8821c_fw.bin`; N:`rtl8xxxu/mod.rs/regs.rs`.|
+|RTL8822BU / C22B USB|0bda:b82c|S0 recognized detection. `rtlwifi/rtl8822bufw.bin` helper is not a production runtime.|USB88+C22B shared core+BU delta+G; actual upstream C22B USB chain first, then2SS/VHT/bands/QoS/lifecycle. L:`rtw88/rtw8822bu.c:rtw_8822bu_id_table`, `usb.c`, `rtw8822b.c` firmware name `rtw88/rtw8822b_fw.bin`; N:`rtl8xxxu/mod.rs/regs.rs`.|
+
+USB hardware declared by local source:8188E/8710B/8723B are1TX/1RX2.4GHz HT;8192E can identify1/2TX with2RX,8192F is its own2.4GHz HT family. CU/BU use upstream C21/C22B dual-band VHT cores. AP support is **not uniformly advertised**: `rtl8xxxu/core.c:rtl8xxxu_probe` starts STA only and adds AP only for `fops.supports_ap`; local8192e/8192f/8723b/8710b set that flag,8188e does not. Do not charge EU AP as proven upstream parity or claim hardware impossibility; more primary hardware/firmware evidence would be needed. C21/C22B upstream rtw88 advertises STA/AP/IBSS separately.
+
+## Feature completeness and package boundaries
+
+Current committed station profiles implement only STA/Open/WPA2-PSK/CCMP. Hardware ciphers, PMF/IGTK/BIP, WPA3/SAE and other cipher/AKM integration are not established for these SoftMAC paths. Shared Rust crypto/SAE helpers elsewhere are not driver integration. BA/reordering/AMSDU/AMPDU, full WMM AC/TID, HT/40MHz/VHT/HE/EHT NSS/width/rate control, active scan/all bands/DFS, concurrent channels/roles, AP/P2P/mesh/IBSS where advertised, TSF/beacon/filtering and IRQ/PM/recovery remain substantial packages. Linux rtlwifi `base.c:_rtl_init_mac80211` advertises STA/AP/IBSS/mesh/P2P; rtw88 `main.c:rtw_register_hw` advertises STA/AP/IBSS; rtw89 `core.c:rtw89_core_register_hw` advertises STA/AP/P2P. Monitor/capture and TDLS must be assessed through the actual mac80211 capability/ops path, not assumed from a descriptor parser.
+
+Source band/width limits provide evidence for real exclusions: rtlwifi EE/CE/92EE/23AE/23BE and legacy rtl8xxxu n chips do not expose5GHz in their chip bandsets; rtw88 C21/C22 expose2.4/5GHz and HT/VHT, not6GHz/HE/EHT; rtw89 A/B/51 expose2.4/5GHz and up to80MHz; C adds6GHz/160;8922 source supports160 maximum and link_num2, **not a declared320MHz profile**. Other missing features must not be relabelled inapplicable merely because the initial NARF implementation excludes them.
+
+The estimate target is full feature parity with the capabilities/ops actually declared by this inspected local Linux source for these matched chips, using the existing NARF capability/async/retained-DMA model and native Rust tests. It excludes arbitrary undocumented vendor features, new unregistered PCI/USB products, insecure deprecated cipher support unless explicitly required, and perpetual future upstream growth. WEP/TKIP, optional certification features and actual supported role combinations require an explicit product decision before a contractual schedule. Base estimates allow modern PSK/SAE/PMF integration; enterprise EAP userspace and certification programs are separate dependencies.
+
+## Remaining shared work packages
+
+| Package | Deliverable and dependencies |
+|---|---|
+|G-IEEE global SoftMAC stack, not Realtek-exclusive|Shared BA/reorder/aggregation/QoS classification/adaptive-rate interfaces, AP/P2P/IBSS/mesh management where exposed, PMF/SAE/GTK/IGTK/rekey/roaming/control plumbing. Existing shared RSNA remains reused. Root MUST deduplicate against Intel/MT/Qualcomm estimates.|
+|G-PLATFORM global lifecycle/IRQ substrate|IRQ-safe async service, reset/drain/reclamation proofs, hotplug/removal/suspend/WoW and multi-device ownership across PCI/USB. Existing bus/USB/capability APIs reused; no TCB scope assumed. Deduplicate globally.|
+|R88 shared rtw88 PCI/radio runtime extension|Extend retained C22/C21 architecture to full band/width/path/rate/QoS/BA/IRQ/tracking/coex/PM/recovery contracts; chip radio callbacks are deltas below. Depends G packages, real metadata/firmware.|
+|R89 shared AX modern backend extension|AX/CV descriptor/DMA/command/RX/MLME, full QoS/HE/width/NSS, scans/DFS/concurrency, IRQ/recovery/PM and common modern PHY handling. BE-specific container/EFUSE/MLO/radio remains BE delta.|
+|RTL shared legacy PCI backend extension|Generalize exact firmware, linked-vs-TXBD lifetime, HT/VHT capabilities, stations/roles/bands/queues/BA/IRQ/PM/reset. No assumption8188EE registers equal other chips.|
+|USB shared legacy rtl8xxxu backend extension|EP0/bulk endpoints/aggregation/control ownership, n-family capability and station/role/QoS/bandwidth/rate/PM/recovery extension. USB stop/drain substrate already exists but device resume/RF state does not.|
+|USB88 shared upstream rtw88 USB backend|New actual rtw88 USB firmware/register/native packet/aggregation/endpoint lifetime composition for CU/BU. REUSE C21/C22B radio/firmware core deltas; do not count their core work again.|
+
+## Chip deltas after shared work
+
+| Chip/profile | Remaining native work |
+|---|---|
+|C22C +R88|Existing native chain; chip tracking/coex/paths/PM and expanded envelopes. Medium-low.|
+|C21 shared silicon +R88 orUSB88|Finish actual operating/awake/packet/peer/station chain after IQK/WIP power, extra RFEs/widths/bands/antenna/tracking/coex. Medium-low.|
+|C22B shared silicon +R88 orUSB88|Chip firmware/MAC/RFK/power/station callbacks; C22C is not substitute. Low.|
+|8852B +R89|Existing chain; full PHY/NSS/bands/rates/tracking/coex/PM callbacks and profile qualification. Medium-low.|
+|8852A +R89|Complete actual A cold/secure/BB/RFK/full-radio/packet runtime and policy. Low.|
+|8852C +R89|C/CV1, 6GHz/160, RFK/firmware/tracking and power/descriptor deltas. Low.|
+|8851B +R89|Corrected-cut/fuse/1SS/antenna/coex radio/runtime. Low.|
+|8922A +R89|BE EFUSE/security/fw format4/PCI+DMA+CMAC+RFK/EHT/2-link MLO integration. Very low; least audited implementation coverage.|
+|8922AE-VS after8922A|Actual variant selection/RFE/firmware/capability/power differences; source has distinct variant, no board evidence. Very low.|
+|8188EE +RTL|Native chain exists; chip-specific HT/antenna/tracking/PM callbacks. Medium-low.|
+|8192CE +RTL|Real2T or1T2R detection/firmware/tables/RFK/power/runtime. Low.|
+|8188CE/88C sibling afterCE|1T chain/table/antenna profile; reuses CE backend. Low.|
+|CE foundry/UMC firmware-cut family afterCE|Exact UMC-A/U_B/default selection, hardware cut/RF profiles and regression fixtures. Low.|
+|8192DE +RTL|Dual-MAC/PHY/power/reset/firmware/radio concurrency and ownership; includes both functions, not doubled. Very low.|
+|8192EE +RTL|Actual92EE TXBD/MAC/RFK/power/station. Low.|
+|8723AE +RTL|A/B firmware, antenna/BT and radio/packet station. Low.|
+|8723BE +RTL|Versioned firmware/S0S1/BT/radio/packet station. Low.|
+|8821AE +RTL|VHT/dual-band exact firmware/PHY/RF/packet/coex/PM. Low.|
+|8188EU +USB|Native chain exists; HT/rate/endpoint/tracking/resume callbacks. Medium-low.|
+|8192EU +USB|Actual1/2TX2RX native initialization/RFK/power/station. Low.|
+|8192FU +USB|Unrepresented matched silicon; exact F-family firmware/radio/2-chain runtime. Very low.|
+|8723BU +USB|Actual1SS/S0S1/BT firmware/radio/station. Low.|
+|8710BU +USB|Unrepresented registered chip; actual firmware/control/RFK/native chain. Very low.|
+|8821CU afterC21+USB88|USB bus/profile integration and board/endpoint behavior only; C21 RF core counted above. Low.|
+|8822BU afterC22B+USB88|USB bus/profile integration and board/endpoint behavior only; C22B RF core counted above. Low.|
+|Identity/match/filename corrections shared|ffef/B711/FU mapping and wrong unused firmware strings; excludes underlying chip implementation. High confidence scope, not validated fix.|
+
+## Planning limits
+
+The original numeric forecast is withdrawn. PHY, BA, QoS, roles, recovery and
+PM appeared in both shared packages and chip deltas; future estimates must map
+each concrete callback/control/packet path to one owner. Test volume was not
+calibrated. Do not derive engineer-days or an agent calendar from this inventory.
+Exact firmware, board power/calibration, revisions and physical acceptance remain
+necessary inputs.

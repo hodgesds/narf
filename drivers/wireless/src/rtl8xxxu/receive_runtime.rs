@@ -54,6 +54,7 @@ pub struct Receiver<C: ControlIo, B: PacketIo> {
     phase: Phase,
     mailbox: u8,
     peer: Option<[u8; 6]>,
+    wmm: Option<Arc<super::wmm_runtime::Proof>>,
 }
 impl<C: ControlIo, B: PacketIo> core::fmt::Debug for Receiver<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -88,6 +89,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             phase: Phase::Prepared,
             mailbox: 0,
             peer: None,
+            wmm: None,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -96,6 +98,81 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         } else {
             self.phase
         }
+    }
+    pub(super) fn wmm_proof(&self) -> Option<Arc<super::wmm_runtime::Proof>> {
+        self.wmm.clone()
+    }
+    pub(super) fn qualify_wmm(
+        &mut self,
+        permission: super::power_policy::Permission,
+    ) -> Result<(), Error> {
+        if self.wmm.is_none() {
+            let factory = self.firmware.factory().ok_or(Error::State)?;
+            let (vid, pid) = self.firmware.usb_identity().ok_or(Error::State)?;
+            self.wmm = Some(super::wmm_runtime::Proof::registered(
+                factory, vid, pid, permission,
+            )?);
+        }
+        self.current_wmm()
+    }
+    pub(super) fn current_wmm(&self) -> Result<(), Error> {
+        if let Some(proof) = &self.wmm {
+            proof.invoke(|| ())?;
+        }
+        Ok(())
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn install_wmm_model(&mut self, proof: Arc<super::wmm_runtime::Proof>) {
+        self.wmm = Some(proof);
+    }
+    pub(super) async fn configure_wmm(
+        &mut self,
+        p: narf_wireless::wmm::Parameters,
+        short: bool,
+    ) -> Result<(), Error> {
+        let values = super::wmm_runtime::words(p, short)?;
+        if self.phase() != Phase::Active || self.wmm.is_none() {
+            return Err(Error::State);
+        }
+        let proof = self.wmm.clone().ok_or(Error::State)?;
+        self.phase = Phase::Configuring;
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = proof
+            .fence(
+                async {
+                    for (reg, value) in [0x508, 0x50c, 0x504, 0x500].into_iter().zip(values) {
+                        self.firmware
+                            .write32(reg, value)
+                            .await
+                            .map_err(Error::Control)?;
+                        if self.firmware.read32(reg).await.map_err(Error::Control)? != value {
+                            return Err(Error::State);
+                        }
+                    }
+                    let acm = self.firmware.read8(0x5c0).await.map_err(Error::Control)? & !0x0e;
+                    self.firmware
+                        .write8(0x5c0, acm)
+                        .await
+                        .map_err(Error::Control)?;
+                    if self.firmware.read8(0x5c0).await.map_err(Error::Control)? != acm {
+                        return Err(Error::State);
+                    }
+                    Ok(())
+                },
+                core::convert::identity,
+            )
+            .await;
+        attempt.armed = false;
+        if result.is_ok() {
+            self.packets.qos = true;
+            self.phase = Phase::Active;
+        } else {
+            self.fail();
+        }
+        result
     }
     pub fn channel(&self) -> u8 {
         self.packets.channel()
@@ -343,6 +420,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         }
     }
     pub(super) fn submit_management(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.current_wmm()?;
         if self.phase() != Phase::Active {
             return Err(Error::State);
         }
@@ -368,6 +446,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
     pub(super) fn poll_delivery(
         &mut self,
     ) -> Result<Option<super::packet_transport::Delivered>, Error> {
+        self.current_wmm()?;
         if self.phase() != Phase::Active {
             return Err(Error::State);
         }
@@ -394,6 +473,13 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         self.fail();
     }
     pub(super) fn submit_native_data(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.submit_native_data_rate(frame, 0)
+    }
+    pub(super) fn submit_native_data_rate(&mut self, frame: &[u8], rate: u8) -> Result<(), Error> {
+        self.current_wmm()?;
+        if rate != 0 && self.wmm.is_none() {
+            return Err(Error::State);
+        }
         if self.phase() != Phase::Active
             || frame.len() < 24
             || frame[10..16] != self.local().ok_or(Error::State)?
@@ -401,7 +487,16 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         {
             return Err(Error::State);
         }
-        let result = self.packets.submit(super::packet_codec::Kind::Data, frame);
+        let proof = self.wmm.clone();
+        let mut submit = || {
+            self.packets
+                .submit_rate(super::packet_codec::Kind::Data, frame, rate)
+        };
+        let result = if let Some(proof) = proof {
+            proof.invoke(submit)?
+        } else {
+            submit()
+        };
         if self.packets.is_failed() {
             self.fail();
         }

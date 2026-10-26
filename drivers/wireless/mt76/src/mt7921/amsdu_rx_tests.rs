@@ -55,6 +55,7 @@ pub(super) fn packet(eth: &[u8], protected: bool, pn: u64, marker: u8, seq: u16)
     frame.extend_from_slice(&eth[12..]);
     let offset = if protected { 40 } else { 24 };
     let mut packet = vec![0; offset];
+    packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes());
     packet[..4].copy_from_slice(&((2u32 << 27) | (offset + frame.len()) as u32).to_le_bytes());
     packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
     packet[16] = marker;

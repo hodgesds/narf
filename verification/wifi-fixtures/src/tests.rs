@@ -352,6 +352,69 @@ case!(wifi_fixture_open_ap_enforces_conversation, {
     Ok(())
 });
 
+case!(wifi_fixture_legacy_rate_profile_wire_and_five_ghz_bounds, {
+    let rates = [0x82, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+    let mut ap = FakeAp::open(PLAN, b"narf", 1, 42)
+        .unwrap()
+        .with_legacy_rates(&rates)
+        .map_err(|_| "rate profile")?;
+    let beacon = ap.beacon();
+    ensure!(
+        beacon[42..60] == [1, 8, 0x82, 4, 11, 22, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108, 3, 1],
+        "literal supported/extended IE split"
+    );
+    ap.receive(&auth()).map_err(|_| "profile auth")?;
+    let mut request = assoc(false);
+    request.truncate(34);
+    request.extend_from_slice(&[1, 8, 2, 4, 11, 22, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108]);
+    let reply = ap.receive(&request).map_err(|_| "full rate association")?;
+    ensure!(
+        reply[0][30..46] == [1, 8, 0x82, 4, 11, 22, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108],
+        "literal response rate offer"
+    );
+    ensure!(
+        ap.with_legacy_rates(&[0x82]).is_err(),
+        "late rate profile replacement"
+    );
+    for channel in [36, 40, 44, 48, 149, 153, 157, 161, 165] {
+        let ap = FakeAp::open(PLAN, b"narf", channel, 42).map_err(|_| "5GHz fixture profile")?;
+        ensure!(
+            ap.beacon().windows(3).any(|w| w == [3, 1, channel]),
+            "5GHz channel wire"
+        );
+        ensure!(ap.with_basic_1mbps().is_err(), "5GHz CCK fallback offered");
+    }
+    for channel in [0, 14, 35, 52, 100, 144, 166, 255] {
+        ensure!(
+            FakeAp::open(PLAN, b"narf", channel, 42).is_err(),
+            "unsupported/DFS fixture channel"
+        );
+    }
+    for bad in [
+        &[][..],
+        &[2][..],
+        &[0x82, 2][..],
+        &[0xff][..],
+        &[0x82; 13][..],
+    ] {
+        ensure!(
+            FakeAp::open(PLAN, b"narf", 1, 42)
+                .unwrap()
+                .with_legacy_rates(bad)
+                .is_err(),
+            "invalid IEEE rate profile"
+        );
+    }
+    ensure!(
+        FakeAp::open(PLAN, b"narf", 36, 42)
+            .unwrap()
+            .with_legacy_rates(&[0x82, 12])
+            .is_err(),
+        "5GHz explicit CCK offered"
+    );
+    Ok(())
+});
+
 case!(wifi_fixture_wpa2_ap_verifies_both_mics, {
     let mut ap =
         FakeAp::wpa2(PLAN, b"narf", 6, 42, [0x55; 32], [0xaa; 32]).map_err(|_| "AP config")?;

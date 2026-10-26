@@ -50,6 +50,38 @@ pub(super) struct Prepared {
     gain: i16,
     channel: u8,
     applied: Option<i16>,
+    pub(super) active_link: Option<super::link::ActiveLinkStatus>,
+    pub(super) mlme: super::assoc::Context,
+}
+
+impl Prepared {
+    fn host_ceiling(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
+        if !self.source.current() || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+            return Err("MVM platform power authority or host policy is no longer valid");
+        }
+        let power = super::super::connection::host_channel_power(domain, self.channel, true)
+            .ok_or("MVM current host channel prohibits initial transmit-power preparation")?;
+        let applied = (i16::from(power) * 8)
+            .checked_sub(self.gain)
+            .ok_or("MVM antenna power arithmetic overflow")?
+            .min(self.maximum);
+        if !(-1024..=1016).contains(&applied) {
+            return Err("MVM current radiated ceiling is outside the supported power range");
+        }
+        Ok(applied)
+    }
+
+    /// A ready receipt is historical metadata. Every active command waiter
+    /// must retain/check this actual source instance and its applied ceiling.
+    pub(super) fn check_applied(&self, domain: &RegulatoryDomain) -> Result<(), &'static str> {
+        let applied = self
+            .applied
+            .ok_or("MVM link power has no completed native receipt")?;
+        if self.host_ceiling(domain)? < applied {
+            return Err("MVM current host policy is below acknowledged link power");
+        }
+        Ok(())
+    }
 }
 
 fn request(binding: [u8; 32], mac: [u8; 6]) -> PowerRequest {
@@ -98,6 +130,8 @@ fn parse(
         gain,
         channel,
         applied: None,
+        active_link: None,
+        mlme: super::assoc::Context::default(),
     })
 }
 
@@ -196,7 +230,14 @@ impl Owner {
     }
 
     pub fn prepared_transmit_power(&self) -> Option<PowerStatus> {
-        if self.phase != Phase::TransmitPowerPrepared || self.hardware.is_failed() {
+        if !matches!(
+            self.phase,
+            Phase::TransmitPowerPrepared
+                | Phase::LinkActive
+                | Phase::Associated
+                | Phase::DataPrepared
+        ) || self.hardware.is_failed()
+        {
             return None;
         }
         let prepared = self.power.prepared.as_ref()?;
@@ -280,7 +321,7 @@ impl Owner {
         }
     }
 
-    fn current_power(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
+    pub(super) fn current_power(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
         let prepared = self
             .power
             .prepared
@@ -314,16 +355,7 @@ impl Owner {
                 "MVM current firmware channel prohibits initial transmit-power preparation",
             );
         }
-        let power = super::super::connection::host_channel_power(domain, prepared.channel, true)
-            .ok_or("MVM current host channel prohibits initial transmit-power preparation")?;
-        let applied = (i16::from(power) * 8)
-            .checked_sub(prepared.gain)
-            .ok_or("MVM antenna power arithmetic overflow")?
-            .min(prepared.maximum);
-        if !(-1024..=1016).contains(&applied) {
-            return Err("MVM current radiated ceiling is outside the supported power range");
-        }
-        Ok(applied)
+        prepared.host_ceiling(domain)
     }
 
     async fn prepare_power_inner(
@@ -359,7 +391,14 @@ impl Owner {
     /// restrictions remain in place; this never sends a permissive reset. A
     /// later station attempt must earn fresh qualification/policy/receipts.
     pub fn release_transmit_power(&mut self) -> Result<(), &'static str> {
-        if self.phase != Phase::TransmitPowerPrepared || self.hardware.is_failed() {
+        if self.phase != Phase::TransmitPowerPrepared
+            || self.hardware.is_failed()
+            || self
+                .power
+                .prepared
+                .as_ref()
+                .is_some_and(|power| power.active_link.is_some())
+        {
             return Err("MVM owner has no completed inactive transmit-power preparation");
         }
         self.power.prepared = None;
@@ -370,4 +409,4 @@ impl Owner {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mvm_power_tests.rs"]
-mod tests;
+pub(super) mod tests;

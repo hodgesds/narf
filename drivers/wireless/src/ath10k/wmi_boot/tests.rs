@@ -30,6 +30,9 @@ fn literal_abi() -> Vec<u8> {
     ]
 }
 fn service_fixture(d: Dialect) -> Vec<u8> {
+    service_factory(d, 0x64)
+}
+fn service_factory(d: Dialect, factory: u32) -> Vec<u8> {
     let mut bitmap = vec![0u8; 64];
     // Legacy BSS_CHANNEL_INFO_64=25 (word6/bit1), PEER_CACHING=37
     // (word9/bit1), TLV RX_FULL_REORDER=65 (extended word0/bit1).
@@ -37,7 +40,7 @@ fn service_fixture(d: Dialect) -> Vec<u8> {
         u32at(&mut bitmap, at, 2);
     }
     let mut reg = vec![0u8; 36];
-    for (at, value) in [(0, 0x64), (20, 2412), (24, 2462), (28, 5180), (32, 5825)] {
+    for (at, value) in [(0, factory), (20, 2412), (24, 2462), (28, 5180), (32, 5825)] {
         u32at(&mut reg, at, value);
     }
     let requests: [[u32; 4]; 4] = [
@@ -103,6 +106,9 @@ fn ready_fixture(d: Dialect) -> Vec<u8> {
     }
 }
 fn event(d: Dialect, ready: bool) -> Vec<u8> {
+    event_factory(d, ready, 0x64)
+}
+fn event_factory(d: Dialect, ready: bool, factory: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     let id = if matches!(d, Dialect::Main | Dialect::Tlv) {
         1u32
@@ -113,7 +119,7 @@ fn event(d: Dialect, ready: bool) -> Vec<u8> {
     bytes.extend_from_slice(&if ready {
         ready_fixture(d)
     } else {
-        service_fixture(d)
+        service_factory(d, factory)
     });
     bytes
 }
@@ -125,6 +131,7 @@ struct Model {
     retained: Option<Vec<MemoryPlan>>,
     expected: Vec<u8>,
     stall_init: bool,
+    factory: u32,
 }
 impl Model {
     fn new(dialect: Dialect) -> Self {
@@ -142,6 +149,7 @@ impl Model {
             retained: None,
             expected: expected.to_vec(),
             stall_init: false,
+            factory: 0x64,
         }
     }
 }
@@ -175,8 +183,10 @@ impl Hif for Model {
             if bytes == [0, 0, 8, 0, 0, 0, 0, 0, 2, 0, 0, 3, 8, 0, 0, 0] {
                 self.rx.push_back((1, header(0, &[3, 0, 0, 3, 0, 1, 0, 1])));
             } else if bytes == [0, 0, 8, 0, 0, 1, 0, 0, 2, 0, 0, 1, 0, 32, 0, 0] {
-                self.rx
-                    .push_back((2, header(2, &event(self.dialect, false))));
+                self.rx.push_back((
+                    2,
+                    header(2, &event_factory(self.dialect, false, self.factory)),
+                ));
                 self.rx.push_back((1, header(0, &[3, 0, 0, 1, 0, 2, 0, 8])));
             } else if bytes != [0, 0, 12, 0, 0, 2, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
                 return Err(BmiError::BadResponse);

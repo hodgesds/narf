@@ -61,6 +61,12 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
         // One non-QoS three-address station. Optional modes are not admitted.
         0x00 | 0xb0 | 0xa0 | 0xc0 if frame[1] & (3 | 64) == 0 => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
+        0x88 if frame[1] & 3 == 1
+            && unicast(&frame[4..10])
+            && frame.get(24..26) == Some(&[0, 0]) =>
+        {
+            Ok(Queue::Data)
+        }
         _ => Err(Error::Frame),
     }
 }
@@ -89,8 +95,20 @@ pub(super) fn transmit(
     address: u64,
     report: bool,
 ) -> Result<(Vec<u8>, Queue), Error> {
+    transmit_rate(frame, own, mac_id, sequence, address, report, 0)
+}
+pub(super) fn transmit_rate(
+    frame: &[u8],
+    own: [u8; 6],
+    mac_id: u8,
+    sequence: u16,
+    address: u64,
+    report: bool,
+    rate: u8,
+) -> Result<(Vec<u8>, Queue), Error> {
     let queue = classify(frame, own)?;
-    if mac_id != 0 || sequence >= IDENTITIES {
+    if mac_id != 0 || sequence >= IDENTITIES || rate > 11 || queue == Queue::Management && rate != 0
+    {
         return Err(Error::Metadata);
     }
     extent(address, frame.len())?;
@@ -118,7 +136,7 @@ pub(super) fn transmit(
         0,
         body0 | 1 << 22 | if queue == Queue::Management { 5 } else { 0 },
     );
-    put(&mut bytes, 24, 1 << 30 | 1 << 10); // USE_RATE, DISDATAFB, CCK1.
+    put(&mut bytes, 24, 1 << 30 | 1 << 10 | u32::from(rate) << 16); // Source DATA_RATE[24:16].
     put(&mut bytes, 36, u32::from(report) << 10);
     put(&mut bytes, 40, 1 << 31 | u32::from(frame[4] & 1 == 0) << 27);
     Ok((bytes, queue))

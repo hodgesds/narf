@@ -212,18 +212,26 @@ kernel_test_in!(
 );
 
 fn changed() -> Result<(), &'static str> {
-    for deny_after in [2, 4] {
+    for (deny_after, clear) in [(2, false), (4, false), (2, true), (4, true)] {
         let mut session = ready_radio()?;
         let before = session.backend.frames.len();
         let calls = Cell::new(0);
+        let database = narf_wireless::reg::db::Database::new();
+        database.install(policy());
         let error = run(session.scan_active_with_policy(&[6], &[Vec::new()], || {
             let call = calls.get();
             calls.set(call + 1);
             if call >= deny_after {
-                Err(Error::Authority)
-            } else {
-                Ok(policy())
+                if clear {
+                    database.clear();
+                } else {
+                    return Err(Error::Authority);
+                }
             }
+            database
+                .snapshot()
+                .map(|domain| domain.as_ref().clone())
+                .ok_or(Error::Authority)
         }))
         .err();
         let frames = &session.backend.frames[before..];
@@ -242,12 +250,22 @@ fn changed() -> Result<(), &'static str> {
                 }
             )
             || !session.backend.owner.published
+            || clear && database.snapshot().is_some()
         {
             return Err(
                 "changed active-scan policy authorized TX/reuse or lost cancellation ownership",
             );
         }
-        if run(session.scan_active_with_policy(&[6], &[Vec::new()], || Ok(policy()))).err()
+        // Explicitly reinstalling policy cannot revive this failed scan's
+        // earlier grant or reinterpret its completion as a reusable owner.
+        database.install(policy());
+        if run(session.scan_active_with_policy(&[6], &[Vec::new()], || {
+            database
+                .snapshot()
+                .map(|domain| domain.as_ref().clone())
+                .ok_or(Error::Authority)
+        }))
+        .err()
             != Some(Error::Busy)
         {
             return Err("failed active scan reused a stale completion");

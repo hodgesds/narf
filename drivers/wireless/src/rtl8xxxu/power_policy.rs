@@ -8,6 +8,8 @@
 //! curve. Signature verification and signer trust belong to narf_firmware.
 use super::device_init::Factory;
 use alloc::{format, vec::Vec};
+use narf_capabilities::{Cap, NoopOp, Read};
+use narf_firmware::FirmwareBlob;
 use narf_firmware::FirmwareError;
 
 const HEADER: usize = 64;
@@ -40,6 +42,7 @@ pub struct Calibration {
     curves: Vec<Curve>,
     signer: [u8; 32],
     digest: [u8; 32],
+    authority: Option<Cap<FirmwareBlob, Read>>,
 }
 impl core::fmt::Debug for Calibration {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -111,6 +114,9 @@ fn factory_bytes(factory: Factory, vid: u16, pid: u16) -> [u8; 29] {
     bytes
 }
 impl Calibration {
+    pub(super) fn authority(&self) -> Option<Cap<FirmwareBlob, Read>> {
+        self.authority
+    }
     pub fn asset_name(factory: Factory) -> alloc::string::String {
         format!(
             "rtl8xxxu/rtl8188eu-cal-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
@@ -131,7 +137,10 @@ impl Calibration {
             .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
         let asset = crate::firmware_asset::load(&auth, &name, HEADER + MAX_ROWS * ROW, true)
             .map_err(Error::Firmware)?;
-        Self::from_verified(&asset.bytes, asset.signer, asset.digest, factory, vid, pid)
+        let mut calibration =
+            Self::from_verified(&asset.bytes, asset.signer, asset.digest, factory, vid, pid)?;
+        calibration.authority = Some(asset.cap);
+        Ok(calibration)
     }
     /// Called only after narf_firmware authenticated the current cap view.
     /// It is deliberately private; the kernel-test child exercises this same
@@ -211,6 +220,7 @@ impl Calibration {
             curves,
             signer,
             digest,
+            authority: None,
         })
     }
     pub fn permission(
@@ -218,6 +228,10 @@ impl Calibration {
         domain: &narf_wireless::reg::RegulatoryDomain,
         channel: u8,
     ) -> Result<Permission, Error> {
+        if let Some(cap) = &self.authority {
+            cap.invoke(NoopOp)
+                .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
+        }
         if channel != 1 || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err(Error::Policy);
         }

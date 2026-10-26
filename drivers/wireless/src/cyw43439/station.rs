@@ -30,6 +30,10 @@ pub struct Station<R: Fullmac> {
     pub cache: Vec<Bss>,
     scan_id: u16,
     pub supplicant: bool,
+    mfp_supported: bool,
+    mfp_verified: bool,
+    phy: Option<phy::Capabilities>,
+    ht_verified: bool,
     power_save: bool,
     operation: bool,
 }
@@ -92,27 +96,7 @@ impl<R: Fullmac> Station<R> {
         country[8..10].copy_from_slice(&domain.country_code);
         set_var(&mut runtime, "country", &country).await?;
         runtime.configure_bus().await?;
-        if R::BAND_5GHZ {
-            // A 20 MHz join chanspec alone is not a firmware bandwidth cap.
-            // Bound both actual BCM43602 bands before WLC_UP, and require
-            // readback; a wider automatic firmware policy cannot satisfy
-            // this retained 20 MHz host-policy profile.
-            for band in [2u32, 1u32] {
-                // WLC_BAND_2G, WLC_BAND_5G.
-                let mut cap = [0; 8];
-                cap[..4].copy_from_slice(&band.to_le_bytes());
-                cap[4..].copy_from_slice(&1u32.to_le_bytes()); // WLC_BW_CAP_20MHZ.
-                set_var(&mut runtime, "bw_cap", &cap).await?;
-                let mut query = b"bw_cap\0".to_vec();
-                query.extend_from_slice(&band.to_le_bytes());
-                let reply = runtime
-                    .command(Direction::Get, ioctl::WLC_GET_VAR, &query, 4)
-                    .await?;
-                if reply.as_slice() != 1u32.to_le_bytes() {
-                    return Err(Error::Unsupported);
-                }
-            }
-        }
+        let phy = phy::probe(&mut runtime).await?;
         set_int(&mut runtime, ioctl::WLC_SET_PM, 0).await?;
         set_int(&mut runtime, 20, 1).await?; // Infrastructure station.
         set_int(&mut runtime, 22, 0).await?; // Open-system 802.11 authentication.
@@ -132,6 +116,14 @@ impl<R: Fullmac> Station<R> {
         let supplicant = match get_var(&mut runtime, "sup_wpa", 4).await {
             Ok(bytes) => bytes.len() == 4,
             Err(Error::Firmware(code)) if code as i32 == -23 => false,
+            Err(error) => return Err(error),
+        };
+        // Linux feature.c probes this exact native iovar; host RSN flags
+        // alone do not establish firmware management-protection support.
+        let mfp_supported = match get_var(&mut runtime, "mfp", 4).await {
+            Ok(bytes) if bytes.len() == 4 && le32(&bytes, 0)? <= 2 => true,
+            Ok(_) => return Err(Error::Malformed),
+            Err(Error::Firmware(_)) => false,
             Err(error) => return Err(error),
         };
         policy::check_initial(&mut runtime, &policy, &domain)?;
@@ -172,6 +164,10 @@ impl<R: Fullmac> Station<R> {
             cache: Vec::new(),
             scan_id: 0,
             supplicant,
+            mfp_supported,
+            mfp_verified: false,
+            phy,
+            ht_verified: false,
             power_save: false,
             operation: false,
         })
@@ -180,6 +176,36 @@ impl<R: Fullmac> Station<R> {
     /// Last firmware-acknowledged ordinary station power-save policy.
     pub fn power_save(&self) -> bool {
         self.power_save
+    }
+
+    /// Completed firmware-offloaded PMF negotiation/key receipt metadata.
+    /// This grants no independent packet or management-frame authority.
+    pub fn management_protection(&self) -> bool {
+        self.mfp_verified && self.bssid.is_some() && self.connection.is_some()
+    }
+    /// Actual retained firmware MFP and four-way-offload capability. This is
+    /// wiphy metadata, not a completed protected association or key grant.
+    pub fn supports_management_protection(&self) -> bool {
+        self.mfp_supported && self.supplicant
+    }
+    /// Actual queried HT capabilities by2GHz/5GHz band. Width40 also requires
+    /// exact firmware chanspec inventory; it grants no operating permission.
+    pub fn ht_capabilities(&self) -> [Option<[u8; 26]>; 2] {
+        [false, true].map(|five| {
+            self.phy
+                .as_ref()
+                .filter(|_| !five || R::BAND_5GHZ)
+                .map(|phy| phy.body(five))
+        })
+    }
+    /// Completed native HT association facts for the currently admitted peer.
+    pub fn ht_connection(&self) -> bool {
+        self.ht_verified && self.bssid.is_some() && self.connection.is_some()
+    }
+    /// Last native-verified occupied width of this connected peer. Metadata
+    /// grants no TX authority; the current policy fence still guards service.
+    pub fn channel_width_mhz(&self) -> Option<u32> {
+        self.bssid.and(self.connection).map(policy::TxGrant::width)
     }
 
     /// Linux brcmf_cfg80211_set_power_mgmt: PM_FAST / PM_OFF followed by
@@ -420,9 +446,6 @@ impl<R: Fullmac> Station<R> {
             .ok_or(Error::Malformed)?
             .clone();
         self.refresh_policy()?;
-        let power =
-            channel_power(&self.domain, bss.info.channel as u8).ok_or(Error::Unsupported)?;
-        let grant = self.grant(bss.info.channel as u8, power)?;
         let secure = match &request.security {
             SecurityConfig::Open
                 if matches!(bss.info.security, narf_wireless::scan::BssSecurity::Open) =>
@@ -436,7 +459,6 @@ impl<R: Fullmac> Station<R> {
                 if rsn.group_cipher != ccmp
                     || !rsn.pairwise_ciphers.contains(&ccmp)
                     || !rsn.akms.contains(&Suite::standard(AKM_PSK))
-                    || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0
                 {
                     return Err(Error::Unsupported);
                 }
@@ -444,19 +466,44 @@ impl<R: Fullmac> Station<R> {
             }
             _ => return Err(Error::Unsupported),
         };
-        validate_association_ies(&request.ie, secure)?;
+        let protection =
+            mfp::Profile::negotiate(&bss.ies, &request.ie, secure, self.mfp_supported)?;
+        validate_association_ies(&request.ie, secure, protection.required())?;
+        let mut ht = self
+            .phy
+            .as_ref()
+            .map(|phy| phy.prepare(&bss.ies, bss.info.channel as u8, &self.channels))
+            .transpose()?
+            .flatten();
+        if ht.is_some_and(|profile| {
+            profile.channel.secondary.is_some()
+                && occupied_power(&self.domain, profile.channel).is_none()
+        }) {
+            ht = ht.map(phy::Profile::narrow);
+        }
+        let occupied = ht.map_or_else(
+            || channel::Operating::twenty(bss.info.channel as u8).ok_or(Error::Unsupported),
+            |profile| Ok(profile.channel),
+        )?;
+        let power = occupied_power(&self.domain, occupied).ok_or(Error::Unsupported)?;
+        let grant = self.grant_occupied(occupied, power)?;
+        self.mfp_verified = false;
+        self.ht_verified = false;
         self.tx_var(grant, "qtxpower", &(u32::from(power) * 4).to_le_bytes())
             .await?;
         self.runtime.poll()?;
         while self.runtime.pop_event().is_some() {}
         let result = async {
+            if self.phy.is_some() || R::BAND_5GHZ {
+                self.configure_width(grant, occupied).await?;
+            }
             self.tx_int(grant, 22, 0).await?;
             // Linux configures (and clears for Open) the association RSNE
             // before joining. Pin the firmware offload to this driver's
-            // single PSK/CCMP, no-PMF profile even on a mixed-mode AP.
+            // single negotiated PSK/CCMP profile even on a mixed-mode AP.
             let mut wpa_ie = Vec::new();
             if secure {
-                let body = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
+                let body = protection.rsn().encode_body();
                 wpa_ie.extend_from_slice(&[48, body.len() as u8]);
                 wpa_ie.extend_from_slice(&body);
             }
@@ -468,6 +515,16 @@ impl<R: Fullmac> Station<R> {
             )
             .await?;
             self.tx_int(grant, 134, if secure { 4 } else { 0 }).await?;
+            if self.mfp_supported {
+                // WSEC can overwrite MFP state: Linux cfg80211.c places
+                // this after cipher configuration, including NONE on Open.
+                self.tx_var(grant, "mfp", &protection.mode().to_le_bytes())
+                    .await?;
+                let applied = self.tx_query(grant, "mfp", 4).await?;
+                if applied.as_slice() != protection.mode().to_le_bytes() {
+                    return Err(Error::Unsupported);
+                }
+            }
             if self.supplicant {
                 self.tx_var(grant, "sup_wpa", &u32::from(secure).to_le_bytes())
                     .await?;
@@ -484,11 +541,7 @@ impl<R: Fullmac> Station<R> {
             join[4..4 + request.ssid.len()].copy_from_slice(&request.ssid);
             join[36..42].copy_from_slice(&request.bssid);
             join[44..48].copy_from_slice(&1u32.to_le_bytes());
-            join[48..50].copy_from_slice(
-                &channel::encode20(bss.info.channel as u8)
-                    .ok_or(Error::Unsupported)?
-                    .to_le_bytes(),
-            );
+            join[48..50].copy_from_slice(&occupied.chanspec().to_le_bytes());
             self.tx_command(grant, 26, &join).await?;
             let deadline = narf_time::Deadline::after_ms(15000);
             let (mut associated, mut keys) = (false, !secure);
@@ -534,6 +587,22 @@ impl<R: Fullmac> Station<R> {
                 // current FIFO/ring idle sample before opening the host port.
                 while self.runtime.pop_data().is_some() {}
                 if associated && keys && consumed == 0 {
+                    if let Some(profile) = ht.filter(|_| !self.ht_verified) {
+                        self.verify_phy(grant, request.bssid, bss.info.channel as u8, profile)
+                            .await?;
+                        self.ht_verified = true;
+                        // Native queries can consume later peer loss/data.
+                        // Re-observe a current FIFO/ring idle sample first.
+                        continue;
+                    }
+                    if protection.required() && !self.mfp_verified {
+                        self.verify_management_protection(grant, request.bssid, protection)
+                            .await?;
+                        self.mfp_verified = true;
+                        // Queries can drain new events/data. Require another
+                        // genuine idle fence before publishing the host port.
+                        continue;
+                    }
                     self.check_grants(core::slice::from_ref(&grant))?;
                     self.connection = Some(grant);
                     self.runtime.set_link(Some(request.bssid));
@@ -555,6 +624,8 @@ impl<R: Fullmac> Station<R> {
         }
         .await;
         if result.is_err() {
+            self.mfp_verified = false;
+            self.ht_verified = false;
             self.bssid = None;
             self.connection = None;
             self.runtime.set_link(None);
@@ -585,6 +656,8 @@ impl<R: Fullmac> Station<R> {
         self.check_connection_policy()?;
         let grant = self.connection.take();
         let peer = self.bssid.take();
+        self.mfp_verified = false;
+        self.ht_verified = false;
         self.runtime.set_link(None);
         if let Some(grant) = grant {
             self.tx_command(grant, 52, &[]).await?;
@@ -658,13 +731,18 @@ impl<R: Fullmac> Station<R> {
 mod policy;
 pub use policy::{GlobalPolicy, PolicySource};
 
+#[path = "station_mfp.rs"]
+mod mfp;
+#[path = "station_phy.rs"]
+mod phy;
+
 const MAX_REPLY: usize = 1502;
 
 /// The firmware offload builds its own association elements. Match the
 /// nl80211 PSK-offload contract: validate the requested RSNE, consume a
 /// bounded well-formed IE list, and leave firmware-generated capabilities
 /// and RSNXE to the firmware. External-key profiles remain unsupported.
-fn validate_association_ies(mut ies: &[u8], secure: bool) -> Result<(), Error> {
+fn validate_association_ies(mut ies: &[u8], secure: bool, mfp: bool) -> Result<(), Error> {
     use narf_wireless::rsn::*;
     if ies.len() > 2048 {
         return Err(Error::Malformed);
@@ -683,8 +761,11 @@ fn validate_association_ies(mut ies: &[u8], secure: bool) -> Result<(), Error> {
             if rsn.group_cipher != ccmp
                 || rsn.pairwise_ciphers != [ccmp]
                 || rsn.akms != [Suite::standard(AKM_PSK)]
-                || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0
+                || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0 && !mfp
                 || !rsn.pmkids.is_empty()
+                || rsn
+                    .group_management_cipher
+                    .is_some_and(|cipher| cipher != Suite::standard(CIPHER_BIP_CMAC_128))
             {
                 return Err(Error::Unsupported);
             }
@@ -733,17 +814,28 @@ fn le32(bytes: &[u8], index: usize) -> Result<u32, Error> {
     ))
 }
 fn channel_power(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> Option<u8> {
-    u8::try_from(channel_ceiling(domain, channel, true)?).ok()
+    occupied_power(domain, channel::Operating::twenty(channel)?)
+}
+fn occupied_power(
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: channel::Operating,
+) -> Option<u8> {
+    u8::try_from(occupied_ceiling(domain, channel, true)?).ok()
 }
 fn channel_ceiling(
     domain: &narf_wireless::reg::RegulatoryDomain,
     channel: u8,
     transmit: bool,
 ) -> Option<i8> {
+    occupied_ceiling(domain, channel::Operating::twenty(channel)?, transmit)
+}
+fn occupied_ceiling(
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: channel::Operating,
+    transmit: bool,
+) -> Option<i8> {
     use narf_wireless::reg::RegFlags;
-    let frequency = channel::frequency(channel)?;
-    let low = frequency - 10;
-    let high = frequency + 10;
+    let (low, high) = channel.span();
     let mut covered = false;
     let mut ceiling: Option<i8> = None;
     for rule in &domain.rules {
@@ -751,8 +843,8 @@ fn channel_ceiling(
             continue;
         }
         if rule.freq_start_mhz >= rule.freq_end_mhz
-            || rule.max_bandwidth_mhz < 20
-            || transmit && rule.flags.intersects(RegFlags::DFS | RegFlags::NO_IR)
+            || rule.max_bandwidth_mhz < channel.width()
+            || transmit && rule.flags.bits() & !RegFlags::NO_P2P.bits() != 0
         {
             return None;
         }

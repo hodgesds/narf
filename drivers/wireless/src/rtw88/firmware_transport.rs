@@ -24,6 +24,7 @@ pub enum Error {
     Memory,
     Firmware(FirmwareError),
     Power(super::power_policy::Error),
+    Calibration8821c(super::calibration8821c::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -31,6 +32,9 @@ pub enum Phase {
     Ready,
     MacPrepared,
     PhyTablesPrepared,
+    Calibration8821cPrepared,
+    Operating8821cPrepared,
+    Radio8821cPrepared,
     Calibrated,
     Station,
     Failed,
@@ -215,6 +219,24 @@ pub(super) unsafe trait Io: Send {
     fn finish_phy(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn begin_calibration8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_calibration8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn begin_operating8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_operating8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn begin_station8821c(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn finish_station8821c(&mut self, _: super::power_policy::Gate) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn begin_commands(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
@@ -224,13 +246,38 @@ pub(super) unsafe trait Io: Send {
     fn poll_h2c(&mut self) -> Result<bool, Error> {
         Err(Error::Unsupported)
     }
+    /// Drain the command producer and park bus mastering without granting
+    /// ordinary packets or reclaiming the retained firmware bounce buffers.
+    fn park_radio(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn finish_radio(&mut self, _: super::power_policy::Gate) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
     fn station_allowed(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn station_publication(&mut self) -> Result<super::publication::Publication, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_own(&mut self) -> Result<[u8; 6], Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_extension(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<super::station_profile::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_extension(
+        &mut self,
+        _: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn packet_profile(&mut self, _: super::packet_format::DataProfile) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_profile_readback(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
@@ -294,9 +341,16 @@ pub(super) struct Owner<I: Io> {
     hardware: Option<super::hardware::Features>,
     phy: Option<super::phy::Info>,
     phy8821c: Option<super::phy8821c::Info>,
+    calibration8821c: Option<super::radio8821c::Info>,
+    envelope8821c: Option<alloc::sync::Arc<super::calibration8821c::Envelope>>,
+    operating8821c: Option<super::operating8821c::Info>,
+    operating_envelope8821c: Option<alloc::sync::Arc<super::operating8821c::Envelope>>,
+    station_grant8821c: Option<alloc::sync::Arc<super::station_power8821c::Grant>>,
+    station_radio8821c: Option<super::radio8821c::StationInfo>,
     image_digest: Option<[u8; 32]>,
     power: Option<alloc::sync::Arc<super::power_policy::Calibration>>,
     radio: Option<super::radio::Info>,
+    radio_gate: Option<super::power_policy::Gate>,
     station: Option<super::station::State>,
 }
 impl<I: Io> core::fmt::Debug for Owner<I> {
@@ -318,9 +372,16 @@ impl<I: Io> Owner<I> {
             hardware: None,
             phy: None,
             phy8821c: None,
+            calibration8821c: None,
+            envelope8821c: None,
+            operating8821c: None,
+            operating_envelope8821c: None,
+            station_grant8821c: None,
+            station_radio8821c: None,
             image_digest: None,
             power: None,
             radio: None,
+            radio_gate: None,
             station: None,
         }
     }
@@ -332,7 +393,9 @@ impl<I: Io> Owner<I> {
         environment: alloc::sync::Arc<dyn super::station::Environment>,
         admission: super::station_control::Admission,
     ) -> Result<super::station_control::Admission, super::station::Error> {
-        if self.phase != Phase::Calibrated || self.station.is_some() {
+        if !matches!(self.phase, Phase::Calibrated | Phase::Radio8821cPrepared)
+            || self.station.is_some()
+        {
             return Err(super::station::Error::State);
         }
         let own = self.io.station_own()?;
@@ -368,6 +431,14 @@ impl<I: Io> Owner<I> {
         }
         self.io
             .station_allowed()
+            .map_err(super::station::Error::Native)
+    }
+    pub(super) fn station_publication(
+        &mut self,
+    ) -> Result<super::publication::Publication, super::station::Error> {
+        self.station_check()?;
+        self.io
+            .station_publication()
             .map_err(super::station::Error::Native)
     }
     pub(super) fn station_phase(&self) -> Option<super::station::Phase> {
@@ -440,7 +511,13 @@ impl<I: Io> Owner<I> {
     pub fn mac_info(&self) -> Option<super::mac::Info> {
         matches!(
             self.phase,
-            Phase::MacPrepared | Phase::PhyTablesPrepared | Phase::Calibrated | Phase::Station
+            Phase::MacPrepared
+                | Phase::PhyTablesPrepared
+                | Phase::Calibration8821cPrepared
+                | Phase::Operating8821cPrepared
+                | Phase::Radio8821cPrepared
+                | Phase::Calibrated
+                | Phase::Station
         )
         .then_some(self.mac)
         .flatten()
@@ -448,7 +525,13 @@ impl<I: Io> Owner<I> {
     pub(super) fn hardware_info(&self) -> Option<super::hardware::Features> {
         if matches!(
             self.phase,
-            Phase::MacPrepared | Phase::PhyTablesPrepared | Phase::Calibrated | Phase::Station
+            Phase::MacPrepared
+                | Phase::PhyTablesPrepared
+                | Phase::Calibration8821cPrepared
+                | Phase::Operating8821cPrepared
+                | Phase::Radio8821cPrepared
+                | Phase::Calibrated
+                | Phase::Station
         ) {
             self.hardware
         } else {
@@ -486,6 +569,9 @@ impl<I: Io> Owner<I> {
             Phase::Ready
             | Phase::MacPrepared
             | Phase::PhyTablesPrepared
+            | Phase::Calibration8821cPrepared
+            | Phase::Operating8821cPrepared
+            | Phase::Radio8821cPrepared
             | Phase::Calibrated
             | Phase::Station => self.image_digest,
             _ => None,
@@ -641,10 +727,271 @@ impl<I: Io> Owner<I> {
             permission,
             policy,
         };
+        self.radio_gate = Some(gate.clone());
         let info = super::radio::prepare(&mut io, factory, mac, phy, gain, gate).await?;
         self.radio = Some(info);
         self.phase = Phase::Calibrated;
         Ok(info)
+    }
+    pub(super) fn calibration_info8821c(&self) -> Option<super::radio8821c::Info> {
+        matches!(
+            self.phase,
+            Phase::Calibration8821cPrepared
+                | Phase::Operating8821cPrepared
+                | Phase::Radio8821cPrepared
+                | Phase::Station
+        )
+        .then_some(self.calibration8821c)
+        .flatten()
+    }
+    pub(super) fn legacy_wmm_request(&self) -> Result<super::station_profile::Request, Error> {
+        if !matches!(self.phase, Phase::Calibrated | Phase::Station) {
+            return Err(Error::State);
+        }
+        self.radio_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::extension_request)
+            .ok_or(Error::Unsupported)
+    }
+    pub(super) fn operating_info8821c(&self) -> Option<super::operating8821c::Info> {
+        matches!(
+            self.phase,
+            Phase::Operating8821cPrepared | Phase::Radio8821cPrepared | Phase::Station
+        )
+        .then_some(self.operating8821c)
+        .flatten()
+    }
+    pub(super) fn operating_request8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::operating8821c::Request, Error> {
+        if self.did != 0xc821
+            || !matches!(
+                self.phase,
+                Phase::Calibration8821cPrepared
+                    | Phase::Operating8821cPrepared
+                    | Phase::Radio8821cPrepared
+                    | Phase::Station
+            )
+        {
+            return Err(Error::State);
+        }
+        Ok(super::operating8821c::request(
+            self.calibration_board8821c(factory)?.request(),
+            self.calibration8821c.ok_or(Error::State)?,
+        ))
+    }
+    pub(super) fn preflight_operating8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+        source: super::operating8821c::Source,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<alloc::sync::Arc<super::operating8821c::Envelope>, Error> {
+        if self.phase != Phase::Calibration8821cPrepared {
+            return Err(Error::State);
+        }
+        let envelope = source.load(
+            self.operating_request8821c(factory)?,
+            factory,
+            self.envelope8821c.as_ref().ok_or(Error::State)?.clone(),
+        )?;
+        envelope.invoke(&|| Ok(domain.clone()), || Ok(()))?;
+        Ok(alloc::sync::Arc::new(envelope))
+    }
+    pub(super) async fn prepare_operating8821c<F>(
+        &mut self,
+        factory: &super::efuse::Factory8821c,
+        envelope: alloc::sync::Arc<super::operating8821c::Envelope>,
+        policy: F,
+    ) -> Result<super::operating8821c::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        if self.phase != Phase::Calibration8821cPrepared
+            || !envelope.matches(&self.operating_request8821c(factory)?)
+        {
+            return Err(Error::State);
+        }
+        envelope.invoke(&policy, || Ok(()))?;
+        self.phase = Phase::Failed;
+        self.operating_envelope8821c = Some(envelope.clone());
+        let info = narf_time::timeout(
+            narf_time::Deadline::after_ms(3000),
+            envelope.prepare(&mut self.io, policy),
+        )
+        .await
+        .map_err(|_| Error::Deadline)??;
+        self.operating8821c = Some(info);
+        self.phase = Phase::Operating8821cPrepared;
+        Ok(info)
+    }
+    pub(super) fn station_request8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::station_power8821c::Request, Error> {
+        if self.did != 0xc821
+            || !matches!(
+                self.phase,
+                Phase::Operating8821cPrepared | Phase::Radio8821cPrepared | Phase::Station
+            )
+        {
+            return Err(Error::State);
+        }
+        // Retained power identity already binds the immutable factory/cut/RFE,
+        // original firmware, IQK recipe and all exact operating gain indices.
+        if !self
+            .envelope8821c
+            .as_ref()
+            .ok_or(Error::State)?
+            .matches(self.calibration_board8821c(factory)?)
+        {
+            return Err(Error::State);
+        }
+        Ok(super::station_power8821c::request(
+            self.operating8821c.ok_or(Error::State)?,
+            factory.mac(),
+        ))
+    }
+    pub(super) fn station_radio_info8821c(&self) -> Option<super::radio8821c::StationInfo> {
+        matches!(self.phase, Phase::Radio8821cPrepared | Phase::Station)
+            .then_some(self.station_radio8821c)
+            .flatten()
+    }
+    pub(super) fn preflight_station8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+        source: super::station_power8821c::Source,
+    ) -> Result<alloc::sync::Arc<super::station_power8821c::Grant>, Error> {
+        if self.phase != Phase::Operating8821cPrepared {
+            return Err(Error::State);
+        }
+        source.load(
+            self.station_request8821c(factory)?,
+            self.operating_envelope8821c
+                .as_ref()
+                .ok_or(Error::State)?
+                .clone(),
+        )
+    }
+    pub(super) async fn prepare_station8821c(
+        &mut self,
+        factory: &super::efuse::Factory8821c,
+        grant: alloc::sync::Arc<super::station_power8821c::Grant>,
+    ) -> Result<super::radio8821c::StationInfo, Error> {
+        if self.phase != Phase::Operating8821cPrepared
+            || !grant.matches(&self.station_request8821c(factory)?)
+        {
+            return Err(Error::State);
+        }
+        grant.check()?;
+        self.phase = Phase::Failed;
+        self.station_grant8821c = Some(grant.clone());
+        let result = narf_time::timeout(
+            narf_time::Deadline::after_ms(4000),
+            super::radio8821c::prepare_station(
+                &mut self.io,
+                factory,
+                self.phy8821c.ok_or(Error::State)?,
+                self.calibration8821c.ok_or(Error::State)?,
+                self.operating8821c.ok_or(Error::State)?,
+                grant,
+            ),
+        )
+        .await
+        .map_err(|_| Error::Deadline)??;
+        self.station_radio8821c = Some(result);
+        self.phase = Phase::Radio8821cPrepared;
+        Ok(result)
+    }
+    pub(super) fn calibration_request8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::calibration8821c::Request, Error> {
+        if self.did != 0xc821 {
+            return Err(Error::Unsupported);
+        }
+        if !matches!(
+            self.phase,
+            Phase::PhyTablesPrepared
+                | Phase::Calibration8821cPrepared
+                | Phase::Operating8821cPrepared
+                | Phase::Radio8821cPrepared
+                | Phase::Station
+        ) {
+            return Err(Error::State);
+        }
+        Ok(self.calibration_board8821c(factory)?.request())
+    }
+    fn calibration_board8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+    ) -> Result<super::calibration8821c::Board, Error> {
+        super::calibration8821c::Board::new(
+            factory,
+            self.phy8821c.ok_or(Error::State)?,
+            self.mac.ok_or(Error::State)?,
+            self.hardware.ok_or(Error::State)?,
+            self.image_digest.ok_or(Error::State)?,
+        )
+        .map_err(Error::Calibration8821c)
+    }
+    pub(super) fn preflight_calibration8821c(
+        &self,
+        factory: &super::efuse::Factory8821c,
+        source: super::calibration8821c::Source,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<alloc::sync::Arc<super::calibration8821c::Envelope>, Error> {
+        if self.did != 0xc821 {
+            return Err(Error::Unsupported);
+        }
+        if self.phase != Phase::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        let envelope = source
+            .load(self.calibration_board8821c(factory)?)
+            .map_err(Error::Calibration8821c)?;
+        envelope.validate(domain).map_err(Error::Calibration8821c)?;
+        Ok(alloc::sync::Arc::new(envelope))
+    }
+    pub(super) async fn prepare_calibration8821c<F>(
+        &mut self,
+        factory: &super::efuse::Factory8821c,
+        envelope: alloc::sync::Arc<super::calibration8821c::Envelope>,
+        policy: F,
+    ) -> Result<super::radio8821c::Info, Error>
+    where
+        F: Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error> + Send + Sync,
+    {
+        if self.did != 0xc821 || self.phase != Phase::PhyTablesPrepared {
+            return Err(Error::State);
+        }
+        // Consume only a preflight for the same immutable board/firmware owner.
+        if !envelope.matches(self.calibration_board8821c(factory)?) {
+            return Err(Error::Calibration8821c(
+                super::calibration8821c::Error::Identity,
+            ));
+        }
+        envelope
+            .validate(&policy()?)
+            .map_err(Error::Calibration8821c)?;
+        self.phase = Phase::Failed;
+        self.envelope8821c = Some(envelope.clone()); // before the first device access/await
+        let mac = self.mac.ok_or(Error::State)?;
+        let phy = self.phy8821c.ok_or(Error::State)?;
+        let mut checked = super::radio8821c::Checked {
+            io: &mut self.io,
+            envelope: &envelope,
+            policy,
+        };
+        let result = narf_time::timeout(
+            narf_time::Deadline::after_ms(12000),
+            super::radio8821c::prepare(&mut checked, factory, mac, phy, &envelope),
+        )
+        .await
+        .map_err(|_| Error::Deadline)??;
+        self.calibration8821c = Some(result);
+        self.phase = Phase::Calibration8821cPrepared;
+        Ok(result)
     }
     pub(super) async fn prepare_phy8821c(
         &mut self,
@@ -894,7 +1241,7 @@ mod power_policy_tests;
 mod radio_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "station_composition_tests.rs"]
-mod station_composition_tests;
+pub(super) mod station_composition_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "firmware_transport_tests.rs"]
 mod tests;

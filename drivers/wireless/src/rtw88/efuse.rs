@@ -66,6 +66,10 @@ impl Factory8821c {
     pub fn thermal(&self) -> u8 {
         self.logical[0xba]
     }
+    /// Original RTL8821C map offset0xc6; calibration does not invent an erased swing.
+    pub fn swing_2g(&self) -> u8 {
+        self.logical[0xc6]
+    }
     pub fn board_option(&self) -> u8 {
         self.logical[0xc1]
     }

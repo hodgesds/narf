@@ -42,9 +42,9 @@ struct Pending {
 pub(super) struct Receiver {
     info: Ht20ReceiveInfo,
     own: [u8; 6],
-    // Remains false until the complete HT/WMM peer/MLME owner is wired.
-    // Test models may exercise this post-admission seam; Transport has no
-    // activation API and the public station remains legacy-only.
+    // Preparation remains inactive; only the complete bound HT/WMM/peer/
+    // security receipt path activates it. Older tests may also exercise the
+    // explicit model-only post-admission seam.
     pub(super) active: bool,
     pending: Option<Pending>,
 }
@@ -95,7 +95,8 @@ impl Receiver {
         }
         let ht = ht.ok_or(Error::UnsupportedFirmware)?;
         let operation = operation.ok_or(Error::UnsupportedFirmware)?;
-        // The narrow receive prerequisite is one stream, HT20, long GI.
+        // The narrow receive prerequisite is one stream, HT20. Guard
+        // interval selection does not change the native MSDU layout.
         // Do not infer higher NSS or accept an AP mandatory basic MCS above7.
         if ht[3] == 0 || operation[7..].iter().any(|&byte| byte != 0) {
             return Err(Error::UnsupportedFirmware);
