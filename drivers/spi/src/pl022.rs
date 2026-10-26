@@ -300,7 +300,7 @@ pub(crate) fn probe_dt(
     // SAFETY: the ioremap covers the PL022 register block.
     let spi = unsafe { Pl022Spi::new_mapped(name, mapping, sspclk_hz) };
     let bus = crate::registry::register_unique(alloc::sync::Arc::new(spi));
-    crate::dt::publish_children(&rec, bus.name());
+    crate::dt::publish_and_bind(&rec, &bus);
     Ok(())
 }
 

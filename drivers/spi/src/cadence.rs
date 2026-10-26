@@ -278,7 +278,7 @@ pub(crate) fn probe_dt(
     // SAFETY: the ioremap covers the Cadence register block.
     let spi = unsafe { CadenceSpi::new_mapped(name, mapping, ref_clk_hz) };
     let bus = crate::registry::register_unique(alloc::sync::Arc::new(spi));
-    crate::dt::publish_children(&rec, bus.name());
+    crate::dt::publish_and_bind(&rec, &bus);
     Ok(())
 }
 

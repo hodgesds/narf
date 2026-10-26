@@ -91,17 +91,44 @@ pub fn publish_children_from(
 ) -> usize {
     let mut n = 0;
     for child in narf_bus::dt::children_of(blob, parent_first_compatible, parent_base) {
-        let Some((cs, _)) = child.reg else {
-            continue;
-        };
-        publish_child(SpiChild {
-            controller: String::from(bus_name),
-            name: child.name.clone(),
-            compatible: child.compatible.clone(),
-            cs: cs as u32,
-            max_hz: child.prop_u32("spi-max-frequency").unwrap_or(0),
-        });
-        n += 1;
+        if let Some(spi_child) = spi_child_of(bus_name, &child) {
+            publish_child(spi_child);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Convert one decoded DT child into a publishable [`SpiChild`]
+/// (`None` when it carries no chip-select `reg`).
+fn spi_child_of(bus_name: &str, child: &narf_bus::dt::DtChild) -> Option<SpiChild> {
+    let (cs, _) = child.reg?;
+    Some(SpiChild {
+        controller: String::from(bus_name),
+        name: child.name.clone(),
+        compatible: child.compatible.clone(),
+        cs: cs as u32,
+        max_hz: child.prop_u32("spi-max-frequency").unwrap_or(0),
+    })
+}
+
+/// Publish a bound controller's DT children AND bind any
+/// SPI-NOR children as MTD devices (step 6). Returns how many
+/// children carried a chip-select `reg`.
+pub fn publish_and_bind(rec: &PlatformDevice, bus: &alloc::sync::Arc<dyn crate::SpiBus>) -> usize {
+    let Some(blob) = narf_bus::dt::dtb_blob() else {
+        return 0;
+    };
+    let Some(win) = rec.reg_windows().first() else {
+        return 0;
+    };
+    let mut n = 0;
+    for child in narf_bus::dt::children_of(blob, rec.first_compatible(), win.base.raw()) {
+        if let Some(spi_child) = spi_child_of(bus.name(), &child) {
+            publish_child(spi_child.clone());
+            n += 1;
+            crate::spi_nor::try_bind(bus, &spi_child);
+        }
     }
     n
 }

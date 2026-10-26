@@ -778,3 +778,178 @@ fn smoke_spi_dt_children_publish() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers-spi", smoke_spi_dt_children_publish);
+
+// ── SPI-NOR (DT programme step 6) ───────────────────────────────
+//
+// A modelled NOR chip behind a fake SpiBus: WEL discipline is
+// enforced (program/erase without WREN are ignored, so a driver
+// that forgets WREN fails its read-back), WIP counts down over
+// status polls, program ANDs, erase resets 64 KiB blocks.
+
+use narf_drivers_storage_mtd::MtdDevice;
+use narf_lib::sync::IrqSafeSpinLock;
+
+#[derive(Debug)]
+struct NorState {
+    cells: alloc::vec::Vec<u8>,
+    wel: bool,
+    wip_polls: u32,
+    id: [u8; 3],
+}
+
+#[derive(Debug)]
+struct FakeNorBus {
+    state: IrqSafeSpinLock<NorState>,
+}
+
+impl FakeNorBus {
+    fn with_id(id: [u8; 3]) -> Self {
+        Self {
+            state: IrqSafeSpinLock::new(NorState {
+                cells: alloc::vec![0xFF; 2 << 20],
+                wel: false,
+                wip_polls: 0,
+                id,
+            }),
+        }
+    }
+
+    fn addr_of(tx: &[u8]) -> usize {
+        ((tx[1] as usize) << 16) | ((tx[2] as usize) << 8) | tx[3] as usize
+    }
+}
+
+impl SpiBus for FakeNorBus {
+    fn name(&self) -> &str {
+        "fake-nor"
+    }
+
+    fn transfer(&self, tx: &[u8], rx: &mut [u8]) -> Result<(), SpiError> {
+        let mut st = self.state.lock();
+        if tx.is_empty() {
+            return Ok(());
+        }
+        match tx[0] {
+            0x06 => st.wel = true, // WREN
+            0x05 => {
+                // RDSR: WIP while the countdown runs; WEL clears
+                // when the operation completes.
+                if rx.len() > 1 {
+                    rx[1] = if st.wip_polls > 0 {
+                        st.wip_polls -= 1;
+                        0x01 | 0x02
+                    } else {
+                        st.wel = false;
+                        0x00
+                    };
+                }
+            }
+            0x9F => {
+                for i in 0..3 {
+                    if rx.len() > 1 + i {
+                        rx[1 + i] = st.id[i];
+                    }
+                }
+            }
+            0x03 => {
+                let addr = Self::addr_of(tx);
+                for i in 0..rx.len().saturating_sub(4) {
+                    rx[4 + i] = st.cells.get(addr + i).copied().unwrap_or(0xFF);
+                }
+            }
+            0x02 => {
+                if st.wel && tx.len() > 4 {
+                    let addr = Self::addr_of(tx);
+                    for (i, b) in tx[4..].iter().enumerate() {
+                        if addr + i < st.cells.len() {
+                            st.cells[addr + i] &= b;
+                        }
+                    }
+                    st.wip_polls = 2;
+                }
+            }
+            0xD8 => {
+                if st.wel {
+                    let addr = Self::addr_of(tx);
+                    let base = addr - addr % 0x1_0000;
+                    let end = (base + 0x1_0000).min(st.cells.len());
+                    st.cells[base..end].fill(0xFF);
+                    st.wip_polls = 3;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn transfer_full_duplex(&self, tx: &mut [u8], rx: &mut [u8]) -> Result<(), SpiError> {
+        let len = core::cmp::min(tx.len(), rx.len());
+        let snapshot = tx[..len].to_vec();
+        self.transfer(&snapshot, &mut rx[..len])
+    }
+
+    fn set_mode(&self, _mode: SpiMode) -> Result<(), SpiError> {
+        Ok(())
+    }
+
+    fn set_freq(&self, _hz: u32) -> Result<(), SpiError> {
+        Ok(())
+    }
+
+    fn set_cs(&self, _cs: u8) -> Result<(), SpiError> {
+        Ok(())
+    }
+}
+
+fn smoke_spi_nor_bind_and_round_trip() -> TestResult {
+    narf_drivers_storage_mtd::registry::__reset_for_test();
+    let bus: Arc<dyn SpiBus> = Arc::new(FakeNorBus::with_id([0xEF, 0x40, 0x15]));
+    let child = crate::dt::SpiChild {
+        controller: "fake-nor".into(),
+        name: "flash@0".into(),
+        compatible: b"jedec,spi-nor\0".to_vec(),
+        cs: 0,
+        max_hz: 0,
+    };
+    let Some(dev) = crate::spi_nor::try_bind(&bus, &child) else {
+        return TestResult::Fail("SPI-NOR try_bind refused a known JEDEC part");
+    };
+    if dev.size() != 2 << 20 || dev.erase_size() != 0x1_0000 || dev.write_size() != 256 {
+        return TestResult::Fail("SPI-NOR geometry mismatch for W25Q16");
+    }
+    if narf_drivers_storage_mtd::registry::find("spi-nor@fake-nor.0").is_none() {
+        return TestResult::Fail("SPI-NOR device not in the MTD registry");
+    }
+    // Program 300 bytes across a page boundary (200..500), read
+    // them back exactly.
+    let pattern: alloc::vec::Vec<u8> = (0..300u32).map(|i| (i as u8).wrapping_mul(37)).collect();
+    if dev.write(200, &pattern).is_err() {
+        return TestResult::Fail("SPI-NOR page program failed");
+    }
+    let mut back = [0u8; 300];
+    if dev.read(200, &mut back).is_err() || back != *pattern {
+        return TestResult::Fail("SPI-NOR read-back mismatch across the page boundary");
+    }
+    // Erase restores block 0; a block-1 write survives it.
+    if dev.write(0x1_0000, &[0x77]).is_err() {
+        return TestResult::Fail("SPI-NOR block-1 write failed");
+    }
+    if dev.erase(0, 0x1_0000).is_err() {
+        return TestResult::Fail("SPI-NOR block erase failed");
+    }
+    let mut byte = [0u8; 1];
+    if dev.read(200, &mut byte).is_err() || byte[0] != 0xFF {
+        return TestResult::Fail("SPI-NOR erase did not restore block 0");
+    }
+    if dev.read(0x1_0000, &mut byte).is_err() || byte[0] != 0x77 {
+        return TestResult::Fail("SPI-NOR erase clobbered block 1");
+    }
+    // An unknown JEDEC ID is not bound.
+    let bus2: Arc<dyn SpiBus> = Arc::new(FakeNorBus::with_id([0xAA, 0xBB, 0xCC]));
+    if crate::spi_nor::try_bind(&bus2, &child).is_some() {
+        return TestResult::Fail("SPI-NOR bound an unknown JEDEC part");
+    }
+    narf_drivers_storage_mtd::registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers-spi", smoke_spi_nor_bind_and_round_trip);

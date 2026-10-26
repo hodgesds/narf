@@ -58,6 +58,7 @@ pub mod intel_lpss;
 /// Read-only; see the module docs for why.
 pub mod intel_spi_flash;
 pub mod pl022;
+pub mod spi_nor;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
