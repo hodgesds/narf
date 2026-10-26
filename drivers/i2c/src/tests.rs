@@ -408,16 +408,16 @@ enum OpSpec {
     Read(usize),
 }
 
+/// What `run_dw_transfer`'s spawned task hands back through the
+/// outcome cell: the transfer result plus the read buffers.
+type TransferOutcome = (Result<(), I2cError>, Vec<Vec<u8>>);
+
 /// Run one `transfer()` on the test scheduler (the existing
 /// spawn + run_until_empty idiom) and return its result plus the
 /// read buffers (one per op, empty for writes).
-fn run_dw_transfer(
-    bus: Arc<dyn I2cBus>,
-    addr: u8,
-    specs: Vec<OpSpec>,
-) -> (Result<(), I2cError>, Vec<Vec<u8>>) {
+fn run_dw_transfer(bus: Arc<dyn I2cBus>, addr: u8, specs: Vec<OpSpec>) -> TransferOutcome {
     narf_scheduler::__reset_queues_for_test();
-    let cell: Arc<narf_lib::sync::IrqSafeSpinLock<Option<(Result<(), I2cError>, Vec<Vec<u8>>)>>> =
+    let cell: Arc<narf_lib::sync::IrqSafeSpinLock<Option<TransferOutcome>>> =
         Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None));
     let cell2 = cell.clone();
     narf_scheduler::spawn(async move {
@@ -865,6 +865,42 @@ fn smoke_amd_fch_dw_data_nack_maps_to_nack() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_data_nack_maps_to_nack);
+
+fn smoke_amd_fch_dw_address_nack_maps_to_nack() -> TestResult {
+    // Target present at DW_ADDR but NAKing its address phase (a
+    // device held in reset / powered down): the model raises
+    // ABRT_7B_ADDR_NOACK (bit 0) — the same source as an absent
+    // device, but here the target is on the bus and records the
+    // AddrNak. The transfer must surface I2cError::Nack, no byte
+    // may be delivered, and the driver must clear the abort.
+    let model = DwModel::new();
+    let mut target = VirtualTarget::new(DW_ADDR, 1);
+    target.set_nak_address(true);
+    model.attach(target);
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let (result, _) = run_dw_transfer(
+        bus,
+        DW_ADDR,
+        alloc::vec![OpSpec::Write(alloc::vec![0x10, 0xA0])],
+    );
+    if result != Err(I2cError::Nack) {
+        return TestResult::Fail("address NAK didn't surface as I2cError::Nack");
+    }
+    if model.events(DW_ADDR) != alloc::vec![BusEvent::AddrNak] {
+        return TestResult::Fail("address-NAKed target saw more than the AddrNak");
+    }
+    if model.target_reg(DW_ADDR, 0x10) != 0 {
+        return TestResult::Fail("a byte was stored despite the address NAK");
+    }
+    if model.tx_abrt_latched() {
+        return TestResult::Fail("TX_ABRT still latched after the address-NAK transfer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_address_nack_maps_to_nack);
 
 fn smoke_amd_fch_dw_abort_reason_mapping() -> TestResult {
     // ABRT_SBYTE_NORSTRT (bit 9) is none of the driver's special
