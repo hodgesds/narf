@@ -4648,6 +4648,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         narf_userspace::release_external_shared_frame,
     );
     narf_memory::install_address_space_drop_hook(narf_userspace::drop_mapped_file_address_space);
+    narf_memory::install_address_space_fork_hook(narf_userspace::fork_mapped_file_address_space);
 
     // Let a filesystem driver ask Linux's `capable()` about the calling
     // process — the handful of checks Linux makes inside a driver rather than

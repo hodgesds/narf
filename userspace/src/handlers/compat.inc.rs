@@ -8380,15 +8380,10 @@ fn task_cpus_allowed(task: u64) -> u64 {
 /// Return the full rlimit table for `pid` as `[(cur, max); 16]`.
 /// Indices follow RLIMIT_* numbering (0=CPU, 3=STACK, 7=NOFILE, …).
 pub fn rlimits_of(pid: u64) -> [(u64, u64); 16] {
-    // Rows are keyed by the monotonic group-leader TaskId; /proc hands this
-    // accessor an outer ProcessId, so resolve it before entering the table.
+    // /proc hands this accessor an outer ProcessId. Snapshot the complete
+    // process-owned object under its lock, not independent READ_ONCE words.
     let key = pid_to_task_raw(pid).unwrap_or(pid);
-    let row = {
-        let g = RLIMIT_TABLE.lock();
-        g.as_ref()
-            .and_then(|state| state.rows.get(&key).copied())
-            .unwrap_or_else(default_rlimits)
-    };
+    let row = rlimit_owner(key).snapshot();
     let mut out = [(0u64, 0u64); 16];
     for (i, p) in row.iter().enumerate() {
         out[i] = (p.cur, p.max);

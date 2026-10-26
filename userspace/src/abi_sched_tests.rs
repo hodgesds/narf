@@ -229,6 +229,192 @@ fn smoke_abi_sched_setrlimit_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setrlimit_pos);
 
+fn smoke_abi_rlimit_read_once_observes_remote_update() -> TestResult {
+    with_setup(|| {
+        const OTHER: u64 = 0xA7_310;
+        let _owner = crate::task::Task::new_registered(OTHER, OTHER);
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        let result = (|| {
+            let initial = [128u64, 4096u64];
+            if call(Syscall::Setrlimit.raw(), a1(7, initial.as_ptr() as u64)) != Some(0) {
+                return Err("set initial rlimit failed");
+            }
+            let mut output = [0u64; 2];
+            if call(Syscall::Getrlimit.raw(), a1(7, output.as_mut_ptr() as u64)) != Some(0)
+                || output != initial
+            {
+                return Err("initial rlimit read failed");
+            }
+            if crate::handlers::__test_rlimit_read_once(FAKE_TASK, 7) != Some((128, 4096)) {
+                return Err("READ_ONCE did not read the process limits");
+            }
+            let changed = [64u64, 4096u64];
+            let mut prior = [0u64; 2];
+            set_task(OTHER);
+            let updated = call(
+                Syscall::Prlimit64.raw(),
+                a3(
+                    FAKE_TASK,
+                    7,
+                    changed.as_ptr() as u64,
+                    prior.as_mut_ptr() as u64,
+                ),
+            );
+            set_task(FAKE_TASK);
+            if updated != Some(0) || prior != initial {
+                return Err("remote prlimit did not atomically return the previous pair");
+            }
+            if call(Syscall::Getrlimit.raw(), a1(7, output.as_mut_ptr() as u64)) != Some(0)
+                || output != changed
+            {
+                return Err("limit read missed a completed remote update");
+            }
+            if crate::handlers::__test_rlimit_read_once(FAKE_TASK, 7) != Some((64, 4096)) {
+                return Err("READ_ONCE missed a completed remote update");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::task::mark_zombie(OTHER);
+        crate::handlers::release_reaped_task(OTHER);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit",
+    smoke_abi_rlimit_read_once_observes_remote_update
+);
+
+fn smoke_abi_rlimit_read_once_fresh_task_needs_no_locks() -> TestResult {
+    with_setup(|| {
+        const TASK: u64 = 0xA7_315;
+        let owner = crate::task::Task::new_registered(TASK, TASK);
+        crate::handlers::register_pid_task_mapping(TASK, TASK);
+        let seeded = crate::handlers::__test_set_rlimit(TASK, 7, 63, 200);
+        let observed = crate::handlers::__test_rlimit_read_once_under_locks(TASK, 7);
+        crate::task::release_task(TASK);
+        drop(owner);
+        if seeded && observed == Some((63, 200)) {
+            Ok(())
+        } else {
+            Err("fresh task's direct limits path did not read the actual atomic words")
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit",
+    smoke_abi_rlimit_read_once_fresh_task_needs_no_locks
+);
+
+fn smoke_abi_rlimit_missing_proc_read_does_not_create_owner() -> TestResult {
+    with_setup(|| {
+        let before = crate::handlers::__test_rlimit_storage_len();
+        let limits = crate::handlers::rlimits_of(0xA7_31F);
+        if limits[7] != (1024, 4096) {
+            return Err("missing process did not return the default limits");
+        }
+        if crate::handlers::__test_rlimit_storage_len() != before {
+            return Err("reading a missing process created a permanent limits owner");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit",
+    smoke_abi_rlimit_missing_proc_read_does_not_create_owner
+);
+
+fn smoke_abi_rlimit_read_once_observes_leader_rebinding() -> TestResult {
+    with_setup(|| {
+        const OTHER_TID: u64 = 0xA7_320;
+        const OTHER_PID: u64 = 0xA7_321;
+        let _owner = crate::task::Task::new_registered(OTHER_TID, OTHER_PID);
+        crate::handlers::register_pid_task_mapping(OTHER_PID, OTHER_TID);
+        let result = (|| {
+            if !crate::handlers::__test_set_rlimit(FAKE_TASK, 7, 128, 4096)
+                || !crate::handlers::__test_set_rlimit(OTHER_TID, 7, 64, 4096)
+            {
+                return Err("could not seed process limit rows");
+            }
+            let mut output = [0u64; 2];
+            if call(Syscall::Getrlimit.raw(), a1(7, output.as_mut_ptr() as u64)) != Some(0)
+                || output != [128, 4096]
+            {
+                return Err("could not read original leader limits");
+            }
+            // The process id now resolves to a different stable leader TaskId.
+            // The process object must follow the new binding without a global
+            // invalidation counter or a stale task-local value snapshot.
+            crate::handlers::register_pid_task_mapping(FAKE_TASK, OTHER_TID);
+            if call(Syscall::Getrlimit.raw(), a1(7, output.as_mut_ptr() as u64)) != Some(0)
+                || output != [64, 4096]
+            {
+                return Err("limits ignored a completed leader binding change");
+            }
+            let task = crate::task::task_get(FAKE_TASK).ok_or("missing fixture task")?;
+            let old = task.rlimit_owner();
+            crate::handlers::register_pid_task_mapping(FAKE_TASK, FAKE_TASK);
+            if old.read_once(7).map(|limit| (limit.cur, limit.max)) != Some((64, 4096)) {
+                return Err("a rebinding changed the already-owned process object");
+            }
+            if crate::handlers::__test_rlimit_read_once(FAKE_TASK, 7) != Some((128, 4096)) {
+                return Err("READ_ONCE did not follow the replacement binding");
+            }
+            Ok(())
+        })();
+        crate::handlers::register_pid_task_mapping(FAKE_TASK, FAKE_TASK);
+        crate::handlers::register_pid_task_mapping(OTHER_PID, OTHER_TID);
+        crate::task::mark_zombie(OTHER_TID);
+        crate::handlers::release_reaped_task(OTHER_PID);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit",
+    smoke_abi_rlimit_read_once_observes_leader_rebinding
+);
+
+fn smoke_abi_rlimit_rebound_read_and_update_in_irq() -> TestResult {
+    with_setup(|| {
+        const OTHER: u64 = 0xA7_325;
+        let owner = crate::task::Task::new_registered(OTHER, OTHER);
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        if !crate::handlers::__test_set_rlimit(OTHER, 0, 10, 20) {
+            crate::task::release_task(OTHER);
+            return Err("could not seed CPU limits");
+        }
+        crate::handlers::register_pid_task_mapping(FAKE_TASK, OTHER);
+        // Exercise the timer's uncommon rebound-owner path under the actual
+        // IRQ/trap context predicates. All owners are prepared beforehand;
+        // neither the read nor update may pin QSBR or allocate/free memory.
+        let irq_gate = narf_lib::sync::IrqSafeSpinLock::new(());
+        let observed = {
+            let _irq = irq_gate.lock();
+            narf_lib::context::enter_trap_handler();
+            narf_lib::context::enter_irq();
+            let before = crate::handlers::__test_rlimit_read_once(FAKE_TASK, 0);
+            let updated = crate::handlers::__test_set_rlimit(FAKE_TASK, 0, 11, 20);
+            let after = crate::handlers::__test_rlimit_read_once(FAKE_TASK, 0);
+            narf_lib::context::exit_irq();
+            narf_lib::context::exit_trap_handler();
+            (before, updated, after)
+        };
+        crate::handlers::register_pid_task_mapping(FAKE_TASK, FAKE_TASK);
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        crate::task::release_task(OTHER);
+        drop(owner);
+        if observed == (Some((10, 20)), true, Some((11, 20))) {
+            Ok(())
+        } else {
+            Err("IRQ enforcement did not follow and update the rebound process")
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit",
+    smoke_abi_rlimit_rebound_read_and_update_in_irq
+);
+
 fn smoke_abi_sched_setrlimit_null_buf_neg() -> TestResult {
     with_setup(|| match call(Syscall::Setrlimit.raw(), a1(7, 0)) {
         Some(v) if v == EFAULT => Ok(()),
@@ -365,6 +551,7 @@ fn smoke_abi_sched_reap_retires_rlimit_storage() -> TestResult {
     with_setup(|| {
         const TARGET_TID: u64 = 0xA7_100;
         const TARGET_PID: u64 = 0xA7_200;
+        let baseline = crate::handlers::__test_rlimit_storage_len();
         let owner = crate::task::Task::new_registered(TARGET_TID, TARGET_PID);
         crate::handlers::register_pid_task_mapping(TARGET_PID, TARGET_TID);
 
@@ -378,13 +565,18 @@ fn smoke_abi_sched_reap_retires_rlimit_storage() -> TestResult {
         crate::task::mark_zombie(TARGET_TID);
         crate::handlers::release_reaped_task(TARGET_PID);
         let retained = crate::handlers::__test_rlimit_storage_len();
+        let refused_retained = crate::handlers::__test_rlimit_retained_update_is_gone(&owner);
+        let after_refused = crate::handlers::__test_rlimit_storage_len();
         drop(owner);
 
-        if set_result != Some(0) || populated != 1 {
-            return Err("prlimit64 did not populate exactly one target row");
+        if set_result != Some(0) || populated != baseline + 1 {
+            return Err("target did not own exactly one process limits object");
         }
-        if retained != 0 {
+        if retained != baseline {
             return Err("reap retained rlimit lifetime state for a dead TaskId");
+        }
+        if !refused_retained || after_refused != baseline {
+            return Err("retained prlimit target recreated a retired process object");
         }
         Ok(())
     })

@@ -61,7 +61,10 @@ pub(crate) fn sys_shmem_map(ctx: &mut dyn TrapContext) {
                 // buddy, which re-hands it out as a page-table page → the
                 // cross-AS "marginal-buddy" double-free. The SysV `sys_shmat`
                 // twin already sets SHARED for the identical frames.
-                perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+                perms: RegionPerms::READ
+                    | RegionPerms::WRITE
+                    | RegionPerms::SHARED
+                    | RegionPerms::EXTERNAL_REFS,
                 phys: phys_list,
                     },
                     false,

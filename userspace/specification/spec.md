@@ -399,7 +399,27 @@ returns the unchanged break. Rlimits are shared by CLONE_THREAD tasks, copied
 by process fork/clone, and retired only when the process is reaped. Device/PFN
 mappings, vDSO/vvar, kernel control rings, guards, and hardware huge mappings
 are lock-exempt; inaccessible PROT_NONE reservations are not populated.
-`setrlimit` validation and replacement are one process-table transaction.
+Each process owns a refcounted limits object shared by its threads. Internal
+enforcement checks use individual `AtomicU64` relaxed loads, the Rust analogue
+of Linux `READ_ONCE`; they do not promise a coherent soft/hard pair. Ordinary
+current-task reads follow the task's immutable initial owner with no global
+lookup, lock, refcount change, or generation retry. Rare identity rebinding
+publishes a replacement under a per-task IRQ-safe binding gate before setting
+a monotone release flag. Acquire readers of that replacement borrow it under
+the gate, including in timer IRQ context, without RCU or an Arc drop. The
+original owner remains pinned by the task's lifetime.
+`getrlimit`, `setrlimit`, `prlimit64`, and `/proc` snapshots use the process's
+own transaction lock for coherent values and hard-limit validation. The global
+index serves only construction, identity rebinding, and retirement. Fork copies
+under the parent's lock before publishing the child PID; CLONE_THREAD shares
+the existing object. Rebind and every task-unregistration path take the same
+binding gate as retained-target revalidation, so reap or cancellation cannot
+revive a retired row. Unregistration needs no shared process lock: siblings
+retain their own owners. TaskId keys remain non-reusable and permission checks
+retain their existing credential and namespace rules.
+Updates borrow the owner while holding the binding gate and then the process
+lock. Rebinding and task unregistration also take the identity-mutation lock
+first, serializing them with a writer that has already resolved its task.
 `prlimit64` copies a proposed limit before PID/permission validation, returns
 `ESRCH` for a nonexistent target, and requires the caller's real uid+gid to
 match all representable target real/effective/saved IDs unless the target is
@@ -1408,6 +1428,14 @@ irrelevant. It mirrors `MAP_FIXED` region splitting and is released by
 `munmap(2)` or final address-space teardown after leaf invalidation. This
 registry lives in userspace compatibility code so address-space regions do not
 gain a filesystem dependency.
+
+Fork clones this VMA-level owner bucket through memory's fork hook before the
+parent VMA transaction is released. A concurrent `munmap` therefore cannot
+drop the final backing `Arc` between the child's memory snapshot and owner
+publication. `MAP_SHARED|MAP_ANONYMOUS`, vVAR, huge shared mappings, and
+kernel-owned rings do not probe per-frame owner registries; mappings whose
+cache, shmem, or device owner maintains alias counts carry the separate
+`EXTERNAL_REFS` provenance bit and retain/release only those frames.
 
 When `FileOps::mmap_lifetime` returns a per-object owner, the same registry
 retains it beside the file reference and clones it across fork and VMA splits.

@@ -68,6 +68,9 @@ static SHARED_FRAME_HOOKS: IrqSafeSpinLock<Option<SharedFrameHooks>> = IrqSafeSp
 type AddressSpaceDropHook = fn(u64);
 static ADDRESS_SPACE_DROP_HOOK: IrqSafeSpinLock<Option<AddressSpaceDropHook>> =
     IrqSafeSpinLock::new(None);
+type AddressSpaceForkHook = fn(u64, u64);
+static ADDRESS_SPACE_FORK_HOOK: IrqSafeSpinLock<Option<AddressSpaceForkHook>> =
+    IrqSafeSpinLock::new(None);
 /// Monotonic address-space incarnation allocator. Zero remains the lazy,
 /// unassigned sentinel used by `AddressSpace::empty()`.
 static NEXT_ADDRESS_SPACE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -178,7 +181,16 @@ pub fn install_address_space_drop_hook(hook: AddressSpaceDropHook) {
     *ADDRESS_SPACE_DROP_HOOK.lock() = Some(hook);
 }
 
+/// Install the callback which clones upper-layer VMA ownership into a fork
+/// child while the parent's VMA transaction still excludes mutation.
+pub fn install_address_space_fork_hook(hook: AddressSpaceForkHook) {
+    *ADDRESS_SPACE_FORK_HOOK.lock() = Some(hook);
+}
+
 fn retain_shared_frames(region: &Region) {
+    if !region.perms.contains(RegionPerms::EXTERNAL_REFS) {
+        return;
+    }
     // Copy the hooks out first: an `if let` scrutinee's guard lives for the
     // whole body, which would hold the global hook lock (IRQs masked) across
     // the userspace callback.
@@ -456,15 +468,14 @@ impl RegionPerms {
     /// strips it the same way.
     pub const STACK_GUARD: RegionPerms = RegionPerms(1 << 9);
 
-    /// Internal flag: this region's frames are *borrowed*, not owned by
-    /// the address space — they belong to an external registry (e.g. the
-    /// narf-shmem store backing System V `shmat`). Two regions in the
-    /// same AS may legitimately alias the same borrowed frames (a second
-    /// `shmat` of the same segment), so `map_region` skips its
-    /// duplicate-phys guard, and neither live-range unmap nor AS drop frees
-    /// the frames (the owning registry does, on `IPC_RMID` /
-    /// process-exit). Bit 10; stripped by the POSIX prot mask like the
-    /// other internal flags.
+    /// Internal flag: this region's frames are *borrowed*, not owned directly
+    /// by the address space. A VMA-level object or an external frame registry
+    /// owns their lifetime. Two regions in the same AS may legitimately alias
+    /// the same borrowed frames, so `map_region` skips its duplicate-phys guard,
+    /// and neither live-range unmap nor AS drop frees the frames. Backing which
+    /// additionally needs a per-frame registry reference carries
+    /// [`EXTERNAL_REFS`](Self::EXTERNAL_REFS). Bit 10; stripped by the POSIX
+    /// prot mask like the other internal flags.
     pub const SHARED: RegionPerms = RegionPerms(1 << 10);
 
     /// Internal flag: this region's unbacked pages are filled by the *backing
@@ -552,6 +563,16 @@ impl RegionPerms {
     /// Externally owned file backing is ordinary frame-allocator RAM. Allows
     /// independent pins even when LOCK_EXEMPT excludes generic mlock handling.
     pub const PINNABLE_RAM: RegionPerms = RegionPerms(1 << 20);
+
+    /// Internal lifetime marker for SHARED mappings whose backing owner keeps
+    /// a per-frame alias count through [`install_shared_frame_hooks`]. SHARED
+    /// mappings without this bit are retained by their VMA-level owner (or by
+    /// another in-memory owner such as the huge-page pool) and must not probe
+    /// every external frame registry on fork and teardown.
+    ///
+    /// The invariant is `EXTERNAL_REFS => SHARED`. Bit 21 is preserved by VMA
+    /// splits, mprotect, mremap, and fork with the other internal flags.
+    pub const EXTERNAL_REFS: RegionPerms = RegionPerms(1 << 21);
 
     // Bits 24..=26 hold the requested `MemoryType` (see `crate::memtype`,
     // `RegionPerms::memory_type` / `with_memory_type`). Zero is write-back,
@@ -1881,6 +1902,7 @@ enum DemandPageClaim {
         ticket: u64,
         file_backed: bool,
         externally_owned: bool,
+        external_refs: bool,
     },
 }
 
@@ -4047,6 +4069,11 @@ impl AddressSpace {
         if region.perms.contains(RegionPerms::LOCK_ONFAULT) {
             region.perms.0 |= RegionPerms::LOCKED.0;
         }
+        if region.perms.contains(RegionPerms::EXTERNAL_REFS)
+            && !region.perms.contains(RegionPerms::SHARED)
+        {
+            return Err(AddressSpaceError::SharedMapping);
+        }
         if region.base.as_u64() & 0xFFF != 0 || region.len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
@@ -5943,8 +5970,10 @@ impl AddressSpace {
 
         self.flush_region_broadcast(old_base, old_len >> 12);
         self.flush_region_broadcast(new_base, new_len >> 12);
-        for (_, &phys) in truncated_phys.indexed() {
-            release_shared_phys(phys);
+        if source_perms.contains(RegionPerms::EXTERNAL_REFS) {
+            for (_, &phys) in truncated_phys.indexed() {
+                release_shared_phys(phys);
+            }
         }
         self.bump_mmap_cursor_past(new_lo, new_len);
         let eager_range = (new_len > old_len
@@ -7372,11 +7401,11 @@ impl AddressSpace {
             punched_pages = punched_pages
                 .checked_add(resident as u64)
                 .ok_or(AddressSpaceError::OutOfRange)?;
-            if old.perms.contains(RegionPerms::SHARED) {
+            if old.perms.contains(RegionPerms::EXTERNAL_REFS) {
                 shared_release_count = shared_release_count
                     .checked_add(resident)
                     .ok_or(AddressSpaceError::AllocationFailed)?;
-            } else {
+            } else if !old.perms.contains(RegionPerms::SHARED) {
                 private_release_count = private_release_count
                     .checked_add(resident)
                     .ok_or(AddressSpaceError::AllocationFailed)?;
@@ -7463,12 +7492,14 @@ impl AddressSpace {
                         crate::rmap::remove(*phys, self.root, va);
                     }
                 }
-                shared_to_release.extend(
-                    old.phys
-                        .indexed_range(p_first, p_last)
-                        .map(|(_, p)| *p)
-                        .filter(|phys| phys.raw() != 0),
-                );
+                if old.perms.contains(RegionPerms::EXTERNAL_REFS) {
+                    shared_to_release.extend(
+                        old.phys
+                            .indexed_range(p_first, p_last)
+                            .map(|(_, p)| *p)
+                            .filter(|phys| phys.raw() != 0),
+                    );
+                }
             } else {
                 // Drop each punched page's rmap entry before its frame returns
                 // to the buddy, mirroring `free_region_frames`: a MAP_FIXED
@@ -8328,8 +8359,10 @@ impl AddressSpace {
     /// here. Callers must have completed the cross-CPU flush first.
     fn release_region_frames(&self, region: &Region) {
         if region.perms.contains(RegionPerms::SHARED) {
-            for (_, phys) in region.phys.indexed() {
-                release_shared_phys(*phys);
+            if region.perms.contains(RegionPerms::EXTERNAL_REFS) {
+                for (_, phys) in region.phys.indexed() {
+                    release_shared_phys(*phys);
+                }
             }
             return;
         }
@@ -8792,6 +8825,7 @@ impl AddressSpace {
             ticket,
             file_backed: perms.contains(RegionPerms::FILE_DEMAND),
             externally_owned: perms.contains(RegionPerms::SHARED),
+            external_refs: perms.contains(RegionPerms::EXTERNAL_REFS),
         })
     }
 
@@ -9503,6 +9537,7 @@ impl AddressSpace {
             ticket,
             file_backed,
             externally_owned,
+            external_refs,
         } = claim
         else {
             return Ok(());
@@ -9543,9 +9578,9 @@ impl AddressSpace {
         // reservation allocates only when the shard table itself must grow.
         if crate::rmap::try_prepare_owner_slots(phys, 1).is_err() {
             self.cancel_demand_page(v, ticket);
-            if file_backed && externally_owned {
+            if file_backed && external_refs {
                 release_shared_phys(phys);
-            } else {
+            } else if !file_backed || !externally_owned {
                 crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
             }
             return Err(AddressSpaceError::AllocationFailed);
@@ -9567,9 +9602,9 @@ impl AddressSpace {
             Ok(published) => published,
             Err(error) => {
                 crate::rmap::release_reserved_owner_slots(phys, 1);
-                if file_backed && externally_owned {
+                if file_backed && external_refs {
                     release_shared_phys(phys);
-                } else {
+                } else if !file_backed || !externally_owned {
                     crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
                 }
                 return Err(error);
@@ -9580,12 +9615,13 @@ impl AddressSpace {
             // by finish_demand_page while the region lock was held.
         } else {
             // The ticket was cancelled before publication, so ownership never
-            // left this fault path. A file hook supplies one external alias
-            // reference, balanced through the normal shared release hook.
+            // left this fault path. Registry-backed files supply an alias
+            // reference balanced through the shared release hook. A plain
+            // SHARED file keeps the frame in its VMA-owned backing object.
             crate::rmap::release_reserved_owner_slots(phys, 1);
-            if file_backed && externally_owned {
+            if file_backed && external_refs {
                 release_shared_phys(phys);
-            } else {
+            } else if !file_backed || !externally_owned {
                 crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
             }
         }
@@ -9832,6 +9868,7 @@ impl AddressSpace {
             ticket,
             file_backed,
             externally_owned,
+            external_refs,
         } = claim
         else {
             return Ok(());
@@ -9864,9 +9901,9 @@ impl AddressSpace {
 
         if crate::rmap::try_prepare_owner_slots(phys, 1).is_err() {
             self.cancel_demand_page(v, ticket);
-            if file_backed && externally_owned {
+            if file_backed && external_refs {
                 release_shared_phys(phys);
-            } else {
+            } else if !file_backed || !externally_owned {
                 crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
             }
             return Err(AddressSpaceError::AllocationFailed);
@@ -9887,9 +9924,9 @@ impl AddressSpace {
             Ok(published) => published,
             Err(error) => {
                 crate::rmap::release_reserved_owner_slots(phys, 1);
-                if file_backed && externally_owned {
+                if file_backed && external_refs {
                     release_shared_phys(phys);
-                } else {
+                } else if !file_backed || !externally_owned {
                     crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
                 }
                 return Err(error);
@@ -9897,9 +9934,9 @@ impl AddressSpace {
         };
         if !published {
             crate::rmap::release_reserved_owner_slots(phys, 1);
-            if file_backed && externally_owned {
+            if file_backed && external_refs {
                 release_shared_phys(phys);
-            } else {
+            } else if !file_backed || !externally_owned {
                 crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
             }
         }
@@ -9972,15 +10009,10 @@ impl AddressSpace {
     /// - `self.root` must be a valid page-table root for the AS
     ///   currently active on this CPU.
     /// - Frame allocator must be initialised.
-    fn stack_growth_plan(
-        regions: &RegionTable,
-        huge_mapped_bytes: u64,
-        v_page: u64,
-        limits: StackGrowthLimits,
-    ) -> Result<StackGrowthPlan, AddressSpaceError> {
+    fn stack_guard_for_fault(regions: &RegionTable, v_page: u64) -> Option<u64> {
         const MAX_GROW: u64 = 256 * 1024;
 
-        let guard_base = regions
+        regions
             .containing(v_page)
             .or_else(|| regions.successor(v_page))
             .filter(|region| {
@@ -9990,7 +10022,16 @@ impl AddressSpace {
                 }
             })
             .map(|region| region.base.as_u64())
-            .ok_or(AddressSpaceError::Unmapped)?;
+    }
+
+    fn stack_growth_plan(
+        regions: &RegionTable,
+        huge_mapped_bytes: u64,
+        v_page: u64,
+        limits: StackGrowthLimits,
+    ) -> Result<StackGrowthPlan, AddressSpaceError> {
+        let guard_base =
+            Self::stack_guard_for_fault(regions, v_page).ok_or(AddressSpaceError::Unmapped)?;
         let new_guard_base = v_page
             .checked_sub(0x1000)
             .ok_or(AddressSpaceError::OutOfRange)?;
@@ -10109,7 +10150,31 @@ impl AddressSpace {
         vaddr: VirtAddr,
         limits: StackGrowthLimits,
     ) -> Result<(), AddressSpaceError> {
+        // SAFETY: forward the caller's live-root/alias/allocator contract.
+        unsafe { self.try_grow_stack_with_limits(vaddr, || limits) }
+    }
+
+    /// Resolve task limits only for faults near a real stack guard.
+    ///
+    /// Invalid user addresses need no credential or resource-limit lookup.
+    /// `limits` runs once, outside every VMA/page-table lock, after a read-only
+    /// candidate lookup. Both subsequent transactions still validate the full
+    /// topology and returned limits; the candidate is never admission authority.
+    ///
+    /// # Safety
+    /// Same requirements as [`Self::try_grow_stack`]. The provider must return
+    /// the limits applicable to the faulting task for this growth attempt.
+    pub unsafe fn try_grow_stack_with_limits(
+        &self,
+        vaddr: VirtAddr,
+        limits: impl FnOnce() -> StackGrowthLimits,
+    ) -> Result<(), AddressSpaceError> {
         let v_page = vaddr.as_u64() & !0xFFFu64;
+        {
+            let regions = self.regions.lock();
+            Self::stack_guard_for_fault(&regions, v_page).ok_or(AddressSpaceError::Unmapped)?;
+        }
+        let limits = limits();
         // Preflight under the VMA transaction. The final transaction repeats
         // every limit/topology check because a CLONE_VM peer may mutate the
         // stack between these critical sections.
@@ -11952,8 +12017,9 @@ impl AddressSpace {
     /// never re-touch settled leaves (Linux `copy_page_range`'s wrprotect
     /// shape); absent lazy leaves need no descriptor update. The child's
     /// clones drop the LOCKED bits (Linux clears VM_LOCKED_MASK in the
-    /// child), and SHARED regions retain their externally-owned frames
-    /// instead of COW owners. Runs of adjacent newly-shared writable pages
+    /// child), and SHARED regions retain either their VMA-level owner or their
+    /// explicitly registry-owned frames instead of COW owners. Runs of
+    /// adjacent newly-shared writable pages
     /// are protected with one descriptor walk per run, and a broadcast
     /// fork that restricts more than a small ceiling of pages coalesces
     /// remote invalidation into one full flush.
@@ -12633,6 +12699,10 @@ impl AddressSpace {
     ///   or left absent for `demand_alloc_page()` to install from retained
     ///   `Region::phys` backing on first access. Private huge mappings are
     ///   copied and installed eagerly by this function.
+    /// - Every base-page `SHARED` region without `EXTERNAL_REFS` has backing
+    ///   that intrinsically outlives both aliases, or the installed address-
+    ///   space fork hook clones its VMA-level owner before this function
+    ///   releases the parent VMA transaction.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
         // Linux `dup_mm` copies `mm_struct`, including `mmap_base`; ASLR is
@@ -12666,9 +12736,9 @@ impl AddressSpace {
         };
         // Linearize the parent topology snapshot before taking the shared-
         // owner transaction. The child is not scheduler-visible during
-        // construction. Release the VMA transaction once both regular and
-        // huge metadata are owned snapshots; backing allocation/copy below
-        // must not run with this IRQ-safe lock held.
+        // construction. Release the VMA transaction once regular/huge
+        // metadata and upper-layer VMA owners are stable child snapshots;
+        // backing allocation/copy below must not run with this lock held.
         let vma_guard = self.vma_transaction.lock();
         let _shared_guard = lock_address_space_shared_mapping_transaction(self.identity());
 
@@ -12706,7 +12776,7 @@ impl AddressSpace {
                 // shared across fork: parent and child map the SAME
                 // physical frames, both writable, each seeing the other's
                 // writes (Linux MAP_SHARED). They must NOT be COW'd —
-                // the frames are registry-owned / borrowed, not
+                // the frames are VMA-owned or registry-owned, not
                 // COW-refcounted (the drop path likewise skips SHARED),
                 // and stripping WRITE would silently fault the writer
                 // into a private copy that never reaches the device.
@@ -12759,13 +12829,24 @@ impl AddressSpace {
                 }
             }
         }
-        drop(vma_guard);
-
-        // All externally-owned regular aliases are now retained by the child.
+        // Every registry-owned regular alias is now retained by the child.
         // Huge allocations and multi-megabyte copies below neither consult nor
         // publish shared-owner state and must not run with this IRQ-safe shard
         // held.
         drop(_shared_guard);
+
+        // VMA-level owners (notably MAP_SHARED|MAP_ANONYMOUS shmem objects)
+        // must be cloned before the parent VMA transaction opens again. A
+        // CLONE_VM sibling could otherwise munmap the parent in the interval
+        // between this memory snapshot and userspace's old post-clone owner
+        // copy, dropping the final backing Arc while the child already names
+        // its frames. Copy the hook out so arbitrary Arc drops/allocations run
+        // without the global hook lock or the IRQ-safe shared-owner shard.
+        let fork_hook = *ADDRESS_SPACE_FORK_HOOK.lock();
+        if let Some(fork_hook) = fork_hook {
+            fork_hook(self.identity(), child.identity());
+        }
+        drop(vma_guard);
 
         // Private hugetlb mappings are copied eagerly. The hugepage pool has
         // no sub-page COW metadata, so sharing a writable hardware block leaf

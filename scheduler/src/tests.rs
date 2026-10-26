@@ -3998,6 +3998,506 @@ kernel_test_in!(
     smoke_scheduler_urgent_next_respects_period_throttle
 );
 
+// Linux removes a sleeping task from its runnable class queue and reactivates
+// it exactly once on a false->true wake. NARF's split READY/PARKED ownership
+// must do the same so ClassScheduler's FIFO head is always runnable.
+fn smoke_scheduler_wake_activates_parked_task_once() -> TestResult {
+    use crate::spawn;
+
+    crate::__reset_queues_for_test();
+    crate::disable_wake_next();
+    let task = spawn(async {});
+    let cpu = crate::CpuId(narf_lib::percpu::current_cpu() as u32);
+
+    let slot = {
+        let mut ready = crate::READY[cpu.0 as usize].lock();
+        ready.as_mut().and_then(|queue| queue.pop_front())
+    };
+    let Some(slot) = slot else {
+        crate::__reset_queues_for_test();
+        return TestResult::Fail("spawned task was not runnable");
+    };
+    let cell = slot.awake.clone();
+    slot.awake
+        .flag
+        .store(false, core::sync::atomic::Ordering::Release);
+    crate::enqueue_on(
+        cpu.0 as usize,
+        slot,
+        crate::policy::TaskEnqueueReason::Requeued,
+    );
+    let ready_before = crate::READY[cpu.0 as usize]
+        .lock()
+        .as_ref()
+        .is_some_and(|queue| queue.is_empty());
+    let parked_before = crate::PARKED[cpu.0 as usize]
+        .lock()
+        .as_ref()
+        .is_some_and(|parked| parked.contains_key(&task));
+
+    let waker = crate::make_waker(cell);
+    for _ in 0..16 {
+        waker.wake_by_ref();
+    }
+    // Existing synchronous providers wake normally, then probe this predicate
+    // before publishing local wake-preemption. Pending activation must remain
+    // visible without forcing the task onto the waker's CPU.
+    let preemptible = crate::task_runnable_on_current_cpu(task.raw());
+    crate::drain_wake_list(cpu.0 as usize);
+    crate::drain_wake_list(cpu.0 as usize);
+
+    let ready_after = crate::READY[cpu.0 as usize]
+        .lock()
+        .as_ref()
+        .is_some_and(|queue| queue.len() == 1 && queue.front().is_some_and(|s| s.id == task));
+    let parked_after = crate::PARKED[cpu.0 as usize]
+        .lock()
+        .as_ref()
+        .is_some_and(|parked| parked.contains_key(&task));
+    crate::__reset_queues_for_test();
+
+    if !ready_before || !parked_before {
+        TestResult::Fail("sleeping task remained on the runnable queue")
+    } else if !preemptible {
+        TestResult::Fail("deferred activation hid a local waiter from wake-preemption")
+    } else if !ready_after || parked_after {
+        TestResult::Fail("wake did not activate the parked task exactly once")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_wake_activates_parked_task_once
+);
+
+fn smoke_scheduler_sync_wake_activates_locally_without_inbox() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_capabilities::{Cap, Grant};
+
+    crate::__reset_queues_for_test();
+    let cap: Cap<crate::SchedPolicy, Grant> = Cap::bootstrap();
+    if crate::install_scheduler(&cap, crate::ClassScheduler).is_err() {
+        return TestResult::Fail("install_scheduler(Class) failed");
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    let task = crate::spawn(core::future::pending::<()>());
+    let _ = crate::poll_one_round();
+    let cell = crate::PARKED[cpu]
+        .lock()
+        .as_ref()
+        .and_then(|slots| slots.get(&task))
+        .map(|entry| entry.slot.awake.clone());
+    let Some(cell) = cell else {
+        return TestResult::Fail("task did not park");
+    };
+    let waker = crate::make_waker(cell);
+    for _ in 0..16 {
+        crate::wake_urgent_task(&waker, task.raw());
+    }
+    let immediately_ready = crate::READY[cpu]
+        .lock()
+        .as_ref()
+        .is_some_and(|queue| queue.len() == 1 && queue.front().is_some_and(|slot| slot.id == task));
+    let inbox_empty = crate::PARKED_WAKE_INBOX[cpu].len.load(Ordering::Acquire) == 0;
+    crate::drain_wake_list(cpu);
+    let still_unique = crate::READY[cpu]
+        .lock()
+        .as_ref()
+        .is_some_and(|queue| queue.len() == 1);
+    crate::__reset_queues_for_test();
+    if !immediately_ready {
+        TestResult::Fail("synchronous wake did not activate immediately")
+    } else if !inbox_empty {
+        TestResult::Fail("synchronous wake unexpectedly staged an inbox node")
+    } else if !still_unique {
+        TestResult::Fail("synchronous wake duplicated the runnable owner")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_sync_wake_activates_locally_without_inbox
+);
+
+fn smoke_scheduler_pending_local_wake_precedes_idle() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{Poll, Waker};
+    use narf_capabilities::{Cap, Grant};
+
+    static WOKEN: AtomicBool = AtomicBool::new(false);
+    static FINISHED: AtomicBool = AtomicBool::new(false);
+    static IDLED_WITH_WORK: AtomicBool = AtomicBool::new(false);
+
+    struct WatchIdle;
+    impl crate::Scheduler for WatchIdle {
+        fn name(&self) -> &'static str {
+            "watch-pending-local-wake"
+        }
+
+        fn pick_next(
+            &self,
+            cpu: crate::CpuId,
+            queue: &crate::RunQueue<'_>,
+        ) -> Option<crate::TaskHandle> {
+            crate::Scheduler::pick_next(&crate::FifoScheduler, cpu, queue)
+        }
+
+        fn on_cpu_state_change(&self, _: crate::CpuId, change: crate::CpuStateChange) {
+            if change.current == crate::CpuState::Idle
+                && WOKEN.load(Ordering::Acquire)
+                && !FINISHED.load(Ordering::Acquire)
+            {
+                IDLED_WITH_WORK.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    crate::__reset_queues_for_test();
+    WOKEN.store(false, Ordering::Release);
+    FINISHED.store(false, Ordering::Release);
+    IDLED_WITH_WORK.store(false, Ordering::Release);
+    let cap: Cap<crate::SchedPolicy, Grant> = Cap::bootstrap();
+    if crate::install_scheduler(&cap, WatchIdle).is_err() {
+        return TestResult::Fail("install_scheduler(WatchIdle) failed");
+    }
+    let cpu = crate::CpuId(narf_lib::percpu::current_cpu() as u32);
+    crate::policy::notify_cpu_state(cpu, crate::CpuState::Idle, None);
+    let stored = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None::<Waker>));
+    let waiter = stored.clone();
+    crate::spawn(core::future::poll_fn(move |cx| {
+        if WOKEN.load(Ordering::Acquire) {
+            FINISHED.store(true, Ordering::Release);
+            Poll::Ready(())
+        } else {
+            *waiter.lock() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }));
+    crate::spawn(async move {
+        let waker = stored.lock().take();
+        WOKEN.store(true, Ordering::Release);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    });
+    crate::run_until_empty();
+    let restored = crate::install_scheduler(&cap, crate::ClassScheduler).is_ok();
+    crate::__reset_queues_for_test();
+    if !restored {
+        TestResult::Fail("restore ClassScheduler failed")
+    } else if !FINISHED.load(Ordering::Acquire) {
+        TestResult::Fail("woken waiter did not finish")
+    } else if IDLED_WITH_WORK.load(Ordering::Acquire) {
+        TestResult::Fail("executor entered idle while a local wake awaited activation")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_pending_local_wake_precedes_idle
+);
+
+// Donation is also an activation source: a sleeping donee leaves PARKED and
+// becomes policy-visible exactly once at the requested queue position.
+fn smoke_scheduler_donation_activates_parked_task() -> TestResult {
+    use crate::{donate_to, spawn, Task};
+    use narf_capabilities::{Cap, Invoke};
+
+    crate::__reset_queues_for_test();
+    crate::__reset_donations_for_test();
+    let target = spawn(core::future::pending::<()>());
+    let cpu = crate::CpuId(narf_lib::percpu::current_cpu() as u32);
+    let _ = crate::poll_one_round();
+    let parked_before = crate::PARKED[cpu.0 as usize]
+        .lock()
+        .as_ref()
+        .is_some_and(|parked| parked.contains_key(&target));
+    let donation: Cap<Task, Invoke> = Cap::bootstrap();
+    let donated = donate_to(target, &donation).is_ok();
+    let ready_after = crate::READY[cpu.0 as usize]
+        .lock()
+        .as_ref()
+        .is_some_and(|queue| {
+            queue.len() == 1
+                && queue
+                    .front()
+                    .is_some_and(|slot| slot.id == target && slot.awake.executor_runnable())
+        });
+    let parked_after = crate::PARKED[cpu.0 as usize]
+        .lock()
+        .as_ref()
+        .is_some_and(|parked| parked.contains_key(&target));
+    crate::__reset_queues_for_test();
+
+    if !parked_before {
+        TestResult::Fail("pending donee did not enter parked ownership")
+    } else if !donated {
+        TestResult::Fail("donation could not find a parked donee")
+    } else if !ready_after || parked_after {
+        TestResult::Fail("donation did not activate the parked donee exactly once")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_donation_activates_parked_task
+);
+
+fn smoke_scheduler_wake_before_park_publication() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    let task = crate::spawn(async {});
+    let slot = crate::READY[cpu]
+        .lock()
+        .as_mut()
+        .and_then(|queue| queue.pop_front());
+    let Some(slot) = slot else {
+        return TestResult::Fail("spawned task missing");
+    };
+    let cell = slot.awake.clone();
+    cell.flag.store(false, Ordering::SeqCst);
+    // Force the wake into the interval after the caller decided to park but
+    // before it published a token. There is no inbox item to rescue this wake.
+    crate::make_waker(cell.clone()).wake_by_ref();
+    let staged = crate::PARKED_WAKE_INBOX[cpu].len.load(Ordering::Acquire);
+    let raced = crate::park_slot(cpu, slot, crate::policy::TaskEnqueueReason::Requeued);
+    let recovered = raced.is_some_and(|entry| {
+        entry.slot.id == task
+            && entry.slot.awake.executor_runnable()
+            && entry.slot.awake.parked_location.load(Ordering::Acquire) == crate::NOT_PARKED
+    });
+    crate::__reset_queues_for_test();
+    if staged != 0 || !recovered {
+        TestResult::Fail("wake before token publication was lost or staged against a running task")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_wake_before_park_publication
+);
+
+fn smoke_scheduler_stale_wake_cannot_claim_reused_parked_slot() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    let old = crate::spawn(core::future::pending::<()>());
+    let _ = crate::poll_one_round();
+    let (old_cell, old_token) = {
+        let parked = crate::PARKED[cpu].lock();
+        let cell = parked
+            .as_ref()
+            .and_then(|slots| slots.get(&old))
+            .map(|entry| entry.slot.awake.clone());
+        let Some(cell) = cell else {
+            return TestResult::Fail("old task did not park");
+        };
+        let token = cell.parked_location.load(Ordering::Acquire);
+        (cell, token)
+    };
+    let retired_cell = alloc::sync::Arc::downgrade(&old_cell);
+    {
+        // Force deferred activation, as on a remote/contended wake.
+        let _ready = crate::READY[cpu].lock();
+        crate::make_waker(old_cell).wake_by_ref();
+    }
+    let retired = crate::PARKED[cpu]
+        .lock()
+        .as_mut()
+        .and_then(|slots| slots.remove(&old));
+    drop(retired);
+    let pinned_until_drain = retired_cell.upgrade().is_some();
+    let replacement = crate::spawn(core::future::pending::<()>());
+    // Park the new task before draining the old id, forcing reuse of its slot.
+    let slot = crate::READY[cpu]
+        .lock()
+        .as_mut()
+        .and_then(|queue| queue.pop_front());
+    let Some(slot) = slot else {
+        return TestResult::Fail("replacement task missing");
+    };
+    let cell = slot.awake.clone();
+    cell.flag.store(false, Ordering::SeqCst);
+    crate::enqueue_on(cpu, slot, crate::policy::TaskEnqueueReason::Requeued);
+    let reused = cell.parked_location.load(Ordering::Acquire) == old_token;
+    crate::drain_wake_list(cpu);
+    let released_after_drain = retired_cell.upgrade().is_none();
+    let stayed_asleep = crate::READY[cpu]
+        .lock()
+        .as_ref()
+        .is_some_and(|queue| queue.is_empty())
+        && crate::PARKED[cpu]
+            .lock()
+            .as_ref()
+            .is_some_and(|slots| slots.contains_key(&replacement));
+    crate::make_waker(cell).wake_by_ref();
+    crate::drain_wake_list(cpu);
+    let woke = crate::READY[cpu].lock().as_ref().is_some_and(|queue| {
+        queue.len() == 1 && queue.front().is_some_and(|slot| slot.id == replacement)
+    });
+    crate::__reset_queues_for_test();
+    if !reused || !stayed_asleep || !woke || !pinned_until_drain || !released_after_drain {
+        TestResult::Fail("stale wake claimed a reused slot or blocked its real wake")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_stale_wake_cannot_claim_reused_parked_slot
+);
+
+fn smoke_scheduler_coalesced_wake_follows_reparked_task() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    let task = crate::spawn(core::future::pending::<()>());
+    let _ = crate::poll_one_round();
+    let cell = crate::PARKED[cpu]
+        .lock()
+        .as_ref()
+        .and_then(|slots| slots.get(&task))
+        .map(|entry| entry.slot.awake.clone());
+    let Some(cell) = cell else {
+        return TestResult::Fail("task did not park");
+    };
+    let original_token = cell.parked_location.load(Ordering::Acquire);
+    let waker = crate::make_waker(cell.clone());
+    {
+        let _ready = crate::READY[cpu].lock();
+        waker.wake_by_ref();
+    }
+    let entry = crate::PARKED[cpu]
+        .lock()
+        .as_mut()
+        .and_then(|slots| slots.remove(&task));
+    let Some(entry) = entry else {
+        return TestResult::Fail("parked owner missing");
+    };
+
+    // A direct continuation can consume a wake and park again before the old
+    // inbox node drains. Occupy its freed slot so its new token must differ.
+    let blocker = crate::spawn(core::future::pending::<()>());
+    let blocker_slot = crate::READY[cpu]
+        .lock()
+        .as_mut()
+        .and_then(|queue| queue.pop_front());
+    let Some(blocker_slot) = blocker_slot else {
+        return TestResult::Fail("blocker missing");
+    };
+    blocker_slot.awake.flag.store(false, Ordering::SeqCst);
+    crate::enqueue_on(
+        cpu,
+        blocker_slot,
+        crate::policy::TaskEnqueueReason::Requeued,
+    );
+    cell.flag.store(false, Ordering::SeqCst);
+    crate::enqueue_on(cpu, entry.slot, entry.reason);
+    let token_changed = cell.parked_location.load(Ordering::Acquire) != original_token;
+    {
+        let _ready = crate::READY[cpu].lock();
+        waker.wake_by_ref();
+    }
+    let coalesced = crate::PARKED_WAKE_INBOX[cpu].len.load(Ordering::Acquire) == 1;
+    crate::drain_wake_list(cpu);
+    let activated = crate::READY[cpu]
+        .lock()
+        .as_ref()
+        .is_some_and(|queue| queue.len() == 1 && queue.front().is_some_and(|slot| slot.id == task));
+    let blocker_asleep = crate::PARKED[cpu]
+        .lock()
+        .as_ref()
+        .is_some_and(|slots| slots.contains_key(&blocker));
+    crate::__reset_queues_for_test();
+    if !token_changed || !coalesced || !activated || !blocker_asleep {
+        TestResult::Fail("coalesced activation did not follow the task's current parked token")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_coalesced_wake_follows_reparked_task
+);
+
+fn smoke_scheduler_wake_during_direct_claim_is_reactivated() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    let task = crate::spawn(core::future::pending::<()>());
+    let _ = crate::poll_one_round();
+    let cell = crate::PARKED[cpu]
+        .lock()
+        .as_ref()
+        .and_then(|slots| slots.get(&task))
+        .map(|entry| entry.slot.awake.clone());
+    let Some(cell) = cell else {
+        return TestResult::Fail("task did not park");
+    };
+    cell.direct_claimed.store(true, Ordering::Release);
+    crate::make_waker(cell.clone()).wake_by_ref();
+    crate::drain_wake_list(cpu);
+    let claimed_stayed_parked = crate::READY[cpu]
+        .lock()
+        .as_ref()
+        .is_some_and(|queue| queue.is_empty());
+    crate::release_direct_handoff_target(&cell, false);
+    crate::drain_wake_list(cpu);
+    let reactivated = crate::READY[cpu]
+        .lock()
+        .as_ref()
+        .is_some_and(|queue| queue.len() == 1 && queue.front().is_some_and(|slot| slot.id == task));
+    crate::__reset_queues_for_test();
+    if !claimed_stayed_parked || !reactivated {
+        TestResult::Fail("claimed task was dispatched concurrently or lost its wake on release")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_wake_during_direct_claim_is_reactivated
+);
+
+fn smoke_scheduler_parked_budget_cap_revocation_reaps_task() -> TestResult {
+    use narf_capabilities::{Cap, Spend};
+    crate::__reset_queues_for_test();
+    let cap: Cap<crate::CpuBudget, Spend> = Cap::bootstrap();
+    let task = crate::spawn_with_spec(
+        core::future::pending::<()>(),
+        crate::TaskSpec {
+            budget_cap: Some(cap),
+            ..crate::TaskSpec::unthrottled()
+        },
+    );
+    let _ = crate::poll_one_round();
+    let was_live = crate::task_affinity(task).is_some();
+    cap.revoke();
+    let _ = crate::poll_one_round();
+    let reaped = crate::task_affinity(task).is_none();
+    crate::__reset_queues_for_test();
+    if !was_live || !reaped {
+        TestResult::Fail("parked task did not observe budget-cap revocation")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_parked_budget_cap_revocation_reaps_task
+);
+
 // Linux applies a fair-class next-buddy only after the core scheduler has
 // ruled out higher classes. The exact urgent hint must likewise never let an
 // ordinary task jump ahead of an eligible realtime task.
@@ -4733,4 +5233,26 @@ fn smoke_sync_wake_affine_requires_an_empty_local_queue() -> TestResult {
 kernel_test_in!(
     "scheduler",
     smoke_sync_wake_affine_requires_an_empty_local_queue
+);
+
+fn smoke_scheduler_waker_identity_survives_clone() -> TestResult {
+    use alloc::sync::Arc;
+
+    let cell = crate::new_wake_cell(crate::TaskId::NONE, 0, false);
+    let original = crate::make_waker(cell.clone());
+    let cloned = original.clone();
+    let second = crate::make_waker(cell.clone());
+    for waker in [&original, &cloned, &second] {
+        if !crate::scheduler_wake_cell(waker).is_some_and(|owner| Arc::ptr_eq(&owner, &cell)) {
+            return TestResult::Fail("scheduler waker lost its vtable identity");
+        }
+    }
+    if crate::scheduler_wake_cell(core::task::Waker::noop()).is_some() {
+        return TestResult::Fail("foreign waker accepted as a scheduler WakeCell");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_waker_identity_survives_clone
 );

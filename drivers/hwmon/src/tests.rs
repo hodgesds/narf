@@ -106,6 +106,27 @@ kernel_test_in!("drivers/hwmon/k10temp", smoke_k10temp_pci_registration);
 
 // ── coretemp ──────────────────────────────────────────────────────────
 
+fn smoke_coretemp_cpu_match() -> TestResult {
+    use crate::coretemp::supports_coretemp;
+    use narf_arch::x86_64::microcode::Vendor;
+
+    for (vendor, max_basic, thermal_eax, expected) in [
+        (Vendor::Intel, 6, 1, true),
+        (Vendor::Intel, 0x20, 0x81, true),
+        (Vendor::Intel, 5, 1, false),
+        (Vendor::Intel, 6, 0, false),
+        (Vendor::Intel, 6, 1 << 6, false),
+        (Vendor::Amd, 0x20, 1, false),
+        (Vendor::Unknown, 0x20, 1, false),
+    ] {
+        if supports_coretemp(vendor, max_basic, thermal_eax) != expected {
+            return TestResult::Fail("coretemp CPU match accepted an unsupported thermal MSR CPU");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/coretemp", smoke_coretemp_cpu_match);
+
 /// MSR_IA32_THERM_STATUS decode: valid bit 31, readout bits 22:16.
 fn smoke_coretemp_therm_status_decode() -> TestResult {
     use crate::coretemp::decode_therm_status;

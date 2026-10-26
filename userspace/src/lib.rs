@@ -78,6 +78,7 @@ pub mod poll;
 pub mod posix_timer;
 pub mod process;
 pub mod ptrace;
+mod rlimit;
 pub mod seccomp;
 pub mod select;
 pub mod socket;
@@ -206,6 +207,13 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
     // SysV attachments belong to the mm as well: Linux `exit_mmap` closes
     // whatever shm mappings are left when it is torn down.
     handlers::drop_address_space_shm(address_space_id);
+}
+
+/// Clone file/device VMA ownership while memory still holds the parent's fork
+/// topology transaction. This pins VMA-owned backing until the child publishes
+/// or its partially-built address space is dropped.
+pub fn fork_mapped_file_address_space(parent_id: u64, child_id: u64) {
+    mapped_file::fork_address_space(parent_id, child_id);
 }
 
 /// Filesystem truncation bridge installed during common boot init.

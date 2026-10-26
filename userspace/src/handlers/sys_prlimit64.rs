@@ -28,15 +28,13 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
     };
 
     let caller = current_task_id();
-    // Linux's read-only pid=0 path selects `current` directly and snapshots
-    // `current->signal->rlim[resource]`. Use NARF's sparse read path too:
-    // when every process has default limits this avoids task-registry lookup,
-    // task↔pid translation, and the global update transaction.
+    // READ_ONCE is for individual enforcement words. A syscall returning the
+    // soft/hard pair must snapshot both under the process transaction lock.
     let prior = if pid == 0 && new_value.is_none() {
-        match read_rlimit(caller, resource) {
-            Some(prior) => prior,
-            None => {
-                ctx.set_return(errno_ret(EINVAL));
+        match update_rlimit_atomic(caller, None, resource, None, false) {
+            Ok(prior) => prior,
+            Err(errno) => {
+                ctx.set_return(errno_ret(errno));
                 return;
             }
         }

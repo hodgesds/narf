@@ -185,12 +185,12 @@ use narf_time::Instant;
 /// A pinned boxed future representing one kernel task.
 type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// Per-CPU ready queues. Each CPU owns its own `VecDeque<TaskSlot>`;
-/// `spawn` enqueues onto the CPU named by the task's affinity hint
-/// (or the current CPU if no hint). `run_until_empty` drains the
-/// caller's queue then attempts to steal one task from another CPU's
-/// queue. With single-CPU configurations only index 0 is exercised,
-/// matching pre-SMP behaviour byte-for-byte.
+/// Per-CPU runnable queues. Sleeping tasks live in [`PARKED`], not here, so
+/// the built-in FIFO/class scheduler can select the runnable head in O(1),
+/// matching Linux's `activate_task`/`deactivate_task` split. `spawn` enqueues
+/// onto the CPU named by the task's affinity hint (or the current CPU if no
+/// hint). `run_until_empty` drains the caller's queue then attempts to steal
+/// one runnable task from another CPU's queue.
 #[repr(align(64))]
 struct ReadyQueueCell(IrqSafeSpinLock<Option<VecDeque<TaskSlot>>>);
 
@@ -205,6 +205,194 @@ impl core::ops::Deref for ReadyQueueCell {
 const NEW_QUEUE: ReadyQueueCell = ReadyQueueCell(IrqSafeSpinLock::new(None));
 static READY: [ReadyQueueCell; narf_lib::percpu::MAX_CPUS] =
     [NEW_QUEUE; narf_lib::percpu::MAX_CPUS];
+
+/// A non-runnable task retains ownership of its future here until a false→true
+/// wake transition activates it. The remembered reason is delivered to an
+/// observing policy only when the task re-enters the selectable runnable set.
+struct ParkedSlot {
+    slot: TaskSlot,
+    reason: policy::TaskEnqueueReason,
+}
+
+/// Per-CPU reusable slots. The wake cell publishes a `(cpu, index)` token, so
+/// parking and wake activation are O(1) and allocate only at a new high-water
+/// mark. Cold introspection/affinity APIs may still search by TaskId. Every
+/// token lookup also checks that id, preventing a stale wake from claiming a
+/// different task after the index is reused.
+struct ParkedTasks {
+    slots: alloc::vec::Vec<ParkedEntry>,
+    free: Option<usize>,
+    len: usize,
+    capped: alloc::vec::Vec<usize>,
+}
+
+struct ParkedEntry {
+    task: Option<ParkedSlot>,
+    next_free: Option<usize>,
+}
+
+const NOT_PARKED: usize = usize::MAX;
+
+impl ParkedTasks {
+    const fn new() -> Self {
+        Self {
+            slots: alloc::vec::Vec::new(),
+            free: None,
+            len: 0,
+            capped: alloc::vec::Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn values(&self) -> impl Iterator<Item = &ParkedSlot> {
+        self.slots.iter().filter_map(|entry| entry.task.as_ref())
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut ParkedSlot> {
+        self.slots
+            .iter_mut()
+            .filter_map(|entry| entry.task.as_mut())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&TaskId, &ParkedSlot)> {
+        self.values().map(|entry| (&entry.slot.id, entry))
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &TaskId> {
+        self.values().map(|entry| &entry.slot.id)
+    }
+
+    fn get(&self, id: &TaskId) -> Option<&ParkedSlot> {
+        self.values().find(|entry| entry.slot.id == *id)
+    }
+
+    fn get_mut(&mut self, id: &TaskId) -> Option<&mut ParkedSlot> {
+        self.values_mut().find(|entry| entry.slot.id == *id)
+    }
+
+    fn contains_key(&self, id: &TaskId) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn insert(&mut self, cpu: usize, entry: ParkedSlot) -> usize {
+        let index = match self.free {
+            Some(index) => {
+                self.free = self.slots[index].next_free;
+                index
+            }
+            None => {
+                let index = self.slots.len();
+                self.slots.push(ParkedEntry {
+                    task: None,
+                    next_free: None,
+                });
+                index
+            }
+        };
+        let token = index * narf_lib::percpu::MAX_CPUS + cpu;
+        assert_eq!(
+            entry
+                .slot
+                .awake
+                .parked_location
+                .swap(token, Ordering::SeqCst),
+            NOT_PARKED,
+            "scheduler: task already has parked ownership"
+        );
+        if entry.slot.spec.budget_cap.is_some() {
+            self.capped.push(index);
+            PARKED_CAPPED_COUNT[cpu].store(self.capped.len(), Ordering::Release);
+        }
+        self.slots[index].task = Some(entry);
+        self.len += 1;
+        index
+    }
+
+    fn take(&mut self, index: usize, id: TaskId) -> Option<ParkedSlot> {
+        let entry = self.slots.get_mut(index)?;
+        if entry.task.as_ref()?.slot.id != id {
+            return None;
+        }
+        let task = entry.task.take()?;
+        let token = task
+            .slot
+            .awake
+            .parked_location
+            .swap(NOT_PARKED, Ordering::SeqCst);
+        if task.slot.spec.budget_cap.is_some() {
+            let pos = self
+                .capped
+                .iter()
+                .position(|candidate| *candidate == index)
+                .expect("scheduler: capped parked slot missing maintenance entry");
+            self.capped.swap_remove(pos);
+            PARKED_CAPPED_COUNT[token % narf_lib::percpu::MAX_CPUS]
+                .store(self.capped.len(), Ordering::Release);
+        }
+        entry.next_free = self.free;
+        self.free = Some(index);
+        self.len -= 1;
+        Some(task)
+    }
+
+    fn remove(&mut self, id: &TaskId) -> Option<ParkedSlot> {
+        let index = self.slots.iter().position(|entry| {
+            entry
+                .task
+                .as_ref()
+                .is_some_and(|entry| entry.slot.id == *id)
+        })?;
+        self.take(index, *id)
+    }
+
+    fn for_cell(&self, cpu: usize, cell: &WakeCell) -> Option<(usize, &ParkedSlot)> {
+        let token = cell.parked_location.load(Ordering::Relaxed);
+        if token == NOT_PARKED || token % narf_lib::percpu::MAX_CPUS != cpu {
+            return None;
+        }
+        let index = token / narf_lib::percpu::MAX_CPUS;
+        let entry = self.slots.get(index)?.task.as_ref()?;
+        (entry.slot.id.raw() == cell.task && core::ptr::eq(Arc::as_ptr(&entry.slot.awake), cell))
+            .then_some((index, entry))
+    }
+
+    fn clear(&mut self) {
+        for entry in self.slots.iter_mut() {
+            if let Some(task) = entry.task.take() {
+                let token = task
+                    .slot
+                    .awake
+                    .parked_location
+                    .swap(NOT_PARKED, Ordering::SeqCst);
+                PARKED_CAPPED_COUNT[token % narf_lib::percpu::MAX_CPUS].store(0, Ordering::Release);
+            }
+        }
+        self.slots.clear();
+        self.free = None;
+        self.len = 0;
+        self.capped.clear();
+    }
+}
+
+#[repr(align(64))]
+struct ParkedQueueCell(IrqSafeSpinLock<Option<ParkedTasks>>);
+
+impl core::ops::Deref for ParkedQueueCell {
+    type Target = IrqSafeSpinLock<Option<ParkedTasks>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+const NEW_PARKED_QUEUE: ParkedQueueCell = ParkedQueueCell(IrqSafeSpinLock::new(None));
+static PARKED: [ParkedQueueCell; narf_lib::percpu::MAX_CPUS] =
+    [NEW_PARKED_QUEUE; narf_lib::percpu::MAX_CPUS];
+static PARKED_CAPPED_COUNT: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
 
 /// Monotonic task identifier. Minted at `spawn` time. `0` is reserved
 /// as "no task"; the first spawn gets `TaskId(1)`.
@@ -306,7 +494,7 @@ static LIVE_USER_TASKS: core::sync::atomic::AtomicUsize = core::sync::atomic::At
 
 /// Hard cap on concurrent user tasks. `fork`/`clone` return `EAGAIN` at the
 /// cap, containing a fork bomb before it exhausts kernel memory and the
-/// per-CPU ready queues (unbounded `VecDeque`s). Generous for real workloads;
+/// per-CPU scheduler-owned slot collections. Generous for real workloads;
 /// far below where that many forked address spaces would OOM. SMP makes an
 /// uncapped bomb worse — more cores to flood and more concurrent shootdowns.
 pub const MAX_USER_TASKS: usize = 1024;
@@ -842,14 +1030,23 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
     active_user_as_slot().lock().clone()
 }
 
-/// A task's wake state, shared between its ready-queue slot and every
+/// A task's wake state, shared between its scheduler-owned slot and every
 /// `Waker` it has handed out. `flag` is the "needs-repoll" bit; `cpu` is
-/// the CPU whose ready queue currently holds the slot — the reschedule-
-/// IPI target so a cross-core wake un-halts an idle owner immediately
-/// instead of leaving it to wake at its next timer tick.
+/// the CPU whose runnable queue, parked map, or in-flight poll owns the slot —
+/// the reschedule-IPI target so a cross-core wake un-halts an idle owner
+/// immediately instead of leaving it to wake at its next timer tick.
 pub(crate) struct WakeCell {
     flag: AtomicBool,
     cpu: AtomicU32,
+    /// Packed `(parked slot index, cpu)`, or NOT_PARKED while runnable/running.
+    /// SeqCst publication plus the post-insert flag recheck pairs with the
+    /// waker's flag swap followed by token load: both sides cannot miss.
+    parked_location: AtomicUsize,
+    /// One intrusive activation node per task, pinned by an inbox-owned Arc
+    /// while queued. Producers may modify wake_next only after claiming
+    /// activation_queued; the consumer reads next before releasing that claim.
+    activation_queued: AtomicBool,
+    wake_next: AtomicPtr<WakeCell>,
     /// The owning task's id, so the raw waker can name it as its CPU's
     /// wake-next buddy (see [`record_wake_next`]). Immutable after creation.
     task: u64,
@@ -952,23 +1149,38 @@ fn try_sync_wake_affine(home: u32, cell: *const WakeCell) -> Option<u32> {
         if !policy::policy_allows_direct_handoff(scheduler) {
             return None;
         }
-        let mut ready = READY[source].try_lock()?;
-        let queue = ready.as_mut()?;
-        let position = queue.iter().position(|slot| {
-            core::ptr::eq(Arc::as_ptr(&slot.awake), cell)
-                && direct_handoff_slot_eligible(slot, CpuId(current as u32))
-        })?;
-        let slot = queue.remove(position)?;
-        if let Some(scheduler) = scheduler.filter(|policy| policy::observes_queue_events(*policy)) {
-            scheduler.on_task_queue_event(
-                CpuId(home),
-                policy::TaskQueueEvent::Dequeued {
-                    task: policy::TaskMeta::from_slot(&slot),
-                    reason: policy::TaskDequeueReason::Migrated,
-                },
-            );
+        let ready_slot = {
+            let mut ready = READY[source].try_lock()?;
+            let queue = ready.as_mut()?;
+            let position = queue.iter().position(|slot| {
+                core::ptr::eq(Arc::as_ptr(&slot.awake), cell)
+                    && direct_handoff_slot_eligible(slot, CpuId(current as u32))
+            });
+            position.and_then(|position| queue.remove(position))
+        };
+        if let Some(slot) = ready_slot {
+            if let Some(scheduler) =
+                scheduler.filter(|policy| policy::observes_queue_events(*policy))
+            {
+                scheduler.on_task_queue_event(
+                    CpuId(home),
+                    policy::TaskQueueEvent::Dequeued {
+                        task: policy::TaskMeta::from_slot(&slot),
+                        reason: policy::TaskDequeueReason::Migrated,
+                    },
+                );
+            }
+            return Some(slot);
         }
-        Some(slot)
+        let mut parked = PARKED[source].try_lock()?;
+        let slots = parked.as_mut()?;
+        // SAFETY: the wake path's live Waker pins cell through this call.
+        let (index, entry) = slots.for_cell(source, unsafe { &*cell })?;
+        if !direct_handoff_slot_eligible(&entry.slot, CpuId(current as u32)) {
+            return None;
+        }
+        let id = entry.slot.id;
+        slots.take(index, id).map(|entry| entry.slot)
     })??;
 
     enqueue_on(current, slot, policy::TaskEnqueueReason::Migrated);
@@ -1050,18 +1262,44 @@ pub(crate) fn claim_direct_handoff_target(
         return None;
     }
 
+    // Exact sleeping partners advertise their indexed owner. Claim under
+    // that one lock instead of probing an unrelated runnable queue first.
+    // A concurrent ownership change simply declines the optional handoff;
+    // the durable activation node still drives ordinary dispatch.
+    if cell.parked_location.load(Ordering::Acquire) != NOT_PARKED {
+        let parked = PARKED[cpu].lock();
+        let (_, entry) = parked.as_ref()?.for_cell(cpu, cell)?;
+        return claim_direct_handoff_slot(cpu, &entry.slot);
+    }
+
     let mut ready = READY[cpu].lock();
     let queue = ready.as_mut()?;
-    let slot = queue.iter().find(|slot| Arc::ptr_eq(&slot.awake, cell))?;
-    claim_direct_handoff_slot(cpu, slot)
+    if let Some(slot) = queue.iter().find(|slot| Arc::ptr_eq(&slot.awake, cell)) {
+        return claim_direct_handoff_slot(cpu, slot);
+    }
+    drop(ready);
+    let parked = PARKED[cpu].lock();
+    let slots = parked.as_ref()?;
+    let (_, entry) = slots.for_cell(cpu, cell)?;
+    claim_direct_handoff_slot(cpu, &entry.slot)
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn release_direct_handoff_target(cell: &WakeCell, completed: bool) {
     if completed {
-        cell.flag.store(true, Ordering::Release);
+        cell.flag.store(true, Ordering::SeqCst);
     }
-    cell.direct_claimed.store(false, Ordering::Release);
+    cell.direct_claimed.store(false, Ordering::SeqCst);
+    // A wake may have arrived while direct_claimed suppressed activation.
+    // Re-stage after release, including completion so the adapter is reaped.
+    if cell.flag.load(Ordering::SeqCst) {
+        if !try_activate_parked_local(cell) {
+            parked_wake_push(cell);
+        }
+        let home = cell.cpu.load(Ordering::Acquire);
+        note_runnable_peer(home, cell.task);
+        resched_remote(home);
+    }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -1110,6 +1348,9 @@ fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
     Arc::new(WakeCell {
         flag: AtomicBool::new(true),
         cpu: AtomicU32::new(cpu),
+        parked_location: AtomicUsize::new(NOT_PARKED),
+        activation_queued: AtomicBool::new(false),
+        wake_next: AtomicPtr::new(core::ptr::null_mut()),
         task: id.raw(),
         wake_cyc: AtomicU64::new(0),
         wake_halt_gen: AtomicU64::new(0),
@@ -1247,16 +1488,23 @@ static CURRENT_SCHED: [CurrentSched; narf_lib::percpu::MAX_CPUS] = [const {
 /// paths may only change it false->true. A stale true costs one harmless
 /// executor round, while a wake cannot be hidden behind a stale false as long
 /// as every false->true runnable transition calls `note_runnable_peer`.
-/// `class_mask` is deliberately monotone; see [`publish_possible_class`].
+/// `class_mask` and `class_fifo_uniform` are deliberately monotone; see
+/// [`publish_possible_class`] and [`publish_class_fifo_shape`].
 #[repr(align(64))]
 struct PerCpuRunnableState {
     peer: AtomicBool,
     class_mask: core::sync::atomic::AtomicU8,
+    /// True until a slot that needs more than default-class FIFO selection can
+    /// appear on this CPU. A false positive would violate class/priority or
+    /// budget ordering, so publication only moves true -> false outside a
+    /// hermetic test reset.
+    class_fifo_uniform: AtomicBool,
 }
 static RUNNABLE_STATE: [PerCpuRunnableState; narf_lib::percpu::MAX_CPUS] = [const {
     PerCpuRunnableState {
         peer: AtomicBool::new(false),
         class_mask: core::sync::atomic::AtomicU8::new(0),
+        class_fifo_uniform: AtomicBool::new(true),
     }
 };
     narf_lib::percpu::MAX_CPUS];
@@ -1283,6 +1531,35 @@ fn publish_possible_class(cpu: usize, rank: u8) {
             .class_mask
             .fetch_or(bit, Ordering::Release);
     }
+}
+
+/// Publish whether an incoming slot preserves the default ClassScheduler's
+/// homogeneous FIFO shape. The bit is a conservative shortcut guard, never
+/// dispatch authority: once an exceptional slot has been visible on a CPU it
+/// stays false until a hermetic test reset, even after that slot leaves.
+#[inline]
+fn publish_class_fifo_shape(cpu: usize, slot: &TaskSlot) {
+    if cpu < RUNNABLE_STATE.len()
+        && (slot.spec.class != SchedClass::Default
+            || slot.spec.priority != Priority::NORMAL
+            || slot.spec.budget != ResourceBudget::unthrottled()
+            || slot.spec.budget_cap.is_some())
+    {
+        RUNNABLE_STATE[cpu]
+            .class_fifo_uniform
+            .store(false, Ordering::Release);
+    }
+}
+
+/// Whether every slot ever published to this CPU since init/reset had the
+/// same always-eligible class and priority. An Acquire pairs with enqueue's
+/// Release before the slot becomes visible in READY or the wake inbox.
+#[inline]
+pub(crate) fn class_fifo_uniform(cpu: usize) -> bool {
+    cpu < RUNNABLE_STATE.len()
+        && RUNNABLE_STATE[cpu]
+            .class_fifo_uniform
+            .load(Ordering::Acquire)
 }
 
 #[inline]
@@ -1462,9 +1739,9 @@ static PENDING_MIGRATE: [IrqSafeSpinLock<Option<(u64, u32)>>; narf_lib::percpu::
 /// (`nr_queued = u16::MAX`) rather than empty — matching `select_fork_cpu`'s
 /// contended-is-busy convention, so the balancer never mistakes a busy CPU for a
 /// light target. Only `Active`/`Idle` CPUs are included; a `Draining`/`Starting`
-/// CPU is not a migration target and is skipped. `nr_queued` is the queued length
-/// (an upper bound on runnable work — parked tasks inflate it, which only makes
-/// the balancer more conservative about targeting that CPU).
+/// CPU is not a migration target and is skipped. `nr_queued` is the runnable
+/// queue length; sleepers are absent exactly as they are from Linux's
+/// `rq->nr_running`.
 pub fn peer_loads(buf: &mut [policy::CpuLoad]) -> &[policy::CpuLoad] {
     let mut n = 0usize;
     for c in 0..narf_lib::percpu::MAX_CPUS {
@@ -2433,8 +2710,12 @@ pub fn init() {
     }
     for (cpu, q) in READY.iter().enumerate() {
         *q.lock() = Some(VecDeque::new());
+        *PARKED[cpu].lock() = Some(ParkedTasks::new());
         RUNNABLE_STATE[cpu].peer.store(false, Ordering::Release);
         RUNNABLE_STATE[cpu].class_mask.store(0, Ordering::Release);
+        RUNNABLE_STATE[cpu]
+            .class_fifo_uniform
+            .store(true, Ordering::Release);
         URGENT_WAKE_NEXT[cpu].0.store(0, Ordering::Release);
         let urgent = URGENT_WAKE_CELL[cpu]
             .0
@@ -2472,8 +2753,14 @@ pub fn __reset_queues_for_test() {
         if let Some(d) = q.lock().as_mut() {
             d.clear();
         }
+        if let Some(d) = PARKED[cpu].lock().as_mut() {
+            d.clear();
+        }
         RUNNABLE_STATE[cpu].peer.store(false, Ordering::Release);
         RUNNABLE_STATE[cpu].class_mask.store(0, Ordering::Release);
+        RUNNABLE_STATE[cpu]
+            .class_fifo_uniform
+            .store(true, Ordering::Release);
         URGENT_WAKE_NEXT[cpu].0.store(0, Ordering::Release);
         let urgent = URGENT_WAKE_CELL[cpu]
             .0
@@ -2488,6 +2775,7 @@ pub fn __reset_queues_for_test() {
     for (cpu, inbox) in WAKE_INBOX.iter().enumerate() {
         inbox.lock().clear();
         WAKE_INBOX_LEN[cpu].store(0, Ordering::Release);
+        reset_parked_wakes(cpu);
     }
     LIVE_USER_ADDRESS_SPACES.lock().clear();
     // A task can queue an in-poll exec replacement and then remain pending.
@@ -2518,7 +2806,8 @@ pub fn __reset_queues_for_test() {
 
 /// Authoritative affinity for every live scheduler task.
 ///
-/// A slot is absent from all ready queues while its future is being polled.
+/// A slot is absent from both runnable and parked ownership while its future is
+/// being polled.
 /// Keeping the mask independently makes `sched_getaffinity(2)` exact during
 /// that interval and lets a concurrent setter publish an update that the slot
 /// consumes at the next cooperative poll boundary.
@@ -2593,17 +2882,11 @@ pub fn select_fork_cpu(allowed: CpuSet, preferred: CpuId) -> Option<CpuId> {
         // is executing, matching Linux rq->nr_running's three constituents.
         let queued = READY[cpu]
             .try_lock()
-            .and_then(|ready| {
-                ready.as_ref().map(|queue| {
-                    queue
-                        .iter()
-                        .filter(|slot| slot.awake.executor_runnable())
-                        .count()
-                })
-            })
+            .and_then(|ready| ready.as_ref().map(VecDeque::len))
             .unwrap_or(usize::MAX / 4);
         let load = queued
             .saturating_add(WAKE_INBOX_LEN[cpu].load(Ordering::Acquire))
+            .saturating_add(PARKED_WAKE_INBOX[cpu].len.load(Ordering::Acquire))
             .saturating_add(usize::from(cpu_running_task(CpuId(cpu as u32))));
         let candidate = CpuId(cpu as u32);
         if candidate == preferred {
@@ -2704,7 +2987,7 @@ pub fn set_task_affinity(id: TaskId, requested: CpuSet) -> Result<(), SetAffinit
             .wrapping_add(1)
     };
 
-    // If the task is parked, update and (when its old queue is no longer
+    // If the task is queued, update and (when its old CPU is no longer
     // allowed) move it before it can dispatch again. At most one READY lock is
     // held at a time; enqueue_on acquires the destination only after removal.
     for (cpu, ready) in READY.iter().enumerate() {
@@ -2734,15 +3017,36 @@ pub fn set_task_affinity(id: TaskId, requested: CpuSet) -> Result<(), SetAffinit
             }
             Some(Some(slot))
         });
-        let Some(moved) = found else {
-            continue;
-        };
-        let Some(moved) = moved else {
+        if let Some(moved) = found {
+            let Some(moved) = moved else {
+                return Ok(());
+            };
+            let target = target_cpu_for_affinity(affinity, cpu);
+            enqueue_on(target, moved, policy::TaskEnqueueReason::Migrated);
             return Ok(());
+        }
+
+        let parked = {
+            let mut parked = PARKED[cpu].lock();
+            let slots = match parked.as_mut() {
+                Some(slots) => slots,
+                None => continue,
+            };
+            let Some(entry) = slots.get_mut(&id) else {
+                continue;
+            };
+            entry.slot.spec.affinity = affinity;
+            entry.slot.affinity_generation = affinity_generation;
+            if allowed.contains(cpu_id) {
+                return Ok(());
+            }
+            slots.remove(&id)
         };
-        let target = target_cpu_for_affinity(affinity, cpu);
-        enqueue_on(target, moved, policy::TaskEnqueueReason::Migrated);
-        return Ok(());
+        if let Some(entry) = parked {
+            let target = target_cpu_for_affinity(affinity, cpu);
+            enqueue_on(target, entry.slot, policy::TaskEnqueueReason::Migrated);
+            return Ok(());
+        }
     }
 
     // The live slot is currently being polled (or is in the tiny
@@ -2913,8 +3217,9 @@ fn offline_migration_target(slot: &TaskSlot, source: usize) -> Option<usize> {
         })
 }
 
-/// Drain one quiesced CPU without holding its queue lock while taking a
-/// destination lock. Returns false if any queued task is pinned there.
+/// Drain one quiesced CPU without holding its runnable/parked locks while
+/// taking a destination lock. Returns false if any resident task is pinned
+/// there.
 pub(crate) fn drain_cpu_queue(cpu: CpuId) -> bool {
     let source = cpu.0 as usize;
     let Some(ready) = READY.get(source) else {
@@ -2930,12 +3235,23 @@ pub(crate) fn drain_cpu_queue(cpu: CpuId) -> bool {
         let Some(queue) = queue.as_mut() else {
             return false;
         };
+        let mut parked = PARKED[source].lock();
+        let Some(parked) = parked.as_mut() else {
+            return false;
+        };
         let mut destinations = alloc::vec::Vec::with_capacity(queue.len());
         for slot in queue.iter() {
             let Some(target) = offline_migration_target(slot, source) else {
                 return false;
             };
             destinations.push(target);
+        }
+        let mut parked_destinations = alloc::vec::Vec::with_capacity(parked.len());
+        for (id, entry) in parked.iter() {
+            let Some(target) = offline_migration_target(&entry.slot, source) else {
+                return false;
+            };
+            parked_destinations.push((*id, target));
         }
         for (slot, target) in queue.drain(..).zip(destinations) {
             if let Some(scheduler) =
@@ -2951,6 +3267,12 @@ pub(crate) fn drain_cpu_queue(cpu: CpuId) -> bool {
             }
             moved.push((target, slot));
         }
+        for (id, target) in parked_destinations {
+            let entry = parked
+                .remove(&id)
+                .expect("validated parked task disappeared under queue lock");
+            moved.push((target, entry.slot));
+        }
         true
     });
     if !drained {
@@ -2959,6 +3281,10 @@ pub(crate) fn drain_cpu_queue(cpu: CpuId) -> bool {
     for (target, slot) in moved {
         enqueue_on(target, slot, policy::TaskEnqueueReason::Migrated);
     }
+    // Pair with the producer's token recheck under the inbox gate. Every node
+    // published before parked ownership moved is now discarded or forwarded;
+    // later producers observe the new owner and cannot strand a node here.
+    drain_parked_wakes(source);
     true
 }
 
@@ -3103,6 +3429,175 @@ static WAKE_INBOX: [IrqSafeSpinLock<VecDeque<(TaskSlot, policy::TaskEnqueueReaso
 static WAKE_INBOX_LEN: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
 
+/// False→true wake transitions for tasks owned by [`PARKED`]. The raw waker
+/// cannot move a `TaskSlot` itself because it may run in IRQ context; it stages
+/// its task-owned intrusive node and the owning CPU performs activation at its
+/// next executor boundary, like Linux's `ttwu_queue` / `sched_ttwu_pending`.
+/// The inbox owns one Arc reference per queued node, so IRQ wakes never allocate
+/// storage and an exited task's waker cannot leave a dangling link. Repeated
+/// wakes coalesce. Running tasks have no parked token; poll return observes
+/// their wake bit and enqueues them directly.
+#[repr(align(64))]
+struct ParkedWakeHead {
+    head: AtomicPtr<WakeCell>,
+    len: AtomicUsize,
+    /// Leaf lock: publish/detach only, never held over a parked/run-queue lock,
+    /// policy callback, allocation, or task teardown.
+    gate: IrqSafeSpinLock<()>,
+}
+static PARKED_WAKE_INBOX: [ParkedWakeHead; narf_lib::percpu::MAX_CPUS] = [const {
+    ParkedWakeHead {
+        head: AtomicPtr::new(core::ptr::null_mut()),
+        len: AtomicUsize::new(0),
+        gate: IrqSafeSpinLock::new(()),
+    }
+};
+    narf_lib::percpu::MAX_CPUS];
+fn parked_wake_push(cell: &WakeCell) {
+    'retry: loop {
+        if cell.parked_location.load(Ordering::SeqCst) == NOT_PARKED
+            || cell.task == TaskId::NONE.raw()
+        {
+            return;
+        }
+        if cell.activation_queued.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let ptr = core::ptr::from_ref(cell).cast_mut();
+        loop {
+            let token = cell.parked_location.load(Ordering::SeqCst);
+            if token == NOT_PARKED {
+                cell.activation_queued.store(false, Ordering::SeqCst);
+                // Another wake can coalesce while this producer still owns the
+                // claim and the task migrates through an in-flight state. Release
+                // then recheck, paired with the waker's SeqCst claim: either it
+                // queues a node or this producer observes and restages its wake.
+                if cell.flag.load(Ordering::SeqCst) {
+                    continue 'retry;
+                }
+                return;
+            }
+            let cpu = token % narf_lib::percpu::MAX_CPUS;
+            let inbox = &PARKED_WAKE_INBOX[cpu];
+            {
+                let _gate = inbox.gate.lock();
+                // An offlining CPU moves all parked owners before its final inbox
+                // drain. Recheck under the same inbox gate so a delayed producer
+                // cannot publish to that CPU after the final drain completed.
+                if cell.parked_location.load(Ordering::SeqCst) != token {
+                    continue;
+                }
+                // SAFETY: every WakeCell is Arc-allocated, and the caller's live
+                // Waker, slot, or direct-transfer reference pins it. This additional
+                // reference belongs to the intrusive inbox until drain.
+                unsafe { Arc::increment_strong_count(ptr) };
+                cell.wake_next
+                    .store(inbox.head.load(Ordering::Relaxed), Ordering::Relaxed);
+                inbox.len.fetch_add(1, Ordering::Release);
+                inbox.head.store(ptr, Ordering::Release);
+            }
+            // Kick the CPU actually owning this queued node. Migration may change
+            // cell.cpu before the raw waker issues its ordinary placement kick.
+            resched_remote(cpu as u32);
+            return;
+        }
+    }
+}
+
+/// Linux's local ttwu_do_activate shape: an exact synchronous wake can publish
+/// same-CPU runnable ownership immediately. Ordinary wakes batch activation at
+/// the executor boundary instead of taking these ownership locks per waiter.
+/// Every lock is non-blocking and the ready deque must
+/// already have capacity, so the raw-waker path cannot allocate or wait behind
+/// a queue owner. Observing policies retain executor-boundary activation so an
+/// IRQ never invokes arbitrary policy callbacks.
+fn try_activate_parked_local(cell: &WakeCell) -> bool {
+    let token = cell.parked_location.load(Ordering::SeqCst);
+    if token == NOT_PARKED {
+        return false;
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= READY.len() || token % narf_lib::percpu::MAX_CPUS != cpu {
+        return false;
+    }
+    policy::try_with_scheduler(CpuId(cpu as u32), |scheduler| {
+        if scheduler.is_some_and(policy::observes_queue_events) {
+            return false;
+        }
+        let Some(mut ready) = READY[cpu].try_lock() else {
+            return false;
+        };
+        let Some(queue) = ready.as_mut() else {
+            return false;
+        };
+        if queue.len() == queue.capacity() {
+            return false;
+        }
+        let entry = {
+            let Some(mut parked) = PARKED[cpu].try_lock() else {
+                return false;
+            };
+            let Some(slots) = parked.as_mut() else {
+                return false;
+            };
+            let Some((index, entry)) = slots.for_cell(cpu, cell) else {
+                return false;
+            };
+            if !cell.flag.load(Ordering::SeqCst) || cell.direct_claimed.load(Ordering::SeqCst) {
+                return false;
+            }
+            let id = entry.slot.id;
+            slots.take(index, id).expect("validated parked wake owner")
+        };
+        publish_possible_class(cpu, entry.slot.spec.class.rank());
+        publish_class_fifo_shape(cpu, &entry.slot);
+        note_runnable_peer(cpu as u32, entry.slot.id.raw());
+        queue.push_back(entry.slot);
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Detach and reverse a single-consumer batch into arrival order. Producers
+/// can only prepend to the atomic head; activation_queued pins every detached
+/// node against reuse until its next link has been consumed below.
+fn take_parked_wake_batch(cpu: usize) -> *mut WakeCell {
+    if PARKED_WAKE_INBOX[cpu]
+        .head
+        .load(Ordering::Acquire)
+        .is_null()
+    {
+        return core::ptr::null_mut();
+    }
+    let mut batch = {
+        let inbox = &PARKED_WAKE_INBOX[cpu];
+        let _gate = inbox.gate.lock();
+        inbox.head.swap(core::ptr::null_mut(), Ordering::Acquire)
+    };
+    let mut ordered = core::ptr::null_mut();
+    while !batch.is_null() {
+        // SAFETY: each detached node owns an Arc reference and remains claimed
+        // by activation_queued, excluding a producer's next-link mutation.
+        let cell = unsafe { &*batch };
+        let next = cell.wake_next.load(Ordering::Relaxed);
+        cell.wake_next.store(ordered, Ordering::Relaxed);
+        ordered = batch;
+        batch = next;
+    }
+    ordered
+}
+
+fn reset_parked_wakes(cpu: usize) {
+    let mut batch = take_parked_wake_batch(cpu);
+    while !batch.is_null() {
+        // SAFETY: this detached node owns exactly one inbox Arc reference.
+        let cell = unsafe { Arc::from_raw(batch) };
+        batch = cell.wake_next.load(Ordering::Relaxed);
+        cell.activation_queued.store(false, Ordering::Release);
+        PARKED_WAKE_INBOX[cpu].len.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// Push `slot` onto `cpu`'s wake inbox (Linux `ttwu_queue` staging). Returns
 /// `true` when the inbox was empty before this push (mirrors `llist_add`'s
 /// "first entry" signal). Holds the inbox lock only for the `push_back`.
@@ -3121,6 +3616,10 @@ fn wake_list_push(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason)
 #[inline]
 fn wake_list_pending(cpu: usize) -> bool {
     WAKE_INBOX_LEN[cpu].load(Ordering::Acquire) != 0
+        || !PARKED_WAKE_INBOX[cpu]
+            .head
+            .load(Ordering::Acquire)
+            .is_null()
 }
 
 /// Fold `cpu`'s wake inbox into `READY[cpu]` (Linux `sched_ttwu_pending`). MUST
@@ -3170,6 +3669,111 @@ fn drain_wake_list(cpu: usize) {
             }
         });
     }
+    drain_parked_wakes(cpu);
+    reap_revoked_parked(cpu);
+}
+
+/// Sleeping tasks still observe capability revocation at an executor boundary,
+/// as they did when they lived in READY. The separate capped-slot index keeps
+/// the ordinary uncapped path O(1); teardown runs after the parked lock drops.
+fn reap_revoked_parked(cpu: usize) {
+    if PARKED_CAPPED_COUNT[cpu].load(Ordering::Acquire) == 0 {
+        return;
+    }
+    loop {
+        let revoked = {
+            let mut parked = PARKED[cpu].lock();
+            let Some(slots) = parked.as_mut() else { return };
+            let index = slots.capped.iter().copied().find(|index| {
+                slots.slots[*index].task.as_ref().is_some_and(|entry| {
+                    !entry.slot.awake.direct_claimed.load(Ordering::Acquire)
+                        && entry
+                            .slot
+                            .spec
+                            .budget_cap
+                            .as_ref()
+                            .is_some_and(|cap| cap.check_live().is_err())
+                })
+            });
+            index.and_then(|index| {
+                let id = slots.slots[index].task.as_ref()?.slot.id;
+                slots.take(index, id)
+            })
+        };
+        let Some(entry) = revoked else { break };
+        notify_slot_reaped(entry.slot.id);
+        drop(entry);
+    }
+}
+
+fn drain_parked_wakes(cpu: usize) {
+    let mut batch = take_parked_wake_batch(cpu);
+    while !batch.is_null() {
+        // SAFETY: the detached node owns exactly one inbox Arc reference.
+        let cell = unsafe { Arc::from_raw(batch) };
+        // Read next BEFORE releasing the claim: another CPU may immediately
+        // requeue this node and overwrite wake_next after the release.
+        batch = cell.wake_next.load(Ordering::Relaxed);
+        PARKED_WAKE_INBOX[cpu].len.fetch_sub(1, Ordering::Release);
+        cell.activation_queued.store(false, Ordering::SeqCst);
+        let token = cell.parked_location.load(Ordering::SeqCst);
+        if token == NOT_PARKED {
+            continue;
+        }
+        let home = token % narf_lib::percpu::MAX_CPUS;
+        if home != cpu {
+            // A queued activation can outlive a migration and a subsequent
+            // sleep. Route the pinned node to its current parked owner.
+            parked_wake_push(&cell);
+            resched_remote(cell.cpu.load(Ordering::Acquire));
+            continue;
+        }
+        let id = TaskId(cell.task);
+        let index = token / narf_lib::percpu::MAX_CPUS;
+        let parked = {
+            let mut parked = PARKED[cpu].lock();
+            parked.as_mut().and_then(|slots| {
+                let task = slots.slots.get(index)?.task.as_ref()?;
+                // A stale id cannot claim a reused index, and an in-flight
+                // direct transfer keeps ownership until its release path
+                // re-stages any wake that arrived while it was claimed.
+                if task.slot.id != id
+                    || !task.slot.awake.flag.load(Ordering::SeqCst)
+                    || task.slot.awake.direct_claimed.load(Ordering::SeqCst)
+                {
+                    return None;
+                }
+                slots.take(index, id)
+            })
+        };
+        let Some(parked) = parked else {
+            // A running/migrated task has already left parked ownership, or
+            // a stale token names a task which has since gone back to sleep.
+            continue;
+        };
+        enqueue_on(cpu, parked.slot, parked.reason);
+    }
+}
+
+/// Publish parked ownership, then recheck the wake after the SeqCst token
+/// store. Paired with the waker's SeqCst flag swap and token load, this closes
+/// the store/load race where both sides would otherwise miss one another.
+fn park_slot(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason) -> Option<ParkedSlot> {
+    let id = slot.id;
+    let mut parked = PARKED[cpu].lock();
+    let slots = parked.as_mut().expect("scheduler: park before init");
+    let index = slots.insert(cpu, ParkedSlot { slot, reason });
+    let cell = &slots.slots[index]
+        .task
+        .as_ref()
+        .expect("just parked")
+        .slot
+        .awake;
+    if cell.flag.load(Ordering::SeqCst) && !cell.direct_claimed.load(Ordering::Acquire) {
+        slots.take(index, id)
+    } else {
+        None
+    }
 }
 
 /// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.
@@ -3188,10 +3792,22 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
         let hi = vfloor(cpu).saturating_add(EEVDF_BASE_SLICE);
         slot.vruntime = slot.vruntime.clamp(lo, hi);
     }
-    // Record the slot's home CPU so a cross-core waker knows where to
-    // send the reschedule IPI. Updated again each time the slot is
-    // polled (it may have been work-stolen onto a different CPU).
+    // Record ownership before deciding between runnable and parked storage. A
+    // racing waker's parked token names the same CPU whose storage receives
+    // the slot. If the wake precedes token publication, park_slot's recheck
+    // activates the task directly.
     let previous_home = slot.awake.cpu.load(Ordering::Relaxed) as usize;
+    slot.awake.cpu.store(cpu as u32, Ordering::Release);
+    if !slot.awake.executor_runnable() {
+        if let Some(parked) = park_slot(cpu, slot, reason) {
+            enqueue_on(cpu, parked.slot, parked.reason);
+        }
+        return;
+    }
+
+    // The slot is now entering the policy-visible runnable set. Publish every
+    // conservative class shortcut guard before READY or the remote inbox can
+    // expose it.
     if matches!(
         reason,
         policy::TaskEnqueueReason::Admitted | policy::TaskEnqueueReason::Migrated
@@ -3201,11 +3817,10 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
         // mask is only a strict-class fast-path guard, never dispatch authority.
         publish_possible_class(cpu, slot.spec.class.rank());
     }
-    slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
-    let awake = slot.awake.executor_runnable();
-    if awake {
-        note_runnable_peer(cpu as u32, slot.id.raw());
-    }
+    // Publish the conservative ClassScheduler shortcut guard before the slot
+    // can become visible either in READY or in the remote wake inbox.
+    publish_class_fifo_shape(cpu, &slot);
+    note_runnable_peer(cpu as u32, slot.id.raw());
     let me = narf_lib::percpu::current_cpu();
 
     // REMOTE target off-load: stage onto the target's lock-free wake list (Linux
@@ -3236,7 +3851,7 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
         // which pairs with the idle-side Dekker handshake.
         if was_empty {
             resched_remote_force(cpu as u32);
-        } else if awake {
+        } else {
             resched_remote(cpu as u32);
         }
         return;
@@ -3278,8 +3893,7 @@ fn slot_is_dispatchable(slot: &TaskSlot, now: u64) -> bool {
 }
 
 fn next_budget_replenishment(cpu: usize, now: u64) -> Option<u64> {
-    let q = READY[cpu].lock();
-    q.as_ref().and_then(|ready| {
+    READY[cpu].lock().as_ref().and_then(|ready| {
         ready
             .iter()
             .filter(|slot| slot.awake.executor_runnable())
@@ -3295,18 +3909,16 @@ fn next_budget_replenishment(cpu: usize, now: u64) -> Option<u64> {
 
 fn notify_cpu_idle(cpu: usize) {
     let now = narf_time::now_cycles();
-    let state = {
+    let (queued, throttled, borrowable, next_budget_replenishment) = {
         let q = READY[cpu].lock();
         let Some(ready) = q.as_ref() else {
             return;
         };
-        let mut parked = 0usize;
         let mut throttled = 0usize;
         let mut borrowable = 0usize;
-        let mut next_budget_replenishment = None;
+        let mut deadline = None;
         for slot in ready {
             if !slot.awake.executor_runnable() {
-                parked += 1;
                 continue;
             }
             let view = slot.account.view(now, &slot.spec.budget);
@@ -3315,23 +3927,25 @@ fn notify_cpu_idle(cpu: usize) {
                 BudgetEligibility::Borrowable => borrowable += 1,
                 BudgetEligibility::Throttled => {
                     throttled += 1;
-                    if let Some(deadline) = view.replenish_at_cycles {
-                        next_budget_replenishment = Some(
-                            next_budget_replenishment
-                                .map(|current: u64| current.min(deadline))
-                                .unwrap_or(deadline),
-                        );
+                    if let Some(next) = view.replenish_at_cycles {
+                        deadline = Some(deadline.map_or(next, |current: u64| current.min(next)));
                     }
                 }
             }
         }
-        CpuIdleMeta {
-            queued: ready.len(),
-            parked,
-            throttled,
-            borrowable,
-            next_budget_replenishment,
-        }
+        (ready.len(), throttled, borrowable, deadline)
+    };
+    let parked = PARKED[cpu]
+        .lock()
+        .as_ref()
+        .map(ParkedTasks::len)
+        .unwrap_or(0);
+    let state = CpuIdleMeta {
+        queued,
+        parked,
+        throttled,
+        borrowable,
+        next_budget_replenishment,
     };
     policy::notify_cpu_executor_state(CpuId(cpu as u32), CpuState::Idle, Some(state));
 }
@@ -3697,14 +4311,22 @@ where
 /// `Arc` keeps the AS alive even if the task drops immediately —
 /// callers holding it observe a consistent snapshot.
 ///
-/// Searches every per-CPU ready queue. The lock on each CPU's queue is held
-/// for the duration of its scan; no two CPUs' queues are held at once.
+/// Searches every per-CPU runnable queue and parked map. Each lock is held only
+/// for its own scan; no two CPUs' ownership collections are held at once.
 pub fn address_space_of(id: TaskId) -> Option<Arc<AddressSpace>> {
     for q in READY.iter() {
         let g = q.lock();
         if let Some(ref dq) = *g {
             if let Some(slot) = dq.iter().find(|s| s.id == id) {
                 return slot.addr_space.clone();
+            }
+        }
+    }
+    for q in PARKED.iter() {
+        let g = q.lock();
+        if let Some(ref parked) = *g {
+            if let Some(entry) = parked.get(&id) {
+                return entry.slot.addr_space.clone();
             }
         }
     }
@@ -3751,9 +4373,9 @@ pub fn address_space_of_live(id: TaskId) -> Option<Arc<AddressSpace>> {
         .or_else(|| address_space_of_running(id))
 }
 
-/// Snapshot of every task currently sitting on a per-CPU ready queue. Used by
-/// /proc to enumerate `[pid]` subdirectories and by debug surfaces
-/// (`ps`-style introspection).
+/// Snapshot of every task currently owned by a per-CPU runnable queue or
+/// parked map. Used by /proc to enumerate `[pid]` subdirectories and by debug
+/// surfaces (`ps`-style introspection).
 ///
 /// Intentionally returns owned Vec rather than an iterator: the
 /// per-CPU lock is dropped before any caller code runs, so the
@@ -3769,12 +4391,18 @@ pub fn all_task_ids() -> alloc::vec::Vec<TaskId> {
             }
         }
     }
+    for q in PARKED.iter() {
+        let g = q.lock();
+        if let Some(ref parked) = *g {
+            out.extend(parked.keys().copied());
+        }
+    }
     out
 }
 
 /// Snapshot every distinct live user address space, including tasks currently
 /// being polled or staged for a remote CPU and therefore temporarily absent
-/// from the ready queues.
+/// from the runnable queues and parked maps.
 pub fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
     let mut out: alloc::vec::Vec<Arc<AddressSpace>> = alloc::vec::Vec::new();
     let mut push_unique = |candidate: Arc<AddressSpace>| {
@@ -3790,6 +4418,16 @@ pub fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
         if let Some(ref dq) = *g {
             for slot in dq.iter() {
                 if let Some(ref addr_space) = slot.addr_space {
+                    push_unique(addr_space.clone());
+                }
+            }
+        }
+    }
+    for q in PARKED.iter() {
+        let g = q.lock();
+        if let Some(ref parked) = *g {
+            for entry in parked.values() {
+                if let Some(ref addr_space) = entry.slot.addr_space {
                     push_unique(addr_space.clone());
                 }
             }
@@ -3811,11 +4449,11 @@ pub fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
 ///
 /// Used by `execve` to swap the current task's AS to the freshly-
 /// loaded program AS without re-spawning the task — the task id,
-/// its place in the ready queue, and any in-flight syscall
+/// its scheduler identity, and any in-flight syscall
 /// bookkeeping (fd table, brk, sigaction handlers) all stay
 /// keyed to the same id.
 ///
-/// Returns None if no slot with that id is on any ready queue.
+/// Returns None if no queued or parked slot has that id.
 pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
     // Wave-49fu: when execve fires from inside a user task's poll
     // body (the normal case), the slot has been popped from the
@@ -3888,6 +4526,25 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
             // Wake-capable final-detach notification runs after the ready-queue
             // lock is released; the reaper waker may itself touch scheduler
             // state.
+            if let Some(previous) = prev.as_ref() {
+                previous.scheduler_detach_user_task();
+            }
+            return prev;
+        }
+    }
+    for q in PARKED.iter() {
+        let replaced = {
+            let mut g = q.lock();
+            g.as_mut().and_then(|parked| {
+                let slot = &mut parked.get_mut(&id)?.slot;
+                new_arc.scheduler_attach_user_task();
+                replace_live_user_address_space(id, &new_arc);
+                let prev = slot.addr_space.take();
+                slot.addr_space = Some(new_arc.clone());
+                Some(prev)
+            })
+        };
+        if let Some(prev) = replaced {
             if let Some(previous) = prev.as_ref() {
                 previous.scheduler_detach_user_task();
             }
@@ -4032,6 +4689,15 @@ fn refund_donor(donor: TaskId, cycles: u64) {
             }
         }
     }
+    for q in PARKED.iter() {
+        let mut g = q.lock();
+        if let Some(ref mut parked) = *g {
+            if let Some(entry) = parked.get_mut(&donor) {
+                entry.slot.account.revert_debit(cycles);
+                return;
+            }
+        }
+    }
     cancel_donor_debit(donor, cycles);
 }
 
@@ -4057,7 +4723,7 @@ pub fn __reset_donations_for_test() {
 ///    quantum.
 /// 3. Stamps a `Donation` claim on the target's slot.
 /// 4. Forces the donee awake and moves the slot to the head of
-///    its ready queue so the next dispatch round polls it first
+///    its runnable queue so the next dispatch round polls it first
 ///    (ahead of normal FIFO order).
 ///
 /// Revocation: if `cap.revoke()` is called before the donee
@@ -4074,13 +4740,26 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
     let mut any_initialised = false;
 
     for (cpu, q) in READY.iter().enumerate() {
-        let mut g = q.lock();
-        let ready = match g.as_mut() {
-            Some(r) => r,
-            None => continue,
-        };
-        any_initialised = true;
-        if let Some(pos) = ready.iter().position(|s| s.id == target) {
+        let result = policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
+            let mut g = q.lock();
+            let ready = match g.as_mut() {
+                Some(r) => r,
+                None => return None,
+            };
+            any_initialised = true;
+            let mut activated_reason = None;
+            let pos = if let Some(pos) = ready.iter().position(|s| s.id == target) {
+                pos
+            } else {
+                let entry = PARKED[cpu]
+                    .lock()
+                    .as_mut()
+                    .and_then(|parked| parked.remove(&target));
+                let entry = entry?;
+                activated_reason = Some(entry.reason);
+                ready.push_back(entry.slot);
+                ready.len() - 1
+            };
             // Build a donor-meta snapshot. If the donor is on the
             // same queue, lift its real `TaskMeta`; if not, synthesise
             // a placeholder carrying just the donor id so the policy
@@ -4164,7 +4843,37 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
             // Refuse short-circuit: no budget changes, no enqueue
             // mutation; donee stays where it is.
             if matches!(placement, crate::donation::EnqueueDonee::Refuse) {
-                return Err(DonateError::PolicyRefused);
+                if let Some(reason) = activated_reason {
+                    let slot = ready
+                        .remove(pos)
+                        .expect("donation target disappeared under queue lock");
+                    let activated = if slot.awake.executor_runnable() {
+                        Some(ParkedSlot { slot, reason })
+                    } else {
+                        park_slot(cpu, slot, reason)
+                    };
+                    if let Some(ParkedSlot { slot, reason }) = activated {
+                        publish_possible_class(cpu, slot.spec.class.rank());
+                        publish_class_fifo_shape(cpu, &slot);
+                        note_runnable_peer(cpu as u32, slot.id.raw());
+                        ready.push_back(slot);
+                        if let Some(scheduler) =
+                            scheduler.filter(|policy| policy::observes_queue_events(*policy))
+                        {
+                            let slot = ready
+                                .back()
+                                .expect("donation wake target was just activated");
+                            scheduler.on_task_queue_event(
+                                CpuId(cpu as u32),
+                                policy::TaskQueueEvent::Enqueued {
+                                    task: policy::TaskMeta::from_slot(slot),
+                                    reason,
+                                },
+                            );
+                        }
+                    }
+                }
+                return Some(Err(DonateError::PolicyRefused));
             }
 
             // Compute the actual cycles to transfer. When the donor
@@ -4209,13 +4918,37 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
             if !was_awake {
                 note_runnable_peer(cpu as u32, slot.id.raw());
             }
+            if activated_reason.is_some() {
+                publish_possible_class(cpu, slot.spec.class.rank());
+                publish_class_fifo_shape(cpu, &slot);
+            }
             match placement {
                 crate::donation::EnqueueDonee::HeadOfQueue => ready.push_front(slot),
                 crate::donation::EnqueueDonee::BackOfQueue => ready.push_back(slot),
                 // Refuse handled above.
                 crate::donation::EnqueueDonee::Refuse => unreachable!(),
             }
-            return Ok(());
+            if let Some(reason) = activated_reason {
+                if let Some(scheduler) =
+                    scheduler.filter(|policy| policy::observes_queue_events(*policy))
+                {
+                    let slot = ready
+                        .iter()
+                        .find(|slot| slot.id == target)
+                        .expect("donation target was just activated");
+                    scheduler.on_task_queue_event(
+                        CpuId(cpu as u32),
+                        policy::TaskQueueEvent::Enqueued {
+                            task: policy::TaskMeta::from_slot(slot),
+                            reason,
+                        },
+                    );
+                }
+            }
+            Some(Ok(()))
+        });
+        if let Some(result) = result {
+            return result;
         }
     }
 
@@ -4255,7 +4988,10 @@ fn settle_donation(slot: &mut TaskSlot) {
 // future is free to stash its waker (as IRQ-driven drivers will want
 // to) and have it outlive the original `TaskSlot` view.
 
-const TASK_VTABLE: RawWakerVTable =
+// Waker identity is used before downcasting its data to WakeCell. A static
+// provides one address; const promotion may create different vtables at each
+// use and silently disable scheduler-owned wake and direct-transfer paths.
+static TASK_VTABLE: RawWakerVTable =
     RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
 
 unsafe fn clone_raw(data: *const ()) -> RawWaker {
@@ -4287,7 +5023,10 @@ unsafe fn wake_raw(data: *const ()) {
     // wake-by-value: consume the Arc.
     // SAFETY: same as clone_raw; we own the refcount handed to us.
     let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
-    let prev_awake = arc.flag.swap(true, Ordering::Release);
+    let prev_awake = arc.flag.swap(true, Ordering::SeqCst);
+    if !prev_awake {
+        parked_wake_push(&arc);
+    }
     // Kick the owner's CPU if it's idle on another core (else the awake
     // bit waits until that CPU's next timer tick — the cross-core wake
     // tail). `resched_remote` no-ops for same-CPU / running targets.
@@ -4309,10 +5048,21 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
     // SAFETY: Valid memory or trusted environment
-    let (home, task, prev_awake) = unsafe {
-        let prev = (*ptr).flag.swap(true, Ordering::Release);
-        ((*ptr).cpu.load(Ordering::Acquire), (*ptr).task, prev)
+    let prev_awake = unsafe {
+        let prev = (*ptr).flag.swap(true, Ordering::SeqCst);
+        if !prev {
+            let cell = &*ptr;
+            if urgent_task != Some(cell.task) || !try_activate_parked_local(cell) {
+                parked_wake_push(cell);
+            }
+        }
+        prev
     };
+    // Load the home AFTER the parked token. Observing token publication must
+    // also observe the preceding home store, so the kick cannot target an old
+    // CPU while activation is staged on the new one.
+    // SAFETY: the caller's live Waker pins ptr.
+    let (home, task) = unsafe { ((*ptr).cpu.load(Ordering::Acquire), (*ptr).task) };
     if !prev_awake {
         // SAFETY: the caller holds a live Waker, so `ptr`'s WakeCell is valid.
         unsafe { wake_race_stamp(&*ptr, home) };
@@ -4408,23 +5158,38 @@ fn try_migrate_wakee_to(home: u32, target: u32, cell: *const WakeCell) -> bool {
     }
     let dest = crate::affinity::CpuId(target);
     let moved = policy::try_with_scheduler(crate::affinity::CpuId(home), |scheduler| {
-        let mut ready = READY[source].try_lock()?;
-        let queue = ready.as_mut()?;
-        let position = queue.iter().position(|slot| {
-            core::ptr::eq(Arc::as_ptr(&slot.awake), cell)
-                && direct_handoff_slot_eligible(slot, dest)
-        })?;
-        let slot = queue.remove(position)?;
-        if let Some(scheduler) = scheduler.filter(|policy| policy::observes_queue_events(*policy)) {
-            scheduler.on_task_queue_event(
-                crate::affinity::CpuId(home),
-                policy::TaskQueueEvent::Dequeued {
-                    task: policy::TaskMeta::from_slot(&slot),
-                    reason: policy::TaskDequeueReason::Migrated,
-                },
-            );
+        let ready_slot = {
+            let mut ready = READY[source].try_lock()?;
+            let queue = ready.as_mut()?;
+            let position = queue.iter().position(|slot| {
+                core::ptr::eq(Arc::as_ptr(&slot.awake), cell)
+                    && direct_handoff_slot_eligible(slot, dest)
+            });
+            position.and_then(|position| queue.remove(position))
+        };
+        if let Some(slot) = ready_slot {
+            if let Some(scheduler) =
+                scheduler.filter(|policy| policy::observes_queue_events(*policy))
+            {
+                scheduler.on_task_queue_event(
+                    crate::affinity::CpuId(home),
+                    policy::TaskQueueEvent::Dequeued {
+                        task: policy::TaskMeta::from_slot(&slot),
+                        reason: policy::TaskDequeueReason::Migrated,
+                    },
+                );
+            }
+            return Some(slot);
         }
-        Some(slot)
+        let mut parked = PARKED[source].try_lock()?;
+        let slots = parked.as_mut()?;
+        // SAFETY: the wake path's live Waker pins cell through this call.
+        let (index, entry) = slots.for_cell(source, unsafe { &*cell })?;
+        if !direct_handoff_slot_eligible(&entry.slot, dest) {
+            return None;
+        }
+        let id = entry.slot.id;
+        slots.take(index, id).map(|entry| entry.slot)
     });
     match moved {
         Some(Some(slot)) => {
@@ -5434,13 +6199,22 @@ pub fn run_until_empty() {
         // flagged. Keeps the slab from hoarding enough to starve the buddy.
         narf_memory::slab::drain_over_watermark();
 
+        // A task polled this round may just have woken a parked peer. Activate
+        // it at this executor boundary before classifying this CPU as idle or
+        // trying to steal elsewhere. Deferring this drain to the next round
+        // would run idle maintenance and balancing with local runnable work
+        // already pending, unlike the former resident READY wake-bit check.
+        if wake_list_pending(cpu) {
+            drain_wake_list(cpu);
+        }
+
         // Local queue done for this round. If empty, try to steal one
         // task from another CPU's queue; if that fails, we have
         // nothing to do — return so the caller decides whether to
         // park (worker APs via `run_forever`) or proceed (BSP-side
         // test callers).
         let now = narf_time::now_cycles();
-        let (local_empty, local_dispatchable) = {
+        let (ready_empty, local_dispatchable) = {
             let q = READY[cpu].lock();
             q.as_ref()
                 .map(|d| {
@@ -5451,6 +6225,14 @@ pub fn run_until_empty() {
                 })
                 .unwrap_or((true, false))
         };
+        // Sleeping residents still require timer-wheel and sleep-pump service
+        // below. Returning to run_forever's truly-empty halt would bypass that
+        // maintenance and could strand a deadline with no runnable slot.
+        let local_empty = ready_empty
+            && PARKED[cpu]
+                .lock()
+                .as_ref()
+                .is_none_or(|parked| parked.len() == 0);
         if !local_dispatchable {
             if try_steal_one(cpu) {
                 continue;
@@ -5938,19 +6720,34 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
 /// Used by synchronous handoff hints after the task's waker has fired. A
 /// nonblocking queue probe avoids taking a scheduler lock from the syscall
 /// wake path; contention declines the optimization and leaves the ordinary
-/// wake-preemption request in force.
+/// wake-preemption request in force. A freshly woken parked owner also counts:
+/// its durable activation is pending at the next executor boundary. Otherwise
+/// callers that wake before publishing an urgent hint would silently lose
+/// local handoff visibility merely because activation is deferred.
 pub(crate) fn task_runnable_on_current_cpu(task_id: u64) -> bool {
     let cpu = narf_lib::percpu::current_cpu();
     let now = narf_time::now_cycles();
     let Some(q) = READY[cpu].try_lock() else {
         return false;
     };
-    q.as_ref()
+    let ready = q
+        .as_ref()
         .map(|d| {
             d.iter()
                 .any(|s| s.id.raw() == task_id && slot_is_dispatchable(s, now))
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    drop(q);
+    if ready {
+        return true;
+    }
+    let Some(parked) = PARKED[cpu].try_lock() else {
+        return false;
+    };
+    parked
+        .as_ref()
+        .and_then(|slots| slots.get(&TaskId(task_id)))
+        .is_some_and(|entry| slot_is_dispatchable(&entry.slot, now))
 }
 
 /// Snapshot per-CPU ready-queue depths. Returns one entry per
@@ -5970,10 +6767,10 @@ pub fn cpu_queue_depths() -> alloc::vec::Vec<(u32, usize)> {
     out
 }
 
-/// Count of RUNNABLE tasks across online CPUs — ready-queue slots whose
-/// awake flag is set (parked sleepers stay queued but not awake). The
+/// Count of RUNNABLE tasks across online CPUs. Sleeping tasks live in the
+/// separate parked maps and therefore do not inflate this value. The
 /// /proc/loadavg sample source: Linux's calc_load counts running +
-/// uninterruptible, and awake-in-queue is NARF's equivalent. try_lock
+/// uninterruptible, and dispatchable-in-queue is NARF's equivalent. try_lock
 /// like the stall watchdog — a contended queue is skipped for one
 /// sample rather than deadlocking a procfs read against the executor.
 pub fn runnable_task_count() -> usize {
@@ -6035,6 +6832,28 @@ pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, usize, u64, u32, bool)
                 slot.awake.executor_runnable(),
                 home,
                 d.len(),
+                allowed.bits(),
+                cpu as u32,
+                allowed.contains(CpuId(cpu as u32)),
+            ));
+        }
+    }
+    for (cpu, parked) in PARKED.iter().enumerate() {
+        if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
+            continue;
+        }
+        let Some(g) = parked.try_lock() else {
+            continue;
+        };
+        let Some(slots) = g.as_ref() else { continue };
+        if let Some(entry) = slots.get(&TaskId(task_id)) {
+            let slot = &entry.slot;
+            let home = slot.awake.cpu.load(Ordering::Relaxed);
+            let allowed = slot.spec.affinity.allowed;
+            return Some((
+                slot.awake.executor_runnable(),
+                home,
+                slots.len(),
                 allowed.bits(),
                 cpu as u32,
                 allowed.contains(CpuId(cpu as u32)),
@@ -6761,6 +7580,9 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     let awake = Arc::new(WakeCell {
         flag: AtomicBool::new(true),
         cpu: AtomicU32::new(narf_lib::percpu::current_cpu() as u32),
+        parked_location: AtomicUsize::new(NOT_PARKED),
+        activation_queued: AtomicBool::new(false),
+        wake_next: AtomicPtr::new(core::ptr::null_mut()),
         // Nested block_on future: not a ready-queue slot, so no wake-next id.
         task: 0,
         wake_cyc: AtomicU64::new(0),

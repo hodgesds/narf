@@ -472,8 +472,12 @@ impl RegionPerms {
     pub const WRITE: RegionPerms;
     pub const EXEC: RegionPerms;
     pub const LOCKED: RegionPerms;
-    /// Externally owned alias; teardown invokes the shared release hook.
+    /// Borrowed alias owned by a VMA object or an external frame registry;
+    /// memory never returns its backing directly to the frame allocator.
     pub const SHARED: RegionPerms;
+    /// SHARED backing whose owner requires one retain/release hook call per
+    /// non-zero frame alias. The invariant is EXTERNAL_REFS => SHARED.
+    pub const EXTERNAL_REFS: RegionPerms;
     /// Missing pages are supplied by the installed file-fault hook. With
     /// SHARED the returned frame is externally owned; without SHARED it is a
     /// fresh private frame whose ownership transfers to this address space.
@@ -1008,13 +1012,27 @@ impl AddressSpace {
     pub unsafe fn try_grow_stack_limited(
         &self, fault: VirtAddr, limits: StackGrowthLimits,
     ) -> Result<(), AddressSpaceError>;
+    /// Reject non-stack faults before resolving task credentials or limits.
+    /// The provider runs once outside VMA locks for a nearby real guard.
+    /// Candidate discovery grants no admission: preflight and final mutation
+    /// still revalidate topology, all returned limits, and PTE ownership.
+    pub unsafe fn try_grow_stack_with_limits(
+        &self, fault: VirtAddr, limits: impl FnOnce() -> StackGrowthLimits,
+    ) -> Result<(), AddressSpaceError>;
 }
 
 /// Install the external shared-page owner's per-alias lifetime hooks.
-/// Every SHARED map retains each non-zero backing frame; unmap, MAP_FIXED
-/// replacement, and address-space teardown release only after the
-/// corresponding translations have been invalidated.
+/// Every SHARED|EXTERNAL_REFS map retains each non-zero backing frame; unmap,
+/// MAP_FIXED replacement, and address-space teardown release only after the
+/// corresponding translations have been invalidated. Plain SHARED mappings
+/// instead retain backing through their VMA-level or in-memory owner.
 pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64));
+/// Clone upper-layer VMA ownership while the parent fork transaction still
+/// excludes mutation, before a child may expose borrowed shared backing.
+/// Callers that create SHARED mappings without EXTERNAL_REFS must either
+/// install this hook or guarantee that the backing intrinsically outlives all
+/// address-space aliases.
+pub fn install_address_space_fork_hook(fork: fn(parent_id: u64, child_id: u64));
 /// Retire upper-layer VMA ownership after the final address-space reference
 /// has invalidated all leaves and released their backing.
 pub fn install_address_space_drop_hook(drop: fn(address_space_id: u64));
@@ -1506,9 +1524,10 @@ x86_64 is rejected at runtime.
   while holding the region lock; structural VMA removal cancels every covered
   ticket before a replacement can appear. A cancelled anonymous allocation
   remains owned by the fault path and returns to the frame allocator; a
-    cancelled externally-owned file alias is released through its
-    backing-owner hook; a cancelled private file page returns directly to the
-    frame allocator.
+  cancelled externally-owned file alias is released through its backing-owner
+  hook; a cancelled plain `SHARED` file page remains owned by its VMA backing
+  object; a cancelled private file page returns directly to the frame
+  allocator.
 - An anonymous demand fault refused by the protected user reserve reports
   the typed `FrameAllocError::ReservePressure` directly from the allocator;
   fallback policy walks preserve that result rather than collapsing it into

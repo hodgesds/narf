@@ -43,6 +43,44 @@ pub const MSR_IA32_THERM_STATUS: u32 = 0x19C;
 /// Bits 23:16: Tj_MAX (°C). Present on Intel Core 2 and later.
 pub const MSR_TEMPERATURE_TARGET: u32 = 0x1A2;
 
+/// Intel's digital thermal sensor is enumerated by CPUID.06H:EAX[0].
+/// Neither generic MSR support nor the legacy ACPI feature implies it.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn supports_coretemp(
+    vendor: narf_arch::x86_64::microcode::Vendor,
+    max_basic: u32,
+    thermal_eax: u32,
+) -> bool {
+    vendor == narf_arch::x86_64::microcode::Vendor::Intel && max_basic >= 6 && thermal_eax & 1 != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cpu_has_coretemp() -> bool {
+    use narf_arch::x86_64::{cpuid::cpuid, microcode};
+
+    let vendor = microcode::vendor();
+    // SAFETY: CPUID leaf 0 is defined on x86_64.
+    let (max_basic, _, _, _) = unsafe { cpuid(0, 0) };
+    if vendor != microcode::Vendor::Intel || max_basic < 6 {
+        return false;
+    }
+    // SAFETY: leaf 0 advertised leaf 6.
+    let (thermal_eax, _, _, _) = unsafe { cpuid(6, 0) };
+    supports_coretemp(vendor, max_basic, thermal_eax)
+}
+
+/// Probe state belongs to the current CPU. Keep the read pinned and exclude
+/// IRQ-side probes until the recoverable MSR access has disarmed it.
+#[cfg(target_arch = "x86_64")]
+fn read_thermal_msr(index: u32) -> Option<u64> {
+    narf_lib::sync::without_interrupts(|| {
+        if !cpu_has_coretemp() {
+            return None;
+        }
+        narf_arch::x86_64::msr::rdmsr_or_gp(index).ok()
+    })
+}
+
 // ── Decode helpers ────────────────────────────────────────────────────
 
 /// Decode the digital readout from `IA32_THERM_STATUS`.
@@ -106,14 +144,7 @@ impl Coretemp {
     /// is unavailable (NARF's arch crate gates `rdmsr` on x86_64).
     #[cfg(target_arch = "x86_64")]
     pub fn read_therm_status(&self) -> Option<u64> {
-        // SAFETY: `rdmsr` is safe to call from CPL-0 on x86_64; the
-        // arch crate marks it unsafe because it's a privileged
-        // instruction, but the kernel always runs at CPL-0.
-        // This path is exercised only after coretemp probe succeeds,
-        // which requires CPL-0 with CPUID.01H:EDX[bit 22] = 1
-        // (ACPI MSR support present).
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        Some(unsafe { narf_arch::x86_64::msr::rdmsr(MSR_IA32_THERM_STATUS) })
+        read_thermal_msr(MSR_IA32_THERM_STATUS)
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -158,13 +189,14 @@ impl crate::HwmonDevice for Coretemp {
 // ── Driver registration ───────────────────────────────────────────────
 
 /// Register the coretemp MSR driver. Called from Stage::Subsys.
-/// Probe: read MSR_TEMPERATURE_TARGET on logical CPU 0; if it
-/// returns a plausible Tjmax (75–125 °C) assume coretemp is present.
+/// Probe only Intel CPUs advertising a digital thermal sensor, then use a
+/// recoverable MSR read and require a plausible Tjmax (75–125 °C).
 #[cfg(target_arch = "x86_64")]
 pub fn register_msr_driver() {
     use core::fmt::Write as _;
-    // SAFETY: rdmsr is a CPL-0 privileged instruction; safe in kernel context.
-    let raw = unsafe { narf_arch::x86_64::msr::rdmsr(MSR_TEMPERATURE_TARGET) };
+    let Some(raw) = read_thermal_msr(MSR_TEMPERATURE_TARGET) else {
+        return;
+    };
     let tjmax = decode_tjmax(raw);
     if !(75..=125).contains(&tjmax) {
         let _ = writeln!(

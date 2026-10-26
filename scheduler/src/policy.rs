@@ -173,11 +173,11 @@ impl TaskMeta {
 /// exactly what a balance decision needs and the core can read cheaply (O(1) per
 /// CPU): the queued length, whether the CPU is idle-halted, and its EEVDF
 /// virtual-time floor (so a vruntime-ordered policy can compare virtual time
-/// across CPUs). `nr_queued` is the run-queue length — an upper bound on runnable
-/// work (parked tasks inflate it) and `u16::MAX` for a CPU whose queue was
-/// momentarily lock-contended (reported busy so it is never mistaken for a light
-/// target). The running task is off-queue during its poll, so `nr_queued` counts
-/// only *queued* tasks.
+/// across CPUs). `nr_queued` is the runnable-queue length (sleepers live in a
+/// separate parked map) and `u16::MAX` for a CPU whose queue was momentarily
+/// lock-contended (reported busy so it is never mistaken for a light target).
+/// The running task is off-queue during its poll, so `nr_queued` counts only
+/// queued runnable tasks.
 #[derive(Copy, Clone, Debug)]
 pub struct CpuLoad {
     pub cpu: CpuId,
@@ -1367,12 +1367,48 @@ pub(crate) fn pick_next_slot(
                 .expect("urgent next-buddy position disappeared under queue lock");
             if !q.is_empty() {
                 // Never clear this hint on the shortcut: another wake can race
-                // this pick, and even parked leftovers make a stale true safer
-                // than a false negative. The next full scan refines it.
+                // this pick, and remaining runnable slots make a stale true
+                // safer than a false negative. The next full scan refines it.
                 crate::publish_runnable_peer(cpu.0 as usize, true);
             }
             return Some((TaskHandle::from_id(slot.id), slot));
         }
+    }
+
+    // Consume the one-shot buddy before considering the FIFO shortcut. An
+    // outstanding buddy must retain its normal precedence even when every
+    // resident task otherwise has identical scheduling metadata. When an
+    // urgent hint exists, keep the generic buddy untouched as before.
+    let wake_next_id = if urgent_id != 0 {
+        urgent_id
+    } else {
+        crate::take_wake_next(cpu.0)
+    };
+
+    let class_fifo_fast = builtin_class
+        && wake_next_id == 0
+        && crate::class_fifo_uniform(cpu.0 as usize)
+        && q.front().is_some_and(|slot| slot.awake.executor_runnable());
+
+    // The common executor queue contains only always-eligible Default/NORMAL
+    // tasks. Enqueue and live-priority mutation publish a monotone per-CPU
+    // guard before any exception becomes queue-visible, so the head is the
+    // ClassScheduler's next FIFO position. Sleeping tasks are owned by the
+    // per-CPU PARKED map, so READY's head is runnable except during a bounded
+    // direct-handoff claim. This turns each common pick into one deque pop;
+    // buddy ordering, a claimed head, mixed classes/priorities, budgets, and
+    // cap-gated tasks retain the authoritative scan below.
+    if class_fifo_fast {
+        // Mirror the full scan's peer refresh before detaching the winner. A
+        // queue with one slot has no peer; retaining a stale true there makes
+        // sched_yield repeatedly switch to an empty executor. Publish before
+        // removal so a later racing wake can restore true, exactly like the
+        // full-scan store-before-observe ordering below.
+        crate::publish_runnable_peer(cpu.0 as usize, q.len() > 1);
+        let slot = q
+            .pop_front()
+            .expect("ClassScheduler FIFO head disappeared under queue lock");
+        return Some((TaskHandle::from_id(slot.id), slot));
     }
 
     let requested = if builtin_class {
@@ -1419,11 +1455,6 @@ pub(crate) fn pick_next_slot(
     // Wake-next ("next buddy"): the id of the most recently woken task on this
     // CPU, read-and-cleared here so the boost is one-shot (Linux clears
     // `cfs_rq->next` on pick). 0 when the feature is off or nothing is queued.
-    let wake_next_id = if urgent_id != 0 {
-        urgent_id
-    } else {
-        crate::take_wake_next(cpu.0)
-    };
     let mut best_tier = 0u8;
     let mut best_pos: Option<usize> = None;
     let mut requested_hit: Option<(usize, u8)> = None;

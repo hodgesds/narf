@@ -28,7 +28,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -117,6 +117,14 @@ pub struct Task {
     /// CPU anchoring this task's process-child rotation. Established by its
     /// first process fork and retained if the parent later migrates.
     fork_base_cpu: AtomicU32,
+    /// The initial process owner is immutable and pinned by this Task's own
+    /// lifetime. Ordinary reads need no RCU pin or refcount operation.
+    rlimits: Arc<crate::rlimit::ProcessLimits>,
+    /// Rare rebinding publishes a replacement before release-setting the
+    /// monotone flag. Its IRQ-safe guard pins borrowed reads without an Arc
+    /// drop or an RCU operation in a timer handler.
+    rlimit_override: IrqSafeSpinLock<Option<Arc<crate::rlimit::ProcessLimits>>>,
+    rlimits_rebound: AtomicBool,
     /// Set by `exit_group(2)` (Linux `signal->group_exit`): the whole
     /// thread group is terminating. Consulted so a sibling that races
     /// the group exit reports the group's status.
@@ -169,6 +177,7 @@ impl Task {
     /// register BEFORE the task is enqueued, so the task can resolve
     /// itself from its very first syscall.
     pub fn new_registered(tid: u64, pid: u64) -> Arc<Task> {
+        let limits = crate::handlers::rlimit_for_new_task(tid, pid);
         let t = Arc::new(Task {
             tid,
             pid: AtomicU64::new(pid),
@@ -187,6 +196,9 @@ impl Task {
             parked_this_slice: AtomicU32::new(0),
             fork_sequence: AtomicU64::new(0),
             fork_base_cpu: AtomicU32::new(u32::MAX),
+            rlimits: limits,
+            rlimit_override: IrqSafeSpinLock::new(None),
+            rlimits_rebound: AtomicBool::new(false),
             group_exiting: core::sync::atomic::AtomicBool::new(false),
             uctx: UserTaskCtx::new(),
             poll_files: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
@@ -199,6 +211,68 @@ impl Task {
         // tables at exit.
         crate::handlers::record_task_start_ns(tid);
         t
+    }
+
+    /// Individual-word enforcement, including timer IRQs. The initial owner
+    /// is pinned by Task; a rebound owner is borrowed under its IRQ-safe gate.
+    /// No callback or Arc drop can escape into this read's critical section.
+    #[inline]
+    pub(crate) fn read_rlimit_once(&self, resource: usize) -> Option<crate::rlimit::Limit> {
+        if !self.rlimits_rebound.load(Ordering::Acquire) {
+            return self.rlimits.read_once(resource);
+        }
+        self.rlimit_override
+            .lock()
+            .as_ref()
+            .expect("task always owns limits")
+            .read_once(resource)
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn __test_rlimits_use_initial(&self) -> bool {
+        !self.rlimits_rebound.load(Ordering::Acquire)
+    }
+
+    /// Owned snapshots are used outside IRQ context (fork and /proc).
+    pub(crate) fn rlimit_owner(&self) -> Arc<crate::rlimit::ProcessLimits> {
+        if !self.rlimits_rebound.load(Ordering::Acquire) {
+            return self.rlimits.clone();
+        }
+        self.rlimit_override
+            .lock()
+            .as_ref()
+            .expect("task always owns limits")
+            .clone()
+    }
+
+    /// Lock order is binding -> process for updates and rebinding. Reap needs
+    /// only the binding gate to exclude this task's retained-target updates.
+    /// Borrowing the owner through both locks avoids an Arc's final drop in an
+    /// IRQ if another CPU rebinds the task during RLIMIT_CPU enforcement.
+    pub(crate) fn rlimit_transaction<R>(
+        &self,
+        f: impl FnOnce(&crate::rlimit::LockedLimits<'_>) -> R,
+    ) -> R {
+        let binding = self.rlimit_override.lock();
+        binding.as_ref().unwrap_or(&self.rlimits).transaction(f)
+    }
+
+    /// Caller holds PID_TASK_MUTATION and is outside IRQ context. Drop the
+    /// displaced Arc after the binding/process guards; ordinary enforcement
+    /// borrows it without a refcount update while the binding gate is held.
+    pub(crate) fn rebind_rlimits(&self, limits: Arc<crate::rlimit::ProcessLimits>) {
+        let mut binding = self.rlimit_override.lock();
+        let old = binding.as_ref().unwrap_or(&self.rlimits).clone();
+        if Arc::ptr_eq(&old, &limits) {
+            return;
+        }
+        let retired = old.transaction(|_| {
+            let retired = binding.replace(limits);
+            self.rlimits_rebound.store(true, Ordering::Release);
+            retired
+        });
+        drop(binding);
+        drop(retired);
     }
 }
 
@@ -1278,7 +1352,19 @@ pub fn task_has_exited(tid: u64) -> bool {
 /// the executor slot's future, if it hasn't been dropped already).
 /// Returns the removed task so callers can log/inspect.
 pub fn release_task(tid: u64) -> Option<Arc<Task>> {
-    TASKS.lock().remove(&tid)
+    // Identity writers take this before replacing a limits binding. Pair it
+    // with unregistration so a rebind that already resolved this Task cannot
+    // publish an owner/index entry after its release has completed.
+    let _identity = crate::handlers::PID_TASK_MUTATION.lock();
+    let owner = task_get(tid)?;
+    let _binding = owner.rlimit_override.lock();
+    let removed = TASKS.lock().remove(&tid);
+    // Every retained-target transaction takes this task's binding gate before
+    // revalidating TASKS. Unregistration therefore needs no shared process
+    // lock; siblings retain their own owners and may keep using their limits.
+    // Never hold TASKS while taking the lifecycle index lock or dropping it.
+    crate::handlers::rlimit_retire_key(tid);
+    removed
 }
 
 /// Snapshot every registered task's `(tid, pid)`. The OOM killer scans this
@@ -1363,5 +1449,7 @@ pub fn slot_reap_handler(id: narf_scheduler::TaskId) {
 /// Test-only: clear the registry between kernel-test cases.
 #[doc(hidden)]
 pub fn __test_reset_tasks() {
-    TASKS.lock().clear();
+    for task in task_ids() {
+        release_task(task);
+    }
 }
