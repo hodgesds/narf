@@ -4421,48 +4421,12 @@ async fn drain_display_clients() -> bool {
     }
 }
 
-/// One plane's DRM framebuffer: a kernel-mapped dumb buffer, or (`bo`) an
-/// amdgpu GEM buffer pinned in VRAM for scanout; its pitch, size and
-/// fourcc, each plane's offset (a 4:2:0 framebuffer's chroma plane at
-/// `offsets[1]` with `chroma_pitch`) and its modifier. A pinned buffer is
-/// scanned out in place (`external`), as amdgpu_dm hands DC the
-/// framebuffer's address: no copy. Dumb buffers are such GEM buffers in
-/// VRAM once the card's client heap is up (amdgpu_mode_dumb_create:
-/// `drm_ioctl_bridge::amdgpu_dumb`). A dumb buffer of the card's own table
-/// (`phys`, made while no heap was up) lives in system memory, which
-/// display fetch on this dGPU never reads (amdgpu_display_supported_domains
-/// is VRAM alone), so the presenter copies it into the plane's staged VRAM
-/// back buffer, as amdgpu_bo_pin would migrate it: a linear RGB plane's
-/// source rectangle, a tiled or 4:2:0 one whole.
-#[derive(Clone, Debug)]
-pub struct PlaneFrame {
-    pub phys: u64,
-    pub pitch: u32,
-    pub width: u32,
-    pub height: u32,
-    pub format: u32,
-    pub offsets: [u32; 2],
-    pub chroma_pitch: u32,
-    pub modifier: u64,
-    /// The pin amdgpu_dm_plane_helper_prepare_fb took on the framebuffer's
-    /// GEM buffer; it lasts until a flip latches past it.
-    pub bo: Option<Arc<crate::amdgpu_gem::ScanoutPin>>,
-}
+/// `PlaneFrame` is the DRM present layer's currency and lives in
+/// the DRM core (`crate::drm::card`); re-exported here so existing
+/// paths keep resolving. Its DC-specific methods stay below.
+pub use crate::drm::card::PlaneFrame;
+
 impl PlaneFrame {
-    /// A linear single-plane framebuffer at `phys`.
-    pub const fn linear(phys: u64, pitch: u32, width: u32, height: u32, format: u32) -> Self {
-        Self {
-            phys,
-            pitch,
-            width,
-            height,
-            format,
-            offsets: [0; 2],
-            chroma_pitch: 0,
-            modifier: 0,
-            bo: None,
-        }
-    }
     /// The framebuffer's tiling, if one the planes list.
     fn tiling(&self) -> Option<crate::amdgpu_dcn401_otg::Tiling> {
         crate::amdgpu_dcn401_otg::Tiling::from_modifier(self.modifier)

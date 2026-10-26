@@ -129,14 +129,18 @@ pub struct DriCardFile {
     /// client opens: handle 3 in one client's fd must not name another
     /// client's buffer. Kept even for a non-AMD card; the dispatcher is gated
     /// on the card's advertised driver name.
+    #[cfg(feature = "amdgpu")]
     amdgpu_gem: crate::amdgpu_gem::GemState,
     /// Per-open GPU address space. Linux keeps one `amdgpu_vm` per DRM file
     /// for the same reason handles are per-file: one client's GPU addresses
     /// must not resolve in another's page tables.
+    #[cfg(feature = "amdgpu")]
     amdgpu_vm: crate::amdgpu_vm::VmState,
     /// Per-open submission contexts (`fpriv->ctx_mgr`).
+    #[cfg(feature = "amdgpu")]
     amdgpu_ctx: crate::amdgpu_ctx::CtxState,
     /// Per-open BO lists (`fpriv->bo_list_handles`).
+    #[cfg(feature = "amdgpu")]
     amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
@@ -178,15 +182,20 @@ impl DriCardFile {
         }
         // amdgpu_driver_open_kms: runtime-resume the card (queued; devfs
         // lookup is synchronous and the first ioctl waits for it).
+        #[cfg(feature = "amdgpu")]
         crate::amdgpu_navi48_runtime_pm::on_open(index);
         Some(DriCardFile {
             index,
             open_id,
             metadata,
             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
+            #[cfg(feature = "amdgpu")]
             amdgpu_gem: crate::amdgpu_gem::GemState::for_card(index),
+            #[cfg(feature = "amdgpu")]
             amdgpu_vm: crate::amdgpu_vm::VmState::for_card(index),
+            #[cfg(feature = "amdgpu")]
             amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
+            #[cfg(feature = "amdgpu")]
             amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
             events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
@@ -240,6 +249,7 @@ impl Drop for DriCardFile {
             // As drm_fb_helper restores the console on lastclose: a native
             // display a client switched off lights again for the console,
             // in the sink's preferred mode.
+            #[cfg(feature = "amdgpu")]
             crate::amdgpu_native_kms::restore_displays();
         }
     }
@@ -251,6 +261,7 @@ impl FileOps for DriCardFile {
         offset: u64,
         len: usize,
     ) -> Result<narf_filesystem::MmapBacking, FsError> {
+        #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
             && offset >> 12 >= 0x4000_0000
         {
@@ -265,7 +276,10 @@ impl FileOps for DriCardFile {
         })
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        #[cfg(feature = "amdgpu")]
         crate::amdgpu_gem::cpu_mapping::published(lifetime);
+        #[cfg(not(feature = "amdgpu"))]
+        let _ = lifetime;
     }
     /// Drain one pending DRM event (`drm_event_vblank`) into `buf`. The
     /// compositor render loop poll/select()s the fd then read()s the
@@ -437,6 +451,7 @@ impl FileOps for DriCardFile {
         // that opened card0 rather than renderD128 asks `AMDGPU_INFO` there,
         // and Linux serves it from both (the INFO ioctl carries neither
         // DRM_AUTH nor DRM_MASTER in amdgpu's table).
+        #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             // DRM syncobjs, in this open's table (the one CS signals).
             if let Some(result) =
@@ -534,7 +549,13 @@ impl FileOps for DriCardFile {
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
             // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
+            #[cfg(feature = "amdgpu")]
+            #[cfg(feature = "amdgpu")]
             let _rpm = crate::amdgpu_navi48_runtime_pm::ioctl_enter(self.index).await?;
+            #[cfg(not(feature = "amdgpu"))]
+            let _rpm = ();
+            #[cfg(not(feature = "amdgpu"))]
+            let _rpm = ();
             if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
                 && crate::drm_ioctl_bridge::is_virtgpu_wait_ioctl(cmd)
             {
@@ -588,6 +609,8 @@ impl FileOps for DriCardFile {
                 )
                 .await;
             }
+            #[cfg(feature = "amdgpu")]
+            #[cfg(feature = "amdgpu")]
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
                 if let Some(result) =
                     crate::amdgpu_info::dispatch_live(self.index, cmd, arg as usize).await
@@ -595,6 +618,8 @@ impl FileOps for DriCardFile {
                     return result;
                 }
             }
+            #[cfg(feature = "amdgpu")]
+            #[cfg(feature = "amdgpu")]
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
                 if let Some(result) =
                     crate::amdgpu_gem::dispatch_async(cmd, arg as usize, &self.amdgpu_gem).await
@@ -636,6 +661,8 @@ impl FileOps for DriCardFile {
                 }
             }
             // amdgpu CS and WAIT_CS park on a card whose queue runs them.
+            #[cfg(feature = "amdgpu")]
+            #[cfg(feature = "amdgpu")]
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu")
                 && crate::amdgpu_cs::is_async_ioctl(cmd)
             {
@@ -680,7 +707,14 @@ impl FileOps for DriCardFile {
                 } else if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
                     // An amdgpu GEM offset, from this open's table only — a
                     // client cannot map a buffer it does not hold a handle to.
-                    self.amdgpu_gem.mmap_frames(offset, len)
+                    #[cfg(feature = "amdgpu")]
+                    {
+                        self.amdgpu_gem.mmap_frames(offset, len)
+                    }
+                    #[cfg(not(feature = "amdgpu"))]
+                    {
+                        Err(dumb_miss)
+                    }
                 } else {
                     Err(dumb_miss)
                 }
@@ -692,6 +726,7 @@ impl FileOps for DriCardFile {
         if let Some(lease) = retain_dumb_mapping(self.index, offset, len) {
             return Some(lease as Arc<dyn MmapLifetime>);
         }
+        #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             // The mapping holds the buffer: GEM_CLOSE must not free pages a
             // process still maps.
@@ -716,6 +751,8 @@ impl FileOps for DriCardFile {
     }
 
     fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {
+        #[cfg(feature = "amdgpu")]
+        #[cfg(feature = "amdgpu")]
         if let Some(object) = self.amdgpu_gem.object(gem_handle) {
             return amdgpu_dma_buf_file(object);
         }
@@ -729,9 +766,11 @@ impl FileOps for DriCardFile {
     }
 
     fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
+        #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             return amdgpu_prime_import(&self.amdgpu_gem, dmabuf);
         }
+        #[cfg(feature = "amdgpu")]
         if let Some(amdgpu) = dmabuf
             .as_any()
             .and_then(|any| any.downcast_ref::<AmdgpuDmaBufFile>())
@@ -993,6 +1032,7 @@ impl FileOps for VirtGpuPrimeDmaBufFile {
 /// LINUX-GAP: a buffer exported to another device or imported from one
 /// (a foreign dma-buf attached as GTT) is refused.
 #[derive(Debug)]
+#[cfg(feature = "amdgpu")]
 pub(crate) struct AmdgpuDmaBufFile {
     object: Arc<crate::amdgpu_gem::GemObject>,
     /// This dma-buf's inode. See [`dma_buf_inode`].
@@ -1005,6 +1045,7 @@ pub(crate) struct AmdgpuDmaBufFile {
 /// the exporter pinned: the importer holds its placement or dumb lease and
 /// shares its reservation). Another card's VRAM would need PCIe peer-to-peer
 /// and is refused (EINVAL), as is any other exporter.
+#[cfg(feature = "amdgpu")]
 pub(crate) fn amdgpu_prime_import(
     gem: &crate::amdgpu_gem::GemState,
     dmabuf: &Arc<dyn FileOps>,
@@ -1042,6 +1083,7 @@ pub(crate) fn amdgpu_prime_import(
 /// A new dma-buf file exporting `object`. amdgpu_gem_prime_export refuses
 /// (EPERM) a `VM_ALWAYS_VALID` buffer: it lives in its address space's
 /// reservation and cannot be shared.
+#[cfg(feature = "amdgpu")]
 pub(crate) fn amdgpu_dma_buf_file(
     object: Arc<crate::amdgpu_gem::GemObject>,
 ) -> Result<Arc<dyn FileOps>, FsError> {
@@ -1057,6 +1099,7 @@ pub(crate) fn amdgpu_dma_buf_file(
     }))
 }
 
+#[cfg(feature = "amdgpu")]
 impl FileOps for AmdgpuDmaBufFile {
     fn mmap_backing(
         &self,
@@ -1066,7 +1109,10 @@ impl FileOps for AmdgpuDmaBufFile {
         crate::amdgpu_gem::cpu_mapping::backing(self.object.clone(), offset, len)
     }
     fn mmap_published(&self, lifetime: Option<&Arc<dyn MmapLifetime>>) {
+        #[cfg(feature = "amdgpu")]
         crate::amdgpu_gem::cpu_mapping::published(lifetime);
+        #[cfg(not(feature = "amdgpu"))]
+        let _ = lifetime;
     }
     fn ino(&self) -> u64 {
         self.inode.ino
@@ -1181,14 +1227,18 @@ pub struct DriRenderFile {
     /// client opens: handle 3 in one client's fd must not name another
     /// client's buffer. Kept even for a non-AMD card; the dispatcher is gated
     /// on the card's advertised driver name.
+    #[cfg(feature = "amdgpu")]
     amdgpu_gem: crate::amdgpu_gem::GemState,
     /// Per-open GPU address space. Linux keeps one `amdgpu_vm` per DRM file
     /// for the same reason handles are per-file: one client's GPU addresses
     /// must not resolve in another's page tables.
+    #[cfg(feature = "amdgpu")]
     amdgpu_vm: crate::amdgpu_vm::VmState,
     /// Per-open submission contexts (`fpriv->ctx_mgr`).
+    #[cfg(feature = "amdgpu")]
     amdgpu_ctx: crate::amdgpu_ctx::CtxState,
     /// Per-open BO lists (`fpriv->bo_list_handles`).
+    #[cfg(feature = "amdgpu")]
     amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
@@ -1213,6 +1263,7 @@ impl FileOps for DriRenderFile {
         offset: u64,
         len: usize,
     ) -> Result<narf_filesystem::MmapBacking, FsError> {
+        #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             return self.amdgpu_gem.mmap_backing(offset, len);
         }
@@ -1314,6 +1365,7 @@ impl FileOps for DriRenderFile {
         // calls it on whichever node it opened — Mesa uses the render node.
         // Unimplemented commands return `Unsupported` and fall through to the
         // generic DRM path, as the virtio-gpu dispatcher above does.
+        #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             // DRM syncobjs, in this open's table (the one CS signals).
             if let Some(result) =
@@ -1474,6 +1526,7 @@ impl FileOps for DriRenderFile {
     }
 
     fn drm_prime_export_file(&self, gem_handle: u32) -> Result<Arc<dyn FileOps>, FsError> {
+        #[cfg(feature = "amdgpu")]
         if let Some(object) = self.amdgpu_gem.object(gem_handle) {
             return amdgpu_dma_buf_file(object);
         }
@@ -1487,9 +1540,11 @@ impl FileOps for DriRenderFile {
     }
 
     fn drm_prime_import_file(&self, dmabuf: &Arc<dyn FileOps>) -> Result<u32, FsError> {
+        #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             return amdgpu_prime_import(&self.amdgpu_gem, dmabuf);
         }
+        #[cfg(feature = "amdgpu")]
         if let Some(amdgpu) = dmabuf
             .as_any()
             .and_then(|any| any.downcast_ref::<AmdgpuDmaBufFile>())
@@ -1508,6 +1563,7 @@ impl FileOps for DriRenderFile {
         if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
             return crate::drm_ioctl_bridge::dispatch_virtgpu_mmap(&self.virtgpu, offset, len);
         }
+        #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             // As on the card node: this open's GEM table and no other.
             return self.amdgpu_gem.mmap_frames(offset, len);
@@ -1516,6 +1572,7 @@ impl FileOps for DriRenderFile {
     }
 
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        #[cfg(feature = "amdgpu")]
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             // As on the card node: the mapping holds the buffer.
             return self
@@ -1562,14 +1619,19 @@ impl DirOps for DriDir {
                     let idx = render_idx - 128;
                     if (idx as usize) < crate::drm_registry::count() {
                         let metadata = crate::drm_registry::node_metadata(idx, true)?;
+                        #[cfg(feature = "amdgpu")]
                         crate::amdgpu_navi48_runtime_pm::on_open(idx);
                         return Some(Arc::new(DriRenderFile {
                             index: idx,
                             metadata,
                             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
+                            #[cfg(feature = "amdgpu")]
                             amdgpu_gem: crate::amdgpu_gem::GemState::for_card(idx),
+                            #[cfg(feature = "amdgpu")]
                             amdgpu_vm: crate::amdgpu_vm::VmState::for_card(idx),
+                            #[cfg(feature = "amdgpu")]
                             amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
+                            #[cfg(feature = "amdgpu")]
                             amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable::new(),
                             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
                         }));
@@ -1712,6 +1774,7 @@ impl crate::drm_registry::DrmCard for VirtioGpuCard {
 ///
 /// Populated from `amdgpu::probe` at probe success.
 #[derive(Debug)]
+#[cfg(feature = "amdgpu")]
 pub struct AmdgpuCard {
     pub name_str: String,
     pub vid: u16,
@@ -1721,6 +1784,7 @@ pub struct AmdgpuCard {
     pub vbios_ver: Option<String>,
 }
 
+#[cfg(feature = "amdgpu")]
 impl AmdgpuCard {
     /// An RX 6000 (RDNA2 discrete) card, served by the RDNA2 controls.
     fn rdna2(&self) -> bool {
@@ -1753,6 +1817,7 @@ impl AmdgpuCard {
     }
 }
 
+#[cfg(feature = "amdgpu")]
 impl crate::drm_registry::DrmCard for AmdgpuCard {
     fn name(&self) -> &str {
         &self.name_str
@@ -1830,6 +1895,7 @@ pub fn install_dri_dir() {
 ///
 /// Populated from `intel_gpu::probe` at probe success.
 #[derive(Debug)]
+#[cfg(feature = "intel")]
 pub struct IntelGpuCard {
     pub name_str: String,
     pub vid: u16,
@@ -1838,6 +1904,7 @@ pub struct IntelGpuCard {
     pub subsystem_did: u16,
 }
 
+#[cfg(feature = "intel")]
 impl IntelGpuCard {
     pub fn new(
         card_name: String,
@@ -1856,6 +1923,7 @@ impl IntelGpuCard {
     }
 }
 
+#[cfg(feature = "intel")]
 impl crate::drm_registry::DrmCard for IntelGpuCard {
     fn name(&self) -> &str {
         &self.name_str

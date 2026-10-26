@@ -239,10 +239,126 @@ pub fn alloc_coherent_scanout(
     Ok((SCANOUT_GTT_OFFSET as u32, frames))
 }
 
+/// A physically contiguous scanout allocation owned by the driver.
+///
+/// The legacy [`alloc_coherent_scanout`] allocates one frame at a
+/// time: the GGTT range is contiguous but the CPU-side frames are
+/// scattered, so the surface cannot be published to a linear
+/// framebuffer consumer (the fb console writes linearly from one
+/// physical base). This allocation comes from the buddy order
+/// allocator instead — one contiguous block — so
+/// `head.start_address()` is a valid linear base for the whole
+/// surface. Lane 1 (#1010): the Intel probe uses this path and
+/// stores the block in `IntelGpu`, giving the scanout an owner.
+#[derive(Copy, Clone, Debug)]
+pub struct ContiguousScanout {
+    /// GGTT byte offset the surface is mapped at.
+    pub gtt_offset: u32,
+    /// First (and head) physical frame of the buddy block.
+    pub head: narf_memory::frame::PhysFrame,
+    /// Buddy order of the block (`size = 4096 << order` bytes).
+    pub order: u8,
+    /// Requested surface size in bytes (<= block size).
+    pub size_bytes: u64,
+}
+
+impl ContiguousScanout {
+    /// Host-physical base of the surface — the linear address a
+    /// framebuffer-console consumer maps and writes.
+    pub fn phys_base(&self) -> u64 {
+        self.head.start_address().raw()
+    }
+}
+
+/// Smallest buddy order whose block holds `size_bytes`.
+/// `None` when the request exceeds the buddy maximum
+/// (`MAX_ORDER` = 13, a 32 MiB block).
+pub fn scanout_order_for(size_bytes: u64) -> Option<u8> {
+    let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
+    let mut order = 0u8;
+    while (1u64 << order) < pages {
+        order += 1;
+        if order > 13 {
+            return None;
+        }
+    }
+    Some(order)
+}
+
+/// Allocate one physically contiguous block of frames and map it
+/// into the GGTT at the scanout offset. On any failure after the
+/// block is allocated, the block is freed before returning.
+pub fn alloc_contiguous_scanout(
+    gtt_mmadr: &narf_bus::bar::MmioRegion,
+    size_bytes: u64,
+) -> Result<ContiguousScanout, GttError> {
+    const GGTT_BASE: u64 = 0x80_0000;
+    const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
+
+    let order = scanout_order_for(size_bytes).ok_or(GttError::OutOfMemory)?;
+    let head = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| GttError::OutOfMemory)?;
+    let base = head.start_address().raw();
+    let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
+    for i in 0..pages {
+        let phys = base + i * GTT_PAGE_SIZE;
+        let pte = match encode_scanout_pte(phys, PatSlot::Slot2) {
+            Ok(p) => p,
+            Err(e) => {
+                narf_memory::frame::free_pages(head, order);
+                return Err(e);
+            }
+        };
+        let pte_index = (SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE) + i;
+        let pte_offset = GGTT_BASE + pte_index * 8;
+        // SAFETY: `gtt_mmadr` is the caller-mapped BAR0 (`GTTMMADR`) region.
+        // `pte_offset` is `GGTT_BASE` (8 MiB into the BAR) plus `pte_index * 8`,
+        // landing on an 8-byte-aligned slot inside the GGTT PTE array, so both
+        // `pte_offset` and `pte_offset + 4` are in-range, naturally-aligned
+        // 32-bit GGTT register writes.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe {
+            gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
+            gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);
+        }
+    }
+    Ok(ContiguousScanout {
+        gtt_offset: SCANOUT_GTT_OFFSET as u32,
+        head,
+        order,
+        size_bytes,
+    })
+}
+
+/// Return a contiguous scanout block to the frame allocator.
+pub fn free_contiguous_scanout(alloc: &ContiguousScanout) {
+    narf_memory::frame::free_pages(alloc.head, alloc.order);
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_scanout_order_sizing() -> TestResult {
+        if scanout_order_for(4096) != Some(0) {
+            return TestResult::Fail("one page must be order 0");
+        }
+        if scanout_order_for(4097) != Some(1) {
+            return TestResult::Fail("two pages must be order 1");
+        }
+        // 1920x1080 XRGB padded surface: 7680 * 1080 = 8,294,400 B -> 2025 pages -> order 11.
+        if scanout_order_for(8_294_400) != Some(11) {
+            return TestResult::Fail("1080p surface must be order 11");
+        }
+        if scanout_order_for(32 * 1024 * 1024) != Some(13) {
+            return TestResult::Fail("32 MiB must be order 13 (MAX_ORDER)");
+        }
+        if scanout_order_for(32 * 1024 * 1024 + 4096).is_some() {
+            return TestResult::Fail(">32 MiB must not resolve to an order");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gtt", smoke_scanout_order_sizing);
 
     fn smoke_pat_slot_round_trip() -> TestResult {
         for slot in [

@@ -468,29 +468,13 @@ impl PixelEncoding {
     }
 }
 
-/// DRM's connector "color format" values (drm_connector_color_format).
-/// AUTO preserves the HDMI helper policy: RGB, then declared 4:2:0.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ColorFormat {
-    #[default]
-    Auto = 0,
-    Rgb = 1,
-    Ycbcr444 = 2,
-    Ycbcr422 = 3,
-    Ycbcr420 = 4,
-}
+/// The connector "color format" value type is vendor-neutral and
+/// lives in the DRM core; re-exported here so existing paths keep
+/// resolving.
+pub use crate::drm::card::ColorFormat;
+
 impl ColorFormat {
-    pub const fn from_linux(value: u64) -> Option<Self> {
-        Some(match value {
-            0 => Self::Auto,
-            1 => Self::Rgb,
-            2 => Self::Ycbcr444,
-            3 => Self::Ycbcr422,
-            4 => Self::Ycbcr420,
-            _ => return None,
-        })
-    }
+    /// The DC pixel encoding this format selects on amdgpu.
     pub const fn encoding(self) -> Option<PixelEncoding> {
         Some(match self {
             Self::Auto => return None,

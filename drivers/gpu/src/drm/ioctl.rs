@@ -572,7 +572,7 @@ fn handle_addfb2(card: &mut Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctl
     // at 20, pitches[4] at 36, offsets[4] at 52, then (after 4 bytes of u64
     // alignment padding) modifier[4] at 72. A struct too short for the
     // modifiers cannot carry DRM_MODE_FB_MODIFIERS.
-    let cmd = crate::amdgpu_dm_modifiers::FbCmd::parse(arg).ok_or(DrmIoctlError::BadSize)?;
+    let cmd = crate::drm::fb_cmd::FbCmd::parse(arg).ok_or(DrmIoctlError::BadSize)?;
     if cmd.flags & 2 != 0 && arg.len() < 104 {
         return Err(DrmIoctlError::Card(CardError::UnknownFormat));
     }

@@ -2,7 +2,13 @@
 //! Placement admission spans target resolution, migration and the commit's
 //! pin handoff; the KMS spinlock is held only for snapshots and commit.
 use super::*;
+#[cfg(feature = "amdgpu")]
 use crate::amdgpu_gem::{GemObject, GemState};
+/// Without the amdgpu driver there are no GEM objects to admit; the
+/// admission types still name the object type, so it is uninhabited
+/// and every target resolves to `None`.
+#[cfg(not(feature = "amdgpu"))]
+type GemObject = core::convert::Infallible;
 
 type ModeState = Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>;
 type Events = narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>;
@@ -66,6 +72,7 @@ pub(super) fn copy_page_flip(arg: usize) -> Result<DrmModePageFlipUapi, FsError>
     // SAFETY: exactly one initialized repr(C) UAPI, byte alignment allowed.
     Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<DrmModePageFlipUapi>()) })
 }
+#[cfg(feature = "amdgpu")]
 fn copy_atomic(arg: usize) -> Result<OwnedAtomic, FsError> {
     // SAFETY: bounded guarded copy of one fixed integer/POD header.
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeAtomicUapi>())? };
@@ -138,6 +145,7 @@ fn copy_atomic(arg: usize) -> Result<OwnedAtomic, FsError> {
     })
 }
 impl Request {
+    #[cfg(feature = "amdgpu")]
     fn copy(nr: u32, arg: usize, gem: &GemState) -> Result<Self, FsError> {
         match nr {
             0xa2 => {
@@ -226,10 +234,19 @@ impl Request {
                 }
             }
             Self::Cursor(r, _) if r.flags & 1 == 0 => {
-                crate::drm_native_planes::cursor_of(card, r.crtc_id)
-                    .and_then(|p| p.fb_id)
-                    .into_iter()
-                    .collect()
+                // The cursor plane exists only on the native card.
+                #[cfg(feature = "amdgpu")]
+                {
+                    crate::drm_native_planes::cursor_of(card, r.crtc_id)
+                        .and_then(|p| p.fb_id)
+                        .into_iter()
+                        .collect()
+                }
+                #[cfg(not(feature = "amdgpu"))]
+                {
+                    let _ = (card, r);
+                    Vec::new()
+                }
             }
             Self::Cursor(_, _) => Vec::new(),
         };
@@ -242,7 +259,10 @@ impl Request {
                 continue;
             }
             let fb = card.framebuffer(id).map_err(|_| FsError::NotFound)?;
+            #[cfg(feature = "amdgpu")]
             fbs.push((id, fb.bo.as_ref().map(|bo| bo.object.clone())));
+            #[cfg(not(feature = "amdgpu"))]
+            fbs.push((id, { let _ = fb; None }));
         }
         let cursor = match self {
             Self::Cursor(_, bo) => bo.clone(),
@@ -250,6 +270,7 @@ impl Request {
         };
         Ok(Targets { fbs, cursor })
     }
+    #[cfg(feature = "amdgpu")]
     fn commit(
         &self,
         card: u32,
@@ -523,6 +544,7 @@ impl CommitAdmission<'_> {
 }
 /// Native amdgpu KMS on a user open. Unsupported cards/commands retain
 /// the synchronous dispatcher. No user input is reread after migration.
+#[cfg(feature = "amdgpu")]
 pub(crate) async fn dispatch(
     card: u32,
     open: u64,

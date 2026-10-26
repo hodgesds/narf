@@ -140,304 +140,530 @@ pub enum GpuError {
     InvalidSubmission,
 }
 
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_atom_displayobj;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_atom_encoder_caps;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_atom_fwinfo;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_atom_gpiopin;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_atom_vm;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_atombios;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_backlight;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_bo_list;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_bringup;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_clearstate;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_clearstate_gfx10;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_compute;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_cp_fw;
 #[path = "amdgpu_cp_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_cp;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_cp as amdgpu_cp_navi22;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_cs;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_ctx;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dc;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dccg;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_audio;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_clk;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_cursor;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_ddc;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_dp;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_dp_link;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_dsc;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_flip;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_hdmi;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_hubbub;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_mst;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_takeover;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_watermarks;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn401_clk;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn401_dccg;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn401_dml;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn401_dscl;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn401_otg;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn401_resource;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn401_spl;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn401_spl_filters;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_clk;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_color;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_dccg;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_display;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_hubp;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_inventory;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_otg;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_plane;
+#[cfg(feature = "amdgpu")]
 mod amdgpu_dcn_profile;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn_stream;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_ddc;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_ddc_navi48;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dio;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_discovery;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dm_modifiers;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dml;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dml30;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dml_regs;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dmub;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dmub_boot;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dmub_firmware;
 #[path = "amdgpu_dmub_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_dmub;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_dmub as amdgpu_dmub_navi22;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dmub_navi48;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dp_training;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dp_tunnel;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dpm;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dsc;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_mst_dsc;
 #[path = "amdgpu_fence_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_fence;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_fence as amdgpu_fence_navi22;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_freesync;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_frl_cap;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_frl_training;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gddr6;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gem;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx10_topology;
+#[cfg(feature = "amdgpu")]
 mod amdgpu_gfx12_draw;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx12_queue;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx12_rs64;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx12_setup;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx12_shader;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx12_topology;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx_firmware;
 #[path = "amdgpu_gfx_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_gfx;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_gfx as amdgpu_gfx_navi22;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gmc;
 #[path = "amdgpu_gmc_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_gmc;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_gmc as amdgpu_gmc_navi22;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gmc_navi48;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_hdmi_audio;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_hdr;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_hpd;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_hwmon;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_ih;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_ih7;
 #[path = "amdgpu_ih_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_ih;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_ih as amdgpu_ih_navi22;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_info;
 #[path = "amdgpu_info_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_info;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_info as amdgpu_info_navi22;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_jpeg_navi48;
 #[path = "amdgpu_kiq_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_kiq;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_kiq as amdgpu_kiq_navi22;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_mes;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_mes12;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_mes12_hw;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_mes_hw;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_modeset;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_mqd;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_mst;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_native_kms;
 #[path = "amdgpu_navi22_bios.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_bios;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_bios as amdgpu_navi22_bios;
 #[path = "amdgpu_navi22_boot.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_boot;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_boot as amdgpu_navi22_boot;
 #[path = "amdgpu_navi22_cs.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_cs;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_cs as amdgpu_navi22_cs;
 #[path = "amdgpu_navi22_display.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_display;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_display as amdgpu_navi22_display;
 #[path = "amdgpu_navi22_gating.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_gating;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_gating as amdgpu_navi22_gating;
 #[path = "amdgpu_navi22_gfxoff.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_gfxoff;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_gfxoff as amdgpu_navi22_gfxoff;
 #[path = "amdgpu_navi22_kms.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_kms;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_kms as amdgpu_navi22_kms;
 #[path = "amdgpu_navi22_modeset.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_modeset;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_modeset as amdgpu_navi22_modeset;
-#[cfg(feature = "kernel-test")]
+#[cfg(all(feature = "kernel-test", feature = "amdgpu"))]
 mod amdgpu_navi22_modeset_model;
 #[path = "amdgpu_navi22_platform.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_platform;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_platform as amdgpu_navi22_platform;
 #[path = "amdgpu_navi22_power.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_power;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_power as amdgpu_navi22_power;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_power_controls;
 #[path = "amdgpu_navi22_power_policy.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_power_policy;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_power_policy as amdgpu_navi22_power_policy;
 #[path = "amdgpu_navi22_power_saving.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_power_saving;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_power_saving as amdgpu_navi22_power_saving;
 #[path = "amdgpu_navi22_recovery.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_recovery;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_recovery as amdgpu_navi22_recovery;
 #[path = "amdgpu_navi22_scanout.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_scanout;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_scanout as amdgpu_navi22_scanout;
 #[path = "amdgpu_navi22_submit.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_submit;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_submit as amdgpu_navi22_submit;
 #[path = "amdgpu_navi22_tdr.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_tdr;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_tdr as amdgpu_navi22_tdr;
 #[path = "amdgpu_navi22_thermal.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_thermal;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_thermal as amdgpu_navi22_thermal;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_boot;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_dispatch;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_display;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_faults;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_firmware;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_interrupts;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_kms;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_msi;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_platform;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_power;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_ras;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_runtime_pm;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_sources;
-#[cfg(feature = "kernel-test")]
+#[cfg(all(feature = "kernel-test", feature = "amdgpu"))]
 mod amdgpu_navi48_tests;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_ucode;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_offsets;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_pageflip;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_pcie_recovery;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_platform;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_pm4;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_pm4_defs;
 #[path = "amdgpu_power_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_board_power;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_board_power as amdgpu_power_navi22;
+#[cfg(feature = "amdgpu")]
 mod amdgpu_admission;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_psp;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_psp_boot;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_psp_firmware;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_psp_ring;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2;
+#[cfg(feature = "amdgpu")]
 mod amdgpu_rdna2_mmr;
 #[path = "amdgpu_reset_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_reset;
+#[cfg(feature = "amdgpu")]
 mod amdgpu_rdna2_vram;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna4;
+#[cfg(feature = "amdgpu")]
 mod amdgpu_reg_window;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_reset;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_reset as amdgpu_reset_navi22;
 #[path = "amdgpu_sdma_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_sdma;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_ring;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_ring_watch;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rlc;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_sdma;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_sdma as amdgpu_sdma_navi22;
 #[path = "amdgpu_sdma_navi22_queues.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_sdma_queues;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_sdma_queues as amdgpu_sdma_navi22_queues;
 #[path = "amdgpu_smu_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_smu;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_sdma_navi48;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smc_firmware;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_smu as amdgpu_smu_navi22;
 #[path = "amdgpu_smu_navi22_telemetry.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_smu_telemetry;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_smu_telemetry as amdgpu_smu_navi22_telemetry;
 #[path = "amdgpu_vcn_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_vcn;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_navi48;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_navi48_telemetry;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_v12;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_v13;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smuio14;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_uapi;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_ucode_header;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_usbc;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_vbios;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_vcn as amdgpu_vcn_navi22;
 #[path = "amdgpu_vcn_navi22_cs.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_vcn_cs;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_vcn_cs as amdgpu_vcn_navi22_cs;
+#[cfg(feature = "amdgpu")]
 mod amdgpu_media_reservation;
 #[path = "amdgpu_video_caps_navi22.rs"]
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_video_caps;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_vcn_navi48;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_video;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_video_caps_navi48;
 /// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_video_caps as amdgpu_video_caps_navi22;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_vm;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_vmhub_regs;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_vmid;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_vram;
+#[cfg(feature = "amdgpu")]
 mod amdgpu_vram_access;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_vram_boot;
 pub mod aspeed;
+#[cfg(feature = "amdgpu")]
 pub mod atombios;
 pub mod backlight;
 pub mod dmabuf;
@@ -450,19 +676,30 @@ pub mod drm;
 pub mod drm_devfs_bridge;
 pub mod drm_fb_hook;
 pub mod drm_ioctl_bridge;
+#[cfg(feature = "amdgpu")]
 pub mod drm_native_planes;
 pub mod drm_registry;
 pub mod drm_sysfs_bridge;
 pub mod drm_uapi;
+#[cfg(feature = "intel")]
 pub mod intel_gpu;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_aux;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_ddi;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_dp_bridge;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gmbus;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gtt;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_modeset;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_pipes;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_pll;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_regions;
 pub mod nvidia_gpu;
 pub mod nvidia_gpu_disp;
@@ -488,7 +725,7 @@ mod atomic_e2e_tests;
 #[cfg(feature = "kernel-test")]
 mod drm_ioctl_smokes;
 
-#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+#[cfg(all(feature = "kernel-test", feature = "amdgpu", target_arch = "x86_64"))]
 mod drm_sync_tests;
 
 /// Stage::Subsys initcalls — register every GPU driver with the
@@ -497,6 +734,7 @@ mod drm_sync_tests;
 /// VESA DP negotiation can hand off to the right display engine.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    #[cfg(feature = "amdgpu")]
     narf_init::register(Stage::Subsys, "amdgpu-pci", || {
         amdgpu::register_pci_driver();
         InitResult::Ok
@@ -505,6 +743,7 @@ pub fn register_initcalls() {
         aspeed::register_pci_driver();
         InitResult::Ok
     });
+    #[cfg(feature = "intel")]
     narf_init::register(Stage::Subsys, "intel-gpu-pci", || {
         intel_gpu::register_pci_driver();
         InitResult::Ok
@@ -521,10 +760,12 @@ pub fn register_initcalls() {
         vmware_svga::register_pci_driver();
         InitResult::Ok
     });
+    #[cfg(feature = "intel")]
     narf_init::register(Stage::Late, "intel-gpu-dp-bridge", || {
         intel_gpu_dp_bridge::register_bridge();
         InitResult::Ok
     });
+    #[cfg(feature = "amdgpu")]
     narf_init::register(Stage::Late, "amdgpu-usbc", amdgpu_usbc::start);
     narf_init::register(Stage::Device, "gpu-backlight", || {
         backlight::init_backlight_initcall();
