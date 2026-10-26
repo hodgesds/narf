@@ -251,7 +251,7 @@ impl Hif for HttModel {
             if self.stall_rx {
                 core::future::pending::<()>().await;
             }
-        } else if payload != [5, 64, if self.raw { 1 } else { 3 }] {
+        } else if payload != if self.raw { [5, 1, 1] } else { [5, 64, 3] } {
             return Err(BmiError::BadResponse);
         }
         Ok(())

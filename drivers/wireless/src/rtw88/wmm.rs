@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! C22 negotiated non-HT WMM with one BE/TID0 producer. Linux rtw88
+//! C21/C22 negotiated non-HT WMM with one BE/TID0 producer. Linux rtw88
 //! mac80211.c::__rtw_conf_tx and fw.c::rtw_fw_send_ra_info; no RF permission.
 use super::{
     firmware_transport::{Error, Io},
@@ -66,7 +66,7 @@ pub(super) async fn commit(
     short: bool,
     admission: &Admission,
 ) -> Result<(), Error> {
-    // The sealed N22L grant must already enclose these actual publications.
+    // The chip-specific N21L/N22L grant already encloses these publications.
     // The native gains are unchanged; read them through the same retained
     // backend before opening a descriptor/rate mode that depends on them.
     io.station_profile_readback()?;
@@ -85,18 +85,18 @@ pub(super) async fn commit(
             narf_scheduler::yield_now().await;
         }
     }
-    let rates = profile.rates.to_le_bytes();
+    let rates = (u32::from(profile.rates) | (u32::from(profile.mcs) << 12)).to_le_bytes();
     super::station_control::send(
         io,
         [
             0x40,
             0,
-            profile.rate_id() | (1 << 5),
+            profile.rate_id() | (1 << 5) | (u8::from(profile.sgi) << 7),
             0x40,
             rates[0],
             rates[1],
-            0,
-            0,
+            rates[2],
+            rates[3],
         ],
         Some(admission),
     )

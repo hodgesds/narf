@@ -342,7 +342,11 @@ pub(crate) fn hardware_cursor(position: Option<(u32, u32)>) -> bool {
     if !crate::adopted_external_scanout() {
         return false;
     }
-    let Some(cursor) = narf_drivers_gpu::amdgpu_dcn_display::active_scanout_cursor() else {
+    #[cfg(feature = "amdgpu")]
+    let cursor = narf_drivers_gpu::amdgpu_dcn_display::active_scanout_cursor();
+    #[cfg(not(feature = "amdgpu"))]
+    let cursor: Option<fn((u32, u32, &[u32]), Option<(i32, i32)>) -> bool> = None;
+    let Some(cursor) = cursor else {
         return false;
     };
     let image = arrow_image();

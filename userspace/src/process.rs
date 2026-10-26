@@ -590,11 +590,14 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     //
     // Drawn from `narf_filesystem::csprng` — the ChaCha20 pool that also
     // backs /dev/random, /dev/urandom and `getrandom(2)`, matching Linux,
-    // whose AT_RANDOM comes from `get_random_bytes`. It seeds itself on
-    // first use, so it is safe this early in a process's life, and it is
-    // arch-neutral: `gather_entropy` prefers RDSEED/RDRAND on x86_64 and
-    // RNDRRS/RNDR on aarch64, falling back to a timer mix only where
-    // neither exists.
+    // whose AT_RANDOM comes from `get_random_bytes`. The pool seeds from
+    // hardware entropy through narf-crypto (seed-grade RDSEED/RNDR, or
+    // the labelled RDRAND conditioned class on x86_64; #996/#1026) and
+    // is arch-neutral. Since #1026 the draw is the fallible `try_fill`:
+    // on entropy-less hardware the pool never seeds, and AT_RANDOM is
+    // then OMITTED — the same `(stack_top_v, None)` shape as the
+    // no-interpreter path below — rather than publishing predictable
+    // or zero canary/pointer-guard material and calling it entropy.
     //
     // This block used to be `cfg(target_arch = "x86_64")`, with the other
     // arches taking a `None` arm, because it called
@@ -615,20 +618,27 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
             let entropy_va = stack_top_v - 16;
             let mut key = [0u8; 16];
-            narf_filesystem::csprng::fill(&mut key);
-            let root = address_space.root;
-            for (i, &byte) in key.iter().enumerate() {
-                if let Some(phys) = resolve_user_phys_byte(root, entropy_va + i as u64) {
-                    // SAFETY: stack region is mapped+materialised R+W
-                    // above; reached through the kernel direct map (this
-                    // runs with a user CR3 live, which no longer carries
-                    // the low identity map).
-                    unsafe {
-                        *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = byte;
+            match narf_filesystem::csprng::try_fill(&mut key) {
+                Ok(()) => {
+                    let root = address_space.root;
+                    for (i, &byte) in key.iter().enumerate() {
+                        if let Some(phys) = resolve_user_phys_byte(root, entropy_va + i as u64) {
+                            // SAFETY: stack region is mapped+materialised R+W
+                            // above; reached through the kernel direct map (this
+                            // runs with a user CR3 live, which no longer carries
+                            // the low identity map).
+                            unsafe {
+                                *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = byte;
+                            }
+                        }
                     }
+                    (entropy_va, Some(entropy_va))
                 }
+                // Pool unseeded (no hardware entropy source): omit
+                // AT_RANDOM rather than publish the zero buffer as
+                // canary material (#1026).
+                Err(_) => (stack_top_v, None),
             }
-            (entropy_va, Some(entropy_va))
         } else {
             (stack_top_v, None)
         };

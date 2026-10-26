@@ -36,6 +36,7 @@ use narf_aml::resource::ResourceItem;
 use narf_lib::mutex::Mutex as AsyncMutex;
 use narf_memory::PhysAddr;
 
+use crate::dw::{DwRegs, MmioDwRegs};
 use crate::{I2cBus, I2cError, I2cOp};
 
 // ── ACPI HIDs we recognise ─────────────────────────────────────────
@@ -108,17 +109,23 @@ const FS_LCNT: u32 = 0x006a;
 const TRANSFER_TIMEOUT_POLLS: u32 = 100_000;
 
 /// One Intel LPSS I2C controller.
-pub struct LpssI2c {
+///
+/// Generic over the register backend `R` (the `DwRegs` seam in
+/// `crate::dw`): production uses `MmioDwRegs`; fixtures plug the
+/// behavioural DW model so the transfer state machine can run
+/// end-to-end without silicon (#1029).
+pub struct LpssI2c<R = MmioDwRegs> {
     name: String,
     mmio_base: PhysAddr,
     mmio_len: u64,
+    regs: R,
     irq_vector: Option<u8>,
     bus: AsyncMutex<()>,
     enabled: AtomicBool,
     last_target: AtomicU8,
 }
 
-impl core::fmt::Debug for LpssI2c {
+impl<R> core::fmt::Debug for LpssI2c<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LpssI2c")
             .field("name", &self.name)
@@ -130,12 +137,37 @@ impl core::fmt::Debug for LpssI2c {
     }
 }
 
-impl LpssI2c {
+impl LpssI2c<MmioDwRegs> {
     pub fn new(name: String, mmio_base: PhysAddr, mmio_len: u64, irq_vector: Option<u8>) -> Self {
+        Self::with_regs(
+            name,
+            mmio_base,
+            mmio_len,
+            irq_vector,
+            MmioDwRegs::new(mmio_base),
+        )
+    }
+}
+
+impl<R: DwRegs> LpssI2c<R> {
+    /// Construct a controller over a caller-supplied register
+    /// backend. This is the fixture seam (#1029): production goes
+    /// through [`LpssI2c::new`], which builds the `MmioDwRegs`
+    /// backend; smokes pass the behavioural DW model instead.
+    /// `mmio_base` is retained for diagnostics + bounds assertions;
+    /// all register traffic goes through `regs`.
+    pub fn with_regs(
+        name: String,
+        mmio_base: PhysAddr,
+        mmio_len: u64,
+        irq_vector: Option<u8>,
+        regs: R,
+    ) -> Self {
         Self {
             name,
             mmio_base,
             mmio_len,
+            regs,
             irq_vector,
             bus: AsyncMutex::new(()),
             enabled: AtomicBool::new(false),
@@ -151,11 +183,11 @@ impl LpssI2c {
     #[inline]
     unsafe fn read32(&self, off: u64) -> u32 {
         debug_assert!(off + 4 <= self.mmio_len);
-        // SAFETY: `mmio_base + off` is a 4-byte-aligned register offset that
-        // the caller has guaranteed lies inside the mapped MMIO window (see
-        // the `# Safety` contract above), so the volatile read is valid.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { narf_arch::mmio::read32(self.mmio_base.raw() + off) }
+        // SAFETY: `off` is a register offset the caller has
+        // guaranteed lies inside the window (see the `# Safety`
+        // contract above), and the backend upholds the DwRegs
+        // contract for that window.
+        unsafe { self.regs.read32(off) }
     }
 
     /// # Safety
@@ -166,11 +198,11 @@ impl LpssI2c {
     #[inline]
     unsafe fn write32(&self, off: u64, val: u32) {
         debug_assert!(off + 4 <= self.mmio_len);
-        // SAFETY: `mmio_base + off` is a 4-byte-aligned register offset that
-        // the caller has guaranteed lies inside the mapped MMIO window (see
-        // the `# Safety` contract above), so the volatile write is valid.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { narf_arch::mmio::write32(self.mmio_base.raw() + off, val) }
+        // SAFETY: `off` is a register offset the caller has
+        // guaranteed lies inside the window (see the `# Safety`
+        // contract above), and the backend upholds the DwRegs
+        // contract for that window.
+        unsafe { self.regs.write32(off, val) }
     }
 
     /// Read IC_COMP_TYPE and confirm we're talking to a DW I2C IP.
@@ -292,7 +324,7 @@ impl LpssI2c {
 }
 
 #[async_trait]
-impl I2cBus for LpssI2c {
+impl<R: DwRegs> I2cBus for LpssI2c<R> {
     async fn transfer(&self, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
         if !self.enabled.load(Ordering::Acquire) {
             return Err(I2cError::BadHardware);

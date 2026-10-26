@@ -2,6 +2,9 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[path = "tx_pipeline_hw_tests.rs"]
+mod tx_pipeline_hw_tests;
+
 fn rig() -> Result<(Vec<u32>, Hardware), Error> {
     let mut words = vec![0u32; 0x100000 / 4];
     let addr = narf_bus::PcieAddr::new(0, 0, 0, 0);
@@ -31,6 +34,7 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
         wm: Ring::allocate(TX_WM, false)?,
         fwdl: Ring::allocate(TX_FWDL, false)?,
         data: Ring::allocate(TX_DATA, false)?,
+        data_dma: 0,
         tokens: packet_tx::Tokens::new(),
         pending_events: VecDeque::new(),
         pending_data: VecDeque::new(),
@@ -110,7 +114,10 @@ fn mt76_recycled_storage_clears_tokens_payloads_indices_and_old_rx() -> TestResu
         ring.set_word(7, 1, (64 << 16) | LAST);
         ring.buffers[7].as_mut_slice()[..32].fill(0x77);
     }
-    storage.tokens.begin(1).unwrap();
+    for slot in 0..packet_tx::PIPELINE {
+        storage.tokens.begin_at(slot as u16 + 1, slot).unwrap();
+    }
+    storage.data_dma = 4;
     storage.pending_events.push_back(vec![0x66; 36]);
     storage.pending_data.push_back(vec![0x55; 64]);
     storage.rx[0].index = 9;
@@ -119,6 +126,7 @@ fn mt76_recycled_storage_clears_tokens_payloads_indices_and_old_rx() -> TestResu
     // memory model. Use the exact storage operation called after stop proof.
     storage.recycle();
     if storage.tokens.available() != Ok(1)
+        || storage.data_dma != 0
         || !storage.pending_events.is_empty()
         || !storage.pending_data.is_empty()
     {

@@ -73,20 +73,23 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
     }
 }
 pub(in crate::rtw88) struct Peer {
-    pub(super) wmm: Option<Vec<u8>>,
-    pub(super) qos: bool,
-    pub(super) association: Option<Vec<u8>>,
-    pub(super) response_rates: Option<Vec<u8>>,
-    pub(super) response_wmm: Option<Option<Vec<u8>>>,
+    pub(in crate::rtw88) wmm: Option<Vec<u8>>,
+    pub(in crate::rtw88) qos: bool,
+    pub(in crate::rtw88) association: Option<Vec<u8>>,
+    pub(in crate::rtw88) response_rates: Option<Vec<u8>>,
+    pub(in crate::rtw88) response_wmm: Option<Option<Vec<u8>>>,
+    pub(in crate::rtw88) ht: Option<Vec<u8>>,
+    pub(in crate::rtw88) declines: Vec<Vec<u8>>,
+    pub(in crate::rtw88) hold_decline: bool,
     pub(in crate::rtw88) ap: FakeAp,
     pub(in crate::rtw88) plan: NetworkPlan,
     pub(super) server: DhcpServer,
-    pub(super) ptk: Option<Ptk>,
+    pub(in crate::rtw88) ptk: Option<Ptk>,
     pub(super) replay: narf_wireless::ccmp::ReplayWindow,
-    pub(super) pn: u64,
+    pub(in crate::rtw88) pn: u64,
     pub(in crate::rtw88) uplink: Vec<Vec<u8>>,
     pub(in crate::rtw88) hold_m4: bool,
-    pub(super) hold_data: bool,
+    pub(in crate::rtw88) hold_data: bool,
 }
 impl Peer {
     pub(in crate::rtw88) fn new(protected: bool) -> Self {
@@ -112,6 +115,9 @@ impl Peer {
             association: None,
             response_rates: None,
             response_wmm: None,
+            ht: None,
+            declines: Vec::new(),
+            hold_decline: false,
             ap,
             plan,
             server: DhcpServer::new(plan),
@@ -162,6 +168,13 @@ impl Peer {
         if frame.len() < 24 || frame[4..10] != AP || frame[10..16] != self.plan.station {
             return Err("native AP peer identity");
         }
+        if frame[0] == 0xd0 {
+            if frame.len() != 33 || frame[24..26] != [3, 1] || frame[27..29] != [37, 0] {
+                return Err("native ADDBA decline differs");
+            }
+            self.declines.push(frame.to_vec());
+            return Ok((Vec::new(), self.hold_decline));
+        }
         if self.ap.phase() != ApPhase::Authorized || matches!(frame[0], 0 | 0xb0) {
             let before = self.ap.phase();
             if frame[0] == 0 {
@@ -210,6 +223,9 @@ impl Peer {
                     {
                         response.extend_from_slice(wmm);
                     }
+                    if let Some(ht) = &self.ht {
+                        response.extend_from_slice(ht);
+                    }
                 }
             }
             if before == ApPhase::Message2 {
@@ -227,10 +243,11 @@ impl Peer {
             }
             return Ok((replies, before == ApPhase::Message4 && self.hold_m4));
         }
-        let header = if self.qos { 26 } else { 24 };
+        let header = if self.qos && frame[0] == 0x88 { 26 } else { 24 };
         if frame.len() < header
-            || frame[0] != if self.qos { 0x88 } else { 8 }
-            || self.qos && frame[24..26] != [0, 0]
+            || !matches!(frame[0], 8 | 0x88)
+            || frame[0] == 0x88 && !self.qos
+            || header == 26 && frame[24..26] != [0, 0]
             || frame[1] & 3 != 1
             || (frame[1] & 0x40 != 0) != self.ap.protected()
         {
@@ -263,6 +280,9 @@ impl Peer {
         let mut ethernet = frame[16..22].to_vec();
         ethernet.extend_from_slice(&frame[10..16]);
         ethernet.extend_from_slice(&body[6..]);
+        if self.qos && header == 24 && ethernet.get(12..14) != Some(&[0x88, 0x8e]) {
+            return Err("native WMM non-QoS data is not private EAPOL");
+        }
         self.uplink.push(ethernet.clone());
         let replies = match self.server.receive(&ethernet) {
             Some(reply) => vec![self.downlink(&reply)?],

@@ -4454,6 +4454,27 @@ fn smoke_mte_tag_round_trip() -> TestResult {
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/mte", smoke_mte_tag_round_trip);
 
+/// Arm period for the PMUv3 round-trip smokes below.
+///
+/// The round trips validate register access — preload and interrupt
+/// control — not overflow delivery: each smoke arms a counter and
+/// immediately pauses it again from the same thread. The period must
+/// therefore be one that cannot elapse inside the arm→pause window.
+/// Arming a small period (the programmable smoke used the 10_000-cycle
+/// `MIN_SAMPLE_PERIOD` floor) on a live, firmware-routed counter is an
+/// interrupt-rate livelock under QEMU TCG: the PMU clocks are
+/// virtual-time-paced and can advance past a small period inside a
+/// single IRQ round trip, so the overflow PPI is pending again before
+/// the test thread executes another instruction and the pause is never
+/// reached — the #987 livelock through the programmable door (PR #993
+/// run 40293088530: the aarch64 kernel-test core group burned its whole
+/// 900 s cap in the programmable smoke with IRQs live; on the previous
+/// head the same boot passed only because an unrelated smoke had leaked
+/// a masked IRQ state that suppressed delivery). `u32::MAX` cycles
+/// cannot elapse in the window, on hardware or under TCG.
+#[cfg(target_arch = "aarch64")]
+const PMUV3_ROUND_TRIP_ARM_PERIOD: u64 = u32::MAX as u64;
+
 #[cfg(target_arch = "aarch64")]
 fn smoke_pmuv3_cycle_counter_round_trip() -> TestResult {
     use crate::aarch64::pmu;
@@ -4471,7 +4492,7 @@ fn smoke_pmuv3_cycle_counter_round_trip() -> TestResult {
     }
     // SAFETY: same live current-CPU counter. This validates that preload and
     // interrupt control registers are accessible without claiming delivery.
-    let arm_failed = unsafe { pmu::arm_sampling(&counter, 100_000) }.is_err();
+    let arm_failed = unsafe { pmu::arm_sampling(&counter, PMUV3_ROUND_TRIP_ARM_PERIOD) }.is_err();
     // SAFETY: same live current-CPU counter remains owned by this smoke.
     let pause_failed = unsafe { pmu::pause_sampling(&counter) }.is_err();
     if arm_failed || pause_failed {
@@ -4559,7 +4580,8 @@ fn smoke_pmuv3_programmable_counter_round_trip() -> TestResult {
         return TestResult::Fail("PMUv3 programmable cycle event did not advance");
     }
     // SAFETY: same live current-CPU counter; the smoke only validates register access.
-    let arm_failed = unsafe { pmu::arm_programmable(&counter, 10_000) }.is_err();
+    let arm_failed =
+        unsafe { pmu::arm_programmable(&counter, PMUV3_ROUND_TRIP_ARM_PERIOD) }.is_err();
     // SAFETY: same live current-CPU counter remains owned by this smoke.
     let pause_failed = unsafe { pmu::pause_programmable(&counter) }.is_err();
     if arm_failed || pause_failed {

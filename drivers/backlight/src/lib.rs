@@ -18,9 +18,19 @@
 //! [`LedDevice`] traits. The registries are globally accessible and
 //! allocation-backed (`Vec<Arc<dyn …>>`).
 //!
+//! Panel ownership is **arbitrated**: several mechanisms can claim
+//! the same panel (native GPU PWM, platform control, ACPI `_BCM`),
+//! and on real laptops the firmware path usually routes to the same
+//! PWM the native driver drives, so two live owners would fight
+//! over one panel. Exactly one registered candidate is the panel
+//! owner (see [`panel_owner`]); the rest are deferred — registered,
+//! but never published or dispatched by the subsystem — until the
+//! owner unregisters and they are promoted. Priority is by
+//! [`BacklightKind`]: Raw > Platform > Firmware.
+//!
 //! The brightness-key handler lives in [`brightness_keys`]: it
 //! subscribes to ACPI Notify events and, on 0x86/0x87, steps the
-//! first registered ACPI video backlight device and emits a
+//! panel owner and emits a
 //! [`narf_input::KeyCode::BrightnessDown`] /
 //! [`narf_input::KeyCode::BrightnessUp`] key event.
 //!
@@ -69,6 +79,23 @@ pub enum BacklightKind {
     Platform,
 }
 
+impl BacklightKind {
+    /// Arbitration priority when several devices claim the panel:
+    /// higher wins. A native (raw) driver is preferred over platform
+    /// control, which is preferred over the generic firmware (ACPI
+    /// `_BCM`) path — the preference Linux resolves through
+    /// `acpi_video_get_backlight_type()`, and the safe default
+    /// because firmware control on most AMD laptops routes to the
+    /// same PWM the native driver drives directly (audit #936 §2).
+    pub fn priority(self) -> u8 {
+        match self {
+            BacklightKind::Raw => 3,
+            BacklightKind::Platform => 2,
+            BacklightKind::Firmware => 1,
+        }
+    }
+}
+
 // ── BacklightDevice trait ──────────────────────────────────────────
 
 /// Trait implemented by every backlight device that registers with
@@ -93,19 +120,86 @@ pub trait BacklightDevice: Send + Sync + core::fmt::Debug {
     /// by the caller before dispatch.
     fn set_brightness(&self, level: u32);
 
+    /// Step brightness up by one increment. The default moves a
+    /// tenth of the range; devices with a discrete ladder (ACPI
+    /// video) override this to move exactly one ladder rung.
+    fn step_up(&self) {
+        let max = self.max_brightness();
+        let step = (max / 10).max(1);
+        let cur = self.current_brightness();
+        self.set_brightness(cur.saturating_add(step).min(max));
+    }
+
+    /// Step brightness down by one increment. The default moves a
+    /// tenth of the range; ladder devices override it (see
+    /// [`BacklightDevice::step_up`]).
+    fn step_down(&self) {
+        let step = (self.max_brightness() / 10).max(1);
+        let cur = self.current_brightness();
+        self.set_brightness(cur.saturating_sub(step));
+    }
+
     /// Interface kind reported to sysfs consumers.
     fn kind(&self) -> BacklightKind;
 }
 
-// ── Global backlight registry ──────────────────────────────────────
+// ── Global backlight registry + single-owner arbitration ─────────
 
 static BACKLIGHT_DEVS: IrqSafeSpinLock<Vec<Arc<dyn BacklightDevice>>> =
     IrqSafeSpinLock::new(Vec::new());
 
-/// Register a backlight device. The name must be unique; duplicate
-/// names silently replace the previous entry (matches Linux's
-/// `backlight_device_register` idempotency assumption).
-pub fn register_backlight(dev: Arc<dyn BacklightDevice>) {
+/// Outcome of a [`register_backlight`] call under single-owner
+/// arbitration.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Ownership {
+    /// The device is the panel's active owner: the only candidate
+    /// the subsystem publishes (`/sys/class/backlight`) and
+    /// dispatches brightness changes to (sysfs stores, brightness
+    /// keys).
+    Owner,
+    /// The device is registered as a candidate, but another device
+    /// owns the panel. A deferred candidate is never dispatched by
+    /// the subsystem and must not drive hardware until it is
+    /// promoted (the current owner unregisters, or it re-registers
+    /// after the owner leaves).
+    Deferred,
+}
+
+/// Elect the panel owner from the candidate list: the highest
+/// [`BacklightKind::priority`] wins; ties keep the earliest
+/// registration, so an incumbent owner is never displaced by an
+/// equal-priority latecomer (no ownership flapping when two native
+/// drivers probe in either order). A strictly higher-priority
+/// candidate preempts — registration order between the Stage::Device
+/// initcalls and PCI probe is not guaranteed, so the firmware
+/// candidate that registered first must yield when the native
+/// driver arrives.
+fn elect_owner(cands: &[Arc<dyn BacklightDevice>]) -> Option<Arc<dyn BacklightDevice>> {
+    let mut best: Option<&Arc<dyn BacklightDevice>> = None;
+    for cand in cands {
+        let wins = match best {
+            None => true,
+            Some(b) => cand.kind().priority() > b.kind().priority(),
+        };
+        if wins {
+            best = Some(cand);
+        }
+    }
+    best.cloned()
+}
+
+/// Register a backlight device as a candidate for panel ownership.
+///
+/// The name must be unique; duplicate names silently replace the
+/// previous entry (matches Linux's `backlight_device_register`
+/// idempotency assumption) and the replacement re-runs the election.
+///
+/// Returns the device's standing after this registration: it is the
+/// panel [`Ownership::Owner`] if it won (or kept) the election, or
+/// [`Ownership::Deferred`] if another candidate owns the panel.
+/// Registrations are serialised by the registry lock, so concurrent
+/// registrations still elect exactly one owner.
+pub fn register_backlight(dev: Arc<dyn BacklightDevice>) -> Ownership {
     let name: String = dev.name().to_owned();
     let mut g = BACKLIGHT_DEVS.lock();
     if let Some(slot) = g.iter_mut().find(|d| d.name() == name) {
@@ -113,14 +207,33 @@ pub fn register_backlight(dev: Arc<dyn BacklightDevice>) {
     } else {
         g.push(dev);
     }
+    match elect_owner(&g) {
+        Some(owner) if owner.name() == name => Ownership::Owner,
+        _ => Ownership::Deferred,
+    }
 }
 
-/// Unregister a backlight device by name.
+/// Unregister a backlight device by name. If the removed device was
+/// the panel owner, the highest-priority remaining candidate is
+/// promoted automatically (see [`panel_owner`]).
 pub fn unregister_backlight(name: &str) {
     BACKLIGHT_DEVS.lock().retain(|d| d.name() != name);
 }
 
-/// Return a snapshot of all registered backlight devices.
+/// The panel's current owner, if any candidate is registered.
+///
+/// This is the only device subsystem paths may dispatch brightness
+/// changes to: the sysfs bridge publishes it alone, and the
+/// brightness-key handler steps it alone. Deferred candidates are
+/// reachable via [`backlight_devices`] for diagnostics, but driving
+/// one directly defeats the arbitration.
+pub fn panel_owner() -> Option<Arc<dyn BacklightDevice>> {
+    let g = BACKLIGHT_DEVS.lock();
+    elect_owner(&g)
+}
+
+/// Return a snapshot of all registered backlight devices — the
+/// panel owner plus any deferred candidates.
 pub fn backlight_devices() -> Vec<Arc<dyn BacklightDevice>> {
     BACKLIGHT_DEVS.lock().clone()
 }

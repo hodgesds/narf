@@ -28,6 +28,7 @@ impl From<format::Error> for Error {
 /// cache maintenance and outer-shareable acquire order before buffer reads.
 /// Every possibly published mapping survives failure, cancellation and drop.
 pub(super) unsafe trait Port {
+    fn receive_chip(&self) -> Result<super::packet_phy::Chip, Error>;
     fn transmit_allowed(&mut self) -> Result<(), Error>;
     fn memory<T>(&mut self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error>;
     fn allocate(&mut self, length: usize) -> Result<DmaBuffer, Error>;
@@ -74,6 +75,7 @@ pub(super) struct Receipt {
 pub(super) struct Frame {
     bytes: Vec<u8>,
     pub(super) rate: u8,
+    pub(super) phy: Option<super::packet_phy::Evidence>,
 }
 impl narf_wireless::station_security::RawFrame for Frame {
     fn bytes(&self) -> &[u8] {
@@ -97,6 +99,7 @@ pub(super) struct Core {
     own: [u8; 6],
     mac_id: u8,
     data_profile: format::DataProfile,
+    receive_chip: super::packet_phy::Chip,
     tx_host: [u16; 2],
     tx_device: [u16; 2],
     rx: u16,
@@ -166,6 +169,7 @@ impl Core {
             return Err(Error::Packet);
         }
         port.transmit_allowed()?;
+        let receive_chip = port.receive_chip()?;
         for queue in [Queue::Management, Queue::Data] {
             if port.index(queue.index())? & 0x0fff_0fff != 0 {
                 return Err(Error::State);
@@ -192,6 +196,7 @@ impl Core {
             own,
             mac_id,
             data_profile: format::DataProfile::LEGACY,
+            receive_chip,
             tx_host: [0; 2],
             tx_device: [0; 2],
             rx: 0,
@@ -315,7 +320,7 @@ impl Core {
         }
         let descriptor = port.rx_bytes(slot, 0, format::RX_DESC)?;
         if let Ok(descriptor) = <&[u8; format::RX_DESC]>::try_from(descriptor.as_slice()) {
-            if let Ok(metadata) = format::receive(descriptor) {
+            if let Ok(metadata) = format::receive_profile(descriptor, self.data_profile.mcs != 0) {
                 let mut body =
                     port.rx_bytes(slot, metadata.payload.start, metadata.payload.len())?;
                 if body.len() != metadata.payload.len() {
@@ -333,11 +338,24 @@ impl Core {
                     }
                     step.c2h = Some(body);
                 } else {
-                    body.truncate(body.len() - 4);
-                    step.frame = Some(Frame {
-                        bytes: body,
-                        rate: metadata.rate,
-                    });
+                    let phy = match format::phy_status(descriptor) {
+                        Some(range) => {
+                            let bytes = port.rx_bytes(slot, range.start, range.len())?;
+                            super::packet_phy::parse(self.receive_chip, metadata.rate, &bytes)
+                                .ok()
+                                .filter(|p| p.initial_channel())
+                                .map(Some)
+                        }
+                        None => Some(None),
+                    };
+                    if let Some(phy) = phy {
+                        body.truncate(body.len() - 4);
+                        step.frame = Some(Frame {
+                            bytes: body,
+                            rate: metadata.rate,
+                            phy,
+                        });
+                    }
                 }
             }
         } else {

@@ -59,6 +59,8 @@ fn image(commands: &[[u8; 4]]) -> Vec<u8> {
 }
 pub(super) fn mvm_image() -> Vec<u8> {
     let mut bytes = image(MVM_COMMANDS);
+    // Legacy header API occupies bits8..15; display-version TLVs are unrelated.
+    bytes[72..76].copy_from_slice(&0x0102_4d04u32.to_le_bytes());
     // Select reduced scan configuration, beacon-filter v4 and MLD MAC in
     // the model. LAR remains an explicit per-test choice, never a default.
     tlv(&mut bytes, 29, &[1, 0, 0, 0, 0, 0x80, 0, 1]);

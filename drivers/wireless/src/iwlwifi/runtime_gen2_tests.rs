@@ -89,6 +89,7 @@ fn smoke_iwl_gen2_owned_boot_keeps_context_sections_without_iml() -> TestResult 
         pnvm_version: None,
         unknown_tlv_count: 0,
     };
+    parsed.api.api_changes[0] |= 1 << 20; // API_NEW_VERSION: raw header77.
     let boot = BootImage::new(&parsed, 0x351, &rx, &commands).unwrap();
     if boot.scratch.is_some()
         || boot.iml.is_some()
@@ -110,6 +111,17 @@ fn smoke_iwl_gen2_owned_boot_keeps_context_sections_without_iml() -> TestResult 
     parsed.header.version = 76;
     if BootImage::new(&parsed, 0x351, &rx, &commands).is_ok() {
         return TestResult::Fail("Gen2 accepted firmware outside exact API77 profile");
+    }
+    parsed.api.api_changes[0] = 0;
+    parsed.header.version = 0x0102_4d04; // legacy API bits8..15, not major/display.
+    parsed.fw_version = Some((123, 0x4567, 8));
+    if BootImage::new(&parsed, 0x351, &rx, &commands).is_err() {
+        return TestResult::Fail("Gen2 did not use source legacy header API field");
+    }
+    parsed.header.version = 77;
+    parsed.fw_version = Some((77, 0, 0));
+    if BootImage::new(&parsed, 0x351, &rx, &commands).is_ok() {
+        return TestResult::Fail("Gen2 treated legacy serial/display77 as protocol API77");
     }
     TestResult::Pass
 }
@@ -154,7 +166,7 @@ fn smoke_iwl_gen2_actual_alive6_unified_nvm_receipts_before_mac() -> TestResult 
     let parsed = ParsedUcode {
         api: super::super::firmware_api::FirmwareApi::default(),
         header: super::super::UcodeHeader {
-            version: 77,
+            version: 0x0102_4d04,
             build: 0,
             human_readable: alloc::string::String::new(),
         },

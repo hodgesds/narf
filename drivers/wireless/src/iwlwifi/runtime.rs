@@ -459,11 +459,7 @@ impl BootImage {
         rx: &ReceiveQueue,
         command: &CommandQueue,
     ) -> Result<Self, &'static str> {
-        if parsed.header.version != super::gen2_profile::API
-            || parsed
-                .fw_version
-                .is_some_and(|version| version.0 != super::gen2_profile::API)
-        {
+        if super::gen2_profile::firmware_api(parsed) != super::gen2_profile::API {
             return Err("unsupported Gen2 firmware API");
         }
         let queues = boot_context::BootQueues {
@@ -563,6 +559,7 @@ pub struct Hardware {
     versions: Vec<u8>,
     armed: bool,
     failed: bool,
+    station_stop: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
 }
 
 impl core::fmt::Debug for Hardware {
@@ -575,6 +572,23 @@ impl core::fmt::Debug for Hardware {
 }
 
 impl Hardware {
+    pub(super) fn bind_station_stop(
+        &mut self,
+        stop: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+    ) {
+        self.station_stop = Some(stop);
+    }
+    pub(super) fn authority(&self, master: bool) -> Authority {
+        let native = true;
+        #[cfg(any(test, feature = "kernel-test"))]
+        let native = native && self.device.id.vendor != 0xffff;
+        Authority {
+            device: self.device,
+            cap: self.cap,
+            master,
+            native,
+        }
+    }
     pub(super) fn new(
         device: narf_bus::BusDevice,
         cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
@@ -639,6 +653,7 @@ impl Hardware {
             versions: parsed.api.commands.to_vec(),
             armed: false,
             failed: false,
+            station_stop: None,
         })
     }
 
@@ -1336,6 +1351,13 @@ impl Hardware {
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
         self.wait_tx_space(id).await?;
+        if self
+            .station_stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Acquire))
+        {
+            return Err("MVM station closed before native packet publication");
+        }
         let queue = self
             .resources
             .data
@@ -1461,6 +1483,39 @@ impl Hardware {
             }
             activity.await;
         }
+    }
+}
+
+/// Read-only retained PCI publication authority; the model-only constructor
+/// still invokes its real object-table capability and never reads physical PCI.
+#[derive(Clone)]
+pub(super) struct Authority {
+    device: narf_bus::BusDevice,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    master: bool,
+    native: bool,
+}
+impl Authority {
+    pub(super) fn invoke<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        super::mmio::invoke(&self.cap, || {
+            if self.native {
+                use narf_bus::pci::{
+                    self,
+                    cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE},
+                };
+                let command = pci::read_command(&self.cap, &self.device)
+                    .map_err(|_| "MVM PCI command unavailable")?;
+                let required = MEM_SPACE | INTX_DISABLE | if self.master { BUS_MASTER } else { 0 };
+                if command & required != required {
+                    return Err("MVM PCI publication command lost");
+                }
+            }
+            operation()
+        })
+        .map_err(|_| "MVM PCI authority revoked")?
     }
 }
 

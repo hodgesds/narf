@@ -22,7 +22,10 @@ use async_trait::async_trait;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::amd_fch::{recognised_hids, AmdFchI2c};
-use crate::lpss::{__new_for_test as lpss_new_for_test, recognised_hids as lpss_recognised_hids};
+use crate::dw_model::{BusEvent, DwModel, VirtualTarget, FIFO_DEPTH};
+use crate::lpss::{
+    __new_for_test as lpss_new_for_test, recognised_hids as lpss_recognised_hids, LpssI2c,
+};
 use crate::{registry, I2cBus, I2cError, I2cOp};
 use narf_memory::PhysAddr;
 
@@ -384,3 +387,665 @@ kernel_test_in!(
     "drivers-i2c",
     smoke_i801_smbus_rejects_transfer_when_disabled
 );
+
+// ── Behavioural DW model fixtures (#1029) ────────────────────────
+//
+// Everything below drives the PRODUCTION transfer state machines
+// of both DW wrappers (AMD FCH + Intel LPSS) against the
+// behavioural register model in `crate::dw_model` — FIFO
+// fill/drain, IC_STATUS evolution, TX_ABRT raising, and a virtual
+// target device on the bus. Before this lane the fixtures stopped
+// at probe/enable; these are the first fixtures in the tree where
+// an `I2cBus::transfer` over DW silicon semantics completes (or
+// fails) end-to-end.
+
+use alloc::vec::Vec;
+
+/// One owned op for `run_dw_transfer` — the borrowed `I2cOp`s are
+/// built inside the spawned task so the buffers outlive the call.
+enum OpSpec {
+    Write(Vec<u8>),
+    Read(usize),
+}
+
+/// What `run_dw_transfer`'s spawned task hands back through the
+/// outcome cell: the transfer result plus the read buffers.
+type TransferOutcome = (Result<(), I2cError>, Vec<Vec<u8>>);
+
+/// Run one `transfer()` on the test scheduler (the existing
+/// spawn + run_until_empty idiom) and return its result plus the
+/// read buffers (one per op, empty for writes).
+fn run_dw_transfer(bus: Arc<dyn I2cBus>, addr: u8, specs: Vec<OpSpec>) -> TransferOutcome {
+    narf_scheduler::__reset_queues_for_test();
+    let cell: Arc<narf_lib::sync::IrqSafeSpinLock<Option<TransferOutcome>>> =
+        Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None));
+    let cell2 = cell.clone();
+    narf_scheduler::spawn(async move {
+        let mut read_bufs: Vec<Vec<u8>> = specs
+            .iter()
+            .map(|s| match s {
+                OpSpec::Write(_) => Vec::new(),
+                OpSpec::Read(n) => alloc::vec![0u8; *n],
+            })
+            .collect();
+        let result = {
+            let mut ops: Vec<I2cOp<'_>> = Vec::with_capacity(specs.len());
+            for (spec, buf) in specs.iter().zip(read_bufs.iter_mut()) {
+                match spec {
+                    OpSpec::Write(data) => ops.push(I2cOp::Write(data.as_slice())),
+                    OpSpec::Read(_) => ops.push(I2cOp::Read(buf.as_mut_slice())),
+                }
+            }
+            bus.transfer(addr, &mut ops).await
+        };
+        *cell2.lock() = Some((result, read_bufs));
+    });
+    narf_scheduler::run_until_empty();
+    let mut guard = cell.lock();
+    match guard.take() {
+        Some(outcome) => outcome,
+        None => (Err(I2cError::Timeout), Vec::new()),
+    }
+}
+
+/// Build an enabled FCH controller over the model (probe + enable,
+/// the production bring-up order).
+fn fch_model_bus(model: &DwModel) -> Result<Arc<dyn I2cBus>, &'static str> {
+    let drv = AmdFchI2c::with_regs(
+        "smoke-dw-fch".to_string(),
+        PhysAddr::new(0),
+        1024,
+        None,
+        model.clone(),
+    );
+    if drv.probe_component_type().is_err() {
+        return Err("FCH probe_component_type failed against the DW model");
+    }
+    if drv.enable().is_err() {
+        return Err("FCH enable failed against the DW model");
+    }
+    Ok(Arc::new(drv))
+}
+
+/// Build an enabled LPSS controller over the model. LPSS probe
+/// runs the ungate sequence first (its register writes land in the
+/// model's stored file, asserted by the caller that cares).
+fn lpss_model_bus(model: &DwModel) -> Result<Arc<dyn I2cBus>, &'static str> {
+    let drv = LpssI2c::with_regs(
+        "smoke-dw-lpss".to_string(),
+        PhysAddr::new(0),
+        1024,
+        None,
+        model.clone(),
+    );
+    if drv.probe_component_type().is_err() {
+        return Err("LPSS probe_component_type failed against the DW model");
+    }
+    if drv.enable().is_err() {
+        return Err("LPSS enable failed against the DW model");
+    }
+    Ok(Arc::new(drv))
+}
+
+const DW_ADDR: u8 = 0x2c;
+
+/// Scenario: one write op lands its bytes in the target's
+/// registers, inside exactly one START..STOP envelope.
+fn scenario_write_end_to_end(bus: Arc<dyn I2cBus>, model: &DwModel) -> Result<(), &'static str> {
+    let (result, _) = run_dw_transfer(
+        bus,
+        DW_ADDR,
+        alloc::vec![OpSpec::Write(alloc::vec![0x10, 0xAA, 0xBB, 0xCC])],
+    );
+    if result.is_err() {
+        return Err("write transfer failed against the DW model");
+    }
+    if model.target_reg(DW_ADDR, 0x10) != 0xAA
+        || model.target_reg(DW_ADDR, 0x11) != 0xBB
+        || model.target_reg(DW_ADDR, 0x12) != 0xCC
+    {
+        return Err("written bytes didn't land in the target registers");
+    }
+    let want = alloc::vec![
+        BusEvent::Start { read: false },
+        BusEvent::WriteByte(0x10),
+        BusEvent::WriteByte(0xAA),
+        BusEvent::WriteByte(0xBB),
+        BusEvent::WriteByte(0xCC),
+        BusEvent::Stop,
+    ];
+    if model.events(DW_ADDR) != want {
+        return Err("bus conversation wasn't one START..STOP write envelope");
+    }
+    Ok(())
+}
+
+/// Scenario: write-the-pointer + read in one transfer — the
+/// repeated-START conversation every register device (and the
+/// I2C-HID descriptor fetch) depends on.
+fn scenario_write_then_read_restart(
+    bus: Arc<dyn I2cBus>,
+    model: &DwModel,
+) -> Result<(), &'static str> {
+    let (result, bufs) = run_dw_transfer(
+        bus,
+        DW_ADDR,
+        alloc::vec![OpSpec::Write(alloc::vec![0x20]), OpSpec::Read(4)],
+    );
+    if result.is_err() {
+        return Err("write+read transfer failed against the DW model");
+    }
+    if bufs[1] != alloc::vec![0xDE, 0xAD, 0xBE, 0xEF] {
+        return Err("read bytes don't match the target's registers");
+    }
+    let want = alloc::vec![
+        BusEvent::Start { read: false },
+        BusEvent::WriteByte(0x20),
+        BusEvent::Restart { read: true },
+        BusEvent::ReadByte(0xDE),
+        BusEvent::ReadByte(0xAD),
+        BusEvent::ReadByte(0xBE),
+        BusEvent::ReadByte(0xEF),
+        BusEvent::Stop,
+    ];
+    if model.events(DW_ADDR) != want {
+        return Err("write+read didn't use a repeated START inside one envelope");
+    }
+    Ok(())
+}
+
+/// Scenario: a read longer than the RX FIFO depth completes by
+/// interleaving command issue and FIFO drain — the transfer shape
+/// descriptor/report reads actually take.
+fn scenario_read_spans_fifo_depth(
+    bus: Arc<dyn I2cBus>,
+    model: &DwModel,
+) -> Result<(), &'static str> {
+    const READ_LEN: usize = 34; // > FIFO_DEPTH (16), not a multiple of it
+    let (result, bufs) = run_dw_transfer(
+        bus,
+        DW_ADDR,
+        alloc::vec![OpSpec::Write(alloc::vec![0x00]), OpSpec::Read(READ_LEN)],
+    );
+    if result.is_err() {
+        return Err("FIFO-spanning read failed against the DW model");
+    }
+    let want: Vec<u8> = (0..READ_LEN as u8).collect();
+    if bufs[1] != want {
+        return Err("FIFO-spanning read returned wrong bytes");
+    }
+    if model.max_rx_level() != FIFO_DEPTH {
+        return Err("RX FIFO never filled to depth — the drain interleave wasn't exercised");
+    }
+    if model.rx_pop_count() != READ_LEN {
+        return Err("driver didn't pop exactly the bytes it issued reads for");
+    }
+    Ok(())
+}
+
+/// Scenario: transfer to an absent address surfaces
+/// `I2cError::Nack`, the driver clears the abort through
+/// IC_CLR_TX_ABRT, and the bus stays usable afterwards.
+fn scenario_nack_absent_then_recover(
+    bus: Arc<dyn I2cBus>,
+    model: &DwModel,
+) -> Result<(), &'static str> {
+    // A target exists on the bus — at 0x30, not at DW_ADDR.
+    let (result, _) = run_dw_transfer(
+        bus.clone(),
+        DW_ADDR,
+        alloc::vec![OpSpec::Write(alloc::vec![0x00, 0x01])],
+    );
+    if result != Err(I2cError::Nack) {
+        return Err("absent-address transfer didn't surface I2cError::Nack");
+    }
+    if model.tx_abrt_latched() {
+        return Err("TX_ABRT still latched — the driver's check_abort didn't clear it");
+    }
+    let (result, _) = run_dw_transfer(
+        bus,
+        0x30,
+        alloc::vec![OpSpec::Write(alloc::vec![0x00, 0x77])],
+    );
+    if result.is_err() {
+        return Err("bus didn't recover for a present target after the NACK");
+    }
+    if model.target_reg(0x30, 0x00) != 0x77 {
+        return Err("recovery transfer's byte didn't land");
+    }
+    Ok(())
+}
+
+/// Scenario: the I2C-HID descriptor conversation, byte-for-byte
+/// the ops `I2cHidDriver::read_descriptor` (drivers/input) issues:
+/// write the 2-byte descriptor register address 0x0001, repeated
+/// START, read the 30-byte descriptor. The field assertions mirror
+/// `HidDescriptor::parse`'s checks on the wire bytes it consumes;
+/// the parser itself is the input crate's, this fixture's job is
+/// proving the DW path delivers those bytes intact.
+fn scenario_hid_descriptor(bus: Arc<dyn I2cBus>, model: &DwModel) -> Result<(), &'static str> {
+    let (result, bufs) = run_dw_transfer(
+        bus,
+        DW_ADDR,
+        alloc::vec![OpSpec::Write(alloc::vec![0x01, 0x00]), OpSpec::Read(30)],
+    );
+    if result.is_err() {
+        return Err("HID descriptor transfer failed against the DW model");
+    }
+    let desc = &bufs[1];
+    let r16 = |off: usize| u16::from_le_bytes([desc[off], desc[off + 1]]);
+    if r16(0) != 30 {
+        return Err("HID descriptor length field isn't 30");
+    }
+    if r16(2) != 0x0100 {
+        return Err("HID descriptor bcdVersion isn't 0x0100");
+    }
+    if r16(4) != 85 || r16(6) != 0x0002 {
+        return Err("HID report-descriptor length/register fields corrupted");
+    }
+    if r16(8) != 0x0003 || r16(10) != 64 {
+        return Err("HID input register / max input length fields corrupted");
+    }
+    if r16(20) != 0x04F3 || r16(22) != 0x31A5 {
+        return Err("HID vendor/product fields corrupted");
+    }
+    let events = model.events(DW_ADDR);
+    if events.first() != Some(&BusEvent::Start { read: false })
+        || !events.contains(&BusEvent::Restart { read: true })
+        || events.iter().filter(|e| **e == BusEvent::Stop).count() != 1
+    {
+        return Err("HID descriptor fetch didn't run as one repeated-START envelope");
+    }
+    Ok(())
+}
+
+/// Plant the HID descriptor (see `scenario_hid_descriptor`) at
+/// register 0x0001 of a 2-byte-addressed target on DW_ADDR.
+fn attach_hid_target(model: &DwModel) {
+    let mut desc = [0u8; 30];
+    let fields: [(usize, u16); 12] = [
+        (0, 30),      // wHIDDescLength
+        (2, 0x0100),  // bcdVersion
+        (4, 85),      // wReportDescLength
+        (6, 0x0002),  // wReportDescRegister
+        (8, 0x0003),  // wInputRegister
+        (10, 64),     // wMaxInputLength
+        (12, 0x0004), // wOutputRegister
+        (14, 32),     // wMaxOutputLength
+        (16, 0x0005), // wCommandRegister
+        (18, 0x0006), // wDataRegister
+        (20, 0x04F3), // wVendorId
+        (22, 0x31A5), // wProductId
+    ];
+    for (off, val) in fields {
+        desc[off..off + 2].copy_from_slice(&val.to_le_bytes());
+    }
+    desc[24..26].copy_from_slice(&1u16.to_le_bytes()); // wVersionId
+    let mut target = VirtualTarget::new(DW_ADDR, 2);
+    target.load(0x0001, &desc);
+    model.attach(target);
+}
+
+fn smoke_amd_fch_dw_write_end_to_end() -> TestResult {
+    let model = DwModel::new();
+    model.attach(VirtualTarget::new(DW_ADDR, 1));
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match scenario_write_end_to_end(bus, &model) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_write_end_to_end);
+
+fn smoke_amd_fch_dw_write_then_read_restart() -> TestResult {
+    let model = DwModel::new();
+    let mut target = VirtualTarget::new(DW_ADDR, 1);
+    target.load(0x20, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    model.attach(target);
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match scenario_write_then_read_restart(bus, &model) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_write_then_read_restart);
+
+fn smoke_amd_fch_dw_multi_op_write_write_read() -> TestResult {
+    // Three ops, one envelope: same-direction ops are invisible on
+    // the wire (the byte stream just continues), the direction
+    // change to the read op is a repeated START, and there is
+    // exactly one STOP, at the very end.
+    let model = DwModel::new();
+    let mut target = VirtualTarget::new(DW_ADDR, 1);
+    target.load(0x42, &[0x99, 0x88]);
+    model.attach(target);
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let (result, bufs) = run_dw_transfer(
+        bus,
+        DW_ADDR,
+        alloc::vec![
+            OpSpec::Write(alloc::vec![0x40, 0x01]),
+            OpSpec::Write(alloc::vec![0x02]),
+            OpSpec::Read(2),
+        ],
+    );
+    if result.is_err() {
+        return TestResult::Fail("multi-op transfer failed against the DW model");
+    }
+    if bufs[2] != alloc::vec![0x99, 0x88] {
+        return TestResult::Fail("multi-op read returned wrong bytes");
+    }
+    if model.target_reg(DW_ADDR, 0x40) != 0x01 || model.target_reg(DW_ADDR, 0x41) != 0x02 {
+        return TestResult::Fail("multi-op write bytes landed in the wrong registers");
+    }
+    let want = alloc::vec![
+        BusEvent::Start { read: false },
+        BusEvent::WriteByte(0x40),
+        BusEvent::WriteByte(0x01),
+        BusEvent::WriteByte(0x02),
+        BusEvent::Restart { read: true },
+        BusEvent::ReadByte(0x99),
+        BusEvent::ReadByte(0x88),
+        BusEvent::Stop,
+    ];
+    if model.events(DW_ADDR) != want {
+        return TestResult::Fail("multi-op conversation had the wrong envelope");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_multi_op_write_write_read);
+
+fn smoke_amd_fch_dw_read_spans_fifo_depth() -> TestResult {
+    let model = DwModel::new();
+    let mut target = VirtualTarget::new(DW_ADDR, 1);
+    let pattern: Vec<u8> = (0..64u8).collect();
+    target.load(0x00, &pattern);
+    model.attach(target);
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match scenario_read_spans_fifo_depth(bus, &model) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_read_spans_fifo_depth);
+
+fn smoke_amd_fch_dw_write_spans_fifo_depth_slow_wire() -> TestResult {
+    // Slow the modelled wire (one command per 4 register reads)
+    // so a 40-byte write genuinely fills the 16-deep TX FIFO and
+    // the driver's TFNF wait engages, then still completes with
+    // every byte in order.
+    let model = DwModel::new();
+    model.set_pump(4, 1);
+    model.attach(VirtualTarget::new(DW_ADDR, 1));
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let mut bytes = alloc::vec![0x50u8];
+    bytes.extend(0..39u8);
+    let (result, _) = run_dw_transfer(bus, DW_ADDR, alloc::vec![OpSpec::Write(bytes)]);
+    if result.is_err() {
+        return TestResult::Fail("slow-wire FIFO-spanning write didn't complete");
+    }
+    if model.max_tx_level() < 12 {
+        return TestResult::Fail("TX FIFO never approached depth — TFNF wait wasn't exercised");
+    }
+    for i in 0..39u16 {
+        if model.target_reg(DW_ADDR, 0x50 + i) != i as u8 {
+            return TestResult::Fail("slow-wire write delivered bytes out of order");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers-i2c",
+    smoke_amd_fch_dw_write_spans_fifo_depth_slow_wire
+);
+
+fn smoke_amd_fch_dw_nack_absent_then_recover() -> TestResult {
+    let model = DwModel::new();
+    model.attach(VirtualTarget::new(0x30, 1));
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match scenario_nack_absent_then_recover(bus, &model) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_nack_absent_then_recover);
+
+fn smoke_amd_fch_dw_data_nack_maps_to_nack() -> TestResult {
+    // Target ACKs its address and the first data byte, NAKs the
+    // second: TX_ABRT_SOURCE bit 3 (ABRT_TXDATA_NOACK) must
+    // surface as I2cError::Nack, the NAKed byte must not be
+    // stored, and the rest of the write must never be delivered.
+    let model = DwModel::new();
+    let mut target = VirtualTarget::new(DW_ADDR, 1);
+    target.set_nak_data_after(Some(1));
+    model.attach(target);
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let (result, _) = run_dw_transfer(
+        bus,
+        DW_ADDR,
+        alloc::vec![OpSpec::Write(alloc::vec![0x10, 0xA0, 0xA1, 0xA2])],
+    );
+    if result != Err(I2cError::Nack) {
+        return TestResult::Fail("data NAK didn't surface as I2cError::Nack");
+    }
+    if model.target_reg(DW_ADDR, 0x10) != 0xA0 {
+        return TestResult::Fail("the ACKed data byte wasn't stored");
+    }
+    if model.target_reg(DW_ADDR, 0x11) != 0 {
+        return TestResult::Fail("the NAKed byte was stored anyway");
+    }
+    let events = model.events(DW_ADDR);
+    if !events.contains(&BusEvent::DataNak(0xA1)) || events.contains(&BusEvent::WriteByte(0xA2)) {
+        return TestResult::Fail("bytes after the NAK were delivered");
+    }
+    if model.tx_abrt_latched() {
+        return TestResult::Fail("TX_ABRT still latched after the data-NAK transfer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_data_nack_maps_to_nack);
+
+fn smoke_amd_fch_dw_address_nack_maps_to_nack() -> TestResult {
+    // Target present at DW_ADDR but NAKing its address phase (a
+    // device held in reset / powered down): the model raises
+    // ABRT_7B_ADDR_NOACK (bit 0) — the same source as an absent
+    // device, but here the target is on the bus and records the
+    // AddrNak. The transfer must surface I2cError::Nack, no byte
+    // may be delivered, and the driver must clear the abort.
+    let model = DwModel::new();
+    let mut target = VirtualTarget::new(DW_ADDR, 1);
+    target.set_nak_address(true);
+    model.attach(target);
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let (result, _) = run_dw_transfer(
+        bus,
+        DW_ADDR,
+        alloc::vec![OpSpec::Write(alloc::vec![0x10, 0xA0])],
+    );
+    if result != Err(I2cError::Nack) {
+        return TestResult::Fail("address NAK didn't surface as I2cError::Nack");
+    }
+    if model.events(DW_ADDR) != alloc::vec![BusEvent::AddrNak] {
+        return TestResult::Fail("address-NAKed target saw more than the AddrNak");
+    }
+    if model.target_reg(DW_ADDR, 0x10) != 0 {
+        return TestResult::Fail("a byte was stored despite the address NAK");
+    }
+    if model.tx_abrt_latched() {
+        return TestResult::Fail("TX_ABRT still latched after the address-NAK transfer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_address_nack_maps_to_nack);
+
+fn smoke_amd_fch_dw_abort_reason_mapping() -> TestResult {
+    // ABRT_SBYTE_NORSTRT (bit 9) is none of the driver's special
+    // cases → I2cError::Abort(source) with the source intact.
+    let model = DwModel::new();
+    model.attach(VirtualTarget::new(DW_ADDR, 1));
+    model.inject_abort(1 << 9);
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let (result, _) = run_dw_transfer(
+        bus,
+        DW_ADDR,
+        alloc::vec![OpSpec::Write(alloc::vec![0x00, 0x01])],
+    );
+    if result != Err(I2cError::Abort(1 << 9)) {
+        return TestResult::Fail("injected abort didn't surface as I2cError::Abort(source)");
+    }
+    // Arbitration loss (bit 12) → I2cError::ArbLost.
+    let model = DwModel::new();
+    model.attach(VirtualTarget::new(DW_ADDR, 1));
+    model.inject_abort(1 << 12);
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let (result, _) = run_dw_transfer(
+        bus,
+        DW_ADDR,
+        alloc::vec![OpSpec::Write(alloc::vec![0x00, 0x01])],
+    );
+    if result != Err(I2cError::ArbLost) {
+        return TestResult::Fail("injected arbitration loss didn't surface as I2cError::ArbLost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_abort_reason_mapping);
+
+fn smoke_amd_fch_dw_timeout_when_target_stretches() -> TestResult {
+    // A target that holds SCL low forever: the write fills the TX
+    // FIFO, TFNF never returns, and the driver's poll budget
+    // expires as I2cError::Timeout (not a hang, not a NACK).
+    let model = DwModel::new();
+    model.set_stretch(u32::MAX);
+    model.attach(VirtualTarget::new(DW_ADDR, 1));
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let mut bytes = alloc::vec![0x00u8];
+    bytes.extend(0..19u8);
+    let (result, _) = run_dw_transfer(bus, DW_ADDR, alloc::vec![OpSpec::Write(bytes)]);
+    if result != Err(I2cError::Timeout) {
+        return TestResult::Fail("stretched target didn't surface as I2cError::Timeout");
+    }
+    // Guard against a false pass: the timeout must have come from
+    // the TFNF wait on a genuinely full TX FIFO, not from the
+    // transfer never having run.
+    if model.max_tx_level() != FIFO_DEPTH {
+        return TestResult::Fail("TX FIFO never filled — the timeout wasn't the TFNF wait");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers-i2c",
+    smoke_amd_fch_dw_timeout_when_target_stretches
+);
+
+fn smoke_amd_fch_dw_hid_descriptor_conversation() -> TestResult {
+    let model = DwModel::new();
+    attach_hid_target(&model);
+    let bus = match fch_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match scenario_hid_descriptor(bus, &model) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_dw_hid_descriptor_conversation);
+
+fn smoke_lpss_dw_write_then_read_restart() -> TestResult {
+    let model = DwModel::new();
+    let mut target = VirtualTarget::new(DW_ADDR, 1);
+    target.load(0x20, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    model.attach(target);
+    let bus = match lpss_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    // The LPSS ungate sequence ran against the model during probe:
+    // PRIV_RESETS (0x204) must hold FUNC|APB|IDMA de-asserted.
+    if model.stored_reg(0x204) != 0x7 {
+        return TestResult::Fail("LPSS ungate didn't reach the model's private window");
+    }
+    match scenario_write_then_read_restart(bus, &model) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_dw_write_then_read_restart);
+
+fn smoke_lpss_dw_read_spans_fifo_depth() -> TestResult {
+    let model = DwModel::new();
+    let mut target = VirtualTarget::new(DW_ADDR, 1);
+    let pattern: Vec<u8> = (0..64u8).collect();
+    target.load(0x00, &pattern);
+    model.attach(target);
+    let bus = match lpss_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match scenario_read_spans_fifo_depth(bus, &model) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_dw_read_spans_fifo_depth);
+
+fn smoke_lpss_dw_nack_absent_then_recover() -> TestResult {
+    let model = DwModel::new();
+    model.attach(VirtualTarget::new(0x30, 1));
+    let bus = match lpss_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match scenario_nack_absent_then_recover(bus, &model) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_dw_nack_absent_then_recover);
+
+fn smoke_lpss_dw_hid_descriptor_conversation() -> TestResult {
+    let model = DwModel::new();
+    attach_hid_target(&model);
+    let bus = match lpss_model_bus(&model) {
+        Ok(b) => b,
+        Err(m) => return TestResult::Fail(m),
+    };
+    match scenario_hid_descriptor(bus, &model) {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_lpss_dw_hid_descriptor_conversation);

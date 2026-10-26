@@ -402,6 +402,22 @@ where
 }
 
 fn notify(event: PlatformEvent) {
+    // Every SCI-funneled event is a wake source for a parked
+    // s2idle CPU (the SCI is the one vector the park leaves
+    // unmasked — see `narf_power::s2idle::wake_irq_allowlist`), so
+    // latch it here, at the funnel, before fanning out. Latching
+    // first means a more specific subscriber-side latch (the lid
+    // driver, the button drivers) runs afterwards and wins
+    // `last_wake_source`. The latch is two atomic stores — safe in
+    // every context `notify` runs in.
+    let source = match event {
+        PlatformEvent::PowerButton => narf_power::s2idle::WakeSource::PowerButton,
+        PlatformEvent::SleepButton => narf_power::s2idle::WakeSource::SleepButton,
+        PlatformEvent::RtcAlarm => narf_power::s2idle::WakeSource::RtcAlarm,
+        PlatformEvent::EcQuery(_) => narf_power::s2idle::WakeSource::EmbeddedController,
+        PlatformEvent::UnclaimedGpe(_) => narf_power::s2idle::WakeSource::Other,
+    };
+    narf_power::s2idle::note_wake_event(source);
     let subs = SUBSCRIBERS.lock();
     for s in subs.iter() {
         s(event);

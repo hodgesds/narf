@@ -3359,11 +3359,13 @@ fn smoke_power_shutdown_syncs_before_device_hooks() -> TestResult {
     if synced != ["other-device", "nvme-flush+shn"] {
         return TestResult::Fail("an already-synced transition must still run every hook");
     }
-    // The production sync step is installed (userspace wait_init) in a
-    // kernel that has the syscall layer, which every kernel-test image does.
-    if saved_sync.is_none() {
-        return TestResult::Fail("no pre-shutdown sync installed: reboot would skip the fs sync");
-    }
+    // The production sync step's install wiring is asserted by the
+    // userspace suite (`smoke_userspace_wait_init_installs_pre_shutdown_sync`):
+    // the installer is userspace's boot init, which lives above this crate
+    // and — in a kernel-test boot — runs only when a userspace test
+    // establishes it, so this smoke's verdict must not depend on which
+    // other suites shared the boot. The swaps above restored whatever was
+    // installed (production hook or none) verbatim.
     TestResult::Pass
 }
 kernel_test_in!(
@@ -3637,6 +3639,74 @@ fn smoke_power_service_buttons_policy() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power/service", smoke_power_service_buttons_policy);
+
+fn smoke_power_service_freeze_action() -> TestResult {
+    use crate::bootstrap_power_authority;
+    use crate::service::{self, PowerAction};
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    #[derive(Debug)]
+    struct Recorder(IrqSafeSpinLock<Vec<PowerAction>>);
+    impl service::ActionExecutor for Recorder {
+        fn execute(&self, action: PowerAction) {
+            self.0.lock().push(action);
+        }
+    }
+
+    service::__reset_for_test();
+    let cap = bootstrap_power_authority();
+    let recorder = Arc::new(Recorder(IrqSafeSpinLock::new(Vec::new())));
+    if service::install_action_executor(&cap, recorder.clone()).is_err() {
+        return TestResult::Fail("install_action_executor rejected the bootstrap cap");
+    }
+
+    // Freeze is its own action with its own pending bit (bit 2) —
+    // it must not alias onto Suspend: the two sleep states run
+    // different cores in the executor.
+    service::request_action(PowerAction::Freeze);
+    if service::pending_actions() != 4 {
+        return TestResult::Fail("freeze request did not set the Freeze pending bit");
+    }
+    if service::stats().freeze_requests != 1 || service::stats().suspend_requests != 0 {
+        return TestResult::Fail("freeze request was not counted as a freeze");
+    }
+    if service::pump_pending() != 1 {
+        return TestResult::Fail("pump did not execute the queued freeze");
+    }
+    {
+        let got = recorder.0.lock();
+        if got.as_slice() != [PowerAction::Freeze] {
+            return TestResult::Fail("executor did not receive exactly [Freeze]");
+        }
+    }
+
+    // Execution order across a mixed queue: Suspend, then Freeze,
+    // then PowerOff (a power-off queued alongside sleeps is served
+    // after them).
+    recorder.0.lock().clear();
+    service::request_action(PowerAction::PowerOff);
+    service::request_action(PowerAction::Freeze);
+    service::request_action(PowerAction::Suspend);
+    if service::pump_pending() != 3 {
+        return TestResult::Fail("pump did not execute all three queued actions");
+    }
+    {
+        let got = recorder.0.lock();
+        if got.as_slice()
+            != [
+                PowerAction::Suspend,
+                PowerAction::Freeze,
+                PowerAction::PowerOff,
+            ]
+        {
+            return TestResult::Fail("executor order was not Suspend, Freeze, PowerOff");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/service", smoke_power_service_freeze_action);
 
 fn smoke_power_service_snapshot_fusion_and_drain() -> TestResult {
     use crate::bootstrap_power_authority;

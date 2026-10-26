@@ -52,6 +52,55 @@ fn smoke_hid_descriptor_long_item_skipped() -> TestResult {
 }
 kernel_test_in!("hid", smoke_hid_descriptor_long_item_skipped);
 
+fn smoke_hid_descriptor_unit_exponent_encodings() -> TestResult {
+    // One Input field under a Unit Exponent item with the given
+    // encoding; returns the field's decoded exponent.
+    fn exponent_of(item: &[u8]) -> i32 {
+        let mut blob: alloc::vec::Vec<u8> = alloc::vec![
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x30, // Usage (X)
+            0xA1, 0x01, // Collection (Application)
+            0x15, 0x00, // Logical Minimum (0)
+            0x26, 0xFF, 0x7F, // Logical Maximum (32767)
+            0x75, 0x10, // Report Size (16)
+            0x95, 0x01, // Report Count (1)
+        ];
+        blob.extend_from_slice(item); // Unit Exponent
+        blob.extend_from_slice(&[0x81, 0x02, 0xC0]); // Input; End Collection
+        let d = parse(&blob).expect("parse");
+        assert_eq!(d.fields.len(), 1);
+        d.fields[0].unit_exp
+    }
+    // Nibble form (HID Descriptor Tool / field devices): 0x0D = −3.
+    if exponent_of(&[0x55, 0x0D]) != -3 {
+        return TestResult::Fail("nibble unit exponent 0x0D must decode as -3");
+    }
+    if exponent_of(&[0x55, 0x08]) != -8 {
+        return TestResult::Fail("nibble unit exponent 0x08 must decode as -8");
+    }
+    if exponent_of(&[0x55, 0x05]) != 5 {
+        return TestResult::Fail("unit exponent 0x05 must decode as 5");
+    }
+    if exponent_of(&[0x55, 0x00]) != 0 {
+        return TestResult::Fail("unit exponent 0x00 must decode as 0");
+    }
+    // Spec form: plain signed integer — −7 as a byte is 0xF9.
+    if exponent_of(&[0x55, 0xF9]) != -7 {
+        return TestResult::Fail("byte unit exponent 0xF9 must decode as -7");
+    }
+    // Spec form for the same value the nibble form above encodes:
+    // −3 as a byte is 0xFD, and must land on the same exponent.
+    if exponent_of(&[0x55, 0xFD]) != -3 {
+        return TestResult::Fail("byte unit exponent 0xFD must decode as -3");
+    }
+    // Spec form, 2-byte: −7 as i16 LE.
+    if exponent_of(&[0x56, 0xF9, 0xFF]) != -7 {
+        return TestResult::Fail("2-byte unit exponent -7 must decode as -7");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid", smoke_hid_descriptor_unit_exponent_encodings);
+
 // ── Boot keyboard descriptor ──────────────────────────────────────
 //
 // Verbatim from HID 1.11 Appendix B.1. The descriptor declares:

@@ -42,10 +42,19 @@ pub(crate) fn sys_getrandom(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
         return;
     }
-    // LINUX-GAP: the `!crng_ready() && !(flags & GRND_INSECURE)` arm —
-    // -EAGAIN under GRND_NONBLOCK, otherwise a block until the pool seeds —
-    // has no counterpart; NARF's pool is always considered ready, so
-    // GRND_NONBLOCK never has anything to decline.
+    // The `!crng_ready()` arm (#1026): while the csprng pool is
+    // unseeded, try_fill refuses and the refusal maps to -EAGAIN for
+    // every flags combination. Linux parks a blocking call until the
+    // CRNG initialises and returns -EAGAIN only under GRND_NONBLOCK;
+    // NARF's syscall handlers have no readiness source to park on, so
+    // a blocking caller takes -EAGAIN too — the same failure mode the
+    // compat read paths use when a blocking read has nothing to park
+    // on. GRND_INSECURE waives blocking, not provenance: it is served
+    // from the seeded pool like any other call and takes the same
+    // -EAGAIN while unseeded — there is no partial-entropy pool state
+    // to honour it with. On any machine with a hardware RNG the pool
+    // seeds during Stage::Subsys init, before userspace runs, so the
+    // refusal window is "hardware with no RNG source", not early boot.
     if ptr == 0 {
         // `import_ubuf`'s `access_ok` arm.
         ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
@@ -75,7 +84,15 @@ pub(crate) fn sys_getrandom(ctx: &mut dyn TrapContext) {
     // module exists precisely to replace that LCG (its header cites the
     // Wave-13/Wave-35 audits) and already prefers RNDRRS/RNDR on aarch64;
     // getrandom simply never used it.
-    narf_filesystem::csprng::fill(&mut kbuf);
+    //
+    // Since #1026 the fill is the fallible `try_fill`: the pool seeds
+    // only from hardware entropy through narf-crypto's fail-closed
+    // surface, and an unseeded pool refuses here (see the crng_ready
+    // note above) rather than serving weaker bytes.
+    if narf_filesystem::csprng::try_fill(&mut kbuf).is_err() {
+        ctx.set_return(errno_ret(EAGAIN));
+        return;
+    }
     // SAFETY: `ptr` is the user buffer (non-zero, `len <= MAX_USER_COPY`, both
     // checked above); copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
     // SAFETY: Valid memory or trusted environment

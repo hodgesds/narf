@@ -2314,6 +2314,25 @@ pub struct FixedRelocationError {
     pub source_shrunk: bool,
 }
 
+/// How a [`AddressSpace::zap_mapping_range_locked_for_syscall_with_shared`]
+/// call disposed of its window. The two outcomes are NOT interchangeable for
+/// the caller: upper file-owner tables must mirror them differently (a
+/// retained VMA keeps its owner row and loses only the window's backing
+/// entries; a removed range retires the row exactly like a punch).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ZapOutcome {
+    /// Every overlapping region survived with its base, length, perms and
+    /// backing descriptor intact; only the window's resident leaves were
+    /// torn down and their frames released. The range can fault back in
+    /// place as soon as its backing source serves it again.
+    Retained,
+    /// Retention was impossible for this window (it intersects swap-backed
+    /// pages or a huge leaf), so the call delegated to the full MAP_FIXED
+    /// punch and the window's regions were removed, exactly as
+    /// [`AddressSpace::punch_fixed`] would have removed them.
+    RangeRemoved,
+}
+
 /// Linux resource limits applied atomically to one `mremap` growth.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MremapLimits {
@@ -7654,6 +7673,278 @@ impl AddressSpace {
             unsafe { crate::frame::free_unique_frame_batch(&frames) };
         }
         Ok(())
+    }
+
+    /// Truncate-only zap with both the VMA and shared-owner transactions
+    /// already held in that order: tear down the resident leaves in
+    /// `[base, base+len)` while KEEPING every overlapping region alive.
+    ///
+    /// # Safety
+    /// The caller must hold [`Self::with_vma_transaction`] and, when
+    /// `shared_transaction_held` is true,
+    /// [`with_address_space_shared_mapping_transaction`].
+    pub unsafe fn zap_mapping_range_locked_for_syscall_with_shared(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        shared_transaction_held: bool,
+    ) -> Result<ZapOutcome, AddressSpaceError> {
+        self.zap_mapping_range_locked_with_shared(base, len, shared_transaction_held)
+    }
+
+    /// The retention half of Linux `unmap_mapping_range`: the PTEs (and the
+    /// frames behind them) go away, the VMA stays. A shrink-truncate revokes
+    /// a file mapping's past-EOF tail through here so that re-extending the
+    /// file lets the SAME mapping fault the range back in — [`Self::punch_fixed`]
+    /// cannot express that, because its contract is range removal (the
+    /// region node goes away, and with it any chance to re-serve the VA).
+    ///
+    /// Zap semantics, per overlapping region: base/len/perms, the backing
+    /// descriptor, guard markers and page tables all survive; each resident
+    /// leaf in the window is cleared locally, its rmap owner retired, its
+    /// `phys` slot zeroed in place, and its frame released through the same
+    /// owner-aware paths the punch uses (external release hook for SHARED
+    /// frames, batched buddy free for private ones), after ONE cross-CPU
+    /// invalidation covering the window. Resident accounting is adjusted by
+    /// hand, as in [`Self::madvise_dontneed`], whose in-place slot writes
+    /// are likewise invisible to the insert/remove accounting primitives.
+    ///
+    /// In-flight demand claims in the window are cancelled under the same
+    /// lock hold (`DemandClaims::retain_outside`, the removal paths'
+    /// discipline): a claimed page has no leaf or slot to retire, and its
+    /// lock-free fill may hold a frame fetched against the pre-truncate
+    /// file, so the claim's ticket is the only thing standing between the
+    /// zap and a stale post-EOF publication. A cancelled claim makes the
+    /// fault's finish refuse and release the fetched frame through the
+    /// fault path's balanced false path.
+    ///
+    /// Two window shapes cannot be retained and delegate to the full punch
+    /// ([`ZapOutcome::RangeRemoved`]): windows intersecting swap-backed
+    /// pages (no phys slot to zero; slot-aware teardown is the punch's
+    /// refusing path) and windows touching a huge leaf (a retained 4 KiB
+    /// region cannot describe a torn huge leaf, and file windows — the
+    /// zap's reason to exist — are regular regions). Callers mirror the
+    /// outcome in their own owner tables.
+    ///
+    /// LOCKED regions are NOT exempt. `madvise_dontneed` spares them
+    /// because it is a hint; truncate is destructive in the munmap family
+    /// (whose punch also ignores LOCKED), and a locked file mapping must
+    /// still stop serving past-EOF frames. The LOCKED bit survives on the
+    /// retained region, so pages re-faulted after re-extension re-enter
+    /// under the lock policy.
+    fn zap_mapping_range_locked_with_shared(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        shared_transaction_held: bool,
+    ) -> Result<ZapOutcome, AddressSpaceError> {
+        if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        let lo = base.as_u64();
+        let hi = lo.checked_add(len).ok_or(AddressSpaceError::OutOfRange)?;
+        if len == 0 {
+            // Nothing to retire; retention is vacuous. (Also keeps an
+            // empty window away from the punch fallback, whose overlap
+            // predicates are not meaningful for a zero-length range.)
+            return Ok(ZapOutcome::Retained);
+        }
+
+        // Keep huge -> regular as the address-space lock order, and run the
+        // punch's shared-transaction dance verbatim: if a SHARED region
+        // overlaps while the caller does not already hold the shared-owner
+        // transaction, drop both table locks, acquire the transaction, and
+        // reclassify under transaction -> huge -> regular order, holding it
+        // through leaf teardown and the external owner's release hook.
+        let mut huge = self.huge_regions.lock();
+        let mut regions = self.regions.lock();
+        let shared =
+            regions.overlapping_any(lo, hi, |region| region.perms.contains(RegionPerms::SHARED));
+        let _shared_transaction = if shared && !shared_transaction_held {
+            drop(regions);
+            drop(huge);
+            let transaction = lock_address_space_shared_mapping_transaction(self.identity());
+            huge = self.huge_regions.lock();
+            regions = self.regions.lock();
+            Some(transaction)
+        } else {
+            None
+        };
+        // The transaction is held from here on iff the caller already held
+        // it or the dance just acquired it; the punch fallback below must
+        // be told the truth, because it re-runs this same classification
+        // and would deadlock re-acquiring a transaction we already hold.
+        let transaction_held = shared_transaction_held || _shared_transaction.is_some();
+
+        let huge_overlap = huge.iter().any(|region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            re > lo && rb < hi
+        });
+        let swap_overlap = regions.swap_pages.range(lo..hi).next().is_some();
+        if huge_overlap || swap_overlap {
+            drop(regions);
+            drop(huge);
+            self.punch_fixed_locked_with_shared_reserving(base, len, transaction_held, 0)?;
+            return Ok(ZapOutcome::RangeRemoved);
+        }
+
+        // Preflight: count the resident pages the zap would retire, split
+        // by release path, and reserve both release batches BEFORE touching
+        // a leaf — the punch's no-allocation-after-commit discipline (a Vec
+        // growth under these IRQ-safe locks could otherwise abort the
+        // kernel mid-teardown).
+        let mut shared_release_count = 0usize;
+        let mut private_release_count = 0usize;
+        regions.for_each_overlapping(lo, hi, |region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            if rb >= hi || re <= lo {
+                return;
+            }
+            let total = (region.len >> 12) as usize;
+            let first = ((lo.max(rb) - rb) >> 12) as usize;
+            let last = (((hi.min(re) - rb) >> 12) as usize).min(total);
+            // A demand region may carry a phys list shorter than its page
+            // count; pages past the materialized prefix have no frame, no
+            // leaf and no rmap owner to retire.
+            let p_last = last.min(region.phys.len());
+            let p_first = first.min(p_last);
+            let resident = region
+                .phys
+                .indexed_range(p_first, p_last)
+                .filter(|(_, phys)| phys.raw() != 0)
+                .count();
+            if region.perms.contains(RegionPerms::SHARED) {
+                shared_release_count = shared_release_count.saturating_add(resident);
+            } else {
+                private_release_count = private_release_count.saturating_add(resident);
+            }
+        });
+        let mut to_free: Vec<crate::frame::PhysFrame> = Vec::new();
+        to_free
+            .try_reserve_exact(private_release_count)
+            .map_err(|_| AddressSpaceError::AllocationFailed)?;
+        let mut shared_to_release: Vec<PhysAddr> = Vec::new();
+        shared_to_release
+            .try_reserve_exact(shared_release_count)
+            .map_err(|_| AddressSpaceError::AllocationFailed)?;
+
+        // Commit: per overlapping region, clear the window's leaves locally
+        // from the AUTHORITATIVE backing — never a deferred PTE walk, the
+        // stale-walk use-after-free the punch's snapshot discipline exists
+        // to prevent — then zero each resident slot in place while retiring
+        // its rmap owner and collecting its frame for release. The pass
+        // runs under the region lock end to end, so it is a serialization
+        // point for racing faults in this AS, exactly like the punch's
+        // commit. A fault whose publication completes before the pass is
+        // retired whole: leaf, slot and rmap owner together. A fault that
+        // starts after the pass sees zeroed slots over a live region and
+        // re-enters the ordinary demand path (SIGBUS while the file is
+        // still shrunk, fresh content once it grows again). The third
+        // case — a fault that CLAIMED before the pass and finishes after
+        // it — is handled by the claim cancellation below, not by this
+        // pass: a claimed page's slot is still zero here, so there is no
+        // leaf to retire, and its lock-free fill may already have fetched
+        // a pre-shrink frame it would otherwise publish past the new EOF.
+        let mut retired = 0u64;
+        regions.for_each_overlapping_mut(lo, hi, |region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            if rb >= hi || re <= lo {
+                return;
+            }
+            let total = (region.len >> 12) as usize;
+            let first = ((lo.max(rb) - rb) >> 12) as usize;
+            let last = (((hi.min(re) - rb) >> 12) as usize).min(total);
+            let p_last = last.min(region.phys.len());
+            let p_first = first.min(p_last);
+            if p_first >= p_last {
+                return;
+            }
+            if self.root.as_u64() != 0 {
+                // SAFETY: the region lock pins this region's backing for
+                // the whole walk; the interval is its page-aligned
+                // intersection with the zap window.
+                unsafe { self.unmap_region_window_local(region, p_first, p_last) };
+            }
+            let shared_region = region.perms.contains(RegionPerms::SHARED);
+            region
+                .phys
+                .for_each_chunk_mut(p_first, p_last, |chunk_first, slots| {
+                    for (offset, slot) in slots.iter_mut().enumerate() {
+                        let phys = *slot;
+                        if phys.raw() == 0 {
+                            continue;
+                        }
+                        let va = VirtAddr::new(rb + ((chunk_first + offset) as u64) * 4096);
+                        // Retire the reverse-map entry before the frame is
+                        // released, exactly as the punch and
+                        // `free_region_frames` do: a stale (root, va) owner
+                        // on a released frame breaks the mapcount invariant.
+                        crate::rmap::remove(phys, self.root, va);
+                        if shared_region {
+                            shared_to_release.push(phys);
+                        } else {
+                            to_free.push(crate::frame::PhysFrame::new(phys));
+                        }
+                        *slot = PhysAddr::new(0);
+                        retired += 1;
+                    }
+                });
+        });
+        // Cancel every in-flight demand claim the window covers, inside
+        // the same lock hold, before the flush/release phase below. A
+        // claimed page's slot is zero, so the commit pass cannot retire
+        // it, and its fill runs lock-free (the hook contract forbids
+        // holding this lock across it), with its only EOF check taken at
+        // fill entry against the pre-shrink size. Left alone, the
+        // straddling fault's `finish_demand_page` would find its ticket
+        // intact — retention guarantees the region, the slot's zeroness
+        // and the ticket all survive — and publish the stale fetched
+        // frame past the new EOF. This is the `retain_outside` discipline
+        // the structural paths already apply (`RegionTable::remove`,
+        // `RegionTable::invalidate_mapping`), scoped to the retained
+        // window instead of a removed region: the cancelled finish
+        // returns `false`, and the fault path releases the fetched frame
+        // through its balanced false path (reserved rmap slots released,
+        // then the shared release hook or the buddy free), with resident
+        // accounting untouched because a claimed slot was never counted.
+        // Both claim producers — the single fault and
+        // `claim_demand_range` — insert into this same table and finish
+        // through `finish_demand_page`, so cancelling tickets here
+        // covers the batch paths (fault-around, bulk page-in) as well.
+        // (COW claims need no such step: the COW finish revalidates its
+        // source slot's contents under this lock, so a copy whose slot
+        // the commit pass zeroed or replaced discards itself.)
+        regions.demand_pages.retain_outside(lo, hi);
+        regions.acct.resident_pages = regions.acct.resident_pages.saturating_sub(retired);
+        drop(regions);
+        drop(huge);
+
+        if retired > 0 {
+            // ONE cross-CPU invalidation covering the window, BEFORE any
+            // frame is released for reuse — the punch's ordering. The zap
+            // detaches no page tables (a retained region may re-fault
+            // immediately), so the invalidation spans exactly the window.
+            // Unlike the punch this release is never deferred: truncate is
+            // not the munmap hot path, and shared file frames — the zap's
+            // common case — require the synchronous ordering anyway.
+            self.flush_region_broadcast(base, (hi - lo) >> 12);
+        }
+        // Shared owners may return their last frame to an external cache,
+        // so release them only after the remote invalidation that protects
+        // private backing reuse. The shared-owner transaction remains held.
+        for phys in shared_to_release {
+            release_shared_phys(phys);
+        }
+        if self.root.as_u64() != 0 && !to_free.is_empty() {
+            // `to_free` comes exclusively from retained regions' phys lists
+            // snapshotted under the lock above; the range flush completed
+            // before this batched owner drop.
+            crate::frame::free_frame_batch(&to_free);
+        }
+        Ok(ZapOutcome::Retained)
     }
 
     /// Detach emptied page-table pages covering the just-unmapped
@@ -14610,6 +14901,66 @@ static TEST_FAULT_ADDRESS_SPACE_ID: core::sync::atomic::AtomicU64 =
 /// Error the test hook answers `TEST_FAULT_PAGE` with instead of a frame:
 /// 0 = none (serve the frame), 1 = `Bus`, 2 = `NoMemory`.
 static TEST_FAULT_ERROR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Address space (raw pointer) whose window the test fault hooks zap
+/// mid-fill, modelling a truncate that lands between a fault's claim and
+/// its finish — the fill is "parked" while the zap runs. 0 = disarmed.
+/// The owning test keeps the address space alive at this address for the
+/// whole fault and clears this before dropping it; the hooks run
+/// synchronously on the faulting stack, so the pointer is live exactly
+/// while it can be dereferenced.
+static TEST_ZAP_AS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Window the armed zap strikes: first page and page count.
+static TEST_ZAP_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TEST_ZAP_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Zap outcome latch: 0 = not fired, 4 = firing, 1 = `Retained`,
+/// 2 = `RangeRemoved`, 3 = error. Doubles as the fire-once latch — the
+/// zap models one truncate landing inside one fill, however many faults
+/// the armed hooks go on to serve.
+static TEST_ZAP_OUTCOME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Fire the armed test zap, if any, exactly once. Called by the test
+/// fault hooks from inside the fill, after the claim and before the
+/// frame is handed back — the one point in the fault lifecycle where a
+/// real truncate's zap can land while a claimed page is still unfilled.
+fn fire_armed_test_zap() {
+    use core::sync::atomic::Ordering;
+    let target = TEST_ZAP_AS.load(Ordering::Acquire);
+    if target == 0
+        || TEST_ZAP_OUTCOME
+            .compare_exchange(0, 4, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    let base = TEST_ZAP_BASE.load(Ordering::Acquire);
+    let pages = TEST_ZAP_PAGES.load(Ordering::Acquire);
+    // SAFETY: `TEST_ZAP_AS` is armed only by a test that keeps the
+    // address space alive at this address until after the fault returns
+    // (see the static's contract), and this runs synchronously inside
+    // that fault.
+    let aspace = unsafe { &*(target as *const AddressSpace) };
+    // SAFETY: the demand fill runs with no address-space lock and no
+    // VMA transaction held (the hook contract), and the fixture runs no
+    // concurrent VMA operation against this address space — the call
+    // models the transaction-held truncate zap landing mid-fill. The
+    // fixture's regions are not SHARED, so no shared-owner transaction
+    // is owed.
+    let outcome = unsafe {
+        aspace.zap_mapping_range_locked_for_syscall_with_shared(
+            VirtAddr::new(base),
+            pages.saturating_mul(4096),
+            false,
+        )
+    };
+    TEST_ZAP_OUTCOME.store(
+        match outcome {
+            Ok(ZapOutcome::Retained) => 1,
+            Ok(ZapOutcome::RangeRemoved) => 2,
+            Err(_) => 3,
+        },
+        Ordering::Release,
+    );
+}
 
 fn test_file_fault_hook(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
     use core::sync::atomic::Ordering;
@@ -14622,6 +14973,9 @@ fn test_file_fault_hook(address_space_id: u64, vaddr: u64) -> Result<u64, FileFa
             2 => return Err(FileFaultError::NoMemory),
             _ => {}
         }
+        // A truncate landing mid-fill strikes here: after this fault's
+        // claim, before its finish sees the frame.
+        fire_armed_test_zap();
         return Ok(TEST_FAULT_FRAME.load(Ordering::Relaxed));
     }
     let chained = *FILE_FAULT_HOOK_UNDER_TEST.lock();
@@ -14666,6 +15020,9 @@ fn test_file_batch_fault_hook(address_space_id: u64, first_vaddr: u64, out: &mut
     let base = TEST_BATCH_BASE.load(Ordering::Relaxed);
     if base != 0 && first_vaddr >= base && first_vaddr < base + 8 * 4096 {
         TEST_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        // As in the single-page hook: an armed zap lands after the
+        // batch's claims and before any of its finishes.
+        fire_armed_test_zap();
         let frames = *TEST_BATCH_FRAMES.lock();
         let fail = TEST_BATCH_FAIL_PAGE.load(Ordering::Relaxed);
         for (index, slot) in out.iter_mut().enumerate() {
@@ -15797,6 +16154,264 @@ kernel_test_in!(
     "memory",
     smoke_memory_file_demand_batch_installs_a_range_in_one_call
 );
+
+/// The truncate zap versus a demand fault whose slow path straddles it
+/// (#691 second review): the fault claims its page, the zap lands while
+/// the fill is still "parked" (the test hook zaps between claim and
+/// finish, inside the real `demand_alloc_page` composition), and the
+/// finish must then refuse publication — a claimed page's slot is zero,
+/// so the zap's retire pass alone cannot stop the pre-shrink frame the
+/// fill fetched from being published past the new EOF. The zap cancels
+/// the claim's ticket inside its lock hold; the finish's refusal runs
+/// the fault path's balanced false path, releasing the fetched frame
+/// exactly once, and resident accounting never moves because the
+/// claimed slot was never counted.
+fn smoke_memory_zap_cancels_straddling_demand_claim() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    // SAFETY: as the file-demand tests above.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0000_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x2000,
+        perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::FILE_DEMAND,
+        phys: Vec::new().into(),
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region rejected a FILE_DEMAND region");
+    }
+    let frame = match crate::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let phys = frame.start_address();
+    // Register the fetched frame with the COW refcount so the fault
+    // path's exactly-once release is observable as a single decrement:
+    // publication would leave the count untouched (the frame stays
+    // resident), a double release would drop it twice.
+    crate::frame::cow::inc_ref(phys);
+    let count_before = crate::frame::cow::count(phys);
+    let resident_before = a.regions.lock().acct.resident_pages;
+
+    let fault_page = vbase + 0x1000;
+    TEST_FAULT_PAGE.store(fault_page, Ordering::Relaxed);
+    TEST_FAULT_FRAME.store(phys.raw(), Ordering::Relaxed);
+    TEST_FAULT_CALLS.store(0, Ordering::Relaxed);
+    TEST_FAULT_ERROR.store(0, Ordering::Relaxed);
+    TEST_ZAP_BASE.store(fault_page, Ordering::Relaxed);
+    TEST_ZAP_PAGES.store(1, Ordering::Relaxed);
+    TEST_ZAP_OUTCOME.store(0, Ordering::Relaxed);
+    TEST_ZAP_AS.store(&a as *const AddressSpace as u64, Ordering::Relaxed);
+    arm_test_file_fault_hook();
+
+    // SAFETY: `a` is a live user root from `new_for_user`; the identity
+    // map is up and the frame allocator is initialised.
+    let served = unsafe { a.demand_alloc_page(VirtAddr::new(fault_page + 0x40)) };
+
+    // Disarm before any cleanup can fault or drop the address space.
+    TEST_ZAP_AS.store(0, Ordering::Relaxed);
+    TEST_FAULT_PAGE.store(0, Ordering::Relaxed);
+
+    let zap_outcome = TEST_ZAP_OUTCOME.load(Ordering::Relaxed);
+    let hook_calls = TEST_FAULT_CALLS.load(Ordering::Relaxed);
+    let slot = a
+        .lookup(VirtAddr::new(vbase))
+        .and_then(|r| r.phys.get(1).copied());
+    let mapped = translate_is_mapped(&a, VirtAddr::new(fault_page));
+    let resident_after = a.regions.lock().acct.resident_pages;
+    let ticket_gone = a.regions.lock().demand_pages.get(fault_page).is_none();
+    let releases = count_before - crate::frame::cow::count(phys);
+    // The claim machinery is unpoisoned by the cancellation: the same
+    // page claims cleanly again (and is cancelled here, by hand).
+    let reclaim = a.claim_demand_page(fault_page, |_, _| Ok(()));
+    let reclaim_ticket = match reclaim {
+        Ok(DemandPageClaim::Owner { ticket, .. }) => Some(ticket),
+        _ => None,
+    };
+    if let Some(ticket) = reclaim_ticket {
+        a.cancel_demand_page(fault_page, ticket);
+    }
+
+    drop(a);
+    // The false path's one release dropped the count by one; this final
+    // decrement is the test's own and frees the frame.
+    crate::frame::free_frame(frame);
+
+    if served.is_err() {
+        return TestResult::Fail("a zap-straddled fault errored instead of refusing publication");
+    }
+    if zap_outcome != 1 {
+        return TestResult::Fail("the mid-fill zap did not run and retain the region");
+    }
+    if hook_calls != 1 {
+        return TestResult::Fail("the fault did not reach the file-fault hook exactly once");
+    }
+    if slot != Some(PhysAddr::new(0)) {
+        return TestResult::Fail("the zap-straddled fault published its pre-shrink frame");
+    }
+    if mapped {
+        return TestResult::Fail("the zap-straddled fault installed a leaf");
+    }
+    if resident_after != resident_before {
+        return TestResult::Fail("a refused publication moved resident accounting");
+    }
+    if !ticket_gone {
+        return TestResult::Fail("the cancelled claim's ticket survived its finish");
+    }
+    if releases != 1 {
+        return TestResult::Fail("the fetched frame was not released exactly once");
+    }
+    if reclaim_ticket.is_none() {
+        return TestResult::Fail("the cancelled page does not claim cleanly again");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_zap_cancels_straddling_demand_claim);
+
+/// The batch twin of the straddle above: `claim_demand_range` takes
+/// both pages' tickets in one lock hold, the zap lands inside the batch
+/// fill hook, and every finish in the run must refuse — the batch claim
+/// path (fault-around / execve bulk page-in) inherits the zap's claim
+/// discipline wholesale, not a per-page version of it. A page outside
+/// the zapped window, claimed by a later batch, still installs.
+fn smoke_memory_zap_cancels_straddling_batch_claims() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    // SAFETY: as the file-demand tests above.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0000_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::FILE_DEMAND,
+        phys: Vec::new().into(),
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region rejected a FILE_DEMAND region");
+    }
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        let frame = match crate::frame::alloc_frame() {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("alloc_frame failed"),
+        };
+        frames.push(frame);
+    }
+    // Release counting on the two straddled frames, as in the
+    // single-fault test; the third is the un-zapped control.
+    crate::frame::cow::inc_ref(frames[0].start_address());
+    crate::frame::cow::inc_ref(frames[1].start_address());
+    let counts_before = [
+        crate::frame::cow::count(frames[0].start_address()),
+        crate::frame::cow::count(frames[1].start_address()),
+    ];
+    let resident_before = a.regions.lock().acct.resident_pages;
+    {
+        let mut table = TEST_BATCH_FRAMES.lock();
+        for (slot, frame) in table.iter_mut().zip(frames.iter()) {
+            *slot = frame.start_address().raw();
+        }
+    }
+    TEST_BATCH_BASE.store(vbase, Ordering::Relaxed);
+    TEST_BATCH_FAIL_PAGE.store(0, Ordering::Relaxed);
+    TEST_BATCH_CALLS.store(0, Ordering::Relaxed);
+    TEST_ZAP_BASE.store(vbase, Ordering::Relaxed);
+    TEST_ZAP_PAGES.store(2, Ordering::Relaxed);
+    TEST_ZAP_OUTCOME.store(0, Ordering::Relaxed);
+    TEST_ZAP_AS.store(&a as *const AddressSpace as u64, Ordering::Relaxed);
+    arm_test_file_batch_fault_hook();
+
+    // SAFETY: as the batch test above.
+    let installed = unsafe { a.demand_alloc_range(VirtAddr::new(vbase), 2) };
+
+    // Disarm the zap (not the batch hook): the control batch below must
+    // fill and publish undisturbed.
+    TEST_ZAP_AS.store(0, Ordering::Relaxed);
+
+    let zap_outcome = TEST_ZAP_OUTCOME.load(Ordering::Relaxed);
+    let batch_calls = TEST_BATCH_CALLS.load(Ordering::Relaxed);
+    let region = a.lookup(VirtAddr::new(vbase));
+    let slots = region
+        .as_ref()
+        .map(|r| (r.phys.get(0).copied(), r.phys.get(1).copied()));
+    let leaves = (
+        translate_is_mapped(&a, VirtAddr::new(vbase)),
+        translate_is_mapped(&a, VirtAddr::new(vbase + 0x1000)),
+    );
+    let resident_after = a.regions.lock().acct.resident_pages;
+    let tickets_gone = {
+        let regions = a.regions.lock();
+        regions.demand_pages.get(vbase).is_none()
+            && regions.demand_pages.get(vbase + 0x1000).is_none()
+    };
+    let releases = [
+        counts_before[0] - crate::frame::cow::count(frames[0].start_address()),
+        counts_before[1] - crate::frame::cow::count(frames[1].start_address()),
+    ];
+
+    // Control: outside the zapped window the same batch machinery
+    // installs normally — the cancellation was window-scoped.
+    // SAFETY: as above.
+    let control = unsafe { a.demand_alloc_range(VirtAddr::new(vbase + 0x2000), 1) };
+    let control_slot = a
+        .lookup(VirtAddr::new(vbase))
+        .and_then(|r| r.phys.get(2).copied());
+    let control_mapped = translate_is_mapped(&a, VirtAddr::new(vbase + 0x2000));
+    let resident_final = a.regions.lock().acct.resident_pages;
+
+    TEST_BATCH_BASE.store(0, Ordering::Relaxed);
+    drop(a);
+    // The straddled frames were each released once by the batch's false
+    // path; these decrements are the test's own. The control frame was
+    // resident in a private region, so address-space teardown already
+    // returned it — `frames[2]` must NOT be freed again here (it is a
+    // `Copy` handle; simply not passing it to `free_frame` is the whole
+    // of the bookkeeping).
+    crate::frame::free_frame(frames[0]);
+    crate::frame::free_frame(frames[1]);
+
+    if installed != 0 {
+        return TestResult::Fail("the batch published a page across the zap");
+    }
+    if zap_outcome != 1 {
+        return TestResult::Fail("the mid-fill zap did not run and retain the region");
+    }
+    if batch_calls != 1 {
+        return TestResult::Fail("the batch did not fill through one hook call");
+    }
+    if slots != Some((Some(PhysAddr::new(0)), Some(PhysAddr::new(0)))) {
+        return TestResult::Fail("a straddled batch page kept or gained a frame");
+    }
+    if leaves != (false, false) {
+        return TestResult::Fail("a straddled batch page installed a leaf");
+    }
+    if resident_after != resident_before {
+        return TestResult::Fail("refused batch publications moved resident accounting");
+    }
+    if !tickets_gone {
+        return TestResult::Fail("a straddled batch claim's ticket survived");
+    }
+    if releases != [1, 1] {
+        return TestResult::Fail("a straddled batch frame was not released exactly once");
+    }
+    if control != 1 || control_slot != Some(frames[2].start_address()) || !control_mapped {
+        return TestResult::Fail("the batch stopped installing outside the zapped window");
+    }
+    if resident_final != resident_before + 1 {
+        return TestResult::Fail("the control publication was not accounted exactly once");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_zap_cancels_straddling_batch_claims);
 
 /// The batch's error contract (#737): a page the file refuses is a
 /// *skip* inside a batch — the rest of the range still installs, and

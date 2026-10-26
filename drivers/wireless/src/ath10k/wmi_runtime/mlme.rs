@@ -35,12 +35,23 @@ pub(super) fn peer(
         false,
     )
 }
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn peer_on(
     dialect: Dialect,
     associated: Associated,
     capabilities: u16,
     rates: u16,
     qos: bool,
+) -> Result<Vec<u8>, Error> {
+    peer_phy(dialect, associated, capabilities, rates, qos, None)
+}
+pub(super) fn peer_phy(
+    dialect: Dialect,
+    associated: Associated,
+    capabilities: u16,
+    rates: u16,
+    qos: bool,
+    ht: Option<super::ht::Profile>,
 ) -> Result<Vec<u8>, Error> {
     let Associated {
         bssid,
@@ -57,6 +68,7 @@ pub(super) fn peer_on(
         || (capabilities & 16 != 0) != protected
         || !crate::ath10k::regulatory::Permission::profile_frequency(frequency)
         || frequency > 3000 && rates & 15 != 0
+        || ht.is_some() && !qos
     {
         return Err(Error::Malformed);
     }
@@ -67,12 +79,18 @@ pub(super) fn peer_on(
         .filter_map(|(i, rate)| (rates & (1 << i) != 0).then_some(rate))
         .collect();
     let tlv = dialect == Dialect::Tlv;
+    let ht_rates: Vec<u8> = (0..8)
+        .filter(|mcs| ht.is_some_and(|ht| ht.mcs & (1 << mcs) != 0))
+        .collect();
     let (command, size) = match dialect {
         Dialect::Main => (0x6005, 356),
         Dialect::TenOne => (0x9020, 348),
         Dialect::TenTwo | Dialect::TenTwoFour => (0x9020, 352),
         Dialect::TenFour => (0x9026, 356),
-        Dialect::Tlv => (0x6005, 76 + 16 + 16 + legacy.len().next_multiple_of(4)),
+        Dialect::Tlv => (
+            0x6005,
+            76 + 16 + 16 + legacy.len().next_multiple_of(4) + ht_rates.len().next_multiple_of(4),
+        ),
     };
     let mut out = wire::packet(command, size)?;
     let at = if tlv {
@@ -88,11 +106,21 @@ pub(super) fn peer_on(
     wire::put(
         &mut out,
         at + 20,
-        1 | if protected { 4 } else { 0 } | if qos { 2 } else { 0 },
+        1 | if protected { 4 } else { 0 }
+            | if qos { 2 } else { 0 }
+            | if ht.is_some() { 0x1000 } else { 0 },
     );
     wire::put(&mut out, at + 24, u32::from(capabilities));
     wire::put(&mut out, at + 28, 1); // Linux STA listen-interval workaround.
-    let mode = if frequency > 3000 {
+    if let Some(ht) = ht {
+        wire::put(&mut out, at + 32, u32::from(ht.capabilities));
+        wire::put(&mut out, at + 36, (1 << (13 + (ht.ampdu & 3))) - 1);
+        wire::put(&mut out, at + 40, ht.density());
+        wire::put(&mut out, at + 44, 8 | if ht.short_gi { 4 } else { 0 });
+    }
+    let mode = if let Some(ht) = ht {
+        ht.mode(frequency)
+    } else if frequency > 3000 {
         0
     } else if rates & !15 != 0 {
         1
@@ -103,14 +131,19 @@ pub(super) fn peer_on(
         wire::put(&mut out, at + 48, 1); // one spatial stream, no HT/VHT
         wire::put(&mut out, at + 56, mode);
         wire::put(&mut out, at + 68, legacy.len() as u32);
+        wire::put(&mut out, at + 72, ht_rates.len() as u32);
         let padded = legacy.len().next_multiple_of(4);
         wire::put(&mut out, at + 76, (17 << 16) | padded as u32);
         out[at + 80..at + 80 + legacy.len()].copy_from_slice(&legacy);
-        wire::put(&mut out, at + 80 + padded, 17 << 16); // no HT rates
-        wire::put(&mut out, at + 84 + padded, (102 << 16) | 16);
+        let ht_padded = ht_rates.len().next_multiple_of(4);
+        wire::put(&mut out, at + 80 + padded, (17 << 16) | ht_padded as u32);
+        out[at + 84 + padded..at + 84 + padded + ht_rates.len()].copy_from_slice(&ht_rates);
+        wire::put(&mut out, at + 84 + padded + ht_padded, (102 << 16) | 16);
     } else {
         wire::put(&mut out, at + 48, legacy.len() as u32);
         out[at + 52..at + 52 + legacy.len()].copy_from_slice(&legacy);
+        wire::put(&mut out, at + 184, ht_rates.len() as u32);
+        out[at + 188..at + 188 + ht_rates.len()].copy_from_slice(&ht_rates);
         wire::put(&mut out, at + 320, 1);
         wire::put(&mut out, at + 328, mode);
         if matches!(

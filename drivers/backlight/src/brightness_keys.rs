@@ -6,13 +6,20 @@
 //!   - **0x87** — Brightness Decrement (Fn+F5 / XF86BrightnessDown).
 //!
 //! This module subscribes to these notify codes and, on each event:
-//!   1. Looks up the first [`crate::acpi_video::AcpiVideoDevice`] in
-//!      the ACPI video registry.
-//!   2. Calls `step_up` / `step_down` on that device to adjust the
-//!      panel brightness by one ladder step.
+//!   1. Looks up the panel owner elected by the subsystem's
+//!      single-owner arbitration ([`crate::panel_owner`]).
+//!   2. Calls `step_up` / `step_down` on the owner to adjust the
+//!      panel brightness by one step (a ladder rung for ACPI video,
+//!      a tenth of the range otherwise).
 //!   3. Emits an [`narf_input::KeyCode::BrightnessUp`] /
 //!      [`narf_input::KeyCode::BrightnessDown`] key-press + key-release
 //!      event pair to the global input ring so userspace can handle it.
+//!
+//! Stepping only the owner matters: the ACPI `_BCM` path and the
+//! native GPU path usually drive the same panel PWM, so stepping a
+//! deferred candidate here would fight the owner (audit #936 §2).
+//! This handler previously hard-coded "ACPI first, AMD bridge as
+//! fallback" — the opposite of the arbitration preference.
 //!
 //! ## Why both hardware and input events?
 //!
@@ -40,8 +47,6 @@ use core::fmt::Write as FmtWrite;
 
 use narf_input::{push_key, KeyCode};
 
-use crate::BacklightDevice;
-
 // ── Notify code constants ──────────────────────────────────────────
 
 /// ACPI Notify value: Brightness Increment (Fn+F6 / XF86BrightnessUp).
@@ -64,11 +69,11 @@ pub const NOTIFY_BRIGHTNESS_DOWN: u8 = 0x87;
 ///
 /// ## Behaviour
 ///
-/// 1. Find the first ACPI video backlight device (if any).
-/// 2. Step its brightness up or down by one ladder step.
+/// 1. Find the panel owner under single-owner arbitration (if any).
+/// 2. Step its brightness up or down by one step.
 /// 3. Emit a key-press + key-release input event pair.
 ///
-/// Steps 1–2 are no-ops if no ACPI video device is registered;
+/// Steps 1–2 are no-ops if no backlight candidate is registered;
 /// step 3 always fires so userspace sees the key regardless of
 /// whether hardware backlight is under kernel control.
 pub fn handle_notify(code: u8) -> bool {
@@ -90,30 +95,14 @@ pub fn handle_notify(code: u8) -> bool {
 // ── Private helpers ────────────────────────────────────────────────
 
 fn step_brightness_up() {
-    let devs = crate::acpi_video::acpi_video_devices();
-    if let Some(dev) = devs.first() {
-        dev.step_up();
-    } else {
-        // Fall back to amdgpu backlight if present.
-        if let Some(amd) = crate::amdgpu_bl::amdgpu_bl_device() {
-            let cur = amd.current_brightness();
-            let max = amd.max_brightness();
-            // Step by ~10% of max_brightness.
-            let step = (max / 10).max(1);
-            amd.set_brightness(cur.saturating_add(step).min(max));
-        }
+    if let Some(owner) = crate::panel_owner() {
+        owner.step_up();
     }
 }
 
 fn step_brightness_down() {
-    let devs = crate::acpi_video::acpi_video_devices();
-    if let Some(dev) = devs.first() {
-        dev.step_down();
-    } else if let Some(amd) = crate::amdgpu_bl::amdgpu_bl_device() {
-        let cur = amd.current_brightness();
-        let max = amd.max_brightness();
-        let step = (max / 10).max(1);
-        amd.set_brightness(cur.saturating_sub(step));
+    if let Some(owner) = crate::panel_owner() {
+        owner.step_down();
     }
 }
 

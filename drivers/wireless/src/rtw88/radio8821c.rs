@@ -24,6 +24,49 @@ pub struct Info {
 const TXAGC: [u16; 8] = [
     0x1d00, 0x1d04, 0x1d08, 0x1d0c, 0x1d10, 0x1d2c, 0x1d30, 0x1d34,
 ];
+/// rtw8821c_set_tx_power_index_by_rate packs four source rate indices per
+/// word at RF-A1d00. C22's reference/difference registers are unrelated.
+pub(super) fn operating_readback(
+    read: impl FnMut(u16) -> Result<u32, Error>,
+    indices: [u8; 12],
+) -> Result<(), Error> {
+    operating_readback_ht(read, indices, [0; 8])
+}
+pub(super) fn operating_readback_ht(
+    mut read: impl FnMut(u16) -> Result<u32, Error>,
+    indices: [u8; 12],
+    mcs: [u8; 8],
+) -> Result<(), Error> {
+    for (slot, reg) in TXAGC.into_iter().enumerate() {
+        let expected = if slot < 3 {
+            u32::from_le_bytes(
+                indices[slot * 4..slot * 4 + 4]
+                    .try_into()
+                    .map_err(|_| Error::State)?,
+            )
+        } else if slot < 5 {
+            u32::from_le_bytes(
+                mcs[(slot - 3) * 4..(slot - 3) * 4 + 4]
+                    .try_into()
+                    .map_err(|_| Error::State)?,
+            )
+        } else {
+            0
+        };
+        if read(reg)? != expected {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read(0x2860)? & 0x70fff != 0xc01
+        || read(0x2820)? & 0xfffff != 0
+        || read(0x1bf0)? & 0x100ff != 0
+        || read(0x100)? & 0x200 != 0
+        || read(0x680)? & 0xcf != 0
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
 const BB_2G: [(u16, u32, u32); 6] = [
     (0x808, 1 << 28, 1),
     (0x454, 1 << 7, 0),

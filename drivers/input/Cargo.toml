@@ -29,6 +29,9 @@ narf-fb             = { path = "../../fb" }
 narf-console        = { path = "../../console" }
 narf-drivers-virtio = { path = "../virtio" }
 narf-kernel-test    = { path = "../../verification/kernel-test" }
+narf-bus            = { path = "../../bus" }
+narf-driver-runtime = { path = "../runtime" }
+narf-power          = { path = "../../power" }
 async-trait         = "0.1"
 
 [lints]

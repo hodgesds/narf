@@ -1,8 +1,12 @@
-//! Sysfs bridge: `/sys/class/backlight/<name>/` per registered device.
+//! Sysfs bridge: `/sys/class/backlight/<name>/` for the panel owner.
 //!
-//! Wires every [`crate::BacklightDevice`] in the global registry into
-//! the kobject tree so that userspace (and the boot diagnostics) can
-//! read and set panel brightness through the standard sysfs interface.
+//! Wires the panel owner elected by the subsystem's single-owner
+//! arbitration ([`crate::panel_owner`]) into the kobject tree so
+//! that userspace (and the boot diagnostics) can read and set panel
+//! brightness through the standard sysfs interface. Deferred
+//! candidates are deliberately NOT published: a sysfs directory for
+//! a loser would give userspace a path that drives hardware the
+//! subsystem has decided another device owns.
 //!
 //! # Attributes exposed
 //!
@@ -44,7 +48,7 @@ use narf_filesystem::sysfs::{
 };
 use narf_filesystem::FsError;
 
-use crate::{backlight_devices, BacklightDevice, BacklightKind};
+use crate::{panel_owner, BacklightDevice, BacklightKind};
 
 // ── bl_power per-device state ─────────────────────────────────────────
 
@@ -69,8 +73,13 @@ impl BlPowerState {
 
 // ── populate ─────────────────────────────────────────────────────────
 
-/// Register `/sys/class/backlight/<name>/` for every device in the
-/// backlight registry.
+/// Register `/sys/class/backlight/<name>/` for the panel owner.
+///
+/// Only the owner elected by the single-owner arbitration is
+/// published; deferred candidates get no directory. Publication is
+/// still a snapshot taken when this runs (dynamic publication on
+/// register/unregister is the #952 follow-up); arbitration decides
+/// *which* device the snapshot may contain.
 ///
 /// Called once from the `backlight/sysfs` initcall (Stage::Device,
 /// after all hardware drivers have run their own initcalls).
@@ -80,8 +89,8 @@ impl BlPowerState {
 pub fn populate_backlight_class() {
     let class = class_register("backlight");
 
-    for dev in backlight_devices() {
-        register_one(class.clone(), dev);
+    if let Some(owner) = panel_owner() {
+        register_one(class, owner);
     }
 }
 

@@ -45,6 +45,8 @@ pub(super) struct Device<I: Io> {
     up: AtomicBool,
     port: AtomicBool,
     bssid: AtomicU64,
+    ht_capability: IrqSafeSpinLock<Option<[u8; 26]>>,
+    receive_generation: AtomicU64,
     metadata: IrqSafeSpinLock<()>,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
@@ -75,10 +77,20 @@ impl Drop for Attempt<'_> {
 impl<I: Io + 'static> Close for Device<I> {
     fn close(&self) {
         self.admission.close();
+        self.clear_receive();
         self.link(None, false);
     }
 }
 impl<I: Io + 'static> Device<I> {
+    fn clear_receive(&self) {
+        if let Some(rx) = self.rx.lock().as_mut() {
+            for _ in 0..RX_RING_N {
+                if !matches!(rx.try_recv(), Ok(Some(_))) {
+                    break;
+                }
+            }
+        }
+    }
     pub(super) fn new(
         name: &str,
         local: [u8; 6],
@@ -104,6 +116,8 @@ impl<I: Io + 'static> Device<I> {
             up: AtomicBool::new(false),
             port: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
+            ht_capability: IrqSafeSpinLock::new(None),
+            receive_generation: AtomicU64::new(0),
             metadata: IrqSafeSpinLock::new(()),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
@@ -129,17 +143,15 @@ impl<I: Io + 'static> Device<I> {
         self.lifecycle
             .start_station(self.environment.clone(), self.admission.clone())
             .await?;
-        let authority = self
-            .lifecycle
-            .retained
-            .lock()
-            .await
-            .as_mut()
-            .ok_or(Error::State)?
-            .station_publication()?;
+        let (authority, ht) = {
+            let mut retained = self.lifecycle.retained.lock().await;
+            let owner = retained.as_mut().ok_or(Error::State)?;
+            (owner.station_publication()?, owner.station_ht_capability())
+        };
         self.admission.run(|| {
             authority.invoke(|| {
                 self.admitted.store(true, Ordering::Release);
+                *self.ht_capability.lock() = ht;
                 Ok(())
             })
         })?;
@@ -171,10 +183,14 @@ impl<I: Io + 'static> Device<I> {
         owner: &mut super::firmware_transport::Owner<I>,
     ) -> Result<super::publication::Publication, Error> {
         let peer = owner.station_peer();
-        let port = owner.station_ready();
+        let port = owner.station_receive_open();
         let authority = owner.station_publication()?;
+        let generation = self.admission.receive_generation();
         self.admission.run(|| {
             authority.invoke(|| {
+                if self.receive_generation.swap(generation, Ordering::AcqRel) != generation {
+                    self.clear_receive();
+                }
                 self.link(peer, port);
                 Ok(())
             })
@@ -349,9 +365,35 @@ impl<I: Io + 'static> Device<I> {
             if self.closed() {
                 break;
             }
+            if !authority.current() {
+                continue;
+            }
+            // A previous callback may have reentered native progress and
+            // changed the key/port epoch. Refresh the actual retained owner,
+            // then release it before the callback (ARP/ND may enqueue/drain).
+            let ready = {
+                let Some(mut storage) = self.lifecycle.retained.try_lock() else {
+                    continue;
+                };
+                let Some(owner) = storage.as_mut() else {
+                    continue;
+                };
+                if owner.station_check().is_err() {
+                    self.close();
+                    if !self.admission.teardown_pending() {
+                        let _ = owner.station_stop();
+                    }
+                    false
+                } else {
+                    owner.station_receive_open()
+                }
+            };
+            if !ready || !authority.current() {
+                continue;
+            }
             if authority
                 .invoke(|| {
-                    if self.closed() {
+                    if self.closed() || !self.port.load(Ordering::Acquire) || !authority.current() {
                         return Err(super::firmware_transport::Error::State);
                     }
                     narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
@@ -359,6 +401,9 @@ impl<I: Io + 'static> Device<I> {
                 })
                 .is_err()
             {
+                if !authority.current() {
+                    continue;
+                }
                 self.close();
                 let _ = self.progress();
                 break;
@@ -442,12 +487,21 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             }],
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
-                ht_supported: false,
+                ht_supported: self.ht_capability.lock().is_some(),
                 vht_supported: false,
                 he_supported: false,
                 eht_supported: false,
             },
         }
+    }
+    fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
+        if band != 2400 {
+            return None;
+        }
+        Some(narf_wireless::iface::PhyCapabilities {
+            ht: (*self.ht_capability.lock())?,
+            vht: None,
+        })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let dwell = scan_dwell(&request)?;

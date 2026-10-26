@@ -17,8 +17,10 @@
 //!
 //! ACPI Notify codes 0x86 (brightness up) and 0x87 (brightness down)
 //! are delivered to the brightness-key handler in
-//! [`crate::brightness_keys`]; that module queries this registry to
-//! find the correct `AcpiVideoDevice` and calls `step_up` / `step_down`.
+//! [`crate::brightness_keys`]; that module steps whichever device
+//! owns the panel under the crate's single-owner arbitration — when
+//! this device is the owner, its `step_up` / `step_down` move one
+//! `_BCL` ladder rung.
 //!
 //! References (GPL-2.0-or-later):
 //! - `drivers/acpi/acpi_video.c` — `acpi_video_init_brightness`,
@@ -188,6 +190,18 @@ impl BacklightDevice for AcpiVideoDevice {
         self.last.store(snapped as i32, Ordering::Release);
     }
 
+    /// One `_BCL` ladder rung — the trait default (a tenth of the
+    /// range) would snap back onto the current rung for coarse
+    /// ladders.
+    fn step_up(&self) {
+        AcpiVideoDevice::step_up(self);
+    }
+
+    /// One `_BCL` ladder rung (see `step_up`).
+    fn step_down(&self) {
+        AcpiVideoDevice::step_down(self);
+    }
+
     fn kind(&self) -> BacklightKind {
         BacklightKind::Firmware
     }
@@ -195,8 +209,10 @@ impl BacklightDevice for AcpiVideoDevice {
 
 // ── ACPI_VIDEO_DEVICES registry ────────────────────────────────────
 
-/// All discovered ACPI video backlight devices. The `brightness_keys`
-/// module iterates this to find which panel to step on a hotkey.
+/// All discovered ACPI video backlight devices. Kept as the
+/// module-local list of concrete devices; which panel a hotkey
+/// steps is decided by the global single-owner arbitration
+/// ([`crate::panel_owner`]), not by this list.
 static ACPI_VIDEO_DEVS: narf_lib::sync::IrqSafeSpinLock<Vec<Arc<AcpiVideoDevice>>> =
     narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
 

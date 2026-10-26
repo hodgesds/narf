@@ -114,6 +114,21 @@ pub(super) unsafe trait Registers: Send {
     fn station_profile_readback(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn station_ht_facts(&self) -> Option<super::ht::Facts> {
+        None
+    }
+    fn station_ht_extension(
+        &mut self,
+        _: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<Option<alloc::sync::Arc<super::ht::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_ht(&mut self, _: alloc::sync::Arc<super::ht::Grant>) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
+        Err(Error::Unsupported)
+    }
     fn mailbox_ready(&mut self) -> Result<bool, Error> {
         Err(Error::Unsupported)
     }
@@ -294,6 +309,21 @@ impl<R: Registers, M: Memory> Backend<R, M> {
 // before publication, poisons before mutation and reopens only on a fresh
 // page completion; R's unsafe contract governs all other native queue state.
 unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
+    fn station_ht_facts(&self) -> Option<super::ht::Facts> {
+        self.io.station_ht_facts()
+    }
+    fn station_ht_extension(
+        &mut self,
+        b: alloc::sync::Arc<super::station_profile::Grant>,
+    ) -> Result<Option<alloc::sync::Arc<super::ht::Grant>>, Error> {
+        self.io.station_ht_extension(b)
+    }
+    fn station_bind_ht(&mut self, g: alloc::sync::Arc<super::ht::Grant>) -> Result<(), Error> {
+        self.io.station_bind_ht(g)
+    }
+    fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
+        self.io.station_ht_request()
+    }
     fn station_publication(&mut self) -> Result<super::publication::Publication, Error> {
         self.io.station_publication()
     }

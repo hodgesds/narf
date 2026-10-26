@@ -1053,11 +1053,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
     }
 
+    let scanout_mode = dev.current_mode();
     *CONTROLLER.lock() = Some(dev);
 
-    // Register with drm_registry (identity card; the KMS mode
-    // state is attached by the lane-1 publication step when a
-    // scanout exists).
+    // Register with drm_registry. With a live scanout the card
+    // carries real KMS mode state (CRTC 1 + mode, encoder 2,
+    // eDP connector 3 — the virtio/bochs pattern in lib.rs) and
+    // the scanout is published to the framebuffer console;
+    // without one (MTL/PTL gate, allocation failure) the card
+    // stays identity-only, as before lane 1.
     let drm_count = crate::drm_registry::count() as u32;
     let card_name = alloc::format!("card{}", drm_count);
     let intel_card = crate::drm_devfs_bridge::IntelGpuCard::new(
@@ -1067,7 +1071,58 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         device.id.subsystem_vendor,
         device.id.subsystem_id,
     );
-    crate::drm_registry::register_drm_card(alloc::sync::Arc::new(intel_card));
+    match scanout_mode {
+        Some(mode) => {
+            use crate::drm::card::{
+                Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
+            };
+            let kms_mode = crate::Mode {
+                width: mode.width,
+                height: mode.height,
+                refresh_hz: 60,
+                bpp: 32,
+            };
+            let mut kms = Card::new("intel-gpu", "NARF Intel iGPU driver", (1, 0, 0));
+            kms.crtcs.push(Crtc {
+                id: 1,
+                mode: Some(kms_mode),
+                enabled: true,
+                primary_fb: None,
+                x: 0,
+                y: 0,
+            });
+            kms.encoders.push(Encoder {
+                id: 2,
+                // i915 reports DP encoders as TMDS to userspace.
+                encoder_type: EncoderType::Tmds,
+                possible_crtcs: 0x1,
+                possible_clones: 0,
+                crtc_id: Some(1),
+            });
+            kms.connectors.push(Connector {
+                id: 3,
+                connector_type: ConnectorType::Edp,
+                connector_type_id: 1,
+                status: ConnectorStatus::Connected,
+                encoder_id: Some(2),
+                modes: alloc::vec![kms_mode],
+            });
+            crate::drm_registry::register_drm_card_with_state(
+                alloc::sync::Arc::new(intel_card),
+                kms,
+            );
+            publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
+                mode.phys_base,
+                mode.width,
+                mode.height,
+                mode.stride_bytes,
+                32,
+            )));
+        }
+        None => {
+            crate::drm_registry::register_drm_card(alloc::sync::Arc::new(intel_card));
+        }
+    }
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("intel-gpu"),
@@ -1103,6 +1158,50 @@ pub fn register_pci_driver() {
         },
         probe,
     });
+}
+
+// ── Framebuffer-console publication (lane 1, #1010 item 4) ──────
+//
+// Mirrors the AMD publication protocol in `amdgpu_dcn_display`:
+// an ACTIVE slot plus a single observer fn pointer, so the fb
+// crate (which depends on this crate, not the reverse) can
+// follow the Intel scanout exactly the way it follows AMD's.
+// Publishing records ACTIVE first; an observer installed late
+// is told the current value immediately, so install order
+// between probe (Stage::Device) and the fb initcall
+// (Stage::Late) does not matter.
+
+/// Told when the active Intel scanout appears or goes away.
+pub type ScanoutObserver = fn(Option<narf_graphics_driver::generic::GenericFb>);
+static ACTIVE_GENERIC: IrqSafeSpinLock<Option<narf_graphics_driver::generic::GenericFb>> =
+    IrqSafeSpinLock::new(None);
+static SCANOUT_OBSERVER: IrqSafeSpinLock<Option<ScanoutObserver>> = IrqSafeSpinLock::new(None);
+
+/// The Intel scanout currently published to the fb console.
+pub fn active_scanout_generic() -> Option<narf_graphics_driver::generic::GenericFb> {
+    *ACTIVE_GENERIC.lock()
+}
+
+/// Install the fb-console observer. Called once during
+/// Stage::Late; a scanout that already exists is replayed
+/// immediately so the edge cannot be missed.
+pub fn register_scanout_observer(observer: ScanoutObserver) {
+    *SCANOUT_OBSERVER.lock() = Some(observer);
+    let current = *ACTIVE_GENERIC.lock();
+    if current.is_some() {
+        observer(current);
+    }
+}
+
+/// Publish (or withdraw) the Intel scanout. Locks are released
+/// before the observer runs, so an observer that reads
+/// `active_scanout_generic` cannot deadlock against this.
+fn publish_scanout(scanout: Option<narf_graphics_driver::generic::GenericFb>) {
+    *ACTIVE_GENERIC.lock() = scanout;
+    let observer = *SCANOUT_OBSERVER.lock();
+    if let Some(observer) = observer {
+        observer(scanout);
+    }
 }
 
 pub fn is_probed() -> bool {

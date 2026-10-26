@@ -453,12 +453,12 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
                 .await?;
         }
         self.wmi.htc.send_htt(&rx_config(dma)?).await?;
-        // Linux defaults64 AMPDU/3 AMSDU. Station admission remains closed
-        // until actual RX deaggregation and reorder ownership are implemented.
-        // Linux disables A-MSDU in RAW mode: firmware RAW aggregation can
-        // produce malformed frames. The legacy station advertises no HT BA.
-        let amsdu = if self.wmi.raw_mode() { 1 } else { 3 };
-        self.wmi.htc.send_htt(&[5, 64, amsdu]).await?;
+        // Firmware offloads TX aggregation. This retained RAW packet owner
+        // submits one MPDU at a time and must configure that native bound,
+        // independently of RX BA/reorder. RAW transmit A-MSDU stays disabled
+        // for Linux's firmware-format workaround (htt_tx.c::aggr_cfg_msg).
+        let (ampdu, amsdu) = if self.wmi.raw_mode() { (1, 1) } else { (64, 3) };
+        self.wmi.htc.send_htt(&[5, ampdu, amsdu]).await?;
         self.config.major = version.major;
         self.ready = Some(version);
         self.failed = false;

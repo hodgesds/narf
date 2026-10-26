@@ -14,7 +14,10 @@
 //! | [`release`] | `nl80211_netlink_notify` → `cfg80211_autodisconnect_wk` |
 
 use super::*;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    future::Future,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 pub(super) const ENOLINK: i32 = 67;
 pub(super) const ENOTCONN: i32 = 107;
@@ -50,7 +53,13 @@ const IFTYPE_AP: u32 = 3;
 pub(super) struct Wdev {
     pub name: String,
     pub namespace: u64,
+    // None is reserved for internal linkless fixtures. A real registration
+    // always replaces that state before any owner or port fact is read.
+    pub ifindex: Option<u32>,
     pub conn_owner: u32,
+    // A socket portid may be reused without replacing the netdev. Tokens
+    // also distinguish a grant from the teardown claim that retired it.
+    pub owner_epoch: u64,
     pub disconnect_bssid: [u8; 6],
     pub control_port_over_nl80211: bool,
     /// `wdev->ps` (`None` until first read: the driver's default).
@@ -58,38 +67,124 @@ pub(super) struct Wdev {
 }
 
 static WDEVS: IrqSafeSpinLock<Vec<Wdev>> = IrqSafeSpinLock::new(Vec::new());
+static NEXT_OWNER_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_owner_epoch() -> Result<u64, i32> {
+    NEXT_OWNER_EPOCH
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
+            epoch.checked_add(1)
+        })
+        .map_err(|_| ERANGE)
+}
+
+impl Wdev {
+    fn empty(name: &str, namespace: u64, ifindex: Option<u32>) -> Self {
+        Self {
+            name: String::from(name),
+            namespace,
+            ifindex,
+            conn_owner: 0,
+            owner_epoch: 0,
+            disconnect_bssid: [0; 6],
+            control_port_over_nl80211: false,
+            ps: None,
+        }
+    }
+
+    fn bind(&mut self, namespace: u64, ifindex: Option<u32>) {
+        if self.namespace != namespace || self.ifindex != ifindex {
+            *self = Self::empty(&self.name, namespace, ifindex);
+        }
+    }
+
+    fn refresh(&mut self) {
+        if let Some(link) = narf_net::iface::lookup(&self.name) {
+            self.bind(link.net_ns_id, Some(link.ifindex));
+        } else if self.ifindex.is_some() {
+            // Removed registrations cannot leave owner/port/PS facts behind.
+            self.bind(self.namespace, None);
+        }
+    }
+
+    fn retire_owner(&mut self) {
+        self.conn_owner = 0;
+        self.owner_epoch = 0;
+        self.control_port_over_nl80211 = false;
+    }
+
+    fn grant_owner(&mut self, portid: u32, bssid: Option<[u8; 6]>) -> Result<(), i32> {
+        self.retire_owner();
+        if portid != 0 {
+            self.owner_epoch = next_owner_epoch()?;
+            self.conn_owner = portid;
+        }
+        self.disconnect_bssid = bssid.unwrap_or([0; 6]);
+        Ok(())
+    }
+}
+
+fn entry<'a>(
+    wdevs: &'a mut Vec<Wdev>,
+    name: &str,
+    namespace: u64,
+    index: Option<u32>,
+) -> &'a mut Wdev {
+    let position = match wdevs.iter().position(|w| w.name == name) {
+        Some(position) => position,
+        None => {
+            wdevs.push(Wdev::empty(name, namespace, index));
+            wdevs.len() - 1
+        }
+    };
+    let wdev = &mut wdevs[position];
+    wdev.bind(namespace, index);
+    wdev
+}
 
 /// Run `f` on `name`'s state (created on first use).
 pub(super) fn with_wdev<R>(name: &str, namespace: u64, f: impl FnOnce(&mut Wdev) -> R) -> R {
     let mut wdevs = WDEVS.lock();
-    if let Some(w) = wdevs.iter_mut().find(|w| w.name == name) {
-        if w.namespace != namespace {
-            // A namespace move resets what belonged to the old owner.
-            w.namespace = namespace;
-            w.conn_owner = 0;
-            w.control_port_over_nl80211 = false;
-        }
-        return f(w);
+    let link = narf_net::iface::lookup(name);
+    if link
+        .as_ref()
+        .is_some_and(|link| link.net_ns_id != namespace)
+    {
+        // A stale namespace caller receives empty detached state. It must
+        // never reset or mutate the current namespace's live record.
+        return f(&mut Wdev::empty(name, namespace, None));
     }
-    wdevs.push(Wdev {
-        name: String::from(name),
+    f(entry(
+        &mut wdevs,
+        name,
         namespace,
-        conn_owner: 0,
-        disconnect_bssid: [0; 6],
-        control_port_over_nl80211: false,
-        ps: None,
-    });
-    let w = wdevs.last_mut().unwrap();
-    f(w)
+        link.map(|link| link.ifindex),
+    ))
+}
+
+/// The identity check and state mutation share WDEVS ownership. A stale
+/// caller cannot rebind a replacement's entry, even if it resolved its old
+/// index before the replacement operation acquired its own owner.
+fn with_link_wdev<R>(
+    name: &str,
+    namespace: u64,
+    index: u32,
+    f: impl FnOnce(&mut Wdev) -> R,
+) -> Result<R, i32> {
+    let mut wdevs = WDEVS.lock();
+    if narf_net::iface::lookup_in(namespace, name).is_none_or(|link| link.ifindex != index) {
+        return Err(ENODEV);
+    }
+    Ok(f(entry(&mut wdevs, name, namespace, Some(index))))
 }
 
 /// The connection owner of `name` (0 = none).
 pub(super) fn conn_owner(name: &str) -> u32 {
-    WDEVS
-        .lock()
-        .iter()
-        .find(|w| w.name == name)
-        .map_or(0, |w| w.conn_owner)
+    let mut wdevs = WDEVS.lock();
+    let Some(wdev) = wdevs.iter_mut().find(|w| w.name == name) else {
+        return 0;
+    };
+    wdev.refresh();
+    wdev.conn_owner
 }
 
 /// `if (wdev->conn_owner_nlportid && wdev->conn_owner_nlportid !=
@@ -106,20 +201,34 @@ pub(super) fn check_owner(name: &str, portid: u32) -> Result<(), i32> {
 
 /// A successful CONNECT / ASSOCIATE with `NL80211_ATTR_SOCKET_OWNER`
 /// records the sender as owner (and where to disconnect from).
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn set_owner(name: &str, namespace: u64, portid: u32, bssid: Option<[u8; 6]>) {
     with_wdev(name, namespace, |w| {
-        w.conn_owner = portid;
-        w.disconnect_bssid = bssid.unwrap_or([0; 6]);
+        let _ = w.grant_owner(portid, bssid);
     });
+}
+
+pub(super) fn set_owner_for_link(
+    name: &str,
+    namespace: u64,
+    index: u32,
+    portid: u32,
+    bssid: Option<[u8; 6]>,
+) -> Result<(), i32> {
+    with_link_wdev(name, namespace, index, |w| w.grant_owner(portid, bssid))?
 }
 
 /// `wdev->conn_owner_nlportid = 0` (cfg80211_disconnect, a failed connect
 /// result, a deauth of the connected / connecting BSS).
 pub(super) fn clear_owner(name: &str) {
     if let Some(w) = WDEVS.lock().iter_mut().find(|w| w.name == name) {
-        w.conn_owner = 0;
-        w.control_port_over_nl80211 = false;
+        w.refresh();
+        w.retire_owner();
     }
+}
+
+pub(super) fn clear_owner_for_link(name: &str, namespace: u64, index: u32) -> Result<(), i32> {
+    with_link_wdev(name, namespace, index, |w| w.retire_owner())
 }
 
 /// Drop cfg80211's per-wireless_dev bookkeeping when a virtual netdev is
@@ -130,54 +239,106 @@ pub(super) fn unregister_wdev(name: &str) {
 }
 
 /// Where received EAPOL goes for this association.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn set_control_port(name: &str, namespace: u64, over_nl80211: bool) {
     with_wdev(name, namespace, |w| {
         w.control_port_over_nl80211 = over_nl80211
     });
 }
 
+pub(super) fn set_control_port_for_link(
+    name: &str,
+    namespace: u64,
+    index: u32,
+    over: bool,
+) -> Result<(), i32> {
+    with_link_wdev(name, namespace, index, |w| {
+        w.control_port_over_nl80211 = over
+    })
+}
+
 /// The owners that disconnected and still need their association torn
 /// down (`schedule_work(&wdev->disconnect_wk)`), run by a spawned task.
-fn autodisconnect(iface: Arc<dyn crate::WirelessNetIface>, namespace: u64) {
-    narf_scheduler::spawn(async move {
-        // cfg80211_autodisconnect_wk → cfg80211_disconnect(
-        // WLAN_REASON_DEAUTH_LEAVING): owner cleared first, then the
-        // driver disconnects (its own events report it).
-        clear_owner(iface.name());
-        if !super::super::in_namespace(iface.as_ref(), namespace) {
-            return;
+pub(super) async fn autodisconnect(
+    iface: Arc<dyn crate::WirelessNetIface>,
+    namespace: u64,
+    index: u32,
+    portid: u32,
+    grant_epoch: u64,
+) {
+    // cfg80211_autodisconnect_wk → cfg80211_disconnect(
+    // WLAN_REASON_DEAUTH_LEAVING): owner cleared first, then the
+    // driver disconnects (its own events report it).
+    let claimed = with_link_wdev(iface.name(), namespace, index, |w| {
+        if portid == 0 || grant_epoch == 0 || w.conn_owner != portid || w.owner_epoch != grant_epoch
+        {
+            return None;
         }
-        if iface.disassociate().await.is_ok() && !iface.reports_disconnect_events() {
-            if let Some(index) = narf_net::netlink_route::ifindex_for_name(iface.name()) {
-                publish_event(
-                    NL80211_FAMILY_ID,
-                    19,
-                    namespace,
-                    GenlReply {
-                        command: DISCONNECT,
-                        attrs: super::super::disconnect_attrs(index, 3, false),
-                    },
-                );
-            }
-        }
+        w.retire_owner();
+        let claim_epoch = next_owner_epoch().ok()?;
+        w.owner_epoch = claim_epoch;
+        Some(claim_epoch)
     });
+    let Ok(Some(claim_epoch)) = claimed else {
+        return;
+    };
+    // Dropping a retired native future preserves the driver's own pending
+    // command/DMA ownership; it must never resume against a later grant.
+    let mut future = core::pin::pin!(iface.disassociate());
+    let result = core::future::poll_fn(|cx| {
+        if !current_owner_claim(iface.name(), namespace, index, claim_epoch) {
+            return core::task::Poll::Ready(None);
+        }
+        future.as_mut().poll(cx).map(Some)
+    })
+    .await;
+    if matches!(result, Some(Ok(())))
+        && !iface.reports_disconnect_events()
+        && current_owner_claim(iface.name(), namespace, index, claim_epoch)
+    {
+        publish_event(
+            NL80211_FAMILY_ID,
+            19,
+            namespace,
+            GenlReply {
+                command: DISCONNECT,
+                attrs: super::super::disconnect_attrs(index, 3, false),
+            },
+        );
+    }
+}
+
+fn current_owner_claim(name: &str, namespace: u64, index: u32, claim_epoch: u64) -> bool {
+    with_link_wdev(name, namespace, index, |w| {
+        w.conn_owner == 0 && w.owner_epoch == claim_epoch
+    }) == Ok(true)
 }
 
 /// `nl80211_netlink_notify(NETLINK_URELEASE)`: a closed socket that owned
 /// a connection disconnects it.
 pub(crate) fn release(namespace: u64, portid: u32) {
-    let owned: Vec<String> = WDEVS
-        .lock()
-        .iter()
-        .filter(|w| w.conn_owner == portid && w.namespace == namespace)
-        .map(|w| w.name.clone())
-        .collect();
-    for name in owned {
+    let owned: Vec<(String, u32, u64)> = {
+        let mut wdevs = WDEVS.lock();
+        wdevs
+            .iter_mut()
+            .filter_map(|w| {
+                w.refresh();
+                (portid != 0
+                    && w.conn_owner == portid
+                    && w.namespace == namespace
+                    && w.owner_epoch != 0)
+                    .then_some(w.ifindex)
+                    .flatten()
+                    .map(|index| (w.name.clone(), index, w.owner_epoch))
+            })
+            .collect()
+    };
+    for (name, index, grant_epoch) in owned {
         if let Some(iface) = crate::registry::list()
             .into_iter()
             .find(|i| i.name() == name)
         {
-            autodisconnect(iface, namespace);
+            narf_scheduler::spawn(autodisconnect(iface, namespace, index, portid, grant_epoch));
         }
     }
 }
@@ -875,17 +1036,20 @@ pub fn rx_control_port(
     pdu: &[u8],
     unencrypted: bool,
 ) -> bool {
-    let (owner, namespace) = {
-        let wdevs = WDEVS.lock();
-        match wdevs.iter().find(|w| w.name == name) {
-            Some(w) => (w.conn_owner, w.namespace),
+    let (owner, namespace, index) = {
+        let mut wdevs = WDEVS.lock();
+        match wdevs.iter_mut().find(|w| w.name == name) {
+            Some(w) => {
+                w.refresh();
+                (w.conn_owner, w.namespace, w.ifindex)
+            }
             None => return false,
         }
     };
     if owner == 0 {
         return false;
     }
-    let Some(index) = narf_net::netlink_route::ifindex_for_name(name) else {
+    let Some(index) = index else {
         return false;
     };
     let wiphy = crate::registry::list()
@@ -1003,11 +1167,12 @@ pub fn notify_michael_mic_failure(name: &str, source: [u8; 6], group: bool, key_
 /// Whether received control-port frames of `name` go over nl80211
 /// (`sdata->control_port_over_nl80211`).
 pub fn control_port_over_nl80211(name: &str) -> bool {
-    WDEVS
-        .lock()
-        .iter()
-        .find(|w| w.name == name)
-        .is_some_and(|w| w.control_port_over_nl80211 && w.conn_owner != 0)
+    let mut wdevs = WDEVS.lock();
+    let Some(w) = wdevs.iter_mut().find(|w| w.name == name) else {
+        return false;
+    };
+    w.refresh();
+    w.control_port_over_nl80211 && w.conn_owner != 0
 }
 
 /// `wdev_id()`: `(wiphy_idx << 32) | identifier`.  The interface's stable
@@ -1027,7 +1192,7 @@ pub(super) fn power_save(
     namespace: u64,
 ) -> Result<Vec<GenlReply>, i32> {
     let default = iface.power_save_default();
-    let current = with_wdev(iface.name(), namespace, |w| w.ps.or(default));
+    let (current, index) = with_wdev(iface.name(), namespace, |w| (w.ps.or(default), w.ifindex));
     if command == GET_POWER_SAVE {
         let Some(ps) = current else {
             return Err(EOPNOTSUPP);
@@ -1052,7 +1217,11 @@ pub(super) fn power_save(
         return Ok(Vec::new());
     }
     iface.set_power_save(wanted).map_err(errno_of)?;
-    with_wdev(iface.name(), namespace, |w| w.ps = Some(wanted));
+    if let Some(index) = index {
+        with_link_wdev(iface.name(), namespace, index, |w| w.ps = Some(wanted))?;
+    } else {
+        with_wdev(iface.name(), namespace, |w| w.ps = Some(wanted));
+    }
     Ok(Vec::new())
 }
 

@@ -260,6 +260,49 @@ broader local Linux driver and mac80211/cfg80211 directories. These are footprin
 counts, not completion percentages. Initial remaining-LOC forecasts were
 withdrawn after review found overlapping work; a delivery date remains uncalibrated.
 
+The next feature checkpoint connects exact API77 Gen2 PCI discovery to the
+retained native station worker, passive scan, Open/WPA2 DHCP/IP, rekeys and
+ordered local retirement with current firmware/power/PCI/generation fences.
+Scan freshness conservatively starts before native publication. MT76 adds
+fresh-peer TID0 transmit BA with real ADDBA and WTBL/STA receipts, eight owned
+packets with separate DMA/TX-free proofs, refusal fallback and key/BA retirement.
+RTL8821CE adds distinct measured N21L legacy-rate/WMM qualification through
+its original C21 radio and reserved DMA. Ath10k adds response-bound HT20,
+native RX BA/PPDU ownership and reorder before PN, bounded authenticated
+A-MSDU receive and final current-policy/port publication checks.
+Shared Rust A-MSDU and opaque reorder owners preserve the default receive
+contracts and make whole-aggregate validation, sequence wrap/BAR/hole expiry
+and receive-epoch retirement reusable. These are software advances; the
+all-chip/all-feature inventory and real assets/firmware/RF acceptance remain open.
+
+This checkpoint adds 93 passing smokes per architecture: selected Wi-Fi/shared
+fixtures pass 2058/0 fail/9 skip on x86_64 and 1588/0 fail/3 skip on aarch64.
+Production boots and both btrfs postflights, scoped production/kernel-test
+Clippy, workspace formatting and release/debug builds pass on both architectures.
+
+Shared typed HT/VHT admission now binds membership requirements and directional
+MCS/GI limits to the original BSS and one atomic association response. Intel
+Gen2 adds native WMM/HT20/SISO through response-bound EDCA/peer/TLC, QoS CCMP,
+staged firmware-deaggregated A-MSDU and actual ADDBA declines. Its distinct
+emission tag 2 qualification cannot reuse the preceding legacy-only power record.
+MT76 adds 5 GHz VHT20/40/80 with four-channel policy/power receipts, native VHT
+records, coherent width retuning and the existing TX/RX BA and packet owners.
+RTL8821CE/RTL8822CE add separately qualified HT20, exact chip gain/readback
+paths, native PHY-status checks before crypto, authenticated A-MSDU up to 3839
+bytes and per-callback receive-epoch fencing across rekey. Shared nl80211
+cache and connection-owner lifetimes distinguish replacement netdev identities
+and socket-owner grants, including delayed control work and socket release.
+Native Rust conversations
+exercise Open/WPA2 DHCP/IP; real qualification assets, firmware/RF acceptance
+and the broader all-family software ledger remain required.
+
+This continuation adds 88 passing smokes per architecture. Selected Wi-Fi/shared
+fixtures pass 2146/0 fail/9 skip on x86_64 and 1676/0 fail/3 skip on aarch64.
+Production boots and both btrfs postflights, scoped production/kernel-test
+Clippy, workspace formatting and release/debug builds pass on both architectures.
+The native MT76 channel-switch command now encodes receive-chain count while
+RLM retains its mask; literal and retained-control tests cover their distinction.
+
 The preceding station power-save continuation added ordinary firmware station power save to the
 common CYW43439/BCM43602 owner. PM_FAST/PM_OFF and the default sleep-retention
 commands are serialized with station control; partial failure or cancellation

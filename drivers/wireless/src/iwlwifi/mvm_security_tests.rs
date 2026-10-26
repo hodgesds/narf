@@ -86,6 +86,7 @@ fn envelope(frame: &[u8], status: u32) -> Vec<u8> {
     b[12..16].copy_from_slice(&status.to_le_bytes());
     b[32] = 40;
     b[34] = 1;
+    b[16..20].copy_from_slice(&0x7f000000u32.to_le_bytes());
     b.extend_from_slice(frame);
     b
 }
@@ -119,7 +120,7 @@ struct Receipt {
     body: Vec<u8>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Kind {
+pub(in crate::iwlwifi) enum Kind {
     Enable,
     Message2,
     Message4,
@@ -133,12 +134,12 @@ enum Kind {
     RemoveQueue,
     Data,
 }
-struct Device {
-    ap: FakeAp,
-    m1: Vec<u8>,
+pub(in crate::iwlwifi) struct Device {
+    pub(in crate::iwlwifi) ap: FakeAp,
+    pub(in crate::iwlwifi) m1: Vec<u8>,
     ptk: Option<Ptk>,
     keys: [Option<[u8; 16]>; 5],
-    events: Vec<Kind>,
+    pub(in crate::iwlwifi) events: Vec<Kind>,
     held: Vec<Receipt>,
     enabled: bool,
     api: u8,
@@ -147,7 +148,7 @@ struct Device {
     pair_adds: usize,
     group_adds: usize,
     sync: u32,
-    data: Vec<Vec<u8>>,
+    pub(in crate::iwlwifi) data: Vec<Vec<u8>>,
     gtk: [u8; 16],
     rsc: u64,
     rekey: Option<Rekey>,
@@ -202,7 +203,15 @@ fn ap_ethernet(pdu: &[u8]) -> Vec<u8> {
     bytes
 }
 impl Device {
-    fn new(api: u8) -> Result<Self, &'static str> {
+    pub(in crate::iwlwifi) fn release(&mut self, fw: &mut runtime::model::Firmware) {
+        for receipt in core::mem::take(&mut self.held) {
+            Self::inject(fw, receipt);
+        }
+    }
+    pub(in crate::iwlwifi) fn holding(&self) -> bool {
+        !self.held.is_empty()
+    }
+    pub(in crate::iwlwifi) fn new(api: u8) -> Result<Self, &'static str> {
         let plan = NetworkPlan {
             station: OWN,
             bssid: AP,
@@ -263,7 +272,7 @@ impl Device {
             &receipt.body,
         );
     }
-    fn react(
+    pub(in crate::iwlwifi) fn react(
         &mut self,
         p: runtime::model::Published,
         fw: &mut runtime::model::Firmware,
@@ -429,7 +438,21 @@ impl Device {
             }
             let flags = u32::from_le_bytes(p.bytes[8..12].try_into().unwrap());
             let mut frame = p.bytes[24..].to_vec();
-            if frame[0] != 8 || frame[1] & 0x87 != 1 || frame[4..10] != AP || frame[10..16] != OWN {
+            let header = if frame[0] == 0x88 { 26 } else { 24 };
+            if header == 26 {
+                if p.bytes[6..8] != [0, 0x2d]
+                    || frame.get(26..28) != Some(&[0, 0])
+                    || frame[24..26] != [0, 0]
+                {
+                    return Err("native QoS TX-v9 padding/TID/offload geometry");
+                }
+                frame.drain(26..28);
+            }
+            if !matches!(frame[0], 8 | 0x88)
+                || frame[1] & 0x87 != 1
+                || frame[4..10] != AP
+                || frame[10..16] != OWN
+            {
                 return Err("native EAPOL/data BSS header");
             }
             let encrypted = frame[1] & 0x40 != 0;
@@ -439,10 +462,10 @@ impl Device {
                 }
                 let actual = self.keys[0].ok_or("encrypted native packet before PTK ACK")?;
                 self.tx_pn += 1;
-                let mut body = frame[24..].to_vec();
+                let mut body = frame[header..].to_vec();
                 let wire = ccmp::protect(
                     &Ccm,
-                    &frame[..24],
+                    &frame[..header],
                     &actual,
                     self.tx_pn,
                     0,
@@ -462,7 +485,7 @@ impl Device {
                     .unwrap();
                 let plain = ccmp::unprotect(
                     &Ccm,
-                    &frame[..24],
+                    &frame[..header],
                     expected,
                     0,
                     false,
@@ -472,7 +495,7 @@ impl Device {
                     &mut cipher,
                 )
                 .map_err(|_| "AP rejected actual firmware key/ciphertext")?;
-                frame.truncate(24);
+                frame.truncate(header);
                 frame.extend_from_slice(&plain);
                 frame[1] &= !0x40;
             } else if flags & 2 == 0 {
@@ -595,7 +618,7 @@ impl Device {
                 }
                 let mut ethernet = frame[16..22].to_vec();
                 ethernet.extend_from_slice(&frame[10..16]);
-                ethernet.extend_from_slice(&frame[30..]);
+                ethernet.extend_from_slice(&frame[header + 6..]);
                 self.data.push(ethernet);
                 kind = Kind::Data;
             }
@@ -633,22 +656,43 @@ impl Device {
             Ok(false)
         }
     }
-    fn encrypted_rx(&self, ethernet: &[u8], pn: u64, group: bool) -> Result<Vec<u8>, &'static str> {
+    pub(in crate::iwlwifi) fn encrypted_rx(
+        &self,
+        ethernet: &[u8],
+        pn: u64,
+        group: bool,
+    ) -> Result<Vec<u8>, &'static str> {
+        self.encrypted_rx_profile(ethernet, pn, group, None)
+    }
+    pub(in crate::iwlwifi) fn encrypted_rx_profile(
+        &self,
+        ethernet: &[u8],
+        pn: u64,
+        group: bool,
+        tid: Option<u8>,
+    ) -> Result<Vec<u8>, &'static str> {
         let mut frame = data_from_ap(ethernet, 12);
+        let header = if let Some(tid) = tid {
+            frame[0] = 0x88;
+            frame.splice(24..24, [tid, 0]);
+            26
+        } else {
+            24
+        };
         frame[1] |= 0x40;
         let expected: &[u8; 16] = if group {
             &self.gtk
         } else {
             self.ptk.as_ref().unwrap().tk.as_slice().try_into().unwrap()
         };
-        let mut clear = frame[24..].to_vec();
+        let mut clear = frame[header..].to_vec();
         let cipher = ccmp::protect(
             &Ccm,
-            &frame[..24],
+            &frame[..header],
             expected,
             pn,
             if group { 1 } else { 0 },
-            0,
+            tid.unwrap_or(0),
             false, // All fixture MPDUs are data, including multicast GTK data.
             &mut clear,
         )
@@ -657,9 +701,9 @@ impl Device {
         let installed = self.keys[if group { 2 } else { 0 }].ok_or("native RX no installed key")?;
         let plain = ccmp::unprotect(
             &Ccm,
-            &frame[..24],
+            &frame[..header],
             &installed,
-            0,
+            tid.unwrap_or(0),
             false,
             &mut ReplayWindow {
                 last_seen_pn: pn - 1,
@@ -667,13 +711,97 @@ impl Device {
             &mut wire,
         )
         .map_err(|_| "native RX key/MIC did not authenticate AP ciphertext")?;
-        frame.truncate(24);
+        frame.truncate(header);
         frame.extend_from_slice(&cipher[..8]);
         frame.extend_from_slice(&plain);
         Ok(envelope(&frame, 0xa4f))
     }
+    /// Independent authenticator aggregate: one genuine CCMP ciphertext/MIC
+    /// authenticates all inner DA/SA/length/LLC bytes before this fake device
+    /// emits the API4 deaggregated MPDUs. No production deaggregator is used.
+    pub(in crate::iwlwifi) fn encrypted_amsdu(
+        &self,
+        frames: &[Vec<u8>],
+        pn: u64,
+        tid: u8,
+    ) -> Result<Vec<Vec<u8>>, &'static str> {
+        if frames.is_empty() || frames.len() > 128 || tid > 7 {
+            return Err("AP aggregate shape");
+        }
+        let mut outer = data_from_ap(&frames[0], 23);
+        outer.truncate(24);
+        outer[0] = 0x88;
+        outer[1] |= 0x40;
+        outer.extend_from_slice(&[tid | 0x80, 0]);
+        let mut body = Vec::new();
+        for (index, ethernet) in frames.iter().enumerate() {
+            if !(14..=1514).contains(&ethernet.len()) {
+                return Err("AP aggregate MSDU extent");
+            }
+            body.extend_from_slice(&ethernet[..12]);
+            body.extend_from_slice(&((ethernet.len() - 6) as u16).to_be_bytes());
+            body.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
+            body.extend_from_slice(&ethernet[12..]);
+            if index + 1 < frames.len() {
+                body.resize(body.len().next_multiple_of(4), 0);
+            }
+        }
+        let ap_key = self
+            .ptk
+            .as_ref()
+            .ok_or("AP aggregate PTK absent")?
+            .tk
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let cipher = ccmp::protect(&Ccm, &outer, ap_key, pn, 0, tid, false, &mut body)
+            .map_err(|_| "AP aggregate CCMP")?;
+        let mut wire = cipher.clone();
+        let native_key = self.keys[0].ok_or("native aggregate key absent")?;
+        let clear = ccmp::unprotect(
+            &Ccm,
+            &outer,
+            &native_key,
+            tid,
+            false,
+            &mut ReplayWindow {
+                last_seen_pn: pn - 1,
+            },
+            &mut wire,
+        )
+        .map_err(|_| "native aggregate MIC/key rejection")?;
+        let mut cursor = clear.as_slice();
+        let mut output = Vec::new();
+        for index in 0..frames.len() {
+            let h = cursor.get(..14).ok_or("native aggregate subheader")?;
+            let length = usize::from(u16::from_be_bytes([h[12], h[13]]));
+            let sub = cursor
+                .get(14..14 + length)
+                .ok_or("native aggregate payload")?;
+            let mut frame = outer.clone();
+            frame[4..10].copy_from_slice(&h[..6]);
+            frame[16..22].copy_from_slice(&h[6..12]);
+            frame.extend_from_slice(&cipher[..8]);
+            frame.extend_from_slice(sub);
+            let mut packet = envelope(&frame, 0xa4f);
+            packet[3] |= 0x40;
+            packet[4] = index as u8 | if index + 1 == frames.len() { 0x80 } else { 0 };
+            packet[28..32].copy_from_slice(&0x00100207u32.to_le_bytes());
+            output.push(packet);
+            let consumed = if index + 1 == frames.len() {
+                14 + length
+            } else {
+                (14 + length).next_multiple_of(4)
+            };
+            cursor = cursor.get(consumed..).ok_or("native aggregate alignment")?;
+        }
+        if !cursor.is_empty() {
+            return Err("native aggregate trailing bytes");
+        }
+        Ok(output)
+    }
 
-    fn challenge(
+    pub(in crate::iwlwifi) fn challenge(
         &mut self,
         fw: &mut runtime::model::Firmware,
         anonce: Option<[u8; 32]>,

@@ -59,6 +59,7 @@ pub(super) enum Source {
     },
 }
 pub(super) struct Grant {
+    digest: [u8; 32],
     request: Request,
     cap: Cap<FirmwareBlob, Read>,
     power: Arc<operating8821c::Envelope>,
@@ -115,6 +116,9 @@ impl Source {
     }
 }
 impl Grant {
+    pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
+        self.power.ht_facts()
+    }
     fn decode(
         raw: &[u8],
         signer: Option<[u8; 32]>,
@@ -153,7 +157,10 @@ impl Grant {
         {
             return Err(denied(QError::Format));
         }
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(raw);
         Ok(Self {
+            digest: hash.finalize(),
             request,
             cap,
             power,
@@ -174,6 +181,21 @@ impl Grant {
     pub(super) fn identity(&self) -> [u8; 32] {
         self.request.identity
     }
+    pub(super) fn indices(&self) -> [u8; 12] {
+        self.power.indices()
+    }
+    pub(super) fn extension_request(&self) -> super::station_profile::Request {
+        super::station_profile::request_c21(
+            self.request.identity,
+            self.digest,
+            self.indices(),
+            self.own(),
+        )
+    }
+    pub(super) fn extension_limit(&self, domain: &RegulatoryDomain) -> Result<i16, Error> {
+        self.power
+            .invoke(&|| Ok(domain.clone()), || self.policy_limit(domain))
+    }
     fn domain(&self) -> Result<RegulatoryDomain, Error> {
         #[cfg(any(test, feature = "kernel-test"))]
         if let Some(db) = &self.model {
@@ -185,6 +207,9 @@ impl Grant {
         narf_wireless::reg::db::get_domain().ok_or_else(|| denied(QError::Policy))
     }
     fn policy(&self, domain: &RegulatoryDomain) -> Result<(), Error> {
+        self.policy_limit(domain).map(|_| ())
+    }
+    fn policy_limit(&self, domain: &RegulatoryDomain) -> Result<i16, Error> {
         if domain.country_code != *b"US" {
             return Err(denied(QError::Policy));
         }
@@ -206,7 +231,7 @@ impl Grant {
         if !covering || self.peaks.iter().any(|&p| p + self.antenna > limit) {
             return Err(denied(QError::Policy));
         }
-        Ok(())
+        Ok(limit)
     }
     pub(super) fn temperature(&self, value: u8) -> Result<(), Error> {
         self.power.temperature(value)?;

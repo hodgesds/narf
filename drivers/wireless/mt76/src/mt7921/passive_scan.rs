@@ -46,6 +46,8 @@ pub(super) struct NativeRx<'a> {
     pub ampdu: bool,
     pub wcid: u16,
     pub tid: u8,
+    /// Optional original P-RXV DW0; absence is not a fabricated PHY rate.
+    pub phy: Option<u32>,
 }
 
 pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
@@ -78,6 +80,7 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     }
     let mut offset = 24usize;
     let mut pn = None;
+    let mut phy = None;
     for (flag, size) in [(14, 16), (11, 16), (12, 8)] {
         if r1 & (1 << flag) != 0 {
             let group = packet.get(offset..offset + size)?;
@@ -90,6 +93,7 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
         }
     }
     if r1 & (1 << 13) != 0 {
+        phy = Some(word(packet, offset)?);
         packet.get(offset..offset + 8)?;
         offset += 8;
         if r1 & (1 << 15) != 0 {
@@ -107,6 +111,7 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
         ampdu: r2 & (1 << 30) == 0, // MT_RXD2_NORMAL_NON_AMPDU.
         wcid: (r1 & 0x3ff) as u16,
         tid: ((r2 >> 16) & 15) as u8,
+        phy,
         ccmp: if cipher == 4 {
             Some(CcmpRx {
                 pn: pn?,

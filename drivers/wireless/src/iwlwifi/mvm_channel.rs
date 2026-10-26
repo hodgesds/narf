@@ -93,7 +93,7 @@ impl Owner {
             .ok_or("missing authenticated MVM regulatory policy")?;
         self.prepare_channel_in_domain(channel, &domain).await
     }
-    async fn prepare_channel_in_domain(
+    pub(super) async fn prepare_channel_in_domain(
         &mut self,
         channel: u8,
         domain: &RegulatoryDomain,

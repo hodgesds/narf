@@ -164,7 +164,7 @@ impl Owner {
             .ok_or("missing authenticated MVM regulatory policy")?;
         self.passive_scan_in_domain(channels, &policy).await
     }
-    async fn passive_scan_in_domain(
+    pub(super) async fn passive_scan_in_domain(
         &mut self,
         channels: &[u8],
         domain: &RegulatoryDomain,

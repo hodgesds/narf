@@ -365,7 +365,7 @@ pub fn parse(blob: &[u8]) -> Result<ReportDescriptor, DescriptorError> {
                 0x2 => global.logical_max = raw_s,
                 0x3 => global.physical_min = raw_s,
                 0x4 => global.physical_max = raw_s,
-                0x5 => global.unit_exp = raw_s,
+                0x5 => global.unit_exp = decode_unit_exponent(raw_s),
                 0x6 => global.unit = raw_u,
                 0x7 => global.report_size = raw_u,
                 0x8 => {
@@ -428,6 +428,29 @@ pub fn parse(blob: &[u8]) -> Result<ReportDescriptor, DescriptorError> {
         has_report_ids,
         top_level_apps,
     })
+}
+
+/// Decode a Unit Exponent global item (HID 1.11 §6.2.2.7).
+///
+/// The item is defined as a plain signed integer — exponent −7
+/// stored as a byte is 0xF9 (−3 is 0xFD). In the field, though, many devices
+/// store it as a two's-complement *nibble*, reusing the Unit
+/// item's exponent code table (0x0D = −3, 0x0E = −2, 0x0F = −1):
+/// the official HID Descriptor Tool writes that form, Microsoft's
+/// sensor descriptors use it, and real firmware (Intel ISH sensor
+/// hubs included) ships it. Linux hid-core accepts both, and so
+/// do we: a value confined to the low nibble is read as a signed
+/// nibble; anything wider is taken as the signed integer it is.
+fn decode_unit_exponent(raw: i32) -> i32 {
+    if raw & !0xF == 0 {
+        if raw & 0x8 != 0 {
+            raw - 16
+        } else {
+            raw
+        }
+    } else {
+        raw
+    }
 }
 
 fn first_usage(local: &LocalState) -> Option<(u16, u16)> {

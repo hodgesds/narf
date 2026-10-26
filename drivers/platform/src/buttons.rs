@@ -76,6 +76,16 @@ pub fn sleep_press_count() -> u64 {
 }
 
 fn dispatch(button: Button) {
+    // A button press is a wake source: if the machine is parked in
+    // s2idle, the press must end the park. Latch before fanning out
+    // to subscribers. The park consumes any latch set before it
+    // begins, so the sleep-button press that *requests* a sleep
+    // (via the power service) cannot instantly end it — the latch
+    // only bites for presses that arrive while parked.
+    narf_power::s2idle::note_wake_event(match button {
+        Button::Power => narf_power::s2idle::WakeSource::PowerButton,
+        Button::Sleep => narf_power::s2idle::WakeSource::SleepButton,
+    });
     match button {
         Button::Power => POWER_PRESSES.fetch_add(1, Ordering::Release),
         Button::Sleep => SLEEP_PRESSES.fetch_add(1, Ordering::Release),

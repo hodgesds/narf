@@ -168,6 +168,8 @@ pub mod amdgpu_clearstate_gfx10;
 pub mod amdgpu_compute;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_cp_fw;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_panel_backlight;
 #[path = "amdgpu_cp_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_cp;
