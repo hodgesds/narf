@@ -1,12 +1,12 @@
 # ath10k — Specification
 
-> Status: **Retained legacy RAW station implemented; physical acceptance pending.**
+> Status: **Retained legacy/HT20 RAW station implemented; physical acceptance pending.**
 > The live PCI task obtains BMI identity, selects trusted firmware/BDF,
 > runs OTP calibration and downloads the image. It retains runtime CE DMA
 > before BMI_DONE, negotiates HTC endpoints, handles firmware host-memory
 > requests and completes WMI INIT/READY. Retained HTT RX/TX and a receive-only
 > scan vdev follow, with policy-authorized directed/wildcard active discovery.
-> Raw-capable non-PFC images can publish a retained legacy
+> Raw-capable non-PFC images can publish a retained legacy/HT20
 > station interface with Open/WPA2, bounded native packet progress and terminal
 > disconnect. Hardware-validation readiness is scoped to this exact profile.
 
@@ -115,6 +115,51 @@ remain separate profiles.
   These opaque probe elements grant no PHY, association, security or regulatory
   authority. Current channel/power checks, terminal correlation/restoration,
   failure/cancellation and retained-DMA rules are identical to `scan_active`.
+- The retained RAW station additionally negotiates a native HT20/one-stream profile when
+  SERVICE_READY reports HT and a valid RF-chain count, and the actual AP offer
+  contains valid HT Capability/Operation and usable WMM. It retains MCS0..7,
+  requires every basic MCS to fit that profile and binds HT Operation to the
+  observed primary channel. SGI20 requires the actual firmware capability and
+  both beacon/response support. A driver-owned HT IE advertises 20 MHz, one
+  stream, SMPS disabled and no GF/STBC/LDPC; caller SME IEs cannot supply it.
+  VDEV_START programs native 11NG/11NA HT20 plus ALLOW_HT, retaining the same
+  20 MHz factory/host power receipt. The actual association response intersects
+  MCS/SGI before native PEER_ASSOC carries HT/QoS, peer HT capabilities,
+  maximum MPDU/density, RC flags, exact HT-rate arrays and HT20 phymode on all
+  six dialects. TLV arrays have independent raw counts and padded lengths.
+  Missing/incompatible HT response cannot open the peer or controlled port.
+  Without firmware HT or usable AP WMM, the existing legacy path remains.
+  Native RX admits HT/HT-TXBF preambles only for this confirmed profile and
+  checks 20 MHz, supported MCS, non-greenfield and negotiated guard interval
+  before CCMP replay commitment. RX bounds use the local capability actually
+  advertised; peer receive MCS/SGI separately constrain firmware transmit RC.
+  Capability reporting exposes exact per-band HT bodies from actual startup
+  firmware facts. Native HTT RX_ADDBA/RX_DELBA records establish separate
+  sparse-peer/TID agreements with windows up to 64 for all sixteen TIDs.
+  Duplicate identical notifications retain sequence/age; changed active
+  windows require retirement. The receiver validates FIRST PPDU metadata and
+  carries it only through matching peer/TID MIDDLE/LAST MPDUs. Original RAW
+  MPDUs enter bounded 12-bit sequence reorder before CCMP/PN; native compressed
+  single-TID BAR and a 100 ms hole timeout advance ownership. Firmware FLUSH
+  is not an ordering proof. DELBA, peer loss, host close and key-reply epochs
+  retire buffered originals. Protected data observed while the port is closed
+  is discarded before later receipts can authorize it. Native RAW transmit
+  aggregation is explicitly capped at one MPDU/one MSDU; firmware offload is
+  not inferred to be disabled by absence of host ADDBA. TX A-MPDU/A-MSDU,
+  wider channels, more streams and VHT remain separate work.
+  Complete first/last native RAW receive MPDUs can carry a default-size A-MSDU
+  up to 3839 bytes. The shared opt-in receiver authenticates the original
+  QoS header and complete ciphertext before validating every subframe and
+  committing one per-key/TID PN. Open aggregates use the same complete parser
+  after native peer/HT/header checks and cannot contain protected input.
+  Invalid tails, addresses, RFC1042 ambiguity or embedded control protocols
+  publish no prefix and consume no PN. A bounded batch holds up to 256 decoded
+  Ethernet frames. The current port and refreshed regulatory permission gate
+  final IPC publication after allocation and each stack callback after driver
+  locks are dropped; buffered data cannot escape a later same-drain rekey.
+  Native tests compose actual CE/WMI/HTT and referenced DMA with Open/WPA2,
+  DHCP/IP on both bands/all dialects, response narrowing, absent/malformed
+  capabilities, invalid RX geometry before PN, cancellation and policy loss.
 - The single-vdev RAW station can negotiate WMM from an actual AP Parameter IE.
   It appends its own Information IE with U-APSD disabled; caller-supplied WMM
   cannot duplicate or replace that negotiation. The bound successful association
@@ -126,7 +171,7 @@ remain separate profiles.
   per-vdev concurrency and makes no firmware ACK claim for these commands.
   Ordinary Ethernet uses QoS BE/TID0 through actual RAW HTT metadata and the
   shared host CCMP formatter; EAPOL/key replies remain legacy non-QoS. RX binds
-  QoS TID to the native descriptor before replay/PN commitment. A-MSDU, BA/TX
+  QoS TID to the native descriptor before replay/PN commitment. BA/TX
   aggregation, TSPEC, U-APSD and non-BE transmit classification remain separate
   features. APs without WMM retain the legacy packet/command profile.
 - The registered Device binds native preparation, authentication/association,
@@ -153,7 +198,7 @@ remain separate profiles.
 - `pci::prepare_station(bssid, frequency_mhz)` prepares one native station
   context selected from the last successful passive or active scan cache. It requires
   the installed authenticated host regulatory policy; initial geometry is
-  legacy 20 MHz on channels 1–11 or 5-GHz centres 5180/5200/5220/5240 and
+  legacy/HT20 on channels 1–11 or 5-GHz centres 5180/5200/5220/5240 and
   5745/5765/5785/5805/5825 MHz within firmware hardware limits. 5 GHz requires
   an actual fixed-country factory identity matching the authenticated host
   country; a world factory identity is never promoted by host policy. Host
@@ -267,7 +312,7 @@ remain separate profiles.
   association, with `None` for Open or the caller's WPA2 PMK. It requires
   firmware `RAW_MODE_SUPPORT` (bit10), RAW RX selected during WMI INIT, and a
   non-PFC HTT profile. All six WMI resource layouts use their actual decap
-  field; HTT disables A-MSDU for Linux's raw-mode workaround. Other images
+  field; HTT disables transmit A-MSDU for Linux's raw-mode workaround. Other images
   retain native-WiFi RX and cannot enter this software-CCMP owner. Shared
   `station_security::Security` owns the supplicant, fallible nonce acquisition,
   software CCMP, per-key/TID replay, PN and retired-key history. M2/M4/group
@@ -277,7 +322,7 @@ remain separate profiles.
   fabricated. An early association-era M1 is preserved only after full native
   descriptor/peer/TID/header and unprotected-unicast EAPOL admission; all
   preauthorization IP is discarded. `StationLink { bssid, frequency, protected }`
-  requires the live peer and first completed authorization. Temporary GTK/PTK
+  requires the live peer and current completed data authorization. Temporary GTK/PTK
   reply waits close the data port without flapping established physical carrier.
 - `pci::transmit_ethernet(bytes)` submits one admitted Ethernet frame through
   this owner and returns its actual HTT publication ID. ToDS/RFC1042 and
@@ -285,16 +330,17 @@ remain separate profiles.
   stays closed. `pci::poll_ethernet()` drives the same HTC/HTT owner and returns
   Ethernet only after receive quiescence with a still-owned peer. Native v1
   descriptors and indications must agree on sparse peer, TID, DS, sequence,
-  length, RAW decap and an unfragmented legacy standalone MPDU. CRC errors,
+  length, RAW decap and an unfragmented legacy/qualified HT20 MPDU. CRC errors,
   foreign identities, hardware-decrypted RX, PADDR offload/fragments and
-  aggregation are excluded. RAW FCS is stripped before CCMP verification;
+  unowned A-MPDU/reorder profiles are excluded. Complete original RAW A-MSDUs
+  use the bounded opt-in shared receiver described above. RAW FCS is stripped before CCMP verification;
   only authenticated, replay-checked data reaches RFC1042 decapsulation.
   Last-peer UNMAP, bound deauthentication, failed terminal TX, timeout,
   malformed state and cancellation close the retained radio. Disconnect
   closes security before awaiting firmware retirement. Their async diagnostic
   surface and the nonblocking network drain share the same packet parsing,
   peer events, terminal receipts and security state.
-- `interface::Device` implements the registered legacy station profile after
+- `interface::Device` implements the registered legacy/HT20 station profile after
   calibrated boot, WMI/HTT/scan setup, RAW/non-PFC firmware admission, signed
   regulatory bootstrap and current network-registry capability admission.
   `boot_task` publishes the retained `SESSION` and `scan_ready` immediately after
@@ -306,7 +352,7 @@ remain separate profiles.
   and board profile; native PCI APIs and the Device share this single owner.
   The Device exposes passive/active scan and Open/WPA2-PSK/CCMP on configured
   channels1–11 and the admitted fixed-country non-DFS 5-GHz centres above,
-  legacy20 only. Unsupported scan options, PHY modes, external EAPOL and
+  legacy/HT20 only. Unsupported scan options, PHY modes, external EAPOL and
   checksum/TSO/VLAN requests are rejected, including direct frame-ring clients.
   Native control and each bounded packet-progress pass sample the current
   trusted regulatory database rather than an attachment-time clone. Passive
@@ -629,7 +675,7 @@ variants, concurrent terminal HTT completion and dropped/failed ownership.
 ## 8. Remaining software and hardware acceptance
 
 The retained validation profile is calibrated BMI boot with a signed board
-file, firmware advertising RAW_MODE_SUPPORT, non-PFC HTT, legacy20 station on
+file, firmware advertising RAW_MODE_SUPPORT, non-PFC HTT, legacy/HT20 station on
 host-permitted channels1–11 or the matching fixed-country non-DFS 5-GHz profile,
 passive/active scan, Open or WPA2-PSK/CCMP, DHCP and
 bidirectional IP. Peer/vdev retirement is terminal; firmware and DMA allocations
@@ -658,7 +704,7 @@ revocation and terminal teardown without DMA reuse. No such run is recorded.
 An image lacking RAW support, or requiring PFC, remains a diagnostic scan owner
 and must not be counted as a usable station under this profile.
 
-Broader bands/widths, HT/VHT/BA aggregation, PFC fetch/queue ownership, alternate
+Broader bands/widths, HT40/multiple streams/VHT/BA aggregation, PFC fetch/queue ownership, alternate
 calibration sources, interrupt throughput, associated/off-channel scanning,
 automatic/stable-interface recovery and host-bus/system power management remain
 explicit later profiles. They
