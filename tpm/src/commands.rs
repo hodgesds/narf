@@ -120,6 +120,18 @@ impl CommandBuilder {
     }
 }
 
+/// A parsed TPM2_PCR_Read response (Part 3 §22.6): the PCR update
+/// counter, the echoed selection list, and the digest values in
+/// selection order.
+pub struct PcrReadResponse {
+    /// `pcrUpdateCounter` — a UINT32 on the wire.
+    pub update_counter: u32,
+    /// `pcrSelectionOut` as `(TPM_ALG_ID, pcrSelect bytes)` pairs.
+    pub selections: Vec<(u16, Vec<u8>)>,
+    /// `pcrValues` — one entry per selected PCR, in selection order.
+    pub digests: Vec<Vec<u8>>,
+}
+
 pub struct ResponseParser<'a> {
     buf: &'a [u8],
 }
@@ -145,26 +157,70 @@ impl<'a> ResponseParser<'a> {
         &self.buf[10..]
     }
 
-    /// Parse TPM2_PCR_Read response.
+    /// Parse a TPM2_PCR_Read response (Part 3 §22.6), returning the
+    /// first digest in the response's selection — the shape callers
+    /// that read a single PCR consume.
+    ///
+    /// The walk is structural (see `parse_pcr_read_full`); this
+    /// method once read the digest off the response tail instead,
+    /// which coincides with the spec framing only for a single-PCR
+    /// response and masked non-spec framing on the device side
+    /// (#1065).
     pub fn parse_pcr_read(&self) -> Result<Vec<u8>, TpmError> {
+        let full = self.parse_pcr_read_full()?;
+        full.digests.into_iter().next().ok_or(TpmError::BadResponse)
+    }
+
+    /// Parse a TPM2_PCR_Read response structurally (Part 3 §22.6):
+    /// `pcrUpdateCounter` (UINT32), `pcrSelectionOut`
+    /// (TPML_PCR_SELECTION), `pcrValues` (TPML_DIGEST — a UINT32
+    /// count followed by that many TPM2B_DIGEST entries, each with
+    /// its own u16 size prefix). The walk must consume the body
+    /// exactly; truncation, an overrun count, or trailing bytes are
+    /// `BadResponse`, never a best-effort tail read.
+    pub fn parse_pcr_read_full(&self) -> Result<PcrReadResponse, TpmError> {
         let body = self.body();
-        if body.len() < 4 {
+        let mut off = 0usize;
+        let take = |off: &mut usize, n: usize| -> Result<&[u8], TpmError> {
+            if body.len() < *off + n {
+                return Err(TpmError::BadResponse);
+            }
+            let s = &body[*off..*off + n];
+            *off += n;
+            Ok(s)
+        };
+        let raw = take(&mut off, 4)?;
+        let update_counter = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let raw = take(&mut off, 4)?;
+        let sel_count = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        // No with_capacity from wire counts: a corrupt count must
+        // fail on the bounds-checked walk, not on a giant alloc.
+        let mut selections = Vec::new();
+        for _ in 0..sel_count {
+            // TPMS_PCR_SELECTION: hashAlg(2) + sizeofSelect(1) + pcrSelect[]
+            let raw = take(&mut off, 3)?;
+            let alg = u16::from_be_bytes([raw[0], raw[1]]);
+            let size = raw[2] as usize;
+            let mask = take(&mut off, size)?.to_vec();
+            selections.push((alg, mask));
+        }
+        let raw = take(&mut off, 4)?;
+        let digest_count = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        let mut digests = Vec::new();
+        for _ in 0..digest_count {
+            // TPM2B_DIGEST: size(2) + buffer[size]
+            let raw = take(&mut off, 2)?;
+            let size = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+            digests.push(take(&mut off, size)?.to_vec());
+        }
+        if off != body.len() {
             return Err(TpmError::BadResponse);
         }
-        // pcrUpdateCounter (u32)
-        // pcrSelectionOut (TPML_PCR_SELECTION)
-        // pcrValues (TPML_DIGEST)
-        // For simplicity in Stage 4, we assume a single PCR was requested.
-        let digest_count = u32::from_be_bytes([
-            body[body.len() - 36],
-            body[body.len() - 35],
-            body[body.len() - 34],
-            body[body.len() - 33],
-        ]);
-        if digest_count == 0 {
-            return Err(TpmError::BadResponse);
-        }
-        Ok(body[body.len() - 32..].to_vec())
+        Ok(PcrReadResponse {
+            update_counter,
+            selections,
+            digests,
+        })
     }
 
     /// Parse a TPM2_GetCapability response for TPM_CAP_TPM_PROPERTIES.

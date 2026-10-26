@@ -709,11 +709,12 @@ impl TpmDevice for Tpm {
         let req = narf_tpm::tpm2::pcr_read(narf_tpm::tpm2::TPM_ALG_SHA256, &mask);
 
         let resp = self.submit_raw(&req).await?;
-        if resp.len() < 30 {
-            return Err(HighLevelTpmError::BadResponse);
-        }
-        // The PCR value is at the end of the response for a single PCR read.
-        Ok(resp[resp.len() - 32..].to_vec())
+        // Structural parse of the spec framing (Part 3 §22.6) via
+        // the canonical parser. This path previously sliced the
+        // digest off the response tail, which coincides with the
+        // framing only for a single-PCR response (#1065).
+        let parser = narf_tpm::commands::ResponseParser::new(&resp)?;
+        parser.parse_pcr_read()
     }
 }
 

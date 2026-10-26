@@ -253,4 +253,9 @@ silent success.
   `parse_get_capability_pcr_selections` (#941) for the
   TPML_TAGGED_TPM_PROPERTY and TPML_PCR_SELECTION pages behind
   `query_info` (§3.1).
+- `ResponseParser::parse_pcr_read` / `parse_pcr_read_full` (#1065)
+  for TPM2_PCR_Read responses: the structural Part 3 §22.6 walk
+  (UINT32 `pcrUpdateCounter`, TPML_PCR_SELECTION, TPML_DIGEST of
+  TPM2B_DIGEST entries), returning the first digest or the full
+  `PcrReadResponse`. No tail-read form exists.
 - TPM_ST / TPM_CC / TPM_SU / TPM_ALG_ID / TPM_CAP / TPM_PT / TPM_RC constants.
