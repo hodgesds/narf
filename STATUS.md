@@ -236,6 +236,23 @@ suites pass 1926/0 fail/9 skip on x86_64 and 1456/0 fail/3 skip on aarch64.
 Production boots/btrfs postflights, scoped production/kernel-test Clippy,
 workspace formatting and release/debug builds pass on both architectures.
 
+The next continuation adds native Gen2 WPA2 keys, authenticated EAPOL/M4
+receipts, RX-epoch fencing, encrypted data and rekeys with key-before-queue
+retirement. Automatic Gen2 PCI/netdev publication remains gated. FullMAC
+HT40/SGI40 now requires actual firmware capability/inventory, negotiated AP
+facts and current power authority for both occupied channels, with 20 MHz fallback.
+RTL8822CE gains distinct signed N22L WMM/legacy-DATA-rate qualification and
+current source/PCI checks around final carrier and host-frame publication;
+RTL8821CE keeps its separate legacy grant. Shared native Intel test owners now
+live on the heap to bound nested aarch64 fixture construction. These advances
+remain software evidence; genuine assets, firmware/RF acceptance and the
+all-family feature backlog remain required.
+
+This wave adds 39 passing smokes per architecture: combined Wi-Fi/shared-fixture
+suites pass 1965/0 fail/9 skip on x86_64 and 1495/0 fail/3 skip on aarch64.
+Production boots/btrfs postflights, scoped production/kernel-test Clippy,
+workspace formatting and release/debug builds pass on both architectures.
+
 The [per-chip inventory](drivers/wireless/research/chip-inventory.md) audits all
 102 registered bus identities. Tokei measures 316,060 Rust code lines including
 tests/tables in the specified scopes, compared with 1,177,080 C/header lines in

@@ -14,17 +14,17 @@ matching a PCI ID or testing a command encoder does not establish a WLAN.
 
 | Driver | Generation | Status | Mechanism |
 | :--- | :--- | :--- | :--- |
-| **iwlwifi** | Gen3 MLD station (Sc/BE211), retained Gen2 association/Open-data owner | Live Gen3 station runtime; automatic Gen2 PCI/netdev and WPA2 keys remain gated | Gen2 API77 has native TID0 queue, DCF/TLC, response-bound legacy Open TX/RX and receipt-fenced teardown; WPA2 isolates EAPOL receive and keeps its port closed — `iwlwifi.md` |
+| **iwlwifi** | Gen3 MLD station (Sc/BE211), retained Gen2 Open/WPA2 data owner | Live Gen3 station runtime; automatic Gen2 PCI/netdev remains gated | Gen2 API77 has native EAPOL/M4 completion, key receipts, RX epoch/PN fencing, encrypted TX/RX, rekeys and key-before-queue retirement; firmware/RF acceptance remains — `iwlwifi.md` |
 | **ath11k** | WCN6855-family and native QCA6390 profiles | Live station/runtime profiles; hardware acceptance pending | Native PDEV power telemetry with generation-scoped query/cache ownership; QCA6390 uses native IPQ8074 RX descriptors and four-vdev resources; QCN9074 remains gated pending its HAL/DP path — `ath11k.md` |
 | **mt76** | MT7921/MT7922 CONNAC2 | Retained legacy/HT20/40/SGI 2.4/5 GHz station service | Native WMM BE/TID0, recipient BA for eight TIDs/windows up to32, native WTBL/STA receipts, reorder-before-PN and ordered key retirement through kernel DHCP; TX aggregation and nested A-MSDU remain gated — `mt7921.md` |
-| **rtw88** | RTL8822CE and RTL8821CE initial stations; RTL8822BE identification | Distinct signed-board-power-gated channel1 station profiles through kernel DHCP | C21 retains its original firmware/PHY/IQK/DMA owner through separately qualified awake radio and native Open/WPA2 station; genuine full static thermal-envelope assets and physical qualification remain — `rtw88.md` |
+| **rtw88** | RTL8822CE and RTL8821CE initial stations; RTL8822BE identification | Distinct signed-board-power-gated channel1 station profiles through kernel DHCP | Optional C22 N22L adds actual response-bound WMM BE/TID0 and measured legacy DATA rates with current carrier/RX publication fences; C21 retains its separate legacy grant; real assets/RF acceptance remain — `rtw88.md` |
 | **rtw89** | RTL8852B initial2T2R profile; other AX/BE prerequisites | Retained reset/cold/firmware/full radio/native station with source-controller/packet kernel DHCP models | Separately qualified WMM BE/TID0, native EDCA ACKs and QoS CCMP extend the existing radio/TXBD/RPQ owner; actual assets, reset handoff and physical qualification remain — `rtw89.md` |
 | **rtlwifi** | RTL8188EE PCIe | Factory-qualified channel1 native polled station through actual kernel DHCP | Response-bound WMM/EDCA and QoS CCMP retain current signed policy/capability, exact M4/RX-idle admission and terminal DMA ownership; physical qualification and wider profiles remain — `rtlwifi.md` |
 | **rtl8xxxu** | RTL8188EU USB firmware profile | Signed-board-power-gated channel1 native station service, Open/WPA2-PSK CCMP with retained RSNA and persistent USB RX/TX | Response-bound WMM, awaited native EDCA and BE/TID0 QoS; actual calibration artifacts, physical qualification, reset/rejoin and wider profiles remain — `rtl8xxxu.md` |
 | **ath10k** | QCA988x/QCA6174 and related PCIe parts | Retained RAW/non-PFC legacy station on 2.4 GHz and qualified non-DFS 5 GHz | Six-dialect WMM BE/TID0 and actual response contention, Open/WPA2, current-policy checks across command/RSNA waits, native station power-save intent and terminal teardown; manual recovery retains old DMA — `ath10k.md` |
 | **ath9k** | AR9285 | Retained EEPROM/calibration, native non-EDMA and channel1 negotiated legacy station through kernel DHCP | Active discovery, adaptive four-series native DATA retries, RF-silent/current-policy checks and exact M4/RX-idle fencing; HT, wider channels and recovery remain — `ath9k.md` |
-| **brcmfmac** | Explicit BCM43602 PCIe board profiles | Signed exact-host board selection, retained CR4/msgbuf and native 2.4/5 GHz FullMAC station through kernel DHCP | Firmware-reported channels, confirmed 20 MHz caps, capability-bound required-PMF WPA2, station power save and ACK-fenced flow reuse; actual deployment assets, wider silicon, recovery and system PM remain — `brcmfmac.md` |
-| **cyw43439** | Infineon SDIO FullMAC | Standard PCI SDHCI/explicit card bootstrap through F2 station attachment | Owned PIO/bootstrap, trusted assets, mailbox/FIFO station/data, firmware station power save and capability-bound required-PMF WPA2; board wiring, gSPI host, reset/reload/system PM remain — `cyw43439.md` |
+| **brcmfmac** | Explicit BCM43602 PCIe board profiles | Signed exact-host board selection, retained CR4/msgbuf and native 2.4/5 GHz FullMAC station through kernel DHCP | Firmware/inventory/AP-qualified HT40/SGI40 with exact chanspec/occupied-power checks and 20 MHz fallback, required-PMF WPA2, station power save and ACK-fenced flow reuse; assets, wider silicon, recovery/system PM remain — `brcmfmac.md` |
+| **cyw43439** | Infineon SDIO FullMAC | Standard PCI SDHCI/explicit card bootstrap through F2 station attachment | Native per-band capability/inventory gates admit HT40/SGI40 only with actual firmware/AP proof and full occupied-channel authority; otherwise HT20 remains; required-PMF WPA2/PS, board wiring, gSPI and reset/PM gates remain — `cyw43439.md` |
 
 The branch completion target is **all eleven families with all features supported
 by their target hardware and firmware ready for physical testing**. The initial
@@ -57,17 +57,17 @@ feature inventory before it can be called ready.
 
 | Family | Required software beyond the initial station milestone |
 |---|---|
-| iwlwifi | Automatic Gen2 PCI/netdev publication and MVM WPA2 RSNA/keys/port; Gen2 richer PHY/QoS/BA/recovery; remaining Gen3 command profiles; 6 GHz/HE/EHT, additional roles, RX/RSS and system PM |
+| iwlwifi | Automatic Gen2 PCI/netdev/worker publication; Gen2 PMF/richer PHY/QoS/BA/recovery; remaining Gen3 command profiles; 6 GHz/HE/EHT, additional roles, RX/RSS and system PM |
 | ath11k | QCN9074 static windows/HAL/DP and firmware profile; complete per-chip optional-feature inventory, remaining platform/BW-scaling paths and architecture coverage |
 | mt76 | Associated/off-channel and richer scans, 6 GHz/VHT/HE, TX BA/aggregation and richer recipient profiles, PMF/WPA3, fragmentation, QoS beyond BE/TID0 and U-APSD/TSPEC, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
 | ath10k | Wider bands/widths, HT/VHT/aggregation, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, automatic/stable-interface recovery, DMA reclamation and host-bus/system PM |
 | ath9k | Other chip/EEPROM/descriptor variants, channel retune, periodic calibration, HT/BA/aggregation and richer rates, IRQs, reset/rejoin, removal and PM |
 | rtlwifi | Other matched chips; wider channel/rate profiles, IRQ/C2H expansion, multiple radios, reset/recovery, removal and suspend |
 | rtl8xxxu | Other matched USB chips, wider channels/rates, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
-| rtw88 | RTL8822BE station path; broader C21/C22 channels/rates/QoS/roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine C21 N21S/other measured board assets |
+| rtw88 | RTL8822BE station path; broader C21/C22 channels/PHY, C21 rates/QoS, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N22L/other board assets |
 | rtw89 | Other AX/BE profiles and BE transport/EFUSE, wider PHY/channel/rate/role/security profiles, periodic RF tracking, IRQs, reset/rejoin/removal/suspend and multiple functions |
-| brcmfmac | Other chip/CPU/RAM/OTP/shared-ring profiles, wider PHY/bandwidth, WPA3/AP and other supported roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
-| cyw43439 | Platform clocks/pins/regulators/reset and gSPI host, wider PHY/role/security coverage, reset/reload, system PM and host-bus power transitions |
+| brcmfmac | Other chip/CPU/RAM/OTP/shared-ring profiles, VHT/80 MHz and further PHY where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
+| cyw43439 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 
 Ordinary firmware station power save is implemented for CYW43439 and BCM43602
 through the common retained FullMAC owner; system suspend, wake offload and
@@ -142,6 +142,24 @@ with clean production boots/btrfs postflights, scoped production/kernel-test
 Clippy, workspace formatting and release/debug builds on both architectures.
 Automatic Gen2 netdev/WPA2 keys, MT76 TX aggregation, broader Realtek PHY/roles
 and the rest of the feature ledger remain open; these are software gates.
+
+The following wave adds retained Gen2 WPA2-PSK/CCMP with actual native M4,
+key and RX-epoch receipts, encrypted bidirectional data, rekeys and ordered
+key-before-queue retirement. Automatic Gen2 PCI/netdev publication remains
+gated. CYW43439/BCM43602 admit HT40/SGI40 only when actual firmware per-band
+capabilities, exact chanspec inventory, AP response and current occupied-channel
+power authority agree; otherwise they retain a confirmed 20 MHz fallback.
+RTL8822CE gains optional signed N22L qualification for response-bound WMM
+BE/TID0 and measured legacy DATA rates, plus final carrier/host-RX publication
+inside current source and PCI authority. C21 retains its separate legacy grant.
+Native Intel fixtures heap-own their shared station owner so nested prerequisite
+construction fits the aarch64 boot stack. Real firmware/RF acceptance and the
+remaining all-family feature ledger still apply.
+
+This wave adds 39 passing smokes per architecture: the combined Wi-Fi/shared
+fixtures pass 1965/0 fail/9 skip on x86_64 and 1495/0 fail/3 skip on aarch64.
+Production boots and btrfs postflights, scoped production/kernel-test Clippy,
+workspace formatting and release/debug builds pass on both architectures.
 
 The public nl80211 scan limit follows each facade's `max_scan_ssids`: Intel
 admits 20 active SSID entries, ath10k, ath11k and common FullMAC admit 16, MT76
