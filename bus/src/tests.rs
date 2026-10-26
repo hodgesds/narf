@@ -3424,14 +3424,6 @@ impl FakeWindow {
         unsafe { core::ptr::read_volatile(self.ptr.add(off) as *const u32) }
     }
 
-    fn write16(&self, off: usize, v: u16) {
-        debug_assert!(off + 2 <= self.len);
-        // SAFETY: `off` is inside the owned window per the assert.
-        unsafe {
-            core::ptr::write_volatile(self.ptr.add(off) as *mut u16, v);
-        }
-    }
-
     fn read16(&self, off: usize) -> u16 {
         debug_assert!(off + 2 <= self.len);
         // SAFETY: `off` is inside the owned window per the assert.
@@ -3499,14 +3491,23 @@ fn smoke_vmd_domain_membar_assignment() -> TestResult {
     if !unsafe { crate::ecam::map_segment(narf_memory::PhysAddr::new(cfg.phys), 0x1000) } {
         return TestResult::Fail("could not map fake ECAM segment");
     }
+    // All three child BARs are 64-bit, so the six header slots are
+    // exactly the BAR0/BAR2/BAR4 low+high halves. The layout is
+    // forced by the RAM seam: an *unimplemented* slot cannot be
+    // modelled in RAM — the sizing write reads back verbatim, so
+    // an untouched slot sizes as a present 16-byte BAR and would
+    // be assigned an aperture slot too (on hardware its read-back
+    // is 0 and `read_bar` skips it as unimplemented).
     // BAR0: 64-bit MMIO, unprogrammed (type bits 0b100 only).
     cfg.write32(0x10, 0x4);
     cfg.write32(0x14, 0);
-    // BAR2: 32-bit MMIO, unprogrammed.
-    cfg.write32(0x18, 0);
-    // BAR4: 32-bit MMIO programmed OUTSIDE the aperture — a stale
+    // BAR2: 64-bit MMIO, unprogrammed.
+    cfg.write32(0x18, 0x4);
+    cfg.write32(0x1C, 0);
+    // BAR4: 64-bit MMIO programmed OUTSIDE the aperture — a stale
     // host-domain address that must be reassigned, not trusted.
-    cfg.write32(0x20, 0xDEAD_0000);
+    cfg.write32(0x20, 0xDEAD_0004);
+    cfg.write32(0x24, 0);
 
     let child = fake_pcie(SEG, 0, 0x144d, 0xa808, 0x010802, cfg.phys);
     let bridge = fake_pcie(0, 28, 0x8086, 0x9A0B, 0x010400, 0);
@@ -3538,10 +3539,10 @@ fn smoke_vmd_domain_membar_assignment() -> TestResult {
     if cfg.read32(0x10) != (MB1 as u32 | 0x4) || cfg.read32(0x14) != 0 {
         return TestResult::Fail("BAR0 was not assigned MEMBAR1's base");
     }
-    if cfg.read32(0x18) != (MB1 as u32 + 0x1000) {
+    if cfg.read32(0x18) != ((MB1 as u32 + 0x1000) | 0x4) || cfg.read32(0x1C) != 0 {
         return TestResult::Fail("BAR2 was not assigned inside MEMBAR1");
     }
-    if cfg.read32(0x20) != (MB2 as u32 + 0x2000) {
+    if cfg.read32(0x20) != ((MB2 as u32 + 0x2000) | 0x4) || cfg.read32(0x24) != 0 {
         return TestResult::Fail("BAR4 was not reassigned into MEMBAR2 past its reserved head");
     }
     if membar_window_of(SEG, MB1, 16) != Some(1)
@@ -3743,8 +3744,8 @@ fn smoke_vmd_irq_remap_msix_and_demux() -> TestResult {
 
     // NVMe policy: idx0 -> entry 2, idx1 -> entry 3 (least loaded
     // at/above first_vec+1), idx2 -> entry 2 (tie broken low).
-    // SAFETY: fixture owns both children's tables exclusively.
     for (idx, dv) in dvs.iter().enumerate() {
+        // SAFETY: fixture owns both children's tables exclusively.
         if unsafe { t1.program_vector(idx as u16, 0, *dv) }.is_err() {
             return TestResult::Fail("program_vector on the VMD child failed");
         }
