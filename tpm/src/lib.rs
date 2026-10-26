@@ -675,6 +675,130 @@ mod tests {
         smoke_tpm_getcapability_pcr_selections_parser
     );
 
+    // ── PCR_Read response framing (#1065) ─────────────────────────
+    //
+    // Part 3 §22.6: `pcrUpdateCounter` is a UINT32, `pcrSelectionOut`
+    // a TPML_PCR_SELECTION, `pcrValues` a TPML_DIGEST whose entries
+    // are TPM2B_DIGESTs (u16 size + bytes). The canonical parser
+    // once read the digest off the response tail, which masked the
+    // keystone model's non-spec emit (u64 counter, unprefixed
+    // digests) — model and parser conversed while neither was
+    // spec-shaped. These fixtures pin the structural walk.
+
+    /// A spec-framed PCR_Read response: one SHA-256 selection, the
+    /// given counter, and the given digests.
+    fn pcr_read_spec_frame(
+        counter: u32,
+        mask: [u8; 3],
+        digests: &[[u8; 32]],
+    ) -> alloc::vec::Vec<u8> {
+        let mut frame = alloc::vec::Vec::new();
+        frame.extend_from_slice(&crate::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes()); // size, patched below
+        frame.extend_from_slice(&0u32.to_be_bytes()); // rc = success
+        frame.extend_from_slice(&counter.to_be_bytes());
+        frame.extend_from_slice(&1u32.to_be_bytes()); // selection count
+        frame.extend_from_slice(&crate::tpm2::TPM_ALG_SHA256.to_be_bytes());
+        frame.push(3u8); // sizeofSelect
+        frame.extend_from_slice(&mask);
+        frame.extend_from_slice(&(digests.len() as u32).to_be_bytes());
+        for d in digests {
+            frame.extend_from_slice(&(d.len() as u16).to_be_bytes());
+            frame.extend_from_slice(d);
+        }
+        let size = frame.len() as u32;
+        frame[2..6].copy_from_slice(&size.to_be_bytes());
+        frame
+    }
+
+    fn smoke_tpm_pcr_read_parser_spec_framing() -> TestResult {
+        use crate::commands::ResponseParser;
+        let digest_a = [0xAAu8; 32];
+        let digest_b = [0xBBu8; 32];
+        // PCRs 0 and 2 selected → two digests, in selection order.
+        let frame = pcr_read_spec_frame(0x1122_3344, [0x05, 0x00, 0x00], &[digest_a, digest_b]);
+        let parser = match ResponseParser::new(&frame) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("parser rejected a spec-framed PCR_Read"),
+        };
+        match parser.parse_pcr_read_full() {
+            Ok(full)
+                if full.update_counter == 0x1122_3344
+                    && full.selections
+                        == alloc::vec![(
+                            crate::tpm2::TPM_ALG_SHA256,
+                            alloc::vec![0x05, 0x00, 0x00]
+                        )]
+                    && full.digests == alloc::vec![digest_a.to_vec(), digest_b.to_vec()] => {}
+            _ => return TestResult::Fail("spec-framed PCR_Read parsed incorrectly"),
+        }
+        // The single-digest wrapper returns the first digest — not,
+        // as the old tail walk did, the last 32 bytes (digest_b).
+        match parser.parse_pcr_read() {
+            Ok(d) if d == digest_a.to_vec() => TestResult::Pass,
+            _ => TestResult::Fail("single-digest wrapper must return the first digest"),
+        }
+    }
+    kernel_test_in!("tpm/pcr-read", smoke_tpm_pcr_read_parser_spec_framing);
+
+    fn smoke_tpm_pcr_read_parser_rejects_legacy_framing() -> TestResult {
+        use crate::commands::ResponseParser;
+        // The pre-#1065 keystone-model framing: an 8-byte counter
+        // and a raw, unprefixed digest. The tail-reading parser
+        // accepted this shape; the structural walk must not.
+        let mut frame = alloc::vec::Vec::new();
+        frame.extend_from_slice(&crate::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&1u64.to_be_bytes()); // counter, 8 bytes
+        frame.extend_from_slice(&1u32.to_be_bytes()); // selection count
+        frame.extend_from_slice(&crate::tpm2::TPM_ALG_SHA256.to_be_bytes());
+        frame.push(3u8);
+        frame.extend_from_slice(&[0x10, 0x00, 0x00]); // PCR 4
+        frame.extend_from_slice(&1u32.to_be_bytes()); // digest count
+        frame.extend_from_slice(&[0xCCu8; 32]); // raw digest, no TPM2B prefix
+        let size = frame.len() as u32;
+        frame[2..6].copy_from_slice(&size.to_be_bytes());
+        match ResponseParser::new(&frame).map(|p| p.parse_pcr_read_full()) {
+            Ok(Err(TpmError::BadResponse)) => TestResult::Pass,
+            _ => TestResult::Fail("legacy u64-counter/unprefixed framing must be rejected"),
+        }
+    }
+    kernel_test_in!(
+        "tpm/pcr-read",
+        smoke_tpm_pcr_read_parser_rejects_legacy_framing
+    );
+
+    fn smoke_tpm_pcr_read_parser_rejects_truncation() -> TestResult {
+        use crate::commands::ResponseParser;
+        let digest = [0xDDu8; 32];
+        let good = pcr_read_spec_frame(7, [0x10, 0x00, 0x00], &[digest]);
+        // (a) TPM2B declares 32 bytes, only 10 present.
+        let truncated = &good[..good.len() - 22];
+        match ResponseParser::new(truncated).map(|p| p.parse_pcr_read_full()) {
+            Ok(Err(TpmError::BadResponse)) => {}
+            _ => return TestResult::Fail("truncated TPM2B digest must be rejected"),
+        }
+        // (b) Digest count claims two, one present.
+        let mut overrun = pcr_read_spec_frame(7, [0x10, 0x00, 0x00], &[digest]);
+        let count_off = overrun.len() - 38; // digest count: 4 before (2 + 32)
+        overrun[count_off..count_off + 4].copy_from_slice(&2u32.to_be_bytes());
+        match ResponseParser::new(&overrun).map(|p| p.parse_pcr_read_full()) {
+            Ok(Err(TpmError::BadResponse)) => {}
+            _ => return TestResult::Fail("digest-count overrun must be rejected"),
+        }
+        // (c) A trailing byte after an otherwise valid frame.
+        let mut trailing = good.clone();
+        trailing.push(0u8);
+        let size = trailing.len() as u32;
+        trailing[2..6].copy_from_slice(&size.to_be_bytes());
+        match ResponseParser::new(&trailing).map(|p| p.parse_pcr_read_full()) {
+            Ok(Err(TpmError::BadResponse)) => TestResult::Pass,
+            _ => TestResult::Fail("trailing bytes must be rejected"),
+        }
+    }
+    kernel_test_in!("tpm/pcr-read", smoke_tpm_pcr_read_parser_rejects_truncation);
+
     // ── TPM 2.0 codec smokes ──────────────────────────────────────
 
     fn smoke_tpm2_header_round_trip() -> TestResult {

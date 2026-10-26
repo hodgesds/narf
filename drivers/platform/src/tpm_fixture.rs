@@ -224,7 +224,10 @@ struct DeviceState {
     /// SHA-256 PCR bank.
     pcrs: [[u8; 32]; 24],
     started: bool,
-    update_counter: u64,
+    /// PCR update counter. Part 3 §22.6 puts it on the wire as a
+    /// UINT32 in PCR_Read responses, so the model keeps it at wire
+    /// width (it once kept a u64 and emitted all 8 bytes — #1065).
+    update_counter: u32,
     rng: u64,
     // Observations for fixture assertions.
     cancel_seen: bool,
@@ -606,6 +609,12 @@ impl FakeTpmDevice {
             }
             selections.push((alg, size_of_select as u8, mask));
         }
+        // Part 3 §22.6 response framing: pcrUpdateCounter (UINT32),
+        // pcrSelectionOut echoing the request, then pcrValues as a
+        // TPML_DIGEST — each digest a TPM2B_DIGEST with its own u16
+        // size prefix. (This model once emitted an 8-byte counter
+        // and unprefixed digests; only the tail-reading parsers
+        // could converse with that — #1065.)
         let mut body = Vec::new();
         body.extend_from_slice(&st.update_counter.to_be_bytes());
         body.extend_from_slice(&(selections.len() as u32).to_be_bytes());
@@ -616,6 +625,7 @@ impl FakeTpmDevice {
         }
         body.extend_from_slice(&(digests.len() as u32).to_be_bytes());
         for d in &digests {
+            body.extend_from_slice(&(d.len() as u16).to_be_bytes());
             body.extend_from_slice(d);
         }
         drop(st);
@@ -1379,10 +1389,10 @@ impl TpmDevice for ModelDevice {
         }
         let req = narf_tpm::tpm2::pcr_read(narf_tpm::tpm2::TPM_ALG_SHA256, &mask);
         let resp = self.submit_raw(&req).await?;
-        if resp.len() < 30 {
-            return Err(HighLevelTpmError::BadResponse);
-        }
-        Ok(resp[resp.len() - 32..].to_vec())
+        // Same structural parse production uses (Part 3 §22.6);
+        // this adapter once carried its own tail-read copy (#1065).
+        let parser = narf_tpm::commands::ResponseParser::new(&resp)?;
+        parser.parse_pcr_read()
     }
 }
 
@@ -1961,6 +1971,179 @@ fn smoke_tpm_getcapability_conversation() -> TestResult {
 kernel_test_in!(
     "drivers/platform/tpm-getcapability",
     smoke_tpm_getcapability_conversation
+);
+
+// ── PCR_Read framing (#1065): the model speaks Part 3 §22.6 ─────
+
+/// The model's PCR_Read response must be byte-for-byte the spec
+/// framing — UINT32 counter, echoed TPML_PCR_SELECTION, TPML_DIGEST
+/// of TPM2B-prefixed digests. This is the emit side of #1065: the
+/// model once wrote an 8-byte counter and raw digests, and only the
+/// tail-reading parsers could converse with it.
+fn smoke_tpm_model_pcr_read_spec_bytes() -> TestResult {
+    use narf_tpm::commands::ResponseParser;
+
+    let mut dev = FakeTpmDevice::crb();
+    let mut cmd_mem = alloc::vec![0u8; 4096];
+    let mut rsp_mem = alloc::vec![0u8; 4096];
+    let cmd_ptr = cmd_mem.as_mut_ptr();
+    let rsp_ptr = rsp_mem.as_mut_ptr();
+    dev.attach_buffers(cmd_ptr, 4096, rsp_ptr, 4096);
+    let dev = Arc::new(dev);
+    if tpm::crb_acquire_and_program(
+        dev.as_ref(),
+        cmd_ptr as u64,
+        4096,
+        rsp_ptr as u64,
+        4096,
+        narf_time::Deadline::after_ms(750),
+    )
+    .is_err()
+    {
+        return TestResult::Fail("CRB bring-up failed against the model");
+    }
+    let adapter: Arc<dyn TpmDevice> = Arc::new(ModelDevice {
+        dev: dev.clone(),
+        cmd_ptr,
+        rsp_ptr,
+        tis: false,
+    });
+    let submit = |req: &[u8]| submit_crb_sync(dev.as_ref(), cmd_ptr, rsp_ptr, req);
+
+    if narf_scheduler::block_on_spin(adapter.startup(narf_tpm::StartupType::Clear)).is_err() {
+        return TestResult::Fail("Startup(CLEAR) failed against the model");
+    }
+    let d1 = [0x41u8; 32];
+    let req = tpm::build_pcr_extend_request(4, &d1);
+    let resp = match submit(&req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("extend submit failed at transport"),
+    };
+    if tpm::validate_pcr_extend_response(&resp).is_err() {
+        return TestResult::Fail("extend response not a success frame");
+    }
+    let want1 = pcr_extend_value(&[0u8; 32], &d1);
+
+    let mut mask = [0u8; 3];
+    mask[0] = 1 << 4;
+    let read_req = narf_tpm::tpm2::pcr_read(narf_tpm::tpm2::TPM_ALG_SHA256, &mask);
+    let resp = match submit(&read_req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("pcr_read submit failed at transport"),
+    };
+
+    // The exact wire bytes (Part 3 §22.6): header + counter(4) +
+    // selection(4 + 2 + 1 + 3) + digest count(4) + TPM2B(2 + 32).
+    let mut want = alloc::vec::Vec::new();
+    want.extend_from_slice(&narf_tpm::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+    want.extend_from_slice(&62u32.to_be_bytes());
+    want.extend_from_slice(&0u32.to_be_bytes()); // TPM_RC_SUCCESS
+    want.extend_from_slice(&1u32.to_be_bytes()); // counter: one extend
+    want.extend_from_slice(&1u32.to_be_bytes()); // selection count
+    want.extend_from_slice(&narf_tpm::tpm2::TPM_ALG_SHA256.to_be_bytes());
+    want.push(3u8); // sizeofSelect
+    want.extend_from_slice(&mask);
+    want.extend_from_slice(&1u32.to_be_bytes()); // digest count
+    want.extend_from_slice(&32u16.to_be_bytes()); // TPM2B_DIGEST size
+    want.extend_from_slice(&want1);
+    if resp != want {
+        return TestResult::Fail("model PCR_Read bytes != Part 3 §22.6 framing");
+    }
+
+    // And the canonical structural parser round-trips them.
+    let parser = match ResponseParser::new(&resp) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("pcr_read response not a success frame"),
+    };
+    match parser.parse_pcr_read_full() {
+        Ok(full) if full.update_counter == 1 && full.digests == alloc::vec![want1.to_vec()] => {}
+        _ => return TestResult::Fail("canonical parser did not round-trip the model frame"),
+    }
+    let _ = (cmd_mem, rsp_mem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-pcr-read",
+    smoke_tpm_model_pcr_read_spec_bytes
+);
+
+/// Multi-PCR round trip: two extended PCRs read back in one
+/// selection parse to both values in ascending order — the case
+/// the old tail walk could not even express — and the adapter's
+/// `read_pcr` (which carried its own tail-read copy) answers
+/// through the structural parser.
+fn smoke_tpm_model_pcr_read_multi_round_trip() -> TestResult {
+    use narf_tpm::commands::ResponseParser;
+
+    let mut dev = FakeTpmDevice::crb();
+    let mut cmd_mem = alloc::vec![0u8; 4096];
+    let mut rsp_mem = alloc::vec![0u8; 4096];
+    let cmd_ptr = cmd_mem.as_mut_ptr();
+    let rsp_ptr = rsp_mem.as_mut_ptr();
+    dev.attach_buffers(cmd_ptr, 4096, rsp_ptr, 4096);
+    let dev = Arc::new(dev);
+    if tpm::crb_acquire_and_program(
+        dev.as_ref(),
+        cmd_ptr as u64,
+        4096,
+        rsp_ptr as u64,
+        4096,
+        narf_time::Deadline::after_ms(750),
+    )
+    .is_err()
+    {
+        return TestResult::Fail("CRB bring-up failed against the model");
+    }
+    let adapter: Arc<dyn TpmDevice> = Arc::new(ModelDevice {
+        dev: dev.clone(),
+        cmd_ptr,
+        rsp_ptr,
+        tis: false,
+    });
+    let submit = |req: &[u8]| submit_crb_sync(dev.as_ref(), cmd_ptr, rsp_ptr, req);
+
+    if narf_scheduler::block_on_spin(adapter.startup(narf_tpm::StartupType::Clear)).is_err() {
+        return TestResult::Fail("Startup(CLEAR) failed against the model");
+    }
+    for (pcr, d) in [(4u32, [0x41u8; 32]), (9u32, [0x42u8; 32])] {
+        let req = tpm::build_pcr_extend_request(pcr, &d);
+        match submit(&req) {
+            Ok(r) if tpm::validate_pcr_extend_response(&r).is_ok() => {}
+            _ => return TestResult::Fail("extend submit failed at transport"),
+        }
+    }
+
+    // PCRs 4 and 9 in one selection: mask byte 0 bit 4, byte 1 bit 1.
+    let mask = [0x10u8, 0x02, 0x00];
+    let read_req = narf_tpm::tpm2::pcr_read(narf_tpm::tpm2::TPM_ALG_SHA256, &mask);
+    let resp = match submit(&read_req) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("pcr_read submit failed at transport"),
+    };
+    let parser = match ResponseParser::new(&resp) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("pcr_read response not a success frame"),
+    };
+    match parser.parse_pcr_read_full() {
+        Ok(full)
+            if full.update_counter == 2
+                && full.selections
+                    == alloc::vec![(narf_tpm::tpm2::TPM_ALG_SHA256, mask.to_vec())]
+                && full.digests == alloc::vec![dev.pcr(4).to_vec(), dev.pcr(9).to_vec()] => {}
+        _ => return TestResult::Fail("multi-PCR round trip parsed incorrectly"),
+    }
+
+    // The adapter path production fixtures consume.
+    match narf_scheduler::block_on_spin(adapter.read_pcr(9)) {
+        Ok(v) if v == dev.pcr(9).to_vec() => {}
+        _ => return TestResult::Fail("adapter read_pcr(9) != device PCR 9"),
+    }
+    let _ = (cmd_mem, rsp_mem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-pcr-read",
+    smoke_tpm_model_pcr_read_multi_round_trip
 );
 
 /// Fixture-cleanup transport: installed into the sysfs bridge on
