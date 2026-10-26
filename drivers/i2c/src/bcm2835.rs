@@ -36,6 +36,7 @@
 //! flagged here as the §3.1 constant the #1052 clock framework
 //! will replace.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 
 use async_trait::async_trait;
